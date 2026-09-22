@@ -73,7 +73,7 @@ class DiffusersGenericPipelineConfig(PipelineConfig):
         """
         return width, height
 
-    def adjust_num_frames(self, num_frames):
+    def adjust_num_frames(self, num_frames, *, log_adjustment: bool = True):
         """
         Pass through - diffusers handles frame count.
         """

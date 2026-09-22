@@ -14,6 +14,7 @@
 
 from sglang.kernels.ops.speculative.multi_layer_eagle import (
     compute_widened_draft_extend_locs_positions_triton,
+    fill_draft_extend_prepare_buffers_native,
     fill_draft_extend_prepare_buffers_triton,
     fill_widened_draft_extend_inputs_triton,
     rotate_input_ids,
@@ -53,6 +54,7 @@ def compute_widened_draft_extend_locs_positions(
 __all__ = [
     "boundary_kv_fix_enabled",
     "compute_widened_draft_extend_locs_positions",
+    "fill_draft_extend_prepare_buffers_native",
     "fill_draft_extend_prepare_buffers_triton",
     "fill_widened_draft_extend_inputs_triton",
     "rotate_input_ids",

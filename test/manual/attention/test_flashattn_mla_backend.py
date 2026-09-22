@@ -49,6 +49,7 @@ class MockModelRunner:
             },
         )
         self.kv_cache_dtype = self.server_args.kv_cache_dtype
+        self.kv_cache_dtype_str = "auto"
 
         batch_size = 160
         # Create a proper req_to_token_pool with the req_to_token attribute

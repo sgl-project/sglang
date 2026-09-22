@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING, Any, Optional
 
 import torch
 
-from sglang.jit_kernel.kv_canary.verify import VerifyPlan
+from sglang.kernels.ops.kv_canary.verify import VerifyPlan
 from sglang.srt.kv_canary.buffer_group import CanaryBufferGroup, PoolKind
 from sglang.srt.kv_canary.runner.future_tensor import DelayedDeviceHostHandler
 
@@ -30,7 +30,7 @@ class SwaDivergenceReporter:
         self,
         *,
         device: torch.device,
-        d2h_stream: torch.cuda.Stream,
+        d2h_stream: torch.Stream,
         interval: int,
         swa_allocator: Optional[SWATokenToKVPoolAllocator] = None,
         req_to_token_pool: Optional[ReqToTokenPool] = None,

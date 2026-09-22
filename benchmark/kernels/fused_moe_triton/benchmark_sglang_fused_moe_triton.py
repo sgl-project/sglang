@@ -26,6 +26,7 @@ from sglang.srt.layers.moe.topk import (
     select_experts,
 )
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
+from sglang.test.test_utils import publish_build_topology
 
 
 def fused_moe_triton_api(
@@ -227,10 +228,8 @@ def main():
             backend="nccl" if torch.cuda.is_available() else "gloo",
         )
 
-        initialize_model_parallel(
-            tensor_model_parallel_size=1,
-            expert_model_parallel_size=1,
-        )
+        publish_build_topology()
+        initialize_model_parallel()
 
         model_config = get_model_config(args.model, args.tp_size, args.ep_size)
         benchmark.run(

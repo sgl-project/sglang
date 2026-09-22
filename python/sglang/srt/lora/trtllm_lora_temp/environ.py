@@ -108,7 +108,7 @@ class _LoraEnvs:
     # diagnostics / tuning:
     SGLANG_OPT_LORA_SHRINK_TUNE = _GatedBool("SGLANG_OPT_LORA_SHRINK_TUNE", False)
 
-    # kimi NVFP4 permute+quant fuse — read in jit_kernel/trtllm_lora_temp/core.py (Python) to pass
+    # kimi NVFP4 permute+quant fuse — read in kernels/ops/moe/trtllm_lora_temp/core.py (Python) to pass
     # a bool to the kernel, AND C++-side via getenv in the launcher. Default off (kimi-only).
     SGLANG_OPT_FUSED_PERMUTE_QUANT = _GatedBool("SGLANG_OPT_FUSED_PERMUTE_QUANT", False)
 

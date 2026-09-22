@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import logging
 from typing import Iterable, List, Optional, Tuple
 
@@ -8,14 +9,27 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from sglang.jit_kernel.dsv4 import fused_q_norm_rope, fused_rope_inplace
+from sglang.kernels.ops.attention.dsv4 import fused_q_norm_rope, fused_rope_inplace
+from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
+    is_unified_kv_triton,
+)
+from sglang.kernels.ops.speculative.dspark.dspark_draft_model import (
+    BuildStepLocal,
+    CommitKvProj,
+)
 from sglang.srt.configs.deepseek_v4 import DeepSeekV4Config
+from sglang.srt.distributed.device_communicators.vocab_gather import make_vocab_gather
 from sglang.srt.environ import envs
+from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.layers.moe.utils import is_shared_experts_fusion_disabled
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
+from sglang.srt.layers.vocab_parallel_embedding import (
+    ParallelLMHead,
+    VocabParallelEmbedding,
+)
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
@@ -25,8 +39,10 @@ from sglang.srt.models.dbrx import ReplicatedLinear
 from sglang.srt.models.deepseek_v4 import (
     DEEPSEEK_V4_STACKED_PARAMS_MAPPING,
     DeepseekV4DecoderLayer,
+    DeepseekV4ForCausalLM,
     MqaAttentionBase,
-    _dequant_fp8_wo_a,
+    _apply_wo_a_bf16_matmul,
+    _dequant_fp8_wo_a_streaming,
     hc_head_torch,
     make_hc_head_params,
 )
@@ -34,26 +50,33 @@ from sglang.srt.models.dspark import (
     DSparkConfidenceHead,
     StepSampler,
     gather_and_crop_vocab,
+    project_through_lm_head,
     run_markov_block,
 )
-from sglang.srt.runtime_context import get_parallel
-from sglang.srt.speculative.dspark_components.dspark_config import (
-    parse_dspark_draft_config,
+from sglang.srt.runtime_context import (
+    get_parallel,
+    get_platform,
 )
-from sglang.srt.speculative.dspark_components.kernels.dspark_draft_model import (
-    BuildStepLocal,
-    CommitKvProj,
+from sglang.srt.speculative.dspark_components.dspark_config import (
+    get_dspark_sample_from_anchor,
+    parse_dspark_draft_config,
 )
 from sglang.srt.speculative.ragged_verify import (
     RaggedVerifyMode,
     read_ragged_verify_mode,
 )
-from sglang.srt.utils import add_prefix, is_blackwell_supported
-from sglang.srt.utils.async_probe import maybe_detect_in_closed_range
+from sglang.srt.utils import add_prefix, is_npu
+from sglang.srt.utils.invariants import Bucket, InClosedRange, Invariant, expect
 
 logger = logging.getLogger(__name__)
 
 _PAD_NUM_HEADS = 64
+
+# DSpark confidence is a per-token score that must stay in [0, 1].
+_CONFIDENCE = Invariant(
+    "dspark.model.confidence", Bucket.GUARD, InClosedRange(0.0, 1.0)
+)
+_is_npu = is_npu()
 
 
 def apply_rotary_emb(
@@ -73,7 +96,6 @@ def apply_rotary_emb(
 
 
 class DSparkAttention(MqaAttentionBase):
-
     def __init__(
         self,
         config: DeepSeekV4Config,
@@ -96,9 +118,9 @@ class DSparkAttention(MqaAttentionBase):
             wo_b_reduce_results=True,
             rope_original_seq_len=0,
         )
-        assert (
-            self.compress_ratio == 0
-        ), "DSpark draft attention requires compress_ratio == 0."
+        assert self.compress_ratio == 0, (
+            "DSpark draft attention requires compress_ratio == 0."
+        )
         self.window_size = int(
             getattr(config, "sliding_window", None) or config.window_size
         )
@@ -115,22 +137,17 @@ class DSparkAttention(MqaAttentionBase):
 
         self._use_fast_kernel = envs.SGLANG_DSPARK_FAST_KERNEL.get()
         self.alt_streams = alt_streams
-        self._multi_stream_bs_limit = 128 if is_blackwell_supported() else 64
+        self._multi_stream_bs_limit = 128 if get_platform().is_blackwell else 64
+        if _is_npu:
+            self.register_buffer(
+                "_q_post_norm_weight",
+                torch.ones(self.head_dim),
+                persistent=False,
+            )
 
     def kv_proj_only(self, x: torch.Tensor) -> torch.Tensor:
         kv, _ = self.wkv(x)
         return kv
-
-    def _local_attn_sink(self) -> torch.Tensor:
-        if self.attn_tp_size == 1:
-            return self.attn_sink
-        if self._attn_sink_local is None:
-            rank = self.attn_tp_rank
-            num_heads = self.n_local_heads
-            sink = self.attn_sink.new_zeros(max(num_heads, _PAD_NUM_HEADS))
-            sink[:num_heads] = self.attn_sink[rank * num_heads : (rank + 1) * num_heads]
-            self._attn_sink_local = sink
-        return self._attn_sink_local
 
     def _store_block_kv(
         self,
@@ -141,6 +158,20 @@ class DSparkAttention(MqaAttentionBase):
         attn_backend,
         pool: DeepSeekV4TokenToKVPool,
     ) -> None:
+        if is_unified_kv_triton():
+            # unified_kv: SWA K lives in the shared bf16 ring (swa_kv_pool is
+            # None). Use the unified ring write target -- get_unified_swa_loc
+            # recomputes it from live positions for multi-step draft decode.
+            pool.set_unified_key_buffer_radix_fused_norm_rope(
+                layer_id=self.layer_id,
+                swa_loc=attn_backend.get_unified_swa_loc(forward_batch),
+                kv=kv,
+                kv_weight=self.kv_norm.weight.data,
+                eps=self.eps,
+                freqs_cis=self.freqs_cis,
+                positions=positions,
+            )
+            return
         pool.set_swa_key_buffer_radix_fused_norm_rope(
             layer_id=self.layer_id,
             swa_loc=attn_backend.get_swa_out_cache_loc(forward_batch),
@@ -161,16 +192,58 @@ class DSparkAttention(MqaAttentionBase):
         q = self.q_norm(q)
         q, _ = self.wq_b(q)
         q = q.view(-1, self.n_local_heads, self.head_dim)
+        if not self.q_head_norm:
+            if self._use_fast_kernel and not _is_npu:
+                fused_rope_inplace(
+                    q[..., -self.rope_head_dim :],
+                    None,
+                    self.freqs_cis,
+                    positions=positions,
+                )
+            else:
+                apply_rotary_emb(
+                    q[..., -self.rope_head_dim :], self.freqs_cis[positions]
+                )
+            if q_out is None:
+                return q
+            q_out.copy_(q)
+            return q_out
         if self._use_fast_kernel:
             if q_out is None:
                 q_out = torch.empty_like(q)
             fused_q_norm_rope(q, q_out, self.eps, self.freqs_cis, positions)
             return q_out
         else:
-            q = q * torch.rsqrt(
-                q.float().square().mean(-1, keepdim=True) + self.eps
-            ).to(q.dtype)
-            apply_rotary_emb(q[..., -self.rope_head_dim :], self.freqs_cis[positions])
+            if _is_npu:
+                import torch_npu
+
+                from sglang.srt.hardware_backend.npu.dsv4.dsv4_rope import (
+                    Dsv4NpuRoPE,
+                )
+
+                q = torch_npu.npu_rms_norm(q, self._q_post_norm_weight, self.eps)[0]
+                cos4, sin4 = Dsv4NpuRoPE.for_freqs(self.freqs_cis).get_cos_sin(
+                    positions,
+                    q.dtype,
+                    view_4d=True,
+                    inverse=False,
+                    allow_build=True,
+                    cache_dtype=torch.float32,
+                )
+                Dsv4NpuRoPE.apply_rotary_mul_inplace(
+                    q,
+                    None,
+                    cos4,
+                    sin4,
+                    qk_nope_dim=q.shape[-1] - self.rope_head_dim,
+                )
+            else:
+                q = q * torch.rsqrt(
+                    q.float().square().mean(-1, keepdim=True) + self.eps
+                ).to(q.dtype)
+                apply_rotary_emb(
+                    q[..., -self.rope_head_dim :], self.freqs_cis[positions]
+                )
             if q_out is not None:
                 q_out.copy_(q)
                 return q_out
@@ -182,6 +255,9 @@ class DSparkAttention(MqaAttentionBase):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
+        if _is_npu and forward_batch.forward_mode.is_idle():
+            return torch.zeros_like(hidden_states)
+
         from sglang.srt.model_executor.forward_context import get_attn_backend
 
         pool = _resolve_dspark_pool()
@@ -242,12 +318,31 @@ class DSparkAttention(MqaAttentionBase):
             attn_sink=attn_sink,
             save_kv_cache=False,
         )
+
         if o.shape[1] != self.n_local_heads:
             o = o[:, : self.n_local_heads, :]
 
         if self._use_fast_kernel:
             fused_rope_inplace(
                 o[..., -rd:], None, self.freqs_cis, positions=positions, inverse=True
+            )
+        elif _is_npu:
+            from sglang.srt.hardware_backend.npu.dsv4.dsv4_rope import Dsv4NpuRoPE
+
+            cos4, sin4 = Dsv4NpuRoPE.for_freqs(self.freqs_cis).get_cos_sin(
+                positions,
+                o.dtype,
+                view_4d=True,
+                inverse=True,
+                allow_build=True,
+                cache_dtype=torch.float32,
+            )
+            Dsv4NpuRoPE.apply_rotary_mul_inplace(
+                o,
+                None,
+                cos4,
+                sin4,
+                qk_nope_dim=o.shape[-1] - rd,
             )
         else:
             apply_rotary_emb(o[..., -rd:], self.freqs_cis[positions], inverse=True)
@@ -259,7 +354,13 @@ class DSparkAttention(MqaAttentionBase):
         )
         wo_a = self.wo_a.weight.view(self.n_local_groups, self.o_lora_rank, -1)
         if self._use_fast_kernel:
-            o = torch.einsum("bgd,grd->bgr", o, wo_a)
+            o = _apply_wo_a_bf16_matmul(
+                o,
+                wo_a,
+                is_decode=forward_batch.forward_mode.is_decode(),
+                is_target_verify=forward_batch.forward_mode.is_target_verify(),
+                fast_path=self.is_dsv41,
+            )
         else:
             o = torch.einsum("bgd,grd->bgr", o.float(), wo_a.float()).to(q.dtype)
         out, _ = self.wo_b(o.reshape(o.shape[0], o.shape[1] * o.shape[2]))
@@ -276,7 +377,6 @@ def _resolve_dspark_pool() -> DeepSeekV4TokenToKVPool:
 
 
 class MarkovW2ShardGeometry(msgspec.Struct, frozen=True):
-
     tp_size: int
     org_vocab_start: int
     org_vocab_end: int
@@ -285,13 +385,15 @@ class MarkovW2ShardGeometry(msgspec.Struct, frozen=True):
 
 
 class DSparkV4MarkovHead(nn.Module):
-
     markov_head_type = "vanilla"
 
-    def __init__(self, *, vocab_size: int, markov_rank: int) -> None:
+    def __init__(
+        self, *, vocab_size: int, markov_rank: int, is_dsv41: bool = False
+    ) -> None:
         super().__init__()
         self.vocab_size = int(vocab_size)
         self.markov_rank = int(markov_rank)
+        self._is_dsv41 = bool(is_dsv41)
         if self.markov_rank <= 0:
             raise ValueError(
                 f"DSparkV4MarkovHead requires markov_rank > 0, got {self.markov_rank}."
@@ -306,6 +408,7 @@ class DSparkV4MarkovHead(nn.Module):
             self.markov_rank, self.vocab_size, bias=False, dtype=markov_w2_dtype
         )
         self._tp_shard: Optional[MarkovW2ShardGeometry] = None
+        self._shard_group = None
 
     def configure_tp_shard(self, *, lm_head: nn.Module) -> None:
         if not self._opt_markov_w2_tp_shard:
@@ -325,16 +428,32 @@ class DSparkV4MarkovHead(nn.Module):
                 f"num_embeddings_per_partition({per_partition}) * tp_size({tp_size}) != "
                 f"num_embeddings_padded({num_padded})."
             )
-        attn_tp_size = get_parallel().attn_tp_group.world_size
-        if attn_tp_size != tp_size:
+        # Follow lm_head's group choice; attn_tp_group degenerates to size 1
+        # under prefill CP while lm_head still shards over the full TP group.
+        parallel = get_parallel()
+        shard_group = (
+            parallel.attn_tp_group
+            if getattr(lm_head, "use_attn_tp_group", False)
+            else parallel.tp_group
+        )
+        shard_group_size = shard_group.world_size
+        if shard_group_size != tp_size:
             raise ValueError(
-                "DSpark markov_w2 TP-shard needs the attn-TP group (used for the per-step "
-                f"all-gather) to equal the lm_head shard group, got attn_tp_size="
-                f"{attn_tp_size} vs lm_head tp_size={tp_size}. This config (e.g. DP "
-                "attention without --enable-dp-lm-head, where lm_head shards over the "
-                "global TP group) is unsupported; disable "
-                "SGLANG_DSPARK_OPT_MARKOV_W2_TP_SHARD."
+                "DSpark markov_w2 TP-shard needs the per-step all-gather group to "
+                f"equal the lm_head shard group, got shard_group_size="
+                f"{shard_group_size} vs lm_head tp_size={tp_size}. "
+                "Disable SGLANG_DSPARK_OPT_MARKOV_W2_TP_SHARD."
             )
+        self._shard_group = shard_group
+        self._vocab_gather = make_vocab_gather(
+            shard_group,
+            local_width=per_partition,
+            prefer_nvlink=self._is_dsv41
+            and envs.SGLANG_DSPARK_NVLINK_VOCAB_GATHER.get(),
+        )
+        if shard_group.rank == 0:
+            cls_name = type(self._vocab_gather).__name__
+            logger.info("DSpark markov_w2 vocab gather: %s", cls_name)
         self._tp_shard = MarkovW2ShardGeometry(
             tp_size=tp_size,
             org_vocab_start=int(lm_head.shard_indices.org_vocab_start_index),
@@ -386,11 +505,39 @@ class DSparkV4MarkovHead(nn.Module):
         else:
             bias = F.linear(latent.float(), weight_local)
         step_local = BuildStepLocal.execute(bias=bias, base_local=base_local)
-        if shard.tp_size > 1:
-            full = get_parallel().attn_tp_group.all_gather(step_local, dim=-1)
-        else:
-            full = step_local
+        full = self._vocab_gather(step_local)
         return full[..., : self.vocab_size]
+
+    @property
+    def supports_sharded_greedy(self) -> bool:
+        return (
+            self._is_dsv41 and self._tp_shard is not None and self._opt_markov_w2_bf16
+        )
+
+    def sample_block_greedy_fused(self, base_logits, *, first_prev_tokens):
+        if not self.supports_sharded_greedy or not base_logits.is_cuda:
+            return None
+        from sglang.kernels.ops.speculative.dspark.sharded_greedy import (
+            sharded_greedy_step,
+        )
+
+        shard = self._tp_shard
+        weight = self.markov_w2.weight[shard.org_vocab_start : shard.org_vocab_end]
+        prev = first_prev_tokens.long()
+        tokens = []
+        for step in range(base_logits.shape[1]):
+            latent = self.get_prev_embeddings(prev)
+            # Preserve the same BF16 GEMM rounding before the FP32 logits add.
+            bias = F.linear(latent.to(weight.dtype), weight)
+            prev = sharded_greedy_step(
+                bias,
+                base_logits[:, step],
+                group=self._shard_group,
+                vocab_start=shard.org_vocab_start,
+                gather=self._vocab_gather.gather_stacked,
+            )
+            tokens.append(prev)
+        return torch.stack(tokens, dim=1)
 
     def forward(self, token_ids: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         embed = self.get_prev_embeddings(token_ids)
@@ -404,13 +551,15 @@ class DSparkV4MarkovHead(nn.Module):
         first_prev_tokens: torch.Tensor,
         hidden_states: Optional[torch.Tensor],
         sampler: StepSampler,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        collect_corrected: bool = True,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         return run_markov_block(
             self,
             base_logits,
             first_prev_tokens=first_prev_tokens,
             hidden_states=hidden_states,
             sampler=sampler,
+            collect_corrected=collect_corrected,
         )
 
 
@@ -441,8 +590,23 @@ def build_dspark_v4_confidence_head(
     )
 
 
-class DSparkV4Stage(DeepseekV4DecoderLayer):
+def _dspark_stage_config(config: DeepSeekV4Config) -> DeepSeekV4Config:
+    n_routed = int(getattr(config, "dspark_n_routed_experts", 0) or 0)
+    n_active = int(getattr(config, "dspark_num_experts_per_tok", 0) or 0)
+    has_vision = int(getattr(config, "vision_n_layers", 0) or 0) > 0
+    if not (n_routed or n_active or has_vision):
+        return config
+    stage_config = copy.copy(config)
+    if n_routed:
+        stage_config.n_routed_experts = n_routed
+    if n_active:
+        stage_config.num_experts_per_tok = n_active
+    if has_vision:
+        stage_config.vision_n_layers = 0
+    return stage_config
 
+
+class DSparkV4Stage(DeepseekV4DecoderLayer):
     def __init__(
         self,
         config: DeepSeekV4Config,
@@ -453,14 +617,18 @@ class DSparkV4Stage(DeepseekV4DecoderLayer):
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
         alt_streams: Optional[List[torch.cuda.Stream]] = None,
+        hc_stats_stream: Optional[torch.cuda.Stream] = None,
+        moe_routed_quant_stream: Optional[torch.cuda.Stream] = None,
     ) -> None:
         super().__init__(
-            config=config,
+            config=_dspark_stage_config(config),
             layer_id=layer_id,
             quant_config=quant_config,
             prefix=prefix,
             is_nextn=True,
             alt_streams=alt_streams,
+            hc_stats_stream=hc_stats_stream,
+            moe_routed_quant_stream=moe_routed_quant_stream,
         )
         self.stage_id = stage_id
         self.dim = config.hidden_size
@@ -481,11 +649,16 @@ class DSparkV4Stage(DeepseekV4DecoderLayer):
 
         if stage_id == num_stages - 1:
             self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-            (
-                self.hc_head_fn,
-                self.hc_head_base,
-                self.hc_head_scale,
-            ) = make_hc_head_params(config.hc_mult, config.hidden_size)
+            if self.hc_pre_from_prev_sublayer:
+                # V4.1 collapses the head with the last FFN's pre-mix; the
+                # checkpoint carries no hc_head_* tensors for the stages.
+                self.hc_head_fn = self.hc_head_base = self.hc_head_scale = None
+            else:
+                (
+                    self.hc_head_fn,
+                    self.hc_head_base,
+                    self.hc_head_scale,
+                ) = make_hc_head_params(config.hc_mult, config.hidden_size)
 
     def _build_self_attn(
         self,
@@ -530,13 +703,19 @@ class DSparkV4Stage(DeepseekV4DecoderLayer):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
-    ) -> torch.Tensor:
+        prev_pre: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        if self.hc_pre_from_prev_sublayer:
+            return self._forward_hc_pre_from_prev(
+                positions, hidden_states, forward_batch, prev_pre
+            )
         residual = hidden_states
         x, post, comb = self._hc_pre_block(
             hidden_states, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base
         )
         x = self.input_layernorm(x)
-        x = self.self_attn(positions, x, forward_batch)
+        with self.self_attn.maybe_use_decode_attn_tp(forward_batch):
+            x = self.self_attn(positions, x, forward_batch)
         x = self._hc_post_block(x, residual, post, comb)
 
         residual = x
@@ -546,7 +725,49 @@ class DSparkV4Stage(DeepseekV4DecoderLayer):
         x = self.post_attention_layernorm(x)
         x = self._run_ffn(x, forward_batch)
         x = self._hc_post_block(x, residual, post, comb)
-        return x
+        return x, None
+
+    def _forward_hc_pre_from_prev(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+        prev_pre: Optional[torch.Tensor],
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        stats_stream = self._get_hc_stats_stream(hidden_states, forward_batch)
+        residual = hidden_states
+        x = self._hc_combine(
+            hidden_states, prev_pre, self.input_layernorm, stats_stream
+        )
+        with self.self_attn.maybe_use_decode_attn_tp(forward_batch):
+            x = self.self_attn(positions, x, forward_batch)
+        attn_pre, attn_post, attn_comb = self._hc_mix_stats(
+            hidden_states,
+            self.hc_attn_fn,
+            self.hc_attn_scale,
+            self.hc_attn_base,
+            stats_stream,
+        )
+        if stats_stream is not None:
+            torch.cuda.current_stream().wait_stream(stats_stream)
+        hidden_states = self.hc_post(x, residual, attn_post, attn_comb)
+
+        residual = hidden_states
+        x = self._hc_combine(
+            hidden_states, attn_pre, self.post_attention_layernorm, stats_stream
+        )
+        x = self._run_ffn(x, forward_batch)
+        ffn_pre, ffn_post, ffn_comb = self._hc_mix_stats(
+            hidden_states,
+            self.hc_ffn_fn,
+            self.hc_ffn_scale,
+            self.hc_ffn_base,
+            stats_stream,
+        )
+        if stats_stream is not None:
+            torch.cuda.current_stream().wait_stream(stats_stream)
+        hidden_states = self.hc_post(x, residual, ffn_post, ffn_comb)
+        return hidden_states, ffn_pre
 
     def _run_ffn(self, x: torch.Tensor, forward_batch: ForwardBatch) -> torch.Tensor:
         shape = x.shape
@@ -558,6 +779,26 @@ class DSparkV4Stage(DeepseekV4DecoderLayer):
 
 
 class DeepseekV4ForCausalLMDSpark(nn.Module):
+    # ModelSlim NPU checkpoints carry QuaRot-aligned, MTP-local
+    # embedding/head weights. The native CUDA path keeps the original DSpark
+    # behavior and shares the target model's vocabulary modules.
+    uses_own_vocab_modules = _is_npu
+
+    @classmethod
+    def shared_experts_fusion_disable_reason(
+        cls,
+        hf_config,
+        quant_config,
+    ):
+        if _is_npu:
+            return (
+                "NPU DSpark ModelSlim weight loading does not support mapping "
+                "shared experts into fused expert slots."
+            )
+
+        return DeepseekV4ForCausalLM.shared_experts_fusion_disable_reason(
+            hf_config, quant_config
+        )
 
     def __init__(
         self,
@@ -568,6 +809,9 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         super().__init__()
         self.config = config
         self.quant_config = quant_config
+        self.num_fused_shared_experts = (
+            0 if is_shared_experts_fusion_disabled() else config.n_shared_experts
+        )
 
         dspark_config = parse_dspark_draft_config(draft_hf_config=config)
         if not dspark_config.require_markov():
@@ -578,6 +822,7 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         self.gamma = int(
             dspark_config.resolve_gamma(default=int(config.num_hidden_layers))
         )
+        self.sample_from_anchor = get_dspark_sample_from_anchor(config)
         self.block_size = self.gamma
         if dspark_config.target_layer_ids is not None:
             self.num_stages = len(dspark_config.target_layer_ids)
@@ -604,6 +849,21 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         self.alt_streams: Optional[List[torch.cuda.Stream]] = (
             [torch.cuda.Stream()] if use_multi_stream else None
         )
+        self.moe_routed_quant_stream = (
+            torch.cuda.Stream()
+            if use_multi_stream
+            and torch.version.cuda is not None
+            and getattr(config, "hc_pre_from_prev_sublayer", False)
+            else None
+        )
+        self.hc_stats_stream = (
+            torch.cuda.Stream()
+            if use_multi_stream
+            and torch.version.cuda is not None
+            and get_platform().is_blackwell
+            and getattr(config, "hc_pre_from_prev_sublayer", False)
+            else None
+        )
         self.stages = nn.ModuleList(
             [
                 DSparkV4Stage(
@@ -615,6 +875,8 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
                     quant_config=quant_config,
                     prefix=add_prefix(f"stages.{stage_id}", prefix),
                     alt_streams=self.alt_streams,
+                    hc_stats_stream=self.hc_stats_stream,
+                    moe_routed_quant_stream=self.moe_routed_quant_stream,
                 )
                 for stage_id in range(self.num_stages)
             ]
@@ -622,6 +884,7 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         self.markov_head = DSparkV4MarkovHead(
             vocab_size=int(config.vocab_size),
             markov_rank=int(dspark_config.markov_rank),
+            is_dsv41=getattr(config, "model_type", None) == "deepseek_v41",
         )
         self.confidence_head = build_dspark_v4_confidence_head(
             config=config, markov_rank=int(dspark_config.markov_rank)
@@ -629,11 +892,30 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         self.hc_mult = int(config.hc_mult)
         self.norm_eps = float(config.rms_norm_eps)
         self.hc_eps = float(config.hc_eps)
+        self.hc_pre_from_prev_sublayer = bool(
+            getattr(config, "hc_pre_from_prev_sublayer", False)
+        )
 
-        self.embed_tokens: Optional[nn.Module] = None
-        self.lm_head: Optional[nn.Module] = None
+        if self.uses_own_vocab_modules:
+            self.embed_tokens = VocabParallelEmbedding(
+                config.vocab_size,
+                config.hidden_size,
+                prefix=add_prefix("embed_tokens", prefix),
+                enable_tp=not is_dp_attention_enabled(),
+            )
+            self.lm_head = ParallelLMHead(
+                config.vocab_size,
+                config.hidden_size,
+                prefix=add_prefix("lm_head", prefix),
+                use_attn_tp_group=get_parallel().enable_dp_lm_head,
+            )
+        else:
+            self.embed_tokens: Optional[nn.Module] = None
+            self.lm_head: Optional[nn.Module] = None
         self._use_fp32_lm_head = envs.SGLANG_DSPARK_FP32_LM_HEAD.get()
         self._opt_markov_w2_tp_shard = envs.SGLANG_DSPARK_OPT_MARKOV_W2_TP_SHARD.get()
+        if self.lm_head is not None:
+            self.markov_head.configure_tp_shard(lm_head=self.lm_head)
 
     @property
     def enable_confidence_head(self) -> bool:
@@ -642,9 +924,10 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
     def attach_shared_modules(
         self, *, embed_tokens: nn.Module, lm_head: nn.Module
     ) -> None:
-        self.embed_tokens = embed_tokens
-        self.lm_head = lm_head
-        self.markov_head.configure_tp_shard(lm_head=lm_head)
+        if not self.uses_own_vocab_modules:
+            self.embed_tokens = embed_tokens
+            self.lm_head = lm_head
+        self.markov_head.configure_tp_shard(lm_head=self.lm_head)
 
     def project_target_hidden(self, main_hidden: torch.Tensor) -> torch.Tensor:
         stage0 = self.stages[0]
@@ -664,10 +947,25 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         kvs = CommitKvProj.execute(
             main_x=main_x,
             wkv_linears=[stage.self_attn.wkv for stage in self.stages],
+            # The FlashMLA writer reads an explicit KV row stride, so views are fine.
+            allow_strided_output=(
+                get_platform().is_blackwell
+                and not is_unified_kv_triton()
+                and not pool.uniform_fp8
+            ),
+        )
+        # Under unified_kv the swa_kv_pool is None; the caller passes a unified
+        # ring loc (state_slot * ring + pos % ring, -1 for uncommitted) so the
+        # store just needs to target the bf16 ring instead of the fp8 flashmla
+        # buffer. Same swa_loc/positions contract either way.
+        store_kv = (
+            pool.set_unified_key_buffer_radix_fused_norm_rope
+            if is_unified_kv_triton()
+            else pool.set_swa_key_buffer_radix_fused_norm_rope
         )
         for stage, kv in zip(self.stages, kvs):
             attn = stage.self_attn
-            pool.set_swa_key_buffer_radix_fused_norm_rope(
+            store_kv(
                 layer_id=attn.layer_id,
                 swa_loc=swa_loc,
                 kv=kv,
@@ -700,12 +998,20 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         if input_embeds is None:
             input_embeds = self.forward_embed(input_ids)
         x = input_embeds
+        pre = None
         for stage in self.stages:
-            x = stage(positions, x, forward_batch)
+            x, pre = stage(positions, x, forward_batch, pre)
+        if self.hc_pre_from_prev_sublayer:
+            from sglang.kernels.ops.layernorm.mhc import hc_combine
+
+            x = hc_combine(x.flatten(1).float(), pre, self.hc_mult, x.dtype)
 
         return LogitsProcessorOutput(next_token_logits=None, hidden_states=x)
 
     def collapse_hc_head(self, x: torch.Tensor) -> torch.Tensor:
+        if self.hc_pre_from_prev_sublayer:
+            assert x.dim() == 2, "V4.1 draft hidden states leave forward() collapsed"
+            return x
         last = self.stages[-1]
         return hc_head_torch(
             x,
@@ -717,7 +1023,6 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         )
 
     def compute_base_logits(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-
         x_post_hc = self.collapse_hc_head(x)
         return self._logits_from_x_post_hc(x_post_hc), x_post_hc
 
@@ -730,10 +1035,10 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         last = self.stages[-1]
         x = last.norm(x_post_hc)
         weight = self.lm_head.weight
-        if self._use_fp32_lm_head:
+        if self._use_fp32_lm_head and weight.is_floating_point():
             local_logits = F.linear(x.float(), weight.float())
         else:
-            local_logits = torch.matmul(x.to(weight.dtype), weight.T)
+            local_logits = project_through_lm_head(x, self.lm_head)
         if self._opt_markov_w2_tp_shard:
             return local_logits
         return gather_and_crop_vocab(local_logits, self.lm_head)
@@ -759,18 +1064,14 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
             markov_embed_stack = None
         confidence_raw = confidence_head(x_post_hc, markov_embed_stack)
         confidence = confidence_head.apply_sts(confidence_raw)
-        maybe_detect_in_closed_range(
-            confidence, 0.0, 1.0, "DSpark confidence must lie in [0, 1]."
-        )
+        expect(_CONFIDENCE, confidence)
         return confidence
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> None:
         params_dict = dict(self.named_parameters())
         loaded_params = set()
 
-        weights = list(weights)
-        if any(name.endswith(".wo_a.scale") for name, _ in weights):
-            weights = list(_dequant_fp8_wo_a(weights))
+        weights = _dequant_fp8_wo_a_streaming(weights)
 
         stacked_params_mapping = DEEPSEEK_V4_STACKED_PARAMS_MAPPING
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
@@ -779,14 +1080,22 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
             ckpt_gate_proj_name="gate_proj",
             ckpt_down_proj_name="down_proj",
             ckpt_up_proj_name="up_proj",
-            num_experts=self.config.n_routed_experts,
+            num_experts=(self.config.n_routed_experts + self.num_fused_shared_experts),
         )
 
         for name, loaded_weight in weights:
-            mapped = self._remap_dspark_weight_name(name)
+            mapped = (
+                self._remap_dspark_weight_name_npu(name)
+                if _is_npu
+                else self._remap_dspark_weight_name(name)
+            )
             if mapped is None:
                 continue
-
+            if self.num_fused_shared_experts > 0 and ".mlp.shared_experts." in mapped:
+                mapped = mapped.replace(
+                    ".mlp.shared_experts.",
+                    f".mlp.experts.{self.config.n_routed_experts}.",
+                )
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name not in mapped:
                     continue
@@ -868,12 +1177,14 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         stage_id, rest = parts[1], parts[2]
 
         if rest.startswith("markov_head."):
-            return f"markov_head.{rest[len('markov_head.'):]}"
+            rest = rest.replace("markov_head.embed.", "markov_head.markov_w1.", 1)
+            rest = rest.replace("markov_head.head.", "markov_head.markov_w2.", 1)
+            return f"markov_head.{rest[len('markov_head.') :]}"
 
         if rest.startswith("confidence_head."):
             if self.confidence_head is None:
                 return None
-            return f"confidence_head.{rest[len('confidence_head.'):]}"
+            return f"confidence_head.{rest[len('confidence_head.') :]}"
 
         mapped_rest = rest
         mapped_rest = mapped_rest.replace("attn.", "self_attn.", 1)
@@ -884,8 +1195,68 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         mapped_rest = mapped_rest.replace(".w2.", ".down_proj.")
         mapped_rest = mapped_rest.replace(".w3.", ".up_proj.")
         mapped_rest = mapped_rest.replace(".gate.tid2eid", ".topk.tid2eid")
+        if mapped_rest.endswith(".gate.bias_vl"):
+            return None
         mapped_rest = mapped_rest.replace(".gate.bias", ".gate.e_score_correction_bias")
         mapped_rest = mapped_rest.replace(".scale", ".weight_scale_inv")
+        return f"stages.{stage_id}.{mapped_rest}"
+
+    def _remap_dspark_weight_name_npu(self, name: str) -> Optional[str]:
+        if name.startswith(("embed.", "embed_tokens.", "head.", "lm_head.")):
+            return None
+        if "rotary_emb.inv_freq" in name:
+            return None
+
+        if not name.startswith("mtp."):
+            return None
+        parts = name.split(".", 2)
+        if len(parts) < 3:
+            return None
+        stage_id, rest = parts[1], parts[2]
+        if not stage_id.isdigit():
+            return None
+        stage_idx = int(stage_id)
+        if rest in ("embed.weight", "embed_tokens.weight"):
+            return (
+                "embed_tokens.weight"
+                if self.uses_own_vocab_modules and stage_idx == 0
+                else None
+            )
+        if rest in ("head.weight", "lm_head.weight"):
+            return (
+                "lm_head.weight"
+                if self.uses_own_vocab_modules and stage_idx == self.num_stages - 1
+                else None
+            )
+        if rest.startswith(("embed.", "embed_tokens.", "head.", "lm_head.")):
+            return None
+
+        if rest.startswith("markov_head."):
+            return f"markov_head.{rest[len('markov_head.') :]}"
+
+        if rest.startswith("confidence_head."):
+            if self.confidence_head is None:
+                return None
+            return f"confidence_head.{rest[len('confidence_head.') :]}"
+
+        mapped_rest = rest
+        if mapped_rest.startswith("attn."):
+            mapped_rest = "self_attn." + mapped_rest.removeprefix("attn.")
+        elif mapped_rest.startswith("ffn."):
+            mapped_rest = "mlp." + mapped_rest.removeprefix("ffn.")
+        elif mapped_rest.startswith("attn_norm."):
+            mapped_rest = "input_layernorm." + mapped_rest.removeprefix("attn_norm.")
+        elif mapped_rest.startswith("ffn_norm."):
+            mapped_rest = "post_attention_layernorm." + mapped_rest.removeprefix(
+                "ffn_norm."
+            )
+        mapped_rest = mapped_rest.replace(".w1.", ".gate_proj.")
+        mapped_rest = mapped_rest.replace(".w2.", ".down_proj.")
+        mapped_rest = mapped_rest.replace(".w3.", ".up_proj.")
+        mapped_rest = mapped_rest.replace(".gate.tid2eid", ".topk.tid2eid")
+        mapped_rest = mapped_rest.replace(".gate.bias", ".gate.e_score_correction_bias")
+        if mapped_rest.endswith(".scale"):
+            mapped_rest = mapped_rest.removesuffix(".scale") + ".weight_scale_inv"
         return f"stages.{stage_id}.{mapped_rest}"
 
 

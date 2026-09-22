@@ -12,7 +12,7 @@ from sgl_kernel.kvcacheio import (
     transfer_kv_all_layer_mla_lf_pf,
 )
 
-from sglang.jit_kernel.hicache import (
+from sglang.kernels.ops.kvcache.hicache import (
     can_use_hicache_jit_kernel,
     transfer_hicache_all_layer_mla_staged_lf_pf,
     transfer_hicache_all_layer_staged_lf_pf,
@@ -327,8 +327,8 @@ Environment:
 
 Comparison target:
 
-- MHA: `sgl_kernel.transfer_kv_all_layer_lf_pf` vs `sglang.jit_kernel.hicache.transfer_hicache_all_layer_staged_lf_pf`
-- MLA: `sgl_kernel.transfer_kv_all_layer_mla_lf_pf` vs `sglang.jit_kernel.hicache.transfer_hicache_all_layer_mla_staged_lf_pf`
+- MHA: `sgl_kernel.transfer_kv_all_layer_lf_pf` vs `sglang.kernels.ops.kvcache.hicache.transfer_hicache_all_layer_staged_lf_pf`
+- MLA: `sgl_kernel.transfer_kv_all_layer_mla_lf_pf` vs `sglang.kernels.ops.kvcache.hicache.transfer_hicache_all_layer_mla_staged_lf_pf`
 
 Metric:
 

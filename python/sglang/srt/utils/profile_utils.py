@@ -8,12 +8,16 @@ from typing import Callable, Dict, List, Optional
 
 import torch
 
-from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import ProfileReqOutput
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.model_executor.step_span_utils import (
+    build_detailed_annotation_suffix,
+    detailed_annotations_enabled,
+    set_detailed_annotations_enabled,
+)
 from sglang.srt.platforms import current_platform
-from sglang.srt.runtime_context import get_server_args
+from sglang.srt.runtime_context import get_device, get_parallel
 from sglang.srt.utils import is_npu
 from sglang.srt.utils.torch_npu_patch_utils import apply_torch_npu_patches
 
@@ -30,6 +34,19 @@ if _is_npu:
 
 logger = logging.getLogger(__name__)
 
+# Single source of truth for the CUDA-graph capture trace output directory,
+# shared by both the original single-trace export and the per-batch-size
+# (SGLANG_GRAPH_BATCH_CAPTURE) traces so they land in the same place.
+GRAPH_CAPTURE_PROFILE_DIRNAME = "graph_capture_profile"
+
+
+def graph_capture_profile_dir() -> str:
+    """``<SGLANG_TORCH_PROFILER_DIR>/graph_capture_profile`` — the one directory
+    both capture-trace modes write to. Change the location here only."""
+    return os.path.join(
+        envs.SGLANG_TORCH_PROFILER_DIR.get(), GRAPH_CAPTURE_PROFILE_DIRNAME
+    )
+
 
 def export_cuda_graph_capture_trace(prof_context, *, runner_name: str, tp_rank: int):
     """Persist a CUDA-graph capture profiler trace (chrome trace) to disk.
@@ -37,15 +54,13 @@ def export_cuda_graph_capture_trace(prof_context, *, runner_name: str, tp_rank: 
     Opt-in via ``SGLANG_ENABLE_CUDA_GRAPH_CAPTURE_TRACE`` (no-op otherwise). The
     capture profiler must have run with ``record_shapes=True`` so the trace can
     be inspected offline as a per-kernel shape/identity record. The file lands in
-    ``<SGLANG_TORCH_PROFILER_DIR>/graph_capture_profile/`` and is namespaced by
-    runner class and TP rank so concurrent capture passes (e.g. EAGLE3
-    target/draft/draft-extend) and ranks don't overwrite each other.
+    ``graph_capture_profile_dir()`` and is namespaced by runner class and TP rank
+    so concurrent capture passes (e.g. EAGLE3 target/draft/draft-extend) and
+    ranks don't overwrite each other.
     """
     if not envs.SGLANG_ENABLE_CUDA_GRAPH_CAPTURE_TRACE.get():
         return
-    output_dir = os.path.join(
-        envs.SGLANG_TORCH_PROFILER_DIR.get(), "graph_capture_profile"
-    )
+    output_dir = graph_capture_profile_dir()
     os.makedirs(output_dir, exist_ok=True)
     path = os.path.join(
         output_dir, f"cuda_graph_capture-{runner_name}-TP-{tp_rank}.json.gz"
@@ -55,16 +70,16 @@ def export_cuda_graph_capture_trace(prof_context, *, runner_name: str, tp_rank: 
 
 
 class ProfileManager:
-    def __init__(self, ps: ParallelState, cpu_group):
+    def __init__(self, cpu_group):
         self.stage_based_trigger = _StageBasedTrigger(
             on_start=self._do_start,
             on_stop=self._do_stop,
         )
-        self.ps = ps
         self.cpu_group = cpu_group
-        self.first_rank_in_node = ps.gpu_id == get_server_args().base_gpu_id
+        self.first_rank_in_node = get_device().gpu_id == get_device().base_gpu_id
         self.profiler_kwargs = None
         self.profiler = None
+        self.detailed_annotations = False
 
     def step(self, forward_mode: ForwardMode):
         stage = _get_stage_from_forward_mode(forward_mode)
@@ -87,12 +102,14 @@ class ProfileManager:
         merge_profiles: bool,
         profile_prefix: str,
         profile_stages: Optional[List[str]] = None,
+        detailed_annotations: bool = False,
     ):
+        self.detailed_annotations = detailed_annotations
         # not supported yet
         assert start_step is None
-        assert (
-            profile_by_stage
-        ), "only support profile_by_stage=true now"  # `false` can be easily supported
+        assert profile_by_stage, (
+            "only support profile_by_stage=true now"
+        )  # `false` can be easily supported
         assert not merge_profiles
 
         if output_dir is None:
@@ -130,9 +147,11 @@ class ProfileManager:
         )
 
         assert self.profiler is None
+        # Fold the per-phase c_/g_ aggregates into the step span while this
+        # stage's profile is active (v2 auto-start path; reset in _do_stop).
+        set_detailed_annotations_enabled(self.detailed_annotations)
         self.profiler = _ProfilerBase.create(
             **self.profiler_kwargs,
-            ps=self.ps,
             cpu_group=self.cpu_group,
             first_rank_in_node=self.first_rank_in_node,
             output_suffix=f"-{stage}" if stage else "",
@@ -146,6 +165,10 @@ class ProfileManager:
             f"Profiling done. Traces are saved to: {self.profiler_kwargs['output_dir']}"
         )
         self.profiler = None
+        # Clear the detailed step-span toggle here too: the v2 trigger auto-stop
+        # goes through _do_stop (not SchedulerProfilerManager._stop_profile), so
+        # this guarantees the flag resets on every stop path.
+        set_detailed_annotations_enabled(False)
 
 
 def _get_stage_from_forward_mode(forward_mode: ForwardMode):
@@ -277,7 +300,6 @@ class _ProfilerConcreteBase(_ProfilerBase):
         output_prefix: str,
         output_suffix: str,
         profile_id: str,
-        ps: ParallelState,
         cpu_group,
         first_rank_in_node: bool,
     ):
@@ -285,7 +307,6 @@ class _ProfilerConcreteBase(_ProfilerBase):
         self.output_prefix = output_prefix
         self.output_suffix = output_suffix
         self.profile_id = profile_id
-        self.ps = ps
         self.cpu_group = cpu_group
         self.first_rank_in_node = first_rank_in_node
 
@@ -332,15 +353,15 @@ class _ProfilerTorch(_ProfilerConcreteBase):
         self.torch_profiler.stop()
         if not _is_npu:
             # Build filename with only non-zero ranks to maintain backward compatibility
-            filename_parts = [self.profile_id, f"TP-{self.ps.tp_rank}"]
+            filename_parts = [self.profile_id, f"TP-{get_parallel().tp_rank}"]
 
             # Only add other ranks if parallelism is enabled (size > 1)
-            if self.ps.dp_size > 1:
-                filename_parts.append(f"DP-{self.ps.dp_rank}")
-            if self.ps.pp_size > 1:
-                filename_parts.append(f"PP-{self.ps.pp_rank}")
-            if self.ps.moe_ep_size > 1:
-                filename_parts.append(f"EP-{self.ps.moe_ep_rank}")
+            if get_parallel().dp_size > 1:
+                filename_parts.append(f"DP-{get_parallel().dp_rank}")
+            if get_parallel().pp_size > 1:
+                filename_parts.append(f"PP-{get_parallel().pp_rank}")
+            if get_parallel().moe_ep_size > 1:
+                filename_parts.append(f"EP-{get_parallel().moe_ep_rank}")
 
             filename = (
                 (self.output_prefix + "-" if self.output_prefix else "")
@@ -359,15 +380,18 @@ class _ProfilerTorch(_ProfilerConcreteBase):
 
 class _ProfilerMemory(_ProfilerConcreteBase):
     def start(self):
-        torch.cuda.memory._record_memory_history(max_entries=100000)
+        torch.cuda.memory._record_memory_history(
+            max_entries=envs.SGLANG_MEM_PROFILE_MAX_ENTRIES.get()
+        )
 
     def stop(self):
         Path(self.output_dir).mkdir(parents=True, exist_ok=True)
 
         memory_profile_path = os.path.join(
             self.output_dir,
-            str(time.time())
-            + f"-TP-{self.ps.tp_rank}-memory"
+            (self.output_prefix + "-" if self.output_prefix else "")
+            + str(time.time())
+            + f"-TP-{get_parallel().tp_rank}-memory"
             + self.output_suffix
             + ".pickle",
         )
@@ -397,10 +421,13 @@ class _ProfilerRPD(_ProfilerConcreteBase):
 
         self.rpd_profile_path = os.path.join(
             self.output_dir,
-            "rpd-" + str(time.time()) + f"-TP-{self.ps.tp_rank}" + ".trace.json.gz",
+            "rpd-"
+            + str(time.time())
+            + f"-TP-{get_parallel().tp_rank}"
+            + ".trace.json.gz",
         )
 
-        if self.ps.tp_rank == 0:
+        if get_parallel().tp_rank == 0:
             import sqlite3
 
             from rocpd.schema import RocpdSchema
@@ -425,17 +452,48 @@ class _ProfilerRPD(_ProfilerConcreteBase):
         self.rpd_profiler.flush()
 
         torch.distributed.barrier(self.cpu_group)
-        if self.ps.tp_rank == 0:
+        if get_parallel().tp_rank == 0:
             from sglang.srt.utils.rpd_utils import rpd_to_chrome_trace
 
             rpd_to_chrome_trace("trace.rpd", self.rpd_profile_path)
 
 
-def build_step_span_name(forward_batch: ForwardBatch) -> str:
-    """Build a profile-trace span name for one forward step."""
+def build_step_span_name(
+    forward_batch: ForwardBatch,
+    detailed_annotations: bool | None = None,
+    *,
+    is_draft_worker: bool = False,
+) -> str:
+    """Build the profile-trace span name for one forward step.
+
+    Detailed annotations are folded into the label (via
+    build_detailed_annotation_suffix) when enabled. detailed_annotations
+    defaults to the process-wide toggle (detailed_annotations_enabled, set
+    by the profiler manager); pass an explicit bool to override (e.g. in tests).
+
+    The target-verify step is labeled ``VERIFY``; every step a draft model
+    runner emits is labeled ``DRAFT`` (some draft paths borrow the TARGET_VERIFY
+    mode, so the mode name alone cannot tell the two models apart).
+    """
+    if detailed_annotations is None:
+        detailed_annotations = detailed_annotations_enabled()
+
     mode = forward_batch.forward_mode
     bs = forward_batch.batch_size
+    if is_draft_worker:
+        stage = "DRAFT"
+    elif mode == ForwardMode.TARGET_VERIFY:
+        stage = "VERIFY"
+    else:
+        stage = mode.name
     if mode == ForwardMode.EXTEND:
         ext_toks = forward_batch.extend_num_tokens or 0
-        return f"step[EXTEND bs={bs} toks={ext_toks}]"
-    return f"step[{mode.name} bs={bs}]"
+        base = f"step[{stage} bs={bs} toks={ext_toks}"
+    else:
+        base = f"step[{stage} bs={bs}"
+
+    if detailed_annotations:
+        suffix = build_detailed_annotation_suffix(forward_batch)
+        if suffix:
+            base = f"{base} {suffix}"
+    return f"{base}]"

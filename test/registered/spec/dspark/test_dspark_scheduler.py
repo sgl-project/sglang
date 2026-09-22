@@ -4,6 +4,9 @@ import unittest
 
 import torch
 
+from sglang.kernels.ops.speculative.dspark.dspark_schedule import (
+    schedule_verify_lens_topk_from_survival,
+)
 from sglang.srt.speculative.dspark_components.dspark_planner import (
     DSparkScheduleConfig,
     HostConfidenceBudgetPlanner,
@@ -15,14 +18,11 @@ from sglang.srt.speculative.dspark_components.dspark_sps import (
     SpsAdditiveCostTable,
     SpsCostTable,
 )
-from sglang.srt.speculative.dspark_components.kernels.dspark_schedule import (
-    schedule_verify_lens_topk_from_survival,
-)
 from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=15, suite="base-a-test-cpu")
+register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
 
 def _flat_table(
@@ -291,7 +291,6 @@ class TestScheduleVerifyLensTopk(CustomTestCase):
 
 
 class TestVerifyLenAnchorContract(CustomTestCase):
-
     @_for_each_impl
     def test_explicit_zero_min_still_clamped_to_anchor(self, impl):
         survival = _survival_from_confidence(
