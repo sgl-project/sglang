@@ -570,7 +570,6 @@ class AnthropicServing:
             "bootstrap_host": anthropic_request.bootstrap_host,
             "bootstrap_port": anthropic_request.bootstrap_port,
             "bootstrap_room": anthropic_request.bootstrap_room,
-            "data_parallel_rank": anthropic_request.data_parallel_rank,
             "routed_dp_rank": anthropic_request.routed_dp_rank,
             "disagg_prefill_dp_rank": anthropic_request.disagg_prefill_dp_rank,
         }

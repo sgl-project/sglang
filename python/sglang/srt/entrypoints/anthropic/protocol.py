@@ -382,7 +382,6 @@ class AnthropicMessagesRequest(BaseModel):
     bootstrap_host: Optional[Union[list[str], str]] = None
     bootstrap_port: Optional[Union[list[Optional[int]], int]] = None
     bootstrap_room: Optional[Union[list[int], int]] = None
-    data_parallel_rank: Optional[int] = None
     routed_dp_rank: Optional[int] = None
     disagg_prefill_dp_rank: Optional[int] = None
 
