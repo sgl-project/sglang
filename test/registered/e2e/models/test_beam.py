@@ -73,6 +73,32 @@ class TestBeamNative(CustomTestCase):
     def logprobs(self, engine, token_ids, count):
         return engine_token_logprobs(engine, token_ids, count, self.config.vocab_size)
 
+    def test_cpu_offload_matches_oracle(self):
+        """Offloaded layers must load their weights before running the model."""
+        engine = sgl.Engine(
+            model_path=self.checkpoint.name,
+            skip_tokenizer_init=True,
+            dtype="bfloat16",
+            tp_size=1,
+            attention_backend="trtllm_mha",
+            page_size=64,
+            cpu_offload_gb=1,
+            disable_cuda_graph=True,
+            disable_radix_cache=True,
+            chunked_prefill_size=-1,
+            max_total_tokens=4096,
+            mem_fraction_static=0.2,
+        )
+        try:
+            prompt = [1, 18, 35, 52, 69, 86]
+            generated, actual = self.logprobs(engine, prompt, 4)
+            self.assertEqual(len(generated), 4)
+            logits = eager_beam_logits(self.config, self.state, prompt + generated[:-1])
+            expected = logits[len(prompt) - 1 :].log_softmax(-1)
+            assert_logprobs_close(self, actual, expected, tag="CPU offload")
+        finally:
+            engine.shutdown()
+
     def test_prefill_cached_decode_and_parallel_layouts(self):
         tp1_results = {}
         for layout, parallel in PARALLEL_LAYOUTS:

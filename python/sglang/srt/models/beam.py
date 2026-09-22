@@ -19,6 +19,7 @@ from typing import Iterable, Optional, Tuple
 import torch
 from torch import nn
 
+from sglang.kernels.ops.elementwise import beam_fused
 from sglang.srt.configs.beam import BeamConfig
 from sglang.srt.distributed import (
     moe_expert_parallel_all_reduce,
@@ -42,7 +43,6 @@ from sglang.srt.layers.moe import (
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.topk import TopK, TopKOutputFormat
-from sglang.kernels.ops.elementwise import beam_fused
 from sglang.srt.layers.moe.utils import RoutingMethodType
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.modelopt_quant import ModelOptFp4Config
@@ -75,7 +75,8 @@ def use_fused_beam_kernels(x: torch.Tensor) -> bool:
     return (
         x.is_cuda
         and x.dtype in (torch.bfloat16, torch.float16)
-        and os.environ.get("SGLANG_BEAM_DISABLE_FUSED", "0").lower() not in ("1", "true")
+        and os.environ.get("SGLANG_BEAM_DISABLE_FUSED", "0").lower()
+        not in ("1", "true")
     )
 
 
@@ -237,6 +238,11 @@ class BeamMoE(nn.Module):
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         if hidden_states.shape[0] > 0:
             router_logits, _ = self.gate(hidden_states.float())
+            if get_exec().offload.cpu_offload_gb > 0:
+                # Offloading replaces parameters, but TopKConfig keeps an alias.
+                self.topk.topk_config.correction_bias = (
+                    self.gate.e_score_correction_bias
+                )
             topk_output = self.topk(hidden_states, router_logits)
         else:
             topk_output = self.topk.empty_topk_output(
@@ -541,7 +547,13 @@ class BeamModel(nn.Module):
         else:
             hidden_states = pp_proxy_tensors["hidden_states"]
         aux_hidden_states = []
-        if use_fused_beam_kernels(hidden_states):
+        # Offload wrappers load weights through each layer's regular forward.
+        # Fusing across layer boundaries would bypass those wrappers.
+        if (
+            use_fused_beam_kernels(hidden_states)
+            and get_exec().offload.cpu_offload_gb <= 0
+            and get_exec().offload.offload_group_size <= 0
+        ):
             return self._forward_fused(
                 positions, hidden_states, forward_batch, aux_hidden_states
             )

@@ -24,8 +24,9 @@ element-wise ops). `fused_sandwich_residual_rmsnorm` does it in one launch and
 reproduces the eager rounding boundaries: the sandwich norm rounds to the
 activation dtype before the combine, each scaled operand rounds before the add
 (or, with `combine_in_fp32`, the fp32 sum rounds once), and the combined stream
-is stored in the activation dtype. Only the RMS reduction order differs from the
-standalone norm kernel.
+is stored in the activation dtype. RMS reduction order can differ from the
+standalone norm kernel. Residual cancellation can amplify those differences
+beyond one activation ULP; this is not a bitwise-equivalence guarantee.
 
 `fused_attention_gate` replaces the three element-wise ops of
 `sigmoid(gate + bias) * attention_output`, keeping the bf16 rounding of the
@@ -39,6 +40,7 @@ from typing import Optional, Tuple
 import torch
 import triton
 import triton.language as tl
+from triton.language.extra import libdevice
 
 
 @triton.jit
@@ -65,7 +67,9 @@ def _fused_sandwich_residual_rmsnorm_kernel(
     mask = offsets < hidden_dim
     act_dtype = x_ptr.dtype.element_ty
 
-    x = tl.load(x_ptr + row * x_stride_row + offsets, mask=mask, other=0.0).to(tl.float32)
+    x = tl.load(x_ptr + row * x_stride_row + offsets, mask=mask, other=0.0).to(
+        tl.float32
+    )
     if HAS_SANDWICH:
         w = tl.load(sandwich_weight_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
         rstd = tl.rsqrt(tl.sum(x * x, axis=0) / hidden_dim + eps)
@@ -78,6 +82,7 @@ def _fused_sandwich_residual_rmsnorm_kernel(
     # `depth_scaled_residual` casts the residual to the branch dtype first.
     residual = residual.to(act_dtype).to(tl.float32)
     if COMBINE_IN_FP32:
+        # The launch disables FMA so both products round before the FP32 sum.
         combined = (x * x_scale + residual * residual_scale).to(act_dtype)
     else:
         xs = (x * x_scale).to(act_dtype).to(tl.float32)
@@ -146,6 +151,7 @@ def fused_sandwich_residual_rmsnorm(
         HAS_OUT_NORM=out_weight is not None,
         COMBINE_IN_FP32=combine_in_fp32,
         num_warps=8,
+        enable_fp_fusion=False,
     )
     return out, combined
 
@@ -173,7 +179,12 @@ def _fused_attention_gate_kernel(
     b = tl.load(bias_ptr + head, mask=mask, other=0.0).to(tl.float32)
     # Eager: (gate + bias) rounds to bf16, sigmoid rounds to bf16, product rounds.
     g = (g + b).to(act_dtype).to(tl.float32)
-    m = tl.sigmoid(g).to(act_dtype).to(tl.float32)
+    if act_dtype == tl.float16:
+        # Approximate exp/div can cross an FP16 rounding boundary near zero.
+        m = tl.div_rn(1.0, 1.0 + libdevice.exp(-g))
+    else:
+        m = tl.sigmoid(g)
+    m = m.to(act_dtype).to(tl.float32)
     tl.store(out_ptr + off, (attn * m).to(act_dtype), mask=mask)
 
 
