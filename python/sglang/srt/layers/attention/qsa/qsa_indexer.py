@@ -519,13 +519,16 @@ class QSAIndexer(MultiPlatformOp):
             token_topk=self.token_topk,
         )
 
-    def forward_cuda(
+    def _forward_impl(
         self,
         hidden_states: torch.Tensor,
         positions: torch.Tensor,
         forward_batch,
         indexer_metadata,
     ) -> torch.Tensor:
+        """Portable orchestration shared by different platforms.
+        Fast paths are gated per platforms inside kernel calls.
+        """
         forward_mode = forward_batch.forward_mode
         is_target_verify = getattr(forward_mode, "is_target_verify", lambda: False)()
         is_draft_extend = getattr(forward_mode, "is_draft_extend_v2", lambda: False)()
@@ -628,6 +631,17 @@ class QSAIndexer(MultiPlatformOp):
             row_sequence_lengths,
         )
 
+    def forward_cuda(
+        self,
+        hidden_states: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch,
+        indexer_metadata,
+    ) -> torch.Tensor:
+        return self._forward_impl(
+            hidden_states, positions, forward_batch, indexer_metadata
+        )
+
     def forward_xpu(
         self,
         hidden_states: torch.Tensor,
@@ -635,10 +649,7 @@ class QSAIndexer(MultiPlatformOp):
         forward_batch,
         indexer_metadata,
     ) -> torch.Tensor:
-        # forward_cuda's fast paths are gated on `tensor.is_cuda`, which is
-        # False for XPU tensors, so it already falls back to the portable
-        # implementation. Reuse it instead of duplicating the orchestration.
-        return self.forward_cuda(
+        return self._forward_impl(
             hidden_states, positions, forward_batch, indexer_metadata
         )
 

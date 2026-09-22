@@ -28,16 +28,13 @@ class _ForwardMode:
 
 class _DispatchIndexer:
     """Mirrors test_qsa.py's _DispatchIndexer; used to prove forward_xpu
-    dispatches prefill/decode identically to forward_cuda, since forward_xpu
-    is implemented as a thin delegation (see qsa_indexer.py)."""
+    dispatches prefill/decode identically to QSAIndexer's behavior."""
 
     layer_id = 3
     index_n_heads = 4
     compress_ratio = 4
     _pending_ring_slots = QSAIndexer._pending_ring_slots
-    # forward_xpu (the code under test) delegates to forward_cuda; bind the
-    # real implementation so this mock indexer can be dispatched through it.
-    forward_cuda = QSAIndexer.forward_cuda
+    _forward_impl = QSAIndexer._forward_impl
 
     def __init__(self):
         self.selected = None
@@ -106,10 +103,7 @@ class _DispatchMetadata:
 
 
 class TestQSAIndexerForwardXpuDispatch(unittest.TestCase):
-    """forward_xpu must route prefill/decode identically to forward_cuda,
-    since it is implemented purely as a delegation to it (all of
-    forward_cuda's fast/fused sub-paths are internally gated on
-    ``tensor.is_cuda``, which XPU tensors report as False)."""
+    """forward_xpu must route prefill/decode identically to QSAIndexer"""
 
     def test_forward_xpu_dispatches_prefill_and_decode_mqa(self):
         indexer = _DispatchIndexer()
