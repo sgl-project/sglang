@@ -205,6 +205,7 @@ POSITIONAL_FIELD_ORDER = (
     "stat_loggers",
     "constrained_json_whitespace_pattern",
     "constrained_json_disable_any_whitespace",
+    "constrained_json_max_whitespace_cnt",
     "attention_backend",
     "decode_attention_backend",
     "enable_lean_attention",

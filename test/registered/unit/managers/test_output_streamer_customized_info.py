@@ -103,7 +103,6 @@ class TestOutputStreamerCustomizedInfo(unittest.TestCase):
         )
         serving_patch.start()
         observability_patch.start()
-        # The streamer asks the context which rank it is streaming from.
         enter_scope(self, published_topology(ranks={"dp_rank": 0}))
         self.addCleanup(serving_patch.stop)
         self.addCleanup(observability_patch.stop)
@@ -148,7 +147,6 @@ class TestOutputStreamerCustomizedInfo(unittest.TestCase):
         streamer = Streamer(
             send_to_detokenizer=SimpleNamespace(send_output=outputs.append),
             tree_cache=None,
-            ps=SimpleNamespace(dp_rank=0, attn_tp_rank=0),
             server_args=SimpleNamespace(
                 stream_interval=1,
                 enable_request_time_stats_logging=False,
@@ -181,7 +179,6 @@ class TestOutputStreamerCustomizedInfo(unittest.TestCase):
         streamer = Streamer(
             send_to_detokenizer=SimpleNamespace(send_output=outputs.append),
             tree_cache=None,
-            ps=SimpleNamespace(dp_rank=0, attn_tp_rank=0),
             server_args=SimpleNamespace(
                 stream_interval=1,
                 enable_request_time_stats_logging=False,
@@ -218,7 +215,6 @@ class TestOutputStreamerCustomizedInfo(unittest.TestCase):
         streamer = Streamer(
             send_to_detokenizer=SimpleNamespace(send_output=outputs.append),
             tree_cache=None,
-            ps=SimpleNamespace(dp_rank=0, attn_tp_rank=0),
             server_args=SimpleNamespace(
                 stream_interval=1,
                 enable_request_time_stats_logging=False,
@@ -258,7 +254,6 @@ class TestOutputStreamerCustomizedInfo(unittest.TestCase):
         streamer = Streamer(
             send_to_detokenizer=SimpleNamespace(send_output=outputs.append),
             tree_cache=None,
-            ps=SimpleNamespace(dp_rank=0, attn_tp_rank=0),
             server_args=SimpleNamespace(
                 stream_interval=1,
                 enable_request_time_stats_logging=False,
@@ -286,7 +281,6 @@ class TestOutputStreamerCustomizedInfo(unittest.TestCase):
         streamer = Streamer(
             send_to_detokenizer=SimpleNamespace(send_output=outputs.append),
             tree_cache=None,
-            ps=SimpleNamespace(dp_rank=0, attn_tp_rank=0),
             server_args=SimpleNamespace(),
             is_generation=True,
             spec_algorithm=SpeculativeAlgorithm.NONE,
@@ -312,7 +306,6 @@ class TestOutputStreamerCustomizedInfo(unittest.TestCase):
         streamer = Streamer(
             send_to_detokenizer=SimpleNamespace(send_output=outputs.append),
             tree_cache=None,
-            ps=SimpleNamespace(dp_rank=0, attn_tp_rank=0),
             server_args=SimpleNamespace(),
             is_generation=True,
             spec_algorithm=SpeculativeAlgorithm.NONE,
@@ -334,7 +327,6 @@ class TestOutputStreamerCustomizedInfo(unittest.TestCase):
             Streamer(
                 send_to_detokenizer=SimpleNamespace(),
                 tree_cache=None,
-                ps=SimpleNamespace(),
                 server_args=SimpleNamespace(),
                 is_generation=True,
                 spec_algorithm=SpeculativeAlgorithm.NONE,
