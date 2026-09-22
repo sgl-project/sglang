@@ -188,7 +188,6 @@ class TestUnifiedMemoryHiCacheTriPool(UnifiedMemoryHiCacheBase):
 
     # The test revision is the reduced checkpoint used by Inkling CI.
     model = "thinkingmachines/Inkling"
-    server_env = {"SGLANG_ENABLE_UNIFIED_RADIX_TREE": "1"}
     extra_args = _SMALL_POOL + [
         "--revision",
         "test",

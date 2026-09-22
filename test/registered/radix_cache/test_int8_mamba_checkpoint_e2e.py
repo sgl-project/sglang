@@ -112,7 +112,6 @@ class TestUnifiedRadixTreeInt8MambaCheckpointE2E(TestInt8MambaCheckpointE2E):
                 other_args=cls.other_args,
                 env={
                     "SGLANG_ENABLE_RANK_CONSENSUS_CHECKER": "1",
-                    "SGLANG_ENABLE_UNIFIED_RADIX_TREE": "1",
                 },
             )
 
