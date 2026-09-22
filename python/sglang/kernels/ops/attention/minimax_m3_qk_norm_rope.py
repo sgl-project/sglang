@@ -556,8 +556,7 @@ def _sparse_qk_index_gemma_rmsnorm_rope_cache_kernel(
     idx_cache_base = (
         idx_k_cache_ptr + loc * idx_k_cache_stride_s + cols * idx_k_cache_stride_d
     )
-    # Store in the index cache's own dtype (it may be fp8 under
-    # SGLANG_OPT_MINIMAX_M3_FP8_INDEX_CACHE); no-op cast when it matches q's.
+    # cast fp32 straight to the cache dtype (fp8 on gfx95) to avoid rounding twice via bf16
     tl.store(
         idx_cache_base,
         out.to(idx_k_cache_ptr.dtype.element_ty),

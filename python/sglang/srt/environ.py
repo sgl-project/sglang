@@ -1714,10 +1714,8 @@ class Envs:
     # 2 is the accuracy-safe default: higher values reuse staler selections
     # in the skip layers.
     SGLANG_MINIMAX_M3_INDEX_TOPK_FREQ = EnvInt(2)
-    # ROCm: allocate the lightning-indexer K cache in fp8_e4m3fn (widening
-    # mode: bf16 q x fp8 k in the score kernels, as in the SM100 fp8 attn-GEMM
-    # mode). Selection-only; main attention K/V stay in kv_cache_dtype. Set to
-    # false for a bf16 index cache.
+    # gfx95: lightning-indexer K cache in fp8_e4m3fn (bf16 q x fp8 k in the scorers);
+    # main attention K/V keep kv_cache_dtype.
     SGLANG_OPT_MINIMAX_M3_FP8_INDEX_CACHE = EnvBool(True)
     # MiniMax M3 NPU prefill MAIN-attention: route the sparse main attention through
     # the native Ascend FA op `torch.ops.npu.npu_fused_infer_attention_score` (FIA)

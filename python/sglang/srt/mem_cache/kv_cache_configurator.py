@@ -1837,8 +1837,7 @@ class KVCacheConfigurator:
         return token_to_kv_pool
 
     def minimax_sparse_index_dtype(self) -> torch.dtype:
-        """Lightning-indexer K-cache dtype. Also used by pool_configurator's
-        per-token cell-size estimate, which must match the constructed pool."""
+        # pool_configurator's per-token cell size reads this; it must match the built pool
         from sglang.srt.server_args import m3_fp8_attn_gemm_enabled
 
         # fp8 attn-GEMM mode opts the indexer cache into fp8 (fp8 indexer
