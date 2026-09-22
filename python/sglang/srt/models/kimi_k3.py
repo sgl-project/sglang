@@ -37,6 +37,10 @@ from sglang.srt.layers import (
 )
 from sglang.srt.layers.activation import SiluAndMul, SituAndMul
 from sglang.srt.layers.attn_residual import AttnResidual, aggregate_stream, get_cw
+from sglang.srt.layers.aux_hidden_states import (
+    AuxHiddenStateAccumulator,
+    AuxHiddenStatePacker,
+)
 from sglang.srt.layers.dcp.planner import prepare_decode_context_parallel_metadata
 from sglang.srt.layers.dp_attention import (
     dp_gather_replicate,
@@ -2962,7 +2966,16 @@ class KimiK3LinearModel(nn.Module):
             and k3_sp_collective.enabled()
         )
         sp_sharded = False
-        aux_hidden_states = []
+        # PP stages keep the list: inherited captures arrive pre-concatenated.
+        aux_hidden_states: AuxHiddenStateAccumulator = (
+            AuxHiddenStatePacker(
+                len(self.dspark_layers_to_capture),
+                out=forward_batch.aux_hidden_states_buffer,
+            )
+            if self.dspark_layers_to_capture is not None
+            and self.pp_group.world_size == 1
+            else []
+        )
         if (
             self.dspark_layers_to_capture is not None
             and not self.pp_group.is_first_rank
@@ -3054,6 +3067,8 @@ class KimiK3LinearModel(nn.Module):
                     hidden_states, _ = self.norm(hidden_states, residual)
 
         if self.dspark_layers_to_capture is not None:
+            if isinstance(aux_hidden_states, AuxHiddenStatePacker):
+                return hidden_states, aux_hidden_states.finalize()
             return hidden_states, aux_hidden_states
         return hidden_states
 
@@ -3141,6 +3156,10 @@ class KimiK3LinearForCausalLM(nn.Module):
         return self.config.hidden_size * sum(
             layer < self.model.start_layer - 1 for layer in layers
         )
+
+    def get_packed_aux_hidden_size(self) -> int:
+        layers = self.model.dspark_layers_to_capture or []
+        return len(layers) * self.config.hidden_size
 
     def set_dspark_layers_to_capture(self, layer_ids: list[int]) -> None:
         if layer_ids is None:
@@ -3612,6 +3631,11 @@ class KimiK3ForConditionalGeneration(nn.Module):
                 "DSPARK layer capture is not available in encoder-only mode"
             )
         self.language_model.set_dspark_layers_to_capture(layer_ids)
+
+    def get_packed_aux_hidden_size(self) -> int:
+        if self.language_model is None:
+            return 0
+        return self.language_model.get_packed_aux_hidden_size()
 
     def preprocess_mm_for_encoder(
         self,

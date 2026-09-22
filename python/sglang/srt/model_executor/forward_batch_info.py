@@ -659,6 +659,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
     # For logits and logprobs post processing
     next_token_logits_buffer: torch.Tensor = None
+    # Graph-runner-owned destination for AuxHiddenStatePacker; None when eager.
+    aux_hidden_states_buffer: Optional[torch.Tensor] = None
     temperature: torch.Tensor = None
     top_p: torch.Tensor = None
 
