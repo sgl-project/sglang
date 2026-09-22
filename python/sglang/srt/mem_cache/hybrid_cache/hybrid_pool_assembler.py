@@ -2099,8 +2099,8 @@ def _check_declared_pools_present(
     if isinstance(strategy, _DECLARATION_VERIFIED_STRATEGIES):
         raise ValueError(msg)
     # Pre-declaration strategies: restoring KV without these pools (e.g. the
-    # indexer's key buffers) corrupts
-    # sparse attention after a host hit. Loud until the path is migrated.
+    # indexer's key buffers) corrupts sparse attention after a host hit.
+    # Loud until the path is migrated.
     logger.error("%s; host restore of these pools is unsupported on this path", msg)
 
 
