@@ -113,9 +113,9 @@ class PageInterleaveKVPoolMixin:
         assert spec.shard_size == shard_group.world_size
         assert spec.shard_rank == shard_group.rank_in_group
         assert spec.page_size == self.page_size
-        # The prefix region must fit N * ceil(prefix_pages / N) pages for any
-        # prefix, i.e. be a multiple of the full-group span; the chunk region
-        # is per-page.
+        # The batch's prefix region is split into equal per-rank gather
+        # blocks, so it must be a multiple of the full-group span. The chunk
+        # region is per-page; admission checks both regions against this spec.
         assert spec.max_prefix_tokens % spec.logical_page_size == 0
         assert spec.chunk_tokens % spec.page_size == 0
 
@@ -133,7 +133,7 @@ class PageInterleaveKVPoolMixin:
         self.kv_gather_stream = self.device_module.Stream()
 
         # Scratch: [prefix | chunk | trash page], double-buffered.
-        scratch_rows = spec.max_prefix_tokens + spec.chunk_tokens + spec.page_size
+        scratch_rows = spec.scratch_rows
         self._chunk_base = spec.max_prefix_tokens
         self._trash_base = spec.max_prefix_tokens + spec.chunk_tokens
         with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
@@ -171,19 +171,51 @@ class PageInterleaveKVPoolMixin:
         self._write_plan: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
         self._translate_cache: Dict[Tuple[int, int], torch.Tensor] = {}
 
+        scratch_bytes = sum(
+            tensor.numel() * tensor.element_size()
+            for slot in self._slots
+            for tensor in slot.tensors.values()
+        )
         logger.info(
             "Page-interleave KV sharding enabled: shard_rank=%d shard_size=%d "
-            "page_size=%d scratch_rows=%d x2",
+            "page_size=%d prefix_tokens=%d chunk_tokens=%d scratch_rows=%d x2 "
+            "(%.2f MiB per rank, charged against the KV budget). "
+            "Batch admission is limited by this scratch capacity.",
             self.shard_rank,
             self.shard_size,
             spec.page_size,
+            spec.max_prefix_tokens,
+            spec.chunk_tokens,
             scratch_rows,
+            scratch_bytes / (1024 * 1024),
         )
 
     def set_kv_buffer_prefix_valid(self, *args, **kwargs):
         raise NotImplementedError(
             "prefix-valid commit is unsupported under logical-page KV sharding "
             "(it writes pool rows directly, bypassing the ownership filter)"
+        )
+
+    def register_layer_transfer_counter(self, layer_transfer_counter):
+        # `None` is the in-tree "disable" signal from the SWA/hybrid wrappers,
+        # so it has to stay a no-op.
+        if layer_transfer_counter is None:
+            super().register_layer_transfer_counter(None)
+            return
+        # Layer-wise KV load-back is unsupported here, and refusing it at
+        # registration is the only safe answer. The gather in `_prefetch_layer`
+        # reads pool rows directly (`_gather_pairs`), so it never passes
+        # through the base getters' `wait_until` hook -- and the first gather
+        # is kicked from `begin_shard_extend`, before any getter runs. Adding
+        # the wait would not make the combination work: the loader writes whole
+        # pool rows at LOGICAL indices with no ownership filter, while this
+        # pool's rows are local physical ones, so ordering the read would only
+        # turn a race into a silent wrong-row read. Same reason as
+        # `set_kv_buffer_prefix_valid` above.
+        raise NotImplementedError(
+            "layer-wise KV load-back (HiCache / external linker) is "
+            "unsupported under logical-page KV sharding (the gather reads "
+            "pool rows directly and the load-back writes them unfiltered)"
         )
 
     # ---- subclass hooks -------------------------------------------------------

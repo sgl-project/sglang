@@ -519,10 +519,10 @@ class Scheduler(
 
         bootstrap.init_parallel_runtime(
             server_args=server_args,
-            model_config=self.model_config,
             device=get_device().device,
             dist_port=self.nccl_port,
         )
+        bootstrap.init_layer_runtime(model_config=self.model_config)
 
         # Init metrics stats
         self.init_metrics_collector(tp_rank, pp_rank, dp_rank)
