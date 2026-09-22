@@ -1,14 +1,15 @@
 import contextlib
 import logging
 import time
-from dataclasses import replace
 from typing import List, Optional
 
 import torch
 
-from sglang.kernels.ops.speculative.topk1 import draft_topk1_postprocess
+from sglang.kernels.ops.speculative.topk1 import (
+    draft_topk1_argmax_only,
+    draft_topk1_postprocess,
+)
 from sglang.srt.configs.model_config import get_dsa_mtp_topk_width
-from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.graph_runner.eagle_draft_extend_npu_graph_runner import (
     EAGLEDraftExtendNpuGraphRunner,
@@ -160,7 +161,6 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         self,
         server_args: ServerArgs,
         gpu_id: int,
-        ps: ParallelState,
         nccl_port: int,
         target_worker: TpModelWorker,
     ):
@@ -169,7 +169,6 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         # copy args
         self.server_args = server_args
         self.gpu_id = gpu_id
-        self.ps = ps
         self.nccl_port = nccl_port
         self.target_worker = target_worker
 
@@ -186,12 +185,13 @@ class EagleDraftWorker(EagleDraftWorkerBase):
 
         self._rebuild_topk1_chain_buffers()
 
-        # Load draft model weights only.
-        if (
+        # Use the same attention topology during draft construction and execution.
+        self.draft_owns_attention = (
             get_parallel().enable_dp_attention
             and self.speculative_algorithm.is_eagle3()
-        ):
-            ctx = draft_tp_context(get_parallel().attn_tp_group)
+        )
+        if self.draft_owns_attention:
+            ctx = draft_tp_context(get_parallel().attn_tp_group, owns_attention=True)
         else:
             ctx = empty_context()
         with (
@@ -204,8 +204,6 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             self.draft_worker = TpModelWorker(
                 server_args=server_args,
                 gpu_id=gpu_id,
-                # spec workers don't support pipeline parallelism
-                ps=replace(ps, pp_rank=0, pp_size=1),
                 nccl_port=nccl_port,
                 is_draft_worker=True,
                 # The draft runs at absolute target positions.
@@ -261,7 +259,10 @@ class EagleDraftWorker(EagleDraftWorkerBase):
     def init_attention_backends(self):
         with (
             draft_pp_context(),
-            self.draft_tp_context(self.draft_runner.tp_group),
+            self.draft_tp_context(
+                self.draft_runner.tp_group,
+                owns_attention=self.draft_owns_attention,
+            ),
             speculative_moe_backend_context(),
             speculative_moe_a2a_backend_context(),
         ):
@@ -271,7 +272,10 @@ class EagleDraftWorker(EagleDraftWorkerBase):
     def init_cuda_graphs(self):
         with (
             draft_pp_context(),
-            self.draft_tp_context(self.draft_runner.tp_group),
+            self.draft_tp_context(
+                self.draft_runner.tp_group,
+                owns_attention=self.draft_owns_attention,
+            ),
             speculative_moe_backend_context(),
             speculative_moe_a2a_backend_context(),
         ):
@@ -797,8 +801,8 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                     )
                     draft_probs_list.append(probs)
                     forward_batch.positions.add_(1)
-                elif self.topk == 1 and not _is_hip:
-                    if _is_cuda:
+                elif self.topk == 1:
+                    if _is_cuda or _is_hip:
                         topk_p, topk_index = draft_topk1_postprocess(
                             logits_output.next_token_logits,
                             forward_batch.positions,
@@ -1148,6 +1152,11 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 batch.sampling_info.temperatures,
                 batch.sampling_info.top_ks,
             )
+        elif self.topk == 1 and _is_hip:
+            ret_topk_p, ret_topk_index = draft_topk1_argmax_only(
+                draft_logits_output.next_token_logits
+            )
+            ret_draft_probs = None
         elif self.topk == 1 and not _is_hip:
             # Gated to CUDA: see #26358 — ROCm's argmax tie-break corrupts
             # MTP draft selection on FP8 logits.
@@ -1188,7 +1197,6 @@ class EAGLEWorkerV2(BaseSpecWorker):
         self,
         server_args: ServerArgs,
         gpu_id: int,
-        ps: ParallelState,
         nccl_port: int,
         target_worker: TpModelWorker,
     ):
@@ -1199,7 +1207,6 @@ class EAGLEWorkerV2(BaseSpecWorker):
         self.topk = get_spec().speculative_eagle_topk
         self.speculative_num_steps = get_spec().speculative_num_steps
         self.speculative_num_draft_tokens = get_spec().speculative_num_draft_tokens
-        self.ps = ps
         self.gpu_id = gpu_id
         self.device = get_device().device
         self._target_worker = target_worker
@@ -1215,7 +1222,6 @@ class EAGLEWorkerV2(BaseSpecWorker):
             EagleDraftWorker(
                 server_args,
                 gpu_id,
-                ps,
                 nccl_port,
                 target_worker,
             )
@@ -1245,13 +1251,18 @@ class EAGLEWorkerV2(BaseSpecWorker):
     @property
     def last_shared_read_runner(self):
         # Per the base contract: the step's last shared-buffer-reading phase is
-        # draft_extend, which runs on the draft runner.
+        # draft_extend when this rank owns the draft. Non-last PP ranks execute
+        # only the target prefill.
+        if self._draft_worker is None:
+            return self._target_worker.model_runner
         return self._draft_worker.draft_runner
 
     @property
     def spec_v2_attn_backends(self) -> tuple:
         # Every attn backend a spec_v2 forward touches; consumed by
         # decide_needs_cpu_seq_lens to gate the seq_lens_cpu D2H.
+        if self._draft_worker is None:
+            return (self._target_worker.model_runner.attn_backend,)
         return (
             self._target_worker.model_runner.attn_backend,
             self._draft_worker.draft_attn_backend,
@@ -1265,7 +1276,8 @@ class EAGLEWorkerV2(BaseSpecWorker):
         if self.adaptive_controller is not None:
             with (
                 self._draft_worker.draft_tp_context(
-                    self._draft_worker.draft_runner.tp_group
+                    self._draft_worker.draft_runner.tp_group,
+                    owns_attention=self._draft_worker.draft_owns_attention,
                 ),
                 speculative_moe_backend_context(),
                 speculative_moe_a2a_backend_context(),
@@ -1325,7 +1337,8 @@ class EAGLEWorkerV2(BaseSpecWorker):
             # Draft prefill
             with (
                 self.draft_worker.draft_tp_context(
-                    self.draft_worker.draft_runner.tp_group
+                    self.draft_worker.draft_runner.tp_group,
+                    owns_attention=self.draft_worker.draft_owns_attention,
                 ),
                 speculative_moe_backend_context(),
                 speculative_moe_a2a_backend_context(),
@@ -1372,7 +1385,8 @@ class EAGLEWorkerV2(BaseSpecWorker):
             else:
                 with (
                     self.draft_worker.draft_tp_context(
-                        self.draft_worker.draft_runner.tp_group
+                        self.draft_worker.draft_runner.tp_group,
+                        owns_attention=self.draft_worker.draft_owns_attention,
                     ),
                     speculative_moe_backend_context(),
                     speculative_moe_a2a_backend_context(),
@@ -1397,7 +1411,8 @@ class EAGLEWorkerV2(BaseSpecWorker):
             else:
                 with (
                     self.draft_worker.draft_tp_context(
-                        self.draft_worker.draft_runner.tp_group
+                        self.draft_worker.draft_runner.tp_group,
+                        owns_attention=self.draft_worker.draft_owns_attention,
                     ),
                     speculative_moe_backend_context(),
                     speculative_moe_a2a_backend_context(),
@@ -1429,7 +1444,8 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 batch.seq_lens_sum = int(batch.seq_lens_cpu.sum())
                 with (
                     self.draft_worker.draft_tp_context(
-                        self.draft_worker.draft_runner.tp_group
+                        self.draft_worker.draft_runner.tp_group,
+                        owns_attention=self.draft_worker.draft_owns_attention,
                     ),
                     speculative_moe_backend_context(),
                     speculative_moe_a2a_backend_context(),
@@ -1763,7 +1779,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
     def update_weights_from_tensor(self, recv_req: UpdateWeightsFromTensorReqInput):
         monkey_patch_torch_reductions()
         named_tensors = MultiprocessingSerializer.deserialize(
-            recv_req.serialized_named_tensors[self.ps.tp_rank]
+            recv_req.serialized_named_tensors[self.model_runner.tp_rank]
         )
         success, message = (
             self.draft_worker.draft_runner.weight_updater.update_weights_from_tensor(

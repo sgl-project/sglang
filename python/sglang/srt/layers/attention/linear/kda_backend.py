@@ -1583,6 +1583,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
             onorm_eps = None
             onorm_gate = None
 
+        a = a.reshape(1, seq_len, h, layer.head_k_dim)
         out = fused_kda_decode_mtp_dspark(
             x_q=x_q,
             x_k=x_k,
