@@ -22,9 +22,14 @@ class UsageProcessor:
         image_tokens: int = 0,
         audio_tokens: int = 0,
         video_tokens: int = 0,
+        completion_tokens_override: Optional[int] = None,
     ) -> UsageInfo:
-        completion_tokens = sum(
-            r["meta_info"].get("completion_tokens", 0) for r in responses
+        # Output padding reports the padded total here; total_tokens is derived
+        # downstream, so overriding at the source keeps the two consistent.
+        completion_tokens = (
+            completion_tokens_override
+            if completion_tokens_override is not None
+            else sum(r["meta_info"].get("completion_tokens", 0) for r in responses)
         )
         prompt_tokens = sum(
             responses[i]["meta_info"].get("prompt_tokens", 0)

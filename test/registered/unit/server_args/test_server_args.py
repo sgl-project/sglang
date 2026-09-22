@@ -73,6 +73,8 @@ from sglang.srt.arg_groups.serving_hook import (
 )
 from sglang.srt.arg_groups.speculative_hook import handle_speculative_decoding
 from sglang.srt.arg_groups.validation_hook import (
+    _MAX_PADDED_OUTPUT_TOKENS,
+    _validate_output_padding_config,
     check_pipeline_parallel_compat,
     check_two_batch_overlap,
 )
@@ -4068,6 +4070,30 @@ class TestLazyReexports(CustomTestCase):
     def test_an_unknown_attribute_still_raises(self):
         with self.assertRaises(AttributeError):
             server_args_module.NotAThing
+
+
+class TestPaddedOutputTokens(CustomTestCase):
+    """``--padded-output-tokens`` range check. A target accepted outside the
+    usable range would leave the operator believing the output-length side
+    channel is closed when it is not."""
+
+    def _validate(self, target):
+        args = ServerArgs(model_path="dummy")
+        args.padded_output_tokens = target
+        _validate_output_padding_config(args)
+
+    def test_unset_is_accepted(self):
+        self._validate(None)
+
+    def test_range_boundaries_are_accepted(self):
+        self._validate(1)
+        self._validate(_MAX_PADDED_OUTPUT_TOKENS)
+
+    def test_out_of_range_is_rejected(self):
+        for target in (0, -1, _MAX_PADDED_OUTPUT_TOKENS + 1):
+            with self.assertRaises(ValueError) as context:
+                self._validate(target)
+            self.assertIn("padded-output-tokens", str(context.exception))
 
 
 if __name__ == "__main__":
