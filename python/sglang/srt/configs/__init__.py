@@ -1,5 +1,6 @@
 from sglang.srt.configs.afmoe import AfmoeConfig
-from sglang.srt.configs.bailing_hybrid import BailingHybridConfig
+from sglang.srt.configs.bailing_hybrid import BailingHybridConfig, BailingMoeV3VLConfig
+from sglang.srt.configs.bailing_moe_v2 import BailingMM2Config
 from sglang.srt.configs.chatglm import ChatGLMConfig
 from sglang.srt.configs.cohere2_moe import Cohere2MoeConfig
 from sglang.srt.configs.cosmos3 import (
@@ -16,6 +17,7 @@ from sglang.srt.configs.dots_ocr import DotsOCRConfig
 from sglang.srt.configs.dots_vlm import DotsVLMConfig
 from sglang.srt.configs.exaone import ExaoneConfig
 from sglang.srt.configs.falcon_h1 import FalconH1Config
+from sglang.srt.configs.gigachat35 import GigaChat35Config
 from sglang.srt.configs.glm5_next import Glm5NextConfig, Glm5NextTextConfig
 from sglang.srt.configs.granitemoehybrid import GraniteMoeHybridConfig
 from sglang.srt.configs.hy_v4 import HYV4Config
@@ -86,6 +88,8 @@ from sglang.srt.configs.zaya import ZayaConfig
 __all__ = [
     "AfmoeConfig",
     "BailingHybridConfig",
+    "BailingMM2Config",
+    "BailingMoeV3VLConfig",
     "ExaoneConfig",
     "ChatGLMConfig",
     "Cosmos3Config",
@@ -129,6 +133,7 @@ __all__ = [
     "Dots3Config",
     "FalconH1Config",
     "FalconMambaConfig",
+    "GigaChat35Config",
     "GraniteMoeHybridConfig",
     "HYV4Config",
     "MambaConfig",

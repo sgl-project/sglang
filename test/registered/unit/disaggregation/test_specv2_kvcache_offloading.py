@@ -55,7 +55,7 @@ def _make_mock_req(
         kv_allocated_len=kv_allocated_len,
     )
     req.prefix_indices = list(range(prefix_indices_len))
-    req.effective_kv_committed_len = lambda: req.kv.kv_committed_len
+    req.owned_kv_len = lambda: req.kv.kv_committed_len
     return req
 
 
@@ -138,8 +138,9 @@ class TestReleaseFinishedReq(unittest.TestCase):
         ]:
             with self.subTest(extra_key=extra_key, cache_salt=cache_salt):
                 namespace = dict(extra_key=extra_key, cache_salt=cache_salt)
-                prefix = manager._compute_prefix_hash(tokens[:4], **namespace)
-                tail = manager._compute_prefix_hash(tokens[4:], prefix[-1], **namespace)
+                req = SimpleNamespace(**namespace)
+                prefix = manager._compute_prefix_hash(req, tokens[:4])
+                tail = manager._compute_prefix_hash(req, tokens[4:], prefix[-1])
                 self.assertEqual(
                     prefix + tail,
                     get_storage_hash_str(RadixKey(tokens, **namespace), page_size=2),

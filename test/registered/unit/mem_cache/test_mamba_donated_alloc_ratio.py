@@ -20,8 +20,8 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     EvictParams,
     IncLockRefResult,
 )
-from sglang.srt.mem_cache.unified_cache.components.mamba_component import MambaComponent
-from sglang.srt.mem_cache.unified_cache.components.tree_component import ComponentType
+from sglang.srt.mem_cache.unified_cache.components.base import ComponentType
+from sglang.srt.mem_cache.unified_cache.components.mamba import MambaComponent
 from sglang.srt.mem_cache.unified_cache.unified_tree_core import UnifiedTreeCore
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedTreeNode
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -297,7 +297,8 @@ class TestPPMambaPoolSizing(unittest.TestCase):
             server_args=SimpleNamespace(),
             spec_algorithm=SimpleNamespace(is_none=lambda: True),
             layer_info=SimpleNamespace(start_layer=start, end_layer=end),
-            ps=SimpleNamespace(attn_dp_size=1, pp_size=pp_size),
+            attn_dp_size=1,
+            pp_size=pp_size,
             hybrid_gdn_config=None,
             model_config=SimpleNamespace(
                 hf_config=SimpleNamespace(), num_hidden_layers=cls.TOTAL_LAYERS
