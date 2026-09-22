@@ -398,7 +398,7 @@ class TestMarkovCandidateCuda(CustomTestCase):
 
     def test_rank_tiles_and_main_candidate_budget(self):
         # Rank tails beyond the first BLOCK_R, and the requested K32/M128
-        # specialization. Full static coverage avoids ambiguous ranking ties.
+        # specialization. M=0 forces online rank reduction for every candidate.
         generator = torch.Generator(device="cuda").manual_seed(5811)
         for rank in (33, 65, 1024):
             for dtype in (torch.float32, torch.float16, torch.bfloat16):
@@ -417,14 +417,14 @@ class TestMarkovCandidateCuda(CustomTestCase):
                 # Use the small vocabulary for exact scalar oracle coverage
                 # through rank=1024; the production case tests K32/M128 below.
                 base = torch.arange(7, device="cuda", dtype=dtype).reshape(1, 1, 7) / 8
-                sampler = self._sampler(base, w1[:7], w2[:7], list(range(7)), 3, 7)
+                sampler = self._sampler(base, w1[:7], w2[:7], list(range(7)), 3, 0)
                 anchor = torch.tensor([3], device="cuda")
                 temp = torch.tensor([0.75], device="cuda")
                 greedy = torch.tensor([True], device="cuda")
                 result = sampler.sample(base, anchor, temp, greedy)
                 inputs = dict(anchor=anchor, temperatures=temp, greedy_mask=greedy)
                 _assert_chain(
-                    self, result, base, w1[:7], w2[:7], list(range(7)), inputs, 3, 7, 1
+                    self, result, base, w1[:7], w2[:7], list(range(7)), inputs, 3, 0, 1
                 )
         # The serving configuration is exercised with non-tied FP32 bases and
         # independent raw-weight reference, not kernel realized scores.
@@ -570,7 +570,10 @@ class TestMarkovCandidateCuda(CustomTestCase):
             )
 
     def test_actual_rejection_distribution_and_wrong_q_negative_control(self):
-        from sglang.kernels.ops.speculative.dspark.dspark_accept import SoftmaxTemp
+        from sglang.kernels.ops.speculative.dspark.dspark_accept import (
+            SoftmaxTemp,
+            softmax_temp_stats_triton,
+        )
         from sglang.kernels.ops.speculative.reject_sampling import (
             chain_speculative_sampling_triton,
         )
@@ -627,14 +630,27 @@ class TestMarkovCandidateCuda(CustomTestCase):
                 temperatures=temperatures,
                 rows_per_request=gamma,
             ).reshape(batch, gamma, vocab)
+            stats = softmax_temp_stats_triton(
+                logits=result.corrected_logits.reshape(batch * gamma, vocab),
+                temperatures=temperatures,
+                rows_per_request=gamma,
+            ).reshape(batch, gamma, 2)
             coin = torch.rand(batch, gamma, device="cuda", generator=generators[1])
             final_coin = torch.rand(batch, device="cuda", generator=generators[2])
             for wrong, tally in ((False, counts), (True, wrong_counts)):
                 # Corrupt q by duplicating token 0's probability and normalizing.
-                supplied = probs.clone()
                 if wrong:
+                    supplied = probs.clone()
                     supplied[:, :, 0] *= 2
                     supplied /= supplied.sum(-1, keepdim=True)
+                    proposal_kwargs = {}
+                else:
+                    supplied = None
+                    proposal_kwargs = dict(
+                        draft_logits=result.corrected_logits,
+                        draft_softmax_stats=stats,
+                        draft_temperatures=temperatures,
+                    )
                 predicts = torch.empty(
                     batch * (gamma + 1), device="cuda", dtype=torch.int32
                 )
@@ -655,6 +671,7 @@ class TestMarkovCandidateCuda(CustomTestCase):
                     1.0,
                     1.0,
                     True,
+                    **proposal_kwargs,
                 )
                 out = predicts.reshape(batch, gamma + 1).cpu().tolist()
                 for row, length in zip(out, accepted.cpu().tolist()):
@@ -662,6 +679,94 @@ class TestMarkovCandidateCuda(CustomTestCase):
         _assert_frequencies(self, counts, expected, total)
         with self.assertRaises(AssertionError):
             _assert_frequencies(self, wrong_counts, expected, total)
+
+    def test_on_demand_probabilities_match_dense_rejection(self):
+        from sglang.kernels.ops.speculative.dspark.dspark_accept import (
+            softmax_temp_stats_triton,
+        )
+        from sglang.kernels.ops.speculative.reject_sampling import (
+            chain_speculative_sampling_triton,
+        )
+
+        batch, gamma, vocab = 3, 2, 12295
+        temperatures = torch.tensor([0.5, 1.0, 2.0], device="cuda")
+        logits = torch.full((batch, gamma, vocab), -torch.inf, device="cuda")
+        support = torch.tensor([1, 4097, vocab - 1], device="cuda")
+        # Sparse rows span multiple vocabulary blocks, with empty blocks and a
+        # tail. Large offsets catch cancellation from storing only logsumexp.
+        offsets = torch.tensor([0.0, 4096.0, 1048576.0], device="cuda")
+        logits[:, :, support] = (
+            offsets[:, None, None]
+            + torch.tensor([0.0, -0.5, -1.0], device="cuda")[None, None, :]
+        )
+        scaled = logits.double() / temperatures[:, None, None].double()
+        probs = scaled.softmax(-1).float()
+        stats = softmax_temp_stats_triton(
+            logits=logits.flatten(0, 1),
+            temperatures=temperatures[:, None],
+            rows_per_request=gamma,
+        ).reshape(batch, gamma, 2)
+        actual_probs = (scaled - stats[:, :, 0, None].double()).exp() * stats[
+            :, :, 1, None
+        ].double()
+        torch.testing.assert_close(actual_probs.float(), probs, rtol=2e-5, atol=1e-7)
+
+        # Every proposed token has acceptance probability 1/2. On rejection,
+        # all residual mass is at an unsupported token in the vocabulary tail.
+        bonus_token = vocab - 2
+        target = torch.zeros(batch, gamma + 1, vocab, device="cuda")
+        target[:, :gamma] = probs * 0.5
+        target[:, :gamma, bonus_token] = 0.5
+        target[:, gamma, bonus_token] = 1.0
+        candidates = torch.tensor(
+            [[0, 1, vocab - 1]] * batch,
+            device="cuda",
+            dtype=torch.int64,
+        )
+        indices = torch.arange(
+            batch * (gamma + 1), device="cuda", dtype=torch.int32
+        ).reshape(batch, gamma + 1)
+        coin = torch.tensor([[0.1, 0.2], [0.8, 0.1], [0.1, 0.8]], device="cuda")
+        final_coin = torch.tensor([0.2, 0.5, 0.8], device="cuda")
+        outputs = []
+        for on_demand in (False, True):
+            predicts = torch.full_like(indices, -1).flatten()
+            accept_index = torch.full_like(indices, -1)
+            num_correct_drafts = torch.empty(batch, device="cuda", dtype=torch.int32)
+            proposal_kwargs = (
+                dict(
+                    draft_logits=logits,
+                    draft_softmax_stats=stats,
+                    draft_temperatures=temperatures,
+                )
+                if on_demand
+                else {}
+            )
+            chain_speculative_sampling_triton(
+                predicts,
+                accept_index,
+                num_correct_drafts,
+                candidates,
+                indices,
+                indices,
+                indices,
+                coin,
+                final_coin,
+                target,
+                None if on_demand else probs,
+                1.0,
+                1.0,
+                True,
+                **proposal_kwargs,
+            )
+            outputs.append((predicts, accept_index, num_correct_drafts))
+        for actual, expected in zip(outputs[1], outputs[0]):
+            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        self.assertEqual(outputs[1][2].cpu().tolist(), [2, 0, 1])
+        self.assertEqual(
+            outputs[1][0].reshape(batch, gamma + 1).cpu().tolist(),
+            [[1, vocab - 1, bonus_token], [bonus_token, -1, -1], [1, bonus_token, -1]],
+        )
 
 
 if __name__ == "__main__":

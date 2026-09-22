@@ -266,8 +266,8 @@ def _candidate_walk(
                 bvalid = (kb < K) & ~duplicate
             else:
                 bvalid = kb < K
-            # Critically, online W2 loads and multiplies are [BLOCK_BASE_K,32],
-            # independent of M and any padded final candidate union size.
+            # Online W2 tiles are [BLOCK_BASE_K, BLOCK_R];
+            # their candidate dimension is independent of M.
             bias = tl.full((BLOCK_BASE_K,), 0, tl.float32)
             for rank_start in range(tl.cdiv(R, BLOCK_R)):
                 ro = rank_start * BLOCK_R + tl.arange(0, BLOCK_R)
@@ -420,7 +420,7 @@ class MarkovCandidateSampler:
                     probe = torch.zeros(
                         (1, w2.shape[0]), dtype=self.logits_dtype, device=w1.device
                     )
-                    top_k(probe, topk, sorted=True, deterministic=True)
+                    top_k(probe, topk, sorted=False, deterministic=True)
                     self._flashinfer_top_k = top_k
                     del probe
                 except (RuntimeError, TypeError, NotImplementedError) as exc:
@@ -628,12 +628,12 @@ class MarkovCandidateSampler:
             # padded/cropped LM-head output and belongs in wrapper benchmarks.
             flat = base_logits.reshape(-1, base_logits.shape[-1]).contiguous()
             values, ids = self._flashinfer_top_k(
-                flat, self.topk, sorted=True, deterministic=True
+                flat, self.topk, sorted=False, deterministic=True
             )
             return values.reshape(*base_logits.shape[:2], self.topk), ids.reshape(
                 *base_logits.shape[:2], self.topk
             )
-        return torch.topk(base_logits, self.topk, dim=-1)
+        return torch.topk(base_logits, self.topk, dim=-1, sorted=False)
 
     def sample(
         self,
@@ -760,7 +760,7 @@ class MarkovCandidateSampler:
             HAS_D2T=self.d2t_offset is not None,
             BLOCK_BASE_K=triton.next_power_of_2(self.topk),
             BLOCK_M=triton.next_power_of_2(max(1, self.bias_topk)),
-            BLOCK_R=32,
+            BLOCK_R=min(triton.next_power_of_2(self.w1.shape[1]), 64),
             num_warps=4,
             enable_fp_fusion=False,
         )

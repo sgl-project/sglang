@@ -182,6 +182,125 @@ class TestDsparkCandidateFallback(CustomTestCase):
     torch.cuda.is_available(), "requires NVIDIA CUDA runtime graph validation"
 )
 class TestDsparkCandidateRuntimeCuda(CustomTestCase):
+    def test_verifier_matches_dense_probabilities_and_replays_updated_logits(self):
+        from sglang.kernels.ops.speculative.dspark.dspark_accept import (
+            AcceptGreedy,
+            AcceptSampling,
+        )
+        from sglang.srt.speculative.dspark_components.dspark_draft import (
+            DraftBlockResult,
+        )
+        from sglang.srt.speculative.dspark_components.dspark_verify import (
+            accept_draft_tokens,
+        )
+
+        batch, gamma, vocab = 2, 2, 7
+        candidates = torch.tensor([[0, 1, 3]] * batch, device="cuda")
+        logits = torch.full((batch, gamma, vocab), -torch.inf, device="cuda")
+        logits[:, :, [1, 3]] = torch.tensor(
+            [[[4.0, 0.0], [0.0, 4.0]], [[0.0, 4.0], [0.0, 4.0]]], device="cuda"
+        )
+        temperatures = torch.tensor([1.0, 2.0], device="cuda")
+        greedy_mask = torch.zeros(batch, dtype=torch.bool, device="cuda")
+        block = DraftBlockResult(candidates[:, 1:], logits, greedy_mask, temperatures)
+        info = SimpleNamespace(
+            temperatures=torch.tensor([[1.0], [0.75]], device="cuda"),
+            is_all_greedy=False,
+            is_any_greedy=False,
+            need_top_k_sampling=False,
+            need_top_p_sampling=False,
+        )
+        probs = (logits / temperatures[:, None, None]).softmax(-1)
+        torch.cuda.manual_seed(517)
+        coin = torch.rand(batch, gamma, device="cuda")[1, 0]
+        wrong_q = (logits[1, 0] / info.temperatures[1, 0]).softmax(-1)[1]
+        target_probs = torch.zeros(batch, gamma + 1, vocab, device="cuda")
+        target_probs[0, :gamma] = probs[0]
+        # This fixed coin rejects under the actual proposal temperature but
+        # accepts if the verifier accidentally uses the target temperature.
+        target_probs[1, 0, 1] = coin * (probs[1, 0, 1] + wrong_q) / 2
+        target_probs[1, 0, 6] = 1 - target_probs[1, 0, 1]
+        target_probs[1, 1, 6] = 1
+        target_probs[:, gamma, 6] = 1
+        target_logits = (target_probs.log() * info.temperatures[:, None]).reshape(
+            -1, vocab
+        )
+        common = dict(
+            candidates=candidates,
+            target_logits=target_logits,
+            sampling_info=info,
+            draft_input=None,
+            gamma=gamma,
+            verify_num_draft_tokens=gamma + 1,
+        )
+        cutoff = None
+
+        def run():
+            return accept_draft_tokens(
+                **common, draft_block=block, cutoff_layout=cutoff
+            )
+
+        def dense_reference():
+            q = (logits / temperatures[:, None, None]).softmax(-1)
+            verify_lens = None if cutoff is None else cutoff.verify_lens
+            torch.cuda.manual_seed(517)
+            sampling = AcceptSampling.execute(
+                **common, draft_probs=q, cutoff_verify_lens=verify_lens
+            )
+            if info.is_any_greedy:
+                greedy = AcceptGreedy.execute(
+                    candidates=candidates,
+                    target_logits=target_logits,
+                    verify_num_draft_tokens=gamma + 1,
+                    cutoff_verify_lens=verify_lens,
+                )
+                sampling = tuple(
+                    torch.where(greedy_mask, g, s) for g, s in zip(greedy, sampling)
+                )
+            # The chain verifier reuses its output buffers on the next call.
+            return tuple(t.clone() for t in sampling)
+
+        for mixed in (False, True):
+            info.is_any_greedy = mixed
+            greedy_mask[0] = mixed
+            # Draft temperatures stay positive even when request temperature=0.
+            info.temperatures[0] = 0.0 if mixed else 1.0
+            for cutoff in (
+                None,
+                SimpleNamespace(
+                    verify_lens=torch.tensor([2, 3], dtype=torch.int32, device="cuda")
+                ),
+            ):
+                expected = dense_reference()
+                torch.cuda.manual_seed(517)
+                actual = run()
+                for a, e in zip(actual, expected):
+                    torch.testing.assert_close(a, e, rtol=0, atol=0)
+                self.assertEqual(actual[0].cpu().tolist(), [1 if cutoff else 2, 0])
+                self.assertEqual(actual[1].cpu().tolist(), [3 if cutoff else 6, 6])
+                self.assertEqual(actual[2].cpu().tolist(), [1 if cutoff else 0, 0])
+
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            for _ in range(3):
+                run()
+        torch.cuda.current_stream().wait_stream(stream)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            actual = run()
+        for update in (False, True):
+            if update:
+                target_logits[gamma + 1].fill_(-torch.inf)
+                target_logits[gamma + 1, 1] = 0.0
+                temperatures[1] = 0.75
+            expected = dense_reference()
+            torch.cuda.manual_seed(517)
+            graph.replay()
+            for a, e in zip(actual, expected):
+                torch.testing.assert_close(a, e, rtol=0, atol=0)
+            self.assertEqual(actual[0].cpu().tolist(), [1, int(update)])
+
     def test_real_wrapper_graph_stages_inputs_and_eager_cache_contract(self):
         for from_anchor in (True, False):
             for folded in (True, False):

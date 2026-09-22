@@ -6,9 +6,16 @@ readable FP16/BF16/FP32 weights, with K<=64, M<=128, rank<=1024 and gamma<=32.
 K=0 and unsupported configurations retain the existing dense proposal path.
 
 The proposal cache is still dense FP32 `[capacity, gamma, target_vocab_size]`;
-only its updates are sparse. The LM head and Top-K remain separate operations,
-and the candidate walk retains `enable_fp_fusion=False`. This change does not
-implement a CSR cache or a fused LM-head/Top-K kernel.
+only its updates are sparse. Top-K does not sort the selected candidates, and the
+walk uses rank tiles of `min(next_power_of_2(rank), 64)`. The LM head and Top-K
+remain separate operations, and the candidate walk retains `enable_fp_fusion=False`.
+
+CUDA verification stores each draft row's scaled maximum and inverse exponential
+sum instead of materializing `[batch, gamma, target_vocab_size]` draft probabilities.
+Acceptance reads only the proposed token's probability; on rejection, the existing
+CDF kernel computes draft probabilities for that row as it scans the residual.
+Normalization still reads the dense logits. Target probabilities and the NPU
+verification path retain their existing representation.
 
 ## Correctness
 
@@ -23,7 +30,8 @@ PYTHONPATH=python python -m pytest -q \
 ```
 
 The tests cover checkpoint configuration and vocabulary mappings, independent
-proposal oracles, actual GPU proposal/rejection distributions, cache reuse,
+proposal oracles, actual GPU proposal/rejection distributions, on-demand versus
+dense-probability rejection parity, cache reuse,
 weight refresh, and CUDA Graph input/RNG updates. Statistical failures must be
 investigated, not rerun until passing. CUDA skips do not establish correctness.
 
