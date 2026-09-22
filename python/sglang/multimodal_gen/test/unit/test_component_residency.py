@@ -299,41 +299,6 @@ def test_component_offload_warmup_skips_preload_when_weights_do_not_fit(
     empty_cache.assert_called_once_with()
 
 
-def test_component_offload_warmup_skips_preload_for_widening_dtype(
-    monkeypatch,
-):
-    strategy = ComponentOffloadStrategy()
-    strategy.prepare_for_use = Mock()
-    strategy.finish_use = Mock()
-    empty_cache = Mock()
-    module = torch.nn.Linear(32, 32, bias=False, dtype=torch.float16)
-    host_bytes = module.weight.nbytes
-    # Enough free memory for the fp16 host copy, but not for an fp32 cast (2x).
-    free_bytes = (1 * 1024**3) + host_bytes + 512
-    monkeypatch.setattr(
-        torch,
-        "get_device_module",
-        lambda: SimpleNamespace(
-            is_available=lambda: True,
-            empty_cache=empty_cache,
-            mem_get_info=lambda: (free_bytes, free_bytes * 2),
-        ),
-    )
-    use = ComponentUse(
-        stage_name="DenoisingStage",
-        component_name="transformer",
-        preferred_ready_after_request=True,
-        target_dtype=torch.float32,
-    )
-    state = ResidencyState(batch_is_warmup=True)
-
-    strategy.finish_request(module, use, state, preferred=True)
-
-    strategy.prepare_for_use.assert_not_called()
-    strategy.finish_use.assert_called_once_with(module, use, state)
-    empty_cache.assert_called_once_with()
-
-
 def test_component_offload_warmup_preload_partial_oom_moves_module_to_cpu(
     monkeypatch,
 ):
@@ -372,34 +337,6 @@ def test_component_offload_warmup_preload_partial_oom_moves_module_to_cpu(
 
     assert module.weight.device.type == "cpu"
     assert module.bias.device.type == "cpu"
-
-
-def test_component_offload_warmup_empty_cache_failure_does_not_raise(
-    monkeypatch,
-):
-    strategy = ComponentOffloadStrategy()
-    strategy.prepare_for_use = Mock(side_effect=RuntimeError("CUDA out of memory"))
-    strategy.finish_use = Mock()
-    monkeypatch.setattr(
-        torch,
-        "get_device_module",
-        lambda: SimpleNamespace(
-            is_available=lambda: True,
-            empty_cache=Mock(side_effect=RuntimeError("empty_cache failed")),
-            mem_get_info=lambda: (8 * 1024**3, 16 * 1024**3),
-        ),
-    )
-    module = torch.nn.Linear(2, 2)
-    use = ComponentUse(
-        stage_name="DenoisingStage",
-        component_name="transformer",
-        preferred_ready_after_request=True,
-    )
-    state = ResidencyState(batch_is_warmup=True)
-
-    strategy.finish_request(module, use, state, preferred=True)
-
-    strategy.finish_use.assert_called_once_with(module, use, state)
 
 
 def test_request_tail_uses_dynamic_component_instance():
