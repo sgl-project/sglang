@@ -1,4 +1,5 @@
 import sys
+from array import array
 from threading import Lock
 
 import pytest
@@ -12,6 +13,9 @@ from sglang.srt.constrained.xgrammar_backend import (
     XGrammarThinkingGrammar,
 )
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
+from sglang.srt.managers.schedule_batch import Req
+from sglang.srt.sampling.sampling_params import SamplingParams
+from sglang.srt.speculative.spec_utils import traverse_tree
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
@@ -167,6 +171,71 @@ def test_thinking_metadata_shared_without_sharing_generation_constraints(grammar
     for original, grammar, token in zip(originals, optimized, (ord("H"), ord("B"))):
         original.accept_token(token)
         assert_same_mask(original, grammar)
+
+
+@pytest.mark.parametrize(
+    "prefix, paths, phase",
+    [
+        ([], [[ord("<"), ord("x")], [ord("a")]], "thinking"),
+        ([], [[256, ord("H"), 259], [257, 259], [ord("a")]], "thinking"),
+        ([], [[0xE2, ord("A")], [0xE2, 0x82, 0xAC], [ord("a")]], "thinking"),
+        ([0xE2], [[ord("A")], [0x82, ord("A")], [0x82, 0xAC]], "fallback"),
+    ],
+    ids=["fallback-sibling", "atomic-boundary", "utf8-rejection", "committed-utf8"],
+)
+def test_speculative_tree_restores_thinking_state(grammars, prefix, paths, phase):
+    _, template, fast_template = grammars
+    original, optimized = template.copy(), fast_template.copy()
+    for token in prefix:
+        original.accept_token(token)
+        optimized.accept_token(token)
+
+    # The root represents the already committed token; traversal accepts its children.
+    tokens, children = [ord("a")], [[]]
+    for path in paths:
+        parent = 0
+        for token in path:
+            node = len(tokens)
+            tokens.append(token)
+            children.append([])
+            children[parent].append(node)
+            parent = node
+    next_child, next_sibling = [-1] * len(tokens), [-1] * len(tokens)
+    for node, nodes in enumerate(children):
+        if nodes:
+            next_child[node] = nodes[0]
+        for left, right in zip(nodes, nodes[1:]):
+            next_sibling[left] = right
+    tree = [torch.tensor(x) for x in (next_child, next_sibling, tokens)]
+    a = original.allocate_vocab_mask(original.vocab_size, len(tokens), "cpu")
+    b = a.clone()
+    traverse_tree(*tree, original, a, vocab_size=original.vocab_size)
+    traverse_tree(*tree, optimized, b, vocab_size=optimized.vocab_size)
+    assert torch.equal(a, b)
+    assert optimized.accepted_tokens == prefix
+    assert optimized.phase == phase
+    assert_same_mask(original, optimized)
+
+
+def test_committed_fallback_survives_request_retraction(grammars):
+    _, template, fast_template = grammars
+    req = Req("thinking-retraction", "", array("q", [1]), SamplingParams())
+    req.grammar = fast_template.copy()
+    req.output_ids.extend(b"<x")
+    original = template.copy()
+    for token in req.output_ids:
+        original.accept_token(token)
+        req.grammar.accept_token(token)
+    req.reset_for_retract()
+    assert req.is_retracted
+    assert list(req.output_ids) == list(b"<x")
+    assert req.grammar.accepted_tokens == list(b"<x")
+    assert req.grammar.phase == "fallback"
+    assert_same_mask(original, req.grammar)
+    req.grammar.accept_token(ord("a"))
+    req.grammar.rollback(1)
+    assert req.grammar.phase == "fallback"
+    assert_same_mask(original, req.grammar)
 
 
 if __name__ == "__main__":
