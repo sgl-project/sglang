@@ -75,6 +75,9 @@ def minimax_sparse_prefill(
     idx_v_scale: Optional[float] = None,
     cached_topk_idx: Optional[torch.Tensor] = None,
     return_topk_idx: bool = False,
+    msa_backend: Optional[str] = None,
+    msa_page_table: Optional[torch.Tensor] = None,
+    msa_graph_state: object | None = None,
 ):
     """Run MiniMax-M3 sparse prefill.
 
@@ -165,8 +168,16 @@ def minimax_sparse_prefill(
                 q_scale=q_scale,
                 k_scale=k_scale,
                 v_scale=v_scale,
+                backend=msa_backend,
+                page_table=msa_page_table,
+                graph_state=msa_graph_state,
+                seqlens_cpu=seqlens_cpu,
             )
         except MSAUnavailableError as err:
+            from .msa import msa_runtime_fallback_allowed
+
+            if not msa_runtime_fallback_allowed():
+                raise
             _warn_msa_fallback(err)
             o = flash_prefill_with_gqa_share_sparse(
                 q=q,
@@ -255,6 +266,9 @@ def minimax_sparse_decode(
     idx_v_scale: Optional[float] = None,
     cached_topk_idx: Optional[torch.Tensor] = None,
     topk_out: Optional[torch.Tensor] = None,
+    msa_backend: Optional[str] = None,
+    msa_page_table: Optional[torch.Tensor] = None,
+    msa_graph_state: object | None = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     # Index top-k sharing for DECODE. A group's source layer passes ``topk_out``
     # (a persistent buffer) and publishes its reduced top-k there; the group's
@@ -340,8 +354,15 @@ def minimax_sparse_decode(
                     q_scale=q_scale,
                     k_scale=k_scale,
                     v_scale=v_scale,
+                    backend=msa_backend,
+                    page_table=msa_page_table,
+                    graph_state=msa_graph_state,
                 )
             except MSAUnavailableError as err:
+                from .msa import msa_runtime_fallback_allowed
+
+                if not msa_runtime_fallback_allowed():
+                    raise
                 _warn_msa_fallback(err)
                 o = flash_decode_with_gqa_share_sparse(
                     q=q,
