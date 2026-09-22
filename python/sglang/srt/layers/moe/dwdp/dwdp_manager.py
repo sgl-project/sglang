@@ -12,13 +12,13 @@ from torch import nn
 from sglang.srt.layers.moe.dwdp.layout import (
     DwdpExpertLayout,
     build_layer_weight_specs,
-    lookup_owner,
 )
 from sglang.srt.layers.moe.dwdp.transport import DWDPTransport
-from sglang.srt.layers.moe.dwdp.weight_buffer import WeightBuffer
+from sglang.srt.layers.moe.dwdp.weight_buffer import WeightBuffer, fill_edge_experts
 from sglang.srt.layers.moe.dwdp.weight_manager import DWDPWeightManager
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.runtime_context import get_parallel
+from sglang.srt.utils.common import get_device_module
 
 if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
@@ -35,7 +35,7 @@ class DwdpManager:
     def __init__(self, server_args: ServerArgs):
         self.dwdp_size = get_parallel().dwdp_size
         self.dwdp_rank = get_parallel().tp_rank
-        self.device_id = torch.cuda.current_device()
+        self.device_id = get_device_module().current_device()
         self.layout: Optional[DwdpExpertLayout] = None
 
         self._weight_manager: Optional[DWDPWeightManager] = None
@@ -80,6 +80,7 @@ class DwdpManager:
         for li, experts in moe_layers:
             local_params[(li, "w13_weight")] = experts.w13_weight.data
             local_params[(li, "w2_weight")] = experts.w2_weight.data
+        self._validate_local_shard_rows(local_params, moe_layers)
         layer_weight_specs = build_layer_weight_specs(
             local_params, self.layout.num_routed_experts
         )
@@ -102,7 +103,13 @@ class DwdpManager:
             device_id=self.device_id,
         )
 
-        self._fill_edge_bytes(weight_buffer, transport.peer_views)
+        fill_edge_experts(
+            weight_buffer,
+            transport.peer_views,
+            local_start=self.layout.local_expert_start,
+            local_end=self.layout.local_expert_end,
+            peer_ranges=self.layout.peer_ranges,
+        )
 
         self._weight_manager = DWDPWeightManager(
             weight_buffer=weight_buffer,
@@ -143,6 +150,27 @@ class DwdpManager:
             self._weight_manager.release()
             self._weight_manager = None
 
+    def _validate_local_shard_rows(
+        self,
+        local_params: Dict[Tuple[int, str], torch.Tensor],
+        moe_layers: List[Tuple[int, FusedMoE]],
+    ) -> None:
+        # Composite VA offsets come from the routed count, so a shard with extra
+        # rows overruns its window; fused shared experts append exactly such a row.
+        expected_rows = self.layout.num_experts_per_worker
+        for (li, name), param in local_params.items():
+            if param.shape[0] != expected_rows:
+                shared = next(
+                    e.num_fused_shared_experts for idx, e in moe_layers if idx == li
+                )
+                raise RuntimeError(
+                    f"DWDP layer {li} {name} has dim0={param.shape[0]}, expected "
+                    f"{expected_rows} ({self.layout.num_routed_experts} routed "
+                    f"experts / dwdp_size {self.dwdp_size}). "
+                    f"num_fused_shared_experts={shared}; if non-zero, "
+                    f"rerun with --disable-shared-experts-fusion."
+                )
+
     @staticmethod
     def _collect_moe_layers(model: nn.Module) -> List[Tuple[int, FusedMoE]]:
         decoder = model.model if hasattr(model, "model") else model
@@ -155,47 +183,13 @@ class DwdpManager:
                 moe_layers.append((layer_idx, experts))
         return moe_layers
 
-    def _fill_edge_bytes(
-        self,
-        weight_buffer: WeightBuffer,
-        peer_views: Dict[Tuple[int, int, str], torch.Tensor],
-    ) -> None:
-        local_start = self.layout.local_expert_start
-        local_end = self.layout.local_expert_end
-        peer_ranges = self.layout.peer_ranges
-
-        for li in weight_buffer.layer_indices:
-            for name in weight_buffer.weight_names(li):
-                edge = weight_buffer.get_edge_info(li, name)
-                if edge.leading_edge == 0 and edge.trailing_edge == 0:
-                    continue
-
-                full_tensor = weight_buffer.get_full_tensor(li, name)
-
-                if edge.leading_edge > 0 and local_start > 0:
-                    prev = local_start - 1
-                    peer = lookup_owner(prev, peer_ranges)
-                    ps, _ = peer_ranges[peer]
-                    key = (peer, li, name)
-                    if key in peer_views:
-                        full_tensor[prev].copy_(peer_views[key][prev - ps])
-
-                if edge.trailing_edge > 0 and local_end < full_tensor.shape[0]:
-                    nxt = local_end
-                    peer = lookup_owner(nxt, peer_ranges)
-                    ps, _ = peer_ranges[peer]
-                    key = (peer, li, name)
-                    if key in peer_views:
-                        full_tensor[nxt].copy_(peer_views[key][nxt - ps])
-
-        torch.cuda.synchronize(weight_buffer.device_id)
-
     def _allgather_small_params(
         self, moe_layers: List[Tuple[int, FusedMoE]], group
     ) -> None:
         local_experts = self.layout.num_experts_per_worker
         num_total = self.layout.num_routed_experts
 
+        # Per-rank cost tracks the global expert count, not dwdp_size.
         for li, experts in moe_layers:
             for pname, data in experts.named_per_expert_tensors(local_experts):
                 shards = [torch.empty_like(data) for _ in range(self.dwdp_size)]

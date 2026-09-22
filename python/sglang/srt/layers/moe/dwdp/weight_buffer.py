@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 import logging
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 import torch
 
@@ -13,14 +13,15 @@ from sglang.srt.layers.moe.dwdp.layout import (
     LayerWeightSpecs,
     MnnvlHandleSet,
     PageAlignedLayout,
+    PeerRanges,
+    lookup_owner,
 )
-from sglang.srt.layers.moe.dwdp.page_pool import PagePool, compute_slot_sizes
-from sglang.srt.utils.cuda_vmm_utils import (
-    VmmReservation,
-    get_device_granularity,
-    make_device_allocation_prop,
-    tensor_from_pointer,
+from sglang.srt.layers.moe.dwdp.page_pool import (
+    PagePool,
+    PoolBinding,
+    compute_slot_sizes,
 )
+from sglang.srt.utils.vmm_backend import get_vmm_backend
 
 logger = logging.getLogger(__name__)
 
@@ -41,17 +42,24 @@ class WeightBuffer:
         self._local_end = local_end
         self._dwdp_size = dwdp_size
         self._device_id = device_id
-        self._granularity = get_device_granularity(device_id)
-        self._prop = make_device_allocation_prop(device_id, handle_types=None)
+        self._backend = get_vmm_backend(device_id)
+        self._granularity = self._backend.granularity
         self._pool_page_size = PagePool.DEFAULT_PAGE_SIZE_MULTIPLIER * self._granularity
         self._page_pool: Optional[PagePool] = None
         self._moe_layer_indices = sorted(layer_weight_specs.keys())
+        # double buffered: consecutive MoE layers alternate slots
+        self._layer_slots = {
+            li: pos % 2 for pos, li in enumerate(self._moe_layer_indices)
+        }
         self._layouts: Dict[int, Dict[str, PageAlignedLayout]] = {}
         self._tensors: Dict[int, Dict[str, torch.Tensor]] = {}
         self._remote_slices: Dict[
             int, Dict[str, List[Tuple[torch.Tensor, int, int]]]
         ] = {}
-        self._reservations: Dict[int, List[VmmReservation]] = {}
+        self._reservations: Dict[int, List] = {}
+        self._pool_bindings: Dict[int, List[PoolBinding]] = {}
+        self._bound_layers: Set[int] = set()
+        self._rebinds_pool_pages = not self._backend.supports_aliased_mappings()
         self._released = False
 
     @classmethod
@@ -103,6 +111,7 @@ class WeightBuffer:
         self._tensors[layer_idx] = {}
         self._remote_slices[layer_idx] = {}
         self._reservations[layer_idx] = []
+        bindings: List[PoolBinding] = []
 
         page_pool_offset = 0
 
@@ -110,44 +119,46 @@ class WeightBuffer:
             spec = weight_specs[name]
             handle = self._handles.get_handle(layer_idx, name)
 
-            reservation = VmmReservation(
+            reservation = self._backend.make_reservation(
                 layout.total_size,
-                self._prop,
-                self._device_id,
+                exportable=False,
                 alignment=self._granularity,
             )
             self._reservations[layer_idx].append(reservation)
             va_base = reservation.base
 
             if layout.pre_size > 0:
-                self._page_pool.map_pages(
-                    slot=buf_slot,
-                    reservation=reservation,
-                    offset=0,
-                    size=layout.pre_size,
-                    page_offset=page_pool_offset,
+                bindings.append(
+                    PoolBinding(
+                        slot=buf_slot,
+                        reservation=reservation,
+                        offset=0,
+                        num_pages=layout.pre_pages,
+                        page_offset=page_pool_offset,
+                    )
                 )
                 page_pool_offset += layout.pre_pages
 
             reservation.map_existing(layout.pre_size, layout.mnnvl_size, handle)
 
             if layout.post_size > 0:
-                self._page_pool.map_pages(
-                    slot=buf_slot,
-                    reservation=reservation,
-                    offset=layout.pre_size + layout.mnnvl_size,
-                    size=layout.post_size,
-                    page_offset=page_pool_offset,
+                bindings.append(
+                    PoolBinding(
+                        slot=buf_slot,
+                        reservation=reservation,
+                        offset=layout.pre_size + layout.mnnvl_size,
+                        num_pages=layout.post_pages,
+                        page_offset=page_pool_offset,
+                    )
                 )
                 page_pool_offset += layout.post_pages
 
             tensor_start = va_base + layout.pre_padding
-            full_tensor = tensor_from_pointer(
+            full_tensor = self._backend.tensor_from_pointer(
                 tensor_start,
                 layout.num_experts * layout.expert_bytes,
                 shape=spec.full_shape,
                 dtype=spec.dtype,
-                device_id=self._device_id,
             )
 
             self._tensors[layer_idx][name] = full_tensor
@@ -160,6 +171,41 @@ class WeightBuffer:
                     (full_tensor[self._local_end :], self._local_end, spec.num_experts)
                 )
             self._remote_slices[layer_idx][name] = slices
+
+        self._pool_bindings[layer_idx] = bindings
+        self.bind_pool_pages(layer_idx)
+
+    def bind_pool_pages(self, layer_idx: int) -> None:
+        """Map this layer's share of the pool pages, evicting the layer that had them.
+
+        Only backends that cannot alias a page into several composite VAs evict;
+        there, the other layer on this slot loses everything outside its local
+        shard. Callers must drain that layer's device work first -- unmapping is a
+        host call and does not wait.
+        """
+        if layer_idx in self._bound_layers:
+            return
+        if self._rebinds_pool_pages:
+            slot = self.buffer_index_for_layer(layer_idx)
+            for other in [
+                li
+                for li in self._bound_layers
+                if self.buffer_index_for_layer(li) == slot
+            ]:
+                self._unbind_pool_pages(other)
+        for binding in self._pool_bindings[layer_idx]:
+            self._page_pool.map_binding(binding)
+        self._bound_layers.add(layer_idx)
+
+    def _unbind_pool_pages(self, layer_idx: int) -> None:
+        for binding in self._pool_bindings[layer_idx]:
+            self._page_pool.unmap_binding(binding)
+        self._bound_layers.discard(layer_idx)
+
+    @property
+    def rebinds_pool_pages(self) -> bool:
+        """Whether a layer's pool pages have to be remapped before each prefetch."""
+        return self._rebinds_pool_pages
 
     def get_full_tensor(self, layer_idx: int, name: str) -> torch.Tensor:
         return self._tensors[layer_idx][name]
@@ -191,13 +237,17 @@ class WeightBuffer:
     def device_id(self) -> int:
         return self._device_id
 
+    @property
+    def device(self) -> torch.device:
+        return self._backend.torch_device
+
     def weight_names(self, layer_idx: int) -> List[str]:
         return list(self._layer_weight_specs[layer_idx].keys())
 
     def buffer_index_for_layer(self, layer_idx: int) -> int:
-        if layer_idx in self._moe_layer_indices:
-            return self._moe_layer_indices.index(layer_idx) % 2
-        return layer_idx % 2
+        if layer_idx not in self._layer_slots:
+            raise KeyError(f"layer {layer_idx} has no DWDP weight buffer slot")
+        return self._layer_slots[layer_idx]
 
     def release(self) -> None:
         if self._released:
@@ -207,8 +257,57 @@ class WeightBuffer:
             for reservation in reservations:
                 reservation.close()
         self._reservations.clear()
+        self._pool_bindings.clear()
+        self._bound_layers.clear()
         self._tensors.clear()
         self._remote_slices.clear()
         if self._page_pool is not None:
             self._page_pool.release()
             self._page_pool = None
+
+
+def fill_edge_experts(
+    weight_buffer: WeightBuffer,
+    peer_views: Dict[Tuple[int, int, str], torch.Tensor],
+    *,
+    local_start: int,
+    local_end: int,
+    peer_ranges: PeerRanges,
+) -> None:
+    """Copy the two experts whose bytes straddle the local handle's edge pages.
+
+    Page alignment puts bytes of the experts just outside [local_start, local_end)
+    on those pages, where no prefetch ever writes them; seed them from the owner.
+    """
+    device_module = torch.get_device_module(weight_buffer.device)
+    for li in weight_buffer.layer_indices:
+        for name in weight_buffer.weight_names(li):
+            edge = weight_buffer.get_edge_info(li, name)
+            if edge.leading_edge == 0 and edge.trailing_edge == 0:
+                continue
+
+            weight_buffer.bind_pool_pages(li)
+            full_tensor = weight_buffer.get_full_tensor(li, name)
+
+            if edge.leading_edge > 0 and local_start > 0:
+                prev = local_start - 1
+                peer = lookup_owner(prev, peer_ranges)
+                ps, _ = peer_ranges[peer]
+                key = (peer, li, name)
+                if key in peer_views:
+                    full_tensor[prev].copy_(peer_views[key][prev - ps])
+
+            if edge.trailing_edge > 0 and local_end < full_tensor.shape[0]:
+                nxt = local_end
+                peer = lookup_owner(nxt, peer_ranges)
+                ps, _ = peer_ranges[peer]
+                key = (peer, li, name)
+                if key in peer_views:
+                    full_tensor[nxt].copy_(peer_views[key][nxt - ps])
+
+        if weight_buffer.rebinds_pool_pages:
+            # the next layer takes these pool pages back, and unmapping does not
+            # wait for the copies above
+            device_module.synchronize(weight_buffer.device_id)
+
+    device_module.synchronize(weight_buffer.device_id)

@@ -35,6 +35,7 @@ from sglang.srt.layers.utils import copy_or_rebind_param
 from sglang.srt.runtime_context import (
     get_exec,
     get_lora,
+    get_parallel,
     get_platform,
 )
 from sglang.srt.utils import (
@@ -580,22 +581,20 @@ class UnquantizedLinearMethod(LinearMethodBase):
 def _use_xpu_moe_ld_padding(use_triton_kernels: bool) -> bool:
     """Whether MoE expert weights should get a padded row stride for XPU.
 
-    is_xpu() only tells us an XPU exists on this machine, not that the weights
-    being created land on it -- this can be true while serving on CPU/CUDA.
-    create_weights takes no device argument and allocates under the model
-    loader's ambient device context, so check that context too: padding a
-    non-XPU weight would make it non-contiguous for no benefit, and other
-    backends' MoE kernels expect contiguous expert tensors.
-
     The Triton path stores B transposed and does not read a row stride, so it
     is excluded even on XPU (either via --moe-runner-backend triton or the
     triton_kernels build).
+
+    DWDP is excluded too: it addresses experts inside a composite virtual address
+    space by their logical byte size, so a padded row stride would put them at
+    the wrong offsets. build_layer_weight_specs re-checks contiguity.
     """
     return (
         is_xpu()
         and not get_moe_runner_backend().is_triton()
         and torch.get_default_device().type == "xpu"
         and not use_triton_kernels
+        and get_parallel().dwdp_size <= 1
     )
 
 

@@ -11,6 +11,7 @@ import torch
 
 from sglang.srt.layers.moe.dwdp.layout import PeerRanges, lookup_owner
 from sglang.srt.layers.moe.dwdp.weight_buffer import WeightBuffer
+from sglang.srt.utils.common import create_device_stream, device_stream_context
 
 logger = logging.getLogger(__name__)
 
@@ -38,18 +39,16 @@ class DWDPWeightManager:
         # transport handles underpin the VA mappings; must outlive this manager
         self._transport = transport
 
-        device = torch.device("cuda", weight_buffer.device_id)
-        self._copy_stream = torch.cuda.Stream(device=device)
+        self._device = weight_buffer.device
+        self._device_module = torch.get_device_module(self._device)
+        self._copy_stream = create_device_stream(self._device)
 
-        self._prefetch_events: List[torch.cuda.Event] = [
-            torch.cuda.Event() for _ in range(2)
-        ]
-        self._consume_events: List[torch.cuda.Event] = [
-            torch.cuda.Event() for _ in range(2)
-        ]
+        event_type = self._device_module.Event
+        self._prefetch_events = [event_type() for _ in range(2)]
+        self._consume_events = [event_type() for _ in range(2)]
 
         # pre-record consume events so the first prefetch doesn't stall
-        current = torch.cuda.current_stream(device)
+        current = self._device_module.current_stream(self._device)
         for ev in self._consume_events:
             ev.record(current)
 
@@ -77,7 +76,14 @@ class DWDPWeightManager:
     def prefetch_layer(self, layer_idx: int) -> None:
         buf_idx = self._weight_buffer.buffer_index_for_layer(layer_idx)
 
-        with torch.cuda.stream(self._copy_stream):
+        if self._weight_buffer.rebinds_pool_pages:
+            # Unmapping is a host call that does not wait, so the copy DMA writing
+            # these pages and the compute reading them must both have finished.
+            self._prefetch_events[buf_idx].synchronize()
+            self._consume_events[buf_idx].synchronize()
+            self._weight_buffer.bind_pool_pages(layer_idx)
+
+        with device_stream_context(self._copy_stream):
             # WAR: wait for compute to finish reading this slot before overwriting
             self._copy_stream.wait_event(self._consume_events[buf_idx])
 
@@ -108,14 +114,12 @@ class DWDPWeightManager:
 
     def wait_prefetch(self, layer_idx: int) -> None:
         buf_idx = self._weight_buffer.buffer_index_for_layer(layer_idx)
-        device = torch.device("cuda", self._weight_buffer.device_id)
-        compute_stream = torch.cuda.current_stream(device)
+        compute_stream = self._device_module.current_stream(self._device)
         compute_stream.wait_event(self._prefetch_events[buf_idx])
 
     def record_compute_and_prefetch_next(self, layer_idx: int) -> None:
         buf_idx = self._weight_buffer.buffer_index_for_layer(layer_idx)
-        device = torch.device("cuda", self._weight_buffer.device_id)
-        compute_stream = torch.cuda.current_stream(device)
+        compute_stream = self._device_module.current_stream(self._device)
 
         self._consume_events[buf_idx].record(compute_stream)
 
