@@ -6232,9 +6232,7 @@ class UnifiedRadixCacheSuite:
             "write_back"
         )
 
-        result = cache.evict(
-            EvictParams(num_tokens=0, swa_num_tokens=len(seq_b))
-        )
+        result = cache.evict(EvictParams(num_tokens=0, swa_num_tokens=len(seq_b)))
         self.assertGreaterEqual(result.swa_num_tokens_evicted, len(seq_a))
 
         m = cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", seq_a))))
