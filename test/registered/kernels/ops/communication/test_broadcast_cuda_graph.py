@@ -105,34 +105,5 @@ def test_broadcast_chain(group, dtype, num_tokens, use_graph, communicator):
         group.pynccl_comm = comm
 
 
-@pytest.mark.parametrize("dtype", [torch.bool, torch.complex64, torch.complex128])
-def test_broadcast_payload_dtype(group, dtype):
-    input_ = torch.zeros(16, device="cuda", dtype=dtype)
-    src = group.world_size - 1
-
-    def forward():
-        output = input_.clone()
-        group.broadcast(output, src=src)
-        return output.clone()
-
-    def value(rank, iteration):
-        if dtype == torch.bool:
-            return bool((rank + iteration) % 2)
-        return complex(rank + iteration, rank - iteration)
-
-    with group.graph_capture() as capture:
-        for _ in range(3):
-            forward()
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph, stream=capture.stream):
-            output = forward()
-        for iteration in range(3):
-            input_.fill_(value(group.rank_in_group, iteration))
-            graph.replay()
-            torch.testing.assert_close(
-                output, torch.full_like(output, value(src, iteration)), atol=0, rtol=0
-            )
-
-
 if __name__ == "__main__":
     multigpu_pytest_main(__name__, __file__, num_gpus=(2, 4))

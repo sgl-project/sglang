@@ -387,9 +387,8 @@ class PyNcclCommunicator:
         self.nccl.ncclBroadcast(
             sendbuff,
             recvbuff,
-            # Broadcast copies bytes, including bool and complex payloads.
-            tensor.numel() * tensor.element_size(),
-            ncclDataTypeEnum.ncclUint8,
+            tensor.numel(),
+            ncclDataTypeEnum.from_torch(tensor.dtype),
             src,
             self.comm,
             cudaStream_t(stream.cuda_stream),
