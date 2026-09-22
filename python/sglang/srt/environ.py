@@ -956,6 +956,10 @@ class Envs:
     # ===================================================================
     SGLANG_NPU_DISABLE_ACL_FORMAT_WEIGHT = EnvBool(False)
     SGLANG_NPU_USE_MULTI_STREAM = EnvBool(False)
+    # Fuse the Qwen3.5 shared expert MLP (gate_up + SwiGLU + down + sigmoid
+    # gate) into Triton kernels from sgl-kernel-npu. Set to 0 to restore the
+    # separate GEMM/SwiGLU/sigmoid-mul ops.
+    SGLANG_NPU_FUSED_SHARED_EXPERT = EnvBool(True)
     # Kimi-K3 attention-TP shared experts: overlap AG / MLP / RS with the
     # routed front / DeepEP dispatch / routed GEMMs, respectively.
     SGLANG_NPU_FINE_GRAINED_MOE_DUAL_STREAM = EnvBool(False)

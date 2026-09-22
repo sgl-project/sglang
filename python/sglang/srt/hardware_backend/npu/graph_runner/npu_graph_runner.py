@@ -399,7 +399,16 @@ class NPUGraphRunner(DecodeCudaGraphRunner):
                     )
                     seq_lens = seq_lens_cpu.tolist() + [0] * (self.bs - self.raw_bs)
             else:
-                seq_lens = forward_batch.seq_lens.cpu().tolist() + [0] * (
+                # Prefer the scheduler-maintained host mirror over a blocking
+                # D2H copy: seq_lens_cpu is updated in lockstep with the
+                # device tensor and is already fresh in overlap mode, whereas
+                # .cpu() would stall here until the in-flight forward drains.
+                host_seq_lens = (
+                    forward_batch.seq_lens_cpu
+                    if forward_batch.seq_lens_cpu is not None
+                    else forward_batch.seq_lens.cpu()
+                )
+                seq_lens = host_seq_lens.tolist() + [0] * (
                     self.bs - self.raw_bs
                 )
             output = self.backend.replay_with_input_update(
