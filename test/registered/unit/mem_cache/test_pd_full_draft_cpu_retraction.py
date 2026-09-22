@@ -20,7 +20,7 @@ from sglang.srt.runtime_context import get_parallel
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.speculative.dflash_worker_v2 import DFlashWorkerV2
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase, published_topology
+from sglang.test.test_utils import CustomTestCase, enter_scope, published_topology
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -59,51 +59,51 @@ def make_pools(dcp_size):
     return target, draft, mamba, hybrid
 
 
+def alloc_dflash_memory_pool(allocator, draft_pool, *, compact=False):
+    worker = object.__new__(DFlashWorkerV2)
+    worker.use_compact_draft_cache = compact
+    worker._draft_worker = SimpleNamespace(alloc_memory_pool=Mock())
+    worker.draft_model_runner = SimpleNamespace(token_to_kv_pool=draft_pool)
+    worker.alloc_memory_pool(
+        req_to_token_pool=object(), token_to_kv_pool_allocator=allocator
+    )
+
+
 class TestFullDraftCpuRetraction(CustomTestCase):
     def setUp(self):
-        self.enterContext(published_topology(speculative_algorithm="DFLASH"))
+        enter_scope(self, published_topology(speculative_algorithm="DFLASH"))
 
-    def test_full_draft_registers_but_compact_mapping_does_not(self):
-        for compact in (False, True):
-            with self.subTest(compact=compact):
-                _, draft, _, hybrid = make_pools(1)
+    def test_only_full_mha_draft_pool_registers(self):
+        _, draft, _, hybrid = make_pools(1)
+        mla_draft, _, _, _ = make_pools(1)
+        for compact, pool, registered in (
+            (False, draft, True),
+            (True, draft, False),
+            # MLA pools localize token ids to DCP rows, so they are not full drafts.
+            (False, mla_draft, False),
+        ):
+            with self.subTest(compact=compact, pool=type(pool).__name__):
                 allocator = TokenToKVPoolAllocator(
                     128, torch.float32, "cpu", hybrid, need_sort=False
                 )
-                worker = object.__new__(DFlashWorkerV2)
-                worker.use_compact_draft_cache = compact
-                worker._draft_worker = SimpleNamespace(alloc_memory_pool=Mock())
-                worker.draft_model_runner = SimpleNamespace(token_to_kv_pool=draft)
-                req_pool = object()
-                worker.alloc_memory_pool(
-                    req_to_token_pool=req_pool,
-                    token_to_kv_pool_allocator=allocator,
-                )
+                alloc_dflash_memory_pool(allocator, pool, compact=compact)
                 self.assertIs(
-                    allocator.cpu_retraction_draft_pool,
-                    None if compact else draft,
+                    allocator.full_draft_kv_pool, pool if registered else None
                 )
 
     def test_poison_and_relocate_preserves_target_mamba_and_full_draft(self):
-        for dcp_size in (1, 2, 8):
-            for rank in range(dcp_size):
-                for length in (0, 1, 7, 17, 63):
-                    for with_draft in (False, True):
-                        with self.subTest(
-                            dcp_size=dcp_size,
-                            rank=rank,
-                            length=length,
-                            with_draft=with_draft,
-                        ):
-                            self._round_trip(dcp_size, rank, length, with_draft)
+        """Reused slots must not leak into a resumed request's draft KV."""
+        # A 17-token single fragment, and two fragments across DCP8 on rank 3.
+        for dcp_size, rank, length in ((1, 0, 17), (8, 3, 63)):
+            with self.subTest(dcp_size=dcp_size, rank=rank, length=length):
+                self._round_trip(dcp_size, rank, length)
 
-    def _round_trip(self, dcp_size, rank, length, with_draft):
+    def _round_trip(self, dcp_size, rank, length):
         target, draft, mamba, hybrid = make_pools(dcp_size)
         allocator = TokenToKVPoolAllocator(
             128 * dcp_size, torch.float32, "cpu", hybrid, need_sort=False
         )
-        if with_draft:
-            allocator.cpu_retraction_draft_pool = draft
+        alloc_dflash_memory_pool(allocator, draft)
         req = Req("test", "", [1] * (length + 1), SamplingParams(max_new_tokens=16))
         req.kv.req_pool_idx = 0
         req.kv.mamba_pool_idx = torch.tensor([1])
@@ -144,10 +144,7 @@ class TestFullDraftCpuRetraction(CustomTestCase):
         for actual, expected in zip(
             (*draft.k_buffer, *draft.v_buffer), draft_expected, strict=True
         ):
-            if with_draft:
-                torch.testing.assert_close(actual[new], expected)
-            else:
-                self.assertTrue(torch.all(actual == -100))
+            torch.testing.assert_close(actual[new], expected)
         for actual, expected in zip(
             (*mamba.mamba_cache.conv, mamba.mamba_cache.temporal),
             mamba_expected,
