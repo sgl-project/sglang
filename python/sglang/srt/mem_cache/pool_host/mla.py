@@ -1116,8 +1116,8 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                     )
                 if scale_buffer_data_ptr is not None:
                     # Host scale layout is (page_num, num_indexer_layers,
-                    # page_size, 1, 1) FP32: one scale value per token per
-                    # indexer layer.
+                    # page_size, 1, 2, 2) uint8: 4 E8M0 MX-scale bytes per
+                    # token per indexer layer.
                     ptr_list.append(
                         scale_buffer_data_ptr + indices[index] * num_indexer_layers * 4
                     )

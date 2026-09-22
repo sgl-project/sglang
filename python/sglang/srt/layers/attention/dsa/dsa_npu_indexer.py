@@ -55,8 +55,8 @@ def _quantize_npu_indexer_activation(x, hadamard, dst_type):
         return (
             torch.empty_like(x, dtype=dst_type),
             torch.zeros(
-                x.shape[:-1] + (2, 2), dtype=torch.float8_e8m0fnu, device=x.device
-            ),
+                x.shape[:-1] + (2, 2), dtype=torch.uint8, device=x.device
+            ).view(torch.float8_e8m0fnu),
         )
     rotated = x @ hadamard
     quantized, scale = torch.ops.npu.npu_dynamic_mx_quant(
@@ -71,7 +71,6 @@ def _quantize_npu_indexer_activation(x, hadamard, dst_type):
     return quantized.reshape(x.shape), scale
 
 
-@lru_cache(maxsize=1)
 def _check_quant_lightning_indexer_constraints(pool) -> None:
     # quant_lightning_indexer (v2) PA_BBND layout: block_size == pool
     # page_size must lie in [16, 1024] and be a multiple of 16.
