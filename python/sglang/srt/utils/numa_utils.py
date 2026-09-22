@@ -6,19 +6,20 @@ import multiprocessing
 import os
 import random
 import shutil
+import subprocess
 import time
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Optional
 
-import psutil
 import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import is_cuda
+from sglang.srt.utils import get_cpu_ids_by_node, is_cuda, is_xpu
 
 _is_cuda = is_cuda()
+_is_xpu = is_xpu()
 
 logger = logging.getLogger(__name__)
 
@@ -28,18 +29,51 @@ def configure_subprocess(server_args: ServerArgs, gpu_id: int):
     if envs.SGLANG_NUMA_BIND_V2.get():
         numa_node = get_numa_node_if_available(server_args, gpu_id)
         if numa_node is not None:
-            numactl_args = f"--cpunodebind={numa_node} --membind={numa_node}"
-            executable, debug_str = _create_numactl_executable(
-                numactl_args=numactl_args
-            )
-            debug_str += (
-                f", logical_gpu_id={gpu_id}, "
-                f"physical_gpu_id={_get_nvml_device_index(gpu_id)}, "
-                f"CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES', '')}"
-            )
-            with _mp_set_executable(executable=executable, debug_str=debug_str):
-                yield
-                return
+            # _numactl_cpu_mem_args returns None (warn/raise) on empty CPU intersection (#26983).
+            numactl_args = _numactl_cpu_mem_args(numa_node, gpu_id)
+            if numactl_args is not None:
+                # Verify numactl can actually apply the binding before we exec it
+                # in front of the interpreter; relax the memory policy if not.
+                numactl_args, probe_err = _probe_numactl_args(numactl_args)
+                if numactl_args is None:
+                    # numactl could not apply even a CPU-only binding (e.g.
+                    # set_mempolicy(2)/sched_setaffinity(2) blocked by seccomp,
+                    # which the read-only get_mempolicy(2) probe in
+                    # _can_set_mempolicy cannot detect). Reuse #26983's failure
+                    # semantics (warn-and-continue, or raise when
+                    # SGLANG_CRASH_ON_NUMA_BIND_FAILURE) with an explicit reason
+                    # carrying the captured stderr: the CPU intersection already
+                    # succeeded here, so the default "no CPU cores allowed"
+                    # message would mislead operators toward the wrong cause.
+                    probe_suffix = f": {probe_err}" if probe_err else ""
+                    _handle_numa_bind_failure(
+                        numa_node,
+                        reason=(
+                            f"numactl could not apply NUMA binding for node "
+                            f"{numa_node} (e.g. set_mempolicy/sched_setaffinity "
+                            f"blocked by seccomp, or cpuset rejects the policy)"
+                            f"{probe_suffix}; skipping NUMA binding for GPU {gpu_id}."
+                        ),
+                    )
+                    yield
+                    return
+                executable, debug_str = _create_numactl_executable(
+                    numactl_args=numactl_args
+                )
+                if _is_xpu:
+                    debug_str += (
+                        f", logical_gpu_id={gpu_id}, "
+                        f"ZE_AFFINITY_MASK={os.environ.get('ZE_AFFINITY_MASK', '')}"
+                    )
+                else:
+                    debug_str += (
+                        f", logical_gpu_id={gpu_id}, "
+                        f"physical_gpu_id={_get_nvml_device_index(gpu_id)}, "
+                        f"CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES', '')}"
+                    )
+                with _mp_set_executable(executable=executable, debug_str=debug_str):
+                    yield
+                    return
     yield
 
 
@@ -66,9 +100,9 @@ def _mp_set_executable(executable: str, debug_str: str):
     try:
         yield
     finally:
-        assert (
-            os.fsdecode(multiprocessing.spawn.get_executable()) == executable
-        ), f"{multiprocessing.spawn.get_executable()=}"
+        assert os.fsdecode(multiprocessing.spawn.get_executable()) == executable, (
+            f"{multiprocessing.spawn.get_executable()=}"
+        )
         multiprocessing.spawn.set_executable(old_executable)
         logger.debug(f"mp.set_executable revert to {old_executable}")
 
@@ -102,6 +136,8 @@ def get_numa_node_if_available(server_args: ServerArgs, gpu_id: int) -> Optional
     """
     if server_args.numa_node is not None:
         return server_args.numa_node[gpu_id]
+    if not envs.SGLANG_AUTO_NUMA_BIND.get():
+        return None
     if _is_numa_available():
         queried_numa_node = _query_numa_node_for_gpu(gpu_id)
         if len(queried_numa_node) == 0:
@@ -135,9 +171,177 @@ def numa_bind_to_node(node: int):
 
     if libnuma is None or libnuma.numa_available() < 0:
         logger.warning("numa not available on this system, skip bind action")
+        return
+
+    node_cpus = _node_cpus(node)
+    if node_cpus:
+        allowed_cpus = os.sched_getaffinity(0)
+        target_cpus = node_cpus & allowed_cpus
+        if not target_cpus:
+            _handle_numa_bind_failure(node, allowed_cpus)
+            return
+        os.sched_setaffinity(0, target_cpus)
     else:
         libnuma.numa_run_on_node(ctypes.c_int(node))
-        libnuma.numa_set_preferred(ctypes.c_int(node))
+    libnuma.numa_set_preferred(ctypes.c_int(node))
+
+
+class _Bitmask(ctypes.Structure):
+    _fields_ = [("size", ctypes.c_ulong), ("maskp", ctypes.POINTER(ctypes.c_ulong))]
+
+
+def _node_cpus(node: int) -> set:
+    libnuma = get_libnuma()
+    if libnuma is None or libnuma.numa_available() < 0:
+        return set()
+    libnuma.numa_allocate_cpumask.restype = ctypes.POINTER(_Bitmask)
+    libnuma.numa_node_to_cpus.argtypes = [ctypes.c_int, ctypes.POINTER(_Bitmask)]
+    libnuma.numa_node_to_cpus.restype = ctypes.c_int
+    libnuma.numa_bitmask_isbitset.argtypes = [ctypes.POINTER(_Bitmask), ctypes.c_uint]
+    libnuma.numa_bitmask_isbitset.restype = ctypes.c_int
+    libnuma.numa_bitmask_free.argtypes = [ctypes.POINTER(_Bitmask)]
+    mask = libnuma.numa_allocate_cpumask()
+    try:
+        if libnuma.numa_node_to_cpus(node, mask) != 0:
+            return set()
+        return {
+            i
+            for i in range(mask.contents.size)
+            if libnuma.numa_bitmask_isbitset(mask, i)
+        }
+    finally:
+        libnuma.numa_bitmask_free(mask)
+
+
+def _numactl_cpu_mem_args(node: int, gpu_id: int) -> Optional[str]:
+    node_cpus = _node_cpus(node)
+    if not node_cpus:
+        return f"--cpunodebind={node} --membind={node}"
+    allowed_cpus = os.sched_getaffinity(0)
+    target_cpus = node_cpus & allowed_cpus
+    if not target_cpus:
+        _handle_numa_bind_failure(node, allowed_cpus, gpu_id)
+        return None
+    if target_cpus == node_cpus:
+        return f"--cpunodebind={node} --membind={node}"
+    cpu_list = ",".join(str(c) for c in sorted(target_cpus))
+    return f"--physcpubind={cpu_list} --membind={node}"
+
+
+def _strip_memory_args(numactl_args: str) -> str:
+    """Return ``numactl_args`` with the ``--membind`` segment removed, keeping
+    only the CPU binding (``--cpunodebind`` / ``--physcpubind``)."""
+    return " ".join(
+        token for token in numactl_args.split() if not token.startswith("--membind")
+    )
+
+
+def _probe_numactl_args(numactl_args: str) -> tuple[Optional[str], str]:
+    """Dry-run ``numactl <args> true`` and fall back to a weaker binding when the
+    kernel rejects the strongest one.
+
+    ``configure_subprocess`` applies NUMA binding by exec-ing ``numactl`` in front
+    of the Python interpreter (see ``_create_numactl_executable``), so a binding
+    that ``numactl`` refuses kills the worker before Python starts, with no
+    traceback. ``_can_set_mempolicy`` only probes ``get_mempolicy(2)`` (read),
+    which does not catch ``set_mempolicy(2)`` being denied (e.g. by a seccomp
+    profile) or a ``--membind`` that the cpuset rejects with ``EINVAL``.
+
+    To avoid that silent crash we probe the requested args and progressively relax
+    the *memory* policy while keeping the CPU binding intact::
+
+        --membind=N  ->  --preferred=N  ->  drop the memory segment
+
+    Returns ``(args, last_stderr)``: ``args`` is the strongest binding that
+    actually runs, or ``None`` if even CPU-only fails (or ``numactl`` is missing /
+    errors out); ``last_stderr`` is the rejection reason numactl printed for the
+    strongest binding that was rejected (empty on success), so the caller can
+    surface it on the total-failure path.
+    """
+
+    def _probe(args: str):
+        """Run ``numactl <args> true``; return ``(succeeded, stderr_text)``."""
+        try:
+            proc = subprocess.run(
+                ["numactl", *args.split(), "true"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                timeout=10,
+            )
+            stderr = proc.stderr.decode("utf-8", errors="replace").strip()
+            if proc.returncode != 0:
+                logger.debug(f"numactl probe for {args!r} rejected: {stderr!r}")
+            return proc.returncode == 0, stderr
+        except Exception as e:
+            # Missing numactl, timeout, etc. Treat as "this binding does not work".
+            logger.debug(f"numactl probe for {args!r} failed: {e}")
+            return False, str(e)
+
+    def _suffix(err: str) -> str:
+        return f": {err}" if err else ""
+
+    # 1. Strongest binding: exactly what was requested.
+    ok, last_err = _probe(numactl_args)
+    if ok:
+        return numactl_args, ""
+
+    # 2. Relax a hard --membind=N to a soft --preferred=N. The memory segment here
+    #    is always a single node, which maps cleanly onto --preferred (single-node
+    #    only). MPOL_PREFERRED is a hint and can succeed where MPOL_BIND is denied.
+    if "--membind=" in numactl_args:
+        preferred_args = numactl_args.replace("--membind=", "--preferred=")
+        ok, _ = _probe(preferred_args)
+        if ok:
+            logger.warning(
+                f"numactl rejected hard memory binding ({numactl_args!r})"
+                f"{_suffix(last_err)}; falling back to soft preferred policy "
+                f"({preferred_args!r})."
+            )
+            return preferred_args, ""
+
+    # 3. Drop the memory segment entirely, keep only the CPU binding.
+    cpu_only_args = _strip_memory_args(numactl_args)
+    if cpu_only_args and cpu_only_args != numactl_args:
+        ok, cpu_err = _probe(cpu_only_args)
+        if ok:
+            logger.warning(
+                f"numactl rejected memory binding ({numactl_args!r})"
+                f"{_suffix(last_err)}; falling back to CPU-only binding "
+                f"({cpu_only_args!r})."
+            )
+            return cpu_only_args, ""
+        last_err = cpu_err
+
+    # 4. Nothing worked.
+    return None, last_err
+
+
+def _handle_numa_bind_failure(
+    node: int,
+    allowed_cpus=None,
+    gpu_id: Optional[int] = None,
+    *,
+    reason: Optional[str] = None,
+) -> None:
+    """Emit the NUMA-bind failure warning, or raise it when
+    ``SGLANG_CRASH_ON_NUMA_BIND_FAILURE`` is set.
+
+    Two call modes:
+      * ``reason is None`` (default): the failure is an empty CPU intersection,
+        so the message reports ``allowed_cpus`` (which must be provided).
+      * ``reason`` provided: the failure is something else (e.g. numactl rejected
+        the binding at runtime); the caller supplies the exact message and
+        ``allowed_cpus`` / ``gpu_id`` are not needed.
+    """
+    if reason is None:
+        gpu_str = f" for GPU {gpu_id}" if gpu_id is not None else ""
+        reason = (
+            f"NUMA node {node} has no CPU cores allowed by the current affinity "
+            f"{sorted(allowed_cpus)}, skipping NUMA binding{gpu_str}."
+        )
+    logger.warning(reason)
+    if envs.SGLANG_CRASH_ON_NUMA_BIND_FAILURE.get():
+        raise RuntimeError(reason)
 
 
 def _can_set_mempolicy() -> bool:
@@ -159,23 +363,11 @@ def _is_numa_available() -> bool:
     """
     Check if NUMA is available and not already configured externally.
     """
-    if not _is_cuda:
+    if not (_is_cuda or _is_xpu):
         return False
 
     # Check if this is a numa system.
     if not os.path.isdir("/sys/devices/system/node/node1"):
-        return False
-
-    # Check if affinity is already constrained
-    pid = os.getpid()
-    process = psutil.Process(pid)
-    cpu_affinity = process.cpu_affinity()
-    all_cpus = list(range(psutil.cpu_count()))
-    constrained_affinity = cpu_affinity != all_cpus
-    if constrained_affinity:
-        logger.warning(
-            "NUMA affinity is already constrained for process, skipping NUMA node configuration for GPU. Remove your constraints to allow automatic configuration."
-        )
         return False
 
     if not shutil.which("numactl") and envs.SGLANG_NUMA_BIND_V2.get():
@@ -198,10 +390,13 @@ def _query_numa_node_for_gpu(device_id: int):
     Get the NUMA node affinity list for a GPU device.
 
     Args:
-        device_id: CUDA logical device index (post-CUDA_VISIBLE_DEVICES).
+        device_id: Logical device index (post-CUDA_VISIBLE_DEVICES / ZE_AFFINITY_MASK).
     Returns:
         List of NUMA node IDs that have affinity with the device.
     """
+    if _is_xpu:
+        return _query_numa_node_for_xpu(device_id)
+
     try:
         import pynvml
     except ModuleNotFoundError:
@@ -244,3 +439,201 @@ def _query_numa_node_for_gpu(device_id: int):
             pynvml.nvmlShutdown()
         except Exception:
             pass  # Ignore shutdown errors
+
+
+def init_threads_binding(
+    *,
+    numa_index: int,
+    world_size: int,
+):
+    omp_cpuids = os.environ.get("SGLANG_CPU_OMP_THREADS_BIND", "all")
+    cpu_ids_by_node = get_cpu_ids_by_node()
+    n_numa_node = len(cpu_ids_by_node)
+    if omp_cpuids == "all":
+        assert world_size <= n_numa_node, (
+            f"SGLANG_CPU_OMP_THREADS_BIND is not set, in this case, "
+            f"the total number of ranks (dp_size * tp_size * pp_size = {world_size}) should be smaller than or equal to number of numa node on the machine {n_numa_node}. "
+            f"If you need more ranks than the number of numa nodes, please set the CPU cores for each rank via SGLANG_CPU_OMP_THREADS_BIND explicitly. "
+            f"For example, on a machine with 2 numa nodes, where core 0-31 are on numa node 0 and core 32-63 are on numa node 1, "
+            f"it is suggested to use -tp 2 and bind tp rank 0 to core 0-31 and tp rank 1 to core 32-63. "
+            f"This is the default behavior if SGLANG_CPU_OMP_THREADS_BIND is not set and it is the same as setting SGLANG_CPU_OMP_THREADS_BIND=0-31|32-63. "
+            f"If you do need more ranks than the number of numa nodes, you could set SGLANG_CPU_OMP_THREADS_BIND explicitly for example SGLANG_CPU_OMP_THREADS_BIND=0-15|16-31|32-47|48-63 and run with -tp 4. "
+            f"If you don't want each rank to use all the cores on one numa node, you could set for example SGLANG_CPU_OMP_THREADS_BIND=0-15|32-47 and run with -tp 2."
+        )
+        if world_size < n_numa_node:
+            logger.warning(
+                f"Detected the current machine has {n_numa_node} numa nodes available, but the total number of ranks (dp_size * tp_size * pp_size) is {world_size}, so only {world_size} numa nodes are used."
+            )
+        assert 0 <= numa_index < n_numa_node, (
+            f"NUMA index {numa_index} (derived from the worker's global device id / gpu_id) "
+            f"is out of range for {n_numa_node} numa nodes. This usually means dp_size * tp_size "
+            f"exceeds the number of numa nodes; reduce it, or set SGLANG_CPU_OMP_THREADS_BIND explicitly."
+        )
+        local_omp_cpuid = cpu_ids_by_node[numa_index]
+    else:
+        threads_bind_list = omp_cpuids.split("|")
+        # Bound-check numa_index against the bind list rather than asserting
+        # world_size == len(...): in router mode each worker is an independent
+        # dp_size=1 server, so world_size is locally 1 and can't equal a
+        # multi-group bind string. numa_index (== the global gpu_id) is the
+        # correct frame here, so this per-rank bound both prevents IndexError
+        # and catches an under-sized bind list, without needing the global
+        # rank count.
+        assert 0 <= numa_index < len(threads_bind_list), (
+            f"NUMA index {numa_index} (derived from the worker's global device id / gpu_id) "
+            f"is out of range for the {len(threads_bind_list)} SGLANG_CPU_OMP_THREADS_BIND entries. "
+            f"Ensure the number of '|'-separated bind groups matches dp_size * tp_size * pp_size (across all DP workers)."
+        )
+        local_omp_cpuid = threads_bind_list[numa_index]
+        if world_size > n_numa_node:
+            logger.warning(
+                f"The total number of ranks ({world_size}) is larger than numa node number ({n_numa_node}), "
+                f"in this case the available memory amount of each rank cannot be determined in prior. "
+                f"Please set proper `--max-total-tokens` to avoid the out-of-memory error."
+            )
+    logger.info(
+        f"init_threads_binding: numa_index={numa_index}, world_size={world_size}, "
+        f"local_omp_cpuid={local_omp_cpuid}"
+    )
+    return local_omp_cpuid
+
+
+def _list_xpu_pci_addresses():
+    """Intel GPU PCI addresses in Level Zero's physical device order."""
+    # sysfs, not the XPU runtime: this also runs in the launcher parent, where a
+    # torch XPU init pins ~170MB of device memory for the life of the server.
+    addresses = []
+    # Walk /dev/dri, which is what Level Zero opens and what a container narrows
+    # to the devices it was given; the sysfs PCI tree always shows every host GPU.
+    for node in glob.glob("/dev/dri/renderD*"):
+        if not os.access(node, os.R_OK | os.W_OK):
+            continue
+        device_link = os.path.join("/sys/class/drm", os.path.basename(node), "device")
+        try:
+            with open(os.path.join(device_link, "vendor")) as f:
+                vendor = f.read().strip()
+        except OSError:
+            continue
+        if vendor == "0x8086":
+            addresses.append(os.path.basename(os.path.realpath(device_link)))
+
+    # Level Zero sorts by PCI domain/bus/device/function, but places integrated
+    # GPUs last unless ZE_ENABLE_PCI_ID_DEVICE_ORDER is set
+    # (intel/compute-runtime, ExecutionEnvironment::comparePciIdBusNumber).
+    pci_id_order = os.environ.get("ZE_ENABLE_PCI_ID_DEVICE_ORDER", "").strip() not in (
+        "",
+        "0",
+    )
+    return sorted(
+        addresses,
+        key=lambda address: _xpu_pci_sort_key(
+            address, integrated_last=not pci_id_order
+        ),
+    )
+
+
+def _is_integrated_xpu(pci_address: str) -> bool:
+    # An Intel integrated GPU is always at domain 0000, bus 00.
+    domain, bus, _ = pci_address.split(":")
+    return int(domain, 16) == 0 and int(bus, 16) == 0
+
+
+def _xpu_pci_sort_key(pci_address: str, *, integrated_last: bool):
+    domain, bus, device_function = pci_address.split(":")
+    device, function = device_function.split(".")
+    return (
+        integrated_last and _is_integrated_xpu(pci_address),
+        int(domain, 16),
+        int(bus, 16),
+        int(device, 16),
+        int(function),
+    )
+
+
+def _xpu_visible_device_indices(num_devices: int):
+    """Physical XPU indices ZE_AFFINITY_MASK exposes, in logical index order."""
+    affinity_mask = os.environ.get("ZE_AFFINITY_MASK", "").strip()
+    if not affinity_mask or affinity_mask == "default":
+        return list(range(num_devices))
+
+    # ZE_AFFINITY_MASK filters instead of permuting like CUDA_VISIBLE_DEVICES
+    # (intel/compute-runtime, ExecutionEnvironment::parseAffinityMask).
+    indices = set()
+    for entry in affinity_mask.split(","):
+        try:
+            index = int(entry.strip().split(".")[0])
+        except ValueError:
+            continue
+        if 0 <= index < num_devices:
+            indices.add(index)
+    return sorted(indices)
+
+
+def _xpu_visible_pci_addresses(addresses: list, *, device_count: int):
+    """The candidate device list whose length matches what the runtime reports."""
+    # Level Zero can leave an integrated GPU out of its device list altogether,
+    # and it orders them last anyway, so retry without them before giving up.
+    for candidate in (addresses, [a for a in addresses if not _is_integrated_xpu(a)]):
+        visible = [candidate[i] for i in _xpu_visible_device_indices(len(candidate))]
+        if len(visible) == device_count:
+            return visible
+    return None
+
+
+def _xpu_pci_address(device_id: int) -> Optional[str]:
+    """Logical XPU device index -> its PCI address, or None if unresolvable.
+
+    The ZE_AFFINITY_MASK-aware counterpart of _get_nvml_device_index.
+    """
+    addresses = _list_xpu_pci_addresses()
+    if not addresses:
+        logger.warning(
+            "No Intel GPU render nodes found under /dev/dri, skipping NUMA node "
+            "configuration for XPU"
+        )
+        return None
+
+    # device_count() is the runtime's own count and needs no XPU init.
+    device_count = torch.xpu.device_count()
+    visible = _xpu_visible_pci_addresses(addresses, device_count=device_count)
+    if visible is None:
+        logger.warning(
+            f"Found {len(addresses)} Intel GPU(s) via /dev/dri but torch reports "
+            f"{device_count} XPU device(s) with ZE_AFFINITY_MASK="
+            f"{os.environ.get('ZE_AFFINITY_MASK', '')!r}, skipping NUMA node "
+            "configuration for XPU"
+        )
+        return None
+
+    if not 0 <= device_id < len(visible):
+        logger.warning(
+            f"XPU device {device_id} is out of range of the {len(visible)} "
+            "Intel GPU(s) found in sysfs, skipping NUMA node configuration for XPU"
+        )
+        return None
+    return visible[device_id]
+
+
+def _read_pci_numa_node(pci_address: str):
+    numa_path = f"/sys/bus/pci/devices/{pci_address}/numa_node"
+    try:
+        with open(numa_path) as f:
+            node = int(f.read().strip())
+    except (OSError, ValueError) as e:
+        logger.warning(
+            f"Could not read {numa_path}: {e}, skipping NUMA node configuration for XPU"
+        )
+        return []
+
+    # The kernel reports -1 when the device has no NUMA affinity.
+    if node < 0:
+        return []
+    return [node]
+
+
+def _query_numa_node_for_xpu(device_id: int):
+    """NUMA node affinity list for an Intel XPU device, via sysfs."""
+    pci_address = _xpu_pci_address(device_id)
+    if pci_address is None:
+        return []
+    return _read_pci_numa_node(pci_address)

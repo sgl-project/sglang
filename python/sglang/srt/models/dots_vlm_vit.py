@@ -9,10 +9,14 @@ from torch.nn import LayerNorm
 from transformers.modeling_utils import PreTrainedModel
 
 from sglang.srt.configs.dots_vlm import DotsVisionConfig
-from sglang.srt.distributed import parallel_state
-from sglang.srt.layers.attention.vision import VisionAttention
+from sglang.srt.layers.attention.vision import (
+    VisionAttention,
+    VisionAttentionMetadata,
+    prepare_vision_attention_metadata,
+)
 from sglang.srt.layers.conv import Conv2dLayer
 from sglang.srt.layers.quantization import QuantizationConfig
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import add_prefix, is_npu
 
 logger = logging.getLogger(__name__)
@@ -173,11 +177,18 @@ class DotsVisionBlock(nn.Module):
         self.mlp = DotsSwiGLUFFN(config, quant_config)
         self.norm2 = RMSNorm(config.embed_dim, eps=config.rms_norm_eps)
 
-    def forward(self, hidden_states, cu_seqlens, rotary_pos_emb) -> torch.Tensor:
+    def forward(
+        self,
+        hidden_states,
+        cu_seqlens,
+        rotary_pos_emb,
+        forward_metadata: Optional[VisionAttentionMetadata] = None,
+    ) -> torch.Tensor:
         hidden_states = hidden_states + self.attn(
             self.norm1(hidden_states),
             cu_seqlens=cu_seqlens,
             position_embeddings=rotary_pos_emb,
+            forward_metadata=forward_metadata,
         )
         hidden_states = hidden_states + self.mlp(self.norm2(hidden_states))
         return hidden_states
@@ -224,7 +235,7 @@ class DotsVisionTransformer(PreTrainedModel):
 
     def _update_vision_config(self):
         """update vision config to support tp"""
-        world_size = parallel_state.get_tensor_model_parallel_world_size()
+        world_size = get_parallel().tp_size
         num_heads = self.config.num_attention_heads
         head_dim = self.config.embed_dim // num_heads
         num_dummy_heads = 0
@@ -319,10 +330,16 @@ class DotsVisionTransformer(PreTrainedModel):
         # cu_seqlens must be on cpu because of npu_flash_attention_unpad operator restriction
         if is_npu():
             cu_seqlens = cu_seqlens.to("cpu")
+        forward_metadata = prepare_vision_attention_metadata(
+            cu_seqlens, device=hidden_states.device
+        )
 
         for blk in self.blocks:
             hidden_states = blk(
-                hidden_states, cu_seqlens=cu_seqlens, rotary_pos_emb=rotary_pos_emb
+                hidden_states,
+                cu_seqlens=cu_seqlens,
+                rotary_pos_emb=rotary_pos_emb,
+                forward_metadata=forward_metadata,
             )
 
         if self.config.post_norm:

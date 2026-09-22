@@ -26,6 +26,21 @@ if TYPE_CHECKING:
     )
 
 
+def require_bitsandbytes() -> None:
+    try:
+        import bitsandbytes
+
+        if version.parse(bitsandbytes.__version__) < version.parse("0.46.1"):
+            raise ImportError(
+                "bitsandbytes version is wrong. Please install bitsandbytes>=0.46.1."
+            )
+    except ImportError as err:
+        raise ImportError(
+            "Please install bitsandbytes>=0.46.1 via "
+            "`pip install bitsandbytes>=0.46.1` to use bitsandbytes quantizer."
+        ) from err
+
+
 class BitsAndBytesConfig(QuantizationConfig):
     """Config class for BitsAndBytes Quantization.
 
@@ -90,7 +105,7 @@ class BitsAndBytesConfig(QuantizationConfig):
         return []
 
     @classmethod
-    def from_config(cls, config: dict[str, Any]) -> "BitsAndBytesConfig":
+    def from_config(cls, config: dict[str, Any]) -> BitsAndBytesConfig:
         def get_safe_value(config, keys, default_value=None):
             try:
                 value = QuantizationConfig.get_from_keys(config, keys)
@@ -184,21 +199,7 @@ class BitsAndBytesLinearMethod(LinearMethodBase):
     """
 
     def __init__(self, quant_config: BitsAndBytesConfig):
-        try:
-            import bitsandbytes
-
-            if version.parse(bitsandbytes.__version__) < version.parse("0.46.1"):
-                raise ImportError(
-                    "bitsandbytes version is wrong. Please "
-                    "install bitsandbytes>=0.46.1."
-                )
-        except ImportError as err:
-            raise ImportError(
-                "Please install bitsandbytes>=0.46.1 via "
-                "`pip install bitsandbytes>=0.46.1` to use "
-                "bitsandbytes quantizer."
-            ) from err
-
+        require_bitsandbytes()
         self.quant_config = quant_config
 
     def create_weights(
@@ -319,9 +320,9 @@ class BitsAndBytesLinearMethod(LinearMethodBase):
                 matmul_states[i].CB = qweight[offsets[i] : offsets[i + 1]]
                 matmul_states[i].SCB = quant_states[i].to(x.device)
                 matmul_states[i].threshold = self.quant_config.llm_int8_threshold
-                matmul_states[i].has_fp16_weights = (
-                    self.quant_config.llm_int8_has_fp16_weight
-                )
+                matmul_states[
+                    i
+                ].has_fp16_weights = self.quant_config.llm_int8_has_fp16_weight
                 matmul_states[i].is_training = False
                 if (
                     matmul_states[i].threshold > 0.0

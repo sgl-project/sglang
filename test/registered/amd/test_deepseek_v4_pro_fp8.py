@@ -36,39 +36,20 @@ DEEPSEEK_V4_PRO_FP8_MODEL_PATH = os.environ.get(
 )
 # Pro is 1.6T; weight load + warmup is much longer than Flash 285B.
 SERVER_LAUNCH_TIMEOUT = 5400
+FLASHMLA_BACKEND = os.environ.get("SGLANG_HACK_FLASHMLA_BACKEND", "unified_kv_triton")
 
-# Common DeepSeek-V4 env vars (AMD ROCm 7.2 path: tilelang + AITER + ROCm700A).
-# Source of truth: python/run_dsv4.sh.
 COMMON_ENV_VARS = {
-    "SGLANG_OPT_USE_FUSED_COMPRESS": "true",
-    "SGLANG_OPT_USE_OLD_COMPRESSOR": "true",
-    "SGLANG_OPT_USE_TILELANG_SWA_PREPARE": "false",
-    "SGLANG_OPT_USE_TRITON_SWA_PREPARE": "true",
-    "SGLANG_OPT_USE_JIT_KERNEL_FUSED_TOPK": "false",
-    "SGLANG_OPT_USE_FUSED_HASH_TOPK": "false",
-    "SGLANG_OPT_DEEPGEMM_HC_PRENORM": "false",
-    "SGLANG_OPT_USE_TILELANG_MHC_PRE": "false",
-    "SGLANG_OPT_USE_AITER_MHC_PRE": "true",
-    "SGLANG_OPT_USE_TILELANG_MHC_POST": "false",
-    "SGLANG_OPT_USE_AITER_MHC_POST": "true",
-    "SGLANG_ENABLE_THINKING": "1",
-    "SGLANG_USE_AITER": "1",
-    "AITER_BF16_FP8_MOE_BOUND": "1",
-    "SGLANG_USE_ROCM700A": "1",
-    "SGLANG_FP8_PAGED_MQA_LOGITS_TORCH": "1",
-    "SGLANG_OPT_DPSK_V4_RADIX": "0",
-    "SGLANG_OPT_USE_OVERLAP_STORE_CACHE": "false",
-    "SGLANG_OPT_USE_FUSED_STORE_CACHE": "false",
-    "SGLANG_TOPK_TRANSFORM_512_TORCH": "1",
-    "SGLANG_OPT_USE_TILELANG_INDEXER": "true",
-    "SGLANG_HACK_FLASHMLA_BACKEND": "triton",
+    "SGLANG_DEFAULT_THINKING": "1",
     "SGLANG_DSV4_REASONING_EFFORT": "max",
+    "SGLANG_USE_ROCM700A": "0",
+    "SGLANG_DP_USE_GATHERV": "1",
+    "SGLANG_HACK_FLASHMLA_BACKEND": FLASHMLA_BACKEND,
+    "AITER_BF16_FP8_MOE_BOUND": "0",
 }
 
-# FP8 variant: dense-FP8 experts via the Triton MoE FP8 path.
+# FP8 variant
 FP8_ENV_VARS = {
     "SGLANG_DSV4_FP4_EXPERTS": "false",
-    "SGLANG_FORCE_TRITON_MOE_FP8": "1",
 }
 
 
@@ -88,11 +69,15 @@ class TestDeepseekV4ProFp8(CustomTestCase):
             "8",
             "--disable-radix-cache",
             "--attention-backend",
-            "compressed",
+            "dsv4",
             "--max-running-requests",
             "256",
             "--page-size",
             "256",
+            "--mem-fraction-static",
+            "0.90",
+            "--swa-full-tokens-ratio",
+            "0.1",
             "--chunked-prefill-size",
             "8192",
             "--disable-shared-experts-fusion",
@@ -130,11 +115,15 @@ class TestDeepseekV4ProFp8(CustomTestCase):
 
         if is_in_ci():
             write_github_step_summary(
-                f"### test_gsm8k (deepseek-v4-pro-fp8)\n"
+                f"### test_gsm8k (deepseek-v4-pro-fp8, {FLASHMLA_BACKEND})\n"
                 f'{metrics["accuracy"]=:.3f}\n'
             )
             self.assertGreater(metrics["accuracy"], 0.91)
 
+    @unittest.skipIf(
+        os.environ.get("SGLANG_DSV4_ACCURACY_ONLY") == "1",
+        "SGLANG_DSV4_ACCURACY_ONLY=1: accuracy-only run (skipping perf)",
+    )
     def test_b_perf_8k_1k(self):
         json_output = "/tmp/deepseek_v4_pro_fp8_perf.json"
         if os.path.exists(json_output):
@@ -185,7 +174,7 @@ class TestDeepseekV4ProFp8(CustomTestCase):
             report_results = results_data
 
         summary_lines = [
-            "### test_perf_8k_1k (deepseek-v4-pro-fp8)",
+            f"### test_perf_8k_1k (deepseek-v4-pro-fp8, {FLASHMLA_BACKEND})",
             "input_len=8192 output_len=1024",
             "",
             "| batch size | latency (s) | input throughput (tok/s) | output throughput (tok/s) | ITL (ms) |",

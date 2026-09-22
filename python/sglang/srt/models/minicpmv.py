@@ -68,7 +68,7 @@ from sglang.srt.models.minicpmv_vit import (
 from sglang.srt.models.qwen2 import Qwen2Config, Qwen2ForCausalLM
 from sglang.srt.models.qwen3 import Qwen3Config, Qwen3ForCausalLM
 from sglang.srt.models.qwen3_5 import Qwen3_5ForCausalLM
-from sglang.srt.utils import add_prefix, flatten_nested_list
+from sglang.srt.utils import add_prefix, flatten_nested_list, get_device
 
 RawImageType = Union[Image.Image, torch.Tensor]
 
@@ -269,7 +269,6 @@ class BaseResampler(nn.Module):
 
 
 class Resampler2_5(BaseResampler):
-
     def __init__(
         self,
         num_queries: int,
@@ -346,9 +345,7 @@ class Resampler2_5(BaseResampler):
             key_padding_mask[i, patch_len[i] :] = True
         pos_embed = torch.nn.utils.rnn.pad_sequence(
             pos_embed, batch_first=True, padding_value=0.0
-        ).permute(
-            1, 0, 2
-        )  # BLD => L * B * D
+        ).permute(1, 0, 2)  # BLD => L * B * D
         x, _ = self.kv_proj(x)  # B * L * D
         x = self.ln_kv(x).permute(1, 0, 2)  # L * B * D
 
@@ -369,7 +366,6 @@ class Resampler2_5(BaseResampler):
 
 
 class Resampler4_5(BaseResampler):
-
     def __init__(
         self,
         num_queries: int,
@@ -522,9 +518,7 @@ class Resampler4_5(BaseResampler):
 
         pos_embed_2d = torch.nn.utils.rnn.pad_sequence(
             pos_embed_2d, batch_first=True, padding_value=0.0
-        ).permute(
-            1, 0, 2
-        )  # BLD => L * B * D
+        ).permute(1, 0, 2)  # BLD => L * B * D
 
         k = x
         v = x + pos_embed_2d
@@ -554,14 +548,10 @@ class Resampler4_5(BaseResampler):
 
             k = torch.nn.utils.rnn.pad_sequence(
                 merge_k, batch_first=True, padding_value=0.0
-            ).permute(
-                1, 0, 2
-            )  # L*(end-start)
+            ).permute(1, 0, 2)  # L*(end-start)
             v = torch.nn.utils.rnn.pad_sequence(
                 merge_v, batch_first=True, padding_value=0.0
-            ).permute(
-                1, 0, 2
-            )  # L*(end-start)
+            ).permute(1, 0, 2)  # L*(end-start)
             key_padding_mask = torch.nn.utils.rnn.pad_sequence(
                 merge_key_padding_mask, batch_first=True, padding_value=True
             ).squeeze(-1)
@@ -725,8 +715,7 @@ class MiniCPMBaseModel(nn.Module):
             )
             if not isinstance(image_embeds, (torch.Tensor, list)):
                 raise ValueError(
-                    f"Incorrect type of image embeds. "
-                    f"Got type: {type(image_embeds)}"
+                    f"Incorrect type of image embeds. Got type: {type(image_embeds)}"
                 )
 
             if isinstance(image_embeds, list):
@@ -936,7 +925,7 @@ class MiniCPMV2_6(MiniCPMBaseModel):
                 prefix=prefix,
             )
 
-        return resampler.to(device="cuda", dtype=torch.get_default_dtype())
+        return resampler.to(device=get_device(), dtype=torch.get_default_dtype())
 
     def get_vision_embedding(
         self,
@@ -1102,7 +1091,7 @@ class MiniCPMV4_0(MiniCPMBaseModel):
                 prefix=prefix,
             )
 
-        return resampler.to(device="cuda", dtype=torch.get_default_dtype())
+        return resampler.to(device=get_device(), dtype=torch.get_default_dtype())
 
     def get_vision_embedding(
         self,
@@ -1272,7 +1261,7 @@ class MiniCPMV4_5(MiniCPMBaseModel):
                 prefix=prefix,
             )
 
-        return resampler.to(device="cuda", dtype=torch.get_default_dtype())
+        return resampler.to(device=get_device(), dtype=torch.get_default_dtype())
 
     def get_vision_embedding(
         self,
@@ -1490,7 +1479,7 @@ class MiniCPMV4_6(MiniCPMBaseModel):
                 quant_config=quant_config,
                 prefix=prefix,
             )
-        return merger.to(device="cuda", dtype=torch.get_default_dtype())
+        return merger.to(device=get_device(), dtype=torch.get_default_dtype())
 
     def get_vision_embedding(
         self,
@@ -1639,6 +1628,14 @@ class MiniCPMV:
     embedding_padding_modules = []
 
     minicpmv: nn.Module
+
+    @staticmethod
+    def shared_experts_fusion_disable_reason(hf_config, quant_config):
+        # 4.6 nests a Qwen3.5 LLM under ``text_config``; every other version
+        # builds a dense LLM, for which the Qwen3.5 gate answers None.
+        return Qwen3_5ForCausalLM.shared_experts_fusion_disable_reason(
+            getattr(hf_config, "text_config", hf_config), quant_config
+        )
 
     def __init__(
         self,

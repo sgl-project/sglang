@@ -61,7 +61,7 @@ class TestDeepseekV31(unittest.TestCase):
                 dataset="gsm8k", baseline_accuracy=0.935
             ),
             performance_params=PerformanceTestParams(
-                profile_dir="performance_profiles_deepseek_v31",
+                result_dir="performance_results_deepseek_v31",
             ),
         )
 

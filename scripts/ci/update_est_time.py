@@ -95,7 +95,7 @@ def update_files(model, dry_run=False):
                     new_content = pattern.sub(rf"\g<1>{p90}\3", new_content)
                     changes.append((relpath, suite, old_val, p90))
                     print(
-                        f"  {relpath}: suite={suite!r} " f"est_time {old_val} -> {p90}",
+                        f"  {relpath}: suite={suite!r} est_time {old_val} -> {p90}",
                         file=sys.stderr,
                     )
                 break  # one (file, suite) -> at most one register call
@@ -121,8 +121,7 @@ def write_summary(changes, summary_file):
     lines = []
     if sig:
         lines.append(
-            f"### Significant est_time changes "
-            f"({len(sig)} of {len(changes)} updates)"
+            f"### Significant est_time changes ({len(sig)} of {len(changes)} updates)"
         )
         lines.append("")
         lines.append("| File | Suite | Old (s) | New (s) | Δ |")
@@ -167,7 +166,8 @@ def main():
     print(f"Fetching {args.model_url}", file=sys.stderr)
     model = fetch_model(args.model_url)
     print(
-        f"  model data_as_of={model.get('data_as_of')} "
+        f"  model fit_window_start={model.get('fit_window_start')} "
+        f"fit_window_days={model.get('fit_window_days')} "
         f"n_runs={model.get('n_runs')} "
         f"n_suites={len(model.get('est', {}))}",
         file=sys.stderr,

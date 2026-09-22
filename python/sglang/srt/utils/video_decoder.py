@@ -33,6 +33,13 @@ def _try_cuda_backend() -> bool:
     return _cuda_backend_enabled
 
 
+def _is_cpu_engine() -> bool:
+    # Lazy import to avoid circular dependency issues and unnecessary imports on module load
+    from sglang.srt.utils.common import is_cpu
+
+    return is_cpu()
+
+
 class VideoDecoderWrapper:
     """Unified video decoder that uses torchcodec when available, decord as fallback.
 
@@ -87,9 +94,11 @@ class VideoDecoderWrapper:
         return len(self._decoder)
 
     def __getitem__(self, idx):
-        """Return single frame as numpy NHWC uint8."""
+        """Return one NHWC uint8 frame (numpy on CPU, tensor on CUDA)."""
         if _BACKEND == "torchcodec":
-            return self._decoder[idx].numpy()
+            frame = self._decoder[idx]
+            data = frame.data if hasattr(frame, "data") else frame
+            return data if data.is_cuda else data.numpy()
         else:
             frame = self._decoder[idx]
             return frame.asnumpy() if hasattr(frame, "asnumpy") else np.array(frame)
@@ -101,11 +110,22 @@ class VideoDecoderWrapper:
         else:
             return self._decoder.get_avg_fps()
 
-    def get_frames_at(self, indices: list) -> np.ndarray:
-        """Return frames at given indices as numpy array with shape (N, H, W, C)."""
+    @property
+    def frame_shape(self) -> tuple[int, int]:
+        if _BACKEND == "torchcodec":
+            metadata = self._decoder.metadata
+            height = getattr(metadata, "height", None)
+            width = getattr(metadata, "width", None)
+            if height and width:
+                return int(height), int(width)
+        shape = self[0].shape
+        return int(shape[-3]), int(shape[-2])
+
+    def get_frames_at(self, indices: list):
+        """Return NHWC uint8 frames (numpy on CPU, tensor on CUDA)."""
         if _BACKEND == "torchcodec":
             batch = self._decoder.get_frames_at(indices)
-            return batch.data.numpy()
+            return batch.data if batch.data.is_cuda else batch.data.numpy()
         else:
             return self._decoder.get_batch(indices).asnumpy()
 
@@ -127,10 +147,13 @@ class VideoDecoderWrapper:
 
         if _BACKEND == "torchcodec":
             batch = self._decoder.get_frames_at(indices)
-            return batch.data.pin_memory()
+            if _is_cpu_engine():
+                return batch.data
+            return batch.data if batch.data.is_cuda else batch.data.pin_memory()
         else:
             arr = self._decoder.get_batch(indices).asnumpy()
-            return torch.from_numpy(arr).pin_memory()
+            output = torch.from_numpy(arr)
+            return output if _is_cpu_engine() else output.pin_memory()
 
     def _parallel_decode(self, indices, num_threads):
         """Decode frames using multiple VideoDecoder instances in parallel threads."""
@@ -141,8 +164,15 @@ class VideoDecoderWrapper:
         chunks = [list(c) for c in np.array_split(indices, num_threads) if len(c) > 0]
         source = self._source
         kwargs = self._tc_kwargs
+        cuda_device = None
+        if kwargs.get("device") == "cuda":
+            cuda_device = torch.cuda.current_device()
 
         def _decode_chunk(chunk):
+            # CUDA's current device is thread-local.  Without this, decoder
+            # workers created by TP rank > 0 silently default to GPU 0.
+            if cuda_device is not None:
+                torch.cuda.set_device(cuda_device)
             d = VideoDecoder(source, **kwargs)
             return d.get_frames_at(chunk).data
 
@@ -156,7 +186,10 @@ class VideoDecoderWrapper:
                 idx = future_to_idx[future]
                 results[idx] = future.result()
 
-        return torch.cat(results, dim=0).pin_memory()
+        output = torch.cat(results, dim=0)
+        if _is_cpu_engine():
+            return output
+        return output if output.is_cuda else output.pin_memory()
 
     @property
     def source_bytes(self) -> bytes | None:
@@ -171,8 +204,11 @@ class VideoDecoderWrapper:
         return None
 
     def close(self):
-        """Explicitly clean up temporary files."""
-        if self._tmp_path is not None:
+        self._decoder = None
+        self._source = None
+        self._source_bytes = None
+        self._source_path = None
+        if getattr(self, "_tmp_path", None) is not None:
             if os.path.exists(self._tmp_path):
                 os.unlink(self._tmp_path)
             self._tmp_path = None

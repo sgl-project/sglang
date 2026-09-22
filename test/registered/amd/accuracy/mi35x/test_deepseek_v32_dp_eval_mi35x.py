@@ -6,12 +6,6 @@ completion benchmark on MI35x.
 Registry: nightly-amd-accuracy-8-gpu-mi35x-deepseek-v32-dp suite
 """
 
-import os
-
-# Set HF cache for MI35x
-os.environ.setdefault("HF_HOME", "/data2/models/huggingface")
-os.environ.setdefault("HF_HUB_CACHE", "/data2/models/huggingface/hub")
-
 import unittest
 from types import SimpleNamespace
 
@@ -95,8 +89,7 @@ class TestDeepseekV32DP(CustomTestCase):
 
         if is_in_ci():
             write_github_step_summary(
-                f"### test_gsm8k (deepseek-v32 DP MI35x)\n"
-                f'{metrics["accuracy"]=:.3f}\n'
+                f'### test_gsm8k (deepseek-v32 DP MI35x)\n{metrics["accuracy"]=:.3f}\n'
             )
             self.assertGreater(metrics["accuracy"], GSM8K_ACCURACY_THRESHOLD)
 
@@ -109,8 +102,7 @@ class TestDeepseekV32DP(CustomTestCase):
 
         if is_in_ci():
             write_github_step_summary(
-                f"### test_bs_1_speed (deepseek-v32 DP MI35x)\n"
-                f"{speed=:.2f} token/s\n"
+                f"### test_bs_1_speed (deepseek-v32 DP MI35x)\n{speed=:.2f} token/s\n"
             )
             self.assertGreater(speed, 10)
 

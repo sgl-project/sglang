@@ -4,6 +4,10 @@ import unittest
 import torch
 import torch.nn.functional as F
 
+from sglang.srt.layers.quantization.fp8_utils import (
+    materialize_bpreshuffle_fp8_scale,
+    view_aiter_fused_rms_transposed_fp8_scale,
+)
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -144,6 +148,44 @@ class TestFusedRMSFP8GroupQuant(CustomTestCase):
             (M, N1, N2), g, dtype, seed = params
             with self.subTest(M=M, N1=N1, N2=N2, group_size=g, dtype=dtype, seed=seed):
                 self._case(M, N1, N2, g, dtype, seed)
+
+    def test_transposed_scale_matches_bpreshuffle_layout_contract(self):
+        from aiter.ops.triton.fused_fp8_quant import fused_rms_fp8_group_quant
+
+        common_kwargs = dict(
+            inp2=None,
+            inp2_weight=None,
+            inp2_epsilon=None,
+            group_size=128,
+            dtype_quant=torch.float8_e4m3fn,
+            res1=None,
+            output_unquantized_inp1=False,
+        )
+
+        for m, k in ((1, 1024), (64, 1024), (1, 4096), (64, 4096)):
+            with self.subTest(m=m, k=k):
+                torch.manual_seed(0)
+                x = torch.randn(m, k, dtype=torch.bfloat16, device="cuda")
+                weight = torch.ones(k, dtype=torch.float32, device="cuda")
+
+                (q_row_major, scale_row_major), *_ = fused_rms_fp8_group_quant(
+                    x, weight, 1e-6, transpose_scale=False, **common_kwargs
+                )
+                (q_transposed, scale_transposed), *_ = fused_rms_fp8_group_quant(
+                    x, weight, 1e-6, transpose_scale=True, **common_kwargs
+                )
+
+                repaired = view_aiter_fused_rms_transposed_fp8_scale(scale_transposed)
+                materialized = materialize_bpreshuffle_fp8_scale(repaired)
+
+                torch.testing.assert_close(q_transposed, q_row_major, rtol=0, atol=0)
+                torch.testing.assert_close(repaired, scale_row_major, rtol=0, atol=0)
+                torch.testing.assert_close(
+                    materialized, scale_row_major, rtol=0, atol=0
+                )
+                self.assertEqual(repaired.stride(), (1, repaired.shape[0]))
+                self.assertEqual(repaired.data_ptr(), scale_transposed.data_ptr())
+                self.assertEqual(materialized.data_ptr(), scale_transposed.data_ptr())
 
 
 if __name__ == "__main__":
