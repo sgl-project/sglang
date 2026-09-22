@@ -177,28 +177,15 @@ class SchedulerWeightUpdaterManager:
             runners += worker.iter_runners()
         return runners
 
-    @contextmanager
-    def _ensure_weight_update_session(self, selector: str) -> Iterator[None]:
-        """Callers that never open begin/end_weight_update (existing RL integrations,
-        tests) get a single-call session so restore/finalize still bracket the load."""
-        if self._weight_update_in_progress:
-            yield
-            return
-        self.begin_weight_update(BeginWeightUpdateReqInput(selector=selector))
-        try:
-            yield
-        finally:
-            self.end_weight_update(EndWeightUpdateReqInput())
-
     def update_weights_from_distributed(
         self,
         recv_req: UpdateWeightsFromDistributedReqInput,
     ) -> Tuple[bool, str]:
         """Update the online model parameter, fanning out to the selected runners."""
-        with (
-            self._ensure_weight_update_session(recv_req.selector),
-            self._observe_weight_load("distributed"),
-        ):
+        assert self._weight_update_in_progress, (
+            "update_weights_from_distributed requires an open begin_weight_update session"
+        )
+        with self._observe_weight_load("distributed"):
             # Only the target (main) model joined this process's update group, so it
             # receives the broadcast once; the received weights are then loaded into
             # each selected runner locally. Draft runners never join the group.
@@ -231,10 +218,10 @@ class SchedulerWeightUpdaterManager:
     def update_weights_from_tensor(self, recv_req: UpdateWeightsFromTensorReqInput):
         """Update the online model parameter from tensors, fanning out to the
         selected runners."""
-        with (
-            self._ensure_weight_update_session(recv_req.selector),
-            self._observe_weight_load("tensor"),
-        ):
+        assert self._weight_update_in_progress, (
+            "update_weights_from_tensor requires an open begin_weight_update session"
+        )
+        with self._observe_weight_load("tensor"):
             monkey_patch_torch_reductions()
             named_tensors = MultiprocessingSerializer.deserialize(
                 recv_req.serialized_named_tensors[self.tp_worker.model_runner.tp_rank]
