@@ -254,7 +254,7 @@ class ComponentOffloadStrategy(ComponentResidencyStrategy):
     ) -> None:
         if preferred and state.batch_is_warmup:
             # Return reserved blocks from earlier non-intensive releases (e.g. VAE)
-            # before sizing the optional preload against driver-free memory.
+            # before sizing the optional warmup preload against driver-free memory.
             _empty_device_cache()
             # Skip a known-too-large H2D instead of paying for a failing copy.
             free_bytes = _device_free_bytes()
