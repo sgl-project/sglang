@@ -1242,9 +1242,11 @@ def test_configure_logs_component_start_and_completion(monkeypatch):
         "Configuring layerwise offload for transformer (_ResidentComponent): "
         "blocks (8 layers)"
     )
+    # "(per request)" is the point of this line: the set is re-established every
+    # request, not pinned for the server's lifetime.
     assert logs[-1] == (
         "Layerwise offload ready for transformer (_ResidentComponent) in 2.35s: "
-        "groups=1, layers=8, prefetch/group=2, resident=3/8, policy=leading"
+        "groups=1, layers=8, prefetch/group=2, resident=3/8 (per request), policy=leading"
     )
 
 
