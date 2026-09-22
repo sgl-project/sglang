@@ -1962,6 +1962,23 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         allocator = self.token_to_kv_pool_allocator
         uses_swa_tail = self._uses_swa_tail_prealloc()
         swa_tail_len = self._swa_tail_len(fill_len)
+        swa_pages_charged = (
+            uses_swa_tail
+            and not is_swa_req_ring(allocator)
+            and not self.scheduler.enable_hisparse
+        )
+        required_swa_tokens = (
+            ceil_align(swa_tail_len, allocator.page_size) if swa_pages_charged else 0
+        )
+        if get_disagg().disaggregation_decode_enable_radix_cache and swa_pages_charged:
+            # Admission includes evictable pages; allocation needs free pages.
+            # Separate-pool resumes skip the caller's unified-only reclaim.
+            reclaim_error = self._reclaim_swa_tail_capacity(
+                swa_tail_len, req.rid, full_len=required_alloc_tokens
+            )
+            if reclaim_error is not None:
+                logger.warning("%s", reclaim_error)
+
         if self.scheduler.enable_hisparse:
             # HiSparse is incompatible with decode-side L1 radix cache. Keep
             # this path on the upstream full-allocation semantics.
@@ -2005,7 +2022,10 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             f"protected={self._radix_full_protected()}, "
             f"required_alloc={required_alloc_tokens}, delta={delta_len}, "
             f"fill={fill_len}, prefix={prefix_len}, total_prefix={total_prefix_len}, "
-            f"page_size={self.token_to_kv_pool_allocator.page_size}, "
+            f"swa_available={allocator.swa_available_size() if swa_pages_charged else -1}, "
+            f"swa_evictable={self.tree_cache.swa_evictable_size() if swa_pages_charged else -1}, "
+            f"required_swa={required_swa_tokens}, swa_tail_len={swa_tail_len}, "
+            f"page_size={allocator.page_size}, "
             f"req={req.rid}"
         )
 
