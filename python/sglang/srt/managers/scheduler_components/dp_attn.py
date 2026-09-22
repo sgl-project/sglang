@@ -7,11 +7,9 @@ import torch
 
 from sglang.srt.batch_overlap.two_batch_overlap import TboDPAttentionPreparer
 from sglang.srt.configs.model_config import ModelConfig
-from sglang.srt.distributed.parallel_state import get_tp_group
-from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.environ import envs
 from sglang.srt.layers.cp.utils import get_cp_strategy
-from sglang.srt.layers.dp_attention import world_dp_gather_enabled
+from sglang.srt.layers.dp_attention import dp_gather_width, world_dp_gather_enabled
 from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler_components.recv_skipper import (
@@ -58,17 +56,18 @@ def _resolve_elastic_world_dp_size(
         return dp_size
 
     from sglang.srt.elastic_ep.elastic_ep import ElasticEPStateManager
-    from sglang.srt.layers.dp_attention import get_attention_dp_size
 
-    live_dp_size = get_attention_dp_size()
+    live_dp_size = dp_gather_width()
     effective_ep_size = ElasticEPStateManager.get_effective_ep_size()
+    # Query live membership because elastic joins can expand WORLD.
     world_size = torch.distributed.get_world_size(group)
 
     if live_dp_size != effective_ep_size:
         raise RuntimeError(
             "[Elastic EP] WORLD MLP sync dp_size is out of sync: "
             f"rank={torch.distributed.get_rank(group)} "
-            f"live_dp_size={live_dp_size} effective_ep_size={effective_ep_size} "
+            f"live_dp_size={live_dp_size} "
+            f"effective_ep_size={effective_ep_size} "
             f"world_size={world_size} server_args_dp_size={dp_size} "
             f"local_num_tokens={local_num_tokens} "
             f"local_forward_mode={local_forward_mode}"
@@ -193,9 +192,9 @@ class MLPSyncBatchInfo:
         )
         num_ranks_in_tp_info = tp_info.shape[0]
         if device == "cpu":
-            tp_active_ranks = get_tp_group().active_ranks_cpu
+            tp_active_ranks = get_parallel().tp_group.active_ranks_cpu
         else:
-            tp_active_ranks = get_tp_group().active_ranks
+            tp_active_ranks = get_parallel().tp_group.active_ranks
         if tp_active_ranks.shape[0] < num_ranks_in_tp_info:
             tp_active_ranks = torch.ones(
                 num_ranks_in_tp_info,
@@ -433,9 +432,9 @@ def prepare_mlp_sync_batch_raw(
     tbo_preparer = TboDPAttentionPreparer()
     use_world_group = world_dp_gather_enabled()
     if use_world_group:
-        from sglang.srt.distributed.parallel_state import get_world_group
+        from sglang.srt.runtime_context import get_parallel
 
-        world = get_world_group()
+        world = get_parallel().world_group
         group = torch.distributed.group.WORLD
         device = world.device
     elif len(offload_tags) == 0 and (
@@ -535,7 +534,6 @@ class SchedulerDPAttnAdapter:
     token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator
     tree_cache: BasePrefixCache
     offload_tags: set[str]
-    ps: ParallelState
     model_config: ModelConfig
     enable_overlap: bool
     spec_algorithm: SpeculativeAlgorithm
@@ -546,8 +544,8 @@ class SchedulerDPAttnAdapter:
             local_batch,
             model_runner=self.model_runner,
             dp_size=get_parallel().dp_size,
-            attn_tp_size=self.ps.attn_tp_size,
-            attn_cp_size=self.ps.attn_cp_size,
+            attn_tp_size=get_parallel().attn_tp_size,
+            attn_cp_size=get_parallel().attn_cp_size,
             tp_group=self.tp_group,
             get_idle_batch=self.get_idle_batch,
             disable_cuda_graph=cuda_graph_fully_disabled(),

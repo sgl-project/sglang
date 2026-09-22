@@ -1282,6 +1282,7 @@ class MoriKVManager(CommonKVManager):
                 "swa_ring",
                 "c128_state",
                 "minimax_index_k",
+                "minimax_dense_kv",
             ):
                 statuses.extend(
                     self._send_swa_dsa_state(
@@ -1409,7 +1410,12 @@ class MoriKVManager(CommonKVManager):
                 f"PD state transfer does not support TP-mismatched non-MLA SWA models "
                 f"(prefill_tp_size={self.attn_tp_size}, decode_tp_size={peer_info.decode_tp_size})"
             )
-        if state_type in ("qsa_pending", "qsa_compressed", "minimax_index_k"):
+        if state_type in (
+            "qsa_pending",
+            "qsa_compressed",
+            "minimax_index_k",
+            "minimax_dense_kv",
+        ):
             if self.pp_size is not None and self.pp_size > 1:
                 # MORI registration does not exchange state_layer_ids. Compact
                 # sparse-state lists therefore cannot be paired safely across
@@ -1445,6 +1451,7 @@ class MoriKVManager(CommonKVManager):
                 "qsa_compressed",
                 "swa_ring",
                 "c128_state",
+                "minimax_dense_kv",
             ):
                 raise RuntimeError(
                     f"{state_type.upper()} state index length mismatch: "
