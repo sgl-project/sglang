@@ -369,7 +369,7 @@ export const config = {
         "--mem-fraction-static 0.8",
         "--speculative-algorithm DSPARK",
         "--speculative-dspark-block-size 5",
-        "--cuda-graph-max-bs 64",
+        "--cuda-graph-max-bs-decode 64",
         "--cuda-graph-backend-prefill breakable",
         "--cuda-graph-max-bs-prefill 4096",
         "--reasoning-parser auto",
