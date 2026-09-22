@@ -169,6 +169,41 @@ class TestMegaMoEAutotuneStartup(CustomTestCase):
                             self.assertEqual(context.prefill_num_tokens, prefill)
                     self.assertIs(mega_autotune._active_context, previous)
 
+            # Cache-disabled startups in the same second must still write to
+            # different files, even if they use the same device and rank.
+            with (
+                patch.dict(sys.modules, modules),
+                patch.dict(os.environ, SGLANG_FLASHINFER_AUTOTUNE_CACHE="0"),
+                patch.multiple(
+                    autotune,
+                    flashinfer_autotune_cache_path=lambda _: cache_path,
+                    get_flashinfer_autotune_skip_ops=lambda _: set(),
+                    get_exec=lambda: SimpleNamespace(
+                        moe=SimpleNamespace(moe_runner_backend="triton")
+                    ),
+                ),
+                patch.object(autotune.datetime, "datetime") as clock,
+                patch.object(
+                    autotune.torch.cuda, "current_stream", return_value=Mock()
+                ),
+                patch.object(
+                    autotune.torch,
+                    "get_device_module",
+                    return_value=SimpleNamespace(stream=lambda _: nullcontext()),
+                ),
+            ):
+                clock.now.return_value.strftime.return_value = "20260922_010000"
+                paths = []
+                for _ in range(2):
+                    with autotune.flashinfer_autotune_context(
+                        runner, run_lm_head=False
+                    ):
+                        paths.append(Path(general.call_args.kwargs["cache"]))
+                self.assertNotEqual(*paths)
+                for path in paths:
+                    self.assertEqual(path.parent, cache_path.parent / "runs")
+                    self.assertTrue(path.name.startswith("rank.20260922_010000."))
+
 
 class TestAutotuneCacheDigest(CustomTestCase):
     def setUp(self):

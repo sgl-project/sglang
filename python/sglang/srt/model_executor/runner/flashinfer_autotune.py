@@ -19,6 +19,7 @@ import functools
 import hashlib
 import json
 import logging
+import uuid
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable, Optional
 
@@ -172,10 +173,22 @@ def flashinfer_autotune_cache_path(model_runner: ModelRunner) -> Path:
         / cache_key
     )
     cache_dir.mkdir(parents=True, exist_ok=True)
-    return (
-        cache_dir
-        / f"rank_tp{mr.ps.tp_rank}_pp{get_parallel().pp_rank}_dp{mr.ps.dp_rank or 0}.json"
+    rank_key = (
+        f"rank_tp{mr.ps.tp_rank}_pp{get_parallel().pp_rank}_dp{mr.ps.dp_rank or 0}"
     )
+    if (
+        get_exec().moe.moe_runner_backend == "flashinfer_megamoe"
+        and not mr.is_draft_worker
+    ):
+        from sglang.srt.platforms import current_platform
+
+        # Like the P2P cache's device namespace, separate colocated engines on
+        # different GPU allocations. Physical UUIDs also handle remapped CUDA
+        # indices and shared cache roots across hosts, while surviving restarts.
+        # MegaMoE's namespaced records require one writer per file. Concurrent
+        # engines sharing the same GPUs must use separate SGLANG_CACHE_DIRs.
+        rank_key += f"_gpu{current_platform.get_device_uuid(mr.gpu_id)}"
+    return cache_dir / f"{rank_key}.json"
 
 
 def _autotune_tactic_sync_group(
@@ -268,7 +281,9 @@ def flashinfer_autotune_context(model_runner: ModelRunner, *, run_lm_head: bool)
         timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         runs_dir = cache_path.parent / "runs"
         runs_dir.mkdir(parents=True, exist_ok=True)
-        autotune_cache = runs_dir / f"{cache_path.stem}.{timestamp}{cache_path.suffix}"
+        autotune_cache = runs_dir / (
+            f"{cache_path.stem}.{timestamp}.{uuid.uuid4().hex}{cache_path.suffix}"
+        )
         logger.info(
             "Running FlashInfer autotune (cache reuse DISABLED via "
             "SGLANG_FLASHINFER_AUTOTUNE_CACHE=0); writing fresh result to: %s",
