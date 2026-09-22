@@ -1115,7 +1115,7 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         check_dsv4_unified_fp8_pd_supported(
             unified_fp8=self._unified_fp8,
             disaggregation_mode=self.disaggregation_mode,
-            pp_size=kvc.ps.pp_size,
+            pp_size=kvc.pp_size,
             enable_hisparse=get_memory().enable_hisparse,
         )
 
