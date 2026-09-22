@@ -57,12 +57,12 @@ def _merge_checksum_payloads(role_payloads: List[Tuple[str, Dict]]) -> Dict:
     parallelism_infos = []
     for role, p in role_payloads:
         for name, chk in p["checksums"].items():
-            # Only non-target roles are prefixed, so target keys stay stable.
-            key = name if role == "" else f"{role}.{name}"
+            # only draft roles are prefixed, so target keys stay stable
+            key = name if role == "target" else f"{role}.{name}"
             if key in merged:
                 raise ValueError(f"checksum key collision: {key}")
             merged[key] = chk
-        parallelism_infos.append({"role": role or "target", **p["parallelism_info"]})
+        parallelism_infos.append({"role": role, **p["parallelism_info"]})
     return {
         "checksums": merged,
         "per_gpu_checksum": overall_checksum(merged),
@@ -93,11 +93,11 @@ class SchedulerWeightUpdaterManager:
     metrics_collector: Optional[Any] = None
     offload_tags: set = field(default_factory=set)
     stashed_model_static_state: Any = None
-    _weight_update_in_progress: bool = False
-    _weight_update_loaded: bool = False
+    _session_open: bool = False
+    _session_loaded_weights: bool = False
     # Runner selector for the open session, recorded at begin_weight_update and
     # reused by end_weight_update so the same set is restored and finalized.
-    _weight_update_selector: str = "all"
+    _session_selector: str = "all"
 
     @contextmanager
     def _observe_weight_load(self, source: str) -> Iterator[None]:
@@ -159,7 +159,7 @@ class SchedulerWeightUpdaterManager:
     ) -> List[Tuple[str, Any]]:
         """Resolve a {target, draft, all} selector to (role, worker) pairs, target
         first. This is the worker-level inclusion decision; each worker then
-        contributes its own runners via iter_runners()."""
+        contributes its own runners via weight_update_runners()."""
         parsed = _parse_runner_selector(selector)
         workers: List[Tuple[str, Any]] = []
         if "target" in parsed:
@@ -168,13 +168,12 @@ class SchedulerWeightUpdaterManager:
             workers.append(("draft", self.draft_worker))
         return workers
 
-    def get_model_runners(self, selector: str = "all") -> List[Tuple[str, Any]]:
+    def _select_runners(self, selector: str = "all") -> List[Tuple[str, Any]]:
         """Resolve a {target, draft, all} selector to (role, ModelRunner) pairs,
-        target first. Role is "" for the target runner; draft roles come from the
-        draft worker's iter_runners()."""
+        target first. Draft roles come from the draft worker's weight_update_runners()."""
         runners: List[Tuple[str, Any]] = []
         for _, worker in self.iter_weight_update_workers(selector):
-            runners += worker.iter_runners()
+            runners += worker.weight_update_runners()
         return runners
 
     def update_weights_from_distributed(
@@ -182,7 +181,7 @@ class SchedulerWeightUpdaterManager:
         recv_req: UpdateWeightsFromDistributedReqInput,
     ) -> Tuple[bool, str]:
         """Update the online model parameter, fanning out to the selected runners."""
-        assert self._weight_update_in_progress, (
+        assert self._session_open, (
             "update_weights_from_distributed requires an open begin_weight_update session"
         )
         with self._observe_weight_load("distributed"):
@@ -197,7 +196,7 @@ class SchedulerWeightUpdaterManager:
                     recv_req.group_name,
                     recv_req.load_format,
                 )
-                for _, runner in self.get_model_runners(recv_req.selector):
+                for _, runner in self._select_runners(recv_req.selector):
                     runner.weight_updater.load_weights(weights)
                 success, message = True, "Succeeded to update parameter online."
             except Exception as e:
@@ -208,7 +207,7 @@ class SchedulerWeightUpdaterManager:
                 )
                 logger.error(message)
             if success:
-                self._weight_update_loaded = True
+                self._session_loaded_weights = True
                 self.flush_cache_after_weight_update(recv_req)
                 self.record_weight_version_after_update(recv_req.weight_version)
             return UpdateWeightsFromDistributedReqOutput(
@@ -218,7 +217,7 @@ class SchedulerWeightUpdaterManager:
     def update_weights_from_tensor(self, recv_req: UpdateWeightsFromTensorReqInput):
         """Update the online model parameter from tensors, fanning out to the
         selected runners."""
-        assert self._weight_update_in_progress, (
+        assert self._session_open, (
             "update_weights_from_tensor requires an open begin_weight_update session"
         )
         with self._observe_weight_load("tensor"):
@@ -227,7 +226,7 @@ class SchedulerWeightUpdaterManager:
                 recv_req.serialized_named_tensors[self.tp_worker.model_runner.tp_rank]
             )
             success, message = True, "Success"
-            for _, runner in self.get_model_runners(recv_req.selector):
+            for _, runner in self._select_runners(recv_req.selector):
                 success, message = runner.weight_updater.update_weights_from_tensor(
                     named_tensors=named_tensors,
                     load_format=recv_req.load_format,
@@ -235,7 +234,7 @@ class SchedulerWeightUpdaterManager:
                 if not success:
                     break
             if success:
-                self._weight_update_loaded = True
+                self._session_loaded_weights = True
                 self.flush_cache_after_weight_update(recv_req)
                 self.record_weight_version_after_update(recv_req.weight_version)
             else:
@@ -284,14 +283,14 @@ class SchedulerWeightUpdaterManager:
         loadable state on the selected runners (target and/or draft), so the draft
         model is prepared identically to the target. The selector is recorded and
         reused by end_weight_update so the same set is finalized."""
-        assert not self._weight_update_in_progress, (
+        assert not self._session_open, (
             "begin_weight_update called while a weight-update session is already open"
         )
-        self._weight_update_selector = recv_req.selector
-        for _, runner in self.get_model_runners(recv_req.selector):
+        self._session_selector = recv_req.selector
+        for _, runner in self._select_runners(recv_req.selector):
             runner.begin_weight_update()
-        self._weight_update_in_progress = True
-        self._weight_update_loaded = False
+        self._session_open = True
+        self._session_loaded_weights = False
         torch.distributed.barrier(group=self.tp_cpu_group)
         return BeginWeightUpdateReqOutput(success=True, message="Success")
 
@@ -299,13 +298,13 @@ class SchedulerWeightUpdaterManager:
         """End the weight-update session on the runners begin_weight_update opened
         (its recorded selector): quant finalize on each, plus model.post_load_weights
         only when load_weights was bypassed this session (e.g. P2P/RDMA)."""
-        assert self._weight_update_in_progress, (
+        assert self._session_open, (
             "end_weight_update called without begin_weight_update"
         )
-        run_post_load = not self._weight_update_loaded
-        for _, runner in self.get_model_runners(self._weight_update_selector):
+        run_post_load = not self._session_loaded_weights
+        for _, runner in self._select_runners(self._session_selector):
             runner.end_weight_update(run_post_load=run_post_load)
-        self._weight_update_in_progress = False
+        self._session_open = False
         torch.distributed.barrier(group=self.tp_cpu_group)
         return EndWeightUpdateReqOutput(success=True, message="Success")
 
@@ -399,7 +398,7 @@ class SchedulerWeightUpdaterManager:
     def check_weights(self, recv_req: CheckWeightsReqInput):
         try:
             role_payloads = []
-            for role, runner in self.get_model_runners(recv_req.selector):
+            for role, runner in self._select_runners(recv_req.selector):
                 p = runner.check_weights(
                     action=recv_req.action,
                     allow_quant_error=recv_req.allow_quant_error,

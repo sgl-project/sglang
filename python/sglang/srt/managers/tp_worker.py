@@ -539,10 +539,9 @@ class TpModelWorker(BaseTpWorker):
     def model_runner(self) -> ModelRunner:
         return self._model_runner
 
-    def iter_runners(self) -> List[Tuple[str, ModelRunner]]:
-        """(role, runner) pairs this worker owns for weight ops. The target worker
-        owns one runner and uses the empty role so its checksum keys stay unprefixed."""
-        return [("", self._model_runner)]
+    def weight_update_runners(self) -> List[Tuple[str, ModelRunner]]:
+        """(role, runner) pairs weight ops apply to; the target worker owns one."""
+        return [("target", self._model_runner)]
 
     def register_hicache_layer_transfer_counter(self, counter: LayerDoneCounter):
         self.hicache_layer_transfer_counter = counter

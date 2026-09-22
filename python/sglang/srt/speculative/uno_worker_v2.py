@@ -58,7 +58,7 @@ logger = logging.getLogger(__name__)
 class UnoWorkerV2(BaseSpecWorker):
     """Single-model UNO worker with linear and native-EAGLE tree decode."""
 
-    def iter_runners(self) -> List[Tuple[str, ModelRunner]]:
+    def weight_update_runners(self) -> List[Tuple[str, ModelRunner]]:
         # UNO drafts through the target runner's LoRA -- no independent draft weights.
         return []
 

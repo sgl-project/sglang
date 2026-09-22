@@ -149,7 +149,7 @@ class TestRecordWeightVersionAfterUpdate(CustomTestCase):
         )
         manager = SchedulerWeightUpdaterManager(
             tp_worker=SimpleNamespace(
-                model_runner=runner, iter_runners=lambda: [("", runner)]
+                model_runner=runner, weight_update_runners=lambda: [("target", runner)]
             ),
             draft_worker=None,
             tp_cpu_group=None,
@@ -163,7 +163,7 @@ class TestRecordWeightVersionAfterUpdate(CustomTestCase):
             ),
         )
         # update_weights_from_* assert an open begin_weight_update session.
-        manager._weight_update_in_progress = True
+        manager._session_open = True
         return manager
 
     def _runner_request(self, **fields):

@@ -40,7 +40,7 @@ def _manager(tp_worker, draft_worker):
         is_fully_idle=Mock(return_value=True),
     )
     # update_weights_from_* assert an open begin_weight_update session.
-    manager._weight_update_in_progress = True
+    manager._session_open = True
     return manager
 
 
@@ -55,9 +55,11 @@ def test_scheduler_distributed_update_receives_once_on_target_loads_into_each():
     manager = _manager(
         tp_worker=SimpleNamespace(
             model_runner=target_runner,
-            iter_runners=lambda: [("", target_runner)],
+            weight_update_runners=lambda: [("target", target_runner)],
         ),
-        draft_worker=SimpleNamespace(iter_runners=lambda: [("draft", draft_runner)]),
+        draft_worker=SimpleNamespace(
+            weight_update_runners=lambda: [("draft", draft_runner)]
+        ),
     )
 
     output = manager.update_weights_from_distributed(_distributed_req())
@@ -85,7 +87,7 @@ def test_scheduler_distributed_update_target_only_selector_skips_draft():
     manager = _manager(
         tp_worker=SimpleNamespace(
             model_runner=target_runner,
-            iter_runners=lambda: [("", target_runner)],
+            weight_update_runners=lambda: [("target", target_runner)],
         ),
         draft_worker=draft_worker,
     )
@@ -97,13 +99,17 @@ def test_scheduler_distributed_update_target_only_selector_skips_draft():
     assert output.success is True
     target_runner.weight_updater.receive_weights_from_distributed.assert_called_once()
     target_runner.weight_updater.load_weights.assert_called_once_with(weights)
-    draft_worker.iter_runners.assert_not_called()
+    draft_worker.weight_update_runners.assert_not_called()
 
 
 def _session_manager(target_runner, draft_runner):
     return _manager(
-        tp_worker=SimpleNamespace(iter_runners=lambda: [("", target_runner)]),
-        draft_worker=SimpleNamespace(iter_runners=lambda: [("draft", draft_runner)]),
+        tp_worker=SimpleNamespace(
+            weight_update_runners=lambda: [("target", target_runner)]
+        ),
+        draft_worker=SimpleNamespace(
+            weight_update_runners=lambda: [("draft", draft_runner)]
+        ),
     )
 
 
@@ -113,7 +119,7 @@ def test_begin_weight_update_restores_target_and_draft():
     target_runner = Mock()
     draft_runner = Mock()
     manager = _session_manager(target_runner, draft_runner)
-    manager._weight_update_in_progress = False
+    manager._session_open = False
 
     with patch("torch.distributed.barrier"):
         output = manager.begin_weight_update(BeginWeightUpdateReqInput())
@@ -121,8 +127,8 @@ def test_begin_weight_update_restores_target_and_draft():
     assert output.success is True
     target_runner.begin_weight_update.assert_called_once_with()
     draft_runner.begin_weight_update.assert_called_once_with()
-    assert manager._weight_update_in_progress is True
-    assert manager._weight_update_loaded is False
+    assert manager._session_open is True
+    assert manager._session_loaded_weights is False
 
 
 def test_end_weight_update_runs_post_load_on_both_when_load_was_bypassed():
@@ -131,7 +137,7 @@ def test_end_weight_update_runs_post_load_on_both_when_load_was_bypassed():
     target_runner = Mock()
     draft_runner = Mock()
     manager = _session_manager(target_runner, draft_runner)
-    manager._weight_update_loaded = False
+    manager._session_loaded_weights = False
 
     with patch("torch.distributed.barrier"):
         output = manager.end_weight_update(EndWeightUpdateReqInput())
@@ -139,7 +145,7 @@ def test_end_weight_update_runs_post_load_on_both_when_load_was_bypassed():
     assert output.success is True
     target_runner.end_weight_update.assert_called_once_with(run_post_load=True)
     draft_runner.end_weight_update.assert_called_once_with(run_post_load=True)
-    assert manager._weight_update_in_progress is False
+    assert manager._session_open is False
 
 
 def test_end_weight_update_skips_post_load_on_both_when_weights_loaded():
@@ -148,7 +154,7 @@ def test_end_weight_update_skips_post_load_on_both_when_weights_loaded():
     target_runner = Mock()
     draft_runner = Mock()
     manager = _session_manager(target_runner, draft_runner)
-    manager._weight_update_loaded = True
+    manager._session_loaded_weights = True
 
     with patch("torch.distributed.barrier"):
         manager.end_weight_update(EndWeightUpdateReqInput())
@@ -191,14 +197,14 @@ def test_begin_weight_update_selector_restores_only_selected_and_is_recorded():
     target_runner = Mock()
     draft_runner = Mock()
     manager = _session_manager(target_runner, draft_runner)
-    manager._weight_update_in_progress = False
+    manager._session_open = False
 
     with patch("torch.distributed.barrier"):
         manager.begin_weight_update(BeginWeightUpdateReqInput(selector="draft"))
 
     target_runner.begin_weight_update.assert_not_called()
     draft_runner.begin_weight_update.assert_called_once_with()
-    assert manager._weight_update_selector == "draft"
+    assert manager._session_selector == "draft"
 
 
 def test_end_weight_update_reuses_session_selector_from_begin():
@@ -206,7 +212,7 @@ def test_end_weight_update_reuses_session_selector_from_begin():
     target_runner = Mock()
     draft_runner = Mock()
     manager = _session_manager(target_runner, draft_runner)
-    manager._weight_update_in_progress = False
+    manager._session_open = False
 
     with patch("torch.distributed.barrier"):
         manager.begin_weight_update(BeginWeightUpdateReqInput(selector="draft"))
@@ -220,7 +226,7 @@ def test_begin_weight_update_rejects_reentry():
     # A second begin while a session is open would leave the first session's
     # restored runners unfinalized — reject it loudly.
     manager = _session_manager(Mock(), Mock())
-    manager._weight_update_in_progress = True
+    manager._session_open = True
 
     with patch("torch.distributed.barrier"):
         with pytest.raises(AssertionError, match="already open"):

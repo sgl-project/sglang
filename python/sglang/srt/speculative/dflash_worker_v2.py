@@ -361,7 +361,7 @@ class DFlashWorkerV2(BaseSpecWorker):
     scheduler runs it synchronously when overlap is disabled.
     """
 
-    def iter_runners(self) -> List[Tuple[str, "ModelRunner"]]:
+    def weight_update_runners(self) -> List[Tuple[str, "ModelRunner"]]:
         return [("draft", self.draft_model_runner)]
 
     def __init__(

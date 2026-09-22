@@ -233,7 +233,7 @@ class TestMsgpackIpcRoundtrip(CustomTestCase):
                 ),
             ).model_dump()
 
-        merged = _merge_checksum_payloads([("", _dump("")), ("draft", _dump(""))])
+        merged = _merge_checksum_payloads([("target", _dump("")), ("draft", _dump(""))])
         converted = msgspec.convert(merged, ChecksumInfo)
         # Draft keys are role-prefixed so they never collide with the target's.
         self.assertEqual(
