@@ -5,6 +5,7 @@ namespace sglang {
 
 template <int kSmem, int kMode>
 __global__ void carveout_probe(int32_t *output) {
+  device::PDLWaitPrimary<kMode == 2>();
   extern __shared__ int32_t scratch[];
   if constexpr (kSmem > 0) {
     scratch[threadIdx.x] = threadIdx.x;
