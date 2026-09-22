@@ -2073,7 +2073,7 @@ class PreshardedModelLoader(DefaultModelLoader):
         try:
             g = get_parallel().world_group
             return g.rank_in_group, g.world_size
-        except (AssertionError, AttributeError):
+        except (AssertionError, AttributeError, RuntimeError):
             return 0, 1
 
     @staticmethod
@@ -2082,7 +2082,7 @@ class PreshardedModelLoader(DefaultModelLoader):
 
         try:
             get_parallel().world_group.barrier()
-        except (AssertionError, AttributeError):
+        except (AssertionError, AttributeError, RuntimeError):
             pass
 
     @staticmethod

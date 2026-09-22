@@ -4,7 +4,7 @@ A component-based, pluggable prefix cache framework for SGLang that unifies Full
 
 ## Design Goals
 
-1. **Unified tree structure** — One radix tree manages all KV cache types instead of separate specialized implementations (`SWARadixCache`, `MambaRadixCache`, etc.).
+1. **Unified tree structure** — One radix tree manages all KV cache types, replacing the separate specialized implementations that preceded it.
 2. **Pluggable components** — Each attention/state type (Full, SWA, Mamba) is a `TreeComponent` that implements hook interfaces. Adding a new cache type only requires adding a new component.
 3. **Per-component resource isolation** — Each component has its own lock reference counting, evictable/protected size tracking, and eviction driver. Auxiliary components use per-component LRUs; Full uses device/host leaf sets.
 4. **Cascade eviction with priority** — When a component evicts a node, lower-or-equal-priority components on the same node are evicted together, maintaining cross-component consistency.
