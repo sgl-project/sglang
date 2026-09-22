@@ -152,7 +152,9 @@ def _symm_buffer(
     )
 
 
-def requires_symmetric_rs(num_tokens: int, device: torch.device) -> bool:
+def requires_symmetric_rs(
+    num_tokens: int, device: torch.device, element_size: int
+) -> bool:
     """Whether standalone or fused RS reads o_proj through its NVLS alias."""
     state = _init_state()
     if state is None:
@@ -165,6 +167,8 @@ def requires_symmetric_rs(num_tokens: int, device: torch.device) -> bool:
         _HIDDEN_SIZE,
         num_tokens,
         device,
+        element_size=element_size,
+        max_push_size=state.comm.max_push_size,
     )
     if dispatch is not None and dispatch.strategy == "pull":
         return True
@@ -266,8 +270,8 @@ def _eligible(
             or not residual.is_contiguous()
         ):
             return False
-    # Pull/direct strategies use separately allocated symmetric tensors. Push
-    # workspace capacity is strategy-specific and checked after table dispatch.
+    # Note(ajit283): Push capacity participates in dispatch selection so an
+    # oversized push can advance to a tuned pull/direct configuration.
     return True
 
 
@@ -286,13 +290,11 @@ def reduce_scatter_res(
         tensor.shape[1],
         tensor.shape[0],
         tensor.device,
+        element_size=tensor.element_size(),
+        max_push_size=state.comm.max_push_size,
     )
     if dispatch is None:
         return None
-    if dispatch.strategy == "push":
-        local_bytes = tensor.numel() * tensor.element_size() // state.group.world_size
-        if local_bytes > state.comm.max_push_size:
-            return None
     output = torch.empty(
         (tensor.shape[0] // state.group.world_size, tensor.shape[1]),
         dtype=tensor.dtype,
@@ -407,13 +409,10 @@ def all_gather(tensor: torch.Tensor) -> Optional[torch.Tensor]:
         tensor.shape[1],
         global_tokens,
         tensor.device,
+        element_size=tensor.element_size(),
+        max_push_size=state.comm.max_push_size,
     )
     if dispatch is None:
-        return None
-    if (
-        dispatch.strategy == "push"
-        and tensor.numel() * tensor.element_size() > state.comm.max_push_size
-    ):
         return None
     output_shape = (global_tokens, tensor.shape[1])
     if dispatch.strategy == "push":

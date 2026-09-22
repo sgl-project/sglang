@@ -2529,7 +2529,9 @@ class KimiK3DecoderLayer(nn.Module):
 
                 def _sp_o_proj_forward(x, *args, **kwargs):
                     output_rows = k3_sp_collective.get_o_proj_output_rows(x.shape[0])
-                    if k3_sp_collective.requires_symmetric_rs(output_rows, x.device):
+                    if k3_sp_collective.requires_symmetric_rs(
+                        output_rows, x.device, x.element_size()
+                    ):
                         output = k3_sp_collective.get_o_proj_output_buffer(
                             output_rows, x.dtype, o_proj.output_size
                         )

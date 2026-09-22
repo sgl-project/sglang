@@ -36,6 +36,32 @@ def test_world16_dispatch_table(device_name, rs_tuning, ag_tuning):
         assert sp_collective.get_dispatch(
             "all_gather", 16, 7168, 512, device
         ) == sp_collective.Dispatch("direct", ag_tuning)
+
+        # T=384 normally inherits the T=256 push bucket, but its 336 KiB
+        # per-rank shard exceeds the default 256 KiB push slot. Dispatch must
+        # advance to the tuned T=512 pull/direct entries.
+        assert (
+            sp_collective.get_dispatch("reduce_scatter", 16, 7168, 384, device).strategy
+            == "push"
+        )
+        assert sp_collective.get_dispatch(
+            "reduce_scatter",
+            16,
+            7168,
+            384,
+            device,
+            element_size=2,
+            max_push_size=256 * 1024,
+        ) == sp_collective.Dispatch("pull", rs_tuning)
+        assert sp_collective.get_dispatch(
+            "all_gather",
+            16,
+            7168,
+            384,
+            device,
+            element_size=2,
+            max_push_size=256 * 1024,
+        ) == sp_collective.Dispatch("direct", ag_tuning)
         assert (
             sp_collective.get_fusion_dispatch(
                 "reduce_scatter_attn_res", 16, 7168, 512, device
