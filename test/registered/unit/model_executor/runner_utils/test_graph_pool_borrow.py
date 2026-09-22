@@ -18,6 +18,7 @@ from sglang.srt.model_executor.runner_backend.full_cuda_graph_backend import (
     FullCudaGraphBackend,
 )
 from sglang.srt.model_executor.runner_utils import pool
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.speculative import dflash_utils, dflash_worker_v2, eagle_utils
 from sglang.srt.speculative.dflash_worker_v2 import DFlashWorkerV2
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -222,12 +223,7 @@ class TestGraphPoolBorrow(CustomTestCase):
                 "sglang.srt.layers.dp_attention.is_dp_attention_enabled",
                 return_value=False,
             ),
-            # `parallel_state`, not the package re-export: a stub on the
-            # re-export is never consulted.
-            patch(
-                "sglang.srt.distributed.parallel_state.get_tp_group",
-                return_value=tp_group,
-            ),
+            get_parallel().override(tp_group=tp_group),
             patch(
                 "sglang.kernels.ops.speculative.sampling.tree_speculative_sampling_target_only",
                 side_effect=fake_sampling,
