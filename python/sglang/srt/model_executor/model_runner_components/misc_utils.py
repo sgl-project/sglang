@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any, Optional, Protocol, runtime_checkable
 
 from sglang.srt.configs.model_config import (
     dsa_layer_skips_topk,
@@ -90,3 +90,18 @@ def resolve_pp_proxy_residual_num_blocks(
     if block_size is None:
         return None
     return (start_layer + block_size - 1) // block_size
+
+
+@runtime_checkable
+class _SupportsDSparkPPProxy(Protocol):
+    def get_pp_proxy_dspark_hidden_size(self) -> int: ...
+
+
+def resolve_pp_proxy_dspark_hidden_size(
+    *, model: Any, pp_size: int, pp_rank: int
+) -> int:
+    if pp_size <= 1 or pp_rank == 0:
+        return 0
+    if isinstance(model, _SupportsDSparkPPProxy):
+        return model.get_pp_proxy_dspark_hidden_size()
+    return 0
