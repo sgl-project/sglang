@@ -71,42 +71,12 @@ def _module_ready_on_local_device(
     return dtype is None or tensor.dtype == dtype
 
 
-def _module_host_weight_bytes(module: nn.Module) -> int:
-    """Deduped host storage size for parameters and buffers."""
-    totals = 0
-    seen: set[int] = set()
-    for tensor in (*module.parameters(), *module.buffers()):
-        if tensor.device.type != "cpu":
-            continue
-        try:
-            storage = tensor.untyped_storage()
-            pointer = storage.data_ptr()
-        except RuntimeError:
-            continue
-        if pointer == 0 or pointer in seen:
-            continue
-        seen.add(pointer)
-        totals += storage.nbytes()
-    return totals
-
-
-def _warmup_preload_need_bytes(
-    module: nn.Module, target_dtype: torch.dtype | None
-) -> int:
-    """Host weight bytes that a warmup preload would place on device."""
-    need_bytes = _module_host_weight_bytes(module)
-    if target_dtype is None or need_bytes == 0:
-        return need_bytes
-    ref = _module_reference_tensor(module)
-    if ref is None or ref.device.type != "cpu":
-        return need_bytes
-    src_itemsize = ref.element_size()
-    if src_itemsize <= 0:
-        return need_bytes
-    dst_itemsize = torch.empty((), dtype=target_dtype).element_size()
-    if dst_itemsize <= src_itemsize:
-        return need_bytes
-    return need_bytes * dst_itemsize // src_itemsize
+def _cpu_module_nbytes(module: nn.Module) -> int:
+    return sum(
+        tensor.nbytes
+        for tensor in (*module.parameters(), *module.buffers())
+        if tensor.device.type == "cpu"
+    )
 
 
 def _device_free_bytes() -> int | None:
@@ -129,27 +99,14 @@ def _is_out_of_memory_error(error: BaseException) -> bool:
     return "out of memory" in str(error).lower()
 
 
-def _first_error_line(error: BaseException) -> str:
-    message = str(error).strip()
-    if not message:
-        return type(error).__name__
-    return message.splitlines()[0]
-
-
-def _try_empty_device_cache() -> None:
-    device_module = torch.get_device_module()
-    if not device_module.is_available():
-        return
-    empty_cache = getattr(device_module, "empty_cache", None)
+def _empty_device_cache() -> None:
+    empty_cache = getattr(torch.get_device_module(), "empty_cache", None)
     if empty_cache is None:
         return
     try:
         empty_cache()
-    except Exception as error:
-        logger.warning(
-            "Failed to empty device cache after warmup preload OOM (%s).",
-            _first_error_line(error),
-        )
+    except Exception:
+        logger.warning("Failed to empty device cache after warmup preload.")
 
 
 def is_fsdp_managed_module(module: nn.Module) -> bool:
@@ -298,7 +255,7 @@ class ComponentOffloadStrategy(ComponentResidencyStrategy):
         if preferred and state.batch_is_warmup:
             # Skip a known-too-large H2D instead of paying for a failing copy.
             free_bytes = _device_free_bytes()
-            need_bytes = _warmup_preload_need_bytes(module, use.target_dtype)
+            need_bytes = _cpu_module_nbytes(module)
             if free_bytes is not None and need_bytes > max(
                 0, free_bytes - _WARMUP_PRELOAD_MARGIN_BYTES
             ):
@@ -311,7 +268,7 @@ class ComponentOffloadStrategy(ComponentResidencyStrategy):
                     free_bytes / (1024**3),
                 )
                 self.finish_use(module, use, state)
-                _try_empty_device_cache()
+                _empty_device_cache()
                 return
 
             try:
@@ -322,14 +279,15 @@ class ComponentOffloadStrategy(ComponentResidencyStrategy):
                 # leave the component on CPU; the next request loads on demand.
                 if not _is_out_of_memory_error(error):
                     raise
+                detail = str(error).strip().splitlines()
                 logger.warning(
                     "Warmup could not keep %s resident after request finalization "
                     "(%s). Leaving it offloaded; it will be loaded on the next use.",
                     use.component_name,
-                    _first_error_line(error),
+                    detail[0] if detail else type(error).__name__,
                 )
                 self.finish_use(module, use, state)
-                _try_empty_device_cache()
+                _empty_device_cache()
             return
         self.finish_use(module, use, state)
 
