@@ -50,6 +50,9 @@ class KVArgs:
     kv_data_ptrs: List[int]
     kv_data_lens: List[int]
     kv_item_lens: List[int]
+    # HiSparse target KV lands in host memory; the appended draft KV is resident.
+    target_kv_data_ptr_count: Optional[int] = None
+    is_hisparse: bool = False
     kv_layer_ids: List[int]
     kv_cache_dtype_str: str
     aux_data_ptrs: List[int]

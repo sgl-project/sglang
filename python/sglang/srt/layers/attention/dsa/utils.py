@@ -14,7 +14,6 @@ from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph impo
 )
 from sglang.srt.runtime_context import (
     get_disagg,
-    get_memory,
     get_parallel,
     process_model_config,
 )
@@ -91,7 +90,6 @@ def should_remap_pd_dsa_seed_to_local_slots() -> bool:
         (is_cuda() or is_hip())
         and envs.SGLANG_DSA_FUSE_TOPK.get()
         and get_disagg().disaggregation_mode == "decode"
-        and not get_memory().enable_hisparse
         and not get_parallel().dcp_enabled
     )
 

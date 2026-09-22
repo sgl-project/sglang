@@ -21,9 +21,15 @@ if is_xpu():
 
 else:
     from sglang.kernels.ops.kvcache.hisparse import (
+        HiSparseSpecState,
+        complete_hisparse_spec_finalize,
         copy_cache_planned_mla,
+        initialize_hisparse_spec_state,
         load_cache_to_device_buffer_dsv4_mla,
         load_cache_to_device_buffer_mla,
+        load_cache_to_device_buffer_spec_mla,
+        prepare_hisparse_spec_verify,
+        transfer_hisparse_spec_finalize,
     )
 
 from sglang.srt.configs.model_config import dsa_layer_skips_topk, is_deepseek_dsa
@@ -36,6 +42,7 @@ from sglang.srt.mem_cache.allocator.hisparse import (
 from sglang.srt.mem_cache.hisparse_memory_pool import (
     HiSparseDSATokenToKVPool,
 )
+from sglang.srt.mem_cache.hisparse_spec import HiSparseSpecPlan
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.memory_pool_host import DeepSeekV4PagedHostPool
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
@@ -139,6 +146,7 @@ class HiSparseCoordinator:
         host_to_device_ratio: int = 2,
         swap_in_block_size: int = 960,
         shared_index_layers: Optional[List[bool]] = None,
+        spec_plan: Optional[HiSparseSpecPlan] = None,
     ):
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
@@ -197,6 +205,11 @@ class HiSparseCoordinator:
             )
             self.item_size_bytes = self.mem_pool_host.token_stride_size
         self.page_size = self.mem_pool_device.page_size
+        # The KV pool exposes this mapping through weakref.proxy.  Python tensor
+        # operations accept that proxy, but TVM-FFI requires the owning Tensor.
+        self._logical_to_device_mapping = (
+            self.token_to_kv_pool_allocator.full_to_hisparse_device_index_mapping
+        )
 
         max_num_req_slots = req_to_token_pool.req_to_token.shape[0]
         max_context_len = req_to_token_pool.max_context_len
@@ -208,6 +221,14 @@ class HiSparseCoordinator:
         self.padded_buffer_size = (
             self.device_buffer_size + self.mem_pool_device.page_size
         )
+        self.spec_plan = spec_plan
+        self.spec_layout = spec_plan.layout if spec_plan is not None else None
+        if self.spec_layout is not None:
+            assert self.spec_layout.hot_slots == self.device_buffer_size
+            assert self.spec_layout.tail_capacity_slots == self.page_size
+            assert self.spec_layout.compress_ratio == self.compress_ratio
+            assert self.spec_layout.top_k == self.top_k
+            assert self.spec_layout.total_buffer_slots == self.padded_buffer_size
 
         self.req_to_device_buffer = torch.zeros(
             (max_num_req_slots, self.padded_buffer_size),
@@ -274,6 +295,11 @@ class HiSparseCoordinator:
         # Updated before each graph replay so padded blocks early-return.
         self.num_real_reqs = torch.zeros(1, dtype=torch.int32, device=device)
 
+        self._init_speculative_verify_state(
+            layer_num=layer_num,
+            max_num_req_slots=max_num_req_slots,
+        )
+
         # CPU flag: True means "skip backup on the next decode step" because
         # staging already backed up all prefill tokens.  Cleared after one step.
         self._skip_first_backup = [False] * max_num_req_slots
@@ -283,6 +309,72 @@ class HiSparseCoordinator:
             layer_num=layer_num,
             max_num_req_slots=max_num_req_slots,
         )
+
+    def _init_speculative_verify_state(
+        self,
+        *,
+        layer_num: int,
+        max_num_req_slots: int,
+    ) -> None:
+        layout = self.spec_layout
+        if layout is None:
+            return
+
+        state_width = layout.state_width(max_num_req_slots)
+        self._spec_cache_index = torch.full(
+            (layer_num, max_num_req_slots, 2, layout.hash_slots),
+            -1,
+            dtype=torch.int64,
+            device=self.device,
+        )
+        # Keep the public state view at the community-defined hot width while
+        # padding its backing rows for the control plane's request-indexed cells.
+        policy_width = layout.policy_width(max_num_req_slots)
+        self._spec_cache_policy = torch.zeros(
+            (layer_num, max_num_req_slots + 1, policy_width),
+            dtype=torch.int32,
+            device=self.device,
+        )
+        self._spec_scratch_state = torch.zeros(
+            (layer_num, max_num_req_slots + 1, state_width),
+            dtype=torch.int32,
+            device=self.device,
+        )
+        self._spec_states = [
+            HiSparseSpecState(
+                cache_index=self._spec_cache_index[layer_id],
+                cache_policy=self._spec_cache_policy[layer_id, :, : layout.hot_slots],
+                scratch_locs=self.req_device_buffer_token_locs[
+                    layer_id, :, layout.scratch_offset : layout.total_buffer_slots
+                ],
+                scratch_state=self._spec_scratch_state[layer_id],
+            )
+            for layer_id in range(layer_num)
+        ]
+        self.verify_raw_indices_buffer = torch.full(
+            (max_num_req_slots, layout.verify_width, layout.top_k),
+            -1,
+            dtype=torch.int32,
+            device=self.device,
+        )
+        self.verify_device_locs_buffer = torch.full_like(
+            self.verify_raw_indices_buffer, -1
+        )
+        # Finalize runs on a side stream, so its caller-owned inputs must be
+        # snapshotted before the caller can reuse their backing buffers.
+        self._finalize_req_indices = torch.zeros(
+            max_num_req_slots, dtype=torch.int64, device=self.device
+        )
+        self._finalize_prefix_lens = torch.zeros(
+            max_num_req_slots, dtype=torch.int64, device=self.device
+        )
+        self._finalize_commit_lens = torch.zeros(
+            max_num_req_slots, dtype=torch.int32, device=self.device
+        )
+
+    @property
+    def speculative_verify_enabled(self) -> bool:
+        return self.spec_layout is not None
 
     def _init_shared_index_prefetch(
         self,
@@ -435,12 +527,15 @@ class HiSparseCoordinator:
             # must preload all tokens from host pool into the device buffer
             # TODO(hzh0425): Optimize this.
             self._preload_to_device_buffer(req)
-        else:
+        elif not self.speculative_verify_enabled:
             # Long sequence: reset device_buffer_tokens to -1 so the kernel
             # sees all slots as empty -> every top-k lookup is a miss -> host load.
             self.req_device_buffer_tokens[
                 :, req.kv.req_pool_idx, : self.device_buffer_size
             ] = -1
+
+        if self.speculative_verify_enabled:
+            self._initialize_spec_request_state(req.kv.req_pool_idx)
 
         req.hisparse_staging = False
         self._skip_first_backup[req.kv.req_pool_idx] = True
@@ -479,7 +574,7 @@ class HiSparseCoordinator:
                 ((allocated_len + page_size - 1) // page_size) * page_size,
                 self.device_buffer_size,
             )
-            if alloc_size == self.device_buffer_size:
+            if self.speculative_verify_enabled or alloc_size == self.device_buffer_size:
                 alloc_size = self.padded_buffer_size
 
         compressed_logical_indices = (
@@ -506,12 +601,35 @@ class HiSparseCoordinator:
         self.req_to_device_buffer[req.kv.req_pool_idx, :alloc_size] = buffer_indices
         self.req_device_buffer_size[req.kv.req_pool_idx] = alloc_size
 
-        self.req_device_buffer_tokens[
-            :, req.kv.req_pool_idx, : self.device_buffer_size
-        ] = self._device_buffer_arange_i32
         self.req_device_buffer_token_locs[:, req.kv.req_pool_idx, :alloc_size] = (
             buffer_indices[:alloc_size]
         )
+        if self.speculative_verify_enabled:
+            self.req_device_buffer_tokens[:, req.kv.req_pool_idx, :] = -1
+            resident_len = min(compressed_len, self.device_buffer_size)
+            if req.hisparse_staging or compressed_len <= self.device_buffer_size:
+                self.req_device_buffer_tokens[:, req.kv.req_pool_idx, :resident_len] = (
+                    self._device_buffer_arange_i32[:resident_len]
+                )
+            if req.hisparse_staging and compressed_len > self.device_buffer_size:
+                self.req_device_buffer_tokens[
+                    :, req.kv.req_pool_idx, self.device_buffer_size
+                ] = (compressed_len - 1)
+        else:
+            self.req_device_buffer_tokens[
+                :, req.kv.req_pool_idx, : self.device_buffer_size
+            ] = self._device_buffer_arange_i32
+
+    def _initialize_spec_request_state(self, req_pool_idx: int) -> None:
+        req_pool_indices = torch.tensor(
+            [req_pool_idx], dtype=torch.int64, device=self.device
+        )
+        for layer_id, state in enumerate(self._spec_states):
+            initialize_hisparse_spec_state(
+                device_buffer_tokens=self.req_device_buffer_tokens[layer_id],
+                req_pool_indices=req_pool_indices,
+                state=state,
+            )
 
     def _grow_device_buffers(
         self,
@@ -612,6 +730,8 @@ class HiSparseCoordinator:
             _, _, req = self.ack_staging_queue.pop(0)
             # prepare device buffer and update req
             self.alloc_device_buffer(req)
+            if self.speculative_verify_enabled:
+                self._initialize_spec_request_state(req.kv.req_pool_idx)
             self._skip_first_backup[req.kv.req_pool_idx] = True
             req.hisparse_staging = False
             finish_count -= 1
@@ -783,6 +903,155 @@ class HiSparseCoordinator:
             return
         self._backup_done_event.wait(device_module.current_stream())
         self._has_pending_backup = False
+
+    def reserve_speculative_host_slots(
+        self,
+        *,
+        req_pool_indices_cpu: torch.Tensor,
+        reserved_seq_lens_cpu: torch.Tensor,
+    ) -> None:
+        """Reserve host C4 slots through the logical allocation watermark."""
+        layout = self.spec_layout
+        assert layout is not None
+
+        page_size = self.mem_pool_host.page_size
+        reservations = []
+        total_new_slots = 0
+        for req_pool_idx, reserved_seq_len in zip(
+            req_pool_indices_cpu.tolist(), reserved_seq_lens_cpu.tolist()
+        ):
+            rid = int(req_pool_idx)
+            target_compressed_len = int(reserved_seq_len) // layout.compress_ratio
+            allocated_len = int(self.req_to_host_pool_allocated_len[rid])
+            page_end = (target_compressed_len + page_size - 1) // page_size * page_size
+            if page_end > allocated_len:
+                total_new_slots += page_end - allocated_len
+                reservations.append(
+                    (rid, allocated_len, target_compressed_len - allocated_len)
+                )
+        if total_new_slots > self.mem_pool_host.available_size():
+            raise RuntimeError(
+                "HiSparse host pool has insufficient capacity for speculative verify"
+            )
+        for rid, start_pos, count in reservations:
+            self.mem_pool_host.alloc_paged_token_slots(
+                self.req_to_host_pool,
+                self.req_to_host_pool_allocated_len,
+                rid,
+                start_pos,
+                count,
+            )
+
+    def prepare_speculative_verify(
+        self,
+        *,
+        req_pool_indices: torch.Tensor,
+        prefix_lens: torch.Tensor,
+        compressed_out_locs: torch.Tensor,
+    ) -> None:
+        layout = self.spec_layout
+        assert layout is not None
+        prepare_hisparse_spec_verify(
+            req_pool_indices=req_pool_indices,
+            prefix_lens=prefix_lens,
+            hisparse_out_locs=compressed_out_locs,
+            req_to_device_buffer=self.req_to_device_buffer,
+            device_buffer_tokens=self.req_device_buffer_tokens,
+            num_real_reqs=self.num_real_reqs,
+            logical_to_device_mapping=self._logical_to_device_mapping,
+            verify_width=layout.verify_width,
+            compress_ratio=layout.compress_ratio,
+            hot_buffer_size=layout.hot_slots,
+            speculative_slots=layout.speculative_slots,
+        )
+
+    def swap_in_speculative_pages(
+        self,
+        *,
+        req_pool_indices: torch.Tensor,
+        compressed_seq_lens: torch.Tensor,
+        top_k_result: torch.Tensor,
+        layer_id: int,
+    ) -> torch.Tensor:
+        layout = self.spec_layout
+        plan = self.spec_plan
+        assert layout is not None
+        assert plan is not None
+        batch_size = req_pool_indices.size(0)
+        raw_indices = top_k_result.view(batch_size, layout.verify_width, layout.top_k)
+        device_locs = self.verify_device_locs_buffer[:batch_size]
+        load_cache_to_device_buffer_spec_mla(
+            transfer_kind=plan.transfer_kind.value,
+            item_size_bytes=self.item_size_bytes,
+            top_k_tokens=raw_indices,
+            device_buffer_tokens=self.req_device_buffer_tokens[
+                layer_id, :, : layout.active_buffer_slots
+            ],
+            host_cache_locs=self.req_to_host_pool,
+            device_buffer_locs=self.req_device_buffer_token_locs[
+                layer_id, :, : layout.active_buffer_slots
+            ],
+            host_cache=self.mem_pool_host.kv_buffer[layer_id],
+            device_buffer=self.mem_pool_device.kv_buffer[layer_id],
+            top_k_device_locs=device_locs,
+            req_pool_indices=req_pool_indices,
+            seq_lens=compressed_seq_lens.view(-1),
+            state=self._spec_states[layer_id],
+            num_real_reqs=self.num_real_reqs,
+        )
+        return device_locs.view(-1, layout.top_k)
+
+    def finalize_speculative_verify(
+        self,
+        *,
+        req_pool_indices: torch.Tensor,
+        prefix_lens: torch.Tensor,
+        commit_lens: torch.Tensor,
+    ) -> None:
+        layout = self.spec_layout
+        plan = self.spec_plan
+        assert layout is not None
+        assert plan is not None
+        self.wait_for_pending_backup()
+        batch_size = req_pool_indices.size(0)
+        req_snapshot = self._finalize_req_indices[:batch_size]
+        prefix_snapshot = self._finalize_prefix_lens[:batch_size]
+        commit_snapshot = self._finalize_commit_lens[:batch_size]
+        req_snapshot.copy_(req_pool_indices)
+        prefix_snapshot.copy_(prefix_lens)
+        commit_snapshot.copy_(commit_lens)
+
+        producer_stream = device_module.current_stream()
+        with device_module.stream(self.decode_backup_stream):
+            self.decode_backup_stream.wait_stream(producer_stream)
+            transfer_hisparse_spec_finalize(
+                device_ptrs=self.mem_pool_device.data_ptrs,
+                host_ptrs=self.mem_pool_host.data_ptrs,
+                req_pool_indices=req_snapshot,
+                prefix_lens=prefix_snapshot,
+                commit_lens=commit_snapshot,
+                req_to_host_pool=self.req_to_host_pool,
+                device_buffer_locs=self.req_device_buffer_token_locs,
+                compress_ratio=layout.compress_ratio,
+                hot_buffer_size=layout.hot_slots,
+                speculative_slots=layout.speculative_slots,
+                transfer_kind=plan.transfer_kind.value,
+                item_size_bytes=self.item_size_bytes,
+            )
+            complete_hisparse_spec_finalize(
+                req_pool_indices=req_snapshot,
+                prefix_lens=prefix_snapshot,
+                commit_lens=commit_snapshot,
+                req_to_token=self.req_to_token_pool.req_to_token,
+                device_buffer_tokens=self.req_device_buffer_tokens,
+                logical_to_device_mapping=self._logical_to_device_mapping,
+                verify_width=layout.verify_width,
+                compress_ratio=layout.compress_ratio,
+                hot_buffer_size=layout.hot_slots,
+                speculative_slots=layout.speculative_slots,
+            )
+            self._backup_done_event.record()
+        self._has_pending_backup = True
 
     def naive_load_topk(
         self,

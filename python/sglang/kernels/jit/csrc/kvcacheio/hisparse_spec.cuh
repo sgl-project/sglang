@@ -1,12 +1,13 @@
 #pragma once
 
 // Multi-step speculative HiSparse cache-management kernels.
-// DSv4 cache transfer remains in hisparse.cuh.
 
 #include <sgl_kernel/tensor.h>  // TensorMatcher and symbolic tensor validation
 #include <sgl_kernel/utils.h>   // RuntimeCheck and host utilities
 
 #include <sgl_kernel/utils.cuh>  // LaunchKernel and PDL helpers
+
+#include "hisparse_transfer.cuh"
 
 #include <dlpack/dlpack.h>
 #include <tvm/ffi/container/tensor.h>
@@ -49,6 +50,8 @@ struct SpecMissWorkspace {
   int32_t* __restrict__ metadata;
   int32_t* __restrict__ counters;
   int64_t loc_stride;
+  // A sliced tail view can have a row stride larger than its usable width.
+  int64_t loc_capacity;
   int64_t metadata_stride;
   int64_t counter_capacity;
 };
@@ -284,83 +287,6 @@ __device__ __forceinline__ void ring_hash_erase_atomic(
   atomic_cas_i64(vals + secondary_slot, expected, HASH_DELETED);
 }
 
-#ifdef USE_ROCM
-template <int ITEM_SIZE_BYTES>
-__device__ __forceinline__ void
-transfer_item_warp(int32_t lane_id, const void* __restrict__ src_addr, void* __restrict__ dst_addr) {
-  const auto src = static_cast<const char*>(src_addr);
-  auto dst = static_cast<char*>(dst_addr);
-
-  constexpr int64_t word_count = ITEM_SIZE_BYTES / static_cast<int64_t>(sizeof(uint64_t));
-  const auto src_words = reinterpret_cast<const uint64_t*>(src);
-  auto dst_words = reinterpret_cast<uint64_t*>(dst);
-  for (int64_t i = lane_id; i < word_count; i += WARP_SIZE) {
-    dst_words[i] = src_words[i];
-  }
-
-  constexpr int64_t tail_start = word_count * static_cast<int64_t>(sizeof(uint64_t));
-  for (int64_t i = tail_start + lane_id; i < ITEM_SIZE_BYTES; i += WARP_SIZE) {
-    dst[i] = src[i];
-  }
-}
-
-#else
-template <int ITEM_SIZE_BYTES>
-__device__ __forceinline__ void transfer_item_warp(int32_t lane_id, const void* src_addr, void* dst_addr) {
-  // Issue the 512B body and 64B edge loads before either store so both host
-  // reads can remain in flight. Rows alternate between 0B and 64B offsets in
-  // a 128B transaction, so place the body on the aligned side of each row.
-  if constexpr (ITEM_SIZE_BYTES == 576) {
-    const auto src = static_cast<const char*>(src_addr);
-    auto dst = static_cast<char*>(dst_addr);
-    const bool edge_first = (reinterpret_cast<uintptr_t>(src_addr) & 127u) == 64u;
-    const int32_t body_offset = edge_first ? 64 : 0;
-    const int32_t edge_offset = edge_first ? 0 : 512;
-    uint64_t body_lo, body_hi;
-    uint64_t edge_lo, edge_hi;
-    const auto body_src = reinterpret_cast<const uint64_t*>(src + body_offset + lane_id * 16);
-    auto body_dst = reinterpret_cast<uint64_t*>(dst + body_offset + lane_id * 16);
-    asm volatile("ld.global.nc.v2.b64 {%0,%1},[%2];" : "=l"(body_lo), "=l"(body_hi) : "l"(body_src) : "memory");
-    if (lane_id < 4) {
-      const auto edge_src = reinterpret_cast<const uint64_t*>(src + edge_offset + lane_id * 16);
-      asm volatile("ld.global.nc.v2.b64 {%0,%1},[%2];" : "=l"(edge_lo), "=l"(edge_hi) : "l"(edge_src) : "memory");
-    }
-    asm volatile("st.global.cg.v2.b64 [%0],{%1,%2};" ::"l"(body_dst), "l"(body_lo), "l"(body_hi) : "memory");
-    if (lane_id < 4) {
-      auto edge_dst = reinterpret_cast<uint64_t*>(dst + edge_offset + lane_id * 16);
-      asm volatile("st.global.cg.v2.b64 [%0],{%1,%2};" ::"l"(edge_dst), "l"(edge_lo), "l"(edge_hi) : "memory");
-    }
-    return;
-  }
-
-  // 128-bit bulk transfer via paired 64-bit loads (avoids alignment issues with uint4)
-  constexpr int total_pairs = ITEM_SIZE_BYTES / 16;  // number of 16-byte chunks
-  {
-    const uint64_t* __restrict__ src = static_cast<const uint64_t*>(src_addr);
-    uint64_t* __restrict__ dst = static_cast<uint64_t*>(dst_addr);
-    for (int j = lane_id; j < total_pairs; j += WARP_SIZE) {
-      uint64_t lo, hi;
-      const uint64_t* s = src + j * 2;
-      asm volatile("ld.global.nc.v2.b64 {%0,%1},[%2];" : "=l"(lo), "=l"(hi) : "l"(s) : "memory");
-      uint64_t* d = dst + j * 2;
-      asm volatile("st.global.cg.v2.b64 [%0],{%1,%2};" ::"l"(d), "l"(lo), "l"(hi) : "memory");
-    }
-  }
-
-  // Tail: 64-bit for remaining 8-byte chunk (if item_size not multiple of 16)
-  constexpr int tail_8B = (ITEM_SIZE_BYTES - total_pairs * 16) / 8;
-  if (tail_8B > 0 && lane_id < tail_8B) {
-    const uint64_t* __restrict__ src8 =
-        reinterpret_cast<const uint64_t*>(static_cast<const char*>(src_addr) + total_pairs * 16);
-    uint64_t* __restrict__ dst8 = reinterpret_cast<uint64_t*>(static_cast<char*>(dst_addr) + total_pairs * 16);
-    uint64_t tmp;
-    asm volatile("ld.global.nc.b64 %0,[%1];" : "=l"(tmp) : "l"(src8 + lane_id) : "memory");
-    asm volatile("st.global.cg.b64 [%0],%1;" ::"l"(dst8 + lane_id), "l"(tmp) : "memory");
-  }
-}
-
-#endif
-
 __device__ __forceinline__ int first_set_lane(BallotMask mask) {
 #ifdef USE_ROCM
   return __ffsll(mask) - 1;
@@ -370,16 +296,16 @@ __device__ __forceinline__ int first_set_lane(BallotMask mask) {
 }
 
 template <int HOT_BUFFER_SIZE>
-__device__ __forceinline__ bool try_get_extra_page_device_loc(
+__device__ __forceinline__ bool try_get_active_tail_device_loc(
     int32_t token_idx,
     int64_t seq_len,
     const int32_t* __restrict__ req_device_buffer_tokens,
     const int32_t* __restrict__ req_device_buffer_locs,
-    int64_t page_size,
+    int64_t active_tail_slots,
     int32_t* __restrict__ out_loc) {
   int64_t slot = -1;
-  if (static_cast<int64_t>(token_idx) >= seq_len - page_size) {
-    if (page_size == 4) {
+  if (static_cast<int64_t>(token_idx) >= seq_len - active_tail_slots) {
+    if (active_tail_slots == 4) {
       const int4 page_tokens = *reinterpret_cast<const int4*>(req_device_buffer_tokens + HOT_BUFFER_SIZE);
       if (page_tokens.x == token_idx) {
         slot = HOT_BUFFER_SIZE;
@@ -391,7 +317,9 @@ __device__ __forceinline__ bool try_get_extra_page_device_loc(
         slot = HOT_BUFFER_SIZE + 3;
       }
     } else {
-      for (int64_t candidate_slot = HOT_BUFFER_SIZE; candidate_slot < HOT_BUFFER_SIZE + page_size; candidate_slot++) {
+      for (int64_t candidate_slot = HOT_BUFFER_SIZE;
+           candidate_slot < HOT_BUFFER_SIZE + active_tail_slots;
+           candidate_slot++) {
         if (req_device_buffer_tokens[candidate_slot] == token_idx) {
           slot = candidate_slot;
           break;
@@ -400,7 +328,7 @@ __device__ __forceinline__ bool try_get_extra_page_device_loc(
     }
   }
 
-  if (slot < HOT_BUFFER_SIZE || slot >= HOT_BUFFER_SIZE + page_size) {
+  if (slot < HOT_BUFFER_SIZE || slot >= HOT_BUFFER_SIZE + active_tail_slots) {
     return false;
   }
   const int32_t loc = req_device_buffer_locs[slot];
@@ -413,7 +341,13 @@ __device__ __forceinline__ bool try_get_extra_page_device_loc(
 
 // Flatten all speculative steps. Each lane resolves one occurrence; the warp
 // cooperatively copies only lanes that won a unique-miss claim.
-template <int BLOCK_SIZE, int NUM_TOP_K, int HOT_BUFFER_SIZE, int ITEM_SIZE_BYTES, int NUM_STEPS, bool RecordMissPlan>
+template <
+    int BLOCK_SIZE,
+    int NUM_TOP_K,
+    int HOT_BUFFER_SIZE,
+    int NUM_STEPS,
+    bool RecordMissPlan,
+    typename KVTransferPolicy>
 __global__ void load_cache_to_device_buffer_spec_gather_kernel(
     const int32_t* __restrict__ top_k_tokens,
     int32_t* __restrict__ device_buffer_tokens,
@@ -435,7 +369,7 @@ __global__ void load_cache_to_device_buffer_spec_gather_kernel(
     int64_t top_k_tokens_stride,
     int64_t top_k_device_locs_stride,
     int64_t plan_stride,
-    int64_t page_size) {
+    int64_t active_tail_slots) {
   const int bid = blockIdx.x;
   const int tid = threadIdx.x;
   constexpr int64_t total_occurrences = NUM_STEPS * NUM_TOP_K;
@@ -496,8 +430,13 @@ __global__ void load_cache_to_device_buffer_spec_gather_kernel(
     const int64_t seq_len = static_cast<int64_t>(seq_lens[bid * NUM_STEPS + step]);
     if (token >= 0 && token < seq_len) {
       int32_t direct_loc = -1;
-      if (try_get_extra_page_device_loc<HOT_BUFFER_SIZE>(
-              token, seq_len, req_device_buffer_tokens, req_device_buffer_locs, page_size, &direct_loc)) {
+      if (try_get_active_tail_device_loc<HOT_BUFFER_SIZE>(
+              token,
+              seq_len,
+              req_device_buffer_tokens,
+              req_device_buffer_locs,
+              active_tail_slots,
+              &direct_loc)) {
         loc = direct_loc;
       } else {
         needs_cache_lookup = true;
@@ -544,7 +483,7 @@ __global__ void load_cache_to_device_buffer_spec_gather_kernel(
               req_compact_hash_positions[unique_idx] = hash_pos;
               __threadfence();
               atomicExch(req_scratch_indices + hash_pos, epoch_bits | static_cast<uint32_t>(unique_idx));
-              if (unique_idx < miss_workspace.loc_stride) {
+              if (unique_idx < miss_workspace.loc_capacity) {
                 loc = req_scratch_locs[unique_idx];
                 copy_owner = loc >= 0;
               }
@@ -558,7 +497,7 @@ __global__ void load_cache_to_device_buffer_spec_gather_kernel(
               index_entry = atomicCAS(req_scratch_indices + hash_pos, 0ull, 0ull);
             }
             const int32_t unique_idx = static_cast<int32_t>(static_cast<uint32_t>(index_entry));
-            if (unique_idx < miss_workspace.loc_stride) {
+            if (unique_idx < miss_workspace.loc_capacity) {
               loc = req_scratch_locs[unique_idx];
             }
             break;
@@ -598,15 +537,20 @@ __global__ void load_cache_to_device_buffer_spec_gather_kernel(
           miss_dst_out[bid * plan_stride + copy_miss_idx] = copy_loc;
         }
       }
-      const auto src_k = static_cast<const char*>(host_cache_k) + copy_src_loc * ITEM_SIZE_BYTES;
-      auto dst_k = static_cast<char*>(device_buffer_k) + static_cast<int64_t>(copy_loc) * ITEM_SIZE_BYTES;
-      transfer_item_warp<ITEM_SIZE_BYTES>(lane_id, src_k, dst_k);
+      KVTransferPolicy::copy_warp(
+          lane_id, host_cache_k, device_buffer_k, copy_src_loc, static_cast<int64_t>(copy_loc));
     }
     copy_mask &= ~(static_cast<BallotMask>(1) << owner_lane);
   }
 }
 
-template <int NUM_TOP_K, int HOT_BUFFER_SIZE, int ITEM_SIZE_BYTES, int NUM_STEPS, bool RecordMissPlan, bool USE_PDL>
+template <
+    int NUM_TOP_K,
+    int HOT_BUFFER_SIZE,
+    int NUM_STEPS,
+    bool RecordMissPlan,
+    typename KVTransferPolicy,
+    bool USE_PDL>
 __global__ void load_cache_to_device_buffer_spec_commit_kernel(
     const int32_t* __restrict__ top_k_tokens,
     int32_t* __restrict__ top_k_device_locs,
@@ -662,7 +606,7 @@ __global__ void load_cache_to_device_buffer_spec_commit_kernel(
   const int32_t scratch_epoch = static_cast<int32_t>(next_scratch_epoch);
   const int32_t miss_count = *req_work_count;
   const int32_t union_hit_count = *req_union_hit_count;
-  const bool scratch_overflow = miss_count > miss_workspace.loc_stride;
+  const bool scratch_overflow = miss_count > miss_workspace.loc_capacity;
   const int64_t compact_iterations = (miss_count + blockDim.x - 1) / blockDim.x;
   const bool lock_free_single_pass = compact_iterations == 1;
 
@@ -675,7 +619,7 @@ __global__ void load_cache_to_device_buffer_spec_commit_kernel(
   if (threadIdx.x == 0) {
     s_use_union_clock = miss_count + union_hit_count <= HOT_BUFFER_SIZE;
     const int32_t mandatory_direct_misses =
-        scratch_overflow ? miss_count - static_cast<int32_t>(miss_workspace.loc_stride) : 0;
+        scratch_overflow ? miss_count - static_cast<int32_t>(miss_workspace.loc_capacity) : 0;
     s_approx_admission_budget =
         s_use_union_clock ? 0
                           : (scratch_overflow ? max(0, HOT_BUFFER_SIZE - union_hit_count - mandatory_direct_misses)
@@ -721,7 +665,7 @@ __global__ void load_cache_to_device_buffer_spec_commit_kernel(
           static_cast<int32_t>(total_occurrences),
           static_cast<uint32_t>(scratch_epoch),
           token);
-      if (unique_idx >= 0 && unique_idx < miss_workspace.loc_stride) {
+      if (unique_idx >= 0 && unique_idx < miss_workspace.loc_capacity) {
         const int32_t old_metadata = atomicOr(req_compact_hash_positions + unique_idx, COMPACT_APPROX_CLAIM_FLAG);
         if ((old_metadata & COMPACT_APPROX_CLAIM_FLAG) == 0) {
           const int32_t admission_ordinal = atomicAdd(req_union_hit_count, 1);
@@ -755,9 +699,9 @@ __global__ void load_cache_to_device_buffer_spec_commit_kernel(
           static_cast<uint32_t>(index_entry >> 32) == static_cast<uint32_t>(scratch_epoch)) {
         token = static_cast<int32_t>(static_cast<uint32_t>(packed));
         unique_idx = static_cast<int32_t>(static_cast<uint32_t>(index_entry));
-        direct_overflow = scratch_overflow && unique_idx >= miss_workspace.loc_stride;
+        direct_overflow = scratch_overflow && unique_idx >= miss_workspace.loc_capacity;
         const bool approximate_admission = !s_use_union_clock && (compact_entry & COMPACT_APPROX_ADMIT_FLAG) != 0;
-        rotate_compact = unique_idx < miss_workspace.loc_stride && (s_use_union_clock || approximate_admission);
+        rotate_compact = unique_idx < miss_workspace.loc_capacity && (s_use_union_clock || approximate_admission);
 
         if ((direct_overflow || rotate_compact) && s_use_union_clock) {
           uint32_t oldest_age = 0;
@@ -782,7 +726,7 @@ __global__ void load_cache_to_device_buffer_spec_commit_kernel(
             req_cache_ref_bits[victim] = cache_epoch;
           }
         } else if (direct_overflow || rotate_compact) {
-          const int32_t scratch_capacity = static_cast<int32_t>(miss_workspace.loc_stride);
+          const int32_t scratch_capacity = static_cast<int32_t>(miss_workspace.loc_capacity);
           const int32_t victim_count = direct_overflow ? miss_count - scratch_capacity : miss_count;
           const int32_t victim_ordinal = direct_overflow ? unique_idx - scratch_capacity : unique_idx;
           for (int32_t linear = victim_ordinal; linear < HOT_BUFFER_SIZE; linear += victim_count) {
@@ -872,9 +816,8 @@ __global__ void load_cache_to_device_buffer_spec_commit_kernel(
             miss_dst_out[bid * plan_stride + miss_idx] = dst_loc;
           }
         }
-        const auto src_k = static_cast<const char*>(host_cache_k) + src_loc * ITEM_SIZE_BYTES;
-        auto dst_k = static_cast<char*>(device_buffer_k) + static_cast<int64_t>(dst_loc) * ITEM_SIZE_BYTES;
-        transfer_item_warp<ITEM_SIZE_BYTES>(lane_id, src_k, dst_k);
+        KVTransferPolicy::copy_warp(
+            lane_id, host_cache_k, device_buffer_k, src_loc, static_cast<int64_t>(dst_loc));
       }
       copy_mask &= ~(static_cast<BallotMask>(1) << owner_lane);
     }
@@ -932,9 +875,9 @@ template <
     int BLOCK_SIZE,
     int NUM_TOP_K,
     int HOT_BUFFER_SIZE,
-    int ITEM_SIZE_BYTES,
     int NUM_STEPS,
     bool RecordMissPlan,
+    typename KVTransferPolicy,
     bool USE_PDL>
 void load_cache_to_device_buffer_spec(
     tvm::ffi::TensorView top_k_tokens,
@@ -951,14 +894,14 @@ void load_cache_to_device_buffer_spec(
     tvm::ffi::TensorView scratch_locs,
     tvm::ffi::TensorView scratch_state,
     tvm::ffi::TensorView num_real_reqs,
-    int64_t page_size,
+    int64_t active_tail_slots,
     tvm::ffi::TensorView miss_src_out,
     tvm::ffi::TensorView miss_dst_out,
     tvm::ffi::TensorView miss_count_out) {
   using namespace host;
 
-  static_assert(NUM_STEPS > 1 && NUM_STEPS <= 4, "HiSparse speculative swap requires 2-4 steps.");
-  static_assert(NUM_TOP_K >= 1024, "HiSparse speculative swap requires top_k >= 1024.");
+  static_assert(NUM_STEPS > 0, "HiSparse speculative swap requires at least one step.");
+  static_assert(NUM_TOP_K > 0, "HiSparse speculative swap requires a positive top_k.");
   static_assert(NUM_STEPS * NUM_TOP_K <= 8192, "HiSparse speculative swap supports at most 8192 occurrences.");
 
   const int64_t bs = top_k_tokens.shape()[0];
@@ -973,10 +916,9 @@ void load_cache_to_device_buffer_spec(
   const int64_t ring_hash_size = cache_index.shape()[2];
   RuntimeCheck(
       ring_hash_size > 0 && (ring_hash_size & (ring_hash_size - 1)) == 0, "ring hash capacity must be a power of two.");
-  RuntimeCheck(
-      scratch_locs.ndim() == 2 && scratch_locs.shape()[1] > 0,
-      "speculative scratch_locs must have shape [num_requests, scratch_capacity].");
+  RuntimeCheck(scratch_locs.ndim() == 2, "speculative scratch_locs must have shape [num_requests, capacity].");
   const int64_t num_request_slots = scratch_locs.shape()[0];
+  const int64_t scratch_capacity = scratch_locs.shape()[1];
   RuntimeCheck(
       cache_index.shape()[0] >= num_request_slots,
       "speculative cache_index request capacity is smaller than scratch_locs.");
@@ -1041,6 +983,7 @@ void load_cache_to_device_buffer_spec(
       scratch_state_ptr + scratch_state_stride_0,
       scratch_state_ptr,
       scratch_stride_0,
+      scratch_capacity,
       scratch_state_stride_0,
       num_request_slots};
   auto cuda_device = SymbolicDevice{};
@@ -1055,9 +998,9 @@ void load_cache_to_device_buffer_spec(
           BLOCK_SIZE,
           NUM_TOP_K,
           HOT_BUFFER_SIZE,
-          ITEM_SIZE_BYTES,
           NUM_STEPS,
-          RecordMissPlan>,
+          RecordMissPlan,
+          KVTransferPolicy>,
       static_cast<const int32_t*>(top_k_tokens.data_ptr()),
       static_cast<int32_t*>(device_buffer_tokens.data_ptr()),
       static_cast<const int64_t*>(host_cache_locs.data_ptr()),
@@ -1078,16 +1021,16 @@ void load_cache_to_device_buffer_spec(
       top_k_tokens_stride,
       top_k_device_locs_stride,
       plan_stride,
-      page_size);
+      active_tail_slots);
 
   LaunchKernel(dim3(static_cast<uint32_t>(bs)), 512, device)
       .enable_pdl(USE_PDL)(
           load_cache_to_device_buffer_spec_commit_kernel<
               NUM_TOP_K,
               HOT_BUFFER_SIZE,
-              ITEM_SIZE_BYTES,
               NUM_STEPS,
               RecordMissPlan,
+              KVTransferPolicy,
               USE_PDL>,
           static_cast<const int32_t*>(top_k_tokens.data_ptr()),
           static_cast<int32_t*>(top_k_device_locs.data_ptr()),
@@ -1108,6 +1051,478 @@ void load_cache_to_device_buffer_spec(
           buffer_stride_0,
           host_stride,
           plan_stride);
+}
+
+template <int HOT_BUFFER_SIZE>
+__global__ void initialize_hisparse_spec_state_kernel(
+    const int32_t* __restrict__ device_buffer_tokens,
+    const int64_t* __restrict__ req_pool_indices,
+    int64_t* __restrict__ cache_index,
+    int32_t* __restrict__ cache_policy,
+    int32_t* __restrict__ scratch_state,
+    int64_t buffer_stride,
+    int64_t hash_row_stride,
+    int64_t hash_bank_stride,
+    int64_t hash_size,
+    int64_t policy_row_stride,
+    int64_t state_row_stride,
+    int64_t num_request_slots) {
+  const int64_t rid = req_pool_indices[blockIdx.x];
+  int64_t* primary = cache_index + rid * hash_row_stride;
+  int64_t* secondary = primary + hash_bank_stride;
+  int32_t* ring_state = cache_policy;
+  int32_t* ref_epochs = cache_policy + (rid + 1) * policy_row_stride;
+  int32_t* counters = scratch_state;
+  int32_t* metadata = scratch_state + (rid + 1) * state_row_stride;
+
+  for (int64_t i = threadIdx.x; i < hash_size; i += blockDim.x) {
+    primary[i] = -1;
+    secondary[i] = -1;
+  }
+  for (int64_t i = threadIdx.x; i < HOT_BUFFER_SIZE; i += blockDim.x) {
+    ref_epochs[i] = 0;
+  }
+  for (int64_t i = threadIdx.x; i < state_row_stride; i += blockDim.x) {
+    metadata[i] = 0;
+  }
+  if (threadIdx.x == 0) {
+    ring_state[rid] = 0;
+    counters[rid] = 0;
+    counters[num_request_slots + rid] = 0;
+    counters[2 * num_request_slots + rid] = 0;
+    counters[3 * num_request_slots + rid] = 0;
+  }
+  __syncthreads();
+
+  const int32_t* tokens = device_buffer_tokens + rid * buffer_stride;
+  for (int32_t slot = threadIdx.x; slot < HOT_BUFFER_SIZE; slot += blockDim.x) {
+    const int32_t token = tokens[slot];
+    if (token >= 0 &&
+        ring_hash_insert_atomic<HOT_BUFFER_SIZE>(primary, secondary, hash_size, token, slot) < 0) {
+      atomicOr(counters + 3 * num_request_slots + rid, static_cast<int32_t>(HASH_DEGRADED_FLAG));
+    }
+  }
+}
+
+template <int HOT_BUFFER_SIZE>
+void initialize_hisparse_spec_state(
+    tvm::ffi::TensorView device_buffer_tokens,
+    tvm::ffi::TensorView req_pool_indices,
+    tvm::ffi::TensorView cache_index,
+    tvm::ffi::TensorView cache_policy,
+    tvm::ffi::TensorView scratch_state) {
+  using namespace host;
+
+  const int64_t batch_size = req_pool_indices.shape()[0];
+  const int64_t num_request_slots = cache_index.shape()[0];
+  const int64_t hash_size = cache_index.shape()[2];
+  auto cuda_device = SymbolicDevice{};
+  cuda_device.set_options<kDLCUDA>();
+  TensorMatcher({batch_size}).with_dtype<int64_t>().with_device(cuda_device).verify(req_pool_indices);
+  const auto device = cuda_device.unwrap();
+
+  LaunchKernel(static_cast<uint32_t>(batch_size), 256, device)(
+      initialize_hisparse_spec_state_kernel<HOT_BUFFER_SIZE>,
+      static_cast<const int32_t*>(device_buffer_tokens.data_ptr()),
+      static_cast<const int64_t*>(req_pool_indices.data_ptr()),
+      static_cast<int64_t*>(cache_index.data_ptr()),
+      static_cast<int32_t*>(cache_policy.data_ptr()),
+      static_cast<int32_t*>(scratch_state.data_ptr()),
+      device_buffer_tokens.strides()[0],
+      cache_index.strides()[0],
+      cache_index.strides()[1],
+      hash_size,
+      cache_policy.strides()[0],
+      scratch_state.strides()[0],
+      num_request_slots);
+}
+
+template <int VERIFY_WIDTH, int COMPRESS_RATIO, int HOT_BUFFER_SIZE, int SPECULATIVE_SLOTS>
+__global__ void prepare_hisparse_spec_verify_kernel(
+    const int64_t* __restrict__ req_pool_indices,
+    const int64_t* __restrict__ prefix_lens,
+    const int64_t* __restrict__ hisparse_out_locs,
+    const int64_t* __restrict__ req_to_device_buffer,
+    int32_t* __restrict__ device_buffer_tokens,
+    const int32_t* __restrict__ num_real_reqs,
+    int64_t* __restrict__ logical_to_device_mapping,
+    int64_t owner_stride,
+    int64_t token_layer_stride,
+    int64_t token_req_stride,
+    int32_t num_layers) {
+  const int bid = blockIdx.x;
+  const int tid = threadIdx.x;
+  if (bid >= num_real_reqs[0]) {
+    return;
+  }
+  const int64_t rid = req_pool_indices[bid];
+  const int64_t prefix = prefix_lens[bid];
+  const int32_t old_count = static_cast<int32_t>(prefix / COMPRESS_RATIO);
+  const int32_t generated_count =
+      static_cast<int32_t>((prefix + VERIFY_WIDTH) / COMPRESS_RATIO) - old_count;
+
+  for (int i = tid; i < num_layers * SPECULATIVE_SLOTS; i += blockDim.x) {
+    const int layer = i / SPECULATIVE_SLOTS;
+    const int ordinal = i % SPECULATIVE_SLOTS;
+    device_buffer_tokens[
+        layer * token_layer_stride + rid * token_req_stride + HOT_BUFFER_SIZE + 1 + ordinal] = -1;
+  }
+  if (tid == 0) {
+    for (int step = 0; step < VERIFY_WIDTH; ++step) {
+      const int64_t seq_len = prefix + step + 1;
+      if (seq_len % COMPRESS_RATIO != 0) {
+        continue;
+      }
+      const int32_t position = static_cast<int32_t>(seq_len / COMPRESS_RATIO - 1);
+      const int32_t ordinal = position - old_count;
+      const int64_t logical_loc = hisparse_out_locs[bid * VERIFY_WIDTH + step];
+      const int64_t device_loc =
+          req_to_device_buffer[rid * owner_stride + HOT_BUFFER_SIZE + 1 + ordinal];
+      logical_to_device_mapping[logical_loc] = device_loc;
+    }
+  }
+  __syncthreads();
+
+  for (int ordinal = 0; ordinal < generated_count; ++ordinal) {
+    const int32_t position = old_count + ordinal;
+    for (int layer = tid; layer < num_layers; layer += blockDim.x) {
+      device_buffer_tokens[
+          layer * token_layer_stride + rid * token_req_stride + HOT_BUFFER_SIZE + 1 + ordinal] = position;
+    }
+  }
+}
+
+template <int VERIFY_WIDTH, int COMPRESS_RATIO, int HOT_BUFFER_SIZE, int SPECULATIVE_SLOTS>
+void prepare_hisparse_spec_verify(
+    tvm::ffi::TensorView req_pool_indices,
+    tvm::ffi::TensorView prefix_lens,
+    tvm::ffi::TensorView hisparse_out_locs,
+    tvm::ffi::TensorView req_to_device_buffer,
+    tvm::ffi::TensorView device_buffer_tokens,
+    tvm::ffi::TensorView num_real_reqs,
+    tvm::ffi::TensorView logical_to_device_mapping) {
+  using namespace host;
+
+  auto batch_size = SymbolicSize{"batch_size"};
+  auto num_out_locs = SymbolicSize{"num_out_locs"};
+  auto num_layers = SymbolicSize{"num_layers"};
+  auto num_req_slots = SymbolicSize{"num_req_slots"};
+  auto buffer_slots = SymbolicSize{"buffer_slots"};
+  auto mapping_size = SymbolicSize{"mapping_size"};
+  auto cuda_device = SymbolicDevice{};
+  cuda_device.set_options<kDLCUDA>();
+  TensorMatcher({batch_size}).with_dtype<int64_t>().with_device(cuda_device).verify(req_pool_indices).verify(
+      prefix_lens);
+  TensorMatcher({num_out_locs})
+      .with_dtype<int64_t>()
+      .with_device(cuda_device)
+      .verify(hisparse_out_locs);
+  RuntimeCheck(
+      num_out_locs.unwrap() == batch_size.unwrap() * VERIFY_WIDTH,
+      "HiSparse speculative output locations must contain batch_size * verify_width entries.");
+  TensorMatcher({num_req_slots, buffer_slots})
+      .with_dtype<int64_t>()
+      .with_device(cuda_device)
+      .verify(req_to_device_buffer);
+  TensorMatcher({num_layers, num_req_slots, buffer_slots})
+      .with_dtype<int32_t>()
+      .with_device(cuda_device)
+      .verify(device_buffer_tokens);
+  TensorMatcher({1}).with_dtype<int32_t>().with_device(cuda_device).verify(num_real_reqs);
+  TensorMatcher({mapping_size})
+      .with_dtype<int64_t>()
+      .with_device(cuda_device)
+      .verify(logical_to_device_mapping);
+
+  LaunchKernel(batch_size.unwrap(), 256, cuda_device.unwrap())(
+      prepare_hisparse_spec_verify_kernel<
+          VERIFY_WIDTH, COMPRESS_RATIO, HOT_BUFFER_SIZE, SPECULATIVE_SLOTS>,
+      static_cast<const int64_t*>(req_pool_indices.data_ptr()),
+      static_cast<const int64_t*>(prefix_lens.data_ptr()),
+      static_cast<const int64_t*>(hisparse_out_locs.data_ptr()),
+      static_cast<const int64_t*>(req_to_device_buffer.data_ptr()),
+      static_cast<int32_t*>(device_buffer_tokens.data_ptr()),
+      static_cast<const int32_t*>(num_real_reqs.data_ptr()),
+      static_cast<int64_t*>(logical_to_device_mapping.data_ptr()),
+      req_to_device_buffer.strides()[0],
+      device_buffer_tokens.strides()[0],
+      device_buffer_tokens.strides()[1],
+      static_cast<int32_t>(num_layers.unwrap()));
+}
+
+constexpr int HISPARSE_SPEC_TRANSFER_BLOCK_SIZE = 256;
+constexpr int HISPARSE_SPEC_TRANSFER_WARPS = HISPARSE_SPEC_TRANSFER_BLOCK_SIZE / WARP_SIZE;
+
+template <int COMPRESS_RATIO, int HOT_BUFFER_SIZE, int SPECULATIVE_SLOTS, typename KVTransferPolicy>
+__global__ __launch_bounds__(HISPARSE_SPEC_TRANSFER_BLOCK_SIZE, 1) void backup_accepted_hisparse_spec_kernel(
+    void** device_caches,
+    void** host_caches,
+    const int64_t* __restrict__ req_pool_indices,
+    const int64_t* __restrict__ prefix_lens,
+    const int32_t* __restrict__ commit_lens,
+    const int64_t* __restrict__ req_to_host_pool,
+    const int32_t* __restrict__ device_buffer_locs,
+    int64_t host_stride,
+    int64_t loc_layer_stride,
+    int64_t loc_req_stride,
+    int32_t batch_size,
+    int32_t num_layers) {
+  const int global_tid = blockIdx.x * blockDim.x + threadIdx.x;
+  const int lane_id = threadIdx.x % WARP_SIZE;
+  const int total_warps = gridDim.x * HISPARSE_SPEC_TRANSFER_WARPS;
+  const int num_items = batch_size * SPECULATIVE_SLOTS;
+
+  for (int item = global_tid / WARP_SIZE; item < num_items; item += total_warps) {
+    const int bid = item / SPECULATIVE_SLOTS;
+    const int ordinal = item % SPECULATIVE_SLOTS;
+    const int64_t rid = req_pool_indices[bid];
+    const int64_t prefix = prefix_lens[bid];
+    const int32_t old_count = static_cast<int32_t>(prefix / COMPRESS_RATIO);
+    const int32_t accepted =
+        static_cast<int32_t>((prefix + commit_lens[bid]) / COMPRESS_RATIO) - old_count;
+    if (ordinal >= accepted) {
+      continue;
+    }
+
+    const int64_t dst = req_to_host_pool[rid * host_stride + old_count + ordinal];
+    for (int layer = 0; layer < num_layers; ++layer) {
+      const int64_t src = device_buffer_locs[
+          layer * loc_layer_stride + rid * loc_req_stride + HOT_BUFFER_SIZE + 1 + ordinal];
+      KVTransferPolicy::copy_warp(lane_id, device_caches[layer], host_caches[layer], src, dst);
+    }
+  }
+}
+
+template <int COMPRESS_RATIO, int HOT_BUFFER_SIZE, int SPECULATIVE_SLOTS, typename KVTransferPolicy>
+__global__ __launch_bounds__(HISPARSE_SPEC_TRANSFER_BLOCK_SIZE, 1) void promote_accepted_hisparse_spec_kernel(
+    void** device_caches,
+    const int64_t* __restrict__ req_pool_indices,
+    const int64_t* __restrict__ prefix_lens,
+    const int32_t* __restrict__ commit_lens,
+    const int32_t* __restrict__ device_buffer_locs,
+    int64_t loc_layer_stride,
+    int64_t loc_req_stride,
+    int32_t batch_size,
+    int32_t num_layers) {
+  const int global_tid = blockIdx.x * blockDim.x + threadIdx.x;
+  const int lane_id = threadIdx.x % WARP_SIZE;
+  const int total_warps = gridDim.x * HISPARSE_SPEC_TRANSFER_WARPS;
+  const int num_items = batch_size * SPECULATIVE_SLOTS;
+
+  for (int item = global_tid / WARP_SIZE; item < num_items; item += total_warps) {
+    const int bid = item / SPECULATIVE_SLOTS;
+    const int ordinal = item % SPECULATIVE_SLOTS;
+    const int64_t rid = req_pool_indices[bid];
+    const int64_t prefix = prefix_lens[bid];
+    const int32_t old_count = static_cast<int32_t>(prefix / COMPRESS_RATIO);
+    const int32_t accepted =
+        static_cast<int32_t>((prefix + commit_lens[bid]) / COMPRESS_RATIO) - old_count;
+    if (ordinal >= accepted) {
+      continue;
+    }
+
+    const int32_t position = old_count + ordinal;
+    const bool promote_to_hot = position < HOT_BUFFER_SIZE;
+    const bool promote_to_canonical = !promote_to_hot && ordinal == accepted - 1;
+    if (!promote_to_hot && !promote_to_canonical) {
+      continue;
+    }
+
+    // Before the sequence fills H, compressed position p owns H[p]. Once H is
+    // full, only the newest accepted position stays device-resident in C; the
+    // other accepted positions have already been persisted to host above.
+    const int32_t dst_slot = promote_to_hot ? position : HOT_BUFFER_SIZE;
+    for (int layer = 0; layer < num_layers; ++layer) {
+      const int64_t loc_offset = layer * loc_layer_stride + rid * loc_req_stride;
+      const int64_t src = device_buffer_locs[loc_offset + HOT_BUFFER_SIZE + 1 + ordinal];
+      const int64_t dst = device_buffer_locs[loc_offset + dst_slot];
+      KVTransferPolicy::copy_warp(lane_id, device_caches[layer], device_caches[layer], src, dst);
+    }
+  }
+}
+
+template <int COMPRESS_RATIO, int HOT_BUFFER_SIZE, int SPECULATIVE_SLOTS, typename KVTransferPolicy>
+void transfer_hisparse_spec_finalize(
+    tvm::ffi::TensorView device_ptrs,
+    tvm::ffi::TensorView host_ptrs,
+    tvm::ffi::TensorView req_pool_indices,
+    tvm::ffi::TensorView prefix_lens,
+    tvm::ffi::TensorView commit_lens,
+    tvm::ffi::TensorView req_to_host_pool,
+    tvm::ffi::TensorView device_buffer_locs) {
+  using namespace host;
+
+  auto num_layers = SymbolicSize{"num_layers"};
+  auto batch_size = SymbolicSize{"batch_size"};
+  auto num_req_slots = SymbolicSize{"num_req_slots"};
+  auto host_slots = SymbolicSize{"host_slots"};
+  auto device_slots = SymbolicSize{"device_slots"};
+  auto cuda_device = SymbolicDevice{};
+  cuda_device.set_options<kDLCUDA>();
+  TensorMatcher({num_layers})
+      .with_dtype<uint64_t>()
+      .with_device(cuda_device)
+      .verify(device_ptrs)
+      .verify(host_ptrs);
+  TensorMatcher({batch_size})
+      .with_dtype<int64_t>()
+      .with_device(cuda_device)
+      .verify(req_pool_indices)
+      .verify(prefix_lens);
+  TensorMatcher({batch_size}).with_dtype<int32_t>().with_device(cuda_device).verify(commit_lens);
+  TensorMatcher({num_req_slots, host_slots})
+      .with_dtype<int64_t>()
+      .with_device(cuda_device)
+      .verify(req_to_host_pool);
+  TensorMatcher({num_layers, num_req_slots, device_slots})
+      .with_dtype<int32_t>()
+      .with_device(cuda_device)
+      .verify(device_buffer_locs);
+
+  const int32_t batch = static_cast<int32_t>(batch_size.unwrap());
+  const int32_t layers = static_cast<int32_t>(num_layers.unwrap());
+  const int backup_items = batch * SPECULATIVE_SLOTS;
+  LaunchKernel(
+      (backup_items + HISPARSE_SPEC_TRANSFER_WARPS - 1) / HISPARSE_SPEC_TRANSFER_WARPS,
+      HISPARSE_SPEC_TRANSFER_BLOCK_SIZE,
+      cuda_device.unwrap())(
+      backup_accepted_hisparse_spec_kernel<
+          COMPRESS_RATIO, HOT_BUFFER_SIZE, SPECULATIVE_SLOTS, KVTransferPolicy>,
+      static_cast<void**>(device_ptrs.data_ptr()),
+      static_cast<void**>(host_ptrs.data_ptr()),
+      static_cast<const int64_t*>(req_pool_indices.data_ptr()),
+      static_cast<const int64_t*>(prefix_lens.data_ptr()),
+      static_cast<const int32_t*>(commit_lens.data_ptr()),
+      static_cast<const int64_t*>(req_to_host_pool.data_ptr()),
+      static_cast<const int32_t*>(device_buffer_locs.data_ptr()),
+      req_to_host_pool.strides()[0],
+      device_buffer_locs.strides()[0],
+      device_buffer_locs.strides()[1],
+      batch,
+      layers);
+  LaunchKernel(
+      (backup_items + HISPARSE_SPEC_TRANSFER_WARPS - 1) / HISPARSE_SPEC_TRANSFER_WARPS,
+      HISPARSE_SPEC_TRANSFER_BLOCK_SIZE,
+      cuda_device.unwrap())(
+      promote_accepted_hisparse_spec_kernel<
+          COMPRESS_RATIO, HOT_BUFFER_SIZE, SPECULATIVE_SLOTS, KVTransferPolicy>,
+      static_cast<void**>(device_ptrs.data_ptr()),
+      static_cast<const int64_t*>(req_pool_indices.data_ptr()),
+      static_cast<const int64_t*>(prefix_lens.data_ptr()),
+      static_cast<const int32_t*>(commit_lens.data_ptr()),
+      static_cast<const int32_t*>(device_buffer_locs.data_ptr()),
+      device_buffer_locs.strides()[0],
+      device_buffer_locs.strides()[1],
+      batch,
+      layers);
+}
+
+template <int VERIFY_WIDTH, int COMPRESS_RATIO, int HOT_BUFFER_SIZE, int SPECULATIVE_SLOTS>
+__global__ void complete_hisparse_spec_finalize_kernel(
+    const int64_t* __restrict__ req_pool_indices,
+    const int64_t* __restrict__ prefix_lens,
+    const int32_t* __restrict__ commit_lens,
+    const int32_t* __restrict__ req_to_token,
+    int32_t* __restrict__ device_buffer_tokens,
+    int64_t* __restrict__ logical_to_device_mapping,
+    int64_t req_to_token_stride,
+    int64_t token_layer_stride,
+    int64_t token_req_stride,
+    int32_t num_layers) {
+  const int bid = blockIdx.x;
+  const int tid = threadIdx.x;
+  const int64_t rid = req_pool_indices[bid];
+  const int64_t prefix = prefix_lens[bid];
+  const int32_t old_count = static_cast<int32_t>(prefix / COMPRESS_RATIO);
+  const int32_t generated_count =
+      static_cast<int32_t>((prefix + VERIFY_WIDTH) / COMPRESS_RATIO) - old_count;
+  const int32_t accepted =
+      static_cast<int32_t>((prefix + commit_lens[bid]) / COMPRESS_RATIO) - old_count;
+
+  for (int i = tid; i < num_layers * SPECULATIVE_SLOTS; i += blockDim.x) {
+    const int layer = i / SPECULATIVE_SLOTS;
+    const int ordinal = i % SPECULATIVE_SLOTS;
+    device_buffer_tokens[
+        layer * token_layer_stride + rid * token_req_stride + HOT_BUFFER_SIZE + 1 + ordinal] = -1;
+    const int32_t position = old_count + ordinal;
+    if (ordinal < accepted && position < HOT_BUFFER_SIZE) {
+      // hot_cache_lookup resolves this positional H entry through
+      // device_buffer_tokens[position] == position, without consulting the
+      // speculative hash state.
+      device_buffer_tokens[layer * token_layer_stride + rid * token_req_stride + position] = position;
+    }
+  }
+  if (accepted > 0) {
+    const int32_t newest_position = old_count + accepted - 1;
+    for (int layer = tid; layer < num_layers; layer += blockDim.x) {
+      device_buffer_tokens[layer * token_layer_stride + rid * token_req_stride + HOT_BUFFER_SIZE] =
+          newest_position >= HOT_BUFFER_SIZE ? newest_position : -1;
+    }
+  }
+  __syncthreads();
+
+  if (tid == 0) {
+    for (int ordinal = 0; ordinal < generated_count; ++ordinal) {
+      const int64_t position = old_count + ordinal;
+      const int64_t boundary = (position + 1) * COMPRESS_RATIO - 1;
+      const int64_t full_logical = req_to_token[rid * req_to_token_stride + boundary];
+      // The mapping is a per-forward write route into E, not persistent
+      // residency metadata. Invalidate every generated route before E reuse.
+      logical_to_device_mapping[full_logical / COMPRESS_RATIO] = 0;
+    }
+  }
+}
+
+template <int VERIFY_WIDTH, int COMPRESS_RATIO, int HOT_BUFFER_SIZE, int SPECULATIVE_SLOTS>
+void complete_hisparse_spec_finalize(
+    tvm::ffi::TensorView req_pool_indices,
+    tvm::ffi::TensorView prefix_lens,
+    tvm::ffi::TensorView commit_lens,
+    tvm::ffi::TensorView req_to_token,
+    tvm::ffi::TensorView device_buffer_tokens,
+    tvm::ffi::TensorView logical_to_device_mapping) {
+  using namespace host;
+
+  auto batch_size = SymbolicSize{"batch_size"};
+  auto num_layers = SymbolicSize{"num_layers"};
+  auto num_req_slots = SymbolicSize{"num_req_slots"};
+  auto context_size = SymbolicSize{"context_size"};
+  auto buffer_slots = SymbolicSize{"buffer_slots"};
+  auto mapping_size = SymbolicSize{"mapping_size"};
+  auto cuda_device = SymbolicDevice{};
+  cuda_device.set_options<kDLCUDA>();
+  TensorMatcher({batch_size})
+      .with_dtype<int64_t>()
+      .with_device(cuda_device)
+      .verify(req_pool_indices)
+      .verify(prefix_lens);
+  TensorMatcher({batch_size}).with_dtype<int32_t>().with_device(cuda_device).verify(commit_lens);
+  TensorMatcher({num_req_slots, context_size})
+      .with_dtype<int32_t>()
+      .with_device(cuda_device)
+      .verify(req_to_token);
+  TensorMatcher({num_layers, num_req_slots, buffer_slots})
+      .with_dtype<int32_t>()
+      .with_device(cuda_device)
+      .verify(device_buffer_tokens);
+  TensorMatcher({mapping_size})
+      .with_dtype<int64_t>()
+      .with_device(cuda_device)
+      .verify(logical_to_device_mapping);
+
+  LaunchKernel(batch_size.unwrap(), 256, cuda_device.unwrap())(
+      complete_hisparse_spec_finalize_kernel<
+          VERIFY_WIDTH, COMPRESS_RATIO, HOT_BUFFER_SIZE, SPECULATIVE_SLOTS>,
+      static_cast<const int64_t*>(req_pool_indices.data_ptr()),
+      static_cast<const int64_t*>(prefix_lens.data_ptr()),
+      static_cast<const int32_t*>(commit_lens.data_ptr()),
+      static_cast<const int32_t*>(req_to_token.data_ptr()),
+      static_cast<int32_t*>(device_buffer_tokens.data_ptr()),
+      static_cast<int64_t*>(logical_to_device_mapping.data_ptr()),
+      req_to_token.strides()[0],
+      device_buffer_tokens.strides()[0],
+      device_buffer_tokens.strides()[1],
+      static_cast<int32_t>(num_layers.unwrap()));
 }
 
 }  // namespace sglang

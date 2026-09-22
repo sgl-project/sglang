@@ -88,7 +88,8 @@ def validate_hisparse(server_args: ServerArgs) -> None:
         is_deepseek_v4,
     )
 
-    hf_config = model_config_of(server_args).hf_config
+    model_config = model_config_of(server_args)
+    hf_config = model_config.hf_config
     is_v4_hisparse = is_deepseek_v4(hf_config)
     is_hip = get_platform().is_hip
     assert is_deepseek_dsa(hf_config) or is_v4_hisparse, (
@@ -99,6 +100,14 @@ def validate_hisparse(server_args: ServerArgs) -> None:
     assert cfg.disable_radix_cache, (
         "Hierarchical sparse attention currently requires --disable-radix-cache."
     )
+
+    if cfg.speculative_algorithm is not None:
+        from sglang.srt.mem_cache.hisparse_spec import resolve_hisparse_spec_plan
+
+        resolve_hisparse_spec_plan(
+            server_args=cfg,
+            hf_text_config=model_config.hf_text_config,
+        )
 
     # DSv4 hisparse handles its own dtype/backend pairing elsewhere; the dtype-
     # aware checks below only apply to the DSA hisparse path.

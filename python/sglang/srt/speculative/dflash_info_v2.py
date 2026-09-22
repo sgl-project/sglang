@@ -194,6 +194,10 @@ class DFlashDraftInputV2(SpecInput):
             cur_kv_lens.copy_(cur_kv_lens_cpu_t, non_blocking=True)
             nxt_kv_lens.copy_(nxt_kv_lens_cpu_t, non_blocking=True)
 
+            coordinator = batch.hisparse_coordinator
+            if coordinator is not None and coordinator.speculative_verify_enabled:
+                coordinator.wait_for_pending_backup()
+
             alloc_for_spec_decode(
                 batch.tree_cache,
                 batch.req_to_token_pool,
@@ -206,6 +210,13 @@ class DFlashDraftInputV2(SpecInput):
                 num_needed_tokens=num_needed_tokens,
                 batch=batch,
             )
+            if coordinator is not None and coordinator.speculative_verify_enabled:
+                # Keep host C4 reservation aligned with the overlap-safe logical
+                # allocation watermark computed above.
+                coordinator.reserve_speculative_host_slots(
+                    req_pool_indices_cpu=batch.req_pool_indices_cpu,
+                    reserved_seq_lens_cpu=nxt_kv_lens_cpu_t,
+                )
         if caller_stream is not None:
             # Enqueue the dependency on the caller's stream, not inside the
             # plan-stream context, so forward work cannot observe partially

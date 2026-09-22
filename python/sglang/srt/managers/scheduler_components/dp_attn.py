@@ -263,6 +263,28 @@ def should_skip_scheduler_all_gather(dp_size: int) -> bool:
     return dp_size == 1 or envs.SGLANG_SCHEDULER_SKIP_ALL_GATHER.get()
 
 
+def _can_run_hisparse_mtp_cuda_graph(model_runner, local_batch) -> bool:
+    """IndexShare needs a real seed before its first draft graph replay."""
+    if not (
+        get_memory().enable_hisparse
+        and local_batch is not None
+        and local_batch.forward_mode.is_decode()
+        and local_batch.spec_algorithm.is_eagle()
+        and getattr(
+            model_runner.model_config.hf_text_config,
+            "index_share_for_mtp_iteration",
+            False,
+        )
+    ):
+        return True
+    draft_input = local_batch.spec_info
+    return draft_input is not None and (
+        draft_input.future_dsa_topk_indices_available
+        if draft_input.future_indices is not None
+        else draft_input.dsa_topk_indices is not None
+    )
+
+
 def _local_decode_cuda_graph_vote(
     *,
     local_batch: Optional[ScheduleBatch],
@@ -402,6 +424,12 @@ def prepare_mlp_sync_batch_raw(
 
     can_run_decode_cuda_graph = _local_decode_cuda_graph_vote(
         local_batch=local_batch, disable_cuda_graph=disable_cuda_graph
+    )
+    # Include the seed veto in the existing cross-rank MIN, so idle ranks
+    # follow the same eager/graph collective sequence as the active ranks.
+    can_run_decode_cuda_graph = (
+        can_run_decode_cuda_graph
+        and _can_run_hisparse_mtp_cuda_graph(model_runner, local_batch)
     )
     breakable_prefill = check_cuda_graph_backend(Phase.PREFILL, Backend.BREAKABLE)
     full_prefill = check_cuda_graph_backend(Phase.PREFILL, Backend.FULL)

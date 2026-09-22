@@ -911,16 +911,25 @@ class C4IndexerBackendMixin:
         hisparse_decode = (
             hisparse_coordinator is not None and forward_batch.forward_mode.is_decode()
         )
+        hisparse_verify = (
+            hisparse_coordinator is not None
+            and hisparse_coordinator.speculative_verify_enabled
+            and forward_batch.forward_mode.is_target_verify()
+        )
 
         raw_indices = None
-        if core_metadata.c4_sparse_raw_indices is not None:
-            raw_indices = core_metadata.c4_sparse_raw_indices
-        elif capture_enabled:
+        if capture_enabled:
             raw_indices = torch.empty_like(c4_sparse_page_indices)
         elif hisparse_decode:
             raw_indices = hisparse_coordinator.raw_indices_buffer[
                 : c4_sparse_page_indices.size(0)
             ]
+        elif hisparse_verify:
+            raw_indices = hisparse_coordinator.verify_raw_indices_buffer[
+                : forward_batch.req_pool_indices.size(0)
+            ].view(-1, c4_sparse_page_indices.size(-1))
+        elif core_metadata.c4_sparse_raw_indices is not None:
+            raw_indices = core_metadata.c4_sparse_raw_indices
 
         all_rows = slice(0, _c4sl.shape[0])
 
@@ -1095,18 +1104,28 @@ class C4IndexerBackendMixin:
                 run_paged_indexer(all_rows, deep_gemm_metadata)
 
         if hisparse_coordinator is not None:
-            if hisparse_decode:
+            if hisparse_decode or hisparse_verify:
                 compress_layer_id = token_to_kv_pool.layer_mapping[
                     c4_indexer.layer_id
                 ].compress_layer_id
-                core_metadata.c4_sparse_page_indices = (
-                    hisparse_coordinator.swap_in_selected_pages(
-                        req_pool_indices=forward_batch.req_pool_indices,
-                        compressed_seq_lens=indexer_metadata.compressed_seq_lens,
-                        top_k_result=raw_indices,
-                        layer_id=compress_layer_id,
+                if hisparse_verify:
+                    core_metadata.c4_sparse_page_indices = (
+                        hisparse_coordinator.swap_in_speculative_pages(
+                            req_pool_indices=forward_batch.req_pool_indices,
+                            compressed_seq_lens=indexer_metadata.compressed_seq_lens,
+                            top_k_result=raw_indices,
+                            layer_id=compress_layer_id,
+                        )
                     )
-                )
+                else:
+                    core_metadata.c4_sparse_page_indices = (
+                        hisparse_coordinator.swap_in_selected_pages(
+                            req_pool_indices=forward_batch.req_pool_indices,
+                            compressed_seq_lens=indexer_metadata.compressed_seq_lens,
+                            top_k_result=raw_indices,
+                            layer_id=compress_layer_id,
+                        )
+                    )
             else:
                 # flash_mla C4 attention requires int32 page indices.
                 core_metadata.c4_sparse_page_indices = (

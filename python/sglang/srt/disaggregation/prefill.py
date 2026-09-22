@@ -225,6 +225,7 @@ class PrefillBootstrapQueue:
     def _init_kv_manager(self) -> CommonKVManager:
         kv_args_class = get_kv_class(self.transfer_backend, KVClassType.KVARGS)
         kv_args = kv_args_class()
+        kv_args.is_hisparse = self.scheduler.enable_hisparse
         kv_args.engine_rank = self.tp_rank
         kv_args.pp_rank = self.pp_rank
         kv_args.system_dp_rank = get_parallel().dp_rank
@@ -259,6 +260,7 @@ class PrefillBootstrapQueue:
         kv_data_ptrs, kv_data_lens, kv_item_lens = (
             self.token_to_kv_pool.get_contiguous_buf_infos()
         )
+        kv_args.target_kv_data_ptr_count = len(kv_data_ptrs)
         kv_args.prefill_end_layer = (
             kv_args.prefill_start_layer + len(kv_data_ptrs)
             if layer_shard_enabled

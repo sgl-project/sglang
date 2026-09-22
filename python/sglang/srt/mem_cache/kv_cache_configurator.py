@@ -533,6 +533,14 @@ class KVCacheConfigurator:
         # pool must be sized by that space.
         draft_virtual_id_space: Optional[int] = None
         if self.is_draft_worker and token_to_kv_pool_allocator is not None:
+            if isinstance(token_to_kv_pool_allocator, HiSparseTokenToKVPoolAllocator):
+                # The target maps these logical IDs into its sparse device pool.
+                # Draft KV is resident and indexes the same IDs directly; the
+                # ordinary DSA pool already adds its own padding page.
+                draft_virtual_id_space = token_to_kv_pool_allocator.size_full
+                sizes = msgspec.structs.replace(
+                    sizes, max_total_num_tokens=draft_virtual_id_space
+                )
             if isinstance(
                 token_to_kv_pool_allocator,
                 (
@@ -1634,7 +1642,7 @@ class KVCacheConfigurator:
             dsa_cp_layer_shard_size,
         ) = get_glm_dsa_cp_layer_shard_info(self)
         pool_kwargs = {}
-        if get_memory().enable_hisparse:
+        if get_memory().enable_hisparse and not self.is_draft_worker:
             PoolCls = HiSparseDSATokenToKVPool
             from sglang.srt.mem_cache.sparsity import parse_hisparse_config
 
@@ -2381,9 +2389,10 @@ class KVCacheConfigurator:
 
         available_bytes = self._profile_available_bytes(pre_model_load_memory)
         config = self.config_from_budget(available_bytes)
-        config.max_running_requests = self.resolve_max_num_reqs(
-            config.max_total_num_tokens
-        )
+        if config.max_running_requests is None:
+            config.max_running_requests = self.resolve_max_num_reqs(
+                config.max_total_num_tokens
+            )
         configurator = create_memory_pool_configurator(self)
         config = configurator.finalize_with_max_running_requests(config)
         config.mem_fraction_static = get_schedule().mem_fraction_static

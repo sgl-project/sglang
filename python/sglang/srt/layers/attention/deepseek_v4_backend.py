@@ -2112,7 +2112,9 @@ class DeepseekV4AttnBackend(
 
         # Upgrade Raw->Full so compress + core_attn + indexer materialization is
         # recorded inside the cuda graph; already Full when PREP_IN_CUDA_GRAPH=0.
+        verify_prefix_lens = None
         if isinstance(self.forward_metadata, DSV4RawVerifyMetadata):
+            verify_prefix_lens = self.forward_metadata.seq_lens
             self.forward_metadata = self.make_forward_metadata_from_raw_verify(
                 raw_metadata=self.forward_metadata,
                 online_c128_state_slot_offset=self.online_c128_mtp.state_slot_offset(),
@@ -2120,6 +2122,23 @@ class DeepseekV4AttnBackend(
         elif isinstance(self.forward_metadata, DSV4RawDecodeMetadata):
             self.forward_metadata = self.make_forward_metadata_from_raw_decode(
                 raw_metadata=self.forward_metadata,
+            )
+
+        if (
+            forward_batch.forward_mode.is_target_verify()
+            and self.hisparse_coordinator is not None
+            and self.hisparse_coordinator.speculative_verify_enabled
+        ):
+            metadata = self.forward_metadata
+            assert isinstance(metadata, DSV4Metadata)
+            self.hisparse_coordinator.prepare_speculative_verify(
+                req_pool_indices=forward_batch.req_pool_indices,
+                prefix_lens=(
+                    verify_prefix_lens
+                    if verify_prefix_lens is not None
+                    else forward_batch.seq_lens
+                ),
+                compressed_out_locs=metadata.core_metadata.c4_out_loc,
             )
 
         metadata = self.forward_metadata

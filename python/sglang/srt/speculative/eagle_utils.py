@@ -1095,6 +1095,15 @@ def eagle_prepare_for_decode(batch: ScheduleBatch):
     reqs = batch.reqs
     cur_kv_lens = cur_kv_lens_device
     nxt_kv_lens = nxt_kv_lens_device
+    coordinator = batch.hisparse_coordinator
+    if coordinator is not None and coordinator.speculative_verify_enabled:
+        # Finalize reads req_to_token on the backup stream. Join it before
+        # allocating/writing the next logical window on the schedule stream.
+        coordinator.wait_for_pending_backup()
+        coordinator.reserve_speculative_host_slots(
+            req_pool_indices_cpu=batch.req_pool_indices_cpu,
+            reserved_seq_lens_cpu=nxt_kv_lens_cpu,
+        )
     alloc_for_spec_decode(
         tree_cache,
         req_to_token_pool,

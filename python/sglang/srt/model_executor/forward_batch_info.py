@@ -1903,6 +1903,11 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                     ]
                 logits_output.hidden_states = logits_output.hidden_states[:bs]
             elif self.forward_mode.is_extend() or self.forward_mode.is_idle():
+                if (
+                    self.forward_mode.is_idle()
+                    and self._original_num_tokens is not None
+                ):
+                    self.positions = self.positions[: self._original_num_tokens]
                 if logits_output.next_token_logits is not None:
                     logits_output.next_token_logits = logits_output.next_token_logits[
                         :bs
