@@ -54,7 +54,6 @@ from sglang.srt.entrypoints.harmony_utils import (
     parse_response_input,
     render_for_completion,
 )
-from sglang.srt.entrypoints.openai.chat_encoding import spec_supports_inline_system
 from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionMessageParam,
     ChatCompletionRequest,
@@ -86,7 +85,6 @@ from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.function_call.json_array_parser import JsonArrayParser
 from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.parser.reasoning_parser import ReasoningParser
-from sglang.srt.parser.template_detection import detect_inline_system_support
 from sglang.srt.runtime_context import get_disagg, get_serving
 from sglang.srt.sampling.sampling_params import (
     set_request_reasoning_end_token_ids,
@@ -168,16 +166,6 @@ class OpenAIServingResponses(OpenAIServingChat):
         # template_manager is already set by parent class; reasoning_parser comes
         # from the parent, which reads the manager's control-plane overlay.
         self.enable_prompt_tokens_details = enable_prompt_tokens_details
-        self._merge_inline_system = not (
-            spec_supports_inline_system(self.chat_encoding_spec)
-            or (
-                self.chat_encoding_spec is None
-                and self.template_manager.chat_template_name is None
-                and detect_inline_system_support(
-                    getattr(self.tokenizer_manager.tokenizer, "chat_template", None)
-                )
-            )
-        )
 
         # Parent OpenAIServingChat.__init__ already populated default_sampling_params.
         if not isinstance(self.default_sampling_params, dict):
@@ -1475,7 +1463,7 @@ class OpenAIServingResponses(OpenAIServingChat):
         messages = self._merge_consecutive_assistant_messages(messages)
 
         # Preserve the history prefix when a later instruction is appended.
-        if not self._merge_inline_system:
+        if self.supports_inline_system:
             return messages
 
         # Most chat templates expect a single leading ``system`` message;
