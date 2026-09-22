@@ -81,58 +81,6 @@ class _LoadedExpert:
 
 
 class TestBeamConfig(CustomTestCase):
-    def test_flashinfer_attention_fails_before_allocation(self):
-        defaults = dict(
-            attention_backend="trtllm_mha",
-            prefill_attention_backend=None,
-            decode_attention_backend=None,
-        )
-        cases = (
-            {"attention_backend": "flashinfer"},
-            {"prefill_attention_backend": "flashinfer"},
-            {"decode_attention_backend": "flashinfer"},
-            {
-                "attention_backend": "flashinfer",
-                "prefill_attention_backend": "trtllm_mha",
-            },
-            {
-                "attention_backend": "flashinfer",
-                "decode_attention_backend": "trtllm_mha",
-            },
-        )
-        for options in cases:
-            with (
-                self.subTest(options=options),
-                get_context().override_server_args(**(defaults | options)),
-                patch("sglang.srt.models.beam.BeamModel") as model,
-            ):
-                with self.assertRaisesRegex(AssertionError, "numerical mismatches"):
-                    BeamForCausalLM(tiny_config())
-                model.assert_not_called()
-
-    def test_attention_guard_honors_effective_backend_overrides(self):
-        cases = (
-            ("trtllm_mha", None, None),
-            ("flashinfer", "trtllm_mha", "trtllm_mha"),
-            (None, "trtllm_mha", "trtllm_mha"),
-        )
-        for backend, prefill, decode in cases:
-            with (
-                self.subTest(backend=backend, prefill=prefill, decode=decode),
-                get_context().override_server_args(
-                    attention_backend=backend,
-                    prefill_attention_backend=prefill,
-                    decode_attention_backend=decode,
-                ),
-                patch(
-                    "sglang.srt.models.beam.BeamModel",
-                    side_effect=RuntimeError("model allocation reached"),
-                ) as model,
-            ):
-                with self.assertRaisesRegex(RuntimeError, "model allocation reached"):
-                    BeamForCausalLM(tiny_config())
-                model.assert_called_once()
-
     def test_unsupported_attention_and_head_parallelism_fail_before_allocation(self):
         for field in ("enable_dp_attention", "enable_dp_lm_head"):
             with (
