@@ -42,6 +42,10 @@ class NPUFinalizeRouting(BaseFinalizeRouting):
         expanded_row_idx: torch.Tensor,
         topk_ids: torch.Tensor,
     ) -> torch.Tensor:
+        if self.drop_pad_mode == 3 and hidden_states.ndim == 2:
+            # Drop mode requires [E, C, H], but uses flattened row indices.
+            # View the packed GMM rows as one capacity buffer without copying.
+            hidden_states = hidden_states.unsqueeze(0)
         return torch.ops.npu.npu_moe_finalize_routing(
             hidden_states,
             skip1=None,
