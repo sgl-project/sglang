@@ -66,7 +66,8 @@ class LLaDAImageTextEncoderRunner:
         server_args: ServerArgs,
     ) -> None:
         import sglang.srt.distributed.parallel_state as srt_parallel_state
-        from sglang.srt.distributed.parallel_state_wrapper import ParallelState
+        from sglang.srt.configs.model_config import ModelConfig
+        from sglang.srt.distributed.bootstrap import init_parallel_runtime
         from sglang.srt.managers.tp_worker import TpModelWorker
         from sglang.srt.mem_cache.cache_init_params import CacheInitParams
         from sglang.srt.mem_cache.chunk_cache import ChunkCache
@@ -86,6 +87,7 @@ class LLaDAImageTextEncoderRunner:
         gpu_id = device.index
         if gpu_id is None:
             gpu_id = int(os.environ.get("LOCAL_RANK", "0"))
+        nccl_port = server_args.nccl_port or 29500
         srt_args = SRTServerArgs(
             model_path=text_encoder_path,
             tokenizer_path=tokenizer_path,
@@ -106,7 +108,9 @@ class LLaDAImageTextEncoderRunner:
             ),
         )
         self.runtime_context = create_context(
-            srt_args, role="scheduler", ranks=SpawnRanks(world_rank=0)
+            srt_args,
+            role="scheduler",
+            ranks=SpawnRanks(world_rank=0, gpu_id=gpu_id),
         )
         with use_context(self.runtime_context):
             # The diffusion runtime mirrors its TP group into the srt globals.
@@ -117,11 +121,16 @@ class LLaDAImageTextEncoderRunner:
             try:
                 srt_parallel_state._TP = None
                 srt_parallel_state._ATTN_TP = None
+                init_parallel_runtime(
+                    server_args=srt_args,
+                    model_config=ModelConfig.from_server_args(srt_args),
+                    device=device.type,
+                    dist_port=nccl_port,
+                )
                 self.worker = TpModelWorker(
                     server_args=srt_args,
                     gpu_id=gpu_id,
-                    ps=ParallelState.trivial(gpu_id=gpu_id),
-                    nccl_port=server_args.nccl_port or 29500,
+                    nccl_port=nccl_port,
                 )
                 # Run the post-construction init phases the srt scheduler drives.
                 self.worker.alloc_memory_pool()

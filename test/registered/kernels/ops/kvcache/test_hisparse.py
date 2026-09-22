@@ -3,26 +3,43 @@ import sys
 import pytest
 import torch
 
-from sglang.kernels.ops.kvcache.hisparse import (
-    load_cache_to_device_buffer_dsv4_mla,
-    load_cache_to_device_buffer_mla,
-    transfer_cache_dsv4_mla,
+from sglang.srt.utils import (
+    get_device,
+    get_device_module,
+    is_cuda,
+    is_hip,
+    is_xpu,
 )
-from sglang.srt.utils import is_cuda, is_hip, is_npu, is_xpu
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from sglang.test.ci.ci_register import (
+    register_amd_ci,
+    register_cuda_ci,
+    register_xpu_ci,
+)
 
 register_amd_ci(est_time=30, stage="stage-b", runner_config="1-gpu-small-amd")
 register_cuda_ci(est_time=10, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_xpu_ci(est_time=60, suite="stage-b-test-1-gpu-xpu")
+
+if is_xpu():
+    from sgl_kernel import (
+        load_cache_to_device_buffer_dsv4_mla,
+        load_cache_to_device_buffer_mla,
+        transfer_cache_dsv4_mla,
+    )
+else:
+    from sglang.kernels.ops.kvcache.hisparse import (
+        load_cache_to_device_buffer_dsv4_mla,
+        load_cache_to_device_buffer_mla,
+        transfer_cache_dsv4_mla,
+    )
+
 
 pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available()
-    or is_npu()
-    or is_xpu()
-    or not (is_cuda() or is_hip()),
-    reason="HiSparse JIT tests require CUDA/ROCm.",
+    not (is_cuda() or is_hip() or is_xpu()),
+    reason="HiSparse kernel tests require CUDA/ROCm/XPU.",
 )
 
-DEVICE = "cuda"
+DEVICE = get_device()
 DTYPE = torch.float32
 KV_DIM = 8
 HOT_BUFFER_SIZE = 4
@@ -131,7 +148,7 @@ def _run_kernel(
         block_size=256,
         num_real_reqs=torch.tensor([num_real_reqs], dtype=torch.int32, device=DEVICE),
     )
-    torch.cuda.synchronize()
+    get_device_module().synchronize()
     return out
 
 
@@ -171,7 +188,7 @@ def _make_state(
         device_buffer[device_buffer_locs[rid, HOT_BUFFER_SIZE]].copy_(
             host_cache[newest_token].to(DEVICE, non_blocking=True)
         )
-    torch.cuda.synchronize()
+    get_device_module().synchronize()
 
     return {
         "host_cache": host_cache,
@@ -199,7 +216,7 @@ def test_transfer_cache_dsv4_mla_copies_paged_token() -> None:
         src_indices=torch.tensor([src_loc], dtype=torch.int64, device=DEVICE),
         dst_indices=torch.tensor([dst_loc], dtype=torch.int64, device=DEVICE),
     )
-    torch.cuda.synchronize()
+    get_device_module().synchronize()
 
     assert torch.equal(
         _read_dsv4_token(dst_cache, dst_loc).to(DEVICE),
@@ -251,7 +268,7 @@ def test_dsv4_swap_in_reads_paged_host_layout() -> None:
         block_size=256,
         num_real_reqs=torch.tensor([1], dtype=torch.int32, device=DEVICE),
     )
-    torch.cuda.synchronize()
+    get_device_module().synchronize()
 
     assert out.item() == swap_loc
     assert torch.equal(
@@ -427,7 +444,7 @@ def test_load_cache_to_device_buffer_miss_copy_is_byte_exact(
     )
     for slot in range(HOT_BUFFER_SIZE):
         device_buffer[slot].copy_(host_cache[slot].to(DEVICE))
-    torch.cuda.synchronize()
+    get_device_module().synchronize()
 
     top_k_tokens = torch.tensor([[miss_token]], dtype=torch.int32, device=DEVICE)
     out = torch.full_like(top_k_tokens, -1)
@@ -454,7 +471,7 @@ def test_load_cache_to_device_buffer_miss_copy_is_byte_exact(
         block_size=256,
         num_real_reqs=torch.tensor([1], dtype=torch.int32, device=DEVICE),
     )
-    torch.cuda.synchronize()
+    get_device_module().synchronize()
 
     # The miss evicts the LRU head (slot 0, physical loc 0) and lands there.
     assert torch.equal(out.cpu(), torch.tensor([[0]], dtype=torch.int32))
@@ -593,7 +610,7 @@ def test_load_cache_to_device_buffer_dsv4_mla_miss_copy_layout() -> None:
         block_size=256,
         num_real_reqs=torch.tensor([1], dtype=torch.int32, device=DEVICE),
     )
-    torch.cuda.synchronize()
+    get_device_module().synchronize()
 
     assert torch.equal(out.cpu(), torch.tensor([[9]], dtype=torch.int32))
 
@@ -666,7 +683,7 @@ def test_load_cache_to_device_buffer_dsv4_fused_copy_multi_miss() -> None:
         block_size=256,
         num_real_reqs=torch.tensor([1], dtype=torch.int32, device=DEVICE),
     )
-    torch.cuda.synchronize()
+    get_device_module().synchronize()
 
     # Which slot each miss evicts is up to the LRU, so take the destinations
     # from the kernel; only require that they are distinct and in range.
@@ -741,7 +758,7 @@ def test_load_cache_to_device_buffer_rocm_large_lru_writeback() -> None:
         block_size=1024,
         num_real_reqs=torch.tensor([1], dtype=torch.int32, device=DEVICE),
     )
-    torch.cuda.synchronize()
+    get_device_module().synchronize()
 
     expected_lru = torch.cat(
         [
