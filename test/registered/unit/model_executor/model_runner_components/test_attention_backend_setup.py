@@ -1,5 +1,5 @@
 import sys
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -116,6 +116,85 @@ def test_equal_resolved_backends_ignore_stale_global_backend():
         )
 
     assert result.name == "resolved"
+
+
+def test_kimi_k3_dflash_captures_the_dspark_post_layer_taps():
+    """DFLASH target_layer_ids name layer outputs. K3 taps already capture layer
+    outputs, so DFLASH must reach them unshifted (targets that tap layer inputs
+    add 1) and land on the same states as DSPARK. K3 used to expose only the
+    DSPARK hook, so DFLASH was rejected here at startup."""
+    import torch
+
+    from sglang.srt.layers.aux_hidden_states import pack_aux_hidden_states
+    from sglang.srt.models import kimi_k3
+    from sglang.srt.models.kimi_k3 import (
+        KimiK3ForConditionalGeneration,
+        KimiK3LinearForCausalLM,
+        KimiK3LinearModel,
+    )
+
+    num_tokens, hidden_size, layer_ids = 3, 4, [1, 3]
+    pp_group = SimpleNamespace(is_first_rank=True, is_last_rank=True, world_size=1)
+
+    def make_layer(idx):
+        def layer(*, hidden_states, residual, **_):
+            return hidden_states + (idx + 1), residual, False
+
+        return layer
+
+    captured = {}
+    for is_dspark in (False, True):
+        model = SimpleNamespace(
+            config=SimpleNamespace(attn_res_block_size=None),
+            pp_group=pp_group,
+            start_layer=0,
+            end_layer=4,
+            layers=[make_layer(i) for i in range(4)],
+            norm=lambda hidden_states: hidden_states,
+            dspark_layers_to_capture=None,
+            _trim_padded_attn=False,
+        )
+        model._dspark_capture_stream = MethodType(
+            KimiK3LinearModel._dspark_capture_stream, model
+        )
+        lm = KimiK3LinearForCausalLM.__new__(KimiK3LinearForCausalLM)
+        torch.nn.Module.__init__(lm)
+        lm.model = model
+        lm.capture_aux_hidden_states = False
+        # The checkpoint architecture is the multimodal wrapper around the LM.
+        target = KimiK3ForConditionalGeneration.__new__(KimiK3ForConditionalGeneration)
+        torch.nn.Module.__init__(target)
+        target.language_model = lm
+
+        attention_backend_setup.configure_aux_hidden_state_capture(
+            model=target,
+            eagle_use_aux_hidden_state=False,
+            eagle_aux_hidden_state_layer_ids=None,
+            dflash_use_aux_hidden_state=True,
+            dflash_target_layer_ids=list(layer_ids),
+            is_dspark=is_dspark,
+        )
+        assert lm.capture_aux_hidden_states
+
+        with patch.object(
+            kimi_k3, "get_parallel", return_value=SimpleNamespace(pp_group=pp_group)
+        ):
+            _, aux_hidden_states = KimiK3LinearModel.forward(
+                model,
+                None,
+                torch.arange(num_tokens),
+                SimpleNamespace(),
+                inputs_embeds=torch.zeros(num_tokens, hidden_size),
+            )
+        captured[is_dspark] = pack_aux_hidden_states(aux_hidden_states)
+
+    # Layer i adds i + 1, so the outputs of layers 1 and 3 hold 3 and 10;
+    # the draft reads them packed in target_layer_ids order.
+    expected = torch.cat(
+        [torch.full((num_tokens, hidden_size), v) for v in (3.0, 10.0)], dim=-1
+    )
+    for packed in captured.values():
+        torch.testing.assert_close(packed, expected)
 
 
 if __name__ == "__main__":
