@@ -277,8 +277,9 @@ class TestDSparkCheckpointWeights(unittest.TestCase):
         ]
         # The input-only mask row need not appear in the predecessor domain.
         weights[0] = ("markov_head.markov_w1.weight", torch.ones(8, 2))
-        with patch("sglang.srt.models.dspark.ParallelLMHead", _Vocab), patch(
-            "sglang.srt.models.dspark.VocabParallelEmbedding", _Vocab
+        with (
+            patch("sglang.srt.models.dspark.ParallelLMHead", _Vocab),
+            patch("sglang.srt.models.dspark.VocabParallelEmbedding", _Vocab),
         ):
             model.load_weights(weights)
         own_embed, own_head = model.embed_tokens, model.lm_head
@@ -296,8 +297,9 @@ class TestDSparkCheckpointWeights(unittest.TestCase):
 
     def test_output_vocab_inferred_from_w2_when_input_has_mask_row(self):
         model = _Draft(_config(vocab_size=9, mask_token_id=8))
-        with patch("sglang.srt.models.dspark.ParallelLMHead", _Vocab), patch(
-            "sglang.srt.models.dspark.VocabParallelEmbedding", _Vocab
+        with (
+            patch("sglang.srt.models.dspark.ParallelLMHead", _Vocab),
+            patch("sglang.srt.models.dspark.VocabParallelEmbedding", _Vocab),
         ):
             model.load_weights(
                 self._weights(input_vocab=8, draft_vocab=3)
@@ -412,12 +414,15 @@ class TestDSparkCheckpointWeights(unittest.TestCase):
         model.attach_shared_modules(embed_tokens=target_embed, lm_head=_Vocab(8, 4))
         self.assertIs(model.lm_head, own_head)
         self.assertIs(model.embed_tokens, target_embed)
-        with patch(
-            "sglang.srt.models.dspark.project_through_lm_head",
-            lambda hidden, head: hidden @ head.weight.T,
-        ), patch(
-            "sglang.srt.models.dspark.gather_and_crop_vocab",
-            lambda logits, head: logits,
+        with (
+            patch(
+                "sglang.srt.models.dspark.project_through_lm_head",
+                lambda hidden, head: hidden @ head.weight.T,
+            ),
+            patch(
+                "sglang.srt.models.dspark.gather_and_crop_vocab",
+                lambda logits, head: logits,
+            ),
         ):
             base, _ = model.compute_base_logits(torch.ones(1, 4))
         torch.testing.assert_close(base, torch.full((1, 8), -8.0))

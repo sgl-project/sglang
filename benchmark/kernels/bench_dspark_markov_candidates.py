@@ -372,14 +372,16 @@ def main():
                 base, anchor, temps, greedy
             ),
             "production_topk_only": lambda: sampler.prepare_topk(base),
-            "production_walk_and_sparse_cache_only_ablation": lambda: sampler.sample_prepared(
-                base,
-                prepared_values,
-                prepared_ids,
-                anchor,
-                temps,
-                greedy,
-                seeds=prepared_seeds,
+            "production_walk_and_sparse_cache_only_ablation": lambda: (
+                sampler.sample_prepared(
+                    base,
+                    prepared_values,
+                    prepared_ids,
+                    anchor,
+                    temps,
+                    greedy,
+                    seeds=prepared_seeds,
+                )
             ),
             "torch_topk_only_ablation": lambda: torch.topk(base, args.k, dim=-1),
             "dense_q_softmax_only_ablation": lambda: (

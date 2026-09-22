@@ -51,6 +51,7 @@ from sglang.srt.speculative.dspark_components.dspark_draft import (
     make_next_draft_input,
 )
 from sglang.srt.speculative.dspark_components.dspark_draft_sampler import (
+    dspark_effective_graph_capacity,
     initialize_markov_candidate_sampler,
     maybe_build_draft_sampler,
 )
@@ -281,23 +282,31 @@ class DSparkWorkerV2(BaseSpecWorker):
                 lm_head=lm_head,
             )
 
+        # Capacity: the tight upper bound on DSpark graph batch size.
+        # get_batch_sizes_to_capture filters decode-bs by req_to_token_pool.size,
+        # which derives from max_running_requests. No graph replay can batch past
+        # that bound, so capping decode_graph_max_bs by max_running_requests avoids
+        # over-allocating candidate cache, draft sampler, and verify epilogue.
+        max_running = get_schedule().max_running_requests
+        decode_max_bs = (
+            max(get_exec().graph.cuda_graph_config.decode.bs)
+            if self._decode_graph_allowed
+            else None
+        )
+        self._effective_graph_capacity = dspark_effective_graph_capacity(
+            max_running_requests=max_running,
+            attn_dp_size=self.ps.attn_dp_size,
+            decode_graph_max_bs=decode_max_bs,
+        )
+
         if not self._is_pd_prefill:
             # Allocate persistent tables and proposal storage before the target
-            # and draft KV pools probe free memory. Capacity includes the largest
-            # graph tier as well as the scheduler's per-worker request bound.
-            max_running = get_schedule().max_running_requests
-            capacity = None
-            if max_running is not None:
-                capacity = max(1, max_running // self.ps.attn_dp_size)
-                if self._decode_graph_allowed:
-                    capacity = max(
-                        capacity, max(get_exec().graph.cuda_graph_config.decode.bs)
-                    )
+            # and draft KV pools probe free memory.
             initialize_markov_candidate_sampler(
                 model=self.draft_model,
                 draft_hf_config=self.draft_model_runner.model_config.hf_config,
                 gamma=self.gamma,
-                capacity=capacity,
+                capacity=self._effective_graph_capacity,
                 tp_size=self.ps.tp_size,
                 markov_topk=get_spec().speculative_dspark_markov_topk,
                 markov_bias_topk=get_spec().speculative_dspark_markov_bias_topk,
@@ -364,8 +373,11 @@ class DSparkWorkerV2(BaseSpecWorker):
             and self._decode_graph_allowed
             and is_cuda()
         ):
+            # _decode_graph_allowed implies decode_max_bs was set, so
+            # _effective_graph_capacity is not None.
+            assert self._effective_graph_capacity is not None
             self._verify_epilogue = DsparkVerifyEpilogue(
-                max_bs=max(get_exec().graph.cuda_graph_config.decode.bs),
+                max_bs=self._effective_graph_capacity,
                 verify_num_draft_tokens=self.verify_num_draft_tokens,
                 device=self.device,
                 tp_sync=self._tp_sync,
@@ -533,10 +545,12 @@ class DSparkWorkerV2(BaseSpecWorker):
             )
 
     def _maybe_build_draft_sampler(self, *, available_memory_gb: float):
+        # Called only when decode graph is allowed, so capacity is not None.
+        assert self._effective_graph_capacity is not None
         return maybe_build_draft_sampler(
             draft_model=self.draft_model,
             gamma=self.gamma,
-            max_bs=max(get_exec().graph.cuda_graph_config.decode.bs),
+            max_bs=self._effective_graph_capacity,
             device=self.device,
             tp_rank=self.ps.tp_rank,
             tp_sync=self._tp_sync,
