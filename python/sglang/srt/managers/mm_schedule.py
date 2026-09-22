@@ -19,6 +19,9 @@ _is_npu = is_npu()
 _is_xpu = is_xpu()
 
 embedding_cache: Optional[MultiModalStaticCache] = None
+# The worker submits its MM offloads on one stream, so the latest record
+# also covers older CPU backups retained across prefill batches.
+host_offload_event: Optional[torch.cuda.Event] = None
 
 
 def init_mm_embedding_cache(max_size: int = 0):
@@ -83,6 +86,12 @@ def _get_precomputed_embedding(
     If some but not all have precomputed_embeddings, raise NotImplementedError.
     If none have precomputed_embeddings, return None.
     """
+    if host_offload_event is not None and any(
+        isinstance(item.precomputed_embeddings, torch.Tensor)
+        and item.precomputed_embeddings.is_cpu
+        for item in items
+    ):
+        host_offload_event.synchronize()
     precomputed_embeddings = []
     max_iterations = min(len(items_size) - 1, len(prefix_length))
 
@@ -97,8 +106,6 @@ def _get_precomputed_embedding(
         if any(item.precomputed_embeddings is None for item in items_per_req):
             chunk = None
         else:
-            for item in items_per_req:
-                item.wait_host_offload()
             req_embeddings = torch.concat(
                 [item.precomputed_embeddings for item in items_per_req]
             )
@@ -217,22 +224,14 @@ def _move_items_to_device(
 ) -> None:
     """Wait for feature readiness and upload unless the encoder defers the move."""
     defer_move = _can_skip_pre_embed_feature_move(data_embedding_func)
-    offload_events = {
-        item.host_offload_event
-        for item in items
-        if isinstance(item.feature, torch.Tensor)
-        and item.feature.is_cpu
-        and item.host_offload_event is not None
-    }
-    if offload_events:
+    if host_offload_event is not None and any(
+        isinstance(item.feature, torch.Tensor) and item.feature.is_cpu for item in items
+    ):
         if defer_move or device.type != "cuda":
             # Deferred encoders can read CPU subsets of a mixed-device batch.
-            for event in offload_events:
-                event.synchronize()
+            host_offload_event.synchronize()
         else:
-            stream = torch.cuda.current_stream(device)
-            for event in offload_events:
-                stream.wait_event(event)
+            torch.cuda.current_stream(device).wait_event(host_offload_event)
     if defer_move:
         return
     for item in items:

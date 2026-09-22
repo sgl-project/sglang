@@ -386,15 +386,6 @@ class MultimodalDataItem(msgspec.Struct, kw_only=True, dict=True, array_like=Tru
     model_specific_data: Dict[str, MultimodalDataValue] = msgspec.field(
         default_factory=dict
     )
-    # Recorded after asynchronous copies; CPU readers wait before accessing them.
-    host_offload_event: Optional[object] = None
-
-    def wait_host_offload(self) -> None:
-        """Block until the async host offload of this item's tensors landed."""
-        event = self.host_offload_event
-        if event is not None:
-            event.synchronize()
-            self.host_offload_event = None
 
     def __post_init__(self) -> None:
         if self.hash is not None:

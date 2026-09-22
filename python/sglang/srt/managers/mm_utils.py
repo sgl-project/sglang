@@ -19,6 +19,7 @@ from torch import nn
 
 from sglang.kernels.ops.memory.gpu_tensor_hash import gpu_tensor_hash
 from sglang.srt.environ import envs
+from sglang.srt.managers import mm_schedule
 from sglang.srt.managers.io_struct import (
     BaseBatchReq,
     TokenizedEmbeddingReqInput,
@@ -727,10 +728,9 @@ def general_mm_embed_routine(
             if mm_inputs_list:
                 language_only = get_disagg().language_only
                 stream = None
-                offloaded_items = []
+                offloaded = False
                 for mm_input_obj in mm_inputs_list:
                     for mm_item in mm_input_obj.mm_items:
-                        offloaded = False
                         feature = mm_item.feature
                         if isinstance(feature, torch.Tensor) and feature.is_cuda:
                             if stream is None:
@@ -756,14 +756,10 @@ def general_mm_embed_routine(
                                     "cpu", non_blocking=True
                                 )
                                 offloaded = True
-                        if offloaded:
-                            offloaded_items.append(mm_item)
-                if offloaded_items:
-                    # One completion event covers this batch's host copies.
-                    event = torch.cuda.Event()
-                    event.record(stream)
-                    for mm_item in offloaded_items:
-                        mm_item.host_offload_event = event
+                if offloaded:
+                    if mm_schedule.host_offload_event is None:
+                        mm_schedule.host_offload_event = torch.cuda.Event()
+                    mm_schedule.host_offload_event.record(stream)
             forward_batch.mm_inputs = None
             forward_batch.mm_input_embeds = (
                 input_embeds.clone()
