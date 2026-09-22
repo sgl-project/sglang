@@ -9,7 +9,7 @@
 
 #include <cstdint>
 
-namespace {
+namespace sglang {
 
 struct StoreKVIndexParams {
   const void* __restrict__ input_ptrs[4];
@@ -168,4 +168,4 @@ void store_kv_index(
       .enable_pdl(kUsePDL)(kernel, params);
 }
 
-}  // namespace
+}  // namespace sglang

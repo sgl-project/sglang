@@ -76,9 +76,9 @@ class TestRadixBasic(ScriptedTestCase):
             f"after eviction r2 must re-chunk from scratch; "
             f"chunks_done={r2.chunks_done} cached_tokens={r2.req.cached_tokens}"
         )
-        assert (
-            r2.req.cached_tokens == 0
-        ), f"eviction must clear r1's prefix; cached_tokens={r2.req.cached_tokens}"
+        assert r2.req.cached_tokens == 0, (
+            f"eviction must clear r1's prefix; cached_tokens={r2.req.cached_tokens}"
+        )
         assert r2.kv_pages == 0
         assert r2.lock_refs == 0
 
@@ -219,9 +219,9 @@ class TestRadixBasic(ScriptedTestCase):
         r = t.start_req(prompt_len=prompt_len, max_new_tokens=2)
         yield from run_until_finished(r, max_steps=400)
         assert r.finished
-        assert (
-            r.chunks_done == 0
-        ), f"full prefix hit must skip chunked path; got chunks_done={r.chunks_done}"
+        assert r.chunks_done == 0, (
+            f"full prefix hit must skip chunked path; got chunks_done={r.chunks_done}"
+        )
 
     def test_radix_evict_race_concurrent_chunked_admit(self):
         self.server.execute_script(
@@ -304,7 +304,7 @@ class TestRadixNoTailChunked(ScriptedTestCase):
             if req is not None and req.rid == r.rid:
                 observed_mid_chunk = True
                 prefix_len: int = len(req.prefix_indices)
-                protected_len: int = req.cache_protected_len
+                protected_len: int = req.kv.cache_protected_len
                 assert prefix_len == protected_len, (
                     f"page_size=1 must take the no-tail else branch: "
                     f"len(prefix_indices)={prefix_len} != "
@@ -319,9 +319,9 @@ class TestRadixNoTailChunked(ScriptedTestCase):
             "test must observe r as the in-flight chunked_req at least once; the "
             "no-tail else branch was never exercised"
         )
-        assert (
-            r.kv_pages == 0
-        ), f"finished chunked req must release KV; got {r.kv_pages}"
+        assert r.kv_pages == 0, (
+            f"finished chunked req must release KV; got {r.kv_pages}"
+        )
 
 
 class TestRadixHitCountInvariant(ScriptedTestCase):
@@ -460,7 +460,7 @@ class TestRadixPartialPage(ScriptedTestCase):
             req = s.chunked_req
             if req is not None and req.rid == r.rid:
                 prefix_len: int = len(req.prefix_indices)
-                protected_len: int = req.cache_protected_len
+                protected_len: int = req.kv.cache_protected_len
                 assert prefix_len >= protected_len, (
                     f"len(prefix_indices)={prefix_len} dropped below "
                     f"cache_protected_len={protected_len}: tail was freed "

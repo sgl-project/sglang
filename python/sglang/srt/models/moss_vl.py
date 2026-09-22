@@ -1192,7 +1192,6 @@ class MossVLForCausalLM(nn.Module):
 
 
 class MossVLForConditionalGeneration(nn.Module):
-
     def __init__(self, config, quant_config=None, prefix: str = ""):
         super().__init__()
         self.config = config

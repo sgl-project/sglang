@@ -24,7 +24,6 @@ from typing import Iterable, Optional, Tuple
 import torch
 from torch import nn
 
-from sglang.srt.distributed import get_pp_group
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.vocab_parallel_embedding import (
@@ -33,6 +32,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.models.qwen2 import Qwen2DecoderLayer, Qwen2ForCausalLM
+from sglang.srt.runtime_context import get_parallel
 
 Qwen2Config = None
 
@@ -51,7 +51,7 @@ class Qwen2DecoderLayer(Qwen2DecoderLayer):
         # https://github.com/SafeAILab/EAGLE/blob/35c78f6cdc19a73e05cf5c330b4c358dad970c6a/eagle/model/cnets.py#L427
         if layer_id == 0:
             del self.input_layernorm
-            setattr(self, "input_layernorm", lambda x: x)
+            setattr(self, "input_layernorm", lambda x, quant_linear=None: x)
 
 
 class Qwen2Model(nn.Module):
@@ -121,7 +121,7 @@ class Qwen2ForCausalLMEagle(Qwen2ForCausalLM):
         nn.Module.__init__(self)
         self.config = config
         self.quant_config = quant_config
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
         self.model = Qwen2Model(
             config, quant_config=quant_config, prefix=add_prefix("model", prefix)
         )

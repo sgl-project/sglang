@@ -22,8 +22,8 @@ tensors remain valid across replays — we don't need Python-managed bridge
 buffers to keep break-point tensors at stable addresses.
 """
 
-import logging
 import threading
+import warnings
 from contextvars import ContextVar
 from typing import Any, Callable, Optional
 
@@ -38,8 +38,6 @@ from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.cuda_ut
     checkCudaErrors,
 )
 from sglang.srt.utils import get_device_module, is_hip, is_xpu
-
-logger = logging.getLogger(__name__)
 
 _is_xpu = is_xpu()
 
@@ -156,16 +154,18 @@ def _uninstall_wait_stream_hook():
 
 
 def _weak_ref_if_tensor(x):
-    """Return a weak-ref tensor view (shared storage, no refcount) for tensors;
-    recurse into tuples/lists; pass-through for non-tensors. Weak-ref'ing
-    captured args lets the shared mempool reclaim per-layer intermediates
-    between segments — storage stays alive for each segment CUDAGraph's
-    lifetime via its pool use_count.
+    """Return a weak-ref view for nonempty accelerator tensors; recurse into
+    tuples/lists and keep CPU, empty, and non-tensor values unchanged.
+    Weak-ref'ing captured args lets the shared mempool reclaim per-layer
+    intermediates between segments — storage stays alive for each segment
+    CUDAGraph's lifetime via its pool use_count.
 
     weak_ref_tensors is imported lazily because it hard-raises on
     platforms without a CUDA/HIP/NPU backend; we only reach this code during
     an active Breakable capture, which runs only on those backends."""
     if torch.is_tensor(x):
+        if x.numel() == 0 or x.device.type == "cpu":
+            return x
         from sglang.srt.compilation.weak_ref_tensor import weak_ref_tensors
 
         return weak_ref_tensors(x)
@@ -225,8 +225,6 @@ def eager_on_graph(enable: bool, capture_stub: Optional[Callable] = None):
             capture = _current_capture_var.get()
             if capture is None:
                 return inner(*args, **kwargs)
-
-            logger.debug("Break graph due to function: %s", inner.__name__)
 
             # End the segment that captured up to this break point.
             capture._end_current_segment()
@@ -322,9 +320,9 @@ class BreakableCUDAGraphCapture:
         capture_error_mode: str = "global",
         barrier_fn: Callable[[], None] | None = None,
     ):
-        assert isinstance(
-            cuda_graph, BreakableCUDAGraph
-        ), "cuda_graph must be a BreakableCUDAGraph"
+        assert isinstance(cuda_graph, BreakableCUDAGraph), (
+            "cuda_graph must be a BreakableCUDAGraph"
+        )
         self.cuda_graph = cuda_graph
         self._pool = pool if pool is not None else (0, 0)
         self._stream = stream
@@ -399,7 +397,12 @@ class BreakableCUDAGraphCapture:
             forked.clear()
         graph = self._current_graph
         assert graph is not None
-        graph.capture_end()
+        # A segment that enqueued no kernels (back-to-back breaks, or a segment
+        # whose ops all ran eagerly) captures an empty graph, which replays as a
+        # no-op. Torch warns about it on every such capture_end; expected here.
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", message="The CUDA Graph is empty")
+            graph.capture_end()
         self.cuda_graph._append_segment(graph, self._current_graph_needs_instantiate)
         self._current_graph = None
         self._current_graph_needs_instantiate = False

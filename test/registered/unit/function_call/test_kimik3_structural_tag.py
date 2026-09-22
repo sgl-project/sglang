@@ -197,7 +197,7 @@ def test_strict_schema_rejects_invalid_parameters(arguments):
 
 def test_required_allows_response_prefix_but_requires_tools():
     grammar = _grammar([_tool()], tool_choice="required")
-    response = "<|open|>response<|sep|>Checking." "<|close|>response<|sep|>"
+    response = "<|open|>response<|sep|>Checking.<|close|>response<|sep|>"
 
     assert _accepts(grammar, response + _tools_section(_valid_weather_call()))
     assert not _accepts(grammar, response)
@@ -377,6 +377,39 @@ def test_strict_schema_handles_number_enums_and_all_of_integer_constraints():
             )
         ),
     )
+
+
+def test_strict_schema_handles_one_sided_negative_integer_minimum():
+    tool = Tool(
+        type="function",
+        function=Function(
+            name="submit",
+            strict=True,
+            parameters={
+                "type": "object",
+                "properties": {
+                    "value": {
+                        "type": "integer",
+                        "minimum": -1000000,
+                    }
+                },
+                "required": ["value"],
+                "additionalProperties": False,
+            },
+        ),
+    )
+    grammar = _grammar([tool], tool_choice="required")
+
+    for value in ("-1000000", "-999999", "-1", "0", "1000001"):
+        assert _accepts(
+            grammar,
+            _tools_section(_call("submit", 1, _argument("value", "number", value))),
+        )
+    for value in ("-", "-1000001", "1.5"):
+        assert not _accepts(
+            grammar,
+            _tools_section(_call("submit", 1, _argument("value", "number", value))),
+        )
 
 
 def test_strict_schema_preserves_additional_properties_default():

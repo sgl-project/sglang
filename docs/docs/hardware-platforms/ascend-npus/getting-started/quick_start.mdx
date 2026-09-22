@@ -14,10 +14,10 @@ see [SGLang installation with NPUs support](/docs/hardware-platforms/ascend-npus
 
 ### Supported Devices
 
-- Atlas 800I A2 inference series (Atlas 800I A2)
-- Atlas 800I A3 inference series (Atlas 800I A3)
+- Ascend A2 Series Products
+- Ascend A3 Series Products
 
-To identify your device, run `npu-smi info -l`: A3 reports `Chip Count: 2` per NPU, while A2 reports `Chip Count: 1` per NPU.
+To identify your device, run `npu-smi info -l`: A3 Series reports `Chip Count: 2` per NPU, while A2 Series reports `Chip Count: 1` per NPU.
 For hardware details, see the [Ascend NPU Reference](/docs/hardware-platforms/ascend-npus/reference/glossary#hardware).
 
 ### Docker
@@ -40,7 +40,7 @@ at least **30GB** of free space. If you need to download model weights, check th
 </Warning>
 
 <Tip>
-We publish both **stable releases** and **daily builds**. Choose a stable release tag (e.g., `v0.5.14-cann9.0.0-a3`)
+We publish both **stable releases** and **daily builds**. Choose a stable release tag (e.g., `cann9.0.0-a3-v0.5.16`)
 if you prefer a validated version, or a daily build tag (e.g., `main-cann9.0.0-a3`) if you need the latest development changes.
 </Tip>
 
@@ -48,11 +48,11 @@ If you have already downloaded model weights to a local path (e.g., `/path/to/mo
 adding `--volume /path/to/model:/path/to/model` to the `docker run` command below.
 
 <Tabs>
-  <Tab title="Atlas 800I A3">
+  <Tab title="Ascend A3 Series">
 
 ```shell Command
 # Choose one (uncomment the line you want):
-export IMAGE=quay.io/ascend/sglang:v0.5.14-cann9.0.0-a3              # Stable release
+export IMAGE=quay.io/ascend/sglang:cann9.0.0-a3-v0.5.16              # Stable release
 # export IMAGE=quay.io/ascend/sglang:main-cann9.0.0-a3               # Daily build
 
 docker run -it --rm --privileged --network=host --ipc=host --shm-size=16g \
@@ -73,11 +73,11 @@ docker run -it --rm --privileged --network=host --ipc=host --shm-size=16g \
 ```
 
   </Tab>
-  <Tab title="Atlas 800I A2">
+  <Tab title="Ascend A2 Series">
 
 ```shell Command
 # Choose one (uncomment the line you want):
-export IMAGE=quay.io/ascend/sglang:v0.5.14-cann9.0.0-910b             # Stable release
+export IMAGE=quay.io/ascend/sglang:cann9.0.0-910b-v0.5.16             # Stable release
 # export IMAGE=quay.io/ascend/sglang:main-cann9.0.0-910b               # Daily build
 
 docker run -it --rm --privileged --network=host --ipc=host --shm-size=16g \

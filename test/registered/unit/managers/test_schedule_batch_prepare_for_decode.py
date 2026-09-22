@@ -4,21 +4,22 @@ from unittest.mock import patch
 
 import torch
 
+from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import maybe_stub_sgl_kernel
+from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
 from sglang.srt.managers.schedule_batch import ScheduleBatch  # noqa: E402
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 def _make_req():
     return types.SimpleNamespace(
         decode_batch_idx=0,
-        kv_committed_len=3,
-        kv_allocated_len=3,
+        kv=types.SimpleNamespace(kv_committed_len=3, kv_allocated_len=3),
+        beam_group=None,
     )
 
 
@@ -38,23 +39,40 @@ def _make_decode_batch():
     return batch
 
 
+class TestPrepareForDecodeMambaInit(CustomTestCase):
+    def test_spec_decode_drops_extend_mamba_init_metadata(self):
+        batch = ScheduleBatch(reqs=[])
+        batch.spec_algorithm = types.SimpleNamespace(is_none=lambda: False)
+        batch.mamba_cow_src_indices = torch.tensor([1])
+        batch.mamba_cow_dst_indices = torch.tensor([2])
+        batch.mamba_clear_indices = torch.tensor([3])
+
+        with patch(
+            "sglang.srt.speculative.spec_utils.spec_prepare_for_decode"
+        ) as prepare:
+            batch.prepare_for_decode()
+
+        prepare.assert_called_once_with(batch)
+        self.assertIsNone(batch.mamba_cow_src_indices)
+        self.assertIsNone(batch.mamba_cow_dst_indices)
+        self.assertIsNone(batch.mamba_clear_indices)
+
+
 class TestPrepareForDecodeSeqLensOwnership(unittest.TestCase):
     def test_decode_seq_lens_bump_is_out_of_place(self):
         """Each prepare_for_decode call rebinds seq-lens tensors to new +1 objects without mutating the old ones."""
         batch = _make_decode_batch()
 
-        server_args = types.SimpleNamespace(
-            enable_mamba_extra_buffer=lambda: False,
+        # The mamba-extra-buffer predicate reads the published bags, so the
+        # fixture publishes a config with the strategy off.
+        override = get_context().override_server_args(
+            mamba_radix_cache_strategy="no_buffer"
         )
-        with (
-            patch(
-                "sglang.srt.managers.schedule_batch.alloc_for_decode",
-                return_value=torch.tensor([6, 7], dtype=torch.int64),
-            ),
-            patch(
-                "sglang.srt.managers.schedule_batch.get_server_args",
-                return_value=server_args,
-            ),
+        override.install()
+        self.addCleanup(override.restore)
+        with patch(
+            "sglang.srt.managers.schedule_batch.alloc_for_decode",
+            return_value=torch.tensor([6, 7], dtype=torch.int64),
         ):
             for step in range(1, 3):
                 prev_seq_lens = batch.seq_lens

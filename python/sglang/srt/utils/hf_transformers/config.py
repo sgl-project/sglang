@@ -19,6 +19,10 @@ from typing import Optional
 from transformers import PretrainedConfig
 from transformers.models.auto.modeling_auto import MODEL_FOR_CAUSAL_LM_MAPPING_NAMES
 
+from sglang.srt.configs.deepseek_v41 import (
+    DeepseekV41Config,
+    normalize_deepseek_v41_config,
+)
 from sglang.srt.configs.model_config_parser_registry import (
     ModelConfigParserBase,
     get_model_config_parser,
@@ -37,8 +41,10 @@ from .common import (
     _override_v_head_dim_if_zero,
     check_gguf_file,
     get_hf_text_config,
+    gguf_sidecar_dir,
     resolve_runai_obj_uri,
 )
+from .gguf_native import build_gguf_config, has_native_gguf_support
 from .mistral_utils import is_mistral_model, load_mistral_config
 
 
@@ -72,6 +78,47 @@ def _try_load_longcat_config(model, revision: Optional[str], **kwargs):
     )
 
 
+def _try_load_raw_mamba_config(model, revision: Optional[str], **kwargs):
+    """Recognize the original state-spaces Mamba-1 checkpoints.
+
+    The raw `state-spaces/mamba-*` repos (e.g. mamba-130m/790m/2.8b, as opposed
+    to the `-hf` conversions) ship a minimal `config.json` with `d_model` /
+    `n_layer` / `ssm_cfg` and NO `model_type` / `architectures`, so
+    `AutoConfig.from_pretrained` rejects them with "Unrecognized model ...".
+    Detect that shape and build our `MambaConfig` (model_type `mamba`, arch
+    `MambaForCausalLM`) with the field-name mapping the SGLang Mamba model
+    expects. Uses `get_config_dict` (which does not require a model_type) so
+    this runs before the failing `AutoConfig` path.
+    """
+    config_dict, _ = PretrainedConfig.get_config_dict(
+        model, revision=revision, **kwargs
+    )
+    # Raw state-spaces Mamba: has d_model + ssm_cfg, and no model_type/arch.
+    if config_dict.get("model_type") or config_dict.get("architectures"):
+        return None
+    if "d_model" not in config_dict or "ssm_cfg" not in config_dict:
+        return None
+
+    from sglang.srt.configs.mamba import MambaConfig
+
+    d_model = config_dict["d_model"]
+    # The embedding is padded up to a multiple of pad_vocab_size_multiple; match
+    # the checkpoint (e.g. 50277 -> 50280) so weight shapes line up.
+    pad = config_dict.get("pad_vocab_size_multiple", 1)
+    vocab_size = config_dict.get("vocab_size", 50280)
+    if pad > 1:
+        vocab_size = ((vocab_size + pad - 1) // pad) * pad
+    return MambaConfig(
+        vocab_size=vocab_size,
+        hidden_size=d_model,
+        num_hidden_layers=config_dict["n_layer"],
+        state_size=config_dict.get("ssm_cfg", {}).get("d_state", 16),
+        layer_norm_epsilon=config_dict.get("layer_norm_epsilon", 1e-5),
+        residual_in_fp32=config_dict.get("residual_in_fp32", True),
+        architectures=["MambaForCausalLM"],
+    )
+
+
 @register_model_config_parser("hf")
 class HfModelConfigParser(ModelConfigParserBase):
     def parse(
@@ -82,6 +129,8 @@ class HfModelConfigParser(ModelConfigParserBase):
         **kwargs,
     ):
         config = _try_load_longcat_config(model, revision, **kwargs)
+        if config is None:
+            config = _try_load_raw_mamba_config(model, revision, **kwargs)
         if config is None:
             config = AutoConfig.from_pretrained(
                 model,
@@ -134,13 +183,23 @@ class HfModelConfigParser(ModelConfigParserBase):
             _set_architectures(config, "DeepseekOCRForCausalLM")
             config = DeepseekVLV2Config.from_pretrained(model, revision=revision)
             _apply_deepseek_ocr_overrides(config, model)
+        elif isinstance(config, DeepseekV41Config):
+            config._name_or_path = model
         elif config.model_type in _CONFIG_REGISTRY:
             model_type = config.model_type
             if model_type == "deepseek_vl_v2" and is_ocr:
                 model_type = "deepseek-ocr"
-            config = _CONFIG_REGISTRY[model_type].from_pretrained(
-                model, revision=revision
-            )
+            # Raw state-spaces Mamba configs are built by
+            # _try_load_raw_mamba_config with architectures injected; reloading
+            # from the checkpoint would drop them, so skip it when the config is
+            # already one of our classes.
+            from sglang.srt.configs.mamba import FalconMambaConfig, MambaConfig
+            from sglang.srt.configs.mamba2 import Mamba2Config
+
+            if not isinstance(config, (Mamba2Config, MambaConfig, FalconMambaConfig)):
+                config = _CONFIG_REGISTRY[model_type].from_pretrained(
+                    model, revision=revision
+                )
 
             # Re-check after reloading config from registry
             if _is_deepseek_ocr_model(config) or _is_deepseek_ocr2_model(config):
@@ -224,6 +283,7 @@ def get_config(
     **kwargs,
 ):
     is_gguf = check_gguf_file(model)
+    gguf_has_sidecar_config = False
     if is_gguf:
         if model_config_parser not in ("auto", "hf"):
             raise ValueError(
@@ -231,7 +291,14 @@ def get_config(
                 "with GGUF inputs; only 'hf' (or 'auto') is supported."
             )
         _ensure_gguf_version()
-        kwargs["gguf_file"] = model
+        gguf_has_sidecar_config = gguf_sidecar_dir(model, "config.json") is not None
+        if not gguf_has_sidecar_config and has_native_gguf_support(model):
+            config = build_gguf_config(model)
+            if model_override_args:
+                config.update(model_override_args)
+            return config
+        if not gguf_has_sidecar_config:
+            kwargs["gguf_file"] = model
         model = Path(model).parent
         # Skip auto-resolution for GGUF: the name-based Mistral heuristic
         # would misfire on the rewritten parent dir.
@@ -254,6 +321,8 @@ def get_config(
     )
 
     if model_override_args:
+        if isinstance(config, DeepseekV41Config):
+            model_override_args = normalize_deepseek_v41_config(model_override_args)
         # A plain update() setattrs a dict-valued override straight onto the
         # config, so '{"text_config": {...}}' on a VLM would replace the whole
         # sub-config with a dict and break attribute access downstream.
@@ -264,9 +333,13 @@ def get_config(
             else:
                 setattr(config, key, value)
 
-    if is_gguf:
+    if is_gguf and not gguf_has_sidecar_config:
         if config.model_type not in MODEL_FOR_CAUSAL_LM_MAPPING_NAMES:
-            raise RuntimeError(f"Can't get gguf config for {config.model_type}.")
+            raise RuntimeError(
+                f"Can't get gguf config for {config.model_type}. Place a "
+                "config.json next to the .gguf file to load the config from "
+                "there instead."
+            )
         _set_architectures(config, MODEL_FOR_CAUSAL_LM_MAPPING_NAMES[config.model_type])
 
     return config

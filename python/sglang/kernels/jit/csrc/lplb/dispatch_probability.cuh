@@ -28,7 +28,7 @@
 
 #include <cstdint>
 
-namespace {
+namespace sglang {
 
 template <int MAX_COPIES, int BLOCK_DIM>
 __global__ void dispatch_probability_kernel(
@@ -119,4 +119,4 @@ void dispatch_probability(
       n);
 }
 
-}  // namespace
+}  // namespace sglang
