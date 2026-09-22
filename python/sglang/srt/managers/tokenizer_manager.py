@@ -1835,9 +1835,13 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         is_stream = getattr(obj, "stream", False)
         while True:
             try:
-                await asyncio.wait_for(
-                    state.event.wait(), timeout=_REQUEST_STATE_WAIT_TIMEOUT
-                )
+                if request is None:
+                    # Engine requests have no HTTP client to poll for disconnects.
+                    await state.event.wait()
+                else:
+                    await asyncio.wait_for(
+                        state.event.wait(), timeout=_REQUEST_STATE_WAIT_TIMEOUT
+                    )
             except asyncio.TimeoutError:
                 if (
                     request is not None
