@@ -15,6 +15,10 @@ from sglang.srt.environ import envs
 from sglang.srt.function_call.deepseekv4_format import (
     mask_literals as mask_dsv4_literals,
 )
+from sglang.srt.function_call.deepseekv4_format import (
+    reasoning_boundary_suffix_start,
+    strip_orphan_reasoning_suffix,
+)
 from sglang.srt.function_call.hunyuan_detector import resolve_hunyuan_tokens
 from sglang.srt.function_call.kimik3_format import (
     MESSAGE_CLOSE,
@@ -1550,6 +1554,41 @@ class DeepSeekV4Detector(BaseReasoningFormatDetector):
         self._content_pending = ""
         self._reasoning_finished = False
         self._tool_payload_started = False
+        self._repair_reasoning_boundary = (
+            self._strict_tool_boundary
+            and envs.SGLANG_DSV4_REJECT_PROTOCOL_MARKERS.get()
+        )
+        self._reasoning_suffix = ""
+        self._reasoning_history: list[str] = []
+        self._reasoning_at_line_start = True
+
+    def _filter_reasoning_boundary(self, text: str) -> str:
+        if not self._repair_reasoning_boundary:
+            return text
+        if text:
+            self._reasoning_history.append(text)
+        combined = self._reasoning_suffix + text
+        start = reasoning_boundary_suffix_start(
+            combined, at_line_start=self._reasoning_at_line_start
+        )
+        emitted, self._reasoning_suffix = combined[:start], combined[start:]
+        if self._reasoning_finished:
+            suffix = self._reasoning_suffix
+            if suffix and self._saw_think_end:
+                history = "".join(self._reasoning_history)
+                suffix = strip_orphan_reasoning_suffix(
+                    history, len(history) - len(suffix)
+                )
+            self._reasoning_suffix = ""
+            self._reasoning_history.clear()
+            self._reasoning_at_line_start = True
+            return emitted + suffix
+        last_newline = max(emitted.rfind("\n"), emitted.rfind("\r"))
+        if last_newline >= 0:
+            self._reasoning_at_line_start = not emitted[last_newline + 1 :].strip(" \t")
+        elif emitted.strip(" \t"):
+            self._reasoning_at_line_start = False
+        return emitted
 
     def _parse_tool_boundary(self, text: str) -> str:
         if self._tool_payload_started:
@@ -1600,6 +1639,7 @@ class DeepSeekV4Detector(BaseReasoningFormatDetector):
             self._reasoning_finished = not self._in_reasoning
         else:
             result = super()._parse_streaming_increment_impl(new_text)
+        result.reasoning_text = self._filter_reasoning_boundary(result.reasoning_text)
         result.normal_text = self._parse_tool_boundary(result.normal_text)
         return result
 
@@ -1614,6 +1654,11 @@ class DeepSeekV4Detector(BaseReasoningFormatDetector):
         )
 
     def finish(self) -> StreamingParseResult:
+        # 未确认 reasoning 闭合时，EOF 必须原样释放暂存片段。
+        if self._reasoning_suffix:
+            self._buffer = self._reasoning_suffix + self._buffer
+            self._reasoning_suffix = ""
+        self._reasoning_history.clear()
         result = super().finish()
         if self._strict_tool_boundary:
             result.normal_text = self._content_pending + result.normal_text
