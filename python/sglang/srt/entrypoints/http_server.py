@@ -2403,6 +2403,10 @@ def _execute_server_warmup(server_args: ServerArgs):
     return success
 
 
+# Bound the wait so a genuinely dead server still reports promptly.
+_FREEZE_GC_CONNECT_TIMEOUT_SECS = 10.0
+
+
 def _freeze_gc_after_server_warmup(server_args: ServerArgs):
     # Freeze GC after server warmup so static objects skip future GC gen2 collection.
     # Use /freeze_gc to freeze scheduler and detokenizer as well.
@@ -2410,16 +2414,26 @@ def _freeze_gc_after_server_warmup(server_args: ServerArgs):
     freeze_headers = {}
     if freeze_key:
         freeze_headers["Authorization"] = f"Bearer {freeze_key}"
-    try:
-        res = requests.post(
-            server_args.url() + "/freeze_gc",
-            headers=freeze_headers,
-            timeout=10,
-            verify=ssl_verify_of(server_args),
-        )
-        res.raise_for_status()
-    except requests.exceptions.RequestException:
-        logger.warning("post-warmup freeze_gc failed", exc_info=True)
+    # Warmup polls /model_info until the listener answers, but it is skipped under
+    # --skip-server-warmup and for elastic joiners, and uvicorn logs "startup
+    # complete" before the socket accepts, so the freeze can land in that gap.
+    deadline = time.perf_counter() + _FREEZE_GC_CONNECT_TIMEOUT_SECS
+    while True:
+        try:
+            res = requests.post(
+                server_args.url() + "/freeze_gc",
+                headers=freeze_headers,
+                timeout=10,
+                verify=ssl_verify_of(server_args),
+            )
+            res.raise_for_status()
+            return
+        except requests.exceptions.RequestException as exc:
+            connecting = isinstance(exc, requests.exceptions.ConnectionError)
+            if not connecting or time.perf_counter() >= deadline:
+                logger.warning("post-warmup freeze_gc failed", exc_info=True)
+                return
+            time.sleep(0.1)
 
 
 def _wait_and_warmup(
