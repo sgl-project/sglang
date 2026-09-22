@@ -19,8 +19,6 @@ _is_npu = is_npu()
 _is_xpu = is_xpu()
 
 embedding_cache: Optional[MultiModalStaticCache] = None
-# The worker submits its MM offloads on one stream, so the latest record
-# also covers older CPU backups retained across prefill batches.
 host_offload_event: Optional[torch.cuda.Event] = None
 
 
