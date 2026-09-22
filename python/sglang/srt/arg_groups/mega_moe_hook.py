@@ -41,7 +41,7 @@ def check_mega_moe_compat(server_args: ServerArgs) -> None:
     # aiter MegaMoEv2 over mori, which needs none of the DeepGEMM requirements.
     # Gate on the env rather than on is_rocm alone so that a ROCm run without it
     # still gets the error instead of silently falling into the CUDA path.
-    if platform.is_rocm and envs.SGLANG_AMD_USE_FLYDSL_MEGA_MOE.get():
+    if platform.is_hip and envs.SGLANG_AMD_USE_FLYDSL_MEGA_MOE.get():
         return
     if not (platform.is_cuda and (platform.is_sm90 or platform.is_sm100)):
         raise ValueError(
