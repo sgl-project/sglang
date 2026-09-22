@@ -45,8 +45,6 @@ from sglang.srt.batch_overlap.two_batch_overlap import (
 )
 from sglang.srt.configs.dots3 import Dots3Config
 from sglang.srt.distributed import (
-    get_pp_group,
-    parallel_state,
     tensor_model_parallel_all_reduce,
 )
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
@@ -391,7 +389,7 @@ class Dots3MoE(nn.Module):
             )
 
             self.deepep_dispatcher = MaybeTboDeepEPDispatcher(
-                group=parallel_state.get_tp_group().device_group,
+                group=get_parallel().tp_group.device_group,
                 router_topk=self.top_k,
                 permute_fusion=True,
                 num_experts=self.num_experts,
@@ -459,7 +457,7 @@ class Dots3MoE(nn.Module):
             final_hidden_states = self.experts(hidden_states, topk_output)
 
         current_stream.wait_stream(self.alt_stream)
-        with use_symmetric_memory(parallel_state.get_tp_group()) as sm:
+        with use_symmetric_memory(get_parallel().tp_group) as sm:
             final_hidden_states_out = torch.empty_like(final_hidden_states)
 
         torch.add(final_hidden_states, shared_output, out=final_hidden_states_out)
@@ -491,7 +489,7 @@ class Dots3MoE(nn.Module):
 
         final_hidden_states = self.experts(hidden_states, topk_output)
         if shared_output is not None:
-            with use_symmetric_memory(parallel_state.get_tp_group()) as sm:
+            with use_symmetric_memory(get_parallel().tp_group) as sm:
                 final_hidden_states_out = torch.empty_like(final_hidden_states)
             torch.add(final_hidden_states, shared_output, out=final_hidden_states_out)
             final_hidden_states = final_hidden_states_out
@@ -735,14 +733,16 @@ class Dots3AttentionMLA(nn.Module):
         self.num_heads = attn_config.num_attention_heads
         assert self.num_heads % attn_tp_size == 0
         self.num_local_heads = self.num_heads // attn_tp_size
-        assert (
-            attn_config.num_attention_heads == attn_config.num_key_value_heads
-        ), "Dots3 Only supports equal number of query and key value heads."
+        assert attn_config.num_attention_heads == attn_config.num_key_value_heads, (
+            "Dots3 Only supports equal number of query and key value heads."
+        )
         self.attention_gate_type = attn_config.attention_gate_type
         assert self.attention_gate_type in {
             "headwise",
             "elementwise",
-        }, f"Unsupported attention_gate_type: {self.attention_gate_type}. Expected 'headwise' or 'elementwise'."
+        }, (
+            f"Unsupported attention_gate_type: {self.attention_gate_type}. Expected 'headwise' or 'elementwise'."
+        )
         self.g_proj_local_dim = self.num_local_heads * (
             1 if self.attention_gate_type == "headwise" else self.v_head_dim
         )
@@ -832,9 +832,9 @@ class Dots3AttentionMLA(nn.Module):
 
         # Optional NSA (Native Sparse Attention) indexer.
         if self.use_nsa:
-            assert (
-                self.q_lora_rank is not None
-            ), "Dots3 NSA requires q_lora_rank to be set in the config."
+            assert self.q_lora_rank is not None, (
+                "Dots3 NSA requires q_lora_rank to be set in the config."
+            )
             self.indexer = Indexer(
                 hidden_size=self.hidden_size,
                 index_n_heads=config.index_n_heads,
@@ -1073,9 +1073,9 @@ class Dots3AttentionMLA(nn.Module):
         zero_allocator: BumpAllocator,
     ):
         if hidden_states.shape[0] == 0:
-            assert (
-                not self.o_proj.reduce_results
-            ), "short-circuiting allreduce will lead to hangs"
+            assert not self.o_proj.reduce_results, (
+                "short-circuiting allreduce will lead to hangs"
+            )
             return hidden_states, None, forward_batch, None
 
         attn_forward_method = self.dispatch_attn_forward_method(forward_batch)
@@ -1729,7 +1729,7 @@ class Dots3Model(nn.Module):
         super().__init__()
         _require_cuda()
         self.first_k_dense_replace = config.first_k_dense_replace
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
 
         if self.pp_group.is_first_rank:
             self.embed_tokens = VocabParallelEmbedding(
@@ -1853,9 +1853,9 @@ class Dots3LanguageModelForCausalLM(nn.Module):
         # for quark model load
         # Always fuse q_a_proj/kv_a_proj_with_mqa/g_proj when loading Dots3.
         self.fuse_qkv_a_g_proj = True
-        assert (
-            config.q_lora_rank is not None
-        ), "Dots3 requires q_lora_rank to enable fused_qkv_a_g_proj_with_mqa loading."
+        assert config.q_lora_rank is not None, (
+            "Dots3 requires q_lora_rank to enable fused_qkv_a_g_proj_with_mqa loading."
+        )
         if self.fuse_qkv_a_g_proj:
             self.packed_modules_mapping["fused_qkv_a_g_proj_with_mqa"] = [
                 "q_a_proj",
@@ -1863,7 +1863,7 @@ class Dots3LanguageModelForCausalLM(nn.Module):
                 "g_proj",
             ]
 
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
         self.config = config
         self.tp_size = get_parallel().tp_size
         self.quant_config = quant_config
@@ -2039,12 +2039,16 @@ class Dots3LanguageModelForCausalLM(nn.Module):
                 assert (
                     self.quant_config is not None
                     and self.quant_config.weight_block_size is not None
-                ), "Dots3 MLA kv_b_proj only supports FP8 block quantization with weight_block_size=(128, 128)."
+                ), (
+                    "Dots3 MLA kv_b_proj only supports FP8 block quantization with weight_block_size=(128, 128)."
+                )
                 weight_block_size = tuple(self.quant_config.weight_block_size)
                 assert weight_block_size == (
                     128,
                     128,
-                ), f"Dots3 MLA kv_b_proj only supports FP8 block_size=(128, 128), got {weight_block_size}."
+                ), (
+                    f"Dots3 MLA kv_b_proj only supports FP8 block_size=(128, 128), got {weight_block_size}."
+                )
                 block_scale = self_attn.kv_b_proj.weight_scale_inv
 
                 if not (
@@ -2062,9 +2066,9 @@ class Dots3LanguageModelForCausalLM(nn.Module):
                         torch.bfloat16,
                     )
             else:
-                assert (
-                    w.dtype == torch.bfloat16
-                ), f"Dots3 MLA kv_b_proj only supports BF16 or FP8(128x128), got dtype={w.dtype}."
+                assert w.dtype == torch.bfloat16, (
+                    f"Dots3 MLA kv_b_proj only supports BF16 or FP8(128x128), got dtype={w.dtype}."
+                )
 
             w_kc, w_vc = w.unflatten(
                 0, (-1, self_attn.qk_nope_head_dim + self_attn.v_head_dim)
@@ -2207,9 +2211,9 @@ class Dots3LanguageModelForCausalLM(nn.Module):
 
         # Always fuse q_a_proj/kv_a_proj_with_mqa/g_proj when loading Dots3.
         fuse_qkv_a_g_proj = True
-        assert (
-            self.config.q_lora_rank is not None
-        ), "Dots3 requires q_lora_rank to enable fused_qkv_a_g_proj_with_mqa loading."
+        assert self.config.q_lora_rank is not None, (
+            "Dots3 requires q_lora_rank to enable fused_qkv_a_g_proj_with_mqa loading."
+        )
         cached_a_proj = {} if fuse_qkv_a_g_proj else None
         attn_tp_rank = get_parallel().attn_tp_rank
         attn_tp_size = get_parallel().attn_tp_size
@@ -2217,9 +2221,9 @@ class Dots3LanguageModelForCausalLM(nn.Module):
         def shard_g_proj_for_attention_tp(
             weight: torch.Tensor, cat_dim: int, is_scale: bool
         ):
-            assert (
-                weight.ndim > cat_dim
-            ), f"weight.ndim={weight.ndim}, cat_dim={cat_dim}"
+            assert weight.ndim > cat_dim, (
+                f"weight.ndim={weight.ndim}, cat_dim={cat_dim}"
+            )
             dim_size = weight.shape[cat_dim]
             if not is_scale:
                 assert dim_size % attn_tp_size == 0, (
@@ -2599,7 +2603,7 @@ class DotsNoteOmniThinkerForConditionalGeneration(nn.Module):
         )
 
         self.config = config
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
         model_dir = Path(config._name_or_path)
         self.language_model = Dots3LanguageModelForCausalLM(
             config,

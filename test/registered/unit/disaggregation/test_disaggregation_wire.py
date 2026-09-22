@@ -2,12 +2,13 @@ import struct
 import threading
 import unittest
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import ANY, Mock, call, patch
 
 import numpy as np
 import torch
+import torch.distributed as dist
 
-from sglang.srt.disaggregation.base.conn import KVArgs, StateType
+from sglang.srt.disaggregation.base.conn import KVArgs, KVPoll, StateType
 from sglang.srt.disaggregation.common.conn import CommonKVManager
 from sglang.srt.disaggregation.common.staging_buffer import (
     StagingAllocator,
@@ -29,24 +30,41 @@ from sglang.srt.disaggregation.decode_schedule_batch_mixin import (
 from sglang.srt.disaggregation.mooncake.conn import (
     KVArgsRegisterInfo,
     MooncakeKVManager,
+    TransferInfo,
 )
 from sglang.srt.disaggregation.utils import (
     MetadataBuffers,
-    get_dsv4_c128_state_indices,
+    build_transfer_entry_pairs,
+    compute_mamba_state_slice_byte_blocks,
+    get_qsa_pending_state_indices,
+    poll_and_all_reduce,
+    poll_and_all_reduce_attn_cp_tp_group,
+    poll_and_all_reduce_with_staging,
     setup_state_kv_args,
+    should_send_replicated_state,
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsa.utils import should_use_dsa_fused_topk
 from sglang.srt.managers.overlap_utils import FutureMap, RelayPayload
 from sglang.srt.managers.schedule_batch import ReqKvInfo
+from sglang.srt.mem_cache.deepseek_v4_compress_state import (
+    CompressStatePool,
+    c4_state_transfer_indices,
+    request_scoped_state_transfer_indices,
+)
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
+from sglang.srt.mem_cache.qsa_kv_pool import (
+    QSA_ROPE_STATE_LAYER_ID,
+    QSATokenToKVPool,
+)
 from sglang.srt.runtime_context import get_context
 from sglang.srt.speculative.eagle_disaggregation import (
     build_eagle_disagg_draft_input,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=2, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 class TestDisaggregationWire(unittest.TestCase):
@@ -78,6 +96,9 @@ class TestDisaggregationWire(unittest.TestCase):
         self.assertEqual(info.staging_total_size, 4096)
         self.assertEqual(info.dst_dcp_size, 4)
         self.assertEqual(info.dst_dcp_rank, 2)
+        self.assertEqual(info.dst_kv_item_lens, [])
+        info = KVArgsRegisterInfo.from_zmq(msg + [b"", struct.pack("Q", 128)])
+        self.assertEqual(info.dst_kv_item_lens, [128])
 
     def test_int_lists_roundtrip(self):
         cases = [
@@ -144,6 +165,117 @@ class TestDisaggregationWire(unittest.TestCase):
         self.assertEqual(unpack_list_of_buffers(pack_list_of_buffers(bufs)), bufs)
 
 
+class TestPollCollectives(CustomTestCase):
+    def setUp(self):
+        super().setUp()
+        failure_prob = patch.object(
+            envs.SGLANG_TEST_DISAGG_FAILURE_PROB, "get", return_value=0
+        )
+        failure_prob.start()
+        self.addCleanup(failure_prob.stop)
+
+    def test_tp_cp_consensus_skips_only_singleton_groups(self):
+        """Poll states retain TP/CP consensus without singleton collectives."""
+        local = [KVPoll.Success, KVPoll.Success, KVPoll.Success]
+        tp_peers = [KVPoll.Success, KVPoll.Transferring, KVPoll.Success]
+        cp_peers = [KVPoll.Bootstrapping, KVPoll.Success, KVPoll.Failed]
+        for tp_size, cp_size in [(4, 1), (2, 2), (1, 4), (1, 1)]:
+            with self.subTest(tp_size=tp_size, cp_size=cp_size):
+                tp, cp = object(), object()
+                sizes = {tp: tp_size, cp: cp_size}
+                peers = {tp: tp_peers, cp: cp_peers}
+                pollers = [Mock(poll=Mock(return_value=state)) for state in local]
+
+                def reduce(tensor, op, group):
+                    self.assertEqual(op, dist.ReduceOp.MIN)
+                    if sizes[group] > 1:
+                        tensor.copy_(
+                            torch.minimum(
+                                tensor, torch.tensor(peers[group], dtype=tensor.dtype)
+                            )
+                        )
+
+                expected = local.copy()
+                expected_calls = []
+                for group in [tp, cp]:
+                    if sizes[group] > 1:
+                        expected = [min(a, b) for a, b in zip(expected, peers[group])]
+                        expected_calls.append(
+                            call(ANY, op=dist.ReduceOp.MIN, group=group)
+                        )
+                with (
+                    patch.object(dist, "get_world_size", side_effect=sizes.__getitem__),
+                    patch.object(dist, "all_reduce", side_effect=reduce) as all_reduce,
+                ):
+                    result = poll_and_all_reduce_attn_cp_tp_group(pollers, cp, tp)
+
+                self.assertEqual(result, expected)
+                self.assertEqual(all_reduce.call_args_list, expected_calls)
+                for poller in pollers:
+                    poller.poll.assert_called_once_with()
+
+    def test_singleton_polling_needs_no_tensor_or_collective(self):
+        """A single rank can poll transfers without allocating a reduction tensor."""
+        states = [KVPoll.Failed, KVPoll.Transferring, KVPoll.Success]
+        pollers = [Mock(poll=Mock(return_value=state)) for state in states]
+        with (
+            patch.object(dist, "get_world_size", return_value=1),
+            patch.object(dist, "all_reduce") as all_reduce,
+            patch.object(
+                torch, "tensor", side_effect=AssertionError("No tensor needed")
+            ),
+        ):
+            self.assertEqual(poll_and_all_reduce(pollers, object()), states)
+        all_reduce.assert_not_called()
+
+    def test_singleton_still_waits_for_decode_metadata(self):
+        pollers = [Mock(poll=Mock(return_value=KVPoll.Success)) for _ in range(2)]
+        requests = [
+            SimpleNamespace(
+                req=SimpleNamespace(bootstrap_host="127.0.0.1"),
+                metadata_buffer_index=index,
+            )
+            for index in range(2)
+        ]
+        metadata = SimpleNamespace(bootstrap_room=torch.tensor([[0], [42]]))
+        with (
+            patch.object(dist, "get_world_size", return_value=1),
+            patch.object(dist, "all_reduce") as all_reduce,
+        ):
+            result = poll_and_all_reduce(pollers, object(), requests, metadata)
+        self.assertEqual(result, [KVPoll.Transferring, KVPoll.Success])
+        all_reduce.assert_not_called()
+
+    def test_singleton_still_advances_and_waits_for_staging(self):
+        request = SimpleNamespace(
+            kv_receiver=Mock(
+                require_staging=True, poll=Mock(return_value=KVPoll.Success)
+            )
+        )
+        staging = Mock(
+            is_done=Mock(return_value=False), is_failed=Mock(return_value=False)
+        )
+        with (
+            patch.object(dist, "get_world_size", return_value=1),
+            patch.object(dist, "all_reduce") as all_reduce,
+        ):
+            result = poll_and_all_reduce_with_staging([request], staging, object())
+        self.assertEqual(result, [KVPoll.Transferring])
+        staging.advance_scatter.assert_called_once_with(request)
+        all_reduce.assert_not_called()
+
+    def test_singleton_preserves_failure_injection(self):
+        poller = Mock(poll=Mock(return_value=KVPoll.Success))
+        with (
+            patch.object(envs.SGLANG_TEST_DISAGG_FAILURE_PROB, "get", return_value=1),
+            patch.object(dist, "get_world_size", return_value=1),
+            patch.object(dist, "all_reduce") as all_reduce,
+        ):
+            result = poll_and_all_reduce([poller], object())
+        self.assertEqual(result, [KVPoll.Failed])
+        all_reduce.assert_not_called()
+
+
 class TestCPReplicatedStateTransfer(unittest.TestCase):
     def test_only_nonzero_cp_ranks_without_layer_split_skip_state(self):
         cases = [
@@ -184,6 +316,191 @@ class TestCPReplicatedStateTransfer(unittest.TestCase):
                 manager._get_dsa_cache_transfer_skip_flags(None),
                 (False, True),
             )
+
+
+class TestQwen4StateWire(unittest.TestCase):
+    def test_qsa_pending_payload_uses_nested_request_pool_row(self):
+        req = SimpleNamespace(kv=ReqKvInfo(req_pool_idx=7))
+
+        np.testing.assert_array_equal(
+            get_qsa_pending_state_indices(req),
+            np.array([7], dtype=np.int32),
+        )
+
+    def test_qsa_registers_request_ring_and_page_state_separately(self):
+        pool = object.__new__(QSATokenToKVPool)
+        pool.full_kv_pool = object()
+        pool.get_state_buf_infos = lambda: ([10], [100], [20])
+        pool.get_state_dim_per_tensor = lambda: [4]
+        pool.get_state_conv_shard_groups = lambda: [None]
+        pool.get_state_slice_outer_counts = lambda: [1]
+        pool.get_state_layer_ids = lambda: [2]
+        pool.page_size = 4
+        pool.qsa_compress_ratio = 2
+        pool.qsa_compressed_page_size = 2
+        pool.full_attention_layer_id_mapping = {24: 0}
+        pool.qsa_key_state_buffer_pool = [torch.zeros((6, 1, 8), dtype=torch.bfloat16)]
+        pool.qsa_rope_position_buffer = torch.zeros((6, 3), dtype=torch.int64)
+        pool.qsa_compressed_k_buffer_pool = [
+            torch.zeros((6, 1, 8), dtype=torch.bfloat16)
+        ]
+
+        kv_args = SimpleNamespace()
+        setup_state_kv_args(kv_args, pool)
+
+        self.assertEqual(
+            kv_args.state_types,
+            [StateType.MAMBA, StateType.QSA_PENDING, StateType.QSA_COMPRESSED],
+        )
+        # Pending entries are whole two-row request rings; compressed-K remains
+        # a two-row compressed page corresponding to one four-token KV page.
+        self.assertEqual(kv_args.state_item_lens[1:], [[32, 48], [32]])
+        self.assertEqual(
+            kv_args.state_layer_ids[1:],
+            [[24, QSA_ROPE_STATE_LAYER_ID], [24]],
+        )
+
+    def test_qsa_stage_without_qsa_layers_does_not_register_rope_ring(self):
+        pool = object.__new__(QSATokenToKVPool)
+        pool.full_kv_pool = object()
+        pool.get_state_buf_infos = lambda: ([10], [100], [20])
+        pool.get_state_dim_per_tensor = lambda: [4]
+        pool.get_state_conv_shard_groups = lambda: [None]
+        pool.get_state_slice_outer_counts = lambda: [1]
+        pool.get_state_layer_ids = lambda: [2]
+        pool.page_size = 4
+        pool.qsa_compress_ratio = 2
+        pool.qsa_compressed_page_size = 2
+        pool.full_attention_layer_id_mapping = {}
+        pool.qsa_key_state_buffer_pool = []
+        pool.qsa_rope_position_buffer = torch.zeros((6, 3), dtype=torch.int64)
+        pool.qsa_compressed_k_buffer_pool = []
+
+        kv_args = SimpleNamespace()
+        setup_state_kv_args(kv_args, pool)
+
+        # Keep the component slots aligned across PP stages, but expose no QSA
+        # buffers or layer ids from a stage that cannot produce their contents.
+        self.assertEqual(
+            kv_args.state_types,
+            [StateType.MAMBA, StateType.QSA_PENDING, StateType.QSA_COMPRESSED],
+        )
+        self.assertEqual(kv_args.state_data_ptrs[1:], [[], []])
+        self.assertEqual(kv_args.state_data_lens[1:], [[], []])
+        self.assertEqual(kv_args.state_item_lens[1:], [[], []])
+        self.assertEqual(kv_args.state_layer_ids[1:], [[], []])
+
+    def test_compact_qsa_entries_map_by_global_layer_id(self):
+        self.assertEqual(
+            build_transfer_entry_pairs(
+                [24, QSA_ROPE_STATE_LAYER_ID],
+                [0, 12, 24, QSA_ROPE_STATE_LAYER_ID],
+                2,
+                4,
+            ),
+            [(0, 2), (1, 3)],
+        )
+
+    def test_replicated_state_tp_policy(self):
+        for src_tp, dst_tp, rank, expected in (
+            (4, 1, 0, True),
+            (4, 1, 1, False),
+            (1, 4, 0, True),
+            (4, 4, 3, True),
+        ):
+            with self.subTest(src_tp=src_tp, dst_tp=dst_tp, rank=rank):
+                self.assertEqual(
+                    should_send_replicated_state(
+                        src_attn_tp_size=src_tp,
+                        dst_attn_tp_size=dst_tp,
+                        local_tp_rank_in_group=rank,
+                    ),
+                    expected,
+                )
+
+        common = dict(
+            src_item_len=96,
+            dst_item_len=96,
+            src_dim=0,
+            dst_dim=0,
+            outer_count=1,
+            src_attn_tp_size=4,
+            dst_attn_tp_size=1,
+            dst_tp_rank_in_group=0,
+        )
+        self.assertEqual(
+            compute_mamba_state_slice_byte_blocks(**common, local_tp_rank_in_group=0),
+            [(0, 0, 96)],
+        )
+        self.assertEqual(
+            compute_mamba_state_slice_byte_blocks(**common, local_tp_rank_in_group=1),
+            [],
+        )
+        with self.assertRaisesRegex(ValueError, "must divide"):
+            should_send_replicated_state(
+                src_attn_tp_size=3,
+                dst_attn_tp_size=2,
+                local_tp_rank_in_group=0,
+            )
+
+
+class TestMooncakeTransferInfoIsDummy(unittest.TestCase):
+    """Truth table for mooncake's payload-inferred is_dummy, with frames built
+    as KVSender sends them: kv and aux are empty iff dummy, state indices are
+    gated on dummy, decode_prefix_len and required_dst_info_num are sent
+    unconditionally."""
+
+    def _frames(self, kv, aux, state, prefix):
+        return [
+            b"7",
+            b"127.0.0.1",
+            b"1234",
+            b"session",
+            kv,
+            aux,
+            state,
+            b"1",
+            prefix,
+            b"",
+        ]
+
+    def test_real_transfer_is_not_dummy(self):
+        kv = np.array([3, 5], dtype=np.int32)
+        info = TransferInfo.from_zmq(
+            self._frames(kv.tobytes(), b"4", pack_int_lists([[1]], "i"), b"0")
+        )
+
+        self.assertFalse(info.is_dummy)
+        np.testing.assert_array_equal(info.dst_kv_indices, kv)
+        self.assertEqual(info.dst_aux_index, 4)
+        self.assertEqual(info.dst_state_indices, [[1]])
+
+    def test_full_prefix_hit_with_empty_kv_is_not_dummy(self):
+        # Empty kv indices serialize to an empty frame, so only the non-empty
+        # aux frame distinguishes a full-prefix-hit transfer from a dummy one.
+        info = TransferInfo.from_zmq(
+            self._frames(np.array([], dtype=np.int32).tobytes(), b"4", b"", b"128")
+        )
+
+        self.assertFalse(info.is_dummy)
+        self.assertEqual(info.dst_aux_index, 4)
+        self.assertEqual(info.decode_prefix_len, 128)
+
+    def test_dummy_parses_dummy_and_clears_payload_fields(self):
+        info = TransferInfo.from_zmq(self._frames(b"", b"", b"", b"0"))
+
+        self.assertTrue(info.is_dummy)
+        self.assertEqual(info.dst_kv_indices.size, 0)
+        self.assertIsNone(info.dst_aux_index)
+        self.assertEqual(info.dst_state_indices, [])
+
+    def test_dummy_with_prefix_hit_still_parses_dummy(self):
+        # decode_prefix_len is sent unconditionally and the inference ignores
+        # it, so a dummy rank with a decode-side prefix hit stays dummy.
+        info = TransferInfo.from_zmq(self._frames(b"", b"", b"", b"128"))
+
+        self.assertTrue(info.is_dummy)
+        self.assertEqual(info.decode_prefix_len, 128)
 
 
 class TestGroupConcurrentContiguous(unittest.TestCase):
@@ -334,9 +651,14 @@ class TestMooncakePPStaging(unittest.TestCase):
         )
 
 
-class TestEagleDsaSeedTransfer(unittest.TestCase):
+class TestEagleDsaSeedTransfer(CustomTestCase):
     @staticmethod
-    def _make_req(seed, metadata_buffer_index=0):
+    def _make_req(
+        seed,
+        metadata_buffer_index=0,
+        sampling_mask=None,
+        sampling_logprob=None,
+    ):
         return SimpleNamespace(
             metadata_buffer_index=metadata_buffer_index,
             output_ids=[101],
@@ -346,7 +668,13 @@ class TestEagleDsaSeedTransfer(unittest.TestCase):
             cached_tokens_storage=0,
             multimodal_inputs=None,
             return_logprob=False,
-            return_sampling_mask=False,
+            return_sampling_mask=sampling_mask is not None,
+            output_token_sampling_mask=(
+                None if sampling_mask is None else [sampling_mask]
+            ),
+            output_token_sampling_logprobs=(
+                None if sampling_logprob is None else [sampling_logprob]
+            ),
             hidden_states_tensor=torch.tensor([1.0, 2.0]),
             output_topk_p=torch.tensor([1.0]),
             output_topk_index=torch.tensor([7]),
@@ -359,18 +687,64 @@ class TestEagleDsaSeedTransfer(unittest.TestCase):
             size=2,
             hidden_size=2,
             hidden_states_dtype=torch.float32,
+            max_sampling_mask_tokens=16,
             output_dsa_topk_indices_dim=3,
         )
         seed = torch.tensor([4, 5, 6], dtype=torch.int32)
         buffers.set_buf(self._make_req(seed))
         buffers.set_buf(self._make_req(None, metadata_buffer_index=1))
 
-        self.assertTrue(torch.equal(buffers.output_dsa_topk_indices[0], seed))
+        self.assertTrue(
+            torch.equal(
+                buffers.output_dsa_topk_indices[0],
+                seed.to(buffers.output_dsa_topk_indices.device),
+            )
+        )
         self.assertEqual(buffers.output_dsa_topk_indices[1].tolist(), [-1, -1, -1])
         ptrs, data_lens, item_lens = buffers.get_buf_infos()
         self.assertEqual(ptrs[-2], buffers.output_dsa_topk_indices.data_ptr())
         self.assertEqual(data_lens[-2], buffers.output_dsa_topk_indices.nbytes)
         self.assertEqual(item_lens[-2], buffers.output_dsa_topk_indices[0].nbytes)
+
+    def test_sampling_mask_metadata_is_opt_in(self):
+        """Disabled masks stay off the wire; enabled masks round-trip at capacity."""
+        schemas = []
+        for enabled in (False, True):
+            with (
+                self.subTest(enabled=enabled),
+                envs.SGLANG_ENABLE_DISAGG_SAMPLING_MASK.override(enabled),
+            ):
+                buffers = MetadataBuffers(
+                    size=1,
+                    hidden_size=2,
+                    hidden_states_dtype=torch.float32,
+                    max_sampling_mask_tokens=3,
+                )
+                buffers.set_buf(
+                    self._make_req(
+                        None,
+                        sampling_mask=[7, 8, 9] if enabled else None,
+                        sampling_logprob=-1.25 if enabled else None,
+                    )
+                )
+                schemas.append(buffers.get_buf_infos())
+                if enabled:
+                    self.assertEqual(
+                        buffers.output_token_sampling_mask_idx.shape, (1, 3)
+                    )
+                    length, mask, logprob = buffers.get_buf(0)[6:9]
+                    self.assertEqual(length[0].item(), 3)
+                    self.assertEqual(mask.tolist(), [7, 8, 9])
+                    self.assertAlmostEqual(logprob[0].item(), -1.25)
+                else:
+                    self.assertIsNone(buffers.output_token_sampling_mask_len)
+                    self.assertIsNone(buffers.output_token_sampling_mask_idx)
+                    self.assertIsNone(buffers.output_token_sampling_logprobs)
+                    self.assertEqual(buffers.get_buf(0)[6:9], (None, None, None))
+        disabled_ptrs, _, disabled_sizes = schemas[0]
+        enabled_ptrs, _, enabled_sizes = schemas[1]
+        self.assertEqual(len(enabled_ptrs) - len(disabled_ptrs), 3)
+        self.assertEqual(sum(enabled_sizes) - sum(disabled_sizes), 3 * 4 + 128)
 
     def test_decode_input_requires_valid_seed_for_every_request(self):
         seeds = (
@@ -445,12 +819,13 @@ class TestEagleDsaSeedTransfer(unittest.TestCase):
             # positions are passed through unremapped.
             ("other", False, False, False, unremapped),
         ):
-            with self.subTest(platform=platform), envs.SGLANG_DSA_FUSE_TOPK.override(
-                True
-            ), patch(
-                "sglang.srt.layers.attention.dsa.utils.is_cuda", return_value=cuda
-            ), patch(
-                "sglang.srt.layers.attention.dsa.utils.is_hip", return_value=hip
+            with (
+                self.subTest(platform=platform),
+                envs.SGLANG_DSA_FUSE_TOPK.override(True),
+                patch(
+                    "sglang.srt.layers.attention.dsa.utils.is_cuda", return_value=cuda
+                ),
+                patch("sglang.srt.layers.attention.dsa.utils.is_hip", return_value=hip),
             ):
                 self.assertEqual(
                     should_use_dsa_fused_topk(seed_dsa_topk_from_draft_extend=True),
@@ -518,30 +893,129 @@ class TestEagleDsaSeedTransfer(unittest.TestCase):
         self.assertEqual(future_map.topk_index_buf.shape, (4, 3))
 
 
+class TestDSV4C4StateIndices(unittest.TestCase):
+    def test_non_mtp_to_mtp_maps_the_same_logical_positions(self):
+        # seq_len=13 keeps logical positions [8, 13) for the overlap C4 state.
+        src = c4_state_transfer_indices(2, 13, ring_size=8)
+        dst = c4_state_transfer_indices(2, 13, ring_size=16)
+
+        np.testing.assert_array_equal(src, np.array([16, 17, 18, 19, 20]))
+        np.testing.assert_array_equal(dst, np.array([40, 41, 42, 43, 44]))
+        self.assertEqual(src.size, dst.size)
+
+    def test_ring_wrap_preserves_position_order(self):
+        np.testing.assert_array_equal(
+            c4_state_transfer_indices(0, 10, ring_size=8),
+            np.array([4, 5, 6, 7, 0, 1], dtype=np.int32),
+        )
+
+    def test_short_and_empty_sequences(self):
+        np.testing.assert_array_equal(
+            c4_state_transfer_indices(3, 3, ring_size=8),
+            np.array([24, 25, 26], dtype=np.int32),
+        )
+        np.testing.assert_array_equal(
+            c4_state_transfer_indices(3, 0, ring_size=8),
+            np.empty((0,), dtype=np.int32),
+        )
+
+    def test_invalid_ring_size_is_rejected(self):
+        with self.assertRaises(ValueError):
+            c4_state_transfer_indices(0, 8, ring_size=4)
+        with self.assertRaises(ValueError):
+            c4_state_transfer_indices(0, 8, ring_size=10)
+
+
 class TestDSV4C128StateIndices(unittest.TestCase):
     def test_online_aligned_boundary_has_no_partial_state(self):
         np.testing.assert_array_equal(
-            get_dsv4_c128_state_indices(7, 256, online=True, ring_size=1),
+            request_scoped_state_transfer_indices(
+                7, 256, ratio=128, online=True, ring_size=1
+            ),
             np.empty((0,), dtype=np.int32),
         )
 
     def test_online_partial_boundary_uses_request_slot(self):
         np.testing.assert_array_equal(
-            get_dsv4_c128_state_indices(7, 257, online=True, ring_size=1),
+            request_scoped_state_transfer_indices(
+                7, 257, ratio=128, online=True, ring_size=1
+            ),
             np.array([7], dtype=np.int32),
         )
 
     def test_offline_aligned_boundary_has_no_partial_state(self):
         np.testing.assert_array_equal(
-            get_dsv4_c128_state_indices(7, 256, online=False, ring_size=128),
+            request_scoped_state_transfer_indices(
+                7, 256, ratio=128, online=False, ring_size=128
+            ),
             np.empty((0,), dtype=np.int32),
         )
 
     def test_offline_partial_boundary_uses_request_local_page(self):
         np.testing.assert_array_equal(
-            get_dsv4_c128_state_indices(7, 129, online=False, ring_size=256),
+            request_scoped_state_transfer_indices(
+                7, 129, ratio=128, online=False, ring_size=256
+            ),
             np.array([15], dtype=np.int32),
         )
+
+
+def _make_state_pool(*, ratio, request_scoped, online=False, ring_size=256):
+    pool = object.__new__(CompressStatePool)
+    pool.ratio = ratio
+    pool.request_scoped = request_scoped
+    pool.online = online
+    pool.ring_size = ring_size
+    return pool
+
+
+class TestDSV4RequestStateTransfer(unittest.TestCase):
+    def _kv(self, *pools):
+        kv = object.__new__(DeepSeekV4TokenToKVPool)
+        kv.compress_state_pools = [None, *pools]
+        return kv
+
+    def test_pool_delegates_to_its_request_scoped_state_pools(self):
+        # One state pool per compressed layer; all c128 layers share the ring layout.
+        kv = self._kv(
+            _make_state_pool(ratio=4, request_scoped=False),
+            *[
+                _make_state_pool(ratio=128, request_scoped=True, ring_size=256)
+                for _ in range(20)
+            ],
+        )
+        np.testing.assert_array_equal(
+            kv.request_state_transfer_indices(7, 129),
+            request_scoped_state_transfer_indices(
+                7, 129, ratio=128, online=False, ring_size=256
+            ),
+        )
+        np.testing.assert_array_equal(
+            kv.request_state_transfer_indices(7, 256), np.empty((0,), dtype=np.int32)
+        )
+
+    def test_online_pool_ships_the_request_row(self):
+        kv = self._kv(
+            _make_state_pool(ratio=128, request_scoped=True, online=True, ring_size=1)
+        )
+        np.testing.assert_array_equal(
+            kv.request_state_transfer_indices(7, 257), np.array([7], dtype=np.int32)
+        )
+
+    def test_requires_request_scoped_pools_with_one_ring_layout(self):
+        with self.assertRaises(AssertionError):
+            self._kv(
+                _make_state_pool(ratio=4, request_scoped=False)
+            ).request_state_transfer_indices(0, 5)
+        with self.assertRaises(AssertionError):
+            self._kv(
+                _make_state_pool(ratio=128, request_scoped=True, ring_size=128),
+                _make_state_pool(ratio=128, request_scoped=True, ring_size=256),
+            ).request_state_transfer_indices(0, 5)
+
+    def test_page_scoped_pool_has_no_transfer_indices(self):
+        with self.assertRaises(AssertionError):
+            _make_state_pool(ratio=4, request_scoped=False).transfer_indices(0, 5)
 
 
 def _buf_infos(*ptrs):
@@ -550,6 +1024,7 @@ def _buf_infos(*ptrs):
 
 def _make_dsv4_target(*, unified, mapping=None):
     pool = object.__new__(DeepSeekV4TokenToKVPool)
+    pool.compression_ratios = [0, 2, 1, 4, 128]
     pool._unified_kv = unified
     pool.page_size = 256
     pool.sliding_window = 128
@@ -561,7 +1036,7 @@ def _make_dsv4_target(*, unified, mapping=None):
     pool.get_unified_swa_ring_buf_infos = lambda: (
         _buf_infos(12) if unified else ([], [], [])
     )
-    pool.get_c128_state_buf_infos = lambda: ([], [], [])
+    pool.get_request_state_buf_infos = lambda: ([], [], [])
     return pool
 
 
@@ -570,6 +1045,7 @@ def _make_dsv4_draft(*, unified, mapping=None):
     pool._unified_kv = unified
     pool.compression_ratios = [0]
     pool.page_size = 256
+    pool.swa_page_size = 256
     pool.sliding_window = 128
     pool.full_to_swa_index_mapping = mapping
     pool.unified_swa_window = 128
@@ -584,7 +1060,7 @@ def _make_dsv4_draft(*, unified, mapping=None):
         )
     else:
         pool.swa_kv_pool = SimpleNamespace(
-            kv_buffer=[torch.empty((2, 16), dtype=torch.uint8)]
+            page_size=256, kv_buffer=[torch.empty((2, 16), dtype=torch.uint8)]
         )
     return pool
 

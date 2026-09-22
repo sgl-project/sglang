@@ -477,6 +477,25 @@ Internally, the DSA backend dispatches to different sub-backends for prefill and
   </tbody>
 </table>
 
+#### Gemma 4 on `aiter` (ROCm)
+
+Gemma 4's hybrid attention mixes sliding-window layers (`head_dim` 256) with
+full-attention layers (`head_dim` 512) and shares KV across layers. The `aiter`
+backend supports this and is allow-listed for Gemma 4, so you can serve it with
+`--attention-backend aiter` on MI300X/MI350X. Under the hood `aiter` routes the
+`head_dim`-512 prefill through the Triton `unified_attention` kernel (the CK
+batch-prefill path caps `head_dim` at 256), honors each layer's softmax scale,
+and resolves the sliding-window KV pool for speculative-decode draft workers.
+Non–sliding-window models (`head_dim` ≤ 256) are unaffected and keep using the
+CK path.
+
+<Warning>
+For Gemma 4 on `aiter`, use bf16 KV cache (`--kv-cache-dtype auto`). Do **not**
+use `--kv-cache-dtype fp8_e4m3`: batched decode currently returns incorrect
+output under fp8 KV on this path (a pre-existing aiter fp8-decode issue, tracked
+separately). bf16 KV is correct at every batch size.
+</Warning>
+
 For deployment examples, see the [DeepSeek V3.2 deployment guide](/cookbook/autoregressive/DeepSeek/DeepSeek-V3_2).
 
 ### Hybrid attention (different backends for prefill vs decode) (Experimental)
@@ -664,15 +683,6 @@ python3 -m sglang.launch_server \
   --trust-remote-code
 ```
 
-- Cutlass MLA
-```bash Command
-python3 -m sglang.launch_server \
-  --tp 8 \
-  --model deepseek-ai/DeepSeek-R1 \
-  --attention-backend cutlass_mla \
-  --trust-remote-code
-```
-
 - Ascend
 ```bash Command
 python3 -m sglang.launch_server \
@@ -699,13 +709,6 @@ python3 -m sglang.launch_server \
 python3 -m sglang.launch_server \
   --model meta-llama/Meta-Llama-3.1-8B-Instruct \
   --attention-backend flex_attention
-```
-
-- Dual Chunk FlashAttention
-```bash Command
-python3 -m sglang.launch_server \
-  --model Qwen/Qwen2.5-14B-Instruct-1M \
-  --attention-backend dual_chunk_flash_attn
 ```
 
 - Torch Native

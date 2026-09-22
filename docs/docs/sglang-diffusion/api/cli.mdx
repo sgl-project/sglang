@@ -76,8 +76,11 @@ Use `sglang generate --help` and `sglang serve --help` for the full argument lis
 
 - `--model-path {MODEL}`: model path or Hugging Face model ID
 - `--served-model-name {NAME}`: stable model name exposed by serving APIs. Defaults to `--model-id` when set, otherwise `--model-path`.
-- `--model-variant {NAME}`: semantic checkpoint variant to load when one model repository contains multiple weight partitions. The pipeline maps this stable name to the repository layout before loading; for example, MiniMax-H3 accepts `fl2va` and `ref2va`. This is a server/load-time choice, unlike a request's `task`.
+- `--model-variant {NAME}`: semantic checkpoint variant to load when one model repository contains multiple weight partitions. The pipeline maps this stable name to the repository layout before loading; for example, MiniMax-H3 accepts `fl2va` and `ref2va`, or `hybrid` with explicit merged transformer weights to serve all three tasks (see the [H3 cookbook](/cookbook/diffusion/MiniMax/MiniMax-H3#singularity-hybrid-weights)). This is a server/load-time choice, unlike a request's `task`.
 - `--minimax-h3-adaln-cache-path {FILE}`: advanced MiniMax-H3-only inference cache. It replaces the checkpoint's AdaLN projection weights with precomputed outputs and only accepts requests whose exact FP32 timestep plan is included in the cache. It requires unquantized weights and the matching model variant.
+- `--minimax-h3-adaln-online {true,false}`: rebuild MiniMax-H3 AdaLN outputs from the checkpoint on demand instead of keeping the 24.2 GiB of `adaln_proj` weights resident. Works with any step count or schedule; requires the unquantized native-layout checkpoint. Built plans live in a GPU slab with per-plan LRU eviction and, by default, a pinned-host cache so previously seen schedules swap back in over PCIe instead of re-reading the checkpoint.
+- `--minimax-h3-adaln-plan-width {N}`: widest timestep plan the online slab is sized for (default 4 covers every task; t2va needs 2, fl2va 3).
+- `--minimax-h3-adaln-host-cache-gb {GB}`: pinned host memory per rank caching built AdaLN plans (default 8; 0 disables). A 50-step schedule needs about 0.9 (t2va) / 1.33 (fl2va) / 1.77 (ref2va) GB; over-capacity plan sets simply recompute. Expert escape hatches (GPU slot count, experimental fp32 rebuild) are the `SGLANG_DIFFUSION_MINIMAX_H3_ADALN_*` environment variables.
 - `--model-subfolder {PATH}`: advanced direct override for a component subfolder inside the model repository. Prefer `--model-variant` when the pipeline exposes semantic routing. If both are supplied, they must resolve to the same weight partition.
 - `--lora-path {PATH}` and `--lora-nickname {NAME}`: load a LoRA adapter from a local path, Hugging Face repo/subfolder, or exact Hub file URL
 - `--lora-weight-name {FILE}`: select one adapter file from a repository that contains multiple LoRA revisions. The Hub download is filtered to that file plus JSON metadata, so unused weights are not downloaded.
@@ -92,7 +95,7 @@ Use `sglang generate --help` and `sglang serve --help` for the full argument lis
 - `--dp-size {N}` (alias `--data-parallel-size`): number of data-parallel replicas. Each replica is a full copy of the engine on `num_gpus / N` GPUs with its own ingress; generation requests round-robin across replicas, realtime sessions stick to the replica holding their state, and control operations (weights, LoRA, memory occupation, shutdown) apply to every replica. Combines with the other parallelism axes (`num_gpus = dp × cfg × tp × sp`); monolithic serving only.
 - `--ulysses-degree {N}` and `--ring-degree {N}`: USP parallelism controls
 - `--kv-gather-degree {N}`: sequence-parallel degree that splits rows inside attention and exchanges with one K/V all-gather (queries stay local) instead of Ulysses all-to-all. Non-causal attention only; does not compose with `--ulysses-degree`/`--ring-degree` yet. When no SP degree is set explicitly, `sp_degree=2` defaults to `kv_gather_degree=2` (its measured-win zone) and higher degrees default to Ulysses; under that auto assignment, attention calls the gather path cannot take fall back to the Ulysses exchange, while an explicit degree fails instead of degrading.
-- `--enable-cfg-parallel {true|false}`: enable or explicitly disable CFG parallelism
+- `--enable-cfg-parallel {true|false}`: enable or explicitly disable CFG parallelism. Requests that disable CFG remain valid on a CFG-parallel server, but extra CFG ranks redundantly recompute the single active branch.
 - `--encoder-parallel {auto|fold|dp|replicate}`: how native encoders use the GPUs in each DiT replica. `auto` TP-folds a native text/image encoder wide enough to benefit, selects batch DP for an explicitly supported native text encoder when it can engage, and otherwise keeps the existing encoder TP layout; `fold` shards native text/image encoders across the full replica whenever dimensions allow; `dp` splits a batched encode across supported native text encoder copies and composes with encoder TP; `replicate` disables folding and batch DP. Encoder collectives never cross `--dp-size` replicas. See [Encoder Parallelism](/docs/sglang-diffusion/encoder_parallel).
 - `--warmup-mode {off|request|server}`: control startup warmup for `sglang serve`; `off` skips warmup, `request` primes the request path, and `server` runs a full synthetic server warmup before serving traffic
 - `--enable-torch-compile {true|false}`: compile native diffusion hot paths. When no warmup mode is configured, this also enables server warmup so first real requests do not pay compile latency.
@@ -100,12 +103,17 @@ Use `sglang generate --help` and `sglang serve --help` for the full argument lis
 - `--enable-breakable-cuda-graph {true|false}`: capture supported DiT forwards as breakable CUDA graph segments to reduce launch overhead. Requires `--warmup-resolutions` for every served resolution because each resolution is captured separately. An `extra-high` or `high` request is rejected when it would mount request-scoped DiT fusions that were not present during lossless graph capture; VAE-only request-gated paths remain compatible.
 - `--bcg-text-buckets {N...}`: prompt-length padding buckets for breakable CUDA graph capture/replay reuse.
 - `--attention-backend {BACKEND}`: attention backend for native SGLang and diffusers pipelines
+- `--enable-attention-backend-autotune {true|false}`: for SGLang-native pipelines, benchmark compatible attention backends on each layer's first sufficiently large input and keep a backend only when it is both numerically compatible and measurably faster. Disabled by default and currently validated on SM90 and SM12x. Explicit `--attention-backend`, component overrides, and model-required backends are never replaced.
 - `--component-attention-backends {MAP}`: per-component attention backend overrides, for example `text_encoder=torch_sdpa,transformer=fa`
 - `--attention-backend-config {CONFIG}`: attention backend configuration
 - `--srt-encoder-url {HTTPADDRESS}`: address of SGLang srt server with AR model for GLM-Image like models. See [Models with AR Stage](/docs/sglang-diffusion/models_with_ar).
 - `--srt-encoder-timeout {SECONDS}`: Timeout in seconds for HTTP requests to the SGLang encoder server
 - `--srt-encoder-connection-timeout {SECONDS}`: TCP connection timeout in seconds for SGLang encoder server
 - `--scheduler-rpc-timeout {SECONDS}`: optional end-to-end deadline for an internal scheduler RPC, including scheduler queue time. It is unset by default so valid long-running and queued video jobs are not failed by the transport layer. Set it only when the deployment requires a bounded request deadline; caller cancellation and server shutdown remain effective without it.
+- `--enable-trace`: export OpenTelemetry traces for the diffusion scheduler and worker stages.
+- `--otlp-traces-endpoint {HOST:PORT}`: OTLP collector endpoint used with `--enable-trace` (default: `localhost:4317`).
+- `--otlp-service-name {NAME}`: `service.name` attached to exported traces. Resolution order is this flag, `OTEL_SERVICE_NAME`, then `sglang-diffusion`.
+- `--enable-metrics`: expose Prometheus metrics at `/metrics` (default: disabled). Includes request counts, queue time, host-side stage timing and LoRA state, separated by role and DP replica. See [Production metrics](/docs/sglang-diffusion/production_metrics) for metric semantics and disaggregated scraping.
 - `--pe-server-url {HTTPADDRESS}`: url of SGLang server hosting the PE model (e.g., for ERNIE-Image). See [Models with Prompt Enhancement](/docs/sglang-diffusion/models_with_pe).
 
 ### Sampling and output
@@ -115,6 +123,7 @@ Use `sglang generate --help` and `sglang serve --help` for the full argument lis
 - `--num-inference-steps {STEPS}` and `--seed {SEED}`
 - `--num-outputs-per-prompt {N}` / `--num-outputs {N}`: generate multiple outputs for each prompt. A scalar seed expands as `seed + output_index`.
 - `--quality {lossless,extra-high,high}`: cumulative request-level optimization tier. `lossless` (default) keeps the selected deployment's reference path and all unconditional bit-exact replacements. `extra-high` adds only request-gated DiT/VAE kernel fusions; the tier does not itself enable sparse, caching, or other approximate paths. `high` includes the complete `extra-high` set and may also enable model-owned approximate optimizations. Separately configured quantization, attention, or caching options still apply. Support and validation constraints are model-specific.
+- `skip_softmax_params` (online request only): explicitly enables lossy BLASST/Skip-Softmax attention for compatible FA self-attention layers. See [Attention Backends](../attention_backends#request-scoped-skip-softmax).
 - `--height {HEIGHT}`, `--width {WIDTH}`, `--num-frames {N}`, `--fps {FPS}`
 - `--output-path {PATH}`, `--output-file-name {NAME}`, `--save-output`, `--return-frames`
 
@@ -309,6 +318,7 @@ The available modes are:
 
 - `resident`: keep the complete component on the accelerator.
 - `component-offload`: keep the complete component on CPU between uses, moving it to the accelerator before each declared use and back to CPU afterward.
+- `snapshot-offload`: retain CPU parameter storage while a complete component runs on GPU. At the end of a use, restore the CPU parameters instead of copying GPU weights back. Mutable buffers still move back to CPU.
 - `layerwise-offload`: keep component weights on CPU and stream its declared layers during execution.
 
 Selectors match exact loaded component keys from `model_index.json`, including names such as `transformer_2`, `audio_vae`, and `connectors`. The group selectors `dit`, `text_encoder`, `image_encoder`, and `vae` are also available, together with `all`. An exact key overrides a matching group, and a group overrides `all`. Components without a matching canonical selector retain their explicit legacy setting or automatic/model default.
@@ -316,6 +326,34 @@ Selectors match exact loaded component keys from `model_index.json`, including n
 The existing `--dit-cpu-offload`, `--text-encoder-cpu-offload`, `--image-encoder-cpu-offload`, `--vae-cpu-offload`, and `--cpu-offload-components` options remain supported. New and legacy options may be mixed: `--component-residency` wins only for components it matches, while unmatched legacy settings remain effective. Legacy layerwise selectors take precedence over legacy component-offload selectors for the same component. Explicit `--dit-layerwise-offload false` makes the DiT resident unless another explicit DiT selector, such as `--dit-cpu-offload true` or `--component-residency dit=component-offload`, selects a different mode.
 
 Layerwise selection is strict. A native weighted component selected for `layerwise-offload` must declare its layer structure; otherwise startup fails with the unsupported component name instead of silently changing modes. Explicit non-resident placement also requires a request-time component-use declaration, so it cannot silently select a module that the pipeline does not manage. FSDP applies only to resident components. The Diffusers backend supports only pipeline-wide `all=resident` and `all=component-offload`.
+
+#### Snapshot offload
+
+On NVIDIA CUDA GPUs with separate host and device memory, explicitly select
+`--component-residency vae=snapshot-offload` to avoid repeated weight D2H transfers.
+Existing defaults and `component-offload` behavior are unchanged.
+
+Snapshot offload retains a full host copy during GPU execution. With
+`--pin-cpu-memory` enabled (the default), it shares a per-worker host pin budget
+with layerwise offload. Layerwise initialization claims its allowance first;
+snapshot weights use the remainder. Shared parameter storage is pinned once and
+reused across requests; its allowance is returned when the storage is released.
+Pinning also checks current host headroom, including the cgroup limit.
+
+Weights that do not fit the budget, or have pinning disabled, retain their
+existing CPU storage. Checkpoint mmap stays file-backed unless pinning, dtype
+conversion, or weight mutation materializes a copy. Pageable H2D can be slower,
+and pinning temporarily needs space for both the original and pinned storage.
+This budget limits new pinned weight allocations, not total process RAM or the
+CUDA host allocator's cache. Benchmark repeated requests with the actual host
+storage and workload; avoiding D2H does not guarantee an end-to-end speedup.
+
+The whole component must still fit on GPU. Unlike layerwise offload with all layers
+retained across denoising steps, snapshot offload does not require a layer-structure
+declaration and also covers parameters outside transformer blocks. Weight updates,
+LoRA merge/unmerge, and sleep restore the CPU weights before mutation or release.
+FSDP-managed components, shared-memory GPUs, and snapshot-offloaded DiTs with
+breakable CUDA graphs are not supported.
 
 ### Layerwise Offload Tuning
 

@@ -5,7 +5,6 @@ from typing import Any
 import torch
 from torch import nn
 
-from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.layers.attention.attention_registry import ATTENTION_BACKENDS
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool, ReqToTokenPool
@@ -240,6 +239,7 @@ class TinyDSAModelConfig:
         self.kv_lora_rank = kv_lora_rank
         self.is_encoder_decoder = False
         self.is_multimodal = False
+        self.model_is_mrope = False
         self.is_generation = True
         self.quantization = None
         self.is_hybrid_swa = False
@@ -321,7 +321,6 @@ class DSAMockModelRunner(ModelRunner):
         self._kernel_warmed_up = True
         self.dp_size = 1
         self.pp_size = 1
-        self.ps = ParallelState.trivial()
         self._server_args_override = get_context().override_server_args(
             attention_backend=case.backend,
             chunked_prefill_size=-1,
@@ -342,12 +341,11 @@ class DSAMockModelRunner(ModelRunner):
             dllm_algorithm_config=None,
             dp_size=1,
             dsa_decode_backend=dsa_decode_backend,
-            dsa_prefill_cp_mode="round-robin-split",
             dsa_prefill_backend=dsa_prefill_backend,
             device=device,
             enable_deterministic_inference=False,
             enable_dp_attention=False,
-            enable_dsa_prefill_context_parallel=False,
+            enable_prefill_cp=False,
             enable_mis=False,
             is_embedding=False,
             kv_cache_dtype="auto",
@@ -1191,8 +1189,8 @@ def dsa_impl_capability(impl: str) -> tuple[bool, str]:
         # TRT-LLM Gen FMHA / MLA require Blackwell SM10.0 (B200 NVL).
         # SM10.3 (GB300) raises "Missing TRTLLM-GEN kernel" at runtime because
         # the kernel binary in the container isn't compiled for sm_103.
-        # Require exactly SM10.0 (same constraint as cutlass_mla) until the
-        # container ships sm_103-compiled TRTLLM-GEN kernels.
+        # Require exactly SM10.0 until the container ships sm_103-compiled
+        # TRTLLM-GEN kernels.
         if major != 10 or minor != 0:
             return (
                 False,
@@ -1456,8 +1454,7 @@ def run_dsa_sparse_cuda_graph_decode_impl_variant_case(
         )
     if not case.forward_mode.is_decode():
         raise ValueError(
-            "run_dsa_sparse_cuda_graph_decode_impl_variant_case expects a "
-            "DECODE case."
+            "run_dsa_sparse_cuda_graph_decode_impl_variant_case expects a DECODE case."
         )
     from ..runner_modes.cuda_graph_decode_runner import (
         run_dsa_sparse_cuda_graph_decode_case,
@@ -1630,7 +1627,7 @@ def run_dsa_forward(
     input_hidden = inputs["input_hidden"]
     # `input_hidden` may have trailing padding for split-op static-token
     # contracts; project only the live token rows for QKV. The kernel
-    # respects `num_token_non_padded_cpu` via the metadata.
+    # respects `global_num_token_non_padded_cpu` via the metadata.
     live_input_hidden = input_hidden[: case.num_input_tokens]
     input_parts = _split_by_lens(live_input_hidden, case.input_lens)
     kv_hidden = torch.cat(
@@ -1669,7 +1666,7 @@ def expected_dsa_output_from_inputs(
 def dsa_attention_layers(fixture: DSAAttentionFixture) -> list:
     """Return the RadixAttention layers the backend forwards through. The
     split-op runner uses this to install per-layer
-    `num_token_non_padded_cpu` metadata before forward."""
+    `global_num_token_non_padded_cpu` metadata before forward."""
     return [fixture.actual_module.attn]
 
 

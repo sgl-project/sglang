@@ -5,11 +5,27 @@ from typing import Dict, List, NamedTuple, Optional, Tuple, Union
 
 import torch
 
-from sglang.kernels.ops.kvcache.hisparse import (
-    copy_cache_planned_mla,
-    load_cache_to_device_buffer_dsv4_mla,
-    load_cache_to_device_buffer_mla,
-)
+from sglang.srt.utils import get_device_module, is_hip, is_xpu
+
+if is_xpu():
+    from sgl_kernel import (
+        load_cache_to_device_buffer_dsv4_mla,
+        load_cache_to_device_buffer_mla,
+    )
+
+    def copy_cache_planned_mla(*args, **kwargs):
+        raise RuntimeError(
+            "HiSparse shared-index prefetch is unsupported on XPU: "
+            "copy_cache_planned_mla has no AOT sgl_kernel implementation."
+        )
+
+else:
+    from sglang.kernels.ops.kvcache.hisparse import (
+        copy_cache_planned_mla,
+        load_cache_to_device_buffer_dsv4_mla,
+        load_cache_to_device_buffer_mla,
+    )
+
 from sglang.srt.configs.model_config import dsa_layer_skips_topk, is_deepseek_dsa
 from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import Req
@@ -23,11 +39,11 @@ from sglang.srt.mem_cache.hisparse_memory_pool import (
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.memory_pool_host import DeepSeekV4PagedHostPool
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
-from sglang.srt.utils import get_device_module, is_hip
 
 device_module = get_device_module()
 
 _is_hip = is_hip()
+_is_xpu = is_xpu()
 
 logger = logging.getLogger(__name__)
 
@@ -133,6 +149,12 @@ class HiSparseCoordinator:
         # Timing probe: skip the host->device KV bytes to measure the "IO is
         # free" floor. Produces garbage output; benchmarking only.
         self.skip_io = envs.SGLANG_DEBUG_HISPARSE_SKIP_IO.get()
+        if _is_xpu and self.skip_io:
+            raise ValueError(
+                "SGLANG_DEBUG_HISPARSE_SKIP_IO is unsupported on XPU: the AOT swap-in "
+                "ops do not accept skip_io, so timings would silently include the KV "
+                "copy."
+            )
         self.compress_ratio = self.token_to_kv_pool_allocator.compress_ratio
 
         self.is_dsv4_hisparse = isinstance(
@@ -279,6 +301,12 @@ class HiSparseCoordinator:
                 "KV pool layer_num %d; using synchronous swap-in.",
                 len(shared_index_layers),
                 layer_num,
+            )
+            shared_index_layers = None
+        if shared_index_layers is not None and _is_xpu:
+            logger.warning(
+                "HiSparse shared-index prefetch disabled on XPU: "
+                "copy_cache_planned_mla is unavailable; using synchronous swap-in."
             )
             shared_index_layers = None
         self._is_shared_index_layer = list(shared_index_layers or [False] * layer_num)
@@ -781,9 +809,9 @@ class HiSparseCoordinator:
         Returns:
             Device KV cache indices for the selected tokens.  Shape: (num_reqs, top_k)
         """
-        assert (
-            not self.is_dsv4_hisparse
-        ), "naive_load_topk is not implemented for dsv4 hisparse"
+        assert not self.is_dsv4_hisparse, (
+            "naive_load_topk is not implemented for dsv4 hisparse"
+        )
         num_reqs = req_pool_indices.size(0)
         top_k_indices = torch.full(
             (num_reqs, self.top_k), -1, dtype=torch.int32, device=self.device
@@ -798,9 +826,9 @@ class HiSparseCoordinator:
             req_idx = int(req_pool_indices[i].item())
             selected_tokens = top_k_tokens[i, :top_n].to(dtype=torch.int64)
 
-            assert torch.all(
-                selected_tokens >= 0
-            ), f"Req {req_idx}: selected tokens contain negative positions"
+            assert torch.all(selected_tokens >= 0), (
+                f"Req {req_idx}: selected tokens contain negative positions"
+            )
             assert torch.all(selected_tokens < seq_len), (
                 f"Req {req_idx}: selected tokens {selected_tokens.tolist()} "
                 f"out of range for seq_len={seq_len}"
@@ -964,6 +992,7 @@ class HiSparseCoordinator:
             if record_plan
             else {}
         )
+        skip_io_kwargs = {} if _is_xpu else dict(skip_io=self.skip_io)
         swap_in_fn(
             top_k_tokens=top_k_result,
             device_buffer_tokens=self.req_device_buffer_tokens[layer_id],
@@ -981,7 +1010,7 @@ class HiSparseCoordinator:
             page_size=1,
             block_size=self.swap_in_block_size,
             num_real_reqs=self.num_real_reqs,
-            skip_io=self.skip_io,
+            **skip_io_kwargs,
             **plan,
         )
         return top_k_indices

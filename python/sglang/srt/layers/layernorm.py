@@ -637,6 +637,11 @@ class RMSNorm(BaseFusedOp):
             if residual is not None:
                 return x, residual
             return x
+        if not x.is_cuda:
+            # AITER kernels dereference activations as GPU pointers; a CPU
+            # input (e.g. unit tests building modules on CPU) aborts the
+            # process with HSA_STATUS_ERROR_MEMORY_FAULT instead of raising.
+            return self.forward_native(x, residual, post_residual_addition)
         if self.weight.data.dtype != x.dtype:
             # AITER's ROCm rmsnorm2d_fwd requires weight/activation dtypes to match;
             # FP32 weight + BF16 activation yields finite-but-corrupted output on gfx950.
@@ -1316,6 +1321,19 @@ class Gemma3RMSNorm(BaseFusedOp):
         if x.dim() == 2:
             return gemma_rmsnorm(x, self.weight.data, self.eps)
         return self.forward_native(x)
+
+    def forward_xpu(self, x, residual: Optional[torch.Tensor] = None):
+        if residual is not None and x.dim() == 2:
+            # The decoder residual is token-major and contiguous. The fused
+            # kernel updates both tensors in place: x becomes the normalized
+            # output and residual becomes x + residual for the next layer.
+            gemma_fused_add_rmsnorm(x, residual, self.weight.data, self.eps)
+            return x, residual
+        # The XPU kernel flattens leading dims internally, so 2D/3D/4D inputs
+        # can all go through it directly without a Python-side reshape.
+        elif residual is None and x.dim() in (2, 3, 4):
+            return gemma_rmsnorm(x, self.weight.data, self.eps)
+        return self.forward_native(x, residual)
 
     def forward_musa(self, x, residual: Optional[torch.Tensor] = None):
         # sgl_kernel's gemma norm ops are built for MUSA; follow the CUDA path.

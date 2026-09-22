@@ -7,7 +7,6 @@ from torch import nn
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
-    from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
 
 class AttentionAndMoeLayers(NamedTuple):
@@ -18,12 +17,23 @@ class AttentionAndMoeLayers(NamedTuple):
     mha_companion_layers: list[Any]
 
 
+def _get_loop_num(hf_config: Any) -> int:
+    # Nanbeige uses num_loops; IQuestLoopCoder uses loop_num.
+    return int(getattr(hf_config, "loop_num", getattr(hf_config, "num_loops", 1)) or 1)
+
+
 def compute_attention_and_moe_layers(layer_model: Any) -> AttentionAndMoeLayers:
     attention_layers: list[Any] = []
     moe_layers: list[Any] = []
     moe_fusions: list[Any] = []
     dsa_indexers: list[Any] = []
     mha_companion_layers: list[Any] = []
+
+    # Loop models (Nanbeige / IQuestLoopCoder) store one RadixAttention per loop
+    # in a ModuleList. Prefill CUDA graph indexes by layer_id, so expand and
+    # reorder to a dense [0..N) list.
+    has_loop_attn = False
+
     layers = layer_model.layers
     if isinstance(layers, nn.ModuleDict):
         layers = layers.values()
@@ -62,11 +72,16 @@ def compute_attention_and_moe_layers(layer_model: Any) -> AttentionAndMoeLayers:
                 # Mamba layer with split op support - store the layer itself
                 attn_layer = layer
 
-        # Keep these lists aligned with global layer ids. Pipeline-parallel
-        # models retain placeholders outside the local stage, while real
-        # attention modules use their global layer_id during graph replay.
-        attention_layers.append(attn_layer)
-        mha_companion_layers.append(mha_companion_layer)
+        if isinstance(attn_layer, nn.ModuleList):
+            attention_layers.extend(attn_layer)
+            mha_companion_layers.extend([mha_companion_layer] * len(attn_layer))
+            has_loop_attn = True
+        else:
+            # Keep these lists aligned with global layer ids. Pipeline-parallel
+            # models retain placeholders outside the local stage, while real
+            # attention modules use their global layer_id during graph replay.
+            attention_layers.append(attn_layer)
+            mha_companion_layers.append(mha_companion_layer)
 
         moe_block = None
         moe_fusion = None
@@ -93,6 +108,10 @@ def compute_attention_and_moe_layers(layer_model: Any) -> AttentionAndMoeLayers:
             dsa_indexer = layer.self_attn.indexer
         dsa_indexers.append(dsa_indexer)
 
+    # Reorder so attention_layers[i] matches RadixAttention.layer_id.
+    if has_loop_attn:
+        attention_layers.sort(key=lambda x: x.layer_id)
+
     return AttentionAndMoeLayers(
         attention_layers,
         moe_layers,
@@ -118,7 +137,6 @@ def resolve_layer_indices(
     model: Any,
     model_config: ModelConfig,
     is_draft_worker: bool,
-    spec_algorithm: SpeculativeAlgorithm,
 ) -> ModelLayerInfo:
     # For MTP models like DeepSeek-V3 or GLM-4.5, the MTP layer(s) are used separately as draft
     # models for speculative decoding. In those cases, `num_nextn_predict_layers` is used to
@@ -126,22 +144,13 @@ def resolve_layer_indices(
     model_num_layers = _compute_model_num_layers(
         model=model, model_config=model_config, is_draft_worker=is_draft_worker
     )
-    _nnpl = model_config.num_nextn_predict_layers
-    model_has_mtp_layers = _nnpl is not None and _nnpl > 0
     pp_range = _resolve_pp_layer_range(model=model, model_num_layers=model_num_layers)
     num_effective_layers = pp_range.end_layer - pp_range.start_layer
 
     # For LoopCoder models, each loop has its own layer_id, so we need to multiply by loop_num
-    loop_num = getattr(model_config.hf_config, "loop_num", 1)
+    loop_num = _get_loop_num(model_config.hf_config)
     if loop_num > 1:
         num_effective_layers = num_effective_layers * loop_num
-
-    _assert_pp_mtp_compat(
-        model_has_mtp_layers=model_has_mtp_layers,
-        spec_algorithm=spec_algorithm,
-        num_effective_layers=num_effective_layers,
-        model_num_layers=model_num_layers,
-    )
 
     return ModelLayerInfo(
         start_layer=pp_range.start_layer,
@@ -187,23 +196,6 @@ def _resolve_pp_layer_range(*, model: Any, model_num_layers: int) -> _PPLayerRan
         start_layer=getattr(model, "start_layer", 0),
         end_layer=getattr(model, "end_layer", model_num_layers),
     )
-
-
-def _assert_pp_mtp_compat(
-    *,
-    model_has_mtp_layers: bool,
-    spec_algorithm: SpeculativeAlgorithm,
-    num_effective_layers: int,
-    model_num_layers: int,
-) -> None:
-    assert (
-        (not model_has_mtp_layers)
-        or (spec_algorithm.is_none())
-        or (
-            (not spec_algorithm.is_none())
-            and (num_effective_layers == model_num_layers)
-        )
-    ), "PP is not compatible with MTP models."
 
 
 def adjust_hybrid_swa_layer_ids(
