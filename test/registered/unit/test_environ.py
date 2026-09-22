@@ -153,15 +153,6 @@ class TestDeprecatedEnvRegistry(unittest.TestCase):
         self._apply(old_name, _DEPRECATED_ENVS[old_name])
         self.assertIs(envs.SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK.get(), False)
 
-    def test_ms_to_s_transform(self):
-        old_name = "SGLANG_QUEUED_TIMEOUT_MS"
-        os.environ[old_name] = "1500"
-        self.addCleanup(os.environ.pop, old_name, None)
-        self.addCleanup(os.environ.pop, "SGLANG_REQ_WAITING_TIMEOUT", None)
-
-        self._apply(old_name, _DEPRECATED_ENVS[old_name])
-        self.assertEqual(envs.SGLANG_REQ_WAITING_TIMEOUT.get(), 1.5)
-
 
 if __name__ == "__main__":
     unittest.main()

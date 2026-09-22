@@ -1883,10 +1883,6 @@ class _DeprecatedEnv:
             os.environ[self.replacement] = value
 
 
-def _ms_to_s(value: str) -> str:
-    return str(float(value) / 1000.0)
-
-
 def _invert_bool(value: str) -> str:
     return "0" if value.lower() in ("true", "1", "yes", "y") else "1"
 
@@ -1897,37 +1893,14 @@ def _invert_bool(value: str) -> str:
 # descriptor, use EnvBoolWithAlias / EnvIntWithAlias instead.
 _DEPRECATED_ENVS: Dict[str, _DeprecatedEnv] = {
     # Renamed: the value is forwarded to the replacement.
-    "SGLANG_GC_LOG": _DeprecatedEnv(replacement="SGLANG_LOG_GC"),
-    "SGLANG_CUTEDSL_MOE_NVFP4_DISPATCH": _DeprecatedEnv(
-        replacement="SGLANG_MOE_NVFP4_DISPATCH"
-    ),
-    "SGLANG_ENABLE_THINKING": _DeprecatedEnv(replacement="SGLANG_DEFAULT_THINKING"),
-    "SGLANG_REASONING_EFFORT": _DeprecatedEnv(
-        replacement="SGLANG_DSV4_REASONING_EFFORT"
-    ),
-    "SGLANG_USE_JIT_ALL_REDUCE": _DeprecatedEnv(
-        replacement="SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2"
-    ),
     # The legacy DISABLE flags have the opposite polarity of their replacement.
     "SGLANG_DISABLE_TP_MEMORY_INBALANCE_CHECK": _DeprecatedEnv(
         replacement="SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK", transform=_invert_bool
-    ),
-    # Renamed with a unit change.
-    "SGLANG_QUEUED_TIMEOUT_MS": _DeprecatedEnv(
-        replacement="SGLANG_REQ_WAITING_TIMEOUT",
-        transform=_ms_to_s,
-        note="Note the unit change: milliseconds -> seconds.",
-    ),
-    "SGLANG_FORWARD_TIMEOUT_MS": _DeprecatedEnv(
-        replacement="SGLANG_REQ_RUNNING_TIMEOUT",
-        transform=_ms_to_s,
-        note="Note the unit change: milliseconds -> seconds.",
     ),
     # Removed without replacement.
     "SGLANG_ENABLE_CP_V2": _DeprecatedEnv(
         note="Strategy-based prefill context parallelism is now the only generic implementation."
     ),
-    "SGLANG_PER_TOKEN_GROUP_QUANT_8BIT_V2": _DeprecatedEnv(),
     # Superseded by the unified JIT per_token_group_quant, the default CUDA path.
     "SGLANG_OPT_USE_JIT_PER_TOKEN_GROUP_QUANT": _DeprecatedEnv(),
     "SGLANG_MASKED_GEMM_FAST_ACT": _DeprecatedEnv(),
@@ -1955,10 +1928,6 @@ _DEPRECATED_ENVS: Dict[str, _DeprecatedEnv] = {
     ),
     "SGLANG_PREFILL_DELAYER_TOKEN_USAGE_LOW_WATERMARK": _DeprecatedEnv(
         note="Please use '--prefill-delayer-token-usage-low-watermark' instead."
-    ),
-    "SGLANG_CUTLASS_MOE": _DeprecatedEnv(
-        note="Please use '--moe-runner-backend=cutlass' and/or "
-        "'--speculative-moe-runner-backend=cutlass' instead."
     ),
     "SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_FP4_ACTS": _DeprecatedEnv(
         note="Please use '--enable-w4a4-mxfp4-megamoe' instead."

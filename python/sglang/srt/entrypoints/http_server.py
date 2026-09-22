@@ -799,16 +799,6 @@ async def model_info():
     return msgspec_to_builtins(result)
 
 
-@app.get("/get_weight_version")
-@app.get("/weight_version")
-async def weight_version():
-    """Get the current weight version."""
-    raise HTTPException(
-        status_code=404,
-        detail="Endpoint '/get_weight_version' or '/weight_version' is deprecated. Please use '/model_info' instead.",
-    )
-
-
 @app.get("/get_server_info")
 async def get_server_info():
     """Get the server information (deprecated - use /server_info instead)."""
@@ -853,33 +843,6 @@ async def server_info():
             "kv_events": describe_kv_events_publisher(server_args),
         }
     )
-
-
-@app.get("/get_load")
-async def get_load():
-    """Get load metrics (deprecated - use /v1/loads instead).
-
-    Legacy shim backed by /v1/loads. Projects the load snapshot down to the
-    historical field shape (dp_rank, num_reqs, num_waiting_reqs, num_tokens,
-    num_pending_tokens, ts_tic) so existing clients keep working.
-    """
-    logger.warning(
-        "Endpoint '/get_load' is deprecated and will be removed in a future version. "
-        "Please use '/v1/loads' instead."
-    )
-    load_results = await _global_state.tokenizer_manager.get_loads(include=["core"])
-    ts = time.perf_counter()
-    return [
-        {
-            "dp_rank": r.dp_rank,
-            "num_reqs": r.num_running_reqs + r.num_waiting_reqs,
-            "num_waiting_reqs": r.num_waiting_reqs,
-            "num_tokens": r.num_total_tokens,
-            "num_pending_tokens": r.num_total_tokens - r.num_used_tokens,
-            "ts_tic": ts,
-        }
-        for r in load_results
-    ]
 
 
 # example usage:
@@ -1068,22 +1031,8 @@ async def list_external_corpora():
     )
 
 
-@app.api_route("/clear_hicache_storage_backend", methods=["GET", "POST"])
-@auth_level(AuthLevel.ADMIN_OPTIONAL)
-async def clear_hicache_storage_backend_deprecated():
-    """Deprecated: use POST /hicache/storage-backend/clear."""
-    ret = await _global_state.tokenizer_manager.clear_hicache_storage()
-    return Response(
-        content=(
-            "Deprecated endpoint. Use POST /hicache/storage-backend/clear.\n"
-            "Hierarchical cache storage backend cleared.\n"
-        ),
-        status_code=200 if ret.success else HTTPStatus.BAD_REQUEST,
-    )
-
-
 # example usage:
-# curl -s -X POST http://127.0.0.1:30000/clear_hicache_storage_backend
+# curl -s -X POST http://127.0.0.1:30000/hicache/storage-backend/clear
 @app.api_route("/hicache/storage-backend/clear", methods=["POST"])
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def clear_hicache_storage_backend():
