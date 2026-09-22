@@ -3,8 +3,8 @@
 
 //! Tokenize-once at ingress under the STICKY policy. The engine-tokenization
 //! offload (`input_ids` forwarding) is a property of the MODEL — does it have a
-//! chat encoder? — not of the routing policy, so a sticky-routed request on a
-//! chat-encoder model must forward `input_ids` exactly like cache-aware does,
+//! chat formatter? — not of the routing policy, so a sticky-routed request on a
+//! chat-formatter model must forward `input_ids` exactly like cache-aware does,
 //! while still pinning sessions O(1) by header.
 //!
 //! Asserts through the real chat handler + `MockWorker` backends:
@@ -17,14 +17,14 @@
 //!   routing is unchanged by the added tokenization).
 //!
 //! The model id contains `deepseek-v4` so the tokenizer registry auto-attaches
-//! the built-in V4 chat encoder — the engine-equivalent path — without a
+//! the built-in V4 chat formatter — the engine-equivalent path — without a
 //! template fixture.
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use serde_json::{json, Value};
 use sgl_router::config::{
-    ActiveLoadConfig, Config, DiscoveryBackend, ModelConfig, ObservabilityConfig, PolicyKind,
+    Config, DiscoveryBackend, InflightLoadConfig, ModelConfig, ObservabilityConfig, PolicyKind,
     ProxyConfig, ServerConfig, StaticUrlsDiscoveryConfig, StickyConfig, StickyFallbackKind,
 };
 use sgl_router::discovery::{ModelId, WorkerId, WorkerMode, WorkerSpec};
@@ -54,6 +54,7 @@ fn config() -> Config {
         model: ModelConfig {
             id: MODEL.into(),
             tokenizer_path: "tests/fixtures/tiny_tokenizer.json".into(),
+            disable_input_ids_forwarding: false,
             policy: PolicyKind::Sticky,
             decode_policy: Default::default(),
             bucket_config: None,
@@ -76,20 +77,20 @@ fn config() -> Config {
             urls: vec!["http://placeholder:0".into()],
         }),
         proxy: ProxyConfig::default(),
-        active_load: ActiveLoadConfig::default(),
+        router_inflight_load: InflightLoadConfig::default(),
     }
 }
 
 /// Build an `AppContext` running the sticky policy over the given workers.
 /// The tokenizer registry is loaded from config (real tiny tokenizer + the
-/// auto-attached V4 chat encoder) so the ingress can tokenize — the sticky
+/// auto-attached V4 chat formatter) so the ingress can tokenize — the sticky
 /// policy itself holds no tokenizer.
 fn build_ctx(worker_urls: &[String]) -> Arc<AppContext> {
     let cfg = config();
     let tokenizers = Arc::new(TokenizerRegistry::load_from_config(&cfg).unwrap());
     assert!(
-        tokenizers.has_chat_encoder(MODEL),
-        "deepseek-v4 model id must auto-attach the built-in chat encoder"
+        tokenizers.has_chat_formatter(MODEL),
+        "deepseek-v4 model id must auto-attach the built-in chat formatter"
     );
     let registry = Arc::new(WorkerRegistry::default());
     for (i, url) in worker_urls.iter().enumerate() {
