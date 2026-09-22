@@ -53,8 +53,8 @@ class GroupedGemmaRMSNorm(nn.Module):
                 x, self.weight, self.group_size, self.variance_epsilon
             )
         if (
-            x.is_cuda
-            and self._jit_group_size is not None
+            self._jit_group_size is not None
+            and x.is_cuda
             and x.dtype in (torch.bfloat16, torch.float16)
         ):
             from sglang.kernels.ops.layernorm.grouped_gemma_rmsnorm import (
@@ -271,8 +271,8 @@ class GatedResidual(HyperConnectionBase):
                 self.hidden_size,
             ).to(self.params_dtype)
         elif (
-            hyper_input_normed.is_cuda
-            and self._jit_mix_ok
+            self._jit_mix_ok
+            and hyper_input_normed.is_cuda
             and hyper_input_normed.dtype in (torch.bfloat16, torch.float16)
             and hyper_input_normed.shape[0] <= 24
         ):
@@ -334,8 +334,8 @@ class GatedResidual(HyperConnectionBase):
             ).to(self.params_dtype)
 
         if (
-            block_output.is_cuda
-            and self._jit_combine_ok
+            self._jit_combine_ok
+            and block_output.is_cuda
             and block_output.dtype in (torch.bfloat16, torch.float16)
             and hyper_input.dtype == block_output.dtype
             and hyper_input_normed.dtype == block_output.dtype
