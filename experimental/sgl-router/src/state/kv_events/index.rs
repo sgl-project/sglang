@@ -47,13 +47,15 @@ use super::tally::{EventKind, EventTally};
 use super::tree::{HashTree, KvWorkerId, Tiers};
 use super::wire::{KvCacheEvent, KvEventBatch};
 use crate::state::load_monitor::engine_reported_load::EngineReportedLoadTable;
-use fallback::{discard_graft, fail_rank, resolve_from_origin};
+use coordinator::bootstrap_coordinator;
+use fallback::{fail_rank, resolve_from_origin, resolve_gap};
 use graft::{apply_snapshot, leaves_gap, still_owed};
 use producer::CachedSnapshot;
 use sweep::{
     snapshot_fetch_timeout, SNAPSHOT_FETCH_ATTEMPTS_PER_DEADLINE, SNAPSHOT_FETCH_TIMEOUT_FLOOR,
 };
 
+mod coordinator;
 mod fallback;
 mod graft;
 mod producer;
@@ -80,6 +82,11 @@ const EVENT_CHANNEL_BUFFER: usize = 1024;
 /// Sized to match `EVENT_CHANNEL_BUFFER`: if the pump is that far behind, the
 /// snapshot is not arriving in time anyway.
 const PENDING_BATCH_LIMIT: usize = 1024;
+
+/// Depth of the obligation queue feeding the coordinator, sized well past a
+/// fleet's worker count. Overflow falls back as [`KvEventIndex::enqueue_bootstrap`]
+/// describes.
+const BOOTSTRAP_QUEUE_DEPTH: usize = 1024;
 
 /// Sequence number of the FIRST batch a publisher ever emits.
 ///
@@ -174,12 +181,39 @@ impl KvIndexMetrics {
     }
 }
 
-/// Obligations for one sweep and the instant their ranks began holding; a
-/// peer's export must be newer to splice.
+/// Obligations handed to the coordinator and the instant their ranks began
+/// holding; a peer's export must be newer to splice.
 struct ObligationBatch {
     obligations: Vec<(KvWorkerId, u64)>,
-    /// Becomes the `freshness_floor` of [`self::sweep::sweep_until_deadline`].
+    /// Folded into [`PendingSweep::freshness_floor`], which the sweep asks with.
+    ///
+    /// [`PendingSweep::freshness_floor`]: coordinator::PendingSweep::freshness_floor
     holding_since: Instant,
+    /// Whether this batch may ride a sweep already in flight.
+    late_join: LateJoin,
+}
+
+/// What a batch accepts when it arrives while a sweep is already in flight.
+///
+/// The sweep asked for freshness on behalf of the ranks it started with, so a
+/// batch that arrives afterwards may be delivered against an export predating
+/// its own `holding_since` — which the pump then resolves [`RankOutcome::Gap`].
+/// Whether that is acceptable depends on what the batch has left to spend.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LateJoin {
+    /// Ride the in-flight sweep's snapshot regardless.
+    ///
+    /// Used by discovery, whose workers land during the first fetch; a rank
+    /// that gaps this way still has its one retry.
+    Permitted,
+    /// Wait for a sweep that asks on this batch's behalf.
+    ///
+    /// Used by a gap retry, for which riding along is equivalent to dropping
+    /// it: `gap_retried` caps it at one, and a snapshot taken before the rank
+    /// resumed holding re-gaps by construction. Deferring costs one loop
+    /// iteration, since the coordinator re-enters `take_pending` as soon as it
+    /// has delivered.
+    Refused,
 }
 
 /// Bundle of `HashTree` + `KvEventSubscriberRegistry` + pump task.
@@ -229,6 +263,9 @@ pub struct KvEventIndex {
     /// `/server_info` but cannot fit a multi-megabyte body, and every large
     /// snapshot would be booked `unreachable`.
     snapshot_http: reqwest::Client,
+    /// Obligations waiting for the coordinator to fold them into the sweep that
+    /// is in flight, or to start one. See [`bootstrap_coordinator`].
+    bootstrap_tx: mpsc::Sender<ObligationBatch>,
     /// Last built snapshot; see [`KvEventIndex::peer_snapshot_body`].
     snapshot_cache: Arc<AsyncMutex<Option<CachedSnapshot>>>,
     /// Worker-sourced `page_size` shared with prefix providers.
@@ -353,6 +390,7 @@ impl KvEventIndex {
         let live_workers: Arc<Mutex<HashSet<KvWorkerId>>> = Arc::new(Mutex::new(HashSet::new()));
         let pump_cancel = CancellationToken::new();
         let peers = Arc::new(PeerRegistry::new());
+        let (bootstrap_tx, bootstrap_rx) = mpsc::channel(BOOTSTRAP_QUEUE_DEPTH);
         let tally = Arc::new(EventTally::new());
         let pump = tokio::spawn(pump_loop(
             PumpDeps {
@@ -362,12 +400,13 @@ impl KvEventIndex {
                 cursors: cursors.clone(),
                 live_workers: live_workers.clone(),
                 bootstrap: Arc::clone(&bootstrap),
+                bootstrap_tx: bootstrap_tx.clone(),
             },
             pump_cancel.clone(),
             rx,
             ctrl_rx,
         ));
-        Arc::new(Self {
+        let index = Arc::new(Self {
             tree,
             maintain_tree,
             subscribers,
@@ -384,9 +423,20 @@ impl KvEventIndex {
             peers,
             ctrl_tx,
             snapshot_http,
+            bootstrap_tx,
             snapshot_cache: Arc::new(AsyncMutex::new(None)),
             block_size_oracle,
-        })
+        });
+        // Same gate as registration, so a coordinator exists exactly when
+        // obligations can be produced.
+        if index.peer_bootstrap_enabled() {
+            tokio::spawn(bootstrap_coordinator(
+                bootstrap_rx,
+                Arc::downgrade(&index),
+                pump_cancel,
+            ));
+        }
+        index
     }
 
     /// Shared handle to the bootstrap tracker. `/readyz` reads it to decide
@@ -585,10 +635,14 @@ impl KvEventIndex {
             // tasks, though: the connect completes asynchronously, so an export
             // taken between this stamp and the connect can still gap, and the
             // splice check is what catches it.
-            self.spawn_bootstrap(ObligationBatch {
+            let batch = ObligationBatch {
                 obligations: bootstrap_obligations,
                 holding_since: Instant::now(),
-            });
+                late_join: LateJoin::Permitted,
+            };
+            // The stamp travels with the batch, so whichever sweep picks it up
+            // asks for an export newer than it.
+            self.enqueue_bootstrap(batch);
         }
         // Mark only the ranks that have an actual SUB socket. `EngineReportedLoadTable`
         // then rejects missing or stale advertised ranks as a whole worker.
@@ -727,6 +781,9 @@ struct PumpDeps {
     cursors: Arc<Mutex<HashMap<KvWorkerId, i64>>>,
     live_workers: Arc<Mutex<HashSet<KvWorkerId>>>,
     bootstrap: Arc<BootstrapTracker>,
+    /// Obligation queue, so a gap-discarded rank can be handed back for another
+    /// sweep instead of staying cold with budget unspent.
+    bootstrap_tx: mpsc::Sender<ObligationBatch>,
 }
 
 /// Drain `WorkerEvent`s: apply KV `Batch`es to the tree and `Load` snapshots
@@ -754,12 +811,14 @@ async fn pump_loop(
         cursors,
         live_workers,
         bootstrap,
+        bootstrap_tx,
     } = deps;
     let pump_state = PumpState {
         tree: &tree,
         cursors: &cursors,
         tally: &tally,
         bootstrap: &bootstrap,
+        bootstrap_tx: &bootstrap_tx,
         live_workers: &live_workers,
     };
 
@@ -1042,7 +1101,13 @@ async fn pump_loop(
                             "kv-bootstrap: sequence gap between snapshot and live stream; \
                              discarding snapshot state for this rank to avoid stale cache entries",
                         );
-                        discard_graft(&pump_state, &worker, RankOutcome::Gap);
+                        // Held, not applied: `resolve_gap` either replays it after
+                        // clearing, or keeps it for the retry's graft.
+                        held.entry(worker.clone())
+                            .or_default()
+                            .push_back((seq, batch));
+                        resolve_gap(&pump_state, &mut held, &worker);
+                        continue;
                     } else {
                         // The deferred check passed: this rank's grafted state is
                         // now proven continuous with its live stream, which is the
@@ -1063,6 +1128,9 @@ struct PumpState<'a> {
     tally: &'a EventTally,
     bootstrap: &'a BootstrapTracker,
     live_workers: &'a Mutex<HashSet<KvWorkerId>>,
+    /// Obligation queue, so the graft path can hand a gapped rank back for
+    /// another sweep. See [`resolve_gap`].
+    bootstrap_tx: &'a mpsc::Sender<ObligationBatch>,
 }
 
 /// Apply one batch, honouring the cursor's out-of-order filter.
