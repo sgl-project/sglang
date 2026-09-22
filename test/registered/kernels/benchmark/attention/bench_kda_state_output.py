@@ -1,4 +1,5 @@
 import argparse
+import gc
 import statistics
 import sys
 
@@ -12,11 +13,13 @@ from sglang.kernels.ops.attention.fla.chunk_delta_h import (
     chunk_gated_delta_rule_fwd_o_128,
 )
 from sglang.kernels.ops.attention.fla.chunk_intra import (
+    chunk_kda_fwd_intra,
     chunk_kda_fwd_kernel_intra_sub_chunk,
 )
 from sglang.kernels.ops.attention.fla.chunk_intra import (
     is_gather_supported as intra_is_gather_supported,
 )
+from sglang.kernels.ops.attention.fla.cumsum import chunk_local_cumsum
 from sglang.kernels.ops.attention.fla.index import prepare_chunk_indices
 from sglang.kernels.ops.attention.fla.kda import (
     _recompute_w_u_fwd_kernel,
@@ -163,6 +166,68 @@ def benchmark_complete_kda(tokens: int, heads: int, implementation: str):
         )
     finally:
         chunk_delta_h.is_gfx95_supported = original
+
+
+@marker.parametrize(
+    "tokens",
+    [1088, 2048, 2112, 4096, 8192, 8256, 16384, 32768, 65536, 131072],
+    [8192, 131072],
+)
+@marker.parametrize("heads", [8, 16])
+@marker.benchmark("implementation", ["current", "fused"])
+def benchmark_kda_intra_path(tokens: int, heads: int, implementation: str):
+    shape = (1, tokens, heads, 128)
+    q = torch.nn.functional.normalize(
+        torch.randn(shape, device="cuda").float(),
+        dim=-1,
+    ).to(torch.bfloat16)
+    k = torch.nn.functional.normalize(
+        torch.randn(shape, device="cuda").float(),
+        dim=-1,
+    ).to(torch.bfloat16)
+    v = torch.randn(shape, device="cuda", dtype=torch.bfloat16)
+    gate_increment = -torch.rand(shape, device="cuda") * 0.01
+    beta = torch.rand((1, tokens, heads), device="cuda")
+    cu_seqlens = torch.tensor([0, tokens], device="cuda", dtype=torch.int64)
+    chunk_indices = prepare_chunk_indices(cu_seqlens, 64)
+    g = chunk_local_cumsum(
+        gate_increment,
+        chunk_size=64,
+        cu_seqlens=cu_seqlens,
+        chunk_indices=chunk_indices,
+    )
+    fused = implementation == "fused"
+
+    def fn():
+        return chunk_kda_fwd_intra(
+            q=q,
+            k=k,
+            v=v,
+            gk=g,
+            beta=beta,
+            scale=128**-0.5,
+            cu_seqlens=cu_seqlens,
+            chunk_indices=chunk_indices,
+            fuse_diagonal=fused,
+            fuse_recompute=fused,
+        )
+
+    result = marker.do_bench(
+        fn,
+        input_args=(),
+        use_cuda_graph=False,
+        warmup_iters=10,
+        replay_iters=100,
+        graph_clone_args=(),
+        graph_clone_kwargs=(),
+        memory_args=None,
+        memory_output=None,
+    )
+    del fn
+    q = k = v = gate_increment = beta = cu_seqlens = chunk_indices = g = None
+    gc.collect()
+    torch.cuda.empty_cache()
+    return result
 
 
 def _parse_profile_args():
@@ -477,3 +542,4 @@ if __name__ == "__main__":
     else:
         benchmark_kda_state_output.run()
         benchmark_complete_kda.run()
+        benchmark_kda_intra_path.run()

@@ -34,6 +34,7 @@ from sglang.kernels.ops.attention.fla.utils import (
     is_intel,
     is_nvidia,
 )
+from sglang.srt.utils import is_gfx95_supported
 
 if is_intel:
     from sglang.srt.hardware_backend.xpu.kernels.fla.chunk_delta_h import (
@@ -1129,6 +1130,43 @@ def kda_gate_chunk_cumsum(
     return g if beta is None else (g, beta_out)
 
 
+def _use_gfx950_glm_fused_intra(
+    *,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    cu_seqlens: Optional[torch.Tensor],
+    chunk_size: int,
+    num_chunks: int,
+    safe_gate: bool,
+    output_intermediate_states: bool,
+    track_state: Optional[torch.Tensor],
+    track_chunk_idx: Optional[torch.Tensor],
+) -> bool:
+    return (
+        is_gfx95_supported()
+        and q.dtype == torch.bfloat16
+        and k.dtype == torch.bfloat16
+        and v.dtype == torch.bfloat16
+        and q.is_contiguous()
+        and k.is_contiguous()
+        and v.is_contiguous()
+        and q.shape[0] == 1
+        and q.shape[-2] in (8, 16)
+        and q.shape[-1] == 128
+        and k.shape == q.shape
+        and v.shape == q.shape
+        and cu_seqlens is not None
+        and len(cu_seqlens) == 2
+        and chunk_size == 64
+        and 17 <= num_chunks <= 2048
+        and not safe_gate
+        and not output_intermediate_states
+        and track_state is None
+        and track_chunk_idx is None
+    )
+
+
 def chunk_kda_fwd(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -1186,9 +1224,8 @@ def chunk_kda_fwd(
 
     # FUSE_DIAGONAL (fold diagonal-block compute into inter+solve) and
     # FUSE_RECOMPUTE (also fold w/u/kg recompute) save kernel launches and HBM
-    # round-trips, but cost register footprint per CTA. Wins at small grid
-    # where launch overhead dominates; loses at large grid where the extra
-    # register pressure spills. Gate both on the same grid heuristic.
+    # round-trips, but cost register footprint per CTA. Preserve the generic
+    # small-grid gate and additionally enable the measured GLM gfx950 geometry.
     # Total CTAs in inter_solve_fused = NT * B * H_per_rank. For varlen,
     # chunks don't cross sequence boundaries, so per-sequence ceil-divs sum to
     # more than cdiv(total_tokens, chunk_size); use chunk_indices.shape[0] which
@@ -1201,6 +1238,19 @@ def chunk_kda_fwd(
     _H_pr = q.shape[-2]
     _B = q.shape[0]
     _small_grid = _B * _NT_pr * _H_pr <= 256
+    _gfx950_glm_fused_intra = _use_gfx950_glm_fused_intra(
+        q=q,
+        k=k,
+        v=v,
+        cu_seqlens=cu_seqlens,
+        chunk_size=chunk_size,
+        num_chunks=_NT_pr,
+        safe_gate=lower_bound is not None,
+        output_intermediate_states=output_intermediate_states,
+        track_state=track_state,
+        track_chunk_idx=track_chunk_idx,
+    )
+    _fuse_intra = _small_grid or _gfx950_glm_fused_intra
     w, u, _, kg, Aqk, _ = chunk_kda_fwd_intra(
         q=q,
         k=k,
@@ -1212,8 +1262,8 @@ def chunk_kda_fwd(
         chunk_size=chunk_size,
         chunk_indices=chunk_indices,
         safe_gate=lower_bound is not None,
-        fuse_diagonal=_small_grid,
-        fuse_recompute=_small_grid,
+        fuse_diagonal=_fuse_intra,
+        fuse_recompute=_fuse_intra,
     )
 
     use_fused_state_output = (

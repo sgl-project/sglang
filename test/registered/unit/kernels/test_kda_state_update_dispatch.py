@@ -3,7 +3,7 @@ from unittest.mock import patch
 
 import torch
 
-from sglang.kernels.ops.attention.fla import chunk_delta_h
+from sglang.kernels.ops.attention.fla import chunk_delta_h, kda
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -108,6 +108,58 @@ class TestKdaStateUpdateDispatch(CustomTestCase):
             return_value=False,
         ):
             self.assertFalse(chunk_delta_h.can_use_fused_kda_state_output(**kwargs))
+
+    def test_gfx950_glm_fused_intra_gate(self):
+        shape = (1, 1088, 8, 128)
+        kwargs = dict(
+            q=torch.empty(shape, dtype=torch.bfloat16),
+            k=torch.empty(shape, dtype=torch.bfloat16),
+            v=torch.empty(shape, dtype=torch.bfloat16),
+            cu_seqlens=torch.tensor([0, 1088]),
+            chunk_size=64,
+            num_chunks=17,
+            safe_gate=False,
+            output_intermediate_states=False,
+            track_state=None,
+            track_chunk_idx=None,
+        )
+        with patch.object(kda, "is_gfx95_supported", return_value=True):
+            for heads in (8, 16):
+                head_shape = (1, 1088, heads, 128)
+                head_tensor = torch.empty(head_shape, dtype=torch.bfloat16)
+                with self.subTest(heads=heads):
+                    self.assertTrue(
+                        kda._use_gfx950_glm_fused_intra(
+                            **(
+                                kwargs
+                                | {
+                                    "q": head_tensor,
+                                    "k": head_tensor.clone(),
+                                    "v": head_tensor.clone(),
+                                }
+                            )
+                        )
+                    )
+            for field, value in (
+                ("num_chunks", 16),
+                ("num_chunks", 2049),
+                ("cu_seqlens", None),
+                ("cu_seqlens", torch.tensor([0, 544, 1088])),
+                ("chunk_size", 32),
+                ("safe_gate", True),
+                ("output_intermediate_states", True),
+                ("track_state", torch.empty(0)),
+                ("track_chunk_idx", torch.empty(0)),
+                ("q", torch.empty(shape, dtype=torch.float16)),
+                ("q", torch.empty((1, 1088, 4, 128), dtype=torch.bfloat16)),
+                ("q", torch.empty((1, 1088, 8, 64), dtype=torch.bfloat16)),
+            ):
+                with self.subTest(field=field):
+                    self.assertFalse(
+                        kda._use_gfx950_glm_fused_intra(**(kwargs | {field: value}))
+                    )
+        with patch.object(kda, "is_gfx95_supported", return_value=False):
+            self.assertFalse(kda._use_gfx950_glm_fused_intra(**kwargs))
 
 
 if __name__ == "__main__":
