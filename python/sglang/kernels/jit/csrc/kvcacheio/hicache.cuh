@@ -721,7 +721,7 @@ struct HiCacheKernel {
     const auto params = HicachePageUnifiedKernelParams{
         .k_cache_dst = k_cache_dst.data_ptr(),
         .v_cache_dst = kIsMLA ? nullptr : v_cache_dst.data_ptr(),
-        .src = src.data_ptr(),
+        .src = runtime::get_device_accessible_ptr(src),
         .src_indices = src_indices.data_ptr(),
         .dst_indices = dst_indices.data_ptr(),
         .total_vecs = static_cast<uint64_t>(N.unwrap()) * num_groups * kComponents * (kElementSize / 16),
