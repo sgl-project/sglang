@@ -39,10 +39,7 @@ elif _is_musa:
     from sgl_kernel import concat_mla_k
 
 if _use_aiter_gfx95:
-    from sglang.srt.models.deepseek_common.utils import (
-        flatten_fp8_per_token_quant,
-        fused_rms_fp8_per_token_quant,
-    )
+    from sglang.srt.models.deepseek_common.utils import flatten_fp8_per_token_quant
 
 
 def resolve_attn_backend(forward_batch: ForwardBatch):
@@ -214,22 +211,10 @@ class DeepseekMHAForwardMixin:
             # DSA Indexer: cache quantized keys, auto-skip topk for sequences <= dsa_index_topk
 
             if self.use_dsa:
-                if _use_aiter_gfx95 and fp8_proj_gemm_active(self.q_b_proj):
-                    q_quanted, q_lora, _, _ = fused_rms_fp8_per_token_quant(
-                        q,
-                        self.q_a_layernorm.weight,
-                        self.q_a_layernorm.variance_epsilon,
-                        dtype_quant=torch.float8_e4m3fn,
-                        output_unquantized_inp1=True,
-                    )
-                    q = self.q_b_proj(q_quanted)[0].view(
-                        -1, self.num_local_heads, self.qk_head_dim
-                    )
-                else:
-                    q_lora = self.q_a_layernorm(q)
-                    q = self.q_b_proj(q_lora)[0].view(
-                        -1, self.num_local_heads, self.qk_head_dim
-                    )
+                q_lora = self.q_a_layernorm(q)
+                q = self.q_b_proj(q_lora)[0].view(
+                    -1, self.num_local_heads, self.qk_head_dim
+                )
                 if self.should_run_indexer():
                     forward_dsa_indexer_for_mha(
                         self.indexer,
@@ -239,17 +224,6 @@ class DeepseekMHAForwardMixin:
                         forward_batch=forward_batch,
                         layer_id=self.layer_id,
                     )
-            elif _use_aiter_gfx95 and fp8_proj_gemm_active(self.q_b_proj):
-                q_quanted, _, _, _ = fused_rms_fp8_per_token_quant(
-                    q,
-                    self.q_a_layernorm.weight,
-                    self.q_a_layernorm.variance_epsilon,
-                    dtype_quant=torch.float8_e4m3fn,
-                    output_unquantized_inp1=False,
-                )
-                q = self.q_b_proj(q_quanted)[0].view(
-                    -1, self.num_local_heads, self.qk_head_dim
-                )
             else:
                 q = self.q_a_layernorm(q)
                 q = self.q_b_proj(q)[0].view(-1, self.num_local_heads, self.qk_head_dim)

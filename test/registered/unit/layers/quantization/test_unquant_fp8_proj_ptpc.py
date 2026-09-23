@@ -290,6 +290,94 @@ class TestUnquantFp8ProjPtpc(CustomTestCase):
         self.assertIs(actual_bf16, expected_bf16)
         bf16_linear.assert_called_once_with(x, parameter, None)
 
+    def test_rocm_mha_ptpc_q_b_requests_bf16_indexer_input(self):
+        from sglang.srt.models.deepseek_common.attention_forward_methods import (
+            forward_mha_rocm,
+        )
+
+        q = torch.empty(2, 8)
+        q_quanted = (torch.empty(2, 8), torch.empty(2, 1))
+        q_unquantized = torch.empty(2, 8, dtype=torch.bfloat16)
+        q_projected = torch.empty(2, 12)
+        q_b_proj = MagicMock(return_value=(q_projected, None))
+        attn = SimpleNamespace(
+            q_a_layernorm=SimpleNamespace(weight=torch.empty(8), variance_epsilon=1e-6),
+            q_b_proj=q_b_proj,
+            num_local_heads=3,
+            qk_head_dim=4,
+        )
+
+        with patch.object(
+            forward_mha_rocm,
+            "fused_rms_fp8_per_token_quant",
+            create=True,
+            return_value=(q_quanted, q_unquantized, None, None),
+        ) as fused_quant:
+            actual_q, actual_unquantized = forward_mha_rocm._run_ptpc_q_b(
+                attn, q, output_unquantized=True
+            )
+
+        self.assertEqual(tuple(actual_q.shape), (2, 3, 4))
+        self.assertIs(actual_unquantized, q_unquantized)
+        q_b_proj.assert_called_once_with(q_quanted)
+        self.assertTrue(fused_quant.call_args.kwargs["output_unquantized_inp1"])
+
+    def test_rocm_mla_ptpc_qk_and_o_proj_inputs(self):
+        from sglang.srt.models.deepseek_common.attention_forward_methods import (
+            forward_mla_rocm,
+        )
+
+        q = torch.empty(2, 8)
+        k_nope = torch.empty(2, 4)
+        q_quanted = (torch.empty(2, 8), torch.empty(2, 1))
+        q_unquantized = torch.empty(2, 8, dtype=torch.bfloat16)
+        k_normalized = torch.empty_like(k_nope)
+        attn = SimpleNamespace(
+            q_a_layernorm=SimpleNamespace(weight=torch.empty(8), variance_epsilon=1e-6),
+            kv_a_layernorm=SimpleNamespace(
+                weight=torch.empty(4), variance_epsilon=1e-6
+            ),
+            use_dsa=True,
+            o_proj=SimpleNamespace(),
+        )
+
+        with patch.object(
+            forward_mla_rocm,
+            "fused_rms_fp8_per_token_quant",
+            create=True,
+            return_value=(q_quanted, q_unquantized, k_normalized, None),
+        ) as fused_quant:
+            actual_q, actual_unquantized, actual_k = forward_mla_rocm._run_ptpc_qk_norm(
+                attn, q, k_nope
+            )
+
+        self.assertIs(actual_q, q_quanted)
+        self.assertIs(actual_unquantized, q_unquantized)
+        self.assertIs(actual_k, k_normalized)
+        self.assertTrue(fused_quant.call_args.kwargs["output_unquantized_inp1"])
+
+        o_input = torch.empty(2, 12)
+        expected_o_input = (torch.empty(2, 12), torch.empty(2, 1))
+        with (
+            patch.object(
+                forward_mla_rocm,
+                "fp8_proj_gemm_active",
+                return_value=True,
+            ),
+            patch.object(
+                forward_mla_rocm,
+                "flatten_fp8_per_token_quant",
+                create=True,
+                return_value=expected_o_input,
+            ) as flatten_quant,
+        ):
+            actual_o_input = forward_mla_rocm._maybe_quant_ptpc_o_proj_input(
+                attn, o_input
+            )
+
+        self.assertIs(actual_o_input, expected_o_input)
+        flatten_quant.assert_called_once()
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=3)

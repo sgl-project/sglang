@@ -18,6 +18,7 @@ from sglang.srt.layers.dcp import all_gather_kv_cache_for_mha_extend
 from sglang.srt.layers.quantization.fp8_utils import (
     materialize_bpreshuffle_fp8_scale_tuple,
 )
+from sglang.srt.layers.quantization.unquant import fp8_proj_gemm_active
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import (
     get_token_to_kv_pool,
@@ -46,6 +47,24 @@ if _use_aiter_gfx95:
 
     from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype
     from sglang.srt.layers.quantization.rocm_mxfp4_utils import fused_rms_mxfp4_quant
+    from sglang.srt.models.deepseek_common.utils import fused_rms_fp8_per_token_quant
+
+
+def _run_ptpc_q_b(
+    attn: DeepseekV2AttentionMLA,
+    q: torch.Tensor,
+    *,
+    output_unquantized: bool,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    q_quanted, q_unquantized, _, _ = fused_rms_fp8_per_token_quant(
+        q,
+        attn.q_a_layernorm.weight,
+        attn.q_a_layernorm.variance_epsilon,
+        dtype_quant=torch.float8_e4m3fn,
+        output_unquantized_inp1=output_unquantized,
+    )
+    q_out = attn.q_b_proj(q_quanted)[0].view(-1, attn.num_local_heads, attn.qk_head_dim)
+    return q_out, q_unquantized
 
 
 class DeepseekMHARocmForwardMixin:
@@ -73,7 +92,13 @@ class DeepseekMHARocmForwardMixin:
                 # on gfx95, we can still use fused RMSNorm+FP8 quant, but MUST request
                 # the unquantized output for q_lora; otherwise q_lora becomes the (fp8,scale)
                 # tuple.
-                if _use_aiter_gfx95 and _is_block_scale_fp8(self.q_b_proj):
+                if _use_aiter_gfx95 and fp8_proj_gemm_active(self.q_b_proj):
+                    q, q_lora = _run_ptpc_q_b(
+                        self,
+                        q,
+                        output_unquantized=True,
+                    )
+                elif _use_aiter_gfx95 and _is_block_scale_fp8(self.q_b_proj):
                     q_quanted, q_lora, _, _ = fused_rms_fp8_group_quant(
                         q,
                         self.q_a_layernorm.weight,
@@ -117,6 +142,8 @@ class DeepseekMHARocmForwardMixin:
                     None,
                 )
                 q = self.q_b_proj(q)[0].view(-1, self.num_local_heads, self.qk_head_dim)
+            elif _use_aiter_gfx95 and fp8_proj_gemm_active(self.q_b_proj):
+                q, _ = _run_ptpc_q_b(self, q, output_unquantized=False)
             elif _use_aiter_gfx95 and _is_block_scale_fp8(self.q_b_proj):
                 q, _, _, _ = fused_rms_fp8_group_quant(
                     q,
