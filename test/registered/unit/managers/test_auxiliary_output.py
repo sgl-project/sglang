@@ -80,6 +80,52 @@ class CopyDone:
         self.record_count += 1
 
 
+def test_persistent_result_copy_event_precedes_optional_tensor_copies():
+    next_token_ids = torch.tensor([1, 2])
+    accept_lens = torch.tensor([2])
+    block_accept_lens = torch.tensor([2])
+    cap_lens = torch.tensor([3])
+    hidden_states = torch.tensor([[4.0]])
+    names = {
+        id(next_token_ids): "next_token_ids",
+        id(accept_lens): "accept_lens",
+        id(block_accept_lens): "block_accept_lens",
+        id(cap_lens): "cap_lens",
+        id(hidden_states): "hidden_states",
+    }
+    order = []
+    owner = Mock()
+    owner.record_result_copy_done.side_effect = lambda: order.append("reuse_event")
+    result = GenerationBatchResult(
+        logits_output=LogitsProcessorOutput(
+            next_token_logits=None, hidden_states=hidden_states
+        ),
+        next_token_ids=next_token_ids,
+        accept_lens=accept_lens,
+        block_accept_lens=block_accept_lens,
+        cap_lens=cap_lens,
+        copy_done=CopyDone(),
+        persistent_result_copy_owner=owner,
+    )
+
+    def record_copy(tensor):
+        order.append(names[id(tensor)])
+        return tensor
+
+    with patch("sglang.srt.managers.utils._async_d2h", side_effect=record_copy):
+        result.copy_to_cpu(return_logprob=False, return_hidden_states=True)
+
+    assert order == [
+        "next_token_ids",
+        "accept_lens",
+        "block_accept_lens",
+        "cap_lens",
+        "reuse_event",
+        "hidden_states",
+    ]
+    assert result.persistent_result_copy_owner is None
+
+
 def _model_runner_for_sampling_path(
     *,
     spec_algorithm=SpeculativeAlgorithm.NONE,
