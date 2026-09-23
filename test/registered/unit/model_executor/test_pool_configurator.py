@@ -1074,6 +1074,47 @@ class TestDflashDraftKvBudget(CustomTestCase):
                     target_kv_per_token + draft_kv_per_token * dcp_size,
                 )
 
+    def test_draft_budget_prices_the_attention_sharded_width(self):
+        """Under DP attention the draft reservation must use attn_tp_size.
+
+        The builders shard the draft KV heads by get_parallel().attn_tp_size;
+        pricing the reservation by raw tp_size under-counts the draft pool by
+        attn_dp_size and the draft worker OOMs out of the runtime slack.
+        """
+        import torch
+
+        from sglang.srt.model_executor.model_runner_components.spec_aux_hidden_state import (
+            _resolve_dflash_draft_cell_size,
+        )
+
+        _publish_config(
+            self,
+            kv_cache_dtype="auto",
+            tp_size=16,
+            dp_size=16,
+            enable_dp_attention=True,
+        )
+        seen = []
+
+        def get_num_kv_heads(tp_size):
+            seen.append(tp_size)
+            return 4
+
+        draft = SimpleNamespace(
+            dtype=torch.bfloat16,
+            get_num_kv_heads=get_num_kv_heads,
+            head_dim=128,
+            v_head_dim=128,
+        )
+        resolved = _resolve_dflash_draft_cell_size(
+            draft_model_config=draft,
+            draft_num_layers=5,
+        )
+        # 4 kv heads * (128 + 128) dims * 5 layers * 2 bytes
+        self.assertEqual(resolved, 10240)
+        # tp16 with dp16 attention shards attention onto a single rank.
+        self.assertEqual(seen, [1])
+
     def test_hybrid_swa_budget_shrinks_by_draft_pool(self):
         """The HybridSWA budget must charge the DFLASH draft pool."""
         available = 10_000_000
