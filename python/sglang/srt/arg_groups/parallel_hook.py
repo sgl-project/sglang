@@ -243,6 +243,11 @@ def handle_data_parallelism(server_args: Any):
             "torch_memory_saver replaces the graph pool's physical memory on "
             "release/resume and registered buffers keep the released pages"
         )
+    if _dp_attention_replays_decode_graphs(server_args):
+        _disable_nccl_graph_buffer_registration(
+            "the graph-captured DP-attention gather/scatter collectives hang "
+            "the TP group with registered buffers"
+        )
 
 
 def _graph_pool_is_pausable(server_args: Any) -> bool:
@@ -251,6 +256,19 @@ def _graph_pool_is_pausable(server_args: Any) -> bool:
     return bool(
         resolving_view(server_args).enable_memory_saver
         and envs.SGLANG_MEMORY_SAVER_CUDA_GRAPH.get()
+    )
+
+
+def _dp_attention_replays_decode_graphs(server_args: Any) -> bool:
+    """Whether decode graphs capture the DP-attention gather/scatter collectives
+    (attention-DP ranks exchanging their tokens over the TP group)."""
+    view = resolving_view(server_args)
+    graph_config = getattr(view, "cuda_graph_config", None)
+    return bool(
+        view.enable_dp_attention
+        and view.dp_size > 1
+        and graph_config is not None
+        and graph_config.decode.backend != Backend.DISABLED
     )
 
 
@@ -285,6 +303,18 @@ def _disable_nccl_graph_buffer_registration(reason: str) -> None:
       Reproduced on a two-node tp16/ep16 engine after a full
       release/resume cycle; graph-resident memory or no registration both
       complete the same run.
+
+    * DP attention replays the attention-DP gather/scatter over the TP group
+      (all_gather_into_tensor / reduce_scatter around the MoE all-reduce)
+      inside the decode graphs, on graph-pool buffers that the capture
+      registers. A two-node tp16/ep16/dp2 engine then stops on its GPUs
+      within the first decode steps: all 16 schedulers wait on the first
+      device synchronisation after a replay (`copy_done.synchronize()` under
+      the overlap scheduler, the routed-experts D2H copy without it), with
+      no CUDA or NCCL error, while the same run with eager decode completes.
+      Graph-pool sharing, the routed-experts capture and the
+      overlap scheduler were each switched off without effect; the
+      registration is the remaining graph-only ingredient.
 
     Must run before the schedulers create their NCCL communicators, which
     inherit this environment. An explicit setting wins.
