@@ -178,11 +178,9 @@ def init_tokenizer_manager(
     port_args: PortArgs,
     TokenizerManagerClass: Optional[TokenizerManager] = None,
 ) -> Tuple[TokenizerManager, TemplateManager]:
-    # Launch tokenizer process
     TokenizerManagerClass = TokenizerManagerClass or TokenizerManager
     tokenizer_manager = TokenizerManagerClass(server_args, port_args)
 
-    # Initialize templates
     template_manager = TemplateManager()
     template_manager.initialize_templates(
         tokenizer_manager=tokenizer_manager,
@@ -191,36 +189,12 @@ def init_tokenizer_manager(
         completion_template=get_serving().completion_template,
     )
 
-    # Resolve any remaining auto parsers using template manager's detection results
-    for attr, suggested, label in (
-        (
-            "reasoning_parser",
-            template_manager.suggested_reasoning_parser,
-            "reasoning parser",
-        ),
-        (
-            "tool_call_parser",
-            template_manager.suggested_tool_call_parser,
-            "tool-call parser",
-        ),
-    ):
-        if tokenizer_manager.config_value(attr) != "auto":
-            continue
-        if suggested is not None:
-            tokenizer_manager.record_config_updates(
-                "template-detection", **{attr: suggested}
-            )
-            logger.info(
-                f"Auto-detected --{attr.replace('_', '-')} as '{suggested}' from chat template"
-            )
-        else:
-            logger.warning(
-                f"--{attr.replace('_', '-')}=auto specified but could not detect "
-                f"{label} from chat template. Disabling {label}."
-            )
-            tokenizer_manager.record_config_updates(
-                "template-detection", **{attr: None}
-            )
+    resolve_auto_parsers(
+        server_args,
+        tokenizer_manager.tokenizer,
+        processor=tokenizer_manager.processor,
+        config_writer=tokenizer_manager.record_config_updates,
+    )
 
     return tokenizer_manager, template_manager
 
@@ -1112,12 +1086,6 @@ class Engine(EngineScoreMixin, EngineBase):
         # sentinel: a record rejected here has to stay retryable.
         server_args.check_server_args()
 
-        # Needs a tokenizer and a chat template, so it cannot live in the
-        # pipeline; after the plugins, which may register the parser detected.
-        parsers = resolving_view(server_args)
-        if parsers.reasoning_parser == "auto" or parsers.tool_call_parser == "auto":
-            resolve_auto_parsers(server_args)
-
         # This publish replaces whatever was published before it, so the
         # rollback below restores that rather than clearing the process: a
         # caller that catches the launch error still has the context it had.
@@ -1256,7 +1224,6 @@ class Engine(EngineScoreMixin, EngineBase):
                 server_args, port_args
             )
         else:
-            # Launch multi-tokenizer router
             tokenizer_manager = MultiTokenizerRouter(server_args, port_args)
             template_manager = None
 

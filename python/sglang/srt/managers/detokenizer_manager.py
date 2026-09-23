@@ -43,7 +43,9 @@ from sglang.srt.managers.io_struct import (
 )
 from sglang.srt.managers.multi_tokenizer_mixin import MultiHttpWorkerDetokenizerMixin
 from sglang.srt.observability.cpu_monitor import start_cpu_monitor_thread
+from sglang.srt.parser.template_detection import resolve_auto_parsers
 from sglang.srt.runtime_context import (
+    get_context,
     get_device,
     get_model,
     get_observability,
@@ -100,23 +102,17 @@ class DecodeStatus:
 
 
 class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
-    """DetokenizerManager is a process that detokenizes the token ids."""
-
     def __init__(
         self,
         server_args: ServerArgs,
         port_args: PortArgs,
     ):
-        # Init inter-process communication
         self.init_ipc_channels(port_args, server_args)
-
-        # Init tokenizer
         self.init_tokenizer(server_args)
-
-        # Init running status
+        resolve_auto_parsers(
+            server_args, self.tokenizer, config_writer=get_context().override
+        )
         self.init_running_status(server_args)
-
-        # Init dispatcher
         self.init_request_dispatcher()
 
     def init_ipc_channels(self, port_args: PortArgs, server_args: ServerArgs):

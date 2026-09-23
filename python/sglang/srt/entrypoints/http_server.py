@@ -216,12 +216,6 @@ def get_global_state() -> _GlobalState:
 
 
 async def init_multi_tokenizer() -> ServerArgs:
-    """
-    Initialization function for multi-process tokenizer mode.
-    It read args information from shm and inits tokenizer manager for current process.
-    """
-
-    # Read configuration from shared memory
     main_pid = get_main_process_id()
     port_args, server_args, scheduler_info = read_from_shared_memory(
         f"multi_tokenizer_args_{main_pid}"
@@ -236,7 +230,6 @@ async def init_multi_tokenizer() -> ServerArgs:
         "API key is not supported in multi-tokenizer mode"
     )
 
-    # Create a new ipc name for the current process
     port_args.tokenizer_ipc_name = (
         f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}"
     )
@@ -245,15 +238,11 @@ async def init_multi_tokenizer() -> ServerArgs:
         f"ipc_name={port_args.tokenizer_ipc_name}"
     )
 
-    # Launch multi-tokenizer manager process
     tokenizer_worker_class = get_tokenizer_worker_class(server_args)
-    tokenizer_manager = tokenizer_worker_class(server_args, port_args)
-    template_manager = TemplateManager()
-    template_manager.initialize_templates(
-        tokenizer_manager=tokenizer_manager,
-        model_path=get_model().model_path,
-        chat_template=get_serving().chat_template,
-        completion_template=get_serving().completion_template,
+    tokenizer_manager, template_manager = init_tokenizer_manager(
+        server_args,
+        port_args,
+        TokenizerManagerClass=tokenizer_worker_class,
     )
 
     tokenizer_manager.max_req_input_len = scheduler_info["max_req_input_len"]

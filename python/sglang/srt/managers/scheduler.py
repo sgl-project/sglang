@@ -314,6 +314,7 @@ from sglang.srt.observability.scheduler_stage_metrics import (
 from sglang.srt.observability.startup_time import build_scheduler_startup_time
 from sglang.srt.observability.trace import process_tracing_init, trace_set_thread_info
 from sglang.srt.parser.reasoning_parser import ReasoningParser
+from sglang.srt.parser.template_detection import resolve_auto_parsers
 from sglang.srt.platforms import current_platform
 from sglang.srt.plugins import load_plugins
 from sglang.srt.rust_server.server import RustServer
@@ -536,8 +537,9 @@ class Scheduler(
         if self.enable_pdmux:
             self.init_pdmux()
 
-        # Init tokenizer
         self.init_tokenizer()
+        self.init_auto_parsers()
+        self.init_reasoning_parser()
 
         # Init moe config and GEMM config (FP8 GEMM, etc.)
         self.init_moe_gemm_config()
@@ -864,6 +866,7 @@ class Scheduler(
     def init_tokenizer(self):
         server_args = self.server_args
         self.is_generation = self.model_config.is_generation
+        self.processor = None
 
         if self.skip_tokenizer_init:
             self.tokenizer = self.processor = None
@@ -910,6 +913,15 @@ class Scheduler(
                     "M-RoPE fallback will not be available."
                 )
 
+    def init_auto_parsers(self) -> None:
+        resolve_auto_parsers(
+            self.server_args,
+            self.tokenizer,
+            processor=self.processor,
+            config_writer=get_context().override,
+        )
+
+    def init_reasoning_parser(self) -> None:
         if get_serving().reasoning_parser and self.tokenizer:
             reasoning_parser = ReasoningParser(
                 model_type=get_serving().reasoning_parser,
