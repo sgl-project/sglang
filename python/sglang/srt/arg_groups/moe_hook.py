@@ -13,6 +13,7 @@ from sglang.srt.arg_groups.overrides import (
     _a2a_fusion_adjustments,
     _moe_runner_backend_quant_constraints,
     _moe_runner_fusion_disable,
+    _routed_experts_capture_backend_guard,
     cutedsl_moe_max_num_tokens,
     declare_resolution,
     max_prefill_buffer_tokens,
@@ -39,6 +40,10 @@ def handle_moe_kernel_config(server_args: Any):
     cfg = resolving_view(server_args)
 
     run_post_process_pass(server_args, _moe_runner_backend_quant_constraints)
+    # Must follow every moe_runner_backend resolution (the arch overrides in
+    # model_hook and the quant constraints above): routed-experts capture needs a
+    # topk-id-materializing runner, so a bypassing pick is downgraded or rejected here.
+    run_post_process_pass(server_args, _routed_experts_capture_backend_guard)
 
     view = resolved_view(server_args)
     if view.moe_runner_backend == "flashinfer_cutlass":
