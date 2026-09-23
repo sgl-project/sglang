@@ -9,6 +9,7 @@
 import logging
 import os
 import re
+from array import array
 from collections.abc import Iterable
 from functools import cached_property
 from types import SimpleNamespace
@@ -2029,7 +2030,8 @@ class KimiK3DeltaAttention(nn.Module):
                     qkv, g_proj_states, f_a, beta, _pad = torch.split(
                         fused_states, self._qkvgbfa_sizes, dim=-1
                     )
-                    forget_gate = gemm(f_a, self._bfa_f_b_w)
+                    # Fused KDA decode consumes f_a and applies f_b itself.
+                    forget_gate = f_a if defer_f_b else gemm(f_a, self._bfa_f_b_w)
                     return qkv, beta, forget_gate, g_proj_states
 
                 if (
@@ -3814,7 +3816,7 @@ class KimiK3ForConditionalGeneration(nn.Module):
         image_embeds = self.vision_tower(pixel_values, grid_thws_host.to(device))
         return self.mm_projector(image_embeds)
 
-    def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
+    def pad_input_ids(self, input_ids: array, mm_inputs: MultimodalInputs) -> array:
         pattern = MultiModalityDataPaddingPatternMultimodalTokens()
         return pattern.pad_input_tokens(input_ids, mm_inputs)
 

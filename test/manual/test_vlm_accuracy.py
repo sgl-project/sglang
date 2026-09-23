@@ -154,10 +154,10 @@ class VisionLLMLogitsBase(unittest.IsolatedAsyncioTestCase):
         model_config = ModelConfig(self.model_path, model_override_args="{}")
         bootstrap.init_parallel_runtime(
             server_args=server_args,
-            model_config=model_config,
             device=get_device().device,
             dist_port=12435,
         )
+        bootstrap.init_layer_runtime(model_config=model_config)
         self.model_runner = ModelRunner(
             model_config=model_config,
             mem_fraction_static=0.8,
