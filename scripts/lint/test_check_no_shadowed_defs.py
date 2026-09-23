@@ -83,6 +83,35 @@ class Loader:
 """
         self.assertEqual(self.check_source(source), [])
 
+    def test_reports_shadowing_under_an_unrelated_register_decorator(self):
+        # `register` only exempts a rebinding attribute such as
+        # `@handler.register`; a plain `@register_custom_op(...)` is an
+        # ordinary decorator and must not hide a collision.
+        source = """
+class Runner:
+    @register_custom_op("x")
+    def run(self):
+        return 1
+
+    @register_custom_op("y")
+    def run(self):
+        return 2
+"""
+        self.assertEqual(self.check_source(source), [("Runner", "run", 4, 8)])
+
+    def test_accepts_singledispatch_register(self):
+        source = """
+class Handler:
+    @singledispatchmethod
+    def handle(self, value):
+        raise NotImplementedError
+
+    @handle.register
+    def handle(self, value: int):
+        return value
+"""
+        self.assertEqual(self.check_source(source), [])
+
     def test_reports_async_method(self):
         source = """
 class Client:

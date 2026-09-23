@@ -14,14 +14,26 @@ import ast
 import pathlib
 import sys
 
-_ALLOWED_DECORATORS = ("overload", "setter", "getter", "deleter", "register")
+# `@x.setter` and friends, and `@f.register` for singledispatch, are the only
+# decorators that legitimately reuse a name. Match the attribute exactly:
+# a substring test also swallows `@register_custom_op`, `@register_post_process`
+# and ~360 other unrelated `register_*` decorators, which would exempt those
+# methods from this check entirely.
+_REBINDING_ATTRS = frozenset({"setter", "getter", "deleter", "register"})
 
 
 def _is_intentional_repeat(node: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:
     """Property accessors and dispatch registrations reuse a name on purpose."""
     for decorator in node.decorator_list:
-        text = ast.unparse(decorator)
-        if any(marker in text for marker in _ALLOWED_DECORATORS):
+        target = decorator.func if isinstance(decorator, ast.Call) else decorator
+        # `@x.setter` / `@f.register`: rebinding only counts off an attribute,
+        # so a plain `@register_custom_op(...)` does not qualify.
+        if isinstance(target, ast.Attribute) and target.attr in _REBINDING_ATTRS:
+            return True
+        # `@overload` and `@typing.overload`.
+        if isinstance(target, ast.Name) and target.id == "overload":
+            return True
+        if isinstance(target, ast.Attribute) and target.attr == "overload":
             return True
     return False
 
