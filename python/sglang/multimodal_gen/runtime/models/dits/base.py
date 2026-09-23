@@ -8,6 +8,7 @@ import torch
 from torch import nn
 
 from sglang.multimodal_gen.configs.models.dits.base import DiTArchConfig, DiTConfig
+from sglang.multimodal_gen.runtime.cache.dpcache import DPCacheMixin
 
 # NOTE: SpectrumMixin lives in runtime.cache.spectrum
 from sglang.multimodal_gen.runtime.cache.spectrum import SpectrumMixin
@@ -147,12 +148,13 @@ class BaseDiT(nn.Module, ABC):
         return next(self.parameters()).device
 
 
-class CachableDiT(SpectrumMixin, TeaCacheMixin, BaseDiT):
+class CachableDiT(DPCacheMixin, SpectrumMixin, TeaCacheMixin, BaseDiT):
     """
     Base class for DiT models that support inference-time cache accelerators.
 
-    Inherits ``SpectrumMixin`` (Chebyshev step skipping) and ``TeaCacheMixin``
-    (temporal L1 similarity caching) plus ``BaseDiT`` core functionality.
+    Inherits ``DPCacheMixin`` (calibrated key-timestep caching), ``SpectrumMixin``
+    (Chebyshev step skipping) and ``TeaCacheMixin`` (temporal L1 similarity
+    caching) plus ``BaseDiT`` core functionality.
 
     """
 

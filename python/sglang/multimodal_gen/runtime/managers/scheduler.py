@@ -576,6 +576,8 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
             candidate_req
         ):
             return "realtime_session"
+        if self._uses_dpcache(base_req) or self._uses_dpcache(candidate_req):
+            return "dpcache"
         if not isinstance(base_req.prompt, str) or not isinstance(
             candidate_req.prompt, str
         ):
@@ -601,6 +603,13 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
     @staticmethod
     def _has_realtime_session(req: Req) -> bool:
         return bool(req.realtime_session_id) or req.session is not None
+
+    def _uses_dpcache(self, req: Req) -> bool:
+        # a DPCache schedule is calibrated for exactly one image per request
+        budget = getattr(req, "dpcache_budget", None)
+        if budget is None:
+            budget = getattr(self.server_args, "dpcache_default_budget", None)
+        return bool(budget)
 
     def _requires_sequential_multi_output(self, *reqs: Req) -> bool:
         pipeline_config = self.server_args.pipeline_config
@@ -634,6 +643,9 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
         if self._has_realtime_session(base_req) or self._has_realtime_session(
             candidate_req
         ):
+            return False
+
+        if self._uses_dpcache(base_req) or self._uses_dpcache(candidate_req):
             return False
 
         if not isinstance(base_req.prompt, str) or not isinstance(

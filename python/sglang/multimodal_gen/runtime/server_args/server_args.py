@@ -295,6 +295,10 @@ class ServerArgs(DisaggServerArgsMixin):
     cache_dit_config: str | dict[str, Any] | None = (
         None  # cache-dit config for diffusers
     )
+    # DPCache: a directory of calibrated schedules (K*.json) this server
+    # serves, and the budget requests use when they set no dpcache_budget.
+    dpcache_schedule_dir: str | None = None
+    dpcache_default_budget: int | None = None
 
     # Distributed executor backend
     nccl_port: Optional[int] = None
@@ -671,7 +675,25 @@ class ServerArgs(DisaggServerArgsMixin):
         self._validate_batching()
         self._validate_breakable_cuda_graph()
         self._validate_minimax_h3_adaln()
+        self._validate_dpcache()
         self.pipeline_config.validate_server_args(self)
+
+    def _validate_dpcache(self) -> None:
+        if self.dpcache_schedule_dir is not None and not os.path.isdir(
+            self.dpcache_schedule_dir
+        ):
+            raise ValueError(
+                f"dpcache_schedule_dir {self.dpcache_schedule_dir!r} is not a directory"
+            )
+        budget = self.dpcache_default_budget
+        if budget is None:
+            return
+        if self.dpcache_schedule_dir is None:
+            raise ValueError("dpcache_default_budget requires dpcache_schedule_dir")
+        if isinstance(budget, bool) or not isinstance(budget, int) or budget < 2:
+            raise ValueError(
+                f"dpcache_default_budget must be an int >= 2, got {budget!r}"
+            )
 
     def _validate_minimax_h3_adaln(self) -> None:
         # Warn, not raise: config-file and from_kwargs construction mark every
@@ -2174,6 +2196,22 @@ class ServerArgs(DisaggServerArgsMixin):
             type=str,
             default=ServerArgs.cache_dit_config,
             help="Path to a Cache-DiT YAML/JSON config. Enables cache-dit for diffusers backend.",
+        )
+        parser.add_argument(
+            "--dpcache-schedule-dir",
+            type=str,
+            default=ServerArgs.dpcache_schedule_dir,
+            help="Directory of calibrated DPCache schedules (K*.json) to serve; "
+            "checked against this server at startup. See "
+            "sglang.multimodal_gen.tools.dpcache_calibrate.",
+        )
+        parser.add_argument(
+            "--dpcache-default-budget",
+            type=int,
+            default=ServerArgs.dpcache_default_budget,
+            help="DPCache budget K for requests that set no dpcache_budget. "
+            "Requests with no matching schedule, or outside DPCache's scope, "
+            "then run natively.",
         )
 
         # HuggingFace specific parameters

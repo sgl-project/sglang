@@ -1,0 +1,200 @@
+---
+title: "DPCache"
+description: "Opt-in key-timestep caching driven by an externally calibrated schedule."
+tag: "approx"
+---
+
+DPCache runs the full transformer on a calibrated subset of `K` denoising steps
+and, on every other step, extrapolates the final transformer-block feature from
+the two most recent full steps. A predicted step bypasses every transformer
+block, so block weights are not read or streamed; it still runs the per-step
+preparation (latent input projection and timestep embedding) and the output head
+(output norm conditioned on the current timestep, then the output projection).
+It adapts [DPCache](https://arxiv.org/abs/2602.22654) and requires no training,
+distillation, or weight changes.
+
+DPCache is an approximation. Outputs are not bit-identical to native inference
+unless every step is scheduled as full. Validate quality and latency on the
+exact model, resolution, step count, and hardware you deploy.
+
+A request that does not use DPCache takes the unchanged native path: no state
+is attached and the transformer runs exactly as it does without this feature.
+
+## Scope
+
+DPCache is opt-in per request. The runtime is model-agnostic, and a DiT uses it
+once it routes its transformer blocks through the DPCache hook (see
+[Adding a model](#adding-a-model)).
+
+| Model | Pipeline | Validated |
+| --- | --- | --- |
+| Qwen-Image 2.1 | `QwenImage21Pipeline` | BF16, 1024x1024, 40 steps, one RTX 5090 |
+
+Every request must also stay inside this configuration:
+
+- BF16 transformer weights and a single transformer (no dual-expert models).
+- Text-to-image with one prompt and one output per request. Reference images,
+  classifier-free guidance, LoRA, and `quality` values other than `lossless`
+  are rejected.
+- Single GPU, eager execution. Torch compile, breakable CUDA graphs, Cache-DiT,
+  TeaCache, Spectrum, skip-softmax attention, attention backend overrides, and
+  sequence, tensor, or CFG parallelism are rejected.
+
+A request that asks for a budget outside this scope, or on a model that does not
+use the hook, fails with an error instead of silently running a different
+approximation. DPCache requests are never merged by dynamic batching, and a
+server warmup request runs natively because it uses fewer steps than any
+calibrated schedule.
+
+## How it works
+
+1. **Calibrate.** Run native generations on a few calibration prompts and record
+   the final transformer-block feature (the input of the output norm) at every
+   step.
+2. **Score.** For every anchor pair `i < j` and later step `t`, predict
+   `h_j + (h_j - h_i) / (j - i) * (t - j)` in BF16 with the same function the
+   runtime uses, and record the mean absolute error against the recorded
+   feature. The cost of consecutive full steps `i < j < k` is the summed error
+   of the steps between `j` and `k`. Only steps the runtime actually predicts
+   are scored; the end of the trajectory is not treated as a scored step.
+3. **Plan.** An exact dynamic program over (previous, current) full-step pairs
+   picks the minimum-cost set of `K` full steps. By default steps 0, 1, and 2
+   are full; any leading prefix of at least two steps is accepted. An optional
+   `max_gap` bounds every gap between full steps, including the last one.
+4. **Serve.** The schedule is a JSON artifact. It records the request settings
+   it was calibrated for (checkpoint revision, resolution, step count, timesteps
+   and sigmas, scheduler class and config digest, guidance scale, attention
+   backend, dtype, quality) plus calibration provenance. A request whose
+   settings differ is rejected before denoising.
+
+Predictions never become anchors, and each request (and each CFG branch) gets
+fresh state that is discarded when the request finishes or fails.
+
+## Usage
+
+A schedule belongs to the deployment, not to a request: it is calibrated for one
+checkpoint and request configuration. The server loads a directory of schedules
+at startup, and a request only chooses a budget `K`.
+
+```bash
+sglang serve --model-path MODEL_PATH \
+  --dpcache-schedule-dir schedules/ \
+  --dpcache-default-budget 20 \
+  --attention-backend torch_sdpa
+```
+
+- `--dpcache-schedule-dir` holds the schedule JSON files, for example `K12.json`
+  and `K20.json`, possibly for several resolutions or step counts. At startup
+  every file is validated and checked against this server's pipeline,
+  checkpoint and attention backend, so a schedule built for another deployment
+  fails the launch rather than a request. Two files with the same budget and
+  request configuration are rejected as ambiguous.
+- A request sets `dpcache_budget`. The server picks the schedule with that
+  budget whose recorded request (resolution, step count, timesteps and sigmas,
+  scheduler, guidance, quality, dtype) matches the request. If none matches, or
+  the request is outside DPCache's scope, the request fails.
+- `--dpcache-default-budget` is optional and applies to requests that set no
+  `dpcache_budget`. Where no schedule matches, or the request is outside the
+  scope, those requests run natively instead of failing. `dpcache_budget: 0`
+  turns DPCache off for one request.
+
+The OpenAI-compatible image and video APIs accept `dpcache_budget` as an extra
+request field, like `cache_dit_params`. From the command line:
+
+```bash
+sglang generate --model-path MODEL_PATH --dpcache-schedule-dir schedules/ \
+  --dpcache-budget 20 --prompt "A red bicycle leaning against a green door" \
+  --width 1024 --height 1024 --num-inference-steps 40
+```
+
+In Python, pass `dpcache_schedule_dir` to `DiffGenerator.from_pretrained` and
+`dpcache_budget` in the sampling parameters. DPCache needs eager execution, so
+do not let `performance_mode="auto"` choose torch compile or CUDA graphs.
+
+## Calibrating a schedule
+
+SGLang does not ship a calibration harness or any pre-built schedule: you supply
+the JSON artifact, and the runtime only validates and applies it.
+`sglang.multimodal_gen.runtime.cache.dpcache` exposes the pieces needed to build
+one from features you captured yourself.
+
+```python
+import torch
+
+from sglang.multimodal_gen.runtime.cache.dpcache import (
+    build_schedule_artifact,
+    pact_costs,
+    pact_step_errors,
+    plan_schedule,
+)
+
+# samples[s] holds one calibration generation's final block features, in step
+# order, in the dtype and on the device the runtime uses.
+errors = torch.stack(
+    [pact_step_errors(features, max_gap=8) for features in samples]
+).mean(dim=0)
+costs = pact_costs(errors, max_gap=8)
+full_steps, calibrated_cost = plan_schedule(costs, num_full_steps=20, max_gap=8)
+
+schedule = build_schedule_artifact(
+    signature=signature,
+    full_steps=full_steps,
+    mandatory=(0, 1, 2),
+    calibrated_cost=calibrated_cost,
+    calibration={"manifest_sha256": corpus_digest, "num_samples": len(samples)},
+    source_commit=source_commit,
+    max_gap=8,
+)
+```
+
+`signature` is a `DPCacheRequestSignature`. It includes the scheduler's timesteps
+and sigmas and a digest of its config, so capture it from the runtime rather than
+reconstructing it: `DenoisingStage.dpcache_signature(batch, server_args)`
+returns the signature for the request being served, and the server matches it
+against each schedule's recorded request.
+
+Calibration features must come from a native run of the same configuration.
+Using the same `max_gap` for scoring and planning avoids unnecessary calibration
+work. If scoring used a bound, planning must use that bound or a smaller one: a
+larger planner bound may need costs that were never computed. Unbounded scoring
+supports a bounded planner.
+
+Choose `K` on a validation split, freeze the choice, and only then measure a
+held-out split. A schedule carries no quality guarantee of its own, and the
+planner minimises the calibrated feature error, not the image difference you
+ultimately care about.
+
+<Warning>
+A low mean image difference does not guarantee that each image is preserved.
+Small `K` can change scene layout or turn an object into a different one while
+the average still looks acceptable. Inspect side-by-side images before choosing
+a budget.
+</Warning>
+
+## Adding a model
+
+A DiT that derives from `CachableDiT` already inherits `DPCacheMixin`. To opt
+in:
+
+1. Set `_supports_dpcache = True` on the model class.
+2. In `forward`, move the transformer block stack into a callable and route it
+   through the hook. Keep everything that depends on the current timestep, in
+   particular the output norm and projection, outside the callable so a
+   predicted step still applies it:
+
+   ```python
+   hidden_states = self.dpcache_blocks(
+       lambda: self._forward_blocks(hidden_states, temb, ...)
+   )
+   output = self.proj_out(self.norm_out(hidden_states, temb))
+   ```
+
+3. If the output head is not `proj_out`, override `dpcache_feature_dtype()` to
+   return the dtype of the block-stack output.
+4. Add a test that an all-full schedule is bit-identical to the native forward
+   and that a predicted step runs no transformer block, as
+   `test_qwen_image21_cuda.py` does for Qwen-Image 2.1.
+
+The denoising stage attaches one state per CFG branch to the request, keyed by
+`is_cfg_negative`, and the hook reads the current step from the forward
+context, so a model needs no DPCache-specific arguments.

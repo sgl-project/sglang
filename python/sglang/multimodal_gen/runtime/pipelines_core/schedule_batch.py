@@ -203,6 +203,9 @@ class Req:
 
     is_warmup: bool = False
 
+    # DPCache anchors keyed by is_cfg_negative; set only while a denoise runs
+    dpcache_states: dict[bool, Any] | None = None
+
     # STA parameters
     STA_param: list | None = None
     is_cfg_negative: bool = False

@@ -345,6 +345,11 @@ class SamplingParams:
     enable_spectrum: bool = False
     spectrum_params: Any = None  # SpectrumParams
 
+    # Lossy DPCache budget K: run K calibrated full steps and predict the rest
+    # from the server's --dpcache-schedule-dir. None follows the server's
+    # --dpcache-default-budget; 0 turns DPCache off for this request.
+    dpcache_budget: int | None = None
+
     # Profiling
     profile: bool = field(default=False, metadata={"batch_sig_exclude": True})
     num_profiled_timesteps: int = field(default=5, metadata={"batch_sig_exclude": True})
@@ -722,6 +727,17 @@ class SamplingParams:
                 "enable_teacache and enable_spectrum are mutually exclusive; enable only one."
             )
 
+        budget = self.dpcache_budget
+        if budget is not None and (
+            isinstance(budget, bool)
+            or not isinstance(budget, int)
+            or budget < 0
+            or budget == 1
+        ):
+            raise ValueError(
+                f"dpcache_budget must be 0 (off) or an int >= 2, got {budget!r}"
+            )
+
         RLRolloutArgs.validate_sampling_params(self)
 
     def check_sampling_param(self):
@@ -1031,6 +1047,12 @@ class SamplingParams:
         add_argument(
             "--cfg-gate-step",
             type=float,
+        )
+        add_argument(
+            "--dpcache-budget",
+            type=int,
+            help="DPCache budget K from the server's --dpcache-schedule-dir; "
+            "0 turns DPCache off for this request.",
         )
         add_argument(
             "--attention-backend-override",

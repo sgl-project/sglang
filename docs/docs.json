@@ -1665,7 +1665,8 @@
                     "pages": [
                       "docs/sglang-diffusion/cache_dit",
                       "docs/sglang-diffusion/teacache",
-                      "docs/sglang-diffusion/spectrum"
+                      "docs/sglang-diffusion/spectrum",
+                      "docs/sglang-diffusion/dpcache"
                     ]
                   },
                   "docs/sglang-diffusion/progressive_resolution",
