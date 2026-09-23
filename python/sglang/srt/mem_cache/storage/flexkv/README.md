@@ -99,6 +99,8 @@ option; when changing layouts, use an empty or separately namespaced cache pool.
   Such requests use their correctly namespaced GPU cache and recompute misses;
   they skip **all** FlexKV lookup, store, and prefetch paths. This includes LoRA
   namespaces. Supporting host reuse requires a shared connector key contract.
+  Deployments that previously stored namespaced requests through this adapter
+  should use a fresh host/remote cache pool to discard old unscoped entries.
 - DeepSeek V4 unified-KV, independent `--enable-hisparse` device-page mapping,
   and Mamba/SSM pools are unsupported.
 - `--enable-streaming-session` is rejected: its wrapper can retain KV without

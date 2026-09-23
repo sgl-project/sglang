@@ -6,12 +6,12 @@ from unittest.mock import MagicMock
 
 import torch
 
-from sglang.srt.mem_cache.unified_cache.components.swa import SWAComponent
 from sglang.srt.mem_cache.unified_cache.components.base import (
     BASE_COMPONENT_TYPE,
     ComponentType,
     EvictLayer,
 )
+from sglang.srt.mem_cache.unified_cache.components.swa import SWAComponent
 from sglang.srt.mem_cache.unified_cache.unified_tree_core import UnifiedTreeCore
 from sglang.test.ci.ci_register import register_cpu_ci
 
