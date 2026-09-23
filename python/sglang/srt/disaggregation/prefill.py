@@ -798,6 +798,7 @@ class SchedulerDisaggregationPrefillMixin:
         draft_input = result.next_draft_input
         draft_hidden_states_cpu = None
         draft_dsa_topk_indices_cpu = None
+        draft_probs_cpu = None
         if self.spec_algorithm.is_eagle() and draft_input is not None:
             draft_hidden_states_cpu = draft_input.hidden_states.to(
                 "cpu", non_blocking=False
@@ -806,6 +807,13 @@ class SchedulerDisaggregationPrefillMixin:
                 draft_dsa_topk_indices_cpu = batch.spec_info.dsa_topk_indices.to(
                     "cpu", non_blocking=False
                 )
+            if draft_input.draft_probs is not None:
+                if draft_input.draft_probs.ndim != 2:
+                    raise RuntimeError(
+                        "PD EAGLE rejection sampling currently expects one "
+                        "prefill draft distribution per request."
+                    )
+                draft_probs_cpu = draft_input.draft_probs.to("cpu", non_blocking=False)
         # Transfer kv for prefill completed requests and add it into disagg_prefill_inflight_queue
         next_token_ids = result.next_token_ids.tolist()
         self.batch_result_processor.move_logprobs_to_cpu(
@@ -891,6 +899,11 @@ class SchedulerDisaggregationPrefillMixin:
                     req.output_topk_p = draft_input.topk_p[i]
                     req.output_topk_index = draft_input.topk_index[i]
                     req.hidden_states_tensor = draft_hidden_states_cpu[i].clone()
+                    req.output_draft_probs = (
+                        draft_probs_cpu[i].clone()
+                        if draft_probs_cpu is not None
+                        else None
+                    )
                     if draft_dsa_topk_indices_cpu is not None:
                         req.output_dsa_topk_indices = draft_dsa_topk_indices_cpu[
                             i
@@ -899,6 +912,7 @@ class SchedulerDisaggregationPrefillMixin:
                         req.output_dsa_topk_indices = None
                 else:
                     req.hidden_states_tensor = None
+                    req.output_draft_probs = None
                     req.output_dsa_topk_indices = None
                 if req.return_logprob:
                     assert extend_logprob_start_len_per_req is not None

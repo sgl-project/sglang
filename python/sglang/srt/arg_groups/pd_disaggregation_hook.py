@@ -23,6 +23,46 @@ def handle_pd_disaggregation(server_args: ServerArgs) -> None:
     """Validate and normalize PD-disaggregation server args."""
     cfg = resolving_view(server_args)
 
+    if cfg.disaggregation_decode_draft_bootstrap:
+        if envs.SGLANG_RUST_SERVER.get():
+            raise ValueError(
+                "Decode draft bootstrap currently requires the Python API server "
+                "(SGLANG_RUST_SERVER=0): native egress does not carry replay accounting"
+            )
+        model_arch = model_config_of(server_args).hf_config.architectures[0]
+        if model_arch not in (
+            "DeepseekV3ForCausalLM",
+            "Glm4MoeForCausalLM",
+            "Glm4MoeLiteForCausalLM",
+            "GlmMoeDsaForCausalLM",
+        ):
+            raise ValueError(
+                "Decode draft bootstrap currently supports only DeepSeek V3 / GLM MoE text models"
+            )
+        if (
+            cfg.disaggregation_mode != "decode"
+            or cfg.speculative_algorithm != "EAGLE"
+            or cfg.enable_multi_layer_eagle
+            or cfg.dp_size != 1
+            or cfg.pp_size != 1
+            or cfg.dcp_size != 1
+            or cfg.attn_cp_size != 1
+            or cfg.enable_hisparse
+            or cfg.disaggregation_transfer_backend not in ("mooncake", "mooncake_tcp")
+            or cfg.disaggregation_decode_enable_radix_cache
+            or cfg.enable_hierarchical_cache
+            or cfg.disaggregation_decode_enable_offload_kvcache
+            or cfg.disaggregation_decode_draft_bootstrap_max_tokens <= 0
+        ):
+            raise ValueError(
+                "Decode draft bootstrap requires single-layer EAGLE, TP-only "
+                "decode, Mooncake, a positive token budget, and no decode cache/offload"
+            )
+        logger.warning(
+            "GEN draft bootstrap replays the full target and draft prefix; "
+            "this is extra compute, not a free handoff or a throughput optimization"
+        )
+
     # "mooncake_tcp" is mooncake with the TCP transport forced: set MC_FORCE_TCP
     # so mooncake installs TcpTransport instead of RDMA, rewrite the backend to
     # mooncake, and skip RDMA HCA selection. Must run before backend-name checks.

@@ -2256,6 +2256,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             output_topk_p,
             output_topk_index,
             output_hidden_states,
+            output_draft_probs,
             output_dsa_topk_indices,
             output_bootstrap_room,
         ) = self.metadata_buffers.get_buf(idx)
@@ -2360,10 +2361,33 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         decode_req.req.mm_image_tokens = cached_tokens[4].item()
         decode_req.req.mm_audio_tokens = cached_tokens[5].item()
         decode_req.req.mm_video_tokens = cached_tokens[6].item()
-        if not self.spec_algorithm.is_none():
+        decode_req.req.pd_draft_bootstrap_pending = (
+            get_disagg().disaggregation_decode_draft_bootstrap
+            and not self.spec_algorithm.is_none()
+        )
+        if decode_req.req.pd_draft_bootstrap_pending:
+            decode_req.req.output_topk_p = None
+            decode_req.req.output_topk_index = None
+            decode_req.req.hidden_states_tensor = None
+            decode_req.req.output_draft_probs = None
+            decode_req.req.output_dsa_topk_indices = None
+        elif not self.spec_algorithm.is_none():
             decode_req.req.output_topk_p = output_topk_p
             decode_req.req.output_topk_index = output_topk_index
             decode_req.req.hidden_states_tensor = output_hidden_states
+            if output_draft_probs is not None and _is_fake_transfer(decode_req.req):
+                # Fake-transfer requests are server warmups: no prefill worker
+                # populated metadata, but the rejection-sampling draft path still
+                # requires a valid q distribution.  Use a one-hot distribution
+                # at the synthetic proposal so warmup exercises the same tensor
+                # shapes without affecting any user-visible sampling result.
+                output_draft_probs.zero_()
+                fake_draft_token = int(output_topk_index.reshape(-1)[0].item())
+                if not 0 <= fake_draft_token < output_draft_probs.numel():
+                    fake_draft_token = 0
+                    output_topk_index[0] = fake_draft_token
+                output_draft_probs[fake_draft_token] = 1.0
+            decode_req.req.output_draft_probs = output_draft_probs
             if (
                 output_dsa_topk_indices is not None
                 and torch.all(output_dsa_topk_indices < 0).item()
@@ -2894,6 +2918,36 @@ class SchedulerDisaggregationDecodeMixin:
         if len(can_run_list) == 0:
             return None
 
+        if get_disagg().disaggregation_decode_draft_bootstrap:
+            from sglang.srt.disaggregation.draft_bootstrap import bootstrap_prompt
+
+            ready, rejected = [], []
+            for req in can_run_list:
+                try:
+                    bootstrap_prompt(
+                        req,
+                        get_disagg().disaggregation_decode_draft_bootstrap_max_tokens,
+                    )
+                except RuntimeError as exc:
+                    prepare_abort(req, str(exc), status_code=HTTPStatus.BAD_REQUEST)
+                    rejected.append(req)
+                else:
+                    ready.append(req)
+            if rejected:
+                failed_batch = ScheduleBatch.init_new(
+                    rejected,
+                    self.req_to_token_pool,
+                    self.token_to_kv_pool_allocator,
+                    self.tree_cache,
+                    self.model_config,
+                    self.enable_overlap,
+                    self.spec_algorithm,
+                )
+                self.batch_result_processor.process_batch_result_prebuilt(failed_batch)
+            can_run_list = ready
+            if not can_run_list:
+                return None
+
         set_time_batch(can_run_list, "set_forward_entry_time")
 
         # construct a schedule batch with those requests and mark as decode
@@ -2917,6 +2971,16 @@ class SchedulerDisaggregationDecodeMixin:
         self.ngram_embedding_manager.prepare_for_forward(
             new_batch, chunked_req=self.chunked_req
         )
+        if get_disagg().disaggregation_decode_draft_bootstrap:
+            # TP-only: all ranks bootstrap the same requests. Drain overlap before
+            # reusing runner buffers or rewriting the transferred target KV.
+            if self.enable_overlap:
+                self.forward_stream.synchronize()
+            from sglang.srt.disaggregation.draft_bootstrap import bootstrap_decode_draft
+
+            for req in new_batch.reqs:
+                if getattr(req, "pd_draft_bootstrap_pending", False):
+                    bootstrap_decode_draft(self, req)
         new_batch.process_prebuilt(self.future_map)
 
         return new_batch

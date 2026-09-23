@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import random
 from collections import deque
 from contextlib import nullcontext
@@ -27,6 +28,8 @@ from sglang.srt.runtime_context import (
     get_spec,
 )
 from sglang.srt.utils import is_npu
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from sglang.srt.disaggregation.base.conn import KVArgs, StateType
@@ -295,11 +298,13 @@ class MetadataBuffers:
         max_top_logprobs_num: int = 128,
         custom_mem_pool: torch.cuda.MemPool = None,
         output_dsa_topk_indices_dim: int = 0,
+        output_draft_probs_dim: int = 0,
         *,
         kv_checksum_enabled: bool = False,
     ):
         self.custom_mem_pool = custom_mem_pool
         self.output_dsa_topk_indices_dim = output_dsa_topk_indices_dim
+        self.output_draft_probs_dim = output_draft_probs_dim
         self.enable_sampling_mask = envs.SGLANG_ENABLE_DISAGG_SAMPLING_MASK.get()
         bootstrap_room_dtype = torch.uint64
         device = "cpu"
@@ -313,6 +318,26 @@ class MetadataBuffers:
             device = "cpu"
         elif envs.SGLANG_MOONCAKE_CUSTOM_MEM_POOL.get() == "INTRA_NODE_NVLINK":
             device = "cuda"
+        draft_probs_dtype = torch.float32
+        if self.output_draft_probs_dim > 0:
+            bytes_per_slot = self.output_draft_probs_dim * draft_probs_dtype.itemsize
+            total_bytes = size * bytes_per_slot
+            # Log before allocation so the requested size is visible even on OOM.
+            logger.info(
+                "Allocating PD rejection-sampling draft-probability buffer: "
+                "slots=%d, vocab_size=%d, dtype=%s, device=%s, "
+                "bytes_per_slot=%d, total_bytes=%d (%.3f GiB per rank). "
+                "Each rank allocates its own full buffer, in addition to KV cache "
+                "and other speculative buffers. Lower --max-running-requests "
+                "to reduce metadata capacity.",
+                size,
+                self.output_draft_probs_dim,
+                draft_probs_dtype,
+                device,
+                bytes_per_slot,
+                total_bytes,
+                total_bytes / (1024**3),
+            )
         with (
             torch.cuda.use_mem_pool(self.custom_mem_pool)
             if self.custom_mem_pool
@@ -360,6 +385,15 @@ class MetadataBuffers:
             )
             self.output_hidden_states = torch.zeros(
                 (size, hidden_size), dtype=hidden_states_dtype, device=device
+            )
+            self.output_draft_probs = (
+                torch.zeros(
+                    (size, self.output_draft_probs_dim),
+                    dtype=draft_probs_dtype,
+                    device=device,
+                )
+                if self.output_draft_probs_dim > 0
+                else None
             )
             if self.output_dsa_topk_indices_dim > 0:
                 self.output_dsa_topk_indices = torch.full(
@@ -410,6 +444,8 @@ class MetadataBuffers:
             self.output_topk_index,
             self.output_hidden_states,
         ]
+        if self.output_draft_probs is not None:
+            bufs.append(self.output_draft_probs)
         if self.output_dsa_topk_indices is not None:
             bufs.append(self.output_dsa_topk_indices)
         bufs.append(self.bootstrap_room)
@@ -447,6 +483,11 @@ class MetadataBuffers:
             self.output_topk_p[idx].clone(),
             self.output_topk_index[idx].clone(),
             self.output_hidden_states[idx].clone(),
+            (
+                self.output_draft_probs[idx].clone()
+                if self.output_draft_probs is not None
+                else None
+            ),
             (
                 self.output_dsa_topk_indices[idx].clone()
                 if self.output_dsa_topk_indices is not None
@@ -557,6 +598,21 @@ class MetadataBuffers:
             self.output_hidden_states[req.metadata_buffer_index].copy_(
                 req.hidden_states_tensor
             )
+            if self.output_draft_probs is not None:
+                draft_probs = req.output_draft_probs
+                if draft_probs is None:
+                    raise RuntimeError(
+                        "PD EAGLE rejection sampling requires prefill draft_probs. "
+                        "Enable speculative-use-rejection-sampling on both the "
+                        "prefill and decode servers."
+                    )
+                if draft_probs.shape != self.output_draft_probs.shape[1:]:
+                    raise RuntimeError(
+                        "Unexpected PD EAGLE draft_probs shape: expected "
+                        f"{tuple(self.output_draft_probs.shape[1:])}, got "
+                        f"{tuple(draft_probs.shape)}."
+                    )
+                self.output_draft_probs[req.metadata_buffer_index].copy_(draft_probs)
             if self.output_dsa_topk_indices is not None:
                 dsa_topk_indices = req.output_dsa_topk_indices
                 if dsa_topk_indices is not None:

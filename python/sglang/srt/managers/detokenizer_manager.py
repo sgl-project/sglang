@@ -473,6 +473,7 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             audio_tokens=recv_obj.audio_tokens,
             video_tokens=recv_obj.video_tokens,
             spec_verify_ct=recv_obj.spec_verify_ct,
+            pd_draft_bootstrap_tokens=recv_obj.pd_draft_bootstrap_tokens,
             spec_num_correct_drafts=recv_obj.spec_num_correct_drafts,
             spec_num_block_accept_tokens=recv_obj.spec_num_block_accept_tokens,
             spec_num_cap_tokens=recv_obj.spec_num_cap_tokens,

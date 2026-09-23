@@ -343,6 +343,7 @@ class _GenerationStreamAccumulator:
     audio_tokens: list = field(default_factory=list)
     video_tokens: list = field(default_factory=list)
     spec_verify_ct: list = field(default_factory=list)
+    pd_draft_bootstrap_tokens: list = field(default_factory=list)
     spec_num_correct_drafts: list = field(default_factory=list)
     spec_num_block_accept_tokens: list = field(default_factory=list)
     spec_num_cap_tokens: list = field(default_factory=list)
@@ -511,6 +512,9 @@ class _GenerationStreamAccumulator:
         self.audio_tokens.append(audio_t)
         self.video_tokens.append(video_t)
 
+        self.pd_draft_bootstrap_tokens.append(
+            getattr(req, "pd_draft_bootstrap_tokens", 0)
+        )
         self.retraction_counts.append(req.retraction_count)
         if req.finished():
             self.weight_versions.append(
@@ -695,6 +699,7 @@ class _GenerationStreamAccumulator:
             rids=self.rids,
             http_worker_ipcs=self.http_worker_ipcs,
             spec_verify_ct=self.spec_verify_ct,
+            pd_draft_bootstrap_tokens=self.pd_draft_bootstrap_tokens,
             spec_num_correct_drafts=self.spec_num_correct_drafts,
             spec_num_block_accept_tokens=self.spec_num_block_accept_tokens,
             spec_num_cap_tokens=self.spec_num_cap_tokens,

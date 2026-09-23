@@ -83,6 +83,16 @@ class Disagg(msgspec.Struct):
         Optional[str],
         'The InfiniBand devices for disaggregation transfer. Supports a single device (e.g., --disaggregation-ib-device mlx5_0), a shared comma-separated list (e.g., --disaggregation-ib-device mlx5_0,mlx5_1), a per-GPU JSON mapping (e.g., --disaggregation-ib-device \'{"0": "mlx5_0,mlx5_1", "1": "mlx5_2"}\'), or a path to a JSON file containing that mapping. Default is None, which triggers automatic device detection when mooncake backend is enabled.',
     ] = None
+    disaggregation_decode_draft_bootstrap: A[
+        bool,
+        "Initialize EAGLE draft state on decode after target-only prefill. "
+        "Replays the full prefix (extra target and draft compute). "
+        "Experimental: text-only, TP-only, single-layer EAGLE, Mooncake, no decode prefix cache.",
+    ] = False
+    disaggregation_decode_draft_bootstrap_max_tokens: A[
+        int,
+        "Maximum prefix tokens per synchronous decode draft bootstrap. No silent truncation.",
+    ] = 65536
     disaggregation_decode_enable_radix_cache: A[
         bool,
         "Enable radix cache on decode server (PD mode). Caches KV prefixes to avoid redundant transfers. Incompatible with --enable-hisparse, speculative decoding, and --disaggregation-transfer-backend fake.",
