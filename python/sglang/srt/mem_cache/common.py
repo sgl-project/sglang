@@ -134,12 +134,15 @@ def free_kv_row_segments(
         end_pos = start_pos + kv_indices.numel()
         lo = min(max(dead_lo, start_pos), end_pos)
         hi = min(max(dead_hi, start_pos), end_pos)
+        # start_pos <= lo <= hi <= end_pos
+        # inside [lo, hi) is the swa dead segment
         if hi <= lo:
             swa_alive.append((kv_indices, start_pos))
             continue
+        swa_dead.append((kv_indices[lo - start_pos : hi - start_pos], lo))
+
         if lo > start_pos:
             swa_alive.append((kv_indices[: lo - start_pos], start_pos))
-        swa_dead.append((kv_indices[lo - start_pos : hi - start_pos], lo))
         if end_pos > hi:
             swa_alive.append((kv_indices[hi - start_pos :], hi))
 
