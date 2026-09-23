@@ -36,12 +36,15 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.kernels.jit.utils import is_arch_support_pdl
+from sglang.kernels.jit.utils import is_arch_support_pdl, is_hip_runtime
 
 # V-tile width of the fused verify kernel. Tuned on B200 at T=5 with
 # benchmark/kernels/bench_kda_verify_sweep.py; any power of two is
 # numerics-safe at num_warps=4 (bit-exact vs the BV=32 original).
 KDA_VERIFY_BLOCK_V = 4
+# gfx950, GLM TP4 at T=6 or 8 with fp32 conv weights: from B=3 wider V tiles
+# share the q/k convolution across more lanes (B=8 T=6: 29.5 -> 22.3 us).
+KDA_VERIFY_BLOCK_V_HIP = 16
 
 
 @triton.jit
@@ -420,7 +423,9 @@ def fused_kda_conv_gating_verify(
     # T=8 safe gate. conv_state is not comparable to the reference at all.
     # The ReplaySSM ring values are bit-exact at any num_warps: they are
     # elementwise (conv FMA chain, gate, sigmoid), upstream of every tl.sum.
-    num_warps: int = 4,
+    # ROCm defaults to 1: on gfx950 it is also the faster choice (GLM T=6 B=8:
+    # 80.8 -> 22.3 us) and matches the reference bit for bit.
+    num_warps: Optional[int] = None,
     # ReplaySSM fused ring-write; same parameter names as the unfused
     # fused_sigmoid_gating_delta_rule_update so ring_kwargs pass through both.
     cache_ring: bool = False,
@@ -435,6 +440,8 @@ def fused_kda_conv_gating_verify(
     seq_len, dim = mixed_qkv.shape
     B = seq_len // T
     W = conv_weight.shape[1]
+    if num_warps is None:
+        num_warps = 1 if is_hip_runtime() else 4
 
     assert mixed_qkv.stride(-1) == 1, "mixed_qkv must be contiguous in dim"
     assert dim == 2 * H * K + HV * V, f"packed dim mismatch: {dim}"
@@ -458,6 +465,16 @@ def fused_kda_conv_gating_verify(
     # the gated RMSNorm into this kernel's epilogue is a dead end; it is
     # PDL-chained behind this kernel instead (see fused_norm_gate.py).
     BV = min(triton.next_power_of_2(V), KDA_VERIFY_BLOCK_V)
+    if (
+        is_hip_runtime()
+        and num_warps == 1
+        and T in (6, 8)
+        and H == HV == 16
+        and K == V == 128
+        and conv_weight.dtype == torch.float32
+        and 3 <= B <= 16
+    ):
+        BV = KDA_VERIFY_BLOCK_V_HIP
     NV = triton.cdiv(V, BV)
 
     a2 = a.reshape(seq_len, HV * K)
