@@ -24,6 +24,7 @@ import torch
 from sglang.srt.beam_search.logits_capture import capture_pre_sample_logits
 from sglang.srt.configs.draft_parallel import DraftParallelLayout
 from sglang.srt.configs.load_config import _DEFAULT_LOAD_GROUP, LoadGroup
+from sglang.srt.disaggregation.utils import restore_cache_only_rebootstrap_tokens
 from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import (
     DestroyWeightsUpdateGroupReqInput,
@@ -52,6 +53,7 @@ from sglang.srt.model_executor.graph_memory_usage import (
 from sglang.srt.model_executor.pool_configurator import MemoryPoolConfig
 from sglang.srt.runtime_context import (
     get_device,
+    get_disagg,
     get_exec,
     get_model,
     get_parallel,
@@ -709,6 +711,20 @@ class TpModelWorker(BaseTpWorker):
                 ),
             )
 
+            if logits_output is None:
+                if not (
+                    get_disagg().dsv41_encoder_only_prefill
+                    and get_disagg().disaggregation_mode == "prefill"
+                    and forward_batch.forward_mode.is_extend_without_speculative()
+                ):
+                    raise RuntimeError(
+                        "Missing logits outside DeepSeek-V4.1 encoder-only Prefill"
+                    )
+                # DeepSeek-V4.1 asymmetric prefill intentionally terminates at
+                # the layer-20 global-cache producer.
+                batch_result.cache_only = True
+                return batch_result
+
             capture_pre_sample_logits(batch, forward_batch, logits_output)
 
             if is_verify:
@@ -730,8 +746,8 @@ class TpModelWorker(BaseTpWorker):
             ):
 
                 def sample_batch_func():
-                    batch_result.next_token_ids = self.model_runner.sample(
-                        logits_output, forward_batch
+                    batch_result.next_token_ids = restore_cache_only_rebootstrap_tokens(
+                        batch, self.model_runner.sample(logits_output, forward_batch)
                     )
                     self._maybe_finalize_elastic_cuda_graph_scale()
                     return batch_result
@@ -741,8 +757,8 @@ class TpModelWorker(BaseTpWorker):
 
             if not forward_batch.is_prefill_only:
                 # For normal requests, sample the next token ids.
-                batch_result.next_token_ids = self.model_runner.sample(
-                    logits_output, forward_batch
+                batch_result.next_token_ids = restore_cache_only_rebootstrap_tokens(
+                    batch, self.model_runner.sample(logits_output, forward_batch)
                 )
             else:
                 # For prefill-only requests, create dummy token IDs on CPU

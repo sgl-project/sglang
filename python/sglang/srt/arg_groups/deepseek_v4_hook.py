@@ -15,6 +15,7 @@ from sglang.srt.arg_groups.overrides import (
     resolving_view,
     run_post_process_pass,
 )
+from sglang.srt.constants import DSV41_REPLAY_WINDOW
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.runtime_context import (
@@ -58,6 +59,36 @@ def _default_dsv4_attention_backend(server_args: ServerArgs) -> str:
     ):
         return "flashmla"
     return "flashmla_mega"
+
+
+def _validate_dsv41_encoder_only_ratio_layout(hf_config) -> None:
+    """Validate target and bundled-MTP compression ratios independently."""
+
+    num_target_layers = getattr(hf_config, "num_hidden_layers", None)
+    num_mtp_layers = getattr(hf_config, "num_nextn_predict_layers", 0) or 0
+    ratios = tuple(getattr(hf_config, "compress_ratios", ()) or ())
+    expected_ratios = num_target_layers + num_mtp_layers
+    if len(ratios) != expected_ratios:
+        raise ValueError(
+            "--dsv41-encoder-only-prefill requires one compression ratio per "
+            "target and bundled MTP layer; "
+            f"got {len(ratios)}, expected {num_target_layers}+{num_mtp_layers}"
+        )
+
+    target_ratios = ratios[:num_target_layers]
+    mtp_ratios = ratios[num_target_layers:]
+    kv_sources = tuple(getattr(hf_config, "kv_source_layer_ids", ()) or ())
+    boundary = max(kv_sources)
+    if (
+        target_ratios[boundary] not in (1, 2)
+        or any(ratio not in (0, 1, 2) for ratio in target_ratios)
+        or any(ratio != 0 for ratio in mtp_ratios)
+    ):
+        raise ValueError(
+            "--dsv41-encoder-only-prefill requires the official target-layer "
+            f"ratio-0/1/2 layout, layer {boundary} to be a global-cache producer, and "
+            "bundled MTP layers to have ratio 0"
+        )
 
 
 def apply_deepseek_v4_defaults(server_args: ServerArgs, model_arch: str) -> None:
@@ -274,6 +305,8 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
 
     cfg = resolving_view(server_args)
     if model_config_of(server_args).hf_config.model_type != "deepseek_v41":
+        if cfg.dsv41_encoder_only_prefill:
+            raise ValueError("--dsv41-encoder-only-prefill requires DeepSeek-V4.1")
         if cfg.enable_encoder_swa_bounded_replay:
             raise ValueError(
                 "--enable-encoder-swa-bounded-replay requires DeepSeek-V4.1"
@@ -329,6 +362,93 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
                 raise ValueError(
                     f"--enable-encoder-swa-bounded-replay does not support {feature} yet"
                 )
+
+    if cfg.dsv41_encoder_only_prefill:
+        hf_config = model_config_of(server_args).hf_config
+        if getattr(hf_config, "vision_n_layers", 0) > 0 and not getattr(
+            hf_config, "language_model_only", False
+        ):
+            raise ValueError(
+                "--dsv41-encoder-only-prefill currently requires a text-only "
+                "configuration; image inputs are not supported in this mode"
+            )
+        if getattr(hf_config, "window_size", None) != DSV41_REPLAY_WINDOW:
+            raise ValueError(
+                "--dsv41-encoder-only-prefill requires "
+                f"window_size={DSV41_REPLAY_WINDOW}"
+            )
+        if cfg.disaggregation_mode not in ("prefill", "decode"):
+            raise ValueError(
+                "--dsv41-encoder-only-prefill requires --disaggregation-mode "
+                "prefill or decode"
+            )
+        if cfg.disaggregation_transfer_backend != "mooncake":
+            raise ValueError("--dsv41-encoder-only-prefill currently requires Mooncake")
+        if not getattr(hf_config, "hc_pre_from_prev_sublayer", False):
+            raise ValueError(
+                "--dsv41-encoder-only-prefill requires the official shifted "
+                "mHC pre-from-previous-sublayer topology"
+            )
+        kv_sources = tuple(getattr(hf_config, "kv_source_layer_ids", ()) or ())
+        index_sources = tuple(getattr(hf_config, "index_source_layer_ids", ()) or ())
+        engram_layers = tuple(getattr(hf_config, "engram_layer_ids", ()) or ())
+        if (
+            getattr(hf_config, "num_hidden_layers", None) != 40
+            or kv_sources != (2, 8, 14, 20)
+            or not set(kv_sources).issubset(index_sources)
+        ):
+            raise ValueError(
+                "--dsv41-encoder-only-prefill requires the official 40-layer "
+                "DeepSeek-V4.1 topology with kv_source_layer_ids=[2,8,14,20] "
+                "and an Indexer-K producer for every source"
+            )
+        if 20 in engram_layers:
+            raise ValueError(
+                "--dsv41-encoder-only-prefill boundary layer 20 cannot be an "
+                "Engram layer"
+            )
+        _validate_dsv41_encoder_only_ratio_layout(hf_config)
+        incompatible = (
+            ("hardware other than CUDA", not get_platform().is_cuda),
+            ("pipeline parallelism", cfg.pp_size != 1),
+            ("data parallelism", cfg.dp_size != 1),
+            ("context parallelism", cfg.attn_cp_size != 1 or cfg.dcp_size != 1),
+            ("prefill context parallelism", cfg.enable_prefill_cp),
+            ("two-batch overlap", cfg.enable_two_batch_overlap),
+            ("mixed prefill/decode", cfg.enable_mixed_chunk),
+            ("LoRA", cfg.enable_lora),
+            ("external cache linker", cfg.enable_unified_cache_external_linker),
+            ("unified memory", cfg.enable_unified_memory),
+            ("radix sessions", cfg.enable_session_radix_cache),
+            ("KV checksum", cfg.disaggregation_enable_kv_checksum),
+            ("encoder SWA bounded replay", cfg.enable_encoder_swa_bounded_replay),
+            ("TRT-LLM attention", cfg.dsv4_attn_backend == "trtllm"),
+            (
+                "speculative decoding except Decode-local DSpark",
+                cfg.speculative_algorithm is not None
+                and not (
+                    cfg.disaggregation_mode == "decode"
+                    and str(cfg.speculative_algorithm).upper() == "DSPARK"
+                ),
+            ),
+        )
+        for feature, enabled in incompatible:
+            if enabled:
+                raise ValueError(
+                    "--dsv41-encoder-only-prefill does not support " + feature
+                )
+
+        if cfg.cuda_graph_config.prefill.backend != Backend.DISABLED:
+            raise ValueError(
+                "--dsv41-encoder-only-prefill requires prefill CUDA graphs "
+                "to be disabled"
+            )
+        if cfg.disaggregation_mode == "decode":
+            declare_resolution(
+                server_args,
+                "validate_deepseek_v41_features",
+                enable_decoder_swa_bounded_replay=True,
+            )
 
     unsupported = (
         (
