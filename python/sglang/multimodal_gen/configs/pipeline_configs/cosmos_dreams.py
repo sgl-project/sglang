@@ -13,8 +13,11 @@ from typing import Any
 
 from sglang.multimodal_gen.configs.models.dits.cosmos_dreams import (
     ACTION_CONDITIONING_MODE,
+    HISTORY_MODE_FULL,
+    CosmosDreamsInferenceProfile,
     CosmosDreamsManifest,
     load_cosmos_dreams_manifest,
+    resolve_inference_profile,
 )
 from sglang.multimodal_gen.configs.pipeline_configs.cosmos3 import (
     Cosmos3Config,
@@ -26,6 +29,9 @@ from sglang.multimodal_gen.configs.pipeline_configs.model_deployment_config impo
 
 # Deployment default from the reference Cosmos-Dreams deployment: 720x1280.
 COSMOS_DREAMS_MAX_PIXELS = 921_600
+# Training rolled out whole 900-frame clips with an unbounded K/V cache; 901
+# pixel frames (1 + 4 * 225) cover them at the 4x temporal compression.
+COSMOS_DREAMS_HISTORY_MAX_FRAMES = 901
 
 
 @dataclass
@@ -52,12 +58,35 @@ class CosmosDreamsConfig(Cosmos3Config):
     chunk_size: int = 4
     temporal_compression_factor: int = 4
 
+    # Sigma schedule per chunk, picked by the chunk's first latent frame (the last entry
+    # repeats). None applies the step42 budget the checkpoints were distilled with: every
+    # artifact sigma for a chunk starting at latent frame 0, sigmas 0 and 2 afterwards. Override
+    # with --pipeline-config-path JSON, e.g. [[1.0, 0.9375, 0.8333, 0.625]] for four steps everywhere.
+    frame_sigma_schedules: list[list[float]] | None = None
+    # "full" keeps the K/V of the first history_max_frames pixel frames like training over
+    # whole clips; "sliding" evicts beyond the artifact's window_frames (an exporter default).
+    history_mode: str = HISTORY_MODE_FULL
+    history_max_frames: int = COSMOS_DREAMS_HISTORY_MAX_FRAMES
+
     def update_config_from_dict(self, args, prefix: str = "") -> None:
         super().update_config_from_dict(args, prefix)
         if self.model_path:
             manifest = self._validate_checkpoint(self.model_path)
             self.chunk_size = manifest.chunk_size
             self.temporal_compression_factor = manifest.temporal_compression_factor
+            # Surface bad deployment settings in the launcher, before weights load.
+            self.inference_profile(manifest)
+
+    def inference_profile(
+        self, manifest: CosmosDreamsManifest
+    ) -> CosmosDreamsInferenceProfile:
+        """Rollout schedule and history settings the stages run with."""
+        return resolve_inference_profile(
+            manifest,
+            frame_sigma_schedules=self.frame_sigma_schedules,
+            history_mode=self.history_mode,
+            history_max_frames=self.history_max_frames,
+        )
 
     def adjust_num_frames(self, num_frames: int, *, log_adjustment: bool = True) -> int:
         # Latent frame 0 is the conditioning image, so the smallest video is one

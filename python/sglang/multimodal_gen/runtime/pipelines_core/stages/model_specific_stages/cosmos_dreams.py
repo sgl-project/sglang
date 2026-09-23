@@ -23,6 +23,7 @@ import torch.nn.functional as F
 from sglang.multimodal_gen.configs.models.dits.cosmos_dreams import (
     TEXT_TOKENS_TRAINING_MAX,
     AffineTransform,
+    CosmosDreamsInferenceProfile,
     CosmosDreamsManifest,
     EmbodimentContract,
 )
@@ -964,6 +965,7 @@ class CosmosDreamsRolloutStage(PipelineStage):
         transformer: CosmosDreamsTransformer,
         scheduler: FlowMatchEulerDiscreteScheduler,
         manifest: CosmosDreamsManifest,
+        profile: CosmosDreamsInferenceProfile | None = None,
     ) -> None:
         super().__init__()
         if not isinstance(transformer, CosmosDreamsTransformer):
@@ -973,6 +975,14 @@ class CosmosDreamsRolloutStage(PipelineStage):
         self.transformer = transformer
         self.scheduler = validate_fixed_step_scheduler(scheduler, manifest)
         self.manifest = manifest
+        # Without a resolved profile the stage runs the artifact as exported:
+        # its t_list on every chunk and its K/V window.
+        self.profile = profile or CosmosDreamsInferenceProfile(
+            frame_sigma_schedules=(tuple(manifest.t_list),),
+            window_frames=manifest.window_frames,
+            sink_frames=manifest.sink_frames,
+            history_mode="sliding",
+        )
 
     def verify_input(self, batch: Req, server_args: ServerArgs) -> VerificationResult:
         result = VerificationResult()
@@ -1031,6 +1041,12 @@ class CosmosDreamsRolloutStage(PipelineStage):
                 f"Cosmos-Dreams requires a single integer seed, got {seed!r}."
             )
 
+        if target_frame - 1 > self.profile.window_frames:
+            self.log_info(
+                f"Rollout of {target_frame} latent frames exceeds the {self.profile.history_mode} "
+                f"history of {self.profile.window_frames} frames; the oldest committed frames "
+                "are evicted from the K/V history once it fills."
+            )
         history: list[KVPair] | None = None
         latents: list[torch.Tensor] = []
         next_frame = 0
@@ -1096,7 +1112,8 @@ class CosmosDreamsRolloutStage(PipelineStage):
                 )
             latents.append(clean_chunk)
             self.log_info(
-                f"Committed latent frames [{chunk_start}, {chunk_end}) of {target_frame}"
+                f"Committed latent frames [{chunk_start}, {chunk_end}) of {target_frame} "
+                f"({len(self.profile.sigmas_for_frame(chunk_start))} denoise steps)"
             )
         return torch.cat(latents, dim=2)
 
@@ -1128,12 +1145,12 @@ class CosmosDreamsRolloutStage(PipelineStage):
         action: torch.Tensor,
         null_indexes: tuple[int, ...],
     ) -> torch.Tensor:
-        """Four fixed-step SDE updates; history K/V is read but never written."""
+        """Fixed-step SDE updates over the chunk's schedule; history K/V is read but never written."""
         return run_fixed_step_sde(
             self.transformer,
             self.scheduler,
             initial_noise,
-            t_list=self.manifest.t_list,
+            t_list=self.profile.sigmas_for_frame(frame_start),
             seed=seed,
             frame_start=frame_start,
             dtype=context.dtype,
@@ -1162,8 +1179,8 @@ class CosmosDreamsRolloutStage(PipelineStage):
             history=history,
             dtype=context.dtype,
             tokens_per_frame=context.tokens_per_frame,
-            sink_frames=self.manifest.sink_frames,
-            window_frames=self.manifest.window_frames,
+            sink_frames=self.profile.sink_frames,
+            window_frames=self.profile.window_frames,
             text_kv=context.text_kv,
             frame_start=frame_idx,
             fps=context.fps,

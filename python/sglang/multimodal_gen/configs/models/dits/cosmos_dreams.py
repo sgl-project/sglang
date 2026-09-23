@@ -15,12 +15,16 @@ import hashlib
 import json
 import math
 import struct
+from collections.abc import Sequence
 from typing import Any
 
 import msgspec
 
 COSMOS_DREAMS_SCHEMA_VERSION = 1
 ACTION_CONTRACT_SCHEMA_VERSION = 3
+HISTORY_MODE_FULL = "full"
+HISTORY_MODE_SLIDING = "sliding"
+HISTORY_MODES = (HISTORY_MODE_FULL, HISTORY_MODE_SLIDING)
 ACTION_CONDITIONING_MODE = "action"
 CONTROL_VIDEO_CONDITIONING_MODE = "control_video"
 TRANSFER_HINTS = ("edge", "blur", "depth", "seg")
@@ -572,3 +576,128 @@ def load_cosmos_dreams_manifest(
             f"has keys {sorted(transformer_config)}."
         )
     return parse_cosmos_dreams_manifest(artifact)
+
+
+class CosmosDreamsInferenceProfile(msgspec.Struct, frozen=True):
+    """Rollout settings resolved from the artifact plus deployment overrides.
+
+    The exporter fills ``window_frames`` with a default when training set no KV
+    window and never records a per-frame step budget, so both are deployment settings.
+    """
+
+    # Sigma schedule of the chunk whose first latent frame is the index; the
+    # last entry repeats for later chunks.
+    frame_sigma_schedules: tuple[tuple[float, ...], ...]
+    # Latest latent frames of committed K/V kept after the sink frames.
+    window_frames: int
+    sink_frames: int
+    history_mode: str
+
+    def sigmas_for_frame(self, frame_idx: int) -> tuple[float, ...]:
+        if frame_idx < 0:
+            raise ValueError(f"frame_idx must be non-negative, got {frame_idx}.")
+        schedules = self.frame_sigma_schedules
+        return schedules[min(frame_idx, len(schedules) - 1)]
+
+    @property
+    def max_steps(self) -> int:
+        return max(len(schedule) for schedule in self.frame_sigma_schedules)
+
+
+def default_frame_sigma_schedules(
+    t_list: Sequence[float],
+) -> tuple[tuple[float, ...], ...]:
+    """The self-forcing "step42" budget the Sim-Bimanual checkpoints were distilled with:
+    every ``t_list`` entry for a chunk starting at latent frame 0, then two steps
+    (``t_list[0]`` and ``t_list[2]``) for every later chunk."""
+    sigmas = tuple(float(value) for value in t_list)
+    if len(sigmas) < 3:
+        return (sigmas,)
+    return (sigmas, (sigmas[0], sigmas[2]))
+
+
+def _validate_sigma_schedule(
+    schedule: Any, index: int, t_list: Sequence[float]
+) -> tuple[float, ...]:
+    if not isinstance(schedule, (list, tuple)) or not schedule:
+        raise ValueError(
+            f"Cosmos-Dreams frame_sigma_schedules[{index}] must be a non-empty list of sigmas."
+        )
+    sigmas: list[float] = []
+    for value in schedule:
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError(
+                f"Cosmos-Dreams frame_sigma_schedules[{index}] must contain numbers, got {value!r}."
+            )
+        sigma = float(value)
+        if not math.isfinite(sigma) or not 0.0 < sigma <= 1.0:
+            raise ValueError(
+                f"Cosmos-Dreams frame_sigma_schedules[{index}] entries must lie in (0, 1], got {sigma}."
+            )
+        # A distilled fixed-step model only saw the artifact's timesteps.
+        if not any(abs(sigma - trained) <= 1e-6 for trained in t_list):
+            raise ValueError(
+                f"Cosmos-Dreams frame_sigma_schedules[{index}] sigma {sigma} is not in the "
+                f"artifact's distilled t_list {list(t_list)}."
+            )
+        sigmas.append(sigma)
+    if abs(sigmas[0] - 1.0) > 1e-6:
+        raise ValueError(
+            f"Cosmos-Dreams frame_sigma_schedules[{index}] must start at 1.0, got {sigmas[0]}."
+        )
+    if any(left <= right for left, right in zip(sigmas, sigmas[1:])):
+        raise ValueError(
+            f"Cosmos-Dreams frame_sigma_schedules[{index}] must be strictly descending, got {sigmas}."
+        )
+    return tuple(sigmas)
+
+
+def resolve_inference_profile(
+    manifest: CosmosDreamsManifest,
+    *,
+    frame_sigma_schedules: Any = None,
+    history_mode: str = HISTORY_MODE_FULL,
+    history_max_frames: int,
+) -> CosmosDreamsInferenceProfile:
+    """Resolve ``frame_sigma_schedules`` (None: the step42 budget derived from the artifact's
+    t_list) and the history length (``full``: the first ``history_max_frames`` pixel frames;
+    ``sliding``: the artifact's ``window_frames``) into one validated profile."""
+    if frame_sigma_schedules is None:
+        schedules = default_frame_sigma_schedules(manifest.t_list)
+    else:
+        if (
+            not isinstance(frame_sigma_schedules, (list, tuple))
+            or not frame_sigma_schedules
+        ):
+            raise ValueError(
+                "Cosmos-Dreams frame_sigma_schedules must be a non-empty list of sigma lists."
+            )
+        schedules = tuple(
+            _validate_sigma_schedule(schedule, index, manifest.t_list)
+            for index, schedule in enumerate(frame_sigma_schedules)
+        )
+    if history_mode not in HISTORY_MODES:
+        raise ValueError(
+            f"Cosmos-Dreams history_mode must be one of {HISTORY_MODES}, got {history_mode!r}."
+        )
+    if history_mode == HISTORY_MODE_FULL:
+        factor = manifest.temporal_compression_factor
+        if (
+            isinstance(history_max_frames, bool)
+            or not isinstance(history_max_frames, int)
+            or history_max_frames <= 1
+            or (history_max_frames - 1) % factor
+        ):
+            raise ValueError(
+                "Cosmos-Dreams history_max_frames must be 1 + "
+                f"{factor} * N pixel frames, got {history_max_frames!r}."
+            )
+        window_frames = (history_max_frames - 1) // factor + 1
+    else:
+        window_frames = manifest.window_frames
+    return CosmosDreamsInferenceProfile(
+        frame_sigma_schedules=schedules,
+        window_frames=window_frames,
+        sink_frames=manifest.sink_frames,
+        history_mode=history_mode,
+    )

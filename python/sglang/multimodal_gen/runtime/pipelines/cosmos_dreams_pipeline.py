@@ -69,21 +69,26 @@ class CosmosDreamsPipeline(ComposedPipelineBase):
                 max_pixels=pipeline_config.max_pixels,
             )
         )
+        profile = pipeline_config.inference_profile(manifest)
         self.add_stage(
             CosmosDreamsRolloutStage(
                 transformer=transformer,
                 scheduler=self.get_module("scheduler"),
                 manifest=manifest,
+                profile=profile,
             )
         )
         self.add_stage(
             Cosmos3DecodingStage(vae, guardrails=False, sound_tokenizer=None)
         )
         logger.info(
-            "Cosmos-Dreams pipeline stages created (checkpoint %s, chunk_size=%d, window=%d frames)",
+            "Cosmos-Dreams pipeline stages created (checkpoint %s, chunk_size=%d, "
+            "denoise steps per chunk %s, %s history of %d latent frames)",
             manifest.checkpoint_id,
             manifest.chunk_size,
-            manifest.window_frames,
+            [len(schedule) for schedule in profile.frame_sigma_schedules],
+            profile.history_mode,
+            profile.window_frames,
         )
 
 

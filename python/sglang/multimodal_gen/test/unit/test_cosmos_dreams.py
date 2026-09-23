@@ -21,6 +21,7 @@ from sglang.multimodal_gen.configs.models.dits.cosmos_dreams import (
     float32_value,
     load_cosmos_dreams_manifest,
     parse_cosmos_dreams_manifest,
+    resolve_inference_profile,
 )
 from sglang.multimodal_gen.configs.pipeline_configs.cosmos3 import Cosmos3Config
 from sglang.multimodal_gen.configs.pipeline_configs.cosmos_dreams import (
@@ -669,6 +670,98 @@ class TestCosmosDreamsKVHistory(unittest.TestCase):
                 sink_frames=0,
                 window_frames=3,
             )
+
+
+class TestCosmosDreamsInferenceProfile(unittest.TestCase):
+    """Per-chunk sigma schedules and history length are deployment settings the
+    artifact does not carry; the defaults must not change the exported rollout
+    except for keeping the whole-clip history training used."""
+
+    STEP42 = [[1.0, 0.9375, 0.8333333333333334, 0.625], [1.0, 0.8333333333333334]]
+
+    def test_defaults_apply_the_step42_budget_with_full_history(self):
+        profile = CosmosDreamsConfig().inference_profile(MANIFEST)
+        t_list = tuple(MANIFEST.t_list)
+        self.assertEqual(
+            profile.frame_sigma_schedules, (t_list, (t_list[0], t_list[2]))
+        )
+        self.assertEqual(profile.sigmas_for_frame(0), t_list)
+        for frame in (1, 7, 500):
+            self.assertEqual(profile.sigmas_for_frame(frame), (1.0, 0.8333333333333334))
+        # 901 pixel frames = 226 latent frames: a whole training clip fits.
+        self.assertEqual(profile.history_mode, "full")
+        self.assertEqual(profile.window_frames, 226)
+        self.assertEqual(profile.sink_frames, MANIFEST.sink_frames)
+        self.assertEqual(profile.max_steps, 4)
+
+    def test_artifact_schedule_on_every_chunk_is_an_explicit_override(self):
+        config = CosmosDreamsConfig()
+        config.update_pipeline_config(
+            {"frame_sigma_schedules": [list(MANIFEST.t_list)]}
+        )
+        profile = config.inference_profile(MANIFEST)
+        for frame in (0, 1, 9):
+            self.assertEqual(profile.sigmas_for_frame(frame), tuple(MANIFEST.t_list))
+        self.assertEqual(profile.max_steps, 4)
+
+    def test_per_frame_schedules_select_by_chunk_start(self):
+        config = CosmosDreamsConfig()
+        # The same shape a --pipeline-config-path JSON file takes.
+        config.update_pipeline_config(
+            {"frame_sigma_schedules": self.STEP42, "history_mode": "sliding"}
+        )
+        profile = config.inference_profile(MANIFEST)
+        self.assertEqual(len(profile.sigmas_for_frame(0)), 4)
+        for frame in (1, 2, 3, 225):
+            self.assertEqual(profile.sigmas_for_frame(frame), (1.0, 0.8333333333333334))
+        self.assertEqual(profile.max_steps, 4)
+        self.assertEqual(profile.window_frames, MANIFEST.window_frames)
+        self.assertEqual(profile.history_mode, "sliding")
+        with self.assertRaises(ValueError):
+            profile.sigmas_for_frame(-1)
+
+    def test_realtime_config_shares_the_profile_fields(self):
+        config = CosmosDreamsRealtimeConfig()
+        config.update_pipeline_config({"history_max_frames": 33})
+        self.assertEqual(config.inference_profile(MANIFEST).window_frames, 9)
+
+    def test_rejects_malformed_schedules_and_history_settings(self):
+        bad_schedules = [
+            [],
+            [[]],
+            [[0.9, 0.5]],
+            [[1.0, 0.625, 0.625]],
+            [[1.0, 1.5]],
+            [[1.0, 0.0]],
+            [[1.0, True]],
+            [[1.0, 0.7]],
+            [[1.0, 0.625, 0.9375]],
+            "1.0, 0.5",
+        ]
+        for schedules in bad_schedules:
+            with self.subTest(schedules=schedules), self.assertRaises(ValueError):
+                resolve_inference_profile(
+                    MANIFEST, frame_sigma_schedules=schedules, history_max_frames=901
+                )
+        with self.assertRaisesRegex(ValueError, "history_mode"):
+            resolve_inference_profile(
+                MANIFEST, history_mode="window", history_max_frames=901
+            )
+        for frames in (0, 1, 900, True, 5.0):
+            with (
+                self.subTest(frames=frames),
+                self.assertRaisesRegex(ValueError, "history_max_frames"),
+            ):
+                resolve_inference_profile(MANIFEST, history_max_frames=frames)
+        with self.assertRaisesRegex(ValueError, "not in the artifact"):
+            resolve_inference_profile(
+                MANIFEST, frame_sigma_schedules=[[1.0, 0.7]], history_max_frames=901
+            )
+        # Sliding mode ignores the cap entirely.
+        profile = resolve_inference_profile(
+            MANIFEST, history_mode="sliding", history_max_frames=900
+        )
+        self.assertEqual(profile.window_frames, MANIFEST.window_frames)
 
 
 class TestCosmosDreamsRegistry(unittest.TestCase):
