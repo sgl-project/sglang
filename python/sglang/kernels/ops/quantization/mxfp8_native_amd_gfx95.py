@@ -44,13 +44,13 @@ class GemvConfig:
     steps: int = 1  # 128-K steps in flight per wave: 1, 2, 4
     rows: int = 16  # weight rows per wave tile: 16, 32
     tokens: int = 16  # token columns per wave tile: 16, 32 (M <= tokens)
-    ksplit: bool = True  # waves split K and reduce through LDS; else one tile per wave
 
     @staticmethod
     def parse(key: str) -> GemvConfig:
-        m = re.fullmatch(r"w(\d+)s(\d+)r(\d+)t(\d+)([kn])", key)
+        # the trailing k: the waves split K and reduce through LDS (the only regime)
+        m = re.fullmatch(r"w(\d+)s(\d+)r(\d+)t(\d+)k", key)
         assert m, key
-        return GemvConfig(int(m[1]), int(m[2]), int(m[3]), int(m[4]), m[5] == "k")
+        return GemvConfig(int(m[1]), int(m[2]), int(m[3]), int(m[4]))
 
     def valid_for(self, m: int, n: int) -> bool:
         return (
@@ -67,8 +67,8 @@ def default_config(m: int, k: int) -> GemvConfig:
     """Heuristic for shapes without a tuned row."""
     tokens = 16 if m <= 16 else 32
     if k // _STEP_K > 40:
-        return GemvConfig(4, 2, 16, tokens, True)
-    return GemvConfig(8, 1, 16, tokens, True)
+        return GemvConfig(4, 2, 16, tokens)
+    return GemvConfig(8, 1, 16, tokens)
 
 
 def m_bucket(m: int) -> int:
@@ -120,7 +120,7 @@ def _select_config(bucket: int, n: int, k: int) -> GemvConfig:
 
 @cache_once
 def _jit_mxfp8_gemv_module(cfg: GemvConfig, x_bf16: bool):
-    args = make_cpp_args(cfg.waves, cfg.steps, cfg.rows, cfg.tokens, cfg.ksplit, x_bf16)
+    args = make_cpp_args(cfg.waves, cfg.steps, cfg.rows, cfg.tokens, x_bf16)
     return load_jit(
         "dpsk_v4_mxfp8_gemv_gfx95",
         *args,

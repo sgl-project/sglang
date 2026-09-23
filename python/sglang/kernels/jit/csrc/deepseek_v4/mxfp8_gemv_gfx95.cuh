@@ -97,8 +97,8 @@ __device__ __forceinline__ int ue8m0_of_amax(float amax) {
 #endif  // __gfx950__
 
 // Knobs swept offline into mxfp8_gemv_gfx95_configs.json: WAVES per workgroup, STEPS 128-K steps
-// in flight, ROWS / TOKENS per wave tile (16 or 32), KSPLIT (waves split K and reduce through LDS).
-template <int WAVES, int STEPS, int ROWS, int TOKENS, bool KSPLIT, bool X_BF16>
+// in flight, ROWS / TOKENS per wave tile (16 or 32); the waves split K and reduce through LDS.
+template <int WAVES, int STEPS, int ROWS, int TOKENS, bool X_BF16>
 __global__ void __launch_bounds__(WAVES * 64) mxfp8_gemv_kernel(
     const uint8_t* __restrict__ W,   // [N/16, K/128, 2048] fp8 e4m3 in MFMA lane order
     const uint8_t* __restrict__ WS,  // [N/32, K/32] ue8m0 (the checkpoint's 32x32 block scales)
@@ -113,8 +113,7 @@ __global__ void __launch_bounds__(WAVES * 64) mxfp8_gemv_kernel(
   static_assert(TOKENS == 16 || TOKENS == 32, "TOKENS must be 16 or 32");
   constexpr int AT = ROWS / kTileN;    // 16-row A tiles per wave tile
   constexpr int BT = TOKENS / kTileN;  // 16-token B tiles per wave tile
-  constexpr int RED_WAVES = KSPLIT ? WAVES : 1;
-  __shared__ float red[RED_WAVES][AT][BT][kTileN][kTileN];
+  __shared__ float red[WAVES][AT][BT][kTileN][kTileN];
 
   const int tid = threadIdx.x;
   const int wave = tid >> 6;
@@ -122,21 +121,13 @@ __global__ void __launch_bounds__(WAVES * 64) mxfp8_gemv_kernel(
   const int row_in_tile = lane & 15;
   const int g = lane >> 4;
   const int nsteps = K / kStepK;
-  // The wave's first 16-row tile and its K range in 128-steps.
-  int tile, w_step0, w_step1;
-  if constexpr (KSPLIT) {
-    tile = blockIdx.x * AT;
-    const int steps_per_wave = (nsteps + WAVES - 1) / WAVES;
-    w_step0 = wave * steps_per_wave;
-    w_step1 = min(nsteps, w_step0 + steps_per_wave);
-  } else {
-    tile = (blockIdx.x * WAVES + wave) * AT;
-    w_step0 = 0;
-    w_step1 = nsteps;
-  }
+  // The block's first 16-row tile (the grid covers N exactly) and this wave's K range in 128-steps.
+  const int tile = blockIdx.x * AT;
+  const int steps_per_wave = (nsteps + WAVES - 1) / WAVES;
+  const int w_step0 = wave * steps_per_wave;
+  const int w_step1 = min(nsteps, w_step0 + steps_per_wave);
   const int n = tile * kTileN + row_in_tile;
   const int KS = K >> 5;
-  const bool tile_valid = n < N;  // KSPLIT == false: waves past the last tile idle
 
   const uint8_t* wtile = W + static_cast<size_t>(tile) * nsteps * kStepBytes + lane * kLaneBytes;
   const size_t a2_off = static_cast<size_t>(nsteps) * kStepBytes;  // the next 16-row tile
@@ -240,51 +231,34 @@ __global__ void __launch_bounds__(WAVES * 64) mxfp8_gemv_kernel(
     }
   };
 
-  if (tile_valid) {
-    int step = w_step0;
-    for (; step + STEPS <= w_step1; step += STEPS)
-      do_steps(step, std::integral_constant<int, STEPS>{});
-    for (; step < w_step1; ++step)
-      do_steps(step, std::integral_constant<int, 1>{});
-  }
+  int step = w_step0;
+  for (; step + STEPS <= w_step1; step += STEPS)
+    do_steps(step, std::integral_constant<int, STEPS>{});
+  for (; step < w_step1; ++step)
+    do_steps(step, std::integral_constant<int, 1>{});
 
   // acc[t][b][r] = D[row 4g + r of A tile t][token lane % 16 of B tile b].
-  if constexpr (KSPLIT) {
-    // -> LDS, then a fixed-order sum over the waves, 256 threads per (A tile, B tile).
+  // -> LDS, then a fixed-order sum over the waves, 256 threads per (A tile, B tile).
 #pragma unroll
-    for (int t = 0; t < AT; ++t)
+  for (int t = 0; t < AT; ++t)
 #pragma unroll
-      for (int b = 0; b < BT; ++b)
+    for (int b = 0; b < BT; ++b)
 #pragma unroll
-        for (int r = 0; r < 4; ++r)
-          red[wave][t][b][4 * g + r][row_in_tile] = acc[t][b][r];
-    __syncthreads();
-    for (int e = tid; e < AT * BT * kTileN * kTileN; e += WAVES * 64) {
-      const int t = e >> 8 >> (BT - 1);  // (t, b) from the 256-entry tile index
-      const int b = (e >> 8) & (BT - 1);
-      const int i = (e >> 4) & 15;  // row within the tile
-      const int j = e & 15;         // token within the B tile
-      const int tok = j + 16 * b;
-      if (tok >= M) continue;
-      float v = red[0][t][b][i][j];
+      for (int r = 0; r < 4; ++r)
+        red[wave][t][b][4 * g + r][row_in_tile] = acc[t][b][r];
+  __syncthreads();
+  for (int e = tid; e < AT * BT * kTileN * kTileN; e += WAVES * 64) {
+    const int t = e >> 8 >> (BT - 1);  // (t, b) from the 256-entry tile index
+    const int b = (e >> 8) & (BT - 1);
+    const int i = (e >> 4) & 15;  // row within the tile
+    const int j = e & 15;         // token within the B tile
+    const int tok = j + 16 * b;
+    if (tok >= M) continue;
+    float v = red[0][t][b][i][j];
 #pragma unroll
-      for (int w = 1; w < WAVES; ++w)
-        v += red[w][t][b][i][j];
-      out[static_cast<size_t>(tok) * N + (tile + t) * kTileN + i] = f32_to_bf16_rne(v);
-    }
-  } else {
-    // Each lane stores its own four rows of its token columns.
-    if (!tile_valid) return;
-#pragma unroll
-    for (int b = 0; b < BT; ++b) {
-      const int tok = row_in_tile + 16 * b;
-      if (tok >= M) continue;
-#pragma unroll
-      for (int t = 0; t < AT; ++t)
-#pragma unroll
-        for (int r = 0; r < 4; ++r)
-          out[static_cast<size_t>(tok) * N + (tile + t) * kTileN + 4 * g + r] = f32_to_bf16_rne(acc[t][b][r]);
-    }
+    for (int w = 1; w < WAVES; ++w)
+      v += red[w][t][b][i][j];
+    out[static_cast<size_t>(tok) * N + (tile + t) * kTileN + i] = f32_to_bf16_rne(v);
   }
 #elif defined(__HIP_DEVICE_COMPILE__)
 // the JIT compiles one --offload-arch; an empty body here would launch and return `out` unwritten
@@ -294,8 +268,8 @@ __global__ void __launch_bounds__(WAVES * 64) mxfp8_gemv_kernel(
 
 }  // namespace mxfp8_gemv
 
-// WAVES {4, 8, 16}, STEPS {1, 2, 4}, ROWS / TOKENS {16, 32}; KSPLIT and X_BF16 as above.
-template <int WAVES, int STEPS, int ROWS, int TOKENS, bool KSPLIT, bool X_BF16>
+// WAVES {4, 8, 16}, STEPS {1, 2, 4}, ROWS / TOKENS {16, 32}; X_BF16 as above.
+template <int WAVES, int STEPS, int ROWS, int TOKENS, bool X_BF16>
 struct Mxfp8GemvGfx950Kernel {
   static void
   run(tvm::ffi::TensorView weight,
@@ -342,10 +316,9 @@ struct Mxfp8GemvGfx950Kernel {
         "mxfp8_gemv: weight_scale must be ue8m0 [N/32, K/32]");
 
     const uint8_t* xs_ptr = X_BF16 ? nullptr : static_cast<const uint8_t*>(x_scale.data_ptr());
-    const int tiles = static_cast<int>(N / ROWS);
-    const int grid = KSPLIT ? tiles : (tiles + WAVES - 1) / WAVES;
+    const int grid = static_cast<int>(N / ROWS);
     host::LaunchKernel(dim3(grid), dim3(WAVES * 64), device.unwrap())(
-        mxfp8_gemv_kernel<WAVES, STEPS, ROWS, TOKENS, KSPLIT, X_BF16>,
+        mxfp8_gemv_kernel<WAVES, STEPS, ROWS, TOKENS, X_BF16>,
         static_cast<const uint8_t*>(weight.data_ptr()),
         static_cast<const uint8_t*>(weight_scale.data_ptr()),
         static_cast<const uint8_t*>(x.data_ptr()),
