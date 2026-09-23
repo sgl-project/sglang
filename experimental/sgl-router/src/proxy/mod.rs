@@ -431,9 +431,23 @@ mod tests {
     use axum::Router;
     use reqwest::StatusCode;
     use std::num::NonZeroU32;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
     use tokio::net::TcpListener;
     use tokio::sync::oneshot;
+
+    /// Threshold used by the interleaving tests. Pinned rather than inherited
+    /// from `CircuitBreakerConfig::default()` because those tests assert on an
+    /// exact streak length, so a change to the default must not silently move
+    /// the trip point out from under them.
+    const STREAK_THRESHOLD: u32 = 3;
+
+    fn breaker_with_threshold(threshold: u32) -> CircuitBreaker {
+        CircuitBreaker::with_config(CircuitBreakerConfig {
+            threshold: NonZeroU32::new(threshold).unwrap(),
+            cool_down: Duration::from_secs(30),
+        })
+    }
 
     #[tokio::test]
     async fn new_returns_result_not_panic() {
@@ -533,6 +547,44 @@ mod tests {
         ] {
             assert_eq!(breaker_outcome(s), BreakerOutcome::Success, "{s}");
         }
+    }
+
+    /// A fake upstream that answers POSTs with a scripted sequence of statuses,
+    /// repeating the last entry once the script runs out.
+    ///
+    /// A fixed-status worker cannot express the case that separates
+    /// `record_backpressure` from `record_success`: a worker *interleaving*
+    /// genuine faults with backpressure. That interleaving is the whole reason
+    /// the Neutral disposition is a third verb rather than an alias for
+    /// success, so it needs a worker that can change its answer.
+    async fn spawn_scripted_worker(statuses: &[u16]) -> (String, oneshot::Sender<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let codes: Vec<StatusCode> = statuses
+            .iter()
+            .map(|s| StatusCode::from_u16(*s).unwrap())
+            .collect();
+        let next = Arc::new(AtomicUsize::new(0));
+        let app = Router::new().route(
+            "/v1/chat/completions",
+            post(move || {
+                let codes = codes.clone();
+                let next = Arc::clone(&next);
+                async move {
+                    let i = next.fetch_add(1, Ordering::SeqCst);
+                    (codes[i.min(codes.len() - 1)], "{\"error\":\"x\"}")
+                }
+            }),
+        );
+        let (tx, rx) = oneshot::channel::<()>();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app)
+                .with_graceful_shutdown(async move {
+                    let _ = rx.await;
+                })
+                .await;
+        });
+        (format!("http://127.0.0.1:{port}"), tx)
     }
 
     /// A fake upstream that answers every POST with a fixed status + tiny body.
@@ -856,5 +908,181 @@ mod tests {
                 "iter {i}: streaming 503 must leave the breaker Closed",
             );
         }
+    }
+
+    /// The property that makes Neutral a distinct verb rather than an alias for
+    /// success: a backpressure answer must not *reset* an in-progress failure
+    /// streak, so a worker interleaving genuine faults with 503s still trips.
+    ///
+    /// Asserting only "a 503 leaves the breaker Closed" cannot see this —
+    /// `record_success` satisfies that too. Driving the streak across the
+    /// backpressure answer is what separates them, and it exercises the
+    /// classification *through the dispatch site* rather than on the breaker
+    /// alone.
+    async fn assert_backpressure_preserves_streak_json(backpressure: u16) {
+        // threshold-1 faults, then backpressure, then one more fault.
+        let (url, _shutdown) = spawn_scripted_worker(&[500, 500, backpressure, 500]).await;
+        let proxy = Proxy::new(Duration::from_secs(5)).unwrap();
+        let breaker = breaker_with_threshold(STREAK_THRESHOLD);
+        let headers = HeaderMap::new();
+
+        let dispatch = async |breaker: &CircuitBreaker| {
+            proxy
+                .forward_json_to(
+                    &url,
+                    WireProtocol::Http1,
+                    breaker,
+                    "/v1/chat/completions",
+                    &headers,
+                    Bytes::from_static(b"{}"),
+                )
+                .await
+                .expect("dispatch should reach the worker")
+                .status()
+        };
+
+        for i in 0..STREAK_THRESHOLD - 1 {
+            assert_eq!(dispatch(&breaker).await, StatusCode::INTERNAL_SERVER_ERROR);
+            assert_eq!(
+                breaker.snapshot().state_code,
+                0,
+                "fault {} of {STREAK_THRESHOLD} is below threshold, still Closed",
+                i + 1,
+            );
+        }
+
+        let bp = dispatch(&breaker).await;
+        assert_eq!(
+            bp.as_u16(),
+            backpressure,
+            "the scripted backpressure answer"
+        );
+        assert_eq!(
+            breaker.snapshot().state_code,
+            0,
+            "{backpressure} must not open the breaker on its own",
+        );
+
+        // The decisive assertion. If the dispatch site had recorded this as a
+        // success, the streak would have been wiped and this final fault would
+        // be #1 of 3 — leaving the breaker Closed.
+        assert_eq!(dispatch(&breaker).await, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            breaker.snapshot().state_code,
+            1,
+            "{backpressure} must not reset the failure streak: \
+             the {STREAK_THRESHOLD}th fault must still open the breaker",
+        );
+    }
+
+    #[tokio::test]
+    async fn engine_503_does_not_reset_an_in_progress_failure_streak() {
+        assert_backpressure_preserves_streak_json(503).await;
+    }
+
+    /// 429 shares the Neutral disposition with 503. `breaker_outcome` classifies
+    /// it, but only an end-to-end pass proves the dispatch arms act on that
+    /// classification for 429 and not just for the 503 the other tests use.
+    #[tokio::test]
+    async fn engine_429_does_not_reset_an_in_progress_failure_streak() {
+        assert_backpressure_preserves_streak_json(429).await;
+    }
+
+    /// Streaming-arm parity for the streak-preservation property above. The
+    /// streaming arm classifies through the same `breaker_outcome` but records
+    /// on a separate code path (up-front, skipping the pump hook), so it needs
+    /// its own guard.
+    #[tokio::test]
+    async fn engine_503_does_not_reset_an_in_progress_failure_streak_streaming() {
+        use http_body_util::BodyExt;
+
+        let (url, _shutdown) = spawn_scripted_worker(&[500, 500, 503, 500]).await;
+        let proxy = Proxy::new(Duration::from_secs(5)).unwrap();
+        let breaker = Arc::new(breaker_with_threshold(STREAK_THRESHOLD));
+        let headers = HeaderMap::new();
+
+        let mut seen = Vec::new();
+        for _ in 0..STREAK_THRESHOLD + 1 {
+            let resp = proxy
+                .forward_streaming_to(
+                    &url,
+                    WireProtocol::Http1,
+                    &breaker,
+                    "/v1/chat/completions",
+                    &headers,
+                    Bytes::from_static(b"{}"),
+                    None,
+                    None,
+                    None,
+                )
+                .await
+                .expect("streaming dispatch should reach the worker");
+            seen.push(resp.status());
+            // Drain so the pump completes and any completion hook fires before
+            // the next assertion reads the breaker.
+            let _ = resp.into_body().collect().await;
+        }
+
+        assert_eq!(
+            seen,
+            vec![
+                StatusCode::INTERNAL_SERVER_ERROR,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                StatusCode::SERVICE_UNAVAILABLE,
+                StatusCode::INTERNAL_SERVER_ERROR,
+            ],
+            "the scripted worker drove the intended interleaving",
+        );
+        assert_eq!(
+            breaker.snapshot().state_code,
+            1,
+            "streaming 503 must not reset the streak: the 3rd fault still opens the breaker",
+        );
+    }
+
+    /// Streaming-arm parity for `engine_503_recovers_a_half_open_breaker`: the
+    /// half-open probe can just as easily land on the streaming path, and the
+    /// wedge it would cause there is identical.
+    #[tokio::test]
+    async fn engine_503_recovers_a_half_open_breaker_streaming() {
+        use http_body_util::BodyExt;
+
+        let (url, _shutdown) = spawn_status_worker(503).await;
+        let proxy = Proxy::new(Duration::from_secs(5)).unwrap();
+        // Same shape as the JSON half-open test: threshold=1 so one prior fault
+        // opens it, and a wait an order of magnitude past the cool-down, since a
+        // real socket means the clock cannot be paused.
+        let breaker = Arc::new(CircuitBreaker::with_config(CircuitBreakerConfig {
+            threshold: NonZeroU32::new(1).unwrap(),
+            cool_down: Duration::from_millis(20),
+        }));
+        let headers = HeaderMap::new();
+
+        breaker.record_failure();
+        assert_eq!(breaker.snapshot().state_code, 1, "breaker should be Open");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let resp = proxy
+            .forward_streaming_to(
+                &url,
+                WireProtocol::Http1,
+                &breaker,
+                "/v1/chat/completions",
+                &headers,
+                Bytes::from_static(b"{}"),
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("the half-open probe must be admitted and reach the worker");
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let _ = resp.into_body().collect().await;
+        assert_eq!(
+            breaker.snapshot().state_code,
+            0,
+            "a streaming 503 probe answer must close the breaker, not wedge it half-open",
+        );
+        assert!(breaker.would_allow(), "worker must admit traffic again");
     }
 }

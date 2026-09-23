@@ -190,8 +190,8 @@ impl CircuitBreaker {
     ///   shutting a recovered-but-busy worker out forever (a worse false-shed
     ///   than the one ignoring 503 removes). The responder is not necessarily
     ///   the probe: [`allow`](Self::allow) gates admission, not completion, so a
-    ///   request admitted while Closed can land here. [`record_success`] has the
-    ///   same property.
+    ///   request admitted while Closed can land here.
+    ///   [`record_success`](Self::record_success) has the same property.
     /// - **Open:** no-op, and reachable — `allow` gates admission, not
     ///   completion, so a request admitted while Closed can return after
     ///   concurrent failures have opened the breaker. A late backpressure answer
@@ -381,6 +381,36 @@ mod tests {
             b.snapshot().state_code,
             0,
             "backpressure alone must never open the breaker, regardless of volume",
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn backpressure_while_open_does_not_reset_the_breaker() {
+        // `allow` gates admission, not completion, so a request admitted while
+        // Closed can report back after concurrent failures have opened the
+        // breaker. That late backpressure answer must be a no-op — it must not
+        // untrip a breaker that has already fired, and it must not shorten the
+        // cool-down by re-admitting early.
+        let b = cb(1, 30);
+        b.record_failure();
+        assert_eq!(b.snapshot().state_code, 1, "breaker is Open");
+
+        b.record_backpressure();
+        assert_eq!(
+            b.snapshot().state_code,
+            1,
+            "a late 503 must leave an already-tripped breaker Open",
+        );
+        assert!(
+            !b.would_allow(),
+            "a late 503 must not re-admit traffic inside the cool-down",
+        );
+
+        // The cool-down is still measured from the original open, not restarted.
+        tokio::time::advance(Duration::from_secs(31)).await;
+        assert!(
+            b.would_allow(),
+            "cool-down still elapses from first-open; backpressure did not restart it",
         );
     }
 }
