@@ -11,10 +11,8 @@ Sequence Parallelism (SP) Support:
 
 from __future__ import annotations
 
-import contextlib
 import functools
 import inspect
-from typing import Iterator
 
 import torch
 import torch.nn as nn
@@ -84,22 +82,6 @@ from sglang.multimodal_gen.runtime.utils.torch_compile import (
 
 _is_npu = current_platform.is_npu()
 logger = init_logger(__name__)
-
-
-@contextlib.contextmanager
-def _module_in_fp32(*modules: nn.Module, enabled: bool) -> Iterator[None]:
-    """Temporarily cast modules to float32, restoring original dtype on exit."""
-    if not enabled:
-        yield
-        return
-    original_dtypes = [next(m.parameters()).dtype for m in modules]
-    for m in modules:
-        m.float()
-    try:
-        yield
-    finally:
-        for m, dtype in zip(modules, original_dtypes):
-            m.to(dtype)
 
 
 class MOVALatentPreparationStage(PipelineStage):

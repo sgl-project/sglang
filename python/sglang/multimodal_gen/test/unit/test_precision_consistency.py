@@ -1,4 +1,6 @@
+import gc
 import unittest
+import weakref
 from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest import mock
@@ -354,6 +356,43 @@ class TestDiffusionPrecisionConsistency(unittest.TestCase):
 
         self.assertEqual(module.weight.dtype, torch.bfloat16)
         self.assertTrue(torch.equal(module.weight, original_weight))
+
+    def test_temporary_module_fp32_dtype_releases_cached_tensor_on_exit(self):
+        module = torch.nn.Linear(2, 2).to(dtype=torch.bfloat16)
+
+        with temporary_module_fp32_dtype(module):
+            # No strong local ref is kept, so the fp32 cache tensor is the only owner.
+            cached_ref = weakref.ref(module.weight.data)
+
+        gc.collect()
+        self.assertIsNone(cached_ref())
+
+    def test_temporary_module_fp32_dtype_doubles_then_restores_param_bytes(self):
+        # bf16 is 2 bytes/elem, fp32 is 4 bytes/elem; cast must exactly double footprint.
+        module = torch.nn.Linear(4, 4, bias=False).to(dtype=torch.bfloat16)
+        original_nbytes = module.weight.numel() * module.weight.element_size()
+
+        with temporary_module_fp32_dtype(module):
+            self.assertEqual(
+                module.weight.numel() * module.weight.element_size(),
+                original_nbytes * 2,
+            )
+
+        self.assertEqual(
+            module.weight.numel() * module.weight.element_size(), original_nbytes
+        )
+
+    def test_temporary_modules_fp32_dtype_releases_cached_tensors_on_exit(self):
+        first = torch.nn.Linear(2, 2).to(dtype=torch.bfloat16)
+        second = torch.nn.Linear(2, 2).to(dtype=torch.bfloat16)
+
+        with temporary_modules_fp32_dtype([first, second]):
+            first_ref = weakref.ref(first.weight.data)
+            second_ref = weakref.ref(second.weight.data)
+
+        gc.collect()
+        self.assertIsNone(first_ref())
+        self.assertIsNone(second_ref())
 
     def test_temporary_modules_fp32_dtype_honors_per_module_enabled(self):
         enabled_module = torch.nn.Linear(2, 2).to(dtype=torch.bfloat16)
