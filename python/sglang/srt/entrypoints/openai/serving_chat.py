@@ -2525,10 +2525,13 @@ class OpenAIServingChat(OpenAIServingBase):
         call_item: ToolCallItem,
         history_tool_calls_cnt: int,
     ) -> str:
-        """Process for generating a new and unique `tool_call_id`"""
+        """Return the `tool_call_id` for a parsed tool call."""
         if self.tool_call_parser == "kimi_k3":
             return f"{call_item.name}:{history_tool_calls_cnt + call_item.tool_index}"
-        if self.tool_call_parser != "kimi_k2":
+        if self.tool_call_parser == "kimi_k2_raw_id" and call_item.tool_call_id:
+            # Keep the model-emitted id verbatim so RL trajectories round-trip it.
+            return call_item.tool_call_id
+        if self.tool_call_parser not in ("kimi_k2", "kimi_k2_raw_id"):
             # A simple uuid is sufficient for all models except for Kimi-K2.
             tool_call_id = f"call_{uuid.uuid4().hex[:24]}"
             return tool_call_id

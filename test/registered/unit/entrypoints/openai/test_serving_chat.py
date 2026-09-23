@@ -39,6 +39,7 @@ from sglang.srt.entrypoints.openai.serving_chat import (
     normalize_tool_content,
 )
 from sglang.srt.environ import envs
+from sglang.srt.function_call.core_types import ToolCallItem
 from sglang.srt.function_call.kimik3_format import TOOLS_CLOSE, TOOLS_OPEN
 from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.parser.jinja_template_utils import (
@@ -2315,6 +2316,116 @@ class ServingChatTestCase(unittest.TestCase):
             payload = json.loads(line[len("data: ") :])
             tool_calls = payload["choices"][0]["delta"]["tool_calls"]
             self.assertEqual(tool_calls[0]["id"], "functions.get_weather:1")
+
+    # ------------- kimi_k2_raw_id tool_call_id passthrough -------------
+    # One tool call in the history, but the model continues its own counter.
+    _KIMI_OUTPUT_CHUNKS = [
+        "<|tool_calls_section_begin|><|tool_call_begin|>functions.get_weather:5",
+        '<|tool_call_argument_begin|>{"city": "LA"}<|tool_call_end|>',
+        "<|tool_call_begin|>functions.get_weather:6",
+        '<|tool_call_argument_begin|>{"city": "Tokyo"}<|tool_call_end|>',
+        "<|tool_calls_section_end|>",
+    ]
+    _KIMI_EXPECTED_IDS = {
+        "kimi_k2": ["functions.get_weather:1", "functions.get_weather:2"],
+        "kimi_k2_raw_id": ["functions.get_weather:5", "functions.get_weather:6"],
+    }
+
+    def _kimi_tool_history_request(self, stream: bool) -> ChatCompletionRequest:
+        return ChatCompletionRequest(
+            model="x",
+            messages=[
+                {"role": "user", "content": "What's the weather in Paris?"},
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "id": "functions.get_weather:0",
+                            "type": "function",
+                            "function": {
+                                "name": "get_weather",
+                                "arguments": '{"city": "Paris"}',
+                            },
+                        }
+                    ],
+                },
+                {
+                    "role": "tool",
+                    "content": "Rainy.",
+                    "tool_call_id": "functions.get_weather:0",
+                },
+                {"role": "user", "content": "What about LA and Tokyo?"},
+            ],
+            tools=[{"type": "function", "function": {"name": "get_weather"}}],
+            stream=stream,
+        )
+
+    def test_kimi_k2_raw_id_non_streaming_returns_model_ids(self):
+        """kimi_k2_raw_id returns the ids the model emitted; kimi_k2 still
+        renumbers them by the tool calls already in the history."""
+        req = self._kimi_tool_history_request(stream=False)
+        for parser, expected_ids in self._KIMI_EXPECTED_IDS.items():
+            with self.subTest(parser=parser):
+                self.chat.tool_call_parser = parser
+                tool_calls, _, _ = self.chat._process_tool_calls(
+                    text="".join(self._KIMI_OUTPUT_CHUNKS),
+                    tools=self.chat._effective_tools(req),
+                    finish_reason={"type": "stop", "matched": None},
+                    history_tool_calls_cnt=self.chat._get_history_tool_calls_cnt(req),
+                )
+                self.assertEqual([tc.id for tc in tool_calls], expected_ids)
+                self.assertEqual([tc.index for tc in tool_calls], [0, 1])
+
+    def test_kimi_k2_raw_id_streaming_returns_model_ids(self):
+        """Streaming deltas carry the same ids as the non-streaming response."""
+        req = self._kimi_tool_history_request(stream=True)
+
+        async def collect_tool_call_ids():
+            parser_dict, ids = {}, []
+            for delta in self._KIMI_OUTPUT_CHUNKS:
+                async for line in self.chat._process_tool_call_stream(
+                    index=0,
+                    delta=delta,
+                    parser_dict=parser_dict,
+                    content={"meta_info": {"id": "chatcmpl-test"}},
+                    request=req,
+                    has_tool_calls={},
+                ):
+                    payload = json.loads(line[len("data: ") :])
+                    for tool_call in (
+                        payload["choices"][0]["delta"].get("tool_calls") or []
+                    ):
+                        if tool_call.get("id") is not None:
+                            ids.append(tool_call["id"])
+            return ids
+
+        for parser, expected_ids in self._KIMI_EXPECTED_IDS.items():
+            with self.subTest(parser=parser):
+                self.chat.tool_call_parser = parser
+                loop = get_or_create_event_loop()
+                self.assertEqual(
+                    loop.run_until_complete(collect_tool_call_ids()), expected_ids
+                )
+
+    def test_kimi_k2_raw_id_without_captured_id_uses_kimi_k2_format(self):
+        """A call with no captured id (an empty streaming id header) gets the
+        history-offset Kimi-K2 id instead of a uuid."""
+        self.chat.tool_call_parser = "kimi_k2_raw_id"
+        for raw_id in (None, ""):
+            with self.subTest(raw_id=raw_id):
+                call_item = ToolCallItem(
+                    tool_index=1,
+                    name="get_weather",
+                    parameters="{}",
+                    tool_call_id=raw_id,
+                )
+                self.assertEqual(
+                    self.chat._process_tool_call_id(
+                        call_item, history_tool_calls_cnt=3
+                    ),
+                    "functions.get_weather:4",
+                )
 
     def test_dpsk_v32_encoding_path(self):
         """Test DeepSeek V3.2 encoding path detection and application."""
