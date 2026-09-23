@@ -454,9 +454,35 @@ class CompressorAscendBackendMixin:
             for _name, _t in (("x", x), ("table", state_block_table)):
                 _s, _ = _fmt(_t)
                 print(f"[CIN] {_tag} {_name} shape={tuple(_t.shape)} {_s}", flush=True)
+                if _name == "table":
+                    # no spaces: dump_diff.py keys lines by whitespace token
+                    _tv = ",".join(str(int(v)) for v in state_block_table.reshape(-1).tolist())
+                    print(f"[CIN] {_tag} table_vals {_tv}", flush=True)
             print(
                 f"[CIN] {_tag} state_cache shape={tuple(state_cache.shape)} "
                 f"ptr={state_cache.data_ptr()}",
+                flush=True,
+            )
+            if os.environ.get("DSV4_DUMP_STATE"):
+                # hash the rows the table points at, to split state CONTENT from addressing
+                _flat = state_cache.reshape(-1, state_cache.shape[-1])
+                _locs = state_block_table.reshape(-1).to(torch.int64)
+                _locs = _locs[(_locs >= 0) & (_locs < _flat.shape[0])]
+                if _locs.numel():
+                    _rows = _flat.index_select(0, _locs)
+                    _a = _rows.detach().to(torch.float32).cpu().numpy()
+                    print(
+                        f"[CIN] {_tag} state_rows n={_rows.shape[0]} "
+                        f"sum={_a.sum():.4f} absmax={abs(_a).max():.4f} "
+                        f"md5={hashlib.md5(_a.tobytes()).hexdigest()[:16]}",
+                        flush=True,
+                    )
+            _all = state_block_table.reshape(-1).to(torch.int64)
+            _rows_n = state_cache.reshape(-1, state_cache.shape[-1]).shape[0]
+            print(
+                f"[CIN] {_tag} state_range n={_all.numel()} "
+                f"min={int(_all.min())} max={int(_all.max())} rows={_rows_n} "
+                f"oob={int((_all >= _rows_n).sum())}",
                 flush=True,
             )
             print(
