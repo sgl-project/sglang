@@ -24,7 +24,9 @@ import triton.language as tl  # type: ignore
 from sglang.srt.utils.custom_op import register_custom_op
 
 _SUPPORTED_DTYPES = {torch.float16, torch.bfloat16, torch.float32}
-_MAX_CHANNELS = 1024
+# One program normalizes one pixel's channel row; 2048 covers the Qwen-Image
+# 2.1 decoder (1152 channels at its deepest levels) with an 8-warp block.
+_MAX_CHANNELS = 2048
 
 
 @triton.jit
