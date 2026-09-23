@@ -1323,9 +1323,9 @@ class CommonKVManager(BaseKVManager):
         # Prefill src is stage-local; decode dst may cover the full model.
         start_layer = self.kv_args.prefill_start_layer
         end_layer = self.kv_args.prefill_end_layer
-        assert (
-            end_layer is not None
-        ), "KVArgs.prefill_end_layer must be set when using compressed-MLA PD with PP"
+        assert end_layer is not None, (
+            "KVArgs.prefill_end_layer must be set when using compressed-MLA PD with PP"
+        )
 
         c4_full = sum(1 for r in mla_ratios if r == 4)
         c128_full = sum(1 for r in mla_ratios if r == 128)
@@ -1377,8 +1377,7 @@ class CommonKVManager(BaseKVManager):
             list(dst_kv_ptrs[swa_s:swa_e])
             + list(
                 dst_kv_ptrs[
-                    compress_section_start
-                    + c4_off_s : compress_section_start
+                    compress_section_start + c4_off_s : compress_section_start
                     + c4_off_e
                 ]
             )
@@ -2159,10 +2158,12 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
                 data.get("enable_dsa_cache_layer_split", False)
             )
 
-        if self.speculative_use_rejection_sampling is None:
-            self.speculative_use_rejection_sampling = data.get(
-                "speculative_use_rejection_sampling"
-            )
+        peer_rs = data.get("speculative_use_rejection_sampling")
+        if self._registered_count == 0:
+            self.speculative_use_rejection_sampling = peer_rs
+        elif self.speculative_use_rejection_sampling != peer_rs:
+            # Mixed/unknown rank layouts stay unknown until the registry restarts.
+            self.speculative_use_rejection_sampling = None
 
         if system_dp_size == 1:
             dp_group = attn_dp_rank

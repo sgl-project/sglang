@@ -75,7 +75,7 @@ class TestDraftMetadataCPU(unittest.TestCase):
             torch.float32,
             max_sampling_mask_tokens=16,
             output_draft_probs_dim=width,
-            **kwargs
+            **kwargs,
         )
 
     def request(self, probs):

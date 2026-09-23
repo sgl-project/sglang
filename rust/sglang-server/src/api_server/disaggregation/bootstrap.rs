@@ -213,8 +213,11 @@ async fn route_put(State(state): State<Arc<Registry>>, Json(body): Json<Route>) 
         );
         topo.enable_dsa_cache_layer_split
             .get_or_insert(body.enable_dsa_cache_layer_split.unwrap_or(false));
-        if topo.speculative_use_rejection_sampling.is_none() {
+        if topo.registered_count == 0 {
             topo.speculative_use_rejection_sampling = body.speculative_use_rejection_sampling;
+        } else if topo.speculative_use_rejection_sampling != body.speculative_use_rejection_sampling {
+            // Do not let a later rank overwrite an unknown or mixed wire layout.
+            topo.speculative_use_rejection_sampling = None;
         }
         topo.prefill_ranks.insert(
             (dp_group, body.attn_cp_rank, body.attn_tp_rank, body.pp_rank),
