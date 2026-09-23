@@ -21,12 +21,14 @@ from sglang.srt.layers.quantization.compressed_tensors.schemes import (
 from sglang.srt.utils.common import (
     is_sm80_supported,
     is_sm90_supported,
+    is_sm100_supported,
     is_sm120_supported,
 )
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_marlin_utils import make_nvfp4_weight_and_ref
 
 register_cuda_ci(est_time=6, stage="base-b-kernel-unit", runner_config="1-gpu-small")
+register_cuda_ci(est_time=20, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
 
 SIZE_M = 17
 SIZE_K = 256
@@ -66,8 +68,13 @@ def _build_layer(
 
 
 @pytest.mark.skipif(
-    not (is_sm80_supported() or is_sm90_supported() or is_sm120_supported()),
-    reason="Weight-only NVFP4 Marlin requires CUDA SM8X/SM9X/SM120",
+    not (
+        is_sm80_supported()
+        or is_sm90_supported()
+        or is_sm100_supported()
+        or is_sm120_supported()
+    ),
+    reason="Weight-only NVFP4 Marlin requires CUDA SM8X/SM9X/SM100/SM120",
 )
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("has_input_global_scale", [False, True])
@@ -101,8 +108,13 @@ def test_scheme_matches_dequant_reference(dtype, has_input_global_scale):
 
 
 @pytest.mark.skipif(
-    not (is_sm80_supported() or is_sm90_supported() or is_sm120_supported()),
-    reason="Weight-only NVFP4 Marlin requires CUDA SM8X/SM9X/SM120",
+    not (
+        is_sm80_supported()
+        or is_sm90_supported()
+        or is_sm100_supported()
+        or is_sm120_supported()
+    ),
+    reason="Weight-only NVFP4 Marlin requires CUDA SM8X/SM9X/SM100/SM120",
 )
 def test_uninverted_global_scale_would_overflow():
     """Guards the divisor-vs-scale conversion specifically.

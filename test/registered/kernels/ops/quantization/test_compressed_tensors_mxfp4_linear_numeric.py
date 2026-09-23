@@ -20,20 +20,27 @@ from sglang.srt.layers.quantization.compressed_tensors.schemes import (
 from sglang.srt.utils.common import (
     is_sm80_supported,
     is_sm90_supported,
+    is_sm100_supported,
     is_sm120_supported,
 )
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_marlin_utils import make_mxfp4_weight_and_ref
 
 register_cuda_ci(est_time=6, stage="base-b-kernel-unit", runner_config="1-gpu-small")
+register_cuda_ci(est_time=20, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
 
 SIZE_M = 17
 SIZE_K = 256
 SIZE_N = 192
 
 requires_fp4_marlin = pytest.mark.skipif(
-    not (is_sm80_supported() or is_sm90_supported() or is_sm120_supported()),
-    reason="Weight-only MXFP4 Marlin requires CUDA SM8X/SM9X/SM120",
+    not (
+        is_sm80_supported()
+        or is_sm90_supported()
+        or is_sm100_supported()
+        or is_sm120_supported()
+    ),
+    reason="Weight-only MXFP4 Marlin requires CUDA SM8X/SM9X/SM100/SM120",
 )
 
 
