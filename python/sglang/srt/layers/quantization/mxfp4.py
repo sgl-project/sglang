@@ -121,8 +121,9 @@ if is_flashinfer_available():
     from flashinfer import (
         nvfp4_block_scale_interleave,
     )
-    from flashinfer.fused_moe.core import (
-        get_w2_permute_indices_with_cache,
+    from flashinfer.utils import (
+        get_shuffle_matrix_a_row_indices,
+        get_shuffle_matrix_sf_a_row_indices,
     )
 
     # SM90 mixed-input helpers landed in FlashInfer #3084 (post-0.6.10). Older
@@ -141,9 +142,11 @@ if is_flashinfer_available():
 else:
     _FI_HAS_SM90_CUTLASS_MXFP4 = False
 
-_flashinfer_mxfp4_permute_indices_cache: dict[torch.Size, torch.Tensor] = {}
-_flashinfer_mxfp4_permute_indices_device_cache: dict[
-    tuple[tuple[int, ...], int, int, str, int], torch.Tensor
+# Permute indices depend only on the tensor shape and are cached on the host.
+# Device copies are transient: a cached device tensor allocated while loading
+# weights lives in the memory-saver weights region and is wiped on release.
+_flashinfer_mxfp4_permute_indices_cache: dict[
+    tuple[tuple[int, ...], int, Optional[int]], torch.Tensor
 ] = {}
 
 
@@ -159,33 +162,17 @@ def _get_flashinfer_mxfp4_device_permute_indices(
     epilogue_tile_m: int,
     num_elts_per_sf: Optional[int] = None,
 ) -> torch.Tensor:
-    extra_args = {} if num_elts_per_sf is None else {"num_elts_per_sf": num_elts_per_sf}
-    permute_indices = get_w2_permute_indices_with_cache(
-        _flashinfer_mxfp4_permute_indices_cache,
-        x,
-        epilogue_tile_m,
-        **extra_args,
-    )
-
-    device_index = -1 if x.device.index is None else x.device.index
-    num_elts_per_sf_key = -1 if num_elts_per_sf is None else num_elts_per_sf
-    cache_key = (
-        tuple(x.shape),
-        epilogue_tile_m,
-        num_elts_per_sf_key,
-        x.device.type,
-        device_index,
-    )
-    cached_device_indices = _flashinfer_mxfp4_permute_indices_device_cache.get(
-        cache_key
-    )
-    if cached_device_indices is None:
-        cached_device_indices = permute_indices.to(x.device)
-        _flashinfer_mxfp4_permute_indices_device_cache[cache_key] = (
-            cached_device_indices
-        )
-
-    return cached_device_indices
+    cache_key = (tuple(x.shape), epilogue_tile_m, num_elts_per_sf)
+    permute_indices = _flashinfer_mxfp4_permute_indices_cache.get(cache_key)
+    if permute_indices is None:
+        if num_elts_per_sf is None:
+            permute_indices = get_shuffle_matrix_a_row_indices(x, epilogue_tile_m)
+        else:
+            permute_indices = get_shuffle_matrix_sf_a_row_indices(
+                x, epilogue_tile_m, num_elts_per_sf=num_elts_per_sf
+            )
+        _flashinfer_mxfp4_permute_indices_cache[cache_key] = permute_indices
+    return permute_indices.to(x.device)
 
 
 if TYPE_CHECKING:
