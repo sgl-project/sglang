@@ -87,7 +87,10 @@ from sglang.srt.layers.modelopt_utils import QUANT_CFG_CHOICES
 from sglang.srt.layers.moe.utils import (
     install_shared_experts_fusion_decision,
 )
-from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.quantization.base_config import (
+    QuantizationConfig,
+    QuantizeMethodBase,
+)
 from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
     trigger_transferring_weights_request,
 )
@@ -1081,8 +1084,8 @@ class DefaultModelLoader(BaseModelLoader):
     def restore_weights_before_loading(model, target_device):
         """Undo in-place quant packing so fresh weights can be loaded."""
         for module, quant_method in _modules_with_quant_method(model):
-            # only schemes that repack in place define it
-            if hasattr(quant_method, "restore_weights_before_loading"):
+            # AMX packing and the MXFP4 backend wrappers are duck-typed and cannot restore
+            if isinstance(quant_method, QuantizeMethodBase):
                 with device_loading_context(module, target_device):
                     quant_method.restore_weights_before_loading(module)
 
