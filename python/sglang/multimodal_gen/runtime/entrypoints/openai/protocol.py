@@ -26,6 +26,7 @@ class ImageUsage(BaseModel):
     completion_tokens: Optional[int] = None
     prompt_tokens_details: Optional[ImagePromptTokensDetails] = None
     reasoning_tokens: Optional[int] = 0
+    think_text: Optional[str] = None
     image_count: Optional[int] = None
 
 

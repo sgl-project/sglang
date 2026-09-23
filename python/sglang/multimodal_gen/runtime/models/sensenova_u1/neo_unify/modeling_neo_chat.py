@@ -374,6 +374,7 @@ class NEOChatModel(PreTrainedModel):
         self.img_context_token_id = None
         self.img_start_token_id = 151670
         self.last_think_content = ""
+        self.last_think_token_count = 0
         self.conv_template = get_conv_template(self.template)
         self.system_message = self.conv_template.system_message
 
@@ -769,9 +770,10 @@ class NEOChatModel(PreTrainedModel):
         eos_token_id = tokenizer.convert_tokens_to_ids(template.sep.strip())
         think_end_token_id = tokenizer.convert_tokens_to_ids("</think>")
         think_token_ids = []
+        think_closed = False
         next_token = torch.argmax(prefix_outputs.logits[:, -1, :], dim=-1)
 
-        for _ in range(max_think_tokens):
+        for token_index in range(max_think_tokens):
             token_item = next_token.item()
             if token_item == eos_token_id:
                 break
@@ -785,6 +787,11 @@ class NEOChatModel(PreTrainedModel):
                 past_key_values = outputs.past_key_values
                 t_idx += 1
                 think_token_ids.append(token_item)
+                think_closed = True
+                break
+
+            # Reserve the final token in the budget for a closing marker.
+            if token_index == max_think_tokens - 1:
                 break
 
             think_token_ids.append(token_item)
@@ -805,9 +812,18 @@ class NEOChatModel(PreTrainedModel):
             return_tensors="pt",
             add_special_tokens=False,
         )["input_ids"].to(self.device)
+        if not think_closed:
+            close_ids = torch.tensor(
+                [[think_end_token_id]],
+                dtype=append_ids.dtype,
+                device=append_ids.device,
+            )
+            append_ids = torch.cat((close_ids, append_ids), dim=1)
+            think_token_ids.append(think_end_token_id)
         t_idx = self._append_text_tokens_to_cache(past_key_values, t_idx, append_ids)
 
         think_text = tokenizer.decode(think_token_ids, skip_special_tokens=False)
+        self.last_think_token_count = len(think_token_ids)
 
         return past_key_values, t_idx, think_text
 
@@ -1975,6 +1991,7 @@ class NEOChatModel(PreTrainedModel):
         t_eps=0.02,
         think_mode=False,
         seed=0,
+        max_think_tokens=1024,
     ):
         assert cfg_norm in ["none", "global", "channel"]
         self._notify_layer_offload_phase("prefix")
@@ -2014,6 +2031,7 @@ class NEOChatModel(PreTrainedModel):
         merge_size = int(1 / self.downsample_ratio)
         question_condition = f"{prompt}"
         think_text = ""
+        self.last_think_token_count = 0
         needs_cfg = not (cfg_scale == 1 and img_cfg_scale == 1)
         needs_img_condition = needs_cfg and (
             img_cfg_scale == 1 or cfg_scale != img_cfg_scale
@@ -2125,6 +2143,7 @@ class NEOChatModel(PreTrainedModel):
                     past_key_values_condition,
                     t_index_condition,
                     IMG_START_TOKEN,
+                    max_think_tokens=max_think_tokens,
                 )
             )
             indexes_image_condition = self._build_t2i_image_indexes(
@@ -2426,6 +2445,7 @@ class NEOChatModel(PreTrainedModel):
         t_eps=0.02,
         think_mode=False,
         seed=0,
+        max_think_tokens=1024,
     ):
         assert self.concat_time_token_num == 0
         assert cfg_norm in ["cfg_zero_star", "global", "none", "channel"]
@@ -2447,6 +2467,7 @@ class NEOChatModel(PreTrainedModel):
 
         self.config.t_eps = t_eps
         think_text = ""
+        self.last_think_token_count = 0
         needs_cfg = cfg_scale > 1
 
         think_content = (
@@ -2531,6 +2552,7 @@ class NEOChatModel(PreTrainedModel):
                     past_key_values_condition,
                     t_index_condition,
                     IMG_START_TOKEN,
+                    max_think_tokens=max_think_tokens,
                 )
             )
             indexes_image_condition = self._build_t2i_image_indexes(

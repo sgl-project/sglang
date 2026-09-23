@@ -18,6 +18,7 @@ from sglang.multimodal_gen.configs.sample.sensenova_u1 import (
     SenseNovaU1SamplingParams,
 )
 from sglang.multimodal_gen.configs.sensenova_u1 import (
+    DEFAULT_MAX_THINK_TOKENS,
     SENSENOVA_U1_REQUEST_EXTRA_KEY,
 )
 from sglang.multimodal_gen.registry import (
@@ -25,6 +26,13 @@ from sglang.multimodal_gen.registry import (
     get_model_info,
     get_non_diffusers_pipeline_name,
     is_registered_diffusion_model_path,
+)
+from sglang.multimodal_gen.runtime.entrypoints.openai.image_api import (
+    _image_request_model_kwargs,
+)
+from sglang.multimodal_gen.runtime.entrypoints.openai.protocol import (
+    ImageGenerationsRequest,
+    ImageUsage,
 )
 from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
     process_generation_batch,
@@ -78,7 +86,7 @@ class _FakeSenseNovaModel:
 
     def t2i_generate(self, tokenizer, prompt, **kwargs):
         self.call_kwargs = {"tokenizer": tokenizer, "prompt": prompt, **kwargs}
-        sample = torch.tensor(
+        image = torch.tensor(
             [
                 [
                     [[-1.0, 0.0], [0.5, 1.0]],
@@ -87,7 +95,11 @@ class _FakeSenseNovaModel:
                 ]
             ]
         )
-        return sample.repeat(kwargs["batch_size"], 1, 1, 1)
+        image = image.repeat(kwargs["batch_size"], 1, 1, 1)
+        if kwargs["think_mode"]:
+            self.last_think_token_count = 3
+            return image, "draft</think>"
+        return image
 
 
 class _FakeTokenizer:
@@ -98,6 +110,41 @@ class _FakeTokenizer:
         del return_tensors
         token_count = len(text.split()) + 1
         return {"input_ids": torch.arange(1, token_count + 1).unsqueeze(0)}
+
+
+def _think_logits(token_id):
+    logits = torch.full((1, 1, 32), float("-inf"))
+    logits[0, 0, token_id] = 0
+    return logits
+
+
+class _FakeThinkLanguageModel:
+    def __init__(self, next_tokens):
+        self.model = SimpleNamespace(current_index=None)
+        self.next_tokens = list(next_tokens)
+
+    def __call__(self, *, past_key_values, **_kwargs):
+        next_token = self.next_tokens.pop(0) if self.next_tokens else 0
+        return SimpleNamespace(
+            logits=_think_logits(next_token),
+            past_key_values=past_key_values,
+        )
+
+
+class _FakeThinkTokenizer:
+    def __init__(self):
+        self._token_ids = {"</s>": 8, "</think>": 9}
+
+    def convert_tokens_to_ids(self, token):
+        return self._token_ids[token]
+
+    def __call__(self, text, **_kwargs):
+        assert text == "\n\n<img>"
+        return {"input_ids": torch.tensor([[20, 21]])}
+
+    def decode(self, token_ids, **_kwargs):
+        pieces = {7: "draft", 9: "</think>"}
+        return "".join(pieces[token_id] for token_id in token_ids)
 
 
 class _RecordingTraceContext:
@@ -638,6 +685,7 @@ def test_sensenova_u1_sampling_params_keep_private_defaults_internal():
         "cfg_interval": (0.0, 1.0),
         "t_eps": 0.02,
         "think_mode": False,
+        "max_think_tokens": DEFAULT_MAX_THINK_TOKENS,
     }
 
 
@@ -1045,6 +1093,7 @@ def test_sensenova_u1_cli_args_expose_only_sglang_compatible_fields():
         cfg_norm="global",
         timestep_shift=9.0,
         think_mode=True,
+        max_think_tokens=128,
     )
 
     cli_args = SenseNovaU1SamplingParams.get_cli_args(args)
@@ -1057,7 +1106,46 @@ def test_sensenova_u1_cli_args_expose_only_sglang_compatible_fields():
     assert cli_args["num_outputs_per_prompt"] == 2
     assert "cfg_norm" not in cli_args
     assert "timestep_shift" not in cli_args
-    assert "think_mode" not in cli_args
+    assert cli_args["think_mode"] is True
+    assert cli_args["max_think_tokens"] == 128
+
+
+@pytest.mark.parametrize(
+    "image_request",
+    [
+        ImageGenerationsRequest(
+            prompt="a mountain lake",
+            think_mode=True,
+            max_think_tokens=128,
+        ),
+        ImageGenerationsRequest(
+            prompt="a mountain lake",
+            extra_body={"think_mode": True, "max_think_tokens": 128},
+        ),
+    ],
+)
+def test_sensenova_u1_thinking_fields_remain_model_specific(image_request):
+    assert _image_request_model_kwargs(image_request, SenseNovaU1SamplingParams) == {
+        "think_mode": True,
+        "max_think_tokens": 128,
+    }
+
+
+@pytest.mark.parametrize("max_think_tokens", [0, 1025])
+def test_sensenova_u1_rejects_invalid_think_token_budget(max_think_tokens):
+    with pytest.raises(ValueError, match="max_think_tokens"):
+        SenseNovaU1SamplingParams(max_think_tokens=max_think_tokens)
+
+
+@pytest.mark.parametrize("max_think_tokens", [True, 1.5])
+def test_sensenova_u1_rejects_non_integer_think_token_budget(max_think_tokens):
+    with pytest.raises(TypeError, match="max_think_tokens"):
+        SenseNovaU1SamplingParams(max_think_tokens=max_think_tokens)
+
+
+def test_sensenova_u1_rejects_non_boolean_think_mode():
+    with pytest.raises(TypeError, match="think_mode"):
+        SenseNovaU1SamplingParams(think_mode="true")
 
 
 def test_sensenova_u1_generation_stage_uses_sglang_params_and_single_model_batch():
@@ -1103,6 +1191,100 @@ def test_sensenova_u1_generation_stage_uses_sglang_params_and_single_model_batch
     assert model.call_kwargs["num_steps"] == 30
     assert model.call_kwargs["batch_size"] == 1
     assert model.call_kwargs["seed"] == 123
+    assert model.call_kwargs["think_mode"] is False
+    assert model.call_kwargs["max_think_tokens"] == DEFAULT_MAX_THINK_TOKENS
+    assert output.usage is None
+
+
+def test_sensenova_u1_generation_stage_returns_thinking_usage():
+    sampling = SenseNovaU1SamplingParams(
+        prompt="a mountain lake",
+        width=2048,
+        height=2048,
+        think_mode=True,
+        max_think_tokens=128,
+    )
+    batch = SimpleNamespace(
+        prompt=sampling.prompt,
+        width=sampling.width,
+        height=sampling.height,
+        guidance_scale=sampling.guidance_scale,
+        num_inference_steps=sampling.num_inference_steps,
+        seed=sampling.seed,
+        num_outputs_per_prompt=1,
+        extra=sampling.build_request_extra(),
+        metrics=None,
+    )
+    model = _FakeSenseNovaModel()
+
+    output = SenseNovaU1GenerationStage(model=model, tokenizer="tok").forward(
+        batch, server_args=SimpleNamespace()
+    )
+
+    assert model.call_kwargs["think_mode"] is True
+    assert model.call_kwargs["max_think_tokens"] == 128
+    assert output.usage == {
+        "think_text": "draft</think>",
+        "reasoning_tokens": 3,
+    }
+    assert ImageUsage.model_validate(output.usage).think_text == "draft</think>"
+
+
+@pytest.mark.parametrize(
+    (
+        "first_token",
+        "next_tokens",
+        "max_think_tokens",
+        "expected_suffix",
+        "expected_token_count",
+    ),
+    [
+        (7, [9, 0], 4, [20, 21], 2),
+        (8, [], 4, [9, 20, 21], 1),
+        (7, [6], 2, [9, 20, 21], 2),
+        (7, [], 1, [9, 20, 21], 1),
+    ],
+)
+def test_sensenova_u1_thinking_always_closes_within_budget(
+    monkeypatch,
+    first_token,
+    next_tokens,
+    max_think_tokens,
+    expected_suffix,
+    expected_token_count,
+):
+    monkeypatch.setattr(
+        "sglang.multimodal_gen.runtime.models.sensenova_u1.neo_unify."
+        "modeling_neo_chat.get_conv_template",
+        lambda _template: SimpleNamespace(sep="</s>"),
+    )
+    appended_ids = []
+    model = SimpleNamespace(
+        template="test",
+        language_model=_FakeThinkLanguageModel(next_tokens),
+        device=torch.device("cpu"),
+        last_think_token_count=0,
+    )
+
+    def append_text_tokens(_cache, index, token_ids):
+        appended_ids.append(token_ids[0].tolist())
+        return index + token_ids.shape[1]
+
+    model._append_text_tokens_to_cache = append_text_tokens
+
+    _, _, think_text = NEOChatModel._generate_think(
+        model,
+        _FakeThinkTokenizer(),
+        SimpleNamespace(logits=_think_logits(first_token)),
+        past_key_values=object(),
+        t_idx=5,
+        IMG_START_TOKEN="<img>",
+        max_think_tokens=max_think_tokens,
+    )
+
+    assert think_text.endswith("</think>")
+    assert model.last_think_token_count == expected_token_count
+    assert appended_ids == [expected_suffix]
 
 
 def test_sensenova_u1_generation_stage_passes_dynamic_batch_inputs():

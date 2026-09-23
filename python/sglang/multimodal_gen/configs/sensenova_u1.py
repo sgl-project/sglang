@@ -27,6 +27,7 @@ DEFAULT_ENABLE_TIMESTEP_SHIFT = True
 DEFAULT_CFG_INTERVAL = (0.0, 1.0)
 DEFAULT_T_EPS = 0.02
 DEFAULT_THINK_MODE = False
+DEFAULT_MAX_THINK_TOKENS = 1024
 
 
 def is_sensenova_u1_model(model_path: str) -> bool:
