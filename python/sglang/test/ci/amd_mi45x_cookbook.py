@@ -226,8 +226,11 @@ _DSR1_ARGS = [
     "16384",
     "--attention-backend",
     "triton",
+    # The cookbook writes 32 here. Raised deliberately: 32 in-flight requests
+    # against a 1319-question eval leaves the GPUs idle waiting on the client,
+    # and the cookbook's own runs drove the server at --parallel 2000.
     "--max-running-requests",
-    "32",
+    "256",
     "--kv-cache-dtype",
     "auto",
     "--page-size",
@@ -369,25 +372,30 @@ _QWEN35_ARGS = [
     "--mem-fraction-static",
     "0.9",
     "--disable-radix-cache",
-    "--prefill-attention-backend",
-    "triton",
-    "--decode-attention-backend",
+    # One backend for both phases. The earlier cookbook split this into
+    # prefill-triton/decode-aiter, which is the path whose l2norm kernel calls
+    # tl.make_block_ptr and dies on images where triton has removed it.
+    "--attention-backend",
     "aiter",
     "--page-size",
     "16",
-    "--prefill-max-requests",
-    "1",
+    "--chunked-prefill-size",
+    "8192",
 ]
 
 _QWEN35_ENV = {
     **_COMMON_ENV,
-    "TRITON_HIP_USE_ASYNC_COPY": "0",
     "SGLANG_USE_AITER_UNIFIED_ATTN": "1",
+    "SGLANG_AITER_VARLEN_PREFILL": "1",
 }
 
 _QWEN35_NOTES = (
     "Measured by Marvin on rocm/sgl-dev:v0.5.18-rocm10-mi45x-dev-20260828, "
-    "not the image the other entries used."
+    "not the image the other entries used. The 0.970 also predates the "
+    "cookbook's move to a single aiter backend, and the cookbook's later "
+    "0.961 came from a harness that wraps the prompt in the chat template "
+    "with enable_thinking=false -- which this one does not do -- so neither "
+    "number is a like-for-like reference until that is settled."
 )
 
 QWEN35_397B_MXFP4_TP1 = CookbookConfig(
@@ -409,7 +417,7 @@ QWEN35_397B_MXFP4_TP4 = CookbookConfig(
     local_dirname="Qwen3.5-397B-A17B-MXFP4",
     hf_repo_id="amd/Qwen3.5-397B-A17B-MXFP4",
     tp_size=4,
-    server_args=list(_QWEN35_ARGS),
+    server_args=list(_QWEN35_ARGS) + ["--disable-custom-all-reduce"],
     env_vars=dict(_QWEN35_ENV),
     accuracy=0.970,
     accuracy_measured_at_tp=1,
@@ -517,6 +525,18 @@ def run_gsm8k_completion(
         arguments, temperature=0, num_threads=parallel, progress_bar=True
     )
     latency = time.perf_counter() - tic
+
+    # A server that dies part-way leaves states with no "answer" variable, and
+    # indexing those raises KeyError('answer') from inside the scorer -- which
+    # reads like a bug in the eval and buries the reason the run actually
+    # stopped. Say what happened and point at the log that has the cause.
+    missing = [i for i, state in enumerate(states) if "answer" not in state]
+    if missing:
+        raise RuntimeError(
+            f"{len(missing)} of {len(states)} requests came back with no "
+            f"completion (first at question {missing[0]}). The server stopped "
+            f"answering during the eval; its log holds the real error."
+        )
 
     preds = [_get_answer_value(states[i]["answer"]) for i in range(len(states))]
     acc = float(np.mean(np.array(preds) == np.array(labels)))
