@@ -550,7 +550,6 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         end_layer: Optional[int] = None,
         indexer_layer_ids: Optional[Sequence[int]] = None,
         kv_cache_dim: Optional[int] = None,
-        dcp_sharded: bool = True,
     ):
         super(MLATokenToKVPool, self).__init__(
             size=size,
@@ -607,10 +606,6 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         self.kr_cache_dim = 0 if self.dsa_kv_cache_store_fp8 else qk_rope_head_dim
         self.index_k_scale_buffer = None
         self.indexer_hadamard_128 = None
-        # Target KV is DCP-sharded.  A speculative draft worker intentionally
-        # keeps a complete replica and indexes the widened virtual loc space
-        # directly, matching the existing CUDA draft-pool contract.
-        self.dcp_sharded = dcp_sharded
 
         self.custom_mem_pool = None
 
@@ -837,7 +832,7 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             )
 
         parallel = get_parallel()
-        if parallel.dcp_enabled and self.dcp_sharded:
+        if parallel.dcp_enabled:
             # Preserve the row count and redirect non-owned rows to the
             # allocator-reserved dummy slot.  Boolean compaction here lowers to
             # aclnnNonzeroV2 on Ascend and crashes the 64-rank DSpark

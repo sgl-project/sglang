@@ -491,6 +491,22 @@ class TestGetDcpLens(CustomTestCase):
         self.assertEqual(model_config.get_num_kv_heads(16, dcp_size=4), 1)
         self.assertEqual(model_config.get_num_kv_heads(16), 1)
 
+    def test_draft_pool_capacity_still_covers_dcp_virtual_addresses(self):
+        configurator = KVCacheConfigurator.__new__(KVCacheConfigurator)
+        override = rc.get_context().override_server_args(page_size=128)
+        override.install()
+        self.addCleanup(override.restore)
+        for dcp_size in (1, 2, 4):
+            for is_draft in (False, True):
+                configurator.is_draft_worker = is_draft
+                with (
+                    self.subTest(dcp_size=dcp_size, is_draft=is_draft),
+                    rc.get_parallel().override(attn_dcp_size=dcp_size),
+                ):
+                    expected_scale = dcp_size if is_draft else 1
+                    self.assertEqual(configurator.loc_space_scale, expected_scale)
+                    self.assertEqual(configurator.pool_page_size, 128 * expected_scale)
+
     def test_gqa_qkv_loader_replicates_kv_within_dcp_group(self):
         hidden_size = 4
         head_size = 2

@@ -1549,7 +1549,7 @@ class AscendAttnBackend(AttentionBackend):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Load a full MLA prefix, gathering rank-local DCP shards if needed."""
         parallel = get_parallel()
-        if parallel.dcp_enabled and getattr(self.token_to_kv_pool, "dcp_sharded", True):
+        if parallel.dcp_enabled:
             metadata = forward_batch.attn_dcp_metadata
             if metadata is None or metadata.dcp_local_prefix_kv_indices is None:
                 raise RuntimeError(

@@ -167,12 +167,7 @@ def forward_mla_prepare_npu(
     layer_scatter_modes,
 ):
     parallel = get_parallel()
-    dcp_sharded_kv = getattr(get_token_to_kv_pool(), "dcp_sharded", True)
-    if (
-        parallel.dcp_enabled
-        and dcp_sharded_kv
-        and forward_batch.forward_mode.is_draft_extend_v2()
-    ):
+    if parallel.dcp_enabled and forward_batch.forward_mode.is_draft_extend_v2():
         raise NotImplementedError(
             "Kimi-K3 NPU DCP does not support draft-extend-v2 attention; "
             "DSPARK uses the supported static target-verify path."
@@ -299,13 +294,9 @@ def forward_mla_prepare_npu(
                 layer_id=m.layer_id,
             )
 
-    dcp_decode_phase = (
-        parallel.dcp_enabled
-        and dcp_sharded_kv
-        and (
-            forward_batch.forward_mode.is_decode()
-            or forward_batch.forward_mode.is_target_verify()
-        )
+    dcp_decode_phase = parallel.dcp_enabled and (
+        forward_batch.forward_mode.is_decode()
+        or forward_batch.forward_mode.is_target_verify()
     )
     if dcp_decode_phase:
         q_nope_out, q_pe = all_gather_q_for_mla_decode(q_nope_out, q_pe)
@@ -342,14 +333,9 @@ def forward_mla_core_npu(
     gate: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     parallel = get_parallel()
-    dcp_sharded_kv = getattr(get_token_to_kv_pool(), "dcp_sharded", True)
-    dcp_decode_phase = (
-        parallel.dcp_enabled
-        and dcp_sharded_kv
-        and (
-            forward_batch.forward_mode.is_decode()
-            or forward_batch.forward_mode.is_target_verify()
-        )
+    dcp_decode_phase = parallel.dcp_enabled and (
+        forward_batch.forward_mode.is_decode()
+        or forward_batch.forward_mode.is_target_verify()
     )
     if dcp_decode_phase:
         attn_output, attn_lse = m.attn_mqa_for_dcp_decode(

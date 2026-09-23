@@ -1587,7 +1587,6 @@ class KVCacheConfigurator:
             enable_memory_saver=get_exec().features.enable_memory_saver,
             start_layer=self.layer_info.start_layer,
             end_layer=self.layer_info.end_layer,
-            dcp_sharded=not self.is_draft_worker,
         )
         return token_to_kv_pool
 

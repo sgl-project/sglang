@@ -139,6 +139,50 @@ class TestNormalizeMlaKRoPECache(unittest.TestCase):
             _normalize_mla_k_rope_cache(torch.empty(8, 1, 32), 64)
 
 
+class TestNpuMlaDcpWrite(unittest.TestCase):
+    def test_pool_write_uses_dcp_topology_without_a_pool_flag(self):
+        from sglang.srt.hardware_backend.npu import memory_pool_npu
+
+        loc = torch.tensor([256, 257, 512, 259, 258, 513], dtype=torch.int32)
+        cache_k = torch.arange(24, dtype=torch.bfloat16).view(6, 1, 4)
+        cache_v = torch.arange(12, dtype=torch.bfloat16).view(6, 1, 2)
+        pool = SimpleNamespace(
+            kv_lora_rank=4,
+            qk_rope_head_dim=2,
+            start_layer=0,
+            dtype=torch.bfloat16,
+            store_dtype=torch.bfloat16,
+            dsa_kv_cache_store_fp8=False,
+            k_buffer=[torch.empty(1024, 1, 4, dtype=torch.bfloat16)],
+            v_buffer=[torch.empty(1024, 1, 2, dtype=torch.bfloat16)],
+            _raise_if_native_kv_cache_disabled=lambda: None,
+        )
+        for dcp_size in (1, 2, 4):
+            for rank in range(dcp_size):
+                with (
+                    self.subTest(dcp_size=dcp_size, rank=rank),
+                    rc.get_parallel().override(
+                        dcp_enabled=dcp_size > 1,
+                        dcp_size=dcp_size,
+                        dcp_rank=rank,
+                    ),
+                    patch.object(memory_pool_npu, "torch_npu", create=True) as npu,
+                ):
+                    memory_pool_npu.NPUMLATokenToKVPool.set_kv_buffer(
+                        pool, SimpleNamespace(layer_id=0), loc, cache_k, cache_v
+                    )
+                    expected = (
+                        loc
+                        if dcp_size == 1
+                        else torch.where(loc % dcp_size == rank, loc // dcp_size, 0)
+                    )
+                    calls = npu.npu_scatter_nd_update_.call_args_list
+                    self.assertEqual(len(calls), 2)
+                    for call, values in zip(calls, (cache_k, cache_v)):
+                        torch.testing.assert_close(call.args[1], expected.view(-1, 1))
+                        torch.testing.assert_close(call.args[2], values)
+
+
 class TestNpuDcpMetadata(unittest.TestCase):
     def test_graph_mtp_mask_keeps_fixed_shape_for_padding_row(self):
         mask, local_lens = build_mla_dcp_mtp_mask(
