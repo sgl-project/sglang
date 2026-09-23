@@ -21,7 +21,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cpu_ci(est_time=685, suite="base-b-tp-test-cpu")
+register_cpu_ci(est_time=685, suite="stage-a-tp-test-cpu-intel")
 
 
 class TestIntelAMXAttnBackend(CustomTestCase):
@@ -109,7 +109,7 @@ class TestDPAttention(CustomTestCase):
             num_questions=32,
             parallel=32,
             max_new_tokens=512,
-            host="http://127.0.0.1",
+            host="127.0.0.1",
             port=int(self.base_url.split(":")[-1]),
         )
         metrics = run_eval_few_shot_gsm8k(args)

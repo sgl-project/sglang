@@ -20,7 +20,7 @@ from pathlib import Path
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=8, suite="base-a-test-cpu")
+register_cpu_ci(est_time=22, suite="base-a-test-cpu")
 
 _REPO_ROOT = Path(__file__).resolve().parents[4]
 _SRT_DIR = _REPO_ROOT / "python" / "sglang" / "srt"
@@ -115,6 +115,17 @@ _OWNER_SITES = {
     (
         "beam_search/fork.py",
         "free_member_rows",
+        "kv_allocated_len",
+    ): 1,
+    # A completed dLLM canvas is discarded while the context and slot stay owned.
+    (
+        "dllm/mixin/scheduler.py",
+        "SchedulerDllmMixin._stash_dllm_context",
+        "kv_committed_len",
+    ): 1,
+    (
+        "dllm/mixin/scheduler.py",
+        "SchedulerDllmMixin._stash_dllm_context",
         "kv_allocated_len",
     ): 1,
     # streaming session tail trimming

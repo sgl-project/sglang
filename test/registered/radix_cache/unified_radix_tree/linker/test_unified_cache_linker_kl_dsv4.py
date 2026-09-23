@@ -20,7 +20,7 @@ DSV4_FLASH_MODEL = os.environ.get(
 )
 DSV4_FLASH_LAUNCH_TIMEOUT = 3600
 
-register_cuda_ci(est_time=1500, stage="extra-b", runner_config="4-gpu-h100")
+register_cuda_ci(est_time=210, stage="extra-b", runner_config="4-gpu-h100")
 
 
 class TestDeepSeekV4FlashUnifiedCacheLinkerKL(
@@ -73,7 +73,6 @@ class TestDeepSeekV4FlashUnifiedCacheLinkerKL(
                 env={
                     **cls.mooncake.server_env(),
                     "SGLANG_DSV4_FP4_EXPERTS": "0",
-                    "SGLANG_ENABLE_UNIFIED_RADIX_TREE": "1",
                 },
             )
             cls.input_ids = get_input_ids(cls.model, num_samples=18)

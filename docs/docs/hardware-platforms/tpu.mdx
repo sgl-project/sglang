@@ -165,7 +165,7 @@ SGLang-JAX provides comprehensive TPU-optimized features for production LLM serv
 
 ## Optimized Model List
 
-The following models have been tested and optimized for TPU deployment:
+SGLang-JAX supports the following model families. Use the linked TPU cookbooks for deployment instructions.
 
 <table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
   <colgroup>
@@ -175,45 +175,53 @@ The following models have been tested and optimized for TPU deployment:
   <thead>
     <tr style={{borderBottom: "2px solid #d55816"}}>
       <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Model Family</th>
-      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Performance Status</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Cookbook</th>
     </tr>
   </thead>
   <tbody>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><a href="https://huggingface.co/Qwen">Qwen 3</a></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>⭐ Recommended for production</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><a href="https://github.com/sgl-project/sglang-jax/blob/main/docs/cookbook/autoregressive/Qwen/Qwen3.md">Qwen3</a></td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><a href="https://huggingface.co/Qwen">Qwen 3 MoE</a></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>⭐ Best performance</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><a href="https://github.com/sgl-project/sglang-jax/blob/main/docs/cookbook/autoregressive/Qwen/Qwen3-MoE.md">Qwen3 MoE</a></td>
     </tr>
     <tr>
-      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><a href="https://huggingface.co/Qwen">Qwen 2</a></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Needs improvement</td>
-    </tr>
-    <tr>
-      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><a href="https://huggingface.co/Qwen">Qwen 2 MoE</a></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Needs improvement</td>
-    </tr>
-    <tr>
-      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><a href="https://huggingface.co/Qwen">Qwen 1.5</a></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Needs improvement</td>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><a href="https://huggingface.co/Qwen/Qwen2.5-VL-32B-Instruct">Qwen2.5-VL</a></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><a href="https://github.com/sgl-project/sglang-jax/blob/main/docs/cookbook/autoregressive/Qwen/Qwen2.5-VL.md">Qwen2.5-VL</a></td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><a href="https://huggingface.co/meta-llama">Llama/LLaMA</a></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Needs improvement</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><a href="https://github.com/sgl-project/sglang-jax/blob/main/docs/cookbook/autoregressive/Llama/Llama3.1.md">Llama 3.1</a> / <a href="https://github.com/sgl-project/sglang-jax/blob/main/docs/cookbook/autoregressive/Llama/Llama3.3-70B.md">Llama 3.3 70B</a></td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><a href="https://huggingface.co/deepseek-ai/DeepSeek-V3">DeepSeek V3</a> / <a href="https://huggingface.co/deepseek-ai/DeepSeek-R1">R1</a></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><a href="https://github.com/sgl-project/sglang-jax/blob/main/docs/cookbook/autoregressive/DeepSeek/DeepSeek-V3.md">DeepSeek V3</a> / <a href="https://github.com/sgl-project/sglang-jax/blob/main/docs/cookbook/autoregressive/DeepSeek/DeepSeek-R1.md">DeepSeek R1</a></td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><a href="https://huggingface.co/moonshotai/Kimi-Linear-48B-A3B-Instruct">Kimi-Linear</a></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><a href="https://github.com/sgl-project/sglang-jax/blob/main/docs/cookbook/autoregressive/Moonshotai/Kimi-Linear.md">Kimi-Linear</a></td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><a href="https://huggingface.co/xai-org">Grok-2</a></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Needs improvement</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><a href="https://github.com/sgl-project/sglang-jax/blob/main/docs/cookbook/autoregressive/Grok/Grok2.md">Grok-2</a></td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><a href="https://huggingface.co/google">Gemma 2</a></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Verified on TPU</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><a href="https://github.com/sgl-project/sglang-jax/blob/main/docs/cookbook/autoregressive/Google/Gemma2.md">Gemma 2</a></td>
     </tr>
     <tr>
-      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Bailing MoE</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Needs improvement</td>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><a href="https://huggingface.co/XiaomiMiMo/MiMo-V2-Flash">MiMo-V2-Flash</a></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><a href="https://github.com/sgl-project/sglang-jax/blob/main/docs/cookbook/autoregressive/Xiaomi/MiMo-V2-Flash.md">MiMo-V2-Flash</a></td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><a href="https://huggingface.co/XiaomiMiMo/MiMo-V2.5-Pro">MiMo-V2.5-Pro</a></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><a href="https://github.com/sgl-project/sglang-jax/blob/main/docs/cookbook/autoregressive/Xiaomi/MiMo-V2.5-Pro.md">MiMo-V2.5-Pro</a></td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><a href="https://huggingface.co/inclusionAI/Ling-2.6-1T">Ling-2.6</a></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><a href="https://github.com/sgl-project/sglang-jax/blob/main/docs/cookbook/autoregressive/InclusionAI/Ling-2.6.md">Ling-2.6</a></td>
     </tr>
   </tbody>
 </table>
