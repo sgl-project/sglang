@@ -459,6 +459,7 @@ class Engine(EngineScoreMixin, EngineBase):
         session_id: Optional[str] = None,
         *,
         cache_salt: Optional[Union[List[str], str]] = None,
+        input_logprob_temperature: Optional[Union[List[float], float]] = None,
     ) -> Union[Dict, Iterator[Dict]]:
         """
         The arguments of this function is the same as `sglang/srt/managers/io_struct.py::GenerateReqInput`.
@@ -480,6 +481,7 @@ class Engine(EngineScoreMixin, EngineBase):
             cache_salt=cache_salt,
             return_logprob=return_logprob,
             logprob_start_len=logprob_start_len,
+            input_logprob_temperature=input_logprob_temperature,
             top_logprobs_num=top_logprobs_num,
             token_ids_logprob=token_ids_logprob,
             lora_path=lora_path,
@@ -574,6 +576,7 @@ class Engine(EngineScoreMixin, EngineBase):
         session_id: Optional[str] = None,
         *,
         cache_salt: Optional[Union[List[str], str]] = None,
+        input_logprob_temperature: Optional[Union[List[float], float]] = None,
     ) -> Union[Dict, AsyncIterator[Dict]]:
         """
         The arguments of this function is the same as `sglang/srt/managers/io_struct.py::GenerateReqInput`.
@@ -595,6 +598,7 @@ class Engine(EngineScoreMixin, EngineBase):
             cache_salt=cache_salt,
             return_logprob=return_logprob,
             logprob_start_len=logprob_start_len,
+            input_logprob_temperature=input_logprob_temperature,
             top_logprobs_num=top_logprobs_num,
             token_ids_logprob=token_ids_logprob,
             lora_path=lora_path,
