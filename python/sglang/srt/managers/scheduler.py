@@ -1630,11 +1630,22 @@ class Scheduler(
             attn_backends = (self.tp_worker.model_runner.attn_backend,)
         needs_cpu_seq_lens = decide_needs_cpu_seq_lens(attn_backends)
         needs_confidence_relay = decide_needs_confidence_relay()
+        # A device wait pending in another HIP queue slows every dispatch of the
+        # forward graph running meanwhile, so speculative overlap schedules on the
+        # forward stream; without speculation there is no publish wait, and the
+        # separate schedule stream keeps overlapping the next batch's preparation.
+        self.schedule_on_forward_stream = (
+            _is_hip
+            and self.enable_overlap
+            and self.spec_algorithm.is_some()
+            and get_parallel().pp_size == 1
+        )
         self.future_map = self.spec_algorithm.create_future_map(
             self.device,
             self.req_to_token_pool,
             needs_cpu_seq_lens=needs_cpu_seq_lens,
             needs_confidence_relay=needs_confidence_relay,
+            same_queue_publish=self.schedule_on_forward_stream,
         )
 
         self._confidence_budget_prepare = None
@@ -1883,6 +1894,8 @@ class Scheduler(
                 self.schedule_stream = allocate_distinct_stream(
                     self.device_module, (self.forward_stream,)
                 )
+        if self.schedule_on_forward_stream:
+            self.schedule_stream = self.forward_stream
         # The global WAR barrier fences the scheduler's next shared-buffer write
         # on the previous forward's read of the unified memory pool.
         self._war_barrier_enabled = is_cuda() or envs.SGLANG_ENABLE_WAR_BARRIER.get()

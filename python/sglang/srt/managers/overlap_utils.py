@@ -257,6 +257,7 @@ class FutureMap:
         req_to_token_pool: ReqToTokenPool,
         needs_cpu_seq_lens: bool = True,
         needs_confidence_relay: bool = False,
+        same_queue_publish: bool = False,
     ):
         # Bufs indexed by req_pool_idx; slot 0 mirrors KV padding row so
         # CUDA-graph padded batches (req_pool_idx == 0) are harmless.
@@ -266,6 +267,9 @@ class FutureMap:
         # full decision (per-backend flag + TBO / piecewise CG overrides).
         self.needs_cpu_seq_lens = needs_cpu_seq_lens
         self.needs_confidence_relay = needs_confidence_relay
+        # True when the scheduler runs on the publishing (forward) stream, so a
+        # publish wait never crosses HW queues.
+        self.same_queue_publish = same_queue_publish
         self.req_pool_size = req_to_token_pool.req_to_token.shape[0]
         # Kept for the mixed-tail late binding (reserved-slot gather).
         self.req_to_token = req_to_token_pool.req_to_token
@@ -475,7 +479,7 @@ class FutureMap:
         if n == 0:
             return
         if self.publish_ready is not None:
-            if _is_hip:
+            if _is_hip and not self.same_queue_publish:
                 self.publish_ready.synchronize()
             else:
                 self.publish_ready.wait()
@@ -527,7 +531,7 @@ class FutureMap:
                 # forward publish; a stale consume means a publish went missing.
                 assert self._publish_fresh, "resolve without a fresh forward publish"
                 self._publish_fresh = False
-            if _is_hip:
+            if _is_hip and not self.same_queue_publish:
                 # Temporary workaround: Event.wait() regresses TPOT on AMD MI355.
                 self.publish_ready.synchronize()
             else:
