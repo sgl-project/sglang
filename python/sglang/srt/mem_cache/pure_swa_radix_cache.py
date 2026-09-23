@@ -65,12 +65,8 @@ class PureSWARadixCache(RadixCache):
     def cache_finished_req(
         self, req: Req, is_insert: bool = True, *, owned_kv_len: int
     ):
-        """Cache request when it finishes.
-
-        Only the prefill portion [0, evict_floor) is inserted into the radix
-        tree. The rest of the request's row goes back through free_kv_row,
-        which skips the span _evict_swa already freed during decode.
-        """
+        """Insert only the prefill portion [0, evict_floor); free_kv_row skips
+        the span _evict_swa already freed during decode."""
         if self.disable:
             self.free_kv_row(req.kv, [(req.kv.cache_protected_len, owned_kv_len)])
             return
@@ -109,7 +105,6 @@ class PureSWARadixCache(RadixCache):
             )
             release_from = insert_end
 
-        # The tree holds [0, release_from); the rest is this request's to free.
         self.free_kv_row(req.kv, [(release_from, owned_kv_len)])
 
         if req.last_node is not None:

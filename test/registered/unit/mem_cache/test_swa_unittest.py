@@ -508,9 +508,7 @@ class TestFreeKvRow(CustomTestCase):
         self.assertEqual(len(allocator.freed), 2)
 
     def test_rows_below_the_dead_floor_are_still_alive(self):
-        # All-SWA, prefill-aware: window eviction starts at swa_dead_lo, so rows
-        # between the protected prefix and the evict floor were never freed and
-        # go back on release; only [swa_dead_lo, cursor) is dead.
+        # all-SWA: only [swa_dead_lo, cursor) is dead; [start, swa_dead_lo) is alive
         allocator = _build_pure_swa_allocator(size_swa=16)
         baseline = allocator.swa_available_size()
         indices = _swa_alloc(allocator, 8)
@@ -521,7 +519,6 @@ class TestFreeKvRow(CustomTestCase):
         kv = ReqKvInfo(req_pool_idx=0, swa_evicted_seqlen=6, swa_evict_floor=4)
         cache.free_kv_row(kv, [(2, 8)])
 
-        # [2, 4) and [6, 8) are given back; [4, 6) is not freed twice.
         self.assertEqual(allocator.swa_available_size(), baseline - 2)
 
 

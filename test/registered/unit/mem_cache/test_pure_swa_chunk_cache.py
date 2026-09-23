@@ -14,8 +14,7 @@ register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 class _FakeAllocator:
-    """Records what free_kv_row hands back. On an all-SWA allocator the
-    full-side call is a no-op, so rows routed there are the ones skipped."""
+    """Rows routed to the full side are skipped: all-SWA has no full pool."""
 
     page_size = 1
 

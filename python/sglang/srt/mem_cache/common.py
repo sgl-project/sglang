@@ -126,9 +126,7 @@ def free_kv_row_segments(
     swa_dead_lo: int = 0,
 ) -> None:
     """Free ascending disjoint ``(kv_indices, start_pos)`` segments of one
-    request's kv row. Row positions in ``[swa_dead_lo, swa_evicted_seqlen)``
-    have no SWA peer any more (see ``ReqKvInfo.swa_dead_lo``), so they go back
-    full-side only; everything else is given back on both sides."""
+    request's kv row; ``[swa_dead_lo, swa_evicted_seqlen)`` goes back full-side only."""
     swa_dead: list[tuple[torch.Tensor, int]] = []
     swa_alive: list[tuple[torch.Tensor, int]] = []
     for kv_indices, start_pos in segments:
@@ -136,9 +134,6 @@ def free_kv_row_segments(
         if num_indices == 0:
             continue
         end_pos = start_pos + num_indices
-        # Between the dead floor and the cursor the SWA peers are already gone
-        # -- window eviction, or the deliberately unmapped prefix of a PD decode
-        # SWA-tail prealloc. Below the floor they never were evicted.
         dead_start = min(max(swa_dead_lo, start_pos), end_pos)
         dead_end = min(max(swa_evicted_seqlen, dead_start), end_pos)
         if dead_end == dead_start:

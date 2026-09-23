@@ -137,13 +137,5 @@ class SWAChunkCache(ChunkCache):
 
 
 class PureSWAChunkCache(SWAChunkCache):
-    """ChunkCache for all-SWA models (no full attention layers).
-
-    For hybrid models, full_to_swa_index_mapping prevents SWA double-free.
-    All-SWA models lack this mapping, so free_kv_row skips the range
-    ``free_swa_out_of_window_slots`` (a.k.a. _evict_swa) already freed during
-    decode: from ``req.kv.swa_dead_lo`` up to ``req.kv.swa_evicted_seqlen``.
-    ``req.kv.swa_evict_floor`` shields the prompt/image KV from window
-    eviction only while the request is active, so that range IS released
-    on finish.
-    """
+    """ChunkCache for all-SWA models (no full attention layers): no
+    full_to_swa_index_mapping, so free_kv_row must skip the window-evicted span."""

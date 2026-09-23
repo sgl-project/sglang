@@ -14,8 +14,7 @@ register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 class _FakeAllocator:
-    """Records what free_kv_row hands back. On an all-SWA allocator the
-    full-side call is a no-op, so rows routed there are the ones skipped."""
+    """Rows routed to the full side are skipped: all-SWA has no full pool."""
 
     page_size = 1
 
@@ -77,8 +76,7 @@ class TestPureSWARadixCache(CustomTestCase):
     def test_no_insert_keeps_rows_below_the_floor_after_swa_eviction(self):
         cache, allocator = _make_cache()
 
-        # Decode evicted [4, 6): the floor is 4, the cursor is 6. Rows below
-        # the floor were shielded from eviction and are still this req's.
+        # floor 4, cursor 6: [4, 6) is dead, [0, 4) was shielded and is alive
         cache.cache_finished_req(
             _make_req(swa_evicted_seqlen=6), is_insert=False, owned_kv_len=8
         )
