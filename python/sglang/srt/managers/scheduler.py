@@ -530,6 +530,7 @@ class Scheduler(
 
         # Init inter-process communication
         self.init_ipc_channels(port_args)
+        self._last_idle_empty_cache_time = time.monotonic()
         self.init_idle_sleeper()
 
         # Init PD-multiplexing context
@@ -4980,6 +4981,9 @@ class Scheduler(
             self.load_inquirer.get_loads, force=True, snapshot=snapshot
         )
 
+        # Per-rank: the caching allocator is per process, not shared across ranks.
+        self.maybe_empty_cache_on_idle()
+
         # sleep until next event
         self.maybe_sleep_on_idle()
         self.metrics_reporter.record_scheduler_idle()
@@ -5856,6 +5860,17 @@ class Scheduler(
             or not self.enable_session_radix_cache
         ):
             self.session_controller.close(recv_req)
+
+    def maybe_empty_cache_on_idle(self) -> None:
+        """Reclaim this rank's cached allocator blocks once the interval elapses."""
+        interval = envs.SGLANG_EMPTY_CACHE_INTERVAL.get()
+        if interval <= 0:
+            return
+        now = time.monotonic()
+        if now - self._last_idle_empty_cache_time < interval:
+            return
+        self._last_idle_empty_cache_time = now
+        current_platform.empty_cache()
 
     def maybe_sleep_on_idle(self):
         if self.idle_sleeper is not None:
