@@ -62,6 +62,7 @@ from sglang.srt.runtime_context import get_context
 from sglang.srt.speculative.eagle_disaggregation import (
     build_eagle_disagg_draft_input,
 )
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -623,6 +624,80 @@ class TestStagingWatermark(unittest.TestCase):
 
         sock.send_multipart.assert_called_once_with(
             [b"WATERMARK", b"3", b"0", b"session-new"]
+        )
+
+
+class TestMooncakeHiSparseSpecIndices(CustomTestCase):
+    def test_draft_buffers_use_logical_device_indices(self):
+        manager = object.__new__(MooncakeKVManager)
+        manager.kv_args = SimpleNamespace(
+            mla_compression_ratios=None,
+            prefill_start_layer=10,
+            prefill_end_layer=12,
+            kv_data_ptrs=[1, 2, 3],
+            kv_item_lens=[4, 4, 4],
+            kv_layer_ids=[],
+        )
+        manager._send_kvcache_generic = Mock(return_value=0)
+        device_indices = np.array([7, 8], dtype=np.int32)
+
+        with patch(
+            "sglang.srt.disaggregation.mooncake.conn.get_memory",
+            return_value=SimpleNamespace(enable_unified_memory=False),
+        ):
+            status = manager.send_kvcache(
+                mooncake_session_id="session",
+                prefill_kv_indices=np.array([1, 2], dtype=np.int32),
+                dst_kv_ptrs=[101, 102, 201],
+                dst_kv_indices=np.array([11, 12], dtype=np.int32),
+                executor=Mock(),
+                dst_device_kv_indices=device_indices,
+            )
+
+        self.assertEqual(status, 0)
+        kwargs = manager._send_kvcache_generic.call_args.kwargs
+        self.assertEqual(kwargs["dst_device_data_ptrs"], {201})
+        np.testing.assert_array_equal(kwargs["dst_device_data_indices"], device_indices)
+
+
+class TestHiSparseStagedSpecRelay(CustomTestCase):
+    def test_builds_lightweight_eagle_relay_handle(self):
+        future_map = object.__new__(FutureMap)
+        future_map.spec_algo = SpeculativeAlgorithm.EAGLE
+        future_map.dsa_topk_indices_buf = None
+        future_indices = torch.tensor([2, 5], device="cpu")
+
+        spec_input = future_map.make_staged_spec_input(future_indices)
+
+        self.assertIs(spec_input.future_indices, future_indices)
+        self.assertFalse(spec_input.future_dsa_topk_indices_available)
+
+    @patch("sglang.srt.managers.overlap_utils.gather_spec_extras")
+    def test_staged_relay_restores_rejection_sampling_probs(self, gather_spec_extras):
+        future_map = object.__new__(FutureMap)
+        future_map.spec_algo = SpeculativeAlgorithm.EAGLE
+        future_map.device = torch.device("cpu")
+        future_map.need_topk = True
+        future_map.need_hidden_states = False
+        future_map.topk_p_buf = torch.zeros((4, 1), dtype=torch.float32)
+        future_map.topk_index_buf = torch.zeros((4, 1), dtype=torch.int64)
+        future_map.output_tokens_buf = torch.arange(4, dtype=torch.int64)
+        future_map.hidden_states_buf = None
+        future_map.draft_probs_buf = torch.arange(12, dtype=torch.float32).view(4, 3)
+        future_map.dsa_topk_indices_buf = None
+        future_indices = torch.tensor([2, 3], dtype=torch.int64)
+        spec_input = future_map.make_staged_spec_input(future_indices)
+        gather_spec_extras.return_value = (
+            torch.zeros((2, 1)),
+            torch.zeros((2, 1), dtype=torch.int64),
+            torch.tensor([2, 3]),
+            None,
+        )
+
+        future_map._resolve_spec_extras(SimpleNamespace(spec_info=spec_input))
+
+        torch.testing.assert_close(
+            spec_input.draft_probs, future_map.draft_probs_buf[future_indices]
         )
 
 

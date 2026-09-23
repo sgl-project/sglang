@@ -1,23 +1,20 @@
 import time
 import unittest
 
+import requests
+
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kits.eval_accuracy_kit import GSM8KMixin
 from sglang.test.server_fixtures.default_fixture import DefaultServerBase
 from sglang.test.test_utils import terminate_and_kill_process_tree
 
-register_cuda_ci(est_time=483, stage="extra-b", runner_config="8-gpu-h200")
+register_cuda_ci(est_time=540, stage="extra-b", runner_config="8-gpu-h200")
 
 GLM52_FP8_MODEL_PATH = "zai-org/GLM-5.2-FP8"
 
 
-class TestGLM52HiSparse(DefaultServerBase, GSM8KMixin):
-    """GLM-5.2 FP8 with HiSparse (host-to-device sparse KV offload) on DSA decode.
-
-    HiSparse targets the high-concurrency regime and is not used together with
-    EAGLE MTP, so this variant runs without speculative decoding (unlike the
-    DSA-MTP variants in test_dsa_glm52_{dp,tp}_mtp.py).
-    """
+class TestGLM52HiSparseSpec(DefaultServerBase, GSM8KMixin):
+    """GLM-5.2 FP8 with HiSparse and multi-step EAGLE speculative decoding."""
 
     model = GLM52_FP8_MODEL_PATH
     other_args = [
@@ -38,6 +35,14 @@ class TestGLM52HiSparse(DefaultServerBase, GSM8KMixin):
         "bfloat16",
         "--dsa-decode-backend",
         "flashmla_sparse",
+        "--speculative-algorithm",
+        "EAGLE",
+        "--speculative-num-steps",
+        "3",
+        "--speculative-eagle-topk",
+        "1",
+        "--speculative-num-draft-tokens",
+        "4",
         "--enable-hisparse",
         "--hisparse-config",
         '{"top_k": 2048, "device_buffer_size": 4096, "host_to_device_ratio": 5}',
@@ -50,6 +55,27 @@ class TestGLM52HiSparse(DefaultServerBase, GSM8KMixin):
     gsm8k_num_questions = 500
     gsm8k_num_threads = 100
     gsm8k_num_shots = 24
+    gsm8k_accept_length_thres = 2.5
+
+    def test_long_context_spec_swap(self):
+        """Exercise the speculative swap path beyond the 4096-token GPU cache."""
+        response = requests.post(
+            self.base_url + "/generate",
+            json={
+                "input_ids": [1] * 8192,
+                "sampling_params": {
+                    "temperature": 0,
+                    "max_new_tokens": 128,
+                    "ignore_eos": True,
+                },
+            },
+            timeout=600,
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        result = response.json()
+        meta = result["meta_info"]
+        self.assertEqual(meta["completion_tokens"], 128)
+        self.assertGreater(meta["spec_verify_ct"], 0)
 
     @classmethod
     def tearDownClass(cls):

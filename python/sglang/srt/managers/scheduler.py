@@ -3611,6 +3611,11 @@ class Scheduler(
         )
         batch.input_ids = None
 
+        if not batch.spec_algorithm.is_none():
+            batch.spec_info = self.future_map.make_staged_spec_input(
+                batch.req_pool_indices
+            )
+
         if batch.return_logprob:
             batch.top_logprobs_nums = [r.logprob.top_logprobs_num for r in reqs]
             batch.token_ids_logprobs = [list(r.origin_input_ids) for r in reqs]
@@ -3916,6 +3921,11 @@ class Scheduler(
             dllm_config=self.dllm_config,
             waiting_queue_len=len(self.waiting_queue),
             prefill_tile_block_m=prefill_tile_block_m,
+            new_request_token_reserve=(
+                self.hisparse_coordinator.spec_scratch_capacity
+                if self.hisparse_coordinator is not None
+                else 0
+            ),
         )
 
         if self.chunked_req is not None:
@@ -4083,6 +4093,7 @@ class Scheduler(
         new_batch.contains_last_prefill_chunk = (
             self.chunked_req is None or len(can_run_list) != 1
         )
+        new_batch.hisparse_coordinator = self.hisparse_coordinator
 
         if self.enable_hierarchical_cache or self.enable_unified_cache_external_linker:
             # todo (zhiqiang): disable cuda graph execution if hicache loading triggered
