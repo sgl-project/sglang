@@ -21,7 +21,6 @@ from sglang.srt.hardware_backend.npu.attention.dcp import (
 from sglang.srt.hardware_backend.npu.attention.dcp_metadata import (
     build_mla_dcp_local_block_tables,
     build_mla_dcp_mtp_mask,
-    prepare_decode_context_parallel_metadata_npu,
 )
 from sglang.srt.hardware_backend.npu.attention.mla_preprocess import (
     is_fia_nz,
@@ -33,7 +32,10 @@ from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config import (
 )
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
-from sglang.srt.layers.dcp.comm import all_gather_kv_cache_for_dcp
+from sglang.srt.layers.dcp.comm import (
+    all_gather_kv_cache_for_dcp,
+    create_dcp_a2a_buffers,
+)
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.layers.utils.cp_utils import cp_all_gather_rerange_kv_cache
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
@@ -108,6 +110,7 @@ class ForwardMetadata:
     actual_seq_lengths_q_pa_cpu: Optional[torch.Tensor] = None
     actual_seq_lengths_kv: Optional[torch.Tensor] = None
     dcp_mtp_attn_mask: Optional[torch.Tensor] = None
+    dcp_a2a_graph_buffers: Optional[dict[str, torch.Tensor]] = None
 
     # swa attention mask for graph mode decode
     swa_mask: Optional[torch.Tensor] = None
@@ -334,7 +337,7 @@ def _normalize_mla_k_rope_cache(
 
 
 class AscendAttnBackend(AttentionBackend):
-    dcp_metadata_builder = staticmethod(prepare_decode_context_parallel_metadata_npu)
+    dcp_use_packed_kv = False
 
     def __init__(self, model_runner: ModelRunner, speculative_step_id: int = 0):
         super().__init__()
@@ -529,10 +532,14 @@ class AscendAttnBackend(AttentionBackend):
             num_padding=getattr(forward_batch, "num_padding", 0),
             in_capture=in_capture,
         )
+        forward_batch.dcp_a2a_graph_buffers = (
+            self.forward_metadata.dcp_a2a_graph_buffers
+        )
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Init the metadata for a forward pass."""
         self.forward_metadata = ForwardMetadata()
+        forward_batch.dcp_a2a_graph_buffers = None
         parallel = get_parallel()
         mla_dcp_decode = (
             self.use_mla
@@ -870,6 +877,20 @@ class AscendAttnBackend(AttentionBackend):
         )
         if mla_dcp_graph:
             metadata.seq_lens = self.graph_metadata["dcp_seq_lens"][:bs]
+            if forward_mode.is_decode() or forward_mode.is_target_verify():
+                query_len = (
+                    int(self.speculative_num_draft_tokens)
+                    if forward_mode.is_target_verify()
+                    else 1
+                )
+                metadata.dcp_a2a_graph_buffers = create_dcp_a2a_buffers(
+                    parallel.dcp_size,
+                    bs * query_len,
+                    self.tp_q_head_num,
+                    self.kv_lora_rank,
+                    dtype=self.model_dtype or torch.bfloat16,
+                    device=self.device,
+                )
             if forward_mode.is_target_verify():
                 metadata.dcp_mtp_attn_mask = self.graph_metadata["dcp_mtp_attn_mask"][
                     :bs

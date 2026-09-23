@@ -6,7 +6,6 @@ from sgl_kernel_npu.norm.fused_split_qk_norm import fused_split_qk_norm
 
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.attention.dcp import (
-    all_gather_mla_decode_q_npu,
     merge_mla_dcp_output_npu,
 )
 from sglang.srt.hardware_backend.npu.attention.mla_preprocess import (
@@ -20,6 +19,7 @@ from sglang.srt.layers.attention.dsa.utils import (
     dsa_use_prefill_cp,
 )
 from sglang.srt.layers.communicator import ScatterMode, get_attn_tp_context
+from sglang.srt.layers.dcp.comm import all_gather_q_for_mla_decode
 from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
 from sglang.srt.runtime_context import get_disagg, get_parallel
 
@@ -308,7 +308,11 @@ def forward_mla_prepare_npu(
         )
     )
     if dcp_decode_phase:
-        q_nope_out, q_pe = all_gather_mla_decode_q_npu(q_nope_out, q_pe)
+        q_nope_out, q_pe = all_gather_q_for_mla_decode(q_nope_out, q_pe)
+        # FIA requires contiguous query inputs, while the common helper returns
+        # transposed views so CUDA backends can choose their preferred layout.
+        q_nope_out = q_nope_out.contiguous()
+        q_pe = q_pe.contiguous()
 
     return (
         q_pe,
@@ -362,7 +366,11 @@ def forward_mla_core_npu(
             m.num_local_heads * parallel.attn_dcp_size,
             m.kv_lora_rank,
         )
-        attn_output = merge_mla_dcp_output_npu(attn_output, attn_lse)
+        attn_output = merge_mla_dcp_output_npu(
+            attn_output,
+            attn_lse,
+            graph_buffers=getattr(forward_batch, "dcp_a2a_graph_buffers", None),
+        )
     else:
         attn_output = m.attn_mqa(
             q_nope_out,

@@ -91,6 +91,8 @@ def create_mla_kv_page_table_for_dcp(
     DCP_RANK: tl.constexpr,
     PAGES_PER_BLOCK: tl.constexpr,
     HAS_V2P: tl.constexpr,
+    NUM_PAGES: tl.constexpr = None,
+    MAX_SEQ_LEN: tl.constexpr = None,
 ):
     """This rank's cyclic slice of each request, as a page table.
 
@@ -104,8 +106,12 @@ def create_mla_kv_page_table_for_dcp(
     page_offsets = page_block * PAGES_PER_BLOCK + tl.arange(0, PAGES_PER_BLOCK)
     local_len = tl.load(local_seq_lens_ptr + req)
     local_pages = tl.cdiv(local_len, PHYSICAL_PAGE_SIZE)
-    mask = page_offsets < local_pages
     global_positions = DCP_RANK + page_offsets * PHYSICAL_PAGE_SIZE * DCP_SIZE
+    mask = page_offsets < local_pages
+    if NUM_PAGES is not None:
+        mask &= page_offsets < NUM_PAGES
+    if MAX_SEQ_LEN is not None:
+        mask &= global_positions < MAX_SEQ_LEN
     req_pool_index = tl.load(req_pool_indices_ptr + req)
     virtual_locs = tl.load(
         req_to_token_ptr + req_pool_index * req_to_token_stride + global_positions,

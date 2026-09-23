@@ -622,8 +622,13 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # module. Import it from sglang.srt.layers.dcp.metadata if a runtime use is added.
     attn_dcp_metadata: Optional[DecodeContextParallelMetadata] = None
 
-    # Decode context parallel KV write mask.
+    # Decode context parallel KV write mask used by HIP KV-store kernels.
+    # Ascend MLA remaps virtual write locations inside NPUMLATokenToKVPool.
     dcp_kv_mask: Optional[torch.Tensor] = None
+
+    # Pointer-stable packed DCP communication buffers owned by an attention
+    # backend during graph capture/replay. Eager forwards leave this unset.
+    dcp_a2a_graph_buffers: Optional[Dict[str, torch.Tensor]] = None
 
     # For ngram embedding
     ngram_embedding_info: Optional[NgramEmbeddingInfo] = None
@@ -995,7 +1000,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         if (
             model_runner.ps.attn_dcp_size > 1
             and ret.out_cache_loc is not None
-            and (is_hip() or _is_npu)
+            and is_hip()
         ):
             ret.dcp_kv_mask = (
                 ret.positions % model_runner.ps.attn_dcp_size

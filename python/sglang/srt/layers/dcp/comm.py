@@ -256,7 +256,9 @@ def all_gather_q_for_mla_decode(
     q_pe: torch.Tensor,
 ):
     group = get_parallel().dcp_group
-    with use_symmetric_memory(group):
+    # The shared helper also serves HCCL. NCCL symmetric-memory allocation is
+    # CUDA-only even if a stale/global flag happens to be enabled on Ascend.
+    with use_symmetric_memory(group, disabled=q_pe.device.type != "cuda"):
         # transpose q_pe and q_nope_out from [B, H, L] to [H, B, L]
         combined = torch.cat([q_pe.transpose(0, 1), q_nope_out.transpose(0, 1)], dim=-1)
     gathered = group.all_gather(combined, dim=0)
@@ -266,6 +268,24 @@ def all_gather_q_for_mla_decode(
     q_pe = q_pe.transpose(0, 1)
     q_nope_out = q_nope_out.transpose(0, 1)
     return q_nope_out, q_pe
+
+
+def create_dcp_a2a_buffers(
+    dcp_size: int,
+    num_tokens: int,
+    local_heads: int,
+    head_dim: int,
+    *,
+    dtype: torch.dtype,
+    device: torch.device | str,
+) -> dict[str, torch.Tensor]:
+    """Packed send/receive storage, also reusable across graph replays."""
+    shape = (dcp_size, num_tokens, local_heads, head_dim + _lse_pack_dim(dtype))
+    send_combined = torch.empty(shape, dtype=dtype, device=device)
+    return {
+        "send_combined": send_combined,
+        "recv_combined": torch.empty_like(send_combined),
+    }
 
 
 def all_gather_kv_cache_for_mla_extend(
@@ -493,19 +513,17 @@ def dcp_a2a_lse_reduce(
     out_dtype = cp_attn_out.dtype
     lpd = _lse_pack_dim(out_dtype)  # 2 for bf16/fp16
 
-    if cuda_graph_buffers is not None:
-        send_combined = cuda_graph_buffers["send_combined"]
-        recv_combined = cuda_graph_buffers["recv_combined"]
-    else:
-        send_combined = torch.empty(
+    if cuda_graph_buffers is None:
+        cuda_graph_buffers = create_dcp_a2a_buffers(
             N,
             B,
             H_per_rank,
-            D + lpd,
+            D,
             dtype=out_dtype,
             device=cp_attn_out.device,
         )
-        recv_combined = torch.empty_like(send_combined)
+    send_combined = cuda_graph_buffers["send_combined"]
+    recv_combined = cuda_graph_buffers["recv_combined"]
 
     send_words = send_combined.view(torch.float32)
     dcp_pack_a2a_send(

@@ -85,9 +85,9 @@ class AttentionBackend(ABC):
     # allow-list enforces.
     kv_index_translator = None
 
-    # Optional device-specific replacement for the CUDA/Triton DCP metadata
-    # builder. The shared planner keeps the CUDA path as its default.
-    dcp_metadata_builder = None
+    # FIA gathers prefix KV from separate K/rope buffers, not the packed MLA
+    # buffer. It needs only the common rank-local prefix indices.
+    dcp_use_packed_kv = True
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Eager entry point. Default = ``_out_graph(fb) + _in_graph(fb)``.

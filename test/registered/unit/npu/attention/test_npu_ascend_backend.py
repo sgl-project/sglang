@@ -2,7 +2,6 @@
 Unit tests for sglang.srt.hardware_backend.npu.attention.ascend_backend.
 """
 
-import math
 import sys
 import unittest
 from dataclasses import fields, is_dataclass
@@ -45,9 +44,7 @@ from sglang.srt.hardware_backend.npu.attention.dcp import (
     merge_mla_dcp_output_npu,
 )
 from sglang.srt.hardware_backend.npu.attention.dcp_metadata import (
-    build_mla_dcp_local_block_tables,
     build_mla_dcp_mtp_mask,
-    prepare_decode_context_parallel_metadata_npu,
 )
 from sglang.srt.layers.dcp.layout import get_dcp_lens
 
@@ -143,57 +140,6 @@ class TestNormalizeMlaKRoPECache(unittest.TestCase):
 
 
 class TestNpuDcpMetadata(unittest.TestCase):
-    def test_local_block_tables_map_widened_virtual_pages(self):
-        physical_page_size = 4
-        dcp_size = 4
-        widened_page_size = physical_page_size * dcp_size
-        seq_lens = torch.tensor([1, 17, 31], dtype=torch.int32)
-        req_pool_indices = torch.tensor([0, 1, 2], dtype=torch.int64)
-        page_ids = [[11, 12], [21, 22], [31, 32]]
-        req_to_token = torch.zeros(3, 32, dtype=torch.int64)
-        for req_idx in range(3):
-            for pos in range(32):
-                virtual_page = pos // widened_page_size
-                req_to_token[req_idx, pos] = (
-                    page_ids[req_idx][virtual_page] * widened_page_size
-                    + pos % widened_page_size
-                )
-
-        for rank in range(dcp_size):
-            block_tables, local_lens = build_mla_dcp_local_block_tables(
-                req_to_token,
-                req_pool_indices,
-                seq_lens,
-                physical_page_size,
-                dcp_size,
-                rank,
-            )
-            expected_lens = get_dcp_lens(seq_lens, dcp_size, rank).to(torch.int32)
-            torch.testing.assert_close(local_lens, expected_lens)
-            for req_idx, local_len in enumerate(expected_lens.tolist()):
-                num_pages = math.ceil(local_len / physical_page_size)
-                self.assertEqual(
-                    block_tables[req_idx, :num_pages].tolist(),
-                    page_ids[req_idx][:num_pages],
-                )
-                self.assertTrue(torch.all(block_tables[req_idx, num_pages:] == 0))
-
-    def test_graph_block_tables_keep_fixed_width_and_mask_tail(self):
-        req_to_token = torch.arange(16, dtype=torch.int64).view(1, 16) + 64
-        block_tables, local_lens = build_mla_dcp_local_block_tables(
-            req_to_token,
-            torch.tensor([0]),
-            torch.tensor([5]),
-            physical_page_size=4,
-            dcp_size=2,
-            dcp_rank=1,
-            num_pages=3,
-        )
-
-        self.assertEqual(local_lens.tolist(), [2])
-        self.assertEqual(block_tables.shape, (1, 3))
-        self.assertEqual(block_tables[0, 1:].tolist(), [0, 0])
-
     def test_graph_mtp_mask_keeps_fixed_shape_for_padding_row(self):
         mask, local_lens = build_mla_dcp_mtp_mask(
             torch.tensor([5, 0]),
@@ -247,46 +193,6 @@ class TestNpuDcpMetadata(unittest.TestCase):
                             (req_idx, rank, query_idx, local_idx),
                         )
 
-    def test_extend_metadata_matches_prefix_owner_layout(self):
-        dcp_size = 4
-        prefix_lens = torch.tensor([4, 8], dtype=torch.int32)
-        extend_lens = torch.tensor([2, 3], dtype=torch.int32)
-        seq_lens = prefix_lens + extend_lens
-        req_to_token = torch.tensor(
-            [
-                [40, 41, 42, 43, 100, 101, 0, 0],
-                [80, 81, 82, 83, 84, 85, 86, 87],
-            ],
-            dtype=torch.int32,
-        )
-        req_pool_indices = torch.tensor([0, 1], dtype=torch.int64)
-        all_prefix = torch.cat([req_to_token[0, :4], req_to_token[1, :8]])
-
-        for rank in range(dcp_size):
-            with rc.get_parallel().override(
-                dcp_enabled=True,
-                dcp_size=dcp_size,
-                dcp_rank=rank,
-            ):
-                metadata = prepare_decode_context_parallel_metadata_npu(
-                    seq_lens=seq_lens,
-                    extend_prefix_lens_cpu=prefix_lens,
-                    extend_seq_lens=extend_lens,
-                    req_pool_indices=req_pool_indices,
-                    req_to_token=req_to_token,
-                    seq_lens_sum=int(seq_lens.sum()),
-                    kv_cache_dtype=torch.bfloat16,
-                    kv_cache_device="cpu",
-                )
-            expected_local = all_prefix[rank::dcp_size] // dcp_size
-            torch.testing.assert_close(
-                metadata.dcp_local_prefix_kv_indices, expected_local
-            )
-            self.assertIsNone(metadata.dcp_kv_indptr)
-            self.assertIsNone(metadata.dcp_kv_indices)
-            self.assertIsNone(metadata.dcp_kv_buffer)
-            self.assertIsNone(metadata.dcp_extend_prefix_lens_sum)
-
 
 class TestForwardMetadata(unittest.TestCase):
     def test_is_dataclass(self):
@@ -334,6 +240,7 @@ class TestForwardMetadata(unittest.TestCase):
             "actual_seq_lengths_q_pa_cpu",
             "actual_seq_lengths_kv",
             "dcp_mtp_attn_mask",
+            "dcp_a2a_graph_buffers",
             "swa_mask",
             "prefix_lens",
             "flatten_prefix_block_tables",
@@ -371,7 +278,17 @@ class TestForwardMetadata(unittest.TestCase):
             out_cache_loc=None,
         )
 
-        with rc.get_parallel().override(dcp_enabled=True, dcp_size=2, dcp_rank=1):
+        with (
+            rc.get_parallel().override(dcp_enabled=True, dcp_size=2, dcp_rank=1),
+            patch(
+                "sglang.srt.hardware_backend.npu.attention.ascend_backend."
+                "build_mla_dcp_local_block_tables",
+                return_value=(
+                    torch.tensor([[7]], dtype=torch.int32),
+                    torch.tensor([4]),
+                ),
+            ),
+        ):
             backend.init_forward_metadata(forward_batch)
 
         self.assertEqual(backend.forward_metadata.seq_lens.tolist(), [4])
@@ -397,13 +314,26 @@ class TestForwardMetadata(unittest.TestCase):
         backend.device = "cpu"
         backend.max_context_len = 8
         backend.speculative_num_draft_tokens = 3
+        backend.tp_q_head_num = 4
+        backend.kv_lora_rank = 16
+        backend.model_dtype = torch.bfloat16
         backend.q_head_num_padding = None
         backend.is_hybrid_swa = False
         backend.use_sliding_window_kv_pool = False
         backend.enable_sparsity_driven_kv_offload = False
         backend.req_to_token = torch.arange(56, 88, dtype=torch.int64).view(2, 16)
 
-        with rc.get_parallel().override(dcp_enabled=True, dcp_size=2, dcp_rank=1):
+        with (
+            rc.get_parallel().override(dcp_enabled=True, dcp_size=2, dcp_rank=1),
+            patch(
+                "sglang.srt.hardware_backend.npu.attention.ascend_backend."
+                "build_mla_dcp_local_block_tables",
+                return_value=(
+                    torch.tensor([[7], [0]], dtype=torch.int32),
+                    torch.tensor([4, 0], dtype=torch.int32),
+                ),
+            ),
+        ):
             backend.init_cuda_graph_state(max_bs=2, max_num_tokens=6)
             metadata = backend._init_cuda_graph_metadata(
                 2,
@@ -412,6 +342,7 @@ class TestForwardMetadata(unittest.TestCase):
             )
             seq_lens_ptr = metadata.seq_lens.data_ptr()
             mask_ptr = metadata.dcp_mtp_attn_mask.data_ptr()
+            send_ptr = metadata.dcp_a2a_graph_buffers["send_combined"].data_ptr()
             backend._apply_cuda_graph_metadata(
                 bs=2,
                 req_pool_indices=torch.tensor([0, 1]),
@@ -429,6 +360,14 @@ class TestForwardMetadata(unittest.TestCase):
         self.assertTrue(metadata.dcp_mtp_attn_mask[1].all())
         self.assertEqual(metadata.seq_lens.data_ptr(), seq_lens_ptr)
         self.assertEqual(metadata.dcp_mtp_attn_mask.data_ptr(), mask_ptr)
+        self.assertEqual(
+            metadata.dcp_a2a_graph_buffers["send_combined"].shape,
+            (2, 6, 4, 18),
+        )
+        self.assertEqual(
+            metadata.dcp_a2a_graph_buffers["send_combined"].data_ptr(),
+            send_ptr,
+        )
 
 
 class TestEmptyDcpTargetVerify(unittest.TestCase):
@@ -537,6 +476,10 @@ class TestEmptyDcpTargetVerify(unittest.TestCase):
         expected = torch.randn(2, 4, 16, dtype=torch.bfloat16)
         compact_a2a.return_value = expected
         dcp_group = MagicMock()
+        graph_buffers = {
+            "send_combined": torch.empty(2, 2, 4, 18, dtype=torch.bfloat16),
+            "recv_combined": torch.empty(2, 2, 4, 18, dtype=torch.bfloat16),
+        }
 
         with rc.get_parallel().override(
             dcp_enabled=True,
@@ -544,7 +487,11 @@ class TestEmptyDcpTargetVerify(unittest.TestCase):
             dcp_rank=0,
             dcp_group=dcp_group,
         ):
-            output = merge_mla_dcp_output_npu(partial_output, partial_lse)
+            output = merge_mla_dcp_output_npu(
+                partial_output,
+                partial_lse,
+                graph_buffers=graph_buffers,
+            )
 
         self.assertIs(output, expected)
         args, kwargs = compact_a2a.call_args
@@ -553,6 +500,7 @@ class TestEmptyDcpTargetVerify(unittest.TestCase):
         self.assertEqual(args[1].dtype, torch.float32)
         self.assertIs(args[2], dcp_group)
         self.assertTrue(kwargs["is_lse_base_on_e"])
+        self.assertIs(kwargs["cuda_graph_buffers"], graph_buffers)
         self.assertEqual(kwargs["comm_backend"], "a2a")
 
 

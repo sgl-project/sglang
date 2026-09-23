@@ -40,24 +40,10 @@ def mask_empty_mla_dcp_shards_npu(
     )
 
 
-def all_gather_mla_decode_q_npu(
-    q_nope: torch.Tensor, q_rope: torch.Tensor
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Gather TP-local query heads across the DCP group with HCCL."""
-    parallel = get_parallel()
-    if not parallel.dcp_enabled:
-        return q_nope, q_rope
-
-    nope_dim = q_nope.shape[-1]
-    combined = torch.cat([q_nope, q_rope], dim=-1).contiguous()
-    combined = parallel.dcp_group.all_gather(combined, dim=1)
-    q_nope, q_rope = combined.split([nope_dim, q_rope.shape[-1]], dim=-1)
-    return q_nope.contiguous(), q_rope.contiguous()
-
-
 def merge_mla_dcp_output_npu(
     partial_output: torch.Tensor,
     partial_lse: torch.Tensor,
+    graph_buffers: dict[str, torch.Tensor] | None = None,
 ) -> torch.Tensor:
     """Compactly exchange and merge DCP partial attention states.
 
@@ -96,5 +82,6 @@ def merge_mla_dcp_output_npu(
         partial_lse,
         parallel.dcp_group,
         is_lse_base_on_e=True,
+        cuda_graph_buffers=graph_buffers,
         comm_backend="a2a",
     )

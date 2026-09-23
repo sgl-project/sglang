@@ -3,52 +3,10 @@
 from __future__ import annotations
 
 import torch
+import triton
 
-from sglang.srt.layers.dcp.layout import get_dcp_lens, maybe_dcp_kernel_indices
-from sglang.srt.layers.dcp.metadata import DecodeContextParallelMetadata
-from sglang.srt.runtime_context import get_parallel
-
-
-def prepare_decode_context_parallel_metadata_npu(
-    seq_lens: torch.Tensor,
-    extend_prefix_lens_cpu,
-    extend_seq_lens: torch.Tensor,
-    req_pool_indices: torch.Tensor,
-    req_to_token: torch.Tensor,
-    seq_lens_sum: int,
-    kv_cache_dtype,
-    kv_cache_device,
-) -> DecodeContextParallelMetadata:
-    """Build the prefix indirection consumed by the Ascend extend path.
-
-    Ascend FIA builds its decode block table separately and gathers prefix KV
-    directly from the two physical MLA buffers.  The CUDA-only indptr, packed
-    indices, and temporary KV buffer in the common metadata contract are
-    therefore intentionally left unset.
-    """
-    parallel = get_parallel()
-    device = req_to_token.device
-    prefix_lens_cpu = [int(x) for x in extend_prefix_lens_cpu]
-
-    prefix_parts = []
-    for batch_idx, prefix_len in enumerate(prefix_lens_cpu):
-        if prefix_len == 0:
-            continue
-        req_idx = int(req_pool_indices[batch_idx].item())
-        prefix_parts.append(req_to_token[req_idx, :prefix_len])
-    if prefix_parts:
-        dcp_prefix_kv_indices = torch.cat(prefix_parts).to(torch.int32)
-    else:
-        dcp_prefix_kv_indices = torch.empty(0, dtype=torch.int32, device=device)
-
-    dcp_local_prefix_kv_indices = maybe_dcp_kernel_indices(
-        dcp_prefix_kv_indices,
-        parallel.dcp_size,
-        parallel.dcp_rank,
-    )
-    return DecodeContextParallelMetadata(
-        dcp_local_prefix_kv_indices=dcp_local_prefix_kv_indices,
-    )
+from sglang.kernels.ops.attention.dcp_kernels import create_mla_kv_page_table_for_dcp
+from sglang.srt.layers.dcp.layout import get_dcp_lens
 
 
 def build_mla_dcp_local_block_tables(
@@ -61,7 +19,7 @@ def build_mla_dcp_local_block_tables(
     *,
     num_pages: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Build the rank-local FIA page table from widened virtual token ids."""
+    """Allocate the FIA view and fill it with the common DCP page-table kernel."""
     if physical_page_size <= 0:
         raise ValueError(
             f"physical_page_size must be positive, got {physical_page_size}"
@@ -70,35 +28,39 @@ def build_mla_dcp_local_block_tables(
         raise ValueError(
             f"invalid DCP topology: dcp_size={dcp_size}, dcp_rank={dcp_rank}"
         )
-
     local_seq_lens = get_dcp_lens(seq_lens, dcp_size, dcp_rank).to(torch.int32)
     if num_pages is None:
-        max_local_len = (
-            int(local_seq_lens.max().item()) if local_seq_lens.numel() > 0 else 0
-        )
-        num_pages = max(
-            1, (max_local_len + physical_page_size - 1) // physical_page_size
-        )
+        max_len = int(local_seq_lens.max().item()) if local_seq_lens.numel() else 0
+        num_pages = max(1, (max_len + physical_page_size - 1) // physical_page_size)
     elif num_pages <= 0:
         raise ValueError(f"num_pages must be positive, got {num_pages}")
-
-    local_page_offsets = torch.arange(
-        num_pages, dtype=torch.long, device=req_to_token.device
+    block_tables = torch.zeros(
+        (req_pool_indices.numel(), num_pages),
+        dtype=torch.int32,
+        device=req_to_token.device,
     )
-    global_positions = dcp_rank + local_page_offsets * physical_page_size * dcp_size
-    req_rows = req_pool_indices.to(device=req_to_token.device, dtype=torch.long)
-    # A graph table has a fixed maximum width and can include one rounded-up
-    # page beyond the request-table width. Clamp the read and mask that page.
-    positions_in_range = global_positions < req_to_token.shape[1]
-    safe_global_positions = global_positions.clamp(max=req_to_token.shape[1] - 1)
-    virtual_locs = req_to_token[req_rows[:, None], safe_global_positions[None, :]]
-    block_tables = (virtual_locs // dcp_size // physical_page_size).to(torch.int32)
-    valid_pages = (
-        local_page_offsets[None, :] * physical_page_size
-        < local_seq_lens.to(req_to_token.device)[:, None]
-    ) & positions_in_range[None, :]
-    block_tables.masked_fill_(~valid_pages, 0)
-    return block_tables.contiguous(), local_seq_lens
+    if not req_pool_indices.numel():
+        return block_tables, local_seq_lens
+    create_mla_kv_page_table_for_dcp[
+        (req_pool_indices.numel(), triton.cdiv(num_pages, 128))
+    ](
+        req_to_token,
+        req_pool_indices,
+        local_seq_lens,
+        block_tables,
+        None,
+        req_to_token.stride(0),
+        block_tables.stride(0),
+        1,
+        PHYSICAL_PAGE_SIZE=physical_page_size,
+        DCP_SIZE=dcp_size,
+        DCP_RANK=dcp_rank,
+        PAGES_PER_BLOCK=128,
+        HAS_V2P=False,
+        NUM_PAGES=num_pages,
+        MAX_SEQ_LEN=req_to_token.shape[1],
+    )
+    return block_tables, local_seq_lens
 
 
 def build_mla_dcp_mtp_mask(
