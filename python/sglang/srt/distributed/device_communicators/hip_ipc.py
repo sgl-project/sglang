@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import ctypes
 import logging
+from functools import lru_cache
 from typing import List, Optional
 
 import torch.distributed as dist
@@ -34,6 +35,8 @@ logger = logging.getLogger(__name__)
 _HANDLE_BYTES = 64
 # hipIpcMemLazyEnablePeerAccess
 _LAZY_ENABLE_PEER_ACCESS = 1
+# Sentinel written by hipMemGetAddressRange on builds where the query is broken.
+_SIZE_T_MAX = (1 << 64) - 1
 
 
 class HipIpcMemHandle(ctypes.Structure):
@@ -104,6 +107,39 @@ class HipRTLibrary:
 
     def memset(self, ptr: ctypes.c_void_p, value: int, size_in_bytes: int) -> None:
         self._check(self.lib.hipMemset(ptr, value, size_in_bytes), "hipMemset")
+
+    def get_address_range(self, ptr: int) -> tuple[int, int]:
+        """Segment base and size containing ``ptr``, validated.
+
+        ``hipMemGetAddressRange`` is not merely allowed to fail here -- on some
+        ROCm builds it returns success while writing nonsense for pointers owned
+        by torch's caching allocator (observed: base ``0x100``, size ``2**64-1``
+        on ``torch 2.11.0+rocm10.0.0`` / HIP 7.15). Trusting the status code
+        alone forwards that garbage to ``hipIpcGetMemHandle``, which then fails
+        with an opaque ``hipErrorInvalidValue``. Validate the payload instead.
+        """
+        base = ctypes.c_void_p()
+        size = ctypes.c_size_t()
+        self._check(
+            self.lib.hipMemGetAddressRange(
+                ctypes.byref(base), ctypes.byref(size), ctypes.c_void_p(ptr)
+            ),
+            "hipMemGetAddressRange",
+        )
+        base_value = base.value or 0
+        size_value = size.value
+        if not 0 < base_value <= ptr or size_value in (0, _SIZE_T_MAX):
+            raise RuntimeError(
+                "hipMemGetAddressRange reported success but returned an "
+                f"implausible range for 0x{ptr:x}: base=0x{base_value:x} "
+                f"size={size_value}. This memory cannot be shared over HIP IPC."
+            )
+        if ptr - base_value >= size_value:
+            raise RuntimeError(
+                f"hipMemGetAddressRange range [0x{base_value:x}, +{size_value}) "
+                f"does not contain 0x{ptr:x}"
+            )
+        return base_value, size_value
 
     def get_ipc_handle(self, ptr: ctypes.c_void_p) -> bytes:
         handle = HipIpcMemHandle()
@@ -196,17 +232,10 @@ def create_shared_tensor(
     # start at zero, and a zeroed staging buffer is harmless.
     tensor = torch.zeros(shape, dtype=dtype, device=device)
 
-    base = ctypes.c_void_p()
-    size = ctypes.c_size_t()
     data_ptr = tensor.data_ptr()
-    lib._check(
-        lib.lib.hipMemGetAddressRange(
-            ctypes.byref(base), ctypes.byref(size), ctypes.c_void_p(data_ptr)
-        ),
-        "hipMemGetAddressRange",
-    )
-    offset = data_ptr - base.value
-    handle = lib.get_ipc_handle(base)
+    base_value, _ = lib.get_address_range(data_ptr)
+    offset = data_ptr - base_value
+    handle = lib.get_ipc_handle(ctypes.c_void_p(base_value))
 
     world_size = dist.get_world_size(group=group)
     rank = dist.get_rank(group=group)
@@ -229,6 +258,34 @@ def create_shared_tensor(
     return tensor, pointers, opened_bases
 
 
+@lru_cache(maxsize=1)
+def torch_memory_is_ipc_capable() -> bool:
+    """Can a torch-allocated tensor be published over HIP IPC on this build?
+
+    Not every ROCm build supports this. On ``torch 2.11.0+rocm10.0.0`` (HIP
+    7.15) ``hipMemGetAddressRange`` returns success but yields a bogus range for
+    caching-allocator pointers, and ``hipIpcGetMemHandle`` rejects them --
+    while raw ``hipMalloc`` allocations on the same device share fine. The
+    capability is therefore probed, not inferred from a version number, so a
+    later runtime that fixes it is picked up with no code change.
+
+    Single-process and side-effect free; the result is cached per process.
+    """
+    import torch
+
+    if not torch.cuda.is_available():
+        return False
+    try:
+        probe = torch.zeros(1024, dtype=torch.uint8, device="cuda")
+        lib = HipRTLibrary()
+        base_value, _ = lib.get_address_range(probe.data_ptr())
+        lib.get_ipc_handle(ctypes.c_void_p(base_value))
+    except Exception as exc:  # noqa: BLE001 - any failure means "unsupported"
+        logger.debug("HIP IPC on torch memory unavailable: %s", exc)
+        return False
+    return True
+
+
 def register_peer_pointers(tensors, group: Optional[ProcessGroup] = None):
     """Publish existing tensors over IPC and return their peer pointers.
 
@@ -245,16 +302,14 @@ def register_peer_pointers(tensors, group: Optional[ProcessGroup] = None):
     lib = HipRTLibrary()
     local = []
     for t in tensors:
-        base = ctypes.c_void_p()
-        size = ctypes.c_size_t()
         data_ptr = t.data_ptr()
-        lib._check(
-            lib.lib.hipMemGetAddressRange(
-                ctypes.byref(base), ctypes.byref(size), ctypes.c_void_p(data_ptr)
-            ),
-            "hipMemGetAddressRange",
+        base_value, _ = lib.get_address_range(data_ptr)
+        local.append(
+            (
+                lib.get_ipc_handle(ctypes.c_void_p(base_value)),
+                data_ptr - base_value,
+            )
         )
-        local.append((lib.get_ipc_handle(base), data_ptr - base.value))
 
     world_size = dist.get_world_size(group=group)
     rank = dist.get_rank(group=group)

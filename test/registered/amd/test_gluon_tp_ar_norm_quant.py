@@ -43,10 +43,31 @@ def _gfx950_gpus() -> int:
     return n
 
 
+def _torch_memory_is_ipc_capable() -> bool:
+    """Probe HIP IPC on torch memory, which this kernel's rendezvous requires.
+
+    Deliberately a capability probe and not a version check: some ROCm builds
+    (e.g. torch 2.11.0+rocm10.0.0 / HIP 7.15) cannot share caching-allocator
+    memory over IPC, and a runtime that later fixes this re-enables the test
+    with no edit here.
+    """
+    if _gfx950_gpus() < 1:
+        return False
+    from sglang.srt.distributed.device_communicators.hip_ipc import (
+        torch_memory_is_ipc_capable,
+    )
+
+    return torch_memory_is_ipc_capable()
+
+
 class TestGluonTpArNormQuant(CustomTestCase):
     @unittest.skipUnless(
         _gfx950_gpus() >= WORLD_SIZE,
         f"needs {WORLD_SIZE} gfx950 GPUs",
+    )
+    @unittest.skipUnless(
+        _torch_memory_is_ipc_capable(),
+        "HIP IPC on torch-allocated memory is unsupported on this ROCm build",
     )
     def test_bit_exact_against_fp32_reference(self):
         """Spawn the 4-rank worker; it exits non-zero on any mismatch."""

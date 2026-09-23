@@ -285,9 +285,9 @@ def _try_gluon_tp_ar_norm_quant(
     if not _gluon_ar.is_supported(x, residual, weight, eps, world_size, group_size):
         return None
 
-    from sglang.srt.distributed import get_tp_group
+    from sglang.srt.runtime_context import get_parallel
 
-    tp_group = get_tp_group()
+    tp_group = get_parallel().tp_group
     state = getattr(tp_group, _GLUON_TP_AR_STATE_ATTR, None)
     if state is None:
         try:
