@@ -114,8 +114,7 @@ jobs:
           echo "CANN_image_a3=swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/cann:9.1.0-a3-ubuntu22.04-py3.12" >> $GITHUB_OUTPUT
 
   # Stage-A gate: CPU-only unit tests. The NPU attention-backend UTs stub out
-  # torch_npu / sgl_kernel_npu before importing, so they need neither an NPU card
-  # nor the CANN image; a hosted runner keeps this fast-fail gate off the NPU queue.
+  # torch_npu / sgl_kernel_npu before importing, so a hosted runner suffices.
   base-a-unit-test-npu-cpu:
     needs: [check-changes, pr-gate]
     if: ${{ !failure() && !cancelled() && inputs.coverage_mode != true && needs.check-changes.outputs.main_package == 'true' }}
@@ -130,8 +129,7 @@ jobs:
           # Pin to the event SHA so this job tests the same commit as the rest of the run.
           ref: ${{ inputs.ref || github.sha }}
 
-      # Same gate the NPU stages run as their first step, so a lint failure stops
-      # here instead of scheduling the NPU jobs only for them to fail-fast.
+      # Same gate the NPU stages run first: fail before the NPU jobs are scheduled.
       - uses: ./.github/actions/check-pr-test-health
 
       - name: Set up Python
@@ -151,19 +149,18 @@ jobs:
           # uv pip targets a venv by default; setup-python has no venv.
           UV_SYSTEM_PYTHON: "1"
         run: |
-          # Swap in the NPU dependency set so this job resolves the same packages as
-          # the NPU stages; only the Ascend-only wheels are left out.
+          # Resolve the same dependency set as the NPU stages, minus Ascend-only wheels.
           rm -f python/pyproject.toml
           mv python/pyproject_npu.toml python/pyproject.toml
-          # Versions mirror npu_ci_install_dependency.sh's PYTORCH_VERSION /
-          # TORCHVISION_VERSION / TORCHAUDIO_VERSION defaults -- keep them in sync.
-          # triton is spelled out because sglang.srt.utils.common imports it
-          # unconditionally, and the CPU-only torch wheel (unlike the PyPI one the
-          # CUDA stages resolve) does not pull it in; the NPU image gets
-          # triton_ascend from that same script instead.
+          # Versions mirror npu_ci_install_dependency.sh's defaults; keep them in sync.
+          # triton: sglang.srt.utils.common imports it unconditionally and the CPU
+          # wheel does not pull it in (the NPU image uses triton-ascend instead).
+          # unsafe-best-match: --index-url is the lowest-priority index, so the
+          # default strategy would resolve PyPI's CUDA torch, not the +cpu build.
           uv pip install torch==2.10.0 torchvision==0.25.0 torchaudio==2.10.0 triton \
             --index-url https://download.pytorch.org/whl/cpu \
-            --extra-index-url https://pypi.org/simple/
+            --extra-index-url https://pypi.org/simple/ \
+            --index-strategy unsafe-best-match
           uv pip install -e "python[dev_npu]" --index-strategy unsafe-best-match
 
       - name: Run NPU unit tests
