@@ -292,11 +292,9 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
             else None
         )
         # BF16 logits can turn close router scores into ties before top-k.
-        self.router_dtype = {
-            None: None,
-            "fp32": torch.float32,
-            "fp64": torch.float64,
-        }[getattr(config, "router_dtype", None)]
+        router_dtype = getattr(config, "router_dtype", None)
+        assert router_dtype in (None, "fp32"), "Qwen3 router_dtype must be null or fp32"
+        self.router_dtype = torch.float32 if router_dtype == "fp32" else None
         if self.router_dtype is not None:
             assert gate_quant_config is None, (
                 "router_dtype requires an unquantized gate"
