@@ -794,7 +794,6 @@ class TestEagleDsaSeedTransfer(CustomTestCase):
                             disaggregation_mode=mode.value,
                             disaggregation_decode_draft_bootstrap=False,
                             disaggregation_transfer_backend="fake",
-                            disaggregation_decode_draft_bootstrap=False,
                             language_only=False,
                         ),
                     ),
