@@ -23,7 +23,6 @@ from __future__ import annotations
 
 import fcntl
 import glob
-import importlib
 import json
 import logging
 import mmap
@@ -38,6 +37,8 @@ from typing import Optional
 
 import numpy as np
 import zstandard
+
+from sglang.srt.utils import dynamic_import
 
 logger = logging.getLogger(__name__)
 
@@ -70,7 +71,7 @@ def pull(
     # refresh, which the deployment supplies as this hook. POSIX shared
     # filesystems (NFS, Lustre, ...) need none.
     if target_version > 0 and pre_read_hook:
-        _load_hook(pre_read_hook)(source_dir, target_version)
+        dynamic_import(pre_read_hook)(source_dir, target_version)
     with _pull_lock(local_checkpoint_dir):
         applied = _read_applied_version(local_checkpoint_dir)  # None on a fresh host
         if applied is not None and target_version < applied:
@@ -92,11 +93,6 @@ def pull(
             start = applied
         for version in range(start + 1, target_version + 1):
             _apply_delta(local_checkpoint_dir, _version_dir(source_dir, version))
-
-
-def _load_hook(path: str):
-    module_path, _, name = path.rpartition(".")
-    return getattr(importlib.import_module(module_path), name)
 
 
 def _version_dir(source_dir: str, version: int) -> str:
