@@ -221,7 +221,7 @@ def _run_mega_routed(
             hidden_states,
             router_logits,
             num_token_non_padded=(
-                forward_batch.num_token_non_padded
+                forward_batch.moe_num_token_non_padded()
                 if forward_batch is not None
                 else None
             ),

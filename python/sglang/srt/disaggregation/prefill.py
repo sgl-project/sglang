@@ -53,6 +53,7 @@ from sglang.srt.disaggregation.utils import (
     build_staging_slot_metadata,
     get_dsa_tail_state_indices,
     get_kv_class,
+    get_kv_transfer_buf_infos,
     get_qsa_pending_state_indices,
     is_aborted,
     is_mla_backend,
@@ -87,6 +88,7 @@ from sglang.srt.observability.scheduler_stage_metrics import (
     scheduler_stage_method,
 )
 from sglang.srt.runtime_context import (
+    get_device,
     get_disagg,
     get_parallel,
     get_schedule,
@@ -212,7 +214,7 @@ class PrefillBootstrapQueue:
         if get_disagg().disaggregation_enable_kv_checksum:
             kv_args = self.kv_manager.kv_args
             self.scheduler.kv_checksum_computer = KvChecksumComputer(
-                device=torch.device(f"cuda:{self.scheduler.ps.gpu_id}"),
+                device=torch.device(f"cuda:{get_device().gpu_id}"),
                 kv_data_ptrs=kv_args.kv_data_ptrs,
                 kv_item_lens=kv_args.kv_item_lens,
                 state_data_ptrs=kv_args.state_data_ptrs,
@@ -226,7 +228,7 @@ class PrefillBootstrapQueue:
         kv_args = kv_args_class()
         kv_args.engine_rank = self.tp_rank
         kv_args.pp_rank = self.pp_rank
-        kv_args.system_dp_rank = self.scheduler.ps.dp_rank
+        kv_args.system_dp_rank = get_parallel().dp_rank
         kv_args.rust_http_port = (
             self.scheduler.rust_server.http_port
             if self.scheduler.rust_server is not None
@@ -255,8 +257,8 @@ class PrefillBootstrapQueue:
                 hf_text_config=self.scheduler.model_config.hf_text_config,
             )
         )
-        kv_data_ptrs, kv_data_lens, kv_item_lens = (
-            self.token_to_kv_pool.get_contiguous_buf_infos()
+        kv_data_ptrs, kv_data_lens, kv_item_lens = get_kv_transfer_buf_infos(
+            self.token_to_kv_pool
         )
         kv_args.prefill_end_layer = (
             kv_args.prefill_start_layer + len(kv_data_ptrs)
@@ -303,7 +305,7 @@ class PrefillBootstrapQueue:
             self.metadata_buffers.get_buf_infos()
         )
         kv_args.ib_device = get_disagg().disaggregation_ib_device
-        kv_args.gpu_id = self.scheduler.ps.gpu_id
+        kv_args.gpu_id = get_device().gpu_id
 
         req_to_token_pool = getattr(self.scheduler, "req_to_token_pool", None)
         setup_state_kv_args(
@@ -1423,6 +1425,7 @@ class SchedulerDisaggregationPrefillMixin:
                 StateType.DSA: _full_kv_pages_payload,
                 StateType.DSA_TAIL: _dsa_tail_payload,
                 StateType.MINIMAX_INDEX_K: _full_kv_pages_payload,
+                StateType.MINIMAX_DENSE_KV: _full_kv_pages_payload,
                 StateType.SWA_RING: _swa_ring_payload,
                 StateType.DSV4_REQUEST_STATE: _request_state_payload,
                 StateType.BLOCK_SCALE: _full_kv_pages_payload,
@@ -1449,15 +1452,21 @@ class SchedulerDisaggregationPrefillMixin:
                 payloads[st]() if st in payloads else None for st in state_types
             ]
 
+        transfer_chunk_tokens = req.disagg_kv_sender.get_max_transfer_tokens()
         if self.enable_staging:
             # One sender.send per grid slot; the sender's cumulative page
             # counter marks only the final sub-send of the final chunk as
             # is_last, routing aux/state correctly.
+            transfer_chunk_tokens = staging_grid_tokens(
+                get_schedule().chunked_prefill_size, page_size
+            )
+        if transfer_chunk_tokens is not None:
+            # Prefill cache hits can leave more KV to transfer than the DCP pack buffer holds.
             segments = compute_grid_segments(
                 start_idx,
                 end_idx,
                 req.disagg_decode_prefix_len,
-                staging_grid_tokens(get_schedule().chunked_prefill_size, page_size),
+                transfer_chunk_tokens,
             )
         else:
             segments = [(start_idx, end_idx)]
@@ -1510,7 +1519,10 @@ class SchedulerDisaggregationPrefillMixin:
             )
         )
         self._release_aborted_request(req)
-        release_kv_cache(req, self.tree_cache)
+        # Mamba insertion donates the checkpoint and clears its sequence marker.
+        release_kv_cache(
+            req, self.tree_cache, is_insert=not self.tree_cache.supports_mamba()
+        )
         req.reset_for_retract()
         req.output_ids = array("q")
         req.start_send_idx = 0
