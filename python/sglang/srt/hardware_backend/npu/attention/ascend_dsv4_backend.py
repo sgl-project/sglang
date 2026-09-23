@@ -436,60 +436,81 @@ class CompressorAscendBackendMixin:
 
         import os
 
+        # A full DSV4_DUMP is tens of thousands of lines. DSV4_DUMP_LAYERS keeps
+        # only the layers in question and DSV4_DUMP_MIN/MAX_POS only the decode
+        # window, so one capture stays small enough to diff by hand.
+        _dump_on = False
         if os.environ.get("DSV4_DUMP"):
             import hashlib
 
-            def _fmt(t):
-                a = t.detach().to(torch.float32).cpu().numpy()
-                if a.size == 0:
-                    return "sum=0 absmax=0 md5=empty", a
-                return (
-                    f"sum={a.sum():.4f} absmax={abs(a).max():.4f} "
-                    f"md5={hashlib.md5(a.tobytes()).hexdigest()[:16]}",
-                    a,
-                )
+            _lo = int(os.environ.get("DSV4_DUMP_MIN_POS", "-1"))
+            _hi = int(os.environ.get("DSV4_DUMP_MAX_POS", str(1 << 31)))
+            _cap = int(os.environ.get("DSV4_DUMP_MAX_CALLS", "0"))
+            _layers = {
+                int(v)
+                for v in os.environ.get("DSV4_DUMP_LAYERS", "").split(",")
+                if v.strip()
+            }
+            _pos = int(fm.start_pos.max().item()) if fm.start_pos.numel() else -1
+            _used = getattr(self, "_dsv4_dump_calls", 0)
+            _dump_on = (
+                _lo <= _pos <= _hi
+                and (not _layers or compressor.layer_id in _layers)
+                and (_cap == 0 or _used < _cap)
+            )
+            if _dump_on:
+                self._dsv4_dump_calls = _used + 1
 
             _tag = f"L{compressor.layer_id} r{ratio} idx={int(compressor.is_in_indexer)}"
 
-            for _name, _t in (("x", x), ("table", state_block_table)):
-                _s, _ = _fmt(_t)
-                print(f"[CIN] {_tag} {_name} shape={tuple(_t.shape)} {_s}", flush=True)
-                if _name == "table":
-                    # no spaces: dump_diff.py keys lines by whitespace token
-                    _tv = ",".join(str(int(v)) for v in state_block_table.reshape(-1).tolist())
-                    print(f"[CIN] {_tag} table_vals {_tv}", flush=True)
-            print(
-                f"[CIN] {_tag} state_cache shape={tuple(state_cache.shape)} "
-                f"ptr={state_cache.data_ptr()}",
-                flush=True,
-            )
-            if os.environ.get("DSV4_DUMP_STATE"):
-                # hash the rows the table points at, to split state CONTENT from addressing
-                _flat = state_cache.reshape(-1, state_cache.shape[-1])
-                _locs = state_block_table.reshape(-1).to(torch.int64)
-                _locs = _locs[(_locs >= 0) & (_locs < _flat.shape[0])]
-                if _locs.numel():
-                    _rows = _flat.index_select(0, _locs)
-                    _a = _rows.detach().to(torch.float32).cpu().numpy()
+            if _dump_on:
+                for _name, _t in (("x", x), ("table", state_block_table)):
+                    _a = _t.detach().to(torch.float32).cpu().numpy()
+                    _s = (
+                        "sum=0 absmax=0 md5=empty"
+                        if _a.size == 0
+                        else f"sum={_a.sum():.4f} absmax={abs(_a).max():.4f} "
+                        f"md5={hashlib.md5(_a.tobytes()).hexdigest()[:16]}"
+                    )
                     print(
-                        f"[CIN] {_tag} state_rows n={_rows.shape[0]} "
-                        f"sum={_a.sum():.4f} absmax={abs(_a).max():.4f} "
-                        f"md5={hashlib.md5(_a.tobytes()).hexdigest()[:16]}",
+                        f"[CIN] {_tag} {_name} shape={tuple(_t.shape)} {_s}",
                         flush=True,
                     )
-            _all = state_block_table.reshape(-1).to(torch.int64)
-            _rows_n = state_cache.reshape(-1, state_cache.shape[-1]).shape[0]
-            print(
-                f"[CIN] {_tag} state_range n={_all.numel()} "
-                f"min={int(_all.min())} max={int(_all.max())} rows={_rows_n} "
-                f"oob={int((_all >= _rows_n).sum())}",
-                flush=True,
-            )
-            print(
-                f"[CIN] {_tag} start_pos={fm.start_pos.tolist()} "
-                f"seqused={fm.seqused.tolist()} cu={fm.actual_seq_lengths_q_pa.tolist()}",
-                flush=True,
-            )
+                print(
+                    f"[CIN] {_tag} state_cache shape={tuple(state_cache.shape)} "
+                    f"ptr={state_cache.data_ptr()}",
+                    flush=True,
+                )
+                _all = state_block_table.reshape(-1).to(torch.int64)
+                _rows_n = state_cache.reshape(-1, state_cache.shape[-1]).shape[0]
+                print(
+                    f"[CIN] {_tag} state_range n={_all.numel()} "
+                    f"min={int(_all.min())} max={int(_all.max())} rows={_rows_n} "
+                    f"oob={int((_all >= _rows_n).sum())}",
+                    flush=True,
+                )
+                print(
+                    f"[CIN] {_tag} start_pos={fm.start_pos.tolist()} "
+                    f"seqused={fm.seqused.tolist()} cu={fm.actual_seq_lengths_q_pa.tolist()}",
+                    flush=True,
+                )
+                if os.environ.get("DSV4_DUMP_STATE"):
+                    # no spaces: dump_diff.py keys lines by whitespace token
+                    _tv = ",".join(
+                        str(int(v)) for v in state_block_table.reshape(-1).tolist()
+                    )
+                    print(f"[CIN] {_tag} table_vals {_tv}", flush=True)
+                    _flat = state_cache.reshape(-1, state_cache.shape[-1])
+                    _locs = _all[(_all >= 0) & (_all < _flat.shape[0])]
+                    if _locs.numel():
+                        _rows = _flat.index_select(0, _locs)
+                        _a = _rows.detach().to(torch.float32).cpu().numpy()
+                        print(
+                            f"[CIN] {_tag} state_rows n={_rows.shape[0]} "
+                            f"sum={_a.sum():.4f} absmax={abs(_a).max():.4f} "
+                            f"md5={hashlib.md5(_a.tobytes()).hexdigest()[:16]}",
+                            flush=True,
+                        )
 
         cos, sin = Dsv4NpuRoPE.for_freqs(
             compressor.freqs_cis, getattr(compressor, "rotary_emb", None)
@@ -538,7 +559,7 @@ class CompressorAscendBackendMixin:
                     f"loc={loc.numel()}, kv={cmp_kv.shape[0]}"
                 )
 
-        if os.environ.get("DSV4_DUMP"):
+        if _dump_on:
             import hashlib
 
             _a = cmp_kv.detach().to(torch.float32).cpu().numpy()
