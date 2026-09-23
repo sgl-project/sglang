@@ -6,10 +6,15 @@ token, so the over-drafted suffix is never committed to KV nor emitted.
 
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 
 from sglang.srt.disaggregation.decode import DecodeRequest, DecodeTransferQueue
+from sglang.srt.disaggregation.utils import (
+    CACHE_ONLY_COVERAGE_SLOT,
+    CACHE_ONLY_METADATA_SLOT,
+)
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
@@ -115,16 +120,21 @@ def _commit_disagg_handoff(
     token_id: int,
     *,
     replayed_boundary: bool = False,
-) -> None:
+    cache_only: bool = False,
+    coverage: int = 0,
+) -> DecodeRequest:
     queue = DecodeTransferQueue.__new__(DecodeTransferQueue)
     queue.scheduler = SimpleNamespace(
         batch_result_processor=processor, kv_checksum_computer=None
     )
     queue.spec_algorithm = SimpleNamespace(is_none=lambda: True)
+    cached_tokens = torch.zeros(16, dtype=torch.long)
+    cached_tokens[CACHE_ONLY_METADATA_SLOT] = int(cache_only)
+    cached_tokens[CACHE_ONLY_COVERAGE_SLOT] = coverage
     queue.metadata_buffers = SimpleNamespace(
         get_buf=lambda _: (
             torch.tensor([token_id], dtype=torch.long),
-            torch.zeros(7, dtype=torch.long),
+            cached_tokens,
             torch.zeros(1),
             torch.zeros(1, dtype=torch.long),
             torch.zeros(1),
@@ -151,6 +161,7 @@ def _commit_disagg_handoff(
     )
 
     queue._commit_transfer_to_req(decode_req)
+    return decode_req
 
 
 class TestSpecV2GrammarTruncation(CustomTestCase):
@@ -249,6 +260,41 @@ class TestReasoningTokenAccounting(CustomTestCase):
 
         self.assertEqual(req.reasoning_tokens, 0)
         self.assertFalse(req._is_reasoning_over)
+
+    def test_cache_only_handoff_rejects_partial_coverage(self):
+        req = _make_req(terminate_after=99)
+        processor = _make_processor()
+
+        with patch("sglang.srt.disaggregation.decode.prepare_abort") as abort:
+            decode_req = _commit_disagg_handoff(
+                req,
+                processor,
+                0,
+                cache_only=True,
+                coverage=len(req.origin_input_ids) - 1,
+            )
+
+        abort.assert_called_once()
+        self.assertIsNone(decode_req.kv_receiver)
+        self.assertFalse(req.dsv41_cache_only_replay)
+
+    def test_cache_only_handoff_commits_explicit_full_coverage(self):
+        req = _make_req(terminate_after=99)
+        processor = _make_processor()
+        prompt_len = len(req.origin_input_ids)
+
+        decode_req = _commit_disagg_handoff(
+            req,
+            processor,
+            0,
+            cache_only=True,
+            coverage=prompt_len,
+        )
+
+        self.assertIsNone(decode_req.kv_receiver)
+        self.assertTrue(req.dsv41_cache_only_replay)
+        self.assertEqual(req.dsv41_cache_only_coverage, prompt_len)
+        self.assertEqual(list(req.output_ids), [])
 
 
 if __name__ == "__main__":

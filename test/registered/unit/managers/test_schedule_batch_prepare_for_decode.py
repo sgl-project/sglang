@@ -65,6 +65,7 @@ class TestPrepareForDecodeSeqLensOwnership(unittest.TestCase):
         batch.dsv41_cache_only_replay = True
         for req in batch.reqs:
             req.dsv41_cache_only_replay = True
+            req.dsv41_cache_only_coverage = 257
 
         override = get_context().override_server_args(
             mamba_radix_cache_strategy="no_buffer"
@@ -79,6 +80,7 @@ class TestPrepareForDecodeSeqLensOwnership(unittest.TestCase):
 
         self.assertFalse(batch.dsv41_cache_only_replay)
         self.assertTrue(all(not req.dsv41_cache_only_replay for req in batch.reqs))
+        self.assertTrue(all(req.dsv41_cache_only_coverage == 0 for req in batch.reqs))
 
     def test_decode_seq_lens_bump_is_out_of_place(self):
         """Each prepare_for_decode call rebinds seq-lens tensors to new +1 objects without mutating the old ones."""
