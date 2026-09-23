@@ -15,6 +15,7 @@ from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
 from sglang.srt.layers.dp_attention import get_dp_global_num_tokens
+from sglang.srt.layers.moe.mega_moe_overlap import should_overlap_shared_and_routed
 from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 from sglang.srt.model_executor.runner import get_is_capture_mode
 
@@ -197,7 +198,7 @@ def forward_mega_moe(
     input_ids_global: torch.Tensor | None = None,
 ) -> torch.Tensor:
     num_tokens = hidden_states.shape[0]
-    overlap = _should_overlap_shared_and_routed(moe, num_tokens)
+    overlap = should_overlap_shared_and_routed(moe, num_tokens)
     if overlap:
         current_stream = torch.cuda.current_stream()
         moe.alt_stream.wait_stream(current_stream)
@@ -214,20 +215,6 @@ def forward_mega_moe(
     if shared_output is not None:
         output.add_(shared_output)
     return output
-
-
-def _should_overlap_shared_and_routed(
-    moe: DeepseekV2MoE,
-    num_tokens: int,
-) -> bool:
-    if envs.SGLANG_AITER_MEGA_RANK_SYNC.get():
-        return False
-    return (
-        moe.alt_stream is not None
-        and moe.num_fused_shared_experts == 0
-        and num_tokens > 0
-        and get_is_capture_mode()
-    )
 
 
 def _run_mega_routed(
