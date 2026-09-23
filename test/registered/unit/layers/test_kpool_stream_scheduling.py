@@ -1,9 +1,10 @@
 """CPU kpool indexer checks: streams, cache contracts, gate math, logits chunking."""
 
+import sys
 import unittest
-from contextlib import contextmanager, nullcontext
+from contextlib import ExitStack, contextmanager, nullcontext
 from functools import partial
-from types import MethodType, SimpleNamespace
+from types import MethodType, ModuleType, SimpleNamespace
 from unittest.mock import Mock, patch
 
 import torch
@@ -471,18 +472,51 @@ def _fp8_zeros(*shape):
     return torch.zeros(shape, dtype=torch.uint8).view(torch.float8_e4m3fn)
 
 
-def _chunking_patches(*, rows_per_chunk, kv_pool):
-    # deep_gemm is bound only under `if is_cuda()`, so create it on CPU.
-    return (
-        patch.object(indexer_module, "deep_gemm", _fake_deep_gemm(), create=True),
-        patch.object(
-            indexer_module,
-            "_mqa_logits_row_chunks",
-            partial(_row_chunks, rows_per_chunk=rows_per_chunk),
-        ),
-        patch.object(indexer_module, "get_token_to_kv_pool", return_value=kv_pool),
-        patch.object(indexer_module, "_should_fuse_kpool_topk", return_value=True),
+def _fake_aiter_modules():
+    # _fp8_mqa_logits imports AITER lazily on ROCm; same row encoding as DeepGEMM.
+    kernel = ModuleType("aiter.ops.triton.fp8_mqa_logits")
+    kernel.fp8_mqa_logits = lambda q, k, scale, w, starts, ends, clean_logits: (
+        w[:, :1].expand(q.shape[0], k.shape[0]).clone()
     )
+    return {
+        "aiter": ModuleType("aiter"),
+        "aiter.ops": ModuleType("aiter.ops"),
+        "aiter.ops.triton": ModuleType("aiter.ops.triton"),
+        "aiter.ops.triton.fp8_mqa_logits": kernel,
+    }
+
+
+def _refuse_deep_gemm(*args, **kwargs):
+    raise AssertionError("ROCm reached DeepGEMM instead of AITER")
+
+
+@contextmanager
+def _chunking_patches(*, rows_per_chunk, kv_pool, rocm=False):
+    deep_gemm = (
+        SimpleNamespace(fp8_mqa_logits=_refuse_deep_gemm) if rocm else _fake_deep_gemm()
+    )
+    with ExitStack() as stack:
+        # deep_gemm is bound only under `if is_cuda()`, so create it on CPU.
+        stack.enter_context(
+            patch.object(indexer_module, "deep_gemm", deep_gemm, create=True)
+        )
+        stack.enter_context(
+            patch.object(
+                indexer_module,
+                "_mqa_logits_row_chunks",
+                partial(_row_chunks, rows_per_chunk=rows_per_chunk),
+            )
+        )
+        stack.enter_context(
+            patch.object(indexer_module, "get_token_to_kv_pool", return_value=kv_pool)
+        )
+        stack.enter_context(
+            patch.object(indexer_module, "_should_fuse_kpool_topk", return_value=True)
+        )
+        stack.enter_context(patch.object(indexer_module, "is_hip", return_value=rocm))
+        if rocm:
+            stack.enter_context(patch.dict(sys.modules, _fake_aiter_modules()))
+        yield
 
 
 class TestKPoolPlanChunking(CustomTestCase):
@@ -490,7 +524,7 @@ class TestKPoolPlanChunking(CustomTestCase):
     TOPK = 4
     PAD_ROWS = 5
 
-    def _drive(self, *, req_ids, rows_per_chunk, topk_method):
+    def _drive(self, *, req_ids, rows_per_chunk, topk_method, rocm=False):
         n_real = len(req_ids)
         total_k_rows = 16
         page_table = torch.arange(self.NUM_REQ_SLOTS * 8, dtype=torch.int32).reshape(
@@ -522,14 +556,10 @@ class TestKPoolPlanChunking(CustomTestCase):
         )
         calls = []
         backend = _chunk_backend(topk=_encoding_topk(width=self.TOPK, calls=calls))
-        deep_gemm, chunks, kv_pool, fuse = _chunking_patches(
-            rows_per_chunk=rows_per_chunk, kv_pool=object()
-        )
         with (
-            deep_gemm,
-            chunks,
-            kv_pool,
-            fuse,
+            _chunking_patches(
+                rows_per_chunk=rows_per_chunk, kv_pool=object(), rocm=rocm
+            ),
             patch(
                 "sglang.srt.layers.attention.dsa.kpool_fp8_index."
                 "gather_index_k_scale_prefix_into",
@@ -562,9 +592,23 @@ class TestKPoolPlanChunking(CustomTestCase):
                 torch.tensor(req_ids[start : start + 16], dtype=torch.int32),
             )
 
+    def _reference(self, *, req_ids, topk_method):
+        # Every real row scored with its own inputs, then -1 padding.
+        n_real = len(req_ids)
+        index = (
+            torch.tensor(req_ids, dtype=torch.int32)
+            if topk_method == TopkTransformMethod.PAGED
+            else torch.arange(n_real, dtype=torch.int32) + 100
+        )
+        return _expected_rows(
+            pool_lens=torch.arange(1, n_real + 1, dtype=torch.int32),
+            index=index,
+            width=self.TOPK,
+            pad_rows=self.PAD_ROWS,
+        )
+
     def test_chunked_rows_match_the_single_call_including_padding(self):
         req_ids = [5, 11, 2, 60, 9, 33, 1] * 4
-        n_real = len(req_ids)
         for method in (TopkTransformMethod.PAGED, TopkTransformMethod.RAGGED):
             with self.subTest(method=method):
                 expected, one_call, _ = self._drive(
@@ -575,20 +619,27 @@ class TestKPoolPlanChunking(CustomTestCase):
                 )
                 self.assertEqual(len(one_call), 1)
                 self.assertGreater(len(chunked), 1)
-                index = (
-                    torch.tensor(req_ids, dtype=torch.int32)
-                    if method == TopkTransformMethod.PAGED
-                    else torch.arange(n_real, dtype=torch.int32) + 100
-                )
-                # Every real row scored with its own inputs, then -1 padding.
-                reference = _expected_rows(
-                    pool_lens=torch.arange(1, n_real + 1, dtype=torch.int32),
-                    index=index,
-                    width=self.TOPK,
-                    pad_rows=self.PAD_ROWS,
-                )
+                reference = self._reference(req_ids=req_ids, topk_method=method)
                 torch.testing.assert_close(expected, reference, rtol=0, atol=0)
                 torch.testing.assert_close(actual, reference, rtol=0, atol=0)
+
+    def test_chunked_rows_score_through_aiter_on_rocm(self):
+        """On ROCm every row chunk must score through _fp8_mqa_logits, which
+        routes to AITER; reaching DeepGEMM there fails the forward."""
+        req_ids = [5, 11, 2, 60, 9, 33, 1] * 4
+        actual, chunked, _ = self._drive(
+            req_ids=req_ids,
+            rows_per_chunk=5,
+            topk_method=TopkTransformMethod.PAGED,
+            rocm=True,
+        )
+        self.assertGreater(len(chunked), 1)
+        torch.testing.assert_close(
+            actual,
+            self._reference(req_ids=req_ids, topk_method=TopkTransformMethod.PAGED),
+            rtol=0,
+            atol=0,
+        )
 
 
 def _causal_seq_lens(*, q_lens, seq_lens):
@@ -636,10 +687,9 @@ class TestKPoolPerRequestChunking(CustomTestCase):
             index_topk=self.TOPK,
             index_kpool=self.POOL,
         )
-        deep_gemm, chunks, kv_pool, fuse = _chunking_patches(
+        with _chunking_patches(
             rows_per_chunk=rows_per_chunk, kv_pool=SimpleNamespace(page_size=64)
-        )
-        with deep_gemm, chunks, kv_pool, fuse:
+        ):
             result = IndexerKPool._get_topk_ragged_kpool(
                 backend,
                 forward_batch=forward_batch,

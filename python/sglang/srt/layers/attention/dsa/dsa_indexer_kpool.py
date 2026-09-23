@@ -91,8 +91,8 @@ def _mqa_logits_row_chunks(
         return (slice(0, num_rows),)
     device_index = device.index
     assert device_index is not None, "q_fp8 must be on an indexed CUDA device"
-    # deep_gemm allocates the logits outside every pool sized by
-    # mem_fraction_static, so only the free-memory budget bounds them.
+    # The logits kernel (DeepGEMM, or AITER on ROCm) allocates them outside every
+    # pool sized by mem_fraction_static, so only the free-memory budget bounds them.
     need_chunk, budget_bytes = mqa_logits_should_chunk(
         num_rows=num_rows,
         num_cols=num_cols,
