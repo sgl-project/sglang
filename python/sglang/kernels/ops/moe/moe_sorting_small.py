@@ -470,10 +470,13 @@ def apply_aiter_small_moe_sort_patch() -> None:
         return_local_topk_ids=False,
         accumulate=True,
         output_aux=False,
+        **orig_kwargs,
     ):
+        # newer aiter passes a caller-owned moe_buf as output=; leave that to aiter
         if (
             not output_aux
             and not return_local_topk_ids
+            and orig_kwargs.get("output") is None
             and _small_sort_supported(
                 topk_ids, int(block_size), expert_mask, num_local_tokens
             )
@@ -535,6 +538,7 @@ def apply_aiter_small_moe_sort_patch() -> None:
             return_local_topk_ids=return_local_topk_ids,
             accumulate=accumulate,
             output_aux=output_aux,
+            **orig_kwargs,
         )
 
     @functools.wraps(orig_mx_quant)
