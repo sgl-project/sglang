@@ -317,6 +317,10 @@ class MiMoVisionTransformer(nn.Module):
             prefix=add_prefix("merger", prefix),
             use_data_parallel=self.use_data_parallel,
         )
+        # MiMo-VL merger ln_q is LayerNorm (see modeling_mimo_v2.py
+        # MiMoVisionPatchMerger), not the Qwen2.5-VL RMSNorm. Checkpoint ships
+        # visual.merger.ln_q.weight only (bias omitted → zeros).
+        self.merger.ln_q = nn.LayerNorm(hidden_size, eps=1e-6, bias=False)
         self._post_init()
 
     def apply_index(self, tensor: torch.Tensor, index: torch.Tensor):
