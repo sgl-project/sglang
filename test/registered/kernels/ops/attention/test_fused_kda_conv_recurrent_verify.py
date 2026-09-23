@@ -274,6 +274,22 @@ def test_glm_fp32_weights_match_unfused_reference(case_index):
     _compare_case(_CASES[case_index], weight_dtype=torch.float32)
 
 
+@pytest.mark.skipif(not torch.version.hip, reason="ROCm default launch shape")
+@pytest.mark.parametrize("case_index", [8, 9])
+def test_glm_fp32_weights_bit_exact_on_rocm(case_index):
+    # One wave keeps the reference reduction order and separately rounded
+    # conv products keep LLVM from contracting them into FMAs.
+    B, T, H, HV, K, V, W, bias, lower, neg_slot, seed = _CASES[case_index]
+    inp = _make_inputs(B, T, H, HV, K, V, W, bias, neg_slot, seed, torch.float32)
+    o_ref, _, _, ic_ref = _run_reference(inp, B, T, H, HV, K, V, lower)
+    o_fus, _, _, ic_fus = _run_fused(inp, B, T, H, HV, K, V, lower, None)
+    valid = [i for i, slot in enumerate(inp["idx_vals"]) if slot >= 0]
+    assert torch.equal(
+        o_fus.reshape(B, T, HV, V)[valid], o_ref.reshape(B, T, HV, V)[valid]
+    )
+    assert torch.equal(ic_fus[valid], ic_ref[valid])
+
+
 @pytest.mark.parametrize("case_index", [9])
 def test_glm_fp32_weights_match_under_graph_replay(case_index):
     B, T, H, HV, K, V, W, bias, lower, neg_slot, seed = _CASES[case_index]

@@ -48,6 +48,24 @@ KDA_VERIFY_BLOCK_V_HIP = 16
 
 
 @triton.jit
+def _conv_product(x, weight, ROUND_PRODUCT: tl.constexpr):
+    if ROUND_PRODUCT:
+        # ROCm's unfused conv uses separately rounded fp32 products. Without
+        # this boundary LLVM contracts the fused path into FMAs, which can
+        # change the bf16 conv output before the recurrent update.
+        return tl.inline_asm_elementwise(
+            "v_mul_f32 $0, $1, $2",
+            constraints="=v,v,v",
+            args=[x.to(tl.float32), weight.to(tl.float32)],
+            dtype=tl.float32,
+            is_pure=True,
+            pack=1,
+        )
+    else:
+        return x * weight
+
+
+@triton.jit
 def fused_kda_conv_gating_verify_kernel(
     x,  # [seq_len, dim] packed qkv, pre-conv
     w,  # [dim, W] conv weights
@@ -92,6 +110,7 @@ def fused_kda_conv_gating_verify_kernel(
     USE_LOWER_BOUND: tl.constexpr,
     SAVE_INTERMEDIATE_WINDOW: tl.constexpr,
     CACHE_INTERMEDIATE_STATES: tl.constexpr,
+    ROUND_CONV_PRODUCTS: tl.constexpr,
     USE_GDC: tl.constexpr = False,
     # ReplaySSM fused ring-write (spec verify): per-slot rings consumed by the
     # commit-time exact fold (kda_replayssm_spec_decode.py). Off -> dead code.
@@ -214,18 +233,18 @@ def fused_kda_conv_gating_verify_kernel(
             acc_q = tl.zeros([BK], dtype=tl.float32)
             acc_k = tl.zeros([BK], dtype=tl.float32)
             acc_v = tl.zeros([BV], dtype=tl.float32)
-        acc_q += q_c0 * wq0
-        acc_q += q_c1 * wq1
-        acc_q += q_c2 * wq2
-        acc_q += x_q * wq3
-        acc_k += k_c0 * wk0
-        acc_k += k_c1 * wk1
-        acc_k += k_c2 * wk2
-        acc_k += x_k * wk3
-        acc_v += v_c0 * wv0
-        acc_v += v_c1 * wv1
-        acc_v += v_c2 * wv2
-        acc_v += x_v * wv3
+        acc_q += _conv_product(q_c0, wq0, ROUND_CONV_PRODUCTS)
+        acc_q += _conv_product(q_c1, wq1, ROUND_CONV_PRODUCTS)
+        acc_q += _conv_product(q_c2, wq2, ROUND_CONV_PRODUCTS)
+        acc_q += _conv_product(x_q, wq3, ROUND_CONV_PRODUCTS)
+        acc_k += _conv_product(k_c0, wk0, ROUND_CONV_PRODUCTS)
+        acc_k += _conv_product(k_c1, wk1, ROUND_CONV_PRODUCTS)
+        acc_k += _conv_product(k_c2, wk2, ROUND_CONV_PRODUCTS)
+        acc_k += _conv_product(x_k, wk3, ROUND_CONV_PRODUCTS)
+        acc_v += _conv_product(v_c0, wv0, ROUND_CONV_PRODUCTS)
+        acc_v += _conv_product(v_c1, wv1, ROUND_CONV_PRODUCTS)
+        acc_v += _conv_product(v_c2, wv2, ROUND_CONV_PRODUCTS)
+        acc_v += _conv_product(x_v, wv3, ROUND_CONV_PRODUCTS)
 
         # Slide the window (reference: col0=col1; col1=col2; col2=x).
         q_c0 = q_c1
@@ -589,6 +608,7 @@ def fused_kda_conv_gating_verify(
         USE_LOWER_BOUND=lower_bound is not None,
         SAVE_INTERMEDIATE_WINDOW=intermediate_conv_window is not None,
         CACHE_INTERMEDIATE_STATES=intermediate_states_buffer is not None,
+        ROUND_CONV_PRODUCTS=is_hip_runtime() and conv_weight.dtype == torch.float32,
         replayssm_rawv=replayssm_rawv,
         replayssm_rawk=replayssm_rawk,
         replayssm_g=replayssm_g,
