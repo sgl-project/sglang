@@ -1278,7 +1278,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         self.assertTrue(self._resolved(sa, "disable_hybrid_swa_memory"))  # materialized
         self.assertTrue((self._publish(sa), self._leaf("disable_hybrid_swa_memory"))[1])
 
-    def test_exaone_conditional_on_sliding_window_pattern(self):
+    def test_exaone4_keeps_hybrid_swa_memory(self):
         # With the pattern the branch also asserts an explicit backend.
         sa = self._construct(
             "Exaone4ForCausalLM",
@@ -1286,8 +1286,28 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             config_extra={"sliding_window_pattern": "LLLG"},
             attention_backend="fa3",
         )
+        self.assertFalse(self._resolved(sa, "disable_hybrid_swa_memory"))
+
+    def test_exaone_moe_still_disables_hybrid_swa_memory(self):
+        sa = self._construct(
+            "ExaoneMoEForCausalLM",
+            "llama",
+            config_extra={"sliding_window_pattern": "LLLG"},
+            attention_backend="fa3",
+        )
         self.assertTrue(self._resolved(sa, "disable_hybrid_swa_memory"))  # materialized
         self.assertTrue((self._publish(sa), self._leaf("disable_hybrid_swa_memory"))[1])
+
+    def test_exaone4_hybrid_swa_memory_off_under_hierarchical_cache(self):
+        from sglang.srt.arg_groups.model_overrides.exaone import _exaone_overrides
+
+        overrides = _exaone_overrides(
+            SimpleNamespace(enable_hierarchical_cache=True),
+            SimpleNamespace(
+                architectures=["Exaone4ForCausalLM"], sliding_window_pattern="LLLG"
+            ),
+        )
+        self.assertTrue(overrides["disable_hybrid_swa_memory"])
 
     def test_exaone_without_pattern_declares_nothing(self):
         from sglang.srt.arg_groups.model_overrides.exaone import _exaone_overrides
