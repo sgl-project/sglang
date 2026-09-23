@@ -87,6 +87,10 @@ class CacheTransferPhase(str, Enum):
     PREFETCH = "prefetch"  # Storage→H
 
 
+class LoadBackIncomplete(Exception):
+    """Component cannot restore its window; the whole load_back must abort."""
+
+
 class LinkerTransferPhase(str, Enum):
     LOOKUP = "lookup"
     LOAD = "load"
@@ -365,6 +369,13 @@ class TreeComponent(ABC):
           when the contiguous window reaches swa_sliding_window_size.
         - Mamba: returns True iff the node has mamba component data."""
         ...
+
+    def device_anchor_needs_reuse_clamp(self) -> bool:
+        """Whether this component's match_device_only validator can accept a node
+        past the boundary the host-gated validators stop at. When it can, the FULL
+        device anchor of a cross-request reuse match has to be clamped back to that
+        boundary -- see UnifiedTreeCore._match_prefix_helper."""
+        return False
 
     def finalize_match_result_in_tree_core(
         self,

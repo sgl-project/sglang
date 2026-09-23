@@ -123,6 +123,14 @@ class Memory(msgspec.Struct):
         Optional[float],
         "Fraction of the available host memory, bounded by visible cgroup memory.max/memory.high or v1 memory limits (after a 10 GiB reserve) that the HiCache host pools of all ranks on this machine may use. Applies only when neither --hicache-ratio nor --hicache-size is set: the default ratio is then reduced until the pools fit. Lower it when several engines share a memory cgroup.",
     ] = 0.8
+    hicache_swa_offload_page_stride: A[
+        int,
+        "Strict bit-exact SWA HiCache: offload one SWA sliding window every N "
+        "pages (plus the sequence tail window, always captured). 1 = per-page "
+        "(finest reuse granularity, most host memory). Larger N trades reuse "
+        "granularity for host memory; the SWA host pool is sized as "
+        "ceil(full_host_pages / N) + tail.",
+    ] = 1
     hicache_write_policy: A[
         str,
         Arg(
