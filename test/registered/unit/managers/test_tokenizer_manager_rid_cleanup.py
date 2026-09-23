@@ -669,6 +669,64 @@ class TestReleaseReqStatesOnFailure(CustomTestCase):
         self.assertNotIn(undelivered, tm.rid_to_state)
 
 
+class TestCreateAbortTask(CustomTestCase):
+    """Regression tests for lifecycle-bound streaming cleanup."""
+
+    @staticmethod
+    async def _run_abort_task(tm, obj):
+        with patch(
+            "sglang.srt.managers.tokenizer_manager.asyncio.sleep",
+            new=AsyncMock(),
+        ):
+            await tm.create_abort_task(obj)()
+
+    def test_unstarted_stream_cleanup_is_a_no_op(self):
+        """A stream closed before startup has no request state to abort."""
+        tm = _make_tokenizer_manager(self)
+        tm._dispatch_to_scheduler = Mock()
+        obj = GenerateReqInput(text="hello", rid="unstarted-rid")
+
+        asyncio.run(self._run_abort_task(tm, obj))
+
+        tm._dispatch_to_scheduler.assert_not_called()
+
+    def test_started_stream_cleanup_aborts_owned_state(self):
+        """A started stream cleanup aborts only its initialized lifecycle."""
+        tm = _make_tokenizer_manager(self)
+        obj = GenerateReqInput(text="hello", rid="active-rid")
+        obj.normalize_batch_and_arguments()
+        tm._init_req_state(obj)
+        tm.rid_to_state[obj.rid].dispatched = True
+        tm._dispatch_to_scheduler = Mock()
+
+        asyncio.run(self._run_abort_task(tm, obj))
+
+        self.assertTrue(tm.rid_to_state[obj.rid].abort_sent)
+        abort_req = tm._dispatch_to_scheduler.call_args.args[0]
+        self.assertEqual(abort_req.rid, obj.rid)
+        self.assertFalse(abort_req.abort_all)
+
+    def test_stale_stream_cleanup_preserves_reused_rid(self):
+        """Delayed cleanup cannot abort a new request reusing the same ID."""
+        tm = _make_tokenizer_manager(self)
+        old_obj = GenerateReqInput(text="old", rid="reused-rid")
+        old_obj.normalize_batch_and_arguments()
+        tm._init_req_state(old_obj)
+        tm._handle_abort_req(_make_abort_req(old_obj.rid))
+        tm._dispatch_to_scheduler = Mock()
+
+        replacement = GenerateReqInput(text="new", rid="reused-rid")
+        replacement.normalize_batch_and_arguments()
+        tm._init_req_state(replacement)
+        replacement_state = tm.rid_to_state[replacement.rid]
+
+        asyncio.run(self._run_abort_task(tm, old_obj))
+
+        self.assertIs(tm.rid_to_state[replacement.rid], replacement_state)
+        self.assertFalse(replacement_state.abort_sent)
+        tm._dispatch_to_scheduler.assert_not_called()
+
+
 class TestParallelStreamTaskCleanup(CustomTestCase):
     def test_failing_choice_cancels_and_closes_sibling_waiters(self):
         tm = _make_tokenizer_manager(self)
