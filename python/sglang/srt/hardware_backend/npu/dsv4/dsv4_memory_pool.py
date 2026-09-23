@@ -8,9 +8,9 @@ rules as the GPU implementation:
 * C128A state follows ``req_pool_idx`` and absolute position.
 
 ``NPUCompressStatePool`` adds the contiguous 3-D view and positive dummy
-location required by the Atlas fused compressor operators. A3 uses explicit
-locations; A5 uses the same ring storage through its request-bank (cycle) ABI.
-There is no paged state allocator or ``cache_mode=1`` compatibility storage.
+location required by the Atlas fused compressor operators. Every arch uses the
+explicit-location ABI (``cache_mode=2``); there is no paged state allocator or
+``cache_mode=1`` compatibility storage.
 """
 
 from __future__ import annotations
@@ -402,11 +402,10 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
     def get_state_buf_infos(self) -> Tuple[List[int], List[int], List[int]]:
         """GPU-compatible ``StateType.SWA`` component.
 
-        On pre-A5 (EXPLICIT cache_mode), SWA KV, C4 attention state and C4
-        indexer state retain separate buffers but share the same SWA page/state
-        index.  On A5 (CYCLE cache_mode) the compressor addresses the C4 state
-        ring by ``req_pool_idx`` instead of SWA page, so C4 state is excluded
-        here and registered separately via :meth:`get_c4_state_buf_infos`.
+        SWA KV, C4 attention state and C4 indexer state keep separate buffers
+        but share the same SWA page/state index on every arch: the C4 state is
+        explicit-location addressed through ``translate_from_swa_loc_to_state_loc``,
+        so it transports with the SWA pages like the pre-A5 path.
         """
         data_ptrs: List[int] = []
         data_lens: List[int] = []
@@ -417,41 +416,17 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
             data_lens.append(buf.nbytes)
             item_lens.append(buf[0].nbytes)
 
-        if not is_npu_arch35():
-            for pools in (
-                self.compress_state_pools,
-                self.indexer_compress_state_pools,
-            ):
-                for pool in pools:
-                    if pool is None or pool.ratio != 4:
-                        continue
-                    state = pool.kv_score_buffer.kv_score
-                    data_ptrs.append(state.data_ptr())
-                    data_lens.append(state.nbytes)
-                    item_lens.append(state[0].nbytes * pool.ring_size)
-
-        return data_ptrs, data_lens, item_lens
-
-    def get_c4_state_buf_infos(self) -> Tuple[List[int], List[int], List[int]]:
-        """C4 compress state ring (attention + indexer).
-
-        Register one physical state row as an item.  PD peers can have
-        different request-local ring sizes (for example prefill without MTP
-        and decode with MTP), so payload indices map the same logical token
-        positions into each peer's local ring independently.
-        """
-        data_ptrs: List[int] = []
-        data_lens: List[int] = []
-        item_lens: List[int] = []
-
-        for pools in (self.compress_state_pools, self.indexer_compress_state_pools):
+        for pools in (
+            self.compress_state_pools,
+            self.indexer_compress_state_pools,
+        ):
             for pool in pools:
                 if pool is None or pool.ratio != 4:
                     continue
                 state = pool.kv_score_buffer.kv_score
                 data_ptrs.append(state.data_ptr())
                 data_lens.append(state.nbytes)
-                item_lens.append(state[0].nbytes)
+                item_lens.append(state[0].nbytes * pool.ring_size)
 
         return data_ptrs, data_lens, item_lens
 

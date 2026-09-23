@@ -78,20 +78,14 @@ def dsv4_state_payloads(
     cross-hardware ``StateType.SWA`` / ``StateType.DSV4_REQUEST_STATE`` defaults:
 
     * ``DSV4_C128`` — C128 KV pages from ``req_to_c128_sidecar``.
-    * ``DSV4_C4_STATE`` (A5 only) — live C4 compress-state rows.  Prefill
-      and decode derive physical rows using their own local ring sizes, so
-      decode-only MTP can safely transfer from an 8-row ring to a 16-row ring.
-      Pre-A5 uses EXPLICIT cache_mode and the C4 state is handled by the
-      shared ``StateType.SWA`` payload.
+
+    The C4 compress state is explicit-location addressed and transports with the
+    shared ``StateType.SWA`` payload on every arch.
     """
 
     import numpy as np
 
     from sglang.srt.disaggregation.ascend.conn import AscendStateType
-    from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
-    from sglang.srt.mem_cache.deepseek_v4_compress_state import (
-        c4_state_transfer_indices,
-    )
 
     seq_len = max(0, int(seq_len))
     prefix_len = max(0, min(int(prefix_len), seq_len))
@@ -110,20 +104,7 @@ def dsv4_state_payloads(
         )
         return pages[pages > 0]
 
-    payloads = {AscendStateType.DSV4_C128: c128_kv_pages}
-
-    if is_npu_arch35():
-
-        def c4_state_indices():
-            return c4_state_transfer_indices(
-                req_pool_idx,
-                seq_len,
-                ring_size=req_to_token_pool.get_dsv4_c4_state_ring_size(),
-            )
-
-        payloads[AscendStateType.DSV4_C4_STATE] = c4_state_indices
-
-    return payloads
+    return {AscendStateType.DSV4_C128: c128_kv_pages}
 
 
 def dsv4_prealloc_kwargs(allocator, req, fill_len, req_to_token_pool, *, device):
