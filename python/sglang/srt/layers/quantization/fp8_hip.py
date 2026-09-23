@@ -69,19 +69,21 @@ def apply_dense(
     backend = method.mxfp8_dense_backend
     mxfp8_ready = layer.block_fp8_mxfp8_ready
     native_route = mxfp8_ready and backend.is_gfx95_mxfp8_native()
+    # Unwrap the producer's operand: the native route takes fp8 + scales or the fp8-grid
+    # bf16 directly; the dot_scaled route quantizes the plain tensor itself (per-32
+    # rounding is idempotent, so the wrapper's rounding is exact for it).
+    input_scale, on_fp8_grid = None, False
     if isinstance(x, Mxfp8Activation):
-        # quantized by a fused producer for the native route; other routes dequantize it (exact)
         if native_route:
-            return _apply_native(method, layer, x.q, bias, input_scale=x.scale)
-        x = Fp8GridActivation(dequant_mxfp8_to_bf16(x.q, x.scale))
-    if isinstance(x, Fp8GridActivation):
-        # the dot_scaled route quantizes the plain tensor itself (per-32 rounding is idempotent)
-        if native_route:
-            return _apply_native(method, layer, x.x, bias, input_on_fp8_grid=True)
-        x = x.x
-    x, input_scale = x if isinstance(x, tuple) else (x, None)
+            x, input_scale = x.q, x.scale
+        else:
+            x = dequant_mxfp8_to_bf16(x.q, x.scale)
+    elif isinstance(x, Fp8GridActivation):
+        x, on_fp8_grid = x.x, native_route
+    elif isinstance(x, tuple):
+        x, input_scale = x
     if native_route:
-        return _apply_native(method, layer, x, bias, input_scale=input_scale)
+        return _apply_native(method, layer, x, bias, input_scale, on_fp8_grid)
     if mxfp8_ready and input_scale is None:
         return method.w8a8_mxfp8_linear(
             input=x,
