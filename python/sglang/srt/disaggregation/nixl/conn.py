@@ -2661,6 +2661,8 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                 )
             elif st in (
                 StateType.SWA,
+                StateType.BLOCK_SCALE,
+                StateType.BLOCK_SCALE_SWA,
                 StateType.QSA_PENDING,
                 StateType.QSA_COMPRESSED,
                 StateType.SWA_RING,

@@ -29,7 +29,6 @@ from sglang.srt.entrypoints.engine import (
     Engine,
     SchedulerInitResult,
     _calculate_rank_ranges,
-    _compute_parallelism_ranks,
 )
 from sglang.srt.environ import envs
 from sglang.srt.ray.scheduler_actor import SchedulerActor
@@ -204,8 +203,6 @@ def _create_scheduler_actor(
         rank0_node_ip: IP of rank-0's node, used for NCCL rendezvous.
         dist_init_addr: Distributed init address (tcp://rank0_node_ip:nccl_port).
     """
-    attn_cp_rank, moe_dp_rank, moe_ep_rank = _compute_parallelism_ranks(tp_rank)
-
     return SchedulerActor.options(
         num_cpus=0,
         num_gpus=1,
@@ -223,9 +220,6 @@ def _create_scheduler_actor(
         port_args=port_args,
         gpu_id=gpu_id,
         tp_rank=tp_rank,
-        attn_cp_rank=attn_cp_rank,
-        moe_dp_rank=moe_dp_rank,
-        moe_ep_rank=moe_ep_rank,
         pp_rank=pp_rank,
         dp_rank=dp_rank,
         dist_init_addr=dist_init_addr,
@@ -340,12 +334,7 @@ class RayEngine(Engine):
                 for node_idx in range(nnodes):
                     bundle_idx = bundle_for_node[node_idx]
                     pp_range, tp_range, pp_per_node, tp_per_node = (
-                        _calculate_rank_ranges(
-                            nnodes,
-                            get_parallel().pp_size,
-                            get_parallel().tp_size,
-                            node_rank=node_idx,
-                        )
+                        _calculate_rank_ranges(node_rank=node_idx)
                     )
                     for pp_rank in pp_range:
                         for tp_rank in tp_range:
