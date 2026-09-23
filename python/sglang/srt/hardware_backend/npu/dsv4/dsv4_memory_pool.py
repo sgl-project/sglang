@@ -343,12 +343,10 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
         )
         config = self.compressed_pool_configs[ratio]
         ring_size = self.get_ring_size(ratio)
-        # A5 cache_mode=2 addresses one ring bank per request.  The A3
-        # explicit-location path can share the smaller flat pool, but the A5
-        # cycle ABI needs enough physical banks for every req_pool_idx.
+        # Explicit-location (A3-style) addressing: the C4 state follows the SWA
+        # pages, so the pool keeps the SWA-scaled ``config.state_size`` on every
+        # arch -- no per-request ring banks (the old A5 cycle ABI is gone).
         size = config.state_size
-        if is_npu_arch35():
-            size = max(size, self.num_req_slots * ring_size)
         return NPUCompressStatePool(
             size=size,
             ring_size=ring_size,
@@ -468,8 +466,7 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
     def get_state_cache(self, layer_id: int, from_indexer: bool) -> torch.Tensor:
         """FP32 ``[block_num, ring_size, 2*coff*D]`` view of this layer's
         kv+score buffer — the fused compressor op
-        (``torch.ops.custom.compressor`` on A5 and ``torch.ops.npu.compressor``
-        elsewhere)'s ``state_cache`` argument."""
+        (``torch.ops.npu.compressor``)'s ``state_cache`` argument."""
         return self._get_state_pool(layer_id, from_indexer).state_cache_3d
 
     # ------------------------------------------------------------------
