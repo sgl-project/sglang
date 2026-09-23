@@ -426,6 +426,18 @@ def get_dflash_attention_sliding_window_size(config: Any) -> Optional[int]:
     )
     if sliding_window is None and is_nemotron_35_draft_config(config):
         sliding_window = _get_dflash_config(config).get("swa_window_size")
+
+    if sliding_window is None:
+        import json
+        from pathlib import Path
+
+        model_path = _cfg_get(config, "_name_or_path")
+        if model_path:
+            config_path = Path(model_path) / "config.json"
+            if config_path.exists():
+                raw_config = json.loads(config_path.read_text())
+                sliding_window = raw_config.get("sliding_window")
+
     if sliding_window is None:
         raise ValueError(
             "DFLASH sliding_attention layers require config.sliding_window."
@@ -1198,6 +1210,9 @@ def build_dflash_verify_target_probs(
 
 
 def validate_dflash_request(req: Req, enable_overlap: bool) -> Optional[str]:
+    if req.return_logprob:
+        return "DFLASH speculative decoding does not support return_logprob yet."
+
     if enable_overlap and req.return_hidden_states:
         return "DFLASH speculative decoding does not support return_hidden_states yet."
 
