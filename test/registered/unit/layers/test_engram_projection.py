@@ -35,6 +35,8 @@ class TestEngramProjection(CustomTestCase):
             ("prefill", 8),
             ("decode", 4),
             ("decode", 8),
+            ("null", 4),
+            ("null", 8),
         ):
             with self.subTest(role=role, tp_size=tp_size):
                 pieces = []
@@ -50,7 +52,7 @@ class TestEngramProjection(CustomTestCase):
     def test_unsupported_topologies_keep_full_weight(self):
         for change in [
             dict(role=None),
-            dict(role="null"),
+            dict(role="invalid"),
             dict(dp_attention=True),
             dict(cp_size=2),
             dict(prefill_cp=True),

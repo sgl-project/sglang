@@ -889,10 +889,10 @@ def build_engram_projection(
     prefill_cp=False,
     sequence_parallel=False,
 ):
-    """Shard replicated PD WKV columns, gathering outputs before the Engram gate."""
+    """Shard replicated-token WKV columns, gathering outputs before the Engram gate."""
     block = getattr(quant_config, "weight_block_size", None)
     if (
-        role not in ("prefill", "decode")
+        role not in ("prefill", "decode", "null")
         or tp_size not in (4, 8)
         or dp_attention
         or cp_size != 1
