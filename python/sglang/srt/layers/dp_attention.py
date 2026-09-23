@@ -897,6 +897,15 @@ def dp_scatter(
         memcpy(local_tokens, global_tokens, 0, local_start_pos, local_num_tokens, True)
 
 
+def can_use_dp_reduce_scatter() -> bool:
+    """Whether the fixed TP group tiles the current attention DP x TP layout."""
+    if not world_dp_gather_enabled():
+        return True
+
+    parallel = get_parallel()
+    return parallel.tp_size == parallel.dp_size * parallel.attn_tp_size
+
+
 def dp_reduce_scatter_tensor(output: torch.Tensor, input: torch.Tensor):
     _note_dp_gather_in_prefill_graph()
     if is_dp_gatherv_active():
