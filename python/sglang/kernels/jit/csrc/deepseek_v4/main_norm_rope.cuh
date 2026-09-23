@@ -15,6 +15,7 @@
 
 #include <bit>
 #include <cstdint>
+#include <type_traits>
 
 namespace sglang {
 
@@ -258,6 +259,12 @@ struct FusedKNormRopeFlashMLAParams {
   int64_t kv_stride_batch;
   uint32_t batch_size;
   float eps;
+  // kRopeQ (ROCm): (B, num_q_heads, kHeadDim) DType; the trailing kRopeDim of every head
+  // are rotated in place with this token's frequencies by the same launch.
+  void* __restrict__ q = nullptr;
+  int64_t q_stride_batch = 0;
+  int64_t q_stride_head = 0;
+  uint32_t num_q_heads = 0;
 };
 
 template <
@@ -267,7 +274,8 @@ template <
     typename PosT,
     int32_t kPageBits,
     deepseek_v4::KVLayout kLayout,
-    bool kUsePDL>
+    bool kUsePDL,
+    bool kRopeQ = false>
 K_KERNEL void fused_k_norm_rope_flashmla(const __grid_constant__ FusedKNormRopeFlashMLAParams params) {
   using namespace device;
 
@@ -331,6 +339,29 @@ K_KERNEL void fused_k_norm_rope_flashmla(const __grid_constant__ FusedKNormRopeF
   // sentinel from the full->SWA translation for out-of-window tokens or
   // padded rows); skip the row instead of writing out of bounds. Checked
   // here, not at the load, so the out_loc prefetch overlaps the norm above.
+  if constexpr (kRopeQ) {
+    // Query rope, pair j of head h at q[h * stride + kHeadDim - kRopeDim + 2j]: the cross product
+    // is rounded, then one fma with the cosine, so the bf16 result is bitwise the Triton flat
+    // rope kernel's on gfx950.
+    static_assert(std::is_same_v<DType, bf16_t>, "the in-place query rope reads q as bf16 pairs");
+    constexpr uint32_t kPairsPerHead = kRopeDim / 2;
+    const auto q_row = static_cast<DType*>(params.q) + work_id * params.q_stride_batch + (kHeadDim - kRopeDim);
+    const auto n_pairs = params.num_q_heads * kPairsPerHead;
+    for (uint32_t p = tx; p < n_pairs; p += kFusedKBlockSize) {
+      const auto head = p / kPairsPerHead;
+      const auto pair = p % kPairsPerHead;
+      auto* ptr = reinterpret_cast<bf16x2_t*>(q_row + head * params.q_stride_head) + pair;
+      const auto qv = cast<fp32x2_t>(*ptr);
+      const auto cos_v = freqs_cis[2 * pair];
+      const auto sin_v = freqs_cis[2 * pair + 1];
+      const float rot_real = -__fmul_rn(qv.y, sin_v);
+      const float rot_imag = __fmul_rn(qv.x, sin_v);
+      const float out_real = fmaf(qv.x, cos_v, rot_real);
+      const float out_imag = fmaf(qv.y, cos_v, rot_imag);
+      *ptr = cast<bf16x2_t>(fp32x2_t{out_real, out_imag});
+    }
+  }
+
   if (out_loc < 0) return;
 
   const auto row = Paged::row(params.kvcache, out_loc);
@@ -398,9 +429,9 @@ struct FusedKNormRopeFlashMLAKernel {
   static_assert(1 << kLogPageSize == kPageSize);
   static_assert(kHeadDim == 512 && kRopeDim == 64, "FlashMLA layout requires (512, 64)");
 
-  template <typename PosT>
+  template <typename PosT, bool kRopeQ>
   static constexpr auto kernel =
-      fused_k_norm_rope_flashmla<DType, kHeadDim, kRopeDim, PosT, kLogPageSize, kLayout, kUsePDL>;
+      fused_k_norm_rope_flashmla<DType, kHeadDim, kRopeDim, PosT, kLogPageSize, kLayout, kUsePDL, kRopeQ>;
 
   static void forward(
       const tvm::ffi::TensorView kv,
@@ -410,6 +441,33 @@ struct FusedKNormRopeFlashMLAKernel {
       const tvm::ffi::TensorView out_loc,
       const tvm::ffi::TensorView kvcache,
       float eps) {
+    forward_impl<false>(kv, kv_weight, freqs_cis, positions, out_loc, kvcache, eps, nullptr);
+  }
+
+  /// `forward` with the same tokens' query heads `q` (B, H, kHeadDim) roped in place (ROCm).
+  static void forward_with_q(
+      const tvm::ffi::TensorView kv,
+      const tvm::ffi::TensorView kv_weight,
+      const tvm::ffi::TensorView freqs_cis,
+      const tvm::ffi::TensorView positions,
+      const tvm::ffi::TensorView out_loc,
+      const tvm::ffi::TensorView kvcache,
+      float eps,
+      const tvm::ffi::TensorView q) {
+    forward_impl<true>(kv, kv_weight, freqs_cis, positions, out_loc, kvcache, eps, &q);
+  }
+
+ private:
+  template <bool kRopeQ>
+  static void forward_impl(
+      const tvm::ffi::TensorView kv,
+      const tvm::ffi::TensorView kv_weight,
+      const tvm::ffi::TensorView freqs_cis,
+      const tvm::ffi::TensorView positions,
+      const tvm::ffi::TensorView out_loc,
+      const tvm::ffi::TensorView kvcache,
+      float eps,
+      const tvm::ffi::TensorView* q) {
     using namespace host;
 
     auto B = SymbolicSize{"batch_size"};
@@ -447,7 +505,7 @@ struct FusedKNormRopeFlashMLAKernel {
     const auto batch_size = static_cast<uint32_t>(B.unwrap());
     if (batch_size == 0) return;
 
-    const auto params = FusedKNormRopeFlashMLAParams{
+    auto params = FusedKNormRopeFlashMLAParams{
         .kv = kv.data_ptr(),
         .kv_weight = kv_weight.data_ptr(),
         .freqs_cis = static_cast<const float*>(freqs_cis.data_ptr()),
@@ -458,8 +516,22 @@ struct FusedKNormRopeFlashMLAKernel {
         .batch_size = batch_size,
         .eps = eps,
     };
-    const auto k_int32 = kernel<int32_t>;
-    const auto k_int64 = kernel<int64_t>;
+    if constexpr (kRopeQ) {
+      auto H = SymbolicSize{"num_q_heads"};
+      TensorMatcher({B, H, kHeadDim})  //
+          .with_strides({-1, -1, 1})
+          .with_dtype<DType>()
+          .with_device(device_)
+          .verify(*q);
+      // The rope pairs are read and written as 4-byte packs.
+      RuntimeCheck(q->stride(1) % 2 == 0 && q->stride(0) % 2 == 0, "q strides must be even");
+      params.q = q->data_ptr();
+      params.q_stride_batch = q->stride(0);
+      params.q_stride_head = q->stride(1);
+      params.num_q_heads = static_cast<uint32_t>(H.unwrap());
+    }
+    const auto k_int32 = kernel<int32_t, kRopeQ>;
+    const auto k_int64 = kernel<int64_t, kRopeQ>;
     const auto k = pos_dtype.is_type<int32_t>() ? k_int32 : k_int64;
     LaunchKernel(batch_size, kFusedKBlockSize, device_.unwrap())  //
         .enable_pdl(kUsePDL)(k, params);

@@ -85,11 +85,11 @@ def _jit_main_k_norm_rope_q_flashmla_module(
         dtype, head_dim, rope_dim, page_size, layout.cpp_name, is_arch_support_pdl()
     )
     return load_jit(
-        make_name("main_k_norm_rope_q_flashmla_hip"),
+        make_name("main_k_norm_rope_q_flashmla"),
         *args,
-        cuda_files=["deepseek_v4/main_norm_rope_hip.cuh"],
+        cuda_files=["deepseek_v4/main_norm_rope.cuh"],
         cuda_wrappers=[
-            ("forward_with_q", f"FusedKNormRopeQFlashMLAKernel<{args}>::forward"),
+            ("forward_with_q", f"FusedKNormRopeFlashMLAKernel<{args}>::forward_with_q"),
         ],
     )
 
