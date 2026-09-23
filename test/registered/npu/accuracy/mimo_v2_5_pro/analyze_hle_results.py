@@ -54,9 +54,9 @@ def analyze_file(filepath: str) -> dict:
     }
 
 
-def extract_target_from_review(filepath: str) -> list:
-    """从 reviews JSONL 提取每题正确答案"""
-    targets = []
+def extract_target_from_review(filepath: str) -> dict:
+    """从 reviews JSONL 提取每题正确答案，按 index 索引返回 "{index: target}" """
+    targets = {}
     with open(filepath, "r", encoding="utf-8") as f:
         for line in f:
             line = line.strip()
@@ -65,16 +65,17 @@ def extract_target_from_review(filepath: str) -> list:
             try:
                 d = json.loads(line)
                 t = d.get("target", [])
-                idx = d.get("index", len(targets))
-                targets.append({"index": idx, "target": t})
+                idx = d.get("index")
+                if idx is not None:
+                    targets[idx] = t
             except json.JSONDecodeError:
                 continue
     return targets
 
 
-def extract_answer_from_prediction(filepath: str) -> list:
-    """从 predictions JSONL 提取模型回答"""
-    answers = []
+def extract_answer_from_prediction(filepath: str) -> dict:
+    """从 predictions JSONL 提取模型回答，按 index 返回 {index: "answer"}"""
+    answers = {}
     with open(filepath, "r", encoding="utf-8") as f:
         for line in f:
             line = line.strip()
@@ -82,7 +83,9 @@ def extract_answer_from_prediction(filepath: str) -> list:
                 continue
             try:
                 d = json.loads(line)
-                idx = d.get("index", len(answers))
+                idx = d.get("index")
+                if idx is None:
+                    continue
                 content = (
                     d.get("model_output", {})
                     .get("choices", [{}])[0]
@@ -106,7 +109,7 @@ def extract_answer_from_prediction(filepath: str) -> list:
                 m = re.search(r"(?:Exact\s+)?Answer:\s*(.+)", full_text, re.IGNORECASE)
                 answer = m.group(1).strip() if m else ""
 
-                answers.append({"index": idx, "answer": answer, "full_text": full_text[:200]})
+                answers[idx] = answer
             except (json.JSONDecodeError, KeyError, IndexError):
                 continue
     return answers
@@ -117,22 +120,20 @@ def normalize_answer(a: str) -> str:
     return a.strip().lower().rstrip(".")
 
 
-def score_answers(targets: list, answers: list) -> list:
-    """比对 targets 和 answers，返回评分结果"""
-    # 按 index 对齐
-    answer_map = {a["index"]: a["answer"] for a in answers}
+def score_answers(targets: dict, answers: dict) -> list:
+    """比对 targets 和 answers（均为 {index: ...}），返回评分结果列表"""
     results = []
 
-    for t in targets:
-        idx = t["index"]
-        target_vals = [normalize_answer(v) for v in t["target"]]
-        model_ans = normalize_answer(answer_map.get(idx, ""))
+    for idx in sorted(targets.keys()):
+        t = targets[idx]
+        target_vals = [normalize_answer(v) for v in t]
+        model_ans = normalize_answer(answers.get(idx, ""))
 
         # 匹配：模型答案是否在 target 列表中
         is_correct = model_ans in target_vals
         results.append({
             "index": idx,
-            "target": t["target"],
+            "target": t,
             "model_answer": model_ans,
             "correct": is_correct,
         })
