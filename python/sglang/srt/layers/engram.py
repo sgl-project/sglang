@@ -57,8 +57,8 @@ logger = logging.getLogger(__name__)
 _MILLER_RABIN_WITNESSES = (2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37)
 
 
-def _cuda_kernels(t: torch.Tensor) -> bool:
-    """True where the Triton kernels apply (CUDA and HIP); CPU takes the torch paths."""
+def _gpu_kernels(t: torch.Tensor) -> bool:
+    """True where the Triton kernels apply; CPU tensors take the torch paths."""
     return t.is_cuda
 
 
@@ -318,7 +318,7 @@ class EngramHasher(nn.Module):
             commit_rows = torch.where(lens > 0, req_slots, self.pad_row)
             commit_last = (starts + lens - 1).clamp(0, num_tokens - 1)
 
-        if _cuda_kernels(input_ids):
+        if _gpu_kernels(input_ids):
             if kmode == MODE_DECODE:
                 # out_cache_loc 0 marks the CUDA-graph padded rows that must not commit.
                 assert forward_batch.out_cache_loc is not None
@@ -453,7 +453,7 @@ class EngramHasher(nn.Module):
     ) -> None:
         """Commit anchor + accepted drafts; the bonus is the next block's anchor."""
         assert self.history is not None, "EngramHasher.init_history was not called"
-        if _cuda_kernels(self.history):
+        if _gpu_kernels(self.history):
             engram_commit_history(
                 self.history, verify_ids_2d, req_pool_indices, commit_lens
             )
@@ -797,7 +797,7 @@ class EngramEmbedding(nn.Module):
         """Rows of `indices` this rank's shard holds, zero for the rest."""
         if self.rows == 0:
             return self._empty(indices).zero_()
-        if self.host_table is None and not _cuda_kernels(indices):
+        if self.host_table is None and not _gpu_kernels(indices):
             local = indices - self.row_start
             owned = (local >= 0) & (local < self.rows)
             local = local.masked_fill(~owned, 0)
@@ -869,7 +869,7 @@ def engram_gate(
 
     The torch path below is the CPU fallback."""
     if (
-        _cuda_kernels(x)
+        _gpu_kernels(x)
         and x.ndim == 3
         and kv.shape == (x.shape[0], (x.shape[1] + 1) * x.shape[2])
         and x.dtype == kv.dtype
