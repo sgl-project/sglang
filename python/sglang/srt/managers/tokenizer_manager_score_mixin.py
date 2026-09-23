@@ -153,7 +153,7 @@ class TokenizerManagerScoreMixin:
                 raise RuntimeError(
                     f"Expected {expected_count} delimiter entries, got {len(input_logprobs)}"
                 )
-            per_delimiter_scores = [[]]
+            per_delimiter_scores = [[]]  # the query boundary is not a decision
             for logprobs_data, labels in zip(input_logprobs[1:], label_token_ids):
                 logprobs = self._extract_logprobs_for_tokens(logprobs_data, labels)
                 score_list = self._convert_logprobs_to_scores(
@@ -165,11 +165,8 @@ class TokenizerManagerScoreMixin:
         elif embedding is not None:
             # Classification model: scores are directly in 2D embedding.
             if apply_softmax:
-                scores_tensor = (
-                    torch.tensor(embedding)
-                    if isinstance(embedding, list)
-                    else embedding
-                )
+                scores_tensor = torch.as_tensor(embedding, dtype=torch.float64)
+                scores_tensor = scores_tensor - scores_tensor.amax(dim=-1, keepdim=True)
                 scores_tensor = torch.nn.functional.softmax(
                     scores_tensor / temperature, dim=-1
                 )
@@ -262,8 +259,9 @@ class TokenizerManagerScoreMixin:
                 prompt_tokens += result.get("meta_info", {}).get("prompt_tokens", 0)
 
                 if apply_softmax:
+                    scores_tensor = torch.as_tensor(embedding, dtype=torch.float64)
                     embedding = torch.softmax(
-                        torch.as_tensor(embedding) / temperature, dim=-1
+                        (scores_tensor - scores_tensor.max()) / temperature, dim=-1
                     ).tolist()
 
                 # The classification head produces per-token logits, which the pooler reduces
@@ -655,7 +653,7 @@ class TokenizerManagerScoreMixin:
         # Create the appropriate request type
         mis_delimiter_indices = [delimiter_indices] if use_multi_item_scoring else None
         if is_generation:
-            # MIS has one packed request; gather the union, then select per item
+            # packed MIS requests gather the union, then select per item
             request_labels = (
                 list(
                     dict.fromkeys(
@@ -723,9 +721,13 @@ class TokenizerManagerScoreMixin:
         ]
 
         if apply_softmax:
-            score_list = torch.softmax(
-                torch.tensor(score_list) / temperature, dim=0
-            ).tolist()
+            # center before scaling so small temperatures do not overflow
+            maximum = max(score_list)
+            weights = [
+                math.exp((score - maximum) / temperature) for score in score_list
+            ]
+            denominator = sum(weights)
+            score_list = [weight / denominator for weight in weights]
         else:
             # Convert logprobs to probabilities if not using softmax
             score_list = [

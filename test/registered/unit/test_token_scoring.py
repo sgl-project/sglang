@@ -147,6 +147,19 @@ class TestTokenScoring(unittest.IsolatedAsyncioTestCase):
             )
         self.assertEqual(manager.requests, [])
 
+    async def test_small_temperature_is_finite(self):
+        for enable_mis in (False, True):
+            for generation in (False, True):
+                manager = ScoringManager(enable_mis=enable_mis, generation=generation)
+                result = await manager.score_request(
+                    query=[4],
+                    items=[[5]],
+                    label_token_ids=[1, 3],
+                    apply_softmax=True,
+                    temperature=1e-300,
+                )
+                self.assertEqual(result.scores, [[0.0, 1.0]])
+
     async def test_empty_batch(self):
         manager = ScoringManager()
         result = await manager.score_request(
