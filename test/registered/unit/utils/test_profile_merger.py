@@ -119,6 +119,22 @@ class TestProfileMerger(CustomTestCase):
         discovered = empty_merger._discover_trace_files()
         self.assertEqual(len(discovered), 0)
 
+    def test_discover_trace_files_with_profile_prefix(self):
+        # When a profile_prefix is set, files are written as
+        # "<prefix>-<profile_id>-TP-...". Discovery must still find them, and
+        # must keep excluding the merged output.
+        prefixed = [
+            f"DECODE-{self.profile_id}-TP-0.trace.json.gz",
+            f"DECODE-{self.profile_id}-TP-1.trace.json.gz",
+        ]
+        for filename in prefixed + [f"merged-{self.profile_id}.trace.json.gz"]:
+            filepath = os.path.join(self.temp_dir, filename)
+            with gzip.open(filepath, "wt") as f:
+                json.dump({"traceEvents": []}, f)
+
+        discovered = {os.path.basename(f) for f in self.merger._discover_trace_files()}
+        self.assertEqual(discovered, set(prefixed))
+
     def test_merge_chrome_traces(self):
         # Create multiple trace files in random order
         trace_files = [
