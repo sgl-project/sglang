@@ -127,25 +127,28 @@ def free_kv_row_segments(
 ) -> None:
     """Free ascending disjoint ``(kv_indices, start_pos)`` segments of one
     request's kv row; ``[swa_dead_lo, swa_evicted_seqlen)`` goes back full-side only."""
+    dead_lo, dead_hi = swa_dead_lo, max(swa_evicted_seqlen, swa_dead_lo)
     swa_dead: list[tuple[torch.Tensor, int]] = []
     swa_alive: list[tuple[torch.Tensor, int]] = []
     for kv_indices, start_pos in segments:
-        num_indices = kv_indices.numel()
-        if num_indices == 0:
-            continue
-        end_pos = start_pos + num_indices
-        dead_start = min(max(swa_dead_lo, start_pos), end_pos)
-        dead_end = min(max(swa_evicted_seqlen, dead_start), end_pos)
-        if dead_end == dead_start:
+        end_pos = start_pos + kv_indices.numel()
+        lo = min(max(dead_lo, start_pos), end_pos)
+        hi = min(max(dead_hi, start_pos), end_pos)
+        if hi <= lo:
             swa_alive.append((kv_indices, start_pos))
             continue
-        if dead_start > start_pos:
-            swa_alive.append((kv_indices[: dead_start - start_pos], start_pos))
-        swa_dead.append(
-            (kv_indices[dead_start - start_pos : dead_end - start_pos], dead_start)
-        )
-        if dead_end < end_pos:
-            swa_alive.append((kv_indices[dead_end - start_pos :], dead_end))
+        for piece_start, piece_end, side in (
+            (start_pos, lo, swa_alive),
+            (lo, hi, swa_dead),
+            (hi, end_pos, swa_alive),
+        ):
+            if piece_end > piece_start:
+                side.append(
+                    (
+                        kv_indices[piece_start - start_pos : piece_end - start_pos],
+                        piece_start,
+                    )
+                )
 
     if swa_dead and swa_alive:
         # The two sides are separate calls, so neither one's page-disjointness
