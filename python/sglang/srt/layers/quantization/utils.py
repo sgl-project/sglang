@@ -64,6 +64,8 @@ def _module_path_match(ignored: str, prefix: str) -> bool:
 _FALLBACK_FUSED_SHARDS: Mapping[str, List[str]] = {
     "qkv_proj": ["q_proj", "k_proj", "v_proj"],
     "gate_up_proj": ["gate_proj", "up_proj"],
+    "in_proj_qkvz": ["in_proj_qkv", "in_proj_z"],
+    "in_proj_ba": ["in_proj_b", "in_proj_a"],
 }
 
 
@@ -257,10 +259,17 @@ def get_dynamic_override(
     key: Optional[str] = None,
     default_value: Union[int, bool, None] = None,
 ) -> Union[Dict, int, bool, None]:
+    proj_name = layer_name.split(".")[-1]
+    fused_shards = _FALLBACK_FUSED_SHARDS.get(proj_name, [])
+    candidate_names = [layer_name] + [
+        layer_name.removesuffix(proj_name) + shard for shard in fused_shards
+    ]
+
     for pattern, pattern_dict in config.dynamic.items():
         # Negative match: matched modules are excluded from quantized init
         if pattern.startswith("-:"):
-            if re.match(pattern.removeprefix("-:"), layer_name):
+            regex = pattern.removeprefix("-:")
+            if any(re.match(regex, name) for name in candidate_names):
                 return False
         # Positive match: matched modules have quant properties overrides
         # base quant config
