@@ -579,6 +579,9 @@ class TpModelWorker(BaseTpWorker):
             * get_parallel().attn_dcp_size
             - 1,
         )
+        max_req_input_len = max_req_len - 5
+        if self.dllm_algorithm is not None:
+            max_req_input_len -= self.dllm_algorithm.block_size
         return (
             self.model_runner.req_to_token_pool.schedulable_token_capacity(
                 self.model_runner.max_total_num_tokens
@@ -587,7 +590,7 @@ class TpModelWorker(BaseTpWorker):
             self.model_runner.max_running_requests,
             get_schedule().max_queued_requests,
             max_req_len,
-            max_req_len - 5,
+            max_req_input_len,
             self.random_seed,
             self.device,
             self.model_runner.forward_stream,
@@ -623,6 +626,10 @@ class TpModelWorker(BaseTpWorker):
             dllm_algo_state=dllm_algo_state,
             can_run_cuda_graph=can_run_cuda_graph,
         )
+
+    def _maybe_finalize_elastic_cuda_graph_scale(self) -> None:
+        if self.model_runner._elastic_cuda_graph_enabled():
+            self.model_runner.maybe_join_ep_ranks()
 
     def forward_batch_generation(
         self,
@@ -704,6 +711,7 @@ class TpModelWorker(BaseTpWorker):
                     batch_result.next_token_ids = self.model_runner.sample(
                         logits_output, forward_batch
                     )
+                    self._maybe_finalize_elastic_cuda_graph_scale()
                     return batch_result
 
                 batch_result.delay_sample_func = sample_batch_func
@@ -731,6 +739,7 @@ class TpModelWorker(BaseTpWorker):
                         logits_output, forward_batch
                     )
 
+            self._maybe_finalize_elastic_cuda_graph_scale()
             return batch_result
         else:
             out = self.model_runner.forward(
@@ -763,6 +772,7 @@ class TpModelWorker(BaseTpWorker):
             )
         else:
             next_token_ids = None
+        self._maybe_finalize_elastic_cuda_graph_scale()
         batch_result = GenerationBatchResult(
             logits_output=logits_output,
             can_run_cuda_graph=can_run_cuda_graph,

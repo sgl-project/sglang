@@ -449,6 +449,7 @@ class Engine(EngineScoreMixin, EngineBase):
         bootstrap_room: Optional[Union[List[int], int]] = None,
         routed_dp_rank: Optional[int] = None,
         disagg_prefill_dp_rank: Optional[int] = None,
+        kv_hints: Optional[Dict] = None,
         # Deprecated: use routed_dp_rank instead
         data_parallel_rank: Optional[int] = None,
         external_trace_header: Optional[Dict] = None,
@@ -493,6 +494,7 @@ class Engine(EngineScoreMixin, EngineBase):
             bootstrap_room=bootstrap_room,
             routed_dp_rank=routed_dp_rank,
             disagg_prefill_dp_rank=disagg_prefill_dp_rank,
+            kv_hints=kv_hints,
             external_trace_header=external_trace_header,
             rid=rid,
             session_id=session_id,
@@ -562,6 +564,7 @@ class Engine(EngineScoreMixin, EngineBase):
         bootstrap_room: Optional[Union[List[int], int]] = None,
         routed_dp_rank: Optional[int] = None,
         disagg_prefill_dp_rank: Optional[int] = None,
+        kv_hints: Optional[Dict] = None,
         # Deprecated: use routed_dp_rank instead
         data_parallel_rank: Optional[int] = None,
         external_trace_header: Optional[Dict] = None,
@@ -606,6 +609,7 @@ class Engine(EngineScoreMixin, EngineBase):
             bootstrap_room=bootstrap_room,
             routed_dp_rank=routed_dp_rank,
             disagg_prefill_dp_rank=disagg_prefill_dp_rank,
+            kv_hints=kv_hints,
             external_trace_header=external_trace_header,
             rid=rid,
             session_id=session_id,
@@ -1876,35 +1880,6 @@ def _set_envs_and_config(server_args: ServerArgs):
     # Set gc threshold
     if gc_threshold := cfg.gc_threshold:
         gc.set_threshold(*gc_threshold)
-
-    _log_legacy_kernel_cache_dirs()
-
-
-def _log_legacy_kernel_cache_dirs():
-    """Note the pre-SGLANG_CACHE_DIR cache dirs without touching them: other
-    frameworks on the box may still be using them."""
-    # TODO(shuwang21): drop once SGLANG_CACHE_DIR has been the default for a
-    # few releases.
-    legacy_dirs = [
-        d
-        for d in (
-            os.path.expanduser("~/.triton"),
-            os.path.expanduser("~/.cache/flashinfer"),
-            os.path.expanduser("~/.cache/deep_gemm"),
-            os.path.expanduser("~/.tilelang/cache"),
-        )
-        if os.path.isdir(d)
-    ]
-    if not legacy_dirs:
-        return
-    logger.debug(
-        "Compiled-kernel caches now live under SGLANG_CACHE_DIR (%s). These "
-        "older directories are no longer used by sglang, but may still be "
-        "used by other frameworks on this machine, so they were left alone: "
-        "%s. Remove them yourself if nothing else needs them.",
-        envs.SGLANG_CACHE_DIR.get(),
-        ", ".join(legacy_dirs),
-    )
 
 
 def _scheduler_died_error(rank: int, proc) -> RuntimeError:

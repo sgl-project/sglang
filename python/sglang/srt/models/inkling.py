@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import logging
 import re
+from array import array
 from typing import Iterable, Optional, Set, Tuple
 
 import torch
@@ -1013,7 +1014,6 @@ class InklingForConditionalGeneration(nn.Module):
         self.config = config
         self.text_config = config.text_config
 
-        assert envs.SGLANG_ENABLE_UNIFIED_RADIX_TREE.get()
         if get_disagg().disaggregation_mode != "decode":
             assert not get_memory().disable_radix_cache
             assert not get_schedule().disable_hybrid_swa_memory
@@ -1122,7 +1122,7 @@ class InklingForConditionalGeneration(nn.Module):
             return 2
         return 1
 
-    def pad_input_ids(self, input_ids: list[int], mm_inputs: MultimodalInputs):
+    def pad_input_ids(self, input_ids: array, mm_inputs: MultimodalInputs) -> array:
         # The processor expands one placeholder per media item into a run of the same
         # token id; the scheduler calls this to replace each run with the item's
         # pad_value (radix hash), which _embed_mm then masks on to scatter the embeds.

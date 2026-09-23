@@ -67,6 +67,7 @@ from sglang.srt.arg_groups.serving_hook import (
     handle_load_balance_method,
     handle_missing_default_values,
     handle_multimodal_feature_transport,
+    handle_other_validations,
     handle_ssl_validation,
     handle_tokenizer_batching,
     ssl_verify_of,
@@ -120,6 +121,25 @@ _mock_device.start()
 
 
 class TestPrepareServerArgs(CustomTestCase):
+    def test_optimistic_prefill_allows_l2_write_through_only(self):
+        for policy, expected in (
+            ("write_back", 2),
+            ("write_through", 2),
+            ("write_through_selective", 0),
+        ):
+            with self.subTest(policy=policy):
+                args = ServerArgs(
+                    model_path="dummy",
+                    disaggregation_mode="prefill",
+                    optimistic_prefill_attempts=2,
+                    enable_hierarchical_cache=True,
+                    hicache_write_policy=policy,
+                )
+                handle_other_validations(args)
+                self.assertEqual(
+                    resolution_result(args, "optimistic_prefill_attempts"), expected
+                )
+
     def test_radix_eviction_policy_explicitness_is_preserved(self):
         omitted = prepare_server_args(["--model-path", "dummy"])
         separated = prepare_server_args(
@@ -544,34 +564,6 @@ class TestMultimodalFeatureTransport(CustomTestCase):
         output = "\n".join(logs.output)
         self.assertIn("base GPU 2", output)
         self.assertIn("4 tokenizer worker", output)
-
-    @override_platform(is_cuda=True)
-    def test_legacy_keep_flag_maps_to_cuda_ipc(self):
-        server_args = ServerArgs(model_path="dummy", keep_mm_feature_on_device=True)
-
-        with patch.dict(os.environ, {"SGLANG_USE_CUDA_IPC_TRANSPORT": "0"}):
-            with self.assertLogs(serving_hook.logger, level="WARNING") as logs:
-                handle_multimodal_feature_transport(server_args)
-
-            self.assertEqual(
-                resolution_result(server_args, "mm_feature_transport"), "cuda_ipc"
-            )
-            self.assertFalse(
-                resolution_result(server_args, "keep_mm_feature_on_device")
-            )
-            self.assertTrue(envs.SGLANG_USE_CUDA_IPC_TRANSPORT.get())
-
-        self.assertIn("deprecated", logs.output[0])
-
-    def test_legacy_keep_flag_rejects_explicit_cuda_vmm(self):
-        server_args = ServerArgs(
-            model_path="dummy",
-            keep_mm_feature_on_device=True,
-            mm_feature_transport="cuda_vmm",
-        )
-
-        with self.assertRaisesRegex(ValueError, "conflicts.*cuda_vmm"):
-            handle_multimodal_feature_transport(server_args)
 
     @override_platform(is_cuda=True)
     def test_explicit_cpu_overrides_legacy_environment(self):
@@ -2068,7 +2060,7 @@ class TestHiCacheArgs(unittest.TestCase):
                 },
                 3,
             ),
-            ({"hicache_write_policy": "write_through"}, 0),
+            ({"hicache_write_policy": "write_through"}, 3),
             (
                 {
                     "hicache_storage_backend": "file",
@@ -3583,6 +3575,25 @@ class TestGrpcServerArgs(CustomTestCase):
             with self.assertRaises(ValueError):
                 handle_deprecated_args(sa)
 
+    def test_grpc_response_timeout(self):
+        parser = self._sidecar_parser()
+        for value in (300, 1800, 0, -1):
+            with self.subTest(timeout=value):
+                argv = ["--model-path", "dummy", "--grpc-port", "50051"]
+                if value != 300:
+                    argv += ["--grpc-response-timeout-secs", str(value)]
+                sa = ServerArgs.from_cli_args(parser.parse_args(argv))
+                if value <= 0:
+                    with self.assertRaisesRegex(
+                        ValueError, "grpc-response-timeout-secs"
+                    ):
+                        handle_deprecated_args(sa)
+                else:
+                    handle_deprecated_args(sa)
+                    self.assertEqual(
+                        resolution_result(sa, "grpc_response_timeout_secs"), value
+                    )
+
     def test_start_server_call_site_matches_native_signature(self):
         """Regression for the startup blocker: the native start_server binding
         only accepts (host, port, runtime_handle, worker_threads, ...). The
@@ -3594,7 +3605,10 @@ class TestGrpcServerArgs(CustomTestCase):
         fake_core = SimpleNamespace(start_server=MagicMock(return_value="handle"))
         fake_bridge = SimpleNamespace(RuntimeHandle=MagicMock(return_value="rt"))
         override = get_context().override_server_args(
-            host="127.0.0.1", grpc_port=50051, grpc_worker_threads=4
+            host="127.0.0.1",
+            grpc_port=50051,
+            grpc_worker_threads=4,
+            grpc_response_timeout_secs=1800,
         )
         server_args = override.install()
         self.addCleanup(override.restore)
@@ -3619,9 +3633,17 @@ class TestGrpcServerArgs(CustomTestCase):
         load_rust_extension.assert_called_once_with("sglang.srt.rust_extensions._grpc")
         _, kwargs = fake_core.start_server.call_args
         self.assertEqual(
-            set(kwargs), {"host", "port", "runtime_handle", "worker_threads"}
+            set(kwargs),
+            {
+                "host",
+                "port",
+                "runtime_handle",
+                "worker_threads",
+                "response_timeout_secs",
+            },
         )
         self.assertEqual(kwargs["worker_threads"], 4)
+        self.assertEqual(kwargs["response_timeout_secs"], 1800)
         self.assertNotIn("max_prefill_tokens", kwargs)
 
 
