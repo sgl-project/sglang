@@ -13,7 +13,6 @@ from typing import Any
 from sglang.srt.arg_groups.overrides import (
     declare_resolution,
     model_config_of,
-    resolved_view,
     resolving_view,
 )
 from sglang.srt.environ import envs
@@ -335,6 +334,9 @@ def handle_deprecated_args(server_args: Any):
             grpc_port=cfg.port + 10000,
         )
 
+    if cfg.grpc_response_timeout_secs <= 0:
+        raise ValueError("--grpc-response-timeout-secs must be positive")
+
     if cfg.grpc_port is not None:
         if not (1 <= cfg.grpc_port <= 65535):
             raise ValueError(
@@ -480,15 +482,6 @@ def handle_other_validations(server_args: Any):
             logger.warning(
                 "Optimistic prefill supports L2 write-back or L3 buffer-only "
                 "write-through hierarchical cache"
-            )
-            declare_resolution(
-                server_args,
-                "_handle_other_validations",
-                optimistic_prefill_attempts=0,
-            )
-        elif resolved_view(server_args).uses_mamba_radix_cache:
-            logger.warning(
-                "Optimistic prefill does not support models that use mamba radix cache."
             )
             declare_resolution(
                 server_args,
@@ -752,27 +745,14 @@ def handle_multimodal_feature_transport(server_args: Any):
 
     CUDA IPC is opt-in because its fixed pool on ``base_gpu_id`` reduces the
     memory left for model/KV-cache allocations. Multi-node MNNVL deployments
-    may still auto-select CUDA VMM. The legacy CUDA IPC flag and environment
-    variable remain supported so existing deployments map to this policy.
+    may still auto-select CUDA VMM. The legacy CUDA IPC environment variable
+    remains supported so existing deployments map to this policy.
     """
 
     cfg = resolving_view(server_args)
     requested_transport = cfg.mm_feature_transport
     legacy_ipc_is_set = envs.SGLANG_USE_CUDA_IPC_TRANSPORT.is_set()
     legacy_ipc_enabled = envs.SGLANG_USE_CUDA_IPC_TRANSPORT.get()
-
-    if cfg.keep_mm_feature_on_device:
-        if requested_transport not in (None, "cuda_ipc"):
-            raise ValueError(
-                "--keep-mm-feature-on-device conflicts with "
-                f"--mm-feature-transport={requested_transport}. Use only "
-                "--mm-feature-transport=cuda_ipc."
-            )
-        requested_transport = "cuda_ipc"
-        logger.warning(
-            "--keep-mm-feature-on-device is deprecated; using "
-            "--mm-feature-transport=cuda_ipc instead."
-        )
 
     if requested_transport is None:
         if legacy_ipc_is_set:
@@ -899,13 +879,6 @@ def handle_multimodal_feature_transport(server_args: Any):
         server_args,
         "_handle_multimodal_feature_transport",
         mm_feature_transport=requested_transport,
-    )
-    # The bounded IPC pool owns device residency. Do not retain unpooled
-    # tensors after a pool miss, which would make HBM use request-dependent.
-    declare_resolution(
-        server_args,
-        "_handle_multimodal_feature_transport",
-        keep_mm_feature_on_device=False,
     )
     envs.SGLANG_USE_CUDA_IPC_TRANSPORT.set(
         "1" if requested_transport == "cuda_ipc" else "0"

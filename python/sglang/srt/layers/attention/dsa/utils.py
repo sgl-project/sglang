@@ -43,7 +43,6 @@ def aiter_can_use_preshuffle_paged_mqa() -> bool:
 
     Set ``SGLANG_DSA_HIP_DISABLE_PRESHUFFLE=1`` to force the legacy path even when
     the gluon kernel would otherwise be available (useful for CI bisection).
-    ``SGLANG_NSA_HIP_DISABLE_PRESHUFFLE`` is a deprecated alias.
     """
     if not is_hip():
         return False

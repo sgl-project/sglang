@@ -1677,6 +1677,11 @@ class Req(ReqDllmMixin):
     def _compute_max_prefix_len(self, input_len: int) -> int:
         # NOTE: the matched length is at most 1 less than the input length to enable logprob computation
         max_prefix_len = input_len - 1
+        if (
+            self.dllm_config is not None
+            and self.dllm_config.requires_separate_context_encoding
+        ):
+            max_prefix_len = min(max_prefix_len, self.dllm_block_offset)
         if self.return_logprob and self.logprob_start_len >= 0:
             max_prefix_len = min(max_prefix_len, self.logprob_start_len)
         return max(max_prefix_len, 0)
@@ -2348,8 +2353,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # A full prefill has one result but can span several run_batch calls.
     split_prefill_start: Optional[Tuple[int, float]] = None
 
-    # CPU mirror of req_pool_indices; schedule-path only (used in overlap_utils,
-    # not read by ForwardBatch), stale in spec draft window
     req_pool_indices_cpu: torch.Tensor = None  # shape: [b], int64
 
     # Forward-pass metrics
@@ -2411,6 +2414,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     mamba_track_buffer_indices: Optional[List[int]] = None  # shape: [b], 0 or 1
     mamba_track_mask: torch.Tensor = None  # shape: [b], bool
     mamba_track_seqlens: torch.Tensor = None  # shape: [b], int64
+    # TBO rejects Mamba tracking; enabling it must also slice these CPU lists.
+    mamba_track_seqlens_cpu: Optional[List[int]] = None
+    mamba_prefill_track_mask_cpu: Optional[List[bool]] = None
     mamba_track_mask_cpu: Optional[List[bool]] = None  # shape: [b]
     mamba_track_mask_next_cpu: Optional[List[bool]] = None  # shape: [b]
     mamba_decode_batch_idx_cpu: Optional[List[int]] = None  # shape: [b]
@@ -2934,6 +2940,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.extend_input_logprob_token_ids = extend_input_logprob_token_ids
 
         if get_exec().mamba.enable_mamba_extra_buffer:
+            self.mamba_prefill_track_mask_cpu = mamba_track_mask_cpu
+            self.mamba_track_seqlens_cpu = mamba_track_seqlens_cpu
             self.mamba_track_indices = torch.tensor(
                 mamba_track_indices_cpu,
                 dtype=torch.int64,
@@ -3500,6 +3508,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     def prepare_for_decode(self):
         self.forward_mode = ForwardMode.DECODE
+        self.mamba_track_seqlens_cpu = None
+        self.mamba_prefill_track_mask_cpu = None
         # Decode embeds the last output token via embed_tokens; clear the stale
         # prefill-time tensor so it doesn't leak into ForwardBatch.
         self.input_embeds = None
@@ -3653,6 +3663,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.mamba_track_buffer_indices = None
         self.mamba_track_mask = None
         self.mamba_track_seqlens = None
+        self.mamba_track_seqlens_cpu = None
+        self.mamba_prefill_track_mask_cpu = None
         self.mamba_track_mask_cpu = None
         self.mamba_track_mask_next_cpu = None
         self.mamba_decode_batch_idx_cpu = None
@@ -3719,6 +3731,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.mamba_track_buffer_indices = None
         self.mamba_track_mask = None
         self.mamba_track_seqlens = None
+        self.mamba_track_seqlens_cpu = None
+        self.mamba_prefill_track_mask_cpu = None
         self.mamba_track_mask_cpu = None
         self.mamba_track_mask_next_cpu = None
         self.mamba_decode_batch_idx_cpu = None
@@ -3759,6 +3773,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             prefix_lens=self.prefix_lens,
             req_to_token_pool=self.req_to_token_pool,
             req_pool_indices=self.req_pool_indices,
+            req_pool_indices_cpu=self.req_pool_indices_cpu,
             model_config=self.model_config,
             forward_mode=self.forward_mode,
             out_cache_loc=self.out_cache_loc,
@@ -3782,6 +3797,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             mamba_track_buffer_indices=self.mamba_track_buffer_indices,
             mamba_track_mask=self.mamba_track_mask,
             mamba_track_seqlens=self.mamba_track_seqlens,
+            mamba_track_seqlens_cpu=self.mamba_track_seqlens_cpu,
+            mamba_prefill_track_mask_cpu=self.mamba_prefill_track_mask_cpu,
             mamba_track_mask_cpu=self.mamba_track_mask_cpu,
             mamba_track_mask_next_cpu=self.mamba_track_mask_next_cpu,
             mamba_decode_batch_idx_cpu=self.mamba_decode_batch_idx_cpu,
