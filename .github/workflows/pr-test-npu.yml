@@ -125,6 +125,9 @@ jobs:
     timeout-minutes: 45
     env:
       SGLANG_IS_IN_CI: true
+      # TEMP(debug): pr-gate fails on the cooldown and check-pr-test-health's
+      # run-wide fail-fast would cascade that failure onto this job.
+      SKIP_PR_TEST_HEALTH_CHECK: "true"
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
