@@ -131,6 +131,7 @@ class TestPageShardScratchSizing(CustomTestCase):
         )
         kvc = SimpleNamespace(
             is_draft_worker=draft,
+            token_to_kv_pool_allocator=None,
             use_mla_backend=use_mla,
             page_size=16,
             kv_cache_dtype=torch.bfloat16,
