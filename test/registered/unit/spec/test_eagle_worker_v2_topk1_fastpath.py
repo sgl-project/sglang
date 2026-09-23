@@ -16,6 +16,7 @@ import torch
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.runtime_context import get_context
 from sglang.srt.speculative.adaptive_runtime_state import SpecRuntimeState
+from sglang.srt.speculative.eagle_info import EagleVerifyInput
 from sglang.srt.speculative.eagle_utils import organize_draft_results
 from sglang.srt.speculative.eagle_worker_v2 import EagleDraftWorker, EAGLEWorkerV2
 from sglang.test.ci.ci_register import register_amd_ci, register_cpu_ci
@@ -134,6 +135,19 @@ class TestEagleWorkerV2Topk1FastPath(CustomTestCase):
         worker = _make_worker(num_steps=3, num_draft_tokens=3)
         with self.assertRaises(AssertionError):
             worker._rebuild_topk1_chain_buffers()
+
+    def test_idle_verify_input_keeps_required_layout_tensors(self):
+        verify_input = EagleVerifyInput.create_idle_input(
+            topk=1,
+            spec_steps=3,
+            num_verify_tokens=4,
+            device=DEVICE,
+        )
+
+        self.assertEqual(verify_input.custom_mask.dtype, torch.bool)
+        self.assertEqual(verify_input.custom_mask.shape, (0,))
+        self.assertEqual(verify_input.positions.dtype, torch.int64)
+        self.assertEqual(verify_input.positions.shape, (0,))
 
     def test_idle_draft_runs_each_eager_forward_without_tree_layout(self):
         worker = object.__new__(EagleDraftWorker)
@@ -390,6 +404,15 @@ class TestEagleWorkerV2BackendFallback(CustomTestCase):
             worker.spec_v2_attn_backends,
             (target_backend, decode_backend, fallback_backend),
         )
+
+    def test_non_last_pp_uses_only_target_runner(self):
+        target_runner = SimpleNamespace(attn_backend=object())
+        worker = object.__new__(EAGLEWorkerV2)
+        worker._target_worker = SimpleNamespace(model_runner=target_runner)
+        worker._draft_worker = None
+
+        self.assertIs(worker.last_shared_read_runner, target_runner)
+        self.assertEqual(worker.spec_v2_attn_backends, (target_runner.attn_backend,))
 
 
 if __name__ == "__main__":

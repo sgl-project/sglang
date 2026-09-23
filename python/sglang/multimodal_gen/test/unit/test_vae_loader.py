@@ -647,59 +647,26 @@ class TestVAELoader(unittest.TestCase):
         self.assertNotIn("latents_mean", loaded)
         self.assertNotIn("latents_std", loaded)
 
-    def test_channels_last_3d_defaults_true_for_qwen_image_on_cuda(self):
+    def test_channels_last_3d_cuda_model_defaults(self):
+        cases = [
+            (QwenImagePipelineConfig, 1, "vae", True),
+            (WanT2V480PConfig, 1, "video_vae", True),
+            (FastWan2_2_TI2V_5B_Config, 1, "video_vae", True),
+            (Wan2_2_I2V_A14B_Config, 2, "video_vae", False),
+            (LTX2PipelineConfig, 1, "video_vae", True),
+            (LTX2PipelineConfig, 2, "video_vae", False),
+        ]
         with (
             patch.dict("os.environ", {}, clear=True),
             patch.object(vae_loader.current_platform, "is_cuda", return_value=True),
             patch.object(vae_loader.current_platform, "is_rocm", return_value=False),
         ):
-            server_args = _FakeServerArgs(QwenImagePipelineConfig())
-            self.assertTrue(_should_use_channels_last_3d(server_args, "vae"))
-
-    def test_channels_last_3d_defaults_true_for_single_gpu_wan_on_cuda(self):
-        with (
-            patch.dict("os.environ", {}, clear=True),
-            patch.object(vae_loader.current_platform, "is_cuda", return_value=True),
-            patch.object(vae_loader.current_platform, "is_rocm", return_value=False),
-        ):
-            server_args = _FakeServerArgs(WanT2V480PConfig(), num_gpus=1)
-            self.assertTrue(_should_use_channels_last_3d(server_args, "video_vae"))
-
-    def test_channels_last_3d_defaults_true_for_single_gpu_fast_wan_on_cuda(self):
-        with (
-            patch.dict("os.environ", {}, clear=True),
-            patch.object(vae_loader.current_platform, "is_cuda", return_value=True),
-            patch.object(vae_loader.current_platform, "is_rocm", return_value=False),
-        ):
-            server_args = _FakeServerArgs(FastWan2_2_TI2V_5B_Config(), num_gpus=1)
-            self.assertTrue(_should_use_channels_last_3d(server_args, "video_vae"))
-
-    def test_channels_last_3d_defaults_false_for_multi_gpu_wan_on_cuda(self):
-        with (
-            patch.dict("os.environ", {}, clear=True),
-            patch.object(vae_loader.current_platform, "is_cuda", return_value=True),
-            patch.object(vae_loader.current_platform, "is_rocm", return_value=False),
-        ):
-            server_args = _FakeServerArgs(Wan2_2_I2V_A14B_Config(), num_gpus=2)
-            self.assertFalse(_should_use_channels_last_3d(server_args, "video_vae"))
-
-    def test_channels_last_3d_defaults_true_for_single_gpu_ltx_on_cuda(self):
-        with (
-            patch.dict("os.environ", {}, clear=True),
-            patch.object(vae_loader.current_platform, "is_cuda", return_value=True),
-            patch.object(vae_loader.current_platform, "is_rocm", return_value=False),
-        ):
-            server_args = _FakeServerArgs(LTX2PipelineConfig(), num_gpus=1)
-            self.assertTrue(_should_use_channels_last_3d(server_args, "video_vae"))
-
-    def test_channels_last_3d_defaults_false_for_multi_gpu_ltx_on_cuda(self):
-        with (
-            patch.dict("os.environ", {}, clear=True),
-            patch.object(vae_loader.current_platform, "is_cuda", return_value=True),
-            patch.object(vae_loader.current_platform, "is_rocm", return_value=False),
-        ):
-            server_args = _FakeServerArgs(LTX2PipelineConfig(), num_gpus=2)
-            self.assertFalse(_should_use_channels_last_3d(server_args, "video_vae"))
+            for config_cls, num_gpus, component, expected in cases:
+                with self.subTest(config=config_cls.__name__, num_gpus=num_gpus):
+                    server_args = _FakeServerArgs(config_cls(), num_gpus=num_gpus)
+                    self.assertEqual(
+                        _should_use_channels_last_3d(server_args, component), expected
+                    )
 
     def test_channels_last_3d_can_be_disabled_by_env(self):
         with (

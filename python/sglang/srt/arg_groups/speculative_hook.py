@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 from typing import TYPE_CHECKING, Optional
 
 from sglang.srt.arg_groups.choices import DRAFT_ATTENTION_BACKEND_CHOICES
@@ -16,6 +15,8 @@ from sglang.srt.arg_groups.overrides import (
     resolving_view,
     run_post_process_pass,
 )
+from sglang.srt.environ import envs
+from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_platform
 
 if TYPE_CHECKING:
@@ -34,6 +35,7 @@ def _should_auto_enable_hip_rejection_sampling(
     accept_threshold_single: float,
     accept_threshold_acc: float,
     enable_deterministic_inference: bool,
+    simulate_acc_len: float = -1.0,
 ) -> bool:
     """Whether HIP may default ``speculative_use_rejection_sampling`` on.
 
@@ -42,6 +44,10 @@ def _should_auto_enable_hip_rejection_sampling(
     would crash configs that previously ran greedy on HIP, including EAGLE3
     stage-a ``test_basic_sanity_eagle3`` (draft 32000 vs target 128256). Skip
     EAGLE3 and any EAGLE run that already has a token map.
+
+    Also skip when ``SGLANG_SIMULATE_ACC_LEN`` is on: AgentX throughput still
+    runs the real EAGLE verify then overwrites accept length, so the Triton
+    chain sampler is paid for and thrown away.
     """
     return (
         is_hip
@@ -52,6 +58,7 @@ def _should_auto_enable_hip_rejection_sampling(
         and accept_threshold_single == 1.0
         and accept_threshold_acc == 1.0
         and not enable_deterministic_inference
+        and simulate_acc_len <= 0
     )
 
 
@@ -134,15 +141,6 @@ def handle_speculative_decoding(server_args: ServerArgs) -> None:
             speculative_algorithm=cfg.speculative_algorithm.upper(),
         )
 
-    # Removal notice for the retired env var; raw os.getenv on purpose -- the
-    # Envs descriptor is gone. Drop this check after one release.
-    if os.getenv("SGLANG_ENABLE_SPEC_V2") is not None:
-        logger.warning(
-            "SGLANG_ENABLE_SPEC_V2 has been removed: speculative decoding "
-            "always runs the V2 worker. Use --disable-overlap-schedule to "
-            "select the non-overlap (synchronous) path."
-        )
-
     kwargs = {}
 
     override_config_file = cfg.decrypted_draft_config_file
@@ -160,8 +158,11 @@ def handle_speculative_decoding(server_args: ServerArgs) -> None:
         ),
     )
 
-    # Validate --speculative-draft-window-size once, regardless of algorithm.
-    # Consumed by DFLASH (compact draft KV cache) and Llama EAGLE-3 (drafter attention SWA).
+    # Validate --speculative-draft-window-size / --speculative-draft-sink-size once,
+    # regardless of algorithm. Consumed by DFLASH (compact draft KV cache), Llama
+    # EAGLE-3 (drafter attention SWA), and the built-in MTP/NEXTN + EAGLE draft-decode
+    # path on the Triton and FlashInfer draft attention backends (StreamingLLM sink +
+    # recent window).
     if cfg.speculative_draft_window_size is not None:
         window_size = int(cfg.speculative_draft_window_size)
         if window_size <= 0:
@@ -173,12 +174,29 @@ def handle_speculative_decoding(server_args: ServerArgs) -> None:
             "handle_speculative_decoding",
             speculative_draft_window_size=window_size,
         )
-        if cfg.speculative_algorithm not in ("EAGLE3", "DFLASH"):
+        if cfg.speculative_algorithm not in ("EAGLE", "EAGLE3", "DFLASH"):
             logger.warning(
                 "--speculative-draft-window-size has no effect with "
-                "speculative_algorithm=%s (honored by Llama EAGLE-3 and DFLASH only).",
+                "speculative_algorithm=%s (honored by DFLASH, Llama EAGLE-3, and the "
+                "EAGLE/MTP/NEXTN draft-decode path on the Triton/FlashInfer draft backends).",
                 cfg.speculative_algorithm,
             )
+
+    if cfg.speculative_draft_sink_size is not None:
+        sink_size = int(cfg.speculative_draft_sink_size)
+        if sink_size < 0:
+            raise ValueError(
+                f"--speculative-draft-sink-size must be non-negative, got {sink_size}."
+            )
+        if cfg.speculative_draft_window_size is None:
+            raise ValueError(
+                "--speculative-draft-sink-size requires --speculative-draft-window-size."
+            )
+        declare_resolution(
+            server_args,
+            "handle_speculative_decoding",
+            speculative_draft_sink_size=sink_size,
+        )
 
     algo = None
     if cfg.speculative_algorithm is not None:
@@ -230,11 +248,17 @@ def handle_speculative_decoding(server_args: ServerArgs) -> None:
 def _handle_dflash(server_args: ServerArgs) -> None:
     cfg = resolving_view(server_args)
 
-    if not (
-        cfg.device.startswith("cuda") or cfg.device == "npu" or cfg.device == "xpu"
-    ):
+    algorithm = "DFLASH"
+    if current_platform.is_out_of_tree():
+        is_supported = current_platform.supports_speculative_algorithm(algorithm)
+    else:
+        is_supported = (
+            cfg.device.startswith("cuda") or cfg.device == "npu" or cfg.device == "xpu"
+        )
+    if not is_supported:
         raise ValueError(
-            "DFLASH speculative decoding only supports CUDA, NPU and XPU devices."
+            f"{algorithm} speculative decoding is not supported by "
+            f"{type(current_platform).__name__} on device {cfg.device!r}."
         )
 
     # DFLASH + dp attention is validated on NPU only.
@@ -594,9 +618,11 @@ def _handle_dspark(server_args: ServerArgs) -> None:
             )
 
     if cfg.pp_size != 1:
-        raise ValueError(
-            "Currently DSpark speculative decoding only supports pp_size == 1."
-        )
+        if cfg.disaggregation_mode != "prefill":
+            raise ValueError(
+                "DSpark pipeline parallelism requires PD prefill; "
+                "decode and non-disaggregated serving require pp_size == 1."
+            )
 
     if cfg.speculative_draft_model_path is None:
         if _target_checkpoint_bundles_dspark_draft(server_args):
@@ -759,15 +785,55 @@ def _resolve_dflash_draft_attention_backend(server_args: ServerArgs) -> None:
     cfg = resolving_view(server_args)
 
     supported_draft_backends = DRAFT_ATTENTION_BACKEND_CHOICES
-    # FlashInfer is CUDA-only; fall back to triton on XPU and ROCm.
-    fallback_backend = (
-        "triton" if (get_platform().is_xpu or get_platform().is_hip) else "flashinfer"
-    )
+
+    def is_supported_backend(backend: str) -> bool:
+        if current_platform.is_out_of_tree():
+            return current_platform.supports_speculative_draft_attention_backend(
+                "DFLASH", backend
+            )
+        return backend in supported_draft_backends
+
+    def get_fallback_backend() -> str:
+        if current_platform.is_out_of_tree():
+            try:
+                fallback_backend = (
+                    current_platform.get_default_speculative_draft_attention_backend(
+                        "DFLASH"
+                    )
+                )
+            except NotImplementedError as error:
+                raise ValueError(
+                    f"{type(current_platform).__name__} must implement "
+                    "get_default_speculative_draft_attention_backend() to use DFLASH."
+                ) from error
+            if not is_supported_backend(fallback_backend):
+                raise ValueError(
+                    f"{type(current_platform).__name__} returned unsupported DFLASH "
+                    f"draft attention backend {fallback_backend!r} from "
+                    "get_default_speculative_draft_attention_backend()."
+                )
+            return fallback_backend
+        # FlashInfer is CUDA-only; fall back to triton on XPU and ROCm.
+        return (
+            "triton"
+            if (get_platform().is_xpu or get_platform().is_hip)
+            else "flashinfer"
+        )
 
     draft_backend = cfg.speculative_draft_attention_backend
     if draft_backend is None:
         draft_backend, _ = attention_backends_of(resolved_view(server_args))
     if draft_backend is None:
+        draft_backend = get_fallback_backend()
+    elif not is_supported_backend(draft_backend):
+        fallback_backend = get_fallback_backend()
+        logger.warning(
+            "DFLASH draft worker does not support attention_backend %r on %s. "
+            "Falling back to '%s'.",
+            draft_backend,
+            type(current_platform).__name__,
+            fallback_backend,
+        )
         draft_backend = fallback_backend
     elif draft_backend == "trtllm_mha":
         from sglang.srt.speculative.dflash_utils import get_dflash_layer_types
@@ -791,6 +857,7 @@ def _resolve_dflash_draft_attention_backend(server_args: ServerArgs) -> None:
         )
         all_causal = getattr(draft_text_config, "is_causal", False) is True
         if not (all_sliding or all_causal):
+            fallback_backend = get_fallback_backend()
             logger.warning(
                 "DFLASH only enables 'trtllm_mha' when all layers use sliding "
                 "attention or the draft is explicitly causal; got "
@@ -801,15 +868,6 @@ def _resolve_dflash_draft_attention_backend(server_args: ServerArgs) -> None:
                 fallback_backend,
             )
             draft_backend = fallback_backend
-    elif draft_backend not in supported_draft_backends:
-        logger.warning(
-            "DFLASH draft worker only supports attention_backend in %s for now, "
-            "but got %r. Falling back to '%s'.",
-            supported_draft_backends,
-            draft_backend,
-            fallback_backend,
-        )
-        draft_backend = fallback_backend
     # FIXME: avoid overriding server args directly; pass the resolved draft
     # backend to the draft worker explicitly instead.
     declare_resolution(
@@ -964,6 +1022,7 @@ def _handle_eagle_family(server_args: ServerArgs) -> None:
         accept_threshold_single=cfg.speculative_accept_threshold_single,
         accept_threshold_acc=cfg.speculative_accept_threshold_acc,
         enable_deterministic_inference=cfg.enable_deterministic_inference,
+        simulate_acc_len=float(envs.SGLANG_SIMULATE_ACC_LEN.get()),
     ):
         declare_resolution(
             server_args,
@@ -1055,9 +1114,9 @@ def _handle_eagle_family(server_args: ServerArgs) -> None:
 
 def _handle_ngram(server_args: ServerArgs) -> None:
     cfg = resolving_view(server_args)
-    if cfg.device not in ("cuda", "cpu"):
+    if cfg.device not in ("cuda", "cpu", "xpu"):
         raise ValueError(
-            "Ngram speculative decoding only supports CUDA or CPU devices."
+            "Ngram speculative decoding only supports CUDA, CPU, or XPU devices."
         )
 
     _disable_overlap_schedule_for_cpu(server_args)

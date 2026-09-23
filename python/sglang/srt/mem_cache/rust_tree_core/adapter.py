@@ -55,6 +55,7 @@ from sglang.srt.mem_cache.unified_cache.unified_tree_core_interface import (
     UnifiedTreeCoreInterface,
 )
 from sglang.srt.runtime_context import get_exec, mamba_cache_chunk_size
+from sglang.srt.utils import assert_int64_array
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -72,9 +73,7 @@ def _radix_key_buffer(key: RadixKey) -> array:
     """The key's token ids honoring `limit`; view-independent since the
     binding derives its own atoms."""
     token_ids = key.raw_token_ids()
-    assert isinstance(token_ids, array) and token_ids.typecode == "q", (
-        f"tree keys must carry array('q') token ids, got {type(token_ids).__name__}"
-    )
+    assert_int64_array(token_ids, "tree key token ids")
     return token_ids
 
 
