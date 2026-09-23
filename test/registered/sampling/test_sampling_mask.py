@@ -585,13 +585,14 @@ class TestSamplingMaskPacking(CustomTestCase):
         self.sampler.tp_sync_group = None
         self.sampler.cp_sync_group = None
 
-    def test_sampled_token_must_have_positive_captured_weight(self):
+    def test_selected_token_must_have_positive_captured_weight(self):
         for token_ids in (None, torch.tensor([[2, 1, 0]], dtype=torch.int32)):
             with self.subTest(sorted_capture=token_ids is not None):
                 capture = _SamplingMaskCapture(
                     batch_rows=torch.tensor([0]),
                     weights=torch.tensor([[0.7, 0.3, 0.0]]),
                     token_ids=token_ids,
+                    selected_weight=None,
                 )
                 selected = torch.tensor([2 if token_ids is None else 0])
                 output = self.sampler._build_sampling_mask_output(
@@ -604,6 +605,7 @@ class TestSamplingMaskPacking(CustomTestCase):
             batch_rows=torch.tensor([0]),
             weights=torch.tensor([[0.6, 0.4, 0.0]]),
             token_ids=None,
+            selected_weight=torch.tensor([0.6]),
         )
         output = self.sampler._build_sampling_mask_output(
             torch.tensor([0]), capture, support_capture_indices=None
@@ -617,11 +619,13 @@ class TestSamplingMaskPacking(CustomTestCase):
                 batch_rows=torch.tensor([0]),
                 weights=torch.tensor([[0.1, 0.6, 0.0, 0.3]]),
                 token_ids=None,
+                selected_weight=torch.tensor([0.3]),
             ),
             _SamplingMaskCapture(
                 batch_rows=torch.tensor([0]),
                 weights=torch.tensor([[0.6, 0.3, 0.1, 0.0]]),
                 token_ids=torch.tensor([[1, 3, 0, 2]], dtype=torch.int32),
+                selected_weight=torch.tensor([0.3]),
             ),
         )
         for capture in captures:
@@ -649,6 +653,7 @@ class TestSamplingMaskPacking(CustomTestCase):
                 ]
             ),
             token_ids=None,
+            selected_weight=torch.tensor([0.7, 0.6]),
         )
         output = self.sampler._build_sampling_mask_output(
             torch.tensor([0, 1]),
@@ -662,11 +667,12 @@ class TestSamplingMaskPacking(CustomTestCase):
             torch.tensor([0.6, 0.3, 0.1]),
         )
 
-    def test_synced_token_is_validated_against_capture(self):
+    def test_synced_token_logprob_is_recomputed_from_capture(self):
         capture = _SamplingMaskCapture(
             batch_rows=torch.tensor([0]),
             weights=torch.tensor([[0.6, 0.2, 0.0]]),
             token_ids=torch.tensor([[2, 1, 0]], dtype=torch.int32),
+            selected_weight=None,
         )
         output = self.sampler._build_sampling_mask_output(
             torch.tensor([1]),
@@ -674,6 +680,7 @@ class TestSamplingMaskPacking(CustomTestCase):
             support_capture_indices=torch.tensor([0]),
         )
         self.assertEqual(output.statuses.tolist(), [SamplingMaskStatus.OK])
+        self.assertAlmostEqual(output.selected_logprobs.item(), math.log(0.25))
         support = output.token_ids[0, :2].tolist()
         self.assertAlmostEqual(
             output.support_logprobs[0, support.index(1)].item(), math.log(0.25)
@@ -717,6 +724,7 @@ class TestSamplingMaskPacking(CustomTestCase):
             batch_rows=torch.tensor([0]),
             weights=torch.tensor([[0.2, 0.2, 0.2, 0.2, 0.2]]),
             token_ids=None,
+            selected_weight=torch.tensor([0.2]),
         )
 
         sampling_output = self.sampler._build_sampling_mask_output(

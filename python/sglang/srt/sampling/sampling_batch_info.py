@@ -188,8 +188,7 @@ class SamplingBatchInfo:
         )  # then check the requests.
         return_sampling_masks = [r.return_sampling_mask for r in reqs]
         return_sampling_support_logprobs = [
-            r.return_sampling_mask
-            and getattr(r, "sampling_logprobs_mode", "selected") == "support"
+            r.return_sampling_mask and r.sampling_logprobs_mode == "support"
             for r in reqs
         ]
         sampling_mask_batch_indices = cls._make_sampling_mask_batch_indices(
