@@ -423,6 +423,22 @@ class TestReasoningTokenAccounting(CustomTestCase):
         self.assertFalse(replayed)
         self.assertEqual(req.pd_rebootstrap_forced_output_id, 12)
 
+    def test_normal_prefill_batch_needs_no_cache_only_marker(self):
+        req = _make_req(terminate_after=99)
+        req.pd_rebootstrap_in_progress = True
+        req.pd_rebootstrap_forced_output_id = 12
+
+        token, replayed = (
+            SchedulerBatchResultProcessor._resolve_cache_only_rebootstrap_token(
+                SimpleNamespace(), req, 999
+            )
+        )
+
+        self.assertEqual(token, 999)
+        self.assertFalse(replayed)
+        self.assertEqual(req.pd_rebootstrap_forced_output_id, 12)
+        self.assertTrue(req.pd_rebootstrap_in_progress)
+
     def test_middle_chunk_does_not_consume_rebootstrap_boundary(self):
         req = _make_req(terminate_after=99)
         req.pd_rebootstrap_in_progress = True
