@@ -5,8 +5,9 @@ token, so the over-drafted suffix is never committed to KV nor emitted.
 """
 
 import unittest
+from dataclasses import replace
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import torch
 
@@ -92,6 +93,15 @@ def _make_processor() -> SchedulerBatchResultProcessor:
     )
 
 
+def _make_prefill_processor() -> SchedulerBatchResultProcessor:
+    return replace(
+        _make_processor(),
+        token_to_kv_pool_allocator=MagicMock(),
+        tree_cache=MagicMock(),
+        output_streamer=MagicMock(),
+    )
+
+
 def _make_req(terminate_after: int) -> Req:
     sp = SamplingParams(max_new_tokens=256, temperature=0)
     sp.normalize(None)
@@ -122,6 +132,7 @@ def _commit_disagg_handoff(
     replayed_boundary: bool = False,
     cache_only: bool = False,
     coverage: int = 0,
+    expected_coverage: int | None = None,
 ) -> DecodeRequest:
     queue = DecodeTransferQueue.__new__(DecodeTransferQueue)
     queue.scheduler = SimpleNamespace(
@@ -151,6 +162,12 @@ def _commit_disagg_handoff(
     )
     req.bootstrap_host = "127.0.0.1"
     req.bootstrap_room = 1
+    if cache_only:
+        req.kv.kv_committed_len = (
+            len(req.origin_input_ids)
+            if expected_coverage is None
+            else expected_coverage
+        )
     if replayed_boundary:
         req.pd_rebootstrap_forced_output_id = token_id
     decode_req = DecodeRequest(
@@ -295,6 +312,156 @@ class TestReasoningTokenAccounting(CustomTestCase):
         self.assertTrue(req.dsv41_cache_only_replay)
         self.assertEqual(req.dsv41_cache_only_coverage, prompt_len)
         self.assertEqual(list(req.output_ids), [])
+
+    def test_cache_only_rebootstrap_accepts_full_generated_prefix_coverage(self):
+        req = _make_req(terminate_after=99)
+        processor = _make_processor()
+        req.output_ids.extend([10, 11])
+        expected_coverage = len(req.origin_input_ids) + len(req.output_ids)
+
+        decode_req = _commit_disagg_handoff(
+            req,
+            processor,
+            0,
+            cache_only=True,
+            coverage=expected_coverage,
+            expected_coverage=expected_coverage,
+        )
+
+        self.assertIsNone(decode_req.kv_receiver)
+        self.assertEqual(req.dsv41_cache_only_coverage, expected_coverage)
+
+    def test_cache_only_rebootstrap_restores_boundary_without_reaccounting(self):
+        req = _make_req(terminate_after=99)
+        req.output_ids.extend([10, 11])
+        req.pd_rebootstrap_in_progress = True
+        req.pd_rebootstrap_forced_output_id = 12
+        req.dsv41_cache_only_replay = True
+        req.dsv41_cache_only_coverage = len(req.origin_input_ids) + len(req.output_ids)
+        req.inflight_middle_chunks = 0
+        req.is_retracted = False
+        req.beam_group = None
+        req.time_stats = MagicMock()
+        req.update_finish_state = MagicMock()
+
+        batch = SimpleNamespace(
+            reqs=[req],
+            dsv41_cache_only_replay=True,
+            return_logprob=False,
+            return_hidden_states=False,
+            return_hidden_states_mode=0,
+            spec_info=None,
+            decoding_reqs=[],
+            spec_algorithm=SimpleNamespace(is_none=lambda: True),
+            prefill_stats=None,
+            dp_cooperation_info=None,
+            forward_iter=1,
+        )
+        result = GenerationBatchResult(
+            logits_output=SimpleNamespace(
+                hidden_states=None,
+                customized_info=None,
+                sampling_mask_output=None,
+            ),
+            next_token_ids=torch.tensor([999], dtype=torch.long),
+        )
+        processor = _make_prefill_processor()
+
+        with (
+            patch(
+                "sglang.srt.managers.scheduler_components.batch_result_processor.maybe_cache_unfinished_req"
+            ),
+            patch(
+                "sglang.srt.managers.scheduler_components.batch_result_processor.get_memory",
+                return_value=SimpleNamespace(enable_hisparse=False),
+            ),
+            patch.object(
+                SchedulerBatchResultProcessor, "_maybe_update_reasoning_tokens"
+            ) as reasoning,
+            patch.object(
+                SchedulerBatchResultProcessor, "_apply_prefill_grammar"
+            ) as grammar,
+        ):
+            processor.process_batch_result_prefill(batch, result)
+
+        self.assertEqual(list(req.output_ids), [10, 11, 12])
+        self.assertIsNone(req.pd_rebootstrap_forced_output_id)
+        self.assertFalse(req.pd_rebootstrap_in_progress)
+        req.update_finish_state.assert_called_once_with()
+        reasoning.assert_not_called()
+        grammar.assert_not_called()
+
+    def test_cache_only_rebootstrap_without_boundary_keeps_sampled_token(self):
+        req = _make_req(terminate_after=99)
+        req.pd_rebootstrap_in_progress = True
+        req.pd_rebootstrap_forced_output_id = None
+        batch = SimpleNamespace(dsv41_cache_only_replay=True)
+
+        token, replayed = (
+            SchedulerBatchResultProcessor._resolve_cache_only_rebootstrap_token(
+                batch, req, 999
+            )
+        )
+
+        self.assertEqual(token, 999)
+        self.assertFalse(replayed)
+        self.assertFalse(req.pd_rebootstrap_in_progress)
+
+    def test_fresh_cache_only_replay_keeps_sampled_token(self):
+        req = _make_req(terminate_after=99)
+        req.pd_rebootstrap_in_progress = False
+        req.pd_rebootstrap_forced_output_id = 12
+        batch = SimpleNamespace(dsv41_cache_only_replay=True)
+
+        token, replayed = (
+            SchedulerBatchResultProcessor._resolve_cache_only_rebootstrap_token(
+                batch, req, 999
+            )
+        )
+
+        self.assertEqual(token, 999)
+        self.assertFalse(replayed)
+        self.assertEqual(req.pd_rebootstrap_forced_output_id, 12)
+
+    def test_middle_chunk_does_not_consume_rebootstrap_boundary(self):
+        req = _make_req(terminate_after=99)
+        req.pd_rebootstrap_in_progress = True
+        req.pd_rebootstrap_forced_output_id = 12
+        req.dsv41_cache_only_replay = True
+        req.inflight_middle_chunks = 1
+        req.is_retracted = False
+        req.time_stats = MagicMock()
+        batch = SimpleNamespace(
+            reqs=[req],
+            dsv41_cache_only_replay=True,
+            return_logprob=False,
+            return_hidden_states=False,
+            return_hidden_states_mode=0,
+            spec_info=None,
+            decoding_reqs=[],
+            spec_algorithm=SimpleNamespace(is_none=lambda: True),
+            prefill_stats=None,
+            dp_cooperation_info=None,
+        )
+        result = GenerationBatchResult(
+            logits_output=SimpleNamespace(
+                hidden_states=None,
+                customized_info=None,
+                sampling_mask_output=None,
+            ),
+            next_token_ids=torch.tensor([999], dtype=torch.long),
+        )
+        processor = _make_prefill_processor()
+
+        with patch(
+            "sglang.srt.managers.scheduler_components.batch_result_processor.get_memory",
+            return_value=SimpleNamespace(enable_hisparse=False),
+        ):
+            processor.process_batch_result_prefill(batch, result)
+
+        self.assertEqual(list(req.output_ids), [])
+        self.assertEqual(req.pd_rebootstrap_forced_output_id, 12)
+        self.assertTrue(req.pd_rebootstrap_in_progress)
 
 
 if __name__ == "__main__":

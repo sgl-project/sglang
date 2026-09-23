@@ -2334,13 +2334,17 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         decode_req.req.mm_video_tokens = cached_tokens[6].item()
         if cache_only:
             coverage = int(cached_tokens[CACHE_ONLY_COVERAGE_SLOT].item())
-            prompt_len = len(decode_req.req.origin_input_ids)
-            if coverage < 0 or coverage > prompt_len or coverage != prompt_len:
+            expected_coverage = decode_req.req.kv.kv_committed_len
+            if (
+                expected_coverage is None
+                or coverage < 0
+                or coverage != expected_coverage
+            ):
                 error_msg = (
                     "Invalid DeepSeek-V4.1 cache-only coverage: "
                     f"request={decode_req.req.rid} coverage={coverage} "
-                    f"prompt_len={prompt_len}; the current handoff requires "
-                    "full-prompt coverage"
+                    f"expected_coverage={expected_coverage}; the current handoff "
+                    "requires full preallocated-sequence coverage"
                 )
                 logger.error(error_msg)
                 prepare_abort(
@@ -2933,13 +2937,20 @@ class SchedulerDisaggregationDecodeMixin:
                 admitted += 1
                 can_run_list.append(req)
                 if cache_only_batch:
-                    end = len(req.origin_input_ids)
                     coverage = req.dsv41_cache_only_coverage
-                    if coverage != end:
+                    expected_coverage = req.kv.kv_committed_len
+                    if coverage != expected_coverage:
                         raise RuntimeError(
-                            "cache-only replay requires explicit full-prompt "
+                            "cache-only replay requires explicit full-sequence "
                             f"coverage: request={req.rid} coverage={coverage} "
-                            f"prompt_len={end}"
+                            f"expected_coverage={expected_coverage}"
+                        )
+                    end = coverage
+                    if len(req.full_untruncated_fill_ids) < end:
+                        raise RuntimeError(
+                            "cache-only replay input is shorter than coverage: "
+                            f"request={req.rid} fill_len="
+                            f"{len(req.full_untruncated_fill_ids)} coverage={coverage}"
                         )
                     start = max(0, coverage - 128)
                     row = self.req_to_token_pool.req_to_token[req.kv.req_pool_idx]
