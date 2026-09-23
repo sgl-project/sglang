@@ -2492,8 +2492,17 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             self._prepare_hpc_ops_weights(layer)
 
         if hasattr(layer, "dispatcher"):
+            # Execution kernels may declare the dispatch wire format they
+            # need (DISPATCHER_QUANT_CONFIG, e.g. the NPU W4A8 MXFP GMMs
+            # consume MXFP8 activations); otherwise report the checkpoint
+            # dtype and let the dispatcher pick.
+            kernel_quant_config = getattr(
+                getattr(layer, "w13_kernel", None), "DISPATCHER_QUANT_CONFIG", None
+            )
             layer.dispatcher.set_quant_config(
-                {
+                kernel_quant_config
+                if kernel_quant_config is not None
+                else {
                     "weight_dtype": layer.w13_weight.dtype,
                     "use_mxfp8": self.use_mxfp8,
                 }
