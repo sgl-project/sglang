@@ -752,3 +752,12 @@ python -m  sglang_router.launch_router --prefill ${P_IP}:8000 \
 --pd-disaggregation \
 --health-check-interval-secs 3600 \
 ```
+
+
+## Rejection-sampling metadata memory
+
+Enable `--speculative-use-rejection-sampling` on both prefill and decode workers for the single-layer EAGLE/EAGLE3/NEXTN PD path. Each rank reserves an FP32 `[metadata_slots, vocab_size]` buffer, sized by capacity rather than the current batch and not vocabulary-sharded across TP ranks.
+
+Memory per rank is `metadata_slots * vocab_size * 4` bytes. Prefill uses `2 * max_running_requests` slots; decode uses `2 * req_to_token_pool.size` (eight times for MiniMax-M3). For example, 8,192 slots and a 131,072-token vocabulary require **4 GiB per rank**, excluding KV cache, request copies, and other speculative buffers.
+
+The buffer normally uses CPU memory; Ascend uses NPU memory, and the selected `INTRA_NODE_NVLINK` Mooncake path uses CUDA memory. Before allocation, an INFO log reports slots, vocabulary size, dtype, device, bytes per slot, and total bytes/GiB per rank. This is an allocation estimate, not peak memory or an enforced limit. Lower `--max-running-requests` to reduce capacity and memory cost.

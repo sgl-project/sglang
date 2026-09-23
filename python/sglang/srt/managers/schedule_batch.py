@@ -1258,6 +1258,7 @@ class Req(ReqDllmMixin):
         self.hidden_states_tensor = None  # Note: use tensor instead of list to transfer hidden_states when PD + MTP
         self.output_topk_p = None
         self.output_topk_index = None
+        self.output_draft_probs = None
         self.output_dsa_topk_indices = None
 
         # capture routed experts
@@ -2645,9 +2646,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         else:
             self.encoder_out_cache_loc = torch.cat(encoder_out_cache_loc)
 
-        assert len(self.out_cache_loc) == self.extend_num_tokens, (
-            f"Expected {len(self.out_cache_loc)}, got {self.extend_num_tokens}"
-        )
+        assert (
+            len(self.out_cache_loc) == self.extend_num_tokens
+        ), f"Expected {len(self.out_cache_loc)}, got {self.extend_num_tokens}"
 
         if self.extend_input_logprob_token_ids is not None:
             new_token_ids_parts = []

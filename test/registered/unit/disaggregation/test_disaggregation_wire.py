@@ -24,6 +24,7 @@ from sglang.srt.disaggregation.common.utils import (
     unpack_int_lists,
     unpack_list_of_buffers,
 )
+from sglang.srt.disaggregation.decode import DecodeTransferQueue
 from sglang.srt.disaggregation.decode_schedule_batch_mixin import (
     ScheduleBatchDisaggregationDecodeMixin,
 )
@@ -34,6 +35,8 @@ from sglang.srt.disaggregation.mooncake.conn import (
     TransferInfo,
 )
 from sglang.srt.disaggregation.utils import (
+    FAKE_BOOTSTRAP_HOST,
+    DisaggregationMode,
     MetadataBuffers,
     build_transfer_entry_pairs,
     compute_mamba_state_slice_byte_blocks,
@@ -62,6 +65,7 @@ from sglang.srt.runtime_context import get_context
 from sglang.srt.speculative.eagle_disaggregation import (
     build_eagle_disagg_draft_input,
 )
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -704,7 +708,290 @@ class TestMooncakePPStaging(unittest.TestCase):
         )
 
 
+class TestMetadataBuffersMemoryLogging(unittest.TestCase):
+    def test_rejection_sampling_logs_actual_buffer_bytes(self):
+        with self.assertLogs("sglang.srt.disaggregation.utils", level="INFO") as logs:
+            buffers = MetadataBuffers(
+                size=2,
+                hidden_size=2,
+                hidden_states_dtype=torch.float32,
+                max_sampling_mask_tokens=16,
+                output_draft_probs_dim=4,
+            )
+
+        self.assertEqual(len(logs.records), 1)
+        message = logs.records[0].getMessage()
+        self.assertIn("slots=2, vocab_size=4, dtype=torch.float32", message)
+        self.assertIn(f"bytes_per_slot={buffers.output_draft_probs[0].nbytes}", message)
+        self.assertIn(f"total_bytes={buffers.output_draft_probs.nbytes}", message)
+        self.assertIn("GiB per rank", message)
+        self.assertIn("--max-running-requests", message)
+
+    def test_rejection_sampling_logs_large_buffer_before_allocation(self):
+        for mem_pool, device in ((None, "cpu"), ("INTRA_NODE_NVLINK", "cuda")):
+            with self.subTest(device=device):
+                with (
+                    self.assertLogs(
+                        "sglang.srt.disaggregation.utils", level="INFO"
+                    ) as logs,
+                    patch("sglang.srt.disaggregation.utils.is_npu", return_value=False),
+                    patch.object(
+                        envs.SGLANG_MOONCAKE_CUSTOM_MEM_POOL,
+                        "get",
+                        return_value=mem_pool,
+                    ),
+                    # No multi-GiB allocation or GPU is needed to test this log.
+                    patch(
+                        "torch.zeros", side_effect=RuntimeError("allocation stopped")
+                    ),
+                ):
+                    with self.assertRaisesRegex(RuntimeError, "allocation stopped"):
+                        MetadataBuffers(
+                            size=8192,
+                            hidden_size=2,
+                            hidden_states_dtype=torch.float32,
+                            max_sampling_mask_tokens=16,
+                            output_draft_probs_dim=131072,
+                        )
+
+                self.assertEqual(len(logs.records), 1)
+                message = logs.records[0].getMessage()
+                self.assertIn(f"device={device}", message)
+                self.assertIn("bytes_per_slot=524288", message)
+                self.assertIn("total_bytes=4294967296 (4.000 GiB per rank)", message)
+
+    def test_disabled_rejection_sampling_does_not_log_buffer_overhead(self):
+        with self.assertNoLogs("sglang.srt.disaggregation.utils", level="INFO"):
+            buffers = MetadataBuffers(
+                size=1,
+                hidden_size=2,
+                hidden_states_dtype=torch.float32,
+                max_sampling_mask_tokens=16,
+            )
+
+        self.assertIsNone(buffers.output_draft_probs)
+
+
 class TestEagleDsaSeedTransfer(CustomTestCase):
+    def test_multilayer_guard_is_pd_only(self):
+        from sglang.srt.managers.scheduler import Scheduler
+
+        module = "sglang.srt.managers.scheduler"
+        for mode in DisaggregationMode:
+            with self.subTest(mode=mode):
+                scheduler = SimpleNamespace(
+                    draft_worker=None,
+                    server_args=SimpleNamespace(),
+                    spec_algorithm=SpeculativeAlgorithm.EAGLE,
+                    model_config=SimpleNamespace(hf_config=SimpleNamespace()),
+                    enable_unified_memory=False,
+                    _hosts_rust_server=lambda: False,
+                )
+                with (
+                    patch(
+                        f"{module}.get_disagg",
+                        return_value=SimpleNamespace(
+                            disaggregation_mode=mode.value,
+                            disaggregation_transfer_backend="fake",
+                            language_only=False,
+                        ),
+                    ),
+                    patch(
+                        f"{module}.get_spec",
+                        return_value=SimpleNamespace(
+                            speculative_use_rejection_sampling=True,
+                            enable_multi_layer_eagle=True,
+                            speculative_draft_model_path=None,
+                            speculative_draft_model_revision=None,
+                        ),
+                    ),
+                    patch(f"{module}.ModelConfig.from_server_args"),
+                    patch(
+                        f"{module}.get_draft_recurrent_hidden_state_spec_from_config",
+                        return_value=(2, torch.float32),
+                    ),
+                    patch(f"{module}.MetadataBuffers") as buffers,
+                ):
+                    if mode == DisaggregationMode.NULL:
+                        Scheduler.init_disaggregation(scheduler)
+                        self.assertIsNone(scheduler.disagg_decode_prealloc_queue)
+                        self.assertIsNone(scheduler.disagg_prefill_bootstrap_queue)
+                    else:
+                        with self.assertRaisesRegex(ValueError, "single-layer"):
+                            Scheduler.init_disaggregation(scheduler)
+                    buffers.assert_not_called()
+
+    def test_metadata_buffer_round_trips_rejection_sampling_draft_probs(self):
+        buffers = MetadataBuffers(
+            size=1,
+            hidden_size=2,
+            hidden_states_dtype=torch.float32,
+            max_sampling_mask_tokens=16,
+            output_draft_probs_dim=4,
+        )
+        req = self._make_req(None)
+        req.output_draft_probs = torch.tensor([0.1, 0.2, 0.3, 0.4])
+
+        buffers.set_buf(req)
+
+        self.assertTrue(torch.equal(buffers.get_buf(0)[12], req.output_draft_probs))
+        ptrs, data_lens, item_lens = buffers.get_buf_infos()
+        self.assertEqual(ptrs[-2], buffers.output_draft_probs.data_ptr())
+        self.assertEqual(data_lens[-2], buffers.output_draft_probs.nbytes)
+        self.assertEqual(item_lens[-2], buffers.output_draft_probs[0].nbytes)
+
+    def test_metadata_buffer_rejects_missing_rejection_sampling_draft_probs(self):
+        buffers = MetadataBuffers(
+            size=1,
+            hidden_size=2,
+            hidden_states_dtype=torch.float32,
+            max_sampling_mask_tokens=16,
+            output_draft_probs_dim=4,
+        )
+
+        with self.assertRaisesRegex(
+            RuntimeError, "Enable speculative-use-rejection-sampling on both"
+        ):
+            buffers.set_buf(self._make_req(None))
+
+    def _commit_draft_probs(self, proposal_token, bootstrap_host, transfer_backend):
+        buffers = MetadataBuffers(
+            size=1,
+            hidden_size=2,
+            hidden_states_dtype=torch.float32,
+            max_sampling_mask_tokens=16,
+            output_draft_probs_dim=4,
+        )
+        req = self._make_req(None)
+        req.bootstrap_host = bootstrap_host
+        req.rid = "draft-warmup-test"
+        req.vocab_size = 4
+        req.time_stats = Mock()
+        req.output_topk_index = torch.tensor([proposal_token])
+        # Nonzero entries expose a missing zero_() when synthesizing one-hot q.
+        original_probs = torch.tensor([0.1, 0.2, 0.3, 0.4])
+        req.output_draft_probs = original_probs.clone()
+        buffers.set_buf(req)
+        req.output_draft_probs = None
+
+        queue = DecodeTransferQueue.__new__(DecodeTransferQueue)
+        queue.metadata_buffers = buffers
+        queue.scheduler = SimpleNamespace(
+            kv_checksum_computer=None, batch_result_processor=Mock()
+        )
+        queue.spec_algorithm = SpeculativeAlgorithm.EAGLE
+        queue._commit_hicache_local_restore_to_req = Mock()
+        decode_req = SimpleNamespace(
+            req=req,
+            metadata_buffer_index=0,
+            is_rebootstrap=False,
+            kv_receiver=Mock(),
+        )
+
+        with patch(
+            "sglang.srt.disaggregation.utils.get_disagg",
+            return_value=SimpleNamespace(
+                disaggregation_transfer_backend=transfer_backend
+            ),
+        ):
+            queue._commit_transfer_to_req(decode_req)
+
+        # Committing a request must not mutate the reusable metadata slot.
+        self.assertTrue(torch.equal(buffers.output_draft_probs[0], original_probs))
+        self.assertEqual(buffers.output_topk_index[0, 0].item(), proposal_token)
+        return req
+
+    def test_fake_transfer_initializes_one_hot_draft_probs(self):
+        for bootstrap_host, backend in (
+            (FAKE_BOOTSTRAP_HOST, "mooncake"),
+            (None, "fake"),
+        ):
+            for proposal_token in (0, 2, 3):
+                with self.subTest(backend=backend, proposal_token=proposal_token):
+                    req = self._commit_draft_probs(
+                        proposal_token, bootstrap_host, backend
+                    )
+                    probs = req.output_draft_probs
+
+                    expected = torch.zeros(4, dtype=torch.float32)
+                    expected[proposal_token] = 1.0
+                    self.assertEqual(probs.shape, (4,))
+                    self.assertEqual(probs.dtype, torch.float32)
+                    self.assertTrue(torch.equal(probs, expected))
+                    self.assertEqual(req.output_topk_index[0].item(), proposal_token)
+
+    def test_fake_transfer_out_of_range_proposal_uses_token_zero(self):
+        for bootstrap_host, backend in (
+            (FAKE_BOOTSTRAP_HOST, "mooncake"),
+            (None, "fake"),
+        ):
+            for proposal_token in (-1, 4, 99):
+                with self.subTest(backend=backend, proposal_token=proposal_token):
+                    req = self._commit_draft_probs(
+                        proposal_token, bootstrap_host, backend
+                    )
+
+                    self.assertEqual(req.output_topk_index[0].item(), 0)
+                    self.assertTrue(
+                        torch.equal(
+                            req.output_draft_probs, torch.tensor([1.0, 0, 0, 0])
+                        )
+                    )
+
+    def test_real_transfer_preserves_draft_probs(self):
+        req = self._commit_draft_probs(2, "127.0.0.1", "mooncake")
+
+        self.assertEqual(req.output_topk_index[0].item(), 2)
+        self.assertTrue(
+            torch.equal(req.output_draft_probs, torch.tensor([0.1, 0.2, 0.3, 0.4]))
+        )
+
+    def test_decode_input_restores_rejection_sampling_draft_probs(self):
+        probs = (
+            torch.tensor([0.1, 0.2, 0.3, 0.4]),
+            torch.tensor([0.4, 0.3, 0.2, 0.1]),
+        )
+        reqs = [self._make_req(None) for _ in probs]
+        for req, req_probs in zip(reqs, probs, strict=True):
+            req.output_draft_probs = req_probs
+        batch = SimpleNamespace(
+            reqs=reqs,
+            device="cpu",
+            enable_overlap=False,
+        )
+        override = get_context().override_server_args(
+            speculative_eagle_topk=1,
+            speculative_num_steps=7,
+            enable_multi_layer_eagle=False,
+            speculative_use_rejection_sampling=True,
+        )
+        override.install()
+        self.addCleanup(override.restore)
+
+        draft_input = build_eagle_disagg_draft_input(
+            batch, torch.tensor([11, 12], dtype=torch.int64), None
+        )
+
+        self.assertTrue(torch.equal(draft_input.draft_probs, torch.stack(probs)))
+
+    def test_decode_input_rejects_missing_rejection_sampling_draft_probs(self):
+        req = self._make_req(None)
+        req.output_draft_probs = None
+        batch = SimpleNamespace(reqs=[req], device="cpu", enable_overlap=False)
+        override = get_context().override_server_args(
+            speculative_eagle_topk=1,
+            speculative_num_steps=7,
+            enable_multi_layer_eagle=False,
+            speculative_use_rejection_sampling=True,
+        )
+        override.install()
+        self.addCleanup(override.restore)
+
+        with self.assertRaisesRegex(RuntimeError, "missing the prefill draft"):
+            build_eagle_disagg_draft_input(
+                batch, torch.tensor([11], dtype=torch.int64), None
+            )
+
     @staticmethod
     def _make_req(
         seed,
@@ -731,6 +1018,7 @@ class TestEagleDsaSeedTransfer(CustomTestCase):
             hidden_states_tensor=torch.tensor([1.0, 2.0]),
             output_topk_p=torch.tensor([1.0]),
             output_topk_index=torch.tensor([7]),
+            output_draft_probs=None,
             output_dsa_topk_indices=seed,
             bootstrap_room=9,
         )

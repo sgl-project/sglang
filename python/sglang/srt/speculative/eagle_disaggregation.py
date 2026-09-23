@@ -56,6 +56,19 @@ def build_eagle_disagg_draft_input(
         [req.hidden_states_tensor for req in batch.reqs], dim=0
     ).to(batch.device)
 
+    draft_probs = None
+    if get_spec().speculative_use_rejection_sampling:
+        request_draft_probs = [req.output_draft_probs for req in batch.reqs]
+        if any(probs is None for probs in request_draft_probs):
+            raise RuntimeError(
+                "PD EAGLE rejection sampling is missing the prefill draft "
+                "distribution. Enable speculative-use-rejection-sampling on "
+                "both the prefill and decode servers."
+            )
+        draft_probs = torch.stack(request_draft_probs, dim=0).to(
+            device=batch.device, dtype=torch.float32
+        )
+
     dsa_topk_indices = None
     dsa_indices_list = [req.output_dsa_topk_indices for req in batch.reqs]
     if dsa_indices_list and all(t is not None for t in dsa_indices_list):
@@ -90,6 +103,7 @@ def build_eagle_disagg_draft_input(
     spec_info = EagleDraftInput(
         topk_p=topk_p,
         topk_index=topk_index,
+        draft_probs=draft_probs,
         hidden_states=hidden_states,
         bonus_tokens=last_tokens_tensor,
         dsa_topk_indices=dsa_topk_indices,

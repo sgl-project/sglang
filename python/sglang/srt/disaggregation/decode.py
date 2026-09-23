@@ -209,9 +209,9 @@ class DecodeReqToTokenPool:
         # Indices of reqs that already have a req_pool_idx and will reuse
         # their existing slot (e.g. chunked prefill continuing across chunks).
         reusing = [i for i, r in enumerate(reqs) if r.kv.holds_kv]
-        assert all(reqs[i].kv.kv_allocated_len > 0 for i in reusing), (
-            "a reused row must carry allocated KV"
-        )
+        assert all(
+            reqs[i].kv.kv_allocated_len > 0 for i in reusing
+        ), "a reused row must carry allocated KV"
 
         need_size = len(reqs) - len(reusing)
         if need_size > len(self.free_slots):
@@ -1917,9 +1917,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
         req_pool_indices = self.req_to_token_pool.alloc([req])
 
-        assert req_pool_indices is not None, (
-            "req_pool_indices is full! There is a bug in memory estimation."
-        )
+        assert (
+            req_pool_indices is not None
+        ), "req_pool_indices is full! There is a bug in memory estimation."
 
         fill_len = self._pre_alloc_fill_len(req)
         req.kv.kv_committed_len = fill_len
@@ -2256,6 +2256,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             output_topk_p,
             output_topk_index,
             output_hidden_states,
+            output_draft_probs,
             output_dsa_topk_indices,
             output_bootstrap_room,
         ) = self.metadata_buffers.get_buf(idx)
@@ -2364,6 +2365,19 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             decode_req.req.output_topk_p = output_topk_p
             decode_req.req.output_topk_index = output_topk_index
             decode_req.req.hidden_states_tensor = output_hidden_states
+            if output_draft_probs is not None and _is_fake_transfer(decode_req.req):
+                # Fake-transfer requests are server warmups: no prefill worker
+                # populated metadata, but the rejection-sampling draft path still
+                # requires a valid q distribution.  Use a one-hot distribution
+                # at the synthetic proposal so warmup exercises the same tensor
+                # shapes without affecting any user-visible sampling result.
+                output_draft_probs.zero_()
+                fake_draft_token = int(output_topk_index.reshape(-1)[0].item())
+                if not 0 <= fake_draft_token < output_draft_probs.numel():
+                    fake_draft_token = 0
+                    output_topk_index[0] = fake_draft_token
+                output_draft_probs[fake_draft_token] = 1.0
+            decode_req.req.output_draft_probs = output_draft_probs
             if (
                 output_dsa_topk_indices is not None
                 and torch.all(output_dsa_topk_indices < 0).item()
@@ -2389,9 +2403,9 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 ].tolist()
             )
         if decode_req.req.return_sampling_mask:
-            assert output_token_sampling_mask_idx is not None, (
-                "sampling mask buffer disabled on decode side"
-            )
+            assert (
+                output_token_sampling_mask_idx is not None
+            ), "sampling mask buffer disabled on decode side"
             sampling_mask_len = int(output_token_sampling_mask_len[0].item())
             if sampling_mask_len < 0:
                 decode_req.req.output_token_sampling_mask.append(None)

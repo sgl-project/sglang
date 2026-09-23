@@ -5,9 +5,16 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
+import json
 import unittest
-from unittest.mock import MagicMock, call, patch
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock, Mock, call, patch
 
+from sglang.srt.disaggregation.common.conn import (
+    CommonKVBootstrapServer,
+    CommonKVManager,
+)
+from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.test.test_utils import CustomTestCase
@@ -21,7 +28,9 @@ class TestRegisterToBootstrap(CustomTestCase):
         # .enable_dsa_cache_layer_split and get_serving().port from the
         # published config.
         override = get_context().override_server_args(
-            load_balance_method="follow_bootstrap_room", port=30000
+            load_balance_method="follow_bootstrap_room",
+            port=30000,
+            speculative_use_rejection_sampling=False,
         )
         override.install()
         self.addCleanup(override.restore)
@@ -178,6 +187,7 @@ class TestRegisterToBootstrap(CustomTestCase):
             "rank_port",
             "page_size",
             "kv_cache_dtype",
+            "speculative_use_rejection_sampling",
             # Self-registered HTTP API port used to derive the PD retract
             # rebootstrap /generate URL on the decode side.
             "prefill_http_port",
@@ -185,6 +195,23 @@ class TestRegisterToBootstrap(CustomTestCase):
         for field in required_fields:
             self.assertIn(field, payload)
         self.assertEqual(payload["prefill_http_port"], 30000)
+        self.assertIs(payload["speculative_use_rejection_sampling"], False)
+
+    @patch("sglang.srt.disaggregation.common.conn.requests.put")
+    def test_payload_advertises_rejection_sampling_enabled(self, mock_put):
+        override = get_context().override_server_args(
+            speculative_use_rejection_sampling=True
+        )
+        override.install()
+        self.addCleanup(override.restore)
+        mock_put.return_value.status_code = 200
+
+        self._make_manager().register_to_bootstrap()
+
+        self.assertIs(
+            mock_put.call_args.kwargs["json"]["speculative_use_rejection_sampling"],
+            True,
+        )
 
     @patch("sglang.srt.disaggregation.common.conn.time")
     @patch("sglang.srt.disaggregation.common.conn.requests.put")
@@ -370,6 +397,151 @@ class TestRegisterToBootstrap(CustomTestCase):
         mgr.kv_cache_dtype_str = "auto"
 
         return mgr
+
+
+CONN = "sglang.srt.disaggregation.common.conn"
+FLAG = "speculative_use_rejection_sampling"
+
+
+class TestPDConfigCompatibility(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.server = self._new_server()
+
+    @staticmethod
+    def _new_server():
+        # Exercise the real HTTP handlers without starting a server thread.
+        with patch.object(CommonKVBootstrapServer, "run"):
+            return CommonKVBootstrapServer("127.0.0.1", 8998)
+
+    @staticmethod
+    def _registration(enabled):
+        return {
+            "attn_tp_size": 1,
+            "attn_tp_rank": 0,
+            "attn_cp_size": 1,
+            "attn_cp_rank": 0,
+            "attn_dp_size": 1,
+            "attn_dp_rank": 0,
+            "pp_size": 1,
+            "pp_rank": 0,
+            "system_dp_size": 1,
+            "system_dp_rank": 0,
+            "rank_ip": "127.0.0.1",
+            "rank_port": 9000,
+            "page_size": 16,
+            "kv_cache_dtype": "bfloat16",
+            FLAG: enabled,
+        }
+
+    async def _register(self, payload):
+        return await self.server._handle_route_put(
+            SimpleNamespace(json=AsyncMock(return_value=payload))
+        )
+
+    async def _prefill_info(self):
+        response = await self.server._handle_route_get(
+            SimpleNamespace(
+                query={
+                    "prefill_dp_rank": "-1",
+                    "prefill_cp_rank": "-1",
+                    "target_tp_rank": "-1",
+                    "target_pp_rank": "-1",
+                }
+            )
+        )
+        self.assertEqual(response.status, 200)
+        return json.loads(response.text)
+
+    @staticmethod
+    def _decode_manager():
+        manager = CommonKVManager.__new__(CommonKVManager)
+        manager.disaggregation_mode = DisaggregationMode.DECODE
+        manager.prefill_info_table = {}
+        manager.kv_args = SimpleNamespace(page_size=16)
+        manager.kv_cache_dtype_str = "bfloat16"
+        manager.dcp_size = 1
+        manager.dsv41_spec_layout = None
+        manager._resolve_rank_mapping = Mock()
+        return manager
+
+    def _ensure_info(self, manager, info, decode_enabled):
+        response = Mock(status_code=200)
+        response.json.return_value = info
+        with (
+            patch(f"{CONN}.requests.get", return_value=response),
+            patch(
+                f"{CONN}.get_spec",
+                return_value=SimpleNamespace(**{FLAG: decode_enabled}),
+            ),
+        ):
+            return manager.try_ensure_parallel_info("127.0.0.1:8998")
+
+    async def test_matching_flags_allow_transfer_setup(self):
+        for enabled in (False, True):
+            with self.subTest(enabled=enabled):
+                self.server = self._new_server()
+                response = await self._register(self._registration(enabled))
+                self.assertEqual(response.status, 200)
+                info = await self._prefill_info()
+                self.assertIs(info[FLAG], enabled)
+
+                manager = self._decode_manager()
+                self.assertTrue(self._ensure_info(manager, info, enabled))
+                manager._resolve_rank_mapping.assert_called_once()
+                self.assertIn("127.0.0.1:8998", manager.prefill_info_table)
+
+    async def test_mismatched_flags_fail_before_rank_mapping_or_cache(self):
+        for prefill_enabled in (False, True):
+            with self.subTest(prefill_enabled=prefill_enabled):
+                self.server = self._new_server()
+                response = await self._register(self._registration(prefill_enabled))
+                self.assertEqual(response.status, 200)
+                info = await self._prefill_info()
+                manager = self._decode_manager()
+
+                with self.assertRaisesRegex(
+                    RuntimeError, "--speculative-use-rejection-sampling mismatch"
+                ) as caught:
+                    self._ensure_info(manager, info, not prefill_enabled)
+
+                self.assertIn(f"prefill={prefill_enabled}", str(caught.exception))
+                self.assertIn(f"decode={not prefill_enabled}", str(caught.exception))
+                manager._resolve_rank_mapping.assert_not_called()
+                self.assertEqual(manager.prefill_info_table, {})
+
+    async def test_unknown_prefill_setting_fails_closed(self):
+        await self._register(self._registration(False))
+        info = await self._prefill_info()
+        # Missing (legacy), null, and non-boolean values are not proof of parity.
+        for value in (None, "false", 0, "missing"):
+            for decode_enabled in (False, True):
+                with self.subTest(value=value, decode_enabled=decode_enabled):
+                    info[FLAG] = value
+                    if value == "missing":
+                        del info[FLAG]
+                    manager = self._decode_manager()
+                    with self.assertRaisesRegex(RuntimeError, "unknown setting"):
+                        self._ensure_info(manager, info, decode_enabled)
+                    manager._resolve_rank_mapping.assert_not_called()
+                    self.assertEqual(manager.prefill_info_table, {})
+
+    async def test_non_pd_skips_flag_check(self):
+        await self._register(self._registration(True))
+        info = await self._prefill_info()
+        manager = self._decode_manager()
+        manager.disaggregation_mode = DisaggregationMode.NULL
+        response = Mock(status_code=200)
+        response.json.return_value = info
+
+        with (
+            patch(f"{CONN}.requests.get", return_value=response),
+            patch(
+                f"{CONN}.get_spec",
+                side_effect=AssertionError("Non-PD must not read the spec config"),
+            ) as get_spec,
+        ):
+            self.assertTrue(manager.try_ensure_parallel_info("127.0.0.1:8998"))
+            get_spec.assert_not_called()
 
 
 if __name__ == "__main__":
