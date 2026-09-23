@@ -208,3 +208,30 @@ void fused_sigmoid_mul_cpu(at::Tensor& input, const at::Tensor& gate) {
         g_strideH);
   });
 }
+
+void fused_softcap_cpu(at::Tensor& input, double softcapping_value) {
+  CHECK_DIM(2, input);
+  CHECK_LAST_DIM_CONTIGUOUS_INPUT(input);
+  TORCH_CHECK(input.scalar_type() == at::kFloat, "input must have float32 dtype");
+
+  const int64_t nrows = input.size(0);
+  const int64_t ncols = input.size(1);
+  const int64_t row_stride = input.stride(0);
+  const float softcap = static_cast<float>(softcapping_value);
+  using Vec = at::vec::Vectorized<float>;
+  constexpr int64_t kVecSize = Vec::size();
+
+  at::parallel_for(0, nrows, 0, [&](int64_t begin, int64_t end) {
+    for (int64_t row = begin; row < end; ++row) {
+      float* row_ptr = input.data_ptr<float>() + row * row_stride;
+      int64_t col = 0;
+      for (; col <= ncols - kVecSize; col += kVecSize) {
+        Vec values = Vec::loadu(row_ptr + col);
+        ((values / Vec(softcap)).tanh() * Vec(softcap)).store(row_ptr + col);
+      }
+      for (; col < ncols; ++col) {
+        row_ptr[col] = softcap * std::tanh(row_ptr[col] / softcap);
+      }
+    }
+  });
+}
