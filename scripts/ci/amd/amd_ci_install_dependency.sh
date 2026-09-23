@@ -230,11 +230,7 @@ if docker exec ci_sglang test -d /sgl-workspace/mori; then
     exit 1
   fi
 
-  if [[ "${GPU_ARCH}" == "mi35x" ]]; then
-    MORI_GPU_ARCHS="gfx950"
-  else
-    MORI_GPU_ARCHS="gfx942"
-  fi
+  MORI_GPU_ARCHS="${IMAGE_GFX}"
 
   echo "[MORI] Reinstalling MORI ${MORI_COMMIT} (MORI_GPU_ARCHS=${MORI_GPU_ARCHS})"
   # Only the rocm724 and rocm1000 (noble) bases attempt to install
