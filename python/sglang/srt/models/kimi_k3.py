@@ -444,6 +444,11 @@ class KimiK3MoE(nn.Module):
         # loading by _merge_front_weights().
         self._front_w: Optional[torch.Tensor] = None
         self._sharded_front_w: Optional[torch.Tensor] = None
+        self._sharded_front_enabled = (
+            envs.SGLANG_ENABLE_K3_SHARDED_FRONT.get()
+            and self.tp_size == 8
+            and get_device_sm() in (103, 107)
+        )
         self._front_sizes: Optional[List[int]] = None
         # True when _front_w merges only [gate, routed_expert_down_proj] (the EP
         # a2a pair) rather than the three-way fused-front weight.
@@ -724,16 +729,19 @@ class KimiK3MoE(nn.Module):
         self._front_w, self._front_sizes = _merge_weights_as_views(mods)
         self._front_is_ep_pair = len(mods) == 2
         if (
-            envs.SGLANG_K3_SHARDED_FRONT.get()
-            and self.tp_size == 8
+            self._sharded_front_enabled
             and self._front_sizes == [1536, 896, 3584]
             and self._front_w.dtype == torch.bfloat16
-            and get_device_sm() in (103, 107)
             and k3_ar_fusion.front_gather_fits(16)
         ):
-            start = 2432 + get_parallel().tp_rank * 448
+            latent_start = sum(self._front_sizes[:2])
+            local_width = self._front_sizes[2] // self.tp_size
+            start = latent_start + get_parallel().tp_rank * local_width
             self._sharded_front_w = torch.cat(
-                [self._front_w[:2432], self._front_w[start : start + 448]]
+                (
+                    self._front_w[:latent_start],
+                    self._front_w[start : start + local_width],
+                )
             )
             if self.layer_idx == 1:
                 logger.info("K3 sharded front enabled: TP8, M8/M16, multicast")
@@ -1353,16 +1361,9 @@ class KimiK3MoE(nn.Module):
 
         num_tokens, hidden_size = hidden_states.shape
         if self._sharded_front_w is not None and num_tokens in (8, 16):
-            from sglang.kernels.ops.gemm.cutedsl_bf16_gemm import (
-                cutedsl_bf16_gemm_out,
+            gate_up, router_logits, routed_input = k3_ar_fusion.gemm_ag_front(
+                x=hidden_states, weight=self._sharded_front_w
             )
-
-            front = torch.empty(
-                (num_tokens, 2880), device=hidden_states.device, dtype=torch.float32
-            )
-            cutedsl_bf16_gemm_out(hidden_states, self._sharded_front_w, front)
-            gate_up, router_logits = front[:, :1536], front[:, 1536:2432]
-            routed_input = k3_ar_fusion.gather_front_latent(front)
         else:
             fused = _k3_bf16_gemm(
                 hidden_states,

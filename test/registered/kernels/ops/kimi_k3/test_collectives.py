@@ -115,10 +115,11 @@ def _symmetric_tensor(shape):
 
 @torch.inference_mode()
 def test_front_gather_push_interleaving():
+    """Changing row counts and push operators must preserve both mailbox phases."""
     _require_sm100()
     if int(os.environ["WORLD_SIZE"]) != 8:
         pytest.skip("K3 front gather requires TP8")
-    comm = _init_comm()
+    _init_comm()
     rank = dist.get_rank()
     fronts = [torch.zeros(m, 2880, device=_device()) for m in (8, 16)]
     expected = [
@@ -128,11 +129,12 @@ def test_front_gather_push_interleaving():
     residual = torch.zeros_like(reduced)
 
     def run():
-        outputs = []
-        for front in fronts:
-            outputs.append(gemm_ag.gather_front_latent(8, front))
-            reduced.fill_(rank + 1)
-            all_reduce.all_reduce_push_res(8, reduced, residual)
+        outputs = tuple(
+            gemm_ag.gather_front_latent(world_size=8, front=front) for front in fronts
+        )
+        # Three collectives make successive replays enter opposite mailbox phases.
+        reduced.fill_(rank + 1)
+        all_reduce.all_reduce_push_res(world_size=8, x=reduced, residual=residual)
         return outputs
 
     run()  # JIT before capture.
@@ -140,8 +142,7 @@ def test_front_gather_push_interleaving():
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         outputs = run()
-    for step in range(32):
-        scale = (0, 1, -1)[step % 3]
+    for scale in (0, 1, -1) * 2:
         for front, ref in zip(fronts, expected):
             front[:, 2432:].copy_(ref[:, rank * 448 : (rank + 1) * 448] * scale)
         graph.replay()
@@ -151,6 +152,50 @@ def test_front_gather_push_interleaving():
             reduced, torch.full_like(reduced, 36), rtol=0, atol=0
         )
     del graph
+
+
+@torch.inference_mode()
+def test_sharded_front_projection():
+    _require_sm100()
+    if int(os.environ["WORLD_SIZE"]) != 8:
+        pytest.skip("K3 front gather requires TP8")
+    _init_comm()
+    rank = dist.get_rank()
+    generator = torch.Generator(device=_device()).manual_seed(42)
+    x = torch.randint(
+        -2, 3, (16, 7168), generator=generator, device=_device()
+    ).bfloat16()
+    weight = torch.randint(
+        -2, 3, (6016, 7168), generator=generator, device=_device()
+    ).bfloat16()
+    weight[:1536].add_(rank)
+    local_weight = torch.cat(
+        (weight[:2432], weight[2432 + rank * 448 : 2432 + (rank + 1) * 448])
+    )
+    # Integer inputs keep the independent FP32 matmul exact across GEMM implementations.
+    expected = x.float() @ weight.float().T
+    for num_tokens in (8, 16):
+        args = dict(world_size=8, x=x[:num_tokens], weight=local_weight)
+        gemm_ag.gemm_ag_front(**args)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            outputs = gemm_ag.gemm_ag_front(**args)
+        graph.replay()
+        torch.testing.assert_close(
+            torch.cat(outputs, dim=-1), expected[:num_tokens], rtol=0, atol=0
+        )
+        del graph
+
+
+@torch.inference_mode()
+def test_front_gather_alignment():
+    _require_sm100()
+    if int(os.environ["WORLD_SIZE"]) != 8:
+        pytest.skip("K3 front gather requires TP8")
+    _init_comm()
+    front = torch.empty(8 * 2880 + 1, device=_device())[1:].view(8, 2880)
+    with pytest.raises(RuntimeError, match="not aligned"):
+        gemm_ag.gather_front_latent(world_size=8, front=front)
 
 
 @torch.inference_mode()
@@ -386,6 +431,7 @@ def _precompile(num_gpus):
         gemm_ar._jit_module(_GEMM_AR_K_TOTAL // world_size, world_size)
     if _GEMM_AG_WORLD_SIZE in num_gpus:
         gemm_ag._jit_module()
+        gemm_ag._front_gather_module()
     attn_res._jit_fused_tma_module(4, 1, 200)
 
 

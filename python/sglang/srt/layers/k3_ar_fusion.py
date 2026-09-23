@@ -335,20 +335,25 @@ def gemm_ag_up_fits(num_tokens: int) -> bool:
 
 def front_gather_fits(num_tokens: int) -> bool:
     state = _get_state()
+    # The FP32 consumer uses 128 threads x four elements, plus a cleanup block.
+    num_blocks = (num_tokens * NORM_DIM + 511) // 512 + 1
     return (
         state is not None
         and state.world_size == 8
         and num_tokens in (8, 16)
-        and num_tokens * 448 * 4 <= state.comm.max_push_size
-        and (num_tokens * NORM_DIM + 511) // 512 + 1
-        <= state.comm.config.num_push_blocks
+        and num_tokens * (NORM_DIM // 8) * 4 <= state.comm.max_push_size
+        and num_blocks <= state.comm.config.num_push_blocks
     )
 
 
-def gather_front_latent(front: torch.Tensor) -> torch.Tensor:
-    from sglang.kernels.ops.kimi_k3.gemm_ag import gather_front_latent
+def gemm_ag_front(
+    *, x: torch.Tensor, weight: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    from sglang.kernels.ops.kimi_k3 import gemm_ag as mod
 
-    return gather_front_latent(_get_state().world_size, front)
+    state = _get_state()
+    assert state is not None
+    return mod.gemm_ag_front(world_size=state.world_size, x=x, weight=weight)
 
 
 def gemm_ag_up_proj(

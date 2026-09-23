@@ -1,14 +1,7 @@
-"""K3 column-parallel up_proj + multicast all-gather + add3 (bf16, TP8).
+"""K3 TP8 projections with multicast gather through the shared push workspace.
 
-One entry point over ``csrc/kimi_k3/comm/gemm_ag.cuh``: for the latent MoE
-up_proj ([M, 3584] x [3584, 7168]) at small decode M, every rank computes
-only its 896-column slice of the replicated GEMM (the C++ side slices the
-full weight itself), multicast-stores it into the CustomAllReduceV2 push
-workspace (one more user of its double-buffer phase protocol), and a
-Lamport-spin consumer assembles ``out = up_proj(x) + b (+ c)`` — reading
-1/8 of the weight bytes per rank instead of all of them. Needs
-:func:`sglang.kernels.ops.kimi_k3.all_reduce.register_comm` once beforehand
-(the same registration the push all-reduce uses).
+Call ``kimi_k3.all_reduce.register_comm`` first;
+serialize these operations with other users of the communicator's push workspace.
 """
 
 from __future__ import annotations
@@ -55,11 +48,25 @@ def _front_gather_op(world_size: int, front: torch.Tensor, out: torch.Tensor) ->
     _front_gather_module().run(_COMM_MAP[world_size], front, out)
 
 
-def gather_front_latent(world_size: int, front: torch.Tensor) -> torch.Tensor:
-    """Assemble TP8 latent columns; serialized with the communicator's push ops."""
+def gather_front_latent(*, world_size: int, front: torch.Tensor) -> torch.Tensor:
+    """Gather FP32 latent slices from [M, 2880] fronts into [M, 3584]."""
     out = front.new_empty((front.shape[0], K))
-    _front_gather_op(world_size, front, out)
+    _front_gather_op(world_size=world_size, front=front, out=out)
     return out
+
+
+def gemm_ag_front(
+    *, world_size: int, x: torch.Tensor, weight: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    from sglang.kernels.ops.gemm.cutedsl_bf16_gemm import cutedsl_bf16_gemm_out
+
+    front = x.new_empty((x.shape[0], weight.shape[0]), dtype=torch.float32)
+    cutedsl_bf16_gemm_out(x=x, weight=weight, out=front)
+    return (
+        front[:, :1536],
+        front[:, 1536:2432],
+        gather_front_latent(world_size=world_size, front=front),
+    )
 
 
 @cache_once
