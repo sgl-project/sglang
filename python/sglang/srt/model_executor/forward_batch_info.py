@@ -45,6 +45,7 @@ from sglang.srt.kv_canary.req_to_expected_token_ids_manager import (
 )
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
+    dp_gather_slot,
     set_dp_buffer_len,
     set_is_extend_in_batch,
     world_dp_gather_enabled,
@@ -1101,13 +1102,12 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             model_runner.lora_manager.prepare_lora_batch(ret)
 
         if (
-            model_runner.ps.attn_dcp_size > 1
+            model_runner.attn_dcp_size > 1
             and ret.out_cache_loc is not None
             and is_hip()
         ):
             ret.dcp_kv_mask = (
-                ret.positions % model_runner.ps.attn_dcp_size
-                == model_runner.ps.attn_dcp_rank
+                ret.positions % model_runner.attn_dcp_size == model_runner.attn_dcp_rank
             )
 
         return ret
@@ -1165,9 +1165,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         if self.global_num_tokens_cpu is not None:
             # DP / MLP-sync path: per-DP padded width.
             if require_mlp_tp_gather():
-                num_tokens_per_dp = self.global_num_tokens_cpu[
-                    get_parallel().attn_dp_rank
-                ]
+                num_tokens_per_dp = self.global_num_tokens_cpu[dp_gather_slot()]
             else:
                 num_tokens_per_dp = self.global_num_tokens_cpu[0]
         else:
@@ -1179,6 +1177,50 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             num_tokens_per_dp=num_tokens_per_dp,
             sharded=sharded,
         )
+
+    def moe_num_token_non_padded(self) -> Optional[torch.Tensor]:
+        """Bound for masking a sparse MoE's padded rows, or None when the MoE
+        input is a gathered buffer whose real rows are not a prefix of it."""
+        from sglang.srt.layers.communicator import ScatterMode, sparse_mlp_scatter_mode
+
+        if self.num_token_non_padded is None:
+            return None
+
+        mode = sparse_mlp_scatter_mode()
+        if mode == ScatterMode.SCATTERED:
+            # a2a dispatch, FP4 all-gather and dwdp all route the local shard.
+            return self.num_token_non_padded
+        if mode == ScatterMode.MOE_FULL and self._moe_input_gathered_across_moe_cp():
+            return None
+        # DSA / MLA CP take the FULL mode but all-gather across CP on a prefill,
+        # which leaves the real rows zigzag-permuted rather than in a prefix.
+        if get_parallel().attn_cp_size > 1 and self._moe_input_gathered_across_cp():
+            return None
+        if get_parallel().attn_dp_size != 1:
+            # dp_gather concatenates one padded slot per attention-DP rank.
+            return None
+        # A single attention-DP group all-reduces instead of gathering, so the
+        # buffer holds the whole sequence and the GLOBAL count bounds it.
+        if not self.attn_tp_sequence_sharded:
+            return self.num_token_non_padded
+        # None under cuda-graph replay: its static batch carries no GLOBAL count.
+        return self.global_num_token_non_padded
+
+    def _moe_input_gathered_across_moe_cp(self) -> bool:
+        from sglang.srt.layers.dp_attention import get_moe_cp_size
+
+        # Mirrors the communicator's MOE_FULL gather guard: decode stays FULL.
+        return (
+            self.forward_mode.is_context_parallel_extend()
+            and self.attn_cp_metadata is not None
+            and get_moe_cp_size() > 1
+        )
+
+    def _moe_input_gathered_across_cp(self) -> bool:
+        from sglang.srt.layers.attention.dsa.utils import dsa_use_prefill_cp
+        from sglang.srt.layers.cp.utils import is_mla_cp_active
+
+        return dsa_use_prefill_cp(self) or is_mla_cp_active(self)
 
     def mamba_track_aligned_lens(self) -> Optional[torch.Tensor]:
         """Tokens of this extend chunk covered by the tracked mamba state,
@@ -1520,7 +1562,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             buffer_len = sum(global_num_tokens)
 
         if len(global_num_tokens) > 1:
-            num_tokens = global_num_tokens[get_parallel().attn_dp_rank]
+            num_tokens = global_num_tokens[dp_gather_slot()]
         else:
             num_tokens = global_num_tokens[0]
 

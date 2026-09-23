@@ -11,7 +11,6 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from sglang.srt.configs.model_config import AttentionArch
-from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.runtime_context import (
     get_memory,
     get_parallel,
@@ -36,7 +35,16 @@ def mock_cpu_env(kv_size=2, tp_size=1, swa_eviction_interval=4):
 
     with (
         patch("torch._utils._element_size", return_value=kv_size),
-        get_parallel().override(attn_tp_size=tp_size),
+        get_parallel().override(
+            tp_size=tp_size,
+            attn_tp_size=tp_size,
+            attn_dp_size=1,
+            attn_cp_size=1,
+            moe_ep_size=1,
+            moe_ep_group=None,
+            moe_dp_size=1,
+            moe_tp_size=tp_size,
+        ),
         envs.SGLANG_SWA_EVICTION_INTERVAL.override(swa_eviction_interval),
     ):
         yield
@@ -170,7 +178,8 @@ def _make_model_runner(
     mr.layer_info = SimpleNamespace(
         start_layer=0, end_layer=num_layers, num_effective_layers=num_layers
     )
-    mr.ps = ParallelState.trivial()
+    mr.attn_dp_size = 1
+    mr.pp_size = 1
     mr.pp_group = SimpleNamespace(rank_in_group=0)
     mr.spec_aux_config = SimpleNamespace(
         eagle_draft_num_layers=None,
@@ -1267,7 +1276,8 @@ class TestSWAPoolFloor(CustomTestCase):
             kv_cache_dtype_str="fp8_e4m3",
             model_config=cfg,
             layer_info=SimpleNamespace(start_layer=0, end_layer=40),
-            ps=SimpleNamespace(pp_size=1, attn_dp_size=1),
+            pp_size=1,
+            attn_dp_size=1,
             sliding_window_size=128,
             page_size=256,
             spec_algorithm=spec,
