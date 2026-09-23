@@ -540,19 +540,27 @@ fn match_validator_host_backed_nodes_extend_the_window() {
 }
 
 #[test]
-fn match_validator_hicache_accepts_live_or_backuped_swa_tombstones() {
-    let mut tc = swa_core(/* window = */ 2, /* page_size = */ 1);
-    tc.set_hicache_enabled();
-    let [live, backuped, dead] = chain(&mut tc);
-    tc.arena
-        .set_device_value(live, FULL, Tensor::from_slice(&[0i64]));
-    tc.arena
-        .set_host_value(backuped, FULL, Tensor::from_slice(&[0i64]));
-    let mut validator =
-        swa_component(2).create_match_validator(&tc, /* match_device_only = */ true);
-    assert!(validator(&tc, live));
-    assert!(validator(&tc, backuped));
-    assert!(!validator(&tc, dead));
+fn match_validator_request_ring_accepts_live_or_backuped_tombstones_without_a_tier_condition() {
+    for enable_hicache in [false, true] {
+        let params = CacheInitParams {
+            swa_req_ring: true,
+            enable_hicache,
+            ..swa_params_with_window(2)
+        };
+        let swa = SwaComponent::new(&params);
+        let mut tc = UnifiedTreeCore::new(params, vec![FULL, SWA]);
+        let [live, backuped, dead] = chain(&mut tc);
+        tc.arena
+            .set_device_value(live, FULL, Tensor::from_slice(&[0i64]));
+        tc.arena
+            .set_host_value(backuped, FULL, Tensor::from_slice(&[0i64]));
+        for device_only in [false, true] {
+            let mut validator = swa.create_match_validator(&tc, device_only);
+            assert!(validator(&tc, live));
+            assert!(validator(&tc, backuped));
+            assert!(!validator(&tc, dead));
+        }
+    }
 }
 
 #[test]
@@ -577,11 +585,9 @@ fn match_validator_hicache_with_a_host_pool_rejects_swa_tombstones() {
     let [live] = chain(&mut tc);
     tc.arena
         .set_device_value(live, FULL, Tensor::from_slice(&[0i64]));
-    // A wired host SWA pool means tombstones must gate the match again.
+    // A host pool cannot supply an SWA window whose nodes hold no host values.
     tc.set_has_swa_host_pool();
-    let swa = SwaComponent {
-        sliding_window_size: 2,
-    };
+    let swa = swa_component(2);
     let mut validator = <SwaComponent as TreeComponent<Vec<i64>>>::create_match_validator(
         &swa, &tc, /* match_device_only = */ true,
     );
@@ -589,19 +595,54 @@ fn match_validator_hicache_with_a_host_pool_rejects_swa_tombstones() {
 }
 
 #[test]
-fn match_validator_hicache_tombstone_acceptance_still_resets_the_window() {
+fn match_validator_request_ring_tombstone_acceptance_still_resets_the_window() {
     let mut tc = swa_core(/* window = */ 2, /* page_size = */ 1);
     tc.set_hicache_enabled();
     let [live, c] = chain(&mut tc);
     tc.arena
         .set_device_value(live, FULL, Tensor::from_slice(&[0i64]));
     set_swa_device(&mut tc, c);
-    let mut validator =
-        swa_component(2).create_match_validator(&tc, /* match_device_only = */ true);
+    let swa = SwaComponent::new(&CacheInitParams {
+        swa_req_ring: true,
+        ..swa_params_with_window(2)
+    });
+    let mut validator = swa.create_match_validator(&tc, /* match_device_only = */ true);
     // The accepted tombstone still zeroes the run: the next valued node
     // sits below the window.
     assert!(validator(&tc, live));
     assert!(!validator(&tc, c));
+}
+
+#[test]
+fn match_prefix_uses_request_ring_layout_instead_of_hicache_pool_presence() {
+    let key: Vec<i64> = (0..12).collect();
+    let values: Vec<i64> = (10..22).collect();
+    let prefix = key[..8].to_vec();
+    for (swa_req_ring, enable_hicache, has_swa_host_pool) in [
+        (false, false, false),
+        (true, false, false),
+        (false, true, false),
+        (false, true, true),
+        (true, true, false),
+    ] {
+        let mut tc = UnifiedTreeCore::new(
+            CacheInitParams {
+                swa_req_ring,
+                enable_hicache,
+                has_swa_host_pool,
+                ..swa_params_with_window(8)
+            },
+            vec![FULL, SWA],
+        );
+        tc.insert(&insert_params_swa(&key, &values, 0, 8));
+        let result = tc.match_prefix(&match_params(&prefix));
+        assert_eq!(result.full_kv_hit_length, 8);
+        let expected = if swa_req_ring { &values[..8] } else { &[] };
+        assert!(
+            result.device_indices.equal(&Tensor::from_slice(expected)),
+            "ring={swa_req_ring}, hicache={enable_hicache}, swa_host={has_swa_host_pool}"
+        );
+    }
 }
 
 // The SWA LRU order, MRU to LRU.
@@ -4879,9 +4920,9 @@ fn swa_host_eviction_skips_a_load_back_pinned_node() {
     let result = tc.drive_host_eviction(SWA, /* num_tokens = */ 1);
     assert_eq!(result.tracker[&SWA], 1);
     assert_eq!(result.host_frees[&SWA].len(), 1);
-    // Write-back reclaims the loaded node's coexisting host duplicate first.
-    assert!(tc.arena.has_host_value(a, SWA));
-    assert!(!tc.arena.has_host_value(b, SWA));
+    // Only the host-only LRU is reclaimed; the loaded node retains its backup.
+    assert!(!tc.arena.has_host_value(a, SWA));
+    assert!(tc.arena.has_host_value(b, SWA));
     tc.sanity_check(&[], &[]);
 }
 
@@ -4932,7 +4973,7 @@ fn build_load_back_spec_degrades_to_empty_on_a_foreign_pin() {
 }
 
 #[test]
-fn host_drive_reclaims_swa_coexisting_host_values_when_the_host_lru_is_empty() {
+fn host_drive_preserves_swa_coexisting_host_values_when_the_host_lru_is_empty() {
     let mut tc: UnifiedTreeCore<Vec<i64>> = UnifiedTreeCore::new(
         CacheInitParams {
             is_write_back: true,
@@ -4975,8 +5016,10 @@ fn host_drive_reclaims_swa_coexisting_host_values_when_the_host_lru_is_empty() {
         &mut df,
         &mut hf,
     );
-    assert_eq!(tracker[&SWA], 2);
-    assert!(!tc.arena.node(parent_idx).has_host_value(SWA));
+    assert_eq!(tracker[&SWA], 0);
+    assert!(hf.is_empty());
+    assert!(df.is_empty());
+    assert!(tc.arena.node(parent_idx).has_host_value(SWA));
     assert!(tc.arena.node(parent_idx).has_device_value(SWA));
     assert!(tc.arena.node(parent_idx).has_host_value(FULL));
     assert!(tc.arena.node(leaf_idx).has_host_value(SWA));
@@ -5097,10 +5140,12 @@ fn write_through_offloads_a_boundary_split_leaf() {
 }
 
 #[test]
-fn deep_swa_tree_survives_backup_evict_and_load_back_rounds() {
+fn deep_request_ring_tree_survives_full_backup_evict_and_load_back_rounds() {
     let mut tc: UnifiedTreeCore<Vec<i64>> = UnifiedTreeCore::new(
         CacheInitParams {
             enable_hicache: true,
+            // Only Full is backed up; the request rebuilds its SWA ring.
+            swa_req_ring: true,
             ..swa_params_with_window(4)
         },
         vec![FULL, SWA],

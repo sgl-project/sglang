@@ -440,6 +440,7 @@ pub struct TreeCoreInitParamsBinding {
     pub write_through_threshold: i64,
     pub device: String,
     pub swa_sliding_window_size: Option<usize>,
+    pub swa_req_ring: bool,
     pub enable_kv_cache_events: bool,
     pub mamba_cache_chunk_size: Option<usize>,
     pub mamba_max_states_per_path: Option<usize>,
@@ -457,6 +458,7 @@ impl TreeCoreInitParamsBinding {
             write_through_threshold: self.write_through_threshold,
             device: parse_device(&self.device)?,
             swa_sliding_window_size: self.swa_sliding_window_size,
+            swa_req_ring: self.swa_req_ring,
             // Wired post-construction via set_has_swa_host_pool.
             has_swa_host_pool: false,
             enable_kv_cache_events: self.enable_kv_cache_events,
@@ -469,7 +471,7 @@ impl TreeCoreInitParamsBinding {
 #[pymethods]
 impl TreeCoreInitParamsBinding {
     #[new]
-    #[pyo3(signature = (eviction_policy = "lru".to_string(), page_size = 1, is_write_back = false, enable_hicache = false, write_through_threshold = 256, device = "cpu".to_string(), swa_sliding_window_size = None, enable_kv_cache_events = false, mamba_cache_chunk_size = None, mamba_max_states_per_path = None, slru_protected_threshold = 2))]
+    #[pyo3(signature = (eviction_policy = "lru".to_string(), page_size = 1, is_write_back = false, enable_hicache = false, write_through_threshold = 256, device = "cpu".to_string(), swa_sliding_window_size = None, enable_kv_cache_events = false, mamba_cache_chunk_size = None, mamba_max_states_per_path = None, slru_protected_threshold = 2, swa_req_ring = false))]
     fn new(
         eviction_policy: String,
         page_size: usize,
@@ -482,6 +484,7 @@ impl TreeCoreInitParamsBinding {
         mamba_cache_chunk_size: Option<usize>,
         mamba_max_states_per_path: Option<usize>,
         slru_protected_threshold: i64,
+        swa_req_ring: bool,
     ) -> Self {
         TreeCoreInitParamsBinding {
             eviction_policy,
@@ -492,6 +495,7 @@ impl TreeCoreInitParamsBinding {
             write_through_threshold,
             device,
             swa_sliding_window_size,
+            swa_req_ring,
             enable_kv_cache_events,
             mamba_cache_chunk_size,
             mamba_max_states_per_path,

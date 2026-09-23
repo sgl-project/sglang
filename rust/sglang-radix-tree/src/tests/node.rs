@@ -1946,6 +1946,57 @@ fn iter_yields_all_members() {
     assert_eq!(members, vec![NodeIdx_(10), NodeIdx_(30)]);
 }
 
+#[test]
+fn ordered_node_set_preserves_survivors_and_appends_reinserted_slots() {
+    let mut set = InsertionOrderedNodeSet::new();
+    for slot in [10, 20, 30, 40, 20] {
+        set.add(NodeIdx_(slot));
+    }
+    assert_eq!(
+        set.iter().collect::<Vec<_>>(),
+        [10, 20, 30, 40].map(NodeIdx_)
+    );
+    set.discard(NodeIdx_(10));
+    set.discard(NodeIdx_(30));
+    set.discard(NodeIdx_(99));
+    set.add(NodeIdx_(10));
+    assert_eq!(set.iter().collect::<Vec<_>>(), [20, 40, 10].map(NodeIdx_));
+    assert!(!set.contains(NodeIdx_(30)));
+    for slot in [40, 20, 10] {
+        assert!(set.contains(NodeIdx_(slot)));
+        set.discard(NodeIdx_(slot));
+        assert!(!set.contains(NodeIdx_(slot)));
+    }
+    assert_eq!(set.iter().next(), None);
+    set.add(NodeIdx_(5));
+    assert_eq!(set.iter().collect::<Vec<_>>(), vec![NodeIdx_(5)]);
+}
+
+#[test]
+fn ordered_node_set_matches_insertion_order_after_mixed_updates() {
+    let mut set = InsertionOrderedNodeSet::new();
+    let mut expected = Vec::new();
+    for step in 0..512 {
+        let slot = NodeIdx_((step * 17 + step / 3) % 31);
+        if step % 4 == 0 {
+            set.discard(slot);
+            expected.retain(|&member| member != slot);
+        } else {
+            set.add(slot);
+            if !expected.contains(&slot) {
+                expected.push(slot);
+            }
+        }
+        assert_eq!(set.iter().collect::<Vec<_>>(), expected);
+        for index in 0..32 {
+            assert_eq!(
+                set.contains(NodeIdx_(index)),
+                expected.contains(&NodeIdx_(index))
+            );
+        }
+    }
+}
+
 // Pin Python/Rust storage hashes across a parent-child boundary.
 #[test]
 fn storage_hashes_match_python() -> Result<(), TreeCoreRuntimeError> {

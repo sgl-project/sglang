@@ -1083,6 +1083,51 @@ def test_host_duplicate_reclaim_override_preserves_normal_host_eviction():
     core.sanity_check([], [])
 
 
+@pytest.mark.parametrize("backend", ["python", "rust"])
+@pytest.mark.parametrize("backup_again", [False, True])
+def test_full_host_duplicates_preserve_backup_order(backend, backup_again):
+    from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+
+    with envs.SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND.override(backend):
+        cache = UnifiedRadixCache(
+            CacheInitParams(
+                disable=True,
+                req_to_token_pool=None,
+                token_to_kv_pool_allocator=None,
+                page_size=1,
+                tree_components=(ComponentType.FULL,),
+            )
+        )
+    core = cache.tree_core
+    core.set_hicache_enabled()
+    core.is_write_back = True
+    nodes = []
+    for index in range(3):
+        node = _insert(core, [index + 1], [index + 101]).last_device_node
+        core.commit_backup(node, torch.tensor([index + 1001]), {})
+        core.mark_write_through_pending([node], node)
+        core.finish_write_through([node], node)
+        nodes.append(node)
+
+    expected = [1001, 1002, 1003]
+    if backup_again:
+        expected.append(2001)
+    for index, expected_slot in enumerate(expected):
+        host_frees = {}
+        _accumulate_step(
+            core.drive_host_eviction(ComponentType.FULL, 1), {}, {}, host_frees
+        )
+        assert torch.cat(host_frees[ComponentType.FULL]).tolist() == [expected_slot]
+        if index == 0 and backup_again:
+            # A new backup rejoins after existing duplicates; it must not take
+            # the removed entry's old position or reorder the surviving nodes.
+            core.commit_backup(nodes[0], torch.tensor([2001]), {})
+            core.mark_write_through_pending([nodes[0]], nodes[0])
+            core.finish_write_through([nodes[0]], nodes[0])
+    assert all(not core.is_backuped(node) for node in nodes)
+    core.sanity_check([], [])
+
+
 @pytest.mark.parametrize("backed_up", [False, True])
 def test_device_eviction_counts_only_full_tokens_without_a_host_copy(backed_up):
     core = _mamba_tree_core()
@@ -1477,6 +1522,7 @@ def _swa_transfer_core(backend, unified=False):
         spec=UnifiedSWAAllocatorBase if unified else SWATokenToKVPoolAllocator
     )
     allocator.device = torch.device("cpu")
+    allocator.swa_req_ring = False
     params = CacheInitParams(
         disable=False,
         req_to_token_pool=None,
@@ -1502,6 +1548,63 @@ def _swa_transfer_core(backend, unified=False):
     core.set_hicache_enabled()
     core.has_swa_host_pool = True
     return core, allocator
+
+
+@pytest.mark.parametrize("backend", ["python", "rust"])
+@pytest.mark.parametrize("guard", ["none", "host_lock", "pending_dma"])
+def test_swa_host_pressure_retains_device_resident_backups(backend, guard):
+    core, allocator = _swa_transfer_core(backend)
+    allocator.translate_loc_from_full_to_swa.side_effect = lambda values: values + 100
+    core.is_write_back = True
+    nodes = []
+    for tokens, values in (([1, 2], [10, 11]), ([1, 2, 3], [20, 21, 12])):
+        result = _insert(core, tokens, values)
+        for action in result.cache_actions:
+            if isinstance(action, SWARebuild):
+                core.set_component_device_value(
+                    action.node_id,
+                    ComponentType.SWA,
+                    allocator.translate_loc_from_full_to_swa(action.source_value),
+                )
+            else:
+                assert isinstance(action, (FreeDeviceKV, FreeDeviceKVFullOnly))
+        nodes.append(result.last_device_node)
+    for node in nodes:
+        full, transfers = core.build_backup_spec(node)
+        for component_transfers in transfers.values():
+            for transfer in component_transfers:
+                transfer.host_indices = transfer.device_indices + 1000
+        core.commit_backup(node, full + 1000, transfers)
+        core.mark_write_through_pending([node], node)
+        core.finish_write_through([node], node)
+
+    if guard == "host_lock":
+        lock = core.inc_host_lock_ref(nodes[-1])
+    elif guard == "pending_dma":
+        core.mark_write_through_pending(nodes, nodes[-1])
+    tracker, device_frees, host_frees = {}, {}, {}
+    _accumulate_step(
+        core.drive_host_eviction(ComponentType.SWA, 2),
+        tracker,
+        device_frees,
+        host_frees,
+    )
+    assert tracker.get(ComponentType.SWA, 0) == 0
+    assert not device_frees and not host_frees
+    if guard == "host_lock":
+        core.dec_host_lock_ref(nodes[-1], lock.to_dec_params())
+    elif guard == "pending_dma":
+        core.finish_write_through(nodes, nodes[-1])
+
+    # Demotion makes the preserved SWA host copy the only copy. Ordinary host
+    # eviction must still reclaim that host-only tree under pressure.
+    for node in reversed(nodes):
+        _accumulate_step(core.demote(node), {}, {}, {})
+        assert core.component_has_host_value_only(node, ComponentType.SWA)
+    host_frees = {}
+    _accumulate_step(core.drive_host_eviction(ComponentType.SWA, 3), {}, {}, host_frees)
+    assert sum(t.numel() for t in host_frees[ComponentType.SWA]) == 3
+    core.sanity_check([], [])
 
 
 @pytest.mark.parametrize("backend", ["python", "rust"])
@@ -1751,8 +1854,8 @@ def test_write_back_load_back_ignores_auxiliary_nodes_for_pending_ownership():
     core.sanity_check([], [])
 
 
-def _swa_cache(window: int = 8, page_size: int = 1):
-    """A real UnifiedRadixCache on the Rust tree core with a real SWA allocator."""
+def _swa_cache(window: int = 8, page_size: int = 1, backend="rust", ring=False):
+    """A real UnifiedRadixCache and SWA allocator, defaulting to the Rust core."""
     from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
     from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
     from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
@@ -1776,6 +1879,8 @@ def _swa_cache(window: int = 8, page_size: int = 1):
         full_attention_layer_ids=[1],
         device="cpu",
     )
+    if ring:
+        kv_pool.swa_req_ring_size = window
     allocator = SWATokenToKVPoolAllocator(
         size=64,
         size_swa=64,
@@ -1784,8 +1889,9 @@ def _swa_cache(window: int = 8, page_size: int = 1):
         device="cpu",
         kvcache=kv_pool,
         need_sort=False,
+        req_to_token_pool=req_to_token_pool,
     )
-    with envs.SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND.override("rust"):
+    with envs.SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND.override(backend):
         cache = UnifiedRadixCache(
             params=CacheInitParams(
                 req_to_token_pool=req_to_token_pool,
@@ -1797,6 +1903,37 @@ def _swa_cache(window: int = 8, page_size: int = 1):
             )
         )
     return cache, allocator
+
+
+@pytest.mark.parametrize("backend", ["python", "rust"])
+@pytest.mark.parametrize(
+    "ring,hicache,has_swa_host_pool",
+    [
+        (False, False, False),
+        (True, False, False),
+        (False, True, False),
+        (False, True, True),
+        (True, True, False),
+    ],
+)
+def test_swa_match_uses_allocator_layout(backend, ring, hicache, has_swa_host_pool):
+    # #38269: a request ring rebuilds its SWA window outside the tree, while
+    # paged SWA requires resident state even if HiCache has no SWA host pool
+    # (for example DSV4.1 encoder replay with DSpark, #38798).
+    cache, allocator = _swa_cache(backend=backend, ring=ring)
+    assert type(cache.tree_core).__name__ == (
+        "RustUnifiedTreeCore" if backend == "rust" else "UnifiedTreeCore"
+    )
+    indices = allocator.alloc(12)
+    cache.insert(
+        InsertParams(key=_key(list(range(12))), value=indices, swa_evicted_seqlen=8)
+    )
+    if hicache:
+        cache.tree_core.set_hicache_enabled()
+    cache.tree_core.has_swa_host_pool = has_swa_host_pool
+    matched = cache.match_prefix(MatchPrefixParams(key=_key(list(range(8)))))
+    assert matched.full_kv_hit_length == 8
+    assert matched.device_indices.tolist() == (indices[:8].tolist() if ring else [])
 
 
 def test_buffer_backup_snapshot_round_trips_and_detects_a_split():

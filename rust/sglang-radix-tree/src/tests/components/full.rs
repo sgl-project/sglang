@@ -424,6 +424,49 @@ fn host_drive_reclaims_coexisting_host_values_while_sparing_the_device_leaf() {
 }
 
 #[test]
+fn host_reclaim_keeps_insertion_order_across_calls_and_rebackup() {
+    let mut tc = write_back_core();
+    let mut handles = Vec::new();
+    for token in 1..=3i64 {
+        let key = vec![token];
+        insert(&mut tc, &key, &[token + 100]);
+        let handle = tc.match_prefix(&match_params(&key)).best_match_node_id;
+        tc.commit_backup(handle, Tensor::from_slice(&[token + 1000]), HashMap::new())
+            .expect("live test node");
+        tc.mark_write_through_pending(vec![handle], handle).unwrap();
+        tc.finish_write_through(vec![handle], handle).unwrap();
+        handles.push(handle);
+    }
+
+    for expected_host_slot in [1001, 1002, 1003, 2001] {
+        let step = tc.drive_host_eviction(FULL, 1);
+        assert_eq!(step.tracker[&FULL], 1);
+        assert!(step.device_frees.is_empty());
+        assert_eq!(step.host_frees[&FULL].len(), 1);
+        assert_eq!(
+            step.host_frees[&FULL][0].int64_value(&[0]),
+            expected_host_slot
+        );
+        if expected_host_slot == 1001 {
+            // A new host copy of the reclaimed slot joins behind the surviving
+            // duplicates. Refreshing another settled member must not move it.
+            tc.commit_backup(handles[0], Tensor::from_slice(&[2001i64]), HashMap::new())
+                .unwrap();
+            tc.mark_write_through_pending(vec![handles[0]], handles[0])
+                .unwrap();
+            tc.finish_write_through(vec![handles[0]], handles[0])
+                .unwrap();
+            tc.mark_write_through_pending(vec![handles[1]], handles[1])
+                .unwrap();
+            tc.finish_write_through(vec![handles[1]], handles[1])
+                .unwrap();
+        }
+        tc.sanity_check(&[], &[]);
+    }
+    assert!(tc.full_coexisting_host_nodes.iter().next().is_none());
+}
+
+#[test]
 fn host_drive_spares_coexisting_host_values_under_an_in_flight_transfer() {
     let mut tc = write_back_core();
     insert(&mut tc, &vec![1, 2], &[10, 11]);

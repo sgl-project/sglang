@@ -1623,6 +1623,90 @@ impl EvictableNodeSet {
         self.nodes.is_empty()
     }
 }
+
+/// Insertion-ordered membership for Full host duplicates. Unlike the dense
+/// leaf sets, removal must preserve the next host-reclaim victim's position.
+/// Links are indexed by arena slot: membership/removal are O(1), insertion is
+/// amortized O(1), and iteration visits only current members.
+pub struct InsertionOrderedNodeSet {
+    links: Vec<Option<(NodeIdx_, NodeIdx_)>>,
+    head: NodeIdx_,
+    tail: NodeIdx_,
+}
+
+impl Default for InsertionOrderedNodeSet {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl InsertionOrderedNodeSet {
+    const END: NodeIdx_ = NodeIdx_(usize::MAX);
+
+    pub fn new() -> Self {
+        Self {
+            links: Vec::new(),
+            head: Self::END,
+            tail: Self::END,
+        }
+    }
+
+    pub fn contains(&self, node_id: NodeIdx_) -> bool {
+        self.links.get(node_id.0).is_some_and(Option::is_some)
+    }
+
+    /// Existing membership keeps its position; a removed/reinserted slot is
+    /// appended, matching assignment to Python's insertion-ordered dict.
+    pub fn add(&mut self, node_id: NodeIdx_) {
+        assert_ne!(
+            node_id,
+            Self::END,
+            "node slot is reserved for the set sentinel"
+        );
+        if node_id.0 >= self.links.len() {
+            self.links.resize(node_id.0 + 1, None);
+        }
+        if self.links[node_id.0].is_some() {
+            return;
+        }
+        self.links[node_id.0] = Some((self.tail, Self::END));
+        if self.tail == Self::END {
+            self.head = node_id;
+        } else {
+            self.links[self.tail.0].as_mut().unwrap().1 = node_id;
+        }
+        self.tail = node_id;
+    }
+
+    pub fn discard(&mut self, node_id: NodeIdx_) {
+        let Some((prev, next)) = self.links.get_mut(node_id.0).and_then(Option::take) else {
+            return;
+        };
+        if prev == Self::END {
+            self.head = next;
+        } else {
+            self.links[prev.0].as_mut().unwrap().1 = next;
+        }
+        if next == Self::END {
+            self.tail = prev;
+        } else {
+            self.links[next.0].as_mut().unwrap().0 = prev;
+        }
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = NodeIdx_> + '_ {
+        let mut current = self.head;
+        std::iter::from_fn(move || {
+            if current == Self::END {
+                return None;
+            }
+            let node_id = current;
+            current = self.links[node_id.0].unwrap().1;
+            Some(node_id)
+        })
+    }
+}
+
 #[cfg(test)]
 #[path = "tests/node.rs"]
 mod tests;

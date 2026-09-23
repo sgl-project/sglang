@@ -14,10 +14,10 @@ use crate::components::{
 use crate::components::{
     BASE_COMPONENT_TYPE, ComponentType, FULL, MAMBA, NUM_COMPONENT_TYPES, SWA,
 };
-use crate::node::EvictableNodeSet;
 use crate::node::Node;
 use crate::node::NodeArena;
 use crate::node::{ChildKeyType, HashDigest, KeyNamespace, KeyNamespaceRef};
+use crate::node::{EvictableNodeSet, InsertionOrderedNodeSet};
 use crate::node::{
     NUM_VALUE_SLOTS, NodeAccessError, NodeId, NodeIdx_, TreeCoreRuntimeError, ValueSlotIdx,
 };
@@ -512,6 +512,8 @@ pub struct CacheInitParams {
     pub device: Device,
     /// SWA sliding window size in tokens; None when SWA is disabled.
     pub swa_sliding_window_size: Option<usize>,
+    /// Whether SWA lives in a per-request ring rather than cached paged slots.
+    pub swa_req_ring: bool,
     /// Whether the cache wired a host SWA pool (HiCache).
     pub has_swa_host_pool: bool,
     /// Whether tree mutations emit BlockStored/BlockRemoved events.
@@ -533,6 +535,7 @@ impl Default for CacheInitParams {
             write_through_threshold: 256,
             device: Device::Cpu,
             swa_sliding_window_size: None,
+            swa_req_ring: false,
             has_swa_host_pool: false,
             enable_kv_cache_events: false,
             mamba_cache_chunk_size: None,
@@ -570,8 +573,8 @@ pub struct UnifiedTreeCore<K: ChildKeyType> {
     pub(crate) evictable_device_leaves: EvictableNodeSet,
     /// Nodes currently eligible for host eviction (H-leaves).
     pub(crate) evictable_host_leaves: EvictableNodeSet,
-    /// Full has no device LRU, so track nodes whose device and host values coexist.
-    pub(crate) full_coexisting_host_nodes: EvictableNodeSet,
+    /// Full has no device LRU; track host/device duplicates in insertion order.
+    pub(crate) full_coexisting_host_nodes: InsertionOrderedNodeSet,
     pub(crate) write_back_coexist_reclaim_digest: i64,
     /// Present only during a device-eviction step, including its cascades.
     tracked_unbacked_tokens: Option<usize>,
@@ -768,7 +771,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             component_states: Default::default(),
             evictable_device_leaves: EvictableNodeSet::new(),
             evictable_host_leaves: EvictableNodeSet::new(),
-            full_coexisting_host_nodes: EvictableNodeSet::new(),
+            full_coexisting_host_nodes: InsertionOrderedNodeSet::new(),
             write_back_coexist_reclaim_digest: 0,
             tracked_unbacked_tokens: None,
             // Disabled components keep harmless empty lists, like component_states.
@@ -812,7 +815,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         self.component_states = Default::default();
         self.evictable_device_leaves = EvictableNodeSet::new();
         self.evictable_host_leaves = EvictableNodeSet::new();
-        self.full_coexisting_host_nodes = EvictableNodeSet::new();
+        self.full_coexisting_host_nodes = InsertionOrderedNodeSet::new();
         self.write_back_coexist_reclaim_digest = 0;
         self.tracked_unbacked_tokens = None;
         self.lru_lists = Self::new_lru_lists();
@@ -2520,7 +2523,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
     }
 
     /// Skip Full duplicate reclaim when requested by the controller, while
-    /// retaining auxiliary reclaim and the normal host-leaf eviction walk.
+    /// preserving the normal host-leaf eviction walk.
     pub fn drive_host_eviction_with_options(
         &mut self,
         component_type: ComponentType,
