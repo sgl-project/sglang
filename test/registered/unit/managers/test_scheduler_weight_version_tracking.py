@@ -135,19 +135,12 @@ class TestRecordWeightVersionAfterUpdate(CustomTestCase):
         )
 
     def _runner_updater(self, target_result):
-        """Manager over one target runner; a failed load surfaces as a raise."""
         self.recorded = []
-        success, message = target_result
-
-        def load_weights(weights):
-            if not success:
-                raise RuntimeError(message)
-
         runner = SimpleNamespace(
             tp_rank=0,
-            model=SimpleNamespace(load_weights=load_weights),
             weight_updater=SimpleNamespace(
-                receive_weights_from_distributed=lambda *args: [],
+                receive_weights_from_distributed=lambda **kwargs: [],
+                load_weights_from_distributed=lambda weights: target_result,
                 update_weights_from_tensor=lambda **kwargs: target_result,
             ),
         )

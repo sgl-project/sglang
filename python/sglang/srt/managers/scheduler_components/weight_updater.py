@@ -185,24 +185,26 @@ class SchedulerWeightUpdaterManager:
             )
         with self._observe_weight_load("distributed"):
             # only the target runner joined the update group; drafts load its receive
+            target = self.tp_worker.model_runner.weight_updater
             try:
-                weights = self.tp_worker.model_runner.weight_updater.receive_weights_from_distributed(
-                    recv_req.names,
-                    recv_req.dtypes,
-                    recv_req.shapes,
-                    recv_req.group_name,
-                    recv_req.load_format,
+                weights = target.receive_weights_from_distributed(
+                    names=recv_req.names,
+                    dtypes=recv_req.dtypes,
+                    shapes=recv_req.shapes,
+                    group_name=recv_req.group_name,
+                    load_format=recv_req.load_format,
                 )
-                for _, runner in self._select_runners(recv_req.selector):
-                    runner.model.load_weights(weights)
-                success, message = True, "Succeeded to update parameter online."
             except Exception as e:
-                success = False
-                message = (
-                    f"Failed to update parameter online: {e}. The full weights of the "
-                    "ModelRunner are partially updated. Please discard the whole weights."
-                )
+                success, message = False, f"Failed to receive weights: {e}"
                 logger.error(message)
+            else:
+                success, message = True, "Succeeded to update parameter online."
+                for _, runner in self._select_runners(recv_req.selector):
+                    success, message = (
+                        runner.weight_updater.load_weights_from_distributed(weights)
+                    )
+                    if not success:
+                        break
             if success:
                 self._session_loaded_weights = True
                 self.flush_cache_after_weight_update(recv_req)

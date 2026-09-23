@@ -48,7 +48,9 @@ def test_scheduler_distributed_update_receives_once_on_target_loads_into_each():
     weights = object()
     target_runner = Mock()
     target_runner.weight_updater.receive_weights_from_distributed.return_value = weights
+    target_runner.weight_updater.load_weights_from_distributed.return_value = (True, "")
     draft_runner = Mock()
+    draft_runner.weight_updater.load_weights_from_distributed.return_value = (True, "")
     manager = _manager(
         tp_worker=SimpleNamespace(
             model_runner=target_runner,
@@ -63,14 +65,19 @@ def test_scheduler_distributed_update_receives_once_on_target_loads_into_each():
 
     assert output.success is True
     target_runner.weight_updater.receive_weights_from_distributed.assert_called_once_with(
-        ["model.layers.0.weight"],
-        ["float32"],
-        [[1]],
-        "weight_update_group",
-        None,
+        names=["model.layers.0.weight"],
+        dtypes=["float32"],
+        shapes=[[1]],
+        group_name="weight_update_group",
+        load_format=None,
     )
-    target_runner.model.load_weights.assert_called_once_with(weights)
-    draft_runner.model.load_weights.assert_called_once_with(weights)
+    target_runner.weight_updater.load_weights_from_distributed.assert_called_once_with(
+        weights
+    )
+    draft_runner.weight_updater.load_weights_from_distributed.assert_called_once_with(
+        weights
+    )
+    draft_runner.weight_updater.receive_weights_from_distributed.assert_not_called()
 
 
 def test_scheduler_distributed_update_target_only_selector_skips_draft():
@@ -78,6 +85,7 @@ def test_scheduler_distributed_update_target_only_selector_skips_draft():
     weights = object()
     target_runner = Mock()
     target_runner.weight_updater.receive_weights_from_distributed.return_value = weights
+    target_runner.weight_updater.load_weights_from_distributed.return_value = (True, "")
     draft_worker = Mock()
     manager = _manager(
         tp_worker=SimpleNamespace(
@@ -93,7 +101,9 @@ def test_scheduler_distributed_update_target_only_selector_skips_draft():
 
     assert output.success is True
     target_runner.weight_updater.receive_weights_from_distributed.assert_called_once()
-    target_runner.model.load_weights.assert_called_once_with(weights)
+    target_runner.weight_updater.load_weights_from_distributed.assert_called_once_with(
+        weights
+    )
     draft_worker.weight_update_runners.assert_not_called()
 
 
