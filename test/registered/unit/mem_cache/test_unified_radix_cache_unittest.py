@@ -816,6 +816,65 @@ class TestUnifiedRadixAllocationEvictionRealComponents(CustomTestCase):
                     self.assertEqual(evicted, first_size)
                     cache.sanity_check()
 
+    def test_swa_allocation_eviction_skips_stale_component_mapping(self):
+        """A logically live SWA node whose mapping is already tombstoned must
+        not consume the physical eviction quota.
+
+        This models an out-of-window SWA release racing ahead of tree metadata:
+        the first LRU victim contributes no allocator capacity, so allocation-
+        aware eviction must continue to the next live victim.
+        """
+        cfg = CacheConfig(
+            page_size=4,
+            components=(ComponentType.FULL, ComponentType.SWA),
+            sliding_window_size=4,
+            kv_size=64,
+        )
+        cache, allocator, req_to_token_pool = build_fixture(cfg)
+
+        def insert_paged(tokens):
+            full = allocator.full_attn_allocator.alloc(len(tokens))
+            swa = allocator.swa_attn_allocator.alloc(len(tokens))
+            self.assertIsNotNone(full)
+            self.assertIsNotNone(swa)
+            allocator.set_full_to_swa_mapping(full, swa)
+            cache.insert(
+                InsertParams(
+                    key=RadixKey(array("q", tokens)),
+                    value=full,
+                )
+            )
+
+        first_tokens = list(range(1, 9))
+        insert_paged(first_tokens)
+        first = cache.match_prefix(
+            MatchPrefixParams(key=RadixKey(array("q", first_tokens)))
+        ).last_device_node
+        first_full = _device_value(cache, first, ComponentType.FULL)
+
+        # Leave the tree component in place while tombstoning its allocator
+        # mapping, reproducing the stale-accounting state seen under SWA pressure.
+        allocator.free_swa(first_full)
+
+        # Keep some SWA capacity outside the tree, then add a second, genuinely
+        # reclaimable node behind the stale node in LRU order.
+        held_full = allocator.full_attn_allocator.alloc(8)
+        held_swa = allocator.swa_attn_allocator.alloc(8)
+        self.assertIsNotNone(held_full)
+        self.assertIsNotNone(held_swa)
+        allocator.set_full_to_swa_mapping(held_full, held_swa)
+        insert_paged(list(range(101, 109)))
+
+        available_before = allocator.swa_available_size()
+        result = cache.evict_for_alloc(EvictParams(swa_num_tokens=8))
+
+        self.assertEqual(result.swa_num_tokens_evicted, 8)
+        self.assertEqual(allocator.swa_available_size(), available_before + 8)
+        self.assertIsNotNone(
+            allocator.swa_attn_allocator.alloc(available_before + 8),
+            "the allocation that triggered eviction must now fit",
+        )
+
     def test_explicit_evict_continues_across_internal_steps(self):
         for component_type in (ComponentType.SWA, ComponentType.MAMBA):
             for enable_session_radix_cache in _session_radix_cache_test_values():

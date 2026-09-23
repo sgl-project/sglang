@@ -665,14 +665,46 @@ class SWAComponent(TreeComponent):
 
         # Device layer
         if EvictLayer.DEVICE in target and cd.value is not None:
-            # Pass full indices to free_swa so slots with no SWA pair are
-            # skipped. Freeing swa_value directly would double free those
-            # entries since they all map to the same sentinel slot.
-            device_frees[self.component_type].append(
-                node.component_data[BASE_COMPONENT_TYPE].value
+            # The component value is a snapshot of the SWA translation taken
+            # when the node was inserted. Window eviction can tombstone the
+            # current Full->SWA mapping afterwards, so len(cd.value) is only the
+            # logical component length -- it is not necessarily the number of
+            # physical SWA slots this eviction can reclaim.
+            #
+            # Count the live entries from the current mapping before queuing the
+            # free. This keeps the eviction tracker honest: otherwise a node full
+            # of sentinel mappings can satisfy the logical quota while releasing
+            # no allocator capacity, causing the following allocation to fail.
+            full_value = node.component_data[BASE_COMPONENT_TYPE].value
+            assert full_value is not None, (
+                f"{ct}: live SWA component on node {node.id} has no Full value"
             )
-            freed = len(cd.value)
-            self.tree_core.component_evictable_size_[ct] -= freed
+            current_swa_value = self._translate_full_to_swa(full_value)
+            live_mask = current_swa_value > 0
+            page_size = self.cache.token_to_kv_pool_allocator.page_size
+            assert full_value.numel() % page_size == 0
+            if page_size > 1:
+                # Paged SWA ownership is all-or-none for each Full page. Keep
+                # only fully live pages so free_swa_segment() never receives a
+                # tombstoned representative (the allocator intentionally fails
+                # loud on that ownership violation).
+                live_by_page = live_mask.reshape(-1, page_size)
+                live_pages = live_by_page.all(dim=1)
+                assert torch.equal(live_pages, live_by_page.any(dim=1)), (
+                    f"{ct}: node {node.id} has a partially mapped SWA page"
+                )
+                live_full_value = full_value.reshape(-1, page_size)[live_pages].reshape(
+                    -1
+                )
+            else:
+                live_full_value = full_value[live_mask]
+            freed = live_full_value.numel()
+
+            # Queue only currently owned peers. The allocator's segment free is
+            # strict and must not receive padding/tombstone mappings.
+            if freed:
+                device_frees[self.component_type].append(live_full_value)
+            self.tree_core.component_evictable_size_[ct] -= len(cd.value)
             cd.value = None
 
         # Host layer
