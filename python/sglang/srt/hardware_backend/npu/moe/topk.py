@@ -127,6 +127,10 @@ def fused_topk_npu(
     if expert_location_dispatch_info is not None:
         topk_ids = topk_ids_logical_to_physical(topk_ids, expert_location_dispatch_info)
     get_global_expert_distribution_recorder().on_select_experts(topk_ids=topk_ids)
-    capture_routed_experts_if_allowed(topk_config, layer_id, topk_ids)
+    capture_routed_experts_if_allowed(
+        topk_config.allow_routed_experts_capture,
+        layer_id,
+        topk_ids,
+    )
 
     return StandardTopKOutput(topk_weights, topk_ids, router_logits)
