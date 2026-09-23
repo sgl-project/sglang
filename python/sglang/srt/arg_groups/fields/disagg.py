@@ -121,6 +121,13 @@ class Disagg(msgspec.Struct):
     optimistic_prefill_attempts: A[
         int, "Number of optimistic prefill forward passes that skip the bootstrap wait."
     ] = 0
+    dsv41_encoder_only_prefill: A[
+        bool,
+        "Experimental DeepSeek-V4.1 asymmetric P/D mode. The prefill worker "
+        "runs through the layer-20 global-cache producer without sampling; "
+        "the decode worker reconstructs request-local state by replaying the "
+        "last 128 prompt tokens and samples the first output token.",
+    ] = False
 
     # -------------------------------------------------------------------------
     # Encode prefill disaggregation

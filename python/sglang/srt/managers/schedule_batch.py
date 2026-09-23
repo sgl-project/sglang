@@ -1038,6 +1038,9 @@ class Req(ReqDllmMixin):
         # full_untruncated_fill_ids from lengths alone, so in-place rewrites
         # that preserve length would silently corrupt fill_ids.
         self.output_ids = array("q")
+        # Set on the decode worker when an asymmetric DeepSeek-V4.1 prefill
+        # transfers cache without a sampled handoff token.
+        self.dsv41_cache_only_replay = False
         # Full untruncated sequence: origin + output (+ DLLM mask block).
         # Kept in sync by _refresh_fill_ids; admission only updates
         # extend_range, never mutates this array's length.
@@ -2392,6 +2395,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # of each request's first extend token (NgramEmbeddingManager).
     engram_history: Optional[torch.Tensor] = None
     encoder_swa_reset: Optional[List[bool]] = None
+    dsv41_cache_only_replay: bool = False
 
     req_pool_indices: torch.Tensor = None  # shape: [b], int64
     seq_lens: torch.Tensor = None  # shape: [b], int64
@@ -2750,7 +2754,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                         "encoder SWA replay cannot return cached prompt logprobs"
                     )
             self.encoder_swa_reset = [
-                r.kv.req_pool_idx is None or r.is_retracted for r in reqs
+                self.dsv41_cache_only_replay
+                or r.kv.req_pool_idx is None
+                or r.is_retracted
+                for r in reqs
             ]
         # Allocate memory
         out_cache_loc, req_pool_indices_tensor, req_pool_indices_cpu = alloc_for_extend(
@@ -3507,6 +3514,16 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         )
 
     def prepare_for_decode(self):
+        # Cache-only EXTEND is a one-shot reconstruction pass.  Clear both the
+        # batch marker and its request copies before constructing any DECODE
+        # ForwardBatch; otherwise ratio-2 producer logic keeps treating every
+        # subsequent decode token as replay state, and a retracted request can
+        # be re-admitted through the cache-only queue path.
+        if self.dsv41_cache_only_replay:
+            self.dsv41_cache_only_replay = False
+            for req in self.reqs:
+                req.dsv41_cache_only_replay = False
+
         self.forward_mode = ForwardMode.DECODE
         self.mamba_track_seqlens_cpu = None
         self.mamba_prefill_track_mask_cpu = None
@@ -3811,6 +3828,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             after_idle_gap=self.after_idle_gap,
             split_prefill_start=self.split_prefill_start,
             extend_num_tokens=self.extend_num_tokens,
+            dsv41_cache_only_replay=self.dsv41_cache_only_replay,
         )
 
     def maybe_evict_swa(self):

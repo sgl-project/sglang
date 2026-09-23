@@ -1174,10 +1174,14 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         assert self.full_to_swa_index_mapping is not None
         return self.full_to_swa_index_mapping[kv_indices]
 
-    def get_contiguous_buf_infos(self) -> Tuple[List[int], List[int], List[int]]:
+    def _get_transfer_buf_infos(
+        self, ratios: Optional[Sequence[int]] = None
+    ) -> Tuple[List[int], List[int], List[int]]:
         data_ptrs: List[int] = []
         data_lens: List[int] = []
         item_lens: List[int] = []
+
+        selected_ratios = None if ratios is None else set(ratios)
 
         if self._unified_kv_fp8:
             # The page-block transfer below prices one row as buf[0].nbytes and
@@ -1201,6 +1205,8 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         # Registration order defines the PD wire layout: C4 KV, C4 indexer, C128 KV.
         # Keep each indexer immediately after the KV buffers of the same ratio.
         for ratio, kv_pool in self.kv_pools.items():
+            if selected_ratios is not None and ratio not in selected_ratios:
+                continue
             if self._unified_kv:
                 # Unified buffers store token rows after the SWA ring. Transfer
                 # compressed pages from the offset; SWA ships as StateType.SWA_RING.
@@ -1243,6 +1249,84 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
                 item_lens.append(buf[0].nbytes * index_pages_per_full_page)
 
         return data_ptrs, data_lens, item_lens
+
+    def get_contiguous_buf_infos(self) -> Tuple[List[int], List[int], List[int]]:
+        return self._get_transfer_buf_infos()
+
+    def _validate_encoder_only_transfer_profile(self) -> None:
+        """Fail before registering a partial or ambiguously paired wire layout."""
+        expected_sources = sorted(self.kv_source_layers)
+        actual_sources = sorted(
+            source
+            for ratio in (1, 2)
+            for source in self.sources_by_ratio.get(ratio, ())
+        )
+        if actual_sources != expected_sources:
+            raise RuntimeError(
+                "encoder-only transfer requires every configured Main-KV source "
+                f"to use ratio 1/2: expected={expected_sources}, actual={actual_sources}"
+            )
+        for ratio in (1, 2):
+            sources = self.sources_by_ratio.get(ratio, ())
+            if not sources:
+                continue
+            kv_pool = self.kv_pools.get(ratio)
+            index_pool = self.index_pools.get(ratio)
+            index_buffers = (
+                index_pool.contiguous_page_row_buffers()
+                if index_pool is not None
+                else ()
+            )
+            if (
+                kv_pool is None
+                or len(kv_pool.kv_buffer) != len(sources)
+                or not index_buffers
+                or len(index_buffers) % len(sources) != 0
+            ):
+                raise RuntimeError(
+                    "encoder-only transfer requires matching Main-KV and "
+                    f"Indexer-K owner groups for ratio {ratio}"
+                )
+
+    def get_encoder_only_transfer_buf_infos(
+        self,
+    ) -> Tuple[List[int], List[int], List[int]]:
+        """Return only global Main-KV and owner Indexer-K wire regions."""
+        self._validate_encoder_only_transfer_profile()
+        infos = self._get_transfer_buf_infos((1, 2))
+        layer_ids = self.get_encoder_only_transfer_layer_ids()
+        if any(len(items) != len(layer_ids) for items in infos):
+            raise RuntimeError(
+                "encoder-only transfer buffer entries and layer IDs are misaligned"
+            )
+        return infos
+
+    def get_encoder_only_transfer_layer_ids(self) -> List[int]:
+        """Layer ids aligned with :meth:`get_encoder_only_transfer_buf_infos`."""
+        self._validate_encoder_only_transfer_profile()
+        layer_ids: List[int] = []
+        for ratio in self.kv_pools:
+            if ratio not in (1, 2):
+                continue
+            sources = list(self.sources_by_ratio.get(ratio, ()))
+            if not sources:
+                continue
+            kv_pool = self.kv_pools.get(ratio)
+            if kv_pool is not None:
+                if len(kv_pool.kv_buffer) != len(sources):
+                    raise RuntimeError(
+                        f"ratio-{ratio} Main-KV entries do not match source layers"
+                    )
+                layer_ids.extend(sources)
+            index_pool = self.index_pools.get(ratio)
+            if index_pool is not None:
+                count = len(index_pool.contiguous_page_row_buffers())
+                if count % len(sources) != 0:
+                    raise RuntimeError(
+                        f"ratio-{ratio} Indexer-K entries do not match source layers"
+                    )
+                layer_ids.extend(sources * (count // len(sources)))
+        return layer_ids
 
     def get_unified_swa_ring_buf_infos(self) -> Tuple[List[int], List[int], List[int]]:
         # StateType.SWA_RING transfers [0, swa_pages) of each unified_kv layer;

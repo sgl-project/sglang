@@ -9,6 +9,8 @@ from sglang.kernels.ops.attention.dsv4.kv_layout import (
     KVLayout,
     is_valid_kv_layout_pair,
 )
+from sglang.srt.managers.schedule_batch import ReqKvInfo
+from sglang.srt.mem_cache.allocation import alloc_for_extend
 from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
     DeepSeekV4SingleKVPool,
@@ -217,6 +219,133 @@ class TestDSV4CompressedPools(CustomTestCase):
         self.assertEqual(pool.get_index_k_page_size(4), 32)
         with self.assertRaisesRegex(AssertionError, "No indexer pool"):
             pool.get_index_k_page_size(128)
+
+    @staticmethod
+    def _make_encoder_only_pool(*, missing_index=False):
+        pool = DeepSeekV4TokenToKVPool.__new__(DeepSeekV4TokenToKVPool)
+        pool._unified_kv = False
+        pool._unified_kv_fp8 = False
+        pool.page_size = 8
+        pool._stage_start = 0
+        pool._stage_end = 8
+        pool.compression_ratios = [0, 0, 1, 0, 4, 0, 2, 128]
+        pool.kv_source_layers = [2, 6]
+        pool.sources_by_ratio = {4: [4], 128: [7], 1: [2], 2: [6]}
+
+        def kv_pool(width):
+            return SimpleNamespace(
+                kv_buffer=[torch.empty((3, width), dtype=torch.uint8)]
+            )
+
+        def index_pool(width):
+            buffers = (
+                []
+                if missing_index
+                else [
+                    torch.empty((3, width), dtype=torch.uint8),
+                    torch.empty((3, 1), dtype=torch.uint8),
+                ]
+            )
+            return SimpleNamespace(
+                page_size=2,
+                contiguous_page_row_buffers=lambda: buffers,
+            )
+
+        # Include unrelated C4/C128 buffers to prove the profile excludes them.
+        pool.kv_pools = {
+            4: kv_pool(40),
+            128: kv_pool(80),
+            1: kv_pool(10),
+            2: kv_pool(20),
+        }
+        pool.index_pools = {
+            4: index_pool(4),
+            1: index_pool(5),
+            2: index_pool(6),
+        }
+        return pool
+
+    def test_encoder_only_transfer_selects_global_main_and_indexer(self):
+        pool = self._make_encoder_only_pool()
+        data_ptrs, data_lens, item_lens = pool.get_encoder_only_transfer_buf_infos()
+        entries = list(zip(data_ptrs, data_lens, item_lens))
+
+        expected = []
+        for ratio in (1, 2):
+            kv = pool.kv_pools[ratio].kv_buffer[0]
+            expected.append((kv.data_ptr(), kv.nbytes, kv[0].nbytes))
+            index_pages_per_full_page = (pool.page_size // ratio) // 2
+            for buf in pool.index_pools[ratio].contiguous_page_row_buffers():
+                expected.append(
+                    (
+                        buf.data_ptr(),
+                        buf.nbytes,
+                        buf[0].nbytes * index_pages_per_full_page,
+                    )
+                )
+
+        self.assertEqual(entries, expected)
+        self.assertEqual(pool.get_encoder_only_transfer_layer_ids(), [2, 2, 2, 6, 6, 6])
+        self.assertNotIn(pool.kv_pools[4].kv_buffer[0].data_ptr(), data_ptrs)
+        self.assertNotIn(pool.kv_pools[128].kv_buffer[0].data_ptr(), data_ptrs)
+
+    def test_encoder_only_transfer_rejects_missing_indexer_owner(self):
+        pool = self._make_encoder_only_pool(missing_index=True)
+        with self.assertRaisesRegex(RuntimeError, "Indexer-K owner groups"):
+            pool.get_encoder_only_transfer_buf_infos()
+
+
+class TestDSV41CacheOnlyReplayAllocation(unittest.TestCase):
+    @staticmethod
+    def _batch(prompt_len, replay_start, *, req_pool_idx=1, allocated_len=None):
+        pool = SimpleNamespace(
+            req_to_token=torch.arange(3 * 256, dtype=torch.int32).reshape(3, 256)
+        )
+        req = SimpleNamespace(
+            kv=ReqKvInfo(
+                req_pool_idx=req_pool_idx,
+                kv_allocated_len=(
+                    prompt_len if allocated_len is None else allocated_len
+                ),
+                kv_committed_len=0,
+            ),
+            extend_range=SimpleNamespace(start=replay_start, end=prompt_len),
+        )
+        allocator = MagicMock()
+        batch = SimpleNamespace(
+            dsv41_cache_only_replay=True,
+            device="cpu",
+            reqs=[req],
+            req_to_token_pool=pool,
+            token_to_kv_pool_allocator=allocator,
+        )
+        return batch, req, allocator
+
+    def test_reuses_preallocated_prompt_tail_without_allocator(self):
+        for prompt_len in (64, 200):
+            replay_start = max(0, prompt_len - 128)
+            with self.subTest(prompt_len=prompt_len):
+                batch, req, allocator = self._batch(prompt_len, replay_start)
+                out, device_indices, cpu_indices = alloc_for_extend(batch)
+                expected = batch.req_to_token_pool.req_to_token[
+                    req.kv.req_pool_idx, replay_start:prompt_len
+                ].long()
+                self.assertTrue(torch.equal(out, expected))
+                self.assertEqual(device_indices.tolist(), [1])
+                self.assertEqual(cpu_indices.tolist(), [1])
+                self.assertEqual(req.kv.kv_committed_len, prompt_len)
+                allocator.assert_not_called()
+
+    def test_requires_complete_preallocation(self):
+        batch, _, allocator = self._batch(200, 72, allocated_len=199)
+        with self.assertRaisesRegex(RuntimeError, "missing preallocated KV slots"):
+            alloc_for_extend(batch)
+        allocator.assert_not_called()
+
+        batch, _, allocator = self._batch(64, 0, req_pool_idx=None)
+        with self.assertRaisesRegex(RuntimeError, "preallocated request slots"):
+            alloc_for_extend(batch)
+        allocator.assert_not_called()
 
 
 HEAD_DIM = 512

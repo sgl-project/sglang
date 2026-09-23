@@ -52,6 +52,7 @@ from sglang.srt.disaggregation.decode_hicache_mixin import (
     HiCacheRestoreResult,
 )
 from sglang.srt.disaggregation.utils import (
+    CACHE_ONLY_METADATA_SLOT,
     DisaggregationMode,
     KVClassType,
     MetadataBuffers,
@@ -560,6 +561,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         )
 
     def _init_kv_manager(self) -> CommonKVManager:
+        main_kv_only = get_disagg().dsv41_encoder_only_prefill
         kv_args_class = get_kv_class(self.transfer_backend, KVClassType.KVARGS)
         kv_args = kv_args_class()
 
@@ -577,7 +579,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             else self.token_to_kv_pool
         )
         kv_data_ptrs, kv_data_lens, kv_item_lens = get_kv_transfer_buf_infos(
-            transfer_kv_pool
+            transfer_kv_pool, main_kv_only=main_kv_only
         )
         kv_data_mem_kinds = (
             ["DRAM"] * len(kv_data_ptrs)
@@ -596,7 +598,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             kv_item_lens += device_kv_item_lens[c4_layer_num:]
             kv_data_mem_kinds += ["VRAM"] * len(device_kv_data_ptrs[c4_layer_num:])
         num_draft_entries = 0
-        if self.draft_token_to_kv_pool is not None:
+        if self.draft_token_to_kv_pool is not None and not main_kv_only:
             # Draft KV shares target virtual ids. Unified target KV is transferred
             # with physical ids, so it needs a separate draft index vector.
             draft_kv_data_ptrs, draft_kv_data_lens, draft_kv_item_lens = (
@@ -614,9 +616,12 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         kv_args.num_draft_entries = num_draft_entries
         kv_args.kv_layer_ids = build_kv_layer_ids(
             token_to_kv_pool=self.token_to_kv_pool,
-            draft_token_to_kv_pool=self.draft_token_to_kv_pool,
+            draft_token_to_kv_pool=(
+                None if main_kv_only else self.draft_token_to_kv_pool
+            ),
             num_draft_entries=num_draft_entries,
             num_hidden_layers=self.scheduler.model_config.num_hidden_layers,
+            main_kv_only=main_kv_only,
         )
         if self.transfer_backend == TransferBackend.NIXL:
             kv_args.kv_data_mem_kinds = kv_data_mem_kinds
@@ -629,9 +634,10 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         setup_state_kv_args(
             kv_args,
             self.token_to_kv_pool,
-            self.draft_token_to_kv_pool,
+            None if main_kv_only else self.draft_token_to_kv_pool,
             total_kv_layers=self.scheduler.model_config.num_hidden_layers,
             req_to_token_pool=getattr(self, "req_to_token_pool", None),
+            main_kv_only=main_kv_only,
         )
 
         kv_args.ib_device = get_disagg().disaggregation_ib_device
@@ -660,7 +666,11 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     kv_layer_ids=kv_args.kv_layer_ids,
                     num_draft_entries=num_draft_entries,
                     kv_pool=kv_pool,
-                    draft_kv_pool=self.draft_token_to_kv_pool,
+                    draft_kv_pool=(
+                        None
+                        if get_disagg().dsv41_encoder_only_prefill
+                        else self.draft_token_to_kv_pool
+                    ),
                 )
                 if staging_slots is not None:
                     k_buffers, v_buffers, slot_layer_ids = staging_slots
@@ -2310,6 +2320,24 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
 
         self._commit_hicache_local_restore_to_req(decode_req)
 
+        cache_only = bool(cached_tokens[CACHE_ONLY_METADATA_SLOT].item())
+        decode_req.req.cached_tokens = cached_tokens[0].item()
+        # Seed already_computed with the prefill-reported cache hit so decode
+        # admission does not count the shared prefix twice.
+        decode_req.req.already_computed = decode_req.req.cached_tokens
+        decode_req.req.cached_tokens_device = cached_tokens[1].item()
+        decode_req.req.cached_tokens_host = cached_tokens[2].item()
+        decode_req.req.cached_tokens_storage = cached_tokens[3].item()
+        decode_req.req.mm_image_tokens = cached_tokens[4].item()
+        decode_req.req.mm_audio_tokens = cached_tokens[5].item()
+        decode_req.req.mm_video_tokens = cached_tokens[6].item()
+        if cache_only:
+            decode_req.req.dsv41_cache_only_replay = True
+            decode_req.kv_receiver.clear()
+            decode_req.kv_receiver = None
+            decode_req.req.time_stats.set_wait_queue_entry_time()
+            return
+
         # Case 3: Success - commit the transfer
         # PD true-retraction rebootstrap: the prefill recomputed the prefix KV
         # under the current weights and sampled a fresh handoff token, but when
@@ -2344,22 +2372,6 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             self.scheduler.batch_result_processor._maybe_update_reasoning_tokens(
                 decode_req.req, committed_output_id
             )
-        decode_req.req.cached_tokens = cached_tokens[0].item()
-        # The prefill node already reported its prefix-cache hit in
-        # cached_tokens[0]. Seed already_computed with it so that
-        # prepare_for_prebuilt's `cached_tokens += pre_len - already_computed`
-        # only adds decode-side reuse *beyond* what prefill counted, instead of
-        # double-counting the shared prompt prefix (which would make
-        # cached_tokens exceed prompt_tokens when decode radix cache is on).
-        decode_req.req.already_computed = decode_req.req.cached_tokens
-        decode_req.req.cached_tokens_device = cached_tokens[1].item()
-        decode_req.req.cached_tokens_host = cached_tokens[2].item()
-        decode_req.req.cached_tokens_storage = cached_tokens[3].item()
-        # Multimodal prompt token counts packed into cached_tokens slots 4-6
-        # by the prefill node (see MetadataBuffers.set_buf).
-        decode_req.req.mm_image_tokens = cached_tokens[4].item()
-        decode_req.req.mm_audio_tokens = cached_tokens[5].item()
-        decode_req.req.mm_video_tokens = cached_tokens[6].item()
         if not self.spec_algorithm.is_none():
             decode_req.req.output_topk_p = output_topk_p
             decode_req.req.output_topk_index = output_topk_index
@@ -2767,6 +2779,17 @@ class SchedulerDisaggregationDecodeMixin:
         new_prebuilt_batch = self.get_new_prebuilt_batch(running_batch)
         if new_prebuilt_batch:
             assert self.chunked_req is None
+            if new_prebuilt_batch.dsv41_cache_only_replay:
+                # This is a real EXTEND forward which reconstructs decoder-local
+                # state and samples the first output.  Overlap scheduling is
+                # rejected for this experimental path, so it is safe to install
+                # it as the running batch before the synchronous forward.
+                assert running_batch.is_empty()
+                set_schedule_time_batch(new_prebuilt_batch)
+                return NextBatchPlan(
+                    batch_to_run=new_prebuilt_batch,
+                    running_batch=new_prebuilt_batch,
+                )
             self.batch_result_processor.process_batch_result_prebuilt(
                 new_prebuilt_batch
             )
@@ -2857,6 +2880,15 @@ class SchedulerDisaggregationDecodeMixin:
         if self.enable_priority_scheduling:
             self.policy.calc_priority(self.waiting_queue, running_batch)
 
+        if (
+            self.waiting_queue[0].dsv41_cache_only_replay
+            and not running_batch.is_empty()
+        ):
+            # Priority scheduling mutates waiting_queue in place, so gate on
+            # the final head. Cache-only replay is an EXTEND pass and cannot
+            # merge into a live DECODE batch; admit it when that batch drains.
+            return None
+
         curr_batch_size = running_batch.batch_size()
 
         batch_size = min(self.req_to_token_pool.size, self.max_running_requests)
@@ -2867,11 +2899,26 @@ class SchedulerDisaggregationDecodeMixin:
         can_run_list: List[Req] = []
         waiting_queue: List[Req] = []
 
+        cache_only_batch = bool(self.waiting_queue[0].dsv41_cache_only_replay)
+        admitted = 0
         for i in range(len(self.waiting_queue)):
             req = self.waiting_queue[i]
+            # PREBUILT and cache-only EXTEND have different forward semantics;
+            # never combine them in one newly admitted batch.
+            if bool(req.dsv41_cache_only_replay) != cache_only_batch:
+                waiting_queue.append(req)
+                continue
             # we can only add at least `num_not_used_batch` new batch to the running queue
-            if i < num_not_used_batch:
+            if admitted < num_not_used_batch:
+                admitted += 1
                 can_run_list.append(req)
+                if cache_only_batch:
+                    end = len(req.origin_input_ids)
+                    start = max(0, end - 128)
+                    row = self.req_to_token_pool.req_to_token[req.kv.req_pool_idx]
+                    req.prefix_indices = row[:start].clone()
+                    req.set_extend_range(start, end)
+                    continue
                 # Decode-radix path: new requests already matched in
                 # `pop_preallocated`. Retracted requests reset `last_node`,
                 # so re-match only when that state is missing.
@@ -2906,6 +2953,11 @@ class SchedulerDisaggregationDecodeMixin:
             self.enable_overlap,
             self.spec_algorithm,
         )
+
+        if cache_only_batch:
+            new_batch.dsv41_cache_only_replay = True
+            new_batch.prepare_for_extend()
+            return new_batch
 
         # construct fake completed prefill
         new_batch.prepare_for_prebuilt()

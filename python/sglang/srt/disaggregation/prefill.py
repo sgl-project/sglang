@@ -224,6 +224,7 @@ class PrefillBootstrapQueue:
             self.scheduler.kv_checksum_computer = None
 
     def _init_kv_manager(self) -> CommonKVManager:
+        main_kv_only = get_disagg().dsv41_encoder_only_prefill
         kv_args_class = get_kv_class(self.transfer_backend, KVClassType.KVARGS)
         kv_args = kv_args_class()
         kv_args.engine_rank = self.tp_rank
@@ -242,7 +243,7 @@ class PrefillBootstrapQueue:
         )
         layer_shard_rank = getattr(self.token_to_kv_pool, "layer_shard_rank", None)
         layer_shard_size = getattr(self.token_to_kv_pool, "layer_shard_size", 1)
-        transfer_draft_cache = (
+        transfer_draft_cache = not main_kv_only and (
             not layer_shard_enabled or layer_shard_rank == layer_shard_size - 1
         )
         kv_args.prefill_start_layer = (
@@ -258,7 +259,7 @@ class PrefillBootstrapQueue:
             )
         )
         kv_data_ptrs, kv_data_lens, kv_item_lens = get_kv_transfer_buf_infos(
-            self.token_to_kv_pool
+            self.token_to_kv_pool, main_kv_only=main_kv_only
         )
         kv_args.prefill_end_layer = (
             kv_args.prefill_start_layer + len(kv_data_ptrs)
@@ -293,6 +294,7 @@ class PrefillBootstrapQueue:
             draft_token_to_kv_pool=draft_kv_pool,
             num_draft_entries=num_draft_entries,
             num_hidden_layers=self.scheduler.model_config.num_hidden_layers,
+            main_kv_only=main_kv_only,
         )
         if not self.is_mla_backend:
             kv_args.kv_head_num = self.token_to_kv_pool.head_num
@@ -314,6 +316,7 @@ class PrefillBootstrapQueue:
             self.draft_token_to_kv_pool if transfer_draft_cache else None,
             self.scheduler.model_config.num_hidden_layers,
             req_to_token_pool=req_to_token_pool,
+            main_kv_only=main_kv_only,
         )
 
         kv_manager_class = get_kv_class(self.transfer_backend, KVClassType.MANAGER)
@@ -757,6 +760,55 @@ class SchedulerDisaggregationPrefillMixin:
         if result.indexer_topk_output is not None:
             result.indexer_topk_output.finalize()
             result.indexer_topk_output = None
+
+        if result.cache_only:
+            aborted_reqs: List[Req] = []
+            for req in batch.reqs:
+                if req.inflight_middle_chunks <= 0:
+                    req.time_stats.set_prefill_finished_time()
+                    if is_aborted(req):
+                        if self._retire_aborted_prefill_result(req):
+                            req.time_stats.set_completion_time()
+                            aborted_reqs.append(req)
+                        continue
+                    if req.pending_bootstrap and should_force_retry(req):
+                        self.optimistic_release_and_requeue(req)
+                        continue
+                    req.dsv41_cache_only_replay = True
+                    maybe_cache_unfinished_req(req, self.tree_cache)
+                    self.disagg_prefill_inflight_queue.append(req)
+                    if not req.pending_bootstrap:
+                        self.send_kv_chunk(req, last_chunk=True)
+                    req.time_stats.set_prefill_transfer_queue_entry_time()
+                else:
+                    req.inflight_middle_chunks -= 1
+                    still_chunking = self.chunked_req is req or (
+                        req.extend_range is not None
+                        and req.extend_range.end >= len(req.origin_input_ids)
+                    )
+                    if is_aborted(req):
+                        if not still_chunking and self._retire_aborted_prefill_result(
+                            req
+                        ):
+                            req.time_stats.set_completion_time()
+                            aborted_reqs.append(req)
+                    elif req.pending_bootstrap and not still_chunking:
+                        self.optimistic_release_and_requeue(req)
+                    elif self.enable_overlap and not req.pending_bootstrap:
+                        self.send_kv_chunk(
+                            req, last_chunk=False, end_idx=req.tmp_end_idx
+                        )
+                    req.time_stats.set_last_chunked_prefill_finish_time()
+            if aborted_reqs:
+                self.output_streamer.stream_output(aborted_reqs, False)
+            self.metrics_reporter.report_prefill_stats(
+                batch=batch,
+                prefill_stats=batch.prefill_stats,
+                can_run_cuda_graph=result.can_run_cuda_graph,
+                dp_cooperation_info=batch.dp_cooperation_info,
+            )
+            self.maybe_send_health_check_signal()
+            return
 
         logprob_pt = 0
         aborted_reqs: List[Req] = []

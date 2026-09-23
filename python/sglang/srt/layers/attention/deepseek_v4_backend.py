@@ -2749,8 +2749,13 @@ class DeepseekV4AttnBackend(
         """Runs on every ratio 1/2 layer before its attention."""
         if forward_batch.forward_mode.is_idle():
             return
-        if forward_batch.encoder_swa_replay:
-            run_compressor = False
+        state_only_replay = forward_batch.encoder_swa_replay
+        if state_only_replay:
+            # The transferred ratio-1/2 Main-KV and Indexer-K rows are
+            # authoritative.  Ratio-2 nevertheless has a request-local pending
+            # pair which must be reconstructed by the bounded tail replay for
+            # the next decode token.
+            run_compressor = layer.compress_ratio == 2
         if dsa_use_prefill_cp(forward_batch) and forward_batch.forward_mode.is_extend():
             self._forward_low_ratio_sources_cp(
                 layer=layer,
@@ -2793,7 +2798,14 @@ class DeepseekV4AttnBackend(
                 )
             return
         if run_compressor and layer.compressor is not None:
-            self._low_ratio_compress(layer, x, req, pos, forward_batch)
+            self._low_ratio_compress(
+                layer,
+                x,
+                req,
+                pos,
+                forward_batch,
+                state_only=state_only_replay,
+            )
         if run_indexer and layer.indexer is not None:
             self._low_ratio_index_topk(layer, x, q_lora, req, pos, forward_batch)
 
@@ -2832,7 +2844,9 @@ class DeepseekV4AttnBackend(
                 q_lens_cpu,
             )
 
-    def _low_ratio_compress(self, layer, x, req, pos, forward_batch) -> None:
+    def _low_ratio_compress(
+        self, layer, x, req, pos, forward_batch, *, state_only=False
+    ) -> None:
         if forward_batch.forward_mode.is_decode():
             self._low_ratio_compress_decode(layer, x, req, pos)
         elif (
@@ -2861,6 +2875,7 @@ class DeepseekV4AttnBackend(
                     forward_batch.forward_mode.is_target_verify()
                     and layer.compressor.use_fused_compress
                 ),
+                state_only=state_only,
             )
 
     def _low_ratio_in_prefill_graph(self) -> bool:
@@ -2995,7 +3010,15 @@ class DeepseekV4AttnBackend(
             )
 
     def _low_ratio_compress_torch(
-        self, layer, x, req, pos, projected=None, *, fuse_index_store=False
+        self,
+        layer,
+        x,
+        req,
+        pos,
+        projected=None,
+        *,
+        fuse_index_store=False,
+        state_only=False,
     ) -> None:
         core = self.forward_metadata.core_metadata
         num_tokens = pos.shape[0]
@@ -3003,6 +3026,8 @@ class DeepseekV4AttnBackend(
         if not num_tokens:
             return
         if layer.compress_ratio == 1:
+            if state_only:
+                return
             self._low_ratio_write_group(
                 layer,
                 kv,
@@ -3020,6 +3045,8 @@ class DeepseekV4AttnBackend(
             pos=pos,
             pad=core.raw_out_loc[:num_tokens] == 0,
         )
+        if state_only:
+            return
         pooled = layer.compressor.pool_pairs(
             torch.stack([partner_kv, kv], dim=1),
             torch.stack([partner_score, score], dim=1),

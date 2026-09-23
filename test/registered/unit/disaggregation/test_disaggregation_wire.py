@@ -34,6 +34,7 @@ from sglang.srt.disaggregation.mooncake.conn import (
     TransferInfo,
 )
 from sglang.srt.disaggregation.utils import (
+    CACHE_ONLY_METADATA_SLOT,
     MetadataBuffers,
     build_transfer_entry_pairs,
     compute_mamba_state_slice_byte_blocks,
@@ -758,6 +759,32 @@ class TestEagleDsaSeedTransfer(CustomTestCase):
         self.assertEqual(ptrs[-2], buffers.output_dsa_topk_indices.data_ptr())
         self.assertEqual(data_lens[-2], buffers.output_dsa_topk_indices.nbytes)
         self.assertEqual(item_lens[-2], buffers.output_dsa_topk_indices[0].nbytes)
+
+    def test_cache_only_metadata_has_no_handoff_token(self):
+        buffers = MetadataBuffers(
+            size=2,
+            hidden_size=2,
+            hidden_states_dtype=torch.float32,
+            max_sampling_mask_tokens=16,
+        )
+        cache_only = self._make_req(None)
+        cache_only.output_ids = []
+        cache_only.dsv41_cache_only_replay = True
+        cache_only.bootstrap_room = 73
+        buffers.output_ids[0, 0] = -123
+
+        buffers.set_buf(cache_only)
+
+        # Cache-only completion must not dereference or invent a handoff token.
+        self.assertEqual(buffers.output_ids[0, 0].item(), -123)
+        self.assertEqual(buffers.cached_tokens[0, CACHE_ONLY_METADATA_SLOT].item(), 1)
+        self.assertEqual(buffers.bootstrap_room[0, 0].item(), 73)
+
+        normal = self._make_req(None, metadata_buffer_index=1)
+        normal.dsv41_cache_only_replay = False
+        buffers.set_buf(normal)
+        self.assertEqual(buffers.output_ids[1, 0].item(), 101)
+        self.assertEqual(buffers.cached_tokens[1, CACHE_ONLY_METADATA_SLOT].item(), 0)
 
     def test_sampling_mask_metadata_is_opt_in(self):
         """Disabled masks stay off the wire; enabled masks round-trip at capacity."""

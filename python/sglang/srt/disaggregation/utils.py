@@ -261,6 +261,8 @@ def poll_and_all_reduce_with_staging(
 # Metadata Buffers
 #########################
 
+CACHE_ONLY_METADATA_SLOT = 7
+
 
 class ReqToMetadataIdxAllocator:
     """A memory pool that maps a request to its first output token location."""
@@ -456,8 +458,9 @@ class MetadataBuffers:
         )
 
     def set_buf(self, req: Req):
-
-        self.output_ids[req.metadata_buffer_index][0] = req.output_ids[0]
+        cache_only = getattr(req, "dsv41_cache_only_replay", False)
+        if not cache_only:
+            self.output_ids[req.metadata_buffer_index][0] = req.output_ids[0]
         # The cached_tokens buffer is (size, 16); slots 0-3 hold cached token
         # counts and slots 4-6 are reused for multimodal prompt token counts
         # (slots 7-15 remain spare). This avoids adding new RDMA buffers.
@@ -476,6 +479,18 @@ class MetadataBuffers:
         self.cached_tokens[req.metadata_buffer_index][4] = image_t
         self.cached_tokens[req.metadata_buffer_index][5] = audio_t
         self.cached_tokens[req.metadata_buffer_index][6] = video_t
+        self.cached_tokens[req.metadata_buffer_index][CACHE_ONLY_METADATA_SLOT] = int(
+            cache_only
+        )
+        # Store the readiness/corruption guard for every profile, including a
+        # cache-only handoff which returns before token metadata below.
+        self.bootstrap_room[req.metadata_buffer_index, 0] = (
+            req.bootstrap_room if req.bootstrap_room is not None else 0
+        )
+        if cache_only:
+            # No handoff token, logprob, sampling or draft metadata exists in this
+            # profile.  Keep the reusable metadata row deterministic.
+            return
         if req.return_logprob:
             if req.logprob.output_token_logprobs_val:  # not none or empty list
                 self.output_token_logprobs_val[req.metadata_buffer_index][0] = (
@@ -565,10 +580,6 @@ class MetadataBuffers:
                     )
                 else:
                     self.output_dsa_topk_indices[req.metadata_buffer_index].fill_(-1)
-        # Store bootstrap_room for validation on decode side
-        self.bootstrap_room[req.metadata_buffer_index, 0] = (
-            req.bootstrap_room if req.bootstrap_room is not None else 0
-        )
 
 
 #########################
@@ -979,6 +990,7 @@ def build_kv_layer_ids(
     draft_token_to_kv_pool,
     num_draft_entries: int,
     num_hidden_layers: int,
+    main_kv_only: bool = False,
 ) -> List[int]:
     """Global layer id for every entry in ``kv_args.kv_data_ptrs``.
 
@@ -992,7 +1004,17 @@ def build_kv_layer_ids(
     Returns [] for pools that cannot report ids, leaving the peers on positional
     pairing.
     """
+    from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
     from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
+
+    if main_kv_only:
+        if draft_token_to_kv_pool is not None or num_draft_entries:
+            raise RuntimeError("encoder-only transfer cannot include draft KV")
+        if not isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool):
+            raise RuntimeError(
+                "encoder-only transfer requires a DeepSeek-V4 token-to-KV pool"
+            )
+        return token_to_kv_pool.get_encoder_only_transfer_layer_ids()
 
     if not isinstance(token_to_kv_pool, HybridLinearKVPool):
         return []
@@ -1312,9 +1334,16 @@ def build_dsa_tail_transfer_blocks(
     return transfer_blocks
 
 
-def get_kv_transfer_buf_infos(pool):
+def get_kv_transfer_buf_infos(pool, *, main_kv_only: bool = False):
+    from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
     from sglang.srt.mem_cache.memory_pool import MiniMaxSparseKVPool
 
+    if main_kv_only:
+        if not isinstance(pool, DeepSeekV4TokenToKVPool):
+            raise RuntimeError(
+                "encoder-only prefill requires a DeepSeek-V4 token-to-KV pool"
+            )
+        return pool.get_encoder_only_transfer_buf_infos()
     if isinstance(pool, MiniMaxSparseKVPool):
         return pool.get_sparse_kv_buf_infos()
     return pool.get_contiguous_buf_infos()
@@ -1326,6 +1355,7 @@ def setup_state_kv_args(
     draft_token_to_kv_pool=None,
     total_kv_layers: int = None,
     req_to_token_pool=None,
+    main_kv_only: bool = False,
 ) -> None:
     from sglang.srt.disaggregation.base.conn import StateType
     from sglang.srt.hardware_backend.npu.memory_pool_npu import NPUMLATokenToKVPool
@@ -1355,6 +1385,8 @@ def setup_state_kv_args(
         if isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool)
         else None
     )
+    if main_kv_only:
+        return
 
     def append_dsa_tail(pool) -> None:
         if not pool.kpool_use_compress:

@@ -18,6 +18,11 @@ def run_encoder_swa_replay(worker, batch):
             continue
         slot = batch.req_pool_indices[i : i + 1]
         window.reset(slot)
+        # The cache-only handoff's ordinary EXTEND is itself the bounded replay.
+        # Only reset request-local SWA state here; an extra replay would execute
+        # the same tail twice.
+        if batch.dsv41_cache_only_replay:
+            continue
         end = batch.prefix_lens[i]
         if not end:
             continue

@@ -606,6 +606,8 @@ class TestDecodePrebuilt(unittest.TestCase):
         scheduler.waiting_queue = original_waiting_queue
         scheduler.waiting_queue[0].priority = 1
         scheduler.waiting_queue[1].priority = 10
+        scheduler.waiting_queue[0].dsv41_cache_only_replay = False
+        scheduler.waiting_queue[1].dsv41_cache_only_replay = False
         scheduler.enable_priority_scheduling = True
         scheduler.policy.calc_priority.side_effect = lambda waiting_queue, _: (
             waiting_queue.sort(key=lambda req: -req.priority)
@@ -635,9 +637,35 @@ class TestDecodePrebuilt(unittest.TestCase):
         self.assertEqual([req.rid for req in selected_reqs], ["high"])
         self.assertEqual([req.rid for req in scheduler.waiting_queue], ["low"])
 
+    def test_priority_sorted_cache_only_replay_waits_for_running_batch(self):
+        scheduler = self._new_scheduler(enable_overlap=False)
+        normal = MagicMock(rid="normal", priority=1)
+        normal.dsv41_cache_only_replay = False
+        replay = MagicMock(rid="replay", priority=10)
+        replay.dsv41_cache_only_replay = True
+        scheduler.waiting_queue = [normal, replay]
+        scheduler.running_batch.is_empty.return_value = False
+        scheduler.enable_priority_scheduling = True
+        scheduler.policy.calc_priority.side_effect = lambda waiting_queue, _: (
+            waiting_queue.sort(key=lambda req: -req.priority)
+        )
+
+        ret = SchedulerDisaggregationDecodeMixin.get_new_prebuilt_batch(
+            scheduler, scheduler.running_batch
+        )
+
+        self.assertIsNone(ret)
+        scheduler.policy.calc_priority.assert_called_once_with(
+            scheduler.waiting_queue, scheduler.running_batch
+        )
+        self.assertEqual(
+            [req.rid for req in scheduler.waiting_queue], ["replay", "normal"]
+        )
+
     def test_overlap_waits_for_forward_before_processing_prebuilt(self):
         scheduler = self._new_scheduler(enable_overlap=True)
         scheduler.waiting_queue = [MagicMock(rid="request")]
+        scheduler.waiting_queue[0].dsv41_cache_only_replay = False
 
         call_order = []
         new_batch = MagicMock()

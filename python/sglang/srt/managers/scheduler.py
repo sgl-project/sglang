@@ -2940,6 +2940,25 @@ class Scheduler(
                 self._add_request_to_queue(req)
                 return
 
+        if get_disagg().dsv41_encoder_only_prefill and (
+            req.multimodal_inputs is not None
+            or req.input_embeds is not None
+            or req.positional_embed_overrides is not None
+            or req.return_logprob
+            or req.return_sampling_mask
+            or req.return_hidden_states
+            or req.return_routed_experts
+            or req.return_indexer_topk
+        ):
+            error_msg = (
+                "DeepSeek-V4.1 encoder-only prefill currently supports only "
+                "text token requests without prompt logprobs, sampling masks, "
+                "or auxiliary hidden/routing captures"
+            )
+            prepare_abort(req, error_msg, status_code=HTTPStatus.BAD_REQUEST)
+            self.output_streamer.stream_output([req], req.return_logprob)
+            return
+
         if req.return_sampling_mask:
             if (
                 self.disaggregation_mode != DisaggregationMode.NULL
@@ -4395,7 +4414,10 @@ class Scheduler(
                             batch, **fwd_kwargs
                         )
                         if batch.spec_algorithm.is_none():
-                            self.future_map.publish(future_indices, batch.seq_lens + 1)
+                            self.future_map.publish(
+                                future_indices,
+                                batch.seq_lens + (0 if batch_result.cache_only else 1),
+                            )
                         # Park any refs the worker wants kept alive 2 iters
                         # (cross-stream tensor lifetime; pinned in the same
                         # ring slot as the SB attr snapshot).
