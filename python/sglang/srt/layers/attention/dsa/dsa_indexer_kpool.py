@@ -878,6 +878,85 @@ class IndexerKPool(MultiPlatformOp):
             q_fp8, (k_fp8, k_scale), weights, starts, ends, clean_logits=clean_logits
         )
 
+    def _topk_from_ragged_kpool(
+        self,
+        q_fp8,
+        k_fp8,
+        k_scale,
+        weights,
+        row_starts,
+        row_ends,
+        pool_lens,
+        seq_lens,
+        page_table=None,
+        topk_offsets=None,
+        out_rows=None,
+        page_table_row_index=None,
+    ):
+        """Ragged logits then top-k, one ROCm-capped block of query rows at a time.
+
+        At long context the full fp32 logits matrix reaches several GiB per
+        rank; consuming each block before computing the next bounds the peak
+        to one block instead of the whole matrix.
+        """
+        num_q = q_fp8.shape[0]
+        num_k = k_fp8.shape[0] if k_fp8 is not None else 0
+        rows_per_chunk = None
+        if is_hip() and num_q and num_k:
+            rows_per_chunk = mqa_logits_rows_per_chunk(
+                num_rows=num_q,
+                row_bytes=mqa_logits_row_bytes(num_k),
+                budget_bytes=MQA_LOGITS_MAX_BYTES_ROCM,
+            )
+        rows_per_chunk = rows_per_chunk or max(num_q, 1)
+        chunks = []
+        for start in range(0, max(num_q, 1), rows_per_chunk):
+            rows = slice(start, min(start + rows_per_chunk, num_q))
+            if num_q and num_k:
+                logits = self._fp8_mqa_logits(
+                    q_fp8[rows].contiguous(),
+                    k_fp8,
+                    k_scale,
+                    weights[rows].contiguous(),
+                    row_starts[rows],
+                    row_ends[rows],
+                    clean_logits=True,
+                )
+            else:
+                logits = torch.empty(
+                    (rows.stop - rows.start, 0),
+                    dtype=torch.float32,
+                    device=q_fp8.device,
+                )
+            chunks.append(
+                self._topk_from_kpool_logits(
+                    logits,
+                    pool_lens[rows],
+                    seq_lens=seq_lens[rows],
+                    page_table=(
+                        page_table[rows]
+                        if page_table is not None and page_table_row_index is None
+                        else page_table
+                    ),
+                    topk_offsets=(
+                        topk_offsets[rows] if topk_offsets is not None else None
+                    ),
+                    row_starts=row_starts[rows],
+                    page_table_row_index=(
+                        page_table_row_index[rows]
+                        if page_table_row_index is not None
+                        else None
+                    ),
+                )
+            )
+            del logits
+        result = chunks[0] if len(chunks) == 1 else torch.cat(chunks, dim=0)
+        if out_rows is not None and out_rows > num_q:
+            padded = result.new_full((out_rows, result.shape[1]), -1)
+            padded[:num_q] = result
+            return padded
+        return result
+
     @staticmethod
     def _should_use_tilelang_paged_mqa_logits(q_fp8: torch.Tensor) -> bool:
         # q_fp8 is [tokens, heads, dim], without the next_n dim
@@ -1038,7 +1117,6 @@ class IndexerKPool(MultiPlatformOp):
         assert len(weights.shape) == 3
         weights = weights.squeeze(-1)
 
-        device = q_fp8.device
         total_q = q_fp8.shape[0]
         seq_lens_expanded = plan.seq_lens_expanded
         pool_lens = plan.pooled_seq_lens_expanded
@@ -1064,18 +1142,10 @@ class IndexerKPool(MultiPlatformOp):
                 k_out=k_u8,
                 scale_out=k_scale,
             )
-            k_fp8 = k_u8.view(torch.float8_e4m3fn)
-            logits = self._fp8_mqa_logits(
-                q_fp8[:n_real].contiguous(),
-                k_fp8.contiguous(),
-                k_scale.contiguous(),
-                weights[:n_real].contiguous(),
-                ks_per_q,
-                ke_per_q,
-                clean_logits=True,
-            )
+            k_fp8 = k_u8.view(torch.float8_e4m3fn).contiguous()
+            k_scale = k_scale.contiguous()
         else:
-            logits = torch.empty((n_real, 0), dtype=torch.float32, device=device)
+            k_fp8 = k_scale = None
 
         topk_method = metadata.topk_transform_method
         attn_metadata = metadata.attn_metadata
@@ -1089,13 +1159,17 @@ class IndexerKPool(MultiPlatformOp):
             elif topk_method == TopkTransformMethod.RAGGED:
                 topk_offsets_all = attn_metadata.topk_indices_offset
 
-        return self._topk_from_kpool_logits(
-            logits,
+        return self._topk_from_ragged_kpool(
+            q_fp8[:n_real],
+            k_fp8,
+            k_scale,
+            weights[:n_real],
+            ks_per_q,
+            ke_per_q,
             pool_lens,
-            seq_lens=seq_lens_expanded,
+            seq_lens_expanded,
             page_table=page_table_all,
             topk_offsets=topk_offsets_all,
-            row_starts=ks_per_q,
             out_rows=total_q,
             page_table_row_index=page_table_row_index_all,
         )
@@ -1292,25 +1366,16 @@ class IndexerKPool(MultiPlatformOp):
                     )
                     k_fp8 = k_fp8.view(torch.float8_e4m3fn)
                     k_scale = k_scale.view(torch.float32).squeeze(-1)
-                row_starts = (
-                    zero_starts_by_batch[i]
-                    if zero_starts_by_batch is not None
-                    and zero_starts_by_batch[i] is not None
-                    else torch.zeros((q_len,), dtype=torch.int32, device=q_fp8.device)
-                )
-                local_logits = self._fp8_mqa_logits(
-                    q_fp8[q_slice].contiguous(),
-                    k_fp8.contiguous(),
-                    k_scale.contiguous(),
-                    weights[q_slice].contiguous(),
-                    row_starts,
-                    local_pool_lens,
-                    clean_logits=True,
-                )
+                k_fp8 = k_fp8.contiguous()
+                k_scale = k_scale.contiguous()
             else:
-                local_logits = torch.empty(
-                    (q_len, 0), dtype=torch.float32, device=q_fp8.device
-                )
+                k_fp8 = k_scale = None
+            row_starts = (
+                zero_starts_by_batch[i]
+                if zero_starts_by_batch is not None
+                and zero_starts_by_batch[i] is not None
+                else torch.zeros((q_len,), dtype=torch.int32, device=q_fp8.device)
+            )
 
             page_table_local = None
             topk_offsets_local = None
@@ -1331,10 +1396,15 @@ class IndexerKPool(MultiPlatformOp):
             ):
                 topk_offsets_local = topk_offsets[q_slice]
 
-            local_topk = self._topk_from_kpool_logits(
-                local_logits,
+            local_topk = self._topk_from_ragged_kpool(
+                q_fp8[q_slice],
+                k_fp8,
+                k_scale,
+                weights[q_slice],
+                row_starts,
                 local_pool_lens,
-                seq_lens=local_seqlens,
+                local_pool_lens,
+                local_seqlens,
                 page_table=page_table_local,
                 topk_offsets=topk_offsets_local,
             )
