@@ -1775,9 +1775,6 @@ class Envs:
 
     # Qwen3.5 and GDN
     SGLANG_ENABLE_GDN_DECODE_FUSED_PROJ_CONV = EnvBool(True)
-    SGLANG_GDN_CHUNK_H_BV = EnvStr("auto")
-    SGLANG_GDN_CHUNK_H_NUM_WARPS = EnvInt(4)
-    SGLANG_GDN_CHUNK_H_NUM_STAGES = EnvStr("auto")
     SGLANG_TRACE_QWEN35_FINAL_NORM = EnvBool(False)
     SGLANG_QWEN35_NATIVE_FINAL_NORM = EnvBool(False)
     # One switch enables deferred MoE finalize and AR + residual + RMSNorm.

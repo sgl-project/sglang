@@ -1,3 +1,4 @@
+import os
 import unittest
 from unittest import mock
 
@@ -202,11 +203,11 @@ class TestGdnContracts(CustomTestCase):
 
     def test_amd_grid_and_sequence_length_selectors(self):
         with (
-            mock.patch.object(chunk_delta_h, "GDN_CHUNK_H_BV", "auto"),
-            mock.patch.object(chunk_delta_h, "GDN_CHUNK_H_NUM_STAGES", "auto"),
-            mock.patch.object(chunk_delta_h, "is_amd", True),
+            mock.patch.dict(os.environ, {}, clear=False),
             mock.patch.object(chunk_delta_h, "_num_compute_units", return_value=256),
         ):
+            os.environ.pop("SGLANG_GDN_CHUNK_H_BV", None)
+            os.environ.pop("SGLANG_GDN_CHUNK_H_NUM_STAGES", None)
             select = chunk_delta_h._select_chunk_h_config
             self.assertEqual(
                 [

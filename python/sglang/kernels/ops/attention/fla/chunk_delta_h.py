@@ -3,6 +3,7 @@
 # Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
 
 import functools
+import os
 from typing import Optional, Tuple
 
 import torch
@@ -14,13 +15,17 @@ from sglang.kernels.ops.attention.fla.index import (
     prepare_chunk_offsets,
 )
 from sglang.kernels.ops.attention.fla.op import exp, exp2, safe_exp
-from sglang.kernels.ops.attention.fla.utils import autotune_cache_kwargs, is_amd
-from sglang.srt.environ import envs
+from sglang.kernels.ops.attention.fla.utils import (
+    autotune_cache_kwargs,
+    is_nvidia_hopper,
+)
+from sglang.srt.utils import is_hip
 
+NUM_WARPS = [2, 4] if is_nvidia_hopper else [2, 4, 8, 16]
 CHUNK_SIZE = 64
-GDN_CHUNK_H_BV = envs.SGLANG_GDN_CHUNK_H_BV.get()
-GDN_CHUNK_H_NUM_WARPS = envs.SGLANG_GDN_CHUNK_H_NUM_WARPS.get()
-GDN_CHUNK_H_NUM_STAGES = envs.SGLANG_GDN_CHUNK_H_NUM_STAGES.get()
+GDN_CHUNK_H_BV = int(os.getenv("SGLANG_GDN_CHUNK_H_BV", "32"))
+GDN_CHUNK_H_NUM_WARPS = int(os.getenv("SGLANG_GDN_CHUNK_H_NUM_WARPS", "4"))
+GDN_CHUNK_H_NUM_STAGES = int(os.getenv("SGLANG_GDN_CHUNK_H_NUM_STAGES", "2"))
 
 _CHUNK_H_BV_CANDIDATES = (64, 32, 16)
 
@@ -34,23 +39,48 @@ def _select_chunk_h_config(
     N: int, H: int, V: int, NT: int, is_varlen: bool, device_index: int
 ) -> tuple[int, int]:
     """Select the ROCm GDN launch geometry."""
-    if GDN_CHUNK_H_BV != "auto":
-        BV = int(GDN_CHUNK_H_BV)
-    else:
+    bv_env = os.getenv("SGLANG_GDN_CHUNK_H_BV")
+    if bv_env is None:
         target = _num_compute_units(device_index)
         candidates = [bv for bv in _CHUNK_H_BV_CANDIDATES if bv <= V] or [16]
         BV = next(
             (bv for bv in candidates if triton.cdiv(V, bv) * N * H >= target),
             candidates[-1],
         )
-    if GDN_CHUNK_H_NUM_STAGES != "auto":
-        num_stages = int(GDN_CHUNK_H_NUM_STAGES)
     else:
+        BV = int(bv_env)
+    stages_env = os.getenv("SGLANG_GDN_CHUNK_H_NUM_STAGES")
+    if stages_env is None:
         chunks_per_seq = NT // max(N, 1) if is_varlen else NT
         num_stages = 3 if chunks_per_seq >= 32 else 2
+    else:
+        num_stages = int(stages_env)
     return BV, num_stages
 
 
+@triton.autotune(
+    # Single hardcoded config. The kernel writes ht (final state) back into
+    # initial_state in-place; with multiple configs, triton's autotune benchmark
+    # phase invokes the kernel many times for timing and corrupts the cache pool,
+    # producing silently wrong output on the first user request. Restoring via
+    # `restore_value=["initial_state"]` works for unit tests but OOMs on
+    # production-scale models (e.g. Kimi-Linear-48B at default mem_fraction)
+    # because cloning the cache pool for each benchmark exceeds available memory.
+    # NT_BUCKET is kept in the autotune key for forward-compatibility (allows
+    # future per-bucket configs once the kernel is refactored to write final
+    # state to a separate output buffer). The env knobs keep this single-config
+    # property while allowing model/hardware-local validation of the selected
+    # tile without corrupting the state pool through multi-config autotune.
+    configs=[
+        triton.Config(
+            {"BV": GDN_CHUNK_H_BV},
+            num_warps=GDN_CHUNK_H_NUM_WARPS,
+            num_stages=GDN_CHUNK_H_NUM_STAGES,
+        )
+    ],
+    key=["H", "K", "V", "BT", "USE_GK", "NT_BUCKET"],
+    **autotune_cache_kwargs,
+)
 @triton.jit(do_not_specialize=["T"])
 def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
     k,
@@ -350,23 +380,6 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
             tl.store(p_ht, b_h4.to(p_ht.dtype.element_ty), boundary_check=(0, 1))
 
 
-# Keep the pre-existing one-config autotune launcher for every path except
-# ROCm GDN. Multiple-config tuning is unsafe because the kernel mutates state.
-_chunk_h_default = triton.autotune(
-    configs=[
-        triton.Config(
-            {"BV": 32 if GDN_CHUNK_H_BV == "auto" else int(GDN_CHUNK_H_BV)},
-            num_warps=GDN_CHUNK_H_NUM_WARPS,
-            num_stages=(
-                2 if GDN_CHUNK_H_NUM_STAGES == "auto" else int(GDN_CHUNK_H_NUM_STAGES)
-            ),
-        )
-    ],
-    key=["H", "K", "V", "BT", "USE_GK", "NT_BUCKET"],
-    **autotune_cache_kwargs,
-)(chunk_gated_delta_rule_fwd_kernel_h_blockdim64)
-
-
 def chunk_gated_delta_rule_fwd_h(
     k: torch.Tensor,
     w: torch.Tensor,
@@ -416,19 +429,18 @@ def chunk_gated_delta_rule_fwd_h(
 
     v_new = torch.empty_like(u) if save_new_value else None
 
-    use_amd_gdn_tuning = is_amd and g is not None
-    if use_amd_gdn_tuning:
+    if is_hip() and g is not None:
         BV, num_stages = _select_chunk_h_config(
             N, H, V, NT, cu_seqlens is not None, k.device.index
         )
-        kernel = chunk_gated_delta_rule_fwd_kernel_h_blockdim64
+        kernel = chunk_gated_delta_rule_fwd_kernel_h_blockdim64.fn
         launch_kwargs = dict(
             BV=BV,
             num_warps=GDN_CHUNK_H_NUM_WARPS,
             num_stages=num_stages,
         )
     else:
-        kernel, launch_kwargs = _chunk_h_default, {}
+        kernel, launch_kwargs = chunk_gated_delta_rule_fwd_kernel_h_blockdim64, {}
 
     def grid(meta):
         return (triton.cdiv(V, meta["BV"]), N * H)
