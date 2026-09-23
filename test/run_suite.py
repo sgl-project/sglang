@@ -105,7 +105,8 @@ PER_COMMIT_SUITES = {
         "extra-b-test-8-gpu-b300",
     ],
     HWBackend.NPU: [
-        "base-a-test-1-npu-a2",
+        "base-a-unit-test-1-npu-a2",
+        "base-a-unit-test-1-npu-a3",
         "base-b-test-1-npu-a3",
         "base-b-test-2-npu-a3",
         "base-b-test-4-npu-a3",
