@@ -223,10 +223,19 @@ def test_diffusers_lora_matches_weight_delta_and_restores_base(
     inner = model.config.hidden_size * model.config.mlp_ratio
     # Diffusers adapter names; the FFN halves are rows [0, inner) and
     # [inner, 2 inner) of the packed gate_up projection.
+    dim = model.config.hidden_size
     targets = {
         "transformer_blocks.0.attn.to_q": (
-            "transformer_blocks.0.attn.to_q",
-            slice(None),
+            "transformer_blocks.0.attn.to_qkv",
+            slice(0, dim),
+        ),
+        "transformer_blocks.0.attn.to_k": (
+            "transformer_blocks.0.attn.to_qkv",
+            slice(dim, 2 * dim),
+        ),
+        "transformer_blocks.0.attn.to_v": (
+            "transformer_blocks.0.attn.to_qkv",
+            slice(2 * dim, 3 * dim),
         ),
         "transformer_blocks.0.img_mlp.out": (
             "transformer_blocks.0.img_mlp.out",
@@ -405,19 +414,24 @@ def test_silu_fusion_mismatch_restores_eager(bf16_model, monkeypatch):
 
 
 @torch.no_grad()
-def test_merged_ffn_loads_diffusers_split_projections(model):
-    # The checkpoint stores img_mlp.gate_layer and img_mlp.proj; the loader
-    # must place them in gate_up rows [0, inner) and [inner, 2 inner).
-    inner = model.config.hidden_size * model.config.mlp_ratio
+def test_merged_projections_load_diffusers_split_names(model):
+    # The checkpoint stores to_q/to_k/to_v and gate_layer/proj; the loader must
+    # place them in to_qkv thirds and gate_up halves in that order.
+    dim = model.config.hidden_size
+    inner = dim * model.config.mlp_ratio
     source = {}
     for name, tensor in model.state_dict().items():
-        if name.endswith(".img_mlp.gate_up.weight"):
+        if name.endswith(".attn.to_qkv.weight"):
+            base = name[: -len(".to_qkv.weight")]
+            for i, part in enumerate(("to_q", "to_k", "to_v")):
+                source[f"{base}.{part}.weight"] = tensor[i * dim : (i + 1) * dim].cpu()
+        elif name.endswith(".img_mlp.gate_up.weight"):
             base = name[: -len(".gate_up.weight")]
             source[f"{base}.gate_layer.weight"] = tensor[:inner].cpu()
             source[f"{base}.proj.weight"] = tensor[inner:].cpu()
         else:
             source[name] = tensor.cpu()
-    assert not any(".gate_up." in name for name in source)
+    assert not any(".gate_up." in name or ".to_qkv." in name for name in source)
     loaded = QwenImage21Transformer2DModel(
         QwenImage21DitConfig(arch_config=model.config), {}
     ).cuda()
@@ -435,16 +449,66 @@ def test_merged_ffn_loads_diffusers_split_projections(model):
         torch.testing.assert_close(loaded.state_dict()[name], tensor, atol=0, rtol=0)
 
 
-def test_quantized_build_keeps_split_ffn_projections(model):
+def test_quantized_build_keeps_split_projections(model):
     # Serialized quantized exports carry per-projection scales under the
-    # Diffusers names, so quantized builds keep gate_layer/proj and no mapping.
+    # Diffusers names, so quantized builds keep the split modules and no mapping.
     quantized = QwenImage21Transformer2DModel(
         QwenImage21DitConfig(arch_config=model.config), {}, quant_config=Fp8Config()
     )
-    mlp = quantized.transformer_blocks[0].img_mlp
-    assert not mlp.merged
-    assert hasattr(mlp, "gate_layer") and hasattr(mlp, "proj")
-    assert not hasattr(mlp, "gate_up")
+    block = quantized.transformer_blocks[0]
+    assert not block.img_mlp.merged and not block.attn.merged
+    assert hasattr(block.img_mlp, "gate_layer") and hasattr(block.img_mlp, "proj")
+    assert not hasattr(block.img_mlp, "gate_up")
+    assert all(hasattr(block.attn, name) for name in ("to_q", "to_k", "to_v"))
+    assert not hasattr(block.attn, "to_qkv")
     assert quantized.param_names_mapping == {}
-    assert model.transformer_blocks[0].img_mlp.merged
+    native = model.transformer_blocks[0]
+    assert native.img_mlp.merged and native.attn.merged
     assert model.param_names_mapping
+
+
+@torch.no_grad()
+def test_packed_qkv_views_match_contiguous_rope_kernels(model):
+    # project_qkv hands the fused norm+RoPE kernels strided views into the
+    # packed [B, S, 3HD] projection. The guards must accept them and the
+    # kernels must read them exactly like a contiguous copy; otherwise the
+    # real model (head size 128) silently falls back to the eager chain.
+    from sglang.kernels.ops.diffusion.rope.qknorm_complex_rope_kv_triton import (
+        can_use_qknorm_complex_rope_kv,
+        qknorm_complex_rope_kv,
+    )
+    from sglang.kernels.ops.diffusion.rope.qknorm_complex_rope_triton import (
+        can_use_qknorm_complex_rope,
+        qknorm_complex_rope,
+    )
+
+    torch.manual_seed(0)
+    heads, seq, prefix = 4, 16, 6
+    arch = QwenImage21ArchConfig(num_attention_heads=heads, attention_head_dim=128)
+    attn = model_module.QwenImage21Attention(arch, None, "attn").cuda().bfloat16()
+    for param in attn.parameters():
+        torch.nn.init.normal_(param, std=0.02)
+    x = torch.randn(2, seq, arch.hidden_size, device="cuda", dtype=torch.bfloat16)
+    q, k, v = attn.project_qkv(x)
+    weight = torch.rand(128, device="cuda", dtype=torch.bfloat16) + 0.5
+    angles = torch.rand(seq, 64, device="cuda")
+    rope = torch.polar(torch.ones_like(angles), angles)
+    kp = torch.randn(2, prefix, heads, 128, device="cuda", dtype=torch.bfloat16)
+    vp = torch.randn_like(kp)
+    assert not q.is_contiguous()
+    assert can_use_qknorm_complex_rope(q, weight, rope)
+    assert can_use_qknorm_complex_rope_kv(k, weight, rope, v, kp, vp)
+    torch.testing.assert_close(
+        qknorm_complex_rope(q, weight, rope, 1e-6),
+        qknorm_complex_rope(q.contiguous(), weight, rope, 1e-6),
+        atol=0,
+        rtol=0,
+    )
+    strided = qknorm_complex_rope_kv(k, weight, rope, v, kp, vp, 1e-6)
+    dense = qknorm_complex_rope_kv(
+        k.contiguous(), weight, rope, v.contiguous(), kp, vp, 1e-6
+    )
+    for actual, expected in zip(strided, dense, strict=True):
+        torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+    # a transposed layout must stay rejected: heads are not contiguous
+    assert not can_use_qknorm_complex_rope(q.transpose(1, 2), weight, rope)
