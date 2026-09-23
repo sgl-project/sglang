@@ -297,6 +297,8 @@ def resolve_draft_attention_backend(
 class ModelRunner:
     """ModelRunner runs the forward passes of the models."""
 
+    watermark_state: Optional[WatermarkState] = None
+
     @property
     def sampling_observer(self) -> Optional[SamplingObserver]:
         return self._sampling_observer
@@ -338,7 +340,6 @@ class ModelRunner:
         self.dist_port = nccl_port
         self.server_args = server_args
         self.is_draft_worker = is_draft_worker
-        self.watermark_state: Optional[WatermarkState] = None
         # The process entry published; a draft runner is not one (it must not
         # clobber the target's config), so only the target checks.
         if not is_draft_worker:
