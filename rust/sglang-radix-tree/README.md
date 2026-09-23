@@ -64,6 +64,10 @@ Unit tests live in `src/tests/`, mirroring the source layout one file per module
 
 Supported component sets are `[Full]`, `[Full, SWA]`, `[Full, Mamba]`, and `[Full, SWA, Mamba]`.
 
+One insertion-ordered `NodeSet` tracks device leaves, host leaves, and Full host
+duplicates. Leaf eviction ranks candidates in the policy heap; duplicate
+reclamation consumes insertion order directly, matching Python's dictionary.
+
 SWA buffer-mode load-back can repair tombstoned windows in Rust. The core finds
 missing SWA spans and attaches loaded slots across node boundaries, preserving
 Full-KV ownership, lock accounting, and pending write-through split actions.

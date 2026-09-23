@@ -1570,86 +1570,26 @@ impl<K: ChildKeyType> NodeArena<K> {
     }
 }
 
-// Eviction-eligible node set.
+// Shared node membership for eviction leaves and Full host duplicates.
 
-/// Set of `NodeIdx_`s with O(1) membership ops and dense iteration.
-#[derive(Default)]
-pub struct EvictableNodeSet {
-    /// Dense member list; order is unspecified (swap-remove).
-    nodes: Vec<NodeIdx_>,
-    /// Each member's position in `nodes`, indexed by `NodeIdx_`.
-    slots: Vec<Option<usize>>,
-}
-
-impl EvictableNodeSet {
-    pub fn new() -> Self {
-        Default::default()
-    }
-
-    /// Whether `node_id` is a member.
-    pub fn contains(&self, node_id: NodeIdx_) -> bool {
-        self.slots.get(node_id.0).copied().flatten().is_some()
-    }
-
-    /// Insert `node_id`; no-op when already a member.
-    pub fn add(&mut self, node_id: NodeIdx_) {
-        if node_id.0 >= self.slots.len() {
-            self.slots.resize(node_id.0 + 1, None);
-        }
-        if self.slots[node_id.0].is_some() {
-            return;
-        }
-        self.slots[node_id.0] = Some(self.nodes.len());
-        self.nodes.push(node_id);
-    }
-
-    /// Remove `node_id`; no-op when not a member.
-    pub fn discard(&mut self, node_id: NodeIdx_) {
-        let Some(slot) = self.slots.get(node_id.0).copied().flatten() else {
-            return;
-        };
-        self.slots[node_id.0] = None;
-        self.nodes.swap_remove(slot);
-        // The swapped-in tail member (if any) now lives at `slot`.
-        if let Some(&moved) = self.nodes.get(slot) {
-            self.slots[moved.0] = Some(slot);
-        }
-    }
-
-    /// The members, in unspecified order.
-    pub fn iter(&self) -> impl Iterator<Item = NodeIdx_> + '_ {
-        self.nodes.iter().copied()
-    }
-
-    // Test-only conveniences: production callers use add/discard/contains/iter.
-    #[cfg(test)]
-    pub fn len(&self) -> usize {
-        self.nodes.len()
-    }
-
-    #[cfg(test)]
-    pub fn is_empty(&self) -> bool {
-        self.nodes.is_empty()
-    }
-}
-
-/// Insertion-ordered membership for Full host duplicates. Unlike the dense
-/// leaf sets, removal must preserve the next host-reclaim victim's position.
+/// An insertion-ordered set of arena slots. Full host duplicate reclamation
+/// consumes this order directly; leaf eviction ranks members in a policy heap.
 /// Links are indexed by arena slot: membership/removal are O(1), insertion is
 /// amortized O(1), and iteration visits only current members.
-pub struct InsertionOrderedNodeSet {
+pub struct NodeSet {
     links: Vec<Option<(NodeIdx_, NodeIdx_)>>,
     head: NodeIdx_,
     tail: NodeIdx_,
+    len: usize,
 }
 
-impl Default for InsertionOrderedNodeSet {
+impl Default for NodeSet {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl InsertionOrderedNodeSet {
+impl NodeSet {
     const END: NodeIdx_ = NodeIdx_(usize::MAX);
 
     pub fn new() -> Self {
@@ -1657,6 +1597,7 @@ impl InsertionOrderedNodeSet {
             links: Vec::new(),
             head: Self::END,
             tail: Self::END,
+            len: 0,
         }
     }
 
@@ -1685,6 +1626,7 @@ impl InsertionOrderedNodeSet {
             self.links[self.tail.0].as_mut().unwrap().1 = node_id;
         }
         self.tail = node_id;
+        self.len += 1;
     }
 
     pub fn discard(&mut self, node_id: NodeIdx_) {
@@ -1701,20 +1643,55 @@ impl InsertionOrderedNodeSet {
         } else {
             self.links[next.0].as_mut().unwrap().0 = prev;
         }
+        self.len -= 1;
     }
 
-    pub fn iter(&self) -> impl Iterator<Item = NodeIdx_> + '_ {
-        let mut current = self.head;
-        std::iter::from_fn(move || {
-            if current == Self::END {
-                return None;
-            }
-            let node_id = current;
-            current = self.links[node_id.0].unwrap().1;
-            Some(node_id)
-        })
+    pub fn iter(&self) -> impl ExactSizeIterator<Item = NodeIdx_> + '_ {
+        // Keep an exact size hint so eviction heaps can reserve once.
+        NodeSetIter {
+            links: &self.links,
+            current: self.head,
+            remaining: self.len,
+        }
+    }
+
+    // Test-only conveniences: production callers use add/discard/contains/iter.
+    #[cfg(test)]
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    #[cfg(test)]
+    pub fn is_empty(&self) -> bool {
+        self.head == Self::END
     }
 }
+
+struct NodeSetIter<'a> {
+    links: &'a [Option<(NodeIdx_, NodeIdx_)>],
+    current: NodeIdx_,
+    remaining: usize,
+}
+
+impl Iterator for NodeSetIter<'_> {
+    type Item = NodeIdx_;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.remaining == 0 {
+            return None;
+        }
+        let node_id = self.current;
+        self.current = self.links[node_id.0].unwrap().1;
+        self.remaining -= 1;
+        Some(node_id)
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (self.remaining, Some(self.remaining))
+    }
+}
+
+impl ExactSizeIterator for NodeSetIter<'_> {}
 
 #[cfg(test)]
 #[path = "tests/node.rs"]

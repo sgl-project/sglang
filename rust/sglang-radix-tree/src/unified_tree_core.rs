@@ -16,8 +16,8 @@ use crate::components::{
 };
 use crate::node::Node;
 use crate::node::NodeArena;
+use crate::node::NodeSet;
 use crate::node::{ChildKeyType, HashDigest, KeyNamespace, KeyNamespaceRef};
-use crate::node::{EvictableNodeSet, InsertionOrderedNodeSet};
 use crate::node::{
     NUM_VALUE_SLOTS, NodeAccessError, NodeId, NodeIdx_, TreeCoreRuntimeError, ValueSlotIdx,
 };
@@ -573,11 +573,11 @@ pub struct UnifiedTreeCore<K: ChildKeyType> {
     /// Per-component bookkeeping, indexed by `ComponentType::idx`.
     pub(crate) component_states: [ComponentState; NUM_COMPONENT_TYPES],
     /// Nodes currently eligible for device eviction (D-leaves).
-    pub(crate) evictable_device_leaves: EvictableNodeSet,
+    pub(crate) evictable_device_leaves: NodeSet,
     /// Nodes currently eligible for host eviction (H-leaves).
-    pub(crate) evictable_host_leaves: EvictableNodeSet,
+    pub(crate) evictable_host_leaves: NodeSet,
     /// Full has no device LRU; track host/device duplicates in insertion order.
-    pub(crate) full_coexisting_host_nodes: InsertionOrderedNodeSet,
+    pub(crate) full_coexisting_host_nodes: NodeSet,
     pub(crate) write_back_coexist_reclaim_digest: i64,
     /// Present only during a device-eviction step, including its cascades.
     tracked_unbacked_tokens: Option<usize>,
@@ -774,9 +774,9 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             components: Vec::new(),
             components_by_type: Default::default(),
             component_states: Default::default(),
-            evictable_device_leaves: EvictableNodeSet::new(),
-            evictable_host_leaves: EvictableNodeSet::new(),
-            full_coexisting_host_nodes: InsertionOrderedNodeSet::new(),
+            evictable_device_leaves: NodeSet::new(),
+            evictable_host_leaves: NodeSet::new(),
+            full_coexisting_host_nodes: NodeSet::new(),
             write_back_coexist_reclaim_digest: 0,
             tracked_unbacked_tokens: None,
             // Disabled components keep harmless empty lists, like component_states.
@@ -820,9 +820,9 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
     pub fn reset(&mut self) {
         self.arena.reset();
         self.component_states = Default::default();
-        self.evictable_device_leaves = EvictableNodeSet::new();
-        self.evictable_host_leaves = EvictableNodeSet::new();
-        self.full_coexisting_host_nodes = InsertionOrderedNodeSet::new();
+        self.evictable_device_leaves = NodeSet::new();
+        self.evictable_host_leaves = NodeSet::new();
+        self.full_coexisting_host_nodes = NodeSet::new();
         self.write_back_coexist_reclaim_digest = 0;
         self.tracked_unbacked_tokens = None;
         self.lru_lists = Self::new_lru_lists();
