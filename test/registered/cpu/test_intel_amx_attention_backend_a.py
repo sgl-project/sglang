@@ -16,6 +16,7 @@ from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
+    get_tp_cpu_bind,
     intel_amx_benchmark,
     is_in_ci,
     popen_launch_server,
@@ -75,6 +76,7 @@ class TestIntelAMXAttnBackend(CustomTestCase):
 class TestDPAttention(CustomTestCase):
     @classmethod
     def setUpClass(cls):
+        tp_size = 2
         cls.model = DEFAULT_MLA_MODEL_NAME_FOR_TEST
         cls.base_url = DEFAULT_URL_FOR_TEST
         other_args = [
@@ -86,7 +88,7 @@ class TestDPAttention(CustomTestCase):
             "0.3",
             "--disable-overlap-schedule",
             "--tp",
-            "2",
+            str(tp_size),
             "--enable-dp-attention",
             "--dp",
             "2",
@@ -96,6 +98,11 @@ class TestDPAttention(CustomTestCase):
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=other_args,
+            env=(
+                {"SGLANG_CPU_OMP_THREADS_BIND": bind}
+                if (bind := get_tp_cpu_bind(tp_size)) is not None
+                else None
+            ),
         )
 
     @classmethod

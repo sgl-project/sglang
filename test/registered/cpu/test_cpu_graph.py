@@ -3,8 +3,6 @@ Usage:
 python3 -m unittest test_cpu_graph.TestCPUGraph.test_mmlu_torch_compile_cpu
 """
 
-import copy
-import os
 import unittest
 from types import SimpleNamespace
 
@@ -16,6 +14,7 @@ from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
+    get_tp_cpu_bind,
     intel_amx_benchmark,
     is_in_ci,
     popen_launch_server,
@@ -38,6 +37,7 @@ class TestCPUGraph(CustomTestCase):
             "2",
         ],
         min_throughput=7,
+        single_numa_node=True,
     )
     def test_latency_torch_compile_cpu(self):
         return DEFAULT_MLA_MODEL_NAME_FOR_TEST
@@ -45,10 +45,10 @@ class TestCPUGraph(CustomTestCase):
     def test_mmlu_torch_compile_cpu(self):
         model = DEFAULT_MLA_MODEL_NAME_FOR_TEST
         base_url = DEFAULT_URL_FOR_TEST
-        cpu_ids_by_node = get_cpu_ids_by_node()
-        n_numa_node = len(cpu_ids_by_node)
-        env = copy.deepcopy(os.environ)
-        env["SGLANG_CPU_OMP_THREADS_BIND"] = "all"
+        n_numa_node = len(get_cpu_ids_by_node())
+        # Confine to an already-set SGLANG_CPU_OMP_THREADS_BIND; otherwise
+        # fall back to the original one-rank-per-numa-node default.
+        bind = get_tp_cpu_bind(n_numa_node)
         process = popen_launch_server(
             model,
             base_url,
@@ -67,7 +67,7 @@ class TestCPUGraph(CustomTestCase):
                 "--tp",
                 f"{n_numa_node}",
             ],
-            env=env,
+            env={"SGLANG_CPU_OMP_THREADS_BIND": bind if bind is not None else "all"},
         )
 
         try:

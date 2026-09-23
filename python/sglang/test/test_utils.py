@@ -1433,7 +1433,7 @@ def run_bench_serving_multi(
     return res_l
 
 
-def run_bench_one_batch(model, other_args):
+def run_bench_one_batch(model, other_args, env=None):
     """Launch a offline process with automatic device detection.
 
     Args:
@@ -1460,7 +1460,9 @@ def run_bench_one_batch(model, other_args):
     ]
     if model is not None:
         command += ["--model-path", model]
-    process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    process = subprocess.Popen(
+        command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env
+    )
 
     prefill_latency = None
     decode_throughput = None
@@ -2602,7 +2604,73 @@ def write_results_to_json(model, metrics, mode="a"):
         json.dump(existing_results, f, indent=2)
 
 
-def intel_amx_benchmark(extra_args=None, min_throughput=None):
+def _parse_cpu_list(spec):
+    """One numa_parse_cpustring-style group ("0,1" / "0-31") into int ids."""
+    cpu_ids = []
+    for token in spec.split(","):
+        token = token.strip()
+        if not token:
+            continue
+        if "-" in token:
+            start, end = token.split("-")
+            cpu_ids.extend(range(int(start), int(end) + 1))
+        else:
+            cpu_ids.append(int(token))
+    return cpu_ids
+
+
+def _bind_groups_from_cpu_ids(cpu_ids, tp_size):
+    cpu_ids = sorted(cpu_ids)
+    quotient, remainder = divmod(len(cpu_ids), tp_size)
+    bind_groups = []
+    offset = 0
+    for rank in range(tp_size):
+        group_size = quotient + (rank < remainder)
+        bind_groups.append(",".join(map(str, cpu_ids[offset : offset + group_size])))
+        offset += group_size
+    return "|".join(bind_groups)
+
+
+def get_available_cpu_ids(min_cpus):
+    """CPU ids confined to an already-set SGLANG_CPU_OMP_THREADS_BIND.
+
+    Returns None when the env var is unset/empty/"all" so callers fall back
+    to their original behavior instead of picking a NUMA node on their own.
+    """
+    bind_value = os.environ.get("SGLANG_CPU_OMP_THREADS_BIND", "")
+    if not bind_value or bind_value == "all":
+        return None
+
+    cpu_ids = sorted(
+        {cpu_id for group in bind_value.split("|") for cpu_id in _parse_cpu_list(group)}
+    )
+    if len(cpu_ids) < min_cpus:
+        raise RuntimeError(
+            f"Only {len(cpu_ids)} CPUs available "
+            f"(SGLANG_CPU_OMP_THREADS_BIND={bind_value!r}) for TP{min_cpus}"
+        )
+    return cpu_ids
+
+
+def get_tp_cpu_bind(tp_size):
+    """Bind string confining tp_size ranks to an already-set
+    SGLANG_CPU_OMP_THREADS_BIND, or None if the env var isn't set."""
+    cpu_ids = get_available_cpu_ids(tp_size)
+    return _bind_groups_from_cpu_ids(cpu_ids, tp_size) if cpu_ids is not None else None
+
+
+def _get_tp_size(args):
+    tp_flags = ("--tp", "--tp-size", "--tensor-parallel-size")
+    for index, arg in enumerate(args):
+        if arg in tp_flags:
+            return int(args[index + 1])
+        for flag in tp_flags:
+            if arg.startswith(f"{flag}="):
+                return int(arg.removeprefix(f"{flag}="))
+    return 1
+
+
+def intel_amx_benchmark(extra_args=None, min_throughput=None, single_numa_node=False):
     def decorator(test_func):
         @wraps(test_func)
         def wrapper(self):
@@ -2615,8 +2683,13 @@ def intel_amx_benchmark(extra_args=None, min_throughput=None):
             full_args = common_args + (extra_args or [])
 
             model = test_func(self)
+            env = None
+            if single_numa_node:
+                bind = get_tp_cpu_bind(_get_tp_size(full_args))
+                if bind is not None:
+                    env = {**os.environ, "SGLANG_CPU_OMP_THREADS_BIND": bind}
             prefill_latency, decode_throughput, decode_latency = run_bench_one_batch(
-                model, full_args
+                model, full_args, env=env
             )
 
             print(f"{model=}")
