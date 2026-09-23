@@ -118,7 +118,6 @@ def run_evalscope(
     timeout=60000,
     stream=True,
     eval_type="openai_api",
-    judge=None,
     judge_model_args=None,
     api_key=None,
 ):
@@ -148,8 +147,6 @@ def run_evalscope(
         config_dict["dataset_args"] = dataset_args
     if dataset_dir:
         config_dict["dataset_dir"] = dataset_dir
-    if judge:
-        config_dict["judge"] = judge
     if judge_model_args:
         config_dict["judge_model_args"] = judge_model_args
     if api_key:
@@ -327,7 +324,6 @@ class TestNpuAccuracyTestCaseBase(CustomTestCase):
     # (get_max_retries); set to 1 to fail fast on first measurement.
     max_retries = None
     test_type = "accuracy"
-    judge = None
     judge_model_args = None
     api_key = None
 
@@ -513,7 +509,6 @@ class TestNpuAccuracyTestCaseBase(CustomTestCase):
                     stream=self.stream,
                     timeout=self.timeout,
                     eval_type=self.eval_type,
-                    judge=getattr(self, "judge", None),
                     judge_model_args=getattr(self, "judge_model_args", None),
                     api_key=getattr(self, "api_key", None),
                 )
@@ -549,7 +544,6 @@ class TestNpuAccuracyMultiNodePdMixTestCaseBase(CustomTestCase):
     server_timeout = DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH
     envs = None
     accuracy = 0.1
-    judge = None
     judge_model_args = None
     api_key = None
 
@@ -621,7 +615,6 @@ class TestNpuAccuracyMultiNodePdMixTestCaseBase(CustomTestCase):
                     stream=self.stream,
                     timeout=self.timeout,
                     eval_type=self.eval_type,
-                    judge=getattr(self, "judge", None),
                     judge_model_args=getattr(self, "judge_model_args", None),
                     api_key=getattr(self, "api_key", None),
                 )
@@ -656,7 +649,6 @@ class TestNpuAccuracyMultiNodePdSepTestCaseBase(CustomTestCase):
     other_args = None
     server_timeout = DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH
     accuracy = 0.1
-    judge = None
     judge_model_args = None
     api_key = None
 
@@ -744,7 +736,6 @@ class TestNpuAccuracyMultiNodePdSepTestCaseBase(CustomTestCase):
                     stream=self.stream,
                     timeout=self.timeout,
                     eval_type=self.eval_type,
-                    judge=getattr(self, "judge", None),
                     judge_model_args=getattr(self, "judge_model_args", None),
                     api_key=getattr(self, "api_key", None),
                 )
