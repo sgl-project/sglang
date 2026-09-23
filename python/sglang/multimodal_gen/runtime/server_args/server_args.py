@@ -1434,8 +1434,6 @@ class ServerArgs(DisaggServerArgsMixin):
         if current_platform.is_cpu() and (
             self.tp_size > 1 or (self.ulysses_degree or 1) > 1
         ):
-            # CPU reuses num_gpus to represent the number of CPU workers.
-            # TODO: Extend this when Ring SP is supported on CPU.
             self.num_gpus = self.tp_size * (self.ulysses_degree or 1)
 
         if self.hsdp_shard_dim is None:

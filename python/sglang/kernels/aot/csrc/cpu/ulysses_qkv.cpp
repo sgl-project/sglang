@@ -35,12 +35,17 @@
 
 void pack_qkv_destination_major_cpu(
     const at::Tensor& q, const at::Tensor& k, const at::Tensor& v, int64_t world_size, at::Tensor& output) {
-  TORCH_CHECK(
-      q.dim() == 3 && k.dim() == 3 && v.dim() == 3 && q.sizes() == k.sizes() && q.sizes() == v.sizes(),
-      "q, k, and v must have the same 3D shape");
+  CHECK_DIM(3, q);
+  CHECK_DIM(3, k);
+  CHECK_DIM(3, v);
+  CHECK_DIM(4, output);
   TORCH_CHECK(q.device().is_cpu() && k.device().is_cpu() && v.device().is_cpu(), "q, k, and v must be CPU tensors");
-  TORCH_CHECK(
-      q.scalar_type() == k.scalar_type() && q.scalar_type() == v.scalar_type(), "q, k, and v must have the same dtype");
+  CHECK_EQ(q.sizes(), k.sizes());
+  CHECK_EQ(q.sizes(), v.sizes());
+
+  CHECK_EQ(q.scalar_type(), k.scalar_type());
+  CHECK_EQ(q.scalar_type(), v.scalar_type());
+  CHECK_EQ(output.scalar_type(), q.scalar_type());
   TORCH_CHECK(
       q.layout() == at::kStrided && k.layout() == at::kStrided && v.layout() == at::kStrided,
       "q, k, and v must be strided tensors");
