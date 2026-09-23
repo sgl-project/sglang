@@ -17,6 +17,11 @@ from sglang.srt.managers.io_struct import (
     msgpack_decode,
     msgpack_encode,
 )
+from sglang.srt.managers.kv_hints import (
+    KvHintAction,
+    KvHintsEnvelope,
+    decode_kv_hints_envelope,
+)
 from sglang.srt.managers.schedule_batch import (
     Modality,
     MultimodalDataItem,
@@ -1139,6 +1144,142 @@ class TestGenerateReqInputNormalization(CustomTestCase):
         req.normalize_batch_and_arguments()
         self.assertEqual(req[0].routed_dp_rank, 3)
         self.assertEqual(req[1].routed_dp_rank, 3)
+
+
+class TestKvHintsTransport(CustomTestCase):
+    """The kv_hints envelope must survive every hop from HTTP to the scheduler."""
+
+    ENVELOPE = {
+        "protocol_version": "0.1",
+        "message_id": "msg-1",
+        "actions": [
+            {
+                "action_id": "a-1",
+                "action_type": "kv.example",
+                "action_version": "1.0",
+                # An action payload is opaque to the transport; a consumer that
+                # implements the type validates it.
+                "payload": {"endpoint": "tcp://10.0.0.2:7000", "hashes": [7]},
+            }
+        ],
+    }
+
+    def test_single_request_decodes_dict_into_typed_envelope(self):
+        req = GenerateReqInput(text="Hello", kv_hints=copy.deepcopy(self.ENVELOPE))
+        req.normalize_batch_and_arguments()
+
+        self.assertIsInstance(req.kv_hints, KvHintsEnvelope)
+        self.assertEqual(req.kv_hints.protocol_version, "0.1")
+        (action,) = req.kv_hints.actions
+        self.assertIsInstance(action, KvHintAction)
+        self.assertEqual(action.action_type, "kv.example")
+        self.assertEqual(
+            action.payload, {"endpoint": "tcp://10.0.0.2:7000", "hashes": [7]}
+        )
+
+    def test_unknown_action_type_is_carried_not_rejected(self):
+        """A consumer must be able to ignore a neighboring action it does not
+        implement, so the transport cannot reject one."""
+        envelope = copy.deepcopy(self.ENVELOPE)
+        envelope["actions"].append(
+            {
+                "action_id": "a-2",
+                "action_type": "some.future.action",
+                "action_version": "9.9",
+                "payload": {"anything": True},
+            }
+        )
+        req = GenerateReqInput(text="Hello", kv_hints=envelope)
+        req.normalize_batch_and_arguments()
+
+        self.assertEqual(
+            [action.action_type for action in req.kv_hints.actions],
+            ["kv.example", "some.future.action"],
+        )
+
+    def test_malformed_envelope_is_rejected(self):
+        for bad in (
+            {"message_id": "msg-1"},  # missing protocol_version
+            {"protocol_version": "0.1", "message_id": "msg-1", "actions": [{}]},
+            {"protocol_version": 1, "message_id": "msg-1"},
+            [{"protocol_version": "0.1", "message_id": "msg-1"}],
+        ):
+            with self.subTest(bad=bad):
+                req = GenerateReqInput(text="Hello", kv_hints=bad)
+                with self.assertRaises(ValueError):
+                    req.normalize_batch_and_arguments()
+
+    def test_single_envelope_broadcasts_to_every_batch_item(self):
+        req = GenerateReqInput(
+            text=["Hello", "World"], kv_hints=copy.deepcopy(self.ENVELOPE)
+        )
+        req.normalize_batch_and_arguments()
+
+        self.assertEqual(
+            [req[i].kv_hints.message_id for i in range(2)], ["msg-1", "msg-1"]
+        )
+
+    def test_per_item_envelopes_stay_with_their_item(self):
+        second = copy.deepcopy(self.ENVELOPE)
+        second["message_id"] = "msg-2"
+        req = GenerateReqInput(
+            text=["Hello", "World"],
+            kv_hints=[copy.deepcopy(self.ENVELOPE), second],
+        )
+        req.normalize_batch_and_arguments()
+
+        self.assertEqual(
+            [req[i].kv_hints.message_id for i in range(2)], ["msg-1", "msg-2"]
+        )
+
+    def test_per_item_envelopes_may_be_none(self):
+        """A router hints only the requests it has a decision for."""
+        req = GenerateReqInput(
+            text=["Hello", "World"], kv_hints=[None, copy.deepcopy(self.ENVELOPE)]
+        )
+        req.normalize_batch_and_arguments()
+
+        self.assertIsNone(req[0].kv_hints)
+        self.assertEqual(req[1].kv_hints.message_id, "msg-1")
+
+    def test_partial_kv_hints_list_is_rejected(self):
+        req = GenerateReqInput(
+            text=["Hello", "World"], kv_hints=[copy.deepcopy(self.ENVELOPE)]
+        )
+        with self.assertRaisesRegex(ValueError, "equal to the batch size"):
+            req.normalize_batch_and_arguments()
+
+    def test_parallel_samples_each_carry_the_envelope(self):
+        req = GenerateReqInput(
+            text=["Hello", "World"],
+            kv_hints=copy.deepcopy(self.ENVELOPE),
+            sampling_params={"n": 2},
+        )
+        req.normalize_batch_and_arguments()
+
+        self.assertEqual([req[i].kv_hints.message_id for i in range(4)], ["msg-1"] * 4)
+
+    def test_envelope_survives_the_msgpack_ipc_hop(self):
+        """The tokenizer-to-scheduler hop is msgpack, not pickle."""
+        tokenized = TokenizedGenerateReqInput(
+            input_text="",
+            input_ids=array("q", [1, 2]),
+            input_embeds=None,
+            mm_inputs=None,
+            token_type_ids=None,
+            sampling_params=SamplingParams(),
+            return_logprob=False,
+            logprob_start_len=0,
+            top_logprobs_num=0,
+            token_ids_logprob=None,
+            stream=False,
+            kv_hints=decode_kv_hints_envelope(copy.deepcopy(self.ENVELOPE)),
+        )
+        tokenized.wrap_pickle_fields()
+        decoded = msgpack_decode(msgpack_encode(tokenized))
+        decoded.unwrap_pickle_fields()
+
+        self.assertEqual(decoded.kv_hints, tokenized.kv_hints)
 
 
 class TestEmbeddingReqInputGetItem(CustomTestCase):

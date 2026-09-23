@@ -38,13 +38,14 @@ def walk_radix_cache_for_canary(
             f"walk_radix_cache_for_canary does not support {cache_type.__name__}"
         )
 
+    # RadixCache has no SWA tier, so every node it holds is SWA-resident and
+    # swa_resident_only is a no-op here.
     slot_buf: list[int] = []
     position_buf: list[int] = []
     prev_slot_buf: list[int] = []
 
     _walk_radix_subtree(
         node=radix_cache.root_node,
-        radix_cache=radix_cache,
         depth=0,
         parent_last_slot=-1,
         slot_buf=slot_buf,
@@ -52,7 +53,6 @@ def walk_radix_cache_for_canary(
         prev_slot_buf=prev_slot_buf,
         is_root=True,
         unlocked_only=unlocked_only,
-        swa_resident_only=swa_resident_only,
     )
 
     slot_tensor = torch.tensor(slot_buf, dtype=torch.int64)
@@ -68,7 +68,6 @@ def walk_radix_cache_for_canary(
 def _walk_radix_subtree(
     *,
     node: TreeNode,
-    radix_cache: BasePrefixCache,
     depth: int,
     parent_last_slot: int,
     slot_buf: list[int],
@@ -76,21 +75,10 @@ def _walk_radix_subtree(
     prev_slot_buf: list[int],
     is_root: bool,
     unlocked_only: bool,
-    swa_resident_only: bool,
 ) -> None:
     node_slots = _node_slots_for_canary(node=node)
 
-    if unlocked_only:
-        emit_slots = not is_root and _node_is_unlocked_for_canary(
-            node=node, radix_cache=radix_cache
-        )
-    else:
-        emit_slots = not is_root
-    if swa_resident_only:
-        emit_slots = emit_slots and _node_is_swa_resident_for_canary(
-            node=node,
-            radix_cache=radix_cache,
-        )
+    emit_slots = not is_root and (not unlocked_only or node.lock_ref == 0)
 
     chain_last_slot = parent_last_slot
     for j, slot in enumerate(node_slots):
@@ -105,7 +93,6 @@ def _walk_radix_subtree(
     for child in node.children.values():
         _walk_radix_subtree(
             node=child,
-            radix_cache=radix_cache,
             depth=child_depth,
             parent_last_slot=chain_last_slot,
             slot_buf=slot_buf,
@@ -113,7 +100,6 @@ def _walk_radix_subtree(
             prev_slot_buf=prev_slot_buf,
             is_root=False,
             unlocked_only=unlocked_only,
-            swa_resident_only=swa_resident_only,
         )
 
 
@@ -122,25 +108,3 @@ def _node_slots_for_canary(*, node: TreeNode) -> list[int]:
     if isinstance(value, torch.Tensor):
         return [int(s) for s in value.tolist()]
     return []
-
-
-def _node_is_unlocked_for_canary(
-    *,
-    node: TreeNode,
-    radix_cache: BasePrefixCache,
-) -> bool:
-    if type(radix_cache) is RadixCache:
-        return node.lock_ref == 0
-
-    raise NotImplementedError(
-        f"walk_radix_cache_for_canary does not support {type(radix_cache).__name__}"
-    )
-
-
-def _node_is_swa_resident_for_canary(
-    *,
-    node: TreeNode,
-    radix_cache: BasePrefixCache,
-) -> bool:
-    # RadixCache has no SWA tier, so every node it holds is resident.
-    return True

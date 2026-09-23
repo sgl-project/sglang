@@ -1515,6 +1515,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 routed_dp_rank=obj.routed_dp_rank,
                 disagg_prefill_dp_rank=obj.disagg_prefill_dp_rank,
                 priority=obj.priority,
+                kv_hints=obj.kv_hints,
                 extra_key=obj.extra_key,
                 cache_salt=obj.cache_salt,
                 routing_key=obj.routing_key,
@@ -2982,10 +2983,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                         / recv_obj.spec_verify_ct[i]
                     )
 
-                # FIXME: backward-compat aliases, remove in next release.
-                meta_info["spec_accepted_drafts"] = num_correct_drafts
-                meta_info["spec_proposed_drafts"] = num_proposed_drafts
-
             # Acceptance histogram: tracks how many decoding steps accepted a certain number of draft tokens.
             if (
                 recv_obj.spec_correct_drafts_histogram
@@ -2993,10 +2990,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 and recv_obj.spec_correct_drafts_histogram[i]
             ):
                 meta_info["spec_correct_drafts_histogram"] = (
-                    recv_obj.spec_correct_drafts_histogram[i]
-                )
-                # FIXME: backward-compat alias, remove in next release.
-                meta_info["spec_accept_histogram"] = (
                     recv_obj.spec_correct_drafts_histogram[i]
                 )
             if (
