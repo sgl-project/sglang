@@ -269,8 +269,11 @@ jobs:
             install_pkg "${pkg}"
           done
 
-          # Install sgl-eval (CLI used by run_eval.py's `sgl-eval run ...`) if missing.
-          command -v sgl-eval >/dev/null 2>&1 || install_pkg "sgl-eval==0.1.0"
+          # Fallback for images that predate the pin in pyproject_npu.toml. Checking
+          # the version, not the command, so a stale wheel is replaced rather than kept.
+          SGL_EVAL_VERSION=0.1.2
+          ${PYTHON_FOR_SGLANG} -c "import sgl_eval, sys; sys.exit(sgl_eval.__version__ != '${SGL_EVAL_VERSION}')" 2>/dev/null \
+            || install_pkg "sgl-eval==${SGL_EVAL_VERSION}"
 
           cd test
           # Append `--nightly` and `--continue-on-error` when the job belongs to the nightly pipeline.
