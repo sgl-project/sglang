@@ -105,9 +105,17 @@ def extract_answer_from_prediction(filepath: str) -> dict:
                 else:
                     full_text = ""
 
-                # 提取 Exact Answer: xxx 或 Answer: xxx
+                # 方式1：提取 Exact Answer: xxx 或 Answer: xxx
                 m = re.search(r"(?:Exact\s+)?Answer:\s*(.+)", full_text, re.IGNORECASE)
                 answer = m.group(1).strip() if m else ""
+
+                # 方式2 fallback：若正则失败，取 full_text 最后一行非空内容
+                if not answer:
+                    lines = [l.strip() for l in full_text.split("\n") if l.strip()]
+                    if lines:
+                        answer = lines[-1]
+                        # 清理 markdown 包裹
+                        answer = re.sub(r"^\*\*|\*\*$|^`|`$|^\$|\$$", "", answer).strip()
 
                 answers[idx] = answer
             except (json.JSONDecodeError, KeyError, IndexError):
@@ -211,7 +219,8 @@ def main():
                 if r["correct"]:
                     total_correct += 1
                 symbol = "✅" if r["correct"] else "❌"
-                print(f"    #{r['index']}: target={r['target']} | answer={r['model_answer']} {symbol}")
+                answer_display = r["model_answer"][:80] if r["model_answer"] else "(空)"
+                print(f"    #{r['index']}: target={r['target']} | answer={answer_display} {symbol}")
         else:
             print(f"    ⚠️ 不可评分（文件不完整）")
 
