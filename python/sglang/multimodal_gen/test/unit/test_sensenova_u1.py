@@ -48,6 +48,7 @@ from sglang.multimodal_gen.runtime.models.sensenova_u1.loader import (
     _validate_supported_checkpoint,
 )
 from sglang.multimodal_gen.runtime.models.sensenova_u1.neo_unify import (
+    modeling_neo_chat,
     modeling_qwen3,
 )
 from sglang.multimodal_gen.runtime.models.sensenova_u1.neo_unify.configuration_neo_chat import (
@@ -65,6 +66,7 @@ from sglang.multimodal_gen.runtime.models.sensenova_u1.neo_unify.modeling_neo_ch
     _copy_right_aligned_prefix_bnsd,
     _randn_with_generators,
     _randn_with_seed,
+    clear_flash_kv_cache,
     prepare_flash_kv_cache,
 )
 from sglang.multimodal_gen.runtime.models.sensenova_u1.neo_unify.modeling_qwen3 import (
@@ -344,6 +346,31 @@ def test_sensenova_u1_cache_dit_requires_an_explicit_guidance_profile():
             _cache_dit_server_args(),
             cfg_interval=(0.0, 1.0),
         )
+
+
+def test_sensenova_u1_cache_dit_is_disabled_with_sequence_parallelism(
+    monkeypatch,
+):
+    calls = _install_sensenova_cache_dit_stub(monkeypatch)
+    transformer = SimpleNamespace(
+        layers=[SimpleNamespace(attention_type="full_attention")],
+        config=SimpleNamespace(num_hidden_layers=1),
+    )
+    stage = SenseNovaU1GenerationStage(
+        model=SimpleNamespace(language_model=SimpleNamespace(model=transformer)),
+        tokenizer="tok",
+    )
+    server_args = _cache_dit_server_args()
+    server_args.sp_degree = 2
+
+    stage._maybe_enable_cache_dit(
+        _cache_dit_batch(),
+        server_args,
+        guidance_profile=SenseNovaGuidanceProfile.CONDITION,
+        cfg_interval=(0.0, 1.0),
+    )
+
+    assert calls == {"enable": [], "disable": [], "refresh": []}
 
 
 class _CacheDitRecordingBlock(torch.nn.Module):
@@ -1312,7 +1339,9 @@ def test_sensenova_u1_allows_dp_and_tp(num_gpus, dp_size, tp_size):
 def test_sensenova_u1_rejects_unassigned_replica_gpus(num_gpus, dp_size, tp_size):
     config = SenseNovaU1PipelineConfig()
 
-    with pytest.raises(ValueError, match=r"num_gpus == dp_size \* tp_size"):
+    with pytest.raises(
+        ValueError, match=r"num_gpus == dp_size \* tp_size \* sp_degree"
+    ):
         config.validate_server_args(
             SimpleNamespace(
                 num_gpus=num_gpus,
@@ -1344,14 +1373,62 @@ def test_sensenova_u1_rejects_unsupported_tp_size(tp_size):
         )
 
 
-def test_sensenova_u1_rejects_sp_and_cfg_parallelism():
-    with pytest.raises(ValueError, match="--sp-degree 1"):
+@pytest.mark.parametrize(
+    ("num_gpus", "dp_size", "tp_size", "sp_degree"),
+    [(2, 1, 1, 2), (4, 1, 2, 2), (8, 2, 2, 2), (8, 1, 1, 8)],
+)
+def test_sensenova_u1_allows_ulysses_sp(num_gpus, dp_size, tp_size, sp_degree):
+    SenseNovaU1PipelineConfig.validate_parallelism(
+        SimpleNamespace(
+            num_gpus=num_gpus,
+            dp_size=dp_size,
+            tp_size=tp_size,
+            sp_degree=sp_degree,
+            ulysses_degree=sp_degree,
+            ring_degree=1,
+            enable_cfg_parallel=False,
+            cfg_parallel_degree=1,
+        )
+    )
+
+
+def test_sensenova_u1_rejects_unsupported_sp_layouts_and_cfg_parallelism():
+    with pytest.raises(ValueError, match="Ulysses only"):
         SenseNovaU1PipelineConfig.validate_parallelism(
             SimpleNamespace(
                 num_gpus=4,
                 dp_size=1,
-                tp_size=2,
+                tp_size=1,
+                sp_degree=4,
+                ulysses_degree=2,
+                ring_degree=2,
+                enable_cfg_parallel=False,
+                cfg_parallel_degree=1,
+            )
+        )
+    with pytest.raises(ValueError, match="Ulysses only"):
+        SenseNovaU1PipelineConfig.validate_parallelism(
+            SimpleNamespace(
+                num_gpus=2,
+                dp_size=1,
+                tp_size=1,
                 sp_degree=2,
+                ulysses_degree=2,
+                ring_degree=1,
+                kv_gather_degree=2,
+                enable_cfg_parallel=False,
+                cfg_parallel_degree=1,
+            )
+        )
+    with pytest.raises(ValueError, match="KV heads"):
+        SenseNovaU1PipelineConfig.validate_parallelism(
+            SimpleNamespace(
+                num_gpus=16,
+                dp_size=1,
+                tp_size=8,
+                sp_degree=2,
+                ulysses_degree=2,
+                ring_degree=1,
                 enable_cfg_parallel=False,
                 cfg_parallel_degree=1,
             )
@@ -2881,6 +2958,32 @@ def test_sensenova_cache_dit_rejects_invalid_attention_before_mount(
     assert calls == {"enable": [], "disable": [], "refresh": []}
     assert not hasattr(transformer, "_sensenova_cache_dit_native_layers")
     assert not hasattr(transformer, "_sensenova_cache_dit_attention_type")
+
+
+def test_sensenova_sp_prefix_cache_keeps_native_storage(monkeypatch):
+    monkeypatch.setattr(modeling_neo_chat, "_sp_world_size", lambda: 2)
+    keys = torch.randn(2, 2, 5, 8)
+    values = torch.randn(2, 2, 5, 8)
+    layer = SimpleNamespace(keys=keys, values=values)
+    cache = SimpleNamespace(layers=[layer])
+
+    prepare_flash_kv_cache(
+        cache,
+        current_len=7,
+        batch_size=2,
+        prefix_lengths=torch.tensor([3, 5]),
+    )
+
+    assert layer.keys is keys
+    assert layer.values is values
+    assert layer.sensenova_sp_prefix_lengths == [3, 5]
+    assert layer.sensenova_sp_image_valid_len == 7
+    assert not hasattr(layer, "flash_k")
+    assert not hasattr(layer, "flash_v")
+
+    clear_flash_kv_cache(cache)
+    assert not hasattr(layer, "sensenova_sp_prefix_lengths")
+    assert not hasattr(layer, "sensenova_sp_image_valid_len")
 
 
 @pytest.mark.parametrize("device", ["cpu", "cuda"])

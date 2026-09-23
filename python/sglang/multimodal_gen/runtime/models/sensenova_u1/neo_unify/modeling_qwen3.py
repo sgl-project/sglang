@@ -29,7 +29,11 @@ from transformers.processing_utils import Unpack
 from transformers.utils import TransformersKwargs, can_return_tuple
 from transformers.utils.deprecation import deprecate_kwarg
 
-from sglang.multimodal_gen.runtime.distributed import get_tp_world_size
+from sglang.multimodal_gen.runtime.distributed import (
+    get_sp_world_size,
+    get_tp_world_size,
+)
+from sglang.multimodal_gen.runtime.layers.attention.layer import USPAttention
 from sglang.multimodal_gen.runtime.layers.linear import (
     ColumnParallelLinear,
     RowParallelLinear,
@@ -723,6 +727,7 @@ class Qwen3Attention(nn.Module):
         self.scaling = self.head_dim**-0.5
         self.attention_dropout = config.attention_dropout
         self.is_causal = True
+        self.use_sglang_sp = bool(getattr(config, "use_sglang_sp", False))
 
         linear_cls = (
             ColumnParallelLinear
@@ -830,6 +835,17 @@ class Qwen3Attention(nn.Module):
             }
         hw_config.max_position_embeddings = config.max_position_embeddings_hw
         self.rotary_emb_hw = Qwen3RotaryEmbedding(config=hw_config)
+
+        self.sp_attn = None
+        if self.use_sglang_sp:
+            self.sp_attn = USPAttention(
+                num_heads=self.num_heads,
+                num_kv_heads=self.num_key_value_heads,
+                head_size=self.head_dim,
+                softmax_scale=self.scaling,
+                causal=False,
+                prefix=f"sensenova.layers.{layer_idx}.self_attn",
+            )
 
     def _resolve_rope_tables(
         self,
@@ -1090,6 +1106,77 @@ class Qwen3Attention(nn.Module):
         key_states = torch.cat([key_states_t, key_states_h, key_states_w], dim=-1)
 
         update_cache = kwargs.get("update_cache", True)
+
+        # During image denoising the prompt K/V is replicated on every SP rank,
+        # while the current image Q/K/V is sequence-sharded. Keep prefix/text
+        # forwards on the native path and enter USP only for this pure-image,
+        # read-only-cache call.
+        if self.use_sglang_sp:
+            if past_key_values is None or update_cache:
+                raise RuntimeError(
+                    "SenseNova sequence parallelism is only valid for image "
+                    "denoising with a read-only prefix KV cache."
+                )
+            layer = past_key_values.layers[self.layer_idx]
+            prefix_k, prefix_v = layer.keys, layer.values
+            if prefix_k is None or prefix_v is None:
+                raise RuntimeError("SenseNova SP requires a populated prefix KV cache.")
+
+            q = query_states.transpose(1, 2).contiguous()
+            k_suffix = key_states.transpose(1, 2).contiguous()
+            v_suffix = value_states.transpose(1, 2).contiguous()
+            k_prefix = prefix_k.transpose(1, 2).contiguous()
+            v_prefix = prefix_v.transpose(1, 2).contiguous()
+
+            prefix_lengths = getattr(layer, "sensenova_sp_prefix_lengths", None)
+            image_valid_len = getattr(layer, "sensenova_sp_image_valid_len", None)
+            if prefix_lengths is None or image_valid_len is None:
+                raise RuntimeError(
+                    "SenseNova SP denoising requires prepare_flash_kv_cache() "
+                    "metadata for the replicated prefix and sharded image tokens."
+                )
+
+            image_padded_len = k_suffix.shape[1] * get_sp_world_size()
+            prefix_width = k_prefix.shape[1]
+            prefix_lengths_host = [int(length) for length in prefix_lengths]
+            prefix_lengths = torch.as_tensor(
+                prefix_lengths_host, device=q.device, dtype=torch.long
+            ).reshape(-1)
+            if prefix_lengths.numel() == 1 and q.shape[0] > 1:
+                prefix_lengths = prefix_lengths.expand(q.shape[0])
+            if prefix_lengths.numel() != q.shape[0]:
+                raise ValueError(
+                    "SenseNova SP prefix-length batch does not match Q batch: "
+                    f"{prefix_lengths.numel()} != {q.shape[0]}."
+                )
+
+            key_mask = None
+            if (
+                any(length != prefix_width for length in prefix_lengths_host)
+                or int(image_valid_len) != image_padded_len
+            ):
+                prefix_mask = (
+                    torch.arange(prefix_width, device=q.device)[None, :]
+                    < prefix_lengths[:, None]
+                )
+                image_mask = torch.arange(image_padded_len, device=q.device)[
+                    None, :
+                ] < int(image_valid_len)
+                key_mask = torch.cat(
+                    [prefix_mask, image_mask.expand(q.shape[0], -1)], dim=1
+                )
+
+            attn_output = self.sp_attn.forward_with_replicated_kv_prefix(
+                q,
+                k_prefix,
+                v_prefix,
+                k_suffix,
+                v_suffix,
+                attn_mask=key_mask,
+            )
+            attn_output = attn_output.reshape(*input_shape, -1).contiguous()
+            attn_output = _linear_output(self.o_proj_mot_gen, attn_output)
+            return attn_output, None
 
         # ------------------------------------------------------------------
         # Flash path:

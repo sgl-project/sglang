@@ -1882,6 +1882,15 @@ class USPAttention(nn.Module):
         q_ = q.transpose(1, 2)
         k_ = k.transpose(1, 2)
         v_ = v.transpose(1, 2)
+        if q_.shape[1] != k_.shape[1]:
+            if q_.shape[1] % k_.shape[1] != 0:
+                raise ValueError(
+                    f"Query heads ({q_.shape[1]}) must be divisible by "
+                    f"KV heads ({k_.shape[1]})."
+                )
+            repeat_factor = q_.shape[1] // k_.shape[1]
+            k_ = k_.repeat_interleave(repeat_factor, dim=1)
+            v_ = v_.repeat_interleave(repeat_factor, dim=1)
         mask = _prepare_sdpa_mask(attn_mask, dtype=q_.dtype, device=q_.device)
         sdpa_context = (
             sdpa_kernel(_PYTORCH_DEFAULT_CUDA_SDP_BACKENDS, set_priority=True)
@@ -1906,14 +1915,21 @@ class USPAttention(nn.Module):
         v_prefix: torch.Tensor,
         k_suffix: torch.Tensor,
         v_suffix: torch.Tensor,
+        attn_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """attention with replicated K/V prefix supplied separately"""
+        """Attention with replicated K/V prefix supplied separately.
+
+        ``attn_mask`` is an optional key-validity mask over the global
+        ``[prefix, gathered suffix]`` layout.
+        """
         forward_context: ForwardContext = get_forward_context()
         ctx_attn_metadata = forward_context.attn_metadata
 
         if self.skip_sequence_parallel or get_sequence_parallel_world_size() == 1:
             k = torch.cat([k_prefix, k_suffix], dim=1)
             v = torch.cat([v_prefix, v_suffix], dim=1)
+            if attn_mask is not None:
+                return self._masked_local_attention(q, k, v, attn_mask)
             return self.attn_impl.forward(q, k, v, ctx_attn_metadata)
 
         if self.sp_attention_mode == "kv_gather":
@@ -1921,6 +1937,8 @@ class USPAttention(nn.Module):
             v_suffix = sequence_model_parallel_all_gather(v_suffix, dim=1)
             k = torch.cat([k_prefix, k_suffix], dim=1)
             v = torch.cat([v_prefix, v_suffix], dim=1)
+            if attn_mask is not None:
+                return self._masked_local_attention(q, k, v, attn_mask)
             return self.attn_impl.forward(q, k, v, ctx_attn_metadata)
 
         if (
@@ -1929,10 +1947,18 @@ class USPAttention(nn.Module):
         ):
             k = torch.cat([k_prefix, k_suffix], dim=1)
             v = torch.cat([v_prefix, v_suffix], dim=1)
+            if attn_mask is not None:
+                return self._masked_local_attention(q, k, v, attn_mask)
             return self(q, k, v)
 
         return self._forward_with_replicated_kv_prefix_split(
-            q, k_prefix, v_prefix, k_suffix, v_suffix, ctx_attn_metadata
+            q,
+            k_prefix,
+            v_prefix,
+            k_suffix,
+            v_suffix,
+            ctx_attn_metadata,
+            attn_mask=attn_mask,
         )
 
     def _forward_with_replicated_kv_prefix(
@@ -1971,6 +1997,7 @@ class USPAttention(nn.Module):
         k_shard: torch.Tensor,
         v_shard: torch.Tensor,
         ctx_attn_metadata,
+        attn_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """split form avoids materializing full K/V before Ulysses all-to-all"""
         u_rank = get_ulysses_parallel_rank()
@@ -1998,7 +2025,13 @@ class USPAttention(nn.Module):
         v_rep = v_rep[:, :, h_start:h_end, :].contiguous()
 
         out = self._replicated_kv_attention(
-            q, k_shard, v_shard, k_rep, v_rep, ctx_attn_metadata
+            q,
+            k_shard,
+            v_shard,
+            k_rep,
+            v_rep,
+            ctx_attn_metadata,
+            attn_mask=attn_mask,
         )
         return _usp_output_all_to_all(out, head_dim=2)
 

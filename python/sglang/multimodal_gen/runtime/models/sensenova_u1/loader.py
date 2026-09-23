@@ -38,7 +38,7 @@ def _validate_supported_checkpoint(config: NEOChatConfig) -> None:
     llm_config = config.llm_config
     if not isinstance(llm_config, NEOLLMConfig):
         raise TypeError(
-            "SenseNova tensor parallelism currently supports only the dense "
+            "SenseNova TP/SP serving currently supports only the dense "
             "sensenova/SenseNova-U1.5-8B-MoT checkpoint; MoE backbones are unsupported."
         )
     mismatches = {
@@ -52,7 +52,7 @@ def _validate_supported_checkpoint(config: NEOChatConfig) -> None:
             for name, (actual, expected) in mismatches.items()
         )
         raise ValueError(
-            "SenseNova tensor parallelism currently supports only "
+            "SenseNova TP/SP serving currently supports only "
             f"sensenova/SenseNova-U1.5-8B-MoT; incompatible config: {details}"
         )
     if bool(getattr(llm_config, "tie_word_embeddings", False)):
@@ -82,6 +82,9 @@ def load_model_and_tokenizer(
     # serialized into the upstream config. Direct Transformers users retain the
     # original nn.Linear model, while SGLang constructs rank-local TP layers.
     config.llm_config.use_sglang_tp = True
+    # Keep prefix/text forwards replicated across SP ranks and shard only the
+    # image-denoising sequence inside the Qwen3 generation branch.
+    config.llm_config.use_sglang_sp = int(getattr(server_args, "sp_degree", 1) or 1) > 1
 
     weight_files = _list_safetensors_files(model_path)
     if not weight_files:

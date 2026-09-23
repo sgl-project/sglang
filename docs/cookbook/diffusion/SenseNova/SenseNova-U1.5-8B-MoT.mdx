@@ -210,11 +210,40 @@ sglang serve \
 
 The supported TP sizes are `1`, `2`, `4`, and `8`. TP shards the Qwen3 attention
 projections, MLP projections, token embedding, and LM head. The vision encoders
-and flow-matching modules remain replicated on every TP rank. Sequence
-parallelism, CFG parallelism, FSDP inference, and direct GPU weight loading are
-not supported for this checkpoint.
+and flow-matching modules remain replicated on every TP rank. CFG parallelism,
+FSDP inference, and direct GPU weight loading are not supported for this
+checkpoint.
 
-### 5.3 Data-parallel serving
+### 5.3 Sequence-parallel serving
+
+On Linux with NVIDIA CUDA or Ascend NPU, Ulysses sequence parallelism shards
+the image-token sequence during every denoising transformer pass. The prompt
+prefix remains replicated, and the image tokens are gathered before the vision
+encoder and final unpatchify. This reduces the per-device attention activation
+footprint for a single high-resolution request:
+
+```bash Command
+sglang serve \
+  --model-path sensenova/SenseNova-U1.5-8B-MoT \
+  --num-gpus 2 \
+  --dp-size 1 \
+  --tp-size 1 \
+  --sp-degree 2 \
+  --ulysses-degree 2 \
+  --ring-degree 1 \
+  --port 30000
+```
+
+SenseNova currently supports Ulysses SP only: `ring-degree` must be `1`, and
+`ulysses-degree` must equal `sp-degree`. Pass `--ulysses-degree` explicitly;
+the runtime's automatic two-device SP mode selects KV-gather, which this model
+does not enable. Both the 32 query heads and 8 KV heads must be divisible by
+`tp-size * ulysses-degree`; therefore valid combined TP/SP products are `1`,
+`2`, `4`, and `8`. Text-to-image and image-to-image requests, dynamic batches,
+and image-token counts that require tail padding are supported. Cache-DiT and
+CFG parallelism are disabled when SP is enabled.
+
+### 5.4 Data-parallel serving
 
 Use one complete replica per GPU to increase throughput for concurrent requests:
 
@@ -228,8 +257,9 @@ sglang serve \
   --port 30000
 ```
 
-You can also combine DP and TP. The device count must equal `dp-size * tp-size`;
-for example, two TP2 replicas require four devices:
+You can also combine DP, TP, and SP. The device count must equal
+`dp-size * tp-size * sp-degree`; for example, two TP2 replicas require four
+devices:
 
 ```bash Command
 sglang serve \
@@ -245,7 +275,7 @@ Generation requests are distributed across DP replicas. DP does not reduce the
 latency of one request, and every replica must have enough aggregate memory for
 the complete model and its request-time activations.
 
-### 5.4 Ascend NPU optimizations
+### 5.5 Ascend NPU optimizations
 
 On Ascend NPU, SenseNova-U1 automatically uses fused inference attention,
 RMSNorm, and SwiGLU MLP operators for supported inputs. FIA and SwiGLU fall back

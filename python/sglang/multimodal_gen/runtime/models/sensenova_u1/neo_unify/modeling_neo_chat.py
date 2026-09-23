@@ -19,6 +19,17 @@ from sglang.multimodal_gen.configs.sensenova_u1 import (
     derive_guidance_profile,
 )
 from sglang.multimodal_gen.runtime.cache.conditioning import cached_conditioning
+from sglang.multimodal_gen.runtime.distributed import (
+    get_sp_group,
+    get_sp_world_size,
+    model_parallel_is_initialized,
+)
+from sglang.multimodal_gen.runtime.distributed.sp_shard_utils import (
+    SpShard,
+    build_shard_plan,
+    gather_seq,
+    shard_like,
+)
 
 from .configuration_neo_chat import NEOChatConfig, NEOMoELLMConfig
 from .conversation import get_conv_template
@@ -38,6 +49,16 @@ from .modeling_qwen3_moe import Qwen3MoeForCausalLM
 from .utils import SYSTEM_MESSAGE_FOR_GEN, load_image_native
 
 logger = logging.get_logger(__name__)
+
+
+def _sp_world_size() -> int:
+    return get_sp_world_size() if model_parallel_is_initialized() else 1
+
+
+def _build_image_shard(seq_len: int) -> SpShard:
+    if not model_parallel_is_initialized():
+        return SpShard(seq_len, seq_len, 0, 1, 0)
+    return build_shard_plan(seq_len)
 
 
 def version_cmp(v1, v2, op="eq"):
@@ -81,6 +102,26 @@ def prepare_flash_kv_cache(
             raise ValueError(
                 f"Expected {batch_size} prefix lengths, got {len(lengths)}"
             )
+
+    if _sp_world_size() > 1:
+        # SP attention consumes the native [B, H, prefix, D] cache directly;
+        # allocating a full [prefix + global image] buffer on every rank would
+        # erase much of SP's memory saving. Store only the validity metadata
+        # needed to construct its replicated-prefix key mask.
+        for layer in past_key_values.layers:
+            prefix_width = 0 if layer.keys is None else int(layer.keys.shape[2])
+            if lengths is not None and any(
+                length < 0 or length > prefix_width for length in lengths
+            ):
+                raise ValueError(
+                    f"Prefix lengths must be between 0 and {prefix_width}, "
+                    f"got {lengths}"
+                )
+            layer.sensenova_sp_prefix_lengths = (
+                lengths if lengths is not None else [prefix_width] * batch_size
+            )
+            layer.sensenova_sp_image_valid_len = int(current_len)
+        return
 
     for layer in past_key_values.layers:
         past_k = layer.keys
@@ -162,6 +203,10 @@ def clear_flash_kv_cache(past_key_values):
     if past_key_values is None:
         return
     for layer in past_key_values.layers:
+        if hasattr(layer, "sensenova_sp_prefix_lengths"):
+            delattr(layer, "sensenova_sp_prefix_lengths")
+        if hasattr(layer, "sensenova_sp_image_valid_len"):
+            delattr(layer, "sensenova_sp_image_valid_len")
         if hasattr(layer, "flash_prefix_len"):
             delattr(layer, "flash_prefix_len")
         if hasattr(layer, "flash_total_len"):
@@ -200,6 +245,52 @@ def optimized_scale(positive_flat, negative_flat):
         st_star = dot_product / squared_norm
 
     return st_star
+
+
+def _sp_zero_padding(x: torch.Tensor, shard: SpShard) -> torch.Tensor:
+    """Zero this rank's synthetic tail rows before CFG reductions/update."""
+    if shard.local_pad:
+        x[:, -shard.local_pad :].zero_()
+    return x
+
+
+def _sp_global_norm(x: torch.Tensor) -> torch.Tensor:
+    """Per-batch L2 norm across local sequence/channel shards."""
+    if _sp_world_size() <= 1:
+        return torch.norm(x, dim=(1, 2), keepdim=True)
+    squared = x.float().square().sum(dim=(1, 2), keepdim=True)
+    squared = get_sp_group().all_reduce(squared)
+    return squared.sqrt().to(dtype=x.dtype)
+
+
+def _sp_optimized_scale(positive: torch.Tensor, negative: torch.Tensor) -> torch.Tensor:
+    """CFG-Zero* scale with dot/norm reduced over the SP sequence."""
+    if _sp_world_size() <= 1:
+        return optimized_scale(
+            positive.view(positive.shape[0], -1),
+            negative.view(negative.shape[0], -1),
+        )
+    stats = torch.stack(
+        [
+            (positive.float() * negative.float()).sum(dim=(1, 2)),
+            negative.float().square().sum(dim=(1, 2)),
+        ],
+        dim=1,
+    )
+    stats = get_sp_group().all_reduce(stats)
+    return (stats[:, :1] / (stats[:, 1:2] + 1e-8)).to(positive.dtype)
+
+
+def _sp_shard_indexes(indexes: torch.Tensor | None, shard: SpShard):
+    if indexes is None:
+        return None
+    return shard_like(indexes, shard, dim=-1, pad_mode="repeat_last")
+
+
+def _sp_gather_tokens(local: torch.Tensor, orig_len: int) -> torch.Tensor:
+    if _sp_world_size() <= 1:
+        return local
+    return gather_seq(local, orig_len, dim=1)
 
 
 def _randn_with_seed(shape, *, device, dtype, seed: int | list[int]) -> torch.Tensor:
@@ -892,6 +983,11 @@ class NEOChatModel(PreTrainedModel):
         )
 
         if self.use_pixel_head:
+            if _sp_world_size() > 1:
+                raise NotImplementedError(
+                    "SenseNova sequence parallelism does not support the legacy "
+                    "pixel-head checkpoint layout."
+                )
             merge_size = int(1 / self.downsample_ratio)
             token_h = image_size[1] // (self.patch_size * merge_size)
             token_w = image_size[0] // (self.patch_size * merge_size)
@@ -979,6 +1075,11 @@ class NEOChatModel(PreTrainedModel):
         verbose=False,
         system_message="",
     ):
+        if _sp_world_size() > 1:
+            raise NotImplementedError(
+                "SenseNova sequence parallelism currently supports t2i_generate "
+                "and it2i_generate, not interleaved generation."
+            )
         self.img_context_token_id = tokenizer.convert_tokens_to_ids(IMG_CONTEXT_TOKEN)
         self.img_start_token_id = tokenizer.convert_tokens_to_ids(IMG_START_TOKEN)
         self.config.t_eps = t_eps
@@ -1501,6 +1602,11 @@ class NEOChatModel(PreTrainedModel):
         think_mode=False,
         seed=0,
     ):
+        if _sp_world_size() > 1:
+            raise NotImplementedError(
+                "SenseNova sequence parallelism currently supports t2i_generate "
+                "and it2i_generate, not interleaved generation."
+            )
         self.img_context_token_id = tokenizer.convert_tokens_to_ids(IMG_CONTEXT_TOKEN)
         self.img_start_token_id = tokenizer.convert_tokens_to_ids(IMG_START_TOKEN)
         self.config.t_eps = t_eps
@@ -2133,6 +2239,8 @@ class NEOChatModel(PreTrainedModel):
 
         token_h = image_size[1] // (self.patch_size * merge_size)
         token_w = image_size[0] // (self.patch_size * merge_size)
+        image_token_num = token_h * token_w
+        image_shard = _build_image_shard(image_token_num)
 
         indexes_image_condition = self._build_t2i_image_indexes(
             token_h,
@@ -2226,6 +2334,16 @@ class NEOChatModel(PreTrainedModel):
                 attention_mask_uncondition_prefix,
             )
         self._notify_layer_offload_phase("denoise")
+
+        indexes_image_condition = _sp_shard_indexes(
+            indexes_image_condition, image_shard
+        )
+        indexes_image_img_condition = _sp_shard_indexes(
+            indexes_image_img_condition, image_shard
+        )
+        indexes_image_uncondition = _sp_shard_indexes(
+            indexes_image_uncondition, image_shard
+        )
 
         for layer_idx in range(len(past_key_values_condition.layers)):
             past_key_values_condition.layers[
@@ -2342,6 +2460,7 @@ class NEOChatModel(PreTrainedModel):
             ] == 0
 
             z = self.patchify(image_prediction, self.patch_size * merge_size)
+            z = shard_like(z, image_shard, dim=1)
             image_input = self.patchify(
                 image_prediction, self.patch_size, channel_first=True
             )
@@ -2350,20 +2469,21 @@ class NEOChatModel(PreTrainedModel):
                 gen_model=True,
                 grid_hw=grid_hw,
             ).view(batch_size, token_h * token_w, -1)
+            image_embeds = shard_like(image_embeds, image_shard, dim=1)
             if denoise_embeddings is not None:
                 timestep_embeddings = denoise_embeddings[step_i].view(1, 1, -1)
             else:
-                t_expanded = t.expand(batch_size * token_h * token_w)
+                t_expanded = t.expand(batch_size * image_shard.local_len)
                 timestep_embeddings = self.fm_modules["timestep_embedder"](
                     t_expanded
-                ).view(batch_size, token_h * token_w, -1)
+                ).view(batch_size, image_shard.local_len, -1)
                 if self.add_noise_scale_embedding:
                     noise_scale_tensor = torch.full_like(
                         t_expanded, noise_scale / self.noise_scale_max_value
                     )
                     timestep_embeddings += self.fm_modules["noise_scale_embedder"](
                         noise_scale_tensor
-                    ).view(batch_size, token_h * token_w, -1)
+                    ).view(batch_size, image_shard.local_len, -1)
             image_embeds = image_embeds + timestep_embeddings
 
             out_cond = self._t2i_predict_v(
@@ -2373,10 +2493,11 @@ class NEOChatModel(PreTrainedModel):
                 past_key_values_condition,
                 t,
                 z,
-                image_token_num=token_h * token_w,
+                image_token_num=image_shard.local_len,
                 timestep_embeddings=timestep_embeddings,
                 image_size=image_size,
             )
+            _sp_zero_padding(out_cond, image_shard)
 
             if not use_cfg or guidance_profile is SenseNovaGuidanceProfile.CONDITION:
                 v_pred = out_cond
@@ -2388,10 +2509,11 @@ class NEOChatModel(PreTrainedModel):
                     past_key_values_img_condition,
                     t,
                     z,
-                    image_token_num=token_h * token_w,
+                    image_token_num=image_shard.local_len,
                     timestep_embeddings=timestep_embeddings,
                     image_size=image_size,
                 )
+                _sp_zero_padding(out_img_cond, image_shard)
                 v_pred = out_img_cond + cfg_scale * (out_cond - out_img_cond)
             elif guidance_profile is SenseNovaGuidanceProfile.CONDITION_UNCONDITIONAL:
                 out_uncond = self._t2i_predict_v(
@@ -2401,10 +2523,11 @@ class NEOChatModel(PreTrainedModel):
                     past_key_values_uncondition,
                     t,
                     z,
-                    image_token_num=token_h * token_w,
+                    image_token_num=image_shard.local_len,
                     timestep_embeddings=timestep_embeddings,
                     image_size=image_size,
                 )
+                _sp_zero_padding(out_uncond, image_shard)
                 v_pred = out_uncond + cfg_scale * (out_cond - out_uncond)
             else:
                 assert (
@@ -2418,10 +2541,11 @@ class NEOChatModel(PreTrainedModel):
                     past_key_values_img_condition,
                     t,
                     z,
-                    image_token_num=token_h * token_w,
+                    image_token_num=image_shard.local_len,
                     timestep_embeddings=timestep_embeddings,
                     image_size=image_size,
                 )
+                _sp_zero_padding(out_img_cond, image_shard)
                 out_uncond = self._t2i_predict_v(
                     image_embeds,
                     indexes_image_uncondition,
@@ -2429,10 +2553,11 @@ class NEOChatModel(PreTrainedModel):
                     past_key_values_uncondition,
                     t,
                     z,
-                    image_token_num=token_h * token_w,
+                    image_token_num=image_shard.local_len,
                     timestep_embeddings=timestep_embeddings,
                     image_size=image_size,
                 )
+                _sp_zero_padding(out_uncond, image_shard)
                 v_pred = (
                     out_uncond
                     + cfg_scale * (out_cond - out_img_cond)
@@ -2440,8 +2565,8 @@ class NEOChatModel(PreTrainedModel):
                 )
             if (cfg_scale > 1 or img_cfg_scale > 1) and use_cfg:
                 if cfg_norm == "global":
-                    norm_v_condition = torch.norm(out_cond, dim=(1, 2), keepdim=True)
-                    norm_v_cfg = torch.norm(v_pred, dim=(1, 2), keepdim=True)
+                    norm_v_condition = _sp_global_norm(out_cond)
+                    norm_v_cfg = _sp_global_norm(v_pred)
                     scale = (norm_v_condition / (norm_v_cfg + 1e-8)).clamp(
                         min=0, max=1.0
                     )
@@ -2455,6 +2580,7 @@ class NEOChatModel(PreTrainedModel):
                     v_pred = v_pred * scale
 
             z = z + (t_next - t) * v_pred
+            z = _sp_gather_tokens(z, image_token_num)
             image_prediction = self.unpatchify(
                 z, self.patch_size * merge_size, image_size[1], image_size[0]
             )
@@ -2562,6 +2688,9 @@ class NEOChatModel(PreTrainedModel):
         token_h = image_size[1] // (self.patch_size * merge_size)
         token_w = image_size[0] // (self.patch_size * merge_size)
 
+        image_token_num = token_h * token_w
+        image_shard = _build_image_shard(image_token_num)
+
         indexes_image_condition = self._build_t2i_image_indexes(
             token_h,
             token_w,
@@ -2602,6 +2731,13 @@ class NEOChatModel(PreTrainedModel):
                     IMG_START_TOKEN,
                 )
             )
+            # Think generation appends real prefix tokens after the original
+            # prompt. Treat the expanded cache as fully valid for denoising.
+            condition_prefix_lengths = torch.tensor(
+                [past_key_values_condition.layers[0].keys.shape[2]],
+                dtype=torch.long,
+                device=input_ids_condition.device,
+            )
             indexes_image_condition = self._build_t2i_image_indexes(
                 token_h,
                 token_w,
@@ -2632,6 +2768,13 @@ class NEOChatModel(PreTrainedModel):
                 attention_mask_uncondition_prefix,
             )
         self._notify_layer_offload_phase("denoise")
+
+        indexes_image_condition = _sp_shard_indexes(
+            indexes_image_condition, image_shard
+        )
+        indexes_image_uncondition = _sp_shard_indexes(
+            indexes_image_uncondition, image_shard
+        )
 
         for layer_idx in range(len(past_key_values_condition.layers)):
             past_key_values_condition.layers[
@@ -2704,7 +2847,12 @@ class NEOChatModel(PreTrainedModel):
             )
 
         attention_mask_condition = {"full_attention": None}
-        if device.type == "npu" and batch_size > 1 and not npu_fia_available():
+        if (
+            _sp_world_size() == 1
+            and device.type == "npu"
+            and batch_size > 1
+            and not npu_fia_available()
+        ):
             condition_key_valid_mask = condition_key_valid_mask.expand(batch_size, -1)
             image_key_valid_mask = torch.ones(
                 (batch_size, token_h * token_w),
@@ -2746,12 +2894,12 @@ class NEOChatModel(PreTrainedModel):
             and num_steps > 0
         ):
             noise_scale_tensor = timesteps.new_full(
-                (batch_size * token_h * token_w,),
+                (batch_size * image_shard.local_len,),
                 noise_scale / self.noise_scale_max_value,
             )
             noise_embeddings = self.fm_modules["noise_scale_embedder"](
                 noise_scale_tensor
-            ).view(batch_size, token_h * token_w, -1)
+            ).view(batch_size, image_shard.local_len, -1)
 
         # Preserve GPU timestep rounding and inclusive CFG boundaries, but
         # transfer the decisions only once instead of synchronizing every step.
@@ -2764,6 +2912,7 @@ class NEOChatModel(PreTrainedModel):
             t_next = timesteps[step_i + 1]
 
             z = self.patchify(image_prediction, self.patch_size * merge_size)
+            z = shard_like(z, image_shard, dim=1)
             image_input = self.patchify(
                 image_prediction, self.patch_size, channel_first=True
             )
@@ -2772,13 +2921,14 @@ class NEOChatModel(PreTrainedModel):
                 gen_model=True,
                 grid_hw=grid_hw,
             ).view(batch_size, token_h * token_w, -1)
+            image_embeds = shard_like(image_embeds, image_shard, dim=1)
             if denoise_embeddings is not None:
                 timestep_embeddings = denoise_embeddings[step_i].view(1, 1, -1)
             else:
-                t_expanded = t.expand(batch_size * token_h * token_w)
+                t_expanded = t.expand(batch_size * image_shard.local_len)
                 timestep_embeddings = self.fm_modules["timestep_embedder"](
                     t_expanded
-                ).view(batch_size, token_h * token_w, -1)
+                ).view(batch_size, image_shard.local_len, -1)
                 if noise_embeddings is not None:
                     timestep_embeddings += noise_embeddings
             image_embeds = image_embeds + timestep_embeddings
@@ -2790,10 +2940,11 @@ class NEOChatModel(PreTrainedModel):
                 past_key_values_condition,
                 t,
                 z,
-                image_token_num=token_h * token_w,
+                image_token_num=image_shard.local_len,
                 timestep_embeddings=timestep_embeddings,
                 image_size=image_size,
             )
+            _sp_zero_padding(v_pred_condition, image_shard)
 
             if cfg_active[step_i]:
                 v_pred_uncondition = self._t2i_predict_v(
@@ -2803,19 +2954,17 @@ class NEOChatModel(PreTrainedModel):
                     past_key_values_uncondition,
                     t,
                     z,
-                    image_token_num=token_h * token_w,
+                    image_token_num=image_shard.local_len,
                     timestep_embeddings=timestep_embeddings,
                     image_size=image_size,
                 )
+                _sp_zero_padding(v_pred_uncondition, image_shard)
                 if cfg_norm == "cfg_zero_star":
-                    positive_flat = v_pred_condition.view(batch_size, -1)
-                    negative_flat = v_pred_uncondition.view(batch_size, -1)
-
-                    alpha = optimized_scale(positive_flat, negative_flat)
+                    alpha = _sp_optimized_scale(v_pred_condition, v_pred_uncondition)
                     alpha = alpha.view(
                         batch_size, *([1] * (len(v_pred_condition.shape) - 1))
                     )
-                    alpha = alpha.to(positive_flat.dtype)
+                    alpha = alpha.to(v_pred_condition.dtype)
 
                     if step_i <= 0:
                         v_pred = v_pred_condition * 0.0
@@ -2828,10 +2977,8 @@ class NEOChatModel(PreTrainedModel):
                         v_pred_condition - v_pred_uncondition
                     )
                     if cfg_norm == "global":
-                        norm_v_condition = torch.norm(
-                            v_pred_condition, dim=(1, 2), keepdim=True
-                        )
-                        norm_v_cfg = torch.norm(v_pred, dim=(1, 2), keepdim=True)
+                        norm_v_condition = _sp_global_norm(v_pred_condition)
+                        norm_v_cfg = _sp_global_norm(v_pred)
                         scale = (norm_v_condition / (norm_v_cfg + 1e-8)).clamp(
                             min=0, max=1.0
                         )
@@ -2849,6 +2996,8 @@ class NEOChatModel(PreTrainedModel):
                 v_pred = v_pred_condition
 
             z = z + (t_next - t) * v_pred
+
+            z = _sp_gather_tokens(z, image_token_num)
 
             image_prediction = self.unpatchify(
                 z, self.patch_size * merge_size, image_size[1], image_size[0]
@@ -2877,6 +3026,11 @@ class NEOChatModel(PreTrainedModel):
         IMG_CONTEXT_TOKEN="<IMG_CONTEXT>",
         verbose=False,
     ):
+        if _sp_world_size() > 1:
+            raise NotImplementedError(
+                "SenseNova sequence parallelism currently supports t2i_generate "
+                "and it2i_generate, not chat/interleaved generation."
+            )
 
         if history is None and pixel_values is not None and "<image>" not in question:
             question = "<image>\n" + question

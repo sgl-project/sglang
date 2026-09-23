@@ -25,6 +25,7 @@ from sglang.multimodal_gen.configs.sensenova_u1 import (
     resolve_sensenova_u1_edit_auto_size,
 )
 from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
+from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 from sglang.multimodal_gen.runtime.models.sensenova_u1.neo_unify.utils import (
     smart_resize,
 )
@@ -270,6 +271,8 @@ class SenseNovaU1GenerationStage(PipelineStage):
         """Why a request that asked for Cache-DiT cannot mount it; None when it can."""
         if server_args.enable_breakable_cuda_graph:
             return "breakable CUDA graphs are enabled"
+        if int(getattr(server_args, "sp_degree", 1) or 1) > 1:
+            return "SenseNova sequence parallelism is enabled"
         if guidance_profile.branch_count > 2:
             return "three conditioning branches are not supported"
         # cache-dit's separate-CFG context expects a stable pair of forwards per
@@ -508,20 +511,23 @@ class SenseNovaU1GenerationStage(PipelineStage):
             think_mode=options.think_mode,
             generators=generators,
         )
-        if edit_images:
-            out = self.model.it2i_generate(
-                self.tokenizer,
-                batch.prompt,
-                edit_images,
-                img_cfg_scale=options.img_cfg_scale,
-                **common_kwargs,
-            )
-        else:
-            out = self.model.t2i_generate(
-                self.tokenizer,
-                batch.prompt,
-                **common_kwargs,
-            )
+        with set_forward_context(
+            current_timestep=0, attn_metadata=None, forward_batch=batch
+        ):
+            if edit_images:
+                out = self.model.it2i_generate(
+                    self.tokenizer,
+                    batch.prompt,
+                    edit_images,
+                    img_cfg_scale=options.img_cfg_scale,
+                    **common_kwargs,
+                )
+            else:
+                out = self.model.t2i_generate(
+                    self.tokenizer,
+                    batch.prompt,
+                    **common_kwargs,
+                )
         think_text = None
         if options.think_mode:
             images, think_text = out

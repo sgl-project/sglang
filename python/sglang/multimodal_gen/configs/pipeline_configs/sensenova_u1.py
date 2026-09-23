@@ -119,19 +119,34 @@ class SenseNovaU1PipelineConfig(PipelineConfig):
 
     @staticmethod
     def validate_parallelism(server_args) -> None:
-        """Validate DP x TP serving for the supported U1.5 dense checkpoint."""
+        """Validate DP x TP x Ulysses-SP serving for the U1.5 checkpoint."""
         num_gpus = int(server_args.num_gpus)
         dp_size = int(getattr(server_args, "dp_size", 1) or 1)
         tp_size = int(getattr(server_args, "tp_size", 1) or 1)
         sp_degree = int(getattr(server_args, "sp_degree", 1) or 1)
+        ulysses_degree = int(
+            getattr(server_args, "ulysses_degree", sp_degree) or sp_degree
+        )
+        ring_degree = int(getattr(server_args, "ring_degree", 1) or 1)
+        kv_gather_degree = int(getattr(server_args, "kv_gather_degree", 1) or 1)
         if tp_size not in (1, 2, 4, 8):
             raise ValueError(
                 "SenseNova-U1.5-8B-MoT supports --tp-size 1, 2, 4, or 8; "
                 f"got {tp_size}."
             )
-        if sp_degree != 1:
+        if ring_degree != 1 or kv_gather_degree != 1 or ulysses_degree != sp_degree:
             raise ValueError(
-                "SenseNova-U1.5-8B-MoT tensor parallelism requires --sp-degree 1."
+                "SenseNova-U1.5-8B-MoT sequence parallelism currently supports "
+                "Ulysses only: --ring-degree and --kv-gather-degree must be 1, "
+                "and --ulysses-degree must equal --sp-degree."
+            )
+        # Ulysses splits the heads that remain on each TP rank. The checkpoint
+        # has 32 query heads and 8 KV heads, so the latter is the tight bound.
+        if 32 % (tp_size * ulysses_degree) != 0 or 8 % (tp_size * ulysses_degree) != 0:
+            raise ValueError(
+                "SenseNova-U1.5-8B-MoT requires both 32 attention heads and 8 "
+                "KV heads to be divisible by tp_size * ulysses_degree; got "
+                f"{tp_size} * {ulysses_degree}."
             )
         if (
             bool(getattr(server_args, "enable_cfg_parallel", False))
@@ -140,10 +155,11 @@ class SenseNovaU1PipelineConfig(PipelineConfig):
             raise ValueError(
                 "SenseNova-U1.5-8B-MoT does not support CFG parallelism yet."
             )
-        if num_gpus != dp_size * tp_size:
+        if num_gpus != dp_size * tp_size * sp_degree:
             raise ValueError(
-                "SenseNova-U1.5-8B-MoT requires num_gpus == dp_size * tp_size "
-                f"with SP/CFG disabled; got {num_gpus} != {dp_size} * {tp_size}."
+                "SenseNova-U1.5-8B-MoT requires "
+                "num_gpus == dp_size * tp_size * sp_degree with CFG disabled; "
+                f"got {num_gpus} != {dp_size} * {tp_size} * {sp_degree}."
             )
 
     @staticmethod
