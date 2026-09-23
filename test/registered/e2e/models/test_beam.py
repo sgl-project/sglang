@@ -29,6 +29,8 @@ from sglang.test.test_utils import CustomTestCase
 
 # Cover FMHA-v2/XQA on Hopper and TRT-LLM-GEN on Blackwell; TP4 runs only on
 # the four-GPU Blackwell runner.
+# ci-cost-override: the smallest Blackwell runner has four GPUs, and each
+# parallel layout needs its own engine launch.
 register_cuda_ci(est_time=600, stage="base-b", runner_config="2-gpu-large")
 register_cuda_ci(est_time=600, stage="base-b", runner_config="4-gpu-b200")
 
