@@ -14,7 +14,18 @@ from sglang.srt.layers.attention.dsa.dsa_indexer import (
     rotate_activation,
 )
 from sglang.srt.layers.attention.dsa.dsa_topk_backend import TopkTransformMethod
-from sglang.srt.layers.attention.dsa.utils import dsa_use_prefill_cp
+from sglang.srt.layers.attention.dsa.paged_mqa_logits_backend import (
+    DSAPagedMQALogitsBackend,
+)
+from sglang.srt.layers.attention.dsa.utils import (
+    aiter_can_use_preshuffle_paged_mqa,
+    dsa_use_prefill_cp,
+)
+from sglang.srt.layers.attention.mqa_logits_utils import (
+    MQA_LOGITS_BYTES_PER_ELEM,
+    MQA_LOGITS_MAX_BYTES_ROCM,
+    mqa_logits_rows_per_chunk,
+)
 from sglang.srt.layers.layernorm import LayerNorm
 from sglang.srt.layers.utils import MultiPlatformOp
 from sglang.srt.utils import add_prefix, ceil_align, is_cuda, is_hip, is_npu
@@ -46,7 +57,7 @@ from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
     is_in_breakable_cuda_graph,
 )
-from sglang.srt.runtime_context import get_device
+from sglang.srt.runtime_context import get_device, get_exec
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
@@ -108,6 +119,11 @@ class IndexerKPool(MultiPlatformOp):
         )
         assert 64 % self.index_kpool == 0, (
             f"index_kpool ({self.index_kpool}) must divide page_size (64)"
+        )
+
+        # resolve() pins ROCm to AITER and lets --dsa-paged-mqa-logits-backend reach this path
+        self.paged_mqa_logits_backend = DSAPagedMQALogitsBackend.resolve(
+            get_exec().kernel.dsa_paged_mqa_logits_backend
         )
 
         self.index_kpool_compress_ape = nn.Parameter(
@@ -809,11 +825,65 @@ class IndexerKPool(MultiPlatformOp):
         return None, None, None
 
     @staticmethod
+    def _fp8_mqa_logits(
+        q_fp8: torch.Tensor,
+        k_fp8: torch.Tensor,
+        k_scale: torch.Tensor,
+        weights: torch.Tensor,
+        starts: torch.Tensor,
+        ends: torch.Tensor,
+        *,
+        clean_logits: bool,
+    ) -> torch.Tensor:
+        """Ragged MQA logits: DeepGEMM on CUDA, AITER's Triton kernel on ROCm."""
+        if is_hip():
+            from aiter.ops.triton.fp8_mqa_logits import fp8_mqa_logits
+
+            # above 2 GiB of fp32 logits the kernel miscompiles and abort()s the
+            # process (ROCm/aiter#5114); rows are independent, so block the queries
+            num_q, num_k = q_fp8.shape[0], k_fp8.shape[0]
+            rows_per_call = mqa_logits_rows_per_chunk(
+                num_rows=num_q,
+                row_bytes=num_k * MQA_LOGITS_BYTES_PER_ELEM,
+                budget_bytes=MQA_LOGITS_MAX_BYTES_ROCM,
+            )
+            if rows_per_call is None:
+                return fp8_mqa_logits(
+                    q_fp8,
+                    k_fp8,
+                    k_scale,
+                    weights,
+                    starts,
+                    ends,
+                    clean_logits=clean_logits,
+                )
+            logits = torch.empty(
+                (num_q, num_k), dtype=torch.float32, device=q_fp8.device
+            )
+            for i in range(0, num_q, rows_per_call):
+                rows = slice(i, i + rows_per_call)
+                logits[rows] = fp8_mqa_logits(
+                    q_fp8[rows],
+                    k_fp8,
+                    k_scale,
+                    weights[rows],
+                    starts[rows],
+                    ends[rows],
+                    clean_logits=clean_logits,
+                )
+            return logits
+
+        return deep_gemm.fp8_mqa_logits(
+            q_fp8, (k_fp8, k_scale), weights, starts, ends, clean_logits=clean_logits
+        )
+
+    @staticmethod
     def _should_use_tilelang_paged_mqa_logits(q_fp8: torch.Tensor) -> bool:
+        # q_fp8 is [tokens, heads, dim], without the next_n dim
         if not is_cuda():
             return False
         arch_major, _ = torch.cuda.get_device_capability(q_fp8.device)
-        num_heads = q_fp8.shape[2]
+        num_heads = q_fp8.shape[1]
         return arch_major == 9 and num_heads not in (32, 64)
 
     def _get_topk_paged(
@@ -850,7 +920,7 @@ class IndexerKPool(MultiPlatformOp):
         if n_real < num_q_padded:
             q_fp8 = q_fp8[:n_real]
             weights = weights[:n_real]
-        q_fp8 = q_fp8.unsqueeze(1)  # the next_n dim is 1 now
+        # aiter_paged_mqa_logits adds the next_n dim itself; the other two want it already there
         assert len(kv_cache_fp8.shape) == 2
         block_kv = 64
         num_heads_kv = 1
@@ -860,7 +930,11 @@ class IndexerKPool(MultiPlatformOp):
         )
         assert len(weights.shape) == 3
         weights = weights.squeeze(2)
-        use_tilelang_paged_mqa = self._should_use_tilelang_paged_mqa_logits(q_fp8)
+        use_aiter_paged_mqa = self.paged_mqa_logits_backend.is_aiter()
+        use_tilelang_paged_mqa = (
+            not use_aiter_paged_mqa
+            and self._should_use_tilelang_paged_mqa_logits(q_fp8)
+        )
 
         pool_seqlens, pool_context_lens, pool_block_tables, pool_schedule_metadata = (
             self._get_kpool_decode_metadata(
@@ -868,17 +942,40 @@ class IndexerKPool(MultiPlatformOp):
                 block_tables,
                 seqlens_32,
                 blocksize,
-                build_schedule_metadata=not use_tilelang_paged_mqa,
+                build_schedule_metadata=not (
+                    use_aiter_paged_mqa or use_tilelang_paged_mqa
+                ),
             )
         )
         pool_max_seq_len = pool_block_tables.shape[1] * blocksize
-        if use_tilelang_paged_mqa:
+        if use_aiter_paged_mqa:
+            # kpool_fp8_index writes in AITER's tile order, so a row-major reader would misread the cache
+            if not aiter_can_use_preshuffle_paged_mqa():
+                raise RuntimeError(
+                    "The ROCm k-pool indexer needs AITER's preshuffle paged-MQA "
+                    "kernel. It requires Triton >= 3.5.0, or "
+                    "AITER_ENABLE_AOT_GLUON_PA_MQA_LOGITS=1 with the AOT gluon "
+                    "artifacts present in the image."
+                )
+            from sglang.kernels.ops.attention.dsa import aiter_paged_mqa_logits
+
+            logits = aiter_paged_mqa_logits(
+                q_fp8,
+                kv_cache_fp8,
+                weights,
+                pool_seqlens,
+                pool_block_tables,
+                pool_max_seq_len,
+                preshuffle=True,
+                kv_block_size=block_kv,
+            )
+        elif use_tilelang_paged_mqa:
             from sglang.kernels.ops.attention.dsa.tilelang_kernel import (
                 tilelang_fp8_paged_mqa_logits,
             )
 
             logits = tilelang_fp8_paged_mqa_logits(
-                q_fp8,
+                q_fp8.unsqueeze(1),
                 kv_cache_fp8,
                 weights,
                 pool_seqlens,
@@ -889,7 +986,7 @@ class IndexerKPool(MultiPlatformOp):
             )
         else:
             logits = deep_gemm.fp8_paged_mqa_logits(
-                q_fp8,
+                q_fp8.unsqueeze(1),
                 kv_cache_fp8,
                 weights,
                 pool_context_lens,
@@ -967,9 +1064,10 @@ class IndexerKPool(MultiPlatformOp):
                 scale_out=k_scale,
             )
             k_fp8 = k_u8.view(torch.float8_e4m3fn)
-            logits = deep_gemm.fp8_mqa_logits(
+            logits = self._fp8_mqa_logits(
                 q_fp8[:n_real].contiguous(),
-                (k_fp8.contiguous(), k_scale.contiguous()),
+                k_fp8.contiguous(),
+                k_scale.contiguous(),
                 weights[:n_real].contiguous(),
                 ks_per_q,
                 ke_per_q,
@@ -1199,9 +1297,10 @@ class IndexerKPool(MultiPlatformOp):
                     and zero_starts_by_batch[i] is not None
                     else torch.zeros((q_len,), dtype=torch.int32, device=q_fp8.device)
                 )
-                local_logits = deep_gemm.fp8_mqa_logits(
+                local_logits = self._fp8_mqa_logits(
                     q_fp8[q_slice].contiguous(),
-                    (k_fp8.contiguous(), k_scale.contiguous()),
+                    k_fp8.contiguous(),
+                    k_scale.contiguous(),
                     weights[q_slice].contiguous(),
                     row_starts,
                     local_pool_lens,
@@ -1333,7 +1432,7 @@ class IndexerKPool(MultiPlatformOp):
         enable_dual_stream: bool,
         return_indices: bool = True,
     ) -> Optional[torch.Tensor]:
-        assert is_cuda(), "DSA kpool target_verify is CUDA-only"
+        assert is_cuda() or is_hip(), "DSA kpool target_verify needs CUDA or ROCm"
         plan = metadata.attn_metadata.kpool_write_plan
         assert plan is not None, "DSA kpool target_verify requires kpool_write_plan"
         num_draft_tokens = plan.num_draft_tokens
@@ -1575,7 +1674,7 @@ class IndexerKPool(MultiPlatformOp):
         if not return_indices:
             return None
 
-        if is_cuda():
+        if is_cuda() or is_hip():
             if (
                 forward_batch.forward_mode.is_decode_or_idle()
                 or forward_batch.forward_mode.is_target_verify()
@@ -1603,5 +1702,7 @@ class IndexerKPool(MultiPlatformOp):
                         kpool_extend_cache=kpool_extend_cache,
                     )
         else:
-            raise NotImplementedError("kpool indexer is only supported on CUDA")
+            raise NotImplementedError(
+                "kpool indexer is only supported on CUDA and ROCm"
+            )
         return topk_result
