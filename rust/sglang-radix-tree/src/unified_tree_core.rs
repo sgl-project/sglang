@@ -22,7 +22,9 @@ use crate::node::{
     NUM_VALUE_SLOTS, NodeAccessError, NodeId, NodeIdx_, TreeCoreRuntimeError, ValueSlotIdx,
 };
 use crate::unified_lru_list::UnifiedLRUList;
-use crate::unified_lru_list::{EvictionStrategy, PriorityKey, get_eviction_strategy};
+use crate::unified_lru_list::{
+    EvictionStrategy, PriorityKey, TlruFloatConfig, get_eviction_strategy,
+};
 
 // A 42-bit mask keeps digest multiplication by 1_000_003 within i64.
 const COEXIST_RECLAIM_DIGEST_MULTIPLIER: i64 = 1_000_003;
@@ -502,6 +504,8 @@ pub struct CacheInitParams {
     pub slru_protected_threshold: i64,
     /// Nonnegative T-LRU threshold minus the next-prompt estimate, in tokens.
     pub tlru_tail_budget: usize,
+    /// Original arithmetic for floating-point T-LRU parameters, when configured.
+    pub tlru_float_config: Option<TlruFloatConfig>,
     /// Atoms per radix page; children are keyed by their key's first page.
     pub page_size: usize,
     /// Whether the cache runs the write-back (vs write-through) policy.
@@ -532,6 +536,7 @@ impl Default for CacheInitParams {
             eviction_policy: "lru".to_string(),
             slru_protected_threshold: 2,
             tlru_tail_budget: 0,
+            tlru_float_config: None,
             page_size: 1,
             is_write_back: false,
             enable_hicache: false,
@@ -786,6 +791,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
                 &params.eviction_policy,
                 params.slru_protected_threshold,
                 params.tlru_tail_budget,
+                params.tlru_float_config,
             ),
             tlru_bookkeeping: params.eviction_policy.eq_ignore_ascii_case("tlru"),
             page_size: params.page_size,

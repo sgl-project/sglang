@@ -488,16 +488,65 @@ impl<K: ChildKeyType> EvictionStrategy<K> for SlruStrategy {
 pub struct TlruStrategy {
     /// max(threshold - next_prompt_estimate, 0), in logical tokens.
     pub tail_budget: usize,
+    /// Preserve Python's operation order when either parameter is a float.
+    pub float_config: Option<TlruFloatConfig>,
+}
+
+#[derive(Clone, Copy)]
+pub struct TlruFloatConfig {
+    pub threshold: f64,
+    pub next_prompt_estimate: TlruPromptEstimate,
+}
+
+/// How Python evaluates history + next_prompt_estimate before subtraction.
+#[derive(Clone, Copy)]
+pub enum TlruPromptEstimate {
+    Float(f64),
+    /// The adapter ensures adding any native history length fits in i128.
+    Integer(i128),
+    /// Larger integers cross at most one float rounding boundary over the
+    /// native history-length range. The adapter computes that boundary once.
+    RoundedInteger {
+        below: f64,
+        cutoff: usize,
+        above: f64,
+    },
+}
+
+impl TlruFloatConfig {
+    pub(crate) fn is_tel_safe(&self, history: usize, cached_without_node: usize) -> bool {
+        let next_prompt = match self.next_prompt_estimate {
+            TlruPromptEstimate::Float(estimate) => history as f64 + estimate,
+            TlruPromptEstimate::Integer(estimate) => (history as i128 + estimate) as f64,
+            TlruPromptEstimate::RoundedInteger {
+                below,
+                cutoff,
+                above,
+            } => {
+                if history < cutoff {
+                    below
+                } else {
+                    above
+                }
+            }
+        };
+        let budget = next_prompt - self.threshold;
+        // Match Python's max(budget, 0) and exact int >= float comparison.
+        // NaN stays unsafe; casting the integer to f64 could round it upward.
+        budget <= 0.0
+            || (budget < (usize::MAX as u128 + 1) as f64
+                && cached_without_node >= budget.ceil() as usize)
+    }
 }
 
 impl<K: ChildKeyType> EvictionStrategy<K> for TlruStrategy {
     fn get_priority(&self, node: &Node<K>) -> PriorityKey {
         let cached_without_node = node.tlru_cached_prefix_len - node.key.atom_len();
-        let tail_len = node.tlru_history_len - cached_without_node;
-        PriorityKey(
-            if tail_len <= self.tail_budget { -1 } else { 0 },
-            node.last_access_counter,
-        )
+        let tel_safe = match self.float_config {
+            Some(config) => config.is_tel_safe(node.tlru_history_len, cached_without_node),
+            None => node.tlru_history_len - cached_without_node <= self.tail_budget,
+        };
+        PriorityKey(if tel_safe { -1 } else { 0 }, node.last_access_counter)
     }
 }
 
@@ -506,6 +555,7 @@ pub fn get_eviction_strategy<K: ChildKeyType>(
     policy: &str,
     slru_protected_threshold: i64,
     tlru_tail_budget: usize,
+    tlru_float_config: Option<TlruFloatConfig>,
 ) -> Box<dyn EvictionStrategy<K> + Send> {
     match policy.to_lowercase().as_str() {
         "lru" => Box::new(LruStrategy),
@@ -519,6 +569,7 @@ pub fn get_eviction_strategy<K: ChildKeyType>(
         }),
         "tlru" => Box::new(TlruStrategy {
             tail_budget: tlru_tail_budget,
+            float_config: tlru_float_config,
         }),
         other => panic!(
             "Unknown eviction policy: {other}. Supported policies: \

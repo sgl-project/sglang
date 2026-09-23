@@ -43,15 +43,6 @@ logger = logging.getLogger(__name__)
 def _rust_fallback_reason(params: CacheInitParams) -> Optional[str]:
     if params.enable_session_radix_cache:
         return "session-aware caching requires the Python TreeCore"
-    if params.eviction_policy.lower() == "tlru":
-        config = params.eviction_policy_config or {}
-        if any(
-            not isinstance(config.get(key, 0), int)
-            for key in ("threshold", "next_prompt_estimate")
-        ):
-            # Python historically accepts non-integer counts. Preserve its
-            # arithmetic/rounding rather than normalize them as integer tokens.
-            return "T-LRU with non-integer token counts requires the Python TreeCore"
     if params.tree_components is not None and set(params.tree_components) - {
         ComponentType.FULL,
         ComponentType.SWA,

@@ -73,6 +73,41 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.unified_cache.unified_tree_core import UnifiedTreeNode
 
 
+def _tlru_float_config(native_bindings, threshold, next_prompt_estimate):
+    """Preserve Python's mixed arithmetic without allocating during eviction."""
+    if not all(
+        isinstance(value, (int, float)) for value in (threshold, next_prompt_estimate)
+    ):
+        raise TypeError("T-LRU parameters must be integer or floating-point numbers")
+    threshold = float(threshold)
+    max_history = 2 * sys.maxsize + 1
+    if isinstance(next_prompt_estimate, int):
+        # Python adds the integer history before converting the sum to float.
+        if -(2**127) <= next_prompt_estimate <= 2**127 - 1 - max_history:
+            return native_bindings.TlruFloatConfig(
+                threshold, 0.0, integer_estimate=next_prompt_estimate
+            )
+
+        # Beyond i128, adjacent float rounding boundaries are farther apart
+        # than the entire native history range. Find the one possible change
+        # once, using Python's exact integers and ties-to-even conversion.
+        below = float(next_prompt_estimate)
+        above = float(next_prompt_estimate + max_history)
+        if below != above:
+            lo, hi = 0, max_history
+            while lo < hi:
+                mid = (lo + hi) // 2
+                if float(next_prompt_estimate + mid) == below:
+                    lo = mid + 1
+                else:
+                    hi = mid
+            return native_bindings.TlruFloatConfig(
+                threshold, below, rounded_estimate_transition=(lo, above)
+            )
+        next_prompt_estimate = below
+    return native_bindings.TlruFloatConfig(threshold, float(next_prompt_estimate))
+
+
 def _radix_key_buffer(key: RadixKey) -> array:
     """The key's token ids honoring `limit`; view-independent since the
     binding derives its own atoms."""
@@ -336,19 +371,19 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
             params.eviction_policy, params.eviction_policy_config
         )
         tlru_tail_budget = 0
+        tlru_float_config = None
         if params.eviction_policy.lower() == "tlru":
             threshold = eviction_strategy.threshold
             next_prompt_estimate = eviction_strategy.next_prompt_estimate
-            if not isinstance(threshold, int) or not isinstance(
-                next_prompt_estimate, int
-            ):
-                raise ValueError("Rust T-LRU requires integer token counts")
-            # Subtract before clamping so arbitrary-sized Python integers keep
-            # their exact difference. Native compares this budget with a usize
-            # path length; larger budgets make every non-root node TEL-safe.
-            tlru_tail_budget = min(
-                max(threshold - next_prompt_estimate, 0), 2 * sys.maxsize + 1
-            )
+            if isinstance(threshold, int) and isinstance(next_prompt_estimate, int):
+                # Subtract before clamping to preserve arbitrary-size integers.
+                tlru_tail_budget = min(
+                    max(threshold - next_prompt_estimate, 0), 2 * sys.maxsize + 1
+                )
+            else:
+                tlru_float_config = _tlru_float_config(
+                    self._bindings, threshold, next_prompt_estimate
+                )
         if ComponentType.SWA in self.tree_components and (
             params.sliding_window_size is None or params.sliding_window_size <= 0
         ):
@@ -386,6 +421,7 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
                     eviction_strategy, "protected_threshold", 2
                 ),
                 tlru_tail_budget=tlru_tail_budget,
+                tlru_float_config=tlru_float_config,
                 page_size=params.page_size,
                 is_write_back=False,
                 enable_hicache=False,

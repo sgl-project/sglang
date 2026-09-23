@@ -1,6 +1,7 @@
 """Integration tests driving the real compiled Rust mem_cache extension."""
 
 import hashlib
+import math
 import sys
 from array import array
 from itertools import pairwise
@@ -29,6 +30,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchResult,
 )
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
+from sglang.srt.mem_cache.evict_policy import TLRUStrategy
 from sglang.srt.mem_cache.hicache_storage import (
     PoolHitPolicy,
     PoolName,
@@ -36,8 +38,12 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolTransferResult,
 )
 from sglang.srt.mem_cache.radix_cache import RadixKey
-from sglang.srt.mem_cache.rust_tree_core.adapter import RustUnifiedTreeCore
+from sglang.srt.mem_cache.rust_tree_core.adapter import (
+    RustUnifiedTreeCore,
+    _tlru_float_config,
+)
 from sglang.srt.mem_cache.rust_tree_core.extension import bindings as mem_cache
+from sglang.srt.mem_cache.rust_tree_core.extension import load_tree_core_extension
 from sglang.srt.mem_cache.unified_cache.cache_action import (
     BackupKV,
     FreeComponentHostSlot,
@@ -320,6 +326,264 @@ def test_tlru_config_prioritizes_safe_tails_then_recency(backend, config, evict_
         [10, 11] if evict_recent else list(range(200, 208))
     )
     core.sanity_check([], [])
+
+
+@pytest.mark.parametrize("backend", ["python", "rust"])
+@pytest.mark.parametrize("tier", ["device", "host"])
+@pytest.mark.parametrize(
+    "threshold,next_prompt_estimate,evict_recent",
+    [
+        pytest.param(4096.0, 4095.0, True, id="integral-floats"),
+        pytest.param(1.5, 0.25, True, id="fractional-safe"),
+        pytest.param(1.5, 0.75, False, id="fractional-protected"),
+        pytest.param(1.5, 0, True, id="float-threshold"),
+        pytest.param(2, 0.5, True, id="float-estimate"),
+        pytest.param(1.2, 0.2, False, id="addition-before-subtraction"),
+        pytest.param(1.2000000000000002, 0.2, True, id="adjacent-float-boundary"),
+        pytest.param(
+            float(2**53 + 2),
+            2**53 + 1,
+            False,
+            id="integer-addition-before-float-conversion",
+        ),
+        pytest.param(2**53 + 1, float(2**53), False, id="large-integer-threshold"),
+        pytest.param(
+            -float(2**53),
+            -(2**53 + 1),
+            True,
+            id="negative-integer-addition-before-float-conversion",
+        ),
+        pytest.param(2**100 + 1, 2**100, True, id="arbitrary-integer-safe"),
+        pytest.param(2**100, 2**100, False, id="arbitrary-integer-protected"),
+        pytest.param(-0.5, -2, True, id="negative-threshold"),
+        pytest.param(0, -1.5, True, id="negative-estimate"),
+        pytest.param(True, False, True, id="boolean-counts"),
+        pytest.param(float("nan"), 0, False, id="nan-threshold"),
+        pytest.param(0, float("nan"), False, id="nan-estimate"),
+        pytest.param(float("inf"), 0, False, id="positive-infinite-threshold"),
+        pytest.param(float("-inf"), 0, False, id="negative-infinite-threshold"),
+        pytest.param(0, float("inf"), False, id="positive-infinite-estimate"),
+        pytest.param(0, float("-inf"), False, id="negative-infinite-estimate"),
+        pytest.param(float("inf"), float("inf"), False, id="infinite-cancellation"),
+    ],
+)
+def test_tlru_numeric_configuration_matches_python_eviction(
+    backend, tier, threshold, next_prompt_estimate, evict_recent
+):
+    core = _tlru_tree_core(
+        backend,
+        {"threshold": threshold, "next_prompt_estimate": next_prompt_estimate},
+    )
+    _tlru_insert(core, list(range(100, 108)), list(range(200, 208)), tier)
+    _tlru_insert(core, [0], [10], tier)
+    _tlru_insert(core, [0, 1], [10, 11], tier)
+
+    # Removing the recent leaf leaves one token cached from a two-token history.
+    # In particular, 2 + 0.2 - 1.2 exceeds 1, while rearranging the expression to
+    # 1.2 - 0.2 would incorrectly mark that leaf safe. Non-finite configurations
+    # put both leaves in the same priority class and retain recency ordering.
+    assert _tlru_evict_one_leaf(core, tier) == (
+        [11] if evict_recent else list(range(200, 208))
+    )
+    core.sanity_check([], [])
+
+
+def _assert_tlru_float_priorities_match_python(
+    bindings, threshold, next_prompt_estimate, histories, cached_counts
+):
+    native = _tlru_float_config(bindings, threshold, next_prompt_estimate)
+    strategy = TLRUStrategy(threshold, next_prompt_estimate)
+    for history in histories:
+        for cached in cached_counts:
+            if cached > history:
+                continue
+            node = SimpleNamespace(
+                _tlru_history_len=history,
+                _tlru_cached_prefix_len=cached,
+                key=(),
+                last_access_time=0.0,
+            )
+            expected = strategy.get_priority(node)[0] == -1
+            assert native.inspect_is_tel_safe(history, cached) == expected, (
+                threshold,
+                next_prompt_estimate,
+                history,
+                cached,
+            )
+
+
+def test_tlru_float_priorities_match_python_at_integer_comparison_boundaries():
+    bindings = load_tree_core_extension(inspection=True)
+    max_history = 2 * sys.maxsize + 1
+    counts = [
+        0,
+        1,
+        2,
+        3,
+        8,
+        2**53 - 1,
+        2**53,
+        2**53 + 1,
+        2**53 + 2,
+        2**53 + 3,
+        2**53 + 4,
+        max_history - 1,
+        max_history,
+    ]
+    for threshold, estimate in (
+        (0.0, 0.0),
+        (1.0, 0.0),
+        (1.2, 0.2),
+        (1.2000000000000002, 0.2),
+        (-0.5, -2.0),
+        (4096.0, 1024.25),
+        (float(2**53), 0.0),
+        (2**53 + 1, float(2**53)),
+        (0.0, math.nextafter(float(max_history + 1), 0.0)),
+        (0.0, float(max_history + 1)),
+        (-sys.float_info.max, sys.float_info.max),
+        (sys.float_info.max, -sys.float_info.max),
+        (float("nan"), 0.0),
+        (0.0, float("nan")),
+        (float("inf"), 0.0),
+        (float("-inf"), 0.0),
+        (0.0, float("inf")),
+        (0.0, float("-inf")),
+        (float("inf"), float("inf")),
+        (float("-inf"), float("-inf")),
+    ):
+        _assert_tlru_float_priorities_match_python(
+            bindings, threshold, estimate, counts, counts
+        )
+
+
+def test_tlru_integer_estimate_priorities_match_python_at_i128_endpoints():
+    bindings = load_tree_core_extension(inspection=True)
+    max_history = 2 * sys.maxsize + 1
+    max_safe_estimate = 2**127 - 1 - max_history
+    histories = [0, 1, 2, 2**53 + 1, max_history - 1, max_history]
+    for estimate in (
+        -(2**127) - 1,
+        -(2**127),
+        -(2**127) + 1,
+        max_safe_estimate - 1,
+        max_safe_estimate,
+        max_safe_estimate + 1,
+        2**127 - 1,
+        2**127,
+    ):
+        for threshold in (float(estimate), math.nextafter(float(estimate), math.inf)):
+            _assert_tlru_float_priorities_match_python(
+                bindings, threshold, estimate, histories, histories
+            )
+
+
+@pytest.mark.parametrize("exponent", [128, 200, 1000])
+def test_tlru_large_integer_estimate_priorities_match_python_at_rounding_ties(exponent):
+    bindings = load_tree_core_extension(inspection=True)
+    max_history = 2 * sys.maxsize + 1
+    for sign in (-1, 1):
+        lower = sign * math.ldexp(1.0, exponent)
+        # Consecutive float pairs exercise both directions of ties-to-even.
+        for _ in range(2):
+            upper = math.nextafter(lower, math.inf)
+            midpoint = (int(lower) + int(upper)) // 2
+            for tie_history in (0, 1, 2, 2**53 + 1, sys.maxsize, max_history):
+                estimate = midpoint - tie_history
+                histories = sorted(
+                    {
+                        0,
+                        1,
+                        2,
+                        2**53 + 1,
+                        max_history - 1,
+                        max_history,
+                        max(tie_history - 1, 0),
+                        tie_history,
+                        min(tie_history + 1, max_history),
+                    }
+                )
+                _assert_tlru_float_priorities_match_python(
+                    bindings, lower, estimate, histories, [0, 1, max_history]
+                )
+            lower = upper
+
+
+@pytest.mark.parametrize(
+    "threshold,next_prompt_estimate",
+    [
+        (10**1000, 0.0),
+        (-(10**1000), 0.0),
+        (0.0, 10**1000),
+        (0.0, -(10**1000)),
+    ],
+)
+def test_tlru_mixed_numeric_overflow_is_reported_at_rust_construction(
+    threshold, next_prompt_estimate
+):
+    config = {"threshold": threshold, "next_prompt_estimate": next_prompt_estimate}
+    # Native construction validates conversions once; Python reports the same
+    # numeric overflow when evaluating a candidate's eviction priority.
+    with pytest.raises(OverflowError):
+        _tlru_tree_core("rust", config)
+    strategy = TLRUStrategy(**config)
+    node = SimpleNamespace(
+        _tlru_history_len=2,
+        _tlru_cached_prefix_len=2,
+        key=(0,),
+        last_access_time=0.0,
+    )
+    with pytest.raises(OverflowError):
+        strategy.get_priority(node)
+
+
+def test_tlru_float_conversion_validates_the_complete_native_history_range():
+    # This integer still converts to the largest finite float at history one,
+    # but reaches the ties-to-even overflow boundary at history two.
+    estimate = 2**1024 - 2**970 - 2
+    strategy = TLRUStrategy(threshold=0.0, next_prompt_estimate=estimate)
+    node = SimpleNamespace(
+        _tlru_history_len=1,
+        _tlru_cached_prefix_len=1,
+        key=(0,),
+        last_access_time=0.0,
+    )
+    assert strategy.get_priority(node)[0] == 0
+    node._tlru_history_len = 2
+    with pytest.raises(OverflowError):
+        strategy.get_priority(node)
+
+    # Reject at startup if any native history can overflow, so eviction does
+    # not silently round an overflowing Python integer to infinity.
+    with pytest.raises(OverflowError):
+        _tlru_tree_core("rust", {"threshold": 0.0, "next_prompt_estimate": estimate})
+
+
+@pytest.mark.parametrize(
+    "threshold,next_prompt_estimate",
+    [
+        pytest.param("1.0", 0, id="string-threshold"),
+        pytest.param(0, "1.0", id="string-estimate"),
+        pytest.param(None, 0, id="null-threshold"),
+        pytest.param(0, None, id="null-estimate"),
+        pytest.param([1], 0, id="list-threshold"),
+        pytest.param(0, {}, id="object-estimate"),
+    ],
+)
+def test_tlru_non_numeric_configuration_raises_type_error(
+    threshold, next_prompt_estimate
+):
+    config = {"threshold": threshold, "next_prompt_estimate": next_prompt_estimate}
+    with pytest.raises(TypeError):
+        _tlru_tree_core("rust", config)
+    node = SimpleNamespace(
+        _tlru_history_len=2,
+        _tlru_cached_prefix_len=2,
+        key=(0,),
+        last_access_time=0.0,
+    )
+    with pytest.raises(TypeError):
+        TLRUStrategy(**config).get_priority(node)
 
 
 @pytest.mark.parametrize("backend", ["python", "rust"])

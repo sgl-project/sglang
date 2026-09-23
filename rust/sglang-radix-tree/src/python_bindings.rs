@@ -13,6 +13,7 @@ use tch::{Device, Kind, Tensor};
 use crate::components::{ComponentSet, ComponentType, FULL, MAMBA, SWA};
 use crate::node::ChildKeyType;
 use crate::node::{KeyNamespaceRef, NodeAccessError, NodeId, TreeCoreRuntimeError};
+use crate::unified_lru_list::{TlruFloatConfig, TlruPromptEstimate};
 use crate::unified_tree_core::KvCacheEvent;
 use crate::unified_tree_core::{
     BufferBackupSnapshot, BufferBackupState, CacheAction, CacheInitParams, CacheTransferPhase,
@@ -428,6 +429,49 @@ fn frees_to_py(py: Python<'_>, frees: HashMap<ComponentType, Vec<Tensor>>) -> Py
     Ok(dict.unbind())
 }
 
+/// Floating-point T-LRU arithmetic, normalized once by the Python adapter.
+#[pyclass(name = "TlruFloatConfig")]
+#[derive(Clone)]
+pub struct TlruFloatConfigBinding {
+    config: TlruFloatConfig,
+}
+
+#[pymethods]
+impl TlruFloatConfigBinding {
+    #[new]
+    #[pyo3(signature = (threshold, next_prompt_estimate, integer_estimate = None, rounded_estimate_transition = None))]
+    fn new(
+        threshold: f64,
+        next_prompt_estimate: f64,
+        integer_estimate: Option<i128>,
+        rounded_estimate_transition: Option<(usize, f64)>,
+    ) -> PyResult<Self> {
+        let estimate = match (integer_estimate, rounded_estimate_transition) {
+            (Some(value), None) if value <= i128::MAX - usize::MAX as i128 => {
+                TlruPromptEstimate::Integer(value)
+            }
+            (None, Some((cutoff, above))) => TlruPromptEstimate::RoundedInteger {
+                below: next_prompt_estimate,
+                cutoff,
+                above,
+            },
+            (None, None) => TlruPromptEstimate::Float(next_prompt_estimate),
+            _ => return Err(PyValueError::new_err("invalid normalized T-LRU estimate")),
+        };
+        Ok(Self {
+            config: TlruFloatConfig {
+                threshold,
+                next_prompt_estimate: estimate,
+            },
+        })
+    }
+
+    #[cfg(feature = "inspection")]
+    fn inspect_is_tel_safe(&self, history: usize, cached_without_node: usize) -> bool {
+        self.config.is_tel_safe(history, cached_without_node)
+    }
+}
+
 /// Python-visible tree-core init params; converts into CacheInitParams.
 #[pyclass(get_all, set_all)]
 #[derive(Clone)]
@@ -435,6 +479,7 @@ pub struct TreeCoreInitParamsBinding {
     pub eviction_policy: String,
     pub slru_protected_threshold: i64,
     pub tlru_tail_budget: usize,
+    pub tlru_float_config: Option<TlruFloatConfigBinding>,
     pub page_size: usize,
     pub is_write_back: bool,
     pub enable_hicache: bool,
@@ -454,6 +499,7 @@ impl TreeCoreInitParamsBinding {
             eviction_policy: self.eviction_policy.clone(),
             slru_protected_threshold: self.slru_protected_threshold,
             tlru_tail_budget: self.tlru_tail_budget,
+            tlru_float_config: self.tlru_float_config.as_ref().map(|value| value.config),
             page_size: self.page_size,
             is_write_back: self.is_write_back,
             enable_hicache: self.enable_hicache,
@@ -473,7 +519,7 @@ impl TreeCoreInitParamsBinding {
 #[pymethods]
 impl TreeCoreInitParamsBinding {
     #[new]
-    #[pyo3(signature = (eviction_policy = "lru".to_string(), page_size = 1, is_write_back = false, enable_hicache = false, write_through_threshold = 256, device = "cpu".to_string(), swa_sliding_window_size = None, enable_kv_cache_events = false, mamba_cache_chunk_size = None, mamba_max_states_per_path = None, slru_protected_threshold = 2, swa_req_ring = false, tlru_tail_budget = 0))]
+    #[pyo3(signature = (eviction_policy = "lru".to_string(), page_size = 1, is_write_back = false, enable_hicache = false, write_through_threshold = 256, device = "cpu".to_string(), swa_sliding_window_size = None, enable_kv_cache_events = false, mamba_cache_chunk_size = None, mamba_max_states_per_path = None, slru_protected_threshold = 2, swa_req_ring = false, tlru_tail_budget = 0, tlru_float_config = None))]
     fn new(
         eviction_policy: String,
         page_size: usize,
@@ -488,11 +534,13 @@ impl TreeCoreInitParamsBinding {
         slru_protected_threshold: i64,
         swa_req_ring: bool,
         tlru_tail_budget: usize,
+        tlru_float_config: Option<TlruFloatConfigBinding>,
     ) -> Self {
         TreeCoreInitParamsBinding {
             eviction_policy,
             slru_protected_threshold,
             tlru_tail_budget,
+            tlru_float_config,
             page_size,
             is_write_back,
             enable_hicache,
@@ -3727,6 +3775,7 @@ fn get_hash_str(
 }
 
 fn register_mem_cache_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add_class::<TlruFloatConfigBinding>()?;
     m.add_function(wrap_pyfunction!(get_hash_str, m)?)?;
     m.add_class::<TreeCoreInitParamsBinding>()?;
     m.add_class::<MatchParamsBinding>()?;

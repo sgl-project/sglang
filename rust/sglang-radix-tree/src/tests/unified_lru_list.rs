@@ -652,7 +652,11 @@ fn tlru_evicts_a_whole_node_only_when_its_uncached_history_fits_the_budget() {
     node.tlru_history_len = 8;
     for (tail_budget, expected_class) in [(0, 0), (2, 0), (3, -1), (4, -1)] {
         assert_eq!(
-            TlruStrategy { tail_budget }.get_priority(node),
+            TlruStrategy {
+                tail_budget,
+                float_config: None,
+            }
+            .get_priority(node),
             PriorityKey(expected_class, 5),
             "tail budget {tail_budget}"
         );
@@ -662,7 +666,10 @@ fn tlru_evicts_a_whole_node_only_when_its_uncached_history_fits_the_budget() {
 #[test]
 fn tlru_safe_nodes_precede_older_unsafe_nodes_but_keep_recency_within_each_phase() {
     let (mut arena, a) = arena_with_node();
-    let strategy = TlruStrategy { tail_budget: 2 };
+    let strategy = TlruStrategy {
+        tail_budget: 2,
+        float_config: None,
+    };
     let node = arena.node_mut(a);
     node.tlru_cached_prefix_len = 4;
     node.tlru_history_len = 8;
@@ -698,13 +705,210 @@ fn tlru_handles_full_usize_depths_and_budgets_without_overflow() {
         node.tlru_cached_prefix_len = prefix;
         assert_eq!(
             TlruStrategy {
-                tail_budget: budget
+                tail_budget: budget,
+                float_config: None,
             }
             .get_priority(node),
             PriorityKey(expected_class, 5),
             "prefix {prefix}, budget {budget}"
         );
     }
+}
+
+fn tlru_float_strategy(threshold: f64, next_prompt_estimate: TlruPromptEstimate) -> TlruStrategy {
+    TlruStrategy {
+        // A nonzero integer budget makes accidental use of the integer path
+        // visible in the float cases that must remain unsafe.
+        tail_budget: usize::MAX,
+        float_config: Some(TlruFloatConfig {
+            threshold,
+            next_prompt_estimate,
+        }),
+    }
+}
+
+#[test]
+fn tlru_float_counts_preserve_fractional_eviction_boundaries() {
+    let (mut arena, a) = arena_with_node();
+    let node = arena.node_mut(a);
+    node.tlru_history_len = 8;
+    let strategy = tlru_float_strategy(2.0, TlruPromptEstimate::Float(0.25));
+    // Python's budget is 8 + 0.25 - 2 == 6.25: six cached tokens are
+    // insufficient, while seven suffice. Truncating the budget changes this.
+    node.tlru_cached_prefix_len = 7;
+    assert_eq!(strategy.get_priority(node), PriorityKey(0, 5));
+    node.tlru_cached_prefix_len = 8;
+    assert_eq!(strategy.get_priority(node), PriorityKey(-1, 5));
+}
+
+#[test]
+fn tlru_float_counts_add_history_before_subtracting_threshold() {
+    let (mut arena, a) = arena_with_node();
+    let node = arena.node_mut(a);
+    let boundary = 2.0_f64.powi(53);
+    let strategy = tlru_float_strategy(boundary, TlruPromptEstimate::Float(boundary));
+    // Python rounds 1 + 2**53 down to 2**53, then subtracts the threshold.
+    // Folding threshold - estimate first would classify this leaf as unsafe.
+    assert_eq!(strategy.get_priority(node), PriorityKey(-1, 5));
+    node.tlru_history_len = 2;
+    node.tlru_cached_prefix_len = 2;
+    assert_eq!(strategy.get_priority(node), PriorityKey(0, 5));
+}
+
+#[test]
+fn tlru_mixed_counts_add_integer_history_exactly_before_float_conversion() {
+    let (mut arena, a) = arena_with_node();
+    let node = arena.node_mut(a);
+    let boundary = 2.0_f64.powi(53);
+    let strategy = tlru_float_strategy(boundary, TlruPromptEstimate::Integer((1_i128 << 53) + 1));
+    // (1 + (2**53 + 1)) - float(2**53) == 2. Converting the estimate
+    // before the integer sum would round twice and incorrectly produce zero.
+    assert_eq!(strategy.get_priority(node), PriorityKey(0, 5));
+    let strategy = tlru_float_strategy(
+        -boundary,
+        TlruPromptEstimate::Integer(-((1_i128 << 53) + 1)),
+    );
+    assert_eq!(strategy.get_priority(node), PriorityKey(-1, 5));
+
+    // A midpoint much wider than usize still changes its rounded value when
+    // integer history crosses the tie; casting the estimate first loses it.
+    let strategy = tlru_float_strategy(
+        2.0_f64.powi(100),
+        TlruPromptEstimate::Integer((1_i128 << 100) + (1_i128 << 47)),
+    );
+    assert_eq!(strategy.get_priority(node), PriorityKey(0, 5));
+}
+
+#[test]
+fn tlru_mixed_counts_cover_both_ends_of_the_exact_i128_sum_range() {
+    let (mut arena, a) = arena_with_node();
+    let node = arena.node_mut(a);
+    node.tlru_history_len = usize::MAX;
+    node.tlru_cached_prefix_len = usize::MAX;
+    for estimate in [i128::MIN, i128::MAX - usize::MAX as i128] {
+        let strategy = tlru_float_strategy(
+            (estimate + usize::MAX as i128) as f64,
+            TlruPromptEstimate::Integer(estimate),
+        );
+        assert_eq!(strategy.get_priority(node), PriorityKey(-1, 5));
+    }
+}
+
+#[test]
+fn tlru_float_counts_preserve_nan_infinity_and_zero_behavior() {
+    let (arena, a) = arena_with_node();
+    let node = arena.node(a);
+    for (threshold, estimate, expected_class) in [
+        (f64::NAN, 0.0, 0),
+        (0.0, f64::NAN, 0),
+        (f64::INFINITY, f64::INFINITY, 0),
+        (f64::NEG_INFINITY, f64::NEG_INFINITY, 0),
+        (f64::INFINITY, 0.0, -1),
+        (f64::NEG_INFINITY, 0.0, 0),
+        (0.0, f64::INFINITY, 0),
+        (0.0, f64::NEG_INFINITY, -1),
+        (-f64::MAX, f64::MAX, 0),
+        (f64::MAX, -f64::MAX, -1),
+        (1.0, -0.0, -1),
+        (-0.0, 0.0, 0),
+    ] {
+        let strategy = tlru_float_strategy(threshold, TlruPromptEstimate::Float(estimate));
+        assert_eq!(
+            strategy.get_priority(node),
+            PriorityKey(expected_class, 5),
+            "threshold {threshold}, estimate {estimate}"
+        );
+    }
+}
+
+#[test]
+#[cfg(target_pointer_width = "64")]
+fn tlru_float_budget_compares_cached_integer_lengths_without_rounding_them() {
+    let (mut arena, a) = arena_with_node();
+    let node = arena.node_mut(a);
+    node.tlru_history_len = (1_usize << 53) + 4;
+    node.tlru_cached_prefix_len = node.tlru_history_len;
+    // Cached length 2**53 + 3 rounds upward to the budget 2**53 + 4 as
+    // f64, but the exact Python integer/float comparison must remain false.
+    let strategy = tlru_float_strategy(0.0, TlruPromptEstimate::Float(0.0));
+    assert_eq!(strategy.get_priority(node), PriorityKey(0, 5));
+    let strategy = tlru_float_strategy(2.0, TlruPromptEstimate::Float(0.0));
+    node.tlru_cached_prefix_len = node.tlru_history_len - 2;
+    assert_eq!(strategy.get_priority(node), PriorityKey(0, 5));
+    node.tlru_cached_prefix_len += 1;
+    assert_eq!(strategy.get_priority(node), PriorityKey(-1, 5));
+
+    // At the unsigned limit, converting history produces 2**64, which
+    // cannot be met by any usize cached length. Saturating that conversion
+    // or rounding the cached length first would misclassify the last leaf.
+    node.tlru_history_len = usize::MAX;
+    node.tlru_cached_prefix_len = usize::MAX;
+    let strategy = tlru_float_strategy(0.0, TlruPromptEstimate::Float(0.0));
+    assert_eq!(strategy.get_priority(node), PriorityKey(0, 5));
+    assert!(
+        !strategy
+            .float_config
+            .unwrap()
+            .is_tel_safe(usize::MAX, usize::MAX)
+    );
+    let strategy = tlru_float_strategy(2048.0, TlruPromptEstimate::Float(0.0));
+    node.tlru_cached_prefix_len = usize::MAX - 2047;
+    assert_eq!(strategy.get_priority(node), PriorityKey(0, 5));
+    node.tlru_cached_prefix_len += 1;
+    assert_eq!(strategy.get_priority(node), PriorityKey(-1, 5));
+}
+
+#[test]
+fn tlru_large_integer_estimates_switch_at_the_normalized_rounding_cutoff() {
+    let (mut arena, a) = arena_with_node();
+    let node = arena.node_mut(a);
+    let positive = 2.0_f64.powi(130);
+    let adjacent = f64::from_bits(positive.to_bits() + 1);
+    // Q = 2**130 + 2**77 - 2 lies two tokens below the midpoint.
+    // The tie at H=2 rounds down; H=3 is the first rounded value above it.
+    let strategy = tlru_float_strategy(
+        positive,
+        TlruPromptEstimate::RoundedInteger {
+            below: positive,
+            cutoff: 3,
+            above: adjacent,
+        },
+    );
+    for (history, expected_class) in [(1, -1), (2, -1), (3, 0), (4, 0)] {
+        node.tlru_history_len = history;
+        node.tlru_cached_prefix_len = history;
+        assert_eq!(strategy.get_priority(node), PriorityKey(expected_class, 5));
+    }
+    // At the corresponding negative midpoint the tie rounds toward the
+    // upper value, so the first transition occurs one history token earlier.
+    let strategy = tlru_float_strategy(
+        -adjacent,
+        TlruPromptEstimate::RoundedInteger {
+            below: -adjacent,
+            cutoff: 2,
+            above: -positive,
+        },
+    );
+    for (history, expected_class) in [(1, -1), (2, 0), (3, 0)] {
+        node.tlru_history_len = history;
+        node.tlru_cached_prefix_len = history;
+        assert_eq!(strategy.get_priority(node), PriorityKey(expected_class, 5));
+    }
+}
+
+#[test]
+fn tlru_factory_forwards_float_config_instead_of_the_integer_budget() {
+    let (arena, a) = arena_with_node();
+    let strategy = get_eviction_strategy::<Vec<i64>>(
+        "TLrU",
+        999,
+        0,
+        Some(TlruFloatConfig {
+            threshold: 2.0,
+            next_prompt_estimate: TlruPromptEstimate::Float(0.5),
+        }),
+    );
+    assert_eq!(strategy.get_priority(arena.node(a)), PriorityKey(-1, 5));
 }
 
 #[test]
@@ -724,7 +928,7 @@ fn get_eviction_strategy_resolves_each_policy_name() {
     ];
     for (policy, expected) in cases {
         assert_eq!(
-            get_eviction_strategy::<Vec<i64>>(policy, 2, 0).get_priority(node),
+            get_eviction_strategy::<Vec<i64>>(policy, 2, 0, None).get_priority(node),
             expected,
             "policy {policy}"
         );
@@ -737,11 +941,11 @@ fn eviction_policy_names_are_case_insensitive() {
     let node = arena.node(NodeIdx_(a.0));
     // Mixed-case names resolve to the same strategies as their lowercase forms.
     assert_eq!(
-        get_eviction_strategy::<Vec<i64>>("LRU", 2, 0).get_priority(node),
+        get_eviction_strategy::<Vec<i64>>("LRU", 2, 0, None).get_priority(node),
         PriorityKey(5, 0)
     );
     assert_eq!(
-        get_eviction_strategy::<Vec<i64>>("Priority", 2, 0).get_priority(node),
+        get_eviction_strategy::<Vec<i64>>("Priority", 2, 0, None).get_priority(node),
         PriorityKey(9, 5)
     );
 }
@@ -749,7 +953,7 @@ fn eviction_policy_names_are_case_insensitive() {
 #[test]
 fn get_eviction_strategy_slru_default_threshold_is_two() {
     let (mut arena, a) = arena_with_node();
-    let slru = get_eviction_strategy::<Vec<i64>>("slru", 2, 0);
+    let slru = get_eviction_strategy::<Vec<i64>>("slru", 2, 0, None);
     // Exactly 2 hits is protected under the factory default; 1 is not.
     arena.node_mut(NodeIdx_(a.0)).hit_count = 2;
     assert_eq!(
@@ -768,11 +972,11 @@ fn tlru_factory_uses_the_tail_budget_and_accepts_mixed_case_names() {
     let (arena, a) = arena_with_node();
     let node = arena.node(a);
     assert_eq!(
-        get_eviction_strategy::<Vec<i64>>("TLrU", 999, 0).get_priority(node),
+        get_eviction_strategy::<Vec<i64>>("TLrU", 999, 0, None).get_priority(node),
         PriorityKey(0, 5)
     );
     assert_eq!(
-        get_eviction_strategy::<Vec<i64>>("TLrU", 999, 1).get_priority(node),
+        get_eviction_strategy::<Vec<i64>>("TLrU", 999, 1, None).get_priority(node),
         PriorityKey(-1, 5)
     );
 }
@@ -780,7 +984,7 @@ fn tlru_factory_uses_the_tail_budget_and_accepts_mixed_case_names() {
 #[test]
 #[should_panic(expected = "Unknown eviction policy: random. Supported policies:")]
 fn get_eviction_strategy_panics_on_an_unknown_policy() {
-    get_eviction_strategy::<Vec<i64>>("Random", 2, 0);
+    get_eviction_strategy::<Vec<i64>>("Random", 2, 0, None);
 }
 
 #[test]

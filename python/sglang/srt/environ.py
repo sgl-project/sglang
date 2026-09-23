@@ -679,7 +679,6 @@ class Envs:
     SGLANG_SWA_EVICTION_INTERVAL = EnvInt(128)
     # The tree-core registry falls back to Python for:
     # - Session-aware caching.
-    # - T-LRU configurations with non-integer token counts.
     # - C128 or other unsupported components.
     # - Custom component overrides.
     # - Non-Linux platforms.
