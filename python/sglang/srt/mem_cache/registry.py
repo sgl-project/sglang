@@ -123,13 +123,6 @@ def default_radix_cache_factory(ctx: TreeCacheBuildContext) -> BasePrefixCache:
             forward_stream=ctx.tp_worker.model_runner.forward_stream,
         )
 
-    if envs.SGLANG_EXPERIMENTAL_CPP_RADIX_TREE.get():
-        # lazy import to avoid JIT overhead
-        from sglang.srt.mem_cache.radix_cache_cpp import RadixCacheCpp
-
-        logger.info("Using experimental C++ radix tree implementation.")
-        return RadixCacheCpp(params=params, server_args=server_args)
-
     if get_memory().enable_unified_cache_external_linker:
         return _create_unified_radix_cache(ctx, server_args, params)
 
