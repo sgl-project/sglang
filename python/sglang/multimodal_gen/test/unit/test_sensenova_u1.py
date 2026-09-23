@@ -824,13 +824,31 @@ def test_sensenova_u1_scheduler_merge_and_split_preserve_request_order():
     assert scheduler._try_merge_generation_reqs(requests) is None
 
 
-def test_sensenova_u1_rejects_multi_gpu_during_arg_validation():
+@pytest.mark.parametrize(("num_gpus", "dp_size"), [(1, 1), (2, 2), (4, 4)])
+def test_sensenova_u1_allows_one_gpu_per_dp_replica(num_gpus, dp_size):
     config = SenseNovaU1PipelineConfig()
 
-    with pytest.raises(ValueError, match="num_gpus=1"):
+    config.validate_server_args(
+        SimpleNamespace(
+            num_gpus=num_gpus,
+            dp_size=dp_size,
+            enable_torch_compile=False,
+            lora_path=None,
+            attention_backend=None,
+            component_attention_backends={},
+        )
+    )
+
+
+@pytest.mark.parametrize(("num_gpus", "dp_size"), [(2, 1), (4, 2)])
+def test_sensenova_u1_rejects_multi_gpu_replica(num_gpus, dp_size):
+    config = SenseNovaU1PipelineConfig()
+
+    with pytest.raises(ValueError, match="one GPU per DP replica"):
         config.validate_server_args(
             SimpleNamespace(
-                num_gpus=2,
+                num_gpus=num_gpus,
+                dp_size=dp_size,
                 enable_torch_compile=False,
                 lora_path=None,
                 attention_backend=None,

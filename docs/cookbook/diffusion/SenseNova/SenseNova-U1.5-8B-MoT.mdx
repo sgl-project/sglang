@@ -97,7 +97,26 @@ in one batch must use the same resolution, inference steps, guidance settings,
 and output options. Requests with multiple outputs or `think_mode=true` are
 executed sequentially.
 
-### 5.2 Ascend NPU optimizations
+### 5.2 Data-parallel serving
+
+Use one complete SenseNova-U1 replica per GPU to increase throughput for
+concurrent requests:
+
+```bash Command
+sglang serve \
+  --model-path sensenova/SenseNova-U1.5-8B-MoT \
+  --num-gpus 2 \
+  --dp-size 2 \
+  --port 30000
+```
+
+Generation requests are distributed across the replicas. Data parallelism does
+not reduce the latency of one request, and every GPU must have enough memory for
+the complete model and its request-time activations. SenseNova-U1 currently
+requires one GPU per replica; tensor and pipeline parallelism within a replica
+are not supported.
+
+### 5.3 Ascend NPU optimizations
 
 On Ascend NPU, SenseNova-U1 automatically uses fused inference attention,
 RMSNorm, and SwiGLU MLP operators for supported inputs. FIA and SwiGLU fall back
