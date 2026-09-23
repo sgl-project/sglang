@@ -3,12 +3,20 @@ name: PR Test (NPU)
 on:
   push:
     branches: [ main ]
+  schedule:
+    - cron: '0 12 * * *'  # Run daily at 12:00 UTC
   pull_request:
   workflow_dispatch:
+    inputs:
+      coverage_mode:
+        description: 'Run in coverage collection mode (uses coverage runners, enables coverage instrumentation, runs setup-covstub)'
+        required: false
+        type: boolean
+        default: false
   workflow_call:
     inputs:
       ref:
-        description: 'Git ref (branch, tag, or SHA) to test. If not provided, uses the default branch.'
+        description: 'Git ref (branch, tag, or SHA) to test. If not provided, uses the event commit SHA.'
         required: false
         type: string
         default: ''
@@ -17,9 +25,14 @@ on:
         required: false
         type: boolean
         default: false
+      coverage_mode:
+        description: 'Run in coverage collection mode (uses coverage runners, enables coverage instrumentation, runs setup-covstub)'
+        required: false
+        type: boolean
+        default: false
 
 concurrency:
-  group: pr-test-npu-${{ inputs.ref || github.ref }}
+  group: pr-test-npu-${{ inputs.coverage_mode == true && 'coverage-' || '' }}${{ inputs.ref || github.ref }}
   cancel-in-progress: ${{ github.event_name != 'workflow_call' }}
 
 jobs:
@@ -34,16 +47,18 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          # Pin to the event SHA (not the branch name) so every job in this run
+          # checks out the same commit even if the branch advances mid-run.
+          ref: ${{ inputs.ref || github.sha }}
 
       - name: Determine run mode
         id: run-mode
         run: |
-          # Run all tests for workflow_call (when ref input is provided)
+          # Run all tests for scheduled runs and workflow_call (when ref input is provided)
           # Note: github.event_name is inherited from caller, so we detect workflow_call by checking inputs.ref
-          if [[ "${{ inputs.run_all_tests }}" == "true" ]]; then
+          if [[ "${{ github.event_name }}" == "schedule" || "${{ inputs.run_all_tests }}" == "true" ]]; then
             echo "run_all_tests=true" >> $GITHUB_OUTPUT
-            echo "Run mode: ALL TESTS (run_all_tests=${{ inputs.run_all_tests }})"
+            echo "Run mode: ALL TESTS (schedule=${{ github.event_name == 'schedule' }}, run_all_tests=${{ inputs.run_all_tests }})"
           else
             echo "run_all_tests=false" >> $GITHUB_OUTPUT
             echo "Run mode: FILTERED (triggered by ${{ github.event_name }})"
@@ -55,8 +70,18 @@ jobs:
         if: steps.run-mode.outputs.run_all_tests != 'true'
         with:
           filters: |
+            # Everything under python/sglang except multimodal_gen/ and kernels/ops/diffusion/.
+            # Exclusions have to be extglobs inside a single pattern: paths-filter ORs the
+            # patterns of a filter (predicate-quantifier defaults to "some"), so a standalone
+            # "!some/path/**" entry matches every file outside that path and makes the whole
+            # filter unconditionally true.
             main_package:
-              - "python/sglang/!(multimodal_gen)/**/!(*.md)"
+              - "python/sglang/!(*.md)"
+              - "python/sglang/!(multimodal_gen|kernels)/**/!(*.md)"
+              - "python/sglang/kernels/!(*.md)"
+              - "python/sglang/kernels/!(ops)/**/!(*.md)"
+              - "python/sglang/kernels/ops/!(*.md)"
+              - "python/sglang/kernels/ops/!(diffusion)/**/!(*.md)"
               - "python/pyproject_npu.toml"
               - "scripts/ci/npu/npu_ci_install_dependency.sh"
               - "test/registered/npu/**"
@@ -64,7 +89,7 @@ jobs:
               - ".github/workflows/pr-test-npu.yml"
             multimodal_gen:
               - "python/sglang/multimodal_gen/**/!(*.md|*.ipynb)"
-              - "python/sglang/kernels/ops/diffusion/triton/npu_fallback.py"
+              - "python/sglang/kernels/ops/diffusion/**"
               - "python/sglang/srt/**"
               - "python/pyproject_npu.toml"
               - "scripts/ci/npu/npu_ci_install_dependency.sh"
@@ -73,7 +98,7 @@ jobs:
   # ==================== PR Gate ==================== #
   pr-gate:
     needs: check-changes
-    if: needs.check-changes.outputs.changes_exist == 'true'
+    if: ${{ inputs.coverage_mode != true && needs.check-changes.outputs.changes_exist == 'true' }}
     uses: ./.github/workflows/pr-gate.yml
     secrets: inherit
 
@@ -92,7 +117,7 @@ jobs:
 
   base-a-test-1-npu-a2:
     needs: [check-changes, pr-gate, set-image-config]
-    if: ${{ !failure() && !cancelled() && needs.check-changes.outputs.main_package == 'true' }}
+    if: ${{ !failure() && !cancelled() && inputs.coverage_mode != true && needs.check-changes.outputs.main_package == 'true' }}
     uses: ./.github/workflows/_npu-pr-test-stage.yml
     with:
       self_name:  base-a-test-1-npu-a2
@@ -104,68 +129,78 @@ jobs:
 
   base-b-test-1-npu-a3:
     needs: [check-changes, pr-gate, set-image-config, base-a-test-1-npu-a2]
-    if: ${{ !failure() && !cancelled() && needs.check-changes.outputs.main_package == 'true' }}
+    if: ${{ !failure() && !cancelled() && (inputs.coverage_mode == true || needs.check-changes.outputs.main_package == 'true') }}
     uses: ./.github/workflows/_npu-pr-test-stage.yml
     with:
       self_name: base-b-test-1-npu-a3
-      runner_config: linux-aarch64-a3-2-
+      runner_config: ${{ inputs.coverage_mode == true && 'linux-aarch64-a3-800t-2' || 'linux-aarch64-a3-2-' }}
       image: ${{ needs.set-image-config.outputs.CANN_image_a3 }}
       run_timeout_minutes: '60'
       timeout_per_file: '3600'
+      use_coverage_runner: ${{ inputs.coverage_mode == true }}
+      upload_test_logs: ${{ inputs.coverage_mode != true }}
     secrets: inherit
 
   base-b-test-2-npu-a3:
     needs: [check-changes, pr-gate, set-image-config, base-a-test-1-npu-a2]
-    if: ${{ !failure() && !cancelled() && needs.check-changes.outputs.main_package == 'true' }}
+    if: ${{ !failure() && !cancelled() && (inputs.coverage_mode == true || needs.check-changes.outputs.main_package == 'true') }}
     uses: ./.github/workflows/_npu-pr-test-stage.yml
     with:
       self_name: base-b-test-2-npu-a3
-      runner_config: linux-aarch64-a3-2-
+      runner_config: ${{ inputs.coverage_mode == true && 'linux-aarch64-a3-800t-2' || 'linux-aarch64-a3-2-' }}
       image: ${{ needs.set-image-config.outputs.CANN_image_a3 }}
       run_timeout_minutes: '60'
       timeout_per_file: '3600'
+      use_coverage_runner: ${{ inputs.coverage_mode == true }}
+      upload_test_logs: ${{ inputs.coverage_mode != true }}
     secrets: inherit
 
   base-b-test-4-npu-a3:
     needs: [check-changes, pr-gate, set-image-config, base-a-test-1-npu-a2]
-    if: ${{ !failure() && !cancelled() && needs.check-changes.outputs.main_package == 'true' }}
+    if: ${{ !failure() && !cancelled() && (inputs.coverage_mode == true || needs.check-changes.outputs.main_package == 'true') }}
     uses: ./.github/workflows/_npu-pr-test-stage.yml
     with:
       self_name: base-b-test-4-npu-a3
-      runner_config: linux-aarch64-a3-4-
+      runner_config: ${{ inputs.coverage_mode == true && 'linux-aarch64-a3-800t-4' || 'linux-aarch64-a3-4-' }}
       image: ${{ needs.set-image-config.outputs.CANN_image_a3 }}
       run_timeout_minutes: '120'
       timeout_per_file: '3600'
       partitions: '{"size":2,"arr":[0, 1]}'
+      use_coverage_runner: ${{ inputs.coverage_mode == true }}
+      upload_test_logs: ${{ inputs.coverage_mode != true }}
     secrets: inherit
 
   base-b-test-8-npu-a3:
     needs: [check-changes, pr-gate, set-image-config, base-a-test-1-npu-a2]
-    if: ${{ !failure() && !cancelled() && needs.check-changes.outputs.main_package == 'true' }}
+    if: ${{ !failure() && !cancelled() && (inputs.coverage_mode == true || needs.check-changes.outputs.main_package == 'true') }}
     uses: ./.github/workflows/_npu-pr-test-stage.yml
     with:
       self_name: base-b-test-8-npu-a3
-      runner_config: linux-aarch64-a3-8-
+      runner_config: ${{ inputs.coverage_mode == true && 'linux-aarch64-a3-800t-8' || 'linux-aarch64-a3-8-' }}
       image: ${{ needs.set-image-config.outputs.CANN_image_a3 }}
       run_timeout_minutes: '60'
       timeout_per_file: '3600'
+      use_coverage_runner: ${{ inputs.coverage_mode == true }}
+      upload_test_logs: ${{ inputs.coverage_mode != true }}
     secrets: inherit
 
   base-b-test-16-npu-a3:
     needs: [check-changes, pr-gate, set-image-config, base-a-test-1-npu-a2]
-    if: ${{ !failure() && !cancelled() && needs.check-changes.outputs.main_package == 'true' }}
+    if: ${{ !failure() && !cancelled() && (inputs.coverage_mode == true || needs.check-changes.outputs.main_package == 'true') }}
     uses: ./.github/workflows/_npu-pr-test-stage.yml
     with:
       self_name: base-b-test-16-npu-a3
-      runner_config: linux-aarch64-a3-16-
+      runner_config: ${{ inputs.coverage_mode == true && 'linux-aarch64-a3-800t-16' || 'linux-aarch64-a3-16-' }}
       image: ${{ needs.set-image-config.outputs.CANN_image_a3 }}
       run_timeout_minutes: '120'
       timeout_per_file: '3600'
+      use_coverage_runner: ${{ inputs.coverage_mode == true }}
+      upload_test_logs: ${{ inputs.coverage_mode != true }}
     secrets: inherit
 
   multimodal-gen-test-1-npu-a3:
     needs: [check-changes, pr-gate, set-image-config, base-a-test-1-npu-a2]
-    if: ${{ !failure() && !cancelled() && needs.check-changes.outputs.multimodal_gen == 'true' }}
+    if: ${{ !failure() && !cancelled() && inputs.coverage_mode != true && needs.check-changes.outputs.multimodal_gen == 'true' }}
     runs-on: linux-aarch64-a3-800t-2
     strategy:
       fail-fast: false
@@ -229,7 +264,7 @@ jobs:
 
   multimodal-gen-test-4-npu-a3:
     needs: [check-changes, pr-gate, set-image-config, base-a-test-1-npu-a2]
-    if: ${{ !failure() && !cancelled() && needs.check-changes.outputs.multimodal_gen == 'true' }}
+    if: ${{ !failure() && !cancelled() && inputs.coverage_mode != true && needs.check-changes.outputs.multimodal_gen == 'true' }}
     runs-on: linux-aarch64-a3-800t-4
     strategy:
       fail-fast: false
@@ -294,34 +329,38 @@ jobs:
   base-c-test-acc-2-npu-a3:
     name: base-c-test-acc-2-npu-a3
     needs: [ check-changes, pr-gate, set-image-config, base-b-test-1-npu-a3, base-b-test-2-npu-a3, base-b-test-4-npu-a3, base-b-test-8-npu-a3, base-b-test-16-npu-a3 ]
-    if: ${{ !failure() && !cancelled() && needs.check-changes.outputs.main_package == 'true' }}
+    if: ${{ !failure() && !cancelled() && (inputs.coverage_mode == true || needs.check-changes.outputs.main_package == 'true') }}
     uses: ./.github/workflows/_npu-single-node-test-stage.yml
     with:
-      runner: linux-aarch64-a3-2-
+      runner: ${{ inputs.coverage_mode == true && 'linux-aarch64-a3-800t-2' || 'linux-aarch64-a3-2-' }}
       test_type: 'accuracy'
       test_suite: base-c-test-acc-2-npu-a3
       image: ${{ needs.set-image-config.outputs.CANN_image_a3 }}
       install_sglang_deps: true
       device_type_for_deps: 'a3'
       partitions: '{"size":2,"arr":[0,1]}'
+      use_coverage_runner: ${{ inputs.coverage_mode == true }}
+      upload_test_logs: ${{ inputs.coverage_mode != true }}
 
   base-c-test-acc-16-npu-a3:
     name: base-c-test-acc-16-npu-a3
     needs: [ check-changes, pr-gate, set-image-config, base-b-test-1-npu-a3, base-b-test-2-npu-a3, base-b-test-4-npu-a3, base-b-test-8-npu-a3, base-b-test-16-npu-a3 ]
-    if: ${{ !failure() && !cancelled() && needs.check-changes.outputs.main_package == 'true' }}
+    if: ${{ !failure() && !cancelled() && (inputs.coverage_mode == true || needs.check-changes.outputs.main_package == 'true') }}
     uses: ./.github/workflows/_npu-single-node-test-stage.yml
     with:
-      runner: linux-aarch64-a3-16-
+      runner: ${{ inputs.coverage_mode == true && 'linux-aarch64-a3-800t-16' || 'linux-aarch64-a3-16-' }}
       test_type: 'accuracy'
       test_suite: base-c-test-acc-16-npu-a3
       image: ${{ needs.set-image-config.outputs.CANN_image_a3 }}
       install_sglang_deps: true
       device_type_for_deps: 'a3'
+      use_coverage_runner: ${{ inputs.coverage_mode == true }}
+      upload_test_logs: ${{ inputs.coverage_mode != true }}
 
   base-c-test-perf-2-npu-a3:
     name: base-c-test-perf-2-npu-a3
     needs: [ check-changes, pr-gate, set-image-config, base-c-test-acc-2-npu-a3, base-c-test-acc-16-npu-a3 ]
-    if: ${{ !failure() && !cancelled() && needs.check-changes.outputs.main_package == 'true' }}
+    if: ${{ !failure() && !cancelled() && (inputs.coverage_mode == true || needs.check-changes.outputs.main_package == 'true') }}
     uses: ./.github/workflows/_npu-single-node-test-stage.yml
     with:
       runner: linux-aarch64-a3-800t-2
@@ -330,11 +369,13 @@ jobs:
       image: ${{ needs.set-image-config.outputs.CANN_image_a3 }}
       install_sglang_deps: true
       device_type_for_deps: 'a3'
+      use_coverage_runner: ${{ inputs.coverage_mode == true }}
+      upload_test_logs: ${{ inputs.coverage_mode != true }}
 
   base-c-test-perf-16-npu-a3:
     name: base-c-test-perf-16-npu-a3
     needs: [ check-changes, pr-gate, set-image-config, base-c-test-acc-2-npu-a3, base-c-test-acc-16-npu-a3 ]
-    if: ${{ !failure() && !cancelled() && needs.check-changes.outputs.main_package == 'true' }}
+    if: ${{ !failure() && !cancelled() && (inputs.coverage_mode == true || needs.check-changes.outputs.main_package == 'true') }}
     uses: ./.github/workflows/_npu-single-node-test-stage.yml
     with:
       runner: linux-aarch64-a3-800t-16
@@ -344,7 +385,261 @@ jobs:
       install_sglang_deps: true
       device_type_for_deps: 'a3'
       test_timeout_minutes: '180'
+      use_coverage_runner: ${{ inputs.coverage_mode == true }}
+      upload_test_logs: ${{ inputs.coverage_mode != true }}
 
+
+  # ==================== Recommend Tests from Coverage ==================== #
+  # Recommends PR-affected test cases from the pre-built coverage baseline.
+  # continue-on-error so it never blocks the PR gate.
+  recommend-tests-from-coverage:
+    name: Recommend tests from coverage
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    if: ${{ !cancelled() && github.event_name == 'pull_request' && inputs.coverage_mode != true }}
+    outputs:
+      coverage_paths: ${{ steps.export-paths.outputs.coverage_paths }}
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - name: Checkout sglang scripts
+        uses: actions/checkout@v4
+        with:
+          sparse-checkout: |
+            scripts
+          sparse-checkout-cone-mode: false
+
+      - name: Download test case map
+        run: |
+          set -euo pipefail
+          curl -fsSL \
+            --retry 3 \
+            --retry-delay 5 \
+            --retry-all-errors \
+            "https://sglang-npu.obs.cn-southwest-2.myhuaweicloud.com/coverage/test_case_map.json" \
+            -o test_case_map.json
+          test -s test_case_map.json
+          echo "Downloaded test_case_map.json"
+          du -h test_case_map.json
+
+      - name: Download coverage package and extract covstub
+        run: |
+          set -euo pipefail
+          curl -fsSL \
+            --retry 3 \
+            --retry-delay 5 \
+            --retry-all-errors \
+            "https://sglang-npu.obs.cn-southwest-2.myhuaweicloud.com/coverage/outputs.tar.gz" \
+            -o outputs.tar.gz
+          test -s outputs.tar.gz
+          echo "Downloaded outputs.tar.gz"
+          du -h outputs.tar.gz
+          tar xzf outputs.tar.gz outputs/covstub
+          test -d outputs/covstub
+          echo "Extracted outputs/covstub"
+          find outputs/covstub -maxdepth 2 -type d | head -20 || true
+
+      - name: Recommend tests for current PR
+        run: |
+          set -euo pipefail
+          if ! python3 -c "import regex" >/dev/null 2>&1; then
+            echo "regex not found for $(python3 -V); bootstrapping pip and installing regex"
+            curl -fsSL https://bootstrap.pypa.io/get-pip.py -o get-pip.py
+            python3 get-pip.py --break-system-packages
+            python3 -m pip install --break-system-packages regex
+          fi
+          python3 -c "import regex; print('regex ok:', regex.__file__)"
+          PR_SPEC="${{ github.repository }}#${{ github.event.pull_request.number }}"
+          echo "Selecting tests for PR: ${PR_SPEC}"
+          # test_selector.py resolves relative paths against the script's own dir,
+          # so pass absolute paths for files downloaded to the workspace root.
+          python3 scripts/ci/npu/precise-test/test_selector.py \
+            --github-pr "${PR_SPEC}" \
+            --source-dir "$PWD/outputs/covstub" \
+            --map-file "$PWD/test_case_map.json"
+
+      - name: Export coverage paths output
+        id: export-paths
+        if: always()
+        run: |
+          FILE="scripts/ci/npu/precise-test/recommended_pytest_paths.txt"
+          if [ -f "$FILE" ]; then
+            {
+              echo "coverage_paths<<EOF"
+              cat "$FILE"
+              echo "EOF"
+            } >> "$GITHUB_OUTPUT"
+            echo "Exported $(wc -l < "$FILE") recommended paths"
+          else
+            echo "coverage_paths=" >> "$GITHUB_OUTPUT"
+            echo "::notice::recommended_pytest_paths.txt not found"
+          fi
+
+  # ==================== Analyze Failure Report ==================== #
+  # Cross-references test failures with coverage recommendations.
+  # !cancelled() only: skipped jobs in needs poison success().
+  analyze-failure-report:
+    name: Analyze failure report
+    needs:
+      [
+        base-a-test-1-npu-a2,
+        base-b-test-1-npu-a3,
+        base-b-test-2-npu-a3,
+        base-b-test-4-npu-a3,
+        base-b-test-8-npu-a3,
+        base-b-test-16-npu-a3,
+
+        multimodal-gen-test-1-npu-a3,
+        multimodal-gen-test-4-npu-a3,
+
+        base-c-test-acc-2-npu-a3,
+        base-c-test-acc-16-npu-a3,
+        base-c-test-perf-2-npu-a3,
+        base-c-test-perf-16-npu-a3,
+
+        recommend-tests-from-coverage,
+      ]
+    if: ${{ !cancelled() && inputs.coverage_mode != true }}
+    uses: ./.github/workflows/_npu-analyze-failure.yml
+    with:
+      log_artifact_pattern: selected-test-logs-*
+      recommendations_content: ${{ needs.recommend-tests-from-coverage.outputs.coverage_paths || '' }}
+
+  # ==================== Coverage Assembly & Publish ==================== #
+  # Assembles coverage data and publishes the baseline to the shared disk.
+  # !failure() && !cancelled() (not success()): skipped upstream poisons success().
+  setup-covstub:
+    needs:
+      [
+        set-image-config,
+        base-b-test-1-npu-a3,
+        base-b-test-2-npu-a3,
+        base-b-test-4-npu-a3,
+        base-b-test-8-npu-a3,
+        base-b-test-16-npu-a3,
+        base-c-test-acc-2-npu-a3,
+        base-c-test-acc-16-npu-a3,
+        base-c-test-perf-2-npu-a3,
+        base-c-test-perf-16-npu-a3,
+      ]
+    if: ${{ !failure() && !cancelled() && inputs.coverage_mode == true }}
+    runs-on: linux-aarch64-a3-800t-2
+    container:
+      image: ${{ needs.set-image-config.outputs.CANN_image_a3 }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          # Pin to the event SHA (not the branch name) so every job in this run
+          # checks out the same commit even if the branch advances mid-run.
+          ref: ${{ inputs.ref || github.sha }}
+
+      - name: Copy sglang source to covstub
+        run: |
+          RUN_DIR="/root/.cache/tests/precise-test/${{ github.run_id }}-attempt-${{ github.run_attempt }}"
+          COVSTUB="${RUN_DIR}/outputs/covstub"
+          mkdir -p "${COVSTUB}"
+          cp -r python/sglang "${COVSTUB}/"
+
+      - name: Build test case map
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          RUN_DIR="/root/.cache/tests/precise-test/${{ github.run_id }}-attempt-${{ github.run_attempt }}"
+          # Date tag derivation must match scripts/ci/npu/precise-test/run_tests_with_coverage.sh.
+          # The custom k8s runner only injects explicitly-set env vars, so
+          # GITHUB_RUN_STARTED_AT may be absent (set -u would abort); fall back
+          # to local date exactly like run_tests_with_coverage.sh does, so both
+          # sides derive the same tag.
+          if [ -n "${GITHUB_RUN_STARTED_AT:-}" ]; then
+            COV_DATE_TAG="${GITHUB_RUN_STARTED_AT:0:10}"
+            COV_DATE_TAG="${COV_DATE_TAG//-/}"
+          else
+            COV_DATE_TAG="$(date +%Y%m%d)"
+          fi
+          COV_ROOT="${RUN_DIR}/outputs/sglang@${COV_DATE_TAG}"
+          COVSTUB="${RUN_DIR}/outputs/covstub"
+          # Placed outside outputs/ so it is NOT included in outputs.tar.gz.
+          MAP_FILE="${RUN_DIR}/test_case_map.json"
+
+          echo "Coverage dir: ${COV_ROOT}"
+          echo "Source dir: ${COVSTUB}"
+
+          # Coverage data may be absent when all test jobs were skipped
+          # (e.g. by the changes filter). Skip map building in that case.
+          if [ ! -d "${COV_ROOT}" ]; then
+            echo "::warning::Coverage dir not found: ${COV_ROOT}, skip building test case map"
+            exit 0
+          fi
+
+          COVERAGE_FILE_COUNT=$(find "${COV_ROOT}" -name 'coverage.*' -type f | wc -l)
+          echo "Found ${COVERAGE_FILE_COUNT} coverage files"
+          if [ "${COVERAGE_FILE_COUNT}" -eq 0 ]; then
+            echo "::warning::No coverage files found under ${COV_ROOT}, skip building test case map"
+            exit 0
+          fi
+
+          if ! python3 -c "import regex" 2>/dev/null; then
+            pip install regex \
+              -i http://cache-service.nginx-pypi-cache.svc.cluster.local/pypi/simple \
+              --trusted-host cache-service.nginx-pypi-cache.svc.cluster.local \
+              --retries 3 --timeout 60 \
+              || pip install regex -i https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple
+          fi
+
+          python3 scripts/ci/npu/precise-test/test_selector.py \
+            --build-map \
+            --coverage-dir "${COV_ROOT}" \
+            --source-dir "${COVSTUB}" \
+            --map-file "${MAP_FILE}"
+          test -s "${MAP_FILE}"
+          du -h "${MAP_FILE}"
+
+      - name: Archive outputs
+        run: |
+          RUN_DIR="/root/.cache/tests/precise-test/${{ github.run_id }}-attempt-${{ github.run_attempt }}"
+          tar -czf "${RUN_DIR}/outputs.tar.gz" -C "${RUN_DIR}" outputs
+
+      - name: Publish outputs and map to shared disk
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          RUN_DIR="/root/.cache/tests/precise-test/${{ github.run_id }}-attempt-${{ github.run_attempt }}"
+          # Fixed publish dir with no RUN_DIR layer: other pipelines have a
+          # different GITHUB_RUN_ID and must be able to read the baseline.
+          # Must match PUBLISH_DIR in the recommend-tests-from-coverage job.
+          PUBLISH_DIR="/root/.cache/tests/precise-test/coverage"
+
+          # Skip publish when no coverage data was collected this run (map
+          # build was skipped), so we never overwrite the historical
+          # baseline on the shared disk with an incomplete one.
+          if [ ! -s "${RUN_DIR}/test_case_map.json" ]; then
+            echo "::warning::test_case_map.json missing (no coverage data this run), skip publish"
+            exit 0
+          fi
+
+          mkdir -p "${PUBLISH_DIR}"
+
+          # mv (rename) within the same shared filesystem is atomic, so a
+          # concurrent reader sees either the old or the new baseline,
+          # never a partial file.
+          mv "${RUN_DIR}/outputs.tar.gz" "${PUBLISH_DIR}/outputs.tar.gz"
+          mv "${RUN_DIR}/test_case_map.json" "${PUBLISH_DIR}/test_case_map.json"
+
+          echo "Published baseline to ${PUBLISH_DIR}"
+          du -h "${PUBLISH_DIR}/outputs.tar.gz" "${PUBLISH_DIR}/test_case_map.json"
+
+      - name: Clean up per-run directory
+        # Skipped on publish failure, keeping RUN_DIR for manual recovery.
+        shell: bash
+        run: |
+          set -euo pipefail
+          RUN_DIR="/root/.cache/tests/precise-test/${{ github.run_id }}-attempt-${{ github.run_attempt }}"
+          rm -rf "${RUN_DIR}"
+          echo "Removed ${RUN_DIR}"
 
   pr-test-npu-finish:
     needs:
@@ -365,6 +660,8 @@ jobs:
         base-c-test-acc-16-npu-a3,
         base-c-test-perf-2-npu-a3,
         base-c-test-perf-16-npu-a3,
+
+        setup-covstub,
       ]
     if: always()
     runs-on: ubuntu-latest

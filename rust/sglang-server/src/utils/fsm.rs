@@ -39,7 +39,7 @@ pub enum RequestState {
 /// Outcome of validation.
 #[derive(Debug, Clone, Copy)]
 pub enum ValidationOutcome {
-    /// Has multimodal inputs → Encoding, where an MM worker runs the native
+    /// Has multimodal inputs → Encoding, where an MM worker runs the multimodal
     /// pipeline and returns the final expanded `input_ids`.
     HasMultimodal,
     /// Plain text → Tokenizing.

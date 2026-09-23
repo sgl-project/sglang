@@ -69,15 +69,15 @@ from sglang.srt.arg_groups.overrides import (
     resolution_result,
     resolving_view,
 )
+from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.configs.model_config import ModelConfig
+from sglang.srt.distributed import bootstrap
 from sglang.srt.distributed.parallel_state import (
     destroy_distributed_environment,
     destroy_model_parallel,
 )
-from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.entrypoints.engine import _set_envs_and_config
 from sglang.srt.hardware_backend.mlx.runtime import use_mlx
-from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
 from sglang.srt.layers.moe import initialize_moe_config
 from sglang.srt.layers.quantization.fp4_utils import initialize_fp4_gemm_config
 from sglang.srt.layers.quantization.fp8_utils import initialize_fp8_gemm_config
@@ -92,10 +92,13 @@ from sglang.srt.model_executor.cuda_graph_config import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.runtime_context import (
+    SpawnRanks,
+    get_device,
     get_model,
     get_parallel,
     get_schedule,
     publish,
+    spawn_world_rank,
 )
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import PortArgs, ServerArgs
@@ -275,7 +278,6 @@ class BenchArgs:
         )
         parser.add_argument(
             "--profile-prefix",
-            "--profile-filename-prefix",  # deprecated alias, kept for back-compat
             dest="profile_prefix",
             type=str,
             default=BenchArgs.profile_prefix,
@@ -314,47 +316,22 @@ def load_model(server_args, port_args, gpu_id, tp_rank):
     cfg = resolving_view(server_args)
     suppress_other_loggers()
     rank_print = print if tp_rank == 0 else lambda *args, **kwargs: None
-    moe_ep_rank = tp_rank // (cfg.tp_size // cfg.ep_size)
 
     model_config = ModelConfig.from_server_args(server_args)
-    attn_tp_rank, attn_tp_size, attn_dp_rank, attn_dp_size = (
-        compute_dp_attention_world_info(
-            cfg.enable_dp_attention,
-            tp_rank,
-            cfg.tp_size,
-            cfg.dp_size,
-            cfg.attn_cp_size,
-        )
-    )
-    ps = ParallelState(
-        tp_rank=tp_rank,
-        tp_size=cfg.tp_size,
-        pp_rank=0,
-        pp_size=1,
-        dp_rank=None,
-        dp_size=cfg.dp_size,
-        attn_tp_rank=attn_tp_rank,
-        attn_tp_size=attn_tp_size,
-        attn_cp_rank=0,
-        attn_cp_size=cfg.attn_cp_size,
-        attn_dcp_rank=tp_rank % cfg.dcp_size,
-        attn_dcp_size=cfg.dcp_size,
-        attn_dp_rank=attn_dp_rank,
-        attn_dp_size=attn_dp_size,
-        moe_ep_rank=moe_ep_rank,
-        moe_ep_size=cfg.ep_size,
-        moe_dp_rank=None,
-        moe_dp_size=cfg.moe_dp_size,
-        gpu_id=gpu_id,
-    )
     runner_kwargs = dict(
         model_config=model_config,
         mem_fraction_static=cfg.mem_fraction_static,
         gpu_id=gpu_id,
-        ps=ps,
         nccl_port=port_args.nccl_port,
         server_args=server_args,
     )
+
+    bootstrap.init_parallel_runtime(
+        server_args=server_args,
+        device=get_device().device,
+        dist_port=port_args.nccl_port,
+    )
+    bootstrap.init_layer_runtime(model_config=model_config)
 
     _use_mlx = use_mlx()
     if _use_mlx:
@@ -369,6 +346,15 @@ def load_model(server_args, port_args, gpu_id, tp_rank):
             model_runner.start_startup_weight_load()
         model_runner.alloc_memory_pool()
         model_runner.init_attention_backends()
+        # bench_one_batch bypasses the Scheduler, so the Mamba SSU backend that
+        # Scheduler.init_mamba_backend() would set up is never initialized. Do it
+        # here (per tp_rank, i.e. per worker process) for mamba/linear-attn models.
+        if mambaish_config(model_runner.model_config) is not None:
+            from sglang.kernels.ops.mamba.triton_ops import (
+                initialize_mamba_selective_state_update_backend,
+            )
+
+            initialize_mamba_selective_state_update_backend(server_args)
         model_runner.init_cuda_graphs()
         if get_model().is_startup_weight_load_overlap:
             model_runner.finalize_startup_weight_load()
@@ -559,7 +545,7 @@ def _maybe_prepare_mlp_sync_batch(batch: ScheduleBatch, model_runner):
             model_runner=model_runner,
             dp_size=get_parallel().dp_size,
             attn_tp_size=get_parallel().attn_tp_size,
-            attn_cp_size=model_runner.ps.attn_cp_size,
+            attn_cp_size=model_runner.attn_cp_size,
             tp_group=model_runner.tp_group,
             get_idle_batch=None,
             disable_cuda_graph=cuda_graph_fully_disabled(),
@@ -697,7 +683,14 @@ def correctness_test(
     gpu_id,
     tp_rank,
 ):
-    publish(server_args, role="scheduler")
+    publish(
+        server_args,
+        role="scheduler",
+        ranks=SpawnRanks(
+            world_rank=spawn_world_rank(server_args, tp_rank=tp_rank, pp_rank=0),
+            gpu_id=gpu_id,
+        ),
+    )
 
     # Configure the logger
     configure_logger(server_args, prefix=f" TP{tp_rank}")
@@ -902,7 +895,14 @@ def latency_test(
     cfg = resolving_view(server_args)
     # `main` runs this inline for tp_size == 1 and spawns it per rank otherwise;
     # a spawned child arrives with nothing published.
-    publish(server_args, role="scheduler")
+    publish(
+        server_args,
+        role="scheduler",
+        ranks=SpawnRanks(
+            world_rank=spawn_world_rank(server_args, tp_rank=tp_rank, pp_rank=0),
+            gpu_id=gpu_id,
+        ),
+    )
     initialize_moe_config()
     initialize_fp8_gemm_config()
     initialize_fp4_gemm_config()

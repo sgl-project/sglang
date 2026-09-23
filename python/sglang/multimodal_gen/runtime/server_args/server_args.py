@@ -215,8 +215,10 @@ BREAKABLE_CUDA_GRAPH_SUPPORTED_MODEL_IDS = frozenset(
         "minimaxai/minimax-h3",
         "qwen/qwen-image",
         "qwen/qwen-image-2512",
+        "qwen/qwen-image-2.1",
         "qwen-image",
         "qwen-image-2512",
+        "qwen-image-2.1",
         "tongyi-mai/z-image",
         "tongyi-mai/z-image-turbo",
         "zai-org/glm-image",
@@ -236,6 +238,7 @@ BREAKABLE_CUDA_GRAPH_SUPPORTED_PIPELINE_CONFIGS = frozenset(
         "LongCatImagePipelineConfig",
         "MiniMaxH3PipelineConfig",
         "QwenImagePipelineConfig",
+        "QwenImage21PipelineConfig",
         "SanaPipelineConfig",
         "SanaVideoPipelineConfig",
         "ZImagePipelineConfig",
@@ -507,6 +510,7 @@ class ServerArgs(DisaggServerArgsMixin):
     # http server endpoint config
     host: str | None = "127.0.0.1"
     port: int | None = 30000
+    enable_metrics: bool = False
 
     # TODO: webui and their endpoint, check if webui_port is available.
     webui: bool = False
@@ -589,6 +593,7 @@ class ServerArgs(DisaggServerArgsMixin):
     # Tracing
     enable_trace: bool = False
     otlp_traces_endpoint: str = "localhost:4317"
+    otlp_service_name: str | None = None
 
     # SGLang backend for encoder stage
     srt_encoder_url: str | None = None
@@ -774,7 +779,8 @@ class ServerArgs(DisaggServerArgsMixin):
         logger.warning(
             "[Diffusion BCG] disabled for %s: only FLUX.1-dev, Ideogram-4, "
             "jdopensource/JoyAI-Echo, Lightricks/LTX-2, LongCat-Image, "
-            "MiniMax-H3, Qwen/Qwen-Image, Qwen/Qwen-Image-2512, SANA1.5, "
+            "MiniMax-H3, Qwen/Qwen-Image, Qwen/Qwen-Image-2512, "
+            "Qwen/Qwen-Image-2.1, SANA1.5, "
             "SANA-Video, Tongyi-MAI/Z-Image/Z-Image-Turbo, and "
             "zai-org/GLM-Image are currently supported.",
             pipeline_config_name,
@@ -1367,9 +1373,8 @@ class ServerArgs(DisaggServerArgsMixin):
             )
 
     def _adjust_network_ports(self):
-        # Disagg role instances (encoder/denoiser/decoder) don't serve HTTP,
-        # so skip settling the HTTP port to avoid unnecessary port collisions.
-        needs_http = self.disagg_role in (
+        # standalone roles only need an HTTP port when exposing metrics
+        needs_http = self.enable_metrics or self.disagg_role in (
             RoleType.MONOLITHIC,
             RoleType.SERVER,
         )
@@ -1901,6 +1906,7 @@ class ServerArgs(DisaggServerArgsMixin):
                 self
             )
 
+        current_platform.apply_server_args_defaults(self)
         # configure logger before use
         configure_logger(server_args=self)
 
@@ -2543,14 +2549,15 @@ class ServerArgs(DisaggServerArgsMixin):
             "--dit-layerwise-resident-layers",
             type=float,
             default=ServerArgs.dit_layerwise_resident_layers,
-            help="With --dit-layerwise-offload, keep this many DiT layers "
-            "permanently resident on GPU (retained across denoise steps) and stream "
-            "the rest with --dit-offload-prefetch-size; which layers stay resident "
-            "is --dit-layerwise-residency-policy. 0.0 = off (pure "
+            help="With --dit-layerwise-offload, keep this many DiT layers on the GPU "
+            "across the denoise steps of a request and stream the rest with "
+            "--dit-offload-prefetch-size; which layers stay is "
+            "--dit-layerwise-residency-policy. 0.0 = off (pure "
             "streaming). Between 0.0 and 1.0 = ratio of layers; >= 1 = absolute "
             "count. Unlike raising the prefetch size, resident layers are transferred "
-            "once (not re-streamed every step), so this trades VRAM for lower denoise "
-            "latency when memory is available.",
+            "once per request rather than once per step, so this trades VRAM for "
+            "lower denoise latency when memory is available. They are released when "
+            "the request finishes, not kept for the life of the server.",
         )
         parser.add_argument(
             "--layerwise-prefetch-size",
@@ -2569,11 +2576,13 @@ class ServerArgs(DisaggServerArgsMixin):
             default=None,
             help="Per-component override of --dit-layerwise-resident-layers, as "
             "component=value entries, e.g. --layerwise-resident-layers "
-            "text_encoder=4. Resident layers are transferred once at startup "
-            "rather than streamed, so they cut the transfer of every pass "
-            "including the first -- an auxiliary component that runs once per "
-            "request still benefits, it just recovers the VRAM once per request "
-            "instead of once per denoising step.",
+            "video_vae=36. The layers are held on the GPU while that component "
+            "does its work for a request and released when it finishes, so this "
+            "pays for a component that runs its layers many times per request -- "
+            "a DiT across the denoise steps, a video VAE across the latent chunks. "
+            "A component that runs its layers once per request, such as a text "
+            "encoder, transfers the whole set again every request, so setting "
+            "this for one has no effect.",
         )
         parser.add_argument(
             "--layerwise-residency-policy",
@@ -2798,6 +2807,12 @@ class ServerArgs(DisaggServerArgsMixin):
             help="Port for the HTTP API server.",
         )
         parser.add_argument(
+            "--enable-metrics",
+            action=StoreBoolean,
+            default=ServerArgs.enable_metrics,
+            help="Expose Prometheus metrics at /metrics.",
+        )
+        parser.add_argument(
             "--strict-ports",
             action=StoreBoolean,
             default=ServerArgs.strict_ports,
@@ -2897,6 +2912,13 @@ class ServerArgs(DisaggServerArgsMixin):
             type=str,
             default=ServerArgs.otlp_traces_endpoint,
             help="OTLP collector endpoint when --enable-trace is set. Format: <host>:<port>",
+        )
+        parser.add_argument(
+            "--otlp-service-name",
+            type=str,
+            default=ServerArgs.otlp_service_name,
+            help="Service name for OTLP traces (displayed as 'service.name' in trace backends). "
+            "If unset, falls back to the OTEL_SERVICE_NAME env var, then to 'sglang-diffusion'.",
         )
         parser.add_argument(
             "--log-requests",
