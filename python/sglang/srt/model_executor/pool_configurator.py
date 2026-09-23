@@ -40,7 +40,10 @@ from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
     get_dsv4_indexer_bytes_per_token,
     get_swa_ring_size,
 )
-from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
+from sglang.srt.mem_cache.memory_pool import (
+    DSATokenToKVPool,
+    get_minimax_sparse_index_dtype,
+)
 from sglang.srt.runtime_context import (
     get_disagg,
     get_exec,
@@ -388,7 +391,9 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             head_dim = model_config.head_dim
             indexer_head_dim = sparse_cfg["sparse_index_dim"]
             indexer_dtype_size = torch._utils._element_size(
-                kvc.minimax_sparse_index_dtype()
+                get_minimax_sparse_index_dtype(
+                    kvc.server_args, kvc.kv_cache_dtype, kvc.model_dtype
+                )
             )
 
             full_pool_ratio = 1

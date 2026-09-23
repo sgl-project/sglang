@@ -9,7 +9,6 @@ from typing import TYPE_CHECKING, Any, Optional
 import msgspec
 import torch
 
-from sglang.srt.arg_groups.overrides import resolving_view
 from sglang.srt.configs.hybrid_arch import (
     hybrid_gdn_config,
     hybrid_kda_config,
@@ -74,6 +73,7 @@ from sglang.srt.mem_cache.memory_pool import (
     NoOpMHATokenToKVPool,
     PageMajorMHATokenToKVPool,
     ReqToTokenPool,
+    get_minimax_sparse_index_dtype,
 )
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.platforms import current_platform
@@ -97,7 +97,6 @@ from sglang.srt.utils.common import (
     get_available_gpu_memory,
     get_device_memory_capacity,
     is_float4_e2m1fn_x2,
-    is_gfx95_supported,
     is_hip,
     is_npu,
 )
@@ -117,7 +116,6 @@ def _should_elide_dsa_index_k(*, is_draft_worker: bool) -> bool:
 
 
 _is_hip = is_hip()
-_is_gfx95_supported = is_gfx95_supported()
 
 
 def _get_dsv4_compress_state_dtypes() -> tuple[torch.dtype, torch.dtype]:
@@ -1836,19 +1834,6 @@ class KVCacheConfigurator:
         )
         return token_to_kv_pool
 
-    def minimax_sparse_index_dtype(self) -> torch.dtype:
-        # pool_configurator's per-token cell size reads this; it must match the built pool
-        from sglang.srt.server_args import m3_fp8_attn_gemm_enabled
-
-        # fp8 attn-GEMM mode opts the indexer cache into fp8 (fp8 indexer
-        # GEMMs); fp8 KV without the mode keeps the indexer bf16 with the
-        # widening-dequant contract.
-        if m3_fp8_attn_gemm_enabled(resolving_view(self.server_args)):
-            return self.kv_cache_dtype
-        if _is_gfx95_supported and envs.SGLANG_OPT_MINIMAX_M3_FP8_INDEX_CACHE.get():
-            return torch.float8_e4m3fn
-        return self.model_dtype
-
     def _build_minimax_sparse_kv_pool(self, *, max_total_num_tokens: int) -> KVCache:
         _hf_config = self.model_config.hf_config
         sparse_cfg = get_minimax_sparse_attention_config(_hf_config)
@@ -1868,7 +1853,9 @@ class KVCacheConfigurator:
             size=max_total_num_tokens,
             page_size=self.pool_page_size,
             dtype=self.kv_cache_dtype,
-            index_dtype=self.minimax_sparse_index_dtype(),
+            index_dtype=get_minimax_sparse_index_dtype(
+                self.server_args, self.kv_cache_dtype, self.model_dtype
+            ),
             head_num=self.model_config.get_num_kv_heads(
                 get_parallel().attn_tp_size, get_parallel().attn_dcp_size
             ),
