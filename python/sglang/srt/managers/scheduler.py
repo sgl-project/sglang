@@ -3778,8 +3778,9 @@ class Scheduler(
         running_bs: int,
         beam_width: Optional[int] = None,
         running_batch: Optional[ScheduleBatch] = None,
+        has_chunked: int = 0,
     ) -> int:
-        pp_budget = get_parallel().pp_max_micro_batch_size - running_bs
+        pp_budget = get_parallel().pp_max_micro_batch_size - running_bs - has_chunked
         available = self.req_to_token_pool.available_size()
 
         active_batch = running_batch or self.running_batch
@@ -3914,6 +3915,7 @@ class Scheduler(
             waiting_queue_len=len(self.waiting_queue),
             prefill_tile_block_m=prefill_tile_block_m,
         )
+        pre_can_run_list_len = len(adder.can_run_list)
 
         if self.chunked_req is not None:
             self.chunked_req.init_next_round_input()
@@ -3924,6 +3926,7 @@ class Scheduler(
                 self.page_size,
             )
             self.chunked_req = adder.add_chunked_req(self.chunked_req)
+        has_chunked = 1 if len(adder.can_run_list) > pre_can_run_list_len else 0
 
         if self.enable_lora:
             running_loras = {
@@ -3951,10 +3954,12 @@ class Scheduler(
             candidate_beam_width = (
                 req.beam_group.beam_width if req.beam_group is not None else None
             )
-            if len(adder.can_run_list) >= self.get_num_allocatable_reqs(
+            # chunked req is loaded in a previous prefill step and should not be counted for occupying a free slot in this step.
+            if len(adder.can_run_list) - has_chunked >= self.get_num_allocatable_reqs(
                 running_bs,
                 candidate_beam_width,
                 running_batch=running_batch,
+                has_chunked=has_chunked,
             ):
                 running_batch.batch_is_full = True
             if self.disaggregation_mode == DisaggregationMode.PREFILL:
