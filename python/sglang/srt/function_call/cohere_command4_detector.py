@@ -11,6 +11,7 @@ from sglang.srt.function_call.base_format_detector import BaseFormatDetector
 from sglang.srt.function_call.core_types import (
     StreamingParseResult,
     StructureInfo,
+    ToolCallItem,
     _GetInfoFunc,
 )
 from sglang.srt.function_call.utils import _partial_json_loads
@@ -128,7 +129,27 @@ class CohereCommand4Detector(BaseFormatDetector):
         block_end = eot_pos + len(self.eot_token)
         result = self.detect_and_parse(current[:block_end], tools)
         self._buffer = current[block_end:]
+        for call in result.calls:
+            self._track_streamed_call(call)
         return result
+
+    def _track_streamed_call(self, call: ToolCallItem) -> None:
+        """Re-index a call from ``detect_and_parse`` for the streaming path.
+
+        ``parse_base_json`` sets ``tool_index`` to the tool's position in the
+        request, and the streaming serving layer sends that value as
+        ``tool_calls[*].index``. Clients aggregate deltas by that index, so
+        repeated calls to one tool collide and a forwarded unknown tool arrives
+        as ``-1``. Use the call's position in the response instead, and record
+        the call so the serving layer sees the same state as the other buffered
+        detectors.
+        """
+        call.tool_index = len(self.prev_tool_call_arr)
+        self.prev_tool_call_arr.append(
+            {"name": call.name, "arguments": json.loads(call.parameters)}
+        )
+        self.streamed_args_for_tool.append(call.parameters)
+        self.current_tool_id = len(self.prev_tool_call_arr)
 
     def supports_structural_tag(self) -> bool:
         return False
