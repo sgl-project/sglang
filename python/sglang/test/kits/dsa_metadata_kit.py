@@ -5,6 +5,7 @@ from types import SimpleNamespace
 
 import torch
 
+from sglang.kernels.ops.attention.dsv4.topk import topk_v2_plan_is_written
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsa.dsa_topk_backend import DSATopKBackend
 from sglang.srt.layers.attention.dsa_backend import DeepseekSparseAttnBackend
@@ -101,6 +102,8 @@ def assert_metadata_equal(test, actual, expected):
     for name, value in actual_buffers.items():
         reference = expected_buffers[name]
         if name == "topk_v2_plan":
+            if not topk_v2_plan_is_written(expected.dsa_seqlens_expanded):
+                continue
             # Unused plan rows are intentionally uninitialized. Active rows are
             # compacted by atomicAdd, so compare them in request order.
             torch.testing.assert_close(value[0], reference[0])

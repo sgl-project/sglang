@@ -3,6 +3,8 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING
 
+import torch
+
 from sglang.kernels.jit.utils import (
     cache_once,
     is_hip_runtime,
@@ -10,15 +12,23 @@ from sglang.kernels.jit.utils import (
     make_cpp_args,
 )
 from sglang.kernels.kernel_api_logging import debug_kernel_api
+from sglang.srt.environ import envs
 
 if TYPE_CHECKING:
-    import torch
     from tvm_ffi.module import Module
 
 _is_hip = is_hip_runtime()
 
 # ROCm needs a wider grid to saturate mapped-host transfers; CUDA keeps the legacy quota.
 DEFAULT_BLOCK_QUOTA = 32 if _is_hip else 2
+
+# Logical copy-group width; this is not the hardware warp/wavefront size.
+COPY_GROUP_THREADS = 32
+
+# Copy-round widths, widest first. The narrow rounds admit element sizes 128
+# does not divide, such as MLA's 576 B fp8 row, but only pay off against the
+# ROCm quota above, so CUDA keeps the original 128 B requirement.
+GROUP_BYTES = (128, 64, 32, 16) if _is_hip else (128,)
 
 
 @cache_once
@@ -73,18 +83,86 @@ def _jit_hicache_staged_module(
     )
 
 
+# TMA staging ring per CTA: 32 KB stages x 6 keeps the host loads in flight
+# under a 4-block launch; smaller stages make the loader's per-chunk cost the
+# limit. 4 store warps drain a strided-destination stage faster than it fills.
+TMA_STAGE_BYTES = 32 * 1024
+TMA_NUM_STAGES = 6
+TMA_STORE_WARPS = 4
+# Each CTA is capped by its SM's write port, so the host link needs four of
+# them; the register kernel keeps DEFAULT_BLOCK_QUOTA.
+TMA_BLOCK_QUOTA = 4
+
+
+@cache_once
+def _jit_hicache_tma_module(*, block_quota: int) -> Module:
+    args = make_cpp_args(TMA_STAGE_BYTES, TMA_NUM_STAGES, TMA_STORE_WARPS, block_quota)
+    return load_jit(
+        "hicache_tma",
+        *args,
+        cuda_files=["kvcacheio/hicache_tma.cuh"],
+        cuda_wrappers=[
+            ("launch_one", f"&HiCacheTmaKernel<{args}>::run_one"),
+            ("launch_all", f"&HiCacheTmaKernel<{args}>::run_all"),
+            ("launch_one_mla", f"&HiCacheTmaKernel<{args}>::run_one_mla"),
+            ("launch_all_mla", f"&HiCacheTmaKernel<{args}>::run_all_mla"),
+            ("fits_device", f"&HiCacheTmaKernel<{args}>::fits_device"),
+        ],
+    )
+
+
+def hicache_tma_rows_per_chunk(element_size: int) -> int:
+    """Rows the TMA kernel moves per stage (mirrors hicache_tma_rows_per_chunk)."""
+    rows = 1
+    while rows * 2 <= TMA_STAGE_BYTES // element_size and rows * 2 <= 128:
+        rows *= 2
+    return rows
+
+
+@cache_once
+def use_hicache_tma_kernel(
+    *, element_size: int, block_quota: int, page_size: int | None = None
+) -> bool:
+    """Whether transfers of `element_size`-byte rows go through the TMA kernel.
+
+    A chunk that straddles pages degrades to one bulk op per row, so pages must
+    tile the chunk; `page_size=None` (caller unaware of paging) trusts the indices.
+    """
+    if _is_hip or not envs.SGLANG_HICACHE_TMA_TRANSFER.get():
+        return False
+    if element_size % 16 != 0 or torch.cuda.get_device_capability()[0] < 9:
+        return False
+    if page_size is not None and page_size % hicache_tma_rows_per_chunk(element_size):
+        return False
+    try:
+        module = _jit_hicache_tma_module(block_quota=block_quota)
+    except Exception as e:
+        logging.getLogger(__name__).warning(
+            f"Failed to load the TMA HiCache kernel, using the register kernel: {e}"
+        )
+        return False
+    return bool(module.fits_device(torch.cuda.current_device()))
+
+
 def can_use_hicache_jit_kernel(
     *,
     element_size: int,
     unroll: int | None = None,  # can be tuned for performance
     block_quota: int | None = None,  # can be tuned for less interference
+    page_size: int | None = None,
 ) -> bool:
     logger = logging.getLogger(__name__)
-    if element_size % 128 != 0:
+    if use_hicache_tma_kernel(
+        element_size=element_size,
+        block_quota=block_quota or TMA_BLOCK_QUOTA,
+        page_size=page_size,
+    ):
+        return True
+    unroll = unroll or _default_unroll(element_size)
+    if not _tiles_across_lanes(element_size, unroll):
         logger.warning(f"Unsupported {element_size = } for JIT HiCache kernel")
         return False
     try:
-        unroll = unroll or _default_unroll(element_size)
         block_quota = block_quota or DEFAULT_BLOCK_QUOTA
         _jit_hicache_module(
             element_size=element_size,
@@ -121,6 +199,20 @@ def can_use_write_back_jit_kernel(
         return False
 
 
+def _tiles_across_lanes(element_size: int, unroll: int) -> bool:
+    """Mirror of pick_group_bytes() in kvcacheio/hicache.cuh."""
+    if unroll <= 0 or unroll > COPY_GROUP_THREADS or COPY_GROUP_THREADS % unroll != 0:
+        return False
+
+    lanes_per_worker = COPY_GROUP_THREADS // unroll
+    return any(
+        group % lanes_per_worker == 0
+        and element_size % group == 0
+        and group // lanes_per_worker in (4, 8, 16)
+        for group in GROUP_BYTES
+    )
+
+
 def _default_unroll(element_size: int) -> int:
     if element_size <= 512:
         return 4
@@ -144,6 +236,7 @@ def transfer_hicache_one_layer(
     element_dim: int | None = None,
     unroll: int | None = None,  # can be tuned for performance
     block_quota: int | None = None,  # can be tuned for less interference
+    page_size: int | None = None,
 ) -> None:
     element_dim = element_dim or k_cache_dst.size(-1)
     k_cache_src = k_cache_src.view(-1, element_dim)
@@ -151,13 +244,19 @@ def transfer_hicache_one_layer(
     k_cache_dst = k_cache_dst.view(-1, element_dim)
     v_cache_dst = v_cache_dst.view(-1, element_dim)
     element_size = element_dim * k_cache_dst.element_size()
-    block_quota = block_quota or DEFAULT_BLOCK_QUOTA
-    unroll = unroll or _default_unroll(element_size)
-    module = _jit_hicache_module(
-        element_size=element_size,
-        unroll=unroll,
-        block_quota=block_quota,
-    )
+    tma_quota = block_quota or TMA_BLOCK_QUOTA
+    if use_hicache_tma_kernel(
+        element_size=element_size, block_quota=tma_quota, page_size=page_size
+    ):
+        module = _jit_hicache_tma_module(block_quota=tma_quota)
+    else:
+        block_quota = block_quota or DEFAULT_BLOCK_QUOTA
+        unroll = unroll or _default_unroll(element_size)
+        module = _jit_hicache_module(
+            element_size=element_size,
+            unroll=unroll,
+            block_quota=block_quota,
+        )
     module.launch_one(
         k_cache_dst,
         v_cache_dst,
@@ -182,11 +281,28 @@ def transfer_hicache_all_layer(
     element_size: int | None = None,
     unroll: int | None = None,  # can be tuned for performance
     block_quota: int | None = None,  # can be tuned for less interference
+    page_size: int | None = None,
 ) -> None:
     if element_size is None:  # assume both contiguous
         assert kv_cache_dst_stride_bytes == kv_cache_src_stride_bytes
         element_size = kv_cache_dst_stride_bytes
 
+    tma_quota = block_quota or TMA_BLOCK_QUOTA
+    if use_hicache_tma_kernel(
+        element_size=element_size, block_quota=tma_quota, page_size=page_size
+    ):
+        _jit_hicache_tma_module(block_quota=tma_quota).launch_all(
+            k_ptr_dst,
+            v_ptr_dst,
+            indices_dst,
+            k_ptr_src,
+            v_ptr_src,
+            indices_src,
+            kv_cache_src_stride_bytes,
+            kv_cache_dst_stride_bytes,
+            element_size,
+        )
+        return
     block_quota = block_quota or DEFAULT_BLOCK_QUOTA
     unroll = unroll or _default_unroll(element_size)
     module = _jit_hicache_module(
@@ -215,18 +331,25 @@ def transfer_hicache_one_layer_mla(
     element_dim: int | None = None,
     unroll: int | None = None,
     block_quota: int | None = None,
+    page_size: int | None = None,
 ) -> None:
     element_dim = element_dim or cache_dst.size(-1)
     cache_src = cache_src.view(-1, element_dim)
     cache_dst = cache_dst.view(-1, element_dim)
     element_size = element_dim * cache_dst.element_size()
-    block_quota = block_quota or DEFAULT_BLOCK_QUOTA
-    unroll = unroll or _default_unroll(element_size)
-    module = _jit_hicache_module(
-        element_size=element_size,
-        unroll=unroll,
-        block_quota=block_quota,
-    )
+    tma_quota = block_quota or TMA_BLOCK_QUOTA
+    if use_hicache_tma_kernel(
+        element_size=element_size, block_quota=tma_quota, page_size=page_size
+    ):
+        module = _jit_hicache_tma_module(block_quota=tma_quota)
+    else:
+        block_quota = block_quota or DEFAULT_BLOCK_QUOTA
+        unroll = unroll or _default_unroll(element_size)
+        module = _jit_hicache_module(
+            element_size=element_size,
+            unroll=unroll,
+            block_quota=block_quota,
+        )
     module.launch_one_mla(
         cache_dst,
         indices_dst,
@@ -246,11 +369,26 @@ def transfer_hicache_all_layer_mla(
     element_size: int | None = None,
     unroll: int | None = None,
     block_quota: int | None = None,
+    page_size: int | None = None,
 ) -> None:
     if element_size is None:
         assert cache_dst_stride_bytes == cache_src_stride_bytes
         element_size = cache_dst_stride_bytes
 
+    tma_quota = block_quota or TMA_BLOCK_QUOTA
+    if use_hicache_tma_kernel(
+        element_size=element_size, block_quota=tma_quota, page_size=page_size
+    ):
+        _jit_hicache_tma_module(block_quota=tma_quota).launch_all_mla(
+            ptr_dst,
+            indices_dst,
+            ptr_src,
+            indices_src,
+            cache_src_stride_bytes,
+            cache_dst_stride_bytes,
+            element_size,
+        )
+        return
     block_quota = block_quota or DEFAULT_BLOCK_QUOTA
     unroll = unroll or _default_unroll(element_size)
     module = _jit_hicache_module(
