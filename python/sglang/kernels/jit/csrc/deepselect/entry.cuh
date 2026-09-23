@@ -192,6 +192,7 @@ struct TopkNormal {
         idx_oob_fill_value,
         value_oob_fill_value,
         abort_when_nan_found);
+    if (plan.args.batch_size == 0) return;
     if constexpr (std::is_same_v<ConfigWave1, ConfigWaves>) {
       details::run_normal<ConfigWave1>(plan.args);
     } else {
@@ -236,6 +237,7 @@ struct TopkCluster {
         idx_oob_fill_value,
         value_oob_fill_value,
         abort_when_nan_found);
+    if (plan.args.batch_size == 0) return;
     topk_select_bf16_cluster::run_topk_select_kernel<Config>(plan.args);
   }
 };
