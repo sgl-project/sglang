@@ -16,6 +16,7 @@
 
 import logging
 import os
+from contextlib import nullcontext
 from functools import lru_cache
 from typing import Iterable, Optional, Set, Tuple, Union
 
@@ -1936,9 +1937,14 @@ class Qwen3_5ForCausalLM(nn.Module):
         # Pass through decoder layers
         for layer_idx in range(self.start_layer, self.end_layer):
             layer = self.layers[layer_idx]
-            with get_global_expert_distribution_recorder().with_current_layer(
-                layer_idx
-            ):
+            ctx = (
+                nullcontext()
+                if check_cuda_graph_backend(Phase.PREFILL, Backend.TC_PIECEWISE)
+                else get_global_expert_distribution_recorder().with_current_layer(
+                    layer_idx
+                )
+            )
+            with ctx:
                 hidden_states, residual = layer(
                     positions=positions,
                     hidden_states=hidden_states,
