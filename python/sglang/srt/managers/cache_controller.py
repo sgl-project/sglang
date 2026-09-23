@@ -601,6 +601,7 @@ class HiCacheController:
                     "nixl",
                     "simm",
                     "mori",
+                    "tensorcast",
                 ]
             ) or (
                 self.storage_backend_type == "dynamic"
@@ -749,17 +750,15 @@ class HiCacheController:
         )
 
     def reset(self):
-        self.storage_stop_event.set()
+        # Reuse detach's queue wakeups and bounded joins, and fail if any
+        # storage thread remains alive before clearing shared state.
+        self._stop_storage_threads()
 
         self.write_queue.clear()
         self.load_queue.clear()
         self.ack_write_queue.clear()
         self.ack_load_queue.clear()
         if self.enable_storage:
-            self.prefetch_thread.join()
-            self.prefetch_io_aux_thread.join()
-            self.prefetch_sync_thread.join()
-            self.backup_thread.join()
             self.prefetch_queue.queue.clear()
             self.backup_queue.queue.clear()
             self.prefetch_buffer.queue.clear()
@@ -789,6 +788,15 @@ class HiCacheController:
             self.prefetch_io_aux_thread.start()
             self.prefetch_sync_thread.start()
             self.backup_thread.start()
+
+    def has_inflight_device_transfers(self) -> bool:
+        """Whether queued or unacknowledged L2 transfers still use device rows."""
+        return bool(
+            self.write_queue
+            or self.load_queue
+            or self.ack_write_queue
+            or self.ack_load_queue
+        )
 
     def write(
         self,
@@ -976,10 +984,6 @@ class HiCacheController:
             )
         )
         return producer_id
-
-    def evict_device(self, device_indices: torch.Tensor) -> int:
-        self.mem_pool_device_allocator.free(device_indices)
-        return len(device_indices)
 
     def evict_host(self, host_indices: torch.Tensor, backup_only: bool = True) -> int:
         if not backup_only:

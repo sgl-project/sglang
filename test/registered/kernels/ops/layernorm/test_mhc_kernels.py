@@ -13,12 +13,7 @@ register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-large")
 
 @pytest.fixture
 def stated_tp_group():
-    """A TP group for a test that runs in a process without one.
-
-    The production call passes the group *into* `use_symmetric_memory`, so
-    stubbing that context manager does not stop the read -- the argument is
-    evaluated first. Stating it on the context answers every spelling.
-    """
+    """Provide a TP-group placeholder for kernels with mocked symmetric memory."""
     from sglang.srt.runtime_context import get_parallel
 
     with get_parallel().override(tp_group=None):
@@ -35,10 +30,7 @@ def test_mhc_fused_post_pre_matches_unfused(
         pytest.skip("CUDA is required for TileLang mHC kernels")
 
     monkeypatch.setattr(mhc, "is_dsa_prefill_cp_interleave", lambda: False)
-    # This is a single-process kernel unit test with no TP group initialized.
-    # mhc_pre / mhc_fused_post_pre allocate the MoE input in the symmetric-memory
-    # pool, which asks for the TP group; bypassing the allocation is enough, and
-    # then nothing asks. Mirrors the workaround in test_mxfp4_sm90_cutlass.py.
+    # Disable symmetric-memory allocation for this single-process kernel test.
     monkeypatch.setattr(mhc, "use_symmetric_memory", lambda *a, **kw: nullcontext())
     monkeypatch.setattr(mhc, "is_allocation_symmetric", lambda: False)
     torch.manual_seed(0)

@@ -19,6 +19,8 @@ pub struct Config {
 pub struct ProxyConfig {
     /// Timeout for upstream response headers and body. Counts as a circuit-breaker failure.
     pub request_timeout_secs: u64,
+    /// Maximum silence between streamed upstream chunks before the stream fails.
+    pub stream_idle_timeout_secs: u64,
 }
 
 pub fn default_proxy_request_timeout_secs() -> u64 {
@@ -29,6 +31,7 @@ impl Default for ProxyConfig {
     fn default() -> Self {
         Self {
             request_timeout_secs: default_proxy_request_timeout_secs(),
+            stream_idle_timeout_secs: 180,
         }
     }
 }
@@ -50,6 +53,13 @@ impl Default for InflightLoadConfig {
             stale_request_timeout_secs: default_stale_request_timeout_secs(),
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
+pub enum ChatRoutingKind {
+    #[default]
+    Legacy,
+    Reorg,
 }
 
 /// Routing strategies accepted by `--policy`.
