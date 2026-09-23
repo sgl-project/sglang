@@ -112,9 +112,19 @@ class TestEnginePrompt(unittest.TestCase):
         )
         self.assertEqual(key, "text")
 
-    def test_non_lossy_multimodal_is_unchanged(self):
+    def test_non_lossy_text_only_multimodal_sends_ids(self):
+        # The ids were already encoded while rendering; re-tokenizing is wasted work.
         key, value = engine_prompt(
             self._server(False), _messages([1, 3, 4]), is_multimodal=True
+        )
+        self.assertEqual(key, "input_ids")
+        self.assertEqual(value, [1, 3, 4])
+
+    def test_non_lossy_with_an_image_still_sends_text(self):
+        key, value = engine_prompt(
+            self._server(False),
+            _messages([1, 3, 4], image_data=["img"]),
+            is_multimodal=True,
         )
         self.assertEqual(key, "text")
         self.assertEqual(value, "rendered")
