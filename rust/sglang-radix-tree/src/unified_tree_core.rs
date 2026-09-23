@@ -791,7 +791,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
                 &params.eviction_policy,
                 params.slru_protected_threshold,
                 params.tlru_tail_budget,
-                params.tlru_float_config.clone(),
+                params.tlru_float_config,
             ),
             tlru_bookkeeping: params.eviction_policy.eq_ignore_ascii_case("tlru"),
             page_size: params.page_size,

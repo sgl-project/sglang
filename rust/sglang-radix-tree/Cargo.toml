@@ -22,9 +22,7 @@ crate-type = ["cdylib"]
 
 [dependencies]
 hashbrown = "0.16"
-num-bigint = "0.4"
-num-traits = "0.2"
-pyo3 = { version = "0.22", optional = true, features = ["num-bigint"] }
+pyo3 = { version = "0.22", optional = true }
 sha2 = "0.10"
 tch = "=0.24.0"
 thiserror = "1"

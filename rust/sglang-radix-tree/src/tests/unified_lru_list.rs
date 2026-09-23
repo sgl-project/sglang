@@ -1,7 +1,6 @@
 use super::*;
 use crate::components::FULL;
 use crate::node::{NodeArena, NodeIdx_, ValueSlotIdx};
-use num_bigint::BigInt;
 
 fn order(list: &UnifiedLRUList) -> Vec<NodeIdx_> {
     list.iter().collect()
@@ -793,6 +792,13 @@ fn tlru_mixed_counts_cover_both_ends_of_the_exact_i128_sum_range() {
         );
         assert_eq!(strategy.get_priority(node), PriorityKey(-1, 5));
     }
+    // A large estimate remains valid while this node's actual history fits;
+    // it need not reserve space for every possible native history length.
+    node.tlru_history_len = 1;
+    node.tlru_cached_prefix_len = 1;
+    let strategy =
+        tlru_float_strategy(i128::MAX as f64, TlruPromptEstimate::Integer(i128::MAX - 1));
+    assert_eq!(strategy.get_priority(node), PriorityKey(-1, 5));
 }
 
 #[test]
@@ -861,32 +867,11 @@ fn tlru_float_budget_compares_cached_integer_lengths_without_rounding_them() {
 }
 
 #[test]
-fn tlru_large_integer_estimates_preserve_exact_sums_at_float_rounding_ties() {
-    let (mut arena, a) = arena_with_node();
-    let node = arena.node_mut(a);
-    for exponent in [130_usize, 1023] {
-        let positive = 2.0_f64.powi(exponent as i32);
-        let adjacent = f64::from_bits(positive.to_bits() + 1);
-        let midpoint = (BigInt::from(1_u8) << exponent) + (BigInt::from(1_u8) << (exponent - 53));
-        // The estimate lies two tokens below a float midpoint. The exact
-        // integer sum at H=2 rounds down; H=3 is the first value above it.
-        let strategy =
-            tlru_float_strategy(positive, TlruPromptEstimate::BigInteger(&midpoint - 2_u8));
-        for (history, expected_class) in [(1, -1), (2, -1), (3, 0), (4, 0)] {
-            node.tlru_history_len = history;
-            node.tlru_cached_prefix_len = history;
-            assert_eq!(strategy.get_priority(node), PriorityKey(expected_class, 5));
-        }
-        // At the corresponding negative midpoint the tie rounds toward the
-        // upper value, so the first transition occurs one history token earlier.
-        let strategy =
-            tlru_float_strategy(-adjacent, TlruPromptEstimate::BigInteger(-midpoint - 2_u8));
-        for (history, expected_class) in [(1, -1), (2, 0), (3, 0)] {
-            node.tlru_history_len = history;
-            node.tlru_cached_prefix_len = history;
-            assert_eq!(strategy.get_priority(node), PriorityKey(expected_class, 5));
-        }
-    }
+#[should_panic(expected = "T-LRU history + next_prompt_estimate overflowed i128")]
+fn tlru_integer_history_overflow_panics_before_float_conversion() {
+    let (arena, a) = arena_with_node();
+    let strategy = tlru_float_strategy(i128::MAX as f64, TlruPromptEstimate::Integer(i128::MAX));
+    strategy.get_priority(arena.node(a));
 }
 
 #[test]

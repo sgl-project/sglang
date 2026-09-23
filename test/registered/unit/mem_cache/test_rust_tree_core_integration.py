@@ -460,26 +460,33 @@ def test_tlru_float_priorities_match_python_at_integer_comparison_boundaries():
 def test_tlru_integer_estimate_priorities_match_python_at_i128_endpoints():
     bindings = load_tree_core_extension(inspection=True)
     max_history = 2 * sys.maxsize + 1
-    max_safe_estimate = 2**127 - 1 - max_history
-    histories = [0, 1, 2, 2**53 + 1, max_history - 1, max_history]
+    max_estimate = 2**127 - 1
+    max_safe_estimate = max_estimate - max_history
+    history_candidates = [0, 1, 2, 2**53 + 1, max_history - 1, max_history]
     for estimate in (
-        -(2**127) - 1,
         -(2**127),
         -(2**127) + 1,
         max_safe_estimate - 1,
         max_safe_estimate,
         max_safe_estimate + 1,
-        2**127 - 1,
-        2**127,
+        max_estimate - 2,
+        max_estimate,
     ):
+        # Only histories whose actual addition fits i128 belong in the parity
+        # oracle; native arithmetic overflow is covered by the Rust panic test.
+        histories = [
+            history
+            for history in history_candidates
+            if history <= max_estimate - estimate
+        ]
         for threshold in (float(estimate), math.nextafter(float(estimate), math.inf)):
             _assert_tlru_float_priorities_match_python(
                 bindings, threshold, estimate, histories, histories
             )
 
 
-@pytest.mark.parametrize("exponent", [128, 200, 1000])
-def test_tlru_large_integer_estimate_priorities_match_python_at_rounding_ties(exponent):
+@pytest.mark.parametrize("exponent", [53, 100, 126])
+def test_tlru_integer_estimate_priorities_match_python_at_rounding_ties(exponent):
     bindings = load_tree_core_extension(inspection=True)
     max_history = 2 * sys.maxsize + 1
     for sign in (-1, 1):
@@ -509,54 +516,21 @@ def test_tlru_large_integer_estimate_priorities_match_python_at_rounding_ties(ex
             lower = upper
 
 
-@pytest.mark.parametrize(
-    "threshold,next_prompt_estimate",
-    [
-        (10**1000, 0.0),
-        (-(10**1000), 0.0),
-        (0.0, 10**1000),
-        (0.0, -(10**1000)),
-    ],
-)
-def test_tlru_mixed_numeric_overflow_is_reported_at_rust_construction(
-    threshold, next_prompt_estimate
-):
-    config = {"threshold": threshold, "next_prompt_estimate": next_prompt_estimate}
-    # Native construction validates conversions once; Python reports the same
-    # numeric overflow when evaluating a candidate's eviction priority.
-    with pytest.raises(OverflowError):
-        _tlru_tree_core("rust", config)
-    strategy = TLRUStrategy(**config)
-    node = SimpleNamespace(
-        _tlru_history_len=2,
-        _tlru_cached_prefix_len=2,
-        key=(0,),
-        last_access_time=0.0,
-    )
-    with pytest.raises(OverflowError):
-        strategy.get_priority(node)
-
-
-def test_tlru_float_conversion_validates_the_complete_native_history_range():
-    # This integer still converts to the largest finite float at history one,
-    # but reaches the ties-to-even overflow boundary at history two.
-    estimate = 2**1024 - 2**970 - 2
-    strategy = TLRUStrategy(threshold=0.0, next_prompt_estimate=estimate)
-    node = SimpleNamespace(
-        _tlru_history_len=1,
-        _tlru_cached_prefix_len=1,
-        key=(0,),
-        last_access_time=0.0,
-    )
-    assert strategy.get_priority(node)[0] == 0
-    node._tlru_history_len = 2
-    with pytest.raises(OverflowError):
-        strategy.get_priority(node)
-
-    # Reject at startup if any native history can overflow, so eviction does
-    # not silently round an overflowing Python integer to infinity.
+@pytest.mark.parametrize("estimate", [-(2**127) - 1, 2**127])
+def test_tlru_mixed_integer_estimate_outside_i128_is_rejected(estimate):
     with pytest.raises(OverflowError):
         _tlru_tree_core("rust", {"threshold": 0.0, "next_prompt_estimate": estimate})
+
+
+@pytest.mark.parametrize("backend", ["python", "rust"])
+def test_tlru_near_i128_max_estimate_accepts_small_history(backend):
+    core = _tlru_tree_core(
+        backend,
+        {"threshold": float(2**127 - 1), "next_prompt_estimate": 2**127 - 3},
+    )
+    _insert(core, [0, 1], [10, 11])
+    assert _tlru_evict_one_leaf(core, "device") == [10, 11]
+    core.sanity_check([], [])
 
 
 @pytest.mark.parametrize(

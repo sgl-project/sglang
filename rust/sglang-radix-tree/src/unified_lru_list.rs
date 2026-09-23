@@ -492,36 +492,28 @@ pub struct TlruStrategy {
     pub float_config: Option<TlruFloatConfig>,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Copy)]
 pub struct TlruFloatConfig {
     pub threshold: f64,
     pub next_prompt_estimate: TlruPromptEstimate,
 }
 
 /// How Python evaluates history + next_prompt_estimate before subtraction.
-#[derive(Clone)]
+#[derive(Clone, Copy)]
 pub enum TlruPromptEstimate {
     Float(f64),
-    /// The binding ensures adding any native history length fits in i128.
+    /// Add the actual history before converting to float, as Python does.
     Integer(i128),
-    /// Preserve Python's exact addition for estimates beyond the i128 range.
-    BigInteger(num_bigint::BigInt),
-}
-
-pub(crate) fn tlru_big_integer_to_float(value: &num_bigint::BigInt) -> f64 {
-    // Decimal parsing retains every digit and rounds ties like Python. The
-    // num-bigint to_f64 conversion can lose low bits near a rounding boundary.
-    value.to_string().parse().expect("valid integer literal")
 }
 
 impl TlruFloatConfig {
     pub(crate) fn is_tel_safe(&self, history: usize, cached_without_node: usize) -> bool {
-        let next_prompt = match &self.next_prompt_estimate {
-            TlruPromptEstimate::Float(estimate) => history as f64 + *estimate,
-            TlruPromptEstimate::Integer(estimate) => (history as i128 + *estimate) as f64,
-            TlruPromptEstimate::BigInteger(estimate) => {
-                tlru_big_integer_to_float(&(estimate + history))
-            }
+        let next_prompt = match self.next_prompt_estimate {
+            TlruPromptEstimate::Float(estimate) => history as f64 + estimate,
+            TlruPromptEstimate::Integer(estimate) => estimate
+                .checked_add(history as i128)
+                .expect("T-LRU history + next_prompt_estimate overflowed i128")
+                as f64,
         };
         let budget = next_prompt - self.threshold;
         // Match Python's max(budget, 0) and exact int >= float comparison.
@@ -535,7 +527,7 @@ impl TlruFloatConfig {
 impl<K: ChildKeyType> EvictionStrategy<K> for TlruStrategy {
     fn get_priority(&self, node: &Node<K>) -> PriorityKey {
         let cached_without_node = node.tlru_cached_prefix_len - node.key.atom_len();
-        let tel_safe = match self.float_config.as_ref() {
+        let tel_safe = match self.float_config {
             Some(config) => config.is_tel_safe(node.tlru_history_len, cached_without_node),
             None => node.tlru_history_len - cached_without_node <= self.tail_budget,
         };

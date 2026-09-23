@@ -21,14 +21,13 @@ Build, import, and runtime failures in supported configurations remain errors.
 T-LRU supports integer and floating-point `threshold` and `next_prompt_estimate`
 parameters. Integer configurations retain exact arithmetic; floating-point
 configurations preserve Python's operation order, rounding, and comparison with
-integer cache lengths, including NaN and infinity. Mixed configurations whose
-integer-to-float conversions overflow within the native history-length range
-raise `OverflowError` at initialization. Mixed integer estimates use i128
-addition when it fits; larger estimates use `num-bigint` addition followed by
-decimal-to-float conversion to retain Python's rounding. Only that oversized
-integer path allocates during priority evaluation. Per-node path depth and branch history
-preserve the tail budget across splits, host refills, and repeated eviction. The
-ancestor history walk runs only when T-LRU is selected.
+integer cache lengths, including NaN and infinity. In mixed integer/float
+configurations, the integer estimate must fit in i128; larger values raise
+`OverflowError` at initialization. The native integer addition is checked and
+panics if the actual history plus estimate overflows. Priority evaluation uses
+only native integer/float arithmetic and does not allocate. Per-node path depth
+and branch history preserve the tail budget across splits, host refills, and
+repeated eviction. The ancestor history walk runs only when T-LRU is selected.
 
 Select a backend explicitly with:
 

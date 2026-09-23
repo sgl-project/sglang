@@ -4,12 +4,8 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::Mutex;
 
-use num_bigint::BigInt;
-use num_traits::ToPrimitive;
 use pyo3::buffer::PyBuffer;
-use pyo3::exceptions::{
-    PyAssertionError, PyKeyError, PyOverflowError, PyRuntimeError, PyValueError,
-};
+use pyo3::exceptions::{PyAssertionError, PyKeyError, PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyList};
 use tch::{Device, Kind, Tensor};
@@ -17,7 +13,7 @@ use tch::{Device, Kind, Tensor};
 use crate::components::{ComponentSet, ComponentType, FULL, MAMBA, SWA};
 use crate::node::ChildKeyType;
 use crate::node::{KeyNamespaceRef, NodeAccessError, NodeId, TreeCoreRuntimeError};
-use crate::unified_lru_list::{TlruFloatConfig, TlruPromptEstimate, tlru_big_integer_to_float};
+use crate::unified_lru_list::{TlruFloatConfig, TlruPromptEstimate};
 use crate::unified_tree_core::KvCacheEvent;
 use crate::unified_tree_core::{
     BufferBackupSnapshot, BufferBackupState, CacheAction, CacheInitParams, CacheTransferPhase,
@@ -444,38 +440,17 @@ pub struct TlruFloatConfigBinding {
 impl TlruFloatConfigBinding {
     #[new]
     #[pyo3(signature = (threshold, next_prompt_estimate, integer_estimate = None))]
-    fn new(
-        threshold: f64,
-        next_prompt_estimate: f64,
-        integer_estimate: Option<BigInt>,
-    ) -> PyResult<Self> {
+    fn new(threshold: f64, next_prompt_estimate: f64, integer_estimate: Option<i128>) -> Self {
         let estimate = match integer_estimate {
-            Some(value) => {
-                if let Some(small) = value.to_i128()
-                    && small <= i128::MAX - usize::MAX as i128
-                {
-                    TlruPromptEstimate::Integer(small)
-                } else {
-                    // Check both endpoints once; all native history lengths
-                    // must remain convertible before eviction starts.
-                    if !tlru_big_integer_to_float(&value).is_finite()
-                        || !tlru_big_integer_to_float(&(&value + usize::MAX)).is_finite()
-                    {
-                        return Err(PyOverflowError::new_err(
-                            "int too large to convert to float",
-                        ));
-                    }
-                    TlruPromptEstimate::BigInteger(value)
-                }
-            }
+            Some(value) => TlruPromptEstimate::Integer(value),
             None => TlruPromptEstimate::Float(next_prompt_estimate),
         };
-        Ok(Self {
+        Self {
             config: TlruFloatConfig {
                 threshold,
                 next_prompt_estimate: estimate,
             },
-        })
+        }
     }
 
     #[cfg(feature = "inspection")]
@@ -511,10 +486,7 @@ impl TreeCoreInitParamsBinding {
             eviction_policy: self.eviction_policy.clone(),
             slru_protected_threshold: self.slru_protected_threshold,
             tlru_tail_budget: self.tlru_tail_budget,
-            tlru_float_config: self
-                .tlru_float_config
-                .as_ref()
-                .map(|value| value.config.clone()),
+            tlru_float_config: self.tlru_float_config.as_ref().map(|value| value.config),
             page_size: self.page_size,
             is_write_back: self.is_write_back,
             enable_hicache: self.enable_hicache,
