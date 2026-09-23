@@ -1,4 +1,5 @@
 import unittest
+from enum import IntEnum
 from types import SimpleNamespace
 from unittest import mock
 
@@ -45,23 +46,37 @@ class _FakeBuffer:
         return 1
 
 
+class _FakeCudaError(IntEnum):
+    SUCCESS = 0
+    INVALID_VALUE = 1
+
+
 class _FakeCudart:
-    def __init__(self, fail_on_registration: int | None = None):
+    def __init__(
+        self,
+        fail_on_registration: int | None = None,
+        fail_on_unregistration: int | None = None,
+    ):
         self.registrations = []
         self.unregistrations = []
         self.fail_on_registration = fail_on_registration
+        self.fail_on_unregistration = fail_on_unregistration
 
-    def cudaHostRegister(self, ptr: int, size: int, flags: int) -> int:
+    def cudaHostRegister(self, ptr: int, size: int, flags: int) -> _FakeCudaError:
         self.registrations.append((ptr, size, flags))
         if len(self.registrations) == self.fail_on_registration:
-            return 1
-        return 0
+            return _FakeCudaError.INVALID_VALUE
+        return _FakeCudaError.SUCCESS
 
-    def cudaHostUnregister(self, ptr: int) -> int:
+    def cudaHostUnregister(self, ptr: int) -> _FakeCudaError:
         self.unregistrations.append(ptr)
-        return 0
+        if len(self.unregistrations) == self.fail_on_unregistration:
+            return _FakeCudaError.INVALID_VALUE
+        return _FakeCudaError.SUCCESS
 
-    def cudaGetErrorString(self, rc: int) -> str:
+    def cudaGetErrorString(self, rc: _FakeCudaError) -> str:
+        if not isinstance(rc, _FakeCudaError):
+            raise TypeError("cudaGetErrorString requires a CUDA error enum")
         return "injected error"
 
 
@@ -353,6 +368,52 @@ class TestHiCacheHostRegister(unittest.TestCase):
             [(base, gib, 0), (base + gib, gib, 0)],
         )
         self.assertEqual(cudart.unregistrations, [base])
+
+    def test_failed_cleanup_retains_ranges_for_retry(self):
+        gib = 1024**3
+        base = 0x10000000
+        for fail_on_registration in (None, 3):
+            with self.subTest(fail_on_registration=fail_on_registration):
+                buffer = _FakeBuffer(base, 3 * gib)
+                cudart = _FakeCudart(
+                    fail_on_registration=fail_on_registration,
+                    fail_on_unregistration=1,
+                )
+                with (
+                    envs.SGLANG_HICACHE_HOST_REGISTER_CHUNK_GB.override(1),
+                    mock.patch.object(torch.cuda, "cudart", return_value=cudart),
+                ):
+                    if fail_on_registration is None:
+                        _cuda_host_register(buffer, registration_granularity_bytes=gib)
+                        with self.assertLogs(level="WARNING") as logs:
+                            _cuda_host_unregister(buffer)
+                        failed_ptr = base + 2 * gib
+                        expected_cleanup = [failed_ptr, base + gib, base]
+                    else:
+                        with (
+                            self.assertLogs(level="WARNING") as logs,
+                            self.assertRaisesRegex(
+                                RuntimeError,
+                                r"rc=1, injected error.*offset=2147483648",
+                            ),
+                        ):
+                            _cuda_host_register(
+                                buffer, registration_granularity_bytes=gib
+                            )
+                        failed_ptr = base + gib
+                        expected_cleanup = [failed_ptr, base]
+
+                    self.assertIn("rc=1, injected error", logs.output[0])
+                    self.assertEqual(cudart.unregistrations, expected_cleanup)
+                    self.assertEqual(
+                        buffer._sglang_cuda_host_registered_ranges, [(failed_ptr, gib)]
+                    )
+                    _cuda_host_unregister(buffer)
+                    _cuda_host_unregister(buffer)
+                    self.assertEqual(
+                        cudart.unregistrations, expected_cleanup + [failed_ptr]
+                    )
+                    self.assertEqual(buffer._sglang_cuda_host_registered_ranges, [])
 
     def test_missing_copy_granularity_preserves_single_registration(self):
         gib = 1024**3
