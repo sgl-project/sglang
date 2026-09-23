@@ -736,6 +736,72 @@ SGLang projects those adapter factors onto the pruned coordinates at load time.
 A structurally modified checkpoint without that metadata still fails closed,
 and packed GGUF weights remain incompatible with LoRA.
 
+### PDD acceleration LoRAs
+
+[Alibaba PAI's MiniMax-H3-Acc-LoRAs](https://huggingface.co/alibaba-pai/MiniMax-H3-Acc-LoRAs)
+use Parallel Decoding Distillation (PDD) for eight denoiser evaluations. These
+checkpoints contain backbone LoRA weights and interval-specific output heads.
+Merge the backbone weights offline, then fuse the output heads before serving.
+The `--lora-path` recipe above does not perform these preparation steps.
+
+Match the adapter and original MiniMax-H3 transformer weights to the server's
+model variant:
+
+| Model variant | Adapter file | Tasks |
+| --- | --- | --- |
+| `fl2va` | `MiniMax-H3-FL2VA-Acc-8Step.safetensors` | `t2va`, `fl2va` |
+| `ref2va` | `MiniMax-H3-Ref2VA-Acc-8Step.safetensors` | `ref2va` |
+
+`BASE_TRANSFORMER_DIR` is the directory containing the original model's
+BF16/FP32 transformer weight files, not the model root or the LoRA directory.
+If you downloaded `MiniMaxAI/MiniMax-H3` to `/path/to/MiniMax-H3`, use
+`/path/to/MiniMax-H3/FL2VA/transformer` for T2VA/FL2VA or
+`/path/to/MiniMax-H3/Ref2VA/transformer` for Ref2VA. This directory contains
+`model-*.safetensors`, `model.safetensors.index.json`, and `config.json`.
+The builder reads these files and writes the merged weights to
+`$PDD_DIR/transformer`, leaving the original weights unchanged.
+
+The following example prepares FL2VA
+weights and serves them on eight NVIDIA CUDA GPUs with TP2 + Ulysses4:
+
+```bash Command
+BASE_TRANSFORMER_DIR=/path/to/MiniMax-H3/FL2VA/transformer
+LORA_DIR=/path/to/h3-acc-loras
+PDD_DIR=/path/to/h3-fl2va-pdd
+
+hf download alibaba-pai/MiniMax-H3-Acc-LoRAs \
+  MiniMax-H3-FL2VA-Acc-8Step.safetensors --local-dir "$LORA_DIR"
+
+python3 -m sglang.multimodal_gen.tools.build_minimax_h3_pdd_weights \
+  "$BASE_TRANSFORMER_DIR" \
+  "$LORA_DIR/MiniMax-H3-FL2VA-Acc-8Step.safetensors" \
+  "$PDD_DIR"
+
+python3 -m sglang.multimodal_gen.tools.fuse_minimax_h3_pdd_heads \
+  "$PDD_DIR" --video-shift 12.0 --audio-shift 3.0
+
+SGLANG_DIFFUSION_MINIMAX_H3_PDD_HEADS="$PDD_DIR/pdd_fused_heads.safetensors" \
+sglang serve \
+  --model-path MiniMaxAI/MiniMax-H3 \
+  --model-variant fl2va \
+  --transformer-weights-path "$PDD_DIR/transformer" \
+  --num-gpus 8 \
+  --tp-size 2 \
+  --ulysses-degree 4 \
+  --performance-mode speed \
+  --port 30010
+```
+
+Keep `pdd_config.json` beside `pdd_fused_heads.safetensors`, outside the
+`transformer/` directory. For Ref2VA, use its adapter and base transformer,
+a separate output directory, and `--model-variant ref2va`.
+
+Use the requests in [Generate video and audio](#4-generate-video-and-audio)
+with `num_inference_steps: 9`, `flow_shift: 12.0`, and `audio_flow_shift: 3.0`.
+The nine sigma grid points give eight denoiser evaluations. These settings
+must match the fused heads; the server rejects a different step count or
+shift. Use `quality: "lossless"` in requests.
+
 ## 6. FastH3: 4-step distilled preview
 
 [FastVideo/FastVideo-FastH3-4-step-Preview-v1-VSA-DataFree](https://huggingface.co/FastVideo/FastVideo-FastH3-4-step-Preview-v1-VSA-DataFree)

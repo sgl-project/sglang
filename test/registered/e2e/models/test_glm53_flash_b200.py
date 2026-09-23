@@ -1,7 +1,7 @@
 """B200 per-commit coverage for the GLM-5.3-Flash serving recipes.
 
-Runs the Low Latency, DFlash2, and High Throughput TP4/EP4 recipes on four
-B200 GPUs. All recipes must retain GSM8K accuracy; the Low Latency recipe also
+Runs the Low Latency, DFlash2, and High Throughput TP4 recipes on four B200
+GPUs. All recipes must retain GSM8K accuracy; the Low Latency recipe also
 checks EAGLE speculative acceptance and single-request decode performance.
 """
 
@@ -29,8 +29,6 @@ GPU_IDLE_TIMEOUT = 120
 COMMON_SERVER_ARGS = [
     "--tp-size",
     "4",
-    "--ep-size",
-    "4",
     "--dsa-prefill-backend",
     "trtllm",
     "--dsa-decode-backend",
@@ -38,11 +36,11 @@ COMMON_SERVER_ARGS = [
     "--kv-cache-dtype",
     "fp8_e4m3",
     "--moe-runner-backend",
-    "deep_gemm",
+    "flashinfer_trtllm",
     "--reasoning-parser",
-    "glm45",
+    "auto",
     "--tool-call-parser",
-    "glm47",
+    "auto",
 ]
 
 
@@ -95,7 +93,6 @@ class TestGLM53FlashB200LowLatency(
         "1",
         "--speculative-num-draft-tokens",
         "6",
-        "--speculative-adaptive",
     ]
 
 
@@ -111,8 +108,6 @@ class TestGLM53FlashB200HighThroughput(
         "--enable-dp-attention",
         "--dp-size",
         "4",
-        "--moe-a2a-backend",
-        "deepep",
     ]
 
 

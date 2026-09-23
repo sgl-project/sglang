@@ -14,6 +14,7 @@ _DEEPEP_V2_MODELS: dict[str, bool] = {
     "DeepseekV3ForCausalLM": False,
     "DeepseekV4ForCausalLM": False,
     "Qwen3MoeForCausalLM": False,
+    "Glm5NextForConditionalGeneration": False,
 }
 
 

@@ -389,8 +389,18 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             indexer_head_dim = sparse_cfg["sparse_index_dim"]
             indexer_dtype_size = torch._utils._element_size(kvc.model_dtype)
 
+            full_pool_ratio = 1
+            if get_memory().enable_hisparse:
+                from sglang.srt.mem_cache.sparsity import parse_hisparse_config
+
+                full_pool_ratio = parse_hisparse_config().host_to_device_ratio
+
             main_pool_bytes = (
-                (num_dense + num_sparse) * 2 * kv_heads * head_dim * kv_size
+                (num_dense * full_pool_ratio + num_sparse)
+                * 2
+                * kv_heads
+                * head_dim
+                * kv_size
             )
             indexer_bytes = (
                 (num_indexer_kv * 2 + num_indexer_k_only)
@@ -399,7 +409,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             )
             # FP4 scale buffer adjustment doesn't apply to MiniMax sparse:
             # cell_size is already a sum over heterogeneous sub-pools.
-            return main_pool_bytes + indexer_bytes
+            return main_pool_bytes + indexer_bytes * full_pool_ratio
         else:
             n = model_config.get_num_kv_heads(tp_size, dcp_size)
             cell_size = (

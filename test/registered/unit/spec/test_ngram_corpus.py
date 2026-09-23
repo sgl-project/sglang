@@ -10,10 +10,11 @@ from sglang.srt.speculative.cpp_ngram.external_corpus import (
     iter_external_corpus_chunks,
 )
 from sglang.srt.speculative.cpp_ngram.ngram_corpus import NgramCorpus
-from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.ci.ci_register import register_cpu_ci, register_xpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=20, suite="base-a-test-cpu")
+register_xpu_ci(est_time=20, suite="stage-b-test-1-gpu-xpu")
 
 
 def _make_corpus(match_type="BFS", **kwargs):
@@ -347,6 +348,44 @@ class TestFrequencyBoosting(CustomTestCase):
             ids_list[1],
             20,
             f"Token 20 should be selected over 10 after frequency boost, got {ids_list}",
+        )
+
+
+class TestFrequencyTieSensitivity(CustomTestCase):
+    """A single additional insertion -- not the forced 10x majority in
+    TestFrequencyBoosting -- is enough to flip which candidate Prob-mode
+    returns for a query that two independent, freshly-stated requests both
+    send unchanged. Reproduces the mechanism behind an observed divergence:
+    two requests generating from the same repeated prompt got different
+    NGRAM drafts because one more generation's output landed in the shared
+    corpus between them, flipping a near-tied frequency count.
+    """
+
+    def test_single_insert_flips_tied_candidate(self):
+        corpus = _make_corpus(
+            "PROB",
+            draft_token_num=2,
+            max_bfs_breadth=1,
+            min_bfs_breadth=1,
+            max_trie_depth=5,
+        )
+        corpus.batch_put([[1, 2, 3, 10, 11]])
+        corpus.batch_put([[1, 2, 3, 20, 21]])
+        corpus.synchronize()
+
+        # Two unrelated requests, each with fresh state, send the identical
+        # query; only the shared corpus differs between them.
+        ids_before, _ = _batch_get_with_state(corpus, "req-before", [1, 2, 3], 3)
+        self.assertEqual(ids_before.tolist(), [3, 10], ids_before.tolist())
+
+        corpus.batch_put([[1, 2, 3, 20, 21]])
+        corpus.synchronize()
+
+        ids_after, _ = _batch_get_with_state(corpus, "req-after", [1, 2, 3], 3)
+        self.assertEqual(
+            ids_after.tolist(),
+            [3, 20],
+            f"one more insertion should flip the tie, got {ids_after.tolist()}",
         )
 
 

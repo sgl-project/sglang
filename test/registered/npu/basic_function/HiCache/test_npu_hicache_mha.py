@@ -38,6 +38,8 @@ class TestAscendMhaHicache(CustomTestCase):
             "--attention-backend",
             "ascend",
             "--enable-hierarchical-cache",
+            "--hicache-size",
+            30,
         ]
 
     def test_a_gsm8k(self):
