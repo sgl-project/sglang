@@ -685,7 +685,7 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         Wiring and transparency changes invalidate the memo. Test stubs without
         epoch state use an uncached walk.
         """
-        m = getattr(self, "_growth_neighbor_memo", None)
+        m = self._growth_neighbor_memo
         if m is not None:
             try:
                 if m[0] == self._chain_capacity_epoch():
