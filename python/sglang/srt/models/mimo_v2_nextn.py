@@ -42,6 +42,7 @@ from sglang.srt.models.mimo_v2 import (
     MiMoV2Attention,
     MiMoV2ForCausalLM,
     MiMoV2MLP,
+    get_attention_sliding_window_size,
     load_mimo_v2_qkv_proj_weight,
 )
 from sglang.srt.runtime_context import get_parallel
@@ -84,9 +85,7 @@ class MiMoV2MTPLayer(nn.Module):
             head_dim=config.swa_head_dim,
             v_head_dim=getattr(config, "swa_v_head_dim", None),
             v_scale=getattr(config, "attention_value_scale", None),
-            # RadixAttention's window excludes the query token; the HF reference (and Megatron) attend
-            # sliding_window_size keys including it, as Gemma's get_attention_sliding_window_size does.
-            sliding_window_size=config.sliding_window_size - 1,
+            sliding_window_size=get_attention_sliding_window_size(config),
             attention_bias=config.attention_bias,
             attention_sink_bias=getattr(config, "add_swa_attention_sink_bias", False),
             layer_id=layer_id,
