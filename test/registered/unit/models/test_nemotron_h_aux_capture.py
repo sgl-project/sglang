@@ -6,9 +6,9 @@ import torch
 from torch import nn
 
 from sglang.srt.layers import communicator as comm
+from sglang.srt.layers.moe.utils import should_skip_mlp_all_reduce
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.models import nemotron_h as model
-from sglang.srt.models.nemotron_h_utils import feeds_mlp_layer
 from sglang.srt.runtime_context import get_context, get_flags, get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -29,12 +29,16 @@ class _Norm(nn.Module):
 
 
 class _Mixer(nn.Module):
-    def __init__(self, scale):
+    """Row-parallel stand-in: a TP partial, reduced unless the layer skips it."""
+
+    def __init__(self, scale, tp=1):
         super().__init__()
         self.scale = scale
+        self.tp = tp
 
     def forward(self, hidden_states, **kwargs):
-        return hidden_states * self.scale
+        partial = hidden_states * (self.scale / self.tp)
+        return partial if should_skip_mlp_all_reduce() else partial * self.tp
 
 
 def _build(pattern, tp, capture):
@@ -53,10 +57,8 @@ def _build(pattern, tp, capture):
         nn.Module.__init__(layer)
         layer.norm = _Norm()
         if kind in "M*":
-            layer.reduces_output = not feeds_mlp_layer(pattern, i)
             layer._init_layer_communicator(config, i)
-            # A mixer feeding an MLP layer hands over its TP partial.
-            layer.mixer = _Mixer(0.5 if layer.reduces_output else 0.5 / tp)
+            layer.mixer = _Mixer(0.5, tp)
         else:
             layer._init_layer_communicator(config, i, is_sparse=False)
             layer.mixer = _Mixer(0.25)

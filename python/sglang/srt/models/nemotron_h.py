@@ -498,14 +498,13 @@ class NemotronHMoEDecoderLayer(NemotronHMLPLikeDecoderLayer):
 
 
 class NemotronHAttnLikeDecoderLayer(nn.Module):
-    """Attention half of a decoder layer, shared by the Mamba / full-attention
-    layers.
-
-    The mixer leaves its output unreduced when an MLP layer follows, whose
-    prepare_mlp reduces it; otherwise the mixer reduces it itself.
-    """
+    """Attention half of a decoder layer. Before an MLP layer the mixer leaves its
+    output unreduced for prepare_mlp; otherwise the mixer reduces it itself."""
 
     def _init_layer_communicator(self, config: NemotronHConfig, layer_idx: int):
+        self.feeds_mlp_layer = feeds_mlp_layer(
+            config.hybrid_override_pattern, layer_idx
+        )
         self.layer_communicator = make_layer_communicator(
             self.norm,
             for_attn=True,
@@ -526,14 +525,15 @@ class NemotronHAttnLikeDecoderLayer(nn.Module):
             return hidden_states, residual
 
         fuse_mlp_allreduce = (
-            self.reduces_output
+            not self.feeds_mlp_layer
             and self.layer_communicator.should_fuse_mlp_allreduce_with_next_layer(
                 forward_batch
             )
         )
-        with get_forward().scoped(fuse_mlp_allreduce=fuse_mlp_allreduce):
+        skip_reduce = self.feeds_mlp_layer or fuse_mlp_allreduce
+        with get_forward().scoped(fuse_mlp_allreduce=skip_reduce):
             hidden_states = self._forward_mixer(
-                hidden_states, forward_batch, fuse_mlp_allreduce
+                hidden_states, forward_batch, skip_reduce
             )
         if fuse_mlp_allreduce:
             hidden_states._sglang_needs_allreduce_fusion = True
@@ -551,9 +551,6 @@ class NemotronHMambaDecoderLayer(NemotronHAttnLikeDecoderLayer):
         super().__init__()
         self.config = config
         self.layer_id = layer_idx
-        self.reduces_output = not feeds_mlp_layer(
-            config.hybrid_override_pattern, layer_idx
-        )
         self.mixer = MambaMixer2(
             cache_params=config.mamba2_cache_params,
             hidden_size=config.hidden_size,
@@ -563,7 +560,7 @@ class NemotronHMambaDecoderLayer(NemotronHAttnLikeDecoderLayer):
             rms_norm_eps=config.layer_norm_epsilon,
             activation=config.mamba_hidden_act,
             quant_config=quant_config,
-            reduce_results=self.reduces_output,
+            reduce_results=True,
             prefix=f"{prefix}.mixer",
         )
 
@@ -592,18 +589,18 @@ class NemotronHMambaDecoderLayer(NemotronHAttnLikeDecoderLayer):
         self,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
-        fuse_mlp_allreduce: bool,
+        skip_reduce: bool,
     ) -> torch.Tensor:
         if is_in_breakable_cuda_graph():
             output = torch.empty_like(hidden_states)
             breakable_nemotron_mamba2_with_output(
-                hidden_states, output, self.layer_id, fuse_mlp_allreduce
+                hidden_states, output, self.layer_id, skip_reduce
             )
             return output
         if is_in_tc_piecewise_cuda_graph():
             output = torch.empty_like(hidden_states)
             nemotron_mamba2_with_output(
-                hidden_states, output, self.layer_id, fuse_mlp_allreduce
+                hidden_states, output, self.layer_id, skip_reduce
             )
             return output
         return self._forward_mamba(hidden_states, forward_batch)
@@ -615,7 +612,6 @@ class NemotronHAttention(nn.Module):
         config: NemotronHConfig,
         layer_idx: int,
         quant_config: QuantizationConfig | None = None,
-        reduce_results: bool = True,
         prefix: str = "",
     ) -> None:
         super().__init__()
@@ -661,8 +657,7 @@ class NemotronHAttention(nn.Module):
             quant_config=quant_config,
             tp_rank=tp_rank,
             tp_size=tp_size,
-            reduce_results=reduce_results,
-            use_dp_attention_reduce=reduce_results and is_dp_attention_enabled(),
+            use_dp_attention_reduce=is_dp_attention_enabled(),
             prefix=f"{prefix}.o_proj",
         )
 
@@ -700,14 +695,10 @@ class NemotronHAttentionDecoderLayer(NemotronHAttnLikeDecoderLayer):
         super().__init__()
         layer_config = config.get_nemotron_h_config_for_layer(layer_idx)
 
-        self.reduces_output = not feeds_mlp_layer(
-            config.hybrid_override_pattern, layer_idx
-        )
         self.mixer = NemotronHAttention(
             layer_config,
             layer_idx,
             quant_config,
-            reduce_results=self.reduces_output,
             prefix=f"{prefix}.mixer",
         )
 
@@ -718,7 +709,7 @@ class NemotronHAttentionDecoderLayer(NemotronHAttnLikeDecoderLayer):
         self,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
-        fuse_mlp_allreduce: bool,
+        skip_reduce: bool,
     ) -> torch.Tensor:
         return self.mixer.forward(
             hidden_states=hidden_states, forward_batch=forward_batch
