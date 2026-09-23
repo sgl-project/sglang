@@ -835,6 +835,7 @@ class BailingMoELinearDecoderLayer(nn.Module):
             input_layernorm=self.input_layernorm,
             post_attention_layernorm=self.post_attention_layernorm,
             allow_reduce_scatter=False,
+            is_last_layer=(is_nextn or layer_id == config.num_hidden_layers - 1),
             qkv_latent_func=qkv_latent_func,
         )
 
