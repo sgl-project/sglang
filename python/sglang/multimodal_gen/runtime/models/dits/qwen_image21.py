@@ -14,6 +14,7 @@ from sglang.kernels.ops.diffusion import (
     can_use_rmsnorm_preserve_reduction,
     fused_complex_rope,
     fused_layernorm_modulate,
+    fused_packed_silu_mul_bitexact,
     fused_silu_mul_bitexact,
     residual_gate_add,
     rmsnorm_preserve_reduction,
@@ -40,6 +41,7 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
 from sglang.multimodal_gen.runtime.layers.attention import LocalAttention, USPAttention
 from sglang.multimodal_gen.runtime.layers.linear import (
     ColumnParallelLinear,
+    MergedColumnParallelLinear,
     RowParallelLinear,
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
@@ -53,6 +55,10 @@ from sglang.srt.layers.layernorm import RMSNorm
 logger = init_logger(__name__)
 _ROPE_FUSION = BitExactFusionGate("Qwen-Image 2.1 complex RoPE")
 _SILU_MUL_FUSION = BitExactFusionGate("Qwen-Image 2.1 SiLU-mul")
+# The packed kernel addresses both halves through the row stride, so verify per layout.
+_SWIGLU_FUSION = BitExactFusionGate(
+    "Qwen-Image 2.1 packed SiLU-mul", per_signature=True
+)
 _QK_ROPE_FUSION = BitExactFusionGate("Qwen-Image 2.1 Q/K RMSNorm + complex RoPE")
 _KV_ROPE_FUSION = BitExactFusionGate("Qwen-Image 2.1 K RMSNorm + RoPE + KV packing")
 _QK_NORM_FUSION = BitExactFusionGate("Qwen-Image 2.1 Q/K RMSNorm")
@@ -169,6 +175,47 @@ def apply_modulation(x, norm, scale):
     return out
 
 
+def apply_swiglu(x):
+    """``silu(gate) * up`` over the packed ``[B, S, 2D]`` gate/up projection."""
+    half = x.shape[-1] // 2
+    if torch.compiler.is_compiling():
+        return nn.functional.silu(x[..., :half]) * x[..., half:]
+    # D and the row stride define how the packed halves are addressed.
+    sig = (x.dtype, x.device, x.shape[-1], x.stride(-2))
+    verified = _SWIGLU_FUSION.is_verified(sig)
+    can_fuse = (
+        not _SWIGLU_FUSION.disabled
+        and x.is_cuda
+        and x.dtype is torch.bfloat16
+        and x.dim() == 3
+        and x.stride(-1) == 1
+        and x.stride(-2) >= x.shape[-1]
+        and x.stride(0) == x.shape[1] * x.stride(1)
+        and x.shape[-1] % 2 == 0
+        and x.numel() > 0
+        # first-sight verification syncs the host, which would abort a capture
+        and (verified or not torch.cuda.is_current_stream_capturing())
+    )
+    if not can_fuse:
+        return nn.functional.silu(x[..., :half]) * x[..., half:]
+    try:
+        fused = fused_packed_silu_mul_bitexact(x)
+    except Exception as exc:
+        _SWIGLU_FUSION.on_exception(exc, logger=logger)
+        return nn.functional.silu(x[..., :half]) * x[..., half:]
+    if verified:
+        return fused
+    return _SWIGLU_FUSION.accept_or_fallback(
+        fused, nn.functional.silu(x[..., :half]) * x[..., half:], sig=sig, logger=logger
+    )
+
+
+def merges_ffn_projections(quant_config):
+    """Native weights pack gate/up into one GEMM; quantized checkpoints keep the
+    Diffusers layout so their scales and layout inference stay unchanged."""
+    return quant_config is None
+
+
 class QwenImage21ZeroCenterRMSNorm(nn.Module):
     def __init__(self, dim, eps):
         super().__init__()
@@ -219,20 +266,31 @@ class QwenImage21TimeEmbedding(nn.Module):
 class QwenImage21FeedForward(nn.Module):
     def __init__(self, dim, ratio, quant_config, prefix):
         super().__init__()
-        self.proj = ColumnParallelLinear(
-            dim,
-            dim * ratio,
-            bias=False,
-            quant_config=quant_config,
-            prefix=f"{prefix}.proj",
-        )
-        self.gate_layer = ColumnParallelLinear(
-            dim,
-            dim * ratio,
-            bias=False,
-            quant_config=quant_config,
-            prefix=f"{prefix}.gate_layer",
-        )
+        self.merged = merges_ffn_projections(quant_config)
+        if self.merged:
+            # one GEMM emits [gate | up]; the checkpoint's gate_layer/proj load as shards 0/1
+            self.gate_up = MergedColumnParallelLinear(
+                dim,
+                [dim * ratio, dim * ratio],
+                bias=False,
+                quant_config=quant_config,
+                prefix=f"{prefix}.gate_up",
+            )
+        else:
+            self.proj = ColumnParallelLinear(
+                dim,
+                dim * ratio,
+                bias=False,
+                quant_config=quant_config,
+                prefix=f"{prefix}.proj",
+            )
+            self.gate_layer = ColumnParallelLinear(
+                dim,
+                dim * ratio,
+                bias=False,
+                quant_config=quant_config,
+                prefix=f"{prefix}.gate_layer",
+            )
         self.out = RowParallelLinear(
             dim * ratio,
             dim,
@@ -242,6 +300,8 @@ class QwenImage21FeedForward(nn.Module):
         )
 
     def forward(self, x):
+        if self.merged:
+            return self.out(apply_swiglu(self.gate_up(x)[0]))[0]
         gate, value = self.gate_layer(x)[0], self.proj(x)[0]
         fused = None
         if can_use_fused_silu_mul(gate, value) and _SILU_MUL_FUSION.can_attempt_once():
@@ -454,6 +514,22 @@ class QwenImage21OutputNorm(nn.Module):
         )
 
 
+# Diffusers checkpoints and LoRA adapters name the FFN halves gate_layer/proj;
+# the native model packs them into gate_up as shards 0/1 of one GEMM.
+_MERGED_FFN_PARAM_NAMES_MAPPING = {
+    r"^(transformer_blocks\.\d+\.img_mlp)\.gate_layer\.(weight|lora_A|lora_B|alpha)$": (
+        r"\1.gate_up.\2",
+        0,
+        2,
+    ),
+    r"^(transformer_blocks\.\d+\.img_mlp)\.proj\.(weight|lora_A|lora_B|alpha)$": (
+        r"\1.gate_up.\2",
+        1,
+        2,
+    ),
+}
+
+
 class QwenImage21Transformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
     _supported_attention_backends = {
         AttentionBackendEnum.FA,
@@ -467,9 +543,17 @@ class QwenImage21Transformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin
     _compile_conditions = _fsdp_shard_conditions
     layer_names = ["transformer_blocks"]
     param_names_mapping = {}
+    packed_modules_mapping = {"gate_up": ["gate_layer", "proj"]}
 
     def __init__(self, config, hf_config, quant_config=None, **kwargs):
         super().__init__(config, hf_config=hf_config, **kwargs)
+        # Instance-local like Qwen-Image: the loaders and the LoRA adapter read
+        # it from the model, and quantized builds keep the split projections.
+        self.param_names_mapping = (
+            dict(_MERGED_FFN_PARAM_NAMES_MAPPING)
+            if merges_ffn_projections(quant_config)
+            else {}
+        )
         ac = self.config
         if ac.patch_size != 1 or not ac.causal_condition or not ac.causal_block:
             raise ValueError(
