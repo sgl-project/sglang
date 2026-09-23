@@ -35,9 +35,12 @@ from sglang.srt.environ import envs
 from sglang.srt.runtime_context import (
     get_disagg,
     get_parallel,
+    get_schedule,
     get_serving,
+    max_prefill_buffer_tokens,
 )
 from sglang.srt.server_args import ServerArgs
+from sglang.srt.utils.common import ceil_align
 from sglang.srt.utils.network import (
     NetworkAddress,
     get_local_ip_auto,
@@ -181,6 +184,7 @@ class CommonKVManager(BaseKVManager):
             envs.SGLANG_DISAGGREGATION_DEFERRED_DECODE_KV_RELEASE.get()
         )
         self._dcp_pack_buffers = None
+        self._dcp_pack_max_tokens: Optional[int] = None
         # for p/d multi node infer
         self.bootstrap_host = get_serving().host
         self.bootstrap_port = get_disagg().disaggregation_bootstrap_port
@@ -378,19 +382,26 @@ class CommonKVManager(BaseKVManager):
             f"{type(self).__name__} does not support staging memory registration"
         )
 
-    def _init_dcp_pack_buffers_once(self, dcp_size: int) -> None:
+    def _init_dcp_pack_buffers_once(
+        self, dcp_size: int, *, include_draft: bool = False
+    ) -> None:
         if self._dcp_pack_buffers is not None:
             return
         if not self.kv_args.kv_item_lens:
             return
         from sglang.srt.disaggregation.common.dcp_pack import init_dcp_pack_buffers
 
+        max_tokens = max_prefill_buffer_tokens() or get_schedule().max_prefill_tokens
+        max_tokens = ceil_align(max_tokens, self.kv_args.page_size)
         self._dcp_pack_buffers = init_dcp_pack_buffers(
             self._register_staging_memory,
             self.kv_args,
             len(self.transfer_queues),
             dcp_size,
+            max_tokens,
+            include_draft=include_draft,
         )
+        self._dcp_pack_max_tokens = max_tokens
 
     def check_status(self, bootstrap_room: int) -> KVPoll:
         return self.request_status[bootstrap_room]
@@ -1265,11 +1276,17 @@ class CommonKVManager(BaseKVManager):
             )
 
         # Regular MLA PP slicing
-        start_layer = self.kv_args.prefill_start_layer
-        end_layer = start_layer + len(src_kv_ptrs)
         # Decode pp size should be equal to prefill pp size or 1
+        start_layer, end_layer = self._mla_kv_entry_span_with_pp(len(src_kv_ptrs))
         sliced_dst_kv_ptrs = dst_kv_ptrs[start_layer:end_layer]
         return src_kv_ptrs, sliced_dst_kv_ptrs, len(src_kv_ptrs)
+
+    def _mla_kv_entry_span_with_pp(self, n_src: int) -> Tuple[int, int]:
+        # A plain MLA pool registers one region per layer ascending, addressed as
+        # layer_id - start_layer, so this stage occupies [start, start + n_src) of a
+        # peer that registered the whole model. Pointer view: get_mla_kv_ptrs_with_pp.
+        start_layer = self.kv_args.prefill_start_layer
+        return start_layer, start_layer + n_src
 
     def _mla_slice_ptrs_for_pp(
         self,
@@ -1535,6 +1552,19 @@ class CommonKVSender(BaseKVSender):
     def pop_decode_prefix_len(self) -> int:
         return self.kv_mgr.req_to_decode_prefix_len.pop(self.bootstrap_room, 0)
 
+    def get_max_transfer_tokens(self) -> Optional[int]:
+        if self.kv_mgr._dcp_pack_max_tokens is None:
+            return None
+        for peer, info in self.kv_mgr.transfer_infos.get(
+            self.bootstrap_room, {}
+        ).items():
+            if (
+                not info.is_dummy
+                and self.kv_mgr.decode_kv_args_table[peer].requires_dcp_relayout
+            ):
+                return self.kv_mgr._dcp_pack_max_tokens
+        return None
+
     def should_send_kv_chunk(self, num_pages: int, last_chunk: bool) -> bool:
         return num_pages > 0 or last_chunk
 
@@ -1627,9 +1657,12 @@ class CommonKVSender(BaseKVSender):
         if hasattr(self.kv_mgr, "transfer_infos"):
             self.kv_mgr.transfer_infos.pop(self.bootstrap_room, None)
         if hasattr(self.kv_mgr, "_deferred_ack_targets"):
-            # Drop a held ack target if the room concluded without draining
-            # (e.g. aborted before any chunk enqueued); else it leaks on prefill.
-            self.kv_mgr._deferred_ack_targets.pop(self.bootstrap_room, None)
+            if hasattr(self.kv_mgr, "_staging_outstanding"):
+                # Preserve the target until in-flight writes drain, even when
+                # the scheduler has already observed Failed and cleared the room.
+                self.kv_mgr._maybe_ack_drained_abort(self.bootstrap_room)
+            else:
+                self.kv_mgr._deferred_ack_targets.pop(self.bootstrap_room, None)
 
     def abort(self):
         self.kv_mgr.record_failure(

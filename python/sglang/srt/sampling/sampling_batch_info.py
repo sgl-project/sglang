@@ -158,10 +158,26 @@ class SamplingBatchInfo:
         logit_bias = None
         if any(r.sampling_params.logit_bias is not None for r in reqs):
             logit_bias = torch.zeros(len(reqs), vocab_size, device=device)
+            rows, cols, vals = [], [], []
             for i, r in enumerate(reqs):
                 if r.sampling_params.logit_bias is not None:
-                    for key, value in r.sampling_params.logit_bias.items():
-                        logit_bias[i, int(key)] = value
+                    # Dedup on int(key) first ("1" and "01" collide): duplicate
+                    # indices make the index_put below nondeterministic on CUDA.
+                    row_bias = {
+                        int(key): value
+                        for key, value in r.sampling_params.logit_bias.items()
+                    }
+                    for token_id, value in row_bias.items():
+                        rows.append(i)
+                        cols.append(token_id)
+                        vals.append(value)
+            if rows:
+                logit_bias[
+                    _rows_to_device_indices(rows, device, _pin),
+                    _rows_to_device_indices(cols, device, _pin),
+                ] = torch.tensor(vals, dtype=logit_bias.dtype, pin_memory=_pin).to(
+                    device, non_blocking=True
+                )
 
         # Check if any request has custom logit processor
         has_custom_logit_processor = (

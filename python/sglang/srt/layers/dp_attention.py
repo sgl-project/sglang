@@ -15,11 +15,6 @@ from sglang.srt.arg_groups.model_override_base import (
 )
 from sglang.srt.distributed import (
     GroupCoordinator,
-    get_attn_tensor_model_parallel_world_size,
-)
-from sglang.srt.distributed import get_moe_dp_group as _get_moe_dp_group
-from sglang.srt.distributed import (
-    get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_reduce,
 )
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
@@ -49,6 +44,44 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 
+def deployment_attn_dp_size() -> int:
+    """Return the deployment's attention-DP replica count.
+
+    Draft scopes retain this count because their metadata gathers include
+    the target's replicas.
+    """
+    parallel = get_parallel()
+    attn_dp_size, _ = derive_attention_widths(
+        tp_size=parallel.tp_size,
+        attn_cp_size=parallel.attn_cp_size,
+        dp_size=parallel.dp_size,
+        enable_dp_attention=parallel.enable_dp_attention,
+    )
+    return attn_dp_size
+
+
+def dp_gather_width() -> int:
+    """Return the DP gather width.
+
+    After elastic scale-up, the gather spans the expanded WORLD; otherwise
+    it spans the attention-DP replicas.
+    """
+    parallel = get_parallel()
+    return parallel.dp_size if world_dp_gather_enabled() else parallel.attn_dp_size
+
+
+def dp_gather_slot() -> int:
+    """Return this process's index in the DP gather.
+
+    After elastic scale-up, use the TP rank plus the join offset; otherwise
+    use the attention-DP rank.
+    """
+    parallel = get_parallel()
+    if world_dp_gather_enabled():
+        return parallel.tp_rank + parallel.ep_join_rank_offset
+    return parallel.attn_dp_rank
+
+
 def world_dp_gather_enabled() -> bool:
     """Whether DP gathers should use expanded WORLD after joiner admission."""
     dp = get_flags().dp
@@ -60,9 +93,11 @@ def enable_joiner_all_gather():
 
 
 def update_dp_attention_post_scale(new_dp_size: int, new_dp_rank: int):
-    get_parallel().override_permanently(
-        attn_dp_size=new_dp_size, attn_dp_rank=new_dp_rank
-    )
+    """Switch DP gathers to the expanded WORLD.
+
+    The caller updates the configured widths; these arguments identify the
+    scale-up in the log.
+    """
     get_flags().dp.use_world_group_for_gather = True
     logger.debug(
         "[Elastic EP] dp_attention switched to WORLD: dp_size=%d dp_rank=%d",
@@ -92,7 +127,7 @@ class DpPaddingMode(IntEnum):
     def get_dp_padding_mode(
         cls, is_extend_in_batch, global_num_tokens: List[int]
     ) -> DpPaddingMode:
-        dp_size = get_parallel().attn_dp_size
+        dp_size = dp_gather_width()
 
         # (trangdough) pplx-kernels a2a is a symmetric collective: every EP rank
         # must dispatch the same number of tokens or the device-side handshake
@@ -359,44 +394,35 @@ def compute_dp_attention_world_info(
     return attn_tp_rank, attn_tp_size, attn_dp_rank, attn_dp_size
 
 
-def initialize_dp_attention(
-    server_args: ServerArgs,
-    model_config: ModelConfig,
-):
+def initialize_dp_attention_flags(server_args: ServerArgs):
+    """Initialize DP runtime flags without changing the worker's placement."""
     dp = get_flags().dp
-    dp.max_len_with_idle = (
-        getattr(model_config.hf_config, "hybrid_override_pattern", None) is not None
-    )
-    enable_dp_attention = get_parallel().enable_dp_attention
-    dp_size = get_parallel().dp_size
-    attn_cp_size = get_parallel().attn_cp_size
-
-    dp.enabled = enable_dp_attention
-
-    tp_rank = get_parallel().tp_rank
-    tp_size = get_tensor_model_parallel_world_size()
-
-    _, _, attn_dp_rank, attn_dp_size = compute_dp_attention_world_info(
-        enable_dp_attention, tp_rank, tp_size, dp_size, attn_cp_size
-    )
+    dp.enabled = get_parallel().enable_dp_attention
 
     if get_exec().moe.elastic_ep_backend is not None and get_parallel().max_ep_size:
-        attn_dp_rank = tp_rank + get_parallel().ep_join_rank_offset
-        # Reads the resolution, not a bag: this runs under
-        # `initialize_dp_attention`, which the weight-cache daemon calls from
-        # `_init_distributed` -- and other callers reach it from processes
-        # whose publish is not guaranteed to have happened yet. (The daemon
-        # itself publishes first, at `daemon.py:284`, before `:320`.)
         if ep_scale_joiner_of(resolving_view(server_args)):
             dp.joiner_skip_all_gather = True
 
-    # Stamped together, after the elastic adjustment: the width and the rank
-    # describe one topology, and a reader that caught them mid-update would
-    # see this process placed in a group it is not in.
-    get_parallel().override_permanently(
-        attn_dp_size=attn_dp_size, attn_dp_rank=attn_dp_rank
-    )
 
+def initialize_dp_attention(server_args: ServerArgs):
+    """Initialize DP flags and state placement from the published topology."""
+    initialize_dp_attention_flags(server_args)
+    parallel = get_parallel()
+    _, _, attn_dp_rank, attn_dp_size = compute_dp_attention_world_info(
+        parallel.enable_dp_attention,
+        parallel.tp_rank,
+        parallel.tp_size,
+        parallel.dp_size,
+        parallel.attn_cp_size,
+    )
+    parallel.override_permanently(attn_dp_size=attn_dp_size, attn_dp_rank=attn_dp_rank)
+
+
+def init_dp_gathered_buffer(model_config: ModelConfig):
+    """Size the gathered buffer from the model this worker is about to run."""
+    get_flags().dp.max_len_with_idle = (
+        getattr(model_config.hf_config, "hybrid_override_pattern", None) is not None
+    )
     _DpGatheredBufferWrapper.set_metadata(
         hidden_size=model_config.hidden_size,
         dtype=model_config.dtype,
@@ -414,7 +440,7 @@ def is_allocation_symmetric() -> bool:
 
 def get_dp_local_info(forward_batch: ForwardBatch) -> Tuple[torch.Tensor, torch.Tensor]:
     # `get_dp_local_info` is only called in global DP gather and scatter. We use global DP rank here.
-    dp_rank = get_parallel().attn_dp_rank
+    dp_rank = dp_gather_slot()
 
     if forward_batch.dp_local_start_pos is None:
         cumtokens = torch.cumsum(forward_batch.global_num_tokens_gpu, dim=0)
@@ -438,7 +464,7 @@ def get_dp_local_slice_cpu(
     # CPU (start, length) slice for DP-local data in a rank-padded buffer.
     # Returns Python ints (no D2H sync) and handles the cuda-graph-padded layout.
     global_num_tokens = forward_batch.global_num_tokens_cpu
-    dp_rank = get_parallel().attn_dp_rank
+    dp_rank = dp_gather_slot()
     local_num_tokens = global_num_tokens[dp_rank]
     if can_run_graph:
         local_start_pos = dp_rank * cuda_graph_batch
@@ -514,7 +540,7 @@ def _dp_gather_via_all_reduce(
         NUM_GPUS_PER_NODE = 8
         if (
             not local_tokens.dtype.is_floating_point
-            and get_tensor_model_parallel_world_size() <= NUM_GPUS_PER_NODE
+            and get_parallel().tp_size <= NUM_GPUS_PER_NODE
         ):
             from sglang.srt.distributed.parallel_state import inplace_all_reduce
 
@@ -534,7 +560,7 @@ def _dp_gather_via_all_gather(
 ):
     use_world = world_dp_gather_enabled()
 
-    if get_attn_tensor_model_parallel_world_size() == 1:
+    if get_parallel().attn_tp_size == 1:
         if use_world:
             torch.distributed.all_gather_into_tensor(
                 global_tokens,
@@ -548,9 +574,9 @@ def _dp_gather_via_all_gather(
     if not is_partial:
         if get_parallel().attn_tp_rank != 0:
             local_tokens.fill_(0)
-    scattered_local_tokens = local_tokens.tensor_split(
-        get_attn_tensor_model_parallel_world_size()
-    )[get_parallel().attn_tp_rank]
+    scattered_local_tokens = local_tokens.tensor_split(get_parallel().attn_tp_size)[
+        get_parallel().attn_tp_rank
+    ]
     get_parallel().attn_tp_group.reduce_scatter_tensor(
         scattered_local_tokens, local_tokens
     )
@@ -721,8 +747,8 @@ def is_dp_gatherv_active() -> bool:
     return (
         _USE_DP_GATHERV
         and not world_dp_gather_enabled()
-        and get_attn_tensor_model_parallel_world_size() == 1
-        and get_tensor_model_parallel_world_size() == get_parallel().attn_dp_size
+        and get_parallel().attn_tp_size == 1
+        and get_parallel().tp_size == get_parallel().attn_dp_size
         and not _DpGatheredBufferWrapper.is_dp_max_padding()
     )
 
@@ -871,6 +897,15 @@ def dp_scatter(
         memcpy(local_tokens, global_tokens, 0, local_start_pos, local_num_tokens, True)
 
 
+def can_use_dp_reduce_scatter() -> bool:
+    """Whether the fixed TP group tiles the current attention DP x TP layout."""
+    if not world_dp_gather_enabled():
+        return True
+
+    parallel = get_parallel()
+    return parallel.tp_size == parallel.dp_size * parallel.attn_tp_size
+
+
 def dp_reduce_scatter_tensor(output: torch.Tensor, input: torch.Tensor):
     _note_dp_gather_in_prefill_graph()
     if is_dp_gatherv_active():
@@ -881,12 +916,12 @@ def dp_reduce_scatter_tensor(output: torch.Tensor, input: torch.Tensor):
         if sizes is not None:
             get_parallel().tp_group.reduce_scatterv(input, output=output, sizes=sizes)
             return
-    if get_tensor_model_parallel_world_size() == get_parallel().attn_dp_size:
+    if get_parallel().tp_size == get_parallel().attn_dp_size:
         get_parallel().tp_group.reduce_scatter_tensor(output, input)
     else:
-        scattered_local_tokens = input.tensor_split(
-            get_tensor_model_parallel_world_size()
-        )[get_parallel().tp_rank]
+        scattered_local_tokens = input.tensor_split(get_parallel().tp_size)[
+            get_parallel().tp_rank
+        ]
         get_parallel().tp_group.reduce_scatter_tensor(scattered_local_tokens, input)
         get_parallel().attn_tp_group.all_gather_into_tensor(
             output, scattered_local_tokens
@@ -1017,15 +1052,15 @@ def attn_cp_all_gather_into_tensor(output: torch.Tensor, input: torch.Tensor):
 
 def get_moe_cp_group() -> GroupCoordinator:
     """Returns the MOE_DP group, which includes CP partners when attn_cp_size > moe_dp_size."""
-    return _get_moe_dp_group()
+    return get_parallel().moe_dp_group
 
 
 def get_moe_cp_rank() -> int:
-    return _get_moe_dp_group().rank_in_group
+    return get_parallel().moe_dp_group.rank_in_group
 
 
 def get_moe_cp_size() -> int:
-    return _get_moe_dp_group().world_size
+    return get_parallel().moe_dp_group.world_size
 
 
 def is_enable_moe_cp_allgather() -> bool:
@@ -1038,7 +1073,7 @@ def is_enable_moe_cp_allgather() -> bool:
 
 
 def moe_cp_all_gather_into_tensor(output: torch.Tensor, input: torch.Tensor):
-    return _get_moe_dp_group().all_gather_into_tensor(output, input)
+    return get_parallel().moe_dp_group.all_gather_into_tensor(output, input)
 
 
 def attn_tp_all_gather(output_list: List[torch.Tensor], input: torch.Tensor):

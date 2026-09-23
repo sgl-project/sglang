@@ -297,7 +297,8 @@ class TestPPMambaPoolSizing(unittest.TestCase):
             server_args=SimpleNamespace(),
             spec_algorithm=SimpleNamespace(is_none=lambda: True),
             layer_info=SimpleNamespace(start_layer=start, end_layer=end),
-            ps=SimpleNamespace(attn_dp_size=1, pp_size=pp_size),
+            attn_dp_size=1,
+            pp_size=pp_size,
             hybrid_gdn_config=None,
             model_config=SimpleNamespace(
                 hf_config=SimpleNamespace(), num_hidden_layers=cls.TOTAL_LAYERS
