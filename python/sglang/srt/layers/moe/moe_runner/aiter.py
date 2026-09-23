@@ -310,12 +310,16 @@ class AiterRunnerCore(MoeRunnerCore):
             # lives elsewhere / is absent.
             from aiter.ops.flydsl.moe_common import GateMode
 
-            # Honor the weight layout on gfx95; elsewhere retain env-only selection.
-            extra["gate_mode"] = (
-                GateMode.INTERLEAVE.value
-                if (not is_gfx95 or self.config.gate_up_interleaved)
-                and envs.SGLANG_USE_AITER_MOE_GU_ITLV.get()
-                else GateMode.SEPARATED.value
+            # a gate_mode from fused_moe_kwargs wins; else gfx95 honors the weight layout,
+            # and SGLANG_USE_AITER_MOE_GU_ITLV=0 selects SEPARATED (gpt-oss MXFP4 layout)
+            extra.setdefault(
+                "gate_mode",
+                (
+                    GateMode.INTERLEAVE.value
+                    if (not is_gfx95 or self.config.gate_up_interleaved)
+                    and envs.SGLANG_USE_AITER_MOE_GU_ITLV.get()
+                    else GateMode.SEPARATED.value
+                ),
             )
             extra["swiglu_limit"] = quant_info.swiglu_limit
         if self.config.no_combine:
