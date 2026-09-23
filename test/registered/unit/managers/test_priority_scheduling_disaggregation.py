@@ -979,6 +979,30 @@ class TestDecodePrebuilt(unittest.TestCase):
         self.assertIs(second.running_batch, updated)
         self.assertIsNone(scheduler.dsv41_suspended_decode_batch)
 
+    def test_finished_cache_only_replay_does_not_block_next_admission(self):
+        scheduler = self._new_scheduler(enable_overlap=False)
+        scheduler.enable_hisparse = False
+        scheduler.dp_attn_adapter = MagicMock()
+        scheduler.dp_attn_adapter.maybe_prepare_mlp_sync_batch.side_effect = (
+            lambda batch: batch
+        )
+
+        finished_replay = MagicMock(name="finished_replay")
+        finished_replay.is_empty.return_value = True
+        finished_replay.dsv41_cache_only_replay = True
+        next_replay = MagicMock(name="next_replay")
+        next_replay.is_empty.return_value = False
+        next_replay.dsv41_cache_only_replay = True
+        scheduler.get_new_prebuilt_batch = MagicMock(return_value=next_replay)
+
+        plan = SchedulerDisaggregationDecodeMixin.get_next_disagg_decode_batch_to_run(
+            scheduler, finished_replay
+        )
+
+        scheduler.get_new_prebuilt_batch.assert_called_once_with(finished_replay)
+        self.assertIs(plan.batch_to_run, next_replay)
+        self.assertIs(plan.running_batch, next_replay)
+
     def test_cache_only_replay_uses_explicit_full_prompt_coverage(self):
         for prompt_len in (127, 128, 129, 255, 256, 257):
             with self.subTest(prompt_len=prompt_len):
