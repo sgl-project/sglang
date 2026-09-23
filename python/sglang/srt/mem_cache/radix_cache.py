@@ -48,7 +48,6 @@ from sglang.srt.mem_cache.base_prefix_cache import (
 from sglang.srt.mem_cache.events import KVCacheEventRecorder
 from sglang.srt.mem_cache.utils import (
     get_eviction_strategy,
-    get_hash_str,
     split_node_hash_value,
 )
 
@@ -245,12 +244,6 @@ class RadixKey:
         if self.cache_salt is not None:
             return ((self.extra_key, self.cache_salt), plain)
         return plain if self.extra_key is None else (self.extra_key, plain)
-
-    def hash_page(self, start: int, end: int, prior_hash: Optional[str] = None) -> str:
-        """SHA256 for logical units [start, end); bigram mode feeds overlapping (t_i, t_{i+1}) byte pairs."""
-        hash_value = get_hash_str(self[start:end], prior_hash)
-        assert isinstance(hash_value, str)
-        return hash_value
 
 
 class TreeNode:
