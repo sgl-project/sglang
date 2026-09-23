@@ -39,6 +39,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
     ForwardMode,
+    PPProxyTensors,
 )
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.model_executor.pool_configurator import MemoryPoolConfig
@@ -747,7 +748,11 @@ class FrozenKVMTPWorkerV2(EAGLEWorkerV2):
         )
 
     def forward_batch_generation(
-        self, batch: ScheduleBatch, on_publish=None, grammar_barrier=None
+        self,
+        batch: ScheduleBatch,
+        on_publish=None,
+        grammar_barrier=None,
+        pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ):
         # Mirrors EAGLEWorkerV2.forward_batch_generation; the only frozen-specific
         # change is the idle draft-input (FrozenKVMTPDraftInput + recurrent hidden
@@ -755,7 +760,9 @@ class FrozenKVMTPWorkerV2(EAGLEWorkerV2):
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
             # Target prefill (frozen is never standalone -> capture FULL hidden).
             batch_output = self.target_worker.forward_batch_generation(
-                batch, capture_hidden_mode=CaptureHiddenMode.FULL
+                batch,
+                pp_proxy_tensors=pp_proxy_tensors,
+                capture_hidden_mode=CaptureHiddenMode.FULL,
             )
 
             # Spec_v2 convention: batch.seq_lens = length BEFORE this iter's tokens.

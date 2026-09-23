@@ -13,6 +13,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
     ForwardMode,
+    PPProxyTensors,
 )
 from sglang.srt.model_executor.forward_context import (
     ForwardContext,
@@ -411,8 +412,11 @@ class UnoWorkerV2(BaseSpecWorker):
         self,
         batch: ScheduleBatch,
         on_publish,
+        pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> GenerationBatchResult:
-        result = self.target_worker.forward_batch_generation(batch)
+        result = self.target_worker.forward_batch_generation(
+            batch, pp_proxy_tensors=pp_proxy_tensors
+        )
         if not isinstance(result.next_token_ids, torch.Tensor):
             raise RuntimeError("UNO target prefill returned no sampled seed tensor.")
 
@@ -772,12 +776,13 @@ class UnoWorkerV2(BaseSpecWorker):
         batch: ScheduleBatch,
         on_publish=None,
         grammar_barrier=None,
+        pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> GenerationBatchResult:
         del grammar_barrier
         self._validate_batch(batch)
 
         if batch.forward_mode == ForwardMode.EXTEND:
-            return self._forward_prefill(batch, on_publish)
+            return self._forward_prefill(batch, on_publish, pp_proxy_tensors)
 
         if batch.forward_mode == ForwardMode.DECODE:
             return self._forward_decode(batch, on_publish)

@@ -18,7 +18,10 @@ if TYPE_CHECKING:
         UpdateWeightFromDiskReqInput,
         UpdateWeightsFromIPCReqInput,
     )
+    from sglang.srt.managers.schedule_batch import ScheduleBatch
     from sglang.srt.managers.tp_worker import TpModelWorker
+    from sglang.srt.managers.utils import GenerationBatchResult
+    from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
     from sglang.srt.model_executor.model_runner import (
         ModelRunner,
         SamplingPrewarmResult,
@@ -306,6 +309,26 @@ class BaseSpecWorker(ABC):
             )
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
+
+    @abstractmethod
+    def forward_batch_generation(
+        self,
+        batch: ScheduleBatch,
+        on_publish=None,
+        grammar_barrier=None,
+        pp_proxy_tensors: Optional[PPProxyTensors] = None,
+    ) -> GenerationBatchResult:
+        """Run one speculative iteration for ``batch``.
+
+        The scheduler's non-overlap path calls this with
+        ``pp_proxy_tensors=...`` unconditionally
+        (``managers/scheduler.py``), so every worker has to accept the
+        keyword even when it has nothing to do with pipeline parallelism --
+        forward it to ``self.target_worker.forward_batch_generation`` on the
+        target-prefill call and ignore it otherwise. Declaring it here keeps
+        the workers from drifting apart again (see #40155).
+        """
+        raise NotImplementedError
 
     def init_attention_backends(self):
         if self.draft_worker is not None:
