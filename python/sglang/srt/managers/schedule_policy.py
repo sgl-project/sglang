@@ -647,7 +647,12 @@ class PrefillAdder:
         self.rem_chunk_tokens = rem_chunk_tokens
         self.chunked_req_limit: Optional[int] = None
         self.dllm_config = dllm_config
-        self.exact_chunk_fill = _use_exact_chunk_fill() and dllm_config is None
+        # Mamba checkpoints only land on page-aligned chunk ends.
+        self.exact_chunk_fill = (
+            _use_exact_chunk_fill()
+            and dllm_config is None
+            and not tree_cache.supports_mamba()
+        )
 
         if self.dllm_config is not None:
             self._init_dllm_meta(dllm_config)
