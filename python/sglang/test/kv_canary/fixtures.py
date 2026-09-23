@@ -320,7 +320,6 @@ def add_unified_child(
 def make_unified_radix_chain(
     chain: List[List[int]], device: torch.device = DEFAULT_DEVICE
 ) -> UnifiedRadixCache:
-    """A FULL-only unified cache holding one root-to-leaf chain of nodes."""
     cache = make_unified_radix_cache()
     parent = None
     for slots in chain:
