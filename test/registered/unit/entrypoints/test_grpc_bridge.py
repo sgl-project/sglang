@@ -145,6 +145,22 @@ class TestEngineStateNotifications(CustomTestCase):
 
         self.assertIs(self.manager._engine_state_changed_callback, callback)
 
+    def test_health_ignores_pause_and_rejects_unhealthy_lifecycle_states(self):
+        handle = RuntimeHandle.__new__(RuntimeHandle)
+        handle.tokenizer_manager = self.manager
+        for status, exiting, expected in [
+            (ServerStatus.Starting, False, False),
+            (ServerStatus.Up, False, True),
+            (ServerStatus.UnHealthy, False, False),
+            (ServerStatus.Up, True, False),
+        ]:
+            for paused in (False, True):
+                with self.subTest(status=status, exiting=exiting, paused=paused):
+                    self.manager.server_status = status
+                    self.manager.gracefully_exit = exiting
+                    self.manager.is_pause = paused
+                    self.assertEqual(handle.health_check(), expected)
+
     def test_graceful_exit_notifies_and_changes_computed_health(self):
         handle = RuntimeHandle.__new__(RuntimeHandle)
         handle.tokenizer_manager = self.manager
