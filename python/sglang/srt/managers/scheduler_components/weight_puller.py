@@ -9,6 +9,7 @@ from sglang.srt.managers.io_struct import PullWeightsReqInput, PullWeightsReqOut
 from sglang.srt.managers.scheduler_components.ipc_channels import (
     SchedulerIpcChannels,
 )
+from sglang.srt.model_loader.weight_utils import download_weights_from_hf
 from sglang.srt.runtime_context import get_exec, get_model, get_parallel
 from sglang.srt.weight_sync import local_checkpoint
 
@@ -49,7 +50,13 @@ class SchedulerWeightPuller:
         try:
             local_checkpoint.pull(
                 local_checkpoint_dir=recv_req.local_checkpoint_dir,
-                base_dir=model.model_path,
+                # the served weights are already on disk, so an HF repo id resolves to its cache
+                base_dir=download_weights_from_hf(
+                    model.model_path,
+                    cache_dir=model.download_dir,
+                    allow_patterns=["*.safetensors"],
+                    revision=model.revision,
+                ),
                 source_dir=recv_req.source_dir,
                 target_version=recv_req.target_version,
                 pre_read_hook=model.custom_pull_weights_pre_read_hook,

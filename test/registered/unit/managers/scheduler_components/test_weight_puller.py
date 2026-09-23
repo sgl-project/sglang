@@ -70,6 +70,9 @@ class TestSchedulerWeightPuller(CustomTestCase):
                 ),
             ),
             patch.object(
+                weight_puller, "download_weights_from_hf", side_effect=lambda p, **_: p
+            ),
+            patch.object(
                 local_checkpoint, "pull", side_effect=lambda **_: release.wait()
             ),
         ):
