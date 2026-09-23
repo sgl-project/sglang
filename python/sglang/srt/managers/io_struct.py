@@ -2036,6 +2036,7 @@ class CheckWeightsReqInput(BaseReq, kw_only=True):
     # Which model runners to update: "target" (target model only), "draft" (draft
     # worker(s) only), or "all" (default).
     selector: Literal["target", "draft", "all"] = "all"
+    names: Optional[List[str]] = None
 
 
 # Wire versions of the pydantic ParallelismInfo/ChecksumInfo in

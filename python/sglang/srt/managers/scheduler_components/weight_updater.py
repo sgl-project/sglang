@@ -587,6 +587,7 @@ class SchedulerWeightUpdaterManager:
                     action=recv_req.action,
                     allow_quant_error=recv_req.allow_quant_error,
                     skip_tensor_list=recv_req.skip_tensor_list,
+                    names=recv_req.names,
                 )
                 if p is not None:
                     role_payloads.append((role, p))
