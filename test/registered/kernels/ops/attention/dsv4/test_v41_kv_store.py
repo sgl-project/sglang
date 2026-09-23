@@ -30,7 +30,7 @@ from sglang.test.test_utils import CustomTestCase
 # the V4.1 store kernels are the SM100 / gfx950 JIT kernels; the only Blackwell runner
 # config is the four-GPU one
 register_cuda_ci(est_time=60, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
-register_amd_ci(est_time=25, suite="stage-b-kernel-test-1-gpu-amd-mi35x")
+register_amd_ci(est_time=60, suite="stage-b-kernel-test-1-gpu-amd-mi35x")
 
 REFERENCE = {
     KVLayout.V41: tq.quantize_k_cache_v41,
