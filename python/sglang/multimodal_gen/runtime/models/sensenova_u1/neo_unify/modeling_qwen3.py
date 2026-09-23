@@ -1,6 +1,7 @@
 # Modified for SGLang; see this directory's README.md for upstream source.
 
 import copy
+import os
 from typing import Callable, Optional, Union
 
 import torch
@@ -63,6 +64,10 @@ except ImportError:  # pragma: no cover - exercised only in CPU-only / no-flash 
 #                    debugging, even when flash-attn is available).
 _VALID_ATTN_BACKENDS = ("auto", "flash", "sdpa")
 _ATTN_BACKEND: str = "auto"
+
+_SENSENOVA_NPU_FUSED_ROPE_ENV = "SGLANG_SENSENOVA_NPU_FUSED_ROPE"
+_SENSENOVA_NPU_FUSED_ROPE_ROTARY_MUL = {"1", "true", "on", "rotary_mul", "mul"}
+_SENSENOVA_NPU_ROTARY_MUL_DISABLED = False
 
 
 def _linear_output(module: nn.Module, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -487,6 +492,62 @@ def rotate_half(x):
     return torch.cat((-x2, x1), dim=-1)
 
 
+def _sensenova_npu_fused_rope_enabled() -> bool:
+    mode = os.getenv(_SENSENOVA_NPU_FUSED_ROPE_ENV, "0").strip().lower()
+    return mode in _SENSENOVA_NPU_FUSED_ROPE_ROTARY_MUL
+
+
+def _can_use_sensenova_npu_fused_rope(q, k, cos, sin, unsqueeze_dim) -> bool:
+    return (
+        q.device.type == "npu"
+        and q.dtype in (torch.float16, torch.bfloat16)
+        and q.dtype == k.dtype == cos.dtype == sin.dtype
+        and q.device == k.device == cos.device == sin.device
+        and not torch.is_grad_enabled()
+        and not torch.compiler.is_compiling()
+        and unsqueeze_dim == 1
+        and q.ndim == k.ndim == 4
+        and q.numel() > 0
+        and k.numel() > 0
+        and q.shape[0] == k.shape[0]
+        and q.shape[2:] == k.shape[2:]
+        and q.shape[0] < 1000
+        and q.shape[1] < 1000
+        and k.shape[1] < 1000
+        and q.shape[-1] < 896
+        and q.shape[-1] % 2 == 0
+        and cos.shape == sin.shape == (q.shape[0], q.shape[2], q.shape[3])
+    )
+
+
+def _sensenova_npu_rotary_mul(q, k, cos, sin):
+    global _SENSENOVA_NPU_ROTARY_MUL_DISABLED
+
+    if _SENSENOVA_NPU_ROTARY_MUL_DISABLED:
+        return None
+
+    try:
+        import torch_npu
+    except ImportError:
+        _SENSENOVA_NPU_ROTARY_MUL_DISABLED = True
+        return None
+
+    if not hasattr(torch_npu, "npu_rotary_mul"):
+        _SENSENOVA_NPU_ROTARY_MUL_DISABLED = True
+        return None
+
+    cos = cos.unsqueeze(1).contiguous()
+    sin = sin.unsqueeze(1).contiguous()
+    try:
+        return (
+            torch_npu.npu_rotary_mul(q, cos, sin, rotary_mode="half"),
+            torch_npu.npu_rotary_mul(k, cos, sin, rotary_mode="half"),
+        )
+    except (RuntimeError, TypeError):
+        _SENSENOVA_NPU_ROTARY_MUL_DISABLED = True
+        return None
+
+
 def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
     """Applies Rotary Position Embedding to the query and key tensors.
 
@@ -507,6 +568,13 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
     Returns:
         `tuple(torch.Tensor)` comprising of the query and key tensors rotated using the Rotary Position Embedding.
     """
+    if _sensenova_npu_fused_rope_enabled() and _can_use_sensenova_npu_fused_rope(
+        q, k, cos, sin, unsqueeze_dim
+    ):
+        npu_output = _sensenova_npu_rotary_mul(q, k, cos, sin)
+        if npu_output is not None:
+            return npu_output
+
     if (
         q.is_cuda
         and q.dtype is torch.bfloat16
@@ -548,6 +616,22 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
     q_embed = (q * cos) + (rotate_half(q) * sin)
     k_embed = (k * cos) + (rotate_half(k) * sin)
     return q_embed, k_embed
+
+
+def _resolve_shared_rope_attention(layer):
+    self_attn = getattr(layer, "self_attn", None)
+    if self_attn is not None and hasattr(self_attn, "_resolve_rope_tables"):
+        return self_attn
+
+    if isinstance(layer, nn.Module):
+        for module in layer.modules():
+            if module is layer:
+                continue
+            self_attn = getattr(module, "self_attn", None)
+            if self_attn is not None and hasattr(self_attn, "_resolve_rope_tables"):
+                return self_attn
+
+    return None
 
 
 def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
@@ -1821,9 +1905,11 @@ class Qwen3Model(Qwen3PreTrainedModel):
         # normalization changes the activation dtype.
         position_embeddings = None
         if layers:
-            position_embeddings = layers[0].self_attn._resolve_rope_tables(
-                indexes, hidden_states
-            )
+            rope_attention = _resolve_shared_rope_attention(layers[0])
+            if rope_attention is not None:
+                position_embeddings = rope_attention._resolve_rope_tables(
+                    indexes, hidden_states
+                )
 
         for decoder_layer in layers[: self.config.num_hidden_layers]:
             attention_type = cache_dit_attention_type(self, decoder_layer)

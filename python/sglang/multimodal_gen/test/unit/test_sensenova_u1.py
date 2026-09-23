@@ -69,6 +69,7 @@ from sglang.multimodal_gen.runtime.models.sensenova_u1.neo_unify.modeling_neo_ch
 )
 from sglang.multimodal_gen.runtime.models.sensenova_u1.neo_unify.modeling_qwen3 import (
     Qwen3Attention,
+    Qwen3DecoderLayer,
     Qwen3ForCausalLM,
     Qwen3MLP,
     Qwen3RotaryEmbedding,
@@ -3108,6 +3109,23 @@ def test_sensenova_u1_model_builds_once_and_shares_with_every_layer(image_gen):
         )
 
     assert len(builds) == 3, f"expected one t/h/w build, got {len(builds)}"
+
+
+def test_sensenova_u1_rope_sharing_finds_attention_inside_cache_dit_wrapper():
+    from sglang.multimodal_gen.runtime.models.sensenova_u1.neo_unify.modeling_qwen3 import (
+        _resolve_shared_rope_attention,
+    )
+
+    class CacheDitLikeWrapper(torch.nn.Module):
+        def __init__(self, inner):
+            super().__init__()
+            self.inner = inner
+
+    layer = Qwen3DecoderLayer(_tiny_dense_config(), layer_idx=0)
+    wrapper = CacheDitLikeWrapper(layer)
+
+    assert _resolve_shared_rope_attention(wrapper) is layer.self_attn
+    assert _resolve_shared_rope_attention(torch.nn.Identity()) is None
 
 
 def _run_shared_and_per_layer(monkeypatch, model, embeds, indicators, indexes):
