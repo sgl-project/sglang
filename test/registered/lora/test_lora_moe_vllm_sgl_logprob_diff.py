@@ -27,7 +27,7 @@ from sglang.test.runners import SRTRunner
 register_cuda_ci(
     est_time=50,
     stage="base-b",
-    runner_config="1-gpu-large",
+    runner_config="1-gpu-h200",
 )
 
 # Format: [{"text": "result string", "lps": [0.1, 0.2, ...]}, ...]

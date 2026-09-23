@@ -28,7 +28,7 @@ from sglang.test.test_utils import (
 register_cuda_ci(
     est_time=480,
     stage="base-b",
-    runner_config="1-gpu-large",
+    runner_config="1-gpu-h200",
 )
 
 MODEL = "Qwen/Qwen3-8B"
