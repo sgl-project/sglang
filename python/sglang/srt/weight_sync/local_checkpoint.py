@@ -22,6 +22,7 @@ extra calls no-ops.
 from __future__ import annotations
 
 import fcntl
+import functools
 import glob
 import json
 import logging
@@ -29,12 +30,12 @@ import mmap
 import os
 import shutil
 import struct
-import threading
 import zlib
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import contextmanager
-from typing import Optional
+from contextlib import ExitStack, contextmanager
+from typing import List, Optional
 
+import msgspec
 import numpy as np
 import zstandard
 
@@ -238,6 +239,86 @@ def _tensor_locations(ckpt_dir: str) -> dict:
     return locations
 
 
+class _TensorPatch(msgspec.Struct, frozen=True):
+    name: str
+    payload: memoryview  # zstd-compressed delta
+    target: mmap.mmap  # the local safetensors file holding the tensor
+    offset: int
+    nbytes: int
+    checksum: str  # of the patched tensor
+
+    def region(self) -> np.ndarray:
+        return np.ndarray(
+            (self.nbytes,), dtype=np.uint8, buffer=self.target, offset=self.offset
+        )
+
+
+def _patch_xor(patch: _TensorPatch, algorithm: str) -> bool:
+    region = patch.region()
+    hasher = _new_hasher(algorithm)
+    reader = zstandard.ZstdDecompressor().stream_reader(patch.payload)
+    pos = 0
+    # 2 MB chunks stay L2-resident across decompress -> XOR -> checksum
+    while pos < patch.nbytes:
+        block = reader.read(min(2 << 20, patch.nbytes - pos))
+        if not block:
+            break
+        chunk = np.frombuffer(block, dtype=np.uint8)
+        region[pos : pos + chunk.size] ^= chunk
+        hasher.update(region[pos : pos + chunk.size])
+        pos += chunk.size
+    return hasher.hexdigest() == patch.checksum
+
+
+def _patch_overwrite(patch: _TensorPatch, algorithm: str) -> bool:
+    delta = np.frombuffer(
+        zstandard.ZstdDecompressor().decompress(patch.payload), dtype=np.uint8
+    )
+    region = patch.region()
+    count = int.from_bytes(delta[:4], "little")
+    positions = np.frombuffer(delta[4 : 4 + 4 * count], dtype="<u4")
+    region[positions] = delta[4 + 4 * count :]
+    return _checksum(algorithm, region) == patch.checksum
+
+
+_PATCHERS = {"xor": _patch_xor, "overwrite": _patch_overwrite}
+
+
+def _read_patches(
+    *, version_dir: str, locations: dict, stack: ExitStack
+) -> List[_TensorPatch]:
+    mmaps = {}
+    patches = []
+    for delta_file in sorted(glob.glob(os.path.join(version_dir, "*.safetensors"))):
+        with open(delta_file, "rb") as f:
+            blob = memoryview(f.read())
+        (header_len,) = struct.unpack("<Q", blob[:8])
+        header = json.loads(bytes(blob[8 : 8 + header_len]))
+        checksums = header.pop("__metadata__")
+        data_start = 8 + header_len
+        for name, info in header.items():
+            begin, end = info["data_offsets"]
+            path, offset, nbytes = locations[name]
+            if path not in mmaps:
+                fh = stack.enter_context(open(path, "r+b"))
+                mmaps[path] = stack.enter_context(mmap.mmap(fh.fileno(), 0))
+            patches.append(
+                _TensorPatch(
+                    name=name,
+                    payload=blob[data_start + begin : data_start + end],
+                    target=mmaps[path],
+                    offset=offset,
+                    nbytes=nbytes,
+                    checksum=checksums[name],
+                )
+            )
+    # prefetch into page cache (evicted during the rollout) so the apply
+    # doesn't fault from cold storage
+    for mm in mmaps.values():
+        mm.madvise(mmap.MADV_WILLNEED)
+    return patches
+
+
 def _apply_delta(local_checkpoint_dir: str, version_dir: str) -> None:
     """Apply one version's delta in place: decompress + apply + checksum each tensor across a thread
     pool (each writes a distinct mmap region, so the writes don't conflict). Any mismatch raises.
@@ -255,105 +336,29 @@ def _apply_delta(local_checkpoint_dir: str, version_dir: str) -> None:
         raise NotImplementedError(
             f"compression {meta['compression_format']!r} not supported"
         )
-    encoding = meta["delta_encoding"]
-    algorithm = meta["checksum_format"]
-    locations = _tensor_locations(local_checkpoint_dir)
+    if meta["delta_encoding"] not in _PATCHERS:
+        raise NotImplementedError(
+            f"delta encoding {meta['delta_encoding']!r} not supported"
+        )
+    patch_tensor = functools.partial(
+        _PATCHERS[meta["delta_encoding"]], algorithm=meta["checksum_format"]
+    )
     # an unusable checksum format must fail before the local checkpoint is touched
-    _new_hasher(algorithm)
+    _new_hasher(meta["checksum_format"])
+    locations = _tensor_locations(local_checkpoint_dir)
     # xor is not idempotent: a retry over half-patched bytes must reseed, not xor again
     _clear_applied_version(local_checkpoint_dir)
-    open_mmaps = {}
-    mismatches = []
-    lock = threading.Lock()
-    file_bytes = []  # keep alive: items hold zero-copy views into these
-    items = []  # (name, compressed_view, path, offset, nbytes, want_checksum)
-    try:
-        for delta_file in sorted(glob.glob(os.path.join(version_dir, "*.safetensors"))):
-            with open(delta_file, "rb") as f:
-                blob = f.read()
-            file_bytes.append(blob)
-            (header_len,) = struct.unpack("<Q", blob[:8])
-            header = json.loads(blob[8 : 8 + header_len])
-            want_checksums = header["__metadata__"]
-            view = memoryview(blob)
-            for name, info in header.items():
-                if name == "__metadata__":
-                    continue
-                begin, end = info["data_offsets"]
-                path, offset, nbytes = locations[name]
-                if path not in open_mmaps:
-                    fh = open(path, "r+b")
-                    open_mmaps[path] = (fh, mmap.mmap(fh.fileno(), 0))
-                data_start = 8 + header_len
-                items.append(
-                    (
-                        name,
-                        view[data_start + begin : data_start + end],
-                        path,
-                        offset,
-                        nbytes,
-                        want_checksums[name],
-                    )
-                )
-
-        # prefetch into page cache (evicted during the rollout) so the apply
-        # doesn't fault from cold storage
-        for _, mm in open_mmaps.values():
-            mm.madvise(mmap.MADV_WILLNEED)
-
-        def apply_xor(item) -> None:
-            name, compressed, path, offset, nbytes, want = item
-            region = np.ndarray(
-                (nbytes,), dtype=np.uint8, buffer=open_mmaps[path][1], offset=offset
-            )
-            hasher = _new_hasher(algorithm)
-            reader = zstandard.ZstdDecompressor().stream_reader(compressed)
-            pos = 0
-            # 2 MB chunks stay L2-resident across decompress -> XOR -> checksum
-            while pos < nbytes:
-                block = reader.read(min(2 << 20, nbytes - pos))
-                if not block:
-                    break
-                chunk = np.frombuffer(block, dtype=np.uint8)
-                region[pos : pos + chunk.size] ^= chunk
-                hasher.update(region[pos : pos + chunk.size])
-                pos += chunk.size
-            if hasher.hexdigest() != want:
-                with lock:
-                    mismatches.append(name)
-
-        def apply_overwrite(item) -> None:
-            name, compressed, path, offset, nbytes, want = item
-            delta = np.frombuffer(
-                zstandard.ZstdDecompressor().decompress(compressed), dtype=np.uint8
-            )
-            region = np.ndarray(
-                (nbytes,), dtype=np.uint8, buffer=open_mmaps[path][1], offset=offset
-            )
-            count = int.from_bytes(delta[:4], "little")
-            positions = np.frombuffer(delta[4 : 4 + 4 * count], dtype="<u4")
-            region[positions] = delta[4 + 4 * count :]
-            if _checksum(algorithm, region) != want:
-                with lock:
-                    mismatches.append(name)
-
-        if encoding == "xor":
-            apply_tensor = apply_xor
-        elif encoding == "overwrite":
-            apply_tensor = apply_overwrite
-        else:
-            raise NotImplementedError(f"delta encoding {encoding!r} not supported")
+    with ExitStack() as stack:
+        patches = _read_patches(
+            version_dir=version_dir, locations=locations, stack=stack
+        )
         with ThreadPoolExecutor(max_workers=NUM_WORKERS) as pool:
-            list(pool.map(apply_tensor, items))
+            matched = list(pool.map(patch_tensor, patches))
         # no msync: the engine reads these pages via the shared cache; durability
         # isn't needed (a host that loses the cache rebuilds from base)
-    finally:
-        for fh, mm in open_mmaps.values():
-            mm.close()
-            fh.close()
+    mismatches = sorted(p.name for p, ok in zip(patches, matched) if not ok)
     if mismatches:
         raise RuntimeError(
             f"checksum mismatch for {len(mismatches)} tensors after applying {version_dir}: "
-            f"{sorted(mismatches)[:20]}"
+            f"{mismatches[:20]}"
         )
-    _write_applied_version(local_checkpoint_dir, int(meta["version"]))
