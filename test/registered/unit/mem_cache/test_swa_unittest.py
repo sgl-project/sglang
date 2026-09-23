@@ -27,22 +27,12 @@ register_cuda_ci(est_time=9, stage="base-b", runner_config="1-gpu-large")
 register_amd_ci(est_time=10, suite="stage-b-test-1-gpu-small-amd")
 
 
-class _DummyReq:
-    def __init__(self):
-        self._kv_committed_len = 0
-        self.swa_prefix_lock_released = False
-        self.kv = SimpleNamespace(swa_evicted_seqlen=0, cache_protected_len=0)
-
-
-def _build_swa_tree(
-    is_eagle: bool,
+def _build_swa_allocator(
     page_size: int = 1,
     req_size: int = 8,
     max_context_len: int = 64,
     kv_size: int = 64,
     kv_size_swa: int = 32,
-    sliding_window_size: int = 4,
-    enable_kv_cache_events: bool = False,
     swa_req_ring_size: int | None = None,
 ):
     head_num = 8
@@ -149,12 +139,10 @@ class TestSWA(unittest.TestCase):
 
     def test_swa_memory_pool_paged_free_clears_full_page_mapping(self):
         page_size = 4
-        allocator, _ = _build_swa_tree(
-            is_eagle=False,
+        allocator, _ = _build_swa_allocator(
             page_size=page_size,
             kv_size=16,
             kv_size_swa=16,
-            sliding_window_size=page_size,
         )
 
         full_indices = _swa_alloc(allocator, page_size)
@@ -176,7 +164,7 @@ class TestSWA(unittest.TestCase):
         """Clearing the full-to-SWA mapping must not block the stream; writing a
         host-resident scalar into it does.
         """
-        allocator, _ = _build_swa_tree(is_eagle=False)
+        allocator, _ = _build_swa_allocator()
         full_indices = _swa_alloc(allocator, 4)
         mapping = allocator.full_to_swa_index_mapping
 
@@ -202,8 +190,7 @@ class TestSWA(unittest.TestCase):
                 self._free_swa_group_owns_deferred_indices(page_size)
 
     def _free_swa_group_owns_deferred_indices(self, page_size):
-        allocator, _ = _build_swa_tree(
-            is_eagle=False,
+        allocator, _ = _build_swa_allocator(
             page_size=page_size,
             kv_size=32 * page_size,
             kv_size_swa=32 * page_size,
@@ -239,8 +226,7 @@ class TestSWA(unittest.TestCase):
         )
 
     def test_free_swa_group_owns_mapping_at_enqueue_time(self):
-        allocator, _ = _build_swa_tree(
-            is_eagle=False,
+        allocator, _ = _build_swa_allocator(
             kv_size=8,
             kv_size_swa=8,
         )
@@ -271,8 +257,7 @@ class TestSWA(unittest.TestCase):
         )
 
     def _build_two_mapped_slots(self, page_size=1):
-        allocator, _ = _build_swa_tree(
-            is_eagle=False,
+        allocator, _ = _build_swa_allocator(
             page_size=page_size,
             kv_size=8 * page_size,
             kv_size_swa=8 * page_size,
@@ -372,7 +357,7 @@ class TestFreeFullPartition(CustomTestCase):
     """`free_full` releases only the full side of a hybrid SWA allocator."""
 
     def setUp(self):
-        self.allocator, _ = _build_swa_tree(is_eagle=False)
+        self.allocator, _ = _build_swa_allocator()
         self.full_baseline = self.allocator.full_available_size()
         self.swa_baseline = self.allocator.swa_available_size()
 
@@ -420,7 +405,7 @@ class TestFreeKvRow(CustomTestCase):
     whole, the SWA side only from the floor up."""
 
     def setUp(self):
-        self.allocator, _ = _build_swa_tree(is_eagle=False)
+        self.allocator, _ = _build_swa_allocator()
         self.full_baseline = self.allocator.full_available_size()
         self.swa_baseline = self.allocator.swa_available_size()
 
@@ -457,7 +442,7 @@ class TestFreeKvRow(CustomTestCase):
                 self.assertEqual(self._sizes(), (self.full_baseline, self.swa_baseline))
 
     def test_below_floor_pieces_go_back_through_the_full_side(self):
-        allocator, _ = _build_swa_tree(is_eagle=False, page_size=4)
+        allocator, _ = _build_swa_allocator(page_size=4)
         indices = _swa_alloc(allocator, 8)
         allocator.free_swa(indices)
         after_alloc = allocator.full_available_size()
@@ -477,7 +462,7 @@ class TestFreeKvRow(CustomTestCase):
         self.assertEqual(allocator.full_available_size(), after_alloc + 8)
 
     def test_grouped_full_side_frees_defer_and_skip_the_unique_path(self):
-        allocator, _ = _build_swa_tree(is_eagle=False, page_size=4)
+        allocator, _ = _build_swa_allocator(page_size=4)
         indices = _swa_alloc(allocator, 12)
         allocator.free_swa(indices[:8])
         after_alloc = allocator.full_available_size()
@@ -540,7 +525,7 @@ class TestSWAPeerMappedContract(CustomTestCase):
         return bool(assert_async.call_args.args[0])
 
     def test_segment_free_flags_a_page_whose_peer_is_already_gone(self):
-        allocator, _ = _build_swa_tree(is_eagle=False, page_size=4)
+        allocator, _ = _build_swa_allocator(page_size=4)
         live = _swa_alloc(allocator, 8)
         stale = _swa_alloc(allocator, 8)
         allocator.clear_full_to_swa_mapping(stale)
@@ -553,7 +538,7 @@ class TestSWAPeerMappedContract(CustomTestCase):
         """page_size > 1: page reps by stride replace the page expansion's
         filter and the inner allocator's torch.unique, in and out of a group."""
         ps = 4
-        allocator, _ = _build_swa_tree(is_eagle=False, page_size=ps)
+        allocator, _ = _build_swa_allocator(page_size=ps)
 
         def grouped(indices):
             allocator.free_group_begin()
@@ -581,7 +566,7 @@ class TestSWAPeerMappedContract(CustomTestCase):
             self.assertIsNone(_sync_error(lambda: grouped(second[: 2 * ps - 1])))
 
     def test_free_swa_flags_a_slot_whose_peer_is_already_gone(self):
-        allocator, _ = _build_swa_tree(is_eagle=False)
+        allocator, _ = _build_swa_allocator()
         live = _swa_alloc(allocator, 4)
         stale = _swa_alloc(allocator, 4)
         # Whoever released the peer left the mapping reading as the padding slot.
@@ -594,7 +579,7 @@ class TestSWAPeerMappedContract(CustomTestCase):
     def test_free_swa_does_not_synchronize(self):
         """The filter's output shape was data-dependent, so it read a count back
         to the host; the gather that replaced it has a fixed shape."""
-        allocator, _ = _build_swa_tree(is_eagle=False)
+        allocator, _ = _build_swa_allocator()
         mapping = allocator.full_to_swa_index_mapping
 
         # Warm up outside the window: a first-time cudaMalloc can synchronize on
@@ -618,8 +603,7 @@ class TestSWAReqRingFree(CustomTestCase):
 
     def _allocated_ring(self):
         ps = self.PS
-        allocator, req_pool = _build_swa_tree(
-            is_eagle=False,
+        allocator, req_pool = _build_swa_allocator(
             page_size=ps,
             req_size=2,
             max_context_len=4 * ps,
@@ -738,7 +722,7 @@ class TestSWAPageRepsFree(CustomTestCase):
     PS = 4
 
     def _allocator(self):
-        allocator, _ = _build_swa_tree(is_eagle=False, page_size=self.PS)
+        allocator, _ = _build_swa_allocator(page_size=self.PS)
         return allocator
 
     def _sizes(self, allocator):
@@ -748,8 +732,7 @@ class TestSWAPageRepsFree(CustomTestCase):
     def test_free_swa_segment_npu_uses_reference_path(self):
         for page_size in (1, 4):
             with self.subTest(page_size=page_size):
-                allocator, _ = _build_swa_tree(
-                    is_eagle=False,
+                allocator, _ = _build_swa_allocator(
                     page_size=page_size,
                     kv_size=8 * page_size,
                     kv_size_swa=8 * page_size,
@@ -800,8 +783,7 @@ class TestSWAPageRepsFree(CustomTestCase):
             with self.subTest(name=name):
                 num_allocated_tokens = max(2 * page_size, num_tokens)
                 kv_size = max(8 * page_size, num_allocated_tokens)
-                allocator, _ = _build_swa_tree(
-                    is_eagle=False,
+                allocator, _ = _build_swa_allocator(
                     page_size=page_size,
                     kv_size=kv_size,
                     kv_size_swa=kv_size,

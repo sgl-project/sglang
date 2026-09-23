@@ -355,7 +355,7 @@ class UnifiedRadixCache(BasePrefixCache):
                 data,
                 group_src=self.pp_rank - 1,
                 group=self.pp_group,
-                tag=P2PTag.HIRADIX_PP_SYNC,
+                tag=P2PTag.HICACHE_PP_SYNC,
             )
         if self.pp_rank + 1 < self.pp_size:
             copy_of_data = data.clone()
@@ -363,7 +363,7 @@ class UnifiedRadixCache(BasePrefixCache):
                 copy_of_data,
                 group_dst=self.pp_rank + 1,
                 group=self.pp_group,
-                tag=P2PTag.HIRADIX_PP_SYNC,
+                tag=P2PTag.HICACHE_PP_SYNC,
             )
             self.work_list.append(send_work)
 
@@ -1537,6 +1537,20 @@ class UnifiedRadixCache(BasePrefixCache):
         self.host_pool_group.release_transfers(backup.pool_transfers)
 
     # ---- HiCache: Backup / LoadBack ----
+
+    def backup_node_for_write_back(self, node_id: NodeId) -> bool:
+        """Synchronously back up one node (Full KV plus any unbacked component
+        state) and drain the ack -- the deferred-demote shape the eviction
+        loop runs for leaves, reusable by component evictors ahead of an
+        internal-state tombstone. Returns True once the backup is committed.
+        """
+        written = self._execute_and_commit_kv_backup(
+            BackupKV(node_ids=[node_id]), write_back=True
+        )
+        if written == 0:
+            return False
+        self.writing_check(write_back=True)
+        return True
 
     def _execute_and_commit_kv_backup(
         self, action: BackupKV, write_back: bool = False
@@ -3463,8 +3477,8 @@ class UnifiedRadixCache(BasePrefixCache):
     def is_load_back_event_done(self, consumer_index: int) -> bool:
         """Return True after the local load-back event is complete.
 
-        Mirrors ``HiRadixCache`` so the disagg decode restore state machine
-        (``DecodeHiCacheTransferMixin``) can gate on load-back completion; the
+        Lets the disagg decode restore state machine
+        (``DecodeHiCacheTransferMixin``) gate on load-back completion; the
         controller-level ``layer_done_counter`` event is shared across cache
         implementations, while the tree-side bookkeeping runs in
         ``loading_check``.
