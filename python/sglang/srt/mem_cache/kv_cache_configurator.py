@@ -294,15 +294,9 @@ class KVCacheConfigurator:
         self.mambaish_config = mambaish_config(self.model_config)
         self.hybrid_gdn_config = hybrid_gdn_config(self.model_config)
         self.hybrid_kda_config = hybrid_kda_config(self.model_config)
-        self.is_hybrid_swa_mtp_draft = (
-            self.is_draft_worker
-            and self.draft_model_idx is not None
-            and self.is_hybrid_swa
-            and getattr(self.model_config.hf_text_config, "mtp_local_layer_ids", None)
-            is not None
-        )
-        self.draft_swa_full_capacity = self.is_hybrid_swa_mtp_draft and (
-            self.draft_model_idx in self.model_config.swa_attention_layer_ids
+        self.is_hybrid_swa_mtp_draft = self.layer_info.is_hybrid_swa_mtp_draft
+        self.draft_swa_full_capacity = self.is_hybrid_swa_mtp_draft and bool(
+            self.layer_info.swa_attention_layer_ids
         )
 
     def hybrid_swa_token_capacity(
@@ -784,19 +778,12 @@ class KVCacheConfigurator:
             swa_head_dim = head_dim
             swa_v_head_dim = head_dim
 
-        # From the sglang ModelConfig WRAPPER, never the HF config's
-        # full_attention_layer_ids: that property feeds the conv/attention
-        # pairing, not the KV-lifetime split, and returns ALL layers.
-        swa_attention_layer_ids = [
-            i
-            for i in self.model_config.swa_attention_layer_ids
-            if self.layer_info.start_layer <= i < self.layer_info.end_layer
-        ]
-        full_attention_layer_ids = [
-            i
-            for i in self.model_config.full_attention_layer_ids
-            if self.layer_info.start_layer <= i < self.layer_info.end_layer
-        ]
+        # From layer_info (the sglang ModelConfig split restricted to this
+        # stage), never the HF config's full_attention_layer_ids: that property
+        # feeds the conv/attention pairing, not the KV-lifetime split, and
+        # returns ALL layers.
+        swa_attention_layer_ids = self.layer_info.swa_attention_layer_ids
+        full_attention_layer_ids = self.layer_info.full_attention_layer_ids
         n_local_layers = self.layer_info.end_layer - self.layer_info.start_layer
         assert (
             len(full_attention_layer_ids) + len(swa_attention_layer_ids)
@@ -903,17 +890,8 @@ class KVCacheConfigurator:
             swa_head_dim = head_dim
             swa_v_head_dim = head_dim
 
-        # Filter layer ids to this worker's [start_layer, end_layer) range.
-        swa_attention_layer_ids = [
-            i
-            for i in self.model_config.swa_attention_layer_ids
-            if self.layer_info.start_layer <= i < self.layer_info.end_layer
-        ]
-        full_attention_layer_ids = [
-            i
-            for i in self.model_config.full_attention_layer_ids
-            if self.layer_info.start_layer <= i < self.layer_info.end_layer
-        ]
+        swa_attention_layer_ids = self.layer_info.swa_attention_layer_ids
+        full_attention_layer_ids = self.layer_info.full_attention_layer_ids
 
         total_bytes = unified_memory_pool_bytes
         # An uncapped, draft-free pool owns the profiled budget, including bytes
@@ -1521,8 +1499,8 @@ class KVCacheConfigurator:
                 get_parallel().attn_tp_size, get_parallel().attn_dcp_size
             ),
             head_dim=self.model_config.head_dim,
-            swa_attention_layer_ids=self.model_config.swa_attention_layer_ids,
-            full_attention_layer_ids=self.model_config.full_attention_layer_ids,
+            swa_attention_layer_ids=self.layer_info.swa_attention_layer_ids,
+            full_attention_layer_ids=self.layer_info.full_attention_layer_ids,
             device=self.device,
             token_to_kv_pool_class=NPUMHATokenToKVPool,
             **kwargs,
@@ -1732,8 +1710,8 @@ class KVCacheConfigurator:
             dtype=self.kv_cache_dtype,
             head_num=0,
             head_dim=0,
-            swa_attention_layer_ids=self.model_config.swa_attention_layer_ids,
-            full_attention_layer_ids=self.model_config.full_attention_layer_ids,
+            swa_attention_layer_ids=self.layer_info.swa_attention_layer_ids,
+            full_attention_layer_ids=self.layer_info.full_attention_layer_ids,
             device=self.device,
             full_kv_pool_class=full_pool_class,
             swa_kv_pool_class=MLATokenToKVPool,
@@ -1799,16 +1777,10 @@ class KVCacheConfigurator:
             if self.kv_cache_dtype_str == "mxfp8"
             else mha_pool_class
         )
-        swa_attention_layer_ids = self.model_config.swa_attention_layer_ids
-        full_attention_layer_ids = self.model_config.full_attention_layer_ids
-        if self.is_hybrid_swa_mtp_draft:
-            if self.draft_swa_full_capacity:
-                # Route local MTP depths through the SWA ring pool.
-                swa_attention_layer_ids = [self.draft_model_idx]
-                full_attention_layer_ids = []
-            else:
-                swa_attention_layer_ids = []
-                full_attention_layer_ids = [self.draft_model_idx]
+        # For a multi-layer MTP draft these hold just its own depth, routing a
+        # local depth through the SWA ring pool and a global one through full.
+        swa_attention_layer_ids = self.layer_info.swa_attention_layer_ids
+        full_attention_layer_ids = self.layer_info.full_attention_layer_ids
         # The draft SWA ring must cover the target allocator's full token capacity.
         size_swa = (
             full_max_total_num_tokens
