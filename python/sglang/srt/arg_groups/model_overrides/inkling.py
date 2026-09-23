@@ -11,7 +11,6 @@ from sglang.srt.arg_groups.model_override_base import (
     is_attention_backend_not_set,
     resolving_view,
 )
-from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_platform
 
 logger = logging.getLogger(__name__)
@@ -76,5 +75,4 @@ def _inkling_overrides(server_args: Any, hf_config: Any) -> dict:
             f"Use {inkling_attn_backend} as the attention backend for Inkling "
             "(requires fa4 or triton)."
         )
-    envs.SGLANG_ENABLE_UNIFIED_RADIX_TREE.set(True)
     return overrides

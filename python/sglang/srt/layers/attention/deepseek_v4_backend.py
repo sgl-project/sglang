@@ -3475,17 +3475,44 @@ class DeepseekV4AttnBackend(
                 self.candidate_indexer.publish_decode(inputs, page_indices, raw_indices)
             )
             return
-        logits = deep_gemm_fp4_paged_mqa_logits(
-            (q_fp4, q_sf),
-            k_cache,
-            weights,
-            metadata.compressed_seq_lens,
-            metadata.page_table,
-            metadata.deep_gemm_metadata,
-            metadata.max_compressed_seq_len,
-        )
-        # TODO(dark): add bf16 topk
-        topk_transform_paged_from_metadata(logits, metadata, page_indices, raw_indices)
+        if isinstance(metadata.deep_gemm_metadata, list):
+            topk_plans = metadata.topk_metadata_chunks
+            assert not metadata.use_topk_v2 or topk_plans is not None
+            for chunk_idx, (rows, plan) in enumerate(metadata.row_chunks()):
+                logits = deep_gemm_fp4_paged_mqa_logits(
+                    (q_fp4[rows], q_sf[rows]),
+                    k_cache,
+                    weights[rows],
+                    metadata.compressed_seq_lens[rows],
+                    metadata.page_table[rows],
+                    plan,
+                    metadata.max_compressed_seq_len,
+                )
+                # TODO(dark): add bf16 topk
+                topk_transform_paged_from_metadata(
+                    logits,
+                    metadata,
+                    page_indices,
+                    raw_indices,
+                    rows=rows,
+                    topk_metadata=(
+                        topk_plans[chunk_idx] if topk_plans is not None else None
+                    ),
+                )
+        else:
+            logits = deep_gemm_fp4_paged_mqa_logits(
+                (q_fp4, q_sf),
+                k_cache,
+                weights,
+                metadata.compressed_seq_lens,
+                metadata.page_table,
+                metadata.deep_gemm_metadata,
+                metadata.max_compressed_seq_len,
+            )
+            # TODO(dark): add bf16 topk
+            topk_transform_paged_from_metadata(
+                logits, metadata, page_indices, raw_indices
+            )
 
     # TODO(candidate): Hopper decode still publishes / consumes masks inline (torch
     # top-k); move into the candidate indexer with the prefill paths.

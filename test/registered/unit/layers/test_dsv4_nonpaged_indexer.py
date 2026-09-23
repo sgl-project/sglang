@@ -752,6 +752,33 @@ class TestPagedIndexerMetadataChunking(CustomTestCase):
     row chunks the indexer loops over; a mismatch would silently score rows
     with another chunk's schedule."""
 
+    def test_capture_warmup_skips_dynamic_budget_but_eager_forward_uses_it(self):
+        metadata = SimpleNamespace(
+            use_prefill_cuda_graph=False,
+            compressed_seq_lens=SimpleNamespace(
+                is_cuda=True, device=SimpleNamespace(index=0)
+            ),
+            max_compressed_seq_len=65536,
+        )
+        for capture_mode in (True, False):
+            with (
+                self.subTest(capture_mode=capture_mode),
+                patch(f"{_METADATA}.get_is_capture_mode", return_value=capture_mode),
+                patch("torch.cuda.is_current_stream_capturing", return_value=False),
+                patch(f"{_METADATA}.is_in_breakable_cuda_graph", return_value=False),
+                patch(f"{_METADATA}.is_in_tc_piecewise_cuda_graph", return_value=False),
+                patch(
+                    f"{_METADATA}.mqa_logits_budget_bytes", return_value=4096
+                ) as budget,
+            ):
+                result = PagedIndexerMetadata._mqa_logits_budget(metadata, num_rows=256)
+                if capture_mode:
+                    self.assertIsNone(result)
+                    budget.assert_not_called()
+                else:
+                    self.assertEqual(result, 4096)
+                    budget.assert_called_once_with(device_index=0, allow_sync=True)
+
     def _build(self, *, num_rows: int, budget, use_topk_v2: bool):
         deep_gemm = SimpleNamespace(
             get_num_sms=MagicMock(return_value=1),
@@ -806,6 +833,12 @@ class TestPagedIndexerMetadataChunking(CustomTestCase):
 
         self.assertIsInstance(metadata.deep_gemm_metadata, list)
         self.assertEqual(len(metadata.deep_gemm_metadata), len(chunks))
+        metadata_chunks = metadata.row_chunks()
+        self.assertEqual([rows for rows, _ in metadata_chunks], chunks)
+        for (_, actual_plan), expected_plan in zip(
+            metadata_chunks, metadata.deep_gemm_metadata
+        ):
+            self.assertIs(actual_plan, expected_plan)
         schedule_rows = [
             call.args[0]
             for call in deep_gemm.get_paged_mqa_logits_metadata.call_args_list
@@ -873,6 +906,92 @@ class TestChunkedTopKMatchesUnchunked(CustomTestCase):
         for rows_per_chunk in (1, 7, 16, rows - 1):
             with self.subTest(rows_per_chunk=rows_per_chunk):
                 self.assertTrue(torch.equal(run(rows_per_chunk), expected))
+
+
+class TestChunkedCandidatePublisher(CustomTestCase):
+    def test_each_deep_gemm_call_receives_one_tensor_schedule(self):
+        from sglang.srt.layers.attention.dsv4 import candidate_indexer_deep_gemm as mod
+
+        num_rows, width = 5, 16
+        chunks = [slice(0, 2), slice(2, 4), slice(4, 5)]
+        plans = [torch.tensor([i], dtype=torch.uint8) for i in range(len(chunks))]
+        topk_plans = [torch.tensor([i], dtype=torch.int32) for i in range(len(chunks))]
+        metadata = SimpleNamespace(
+            compressed_seq_lens=torch.full((num_rows, 1), width, dtype=torch.int32),
+            page_table=torch.zeros((num_rows, 1), dtype=torch.int32),
+            deep_gemm_metadata=plans,
+            max_compressed_seq_len=width,
+            compressed_page_size=64,
+            topk_metadata_chunks=topk_plans,
+            use_topk_v2=True,
+            row_chunks=lambda: list(zip(chunks, plans)),
+        )
+        inputs = SimpleNamespace(
+            q_fp4=torch.zeros((num_rows, 1, 2, 64), dtype=torch.int8),
+            q_sf=torch.zeros((num_rows, 1, 2), dtype=torch.int32),
+            k_cache=torch.zeros((1, 64, 1, 68), dtype=torch.uint8),
+            weights=torch.zeros((num_rows, 2), dtype=torch.float32),
+            metadata=metadata,
+            request_ids=torch.arange(num_rows),
+            num_rows=num_rows,
+        )
+        page_indices = torch.full((num_rows, 4), -1, dtype=torch.int32)
+        raw_indices = torch.full_like(page_indices, -1)
+        indexer = object.__new__(mod.DeepGemmCandidateIndexer)
+        indexer.topk_blocks = 2
+
+        deep_gemm = MagicMock(
+            side_effect=lambda q, *_args: torch.zeros(
+                (q[0].shape[0], width), dtype=torch.float32
+            )
+        )
+        topk = MagicMock()
+        event = MagicMock()
+        stream = MagicMock()
+        with (
+            patch.object(mod, "deep_gemm_fp4_paged_mqa_logits", deep_gemm),
+            patch.object(mod, "topk_transform_paged_from_metadata", topk),
+            patch.object(
+                mod,
+                "candidate_row_lens",
+                side_effect=lambda lens, _topk: (
+                    torch.ones_like(lens),
+                    lens.clone(),
+                ),
+            ),
+            patch.object(
+                mod,
+                "amax_topk_blocks",
+                side_effect=lambda _logits, lens, _nblocks, topk_blocks: torch.zeros(
+                    (lens.shape[0], topk_blocks), dtype=torch.int32
+                ),
+            ),
+            patch.object(
+                mod,
+                "sort_candidate_blocks",
+                side_effect=lambda blocks, *_args: blocks + 1,
+            ),
+            patch.object(
+                mod,
+                "build_sparse_indexer_schedule",
+                return_value=torch.tensor([7], dtype=torch.uint8),
+            ),
+            patch.object(mod.torch.cuda, "Event", return_value=event),
+            patch.object(mod.torch.cuda, "current_stream", return_value=stream),
+        ):
+            table = indexer.publish_decode(inputs, page_indices, raw_indices)
+
+        self.assertEqual(deep_gemm.call_count, len(chunks))
+        for call, plan in zip(deep_gemm.call_args_list, plans):
+            self.assertIs(call.args[5], plan)
+            self.assertIsInstance(call.args[5], torch.Tensor)
+        self.assertEqual([call.kwargs["rows"] for call in topk.call_args_list], chunks)
+        for call, plan in zip(topk.call_args_list, topk_plans):
+            self.assertIs(call.kwargs["topk_metadata"], plan)
+        self.assertEqual(table.blocks.shape, (num_rows, indexer.topk_blocks))
+        self.assertEqual(table.phys_blocks.shape, table.blocks.shape)
+        self.assertEqual(table.valid_lens.shape, (num_rows,))
+        event.record.assert_called_once_with(stream)
 
 
 class TestCandidateIndexerGating(CustomTestCase):
