@@ -8,16 +8,16 @@ export const Qwen35Deployment = () => {
   //   27B, 9B, 4B, 2B, 0.8B
   //
   // GPU requirements (BF16):
-  //   397B-A17B: H100 tp=16 (2 nodes), H200 tp=8, B200 tp=8, B300 tp=8, MI300X tp=8, MI325X tp=4, MI355X tp=4
-  //   122B-A10B: H100 tp=4,  H200 tp=4, B200 tp=2, B300 tp=2, MI300X tp=2, MI325X tp=1, MI355X tp=1
-  //   35B-A3B:   H100 tp=1 (tp=2 w/ MTP), H200 tp=1, B200 tp=1, B300 tp=1, MI300X tp=1, MI325X tp=1, MI355X tp=1
+  //   397B-A17B: H100 tp=16 (2 nodes), H200 tp=8, B200 tp=8, B300 tp=8, GB200 tp=8 (2 nodes, 4 GPUs/node), GB300 tp=8 (2 nodes, 4 GPUs/node), MI300X tp=8, MI325X tp=4, MI355X tp=4
+  //   122B-A10B: H100 tp=4,  H200 tp=4, B200 tp=2, B300 tp=2, GB200 tp=2, GB300 tp=2, MI300X tp=2, MI325X tp=1, MI355X tp=1
+  //   35B-A3B:   H100 tp=1 (tp=2 w/ MTP), H200 tp=1, B200 tp=1, B300 tp=1, GB200 tp=1, GB300 tp=1, MI300X tp=1, MI325X tp=1, MI355X tp=1
   //   27B:       H100 tp=1 (tp=2 w/ MTP); tp=1 on all other hardware
   //   9B/4B/2B/0.8B: tp=1 on all hardware (including MI300X, MI325X, MI355X)
   //
   // GPU requirements (FP8, where available):
-  //   397B-A17B: H100 tp=8, H200 tp=8 ep=8, B200 tp=4, B300 tp=4, MI300X tp=4, MI325X tp=2, MI355X tp=2
-  //   122B-A10B: H100 tp=2 (tp=4 w/ MTP), H200 tp=2, B200 tp=1, B300 tp=1, MI300X tp=1, MI325X tp=1, MI355X tp=1
-  //   35B-A3B:   H100 tp=1, H200 tp=1, B200 tp=1, B300 tp=1, MI300X tp=1, MI325X tp=1, MI355X tp=1
+  //   397B-A17B: H100 tp=8, H200 tp=8 ep=8, B200 tp=4, B300 tp=4, GB200 tp=4, GB300 tp=4, MI300X tp=4, MI325X tp=2, MI355X tp=2
+  //   122B-A10B: H100 tp=2 (tp=4 w/ MTP), H200 tp=2, B200 tp=1, B300 tp=1, GB200 tp=1, GB300 tp=1, MI300X tp=1, MI325X tp=1, MI355X tp=1
+  //   35B-A3B:   H100 tp=1, H200 tp=1, B200 tp=1, B300 tp=1, GB200 tp=1, GB300 tp=1, MI300X tp=1, MI325X tp=1, MI355X tp=1
   //   27B:       tp=1 on all hardware (including MI300X, MI325X, MI355X)
   //
   // FP4 (397B only): NVFP4 on Blackwell B200 tp=4 (tp=2 ep=2 w/ MTP) / B300 tp=4; AMD MXFP4 on MI355X tp=2
@@ -62,6 +62,8 @@ export const Qwen35Deployment = () => {
           { id: 'h200',   label: 'H200',   default: false,     disabled: isNvfp4 },
           { id: 'b200',   label: 'B200',   default: false,     disabled: false },
           { id: 'b300',   label: 'B300',   default: isNvfp4,   disabled: false },
+          { id: 'gb200',  label: 'GB200',  default: false,     disabled: isNvfp4 },
+          { id: 'gb300',  label: 'GB300',  default: false,     disabled: isNvfp4 },
           { id: 'mi300x', label: 'MI300X', default: false,     disabled: isNvfp4 },
           { id: 'mi325x', label: 'MI325X', default: false,     disabled: isNvfp4 },
           { id: 'mi355x', label: 'MI355X', default: false,     disabled: false },
@@ -163,6 +165,8 @@ export const Qwen35Deployment = () => {
       h200:   { bf16: { tp: 8,  mem: 0.8 }, fp8: { tp: 8, ep: 8, mem: 0.8 } },
       b200:   { bf16: { tp: 8,  mem: 0.8 }, fp8: { tp: 4, mem: 0.8 }, fp4: { tp: 4, mem: 0.85 } },
       b300:   { bf16: { tp: 8,  mem: 0.8 }, fp8: { tp: 4, mem: 0.8 }, fp4: { tp: 4, mem: 0.8 } },
+      gb200:  { bf16: { tp: 8, mem: 0.8, multinode: true, nnodes: 2 }, fp8: { tp: 4, mem: 0.8 } },
+      gb300:  { bf16: { tp: 8, mem: 0.8, multinode: true, nnodes: 2 }, fp8: { tp: 4, mem: 0.85 } },
       mi300x: { bf16: { tp: 8, mem: 0.8 }, fp8: { tp: 4, mem: 0.8 } },
       mi325x: { bf16: { tp: 4, mem: 0.8 }, fp8: { tp: 2, mem: 0.8 } },
       mi355x: { bf16: { tp: 4, mem: 0.8 }, fp8: { tp: 2, mem: 0.8 }, fp4: { tp: 2, mem: 0.8 } },
@@ -173,6 +177,8 @@ export const Qwen35Deployment = () => {
       h200:   { bf16: { tp: 4 },            fp8: { tp: 2 } },
       b200:   { bf16: { tp: 2, mem: 0.8 }, fp8: { tp: 1, mem: 0.8 } },
       b300:   { bf16: { tp: 2 },           fp8: { tp: 1, mem: 0.8 } },
+      gb200:  { bf16: { tp: 2, mem: 0.8 }, fp8: { tp: 1, mem: 0.8 } },
+      gb300:  { bf16: { tp: 2, mem: 0.8 }, fp8: { tp: 1, mem: 0.8 } },
       mi300x: { bf16: { tp: 2, mem: 0.8 }, fp8: { tp: 1, mem: 0.8 } },
       mi325x: { bf16: { tp: 1, mem: 0.8 }, fp8: { tp: 1, mem: 0.8 } },
       mi355x: { bf16: { tp: 1, mem: 0.8 }, fp8: { tp: 1, mem: 0.8 } },
@@ -183,6 +189,8 @@ export const Qwen35Deployment = () => {
       h200:   { bf16: { tp: 1, mem: 0.8 }, fp8: { tp: 1, mem: 0.8 } },
       b200:   { bf16: { tp: 1, mem: 0.8 }, fp8: { tp: 1, mem: 0.8 } },
       b300:   { bf16: { tp: 1, mem: 0.8 }, fp8: { tp: 1, mem: 0.8 } },
+      gb200:  { bf16: { tp: 1, mem: 0.8 }, fp8: { tp: 1, mem: 0.8 } },
+      gb300:  { bf16: { tp: 1, mem: 0.8 }, fp8: { tp: 1, mem: 0.8 } },
       mi300x: { bf16: { tp: 1, mem: 0.8 }, fp8: { tp: 1, mem: 0.8 } },
       mi325x: { bf16: { tp: 1, mem: 0.8 }, fp8: { tp: 1, mem: 0.8 } },
       mi355x: { bf16: { tp: 1, mem: 0.8 }, fp8: { tp: 1, mem: 0.8 } },
@@ -194,6 +202,8 @@ export const Qwen35Deployment = () => {
       h200:   { bf16: { tp: 1, mem: 0.8 }, fp8: { tp: 1, mem: 0.8 } },
       b200:   { bf16: { tp: 1, mem: 0.8 }, fp8: { tp: 1, mem: 0.8 } },
       b300:   { bf16: { tp: 1, mem: 0.8 }, fp8: { tp: 1, mem: 0.8 } },
+      gb200:  { bf16: { tp: 1, mem: 0.8 }, fp8: { tp: 1, mem: 0.8 } },
+      gb300:  { bf16: { tp: 1, mem: 0.8 }, fp8: { tp: 1, mem: 0.8 } },
       mi300x: { bf16: { tp: 1, mem: 0.8 }, fp8: { tp: 1, mem: 0.8 } },
       mi325x: { bf16: { tp: 1, mem: 0.8 }, fp8: { tp: 1, mem: 0.8 } },
       mi355x: { bf16: { tp: 1, mem: 0.8 }, fp8: { tp: 1, mem: 0.8 } },
@@ -204,6 +214,8 @@ export const Qwen35Deployment = () => {
       h200:   { bf16: { tp: 1, mem: 0.8 } },
       b200:   { bf16: { tp: 1, mem: 0.8 } },
       b300:   { bf16: { tp: 1, mem: 0.8 } },
+      gb200:  { bf16: { tp: 1, mem: 0.8 } },
+      gb300:  { bf16: { tp: 1, mem: 0.8 } },
       mi300x: { bf16: { tp: 1, mem: 0.8 } },
       mi325x: { bf16: { tp: 1, mem: 0.8 } },
       mi355x: { bf16: { tp: 1, mem: 0.8 } },
@@ -215,6 +227,8 @@ export const Qwen35Deployment = () => {
       h200:   { bf16: { tp: 1, mem: 0.8 } },
       b200:   { bf16: { tp: 1, mem: 0.8 } },
       b300:   { bf16: { tp: 1, mem: 0.8 } },
+      gb200:  { bf16: { tp: 1, mem: 0.8 } },
+      gb300:  { bf16: { tp: 1, mem: 0.8 } },
       mi300x: { bf16: { tp: 1, mem: 0.8 } },
       mi325x: { bf16: { tp: 1, mem: 0.8 } },
       mi355x: { bf16: { tp: 1, mem: 0.8 } },
@@ -226,6 +240,8 @@ export const Qwen35Deployment = () => {
       h200:   { bf16: { tp: 1, mem: 0.8 } },
       b200:   { bf16: { tp: 1, mem: 0.8 } },
       b300:   { bf16: { tp: 1, mem: 0.8 } },
+      gb200:  { bf16: { tp: 1, mem: 0.8 } },
+      gb300:  { bf16: { tp: 1, mem: 0.8 } },
       mi300x: { bf16: { tp: 1, mem: 0.8 } },
       mi325x: { bf16: { tp: 1, mem: 0.8 } },
       mi355x: { bf16: { tp: 1, mem: 0.8 } },
@@ -236,6 +252,8 @@ export const Qwen35Deployment = () => {
       h200:   { bf16: { tp: 1, mem: 0.8 } },
       b200:   { bf16: { tp: 1, mem: 0.8 } },
       b300:   { bf16: { tp: 1, mem: 0.8 } },
+      gb200:  { bf16: { tp: 1, mem: 0.8 } },
+      gb300:  { bf16: { tp: 1, mem: 0.8 } },
       mi300x: { bf16: { tp: 1, mem: 0.8 } },
       mi325x: { bf16: { tp: 1, mem: 0.8 } },
       mi355x: { bf16: { tp: 1, mem: 0.8 } },
@@ -364,6 +382,7 @@ export const Qwen35Deployment = () => {
     const memFraction = hwConfig.mem;
     const isMultinode = !!hwConfig.multinode;
     const nnodes = hwConfig.nnodes || 1;
+    const gbHw = hardware === 'gb200' || hardware === 'gb300';
 
     // Initialize the base command
     let cmd = `sglang serve --model-path ${modelName}`;
@@ -467,7 +486,7 @@ export const Qwen35Deployment = () => {
     }
 
     // Append backend configurations
-    if (hardware === 'b200' || (hardware === 'b300' && quantization === 'fp4')) {
+    if (hardware === 'b200' || gbHw || (hardware === 'b300' && quantization === 'fp4')) {
       cmd += ` \\\n  --attention-backend trtllm_mha`;
     }
     if (hardware === 'b300' && quantization !== 'fp4') {
@@ -475,13 +494,24 @@ export const Qwen35Deployment = () => {
     }
 
     // Enable FlashInfer GDN (linear attention) prefill for Blackwell FP8 deployments.
+    // Not applied to GB200/GB300: their trtllm_mha attention backend (above) is the
+    // validated combination instead.
     if ((hardware === 'b200' || hardware === 'b300') && quantization === 'fp8') {
       cmd += ` \\\n  --linear-attn-prefill-backend flashinfer`;
     }
 
     // Enable FlashInfer trtllm MoE for FP8 Blackwell deployments for MoE models.
-    if ((hardware === 'b200' || hardware === 'b300') && quantization === 'fp8' && MOE_MODELS.has(model)) {
+    if ((hardware === 'b200' || hardware === 'b300' || gbHw) && quantization === 'fp8' && MOE_MODELS.has(model)) {
       cmd += ` \\\n  --moe-runner-backend flashinfer_trtllm`;
+    }
+
+    // GB200/GB300 (Grace-Blackwell superchip, MNNVL-connected) FP8 tuning.
+    if (gbHw && quantization === 'fp8') {
+      cmd += ` \\\n  --kv-cache-dtype fp8_e4m3`;
+      if (MOE_MODELS.has(model)) {
+        cmd += ` \\\n  --mamba-ssm-dtype bfloat16`;
+        cmd += ` \\\n  --disable-shared-experts-fusion`;
+      }
     }
 
     // Append AMD GPU-specific backend configurations.
@@ -505,6 +535,17 @@ export const Qwen35Deployment = () => {
       if (hwConfig.tp > 1 && !amdFp4) {
         cmd += " \\\n  --enable-aiter-allreduce-fusion";
       }
+    }
+
+    // GB200/GB300 nodes are MNNVL-connected (a single coherent NVLink domain across
+    // nodes) — these env vars turn that on and are generic across Qwen3.5 sizes/quants.
+    if (gbHw) {
+      const gbEnv =
+        "NCCL_MNNVL_ENABLE=1 \\\n" +
+        "NCCL_CUMEM_ENABLE=1 \\\n" +
+        "MC_FORCE_MNNVL=1 \\\n" +
+        "NVSHMEM_REMOTE_TRANSPORT=none \\\n";
+      cmd = gbEnv + cmd;
     }
 
     // Tokenizer workers for H200 and B200/B300

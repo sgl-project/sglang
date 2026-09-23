@@ -547,9 +547,9 @@ class BaseRunner(ABC):
             if (
                 capture_forward_mode == ForwardMode.EXTEND
                 and get_parallel().pp_rank != 0
-                and mr.ps.attn_cp_size > 1
+                and mr.attn_cp_size > 1
             ):
-                pp_hidden_tokens = num_tokens // mr.ps.attn_cp_size
+                pp_hidden_tokens = num_tokens // mr.attn_cp_size
             pp_proxy_tensors = PPProxyTensors(
                 {k: v[:pp_hidden_tokens] for k, v in buffers.pp_proxy_tensors.items()}
             )
