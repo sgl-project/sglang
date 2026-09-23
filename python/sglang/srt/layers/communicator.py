@@ -44,6 +44,7 @@ from sglang.srt.layers.dp_attention import (
     attn_tp_reduce_scatter_tensor,
     can_use_dp_reduce_scatter,
     dp_gather_partial,
+    dp_gather_replicate,
     dp_reduce_scatter_tensor,
     dp_scatter,
     get_dp_global_num_tokens,
@@ -542,6 +543,10 @@ class LayerCommunicator:
         allow_reduce_scatter: bool = False,
         is_last_layer: bool = False,
         qkv_latent_func: Optional[Callable] = None,
+        # Under DP attention with attn_tp_size > 1, reduce over attn TP and norm
+        # before the DP gather: one more collective for a more precise residual
+        # stream (see _gather_hidden_states_and_residual).
+        force_layernorm_before_dp_gather: bool = False,
         enable_fused_ar_quant: bool = False,
         fused_ar_quant_keep_bf16: bool = False,
         _is_sp_variant: bool = False,
@@ -552,10 +557,14 @@ class LayerCommunicator:
         self.allow_reduce_scatter = allow_reduce_scatter
         self.is_last_layer = is_last_layer
         self.qkv_latent_func = qkv_latent_func
+        self.force_layernorm_before_dp_gather = force_layernorm_before_dp_gather
         self.enable_fused_ar_quant = enable_fused_ar_quant
         self.fused_ar_quant_keep_bf16 = fused_ar_quant_keep_bf16
 
         self._context = CommunicateContext.init_new()
+        self._context.force_layernorm_before_dp_gather = (
+            force_layernorm_before_dp_gather
+        )
         self._post_init_communicate()
         self._speculative_algo = SpeculativeAlgorithm.from_string(
             get_spec().speculative_algorithm
@@ -579,6 +588,7 @@ class LayerCommunicator:
                 allow_reduce_scatter=allow_reduce_scatter,
                 is_last_layer=is_last_layer,
                 qkv_latent_func=qkv_latent_func,
+                force_layernorm_before_dp_gather=force_layernorm_before_dp_gather,
                 enable_fused_ar_quant=enable_fused_ar_quant,
                 fused_ar_quant_keep_bf16=fused_ar_quant_keep_bf16,
                 _is_sp_variant=True,
@@ -1015,6 +1025,7 @@ class CommunicateContext:
     tp_size: int
     cache = None
     tp_rank: int
+    force_layernorm_before_dp_gather: bool = False
 
     def is_same_group_size(self, a: ScatterMode, b: ScatterMode):
         return self.process_group_sizes[a] == self.process_group_sizes[b]
@@ -1273,9 +1284,20 @@ class CommunicateWithAllReduceAndLayerNormFn:
             )
             attn_tp_all_gather_into_tensor(residual, local_residual)
         if context.attn_dp_size != 1:
-            # Perform layernorm on smaller data before comm. Only valid when attn_tp_size is 1 (tp_size == dp_size)
-            use_layer_norm_before_gather = context.attn_tp_size == 1
+            # With attn_tp_size > 1 the default adds the residual to attn-TP rank
+            # 0's partial and lets the partial DP gather sum the partials. That
+            # folds the attn-TP reduction into the gather, but rounds the residual
+            # stream to bf16 once more per layer, before the norm. The forced path
+            # instead all-reduces over attn TP first so the residual add happens
+            # inside the fused norm, at the cost of one more attn-TP all-reduce.
+            use_layer_norm_before_gather = (
+                context.force_layernorm_before_dp_gather or context.attn_tp_size == 1
+            )
             if use_layer_norm_before_gather and hidden_states.shape[0] != 0:
+                if context.attn_tp_size > 1:
+                    hidden_states = attention_tensor_model_parallel_all_reduce(
+                        hidden_states
+                    )
                 with use_symmetric_memory(
                     get_parallel().tp_group,
                     disabled=not is_allocation_symmetric(),
@@ -1288,7 +1310,10 @@ class CommunicateWithAllReduceAndLayerNormFn:
                 get_global_dp_buffer(get_parallel().tp_group),
                 hidden_states,
             )
-            dp_gather_partial(hidden_states, local_hidden_states, forward_batch)
+            if use_layer_norm_before_gather:
+                dp_gather_replicate(hidden_states, local_hidden_states, forward_batch)
+            else:
+                dp_gather_partial(hidden_states, local_hidden_states, forward_batch)
 
             if not use_layer_norm_before_gather:
                 dp_scatter(residual, hidden_states, forward_batch)

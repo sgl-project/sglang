@@ -50,6 +50,9 @@ def make_layer_communicator(
         layer_scatter_modes=_build_layer_scatter_modes(is_sparse),
         input_layernorm=layer_norm if for_attn else nn.Identity(),
         post_attention_layernorm=nn.Identity() if for_attn else layer_norm,
+        # With attention TP > 1, the default gather adds the residual to one
+        # rank's partial in bf16 before the cross-rank sum.
+        force_layernorm_before_dp_gather=True,
         allow_reduce_scatter=allow_reduce_scatter,
         is_last_layer=is_last_layer,
     )
