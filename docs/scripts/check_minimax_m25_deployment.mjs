@@ -32,7 +32,8 @@ test('A2 emits the tested eight-device low-concurrency command regardless of GPU
     '--device npu', '--tp-size 8', '--quantization modelslim', '--dtype bfloat16',
     '--reasoning-parser minimax \\\n', '--tool-call-parser minimax-m2',
     '--host 127.0.0.1 --port 31216', '--context-length 4096', '--max-running-requests 1',
-    '--chunked-prefill-size 128', '--max-prefill-tokens 4096', '--mem-fraction-static 0.95',
+    '--chunked-prefill-size 128', '--max-prefill-tokens 4096', '--mem-fraction-static 0.96',
+    '--max-total-tokens 4096',
     '--disable-cuda-graph', '--disable-radix-cache',
   ]) assert.ok(command.includes(expected), `Missing ${expected}`);
   assert.doesNotMatch(command, /EAGLE3|custom_eagle3|speculative|ascend_fuseep|--dp-size|flashinfer|fp8_e4m3/);
