@@ -1657,9 +1657,12 @@ class CommonKVSender(BaseKVSender):
         if hasattr(self.kv_mgr, "transfer_infos"):
             self.kv_mgr.transfer_infos.pop(self.bootstrap_room, None)
         if hasattr(self.kv_mgr, "_deferred_ack_targets"):
-            # Drop a held ack target if the room concluded without draining
-            # (e.g. aborted before any chunk enqueued); else it leaks on prefill.
-            self.kv_mgr._deferred_ack_targets.pop(self.bootstrap_room, None)
+            if hasattr(self.kv_mgr, "_staging_outstanding"):
+                # Preserve the target until in-flight writes drain, even when
+                # the scheduler has already observed Failed and cleared the room.
+                self.kv_mgr._maybe_ack_drained_abort(self.bootstrap_room)
+            else:
+                self.kv_mgr._deferred_ack_targets.pop(self.bootstrap_room, None)
 
     def abort(self):
         self.kv_mgr.record_failure(

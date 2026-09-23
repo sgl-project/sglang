@@ -38,6 +38,7 @@ from sglang.srt.distributed import (
     moe_tensor_model_parallel_all_reduce,
     tensor_model_parallel_all_reduce,
 )
+from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
@@ -108,14 +109,6 @@ from sglang.srt.utils import (
     make_layers,
     use_intel_amx_backend,
 )
-
-if is_npu():
-    from sglang.srt.hardware_backend.npu.cmo import (
-        shared_expert_on_independent_stream,
-        wait_share_stream,
-    )
-
-from sglang.srt.environ import envs
 from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
 _SGLANG_EXPERIMENTAL_LORA_OPTI = envs.SGLANG_EXPERIMENTAL_LORA_OPTI.get()
@@ -126,6 +119,7 @@ _is_cuda = is_cuda()
 _is_cpu = is_cpu()
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_hip = is_hip()
+_is_npu = is_npu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
 
@@ -539,6 +533,13 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
 
                     gate = self.shared_expert_gate(hidden_states)
                     shared_output = sigmoid_gate_mul_broadcast(shared_output, gate)
+                elif _is_npu:
+                    from sgl_kernel_npu.activation.fused_sigmoid_mul import (
+                        fused_sigmoid_mul_broadcast,
+                    )
+
+                    gate = self.shared_expert_gate(hidden_states)
+                    shared_output = fused_sigmoid_mul_broadcast(shared_output, gate)
                 else:
                     shared_output = (
                         F.sigmoid(self.shared_expert_gate(hidden_states))
@@ -585,6 +586,11 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             # router_logits: (num_tokens, n_experts)
             router_logits, _ = self.gate(hidden_states)
             if enable_dual_stream:
+                from sglang.srt.hardware_backend.npu.cmo import (
+                    shared_expert_on_independent_stream,
+                    wait_share_stream,
+                )
+
                 shared_output = shared_expert_on_independent_stream(
                     hidden_states.clone(), self._forward_shared_experts
                 )
@@ -601,7 +607,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             topk_output = self.topk(
                 hidden_states,
                 router_logits,
-                num_token_non_padded=forward_batch.num_token_non_padded,
+                num_token_non_padded=forward_batch.moe_num_token_non_padded(),
                 expert_location_dispatch_info=(
                     ExpertLocationDispatchInfo.init_new(
                         layer_id=self.layer_id,
@@ -619,7 +625,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         )
         trace_sync("post_experts")
         if enable_dual_stream:
-            wait_share_stream()
+            final_hidden_states = wait_share_stream(final_hidden_states)
         elif enable_cuda_shared_overlap:
             torch.cuda.current_stream().wait_event(shared_event)
 
@@ -658,7 +664,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                 hidden_states,
                 router_logits,
                 num_token_non_padded=(
-                    forward_batch.num_token_non_padded
+                    forward_batch.moe_num_token_non_padded()
                     if forward_batch is not None
                     else None
                 ),
