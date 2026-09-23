@@ -90,10 +90,6 @@ class Disagg(msgspec.Struct):
     disaggregation_decode_enable_offload_kvcache: A[
         bool, "Enable async KV cache offloading on decode server (PD mode)."
     ] = False
-    disaggregation_decode_host_receive_threshold: A[
-        float,
-        "Device token usage fraction at which incoming KV is received in the decode retraction host pool, excluding evictable cache pages. Range [0, 1]; 0 disables host receive. Size with --hicache-size or --hicache-ratio; requires dense MHA and a transfer backend that supports host destinations. No built-in backend currently supports this.",
-    ] = 0.0
     disaggregation_decode_retraction_backup: A[
         Optional[str],
         Arg(
@@ -179,3 +175,7 @@ class Disagg(msgspec.Struct):
         "The path of the PD-Multiplexing config file.",
     ] = None
     sm_group_num: A[int, "Number of sm partition groups."] = 8
+    disaggregation_decode_host_receive_threshold: A[
+        float,
+        "Device token usage fraction at which incoming KV is received in the decode retraction host pool, excluding evictable cache pages. Range [0, 1]; 0 disables host receive. Size with --hicache-size or --hicache-ratio; requires dense MHA and a transfer backend that supports host destinations. No built-in backend currently supports this.",
+    ] = 0.0
