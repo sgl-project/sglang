@@ -18,7 +18,8 @@ from ..common.utils import (
     unit_scale,
 )
 
-_MAX_PER_PAGE_SLOT_UNROLL = 8
+# gfx950 MI350X: per-page wins at <=2 pages/block, loses at >=8
+_MAX_PER_PAGE_SLOT_UNROLL = 2
 
 
 @triton.heuristics(
@@ -531,7 +532,7 @@ def _index_block_score_only_kernel(
         blk = i // block_size
         pos = i + off_k
         pos_mask = pos < seq_len
-        # One base-slot load per page; off when the unroll won't pay (page_size 1).
+        # One base-slot load per page instead of one per token.
         if PER_PAGE_SLOTS:
             slots = tl.zeros([block_size], dtype=tl.int64)
             for p in tl.static_range(0, pages_per_block):
