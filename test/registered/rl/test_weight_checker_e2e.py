@@ -163,7 +163,10 @@ class TestWeightCheckerE2E(CustomTestCase):
         self.assertIn("checksums", first)
         self.assertIn("parallelism_info", first)
 
-        info = first["parallelism_info"]
+        infos = first["parallelism_info"]
+        # one entry per runner; without speculative decoding that is the target
+        self.assertEqual([info["role"] for info in infos], ["target"])
+        info = infos[0]
         for key in (
             "tp_rank",
             "tp_size",
