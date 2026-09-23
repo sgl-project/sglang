@@ -193,6 +193,25 @@ _FLYDSL_REDUCTION_PARAMS = (
 )
 
 
+def _argument_reader(signature: inspect.Signature):
+    """``(args, kwargs) -> {name: value}`` with the signature's defaults applied: the
+    per-call work of ``signature.bind`` done once, since the overrides run per launch."""
+    names = tuple(signature.parameters)
+    defaults = {
+        name: p.default
+        for name, p in signature.parameters.items()
+        if p.default is not inspect.Parameter.empty
+    }
+
+    def read(args, kwargs) -> dict:
+        arguments = dict(defaults)
+        arguments.update(zip(names, args))
+        arguments.update(kwargs)
+        return arguments
+
+    return read
+
+
 @functools.cache
 def _install_fused_reduce_override() -> bool:
     """Wrap the FlyDSL stage2 reduction (``_run_moe_reduction``) once; False when aiter
@@ -217,6 +236,7 @@ def _install_fused_reduce_override() -> bool:
             "aiter's reduction and the separate shared-expert add"
         )
         return False
+    read_arguments = _argument_reader(signature)
 
     from sglang.kernels.ops.moe.moe_reduce_add_hip import moe_topk_reduce_add
 
@@ -224,9 +244,7 @@ def _install_fused_reduce_override() -> bool:
         request = _fused_reduce_request.get()
         if request is None:
             return original(*args, **kwargs)
-        bound = signature.bind(*args, **kwargs)
-        bound.apply_defaults()
-        arg = bound.arguments
+        arg = read_arguments(args, kwargs)
         target, out, shared = arg["target"], arg["out"], request.shared_output
         token_num, topk, model_dim = (
             int(arg["token_num"]),
@@ -356,6 +374,7 @@ def _install_fused_sorting_override() -> bool:
         )
         return False
     extra_params = params[len(_AITER_MOE_SORTING_PARAMS) :]
+    read_arguments = _argument_reader(signature)
 
     from sglang.kernels.ops.moe.aiter_moe_sorting_fused import (
         AITER_FUSED_SORT_MAX_TOKENS,
@@ -376,10 +395,8 @@ def _install_fused_sorting_override() -> bool:
         request = _fused_sorting_request.get()
         if request is None:
             return original(*args, **kwargs)
-        bound = signature.bind(*args, **kwargs)
-        bound.apply_defaults()
-        arg = bound.arguments
-        if any(arg.get(name) not in (None, False) for name in extra_params):
+        arg = read_arguments(args, kwargs)
+        if any(arg[name] not in (None, False) for name in extra_params):
             return original(*args, **kwargs)
         topk_ids, topk_weights = arg["topk_ids"], arg["topk_weights"]
         expert_mask = arg["expert_mask"]
