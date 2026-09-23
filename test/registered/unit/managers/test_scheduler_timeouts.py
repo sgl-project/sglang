@@ -64,7 +64,6 @@ def _scheduler(waiting_queue, running_reqs=(), last_batch_reqs=()):
     s.waiting_queue = waiting_queue
     s.enable_hierarchical_cache = False
     s.enable_hicache_storage = False
-    s.enable_unified_cache_external_linker = False
     s.ipc_channels = SimpleNamespace(send_to_tokenizer=MagicMock())
     s.beam_coordinator = MagicMock()
     s.running_batch = _batch(list(running_reqs))

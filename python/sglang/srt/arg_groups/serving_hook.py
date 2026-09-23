@@ -10,6 +10,7 @@ import random
 import socket
 from typing import Any
 
+from sglang.srt.arg_groups.hicache_mode import hicache_has_host_tier
 from sglang.srt.arg_groups.overrides import (
     declare_resolution,
     model_config_of,
@@ -468,7 +469,7 @@ def handle_other_validations(server_args: Any):
                 "_handle_other_validations",
                 optimistic_prefill_attempts=0,
             )
-        elif cfg.enable_hierarchical_cache and not (
+        elif hicache_has_host_tier(cfg) and not (
             (
                 cfg.hicache_storage_backend is None
                 and cfg.hicache_write_policy == "write_back"

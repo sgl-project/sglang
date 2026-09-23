@@ -430,8 +430,10 @@ class TestHybridDevicePoolAssembler(CustomTestCase):
                     spec,
                     "get_memory",
                     return_value=SimpleNamespace(
-                        enable_hierarchical_cache=not linker_enabled,
-                        enable_unified_cache_external_linker=linker_enabled,
+                        enable_hierarchical_cache=True,
+                        hicache_host_memory_mode=(
+                            "linker" if linker_enabled else "cache"
+                        ),
                     ),
                 ),
             ):

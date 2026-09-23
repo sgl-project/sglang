@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
+from sglang.srt.arg_groups.hicache_mode import hicache_uses_linker
 from sglang.srt.model_executor.graph_memory_usage import (
     merge_graph_memory_usage,
     merge_graph_time_usage,
@@ -253,7 +254,6 @@ class BaseSpecWorker(ABC):
         spec_algorithm = target_model_runner.spec_algorithm
         if not (
             get_memory().enable_hierarchical_cache
-            or get_memory().enable_unified_cache_external_linker
             or get_disagg().disaggregation_decode_retraction_backup == "host_pool"
         ):
             return HiCacheDraftPlan()
@@ -277,7 +277,7 @@ class BaseSpecWorker(ABC):
                 device_pools=draft_pools,
             )
 
-        if get_memory().enable_unified_cache_external_linker:
+        if hicache_uses_linker(get_memory()):
             raise NotImplementedError(
                 "The external linker only supports packed draft KV caches."
             )

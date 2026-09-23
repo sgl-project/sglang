@@ -5,6 +5,7 @@ import logging
 import os
 from typing import TYPE_CHECKING, Dict, List, Optional, Union
 
+from sglang.srt.arg_groups.hicache_mode import hicache_has_host_tier
 from sglang.srt.environ import envs
 from sglang.srt.runtime_context import (
     get_disagg,
@@ -325,7 +326,7 @@ def maybe_init_shared_mooncake_transfer_engine(*, gpu_id: int) -> None:
             and get_disagg().disaggregation_transfer_backend == "mooncake"
         )
         or (
-            get_memory().enable_hierarchical_cache
+            hicache_has_host_tier(get_memory())
             and get_memory().hicache_storage_backend == "mooncake"
             and envs.SGLANG_HICACHE_MOONCAKE_REUSE_TE.get()
         )

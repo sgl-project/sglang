@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING
 
+from sglang.srt.arg_groups.hicache_mode import hicache_uses_linker
 from sglang.srt.arg_groups.overrides import (
     _deepseek_v4_kv_cache_dtype,
     declare_resolution,
@@ -198,7 +199,7 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
             ),
             ("DP attention", cfg.enable_dp_attention),
             ("context parallelism", cfg.attn_cp_size > 1),
-            ("external cache linker", cfg.enable_unified_cache_external_linker),
+            ("external cache linker", hicache_uses_linker(cfg)),
             ("unified memory", cfg.enable_unified_memory),
             ("PD disaggregation", cfg.disaggregation_mode != "null"),
             ("mixed prefill/decode", cfg.enable_mixed_chunk),

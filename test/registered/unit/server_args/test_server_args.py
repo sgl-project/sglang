@@ -1968,19 +1968,20 @@ class TestSSLArgs(unittest.TestCase):
 
 class TestHiCacheArgs(unittest.TestCase):
     def test_linker_mla_dedup_requires_mooncake_linker(self):
-        for enabled, linker, backend in (
-            (False, False, "mooncake"),
-            (True, True, "mooncake"),
-            (True, False, "mooncake"),
-            (True, True, "mori"),
+        for enabled, mode, backend in (
+            (False, "cache", None),
+            (True, "linker", "mooncake"),
+            (True, "cache", "mooncake"),
+            (True, "linker", "mori"),
         ):
-            with self.subTest(enabled=enabled, linker=linker, backend=backend):
+            with self.subTest(enabled=enabled, mode=mode, backend=backend):
                 args = self._make_args(
+                    enable_hierarchical_cache=True,
                     enable_linker_mla_dedup=enabled,
-                    enable_unified_cache_external_linker=linker,
-                    unified_cache_external_linker_backend=backend,
+                    hicache_host_memory_mode=mode,
+                    hicache_storage_backend=backend,
                 )
-                if enabled and (not linker or backend != "mooncake"):
+                if enabled and (mode != "linker" or backend != "mooncake"):
                     with self.assertRaisesRegex(ValueError, "requires the Mooncake"):
                         handle_hicache(args)
                 else:

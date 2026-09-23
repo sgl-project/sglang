@@ -107,8 +107,8 @@ class Memory(msgspec.Struct):
     hicache_host_memory_mode: A[
         str,
         Arg(
-            help="Whether host memory is a persistent HiCache tier (cache) or a transient staging buffer between GPU and the storage backend (buffer_only). buffer_only requires --hicache-storage-backend.",
-            choices=["cache", "buffer_only"],
+            help="HiCache mode. cache: host memory is a persistent HiCache tier. buffer_only: host memory is a transient staging buffer between GPU and the storage backend. linker: no host tier, the unified radix cache links device pools directly to the storage backend (mooncake or mori). buffer_only and linker require --hicache-storage-backend.",
+            choices=["cache", "buffer_only", "linker"],
         ),
     ] = "cache"
     hicache_ratio: A[
@@ -210,17 +210,6 @@ class Memory(msgspec.Struct):
     # -------------------------------------------------------------------------
     # Unified Radix Cache
     # -------------------------------------------------------------------------
-    enable_unified_cache_external_linker: A[
-        bool,
-        "Link UnifiedRadixCache directly to an external KV store (direct L3), with no host cache tier.",
-    ] = False
-    unified_cache_external_linker_backend: A[
-        str,
-        Arg(
-            help="Storage backend for --enable-unified-cache-external-linker.",
-            choices=["mooncake", "mori"],
-        ),
-    ] = "mooncake"
     enable_linker_mla_dedup: A[
         bool,
         "Load replicated MLA KV on rank 0 and broadcast each layer with the Mooncake linker.",

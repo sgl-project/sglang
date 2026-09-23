@@ -6,6 +6,7 @@ from __future__ import annotations
 import logging
 from typing import Any
 
+from sglang.srt.arg_groups.hicache_mode import hicache_has_host_tier
 from sglang.srt.arg_groups.overrides import (
     attention_backends_of,
     declare_resolution,
@@ -254,7 +255,7 @@ def handle_kv4_compatibility(server_args: Any) -> None:
                 "implemented by the KV transfer path."
             )
         if uses_sm100_trtllm_nvfp4 and (
-            cfg.enable_hierarchical_cache or cfg.enable_lmcache
+            hicache_has_host_tier(cfg) or cfg.enable_lmcache
         ):
             raise ValueError(
                 "SM100 native NVFP4 with trtllm_mha does not yet support "

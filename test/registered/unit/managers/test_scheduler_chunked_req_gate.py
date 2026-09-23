@@ -84,7 +84,6 @@ def _scheduler_for_get_next_batch(*, tree_cache, chunked_req) -> Scheduler:
     # Exercise the unconditional scheduler-loop HiCache event-drain point.
     s.enable_hierarchical_cache = True
     s.enable_hicache_storage = False
-    s.enable_unified_cache_external_linker = False
     s.last_batch = None
     s.require_mlp_sync = False
     s.spec_algorithm = MagicMock()

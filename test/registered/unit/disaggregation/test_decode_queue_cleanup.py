@@ -449,7 +449,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
         scheduler.disagg_decode_transfer_queue = SimpleNamespace(queue=[])
         scheduler.decode_offload_manager = None
         scheduler.enable_hisparse = False
-        scheduler.enable_hierarchical_cache = False
+        scheduler.enable_hicache_host_tier = False
 
         self.assertFalse(scheduler.is_fully_idle())
 

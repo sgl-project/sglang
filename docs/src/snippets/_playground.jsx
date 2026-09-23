@@ -391,14 +391,18 @@ export const Playground = ({ config }) => {
   };
 
   // -------- HiCache flag family --------
-  // Shared because two axes own it: `hicache` emits it, and `umbp` strips the
-  // whole family when it takes the tier over (the two are mutually exclusive).
+  // Shared because two axes own it: `hicache` emits the host-tier (cache mode)
+  // recipe, and `umbp` replaces the family with the linker-mode recipe (one
+  // HiCache mode at a time).
   const HICACHE_HEADS = [
-    "--enable-hierarchical-cache", "--hicache-ratio", "--hicache-size",
+    "--enable-hierarchical-cache", "--hicache-host-memory-mode",
+    "--hicache-ratio", "--hicache-size",
     "--hicache-write-policy", "--hicache-mem-layout", "--hicache-io-backend",
     "--hicache-storage-backend", "--hicache-storage-prefetch-policy",
     "--hicache-storage-backend-extra-config",
   ];
+  const isLinkerMode = (flags, h) =>
+    h.findFlagArg(flags, "--hicache-host-memory-mode") === "linker";
 
   // -------- Prefill-CP flag family (shared by the attention axis) --------
   // Every flag head that toggles/parameterizes prefill context parallelism:
@@ -1213,7 +1217,7 @@ export const Playground = ({ config }) => {
       deriveFromBase: (cell, fc, h) => {
         const flags = (cell && cell.flags) || [];
         return {
-          enable: h.hasFlag(flags, "--enable-hierarchical-cache"),
+          enable: h.hasFlag(flags, "--enable-hierarchical-cache") && !isLinkerMode(flags, h),
           backend: h.findFlagArg(flags, "--hicache-storage-backend"),
           writePolicy: h.findFlagArg(flags, "--hicache-write-policy") || "auto",
         };
@@ -1354,30 +1358,30 @@ export const Playground = ({ config }) => {
       },
     },
 
-    // ---- Axis: UMBP (unified cache external linker) -------------------------
-    // A SIBLING of HiCache, not a tier inside it: the unified radix tree loads
-    // and offloads straight against an external store with no host cache tier,
-    // and sglang refuses the pair outright (arg_groups/hicache_hook.py raises on
-    // --enable-hierarchical-cache or --hicache-storage-backend alongside it).
-    // So enabling this strips the whole HiCache family instead of layering on
-    // it, and it is declared after hicache so that strip runs last.
+    // ---- Axis: UMBP (HiCache linker mode) -----------------------------------
+    // HiCache's linker mode, not a tier inside the hierarchy: the unified radix
+    // tree loads and offloads straight against the storage backend with no host
+    // cache tier (--hicache-host-memory-mode linker). It shares the HiCache flag
+    // family with the `hicache` axis, so enabling this replaces the whole family
+    // with the linker recipe, and it is declared after hicache so that runs last.
     umbp: {
       initState: () => ({ enable: null, backend: null }),
 
       deriveFromBase: (cell, fc, h) => {
         const flags = (cell && cell.flags) || [];
         return {
-          enable: h.hasFlag(flags, "--enable-unified-cache-external-linker"),
-          backend: h.findFlagArg(flags, "--unified-cache-external-linker-backend"),
+          enable: h.hasFlag(flags, "--enable-hierarchical-cache") && isLinkerMode(flags, h),
+          backend: h.findFlagArg(flags, "--hicache-storage-backend"),
         };
       },
 
       apply: ({ flags, env, value, fc, sel, h, derived }) => {
-        const ownedHeads = [
-          "--enable-unified-cache-external-linker",
-          "--unified-cache-external-linker-backend",
-          ...((fc.requiredFlags || []).map((f) => f.split(/\s/)[0])),
-        ];
+        const requiredHeads = (fc.requiredFlags || []).map((f) => f.split(/\s/)[0]);
+        // A linker recipe in the base is a HiCache-family command, so turning
+        // the card off strips the family it emitted; a cache-mode recipe from
+        // the hicache axis is left alone.
+        const ownedHeads = isLinkerMode(flags, h)
+          ? [...HICACHE_HEADS, ...requiredHeads] : requiredHeads;
         flags = h.stripFlagsByFirstToken(flags, ownedHeads);
         if (fc.requiredEnv && fc.requiredEnv.length) {
           env = h.stripEnvByPrefix(env, fc.requiredEnv.map((e) => e.split("=")[0]));
@@ -1398,8 +1402,9 @@ export const Playground = ({ config }) => {
         const backend = value.backend
           || (derived && derived.backend) || fc.defaultBackend || "mori";
         flags = h.insertBeforeTail(flags, [
-          "--enable-unified-cache-external-linker",
-          `--unified-cache-external-linker-backend ${backend}`,
+          "--enable-hierarchical-cache",
+          "--hicache-host-memory-mode linker",
+          `--hicache-storage-backend ${backend}`,
           ...(fc.requiredFlags || []),
         ]);
         env = [...env, ...(fc.requiredEnv || []).filter((e) => !env.includes(e))];

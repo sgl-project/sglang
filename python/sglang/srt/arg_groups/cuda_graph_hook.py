@@ -6,6 +6,7 @@ from __future__ import annotations
 import logging
 from typing import Any, Optional
 
+from sglang.srt.arg_groups.hicache_mode import hicache_has_host_tier
 from sglang.srt.arg_groups.overrides import (
     attention_backends_of,
     declare_resolution,
@@ -233,7 +234,7 @@ def disable_tc_piecewise_cudagraph_if_incompatible(server_args: Any):
         ("DLLM (diffusion LLM)", lambda: cfg.dllm_algorithm is not None),
         (
             "CPU offload / hierarchical cache",
-            lambda: cfg.cpu_offload_gb > 0 or cfg.enable_hierarchical_cache,
+            lambda: cfg.cpu_offload_gb > 0 or hicache_has_host_tier(cfg),
         ),
         (
             "deterministic inference",

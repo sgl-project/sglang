@@ -25,6 +25,7 @@ class KVCacheBuildResult:
 
 from typing import TYPE_CHECKING
 
+from sglang.srt.arg_groups.hicache_mode import hicache_has_host_tier
 from sglang.srt.arg_groups.overrides import resolving_view
 from sglang.srt.configs.hybrid_arch import (
     glm5_next_config,
@@ -76,7 +77,7 @@ def prepare_hicache_staging(
     memory = get_memory()
     page_size = get_schedule().page_size
     if memory.hicache_mem_layout != "page_first" or not (
-        memory.enable_hierarchical_cache
+        hicache_has_host_tier(memory)
         or get_disagg().disaggregation_decode_retraction_backup == "host_pool"
     ):
         return
@@ -239,7 +240,7 @@ def resolve_decode_retraction_backup(*, tp_worker: BaseTpWorker) -> str:
         # backup-only pool can be small: retractions that overflow it abort their
         # request instead of crashing the scheduler. Sharing the pool with
         # HiCache keeps the standard default.
-        if backend == "host_pool" and not memory.enable_hierarchical_cache:
+        if backend == "host_pool" and not hicache_has_host_tier(memory):
             fields["hicache_ratio"] = BACKUP_ONLY_HICACHE_RATIO
         else:
             fields["hicache_ratio"] = 2.0
@@ -294,6 +295,7 @@ def build_kv_cache(
     mtp_draft_device_pools = tp_worker.model_runner.mtp_draft_device_pools
 
     retraction_backup = resolve_decode_retraction_backup(tp_worker=tp_worker)
+    enable_hicache_host_tier = hicache_has_host_tier(get_memory())
 
     disable_radix_cache = get_memory().disable_radix_cache or (
         model_config.is_multimodal and uses_transformers_backend
@@ -389,12 +391,12 @@ def build_kv_cache(
     with auto_size_hicache(
         params,
         hicache_draft_plan,
-        enabled=enable_hierarchical_cache or retraction_backup == "host_pool",
+        enabled=enable_hicache_host_tier or retraction_backup == "host_pool",
     ):
         tree_cache = create_tree_cache(tree_context)
 
         if (
-            enable_hierarchical_cache or retraction_backup == "host_pool"
+            enable_hicache_host_tier or retraction_backup == "host_pool"
         ) and hicache_draft_plan is not None:
             maybe_register_hicache_draft(
                 tree_cache=tree_cache,

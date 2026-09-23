@@ -6,6 +6,10 @@ from __future__ import annotations
 import logging
 from typing import Any
 
+from sglang.srt.arg_groups.hicache_mode import (
+    HICACHE_LINKER_BACKENDS,
+    hicache_uses_linker,
+)
 from sglang.srt.arg_groups.overrides import (
     declare_resolution,
     resolving_view,
@@ -23,23 +27,13 @@ def handle_hicache(server_args: Any):
     2) Storage <-> layout compatibility (may rewrite layout).
     """
     cfg = resolving_view(server_args)
-    if cfg.enable_linker_mla_dedup and (
-        not cfg.enable_unified_cache_external_linker
-        or cfg.unified_cache_external_linker_backend != "mooncake"
+    if cfg.enable_linker_mla_dedup and not (
+        hicache_uses_linker(cfg) and cfg.hicache_storage_backend == "mooncake"
     ):
-        raise ValueError("--enable-linker-mla-dedup requires the Mooncake linker.")
-    if cfg.enable_unified_cache_external_linker:
-        if cfg.enable_hierarchical_cache:
-            raise ValueError(
-                "--enable-unified-cache-external-linker and "
-                "--enable-hierarchical-cache are mutually exclusive."
-            )
-        if cfg.hicache_storage_backend is not None:
-            raise ValueError(
-                "--enable-unified-cache-external-linker does not use "
-                "--hicache-storage-backend."
-            )
-        return
+        raise ValueError(
+            "--enable-linker-mla-dedup requires the Mooncake linker "
+            "(--hicache-host-memory-mode linker --hicache-storage-backend mooncake)."
+        )
 
     # Skip all normalization when neither hicache nor decode-offload path is active.
     if not (
@@ -53,6 +47,8 @@ def handle_hicache(server_args: Any):
         return
 
     validate_hicache_host_memory_mode(server_args)
+    if hicache_uses_linker(cfg):
+        return
 
     # Step 1: Initial layout-io compatibility normalization.
     resolve_layout_io_compatibility(server_args)
@@ -191,11 +187,20 @@ def resolve_storage_layout_compatibility(server_args: Any):
 
 def validate_hicache_host_memory_mode(server_args: Any):
     cfg = resolving_view(server_args)
-    if cfg.hicache_host_memory_mode not in ("cache", "buffer_only"):
+    if cfg.hicache_host_memory_mode not in ("cache", "buffer_only", "linker"):
         raise ValueError(
-            "hicache_host_memory_mode must be 'cache' or 'buffer_only', "
+            "hicache_host_memory_mode must be 'cache', 'buffer_only' or 'linker', "
             f"got {cfg.hicache_host_memory_mode!r}"
         )
+    if cfg.hicache_host_memory_mode == "linker":
+        if cfg.hicache_storage_backend not in HICACHE_LINKER_BACKENDS:
+            raise ValueError(
+                "--hicache-host-memory-mode linker requires "
+                "--hicache-storage-backend "
+                f"{' or '.join(HICACHE_LINKER_BACKENDS)}, "
+                f"got {cfg.hicache_storage_backend!r}."
+            )
+        return
 
     # Both modes are defaulted upstream (a decode server resolves the
     # ratio later, in kv_cache_builder), so this fires only if that

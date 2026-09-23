@@ -1160,7 +1160,7 @@ class SchedulerMetricsReporter:
 
         These are pushed to Prometheus by SchedulerMetricsCollector.log_stats().
         """
-        if not self.scheduler.enable_hierarchical_cache:
+        if not self.scheduler.enable_hicache_host_tier:
             return
 
         host_pool = getattr(

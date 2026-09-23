@@ -44,6 +44,7 @@ from sglang.srt.arg_groups.arg_utils import (
     resolvable_fields,
     with_fallback,
 )
+from sglang.srt.arg_groups.hicache_mode import hicache_has_host_tier
 
 # Re-exported for the callers that already import these names from here; the
 # declarations under ``model_overrides/`` import them from the base directly.
@@ -409,7 +410,7 @@ def _step3p_overrides(server_args: Any, hf_config: Any) -> dict:
             "Enable multi-layer EAGLE speculative decoding for Step3p5ForCausalLM model."
         )
         overrides["enable_multi_layer_eagle"] = True
-    if cfg.enable_hierarchical_cache:
+    if hicache_has_host_tier(cfg):
         logger.warning(
             "Reset swa_full_tokens_ratio to 1.0 for Step3p5ForCausalLM model with hierarchical cache"
         )

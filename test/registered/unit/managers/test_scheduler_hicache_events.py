@@ -25,7 +25,6 @@ class TestSchedulerHiCacheEvents(unittest.TestCase):
         self.scheduler = s = Scheduler.__new__(Scheduler)
         s.scheduler_stage_metrics = None
         s.enable_hierarchical_cache = True
-        s.enable_unified_cache_external_linker = False
         s.enable_hicache_storage = True
         s.tree_cache = SimpleNamespace(check_hicache_events=self.calls.drain)
         s._process_storage_prefetch_retries = self.calls.retry
@@ -38,18 +37,16 @@ class TestSchedulerHiCacheEvents(unittest.TestCase):
         )
 
     def test_feature_gates(self):
-        for hierarchical, flexkv, linker, storage in (
-            (False, False, False, False),
-            (True, False, False, False),
-            (False, True, False, False),
-            (False, False, True, False),
-            (True, False, False, True),
+        for hierarchical, flexkv, storage in (
+            (False, False, False),
+            (True, False, False),
+            (False, True, False),
+            (True, False, True),
         ):
             with (
                 self.subTest(
                     hierarchical=hierarchical,
                     flexkv=flexkv,
-                    linker=linker,
                     storage=storage,
                 ),
                 patch(
@@ -60,10 +57,9 @@ class TestSchedulerHiCacheEvents(unittest.TestCase):
                 self.calls.reset_mock()
                 s = self.scheduler
                 s.enable_hierarchical_cache = hierarchical
-                s.enable_unified_cache_external_linker = linker
                 s.enable_hicache_storage = storage
                 s._process_hicache_events()
-                expected = [call.drain()] if hierarchical or flexkv or linker else []
+                expected = [call.drain()] if hierarchical or flexkv else []
                 if storage:
                     expected.append(call.retry())
                 self.assertEqual(self.calls.mock_calls, expected)

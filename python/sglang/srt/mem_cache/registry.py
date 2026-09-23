@@ -14,6 +14,7 @@ import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Callable, Optional
 
+from sglang.srt.arg_groups.hicache_mode import hicache_uses_linker
 from sglang.srt.hardware_backend.mlx.runtime import use_mlx
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
@@ -100,7 +101,7 @@ def default_radix_cache_factory(ctx: TreeCacheBuildContext) -> BasePrefixCache:
 
         return SWAChunkCache(params)
 
-    if get_memory().enable_unified_cache_external_linker:
+    if hicache_uses_linker(get_memory()):
         return _create_unified_radix_cache(ctx, server_args, params)
 
     if ctx.is_hybrid_swa and ctx.full_tokens_per_layer == 0:
@@ -180,16 +181,8 @@ def _create_unified_radix_cache(
             ComponentType.MAMBA: MlxAuxiliaryStateComponent,
         }
     cache = UnifiedRadixCache(params)
-    if (
-        ctx.enable_hierarchical_cache
-        or get_disagg().disaggregation_decode_retraction_backup == "host_pool"
-    ):
-        cache.init_hicache(server_args, params)
-        ctx.tp_worker.register_hicache_layer_transfer_counter(
-            cache.cache_controller.layer_done_counter
-        )
-    elif get_memory().enable_unified_cache_external_linker:
-        backend = get_memory().unified_cache_external_linker_backend
+    if hicache_uses_linker(get_memory()):
+        backend = get_memory().hicache_storage_backend
         if backend == "mooncake":
             from sglang.srt.mem_cache.storage.mooncake_store.mooncake_direct_linker import (
                 MooncakeDirectLinker,
@@ -203,9 +196,7 @@ def _create_unified_radix_cache(
 
             linker_cls = UMBPDirectLinker
         else:
-            raise ValueError(
-                f"Unknown unified cache external linker backend: {backend!r}"
-            )
+            raise ValueError(f"Unknown HiCache linker backend: {backend!r}")
 
         cache.init_cache_linker(
             linker_cls(server_args, params, components=set(cache.components))
@@ -214,6 +205,14 @@ def _create_unified_radix_cache(
         kvcache = params.token_to_kv_pool_allocator.get_kvcache()
         kvcache.register_layer_transfer_counter(counter)
         ctx.tp_worker.register_hicache_layer_transfer_counter(counter)
+    elif (
+        ctx.enable_hierarchical_cache
+        or get_disagg().disaggregation_decode_retraction_backup == "host_pool"
+    ):
+        cache.init_hicache(server_args, params)
+        ctx.tp_worker.register_hicache_layer_transfer_counter(
+            cache.cache_controller.layer_done_counter
+        )
     return cache
 
 

@@ -654,7 +654,7 @@ For AMD devices,
 
 The Write policy knob defaults to `write_through` (the upstream default); switch to `write_back` / `write_through_selective` to trade durability for write speed when the storage tier is slow.
 
-For more details, see the [HiCache documentation](../../../docs/advanced_features/hicache). For the alternative that skips the host tier entirely, see [§3.9 UMBP](#3-9-umbp-direct-external-kv-store) — it is a sibling of HiCache, not a storage backend for it, and the two cannot be enabled together.
+For more details, see the [HiCache documentation](../../../docs/advanced_features/hicache). For the HiCache mode that skips the host tier entirely, see [§3.9 UMBP](#3-9-umbp-direct-external-kv-store) — it is HiCache's linker mode, so it replaces the host-tier knobs rather than adding a storage backend under them.
 
 ### 3.4 DSpark (Speculative Decoding)
 
@@ -993,7 +993,7 @@ The roles are sized per **Strategy**, so the Deploy panel's operating point carr
 - **Balanced** — still TP-only, with the ceiling at `--max-running-requests 96` and a 16384 chunked-prefill budget. Decode ladders all the way to 96, since without DP the server-wide ceiling *is* the per-rank batch. Prefill runs a **HiCache** host tier (`--hicache-ratio 2.5`, `page_first`, write-through, best-effort prefetch); decode does not, because HiCache is not recommended on the decode role with MORI.
 - **High-Throughput** — inherits TP8 / DP8 and the 65536 chunked-prefill budget from the base cell, raises the ceiling to `--max-running-requests 256` and `--mem-fraction-static 0.92`, and ladders decode to 32 — the per-rank batch 256 leaves across DP 8. It adds `--enable-cache-report`, which surfaces the prefix hit rate you need to judge whether an offload tier is paying for itself at that concurrency.
 
-The offload tier is what actually separates balanced from high-throughput: balanced pairs prefill with HiCache's tiered GPU → host cache, while high-throughput pairs it with UMBP, which links the radix tree straight to MORI with no host tier. They cannot both be on, and the Playground enforces that.
+The offload tier is what actually separates balanced from high-throughput: balanced pairs prefill with HiCache's tiered GPU → host cache, while high-throughput pairs it with UMBP, HiCache's linker mode, which links the radix tree straight to MORI with no host tier. A recipe runs in one HiCache mode at a time, and the Playground enforces that.
 
 <Note>
 The low-latency and balanced roles are TP-only, and that is exactly why their decode ladders run to the full ceiling. Selecting either role forces DP-Attention off and grays the control: `--max-running-requests` is server-wide and floor-divided by `attn_dp_size`, so switching DP on would cut the per-rank batch below the captured graphs without changing either flag in the command. With PD off, the balanced cell stays a DP recipe for aggregated serving.
@@ -1025,14 +1025,15 @@ Run the two roles on separate nodes with the same transport and IB device select
 
 ### 3.9 UMBP (Direct External KV Store)
 
-UMBP is the second way to spill KV off the GPU, and it is an **alternative to [HiCache](#3-3-hicache-hierarchical-kv-caching), not a tier inside it**. HiCache is a hierarchy — GPU, then pinned host memory, then optionally a storage backend. UMBP links the unified radix tree straight to MORI's buffer pool with no host cache tier in between, so pages load and offload against the external store directly. SGLang rejects the two together, so enabling the **UMBP** card in the [Playground above](#playground) strips the whole HiCache flag family from the command:
+UMBP is the second way to spill KV off the GPU, and it is **[HiCache](#3-3-hicache-hierarchical-kv-caching)'s linker mode, not a tier inside the hierarchy**. HiCache's default `cache` mode is a hierarchy — GPU, then pinned host memory, then optionally a storage backend. In `linker` mode there is no host tier: the unified radix tree links straight to MORI's buffer pool, so pages load and offload against the external store directly. The host-tier knobs (ratio, size, write policy, layout, IO backend) do not apply, so enabling the **UMBP** card in the [Playground above](#playground) replaces the HiCache flag family with the linker recipe:
 
 ```bash Command
---enable-unified-cache-external-linker \
---unified-cache-external-linker-backend mori
+--enable-hierarchical-cache \
+--hicache-host-memory-mode linker \
+--hicache-storage-backend mori
 ```
 
-The **Store** knob picks the linker backend. `mori` is the UMBP pool; `mooncake` drives the same direct-linker path against a Mooncake store instead.
+The **Store** knob picks the linker backend through `--hicache-storage-backend`. `mori` is the UMBP pool; `mooncake` drives the same direct-linker path against a Mooncake store instead.
 
 **DP Attention is required**, and the card's Enable chip stays greyed out until you turn it on. This is not a soft preference. The linker keys its objects by rank, and MLA KV is replicated across TP, so a TP8 prefill worker under pure TP opens eight separate keyspaces holding eight copies of the same tokens — the pool's effective distinct-token capacity would be an eighth of what its byte budget suggests, which is easy to mistake for a real measurement. DP attention collapses the keys onto one shared keyspace.
 

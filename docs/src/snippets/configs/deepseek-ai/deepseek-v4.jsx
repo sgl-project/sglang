@@ -632,12 +632,13 @@ sgl-eval run mmmu_pro \\
       ],
     },
 
-    // ----- Card 7: "UMBP" (unified cache external linker) -----
-    // Sits beside HiCache rather than inside it. HiCache is a tiered cache
-    // (GPU -> pinned host -> optional storage); UMBP links the unified radix
-    // tree DIRECTLY to an external store with no host tier at all, so the two
-    // are alternatives and sglang rejects them together. Enabling this card
-    // therefore strips the HiCache family from the command.
+    // ----- Card 7: "UMBP" (HiCache linker mode) -----
+    // HiCache's linker mode rather than a tier inside it. Cache mode is a
+    // tiered cache (GPU -> pinned host -> optional storage); linker mode links
+    // the unified radix tree DIRECTLY to the storage backend with no host tier
+    // at all, so a recipe runs in one mode at a time. Enabling this card
+    // therefore replaces the HiCache family in the command with the linker
+    // recipe.
     //
     // ROCm-only in practice: the store is MORI's buffer pool, the same
     // transport the PD roles use, and there is no CUDA recipe for it yet.

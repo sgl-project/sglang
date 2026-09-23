@@ -28,6 +28,7 @@ from functools import partial
 from http import HTTPStatus
 from typing import TYPE_CHECKING, Any, Deque, Dict, List, Optional, Set, Tuple, Union
 
+from sglang.srt.arg_groups.hicache_mode import hicache_has_host_tier
 from sglang.srt.runtime_context import (
     SpawnRanks,
     attention_backends,
@@ -497,14 +498,15 @@ class Scheduler(
         )
         self.page_size = get_schedule().page_size
         self.enable_hierarchical_cache = get_memory().enable_hierarchical_cache
+        self.enable_hicache_host_tier = hicache_has_host_tier(get_memory())
         self.enable_session_radix_cache = get_memory().enable_session_radix_cache
-        self.enable_hicache_storage = get_memory().hicache_storage_backend is not None
-        self.enable_unified_cache_external_linker = (
-            get_memory().enable_unified_cache_external_linker
+        self.enable_hicache_storage = (
+            self.enable_hicache_host_tier
+            and get_memory().hicache_storage_backend is not None
         )
         self.enable_decode_hicache = (
             get_disagg().disaggregation_decode_enable_radix_cache
-            and self.enable_hierarchical_cache
+            and self.enable_hicache_host_tier
         )
         self.max_recv_per_poll = envs.SGLANG_SCHEDULER_MAX_RECV_PER_POLL.get()
         self.max_new_tokens_limit = envs.SGLANG_MAX_NEW_TOKENS_LIMIT.get()
@@ -782,7 +784,7 @@ class Scheduler(
             dp_rank=dp_rank,
             enable_priority_scheduling=self.enable_priority_scheduling,
             enable_lora=self.enable_lora,
-            enable_hierarchical_cache=self.enable_hierarchical_cache,
+            enable_hierarchical_cache=self.enable_hicache_host_tier,
         )
         self.metrics_collector = self.metrics_collector_context.collector
 
@@ -3621,11 +3623,7 @@ class Scheduler(
     def _process_hicache_events(self) -> None:
         # The HiCache drain is TP-wide consensus; run it before rank-local
         # decisions (_should_defer_prefill) or ranks enter different collectives.
-        if (
-            self.enable_hierarchical_cache
-            or get_memory().enable_flexkv
-            or self.enable_unified_cache_external_linker
-        ):
+        if self.enable_hierarchical_cache or get_memory().enable_flexkv:
             self.tree_cache.check_hicache_events()
             if self.enable_hicache_storage:
                 self._process_storage_prefetch_retries()
@@ -4010,10 +4008,7 @@ class Scheduler(
 
             if res != AddReqResult.CONTINUE:
                 if res == AddReqResult.NO_TOKEN:
-                    if (
-                        self.enable_hierarchical_cache
-                        or self.enable_unified_cache_external_linker
-                    ):
+                    if self.enable_hierarchical_cache:
                         # Set batch_is_full after making sure there are requests that can be served
                         running_batch.batch_is_full = len(adder.can_run_list) > 0 or (
                             not running_batch.is_empty()
@@ -4081,7 +4076,7 @@ class Scheduler(
             self.chunked_req is None or len(can_run_list) != 1
         )
 
-        if self.enable_hierarchical_cache or self.enable_unified_cache_external_linker:
+        if self.enable_hierarchical_cache:
             # todo (zhiqiang): disable cuda graph execution if hicache loading triggered
             new_batch.hicache_consumer_index = (
                 self.tree_cache.ready_to_load_host_cache()
@@ -4882,7 +4877,7 @@ class Scheduler(
         return self.external_corpus_manager.list(recv_req)
 
     def clear_hicache_storage_wrapped(self, recv_req: ClearHiCacheReqInput):
-        if self.enable_hierarchical_cache:
+        if self.enable_hicache_host_tier:
             self.tree_cache.clear_storage_backend()
             logger.info("Hierarchical cache cleared successfully!")
             if_success = True
@@ -5034,7 +5029,7 @@ class Scheduler(
 
             # HiCache: in-flight async ops (GPU↔Host↔L3) must drain before
             # destructive operations like attach/detach/flush_cache.
-            if self.enable_hierarchical_cache:
+            if self.enable_hicache_host_tier:
                 tc = self.tree_cache
                 idle &= len(tc.ongoing_write_through) == 0
                 idle &= len(tc.ongoing_load_back) == 0
@@ -5059,7 +5054,7 @@ class Scheduler(
     def attach_hicache_storage_wrapped(
         self, recv_req: AttachHiCacheStorageReqInput
     ) -> AttachHiCacheStorageReqOutput:
-        if not self.enable_hierarchical_cache:
+        if not self.enable_hicache_host_tier:
             return AttachHiCacheStorageReqOutput(
                 success=False, message="Hierarchical cache is not enabled."
             )
@@ -5115,7 +5110,7 @@ class Scheduler(
     def detach_hicache_storage_wrapped(
         self, recv_req: DetachHiCacheStorageReqInput
     ) -> DetachHiCacheStorageReqOutput:
-        if not self.enable_hierarchical_cache:
+        if not self.enable_hicache_host_tier:
             return DetachHiCacheStorageReqOutput(
                 success=False, message="Hierarchical cache is not enabled."
             )

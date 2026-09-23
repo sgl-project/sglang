@@ -53,7 +53,7 @@ def _make_ctx(
         enable_streaming_session=enable_streaming,
         enable_lmcache=enable_lmcache,
         enable_flexkv=False,
-        enable_unified_cache_external_linker=False,
+        enable_hierarchical_cache=False,
     )
     return TreeCacheBuildContext(
         server_args=server_args,
@@ -321,8 +321,9 @@ class TestDefaultRadixCacheFactory(CustomTestCase):
         enter_override(
             self,
             get_context().override_server_args(
-                enable_unified_cache_external_linker=True,
-                unified_cache_external_linker_backend="mori",
+                enable_hierarchical_cache=True,
+                hicache_host_memory_mode="linker",
+                hicache_storage_backend="mori",
             ),
         )
         fake_components = MagicMock()
