@@ -222,7 +222,9 @@ class TestLoRAAdapterEviction(ScriptedTestCase):
 
         t.abort(r_a)
         for _ in range(12):
-            if r_a.kv_pages == 0 and (r_a.req is None or r_a.req.req_pool_idx is None):
+            if r_a.kv_pages == 0 and (
+                r_a.req is None or r_a.req.kv.req_pool_idx is None
+            ):
                 break
             yield
 

@@ -11,6 +11,8 @@ from typing import (
     Tuple,
 )
 
+from sglang.srt.mem_cache.allocator.swa import is_swa_req_ring
+
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
     from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
@@ -33,6 +35,8 @@ class PoolStats:
     is_hisparse: bool = False
 
     # For hybrid-swa pools
+    full_capacity: Optional[int] = None
+    swa_capacity: Optional[int] = None
     swa_num_used: Optional[int] = None
     swa_token_usage: Optional[float] = None
     swa_available_size: Optional[int] = None
@@ -172,8 +176,8 @@ class SchedulerPoolStatsObserver:
             if batch is None or batch.is_empty():
                 continue
             for req in batch.reqs:
-                if req.req_pool_idx is not None:
-                    idxs.add(req.req_pool_idx)
+                if req.kv.holds_kv:
+                    idxs.add(req.kv.req_pool_idx)
         return idxs
 
     def session_held_tokens(self) -> int:
@@ -284,16 +288,20 @@ class SchedulerPoolStatsObserver:
         )
 
     def _get_swa_token_info(self) -> PoolStats:
-        full_available_size = self.token_to_kv_pool_allocator.full_available_size()
+        (full_capacity, full_available_size), (swa_capacity, swa_available_size) = (
+            self.token_to_kv_pool_allocator.swa_capacity_and_available(
+                full_capacity=self.full_tokens_per_layer,
+                swa_capacity=self.swa_tokens_per_layer,
+            )
+        )
         full_evictable_size = self.tree_cache.full_evictable_size()
-        swa_available_size = self.token_to_kv_pool_allocator.swa_available_size()
         swa_evictable_size = self.tree_cache.swa_evictable_size()
-        full_num_used = self.full_tokens_per_layer - (
-            full_available_size + full_evictable_size
-        )
-        swa_num_used = self.swa_tokens_per_layer - (
-            swa_available_size + swa_evictable_size
-        )
+        # Per-request SWA ring: released with the req slot, yet cached radix
+        # prefixes still report swa_evictable; counting it drives usage negative.
+        if is_swa_req_ring(self.token_to_kv_pool_allocator):
+            swa_evictable_size = 0
+        full_num_used = full_capacity - (full_available_size + full_evictable_size)
+        swa_num_used = swa_capacity - (swa_available_size + swa_evictable_size)
         # FIXME(hisparse): host-backup transiently over-releases the device pool
         # counter, producing negative full_num_used / swa_num_used. We clamp to 0
         # to keep token_usage / leak checks sane, but the underlying accounting
@@ -301,16 +309,23 @@ class SchedulerPoolStatsObserver:
         if self.enable_hisparse:
             full_num_used = max(0, full_num_used)
             swa_num_used = max(0, swa_num_used)
-        if not self.full_tokens_per_layer:
+        if not full_capacity:
             full_num_used = 0
             full_available_size = 0
             full_token_usage = 0.0
         else:
-            full_token_usage = full_num_used / self.full_tokens_per_layer
-        swa_token_usage = swa_num_used / self.swa_tokens_per_layer
+            full_token_usage = full_num_used / full_capacity
+        if not swa_capacity:
+            swa_num_used = 0
+            swa_available_size = 0
+            swa_token_usage = 0.0
+        else:
+            swa_token_usage = swa_num_used / swa_capacity
 
         return PoolStats(
             is_hybrid_swa=True,
+            full_capacity=full_capacity,
+            swa_capacity=swa_capacity,
             full_num_used=full_num_used,
             full_token_usage=full_token_usage,
             full_available_size=full_available_size,

@@ -23,7 +23,10 @@ from sglang.srt.layers.moe.token_dispatcher.deepep import (
 )
 from sglang.srt.layers.moe.topk import TopKOutput
 from sglang.srt.layers.moe.utils import DeepEPMode
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import (
+    get_parallel,
+    get_resources,
+)
 
 try:
     from nixl_ep import Buffer
@@ -52,8 +55,6 @@ class NixlEPBuffer:
     @classmethod
     def _state(cls):
         from types import SimpleNamespace
-
-        from sglang.srt.runtime_context import get_resources
 
         buffers = get_resources().buffers
         state = buffers.get("nixl_ep_state")
@@ -418,7 +419,7 @@ class _NixlEPDispatcherImpl(_NixlEPDispatcherImplBase):
         if self._mask_buffer is not None:
             buffer.query_mask_buffer(self._mask_buffer)
 
-            n = ElasticEPStateManager.get_effective_ep_size()
+            n = ElasticEPStateManager.get_data_plane_ep_size()
             self.active_ranks[:n].copy_(1 - self._mask_buffer[:n])
 
         self.packed_recv_count = self.handle = None

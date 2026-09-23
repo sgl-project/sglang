@@ -25,6 +25,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Mapping, Optional
 
 from sglang.srt.environ import envs
+from sglang.srt.runtime_context import get_resources
 from sglang.srt.utils import get_int_env_var
 
 logger = logging.getLogger(__name__)
@@ -75,7 +76,6 @@ def extract_trace_headers(headers: Mapping[str, str]) -> Optional[Dict]:
 
 
 def get_global_trace_level() -> int:
-    from sglang.srt.runtime_context import get_resources
 
     resources = get_resources()
     if resources.trace_level is None:
@@ -84,7 +84,6 @@ def get_global_trace_level() -> int:
 
 
 def set_global_trace_level(level: int):
-    from sglang.srt.runtime_context import get_resources
 
     get_resources().trace_level = level
 
@@ -228,9 +227,12 @@ def process_tracing_init(
         )
 
     try:
+        # Priority: explicit server_name > OTEL_SERVICE_NAME > "sglang"
+        service_name = server_name or os.getenv("OTEL_SERVICE_NAME", "sglang")
+
         resource = Resource.create(
             attributes={
-                SERVICE_NAME: server_name,
+                SERVICE_NAME: service_name,
             }
         )
         tracer_provider = TracerProvider(
@@ -260,7 +262,7 @@ def process_tracing_init(
     if envs.SGLANG_TRACE_ASYNC.get():
         from sglang.srt.observability.trace_async import start_trace_exporter
 
-        start_trace_exporter(otlp_endpoint, server_name, trace_modules=trace_modules)
+        start_trace_exporter(otlp_endpoint, service_name, trace_modules=trace_modules)
 
 
 def get_global_tracing_enabled():

@@ -8,6 +8,7 @@
 
 from contextlib import nullcontext
 from functools import lru_cache
+from typing import Optional
 
 import torch
 import torch.nn.functional as F
@@ -30,6 +31,7 @@ from sglang.srt.utils import (
     is_npu,
     next_power_of_2,
 )
+from sglang.srt.utils.custom_op import register_custom_op
 
 _is_npu = is_npu()
 _use_cpu = is_cpu() and cpu_has_amx_support()
@@ -83,6 +85,8 @@ def _layer_norm_fwd_1pass_kernel(
     stride_x_row,  # how much to increase the pointer when moving by 1 row
     stride_y_row,
     stride_z_row,
+    stride_z_token,
+    stride_z_head,
     M,  # number of rows in X
     N: tl.constexpr,  # number of columns in X
     eps,  # epsilon to avoid division by zero
@@ -90,6 +94,8 @@ def _layer_norm_fwd_1pass_kernel(
     ROWS_PER_BLOCK: tl.constexpr,
     HAS_BIAS: tl.constexpr,
     HAS_Z: tl.constexpr,
+    Z_IS_3D: tl.constexpr,
+    Z_HEADS: tl.constexpr,
     NORM_BEFORE_GATE: tl.constexpr,
     IS_RMS_NORM: tl.constexpr,
     ACTIVATION: tl.constexpr,
@@ -123,7 +129,13 @@ def _layer_norm_fwd_1pass_kernel(
     x = tl.load(X_base, mask=mask, other=0.0).to(tl.float32)
 
     if HAS_Z and not NORM_BEFORE_GATE:
-        Z_base = Z + rows[:, None] * stride_z_row + col_offsets
+        if Z_IS_3D:
+            z_row_offsets = (rows[:, None] // Z_HEADS) * stride_z_token + (
+                rows[:, None] % Z_HEADS
+            ) * stride_z_head
+        else:
+            z_row_offsets = rows[:, None] * stride_z_row
+        Z_base = Z + z_row_offsets + col_offsets
         z = tl.load(Z_base, mask=mask, other=0.0).to(tl.float32)
         if ACTIVATION == "swish" or ACTIVATION == "silu":
             x *= z * tl.sigmoid(z)
@@ -169,7 +181,13 @@ def _layer_norm_fwd_1pass_kernel(
     y = x_hat * w[None, :] + b[None, :] if HAS_BIAS else x_hat * w[None, :]
 
     if HAS_Z and NORM_BEFORE_GATE:
-        Z_base = Z + rows[:, None] * stride_z_row + col_offsets
+        if Z_IS_3D:
+            z_row_offsets = (rows[:, None] // Z_HEADS) * stride_z_token + (
+                rows[:, None] % Z_HEADS
+            ) * stride_z_head
+        else:
+            z_row_offsets = rows[:, None] * stride_z_row
+        Z_base = Z + z_row_offsets + col_offsets
         z = tl.load(Z_base, mask=mask, other=0.0).to(tl.float32)
         if ACTIVATION == "swish" or ACTIVATION == "silu":
             y *= z * tl.sigmoid(z)
@@ -223,9 +241,14 @@ def _layer_norm_fwd(
     assert N % group_size == 0
     ngroups = N // group_size
     assert x.stride(-1) == 1
+    z_is_3d = z is not None and z.ndim == 3
     if z is not None:
         assert z.stride(-1) == 1
-        assert z.shape == (M, N)
+        if z_is_3d:
+            assert z.shape[0] * z.shape[1] == M
+            assert z.shape[2] == N
+        else:
+            assert z.shape == (M, N)
     assert weight.shape == (N,)
     assert weight.stride(-1) == 1
     if bias is not None:
@@ -280,7 +303,9 @@ def _layer_norm_fwd(
             rstd,
             x.stride(0),
             out.stride(0),
-            z.stride(0) if z is not None else 0,
+            z.stride(0) if z is not None and not z_is_3d else 0,
+            z.stride(0) if z_is_3d else 0,
+            z.stride(1) if z_is_3d else 0,
             M,
             group_size,
             eps,
@@ -288,6 +313,8 @@ def _layer_norm_fwd(
             ROWS_PER_BLOCK=rows_per_block,
             HAS_BIAS=bias is not None,
             HAS_Z=z is not None,
+            Z_IS_3D=z_is_3d,
+            Z_HEADS=z.shape[1] if z_is_3d else 1,
             NORM_BEFORE_GATE=norm_before_gate,
             IS_RMS_NORM=is_rms_norm,
             num_warps=num_warps,
@@ -298,7 +325,70 @@ def _layer_norm_fwd(
 
 
 if _is_npu:
-    from sgl_kernel_npu.fla.layernorm_gated import layer_norm_fwd_npu as _layer_norm_fwd
+    from sgl_kernel_npu.fla.layernorm_gated import (
+        layer_norm_fwd_npu as _layer_norm_fwd_npu_raw,
+    )
+
+    @register_custom_op(out_shape="x", mutates_args=["out"])
+    def _layer_norm_fwd_custom(
+        x: torch.Tensor,
+        weight: torch.Tensor,
+        bias: Optional[torch.Tensor],
+        eps: float,
+        z: Optional[torch.Tensor],
+        out: Optional[torch.Tensor],
+        group_size: Optional[int],
+        norm_before_gate: bool,
+        is_rms_norm: bool,
+        activation: Optional[str],
+    ) -> torch.Tensor:
+        _out, _mean, _rstd = _layer_norm_fwd_npu_raw(
+            x=x,
+            weight=weight,
+            bias=bias,
+            eps=eps,
+            z=z,
+            out=out,
+            group_size=group_size,
+            norm_before_gate=norm_before_gate,
+            is_rms_norm=is_rms_norm,
+            activation=activation,
+        )
+        return _out
+
+    def _layer_norm_fwd(
+        x,
+        weight,
+        bias,
+        eps,
+        z=None,
+        out=None,
+        group_size=None,
+        norm_before_gate=True,
+        is_rms_norm=False,
+        activation=None,
+    ):
+        if group_size is None:
+            group_size = x.shape[-1]
+        if out is not None:
+            assert out.shape == x.shape
+        else:
+            out = torch.empty_like(x)
+        y = _layer_norm_fwd_custom(
+            x=x,
+            weight=weight,
+            bias=bias,
+            eps=eps,
+            z=z,
+            out=out,
+            group_size=group_size,
+            norm_before_gate=norm_before_gate,
+            is_rms_norm=is_rms_norm,
+            activation=activation,
+        )
+        # mean/rstd are unused by all callers on the NPU path (rms_norm_gated
+        # discards them); return None to keep the (y, mean, rstd) unpack contract.
+        return y, None, None
 
 
 def rms_norm_gated(
@@ -321,10 +411,16 @@ def rms_norm_gated(
     if x.stride(-1) != 1:
         x = x.contiguous()
     if z is not None:
-        assert z.shape == x_shape_og
-        z = z.reshape(-1, z.shape[-1])
-        if z.stride(-1) != 1:
-            z = z.contiguous()
+        if z.shape == x_shape_og:
+            z = z.reshape(-1, z.shape[-1])
+            if z.stride(-1) != 1:
+                z = z.contiguous()
+        else:
+            assert len(x_shape_og) == 2
+            assert z.ndim == 3
+            assert z.shape[0] * z.shape[1] == x.shape[0]
+            assert z.shape[2] == x.shape[1]
+            assert z.stride(-1) == 1
     weight = weight.contiguous()
     if bias is not None:
         bias = bias.contiguous()
@@ -345,7 +441,6 @@ def rms_norm_gated(
 
 
 class LayerNormFn(torch.autograd.Function):
-
     @staticmethod
     def forward(
         ctx,
@@ -389,7 +484,6 @@ def layernorm_fn(
 
 
 class LayerNorm(torch.nn.Module):
-
     def __init__(
         self,
         hidden_size,
@@ -431,7 +525,6 @@ class LayerNorm(torch.nn.Module):
 
 
 class RMSNorm(torch.nn.Module):
-
     def __init__(
         self,
         hidden_size,
@@ -465,7 +558,9 @@ class RMSNorm(torch.nn.Module):
                 self.norm_before_gate
                 and self.group_size is None
                 and self.activation == "swish"
-            ), "CPU rmsnorm_gated currently only supports norm before gate without group size or activation other than swish"
+            ), (
+                "CPU rmsnorm_gated currently only supports norm before gate without group size or activation other than swish"
+            )
             return torch.ops.sgl_kernel.fused_rmsnorm_gated_cpu(
                 x, self.weight, z, self.eps
             )

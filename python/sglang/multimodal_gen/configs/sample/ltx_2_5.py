@@ -26,8 +26,24 @@ class LTX25SamplingParams(LTX2SamplingParams):
 
     guidance_scale: float = 1.0
 
-    # `auto_duration` on the base class has the duration head predict this
-    # instead, overriding `num_frames`.
+    use_diffusion_decoder: bool = False
+    auto_duration: bool = False
+    auto_duration_min_seconds: float = 1.0
+    auto_duration_max_seconds: float = 20.0
+
+    # `auto_duration` has the duration head predict this instead, overriding
+    # `num_frames`.
     # The schedule is pinned by the pipeline config; this only keeps the
     # reported step count honest.
     num_inference_steps: int = 8
+
+    @classmethod
+    def video_request_extra_fields(cls) -> frozenset[str]:
+        return frozenset(
+            {
+                "auto_duration",
+                "auto_duration_max_seconds",
+                "auto_duration_min_seconds",
+                "use_diffusion_decoder",
+            }
+        )

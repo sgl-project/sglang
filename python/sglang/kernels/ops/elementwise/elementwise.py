@@ -3,9 +3,10 @@ import triton
 import triton.language as tl
 
 from sglang.kernels.jit.utils import is_arch_support_pdl
-from sglang.srt.utils import is_hip
+from sglang.srt.utils import is_hip, is_npu
 
 _is_hip = is_hip()
+_is_npu = is_npu()
 
 
 rmsnorm_autotune = triton.autotune(
@@ -103,9 +104,9 @@ fused_dual_residual_rmsnorm_kernel_autotune = rmsnorm_autotune(
 
 def fused_dual_residual_rmsnorm(x, residual, weight1, weight2, eps, autotune=False):
     assert len(x.shape) == 2
-    assert (
-        x.shape == residual.shape and x.dtype == residual.dtype
-    ), f"{x.shape=} {residual.shape=} {x.dtype=} {residual.dtype=}"
+    assert x.shape == residual.shape and x.dtype == residual.dtype, (
+        f"{x.shape=} {residual.shape=} {x.dtype=} {residual.dtype=}"
+    )
     output, mid = torch.empty_like(x), torch.empty_like(x)
     bs, hidden_dim = x.shape
     if autotune:
@@ -434,14 +435,23 @@ def fused_sigmoid_mul(
         gate_stride_head = gate.stride(1)
     else:
         # Flat path: both tensors have the same shape
-        assert (
-            attn_output.shape == gate.shape
-        ), "attn_output and gate must have the same shape"
+        assert attn_output.shape == gate.shape, (
+            "attn_output and gate must have the same shape"
+        )
         hidden_dim = attn_output.shape[-1]
         num_tokens = attn_output.numel() // hidden_dim
         head_dim = hidden_dim
         gate_stride_row = hidden_dim
         gate_stride_head = hidden_dim
+
+    if _is_npu and torch.compiler.is_compiling():
+        gate_reshaped = (
+            gate.view_as(attn_output) if gate.numel() == attn_output.numel() else gate
+        )
+        if inplace:
+            attn_output.mul_(torch.sigmoid(gate_reshaped))
+            return attn_output
+        return attn_output * torch.sigmoid(gate_reshaped)
 
     out = attn_output if inplace else torch.empty_like(attn_output)
     block_h = 1024 if num_tokens < 1024 else 2048
@@ -465,9 +475,10 @@ def _fused_gate_sigmoid_mul_add_kernel(
     hidden_states_ptr,  # [num_tokens, hidden_dim]
     gate_weight_ptr,  # [hidden_dim]
     shared_output_ptr,  # [num_tokens, hidden_dim]
-    final_hidden_states_ptr,  # [num_tokens, hidden_dim]
+    output_ptr,  # [num_tokens, hidden_dim], optionally also the addend
     hidden_dim: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
+    DO_ADD: tl.constexpr = True,
     USE_PDL: tl.constexpr = False,
 ):
     pid = tl.program_id(axis=0).to(tl.int64)
@@ -487,41 +498,39 @@ def _fused_gate_sigmoid_mul_add_kernel(
     s = tl.load(shared_output_ptr + row_offset + offsets, mask=mask, other=0.0).to(
         tl.float32
     )
-    f = tl.load(
-        final_hidden_states_ptr + row_offset + offsets, mask=mask, other=0.0
-    ).to(tl.float32)
+    if DO_ADD:
+        f = tl.load(output_ptr + row_offset + offsets, mask=mask, other=0.0).to(
+            tl.float32
+        )
 
     if USE_PDL:
         tl.extra.cuda.gdc_launch_dependents()
 
     gate_val = tl.sigmoid(tl.sum(h * w, axis=0))
-    result = f + gate_val * s
+    result = gate_val * s
+    if DO_ADD:
+        result += f
 
-    tl.store(final_hidden_states_ptr + row_offset + offsets, result, mask=mask)
+    tl.store(output_ptr + row_offset + offsets, result, mask=mask)
 
 
-def fused_gate_sigmoid_mul_add(
+def _launch_fused_gate_sigmoid_mul(
     hidden_states: torch.Tensor,
     gate_weight: torch.Tensor,
     shared_output: torch.Tensor,
-    final_hidden_states: torch.Tensor,
+    output: torch.Tensor,
+    *,
+    do_add: bool,
 ) -> None:
-    """
-    Fused gate-sigmoid-mul-add for MoE shared expert gating.
-
-    Equivalent to:
-        gate = hidden_states @ gate_weight
-        final_hidden_states += sigmoid(gate).unsqueeze(1) * shared_output
-    """
     assert hidden_states.is_contiguous(), "hidden_states must be contiguous"
     assert gate_weight.is_contiguous(), "gate_weight must be contiguous"
     assert shared_output.is_contiguous(), "shared_output must be contiguous"
-    assert final_hidden_states.is_contiguous(), "final_hidden_states must be contiguous"
+    assert output.is_contiguous(), "output must be contiguous"
 
     num_tokens, hidden_dim = hidden_states.shape
     assert gate_weight.shape == (hidden_dim,)
     assert shared_output.shape == (num_tokens, hidden_dim)
-    assert final_hidden_states.shape == (num_tokens, hidden_dim)
+    assert output.shape == (num_tokens, hidden_dim)
 
     max_warps = 16 if _is_hip else 32
     config = {
@@ -534,14 +543,50 @@ def fused_gate_sigmoid_mul_add(
     if num_tokens >= 1024:
         config["num_warps"] = min(config["num_warps"], 8)
 
-    pdl_kwargs = {"USE_PDL": True, "launch_pdl": True} if is_arch_support_pdl() else {}
+    use_pdl = is_arch_support_pdl()
+    pdl_kwargs = {"launch_pdl": True} if use_pdl else {}
 
     _fused_gate_sigmoid_mul_add_kernel[(num_tokens,)](
         hidden_states,
         gate_weight,
         shared_output,
-        final_hidden_states,
+        output,
         hidden_dim=hidden_dim,
+        DO_ADD=do_add,
+        USE_PDL=use_pdl,
         **config,
         **pdl_kwargs,
+    )
+
+
+def fused_gate_sigmoid_mul(
+    hidden_states: torch.Tensor,
+    gate_weight: torch.Tensor,
+    shared_output: torch.Tensor,
+) -> torch.Tensor:
+    """Materialize the gated shared-expert contribution without an add/copy."""
+    output = torch.empty_like(shared_output)
+    _launch_fused_gate_sigmoid_mul(
+        hidden_states,
+        gate_weight,
+        shared_output,
+        output,
+        do_add=False,
+    )
+    return output
+
+
+def fused_gate_sigmoid_mul_add(
+    hidden_states: torch.Tensor,
+    gate_weight: torch.Tensor,
+    shared_output: torch.Tensor,
+    final_hidden_states: torch.Tensor,
+) -> None:
+    """Add the gated shared-expert contribution to routed-expert output."""
+    _launch_fused_gate_sigmoid_mul(
+        hidden_states,
+        gate_weight,
+        shared_output,
+        final_hidden_states,
+        do_add=True,
     )

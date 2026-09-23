@@ -3,8 +3,59 @@ import triton
 import triton.language as tl
 
 
-def quantize_k_cache(cache_k):
-    return _quantize_k_cache_fast_wrapped(cache_k)
+def gather_dsa_kv_scales(
+    scale_src,
+    scale_dst,
+    kv_indices,
+    kv_indptr,
+    kv_indptr_idx,
+):
+    _gather_dsa_kv_scales[(32,)](
+        scale_src,
+        scale_dst,
+        kv_indices,
+        kv_indptr,
+        scale_src.stride(0),
+        KV_INDPTR_IDX=kv_indptr_idx,
+        NUM_TILES=scale_src.shape[-1],
+        BLOCK=256,
+    )
+
+
+@triton.jit
+def _gather_dsa_kv_scales(
+    scale_src,
+    scale_dst,
+    kv_indices,
+    kv_indptr,
+    scale_src_stride,
+    KV_INDPTR_IDX: tl.constexpr,
+    NUM_TILES: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    num_programs = tl.num_programs(0)
+    active = tl.load(kv_indptr + KV_INDPTR_IDX)
+    block_start = pid * BLOCK
+    tiles = tl.arange(0, NUM_TILES)
+    while block_start < active:
+        offsets = block_start + tl.arange(0, BLOCK)
+        mask = offsets < active
+        rows = tl.load(kv_indices + offsets, mask=mask, other=0)
+        values = tl.load(
+            scale_src + rows[:, None] * scale_src_stride + tiles[None, :],
+            mask=mask[:, None],
+        )
+        tl.store(
+            scale_dst + rows[:, None] * NUM_TILES + tiles[None, :],
+            values,
+            mask=mask[:, None],
+        )
+        block_start += num_programs * BLOCK
+
+
+def quantize_k_cache(cache_k, dv: int | None = None):
+    return _quantize_k_cache_fast_wrapped(cache_k, dv=dv)
 
 
 def quantize_k_cache_separate(
@@ -20,31 +71,41 @@ def quantize_k_cache_separate(
 
     Args:
         k_nope: (num_tokens, dim_nope) or (num_tokens, 1, dim_nope)
-                Must have dim_nope=512 for FP8 MLA quantization
+                dim_nope must be divisible by 128
         k_rope: (num_tokens, dim_rope) or (num_tokens, 1, dim_rope)
-                Must have dim_rope=64 for FP8 MLA quantization
+                Must have dim_rope=64 for FP8 MLA quantization, or dim_rope=0
+                for no-PE MLA (empty rope); None is treated
+                the same as an empty rope.
         tile_size: quantization tile size (default 128)
 
     Returns:
         Tuple of (nope_part, rope_part) where:
-        - nope_part: (num_tokens, 1, 528) as uint8 view, contains [nope_fp8(512) | scales(16)]
-        - rope_part: (num_tokens, 1, 128) as uint8 view, contains [rope_bf16_bytes(128)]
+        - nope_part: uint8 view containing [nope_fp8 | one FP32 scale per tile]
+        - rope_part: uint8 view containing the raw BF16 RoPE bytes
+                     (empty, (num_tokens, 1, 0), when dim_rope=0)
 
         These two tensors can be directly passed to set_mla_kv_buffer_triton(kv_buffer, loc, nope_part, rope_part)
     """
     # Squeeze middle dimension if present
     k_nope_2d = k_nope.squeeze(1) if k_nope.ndim == 3 else k_nope
-    k_rope_2d = k_rope.squeeze(1) if k_rope.ndim == 3 else k_rope
+    if k_rope is None or k_rope.numel() == 0:
+        k_rope_2d = torch.empty(
+            (k_nope_2d.shape[0], 0), dtype=k_nope_2d.dtype, device=k_nope_2d.device
+        )
+    else:
+        k_rope_2d = k_rope.squeeze(1) if k_rope.ndim == 3 else k_rope
 
     num_tokens = k_nope_2d.shape[0]
     dim_nope = k_nope_2d.shape[1]
     dim_rope = k_rope_2d.shape[1]
 
     # Validate dimensions for FP8 MLA
-    if dim_nope != 512:
-        raise ValueError(f"Expected dim_nope=512 for FP8 MLA, got {dim_nope}")
-    if dim_rope != 64:
-        raise ValueError(f"Expected dim_rope=64 for FP8 MLA, got {dim_rope}")
+    if dim_nope % tile_size != 0:
+        raise ValueError(
+            f"Expected dim_nope divisible by {tile_size} for FP8 MLA, got {dim_nope}"
+        )
+    if dim_rope not in (0, 64):
+        raise ValueError(f"Expected dim_rope=64 (or 0 for no-PE MLA), got {dim_rope}")
     if k_rope_2d.shape[0] != num_tokens:
         raise ValueError(
             f"k_nope and k_rope must have same num_tokens, got {num_tokens} vs {k_rope_2d.shape[0]}"
@@ -111,14 +172,24 @@ def _quantize_k_cache_ref(
 
 def _quantize_k_cache_fast_wrapped(
     input_k_cache: torch.Tensor,
-    dv: int = 512,
+    dv: int | None = None,
     tile_size: int = 128,
 ) -> torch.Tensor:
     # TODO the final API may be 2D instead of 4D, thus we convert them here
     num_blocks, block_size, _, dim_nope_and_rope = input_k_cache.shape
-    assert dv == 512
-    assert dim_nope_and_rope == 512 + 64
     assert tile_size == 128
+    if dv is None:
+        if dim_nope_and_rope == 256:
+            dv = 256
+        elif dim_nope_and_rope == 512 + 64:
+            dv = 512
+        else:
+            raise ValueError(
+                "Cannot infer FP8 MLA NoPE width from total width "
+                f"{dim_nope_and_rope}; pass dv explicitly"
+            )
+    if dv % tile_size != 0 or dv > dim_nope_and_rope:
+        raise ValueError(f"Invalid dv={dv} for input width {dim_nope_and_rope}")
     input_k_cache = input_k_cache.view((-1, dim_nope_and_rope))
 
     # TODO deliberately split into two tensors, then upstream can provide the two tensors instead of concat into one
@@ -142,8 +213,8 @@ def _quantize_k_cache_fast(k_nope, k_rope, group_size: int = 128):
     num_tokens, dim_nope = k_nope.shape
     num_tokens_, dim_rope = k_rope.shape
     assert num_tokens == num_tokens_
-    assert dim_nope == 512
-    assert dim_rope == 64
+    assert dim_nope % group_size == 0
+    assert dim_rope in (0, 64)
     assert k_nope.dtype == k_rope.dtype
     num_tiles = dim_nope // group_size
 
@@ -159,8 +230,7 @@ def _quantize_k_cache_fast(k_nope, k_rope, group_size: int = 128):
     output_nope_s = output[..., dim_nope : dim_nope + num_tiles * 4].view(torch.float32)
     output_rope = output[..., dim_nope + num_tiles * 4 :].view(torch.bfloat16)
 
-    num_blocks_per_token = triton.cdiv(dim_nope + dim_rope, group_size)
-    assert num_blocks_per_token == 5
+    num_blocks_per_token = num_tiles + triton.cdiv(dim_rope, group_size)
 
     assert dim_nope % group_size == 0
     NUM_NOPE_BLOCKS = dim_nope // group_size
@@ -193,8 +263,8 @@ def _quantize_k_cache_fast_separate(k_nope, k_rope, group_size: int = 128):
 
     This avoids packing/unpacking and enables direct use with set_mla_kv_buffer_triton.
 
-    :param k_nope: (num_tokens, dim_nope 512) bfloat16
-    :param k_rope: (num_tokens, dim_rope 64) bfloat16
+    :param k_nope: (num_tokens, dim_nope) bfloat16; width divisible by 128
+    :param k_rope: (num_tokens, dim_rope) bfloat16; width 0 or 64
     :param group_size: quantization tile size (default 128, kernel is tuned for this value)
     :return: Tuple of (nope_part_u8, rope_part_u8)
         - nope_part_u8: (num_tokens, 1, nope_part_bytes) uint8, layout [nope_fp8(dim_nope) | scales(num_tiles*4)]
@@ -234,7 +304,12 @@ def _quantize_k_cache_fast_separate(k_nope, k_rope, group_size: int = 128):
     # Fixed byte layout for rope_part: [rope_bf16 (dim_rope*2 bytes)]
     nope_q_view = nope_part_u8[:, :dim_nope].view(torch.float8_e4m3fn)
     nope_s_view = nope_part_u8[:, dim_nope:].view(torch.float32)
-    rope_view = rope_part_u8.view(torch.bfloat16)
+    if dim_rope > 0:
+        rope_view = rope_part_u8.view(torch.bfloat16)
+    else:
+        rope_view = torch.empty(
+            (num_tokens, 0), dtype=torch.bfloat16, device=k_rope.device
+        )
 
     # Kernel launch parameters
     num_blocks_per_token = triton.cdiv(dim_nope + dim_rope, group_size)
@@ -283,7 +358,7 @@ def _quantize_k_cache_fast_kernel(
     FP8_MIN: tl.constexpr,
     FP8_MAX: tl.constexpr,
 ):
-    token_id = tl.program_id(0)
+    token_id = tl.program_id(0).to(tl.int64)
     raw_block_id = tl.program_id(1)
 
     if raw_block_id < NUM_NOPE_BLOCKS:
