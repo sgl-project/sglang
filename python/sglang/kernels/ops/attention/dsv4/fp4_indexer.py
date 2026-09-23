@@ -413,8 +413,11 @@ def _fp4_index_logits_kernel(
     slots_ptr,  # [B, L] int64 pool slots per (request, compressed position)
     lens_ptr,  # [B] int64 visible compressed positions per request
     table_ptr,  # [num_pages, page_size * 64 + page_size * 4] uint8
-    out_ptr,  # [B, L] fp32 logits, -inf beyond lens
+    out_ptr,  # [B, output_width] fp32 logits
+    blocks_ptr,  # optional [B, candidate_blocks] logical block IDs
     L,
+    output_width,
+    block_stride,
     page_size,
     row_stride,
     stride_qb,
@@ -423,6 +426,8 @@ def _fp4_index_logits_kernel(
     H: tl.constexpr,
     HALF_D: tl.constexpr,  # D // 2 == 64 nibble-pairs per row
     BLOCK_L: tl.constexpr,
+    HAS_CANDIDATES: tl.constexpr,
+    CANDIDATE_BLOCK_SIZE: tl.constexpr,
 ):
     # The caller returns for L == 0 and makes q contiguous. Exclude singleton
     # heads, whose stride is not constrained by PyTorch contiguity.
@@ -438,16 +443,28 @@ def _fp4_index_logits_kernel(
     )  # byte index i holds elements 2i (low nibble), 2i+1 (high nibble)
 
     n_vis = tl.load(lens_ptr + b)
-    # Graph replay keeps the capacity-sized grid even for short live contexts.
-    # Skip whole invisible tiles using the current device-side length; masking
-    # only the K loads would still run dequantization, dot products and reduction.
-    if lb * BLOCK_L >= n_vis:
-        tl.store(out_ptr + b * L + offs_l, float("-inf"), mask=offs_l < L)
-    else:
-        valid = offs_l < tl.minimum(n_vis, L)
-        slot = tl.load(slots_ptr + b * L + offs_l, mask=offs_l < L, other=0).to(
-            tl.int64
+    # Dense graph replay retains a capacity-sized grid: skip invisible tiles.
+    # Candidate columns are not logical positions, so this shortcut is dense-only.
+    if (not HAS_CANDIDATES) and lb * BLOCK_L >= n_vis:
+        tl.store(
+            out_ptr + b * output_width + offs_l,
+            float("-inf"),
+            mask=offs_l < output_width,
         )
+    else:
+        logical = offs_l
+        if HAS_CANDIDATES:
+            block = tl.load(
+                blocks_ptr + b * block_stride + offs_l // CANDIDATE_BLOCK_SIZE,
+                mask=offs_l < output_width,
+                other=-1,
+            ).to(tl.int64)
+            logical = block * CANDIDATE_BLOCK_SIZE + offs_l % CANDIDATE_BLOCK_SIZE
+        valid = (
+            (offs_l < output_width) & (logical >= 0) & (logical < tl.minimum(n_vis, L))
+        )
+        # Follow the logical -> physical mapping inside the scorer, without a K gather.
+        slot = tl.load(slots_ptr + b * L + logical, mask=valid, other=0).to(tl.int64)
         page = slot // page_size
         off = slot % page_size
         row_base = page * row_stride
@@ -499,7 +516,7 @@ def _fp4_index_logits_kernel(
         s = (s * w[:, None]).to(tl.bfloat16).to(tl.float32)
         logit = tl.sum(s, axis=0).to(tl.bfloat16).to(tl.float32)
         logit = tl.where(valid, logit, float("-inf"))
-        tl.store(out_ptr + b * L + offs_l, logit, mask=offs_l < L)
+        tl.store(out_ptr + b * output_width + offs_l, logit, mask=offs_l < output_width)
 
 
 def fp4_index_logits_decode(
@@ -509,11 +526,20 @@ def fp4_index_logits_decode(
     lens: torch.Tensor,
     table: torch.Tensor,
     page_size: int,
+    *,
+    candidate_blocks: torch.Tensor | None = None,
+    candidate_block_size: int = 8,
 ) -> torch.Tensor:
     """Decode index logits from the fp4 index-K pool. q [B, H, 128] bf16, weights
     [B, H], slots [B, L] int64, lens [B] int64, table = the layer's index-K page
     buffer (uint8, 2D). Returns [B, L] fp32 logits, -inf at positions >= lens,
-    rounded as the torch reference does."""
+    rounded as the torch reference does.
+
+    With candidate_blocks [B, C], output is [B, C * candidate_block_size].
+    Column i scores logical K position blocks[b, i // block_size] * block_size
+    + i % block_size. Negative block IDs and invisible positions score -inf.
+    The paged FP4 K is read and dequantized in the kernel, not materialized.
+    """
     assert q.dtype == torch.bfloat16 and q.shape[-1] == INDEX_HEAD_DIM
     B, H, _ = q.shape
     L = slots.shape[1]
@@ -521,11 +547,24 @@ def fp4_index_logits_decode(
     q = q.contiguous()
     weights = weights.to(torch.bfloat16).contiguous()
     slots = slots.contiguous()
-    out = torch.empty((B, L), dtype=torch.float32, device=q.device)
-    if L == 0:
+    assert slots.shape[0] == B and lens.shape == (B,)
+    assert weights.shape == (B, H)
+    output_width = L
+    block_stride = 0
+    if candidate_blocks is not None:
+        assert candidate_blocks.ndim == 2 and candidate_blocks.shape[0] == B
+        assert candidate_blocks.dtype in (torch.int32, torch.int64)
+        assert candidate_block_size > 0
+        candidate_blocks = candidate_blocks.contiguous()
+        output_width = candidate_blocks.shape[1] * candidate_block_size
+        block_stride = candidate_blocks.stride(0)
+    out = torch.empty((B, output_width), dtype=torch.float32, device=q.device)
+    if B == 0 or output_width == 0:
         return out
+    if L == 0:
+        return out.fill_(-torch.inf)
     BLOCK_L = 64
-    grid = (B, triton.cdiv(L, BLOCK_L))
+    grid = (B, triton.cdiv(output_width, BLOCK_L))
     _fp4_index_logits_kernel[grid](
         q,
         weights,
@@ -533,7 +572,10 @@ def fp4_index_logits_decode(
         lens.to(torch.int64).contiguous(),
         table,
         out,
+        candidate_blocks if candidate_blocks is not None else slots,
         L,
+        output_width,
+        block_stride,
         page_size,
         table.stride(0),
         q.stride(0),
@@ -542,6 +584,8 @@ def fp4_index_logits_decode(
         H=H,
         HALF_D=INDEX_HEAD_DIM // 2,
         BLOCK_L=BLOCK_L,
+        HAS_CANDIDATES=candidate_blocks is not None,
+        CANDIDATE_BLOCK_SIZE=candidate_block_size,
         num_warps=4,
     )
     return out

@@ -181,6 +181,12 @@ class DenseCandidateIndexer(CandidateIndexer):
         self.topk_blocks = topk_blocks
         self.block_size = block_size
 
+    def publish_decode(self, inputs, page_indices, raw_indices=None):
+        raise NotImplementedError("DenseCandidateIndexer is prefill-only")
+
+    def select_decode(self, published, inputs, page_indices, raw_indices=None):
+        raise NotImplementedError("DenseCandidateIndexer is prefill-only")
+
     def publish_prefill(
         self, inputs: PrefillIndexerInputs, out_positions: torch.Tensor
     ) -> PrefillCandidateBlocks:
