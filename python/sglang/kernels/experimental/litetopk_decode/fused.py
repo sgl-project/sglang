@@ -18,10 +18,9 @@ import threading
 
 HERE = Path(__file__).resolve().parent
 MAIN_COMMIT = "1853080cf74589228fcd5dc333197c2ca6df49cf"
-PATCH_SHA256 = "8f5aab43b32e9c28552e9a752972a826473cac1104bf23ce9b2888a2849f5103"
+PATCH_SHA256 = "4397806ac79b5d03e69761832cc7b55d1ae1035f078460309e47091e57c17548"
 ENVELOPE = 1_048_576
 TOPK = 2048
-WORKSPACE_BYTES = 20_974_592
 _IMPORT_LOCK = threading.RLock()
 
 
@@ -78,8 +77,6 @@ def _load_deepgemm(directory):
     sys.modules[name] = module
     try:
         spec.loader.exec_module(module)
-        if not hasattr(module, "fp8_paged_mqa_logits_with_histogram"):
-            raise ImportError("private DeepGEMM package lacks the histogram API")
         module._litetopk_library_sha256 = manifest["library_sha256"]
     except Exception:
         for key in tuple(sys.modules):
@@ -87,34 +84,6 @@ def _load_deepgemm(directory):
                 del sys.modules[key]
         raise
     return module
-
-
-class _ConcurrentPair:
-    # Same event dependencies as the measured V7 selector submission.
-    def __init__(self, small, large, device):
-        import torch
-        self.small, self.large, self.device = small, large, device
-        self.stream = torch.cuda.Stream(device=device)
-        self.fork = torch.cuda.Event(enable_timing=False)
-        self.join = torch.cuda.Event(enable_timing=False)
-        origin = torch.cuda.current_stream(device)
-        self.fork.record(origin)
-        self.stream.wait_event(self.fork)
-        self.join.record(self.stream)
-        origin.wait_event(self.join)
-
-    def __call__(self, *args):
-        import torch
-        origin = torch.cuda.current_stream(self.device)
-        if origin.cuda_stream == self.stream.cuda_stream:
-            raise ValueError("cannot call a plan from its private selector stream")
-        self.fork.record(origin)
-        self.stream.wait_event(self.fork)
-        self.small(*args)
-        with torch.cuda.stream(self.stream):
-            self.large(*args)
-            self.join.record(self.stream)
-        origin.wait_event(self.join)
 
 
 def _tensor(tensor, shape, dtype, device, alignment=4):
@@ -131,6 +100,11 @@ class FusedDecodePlan:
     an int32[B,2048] tensor owned by this plan and overwritten on the next call.
     Native valid lengths/page IDs/schedule preconditions apply. No host read of
     device tensor values is performed in the execution path.
+
+    Candidate capacity is fixed by the selector build (default 32768 per row).
+    Candidate overflow, or a histogram total that differs from a row length
+    (e.g. a NaN score), raises a CUDA device error; rebuild with a larger
+    --candidate-capacity for inputs that exceed the limit.
     """
     def __init__(self, q, cache, weights, *, deepgemm_package=None,
                  selector_dir=None, max_context_len=ENVELOPE):
@@ -155,7 +129,7 @@ class FusedDecodePlan:
             raise ValueError("max_context_len must be in 1..1048576")
         properties = torch.cuda.get_device_properties(self.device)
         if properties.major != 10 or properties.minor != 0 or properties.multi_processor_count != 148:
-            raise ValueError("this selector/diagnostic ABI is qualified for 148-SM B200 only")
+            raise ValueError("this selector ABI is qualified for 148-SM B200 only")
         self.q, self.cache, self.weights = q, cache, weights
         self.max_context_len = max_context_len
         with _IMPORT_LOCK, torch.cuda.device(self.device):
@@ -168,31 +142,29 @@ class FusedDecodePlan:
             self.deepgemm._litetopk_device = self.device.index
         root = Path(selector_dir or HERE / "build/fused").resolve()
         manifest = json.loads((root / "manifest.json").read_text())
-        if (manifest.get("schema") != "sglang-litetopk-fused-selectors-v1"
-                or manifest.get("geometry") != "device_guarded_pair"
-                or manifest.get("cutoff") != 8):
-            raise ValueError("expected the qualified guarded selector pair")
-        self.modules = []
+        capacity = manifest.get("candidate_capacity")
+        if capacity not in (16384, 32768, 65536, 131072):
+            raise ValueError("unsupported selector candidate capacity")
+        expected = dict(schema="sglang-litetopk-fused-selectors-v4", cutoff=8,
+                        histogram_mapping="hybrid1024-fp16rn16-unit-overflow-v1",
+                        workspace_layout="fixed-header-pair-v1", workspace_candidate_offset=4096,
+                        workspace_tail_offset=2048, workspace_bytes=4096 + 160 * capacity * 8,
+                        certificate_miss="error", overflow_policy="error", device_assertions=True)
+        if any(manifest.get(key) != value for key, value in expected.items()):
+            raise ValueError("expected the qualified selector pair")
+        # The 512-thread route serves B <= cutoff; the 1024-thread route serves larger batches.
+        record = manifest["small" if self.rows <= 8 else "large"]
+        _verified(root, record["source"], record["source_sha256"])
+        library = _verified(root, record["library"], record["library_sha256"])
         self._ffi_libraries = [ctypes.CDLL(str(path), mode=ctypes.RTLD_GLOBAL)
                                for path in runtime.find_runtime_libraries(enable_tvm_ffi=True)]
-        for route, threads, unroll in (("small", 512, 1), ("large", 1024, 4)):
-            record = manifest[route]
-            expected = dict(batch=128, bins=1024, max_rows=128, R=1,
-                            threads=threads, u=unroll, candidate_capacity=16384,
-                            workspace_tail_offset=20973568, workspace_bytes=WORKSPACE_BYTES,
-                            dynamic_active_batch=True, certificate_miss="exact_fallback",
-                            device_route=route, cutoff=8, flattened_grid_ctas=128,
-                            diagnostic_records_per_row=1)
-            if any(record.get(key) != value for key, value in expected.items()):
-                raise ValueError(f"{route} selector ABI mismatch")
-            _verified(root, record["source"], record["source_sha256"])
-            library = _verified(root, record["library"], record["library_sha256"])
-            self.modules.append(tvm_ffi.load_module(str(library)))
-        self.fn = _ConcurrentPair(self.modules[0].select, self.modules[1].select, self.device)
+        self.module = tvm_ffi.load_module(str(library))
+        self.fn = self.module.select
+        self.candidate_capacity = capacity
         self.histogram = torch.zeros((self.rows, 1024), dtype=torch.int32, device=self.device)
-        self.diag = torch.empty(148, dtype=torch.int32, device=self.device)
-        self.workspace = torch.zeros(WORKSPACE_BYTES // 4, dtype=torch.int32, device=self.device)
-        self.hints = torch.arange(TOPK, dtype=torch.int32, device=self.device).repeat(self.rows, 1)
+        # 4 KiB of per-row counters, then one slab of `capacity` 8-byte candidates per row.
+        self.workspace = torch.zeros((4096 + self.rows * capacity * 8) // 4,
+                                     dtype=torch.int32, device=self.device)
         self.output = torch.empty((self.rows, TOPK), dtype=torch.int32, device=self.device)
         self.selector_diag = torch.empty((self.rows, 6), dtype=torch.int32, device=self.device)
         self._active = torch.full((1,), self.rows, dtype=torch.int32, device=self.device)
@@ -220,18 +192,15 @@ class FusedDecodePlan:
             raise ValueError("select the plan's CUDA device before calling it")
         # A reused graph requires in-place metadata updates, not new pointers.
         # Hold capture inputs and returned dense buffers for the graph lifetime.
-        dense = self.deepgemm.fp8_paged_mqa_logits_with_histogram(
-            self.q, self.cache, self.weights, lengths.reshape(self.rows, 1), table, schedule,
-            self.max_context_len, self.histogram, self.diag,
-            clean_logits=False, indices=None)
+        dense = self.deepgemm.fp8_fp4_paged_mqa_logits(
+            (self.q, None), self.cache, self.weights, lengths.reshape(self.rows, 1), table, schedule,
+            self.max_context_len, clean_logits=False, indices=None, histogram=self.histogram)
         self.dense = dense
-        pre = (self.max_context_len, dense.stride(0), TOPK, 8192, 4096, 1, 0, 0, 0, 0, 0)
         # Native output is a logical slice of a 256-aligned allocation. Expose
         # its full row stride to the compact-tensor selector ABI without a copy.
         selector_scores = dense.as_strided((self.rows, dense.stride(0)), dense.stride())
-        self.fn(selector_scores, self.hints, self.output, self.workspace, *pre,
-                lengths, 4096, 48, 7168, 0, 0, self.histogram.reshape(-1), self.diag, 1,
-                self.selector_diag, table.reshape(-1), table.shape[1], self.cache.shape[0],
+        self.fn(selector_scores, self.output, self.workspace, self.max_context_len, lengths,
+                self.histogram.reshape(-1), self.selector_diag, table.reshape(-1), table.shape[1],
                 self._active)
         if torch.cuda.is_current_stream_capturing():
             self._owners[(table.data_ptr(), lengths.data_ptr(), schedule.data_ptr(),

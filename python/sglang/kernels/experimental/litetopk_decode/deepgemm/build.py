@@ -16,13 +16,14 @@ SUBMODULES = {
     "cutlass": "f3fde58372d33e9a5650ba7b80fc48b3b49d40c8",
     "fmt": "553ec11ec06fbe0beebfbb45f9dc3c9eabd83d28",
 }
-PATCH_SHA256 = "8f5aab43b32e9c28552e9a752972a826473cac1104bf23ce9b2888a2849f5103"
+PATCH_SHA256 = "4397806ac79b5d03e69761832cc7b55d1ae1035f078460309e47091e57c17548"
+# Four patched files plus the unchanged package __init__.py, which the fused loader cross-checks.
 PATCHED_SOURCES = {
-    "csrc/apis/attention.hpp": "da9e4f586a33d040860d6f6daafa6553c5c3701f94751556b36baac4efd89b4f",
-    "csrc/jit_kernels/impls/sm100_mqa_logits.hpp": "eb80fdfcf8f35448edaca7f6f2e53c84ac3297bfbf8044cb2deda8588064f668",
-    "deep_gemm/__init__.py": "99217d812214c3273c23ea0bd573204994a0a39ef789b8138a8a88c2e0d0b549",
-    "deep_gemm/include/deep_gemm/impls/sm100_mqa_logits.cuh": "6b9a9971bad2086298470df31eab9b51fc43647540c69076b2ee7aa1a97f619b",
-    "deep_gemm/include/deep_gemm/epilogue/coarse_histogram.cuh": "6a8330ba93f82e075fb63f07467647985b53d0e916254d2a68353ee4dd6a7bac",
+    "csrc/apis/attention.hpp": "fe27f86527e76165be99440488d389ac1307ba86f8961830030eded113278e29",
+    "csrc/jit_kernels/impls/sm100_mqa_logits.hpp": "f41527f5717d3c1f7bb1dd289cf6e9b57e26b4eb2a33eb0dc3b5ed786e0272de",
+    "deep_gemm/__init__.py": "05075513e4ddff743bd5d13745cc2c2e4600ae890b0114f5df2094292c4460f9",
+    "deep_gemm/include/deep_gemm/impls/sm100_mqa_logits.cuh": "251ec364232113b0c66b945cd082673f277b704bd2c6b6326faf4abae742fc1b",
+    "deep_gemm/include/deep_gemm/epilogue/coarse_histogram.cuh": "23a0c34fe2485b87891c13dcc8ad24ec6fc7d4b2bb1c8c708696849c0029f486",
 }
 # Unchanged baseline and dependency headers, checked even in containers without Git.
 BASELINE_FILES = {

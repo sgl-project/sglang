@@ -21,7 +21,6 @@ import traceback
 
 HERE = Path(__file__).resolve().parent
 TOPK = 2048
-TAIL_WORD = 20_973_568 // 4
 
 
 def require(condition, message):
@@ -227,34 +226,34 @@ def check_full(torch, plan, dense, inputs, refs):
         strict = set((reference > threshold).nonzero().flatten().tolist())
         require(strict.issubset(set(logical)), f'row {row}: missing strictly greater score')
     require(not bool(plan.histogram.any()), 'histogram was not restored')
-    counters = torch.cat((plan.workspace[:inputs.batch * 2], plan.workspace[320:320 + inputs.batch],
-                          plan.workspace[TAIL_WORD:TAIL_WORD + inputs.batch * 2])).cpu()
-    require(not bool(counters.any()), 'workspace counters were not restored')
-    require(not bool(plan.diag.any()), 'unexpected producer diagnostic on finite valid inputs')
+    require(not bool(plan.workspace.any()), 'workspace was not restored to zero')
     return dict(full_live_score_bits_exact=True, physical_topk_threshold_exact=True,
                 strict_set_complete=True, selected_ids_unique=True, physical_mapping_valid=True,
-                short_row_padding_exact=True, histogram_restored=True, workspace_counters_restored=True,
-                producer_diagnostics_zero=True, selector_diagnostics=plan.selector_diag.cpu().tolist(),
+                short_row_padding_exact=True, histogram_restored=True, workspace_restored=True,
+                selector_diagnostics=plan.selector_diag.cpu().tolist(),
                 row_score_sha256=[score_hash(torch, row) for row in refs])
 
 
 def check_histogram(torch, plan, inputs, refs, schedule):
     histogram = torch.zeros_like(plan.histogram)
-    diag = torch.full_like(plan.diag, 31)
-    dense = plan.deepgemm.fp8_paged_mqa_logits_with_histogram(
-        inputs.q, inputs.cache, inputs.weights, inputs.lengths.reshape(inputs.batch, 1), inputs.table,
-        schedule, inputs.maximum, histogram, diag, clean_logits=False, indices=None)
+    dense = plan.deepgemm.fp8_fp4_paged_mqa_logits(
+        (inputs.q, None), inputs.cache, inputs.weights, inputs.lengths.reshape(inputs.batch, 1), inputs.table,
+        schedule, inputs.maximum, clean_logits=False, indices=None, histogram=histogram)
     actual = [dense[row, :n].detach().cpu().contiguous() for row, n in enumerate(inputs.live)]
     same_scores(torch, actual, refs, 'histogram-only scorer')
     cpu_hist = histogram.cpu().long()
     for row, scores in enumerate(refs):
-        bits = scores.half().view(torch.int16).int() & 65535
-        rank = torch.where((bits & 32768) != 0, bits, (~bits) & 32767)
-        expected = torch.bincount((rank >> 6).long(), minlength=1024)
+        # hybrid1024-fp16rn16-unit-overflow-v1: FP16-RN bins below 16, unit bins saturating at 223
+        bits = scores.view(torch.int32).long() & 0xffffffff
+        magnitude = bits & 0x7fffffff
+        negative = ((bits >> 31) == 1) & (magnitude != 0)
+        code = (scores.half().view(torch.int16).long() & 0x7fff) >> 6
+        bounded = torch.clamp(magnitude - negative.long(), max=0x435f0000).int().view(torch.float32)
+        code = torch.where(code >= 304, torch.clamp(bounded.floor().long() + 288, min=304), code)
+        expected = torch.bincount(torch.where(negative, 512 + code, 511 - code), minlength=1024)
         require(torch.equal(cpu_hist[row], expected), f'row {row}: coarse histogram mismatch')
     require(cpu_hist.sum(1).tolist() == inputs.live, 'histogram totals mismatch')
-    require(not bool(diag.any()), 'histogram scorer did not reset stale diagnostics')
-    return dict(full_live_score_bits_exact=True, all_1024_bins_exact=True, diagnostics_reset=True)
+    return dict(full_live_score_bits_exact=True, all_1024_bins_exact=True)
 
 
 def run_batch(torch, api, baseline, args, batch, record, hashes):
@@ -302,12 +301,10 @@ def run_batch(torch, api, baseline, args, batch, record, hashes):
         same_scores(torch, baseline_after, refs, 'default-after versus private-old')
         baseline.check()
         histogram_check = check_histogram(torch, plan, inputs, refs, schedule)
-        plan.diag.fill_(31)
         plan.output.fill_(-123)
         plan(inputs.table, inputs.lengths, schedule)
         eager = check_full(torch, plan, plan.dense, inputs, refs)
         for _ in range(args.graph_replays):
-            plan.diag.fill_(31)
             plan.output.fill_(-123)
             graph.replay()
             graph_check = check_full(torch, plan, graph_dense, inputs, refs)

@@ -1,10 +1,7 @@
-"""AOT-build the opt-in 1024-bin selector pair for the SGL main Q1 scorer.
+"""AOT-build the LiteTopK decode selector pair (512- and 1024-thread routes) for sm_100a.
 
-Generate and verify sources without CUDA: ``python build_fused.py --check-sources``.
 Build with CUDA_VISIBLE_DEVICES='', MAX_JOBS=1, CUTE_DSL_ARCH=sm_100a.
-The checked-in selector is the final large variant; the small variant changes
-only route ownership and histogram scanning. Trimmed sources have new hashes.
-Compare rebuilt binary hashes with the measured references before qualification.
+``--check-sources`` parses the selector source and prints its hash without CUDA.
 """
 
 from __future__ import annotations
@@ -19,158 +16,89 @@ from pathlib import Path
 import subprocess
 import sys
 
-
 HERE = Path(__file__).resolve().parent
-REFERENCE_LIBRARIES = {
-    "small": "015c4f33e3f1fc0fb1aa8f1ae16d7fe79aef9b58bc9cf1bd5d34317c2f515018",
-    "large": "a38033a368911ef2beaa00bfdb297b027430fea865aaa6afdd080f4e0374ecb2",
-}
-REFERENCE_SOURCES = {
-    "small": "0574e383697ccdec76f6a3c18fc4e6e060a73c8955c1736da4ffeba99898d561",
-    "large": "f200bdabf3aea42dfc4d031a7637de3e45b8662c524f65ce42b11792c8c7737c",
-}
-WORKSPACE_TAIL_OFFSET = 20_973_568
-WORKSPACE_BYTES = WORKSPACE_TAIL_OFFSET + 128 * 8
-
-
-def load(name, path):
-    spec = importlib.util.spec_from_file_location(name, path)
-    if spec is None or spec.loader is None:
-        raise ImportError(path)
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[name] = module
-    spec.loader.exec_module(module)
-    return module
+SOURCE = HERE / "selectors/selector.py"
 
 
 def sha(path):
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
 
 
-def generate_sources():
-    transform = load("_litetopk_fused_source", HERE / "selectors/fused_source.py")
-    if sha(HERE / "vendor/gvr2_topk_decode.py") != transform.VENDOR_SHA256:
-        raise ValueError("selector helper source drift")
-    base = (HERE / "selectors/selector.py").read_text()
-    return {route: transform.source(base, route) for route in ("small", "large")}
-
-
-def require_build_environment():
-    expected = dict(CUDA_VISIBLE_DEVICES="", MAX_JOBS="1", CUTE_DSL_ARCH="sm_100a")
-    actual = {name: os.environ.get(name) for name in expected}
-    if actual != expected:
-        raise RuntimeError(f"required build environment: {expected}; got {actual}")
-
-
-def prepare_output_directory(directory):
-    # The independent DeepGEMM build shares this root under deepgemm/.
-    # Reserve only paths owned by this selector builder, including symlinks.
-    for name in ("manifest.json", "small", "large"):
-        path = directory / name
-        if path.exists() or path.is_symlink():
-            raise FileExistsError(f"refusing to overwrite selector artifacts: {path}")
-    directory.mkdir(parents=True, exist_ok=True)
-
-
-def build_one(directory, route, text):
+def build_one(directory, route, source, capacity):
     import cutlass
     import cutlass.cute as cute
     from cutlass.cute import runtime
 
-    threads, unroll = (512, 1) if route == "small" else (1024, 4)
+    threads = 512 if route == "small" else 1024
     folder = directory / route
     folder.mkdir()
-    generated = folder / "generated.py"
-    generated.write_text(text)
-    # Preserve the qualified derivative's import ABI and compilation module name.
-    load("_gvr_hist_prologue_acqrel_hsplitq_original_20260918", HERE / "vendor/gvr2_topk_decode.py")
-    module = load(f"_dynamic128v6_{route}", generated)
+    copy = folder / "selector.py"
+    copy.write_text(source)
+    spec = importlib.util.spec_from_file_location(f"litetopk_{route}", copy)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
 
     def fake(dtype, rank, align=16):
         return runtime.make_fake_compact_tensor(
             dtype, tuple(cute.sym_int() for _ in range(rank)),
-            stride_order=tuple(reversed(range(rank))), assumed_align=align,
-        )
+            stride_order=tuple(reversed(range(rank))), assumed_align=align)
 
-    kernel = module.SplitQAcqRelHistogramPrologueGvrKernel(threads, unroll)
     compiled = cute.compile(
-        kernel,
-        fake(cutlass.Float32, 2),
-        fake(cutlass.Int32, 2),
-        fake(cutlass.Int32, 2),
-        fake(cutlass.Int32, 1),
-        *([cutlass.Int32(0)] * 11),
-        fake(cutlass.Int32, 1, 4),
-        *([cutlass.Int32(0)] * 5),
-        fake(cutlass.Int32, 1),
-        fake(cutlass.Int32, 1, 4),
-        cutlass.Int32(0),
-        fake(cutlass.Int32, 2),
-        fake(cutlass.Int32, 1, 4),
-        cutlass.Int32(0),
-        cutlass.Int32(0),
-        fake(cutlass.Int32, 1, 4),
+        module.HistogramSelector(threads, capacity),
+        fake(cutlass.Float32, 2),  # scores
+        fake(cutlass.Int32, 2),  # output
+        fake(cutlass.Int32, 1),  # workspace
+        cutlass.Int32(0),  # logical length envelope
+        fake(cutlass.Int32, 1, 4),  # per-row lengths
+        fake(cutlass.Int32, 1),  # histogram
+        fake(cutlass.Int32, 2),  # selector diagnostics
+        fake(cutlass.Int32, 1, 4),  # page table
+        cutlass.Int32(0),  # page-table row stride
+        fake(cutlass.Int32, 1, 4),  # active rows
         stream=runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
-        options="--enable-tvm-ffi --gpu-arch sm_100a",
-    )
+        options="--enable-tvm-ffi --gpu-arch sm_100a --enable-assertions")
     obj, library = folder / "select.o", folder / "select.so"
     compiled.export_to_c(str(obj), function_name="select")
-    runtime_libraries = runtime.find_runtime_libraries(enable_tvm_ffi=True)
-    command = ["gcc", "-shared", "-o", str(library), str(obj), *map(str, runtime_libraries)]
-    subprocess.run(command, check=True)
-    return dict(
-        name=f"dynamic128v6_{route}", batch=128, max_rows=128, bins=1024,
-        threads=threads, u=unroll, R=1, diagnostic_records_per_row=1,
-        flattened_grid_ctas=128, device_route=route, cutoff=8,
-        runtime_row_parts="active<=2:64, <=8:16, <=16:8, <=32:4, <=64:2, else:1",
-        geometry=f"flat128_guarded_{route}", dynamic_active_batch=True,
-        candidate_capacity=16384, workspace_tail_offset=WORKSPACE_TAIL_OFFSET,
-        workspace_bytes=WORKSPACE_BYTES, adaptive=False,
-        certificate_miss="exact_fallback", sampling=True,
-        source=f"{route}/generated.py", source_sha256=sha(generated),
-        reference_source_sha256=REFERENCE_SOURCES[route],
-        library=f"{route}/select.so", library_sha256=sha(library),
-        reference_library_sha256=REFERENCE_LIBRARIES[route],
-        matches_reference_binary=sha(library) == REFERENCE_LIBRARIES[route],
-        link_command=command,
-    )
+    subprocess.run(["gcc", "-shared", "-o", str(library), str(obj),
+                    *map(str, runtime.find_runtime_libraries(enable_tvm_ffi=True))], check=True)
+    return dict(threads=threads, source=f"{route}/selector.py", source_sha256=sha(copy),
+                library=f"{route}/select.so", library_sha256=sha(library))
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output-dir", type=Path, default=HERE / "build/fused")
     parser.add_argument("--check-sources", action="store_true")
+    parser.add_argument("--candidate-capacity", type=int, default=32768,
+                        choices=(16384, 32768, 65536, 131072),
+                        help="per-row candidate limit; overflow raises a CUDA device error")
     args = parser.parse_args()
-    sources = (HERE / "build_fused.py", HERE / "selectors/selector.py",
-               HERE / "selectors/fused_source.py", HERE / "vendor/gvr2_topk_decode.py")
-    hashes = {str(path.relative_to(HERE)): sha(path) for path in sources}
-    texts = generate_sources()
-    source_hashes = {name: hashlib.sha256(text.encode()).hexdigest() for name, text in texts.items()}
+    source = SOURCE.read_text()
+    compile(source, str(SOURCE), "exec")
     if args.check_sources:
-        print(json.dumps(dict(status="ok", source_hashes=source_hashes,
-                              source_dependencies=hashes), indent=2))
+        print(json.dumps(dict(status="ok", source_sha256=sha(SOURCE)), indent=2))
         return
-    require_build_environment()
-    import torch
-
-    if torch.cuda.is_initialized():
-        raise RuntimeError("build must start before CUDA initialization")
+    expected = dict(CUDA_VISIBLE_DEVICES="", MAX_JOBS="1", CUTE_DSL_ARCH="sm_100a")
+    if any(os.environ.get(name) != value for name, value in expected.items()):
+        raise RuntimeError(f"required build environment: {expected}")
     directory = args.output_dir.resolve()
-    prepare_output_directory(directory)
-    records = {route: build_one(directory, route, text) for route, text in texts.items()}
-    if any(sha(HERE / name) != digest for name, digest in hashes.items()):
+    # The DeepGEMM build shares this root under deepgemm/; only the selector paths are reserved.
+    for name in ("manifest.json", "small", "large"):
+        if (directory / name).exists() or (directory / name).is_symlink():
+            raise FileExistsError(f"refusing to overwrite selector artifacts: {directory / name}")
+    directory.mkdir(parents=True, exist_ok=True)
+    records = {route: build_one(directory, route, source, args.candidate_capacity) for route in ("small", "large")}
+    if SOURCE.read_text() != source:
         raise RuntimeError("source changed during the build")
     manifest = dict(
-        schema="sglang-litetopk-fused-selectors-v1", status="built",
-        name="dynamic128v6_guarded_pair", geometry="device_guarded_pair", cutoff=8,
-        target="sm_100a", bins=1024, max_rows=128, envelope=1048576, topk=2048,
-        page_size=64, producer_diagnostics_words=148,
-        workspace_tail_offset=WORKSPACE_TAIL_OFFSET, workspace_bytes=WORKSPACE_BYTES,
-        source_dependencies=hashes, torch=torch.__version__, torch_cuda=torch.version.cuda,
+        schema="sglang-litetopk-fused-selectors-v4", target="sm_100a", cutoff=8,
+        histogram_mapping="hybrid1024-fp16rn16-unit-overflow-v1", candidate_capacity=args.candidate_capacity,
+        workspace_layout="fixed-header-pair-v1", workspace_candidate_offset=4096, workspace_tail_offset=2048,
+        workspace_bytes=4096 + 160 * args.candidate_capacity * 8,
+        certificate_miss="error", overflow_policy="error", device_assertions=True,
         versions={name: importlib.metadata.version(name) for name in
                   ("nvidia-cutlass-dsl", "apache-tvm-ffi", "cuda-python")},
-        source_provenance="Specialized V6 decode selector; unsupported compile-time branches removed, exact fallback and physical mapping retained. Source hashes differ from the measured snapshot; reference binary hashes are recorded separately.",
-        binary_validation="Compare source/library hashes and qualify rebuilt artifacts before claiming new-toolchain performance.",
         **records,
     )
     (directory / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
