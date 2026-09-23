@@ -224,6 +224,15 @@ def _k3_bf16_gemm(
 # chain + o_norm here.
 
 
+def _merge_dtype_ok(weights: list[torch.Tensor]) -> bool:
+    """Return whether these weights may be concatenated into one fused buffer.
+
+    _merge_weights_as_views cats .weight alone, so anything carrying a separate
+    scale tensor (per-channel FP8, packed MXFP4) must stay unfused."""
+    dtypes = {weight.dtype for weight in weights}
+    return len(dtypes) == 1 and dtypes.pop() in (torch.bfloat16, torch.float16)
+
+
 def _merge_weights_as_views(
     mods: list, pad_rows_to: int = 1
 ) -> tuple[torch.Tensor, list[int]]:
@@ -1850,6 +1859,10 @@ class KimiK3DeltaAttention(nn.Module):
         else:
             if any(getattr(mod, "weight", None) is None for mod in mods):
                 return
+            # Leave a quantized checkpoint on the unfused b_proj/f_a_proj GEMVs;
+            # the merged buffer would drop their scales.
+            if not _merge_dtype_ok([mod.weight for mod in mods]):
+                return
             self._bfa_w, sizes = _merge_weights_as_views(mods, pad_rows_to=8)
             self._bfa_f_b_w = self.f_b_proj.weight
         self._bfa_fa_size, self._bfa_b_size = sizes
@@ -1904,6 +1917,11 @@ class KimiK3DeltaAttention(nn.Module):
             return False
         ws = [m.weight for m in (self.fused_qkvg_proj, self.f_a_proj, self.b_proj)]
         if not all(type(w.data) is torch.Tensor and w.dim() == 2 for w in ws):
+            return False
+        # Whitelist the dtype rather than only require the three to agree: the
+        # merged buffer carries only .weight, so quantized weights that happen to
+        # match each other still lose their per-channel scales.
+        if not _merge_dtype_ok(ws):
             return False
         return len({(w.dtype, w.shape[1]) for w in ws}) == 1
 
@@ -3421,12 +3439,44 @@ class KimiK3LinearForCausalLM(nn.Module):
                 self_attn.use_deep_gemm_bmm = False
                 continue
             kv_b_weight = _get_k3_dense_weight(self_attn.kv_b_proj)
+            scale_folded_into_weight = False
+            if _is_hip and kv_b_weight.dtype in (
+                torch.float8_e4m3fn,
+                torch.float8_e4m3fnuz,
+            ):
+                scale = getattr(self_attn.kv_b_proj, "weight_scale", None)
+                if isinstance(scale, torch.Tensor) and scale.numel() > 1:
+                    from sglang.srt.models.kimi_k3_rocm_quant import (
+                        _k3_channel_fp8_to_bf16,
+                    )
+
+                    # Fold the per-channel scale while dim 0 is still the
+                    # channel axis it indexes, i.e. before the head split.
+                    kv_b_weight = _k3_channel_fp8_to_bf16(
+                        self_attn.kv_b_proj, kv_b_weight
+                    )
+                    scale_folded_into_weight = True
             w_kc, w_vc = kv_b_weight.unflatten(
                 0, (-1, self_attn.qk_nope_head_dim + self_attn.v_head_dim)
             ).split([self_attn.qk_nope_head_dim, self_attn.v_head_dim], dim=1)
             self_attn.w_kc = w_kc.transpose(1, 2).contiguous().transpose(1, 2)
             self_attn.w_vc = w_vc.contiguous().transpose(1, 2)
-            if hasattr(self_attn.kv_b_proj, "weight_scale"):
+            kv_b_scale = getattr(self_attn.kv_b_proj, "weight_scale", None)
+            if _is_hip and (
+                scale_folded_into_weight
+                or not (
+                    isinstance(kv_b_scale, torch.Tensor) and kv_b_scale.numel() == 1
+                )
+            ):
+                # aiter's absorb GEMM dereferences w_scale as one scalar. A scale
+                # folded into the now-bf16 w_kc/w_vc, a vector the branch above
+                # could not fold, or the None quark leaves on a dequantized
+                # narrow partition must keep DeepseekV2AttentionMLA's 1.0
+                # default. Skip the assignment rather than reset afterwards:
+                # assigning a Parameter registers it, and nn.Module then refuses
+                # a float in its place.
+                pass
+            elif hasattr(self_attn.kv_b_proj, "weight_scale"):
                 self_attn.w_scale = self_attn.kv_b_proj.weight_scale
 
         # Post-load: precompute the attn-res combined score weights BEFORE
