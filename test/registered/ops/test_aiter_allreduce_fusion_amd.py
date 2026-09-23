@@ -13,8 +13,9 @@ import torch
 
 from sglang.srt.layers import communicator as comm
 from sglang.srt.layers.communicator import LayerCommunicator, ScatterMode
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.test.ci.ci_register import register_amd_ci
-from sglang.test.test_utils import CustomTestCase
+from sglang.test.test_utils import CustomTestCase, publish_build_topology
 
 register_amd_ci(est_time=240, suite="stage-c-test-large-8-gpu-amd")
 
@@ -64,7 +65,8 @@ def _run_residual_accuracy_check():
         distributed_init_method="env://",
         backend="nccl",
     )
-    initialize_model_parallel(tensor_model_parallel_size=world_size)
+    publish_build_topology(tp_size=world_size, world_rank=rank)
+    initialize_model_parallel()
 
     dtype = torch.bfloat16
     eps = 1e-6
@@ -357,8 +359,11 @@ def _fake_self(*, mlp_mode=ScatterMode.TP_ATTN_FULL, is_last_layer=False, tp_siz
     )
 
 
-def _fake_forward_batch(batch_size=8):
-    return types.SimpleNamespace(input_ids=types.SimpleNamespace(shape=(batch_size,)))
+def _fake_forward_batch(batch_size=8, forward_mode=ForwardMode.DECODE):
+    return types.SimpleNamespace(
+        input_ids=types.SimpleNamespace(shape=(batch_size,)),
+        forward_mode=forward_mode,
+    )
 
 
 class TestAiterAllreduceFusionGate(CustomTestCase):
@@ -386,6 +391,9 @@ class TestAiterAllreduceFusionGate(CustomTestCase):
         mlp_mode=ScatterMode.TP_ATTN_FULL,
         is_last_layer=False,
         tp_size=8,
+        forward_mode=ForwardMode.DECODE,
+        disable_in_prefill=False,
+        disable_in_decode=False,
     ):
         """Run the gate with the aiter branch isolated (flashinfer forced off)."""
         a2a_backend = types.SimpleNamespace(is_none=lambda: a2a_is_none)
@@ -424,7 +432,9 @@ class TestAiterAllreduceFusionGate(CustomTestCase):
 
             stack.enter_context(
                 get_context().override_server_args(
-                    enable_aiter_allreduce_fusion=aiter_enabled
+                    enable_aiter_allreduce_fusion=aiter_enabled,
+                    disable_aiter_allreduce_fusion_in_prefill=disable_in_prefill,
+                    disable_aiter_allreduce_fusion_in_decode=disable_in_decode,
                 )
             )
 
@@ -437,7 +447,7 @@ class TestAiterAllreduceFusionGate(CustomTestCase):
                 mlp_mode=mlp_mode, is_last_layer=is_last_layer, tp_size=tp_size
             )
             return LayerCommunicator.should_fuse_mlp_allreduce_with_next_layer(
-                fake_self, _fake_forward_batch()
+                fake_self, _fake_forward_batch(forward_mode=forward_mode)
             )
 
     def test_dense_tp_fuses(self):
@@ -477,6 +487,69 @@ class TestAiterAllreduceFusionGate(CustomTestCase):
         self.assertFalse(
             self._evaluate_gate(dp_attention=False, a2a_is_none=True, tp_size=1)
         )
+
+    PREFILL_MODES = (ForwardMode.EXTEND, ForwardMode.MIXED, ForwardMode.SPLIT_PREFILL)
+    DECODE_MODES = (
+        ForwardMode.DECODE,
+        ForwardMode.TARGET_VERIFY,
+        ForwardMode.DRAFT_EXTEND_V2,
+        ForwardMode.IDLE,
+    )
+
+    def test_prefill_opt_out_disables_fusion_in_prefill_only(self):
+        for mode in self.PREFILL_MODES:
+            with self.subTest(forward_mode=mode):
+                self.assertFalse(
+                    self._evaluate_gate(
+                        dp_attention=False,
+                        a2a_is_none=True,
+                        forward_mode=mode,
+                        disable_in_prefill=True,
+                    )
+                )
+        for mode in self.DECODE_MODES:
+            with self.subTest(forward_mode=mode):
+                self.assertTrue(
+                    self._evaluate_gate(
+                        dp_attention=False,
+                        a2a_is_none=True,
+                        forward_mode=mode,
+                        disable_in_prefill=True,
+                    )
+                )
+
+    def test_decode_opt_out_disables_fusion_in_decode_only(self):
+        for mode in self.DECODE_MODES:
+            with self.subTest(forward_mode=mode):
+                self.assertFalse(
+                    self._evaluate_gate(
+                        dp_attention=False,
+                        a2a_is_none=True,
+                        forward_mode=mode,
+                        disable_in_decode=True,
+                    )
+                )
+        for mode in self.PREFILL_MODES:
+            with self.subTest(forward_mode=mode):
+                self.assertTrue(
+                    self._evaluate_gate(
+                        dp_attention=False,
+                        a2a_is_none=True,
+                        forward_mode=mode,
+                        disable_in_decode=True,
+                    )
+                )
+
+    def test_no_phase_opt_out_fuses_everywhere(self):
+        for mode in self.PREFILL_MODES + self.DECODE_MODES:
+            with self.subTest(forward_mode=mode):
+                self.assertTrue(
+                    self._evaluate_gate(
+                        dp_attention=False,
+                        a2a_is_none=True,
+                        forward_mode=mode,
+                    )
+                )
 
 
 if __name__ == "__main__":

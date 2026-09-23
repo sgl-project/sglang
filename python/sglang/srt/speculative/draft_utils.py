@@ -1,6 +1,6 @@
 from typing import Optional
 
-from sglang.srt.layers.attention.qsa.config import QSA_VARIANT_COMPRESSED, QSAProfile
+from sglang.srt.layers.attention.qsa.config import QSAProfile
 from sglang.srt.runtime_context import attention_backends, get_spec
 from sglang.srt.utils.common import (
     cpu_has_amx_support,
@@ -175,10 +175,6 @@ class DraftBackendFactory:
         backend.decode_attention_backend_str = "qsa"
 
     def _create_qwen_qsa_draft_extend_backend(self):
-        if self.qsa_profile.variant != QSA_VARIANT_COMPRESSED:
-            # Tokenwise QSA has no graph-stable indexer metadata: draft extend
-            # stays eager instead of falling back to a dense backend.
-            return None
         from sglang.srt.layers.attention.qwen_sparse_attn_backend import (
             QwenSparseAttnBackend,
         )

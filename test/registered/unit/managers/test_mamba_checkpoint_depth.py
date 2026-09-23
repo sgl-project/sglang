@@ -3,7 +3,10 @@
 DCP widens the tree page past the mamba chunk grid. A checkpoint picked on the
 finer grid names a depth no radix node can carry, so it gets attached to the
 preceding node and a later request resumes from a state that already covers
-tokens past that node.
+tokens past that node. The same happens when the depth is measured from a
+prefix that a chunked prefill left on the scheduler page but off the widened
+tree page: 64 + 512 = 576 is no 512-page boundary, and the finished request
+then frees two kv-row segments that share the page holding 576.
 """
 
 import unittest
@@ -27,8 +30,9 @@ register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 CHUNK = 64
 
 
-def _track_seqlen(*, tree_page: int, prefix_len: int, extend_len: int) -> int:
-    """Run one extend through the tracker and report the donated depth."""
+def _track_seqlen(*, tree_page: int, prefix_len: int, extend_len: int) -> int | None:
+    """Run one extend through the tracker and report the donated depth, or
+    None when the extend donates no checkpoint."""
     server_args = ServerArgs(model_path="dummy", page_size=CHUNK)
     # The property would otherwise load the HF config for the dummy model.
     server_args._mamba_cache_chunk_size = CHUNK
@@ -57,7 +61,10 @@ def _track_seqlen(*, tree_page: int, prefix_len: int, extend_len: int) -> int:
     batch.req_to_token_pool = MagicMock()
     batch.req_to_token_pool.get_mamba_ping_pong_other_idx.return_value = 1
 
-    batch._mamba_radix_cache_v2_req_prepare_for_extend(req)
+    entry = batch._mamba_radix_cache_v2_req_prepare_for_extend(req)
+    if not entry.track_mask:
+        assert req.kv.mamba_last_track_seqlen is None
+        return None
     return req.kv.mamba_last_track_seqlen
 
 
@@ -72,6 +79,25 @@ class TestMambaCheckpointDepth(unittest.TestCase):
     def test_unwidened_tree_page_keeps_the_chunk_grid(self):
         depth = _track_seqlen(tree_page=CHUNK, prefix_len=16384, extend_len=4066)
         self.assertEqual(depth, 20416)
+
+    def test_depth_is_picked_on_the_absolute_grid(self):
+        # (tree_page, prefix_len, extend_len) -> donated depth, or None when the
+        # extend crosses no page or the prefix is off the kernel chunk grid.
+        for tree_page, prefix_len, extend_len, expected in (
+            (512, 64, 540, 512),
+            (512, 448, 128, 512),
+            (512, 64, 400, None),
+            (512, 37, 540, None),
+        ):
+            with self.subTest(prefix_len=prefix_len, extend_len=extend_len):
+                self.assertEqual(
+                    _track_seqlen(
+                        tree_page=tree_page,
+                        prefix_len=prefix_len,
+                        extend_len=extend_len,
+                    ),
+                    expected,
+                )
 
 
 class TestMambaTrackGrid(unittest.TestCase):

@@ -33,7 +33,8 @@ RUN if [ "$TARGETARCH" = "amd64" ]; then \
       echo "Unsupported TARGETARCH: $TARGETARCH"; exit 1; \
     fi
 
-WORKDIR /sgl-workspace
+# Set workspace directory
+WORKDIR /sgl-workspace/sglang
 
 # Define environments
 ENV DEBIAN_FRONTEND=noninteractive
