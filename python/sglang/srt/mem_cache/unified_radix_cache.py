@@ -355,7 +355,7 @@ class UnifiedRadixCache(BasePrefixCache):
                 data,
                 group_src=self.pp_rank - 1,
                 group=self.pp_group,
-                tag=P2PTag.HIRADIX_PP_SYNC,
+                tag=P2PTag.HICACHE_PP_SYNC,
             )
         if self.pp_rank + 1 < self.pp_size:
             copy_of_data = data.clone()
@@ -363,7 +363,7 @@ class UnifiedRadixCache(BasePrefixCache):
                 copy_of_data,
                 group_dst=self.pp_rank + 1,
                 group=self.pp_group,
-                tag=P2PTag.HIRADIX_PP_SYNC,
+                tag=P2PTag.HICACHE_PP_SYNC,
             )
             self.work_list.append(send_work)
 
@@ -3477,8 +3477,8 @@ class UnifiedRadixCache(BasePrefixCache):
     def is_load_back_event_done(self, consumer_index: int) -> bool:
         """Return True after the local load-back event is complete.
 
-        Mirrors ``HiRadixCache`` so the disagg decode restore state machine
-        (``DecodeHiCacheTransferMixin``) can gate on load-back completion; the
+        Lets the disagg decode restore state machine
+        (``DecodeHiCacheTransferMixin``) gate on load-back completion; the
         controller-level ``layer_done_counter`` event is shared across cache
         implementations, while the tree-side bookkeeping runs in
         ``loading_check``.
