@@ -17,6 +17,7 @@ from sglang.benchmark.datasets.common import (
     DatasetRow,
     compute_random_lens,
     gen_prompt,
+    get_available_tokens,
 )
 
 
@@ -51,6 +52,7 @@ class GeneratedSharedPrefixDataset(BaseDataset):
     ordered: bool
     group_distribution: str = "uniform"
     zipf_alpha: Optional[float] = None
+    input_ids: bool = False
 
     @classmethod
     def from_args(cls, args: Namespace) -> "GeneratedSharedPrefixDataset":
@@ -97,6 +99,7 @@ class GeneratedSharedPrefixDataset(BaseDataset):
             ordered=getattr(args, "gsp_ordered", False),
             group_distribution=group_distribution,
             zipf_alpha=zipf_alpha,
+            input_ids=getattr(args, "gsp_input_ids", False),
         )
 
     def load(
@@ -117,6 +120,7 @@ class GeneratedSharedPrefixDataset(BaseDataset):
             ordered=self.ordered,
             group_distribution=self.group_distribution,
             zipf_alpha=self.zipf_alpha,
+            input_ids=self.input_ids,
         )
 
 
@@ -130,6 +134,7 @@ def get_gen_prefix_cache_path(
     tokenizer,
     group_distribution: str = "uniform",
     zipf_alpha: Optional[float] = None,
+    input_ids: bool = False,
 ):
     """Create cache directory under ~/.cache/sglang/benchmark.
 
@@ -142,6 +147,10 @@ def get_gen_prefix_cache_path(
     suffix = ""
     if group_distribution != "uniform":
         suffix = f"_{group_distribution}_{zipf_alpha}"
+    # input_ids payloads are raw token-id lists, not decoded text; keep them
+    # under a distinct key so a text-mode cache is never loaded as ids.
+    if input_ids:
+        suffix += "_ids"
 
     cache_key = (
         f"gen_shared_prefix_{seed}_{num_groups}_{prompts_per_group}_"
@@ -166,6 +175,7 @@ def sample_generated_shared_prefix_requests(
     ordered: bool = False,
     group_distribution: str = "uniform",
     zipf_alpha: Optional[float] = None,
+    input_ids: bool = False,
 ) -> List[DatasetRow]:
     """Generate benchmark requests with shared system prompts using random tokens and caching.
 
@@ -190,6 +200,7 @@ def sample_generated_shared_prefix_requests(
         tokenizer,
         group_distribution=group_distribution,
         zipf_alpha=zipf_alpha,
+        input_ids=input_ids,
     )
     # range_ratio != 1 / num_turns > 1 perturb the payload but are not in the
     # cache key; send_routing_key embeds a per-run uuid + timestamp that is
@@ -233,17 +244,26 @@ def sample_generated_shared_prefix_requests(
     ).reshape(num_groups, prompts_per_group)
     del system_prompt_len, question_len, output_len
 
-    system_prompts = [
-        gen_prompt(tokenizer, system_prompt_lens[i]) for i in range(num_groups)
-    ]
+    # input_ids emits raw token-id lists so the server receives ids directly and
+    # skips tokenization before prefill; the text path decodes ids back to a
+    # string that the server then re-encodes.
+    if input_ids:
+        available_tokens = get_available_tokens(tokenizer)
+
+        def _gen(token_num):
+            return random.choices(available_tokens, k=int(token_num))
+
+    else:
+
+        def _gen(token_num):
+            return gen_prompt(tokenizer, int(token_num))
+
+    system_prompts = [_gen(system_prompt_lens[i]) for i in range(num_groups)]
 
     # shape: (num_groups, prompts_per_group, num_turns)
     questions = [
         [
-            [
-                gen_prompt(tokenizer, int(question_lens[g, p, t]))
-                for t in range(num_turns)
-            ]
+            [_gen(int(question_lens[g, p, t])) for t in range(num_turns)]
             for p in range(prompts_per_group)
         ]
         for g in range(num_groups)
@@ -281,9 +301,20 @@ def sample_generated_shared_prefix_requests(
             else None
         )
         turn_questions = questions[src_g][src_p]
-        turn_prompts = [f"{system_prompt}\n\n{turn_questions[0]}"] + turn_questions[1:]
+        # ids path concatenates lists; text path concatenates strings.
+        if input_ids:
+            turn_prompts = [system_prompt + turn_questions[0]] + turn_questions[1:]
+        else:
+            turn_prompts = [
+                f"{system_prompt}\n\n{turn_questions[0]}"
+            ] + turn_questions[1:]
         full_prompt = turn_prompts[0] if num_turns == 1 else turn_prompts
-        prompt_len = 1 if fast_prepare else len(tokenizer.encode(turn_prompts[0]))
+        if input_ids:
+            prompt_len = len(turn_prompts[0])
+        elif fast_prepare:
+            prompt_len = 1
+        else:
+            prompt_len = len(tokenizer.encode(turn_prompts[0]))
         output_len_val = int(output_lens[src_g, src_p])
 
         input_requests.append(
@@ -308,7 +339,8 @@ def sample_generated_shared_prefix_requests(
     if group_distribution == "zipf":
         print(f"Zipf alpha: {zipf_alpha}")
     print(f"Total prompts: {len(input_requests)}")
-    if not fast_prepare:
+    # input_ids stores raw id lists, so tokenizer.encode() on them is meaningless.
+    if not fast_prepare and not input_ids:
         print(f"Total input tokens: {total_input_tokens}")
         print(f"Total output tokens: {total_output_tokens}")
         print(

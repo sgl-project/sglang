@@ -2667,6 +2667,11 @@ def cli_main():
         help="Speedup preparing by removing statistics computation, which will make some output statistics inaccurate but suitable for pressure tests.",
     )
     group.add_argument(
+        "--gsp-input-ids",
+        action="store_true",
+        help="Send raw random token ids as input_ids instead of decoded text, so the server skips tokenization before prefill. Statistics are suppressed like --gsp-fast-prepare; use for pure prefill/decode pressure tests.",
+    )
+    group.add_argument(
         "--gsp-send-routing-key",
         action="store_true",
         help="Send routing key in requests via X-SMG-Routing-Key header. Requests with the same prefix share the same routing key.",
