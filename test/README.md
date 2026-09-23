@@ -58,6 +58,30 @@ python3 test/run_suite.py --hw cuda --suite base-b-test-1-gpu-small \
     --auto-partition-id 0 --auto-partition-size 4
 ```
 
+## Run the HiCache Regression Group
+
+On a pull request, comment `/rerun-group hicache-all` to run the cross-directory
+HiCache and unified radix cache regression group. It includes the CPU/CUDA tests
+in `registered/hicache/`, `registered/e2e/hicache/`, and the entire
+`registered/radix_cache/unified_radix_tree/` subtree (including linker tests),
+plus related host-pool, storage, scheduler, PD, model, kernel, and tree tests.
+The registered HiCache transfer benchmark is included as well. Mixed-purpose
+test files run in full, including their accuracy and non-HiCache cases.
+
+The group uses the explicit file list in
+[`scripts/ci/rerun_test_groups.json`](../scripts/ci/rerun_test_groups.json).
+Add new HiCache or unified radix regression files to that list, and update it
+when moving or deleting a listed file. Each file keeps its own CI registration
+and runner requirements. `/rerun-group hicache` and
+`/rerun-group radix_cache/unified_radix_tree` remain smaller directory-based
+entry points.
+
+The rerun dispatcher supports CPU and CUDA registrations. Manual tests and
+AMD/NPU/XPU-only tests remain in their respective workflows; this includes
+`test_hicache_storage_umbp_backend.py` and `test_umbp_store.py`, which are AMD-only.
+Shared files with CPU/CUDA registrations are included, but this command does not
+run their other backend registrations.
+
 ## CI Registration
 
 Every CI-discovered test file must call a registration function at module level:
