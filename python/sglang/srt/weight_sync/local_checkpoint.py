@@ -130,7 +130,10 @@ def _new_hasher(algorithm: str):
 
         return xxhash.xxh3_128()
     if algorithm == "blake3":
-        import blake3
+        try:
+            import blake3
+        except ImportError as e:
+            raise ImportError("blake3 checksums need `pip install blake3`") from e
 
         return blake3.blake3()
     if algorithm == "adler32":
@@ -255,6 +258,8 @@ def _apply_delta(local_checkpoint_dir: str, version_dir: str) -> None:
     encoding = meta["delta_encoding"]
     algorithm = meta["checksum_format"]
     locations = _tensor_locations(local_checkpoint_dir)
+    # an unusable checksum format must fail before the local checkpoint is touched
+    _new_hasher(algorithm)
     # xor is not idempotent: a retry over half-patched bytes must reseed, not xor again
     _clear_applied_version(local_checkpoint_dir)
     open_mmaps = {}
