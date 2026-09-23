@@ -361,7 +361,10 @@ class TestLayerNorm:
         weight_dtype: torch.dtype,
         bias_dtype: Optional[torch.dtype],
     ) -> None:
-        """CPU LayerNorm must support independent input and parameter dtypes."""
+        """CPU LayerNorm supports mixed input/parameter dtypes, but one parameter dtype."""
+        if bias_dtype is not None and bias_dtype != weight_dtype:
+            pytest.skip("weight and bias must have the same dtype")
+
         shape = [8, hidden_size] if ndim == 2 else [8, 3, hidden_size]
         x = make_non_contiguous(torch.randn(shape, dtype=input_dtype))
         weight = torch.randn(hidden_size, dtype=weight_dtype)
@@ -396,6 +399,15 @@ class TestLayerNorm:
             torch.testing.assert_close(
                 residual, expected_residual, atol=atol, rtol=rtol
             )
+
+    def test_layernorm_rejects_mismatched_parameter_dtypes(self) -> None:
+        hidden_size = 128
+        x = torch.randn(8, hidden_size, dtype=torch.bfloat16)
+        weight = torch.randn(hidden_size, dtype=torch.bfloat16)
+        bias = torch.randn(hidden_size, dtype=torch.float32)
+
+        with pytest.raises(RuntimeError, match="bias dtype to match weight dtype"):
+            torch.ops.sgl_kernel.layernorm_cpu(x, weight, bias, eps)
 
 
 class TestFusedQKGemmaRMSNorm:
