@@ -91,6 +91,13 @@ class CompressedTensorsW4AFP8MoE(CompressedTensorsMoEScheme):
         self.weight_quant = weight_quant
         self.input_quant = input_quant
 
+        if self.group_size != 128:
+            raise ValueError(
+                "CompressedTensorsW4AFP8MoE requires group_size=128 "
+                f"(cutlass_w4a8_moe chunk_size); got {self.group_size}. "
+                "Requantize with group_size=128."
+            )
+
         assert config.symmetric, "Only symmetric quantization is supported"
         assert (
             self.quant_config.quant_format == CompressionFormat.pack_quantized.value
@@ -298,7 +305,6 @@ class CompressedTensorsW4AFP8MoE(CompressedTensorsMoEScheme):
         topk_output = dispatch_output.topk_output
         topk_weights, topk_ids, _ = topk_output
 
-        # TODO: currently, group_size is hardcoded to 128 in the cutlass_w4a8_moe kernel.
         output = cutlass_w4a8_moe(
             x,
             layer.w13_weight_packed,
@@ -321,5 +327,6 @@ class CompressedTensorsW4AFP8MoE(CompressedTensorsMoEScheme):
             layer.a13_scale,
             layer.a2_scale,
             routed_scaling_factor=self.moe_runner_config.routed_scaling_factor or 1.0,
+            group_size=self.group_size,
         )
         return StandardCombineInput(hidden_states=output)
