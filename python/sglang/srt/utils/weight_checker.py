@@ -8,6 +8,7 @@ import torch.distributed as dist
 from pydantic import BaseModel, ConfigDict
 
 from sglang.srt.managers.mm_utils import tensor_hash
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils.weight_checker_comparator import (
     CHUNK_NUMEL,
     ComparableWeight,
@@ -49,10 +50,13 @@ class CheckEntry(NamedTuple):
 class QuantizedWeight(NamedTuple):
     comparable_cls: type[ComparableWeight]
     scale_name: str
+    is_shuffled: bool = False
 
 
 _NON_PERSISTENT_BUFFER_PATTERNS = (
     "cos_sin_cache",
+    "cos_cache",
+    "sin_cache",
     "inv_freq",
     "freqs_cis",
     "expert_mask_gpu",
@@ -64,9 +68,20 @@ def _is_non_persistent_buffer_name(name: str) -> bool:
 
 
 class WeightChecker:
-    def __init__(self, *, get_model: Callable[[], Any], ps: Any):
+    def __init__(self, *, get_model: Callable[[], Any]):
         self._get_model = get_model
-        self._ps = ps
+        # Capture the runner placement before its draft scope exits.
+        parallel = get_parallel()
+        self._placement = ParallelismInfo(
+            tp_rank=parallel.tp_rank,
+            tp_size=parallel.tp_size,
+            dp_rank=parallel.dp_rank if parallel.dp_rank is not None else 0,
+            dp_size=parallel.attn_dp_size,
+            pp_rank=parallel.pp_rank,
+            pp_size=parallel.pp_size,
+            rank=0,
+            size=1,
+        )
         self._snapshot_tensors = None
 
     def handle(self, action: str, allow_quant_error: bool = False) -> Optional[Dict]:
@@ -89,9 +104,9 @@ class WeightChecker:
             (name, param.data.detach().cpu()) for name, param in self._model_state()
         ]
         self._snapshot_tensors = dict(named_tensors)
-        assert len(self._snapshot_tensors) == len(
-            named_tensors
-        ), f"should not have duplicated tensor name"
+        assert len(self._snapshot_tensors) == len(named_tensors), (
+            f"should not have duplicated tensor name"
+        )
 
     def _reset_tensors(self):
         for name, param in self._model_state():
@@ -158,16 +173,12 @@ class WeightChecker:
         return info.model_dump()
 
     def _parallelism_info(self) -> ParallelismInfo:
-        ps = self._ps
-        return ParallelismInfo(
-            tp_rank=ps.tp_rank,
-            tp_size=ps.tp_size,
-            dp_rank=ps.dp_rank if ps.dp_rank is not None else 0,
-            dp_size=ps.attn_dp_size,
-            pp_rank=ps.pp_rank,
-            pp_size=ps.pp_size,
-            rank=dist.get_rank() if dist.is_initialized() else 0,
-            size=dist.get_world_size() if dist.is_initialized() else 1,
+        # Read the current WORLD rank because elastic scale-up can change it.
+        return self._placement.model_copy(
+            update={
+                "rank": dist.get_rank() if dist.is_initialized() else 0,
+                "size": dist.get_world_size() if dist.is_initialized() else 1,
+            }
         )
 
     def _model_state(self):
@@ -198,9 +209,9 @@ def _check_tensors(
             # skip cos/sin cache which is deterministic from shape and dtype and may have different shapes due to different implementations.
             continue
         assert expect_name == actual_name, f"{expect_name=} {actual_name=}"
-        assert (
-            should_compare == actual_should_compare
-        ), f"{should_compare=} {actual_should_compare=}"
+        assert should_compare == actual_should_compare, (
+            f"{should_compare=} {actual_should_compare=}"
+        )
         name = expect_name
 
         try:
@@ -267,12 +278,14 @@ def _build_quantized_set(model) -> Dict[str, QuantizedWeight]:
         if comparable_cls is None:
             continue
         prefix = f"{module_name}." if module_name else ""
-        own = {name for name, _ in module.named_parameters(recurse=False)}
-        for name in own:
+        own = dict(module.named_parameters(recurse=False))
+        for name, parameter in own.items():
             scale = name.replace("weight", "weight_scale_inv")
             if name.endswith("weight") and scale in own:
                 quantized_set[prefix + name] = QuantizedWeight(
-                    comparable_cls, prefix + scale
+                    comparable_cls,
+                    prefix + scale,
+                    getattr(parameter, "is_shuffled", False),
                 )
     return quantized_set
 
@@ -293,7 +306,13 @@ def _build_check_entries(
             continue  # compared via its weight's comparable
         if name in quantized_set:
             qw = quantized_set[name]
-            yield CheckEntry(name, True, qw.comparable_cls(tensor, raw[qw.scale_name]))
+            yield CheckEntry(
+                name,
+                True,
+                qw.comparable_cls(
+                    tensor, raw[qw.scale_name], is_shuffled=qw.is_shuffled
+                ),
+            )
         else:
             should_compare = name not in skip_compare_names and (
                 not _is_non_persistent_buffer_name(name)

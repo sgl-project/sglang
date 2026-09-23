@@ -11,6 +11,9 @@ from sglang.srt.model_executor.cuda_graph_buffer_registry import (
     build_prefill_registry,
 )
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
+from sglang.srt.model_executor.model_runner_components.misc_utils import (
+    resolve_pp_proxy_dspark_hidden_size,
+)
 from sglang.srt.model_executor.runner.prefill_cuda_graph_runner import (
     PrefillCudaGraphRunner,
     _build_layer_model_forward_kwargs,
@@ -21,7 +24,7 @@ from sglang.srt.model_loader.utils import resolve_language_model
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=2, suite="base-a-test-cpu")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 class _LayerModel:
@@ -52,6 +55,25 @@ def _make_pp_buffers_and_registry():
 
 
 class TestPrefillCudaGraphRunnerHelpers(CustomTestCase):
+    def test_dspark_proxy_width_requires_receiving_stage_and_model_support(self):
+        class Model:
+            def get_pp_proxy_dspark_hidden_size(self):
+                return 16
+
+        for model, pp_size, pp_rank, expected in (
+            (Model(), 1, 0, 0),
+            (Model(), 2, 0, 0),
+            (Model(), 2, 1, 16),
+            (object(), 2, 1, 0),
+        ):
+            with self.subTest(pp_size=pp_size, pp_rank=pp_rank, expected=expected):
+                self.assertEqual(
+                    resolve_pp_proxy_dspark_hidden_size(
+                        model=model, pp_size=pp_size, pp_rank=pp_rank
+                    ),
+                    expected,
+                )
+
     def test_pp_proxy_stable_buffers_accept_full_and_hidden_only_contracts(self):
         buffers, registry = _make_pp_buffers_and_registry()
         full_proxy = PPProxyTensors(
@@ -170,6 +192,7 @@ class TestPrefillCudaGraphRunnerHelpers(CustomTestCase):
             pp_size=2,
             is_first_pp_rank=False,
             pp_proxy_residual_num_blocks=3,
+            pp_proxy_dspark_hidden_size=16,
         )
 
         self.assertEqual(
@@ -177,8 +200,150 @@ class TestPrefillCudaGraphRunnerHelpers(CustomTestCase):
                 key: tuple(value.shape)
                 for key, value in buffers.pp_proxy_tensors.items()
             },
-            {"hidden_states": (16, 8), "residual": (16, 3, 8)},
+            {
+                "hidden_states": (16, 8),
+                "residual": (16, 3, 8),
+                "dspark_hidden_states": (16, 16),
+            },
         )
+
+    def test_dspark_proxy_width_respects_deferred_k3_boundary_capture(self):
+        from sglang.srt.models.kimi_k3 import (
+            KimiK3ForConditionalGeneration,
+            KimiK3LinearForCausalLM,
+        )
+        from sglang.srt.models.kimi_linear import KimiLinearForCausalLM
+
+        for start, k3_count, linear_count in [
+            (0, 0, 0),
+            (8, 0, 1),
+            (24, 1, 2),
+            (52, 2, 3),
+        ]:
+            model = SimpleNamespace(
+                config=SimpleNamespace(hidden_size=8),
+                model=SimpleNamespace(
+                    start_layer=start, dspark_layers_to_capture=[7, 23, 51]
+                ),
+            )
+            self.assertEqual(
+                KimiK3LinearForCausalLM.get_pp_proxy_dspark_hidden_size(model),
+                k3_count * 8,
+            )
+            self.assertEqual(
+                KimiLinearForCausalLM.get_pp_proxy_dspark_hidden_size(model),
+                linear_count * 8,
+            )
+            model.get_pp_proxy_dspark_hidden_size = lambda: (
+                KimiK3LinearForCausalLM.get_pp_proxy_dspark_hidden_size(model)
+            )
+            self.assertEqual(
+                KimiK3ForConditionalGeneration.get_pp_proxy_dspark_hidden_size(
+                    SimpleNamespace(language_model=model)
+                ),
+                k3_count * 8,
+            )
+
+    def test_body_replay_uses_plural_embeds_and_skips_embedding_on_later_pp_stage(self):
+        for first_rank in (True, False):
+            for positional in (True, False):
+                with self.subTest(first_rank=first_rank, positional=positional):
+                    runner = PrefillCudaGraphRunner.__new__(PrefillCudaGraphRunner)
+                    runner._is_full_backend = False
+                    runner._input_embeds_arg_idx = 3
+                    backing = torch.zeros(4, 8)
+                    supplied = torch.full((4, 8), 7.0) if first_rank else None
+                    runner.buffer_registry = SimpleNamespace(
+                        has_slot=lambda name: name == "input_embeds",
+                        get_slot=lambda _: SimpleNamespace(
+                            slice_for=lambda *args: backing
+                        ),
+                    )
+                    layer = SimpleNamespace(forward=lambda *args, **kwargs: None)
+                    original = layer.forward
+                    runner.layer_model = layer
+                    sentinel = object()
+                    runner.backend = SimpleNamespace(
+                        replay=lambda *args, **kwargs: sentinel
+                    )
+                    runner._prefill_forward_context = lambda *args, **kwargs: (
+                        nullcontext()
+                    )
+
+                    def outer_forward(ids, positions, batch):
+                        if positional:
+                            return layer.forward(None, positions, batch, supplied)
+                        return layer.forward(
+                            None, positions, batch, inputs_embeds=supplied
+                        )
+
+                    runner.model_runner = SimpleNamespace(
+                        pp_group=SimpleNamespace(is_first_rank=first_rank),
+                        model=SimpleNamespace(forward=outer_forward),
+                    )
+                    batch = SimpleNamespace(
+                        input_ids=torch.arange(4),
+                        positions=torch.arange(4),
+                        mm_input_embeds=None,
+                    )
+                    result = runner._execute_body_capture(batch, batch, 4, 4, None)
+                    self.assertIs(result, sentinel)
+                    self.assertIs(layer.forward, original)
+                    if first_rank:
+                        torch.testing.assert_close(backing, supplied)
+                    else:
+                        self.assertEqual(torch.count_nonzero(backing).item(), 0)
+
+    def test_dspark_proxy_replay_updates_features_and_clears_padding(self):
+        buffers = PrefillInputBuffers.create(
+            device=torch.device("cpu"),
+            max_bs=1,
+            max_num_tokens=8,
+            cache_loc_dtype=torch.int64,
+            is_multimodal=False,
+            hidden_size=4,
+            dtype=torch.float32,
+            enable_mamba_track=False,
+            pp_size=2,
+            pp_proxy_dspark_hidden_size=8,
+        )
+        registry = build_prefill_registry(
+            device=torch.device("cpu"),
+            max_bs=1,
+            max_num_token=8,
+            cache_loc_dtype=torch.int64,
+            share_pool=False,
+            source=buffers,
+        )
+        runner = PrefillCudaGraphRunner.__new__(PrefillCudaGraphRunner)
+        runner.buffers = buffers
+        runner.model_runner = SimpleNamespace(
+            pp_group=SimpleNamespace(is_first_rank=False)
+        )
+        captured = runner._capture_pp_proxy_tensors(8)["dspark_hidden_states"]
+        ptr = captured.data_ptr()
+        for count, value in [(7, 2.0), (3, 5.0)]:
+            tokens = torch.arange(count)
+            proxy = PPProxyTensors(
+                {
+                    "hidden_states": torch.zeros(count, 4),
+                    "residual": torch.zeros(count, 4),
+                    "dspark_hidden_states": torch.full((count, 8), value),
+                }
+            )
+            registry.fill_from(
+                SimpleNamespace(
+                    input_ids=tokens, positions=tokens, out_cache_loc=tokens
+                ),
+                raw_bs=1,
+                padded_bs=1,
+                raw_num_tokens=count,
+                padded_num_tokens=8,
+                pp_proxy_tensors=proxy,
+            )
+            self.assertEqual(captured.data_ptr(), ptr)
+            torch.testing.assert_close(captured[:count], proxy["dspark_hidden_states"])
+            self.assertEqual(torch.count_nonzero(captured[count:]).item(), 0)
 
     def test_pipeline_proxy_output_is_supported(self):
         runner = PrefillCudaGraphRunner.__new__(PrefillCudaGraphRunner)

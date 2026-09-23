@@ -26,13 +26,14 @@ from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kits.kl_divergence_kit import KLDivergenceMixin
 from sglang.test.server_fixtures.default_fixture import DefaultServerBase
 
-register_cuda_ci(est_time=600, stage="extra-a", runner_config="1-gpu-large")
+register_cuda_ci(est_time=154, stage="extra-a", runner_config="1-gpu-large")
 
 
 class TestMamba2ExtraBufferKL(KLDivergenceMixin, DefaultServerBase):
     """NemotronH (Mamba2) + extra_buffer: cache-hit logprobs match cold recompute."""
 
     model = "nvidia/NVIDIA-Nemotron-Nano-9B-v2"
+    server_env = {"SGLANG_ENABLE_RANK_CONSENSUS_CHECKER": "1"}
 
     # Decode-seeded reuse is the regression trigger (the graphed decode
     # track-save); the broken path fails at KL ~1.5, so 0.005 discriminates
@@ -48,7 +49,7 @@ class TestMamba2ExtraBufferKL(KLDivergenceMixin, DefaultServerBase):
         "256",
         "--mem-fraction-static",
         "0.8",
-        "--mamba-scheduler-strategy",
+        "--mamba-radix-cache-strategy",
         "extra_buffer",
         # The 512-token decode turns must cross a track boundary for the tree
         # to hold decode-seeded states; halve the default interval (must stay

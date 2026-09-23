@@ -44,6 +44,7 @@
 import copy
 import logging
 import math
+from array import array
 from dataclasses import dataclass
 from typing import Iterable, List, Optional, Tuple
 
@@ -88,7 +89,6 @@ class MaxImageTokenMeta:
 
 
 class KimiVLMultiModalProjector(nn.Module):
-
     def __init__(self, config: KimiVLConfig):
         super().__init__()
 
@@ -193,7 +193,7 @@ class KimiVLForConditionalGeneration(nn.Module):
         res = self.multi_modal_projector(image_features)
         return res
 
-    def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
+    def pad_input_ids(self, input_ids: array, mm_inputs: MultimodalInputs) -> array:
         pattern = MultiModalityDataPaddingPatternMultimodalTokens()
         return pattern.pad_input_tokens(input_ids, mm_inputs)
 
@@ -357,7 +357,7 @@ def get_spec_layer_idx_from_weight_name(
     ):
         layer_idx = config.num_hidden_layers
         for i in range(config.num_nextn_predict_layers):
-            if weight_name.startswith(f"model.layers.{layer_idx+i}."):
+            if weight_name.startswith(f"model.layers.{layer_idx + i}."):
                 return layer_idx + i
     return None
 

@@ -1,6 +1,7 @@
 # Adapted from
 # https://github.com/huggingface/transformers/blob/af9b2eaa54c150741f298d6db939af6328e1dc38/src/transformers/models/clip/modeling_clip.py
 
+from array import array
 from functools import partial
 from typing import Iterable, List, Optional, Tuple, Type, Union
 
@@ -49,7 +50,6 @@ def prepare_clip_attention_mask(
 
 
 class CLIPVisionEmbeddings(nn.Module):
-
     def __init__(self, config: CLIPVisionConfig):
         super().__init__()
         self.config = config
@@ -141,7 +141,6 @@ class CLIPTextEmbeddings(nn.Module):
 
 
 class CLIPMLP(nn.Module):
-
     def __init__(
         self,
         config,
@@ -240,7 +239,6 @@ class CLIPAttention(nn.Module):
 
 
 class CLIPEncoderLayer(nn.Module):
-
     def __init__(
         self,
         config: CLIPVisionConfig,
@@ -428,7 +426,6 @@ class CLIPTextModel(nn.Module):
 
 
 class CLIPVisionTransformer(nn.Module):
-
     def __init__(
         self,
         config: CLIPVisionConfig,
@@ -584,7 +581,7 @@ class CLIPModel(nn.Module):
                 embeddings=self.text_projection(pooled_output.embeddings)
             )
 
-    def pad_input_ids(self, input_ids: List[int], image_inputs: MultimodalInputs):
+    def pad_input_ids(self, input_ids: array, image_inputs: MultimodalInputs) -> array:
         # Clip embeddings models handle text/image separately, so we don't need to pad input ids
         return input_ids
 

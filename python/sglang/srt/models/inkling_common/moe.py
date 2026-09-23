@@ -31,9 +31,6 @@ from sglang.kernels.ops.moe.sigmoid_gate_topk_renorm import (
     sigmoid_gate_topk_renorm,
 )
 from sglang.srt.configs.inkling import InklingModelConfig
-from sglang.srt.distributed import (
-    get_tensor_model_parallel_group,
-)
 from sglang.srt.environ import GateGemvMode, envs
 from sglang.srt.layers.moe import get_moe_runner_backend
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
@@ -512,7 +509,9 @@ def make_forward_inputs_2d(
     return hidden_states, topk_weights, topk_ids, top_k, num_experts
 
 
-def run_moe_preprocess(topk_ids: torch.Tensor, num_experts: int) -> tuple[
+def run_moe_preprocess(
+    topk_ids: torch.Tensor, num_experts: int
+) -> tuple[
     torch.Tensor,
     torch.Tensor,
     torch.Tensor,
@@ -562,9 +561,9 @@ def activation(
     use_interleaved: bool = True,
 ):
     if activation_type == "silu_and_mul":
-        assert (
-            gateup_output.is_contiguous()
-        ), f"{gateup_output.shape=} {gateup_output.stride()=}"
+        assert gateup_output.is_contiguous(), (
+            f"{gateup_output.shape=} {gateup_output.stride()=}"
+        )
         assert gateup_output.ndim == 2, f"{gateup_output.shape=}"
         out_dtype = None
         if gateup_output.numel() == 0:
@@ -669,11 +668,13 @@ class InklingSharedFusedMoE(FusedMoE):
         quant_config: QuantizationConfig | None,
         inference_moe_w13_interleaved: bool,
     ) -> None:
-        # FusedMoE.__init__ reads get_parallel() once and caches it on self, so
-        # scoping the override to just this call is sufficient for the module's lifetime.
+        # FusedMoE caches this topology at construction. Shared experts are
+        # replicated, so they need no expert-parallel group.
         with get_parallel().override(
             moe_ep_size=1,
             moe_ep_rank=0,
+            moe_ep_group=None,
+            moe_dp_size=1,
             moe_tp_size=get_parallel().tp_size,
             moe_tp_rank=get_parallel().tp_rank,
         ):
@@ -749,7 +750,7 @@ def _build_inkling_shared_experts(
             inference_moe_w13_interleaved=inference_moe_w13_interleaved,
             tp_rank=moe_tp_rank,
             tp_size=moe_tp_size,
-            tp_group=get_tensor_model_parallel_group(),
+            tp_group=get_parallel().tp_group,
         )
         return InklingBatchDenseMLP(
             **dense_kwargs,
@@ -768,7 +769,7 @@ def _build_inkling_shared_experts(
         quant_config=quant_config,
         tp_rank=moe_tp_rank,
         tp_size=moe_tp_size,
-        tp_group=get_tensor_model_parallel_group(),
+        tp_group=get_parallel().tp_group,
     )
 
 
@@ -1067,7 +1068,7 @@ class InklingMoE(nn.Module):
                     # {routed + shared} add on the fold paths.
                     stash_ar_shared(shared_out)
                     return out
-                tp = get_tensor_model_parallel_group()
+                tp = get_parallel().tp_group
                 buf = get_ar_buffer(tp, out.shape[0], out.shape[1], out.dtype)
                 if buf is not None:
                     torch.add(out, shared_out, out=buf)
@@ -1075,7 +1076,7 @@ class InklingMoE(nn.Module):
                 return out + shared_out
             return out
 
-        tp = get_tensor_model_parallel_group()
+        tp = get_parallel().tp_group
         if shared_out is not None:
             if self._fused_ar_shared and not self.scattered_sconv:
                 # The AR dispatch folds in-kernel on the fold paths and pre-adds

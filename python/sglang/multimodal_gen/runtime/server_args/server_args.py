@@ -27,6 +27,7 @@ from sglang.multimodal_gen.configs.pipeline_configs.ltx_2 import (
 )
 from sglang.multimodal_gen.configs.quantization.nunchaku import NunchakuSVDQuantArgs
 from sglang.multimodal_gen.configs.quantization.qvg_kv import QVGKVQuantArgs
+from sglang.multimodal_gen.configs.utils import expand_path_fields
 from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 from sglang.multimodal_gen.runtime.layers.quantization.configs.nunchaku_config import (
     NunchakuConfig,
@@ -36,6 +37,7 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency 
     COMPONENT_OFFLOAD,
     LAYERWISE_OFFLOAD,
     RESIDENT,
+    SNAPSHOT_OFFLOAD,
     normalize_component_residency,
     resolve_component_residency_mode,
     resolve_diffusers_pipeline_offload,
@@ -46,6 +48,9 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload_co
     LAYERWISE_OFFLOAD_IMAGE_ENCODER_GROUP,
     LAYERWISE_OFFLOAD_TEXT_ENCODER_GROUP,
     LAYERWISE_OFFLOAD_VAE_GROUP,
+    RESIDENCY_LIFETIME_FORWARD,
+    RESIDENCY_LIFETIME_PERMANENT,
+    RESIDENCY_LIFETIMES,
     RESIDENCY_POLICIES,
     RESIDENCY_POLICY_LEADING,
     cpu_offload_component_matches,
@@ -67,6 +72,10 @@ from sglang.multimodal_gen.runtime.server_args.auto_tune import (
     ServerArgsAutoTuner,
 )
 from sglang.multimodal_gen.runtime.server_args.disagg import DisaggServerArgsMixin
+from sglang.multimodal_gen.runtime.utils.argparse import (
+    FlexibleArgumentParser,
+    StoreBoolean,
+)
 from sglang.multimodal_gen.runtime.utils.common import (
     is_port_available,
     is_valid_ipv6_address,
@@ -77,14 +86,9 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import (
     configure_logger,
     init_logger,
 )
+from sglang.multimodal_gen.runtime.utils.precision_types import PRECISION_TO_TYPE
 from sglang.multimodal_gen.runtime.weights.source import (
     is_explicit_weight_file_reference,
-)
-from sglang.multimodal_gen.utils import (
-    PRECISION_TO_TYPE,
-    FlexibleArgumentParser,
-    StoreBoolean,
-    expand_path_fields,
 )
 
 logger = init_logger(__name__)
@@ -109,6 +113,27 @@ def _normalize_ltx2_two_stage_device_mode(mode: str | None) -> str | None:
 
 def is_ltx2_two_stage_pipeline_name(pipeline_class_name: str | None) -> bool:
     return pipeline_class_name in LTX2_TWO_STAGE_PIPELINE_NAMES
+
+
+def _infer_direct_constructor_explicit_arg_names(server_args) -> set[str]:
+    explicit_arg_names: set[str] = set()
+    for attr in dataclasses.fields(server_args):
+        if not attr.init or attr.name == "_explicit_arg_names":
+            continue
+
+        value = getattr(server_args, attr.name)
+        if attr.default is not dataclasses.MISSING:
+            default = attr.default
+        elif attr.default_factory is not dataclasses.MISSING:
+            default = attr.default_factory()
+        else:
+            explicit_arg_names.add(attr.name)
+            continue
+
+        if value != default:
+            explicit_arg_names.add(attr.name)
+
+    return explicit_arg_names
 
 
 def _normalize_component_precisions(value: object) -> dict[str, str]:
@@ -165,6 +190,7 @@ DEFAULT_BCG_TEXT_BUCKETS = (64, 128, 256, 512, 1024)
 
 BREAKABLE_CUDA_GRAPH_SUPPORTED_MODEL_IDS = frozenset(
     {
+        "black-forest-labs/flux.1-dev",
         "comfy-org/ideogram-4",
         "efficient-large-model/sana1.5_1.6b_1024px_diffusers",
         "efficient-large-model/sana-video_2b_480p_diffusers",
@@ -172,6 +198,7 @@ BREAKABLE_CUDA_GRAPH_SUPPORTED_MODEL_IDS = frozenset(
         "sana-video_2b_480p_diffusers",
         "fal/ideogram-v4-fast",
         "fal/ideogram-v4-instant",
+        "flux.1-dev",
         "glm-image",
         "ideogram-4",
         "ideogram-4-fp8",
@@ -180,6 +207,8 @@ BREAKABLE_CUDA_GRAPH_SUPPORTED_MODEL_IDS = frozenset(
         "ideogram-v4-instant",
         "ideogram-ai/ideogram-4-fp8",
         "ideogram-ai/ideogram-4-nf4",
+        "jdopensource/joyai-echo",
+        "joyai-echo",
         "lightricks/ltx-2",
         "lightricks/ltx-2.3",
         "meituan-longcat/longcat-image",
@@ -189,8 +218,10 @@ BREAKABLE_CUDA_GRAPH_SUPPORTED_MODEL_IDS = frozenset(
         "minimaxai/minimax-h3",
         "qwen/qwen-image",
         "qwen/qwen-image-2512",
+        "qwen/qwen-image-2.1",
         "qwen-image",
         "qwen-image-2512",
+        "qwen-image-2.1",
         "tongyi-mai/z-image",
         "tongyi-mai/z-image-turbo",
         "zai-org/glm-image",
@@ -201,13 +232,16 @@ BREAKABLE_CUDA_GRAPH_SUPPORTED_MODEL_IDS = frozenset(
 
 BREAKABLE_CUDA_GRAPH_SUPPORTED_PIPELINE_CONFIGS = frozenset(
     {
+        "FluxPipelineConfig",
         "GlmImagePipelineConfig",
         "Ideogram4PipelineConfig",
+        "JoyEchoPipelineConfig",
         "LTX2PipelineConfig",
         "LTX23PipelineConfig",
         "LongCatImagePipelineConfig",
         "MiniMaxH3PipelineConfig",
         "QwenImagePipelineConfig",
+        "QwenImage21PipelineConfig",
         "SanaPipelineConfig",
         "SanaVideoPipelineConfig",
         "ZImagePipelineConfig",
@@ -247,6 +281,10 @@ class ServerArgs(DisaggServerArgsMixin):
 
     # Attention
     attention_backend: str = None
+    # Time the viable attention backends on the model's own tensors during
+    # warmup and keep the fastest per layer. Off by default: it has only been
+    # measured on sm90 and sm12x.
+    enable_attention_backend_autotune: bool = False
     attention_backend_config: addict.Dict | None = None
     component_attention_backends: dict[str, str] | str | None = field(
         default_factory=dict
@@ -352,6 +390,11 @@ class ServerArgs(DisaggServerArgsMixin):
     # Widest timestep plan the rebuild slab is sized for; see
     # MINIMAX_H3_ADALN_MAX_PLAN_WIDTH.
     minimax_h3_adaln_plan_width: int = 4
+    # Pinned-host cache for built AdaLN plans (decimal GB, 0 disables). Plans
+    # evicted from the GPU slab swap back in from here instead of re-reading
+    # the 24.2 GiB checkpoint. Expert knobs (GPU slot count, fp32 rebuild)
+    # live in envs.py as SGLANG_DIFFUSION_MINIMAX_H3_ADALN_*.
+    minimax_h3_adaln_host_cache_gb: float = 8.0
     # Explicit quantization method override (e.g. "mxfp8", "fp8", "modelslim").
     # When set, the transformer loader uses it instead of auto-detection.
     quantization: str | None = None
@@ -378,13 +421,19 @@ class ServerArgs(DisaggServerArgsMixin):
     dit_layerwise_resident_layers: float = 0.0
     # Which layers those are: the leading ones, or spread evenly over the stack.
     dit_layerwise_residency_policy: str = RESIDENCY_POLICY_LEADING
-    # Per-component overrides of the three knobs above; an entry wins for that
+    # How long they stay: while the DiT runs for a request, or for the life of
+    # the server.
+    dit_layerwise_residency_lifetime: str = RESIDENCY_LIFETIME_FORWARD
+    # Per-component overrides of the four knobs above; an entry wins for that
     # component.
     layerwise_prefetch_size: dict[str, float] | str | None = field(default_factory=dict)
     layerwise_resident_layers: dict[str, float] | str | None = field(
         default_factory=dict
     )
     layerwise_residency_policy: dict[str, str] | str | None = field(
+        default_factory=dict
+    )
+    layerwise_residency_lifetime: dict[str, str] | str | None = field(
         default_factory=dict
     )
     offload_during_compile: bool = True
@@ -446,6 +495,10 @@ class ServerArgs(DisaggServerArgsMixin):
     warmup_resolutions: list[str] = None
     warmup_num_frames: int | None = None
     warmup_steps: int = 1
+    # JSON overrides for the representative request shape used by synthetic
+    # warmup and automatic residency planning. Execution remains bounded by
+    # warmup_steps and the server warmup frame/area caps.
+    warmup_sampling_params: dict[str, Any] | str | None = None
 
     disable_autocast: bool | None = None
 
@@ -466,6 +519,7 @@ class ServerArgs(DisaggServerArgsMixin):
     # http server endpoint config
     host: str | None = "127.0.0.1"
     port: int | None = 30000
+    enable_metrics: bool = False
 
     # TODO: webui and their endpoint, check if webui_port is available.
     webui: bool = False
@@ -548,6 +602,7 @@ class ServerArgs(DisaggServerArgsMixin):
     # Tracing
     enable_trace: bool = False
     otlp_traces_endpoint: str = "localhost:4317"
+    otlp_service_name: str | None = None
 
     # SGLang backend for encoder stage
     srt_encoder_url: str | None = None
@@ -615,7 +670,20 @@ class ServerArgs(DisaggServerArgsMixin):
         self._validate_cfg_parallel()
         self._validate_batching()
         self._validate_breakable_cuda_graph()
+        self._validate_minimax_h3_adaln()
         self.pipeline_config.validate_server_args(self)
+
+    def _validate_minimax_h3_adaln(self) -> None:
+        # Warn, not raise: config-file and from_kwargs construction mark every
+        # provided key as explicit, so a shared base config pinning the
+        # default (or 0) must not fail non-online launches.
+        if self.minimax_h3_adaln_online:
+            return
+        if self.is_arg_explicitly_set("minimax_h3_adaln_host_cache_gb"):
+            logger.warning(
+                "--minimax-h3-adaln-host-cache-gb only takes effect with "
+                "--minimax-h3-adaln-online; ignoring it"
+            )
 
     def _validate_scheduler_rpc_timeout(self) -> None:
         timeout = self.scheduler_rpc_timeout
@@ -662,12 +730,44 @@ class ServerArgs(DisaggServerArgsMixin):
                 "model default warmup resolution. Requests at other "
                 "resolutions run eager."
             )
+        if self._is_video_gen_task() and self.warmup_num_frames is None:
+            default_frames = self._bcg_default_warmup_num_frames()
+            logger.info(
+                "[Diffusion BCG] --warmup-num-frames unset; capturing the "
+                "model default warmup frame count (%s). Requests with a "
+                "different frame count run eager. Pass --warmup-num-frames N "
+                "matching your served frame count.",
+                default_frames,
+            )
         if self.bcg_text_buckets is not None and not any(
             int(b) > 0 for b in self.bcg_text_buckets
         ):
             raise ValueError(
                 "--bcg-text-buckets must contain at least one positive integer."
             )
+
+    def _is_video_gen_task(self) -> bool:
+        pipeline_config = getattr(self, "pipeline_config", None)
+        task_type = getattr(pipeline_config, "task_type", None)
+        is_video_gen = getattr(task_type, "is_video_gen", None)
+        return bool(is_video_gen()) if callable(is_video_gen) else False
+
+    def _bcg_default_warmup_num_frames(self):
+        """Best-effort preview of the warmup frame count BCG will capture."""
+        try:
+            from sglang.multimodal_gen.runtime.warmup_request_builder import (
+                _resolve_warmup_num_frames,
+                get_model_sampling_defaults,
+            )
+
+            sampling_defaults = get_model_sampling_defaults(self)
+            return _resolve_warmup_num_frames(
+                self,
+                sampling_defaults,
+                server_based_warmup=True,
+            )
+        except Exception:  # pragma: no cover - defensive
+            return None
 
     def _adjust_breakable_cuda_graph_support(self):
         if not self.enable_breakable_cuda_graph:
@@ -684,11 +784,12 @@ class ServerArgs(DisaggServerArgsMixin):
             return
 
         logger.warning(
-            "[Diffusion BCG] disabled for %s: only Ideogram-4, "
-            "Lightricks/LTX-2, LongCat-Image, MiniMax-H3, "
-            "Qwen/Qwen-Image, Qwen/Qwen-Image-2512, SANA1.5, SANA-Video, "
-            "Tongyi-MAI/Z-Image/Z-Image-Turbo, and zai-org/GLM-Image are "
-            "currently supported.",
+            "[Diffusion BCG] disabled for %s: only FLUX.1-dev, Ideogram-4, "
+            "jdopensource/JoyAI-Echo, Lightricks/LTX-2, LongCat-Image, "
+            "MiniMax-H3, Qwen/Qwen-Image, Qwen/Qwen-Image-2512, "
+            "Qwen/Qwen-Image-2.1, SANA1.5, "
+            "SANA-Video, Tongyi-MAI/Z-Image/Z-Image-Turbo, and "
+            "zai-org/GLM-Image are currently supported.",
             pipeline_config_name,
         )
         self.enable_breakable_cuda_graph = False
@@ -858,6 +959,23 @@ class ServerArgs(DisaggServerArgsMixin):
         self.component_residency = normalize_component_residency(
             self.component_residency
         )
+        if SNAPSHOT_OFFLOAD in (self.component_residency or {}).values():
+            if (
+                not current_platform.is_cuda()
+                or current_platform.device_shares_host_memory()
+            ):
+                raise ValueError(
+                    "snapshot-offload requires CUDA with separate host and device memory; "
+                    "use component-offload or layerwise-offload on this platform"
+                )
+            if self.enable_breakable_cuda_graph and any(
+                self.canonical_residency_mode(name) == SNAPSHOT_OFFLOAD
+                for name in ("transformer", "transformer_2")
+            ):
+                raise ValueError(
+                    "snapshot-offload for DiT is incompatible with "
+                    "--enable-breakable-cuda-graph because weight addresses change"
+                )
 
     def _adjust_ltx2_two_stage_device_mode(self):
         if not self._is_ltx23_two_stage_pipeline():
@@ -885,7 +1003,7 @@ class ServerArgs(DisaggServerArgsMixin):
             component_name: residency_mode
             for component_name in ("transformer", "transformer_2")
             if (residency_mode := self.explicit_residency_mode(component_name))
-            in (COMPONENT_OFFLOAD, LAYERWISE_OFFLOAD)
+            in (COMPONENT_OFFLOAD, SNAPSHOT_OFFLOAD, LAYERWISE_OFFLOAD)
         }
         if mode == "resident" and explicit_nonresident_dits:
             configured = ", ".join(
@@ -1100,8 +1218,8 @@ class ServerArgs(DisaggServerArgsMixin):
 
     def layerwise_tuning_for(
         self, component_name: str | None, *, dit_group: bool
-    ) -> tuple[float, float, str]:
-        """Prefetch size, resident layers and residency policy for one component."""
+    ) -> tuple[float, float, str, str]:
+        """Prefetch size, resident layers, residency policy and lifetime for one component."""
         prefetch_map = self._parse_component_value_map(
             self.layerwise_prefetch_size, option="--layerwise-prefetch-size"
         )
@@ -1110,6 +1228,9 @@ class ServerArgs(DisaggServerArgsMixin):
         )
         policy_map = self._parse_component_value_map(
             self.layerwise_residency_policy, option="--layerwise-residency-policy"
+        )
+        lifetime_map = self._parse_component_value_map(
+            self.layerwise_residency_lifetime, option="--layerwise-residency-lifetime"
         )
 
         def _pick(mapping: dict[str, str], group_default, aux_default):
@@ -1131,7 +1252,19 @@ class ServerArgs(DisaggServerArgsMixin):
                 f"unknown residency policy {policy!r} for component "
                 f"{component_name!r}, expected one of {RESIDENCY_POLICIES}"
             )
-        return prefetch, resident, policy
+        lifetime = str(
+            _pick(
+                lifetime_map,
+                self.dit_layerwise_residency_lifetime,
+                RESIDENCY_LIFETIME_FORWARD,
+            )
+        )
+        if lifetime not in RESIDENCY_LIFETIMES:
+            raise ValueError(
+                f"unknown residency lifetime {lifetime!r} for component "
+                f"{component_name!r}, expected one of {RESIDENCY_LIFETIMES}"
+            )
+        return prefetch, resident, policy, lifetime
 
     @staticmethod
     def _parse_component_attention_backend_map(
@@ -1262,9 +1395,8 @@ class ServerArgs(DisaggServerArgsMixin):
             )
 
     def _adjust_network_ports(self):
-        # Disagg role instances (encoder/denoiser/decoder) don't serve HTTP,
-        # so skip settling the HTTP port to avoid unnecessary port collisions.
-        needs_http = self.disagg_role in (
+        # standalone roles only need an HTTP port when exposing metrics
+        needs_http = self.enable_metrics or self.disagg_role in (
             RoleType.MONOLITHIC,
             RoleType.SERVER,
         )
@@ -1363,9 +1495,11 @@ class ServerArgs(DisaggServerArgsMixin):
                     self.enable_cfg_parallel = auto_cfg_parallel_degree > 1
                     if self.enable_cfg_parallel:
                         logger.info(
-                            "Automatically enabled CFG parallel at degree %d for %d GPUs. "
-                            "Use --sp-degree / --ulysses-degree to use sequence "
-                            "parallelism instead.",
+                            "Automatically enabled CFG parallel at degree %d for %d GPUs "
+                            "because this model uses classifier-free guidance by default. "
+                            "A request that turns CFG off still runs, but it has one branch, "
+                            "so the other CFG rank(s) recompute it redundantly. Override with "
+                            "--cfg-parallel-size 1, --tp-size, or --sp-degree / --ulysses-degree.",
                             self.cfg_parallel_degree,
                             self.num_gpus,
                         )
@@ -1587,11 +1721,15 @@ class ServerArgs(DisaggServerArgsMixin):
         return RESIDENT
 
     def should_cpu_offload_component(self, component_name: str) -> bool:
-        return self.residency_mode(component_name) == COMPONENT_OFFLOAD
+        return self.residency_mode(component_name) in (
+            COMPONENT_OFFLOAD,
+            SNAPSHOT_OFFLOAD,
+        )
 
     def should_start_component_on_cpu(self, component_name: str) -> bool:
         return self.residency_mode(component_name) in (
             COMPONENT_OFFLOAD,
+            SNAPSHOT_OFFLOAD,
             LAYERWISE_OFFLOAD,
         )
 
@@ -1688,7 +1826,7 @@ class ServerArgs(DisaggServerArgsMixin):
 
         has_explicit_dit_offload = bool(
             self.canonical_residency_mode("transformer")
-            in (COMPONENT_OFFLOAD, LAYERWISE_OFFLOAD)
+            in (COMPONENT_OFFLOAD, SNAPSHOT_OFFLOAD, LAYERWISE_OFFLOAD)
             or self.is_explicit_layerwise_offload_component("transformer")
             or (
                 self.is_arg_explicitly_set("cpu_offload_components")
@@ -1782,22 +1920,20 @@ class ServerArgs(DisaggServerArgsMixin):
             raise ValueError(f"Could not parse attention backend config: {config_str}")
 
     def __post_init__(self):
+        if not self._explicit_arg_names:
+            self._explicit_arg_names = _infer_direct_constructor_explicit_arg_names(
+                self
+            )
+
+        current_platform.apply_server_args_defaults(self)
         # configure logger before use
         configure_logger(server_args=self)
 
         component_paths: dict[str, str] = {}
         component_weights_paths = dict(self.component_weights_paths)
+        migrated_component_weight_path = False
         for component, path in self.component_paths.items():
-            supports_weight_file_override = (
-                is_dit_component_name(component)
-                or is_text_encoder_component_name(component)
-                or is_image_encoder_component_name(component)
-                or is_vae_component_name(component)
-            )
-            if (
-                not supports_weight_file_override
-                or not is_explicit_weight_file_reference(path)
-            ):
+            if not is_explicit_weight_file_reference(path):
                 component_paths[component] = path
                 continue
             existing = component_weights_paths.get(component)
@@ -1807,6 +1943,11 @@ class ServerArgs(DisaggServerArgsMixin):
                     f"{existing!r} and {path!r}"
                 )
             component_weights_paths[component] = path
+            migrated_component_weight_path = True
+        if migrated_component_weight_path and self.is_arg_explicitly_set(
+            "component_paths"
+        ):
+            self._explicit_arg_names.add("component_weights_paths")
         self.component_paths = component_paths
         self.component_weights_paths = component_weights_paths
         self.component_precisions = _normalize_component_precisions(
@@ -1932,6 +2073,20 @@ class ServerArgs(DisaggServerArgsMixin):
                 "for. The default 4 covers every task; a deployment serving "
                 "only t2va (2) or fl2va (3) can shrink the slab proportionally. "
                 "A request exceeding it is rejected rather than truncated."
+            ),
+        )
+        parser.add_argument(
+            "--minimax-h3-adaln-host-cache-gb",
+            type=float,
+            default=ServerArgs.minimax_h3_adaln_host_cache_gb,
+            help=(
+                "Pinned host memory (decimal GB, per rank) caching AdaLN plans "
+                "built by --minimax-h3-adaln-online, so a plan set evicted "
+                "from the GPU slab swaps back in over PCIe instead of "
+                "re-reading the 24.2 GiB checkpoint (measured 5.8-6.7 s). One "
+                "50-step schedule needs ~0.9 (t2va) / 1.33 (fl2va) / 1.77 "
+                "(ref2va) GB; the default 8 holds several. Groups are evicted "
+                "LRU and over-cap groups just recompute. 0 disables the tier."
             ),
         )
         parser.add_argument(
@@ -2326,6 +2481,18 @@ class ServerArgs(DisaggServerArgsMixin):
             default=ServerArgs.warmup_steps,
             help="The number of warmup steps to perform for each resolution.",
         )
+        parser.add_argument(
+            "--warmup-sampling-params",
+            type=str,
+            default=ServerArgs.warmup_sampling_params,
+            help=(
+                "JSON object overriding model sampling defaults for synthetic "
+                "warmup and auto residency planning, for example "
+                '\'{"width":832,"height":480,"num_frames":9,'
+                '"num_inference_steps":4}\'. Warmup still applies its '
+                "bounded execution caps."
+            ),
+        )
         # component residency and legacy offload controls
         parser.add_argument(
             "--component-residency",
@@ -2334,7 +2501,7 @@ class ServerArgs(DisaggServerArgsMixin):
             default=ServerArgs.component_residency,
             metavar="COMPONENT=MODE",
             help=(
-                "Select resident, component-offload, or layerwise-offload for "
+                "Select resident, component-offload, snapshot-offload, or layerwise-offload for "
                 "pipeline components. Exact model_index.json component keys override "
                 "the dit, text_encoder, image_encoder, vae, and all groups. "
                 "Components without an assignment keep their automatic placement."
@@ -2401,14 +2568,16 @@ class ServerArgs(DisaggServerArgsMixin):
             "--dit-layerwise-resident-layers",
             type=float,
             default=ServerArgs.dit_layerwise_resident_layers,
-            help="With --dit-layerwise-offload, keep this many DiT layers "
-            "permanently resident on GPU (retained across denoise steps) and stream "
-            "the rest with --dit-offload-prefetch-size; which layers stay resident "
-            "is --dit-layerwise-residency-policy. 0.0 = off (pure "
+            help="With --dit-layerwise-offload, keep this many DiT layers on the GPU "
+            "across the denoise steps of a request and stream the rest with "
+            "--dit-offload-prefetch-size; which layers stay is "
+            "--dit-layerwise-residency-policy. 0.0 = off (pure "
             "streaming). Between 0.0 and 1.0 = ratio of layers; >= 1 = absolute "
             "count. Unlike raising the prefetch size, resident layers are transferred "
-            "once (not re-streamed every step), so this trades VRAM for lower denoise "
-            "latency when memory is available.",
+            "once per request rather than once per step, so this trades VRAM for "
+            "lower denoise latency when memory is available. How long they stay on "
+            "the GPU is --dit-layerwise-residency-lifetime: released when the "
+            "request finishes by default, or kept for the life of the server.",
         )
         parser.add_argument(
             "--layerwise-prefetch-size",
@@ -2427,11 +2596,14 @@ class ServerArgs(DisaggServerArgsMixin):
             default=None,
             help="Per-component override of --dit-layerwise-resident-layers, as "
             "component=value entries, e.g. --layerwise-resident-layers "
-            "text_encoder=4. Resident layers are transferred once at startup "
-            "rather than streamed, so they cut the transfer of every pass "
-            "including the first -- an auxiliary component that runs once per "
-            "request still benefits, it just recovers the VRAM once per request "
-            "instead of once per denoising step.",
+            "video_vae=36. The layers are held on the GPU while that component "
+            "does its work for a request and released when it finishes, so this "
+            "pays for a component that runs its layers many times per request -- "
+            "a DiT across the denoise steps, a video VAE across the latent chunks. "
+            "A component that runs its layers once per request, such as a text "
+            "encoder, transfers the whole set again every request, so setting "
+            "this for one has no effect unless --layerwise-residency-lifetime "
+            "keeps the layers for the life of the server.",
         )
         parser.add_argument(
             "--layerwise-residency-policy",
@@ -2440,6 +2612,17 @@ class ServerArgs(DisaggServerArgsMixin):
             help="Per-component override of --dit-layerwise-residency-policy, as "
             "component=value entries, e.g. --layerwise-residency-policy "
             "text_encoder=strided.",
+        )
+        parser.add_argument(
+            "--layerwise-residency-lifetime",
+            type=str,
+            default=None,
+            help="Per-component override of --dit-layerwise-residency-lifetime, as "
+            "component=value entries, e.g. --layerwise-residency-lifetime "
+            "transformer=permanent,video_vae=forward. 'forward' releases a "
+            "component's resident layers when it finishes running for a request; "
+            "'permanent' places them on the GPU at load time and never releases "
+            "them.",
         )
         parser.add_argument(
             "--dit-layerwise-residency-policy",
@@ -2454,6 +2637,21 @@ class ServerArgs(DisaggServerArgsMixin):
             "schedule. Worth trying when weight streaming overlaps "
             "memory-bound compute -- the transfers stop competing with it for "
             "L2 and DRAM bandwidth, which is where the gain comes from.",
+        )
+        parser.add_argument(
+            "--dit-layerwise-residency-lifetime",
+            type=str,
+            choices=RESIDENCY_LIFETIMES,
+            default=ServerArgs.dit_layerwise_residency_lifetime,
+            help="How long the DiT layers kept by --dit-layerwise-resident-layers "
+            "stay on the GPU. 'forward' (default): placed when the DiT starts its "
+            "denoise steps for a request and released when they finish, so they "
+            "are transferred once per request and keep a copy in host memory. "
+            "'permanent': placed at load time, no host copy, never released -- "
+            "one transfer for the life of the server. Choose 'permanent' when the "
+            "resident layers of every component fit on the GPU together; with "
+            "'forward' only the running component holds its set, so the peak is "
+            "the largest set rather than their sum.",
         )
 
         # offload flags
@@ -2554,7 +2752,7 @@ class ServerArgs(DisaggServerArgsMixin):
             type=int,
             default=None,
             choices=[0, 1],
-            help="Quantize the attention sink too (1, default) " "or keep it bf16 (0).",
+            help="Quantize the attention sink too (1, default) or keep it bf16 (0).",
         )
         parser.add_argument(
             "--kv-cache-quant-sink-keep",
@@ -2656,6 +2854,12 @@ class ServerArgs(DisaggServerArgsMixin):
             help="Port for the HTTP API server.",
         )
         parser.add_argument(
+            "--enable-metrics",
+            action=StoreBoolean,
+            default=ServerArgs.enable_metrics,
+            help="Expose Prometheus metrics at /metrics.",
+        )
+        parser.add_argument(
             "--strict-ports",
             action=StoreBoolean,
             default=ServerArgs.strict_ports,
@@ -2755,6 +2959,13 @@ class ServerArgs(DisaggServerArgsMixin):
             type=str,
             default=ServerArgs.otlp_traces_endpoint,
             help="OTLP collector endpoint when --enable-trace is set. Format: <host>:<port>",
+        )
+        parser.add_argument(
+            "--otlp-service-name",
+            type=str,
+            default=ServerArgs.otlp_service_name,
+            help="Service name for OTLP traces (displayed as 'service.name' in trace backends). "
+            "If unset, falls back to the OTEL_SERVICE_NAME env var, then to 'sglang-diffusion'.",
         )
         parser.add_argument(
             "--log-requests",
@@ -3464,6 +3675,27 @@ class ServerArgs(DisaggServerArgsMixin):
                     "--dit-layerwise-residency-policy has no effect because "
                     "--dit-layerwise-resident-layers is 0: every layer is streamed, "
                     "so there is no resident set to place."
+                )
+
+        if self.dit_layerwise_residency_lifetime not in RESIDENCY_LIFETIMES:
+            raise ValueError(
+                f"Invalid --dit-layerwise-residency-lifetime "
+                f"{self.dit_layerwise_residency_lifetime!r}; expected one of "
+                f"{RESIDENCY_LIFETIMES}."
+            )
+        if self.dit_layerwise_residency_lifetime == RESIDENCY_LIFETIME_PERMANENT:
+            if not self.is_dit_layerwise_offload_selected:
+                logger.warning(
+                    "--dit-layerwise-residency-lifetime has no effect because the "
+                    "DiT is not layerwise-offloaded. It only applies together with "
+                    "--dit-layerwise-offload (or 'dit' in "
+                    "--layerwise-offload-components)."
+                )
+            elif self.dit_layerwise_resident_layers <= 0:
+                logger.warning(
+                    "--dit-layerwise-residency-lifetime has no effect because "
+                    "--dit-layerwise-resident-layers is 0: there is no resident "
+                    "set to keep."
                 )
 
         # validate layerwise offload conflicts

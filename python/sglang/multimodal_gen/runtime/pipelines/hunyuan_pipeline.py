@@ -19,7 +19,6 @@ from sglang.multimodal_gen.runtime.server_args import ServerArgs
 
 
 class HunyuanVideoPipeline(ComposedPipelineBase):
-
     pipeline_name = "HunyuanVideoPipeline"
 
     _required_config_modules = [
