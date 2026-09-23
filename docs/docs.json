@@ -984,6 +984,7 @@
                 "pages": [
                   "docs/supported-models/generative_models",
                   "docs/supported-models/multimodal_language_models",
+                  "docs/basic_usage/mineru2_5",
                   "docs/supported-models/diffusion_language_models"
                 ]
               },
