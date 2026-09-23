@@ -73,6 +73,11 @@ def pull(
         _load_hook(pre_read_hook)(source_dir, target_version)
     with _pull_lock(local_checkpoint_dir):
         applied = _read_applied_version(local_checkpoint_dir)  # None on a fresh host
+        if applied is not None and target_version < applied:
+            raise RuntimeError(
+                f"{local_checkpoint_dir} is at v{applied}, past the requested v{target_version}; "
+                "deltas only apply forward, so pull an older version into a fresh local_checkpoint_dir"
+            )
         # Scan back from the target for the newest full version. Stop at the
         # local state — below it a reset can never be needed (or, on a fresh
         # host, at 0 = the engine's base).

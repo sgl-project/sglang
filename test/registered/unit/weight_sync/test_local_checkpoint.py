@@ -173,6 +173,16 @@ class TestLocalCheckpointPull(unittest.TestCase):
         self.assertEqual(_read_tensors(self.local), self.V1)
         self.assertEqual(local_checkpoint._read_applied_version(self.local), 1)
 
+    def test_pulling_a_version_below_the_local_state_raises(self):
+        """A pull must never report success while the host serves a different version."""
+        _write_delta_version(self._vdir(1), 1, self.V0, self.V1, "xor")
+        _write_delta_version(self._vdir(2), 2, self.V1, self.V2, "xor")
+        self._pull(2)
+
+        with self.assertRaisesRegex(RuntimeError, "past the requested v1"):
+            self._pull(1)
+        self.assertEqual(_read_tensors(self.local), self.V2)
+
     def test_out_of_order_delta_raises(self):
         _write_delta_version(self._vdir(1), 1, self.V0, self.V1, "xor")
         _write_delta_version(self._vdir(2), 2, self.V1, self.V2, "xor")
