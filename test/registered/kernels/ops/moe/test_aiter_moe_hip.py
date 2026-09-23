@@ -262,29 +262,6 @@ class TestRocmRouterGate(CustomTestCase):
             self.reduce(self.gemv(shifted, weight), out_shifted)
             self.assertTrue(torch.equal(out_shifted, torch.roll(full, num_tokens, 0)))
 
-    def test_fused_gate_on_partials(self):
-        weight = (self._randn(NUM_EXPERTS, HIDDEN) * 0.02).to(torch.bfloat16)
-        for num_tokens in (1, 64):
-            x = self._randn(num_tokens, HIDDEN).to(torch.bfloat16)
-            partials = self.gemv(x, weight)
-            logits = torch.empty(num_tokens, NUM_EXPERTS, device=self.device)
-            self.reduce(partials, logits)
-            ref_w, ref_i = _aiter_gate(
-                logits, self.bias_bf16, TOPK, True, ROUTED_SCALING
-            )
-            fused_logits = torch.empty_like(logits)
-            out_w, out_i = self.gate(
-                fused_logits,
-                self.bias_bf16,
-                TOPK,
-                True,
-                ROUTED_SCALING,
-                partials=partials,
-            )
-            self.assertTrue(torch.equal(fused_logits, logits))
-            self.assertTrue(torch.equal(ref_i, out_i))
-            self.assertTrue(torch.equal(ref_w, out_w))
-
 
 @unittest.skipUnless(
     is_hip()

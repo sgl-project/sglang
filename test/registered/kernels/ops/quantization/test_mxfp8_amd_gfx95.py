@@ -174,6 +174,7 @@ class TestMxfp8NativeRouteGfx95(CustomTestCase):
                     mxfp8_native_blockscaled_linear(x, w_sh, ws8, w_small), full
                 )
             )
+            compared = 0
             for m in (m_lo, (m_lo + m_hi) // 2):
                 if self._kernel_identity(m, n, k, has_bf16) != self._kernel_identity(
                     m_hi, n, k, has_bf16
@@ -183,6 +184,8 @@ class TestMxfp8NativeRouteGfx95(CustomTestCase):
                     x[:m].contiguous(), w_sh, ws8, w_small
                 )
                 self.assertTrue(torch.equal(part, full[:m]), (m_lo, m_hi, m))
+                compared += 1
+            self.assertGreater(compared, 0, f"no M shared a kernel with {m_hi}: nothing compared")
 
 
 if __name__ == "__main__":
