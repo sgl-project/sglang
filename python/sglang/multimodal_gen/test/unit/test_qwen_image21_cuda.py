@@ -371,3 +371,77 @@ def test_silu_fusion_mismatch_restores_eager(bf16_model, monkeypatch):
         torch.testing.assert_close(mlp(x), expected, atol=0, rtol=0)
         assert gate.disabled and not gate.verified
         torch.testing.assert_close(mlp(x), expected, atol=0, rtol=0)
+
+
+@torch.no_grad()
+def test_vae_fast_path_keeps_names_and_lossless_output():
+    # The gated fast path must keep the checkpoint's parameter names, run the
+    # original ops bit for bit while the gate is off, and stay close to them
+    # with the gate on (channels_last convs and fused norm+SiLU round differently).
+    from sglang.multimodal_gen.configs.models.vaes.qwenimage21 import (
+        QwenImage21VAEArchConfig,
+        QwenImage21VAEConfig,
+    )
+    from sglang.multimodal_gen.runtime.models.vaes.autoencoder_kl_qwenimage21 import (
+        AutoencoderKLQwenImage21,
+    )
+    from sglang.multimodal_gen.runtime.models.vaes.fast_path_gate import (
+        use_vae_fast_path,
+    )
+    from sglang.multimodal_gen.runtime.models.vaes.qwen_image21_vae_cuda_opt import (
+        _GatedRMSNormSiLU,
+        maybe_optimize_qwen_image21_vae,
+    )
+
+    ac = QwenImage21VAEArchConfig(
+        base_dim=8,
+        decoder_base_dim=8,
+        z_dim=4,
+        dim_mult=(1, 2, 2, 2, 2),
+        num_res_blocks=1,
+        temperal_downsample=(False, True, True, True),
+    )
+    torch.manual_seed(0)
+    plain = AutoencoderKLQwenImage21(QwenImage21VAEConfig(arch_config=ac))
+    plain = plain.cuda().bfloat16().eval()
+    fast = AutoencoderKLQwenImage21(QwenImage21VAEConfig(arch_config=ac))
+    fast = fast.cuda().bfloat16().eval()
+    fast.load_state_dict(plain.state_dict())
+    fast = maybe_optimize_qwen_image21_vae(fast)
+    assert list(fast.state_dict()) == list(plain.state_dict())
+    norms = [m for m in fast.modules() if isinstance(m, _GatedRMSNormSiLU)]
+    assert norms, "fast path was not installed"
+    fused_inputs = []
+    handles = [
+        m.register_forward_pre_hook(
+            lambda mod, args: fused_inputs.append(
+                args[0].is_contiguous(memory_format=torch.channels_last_3d)
+            )
+        )
+        for m in norms
+    ]
+    latent = torch.randn(1, 4, 1, 4, 6, device="cuda", dtype=torch.bfloat16)
+    pixels = torch.randn(1, 4, 1, 64, 96, device="cuda", dtype=torch.bfloat16)
+    try:
+        for name, plain_fn, fast_fn in (
+            ("decode", lambda: plain.decode(latent), lambda: fast.decode(latent)),
+            (
+                "encode",
+                lambda: plain.encode(pixels).mode(),
+                lambda: fast.encode(pixels).mode(),
+            ),
+        ):
+            reference = plain_fn()
+            torch.testing.assert_close(fast_fn(), reference, atol=0, rtol=0)
+            fused_inputs.clear()
+            with use_vae_fast_path(fast, True):
+                accelerated = fast_fn()
+            assert any(fused_inputs), f"{name}: no norm saw a channels_last_3d input"
+            assert accelerated.shape == reference.shape
+            diff = (accelerated.float() - reference.float()).abs()
+            assert diff.mean().item() < 2e-2, f"{name}: mean abs diff {diff.mean()}"
+            # the gate resets after the block, so the next call is bit-exact again
+            torch.testing.assert_close(fast_fn(), reference, atol=0, rtol=0)
+    finally:
+        for handle in handles:
+            handle.remove()

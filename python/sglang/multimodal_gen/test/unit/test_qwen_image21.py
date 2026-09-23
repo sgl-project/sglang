@@ -370,6 +370,8 @@ def test_condition_pixels_match_reference_preprocessing(monkeypatch, tiling):
         num_outputs_per_prompt=1,
         do_classifier_free_guidance=False,
         extra={},
+        # the stage gates the VAE fast path on the request's quality level
+        sampling_params=QwenImage21SamplingParams(),
     )
     stage.forward(
         batch,
