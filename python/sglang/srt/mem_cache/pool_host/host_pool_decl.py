@@ -109,3 +109,34 @@ def make_kv_pool_decl(pool: Any) -> HostPoolDecl:
         storage_info=None,
         host_pool_builder=None,
     )
+
+
+# Separate (non-packed) drafts keep each target-role pool under its own name
+# while reusing the target KV transfer indices.
+_DRAFT_NAMES = {
+    PoolName.KV: PoolName.DRAFT,
+    PoolName.INDEXER: PoolName.DRAFT_INDEXER,
+}
+
+
+def make_draft_sidecar_decls(
+    draft_decls: tuple[HostPoolDecl, ...],
+) -> tuple[HostPoolDecl, ...]:
+    """Rename a draft pool's declarations into the target's sidecar namespace:
+    KV -> DRAFT (own capacity), INDEXER -> DRAFT_INDEXER laid out on DRAFT,
+    every transfer index taken from target KV."""
+    out = []
+    for d in draft_decls:
+        if d.pool_name not in _DRAFT_NAMES:
+            raise ValueError(f"no separate-draft sidecar defined for {d.pool_name}")
+        out.append(
+            msgspec.structs.replace(
+                d,
+                pool_name=_DRAFT_NAMES[d.pool_name],
+                indices_from_pool=PoolName.KV,
+                layout_source=(
+                    None if d.layout_source is None else _DRAFT_NAMES[d.layout_source]
+                ),
+            )
+        )
+    return tuple(out)

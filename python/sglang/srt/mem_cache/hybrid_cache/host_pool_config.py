@@ -129,10 +129,12 @@ def prepare_host_pool_configs(
     full_layer_mapping: dict[int, int],
     transfer_layer_id_max: int,
     packed_draft_decls: tuple[tuple[HostPoolDecl, ...], ...] = (),
+    index_primary: Optional[PoolName] = None,
 ) -> tuple[HostPoolBuildConfig, ...]:
-    """Bind declarations to a stack: the primary KV pool is the one layout root
-    that anchors the others' capacity, and every sidecar takes its indices from
-    it (HostPoolGroup resolves no chains).
+    """Bind declarations to a stack. A target group contains its own primary
+    KV pool; a draft sidecar group reuses an external ``index_primary``. Either
+    way exactly one layout root anchors the others' capacity, and sidecar
+    indices come from one real source (HostPoolGroup resolves no chains).
 
     ``packed_draft_decls`` have passed validate_packed_draft_pools; each config
     carries the draft objects that own its same-named buffers."""
@@ -140,16 +142,20 @@ def prepare_host_pool_configs(
     if len(set(names)) != len(names):
         raise ValueError(f"duplicate host pool names: {names}")
     root = layout_root(decls)
-    if not root.is_primary or root.pool_name != PoolName.KV:
-        raise ValueError(
-            f"expected the layout root to be the primary KV pool, got {root.pool_name}"
-        )
+    if index_primary is None:
+        if not root.is_primary or root.pool_name != PoolName.KV:
+            raise ValueError(
+                f"expected the layout root to be the primary KV pool, got {root.pool_name}"
+            )
+        index_primary = root.pool_name
+    elif any(d.is_primary for d in decls):
+        raise ValueError("a sidecar group must take every index from the target")
     for d in decls:
         if d.is_primary:
             continue
-        if d.indices_from_pool != root.pool_name:
+        if d.indices_from_pool != index_primary:
             raise ValueError(
-                f"{d.pool_name}.indices_from_pool must be {root.pool_name}, "
+                f"{d.pool_name}.indices_from_pool must be {index_primary}, "
                 f"got {d.indices_from_pool}"
             )
         if d.is_layout_root:
