@@ -3,6 +3,7 @@
 import math
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 
@@ -201,12 +202,12 @@ class TestAiterSparseBackend(CustomTestCase):
         )[0]
 
     def test_pinned_splits_are_batch_invariant(self):
-        """SGLANG_OPT_HIP_ATTN_KV_SPLITS pins the split-KV count so a row's output
-        is bitwise the same at every batch size; aiter's cost model changes the count
+        """A pinned split-KV count (deterministic inference pins 4) keeps a row's output
+        bitwise the same at every batch size; aiter's cost model changes the count
         past 64 rows."""
-        from sglang.srt.environ import envs
-
-        with envs.SGLANG_OPT_HIP_ATTN_KV_SPLITS.override(4):
+        with patch(
+            "sglang.srt.layers.attention.hip_flash_mla.hip_attn_kv_splits", lambda: 4
+        ):
             one, eight, many = (
                 self._run_rows(1),
                 self._run_rows(8),

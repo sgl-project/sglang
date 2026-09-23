@@ -931,25 +931,6 @@ class Envs:
     # go back to the unfused chain on the verify path.
     SGLANG_OPT_FUSED_QK_NORM_ROPE_VERIFY = EnvBool(True)
     SGLANG_OPT_USE_AITER_INDEXER = EnvBool(False)
-    # gfx950 mHC: the boundary reduce + sinkhorn rides in the layer's next RMSNorm launch (0: alone)
-    SGLANG_OPT_HIP_FUSE_SINKHORN_INTO_NORM = EnvBool(True)
-    # Opt-in: faster mHC projection can regress full-model decode throughput.
-    SGLANG_OPT_HIP_MHC_BF16X3_PREFILL = EnvBool(False)
-    # gfx950 standalone mHC post: wider blocks for medium prefill batches.
-    SGLANG_OPT_HIP_MHC_POST_SPLIT_H = EnvBool(True)
-    # gfx950 TP4 BF16 WO-A: GEMV/tiny split-K and direct output for large verify batches.
-    SGLANG_OPT_HIP_WO_A_BF16_DECODE = EnvBool(True)
-    # TP4 verify: quantize WO-A partial sums directly for native MXFP8 WO-B.
-    SGLANG_OPT_HIP_WO_A_MXFP8_EPILOGUE = EnvBool(False)
-    # gfx950 TP4 tiny-row attention and MoE all-reduce/post fusion.
-    SGLANG_OPT_HIP_ALL_REDUCE_MHC = EnvBool(True)
-    # aiter MoE: the FlyDSL top-k reduction adds the shared expert in the same launch (0: separate add)
-    SGLANG_OPT_HIP_FUSED_MOE_REDUCE_ADD = EnvBool(True)
-    # HIP: fused decode glue launches (page table, index widening, image select); 0: torch
-    SGLANG_OPT_HIP_FUSED_DECODE_GLUE = EnvBool(True)
-    # HIP sparse decode split-KV count. Unset: adaptive splits and the native TP4 16-head
-    # attention, or a fixed 4 under deterministic inference (hip_flash_mla.hip_attn_kv_splits).
-    SGLANG_OPT_HIP_ATTN_KV_SPLITS = EnvInt(None)
 
     # ===================================================================
     # Apple Silicon and MLX
@@ -1538,9 +1519,6 @@ class Envs:
     # anonymous mapping per rank holding only its rows, gathered with the
     # all-reduce, and the only layout that gets huge pages without shmem THP.
     SGLANG_DSV41_ENGRAM_HOST_TABLE_LAYOUT = EnvStr("shared")
-    # Overlap the engram layer's shared-host lookup and WKV projection with the earlier
-    # layers at batch size 1.
-    SGLANG_ENABLE_DSV41_ENGRAM_KV_PREFETCH = EnvBool(False)
 
     # Kernels and indexer
     SGLANG_OPT_DEEPGEMM_HC_PRENORM = EnvBool(True)

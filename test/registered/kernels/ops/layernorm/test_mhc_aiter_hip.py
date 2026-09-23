@@ -212,8 +212,8 @@ class TestAiterMHCGLM53Flash(CustomTestCase):
 
 @unittest.skipUnless(is_hip() and is_gfx95_supported(), "requires gfx950")
 class TestMhcPostSplitH(CustomTestCase):
-    """SGLANG_OPT_HIP_MHC_POST_SPLIT_H routes the model's hc_post to the
-    split-H launch: bitwise aiter's mhc_post and stable under graph replay."""
+    """The model's hc_post takes the split-H launch: bitwise aiter's mhc_post and
+    stable under graph replay."""
 
     def setUp(self):
         from sglang.srt.models.deepseek_v4 import DeepseekV4DecoderLayer
@@ -223,7 +223,6 @@ class TestMhcPostSplitH(CustomTestCase):
         )
         self.run_post = lambda *args: DeepseekV4DecoderLayer.hc_post(self.layer, *args)
         for setting in (
-            envs.SGLANG_OPT_HIP_MHC_POST_SPLIT_H.override(True),
             envs.SGLANG_OPT_USE_TILELANG_MHC_POST.override(False),
             envs.SGLANG_OPT_USE_FLASHINFER_MHC.override(False),
         ):

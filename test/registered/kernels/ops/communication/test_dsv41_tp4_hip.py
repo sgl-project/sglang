@@ -3,6 +3,7 @@ mHC post handoff of attention and MoE under mutable graph replay, the sharded gr
 selection of the DSpark draft, and the bit-preserving Engram reconstruction."""
 
 import os
+from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -78,8 +79,6 @@ class _Attention:
         self.rank = group.rank_in_group
 
     def maybe_use_decode_attn_tp(self, forward_batch):
-        from contextlib import nullcontext
-
         return nullcontext()
 
     def __call__(self, *, x, **kwargs):
@@ -97,8 +96,6 @@ def _layer(group):
         config=SimpleNamespace(model_type="deepseek_v41"),
         dsa_enable_prefill_cp=False,
         hc_pre_from_prev_sublayer=False,
-        _hc_attn_bf16_parts=None,
-        _hc_ffn_bf16_parts=None,
         self_attn=_Attention(group),
         mlp=SimpleNamespace(tp_size=1),
         hc_mult=4,
@@ -136,6 +133,9 @@ def _no_deterministic_inference():
     )
 
 
+_FUSED_MHC = "sglang.srt.models.deepseek_common.amd.deepseek_v4_fused_mhc"
+
+
 def _replay_fused_and_unfused(group, run, check, *, residual, pre):
     """Capture run with the fused all-reduce off and on, then replay both on new
     inputs and compare through check."""
@@ -144,7 +144,9 @@ def _replay_fused_and_unfused(group, run, check, *, residual, pre):
         # the server hook turns the tilelang post off on ROCm at model load
         with (
             envs.SGLANG_OPT_USE_TILELANG_MHC_POST.override(False),
-            envs.SGLANG_OPT_HIP_ALL_REDUCE_MHC.override(enabled),
+            nullcontext()
+            if enabled
+            else patch(f"{_FUSED_MHC}._can_fuse_mhc", lambda *_: False),
         ):
             graph = torch.cuda.CUDAGraph()
             with group.graph_capture() as capture:

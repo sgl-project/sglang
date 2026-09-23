@@ -2597,11 +2597,20 @@ def _hc_mix_stats_bf16x3_kernel(
     tl.store(SQ + tl.program_id(1) * M + rows, sq, rows < M)
 
 
-def hc_mix_stats_bf16x3_partials(x: torch.Tensor, weight_parts, hc_mult: int = 4):
+def hc_mix_stats_sinkhorn_bf16x3(
+    x: torch.Tensor,
+    weight_parts,
+    scale: torch.Tensor,
+    base: torch.Tensor,
+    sinkhorn_iters: int,
+    rms_eps: float,
+    hc_eps: float,
+    hc_mult: int = 4,
+):
     m, k = x.shape
     mix = (2 + hc_mult) * hc_mult
     slices = _HC_MIX_COMPENSATED_SLICES
-    assert x.is_contiguous() and x.dtype == torch.bfloat16 and 0 < m <= 65536
+    assert x.is_contiguous() and x.dtype == torch.bfloat16 and 4096 <= m <= 65536
     assert k % (slices * _HC_MIX_BLOCK_K) == 0
     assert len(weight_parts) == 3
     assert all(
@@ -2610,6 +2619,9 @@ def hc_mix_stats_bf16x3_partials(x: torch.Tensor, weight_parts, hc_mult: int = 4
     )
     part_mix = torch.empty((slices, m, mix), device=x.device, dtype=torch.float32)
     sq = torch.empty((slices, m), device=x.device, dtype=torch.float32)
+    pre = torch.empty((m, hc_mult), device=x.device, dtype=torch.float32)
+    post = torch.empty_like(pre)
+    comb = torch.empty((m, hc_mult, hc_mult), device=x.device, dtype=torch.float32)
     _hc_mix_stats_bf16x3_kernel[(triton.cdiv(m, _HC_MIX_BF16X3_BLOCK_M), slices)](
         x,
         *weight_parts,
@@ -2625,27 +2637,6 @@ def hc_mix_stats_bf16x3_partials(x: torch.Tensor, weight_parts, hc_mult: int = 4
         num_warps=4,
         num_stages=3,
     )
-    return part_mix, sq
-
-
-def hc_mix_stats_sinkhorn_bf16x3(
-    x: torch.Tensor,
-    weight_parts,
-    scale: torch.Tensor,
-    base: torch.Tensor,
-    sinkhorn_iters: int,
-    rms_eps: float,
-    hc_eps: float,
-    hc_mult: int = 4,
-):
-    m, k = x.shape
-    mix = (2 + hc_mult) * hc_mult
-    slices = _HC_MIX_COMPENSATED_SLICES
-    assert 4096 <= m <= 65536
-    part_mix, sq = hc_mix_stats_bf16x3_partials(x, weight_parts, hc_mult)
-    pre = torch.empty((m, hc_mult), device=x.device, dtype=torch.float32)
-    post = torch.empty_like(pre)
-    comb = torch.empty((m, hc_mult, hc_mult), device=x.device, dtype=torch.float32)
     _hc_mix_reduce_sinkhorn_kernel[(m,)](
         part_mix,
         sq,

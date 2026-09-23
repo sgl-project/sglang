@@ -18,12 +18,10 @@ _AITER_SPARSE_SINGLE_SPLIT_MIN_TOKENS = 1024
 
 
 def hip_attn_kv_splits() -> int:
-    """Split-KV count for the HIP sparse decode kernels. SGLANG_OPT_HIP_ATTN_KV_SPLITS
-    wins when set; otherwise deterministic inference pins 4 splits (a fixed combine order
-    keeps the bits identical at every batch size) and everything else uses 0: adaptive
-    splits plus the native 16-head attention for small TP4 decode batches."""
-    if envs.SGLANG_OPT_HIP_ATTN_KV_SPLITS.is_set():
-        return envs.SGLANG_OPT_HIP_ATTN_KV_SPLITS.get()
+    """Split-KV count for the HIP sparse decode kernels. Deterministic inference pins 4
+    splits (a fixed combine order keeps the bits identical at every batch size) and
+    everything else uses 0: adaptive splits plus the native 16-head attention for small
+    TP4 decode batches."""
     try:
         deterministic = get_exec().deterministic.enable_deterministic_inference
     except ValueError:  # no published exec config (kernel tests, offline tools)
@@ -153,12 +151,6 @@ def _apply_inverse_rope(
         positions.view(-1)[:n],
         inverse=True,
     )
-
-
-def hip_fused_decode_glue() -> bool:
-    """Whether the DSV4.1 decode glue (page table, index widening, image select)
-    runs as fused HIP launches; the torch chains are bitwise the same."""
-    return is_hip() and envs.SGLANG_OPT_HIP_FUSED_DECODE_GLUE.get()
 
 
 def resolve_hip_flashmla_backend(backend: Optional[str] = None) -> str:

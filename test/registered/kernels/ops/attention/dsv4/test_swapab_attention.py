@@ -182,10 +182,11 @@ class TestSwapABAttention(CustomTestCase):
         from types import SimpleNamespace
         from unittest.mock import patch
 
+        backend_module = "sglang.srt.layers.attention.deepseek_v4_backend_hip_radix"
+
         from sglang.kernels.ops.attention.dsv4.dequant_k_cache import (
             dequantize_k_cache_paged,
         )
-        from sglang.srt.environ import envs
         from sglang.srt.model_executor.forward_batch_info import ForwardMode
         from sglang.test.kits.attention_unittest.attention_methods import (
             dsv4_attention as kit,
@@ -226,9 +227,13 @@ class TestSwapABAttention(CustomTestCase):
         )
         for splits, calls in ((0, 1), (1, 0)):
             with (
-                envs.SGLANG_OPT_HIP_ATTN_KV_SPLITS.override(splits),
+                patch(f"{backend_module}.hip_attn_kv_splits", lambda: splits),
                 patch(
-                    "sglang.srt.layers.attention.deepseek_v4_backend_hip_radix.swapab_attention",
+                    "sglang.srt.layers.attention.hip_flash_mla.hip_attn_kv_splits",
+                    lambda: splits,
+                ),
+                patch(
+                    f"{backend_module}.swapab_attention",
                     wraps=swapab_attention,
                 ) as native,
             ):

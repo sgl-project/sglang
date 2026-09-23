@@ -943,20 +943,6 @@ class Engram(nn.Module):
             # empty M.
             return x
         kv, _ = self.wkv(emb.flatten(-2))
-        return self.apply_gate(x, kv, image_select=image_select)
-
-    def project(
-        self, hash_ids: torch.Tensor, *, cp_all_tokens: bool = False
-    ) -> torch.Tensor:
-        kv, _ = self.wkv(self.embed(hash_ids, cp_all_tokens=cp_all_tokens).flatten(-2))
-        return kv
-
-    def apply_gate(
-        self,
-        x: torch.Tensor,
-        kv: torch.Tensor,
-        image_select: Optional[Tuple[torch.Tensor, int]] = None,
-    ) -> torch.Tensor:
         return engram_gate(
             x,
             kv,

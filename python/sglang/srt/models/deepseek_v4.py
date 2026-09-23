@@ -427,13 +427,8 @@ _wo_a_aiter_batched_gemm_disabled = False
 _wo_a_fp8_mxscale = None
 _wo_a_fp8_mxscale_fused_invrope = None
 _wo_a_weight_scale_to_e8m0 = None
-# DeepSeek-V4.1 Flash: the Engram layer whose lookup the BS=1 decode prefetches
-ENGRAM_PREFETCH_LAYER_ID = 14
 _hip = None
 if _is_hip:
-    from sglang.kernels.ops.attention.dsv4.wo_a_bf16_hip import (
-        wo_a_bf16_small_batch_mxfp8_hip,
-    )
     from sglang.srt.models.deepseek_common.amd import deepseek_v4_hip as _hip
     from sglang.srt.models.deepseek_common.amd.deepseek_v4_wo_a_fp8 import (
         apply_wo_a_fp8_mxscale,
@@ -480,7 +475,6 @@ def _apply_wo_a_bf16_matmul(
     hip_decode_verify = (
         _is_hip
         and _is_gfx95_supported
-        and envs.SGLANG_OPT_HIP_WO_A_BF16_DECODE.get()
         and (
             (is_decode and o.shape[0] == 1 and o.is_contiguous())
             or (is_target_verify and 2 <= o.shape[0] <= 384)
@@ -532,13 +526,6 @@ def _apply_wo_a_bf16_matmul(
         if is_decode and o.shape[0] == 1:
             return wo_a_bf16_gemv(o, wo_a)
         if 2 <= o.shape[0] <= 8:
-            if (
-                _is_hip
-                and fp8_grid
-                and not get_forward().sp_active
-                and envs.SGLANG_OPT_HIP_WO_A_MXFP8_EPILOGUE.get()
-            ):
-                return wo_a_bf16_small_batch_mxfp8_hip(o, wo_a)
             if fuse_mxfp8_quant and _is_cuda:
                 return Mxfp8SwizzledInput(*wo_a_bf16_small_batch_mxfp8(o, wo_a))
             return wo_a_bf16_small_batch(o, wo_a)
@@ -2879,20 +2866,6 @@ class DeepseekV4DecoderLayer(nn.Module):
         self._hc_attn_tf32_parts = self._hc_ffn_tf32_parts = None
         self._hc_attn_bf16_parts = self._hc_ffn_bf16_parts = None
         if (
-            _is_gfx95_supported
-            and self.hc_pre_from_prev_sublayer
-            and self.hc_attn_fn.shape == self.hc_ffn_fn.shape == (24, 20480)
-            and getattr(self.config, "model_type", None) == "deepseek_v41"
-            and envs.SGLANG_OPT_HIP_MHC_BF16X3_PREFILL.get()
-            and not is_batch_invariant_mode_enabled()
-        ):
-            from sglang.kernels.ops.layernorm.mhc import (
-                split_bf16_hc_weight,
-            )
-
-            self._hc_attn_bf16_parts = split_bf16_hc_weight(self.hc_attn_fn.data)
-            self._hc_ffn_bf16_parts = split_bf16_hc_weight(self.hc_ffn_fn.data)
-        if (
             self.hc_pre_from_prev_sublayer
             and get_platform().is_sm100
             and self.hc_attn_fn.shape == (24, 20480)
@@ -3149,7 +3122,6 @@ class DeepseekV4DecoderLayer(nn.Module):
         if (
             _is_hip
             and _is_gfx95_supported
-            and envs.SGLANG_OPT_HIP_MHC_POST_SPLIT_H.get()
             and self.config.model_type == "deepseek_v41"
             and 768 <= x.shape[0] <= 4096
             and x.shape[1] == 5120
@@ -4469,36 +4441,6 @@ class DeepseekV4Model(nn.Module):
                 ),
             )
 
-        self.engram_prefetch_stream = None
-        if (
-            (_is_cuda or _is_hip)
-            and envs.SGLANG_ENABLE_DSV41_ENGRAM_KV_PREFETCH.get()
-            and self.pp_group.world_size == 1
-            and not is_dp_attention_enabled()
-            # HIP preserves image-token rows after the prefetched projection.
-            and (_is_hip or config.vision_n_layers == 0)
-            and config.hc_pre_from_prev_sublayer
-            and self.start_layer <= ENGRAM_PREFETCH_LAYER_ID < self.end_layer
-            and self.layers[ENGRAM_PREFETCH_LAYER_ID].engram is not None
-            and self.layers[ENGRAM_PREFETCH_LAYER_ID].engram.embed._shared
-            # These backends use per-call scratch rather than a shared GEMM workspace.
-            and getattr(
-                self.layers[ENGRAM_PREFETCH_LAYER_ID].engram.wkv.quant_method,
-                "mxfp8_dense_backend",
-                None,
-            )
-            in (
-                Mxfp8DenseGemmBackend.FLASHINFER_CUTEDSL,
-                Mxfp8DenseGemmBackend.GFX95_DOT_SCALED,
-                Mxfp8DenseGemmBackend.GFX95_MXFP8_NATIVE,
-            )
-        ):
-            self.engram_prefetch_stream = torch.cuda.Stream()
-            logger.info(
-                "Engram layer %d KV prefetch enabled for BS=1 decode",
-                ENGRAM_PREFETCH_LAYER_ID,
-            )
-
         self.use_fused_mhc_post_pre = (
             is_cross_layer_mhc_fusion_enabled() or _is_fused_mhc_post_pre_enabled_xpu()
         )
@@ -4619,22 +4561,6 @@ class DeepseekV4Model(nn.Module):
                 )
             else:
                 hash_ids = self.engram_hasher(input_ids, forward_batch)
-        prefetched_engram_kv = None
-        if (
-            self.engram_prefetch_stream is not None
-            and forward_batch.forward_mode.is_decode()
-            and hash_ids.shape[0] == 1
-        ):
-            # Overlap the prefetch layer's shared-host lookup and WKV projection with the
-            # earlier layers; the main stream joins right before the gate.
-            prefetch_stream = self.engram_prefetch_stream
-            prefetch_stream.wait_stream(torch.cuda.current_stream())
-            engram = self.layers[ENGRAM_PREFETCH_LAYER_ID].engram
-            with torch.cuda.stream(prefetch_stream):
-                prefetched_engram_kv = engram.project(
-                    hash_ids[:, engram.layer_hash_index]
-                )
-            hash_ids.record_stream(prefetch_stream)
         tail = None
         if (
             self.late_layer_start is not None
@@ -4681,22 +4607,13 @@ class DeepseekV4Model(nn.Module):
                     if _is_hip
                     else None
                 )
-                if i == ENGRAM_PREFETCH_LAYER_ID and prefetched_engram_kv is not None:
-                    main_stream = torch.cuda.current_stream()
-                    main_stream.wait_stream(self.engram_prefetch_stream)
-                    prefetched_engram_kv.record_stream(main_stream)
-                    hidden_states = engram.apply_gate(
-                        hidden_states, prefetched_engram_kv, image_select=image_select
-                    )
-                    prefetched_engram_kv = None
-                else:
-                    hidden_states = engram(
-                        hidden_states,
-                        hash_ids[:, engram.layer_hash_index],
-                        forward_batch,
-                        cp_all_tokens=cp_extend,
-                        image_select=image_select,
-                    )
+                hidden_states = engram(
+                    hidden_states,
+                    hash_ids[:, engram.layer_hash_index],
+                    forward_batch,
+                    cp_all_tokens=cp_extend,
+                    image_select=image_select,
+                )
                 if image_select is None and (
                     self.config.model_type == "deepseek_v41"
                     and self.config.vision_n_layers > 0

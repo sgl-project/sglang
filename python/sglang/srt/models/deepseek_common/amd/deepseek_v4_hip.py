@@ -11,7 +11,6 @@ import torch
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.hip_flash_mla import (
     hip_attention_needs_head_pad,
-    hip_fused_decode_glue,
 )
 from sglang.srt.layers.quantization.fp8 import Fp8Config
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context import (
@@ -124,7 +123,7 @@ def engram_image_select(config, input_ids: torch.Tensor):
     itself (the model's torch.where after the gate), else None."""
     if not (config.model_type == "deepseek_v41" and config.vision_n_layers > 0):
         return None
-    if not (input_ids.is_cuda and hip_fused_decode_glue()):
+    if not input_ids.is_cuda:
         return None
     return input_ids.contiguous(), config.image_token_id
 

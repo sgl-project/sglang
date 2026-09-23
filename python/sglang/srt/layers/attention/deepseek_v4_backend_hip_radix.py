@@ -91,7 +91,6 @@ from sglang.srt.layers.attention.hip_flash_mla import (
     _apply_inverse_rope,
     flash_mla_with_kvcache_entrypoint,
     hip_attn_kv_splits,
-    hip_fused_decode_glue,
     resolve_hip_flashmla_backend,
 )
 from sglang.srt.layers.cp.utils import is_cp_active
@@ -1579,7 +1578,6 @@ class DeepseekV4HipRadixBackend(
                 and forward_batch.positions.is_cuda
                 and forward_batch.req_pool_indices.shape
                 == forward_batch.positions.shape
-                and hip_fused_decode_glue()
             ):
                 # both widenings in one launch
                 metadata.low_ratio_req_indices, metadata.low_ratio_pos_i64 = (
@@ -3075,7 +3073,7 @@ class DeepseekV4HipRadixBackend(
                 torch.clamp(seq_lens_casual, max=SWA_WINDOW), floored.clamp_min(0)
             )
 
-        if req_to_token.is_cuda and hip_fused_decode_glue():
+        if req_to_token.is_cuda:
             # the gather, the floor division and the cast in one launch
             page_table = page_table_from_req_to_token(
                 req_to_token, req_pool_indices_repeated, max_seq_len, self.page_size

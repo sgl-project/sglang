@@ -8,7 +8,6 @@ import triton
 import triton.language as tl
 
 from sglang.kernels.jit.utils import cache_once, load_jit
-from sglang.kernels.ops.layernorm.mhc_prefill_hip import hc_boundary_bf16x3_partials
 from sglang.kernels.ops.quantization.rmsnorm_fake_quant_amd_gfx95 import (
     Fp8GridActivation,
     Mxfp8Activation,
@@ -27,7 +26,6 @@ _HC_BOUNDARY_BLOCK_M = 16
 _HC_BOUNDARY_BLOCK_K = 64
 _HC_BOUNDARY_NUM_WARPS = 2
 _HC_BOUNDARY_NUM_STAGES = 1
-_HC_BOUNDARY_BF16X3_MIN_M = 1024
 # the reduce + sinkhorn row uses the norm kernel's warp count whether hosted there or launched alone
 _HC_SINKHORN_NUM_WARPS = 4
 
@@ -720,8 +718,6 @@ def hc_boundary_fused_deferred(
     sinkhorn_iters: int,
     rms_eps: float,
     hc_eps: float,
-    *,
-    weight_parts=None,
 ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor], HcCoefficients]:
     """HIP mHC sublayer boundary with the reduce + sinkhorn left pending: residual_out =
     hc_post(x, residual, post_in, comb_in) when x is given, y = sum_k pre_prev[k] * copy_k
@@ -752,30 +748,17 @@ def hc_boundary_fused_deferred(
         y = torch.empty((m, h), dtype=residual.dtype, device=dev)
     else:
         y = None
-    if (
-        weight_parts is not None
-        and _HC_BOUNDARY_BF16X3_MIN_M <= m <= 65536
-        and h == 5120
-        and residual.dtype == torch.bfloat16
-        and residual.is_contiguous()
-        and (x is None or x.is_contiguous())
-        and _hc_boundary_prefill_available()
-    ):
-        part_mix, part_sq = hc_boundary_bf16x3_partials(
-            x, residual, post_in, comb_in, pre_prev, residual_out, y, weight_parts
-        )
-    else:
-        part_mix, part_sq = _hc_boundary_partials(
-            x,
-            residual,
-            post_in,
-            comb_in,
-            pre_prev,
-            hc_fn,
-            residual_out,
-            y,
-            hc_mult=hc_mult,
-        )
+    part_mix, part_sq = _hc_boundary_partials(
+        x,
+        residual,
+        post_in,
+        comb_in,
+        pre_prev,
+        hc_fn,
+        residual_out,
+        y,
+        hc_mult=hc_mult,
+    )
     coefficients = HcCoefficients(
         part_mix,
         part_sq,

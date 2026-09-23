@@ -7,7 +7,6 @@ import torch
 
 from sglang.kernels.ops.communication.all_reduce_mhc_hip import all_reduce_mhc_post
 from sglang.srt.distributed.parallel_state import get_tp_group
-from sglang.srt.environ import envs
 from sglang.srt.layers.moe.mhc_post_fusion import current_mhc_post_fusion
 from sglang.srt.layers.moe.utils import post_experts_all_reduce
 from sglang.srt.models.deepseek_common.amd.deepseek_v4_fused_mhc import (
@@ -41,8 +40,7 @@ def fuse_shared_into_reduce(moe, skip_shared_experts: bool, num_tokens: int) -> 
     in one launch. shared_experts exists only when the checkpoint has one that is not
     fused into the routed kernel."""
     return bool(
-        envs.SGLANG_OPT_HIP_FUSED_MOE_REDUCE_ADD.get()
-        and getattr(moe, "shared_experts", None) is not None
+        getattr(moe, "shared_experts", None) is not None
         and not moe._shared_expert_tp1
         and not moe._fuse_shared_experts_inside_sbo
         and not skip_shared_experts

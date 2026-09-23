@@ -465,12 +465,6 @@ def hc_boundary(
     """Fused sublayer boundary (ROCm): apply the pending hc_post of x onto residual, collapse
     with pre_prev (copy 0 when None) and take the mixing statistics. Returns (new_residual, y,
     coefficients); the coefficients' reduce + sinkhorn is still pending (see HcCoefficients)."""
-    # the bf16x3 weight parts exist only when the layer enabled that prefill regime
-    weight_parts = (
-        layer._hc_attn_bf16_parts
-        if hc_fn is layer.hc_attn_fn
-        else layer._hc_ffn_bf16_parts
-    )
     new_residual, y, coefficients = hc_boundary_fused_deferred(
         x,
         residual,
@@ -484,10 +478,7 @@ def hc_boundary(
         layer.hc_sinkhorn_iters,
         layer.rms_norm_eps,
         layer.hc_eps,
-        weight_parts=weight_parts,
     )
-    if not envs.SGLANG_OPT_HIP_FUSE_SINKHORN_INTO_NORM.get():
-        coefficients.materialize()
     if new_residual is None:
         new_residual = residual
     if y is None:
@@ -498,7 +489,6 @@ def hc_boundary(
 def _can_fuse_mhc(layer, residual: torch.Tensor, forward_batch) -> bool:
     return (
         _is_gfx95_supported
-        and envs.SGLANG_OPT_HIP_ALL_REDUCE_MHC.get()
         and 1 <= residual.shape[0] <= ALL_REDUCE_MHC_MAX_ROWS
         and residual.shape[1:] == (4, MHC_HIDDEN_SIZE)
         and residual.dtype == torch.bfloat16
