@@ -178,7 +178,9 @@ def _restore_fnuz_block_weight(
 ) -> None:
     """Invert gfx94x block-FP8 finalization without changing parameter/storage identity.
 
-    Keeping old values valid also permits partial updates and empty sessions.
+    Keeping old values valid also permits partial updates and empty sessions on gfx94x.
+    It does not on gfx95: the AITER shuffles there are neither flagged nor undone, so a
+    layer a session does not overwrite is shuffled a second time when it is finalized.
     FN/FNUZ conversion is a bit reinterpretation paired with a scale change,
     never a numeric cast. The shuffle is AITER's default (16, 16) FP8 layout.
     """

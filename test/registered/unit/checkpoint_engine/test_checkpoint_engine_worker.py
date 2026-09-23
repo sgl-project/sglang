@@ -139,3 +139,39 @@ class TestWorkerDeviceUuidOnXpu(CustomTestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=3)
+
+
+@unittest.skipUnless(_HAS_CHECKPOINT_ENGINE, _NO_CKPT_ENGINE)
+class TestWorkerModelLoaderRestores(CustomTestCase):
+    """An IPC reload opens no weight-update session, so the loader itself must put the
+    converted layers back in checkpoint form before the first write."""
+
+    def test_restore_runs_before_every_load(self):
+        calls = []
+        model_runner = MagicMock()
+        model_runner.model.load_weights.side_effect = lambda weights: calls.append(
+            ("load", list(weights))
+        )
+        worker = SGLangCheckpointEngineWorkerExtensionImpl(model_runner=model_runner)
+        with (
+            patch(
+                "sglang.srt.model_loader.loader.restore_weight",
+                side_effect=lambda model, device: calls.append(("restore", model)),
+            ),
+            patch(f"{_WORKER_MOD}.get_device", return_value="cpu"),
+            patch(f"{_WORKER_MOD}.get_device_module") as device_module,
+        ):
+            device_module.return_value.current_device.return_value = 0
+            loader = worker.get_model_loader()
+            loader(iter([("a", 1)]))
+            loader(iter([]))
+
+        self.assertEqual(
+            calls,
+            [
+                ("restore", model_runner.model),
+                ("load", [("a", 1)]),
+                ("restore", model_runner.model),
+                ("load", []),
+            ],
+        )
