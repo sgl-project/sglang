@@ -5,7 +5,7 @@ under a shared ``source_dir``. Each version is a canonical HF checkpoint
 directory of one of two kinds, distinguished by its index metadata:
 
 - **full**: an ordinary checkpoint. Pulling it copies it into the host-local
-  ``local_checkpoint_dir``, replacing whatever is there — no history needed.
+  ``local_checkpoint_dir``, replacing whatever is there; no history needed.
 - **delta** (index metadata carries ``delta_encoding``): safetensors files
   holding zstd-compressed per-tensor diffs against version N-1, plus per-tensor
   checksums of the new state. Pulling it patches the local checkpoint in place.
@@ -16,7 +16,8 @@ local checkpoint through the ordinary ``update_weights_from_disk`` path.
 
 ``pull()`` is safe to call concurrently from every scheduler rank on a host: a
 per-host file lock serializes the work and an applied-version marker makes the
-extra calls no-ops.
+extra calls no-ops. The marker is dropped before the local files are touched, so
+a pull that fails midway leaves a host that reseeds on its next pull.
 """
 
 from __future__ import annotations
@@ -59,18 +60,8 @@ def pull(
     target_version: int,
     pre_read_hook: Optional[str] = None,
 ) -> None:
-    """Bring the host-local checkpoint up to ``target_version``.
-
-    Seeds from the newest full checkpoint at or below the target — the engine's
-    own base (``base_dir``) for a pure-delta stream, a published full version
-    otherwise — then applies the remaining deltas in order. A local checkpoint
-    already past the seed point just continues its delta chain. Raises on any
-    per-tensor checksum mismatch (fail loud, never serve bad weights).
-    """
-    # Object-store-backed shared filesystems lack cross-host read-after-write
-    # consistency: the publisher's files only appear here after an explicit
-    # refresh, which the deployment supplies as this hook. POSIX shared
-    # filesystems (NFS, Lustre, ...) need none.
+    """Bring the host-local checkpoint up to ``target_version``: seed from the newest full
+    version at or below it (v0 is ``base_dir``), then apply the deltas after it in order."""
     if target_version > 0 and pre_read_hook:
         dynamic_import(pre_read_hook)(source_dir, target_version)
     with _pull_lock(local_checkpoint_dir):
@@ -80,9 +71,7 @@ def pull(
                 f"{local_checkpoint_dir} is at v{applied}, past the requested v{target_version}; "
                 "deltas only apply forward, so pull an older version into a fresh local_checkpoint_dir"
             )
-        # Scan back from the target for the newest full version. Stop at the
-        # local state — below it a reset can never be needed (or, on a fresh
-        # host, at 0 = the engine's base).
+        # below the local state a reseed is never needed; a fresh host bottoms out at v0
         floor = applied if applied is not None else 0
         start = target_version
         while start > floor and _is_delta(_version_dir(source_dir, start)):
@@ -101,20 +90,17 @@ def _version_dir(source_dir: str, version: int) -> str:
 
 
 def _is_delta(version_dir: str) -> bool:
-    """A version is a delta iff its index metadata declares an encoding; an
-    ordinary HF checkpoint (with or without an index) is a full version."""
     if not os.path.isdir(version_dir):
         raise FileNotFoundError(f"published weight version missing: {version_dir}")
     try:
         with open(os.path.join(version_dir, "model.safetensors.index.json")) as f:
             return "delta_encoding" in json.load(f).get("metadata", {})
-    except FileNotFoundError:
+    except FileNotFoundError:  # a single-file HF checkpoint has no index
         return False
 
 
+# adler32 behind the incremental .update / .hexdigest interface of the hash objects
 class _Adler32:
-    """adler32 behind the incremental .update / .hexdigest interface the hash objects expose."""
-
     def __init__(self):
         self._value = 1
 
@@ -187,7 +173,6 @@ def _write_applied_version(local_checkpoint_dir: str, version: int) -> None:
 
 
 def _drop_page_cache(path: str) -> None:
-    """Evict a file from the page cache (POSIX_FADV_DONTNEED)."""
     fd = os.open(path, os.O_RDONLY)
     try:
         os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
@@ -196,9 +181,6 @@ def _drop_page_cache(path: str) -> None:
 
 
 def _reset_checkpoint(src_dir: str, local_checkpoint_dir: str, version: int) -> None:
-    """Make local_checkpoint_dir an exact copy of the full checkpoint in src_dir
-    (files the new checkpoint doesn't have — e.g. differently-sharded old ones —
-    are pruned). Later deltas chain on top of this state."""
     logger.info(
         "Pulling full checkpoint v%d %s -> %s", version, src_dir, local_checkpoint_dir
     )
@@ -209,6 +191,7 @@ def _reset_checkpoint(src_dir: str, local_checkpoint_dir: str, version: int) -> 
         shutil.copy2(entry.path, os.path.join(local_checkpoint_dir, entry.name))
         # don't let the source evict the local copy we keep resident
         _drop_page_cache(entry.path)
+    # an exact copy: drop files the new checkpoint lacks, e.g. a different sharding
     names = {entry.name for entry in src_files}
     for entry in os.scandir(local_checkpoint_dir):
         if entry.is_file() and entry.name not in names:
@@ -225,8 +208,7 @@ def _reset_checkpoint(src_dir: str, local_checkpoint_dir: str, version: int) -> 
 
 
 def _tensor_locations(ckpt_dir: str) -> dict:
-    """Map each tensor name to (file, byte offset, nbytes) by reading every safetensors header."""
-    locations = {}
+    locations = {}  # name -> (file, byte offset, nbytes)
     for path in glob.glob(os.path.join(ckpt_dir, "*.safetensors")):
         with open(path, "rb") as f:
             (header_len,) = struct.unpack("<Q", f.read(8))
@@ -320,9 +302,6 @@ def _read_patches(
 
 
 def _apply_delta(local_checkpoint_dir: str, version_dir: str) -> None:
-    """Apply one version's delta in place: decompress + apply + checksum each tensor across a thread
-    pool (each writes a distinct mmap region, so the writes don't conflict). Any mismatch raises.
-    """
     with open(os.path.join(version_dir, "model.safetensors.index.json")) as f:
         meta = json.load(f)["metadata"]
     applied = _read_applied_version(local_checkpoint_dir)
@@ -352,6 +331,7 @@ def _apply_delta(local_checkpoint_dir: str, version_dir: str) -> None:
         patches = _read_patches(
             version_dir=version_dir, locations=locations, stack=stack
         )
+        # each patch writes a distinct mmap region, so the workers never conflict
         with ThreadPoolExecutor(max_workers=NUM_WORKERS) as pool:
             matched = list(pool.map(patch_tensor, patches))
         # no msync: the engine reads these pages via the shared cache; durability
