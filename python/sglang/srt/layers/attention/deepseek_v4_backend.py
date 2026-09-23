@@ -42,6 +42,9 @@ from sglang.kernels.ops.attention.dsv4.metadata_kernel import (
     init_compression_metadata as _init_compression_metadata_triton,
 )
 from sglang.kernels.ops.attention.dsv4.online_c128_mtp import OnlineC128MTPController
+from sglang.kernels.ops.attention.dsv4.prefill_candidates import (
+    topk_prefill_candidates,
+)
 from sglang.kernels.ops.attention.dsv4_attn_metadata_kernels import (
     BuildCausalSwaPageIndices,
     BuildPageTablePositions,
@@ -314,15 +317,13 @@ def _dense_fp4_mqa_logits(
 
 def _prefill_graph_dense_k_layout(
     req_to_token: torch.Tensor,
-    pool,
-    layer_id: int,
     ratio: int,
     width: int,
     local_req_ids: torch.Tensor,
     req_ids: torch.Tensor,
     req_lens: torch.Tensor,
-) -> Tuple[torch.Tensor, torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-    """Pack up to eight replayed requests into capture-stable contiguous FP4 K."""
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Build capture-stable offsets and slots for up to eight requests."""
     req_ord = (local_req_ids[:, None] == req_ids[None, :]).to(torch.int32).argmax(1)
     ks = req_ord.to(torch.int32) * width
     logical_k = torch.arange(width, device=req_to_token.device)
@@ -331,7 +332,7 @@ def _prefill_graph_dense_k_layout(
     logical_pos = logical_pos.masked_fill(~valid_k, 0)
     k_slots = req_to_token[req_ids[:, None], logical_pos].to(torch.int64) // ratio
     k_slots = k_slots.masked_fill(~valid_k, 0).clamp_min_(0).flatten()
-    return ks, k_slots, pool.get_low_ratio_index_k_fp4(layer_id, k_slots)
+    return ks, k_slots
 
 
 def _low_ratio_source_projections(layer, x, q_lora, positions, bufs):
@@ -1055,6 +1056,12 @@ class DSV4Metadata:
     low_ratio_dense_req_indices: Optional[torch.Tensor] = None
     low_ratio_dense_seq_lens: Optional[torch.Tensor] = None
     prefill_graph_dense_indexer: bool = False
+    # Request layout is shared by every indexer layer at the same ratio. Its
+    # captured kernels replay once per ratio; only the layer-specific K gather
+    # remains in each indexer layer.
+    low_ratio_dense_k_layouts: Dict[int, Tuple[torch.Tensor, torch.Tensor]] = field(
+        default_factory=dict
+    )
 
     # Per-step scratch for TP-padded query heads, zeroed by the first user.
     # Later layers overwrite real heads and preserve the zero padding.
@@ -1319,6 +1326,11 @@ class DeepseekV4AttnBackend(
         ] = None
         self.online_c128_mtp = OnlineC128MTPController(self)
         self.sparse_prefill_workspace = SparsePrefillWorkspace(self.device)
+        # CP V4.1 consumers share compressed KV across layers. Separate ratio
+        # workspaces keep those prefixes intact while each layer refreshes SWA.
+        self.shared_compressed_prefill_workspaces = {
+            ratio: SparsePrefillWorkspace(self.device) for ratio in (1, 2)
+        }
         spec_alg = model_runner.spec_algorithm
         self.needs_cpu_seq_lens = not spec_alg.is_dspark() and (
             not _is_cuda or self.online_c128_mtp.enabled()
@@ -2967,7 +2979,16 @@ class DeepseekV4AttnBackend(
                 x_global = x_global[:total]
             self._low_ratio_compress_torch(layer, x_global, req_global, pos_global)
         if run_indexer and layer.indexer is not None:
-            if self._low_ratio_in_prefill_graph():
+            # Small graph buckets keep the existing eager dense indexer. Its K
+            # packing scales with the live request count; the captured dense
+            # path amortizes its fixed eight-request capacity on a full bucket.
+            use_dense_graph = (
+                self._low_ratio_in_prefill_graph()
+                and x.shape[0]
+                >= _PREFILL_GRAPH_DENSE_INDEXER_MAX_REQUESTS
+                * _PREFILL_GRAPH_INDEXER_ROW_CHUNK
+            )
+            if use_dense_graph:
                 # CP-local rows were already reindexed in the captured metadata.
                 q = layer.indexer.queries(q_lora, layer.freqs_cis[positions])
                 w = layer.indexer.head_weights(x)
@@ -3515,7 +3536,14 @@ class DeepseekV4AttnBackend(
         page_indices = core.sparse_page_indices(ratio)
         raw_indices = core.sparse_raw_indices(ratio)
         topk = min(indexer.index_topk, width)
-        dense = self.forward_metadata.prefill_graph_dense_indexer
+        # CP only enters the dense graph path for a full bucket. Keep the same
+        # guard here so other prefill graph callers retain the paged path.
+        dense = (
+            self.forward_metadata.prefill_graph_dense_indexer
+            and num_tokens
+            >= _PREFILL_GRAPH_DENSE_INDEXER_MAX_REQUESTS
+            * _PREFILL_GRAPH_INDEXER_ROW_CHUNK
+        )
         if dense:
             req_ids = self.forward_metadata.low_ratio_dense_req_indices
             req_lens = self.forward_metadata.low_ratio_dense_seq_lens
@@ -3524,16 +3552,19 @@ class DeepseekV4AttnBackend(
             assert local_req_ids is not None and local_req_ids.shape[0] == num_tokens
             # The graph key contains token count but not request count. Rebuild
             # the contiguous K layout from the replayed eight-slot request data.
-            ks, k_slots, k_fp4 = _prefill_graph_dense_k_layout(
-                self.req_to_token,
-                pool,
-                layer.layer_id,
-                ratio,
-                width,
-                local_req_ids,
-                req_ids,
-                req_lens,
-            )
+            layout = self.forward_metadata.low_ratio_dense_k_layouts.get(ratio)
+            if layout is None:
+                layout = _prefill_graph_dense_k_layout(
+                    self.req_to_token,
+                    ratio,
+                    width,
+                    local_req_ids,
+                    req_ids,
+                    req_lens,
+                )
+                self.forward_metadata.low_ratio_dense_k_layouts[ratio] = layout
+            ks, k_slots = layout
+            k_fp4 = pool.get_low_ratio_index_k_fp4(layer.layer_id, k_slots)
             q_fp4 = q_fp4.view(num_tokens, num_heads, 64)
             q_sf = q_sf.view(num_tokens, num_heads)
             row_chunks = [(slice(0, num_tokens), None)]
@@ -3566,7 +3597,6 @@ class DeepseekV4AttnBackend(
                     plan,
                     width,
                 )
-            scores = logits
             if candidate_blocks is not None:
                 candidate_blocks.append(
                     select_candidate_block_mask_v2(
@@ -3576,18 +3606,26 @@ class DeepseekV4AttnBackend(
                         indexer.candidate_block_size,
                     )
                 )
-            elif consume is not None:
-                mask = consume[rows].repeat_interleave(
-                    indexer.candidate_block_size, dim=-1
-                )[..., :width]
-                scores = logits.masked_fill(~mask, -torch.inf)
-
             selected = torch.empty(
                 (logits.shape[0], topk), dtype=torch.int32, device=logits.device
             )
-            if dense:
+            if consume is not None:
+                offsets = ks[rows] if dense else torch.zeros_like(lens[rows])
+                topk_prefill_candidates(
+                    logits,
+                    lens[rows],
+                    consume[rows],
+                    indexer.candidate_block_size,
+                    offsets,
+                    selected,
+                )
+                if dense:
+                    selected = torch.where(
+                        selected >= 0, selected - ks[rows, None], selected
+                    )
+            elif dense:
                 topk_transform_ragged_v2(
-                    scores,
+                    logits,
                     lens[rows],
                     out_offsets=ks[rows],
                     out_indices=selected,
@@ -3597,7 +3635,7 @@ class DeepseekV4AttnBackend(
                 )
             else:
                 topk_transform_paged_v2(
-                    scores,
+                    logits,
                     lens[rows],
                     None,
                     selected,
@@ -3605,9 +3643,6 @@ class DeepseekV4AttnBackend(
                     metadata.topk_plan_for_chunk(chunk_index, rows),
                 )
             reach = selected >= 0
-            if consume is not None:
-                selected_for_gather = selected.clamp_min(0).to(torch.int64)
-                reach = reach & (scores.gather(-1, selected_for_gather) > -torch.inf)
             unselected = torch.iinfo(torch.int32).max
             selected = torch.where(reach, selected, unselected).sort(dim=-1).values
             reach = selected != unselected
@@ -4242,20 +4277,38 @@ class DeepseekV4AttnBackend(
                 compress_ratio, core_attn_metadata, extra_page_size
             )
             n_compressed = flat_token_ids.shape[0]
-            workspace = self.sparse_prefill_workspace.get(
-                n_compressed + cache.swa_token_ids.shape[0]
+            reuse_compressed = compress_ratio in (1, 2) and is_cp_active(forward_batch)
+            workspace_pool = (
+                self.shared_compressed_prefill_workspaces[compress_ratio]
+                if reuse_compressed
+                else self.sparse_prefill_workspace
             )
+            workspace = workspace_pool.get(n_compressed + cache.swa_token_ids.shape[0])
             compressed_slice = workspace[:n_compressed]
             swa_slice = workspace[n_compressed:]
 
         if compressed_slice is not None:
-            dequantize_k_cache_paged(
-                extra_k_cache,
-                flat_token_ids,
-                page_size=extra_page_size,
-                out=compressed_slice,
-                layout=token_to_kv_pool.get_extra_key_layout(layer_id),
-            )
+            source_key = None
+            if reuse_compressed:
+                source_layer = token_to_kv_pool.source_layer_of(layer_id)
+                source_key = (source_layer, workspace.data_ptr())
+                gather = cache.compressed[compress_ratio]
+            # Source layers may update their cache in place. Consumer layers
+            # reuse only the compressed prefix; top-k and SWA remain per-layer.
+            if (
+                source_key is None
+                or layer_id == source_key[0]
+                or gather.dequantized_source != source_key
+            ):
+                dequantize_k_cache_paged(
+                    extra_k_cache,
+                    flat_token_ids,
+                    page_size=extra_page_size,
+                    out=compressed_slice,
+                    layout=token_to_kv_pool.get_extra_key_layout(layer_id),
+                )
+                if source_key is not None:
+                    gather.dequantized_source = source_key
         dequantize_k_cache_paged(
             token_to_kv_pool.get_swa_key_buffer_radix(layer_id),
             cache.swa_token_ids,
