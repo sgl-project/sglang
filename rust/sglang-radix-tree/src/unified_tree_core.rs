@@ -4334,6 +4334,9 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         if window_start == window_end {
             return Ok(Vec::new());
         }
+        // Buffer-mode staging rounds the SWA window to complete tree pages;
+        // matched prefixes and storage-hit lengths use those same logical pages.
+        // Splitting at an unaligned offset would break the radix page keys.
         if !window_start.is_multiple_of(self.page_size)
             || !window_end.is_multiple_of(self.page_size)
         {

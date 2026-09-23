@@ -43,8 +43,17 @@ the shared fingerprinted Rust-extension cache; it never writes a shared object
 into the Python package. LibTorch and the Python headers come from the running
 interpreter's PyTorch install. PyTorch 2.11 through 2.13 are accepted explicitly,
 and `torch_2_13_compat.h` covers two alignment APIs removed in PyTorch 2.13.
+Source checkouts require working `cargo` and `rustc`, including for fingerprinted
+cache lookup. Trusted bundled extensions do not require a Rust compiler.
 
 ## Development
+
+External backends registered through `register_tree_core_backend` must implement
+the new `UnifiedTreeCoreInterface.swa_tombstone_ranges` and `attach_swa_window`
+methods for SWA buffer-mode repair. These methods are abstract, so existing
+subclasses need to add them before they can be instantiated. The new
+`finish_mamba_state_eviction` hook is optional for backends that complete Mamba
+backup inline and never return a deferred `mamba_backup_node_id`.
 
 ```bash
 # Build (libtorch from the installed torch package):

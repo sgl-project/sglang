@@ -383,6 +383,9 @@ fn comp_xfers_to_py(
     comp_xfers: HashMap<ComponentType, Vec<PoolTransfer>>,
 ) -> PyResult<Py<PyDict>> {
     let dict = PyDict::new_bound(py);
+    // Pool allocation can evict across components, so preserve Python's order.
+    let mut comp_xfers: Vec<_> = comp_xfers.into_iter().collect();
+    comp_xfers.sort_unstable_by_key(|(ct, _)| component_type_to_u8(*ct));
     for (ct, transfers) in comp_xfers {
         let list = PyList::empty_bound(py);
         for transfer in transfers {

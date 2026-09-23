@@ -666,7 +666,12 @@ class UnifiedTreeCoreInterface(ABC):
         window_end: int,
         swa_values: torch.Tensor,
     ) -> list[CacheAction | ComponentAction]:
-        """Attach a loaded SWA window to tombstoned spans, returning split actions."""
+        """Attach a loaded SWA window to tombstoned spans, returning split actions.
+
+        The shared pipeline supplies page-aligned logical token offsets and
+        int64 values on the core's device. The entire span must be matched and
+        tombstoned before publication.
+        """
         ...
 
     @abstractmethod

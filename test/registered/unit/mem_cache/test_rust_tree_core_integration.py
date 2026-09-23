@@ -129,6 +129,27 @@ def test_match_on_the_empty_tree_returns_no_indices():
     assert result.device_indices.numel() == 0
 
 
+def test_default_backend_constructs_real_rust_cpu_cache(monkeypatch):
+    from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+
+    monkeypatch.delenv("SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND", raising=False)
+    cache = UnifiedRadixCache(
+        CacheInitParams(
+            disable=False,
+            req_to_token_pool=None,
+            token_to_kv_pool_allocator=None,
+            page_size=1,
+            tree_components=(ComponentType.FULL,),
+        )
+    )
+    assert cache._tree_core_backend == "rust"
+    assert isinstance(cache.tree_core, RustUnifiedTreeCore)
+    cache.insert(InsertParams(key=_key([1, 2, 3]), value=torch.tensor([11, 12, 13])))
+    matched = cache.match_prefix(MatchPrefixParams(key=_key([1, 2, 3])))
+    assert matched.device_indices.tolist() == [11, 12, 13]
+    cache.tree_core.sanity_check([], [])
+
+
 def test_insert_then_match_back_returns_the_exact_indices():
     core = _tree_core()
     result = _insert(core, [1, 2, 3], [10, 11, 12])
@@ -1919,12 +1940,16 @@ def _swa_tree_core(window: int = 8, **params_overrides) -> RustUnifiedTreeCore:
     )
 
 
-def _swa_transfer_core(backend, unified=False):
+def _swa_transfer_core(
+    backend, unified=False, mamba=False, page_size=1, window=16, is_eagle=False
+):
     from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
     from sglang.srt.mem_cache.allocator.unified_hybrid_swa import (
         UnifiedSWAAllocatorBase,
     )
+    from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
     from sglang.srt.mem_cache.unified_cache.components.full import FullComponent
+    from sglang.srt.mem_cache.unified_cache.components.mamba import MambaComponent
     from sglang.srt.mem_cache.unified_cache.components.swa import SWAComponent
     from sglang.srt.mem_cache.unified_cache.unified_tree_core import UnifiedTreeCore
 
@@ -1935,29 +1960,149 @@ def _swa_transfer_core(backend, unified=False):
     allocator.swa_req_ring = False
     params = CacheInitParams(
         disable=False,
-        req_to_token_pool=None,
+        req_to_token_pool=Mock(spec=HybridReqToTokenPool) if mamba else None,
         token_to_kv_pool_allocator=allocator,
-        page_size=1,
-        tree_components=(ComponentType.FULL, ComponentType.SWA),
-        sliding_window_size=16,
+        page_size=page_size,
+        is_eagle=is_eagle,
+        tree_components=(ComponentType.FULL, ComponentType.SWA)
+        + ((ComponentType.MAMBA,) if mamba else ()),
+        sliding_window_size=window,
     )
-    if backend == "rust":
-        core = RustUnifiedTreeCore(params)
-    else:
-        cache = SimpleNamespace(
-            token_to_kv_pool_allocator=allocator, enable_session_radix_cache=False
-        )
-        core = UnifiedTreeCore(
-            params,
-            {
+    with get_context().override_server_args(
+        _mamba_cache_chunk_size=256, mamba_max_states_per_path=-1
+    ):
+        if backend == "rust":
+            core = RustUnifiedTreeCore(params)
+        else:
+            cache = SimpleNamespace(
+                token_to_kv_pool_allocator=allocator, enable_session_radix_cache=False
+            )
+            components = {
                 ComponentType.FULL: FullComponent(cache, params),
                 ComponentType.SWA: SWAComponent(cache, params),
-            },
-        )
-        cache.tree_core = core
+            }
+            if mamba:
+                components[ComponentType.MAMBA] = MambaComponent(cache, params)
+            core = UnifiedTreeCore(params, components)
+            cache.tree_core = core
     core.set_hicache_enabled()
     core.has_swa_host_pool = True
     return core, allocator
+
+
+def _hybrid_transfer_order_fixture(backend):
+    from sglang.srt.mem_cache.unified_cache.components import CacheTransferPhase
+
+    core, _ = _swa_transfer_core(backend, mamba=True)
+    root = core.root_node_handle()
+    a = core.insert_host(root, _key([10, 11]), torch.tensor([100, 101]), ["a0", "a1"])
+    b = core.insert_host(root, _key([20, 21]), torch.tensor([200, 201]), ["b0", "b1"])
+    # The pools can have different LRU order: SWA oldest=A, Mamba oldest=B.
+    for result, component, pool, indices in (
+        (a, ComponentType.SWA, PoolName.SWA, [1, 2]),
+        (b, ComponentType.SWA, PoolName.SWA, [3, 4]),
+        (b, ComponentType.MAMBA, PoolName.MAMBA, [12]),
+        (a, ComponentType.MAMBA, PoolName.MAMBA, [11]),
+    ):
+        actions = []
+        core.commit_hicache_transfers(
+            root,
+            CacheTransferPhase.PREFETCH,
+            {component: [PoolTransfer(name=pool, host_indices=torch.tensor(indices))]},
+            cache_actions=actions,
+            insert_result=result,
+            pool_storage_result=PoolTransferResult(
+                kv_hit_pages=2, extra_pool_hit_pages={pool: len(indices)}
+            ),
+        )
+        assert actions == []
+    c = _mamba_insert(core, [30, 31], [300, 301], 13)
+    for action in c.cache_actions:
+        if isinstance(action, SWARebuild):
+            core.set_component_device_value(
+                action.node_id, ComponentType.SWA, action.source_value
+            )
+    core.sanity_check([], [])
+    return core, a.inserted_host_node, c.last_device_node
+
+
+@pytest.mark.parametrize("backend", ["python", "rust"])
+@pytest.mark.parametrize("planner", ["backup", "load_back", "storage"])
+def test_hybrid_transfer_planners_preserve_component_order(backend, planner):
+    core, host_node, device_node = _hybrid_transfer_order_fixture(backend)
+    # Each native plan creates a fresh map. Its randomized iteration must not
+    # leak into allocation/reclamation order across calls or TP ranks.
+    for _ in range(64):
+        if planner == "backup":
+            _, transfers = core.build_backup_spec(device_node)
+        elif planner == "load_back":
+            _, transfers = core.build_load_back_spec(host_node)
+        else:
+            transfers = core.build_storage_backup_spec(host_node, False).comp_xfers
+        assert list(transfers) == [ComponentType.SWA, ComponentType.MAMBA]
+
+
+@pytest.mark.parametrize("backend", ["python", "rust"])
+def test_hybrid_backup_pool_pressure_preserves_host_victim(backend):
+    from sglang.srt.mem_cache.pool_host.group import HostPoolGroup, PoolEntry
+
+    core, _, device_node = _hybrid_transfer_order_fixture(backend)
+    _, transfers = core.build_backup_spec(device_node)
+    free_slots = {
+        ct: [] for ct in (ComponentType.FULL, ComponentType.SWA, ComponentType.MAMBA)
+    }
+    freed_full = []
+
+    def allocate(count, component):
+        slots = free_slots[component]
+        if len(slots) < count:
+            return None
+        indices = torch.tensor(slots[:count], dtype=torch.int64)
+        del slots[:count]
+        return indices
+
+    def release(indices, component):
+        free_slots[component].extend(indices.tolist())
+        return len(indices)
+
+    def reclaim(count, component):
+        result = core.drive_host_eviction(component, count)
+        assert not result.device_frees
+        for ct, tensors in result.host_frees.items():
+            for indices in tensors:
+                release(indices, ct)
+                if ct == ComponentType.FULL:
+                    freed_full.extend(indices.tolist())
+        result.host_frees.clear()
+
+    entries = []
+    for ct, name in (
+        (ComponentType.FULL, PoolName.KV),
+        (ComponentType.SWA, PoolName.SWA),
+        (ComponentType.MAMBA, PoolName.MAMBA),
+    ):
+        # Simulate only physical host allocation; tree eviction and the host
+        # group's allocation/reclaim/rollback flow are the production code.
+        pool = Mock(can_use_write_back_jit=False)
+        pool.alloc.side_effect = lambda count, ct=ct: allocate(count, ct)
+        pool.free.side_effect = lambda indices, ct=ct: release(indices, ct)
+        entries.append(
+            PoolEntry(
+                name=name,
+                host_pool=pool,
+                device_pool=None,
+                layer_mapper=lambda _: 0,
+                host_evict_fn=lambda count, ct=ct: reclaim(count, ct),
+            )
+        )
+    resolved = HostPoolGroup(entries).resolve_host_transfers(
+        [transfer for xfers in transfers.values() for transfer in xfers]
+    )
+    assert resolved is not None
+    # SWA pressure frees A's complete host leaf, satisfying both side pools.
+    # Mamba-first allocation would instead free B's Full slots [200, 201].
+    assert freed_full == [100, 101]
+    core.sanity_check([], [])
 
 
 @pytest.mark.parametrize("backend", ["python", "rust"])
@@ -2916,6 +3061,40 @@ def test_swa_load_back_missing_value_raises_assertion_error():
         )
     with pytest.raises(AssertionError):
         core.build_load_back_spec(node)
+
+
+@pytest.mark.parametrize("backend", ["python", "rust"])
+@pytest.mark.parametrize("is_bigram", [False, True])
+def test_swa_window_repair_with_page_rounded_window(backend, is_bigram):
+    core, _ = _swa_transfer_core(backend, page_size=4, window=5, is_eagle=is_bigram)
+    key = RadixKey(
+        array("q", range(16 + is_bigram)),
+        extra_key="adapter-a",
+        cache_salt="tenant-a",
+        is_bigram=is_bigram,
+    )
+    full_values = torch.arange(10, 26, dtype=torch.int64)
+    _pump_insert(
+        core,
+        InsertParams(key=key, value=full_values, swa_evicted_seqlen=16),
+    )
+    # A five-token window stages two four-token pages. Bigrams add one raw
+    # boundary token but preserve the logical repair span [8, 16).
+    ranges = core.swa_tombstone_ranges(key, 8, 16)
+    assert ranges == [(8, 16)]
+    assert core.attach_swa_window(key, 8, 16, torch.arange(50, 58)) == []
+    matched_len, leaf, _ = core.match_full_device_prefix(key)
+    assert matched_len == 16
+    assert torch.equal(
+        core.collect_full_device_indices(leaf, core.root_node_handle()), full_values
+    )
+    assert core.get_component_device_value(leaf, ComponentType.SWA).tolist() == list(
+        range(50, 58)
+    )
+    assert core.swa_tombstone_ranges(key, 0, 16) == [(0, 8)]
+    assert core.full_evictable_size() == 16
+    assert core.swa_evictable_size() == 8
+    core.sanity_check([], [])
 
 
 @pytest.mark.parametrize("page_size", [1, 2])
