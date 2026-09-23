@@ -160,6 +160,14 @@ plus rename rather than `fsync`. The module docstring of
 `sglang/srt/mem_cache/storage/fast_file/fast_file_store.py` lists every
 extra-config key.
 
+With several local disks, give one root per disk, e.g.
+`"storage_dir":["/mnt/nvme0/hicache","/mnt/nvme1/hicache"]` (a comma-separated
+string also works). Each page file lives on exactly one root, chosen by a
+stable hash of its file name; `max_size` is split across the roots and
+`min_free_space` applies to each root's filesystem. Reordering the list changes
+nothing, and adding or removing a root only loses the pages that now route
+elsewhere: they read as misses and are removed at the next startup.
+
 `write_workers` (default 1) sizes a write pool kept separate from
 `read_workers`, so background backups never queue ahead of prefetch reads.
 

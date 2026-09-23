@@ -11,6 +11,7 @@ NVMe or filesystem tier needs to keep up with serving:
   and the page file, so pages skip the staging tensor copy;
 - bounded worker pools for parallel page reads and existence checks and,
   separately, for parallel page writes;
+- optional striping over several storage roots (one per local disk);
 - atomic publication (temporary file + rename), so a reader never observes a
   partially written page;
 - background LRU eviction between two watermarks plus an optional positive
@@ -24,15 +25,26 @@ extra-config key, then the ``file`` backend's
 namespace directory keeps ``fast_file`` pages apart from ``file`` pages that
 share the root.
 
+``storage_dir`` may list several roots (a JSON list, or a comma-separated
+string), normally one per local disk. Every root gets the same namespace
+directory and each page file lives on exactly one root, chosen by a stable
+hash of its file name (see ``DiskRouter``): the order of the list does not
+matter, and adding or removing a root only makes that root's share of the
+pages unreachable (read as misses; the startup scan removes pages that now
+route elsewhere). Each root has its own evictor: ``max_size`` is split across
+roots by their key share and ``min_free_space`` applies to each root's
+filesystem.
+
 Extra-config keys (``--hicache-storage-backend-extra-config``):
 
-  storage_dir            root directory (default: see above)
+  storage_dir            root directory, or a list of them (default: see above)
   read_workers           parallel read / existence-check threads (default 1)
   write_workers          parallel write threads, a separate pool (default 1)
   enable_metadata_cache  cache positive existence checks (default false)
   metadata_ttl           positive-cache lifetime in seconds, -1 = forever (5.0)
-  max_size               byte cap per namespace, SI/IEC suffixes (unbounded)
-  min_free_space         free-space floor for the filesystem (0 = off)
+  max_size               byte cap per namespace, SI/IEC suffixes (unbounded);
+                         split across storage roots by key share
+  min_free_space         free-space floor for each root's filesystem (0 = off)
   evict_high_watermark   start background eviction above this cap fraction (0.95)
   evict_low_watermark    stop background eviction at this cap fraction (0.85)
   preevict_interval_ms   background eviction check interval (10)
@@ -68,7 +80,10 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolTransfer,
 )
 from sglang.srt.mem_cache.storage.fast_file.lru_file_evictor import (
+    DiskRouter,
     LRUFileEvictor,
+    StripedEvictor,
+    parse_size_to_bytes,
     setting,
 )
 
@@ -85,6 +100,27 @@ _DEFAULT_METADATA_TTL_S = 5.0
 
 class _CorruptPageError(OSError):
     """An on-disk page whose size does not match the requested transfer."""
+
+
+def _parse_storage_roots(value: Any) -> list[str]:
+    """``storage_dir`` as an ordered list of unique roots."""
+    if isinstance(value, (list, tuple)):
+        candidates = [str(path).strip() for path in value]
+    else:
+        candidates = [path.strip() for path in str(value).split(",")]
+    roots = [path for path in candidates if path]
+    if not roots:
+        raise ValueError(f"HiCacheFastFile storage_dir is empty: {value!r}")
+    seen: dict[str, str] = {}
+    for root in roots:
+        real = os.path.realpath(root)
+        if real in seen:
+            raise ValueError(
+                f"HiCacheFastFile storage_dir lists {root!r} and {seen[real]!r}, "
+                "which are the same directory."
+            )
+        seen[real] = root
+    return roots
 
 
 def _parse_workers(extra_config: dict, name: str, default: int) -> int:
@@ -116,15 +152,26 @@ class HiCacheFastFile(HiCacheFile):
         # and storage-dir env var are shared.
         extra_config = storage_config.extra_config or {}
         self.config_suffix = self._build_config_suffix(storage_config)
-        self.storage_root = (
-            extra_config.get("storage_dir")
-            or envs.SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR.get()
-            or file_path
+        configured_dir = extra_config.get("storage_dir")
+        if configured_dir:
+            self.storage_roots = _parse_storage_roots(configured_dir)
+        else:
+            # The env var is shared with the ``file`` backend: one path only.
+            self.storage_roots = [
+                envs.SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR.get() or file_path
+            ]
+        self.storage_root = self.storage_roots[0]
+        namespace = self._namespace_name(storage_config, mem_pool_host)
+        self.file_paths = [os.path.join(root, namespace) for root in self.storage_roots]
+        # First (for a single root, the only) namespace directory. Code that
+        # touches files must route through _page_path, never use this alone.
+        self.file_path = self.file_paths[0]
+        for path in self.file_paths:
+            os.makedirs(path, exist_ok=True)
+        self._router = DiskRouter(
+            [os.path.normpath(os.path.abspath(root)) for root in self.storage_roots]
         )
-        self.file_path = os.path.join(
-            self.storage_root, self._namespace_name(storage_config, mem_pool_host)
-        )
-        os.makedirs(self.file_path, exist_ok=True)
+        self._warn_shared_filesystems()
 
         self.read_workers = _parse_workers(
             extra_config, "read_workers", _DEFAULT_READ_WORKERS
@@ -156,16 +203,7 @@ class HiCacheFastFile(HiCacheFile):
         self._prefetch_bandwidth: list[float] = []
         self._backup_bandwidth: list[float] = []
 
-        self._evictor = LRUFileEvictor(
-            self.file_path,
-            self.config_suffix,
-            tp_rank=storage_config.tp_rank,
-            is_mla_model=storage_config.is_mla_model,
-            extra_config=extra_config,
-            on_evict=(
-                self.metadata_cache.remove if self.metadata_cache is not None else None
-            ),
-        )
+        self._evictor = self._build_evictor(storage_config, extra_config)
         if self.metadata_cache is not None:
             self._scan_existing_files_to_metadata_cache()
         # Separate pools: a large background backup must not queue ahead of a
@@ -187,11 +225,80 @@ class HiCacheFastFile(HiCacheFile):
                 "HiCacheFastFile vectored I/O is unavailable; using staged copies."
             )
         logger.info(
-            "HiCacheFastFile namespace=%s read_workers=%d write_workers=%d",
-            self.file_path,
+            "HiCacheFastFile namespace=%s roots=%d read_workers=%d write_workers=%d",
+            namespace,
+            len(self.file_paths),
             self.read_workers,
             self.write_workers,
         )
+
+    def _build_evictor(
+        self, storage_config: HiCacheStorageConfig, extra_config: dict
+    ) -> LRUFileEvictor | StripedEvictor:
+        on_evict = (
+            self.metadata_cache.remove if self.metadata_cache is not None else None
+        )
+        if len(self.file_paths) == 1:
+            return LRUFileEvictor(
+                self.file_path,
+                self.config_suffix,
+                tp_rank=storage_config.tp_rank,
+                is_mla_model=storage_config.is_mla_model,
+                extra_config=extra_config,
+                on_evict=on_evict,
+            )
+        max_size = parse_size_to_bytes(extra_config.get("max_size"))
+
+        def build(index: int) -> LRUFileEvictor:
+            root_config = dict(extra_config)
+            if max_size > 0:
+                # 0 would mean "unbounded", so a root keeps at least one byte.
+                root_config["max_size"] = max(
+                    1, int(max_size * self._router.shares[index])
+                )
+            return LRUFileEvictor(
+                self.file_paths[index],
+                self.config_suffix,
+                tp_rank=storage_config.tp_rank,
+                is_mla_model=storage_config.is_mla_model,
+                extra_config=root_config,
+                on_evict=on_evict,
+                owns=lambda stem: self._router.route(stem) == index,
+            )
+
+        # Startup scans are per filesystem; run them side by side.
+        with ThreadPoolExecutor(
+            max_workers=len(self.file_paths),
+            thread_name_prefix=f"HiCacheFastFileScan-{storage_config.tp_rank}",
+        ) as pool:
+            futures = [pool.submit(build, i) for i in range(len(self.file_paths))]
+        evictors, first_error = [], None
+        for future in futures:
+            try:
+                evictors.append(future.result())
+            except Exception as exc:
+                first_error = first_error or exc
+        if first_error is not None:
+            for evictor in evictors:
+                evictor.close()
+            raise first_error
+        return StripedEvictor(evictors, self._router)
+
+    def _warn_shared_filesystems(self) -> None:
+        devices: dict[int, str] = {}
+        for path in self.file_paths:
+            try:
+                device = os.stat(path).st_dev
+            except OSError:
+                continue
+            if device in devices:
+                logger.warning(
+                    "HiCacheFastFile storage roots %s and %s share one filesystem; "
+                    "striping over them adds no bandwidth.",
+                    devices[device],
+                    path,
+                )
+            devices.setdefault(device, path)
 
     @classmethod
     def _namespace_name(
@@ -420,7 +527,30 @@ class HiCacheFastFile(HiCacheFile):
     # ----- single page read / write ------------------------------------------
 
     def _page_path(self, suffixed_key: str) -> str:
-        return os.path.join(self.file_path, f"{suffixed_key}.bin")
+        root = self._router.route(suffixed_key)
+        return os.path.join(self.file_paths[root], f"{suffixed_key}.bin")
+
+    def _get_component_path(
+        self, key: str, component_name: Optional[str] = None
+    ) -> str:
+        return self._page_path(self._get_component_key(key, component_name))
+
+    def _scan_existing_files_to_metadata_cache(self) -> None:
+        for root, path in enumerate(self.file_paths):
+            try:
+                names = os.listdir(path)
+            except FileNotFoundError:
+                continue
+            for name in names:
+                if not name.endswith(".bin"):
+                    continue
+                stem = name[:-4]
+                # Only this rank/model's pages, and only where reads look.
+                if (
+                    stem.endswith(self.config_suffix)
+                    and self._router.route(stem) == root
+                ):
+                    self.metadata_cache.add(stem)
 
     def _write_lock_for(self, suffixed_key: str) -> threading.Lock:
         return self._write_locks[hash(suffixed_key) % len(self._write_locks)]
@@ -733,7 +863,7 @@ class HiCacheFastFile(HiCacheFile):
         stem = filename[:-4]
         if self.metadata_cache is not None and self.metadata_cache.contains(stem):
             return filename
-        if not os.path.exists(os.path.join(self.file_path, filename)):
+        if not os.path.exists(self._page_path(stem)):
             return None
         if self.metadata_cache is not None:
             self.metadata_cache.add(stem)
@@ -835,10 +965,10 @@ class HiCacheFastFile(HiCacheFile):
         if self.metadata_cache is not None:
             self.metadata_cache.clear()
         if success:
-            logger.info("Cleared HiCacheFastFile namespace %s.", self.file_path)
+            logger.info("Cleared HiCacheFastFile namespace %s.", self.file_paths)
         else:
             logger.error(
-                "Failed to fully clear HiCacheFastFile namespace %s.", self.file_path
+                "Failed to fully clear HiCacheFastFile namespace %s.", self.file_paths
             )
         return success
 

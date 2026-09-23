@@ -7,17 +7,21 @@ The evictor owns the LRU recency index, per-file size accounting, free-space
 probing, the startup scan, and victim removal for one namespace directory.
 Without ``max_size`` or ``min_free_space`` it is inert: ``reserve`` always
 admits and every other call is a no-op.
+
+A namespace spread over several storage roots uses one evictor per root
+behind ``StripedEvictor``; ``DiskRouter`` decides which root owns a key.
 """
 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import logging
 import os
 import threading
 import time
 from collections import OrderedDict
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Optional, Sequence
 
 from sglang.srt.utils.common import human_readable_int
 
@@ -106,11 +110,15 @@ class LRUFileEvictor:
         is_mla_model: bool,
         extra_config: dict,
         on_evict: Optional[Callable[[str], None]] = None,
+        owns: Optional[Callable[[str], bool]] = None,
     ) -> None:
         self.file_path = file_path
         self.config_suffix = config_suffix
         self._tp_rank = tp_rank
         self._on_evict = on_evict
+        # Multi-root namespaces: False for a page stem that now routes to a
+        # different root. Such a file can never be read again.
+        self._owns = owns
         # MLA ranks share one namespace, so rank 0 owns the bookkeeping.
         self._is_storage_owner = (not is_mla_model) or tp_rank == 0
 
@@ -152,7 +160,7 @@ class LRUFileEvictor:
                     self.max_size_bytes = safe_max
 
         if self._is_storage_owner and (
-            self._eviction_enabled or self.stale_temp_age_s > 0
+            self._eviction_enabled or self.stale_temp_age_s > 0 or owns is not None
         ):
             self._scan_existing_files(track_entries=self._eviction_enabled)
 
@@ -455,10 +463,16 @@ class LRUFileEvictor:
             return
         tracked: list[tuple[float, str, int]] = []
         removed_temp_files = 0
+        removed_misrouted_files = 0
         cutoff = time.time() - self.stale_temp_age_s
+        check_route = self._owns is not None
         for entry in entries:
             is_temp = self._is_matching_temp(entry.name)
-            page_stem = self._matching_page_stem(entry.name) if track_entries else None
+            page_stem = (
+                self._matching_page_stem(entry.name)
+                if track_entries or check_route
+                else None
+            )
             if not is_temp and page_stem is None:
                 continue
             try:
@@ -481,6 +495,24 @@ class LRUFileEvictor:
                             exc,
                         )
                 continue
+            if check_route and not self._owns(page_stem):
+                # The storage-root list changed and this key now routes to
+                # another root, so it can never be read again: reclaim it now
+                # rather than let it hold space (or leak with eviction off).
+                try:
+                    os.remove(entry.path)
+                    removed_misrouted_files += 1
+                except FileNotFoundError:
+                    pass
+                except OSError as exc:
+                    logger.warning(
+                        "Failed to remove misrouted HiCacheFastFile page %s: %s",
+                        entry.path,
+                        exc,
+                    )
+                continue
+            if not track_entries:
+                continue
             tracked.append((stat.st_mtime, page_stem, stat.st_size))
 
         tracked.sort(key=lambda item: item[0])
@@ -490,6 +522,13 @@ class LRUFileEvictor:
         if removed_temp_files:
             logger.info(
                 "Removed %d stale HiCacheFastFile temp files", removed_temp_files
+            )
+        if removed_misrouted_files:
+            logger.info(
+                "Removed %d HiCacheFastFile pages from %s that route to another "
+                "storage root",
+                removed_misrouted_files,
+                self.file_path,
             )
 
     def _evict_one_lru_locked(self) -> tuple[str, int]:
@@ -586,3 +625,128 @@ class LRUFileEvictor:
                 if self._preevict_batch() == 0 or time.monotonic() >= deadline:
                     break
                 time.sleep(0)
+
+
+_MASK64 = (1 << 64) - 1
+
+
+def _hash64(text: str) -> int:
+    """Process- and platform-stable 64-bit hash (``hash()`` is salted)."""
+    return int.from_bytes(
+        hashlib.blake2b(text.encode("utf-8"), digest_size=8).digest(), "little"
+    )
+
+
+def _mix64(value: int) -> int:
+    """splitmix64 finalizer: a cheap bijective 64-bit mixer."""
+    value = ((value ^ (value >> 30)) * 0xBF58476D1CE4E5B9) & _MASK64
+    value = ((value ^ (value >> 27)) * 0x94D049BB133111EB) & _MASK64
+    return value ^ (value >> 31)
+
+
+class DiskRouter:
+    """Stable page-stem -> storage-root routing.
+
+    A stem hashes into one of ``2**BUCKET_BITS`` buckets, and each bucket is
+    assigned once, at construction, to the root with the highest rendezvous
+    score for (bucket, root identity). A lookup is one hash plus a table index;
+    the assignment does not depend on the order roots are listed in, and adding
+    or removing one root only moves that root's share of the buckets, so the
+    rest of the cache stays reachable. Keys that do move read as misses.
+    """
+
+    BUCKET_BITS = 14
+
+    def __init__(self, identities: Sequence[str]) -> None:
+        if not identities:
+            raise ValueError("DiskRouter needs at least one storage root")
+        if len(set(identities)) != len(identities):
+            raise ValueError(f"DiskRouter storage roots must be unique: {identities}")
+        self.num_roots = len(identities)
+        self._mask = (1 << self.BUCKET_BITS) - 1
+        if self.num_roots == 1:
+            self._table: Optional[tuple[int, ...]] = None
+            self.shares: tuple[float, ...] = (1.0,)
+            return
+        seeds = [_hash64(identity) for identity in identities]
+        roots = range(self.num_roots)
+        table = tuple(
+            max(roots, key=lambda i: _mix64(seeds[i] ^ bucket))
+            for bucket in range(self._mask + 1)
+        )
+        counts = [0] * self.num_roots
+        for root in table:
+            counts[root] += 1
+        self._table = table
+        self.shares = tuple(count / len(table) for count in counts)
+
+    def route(self, stem: str) -> int:
+        if self._table is None:
+            return 0
+        return self._table[_hash64(stem) & self._mask]
+
+
+class StripedEvictor:
+    """One ``LRUFileEvictor`` per storage root behind the single-root API.
+
+    Each root is its own filesystem, so its cap share, free-space floor, LRU
+    order and background drain are independent; a key is only ever accounted
+    by the evictor of the root it routes to.
+    """
+
+    def __init__(self, evictors: Sequence[LRUFileEvictor], router: DiskRouter):
+        if len(evictors) != router.num_roots:
+            raise ValueError("StripedEvictor needs one evictor per storage root")
+        self.evictors = tuple(evictors)
+        self.router = router
+
+    def _for(self, suffixed_key: str) -> LRUFileEvictor:
+        return self.evictors[self.router.route(suffixed_key)]
+
+    @property
+    def enabled(self) -> bool:
+        return self.evictors[0].enabled
+
+    @property
+    def configured(self) -> bool:
+        return self.evictors[0].configured
+
+    @property
+    def is_storage_owner(self) -> bool:
+        return self.evictors[0].is_storage_owner
+
+    def reserve(self, suffixed_key: str, value_bytes: int, *, key: str = "") -> bool:
+        return self._for(suffixed_key).reserve(suffixed_key, value_bytes, key=key)
+
+    def commit(self, suffixed_key: str) -> None:
+        self._for(suffixed_key).commit(suffixed_key)
+
+    def abort(self, suffixed_key: str) -> None:
+        self._for(suffixed_key).abort(suffixed_key)
+
+    def touch(
+        self, suffixed_key: str, tensor_path: str, *, size: Optional[int] = None
+    ) -> None:
+        self._for(suffixed_key).touch(suffixed_key, tensor_path, size=size)
+
+    def forget(self, suffixed_key: str) -> bool:
+        return self._for(suffixed_key).forget(suffixed_key)
+
+    def clear_storage(self) -> bool:
+        # Clear every root even if an earlier one fails.
+        results = [evictor.clear_storage() for evictor in self.evictors]
+        return all(results)
+
+    def close(self) -> None:
+        for evictor in self.evictors:
+            evictor.close()
+
+    def snapshot(self) -> dict[str, int | bool]:
+        snapshots = [evictor.snapshot() for evictor in self.evictors]
+        merged: dict[str, int | bool] = {}
+        for name, value in snapshots[0].items():
+            if isinstance(value, bool):
+                merged[name] = any(snap[name] for snap in snapshots)
+            else:
+                merged[name] = sum(snap[name] for snap in snapshots)
+        return merged
