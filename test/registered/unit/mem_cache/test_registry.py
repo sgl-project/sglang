@@ -40,6 +40,7 @@ def _make_ctx(
     is_hybrid_swa=False,
     is_hybrid_ssm=False,
     is_dsa=False,
+    is_eagle=False,
     enable_hierarchical_cache=False,
     disable_radix_cache=False,
     effective_chunked_prefill_size=None,
@@ -58,7 +59,7 @@ def _make_ctx(
     )
     return TreeCacheBuildContext(
         server_args=server_args,
-        params=MagicMock(),
+        params=MagicMock(is_eagle=is_eagle),
         is_hybrid_swa=is_hybrid_swa,
         is_hybrid_ssm=is_hybrid_ssm,
         is_dsa=is_dsa,
@@ -114,6 +115,45 @@ class TestRegisterRadixCacheBackend(_RegistryIsolationMixin, CustomTestCase):
 
 
 class TestCreateTreeCacheRouting(_RegistryIsolationMixin, CustomTestCase):
+    def test_flexkv_rejects_eagle_before_loading_optional_connector(self):
+        for backend in (None, "flexkv"):
+            for is_hybrid_swa in (False, True):
+                with self.subTest(backend=backend, is_hybrid_swa=is_hybrid_swa):
+                    ctx = _make_ctx(
+                        self,
+                        backend=backend,
+                        enable_flexkv=backend is None,
+                        is_hybrid_swa=is_hybrid_swa,
+                        is_eagle=True,
+                    )
+                    # An unavailable optional package must not hide the key
+                    # contract error or trigger connector/GPU initialization.
+                    with patch.dict(
+                        "sys.modules", {"flexkv.integration.sglang.connector": None}
+                    ):
+                        with self.assertRaisesRegex(ValueError, "EAGLE.*bigram"):
+                            create_tree_cache(ctx)
+
+    def test_flexkv_non_eagle_still_loads_optional_connector(self):
+        for backend in (None, "flexkv"):
+            for is_hybrid_swa in (False, True):
+                with self.subTest(backend=backend, is_hybrid_swa=is_hybrid_swa):
+                    ctx = _make_ctx(
+                        self,
+                        backend=backend,
+                        enable_flexkv=backend is None,
+                        is_hybrid_swa=is_hybrid_swa,
+                    )
+                    with patch.dict(
+                        "sys.modules",
+                        {
+                            "flexkv": MagicMock(),
+                            "flexkv.integration.sglang.connector": None,
+                        },
+                    ):
+                        with self.assertRaisesRegex(RuntimeError, "incompatible"):
+                            create_tree_cache(ctx)
+
     def test_flexkv_rejects_conflicting_cache_lifecycles_before_initialization(self):
         from sglang.srt.mem_cache.storage.flexkv import _flexkv_factory
 

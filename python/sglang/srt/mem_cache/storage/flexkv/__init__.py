@@ -36,6 +36,14 @@ def _flexkv_factory(ctx):
         raise ValueError("FlexKV cannot be combined with --enable-hierarchical-cache")
     if ctx.is_hybrid_ssm:
         raise NotImplementedError("FlexKV does not support Mamba/SSM pools yet")
+    if ctx.params.is_eagle:
+        # N bigram KV slots depend on N+1 raw tokens. The connector's token-only
+        # key uses N tokens and would drop the distinguishing boundary token.
+        raise ValueError(
+            "FlexKV does not support EAGLE-style bigram cache keys yet: "
+            "the connector cannot preserve the extra boundary token. "
+            "Disable FlexKV or use a speculative mode without bigram cache keys."
+        )
 
     try:
         from flexkv.integration.sglang.connector import FlexKVConnector  # noqa: F401

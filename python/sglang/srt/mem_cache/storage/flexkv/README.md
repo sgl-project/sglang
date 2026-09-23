@@ -95,6 +95,11 @@ option; when changing layouts, use an empty or separately namespaced cache pool.
 
 ## Supported boundaries
 
+- Speculative modes using EAGLE-style bigram radix keys (currently EAGLE,
+  EAGLE3, and FROZEN_KV_MTP) are rejected before connector initialization.
+  Their N KV slots depend on N+1 raw tokens; the connector's token-only key
+  cannot preserve the extra boundary token. This applies to both ordinary
+  and hybrid adapters and both backend-selection flags.
 - The connector currently hashes token IDs without `extra_key` or `cache_salt`.
   Such requests use their correctly namespaced GPU cache and recompute misses;
   they skip **all** FlexKV lookup, store, and prefetch paths. This includes LoRA
