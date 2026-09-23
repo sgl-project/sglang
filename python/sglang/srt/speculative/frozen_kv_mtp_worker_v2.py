@@ -75,6 +75,7 @@ from sglang.srt.speculative.spec_utils import (
     draft_tp_context,
     fast_topk,
     get_plan_stream,
+    lm_head_is_packed,
     select_top_k_tokens,
     spec_stage_span,
 )
@@ -148,7 +149,13 @@ class FrozenKVMTPDraftWorker(EagleDraftWorkerBase, TpModelWorker):
                 context_length=self.target_worker.model_runner.model_config.context_len,
             )
 
-        embed, head = self.target_worker.model_runner.model.get_embed_and_head()
+        target_model = self.target_worker.model_runner.model
+        embed, head = target_model.get_embed_and_head()
+        if head is None and lm_head_is_packed(getattr(target_model, "lm_head", None)):
+            raise ValueError(
+                "The target lm_head stores its weight packed; Frozen-KV MTP "
+                "shares the head tensor only."
+            )
         if hasattr(self.draft_model_runner.model, "set_embed_and_head"):
             self.draft_model_runner.model.set_embed_and_head(embed, head)
         else:

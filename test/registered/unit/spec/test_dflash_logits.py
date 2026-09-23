@@ -9,7 +9,10 @@ from sglang.srt.models.dflash import (
     DFlash2DraftModel,
     _grouped_conv,
 )
-from sglang.srt.speculative.dflash_utils import parse_dflash_draft_config
+from sglang.srt.speculative.dflash_utils import (
+    is_dense_head_weight,
+    parse_dflash_draft_config,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=38, suite="base-a-test-cpu")
@@ -94,7 +97,7 @@ def _flashinfer_contract_topk(scores, k, sorted=False, deterministic=False):
 
 class _FakeQuantMethod:
     """Projects through a captured dense weight, asserting the packed-head
-    call contract (packed dtype, no bias). The padded tail comes out as
+    call contract (no dense weight, no bias). The padded tail comes out as
     dominant garbage so a masking regression surfaces as wrong candidates."""
 
     def __init__(self, dense_weight, num_padded):
@@ -104,7 +107,7 @@ class _FakeQuantMethod:
 
     def apply(self, layer, x, bias):
         self.called = True
-        assert layer.weight.dtype == torch.int8
+        assert not is_dense_head_weight(getattr(layer, "weight", None))
         assert bias is None
         logits = torch.matmul(x, self.dense_weight.T)
         pad = logits.new_full((logits.shape[0], self.num_padded), 100.0)
@@ -114,13 +117,24 @@ class _FakeQuantMethod:
         return torch.stack([full, full], dim=-1)[..., 0]
 
 
+# A quantized head keeps its packed bytes either under `.weight` (ModelOpt,
+# FP8) or under another name with no `.weight` at all (compressed-tensors
+# `weight_packed`, GGUF `qweight`). Both must reach the quant method.
+_PACKED_HEAD_LAYOUTS = {
+    "packed_weight": lambda: {"weight": torch.empty(8, 2, dtype=torch.int8)},
+    "no_weight": lambda: {"weight_packed": torch.empty(8, 2, dtype=torch.int32)},
+}
+
+
+@pytest.mark.parametrize("layout", list(_PACKED_HEAD_LAYOUTS))
 def test_selector_projects_a_quantized_target_lm_head_through_its_quant_method(
-    monkeypatch,
+    monkeypatch, layout
 ):
     """Packed head weights must be projected through their quantization method,
     with the padded-vocab tail masked out of the top-k on contiguous logits:
     flashinfer's radix top-k rejects non-contiguous input, so a plain crop view
-    would fail at capture on any padded vocab."""
+    would fail at capture on any padded vocab. A head with no `.weight` at all
+    used to be refused before reaching this path."""
     torch.manual_seed(0)
     hidden = torch.randn(2, 4)
     dense_weight = torch.randn(6, 4)
@@ -128,7 +142,7 @@ def test_selector_projects_a_quantized_target_lm_head_through_its_quant_method(
     quant_method = _FakeQuantMethod(dense_weight, num_padded=2)
     lm_head = SimpleNamespace(
         # Mimic a 2:1 packed head and two padded vocabulary rows.
-        weight=torch.empty(8, 2, dtype=torch.int8),
+        **_PACKED_HEAD_LAYOUTS[layout](),
         quant_method=quant_method,
         org_vocab_size=6,
     )
@@ -212,7 +226,8 @@ def test_selector_gathers_global_candidates_across_vocab_shards(monkeypatch):
     torch.testing.assert_close(unary_logits, expected_logits.float())
 
 
-def test_worker_folds_a_gate_admitted_quantized_selector_head(monkeypatch):
+@pytest.mark.parametrize("layout", list(_PACKED_HEAD_LAYOUTS))
+def test_worker_folds_a_gate_admitted_quantized_selector_head(monkeypatch, layout):
     """The pre-capture screen decides whether a quantized head reaches the
     graph-folded selector sampler or silently degrades to the eager per-round
     fallback -- a revert there keeps every compute_candidates test green, so
@@ -242,7 +257,7 @@ def test_worker_folds_a_gate_admitted_quantized_selector_head(monkeypatch):
         ),
     )
     quant_head = SimpleNamespace(
-        weight=torch.empty(8, 2, dtype=torch.int8),
+        **_PACKED_HEAD_LAYOUTS[layout](),
         quant_method=_FakeQuantMethod(torch.randn(6, 4), num_padded=2),
     )
     worker = SimpleNamespace(
