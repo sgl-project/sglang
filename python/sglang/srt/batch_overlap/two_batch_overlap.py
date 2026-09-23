@@ -284,6 +284,14 @@ def split_spec_info(
         seq_lens_cpu=seq_lens_cpu,
         seq_lens_sum=seq_lens_sum,
     )
+    if getattr(spec_info, "swa_custom_mask", None) is not None:
+        mask_lens = (
+            spec_info.seq_lens_cpu.clamp(max=spec_info.swa_mask_window)
+            + spec_info.draft_token_num
+        ) * spec_info.draft_token_num
+        start = int(mask_lens[:start_seq_index].sum())
+        end = int(mask_lens[:end_seq_index].sum())
+        output_spec_info.swa_custom_mask = spec_info.swa_custom_mask[start:end]
     return output_spec_info
 
 
