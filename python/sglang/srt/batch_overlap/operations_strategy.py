@@ -6,6 +6,7 @@ import torch
 from sglang.srt.batch_overlap import operations
 from sglang.srt.batch_overlap.operations import Operation
 from sglang.srt.layers.moe.token_dispatcher import DeepEPConfig
+from sglang.srt.layers.utils.common import PPMissingLayer
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.utils import is_hip
 
@@ -35,14 +36,24 @@ class OperationsStrategy:
         layers: torch.nn.ModuleList,
         forward_mode: ForwardMode,
     ) -> "OperationsStrategy":
-        layer_name = layers[0].__class__.__name__
+        # Filter out PPMissingLayer for Pipeline Parallelism
+        real_layers = [
+            layer for layer in layers if not isinstance(layer, PPMissingLayer)
+        ]
+        if len(real_layers) == 0:
+            # All layers are PPMissingLayer, return empty strategy
+            return OperationsStrategy(
+                operations=[], deep_gemm_num_sms=None, tbo_delta_stages=0
+            )
+
+        layer_name = real_layers[0].__class__.__name__
         if layer_name == "DeepseekV2DecoderLayer":
             return OperationsStrategy.concat(
                 [
                     _compute_moe_deepseek_layer_operations_strategy_tbo(
                         layer, forward_mode
                     )
-                    for layer in layers
+                    for layer in real_layers
                 ]
             )
         elif layer_name == "Qwen3MoeDecoderLayer":
@@ -51,7 +62,7 @@ class OperationsStrategy:
                     _compute_moe_qwen3_layer_operations_strategy_tbo(
                         layer, forward_mode
                     )
-                    for layer in layers
+                    for layer in real_layers
                 ]
             )
         elif layer_name == "MiMoV2DecoderLayer":
@@ -60,7 +71,20 @@ class OperationsStrategy:
                     _compute_moe_mimov2_layer_operations_strategy_tbo(
                         layer, forward_mode
                     )
-                    for layer in layers
+                    for layer in real_layers
+                ]
+            )
+        # The decoder layers in Qwen3.5 have different names.
+        elif layer_name in [
+            "Qwen3_5LinearDecoderLayer",
+            "Qwen3_5AttentionDecoderLayer",
+        ]:
+            return OperationsStrategy.concat(
+                [
+                    _compute_moe_qwen3_5_layer_operations_strategy_tbo(
+                        layer, forward_mode
+                    )
+                    for layer in real_layers
                 ]
             )
         elif layer_name == "DeepseekV4DecoderLayer":
@@ -374,5 +398,82 @@ def _compute_moe_mimov2_decode(layer):
             layer.mlp.op_output,
             layer.op_comm_postprocess_layer,
             operations.YieldOperation(),
+        ],
+    )
+
+
+# -------------------------------- Strategy for Qwen3.5 ---------------------------------------
+
+
+def _compute_moe_qwen3_5_layer_operations_strategy_tbo(
+    layer: torch.nn.Module,
+    forward_mode: ForwardMode,
+) -> OperationsStrategy:
+    assert layer.is_layer_sparse, "qwen3.5 dense layer TBO not yet implemented"
+    if forward_mode == ForwardMode.EXTEND:
+        return _compute_moe_qwen3_5_prefill(layer)
+    elif (
+        forward_mode == ForwardMode.DECODE or forward_mode == ForwardMode.TARGET_VERIFY
+    ):
+        return _compute_moe_qwen3_5_decode(layer)
+    else:
+        raise NotImplementedError(f"Unsupported {forward_mode=}")
+
+
+def _compute_moe_qwen3_5_prefill(layer):
+    device_properties = torch.cuda.get_device_properties(device="cuda")
+    total_num_sms = device_properties.multi_processor_count
+    deep_gemm_num_sms = None
+    if not _is_hip:
+        deep_gemm_num_sms = total_num_sms - DeepEPConfig.get_instance().num_sms
+
+    return OperationsStrategy(
+        deep_gemm_num_sms=deep_gemm_num_sms,
+        tbo_delta_stages=0,
+        operations=[
+            layer.op_comm_prepare_attn,
+            layer.op_attn_prepare,
+            layer.op_attn_core,
+            layer.op_comm_prepare_mlp,
+            layer.mlp.op_gate,
+            layer.mlp.op_select_experts,
+            layer.mlp.op_dispatch_a,
+            operations.YieldOperation(),
+            layer.mlp.op_dispatch_b,
+            layer.mlp.op_experts,
+            layer.mlp.op_combine_a,
+            operations.YieldOperation(),
+            layer.mlp.op_shared_experts,
+            layer.mlp.op_combine_b,
+            layer.mlp.op_output,
+            layer.op_comm_postprocess_layer,
+        ],
+    )
+
+
+def _compute_moe_qwen3_5_decode(layer):
+    return OperationsStrategy(
+        deep_gemm_num_sms=None,
+        tbo_delta_stages=2,
+        operations=[
+            layer.op_comm_prepare_attn,
+            layer.op_attn_prepare,
+            layer.op_attn_core,
+            operations.YieldOperation(),
+            layer.op_comm_prepare_mlp,
+            layer.mlp.op_gate,
+            layer.mlp.op_select_experts,
+            operations.YieldOperation(),
+            layer.mlp.op_dispatch_a,
+            layer.mlp.op_shared_experts,
+            operations.YieldOperation(),
+            layer.mlp.op_dispatch_b,
+            layer.mlp.op_experts,
+            layer.mlp.op_combine_a,
+            operations.YieldOperation(),
+            layer.mlp.op_combine_b,
+            operations.YieldOperation(),
+            layer.mlp.op_output,
+            layer.op_comm_postprocess_layer,
         ],
     )

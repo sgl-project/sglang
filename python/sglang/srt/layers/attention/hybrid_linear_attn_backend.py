@@ -290,6 +290,9 @@ class MambaAttnBackendBase(AttentionBackend):
                     forward_batch.extend_start_loc[-1]
                     + forward_batch.extend_seq_lens[-1]
                 )
+                # to adapt variable length split
+                query_start_loc -= forward_batch.extend_start_loc[0]
+
                 if (
                     forward_batch.extend_seq_lens_cpu is not None
                     and len(forward_batch.extend_seq_lens_cpu) == bs
