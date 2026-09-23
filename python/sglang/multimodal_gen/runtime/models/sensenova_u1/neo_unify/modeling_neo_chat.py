@@ -13,6 +13,12 @@ from transformers.modeling_outputs import CausalLMOutputWithPast
 from transformers.modeling_utils import PreTrainedModel
 from transformers.utils import logging
 
+from sglang.multimodal_gen.configs.sensenova_u1 import (
+    DEFAULT_IMG_CFG_SCALE,
+    SenseNovaGuidanceProfile,
+    derive_guidance_profile,
+)
+
 from .configuration_neo_chat import NEOChatConfig, NEOMoELLMConfig
 from .conversation import get_conv_template
 from .modeling_fm_modules import (
@@ -2014,11 +2020,11 @@ class NEOChatModel(PreTrainedModel):
         merge_size = int(1 / self.downsample_ratio)
         question_condition = f"{prompt}"
         think_text = ""
-        needs_cfg = not (cfg_scale == 1 and img_cfg_scale == 1)
-        needs_img_condition = needs_cfg and (
-            img_cfg_scale == 1 or cfg_scale != img_cfg_scale
+        guidance_profile = derive_guidance_profile(
+            is_edit=True,
+            cfg_scale=cfg_scale,
+            img_cfg_scale=img_cfg_scale,
         )
-        needs_uncondition = needs_cfg and img_cfg_scale != 1
 
         think_content = (
             "<think>\n" if think_mode else "<think>\n\n</think>\n\n" + IMG_START_TOKEN
@@ -2030,12 +2036,12 @@ class NEOChatModel(PreTrainedModel):
         )
         query_img_condition = (
             self._build_t2i_query("<image>" * len(images), append_text=IMG_START_TOKEN)
-            if needs_img_condition
+            if guidance_profile.needs_image_condition
             else None
         )
         query_uncondition = (
             self._build_t2i_query("", append_text=IMG_START_TOKEN)
-            if needs_uncondition
+            if guidance_profile.needs_uncondition
             else None
         )
 
@@ -2316,11 +2322,9 @@ class NEOChatModel(PreTrainedModel):
                 image_size=image_size,
             )
 
-            if not use_cfg:
+            if not use_cfg or guidance_profile is SenseNovaGuidanceProfile.CONDITION:
                 v_pred = out_cond
-            elif cfg_scale == 1 and img_cfg_scale == 1:
-                v_pred = out_cond
-            elif img_cfg_scale == 1:
+            elif guidance_profile is SenseNovaGuidanceProfile.CONDITION_IMAGE:
                 out_img_cond = self._t2i_predict_v(
                     image_embeds,
                     indexes_image_img_condition,
@@ -2333,7 +2337,7 @@ class NEOChatModel(PreTrainedModel):
                     image_size=image_size,
                 )
                 v_pred = out_img_cond + cfg_scale * (out_cond - out_img_cond)
-            elif cfg_scale == img_cfg_scale:
+            elif guidance_profile is SenseNovaGuidanceProfile.CONDITION_UNCONDITIONAL:
                 out_uncond = self._t2i_predict_v(
                     image_embeds,
                     indexes_image_uncondition,
@@ -2347,6 +2351,10 @@ class NEOChatModel(PreTrainedModel):
                 )
                 v_pred = out_uncond + cfg_scale * (out_cond - out_uncond)
             else:
+                assert (
+                    guidance_profile
+                    is SenseNovaGuidanceProfile.CONDITION_IMAGE_UNCONDITIONAL
+                )
                 out_img_cond = self._t2i_predict_v(
                     image_embeds,
                     indexes_image_img_condition,
@@ -2447,7 +2455,11 @@ class NEOChatModel(PreTrainedModel):
 
         self.config.t_eps = t_eps
         think_text = ""
-        needs_cfg = cfg_scale > 1
+        guidance_profile = derive_guidance_profile(
+            is_edit=False,
+            cfg_scale=cfg_scale,
+            img_cfg_scale=DEFAULT_IMG_CFG_SCALE,
+        )
 
         think_content = (
             "<think>\n" if think_mode else "<think>\n\n</think>\n\n" + IMG_START_TOKEN
@@ -2465,7 +2477,7 @@ class NEOChatModel(PreTrainedModel):
         )
         query_uncondition = (
             self._build_t2i_query("", append_text=IMG_START_TOKEN)
-            if needs_cfg
+            if guidance_profile.needs_uncondition
             else None
         )
 
@@ -2660,6 +2672,21 @@ class NEOChatModel(PreTrainedModel):
                     "noise_scale_embedder"
                 ](noise_level)
 
+        # Noise scale is fixed for this request; only the timestep changes.
+        noise_embeddings = None
+        if (
+            denoise_embeddings is None
+            and self.add_noise_scale_embedding
+            and num_steps > 0
+        ):
+            noise_scale_tensor = timesteps.new_full(
+                (batch_size * token_h * token_w,),
+                noise_scale / self.noise_scale_max_value,
+            )
+            noise_embeddings = self.fm_modules["noise_scale_embedder"](
+                noise_scale_tensor
+            ).view(batch_size, token_h * token_w, -1)
+
         for step_i in range(num_steps):
             t = timesteps[step_i]
             t_next = timesteps[step_i + 1]
@@ -2680,13 +2707,8 @@ class NEOChatModel(PreTrainedModel):
                 timestep_embeddings = self.fm_modules["timestep_embedder"](
                     t_expanded
                 ).view(batch_size, token_h * token_w, -1)
-                if self.add_noise_scale_embedding:
-                    noise_scale_tensor = torch.full_like(
-                        t_expanded, noise_scale / self.noise_scale_max_value
-                    )
-                    timestep_embeddings += self.fm_modules["noise_scale_embedder"](
-                        noise_scale_tensor
-                    ).view(batch_size, token_h * token_w, -1)
+                if noise_embeddings is not None:
+                    timestep_embeddings += noise_embeddings
             image_embeds = image_embeds + timestep_embeddings
 
             v_pred_condition = self._t2i_predict_v(
@@ -2701,7 +2723,11 @@ class NEOChatModel(PreTrainedModel):
                 image_size=image_size,
             )
 
-            if t >= cfg_interval[0] and t <= cfg_interval[1] and cfg_scale > 1:
+            if (
+                t >= cfg_interval[0]
+                and t <= cfg_interval[1]
+                and guidance_profile is SenseNovaGuidanceProfile.CONDITION_UNCONDITIONAL
+            ):
                 v_pred_uncondition = self._t2i_predict_v(
                     image_embeds,
                     indexes_image_uncondition,
