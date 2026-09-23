@@ -100,27 +100,38 @@ class TestAFDControlWireProtocol(unittest.TestCase):
 
 class TestAFDHandshakeWireProtocol(unittest.TestCase):
     def test_handshake_roundtrip_agrees_on_endpoints_and_model(self):
-        port = _free_port()
-        ffn_info = _handshake_info("ffn")
-        attn_info = _handshake_info("attn")
-        with (
-            envs.SGLANG_AFD_HANDSHAKE_TIMEOUT_S.override(5),
-            ThreadPoolExecutor(max_workers=1) as pool,
+        for num_attn, num_ffn, backend in (
+            (1, 1, "none"),
+            (3, 2, "none"),
+            (2, 3, "deepep"),
         ):
-            server = pool.submit(_accept_handshake, port, ffn_info)
-            result = run_handshake_attn(
-                f"127.0.0.1:{port - AFD_HANDSHAKE_PORT_DELTA}", attn_info
-            )
-            peer_result = server.result(timeout=10)
-        self.assertEqual(result.local, attn_info)
-        self.assertEqual(result.peer, ffn_info)
-        self.assertEqual(peer_result.local, ffn_info)
-        self.assertEqual(peer_result.peer, attn_info)
-        self.assertEqual(result.dist_host, "127.0.0.1")
-        self.assertEqual(result.sync_port, port + 1)
-        self.assertEqual(result.dist_port, port + 2)
-        self.assertEqual(result.sync_port, peer_result.sync_port)
-        self.assertEqual(result.dist_port, peer_result.dist_port)
+            with self.subTest(num_attn=num_attn, num_ffn=num_ffn, backend=backend):
+                port = _free_port()
+                ffn_info = _handshake_info("ffn")
+                attn_info = _handshake_info("attn")
+                ffn_info.num_ranks = num_ffn
+                attn_info.num_ranks = num_attn
+                ffn_info.afd_ffn_moe_backend = backend
+                attn_info.afd_ffn_moe_backend = backend
+                attn_info.decode_token_buckets = [96]
+                with (
+                    envs.SGLANG_AFD_HANDSHAKE_TIMEOUT_S.override(5),
+                    ThreadPoolExecutor(max_workers=1) as pool,
+                ):
+                    server = pool.submit(_accept_handshake, port, ffn_info)
+                    result = run_handshake_attn(
+                        f"127.0.0.1:{port - AFD_HANDSHAKE_PORT_DELTA}", attn_info
+                    )
+                    peer_result = server.result(timeout=10)
+                self.assertEqual(result.local, attn_info)
+                self.assertEqual(result.peer, ffn_info)
+                self.assertEqual(peer_result.local, ffn_info)
+                self.assertEqual(peer_result.peer, attn_info)
+                self.assertEqual(result.dist_host, "127.0.0.1")
+                self.assertEqual(result.sync_port, port + 1)
+                self.assertEqual(result.dist_port, port + 2)
+                self.assertEqual(result.sync_port, peer_result.sync_port)
+                self.assertEqual(result.dist_port, peer_result.dist_port)
 
     def test_handshake_rejects_model_mismatch_on_both_peers(self):
         port = _free_port()

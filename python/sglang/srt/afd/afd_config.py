@@ -35,6 +35,18 @@ def afd_role_from_args(server_args: ServerArgs) -> Optional[AFDRole]:
     return AFDRole(server_args.afd_role)
 
 
+def is_afd_attn_moe_scattered() -> bool:
+    from sglang.srt.runtime_context import get_disagg
+
+    server_args = get_disagg()
+    role = afd_role_from_args(server_args)
+    return (
+        role is not None
+        and role.is_attn()
+        and server_args.afd_ffn_moe_backend == "deepep"
+    )
+
+
 def prepare_afd_ffn_moe_backend(server_args: ServerArgs) -> None:
     """Separate AFD's logical expert layout from the local MoE backend."""
     cfg = resolving_view(server_args)
@@ -179,9 +191,9 @@ def _check_attn_args(server_args: ServerArgs) -> None:
             "AFD attn instance requires the internal MoE backend 'afd'; "
             f"got {cfg.moe_a2a_backend!r}"
         )
-    if cfg.afd_ffn_moe_backend != "none":
+    if cfg.afd_ffn_moe_backend not in ("none", "deepep"):
         raise ValueError(
-            "AFD supports F-internal --moe-a2a-backend none; "
+            "AFD supports F-internal --moe-a2a-backend none or deepep; "
             f"got {cfg.afd_ffn_moe_backend!r}"
         )
     if cfg.ep_size != 1 or cfg.moe_dp_size != 1:
@@ -209,9 +221,9 @@ def _check_ffn_args(server_args: ServerArgs) -> None:
             "--afd-ffn-addr is an attn-side arg pointing at the ffn "
             "instance; the ffn instance itself only needs --afd-role ffn"
         )
-    if cfg.moe_a2a_backend != "none":
+    if cfg.moe_a2a_backend not in ("none", "deepep"):
         raise ValueError(
-            "AFD ffn instance supports --moe-a2a-backend none; "
+            "AFD ffn instance supports --moe-a2a-backend none or deepep; "
             f"got {cfg.moe_a2a_backend!r}"
         )
     if cfg.moe_a2a_backend == "none":

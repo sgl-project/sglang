@@ -25,8 +25,6 @@ class AFDCommConfig:
     def __post_init__(self):
         if self.num_attn_ranks <= 0 or self.num_ffn_ranks <= 0:
             raise ValueError("AFD communicator rank counts must be positive")
-        if self.num_attn_ranks != self.num_ffn_ranks:
-            raise ValueError("AFD requires equal attention and FFN rank counts")
         num_local = self.num_attn_ranks if self.role.is_attn() else self.num_ffn_ranks
         if not 0 <= self.instance_rank < num_local:
             raise ValueError(
@@ -44,11 +42,15 @@ class AFDCommConfig:
             return self.instance_rank
         return self.num_ffn_ranks + self.instance_rank
 
-    def ffn_ranks_for_attn(self, attn_rank: int) -> tuple[int, ...]:
-        return (attn_rank,)
+    def ffn_ranks_for_attn(self, attn_rank: int, *, scattered: bool) -> tuple[int, ...]:
+        if scattered:
+            return (attn_rank % self.num_ffn_ranks,)
+        return tuple(range(attn_rank, self.num_ffn_ranks, self.num_attn_ranks))
 
-    def attn_ranks_for_ffn(self, ffn_rank: int) -> tuple[int, ...]:
-        return (ffn_rank,)
+    def attn_ranks_for_ffn(self, ffn_rank: int, *, scattered: bool) -> tuple[int, ...]:
+        if scattered:
+            return tuple(range(ffn_rank, self.num_attn_ranks, self.num_ffn_ranks))
+        return (ffn_rank % self.num_attn_ranks,)
 
     def ffn_global_rank(self, ffn_rank: int) -> int:
         return ffn_rank

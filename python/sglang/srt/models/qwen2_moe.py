@@ -31,6 +31,7 @@ from sglang.kernels.ops.elementwise.elementwise import (
     fused_gate_sigmoid_mul,
     fused_gate_sigmoid_mul_add,
 )
+from sglang.srt.afd.afd_config import is_afd_attn_moe_scattered
 from sglang.srt.batch_overlap.two_batch_overlap import model_forward_maybe_tbo
 from sglang.srt.distributed import (
     get_pp_group,
@@ -383,6 +384,10 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                         or get_moe_a2a_backend().is_mori()
                         or get_moe_a2a_backend().is_deepep_v2()
                         or get_moe_a2a_backend().is_flashinfer()
+                        or (
+                            get_moe_a2a_backend().is_afd_attn()
+                            and is_afd_attn_moe_scattered()
+                        )
                     )
                     else {}
                 ),

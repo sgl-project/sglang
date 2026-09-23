@@ -25,6 +25,7 @@ import torch
 from torch import nn
 from transformers import PretrainedConfig
 
+from sglang.srt.afd.afd_config import is_afd_attn_moe_scattered
 from sglang.srt.distributed import (
     get_pp_group,
     moe_expert_parallel_all_reduce,
@@ -299,6 +300,8 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         forward_batch: Optional[ForwardBatch] = None,
     ) -> torch.Tensor:
         if get_moe_a2a_backend().is_afd_attn():
+            if is_afd_attn_moe_scattered():
+                return self.forward_deepep(hidden_states, forward_batch)
             return self.forward_normal(hidden_states)
 
         if (

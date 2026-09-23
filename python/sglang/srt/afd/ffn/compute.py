@@ -10,6 +10,10 @@ import torch
 from sglang.srt.afd.afd_config import AFDRole
 from sglang.srt.afd.layers import AFDMoELayer, collect_afd_moe_layers
 from sglang.srt.layers.moe.topk import StandardTopKOutput
+from sglang.srt.runtime_context import get_disagg, get_exec
+from sglang.srt.utils import get_bool_env_var, is_hip
+
+_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
 
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import Scheduler
@@ -26,6 +30,11 @@ def _resolve_routed_scaling_mode(layer: AFDMoELayer) -> _RoutedScalingMode:
         return _RoutedScalingMode.RUNNER
     if layer.experts.should_fuse_routed_scaling_factor_in_topk:
         return _RoutedScalingMode.TOPK_WEIGHTS
+
+    from sglang.srt.layers.moe.ep_moe.layer import DeepEPMoE
+
+    if isinstance(layer.experts, DeepEPMoE):
+        return _RoutedScalingMode.RUNNER if _use_aiter else _RoutedScalingMode.OUTPUT
 
     from sglang.srt.layers.quantization.mxfp4_flashinfer_trtllm_moe import (
         requires_post_expert_routed_scaling,
@@ -47,6 +56,10 @@ class AFDFFNCompute:
             _resolve_routed_scaling_mode(layer) for layer in self._layers
         ]
         self._device = next(self._layers[0].experts.parameters()).device
+        self._uses_deepep_low_latency = (
+            get_disagg().afd_ffn_moe_backend == "deepep"
+            and get_exec().moe.deepep_mode != "normal"
+        )
 
     @property
     def layers(self) -> list[AFDMoELayer]:
@@ -55,6 +68,24 @@ class AFDFFNCompute:
     @property
     def device(self) -> torch.device:
         return self._device
+
+    def configure_native_deepep_dispatch_limit(
+        self,
+        dispatch_limit: int | None,
+    ) -> None:
+        if not self._uses_deepep_low_latency:
+            return
+        if dispatch_limit is None:
+            raise RuntimeError("AFD DeepEP low-latency capacity was not derived")
+
+        for layer in self._layers:
+            for dispatcher in layer.experts.dispatcher._inners:
+                if dispatcher.deepep_mode.enable_low_latency():
+                    dispatcher._low_latency_dispatcher.num_max_dispatch_tokens_per_rank = dispatch_limit
+                if dispatcher.deepep_mode.enable_normal():
+                    dispatcher._normal_dispatcher.num_max_dispatch_tokens_per_rank = (
+                        dispatch_limit
+                    )
 
     def run(
         self,

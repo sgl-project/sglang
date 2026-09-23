@@ -9,7 +9,11 @@ import torch
 import zmq
 
 from sglang.srt.afd.afd_config import AFDRole
-from sglang.srt.afd.afd_handshake import AFDHandshakeServer, afd_handshake_port
+from sglang.srt.afd.afd_handshake import (
+    AFDHandshakeServer,
+    afd_handshake_port,
+    build_afd_ffn_capacity_plan,
+)
 from sglang.srt.afd.afd_sync import AFDSyncMsgReceiver
 from sglang.srt.afd.ffn.compute import AFDFFNCompute
 from sglang.srt.afd.ffn.executor import AFDFFNExecutor
@@ -26,7 +30,7 @@ from sglang.srt.managers.io_struct import (
     sock_recv,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
-from sglang.srt.runtime_context import get_serving
+from sglang.srt.runtime_context import get_exec, get_serving
 from sglang.srt.utils.common import broadcast_pyobj
 
 if TYPE_CHECKING:
@@ -130,6 +134,14 @@ def event_loop_afd_ffn(scheduler: Scheduler) -> None:
     else:
         (handshake,) = broadcast_pyobj([], rank, scheduler.tp_cpu_group, src=0)
 
+    capacity_plan = build_afd_ffn_capacity_plan(
+        handshake.local,
+        handshake.peer,
+        use_deepep_low_latency=get_exec().moe.deepep_mode != "normal",
+    )
+    scheduler.afd_ffn_compute.configure_native_deepep_dispatch_limit(
+        capacity_plan.deepep_dispatch_limit
+    )
     backend = init_afd_comm_backend(scheduler, AFDRole.FFN, handshake)
     executor = AFDFFNExecutor(scheduler, backend, scheduler.afd_ffn_compute)
     backend.startup_barrier()

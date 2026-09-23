@@ -36,6 +36,7 @@ from sglang.kernels.ops.attention.dsv4 import (
 from sglang.kernels.ops.quantization.fp8_kernel import (
     create_per_token_group_quant_fp8_output_scale,
 )
+from sglang.srt.afd.afd_config import is_afd_attn_moe_scattered
 from sglang.srt.batch_overlap.single_batch_overlap import SboFlags, compute_overlap_args
 from sglang.srt.batch_overlap.two_batch_overlap import (
     MaybeTboDeepEPDispatcher,
@@ -756,6 +757,7 @@ class DeepseekV2MoE(nn.Module):
                 or get_moe_a2a_backend().is_flashinfer()
                 or get_moe_a2a_backend().is_megamoe()
                 or get_moe_a2a_backend().is_deepep_v2()
+                or (get_moe_a2a_backend().is_afd_attn() and is_afd_attn_moe_scattered())
                 or should_use_flashinfer_cutlass_moe_fp4_allgather()
                 or envs.SGLANG_SHARED_EXPERT_TP1.get()
             )
@@ -955,6 +957,11 @@ class DeepseekV2MoE(nn.Module):
                     input_ids,
                     input_ids_global=input_ids_global,
                     skip_shared_experts=skip_shared_experts,
+                    num_token_non_padded=(
+                        forward_batch.num_token_non_padded
+                        if is_afd_attn_moe_scattered()
+                        else None
+                    ),
                 )
         else:
             return self.forward_deepep(
@@ -1081,6 +1088,7 @@ class DeepseekV2MoE(nn.Module):
         input_ids: Optional[torch.Tensor] = None,
         input_ids_global: Optional[torch.Tensor] = None,
         skip_shared_experts: bool = False,
+        num_token_non_padded: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if hasattr(self, "shared_experts") and use_intel_amx_backend(
             self.shared_experts.gate_up_proj
@@ -1124,6 +1132,7 @@ class DeepseekV2MoE(nn.Module):
             topk_output = self.topk(
                 hidden_states,
                 router_logits,
+                num_token_non_padded=num_token_non_padded,
                 expert_location_dispatch_info=dispatch_info,
                 **topk_kwargs,
             )

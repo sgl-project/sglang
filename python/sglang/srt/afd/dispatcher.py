@@ -31,20 +31,27 @@ class AFDDispatcher:
         layers: Sequence[AFDMoELayer],
         dtype: torch.dtype,
         device: torch.device,
+        scattered: bool,
     ):
         self._comm = comm
         self._layers = list(layers)
         self._dtype = dtype
         self._device = device
-        (ffn_rank,) = comm.config.ffn_ranks_for_attn(comm.config.instance_rank)
-        self._ffn_global_rank = comm.config.ffn_global_rank(ffn_rank)
+        self._ffn_global_ranks = tuple(
+            comm.config.ffn_global_rank(rank)
+            for rank in comm.config.ffn_ranks_for_attn(
+                comm.config.instance_rank, scattered=scattered
+            )
+        )
         self._next_step_id = 0
         self._step_id: Optional[int] = None
         self._wire_capacity = 0
         self._next_layer_index = 0
         self._active_handle: Optional[AFDWorkHandle] = None
 
-    def begin_batch(self, forward_mode: ForwardMode, wire_capacity: int) -> int:
+    def begin_batch(
+        self, forward_mode: ForwardMode, dp_capacity: int, wire_capacity: int
+    ) -> int:
         if self._active_handle is not None:
             raise RuntimeError("AFD cannot start a batch with active work")
         if (
@@ -58,6 +65,11 @@ class AFDDispatcher:
             )
         if wire_capacity < 0:
             raise ValueError("AFD token capacity cannot be negative")
+        if wire_capacity != dp_capacity:
+            raise ValueError(
+                "AFD eager execution requires exact-size transport: "
+                f"dp={dp_capacity}, wire={wire_capacity}"
+            )
         if forward_mode.is_idle() and wire_capacity != 0:
             raise ValueError("AFD idle step must have zero capacity")
 
@@ -96,17 +108,26 @@ class AFDDispatcher:
                 hidden_states, memory_format=torch.contiguous_format
             ),
         )
-        self._comm.send_to(
-            [handle.hidden_states, handle.topk_ids, handle.topk_weights],
-            self._ffn_global_rank,
-        )
+        if not self._ffn_global_ranks:
+            handle.output.zero_()
+        for peer_global_rank in self._ffn_global_ranks:
+            self._comm.send_to(
+                [handle.hidden_states, handle.topk_ids, handle.topk_weights],
+                peer_global_rank,
+            )
         self._active_handle = handle
         return handle
 
     def combine(self, handle: AFDWorkHandle) -> torch.Tensor:
         if self._active_handle is not handle:
             raise RuntimeError("AFD combine requires the active work handle")
-        self._comm.recv_from([handle.output], self._ffn_global_rank)
+        if self._ffn_global_ranks:
+            self._comm.recv_from([handle.output], self._ffn_global_ranks[0])
+            if len(self._ffn_global_ranks) > 1:
+                scratch = torch.empty_like(handle.output)
+                for peer_global_rank in self._ffn_global_ranks[1:]:
+                    self._comm.recv_from([scratch], peer_global_rank)
+                    handle.output.add_(scratch)
         self._active_handle = None
         self._next_layer_index += 1
         return handle.output

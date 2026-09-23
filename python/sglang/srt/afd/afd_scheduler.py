@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING, Optional, Sequence
 
 import torch
 
-from sglang.srt.afd.afd_config import AFDRole
+from sglang.srt.afd.afd_config import AFDRole, is_afd_attn_moe_scattered
 from sglang.srt.afd.afd_handshake import AFDHandshakeResult, run_handshake_attn
 from sglang.srt.afd.afd_sync import AFDSyncMsg, AFDSyncMsgSender
 from sglang.srt.afd.dispatcher import (
@@ -57,7 +57,9 @@ def _tokens_per_rank(batch: ScheduleBatch, num_attn_ranks: int) -> list[int]:
     model_uses_cross_dp_layout = (
         batch.global_num_tokens is not None and len(batch.global_num_tokens) > 1
     )
-    if batch.global_num_tokens is not None:
+    if batch.global_num_tokens_across_dp is not None:
+        tokens = list(batch.global_num_tokens_across_dp)
+    elif batch.global_num_tokens is not None:
         tokens = list(batch.global_num_tokens)
     elif batch.forward_mode.is_idle():
         tokens = [0]
@@ -99,15 +101,26 @@ def _effective_forward_mode(
 def prepare_afd_attn_batch(scheduler: Scheduler, batch: ScheduleBatch) -> None:
     tokens_per_rank = _tokens_per_rank(batch, scheduler.afd_handshake.local.num_ranks)
     forward_mode = _effective_forward_mode(batch, tokens_per_rank)
-    wire_capacity = sum(tokens_per_rank)
-    step_id = get_afd_dispatcher().begin_batch(forward_mode, wire_capacity)
+    scattered = is_afd_attn_moe_scattered()
+    dp_capacity = (
+        tokens_per_rank[scheduler.ps.tp_rank] if scattered else sum(tokens_per_rank)
+    )
+    wire_capacity = dp_capacity
+    control_wire_capacity = (
+        max(tokens_per_rank, default=0) if scattered else wire_capacity
+    )
+    step_id = get_afd_dispatcher().begin_batch(
+        forward_mode=forward_mode,
+        dp_capacity=dp_capacity,
+        wire_capacity=wire_capacity,
+    )
     if scheduler._afd_sync_sender is not None:
         scheduler._afd_sync_sender.send(
             AFDSyncMsg(
                 step_id=step_id,
                 tokens_per_rank=tokens_per_rank,
                 forward_mode=int(forward_mode),
-                wire_capacity=wire_capacity,
+                wire_capacity=control_wire_capacity,
             )
         )
 
@@ -136,6 +149,7 @@ def init_afd_attn(
             layers=collect_afd_moe_layers(model_runner.model, AFDRole.ATTN),
             dtype=model_runner.dtype,
             device=torch.device(backend.config.device),
+            scattered=handshake.local.afd_ffn_moe_backend == "deepep",
         )
     )
     backend.startup_barrier()

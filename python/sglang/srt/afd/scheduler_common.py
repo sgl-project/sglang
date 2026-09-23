@@ -32,6 +32,13 @@ if _LOG_INTERVAL < 0:
 def build_local_handshake_info(scheduler: Scheduler, role: AFDRole) -> AFDHandshakeInfo:
     model_runner = scheduler.tp_worker.model_runner
     moe_layers = collect_afd_moe_layers(model_runner.model, role)
+    scattered = get_disagg().afd_ffn_moe_backend == "deepep"
+    decode_token_buckets = []
+    if role.is_attn():
+        wire_token_multiplier = 1 if scattered else scheduler.ps.tp_size
+        decode_token_buckets = [
+            model_runner.max_running_requests * wire_token_multiplier
+        ]
     return AFDHandshakeInfo(
         role=role.value,
         model_identity=compute_model_identity(get_model().model_path),
@@ -39,6 +46,7 @@ def build_local_handshake_info(scheduler: Scheduler, role: AFDRole) -> AFDHandsh
         afd_backend=get_disagg().afd_backend,
         afd_ffn_moe_backend=get_disagg().afd_ffn_moe_backend,
         wire_dtype=str(model_runner.dtype).removeprefix("torch."),
+        decode_token_buckets=decode_token_buckets,
         moe_layers=[
             {
                 "layer_id": layer.layer_id,

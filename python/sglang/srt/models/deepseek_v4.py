@@ -33,6 +33,7 @@ from sglang.kernels.ops.attention.flash_mla_sm120 import SM120_DECODE_MAX_TOKENS
 from sglang.kernels.ops.quantization.fp8_kernel import (
     sglang_per_token_group_quant_fp8,
 )
+from sglang.srt.afd.afd_config import is_afd_attn_moe_scattered
 from sglang.srt.compilation.compilation_config import register_split_op
 from sglang.srt.configs.deepseek_v4 import DeepSeekV4Config
 from sglang.srt.distributed import (
@@ -2394,13 +2395,21 @@ class DeepseekV4DecoderLayer(nn.Module):
         _use_tp_moe_gather = (
             not _use_cp
             and get_parallel().attn_dp_size > 1
-            and (get_moe_a2a_backend().is_none() or get_moe_a2a_backend().is_afd_attn())
+            and (
+                get_moe_a2a_backend().is_none()
+                or (
+                    get_moe_a2a_backend().is_afd_attn()
+                    and not is_afd_attn_moe_scattered()
+                )
+            )
         )
         _use_tp_attn_a2a_scatter = (
             not _use_cp
             and get_parallel().attn_tp_size > 1
             and not get_moe_a2a_backend().is_none()
-            and not get_moe_a2a_backend().is_afd_attn()
+            and not (
+                get_moe_a2a_backend().is_afd_attn() and not is_afd_attn_moe_scattered()
+            )
         )
         # symmetric gather+scatter for the no-EP TP-MoE dp-attn path:
         # all_gatherv gather (in self.mlp's dp_gather) + reduce_scatterv combine.
@@ -3242,7 +3251,8 @@ class DeepseekV4Model(nn.Module):
                 )
 
         if get_parallel().attn_dp_size > 1 and (
-            get_moe_a2a_backend().is_none() or get_moe_a2a_backend().is_afd_attn()
+            get_moe_a2a_backend().is_none()
+            or (get_moe_a2a_backend().is_afd_attn() and not is_afd_attn_moe_scattered())
         ):
             input_ids_global = torch.empty(
                 (get_global_dp_buffer_len(), 1),

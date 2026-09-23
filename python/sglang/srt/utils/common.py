@@ -102,6 +102,7 @@ from sglang.srt.environ import envs
 from sglang.srt.observability.func_timer import enable_func_timer
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import (
+    get_disagg,
     get_exec,
     get_flags,
     get_model,
@@ -3836,7 +3837,12 @@ def require_mlp_tp_gather():
             return True
         elif not get_parallel().enable_dp_lm_head:
             return True
-        elif get_moe_a2a_backend().is_none() or get_moe_a2a_backend().is_afd_attn():
+        elif get_moe_a2a_backend().is_none():
+            return True
+        elif (
+            get_disagg().afd_role == "attn"
+            and get_disagg().afd_ffn_moe_backend != "deepep"
+        ):
             return True
         elif get_moe_a2a_backend().is_flashinfer():
             # FlashInfer MoE A2A needs a rank-invariant, DP-synchronized per-rank

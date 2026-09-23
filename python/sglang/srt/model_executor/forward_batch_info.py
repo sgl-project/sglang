@@ -37,6 +37,7 @@ from typing import TYPE_CHECKING, Dict, List, Optional, Set, Tuple, Union
 import torch
 
 from sglang.kernels.ops.attention.position import compute_position_triton
+from sglang.srt.afd.afd_config import is_afd_attn_moe_scattered
 from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.environ import envs
 from sglang.srt.kv_canary.req_to_expected_token_ids_manager import (
@@ -1797,7 +1798,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
 
 def enable_num_token_non_padded():
-    return get_parallel().moe_ep_size > 1
+    return get_parallel().moe_ep_size > 1 or is_afd_attn_moe_scattered()
 
 
 def build_inner_fb_view(

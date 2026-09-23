@@ -35,6 +35,8 @@ class AFDHandshakeInfo:
     afd_ffn_moe_backend: str
     wire_dtype: str
     moe_layers: list[dict] = field(repr=False)
+    # A admission bound: global tokens for FULL, per-rank tokens for SCATTERED.
+    decode_token_buckets: list[int] = field(default_factory=list, repr=False)
 
 
 class _HandshakeRequest(msgspec.Struct, tag="request", forbid_unknown_fields=True):
@@ -64,6 +66,34 @@ class AFDHandshakeResult:
     dist_host: str
     sync_port: int
     dist_port: int
+
+
+@dataclass(frozen=True)
+class AFDFFNCapacityPlan:
+    deepep_dispatch_limit: int | None
+
+
+def build_afd_ffn_capacity_plan(
+    ffn: AFDHandshakeInfo,
+    attn: AFDHandshakeInfo,
+    use_deepep_low_latency: bool,
+) -> AFDFFNCapacityPlan:
+    """Derive the staged DeepEP capacity from A admission and rank fan-in."""
+    deepep_dispatch_limit = None
+    if (
+        ffn.afd_ffn_moe_backend == "deepep"
+        and use_deepep_low_latency
+        and attn.decode_token_buckets
+    ):
+        fan_in = (attn.num_ranks + ffn.num_ranks - 1) // ffn.num_ranks
+        deepep_dispatch_limit = max(attn.decode_token_buckets) * fan_in
+        if deepep_dispatch_limit > 1024:
+            raise RuntimeError(
+                "AFD SCATTERED requires at most 1024 DeepEP dispatch tokens "
+                "per rank for one attn session; "
+                f"required={deepep_dispatch_limit}"
+            )
+    return AFDFFNCapacityPlan(deepep_dispatch_limit=deepep_dispatch_limit)
 
 
 def afd_handshake_port(ffn_api_port: int) -> int:
@@ -128,9 +158,9 @@ def _check_compatible(local: AFDHandshakeInfo, peer: AFDHandshakeInfo) -> None:
             f"AFD handshake: wire dtype mismatch, attn={attn.wire_dtype!r} "
             f"ffn={ffn.wire_dtype!r}"
         )
-    if attn.num_ranks <= 0 or attn.num_ranks != ffn.num_ranks:
+    if attn.num_ranks <= 0 or ffn.num_ranks <= 0:
         raise RuntimeError(
-            "AFD handshake: equal positive rank counts are required, "
+            "AFD handshake: positive rank counts are required, "
             f"attn={attn.num_ranks} ffn={ffn.num_ranks}"
         )
     _check_moe_layers_compatible(attn.moe_layers, ffn.moe_layers)

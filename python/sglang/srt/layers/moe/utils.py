@@ -706,6 +706,11 @@ def should_skip_post_experts_all_reduce(*, is_tp_path: bool) -> bool:
     the decoder via ``get_forward().scoped(...)``. Pass ``is_tp_path=True``
     for the post-experts TP all-reduce, ``False`` for the EP all-reduce.
     """
+    if get_moe_a2a_backend().is_afd_attn():
+        from sglang.srt.afd.afd_config import is_afd_attn_moe_scattered
+
+        if is_afd_attn_moe_scattered():
+            return True
     if should_skip_mlp_all_reduce():
         return True
     if get_parallel().dwdp_size > 1:

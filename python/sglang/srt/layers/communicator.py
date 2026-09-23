@@ -20,6 +20,7 @@ from typing import Callable, Dict, Optional, Tuple, Union
 
 import torch
 
+from sglang.srt.afd.afd_config import is_afd_attn_moe_scattered
 from sglang.srt.distributed import (
     attention_tensor_model_parallel_all_reduce,
     attention_tensor_model_parallel_quant_all_reduce,
@@ -427,7 +428,10 @@ class LayerScatterModes:
                 # Token dispatch/combine will be handled outside of LayerCommunicator for these modes.
                 (
                     not get_moe_a2a_backend().is_none()
-                    and not get_moe_a2a_backend().is_afd_attn()
+                    and (
+                        not get_moe_a2a_backend().is_afd_attn()
+                        or is_afd_attn_moe_scattered()
+                    )
                 )
                 or should_use_flashinfer_cutlass_moe_fp4_allgather()
                 or enable_dwdp()
