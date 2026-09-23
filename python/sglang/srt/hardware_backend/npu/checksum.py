@@ -10,6 +10,9 @@ import triton.language as tl
 
 _MOD_ADLER = 65521
 _BLOCK_SIZE = 1024
+# Arbitrary; picked to stay at core scale rather than measured on A5. Ascend
+# re-runs a grid wider than the device's cores, so each program loops instead.
+_MAX_PROGRAMS = 64
 
 
 @triton.jit
@@ -17,29 +20,42 @@ def _adler32_partial_kernel(
     base,
     indices,
     partials,
-    stride: tl.constexpr,
-    num_bytes,
-    remaining_bytes,
+    num_items,
+    stride,
+    items_per_program,
+    remaining_mod,
+    stride_mod,
     BLOCK: tl.constexpr,
 ):
-    block = tl.program_id(0)
-    offsets = block.to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
-    valid = offsets < num_bytes
-    rows = tl.load(indices + offsets // stride, mask=valid, other=0).to(tl.int64)
+    pid = tl.program_id(0)
+    first = pid * items_per_program
+    last = tl.minimum(first + items_per_program, num_items)
+    # The int-to-pointer cast stays outside both loops: an in-loop cast is a
+    # known Ascend hazard (vllm-ascend vllm_ascend/ops/triton/batch_memcpy.py).
     ptr = base.to(tl.pointer_type(tl.uint8))
-    values = tl.load(ptr + rows * stride + offsets % stride, valid, other=0).to(
-        tl.int32
-    )
+    lane = tl.arange(0, BLOCK)
 
     # For a stream of N bytes x[j]:
     # a = 1 + sum(x[j]); b = N + sum((N - j) * x[j]), modulo 65521.
-    # Reduce each product before summation to keep the vector reduction in
-    # int32: BLOCK * (65521 - 1) < 2**31, even for multi-GiB streams.
-    weights = ((remaining_bytes - offsets) % 65521).to(tl.int32)
-    a = tl.sum(values, 0) % 65521
-    b = tl.sum((weights * values) % 65521, 0) % 65521
-    tl.store(partials + block * 2, a)
-    tl.store(partials + block * 2 + 1, b)
+    # Every term is reduced before it accumulates, so the lanes stay in int32:
+    # BLOCK * (65521 - 1) < 2**31, even for multi-GiB streams.
+    pos_mod = ((first.to(tl.int64) * stride) % 65521).to(tl.int32)
+    a = tl.zeros([BLOCK], dtype=tl.int32)
+    b = tl.zeros([BLOCK], dtype=tl.int32)
+    for item in range(first, last):
+        row = tl.load(indices + item).to(tl.int64)
+        row_ptr = ptr + row * stride
+        for start in range(0, stride, BLOCK):
+            offsets = start + lane
+            valid = offsets < stride
+            values = tl.load(row_ptr + offsets, mask=valid, other=0).to(tl.int32)
+            # 2 * 65521 keeps the weight positive before the truncating modulo.
+            weights = (remaining_mod - pos_mod - offsets % 65521 + 131042) % 65521
+            a = (a + values) % 65521
+            b = (b + (weights * values) % 65521) % 65521
+        pos_mod = (pos_mod + stride_mod) % 65521
+    tl.store(partials + pid * 2, tl.sum(a, 0) % 65521)
+    tl.store(partials + pid * 2 + 1, tl.sum(b, 0) % 65521)
 
 
 def adler32_strided_checksum(
@@ -74,24 +90,36 @@ def adler32_strided_checksum(
     total_bytes = sum(sizes)
     if total_bytes == 0:
         return 1
-    blocks = [triton.cdiv(size, _BLOCK_SIZE) for size in sizes]
-    partials = torch.empty((sum(blocks), 2), dtype=torch.int32, device=device)
-    block_offset = 0
+    plans = []
+    for idx, size in zip(indices, sizes):
+        if size == 0:
+            plans.append((0, 0))
+            continue
+        items = idx.numel()
+        per_program = triton.cdiv(items, min(items, _MAX_PROGRAMS))
+        plans.append((per_program, triton.cdiv(items, per_program)))
+
+    partials = torch.empty(
+        (sum(count for _, count in plans), 2), dtype=torch.int32, device=device
+    )
+    program_offset = 0
     byte_offset = 0
-    for base, stride, idx, size, count in zip(
-        data_ptrs, strides, indices, sizes, blocks
+    for base, stride, idx, size, (per_program, count) in zip(
+        data_ptrs, strides, indices, sizes, plans
     ):
         if count:
             _adler32_partial_kernel[(count,)](
                 base,
                 idx,
-                partials[block_offset:],
+                partials[program_offset:],
+                idx.numel(),
                 stride,
-                size,
-                total_bytes - byte_offset,
+                per_program,
+                (total_bytes - byte_offset) % _MOD_ADLER,
+                stride % _MOD_ADLER,
                 BLOCK=_BLOCK_SIZE,
             )
-        block_offset += count
+        program_offset += count
         byte_offset += size
 
     sums = partials.sum(dim=0, dtype=torch.int64).cpu().tolist()
