@@ -987,10 +987,6 @@ class HiCacheController:
         )
         return producer_id
 
-    def evict_device(self, device_indices: torch.Tensor) -> int:
-        self.mem_pool_device_allocator.free(device_indices)
-        return len(device_indices)
-
     def evict_host(self, host_indices: torch.Tensor, backup_only: bool = True) -> int:
         if not backup_only:
             raise ValueError("Other eviction policies are not supported yet.")

@@ -27,6 +27,8 @@ on:
         value: ${{ jobs.run.outputs.jit_kernel }}
       multimodal_gen:
         value: ${{ jobs.run.outputs.multimodal_gen }}
+      renderer:
+        value: ${{ jobs.run.outputs.renderer }}
       rust_workspace:
         value: ${{ jobs.run.outputs.rust_workspace }}
       partitions:
@@ -50,6 +52,7 @@ jobs:
       sgl_kernel: ${{ steps.filter.outputs.sgl_kernel }}
       jit_kernel: ${{ steps.filter.outputs.jit_kernel || steps.run-mode.outputs.run_all_tests }}
       multimodal_gen: ${{ steps.filter.outputs.multimodal_gen || steps.run-mode.outputs.run_all_tests }}
+      renderer: ${{ steps.filter.outputs.renderer || steps.run-mode.outputs.run_all_tests }}
       rust_workspace: ${{ steps.filter.outputs.rust_workspace || steps.run-mode.outputs.run_all_tests }}
       partitions: ${{ steps.partitions.outputs.partitions }}
       partition_model_sha: ${{ steps.partition-model-sha.outputs.sha }}
@@ -96,8 +99,11 @@ jobs:
               - "scripts/ci/cuda/*"
               - "scripts/ci/utils/*"
               - "test/**/!(*.md)"
-              - "rust/**"
+              - "rust/*"
+              - "rust/!(sglang-renderer)/**"
               - "proto/sglang/runtime/v1/sglang.proto"
+            renderer:
+              - "rust/sglang-renderer/**"
             simulator:
               - ".github/workflows/pr-test-extra.yml"
               - ".github/workflows/_pr-test-simulator-cpu.yml"

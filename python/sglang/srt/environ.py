@@ -662,7 +662,6 @@ class Envs:
     # ===================================================================
     # Radix and sparse KV caches
     # ===================================================================
-    SGLANG_EXPERIMENTAL_CPP_RADIX_TREE = EnvBool(False)
     SGLANG_RADIX_FORCE_MISS = EnvBool(False)
     SGLANG_CHUNKED_PREFIX_CACHE_THRESHOLD = EnvInt(8192)
     SGLANG_MAX_KV_CHUNK_CAPACITY = EnvInt(128 * 1024)
@@ -672,10 +671,6 @@ class Envs:
     SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS = EnvBool(True)
     # Decode batches between SWA out-of-window evictions.
     SGLANG_SWA_EVICTION_INTERVAL = EnvInt(128)
-    # Deprecated: the unified radix tree is the default tree cache now, so the
-    # registry no longer reads this. Kept because a few model/arch call sites
-    # still assert on it; do not use in new code.
-    SGLANG_ENABLE_UNIFIED_RADIX_TREE = EnvBool(False)
     # Registered TreeCore backend serving the unified radix cache.
     SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND = EnvStr("python")
     SGLANG_OPT_SWA_RELEASE_LEAF_LOCK_AFTER_WINDOW = EnvBool(False)
@@ -1976,8 +1971,7 @@ _DEPRECATED_ENVS: Dict[str, _DeprecatedEnv] = {
         "To override the threshold, use '--min-free-slots-delay'."
     ),
     "SGLANG_ENABLE_UNIFIED_RADIX_TREE": _DeprecatedEnv(
-        note="The unified radix tree is the default tree cache now; unset this "
-        "env. The field is still defined for legacy call sites."
+        note="The unified radix tree is the default tree cache now; unset this env."
     ),
 }
 
