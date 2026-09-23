@@ -1825,16 +1825,6 @@ class MQALayer(MqaAttentionBase):
         k_rope_out: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         x_linear = x_quant if x_quant is not None else x
-        # CP projections hide the KV-score all-gather; forward_core_compressor joins it.
-        if (
-            _is_hip
-            and self.compressor is not None
-            and self.compress_ratio not in (1, 2)
-        ):
-            self.compressor.prelaunch_kv_score(x, forward_batch)
-            if self.indexer is not None:
-                self.indexer.compressor.prelaunch_kv_score(x, forward_batch)
-
         if self.fuse_wqa_wkv:
             qkv_a, _ = self.wqkv_a(x_linear)
             q_lora = qkv_a[..., : self.q_lora_rank]
