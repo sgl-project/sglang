@@ -239,16 +239,6 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
     def _safe_decode(
         self, ids: List[int], skip_special_tokens: bool, spaces_between_special_tokens: bool
     ) -> str:
-        """
-        Decode one id span, tolerating tokenizers whose convert_tokens_to_string
-        assumes a non-empty token list (e.g. InternLM3's custom remote-code
-        tokenizer: `tokens[0].startswith(...)` with no length check -- see
-        SGLANGT-1163/SGLANGT-1689). skip_special_tokens=True can legitimately
-        filter every id out of a non-empty span (e.g. a span that's entirely an
-        EOS/pad token), leaving convert_tokens_to_string([]) to be called --
-        that's a normal runtime state, not a reason to crash the whole
-        scheduler/detokenizer process and take down every in-flight request.
-        """
         if not ids:
             return ""
         try:
@@ -325,10 +315,6 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
                         for idx, text in zip(indices, group_decoded):
                             decoded[idx] = text
         except Exception as e:
-            # A batch call can hit the same empty-after-filtering tokenizer
-            # bug _safe_decode guards against (see its docstring), just for
-            # one row inside a larger batch -- fall back to per-row _safe_decode
-            # so one bad row degrades to "" instead of crashing the whole batch.
             logger.warning(
                 f"tokenizer.batch_decode failed for a batch of {len(ids_list)}: {e}. "
                 "Falling back to per-row safe decode."
