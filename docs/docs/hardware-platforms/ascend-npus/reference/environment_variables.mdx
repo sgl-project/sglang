@@ -139,7 +139,7 @@ This document provides a list of commonly used environment variables and aims to
     </tr>
     <tr>
       <td><code>ASCEND_MF_NIC</code></td>
-      <td>The NIC endpoint (<code>IP:PORT</code>) used by the transfer engine. Only effective<br/> with <code>ASCEND_MF_TRANSFER_PROTOCOL=host_rdma</code>. The endpoint is passed<br/> verbatim to the engine; if the port conflicts, the engine reports an error<br/> and a different port should be configured.</td>
+      <td>The base NIC endpoint (<code>IP:PORT</code>) for host_rdma. Required with<br/> <code>ASCEND_MF_TRANSFER_PROTOCOL=host_rdma</code>. Each worker derives its listen<br/> port as <code>PORT + role offset + npu_id * 8</code> (role offset: Decode 0,<br/> Prefill 128), so Prefill and Decode can share a host without conflicts.</td>
       <td></td>
     </tr>
     <tr>

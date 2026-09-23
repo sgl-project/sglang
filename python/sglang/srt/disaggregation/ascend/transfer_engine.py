@@ -22,6 +22,14 @@ logger = logging.getLogger(__name__)
 
 _DEFAULT_PROTOCOL = "sdma"
 
+# Under host_rdma, MemFabric derives each rank's listen port from the base
+# port it is given (it binds base_port + its group rank, 0..7), so every
+# worker must own a disjoint stride of ports. Decode and Prefill get
+# disjoint strides so both roles can run on the same host (up to 16
+# workers per role per host).
+_HOST_RDMA_PORTS_PER_WORKER = 8
+_HOST_RDMA_ROLE_PORT_STRIDE = 128
+
 
 class AscendTransferEngine(MooncakeTransferEngine):
     def __init__(
@@ -76,17 +84,20 @@ class AscendTransferEngine(MooncakeTransferEngine):
 
         trans_op_type = self._resolve_trans_op_type(transfer_protocol)
 
-        # The NIC endpoint is user-configured and passed verbatim to the engine.
-        # No port rewriting is done here: the multi-rank port layout follows the
-        # transfer engine's contract, and a conflicting endpoint should surface
-        # as an engine error for the user to fix in configuration.
+        # Under host_rdma, the framework derives each worker's listen port from
+        # the user-provided NIC endpoint: MemFabric binds base_port + group
+        # rank within a worker's stride, and the multi-rank topology is only
+        # known here, so the per-worker base ports are assigned in the
+        # framework rather than by the engine.
         nic = os.getenv("ASCEND_MF_NIC")
-        if transfer_protocol == "host_rdma" and nic:
-            logger.info(
-                "HOST_RDMA endpoint: npu_id=%s, nic=%s",
-                self.npu_id,
-                nic,
-            )
+        if transfer_protocol == "host_rdma":
+            if not nic:
+                raise ValueError(
+                    "ASCEND_MF_NIC (IP:PORT or tcp://IP:PORT) must be set for "
+                    "host_rdma; otherwise the engine binds a loopback endpoint "
+                    "that peers cannot reach."
+                )
+            nic = self._derive_worker_nic(nic)
 
         """Initialize the ascend transfer instance."""
         ret_value = self.engine.initialize(
@@ -109,6 +120,53 @@ class AscendTransferEngine(MooncakeTransferEngine):
             ret_value = -1
         if ret_value != 0:
             logger.debug(f"Ascend memory registration for ptr {ptrs} failed.")
+
+    def _derive_worker_nic(self, nic: str) -> str:
+        """Derive this worker's HOST_RDMA endpoint from the configured base.
+
+        The user configures one base endpoint in ASCEND_MF_NIC; each worker
+        gets base_port + role offset + npu_id * stride. MemFabric then binds
+        ports within [worker_port, worker_port + stride).
+        """
+        host, sep, port_str = nic.rpartition(":")
+        try:
+            base_port = int(port_str)
+        except ValueError:
+            raise ValueError(
+                f"Invalid port in ASCEND_MF_NIC: {nic!r} (expected IP:PORT)"
+            ) from None
+        if not sep or not base_port:
+            raise ValueError(
+                f"Invalid ASCEND_MF_NIC: {nic!r} (expected IP:PORT)"
+            )
+
+        role_offset = (
+            _HOST_RDMA_ROLE_PORT_STRIDE if self.role == "Prefill" else 0
+        )
+        worker_port = (
+            base_port + role_offset + self.npu_id * _HOST_RDMA_PORTS_PER_WORKER
+        )
+        if not (
+            1024
+            <= worker_port
+            and worker_port + _HOST_RDMA_PORTS_PER_WORKER - 1 <= 65535
+        ):
+            raise ValueError(
+                f"Resolved HOST_RDMA port out of range: base_port={base_port}, "
+                f"npu_id={self.npu_id}, role={self.role}, "
+                f"resolved_range={worker_port}-"
+                f"{worker_port + _HOST_RDMA_PORTS_PER_WORKER - 1}"
+            )
+
+        endpoint = f"{host}:{worker_port}"
+        logger.info(
+            "HOST_RDMA endpoint: role=%s, npu_id=%s, base=%s, endpoint=%s",
+            self.role,
+            self.npu_id,
+            nic,
+            endpoint,
+        )
+        return endpoint
 
     @staticmethod
     def _get_transfer_protocol() -> str:
