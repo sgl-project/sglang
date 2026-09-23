@@ -27,7 +27,7 @@ from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
 from sglang.srt.mem_cache.deepseek_v4_compress_state import CompressStatePool
 from sglang.srt.mem_cache.memory_pool import KVCache
 from sglang.srt.runtime_context import get_exec, get_platform, get_spec
-from sglang.srt.utils import ceil_div, is_hip
+from sglang.srt.utils import ceil_div, is_gfx95_supported, is_hip
 
 logger = logging.getLogger(__name__)
 
@@ -157,7 +157,6 @@ def select_dsv4_kv_layout() -> Tuple[KVLayout, Optional[str]]:
         from sglang.srt.layers.attention.hip_flash_mla import (
             resolve_hip_flashmla_backend,
         )
-        from sglang.srt.utils import is_gfx95_supported
 
         supported = (
             is_gfx95_supported() and resolve_hip_flashmla_backend() == "aiter_sparse"

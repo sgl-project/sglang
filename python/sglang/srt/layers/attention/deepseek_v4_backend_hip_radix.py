@@ -62,7 +62,9 @@ from sglang.srt.layers.attention.deepseek_v4_backend import (
     DSV4AttnMetadata as SharedDSV4AttnMetadata,
 )
 from sglang.srt.layers.attention.deepseek_v4_backend import (
+    LateLayerTail,
     _pad_last_dim,
+    _tail_rows,
 )
 from sglang.srt.layers.attention.dsv4.compressor_v2 import (
     CompressorBackendMixin,
@@ -99,6 +101,7 @@ from sglang.srt.layers.dp_attention import (
     set_local_dp_buffer_len,
 )
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
+from sglang.srt.mem_cache.dsv41_request_window import window_layout
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.runtime_context import (
     get_exec,
@@ -1985,11 +1988,6 @@ class DeepseekV4HipRadixBackend(
         """Metadata for the layers after the last kv_source layer under decoder SWA bounded
         replay: each request's last SWA_WINDOW extend tokens, whose window is floored at the
         tail start since no window KV before it is written at those layers."""
-        from sglang.srt.layers.attention.deepseek_v4_backend import (
-            LateLayerTail,
-            _tail_rows,
-        )
-
         extend_lens_cpu = forward_batch.extend_seq_lens_cpu
         seq_lens_cpu = forward_batch.seq_lens_cpu
         assert extend_lens_cpu is not None and seq_lens_cpu is not None
@@ -2028,10 +2026,10 @@ class DeepseekV4HipRadixBackend(
             swa_replay_start=swa_replay_start,
             cp_metadata=cp_tail["cp_metadata"] if cp_tail is not None else None,
         )
-        window_layout = metadata.core_attn_metadata.request_window_layout
+        request_layout = metadata.core_attn_metadata.request_window_layout
         swa_out_cache_loc = (
-            window_layout.write_loc
-            if window_layout is not None
+            request_layout.write_loc
+            if request_layout is not None
             else self.token_to_kv_pool.translate_loc_from_full_to_swa(out_cache_loc).to(
                 torch.int32
             )
@@ -2699,10 +2697,10 @@ class DeepseekV4HipRadixBackend(
             layout = self.forward_metadata.core_attn_metadata.request_window_layout
             window.activate(layout)
             return layout.write_loc
-        tail = getattr(self.forward_metadata, "late_layer_tail", None)
-        if tail is not None:
+        metadata = self.forward_metadata
+        if isinstance(metadata, DSV4Metadata) and metadata.late_layer_tail is not None:
             # the tail's rows are a subset of the extend, so it owns its own store target
-            return tail.swa_out_cache_loc
+            return metadata.late_layer_tail.swa_out_cache_loc
         out_cache_loc = forward_batch.out_cache_loc
         core = getattr(self.forward_metadata, "core_attn_metadata", None)
         cached = core.swa_out_cache_loc if core is not None else None
@@ -3020,8 +3018,6 @@ class DeepseekV4HipRadixBackend(
         request_layout = None
         window = self.token_to_kv_pool.request_window
         if window is not None:
-            from sglang.srt.mem_cache.dsv41_request_window import window_layout
-
             request_layout = window_layout(
                 req_pool_indices_repeated,
                 raw_positions,

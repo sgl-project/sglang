@@ -71,7 +71,7 @@ def default_config(m: int, k: int) -> GemvConfig:
     return GemvConfig(8, 1, 16, tokens)
 
 
-def m_bucket(m: int) -> int:
+def _m_bucket(m: int) -> int:
     for b in M_BUCKETS:
         if m <= b:
             return b
@@ -98,19 +98,19 @@ def _config_table(section: str) -> Dict[str, str]:
 
 
 @functools.lru_cache(maxsize=None)
-def gfx_name() -> str:
+def _gfx_name() -> str:
     return torch.cuda.get_device_properties(0).gcnArchName.split(":")[0]
 
 
 def select_config(m: int, n: int, k: int) -> GemvConfig:
     """The tuned configuration for (gfx, N, K, M bucket), else the heuristic."""
-    return _select_config(m_bucket(m), n, k)
+    return _select_config(_m_bucket(m), n, k)
 
 
 @functools.lru_cache(maxsize=None)
 def _select_config(bucket: int, n: int, k: int) -> GemvConfig:
     table = _config_table("configs")
-    key = f"{gfx_name()}:{n}:{k}:{bucket}"
+    key = f"{_gfx_name()}:{n}:{k}:{bucket}"
     if key in table:
         cfg = GemvConfig.parse(table[key])
         if cfg.valid_for(bucket, n):
@@ -193,7 +193,7 @@ LARGE_M_BUCKETS = (64, 128, 256, 1024, 4096, 8192, 16384)
 HIPBLASLT_BF16 = "hipblaslt_bf16"
 
 
-def large_m_bucket(m: int) -> int:
+def _large_m_bucket(m: int) -> int:
     for b in LARGE_M_BUCKETS:
         if m <= b:
             return b
@@ -205,13 +205,13 @@ def _large_m_table(fp8_in: bool) -> Dict[str, str]:
     return _config_table("large_m_fp8in" if fp8_in else "large_m")
 
 
-def large_m_plan(
+def _large_m_plan(
     m: int, n: int, k: int, fp8_in: bool = False
 ) -> Optional[Tuple[int, int, int, int, int]]:
     """The dot_scaled tile (BM, BN, BK, warps, split_k) for m rows, or None when hipBLASLt
     bf16 is the measured winner or the shape has no row (the caller then needs a bf16 copy).
     fp8_in: the activation arrives as fp8 + ue8m0 (no quant to pay)."""
-    entry = _large_m_table(fp8_in).get(f"{gfx_name()}:{n}:{k}:{large_m_bucket(m)}")
+    entry = _large_m_table(fp8_in).get(f"{_gfx_name()}:{n}:{k}:{_large_m_bucket(m)}")
     if entry is None or entry == HIPBLASLT_BF16:
         return None
     assert entry.startswith("ds:"), entry
@@ -219,10 +219,10 @@ def large_m_plan(
     return bm, bn, bk, warps, sk
 
 
-def weight_needs_bf16_copy(n: int, k: int) -> bool:
+def _weight_needs_bf16_copy(n: int, k: int) -> bool:
     """Some M > 32 bucket of this shape runs hipBLASLt bf16 for either activation encoding
     (or the shape is untuned)."""
-    keys = [f"{gfx_name()}:{n}:{k}:{b}" for b in LARGE_M_BUCKETS]
+    keys = [f"{_gfx_name()}:{n}:{k}:{b}" for b in LARGE_M_BUCKETS]
     for fp8_in in (False, True):
         table = _large_m_table(fp8_in)
         if not all(key in table for key in keys):
@@ -238,7 +238,7 @@ def native_consumer_wants_fp8(m: int, n: int, k: int) -> bool:
     winner with a free fp8 input is the dot_scaled tile (hipBLASLt bf16 wants bf16)."""
     if m <= MXFP8_GEMV_MAX_TOKENS:
         return True
-    return large_m_plan(m, n, k, fp8_in=True) is not None
+    return _large_m_plan(m, n, k, fp8_in=True) is not None
 
 
 def native_route_supports(n: int, k: int) -> bool:
@@ -257,7 +257,7 @@ def prepare_mxfp8_native_weight(
     shuffled = shuffle_mxfp8_weight(weight.contiguous())
     scale_ue8m0 = ue8m0_weight_scale(weight_scale)
     weight_bf16 = None
-    if weight_needs_bf16_copy(n, k):
+    if _weight_needs_bf16_copy(n, k):
         weight_bf16 = dequant_block_fp8_weight_to_bf16(weight, weight_scale, block_size)
     return shuffled, scale_ue8m0, weight_bf16
 
@@ -338,7 +338,7 @@ def _mxfp8_shuffled_gemm_kernel(
         tl.store(o_ptrs, acc.to(tl.bfloat16), mask=m_mask[:, None] & n_mask[None, :])
 
 
-def mxfp8_shuffled_gemm(
+def _mxfp8_shuffled_gemm(
     xq: torch.Tensor,
     xs: torch.Tensor,
     weight_shuffled: torch.Tensor,
@@ -390,7 +390,7 @@ def native_route_plan(
     """Which kernel serves m tokens: 'gemv', 'hipblaslt_bf16' or 'dot_scaled'."""
     if m <= MXFP8_GEMV_MAX_TOKENS:
         return "gemv"
-    if has_bf16_copy and large_m_plan(m, n, k, fp8_in) is None:
+    if has_bf16_copy and _large_m_plan(m, n, k, fp8_in) is None:
         return HIPBLASLT_BF16
     return "dot_scaled"
 
@@ -440,9 +440,9 @@ def mxfp8_native_blockscaled_linear(
             if xq is None:
                 xq, xs = mxfp8_e4m3_quantize(input_2d)
             # a weight without a bf16 copy has a row for every bucket, so the plan is never None here
-            tile = large_m_plan(m, n, k, fp8_in)
+            tile = _large_m_plan(m, n, k, fp8_in)
             assert tile is not None, (m, n, k, fp8_in)
-            out = mxfp8_shuffled_gemm(
+            out = _mxfp8_shuffled_gemm(
                 xq, xs, weight_shuffled, weight_scale_ue8m0, tile[:4], tile[4]
             )
     if bias is not None:

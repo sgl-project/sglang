@@ -18,7 +18,7 @@ from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
 
 def resolve_fused_clamp_route(mlp, half_width: int) -> None:
     """Fix mlp's activation route from down_proj's loaded weight (once per layer)."""
-    quant_method = getattr(mlp.down_proj, "quant_method", None)
+    quant_method = mlp.down_proj.quant_method
     # the aiter kernel tiles and quantizes the half width per 128, the 128x128 block GEMM's layout
     mlp.use_fused_clamp_act_mul = half_width % 128 == 0
     mlp._fused_clamp_use_fp8 = (
