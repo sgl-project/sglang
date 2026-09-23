@@ -11,151 +11,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""Fused Triton kernels for Beam's sandwich-norm residual flow and output gate.
-
-Beam's decoder layer runs, twice per layer, the eager sequence
-
-    t        = post_norm(branch)                       # RMSNorm, bf16 out
-    combined = depth_scaled_residual(t, residual)      # bf16 arithmetic
-    out      = next_norm(combined)                     # RMSNorm, bf16 out
-
-which costs eight kernel launches per transition (two RMSNorms and six
-element-wise ops). `fused_sandwich_residual_rmsnorm` does it in one launch and
-reproduces the eager rounding boundaries: the sandwich norm rounds to the
-activation dtype before the combine, each scaled operand rounds before the add
-(or, with `combine_in_fp32`, the fp32 sum rounds once), and the combined stream
-is stored in the activation dtype. RMS reduction order can differ from the
-standalone norm kernel. Residual cancellation can amplify those differences
-beyond one activation ULP; this is not a bitwise-equivalence guarantee.
-
-`fused_attention_gate` replaces the three element-wise ops of
-`sigmoid(gate + bias) * attention_output`, keeping the bf16 rounding of the
-biased gate and of the sigmoid before the product.
-"""
+"""Beam attention gate with activation-dtype bias and sigmoid rounding."""
 
 from __future__ import annotations
-
-from typing import Optional, Tuple
 
 import torch
 import triton
 import triton.language as tl
 from triton.language.extra import libdevice
 
-
-@triton.jit
-def _fused_sandwich_residual_rmsnorm_kernel(
-    out_ptr,
-    combined_ptr,
-    x_ptr,
-    residual_ptr,
-    x_stride_row,
-    residual_stride_row,
-    sandwich_weight_ptr,
-    out_weight_ptr,
-    eps: tl.constexpr,
-    x_scale: tl.constexpr,
-    residual_scale: tl.constexpr,
-    hidden_dim: tl.constexpr,
-    BLOCK_SIZE: tl.constexpr,
-    HAS_SANDWICH: tl.constexpr,
-    HAS_OUT_NORM: tl.constexpr,
-    COMBINE_IN_FP32: tl.constexpr,
-):
-    row = tl.program_id(axis=0).to(tl.int64)
-    offsets = tl.arange(0, BLOCK_SIZE)
-    mask = offsets < hidden_dim
-    act_dtype = x_ptr.dtype.element_ty
-
-    x = tl.load(x_ptr + row * x_stride_row + offsets, mask=mask, other=0.0).to(
-        tl.float32
-    )
-    if HAS_SANDWICH:
-        w = tl.load(sandwich_weight_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
-        rstd = tl.rsqrt(tl.sum(x * x, axis=0) / hidden_dim + eps)
-        # The standalone RMSNorm writes the activation dtype before the combine.
-        x = (x * rstd * w).to(act_dtype).to(tl.float32)
-
-    residual = tl.load(
-        residual_ptr + row * residual_stride_row + offsets, mask=mask, other=0.0
-    )
-    # `depth_scaled_residual` casts the residual to the branch dtype first.
-    residual = residual.to(act_dtype).to(tl.float32)
-    if COMBINE_IN_FP32:
-        # Explicit rounding also prevents ptxas from fusing packed FP32 ops.
-        xs = libdevice.mul_rn(x, x_scale)
-        rs = libdevice.mul_rn(residual, residual_scale)
-        combined = libdevice.add_rn(xs, rs).to(act_dtype)
-    else:
-        xs = (x * x_scale).to(act_dtype).to(tl.float32)
-        rs = (residual * residual_scale).to(act_dtype).to(tl.float32)
-        combined = (xs + rs).to(act_dtype)
-    out_offsets = row * hidden_dim + offsets
-    tl.store(combined_ptr + out_offsets, combined, mask=mask)
-
-    if HAS_OUT_NORM:
-        c = combined.to(tl.float32)
-        w2 = tl.load(out_weight_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
-        rstd2 = tl.rsqrt(tl.sum(c * c, axis=0) / hidden_dim + eps)
-        tl.store(out_ptr + out_offsets, (c * rstd2 * w2).to(act_dtype), mask=mask)
-
-
-def fused_sandwich_residual_rmsnorm(
-    branch: torch.Tensor,
-    residual: torch.Tensor,
-    sandwich_weight: Optional[torch.Tensor],
-    out_weight: Optional[torch.Tensor],
-    eps: float,
-    scales: Tuple[float, float],
-    combine_in_fp32: bool,
-) -> Tuple[Optional[torch.Tensor], torch.Tensor]:
-    """Return `(next_norm(combined), combined)`; the first is None without `out_weight`.
-
-    `branch` and `residual` are 2-D `[tokens, hidden]` in the activation dtype.
-    `sandwich_weight` is the post-norm weight applied to `branch` before the
-    combine (None skips it); `out_weight` is the following norm's weight (None
-    returns only the combined stream, for the last layer of a non-final
-    pipeline stage).
-    """
-    if branch.ndim != 2 or residual.shape != branch.shape:
-        raise ValueError(
-            f"expected matching 2-D tensors; got {tuple(branch.shape)} and {tuple(residual.shape)}"
-        )
-    if branch.stride(1) != 1 or residual.stride(1) != 1:
-        raise ValueError("branch and residual must be contiguous along hidden")
-    hidden_dim = branch.shape[1]
-    for w in (sandwich_weight, out_weight):
-        if w is not None and (w.shape != (hidden_dim,) or not w.is_contiguous()):
-            raise ValueError("norm weights must be contiguous [hidden]")
-    combined = torch.empty_like(branch)
-    out = torch.empty_like(branch) if out_weight is not None else None
-    rows = branch.shape[0]
-    if rows == 0:
-        return out, combined
-    dummy = sandwich_weight if sandwich_weight is not None else out_weight
-    if dummy is None:
-        dummy = branch  # never dereferenced: both norm flags are off
-    _fused_sandwich_residual_rmsnorm_kernel[(rows,)](
-        out if out is not None else combined,
-        combined,
-        branch,
-        residual,
-        branch.stride(0),
-        residual.stride(0),
-        sandwich_weight if sandwich_weight is not None else dummy,
-        out_weight if out_weight is not None else dummy,
-        eps=eps,
-        x_scale=scales[0],
-        residual_scale=scales[1],
-        hidden_dim=hidden_dim,
-        BLOCK_SIZE=triton.next_power_of_2(hidden_dim),
-        HAS_SANDWICH=sandwich_weight is not None,
-        HAS_OUT_NORM=out_weight is not None,
-        COMBINE_IN_FP32=combine_in_fp32,
-        num_warps=8,
-        enable_fp_fusion=False,
-    )
-    return out, combined
+from sglang.srt.utils.custom_op import register_custom_op
 
 
 @triton.jit
@@ -190,6 +55,11 @@ def _fused_attention_gate_kernel(
     tl.store(out_ptr + off, (attn * m).to(act_dtype), mask=mask)
 
 
+def _fake_attention_gate(attention_output, gate, gate_bias, head_dim):
+    return torch.empty_like(attention_output, memory_format=torch.contiguous_format)
+
+
+@register_custom_op(fake_impl=_fake_attention_gate)
 def fused_attention_gate(
     attention_output: torch.Tensor,
     gate: torch.Tensor,

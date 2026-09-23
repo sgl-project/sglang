@@ -439,6 +439,82 @@ class GemmaFusedAddRMSNormOp(BaseFusedOp):
         residual.copy_(residual_out)
 
 
+class BeamSandwichResidualRMSNormOp(BaseFusedOp):
+    """Post-normalize a branch, combine residuals, then normalize the next input.
+
+    Returns ``(normed, combined)``. Either norm weight may be None; without
+    ``out_weight``, ``normed`` is None (a non-final pipeline stage).
+    """
+
+    op = "layernorm.beam_sandwich_residual_rmsnorm"
+    capabilities = {KernelBackend.TRITON: _CUDA}
+    format_signature = FormatSignature(supported_dtypes=_NORM_DTYPES)
+
+    def _torch_compile_forward(self, num_tokens: int):
+        # Native compilation can remove the required intermediate rounding.
+        return None
+
+    def forward_native(
+        self,
+        branch: torch.Tensor,
+        residual: torch.Tensor,
+        sandwich_weight: Optional[torch.Tensor],
+        out_weight: Optional[torch.Tensor],
+        eps: float,
+        scales: tuple[float, float],
+        combine_in_fp32: bool,
+    ) -> tuple[Optional[torch.Tensor], torch.Tensor]:
+        if sandwich_weight is not None:
+            branch = _RMSNORM.forward_native(branch, sandwich_weight, eps)
+        residual = residual.to(branch.dtype)
+        dtype = branch.dtype
+        if combine_in_fp32:
+            branch, residual = branch.float(), residual.float()
+        combined = (branch * scales[0] + residual * scales[1]).to(dtype)
+        out = (
+            _RMSNORM.forward_native(combined, out_weight, eps)
+            if out_weight is not None
+            else None
+        )
+        return out, combined
+
+    def forward_triton(
+        self,
+        branch: torch.Tensor,
+        residual: torch.Tensor,
+        sandwich_weight: Optional[torch.Tensor],
+        out_weight: Optional[torch.Tensor],
+        eps: float,
+        scales: tuple[float, float],
+        combine_in_fp32: bool,
+    ) -> tuple[Optional[torch.Tensor], torch.Tensor]:
+        import torch
+
+        from sglang.kernels.ops.layernorm.beam_fused import (
+            fused_sandwich_residual_rmsnorm,
+        )
+
+        if not branch.is_cuda or branch.dtype not in (torch.float16, torch.bfloat16):
+            return self.forward_native(
+                branch,
+                residual,
+                sandwich_weight,
+                out_weight,
+                eps,
+                scales,
+                combine_in_fp32,
+            )
+        return fused_sandwich_residual_rmsnorm(
+            branch,
+            residual,
+            sandwich_weight,
+            out_weight,
+            eps,
+            *scales,
+            combine_in_fp32,
+        )
+
+
 _RMSNORM = register_fused_op(RMSNormOp(), __name__, "_RMSNORM")
 _FUSED_ADD_RMSNORM = register_fused_op(
     FusedAddRMSNormOp(), __name__, "_FUSED_ADD_RMSNORM"
@@ -446,6 +522,10 @@ _FUSED_ADD_RMSNORM = register_fused_op(
 _GEMMA_RMSNORM = register_fused_op(GemmaRMSNormOp(), __name__, "_GEMMA_RMSNORM")
 _GEMMA_FUSED_ADD_RMSNORM = register_fused_op(
     GemmaFusedAddRMSNormOp(), __name__, "_GEMMA_FUSED_ADD_RMSNORM"
+)
+
+_BEAM_SANDWICH_RESIDUAL_RMSNORM = register_fused_op(
+    BeamSandwichResidualRMSNormOp(), __name__, "_BEAM_SANDWICH_RESIDUAL_RMSNORM"
 )
 
 
@@ -494,6 +574,7 @@ def gemma_fused_add_rmsnorm(
 
 
 __all__ = [
+    "BeamSandwichResidualRMSNormOp",
     "RMSNormOp",
     "FusedAddRMSNormOp",
     "GemmaRMSNormOp",

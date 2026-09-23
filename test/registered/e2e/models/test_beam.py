@@ -48,11 +48,13 @@ PARALLEL_LAYOUTS = (
 )
 
 
-class TestBeamNative(CustomTestCase):
+class _BeamFixture(CustomTestCase):
+    min_gpus = 1
+
     @classmethod
     def setUpClass(cls):
-        if torch.cuda.device_count() < 2:
-            raise unittest.SkipTest("Beam TP differential test requires two CUDA GPUs")
+        if torch.cuda.device_count() < cls.min_gpus:
+            raise unittest.SkipTest(f"Beam test requires {cls.min_gpus} CUDA GPUs")
         if not is_flashinfer_available() or not (
             is_sm90_supported() or is_sm100_supported() or is_sm120_supported()
         ):
@@ -73,6 +75,8 @@ class TestBeamNative(CustomTestCase):
     def logprobs(self, engine, token_ids, count):
         return engine_token_logprobs(engine, token_ids, count, self.config.vocab_size)
 
+
+class TestBeamOffload(_BeamFixture):
     def test_cpu_offload_matches_oracle(self):
         """Offloaded layers must load their weights before running the model."""
         engine = sgl.Engine(
@@ -98,6 +102,10 @@ class TestBeamNative(CustomTestCase):
             assert_logprobs_close(self, actual, expected, tag="CPU offload")
         finally:
             engine.shutdown()
+
+
+class TestBeamNative(_BeamFixture):
+    min_gpus = 2
 
     def test_prefill_cached_decode_and_parallel_layouts(self):
         tp1_results = {}

@@ -18,13 +18,13 @@ from typing import Iterable, Optional, Tuple
 import torch
 from torch import nn
 
-from sglang.kernels.ops.elementwise import beam_fused
+from sglang.kernels.ops.elementwise import BeamAttentionGateOp
+from sglang.kernels.ops.layernorm import BeamSandwichResidualRMSNormOp
 from sglang.srt.configs.beam import BeamConfig
 from sglang.srt.distributed import (
     moe_expert_parallel_all_reduce,
     moe_tensor_model_parallel_all_reduce,
 )
-from sglang.srt.environ import envs
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
@@ -64,19 +64,6 @@ def apply_ssmax(q: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
     """Scale Q using absolute positions, rounding only after multiplication."""
     scale = torch.exp(0.1 * torch.log1p((positions.float() + 1) / 2048))
     return (q.float() * scale.unsqueeze(-1)).to(q.dtype)
-
-
-def use_fused_beam_kernels(x: torch.Tensor) -> bool:
-    """Fused Triton paths run on CUDA half-precision activations.
-
-    `SGLANG_DISABLE_BEAM_FUSED=1` restores the eager reference sequence, for
-    ablation and parity checks.
-    """
-    return (
-        x.is_cuda
-        and x.dtype in (torch.bfloat16, torch.float16)
-        and not envs.SGLANG_DISABLE_BEAM_FUSED.get()
-    )
 
 
 def apply_attention_gate(
@@ -306,6 +293,7 @@ class BeamAttention(nn.Module):
             tp_size=self.tp_size,
             prefix=add_prefix("gate_proj", prefix),
         )
+        self.attention_gate = BeamAttentionGateOp()
         self.gate_bias = nn.Parameter(torch.empty(self.num_heads), requires_grad=False)
         set_weight_attrs(self.gate_bias, {"weight_loader": self.load_gate_bias})
         self.o_proj = RowParallelLinear(
@@ -359,19 +347,12 @@ class BeamAttention(nn.Module):
             q = apply_ssmax(q, positions)
         attention_output = self.attn(q, k, v, forward_batch)
         gate, _ = self.gate_proj(hidden_states)
-        if use_fused_beam_kernels(attention_output):
-            attention_output = beam_fused.fused_attention_gate(
-                attention_output.view(-1, self.q_size),
-                gate.view(-1, self.q_size),
-                self.gate_bias,
-                self.head_dim,
-            )
-        else:
-            attention_output = apply_attention_gate(
-                attention_output.view(-1, self.num_heads, self.head_dim),
-                gate.view(-1, self.num_heads, self.head_dim),
-                self.gate_bias,
-            ).view(-1, self.q_size)
+        attention_output = self.attention_gate(
+            attention_output.view(-1, self.q_size),
+            gate.view(-1, self.q_size),
+            self.gate_bias,
+            self.head_dim,
+        )
         output, _ = self.o_proj(attention_output)
         return output
 
@@ -389,6 +370,7 @@ class BeamDecoderLayer(nn.Module):
         self.layer_id = layer_id
         self.residual_scale_in_fp32 = config.residual_scale_in_fp32
         self.rms_norm_eps = config.rms_norm_eps
+        self.sandwich_residual_norm = BeamSandwichResidualRMSNormOp()
         attn_depth = 2 * (layer_id + 1)
         mlp_depth = attn_depth + 1
         attn_denominator = math.sqrt(attn_depth)
@@ -468,7 +450,7 @@ class BeamDecoderLayer(nn.Module):
         that does not own the final norm) and the new residual stream.
         """
         attn = self.self_attn(positions, normed, forward_batch)
-        normed, residual = beam_fused.fused_sandwich_residual_rmsnorm(
+        normed, residual = self.sandwich_residual_norm(
             attn,
             residual,
             self.post_attention_layernorm.weight,
@@ -478,7 +460,7 @@ class BeamDecoderLayer(nn.Module):
             self.residual_scale_in_fp32,
         )
         mlp = self.mlp(normed)
-        return beam_fused.fused_sandwich_residual_rmsnorm(
+        return self.sandwich_residual_norm(
             mlp,
             residual,
             self.post_feedforward_layernorm.weight,
@@ -549,8 +531,7 @@ class BeamModel(nn.Module):
         # Offload wrappers load weights through each layer's regular forward.
         # Fusing across layer boundaries would bypass those wrappers.
         if (
-            use_fused_beam_kernels(hidden_states)
-            and get_exec().offload.cpu_offload_gb <= 0
+            get_exec().offload.cpu_offload_gb <= 0
             and get_exec().offload.offload_group_size <= 0
         ):
             return self._forward_fused(
