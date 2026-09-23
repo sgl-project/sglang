@@ -251,33 +251,64 @@ SGL_DEVICE static void stream_pass_bf16(
     const uint32_t buf = iter % kNumStages;
     const uint32_t base = iter * kSizePerStage;
 
+    if (iter > 0 && base + kSizePerStage <= total) {
+      // Interior full stage: head padding (w < base_offset < kElemPerStage)
+      // can only exist in stage 0, and the full-stage bound keeps every
+      // element below `total`, so the whole stage lies inside the logical
+      // window -- no per-element checks (perf-critical hot loop).
+      const uint32_t idx_base = base - base_offset;
 #pragma unroll
-    for (uint32_t e = 0; e < kElemPerStage; ++e) {
-      const uint32_t local = tx * kElemPerStage + e;
-      const uint32_t w = base + local;
-      if (w >= total) break;
-      // Unsigned wrap makes the `base_offset` head elements compare as huge,
-      // so this single check drops both the head padding and the tail.
-      const uint32_t global_idx = w - base_offset;
-      if (global_idx >= length) continue;
+      for (uint32_t e = 0; e < kElemPerStage; ++e) {
+        const uint32_t local = tx * kElemPerStage + e;
+        const float val = __bfloat162float(smem->bf16_buffer[buf][local]);
+        const uint32_t bin = extract_coarse_bin_pf<kHistBits>(val);
 
-      const float val = __bfloat162float(smem->bf16_buffer[buf][local]);
-      const uint32_t bin = extract_coarse_bin_pf<kHistBits>(val);
-
-      if constexpr (kIsScatter) {
-        if (bin > thr_bin) {
-          const auto pos = atomicAdd(&smem->counter_gt, 1u);
-          if (pos < kTopK) {
-            s_topk_indices[pos] = static_cast<int32_t>(global_idx);
+        if constexpr (kIsScatter) {
+          if (bin > thr_bin) {
+            const auto pos = atomicAdd(&smem->counter_gt, 1u);
+            if (pos < kTopK) {
+              s_topk_indices[pos] = static_cast<int32_t>(idx_base + local);
+            }
+          } else if (bin == thr_bin) {
+            const auto pos = atomicAdd(&smem->counter_eq, 1u);
+            if (pos < kMaxTies) {
+              smem->tie_buffer[pos] = TieV3{.idx = idx_base + local, .score = val};
+            }
           }
-        } else if (bin == thr_bin) {
-          const auto pos = atomicAdd(&smem->counter_eq, 1u);
-          if (pos < kMaxTies) {
-            smem->tie_buffer[pos] = TieV3{.idx = global_idx, .score = val};
-          }
+        } else {
+          atomicAdd(&smem->histogram[bin], 1u);
         }
-      } else {
-        atomicAdd(&smem->histogram[bin], 1u);
+      }
+    } else {
+      // Stage 0 (may carry head padding) and/or the tail stage: masked window.
+#pragma unroll
+      for (uint32_t e = 0; e < kElemPerStage; ++e) {
+        const uint32_t local = tx * kElemPerStage + e;
+        const uint32_t w = base + local;
+        if (w >= total) break;
+        // Unsigned wrap makes the `base_offset` head elements compare as huge,
+        // so this single check drops both the head padding and the tail.
+        const uint32_t global_idx = w - base_offset;
+        if (global_idx >= length) continue;
+
+        const float val = __bfloat162float(smem->bf16_buffer[buf][local]);
+        const uint32_t bin = extract_coarse_bin_pf<kHistBits>(val);
+
+        if constexpr (kIsScatter) {
+          if (bin > thr_bin) {
+            const auto pos = atomicAdd(&smem->counter_gt, 1u);
+            if (pos < kTopK) {
+              s_topk_indices[pos] = static_cast<int32_t>(global_idx);
+            }
+          } else if (bin == thr_bin) {
+            const auto pos = atomicAdd(&smem->counter_eq, 1u);
+            if (pos < kMaxTies) {
+              smem->tie_buffer[pos] = TieV3{.idx = global_idx, .score = val};
+            }
+          }
+        } else {
+          atomicAdd(&smem->histogram[bin], 1u);
+        }
       }
     }
     __syncthreads();
@@ -341,24 +372,50 @@ SGL_DEVICE static void scatter_pass_bf16_warp_steal(
       const uint4 data = *reinterpret_cast<const uint4*>(scores_bf16 + global_base);
       const __nv_bfloat16* vals = reinterpret_cast<const __nv_bfloat16*>(&data);
 
+      if (base >= kWarpTileElems) {
+        // Interior full tile: head padding (w < base_offset < kElemPerStage)
+        // can only exist in tile 0, and the full-tile bound keeps every
+        // element below `total`, so all elements lie inside the logical
+        // window -- skip the per-element checks (perf-critical hot loop).
+        const uint32_t idx_base = global_base - base_offset;
 #pragma unroll
-      for (uint32_t e = 0; e < kElemPerStage; ++e) {
-        // Unsigned wrap drops the `base_offset` head elements.
-        const uint32_t global_idx = global_base + e - base_offset;
-        if (global_idx >= length) continue;
+        for (uint32_t e = 0; e < kElemPerStage; ++e) {
+          const float fval = __bfloat162float(vals[e]);
+          const uint32_t bin = extract_coarse_bin_pf<kHistBits>(fval);
 
-        const float fval = __bfloat162float(vals[e]);
-        const uint32_t bin = extract_coarse_bin_pf<kHistBits>(fval);
-
-        if (bin > thr_bin) {
-          const auto pos = atomicAdd(&smem->counter_gt, 1u);
-          if (pos < kTopK) {
-            s_topk_indices[pos] = static_cast<int32_t>(global_idx);
+          if (bin > thr_bin) {
+            const auto pos = atomicAdd(&smem->counter_gt, 1u);
+            if (pos < kTopK) {
+              s_topk_indices[pos] = static_cast<int32_t>(idx_base + e);
+            }
+          } else if (bin == thr_bin) {
+            const auto pos = atomicAdd(&smem->counter_eq, 1u);
+            if (pos < kMaxTies) {
+              smem->tie_buffer[pos] = TieV3{.idx = idx_base + e, .score = fval};
+            }
           }
-        } else if (bin == thr_bin) {
-          const auto pos = atomicAdd(&smem->counter_eq, 1u);
-          if (pos < kMaxTies) {
-            smem->tie_buffer[pos] = TieV3{.idx = global_idx, .score = fval};
+        }
+      } else {
+        // Tile 0: may carry head padding from the 16B align-down.
+#pragma unroll
+        for (uint32_t e = 0; e < kElemPerStage; ++e) {
+          // Unsigned wrap drops the `base_offset` head elements.
+          const uint32_t global_idx = global_base + e - base_offset;
+          if (global_idx >= length) continue;
+
+          const float fval = __bfloat162float(vals[e]);
+          const uint32_t bin = extract_coarse_bin_pf<kHistBits>(fval);
+
+          if (bin > thr_bin) {
+            const auto pos = atomicAdd(&smem->counter_gt, 1u);
+            if (pos < kTopK) {
+              s_topk_indices[pos] = static_cast<int32_t>(global_idx);
+            }
+          } else if (bin == thr_bin) {
+            const auto pos = atomicAdd(&smem->counter_eq, 1u);
+            if (pos < kMaxTies) {
+              smem->tie_buffer[pos] = TieV3{.idx = global_idx, .score = fval};
+            }
           }
         }
       }
