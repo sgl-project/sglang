@@ -644,6 +644,7 @@ class BailingMoEBlock(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
         alt_stream: Optional[torch.cuda.Stream] = None,
+        is_nextn: bool = False,
     ):
         super().__init__()
         self.config = config
@@ -681,7 +682,7 @@ class BailingMoEBlock(nn.Module):
             is_next_layer_sparse=is_next_layer_sparse,
         )
 
-        self.is_last_layer = self.layer_id == config.num_hidden_layers - 1
+        self.is_last_layer = is_nextn or (self.layer_id == config.num_hidden_layers - 1)
 
         if self.is_layer_sparse:
             self.mlp = BailingMoESparseMoeBlock(
@@ -712,7 +713,7 @@ class BailingMoEBlock(nn.Module):
             input_layernorm=self.input_layernorm,
             post_attention_layernorm=self.post_attention_layernorm,
             allow_reduce_scatter=True,
-            is_last_layer=(self.layer_id == self.config.num_hidden_layers - 1),
+            is_last_layer=self.is_last_layer,
         )
 
     def _is_layer_sparse(
