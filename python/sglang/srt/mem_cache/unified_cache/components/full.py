@@ -482,17 +482,10 @@ class FullComponent(TreeComponent):
         full_transfer: PoolTransfer,
         transfer: PoolTransfer,
         prefix_len: int,
-        *,
-        insert_result: Optional[InsertResult] = None,
-        canonical_full: Optional[torch.Tensor] = None,
     ) -> Optional[PoolTransfer]:
         if phase == ExternalLinkerLoadPhase.ABORT:
             self._full_allocator().free(transfer.device_indices)
             return None
-        if phase == ExternalLinkerLoadPhase.PREPARE:
-            return transfer
-
-        assert phase == ExternalLinkerLoadPhase.COMMIT
         return transfer
 
     def free_host_values(self, host_values: list[torch.Tensor]) -> None:

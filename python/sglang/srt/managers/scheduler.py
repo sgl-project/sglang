@@ -4622,9 +4622,35 @@ class Scheduler(
                     can_run_cuda_graph=can_run_cuda_graph,
                 )
 
+        if self.enable_unified_cache_external_linker:
+            self._abort_failed_external_linker_loads(batch)
+
         self._maybe_report_active_ranks()
 
         return ret
+
+    def _abort_failed_external_linker_loads(self, batch: ScheduleBatch) -> None:
+        """Abort the requests whose external KV load for ``batch`` failed.
+
+        Their forward already ran on slots the load never filled, so the output
+        is dropped and their KV must never reach the radix tree. The slots are
+        private to them, so no other request has read them.
+        """
+        failed_rids = set(self.tree_cache.finish_external_linker_loads())
+        if not failed_rids:
+            return
+        for req in batch.reqs:
+            if req.rid not in failed_rids:
+                continue
+            req.skip_radix_cache_insert = True
+            if req is self.chunked_req:
+                # Stops the next chunk and releases the request, as for a
+                # client abort.
+                self._pending_chunked_abort_req = req
+            else:
+                req.to_finish = FINISH_ABORT(
+                    "External KV cache load failed", HTTPStatus.SERVICE_UNAVAILABLE
+                )
 
     def _maybe_report_active_ranks(self) -> None:
         if not (

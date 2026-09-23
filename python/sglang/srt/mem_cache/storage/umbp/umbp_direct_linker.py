@@ -328,10 +328,9 @@ class UMBPDirectLinker(UnifiedCacheLinker):
             )
         self._pending: dict[str, list[PoolTransfer]] = {}
         self._gc_frozen = False
-        self._load_queue: Queue[
-            tuple[int, list[str], list[_PoolRangePlan], object] | None
-        ] = Queue()
-        self._completed_loads: Queue[list[str]] = Queue()
+        self._load_queue: Queue[tuple[int, list[_PoolRangePlan], object] | None] = (
+            Queue()
+        )
         self._offload_queue: Queue[tuple[list[PoolTransfer], object] | None] = Queue()
         self._offload_results: Queue[bool] = Queue()
         self._stats = {
@@ -484,27 +483,21 @@ class UMBPDirectLinker(UnifiedCacheLinker):
         return True
 
     def cancel_queued_load(self, rid: str) -> bool:
-        # The tree node is already visible in L1. Dropping its transfer would
-        # leave a device hit pointing at slots that were never populated.
-        return False
+        return self._pending.pop(rid, None) is not None
 
-    def num_completed_loads(self) -> int:
-        return self._completed_loads.qsize()
-
-    def pop_completed_load(self) -> list[str]:
-        return self._completed_loads.get_nowait()
+    def finish_layer_wise_loading(self, counter_index: int) -> bool:
+        return self.layer_done_counter.finish(counter_index)
 
     def start_layer_wise_loading(self) -> int:
         if not self._pending:
             return -1
         self._freeze_gc_once()
         pending = self._pending
-        rids = list(pending)
         plans = self._build_load_plans(list(pending.values()))
         ready_event = device_module.Event()
         ready_event.record()
         counter_index = self.layer_done_counter.update_producer()
-        self._load_queue.put((counter_index, rids, plans, ready_event))
+        self._load_queue.put((counter_index, plans, ready_event))
         self._pending = {}
         self._stats["load"] += len(pending)
         return counter_index
@@ -646,11 +639,8 @@ class UMBPDirectLinker(UnifiedCacheLinker):
             try:
                 if task is None:
                     return
-                counter_index, rids, plans, ready_event = task
-                try:
-                    self._run_layer_wise_batch(counter_index, plans, ready_event)
-                finally:
-                    self._completed_loads.put(rids)
+                counter_index, plans, ready_event = task
+                self._run_layer_wise_batch(counter_index, plans, ready_event)
             finally:
                 self._load_queue.task_done()
 
@@ -982,11 +972,6 @@ class UMBPDirectLinker(UnifiedCacheLinker):
         while True:
             try:
                 self._offload_results.get_nowait()
-            except Empty:
-                break
-        while True:
-            try:
-                self._completed_loads.get_nowait()
             except Empty:
                 break
         self.layer_done_counter.reset()

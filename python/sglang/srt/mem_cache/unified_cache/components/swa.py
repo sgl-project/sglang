@@ -1195,9 +1195,6 @@ class SWAComponent(TreeComponent):
         full_transfer: PoolTransfer,
         transfer: PoolTransfer,
         prefix_len: int,
-        *,
-        insert_result: Optional[InsertResult] = None,
-        canonical_full: Optional[torch.Tensor] = None,
     ) -> Optional[PoolTransfer]:
         if phase == ExternalLinkerLoadPhase.ABORT:
             self.cache.token_to_kv_pool_allocator.swa_attn_allocator.free(
@@ -1223,12 +1220,6 @@ class SWAComponent(TreeComponent):
                 )
             else:
                 req.kv.swa_evicted_seqlen = max(req.kv.swa_evicted_seqlen, boundary)
-            return transfer
-
-        assert phase == ExternalLinkerLoadPhase.COMMIT
-        assert insert_result is not None and canonical_full is not None
-        assert len(canonical_full) == len(transfer.device_indices)
-        allocator.set_full_to_swa_mapping(canonical_full, transfer.device_indices)
         return transfer
 
     def commit_hicache_transfer(
