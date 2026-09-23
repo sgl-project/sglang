@@ -68,6 +68,16 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _initialize_dummy_request_window_history(model_runner: ModelRunner) -> None:
+    """Initialize legacy request-window state when the selected pool has it."""
+    if not get_exec().features.enable_encoder_swa_bounded_replay:
+        return
+
+    request_window = model_runner.token_to_kv_pool.request_window
+    if request_window is not None:
+        request_window.initialize_dummy_history()
+
+
 def _allocate_decode_buffers(
     *,
     device: torch.device,
@@ -653,8 +663,7 @@ class BaseRunner(ABC):
 
         forward_batch = mr.prepare_dummy_forward_batch(forward_batch)
         mr.attn_backend.init_forward_metadata(forward_batch)
-        if get_exec().features.enable_encoder_swa_bounded_replay:
-            mr.token_to_kv_pool.request_window.initialize_dummy_history()
+        _initialize_dummy_request_window_history(mr)
 
         def run_once():
             # Reused dummy batches may carry DP-local lazy caches from a prior
