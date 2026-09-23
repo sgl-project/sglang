@@ -38,7 +38,6 @@ from sglang.kernels.ops.speculative.dspark.dspark_attn_metadata import (
     ComputeDsparkWindowGather,
 )
 from sglang.srt.environ import envs
-from sglang.srt.layers.attention.hip_flash_mla import hip_attn_kv_splits
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.deepseek_v4_backend import (
     PAGE_INDEX_ALIGNED_SIZE,
@@ -74,7 +73,10 @@ from sglang.srt.layers.attention.dsv4.metadata import (
     copy_metadata,
     maybe_copy_inplace,
 )
-from sglang.srt.layers.attention.hip_flash_mla import hip_fused_decode_glue
+from sglang.srt.layers.attention.hip_flash_mla import (
+    hip_attn_kv_splits,
+    hip_fused_decode_glue,
+)
 from sglang.srt.layers.cp.utils import is_cp_active
 from sglang.srt.layers.dp_attention import (
     get_local_dp_buffer_len,
@@ -2217,7 +2219,6 @@ class DeepseekV4HipRadixBackend(
             self._refresh_fp4_prefill_workspace(forward_batch)
             assert isinstance(self.forward_metadata, DSV4Metadata)
             return self.forward_metadata
-            return
         self._check_breakable_cuda_graph_support(forward_batch)
         metadata = self._prefill_metadata_for_batch(forward_batch)
         self.forward_metadata = metadata
