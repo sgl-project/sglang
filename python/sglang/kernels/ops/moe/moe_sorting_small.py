@@ -27,7 +27,8 @@ logger = logging.getLogger(__name__)
 
 
 # P <= 64: one sort CTA does the whole P x P rank compare
-@triton.jit
+# per-M ints stay unspecialized so prefill sizes reuse the graph-capture compiles
+@triton.jit(do_not_specialize=["M", "moe_buf_numel", "num_buf"])
 def _moe_sorting_small_kernel(
     topk_ids_ptr,  # [M, topk] i32
     topk_weights_ptr,  # [M, topk] fp32
@@ -46,14 +47,14 @@ def _moe_sorting_small_kernel(
     P_POW2: tl.constexpr,  # >= M * topk
     PAD_POW2: tl.constexpr,  # >= (M * topk) * BLOCK_SIZE (worst-case padded len)
     BUF_BLOCK: tl.constexpr,
-    NUM_BUF: tl.constexpr,  # buf-zero CTAs occupy pids [1, NUM_BUF]
+    num_buf,  # buf-zero CTAs occupy pids [1, num_buf]
     EMIT_MX: tl.constexpr,  # also emit the mxfp8 quant of qx (group_size 32)
     N_COLS: tl.constexpr,
     QCHUNK: tl.constexpr,  # columns per quant iteration (multiple of 32)
     SCALEN_PAD: tl.constexpr,  # ceil(N_COLS/32 / 8) * 8
 ):
     pid = tl.program_id(0)
-    if pid > 0 and pid <= NUM_BUF:
+    if pid > 0 and pid <= num_buf:
         offs = (pid - 1) * BUF_BLOCK + tl.arange(0, BUF_BLOCK)
         tl.store(
             moe_buf_ptr + offs,
@@ -86,9 +87,9 @@ def _moe_sorting_small_kernel(
     )
     dest = blocks_before * BLOCK_SIZE + rank
 
-    if EMIT_MX and pid > NUM_BUF:
+    if EMIT_MX and pid > num_buf:
         # quant CTA: one (pair, column-chunk) slice, mirroring fused_dynamic_mxfp8_quant_moe_sort
-        q_id = pid - NUM_BUF - 1
+        q_id = pid - num_buf - 1
         CHUNKS: tl.constexpr = N_COLS // QCHUNK
         p = q_id // CHUNKS
         c0 = (q_id % CHUNKS) * QCHUNK
@@ -159,7 +160,8 @@ def _expert_chunk_blocks(e, offs_chunk, BLOCK_SIZE: tl.constexpr):
     return cnt, (cnt + BLOCK_SIZE - 1) // BLOCK_SIZE
 
 
-@triton.jit
+# per-M ints stay unspecialized so prefill sizes reuse the graph-capture compiles
+@triton.jit(do_not_specialize=["M", "moe_buf_numel", "num_buf"])
 def _moe_sorting_small_kernel_distributed(
     topk_ids_ptr,  # [M, topk] i32
     topk_weights_ptr,  # [M, topk] fp32
@@ -181,7 +183,7 @@ def _moe_sorting_small_kernel_distributed(
     E_CEIL: tl.constexpr,  # num_experts rounded up to P_CHUNK
     PAD_POW2: tl.constexpr,  # >= (M * topk) * BLOCK_SIZE (worst-case padded len)
     BUF_BLOCK: tl.constexpr,
-    NUM_BUF: tl.constexpr,  # buf-zero CTAs occupy pids [1, NUM_BUF]
+    num_buf,  # buf-zero CTAs occupy pids [1, num_buf]
     EMIT_MX: tl.constexpr,  # also emit the mxfp8 quant of qx (group_size 32)
     N_COLS: tl.constexpr,
     QCHUNK: tl.constexpr,  # columns per quant iteration (multiple of 32)
@@ -194,7 +196,7 @@ def _moe_sorting_small_kernel_distributed(
     # sentinel expert keeps inactive lanes out of every "smaller expert" count
     e = tl.load(topk_ids_ptr + offs_p, mask=mask_p, other=0x7FFFFFFF)
 
-    # one writer per byte: expert-chunk CTAs, then NUM_BUF zero-fill CTAs, then one CTA per pair
+    # one writer per byte: expert-chunk CTAs, then num_buf zero-fill CTAs, then one CTA per pair
     NUM_ECHUNK: tl.constexpr = E_CEIL // P_CHUNK
 
     if pid < NUM_ECHUNK:
@@ -233,7 +235,7 @@ def _moe_sorting_small_kernel_distributed(
             )
         return
 
-    if pid < NUM_ECHUNK + NUM_BUF:
+    if pid < NUM_ECHUNK + num_buf:
         offs = (pid - NUM_ECHUNK) * BUF_BLOCK + tl.arange(0, BUF_BLOCK)
         tl.store(
             moe_buf_ptr + offs,
@@ -243,7 +245,7 @@ def _moe_sorting_small_kernel_distributed(
         return
 
     # per-pair CTA: dest = blocks of smaller experts * BLOCK_SIZE + stable rank in its expert
-    p = pid - NUM_ECHUNK - NUM_BUF
+    p = pid - NUM_ECHUNK - num_buf
     if p >= P:
         return
 
@@ -357,7 +359,7 @@ def _run_small_sort(
             P_POW2=triton.next_power_of_2(p),
             PAD_POW2=triton.next_power_of_2(p * block_size),
             BUF_BLOCK=buf_block,
-            NUM_BUF=num_buf,
+            num_buf=num_buf,
             EMIT_MX=emit_mx,
             N_COLS=n_cols,
             QCHUNK=min(2048, n_cols),
@@ -393,7 +395,7 @@ def _run_small_sort(
         E_CEIL=(num_experts + p_chunk - 1) // p_chunk * p_chunk,
         PAD_POW2=triton.next_power_of_2(p * block_size),
         BUF_BLOCK=buf_block,
-        NUM_BUF=num_buf,
+        num_buf=num_buf,
         EMIT_MX=emit_mx,
         N_COLS=n_cols,
         QCHUNK=min(2048, n_cols),
