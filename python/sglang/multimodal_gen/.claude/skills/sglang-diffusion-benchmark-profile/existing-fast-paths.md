@@ -125,7 +125,12 @@ framework-specific optimization workflow.
   decoder rewrites used by FLUX.1/FLUX.2/Z-Image/SD3, and Wan / Qwen-Image
   VAE RMSNorm+SiLU (the Qwen-Image VAE is the Wan 2.1 VAE; its gate also
   re-expresses the `Resample` upsample input with canonical NHWC strides so
-  the 2D conv runs channels_last end-to-end).
+  the 2D conv runs channels_last end-to-end). The Qwen-Image 2.1 VAE
+  (`runtime/models/vaes/qwen_image21_vae_cuda_opt.py`) is a separate class
+  with the same gate: channels_last convs with cuDNN padding (no `F.pad`
+  copies, no NCHW/NHWC transposes), the fused RMSNorm+SiLU, and the NHWC
+  nearest upsample, on encode and decode. Left on the table there: the conv
+  bias is still a separate `add_` per conv (about 10% of decode).
 - Do not confuse request `--quality` with `--output-quality`, which controls
   output-file compression rather than model math.
 - Validation: `test/registered/kernels/ops/diffusion/test_sites.py`,

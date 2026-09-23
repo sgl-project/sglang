@@ -183,6 +183,11 @@ text prompt; precomputed embeddings alone are insufficient.
 - **VAE:** full-image decoding is the default. Tiling can change pixels near
   boundaries. With two or more GPUs, **Spatial shard** distributes full-image
   decoding without enabling tiling; floating-point rounding can still differ.
+  `--quality extra-high` (or `high`) switches the VAE to a channels_last fast
+  path with fused RMSNorm+SiLU for both encode and decode; on one A800 at
+  1024×1024 that took decode from 181 ms to 135 ms and edit conditioning from
+  259 ms to 240 ms with edit output at SSIM 0.9988 / 43 dB against the
+  lossless default, which stays bit-exact.
 
 See the [compatibility inventory](/docs/sglang-diffusion/compatibility_matrix)
 for configuration support and the
