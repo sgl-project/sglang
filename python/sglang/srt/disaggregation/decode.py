@@ -429,10 +429,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         if self.enable_staging:
             self.transfer_queue._init_staging_handler(self.kv_manager)
 
-        if (
-            self.scheduler.tp_worker.is_hybrid_swa
-            and not self._uses_swa_tail_prealloc()
-        ):
+        if self._uses_paged_swa_capacity_limit():
             # Fallback for SWA allocators that still allocate the SWA pool at
             # full prompt length.
             self.max_total_num_tokens = min(
@@ -458,6 +455,13 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             and self.token_to_kv_pool_allocator.page_size > 1
             and hasattr(self.token_to_kv_pool_allocator, "alloc_extend_swa_tail")
         )
+
+    def _uses_paged_swa_capacity_limit(self) -> bool:
+        if not self.scheduler.tp_worker.is_hybrid_swa:
+            return False
+        if self._uses_swa_tail_prealloc():
+            return False
+        return getattr(self.token_to_kv_pool, "swa_kv_pool", None) is not None
 
     def _uses_swa_reservation(self) -> bool:
         return (

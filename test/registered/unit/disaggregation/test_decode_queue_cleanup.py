@@ -105,6 +105,30 @@ class TestDecodeQueueCleanup(CustomTestCase):
         self.assertEqual(physical_available, 3 * page_size)
         self.assertEqual(queue._pre_alloc.call_count, 3)
 
+    def test_request_window_does_not_cap_full_capacity_with_zero_paged_swa(self):
+        queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
+        queue.scheduler = SimpleNamespace(
+            tp_worker=SimpleNamespace(is_hybrid_swa=True)
+        )
+        queue.token_to_kv_pool = SimpleNamespace(
+            request_window=object(), swa_kv_pool=None
+        )
+        queue._uses_swa_tail_prealloc = MagicMock(return_value=False)
+
+        self.assertFalse(queue._uses_paged_swa_capacity_limit())
+
+    def test_legacy_paged_swa_still_caps_full_capacity(self):
+        queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
+        queue.scheduler = SimpleNamespace(
+            tp_worker=SimpleNamespace(is_hybrid_swa=True)
+        )
+        queue.token_to_kv_pool = SimpleNamespace(
+            request_window=None, swa_kv_pool=object()
+        )
+        queue._uses_swa_tail_prealloc = MagicMock(return_value=False)
+
+        self.assertTrue(queue._uses_paged_swa_capacity_limit())
+
     def test_prealloc_abort_clears_receiver_before_removing_request(self):
         receiver = FakeReceiver()
         req = SimpleNamespace(
