@@ -263,12 +263,10 @@ def _dp_attention_replays_decode_graphs(server_args: Any) -> bool:
     """Whether decode graphs capture the DP-attention gather/scatter collectives
     (attention-DP ranks exchanging their tokens over the TP group)."""
     view = resolving_view(server_args)
-    graph_config = getattr(view, "cuda_graph_config", None)
     return bool(
         view.enable_dp_attention
         and view.dp_size > 1
-        and graph_config is not None
-        and graph_config.decode.backend != Backend.DISABLED
+        and view.cuda_graph_config.decode.backend != Backend.DISABLED
     )
 
 
