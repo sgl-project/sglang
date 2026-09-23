@@ -65,8 +65,8 @@ SGLang supports various environment variables that can be used to configure its 
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_FORWARD_UNKNOWN_TOOLS</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Forward unknown tool calls to clients instead of dropping them</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code> (drop unknown tools)</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Forward unknown tool calls to clients instead of dropping them. When set to <code>false</code>, tool calls with names not in the declared tool list are silently dropped; when <code>true</code> (default), they are forwarded so the client can validate and return an error to the model, which is the expected behavior for agent loops.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>true</code> (forward unknown tools)</td>
     </tr>
 <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_REQ_WAITING_TIMEOUT</code></td>
