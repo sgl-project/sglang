@@ -24,6 +24,12 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     maybe_init_distributed_environment_and_model_parallel,
     model_parallel_is_initialized,
 )
+from sglang.multimodal_gen.runtime.layers.quantization.fp8 import Fp8Config
+from sglang.multimodal_gen.runtime.loader.utils import (
+    get_param_names_mapping,
+    hf_to_custom_state_dict,
+    load_model_state_dict,
+)
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 from sglang.multimodal_gen.runtime.models.dits import qwen_image21 as model_module
 from sglang.multimodal_gen.runtime.models.dits.qwen_image21 import (
@@ -214,14 +220,35 @@ def test_diffusers_lora_matches_weight_delta_and_restores_base(
         loaded.load_state_dict(model.state_dict())
     pipeline.modules = {"transformer": actual_model}
     pipeline.__init__()
+    inner = model.config.hidden_size * model.config.mlp_ratio
+    # Diffusers adapter names; the FFN halves are rows [0, inner) and
+    # [inner, 2 inner) of the packed gate_up projection.
+    targets = {
+        "transformer_blocks.0.attn.to_q": (
+            "transformer_blocks.0.attn.to_q",
+            slice(None),
+        ),
+        "transformer_blocks.0.img_mlp.out": (
+            "transformer_blocks.0.img_mlp.out",
+            slice(None),
+        ),
+        "transformer_blocks.0.img_mlp.gate_layer": (
+            "transformer_blocks.0.img_mlp.gate_up",
+            slice(0, inner),
+        ),
+        "transformer_blocks.0.img_mlp.proj": (
+            "transformer_blocks.0.img_mlp.gate_up",
+            slice(inner, 2 * inner),
+        ),
+    }
     weights = {}
-    for name in ("transformer_blocks.0.attn.to_q", "transformer_blocks.0.img_mlp.out"):
-        layer = reference.get_submodule(name)
-        a = torch.randn(2, layer.weight.shape[1], device="cuda") * 0.2
-        b = torch.randn(layer.weight.shape[0], 2, device="cuda") * 0.2
+    for name, (module_name, rows) in targets.items():
+        weight = reference.get_submodule(module_name).weight
+        a = torch.randn(2, weight.shape[1], device="cuda") * 0.2
+        b = torch.randn(weight[rows].shape[0], 2, device="cuda") * 0.2
         weights[f"transformer.{name}.lora_A.weight"] = a.cpu()
         weights[f"transformer.{name}.lora_B.weight"] = b.cpu()
-        layer.weight.add_(b @ a)
+        weight[rows] += b @ a
     adapter = tmp_path / "adapter.safetensors"
     save_file(weights, str(adapter))
     kwargs = dict(inputs(5, False), prefix_caches=None)
@@ -321,7 +348,7 @@ def test_bf16_fusions_match_eager_prefill_and_cached_steps(
     disabled = BitExactFusionGate("reference")
     disabled.disable()
     with monkeypatch.context() as reference, set_forward_context(None, None):
-        reference.setattr(model_module, "_SILU_MUL_FUSION", disabled)
+        reference.setattr(model_module, "_SWIGLU_FUSION", disabled)
         reference.setattr(
             model_module,
             "residual_gate_add",
@@ -331,8 +358,8 @@ def test_bf16_fusions_match_eager_prefill_and_cached_steps(
             reference_kwargs["timestep"].fill_(timestep)
             expected.append(actual_model(**reference_kwargs))
 
-    gate = BitExactFusionGate("test SiLU-mul")
-    monkeypatch.setattr(model_module, "_SILU_MUL_FUSION", gate)
+    gate = BitExactFusionGate("test packed SiLU-mul", per_signature=True)
+    monkeypatch.setattr(model_module, "_SWIGLU_FUSION", gate)
     with set_forward_context(None, None):
         for timestep, output in zip((700, 300, 10), expected, strict=True):
             kwargs["timestep"].fill_(timestep)
@@ -359,15 +386,65 @@ def test_bf16_fusions_match_eager_prefill_and_cached_steps(
 def test_silu_fusion_mismatch_restores_eager(bf16_model, monkeypatch):
     mlp = bf16_model.transformer_blocks[0].img_mlp
     x = torch.randn(1, 16, 128, device="cuda", dtype=torch.bfloat16)
-    gate = BitExactFusionGate("test mismatch")
-    monkeypatch.setattr(model_module, "_SILU_MUL_FUSION", gate)
+    gate = BitExactFusionGate("test mismatch", per_signature=True)
+    monkeypatch.setattr(model_module, "_SWIGLU_FUSION", gate)
     monkeypatch.setattr(
-        model_module, "fused_silu_mul_bitexact", lambda a, b: torch.zeros_like(a)
+        model_module,
+        "fused_packed_silu_mul_bitexact",
+        lambda packed: packed.new_zeros(*packed.shape[:-1], packed.shape[-1] // 2),
     )
     with set_forward_context(None, None):
+        packed = mlp.gate_up(x)[0]
+        half = packed.shape[-1] // 2
         expected = mlp.out(
-            torch.nn.functional.silu(mlp.gate_layer(x)[0]) * mlp.proj(x)[0]
+            torch.nn.functional.silu(packed[..., :half]) * packed[..., half:]
         )[0]
         torch.testing.assert_close(mlp(x), expected, atol=0, rtol=0)
         assert gate.disabled and not gate.verified
         torch.testing.assert_close(mlp(x), expected, atol=0, rtol=0)
+
+
+@torch.no_grad()
+def test_merged_ffn_loads_diffusers_split_projections(model):
+    # The checkpoint stores img_mlp.gate_layer and img_mlp.proj; the loader
+    # must place them in gate_up rows [0, inner) and [inner, 2 inner).
+    inner = model.config.hidden_size * model.config.mlp_ratio
+    source = {}
+    for name, tensor in model.state_dict().items():
+        if name.endswith(".img_mlp.gate_up.weight"):
+            base = name[: -len(".gate_up.weight")]
+            source[f"{base}.gate_layer.weight"] = tensor[:inner].cpu()
+            source[f"{base}.proj.weight"] = tensor[inner:].cpu()
+        else:
+            source[name] = tensor.cpu()
+    assert not any(".gate_up." in name for name in source)
+    loaded = QwenImage21Transformer2DModel(
+        QwenImage21DitConfig(arch_config=model.config), {}
+    ).cuda()
+    valid = set(loaded.state_dict())
+    assert "transformer_blocks.0.img_mlp.gate_up.weight" in valid
+    state_dict, _ = hf_to_custom_state_dict(
+        source,
+        get_param_names_mapping(loaded.param_names_mapping, valid_target_names=valid),
+        valid_target_names=valid,
+        strict=True,
+    )
+    missing, unexpected = load_model_state_dict(loaded, state_dict, strict=False)
+    assert not missing and not unexpected
+    for name, tensor in model.state_dict().items():
+        torch.testing.assert_close(loaded.state_dict()[name], tensor, atol=0, rtol=0)
+
+
+def test_quantized_build_keeps_split_ffn_projections(model):
+    # Serialized quantized exports carry per-projection scales under the
+    # Diffusers names, so quantized builds keep gate_layer/proj and no mapping.
+    quantized = QwenImage21Transformer2DModel(
+        QwenImage21DitConfig(arch_config=model.config), {}, quant_config=Fp8Config()
+    )
+    mlp = quantized.transformer_blocks[0].img_mlp
+    assert not mlp.merged
+    assert hasattr(mlp, "gate_layer") and hasattr(mlp, "proj")
+    assert not hasattr(mlp, "gate_up")
+    assert quantized.param_names_mapping == {}
+    assert model.transformer_blocks[0].img_mlp.merged
+    assert model.param_names_mapping
