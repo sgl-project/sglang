@@ -317,46 +317,6 @@ class TestPPPrefetchTicket(unittest.TestCase):
         self.assertEqual(c.mem_pool_host.free.call_count, 1)
         self.assertEqual(c.mem_pool_host.free.call_args.kwargs["pool"], PoolName.KV)
 
-    def test_memcache_ticket_keeps_resolved_coarse_keys_and_coverage(self):
-        c = self.c
-        c.storage_backend_type = "npu_memcache"
-        c.mem_pool_host.get_pool.return_value = Mock(page_size=16)
-        transfer = PoolTransfer(
-            PoolName.DEEPSEEK_V4_C128,
-            keys=["__placeholder__"] * 2,
-            logical_pages_per_object=2,
-        )
-
-        def query(operation, pp_rank):
-            operation.all_hash_values = ["h0", "h1", "h2", "h3"]
-            transfer.keys = ["h1", "h3"]
-            return operation.all_hash_values[:2], 8
-
-        c._storage_hit_query.side_effect = query
-        self.submit(pools=[transfer])
-        ticket = pickle.loads(pickle.dumps(c.pp_prefetch_states["hit"].ticket))
-        self.assertEqual(ticket.pool_specs[0].keys, ["h1"])
-        self.assertEqual(ticket.pool_specs[0].logical_pages_per_object, 2)
-        for rank in (0, 1):
-            with self.subTest(rank=rank):
-                c.pp_rank = rank
-                if rank:
-                    c.pp_prefetch_states.clear()
-                c.mem_pool_host.alloc.reset_mock()
-                self.run_commands(ticket)
-                operation = c.prefetch_buffer.get_nowait()
-                self.assertEqual(
-                    c.mem_pool_host.alloc.call_args_list,
-                    [
-                        call(8, pool=PoolName.KV),
-                        call(16, pool=PoolName.DEEPSEEK_V4_C128),
-                    ],
-                )
-                restored = operation.pool_transfers[0]
-                self.assertEqual(restored.keys, ["h1"])
-                self.assertEqual(restored.logical_pages_per_object, 2)
-                self.assertEqual(restored.host_indices.numel(), 16)
-
     def test_failed_source_allocation_does_not_free_borrowed_sidecar_early(self):
         c = self.c
         borrowed = PoolTransfer(PoolName.SWA, host_indices=torch.arange(4))

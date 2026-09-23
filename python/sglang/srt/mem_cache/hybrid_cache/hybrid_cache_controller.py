@@ -57,7 +57,6 @@ class PPPrefetchPoolSpec:
     keys: Optional[List[str]] = None
     hit_policy: PoolHitPolicy = PoolHitPolicy.ALL_PAGES
     indices_from_pool: Optional[PoolName] = None
-    logical_pages_per_object: int = 1
 
     @classmethod
     def from_transfer(cls, transfer: PoolTransfer) -> PPPrefetchPoolSpec:
@@ -72,7 +71,6 @@ class PPPrefetchPoolSpec:
             keys=list(transfer.keys) if transfer.keys is not None else None,
             hit_policy=transfer.hit_policy,
             indices_from_pool=transfer.indices_from_pool,
-            logical_pages_per_object=transfer.logical_pages_per_object,
         )
 
 
@@ -803,16 +801,6 @@ class HybridCacheController(BaseHiCacheController):
             return PrefetchSubmission(decision=False)
 
         ticket.storage_hit_count = storage_hit_count
-        if operation.pool_transfers and self.storage_backend_type == "npu_memcache":
-            self._trim_prefetch_transfers(
-                operation.pool_transfers,
-                operation.all_hash_values,
-                storage_hit_count // self.page_size,
-            )
-            ticket.pool_specs = tuple(
-                PPPrefetchPoolSpec.from_transfer(transfer)
-                for transfer in operation.pool_transfers
-            )
         operation.is_pp_broadcast = True
         state = PPPrefetchState(ticket=ticket, operation=operation)
         with self.pp_prefetch_state_lock:
@@ -863,9 +851,7 @@ class HybridCacheController(BaseHiCacheController):
                         spec.num_slots,
                         min(
                             len(spec.keys or []),
-                            ticket.storage_hit_count
-                            // self.page_size
-                            // spec.logical_pages_per_object,
+                            ticket.storage_hit_count // self.page_size,
                         ),
                     )
                 if indices is None:
@@ -886,7 +872,6 @@ class HybridCacheController(BaseHiCacheController):
                     keys=list(spec.keys) if spec.keys is not None else None,
                     hit_policy=spec.hit_policy,
                     indices_from_pool=spec.indices_from_pool,
-                    logical_pages_per_object=spec.logical_pages_per_object,
                 )
             )
 
@@ -995,7 +980,6 @@ class HybridCacheController(BaseHiCacheController):
                                     keys=spec.keys,
                                     hit_policy=spec.hit_policy,
                                     indices_from_pool=spec.indices_from_pool,
-                                    logical_pages_per_object=spec.logical_pages_per_object,
                                 )
                                 for spec in ticket.pool_specs
                             ]
@@ -1139,7 +1123,6 @@ class HybridCacheController(BaseHiCacheController):
                         hit_policy=transfer.hit_policy,
                         indices_from_pool=transfer.indices_from_pool,
                         logical_pages_per_object=transfer.logical_pages_per_object,
-                        anchor_index_parts=transfer.anchor_index_parts,
                     )
                 )
         return host_indices, device_indices, resolved_pool_transfers
