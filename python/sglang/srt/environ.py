@@ -850,7 +850,9 @@ class Envs:
     SGLANG_MORI_TRANSFER_TIMEOUT_MS = EnvInt(0)
     SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(4096)
     SGLANG_MORI_EP_VERSION = EnvStr("epv1")
+    SGLANG_MORI_DISPATCH_DTYPE = EnvStr("auto")
     SGLANG_MORI_RECV_BOUND = EnvBool(False)
+    SGLANG_MORI_EPV2_PER_RANK_VMM_GB = EnvInt(4)
 
     # ===================================================================
     # AMD, ROCm, and AITER
