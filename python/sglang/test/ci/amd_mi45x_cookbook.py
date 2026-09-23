@@ -99,12 +99,18 @@ class CookbookConfig:
     tp_size: int
     server_args: List[str]
     env_vars: Dict[str, str] = field(default_factory=dict)
-    # Env vars to drop before launching. The cookbook runs some entries only
-    # after unsetting variables the image exports, so inheriting them silently
-    # changes what is being measured.
+    # Extra env vars to drop before launching, on top of the multi-GPU set that
+    # any tp_size > 1 config drops automatically. The cookbook runs some entries
+    # only after unsetting variables the image exports, so inheriting them
+    # silently changes what is being measured.
     unset_env: Tuple[str, ...] = ()
     # Measured on MI455 A0, from the cookbook.
     accuracy: Optional[float] = None
+    # TP the `accuracy` above was actually measured at, when that is not this
+    # config's own tp_size. The cookbook only ran one or two TPs per model, so
+    # the rest of the matrix gates against a carried-over number; recording
+    # which one keeps a delta from being read as a same-config regression.
+    accuracy_measured_at_tp: Optional[int] = None
     invalid: Optional[float] = None
     latency_s: Optional[float] = None
     output_throughput: Optional[float] = None
@@ -129,8 +135,13 @@ class CookbookConfig:
 
     def full_env(self) -> Dict[str, str]:
         env = os.environ.copy()
-        for key in self.unset_env:
+        drop = set(self.unset_env)
+        if self.tp_size > 1:
+            drop.update(_MULTI_GPU_UNSET_ENV)
+        for key in drop:
             env.pop(key, None)
+        if self.tp_size > 1:
+            env.update(_MULTI_GPU_ENV)
         env.update(self.env_vars)
         return env
 
@@ -145,27 +156,46 @@ _COMMON_ENV = {
     "HSA_COREDUMP_PATTERN": "/dev/null",
 }
 
+# Applied by full_env() to every tp_size > 1 entry rather than written into each
+# config, because forgetting them does not fail loudly -- it hangs. These images
+# export NCCL_MIN_NCHANNELS=112, far past what a small all-reduce wants, and a
+# TP=2 run inheriting it sat at 100% on both cards through CUDA-graph capture
+# until it was killed.
+_MULTI_GPU_UNSET_ENV: Tuple[str, ...] = (
+    "NCCL_MIN_NCHANNELS",
+    "NCCL_MAX_NCHANNELS",
+)
+
+_MULTI_GPU_ENV = {
+    "NCCL_IGNORE_CPU_AFFINITY": "1",
+    "NCCL_CUMEM_ENABLE": "1",
+    "NCCL_MNNVL_ENABLE": "1",
+    "HSA_HOTSWAP_DISABLE": "1",
+}
+
 
 # --- 1. GPT-OSS-120B ---------------------------------------------------------
-GPT_OSS_120B = CookbookConfig(
-    name="gpt-oss-120b-w-mxfp4-a-fp8",
+_GPT_OSS_ARGS = [
+    "--trust-remote-code",
+    "--max-running-requests",
+    "128",
+    "--mem-fraction-static",
+    "0.9",
+    # One backend for both phases, and CUDA graphs off. This is the whole
+    # difference from the other registered gpt-oss mi45x test; do not
+    # "modernise" it to the prefill/decode split without re-measuring.
+    "--attention-backend",
+    "triton",
+    "--disable-radix-cache",
+    "--disable-cuda-graph",
+]
+
+GPT_OSS_120B_TP1 = CookbookConfig(
+    name="gpt-oss-120b-w-mxfp4-a-fp8 (TP=1)",
     local_dirname="gpt-oss-120b-w-mxfp4-a-fp8",
     hf_repo_id="amd/gpt-oss-120b-w-mxfp4-a-fp8",
     tp_size=1,
-    server_args=[
-        "--trust-remote-code",
-        "--max-running-requests",
-        "128",
-        "--mem-fraction-static",
-        "0.9",
-        # One backend for both phases, and CUDA graphs off. This is the whole
-        # difference from the other registered gpt-oss mi45x test; do not
-        # "modernise" it to the prefill/decode split without re-measuring.
-        "--attention-backend",
-        "triton",
-        "--disable-radix-cache",
-        "--disable-cuda-graph",
-    ],
+    server_args=list(_GPT_OSS_ARGS),
     env_vars=dict(_COMMON_ENV),
     accuracy=0.845,
     invalid=0.010,
@@ -174,51 +204,80 @@ GPT_OSS_120B = CookbookConfig(
     notes="No AITER env; single triton attention backend, CUDA graphs disabled.",
 )
 
+GPT_OSS_120B_TP4 = CookbookConfig(
+    name="gpt-oss-120b-w-mxfp4-a-fp8 (TP=4)",
+    local_dirname="gpt-oss-120b-w-mxfp4-a-fp8",
+    hf_repo_id="amd/gpt-oss-120b-w-mxfp4-a-fp8",
+    tp_size=4,
+    server_args=list(_GPT_OSS_ARGS),
+    env_vars=dict(_COMMON_ENV),
+    accuracy=0.845,
+    accuracy_measured_at_tp=1,
+    notes="No AITER env; single triton attention backend, CUDA graphs disabled.",
+)
+
 
 # --- 2. DeepSeek-R1-0528-MXFP4 ----------------------------------------------
-DEEPSEEK_R1_0528_MXFP4 = CookbookConfig(
-    name="DeepSeek-R1-0528-MXFP4",
+_DSR1_ARGS = [
+    "--trust-remote-code",
+    "--mem-fraction-static",
+    "0.90",
+    "--chunked-prefill-size",
+    "16384",
+    "--attention-backend",
+    "triton",
+    "--max-running-requests",
+    "32",
+    "--kv-cache-dtype",
+    "auto",
+    "--page-size",
+    "64",
+]
+
+_DSR1_ENV = {
+    **_COMMON_ENV,
+    "HSA_ENABLE_COREDUMP": "0",
+    "AMD_COREDUMP": "0",
+    "SGLANG_USE_AITER": "1",
+    "AITER_FORCE_A8W4": "1",
+    "AITER_GROUPED_FORCE_SPLIT_K1": "1",
+    "SGLANG_MOE_SHUFFLE_GFX1250": "1",
+    "ROCM_QUICK_REDUCE_QUANTIZATION": "NONE",
+    "SGLANG_AITER_FP8_PREFILL_ATTN": "0",
+    "SGLANG_AITER_MLA_PERSIST": "0",
+    "SGLANG_INT4_WEIGHT": "0",
+    "SGLANG_MOE_PADDING": "1",
+    "SGLANG_SET_CPU_AFFINITY": "1",
+    "SGLANG_ROCM_FUSED_DECODE_MLA": "0",
+    "SGLANG_USE_ROCM700A": "1",
+    "AITER_GROUPED_CONTIGUOUS_TOKEN_THRESHOLD": "16",
+}
+
+# The cookbook only ran this model at TP=1 (0.948); both entries below gate
+# against that number. SGLANG_SET_CPU_AFFINITY=1 stays on from the cookbook env
+# even though full_env() adds NCCL_IGNORE_CPU_AFFINITY=1 for TP>1 -- the two
+# control different layers (SGLang's own pinning vs NCCL's), and the cookbook's
+# own TP=2 entry for DSV4 sets the NCCL one while leaving SGLang's alone.
+DEEPSEEK_R1_0528_MXFP4_TP2 = CookbookConfig(
+    name="DeepSeek-R1-0528-MXFP4 (TP=2)",
     local_dirname="DeepSeek-R1-0528-MXFP4",
     hf_repo_id="amd/DeepSeek-R1-0528-MXFP4",
-    tp_size=1,
-    server_args=[
-        "--trust-remote-code",
-        "--mem-fraction-static",
-        "0.90",
-        "--chunked-prefill-size",
-        "16384",
-        "--attention-backend",
-        "triton",
-        "--max-running-requests",
-        "32",
-        "--kv-cache-dtype",
-        "auto",
-        "--page-size",
-        "64",
-    ],
-    env_vars={
-        **_COMMON_ENV,
-        "HSA_ENABLE_COREDUMP": "0",
-        "AMD_COREDUMP": "0",
-        "SGLANG_USE_AITER": "1",
-        "AITER_FORCE_A8W4": "1",
-        "AITER_GROUPED_FORCE_SPLIT_K1": "1",
-        "SGLANG_MOE_SHUFFLE_GFX1250": "1",
-        "ROCM_QUICK_REDUCE_QUANTIZATION": "NONE",
-        "SGLANG_AITER_FP8_PREFILL_ATTN": "0",
-        "SGLANG_AITER_MLA_PERSIST": "0",
-        "SGLANG_INT4_WEIGHT": "0",
-        "SGLANG_MOE_PADDING": "1",
-        "SGLANG_SET_CPU_AFFINITY": "1",
-        "SGLANG_ROCM_FUSED_DECODE_MLA": "0",
-        "SGLANG_USE_ROCM700A": "1",
-        "AITER_GROUPED_CONTIGUOUS_TOKEN_THRESHOLD": "16",
-    },
+    tp_size=2,
+    server_args=list(_DSR1_ARGS),
+    env_vars=dict(_DSR1_ENV),
     accuracy=0.948,
-    invalid=0.000,
-    latency_s=471.640,
-    output_throughput=279.599,
-    notes="Cookbook used --tensor-parallel-size 1 (alias of --tp).",
+    accuracy_measured_at_tp=1,
+)
+
+DEEPSEEK_R1_0528_MXFP4_TP4 = CookbookConfig(
+    name="DeepSeek-R1-0528-MXFP4 (TP=4)",
+    local_dirname="DeepSeek-R1-0528-MXFP4",
+    hf_repo_id="amd/DeepSeek-R1-0528-MXFP4",
+    tp_size=4,
+    server_args=list(_DSR1_ARGS),
+    env_vars=dict(_DSR1_ENV),
+    accuracy=0.948,
+    accuracy_measured_at_tp=1,
 )
 
 
@@ -280,68 +339,81 @@ DEEPSEEK_V4_FLASH_TP1 = CookbookConfig(
     output_throughput=950.984,
 )
 
-DEEPSEEK_V4_FLASH_TP2 = CookbookConfig(
-    name="DeepSeek-V4-Flash (TP=2)",
+# The NCCL/HSA env the cookbook writes out for this entry is not repeated here;
+# full_env() applies it to every TP>1 config. --disable-custom-all-reduce is
+# still explicit because it is a server flag, and because the cookbook only
+# carries it on the multi-GPU DSV4 command line.
+DEEPSEEK_V4_FLASH_TP4 = CookbookConfig(
+    name="DeepSeek-V4-Flash (TP=4)",
     local_dirname="DeepSeek-V4-Flash",
     hf_repo_id="deepseek-ai/DeepSeek-V4-Flash",
-    tp_size=2,
+    tp_size=4,
     server_args=list(_DSV4_ARGS) + ["--disable-custom-all-reduce"],
-    env_vars={
-        **_DSV4_ENV,
-        "NCCL_IGNORE_CPU_AFFINITY": "1",
-        "NCCL_CUMEM_ENABLE": "1",
-        "NCCL_MNNVL_ENABLE": "1",
-        "HSA_HOTSWAP_DISABLE": "1",
-    },
-    # These ROCm images export NCCL_MIN_NCHANNELS=112, which is far past what a
-    # 2-GPU all-reduce wants and hangs CUDA-graph capture.
-    unset_env=("NCCL_MIN_NCHANNELS", "NCCL_MAX_NCHANNELS"),
+    env_vars=dict(_DSV4_ENV),
+    # Carried from the cookbook's TP=2 run (0.926) rather than its TP=1 (0.932),
+    # that being the nearer multi-GPU measurement.
     accuracy=0.926,
-    invalid=0.000,
-    latency_s=177.039,
-    output_throughput=668.197,
+    accuracy_measured_at_tp=2,
     notes=(
-        "Cookbook measured this on heliosr-1b114-a04-2 rather than the A0 box, "
+        "Cookbook measured TP=2 on heliosr-1b114-a04-2 rather than the A0 box, "
         "so a delta here is not automatically a regression."
     ),
 )
 
 
 # --- 6. Qwen3.5-397B-A17B-MXFP4 ---------------------------------------------
-QWEN35_397B_MXFP4 = CookbookConfig(
-    name="Qwen3.5-397B-A17B-MXFP4",
+_QWEN35_ARGS = [
+    "--trust-remote-code",
+    "--max-running-requests",
+    "128",
+    "--mem-fraction-static",
+    "0.9",
+    "--disable-radix-cache",
+    "--prefill-attention-backend",
+    "triton",
+    "--decode-attention-backend",
+    "aiter",
+    "--page-size",
+    "16",
+    "--prefill-max-requests",
+    "1",
+]
+
+_QWEN35_ENV = {
+    **_COMMON_ENV,
+    "TRITON_HIP_USE_ASYNC_COPY": "0",
+    "SGLANG_USE_AITER_UNIFIED_ATTN": "1",
+}
+
+_QWEN35_NOTES = (
+    "Measured by Marvin on rocm/sgl-dev:v0.5.18-rocm10-mi45x-dev-20260828, "
+    "not the image the other entries used."
+)
+
+QWEN35_397B_MXFP4_TP1 = CookbookConfig(
+    name="Qwen3.5-397B-A17B-MXFP4 (TP=1)",
     local_dirname="Qwen3.5-397B-A17B-MXFP4",
     hf_repo_id="amd/Qwen3.5-397B-A17B-MXFP4",
     tp_size=1,
-    server_args=[
-        "--trust-remote-code",
-        "--max-running-requests",
-        "128",
-        "--mem-fraction-static",
-        "0.9",
-        "--disable-radix-cache",
-        "--prefill-attention-backend",
-        "triton",
-        "--decode-attention-backend",
-        "aiter",
-        "--page-size",
-        "16",
-        "--prefill-max-requests",
-        "1",
-    ],
-    env_vars={
-        **_COMMON_ENV,
-        "TRITON_HIP_USE_ASYNC_COPY": "0",
-        "SGLANG_USE_AITER_UNIFIED_ATTN": "1",
-    },
+    server_args=list(_QWEN35_ARGS),
+    env_vars=dict(_QWEN35_ENV),
     accuracy=0.970,
     invalid=0.005,
     latency_s=216.519,
     output_throughput=258.800,
-    notes=(
-        "Measured by Marvin on rocm/sgl-dev:v0.5.18-rocm10-mi45x-dev-20260828, "
-        "not the image the other entries used."
-    ),
+    notes=_QWEN35_NOTES,
+)
+
+QWEN35_397B_MXFP4_TP4 = CookbookConfig(
+    name="Qwen3.5-397B-A17B-MXFP4 (TP=4)",
+    local_dirname="Qwen3.5-397B-A17B-MXFP4",
+    hf_repo_id="amd/Qwen3.5-397B-A17B-MXFP4",
+    tp_size=4,
+    server_args=list(_QWEN35_ARGS),
+    env_vars=dict(_QWEN35_ENV),
+    accuracy=0.970,
+    accuracy_measured_at_tp=1,
+    notes=_QWEN35_NOTES,
 )
 
 
@@ -352,11 +424,14 @@ QWEN35_397B_MXFP4 = CookbookConfig(
 
 
 ALL_CONFIGS: Tuple[CookbookConfig, ...] = (
-    GPT_OSS_120B,
-    DEEPSEEK_R1_0528_MXFP4,
+    GPT_OSS_120B_TP1,
+    GPT_OSS_120B_TP4,
+    DEEPSEEK_R1_0528_MXFP4_TP2,
+    DEEPSEEK_R1_0528_MXFP4_TP4,
     DEEPSEEK_V4_FLASH_TP1,
-    DEEPSEEK_V4_FLASH_TP2,
-    QWEN35_397B_MXFP4,
+    DEEPSEEK_V4_FLASH_TP4,
+    QWEN35_397B_MXFP4_TP1,
+    QWEN35_397B_MXFP4_TP4,
 )
 
 
@@ -554,7 +629,12 @@ def run_cookbook_case(test_case, config: CookbookConfig) -> None:
     if outcome.output_throughput is not None:
         print(f"  output throughput={outcome.output_throughput:.3f} token/s")
     if config.accuracy is not None:
-        print(f"  cookbook accuracy={config.accuracy:.3f} (delta {delta})")
+        measured_at = (
+            ""
+            if config.accuracy_measured_at_tp is None
+            else f" measured at TP={config.accuracy_measured_at_tp}"
+        )
+        print(f"  cookbook accuracy={config.accuracy:.3f}{measured_at} (delta {delta})")
     print(
         "  cookbook reference: "
         f"latency={config.latency_s}s throughput={config.output_throughput} token/s",
@@ -575,7 +655,13 @@ def run_cookbook_case(test_case, config: CookbookConfig) -> None:
             f" | output {outcome.output_throughput:.1f} tok/s "
             f"(cookbook {config.output_throughput} tok/s)"
         )
-    summary += f" | {count} questions\n\n"
+    summary += f" | {count} questions\n"
+    if config.accuracy_measured_at_tp is not None:
+        summary += (
+            f"\nBaseline carried over from the cookbook's TP="
+            f"{config.accuracy_measured_at_tp} run; this TP was never measured.\n"
+        )
+    summary += "\n"
 
     if is_in_ci():
         write_github_step_summary(summary)

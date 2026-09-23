@@ -23,7 +23,10 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/../../../.." && pwd)"
 # the same models under different flags and are not selected by default. Keep in
 # sync with the `register_amd_ci(suite=...)` calls under
 # test/registered/accuracy/mi45x/cookbook/.
-DEFAULT_SUITES="nightly-amd-1-gpu-mi45x-cookbook-gpt-oss,nightly-amd-1-gpu-mi45x-cookbook-dsr1,nightly-amd-2-gpu-mi45x-cookbook-dsv4-flash,nightly-amd-1-gpu-mi45x-cookbook-qwen35"
+#
+# Ordered small-TP first for every model, so a run that is going to fail on a
+# model fails on its cheapest configuration rather than after a 4-card launch.
+DEFAULT_SUITES="nightly-amd-1-gpu-mi45x-cookbook-gpt-oss,nightly-amd-4-gpu-mi45x-cookbook-gpt-oss,nightly-amd-2-gpu-mi45x-cookbook-dsr1,nightly-amd-4-gpu-mi45x-cookbook-dsr1,nightly-amd-1-gpu-mi45x-cookbook-dsv4-flash,nightly-amd-4-gpu-mi45x-cookbook-dsv4-flash,nightly-amd-1-gpu-mi45x-cookbook-qwen35,nightly-amd-4-gpu-mi45x-cookbook-qwen35"
 
 SUITES="${DEFAULT_SUITES}"
 TAG=""
@@ -71,7 +74,11 @@ Examples:
   ./run_mi45x_local.sh -s nightly-amd-1-gpu-mi45x-cookbook-gpt-oss \
       -e SGLANG_MI45X_NUM_QUESTIONS=32 -t smoke
 
-  # Full sweep of every cookbook suite, compared against the last run.
+  # One model, both its TPs, gated for real.
+  ./run_mi45x_local.sh -t gpt-oss \
+      -s nightly-amd-1-gpu-mi45x-cookbook-gpt-oss,nightly-amd-4-gpu-mi45x-cookbook-gpt-oss
+
+  # Full sweep of all eight cookbook suites, compared against the last run.
   ./run_mi45x_local.sh -t baseline
 EOF
 }
