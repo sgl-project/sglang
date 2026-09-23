@@ -28,7 +28,6 @@ if TYPE_CHECKING:
     SGLANG_DIFFUSION_DEBUG_HOST_MEMORY: bool = False
     SGLANG_DIFFUSION_DEBUG_LAYERWISE_TIMING: bool = False
     SGLANG_DIFFUSION_DISABLE_LORA_MERGE_CACHE: bool = False
-    SGLANG_DIFFUSION_WORKER_MULTIPROC_METHOD: str = "fork"
     SGLANG_DIFFUSION_TARGET_DEVICE: str = "cuda"
     SGLANG_DIFFUSION_PLATFORM_OVERRIDE: str = ""
     SGLANG_EXTERNAL_MODEL_PACKAGE: str = ""
@@ -48,6 +47,7 @@ if TYPE_CHECKING:
     SGLANG_DIFFUSION_DISABLE_AUTO_RESIDENCY: bool = False
     SGLANG_DIFFUSION_MINIMAX_H3_ADALN_GPU_PLANS: int = 64
     SGLANG_DIFFUSION_MINIMAX_H3_ADALN_FP32: bool = False
+    SGLANG_DIFFUSION_MINIMAX_H3_PDD_HEADS: str | None = None
     SGLANG_DIFFUSION_CFG_GATE_STEP: float = 1.0
     # cache-dit env vars (primary transformer)
     # on by default; engages only on 2 ranks with peer-to-peer access and falls
@@ -69,6 +69,11 @@ if TYPE_CHECKING:
     SGLANG_CACHE_DIT_MC: int = 3
     SGLANG_CACHE_DIT_TAYLORSEER: bool = False
     SGLANG_CACHE_DIT_TS_ORDER: int = 1
+    SGLANG_CACHE_DIT_DMD: bool = False
+    SGLANG_CACHE_DIT_DMD_HISTORY: int = 6
+    SGLANG_CACHE_DIT_DMD_RANK: int = 0
+    SGLANG_CACHE_DIT_DMD_RIDGE: float = 1e-8
+    SGLANG_CACHE_DIT_DMD_SVD_PRECISION: str = "medium"
     SGLANG_CACHE_DIT_SCM_PRESET: str = "none"
     SGLANG_CACHE_DIT_SCM_COMPUTE_BINS: str | None = None
     SGLANG_CACHE_DIT_SCM_CACHE_BINS: str | None = None
@@ -81,6 +86,11 @@ if TYPE_CHECKING:
     SGLANG_CACHE_DIT_SECONDARY_MC: int = 3
     SGLANG_CACHE_DIT_SECONDARY_TAYLORSEER: bool = False
     SGLANG_CACHE_DIT_SECONDARY_TS_ORDER: int = 1
+    SGLANG_CACHE_DIT_SECONDARY_DMD: bool = False
+    SGLANG_CACHE_DIT_SECONDARY_DMD_HISTORY: int = 6
+    SGLANG_CACHE_DIT_SECONDARY_DMD_RANK: int = 0
+    SGLANG_CACHE_DIT_SECONDARY_DMD_RIDGE: float = 1e-8
+    SGLANG_CACHE_DIT_SECONDARY_DMD_SVD_PRECISION: str = "medium"
     # model loading
     SGLANG_USE_RUNAI_MODEL_STREAMER: bool = True
     SGLANG_LINGBOT_ENABLE_INTERACTIVE_KV_WINDOW: bool = False
@@ -243,13 +253,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "SGLANG_DIFFUSION_MXFP8_FA_HEAD_CHUNK_SIZE": _lazy_int(
         "SGLANG_DIFFUSION_MXFP8_FA_HEAD_CHUNK_SIZE", 4
     ),
-    # Use dedicated multiprocess context for workers.
-    # Both spawn and fork work
-    "SGLANG_DIFFUSION_WORKER_MULTIPROC_METHOD": _lazy_str(
-        "SGLANG_DIFFUSION_WORKER_MULTIPROC_METHOD", "fork"
-    ),
-    # Internal per-worker platform override used by disaggregated role launch.
-    # Empty means normal platform auto-detection.
+    # Select a built-in platform or an installed platform entry point.
+    # Empty means automatic plugin activation followed by built-in detection.
     "SGLANG_DIFFUSION_PLATFORM_OVERRIDE": _lazy_str(
         "SGLANG_DIFFUSION_PLATFORM_OVERRIDE", ""
     ),
@@ -323,6 +328,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "SGLANG_DIFFUSION_CFG_GATE_STEP": _lazy_float(
         "SGLANG_DIFFUSION_CFG_GATE_STEP", 1.0
     ),
+    # Path to a Parallel Decoding Distillation head stack (one fused output head
+    # per denoise step, produced by fuse_minimax_h3_pdd_heads.py). Set only when serving a
+    # PDD-distilled checkpoint; an ordinary run leaves the projection alone.
+    "SGLANG_DIFFUSION_MINIMAX_H3_PDD_HEADS": _lazy_str(
+        "SGLANG_DIFFUSION_MINIMAX_H3_PDD_HEADS"
+    ),
     "SGLANG_DIFFUSION_VAE_CHANNELS_LAST_3D": _lazy_str(
         "SGLANG_DIFFUSION_VAE_CHANNELS_LAST_3D", "auto"
     ),
@@ -389,6 +400,19 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "SGLANG_CACHE_DIT_TAYLORSEER": _lazy_bool("SGLANG_CACHE_DIT_TAYLORSEER", "false"),
     # TaylorSeer order (1 or 2)
     "SGLANG_CACHE_DIT_TS_ORDER": _lazy_int("SGLANG_CACHE_DIT_TS_ORDER", 1),
+    # Enable DMD (Dynamic Mode Decomposition) calibrator (mutually exclusive
+    # with TaylorSeer). DMD forecasts Bn residuals via an exponential basis.
+    "SGLANG_CACHE_DIT_DMD": _lazy_bool("SGLANG_CACHE_DIT_DMD", "false"),
+    # DMD snapshot window length (>= 4 uniformly spaced snapshots to engage)
+    "SGLANG_CACHE_DIT_DMD_HISTORY": _lazy_int("SGLANG_CACHE_DIT_DMD_HISTORY", 6),
+    # DMD SVD truncation rank (0 = automatic)
+    "SGLANG_CACHE_DIT_DMD_RANK": _lazy_int("SGLANG_CACHE_DIT_DMD_RANK", 0),
+    # DMD Tikhonov regularisation term added to inverted singular values
+    "SGLANG_CACHE_DIT_DMD_RIDGE": _lazy_float("SGLANG_CACHE_DIT_DMD_RIDGE", 1e-8),
+    # DMD SVD precision mode: low, medium, high
+    "SGLANG_CACHE_DIT_DMD_SVD_PRECISION": _lazy_str(
+        "SGLANG_CACHE_DIT_DMD_SVD_PRECISION", "medium"
+    ),
     # SCM preset: none, slow, medium, fast, ultra
     "SGLANG_CACHE_DIT_SCM_PRESET": _lazy_str("SGLANG_CACHE_DIT_SCM_PRESET", "none"),
     # SCM custom compute bins (e.g., "8,3,3,2,2")
@@ -465,6 +489,10 @@ _CACHE_DIT_SECONDARY_CONFIGS = [
     ("RDT", float, "0.24"),
     ("MC", int, "3"),
     ("TS_ORDER", int, "1"),
+    ("DMD_HISTORY", int, "6"),
+    ("DMD_RANK", int, "0"),
+    ("DMD_RIDGE", float, "1e-8"),
+    ("DMD_SVD_PRECISION", str, "medium"),
 ]
 
 
@@ -497,6 +525,17 @@ def _secondary_taylorseer_getter():
 environment_variables["SGLANG_CACHE_DIT_SECONDARY_TAYLORSEER"] = (
     _secondary_taylorseer_getter
 )
+
+
+# Special handling for boolean secondary var (DMD)
+def _secondary_dmd_getter():
+    return get_bool_env_var(
+        "SGLANG_CACHE_DIT_SECONDARY_DMD",
+        default=os.getenv("SGLANG_CACHE_DIT_DMD", "false"),
+    )
+
+
+environment_variables["SGLANG_CACHE_DIT_SECONDARY_DMD"] = _secondary_dmd_getter
 
 
 # end-env-vars-definition
