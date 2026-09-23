@@ -97,10 +97,11 @@ class WeightChecker:
         action: str,
         allow_quant_error: bool = False,
         skip_tensor_list: Optional[List[str]] = None,
+        names: Optional[List[str]] = None,
     ) -> Optional[Dict]:
         logger.info(
             f"[WeightChecker] handle action={action} "
-            f"allow_quant_error={allow_quant_error} skip_tensor_list={skip_tensor_list}"
+            f"allow_quant_error={allow_quant_error} skip_tensor_list={skip_tensor_list} names={names}"
         )
         if action == "snapshot":
             return self._snapshot()
@@ -112,6 +113,8 @@ class WeightChecker:
             )
         elif action == "checksum":
             return self._compute_checksum(skip_tensor_list)
+        elif action == "raw_checksum":
+            return self._compute_raw_checksum(names)
         else:
             raise Exception(f"Unsupported {action=}")
 
@@ -206,6 +209,19 @@ class WeightChecker:
         )
         return info.model_dump()
 
+    def _compute_raw_checksum(self, names: Optional[List[str]]) -> Dict:
+        params = dict(self._get_model().named_parameters())
+        checksums = {
+            name: _sha256_tensor(params[name].data)
+            for name in (params if names is None else names)
+        }
+        info = ChecksumInfo(
+            checksums=checksums,
+            per_gpu_checksum=overall_checksum(checksums),
+            parallelism_info=self._parallelism_info(),
+        )
+        return info.model_dump()
+
     def _parallelism_info(self) -> ParallelismInfo:
         ps = self._ps
         return ParallelismInfo(
@@ -227,6 +243,12 @@ class WeightChecker:
 
 def _hash_tensor(t: torch.Tensor) -> str:
     return f"{tensor_hash(t):016x}"
+
+
+def _sha256_tensor(t: torch.Tensor) -> str:
+    return hashlib.sha256(
+        t.detach().cpu().contiguous().flatten().view(torch.uint8).numpy()
+    ).hexdigest()
 
 
 def _check_tensors(
