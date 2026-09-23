@@ -391,6 +391,22 @@ pub(crate) fn router_and_sweeper() -> (Router, impl std::future::Future<Output =
 #[cfg(test)]
 mod tests {
     #[test]
+    fn mixed_rejection_sampling_flags_stay_unknown() {
+        let (_rt, addr) = start_on_free_port();
+        for flag in [false, true, true] {
+            let body = put_route(serde_json::json!({"speculative_use_rejection_sampling": flag}));
+            assert_eq!(request(addr, "PUT", "/route", Some(&body)).0, 200);
+        }
+        let (status, body) = request(addr, "GET", SENTINEL, None);
+        assert_eq!(status, 200);
+        let info: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(
+            info.get("speculative_use_rejection_sampling"),
+            Some(&serde_json::Value::Null),
+        );
+    }
+
+    #[test]
     fn rejection_sampling_flag_round_trip() {
         for enabled in [Some(false), Some(true), None] {
             let (_rt, addr) = start_on_free_port();
