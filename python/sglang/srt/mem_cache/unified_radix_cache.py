@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import atexit
+import json
 import logging
+import os
 import threading
 import time
 from dataclasses import replace
@@ -157,6 +159,33 @@ class _OngoingPrefetch(NamedTuple):
     operation: PrefetchOperation
     anchor_lock_params: DecLockRefParams
     comp_xfers: dict[ComponentType, list[PoolTransfer]]
+
+
+_RETREAT_TRACE_PATH = os.environ.get("SGLANG_RETREAT_TRACE", "")
+
+
+def _retreat_trace_log(req, result: MatchResult) -> None:
+    # Observability for the Mamba/GDN tail-retreat path (RFC sgl-project#40865):
+    # per-match record of the pre-retreat Full-KV hit (full_kv_hit), the
+    # post-retreat accepted boundary (accepted), and the branching checkpoint
+    # the scheduler will force-track. accepted << full_kv_hit means the hit
+    # was collapsed by a missing/evicted Mamba checkpoint and the gap
+    # [accepted, full_kv_hit) is re-prefilled through ALL layers today.
+    try:
+        entry = {
+            "ts": time.time(),
+            "rid": getattr(req, "rid", None),
+            "prompt_len": len(req.origin_input_ids),
+            "full_kv_hit": result.full_kv_hit_length,
+            "accepted": len(result.device_indices) + result.host_hit_length,
+            "branching": result.mamba_branching_seqlen,
+            "host_hit": result.host_hit_length,
+            "mamba_host_hit": result.mamba_host_hit_length,
+        }
+        with open(_RETREAT_TRACE_PATH, "a") as f:
+            f.write(json.dumps(entry) + "\n")
+    except Exception:
+        pass
 
 
 class UnifiedRadixCache(BasePrefixCache):
@@ -569,6 +598,8 @@ class UnifiedRadixCache(BasePrefixCache):
             result = component.finalize_match_result_in_cache(params, result)
         # Finalizers must not emit actions; the walk's were applied above.
         assert not result.cache_actions
+        if _RETREAT_TRACE_PATH and params.req is not None:
+            _retreat_trace_log(params.req, result)
         if self.linker is not None and params.req is not None:
             result = self.linker.match(params.key, params.req, result)
         return result

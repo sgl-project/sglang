@@ -1611,6 +1611,16 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             )
         )
 
+        # Micro-benchmark only: skip the whole full-attention layer (attn + MLP)
+        # to measure the GDN-only replay cost of the tail-replay proposal
+        # (RFC sgl-project#40865). Not for production use.
+        if (
+            _SKIP_FA_LAYERS
+            and not forward_batch.forward_mode.is_idle()
+            and hidden_states.shape[0] > 0
+        ):
+            return hidden_states, residual
+
         # fused AR+quant hands down a (fp8, scale) / (bf16, fp8, scale) tuple
         hs = hidden_states[0] if isinstance(hidden_states, tuple) else hidden_states
         if not forward_batch.forward_mode.is_idle() and hs.shape[0] > 0:
@@ -1676,6 +1686,11 @@ ALL_DECODER_LAYER_TYPES = {
     "attention": Qwen3_5AttentionDecoderLayer,
     "linear_attention": Qwen3_5LinearDecoderLayer,
 }
+
+# Micro-benchmark switch for the tail-replay cost model (RFC sgl-project#40865):
+# when "1", every full-attention decoder layer returns its input unchanged, so
+# measured prefill time approximates embed + GDN layers + lm_head only.
+_SKIP_FA_LAYERS = os.environ.get("SGLANG_SKIP_FA_LAYERS", "0") == "1"
 
 # ModelOpt FP4 checkpoints bake the per-layer KV-cache scales under the HF
 # attention projections; in sglang they live on RadixAttention. Apply this to the
