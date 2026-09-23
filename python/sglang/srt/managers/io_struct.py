@@ -412,6 +412,11 @@ class GenerateReqInput:
             self._normalize_batch_inputs()
 
         self._validate_rid_uniqueness()
+        if self.input_embeds is not None and self.session_params is not None:
+            raise ValueError(
+                "input_embeds does not support session_params. "
+                "Send input_embeds without a session, or use input_ids for sessions."
+            )
 
     def _validate_inputs(self):
         """Validate that the input configuration is valid."""

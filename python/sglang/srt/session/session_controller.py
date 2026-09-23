@@ -211,8 +211,6 @@ class Session:
     ):
         assert req.session_params is not None
         session_params = req.session_params
-        if req.input_embeds is not None:
-            req.input_ids = array("q", [1]) * len(req.input_embeds)
 
         last_req_node = None
         last_req = None
@@ -305,7 +303,6 @@ class Session:
             origin_input_ids_unpadded=input_ids_unpadded,
             sampling_params=req.sampling_params,
             lora_id=req.lora_id,
-            input_embeds=req.input_embeds,
             session=self,
             custom_logit_processor=req.custom_logit_processor,
             stream=req.stream,
