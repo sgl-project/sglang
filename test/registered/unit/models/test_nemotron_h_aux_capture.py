@@ -8,7 +8,7 @@ from torch import nn
 from sglang.srt.layers import communicator as comm
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.models import nemotron_h as model
-from sglang.srt.models.nemotron_h_utils import make_layer_communicator
+from sglang.srt.models.nemotron_h_utils import feeds_mlp_layer
 from sglang.srt.runtime_context import get_context, get_flags, get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -37,10 +37,11 @@ class _Mixer(nn.Module):
         return hidden_states * self.scale
 
 
-def _build(pattern, tp, dp_enabled, capture):
+def _build(pattern, tp, capture):
+    config = SimpleNamespace(hybrid_override_pattern=pattern)
     instance = model.NemotronHModel.__new__(model.NemotronHModel)
     nn.Module.__init__(instance)
-    instance.config = SimpleNamespace(hybrid_override_pattern=pattern)
+    instance.config = config
     instance.pp_group = SimpleNamespace(is_first_rank=True, is_last_rank=True)
     instance.start_layer, instance.end_layer = 0, len(pattern)
     instance.norm_f = _Norm()
@@ -51,13 +52,14 @@ def _build(pattern, tp, dp_enabled, capture):
         layer = cls.__new__(cls)
         nn.Module.__init__(layer)
         layer.norm = _Norm()
-        layer.prev_layer_is_attn = i > 0 and pattern[i - 1] in "M*"
-        layer.layer_communicator = make_layer_communicator(
-            layer.norm, for_attn=kind in "M*", is_last_layer=i == len(pattern) - 1
-        )
-        layer.mixer = _Mixer(
-            (0.5 / tp if dp_enabled else 0.5) if kind in "M*" else 0.25
-        )
+        if kind in "M*":
+            layer.reduces_output = not feeds_mlp_layer(pattern, i)
+            layer._init_layer_communicator(config, i)
+            # A mixer feeding an MLP layer hands over its TP partial.
+            layer.mixer = _Mixer(0.5 if layer.reduces_output else 0.5 / tp)
+        else:
+            layer._init_layer_communicator(config, i, is_sparse=False)
+            layer.mixer = _Mixer(0.25)
         if kind == "M":
             layer._forward_mamba = lambda h, batch, mixer=layer.mixer: mixer(h)
         layers.append(layer)
@@ -69,7 +71,7 @@ class TestNemotronAuxCapture(CustomTestCase):
     def test_capture_reduces_only_its_snapshot(self):
         """Each auxiliary snapshot equals the full hidden state at its boundary,
         also under DP attention and after later norms update the residual in place."""
-        for pattern in ("*-", "M-", "**-", "*"):
+        for pattern in ("*-", "M-", "**-", "*", "*--", "-*"):
             for dp_enabled, tp in ((True, 2), (True, 1), (False, 2)):
                 with self.subTest(pattern=pattern, dp_enabled=dp_enabled, tp=tp):
                     self._check(pattern, dp_enabled, tp)
@@ -112,10 +114,10 @@ class TestNemotronAuxCapture(CustomTestCase):
             patch.object(comm, "apply_flashinfer_allreduce_fusion", return_value=False),
             patch.object(comm, "apply_aiter_all_reduce_fusion", return_value=False),
         ):
-            baseline = _build(pattern, tp, dp_enabled, False)(
+            baseline = _build(pattern, tp, False)(
                 batch.input_ids, torch.arange(2), batch, inputs_embeds=inputs.clone()
             )
-            output, snapshots = _build(pattern, tp, dp_enabled, True)(
+            output, snapshots = _build(pattern, tp, True)(
                 batch.input_ids, torch.arange(2), batch, inputs_embeds=inputs.clone()
             )
         torch.testing.assert_close(output, baseline)

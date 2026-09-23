@@ -8,7 +8,6 @@ from torch import nn
 from sglang.srt.layers import communicator as comm
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.models import nemotron_h_mtp
-from sglang.srt.models.nemotron_h_utils import make_layer_communicator
 from sglang.srt.runtime_context import get_context, get_flags, get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -69,8 +68,11 @@ class TestNemotronMTPReduction(CustomTestCase):
                     layer.has_start_projections = False
                     layer.has_end_norm = False
                     layer.mixer = nn.Identity()
-                    layer.layer_communicator = make_layer_communicator(
-                        _Norm(), for_attn=False, is_last_layer=True
+                    layer.norm = _Norm()
+                    layer._init_layer_communicator(
+                        SimpleNamespace(hybrid_override_pattern="*E"),
+                        1,
+                        is_sparse=False,
                     )
                     partial = torch.tensor([[1.0, 2.0], [3.0, 4.0]])
                     residual = torch.tensor([[7.0, 3.0], [5.0, 9.0]])
