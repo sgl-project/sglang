@@ -56,11 +56,7 @@ class TestDeepseekV3MTP(GSM8KMixin, DefaultServerBase):
                 f"{acc_length=:.2f}\n"
                 f"{speed=:.2f} token/s\n"
             )
-            self.assertGreater(acc_length, 2.8)
-            if is_in_amd_ci():
-                self.assertGreater(speed, 15)
-            else:
-                self.assertGreater(speed, 130)
+            self.assertGreater(speed, 130)
 
 
 if __name__ == "__main__":

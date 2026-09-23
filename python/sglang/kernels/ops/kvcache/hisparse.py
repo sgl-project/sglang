@@ -174,6 +174,8 @@ def _jit_sparse_module(
     hot_buffer_size: int,
     is_mla: bool = False,
     is_dsv4_layout: bool = False,
+    top_k_block_size: int = 1,
+    top_k_is_blocks: bool = False,
     record_miss_plan: bool = False,
     skip_io: bool = False,
 ) -> Module:
@@ -185,6 +187,8 @@ def _jit_sparse_module(
         hot_buffer_size,
         is_mla,
         is_dsv4_layout,
+        top_k_block_size,
+        top_k_is_blocks,
         record_miss_plan,
         skip_io,
     )
@@ -195,6 +199,8 @@ def _jit_sparse_module(
         hot_buffer_size,
         is_mla,
         is_dsv4_layout,
+        top_k_block_size,
+        top_k_is_blocks,
         record_miss_plan,
         skip_io,
     )
@@ -308,7 +314,7 @@ def _load_cache_to_device_buffer_mla(
         skip_io=skip_io,
     )
 
-    empty = torch.empty(0)
+    empty = torch.empty(0, device=top_k_tokens.device)
 
     if num_real_reqs is None:
         num_real_reqs = torch.tensor(
@@ -396,6 +402,83 @@ def load_cache_to_device_buffer_mla(
         miss_dst=miss_dst,
         miss_count=miss_count,
         skip_io=skip_io,
+    )
+
+
+def load_blocks_to_device_buffer_mha(
+    top_k_blocks: torch.Tensor,
+    device_buffer_tokens: torch.Tensor,
+    host_cache_locs: torch.Tensor,
+    device_buffer_locs: torch.Tensor,
+    host_cache_k: torch.Tensor,
+    host_cache_v: torch.Tensor,
+    device_buffer_k: torch.Tensor,
+    device_buffer_v: torch.Tensor,
+    top_k_device_locs: torch.Tensor,
+    req_pool_indices: torch.Tensor,
+    seq_lens: torch.Tensor,
+    lru_slots: torch.Tensor,
+    item_size_bytes: int,
+    hot_buffer_size: int,
+    sparse_block_size: int,
+    page_size: int = 1,
+    block_size: int = 256,
+    num_real_reqs: torch.Tensor | None = None,
+    skip_io: bool = False,
+) -> None:
+    """Swap block-selected MHA K/V into the HiSparse device pool."""
+    num_top_k_blocks = top_k_blocks.size(1)
+    num_top_k_tokens = num_top_k_blocks * sparse_block_size
+    assert hot_buffer_size >= num_top_k_tokens, (
+        f"hot_buffer_size ({hot_buffer_size}) must be >= selected tokens "
+        f"({num_top_k_tokens})"
+    )
+    assert top_k_device_locs.size(1) >= num_top_k_tokens
+    k_stride = host_cache_k.stride(0) * host_cache_k.element_size()
+    v_stride = host_cache_v.stride(0) * host_cache_v.element_size()
+    assert k_stride == v_stride == item_size_bytes, (
+        "K/V token strides must equal item_size_bytes: "
+        f"k_stride={k_stride}, v_stride={v_stride}, "
+        f"item_size_bytes={item_size_bytes}"
+    )
+
+    module = _jit_sparse_module(
+        item_size_bytes,
+        block_size,
+        num_top_k_blocks,
+        hot_buffer_size,
+        is_mla=False,
+        is_dsv4_layout=False,
+        top_k_block_size=sparse_block_size,
+        top_k_is_blocks=True,
+        record_miss_plan=False,
+        skip_io=skip_io,
+    )
+    empty = torch.empty(0, device=top_k_blocks.device)
+    if num_real_reqs is None:
+        num_real_reqs = torch.tensor(
+            [top_k_blocks.size(0)], dtype=torch.int32, device=top_k_blocks.device
+        )
+
+    module.load_cache_to_device_buffer(
+        top_k_blocks,
+        device_buffer_tokens,
+        host_cache_locs,
+        device_buffer_locs,
+        host_cache_k,
+        host_cache_v,
+        device_buffer_k,
+        device_buffer_v,
+        top_k_device_locs,
+        req_pool_indices,
+        seq_lens,
+        lru_slots,
+        num_real_reqs,
+        page_size,
+        item_size_bytes,
+        empty,
+        empty,
+        empty,
     )
 
 
