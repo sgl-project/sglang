@@ -911,12 +911,165 @@ fn request_internal_mamba_backup(tc: &mut UnifiedTreeCore<Vec<i64>>, parent: Nod
     assert_eq!(tc.mamba_evictable_size(), 2);
 }
 
+fn check_mamba_restored_during_expanded_swa_backup(pin_ancestor: bool) {
+    let mut tc = UnifiedTreeCore::new(
+        CacheInitParams {
+            page_size: 1,
+            swa_sliding_window_size: Some(2),
+            mamba_cache_chunk_size: Some(256),
+            enable_hicache: true,
+            has_swa_host_pool: true,
+            is_write_back: true,
+            ..Default::default()
+        },
+        vec![FULL, SWA, MAMBA],
+    );
+    let [a, b, c] = chain::<3>(&mut tc);
+    let [a_id, b_id, c_id] = [a, b, c].map(|idx| tc.arena.node(idx).id);
+    // State after SWA eviction and repair: Full backups survived, SWA A/B
+    // needs an expanded backup, and the old Mamba A was cascade-evicted.
+    for (idx, full, swa) in [(a, 10i64, 20i64), (b, 11, 21), (c, 12, 22)] {
+        let id = tc.arena.node(idx).id;
+        tc.arena
+            .set_device_value(idx, FULL, Tensor::from_slice(&[full]));
+        tc.inc_evictable_size(FULL, 1);
+        tc.set_component_device_value(id, SWA, Tensor::from_slice(&[swa]))
+            .unwrap();
+        set_full_host(&mut tc, idx, full + 1000);
+        tc.mark_write_through_pending(vec![id], id).unwrap();
+        tc.finish_write_through(vec![id], id).unwrap();
+        tc.update_evictable_leaf_sets_(idx);
+    }
+    set_mamba_device(&mut tc, b, 202);
+    set_mamba_device(&mut tc, c, 203);
+    let (full, mut transfers) = tc.build_backup_spec(b_id).unwrap();
+    assert_eq!(full.numel(), 0);
+    assert_eq!(transfers[&SWA][0].nodes_to_load, Some(vec![a_id, b_id]));
+    assert!(
+        transfers[&MAMBA][0]
+            .device_indices
+            .as_ref()
+            .unwrap()
+            .equal(&Tensor::from_slice(&[202i64]))
+    );
+    for xfers in transfers.values_mut() {
+        for transfer in xfers {
+            transfer.host_indices = Some(transfer.device_indices.as_ref().unwrap() + 1000);
+        }
+    }
+    tc.commit_backup(b_id, full, transfers).unwrap();
+    let release_params = |receipt: IncLockRefResult| DecLockRefParams {
+        node_id: receipt.node_id,
+        swa_uuid_for_lock: receipt.swa_uuid_for_lock,
+        swa_uuid_for_host_lock: receipt.swa_uuid_for_host_lock,
+        skipped_lock_components: receipt.skipped_lock_components,
+    };
+    let backup_lock = release_params(tc.inc_lock_ref(b_id, ComponentSet::EMPTY).unwrap());
+    tc.mark_write_through_pending(vec![a_id, b_id], b_id)
+        .unwrap();
+    assert!(!tc.arena.has_device_value(a, MAMBA));
+
+    // A separate request finishes A while B's transfer is pending. Its new
+    // Mamba checkpoint is not in the already-submitted DMA source tensor.
+    let inserted = tc.insert(&insert_params_mamba(&vec![1], &[90], Some(201)));
+    assert!(
+        !inserted
+            .cache_actions
+            .iter()
+            .any(|action| matches!(action, CacheAction::BackupKV(_)))
+    );
+    assert!(
+        tc.arena
+            .device_value(a, MAMBA)
+            .equal(&Tensor::from_slice(&[201i64]))
+    );
+    assert_eq!(tc.arena.node(a).write_through_pending_id, Some(b_id));
+    assert_eq!(tc.arena.device_lock_ref(a, MAMBA), 0);
+    assert_eq!(tc.arena.device_lock_ref(b, MAMBA), 1);
+    assert_eq!(tc.arena.device_lock_ref(a, SWA), 1);
+
+    let child_lock = release_params(tc.inc_lock_ref(c_id, ComponentSet::EMPTY).unwrap());
+    let ancestor_lock =
+        pin_ancestor.then(|| release_params(tc.inc_lock_ref(a_id, ComponentSet::EMPTY).unwrap()));
+    let mut active = vec![(b_id as i64, b_id), (c_id as i64, c_id)];
+    if pin_ancestor {
+        active.push((a_id as i64, a_id));
+    }
+    tc.sanity_check(&active, &[]);
+
+    tc.evict_device_start(MAMBA, 1);
+    let (next, step) = tc.evict_device_next_node(MAMBA, &HashMap::new());
+    tc.evict_device_end(MAMBA);
+    assert_eq!(next, None);
+    assert_eq!(step.mamba_backup_node_id, None);
+    assert_eq!(
+        step.tracker.get(&MAMBA).copied().unwrap_or(0),
+        usize::from(!pin_ancestor)
+    );
+    assert!(step.host_frees.is_empty());
+    if pin_ancestor {
+        assert!(step.device_frees.is_empty());
+    } else {
+        assert_eq!(step.device_frees.len(), 1);
+        assert_eq!(step.device_frees[&MAMBA].len(), 1);
+        assert!(step.device_frees[&MAMBA][0].equal(&Tensor::from_slice(&[201i64])));
+    }
+    assert!(
+        tc.arena
+            .device_value(b, MAMBA)
+            .equal(&Tensor::from_slice(&[202i64]))
+    );
+    tc.sanity_check(&active, &[]);
+
+    tc.finish_write_through(vec![a_id, b_id], b_id).unwrap();
+    tc.dec_lock_ref(b_id, &backup_lock, false).unwrap();
+    tc.evict_device_start(MAMBA, 1);
+    let (next, step) = tc.evict_device_next_node(MAMBA, &HashMap::new());
+    tc.evict_device_end(MAMBA);
+    assert_eq!(next, None);
+    assert_eq!(step.mamba_backup_node_id, None);
+    assert_eq!(step.tracker[&MAMBA], 1);
+    assert_eq!(step.device_frees.len(), 1);
+    assert_eq!(step.device_frees[&MAMBA].len(), 1);
+    assert!(step.device_frees[&MAMBA][0].equal(&Tensor::from_slice(&[202i64])));
+    assert!(step.host_frees.is_empty());
+    for (idx, full, swa) in [(a, 10i64, 20i64), (b, 11, 21), (c, 12, 22)] {
+        assert!(
+            tc.arena
+                .device_value(idx, FULL)
+                .equal(&Tensor::from_slice(&[full]))
+        );
+        assert!(
+            tc.arena
+                .device_value(idx, SWA)
+                .equal(&Tensor::from_slice(&[swa]))
+        );
+    }
+    tc.dec_lock_ref(c_id, &child_lock, false).unwrap();
+    if let Some(params) = ancestor_lock {
+        tc.dec_lock_ref(a_id, &params, false).unwrap();
+    }
+    tc.sanity_check(&[], &[]);
+}
+
+#[test]
+fn mamba_device_eviction_reclaims_state_restored_during_swa_backup() {
+    check_mamba_restored_during_expanded_swa_backup(false);
+}
+
+#[test]
+fn mamba_device_eviction_preserves_pins_during_expanded_swa_backup() {
+    check_mamba_restored_during_expanded_swa_backup(true);
+}
+
 fn commit_internal_mamba_backup(tc: &mut UnifiedTreeCore<Vec<i64>>, parent: NodeId) {
     let (full, mut transfers) = tc.build_backup_spec(parent).unwrap();
     assert!(full.equal(&Tensor::from_slice(&[10i64])));
     transfers.get_mut(&MAMBA).unwrap()[0].host_indices = Some(Tensor::from_slice(&[70i64]));
     tc.commit_backup(parent, Tensor::from_slice(&[100i64]), transfers)
         .unwrap();
+    tc.mark_write_through_pending(vec![parent], parent).unwrap();
+    tc.finish_write_through(vec![parent], parent).unwrap();
 }
 
 #[test]
@@ -1476,7 +1629,7 @@ fn load_back_commit_moves_the_node_onto_the_device_tier() {
 }
 
 #[test]
-fn mamba_device_eviction_skips_a_load_back_pinned_node() {
+fn mamba_device_eviction_preserves_a_locked_load_back_destination() {
     let mut tc = mamba_core(/* page_size = */ 1);
     tc.is_write_back = true;
     let [n] = chain::<1>(&mut tc);
@@ -1493,6 +1646,9 @@ fn mamba_device_eviction_skips_a_load_back_pinned_node() {
         comp_xfers,
     )
     .expect("live test node");
+    let receipt = tc
+        .inc_lock_ref(tc.arena.node(n).id, ComponentSet::EMPTY)
+        .expect("live test node");
 
     tc.evict_device_start(MAMBA, /* request_cnt = */ 1);
     let (next, _) = tc.evict_device_next_node(MAMBA, &HashMap::new());
@@ -1500,6 +1656,17 @@ fn mamba_device_eviction_skips_a_load_back_pinned_node() {
     tc.evict_device_end(MAMBA);
     assert!(tc.arena.has_device_value(n, MAMBA));
 
+    tc.dec_lock_ref(
+        tc.arena.node(n).id,
+        &DecLockRefParams {
+            node_id: receipt.node_id,
+            swa_uuid_for_lock: receipt.swa_uuid_for_lock,
+            swa_uuid_for_host_lock: receipt.swa_uuid_for_host_lock,
+            skipped_lock_components: receipt.skipped_lock_components,
+        },
+        false,
+    )
+    .expect("live test node");
     tc.finish_load_back(tc.arena.node(n).id)
         .expect("live test node");
     tc.evict_device_start(MAMBA, /* request_cnt = */ 1);
@@ -1508,39 +1675,222 @@ fn mamba_device_eviction_skips_a_load_back_pinned_node() {
     tc.evict_device_end(MAMBA);
 }
 
-#[test]
-fn mamba_host_eviction_skips_a_load_back_pinned_node() {
+fn check_mamba_device_restored_during_full_load_back(pin_ancestor: bool) {
     let mut tc = mamba_core(/* page_size = */ 1);
     tc.is_write_back = true;
+    tc.enable_hicache = true;
     let [a, b] = chain::<2>(&mut tc);
+    let [a_id, b_id] = [a, b].map(|idx| tc.arena.node(idx).id);
+    for (idx, full, mamba) in [(a, 10, 20), (b, 11, 21)] {
+        set_full_host(&mut tc, idx, full);
+        set_mamba_host(&mut tc, idx, mamba);
+        tc.host_lru_list_mut(MAMBA).insert_mru(idx);
+        tc.update_evictable_leaf_sets_(idx);
+    }
+    let release_params = |receipt: IncLockRefResult| DecLockRefParams {
+        node_id: receipt.node_id,
+        swa_uuid_for_lock: receipt.swa_uuid_for_lock,
+        swa_uuid_for_host_lock: receipt.swa_uuid_for_host_lock,
+        skipped_lock_components: receipt.skipped_lock_components,
+    };
+    let host_lock = release_params(tc.inc_host_lock_ref(b_id).unwrap());
+    let temporary_lock = release_params(tc.inc_lock_ref(b_id, ComponentSet::EMPTY).unwrap());
+    let (full, mut transfers) = tc.build_load_back_spec(b_id, None).unwrap();
+    assert_eq!(full.nodes_to_load, Some(vec![a_id, b_id]));
+    assert_eq!(transfers[&MAMBA][0].nodes_to_load, Some(vec![b_id]));
+    transfers.get_mut(&MAMBA).unwrap()[0].device_indices = Some(Tensor::from_slice(&[40i64]));
+    tc.dec_lock_ref(b_id, &temporary_lock, false).unwrap();
+    tc.commit_load_back(b_id, Tensor::from_slice(&[30i64, 31]), full, transfers)
+        .unwrap();
+    let pending_lock = release_params(tc.inc_lock_ref(b_id, ComponentSet::EMPTY).unwrap());
+    assert!(!tc.arena.has_device_value(a, MAMBA));
+
+    // A separate request restores A after the transfer selected only B's
+    // Mamba destination. A's Full row is still part of that pending load.
+    tc.insert(&insert_params_mamba(&vec![1], &[90], Some(41)));
+    assert!(
+        tc.arena
+            .device_value(a, MAMBA)
+            .equal(&Tensor::from_slice(&[41i64]))
+    );
+    assert!(tc.arena.node(a).is_load_back_pending());
+    assert_eq!(tc.arena.device_lock_ref(a, MAMBA), 0);
+    assert_eq!(tc.arena.device_lock_ref(b, MAMBA), 1);
+    let ancestor_lock =
+        pin_ancestor.then(|| release_params(tc.inc_lock_ref(a_id, ComponentSet::EMPTY).unwrap()));
+    let active: Vec<_> = ancestor_lock.iter().map(|_| (a_id as i64, a_id)).collect();
+    tc.sanity_check(&active, &[(b_id as i64, b_id)]);
+
+    tc.evict_device_start(MAMBA, 1);
+    let (next, step) = tc.evict_device_next_node(MAMBA, &HashMap::new());
+    tc.evict_device_end(MAMBA);
+    assert_eq!(next, None);
+    assert_eq!(step.mamba_backup_node_id, None);
+    assert_eq!(
+        step.tracker.get(&MAMBA).copied().unwrap_or(0),
+        usize::from(!pin_ancestor)
+    );
+    assert!(step.host_frees.is_empty());
+    if pin_ancestor {
+        assert!(step.device_frees.is_empty());
+    } else {
+        assert_eq!(step.device_frees.len(), 1);
+        assert_eq!(step.device_frees[&MAMBA].len(), 1);
+        assert!(step.device_frees[&MAMBA][0].equal(&Tensor::from_slice(&[41i64])));
+    }
+    assert_eq!(tc.arena.has_device_value(a, MAMBA), pin_ancestor);
+    assert!(
+        tc.arena
+            .device_value(b, MAMBA)
+            .equal(&Tensor::from_slice(&[40i64]))
+    );
+    assert!(
+        tc.arena
+            .device_value(a, FULL)
+            .equal(&Tensor::from_slice(&[30i64]))
+    );
+    assert!(
+        tc.arena
+            .device_value(b, FULL)
+            .equal(&Tensor::from_slice(&[31i64]))
+    );
+    tc.sanity_check(&active, &[(b_id as i64, b_id)]);
+
+    // The controller synchronizes the DMA before releasing this receipt.
+    tc.dec_lock_ref(b_id, &pending_lock, false).unwrap();
+    tc.dec_host_lock_ref(b_id, &host_lock).unwrap();
+    tc.finish_load_back(b_id).unwrap();
+    tc.evict_device_start(MAMBA, 1);
+    let (next, _) = tc.evict_device_next_node(MAMBA, &HashMap::new());
+    tc.evict_device_end(MAMBA);
+    assert_eq!(next, Some(b_id));
+    if let Some(params) = ancestor_lock {
+        tc.dec_lock_ref(a_id, &params, false).unwrap();
+    }
+    tc.sanity_check(&[], &[]);
+}
+
+#[test]
+fn mamba_device_eviction_reclaims_state_restored_during_full_load_back() {
+    check_mamba_device_restored_during_full_load_back(false);
+}
+
+#[test]
+fn mamba_device_eviction_preserves_pins_during_full_load_back() {
+    check_mamba_device_restored_during_full_load_back(true);
+}
+
+fn check_mamba_host_eviction_during_full_load_back(lock_ancestor_host: bool) {
+    let mut tc = mamba_core(/* page_size = */ 1);
+    tc.is_write_back = true;
+    tc.enable_hicache = true;
+    let [a, b] = chain::<2>(&mut tc);
+    let a_id = tc.arena.node(a).id;
+    let b_id = tc.arena.node(b).id;
     set_full_host(&mut tc, a, 10);
     set_full_host(&mut tc, b, 11);
     set_mamba_host(&mut tc, a, 20);
+    set_mamba_host(&mut tc, b, 21);
     tc.host_lru_list_mut(MAMBA).insert_mru(a);
-    let (kv_xfer, comp_xfers) = tc
-        .build_load_back_spec(tc.arena.node(b).id, /* req = */ None)
-        .expect("live test node");
-    assert!(comp_xfers.is_empty());
-    tc.commit_load_back(
-        tc.arena.node(b).id,
-        Tensor::from_slice(&[30i64, 31]),
-        kv_xfer,
-        comp_xfers,
-    )
-    .expect("live test node");
+    tc.host_lru_list_mut(MAMBA).insert_mru(b);
+    tc.update_evictable_leaf_sets_(a);
+    tc.update_evictable_leaf_sets_(b);
+    let release_params = |receipt: IncLockRefResult| DecLockRefParams {
+        node_id: receipt.node_id,
+        swa_uuid_for_lock: receipt.swa_uuid_for_lock,
+        swa_uuid_for_host_lock: receipt.swa_uuid_for_host_lock,
+        skipped_lock_components: receipt.skipped_lock_components,
+    };
+    let ancestor_host_lock = lock_ancestor_host
+        .then(|| release_params(tc.inc_host_lock_ref(a_id).expect("live ancestor")));
+    // Mirror the controller: protect host sources, build under a temporary
+    // device lock, then replace that lock after committing the allocated rows.
+    let host_lock = release_params(tc.inc_host_lock_ref(b_id).expect("live anchor"));
+    let before_lock = release_params(
+        tc.inc_lock_ref(b_id, ComponentSet::EMPTY)
+            .expect("live anchor"),
+    );
+    let (kv_xfer, mut comp_xfers) = tc
+        .build_load_back_spec(b_id, /* req = */ None)
+        .expect("live anchor");
+    assert_eq!(kv_xfer.nodes_to_load, Some(vec![a_id, b_id]));
+    let mamba_xfer = &mut comp_xfers.get_mut(&MAMBA).unwrap()[0];
+    assert_eq!(mamba_xfer.nodes_to_load, Some(vec![b_id]));
+    assert!(
+        mamba_xfer
+            .host_indices
+            .as_ref()
+            .unwrap()
+            .equal(&Tensor::from_slice(&[21i64]))
+    );
+    mamba_xfer.device_indices = Some(Tensor::from_slice(&[40i64]));
+    tc.dec_lock_ref(b_id, &before_lock, false)
+        .expect("live anchor");
+    tc.commit_load_back(b_id, Tensor::from_slice(&[30i64, 31]), kv_xfer, comp_xfers)
+        .expect("live anchor");
+    let pending_lock = release_params(
+        tc.inc_lock_ref(b_id, ComponentSet::EMPTY)
+            .expect("live anchor"),
+    );
+    assert!(tc.arena.node(a).is_load_back_pending());
+    assert!(tc.arena.node(b).is_load_back_pending());
+    assert_eq!(
+        tc.arena.host_lock_ref(a, MAMBA),
+        u32::from(lock_ancestor_host)
+    );
+    assert_eq!(tc.arena.host_lock_ref(b, MAMBA), 1);
+    tc.sanity_check(&[], &[(b_id as i64, b_id)]);
 
     let result = tc.drive_host_eviction(MAMBA, /* num_tokens = */ 1);
-    assert_eq!(result.tracker[&MAMBA], 0);
-    assert!(result.host_frees.is_empty());
-    assert!(tc.arena.has_host_value(a, MAMBA));
+    assert_eq!(result.tracker[&MAMBA], usize::from(!lock_ancestor_host));
+    assert!(result.device_frees.is_empty());
+    if lock_ancestor_host {
+        assert!(result.host_frees.is_empty());
+    } else {
+        assert_eq!(result.host_frees.len(), 1);
+        assert!(result.host_frees[&MAMBA][0].equal(&Tensor::from_slice(&[20i64])));
+    }
+    assert_eq!(tc.arena.has_host_value(a, MAMBA), lock_ancestor_host);
+    assert!(tc.arena.has_host_value(b, MAMBA));
+    // The Full transfer still owns both sources even when A's unused Mamba
+    // host slot can be reclaimed independently.
+    let full_pressure = tc.drive_host_eviction(FULL, 2);
+    assert_eq!(full_pressure.tracker[&FULL], 0);
+    assert!(full_pressure.host_frees.is_empty());
+    assert!(tc.arena.has_host_value(a, FULL));
+    assert!(tc.arena.has_host_value(b, FULL));
+    tc.sanity_check(&[], &[(b_id as i64, b_id)]);
 
-    tc.finish_load_back(tc.arena.node(b).id)
-        .expect("live test node");
+    tc.dec_lock_ref(b_id, &pending_lock, false)
+        .expect("live anchor");
+    tc.dec_host_lock_ref(b_id, &host_lock).expect("live anchor");
+    tc.finish_load_back(b_id).expect("live anchor");
+    if let Some(params) = ancestor_host_lock {
+        tc.dec_host_lock_ref(a_id, &params).expect("live ancestor");
+    }
     let result = tc.drive_host_eviction(MAMBA, /* num_tokens = */ 1);
-    assert_eq!(result.tracker[&MAMBA], 1);
-    assert_eq!(result.host_frees[&MAMBA].len(), 1);
+    assert_eq!(result.tracker[&MAMBA], usize::from(lock_ancestor_host));
+    if lock_ancestor_host {
+        assert_eq!(result.host_frees[&MAMBA].len(), 1);
+        assert!(result.host_frees[&MAMBA][0].equal(&Tensor::from_slice(&[20i64])));
+    } else {
+        assert!(result.host_frees.is_empty());
+    }
     assert!(!tc.arena.has_host_value(a, MAMBA));
+    assert!(tc.arena.has_host_value(b, MAMBA));
+    assert!(!tc.arena.node(a).is_load_back_pending());
+    assert!(!tc.arena.node(b).is_load_back_pending());
     tc.sanity_check(&[], &[]);
+}
+
+#[test]
+fn mamba_host_eviction_reclaims_unused_ancestor_during_full_load_back() {
+    check_mamba_host_eviction_during_full_load_back(false);
+}
+
+#[test]
+fn mamba_host_eviction_preserves_locked_ancestor_during_full_load_back() {
+    check_mamba_host_eviction_during_full_load_back(true);
 }
 
 #[test]

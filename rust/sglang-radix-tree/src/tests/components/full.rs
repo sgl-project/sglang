@@ -406,6 +406,10 @@ fn host_drive_reclaims_coexisting_host_values_while_sparing_the_device_leaf() {
     .expect("live test node");
     tc.commit_backup(leaf_handle, Tensor::from_slice(&[22i64]), HashMap::new())
         .expect("live test node");
+    for handle in [tc.arena.node(parent).id, leaf_handle] {
+        tc.mark_write_through_pending(vec![handle], handle).unwrap();
+        tc.finish_write_through(vec![handle], handle).unwrap();
+    }
     assert!(tc.evictable_host_leaves.is_empty());
 
     let (mut tr, mut df, mut hf) = (tracker(), frees(), frees());
@@ -467,6 +471,75 @@ fn host_reclaim_keeps_insertion_order_across_calls_and_rebackup() {
 }
 
 #[test]
+fn host_reclaim_orders_pending_internal_split_fragments_by_ack() {
+    let mut tc = write_back_core();
+    insert(&mut tc, &vec![1, 2, 3, 4], &[10, 11, 12, 13]);
+    insert(&mut tc, &vec![1, 2, 3, 4, 5], &[10, 11, 12, 13, 14]);
+    insert(&mut tc, &vec![7, 8], &[17, 18]);
+    let a = tc
+        .match_prefix(&match_params(&vec![1, 2, 3, 4]))
+        .best_match_node_id;
+    let b = tc
+        .match_prefix(&match_params(&vec![7, 8]))
+        .best_match_node_id;
+    for (handle, slots) in [(a, vec![20i64, 21, 22, 23]), (b, vec![27, 28])] {
+        tc.commit_backup(handle, Tensor::from_slice(&slots), HashMap::new())
+            .unwrap();
+        tc.inc_lock_ref(handle, ComponentSet::EMPTY).unwrap();
+        tc.mark_write_through_pending(vec![handle], handle).unwrap();
+    }
+    // Incremental SWA backup can submit an unbacked Full ancestor
+    // asynchronously under write_back; matching can split it before the ack.
+    let (prefix_idx, action) = tc.split_node_(tc.arena.resolve(a).unwrap(), 2);
+    let published_a = match action {
+        Some(CacheAction::ReplaceWriteThroughOnNodeSplit {
+            ack_id,
+            old_node_id,
+            new_node_id,
+            new_child_node_id,
+        }) => {
+            assert_eq!((ack_id, old_node_id, new_child_node_id), (a, a, a));
+            assert_eq!(new_node_id, tc.arena.node(prefix_idx).id);
+            vec![new_node_id, new_child_node_id]
+        }
+        _ => panic!("expected pending-backup split publication"),
+    };
+    tc.sanity_check(&[(a as i64, a), (b as i64, b)], &[]);
+
+    // The controller publishes each FIFO ack's fragments ancestors first,
+    // then releases the original node's lock (which also covers its prefix).
+    for (ack, published) in [(a, published_a), (b, vec![b])] {
+        tc.finish_write_through(published, ack).unwrap();
+        tc.dec_lock_ref(
+            ack,
+            &DecLockRefParams {
+                node_id: Some(ack),
+                ..Default::default()
+            },
+            false,
+        )
+        .unwrap();
+    }
+    assert!(!tc.evictable_device_leaves.contains(prefix_idx));
+    assert!(
+        !tc.arena
+            .node(tc.arena.resolve(a).unwrap())
+            .children
+            .is_empty()
+    );
+    for expected in [[20i64, 21], [22, 23], [27, 28]] {
+        let step = tc.drive_host_eviction(FULL, 1);
+        assert_eq!(step.tracker[&FULL], 2);
+        assert!(step.device_frees.is_empty());
+        assert_eq!(step.host_frees[&FULL].len(), 1);
+        let slots = &step.host_frees[&FULL][0];
+        assert_eq!([slots.int64_value(&[0]), slots.int64_value(&[1])], expected);
+        tc.sanity_check(&[], &[]);
+    }
+    assert!(tc.full_coexisting_host_nodes.iter().next().is_none());
+}
+
+#[test]
 fn host_drive_spares_coexisting_host_values_under_an_in_flight_transfer() {
     let mut tc = write_back_core();
     insert(&mut tc, &vec![1, 2], &[10, 11]);
@@ -475,8 +548,12 @@ fn host_drive_spares_coexisting_host_values_under_an_in_flight_transfer() {
         .best_match_node_id;
     tc.commit_backup(handle, Tensor::from_slice(&[20i64, 21]), HashMap::new())
         .expect("live test node");
+    // commit_backup precedes the controller's pending marker; membership is
+    // born only when the transfer is acknowledged, not in this short gap.
+    assert!(tc.full_coexisting_host_nodes.iter().next().is_none());
     tc.mark_write_through_pending(vec![handle], /* ack_id = */ handle)
         .expect("live test node");
+    assert!(tc.full_coexisting_host_nodes.iter().next().is_none());
 
     let (mut tr, mut df, mut hf) = (tracker(), frees(), frees());
     accumulate_step(
@@ -494,6 +571,10 @@ fn host_drive_spares_coexisting_host_values_under_an_in_flight_transfer() {
 
     tc.finish_write_through(vec![handle], handle)
         .expect("live test node");
+    assert!(
+        tc.full_coexisting_host_nodes
+            .contains(tc.arena.resolve(handle).unwrap())
+    );
     accumulate_step(
         tc.drive_host_eviction(FULL, /* num_tokens = */ 2),
         &mut tr,

@@ -3910,7 +3910,9 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
                 );
         }
         assert!(cache_actions.is_empty()); // BACKUP_HOST emits no actions
-        self.update_full_coexisting_host_tracking_(node_id);
+        // The controller marks the transfer pending after this commit. Register
+        // the duplicate in finish_write_through, once its acknowledgment also
+        // establishes the ancestor-first order of any intervening split.
         Ok(())
     }
 

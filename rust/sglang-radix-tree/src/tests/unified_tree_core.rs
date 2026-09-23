@@ -4094,6 +4094,12 @@ fn backuped_chain(tc: &mut UnifiedTreeCore<Vec<i64>>) -> (NodeIdx_, NodeIdx_) {
         .expect("live test node");
     tc.commit_backup(child, Tensor::from_slice(&[22i64, 23]), HashMap::new())
         .expect("live test node");
+    for node_id in [parent, child] {
+        tc.mark_write_through_pending(vec![node_id], node_id)
+            .expect("live test node");
+        tc.finish_write_through(vec![node_id], node_id)
+            .expect("live test node");
+    }
     (
         tc.arena.resolve(parent).expect("live test node"),
         tc.arena.resolve(child).expect("live test node"),
@@ -4499,6 +4505,12 @@ fn mixed_backup_evict_insert_keeps_the_leaf_sets_disjoint() {
         .best_match_node_id;
     tc.commit_backup(third, Tensor::from_slice(&[104i64, 105]), HashMap::new())
         .expect("live test node");
+    for node_id in [first, second, third] {
+        tc.mark_write_through_pending(vec![node_id], node_id)
+            .expect("live test node");
+        tc.finish_write_through(vec![node_id], node_id)
+            .expect("live test node");
+    }
     let mut tracker = HashMap::from([(FULL, 0)]);
     let (mut df, mut hf) = (HashMap::new(), HashMap::new());
     tc.evict_device_start(FULL, /* request_cnt = */ 4);
@@ -8134,6 +8146,10 @@ fn resume_insert_completes_after_an_on_path_host_leaf_is_evicted() {
         HashMap::new(),
     )
     .expect("live test node");
+    tc.mark_write_through_pending(vec![h_leaf], h_leaf)
+        .expect("live test node");
+    tc.finish_write_through(vec![h_leaf], h_leaf)
+        .expect("live test node");
     demote_node(&mut tc, h_leaf_idx);
     let step = tc.begin_insert(&insert_params(
         &vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
@@ -8160,6 +8176,10 @@ fn resume_insert_completes_after_an_on_path_host_leaf_is_evicted() {
         HashMap::new(),
     )
     .expect("live test node");
+    tc.mark_write_through_pending(vec![top], top)
+        .expect("live test node");
+    tc.finish_write_through(vec![top], top)
+        .expect("live test node");
     let done = tc.resume_insert();
     let result = done.result.expect("the resumed walk completes");
     assert_eq!(result.prefix_len, 4);
@@ -8197,6 +8217,11 @@ fn aborted_barrier_crossing_refires_on_the_next_insert() {
         HashMap::new(),
     )
     .expect("live test node");
+    let node_id = tc.arena.node(a).id;
+    tc.mark_write_through_pending(vec![node_id], node_id)
+        .expect("live test node");
+    tc.finish_write_through(vec![node_id], node_id)
+        .expect("live test node");
     let done = tc.resume_insert();
     assert_eq!(
         done.result.expect("the resumed walk completes").prefix_len,

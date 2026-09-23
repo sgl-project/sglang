@@ -181,7 +181,8 @@ pub struct Node<K: ChildKeyType> {
     pub rotation_base: Option<i64>,
     /// The in-flight write-through backup's ack id.
     pub write_through_pending_id: Option<usize>,
-    /// Load-back anchor currently reading this node's host slots.
+    /// Load-back anchor currently reading this node's Full host slots.
+    /// Auxiliary transfers are protected by their component locks.
     pub load_back_pending_id: Option<NodeId>,
     /// Monotonic access tick for LRU ordering (exact; not wall-clock).
     pub last_access_counter: i64,
@@ -382,7 +383,7 @@ impl<K: ChildKeyType> Node<K> {
             .any(|state| state.lock_ref > 0)
     }
 
-    /// Whether an in-flight load-back currently pins this node.
+    /// Whether an in-flight load-back currently pins this node's Full slots.
     pub fn is_load_back_pending(&self) -> bool {
         self.load_back_pending_id.is_some()
     }

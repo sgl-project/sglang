@@ -770,15 +770,15 @@ impl<K: ChildKeyType> TreeComponent<K> for SwaComponent {
                 .device_lru_list(SWA)
                 .get_lru_no_lock(&tree_core.arena);
         }
-        let next = loop {
+        let next = 'step: {
             if tracker[&ct] >= tree_core.component_state(SWA).evict_device_request_cnt {
-                break None;
+                break 'step None;
             }
             let Some(x) = cursor else {
-                break None;
+                break 'step None;
             };
             if !tree_core.device_lru_list(SWA).in_list(Some(x)) {
-                break None;
+                break 'step None;
             }
             assert!(
                 tree_core.arena.has_device_value(x, SWA),
@@ -787,12 +787,11 @@ impl<K: ChildKeyType> TreeComponent<K> for SwaComponent {
             cursor = tree_core
                 .device_lru_list(SWA)
                 .get_prev_no_lock(x, &tree_core.arena);
-            // A load-back pin means an in-flight DMA targets this node's slices.
-            if tree_core.arena.node(x).is_load_back_pending() {
-                continue;
-            }
+            // The SWA LRU filters its own transfer/request locks. A Full load
+            // pin can also cover an ancestor outside the loaded SWA window,
+            // whose separately restored SWA rows remain independently evictable.
             if tree_core.evictable_device_leaves.contains(x) {
-                break Some(x);
+                break 'step Some(x);
             }
             // Internal nodes are tombstoned inline (no IO).
             tree_core.evict_component_and_detach_lru_(
@@ -804,7 +803,7 @@ impl<K: ChildKeyType> TreeComponent<K> for SwaComponent {
                 Some(tracker),
             );
             tree_core.cascade_evict_(x, ct, tracker, device_frees, host_frees, EvictLayer::Device);
-            break None;
+            None
         };
         tree_core.component_state_mut(SWA).evict_device_cursor = cursor;
         next
@@ -842,11 +841,8 @@ impl<K: ChildKeyType> TreeComponent<K> for SwaComponent {
             let x_next = tree_core
                 .host_lru_list(SWA)
                 .get_prev_no_lock(cur, &tree_core.arena);
-            // A load-back pin means an in-flight DMA reads this node's host slices.
-            if tree_core.arena.node(cur).is_load_back_pending() {
-                x = x_next;
-                continue;
-            }
+            // The host LRU filters SWA's own locks. A Full load-back pin may
+            // cover an ancestor outside the SWA transfer window.
             if tree_core.evictable_host_leaves.contains(cur) {
                 tree_core.evict_host_leaf_(cur, tracker, device_frees, host_frees);
             } else {

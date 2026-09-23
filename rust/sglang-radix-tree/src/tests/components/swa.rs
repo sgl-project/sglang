@@ -4839,7 +4839,7 @@ fn auxiliary_load_does_not_reuse_a_full_pending_pin() {
 }
 
 #[test]
-fn swa_device_eviction_skips_a_load_back_pinned_node() {
+fn swa_device_eviction_preserves_a_locked_load_back_destination() {
     let mut tc: UnifiedTreeCore<Vec<i64>> = UnifiedTreeCore::new(
         CacheInitParams {
             is_write_back: true,
@@ -4863,12 +4863,26 @@ fn swa_device_eviction_skips_a_load_back_pinned_node() {
         comp_xfers,
     )
     .expect("live test node");
-    // The pin alone keeps the in-flight SWA slice out of every eviction branch.
+    let receipt = tc
+        .inc_lock_ref(tc.arena.node(n).id, ComponentSet::EMPTY)
+        .expect("live test node");
+    // The selected SWA destination is protected by its component lock.
     tc.evict_device_start(SWA, 4);
     let (next, _) = tc.evict_device_next_node(SWA, &HashMap::new());
     assert_eq!(next, None);
     tc.evict_device_end(SWA);
     assert!(tc.arena.has_device_value(n, SWA));
+    tc.dec_lock_ref(
+        tc.arena.node(n).id,
+        &DecLockRefParams {
+            node_id: receipt.node_id,
+            swa_uuid_for_lock: receipt.swa_uuid_for_lock,
+            swa_uuid_for_host_lock: receipt.swa_uuid_for_host_lock,
+            skipped_lock_components: receipt.skipped_lock_components,
+        },
+        false,
+    )
+    .expect("live test node");
     tc.finish_load_back(tc.arena.node(n).id)
         .expect("live test node");
     tc.evict_device_start(SWA, 4);
@@ -4877,8 +4891,7 @@ fn swa_device_eviction_skips_a_load_back_pinned_node() {
     tc.evict_device_end(SWA);
 }
 
-#[test]
-fn swa_host_eviction_skips_a_load_back_pinned_node() {
+fn check_swa_device_restored_during_full_load_back(pin_ancestor: bool) {
     let mut tc: UnifiedTreeCore<Vec<i64>> = UnifiedTreeCore::new(
         CacheInitParams {
             is_write_back: true,
@@ -4889,41 +4902,232 @@ fn swa_host_eviction_skips_a_load_back_pinned_node() {
         vec![FULL, SWA],
     );
     let [a, b] = chain::<2>(&mut tc);
-    set_full_host(&mut tc, a);
-    set_swa_host(&mut tc, a);
-    set_full_host(&mut tc, b);
-    set_swa_host(&mut tc, b);
-    tc.host_lru_list_mut(SWA).insert_mru(a);
-    let (kv_xfer, mut comp_xfers) = tc
-        .build_load_back_spec(tc.arena.node(b).id, /* req = */ None)
-        .expect("live test node");
+    let [a_id, b_id] = [a, b].map(|idx| tc.arena.node(idx).id);
+    for (idx, swa) in [(a, 20i64), (b, 21)] {
+        set_full_host(&mut tc, idx);
+        tc.arena
+            .set_host_value(idx, SWA, Tensor::from_slice(&[swa]));
+        tc.host_lru_list_mut(SWA).insert_mru(idx);
+        tc.update_evictable_leaf_sets_(idx);
+    }
+    let release_params = |receipt: IncLockRefResult| DecLockRefParams {
+        node_id: receipt.node_id,
+        swa_uuid_for_lock: receipt.swa_uuid_for_lock,
+        swa_uuid_for_host_lock: receipt.swa_uuid_for_host_lock,
+        skipped_lock_components: receipt.skipped_lock_components,
+    };
+    let host_lock = release_params(tc.inc_host_lock_ref(b_id).unwrap());
+    let temporary_lock = release_params(tc.inc_lock_ref(b_id, ComponentSet::EMPTY).unwrap());
+    let (full, mut transfers) = tc.build_load_back_spec(b_id, None).unwrap();
+    assert_eq!(full.nodes_to_load, Some(vec![a_id, b_id]));
+    assert_eq!(transfers[&SWA][0].nodes_to_load, Some(vec![b_id]));
+    transfers.get_mut(&SWA).unwrap()[0].device_indices = Some(Tensor::from_slice(&[60i64]));
+    tc.dec_lock_ref(b_id, &temporary_lock, false).unwrap();
+    tc.commit_load_back(b_id, Tensor::from_slice(&[50i64, 51]), full, transfers)
+        .unwrap();
+    let pending_lock = release_params(tc.inc_lock_ref(b_id, ComponentSet::EMPTY).unwrap());
+    assert!(!tc.arena.has_device_value(a, SWA));
+
+    // A is outside the loaded SWA window. A new request emits the normal
+    // locked-Full repair action; resolve only its allocator/mapping boundary.
+    let inserted = tc.insert(&insert_params_swa(&vec![1], &[90], 0, 0));
+    let [
+        CacheAction::RecoverSwaWithLockedFull {
+            node_id,
+            kept_full,
+            incoming_full,
+        },
+    ] = inserted.cache_actions.as_slice()
+    else {
+        panic!("expected one RecoverSwaWithLockedFull action");
+    };
+    assert_eq!(*node_id, a_id);
+    assert!(kept_full.equal(&Tensor::from_slice(&[50i64])));
+    assert!(incoming_full.equal(&Tensor::from_slice(&[90i64])));
+    tc.set_component_device_value(a_id, SWA, Tensor::from_slice(&[70i64]))
+        .unwrap();
+    assert!(tc.arena.node(a).is_load_back_pending());
+    assert_eq!(tc.arena.device_lock_ref(a, SWA), 0);
+    assert_eq!(tc.arena.device_lock_ref(b, SWA), 1);
+    let ancestor_lock =
+        pin_ancestor.then(|| release_params(tc.inc_lock_ref(a_id, ComponentSet::EMPTY).unwrap()));
+    let active: Vec<_> = ancestor_lock.iter().map(|_| (a_id as i64, a_id)).collect();
+    tc.sanity_check(&active, &[(b_id as i64, b_id)]);
+
+    tc.evict_device_start(SWA, 1);
+    let (next, step) = tc.evict_device_next_node(SWA, &HashMap::new());
+    tc.evict_device_end(SWA);
+    assert_eq!(next, None);
     assert_eq!(
-        comp_xfers.get(&SWA).unwrap()[0].nodes_to_load,
-        Some(vec![tc.arena.node(b).id])
+        step.tracker.get(&SWA).copied().unwrap_or(0),
+        usize::from(!pin_ancestor)
     );
-    comp_xfers.get_mut(&SWA).unwrap()[0].device_indices = Some(Tensor::from_slice(&[60i64]));
-    tc.commit_load_back(
-        tc.arena.node(b).id,
-        Tensor::from_slice(&[50i64, 51]),
-        kv_xfer,
-        comp_xfers,
-    )
-    .expect("live test node");
+    assert!(step.host_frees.is_empty());
+    if pin_ancestor {
+        assert!(step.device_frees.is_empty());
+    } else {
+        assert_eq!(step.device_frees.len(), 1);
+        assert_eq!(step.device_frees[&SWA].len(), 1);
+        // free_swa resolves physical rows through the retained Full indices.
+        assert!(step.device_frees[&SWA][0].equal(&Tensor::from_slice(&[50i64])));
+    }
+    assert_eq!(tc.arena.has_device_value(a, SWA), pin_ancestor);
+    assert!(
+        tc.arena
+            .device_value(b, SWA)
+            .equal(&Tensor::from_slice(&[60i64]))
+    );
+    assert!(
+        tc.arena
+            .device_value(a, FULL)
+            .equal(&Tensor::from_slice(&[50i64]))
+    );
+    assert!(
+        tc.arena
+            .device_value(b, FULL)
+            .equal(&Tensor::from_slice(&[51i64]))
+    );
+    tc.sanity_check(&active, &[(b_id as i64, b_id)]);
+
+    tc.dec_lock_ref(b_id, &pending_lock, false).unwrap();
+    tc.dec_host_lock_ref(b_id, &host_lock).unwrap();
+    tc.finish_load_back(b_id).unwrap();
+    tc.evict_device_start(SWA, 1);
+    let (next, _) = tc.evict_device_next_node(SWA, &HashMap::new());
+    tc.evict_device_end(SWA);
+    assert_eq!(next, Some(b_id));
+    if let Some(params) = ancestor_lock {
+        tc.dec_lock_ref(a_id, &params, false).unwrap();
+    }
+    tc.sanity_check(&[], &[]);
+}
+
+#[test]
+fn swa_device_eviction_reclaims_state_restored_during_full_load_back() {
+    check_swa_device_restored_during_full_load_back(false);
+}
+
+#[test]
+fn swa_device_eviction_preserves_pins_during_full_load_back() {
+    check_swa_device_restored_during_full_load_back(true);
+}
+
+fn check_swa_host_eviction_during_full_load_back(lock_ancestor_host: bool) {
+    let mut tc: UnifiedTreeCore<Vec<i64>> = UnifiedTreeCore::new(
+        CacheInitParams {
+            is_write_back: true,
+            enable_hicache: true,
+            has_swa_host_pool: true,
+            ..swa_params_with_window(1)
+        },
+        vec![FULL, SWA],
+    );
+    let [a, b] = chain::<2>(&mut tc);
+    let a_id = tc.arena.node(a).id;
+    let b_id = tc.arena.node(b).id;
+    set_full_host(&mut tc, a);
+    set_full_host(&mut tc, b);
+    tc.arena
+        .set_host_value(a, SWA, Tensor::from_slice(&[20i64]));
+    tc.arena
+        .set_host_value(b, SWA, Tensor::from_slice(&[21i64]));
+    tc.host_lru_list_mut(SWA).insert_mru(a);
+    tc.host_lru_list_mut(SWA).insert_mru(b);
+    tc.update_evictable_leaf_sets_(a);
+    tc.update_evictable_leaf_sets_(b);
+    let release_params = |receipt: IncLockRefResult| DecLockRefParams {
+        node_id: receipt.node_id,
+        swa_uuid_for_lock: receipt.swa_uuid_for_lock,
+        swa_uuid_for_host_lock: receipt.swa_uuid_for_host_lock,
+        skipped_lock_components: receipt.skipped_lock_components,
+    };
+    let ancestor_host_lock = lock_ancestor_host
+        .then(|| release_params(tc.inc_host_lock_ref(a_id).expect("live ancestor")));
+    let host_lock = release_params(tc.inc_host_lock_ref(b_id).expect("live anchor"));
+    let before_lock = release_params(
+        tc.inc_lock_ref(b_id, ComponentSet::EMPTY)
+            .expect("live anchor"),
+    );
+    let (kv_xfer, mut comp_xfers) = tc
+        .build_load_back_spec(b_id, /* req = */ None)
+        .expect("live anchor");
+    assert_eq!(kv_xfer.nodes_to_load, Some(vec![a_id, b_id]));
+    let swa_xfer = &mut comp_xfers.get_mut(&SWA).unwrap()[0];
+    // A contributes Full rows but lies outside B's trailing SWA window.
+    assert_eq!(swa_xfer.nodes_to_load, Some(vec![b_id]));
+    assert!(
+        swa_xfer
+            .host_indices
+            .as_ref()
+            .unwrap()
+            .equal(&Tensor::from_slice(&[21i64]))
+    );
+    swa_xfer.device_indices = Some(Tensor::from_slice(&[60i64]));
+    tc.dec_lock_ref(b_id, &before_lock, false)
+        .expect("live anchor");
+    tc.commit_load_back(b_id, Tensor::from_slice(&[50i64, 51]), kv_xfer, comp_xfers)
+        .expect("live anchor");
+    let pending_lock = release_params(
+        tc.inc_lock_ref(b_id, ComponentSet::EMPTY)
+            .expect("live anchor"),
+    );
+    assert!(tc.arena.node(a).is_load_back_pending());
+    assert!(tc.arena.node(b).is_load_back_pending());
+    assert_eq!(
+        tc.arena.host_lock_ref(a, SWA),
+        u32::from(lock_ancestor_host)
+    );
+    assert_eq!(tc.arena.host_lock_ref(b, SWA), 1);
+    tc.sanity_check(&[], &[(b_id as i64, b_id)]);
 
     let result = tc.drive_host_eviction(SWA, /* num_tokens = */ 1);
-    assert_eq!(result.tracker[&SWA], 0);
-    assert!(result.host_frees.is_empty());
-    assert!(tc.arena.has_host_value(a, SWA));
+    assert_eq!(result.tracker[&SWA], usize::from(!lock_ancestor_host));
+    assert!(result.device_frees.is_empty());
+    if lock_ancestor_host {
+        assert!(result.host_frees.is_empty());
+    } else {
+        assert_eq!(result.host_frees.len(), 1);
+        assert!(result.host_frees[&SWA][0].equal(&Tensor::from_slice(&[20i64])));
+    }
+    assert_eq!(tc.arena.has_host_value(a, SWA), lock_ancestor_host);
+    assert!(tc.arena.has_host_value(b, SWA));
+    let full_pressure = tc.drive_host_eviction(FULL, 2);
+    assert_eq!(full_pressure.tracker[&FULL], 0);
+    assert!(full_pressure.host_frees.is_empty());
+    assert!(tc.arena.has_host_value(a, FULL));
+    assert!(tc.arena.has_host_value(b, FULL));
+    tc.sanity_check(&[], &[(b_id as i64, b_id)]);
 
-    tc.finish_load_back(tc.arena.node(b).id)
-        .expect("live test node");
+    tc.dec_lock_ref(b_id, &pending_lock, false)
+        .expect("live anchor");
+    tc.dec_host_lock_ref(b_id, &host_lock).expect("live anchor");
+    tc.finish_load_back(b_id).expect("live anchor");
+    if let Some(params) = ancestor_host_lock {
+        tc.dec_host_lock_ref(a_id, &params).expect("live ancestor");
+    }
     let result = tc.drive_host_eviction(SWA, /* num_tokens = */ 1);
-    assert_eq!(result.tracker[&SWA], 1);
-    assert_eq!(result.host_frees[&SWA].len(), 1);
-    // Only the host-only LRU is reclaimed; the loaded node retains its backup.
+    assert_eq!(result.tracker[&SWA], usize::from(lock_ancestor_host));
+    if lock_ancestor_host {
+        assert_eq!(result.host_frees[&SWA].len(), 1);
+        assert!(result.host_frees[&SWA][0].equal(&Tensor::from_slice(&[20i64])));
+    } else {
+        assert!(result.host_frees.is_empty());
+    }
     assert!(!tc.arena.has_host_value(a, SWA));
     assert!(tc.arena.has_host_value(b, SWA));
+    assert!(!tc.arena.node(a).is_load_back_pending());
+    assert!(!tc.arena.node(b).is_load_back_pending());
     tc.sanity_check(&[], &[]);
+}
+
+#[test]
+fn swa_host_eviction_reclaims_outside_window_during_full_load_back() {
+    check_swa_host_eviction_during_full_load_back(false);
+}
+
+#[test]
+fn swa_host_eviction_preserves_locked_ancestor_during_full_load_back() {
+    check_swa_host_eviction_during_full_load_back(true);
 }
 
 #[test]
@@ -5005,6 +5209,8 @@ fn host_drive_preserves_swa_coexisting_host_values_when_the_host_lru_is_empty() 
             HashMap::from([(SWA, vec![swa_xfer])]),
         )
         .expect("live test node");
+        tc.mark_write_through_pending(vec![handle], handle).unwrap();
+        tc.finish_write_through(vec![handle], handle).unwrap();
     }
     assert_eq!(tc.host_lru_list(SWA).len(), 0);
 
@@ -5196,6 +5402,9 @@ fn deep_request_ring_tree_survives_full_backup_evict_and_load_back_rounds() {
             HashMap::new(),
         )
         .expect("live test node");
+        let handle = tc.arena.node(node).id;
+        tc.mark_write_through_pending(vec![handle], handle).unwrap();
+        tc.finish_write_through(vec![handle], handle).unwrap();
     }
     tc.sanity_check(&[], &[]);
     // Stepwise eviction rounds: half the Full budget, then the whole SWA budget.
