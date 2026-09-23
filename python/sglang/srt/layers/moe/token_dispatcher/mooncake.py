@@ -9,6 +9,7 @@ import torch
 import torch.distributed as dist
 
 from sglang.srt.elastic_ep.elastic_ep import ElasticEPStateManager
+from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.layers.dp_attention import get_is_extend_in_batch
 from sglang.srt.layers.moe.token_dispatcher.base import (
@@ -181,7 +182,7 @@ class _MooncakeEPDispatcherImpl:
         hidden_states, masked_m, event, hook = self._dispatch_core(
             hidden_states,
             topk_ids,
-            use_fp8=True,
+            use_fp8=not envs.SGLANG_MOONCAKE_EP_BF16_DISPATCH.get(),
         )
         return (
             hidden_states,
