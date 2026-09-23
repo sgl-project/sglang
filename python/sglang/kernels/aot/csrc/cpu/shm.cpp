@@ -231,6 +231,7 @@ int64_t shm_initialize(int size, int rank, const char* addr_string, const char* 
   workspace_buf = (struct allreduce_workspace*)malloc(sizeof(struct allreduce_workspace));
   snprintf(shm_name, NAME_BUF_SIZE, "%.900s_%d", shm_name_prefix, rank);
   shared_create(&allreduce_buffer, shm_name, workspace_buf, sizeof(struct allreduce_workspace));
+  free(workspace_buf);
   workspace_buf = (struct allreduce_workspace*)allreduce_buffer.bytes;
   workspace_buf->states[STATE_GROUP_SYMMETRIC_ALLREDUCE] =
       coll_alt2_allreduce_naive__copy_in_done;                            // symmetric_naive_all_reduce

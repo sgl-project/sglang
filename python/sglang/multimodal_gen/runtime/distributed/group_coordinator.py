@@ -206,6 +206,24 @@ class GroupCoordinator:
 
         # TODO: fix it for other platforms
         self.device = get_local_torch_device()
+        self.shm_handle = None
+        if (
+            current_platform.is_cpu()
+            and self.world_size > 1
+            and hasattr(torch.ops.sgl_kernel, "shm_group_initialize")
+            and self.unique_name.startswith(("tp", "sp"))
+        ):
+            group_ranks = "-".join(str(rank) for rank in self.ranks)
+            group_name = f"{self.unique_name}-{group_ranks}"
+
+            self.shm_handle = int(
+                torch.ops.sgl_kernel.shm_group_initialize(
+                    group_name,
+                    self.world_size,
+                    self.rank_in_group,
+                )
+            )
+            torch.distributed.barrier(group=self.cpu_group)
 
         self.use_device_communicator = use_device_communicator
         self.device_communicator: DeviceCommunicatorBase = None  # type: ignore
@@ -377,18 +395,20 @@ class GroupCoordinator:
                 if output is not None:
                     return output
             if (
-                current_platform.is_cpu()
+                not async_op
+                and self.shm_handle is not None
                 and is_shm_available(input_.dtype, self.world_size, len(self.ranks))
-                and op is torch.distributed.ReduceOp.SUM
+                and op == torch.distributed.ReduceOp.SUM
             ):
-                # for CPU platform, intra-node case we could speedup with shared memory based comm ops
+                # For CPU intra-node groups, use the group-aware SHM collective.
                 torch.ops.sgl_kernel.shm_allreduce(
-                    input_, int(torch.distributed.ReduceOp.SUM)
+                    input_, int(torch.distributed.ReduceOp.SUM), self.shm_handle
                 )
             else:
                 torch.distributed.all_reduce(
                     input_, op=op, group=self.device_group, async_op=async_op
                 )
+
         return input_
 
     def all_gather(
@@ -411,16 +431,20 @@ class GroupCoordinator:
             input_size, dtype=input_.dtype, device=input_.device
         )
 
-        # All-gather.
-        if current_platform.is_cpu() and is_shm_available(
+        # Group-aware CPU SHM all-gather.
+        if self.shm_handle is not None and is_shm_available(
             input_.dtype, self.world_size, len(self.ranks)
         ):
-            output_tensor = torch.ops.sgl_kernel.shm_allgather(input_, dim)
+            output_tensor = torch.ops.sgl_kernel.shm_allgather(
+                input_, dim, self.shm_handle
+            )
+
             if separate_tensors:
                 return list(output_tensor.chunk(world_size, dim=dim))
             return output_tensor
-        else:
-            all_gather_single(output_tensor, input_, group=self.device_group)
+
+        # Fallback.
+        all_gather_single(output_tensor, input_, group=self.device_group)
 
         if dim != 0:
             input_size[0] //= world_size
@@ -858,3 +882,10 @@ class SequenceParallelGroupCoordinator(GroupCoordinator):
         self.ulysses_rank = torch.distributed.get_rank(self.ulysses_group)
         self.ring_world_size = torch.distributed.get_world_size(self.ring_group)
         self.ring_rank = torch.distributed.get_rank(self.ring_group)
+        self.ulysses_shm_handle = None
+        if (
+            current_platform.is_cpu()
+            and self.ulysses_world_size > 1
+            and hasattr(torch.ops.sgl_kernel, "shm_group_initialize")
+        ):
+            self.ulysses_shm_handle = self.shm_handle

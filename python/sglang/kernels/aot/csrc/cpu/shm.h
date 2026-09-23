@@ -1,3 +1,7 @@
+#include <torch/all.h>
+
+#include <torch/csrc/distributed/c10d/ProcessGroup.hpp>
+
 #ifndef __SHM_COLLECTIVES__
 #define __SHM_COLLECTIVES__
 
