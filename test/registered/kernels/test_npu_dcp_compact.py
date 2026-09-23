@@ -149,12 +149,8 @@ class TestNpuDcpCompactKernels(CustomTestCase):
         self.assertEqual(table.shape, (0, 1))
         self.assertEqual(lens.shape, (0,))
 
-    def test_shared_planner_runs_prefix_kernel_on_npu(self):
-        from unittest.mock import patch
-
-        from sglang.kernels.ops.kvcache.kv_indices import (
-            create_chunked_prefix_cache_kv_indices,
-        )
+    def test_shared_planner_uses_slice_cat_prefix_on_npu(self):
+        from unittest.mock import MagicMock, patch
         from sglang.srt import runtime_context as rc
         from sglang.srt.layers.dcp.planner import (
             prepare_decode_context_parallel_metadata,
@@ -167,6 +163,7 @@ class TestNpuDcpCompactKernels(CustomTestCase):
             dcp_use_packed_kv=False, kv_index_translator=translator
         )
         table = torch.arange(40, 64, dtype=torch.int32, device=self.device).view(3, 8)
+        prefix_kernel = MagicMock()
         for prefixes in ([4, 8], [0, 4], [0, 0]):
             prefix_lens = torch.tensor(prefixes, dtype=torch.int32, device=self.device)
             extend_lens = torch.tensor([2, 3], dtype=torch.int32, device=self.device)
@@ -196,7 +193,7 @@ class TestNpuDcpCompactKernels(CustomTestCase):
                         kv_buffer_shape=torch.Size([32, 1]),
                         kv_cache_dtype=torch.bfloat16,
                         kv_cache_device=self.device,
-                        create_chunked_prefix_cache_kv_indices_fn=create_chunked_prefix_cache_kv_indices,
+                        create_chunked_prefix_cache_kv_indices_fn=prefix_kernel,
                     )
                     expected = torch.cat(
                         [table[2, : prefixes[0]], table[0, : prefixes[1]]]
@@ -205,6 +202,7 @@ class TestNpuDcpCompactKernels(CustomTestCase):
                         metadata.dcp_local_prefix_kv_indices, expected[rank::4] // 4
                     )
                     self.assertIsNone(metadata.dcp_kv_buffer)
+                    prefix_kernel.__getitem__.assert_not_called()
 
     def test_compact_buffers_survive_graph_replay(self):
         """Real NPU graph kernels; local copy substitutes for HCCL transport."""

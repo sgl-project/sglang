@@ -46,6 +46,26 @@ def prepare_decode_context_parallel_metadata(
     parallel = get_parallel()
     if not parallel.dcp_enabled:
         return None
+    backend = get_attn_backend()
+    if not backend.dcp_use_packed_kv:
+        # Restore the slice/cat prefix builder for the unpacked Ascend path.
+        # Keep the shared read-ID translation; only index construction changes.
+        prefix_parts = []
+        for batch_idx, prefix_len in enumerate(extend_prefix_lens_cpu):
+            prefix_len = int(prefix_len)
+            if prefix_len:
+                req_idx = int(req_pool_indices[batch_idx].item())
+                prefix_parts.append(req_to_token[req_idx, :prefix_len])
+        prefix_indices = (
+            torch.cat(prefix_parts).to(torch.int32)
+            if prefix_parts
+            else torch.empty(0, dtype=torch.int32, device=req_to_token.device)
+        )
+        return DecodeContextParallelMetadata(
+            dcp_local_prefix_kv_indices=backend.kv_index_translator.translate_dcp_read_ids(
+                prefix_indices[parallel.dcp_rank :: parallel.dcp_size]
+            ),
+        )
     # dcp_kv_buffer tokens' layout
     # [ rank0_r1.prefix_tokens, rank1_r1.prefix_tokens, ..., rank7_r1.prefix_tokens,
     #   ...,
@@ -74,14 +94,9 @@ def prepare_decode_context_parallel_metadata(
     )
     # Prefix lengths are dcp_size-aligned (widened allocator page), so no nonzero().
     # `get_mla_kv_buffer` is a read door with the caller-translates contract.
-    backend = get_attn_backend()
     dcp_local_prefix_kv_indices = backend.kv_index_translator.translate_dcp_read_ids(
         dcp_prefix_kv_indices[parallel.dcp_rank :: parallel.dcp_size]
     )
-    if not backend.dcp_use_packed_kv:
-        return DecodeContextParallelMetadata(
-            dcp_local_prefix_kv_indices=dcp_local_prefix_kv_indices,
-        )
     dcp_kv_indptr = torch.zeros(
         len(seq_lens) + 1,
         dtype=torch.int32,

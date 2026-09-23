@@ -229,7 +229,7 @@ class TestGetDcpLens(CustomTestCase):
         lens = torch.tensor(LENS, dtype=torch.int32)
         self.assertTrue(torch.equal(get_dcp_lens(lens, 1, 0), lens))
 
-    def test_metadata_planner_shares_prefix_indices_without_packed_kv(self):
+    def test_metadata_planner_slices_prefix_indices_without_packed_kv(self):
         translator = KVIndexTranslator.__new__(KVIndexTranslator)
         translator.is_translating = False
         backend = SimpleNamespace(
@@ -239,14 +239,7 @@ class TestGetDcpLens(CustomTestCase):
         req_indices = torch.tensor([2, 0])
         extend_lens = torch.tensor([2, 3], dtype=torch.int32)
 
-        def cpu_prefix_kernel(table, reqs, starts, lens, cu_lens, out, stride):
-            for i in range(reqs.numel()):
-                out[cu_lens[i] : cu_lens[i] + lens[i]] = table[
-                    reqs[i], starts[i] : starts[i] + lens[i]
-                ]
-
         kernel = MagicMock()
-        kernel.__getitem__.return_value.side_effect = cpu_prefix_kernel
         for prefix_lengths in ([4, 8], [0, 4], [0, 0]):
             prefix_lens = torch.tensor(prefix_lengths, dtype=torch.int32)
             seq_lens = prefix_lens + extend_lens
@@ -287,11 +280,64 @@ class TestGetDcpLens(CustomTestCase):
                     torch.testing.assert_close(
                         result.dcp_local_prefix_kv_indices, all_prefix[rank::4] // 4
                     )
+                    kernel.__getitem__.assert_not_called()
                     packed.__getitem__.assert_not_called()
                     self.assertIsNone(result.dcp_kv_indptr)
                     self.assertIsNone(result.dcp_kv_indices)
                     self.assertIsNone(result.dcp_kv_buffer)
                     self.assertIsNone(result.dcp_extend_prefix_lens_sum)
+
+    def test_metadata_planner_keeps_prefix_kernel_for_packed_kv(self):
+        translator = KVIndexTranslator.__new__(KVIndexTranslator)
+        translator.is_translating = False
+        backend = SimpleNamespace(
+            dcp_use_packed_kv=True, kv_index_translator=translator
+        )
+        table = torch.arange(40, 64, dtype=torch.int32).view(3, 8)
+        prefixes = torch.tensor([4, 8], dtype=torch.int32)
+        extend = torch.tensor([2, 3], dtype=torch.int32)
+
+        def cpu_prefix_kernel(table, reqs, starts, lens, cu_lens, out, stride):
+            for i in range(reqs.numel()):
+                out[cu_lens[i] : cu_lens[i] + lens[i]] = table[
+                    reqs[i], starts[i] : starts[i] + lens[i]
+                ]
+
+        kernel = MagicMock()
+        kernel.__getitem__.return_value.side_effect = cpu_prefix_kernel
+        with (
+            rc.get_parallel().override(
+                dcp_enabled=True, dcp_size=4, dcp_rank=1, attn_dcp_size=4
+            ),
+            patch(
+                "sglang.srt.layers.dcp.planner.get_attn_backend", return_value=backend
+            ),
+            patch(
+                "sglang.srt.layers.dcp.planner.get_device",
+                return_value=SimpleNamespace(device="cpu"),
+            ),
+            patch("sglang.srt.layers.dcp.planner.create_dcp_kv_indices") as packed,
+        ):
+            result = prepare_decode_context_parallel_metadata(
+                seq_lens=prefixes + extend,
+                extend_prefix_lens=prefixes,
+                extend_prefix_lens_cpu=[4, 8],
+                extend_seq_lens=extend,
+                req_pool_indices=torch.tensor([2, 0]),
+                req_to_token=table,
+                seq_lens_sum=17,
+                kv_buffer_shape=torch.Size([32, 1]),
+                kv_cache_dtype=torch.bfloat16,
+                kv_cache_device="cpu",
+                create_chunked_prefix_cache_kv_indices_fn=kernel,
+            )
+        kernel.__getitem__.assert_called_once_with((2,))
+        kernel.__getitem__.return_value.assert_called_once()
+        packed.__getitem__.return_value.assert_called_once()
+        expected = torch.cat([table[2, :4], table[0, :8]])[1::4] // 4
+        torch.testing.assert_close(result.dcp_local_prefix_kv_indices, expected)
+        self.assertEqual(result.dcp_kv_buffer.shape, (17, 1))
+        self.assertEqual(result.dcp_extend_prefix_lens_sum, 12)
 
     def test_gqa_current_chunk_selects_kv_for_the_global_dcp_head_layout(self):
         """A local Q shard must not restart GQA mapping at KV head zero."""
