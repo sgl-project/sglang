@@ -1577,9 +1577,14 @@ impl<K: ChildKeyType> NodeArena<K> {
 /// Links are indexed by arena slot: membership/removal are O(1), insertion is
 /// amortized O(1), and iteration visits only current members.
 pub struct NodeSet {
+    /// Per arena slot: `Some((previous, next))` in insertion order, or `None` if absent.
+    /// `END` marks a missing neighbor at either end.
     links: Vec<Option<(NodeIdx_, NodeIdx_)>>,
+    /// First member in insertion order, or `END` when empty.
     head: NodeIdx_,
+    /// Last member in insertion order; new members append here. `END` when empty.
     tail: NodeIdx_,
+    /// Number of current members, excluding absent slots in `links`.
     len: usize,
 }
 
@@ -1646,6 +1651,7 @@ impl NodeSet {
         self.len -= 1;
     }
 
+    /// Visit members from `head` to `tail` by following each entry's `next` link.
     pub fn iter(&self) -> impl ExactSizeIterator<Item = NodeIdx_> + '_ {
         // Keep an exact size hint so eviction heaps can reserve once.
         NodeSetIter {
