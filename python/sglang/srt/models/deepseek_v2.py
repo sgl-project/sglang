@@ -53,7 +53,6 @@ from sglang.srt.configs.model_config import (
     is_glm_moe_dsa,
 )
 from sglang.srt.distributed import divide
-from sglang.srt.distributed.parallel_state import get_tp_group
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
@@ -229,15 +228,11 @@ if _use_aiter:
     pass
 
 if _is_hip:
-    from sglang.kernels.ops.communication.all_reduce_mhc_hip import (
-        all_reduce_mhc_post,
-    )
     from sglang.srt.models.deepseek_common.amd import deepseek_v2_hip_act as _hip_act
-    from sglang.srt.models.deepseek_common.amd.deepseek_v4_fused_mhc import (
-        ALL_REDUCE_MHC_MAX_ROWS,
-    )
+    from sglang.srt.models.deepseek_common.amd import deepseek_v2_hip_moe as _hip_moe
 else:
     _hip_act = None
+    _hip_moe = None
 
 if _is_cuda:
     from sglang.kernels.ops.gemm.tiny_gemm import tiny_gemm_bf16
@@ -1022,26 +1017,11 @@ class DeepseekV2MoE(nn.Module):
         return self.gate(hidden_states, gemm_output_zero_allocator), None
 
     def _all_reduce_output(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        """Post-experts all-reduce; on ROCm the eagerly built 1-8 row mHC states take the
-        fused all-reduce + post kernel."""
+        """Post-experts all-reduce of a DeepSeek-V4 layer; the mHC post fusion state,
+        when one is active, learns whether the reduction ran here."""
+        if _is_hip:
+            return _hip_moe.all_reduce_output(self, hidden_states)
         mhc = current_mhc_post_fusion()
-        if (
-            mhc is not None
-            and _is_hip
-            and not self._shared_expert_tp1
-            and not mhc.overlap_only
-            and mhc.post is not None
-            and 1 <= hidden_states.shape[0] <= ALL_REDUCE_MHC_MAX_ROWS
-        ):
-            mhc.output = all_reduce_mhc_post(
-                hidden_states,
-                mhc.residual,
-                mhc.post,
-                mhc.comb,
-                get_tp_group().ca_comm,
-            )
-            # the decoder reads mhc.output; the return keeps the DP wrapper's tensor contract
-            return hidden_states
         if mhc is not None:
             mhc.start_stats_before_all_reduce()
         return post_experts_all_reduce(hidden_states)
@@ -1291,17 +1271,8 @@ class DeepseekV2MoE(nn.Module):
     def _fuse_shared_into_reduce(
         self, skip_shared_experts: bool, num_tokens: int
     ) -> bool:
-        """aiter: the shared expert runs first so the experts' top-k reduction can add
-        it in one launch. shared_experts exists only when the checkpoint has one
-        that is not fused into the routed kernel."""
-        return bool(
-            _use_aiter
-            and envs.SGLANG_OPT_HIP_FUSED_MOE_REDUCE_ADD.get()
-            and getattr(self, "shared_experts", None) is not None
-            and not self._shared_expert_tp1
-            and not self._fuse_shared_experts_inside_sbo
-            and not skip_shared_experts
-            and num_tokens > 0
+        return _use_aiter and _hip_moe.fuse_shared_into_reduce(
+            self, skip_shared_experts, num_tokens
         )
 
     def forward_normal(

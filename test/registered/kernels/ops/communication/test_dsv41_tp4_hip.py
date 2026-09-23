@@ -243,7 +243,7 @@ def test_moe_model_handoff(group, rows, dual, defer, shared_tp1):
             sp_active=False, fuse_mlp_allreduce=False, flashinfer_trtllm_bypass=False
         ),
         patch(
-            "sglang.srt.models.deepseek_v2.post_experts_all_reduce",
+            "sglang.srt.models.deepseek_common.amd.deepseek_v2_hip_moe.post_experts_all_reduce",
             side_effect=group.all_reduce,
         ) as original_reduce,
         patch(
