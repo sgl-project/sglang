@@ -94,6 +94,7 @@ class Parallel(msgspec.Struct):
                 "follow_bootstrap_room",
                 "total_requests",
                 "total_tokens",
+                "routing_key",
             ],
         ),
     ] = "auto"
