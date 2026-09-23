@@ -170,7 +170,7 @@ def handle_decode_context_parallelism(server_args: Any):
             "--decode-context-parallel-size) must be >= 1, but got "
             f"dcp_size={cfg.dcp_size}."
         )
-    if cfg.dcp_comm_backend in ("a2a", "fi_a2a") and cfg.dcp_size <= 1:
+    if cfg.dcp_comm_backend in ("a2a", "fi_a2a", "fi_a2a_fused") and cfg.dcp_size <= 1:
         raise ValueError(
             f"--dcp-comm-backend {cfg.dcp_comm_backend} only affects the "
             "decode context-parallel attention reduction and therefore "
@@ -184,13 +184,21 @@ def handle_decode_context_parallelism(server_args: Any):
             "within one MNNVL domain. Use 'a2a' or 'ag_rs' elsewhere, or leave "
             "the flag unset to resolve it."
         )
+    if cfg.dcp_comm_backend == "fi_a2a_fused" and not get_platform().is_cuda:
+        raise ValueError(
+            "--dcp-comm-backend fi_a2a_fused delegates both the exchange and the "
+            "LSE reduce to FlashInfer's fused kernel, which requires Blackwell and "
+            "a DCP group within one NVLink domain. Use 'a2a' or 'ag_rs' elsewhere, "
+            "or leave the flag unset to resolve it."
+        )
     if cfg.dcp_replicate_q_proj:
         if cfg.dcp_size <= 1:
             raise ValueError("--dcp-replicate-q-proj requires --dcp-size > 1.")
-        if cfg.dcp_comm_backend not in ("a2a", "fi_a2a"):
+        if cfg.dcp_comm_backend not in ("a2a", "fi_a2a", "fi_a2a_fused"):
             raise ValueError(
-                "--dcp-replicate-q-proj only applies to the a2a/fi_a2a DCP "
-                "communication backend (it removes the head-dim Q all-gather); "
+                "--dcp-replicate-q-proj only applies to the a2a/fi_a2a/"
+                "fi_a2a_fused DCP communication backend (it removes the "
+                "head-dim Q all-gather); "
                 f"got --dcp-comm-backend={cfg.dcp_comm_backend}."
             )
 

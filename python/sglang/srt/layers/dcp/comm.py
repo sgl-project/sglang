@@ -18,8 +18,13 @@ The two LSE-merge variants kept separate (bodies are backend-forced, see
 PR #25090 vs #14194):
   - cp_lse_ag_out_rs_mha: torch / natural-log logsumexp / all-reduce + head slice
   - cp_lse_ag_out_rs_mla: Triton (log2/exp2) correction / reduce-scatter
+
+The a2a family exchanges head partials instead: a2a (NCCL) and fi_a2a
+(FlashInfer MNNVL) both combine locally with a Triton kernel, while
+fi_a2a_fused does the exchange and the merge in one FlashInfer kernel.
 """
 
+import logging
 import warnings
 from typing import Optional
 
@@ -39,6 +44,8 @@ from sglang.srt.distributed.parallel_state import GroupCoordinator
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import is_hip
 from sglang.srt.utils.common import is_fi_a2a_supported
+
+logger = logging.getLogger(__name__)
 
 _is_hip = is_hip()
 
@@ -486,6 +493,11 @@ def dcp_a2a_lse_reduce(
             cp_attn_out, cp_attn_lse, cp_group, is_lse_base_on_e
         )
 
+    if comm_backend == "fi_a2a_fused":
+        return _dcp_fi_a2a_fused_lse_reduce(
+            cp_attn_out, cp_attn_lse, cp_group, is_lse_base_on_e
+        )
+
     N = cp_group.world_size
     B, H, D = cp_attn_out.shape
     assert H % N == 0, f"num_heads ({H}) must be divisible by dcp_size ({N})"
@@ -586,3 +598,182 @@ def _dcp_fi_a2a_lse_reduce(
         recv_output, recv_lse, is_lse_base_on_e=is_lse_base_on_e
     )
     return combined
+
+
+# fi_a2a_fused (flashinfer #4929): fuses the exchange and the LSE merge into one
+# kernel. NCCL LSA symmetric memory, not the MNNVL FIFO fi_a2a uses, hence a
+# separate workspace.
+_FI_A2A_FUSED_STATE: Optional[dict] = None
+
+# Default stream + the global graph-capture stream. Rendezvous is collective and
+# not capturable, so per-stream workspaces cannot be created on demand.
+_FI_A2A_FUSED_NUM_STREAMS = 2
+
+
+def init_fi_a2a_fused_workspace(
+    cp_group: "GroupCoordinator",
+    *,
+    max_tokens: int,
+    local_heads: int,
+    head_dim: int,
+    dtype: torch.dtype,
+) -> None:
+    """Allocate the fi_a2a_fused workspaces. Must run before CUDA-graph capture."""
+    global _FI_A2A_FUSED_STATE
+    if _FI_A2A_FUSED_STATE is not None:
+        return
+    if cp_group.world_size == 1:
+        return
+
+    import torch.distributed as dist
+
+    try:
+        from flashinfer.comm import decode_cp_a2a_lse_reduce_create_workspace
+    except ImportError as e:
+        raise ImportError(
+            "--dcp-comm-backend fi_a2a_fused requires FlashInfer with the fused "
+            "DCP A2A + LSE reduce op (flashinfer #4929, unreleased as of 0.6.x); "
+            "could not import decode_cp_a2a_lse_reduce_create_workspace from "
+            "flashinfer.comm. Use --dcp-comm-backend fi_a2a or a2a otherwise."
+        ) from e
+
+    cp_size = cp_group.world_size
+    cp_rank = cp_group.rank_in_group
+    parallel = get_parallel()
+
+    # The kernel asserts one NCCL LSA domain, the same topology fi_a2a gates on.
+    if not is_fi_a2a_supported(
+        dcp_size=cp_size,
+        tp_size=parallel.tp_size,
+        pp_size=parallel.pp_size,
+        nnodes=parallel.nnodes,
+    ):
+        raise RuntimeError(
+            "--dcp-comm-backend fi_a2a_fused needs a Blackwell system whose DCP "
+            f"group shares one NVLink domain (got dcp_size={cp_size}, "
+            f"tp_size={parallel.tp_size}, pp_size={parallel.pp_size}, "
+            f"nnodes={parallel.nnodes}). Use --dcp-comm-backend a2a or ag_rs "
+            "otherwise."
+        )
+
+    if dtype not in (torch.float16, torch.bfloat16):
+        raise ValueError(
+            f"--dcp-comm-backend fi_a2a_fused supports fp16/bf16 attention output, "
+            f"got {dtype}. Unlike a2a (which ships the partials as opaque bytes), "
+            "the fused kernel reduces in-place and has no fp8 path -- use "
+            "--dcp-comm-backend a2a for fp8 KV-cache configurations."
+        )
+    itemsize = torch.empty((), dtype=dtype).element_size()
+    if head_dim * itemsize % 16 != 0:
+        raise ValueError(
+            f"--dcp-comm-backend fi_a2a_fused needs 16-byte aligned head rows, got "
+            f"head_dim={head_dim} x {itemsize}B = {head_dim * itemsize}B."
+        )
+    if cp_size > 64:
+        raise ValueError(
+            f"--dcp-comm-backend fi_a2a_fused supports at most 64 ranks, got {cp_size}."
+        )
+
+    from flashinfer.comm import decode_cp_a2a_lse_reduce_workspace_size
+
+    nbytes = decode_cp_a2a_lse_reduce_workspace_size(
+        max_tokens, local_heads, cp_size, head_dim, dtype
+    )
+    logger.info(
+        "fi_a2a_fused: allocating %d x %.1f MiB NCCL-symmetric workspaces "
+        "(max_tokens=%d, local_heads=%d, head_dim=%d, cp_size=%d)",
+        _FI_A2A_FUSED_NUM_STREAMS,
+        nbytes / (1 << 20),
+        max_tokens,
+        local_heads,
+        head_dim,
+        cp_size,
+    )
+    workspaces = [
+        decode_cp_a2a_lse_reduce_create_workspace(
+            max_tokens=max_tokens,
+            local_heads=local_heads,
+            cp_size=cp_size,
+            head_dim=head_dim,
+            dtype=dtype,
+            group=cp_group.device_group,
+        )
+        for _ in range(_FI_A2A_FUSED_NUM_STREAMS)
+    ]
+    # No rank may publish a remote readiness word before every rank has finished.
+    dist.barrier(group=cp_group.device_group)
+    _FI_A2A_FUSED_STATE = {
+        "pool": workspaces,
+        "by_stream": {},
+        "cp_rank": cp_rank,
+        "max_tokens": max_tokens,
+    }
+
+
+def _fi_a2a_fused_workspace_for_current_stream(state: dict) -> torch.Tensor:
+    """Bind one pre-allocated workspace per ordered CUDA stream."""
+    stream_id = int(torch.cuda.current_stream().cuda_stream)
+    workspace = state["by_stream"].get(stream_id)
+    if workspace is None:
+        if not state["pool"]:
+            raise RuntimeError(
+                "--dcp-comm-backend fi_a2a_fused ran out of per-stream workspaces "
+                f"({_FI_A2A_FUSED_NUM_STREAMS} pre-allocated, a "
+                f"{len(state['by_stream']) + 1}th CUDA stream appeared). Workspaces "
+                "cannot be allocated lazily because rendezvous is collective and "
+                "not graph-capturable. PDMUX captures one stream per stream group "
+                "and is the expected cause; raise _FI_A2A_FUSED_NUM_STREAMS to "
+                "1 + the number of capture streams, or use --dcp-comm-backend fi_a2a."
+            )
+        workspace = state["pool"].pop()
+        state["by_stream"][stream_id] = workspace
+    return workspace
+
+
+def _dcp_fi_a2a_fused_lse_reduce(
+    cp_attn_out: torch.Tensor,
+    cp_attn_lse: torch.Tensor,
+    cp_group: "GroupCoordinator",
+    is_lse_base_on_e: bool = True,
+) -> torch.Tensor:
+    """Same send layout as fi_a2a, but the LSE is its own fp32 tensor rather than
+    slot 0 of a padded stats pair, and the op returns the combined output."""
+    from flashinfer.comm import decode_cp_a2a_lse_reduce
+
+    state = _FI_A2A_FUSED_STATE
+    assert state is not None, (
+        "fi_a2a_fused workspace not initialized — call "
+        "init_fi_a2a_fused_workspace(dcp_group, ...) at model-runner init "
+        "(before CUDA graph capture)."
+    )
+
+    N = cp_group.world_size
+    B, H, D = cp_attn_out.shape
+    assert H % N == 0, f"num_heads ({H}) must be divisible by dcp_size ({N})"
+    H_per_rank = H // N
+    assert B <= state["max_tokens"], (
+        f"batch {B} exceeds the fi_a2a_fused workspace bound "
+        f"({state['max_tokens']}); the workspace is sized at init and cannot grow."
+    )
+
+    partial_o = torch.empty(
+        B, H_per_rank, N, D, dtype=cp_attn_out.dtype, device=cp_attn_out.device
+    )
+    partial_lse = torch.empty(
+        B, H_per_rank, N, dtype=torch.float32, device=cp_attn_out.device
+    )
+    dcp_pack_a2a_send(
+        cp_attn_out,
+        cp_attn_lse,
+        partial_o.permute(2, 0, 1, 3),
+        partial_lse.permute(2, 0, 1),
+    )
+
+    return decode_cp_a2a_lse_reduce(
+        partial_o,
+        partial_lse,
+        _fi_a2a_fused_workspace_for_current_stream(state),
+        state["cp_rank"],
+        N,
+        lse_mode="basee" if is_lse_base_on_e else "base2",
+    )

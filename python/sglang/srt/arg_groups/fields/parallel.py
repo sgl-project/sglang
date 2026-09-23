@@ -126,10 +126,13 @@ class Parallel(msgspec.Struct):
             help="Communication backend for the decode context-parallel (DCP) "
             "attention reduction: 'ag_rs' (AllGather + ReduceScatter), 'a2a' "
             "(fused NCCL All-to-All exchange of output+LSE + local Triton LSE "
-            "combine), or 'fi_a2a' (FlashInfer MNNVL All-to-All kernel; requires "
-            "Blackwell and a DCP group within one MNNVL domain). Unset resolves "
-            "to 'fi_a2a' where supported, else 'a2a' on CUDA/ROCm, else 'ag_rs'.",
-            choices=["ag_rs", "a2a", "fi_a2a"],
+            "combine), 'fi_a2a' (FlashInfer MNNVL All-to-All kernel; requires "
+            "Blackwell and a DCP group within one MNNVL domain), or "
+            "'fi_a2a_fused' (FlashInfer fused All-to-All + LSE reduce in a single "
+            "kernel; same topology requirement as 'fi_a2a', fp16/bf16 only). Unset "
+            "resolves to 'fi_a2a' where supported, else 'a2a' on CUDA/ROCm, else "
+            "'ag_rs'.",
+            choices=["ag_rs", "a2a", "fi_a2a", "fi_a2a_fused"],
             resolvable=True,
         ),
     ] = None
