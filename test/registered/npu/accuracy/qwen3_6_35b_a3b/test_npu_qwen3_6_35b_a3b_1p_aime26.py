@@ -10,6 +10,10 @@ from sglang.test.ci.ci_register import register_npu_ci
 
 register_npu_ci(est_time=6500, suite="nightly-acc-2-npu-a3", nightly=True)
 
+# TEMPORARY: extra registration for the temperature=0 verification job in
+# nightly-test-npu.yml. Remove before merging.
+register_npu_ci(est_time=6500, suite="nightly-acc-temp0-2-npu-a3", nightly=True)
+
 QWEN3_6_35B_A3B_3K5_1K5_ENVS = {
     "PYTORCH_NPU_ALLOC_CONF": "expandable_segments:True",
     "STREAMS_PER_DEVICE": "32",
