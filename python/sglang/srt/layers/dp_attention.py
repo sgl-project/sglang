@@ -20,6 +20,7 @@ from sglang.srt.distributed import (
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
+from sglang.srt.elastic_ep.topology import physical_ep_rank_to_dp_rank
 from sglang.srt.environ import envs
 from sglang.srt.runtime_context import (
     derive_attention_ranks,
@@ -73,12 +74,15 @@ def dp_gather_width() -> int:
 def dp_gather_slot() -> int:
     """Return this process's index in the DP gather.
 
-    After elastic scale-up, use the TP rank plus the join offset; otherwise
-    use the attention-DP rank.
+    After elastic scale-up, convert the physical EP rank to its logical
+    attention-DP replica; otherwise use the local attention-DP rank.
     """
     parallel = get_parallel()
     if world_dp_gather_enabled():
-        return parallel.tp_rank + parallel.ep_join_rank_offset
+        return physical_ep_rank_to_dp_rank(
+            parallel.tp_rank + parallel.ep_join_rank_offset,
+            parallel.attn_tp_size * parallel.attn_cp_size,
+        )
     return parallel.attn_dp_rank
 
 
