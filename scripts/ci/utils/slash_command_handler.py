@@ -613,7 +613,7 @@ def resolve_test_group_specs(group_name):
     """
     Resolve a test group name into /rerun-test specs.
 
-    A group maps to either a named cross-directory file set or a directory
+    A group maps to either a named set of test files/directories or a directory
     under test/registered/. For example, "hicache" maps to all test_*.py
     files under test/registered/hicache/.
 
@@ -638,14 +638,41 @@ def resolve_test_group_specs(group_name):
         missing = [
             test_spec
             for test_spec in test_specs
-            if not os.path.isfile(os.path.join("test", test_spec))
+            if not (
+                os.path.isfile(os.path.join("test", test_spec))
+                or os.path.isdir(os.path.join("test", test_spec))
+            )
         ]
         if missing:
             return [], (
-                f"Named test group `{group_name}` references missing files: "
+                f"Named test group `{group_name}` references missing paths: "
                 + ", ".join(f"`test/{path}`" for path in missing)
             )
-        return test_specs, None
+        expanded = []
+        for test_spec in test_specs:
+            path = os.path.join("test", test_spec)
+            if os.path.isfile(path):
+                expanded.append(test_spec)
+                continue
+            files = sorted(
+                glob.glob(os.path.join(path, "**", "test_*.py"), recursive=True)
+            )
+            if not files:
+                return [], f"No registered test files found in `{path}`."
+            for test_file in files:
+                with open(test_file, encoding="utf-8") as f:
+                    content = f.read()
+                # Directory membership follows CPU/CUDA dispatch support. Keep
+                # malformed CPU/CUDA registrations visible to detect_suite().
+                other_backends, _ = _extract_other_backends(content)
+                if other_backends and not re.search(
+                    r"^[^#\n]*register_(?:cpu|cuda)_ci\s*\(", content, re.MULTILINE
+                ):
+                    continue
+                expanded.append(os.path.relpath(test_file, "test"))
+        if not expanded:
+            return [], f"No CPU/CUDA test files found in test group `{group_name}`."
+        return list(dict.fromkeys(expanded)), None
 
     group_dir = os.path.join("test", "registered", group_name)
     if not os.path.isdir(group_dir):
