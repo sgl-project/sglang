@@ -203,6 +203,11 @@ To enable EAGLE speculative decoding the following parameters are relevant:
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>1.0</code></td>
     </tr>
     <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>--speculative-use-rejection-sampling</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Verify with rejection sampling instead of the target-only tree kernel, so that at <code>temperature &gt; 0</code> accepted tokens come from the target distribution. Requires a chain draft (<code>--speculative-eagle-topk 1</code>). A draft with a reduced (hot) vocabulary is supported: its proposal distribution is scattered onto the target vocabulary through the <code>d2t</code> map, which lowers acceptance but does not change the output distribution. A reduced draft vocabulary is not supported on a PD-disaggregation decode server. Do not combine with UNO, which manages its own stochastic verification.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>False</code></td>
+    </tr>
+    <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>--speculative-attention-mode</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Attention mode for speculative operations (<code>prefill</code> or <code>decode</code>), affecting both target verification and draft extension.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>"prefill"</code></td>
@@ -410,8 +415,10 @@ print(response.choices[0].message.content)
 
 For stochastic EAGLE, EAGLE3, or NEXTN decoding on NVIDIA CUDA or AMD ROCm, add
 `--speculative-use-block-verification`
-with `--speculative-eagle-topk 1`. The draft model must produce a full target-vocabulary
-proposal distribution, as required by the existing rejection sampler.
+with `--speculative-eagle-topk 1`. The verifier reads the draft's proposal distribution
+in the target vocabulary. For an EAGLE3 draft with a reduced (hot) vocabulary, the
+distribution is scattered there through the draft's `d2t` map; this combination is not
+supported on a PD-disaggregation decode server.
 
 The same flag applies to the DFlash family (`DFLASH` and `DSPARK`) on CUDA or ROCm
 when the draft samples its proposals: DSpark drafts, DFlash checkpoints with a
