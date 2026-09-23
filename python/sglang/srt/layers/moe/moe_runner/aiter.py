@@ -352,11 +352,6 @@ def _is_mori_dispatch_output(dispatch_output: Any) -> bool:
     return hasattr(dispatch_output, "origin_topk_ids")
 
 
-def _is_mori_epv2_output(dispatch_output: Any) -> bool:
-    """Whether dispatch exposes MORI EPv2's token-major view."""
-    return type(dispatch_output).__module__.endswith(".token_dispatcher.moriepv2")
-
-
 def _resolve_mori_quant_type(
     dispatch_a1_dtype: torch.dtype,
     dispatch_scale: Optional[torch.Tensor],
@@ -415,12 +410,9 @@ def _pre_permute_deepep_to_aiter(
         a1_scale = dispatch_output.hidden_states_scale
         num_local_tokens = dispatch_output.num_recv_tokens_per_expert
         output_dtype = dispatch_output.out_dtype
-        if _is_mori_epv2_output(dispatch_output):
-            output = dispatch_output.expert_output
-            # Use the receive cap selected by the EPv2 dispatcher, including
-            # its metadata checks and trimming opt-out.
-            mori_max = dispatch_output.recv_cap
-        else:
+        output = getattr(dispatch_output, "expert_output", None)
+        mori_max = getattr(dispatch_output, "recv_cap", None)
+        if mori_max is None:
             mori_max = get_int_env_var("SGLANG_MORI_MOE_MAX_INPUT_TOKENS", 0)
             if mori_max <= 0:
                 mori_max = _mori_decode_recv_bound(

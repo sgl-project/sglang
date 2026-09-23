@@ -6,7 +6,7 @@ from types import SimpleNamespace
 import torch
 import torch.distributed as dist
 
-import sglang.srt.layers.moe.token_dispatcher.moriepv2 as adapter
+import sglang.srt.layers.moe.token_dispatcher.moriep as adapter
 from sglang.srt.batch_overlap.two_batch_overlap import MaybeTboDeepEPDispatcher
 from sglang.srt.environ import envs
 from sglang.srt.layers.moe.topk import StandardTopKOutput
@@ -79,11 +79,11 @@ def main():
         dispatcher = MaybeTboDeepEPDispatcher(**kwargs)
     children = dispatcher._inners
     assert len(children) == 2
-    assert children[0]._comm_stream is children[1]._comm_stream
-    assert children[0]._geometry == (32, 4, 48, 4)
+    assert children[0]._get_impl()._comm_stream is children[1]._get_impl()._comm_stream
+    assert children[0]._get_impl()._geometry == (32, 4, 48, 4)
     for child in children:
         child.set_quant_config({"weight_dtype": torch.float4_e2m1fn_x2})
-    assert children[0].op is not children[1].op
+    assert children[0]._get_impl().mori_op is not children[1]._get_impl().mori_op
 
     failures = torch.zeros(1, dtype=torch.int32)
     inputs = []
@@ -151,8 +151,8 @@ def main():
             flush=True,
         )
     for child in children:
-        child.op.close()
-        child.op.comm.destroy()
+        child._get_impl().mori_op.close()
+        child._get_impl().mori_op.comm.destroy()
     dist.destroy_process_group()
     raise SystemExit(int(failures.item() != 0))
 
