@@ -1560,12 +1560,15 @@ echo "[drive_batch] \$(hostname) rank \${SPUR_NODEID:-?} elected driver"
 # records: a leg that failed in the monitor loop left an sbatch.out that simply
 # stopped mid-run, with the teardown lines never visible.
 #
-# A plain redirect, deliberately NOT `| tee`. With a pipeline, drive_batch waits
-# for the whole pipeline, and that does not finish when drive.sh does -- the
-# backgrounded `tail -F` on bench.log inherits drive.sh's stdout and holds the
-# pipe's write end open. drive.sh exited 0 and drive_exit was still unwritten
-# 11 minutes later, so the standby tasks kept the allocation alive and the leg
-# looked hung after it had actually passed.
+# A plain redirect, deliberately not a tee pipeline. With a pipeline,
+# drive_batch waits for the whole pipeline, and that does not finish when
+# drive.sh does -- the backgrounded tail on bench.log inherits drive.sh's
+# stdout and holds the pipe's write end open. drive.sh exited 0 and drive_exit
+# was still unwritten 11 minutes later, so the standby tasks kept the
+# allocation alive and the leg looked hung after it had actually passed.
+# No backticks anywhere in this heredoc: it is unquoted, so bash runs them at
+# generation time. The pair that used to be here printed a syntax error on
+# every launch and ran a stray tail on the submitting host.
 bash "$WORKDIR/drive.sh" "$WORKDIR" "$PW" "$DW" "$PN_PER" "$DN_PER" "$DIST_SOCK" "$ADDR_NIC" \
   > "$WORKDIR/drive_\$(hostname).log" 2>&1
 echo \$? > "$WORKDIR/drive_exit"
