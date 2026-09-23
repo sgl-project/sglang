@@ -62,6 +62,18 @@ class Serving(msgspec.Struct):
         int,
         "The worker num of the detokenizer manager.",
     ] = 1
+    tokenizer_worker_device: A[
+        str,
+        Arg(
+            help=(
+                "Device for tokenizer workers. 'auto' keeps the default CUDA IPC "
+                "tensor transport; 'cpu' runs tokenizer workers without a CUDA "
+                "context (forces CPU tensor transport and disables CUDA in worker "
+                "processes)."
+            ),
+            choices=["auto", "cpu"],
+        ),
+    ] = "auto"
     skip_tokenizer_init: A[
         bool, "If set, skip init tokenizer and pass input_ids in generate request."
     ] = False
