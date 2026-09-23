@@ -94,6 +94,19 @@ MODEL_ROOT="${MODEL_ROOT:-}"
 # Root used to RESOLVE the snapshot hash; defaults to MODEL_ROOT. Set it when
 # MODEL_ROOT is node-local and therefore unreadable from the driver node.
 MODEL_RESOLVE_ROOT="${MODEL_RESOLVE_ROOT:-$MODEL_ROOT}"
+# Optional node-local mirror of the model cache, for clusters where shared
+# storage cannot serve every rank at once. Resolution stays on the shared root:
+# resolve_snapshot runs on the driver node, which has no mirror. Must be assigned
+# after MODEL_RESOLVE_ROOT, which keeps the readable root.
+MODEL_LOCAL_ROOT="${MODEL_LOCAL_ROOT:-}"
+if [[ -n "$MODEL_LOCAL_ROOT" ]]; then
+    if [[ -z "$MODEL_RESOLVE_ROOT" ]]; then
+        echo "ERROR: MODEL_LOCAL_ROOT is set but MODEL_ROOT/MODEL_RESOLVE_ROOT is empty;" >&2
+        echo "       the snapshot hash has to be resolved against a root the driver can read." >&2
+        exit 1
+    fi
+    MODEL_ROOT="$MODEL_LOCAL_ROOT"
+fi
 MODEL_ROOT_FROM="${MODEL_ROOT_FROM:-/it-share/model_coverage}"
 relocate_model_root() {
     local p="$1"
