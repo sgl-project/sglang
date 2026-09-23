@@ -205,6 +205,59 @@ class TestFp8BlockwiseLinearBackends(_LinearBackendCheck):
         self._run("cutlass")
 
 
+@unittest.skipIf(get_device_sm() < 100, "FlashInfer groupwise FP8 needs Blackwell")
+class TestFp8BlockwisePrequantizedInput(CustomTestCase):
+    """A layer handed ``(fp8 q, scales)`` gives what it gives for the bf16 rows
+    it would have quantized itself into that same pair, bit for bit."""
+
+    @classmethod
+    def setUpClass(cls):
+        init_single_process_dist()
+
+    def _check(self, backend: str):
+        from sglang.kernels.ops.quantization.fp8_kernel import (
+            sglang_per_token_group_quant_fp8,
+        )
+
+        sm = get_device_sm()
+        # FlashInfer's CUTLASS groupwise kernel also serves SM120, where it is
+        # what auto dispatch picks; TRTLLM is SM100/103 only.
+        allowed = ["flashinfer_cutlass"]
+        if 100 <= sm < 110:
+            allowed.append("flashinfer_trtllm")
+        if backend not in allowed:
+            self.skipTest(f"{backend} not supported on SM{sm}")
+        torch.manual_seed(7)
+        for m, n, k in FP8_BLOCK_SHAPES:
+            with (
+                self.subTest(backend=backend, shape=(m, n, k)),
+                mock.patch.object(
+                    fp8_utils,
+                    "FP8_GEMM_RUNNER_BACKEND",
+                    Fp8GemmRunnerBackend(backend),
+                ),
+            ):
+                layer, _ = TestFp8BlockwiseLinearBackends._build_layer(n, k)
+                layer.quant_method.process_weights_after_loading(layer)
+                x = torch.randn((m, k), device="cuda", dtype=torch.bfloat16) / 10
+                expected, _ = layer(x)
+                q, scales = sglang_per_token_group_quant_fp8(x, 128)
+                for layout, s in (
+                    ("row-major", scales),
+                    ("column-major", scales.t().contiguous().t()),
+                ):
+                    with self.subTest(scales=layout):
+                        out, _ = layer((q, s))
+                        self.assertEqual(out.dtype, torch.bfloat16)
+                        self.assertTrue(torch.equal(out, expected))
+
+    def test_flashinfer_trtllm(self):
+        self._check("flashinfer_trtllm")
+
+    def test_flashinfer_cutlass(self):
+        self._check("flashinfer_cutlass")
+
+
 @unittest.skipIf(get_device_sm() < 90, "FP8 GEMM backends require SM90+")
 class TestMxfp8LinearBackends(_LinearBackendCheck):
     @staticmethod

@@ -982,26 +982,46 @@ def flashinfer_gemm_w8a8_block_fp8_linear_with_fallback(
     input_scale: Optional[torch.Tensor] = None,
     bias: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    assert input_scale is None
-
     input_2d = input.view(-1, input.shape[-1])
     backend = _get_flashinfer_groupwise_backend()
+    # A pre-quantized input is the fp8 per-token-group q and its fp32
+    # (m, k // block_k) scales, row- or column-major, and gives bf16 like the
+    # other backends that accept one.
+    out_dtype = torch.bfloat16 if input_scale is not None else input_2d.dtype
     # Fall back to triton for non-supported formats.
     # TODO: Check if flashinfer supports other output dtypes besides bf16.
-    if backend == "trtllm" and (
-        input_2d.shape[1] < 256 or input_2d.dtype != torch.bfloat16
-    ):
+    if backend == "trtllm" and (input_2d.shape[1] < 256 or out_dtype != torch.bfloat16):
         return triton_w8a8_block_fp8_linear(
-            input, weight, block_size, weight_scale, input_scale, bias
+            input,
+            weight,
+            block_size,
+            weight_scale,
+            # Triton reads its scales row-major.
+            None if input_scale is None else input_scale.contiguous(),
+            bias,
         )
 
     output_shape = [*input.shape[:-1], weight.shape[0]]
 
     # TRTLLM uses the existing SGLang column-major scale layout.
     # CUTLASS with scale_major_mode="MN" expects (k//block_k, m), so we normalize below.
-    q_input, x_scale = sglang_per_token_group_quant_fp8(
-        input_2d, block_size[1], column_major_scales=(backend == "trtllm")
-    )
+    if input_scale is None:
+        q_input, x_scale = sglang_per_token_group_quant_fp8(
+            input_2d, block_size[1], column_major_scales=(backend == "trtllm")
+        )
+    else:
+        assert input.dtype == torch.float8_e4m3fn, (
+            f"pre-quantized input must be float8_e4m3fn, got {input.dtype}"
+        )
+        q_input = input_2d
+        expected = (input_2d.shape[0], input_2d.shape[1] // block_size[1])
+        assert input_scale.shape == expected, (
+            f"pre-quantized input scales must be {expected}, "
+            f"got {tuple(input_scale.shape)}"
+        )
+        x_scale = (
+            input_scale.t().contiguous().t() if backend == "trtllm" else input_scale
+        )
     if backend == "cutlass":
         block_n, block_k = block_size
         m, k = input_2d.shape
@@ -1040,13 +1060,13 @@ def flashinfer_gemm_w8a8_block_fp8_linear_with_fallback(
         weight,
         x_scale,
         weight_scale,
-        out_dtype=input_2d.dtype,
+        out_dtype=out_dtype,
     )
 
     if bias is not None:
         output += bias
 
-    return output.to(dtype=input_2d.dtype).view(*output_shape)
+    return output.to(dtype=out_dtype).view(*output_shape)
 
 
 def flashinfer_deepgemm_w8a8_block_fp8_linear_with_fallback(
