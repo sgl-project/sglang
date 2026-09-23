@@ -33,7 +33,6 @@ if TYPE_CHECKING:
     import torch
 
     from sglang.srt.mem_cache.cache_init_params import CacheInitParams
-    from sglang.srt.mem_cache.hiradix_cache import HiRadixCache
     from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
     from sglang.srt.server_args import ServerArgs
 
@@ -2229,7 +2228,7 @@ def build_minimax_sparse_hicache_stack(
             "MiniMax-M3 sparse HiCache does not support pipeline parallelism "
             "(pp_size>1) yet."
         )
-    # mirror HiRadix's guard, which the Unified-tree strategy path otherwise skips.
+    # The Unified-tree strategy path does not reject value-bearing index layers.
     if sparse_pool.index_kv_pool is not None:
         raise ValueError(
             "MiniMax sparse HiCache currently supports index-k-only sparse layers; "
@@ -2301,124 +2300,3 @@ def build_minimax_sparse_hicache_stack(
         enable_storage_metrics=enable_storage_metrics,
     )
     return host_pool_group, cache_controller
-
-
-def attach_hybrid_minimax_sparse_pool_to_hiradix_cache(
-    radix_cache: HiRadixCache,
-    params: CacheInitParams,
-    *,
-    extra_config: dict,
-    prefetch_threshold: int,
-    enable_storage_metrics: bool,
-    load_cache_event,
-) -> None:
-    """Attach HostPoolGroup (KV + index K) + HybridCacheController for HiRadixCache."""
-    from sglang.srt.mem_cache.memory_pool import MiniMaxSparseKVPool
-
-    try:
-        sparse_pool = radix_cache.kv_cache
-        if not isinstance(sparse_pool, MiniMaxSparseKVPool):
-            raise TypeError(
-                f"Expected MiniMaxSparseKVPool, got {type(sparse_pool).__name__}"
-            )
-        if sparse_pool.index_kv_pool is not None:
-            raise ValueError(
-                "MiniMax M3 HiCache L2 currently supports index-k-only sparse layers "
-                "(sparse_disable_index_value=1 for all sparse layers). "
-                "This model has index_kv_pool layers; INDEXER_KV sidecar is not "
-                "implemented yet."
-            )
-
-        main_pool = sparse_pool.main_pool
-        if sparse_pool.index_k_pool is None:
-            host_pool_group, cache_controller = build_kv_only_stack(
-                params=params,
-                kv_pool=main_pool,
-                full_layer_mapping={
-                    layer_id: layer_id for layer_id in range(main_pool.layer_num)
-                },
-                load_cache_event=load_cache_event,
-                storage_backend=get_memory().hicache_storage_backend,
-                use_mla=False,
-                prefetch_threshold=prefetch_threshold,
-                model_name=get_serving().served_model_name,
-                storage_backend_extra_config=extra_config,
-                enable_storage_metrics=enable_storage_metrics,
-            )
-            pools_desc = "KV"
-        else:
-            host_pool_group, cache_controller = build_minimax_sparse_hicache_stack(
-                params=params,
-                sparse_pool=sparse_pool,
-                load_cache_event=load_cache_event,
-                storage_backend=get_memory().hicache_storage_backend,
-                prefetch_threshold=prefetch_threshold,
-                model_name=get_serving().served_model_name,
-                storage_backend_extra_config=extra_config,
-                enable_storage_metrics=enable_storage_metrics,
-            )
-            pools_desc = "KV + INDEXER(k-only)"
-
-        sparse_pool.register_layer_transfer_counter(cache_controller.layer_done_counter)
-        radix_cache.full_kv_pool_host = host_pool_group.get_pool(PoolName.KV)
-        radix_cache.token_to_kv_pool_host = host_pool_group
-        radix_cache.cache_controller = cache_controller
-        logger.info(
-            "Attached hybrid MiniMax sparse pool stack to HiRadixCache: pools=%s, "
-            "transfer_layer_id_max=%s, sparse_index_k_layers=%s",
-            pools_desc,
-            main_pool.layer_num,
-            len(sparse_pool.index_k_layer_id_mapping),
-        )
-    except Exception:
-        logger.exception("attach_hybrid_minimax_sparse_pool_to_hiradix_cache failed")
-        raise
-
-
-def attach_hybrid_dsa_pool_to_hiradix_cache(
-    radix_cache: HiRadixCache,
-    params: CacheInitParams,
-    *,
-    extra_config: dict,
-    prefetch_threshold: int,
-    enable_storage_metrics: bool,
-    load_cache_event,
-) -> None:
-    """Attach HostPoolGroup (KV + indexer) + HybridCacheController for HiRadixCache.
-
-    This entrypoint is currently intended only for HiRadixCache's DSA path.
-    """
-    try:
-        kv = radix_cache.kv_cache
-        layer_mapping = {layer_id: layer_id for layer_id in range(kv.layer_num)}
-        host_pool_group, cache_controller = build_anchor_sidecar_stack(
-            params=params,
-            kv_pool=kv,
-            sidecar_pool_name=PoolName.INDEXER,
-            full_layer_mapping=layer_mapping,
-            load_cache_event=load_cache_event,
-            storage_backend=get_memory().hicache_storage_backend,
-            use_mla=True,
-            override_kv_cache_dim=kv.kv_cache_dim,
-            prefetch_threshold=prefetch_threshold,
-            sidecar_host_pool_factory=lambda kv_host_pool: DSAIndexerPoolHost(
-                kv,
-                kv_host_pool,
-                get_memory().hicache_mem_layout,
-                allocator_type=_get_allocator_type(),
-            ),
-            model_name=get_serving().served_model_name,
-            storage_backend_extra_config=extra_config,
-            enable_storage_metrics=enable_storage_metrics,
-        )
-        radix_cache.full_kv_pool_host = host_pool_group.get_pool(PoolName.KV)
-        radix_cache.token_to_kv_pool_host = host_pool_group
-        radix_cache.cache_controller = cache_controller
-        logger.info(
-            "Attached hybrid DSA pool stack to HiRadixCache: pools=KV + INDEXER, "
-            "transfer_layer_id_max=%s",
-            len(layer_mapping),
-        )
-    except Exception:
-        logger.exception("attach_hybrid_dsa_pool_to_hiradix_cache failed")
-        raise
