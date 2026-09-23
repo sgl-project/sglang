@@ -863,6 +863,18 @@ class NemotronHModel(nn.Module):
             self.norm_f = PPMissingLayer(return_tuple=True)
         self.layers_to_capture: set[int] = set()
 
+    def _capture_hidden_states(self, hidden_states, residual, boundary_idx):
+        if (
+            is_dp_attention_enabled()
+            and residual is not None
+            and boundary_idx > 0
+            and is_attn_layer(self.config.hybrid_override_pattern[boundary_idx - 1])
+        ):
+            # Reduce a copy so the next layer still receives a TP partial.
+            hidden_states = attn_tp_all_reduce(hidden_states.clone())
+        # Later norms update the input residual in place.
+        return hidden_states.clone() if residual is None else hidden_states + residual
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -891,7 +903,7 @@ class NemotronHModel(nn.Module):
                     hidden_states = tensor_model_parallel_all_reduce(hidden_states)
                     hidden_states._sglang_needs_allreduce_fusion = False
                 aux_hidden_states.append(
-                    hidden_states if residual is None else hidden_states + residual
+                    self._capture_hidden_states(hidden_states, residual, i)
                 )
             layer = self.layers[i]
             if not isinstance(layer, Layers):
@@ -913,7 +925,7 @@ class NemotronHModel(nn.Module):
                 hidden_states = tensor_model_parallel_all_reduce(hidden_states)
                 hidden_states._sglang_needs_allreduce_fusion = False
             aux_hidden_states.append(
-                hidden_states if residual is None else hidden_states + residual
+                self._capture_hidden_states(hidden_states, residual, self.end_layer)
             )
         hidden_states, _ = self.norm_f(hidden_states, residual)
         if aux_hidden_states:
