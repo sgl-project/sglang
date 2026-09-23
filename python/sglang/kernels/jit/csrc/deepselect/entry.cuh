@@ -15,6 +15,7 @@
 #include "vendor/cuda_kernels/v3_cluster/topk_select.cuh"
 #include "vendor/cuda_kernels/v3_fp32/topk_select.cuh"
 #include <cstdint>
+#include <limits>
 #include <type_traits>
 
 namespace sglang {
@@ -32,6 +33,27 @@ namespace sglang {
 namespace deepselect {
 
 namespace details {
+
+class ScopedCudaDevice {
+ public:
+  explicit ScopedCudaDevice(DLDevice device) {
+    CHECK_HOST(device.device_type == kDLCUDA) << "input must be a CUDA tensor";
+    CHECK_CUDA(cudaGetDevice(&previous_device_));
+    changed_ = previous_device_ != device.device_id;
+    if (changed_) CHECK_CUDA(cudaSetDevice(device.device_id));
+  }
+
+  ~ScopedCudaDevice() {
+    if (changed_) cudaSetDevice(previous_device_);
+  }
+
+  ScopedCudaDevice(const ScopedCudaDevice&) = delete;
+  ScopedCudaDevice& operator=(const ScopedCudaDevice&) = delete;
+
+ private:
+  int previous_device_ = -1;
+  bool changed_ = false;
+};
 
 /// The two families of one-CTA-per-row kernels live in separate namespaces.
 template <typename Config>
@@ -61,9 +83,12 @@ auto make_plan(
     tvm::ffi::TensorView input,
     tvm::ffi::Optional<tvm::ffi::TensorView> output_value,
     tvm::ffi::TensorView output_index,
+    tvm::ffi::TensorView kernel_output_index,
+    tvm::ffi::Optional<tvm::ffi::TensorView> begin,
     tvm::ffi::Optional<tvm::ffi::TensorView> end,
     tvm::ffi::Optional<tvm::ffi::TensorView> output_index_offset,
     int64_t topk,
+    int64_t input_storage_bytes,
     int64_t idx_oob_fill_value,
     double value_oob_fill_value,
     bool abort_when_nan_found) -> LaunchPlan {
@@ -75,21 +100,35 @@ auto make_plan(
   auto vocab = SymbolicSize{"vocab_size"};
   auto input_stride = SymbolicSize{"input_row_stride"};
   auto index_stride = SymbolicSize{"index_row_stride"};
+  auto kernel_index_stride = SymbolicSize{"kernel_index_row_stride"};
   auto value_stride = SymbolicSize{"value_row_stride"};
   auto device = SymbolicDevice{};
+
+  CHECK_HOST(topk > 0 && topk <= static_cast<int64_t>(Config::max_topk))
+      << "topk must be in (0, " << Config::max_topk << "] for this module, got " << topk;
+  CHECK_HOST(!begin.has_value()) << "`begin` is not supported currently";
+  CHECK_HOST(
+      idx_oob_fill_value >= std::numeric_limits<int32_t>::min() &&
+      idx_oob_fill_value <= std::numeric_limits<int32_t>::max())
+      << "idx_oob_fill_value must fit in int32";
+  CHECK_HOST(input_storage_bytes >= 0) << "input_storage_bytes must be non-negative";
 
   TensorMatcher({batch, vocab})
       .with_strides({input_stride, 1})
       .with_device<kDLCUDA>(device)
       .with_dtype<ValueT>()
-      .ensure_alignment(INPUT_STRIDE_ALIGNMENT_REQUIREMENT)
       .verify(input);
   TensorMatcher({batch, topk})
       .with_strides({index_stride, 1})
       .with_device<kDLCUDA>(device)
       .with_dtype<OutIdxT>()
-      .ensure_alignment(OUTPUT_STRIDE_ALIGNMENT_REQUIREMENT)
       .verify(output_index);
+  TensorMatcher({batch, topk})
+      .with_strides({kernel_index_stride, 1})
+      .with_device<kDLCUDA>(device)
+      .with_dtype<OutIdxT>()
+      .ensure_alignment(OUTPUT_STRIDE_ALIGNMENT_REQUIREMENT)
+      .verify(kernel_output_index);
 
   void* output_value_ptr = nullptr;
   uint64_t stride_output_value = 0;
@@ -120,11 +159,42 @@ auto make_plan(
 
   const auto batch_size = static_cast<uint32_t>(batch.unwrap());
   const auto vocab_size = static_cast<uint32_t>(vocab.unwrap());
-  CHECK_HOST(topk > 0 && topk <= static_cast<int64_t>(Config::max_topk))
-      << "topk must be in (0, " << Config::max_topk << "] for this module, got " << topk;
   CHECK_HOST(vocab_size < MAX_VOCAB_SIZE) << "vocab_size must be < " << MAX_VOCAB_SIZE << ", got " << vocab_size;
 
   const DLDevice dev = device.unwrap();
+  const auto sm_version = host::runtime::get_sm_version(dev.device_id);
+  CHECK_HOST(sm_version == 90 || sm_version == 100 || sm_version == 103)
+      << "DeepSelect does not support SM" << sm_version;
+  CHECK_HOST(sm_version * 10 == SGL_CUDA_ARCH)
+      << "DeepSelect JIT module was compiled for SM" << SGL_CUDA_ARCH / 10 << " but input is on SM" << sm_version;
+  if constexpr (Config::cluster_size > 1) {
+    CHECK_HOST(
+        (sm_version == 90 && Config::cluster_size == 8) ||
+        ((sm_version == 100 || sm_version == 103) && Config::cluster_size == 16))
+        << "DeepSelect cluster size " << Config::cluster_size << " is invalid for SM" << sm_version;
+  }
+
+  const auto input_stride_elements = input_stride.unwrap();
+  CHECK_HOST(input_stride_elements >= 0) << "input row stride must be non-negative";
+  CHECK_HOST(
+      static_cast<uint64_t>(input_stride_elements) * sizeof(ValueT) % INPUT_STRIDE_ALIGNMENT_REQUIREMENT == 0)
+      << "input row stride must be a multiple of " << INPUT_STRIDE_ALIGNMENT_REQUIREMENT << " bytes";
+  CHECK_HOST(
+      static_cast<uint64_t>(index_stride.unwrap()) * sizeof(OutIdxT) % OUTPUT_STRIDE_ALIGNMENT_REQUIREMENT == 0)
+      << "output_index row stride must be a multiple of " << OUTPUT_STRIDE_ALIGNMENT_REQUIREMENT << " bytes";
+
+  if (batch_size != 0 && vocab_size != 0) {
+    const uint64_t address_alignment = sm_version == 90 ? 16 : 32;
+    CHECK_HOST(reinterpret_cast<uintptr_t>(input.data_ptr()) % address_alignment == 0)
+        << "input address must be aligned to " << address_alignment << " bytes";
+    const uint64_t row_bytes = static_cast<uint64_t>(vocab_size) * sizeof(ValueT);
+    const uint64_t padded_row_bytes = (row_bytes + 127) / 128 * 128;
+    const uint64_t required_bytes =
+        static_cast<uint64_t>(batch_size - 1) * input_stride_elements * sizeof(ValueT) + padded_row_bytes;
+    CHECK_HOST(required_bytes <= static_cast<uint64_t>(input_storage_bytes))
+        << "input storage must include the final row padded to 128 bytes";
+  }
+
   return LaunchPlan{
       TopkSelectArgs{
           batch_size,
@@ -132,13 +202,13 @@ auto make_plan(
           static_cast<uint32_t>(topk),
           input.data_ptr(),
           output_value_ptr,
-          output_index.data_ptr(),
+          kernel_output_index.data_ptr(),
           nullptr,  // `begin` is unimplemented upstream
           end_ptr,
           index_offset_ptr,
           static_cast<uint64_t>(input_stride.unwrap()),
           stride_output_value,
-          static_cast<uint64_t>(index_stride.unwrap()),
+          static_cast<uint64_t>(kernel_index_stride.unwrap()),
           Config::sorted_value,
           Config::sorted_index,
           Config::return_value,
@@ -176,19 +246,26 @@ struct TopkNormal {
       tvm::ffi::TensorView input,
       tvm::ffi::Optional<tvm::ffi::TensorView> output_value,
       tvm::ffi::TensorView output_index,
+      tvm::ffi::TensorView kernel_output_index,
+      tvm::ffi::Optional<tvm::ffi::TensorView> begin,
       tvm::ffi::Optional<tvm::ffi::TensorView> end,
       tvm::ffi::Optional<tvm::ffi::TensorView> output_index_offset,
       int64_t topk,
+      int64_t input_storage_bytes,
       int64_t idx_oob_fill_value,
       double value_oob_fill_value,
       bool abort_when_nan_found) -> void {
+    const details::ScopedCudaDevice device_guard(input.device());
     const auto plan = details::make_plan<ConfigWave1>(
         input,
         output_value,
         output_index,
+        kernel_output_index,
+        begin,
         end,
         output_index_offset,
         topk,
+        input_storage_bytes,
         idx_oob_fill_value,
         value_oob_fill_value,
         abort_when_nan_found);
@@ -221,19 +298,26 @@ struct TopkCluster {
       tvm::ffi::TensorView input,
       tvm::ffi::Optional<tvm::ffi::TensorView> output_value,
       tvm::ffi::TensorView output_index,
+      tvm::ffi::TensorView kernel_output_index,
+      tvm::ffi::Optional<tvm::ffi::TensorView> begin,
       tvm::ffi::Optional<tvm::ffi::TensorView> end,
       tvm::ffi::Optional<tvm::ffi::TensorView> output_index_offset,
       int64_t topk,
+      int64_t input_storage_bytes,
       int64_t idx_oob_fill_value,
       double value_oob_fill_value,
       bool abort_when_nan_found) -> void {
+    const details::ScopedCudaDevice device_guard(input.device());
     const auto plan = details::make_plan<Config>(
         input,
         output_value,
         output_index,
+        kernel_output_index,
+        begin,
         end,
         output_index_offset,
         topk,
+        input_storage_bytes,
         idx_oob_fill_value,
         value_oob_fill_value,
         abort_when_nan_found);

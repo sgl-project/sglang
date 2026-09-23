@@ -213,7 +213,7 @@ struct EpilogueRunner {
                 if (warp_idx < NUM_WARPS/2) {
                     #pragma unroll 8
                     for (uint32_t i = threadIdx.x; i < args.topk; i += NUM_THREADS/2) {
-                        smem_index_buf[i] = i < end_vocab_idx ? i : args.idx_oob_fill_value - output_idx_offset;
+                        smem_index_buf[i] = i < end_vocab_idx ? i : UINT32_MAX;
                     }
                 } else {
                     constexpr uint32_t NUM_VALUES_PER_LDG128 = NUM_BYTES_PER_SMEM_LOAD / sizeof(ValueT);
@@ -239,8 +239,12 @@ struct EpilogueRunner {
             if (IS_SHORTCUT || args.topk < MAX_TOPK) {
                 uint32_t limit = IS_SHORTCUT ? end_vocab_idx : args.topk;
                 CUTE_UNROLL
-                for (uint32_t i = 0; i < NUM_VALUES_PER_THREAD_FOR_SORT; ++i)
-                    local_values[i] = thread_offset + i < limit ? local_values[i] : 0;
+                for (uint32_t i = 0; i < NUM_VALUES_PER_THREAD_FOR_SORT; ++i) {
+                    if (thread_offset + i >= limit) {
+                        local_values[i] = 0;
+                        local_indices[i] = UINT32_MAX;
+                    }
+                }
             }
             __syncthreads();    // To allow `radix_sort_temp_storage` overlap with `smem_value_buf` and `smem_index_buf`
             BlockRadixSortT(radix_sort_temp_storage).SortDescending(local_values, local_indices);
@@ -254,7 +258,9 @@ struct EpilogueRunner {
                 OutIdxT local_indices_new[NUM_VALUES_PER_THREAD_FOR_SORT];
                 CUTE_UNROLL
                 for (uint32_t i = 0; i < NUM_VALUES_PER_THREAD_FOR_SORT; ++i)
-                    local_indices_new[i] = (OutIdxT)((int32_t)local_indices[i] + output_idx_offset);
+                    local_indices_new[i] = local_indices[i] == UINT32_MAX
+                        ? (OutIdxT)args.idx_oob_fill_value
+                        : (OutIdxT)local_indices[i] + output_idx_offset;
                 auto store = [&]<uint32_t NUM_VALUES, typename T>(T* dst, T src[NUM_VALUES]) {
                     constexpr uint32_t NUM_BYTES_TO_STORE = NUM_VALUES * sizeof(T);
                     if constexpr (NUM_BYTES_TO_STORE <= NUM_BYTES_PER_GMEM_STORE) {
@@ -1007,17 +1013,24 @@ public:
         uint32_t &eq_quota, // The EQ quota of this thread. May decrease
         nv_bfloat162 packed_values,
         uint32_t pivot_value_x2_bits,
-        uint32_t src_ptr    // The pointer to the location of src. `src` contains 8B pairs in {index, value}
+        uint32_t src_ptr,   // The pointer to the location of src. `src` contains 8B pairs in {index, value}
+        uint32_t num_valid = 2
     ) {
         uint32_t values_raw = bf16x2_to_u32(packed_values);
         #define MOVE_SELECTED_PAIR2(ADD)                \
             asm volatile (                                          \
                 "{\n"                                               \
-                ".reg .pred g0, g1, e0, e1, q, t0, t1, s0, s1;\n"   \
+                ".reg .pred g0, g1, e0, e1, q, t0, t1, s0, s1, valid0, valid1;\n" \
                 ".reg .b32 pair0_lo, pair0_hi, pair1_lo, pair1_hi;\n" \
                 "ld.shared.v4.b32 {pair0_lo, pair0_hi, pair1_lo, pair1_hi}, [%4];\n" \
                 "setp.gt.bf16x2 g0|g1, %2, %3;\n"                   \
                 "setp.eq.bf16x2 e0|e1, %2, %3;\n"                   \
+                "setp.gt.u32 valid0, %5, 0;\n"                      \
+                "setp.gt.u32 valid1, %5, 1;\n"                      \
+                "and.pred e0, e0, valid0;\n"                        \
+                "and.pred e1, e1, valid1;\n"                        \
+                "and.pred g0, g0, valid0;\n"                        \
+                "and.pred g1, g1, valid1;\n"                        \
                 /* element 0 (low half) */                          \
                 "setp.ne.and.u32 t0, %1, 0, e0;\n"                                                  \
                 "@t0 sub.u32 %1, %1, 1;\n"                          \
@@ -1032,7 +1045,7 @@ public:
                 "@s1 " ADD "\n"                                     \
                 "}\n"                                               \
                 : "+r"(dst_ptr), "+r"(eq_quota)                     \
-                : "r"(values_raw), "r"(pivot_value_x2_bits), "r"(src_ptr) \
+                : "r"(values_raw), "r"(pivot_value_x2_bits), "r"(src_ptr), "r"(num_valid) \
                 : "memory"                                          \
             )
         if constexpr (USE_CLUSTER_ADDRESSING) {
@@ -1052,16 +1065,23 @@ public:
         nv_bfloat162 packed_values,
         uint32_t pivot_value_x2_bits,
         uint32_t index0,
-        uint32_t index1
+        uint32_t index1,
+        uint32_t end_vocab_idx
     ) {
         uint32_t values_raw = bf16x2_to_u32(packed_values);
         uint32_t val_word1 = values_raw >> 16;   // element 1 low, clean high
         #define APPEND_SELECTED_PAIR2(ADD)              \
             asm volatile (                                          \
                 "{\n"                                               \
-                ".reg .pred g0, g1, e0, e1, q, t0, t1, s0, s1;\n"   \
+                ".reg .pred g0, g1, e0, e1, q, t0, t1, s0, s1, valid0, valid1;\n" \
                 "setp.gt.bf16x2 g0|g1, %2, %3;\n"                   \
                 "setp.eq.bf16x2 e0|e1, %2, %3;\n"                   \
+                "setp.lt.u32 valid0, %4, %7;\n"                     \
+                "setp.lt.u32 valid1, %5, %7;\n"                     \
+                "and.pred e0, e0, valid0;\n"                        \
+                "and.pred e1, e1, valid1;\n"                        \
+                "and.pred g0, g0, valid0;\n"                        \
+                "and.pred g1, g1, valid1;\n"                        \
                 /* element 0 (low half) */                          \
                 "setp.ne.and.u32 t0, %1, 0, e0;\n"                                                  \
                 "@t0 sub.u32 %1, %1, 1;\n"                          \
@@ -1077,7 +1097,7 @@ public:
                 "}\n"                                               \
                 : "+r"(dst_ptr), "+r"(eq_quota)                     \
                 : "r"(values_raw), "r"(pivot_value_x2_bits),               \
-                "r"(index0), "r"(index1), "r"(val_word1)          \
+                "r"(index0), "r"(index1), "r"(val_word1), "r"(end_vocab_idx) \
                 : "memory"                                          \
             )
         if constexpr (USE_CLUSTER_ADDRESSING) {
@@ -1101,7 +1121,8 @@ public:
     template<bool USE_CLUSTER_ADDRESSING, uint32_t N, uint32_t NUM_PACKED_VALUES_ALIGNMENT = 1>
     static __device__ __forceinline__
     PivotAndQuota compute_pivot_and_quota(uint32_t topk, const nv_bfloat162 (&values)[N],
-                                       uint32_t num_values, uint32_t warp_idx, uint32_t lane_idx, SharedMemoryPlanBase &smem) {
+                                       uint32_t num_values, uint32_t warp_idx, uint32_t lane_idx, SharedMemoryPlanBase &smem,
+                                       uint32_t num_padding_elems = 0) {
         if (warp_idx == 0) {
             Base::template find_pivot_in_histogram<false>(smem, smem.reconstruct_bucket_counter[0], topk, lane_idx);
         }
@@ -1122,6 +1143,11 @@ public:
         uint32_t pivot_value_x2_bits = ((uint32_t)pivot_value << 16) | pivot_value;
 
         auto census = get_census_counts<N, NUM_PACKED_VALUES_ALIGNMENT>(values, num_values, pivot_value_x2_bits);
+        // Padding can share the -INF pivot with real values, but must not
+        // consume equality quota or shift later threads' collector offsets.
+        if (pivot_value_x2_bits == NEG_INF_X2_BITS) {
+            census.cnt_eq -= num_padding_elems;
+        }
 
         static_assert(NUM_WARPS <= NUM_RECONSTRUCT_BUCKETS);
         auto eqgt = Base::compute_equal_quota_and_prefix(census.cnt_gt, census.cnt_eq, topk, warp_idx, lane_idx, smem.reconstruct_bucket_counter[0]);
@@ -1268,8 +1294,11 @@ public:
             // selection must degrade to "select all real elements": cap the K used in the pivot /
             // quota computation at the real count
             uint32_t effective_topk = min(topk, num_real_init_elems);
+            uint32_t padding_begin = max(my_elem_start_idx, num_local_tail_elems);
+            uint32_t padding_end = min(my_elem_start_idx + num_my_elems, num_local_tail_elems_padded);
+            uint32_t num_my_padding_elems = padding_end > padding_begin ? padding_end - padding_begin : 0u;
             auto [pivot_value_x2_bits, start_pos_in_collector, eq_quota, cnt_nan] =
-                compute_pivot_and_quota<USE_CLUSTER_ADDRESSING, NUM_UINT32_IN_INIT_WINDOW_PER_THREAD, 4>(effective_topk, init_values, num_my_elems / 2, warp_idx, lane_idx, smem);
+                compute_pivot_and_quota<USE_CLUSTER_ADDRESSING, NUM_UINT32_IN_INIT_WINDOW_PER_THREAD, 4>(effective_topk, init_values, num_my_elems / 2, warp_idx, lane_idx, smem, num_my_padding_elems);
             // The init census walks the thread's whole slice of the window, i.e. every element of the init
             // window exactly once, so NaNs inside the window are caught here.
             have_nan |= cnt_nan != 0;
@@ -1300,7 +1329,7 @@ public:
                     uint32_t index0 = __float_as_uint(unit_base_f + __uint_as_float(i % 4 * 2));
                     uint32_t index1 = __float_as_uint(unit_base_f + __uint_as_float(i % 4 * 2 + 1));
                     nv_bfloat162 cur_value = init_values[i];      // two bf16 payloads packed as bf16x2
-                    append_selected_pairs_from_registers<USE_CLUSTER_ADDRESSING>(out_ptr, eq_quota, cur_value, pivot_value_x2_bits, index0, index1);
+                    append_selected_pairs_from_registers<USE_CLUSTER_ADDRESSING>(out_ptr, eq_quota, cur_value, pivot_value_x2_bits, index0, index1, end_vocab_idx);
                 }
             }
 

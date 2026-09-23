@@ -2,7 +2,9 @@
 
 `vendor/` is [deepseek-ai/DeepSelect](https://github.com/deepseek-ai/DeepSelect)
 (commit `382d62a`, plus the SM90 cluster variant from upstream PR #14), stripped
-to the kernel implementation. MIT licensed; see `vendor/LICENSE`.
+to the kernel implementation. It also carries the padding, `-inf` tie, and
+int64 offset correctness fixes from SGLang's former AOT implementation. MIT
+licensed; see `vendor/LICENSE`.
 
 `entry.cuh` is the SGLang side: tensor validation, the `TopkSelectArgs` block,
 and the two host entry points the JIT exports. `python/sglang/kernels/ops/deep_select.py`
@@ -53,7 +55,7 @@ subnormals.
 
 ## Re-syncing with upstream
 
-Copy the files listed above into `vendor/`. They are unmodified apart from
-trailing whitespace and the removed `#include "topk_select.h"` line at the top
-of each `topk_select.cuh`. `vendor/.clang-format` disables formatting so a
-re-sync stays a plain copy.
+Copy the files listed above into `vendor/`, remove the
+`#include "topk_select.h"` line at the top of each `topk_select.cuh`, then
+reapply the SGLang AOT correctness patch described above. `vendor/.clang-format`
+disables formatting so a re-sync stays reviewable.

@@ -10,6 +10,7 @@ from sglang.kernels.jit.utils import (
     cache_once,
     load_jit,
     make_cpp_args,
+    override_jit_cuda_arch,
 )
 
 if TYPE_CHECKING:
@@ -22,6 +23,7 @@ _INPUT_STRIDE_ALIGNMENT_BYTES = 1024
 _OUTPUT_STRIDE_ALIGNMENT_BYTES = 32
 _CLUSTER_MAX_TOPK = 1024
 _CLUSTER_MAX_BATCH_SIZE = 6
+_SUPPORTED_CAPABILITIES = ((9, 0), (10, 0), (10, 3))
 
 
 class _Config(NamedTuple):
@@ -79,9 +81,9 @@ _NORMAL_CONFIGS: Dict[Tuple[torch.dtype, int], Tuple[_Config, ...]] = {
 
 
 @cache_once
-def _cluster_tuning() -> Tuple[int, int]:
+def _cluster_tuning(device_capability: Tuple[int, int]) -> Tuple[int, int]:
     # Return (cluster_size, min_vocab_size)
-    major = torch.cuda.get_device_capability()[0]
+    major = device_capability[0]
     return (8, 128 * 1024) if major == 9 else (16, 512 * 1024)
 
 
@@ -94,8 +96,9 @@ def _jit_deep_select_module(
     return_value: bool,
     max_topk: int,
     cluster_size: int,
+    device_capability: Tuple[int, int],
 ) -> Module:
-    assert 9 <= torch.cuda.get_device_capability()[0] <= 10
+    assert device_capability in _SUPPORTED_CAPABILITIES
     assert value_dtype in (torch.bfloat16, torch.float32)
     assert index_dtype in (torch.int32, torch.int64)
     if sorted_value:
@@ -123,27 +126,33 @@ def _jit_deep_select_module(
     ]
     classes = make_cpp_args(*classes)
     root = (KERNEL_PATH / "csrc" / "deepselect" / "vendor").resolve()
-    return load_jit(
-        "deep_select_topk",
-        # cache only distinct key for better readability
-        *make_cpp_args(
-            value_dtype,
-            index_dtype,
-            sorted_value,
-            sorted_index,
-            return_value,
-            max_topk,
-            cluster_size,
-        ),
-        cuda_files=["deepselect/entry.cuh"],
-        cuda_wrappers=[("topk", f"deepselect::{host_dispatch}<{classes}>::topk")],
-        extra_include_paths=[
-            str(root),
-            str(root / "3rdparty" / "kerutils" / "include"),
-        ],
-        extra_dependencies=["cutlass"],
-        extra_cuda_cflags=["--expt-extended-lambda", "--use_fast_math", "--ftz=false"],
-    )
+    with override_jit_cuda_arch(*device_capability):
+        return load_jit(
+            "deep_select_topk",
+            # cache only distinct key for better readability
+            *make_cpp_args(
+                value_dtype,
+                index_dtype,
+                sorted_value,
+                sorted_index,
+                return_value,
+                max_topk,
+                cluster_size,
+                *device_capability,
+            ),
+            cuda_files=["deepselect/entry.cuh"],
+            cuda_wrappers=[("topk", f"deepselect::{host_dispatch}<{classes}>::topk")],
+            extra_include_paths=[
+                str(root),
+                str(root / "3rdparty" / "kerutils" / "include"),
+            ],
+            extra_dependencies=["cutlass"],
+            extra_cuda_cflags=[
+                "--expt-extended-lambda",
+                "--use_fast_math",
+                "--ftz=false",
+            ],
+        )
 
 
 def _get_max_topk_bucket(topk: int, use_cluster: bool) -> int:
@@ -156,13 +165,53 @@ def get_input_stride_alignment_bytes() -> int:
     return _INPUT_STRIDE_ALIGNMENT_BYTES
 
 
+def get_stride_requirement() -> Tuple[int, int]:
+    """Return the input and output row-stride requirements in bytes."""
+    return _INPUT_STRIDE_ALIGNMENT_BYTES, _OUTPUT_STRIDE_ALIGNMENT_BYTES
+
+
+def get_deepselect_supported_architectures() -> Tuple[int, ...]:
+    """Return the CUDA compute capabilities supported by the JIT kernel."""
+    return tuple(major * 10 + minor for major, minor in _SUPPORTED_CAPABILITIES)
+
+
+def is_deepselect_supported(device=None) -> bool:
+    """Return whether DeepSelect JIT supports a CUDA device."""
+    if torch.version.cuda is None or not torch.cuda.is_available():
+        return False
+    try:
+        normalized_device = (
+            torch.device("cuda", device)
+            if isinstance(device, int)
+            else (
+                torch.device("cuda", torch.cuda.current_device())
+                if device is None
+                else torch.device(device)
+            )
+        )
+        if normalized_device.type != "cuda":
+            return False
+        return torch.cuda.get_device_capability(normalized_device) in _SUPPORTED_CAPABILITIES
+    except (RuntimeError, TypeError, ValueError):
+        return False
+
+
+def _needs_output_staging(output: torch.Tensor, topk: int) -> bool:
+    return (
+        output.data_ptr() % _OUTPUT_STRIDE_ALIGNMENT_BYTES != 0
+        or topk * output.element_size() % _OUTPUT_STRIDE_ALIGNMENT_BYTES != 0
+    )
+
+
 def topk(
     input: torch.Tensor,
     topk: int,
     sorted: bool = False,
+    begin: Optional[torch.Tensor] = None,
     end: Optional[torch.Tensor] = None,
-    indices_type: torch.dtype = torch.int32,
+    indices_type: torch.dtype = torch.int64,
     sorted_index: bool = False,
+    hint: Optional[torch.Tensor] = None,
     output_idx: Optional[torch.Tensor] = None,
     output_idx_offset: Optional[torch.Tensor] = None,
     idx_oob_fill_value: int = 2147483647,
@@ -172,18 +221,39 @@ def topk(
 ) -> Tuple[Optional[torch.Tensor], torch.Tensor]:
     """Select the largest ``topk`` values of every row of ``input``.
 
-    Follows the public DeepSelect interface, minus ``begin`` and ``hint``, which
-    upstream does not implement. ``input`` must be bfloat16 or float32 with a
-    row stride that is a multiple of ``_INPUT_STRIDE_ALIGNMENT_BYTES``; ``end``
-    is the per-row exclusive valid length. Neither output is sorted unless
-    ``sorted`` (by value, float32 only) or ``sorted_index`` asks for it, and
-    both are allocated with a padded row stride, so they may not be contiguous.
+    This follows the public DeepSelect interface. ``end`` is the per-row
+    exclusive valid length; ``begin`` and ``hint`` are reserved but unsupported.
 
     Returns ``(values, indices)``; ``values`` is None when ``return_value`` is
     False, which skips writing them and is about 10% faster.
     """
+    if hint is not None:
+        raise ValueError("hint is not supported currently")
+    if input.dtype not in (torch.bfloat16, torch.float32):
+        raise RuntimeError("input dtype must be bfloat16 or float32")
+    if indices_type not in (torch.int32, torch.int64):
+        raise RuntimeError("indices_type must be int32 or int64")
+    if output_idx is not None and output_idx.dtype != indices_type:
+        raise ValueError("output_idx dtype must match indices_type")
+    if input.device.type != "cuda":
+        raise RuntimeError("input must be a CUDA tensor")
+    if input.ndim != 2:
+        raise RuntimeError("input must be a 2D tensor")
+    if not 0 < topk <= 4096:
+        raise RuntimeError(f"topk must be in [1, 4096], got {topk}")
+    if sorted and not return_value:
+        raise RuntimeError("return_value must be enabled when sorted is True")
+    if sorted and sorted_index:
+        raise RuntimeError("sorted and sorted_index cannot both be True")
+    if sorted and input.dtype is torch.bfloat16:
+        raise RuntimeError("sorted is only supported for float32 input")
+
     rows, vocab_size = input.shape
-    cluster_size, cluster_min_vocab_size = _cluster_tuning()
+    device_capability = torch.cuda.get_device_capability(input.device)
+    if device_capability not in _SUPPORTED_CAPABILITIES:
+        major, minor = device_capability
+        raise RuntimeError(f"DeepSelect does not support SM{major}{minor}")
+    cluster_size, cluster_min_vocab_size = _cluster_tuning(device_capability)
     use_cluster = (
         input.dtype is torch.bfloat16
         and rows <= _CLUSTER_MAX_BATCH_SIZE
@@ -205,6 +275,18 @@ def topk(
             input.device,
             alignment=_OUTPUT_STRIDE_ALIGNMENT_BYTES,
         )
+        kernel_output_idx = output_idx
+    else:
+        kernel_output_idx = (
+            aligned_new_empty(
+                (rows, topk),
+                indices_type,
+                input.device,
+                alignment=_OUTPUT_STRIDE_ALIGNMENT_BYTES,
+            )
+            if _needs_output_staging(output_idx, topk)
+            else output_idx
+        )
     module = _jit_deep_select_module(
         input.dtype,
         indices_type,
@@ -213,16 +295,29 @@ def topk(
         return_value,
         _get_max_topk_bucket(topk, use_cluster),
         cluster_size if use_cluster else 1,
+        device_capability,
+    )
+    input_storage_bytes = (
+        input.untyped_storage().nbytes()
+        - input.storage_offset() * input.element_size()
     )
     module.topk(
         input,
         values,
         output_idx,
+        kernel_output_idx,
+        begin,
         end,
         output_idx_offset,
         topk,
+        input_storage_bytes,
         idx_oob_fill_value,
         value_oob_fill_value,
         abort_when_nan_found,
     )
+    if kernel_output_idx is not output_idx:
+        output_idx.copy_(kernel_output_idx)
     return values, output_idx
+
+
+deepselect_topk = topk

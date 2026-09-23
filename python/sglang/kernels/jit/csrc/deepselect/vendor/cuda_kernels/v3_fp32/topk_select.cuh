@@ -142,7 +142,7 @@ public:
             uint32_t cnt_nan;
         };
 
-        auto compute_pivot_and_quota = [&](uint32_t topk, const auto &for_each_value) -> PivotAndQuota {
+        auto compute_pivot_and_quota = [&](uint32_t topk, const auto &for_each_value, uint32_t num_padding_elems) -> PivotAndQuota {
             if (warp_idx == 0) {
                 find_pivot_in_histogram(topk, smem.reconstruct_bucket_counter[0]);
             }
@@ -221,6 +221,11 @@ public:
             });
             uint32_t cnt_gt = (uint32_t)gt_accum;
             uint32_t cnt_eq = (uint32_t)eq_accum;
+            // Real -INF values and padding compare equal; only real values
+            // may consume quota or contribute to collector offsets.
+            if (pivot_value_bits == NEG_INF_BITS) {
+                cnt_eq -= num_padding_elems;
+            }
             float nan_flag;
             asm ("set.nan.f32.f32 %0, %1, %1;" : "=f"(nan_flag) : "f"(nan_accum));
             uint32_t cnt_nan = (uint32_t)nan_flag;
@@ -271,7 +276,7 @@ public:
             __syncthreads();
 
             uint32_t topk = args.topk;
-            auto [pivot_value_bits, start_pos_in_collector, eq_quota, cnt_nan] = compute_pivot_and_quota(topk, for_each_value);
+            auto [pivot_value_bits, start_pos_in_collector, eq_quota, cnt_nan] = compute_pivot_and_quota(topk, for_each_value, 0);
             // Every NaN the main loop collected is part of the buffer this census just walked (the hit test
             // is `.gtu`, so NaN always becomes an incomer); the CTA-wide OR happens at the end.
             have_nan |= cnt_nan != 0;
@@ -383,7 +388,10 @@ public:
                     fn(init_values[i]);
                 }
             };
-            auto [pivot_value_bits, start_pos_in_collector, eq_quota, cnt_nan] = compute_pivot_and_quota(args.topk, for_each_init_value);
+            uint32_t padding_begin = max(my_elem_start_idx, num_local_tail_elems);
+            uint32_t padding_end = min(my_elem_start_idx + num_my_elems, num_local_tail_elems_padded);
+            uint32_t num_my_padding_elems = padding_end > padding_begin ? padding_end - padding_begin : 0u;
+            auto [pivot_value_bits, start_pos_in_collector, eq_quota, cnt_nan] = compute_pivot_and_quota(args.topk, for_each_init_value, num_my_padding_elems);
             // The init census walks the thread's whole slice of the window, i.e. every element of the init
             // window exactly once, so NaNs inside the window are caught here.
             have_nan |= cnt_nan != 0;
@@ -413,13 +421,13 @@ public:
                     uint32_t index1 = __float_as_uint(b128_base_f + __uint_as_float(i % NUM_ELEMS_PER_128b + 1));
                     float v0 = __uint_as_float(init_values[i]);
                     float v1 = __uint_as_float(init_values[i + 1]);
-                    bool t0 = v0 == pivot_value && eq_quota != 0;
+                    bool t0 = index0 < end_vocab_idx && v0 == pivot_value && eq_quota != 0;
                     eq_quota -= t0;
-                    if (v0 > pivot_value || t0) { append_pair_at(out_ptr, index0, init_values[i]); }
+                    if ((index0 < end_vocab_idx && v0 > pivot_value) || t0) { append_pair_at(out_ptr, index0, init_values[i]); }
                     // the quota is re-tested after element 0's decrement
-                    bool t1 = v1 == pivot_value && eq_quota != 0;
+                    bool t1 = index1 < end_vocab_idx && v1 == pivot_value && eq_quota != 0;
                     eq_quota -= t1;
-                    if (v1 > pivot_value || t1) { append_pair_at(out_ptr, index1, init_values[i + 1]); }
+                    if ((index1 < end_vocab_idx && v1 > pivot_value) || t1) { append_pair_at(out_ptr, index1, init_values[i + 1]); }
                 }
             }
 

@@ -139,7 +139,7 @@ public:
 
         // Each CTA gets its local top-k elements
         bool nan_seen = false;
-        BF16Base::template scan_segs<true>(
+        uint32_t num_survivors = BF16Base::template scan_segs<true>(
             tma_params, smem,
             batch_idx, end_vocab_idx, args.topk, warp_idx, lane_idx,
             num_perm_segs, local_start_seg_idx, num_local_perm_segs, num_local_tail_elems_padded, num_local_tail_elems,
@@ -176,7 +176,7 @@ public:
             }
             st_async_32b(
                 cute::set_block_rank(cute::cast_smem_ptr_to_uint(smem.gathered_num_survivors + rank_in_cluster), 0),
-                (uint32_t)nan_seen,
+                num_survivors | ((uint32_t)nan_seen << 31),
                 smem.gather_val_bar
             );
         }
@@ -221,23 +221,31 @@ public:
 
         static_assert(Config::cluster_size <= 32);
         uint32_t stored_num_survivors = lane_idx < Config::cluster_size ? smem.gathered_num_survivors[lane_idx] : 0u;
-        nan_seen |= stored_num_survivors;
+        nan_seen |= (stored_num_survivors >> 31) != 0;
 
         uint32_t unit_base = threadIdx.x * NUM_UINT32_GATHER_PER_THREAD;
         uint32_t num_my_units = unit_base < NUM_GATHER_UNITS ? min((uint32_t)NUM_UINT32_GATHER_PER_THREAD, NUM_GATHER_UNITS - unit_base) : 0u;
 
         const uint32_t *gather_vals = (const uint32_t*)smem.incoming_topk_pairs;
+        auto num_valid_in_unit = [&](uint32_t unit) {
+            uint32_t rank = 2 * unit / MAX_TOPK;
+            uint32_t offset = 2 * unit % MAX_TOPK;
+            uint32_t count = smem.gathered_num_survivors[rank] & 0x7FFFFFFFu;
+            return offset < count ? min(2u, count - offset) : 0u;
+        };
         nv_bfloat162 values[NUM_UINT32_GATHER_PER_THREAD];
+        uint32_t num_my_padding_elems = 0;
         CUTE_UNROLL
         for (uint32_t i = 0; i < NUM_UINT32_GATHER_PER_THREAD; i++) {
             if (i == num_my_units) break;
             values[i] = topk_select_common::u32_to_bf16x2(gather_vals[unit_base + i]);
+            num_my_padding_elems += 2 - num_valid_in_unit(unit_base + i);
         }
         BF16Base::histogram_radix_msb(smem.reconstruct_bucket_counter[0], values, num_my_units);
         __syncthreads();
 
         auto [pivot_value_x2_bits, out_prefix, eq_quota, cnt_nan] =
-            BF16Base::template compute_pivot_and_quota<true>(args.topk, values, num_my_units, warp_idx, lane_idx, smem);
+            BF16Base::template compute_pivot_and_quota<true>(args.topk, values, num_my_units, warp_idx, lane_idx, smem, num_my_padding_elems);
         nan_seen |= cnt_nan != 0;
 
         smem.gather_bar.wait(0);
@@ -248,7 +256,7 @@ public:
         CUTE_UNROLL
         for (uint32_t m = 0; m < NUM_UINT32_GATHER_PER_THREAD; m++) {
             if (m == num_my_units) break;
-            BF16Base::template copy_selected_pairs_to_survivor<true>(out_ptr, eq_quota, values[m], pivot_value_x2_bits, gather_pairs_base + 2 * (unit_base + m) * (uint32_t)sizeof(uint64_t));
+            BF16Base::template copy_selected_pairs_to_survivor<true>(out_ptr, eq_quota, values[m], pivot_value_x2_bits, gather_pairs_base + 2 * (unit_base + m) * (uint32_t)sizeof(uint64_t), num_valid_in_unit(unit_base + m));
         }
         survivor_buf_idx ^= 1;
 
