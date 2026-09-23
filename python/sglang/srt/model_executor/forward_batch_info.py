@@ -537,6 +537,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
     # For DP attention
     is_extend_in_batch: bool = False
+    dp_spec_prefill_coordination_applied: bool = False
     can_run_decode_cuda_graph: bool = False
     can_run_dp_prefill_cuda_graph: bool = False
     dp_prefill_cuda_graph_max_prefix_len: int = 0
@@ -812,6 +813,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         self, batch: ScheduleBatch, device: Union[str, torch.device]
     ) -> None:
         """Populate per-rank token counts for DP-attention MLP synchronization."""
+        self.dp_spec_prefill_coordination_applied = (
+            batch.dp_spec_prefill_coordination_applied
+        )
         if batch.global_num_tokens is None:
             return
 
@@ -1551,6 +1555,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             and not prefill_graph_tolerates_sum_len()
         ):
             dp_padding_mode = DpPaddingMode.MAX_LEN
+        if self.dp_spec_prefill_coordination_applied:
+            # Preserve each rank's forward mode on coordinated steps.
+            dp_padding_mode = DpPaddingMode.SUM_LEN
         self.dp_padding_mode = dp_padding_mode
 
         if dp_padding_mode.is_max_len():

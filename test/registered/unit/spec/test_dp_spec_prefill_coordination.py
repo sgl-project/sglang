@@ -6,6 +6,7 @@ from unittest.mock import MagicMock, patch
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.layers.dp_attention import DpPaddingMode
 from sglang.srt.managers.scheduler_components.dp_attn import _update_gather_batch
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.speculative.dp_spec_prefill_coordination import (
@@ -14,6 +15,7 @@ from sglang.srt.speculative.dp_spec_prefill_coordination import (
 from sglang.srt.speculative.eagle_worker_v2 import EAGLEWorkerV2
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -41,7 +43,7 @@ def make_batch(counts, logprobs):
     )
 
 
-class TestDPSpecPrefillCoordinationPlan(unittest.TestCase):
+class TestDPSpecPrefillCoordinationPlan(CustomTestCase):
     def setUp(self):
         self.plan = make_plan()
 
@@ -88,7 +90,7 @@ class TestDPSpecPrefillCoordinationPlan(unittest.TestCase):
                             if local_only
                             else self.plan.logprob_counts,
                         )
-                        self.plan.apply(batch, phase, rank)
+                        self.plan.apply(batch, phase, rank, local_only=local_only)
                         self.assertEqual(
                             batch.global_num_tokens,
                             [tokens[rank]] if local_only else tokens,
@@ -102,11 +104,22 @@ class TestDPSpecPrefillCoordinationPlan(unittest.TestCase):
                         self.assertFalse(batch.can_run_decode_cuda_graph)
                         self.assertFalse(batch.can_run_dp_prefill_cuda_graph)
 
-    def test_invalid_phase_and_group_width_are_rejected(self):
+    def test_local_draft_restores_target_counts(self):
+        plan = DPSpecPrefillCoordinationPlan(
+            [4096, 24], [1, 24], torch.tensor([1, 0]), 10, 32
+        )
+        batch = make_batch(plan.counts, plan.logprob_counts)
+        plan.apply(batch, "draft", 1, local_only=True)
+        self.assertEqual(batch.global_num_tokens, [240])
+        plan.apply(batch, "target", 1, local_only=False)
+        self.assertEqual(batch.global_num_tokens, [4096, 768])
+        self.assertEqual(batch.global_num_tokens_for_logprob, [1, 768])
+        plan.apply(batch, "draft_extend", 1, local_only=True)
+        self.assertEqual(batch.global_num_tokens, [768])
+
+    def test_invalid_phase_is_rejected(self):
         with self.assertRaises(ValueError):
             self.plan.phase_counts("unknown")
-        with self.assertRaises(ValueError):
-            self.plan.apply(make_batch([1, 2], [1, 2]), "target", 0)
 
     def test_gather_resets_coordination_and_restores_pure_decode_flags(self):
         for local_only in (False, True):
@@ -151,14 +164,89 @@ class TestDPSpecPrefillCoordinationPlan(unittest.TestCase):
                     return_value=([16384, 512], [4, 512]),
                 ) as scale:
                     forward.init_mlp_sync_metadata(batch, "cpu")
+                self.assertEqual(forward.dp_spec_prefill_coordination_applied, applied)
                 self.assertEqual(scale.call_count, int(not applied))
                 self.assertEqual(
                     forward.global_num_tokens_cpu,
                     [16384, 512] if not applied else [4096, 128],
                 )
 
+    def test_coordinated_padding_preserves_local_forward_modes(self):
+        module = "sglang.srt.model_executor.forward_batch_info"
+        for mode in (
+            ForwardMode.DECODE,
+            ForwardMode.TARGET_VERIFY,
+            ForwardMode.DRAFT_EXTEND_V2,
+            ForwardMode.IDLE,
+        ):
+            for hybrid in (False, True):
+                with self.subTest(mode=mode, hybrid=hybrid):
+                    idle = mode.is_idle()
+                    width = 1 if mode.is_decode() or idle else 4
+                    tokens = 0 if idle else 2 * width
+                    counts = [tokens, 8] if idle else [0, tokens]
+                    batch = ForwardBatch(
+                        forward_mode=mode,
+                        batch_size=0 if idle else 2,
+                        input_ids=torch.arange(tokens),
+                        req_pool_indices=torch.arange(0 if idle else 2),
+                        seq_lens=torch.tensor([] if idle else [5, 6]),
+                        out_cache_loc=torch.arange(tokens),
+                        seq_lens_sum=0 if idle else 11,
+                        is_extend_in_batch=True,
+                        dp_spec_prefill_coordination_applied=True,
+                        global_num_tokens_cpu=counts,
+                        global_num_tokens_for_logprob_cpu=counts,
+                        global_num_tokens_gpu=torch.tensor(counts),
+                        spec_info=SimpleNamespace(
+                            num_tokens_per_req=width,
+                            is_draft_input=lambda: True,
+                        ),
+                    )
+                    runner = MagicMock(enable_elastic_ep=False)
+                    with (
+                        patch(
+                            f"{module}.get_parallel",
+                            return_value=SimpleNamespace(attn_tp_size=1),
+                        ),
+                        patch(
+                            f"{module}.get_exec",
+                            return_value=SimpleNamespace(
+                                graph=SimpleNamespace(
+                                    cuda_graph_config=SimpleNamespace(
+                                        prefill=SimpleNamespace(bs=[])
+                                    )
+                                )
+                            ),
+                        ),
+                        patch.object(
+                            DpPaddingMode,
+                            "get_dp_padding_mode",
+                            return_value=DpPaddingMode.MAX_LEN,
+                        ),
+                        patch(
+                            f"{module}.dp_gather_slot", return_value=0 if idle else 1
+                        ),
+                        patch(f"{module}.set_dp_buffer_len"),
+                        patch(f"{module}.set_is_extend_in_batch"),
+                        patch(
+                            f"{module}.mambaish_config",
+                            return_value=object() if hybrid else None,
+                        ),
+                        patch(f"{module}._is_cpu", True),
+                        patch.object(ForwardBatch, "_pad_inputs_to_size"),
+                        patch(
+                            "sglang.srt.batch_overlap.two_batch_overlap.TboForwardBatchPreparer.prepare"
+                        ),
+                    ):
+                        batch.prepare_mlp_sync_batch(runner)
+                    self.assertEqual(batch.dp_padding_mode, DpPaddingMode.SUM_LEN)
+                    self.assertEqual(batch.forward_mode, mode)
+                    self.assertEqual(batch.global_num_tokens_cpu, counts)
+                    self.assertEqual(batch.batch_size, 0 if idle else 2)
 
-class TestDPSpecPrefillCoordinationWorker(unittest.TestCase):
+
+class TestDPSpecPrefillCoordinationWorker(CustomTestCase):
     def test_prefill_decode_and_idle_ranks_follow_the_same_phase_order(self):
         plan = make_plan()
         for rank in range(8):
@@ -197,9 +285,10 @@ class TestDPSpecPrefillCoordinationWorker(unittest.TestCase):
 
                 def record(phase, current):
                     self.assertTrue(current.dp_spec_prefill_coordination_applied)
-                    self.assertEqual(
-                        current.global_num_tokens, plan.phase_counts(phase)[0]
-                    )
+                    counts = plan.phase_counts(phase)[0]
+                    if phase != "target" and worker._draft_worker.draft_owns_attention:
+                        counts = [counts[rank]]
+                    self.assertEqual(current.global_num_tokens, counts)
                     self.assertFalse(current.can_run_decode_cuda_graph)
                     self.assertFalse(current.can_run_dp_prefill_cuda_graph)
                     events.append(phase)
@@ -288,8 +377,11 @@ class TestDPSpecPrefillCoordinationWorker(unittest.TestCase):
 
     def test_local_mixed_batch_is_rejected_before_draft(self):
         worker = object.__new__(EAGLEWorkerV2)
+        worker._draft_worker = SimpleNamespace(draft_owns_attention=False)
         batch = SimpleNamespace(
-            forward_mode=ForwardMode.EXTEND, decoding_reqs=[object()]
+            forward_mode=ForwardMode.EXTEND,
+            decoding_reqs=[object()],
+            global_num_tokens=[1, 1],
         )
         with patch(
             f"{WORKER_MODULE}.get_parallel",

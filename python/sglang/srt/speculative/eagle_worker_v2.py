@@ -1314,12 +1314,6 @@ class EAGLEWorkerV2(BaseSpecWorker):
         self.enable_dp_spec_prefill_coordination = (
             envs.SGLANG_ENABLE_DP_SPEC_PREFILL_COORDINATION.get()
         )
-        # Coordination for other speculative algorithms is not implemented yet.
-        if (
-            self.enable_dp_spec_prefill_coordination
-            and self.speculative_algorithm != SpeculativeAlgorithm.EAGLE
-        ):
-            raise ValueError("DP spec/prefill coordination requires EAGLE")
 
         # Only the last PP stage runs the draft; other EAGLEWorkerV2 instances
         # return proxies so scheduler dispatch remains rank-uniform.
@@ -1575,7 +1569,15 @@ class EAGLEWorkerV2(BaseSpecWorker):
             return batch_output
 
         if coordination_plan is not None:
-            coordination_plan.apply(batch, "draft_extend", get_parallel().attn_dp_rank)
+            coordination_plan.apply(
+                batch,
+                "draft_extend",
+                get_parallel().attn_dp_rank,
+                local_only=(
+                    len(batch.global_num_tokens) == 1
+                    or self.draft_worker.draft_owns_attention
+                ),
+            )
 
         # Draft prefill
         with (
@@ -1600,6 +1602,8 @@ class EAGLEWorkerV2(BaseSpecWorker):
     ):
         """Run draft, target, and draft-extend with each rank's local mode."""
         rank = get_parallel().attn_dp_rank
+        target_local_only = len(batch.global_num_tokens) == 1
+        draft_local_only = target_local_only or self.draft_worker.draft_owns_attention
         is_prefill = batch.forward_mode.is_extend()
         if is_prefill and batch.decoding_reqs:
             raise RuntimeError("Local mixed prefill/verify is not implemented")
@@ -1630,7 +1634,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 topk=self.topk,
                 capture_hidden_mode=CaptureHiddenMode.LAST,
             )
-        plan.apply(draft_batch, "draft", rank)
+        plan.apply(draft_batch, "draft", rank, local_only=draft_local_only)
         with (
             self.draft_worker.draft_tp_context(
                 self.draft_worker.draft_runner.tp_group,
@@ -1642,7 +1646,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
         ):
             verify_input = self.draft_worker.draft(draft_batch)
 
-        plan.apply(batch, "target", rank)
+        plan.apply(batch, "target", rank, local_only=target_local_only)
         if is_prefill:
             result = self._forward_prefill_batch(
                 batch, on_publish, pp_proxy_tensors, coordination_plan=plan
@@ -1657,7 +1661,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
         result = self.verify(batch, grammar_barrier=grammar_barrier)
         if on_publish is not None:
             on_publish(result.new_seq_lens)
-        plan.apply(batch, "draft_extend", rank)
+        plan.apply(batch, "draft_extend", rank, local_only=draft_local_only)
         with (
             self.draft_worker.draft_tp_context(
                 self.draft_worker.draft_runner.tp_group,

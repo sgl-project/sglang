@@ -60,7 +60,10 @@ class TestEAGLE3EngineDPAttention(DPSpecPrefillCoordinationKit, CustomTestCase):
             "--cuda-graph-max-bs-decode",
             "64",
         ]
-        with envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.override(1):
+        with (
+            envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.override(1),
+            envs.SGLANG_ENABLE_DP_SPEC_PREFILL_COORDINATION.override(True),
+        ):
             cls.process = popen_launch_server(
                 cls.model,
                 cls.base_url,

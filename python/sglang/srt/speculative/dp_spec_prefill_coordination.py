@@ -1,13 +1,12 @@
 """Plan token counts for prefill and speculative decoding across DP ranks."""
 
-from dataclasses import dataclass
 from typing import List
 
+import msgspec
 import torch
 
 
-@dataclass(frozen=True)
-class DPSpecPrefillCoordinationPlan:
+class DPSpecPrefillCoordinationPlan(msgspec.Struct, frozen=True):
     # Counts from the scheduler: prefill token counts or decode request counts.
     counts: List[int]
     logprob_counts: List[int]
@@ -41,13 +40,11 @@ class DPSpecPrefillCoordinationPlan:
             ],
         )
 
-    def apply(self, batch, phase, rank):
+    def apply(self, batch, phase, rank, *, local_only):
         tokens, logprobs = self.phase_counts(phase)
-        # EP-only batches retain only their local counts.
-        if len(batch.global_num_tokens) == 1:
+        # Local drafts and EP-only batches retain only this rank's counts.
+        if local_only:
             tokens, logprobs = [tokens[rank]], [logprobs[rank]]
-        elif len(batch.global_num_tokens) != len(tokens):
-            raise ValueError("Unexpected DP synchronization group width")
         batch.global_num_tokens = tokens
         batch.global_num_tokens_for_logprob = logprobs
         batch.dp_spec_prefill_coordination_applied = True

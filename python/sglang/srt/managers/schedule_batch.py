@@ -2434,7 +2434,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     forward_mode: ForwardMode = None
     global_forward_mode: Optional[ForwardMode] = None
 
-    # Experimental full-DP metadata, populated from the existing scheduler gather.
+    # Full-DP metadata from the existing scheduler gather.
     dp_spec_prefill_coordination_metadata: Optional[tuple] = None
     dp_spec_prefill_coordination_applied: bool = False
 
