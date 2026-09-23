@@ -275,8 +275,6 @@ class TestTreeNode(unittest.TestCase):
         self.assertIsNone(node.value)
         self.assertEqual(node.lock_ref, 0)
         self.assertEqual(node.hit_count, 0)
-        self.assertEqual(node.host_ref_counter, 0)
-        self.assertIsNone(node.host_value)
         self.assertIsNone(node.hash_value)
 
     def test_init_with_id(self):
@@ -286,46 +284,12 @@ class TestTreeNode(unittest.TestCase):
         node2 = TreeNode()
         self.assertEqual(node2.id, 1)  # Counter was incremented
 
-    def test_evicted_backuped_properties(self):
-        """Test evicted and backuped properties."""
-        test_cases = [
-            (False, False, True, False),
-            (True, False, False, False),
-            (True, True, False, True),
-            (False, True, True, True),
-        ]
-
-        for (
-            has_value,
-            has_host_value,
-            expected_evicted,
-            expected_backuped,
-        ) in test_cases:
-            with self.subTest(has_value=has_value, has_host_value=has_host_value):
-                node = TreeNode()
-
-                if has_value:
-                    node.value = torch.tensor([1, 2, 3])
-                if has_host_value:
-                    node.host_value = torch.tensor([4, 5, 6])
-
-                self.assertEqual(node.evicted, expected_evicted)
-                self.assertEqual(node.backuped, expected_backuped)
-
-    def test_protect_release_host(self):
-        """Test protect_host and release_host methods."""
+    def test_evicted_property(self):
+        """Test the evicted property."""
         node = TreeNode()
-        self.assertEqual(node.host_ref_counter, 0)
-
-        node.protect_host()
-        self.assertEqual(node.host_ref_counter, 1)
-
-        node.release_host()
-        self.assertEqual(node.host_ref_counter, 0)
-
-        # Test error case
-        with self.assertRaises(RuntimeError):
-            node.release_host()
+        self.assertTrue(node.evicted)
+        node.value = torch.tensor([1, 2, 3])
+        self.assertFalse(node.evicted)
 
     def test_get_last_hash_value(self):
         """Test get_last_hash_value method."""

@@ -739,7 +739,6 @@ Pending update...
 
 **TP8, concurrency 1–8:**
 ```bash Command
-SGLANG_ENABLE_UNIFIED_RADIX_TREE=1 \
 python3 -m sglang.launch_server \
   --model-path deepseek-ai/DeepSeek-V4-Pro-0813 \
   --trust-remote-code \
@@ -765,7 +764,6 @@ DSv4 HiCache sizes the host tier with `--hicache-ratio` (host/device token ratio
 
 **DEP8 (DP Attention), concurrency 64–160:**
 ```bash Command
-SGLANG_ENABLE_UNIFIED_RADIX_TREE=1 \
 SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK=8320 \
 python3 -m sglang.launch_server \
   --model-path deepseek-ai/DeepSeek-V4-Pro-0813 \
@@ -883,7 +881,6 @@ DeepSeek-V4-Pro-0813 bundles the DSpark head, so `--speculative-draft-model-path
 
 **TP8, concurrency 1–16:**
 ```bash Command
-SGLANG_ENABLE_UNIFIED_RADIX_TREE=1 \
 SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS=1 \
 SGLANG_USE_ROCM700A=0 \
 TORCH_BLAS_PREFER_HIPBLASLT=1 \
@@ -922,7 +919,6 @@ Concurrency 32–48 keeps the same TP-only command and adds HiCache DRAM offload
 
 **DP8 (DP Attention), concurrency 128–256:**
 ```bash Command
-SGLANG_ENABLE_UNIFIED_RADIX_TREE=1 \
 SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS=1 \
 SGLANG_USE_ROCM700A=0 \
 TORCH_BLAS_PREFER_HIPBLASLT=1 \
