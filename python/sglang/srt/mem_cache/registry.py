@@ -14,7 +14,6 @@ import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Callable, Optional
 
-from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.mlx.runtime import use_mlx
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
@@ -100,13 +99,6 @@ def default_radix_cache_factory(ctx: TreeCacheBuildContext) -> BasePrefixCache:
         from sglang.srt.mem_cache.chunk_cache import SWAChunkCache
 
         return SWAChunkCache(params)
-
-    if envs.SGLANG_EXPERIMENTAL_CPP_RADIX_TREE.get():
-        # lazy import to avoid JIT overhead
-        from sglang.srt.mem_cache.radix_cache_cpp import RadixCacheCpp
-
-        logger.info("Using experimental C++ radix tree implementation.")
-        return RadixCacheCpp(params=params, server_args=server_args)
 
     if get_memory().enable_unified_cache_external_linker:
         return _create_unified_radix_cache(ctx, server_args, params)

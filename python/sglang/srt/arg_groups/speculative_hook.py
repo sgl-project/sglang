@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 from typing import TYPE_CHECKING, Optional
 
 from sglang.srt.arg_groups.choices import DRAFT_ATTENTION_BACKEND_CHOICES
@@ -140,15 +139,6 @@ def handle_speculative_decoding(server_args: ServerArgs) -> None:
             server_args,
             "handle_speculative_decoding",
             speculative_algorithm=cfg.speculative_algorithm.upper(),
-        )
-
-    # Removal notice for the retired env var; raw os.getenv on purpose -- the
-    # Envs descriptor is gone. Drop this check after one release.
-    if os.getenv("SGLANG_ENABLE_SPEC_V2") is not None:
-        logger.warning(
-            "SGLANG_ENABLE_SPEC_V2 has been removed: speculative decoding "
-            "always runs the V2 worker. Use --disable-overlap-schedule to "
-            "select the non-overlap (synchronous) path."
         )
 
     kwargs = {}
@@ -1124,9 +1114,9 @@ def _handle_eagle_family(server_args: ServerArgs) -> None:
 
 def _handle_ngram(server_args: ServerArgs) -> None:
     cfg = resolving_view(server_args)
-    if cfg.device not in ("cuda", "cpu"):
+    if cfg.device not in ("cuda", "cpu", "xpu"):
         raise ValueError(
-            "Ngram speculative decoding only supports CUDA or CPU devices."
+            "Ngram speculative decoding only supports CUDA, CPU, or XPU devices."
         )
 
     _disable_overlap_schedule_for_cpu(server_args)

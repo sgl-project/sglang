@@ -278,7 +278,6 @@ class BenchArgs:
         )
         parser.add_argument(
             "--profile-prefix",
-            "--profile-filename-prefix",  # deprecated alias, kept for back-compat
             dest="profile_prefix",
             type=str,
             default=BenchArgs.profile_prefix,
