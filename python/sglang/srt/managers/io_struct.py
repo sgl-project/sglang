@@ -1115,8 +1115,6 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
     token_ids_logprob: Optional[List[int]]
     # Whether to stream output
     stream: bool
-    # Temperature applied only when computing input-token logprobs.
-    input_logprob_temperature: float = 1.0
     # Whether to return sparse output-token support from top-k/top-p/min-p sampling.
     return_sampling_mask: bool = False
     # Assemble prompt top logprobs as flat arrays scheduler-side (see
@@ -1211,6 +1209,9 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
     sampling_logprobs_mode: SamplingLogprobsMode = "selected"
     # LoRA adapter name; KV events namespace this request's blocks by it.
     lora_name: Optional[str] = None
+
+    # Temperature applied only when computing input-token logprobs.
+    input_logprob_temperature: float = 1.0
 
     def wrap_pickle_fields(self):
         self.time_stats = wrap_as_pickle(self.time_stats)

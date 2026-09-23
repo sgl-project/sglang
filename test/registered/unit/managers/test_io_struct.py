@@ -75,6 +75,28 @@ class TestTokenizedReqInputMsgpack(unittest.TestCase):
             "Rust may omit only a defaulted suffix of the Python wire schema",
         )
 
+    def test_input_logprob_temperature_wire_round_trip(self):
+        req = TokenizedGenerateReqInput(
+            input_text="Hello",
+            input_ids=None,
+            input_embeds=None,
+            mm_inputs=None,
+            token_type_ids=None,
+            sampling_params=SamplingParams(),
+            return_logprob=True,
+            logprob_start_len=0,
+            top_logprobs_num=0,
+            token_ids_logprob=None,
+            stream=False,
+            input_logprob_temperature=0.5,
+        )
+        self.assertEqual(self._round_trip(req).input_logprob_temperature, 0.5)
+
+        # Older producers omit this defaulted suffix of the positional schema.
+        wire = msgspec.msgpack.decode(msgpack_encode(req))
+        decoded = msgpack_decode(msgspec.msgpack.encode(wire[:-1]))
+        self.assertEqual(decoded.input_logprob_temperature, 1.0)
+
     def _make_mm_inputs(self, device="cpu"):
         return MultimodalProcessorOutput(
             mm_items=[
