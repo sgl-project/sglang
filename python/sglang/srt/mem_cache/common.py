@@ -137,18 +137,11 @@ def free_kv_row_segments(
         if hi <= lo:
             swa_alive.append((kv_indices, start_pos))
             continue
-        for piece_start, piece_end, side in (
-            (start_pos, lo, swa_alive),
-            (lo, hi, swa_dead),
-            (hi, end_pos, swa_alive),
-        ):
-            if piece_end > piece_start:
-                side.append(
-                    (
-                        kv_indices[piece_start - start_pos : piece_end - start_pos],
-                        piece_start,
-                    )
-                )
+        if lo > start_pos:
+            swa_alive.append((kv_indices[: lo - start_pos], start_pos))
+        swa_dead.append((kv_indices[lo - start_pos : hi - start_pos], lo))
+        if end_pos > hi:
+            swa_alive.append((kv_indices[hi - start_pos :], hi))
 
     if swa_dead and swa_alive:
         # The two sides are separate calls, so neither one's page-disjointness
