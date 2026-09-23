@@ -5,6 +5,7 @@ These cover the pure-Python logic that the GPU end-to-end test
 (test_weight_cache_daemon.py) cannot exercise cheaply:
 
   - length-prefixed socket framing (send_msg/recv_msg) over socketpair()
+  - CPU storage FD transport, aliases, strided/empty views, and multiple clients
   - CacheConfig compatibility matching / (de)serialization
   - quant-config hashing and method-name extraction
   - daemon spawn configuration and socket/ready path derivation
@@ -130,6 +131,47 @@ class TestProtocolFraming(CustomTestCase):
 
 
 class TestTransportBackend(CustomTestCase):
+    def test_cpu_storage_views_survive_multiple_clients(self):
+        source = torch.arange(32, dtype=torch.bfloat16)
+        tensors = {
+            "left": (source[2:14:2], True),
+            "right": (source[8:20].view(3, 4), False),
+            "empty": (torch.empty(0, dtype=torch.bfloat16), True),
+        }
+        server = TorchIpcTransportBackend()
+        entries = server.prepare_export(tensors)
+        clients = []
+        for _ in range(2):
+            client = TorchIpcTransportBackend()
+            a, b = socket.socketpair()
+            try:
+                a.settimeout(5)
+                b.settimeout(5)
+                server.send_fetch_state_response(a, config={}, entries=entries, pid=123)
+                response = client.recv_fetch_state_response(b, recv_msg(b))
+                imported = {
+                    name: client.import_tensor(entry)
+                    for name, entry in response["entries"].items()
+                }
+            finally:
+                a.close()
+                b.close()
+            for name, (expected, _) in tensors.items():
+                actual = imported[name]
+                torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+                self.assertEqual(actual.stride(), expected.stride())
+                self.assertEqual(actual.storage_offset(), expected.storage_offset())
+            self.assertEqual(
+                imported["left"].untyped_storage().data_ptr(),
+                imported["right"].untyped_storage().data_ptr(),
+            )
+            clients.append(imported)
+        # Both clients and the source retain the same physical CPU storage.
+        source[8] = 123
+        for imported in clients:
+            self.assertEqual(imported["left"][3].item(), 123)
+            self.assertEqual(imported["right"][0, 0].item(), 123)
+
     def test_default_backend_is_torch_ipc(self):
         backend = get_client_transport_backend(None)
         self.assertEqual(backend.name, TORCH_IPC_BACKEND)
