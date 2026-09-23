@@ -444,10 +444,9 @@ class KimiK3MoE(nn.Module):
         # loading by _merge_front_weights().
         self._front_w: Optional[torch.Tensor] = None
         self._sharded_front_w: Optional[torch.Tensor] = None
-        self._sharded_front_enabled = (
-            envs.SGLANG_ENABLE_K3_SHARDED_FRONT.get()
-            and self.tp_size == 8
-            and get_device_sm() in (103, 107)
+        self._sharded_front_enabled = self.tp_size == 8 and get_device_sm() in (
+            103,
+            107,
         )
         self._front_sizes: Optional[List[int]] = None
         # True when _front_w merges only [gate, routed_expert_down_proj] (the EP
