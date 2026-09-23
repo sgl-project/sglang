@@ -246,6 +246,54 @@ def _asm_context_prefill_gather_indices(
     return tok_idx, cu_k
 
 
+# mha_batch_prefill reads 128 indices past the last real token (see
+# AiterIndicesUpdaterPrefill). 256 leaves that tile inside the buffer.
+_MHA_PREFILL_KV_INDEX_PAD = 256
+
+
+def _pad_mha_prefill_kv_indices(kv_indices: torch.Tensor) -> torch.Tensor:
+    """Repeat a live page id into the tail the CK prefill kernel over-reads.
+
+    An exact-sized index tensor makes that tile load uninitialized page ids
+    and fault. The prefill updater already pads; draft-extend must too.
+    """
+    n = kv_indices.shape[0]
+    if n == 0:
+        return kv_indices
+    padded = torch.empty(
+        n + _MHA_PREFILL_KV_INDEX_PAD,
+        dtype=kv_indices.dtype,
+        device=kv_indices.device,
+    )
+    padded[:n].copy_(kv_indices)
+    padded[n:] = kv_indices[0]
+    return padded
+
+
+def _batch_max_kv_len(forward_batch, bs: int) -> int:
+    """Max KV length for this batch, from the CPU mirror when it is present."""
+    if bs <= 0:
+        return 0
+    cpu_lens = getattr(forward_batch, "seq_lens_cpu", None)
+    if cpu_lens is not None and len(cpu_lens) >= bs:
+        window = cpu_lens[:bs]
+        if torch.is_tensor(window):
+            return int(window.max().item())
+        return int(max(window))
+    return int(forward_batch.seq_lens[:bs].max().item())
+
+
+def _draft_extend_uses_unified(use_mla: bool, eagle_topk, enabled: bool) -> bool:
+    """Short-Q draft extend belongs on unified_attention, not CK batch prefill.
+
+    topk > 1 is a tree mask. unified_attention's causal flag does not represent
+    it, so those drafts stay on the CK fallback.
+    """
+    if use_mla or not enabled:
+        return False
+    return eagle_topk is None or int(eagle_topk) <= 1
+
+
 class AiterAttnBackend(AttentionBackend):
     # kv_indptr/qo_indptr are preallocated at (req pool + 1); an extend batch
     # can never carry more seqs than the pool.
@@ -416,6 +464,19 @@ class AiterAttnBackend(AttentionBackend):
             and self.topk == 1
             and get_bool_env_var("SGLANG_AITER_UNIFIED_VERIFY", "1")
         )
+        # Draft extend only. Default aiter keeps prefill and target verify on
+        # their existing kernels; the draft step is the one that is short-Q
+        # and was falling through to mha_batch_prefill.
+        self._use_unified_draft_extend = _draft_extend_uses_unified(
+            self.use_mla,
+            get_spec().speculative_eagle_topk,
+            envs.SGLANG_AITER_UNIFIED_DRAFT_EXTEND.get(),
+        )
+        if self._use_unified_draft_extend:
+            logger.info(
+                "Aiter draft extend uses unified_attention "
+                "(SGLANG_AITER_UNIFIED_DRAFT_EXTEND, topk<=1)."
+            )
 
         # aiter kernel related initialization
         self.max_num_partitions = (
@@ -1750,6 +1811,14 @@ class AiterAttnBackend(AttentionBackend):
                         self.req_to_token,
                     )
                 )
+                # The CK fallback reads self.qo_indptr, which the prompt extend
+                # left at the prompt length. Publish this step's short indptr
+                # there, and pad the page ids the kernel over-reads.
+                kv_indices = _pad_mha_prefill_kv_indices(kv_indices)
+                n_qo = qo_indptr.shape[0]
+                self.qo_indptr[:n_qo].copy_(qo_indptr)
+                qo_indptr = self.qo_indptr[:n_qo]
+                max_kv_len = _batch_max_kv_len(forward_batch, bs)
                 self.forward_metadata = ForwardMetadata(
                     kv_indptr,
                     kv_indices,
@@ -3440,15 +3509,16 @@ class AiterAttnBackend(AttentionBackend):
                 return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
             # draft_extend (EAGLE-v2 KV catch-up) is decode-shaped: short Q
-            # (accepted tokens) against long paged KV, GQA. The default
-            # mha_batch_prefill_func FMHA has no split-KV, so at short Q it is
-            # occupancy-starved (~0.2% HBM BW, ~400x over the memory floor).
-            # Route it through unified_attention (GQA-packed + split-KV), exactly
-            # like target_verify, so it runs near the memory floor.
+            # (accepted tokens) against long paged KV, GQA. #30105 already
+            # routes it through unified_attention (GQA-packed + split-KV) and
+            # defaults SGLANG_AITER_UNIFIED_DRAFT_EXTEND on, but the call was
+            # also gated on _use_unified_verify, which stays false unless
+            # SGLANG_USE_AITER_UNIFIED_ATTN is set. Drop that conjunct so the
+            # default aiter backend actually takes the #30105 kernel. topk>1
+            # and the env kill switch fall through to the padded CK path.
             if (
-                self._use_unified_verify
+                self._use_unified_draft_extend
                 and forward_batch.forward_mode.is_draft_extend_v2()
-                and envs.SGLANG_AITER_UNIFIED_DRAFT_EXTEND.get()
             ):
                 bs = forward_batch.batch_size
                 if layer.qk_head_dim != layer.v_head_dim:
@@ -3704,15 +3774,23 @@ class AiterAttnBackend(AttentionBackend):
                     -1, layer.tp_q_head_num, layer.head_dim
                 )
 
+            # Draft-extend publishes its own qo_indptr. A normal extend leaves
+            # that field empty and writes the shared buffer instead.
+            cu_seqlens_q = self.forward_metadata.qo_indptr
+            if cu_seqlens_q is None:
+                cu_seqlens_q = self.qo_indptr[:bs0]
+            max_kv_len = self.forward_metadata.max_kv_len
+            if max_kv_len is None:
+                max_kv_len = _batch_max_kv_len(forward_batch, bs0 - 1)
             o = mha_batch_prefill_func(
                 q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
                 k_cache,
                 v_cache,
-                self.qo_indptr[:bs0],
+                cu_seqlens_q,
                 self.forward_metadata.kv_indptr[:bs0],
                 page_table,
                 self.forward_metadata.max_q_len,
-                self.forward_metadata.max_kv_len,
+                max_kv_len,
                 causal=True,
                 logits_soft_cap=self.logits_soft_cap,
                 alibi_slopes=None,
