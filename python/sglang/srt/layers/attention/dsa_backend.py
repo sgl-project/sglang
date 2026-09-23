@@ -1264,10 +1264,7 @@ class DeepseekSparseAttnBackend(
         )
 
         max_ctx_len = self.req_to_token.shape[1]
-        # The wide page_table (max_num_tokens x max_ctx_len int32) and the
-        # flashmla metadata are rewritten in full before every replay, so they
-        # can live in the pausable cuda-graph region. The others are written
-        # once at init and would come back zeroed after a resume.
+        # rewritten in full before every replay; the init-once metadata below would resume zeroed
         with self._memory_saver_adapter.region(tag=GPU_MEMORY_TYPE_CUDA_GRAPH):
             page_table = (
                 None
