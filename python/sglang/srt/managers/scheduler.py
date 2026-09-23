@@ -916,8 +916,8 @@ class Scheduler(
                 stream_reasoning=False,
                 tokenizer=self.tokenizer,
             )
-            think_end_ids = self.tokenizer.encode(
-                reasoning_parser.detector.think_end_token, add_special_tokens=False
+            think_end_ids = reasoning_parser.detector.get_think_end_token_ids(
+                self.tokenizer
             )
             if think_end_ids:
                 self.model_config.think_end_ids = think_end_ids
@@ -2801,6 +2801,7 @@ class Scheduler(
                 disagg_mode=self.disaggregation_mode,
                 routed_dp_rank=recv_req.routed_dp_rank,
                 disagg_prefill_dp_rank=recv_req.disagg_prefill_dp_rank,
+                kv_hints=recv_req.kv_hints,
                 vocab_size=self.model_config.vocab_size,
                 priority=recv_req.priority,
                 metrics_collector=(
@@ -2909,6 +2910,19 @@ class Scheduler(
             )
             self.init_req_max_new_tokens(req)
             self._add_request_to_queue(req)
+            return
+
+        if error_msg := self.validate_dllm_request(req):
+            abort_req = _make_abort_req(
+                req,
+                finished_reason={
+                    "type": "abort",
+                    "status_code": HTTPStatus.BAD_REQUEST,
+                    "message": error_msg,
+                },
+            )
+            req.time_stats.trace_ctx.abort(abort_info=abort_req.finished_reason)
+            self.ipc_channels.send_to_tokenizer.send_output(abort_req, req)
             return
 
         if self.spec_algorithm.is_dflash_family():
@@ -3513,7 +3527,10 @@ class Scheduler(
             self.handle_embedding_request(tokenized_req)
 
     def stash_chunked_request(self, req: Req):
-        maybe_cache_unfinished_req(req, self.tree_cache, chunked=True)
+        if self.disaggregation_mode == DisaggregationMode.PREFILL:
+            self.cache_unfinished_disagg_prefill(req, chunked=True)
+        else:
+            maybe_cache_unfinished_req(req, self.tree_cache, chunked=True)
 
     def process_pending_chunked_abort(self) -> None:
         """Abort an in-flight chunked-prefill request once it is safe to do so.
@@ -3635,13 +3652,7 @@ class Scheduler(
         if self.dllm_config is not None and self.dllm_manager.any_staging_reqs():
             chunked_req_to_exclude.update(self.dllm_manager.staging_queue)
             for req in self.dllm_manager.staging_queue:
-                if self.dllm_config.first_done_first_out_mode:
-                    if not req.dllm_incomplete_ids:
-                        self.stash_chunked_request(req)
-                        self.req_to_token_pool.free(req)
-                    # Otherwise, keep req slot/KV for reuse.
-                else:
-                    self.stash_chunked_request(req)
+                self.finish_dllm_forward(req)
 
         if self.chunked_req is not None:
             # Move the chunked request out of the batch so that we can merge
@@ -5441,24 +5452,13 @@ class Scheduler(
             # For disaggregation decode mode, the request in the waiting queue has KV cache allocated.
             if self.disaggregation_mode == DisaggregationMode.DECODE:
                 release_kv_cache(req, self.tree_cache)
-            # For disaggregation prefill mode, free the metadata buffer index
             if self.disaggregation_mode == DisaggregationMode.PREFILL:
-                bootstrap_pending = req.pending_bootstrap
-                maybe_release_metadata_buffer(
-                    req, self.req_to_metadata_buffer_idx_allocator
-                )
-                if (
-                    bootstrap_pending
-                    and hasattr(req, "disagg_kv_sender")
-                    and req.disagg_kv_sender is not None
-                ):
-                    if hasattr(req.disagg_kv_sender, "abort"):
-                        req.disagg_kv_sender.abort()
+                self.release_aborted_prefill_waiting_req(req)
 
             # For mamba radix cache
-            if (
-                req.kv.holds_mamba
-                and self.disaggregation_mode != DisaggregationMode.DECODE
+            if req.kv.holds_mamba and self.disaggregation_mode not in (
+                DisaggregationMode.PREFILL,
+                DisaggregationMode.DECODE,
             ):
                 release_kv_cache(req, self.tree_cache, is_insert=False)
             logger.debug(f"Abort queued request. {req.rid=}")

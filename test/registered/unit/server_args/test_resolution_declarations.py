@@ -95,7 +95,6 @@ _REACHED_BY_SHAPES = frozenset(
         "flashinfer_allreduce_fusion_backend",
         "grammar_backend",
         "hicache_ratio",
-        "keep_mm_feature_on_device",
         "load_balance_method",
         "max_running_requests",
         "mem_fraction_static",

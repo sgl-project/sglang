@@ -1,14 +1,6 @@
-"""The order ``ServerArgs`` presents its fields in, frozen.
+"""Field order preserving the ServerArgs positional constructor signature.
 
-A dataclass turns field order into a positional constructor signature, so
-``ServerArgs(model_path, tokenizer_path)`` has to keep meaning what it means.
-Grouping the declarations by namespace would move the second argument onto
-another field, silently.
-
-A compatibility record and nothing else -- a field's namespace is the module it
-is declared in, and only ``collect_input_fields`` reads this. A name that is not
-here sorts after every name that is, which is the only backward-compatible
-position for a new field anyway.
+``collect_input_fields`` appends unlisted fields after these entries.
 """
 
 # fmt: off
@@ -339,7 +331,6 @@ POSITIONAL_FIELD_ORDER = (
     "elastic_ep_initial_size",
     "max_ep_size",
     "elastic_ep_scale_timeout",
-    "elastic_ep_rejoin",
     "disable_flashinfer_cutlass_moe_fp4_allgather",
     "disable_shared_experts_fusion",
     "enforce_shared_experts_fusion",
@@ -393,7 +384,6 @@ POSITIONAL_FIELD_ORDER = (
     "mm_global_cache_backend",
     "disable_fast_image_processor",
     "mm_feature_transport",
-    "keep_mm_feature_on_device",
     "enable_lora",
     "enable_lora_overlap_loading",
     "max_lora_rank",
