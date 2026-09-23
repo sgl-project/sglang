@@ -71,6 +71,20 @@ from sglang.srt.utils.custom_op import register_custom_op
 
 logger = logging.getLogger(__name__)
 
+
+def _restore_padded_topk_rows(
+    topk_result: torch.Tensor, total_rows: int, padding_value: int
+) -> torch.Tensor:
+    pad_len = total_rows - topk_result.shape[0]
+    if pad_len == 0:
+        return topk_result
+    padding = topk_result.new_full(
+        (pad_len, *topk_result.shape[1:]),
+        padding_value,
+    )
+    return torch.cat([topk_result, padding], dim=0)
+
+
 _is_cuda = is_cuda()
 _is_hip = is_hip()
 _is_npu = is_npu()
@@ -866,6 +880,9 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         assert len(weights.shape) == 3
         weights = weights.squeeze(2)
 
+        topk_lengths = metadata.get_seqlens_expanded()
+        valid_query_rows = topk_lengths.shape[0]
+
         # SM100 DeepGEMM paged MQA requires batch_size <= num_sms; chunk larger batches.
         def _chunked_fp8_paged_mqa_logits(
             q: torch.Tensor,
@@ -914,9 +931,9 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
 
         if self.paged_mqa_logits_backend.is_aiter():
             logits = aiter_paged_mqa_logits(
-                q_fp8,
+                q_fp8[:valid_query_rows],
                 kv_cache_fp8,
-                weights,
+                weights[:valid_query_rows],
                 seqlens_32,
                 block_tables,
                 max_seq_len,
@@ -980,19 +997,15 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 q_offset=q_offset,
             )
 
-        # NOTE(dark): logits should be cleaned in topk_transform
+        # MLP-sync padding adds query rows not represented in DSA metadata.
+        logits = logits[:valid_query_rows]
         self._mask_init_and_local_tokens(logits, seqlens_32)
         topk_result = metadata.topk_transform(logits, self.index_topk)
-        # Restore possible padding exist in the hidden states.
-        if not _is_hip and q_offset < q_fp8.shape[0]:
-            pad_len = q_fp8.shape[0] - q_offset
-            padding = torch.full(
-                (pad_len, topk_result.shape[1]),
-                -1,
-                dtype=topk_result.dtype,
-                device=topk_result.device,
-            )
-            topk_result = torch.cat([topk_result, padding], dim=0)
+        topk_result = _restore_padded_topk_rows(
+            topk_result,
+            total_rows=q_fp8.shape[0],
+            padding_value=0 if _is_hip else -1,
+        )
         return topk_result
 
     def _get_mqa_logits_budget_bytes(self, device_index: int) -> int:

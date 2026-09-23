@@ -70,6 +70,7 @@ from sglang.srt.layers.aux_hidden_states import (
 from sglang.srt.layers.communicator import (
     LayerCommunicator,
     LayerScatterModes,
+    ScatterMode,
     enable_moe_dense_fully_dp,
     get_attn_tp_context,
 )
@@ -205,6 +206,7 @@ from sglang.srt.utils import (
     is_non_idle_and_non_empty,
     is_sm90_supported,
     make_layers,
+    temp_attr_context,
     use_intel_amx_backend,
 )
 from sglang.srt.utils.custom_op import register_custom_op
@@ -2485,6 +2487,19 @@ class DeepseekV2AttentionMLA(
             return quant_config
 
 
+def _moe_sees_dp_gathered_rows(
+    mlp: nn.Module, layer_scatter_modes: LayerScatterModes
+) -> bool:
+    parallel = get_parallel()
+    return (
+        isinstance(mlp, DeepseekV2MoE)
+        and parallel.enable_dp_attention
+        and parallel.attn_dp_size > 1
+        and get_moe_a2a_backend().is_none()
+        and layer_scatter_modes.mlp_mode == ScatterMode.FULL
+    )
+
+
 class DeepseekV2DecoderLayer(nn.Module):
     def __init__(
         self,
@@ -2589,10 +2604,9 @@ class DeepseekV2DecoderLayer(nn.Module):
 
         self._gfx95_quant_format = self._detect_gfx95_quant_format()
 
+        parallel = get_parallel()
         communicator_cls = (
-            DSACPLayerCommunicator
-            if get_parallel().enable_prefill_cp
-            else LayerCommunicator
+            DSACPLayerCommunicator if parallel.enable_prefill_cp else LayerCommunicator
         )
         self.layer_communicator = communicator_cls(
             layer_scatter_modes=self.layer_scatter_modes,
@@ -2603,6 +2617,12 @@ class DeepseekV2DecoderLayer(nn.Module):
                 is_nextn or (self.layer_id == self.config.num_hidden_layers - 1)
             ),
             qkv_latent_func=self.self_attn.prepare_qkv_latent,
+            force_layernorm_before_dp_gather=(
+                _is_hip
+                and parallel.enable_dp_attention
+                and parallel.attn_dp_size > 1
+                and parallel.attn_tp_size > 1
+            ),
         )
 
     def _detect_gfx95_quant_format(self) -> str:
@@ -2717,16 +2737,27 @@ class DeepseekV2DecoderLayer(nn.Module):
         else:
             _mlp_ctx = nullcontext()
 
-        with get_forward().scoped(
-            fuse_mlp_allreduce=fuse_mlp_allreduce,
-            mlp_reduce_scatter=mlp_reduce_scatter,
+        mlp_sees_dp_gathered_rows = _moe_sees_dp_gathered_rows(
+            self.mlp, self.layer_scatter_modes
+        )
+        token_count_ctx = (
+            temp_attr_context(forward_batch, "num_token_non_padded", None)
+            if mlp_sees_dp_gathered_rows
+            else nullcontext()
+        )
+        with (
+            token_count_ctx,
+            get_forward().scoped(
+                fuse_mlp_allreduce=fuse_mlp_allreduce,
+                mlp_reduce_scatter=mlp_reduce_scatter,
+            ),
+            _mlp_ctx,
         ):
-            with _mlp_ctx:
-                hidden_states = self.mlp(
-                    hidden_states,
-                    forward_batch,
-                    gemm_output_zero_allocator,
-                )
+            hidden_states = self.mlp(
+                hidden_states,
+                forward_batch,
+                gemm_output_zero_allocator,
+            )
 
         if fuse_mlp_allreduce:
             hidden_states._sglang_needs_allreduce_fusion = True

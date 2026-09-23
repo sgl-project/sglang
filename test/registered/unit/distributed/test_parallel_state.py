@@ -208,10 +208,12 @@ def test_parallel_group_construction_tp8_attn_cp2():
     ):
         # Mock init_model_parallel_group to capture the groups being created
         created_groups = {}
+        created_group_options = {}
 
         def mock_init_model_parallel_group(group_ranks, local_rank, backend, **kwargs):
             group_name = kwargs.get("group_name", "unknown")
             created_groups[group_name] = group_ranks
+            created_group_options[group_name] = kwargs
 
             # Create a mock group object
             mock_group = Mock()
@@ -224,6 +226,7 @@ def test_parallel_group_construction_tp8_attn_cp2():
                 "init_model_parallel_group",
                 side_effect=mock_init_model_parallel_group,
             ),
+            patch.object(parallel_state, "is_hip", return_value=True),
             patch.object(parallel_state, "get_world_group") as mock_world_group,
         ):
             # Mock world group
@@ -265,10 +268,60 @@ def test_parallel_group_construction_tp8_attn_cp2():
                 f"Wrong ATTN_CP groups: {attn_cp_groups}"
             )
 
+            # A distinct attention-TP group participates in decode CUDA graph
+            # capture. It needs PyNccl so the graph path cannot fall through to
+            # torch.distributed, while avoiding a second custom-AR buffer pool.
+            attn_tp_options = created_group_options["attention_tp"]
+            assert attn_tp_options["use_custom_allreduce"] is False
+            assert attn_tp_options["use_pynccl"] is True
+
             print("TP=8, Attn CP=2 group construction verified")
 
             # Cleanup
             parallel_state.destroy_model_parallel()
+
+
+def test_rocm_dp_attention_disables_custom_ar_on_full_tp_group():
+    created_group_options = {}
+
+    def mock_init_model_parallel_group(group_ranks, local_rank, backend, **kwargs):
+        created_group_options[kwargs.get("group_name", "unknown")] = kwargs
+        group = Mock()
+        group.device_group = Mock()
+        return group
+
+    with (
+        patch.object(parallel_state, "_WORLD", None),
+        patch.object(parallel_state, "_TP", None),
+        patch.object(parallel_state, "_ATTN_CP", None),
+        patch.object(parallel_state, "_ATTN_TP", None),
+        patch.object(parallel_state, "_PP", None),
+        patch("torch.distributed.is_initialized", return_value=True),
+        patch("torch.distributed.get_world_size", return_value=8),
+        patch("torch.distributed.get_rank", return_value=0),
+        patch("torch.distributed.get_backend", return_value="nccl"),
+        patch.object(
+            parallel_state,
+            "init_model_parallel_group",
+            side_effect=mock_init_model_parallel_group,
+        ),
+        patch.object(parallel_state, "is_hip", return_value=True),
+        patch.object(parallel_state, "get_world_group") as mock_world_group,
+    ):
+        mock_world_group.return_value = Mock(device_group=Mock(), local_rank=0)
+        publish_build_topology(
+            tp_size=8,
+            pp_size=1,
+            dp_size=2,
+            enable_dp_attention=True,
+        )
+        parallel_state.initialize_model_parallel()
+
+        tp_options = created_group_options["tp"]
+        assert tp_options["use_pynccl"] is True
+        assert tp_options["use_custom_allreduce"] is False
+
+        parallel_state.destroy_model_parallel()
 
 
 def test_parallel_group_construction_tp8_moe_ep4_cp2():

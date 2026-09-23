@@ -1,5 +1,7 @@
 import unittest
 
+import torch
+
 from sglang.srt.utils import is_cuda, is_hip
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -36,6 +38,16 @@ class TestDsaHeadGateGuard(CustomTestCase):
         for name in HELPERS:
             with self.subTest(helper=name):
                 self.assertEqual(hasattr(dsa_prefill_cuda_graph, name), expected)
+
+    def test_dpa_padding_is_excluded_from_topk_and_restored(self):
+        from sglang.srt.layers.attention.dsa.dsa_indexer import (
+            _restore_padded_topk_rows,
+        )
+
+        real_topk = torch.arange(6 * 4, dtype=torch.int32).reshape(6, 4)
+        restored = _restore_padded_topk_rows(real_topk, total_rows=12, padding_value=0)
+        self.assertTrue(torch.equal(restored[:6], real_topk))
+        self.assertTrue(torch.equal(restored[6:], torch.zeros_like(real_topk)))
 
 
 if __name__ == "__main__":

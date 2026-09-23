@@ -16,7 +16,11 @@ from unittest.mock import MagicMock
 import torch
 
 from sglang.srt.layers.logits_processor import LogitsMetadata, LogitsProcessor
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.model_executor.forward_batch_info import (
+    ForwardBatch,
+    ForwardMode,
+    _mlp_sync_token_alignment,
+)
 from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
     DecodeCudaGraphRunner,
 )
@@ -41,6 +45,13 @@ def _logits_output(num_rows: int) -> SimpleNamespace:
 
 
 class TestMlpSyncPadUnpad(CustomTestCase):
+    def test_speculative_alignment_preserves_request_width_and_attn_tp(self):
+        spec_info = SimpleNamespace(num_tokens_per_req=6)
+
+        self.assertEqual(_mlp_sync_token_alignment(4, spec_info), 12)
+        self.assertEqual(_mlp_sync_token_alignment(8, spec_info), 24)
+        self.assertEqual(_mlp_sync_token_alignment(4, None), 4)
+
     def test_idle_rank_does_not_index_dummy_last_token(self):
         # MLP-sync turns an idle rank into a dummy zero-token EXTEND batch.
         empty = torch.empty(0, dtype=torch.int64)

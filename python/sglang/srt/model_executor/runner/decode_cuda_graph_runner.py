@@ -59,6 +59,7 @@ from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
     set_dp_buffer_len,
     set_is_extend_in_batch,
+    should_disable_rocm_partial_dpa_target_verify_graph,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.model_executor.cuda_graph_buffer_registry import (
@@ -685,6 +686,11 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         else:
             cuda_graph_bs = forward_batch.batch_size
 
+        if should_disable_rocm_partial_dpa_target_verify_graph(
+            forward_batch, cuda_graph_bs
+        ):
+            return False
+
         graph_key = self._make_graph_key(
             cuda_graph_bs,
             stream_idx=get_current_stream_idx() if self.enable_pdmux else None,
@@ -1181,6 +1187,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     num_tokens,
                     forward_batch.dp_padding_mode.is_max_len(),
                     forward_batch.global_num_tokens_cpu,
+                    forward_batch.global_num_tokens_gpu,
                 )
                 set_is_extend_in_batch(False)
 
