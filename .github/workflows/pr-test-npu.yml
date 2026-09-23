@@ -115,7 +115,7 @@ jobs:
 
   # Stage-A gate: CPU-only unit tests. The NPU attention-backend UTs stub out
   # torch_npu / sgl_kernel_npu before importing, so a hosted runner suffices.
-  base-a-unit-test-npu-cpu:
+  base-a-test-npu:
     needs: [check-changes, pr-gate]
     if: ${{ !failure() && !cancelled() && inputs.coverage_mode != true && needs.check-changes.outputs.main_package == 'true' }}
     runs-on: ubuntu-latest
@@ -167,10 +167,10 @@ jobs:
         timeout-minutes: 10
         run: |
           cd test
-          python3 run_suite.py --hw npu --suite base-a-unit-test-npu-cpu
+          python3 run_suite.py --hw npu --suite base-a-test-npu
 
   base-b-test-1-npu-a3:
-    needs: [check-changes, pr-gate, set-image-config, base-a-unit-test-npu-cpu]
+    needs: [check-changes, pr-gate, set-image-config, base-a-test-npu]
     if: ${{ !failure() && !cancelled() && (inputs.coverage_mode == true || needs.check-changes.outputs.main_package == 'true') }}
     uses: ./.github/workflows/_npu-pr-test-stage.yml
     with:
@@ -184,7 +184,7 @@ jobs:
     secrets: inherit
 
   base-b-test-2-npu-a3:
-    needs: [check-changes, pr-gate, set-image-config, base-a-unit-test-npu-cpu]
+    needs: [check-changes, pr-gate, set-image-config, base-a-test-npu]
     if: ${{ !failure() && !cancelled() && (inputs.coverage_mode == true || needs.check-changes.outputs.main_package == 'true') }}
     uses: ./.github/workflows/_npu-pr-test-stage.yml
     with:
@@ -198,7 +198,7 @@ jobs:
     secrets: inherit
 
   base-b-test-4-npu-a3:
-    needs: [check-changes, pr-gate, set-image-config, base-a-unit-test-npu-cpu]
+    needs: [check-changes, pr-gate, set-image-config, base-a-test-npu]
     if: ${{ !failure() && !cancelled() && (inputs.coverage_mode == true || needs.check-changes.outputs.main_package == 'true') }}
     uses: ./.github/workflows/_npu-pr-test-stage.yml
     with:
@@ -213,7 +213,7 @@ jobs:
     secrets: inherit
 
   base-b-test-8-npu-a3:
-    needs: [check-changes, pr-gate, set-image-config, base-a-unit-test-npu-cpu]
+    needs: [check-changes, pr-gate, set-image-config, base-a-test-npu]
     if: ${{ !failure() && !cancelled() && (inputs.coverage_mode == true || needs.check-changes.outputs.main_package == 'true') }}
     uses: ./.github/workflows/_npu-pr-test-stage.yml
     with:
@@ -227,7 +227,7 @@ jobs:
     secrets: inherit
 
   base-b-test-16-npu-a3:
-    needs: [check-changes, pr-gate, set-image-config, base-a-unit-test-npu-cpu]
+    needs: [check-changes, pr-gate, set-image-config, base-a-test-npu]
     if: ${{ !failure() && !cancelled() && (inputs.coverage_mode == true || needs.check-changes.outputs.main_package == 'true') }}
     uses: ./.github/workflows/_npu-pr-test-stage.yml
     with:
@@ -241,7 +241,7 @@ jobs:
     secrets: inherit
 
   multimodal-gen-test-1-npu-a3:
-    needs: [check-changes, pr-gate, set-image-config, base-a-unit-test-npu-cpu]
+    needs: [check-changes, pr-gate, set-image-config, base-a-test-npu]
     if: ${{ !failure() && !cancelled() && inputs.coverage_mode != true && needs.check-changes.outputs.multimodal_gen == 'true' }}
     runs-on: linux-aarch64-a3-800t-2
     strategy:
@@ -305,7 +305,7 @@ jobs:
           retention-days: 7
 
   multimodal-gen-test-4-npu-a3:
-    needs: [check-changes, pr-gate, set-image-config, base-a-unit-test-npu-cpu]
+    needs: [check-changes, pr-gate, set-image-config, base-a-test-npu]
     if: ${{ !failure() && !cancelled() && inputs.coverage_mode != true && needs.check-changes.outputs.multimodal_gen == 'true' }}
     runs-on: linux-aarch64-a3-800t-4
     strategy:
@@ -525,7 +525,7 @@ jobs:
     name: Analyze failure report
     needs:
       [
-        base-a-unit-test-npu-cpu,
+        base-a-test-npu,
         base-b-test-1-npu-a3,
         base-b-test-2-npu-a3,
         base-b-test-4-npu-a3,
@@ -688,7 +688,7 @@ jobs:
       [
         check-changes,
 
-        base-a-unit-test-npu-cpu,
+        base-a-test-npu,
         base-b-test-1-npu-a3,
         base-b-test-2-npu-a3,
         base-b-test-4-npu-a3,
