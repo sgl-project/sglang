@@ -46,6 +46,9 @@ DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_COMMON_ENVS = {
     "SGLANG_DSPARK_ENABLE_MULTI_STREAM": "0",
     "SGLANG_DSPARK_QUANT_AUDIT": "1",
     "SGLANG_DSPARK_QUANT_AUDIT_STRICT": "0",
+    # bound the DeepEP HCCL pool explicitly (aligned with d.sh) to avoid
+    # runtime HCCL allocation failures like "Failed to allocate 2517630976 bytes"
+    "DEEPEP_HCCL_BUFFSIZE": "1536",
 }
 
 # Prefill node environment variables for DSV4-Flash-0731 PD-Sep deployment.
@@ -70,7 +73,9 @@ DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_DECODE_ENVS = {
     "DEEPEP_NORMAL_LONG_SEQ_ROUND": "8",
     "DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS": "2048",
     "DEEPEP_NORMAL_COMBINE_ENABLE_LONG_SEQ": "1",
-    "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "128",
+    # 128 makes the DeepEP buffer ~2.3GB and OOMs HCCL on the decode node;
+    # d.sh uses 64 for decode.
+    "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "64",
     "SGLANG_NPU_USE_MULTI_STREAM": "0",
     "SGLANG_NPU_SPLIT_SHARED_EXPERT_OVERLAP": "1",
     # pd.sh also exports this on the decode node
