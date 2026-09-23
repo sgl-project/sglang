@@ -365,8 +365,11 @@ def finalize_all_reduce_push_norm(
     weight: torch.Tensor,
     eps: float = 1e-6,
 ) -> torch.Tensor:
-    """Deferred MoE finalize fused into the 1shot push AR + RMSNorm; ``out`` is
-    output-only. Caller checked :func:`finalize_push_fits`."""
+    """Finalize and reduce the latent, optionally reducing trailing shared rows.
+
+    Only the leading latent is normalized and output-only. Any trailing
+    shared rows must contain rank-local sums. Caller checked the push size.
+    """
     from sglang.kernels.ops.communication import all_reduce_residual as mod
 
     state = _get_state()
@@ -380,3 +383,14 @@ def finalize_all_reduce_push_norm(
         weight,
         eps,
     )
+
+
+def gemm_ag_down_proj(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    """BS1 TP8 replicated latent down projection, sharded across ranks."""
+    from sglang.kernels.ops.communication import gemm_ag as mod
+
+    state = _get_state()
+    assert state is not None
+    out = torch.empty((1, NORM_DIM), dtype=torch.float32, device=x.device)
+    mod.gemm_ag_down_proj(state.world_size, x, weight, out)
+    return out
