@@ -244,12 +244,14 @@ jobs:
 
       - name: Run test
         timeout-minutes: 60
+        env:
+          TEST_COMMAND: ${{ inputs.test_command }}
         run: |
           cmds=()
           while IFS= read -r cmd; do
             [ -z "$cmd" ] && continue
             cmds+=("$cmd")
-          done <<< "${{ inputs.test_command }}"
+          done <<< "$TEST_COMMAND"
           total=${#cmds[@]}
           suite_start=$SECONDS
           for idx in "${!cmds[@]}"; do
@@ -257,10 +259,10 @@ jobs:
             cmd="${cmds[$idx]}"
             echo ""
             echo "."
-            echo "Begin ($i/$total): python3 -m pytest $cmd -x"
+            echo "Begin ($i/$total): $cmd"
             echo "."
             file_start=$SECONDS
-            python3 -m pytest $cmd -x || exit 1
+            python3 python/sglang/multimodal_gen/test/runner/pytest_launcher.py "$cmd" || exit 1
             elapsed=$(( SECONDS - file_start ))
             echo "."
             echo "End ($i/$total): elapsed=${elapsed}s"

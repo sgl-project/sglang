@@ -1555,10 +1555,6 @@ COMPONENT_ACCURACY_SUITES = {
     "component-accuracy-1-gpu",
     "component-accuracy-2-gpu",
 }
-COMPONENT_ACCURACY_FILE_NUM_GPUS = {
-    "test_component_accuracy_1_gpu.py": 1,
-    "test_component_accuracy_2_gpu.py": 2,
-}
 
 DEFAULT_EST_TIME_SECONDS = 300.0
 STARTUP_OVERHEAD_SECONDS = 120.0

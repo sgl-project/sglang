@@ -9,6 +9,7 @@ import copy
 import json
 import os
 import random
+import shlex
 import subprocess
 import sys
 import time
@@ -20,6 +21,7 @@ import tabulate
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.test.partitioning import PartitionItem, assign_partition
+from sglang.multimodal_gen.test.runner.pytest_launcher import build_pytest_command
 from sglang.multimodal_gen.test.runner.pytest_runner import (
     partition_items_by_index,
     run_pytest,
@@ -48,7 +50,6 @@ else:
         _UPDATE_WEIGHTS_FROM_DISK_TEST_FILE,
         _UPDATE_WEIGHTS_MODEL_PAIR_ENV,
         _UPDATE_WEIGHTS_MODEL_PAIR_IDS,
-        COMPONENT_ACCURACY_FILE_NUM_GPUS,
         COMPONENT_ACCURACY_SUITES,
         DEFAULT_EST_TIME_SECONDS,
         DEFAULT_STANDALONE_EST_TIME_SECONDS,
@@ -365,27 +366,16 @@ def write_execution_report(
 def run_component_accuracy_files(files, filter_expr=None, continue_on_error=False):
     exit_code = 0
     for file_path in files:
-        file_name = Path(file_path).name
-        num_gpus = COMPONENT_ACCURACY_FILE_NUM_GPUS.get(file_name, 1)
-        if num_gpus > 1:
-            cmd = [
-                sys.executable,
-                "-m",
-                "torch.distributed.run",
-                f"--nproc_per_node={num_gpus}",
-                "-m",
-                "pytest",
-                "-s",
-                "-v",
-            ]
-        else:
-            cmd = [sys.executable, "-m", "pytest", "-s", "-v"]
-
+        pytest_args = ["-s", "-v"]
         if filter_expr:
-            cmd.extend(["-k", filter_expr])
-        cmd.append(file_path)
+            pytest_args.extend(["-k", filter_expr])
+        cmd = build_pytest_command(
+            shlex.quote(str(file_path)),
+            python=sys.executable,
+            pytest_args=pytest_args,
+        )
 
-        print(f"Running command: {' '.join(cmd)}")
+        print(f"Running command: {shlex.join(cmd)}")
         file_exit_code = subprocess.call(cmd)
         if file_exit_code == 5:
             print(
