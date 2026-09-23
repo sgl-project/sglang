@@ -153,7 +153,10 @@ def _encode_image_bytes(
 
     from PIL import Image
 
-    image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+    try:
+        image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+    except OSError as e:
+        raise ValueError(f"Could not decode image: {e}") from e
     scaled_size = _scaled_image_dimensions(
         *image.size,
         rescale_image_frac=rescale_image_frac,
