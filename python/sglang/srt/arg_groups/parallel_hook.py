@@ -251,7 +251,7 @@ def handle_data_parallelism(server_args: Any):
 
 
 def _graph_pool_is_pausable(server_args: Any) -> bool:
-    """Whether decode graphs are captured into the torch_memory_saver region
+    """Whether CUDA graphs are captured into the torch_memory_saver region
     that `release_memory_occupation(tags=["cuda_graph"])` pauses."""
     return bool(
         resolving_view(server_args).enable_memory_saver
@@ -277,44 +277,27 @@ def _disable_nccl_graph_buffer_registration(reason: str) -> None:
 
     NCCL_GRAPH_REGISTER (default on) registers the send/recv buffers of every
     collective captured in a CUDA graph for the lifetime of the graph, and
-    peers then move data through those registrations directly. Two captured
-    configurations cannot live with that:
+    peers then move data through those registrations directly. The TP LM-head
+    all-to-all is captured in the decode graphs on graph-pool temporaries,
+    whose addresses the pool also hands to other tensors, and the registered
+    exchange does not survive that: under a burst of new requests (DP ranks
+    ramping at different rates) one rank finishes its step while the others
+    spin in ncclDevKernel_SendRecv forever, and every DP rank hangs.
+    Reproduced on tp4/dp4/ep4 and on a multi-node tp16/dp16/ep16 PD decode
+    deployment; disabling the registration removes the hang while dedicated
+    all-to-all buffers alone do not.
 
-    * The TP LM-head all-to-all is captured in the decode graphs on graph-pool
-      temporaries, whose addresses the pool also hands to other tensors, and
-      the registered exchange does not survive that: under a burst of new
-      requests (DP ranks ramping at different rates) one rank finishes its
-      step while the others spin in ncclDevKernel_SendRecv forever, and every
-      DP rank hangs. Reproduced on tp4/dp4/ep4 and on a multi-node
-      tp16/dp16/ep16 PD decode deployment; disabling the registration removes
-      the hang while dedicated all-to-all buffers alone do not.
+    A pausable graph pool breaks the registrations too: torch_memory_saver
+    resume maps new physical pages behind the pool's virtual addresses while
+    the registrations made at capture keep the released pages, so replayed
+    collectives move data through pages the rest of the graph no longer uses
+    and the TP group deadlocks once the ranks diverge. The custom all-reduce
+    likewise skips its IPC registration in this pool (`tms_cudagraph`).
 
-    * A pausable graph pool (--enable-memory-saver with
-      SGLANG_MEMORY_SAVER_CUDA_GRAPH) is a torch_memory_saver region: it is
-      allocated through cuMem, so its buffers qualify for registration, and
-      pause/resume unmaps, releases and re-creates the physical memory behind
-      the same virtual addresses. The NVLS multicast and network registrations
-      made at capture keep pointing at the released pages, so after a resume
-      every replay reads the new pages through the addresses and the stale
-      pages through the registered paths, ranks receive different all-reduce
-      results, and the TP group deadlocks once their batches diverge. This is
-      the same rule the custom all-reduce already applies to its own IPC
-      registration under that region (`tms_cudagraph`), extended to NCCL's.
-      Reproduced on a two-node tp16/ep16 engine after a full
-      release/resume cycle; graph-resident memory or no registration both
-      complete the same run.
-
-    * DP attention replays the attention-DP gather/scatter over the TP group
-      (all_gather_into_tensor / reduce_scatter around the MoE all-reduce)
-      inside the decode graphs, on graph-pool buffers that the capture
-      registers. A two-node tp16/ep16/dp2 engine then stops on its GPUs
-      within the first decode steps: all 16 schedulers wait on the first
-      device synchronisation after a replay (`copy_done.synchronize()` under
-      the overlap scheduler, the routed-experts D2H copy without it), with
-      no CUDA or NCCL error, while the same run with eager decode completes.
-      Graph-pool sharing, the routed-experts capture and the
-      overlap scheduler were each switched off without effect; the
-      registration is the remaining graph-only ingredient.
+    DP attention replays its `dp_gather` / `dp_scatter` collectives over the
+    TP group inside the decode graphs; with registered buffers the TP group
+    stops on its GPUs within the first decode steps, without a CUDA or NCCL
+    error, while eager decode completes.
 
     Must run before the schedulers create their NCCL communicators, which
     inherit this environment. An explicit setting wins.
