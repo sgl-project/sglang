@@ -271,37 +271,31 @@ class HiSparseSpecSwapManager:
         ] = 0
         self._scratch_state[req_pool_idx + 1].fill_(-1)
 
-    def ensure_scratch(self, req_pool_indices_cpu: torch.Tensor) -> None:
-        if not self.enabled:
+    def allocate_scratch(self, req_pool_idx: int) -> None:
+        """Reserve one request's graph-stable swap workspace at admission."""
+        if not self.enabled or req_pool_idx in self._scratch_reqs:
             return
-        req_indices = [int(idx) for idx in req_pool_indices_cpu.tolist()]
-        missing = [idx for idx in req_indices if idx not in self._scratch_reqs]
-        if not missing:
-            return
-
-        total_slots = len(missing) * self.scratch_capacity
         allocator = self._coordinator.token_to_kv_pool_allocator
-        scratch_locs = allocator.hisparse_attn_allocator.alloc(total_slots)
+        scratch_locs = allocator.hisparse_attn_allocator.alloc(self.scratch_capacity)
         if scratch_locs is None:
             raise RuntimeError(
-                f"HiSparse spec failed to allocate {total_slots} scratch slots."
+                "HiSparse spec failed to allocate "
+                f"{self.scratch_capacity} scratch slots."
             )
-        scratch_locs = scratch_locs.to(torch.int32).view(
-            len(missing), self.scratch_capacity
-        )
-        for row, req_pool_idx in enumerate(missing):
-            # Physical slots are shared by all KV layers, but every full-index
-            # layer rotates those IDs between persistent cache and scratch
-            # independently. Keep per-layer location views so one layer cannot
-            # overwrite the next layer's ownership state.
-            self.req_to_scratch[:, req_pool_idx].copy_(scratch_locs[row])
-            self._scratch_reqs.add(req_pool_idx)
+        # Physical slots are shared by all KV layers, but every full-index
+        # layer rotates those IDs between persistent cache and scratch
+        # independently. Keep per-layer location views so one layer cannot
+        # overwrite the next layer's ownership state.
+        self.req_to_scratch[:, req_pool_idx].copy_(scratch_locs.to(torch.int32))
+        self._scratch_reqs.add(req_pool_idx)
 
-    def free_scratch(self, req_pool_idx: int) -> None:
+    def free_unrotated_scratch(self, req_pool_idx: int) -> None:
+        """Free scratch before any swap kernel has changed its ownership."""
         if not self.enabled or req_pool_idx not in self._scratch_reqs:
             return
-        scratch_locs = torch.unique(self.req_to_scratch[:, req_pool_idx].reshape(-1))
-        self._coordinator.token_to_kv_pool_allocator.free_hisparse_indices(scratch_locs)
+        self._coordinator.token_to_kv_pool_allocator.free_hisparse_indices(
+            self.req_to_scratch[0, req_pool_idx].clone()
+        )
         self.clear_scratch(req_pool_idx)
 
     def clear_scratch(self, req_pool_idx: int) -> None:
@@ -317,45 +311,10 @@ class HiSparseSpecSwapManager:
             return owned_locs
         return torch.cat([owned_locs, self.req_to_scratch[:, req_pool_idx].reshape(-1)])
 
-    def release_decode_reserve(
-        self,
-        batch: ScheduleBatch,
-        current_kv_lens_cpu: torch.Tensor,
-        next_kv_lens_cpu: torch.Tensor,
-    ) -> None:
-        """Release physical pages hidden behind spec decode's logical reserve."""
-        coordinator = self._coordinator
-        req_pool_indices = batch.req_pool_indices
-        logical_locs = [
-            coordinator.req_to_token_pool.req_to_token[
-                req_pool_idx, current_len:next_len
-            ]
-            for req_pool_idx, current_len, next_len in zip(
-                req_pool_indices,
-                current_kv_lens_cpu.tolist(),
-                next_kv_lens_cpu.tolist(),
-                strict=True,
-            )
-            if current_len < next_len
-        ]
-        if not logical_locs:
-            return
-        logical_locs = torch.cat(logical_locs)
-        allocator = coordinator.token_to_kv_pool_allocator
-        mapping = allocator.full_to_hisparse_device_index_mapping
-        mapped_device_locs = mapping[logical_locs]
-        mapped_device_locs = mapped_device_locs[mapped_device_locs > 0]
-        if mapped_device_locs.numel() > 0:
-            allocator.free_hisparse_indices(mapped_device_locs)
-        mapping[logical_locs] = 0
-
     def prepare_verify(self, batch: ScheduleBatch) -> None:
         """Bind target-verify KV writes to the side buffer's extra page."""
         coordinator = self._coordinator
         req_pool_indices = batch.req_pool_indices
-        req_pool_indices_cpu = batch.req_pool_indices_cpu
-        if req_pool_indices_cpu is None:
-            req_pool_indices_cpu = req_pool_indices.cpu()
         verify_cache_locs = batch.out_cache_loc
         start_positions = batch.seq_lens
 
@@ -372,12 +331,6 @@ class HiSparseSpecSwapManager:
                 f"HiSparse verify slot mismatch: expected {expected_slots}, "
                 f"got {verify_cache_locs.numel()}."
             )
-
-        coordinator._grow_device_buffers_to(
-            req_pool_indices_cpu,
-            torch.full_like(req_pool_indices_cpu, coordinator.padded_buffer_size),
-        )
-        self.ensure_scratch(req_pool_indices_cpu)
 
         extra_start = coordinator.device_buffer_size + 1
         total_slots = req_pool_indices.numel() * self.num_draft_tokens
@@ -852,6 +805,14 @@ class HiSparseCoordinator:
     def set_decode_producer_stream(self, stream) -> None:
         self.decode_producer_stream = stream
 
+    @property
+    def spec_scratch_capacity(self) -> int:
+        return self.spec_swap.scratch_capacity
+
+    def allocate_spec_scratch(self, req_pool_indices: List[int]) -> None:
+        for req_pool_idx in req_pool_indices:
+            self.spec_swap.allocate_scratch(req_pool_idx)
+
     def destroy(self) -> None:
         # Drain in-flight transfers so the buffer is idle, then unregister it.
         # See HostKVCache.destroy for why the explicit unregister matters.
@@ -985,14 +946,22 @@ class HiSparseCoordinator:
         else:
             allocated_len = req.kv.kv_allocated_len
             page_size = self.mem_pool_device.page_size
-            # Allocate only enough for current tokens (page-aligned).
-            # When prefill already fills device_buffer_size, include the reserved page.
-            alloc_size = min(
-                ((allocated_len + page_size - 1) // page_size) * page_size,
-                self.device_buffer_size,
-            )
-            if alloc_size == self.device_buffer_size:
+            if self.spec_swap.enabled:
+                # Spec verify writes into the extra page and its CUDA-graph
+                # workspace cannot grow on demand. Reserve both before the
+                # request becomes runnable so allocator availability accounts
+                # for their real scheduling cost.
                 alloc_size = self.padded_buffer_size
+            else:
+                # Allocate only enough for current tokens (page-aligned).
+                # When prefill already fills device_buffer_size, include the
+                # reserved page.
+                alloc_size = min(
+                    ((allocated_len + page_size - 1) // page_size) * page_size,
+                    self.device_buffer_size,
+                )
+                if alloc_size == self.device_buffer_size:
+                    alloc_size = self.padded_buffer_size
 
         compressed_logical_indices = (
             self.mem_pool_device.translate_loc_from_full_to_compressed(
@@ -1024,6 +993,7 @@ class HiSparseCoordinator:
         self.req_device_buffer_token_locs[:, req.kv.req_pool_idx, :alloc_size] = (
             buffer_indices[:alloc_size]
         )
+        self.spec_swap.allocate_scratch(req.kv.req_pool_idx)
         self.spec_swap.reset(req.kv.req_pool_idx)
 
     def _grow_device_buffers(
@@ -1099,34 +1069,6 @@ class HiSparseCoordinator:
         reserved_positions = (seq_lens - 1).clamp(max=self.device_buffer_size)
         return self.req_to_device_buffer[req_pool_indices, reserved_positions]
 
-    def _grow_device_buffers_to(
-        self, req_pool_indices_cpu: torch.Tensor, target_caps: torch.Tensor
-    ) -> None:
-        """Grow selected request buffers to explicit capacities."""
-        grow_reqs = []
-        for req_pool_idx, target_cap in zip(
-            req_pool_indices_cpu.tolist(), target_caps.tolist(), strict=True
-        ):
-            old_cap = int(self.req_device_buffer_size[req_pool_idx])
-            if old_cap < target_cap:
-                grow_reqs.append((int(req_pool_idx), old_cap, int(target_cap)))
-        total_grow = sum(new - old for _, old, new in grow_reqs)
-        if total_grow == 0:
-            return
-
-        new_locs = self.token_to_kv_pool_allocator.hisparse_attn_allocator.alloc(
-            total_grow
-        )
-        if new_locs is None:
-            raise RuntimeError(f"HiSparse failed to allocate {total_grow} KV slots.")
-        offset = 0
-        for req_pool_idx, old_cap, new_cap in grow_reqs:
-            chunk = new_locs[offset : offset + new_cap - old_cap]
-            offset += new_cap - old_cap
-            self.req_to_device_buffer[req_pool_idx, old_cap:new_cap] = chunk
-            self.req_device_buffer_token_locs[:, req_pool_idx, old_cap:new_cap] = chunk
-            self.req_device_buffer_size[req_pool_idx] = new_cap
-
     def has_ongoing_staging(self) -> bool:
         return len(self.ack_staging_queue) > 0
 
@@ -1158,16 +1100,6 @@ class HiSparseCoordinator:
             finish_count -= 1
             ready_reqs.append(req)
         return ready_reqs
-
-    def release_spec_decode_reserve(
-        self,
-        batch: ScheduleBatch,
-        current_kv_lens_cpu: torch.Tensor,
-        next_kv_lens_cpu: torch.Tensor,
-    ) -> None:
-        self.spec_swap.release_decode_reserve(
-            batch, current_kv_lens_cpu, next_kv_lens_cpu
-        )
 
     def prepare_spec_verify(self, batch: ScheduleBatch) -> None:
         self.spec_swap.prepare_verify(batch)
@@ -1461,6 +1393,7 @@ class HiSparseCoordinator:
         self.req_to_host_pool[req.kv.req_pool_idx, :] = -1
         self.req_to_host_pool_allocated_len[req.kv.req_pool_idx] = 0
         self._skip_first_backup[req.kv.req_pool_idx] = False
+        self.spec_swap.free_unrotated_scratch(req.kv.req_pool_idx)
         req.hisparse_staging = False
 
     def retract_req(self, req: Req) -> None:
@@ -1483,6 +1416,9 @@ class HiSparseCoordinator:
         # re-frees them (double-free into the page allocator's free list).
         allocated_len = req.kv.kv_allocated_len
         req_pool_idx = req.kv.req_pool_idx
+        allocated_locs = self.req_to_token_pool.req_to_token[
+            req_pool_idx, :allocated_len
+        ]
 
         # The spec commit kernel rotates physical locations between each
         # layer's persistent cache and scratch.  Their current union is the
@@ -1498,13 +1434,19 @@ class HiSparseCoordinator:
             if all_hi.numel() > 0:
                 self.token_to_kv_pool_allocator.free_hisparse_indices(all_hi)
 
-        allocated_locs = self.req_to_token_pool.req_to_token[
-            req_pool_idx, :allocated_len
-        ]
-        compressed_locs = self.mem_pool_device.translate_loc_from_full_to_compressed(
-            allocated_locs
-        )
-        self.mem_pool_device.full_to_hisparse_device_index_mapping[compressed_locs] = 0
+            compressed_locs = (
+                self.mem_pool_device.translate_loc_from_full_to_compressed(
+                    allocated_locs
+                )
+            )
+            self.mem_pool_device.full_to_hisparse_device_index_mapping[
+                compressed_locs
+            ] = 0
+        else:
+            # The request can finish or be aborted during prefill, before a
+            # device side buffer exists.  Its ordinary prefill mapping is still
+            # owned by release_kv_cache; only release our separate workspace.
+            self.spec_swap.free_unrotated_scratch(req_pool_idx)
 
         host_indices = self.mem_pool_host.allocated_host_indices(
             self.req_to_host_pool,

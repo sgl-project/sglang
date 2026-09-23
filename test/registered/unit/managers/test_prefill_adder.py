@@ -273,6 +273,34 @@ class TestPrefillAdder(CustomTestCase):
         )
         self.assertEqual(adder.can_run_list, [])
 
+    def test_new_request_workspace_is_charged_to_admission(self):
+        self.mock_token_allocator.available_size.return_value = 1100
+        adder = self.create_adder(
+            self.create_running_batch(), new_request_token_reserve=1024
+        )
+        req = self.create_shared_req("spec-workspace", max_new_tokens=0)
+        req.full_untruncated_fill_ids = list(range(100))
+        req.kv = SimpleNamespace(req_pool_idx=None)
+
+        self.assertEqual(
+            adder.add_one_req(req, has_chunked_req=False, truncation_align_size=None),
+            AddReqResult.NO_TOKEN,
+        )
+        self.assertEqual(adder.can_run_list, [])
+
+        # A continuation already owns the fixed workspace and must not pay for
+        # it again on each chunk.
+        continuation_adder = self.create_adder(
+            self.create_running_batch(), new_request_token_reserve=1024
+        )
+        req.kv.req_pool_idx = 3
+        self.assertNotEqual(
+            continuation_adder.add_one_req(
+                req, has_chunked_req=False, truncation_align_size=None
+            ),
+            AddReqResult.NO_TOKEN,
+        )
+
     def test_continuation_without_limit_keeps_normal_chunk_size(self):
         adder = self.create_shortest_prefill_adder()
         req = self.create_shared_req("continuation")

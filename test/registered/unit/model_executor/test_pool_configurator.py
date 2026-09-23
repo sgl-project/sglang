@@ -92,6 +92,8 @@ def _make_model_runner(
     max_running_requests=None,
     disaggregation_decode_extra_slots=0,
     enable_unified_memory=False,
+    enable_hisparse=False,
+    hisparse_host_to_device_ratio=1,
     kv_lora_rank=512,
     qk_rope_head_dim=64,
     swa_kv_lora_rank=128,
@@ -160,7 +162,10 @@ def _make_model_runner(
         max_running_requests=max_running_requests,
         disaggregation_decode_extra_slots=disaggregation_decode_extra_slots,
         enable_unified_memory=enable_unified_memory,
-        enable_hisparse=False,
+        enable_hisparse=enable_hisparse,
+        hisparse_config=(
+            f'{{"host_to_device_ratio": {hisparse_host_to_device_ratio}}}'
+        ),
         enable_hierarchical_cache=False,
         enable_dsa_cache_layer_split=False,
         kv_cache_dtype="auto",
@@ -857,6 +862,52 @@ class TestEagleConfigurator(CustomTestCase):
             576 * num_layers
             + indexer_bytes_per_token * active_indexer_layers
             + (576 + indexer_bytes_per_token) * draft_num_layers
+        )
+        self.assertEqual(cfg._cell_size, actual_bytes_per_token)
+        self.assertLessEqual(
+            config.max_total_num_tokens * actual_bytes_per_token,
+            available,
+        )
+
+    @patch(
+        "sglang.srt.mem_cache.kv_cache_configurator.calculate_mla_kv_cache_dim",
+        return_value=576,
+    )
+    def test_hisparse_draft_expanded_id_space_is_budgeted(
+        self,
+        _mock_calculate_mla_kv_cache_dim,
+    ):
+        """The dense draft pool spans HiSparse's host-expanded logical IDs."""
+        available = 10_000_000
+        num_layers = 78
+        draft_num_layers = 1
+        indexer_bytes_per_token = 132
+        host_to_device_ratio = 4
+
+        mr = _make_model_runner(
+            self,
+            num_layers=num_layers,
+            use_mla_backend=True,
+            enable_hisparse=True,
+            hisparse_host_to_device_ratio=host_to_device_ratio,
+        )
+        _configure_dsa_model(mr)
+        mr.spec_algorithm.is_eagle.return_value = True
+        mr.spec_algorithm.is_none.return_value = False
+        mr.spec_aux_config.eagle_draft_num_layers = draft_num_layers
+
+        with mock_cpu_env(kv_size=1):
+            from sglang.srt.model_executor.pool_configurator import (
+                create_memory_pool_configurator,
+            )
+
+            cfg = create_memory_pool_configurator(mr)
+            config = cfg.calculate_pool_sizes(available, page_size=1)
+
+        actual_bytes_per_token = (
+            576 * num_layers
+            + indexer_bytes_per_token * num_layers * host_to_device_ratio
+            + (576 + indexer_bytes_per_token) * draft_num_layers * host_to_device_ratio
         )
         self.assertEqual(cfg._cell_size, actual_bytes_per_token)
         self.assertLessEqual(

@@ -111,6 +111,11 @@ def validate_hisparse(server_args: ServerArgs) -> None:
             "The minimal HiSparse spec integration supports linear speculation "
             "only; use --speculative-eagle-topk 1."
         )
+    if enable_spec and cfg.speculative_adaptive:
+        raise ValueError(
+            "HiSparse speculative decoding uses statically sized swap state; "
+            "--speculative-adaptive is not supported."
+        )
 
     # DSv4 hisparse handles its own dtype/backend pairing elsewhere; the dtype-
     # aware checks below only apply to the DSA hisparse path.
