@@ -9,7 +9,8 @@ NVMe or filesystem tier needs to keep up with serving:
 
 - vectored ``readv``/``writev`` straight between page-first host pool buffers
   and the page file, so pages skip the staging tensor copy;
-- a bounded worker pool for parallel page reads and existence checks;
+- bounded worker pools for parallel page reads and existence checks and,
+  separately, for parallel page writes;
 - atomic publication (temporary file + rename), so a reader never observes a
   partially written page;
 - background LRU eviction between two watermarks plus an optional positive
@@ -26,7 +27,8 @@ share the root.
 Extra-config keys (``--hicache-storage-backend-extra-config``):
 
   storage_dir            root directory (default: see above)
-  read_workers           parallel read threads (default 1)
+  read_workers           parallel read / existence-check threads (default 1)
+  write_workers          parallel write threads, a separate pool (default 1)
   enable_metadata_cache  cache positive existence checks (default false)
   metadata_ttl           positive-cache lifetime in seconds, -1 = forever (5.0)
   max_size               byte cap per namespace, SI/IEC suffixes (unbounded)
@@ -77,11 +79,23 @@ logger = logging.getLogger(__name__)
 
 _DEFAULT_STORAGE_DIR = "/tmp/hicache"
 _DEFAULT_READ_WORKERS = 1
+_DEFAULT_WRITE_WORKERS = 1
 _DEFAULT_METADATA_TTL_S = 5.0
 
 
 class _CorruptPageError(OSError):
     """An on-disk page whose size does not match the requested transfer."""
+
+
+def _parse_workers(extra_config: dict, name: str, default: int) -> int:
+    value = setting(extra_config, name, default)
+    try:
+        workers = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"HiCacheFastFile {name} must be an integer") from exc
+    if isinstance(value, bool) or workers < 1:
+        raise ValueError(f"HiCacheFastFile {name} must be at least 1, got {value!r}.")
+    return workers
 
 
 class HiCacheFastFile(HiCacheFile):
@@ -112,13 +126,12 @@ class HiCacheFastFile(HiCacheFile):
         )
         os.makedirs(self.file_path, exist_ok=True)
 
-        self.read_workers = int(
-            setting(extra_config, "read_workers", _DEFAULT_READ_WORKERS)
+        self.read_workers = _parse_workers(
+            extra_config, "read_workers", _DEFAULT_READ_WORKERS
         )
-        if self.read_workers < 1:
-            raise ValueError(
-                f"HiCacheFastFile read_workers must be at least 1, got {self.read_workers}."
-            )
+        self.write_workers = _parse_workers(
+            extra_config, "write_workers", _DEFAULT_WRITE_WORKERS
+        )
         self.enable_metadata_cache = bool(
             setting(extra_config, "enable_metadata_cache", False)
         )
@@ -155,20 +168,29 @@ class HiCacheFastFile(HiCacheFile):
         )
         if self.metadata_cache is not None:
             self._scan_existing_files_to_metadata_cache()
+        # Separate pools: a large background backup must not queue ahead of a
+        # latency-sensitive prefetch (or its existence checks).
         self._read_executor: Optional[ThreadPoolExecutor] = None
         if self.read_workers > 1:
             self._read_executor = ThreadPoolExecutor(
                 max_workers=self.read_workers,
                 thread_name_prefix=f"HiCacheFastFileRead-{storage_config.tp_rank}",
             )
+        self._write_executor: Optional[ThreadPoolExecutor] = None
+        if self.write_workers > 1:
+            self._write_executor = ThreadPoolExecutor(
+                max_workers=self.write_workers,
+                thread_name_prefix=f"HiCacheFastFileWrite-{storage_config.tp_rank}",
+            )
         if not self._vector_io_supported:
             logger.warning(
                 "HiCacheFastFile vectored I/O is unavailable; using staged copies."
             )
         logger.info(
-            "HiCacheFastFile namespace=%s read_workers=%d",
+            "HiCacheFastFile namespace=%s read_workers=%d write_workers=%d",
             self.file_path,
             self.read_workers,
+            self.write_workers,
         )
 
     @classmethod
@@ -358,14 +380,36 @@ class HiCacheFastFile(HiCacheFile):
         return completed
 
     def _parallel_map(self, fn: Callable, *iterables) -> list:
-        if self._read_executor is None:
-            return [fn(*args) for args in zip(*iterables)]
-        futures = [self._read_executor.submit(fn, *args) for args in zip(*iterables)]
-        results = [None] * len(futures)
+        """Run ``fn`` over ``iterables`` on the read pool, preserving order."""
+        return self._map_on(self._read_executor, self.read_workers, fn, *iterables)
+
+    def _parallel_write_map(self, fn: Callable, *iterables) -> list:
+        """Run ``fn`` over ``iterables`` on the write pool, preserving order."""
+        return self._map_on(self._write_executor, self.write_workers, fn, *iterables)
+
+    @staticmethod
+    def _map_on(
+        executor: Optional[ThreadPoolExecutor], workers: int, fn: Callable, *iterables
+    ) -> list:
+        calls = list(zip(*iterables))
+        if executor is None or len(calls) <= 1:
+            return [fn(*args) for args in calls]
+        # One contiguous slice per worker, not one task per page: for small
+        # pages the per-task handoff costs more than the I/O it overlaps.
+        step = -(-len(calls) // workers)
+        futures = [
+            executor.submit(
+                lambda chunk: [fn(*args) for args in chunk], calls[i : i + step]
+            )
+            for i in range(0, len(calls), step)
+        ]
+        # Every task finishes before this returns or raises: the caller may
+        # release or reuse the host buffers the tasks read from or write to.
+        results: list = []
         first_error = None
-        for index, future in enumerate(futures):
+        for future in futures:
             try:
-                results[index] = future.result()
+                results.extend(future.result())
             except Exception as exc:
                 if first_error is None:
                     first_error = exc
@@ -575,10 +619,9 @@ class HiCacheFastFile(HiCacheFile):
                     if ok
                 )
                 return results, sum(results), num_bytes
-            sized = [
-                self._write_page_buffers(storage_key, buffers)
-                for storage_key, buffers in zip(storage_keys, page_buffers)
-            ]
+            sized = self._parallel_write_map(
+                self._write_page_buffers, storage_keys, page_buffers
+            )
         else:
             op = self._staged_read_page if read else self._staged_write_page
             offsets = [host_indices[i * page_size].item() for i in range(len(keys))]
@@ -587,9 +630,9 @@ class HiCacheFastFile(HiCacheFile):
                     op, [pool_name] * len(keys), keys, [host_pool] * len(keys), offsets
                 )
             else:
-                sized = [
-                    op(pool_name, key, host_pool, o) for key, o in zip(keys, offsets)
-                ]
+                sized = self._parallel_write_map(
+                    op, [pool_name] * len(keys), keys, [host_pool] * len(keys), offsets
+                )
         results = [ok for ok, _ in sized]
         pages = sum(1 for _, num_bytes in sized if num_bytes)
         return results, pages, sum(num_bytes for _, num_bytes in sized)
@@ -818,8 +861,9 @@ class HiCacheFastFile(HiCacheFile):
         return storage_metrics
 
     def close(self) -> None:
-        executor = self._read_executor
-        self._read_executor = None
-        if executor is not None:
-            executor.shutdown(wait=True)
+        for name in ("_read_executor", "_write_executor"):
+            executor = getattr(self, name)
+            setattr(self, name, None)
+            if executor is not None:
+                executor.shutdown(wait=True)
         self._evictor.close()

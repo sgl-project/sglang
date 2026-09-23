@@ -160,6 +160,9 @@ plus rename rather than `fsync`. The module docstring of
 `sglang/srt/mem_cache/storage/fast_file/fast_file_store.py` lists every
 extra-config key.
 
+`write_workers` (default 1) sizes a write pool kept separate from
+`read_workers`, so background backups never queue ahead of prefetch reads.
+
 ### Deployment with HF3FS
 
 Here is an example of deploying DeepSeek-R1 with HiCache-HF3FS. For more details, see the [HF3FS Documentation](https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/mem_cache/storage/hf3fs/docs/README.md).
