@@ -441,13 +441,15 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         """
         from sglang.srt.mem_cache.common import coalesce_ranges, free_kv_row_segments
 
+        allocator = self.token_to_kv_pool_allocator
         row = self.req_to_token_pool.req_to_token[kv.req_pool_idx]
         # Adjacent pieces whose seam falls inside one (DCP-widened) page would
         # free that page twice; the allocator rejects that, so merge them first.
         free_kv_row_segments(
-            self.token_to_kv_pool_allocator,
+            allocator,
             [(row[start:end], start) for start, end in coalesce_ranges(ranges)],
             swa_evicted_seqlen=kv.swa_evicted_seqlen,
+            swa_dead_lo=kv.swa_dead_lo(allocator.page_size),
         )
 
     @abstractmethod
