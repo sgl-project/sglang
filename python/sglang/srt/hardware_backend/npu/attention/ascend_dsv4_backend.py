@@ -1982,6 +1982,47 @@ class DeepseekV4AscendAttnBackend(
 
         if self._dsv4_compress_ratios:
             self._build_npu_compress_metadata(forward_batch)
+            self._dump_compress_metadata(fm, forward_batch)
+
+    def _dump_compress_metadata(self, fm, forward_batch: ForwardBatch) -> None:
+        """One line per forward step naming the metadata the attention reads.
+
+        Called from init_forward_metadata, i.e. host side and outside any graph
+        capture, so it stays at one line per step and also covers the prefill --
+        a request with no prefill line is the cache hit. Hashing each table
+        shrinks "which field differs on the hit path" to one md5 comparison.
+        """
+        import hashlib
+        import os
+
+        if not os.environ.get("DSV4_DUMP_META"):
+            return
+
+        def _h(t) -> str:
+            if t is None:
+                return "none"
+            a = t.detach().to(torch.float32).cpu().numpy()
+            if a.size == 0:
+                return "empty"
+            return hashlib.md5(a.tobytes()).hexdigest()[:12]
+
+        def _l(t) -> str:
+            if t is None or not torch.is_tensor(t):
+                return str(t)
+            return str(t.tolist())
+
+        print(
+            f"[META] mode={forward_batch.forward_mode} bs={forward_batch.batch_size} "
+            f"start_pos={_l(getattr(fm, 'start_pos', None))} "
+            f"seqused={_l(getattr(fm, 'seqused', None))} "
+            f"swa={_h(getattr(fm, 'swa_page_table', None))} "
+            f"c4pt={_h(getattr(fm, 'c4_page_table', None))} "
+            f"c128pt={_h(getattr(fm, 'c128_page_table', None))} "
+            f"c4loc={_h(getattr(fm, 'c4_loc', None))} "
+            f"c128loc={_h(getattr(fm, 'c128_loc', None))} "
+            f"kv={_h(getattr(fm, 'actual_seq_lengths_kv', None))}",
+            flush=True,
+        )
 
     def _compute_kernel_metadata(self, forward_batch: ForwardBatch) -> dict:
         fm = self.forward_metadata
