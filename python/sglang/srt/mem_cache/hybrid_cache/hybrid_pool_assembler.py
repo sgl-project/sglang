@@ -1110,7 +1110,7 @@ def build_deepseek_v4_hicache_stack(
 def build_hybrid_mamba_stack(
     *,
     params: CacheInitParams,
-    kv_pool: Any,
+    decls: tuple[HostPoolDecl, ...],
     mamba_pool: Any,
     full_layer_mapping: dict[int, int],
     mamba_layer_mapping: dict[int, int],
@@ -1123,36 +1123,43 @@ def build_hybrid_mamba_stack(
     model_name: Optional[str] = None,
     storage_backend_extra_config: Optional[dict] = None,
     enable_storage_metrics: bool = False,
-) -> tuple[HostPoolGroup, HybridCacheController]:
+) -> HostPoolAssemblyResult:
+    """KV plus every pool the hybrid pool declares (e.g. a sparse indexer),
+    then the Mamba state pool, which keeps its own host path."""
+    kv_pool = layout_root(decls).device_pool
     transfer_layer_id_max = (
         max(full_layer_mapping.keys() | mamba_layer_mapping.keys()) + 1
     )
     mamba_allocator = params.req_to_token_pool.mamba_allocator
-    from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
-
-    mtp_draft_device_pools = tuple(
-        pool.full_kv_pool if isinstance(pool, HybridLinearKVPool) else pool
-        for pool in params.mtp_draft_device_pools
+    packed_drafts = validate_packed_draft_pools(
+        target_decls=decls, draft_pools=params.mtp_draft_device_pools
     )
     kv_host_size, mamba_host_size = None, 0
     if get_memory().hicache_size > 0:
         kv_host_size, mamba_host_size = _split_hicache_size(
             get_memory().hicache_size, (kv_pool, mamba_pool)
         )
+    if packed_drafts:
+        full_layer_mapping = _with_mtp_layer_mapping(
+            full_layer_mapping,
+            transfer_layer_start=transfer_layer_id_max,
+            target_device_layer_num=kv_pool.layer_num,
+            draft_layer_num=len(packed_drafts),
+        )
+    configs = prepare_host_pool_configs(
+        decls=decls,
+        full_layer_mapping=full_layer_mapping,
+        transfer_layer_id_max=transfer_layer_id_max + len(packed_drafts),
+        packed_draft_decls=packed_drafts,
+    )
+    _validate_host_pool_buffers(configs, page_size=params.page_size)
     kv_host_pool = build_kv_host_pool(
         kv_pool=kv_pool,
         page_size=params.page_size,
         use_mla=use_mla,
         host_size=kv_host_size,
-        mtp_draft_device_pools=mtp_draft_device_pools,
+        mtp_draft_device_pools=_root_config(configs).packed_draft_device_pools,
     )
-    if mtp_draft_device_pools:
-        full_layer_mapping = _with_mtp_layer_mapping(
-            full_layer_mapping,
-            transfer_layer_start=transfer_layer_id_max,
-            target_device_layer_num=kv_pool.layer_num,
-            draft_layer_num=len(mtp_draft_device_pools),
-        )
     # MambaPoolHost only supports page_first_direct; the global layout may be
     # page_first_kv_split (e.g. MLA + KDA hybrid on NPU). The Mamba/KDA state
     # pool has no separate K/V buffers, so kv_split does not apply; override
@@ -1169,16 +1176,7 @@ def build_hybrid_mamba_stack(
         allocator_type=_get_allocator_type(),
         layout=mamba_layout,
     )
-    entries = [
-        build_pool_entry(
-            name=PoolName.KV,
-            host_pool=kv_host_pool,
-            device_pool=kv_pool,
-            layer_mapping=full_layer_mapping,
-            transfer_layer_id_max=transfer_layer_id_max + len(mtp_draft_device_pools),
-            is_anchor=True,
-            packed_draft_device_pools=mtp_draft_device_pools,
-        ),
+    entries = _build_declared_entries(configs, root_host_pool=kv_host_pool) + [
         build_pool_entry(
             name=PoolName.MAMBA,
             host_pool=mamba_host_pool,
@@ -1189,29 +1187,25 @@ def build_hybrid_mamba_stack(
             device_evict_fn=device_mamba_evict_fn,
             device_alloc_fn=mamba_allocator.alloc,
             device_free_fn=mamba_allocator.free,
-        ),
+        )
     ]
     host_pool_group = HostPoolGroup(entries)
-    cache_controller = HybridCacheController(
-        params.token_to_kv_pool_allocator,
-        host_pool_group,
-        params.page_size,
-        params.tp_cache_group,
+    cache_controller = _build_declared_controller(
+        params=params,
+        host_pool_group=host_pool_group,
         load_cache_event=load_cache_event,
-        attn_cp_group=params.attn_cp_cache_group,
-        attn_tp_group=params.attn_tp_cache_group,
-        pp_group=params.pp_cache_group,
-        write_policy=get_memory().hicache_write_policy,
-        io_backend=get_memory().hicache_io_backend,
         storage_backend=storage_backend,
         prefetch_threshold=prefetch_threshold,
         model_name=model_name,
         storage_backend_extra_config=storage_backend_extra_config,
         transfer_layer_id_max=transfer_layer_id_max,
         enable_storage_metrics=enable_storage_metrics,
-        host_memory_mode=get_memory().hicache_host_memory_mode,
     )
-    return host_pool_group, cache_controller
+    return HostPoolAssemblyResult(
+        host_pool_group=host_pool_group,
+        cache_controller=cache_controller,
+        configs=configs,
+    )
 
 
 def build_hybrid_mamba_swa_stack(
@@ -1856,9 +1850,9 @@ class _MambaStrategy(StackStrategy):
         mamba_layer_mapping = _stage_local_layer_mapping(
             params.req_to_token_pool.mamba_map, kvcache.start_layer
         )
-        host_pool_group, cache_controller = build_hybrid_mamba_stack(
+        stack = build_hybrid_mamba_stack(
             params=params,
-            kv_pool=kvcache.full_kv_pool,
+            decls=kvcache.host_pool_decls(),
             mamba_pool=params.req_to_token_pool.mamba_pool,
             full_layer_mapping=full_layer_mapping,
             mamba_layer_mapping=mamba_layer_mapping,
@@ -1873,14 +1867,18 @@ class _MambaStrategy(StackStrategy):
             enable_storage_metrics=enable_storage_metrics,
         )
         return StackBuildResult(
-            host_pool_group=host_pool_group,
-            cache_controller=cache_controller,
+            host_pool_group=stack.host_pool_group,
+            cache_controller=stack.cache_controller,
             component_host_pools={
-                ComponentType.FULL: host_pool_group.get_pool(PoolName.KV),
-                ComponentType.MAMBA: host_pool_group.get_pool(PoolName.MAMBA),
+                ComponentType.FULL: stack.host_pool_group.get_pool(PoolName.KV),
+                ComponentType.MAMBA: stack.host_pool_group.get_pool(PoolName.MAMBA),
             },
+            sidecars=stack.sidecars,
+            pool_declarations=tuple(c.decl for c in stack.configs),
             register_req_to_token_counter=True,
-            pools_desc="KV + MAMBA",
+            pools_desc=" + ".join(
+                [c.decl.pool_name.value.upper() for c in stack.configs] + ["MAMBA"]
+            ),
         )
 
 
@@ -2226,7 +2224,7 @@ def _select_strategy(kvcache: Any, components: set[ComponentType]) -> StackStrat
 
 # Strategies that assemble from host_pool_decls(), so every declared pool has an
 # entry by construction; a miss here is a bug, not an unsupported combination.
-_DECLARATION_VERIFIED_STRATEGIES: tuple[type, ...] = (_DsaStrategy,)
+_DECLARATION_VERIFIED_STRATEGIES: tuple[type, ...] = (_DsaStrategy, _MambaStrategy)
 
 
 def _check_declared_pools_present(
