@@ -2193,15 +2193,6 @@ class FloatMultiEndedAllocator(MultiEndedAllocator):
             return 0
         return len(p._free_phys_pages) * p.entry_bytes_per_page
 
-    def _schedulable_capacity_key(self) -> Tuple[int, ...]:
-        # Equal maximum credit can hide a change of side; each side extends
-        # a different gap and must participate independently in the memo key.
-        return (
-            self._chain_capacity_epoch(),
-            self._side_drainable_hole_bytes("low"),
-            self._side_drainable_hole_bytes("high"),
-        )
-
     def _peer_drainable_hole_bytes(self) -> int:
         """The better of the two sides. `_growth_side_neighbor()` is undefined
         for a float -- its `grow_direction` is "float", so the base answers
