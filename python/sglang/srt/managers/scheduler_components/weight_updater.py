@@ -581,29 +581,14 @@ class SchedulerWeightUpdaterManager:
 
     def check_weights(self, recv_req: CheckWeightsReqInput):
         try:
-            role_payloads = []
-            for role, runner in self.get_model_runners(recv_req.selector):
-                p = runner.check_weights(
+            payload = self._all_gather_checksum_payloads(
+                self._compute_local_checksum_payload(
                     action=recv_req.action,
+                    selector=recv_req.selector,
                     allow_quant_error=recv_req.allow_quant_error,
                     skip_tensor_list=recv_req.skip_tensor_list,
                 )
-                if p is not None:
-                    role_payloads.append((role, p))
-            payload = _merge_checksum_payloads(role_payloads) if role_payloads else None
-
-            tp_size = torch.distributed.get_world_size(group=self.tp_cpu_group)
-            if tp_size > 1 and payload is not None:
-                all_payloads = [None] * tp_size
-                torch.distributed.all_gather_object(
-                    all_payloads, payload, group=self.tp_cpu_group
-                )
-                payload = all_payloads
-            if payload is not None:
-                # Normalize to one ChecksumInfo per rank so the wire shape is a
-                # uniform List[ChecksumInfo] (tp==1 becomes a single-element list).
-                per_rank = payload if isinstance(payload, list) else [payload]
-                payload = [msgspec.convert(p, ChecksumInfo) for p in per_rank]
+            )
             return CheckWeightsReqOutput(
                 success=True, message="Success.", payload=payload
             )
@@ -611,6 +596,42 @@ class SchedulerWeightUpdaterManager:
             logger.warning(f"check_weights see error: {e}")
             traceback.print_exc()
             return CheckWeightsReqOutput(success=False, message=f"{e}")
+
+    def _compute_local_checksum_payload(
+        self,
+        *,
+        action: str,
+        selector: str,
+        allow_quant_error: bool,
+        skip_tensor_list: Optional[List[str]],
+    ) -> Optional[Dict]:
+        role_payloads = []
+        for role, runner in self.get_model_runners(selector):
+            p = runner.check_weights(
+                action=action,
+                allow_quant_error=allow_quant_error,
+                skip_tensor_list=skip_tensor_list,
+            )
+            if p is not None:
+                role_payloads.append((role, p))
+        return _merge_checksum_payloads(role_payloads) if role_payloads else None
+
+    def _all_gather_checksum_payloads(
+        self, payload: Optional[Dict]
+    ) -> Optional[List[ChecksumInfo]]:
+        tp_size = torch.distributed.get_world_size(group=self.tp_cpu_group)
+        if tp_size > 1 and payload is not None:
+            all_payloads = [None] * tp_size
+            torch.distributed.all_gather_object(
+                all_payloads, payload, group=self.tp_cpu_group
+            )
+            payload = all_payloads
+        if payload is not None:
+            # Normalize to one ChecksumInfo per rank so the wire shape is a
+            # uniform List[ChecksumInfo] (tp==1 becomes a single-element list).
+            per_rank = payload if isinstance(payload, list) else [payload]
+            payload = [msgspec.convert(p, ChecksumInfo) for p in per_rank]
+        return payload
 
     def save_remote_model(self, params):
         url = params["url"]

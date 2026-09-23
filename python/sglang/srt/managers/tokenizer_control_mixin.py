@@ -454,7 +454,7 @@ class TokenizerControlMixin:
 
     async def _weight_update_session_call(
         self: TokenizerManager, communicator, obj
-    ) -> Tuple[bool, str]:
+    ) -> List:
         """Run one weight-update session RPC under the same pause-aware locking as
         update_weights_from_distributed: while the engine is paused the writer lock
         is already held by whoever paused it, so taking it again would deadlock."""
@@ -466,15 +466,17 @@ class TokenizerControlMixin:
         if not is_paused:
             async with self.model_update_lock.writer_lock:
                 results = await communicator(obj)
-        return FanOutCommunicator.merge_results(results)
+        return results
 
     async def begin_weight_update(
         self: TokenizerManager,
         obj: BeginWeightUpdateReqInput,
         request: Optional[fastapi.Request] = None,
     ) -> Tuple[bool, str]:
-        success, message = await self._weight_update_session_call(
-            self.begin_weight_update_communicator, obj
+        success, message = FanOutCommunicator.merge_results(
+            await self._weight_update_session_call(
+                self.begin_weight_update_communicator, obj
+            )
         )
         if success:
             self._weight_update_session_open = True
@@ -486,9 +488,10 @@ class TokenizerControlMixin:
         obj: EndWeightUpdateReqInput,
         request: Optional[fastapi.Request] = None,
     ) -> Tuple[bool, str]:
-        success, message = await self._weight_update_session_call(
+        results = await self._weight_update_session_call(
             self.end_weight_update_communicator, obj
         )
+        success, message = FanOutCommunicator.merge_results(results)
         self._weight_update_session_open = False
         if success:
             self._update_weight_version_if_provided(self._weight_update_pending_version)
