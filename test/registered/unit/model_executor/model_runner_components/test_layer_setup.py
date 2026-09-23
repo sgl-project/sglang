@@ -70,8 +70,7 @@ def _hybrid_swa_model_config(*, architecture="Hybrid", mtp_local_layer_ids=None)
 
 class TestResolveHybridSWALayerIds(unittest.TestCase):
     def test_pipeline_stages_own_each_hybrid_layer_once(self):
-        """Each pipeline stage lists only its own layers as full or sliding-window
-        attention layers, so every layer belongs to exactly one stage."""
+        """Every hybrid layer belongs to exactly one pipeline stage."""
         for pp_size in (1, 8):
             with self.subTest(pp_size=pp_size), patch.dict(os.environ):
                 os.environ.pop("SGLANG_PP_LAYER_PARTITION", None)
@@ -99,8 +98,7 @@ class TestResolveHybridSWALayerIds(unittest.TestCase):
                 self.assertEqual(swa_ids, GLOBAL_SWA_IDS)
 
     def test_model_config_is_shared_and_never_modified(self):
-        """Multi-layer MTP draft runners share one ModelConfig; resolving the
-        local view for one runner must not change what the next one sees."""
+        """Resolving one runner's view must not change the shared ModelConfig."""
         model_config = _hybrid_swa_model_config()
         for start, end in ((0, 4), (4, 9), (0, 1)):
             resolve_layer_indices(
@@ -112,9 +110,7 @@ class TestResolveHybridSWALayerIds(unittest.TestCase):
             self.assertEqual(model_config.swa_attention_layer_ids, GLOBAL_SWA_IDS)
 
     def test_multi_layer_mtp_draft_owns_its_depth(self):
-        """A hybrid-SWA MTP draft runner owns the depth it serves, not layer 0,
-        whichever pool (sliding-window or full) that depth is routed to."""
-        # Depths 0 and 2 are sliding-window; depth 1 is full attention.
+        """Each MTP draft runner owns the depth it serves, not layer 0."""
         model_config = _hybrid_swa_model_config(
             architecture="InklingForConditionalGenerationMTP",
             mtp_local_layer_ids=[0, 2],

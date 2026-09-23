@@ -130,13 +130,11 @@ class ModelLayerInfo(msgspec.Struct, frozen=True, kw_only=True):
     start_layer: int
     end_layer: int
     num_effective_layers: int
-    # Global ids of the hybrid-SWA layers this runner owns. None unless the
-    # model config carries a swa/full split. ModelConfig keeps the whole
-    # model's split; this is the per-runner (PP stage or MTP depth) view.
+    # This runner's slice of ModelConfig's whole-model swa/full split, as global
+    # layer ids; None when the model has no split.
     swa_attention_layer_ids: Optional[list[int]] = None
     full_attention_layer_ids: Optional[list[int]] = None
-    # A multi-layer hybrid-SWA MTP draft runner owns one block whose layer_id
-    # is its depth (draft_model_idx), not a [start_layer, end_layer) slice.
+    # Owns the single block at layer_id == draft_model_idx, not a [start, end) slice.
     is_hybrid_swa_mtp_draft: bool = False
 
 
@@ -194,10 +192,7 @@ def _resolve_local_hybrid_swa_layer_ids(
     model_config: ModelConfig,
     owned_layers: range,
 ) -> tuple[Optional[list[int]], Optional[list[int]]]:
-    # ModelConfig only carries the split for hybrid-SWA models with an explicit
-    # swa/full layer list (not DeepSeek-V4). It is never modified here: several
-    # draft runners share one ModelConfig, so the local view lives on
-    # ModelLayerInfo instead.
+    # Read-only: multi-layer MTP draft runners share one ModelConfig instance.
     swa_attention_layer_ids = getattr(model_config, "swa_attention_layer_ids", None)
     full_attention_layer_ids = getattr(model_config, "full_attention_layer_ids", None)
     if swa_attention_layer_ids is None or full_attention_layer_ids is None:

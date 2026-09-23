@@ -778,10 +778,8 @@ class KVCacheConfigurator:
             swa_head_dim = head_dim
             swa_v_head_dim = head_dim
 
-        # From layer_info (the sglang ModelConfig split restricted to this
-        # stage), never the HF config's full_attention_layer_ids: that property
-        # feeds the conv/attention pairing, not the KV-lifetime split, and
-        # returns ALL layers.
+        # Never the HF config's full_attention_layer_ids: that property feeds the
+        # conv/attention pairing and returns ALL layers.
         swa_attention_layer_ids = self.layer_info.swa_attention_layer_ids
         full_attention_layer_ids = self.layer_info.full_attention_layer_ids
         n_local_layers = self.layer_info.end_layer - self.layer_info.start_layer
@@ -1777,8 +1775,6 @@ class KVCacheConfigurator:
             if self.kv_cache_dtype_str == "mxfp8"
             else mha_pool_class
         )
-        # For a multi-layer MTP draft these hold just its own depth, routing a
-        # local depth through the SWA ring pool and a global one through full.
         swa_attention_layer_ids = self.layer_info.swa_attention_layer_ids
         full_attention_layer_ids = self.layer_info.full_attention_layer_ids
         # The draft SWA ring must cover the target allocator's full token capacity.
