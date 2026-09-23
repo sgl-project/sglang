@@ -218,6 +218,20 @@ def spec_owns_reasoning_history(spec: Optional[str]) -> bool:
     return spec is not None
 
 
+def template_reads_reasoning_content(template: Any) -> bool:
+    """Whether a Jinja chat template renders an assistant's ``reasoning_content``.
+
+    Templates that reference the field take prior-turn thinking through it; a
+    detector-marker splice into content instead renders the template's own
+    empty reasoning block next to the spliced one, teaching the model to echo
+    raw markers as visible text (Qwen3.8 dropped the inline fallback older
+    templates had). Templates that never reference the field keep the splice.
+    """
+    if isinstance(template, dict):
+        template = "\n".join(str(value) for value in template.values())
+    return isinstance(template, str) and "reasoning_content" in template
+
+
 def spec_renders_prompt_ids(spec: Optional[str]) -> bool:
     """Whether the encoder for ``spec`` returns pre-tokenized prompt ids.
 

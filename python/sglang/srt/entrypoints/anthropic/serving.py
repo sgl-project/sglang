@@ -371,8 +371,9 @@ class AnthropicServing:
         ) -> tuple[Optional[str], Optional[str]]:
             """Reconstruct prior-turn thinking as ``(reasoning_content, text)``.
 
-            At most one is set: encoders that frame the reasoning channel take
-            it as ``reasoning_content``, everything else gets it re-wrapped and
+            At most one is set: encoders that frame the reasoning channel, and
+            Jinja templates that render the field themselves, take it as
+            ``reasoning_content``; everything else gets it re-wrapped and
             spliced into content.
 
             ``redacted_thinking`` carries encrypted bytes that no local
@@ -394,7 +395,10 @@ class AnthropicServing:
                 return None, None
 
             reasoning_text = "\n".join(thinking_parts)
-            if self.openai_serving_chat.supports_native_reasoning_history():
+            if (
+                self.openai_serving_chat.supports_native_reasoning_history()
+                or self.openai_serving_chat.template_reads_reasoning_content()
+            ):
                 return reasoning_text, None
 
             try:

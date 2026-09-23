@@ -2773,6 +2773,14 @@ class OpenAIServingChat(OpenAIServingBase):
         """
         return chat_encoding.spec_owns_reasoning_history(self.chat_encoding_spec)
 
+    def template_reads_reasoning_content(self) -> bool:
+        """Whether the Jinja chat template renders ``reasoning_content`` itself;
+        see :func:`chat_encoding.template_reads_reasoning_content` for why.
+        """
+        return chat_encoding.template_reads_reasoning_content(
+            getattr(self.tokenizer_manager.tokenizer, "chat_template", None)
+        )
+
     def wrap_reasoning_history(self, reasoning_text: str) -> str:
         """Wrap prior-turn reasoning in the detector's own start/end tokens.
 

@@ -40,6 +40,13 @@ class _FakeOpenAIServingChat:
     def supports_native_reasoning_history(self):
         return self.native_reasoning_history
 
+    def template_reads_reasoning_content(self):
+        from sglang.srt.entrypoints.openai import chat_encoding
+
+        return chat_encoding.template_reads_reasoning_content(
+            self.tokenizer_manager.tokenizer.chat_template
+        )
+
     def _generate_chat_stream(self, adapted_request, processed_request, raw_request):
         async def _gen():
             for line in self.stream_lines:
@@ -774,6 +781,53 @@ class TestAnthropicServing(unittest.TestCase):
         self.assertEqual(anthropic_response.content[0].thinking, "2 + 2 = 4")
         self.assertEqual(anthropic_response.content[1].type, "text")
         self.assertEqual(anthropic_response.content[1].text, "the answer is 4")
+
+    def _prior_thinking_request(self):
+        return self._anthropic_request(
+            stream=False,
+            messages=[
+                {"role": "user", "content": "2+2?"},
+                {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "thinking", "thinking": "adding the numbers"},
+                        {"type": "text", "text": "4"},
+                    ],
+                },
+                {"role": "user", "content": "thanks"},
+            ],
+        )
+
+    def test_prior_thinking_maps_to_field_when_template_reads_it(self):
+        """A template rendering reasoning_content takes prior thinking as the field."""
+        chat_request = self._serving(
+            chat_template=(
+                "{%- for m in messages %}"
+                "{{ m.reasoning_content if m.reasoning_content is defined }}"
+                "{{ m.content }}"
+                "{%- endfor %}"
+            )
+        )._convert_to_chat_completion_request(self._prior_thinking_request())
+        assistant = chat_request.model_dump(exclude_none=True)["messages"][1]
+
+        self.assertEqual(assistant["reasoning_content"], "adding the numbers")
+        self.assertEqual(assistant["content"], "4")
+
+    def test_prior_thinking_wraps_when_template_lacks_the_field(self):
+        """A template that never references reasoning_content keeps the splice."""
+        chat_request = self._serving(
+            chat_template=("{%- for m in messages %}{{ m.content }}{%- endfor %}")
+        )._convert_to_chat_completion_request(self._prior_thinking_request())
+        assistant = chat_request.model_dump(exclude_none=True)["messages"][1]
+
+        self.assertNotIn("reasoning_content", assistant)
+        self.assertEqual(
+            assistant["content"],
+            [
+                {"type": "text", "text": "<think>\nadding the numbers\n</think>"},
+                {"type": "text", "text": "4"},
+            ],
+        )
 
     def test_request_thinking_disabled_invokes_apply_reasoning_enabled(self):
         """``thinking={"type": "disabled"}`` must flip the reasoning toggle off."""
