@@ -174,8 +174,8 @@ from sglang.srt.models.deepseek_common.utils import (
     _is_cpu,
     _is_cpu_amx_available,
     _is_cuda,
-    _is_gfx942_supported,
     _is_gfx95_supported,
+    _is_gfx942_supported,
     _is_hip,
     _is_musa,
     _is_npu,
@@ -203,6 +203,7 @@ from sglang.srt.utils import (
     BumpAllocator,
     LazyValue,
     add_prefix,
+    is_gfx942_supported,
     is_non_idle_and_non_empty,
     is_sm90_supported,
     make_layers,
@@ -675,6 +676,25 @@ class DeepseekV2MoE(nn.Module):
             prefix=add_prefix("experts", prefix),
         )
 
+        # Only this concrete gfx942 runner/dispatcher path is known to finalize
+        # the scale here: Triton combine scales when AITER is off; with AITER
+        # it only sums, so both learned and hash TopK must scale their weights.
+        # Do not infer ownership from the global runner setting (quant methods
+        # may select a different runner), or alter fused shared/A2A semantics.
+        runner = getattr(self.experts, "runner", None)
+        self._hip_triton_routed_scale_finalized = (
+            is_deepseek_v4
+            and _is_hip
+            and is_gfx942_supported()
+            and get_moe_a2a_backend().is_none()
+            and runner is not None
+            and runner.runner_backend.is_triton()
+            and not runner.config.no_combine
+            and not self.experts.should_fuse_routed_scaling_factor_in_topk
+            and not isinstance(self.experts.quant_method, KTEPWrapperMethod)
+            and self.num_fused_shared_experts == 0
+        )
+
         if self.is_hash and not (is_nextn and is_deepseek_v4):
             self.topk = HashTopK(
                 topk=config.num_experts_per_tok + self.num_fused_shared_experts,
@@ -683,7 +703,11 @@ class DeepseekV2MoE(nn.Module):
                 vocab_size=config.vocab_size,
                 scoring_func=config.scoring_func,
                 routed_scaling_factor=self.routed_scaling_factor,
-                apply_routed_scaling_factor_on_output=self.experts.should_fuse_routed_scaling_factor_in_topk,
+                apply_routed_scaling_factor_on_output=(
+                    _use_aiter
+                    if self._hip_triton_routed_scale_finalized
+                    else self.experts.should_fuse_routed_scaling_factor_in_topk
+                ),
                 layer_id=self.layer_id,
             )
         else:
@@ -1086,6 +1110,7 @@ class DeepseekV2MoE(nn.Module):
             not _is_cuda
             and not _is_musa
             and not _use_aiter
+            and not self._hip_triton_routed_scale_finalized
             or isinstance(self.experts.quant_method, KTEPWrapperMethod)
         ):
             final_hidden_states *= self.routed_scaling_factor
@@ -1330,9 +1355,10 @@ class DeepseekV2MoE(nn.Module):
             and not _is_musa
             and not _is_xpu
             and not _use_aiter
+            and not self._hip_triton_routed_scale_finalized
             or isinstance(self.experts.quant_method, KTEPWrapperMethod)
         ):
-            # fused in biased_grouped_topk so we can skip here
+            # Other backends still finalize the routed scale outside the runner.
             final_hidden_states *= self.routed_scaling_factor
 
         if (
