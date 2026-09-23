@@ -543,9 +543,6 @@ class LayerCommunicator:
         allow_reduce_scatter: bool = False,
         is_last_layer: bool = False,
         qkv_latent_func: Optional[Callable] = None,
-        # Under DP attention with attn_tp_size > 1, reduce over attn TP and norm
-        # before the DP gather: one more collective for a more precise residual
-        # stream (see _gather_hidden_states_and_residual).
         force_layernorm_before_dp_gather: bool = False,
         enable_fused_ar_quant: bool = False,
         fused_ar_quant_keep_bf16: bool = False,
@@ -1284,12 +1281,6 @@ class CommunicateWithAllReduceAndLayerNormFn:
             )
             attn_tp_all_gather_into_tensor(residual, local_residual)
         if context.attn_dp_size != 1:
-            # With attn_tp_size > 1 the default adds the residual to attn-TP rank
-            # 0's partial and lets the partial DP gather sum the partials. That
-            # folds the attn-TP reduction into the gather, but rounds the residual
-            # stream to bf16 once more per layer, before the norm. The forced path
-            # instead all-reduces over attn TP first so the residual add happens
-            # inside the fused norm, at the cost of one more attn-TP all-reduce.
             use_layer_norm_before_gather = (
                 context.force_layernorm_before_dp_gather or context.attn_tp_size == 1
             )
