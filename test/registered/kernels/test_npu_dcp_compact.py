@@ -24,6 +24,33 @@ def _npu_is_available() -> bool:
 class TestNpuDcpCompactKernels(CustomTestCase):
     device = "npu"
 
+    def test_fixed_shape_write_remap_scalar_dummy_graph(self):
+        from sglang.srt.layers.dcp.layout import remap_dcp_write_locations_fixed_shape
+
+        for dtype in (torch.int32, torch.int64):
+            for dummy in (0, 17):
+                loc_cpu = torch.tensor([0, 256, 257, 259, 512, 513], dtype=dtype)
+                if dtype == torch.int64:
+                    loc_cpu += 2**34
+                loc = loc_cpu.to(self.device)
+                for _ in range(3):
+                    remap_dcp_write_locations_fixed_shape(loc, 2, 0, dummy_loc=dummy)
+                torch.npu.synchronize()
+                graph = torch.npu.NPUGraph()
+                with torch.npu.graph(graph):
+                    output = remap_dcp_write_locations_fixed_shape(
+                        loc, 2, 0, dummy_loc=dummy
+                    )
+                pointers = (loc.data_ptr(), output.data_ptr())
+                for shift in (0, 1, 2):
+                    current = loc_cpu + shift
+                    loc.copy_(current)
+                    graph.replay()
+                    torch.npu.synchronize()
+                    expected = torch.where(current % 2 == 0, current // 2, dummy)
+                    torch.testing.assert_close(output.cpu(), expected, atol=0, rtol=0)
+                    self.assertEqual(pointers, (loc.data_ptr(), output.data_ptr()))
+
     def test_shared_dcp_prefix_index_kernel(self):
         from sglang.kernels.ops.kvcache.kv_indices import (
             create_chunked_prefix_cache_kv_indices,

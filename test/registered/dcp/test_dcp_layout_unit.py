@@ -180,6 +180,25 @@ class TestGetDcpLens(CustomTestCase):
         with self.assertRaises(ValueError):
             remap_dcp_write_locations_fixed_shape(torch.arange(4), 2, 2)
 
+    def test_fixed_shape_write_remap_scalar_dummy_matches_tensor(self):
+        for dtype in (torch.int32, torch.int64):
+            virtual = torch.tensor([0, 256, 257, 259, 512, 513], dtype=dtype)
+            if dtype == torch.int64:
+                virtual += 2**34
+            for loc in (virtual[:0], virtual[::2], virtual):
+                for size in (1, 2, 4):
+                    for rank in range(size):
+                        for dummy in (0, 17):
+                            local = loc // size
+                            expected = torch.where(
+                                loc % size == rank, local, torch.full_like(local, dummy)
+                            )
+                            actual = remap_dcp_write_locations_fixed_shape(
+                                loc, size, rank, dummy_loc=dummy
+                            )
+                            torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+                            self.assertEqual(actual.device, loc.device)
+
     def test_start_none_matches_owner_count(self):
         for n in DCP_SIZES:
             for rank in range(n):

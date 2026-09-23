@@ -76,11 +76,7 @@ def remap_dcp_write_locations_fixed_shape(
         )
     owner_mask = torch.remainder(virtual_locs, dcp_size) == dcp_rank
     local_locs = torch.div(virtual_locs, dcp_size, rounding_mode="floor")
-    return torch.where(
-        owner_mask,
-        local_locs,
-        torch.full_like(local_locs, dummy_loc),
-    )
+    return torch.where(owner_mask, local_locs, dummy_loc)
 
 
 def filter_dcp_local_kv_indices(kv_indices: torch.Tensor):
