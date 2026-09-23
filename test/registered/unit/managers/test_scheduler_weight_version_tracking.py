@@ -157,7 +157,9 @@ class _WeightUpdaterManagerTestBase(CustomTestCase):
             flush_cache=lambda **kwargs: True,
             is_fully_idle=lambda **kwargs: True,
             scheduler=SimpleNamespace(
-                record_weight_version_change=self.recorded.append
+                record_weight_version_change=lambda new_version: self.recorded.append(
+                    new_version
+                )
             ),
         )
         if session:
