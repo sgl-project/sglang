@@ -212,11 +212,12 @@ class TestMsgpackIpcRoundtrip(CustomTestCase):
 
     def test_check_weights_producer_conversion(self):
         # the merged per-role payload is what msgspec.convert has to accept
-        def _dump():
+        def _dump(role):
             return PydanticChecksumInfo(
                 checksums={"model.layers.0": "deadbeef"},
                 per_gpu_checksum="cafef00d",
                 parallelism_info=PydanticParallelismInfo(
+                    role=role,
                     tp_rank=0,
                     tp_size=2,
                     dp_rank=0,
@@ -228,7 +229,9 @@ class TestMsgpackIpcRoundtrip(CustomTestCase):
                 ),
             ).model_dump()
 
-        merged = _merge_checksum_payloads([("target", _dump()), ("draft", _dump())])
+        merged = _merge_checksum_payloads(
+            [("target", _dump("target")), ("draft", _dump("draft"))]
+        )
         converted = msgspec.convert(merged, ChecksumInfo)
         self.assertEqual(
             sorted(converted.checksums), ["draft.model.layers.0", "model.layers.0"]

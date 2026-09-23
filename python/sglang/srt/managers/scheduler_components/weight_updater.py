@@ -62,7 +62,7 @@ def _merge_checksum_payloads(role_payloads: List[Tuple[str, Dict]]) -> Dict:
             if key in merged:
                 raise ValueError(f"checksum key collision: {key}")
             merged[key] = chk
-        parallelism_infos.append({"role": role, **p["parallelism_info"]})
+        parallelism_infos.append(p["parallelism_info"])
     return {
         "checksums": merged,
         "per_gpu_checksum": overall_checksum(merged),
@@ -410,6 +410,7 @@ class SchedulerWeightUpdaterManager:
                     action=recv_req.action,
                     allow_quant_error=recv_req.allow_quant_error,
                     skip_tensor_list=recv_req.skip_tensor_list,
+                    role=role,
                 )
                 if p is not None:
                     role_payloads.append((role, p))

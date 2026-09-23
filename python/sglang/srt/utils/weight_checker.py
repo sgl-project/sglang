@@ -25,6 +25,8 @@ class _StrictBaseModel(BaseModel):
 
 
 class ParallelismInfo(_StrictBaseModel):
+    # "target", or a draft role such as "draft" / "draft_step_0"
+    role: str
     tp_rank: int
     tp_size: int
     dp_rank: int
@@ -89,15 +91,13 @@ class WeightChecker:
         self._get_model = get_model
         # Capture the runner placement before its draft scope exits.
         parallel = get_parallel()
-        self._placement = ParallelismInfo(
+        self._placement = dict(
             tp_rank=parallel.tp_rank,
             tp_size=parallel.tp_size,
             dp_rank=parallel.dp_rank if parallel.dp_rank is not None else 0,
             dp_size=parallel.attn_dp_size,
             pp_rank=parallel.pp_rank,
             pp_size=parallel.pp_size,
-            rank=0,
-            size=1,
         )
         self._snapshot_tensors = None
 
@@ -106,6 +106,8 @@ class WeightChecker:
         action: str,
         allow_quant_error: bool = False,
         skip_tensor_list: Optional[List[str]] = None,
+        *,
+        role: str,
     ) -> Optional[Dict]:
         logger.info(
             f"[WeightChecker] handle action={action} "
@@ -120,7 +122,7 @@ class WeightChecker:
                 allow_quant_error=allow_quant_error, skip_tensor_list=skip_tensor_list
             )
         elif action == "checksum":
-            return self._compute_checksum(skip_tensor_list)
+            return self._compute_checksum(skip_tensor_list, role=role)
         else:
             raise Exception(f"Unsupported {action=}")
 
@@ -168,7 +170,9 @@ class WeightChecker:
             allow_quant_error=allow_quant_error,
         )
 
-    def _compute_checksum(self, skip_tensor_list: Optional[List[str]] = None) -> Dict:
+    def _compute_checksum(
+        self, skip_tensor_list: Optional[List[str]] = None, *, role: str
+    ) -> Dict:
         torch.cuda.synchronize()
         start = time.perf_counter()
 
@@ -195,17 +199,17 @@ class WeightChecker:
         info = ChecksumInfo(
             checksums=checksums,
             per_gpu_checksum=overall,
-            parallelism_info=self._parallelism_info(),
+            parallelism_info=self._parallelism_info(role=role),
         )
         return info.model_dump()
 
-    def _parallelism_info(self) -> ParallelismInfo:
+    def _parallelism_info(self, *, role: str) -> ParallelismInfo:
         # Read the current WORLD rank because elastic scale-up can change it.
-        return self._placement.model_copy(
-            update={
-                "rank": dist.get_rank() if dist.is_initialized() else 0,
-                "size": dist.get_world_size() if dist.is_initialized() else 1,
-            }
+        return ParallelismInfo(
+            role=role,
+            rank=dist.get_rank() if dist.is_initialized() else 0,
+            size=dist.get_world_size() if dist.is_initialized() else 1,
+            **self._placement,
         )
 
     def _model_state(self):
