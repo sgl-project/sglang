@@ -4,7 +4,6 @@ import logging
 import os
 import threading
 from collections import defaultdict
-from concurrent.futures import Future
 from dataclasses import dataclass
 from queue import Empty, Queue
 from typing import Any, Callable
@@ -22,7 +21,10 @@ from sglang.srt.mem_cache.hicache_storage import (
 from sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler import (
     resolve_hybrid_device_pool_group,
 )
-from sglang.srt.mem_cache.unified_cache.unified_cache_linker import UnifiedCacheLinker
+from sglang.srt.mem_cache.unified_cache.unified_cache_linker import (
+    LayerWiseLoadCounter,
+    UnifiedCacheLinker,
+)
 from sglang.srt.runtime_context import (
     get_memory,
     get_model,
@@ -63,50 +65,6 @@ def _ordered_layers(entry) -> list[int]:
             f"UMBP pool {entry.name} layer mapping is not a contiguous bijection."
         )
     return [by_buffer[index] for index in range(pool_layer_count)]
-
-
-class LayerWiseLoadCounter:
-    """CPU completion counter compatible with KV pools' layer wait hook."""
-
-    def __init__(self, num_layers: int):
-        self.num_layers = num_layers
-        self._producer_index = -1
-        self.consumer_index = -1
-        self._futures: dict[int, list[Future]] = {}
-
-    def update_producer(self) -> int:
-        self._producer_index += 1
-        self._futures[self._producer_index] = [Future() for _ in range(self.num_layers)]
-        return self._producer_index
-
-    def set_consumer(self, index: int) -> None:
-        self.consumer_index = index
-
-    def complete(self, index: int, layer: int) -> None:
-        self._futures[index][layer].set_result(None)
-
-    def fail(self, index: int, error: BaseException) -> None:
-        for future in self._futures.get(index, ()):
-            if not future.done():
-                future.set_exception(error)
-
-    def wait_until(self, threshold: int) -> None:
-        index = self.consumer_index
-        futures = self._futures.get(index)
-        if futures is None:
-            return
-        try:
-            futures[threshold].result()
-        except BaseException as error:
-            raise RuntimeError("UMBP layer-wise KV load failed.") from error
-        finally:
-            if threshold == self.num_layers - 1:
-                self._futures.pop(index, None)
-
-    def reset(self) -> None:
-        self._producer_index = -1
-        self.consumer_index = -1
-        self._futures.clear()
 
 
 @dataclass

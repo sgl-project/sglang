@@ -20,8 +20,9 @@ The tree only needs a handful of guarded hooks:
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from collections.abc import Sequence
-from typing import TYPE_CHECKING, NamedTuple
+from collections.abc import Callable, Sequence
+from concurrent.futures import Future
+from typing import TYPE_CHECKING, NamedTuple, Optional
 
 import torch
 
@@ -56,6 +57,57 @@ _EXTERNAL_LINKER_SUPPORTED_COMPONENTS = frozenset(
         ComponentType.SWA,
     }
 )
+
+
+class LayerWiseLoadCounter:
+    """CPU completion counter compatible with KV pools' layer wait hook."""
+
+    def __init__(
+        self,
+        num_layers: int,
+        on_layer_ready: Optional[Callable[[int, int], None]] = None,
+    ):
+        self.num_layers = num_layers
+        self.on_layer_ready = on_layer_ready
+        self.producer_index = -1
+        self.consumer_index = -1
+        self.futures: dict[int, list[Future]] = {}
+
+    def update_producer(self) -> int:
+        self.producer_index += 1
+        self.futures[self.producer_index] = [Future() for _ in range(self.num_layers)]
+        return self.producer_index
+
+    def set_consumer(self, index: int) -> None:
+        self.consumer_index = index
+
+    def complete(self, index: int, layer: int) -> None:
+        self.futures[index][layer].set_result(None)
+
+    def fail(self, index: int, error: BaseException) -> None:
+        for future in self.futures.get(index, ()):
+            if not future.done():
+                future.set_exception(error)
+
+    def wait_until(self, threshold: int) -> None:
+        index = self.consumer_index
+        futures = self.futures.get(index)
+        if futures is None:
+            return
+        try:
+            futures[threshold].result()
+            if self.on_layer_ready is not None:
+                self.on_layer_ready(index, threshold)
+        except BaseException as error:
+            raise RuntimeError("Layer-wise KV load failed.") from error
+        finally:
+            if threshold == self.num_layers - 1:
+                self.futures.pop(index, None)
+
+    def reset(self) -> None:
+        self.producer_index = -1
+        self.consumer_index = -1
+        self.futures.clear()
 
 
 class UnifiedCacheLinker(ABC):
