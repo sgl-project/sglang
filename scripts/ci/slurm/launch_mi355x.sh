@@ -525,6 +525,13 @@ if [ -n "$_ionic_provider" ] && [ -e "$_ionic_provider" ]; then
 fi
 IONIC_EOF
 
+# drive.sh is a quoted heredoc and expands nothing, so its staging check gets the
+# resolved paths through a file, as model_flags.sh does. Empty path = no check.
+{
+    printf 'STAGE_LOCAL_PATH=%q\n' "${MODEL_LOCAL_ROOT:+$MODEL_PATH}"
+    printf 'STAGE_SHARED_ROOT=%q\n' "$MODEL_RESOLVE_ROOT"
+} > "$WORKDIR/stage_check.sh"
+
 # Optional topology / speculative-decode flags driven by the recipe. Base recipes
 # (EP1/DP1, no mtp) leave the extra strings empty, preserving prior behavior.
 #
@@ -1340,6 +1347,25 @@ PIP=$(resolve_ip "$PNODE") || exit 1
 DIP=$(resolve_ip "$DNODE") || exit 1
 echo "[drive] prefill nodes: ${PNODES[*]} ; decode nodes: ${DNODES[*]}"
 echo "[drive] bench targets prefill=$PNODE($PIP) decode=$DNODE($DIP)"
+# The local copy is staged out of band and does not survive a reboot. Without
+# this the container falls back to the shared root and the only symptom is a
+# health-wait timeout 50 minutes later.
+source "$WORKDIR/stage_check.sh"
+if [[ -n "$STAGE_LOCAL_PATH" ]]; then
+  _stage_bad=0
+  for n in "${NODES[@]}"; do
+    if ! srun_local_or_step "$n" test -d "$STAGE_LOCAL_PATH" >/dev/null 2>&1; then
+      echo "ERROR: $n is missing the node-local snapshot $STAGE_LOCAL_PATH" >&2
+      _stage_bad=1
+    fi
+  done
+  if (( _stage_bad )); then
+    echo "ERROR: re-stage the model onto every allocated node, or unset MODEL_LOCAL_ROOT" >&2
+    echo "       to read from $STAGE_SHARED_ROOT (slow: large checkpoints will time out)." >&2
+    exit 1
+  fi
+  echo "[drive] node-local snapshot present on all ${#NODES[@]} nodes"
+fi
 if (( DW > 1 )); then
   echo "[drive] NOTE: router + bench use the first decode engine only;"
   echo "[drive]       multi-decode fan-out is not wired yet (LB work)."
