@@ -88,6 +88,7 @@ from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionRequest,
     ClassifyRequest,
     CompletionRequest,
+    DecisionRequest,
     DetokenizeRequest,
     EmbeddingRequest,
     ErrorResponse,
@@ -100,6 +101,7 @@ from sglang.srt.entrypoints.openai.protocol import (
 )
 from sglang.srt.entrypoints.openai.serving_classify import OpenAIServingClassify
 from sglang.srt.entrypoints.openai.serving_completions import OpenAIServingCompletion
+from sglang.srt.entrypoints.openai.serving_decisions import OpenAIServingDecisions
 from sglang.srt.entrypoints.openai.serving_embedding import OpenAIServingEmbedding
 from sglang.srt.entrypoints.openai.serving_rerank import OpenAIServingRerank
 from sglang.srt.entrypoints.openai.serving_score import OpenAIServingScore
@@ -322,6 +324,9 @@ async def lifespan(fast_api_app: FastAPI):
     )
     fast_api_app.state.openai_serving_score = OpenAIServingScore(
         _global_state.tokenizer_manager
+    )
+    fast_api_app.state.openai_serving_decisions = OpenAIServingDecisions(
+        fast_api_app.state.openai_serving_chat
     )
     fast_api_app.state.openai_serving_rerank = OpenAIServingRerank(
         _global_state.tokenizer_manager, _global_state.template_manager
@@ -1929,6 +1934,14 @@ async def retrieve_model(model: str):
 async def v1_score_request(request: ScoringRequest, raw_request: Request):
     """Endpoint for the scoring API. Supports CausalLM (logprob-based) and SequenceClassification (class logit-based) models. See Engine.score() for documentation."""
     return await raw_request.app.state.openai_serving_score.handle_request(
+        request, raw_request
+    )
+
+
+@app.post("/v1/decisions", dependencies=[Depends(validate_json_request)])
+async def v1_decisions_request(request: DecisionRequest, raw_request: Request):
+    """Answer typed choice, score, and yes or no questions about an input by scoring single-token answer labels through the scoring API, without generation."""
+    return await raw_request.app.state.openai_serving_decisions.handle_request(
         request, raw_request
     )
 

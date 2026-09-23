@@ -998,7 +998,8 @@
               {
                 "group": "Specialized Models",
                 "pages": [
-                  "docs/supported-models/reward_models"
+                  "docs/supported-models/reward_models",
+                  "docs/supported-models/decision_models"
                 ]
               },
               {

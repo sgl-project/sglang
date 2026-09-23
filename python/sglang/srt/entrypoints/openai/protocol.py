@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import logging
 import time
+import unicodedata
 import uuid
 from dataclasses import dataclass
 from typing import (
@@ -1420,6 +1421,128 @@ class ScoringResponse(BaseModel):
     object: str = "scoring"
 
 
+def _nonblank_decision_text(value):
+    if not (value.strip() if isinstance(value, str) else value):
+        raise ValueError("must not be blank")
+    return value
+
+
+# Objects and arrays are rendered into the prompt as compact JSON.
+DecisionText = Union[str, Dict[str, Any], List[Any]]
+RequiredDecisionText = Annotated[DecisionText, AfterValidator(_nonblank_decision_text)]
+
+
+class DecisionOption(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    name: str
+    description: Optional[DecisionText] = None
+
+
+class DecisionChoiceQuestion(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: Annotated[str, AfterValidator(_nonblank_decision_text)]
+    type: Literal["choice"]
+    question: RequiredDecisionText
+    # Options are labeled A to Z in order, so at most 26.
+    options: List[DecisionOption] = Field(min_length=2, max_length=26)
+
+    @model_validator(mode="after")
+    def _option_names_distinct(self):
+        seen = set()
+        for option in self.options:
+            key = option.name.strip().casefold()
+            if not key:
+                raise ValueError(f"question {self.id!r}: option names must be nonempty")
+            # Each option is rendered as one prompt line.
+            if any(unicodedata.category(c) in ("Cc", "Zl", "Zp") for c in option.name):
+                raise ValueError(
+                    f"question {self.id!r}: option name {option.name!r} must not "
+                    "contain control or line break characters"
+                )
+            if key in seen:
+                raise ValueError(
+                    f"question {self.id!r}: option name {option.name!r} repeats "
+                    "another option"
+                )
+            seen.add(key)
+        return self
+
+
+class DecisionScoreQuestion(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: Annotated[str, AfterValidator(_nonblank_decision_text)]
+    type: Literal["score"]
+    question: RequiredDecisionText
+    # Levels are labeled 0 to 9 in order, so at most 10.
+    levels: List[RequiredDecisionText] = Field(min_length=2, max_length=10)
+
+
+class DecisionYesNoQuestion(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: Annotated[str, AfterValidator(_nonblank_decision_text)]
+    type: Literal["yes_no"]
+    question: RequiredDecisionText
+    yes: Optional[DecisionText] = None
+    no: Optional[DecisionText] = None
+
+
+DecisionQuestion = Annotated[
+    Union[DecisionChoiceQuestion, DecisionScoreQuestion, DecisionYesNoQuestion],
+    Field(discriminator="type"),
+]
+
+
+class DecisionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    input: RequiredDecisionText
+    questions: List[DecisionQuestion] = Field(min_length=1)
+    # Scales option probabilities only, not label_mass.
+    temperature: float = Field(default=1.0, gt=0, allow_inf_nan=False)
+    # Applied over the server defaults, with the template reasoning toggle off.
+    chat_template_kwargs: Dict[str, Any] = Field(default_factory=dict)
+    # Pins the server-owned prompt wording. A different served version is refused.
+    prompt_format_version: Optional[int] = None
+    return_prompt_token_ids: bool = False
+    model: str = DEFAULT_MODEL_NAME
+
+    @field_validator("questions")
+    @classmethod
+    def _question_ids_distinct(cls, questions):
+        seen = set()
+        for question in questions:
+            if question.id in seen:
+                raise ValueError(
+                    f"question id {question.id!r} repeats another question"
+                )
+            seen.add(question.id)
+        return questions
+
+
+class DecisionAnswer(BaseModel):
+    type: Literal["choice", "score", "yes_no"]
+    probabilities: Dict[str, float]
+    # Full-vocabulary probability of all answer labels at the answer position.
+    label_mass: float
+    choice: Optional[str] = None
+    score: Optional[float] = None
+    # The exact /v1/score inputs, with return_prompt_token_ids.
+    prompt_token_ids: Optional[List[int]] = None
+    label_token_ids: Optional[List[int]] = None
+
+
+class DecisionResponse(BaseModel):
+    object: str = "decisions"
+    model: str
+    prompt_format_version: int
+    answers: Dict[str, DecisionAnswer]
+    usage: UsageInfo
+
+
 class V1RerankReqInput(BaseModel):
     query: RerankContent = Field(
         ...,
@@ -1545,6 +1668,7 @@ OpenAIServingRequest = Union[
     EmbeddingRequest,
     ClassifyRequest,
     ScoringRequest,
+    DecisionRequest,
     V1RerankReqInput,
     TokenizeRequest,
     DetokenizeRequest,
