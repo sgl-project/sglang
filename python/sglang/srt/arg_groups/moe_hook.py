@@ -40,8 +40,6 @@ def handle_moe_kernel_config(server_args: Any):
     cfg = resolving_view(server_args)
 
     run_post_process_pass(server_args, _moe_runner_backend_quant_constraints)
-    # Must follow every moe_runner_backend resolution: the arch overrides in model_hook
-    # and the quant constraints above can both pick a topk-bypassing runner.
     run_post_process_pass(server_args, _routed_experts_capture_backend_guard)
 
     view = resolved_view(server_args)

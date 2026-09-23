@@ -906,8 +906,6 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
         block layout. During weight update, checkpoint tensors are in
         canonical layout and need a temporary shape restore for copy.
         """
-        # Mirrors the repack condition in process_weights_after_loading, which blocks
-        # w13/w2 for every TRT-LLM MoE variant, not only the routed one.
         if not self.use_flashinfer_trtllm_moe:
             return
 

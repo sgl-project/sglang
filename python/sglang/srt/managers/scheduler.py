@@ -4998,8 +4998,6 @@ class Scheduler(
 
     def flush_cache(self, empty_cache: bool = True):
         """Flush memory pools (e.g., KV cache, Mamba cache) and optionally empty device allocator cache."""
-        # release_memory_occupation flushed right before unmapping the KV region; clearing
-        # the hybrid state pools now would write unmapped memory (sticky CUDA error 700).
         if GPU_MEMORY_TYPE_KV_CACHE in self.weight_updater.offload_tags:
             logger.info("Cache flush skipped: KV cache memory is released.")
             return True

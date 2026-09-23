@@ -1578,8 +1578,6 @@ def _moe_runner_backend_quant_constraints(view: Any) -> dict:
     return {}
 
 
-# Routing runs inside the fused kernel, so capture_routed_experts_if_allowed is never
-# reached and the routed-experts capturer returns its zero-initialized buffer.
 _TOPK_BYPASSING_MOE_RUNNER_BACKENDS = frozenset(
     {
         "flashinfer_trtllm",
@@ -1592,31 +1590,21 @@ _TOPK_BYPASSING_MOE_RUNNER_BACKENDS = frozenset(
 
 @register_post_process
 def _routed_experts_capture_backend_guard(view: Any) -> dict:
-    """--enable-return-routed-experts needs a MoE runner that materializes topk ids;
-    downgrade a bypassing one to 'auto' where that is safe for the quantization,
-    otherwise refuse instead of returning all-zero routed experts."""
+    """Routed-experts capture needs a MoE runner that materializes topk ids."""
     if not view.enable_return_routed_experts:
         return {}
     if view.moe_runner_backend not in _TOPK_BYPASSING_MOE_RUNNER_BACKENDS:
         return {}
     if view.quantization in (None, "fp8"):
         logger.warning(
-            "--enable-return-routed-experts cannot capture routed experts "
-            f"under moe_runner_backend={view.moe_runner_backend!r}: its TopK "
-            "output is bypassed into the fused kernel and per-token expert "
-            "ids are never materialized. Falling back to "
-            "moe_runner_backend='auto' so the capture path "
-            "(select_experts -> capture_routed_experts_if_allowed) runs."
+            f"moe_runner_backend={view.moe_runner_backend!r} bypasses TopK, so "
+            "--enable-return-routed-experts falls back to moe_runner_backend='auto'."
         )
         return {"moe_runner_backend": "auto"}
     raise ValueError(
-        "--enable-return-routed-experts is incompatible with "
-        f"moe_runner_backend={view.moe_runner_backend!r}: TopK is bypassed "
-        "into the fused kernel, so per-token routed-expert ids are never "
-        "materialized, and no safe automatic fallback exists for "
-        f"quantization={view.quantization!r}. Pass a topk-materializing "
-        "--moe-runner-backend explicitly (e.g. triton) or drop "
-        "--enable-return-routed-experts."
+        f"--enable-return-routed-experts is incompatible with moe_runner_backend="
+        f"{view.moe_runner_backend!r} under quantization={view.quantization!r}; "
+        "pass a topk-materializing --moe-runner-backend such as triton."
     )
 
 
