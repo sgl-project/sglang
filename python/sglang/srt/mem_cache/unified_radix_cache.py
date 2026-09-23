@@ -1202,18 +1202,22 @@ class UnifiedRadixCache(BasePrefixCache):
                 )
             return
 
-        # Match prefix. SWA insertion retains one extra window before the
-        # page-aligned boundary, so the normal match remains safe to repoint.
-        match_result = self.match_prefix(MatchPrefixParams(key=radix_key, req=req))
-        new_indices = match_result.device_indices
-        new_last_node = match_result.last_device_node
+        # Protect the whole inserted path. With disaggregated decode caching,
+        # SWA slots may exist only for the prompt's tail; EAGLE page alignment
+        # can leave less than a live window inside the inserted range. A fresh
+        # match may then stop short, letting the request free tree-owned slots.
+        # Read canonical indices from the final insert path instead.
+        new_last_node = result.last_device_node
+        new_indices = self.tree_core.collect_full_device_indices(
+            new_last_node, self.root_node_handle()
+        )
         new_prefix_len = result.prefix_len
         assert req.kv.cache_protected_len <= len(new_indices) + self.page_size - 1, (
             f"{req.kv.cache_protected_len=}, {len(new_indices)=}, {page_aligned_len=}"
         )
-        assert new_prefix_len <= len(new_indices), (
-            f"{new_prefix_len=}, {len(new_indices)=}"
-        )
+        assert (
+            new_prefix_len <= len(new_indices) and len(new_indices) == page_aligned_len
+        ), f"{new_prefix_len=}, {len(new_indices)=}, {page_aligned_len=}"
         self.req_to_token_pool.write(
             (req.kv.req_pool_idx, slice(req.kv.cache_protected_len, len(new_indices))),
             new_indices[req.kv.cache_protected_len :],
