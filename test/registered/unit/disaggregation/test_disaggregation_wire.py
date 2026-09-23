@@ -1,3 +1,4 @@
+import concurrent.futures
 import struct
 import threading
 import unittest
@@ -33,6 +34,7 @@ from sglang.srt.disaggregation.mooncake.conn import (
     MooncakeKVSender,
     TransferInfo,
 )
+from sglang.srt.disaggregation.nixl.conn import NixlKVManager
 from sglang.srt.disaggregation.utils import (
     MetadataBuffers,
     build_transfer_entry_pairs,
@@ -495,6 +497,291 @@ class TestQwen4StateWire(unittest.TestCase):
                 dst_attn_tp_size=2,
                 local_tp_rank_in_group=0,
             )
+
+
+class _MemcpyNixlAgent:
+    """NIXL agent stand-in whose WRITE copies bytes within one host array."""
+
+    def __init__(self, memory: np.ndarray):
+        self.memory = memory
+
+    def get_xfer_descs(self, reqs, mem_type):
+        return reqs
+
+    def initialize_xfer(self, op, src_descs, dst_descs, peer_name, notif):
+        return src_descs, dst_descs
+
+    def transfer(self, handle):
+        for (src, length, _), (dst, dst_length, _) in zip(*handle):
+            assert length == dst_length
+            src, dst, length = int(src), int(dst), int(length)
+            self.memory[dst : dst + length] = self.memory[src : src + length]
+        return "DONE"
+
+
+class TestHeteroTpSwaStateTransfer(CustomTestCase):
+    """Bug regression: PD rejected non-MLA SWA state across attention TP sizes;
+    each decode rank must receive exactly its KV heads of the window pages."""
+
+    PAGE_SIZE = 2
+    HEAD_BYTES = 4
+    NUM_ENTRIES = 4  # K then V of two SWA layers
+    NUM_PAGES = 6
+    # The window occupies unrelated physical pages on the two sides.
+    SRC_PAGES = [4, 1, 5]
+    DST_PAGES = [2, 5, 0]
+    # (prefill attn TP, decode attn TP, total KV heads); the last three
+    # replicate KV heads across the attention TP ranks of one side.
+    TOPOLOGIES = [(2, 4, 8), (4, 2, 8), (1, 4, 2), (8, 2, 4), (2, 8, 4)]
+
+    @staticmethod
+    def _rank_heads(rank, tp_size, total_heads):
+        # Model-side KV sharding: ranks beyond the head count replicate a head.
+        if total_heads >= tp_size:
+            per_rank = total_heads // tp_size
+            return list(range(rank * per_rank, (rank + 1) * per_rank))
+        return [rank // (tp_size // total_heads)]
+
+    @staticmethod
+    def _source_ranks(prefill_tp, decode_tp, dst_rank):
+        decode = object.__new__(CommonKVManager)
+        decode.attn_tp_size = decode_tp
+        decode.kv_args = SimpleNamespace(engine_rank=dst_rank)
+        decode.is_mla_backend = decode.is_hybrid_mla_backend = False
+        decode.attn_cp_size, decode.attn_cp_rank = 1, 0
+        decode.pp_size, decode.pp_rank = 1, 0
+        info = SimpleNamespace(attn_tp_size=prefill_tp, attn_cp_size=1, pp_size=1)
+        decode._resolve_rank_mapping(info)
+        return info.target_tp_ranks
+
+    def _send_mooncake(self, memory, prefill, dst_rank, decode_tp, dst_ptrs, item_len):
+        def copy_blocks(session_id, blocks):
+            for src, dst, length in blocks:
+                memory[dst : dst + length] = memory[src : src + length]
+            return 0
+
+        prefill.is_hybrid_mla_backend = False
+        prefill.enable_deferred_decode_kv_release = False
+        prefill._transfer_data = copy_blocks
+        req = SimpleNamespace(
+            mooncake_session_id="decode", dst_state_indices=[self.DST_PAGES]
+        )
+        dst_info = SimpleNamespace(
+            dst_state_data_ptrs=[dst_ptrs],
+            dst_state_item_lens=[[item_len] * len(dst_ptrs)],
+            dst_state_dim_per_tensor=[[]],
+            dst_state_layer_ids=[[]],
+            dst_attn_tp_size=decode_tp,
+            dst_tp_rank=dst_rank,
+        )
+        with concurrent.futures.ThreadPoolExecutor(1) as executor:
+            rc = prefill.maybe_send_extra(
+                req, [np.array(self.SRC_PAGES, dtype=np.int32)], executor, dst_info
+            )
+        self.assertEqual(rc, 0)
+
+    def _send_nixl(self, memory, prefill, dst_rank, decode_tp, dst_ptrs, item_len):
+        prefill.agent = _MemcpyNixlAgent(memory)
+        handles = prefill.maybe_send_extra(
+            "decode",
+            [np.array(self.SRC_PAGES, dtype=np.int32)],
+            [dst_ptrs],
+            [self.DST_PAGES],
+            0,
+            "7_state_0",
+            decode_tp,
+            decode_tp_rank=dst_rank,
+            dst_state_item_lens=[[item_len] * len(dst_ptrs)],
+        )
+        self.assertEqual(len(handles), 1)
+
+    def _prefill_manager(
+        self, *, backend, src_rank, prefill_tp, pp_size, total_heads, src_ptrs, item_len
+    ):
+        prefill = object.__new__(backend)
+        prefill.attn_tp_size = prefill_tp
+        prefill.is_mla_backend = False
+        prefill.pp_size = pp_size
+        prefill.kv_args = SimpleNamespace(
+            engine_rank=src_rank,
+            gpu_id=0,
+            page_size=self.PAGE_SIZE,
+            total_kv_head_num=total_heads,
+            prefill_start_layer=0,
+            state_types=[StateType.SWA],
+            state_data_ptrs=[src_ptrs],
+            state_item_lens=[[item_len] * len(src_ptrs)],
+            state_dim_per_tensor=[[]],
+            state_layer_ids=[[]],
+        )
+        return prefill
+
+    def _pool_shape(self, tp_size, total_heads):
+        # [rank, entry, page, token, local head, byte]
+        heads = len(self._rank_heads(rank=0, tp_size=tp_size, total_heads=total_heads))
+        return (
+            tp_size,
+            self.NUM_ENTRIES,
+            self.NUM_PAGES,
+            self.PAGE_SIZE,
+            heads,
+            self.HEAD_BYTES,
+        )
+
+    def _check_transfer(self, backend, send, prefill_tp, decode_tp, total_heads):
+        rng = np.random.default_rng(0)
+        window_shape = (self.NUM_ENTRIES, len(self.SRC_PAGES), self.PAGE_SIZE)
+        window = rng.integers(
+            0, 256, window_shape + (total_heads, self.HEAD_BYTES), dtype=np.uint8
+        )
+        src_shape = self._pool_shape(tp_size=prefill_tp, total_heads=total_heads)
+        dst_shape = self._pool_shape(tp_size=decode_tp, total_heads=total_heads)
+        src_bytes = int(np.prod(src_shape))
+        # Prefill pages outside the window hold bytes a wrong page stride copies.
+        memory = np.concatenate(
+            [
+                rng.integers(0, 256, src_bytes, dtype=np.uint8),
+                np.zeros(int(np.prod(dst_shape)), dtype=np.uint8),
+            ]
+        )
+        src_pools = memory[:src_bytes].reshape(src_shape)
+        dst_pools = memory[src_bytes:].reshape(dst_shape)
+        expected = np.zeros_like(dst_pools)
+        for rank in range(prefill_tp):
+            heads = self._rank_heads(
+                rank=rank, tp_size=prefill_tp, total_heads=total_heads
+            )
+            src_pools[rank][:, self.SRC_PAGES] = window[..., heads, :]
+        for rank in range(decode_tp):
+            heads = self._rank_heads(
+                rank=rank, tp_size=decode_tp, total_heads=total_heads
+            )
+            expected[rank][:, self.DST_PAGES] = window[..., heads, :]
+
+        src_item_len = int(np.prod(src_shape[3:]))
+        dst_item_len = int(np.prod(dst_shape[3:]))
+        for dst_rank in range(decode_tp):
+            dst_ptrs = [
+                src_bytes
+                + (dst_rank * self.NUM_ENTRIES + e) * self.NUM_PAGES * dst_item_len
+                for e in range(self.NUM_ENTRIES)
+            ]
+            for src_rank in self._source_ranks(
+                prefill_tp=prefill_tp, decode_tp=decode_tp, dst_rank=dst_rank
+            ):
+                src_ptrs = [
+                    (src_rank * self.NUM_ENTRIES + e) * self.NUM_PAGES * src_item_len
+                    for e in range(self.NUM_ENTRIES)
+                ]
+                prefill = self._prefill_manager(
+                    backend=backend,
+                    src_rank=src_rank,
+                    prefill_tp=prefill_tp,
+                    pp_size=1,
+                    total_heads=total_heads,
+                    src_ptrs=src_ptrs,
+                    item_len=src_item_len,
+                )
+                send(
+                    memory=memory,
+                    prefill=prefill,
+                    dst_rank=dst_rank,
+                    decode_tp=decode_tp,
+                    dst_ptrs=dst_ptrs,
+                    item_len=dst_item_len,
+                )
+
+        np.testing.assert_array_equal(dst_pools, expected)
+
+    def test_decode_ranks_receive_their_heads_of_the_window(self):
+        for backend, send in (
+            (MooncakeKVManager, self._send_mooncake),
+            (NixlKVManager, self._send_nixl),
+        ):
+            for prefill_tp, decode_tp, total_heads in self.TOPOLOGIES:
+                with self.subTest(
+                    backend=backend.__name__,
+                    prefill_tp=prefill_tp,
+                    decode_tp=decode_tp,
+                    total_heads=total_heads,
+                ):
+                    self._check_transfer(
+                        backend=backend,
+                        send=send,
+                        prefill_tp=prefill_tp,
+                        decode_tp=decode_tp,
+                        total_heads=total_heads,
+                    )
+
+    def test_pipeline_parallel_prefill_is_rejected(self):
+        """Bug regression: a later prefill PP stage's SWA state landed on the
+        decode peer's first SWA layers instead of being rejected."""
+        # Prefill stage 1 of 2 owns SWA layers [4, 6]; the PP1 decode peer owns
+        # [0, 2, 4, 6]. SWA state has no layer ids and a zero layer offset.
+        src_item_len = self.PAGE_SIZE * 2 * self.HEAD_BYTES
+        dst_item_len = self.PAGE_SIZE * self.HEAD_BYTES
+        src_bytes = 4 * self.NUM_PAGES * src_item_len
+        memory = np.concatenate(
+            [
+                np.full(src_bytes, 0xA5, dtype=np.uint8),
+                np.zeros(8 * self.NUM_PAGES * dst_item_len, dtype=np.uint8),
+            ]
+        )
+        src_ptrs = [e * self.NUM_PAGES * src_item_len for e in range(4)]
+        dst_ptrs = [src_bytes + e * self.NUM_PAGES * dst_item_len for e in range(8)]
+        for backend, send in (
+            (MooncakeKVManager, self._send_mooncake),
+            (NixlKVManager, self._send_nixl),
+        ):
+            with self.subTest(backend=backend.__name__):
+                prefill = self._prefill_manager(
+                    backend=backend,
+                    src_rank=0,
+                    prefill_tp=1,
+                    pp_size=2,
+                    total_heads=2,
+                    src_ptrs=src_ptrs,
+                    item_len=src_item_len,
+                )
+                with self.assertRaisesRegex(
+                    RuntimeError, "different TP sizes for non-MLA SWA"
+                ):
+                    send(
+                        memory=memory,
+                        prefill=prefill,
+                        dst_rank=0,
+                        decode_tp=2,
+                        dst_ptrs=dst_ptrs,
+                        item_len=dst_item_len,
+                    )
+                self.assertFalse(memory[src_bytes:].any())
+
+    def test_unsliceable_layouts_are_rejected(self):
+        """A unified-memory envelope and SWA heads sharded unlike
+        total_kv_head_num must fail instead of shipping nothing or wrong bytes."""
+        prefill = object.__new__(CommonKVManager)
+        prefill.attn_tp_size = 2
+        prefill.pp_size = 1
+        prefill.kv_args = SimpleNamespace(
+            engine_rank=0, page_size=2, total_kv_head_num=8, prefill_start_layer=0
+        )
+        for src_item_lens, dst_item_lens, message in (
+            ([64], [32], "per-layer K/V"),
+            # One SWA head per rank on both sides, against 8 total KV heads.
+            ([8, 8], [8, 8], "do not split"),
+        ):
+            with self.subTest(message=message):
+                with self.assertRaisesRegex(RuntimeError, message):
+                    prefill._get_mha_head_slice_blocks(
+                        src_ptrs=[0x1000 * i for i in range(len(src_item_lens))],
+                        src_item_lens=src_item_lens,
+                        dst_ptrs=[0x9000 * i for i in range(len(dst_item_lens))],
+                        dst_item_lens=dst_item_lens,
+                        src_page_indices=np.array([1]),
+                        dst_page_indices=np.array([2]),
+                        dst_attn_tp_size=4,
+                        dst_tp_rank=0,
+                    )
 
 
 class TestMooncakeTransferInfoIsDummy(unittest.TestCase):

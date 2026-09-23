@@ -1766,12 +1766,13 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                     and self.attn_tp_size
                     != target_rank_registration_info.dst_attn_tp_size
                 )
-                if (
+                slice_kv_heads = (
                     has_heterogeneous_attn_tp
                     and not self.is_mla_backend
                     and not self.is_hybrid_mla_backend
                     and not is_qwen4_qsa_state
-                ):
+                )
+                if slice_kv_heads and st != StateType.SWA:
                     raise RuntimeError(
                         f"PD Disaggregation does NOT support PD different TP sizes for non-MLA {st.upper()} hybrid models yet."
                     )
@@ -1836,6 +1837,25 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                         src_indices = src_indices[: len(dst_indices_local)]
                     else:
                         dst_indices_local = dst_indices_local[: len(src_indices)]
+                if slice_kv_heads:
+                    rc = (
+                        self._send_swa_state_slice(
+                            req=req,
+                            prefill_swa_page_indices=src_indices,
+                            src_state_data_ptrs=src_data_ptrs,
+                            src_state_item_lens=src_item_lens,
+                            dst_state_data_ptrs=dst_data_ptrs,
+                            dst_swa_page_indices=dst_indices_local,
+                            dst_state_item_lens=dst_item_lens,
+                            dst_tp_rank=target_rank_registration_info.dst_tp_rank,
+                            dst_attn_tp_size=(
+                                target_rank_registration_info.dst_attn_tp_size
+                            ),
+                            executor=executor,
+                        )
+                        or rc
+                    )
+                    continue
                 rc = (
                     self._send_kvcache_generic(
                         mooncake_session_id=req.mooncake_session_id,
@@ -2085,6 +2105,49 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 transfer_blocks.append((src_addr, dst_addr, bytes_to_send))
 
         return self._transfer_data(req.mooncake_session_id, transfer_blocks)
+
+    def _send_swa_state_slice(
+        self,
+        req: TransferInfo,
+        prefill_swa_page_indices: List[int],
+        src_state_data_ptrs: List[int],
+        src_state_item_lens: List[int],
+        dst_state_data_ptrs: List[int],
+        dst_swa_page_indices: List[int],
+        dst_state_item_lens: List[int],
+        dst_tp_rank: int,
+        dst_attn_tp_size: int,
+        executor: concurrent.futures.ThreadPoolExecutor,
+    ) -> int:
+        blocks = self._get_mha_head_slice_blocks(
+            src_ptrs=src_state_data_ptrs,
+            src_item_lens=src_state_item_lens,
+            dst_ptrs=dst_state_data_ptrs,
+            dst_item_lens=dst_state_item_lens,
+            src_page_indices=np.asarray(prefill_swa_page_indices),
+            dst_page_indices=np.asarray(dst_swa_page_indices),
+            dst_attn_tp_size=dst_attn_tp_size,
+            dst_tp_rank=dst_tp_rank,
+        )
+        logger.warning_once(
+            "Using SWA state head-slice transfer for different attention TP sizes: "
+            f"prefill={self.attn_tp_size}, decode={dst_attn_tp_size}."
+        )
+        futures = [
+            executor.submit(
+                self._transfer_data,
+                req.mooncake_session_id,
+                list(
+                    zip(
+                        src_addrs.tolist(),
+                        dst_addrs.tolist(),
+                        [length] * src_addrs.size,
+                    )
+                ),
+            )
+            for src_addrs, dst_addrs, length in blocks
+        ]
+        return self._await_transfer_futures(futures)
 
     def transfer_worker(
         self,
