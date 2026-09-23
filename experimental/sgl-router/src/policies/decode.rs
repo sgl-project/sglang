@@ -158,7 +158,7 @@ impl DecodePolicy for LegacyHostAffinityDecodePolicy {
 /// Builds a decode policy scoped to one role.
 pub fn build_decode_policy(kind: DecodePolicyKind) -> Box<dyn DecodePolicy> {
     match kind {
-        DecodePolicyKind::PowerOfN => Box::new(DecodePowerOfTwoPolicy::new()),
+        DecodePolicyKind::PowerOfTwo => Box::new(DecodePowerOfTwoPolicy::new()),
         DecodePolicyKind::LegacyHostAffinity => Box::new(LegacyHostAffinityDecodePolicy),
     }
 }

@@ -339,7 +339,7 @@ Session and sticky policies do not create assignments for missing keys. A
 binding outside the candidates cannot win. A missing binding may invoke policy
 fallback within the group; hard admission rejection remains an error.
 
-Sticky fallback supports `round_robin`, `random`, `power_of_n`, and `load_based`,
+Sticky fallback supports `round_robin`, `random`, `power_of_two`, and `load_based`,
 with round-robin as the default. Nested fallbacks use
 `AdmissionLimits::default()`; the owning policy explicitly checks the engine
 returned by its fallback.

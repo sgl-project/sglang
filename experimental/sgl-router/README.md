@@ -90,7 +90,8 @@ Use `--power-of-n-choices 4` to sample four distinct engines for selection and
 fallbacks. The default is 2; N must be positive and is capped at the pool size.
 This option requires `--chat-routing reorg`.
 
-Omitting `--chat-routing` keeps the existing routing implementation and defaults.
+Omitting `--chat-routing` keeps legacy routing, including `--policy power_of_two`
+and its existing decode and sticky-fallback names.
 
 ### Fleet-wide sampling contract
 

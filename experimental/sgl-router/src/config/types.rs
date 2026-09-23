@@ -70,6 +70,9 @@ pub enum PolicyKind {
     RoundRobin,
     #[value(name = "random")]
     Random,
+    #[value(name = "power_of_two")]
+    PowerOfTwo,
+    /// Power-of-N selection for reorg routing.
     #[value(name = "power_of_n")]
     PowerOfN,
     /// Selects the currently least-loaded worker.
@@ -96,8 +99,8 @@ pub enum PolicyKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
 pub enum DecodePolicyKind {
     #[default]
-    #[value(name = "power_of_n")]
-    PowerOfN,
+    #[value(name = "power_of_two")]
+    PowerOfTwo,
     #[value(name = "legacy_host_affinity")]
     LegacyHostAffinity,
 }
@@ -215,8 +218,8 @@ pub enum StickyFallbackKind {
     RoundRobin,
     #[value(name = "random")]
     Random,
-    #[value(name = "power_of_n")]
-    PowerOfN,
+    #[value(name = "power_of_two")]
+    PowerOfTwo,
     #[value(name = "load_based")]
     LoadBased,
 }

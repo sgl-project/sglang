@@ -29,7 +29,7 @@ fn build_sticky_fallback(kind: StickyFallbackKind) -> Arc<dyn Policy> {
     match kind {
         StickyFallbackKind::RoundRobin => Arc::new(RoundRobinPolicy::new()),
         StickyFallbackKind::Random => Arc::new(RandomPolicy::new()),
-        StickyFallbackKind::PowerOfN => Arc::new(PowerOfTwoChoicesPolicy::new()),
+        StickyFallbackKind::PowerOfTwo => Arc::new(PowerOfTwoChoicesPolicy::new()),
         StickyFallbackKind::LoadBased => Arc::new(LoadBasedPolicy::new()),
     }
 }
@@ -95,7 +95,8 @@ fn build_kind(
     Ok(match kind {
         PolicyKind::RoundRobin => Arc::new(RoundRobinPolicy::new()),
         PolicyKind::Random => Arc::new(RandomPolicy::new()),
-        PolicyKind::PowerOfN => Arc::new(PowerOfTwoChoicesPolicy::new()),
+        PolicyKind::PowerOfTwo => Arc::new(PowerOfTwoChoicesPolicy::new()),
+        PolicyKind::PowerOfN => return Err(anyhow!("power_of_n requires reorg routing")),
         PolicyKind::LoadBased => Arc::new(LoadBasedPolicy::new()),
         PolicyKind::SessionAware => Arc::new(SessionAwarePolicy::new(
             model.affinity.clone().unwrap_or_default(),
@@ -192,7 +193,8 @@ pub fn build_policy_kind_only(kind: PolicyKind) -> Result<Arc<dyn Policy>> {
     Ok(match kind {
         PolicyKind::RoundRobin => Arc::new(RoundRobinPolicy::new()),
         PolicyKind::Random => Arc::new(RandomPolicy::new()),
-        PolicyKind::PowerOfN => Arc::new(PowerOfTwoChoicesPolicy::new()),
+        PolicyKind::PowerOfTwo => Arc::new(PowerOfTwoChoicesPolicy::new()),
+        PolicyKind::PowerOfN => return Err(anyhow!("power_of_n requires reorg routing")),
         PolicyKind::LoadBased => Arc::new(LoadBasedPolicy::new()),
         PolicyKind::SessionAware => Arc::new(SessionAwarePolicy::new(
             crate::config::AffinityConfig::default(),
@@ -363,7 +365,7 @@ mod tests {
         for (kind, needs_load_snapshot, needs_dispatch_timestamps) in [
             (PolicyKind::RoundRobin, false, false),
             (PolicyKind::Random, false, false),
-            (PolicyKind::PowerOfN, true, false),
+            (PolicyKind::PowerOfTwo, true, false),
             (PolicyKind::LoadBased, true, true),
             (PolicyKind::SessionAware, true, false),
             (PolicyKind::CacheAware, true, false),
@@ -537,7 +539,7 @@ mod tests {
         for kind in [
             StickyFallbackKind::RoundRobin,
             StickyFallbackKind::Random,
-            StickyFallbackKind::PowerOfN,
+            StickyFallbackKind::PowerOfTwo,
             StickyFallbackKind::LoadBased,
         ] {
             assert!(

@@ -33,8 +33,8 @@ pub fn validate(model: &ModelConfig) -> Result<()> {
         "legacy --bucket-config cannot define complete reorg buckets"
     );
     ensure!(
-        model.decode_policy == DecodePolicyKind::PowerOfN,
-        "reorg routing requires --decode-policy power_of_n"
+        model.decode_policy == DecodePolicyKind::PowerOfTwo,
+        "reorg routing does not support --decode-policy legacy_host_affinity"
     );
     if let Some(filters) = &model.eligibility {
         ensure!(

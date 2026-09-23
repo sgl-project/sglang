@@ -227,7 +227,7 @@ mod tests {
                 tokenizer_path: "/tmp/tok.json".into(),
                 disable_input_ids_forwarding: false,
                 policy: PolicyKind::RoundRobin,
-                decode_policy: DecodePolicyKind::PowerOfN,
+                decode_policy: DecodePolicyKind::PowerOfTwo,
                 power_of_n_choices: 2,
                 bucket_config: None,
                 circuit_breaker: None,
