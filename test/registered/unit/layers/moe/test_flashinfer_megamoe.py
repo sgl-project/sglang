@@ -6,6 +6,7 @@ from pathlib import Path
 import torch
 
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -212,6 +213,28 @@ def test_capture_safe_ue8m0_pack_is_scoped(monkeypatch):
         assert packed.dtype == torch.int32
 
     assert dgm.pack_ue8m0_to_int is original
+
+
+class TestMegaMoeOutputViewCapability(CustomTestCase):
+    def test_unsupported_workspace_view_uses_owning_output(self):
+        """A shared forward signature does not imply backend view support."""
+        import pytest
+
+        with pytest.MonkeyPatch.context() as monkeypatch:
+            module = _load_megamoe_module(monkeypatch)
+            output = torch.arange(4, dtype=torch.bfloat16)
+
+            class Mega:
+                supports_output_view = False
+
+                def forward(self, tensors, *, return_workspace_view=False):
+                    if return_workspace_view:
+                        raise ValueError("workspace views are unsupported")
+                    return output
+
+            mega = Mega()
+            result = module._select_megamoe_forward(mega)(mega, object())
+            self.assertIs(result, output)
 
 
 if __name__ == "__main__":
