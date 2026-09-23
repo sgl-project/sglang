@@ -9,6 +9,8 @@ Run with:
 """
 
 import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 
@@ -65,6 +67,42 @@ def awq_dequantize_torch(
 
 
 class TestAWQTriton(CustomTestCase):
+    @unittest.skipIf(torch.version.hip is None, "ROCm AWQ dispatch")
+    def test_linear_dispatch(self):
+        from sglang.srt.hardware_backend.gpu.quantization import awq_kernels
+        from sglang.srt.layers.quantization.awq.awq import AWQConfig
+
+        config = AWQConfig(weight_bits=4, group_size=128, zero_point=True)
+        self.assertIn(torch.bfloat16, config.get_supported_act_dtypes())
+        for dtype in (torch.float16, torch.bfloat16):
+            layer = SimpleNamespace(
+                qweight=torch.randint(
+                    0, 2**31 - 1, (512, 9), device=device, dtype=torch.int32
+                ),
+                qzeros=torch.randint(
+                    0, 2**31 - 1, (4, 9), device=device, dtype=torch.int32
+                ),
+                scales=torch.rand((4, 72), device=device, dtype=dtype) * 0.05,
+            )
+            weight = awq_dequantize_torch(
+                layer.qweight, layer.scales, layer.qzeros, 128
+            )
+            kernel = awq_kernels.AWQLinearKernel(config)
+            bias = torch.randn(72, device=device, dtype=dtype)
+            for rows in (0, 1, 16, 17):
+                with self.subTest(dtype=dtype, rows=rows):
+                    x = torch.randn((1, rows, 1024), device=device, dtype=dtype)[
+                        ..., ::2
+                    ]
+                    with patch.object(
+                        awq_kernels, "awq_gemm", wraps=awq_kernels.awq_gemm
+                    ) as packed:
+                        actual = kernel.apply(layer, x, bias)
+                    self.assertEqual(packed.call_count, int(0 < rows <= 16))
+                    torch.testing.assert_close(
+                        actual, x @ weight + bias, atol=0.03, rtol=0.01
+                    )
+
     def test_dequantize(self):
         rows_list = [3584, 18944, 128, 256, 512, 1024]
         cols_list = [448, 576, 4736, 16, 32, 64, 128]

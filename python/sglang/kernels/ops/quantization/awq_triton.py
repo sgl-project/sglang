@@ -133,7 +133,7 @@ def awq_gemm_kernel(
     pid_m = pid // num_pid_n
     pid_n = pid % num_pid_n
 
-    accumulator_dtype = c_ptr.type.element_ty
+    accumulator_dtype = tl.float32
 
     # NOTE: This doesn't work in TRITON_INTERPRET=1 mode.  Use below instead.
     # accumulator = tl.arange(0, BLOCK_SIZE_N)
@@ -212,7 +212,7 @@ def awq_gemm_kernel(
         b = (b >> shifts) & 0xF
         zeros = (zeros >> shifts) & 0xF
         b = (b - zeros) * scales
-        b = b.to(c_ptr.type.element_ty)
+        b = b.to(a_ptr.type.element_ty)
 
         # Accumulate results.
         accumulator = tl.dot(a, b, accumulator, out_dtype=accumulator_dtype)
@@ -227,6 +227,24 @@ def awq_gemm_kernel(
     c_ptrs = c_ptr + pid_z * N * M + N * offs_cm[:, None] + offs_cn[None, :]
     c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
     tl.store(c_ptrs, c, mask=c_mask)
+
+
+@triton.jit
+def awq_reduce_split_k_kernel(
+    partial_ptr,
+    output_ptr,
+    numel,
+    SPLIT_K: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    offsets = tl.program_id(0) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    splits = tl.arange(0, SPLIT_K)
+    partial = tl.load(
+        partial_ptr + splits[:, None] * numel + offsets[None, :],
+        mask=offsets[None, :] < numel,
+        other=0.0,
+    )
+    tl.store(output_ptr + offsets, tl.sum(partial, axis=0), mask=offsets < numel)
 
 
 # qweights - [K     , M // 8], int32
@@ -314,7 +332,11 @@ def awq_gemm_triton(
         split_k_iters,
     )
 
-    result = torch.zeros((split_k_iters, M, N), dtype=scales.dtype, device=input.device)
+    result = torch.empty(
+        (split_k_iters, M, N),
+        dtype=torch.float32 if split_k_iters > 1 else input.dtype,
+        device=input.device,
+    )
 
     # A = input, B = qweight, C = result
     # A = M x K, B = K x N, C = M x N
@@ -334,9 +356,14 @@ def awq_gemm_triton(
         SPLIT_K=split_k_iters,
     )
 
-    result = result.sum(0)
+    if split_k_iters == 1:
+        return result[0]
 
-    return result
+    output = torch.empty((M, N), dtype=input.dtype, device=input.device)
+    awq_reduce_split_k_kernel[(triton.cdiv(M * N, 256),)](
+        result, output, M * N, SPLIT_K=split_k_iters, BLOCK_SIZE=256
+    )
+    return output
 
 
 def awq_dequantize_decomposition(
