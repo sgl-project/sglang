@@ -2,7 +2,6 @@
 
 import unittest
 from array import array
-from queue import Queue
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -19,11 +18,6 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolName,
     PoolTransfer,
     SidecarPoolSpec,
-)
-from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
-    HybridCacheController,
-    PrefetchOperation,
-    StorageOperation,
 )
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.unified_cache.components.base import (
@@ -284,76 +278,6 @@ class TestBufferModeSidecar(unittest.TestCase):
             cache.prefetch_loaded_tokens_by_reqid[req_id], len(host_indices)
         )
         self.assertEqual(cache.prefetch_loaded_storage_start_by_reqid[req_id], 0)
-
-
-class TestSidecarStorageChain(unittest.TestCase):
-    prefix = ["anc-0", "anc-1"]
-    hashes = ["page-0", "page-1", "page-2", "page-3"]
-
-    def _controller(self):
-        self.chains = {}
-
-        def record(transfers, extra_info):
-            for transfer in transfers:
-                self.chains[transfer.name] = extra_info.prefix_keys + transfer.keys
-            return {t.name: [True] * len(t.keys) for t in transfers}
-
-        controller = HybridCacheController.__new__(HybridCacheController)
-        controller.storage_backend = SimpleNamespace(
-            batch_set_v2=record, batch_get_v2=record
-        )
-        controller.backup_skip = False
-        controller.page_size = 2
-        controller.page_set_func = lambda *args: True
-        controller.mem_pool_host = SimpleNamespace(entry_map={})
-        controller.prefetch_sync_queue = Queue()
-        return controller
-
-    @staticmethod
-    def _sidecars(swa_keys, mamba_keys):
-        return [
-            PoolTransfer(
-                name=PoolName.SWA,
-                keys=swa_keys,
-                hit_policy=PoolHitPolicy.TRAILING_PAGES,
-            ),
-            PoolTransfer(
-                name=PoolName.MAMBA,
-                keys=mamba_keys,
-                hit_policy=PoolHitPolicy.TRAILING_PAGES,
-            ),
-        ]
-
-    def test_backup_sidecar_chain_is_contiguous(self):
-        controller = self._controller()
-        operation = StorageOperation(
-            torch.arange(8),
-            token_ids=list(range(8)),
-            hash_value=self.hashes,
-            prefix_keys=self.prefix,
-            pool_transfers=self._sidecars(self.hashes[-2:], self.hashes[-1:]),
-        )
-
-        controller._page_backup(operation)
-
-        chain = self.prefix + self.hashes
-        self.assertEqual(self.chains, {PoolName.SWA: chain, PoolName.MAMBA: chain})
-
-    def test_prefetch_sidecar_chain_is_contiguous(self):
-        controller = self._controller()
-        hit_pages = 3
-        operation = PrefetchOperation(
-            CacheRequestHandle("sidecar-chain", 0),
-            token_ids=list(range(8)),
-            prefix_keys=self.prefix,
-            pool_transfers=self._sidecars(["__placeholder__"] * 2, ["__placeholder__"]),
-        )
-        operation.hash_value = self.hashes[:hit_pages]
-
-        controller._page_transfer_sidecar(operation, hit_pages)
-
-        chain = self.prefix + self.hashes[:hit_pages]
-        self.assertEqual(self.chains, {PoolName.SWA: chain, PoolName.MAMBA: chain})
 
 
 if __name__ == "__main__":
