@@ -174,6 +174,7 @@ from sglang.srt.models.deepseek_common.utils import (
     _is_cpu,
     _is_cpu_amx_available,
     _is_cuda,
+    _is_gfx942_supported,
     _is_gfx95_supported,
     _is_hip,
     _is_musa,
@@ -541,6 +542,10 @@ class MoEGate(nn.Module):
             )
         elif _use_aiter:
             logits = aiter_dsv3_router_gemm(hidden_states, self.weight)
+        elif self.is_deepseek_v4 and _is_gfx942_supported:
+            # Routing stays FP32 on gfx942 whether or not AITER is enabled; the global
+            # kernel toggle must not silently lower router precision.
+            logits = F.linear(hidden_states.float(), self.weight.detach().float())
         elif not _is_cuda:
             logits = F.linear(hidden_states, self.weight, None)
         else:
