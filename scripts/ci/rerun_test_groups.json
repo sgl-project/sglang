@@ -1,4 +1,18 @@
 {
+  "hisparse": [
+    "registered/disaggregation/test_disaggregation_hisparse.py",
+    "registered/e2e/models/test_dsa_glm52_hisparse.py",
+    "registered/kernels/ops/kvcache/test_hisparse.py",
+    "registered/kernels/ops/kvcache/test_hisparse_slot_mapping.py",
+    "registered/kernels/ops/kvcache/test_hisparse_spec.py",
+    "registered/unit/managers/test_hisparse_unit.py",
+    "registered/unit/managers/test_schedule_batch_req_pool_indices.py",
+    "registered/unit/mem_cache/test_hisparse_allocator.py",
+    "registered/unit/mem_cache/test_hisparse_max_token_pool_size.py",
+    "registered/unit/mem_cache/test_hisparse_slot_translation.py",
+    "registered/unit/mem_cache/test_minimax_sparse_pool_pd_unit.py",
+    "registered/unit/model_executor/test_hisparse_pool_configurator.py"
+  ],
   "rust-server": [
     "registered/rust/test_run_rust_tests.py",
     "registered/core/test_srt_endpoint.py",
