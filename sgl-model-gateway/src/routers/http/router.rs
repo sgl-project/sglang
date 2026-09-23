@@ -321,7 +321,10 @@ impl Router {
         // mask "200-then-broken" workers — every request would tick a
         // success before the stream had a chance to error out.
         if !is_stream {
-            worker.record_outcome(status.is_success());
+            // 4xx responses are client/request errors — the worker is healthy.
+            // Only 5xx and transport errors should trip the circuit breaker.
+            // (Mirrors the logic already in pd_router.rs.)
+            worker.record_outcome(status.is_success() || status.is_client_error());
         }
 
         // Record worker errors for server errors (5xx)
@@ -622,17 +625,21 @@ impl Router {
             // no spawned task or channel needed. `BreakerTrackedStream`
             // updates the worker's circuit breaker exactly once on drop:
             // success on clean end, failure on stream error, neither on
-            // client disconnect. For non-2xx responses we pre-mark the
+            // client disconnect. For 5xx responses we pre-mark the
             // wrapper as Errored — otherwise the small error body would
             // stream cleanly to `None` and Drop would record a spurious
-            // success (and the streaming branch also skips the eager
+            // success. 4xx responses are client-side errors and do not
+            // constitute a worker failure, so we leave the tracker unmarked
+            // (and the streaming branch also skips the eager
             // `record_outcome` above).
             let mut tracked = BreakerTrackedStream::new(
                 res.bytes_stream(),
                 worker.clone(),
                 worker_url.to_string(),
             );
-            if !status.is_success() {
+            // Only pre-mark as errored for 5xx/transport failures; 4xx errors
+            // are the client's fault and should not trip the circuit breaker.
+            if !(status.is_success() || status.is_client_error()) {
                 tracked.mark_errored();
             }
             let body = Body::from_stream(tracked);
