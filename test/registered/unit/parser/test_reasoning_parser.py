@@ -267,13 +267,10 @@ class TestDeepSeekV4StrictToolBoundary(CustomTestCase):
         "</｜DSML｜parameter></｜DSML｜invoke></｜DSML｜tool_calls>"
     )
 
-    def _detector(self, *, strict=True, **kwargs):
+    def _detector(self, **kwargs):
         options = {"force_reasoning": True, "tool_call_parser_active": True}
         options.update(kwargs)
-        with patch.dict(
-            os.environ, {"SGLANG_DSV4_STRICT_TOOL_OUTPUT": "1" if strict else "0"}
-        ):
-            return DeepSeekV4Detector(**options)
+        return DeepSeekV4Detector(**options)
 
     def _stream(self, chunks, **kwargs):
         detector = self._detector(**kwargs)
@@ -396,11 +393,10 @@ class TestDeepSeekV4StrictToolBoundary(CustomTestCase):
             example + "\n" + self.tool,
         )
 
-    def test_inactive_or_non_strict_behavior_is_unchanged(self):
+    def test_inactive_tool_parser_behavior_is_unchanged(self):
         tool = "<｜DSML｜tool_calls>"
         text = "<think>Inspect.</think>Now run.\n</think>\n" + tool
         normal = "Now run.\n</think>\n" + tool
-        self._assert_parses(text, "Inspect.", normal, strict=False)
         self._assert_parses(text, "Inspect.", normal, tool_call_parser_active=False)
 
     def test_continue_final_message_is_unchanged(self):
@@ -428,10 +424,9 @@ class TestDeepSeekV4StrictToolBoundary(CustomTestCase):
         )
 
     def test_reasoning_parser_passes_active_tool_flag(self):
-        with patch.dict(os.environ, {"SGLANG_DSV4_STRICT_TOOL_OUTPUT": "1"}):
-            parser = ReasoningParser(
-                "deepseek-v4", force_reasoning=True, tool_call_parser_active=True
-            )
+        parser = ReasoningParser(
+            "deepseek-v4", force_reasoning=True, tool_call_parser_active=True
+        )
         reasoning, normal = parser.parse_stream_chunk(
             "Inspect.</think>Now run.\n</think>\n" + self.tool
         )
@@ -442,35 +437,33 @@ class TestDeepSeekV4StrictToolBoundary(CustomTestCase):
 
 class TestDeepSeekV4ReasoningBoundaryCleanup(TestDeepSeekV4StrictToolBoundary):
     def test_orphan_closer_at_confirmed_reasoning_end(self):
-        with patch.dict(os.environ, {"SGLANG_DSV4_REJECT_PROTOCOL_MARKERS": "1"}):
-            for stream_reasoning in [True, False]:
-                for closer in [
-                    "</parameter>",
-                    "</invoke>",
-                    "</tool_calls>",
-                    "</function_calls>",
-                ]:
-                    self._assert_parses(
-                        "Plan.\n" + closer + "</think>Now run.\n" + self.tool,
-                        "Plan.\n",
-                        "Now run.\n" + self.tool,
-                        stream_reasoning=stream_reasoning,
-                    )
-            source = "Plan.\n</parameter></think>Now run.</think>\n\n" + self.tool
-            for split in range(len(source) + 1):
-                with self.subTest(split=split):
-                    self.assertEqual(
-                        self._stream([source[:split], source[split:]]),
-                        ("Plan.\n", "Now run.\n\n" + self.tool),
-                    )
+        for stream_reasoning in [True, False]:
+            for closer in [
+                "</parameter>",
+                "</invoke>",
+                "</tool_calls>",
+                "</function_calls>",
+            ]:
+                self._assert_parses(
+                    "Plan.\n" + closer + "</think>Now run.\n" + self.tool,
+                    "Plan.\n",
+                    "Now run.\n" + self.tool,
+                    stream_reasoning=stream_reasoning,
+                )
+        source = "Plan.\n</parameter></think>Now run.</think>\n\n" + self.tool
+        for split in range(len(source) + 1):
+            with self.subTest(split=split):
+                self.assertEqual(
+                    self._stream([source[:split], source[split:]]),
+                    ("Plan.\n", "Now run.\n\n" + self.tool),
+                )
 
     def test_multiple_closers_and_crlf_are_handled_without_losing_whitespace(self):
-        with patch.dict(os.environ, {"SGLANG_DSV4_REJECT_PROTOCOL_MARKERS": "1"}):
-            self._assert_parses(
-                "Plan.\r\n  </parameter>\r\n</invoke>\r\n</think>Done.",
-                "Plan.\r\n  \r\n\r\n",
-                "Done.",
-            )
+        self._assert_parses(
+            "Plan.\r\n  </parameter>\r\n</invoke>\r\n</think>Done.",
+            "Plan.\r\n  \r\n\r\n",
+            "Done.",
+        )
 
     def test_quoted_balanced_inline_and_intervening_text_are_preserved(self):
         bodies = [
@@ -490,78 +483,65 @@ class TestDeepSeekV4ReasoningBoundaryCleanup(TestDeepSeekV4StrictToolBoundary):
             "<parameter>\n<![CDATA[</parameter>]]>\n</parameter>",
             "<parameter>\n<!-- ' -->\n</parameter>",
         ]
-        with patch.dict(os.environ, {"SGLANG_DSV4_REJECT_PROTOCOL_MARKERS": "1"}):
-            for body in bodies:
-                with self.subTest(body=body):
-                    for stream_reasoning in [True, False]:
-                        self._assert_parses(
-                            body + "</think>Done.",
-                            body,
-                            "Done.",
-                            stream_reasoning=stream_reasoning,
-                        )
+        for body in bodies:
+            with self.subTest(body=body):
+                for stream_reasoning in [True, False]:
+                    self._assert_parses(
+                        body + "</think>Done.",
+                        body,
+                        "Done.",
+                        stream_reasoning=stream_reasoning,
+                    )
 
     def test_closed_literal_openers_do_not_pair_with_orphan_suffix(self):
-        with patch.dict(os.environ, {"SGLANG_DSV4_REJECT_PROTOCOL_MARKERS": "1"}):
-            for prefix in ["<!-- <parameter> -->\n", "<![CDATA[<parameter>]]>\n"]:
-                self._assert_parses(
-                    prefix + "</parameter></think>Done.", prefix, "Done."
-                )
+        for prefix in ["<!-- <parameter> -->\n", "<![CDATA[<parameter>]]>\n"]:
+            self._assert_parses(prefix + "</parameter></think>Done.", prefix, "Done.")
 
     def test_streaming_thoughts_are_not_buffered_in_full(self):
-        with patch.dict(os.environ, {"SGLANG_DSV4_REJECT_PROTOCOL_MARKERS": "1"}):
-            detector = self._detector()
-            self.assertEqual(
-                detector.parse_streaming_increment("Thinking normally").reasoning_text,
-                "Thinking normally",
-            )
-            self.assertEqual(
-                detector.parse_streaming_increment("\n</para").reasoning_text, "\n"
-            )
-            self.assertEqual(
-                detector.parse_streaming_increment("meter>").reasoning_text, ""
-            )
-            closed = detector.parse_streaming_increment("</think>Done.")
-            self.assertEqual(closed.reasoning_text, "")
-            self.assertEqual(detector.finish().normal_text, "Done.")
-            self.assertEqual(detector.finish().reasoning_text, "")
+        detector = self._detector()
+        self.assertEqual(
+            detector.parse_streaming_increment("Thinking normally").reasoning_text,
+            "Thinking normally",
+        )
+        self.assertEqual(
+            detector.parse_streaming_increment("\n</para").reasoning_text, "\n"
+        )
+        self.assertEqual(
+            detector.parse_streaming_increment("meter>").reasoning_text, ""
+        )
+        closed = detector.parse_streaming_increment("</think>Done.")
+        self.assertEqual(closed.reasoning_text, "")
+        self.assertEqual(detector.finish().normal_text, "Done.")
+        self.assertEqual(detector.finish().reasoning_text, "")
 
     def test_unconfirmed_eof_or_tool_interruption_does_not_erase_closer(self):
-        with patch.dict(os.environ, {"SGLANG_DSV4_REJECT_PROTOCOL_MARKERS": "1"}):
-            for stream_reasoning in [True, False]:
-                for ending in ["</para", "</parameter>", "</parameter>\n\n"]:
-                    body = "Plan.\n" + ending
-                    self._assert_parses(
-                        body, body, "", stream_reasoning=stream_reasoning
-                    )
-            self._assert_parses(
-                "Plan.\n</parameter>" + self.tool,
-                "Plan.\n</parameter>",
-                self.tool,
-            )
+        for stream_reasoning in [True, False]:
+            for ending in ["</para", "</parameter>", "</parameter>\n\n"]:
+                body = "Plan.\n" + ending
+                self._assert_parses(body, body, "", stream_reasoning=stream_reasoning)
+        self._assert_parses(
+            "Plan.\n</parameter>" + self.tool,
+            "Plan.\n</parameter>",
+            self.tool,
+        )
 
-    def test_disabled_or_inactive_gate_keeps_original_reasoning(self):
+    def test_inactive_tool_parser_and_continuation_keep_original_reasoning(self):
         body = "Plan.\n</parameter>"
-        with patch.dict(os.environ, {"SGLANG_DSV4_REJECT_PROTOCOL_MARKERS": "0"}):
-            self._assert_parses(body + "</think>Done.", body, "Done.")
-        with patch.dict(os.environ, {"SGLANG_DSV4_REJECT_PROTOCOL_MARKERS": "1"}):
-            self._assert_parses(body + "</think>Done.", body, "Done.", strict=False)
-            self._assert_parses(
-                body + "</think>Done.", body, "Done.", tool_call_parser_active=False
-            )
-            self._assert_parses(
-                body + "</think>Done.",
-                body,
-                "Done.",
-                continue_final_message=True,
-                previous_content="<think>Earlier.",
-            )
+        self._assert_parses(
+            body + "</think>Done.", body, "Done.", tool_call_parser_active=False
+        )
+        self._assert_parses(
+            body + "</think>Done.",
+            body,
+            "Done.",
+            continue_final_message=True,
+            previous_content="<think>Earlier.",
+        )
 
     def test_force_nonempty_eof_preserves_held_reasoning(self):
-        with patch.dict(os.environ, {"SGLANG_DSV4_REJECT_PROTOCOL_MARKERS": "1"}):
-            detector = self._detector(force_nonempty_content=True)
-            detector.parse_streaming_increment("Plan.\n</parameter>")
-            self.assertEqual(detector.finish().normal_text, "Plan.\n</parameter>")
+        detector = self._detector(force_nonempty_content=True)
+        detector.parse_streaming_increment("Plan.\n</parameter>")
+        self.assertEqual(detector.finish().normal_text, "Plan.\n</parameter>")
 
 
 class TestDanglingThinkEnd(CustomTestCase):

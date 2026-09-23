@@ -66,9 +66,7 @@ class TestDeepSeekV4Streaming(CustomTestCase):
         value = "Example:\n<think>keep this</think>"
         text = "Inspect.</think>Now call.\n</think>\n" + _weather_call(value)
         for size in [1, 2, 7, 23, len(text)]:
-            with self.subTest(size=size), patch.dict(
-                os.environ, {"SGLANG_DSV4_STRICT_TOOL_OUTPUT": "1"}
-            ):
+            with self.subTest(size=size):
                 reasoning = ReasoningParser(
                     "deepseek-v4",
                     force_reasoning=True,
@@ -193,6 +191,7 @@ class TestDeepSeekV4Streaming(CustomTestCase):
                         )
 
     def test_incomplete_non_string_parameter_does_not_emit_a_guessed_value(self):
+        self.tools[0].function.parameters["properties"]["city"]["type"] = "number"
         detector = DeepSeekV4Detector()
         chunks = [
             f'<{DSML}tool_calls><{DSML}invoke name="get_weather">'
@@ -242,25 +241,15 @@ class TestDeepSeekV4Streaming(CustomTestCase):
         with self.assertRaisesRegex(ValueError, "Incomplete DSML non-string parameter"):
             detector.finish(self.tools)
 
-    def test_parse_error_neither_swallows_nor_duplicates(self):
-        """An unexpected parse error must not empty the turn, and the dropped
-        buffer must not come back on the next delta."""
+    def test_parse_error_is_explicit_instead_of_returning_raw_protocol(self):
         detector = DeepSeekV4Detector()
-
         with patch.object(
             DeepSeekV4Detector,
             "_parse_parameters_from_xml",
             side_effect=RuntimeError("boom"),
         ):
-            first = detector.parse_streaming_increment(_weather_call(), self.tools)
-            self.assertEqual(detector._buffer, "")
-            second = detector.parse_streaming_increment(" tail", self.tools)
-
-        self.assertIn("get_weather", first.normal_text)
-        self.assertNotIn("get_weather", second.normal_text)
-        # No half-formed call: the failure can land between a tool's name and its
-        # arguments, so an argument-less named call must not reach the client.
-        self.assertEqual(first.calls, [])
+            with self.assertRaisesRegex(ValueError, "Failed to parse.*boom"):
+                detector.parse_streaming_increment(_weather_call(), self.tools)
 
     def test_damaged_wrappers_do_not_become_assistant_preamble(self):
         prefixes = [
@@ -335,15 +324,13 @@ class TestDeepSeekV4Streaming(CustomTestCase):
             self.assertEqual(quoted_only.normal_text, quote)
             self.assertEqual(quoted_only.calls, [])
 
-    def test_strict_mode_rejects_orphan_markup_before_content_is_emitted(self):
+    def test_ordinary_control_tag_text_is_preserved(self):
         for text in [
             "Now let me update the result.\n\n</parameter>\n",
             '\n\n</parameter>\n</invoke>\n<invoke name="exec_command">\n',
             '</parameter></invoke><invoke name="exec_command">\n',
         ]:
-            with self.subTest(text=text), patch.dict(
-                os.environ, {"SGLANG_DSV4_STRICT_TOOL_OUTPUT": "1"}
-            ):
+            with self.subTest(text=text):
                 detector = DeepSeekV4Detector()
                 normal = ""
                 for start in range(0, len(text), 3):
@@ -351,13 +338,14 @@ class TestDeepSeekV4Streaming(CustomTestCase):
                         text[start : start + 3], self.tools
                     )
                     normal += result.normal_text
-                self.assertEqual(normal, "")
-                with self.assertRaisesRegex(ValueError, "Orphan"):
-                    detector.finish(self.tools)
-                with self.assertRaisesRegex(ValueError, "Orphan"):
-                    DeepSeekV4Detector().detect_and_parse(text, self.tools)
+                    self.assertEqual(result.calls, [])
+                normal += detector.finish(self.tools).normal_text
+                self.assertEqual(normal, text)
+                parsed = DeepSeekV4Detector().detect_and_parse(text, self.tools)
+                self.assertEqual(parsed.normal_text, text)
+                self.assertEqual(parsed.calls, [])
 
-    def test_strict_mode_preserves_literal_markup_and_balanced_xml(self):
+    def test_literal_markup_and_balanced_xml_are_preserved(self):
         for text in [
             "Literal `</parameter>`.",
             "Example:\n```xml\n</parameter>\n</invoke>\n```",
@@ -365,52 +353,50 @@ class TestDeepSeekV4Streaming(CustomTestCase):
             "</parameter>",
             "Text with an unrelated SGML fragment: <![unexpected[.",
         ]:
-            with self.subTest(text=text), patch.dict(
-                os.environ, {"SGLANG_DSV4_STRICT_TOOL_OUTPUT": "1"}
-            ):
+            with self.subTest(text=text):
                 detector = DeepSeekV4Detector()
+                normal = ""
                 for part in text:
                     result = detector.parse_streaming_increment(part, self.tools)
-                    self.assertEqual(result.normal_text, "")
-                self.assertEqual(detector.finish(self.tools).normal_text, text)
+                    normal += result.normal_text
+                    self.assertEqual(result.calls, [])
+                normal += detector.finish(self.tools).normal_text
+                self.assertEqual(normal, text)
                 self.assertEqual(
                     DeepSeekV4Detector().detect_and_parse(text, self.tools).normal_text,
                     text,
                 )
 
     def test_strict_mode_never_falls_back_to_raw_dsml_on_parse_failure(self):
-        with patch.dict(os.environ, {"SGLANG_DSV4_STRICT_TOOL_OUTPUT": "1"}):
-            detector = DeepSeekV4Detector()
-            with patch.object(
-                detector, "_parse_parameters_from_xml", side_effect=RuntimeError("boom")
-            ):
-                with self.assertRaisesRegex(ValueError, "Failed to parse"):
-                    detector.parse_streaming_increment(_weather_call(), self.tools)
+        detector = DeepSeekV4Detector()
+        with patch.object(
+            detector, "_parse_parameters_from_xml", side_effect=RuntimeError("boom")
+        ):
+            with self.assertRaisesRegex(ValueError, "Failed to parse"):
+                detector.parse_streaming_increment(_weather_call(), self.tools)
 
     def test_strict_mode_rejects_invalid_non_string_json_instead_of_coercion(self):
         text = _wrapped(_invoke("get_weather", _param("city", "false", "[1,broken]")))
-        with patch.dict(os.environ, {"SGLANG_DSV4_STRICT_TOOL_OUTPUT": "1"}):
-            with self.assertRaisesRegex(ValueError, "Invalid JSON"):
-                DeepSeekV4Detector().detect_and_parse(text, self.tools)
+        with self.assertRaisesRegex(ValueError, "Invalid JSON"):
+            DeepSeekV4Detector().detect_and_parse(text, self.tools)
 
     def test_strict_mode_keeps_tool_argument_streaming(self):
-        with patch.dict(os.environ, {"SGLANG_DSV4_STRICT_TOOL_OUTPUT": "1"}):
-            detector = DeepSeekV4Detector()
-            start = (
-                f'<{DSML}tool_calls><{DSML}invoke name="get_weather">'
-                f'<{DSML}parameter name="city" string="true">San Fran'
-            )
-            calls = detector.parse_streaming_increment(start, self.tools).calls
-            calls += detector.parse_streaming_increment("cisco", self.tools).calls
-            self.assertIn("San Fran", "".join(c.parameters for c in calls))
-            tail = detector.parse_streaming_increment(
-                f"</{DSML}parameter></{DSML}invoke></{DSML}tool_calls>", self.tools
-            )
-            calls += tail.calls + detector.finish(self.tools).calls
-            self.assertEqual(
-                json.loads("".join(c.parameters for c in calls)),
-                {"city": "San Francisco"},
-            )
+        detector = DeepSeekV4Detector()
+        start = (
+            f'<{DSML}tool_calls><{DSML}invoke name="get_weather">'
+            f'<{DSML}parameter name="city" string="true">San Fran'
+        )
+        calls = detector.parse_streaming_increment(start, self.tools).calls
+        calls += detector.parse_streaming_increment("cisco", self.tools).calls
+        self.assertIn("San Fran", "".join(c.parameters for c in calls))
+        tail = detector.parse_streaming_increment(
+            f"</{DSML}parameter></{DSML}invoke></{DSML}tool_calls>", self.tools
+        )
+        calls += tail.calls + detector.finish(self.tools).calls
+        self.assertEqual(
+            json.loads("".join(c.parameters for c in calls)),
+            {"city": "San Francisco"},
+        )
 
     def test_incomplete_dsml_invocation_is_an_explicit_error(self):
         detector = DeepSeekV4Detector()
@@ -452,13 +438,16 @@ class TestDeepSeekV4Streaming(CustomTestCase):
             [{"city": literal}, {"city": "NY"}],
         )
 
-    def test_public_parser_flush_rejects_orphan_output_in_strict_mode(self):
-        with patch.dict(os.environ, {"SGLANG_DSV4_STRICT_TOOL_OUTPUT": "1"}):
-            parser = FunctionCallParser(self.tools, "deepseekv4")
-            for chunk in ["Working.\n", "</para", "meter>\n"]:
-                self.assertEqual(parser.parse_stream_chunk(chunk), ("", []))
-            with self.assertRaisesRegex(ValueError, "Orphan"):
-                parser.parse_stream_end()
+    def test_public_parser_preserves_literal_control_tag_text(self):
+        parser = FunctionCallParser(self.tools, "deepseekv4")
+        normal = ""
+        for chunk in ["Working.\n", "</para", "meter>\n"]:
+            text, calls = parser.parse_stream_chunk(chunk)
+            normal += text
+            self.assertEqual(calls, [])
+        text, calls = parser.parse_stream_end()
+        self.assertEqual(normal + text, "Working.\n</parameter>\n")
+        self.assertEqual(calls, [])
 
     def test_strict_string_parameter_rejects_malformed_closer_before_dispatch(self):
         bad = f"</{DSML}parameter |"
@@ -482,7 +471,7 @@ class TestDeepSeekV4Streaming(CustomTestCase):
         source = _wrapped(_invoke("exec_command", _param("cmd", "true", command)))
         for width in [1, 2, 7, 31, len(source)]:
             with self.subTest(width=width):
-                detector = DeepSeekV4Detector(strict_output=True)
+                detector = DeepSeekV4Detector()
                 arguments = ""
                 with self.assertRaisesRegex(
                     ValueError, "Malformed DSML parameter terminator"
@@ -497,10 +486,10 @@ class TestDeepSeekV4Streaming(CustomTestCase):
                 with self.assertRaises(json.JSONDecodeError):
                     json.loads(arguments)
         with self.assertRaisesRegex(ValueError, "Malformed DSML parameter terminator"):
-            DeepSeekV4Detector(strict_output=True).detect_and_parse(source, tools)
+            DeepSeekV4Detector().detect_and_parse(source, tools)
         direct_json = _wrapped(_invoke("exec_command", json.dumps({"cmd": command})))
         with self.assertRaisesRegex(ValueError, "Malformed DSML parameter terminator"):
-            DeepSeekV4Detector(strict_output=True).detect_and_parse(direct_json, tools)
+            DeepSeekV4Detector().detect_and_parse(direct_json, tools)
 
     def test_string_parameter_preserves_quoted_heredoc_and_escaped_marker_literals(
         self,
@@ -521,7 +510,7 @@ class TestDeepSeekV4Streaming(CustomTestCase):
             source = _wrapped(_invoke("get_weather", _param("city", "true", value)))
             for width in [1, 3, 13, len(source)]:
                 with self.subTest(value=value, width=width):
-                    detector = DeepSeekV4Detector(strict_output=True)
+                    detector = DeepSeekV4Detector()
                     arguments = ""
                     for start in range(0, len(source), width):
                         result = detector.parse_streaming_increment(
@@ -530,21 +519,17 @@ class TestDeepSeekV4Streaming(CustomTestCase):
                         arguments += "".join(item.parameters for item in result.calls)
                     detector.finish(self.tools)
                     self.assertEqual(json.loads(arguments), {"city": value})
-            parsed = DeepSeekV4Detector(strict_output=True).detect_and_parse(
-                source, self.tools
-            )
+            parsed = DeepSeekV4Detector().detect_and_parse(source, self.tools)
             self.assertEqual(json.loads(parsed.calls[0].parameters), {"city": value})
 
-    def test_new_parameter_guard_does_not_change_non_strict_behavior(self):
+    def test_public_parser_rejects_malformed_parameter_terminators_by_default(self):
         value = f'echo "created"</{DSML}parameter |\nprintf done'
         source = _wrapped(_invoke("get_weather", _param("city", "true", value)))
-        parsed = DeepSeekV4Detector(strict_output=False).detect_and_parse(
-            source, self.tools
-        )
-        self.assertEqual(json.loads(parsed.calls[0].parameters), {"city": value})
+        with self.assertRaisesRegex(ValueError, "Malformed DSML parameter terminator"):
+            FunctionCallParser(self.tools, "deepseekv4").parse_non_stream(source)
 
     def test_strict_direct_json_waits_for_complete_validated_invoke(self):
-        detector = DeepSeekV4Detector(strict_output=True)
+        detector = DeepSeekV4Detector()
         opening = f'<{DSML}tool_calls><{DSML}invoke name="get_weather">'
         calls = detector.parse_streaming_increment(
             opening + '{"city":', self.tools
@@ -569,7 +554,7 @@ class TestDeepSeekV4Streaming(CustomTestCase):
         )
         for width in [1, 2, 7, 31, len(source)]:
             with self.subTest(width=width):
-                detector = DeepSeekV4Detector(strict_output=True)
+                detector = DeepSeekV4Detector()
                 with self.assertRaisesRegex(ValueError, "Malformed DSML parameter"):
                     for start in range(0, len(source), width):
                         detector.parse_streaming_increment(
@@ -577,7 +562,7 @@ class TestDeepSeekV4Streaming(CustomTestCase):
                         )
                     detector.finish(self.tools)
         with self.assertRaisesRegex(ValueError, "Malformed DSML parameter"):
-            DeepSeekV4Detector(strict_output=True).detect_and_parse(source, self.tools)
+            DeepSeekV4Detector().detect_and_parse(source, self.tools)
 
     def test_strict_rejects_unclosed_string_parameter_at_invoke_end(self):
         source = _wrapped(
@@ -586,7 +571,7 @@ class TestDeepSeekV4Streaming(CustomTestCase):
         )
         for width in [1, 2, 7, 31, len(source)]:
             with self.subTest(width=width):
-                detector = DeepSeekV4Detector(strict_output=True)
+                detector = DeepSeekV4Detector()
                 with self.assertRaisesRegex(ValueError, "Incomplete DSML parameter"):
                     for start in range(0, len(source), width):
                         detector.parse_streaming_increment(
@@ -594,10 +579,10 @@ class TestDeepSeekV4Streaming(CustomTestCase):
                         )
                     detector.finish(self.tools)
         with self.assertRaisesRegex(ValueError, "Incomplete DSML parameter"):
-            DeepSeekV4Detector(strict_output=True).detect_and_parse(source, self.tools)
+            DeepSeekV4Detector().detect_and_parse(source, self.tools)
 
     def test_strict_incomplete_later_call_does_not_rewrite_previous_calls(self):
-        detector = DeepSeekV4Detector(strict_output=True)
+        detector = DeepSeekV4Detector()
         calls = detector.parse_streaming_increment(
             _weather_call("SF"), self.tools
         ).calls
@@ -625,7 +610,7 @@ class TestDeepSeekV4Streaming(CustomTestCase):
             source = _wrapped(_invoke("get_weather", body))
             for width in [1, 5, len(source)]:
                 with self.subTest(body=body, width=width):
-                    detector = DeepSeekV4Detector(strict_output=True)
+                    detector = DeepSeekV4Detector()
                     with self.assertRaisesRegex(ValueError, message):
                         for start in range(0, len(source), width):
                             detector.parse_streaming_increment(
@@ -634,7 +619,7 @@ class TestDeepSeekV4Streaming(CustomTestCase):
                         detector.finish(self.tools)
 
     def test_strict_argument_stream_cannot_change_emitted_prefix(self):
-        detector = DeepSeekV4Detector(strict_output=True)
+        detector = DeepSeekV4Detector()
         detector.parse_streaming_increment(
             f'<{DSML}invoke name="get_weather">'
             f'<{DSML}parameter name="city" string="true">San Fran',
@@ -653,7 +638,7 @@ class TestDeepSeekV4Streaming(CustomTestCase):
     def test_strict_completed_arguments_must_be_a_json_object(self):
         for arguments in ['{"city":', "[]", '{"city": NaN}']:
             with self.subTest(arguments=arguments):
-                detector = DeepSeekV4Detector(strict_output=True)
+                detector = DeepSeekV4Detector()
                 with patch.object(
                     detector, "_parse_parameters_from_xml", return_value=arguments
                 ):
@@ -670,23 +655,19 @@ class TestDeepSeekV4Streaming(CustomTestCase):
             with self.subTest(arguments=arguments):
                 source = _wrapped(_invoke("get_weather", arguments))
                 with self.assertRaisesRegex(ValueError, "Duplicate|Invalid DSML JSON"):
-                    DeepSeekV4Detector(strict_output=True).detect_and_parse(
-                        source, self.tools
-                    )
+                    DeepSeekV4Detector().detect_and_parse(source, self.tools)
 
-    def test_non_strict_duplicate_parameters_retain_legacy_behavior(self):
+    def test_public_parser_rejects_duplicate_parameters_by_default(self):
         source = _wrapped(
             _invoke(
                 "get_weather",
                 _param("city", "true", "SF") + _param("city", "true", "NY"),
             )
         )
-        parsed = DeepSeekV4Detector(strict_output=False).detect_and_parse(
-            source, self.tools
-        )
-        self.assertEqual(json.loads(parsed.calls[0].parameters), {"city": "NY"})
+        with self.assertRaisesRegex(ValueError, "Duplicate DSML parameter"):
+            FunctionCallParser(self.tools, "deepseekv4").parse_non_stream(source)
 
-    def test_optional_schema_validation_rejects_missing_unknown_and_wrong_types(self):
+    def test_schema_validation_rejects_missing_unknown_and_wrong_types(self):
         self.tools[0].function.parameters["additionalProperties"] = False
         for arguments, constraint in [
             ({}, "required"),
@@ -703,9 +684,7 @@ class TestDeepSeekV4Streaming(CustomTestCase):
                 source = _wrapped(_invoke("get_weather", body))
                 for width in [1, 7, len(source)]:
                     with self.subTest(arguments=arguments, width=width, body=body):
-                        detector = DeepSeekV4Detector(
-                            strict_output=True, validate_tool_schema=True
-                        )
+                        detector = DeepSeekV4Detector()
                         with self.assertRaisesRegex(ValueError, constraint):
                             for start in range(0, len(source), width):
                                 detector.parse_streaming_increment(
@@ -713,16 +692,14 @@ class TestDeepSeekV4Streaming(CustomTestCase):
                                 )
                             detector.finish(self.tools)
                 with self.assertRaisesRegex(ValueError, constraint):
-                    DeepSeekV4Detector(
-                        strict_output=True, validate_tool_schema=True
-                    ).detect_and_parse(source, self.tools)
+                    DeepSeekV4Detector().detect_and_parse(source, self.tools)
 
-    def test_optional_schema_validation_keeps_valid_arguments_unchanged(self):
+    def test_schema_validation_keeps_valid_arguments_unchanged(self):
         for source in [
             _weather_call("SF"),
             _wrapped(_invoke("get_weather", '{"city": "SF"}')),
         ]:
-            detector = DeepSeekV4Detector(strict_output=True, validate_tool_schema=True)
+            detector = DeepSeekV4Detector()
             arguments = ""
             for character in source:
                 result = detector.parse_streaming_increment(character, self.tools)
@@ -731,23 +708,19 @@ class TestDeepSeekV4Streaming(CustomTestCase):
             self.assertEqual(json.loads(arguments), {"city": "SF"})
             self.assertEqual(len(detector._schema_validators), 1)
 
-    def test_optional_schema_validation_supports_local_references(self):
+    def test_schema_validation_supports_local_references(self):
         self.tools[0].function.parameters = {
             "type": "object",
             "properties": {"city": {"$ref": "#/$defs/city"}},
             "$defs": {"city": {"type": "string", "enum": ["SF"]}},
             "required": ["city"],
         }
-        parsed = DeepSeekV4Detector(
-            strict_output=True, validate_tool_schema=True
-        ).detect_and_parse(_weather_call("SF"), self.tools)
+        parsed = DeepSeekV4Detector().detect_and_parse(_weather_call("SF"), self.tools)
         self.assertEqual(json.loads(parsed.calls[0].parameters), {"city": "SF"})
         with self.assertRaisesRegex(ValueError, "enum"):
-            DeepSeekV4Detector(
-                strict_output=True, validate_tool_schema=True
-            ).detect_and_parse(_weather_call("NY"), self.tools)
+            DeepSeekV4Detector().detect_and_parse(_weather_call("NY"), self.tools)
 
-    def test_optional_schema_validation_never_fetches_remote_references(self):
+    def test_schema_validation_never_fetches_remote_references(self):
         self.tools[0].function.parameters["properties"]["city"] = {
             "$ref": "https://example.invalid/city.json"
         }
@@ -755,79 +728,50 @@ class TestDeepSeekV4Streaming(CustomTestCase):
             "urllib.request.urlopen", side_effect=AssertionError("network forbidden")
         ):
             with self.assertRaisesRegex(ValueError, "external retrieval is disabled"):
-                DeepSeekV4Detector(
-                    strict_output=True, validate_tool_schema=True
-                ).detect_and_parse(_weather_call(), self.tools)
+                DeepSeekV4Detector().detect_and_parse(_weather_call(), self.tools)
 
-    def test_optional_schema_validation_reuses_normalization_without_mutation(self):
+    def test_schema_validation_reuses_normalization_without_mutation(self):
         schema = self.tools[0].function.parameters
         schema["properties"]["city"]["type"] = "varchar"
-        parsed = DeepSeekV4Detector(
-            strict_output=True, validate_tool_schema=True
-        ).detect_and_parse(_weather_call(), self.tools)
+        parsed = DeepSeekV4Detector().detect_and_parse(_weather_call(), self.tools)
         self.assertEqual(json.loads(parsed.calls[0].parameters), {"city": "SF"})
         self.assertEqual(schema["properties"]["city"]["type"], "varchar")
 
-    def test_optional_schema_validation_preserves_unknown_tool_forwarding_policy(self):
+    def test_schema_validation_preserves_unknown_tool_forwarding_policy(self):
         source = _wrapped(_invoke("unknown_tool", "{}"))
         with patch.dict(os.environ, {"SGLANG_FORWARD_UNKNOWN_TOOLS": "0"}):
             with self.assertRaisesRegex(ValueError, "Undefined DSML tool"):
-                DeepSeekV4Detector(
-                    strict_output=True, validate_tool_schema=True
-                ).detect_and_parse(source, self.tools)
+                DeepSeekV4Detector().detect_and_parse(source, self.tools)
         with patch.dict(os.environ, {"SGLANG_FORWARD_UNKNOWN_TOOLS": "1"}):
-            parsed = DeepSeekV4Detector(
-                strict_output=True, validate_tool_schema=True
-            ).detect_and_parse(source, self.tools)
+            parsed = DeepSeekV4Detector().detect_and_parse(source, self.tools)
             self.assertEqual(parsed.calls[0].name, "unknown_tool")
 
-    def test_optional_schema_validation_is_off_by_default_and_requires_strict(self):
+    def test_schema_validation_is_enabled_in_the_public_parser(self):
         source = _wrapped(_invoke("get_weather", "{}"))
-        parsed = DeepSeekV4Detector(
-            strict_output=True, validate_tool_schema=False
-        ).detect_and_parse(source, self.tools)
-        self.assertEqual(json.loads(parsed.calls[0].parameters), {})
-        with self.assertRaisesRegex(ValueError, "requires strict"):
-            DeepSeekV4Detector(strict_output=False, validate_tool_schema=True)
-        with patch.dict(
-            os.environ,
-            {
-                "SGLANG_DSV4_STRICT_TOOL_OUTPUT": "1",
-                "SGLANG_DSV4_VALIDATE_TOOL_SCHEMA": "1",
-            },
-        ):
-            with self.assertRaisesRegex(ValueError, "required"):
-                FunctionCallParser(self.tools, "deepseekv4").parse_non_stream(source)
+        with self.assertRaisesRegex(ValueError, "required"):
+            FunctionCallParser(self.tools, "deepseekv4").parse_non_stream(source)
 
-    def test_opt_in_marker_policy_rejects_quoted_document_payload_without_rewriting(
+    def test_protocol_literals_in_document_payload_are_preserved(
         self,
     ):
         value = 'python3 <<\'PY\'\ntext = """Notes.</think>"""\nprint(text)\nPY'
         source = _weather_call(value)
         for width in [1, 2, 7, len(source)]:
             with self.subTest(width=width):
-                detector = DeepSeekV4Detector(
-                    strict_output=True, reject_reasoning_markers=True
-                )
+                detector = DeepSeekV4Detector()
                 arguments = ""
-                with self.assertRaisesRegex(ValueError, "Reasoning marker"):
-                    for start in range(0, len(source), width):
-                        result = detector.parse_streaming_increment(
-                            source[start : start + width], self.tools
-                        )
-                        arguments += "".join(call.parameters for call in result.calls)
-                    detector.finish(self.tools)
-                self.assertNotIn("</think>", arguments)
-        with self.assertRaisesRegex(ValueError, "Reasoning marker"):
-            DeepSeekV4Detector(
-                strict_output=True, reject_reasoning_markers=True
-            ).detect_and_parse(source, self.tools)
-        parsed = DeepSeekV4Detector(
-            strict_output=True, reject_reasoning_markers=False
-        ).detect_and_parse(source, self.tools)
+                for start in range(0, len(source), width):
+                    result = detector.parse_streaming_increment(
+                        source[start : start + width], self.tools
+                    )
+                    arguments += "".join(call.parameters for call in result.calls)
+                detector.finish(self.tools)
+                self.assertEqual(json.loads(arguments), {"city": value})
+        parsed = DeepSeekV4Detector().detect_and_parse(source, self.tools)
         self.assertEqual(json.loads(parsed.calls[0].parameters), {"city": value})
 
-    def test_opt_in_marker_policy_checks_nested_values_and_keys(self):
+    def test_protocol_literals_in_nested_values_and_keys_are_preserved(self):
+        self.tools[0].function.parameters["properties"]["city"] = {}
         for arguments in [
             {"city": "literal <think> text"},
             {"city": [{"notes": "literal </think> text"}]},
@@ -838,20 +782,14 @@ class TestDeepSeekV4Streaming(CustomTestCase):
                 _param("city", "false", json.dumps(arguments["city"])),
             ]:
                 with self.subTest(arguments=arguments, body=body):
-                    with self.assertRaisesRegex(ValueError, "Reasoning marker"):
-                        DeepSeekV4Detector(
-                            strict_output=True, reject_reasoning_markers=True
-                        ).detect_and_parse(
-                            _wrapped(_invoke("get_weather", body)), self.tools
-                        )
+                    parsed = DeepSeekV4Detector().detect_and_parse(
+                        _wrapped(_invoke("get_weather", body)), self.tools
+                    )
+                    self.assertEqual(json.loads(parsed.calls[0].parameters), arguments)
 
-    def test_opt_in_marker_policy_preserves_clean_arguments(self):
+    def test_default_validation_preserves_clean_arguments(self):
         source = _weather_call("San Francisco")
-        detector = DeepSeekV4Detector(
-            strict_output=True,
-            validate_tool_schema=True,
-            reject_reasoning_markers=True,
-        )
+        detector = DeepSeekV4Detector()
         arguments = ""
         for character in source:
             result = detector.parse_streaming_increment(character, self.tools)
@@ -859,57 +797,45 @@ class TestDeepSeekV4Streaming(CustomTestCase):
         detector.finish(self.tools)
         self.assertEqual(json.loads(arguments), {"city": "San Francisco"})
 
-    def test_opt_in_marker_policy_does_not_filter_ordinary_text(self):
+    def test_protocol_literals_in_ordinary_text_are_preserved(self):
         text = "Literal `<think>` and `</think>` in an explanation."
-        result = DeepSeekV4Detector(
-            strict_output=True, reject_reasoning_markers=True
-        ).detect_and_parse(text, self.tools)
+        result = DeepSeekV4Detector().detect_and_parse(text, self.tools)
         self.assertEqual(result.normal_text, text)
         self.assertEqual(result.calls, [])
 
-    def test_opt_in_marker_policy_requires_strict_mode_and_wires_public_parser(self):
-        with self.assertRaisesRegex(ValueError, "requires strict"):
-            DeepSeekV4Detector(strict_output=False, reject_reasoning_markers=True)
-        with patch.dict(
-            os.environ,
-            {
-                "SGLANG_DSV4_STRICT_TOOL_OUTPUT": "1",
-                "SGLANG_DSV4_REJECT_REASONING_MARKERS_IN_TOOL_ARGS": "1",
-            },
-        ):
-            with self.assertRaisesRegex(ValueError, "Reasoning marker"):
-                FunctionCallParser(self.tools, "deepseekv4").parse_non_stream(
-                    _weather_call("quoted '</think>'")
-                )
+    def test_public_parser_preserves_protocol_literals_in_arguments(self):
+        _, calls = FunctionCallParser(self.tools, "deepseekv4").parse_non_stream(
+            _weather_call("quoted '</think>'")
+        )
+        self.assertEqual(json.loads(calls[0].parameters), {"city": "quoted '</think>'"})
 
-    def test_protocol_gate_rejects_normal_markers_before_content_is_released(self):
+    def test_ordinary_protocol_literals_stream_without_rewriting(self):
         for text in [
             "ordinary explanation</think>",
-            "Quoted `</think>` stays a literal, but this policy forbids it.",
+            "Quoted `</think>` stays a literal.",
             f"Quoted `<{DSML}tool_calls>` example.",
             "</parameter>",
             "Example: |DSML|invoke",
         ]:
             for width in [1, 7, len(text)]:
                 with self.subTest(text=text, width=width):
-                    detector = DeepSeekV4Detector(
-                        strict_output=True, reject_protocol_markers=True
-                    )
+                    detector = DeepSeekV4Detector()
                     normal = ""
-                    with self.assertRaisesRegex(ValueError, "Protocol marker"):
-                        for start in range(0, len(text), width):
-                            result = detector.parse_streaming_increment(
-                                text[start : start + width], self.tools
-                            )
-                            normal += result.normal_text
-                        normal += detector.finish(self.tools).normal_text
-                    self.assertEqual(normal, "")
-            with self.assertRaisesRegex(ValueError, "Protocol marker"):
-                DeepSeekV4Detector(
-                    strict_output=True, reject_protocol_markers=True
-                ).detect_and_parse(text, self.tools)
+                    for start in range(0, len(text), width):
+                        result = detector.parse_streaming_increment(
+                            text[start : start + width], self.tools
+                        )
+                        normal += result.normal_text
+                        self.assertEqual(result.calls, [])
+                    normal += detector.finish(self.tools).normal_text
+                    self.assertEqual(normal, text)
+            self.assertEqual(
+                DeepSeekV4Detector().detect_and_parse(text, self.tools).normal_text,
+                text,
+            )
 
-    def test_protocol_gate_rejects_argument_markers_including_quoted_literals(self):
+    def test_protocol_literals_are_preserved_in_xml_and_json_arguments(self):
+        self.tools[0].function.parameters["properties"]["city"] = {}
         for marker in ["</think>", f"<{DSML}tool_calls>", "|DSML|", "</invoke>"]:
             value = f'print("literal {marker}")'
             sources = [
@@ -922,39 +848,32 @@ class TestDeepSeekV4Streaming(CustomTestCase):
             for source in sources:
                 for width in [1, 7, len(source)]:
                     with self.subTest(marker=marker, width=width, source=source):
-                        detector = DeepSeekV4Detector(
-                            strict_output=True, reject_protocol_markers=True
-                        )
+                        detector = DeepSeekV4Detector()
                         arguments = ""
-                        with self.assertRaisesRegex(ValueError, "Protocol marker"):
-                            for start in range(0, len(source), width):
-                                result = detector.parse_streaming_increment(
-                                    source[start : start + width], self.tools
-                                )
-                                arguments += "".join(c.parameters for c in result.calls)
-                            detector.finish(self.tools)
-                        self.assertNotIn(marker, arguments)
+                        for start in range(0, len(source), width):
+                            result = detector.parse_streaming_increment(
+                                source[start : start + width], self.tools
+                            )
+                            arguments += "".join(c.parameters for c in result.calls)
+                        detector.finish(self.tools)
+                        expected = [value] if source == sources[-1] else value
+                        self.assertEqual(json.loads(arguments), {"city": expected})
 
-    def test_protocol_gate_rejects_marker_in_tool_name_or_json_key(self):
-        for source in [
-            _wrapped(_invoke("run</think>", "{}")),
-            _wrapped(_invoke("get_weather", '{"</think>": "SF"}')),
-        ]:
-            with self.subTest(source=source), self.assertRaisesRegex(
-                ValueError, "Protocol marker"
-            ):
-                DeepSeekV4Detector(
-                    strict_output=True, reject_protocol_markers=True
-                ).detect_and_parse(source, self.tools)
+    def test_unknown_tool_names_fail_schema_lookup_not_marker_matching(self):
+        source = _wrapped(_invoke("run</think>", "{}"))
+        with self.assertRaisesRegex(ValueError, "Undefined DSML tool"):
+            DeepSeekV4Detector().detect_and_parse(source, self.tools)
 
-    def test_protocol_gate_preserves_clean_content_arguments_and_native_framing(self):
+    def test_literal_protocol_markers_are_valid_json_keys(self):
+        arguments = {"city": "SF", "</think>": "literal", "｜DSML｜": "example"}
+        source = _wrapped(_invoke("get_weather", json.dumps(arguments)))
+        parsed = DeepSeekV4Detector().detect_and_parse(source, self.tools)
+        self.assertEqual(json.loads(parsed.calls[0].parameters), arguments)
+
+    def test_default_validation_preserves_clean_content_and_native_framing(self):
         source = "Checking.\n" + _weather_call("SF")
         for width in [1, 7, len(source)]:
-            detector = DeepSeekV4Detector(
-                strict_output=True,
-                validate_tool_schema=True,
-                reject_protocol_markers=True,
-            )
+            detector = DeepSeekV4Detector()
             normal, arguments = "", ""
             for start in range(0, len(source), width):
                 parsed = detector.parse_streaming_increment(
@@ -966,25 +885,16 @@ class TestDeepSeekV4Streaming(CustomTestCase):
             self.assertEqual(normal.strip(), "Checking.")
             self.assertEqual(json.loads(arguments), {"city": "SF"})
 
-    def test_protocol_gate_is_optional_and_never_silently_rewrites_literals(self):
+    def test_public_parser_keeps_native_tag_examples_in_arguments(self):
         literal = f'print("<{DSML}tool_calls>")'
-        parsed = DeepSeekV4Detector(
-            strict_output=True, reject_protocol_markers=False
-        ).detect_and_parse(_weather_call(literal), self.tools)
+        parsed = DeepSeekV4Detector().detect_and_parse(
+            _weather_call(literal), self.tools
+        )
         self.assertEqual(json.loads(parsed.calls[0].parameters), {"city": literal})
-        with self.assertRaisesRegex(ValueError, "requires strict"):
-            DeepSeekV4Detector(strict_output=False, reject_protocol_markers=True)
-        with patch.dict(
-            os.environ,
-            {
-                "SGLANG_DSV4_STRICT_TOOL_OUTPUT": "1",
-                "SGLANG_DSV4_REJECT_PROTOCOL_MARKERS": "1",
-            },
-        ):
-            with self.assertRaisesRegex(ValueError, "Protocol marker"):
-                FunctionCallParser(self.tools, "deepseekv4").parse_non_stream(
-                    _weather_call(literal)
-                )
+        _, calls = FunctionCallParser(self.tools, "deepseekv4").parse_non_stream(
+            _weather_call(literal)
+        )
+        self.assertEqual(json.loads(calls[0].parameters), {"city": literal})
 
 
 if __name__ == "__main__":

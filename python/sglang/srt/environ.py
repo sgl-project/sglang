@@ -1454,14 +1454,6 @@ class Envs:
     SGLANG_DSV4_FP4_DEQUANT = EnvBool(False)
     # Flash-0731 also accepts "low"; the active profile is checkpoint-resolved.
     SGLANG_DSV4_REASONING_EFFORT = EnvStr("")
-    # Buffer ordinary tool-parser output and reject malformed control fragments.
-    SGLANG_DSV4_STRICT_TOOL_OUTPUT = EnvBool(False)
-    # Optional output-schema enforcement; requires strict output and never coerces data.
-    SGLANG_DSV4_VALIDATE_TOOL_SCHEMA = EnvBool(False)
-    # Opt-in literal-marker rejection, not rewriting of quoted code or documents.
-    SGLANG_DSV4_REJECT_REASONING_MARKERS_IN_TOOL_ARGS = EnvBool(False)
-    # Opt-in lexical gate, including quoted examples, for tool-parser output.
-    SGLANG_DSV4_REJECT_PROTOCOL_MARKERS = EnvBool(False)
     # Raw model output may be sensitive; a directory alone does not enable logging.
     SGLANG_ENABLE_MODEL_OUTPUT_LOGGING = EnvBool(False)
     SGLANG_MODEL_OUTPUT_TRACE_DIR = EnvStr("")

@@ -2,7 +2,6 @@ import json
 import logging
 import re
 from copy import deepcopy
-from html.parser import HTMLParser
 
 from jsonschema import Draft202012Validator, SchemaError
 from referencing import Registry
@@ -16,17 +15,6 @@ from sglang.srt.function_call.deepseekv32_detector import DeepSeekV32Detector
 from sglang.srt.function_call.utils import normalize_json_schema_types
 
 logger = logging.getLogger(__name__)
-
-_PROTOCOL_MARKERS = (
-    "<think>",
-    "</think>",
-    "｜DSML｜",
-    "|DSML|",
-    "</parameter>",
-    "</invoke>",
-    "</tool_calls>",
-    "</function_calls>",
-)
 
 
 def _unique_json_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
@@ -79,32 +67,6 @@ def _validate_string_parameter(name: str, value: str, *, complete: bool) -> None
         )
 
 
-class _BareControlValidator(HTMLParser):
-    def __init__(self, text: str) -> None:
-        super().__init__()
-        self.lines = text.splitlines()
-        self.depth = {
-            tag: 0 for tag in ("parameter", "invoke", "tool_calls", "function_calls")
-        }
-
-    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
-        if tag in self.depth:
-            self.depth[tag] += 1
-
-    def handle_endtag(self, tag: str) -> None:
-        if tag not in self.depth:
-            return
-        if self.depth[tag]:
-            self.depth[tag] -= 1
-            return
-        line, _ = self.getpos()
-        if re.fullmatch(
-            r"(?:</?(?:parameter|invoke|tool_calls|function_calls)\b[^<>]*>\s*)+",
-            self.lines[line - 1].strip(),
-        ):
-            raise ValueError(f"Orphan DeepSeek V4 protocol ending: </{tag}>")
-
-
 class DeepSeekV4Detector(DeepSeekV32Detector):
     """
     Detector for DeepSeek V4 model function call format.
@@ -154,76 +116,25 @@ class DeepSeekV4Detector(DeepSeekV32Detector):
     - Parameters: Either XML tags or direct JSON format
     - Supports multiple tool calls
 
-    Strict output validates protocol structure without rewriting arguments.
-    Optional SGLANG_DSV4_VALIDATE_TOOL_SCHEMA=1 additionally rejects completed
-    calls that violate the provided tool schema. It requires strict output,
-    is disabled by default, and resolves only local schema references.
-    A rejected generation is not repaired into a guessed tool invocation.
-    SGLANG_DSV4_REJECT_REASONING_MARKERS_IN_TOOL_ARGS=1 optionally rejects
-    literal <think> / </think> text anywhere in parsed arguments, including
-    quoted code and document strings. It requires strict output and defaults
-    off so legitimate protocol examples remain usable. It does not inspect
-    artifacts produced by executing a command, and never edits argument text.
-    SGLANG_DSV4_REJECT_PROTOCOL_MARKERS=1 adds a lexical gate for think/DSML
-    markers and bare protocol closers in normal tool-parser content and tool
-    names/arguments. This strict-only, default-off policy also rejects quoted
-    protocol examples rather than silently deleting or rewriting their bytes.
-    This gate does not inspect the separate reasoning channel. With the same
-    flag enabled, the reasoning parser only removes unpaired bare control
-    closers on trailing lines at an explicit </think> boundary. It preserves
-    inline examples, quoted or balanced XML, truncated reasoning at EOF, and
-    tool interruptions. It therefore does not guarantee marker-free reasoning.
+    Protocol structure, completed JSON arguments, and the provided tool schema
+    are validated by default. Validation neither coerces values nor supplies
+    missing fields, and schema references are resolved locally only.
+    Malformed calls fail explicitly instead of falling back to assistant text.
+    Protocol-like literals in ordinary content and valid arguments are not
+    subject to a blanket marker-content filter. Confirmed reasoning-boundary
+    normalization is handled separately by the reasoning parser; arbitrary
+    reasoning text is not rewritten.
 
     Reference: DeepSeek V4 format specification
     """
 
-    def __init__(
-        self,
-        strict_output: bool | None = None,
-        *,
-        validate_tool_schema: bool | None = None,
-        reject_reasoning_markers: bool | None = None,
-        reject_protocol_markers: bool | None = None,
-    ):
+    def __init__(self):
         super().__init__()
         self.bot_token = "<｜DSML｜tool_calls>"
         self.eot_token = "</｜DSML｜tool_calls>"
         self.function_calls_regex = r"<｜DSML｜tool_calls>(.*?)</｜DSML｜tool_calls>"
-        self.strict_output = (
-            envs.SGLANG_DSV4_STRICT_TOOL_OUTPUT.get()
-            if strict_output is None
-            else strict_output
-        )
-        self.validate_tool_schema = (
-            envs.SGLANG_DSV4_VALIDATE_TOOL_SCHEMA.get()
-            if validate_tool_schema is None
-            else validate_tool_schema
-        )
-        if self.validate_tool_schema and not self.strict_output:
-            raise ValueError(
-                "DeepSeek V4 tool schema validation requires strict output"
-            )
-        self.reject_reasoning_markers = (
-            envs.SGLANG_DSV4_REJECT_REASONING_MARKERS_IN_TOOL_ARGS.get()
-            if reject_reasoning_markers is None
-            else reject_reasoning_markers
-        )
-        if self.reject_reasoning_markers and not self.strict_output:
-            raise ValueError(
-                "DeepSeek V4 argument marker rejection requires strict output"
-            )
-        self.reject_protocol_markers = (
-            envs.SGLANG_DSV4_REJECT_PROTOCOL_MARKERS.get()
-            if reject_protocol_markers is None
-            else reject_protocol_markers
-        )
-        if self.reject_protocol_markers and not self.strict_output:
-            raise ValueError(
-                "DeepSeek V4 protocol marker rejection requires strict output"
-            )
         self._schema_validators: dict[str, Draft202012Validator] = {}
         self._quote_history: list[str] = []
-        self._normal_chunks: list[str] = []
         self._active_invoke_start = 0
 
     def _find_invoke(self, text: str) -> re.Match | None:
@@ -250,50 +161,45 @@ class DeepSeekV4Detector(DeepSeekV32Detector):
         return text[:start].removesuffix("\n\n")
 
     def _raise_parse_error(self, error: Exception) -> None:
-        if self.strict_output:
-            raise ValueError(
-                f"Failed to parse DeepSeek V4 tool output: {error}"
-            ) from error
+        raise ValueError(f"Failed to parse DeepSeek V4 tool output: {error}") from error
 
     def _parse_parameters_from_xml(
         self, invoke_content: str, allow_partial: bool = False
     ) -> str:
-        if self.strict_output:
-            if invoke_content.lstrip().startswith("{"):
-                # Keep direct-JSON arguments private until their strings can be
-                # validated; do not repair or reserialize partial JSON.
-                if allow_partial:
-                    return ""
-                parameters = _strict_json_loads(invoke_content)
-                for name, value in parameters.items():
-                    if isinstance(value, str):
-                        _validate_string_parameter(name, value, complete=True)
-                self._check_argument_markers("arguments", parameters)
-                return super()._parse_parameters_from_xml(invoke_content, False)
-            last_match_end = 0
-            names: set[str] = set()
-            for match in re.finditer(self.parameter_regex, invoke_content, re.DOTALL):
-                if invoke_content[last_match_end : match.start()].strip():
-                    raise ValueError("Malformed DSML parameter boundary")
-                last_match_end = match.end()
-                self._validate_xml_parameter(match, names, complete=True)
-            remaining = invoke_content[last_match_end:]
+        if invoke_content.lstrip().startswith("{"):
+            # Keep direct-JSON arguments private until their strings can be
+            # validated; do not repair or reserialize partial JSON.
             if allow_partial:
-                partial = re.search(self.partial_parameter_regex, remaining, re.DOTALL)
-                if partial:
-                    if remaining[: partial.start()].strip():
-                        raise ValueError("Malformed DSML parameter boundary")
-                    self._validate_xml_parameter(partial, names, complete=False)
-                elif tail := remaining.lstrip():
-                    parameter_start = "<｜DSML｜parameter"
-                    if not (
-                        parameter_start.startswith(tail)
-                        or tail.startswith(parameter_start)
-                        or self.invoke_end_token.startswith(tail)
-                    ):
-                        raise ValueError("Malformed DSML parameter boundary")
-            elif remaining.strip():
-                raise ValueError("Incomplete DSML parameter at end of invoke")
+                return ""
+            parameters = _strict_json_loads(invoke_content)
+            for name, value in parameters.items():
+                if isinstance(value, str):
+                    _validate_string_parameter(name, value, complete=True)
+            return super()._parse_parameters_from_xml(invoke_content, False)
+        last_match_end = 0
+        names: set[str] = set()
+        for match in re.finditer(self.parameter_regex, invoke_content, re.DOTALL):
+            if invoke_content[last_match_end : match.start()].strip():
+                raise ValueError("Malformed DSML parameter boundary")
+            last_match_end = match.end()
+            self._validate_xml_parameter(match, names, complete=True)
+        remaining = invoke_content[last_match_end:]
+        if allow_partial:
+            partial = re.search(self.partial_parameter_regex, remaining, re.DOTALL)
+            if partial:
+                if remaining[: partial.start()].strip():
+                    raise ValueError("Malformed DSML parameter boundary")
+                self._validate_xml_parameter(partial, names, complete=False)
+            elif tail := remaining.lstrip():
+                parameter_start = "<｜DSML｜parameter"
+                if not (
+                    parameter_start.startswith(tail)
+                    or tail.startswith(parameter_start)
+                    or self.invoke_end_token.startswith(tail)
+                ):
+                    raise ValueError("Malformed DSML parameter boundary")
+        elif remaining.strip():
+            raise ValueError("Incomplete DSML parameter at end of invoke")
         return super()._parse_parameters_from_xml(invoke_content, allow_partial)
 
     def _validate_xml_parameter(
@@ -303,54 +209,17 @@ class DeepSeekV4Detector(DeepSeekV32Detector):
         if name in names:
             raise ValueError(f"Duplicate DSML parameter {name!r}")
         names.add(name)
-        self._check_argument_markers(name, name)
         if string_flag not in {"true", "false"}:
             raise ValueError(f"Invalid DSML string flag for parameter {name!r}")
         if string_flag == "true":
             _validate_string_parameter(name, value, complete=complete)
-            checked_value = value
-            if not complete:
-                # A split native parameter closer is framing, not argument text.
-                closing = "</｜DSML｜parameter>"
-                for width in range(min(len(value), len(closing) - 1), 0, -1):
-                    if closing.startswith(value[-width:]):
-                        checked_value = value[:-width]
-                        break
-            self._check_argument_markers(name, checked_value)
         elif complete:
             try:
-                parsed = _strict_json_loads(value.strip())
+                _strict_json_loads(value.strip())
             except ValueError as error:
                 raise ValueError(
                     f"Invalid JSON in DSML non-string parameter {name!r}"
                 ) from error
-            self._check_argument_markers(name, parsed)
-
-    def _check_argument_markers(self, name: str, value: object) -> None:
-        if not (self.reject_reasoning_markers or self.reject_protocol_markers):
-            return
-        pending = [value]
-        while pending:
-            item = pending.pop()
-            if isinstance(item, str):
-                self._check_protocol_text(item, "tool argument")
-                if self.reject_reasoning_markers and (
-                    "<think>" in item or "</think>" in item
-                ):
-                    raise ValueError(
-                        f"Reasoning marker in DeepSeek V4 tool argument {name!r}"
-                    )
-            elif isinstance(item, dict):
-                pending.extend(item.keys())
-                pending.extend(item.values())
-            elif isinstance(item, list):
-                pending.extend(item)
-
-    def _check_protocol_text(self, text: str, field: str) -> None:
-        if self.reject_protocol_markers and any(
-            marker in text for marker in _PROTOCOL_MARKERS
-        ):
-            raise ValueError(f"Protocol marker in DeepSeek V4 {field}")
 
     def _validate_arguments(
         self,
@@ -360,9 +229,6 @@ class DeepSeekV4Detector(DeepSeekV32Detector):
         *,
         complete: bool,
     ) -> None:
-        if not self.strict_output:
-            return
-        self._check_protocol_text(name, "tool name")
         sent = self.streamed_args_for_tool[self.current_tool_id]
         if not arguments.startswith(sent):
             raise ValueError(f"Non-monotonic DSML argument stream for tool {name!r}")
@@ -375,9 +241,7 @@ class DeepSeekV4Detector(DeepSeekV32Detector):
                 ) from error
             if not isinstance(parameters, dict):
                 raise ValueError(f"DSML arguments for tool {name!r} must be an object")
-            self._check_argument_markers(name, parameters)
-            if self.validate_tool_schema:
-                self._validate_against_tool_schema(name, parameters, tools)
+            self._validate_against_tool_schema(name, parameters, tools)
 
     def _validate_against_tool_schema(
         self, name: str, parameters: dict, tools: list[Tool]
@@ -427,9 +291,6 @@ class DeepSeekV4Detector(DeepSeekV32Detector):
             self._quote_history.clear()
         elif result.normal_text:
             self._quote_history.append(result.normal_text)
-        if self.strict_output and result.normal_text:
-            self._normal_chunks.append(result.normal_text)
-            result.normal_text = ""
         return result
 
     def finish(self, tools: list[Tool]) -> StreamingParseResult:
@@ -446,35 +307,12 @@ class DeepSeekV4Detector(DeepSeekV32Detector):
         masked = _mask_literals(history + remaining)[len(history) :]
         if re.search(r"</?｜DSML｜", masked):
             raise ValueError("Incomplete or malformed DSML tool block at end of stream")
-        if self.strict_output:
-            normal = "".join(self._normal_chunks) + remaining
-            self._check_protocol_text(normal, "normal content")
-            masked = _mask_literals(normal)
-            if re.search(
-                r"</(?:parameter|invoke|tool_calls|function_calls)>", masked
-            ) and not re.fullmatch(
-                r"\s*</(?:parameter|invoke|tool_calls|function_calls)>\s*", masked
-            ):
-                validator = _BareControlValidator(masked)
-                try:
-                    validator.feed(masked)
-                    validator.close()
-                except AssertionError as error:
-                    raise ValueError("Invalid markup in DeepSeek V4 output") from error
-            self._normal_chunks.clear()
-        else:
-            normal = remaining
         self._buffer = ""
         self._quote_history.clear()
-        return StreamingParseResult(normal_text=normal)
+        return StreamingParseResult(normal_text=remaining)
 
     def detect_and_parse(self, text: str, tools: list[Tool]) -> StreamingParseResult:
-        detector = type(self)(
-            strict_output=self.strict_output,
-            validate_tool_schema=self.validate_tool_schema,
-            reject_reasoning_markers=self.reject_reasoning_markers,
-            reject_protocol_markers=self.reject_protocol_markers,
-        )
+        detector = type(self)()
         parsed = detector.parse_streaming_increment(text, tools)
         tail = detector.finish(tools)
         accumulated: dict[int, ToolCallItem] = {}

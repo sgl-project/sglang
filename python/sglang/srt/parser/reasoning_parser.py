@@ -11,7 +11,6 @@ from sglang.srt.entrypoints.openai.encoding_dsv4 import (
     thinking_start_token as dsv4_thinking_start_token,
 )
 from sglang.srt.entrypoints.openai.protocol import ChatCompletionRequest
-from sglang.srt.environ import envs
 from sglang.srt.function_call.deepseekv4_format import (
     mask_literals as mask_dsv4_literals,
 )
@@ -1546,24 +1545,18 @@ class DeepSeekV4Detector(BaseReasoningFormatDetector):
             reasoning_default="explicit_thinking",
             force_nonempty_content=force_nonempty_content,
         )
-        self._strict_tool_boundary = (
-            tool_call_parser_active
-            and envs.SGLANG_DSV4_STRICT_TOOL_OUTPUT.get()
-            and not continue_final_message
+        self._tool_boundary_enabled = (
+            tool_call_parser_active and not continue_final_message
         )
         self._content_pending = ""
         self._reasoning_finished = False
         self._tool_payload_started = False
-        self._repair_reasoning_boundary = (
-            self._strict_tool_boundary
-            and envs.SGLANG_DSV4_REJECT_PROTOCOL_MARKERS.get()
-        )
         self._reasoning_suffix = ""
         self._reasoning_history: list[str] = []
         self._reasoning_at_line_start = True
 
     def _filter_reasoning_boundary(self, text: str) -> str:
-        if not self._repair_reasoning_boundary:
+        if not self._tool_boundary_enabled:
             return text
         if text:
             self._reasoning_history.append(text)
@@ -1618,7 +1611,7 @@ class DeepSeekV4Detector(BaseReasoningFormatDetector):
         return normal
 
     def _parse_streaming_increment_impl(self, new_text: str) -> StreamingParseResult:
-        if not self._strict_tool_boundary:
+        if not self._tool_boundary_enabled:
             return super()._parse_streaming_increment_impl(new_text)
         if self._reasoning_finished:
             return StreamingParseResult(normal_text=self._parse_tool_boundary(new_text))
@@ -1644,7 +1637,7 @@ class DeepSeekV4Detector(BaseReasoningFormatDetector):
         return result
 
     def _detect_and_parse_impl(self, text: str) -> StreamingParseResult:
-        if not self._strict_tool_boundary:
+        if not self._tool_boundary_enabled:
             return super()._detect_and_parse_impl(text)
         result = self._parse_streaming_increment_impl(text)
         tail = self.finish()
@@ -1660,7 +1653,7 @@ class DeepSeekV4Detector(BaseReasoningFormatDetector):
             self._reasoning_suffix = ""
         self._reasoning_history.clear()
         result = super().finish()
-        if self._strict_tool_boundary:
+        if self._tool_boundary_enabled:
             result.normal_text = self._content_pending + result.normal_text
             self._content_pending = ""
         return result
