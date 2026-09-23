@@ -75,17 +75,106 @@ __device__ void naive_topk_transform_ragged(
   }
 }
 
-__device__ __forceinline__ auto convert_to_uint8(float x) -> uint8_t {
+// Width of the first, coarse selection pass.
+//
+// 8 bits is not enough. The coarse key is the top bits of an order-preserving
+// fp16 image, so one bin spans a fixed slice of the exponent range, and indexer
+// logits within a row sit inside one or two of those slices. Measured on decode
+// logits captured from a live GLM-5.2 server, the threshold bin holds ~77% of
+// the row: 5947 of 7680 for the worst of 24 captured rows. The threshold-bin
+// candidates go to a fixed-size LDS buffer and anything past it is dropped with
+// no signal, so that row silently loses part of its top-k as soon as 0.77*L
+// exceeds the buffer -- already true at L=7680 on the 4096-entry configs.
+//
+// At 12 bits the same rows put at most ~1500 elements in the threshold bin at
+// any length, because the top-2048 threshold lands in the sparse tail rather
+// than the bulk. That both restores correctness and cuts the refinement work.
+constexpr int kCoarseBits = 12;
+constexpr int kCoarseBins = 1 << kCoarseBits;
+
+__device__ __forceinline__ auto convert_to_coarse(float x) -> uint32_t {
   __half h = __float2half_rn(x);
   uint16_t bits = __half_as_ushort(h);
   uint16_t key = (bits & 0x8000) ? static_cast<uint16_t>(~bits) : static_cast<uint16_t>(bits | 0x8000);
-  return static_cast<uint8_t>(key >> 8);
+  return static_cast<uint32_t>(key >> (16 - kCoarseBits));
 }
 
 __device__ __forceinline__ auto convert_to_uint32(float x) -> uint32_t {
   uint32_t bits = __float_as_uint(x);
   return (bits & 0x80000000u) ? ~bits : (bits | 0x80000000u);
 }
+
+#ifdef __AMDGCN_WAVEFRONT_SIZE
+constexpr int kWaveSize = __AMDGCN_WAVEFRONT_SIZE;
+#elif defined(USE_ROCM)
+constexpr int kWaveSize = 64;
+#else
+constexpr int kWaveSize = 32;
+#endif
+
+// CUDA removed the unsynchronised warp shuffles, so the two scans below have to
+// spell the operation differently per platform. Both call sites are reached by
+// every thread of the block, hence the full mask.
+__device__ __forceinline__ int shfl_down_wave(int value, int delta) {
+#ifdef USE_ROCM
+  return __shfl_down(value, delta, kWaveSize);
+#else
+  return __shfl_down_sync(0xffffffffu, value, delta, kWaveSize);
+#endif
+}
+
+// Inclusive suffix sum over h[0..kCoarseBins), with h[kCoarseBins] == 0.
+//
+// Unlike the 256-bin scan below this one has more bins than the block has
+// threads, so confining it to a single wave would cost kCoarseBins/kWaveSize
+// dependent LDS round trips. Every wave scans its own descending range and then
+// only needs the totals of the waves above it.
+__device__ __forceinline__ void suffix_scan_coarse(int* h, int tx) {
+  constexpr int kWaves = kThreadsPerBlock / kWaveSize;
+  constexpr int kPerLane = kCoarseBins / kThreadsPerBlock;
+  static_assert(kCoarseBins % kThreadsPerBlock == 0);
+  __shared__ int s_wave_total[kWaves];
+  const int wave = tx / kWaveSize, lane = tx % kWaveSize;
+
+  const int base_i = tx * kPerLane;
+  int v[kPerLane];
+#pragma unroll
+  for (int k = 0; k < kPerLane; ++k)
+    v[k] = h[base_i + k];
+#pragma unroll
+  for (int k = kPerLane - 2; k >= 0; --k)
+    v[k] += v[k + 1];
+  const int total = v[0];
+  int suf = total;
+#pragma unroll
+  for (int d = 1; d < kWaveSize; d <<= 1) {
+    const int y = shfl_down_wave(suf, d);
+    if (lane + d < kWaveSize) suf += y;
+  }
+  if (lane == 0) s_wave_total[wave] = suf;
+  __syncthreads();
+
+  int above = 0;
+  for (int w = wave + 1; w < kWaves; ++w)
+    above += s_wave_total[w];
+  const int excl = (suf - total) + above;
+#pragma unroll
+  for (int k = 0; k < kPerLane; ++k)
+    h[base_i + k] = v[k] + excl;
+  __syncthreads();
+}
+
+#ifdef USE_ROCM
+// Elements each thread loads per trip of the two full-length loops below.
+//
+// This is where the kernel's time goes. Both loops are a dependent chain of
+// load -> classify -> LDS atomic, and the grid is one block per row, so at
+// batch 64 only 64 of 256 CUs are occupied and there is no other work resident
+// to hide the load latency behind. Issuing a couple of loads before consuming
+// either of them fills that gap; 2 measured best on gfx950, 4 and 8 spend the
+// registers without buying more overlap.
+constexpr int kUnroll = 2;
+#endif  // USE_ROCM
 
 __device__ void fast_topk_cuda_tl(const float* __restrict__ input, int* __restrict__ index, int row_start, int length) {
   // An optimized topk kernel copied from tilelang kernel
@@ -106,17 +195,77 @@ __device__ void fast_topk_cuda_tl(const float* __restrict__ input, int* __restri
 
   const int tx = threadIdx.x;
 
-  // stage 1: 8bit coarse histogram
-  if (tx < RADIX + 1) s_histogram[tx] = 0;
+  // The coarse histogram is done with before the first candidate is stored, so
+  // it borrows the front of the candidate buffer instead of costing its own LDS.
+  static_assert(kCoarseBins + 1 <= int(2 * SMEM_INPUT_SIZE));
+  int* const s_coarse = reinterpret_cast<int*>(s_input_idx);
+
+  // stage 1: coarse histogram
+  for (int i = tx; i <= kCoarseBins; i += BLOCK_SIZE)
+    s_coarse[i] = 0;
   __syncthreads();
 
+#ifndef USE_ROCM
   for (int idx = tx; idx < length; idx += BLOCK_SIZE) {
-    const auto bin = convert_to_uint8(input[idx + row_start]);
-    ::atomicAdd(&s_histogram[bin], 1);
+    ::atomicAdd(&s_coarse[convert_to_coarse(input[idx + row_start])], 1);
   }
+#else
+  // Same work, but the loads for a trip are all issued before any of them is
+  // consumed. Stride stays BLOCK_SIZE so each load is still coalesced; row_start
+  // is an arbitrary runtime offset, so a wider vector load is not available.
+  for (int base = tx; base < length; base += kUnroll * BLOCK_SIZE) {
+    float v[kUnroll];
+    bool ok[kUnroll];
+#pragma unroll
+    for (int k = 0; k < kUnroll; ++k) {
+      const int idx = base + k * BLOCK_SIZE;
+      ok[k] = idx < length;
+      v[k] = ok[k] ? input[idx + row_start] : 0.0f;
+    }
+#pragma unroll
+    for (int k = 0; k < kUnroll; ++k) {
+      if (ok[k]) ::atomicAdd(&s_coarse[convert_to_coarse(v[k])], 1);
+    }
+  }
+#endif
   __syncthreads();
 
   const auto run_cumsum = [&] {
+#ifdef USE_ROCM
+    // Inclusive suffix sum over s_histogram[0..RADIX), confined to wave 0 and
+    // done with shuffles, so the block pays 1 barrier instead of 8: the
+    // original runs 8 rounds in which only 256 of the 1024 threads work, yet
+    // all 16 wave64s stop at every one. Worth ~1.3 us per launch.
+    //
+    // s_histogram[RADIX] is not touched here; the `tx < RADIX + 1` initialisers
+    // zero it and it must stay 0.
+    static_assert(RADIX % kWaveSize == 0);
+    if (tx < kWaveSize) {
+      constexpr int kPerLane = RADIX / kWaveSize;
+      const int base_i = tx * kPerLane;
+      int v[kPerLane];
+#pragma unroll
+      for (int k = 0; k < kPerLane; ++k)
+        v[k] = s_histogram[base_i + k];
+      // suffix sum of this lane's own slice
+#pragma unroll
+      for (int k = kPerLane - 2; k >= 0; --k)
+        v[k] += v[k + 1];
+      // suffix scan of the per-lane totals across the wave
+      const int total = v[0];
+      int suf = total;
+#pragma unroll
+      for (int d = 1; d < kWaveSize; d <<= 1) {
+        const int y = shfl_down_wave(suf, d);
+        if (tx + d < kWaveSize) suf += y;
+      }
+      const int excl = suf - total;  // sum of every bin owned by a later lane
+#pragma unroll
+      for (int k = 0; k < kPerLane; ++k)
+        s_histogram[base_i + k] = v[k] + excl;
+    }
+    __syncthreads();
+#else
 #pragma unroll 8
     for (int i = 0; i < 8; ++i) {
       static_assert(1 << 8 == RADIX);
@@ -131,22 +280,26 @@ __device__ void fast_topk_cuda_tl(const float* __restrict__ input, int* __restri
       }
       __syncthreads();
     }
+#endif
   };
 
-  run_cumsum();
-  if (tx < RADIX && s_histogram[tx] > topk && s_histogram[tx + 1] <= topk) {
-    s_threshold_bin_id = tx;
-    s_num_input[0] = 0;
-    s_counter = 0;
+  suffix_scan_coarse(s_coarse, tx);
+  for (int i = tx; i < kCoarseBins; i += BLOCK_SIZE) {
+    if (s_coarse[i] > topk && s_coarse[i + 1] <= topk) {
+      s_threshold_bin_id = i;
+      s_num_input[0] = 0;
+      s_counter = 0;
+    }
   }
   __syncthreads();
 
   const auto threshold_bin = s_threshold_bin_id;
-  topk -= s_histogram[threshold_bin + 1];
+  // Read before the collect pass below starts overwriting s_coarse.
+  topk -= s_coarse[threshold_bin + 1];
 
   if (topk == 0) {
     for (int idx = tx; idx < length; idx += BLOCK_SIZE) {
-      const auto bin = static_cast<int>(convert_to_uint8(input[idx + row_start]));
+      const auto bin = static_cast<int>(convert_to_coarse(input[idx + row_start]));
       if (bin > threshold_bin) {
         const auto pos = ::atomicAdd(&s_counter, 1);
         index[pos] = idx;
@@ -161,9 +314,10 @@ __device__ void fast_topk_cuda_tl(const float* __restrict__ input, int* __restri
     }
     __syncthreads();
 
+#ifndef USE_ROCM
     for (int idx = tx; idx < length; idx += BLOCK_SIZE) {
       const auto raw_input = input[idx + row_start];
-      const auto bin = static_cast<int>(convert_to_uint8(raw_input));
+      const auto bin = static_cast<int>(convert_to_coarse(raw_input));
       if (bin > threshold_bin) {
         const auto pos = ::atomicAdd(&s_counter, 1);
         index[pos] = idx;
@@ -178,6 +332,37 @@ __device__ void fast_topk_cuda_tl(const float* __restrict__ input, int* __restri
         }
       }
     }
+#else
+    for (int base = tx; base < length; base += kUnroll * BLOCK_SIZE) {
+      float v[kUnroll];
+      bool ok[kUnroll];
+#pragma unroll
+      for (int k = 0; k < kUnroll; ++k) {
+        const int i = base + k * BLOCK_SIZE;
+        ok[k] = i < length;
+        v[k] = ok[k] ? input[i + row_start] : 0.0f;
+      }
+#pragma unroll
+      for (int k = 0; k < kUnroll; ++k) {
+        if (!ok[k]) continue;
+        const int idx = base + k * BLOCK_SIZE;
+        const auto raw_input = v[k];
+        const auto bin = static_cast<int>(convert_to_coarse(raw_input));
+        if (bin > threshold_bin) {
+          const auto pos = ::atomicAdd(&s_counter, 1);
+          index[pos] = idx;
+        } else if (bin == threshold_bin) {
+          const auto pos = ::atomicAdd(&s_num_input[0], 1);
+          /// NOTE: (dark) fuse the histogram computation here
+          if (C10_LIKELY(pos < SMEM_INPUT_SIZE)) {
+            s_input_idx[0][pos] = idx;
+            const auto sub_bin = (convert_to_uint32(raw_input) >> 24) & 0xFF;
+            ::atomicAdd(&s_histogram[sub_bin], 1);
+          }
+        }
+      }
+    }
+#endif
     __syncthreads();
   }
 
