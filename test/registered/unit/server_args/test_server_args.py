@@ -30,6 +30,7 @@ from sglang.srt.arg_groups.cuda_graph_hook import (
     handle_cuda_graph_config,
 )
 from sglang.srt.arg_groups.hicache_hook import (
+    _supports_hicache_mamba_size,
     handle_hicache,
     handle_hicache_ratio_default,
 )
@@ -1967,6 +1968,111 @@ class TestSSLArgs(unittest.TestCase):
 
 
 class TestHiCacheArgs(unittest.TestCase):
+    def test_mamba_size_cli_and_supported_configuration(self):
+        args = prepare_server_args(
+            [
+                "--model-path",
+                "dummy",
+                "--enable-hierarchical-cache",
+                "--hicache-ratio",
+                "1.5",
+                "--hicache-mamba-size",
+                "104",
+            ]
+        )
+        args._model_config = SimpleNamespace(
+            hf_config=SimpleNamespace(
+                architectures=["Qwen3_5MoeForConditionalGeneration"]
+            )
+        )
+        handle_hicache_ratio_default(args)
+        with (
+            override_platform(is_hip=True),
+            patch(
+                "torch.cuda.get_device_properties",
+                return_value=SimpleNamespace(gcnArchName="gfx950:sramecc+:xnack-"),
+            ),
+        ):
+            handle_hicache(args)
+        self.assertEqual(resolution_result(args, "hicache_mamba_size"), 104.0)
+        self.assertEqual(resolution_result(args, "hicache_ratio"), 1.5)
+        self.assertIsNone(resolution_result(args, "hicache_host_memory_fraction"))
+
+    def test_mamba_size_hardware_and_model_gate(self):
+        qwen = "Qwen3_5MoeForConditionalGeneration"
+        cases = [
+            (True, "gfx950:sramecc+:xnack-", qwen, True),
+            (True, "gfx950", "Qwen3_5ForConditionalGeneration", True),
+            (True, "gfx950", "Qwen3_5ForCausalLM", True),
+            (True, "gfx950", "Qwen3_5MoeForCausalLM", True),
+            (True, "gfx942", qwen, False),
+            (True, "gfx951", qwen, False),
+            (False, "gfx950", qwen, False),
+            (True, "gfx950", "Qwen3NextForCausalLM", False),
+        ]
+        for hip, device_arch, model_arch, supported in cases:
+            with (
+                self.subTest(hip=hip, device=device_arch, model=model_arch),
+                override_platform(is_hip=hip),
+                patch(
+                    "torch.cuda.get_device_properties",
+                    return_value=SimpleNamespace(gcnArchName=device_arch),
+                ),
+            ):
+                args = self._make_args(
+                    enable_hierarchical_cache=True,
+                    hicache_ratio=1.5,
+                    hicache_mamba_size=104,
+                )
+                args._model_config = SimpleNamespace(
+                    hf_config=SimpleNamespace(architectures=[model_arch])
+                )
+                self.assertEqual(_supports_hicache_mamba_size(args), supported)
+                if not supported:
+                    with self.assertRaisesRegex(ValueError, "Qwen3.5.*gfx950"):
+                        handle_hicache(args)
+
+    def test_mamba_size_default_keeps_automatic_sizing(self):
+        args = self._make_args(enable_hierarchical_cache=True, max_running_requests=64)
+        with patch(
+            "torch.cuda.get_device_properties",
+            side_effect=AssertionError("unexpected device probe"),
+        ):
+            handle_hicache(args)
+        self.assertEqual(resolution_result(args, "hicache_mamba_size"), 0)
+        self.assertEqual(resolution_result(args, "hicache_host_memory_fraction"), 0.8)
+
+    def test_mamba_size_rejects_invalid_values_and_conflicting_modes(self):
+        cases = [
+            ({"hicache_mamba_size": value}, "finite and non-negative")
+            for value in (-1, float("inf"), float("nan"))
+        ] + [
+            (
+                {"enable_hierarchical_cache": False},
+                "requires --enable-hierarchical-cache",
+            ),
+            ({"hicache_size": 200}, "cannot be combined with --hicache-size"),
+            ({"hicache_ratio": None}, "explicit --hicache-ratio"),
+            (
+                {
+                    "hicache_host_memory_mode": "buffer_only",
+                    "hicache_storage_backend": "file",
+                },
+                "host-memory-mode cache",
+            ),
+        ]
+        for overrides, message in cases:
+            with self.subTest(overrides=overrides):
+                values = dict(
+                    enable_hierarchical_cache=True,
+                    hicache_ratio=1.5,
+                    hicache_mamba_size=104,
+                )
+                values.update(overrides)
+                args = self._make_args(**values)
+                with self.assertRaisesRegex(ValueError, message):
+                    handle_hicache(args)
+
     def test_linker_mla_dedup_requires_mooncake_linker(self):
         for enabled, linker, backend in (
             (False, False, "mooncake"),

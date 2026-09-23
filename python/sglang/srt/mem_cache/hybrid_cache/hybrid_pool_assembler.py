@@ -1101,6 +1101,8 @@ def build_hybrid_mamba_stack(
         kv_host_size, mamba_host_size = _split_hicache_size(
             get_memory().hicache_size, (kv_pool, mamba_pool)
         )
+    if get_memory().hicache_mamba_size > 0:
+        mamba_host_size = get_memory().hicache_mamba_size
     kv_host_pool = build_kv_host_pool(
         kv_pool=kv_pool,
         page_size=params.page_size,
