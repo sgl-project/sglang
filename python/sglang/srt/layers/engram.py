@@ -46,7 +46,7 @@ from sglang.srt.layers.linear import ColumnParallelLinear, ReplicatedLinear
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.managers.schedule_batch import MM_PAD_SHIFT_VALUE
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.runtime_context import get_disagg, get_model, get_parallel, get_serving
+from sglang.srt.runtime_context import get_model, get_parallel, get_serving
 from sglang.srt.utils import add_prefix, is_cuda
 from sglang.srt.utils.hf_transformers.tokenizer import get_tokenizer
 
@@ -881,7 +881,6 @@ def build_engram_projection(
     *,
     quant_config,
     prefix,
-    role=None,
     tp_rank=0,
     tp_size=1,
     dp_attention=False,
@@ -892,8 +891,7 @@ def build_engram_projection(
     """Shard replicated-token WKV columns, gathering outputs before the Engram gate."""
     block = getattr(quant_config, "weight_block_size", None)
     if (
-        role not in ("prefill", "decode", "null")
-        or tp_size not in (4, 8)
+        tp_size not in (4, 8)
         or dp_attention
         or cp_size != 1
         or prefill_cp
@@ -952,7 +950,6 @@ class Engram(nn.Module):
             dim * (hc_mult + 1),
             quant_config=quant_config,
             prefix=add_prefix("wkv", prefix),
-            role=get_disagg().disaggregation_mode,
             tp_rank=parallel.tp_rank,
             tp_size=parallel.tp_size,
             dp_attention=parallel.enable_dp_attention,

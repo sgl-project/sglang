@@ -17,7 +17,6 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 class TestEngramProjection(CustomTestCase):
     def build(self, **changes):
         options = dict(
-            role="prefill",
             tp_rank=0,
             tp_size=8,
             quant_config=None,
@@ -30,18 +29,11 @@ class TestEngramProjection(CustomTestCase):
 
     def test_sharded_weight_loader_reconstructs_original(self):
         full = torch.arange(256 * 64, dtype=torch.float32).reshape(256, 64)
-        for role, tp_size in (
-            ("prefill", 4),
-            ("prefill", 8),
-            ("decode", 4),
-            ("decode", 8),
-            ("null", 4),
-            ("null", 8),
-        ):
-            with self.subTest(role=role, tp_size=tp_size):
+        for tp_size in (4, 8):
+            with self.subTest(tp_size=tp_size):
                 pieces = []
                 for rank in range(tp_size):
-                    layer = self.build(role=role, tp_rank=rank, tp_size=tp_size)
+                    layer = self.build(tp_rank=rank, tp_size=tp_size)
                     layer.weight.weight_loader(layer.weight, full)
                     self.assertEqual(tuple(layer.weight.shape), (256 // tp_size, 64))
                     self.assertIsInstance(layer, ColumnParallelLinear)
@@ -51,8 +43,6 @@ class TestEngramProjection(CustomTestCase):
 
     def test_unsupported_topologies_keep_full_weight(self):
         for change in [
-            dict(role=None),
-            dict(role="invalid"),
             dict(dp_attention=True),
             dict(cp_size=2),
             dict(prefill_cp=True),
