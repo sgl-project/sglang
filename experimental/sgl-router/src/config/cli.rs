@@ -11,8 +11,8 @@ use crate::config::sampling::{parse_sampling_overrides, ConflictPolicy};
 use crate::config::{
     default_cb_cool_down, default_host, default_port, default_proxy_request_timeout_secs,
     default_shutdown_drain_secs, default_stale_request_timeout_secs, resolve_mode, AffinityConfig,
-    AffinityMode, CacheAwareConfig, CachePrefixProvider, CircuitBreakerConfig, Config,
-    DecodePolicyKind, DiscoveryBackend, EligibilityConfig, FilterKind, FusedTerm,
+    AffinityMode, CacheAwareConfig, CachePrefixProvider, ChatRoutingKind, CircuitBreakerConfig,
+    Config, DecodePolicyKind, DiscoveryBackend, EligibilityConfig, FilterKind, FusedTerm,
     InflightLoadConfig, K8sDiscoveryConfig, KvIndexerEndpointConfig, LogFormat, ModelConfig,
     ObservabilityConfig, PolicyKind, ProxyConfig, ServerConfig, SessionAffinityMode,
     StaticUrlsDiscoveryConfig, StickyConfig, StickyFallbackKind, DEFAULT_FUSE,
@@ -164,8 +164,17 @@ pub struct DiscoveryArgs {
 
 #[derive(clap::Args, Debug)]
 pub struct RoutingArgs {
-    /// Routing policy.
-    #[arg(long, value_enum, default_value = "round_robin")]
+    /// Chat routing implementation; --policy selects a policy within it.
+    #[arg(long, value_enum, default_value = "legacy")]
+    pub chat_routing: ChatRoutingKind,
+
+    /// Routing policy (defaults to power_of_two with reorg routing).
+    #[arg(
+        long,
+        value_enum,
+        default_value = "round_robin",
+        default_value_if("chat_routing", "reorg", "power_of_two")
+    )]
     pub policy: PolicyKind,
 
     /// Policy used to select decode workers for PD requests.
@@ -333,6 +342,20 @@ pub struct AffinityArgs {
 impl Cli {
     /// Resolve CLI options and validate the resulting configuration.
     pub fn into_config(self) -> Result<Config> {
+        if self.routing.chat_routing == ChatRoutingKind::Reorg {
+            ensure!(
+                self.affinity.affinity_mode != Some(AffinityMode::Soft),
+                "reorg sessions do not support --affinity-mode soft"
+            );
+            ensure!(
+                self.routing.policy != PolicyKind::SessionAware
+                    || (self.affinity.pressure_abs_threshold_tokens.is_none()
+                        && self.affinity.pressure_abs_threshold_ms.is_none()
+                        && self.affinity.pressure_rel_threshold.is_none()
+                        && !self.affinity.disable_pressure_guard),
+                "reorg pressure guard options only apply to cache_aware"
+            );
+        }
         let affinity = self
             .affinity
             .build_config(&self.cache, self.routing.policy)?;
@@ -400,6 +423,9 @@ impl Cli {
             },
         };
         config.validate()?;
+        if self.routing.chat_routing == ChatRoutingKind::Reorg {
+            crate::policies_reorg::factory::validate(&config.model)?;
+        }
         Ok(config)
     }
 }
@@ -822,6 +848,82 @@ fn join_selector(terms: &[String]) -> Option<String> {
 mod tests {
     use super::*;
     use crate::config::{DiscoveryBackend, K8sDiscoveryMode, ScoreTermKind};
+
+    #[test]
+    fn chat_routing_selects_policy_implementation_without_another_config() {
+        let base = [
+            "router",
+            "--model-id",
+            "tiny",
+            "--worker-urls",
+            "http://localhost:30000",
+        ];
+        let legacy = Cli::try_parse_from(base).unwrap();
+        assert_eq!(legacy.routing.chat_routing, ChatRoutingKind::Legacy);
+        assert_eq!(
+            legacy.into_config().unwrap().model.policy,
+            PolicyKind::RoundRobin
+        );
+        let reorg = ["--chat-routing", "reorg"];
+        let parse = |args: &[&str]| {
+            Cli::try_parse_from(base.iter().chain(reorg.iter()).chain(args))
+                .unwrap()
+                .into_config()
+        };
+        assert_eq!(parse(&[]).unwrap().model.policy, PolicyKind::PowerOfTwo);
+        let cache = parse(&[
+            "--policy",
+            "cache_aware",
+            "--worker-queue-limit",
+            "3",
+            "--kv-indexer-endpoint",
+            "http://localhost:50051",
+        ])
+        .unwrap();
+        assert_eq!(cache.model.affinity.unwrap().worker_queue_limit, Some(3));
+        assert!(cache
+            .model
+            .cache_aware
+            .unwrap()
+            .kv_indexer_endpoint
+            .is_some());
+        let session = parse(&[
+            "--policy",
+            "session_aware",
+            "--session-id-header",
+            "x-session",
+        ])
+        .unwrap();
+        assert_eq!(
+            session.model.affinity.unwrap().session_id_header,
+            "x-session"
+        );
+        assert_eq!(
+            parse(&["--filter", "overloaded", "--max-in-flight", "2"])
+                .unwrap()
+                .model
+                .eligibility
+                .unwrap()
+                .max_in_flight,
+            Some(2)
+        );
+        for args in [
+            vec!["--policy", "round_robin"],
+            vec!["--decode-policy", "legacy_host_affinity"],
+            vec!["--policy", "session_aware", "--stable-pair"],
+            vec!["--policy", "session_aware", "--affinity-mode", "soft"],
+            vec!["--policy", "session_aware", "--pressure-rel-threshold", "2"],
+            vec!["--policy", "cache_aware", "--min-load-choices", "4"],
+            vec![
+                "--filter",
+                "prefix_cache",
+                "--prefix-cache-min-share",
+                "0.2",
+            ],
+        ] {
+            assert!(parse(&args).is_err(), "accepted {args:?}");
+        }
+    }
 
     /// Parse argv (without the leading binary name) into a `Config`.
     fn into_config(args: &[&str]) -> Result<Config> {
