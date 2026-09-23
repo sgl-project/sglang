@@ -397,21 +397,6 @@ def handle_elastic_ep(server_args: Any):
     from sglang.srt.arg_groups.validation_hook import validate_ib_devices
 
     cfg = resolving_view(server_args)
-    if cfg.elastic_ep_rejoin:
-        if cfg.ep_join_mode is None:
-            logger.warning(
-                "--elastic-ep-rejoin is deprecated, use --elastic-ep-join-mode recover instead."
-            )
-            declare_resolution(
-                server_args,
-                "_handle_elastic_ep",
-                ep_join_mode="recover",
-            )
-        else:
-            assert cfg.ep_join_mode == "recover", (
-                "--elastic-ep-rejoin (deprecated) conflicts with "
-                f"--elastic-ep-join-mode {cfg.ep_join_mode}."
-            )
     if cfg.elastic_ep_backend is not None:
         if cfg.enable_eplb:
             if cfg.eplb_algorithm == "auto":
@@ -626,13 +611,6 @@ def handle_eplb_and_dispatch(server_args: Any):
 
 def handle_expert_distribution_metrics(server_args: Any):
     cfg = resolving_view(server_args)
-    if "SGLANG_ENABLE_EPLB_BALANCEDNESS_METRIC" in os.environ:
-        raise ValueError(
-            "SGLANG_ENABLE_EPLB_BALANCEDNESS_METRIC is no longer supported. Use "
-            "--expert-balancedness-report-mode with one of: off, server_log, "
-            "prometheus, both."
-        )
-
     if should_report_expert_balancedness(server_args) and (
         cfg.expert_distribution_recorder_mode is None
     ):

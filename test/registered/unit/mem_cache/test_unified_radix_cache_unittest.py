@@ -6113,6 +6113,100 @@ class UnifiedRadixCacheSuite:
                 self.assertTrue(cache.tree_core.is_node_in_host_lru(node, aux))
         cache.sanity_check()
 
+    def _build_internal_mamba_fixture(self, write_policy):
+        """HiCache fixture where seq_a's node is INTERNAL (seq_b splits a
+        suffix off it) and holds its own mamba state."""
+        cache, allocator, req_to_token_pool = build_fixture(self.cfg)
+        self._init_hicache(cache, write_policy=write_policy)
+        seq_a = self._make_seq(1, 2)
+        seq_b = seq_a + self._make_seq(1000, 1)
+        self._insert(cache, allocator, req_to_token_pool, seq_a)
+        self._insert(cache, allocator, req_to_token_pool, seq_b)
+        return cache, req_to_token_pool, seq_a
+
+    def test_hicache_write_back_internal_mamba_evict_demotes_state(self):
+        """write_back: an internal node's tombstoned mamba state is demoted
+        to host, keeping the node a valid match boundary so the KV beneath
+        it stays servable."""
+        if not self.cfg.has_mamba:
+            self.skipTest("requires Mamba component")
+        if self.cfg.has_swa:
+            self.skipTest("no hicache strategy covers FULL+SWA+MAMBA")
+        # TODO(ShangmingCai): port the internal-node demote to the Rust core;
+        # its eviction walk still tombstones the state without a host backup.
+        if _selected_tree_core_test_backend() == "rust":
+            self.skipTest("internal-node state demote is Python-core only")
+        cache, req_to_token_pool, seq_a = self._build_internal_mamba_fixture(
+            "write_back"
+        )
+
+        result = cache.evict(EvictParams(num_tokens=0, mamba_num=10))
+        self.assertGreaterEqual(result.mamba_num_evicted, 1)
+
+        m = cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", seq_a))))
+        node = m.best_match_node
+        self.assertNotEqual(
+            node,
+            cache.root_node_handle(),
+            "host-demoted mamba must keep the node a valid match boundary",
+        )
+        self.assertIsNone(
+            _device_value(cache, node, ComponentType.MAMBA),
+            "device state was tombstoned",
+        )
+        self.assertIsNotNone(
+            _host_value(cache, node, ComponentType.MAMBA),
+            "state demoted to host, not dropped",
+        )
+        self.assertEqual(
+            len(m.device_indices) + m.host_hit_length,
+            len(seq_a),
+            "the full prefix stays servable (device KV is claimed once the "
+            "state is revived)",
+        )
+        self.assertGreaterEqual(
+            m.mamba_host_hit_length, 1, "load-back armed for the host state"
+        )
+
+        # Scheduler-side serve path: init_load_back revives the state and
+        # returns the node's still-device-resident KV.
+        req = self._make_req(req_to_token_pool)
+        self._apply_match_to_req(req, m)
+        new_indices, last_node = cache.init_load_back(
+            InitLoadBackParams(
+                best_match_node=m.best_match_node,
+                host_hit_length=m.host_hit_length,
+                req=req,
+            )
+        )
+        self.assertEqual(last_node, node)
+        self.assertEqual(len(m.device_indices) + len(new_indices), len(seq_a))
+        self.assertIsNotNone(
+            _device_value(cache, node, ComponentType.MAMBA),
+            "mamba state revived on device",
+        )
+        self._finish_pending_loads(cache)
+        self._release_ongoing_load_back_locks(cache)
+        cache.sanity_check()
+
+    def test_hicache_write_through_internal_mamba_evict_keeps_drop(self):
+        """Non-write_back policies keep the legacy tombstone-and-drop."""
+        if not self.cfg.has_mamba:
+            self.skipTest("requires Mamba component")
+        if self.cfg.has_swa:
+            self.skipTest("no hicache strategy covers FULL+SWA+MAMBA")
+        cache, _, seq_a = self._build_internal_mamba_fixture("write_through")
+
+        cache.evict(EvictParams(num_tokens=0, mamba_num=10))
+
+        m = cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", seq_a))))
+        self.assertEqual(
+            len(m.device_indices),
+            0,
+            "write_through keeps the legacy drop: frontier capped at root",
+        )
+        cache.sanity_check()
+
     def _build_chain_pages(self, cache, allocator, req_to_token_pool, num_pages):
         """Insert an incremental chain of single-page extensions.
 
