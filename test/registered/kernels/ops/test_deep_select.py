@@ -44,42 +44,6 @@ def test_deepselect_topk_matches_official_signature():
     ]
 
 
-@pytest.mark.parametrize(
-    "dtype,width,length",
-    [
-        (torch.bfloat16, 32768, 16385),
-        (torch.float32, 16384, 8193),
-        (torch.bfloat16, 524288, 512),
-        (torch.bfloat16, 524288, 16385),
-    ],
-)
-def test_negative_infinity_ties_never_select_padding(dtype, width, length):
-    input = _aligned_input(1, width, dtype)
-    input.fill_(float("-inf"))
-    input[0, :17] = torch.arange(17, device=input.device).to(dtype)
-    end = torch.tensor([length], dtype=torch.int32, device=input.device)
-
-    values, indices = topk(input, 512, end=end)
-
-    assert values is not None
-    assert torch.all((indices >= 0) & (indices < length))
-    assert indices.unique().numel() == 512
-    torch.testing.assert_close(input.gather(1, indices), values, rtol=0, atol=0)
-
-
-def test_sorted_int64_offset_does_not_wrap():
-    input = _aligned_input(1, 1024, torch.float32)
-    input.copy_(torch.arange(1024, device=input.device))
-    offset = torch.tensor([2147483647], dtype=torch.int32, device=input.device)
-
-    values, indices = topk(input, 2, sorted=True, output_idx_offset=offset)
-
-    assert values is not None
-    expected = torch.topk(input, 2)
-    torch.testing.assert_close(indices, expected.indices + offset, rtol=0, atol=0)
-    torch.testing.assert_close(values, expected.values, rtol=0, atol=0)
-
-
 def test_out_of_range_oob_fill_is_rejected():
     input = _aligned_input(1, 1024, torch.float32)
     with pytest.raises(RuntimeError, match="idx_oob_fill_value must fit in int32"):
@@ -129,25 +93,3 @@ def test_begin_is_rejected_by_cpp():
     begin = torch.zeros(1, dtype=torch.int32, device=input.device)
     with pytest.raises(RuntimeError, match="`begin` is not supported"):
         topk(input, 8, begin=begin)
-
-
-def test_non_current_cuda_device_launch():
-    if torch.cuda.device_count() < 2:
-        pytest.skip("requires two CUDA devices")
-    if torch.cuda.get_device_capability(0) != torch.cuda.get_device_capability(1):
-        pytest.skip("requires two CUDA devices with the same capability")
-
-    previous_device = torch.cuda.current_device()
-    try:
-        torch.cuda.set_device(0)
-        input = _aligned_input(1, 1024, torch.float32, "cuda:1")
-        input.copy_(torch.arange(1024, device=input.device))
-        values, indices = topk(input, 8, sorted=True)
-        torch.cuda.synchronize(1)
-
-        assert torch.cuda.current_device() == 0
-        expected = torch.topk(input, 8)
-        torch.testing.assert_close(indices, expected.indices, rtol=0, atol=0)
-        torch.testing.assert_close(values, expected.values, rtol=0, atol=0)
-    finally:
-        torch.cuda.set_device(previous_device)

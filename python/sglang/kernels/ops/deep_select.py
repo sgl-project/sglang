@@ -10,7 +10,6 @@ from sglang.kernels.jit.utils import (
     cache_once,
     load_jit,
     make_cpp_args,
-    override_jit_cuda_arch,
 )
 
 if TYPE_CHECKING:
@@ -96,9 +95,7 @@ def _jit_deep_select_module(
     return_value: bool,
     max_topk: int,
     cluster_size: int,
-    device_capability: Tuple[int, int],
 ) -> Module:
-    assert device_capability in _SUPPORTED_CAPABILITIES
     assert value_dtype in (torch.bfloat16, torch.float32)
     assert index_dtype in (torch.int32, torch.int64)
     if sorted_value:
@@ -126,33 +123,31 @@ def _jit_deep_select_module(
     ]
     classes = make_cpp_args(*classes)
     root = (KERNEL_PATH / "csrc" / "deepselect" / "vendor").resolve()
-    with override_jit_cuda_arch(*device_capability):
-        return load_jit(
-            "deep_select_topk",
-            # cache only distinct key for better readability
-            *make_cpp_args(
-                value_dtype,
-                index_dtype,
-                sorted_value,
-                sorted_index,
-                return_value,
-                max_topk,
-                cluster_size,
-                *device_capability,
-            ),
-            cuda_files=["deepselect/entry.cuh"],
-            cuda_wrappers=[("topk", f"deepselect::{host_dispatch}<{classes}>::topk")],
-            extra_include_paths=[
-                str(root),
-                str(root / "3rdparty" / "kerutils" / "include"),
-            ],
-            extra_dependencies=["cutlass"],
-            extra_cuda_cflags=[
-                "--expt-extended-lambda",
-                "--use_fast_math",
-                "--ftz=false",
-            ],
-        )
+    return load_jit(
+        "deep_select_topk",
+        # cache only distinct key for better readability
+        *make_cpp_args(
+            value_dtype,
+            index_dtype,
+            sorted_value,
+            sorted_index,
+            return_value,
+            max_topk,
+            cluster_size,
+        ),
+        cuda_files=["deepselect/entry.cuh"],
+        cuda_wrappers=[("topk", f"deepselect::{host_dispatch}<{classes}>::topk")],
+        extra_include_paths=[
+            str(root),
+            str(root / "3rdparty" / "kerutils" / "include"),
+        ],
+        extra_dependencies=["cutlass"],
+        extra_cuda_cflags=[
+            "--expt-extended-lambda",
+            "--use_fast_math",
+            "--ftz=false",
+        ],
+    )
 
 
 def _get_max_topk_bucket(topk: int, use_cluster: bool) -> int:
@@ -295,7 +290,6 @@ def topk(
         return_value,
         _get_max_topk_bucket(topk, use_cluster),
         cluster_size if use_cluster else 1,
-        device_capability,
     )
     input_storage_bytes = (
         input.untyped_storage().nbytes()

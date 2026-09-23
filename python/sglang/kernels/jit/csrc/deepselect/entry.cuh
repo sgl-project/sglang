@@ -34,27 +34,6 @@ namespace deepselect {
 
 namespace details {
 
-class ScopedCudaDevice {
- public:
-  explicit ScopedCudaDevice(DLDevice device) {
-    CHECK_HOST(device.device_type == kDLCUDA) << "input must be a CUDA tensor";
-    CHECK_CUDA(cudaGetDevice(&previous_device_));
-    changed_ = previous_device_ != device.device_id;
-    if (changed_) CHECK_CUDA(cudaSetDevice(device.device_id));
-  }
-
-  ~ScopedCudaDevice() {
-    if (changed_) cudaSetDevice(previous_device_);
-  }
-
-  ScopedCudaDevice(const ScopedCudaDevice&) = delete;
-  ScopedCudaDevice& operator=(const ScopedCudaDevice&) = delete;
-
- private:
-  int previous_device_ = -1;
-  bool changed_ = false;
-};
-
 /// The two families of one-CTA-per-row kernels live in separate namespaces.
 template <typename Config>
 inline auto run_normal(const TopkSelectArgs& args) -> void {
@@ -162,18 +141,6 @@ auto make_plan(
   CHECK_HOST(vocab_size < MAX_VOCAB_SIZE) << "vocab_size must be < " << MAX_VOCAB_SIZE << ", got " << vocab_size;
 
   const DLDevice dev = device.unwrap();
-  const auto sm_version = host::runtime::get_sm_version(dev.device_id);
-  CHECK_HOST(sm_version == 90 || sm_version == 100 || sm_version == 103)
-      << "DeepSelect does not support SM" << sm_version;
-  CHECK_HOST(sm_version * 10 == SGL_CUDA_ARCH)
-      << "DeepSelect JIT module was compiled for SM" << SGL_CUDA_ARCH / 10 << " but input is on SM" << sm_version;
-  if constexpr (Config::cluster_size > 1) {
-    CHECK_HOST(
-        (sm_version == 90 && Config::cluster_size == 8) ||
-        ((sm_version == 100 || sm_version == 103) && Config::cluster_size == 16))
-        << "DeepSelect cluster size " << Config::cluster_size << " is invalid for SM" << sm_version;
-  }
-
   const auto input_stride_elements = input_stride.unwrap();
   CHECK_HOST(input_stride_elements >= 0) << "input row stride must be non-negative";
   CHECK_HOST(
@@ -184,7 +151,7 @@ auto make_plan(
       << "output_index row stride must be a multiple of " << OUTPUT_STRIDE_ALIGNMENT_REQUIREMENT << " bytes";
 
   if (batch_size != 0 && vocab_size != 0) {
-    const uint64_t address_alignment = sm_version == 90 ? 16 : 32;
+    constexpr uint64_t address_alignment = SGL_CUDA_ARCH == 900 ? 16 : 32;
     CHECK_HOST(reinterpret_cast<uintptr_t>(input.data_ptr()) % address_alignment == 0)
         << "input address must be aligned to " << address_alignment << " bytes";
     const uint64_t row_bytes = static_cast<uint64_t>(vocab_size) * sizeof(ValueT);
@@ -255,7 +222,6 @@ struct TopkNormal {
       int64_t idx_oob_fill_value,
       double value_oob_fill_value,
       bool abort_when_nan_found) -> void {
-    const details::ScopedCudaDevice device_guard(input.device());
     const auto plan = details::make_plan<ConfigWave1>(
         input,
         output_value,
@@ -307,7 +273,6 @@ struct TopkCluster {
       int64_t idx_oob_fill_value,
       double value_oob_fill_value,
       bool abort_when_nan_found) -> void {
-    const details::ScopedCudaDevice device_guard(input.device());
     const auto plan = details::make_plan<Config>(
         input,
         output_value,
