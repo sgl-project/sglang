@@ -46,7 +46,6 @@ from sglang.srt.utils import (
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
-    from sglang.srt.distributed.parallel_state_wrapper import ParallelState
     from sglang.srt.rust_server.server import RustServer
     from sglang.srt.server_args import ServerArgs
     from sglang.test.scripted_runtime.scheduler_hook import ScriptedSchedulerHook
@@ -64,7 +63,6 @@ class SchedulerRequestReceiver:
     recv_skipper: Any
     input_blocker: Any
     mm_receiver: Any
-    ps: ParallelState
     tp_group: Any
     tp_cpu_group: Any
     attn_tp_group: Any
@@ -120,7 +118,7 @@ class SchedulerRequestReceiver:
 
     def _pull_raw_reqs(self) -> Optional[List]:
         if get_parallel().pp_rank == 0:
-            if self.ps.attn_tp_rank == 0 and self.ps.attn_cp_rank == 0:
+            if get_parallel().attn_tp_rank == 0 and get_parallel().attn_cp_rank == 0:
                 recv_reqs = []
 
                 # Rust ringbuffer backend: drain the in-process ring fed by the
@@ -152,16 +150,18 @@ class SchedulerRequestReceiver:
             else:
                 recv_reqs = None
         else:
-            if self.ps.attn_tp_rank == 0 and self.ps.attn_cp_rank == 0:
+            if get_parallel().attn_tp_rank == 0 and get_parallel().attn_cp_rank == 0:
                 dp_offset = (
-                    self.ps.attn_dp_rank * self.ps.attn_cp_size * self.ps.attn_tp_size
+                    get_parallel().attn_dp_rank
+                    * get_parallel().attn_cp_size
+                    * get_parallel().attn_tp_size
                 )
                 recv_reqs = point_to_point_pyobj(
                     [],
-                    get_parallel().pp_rank * self.ps.tp_size + dp_offset,
+                    get_parallel().pp_rank * get_parallel().tp_size + dp_offset,
                     self.world_group.cpu_group,
-                    (get_parallel().pp_rank - 1) * self.ps.tp_size + dp_offset,
-                    get_parallel().pp_rank * self.ps.tp_size + dp_offset,
+                    (get_parallel().pp_rank - 1) * get_parallel().tp_size + dp_offset,
+                    get_parallel().pp_rank * get_parallel().tp_size + dp_offset,
                 )
             else:
                 recv_reqs = None
@@ -176,7 +176,7 @@ class SchedulerRequestReceiver:
         """
         local_reqs = local_reqs or []
         if get_parallel().enable_dp_attention:
-            if self.ps.attn_tp_rank == 0 and self.ps.attn_cp_rank == 0:
+            if get_parallel().attn_tp_rank == 0 and get_parallel().attn_cp_rank == 0:
                 work_reqs, control_reqs = self._split_work_and_control_reqs(recv_reqs)
                 work_reqs.extend(local_reqs)
             else:
@@ -196,7 +196,7 @@ class SchedulerRequestReceiver:
             )
             if _local_ctrl:
                 control_reqs = attn_cp_tp_broadcast_pyobj(control_reqs)
-            elif self.ps.tp_size != 1:
+            elif get_parallel().tp_size != 1:
                 control_reqs = broadcast_pyobj(
                     control_reqs,
                     self.tp_group.rank,
@@ -207,7 +207,7 @@ class SchedulerRequestReceiver:
         else:
             if recv_reqs is not None:
                 recv_reqs = [*recv_reqs, *local_reqs]
-            if self.ps.tp_size != 1:
+            if get_parallel().tp_size != 1:
                 recv_reqs = broadcast_pyobj(
                     recv_reqs,
                     self.tp_group.rank,
@@ -269,11 +269,11 @@ class SchedulerRequestReceiver:
         # 1. wait until every rank has opened the shared feature segments
         parallel = get_parallel()
         if parallel.enable_dp_attention:
-            if self.ps.attn_tp_size > 1:
+            if parallel.attn_tp_size > 1:
                 barrier(group=self.attn_tp_cpu_group)
-            if self.ps.attn_cp_size > 1:
+            if parallel.attn_cp_size > 1:
                 barrier(group=self.attn_cp_cpu_group)
-        elif self.ps.tp_size > 1:
+        elif parallel.tp_size > 1:
             barrier(group=self.tp_cpu_group)
 
         # 2. materialize independently so one bad VLM request does not stop the loop
@@ -293,11 +293,11 @@ class SchedulerRequestReceiver:
 
         # 3. all ranks reject the same requests before entering model collectives
         if parallel.enable_dp_attention:
-            if self.ps.attn_tp_size > 1:
+            if parallel.attn_tp_size > 1:
                 all_reduce(failed, op=ReduceOp.MAX, group=self.attn_tp_cpu_group)
-            if self.ps.attn_cp_size > 1:
+            if parallel.attn_cp_size > 1:
                 all_reduce(failed, op=ReduceOp.MAX, group=self.attn_cp_cpu_group)
-        elif self.ps.tp_size > 1:
+        elif parallel.tp_size > 1:
             all_reduce(failed, op=ReduceOp.MAX, group=self.tp_cpu_group)
 
         error = MMInputsProcessError(

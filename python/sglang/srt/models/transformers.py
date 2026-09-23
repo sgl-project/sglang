@@ -21,6 +21,7 @@
 import inspect
 import logging
 import re
+from array import array
 from collections.abc import Iterable, Mapping
 from contextlib import contextmanager
 from typing import List, Literal, Optional, Tuple, Union
@@ -1368,7 +1369,7 @@ class MultiModalMixin:
         rope_type = str(getattr(self.text_config, "rope_type", "")).lower()
         return "mrope" in rope_type
 
-    def pad_input_ids(self, input_ids: list[int], mm_inputs: MultimodalInputs):
+    def pad_input_ids(self, input_ids: array, mm_inputs: MultimodalInputs) -> array:
         return input_ids
 
     def _get_modality_encoder(self, modality_name: str):
