@@ -117,9 +117,6 @@ def _make_reporter(test, scheduler) -> SchedulerMetricsReporter:
     )
     return SchedulerMetricsReporter(
         scheduler=scheduler,
-        tp_rank=0,
-        pp_rank=0,
-        dp_rank=0,
         metrics_collector_context=context,
         metrics_collector=None,
     )
