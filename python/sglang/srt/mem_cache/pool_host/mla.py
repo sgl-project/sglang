@@ -20,7 +20,6 @@ from sglang.kernels.ops.kvcache.hicache import (
     transfer_hicache_one_layer_mla as jit_transfer_hicache_one_layer_mla,
 )
 from sglang.srt.layers.dcp.layout import maybe_dcp_kernel_indices
-from sglang.srt.mem_cache.host_memory import available_host_memory_bytes
 from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
 from sglang.srt.mem_cache.pool_host.base import (
     _WRITE_BACK_STAGING_PAGE_CHUNK,
@@ -340,7 +339,6 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                     )
                 ensure_memfabric_capacity(total_bytes, torch.npu.current_device())
                 alloc_func = alloc_with_memfabric
-            cgroup_value = available_host_memory_bytes()
             self.k_buffer = alloc_func(
                 (*base_dims, k_width),
                 dtype=self.dtype,
