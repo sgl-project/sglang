@@ -7,7 +7,7 @@ full weight itself), multicast-stores it into the CustomAllReduceV2 push
 workspace (one more user of its double-buffer phase protocol), and a
 Lamport-spin consumer assembles ``out = up_proj(x) + b (+ c)`` — reading
 1/8 of the weight bytes per rank instead of all of them. Needs
-:func:`sglang.kernels.ops.kimi_k3.all_reduce.register_comm` once beforehand
+:func:`sglang.kernels.ops.communication.all_reduce_residual.register_comm` once beforehand
 (the same registration the push all-reduce uses).
 """
 
@@ -23,7 +23,7 @@ from sglang.kernels.jit.utils import (
     load_jit,
     make_cpp_args,
 )
-from sglang.kernels.ops.kimi_k3.all_reduce import _COMM_MAP
+from sglang.kernels.ops.communication.all_reduce_residual import _COMM_MAP
 from sglang.srt.utils.custom_op import register_custom_op
 
 if TYPE_CHECKING:
