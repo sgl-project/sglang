@@ -2197,6 +2197,7 @@ class ProfileReq(BaseReq, kw_only=True):
     # If set, it profile as many as this number of steps.
     # If it is set, profiling is automatically stopped after this step, and
     # the caller doesn't need to run stop_profile.
+    # Required and positive when profile_by_stage is enabled.
     num_steps: Optional[int] = None
     # The activities to record. The choices are ["CPU", "GPU", "MEM", "RPD"]
     activities: Optional[List[str]] = None
@@ -2215,6 +2216,10 @@ class ProfileReq(BaseReq, kw_only=True):
     profile_stages: Optional[List[str]] = None
     # Add iteration-level annotations (KV / request aggregates) for roofline-style analysis
     detailed_annotations: bool = False
+
+    def __post_init__(self):
+        if self.profile_by_stage and (self.num_steps is None or self.num_steps <= 0):
+            raise ValueError("profile_by_stage requires a positive num_steps")
 
 
 class ProfileReqOutput(BaseReq, kw_only=True):
