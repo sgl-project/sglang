@@ -8,20 +8,18 @@ from sglang.srt.layers.attention.dsv4.candidate_indexer import (
     CandidateIndexer,
     CandidateMetadata,
     PrefillCandidateBlocks,
+    PrefillIndexerBudget,
     PrefillIndexerInputs,
     candidate_block_mask,
     mask_topk_scores,
     select_candidate_block_ids,
 )
 from sglang.srt.layers.attention.mqa_logits_utils import (
+    mqa_logits_needs_budget_check,
     mqa_logits_row_bytes,
     mqa_logits_rows_per_chunk,
 )
 from sglang.srt.utils.common import ceil_align
-
-# TODO: use a per-forward mqa_logits_budget_bytes() budget that also
-# leaves room for candidate masks and block-selection scratch.
-_SCORE_BUDGET_BYTES = 2 << 30
 
 
 def dense_prefill_topk(
@@ -37,6 +35,7 @@ def dense_prefill_topk(
     candidate_block_size: int,
     publish_candidates: bool,
     candidates: PrefillCandidateBlocks | None,
+    budget: PrefillIndexerBudget | None = None,
 ) -> tuple[torch.Tensor, PrefillCandidateBlocks | None]:
     selected = torch.full(
         (q[0].shape[0], topk), -1, dtype=torch.int32, device=weights.device
@@ -63,7 +62,23 @@ def dense_prefill_topk(
     width = ceil_align(max((n for _, n in request_lengths), default=0), 4)
     if row == 0 or width == 0:
         return selected, published
-    rows_per_chunk = _rows_per_chunk(row, width, heads=q[0].shape[1])
+    scratch_row_bytes, scratch_bytes = _candidate_scratch_bytes(
+        width=width,
+        topk=topk,
+        topk_blocks=candidate_topk_blocks,
+        block_size=candidate_block_size,
+        publish=published is not None,
+        consume=candidates is not None,
+    )
+    rows_per_chunk = _rows_per_chunk(
+        row,
+        width,
+        heads=q[0].shape[1],
+        device=weights.device,
+        budget=budget if budget is not None else PrefillIndexerBudget(),
+        scratch_row_bytes=scratch_row_bytes + 8,
+        scratch_bytes=scratch_bytes,
+    )
     for offset in range(0, row, rows_per_chunk):
         rows = slice(offset, min(offset + rows_per_chunk, row))
         _select_tile(
@@ -83,14 +98,25 @@ def dense_prefill_topk(
     return selected, published
 
 
-def _rows_per_chunk(rows: int, width: int, *, heads: int) -> int:
-    """Query rows per logits tile so one fp32 [rows, width] tile fits the
-    budget; the row count stays a multiple of the kernel's row alignment."""
+def _rows_per_chunk(
+    rows: int,
+    width: int,
+    *,
+    heads: int,
+    device: torch.device,
+    budget: PrefillIndexerBudget,
+    scratch_row_bytes: int = 0,
+    scratch_bytes: int = 0,
+) -> int:
+    if budget.bytes is None and not mqa_logits_needs_budget_check(
+        num_rows=rows, num_cols=width
+    ):
+        return rows
     row_alignment = 128 // heads
     rows_per_chunk = mqa_logits_rows_per_chunk(
         num_rows=ceil_align(rows, row_alignment),
-        row_bytes=mqa_logits_row_bytes(width),
-        budget_bytes=_SCORE_BUDGET_BYTES,
+        row_bytes=mqa_logits_row_bytes(width) + scratch_row_bytes,
+        budget_bytes=max(1, budget.resolve(device) - scratch_bytes),
     )
     if rows_per_chunk is None:
         return rows
@@ -98,20 +124,27 @@ def _rows_per_chunk(rows: int, width: int, *, heads: int) -> int:
 
 
 def score_tiles(
-    inputs: PrefillIndexerInputs, *, width_align: int = 4
+    inputs: PrefillIndexerInputs, *, block_size: int
 ) -> Iterator[tuple[slice, torch.Tensor]]:
     """The dense scores of ``inputs`` row tile by row tile under the budget:
     ``(rows, logits)`` with fp32 ``logits[i, j]`` the score of query row
     ``rows.start + i`` against ``kv[request_starts + j]``, garbage past the row's
     ``compress_lens``; the width is the batch's largest context aligned to
-    ``width_align`` columns."""
+    ``block_size`` columns."""
     from deep_gemm import fp8_fp4_mqa_logits
 
     rows = inputs.num_rows
-    width = ceil_align(max(inputs.lens_per_request, default=0), width_align)
+    width = ceil_align(max(inputs.lens_per_request, default=0), block_size)
     if rows == 0 or width == 0:
         return
-    rows_per_chunk = _rows_per_chunk(rows, width, heads=inputs.q_fp4.shape[1])
+    rows_per_chunk = _rows_per_chunk(
+        rows,
+        width,
+        heads=inputs.q_fp4.shape[1],
+        device=inputs.weights.device,
+        budget=inputs.budget,
+        scratch_row_bytes=4 * ceil_align(width // block_size, 4) + 8,
+    )
     for offset in range(0, rows, rows_per_chunk):
         tile = slice(offset, min(offset + rows_per_chunk, rows))
         starts = inputs.request_starts[tile]
@@ -150,6 +183,7 @@ def _dense_topk(
         candidate_block_size=block_size,
         publish_candidates=publish,
         candidates=candidates,
+        budget=inputs.budget,
     )
     out_positions.copy_(selected)
     return published
@@ -275,3 +309,36 @@ def _select_tile(
         selected.copy_(
             mask_topk_scores(scores=logits, indices=selected, offsets=starts)
         )
+
+
+def _candidate_scratch_bytes(
+    *,
+    width: int,
+    topk: int,
+    topk_blocks: int,
+    block_size: int,
+    publish: bool,
+    consume: bool,
+) -> tuple[int, int]:
+    blocks = (width + block_size - 1) // block_size
+    block_topk = min(topk_blocks, blocks)
+    padded_width = blocks * block_size
+    if publish:
+        padded_scores = 4 * padded_width
+        block_scores = 4 * blocks
+        masked_block_scores = 2 * block_scores + blocks
+        block_selection = block_scores + 12 * block_topk
+        converted_block_ids = 20 * block_topk
+        return max(
+            width,
+            padded_scores + block_scores,
+            masked_block_scores,
+            block_selection,
+            converted_block_ids,
+        ), 8 * width
+    if consume:
+        block_scatter = blocks + 1 + 17 * block_topk
+        masks = 2 * padded_width
+        selected_score_validation = 32 * topk
+        return max(block_scatter, masks, selected_score_validation), 0
+    return 0, 0

@@ -377,7 +377,7 @@ class DeepGemmCandidateIndexer(CandidateIndexer):
         nblocks, valid_lens = candidate_row_lens(inputs.compress_lens, self.topk_blocks)
         blocks = torch.empty(rows, self.topk_blocks, dtype=torch.int32, device=device)
         # the block keys read the score rows through 32-byte vectors
-        for tile, logits in score_tiles(inputs, width_align=8):
+        for tile, logits in score_tiles(inputs, block_size=self.block_size):
             lens = inputs.compress_lens[tile]
             topk_transform_ragged_v2(
                 logits,
@@ -400,6 +400,7 @@ class DeepGemmCandidateIndexer(CandidateIndexer):
                 ),
                 out_indices=blocks[tile],
             )
+            del logits, keys
         request_ids = torch.repeat_interleave(
             torch.arange(
                 len(inputs.rows_per_request), dtype=torch.int32, device=device

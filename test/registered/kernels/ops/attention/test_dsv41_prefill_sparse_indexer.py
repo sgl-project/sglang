@@ -2,13 +2,16 @@
 block selection and the dense implementation of the same protocol."""
 
 import unittest
+import weakref
 from typing import NamedTuple
+from unittest.mock import patch
 
 import msgspec
 import torch
 
 from sglang.kernels.ops.attention.dsv4.fp4_indexer import quantize_fp4_indexer_tensor
 from sglang.srt.layers.attention.dsv4.candidate_indexer import (
+    PrefillIndexerBudget,
     PrefillIndexerInputs,
     select_candidate_blocks,
 )
@@ -94,6 +97,7 @@ def make_case(rows, ctx, seed) -> Case:
         .contiguous(),
         kv_page_size=PAGE,
         compress_ratio=1,
+        budget=PrefillIndexerBudget(bytes=2 << 30),
     )
     return Case(dense, lens, inputs)
 
@@ -152,6 +156,35 @@ class TestPrefillSparseIndexer(CustomTestCase):
 
         self.sparse = DeepGemmCandidateIndexer(TOPK_BLOCKS, BLOCK)
         self.dense = DenseCandidateIndexer(TOPK_BLOCKS, BLOCK)
+
+    @torch.inference_mode()
+    def test_publish_releases_each_score_tile_before_allocating_the_next(self):
+        """Adjacent tiles must not coexist even when the caller iterates a generator."""
+        from deep_gemm import fp8_fp4_mqa_logits
+
+        case = make_case(256, 40000, seed=17)
+        expected, expected_positions = publish(self.sparse, case.inputs)
+        case.inputs.budget.bytes = 8 << 20
+        previous = None
+        tiles = 0
+
+        def checked_logits(*args, **kwargs):
+            nonlocal previous, tiles
+            if previous is not None:
+                self.assertIsNone(previous())
+            logits = fp8_fp4_mqa_logits(*args, **kwargs)
+            previous = weakref.ref(logits)
+            tiles += 1
+            return logits
+
+        with patch("deep_gemm.fp8_fp4_mqa_logits", new=checked_logits):
+            actual, actual_positions = publish(self.sparse, case.inputs)
+        self.assertGreater(tiles, 1)
+        self.assertIsNone(previous())
+        torch.testing.assert_close(actual.blocks, expected.blocks)
+        torch.testing.assert_close(
+            actual_positions.sort().values, expected_positions.sort().values
+        )
 
     @torch.inference_mode()
     def test_publish_prefill_is_the_torch_block_selection(self):

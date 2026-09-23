@@ -5,6 +5,7 @@ import torch
 
 from sglang.kernels.ops.attention.dsv4.fp4_indexer import quantize_fp4_indexer_tensor
 from sglang.srt.layers.attention.dsv4 import dense_prefill_indexer
+from sglang.srt.layers.attention.dsv4.candidate_indexer import PrefillIndexerBudget
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -45,6 +46,7 @@ def make_inputs(request_lengths, ratio=1, zero_queries=False, seed=17):
         topk=512,
         candidate_topk_blocks=2,
         candidate_block_size=8,
+        budget=PrefillIndexerBudget(bytes=2 << 30),
     )
 
 
@@ -119,10 +121,9 @@ class TestDensePrefillIndexer(CustomTestCase):
                     )
                     consumer_inputs["kv"] = inputs["kv"]
                     consumer_inputs["candidate_topk_blocks"] = 128
+                    consumer_inputs["budget"] = inputs["budget"]
                     consumer_scores = dense_scores(consumer_inputs)
-                    with patch.object(
-                        dense_prefill_indexer, "_SCORE_BUDGET_BYTES", 128 << 10
-                    ):
+                    with patch.object(inputs["budget"], "bytes", 128 << 10):
                         selected, candidates = dense_prefill_indexer.dense_prefill_topk(
                             **inputs, publish_candidates=True, candidates=None
                         )
@@ -258,7 +259,7 @@ class TestDensePrefillIndexer(CustomTestCase):
                     return logits
 
                 with (
-                    patch.object(dense_prefill_indexer, "_SCORE_BUDGET_BYTES", budget),
+                    patch.object(inputs["budget"], "bytes", budget),
                     patch("deep_gemm.fp8_fp4_mqa_logits", new=checked_logits),
                 ):
                     selected, _ = dense_prefill_indexer.dense_prefill_topk(
@@ -269,7 +270,7 @@ class TestDensePrefillIndexer(CustomTestCase):
                 self.assert_topk(inputs, selected, expected)
 
     def test_score_memory_is_bounded(self):
-        for context, limit_gib in ((65536, 3), (65535, 5)):
+        for context in (65536, 65535):
             with self.subTest(context=context):
                 inputs = make_inputs([(16384, context)])
                 inputs["candidate_topk_blocks"] = 2048
@@ -281,7 +282,8 @@ class TestDensePrefillIndexer(CustomTestCase):
                 )
                 torch.cuda.synchronize()
                 self.assertLess(
-                    torch.cuda.max_memory_allocated() - baseline, limit_gib << 30
+                    torch.cuda.max_memory_allocated() - baseline,
+                    inputs["budget"].bytes + (224 << 20),
                 )
                 self.assertEqual(tuple(selected.shape), (16384, 512))
                 self.assertEqual(
@@ -303,7 +305,8 @@ class TestDensePrefillIndexer(CustomTestCase):
                     torch.cuda.synchronize()
                     self.assertIsNone(published)
                     self.assertLess(
-                        torch.cuda.max_memory_allocated() - baseline, 4 << 30
+                        torch.cuda.max_memory_allocated() - baseline,
+                        inputs["budget"].bytes + (64 << 20),
                     )
                     self.assertEqual(tuple(selected.shape), (16384, 512))
                     del selected
