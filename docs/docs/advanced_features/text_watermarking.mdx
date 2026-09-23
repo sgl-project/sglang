@@ -179,6 +179,33 @@ Face-compatible tokenizer and no special tokens; prefer the returned token IDs
 when available. In dual-key mode, the result also reports each key's partition.
 `log_p_value` stays finite when the p-value underflows to zero on long texts.
 
+### Standalone detector usage
+
+The import above is intended for an SGLang environment. To run detection
+without installing SGLang or Torch, copy the package directory into a separate
+application:
+
+```bash
+cp -R python/sglang/srt/sampling/watermarking detector_app/watermarking
+python -m pip install msgspec
+```
+
+Then import the copied package directly:
+
+```python
+from watermarking.detector import WatermarkDetector
+
+detector = WatermarkDetector("0123456789abcdef")
+result = detector.detect_tokens(
+    completion_token_ids,
+    prompt_token_ids=prompt_token_ids,
+)
+```
+
+The copied detector uses the Python standard library and `msgspec`. NumPy is
+optional for applications that store token arrays in NumPy formats; the
+detector itself does not import it.
+
 ## Detector specification
 
 A compatible detector must use the same tokenizer and the exact prompt token

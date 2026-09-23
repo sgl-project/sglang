@@ -6,7 +6,7 @@ from typing import Iterable, Optional, Protocol, Sequence
 
 import msgspec
 
-from sglang.srt.sampling.watermarking.config import (
+from .config import (
     MAX_WATERMARK_CONTEXT_WINDOW,
     MAX_WATERMARKED_CONTEXTS_PER_REQUEST,
     parse_watermark_key,

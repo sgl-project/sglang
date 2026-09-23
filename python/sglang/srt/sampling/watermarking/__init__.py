@@ -1,4 +1,4 @@
-from sglang.srt.sampling.watermarking.detector import (
+from .detector import (
     WatermarkDetection,
     WatermarkDetector,
     WatermarkStatistics,

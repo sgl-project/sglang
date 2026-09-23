@@ -1,8 +1,12 @@
 import ast
 import math
+import os
+import shutil
+import subprocess
 import sys
 from pathlib import Path
 
+import msgspec
 import pytest
 import torch
 
@@ -234,6 +238,48 @@ def test_detector_dependencies_do_not_import_torch(module):
         elif isinstance(node, ast.ImportFrom) and node.module:
             imported.add(node.module.split(".")[0])
     assert "torch" not in imported
+
+
+def test_detector_package_is_standalone(tmp_path):
+    """Copying the package must not retain repository-qualified imports."""
+    standalone_root = tmp_path / "standalone"
+    shutil.copytree(
+        Path(detector_module.__file__).parent, standalone_root / "watermarking"
+    )
+    shutil.copytree(Path(msgspec.__file__).parent, standalone_root / "msgspec")
+    script = """
+import importlib.util
+import sys
+
+sys.path.insert(0, sys.argv[1])
+assert importlib.util.find_spec("sglang") is None
+assert "sglang" not in sys.modules
+assert "torch" not in sys.modules
+from watermarking.detector import WatermarkDetector
+
+assert "sglang" not in sys.modules
+assert "torch" not in sys.modules
+prompt = [100, 200, 300, 400]
+tokens = [
+    5, 33, 16, 8, 25, 28, 63, 47, 41, 27, 3, 6, 4, 13, 22, 2,
+    48, 32, 2, 52, 27, 41, 60, 45, 53, 4, 3, 51, 19, 38, 3, 20,
+]
+result = WatermarkDetector("0123456789abcdef").detect_tokens(
+    tokens, prompt_token_ids=prompt
+)
+assert result.combined.num_contexts == 32
+assert result.combined.p_value < 1e-30
+"""
+    env = os.environ.copy()
+    env.pop("PYTHONPATH", None)
+    completed = subprocess.run(
+        [sys.executable, "-I", "-S", "-c", script, str(standalone_root)],
+        cwd=tmp_path,
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+    assert completed.returncode == 0, completed.stderr
 
 
 if __name__ == "__main__":

@@ -7,12 +7,12 @@ from typing import TYPE_CHECKING, Any, Optional, Sequence
 import msgspec
 import torch
 
-from sglang.srt.sampling.watermarking.config import (
+from .config import (
     MAX_WATERMARKED_CONTEXTS_PER_REQUEST,
     WatermarkServerConfig,
     parse_watermark_key,
 )
-from sglang.srt.sampling.watermarking.detector import hash_context
+from .detector import hash_context
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import ScheduleBatch
