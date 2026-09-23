@@ -284,8 +284,10 @@ class Mxfp4FlashinferTrtllmMoEMethod:
         hidden_states = dispatch_output.hidden_states
         topk_output = dispatch_output.topk_output
 
-        w13 = layer.w13_weight
-        w2 = layer.w2_weight
+        # Loaders keep signed checkpoint bytes; FlashInfer identifies packed FP4
+        # and its logical dimensions through unsigned, zero-copy byte views.
+        w13 = layer.w13_weight.view(torch.uint8)
+        w2 = layer.w2_weight.view(torch.uint8)
         w13_scale = getattr(layer, _shuffled_scale_name("w13_weight_scale_inv")).view(
             torch.float8_e4m3fn
         )
