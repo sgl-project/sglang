@@ -100,3 +100,16 @@ class Olmo3Config(PretrainedConfig):
                 "sliding_attention" if (i + 1) % 4 != 0 else "full_attention"
                 for i in range(self.num_hidden_layers)
             ]
+
+        # Read by is_hybrid_swa_model() and get_hybrid_layer_ids().
+        _layer_types = list(self.layer_types)[: self.num_hidden_layers]
+        if len(_layer_types) < self.num_hidden_layers:
+            _layer_types += ["full_attention"] * (
+                self.num_hidden_layers - len(_layer_types)
+            )
+        self.hybrid_layer_pattern = [
+            1 if lt == "sliding_attention" else 0 for lt in _layer_types
+        ]
+        self.is_hybrid_swa = bool(self.sliding_window) and (
+            0 < sum(self.hybrid_layer_pattern) < self.num_hidden_layers
+        )
