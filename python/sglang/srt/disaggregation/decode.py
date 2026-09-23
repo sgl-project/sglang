@@ -746,6 +746,21 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         ).to_dec_params()
         return self._build_decode_prefix_match(req, result)
 
+    def _prepare_streaming_session_preallocation(
+        self, req: Req
+    ) -> Optional[torch.Tensor]:
+        """Restore an existing session row before reserving transfer destinations."""
+        session = getattr(req, "session", None)
+        if session is None or not session.streaming or not session.req_nodes:
+            return None
+
+        req.init_next_round_input(self.tree_cache)
+        if not req.kv.holds_kv:
+            # A previous aborted turn may have released the slot. The retained
+            # token history still allows the ordinary full-prefill path.
+            return None
+        return req.prefix_indices
+
     def _resolve_prefill_dp_rank(self, req: Req) -> Optional[int]:
         prefill_info = self.kv_manager.prefill_info_table.get(_bootstrap_addr(req))
         # If None, it will go to the slow path and resolve prefill_info by _ensure_prefill_info then cache it
@@ -1288,22 +1303,6 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             if not decode_req.waiting_for_input:
                 continue
 
-            if self.req_to_token_pool.available_size() <= 0:
-                break
-
-            # Hybrid models (e.g. K3 with KDA): guard against prealloc
-            # draining the mamba pool before the KV pool (would assert "Not
-            # enough space for mamba cache"). Evict a cached mamba slot from
-            # the radix tree first (only if it manages mamba states;
-            # ChunkCache.evict is a no-op), else stop.
-            mamba_allocator = getattr(self.req_to_token_pool, "mamba_allocator", None)
-            if mamba_allocator is not None and mamba_allocator.available_size() <= 0:
-                supports_mamba = self.tree_cache.supports_mamba()
-                if supports_mamba and hasattr(self.tree_cache, "evict"):
-                    self.tree_cache.evict(EvictParams(num_tokens=0, mamba_num=1))
-                if mamba_allocator.available_size() <= 0:
-                    break
-
             if self.req_to_metadata_buffer_idx_allocator.available_size() <= 0:
                 break
 
@@ -1315,6 +1314,33 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             ):
                 continue
 
+            streaming_prefix = (
+                self._prepare_streaming_session_preallocation(decode_req.req)
+                if not decode_req.is_rebootstrap
+                else None
+            )
+            reused_session_row = streaming_prefix is not None
+            if not reused_session_row and self.req_to_token_pool.available_size() <= 0:
+                # A later continuation may already own its row. Do not let a
+                # fresh request block that session from making progress.
+                continue
+
+            # Hybrid models (e.g. K3 with KDA): guard against prealloc
+            # draining the mamba pool before the KV pool (would assert "Not
+            # enough space for mamba cache"). A restored session may already
+            # own its state; otherwise evict a cached slot if possible.
+            mamba_allocator = getattr(self.req_to_token_pool, "mamba_allocator", None)
+            if (
+                mamba_allocator is not None
+                and not decode_req.req.kv.holds_mamba
+                and mamba_allocator.available_size() <= 0
+            ):
+                supports_mamba = self.tree_cache.supports_mamba()
+                if supports_mamba and hasattr(self.tree_cache, "evict"):
+                    self.tree_cache.evict(EvictParams(num_tokens=0, mamba_num=1))
+                if mamba_allocator.available_size() <= 0:
+                    continue
+
             # Memory estimation: don't add if the projected memory cannot be met
             # TODO: add new_token ratio
             origin_input_len = self._rebootstrap_prefill_len(decode_req.req)
@@ -1323,7 +1349,14 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 get_disagg().disaggregation_decode_enable_radix_cache
                 and not decode_req.is_rebootstrap
             )
-            if use_decode_radix_cache:
+            if reused_session_row:
+                prefix_indices = streaming_prefix
+                prefix_len = total_prefix_len = len(prefix_indices)
+                required_alloc_tokens = self._required_alloc_tokens(
+                    fill_len=self._pre_alloc_fill_len(decode_req.req),
+                    prefix_len=prefix_len,
+                )
+            elif use_decode_radix_cache:
                 # Match prefix against decode's radix cache.
                 prefix_match = self._match_prefix_and_lock(decode_req.req)
                 prefix_indices = prefix_match.prefix_indices
@@ -1478,13 +1511,23 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     count_retracted=True,
                     extra_reserved_reqs=len(preallocated_reqs) + 1,
                 )
-            decode_req.req.kv.cache_protected_len = total_prefix_len
+            if not reused_session_row:
+                decode_req.req.kv.cache_protected_len = total_prefix_len
 
             page_size = self.token_to_kv_pool_allocator.page_size
+            # Session KV may end within a page. Allocation can extend that
+            # page, but the transport sends whole pages: include the shared
+            # partial page in the transfer rather than dropping the last page
+            # of an unaligned suffix. The session has only one active turn.
+            transfer_prefix_len = (
+                page_align_floor(total_prefix_len, page_size)
+                if reused_session_row
+                else total_prefix_len
+            )
             kv_transfer_page_size = page_size
             raw_kv_indices = self.req_to_token_pool.req_to_token[
                 decode_req.req.kv.req_pool_idx
-            ][total_prefix_len:origin_input_len]
+            ][transfer_prefix_len:origin_input_len]
             if self.scheduler.enable_hisparse:
                 # Direct-to-host sends host/C4 rows; keep allocator.page_size
                 # logical and use the compressed page size only for these indices.
@@ -1635,7 +1678,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                         "DSV4 HiSparse direct PD transfer currently requires "
                         "the Mooncake backend"
                     )
-            metadata_kwargs = {"decode_prefix_len": total_prefix_len}
+            metadata_kwargs = {"decode_prefix_len": transfer_prefix_len}
             if device_page_indices is not None:
                 metadata_kwargs["device_kv_indices"] = device_page_indices
             if (
@@ -2872,13 +2915,10 @@ class SchedulerDisaggregationDecodeMixin:
             # we can only add at least `num_not_used_batch` new batch to the running queue
             if i < num_not_used_batch:
                 can_run_list.append(req)
-                # Decode-radix path: new requests already matched in
-                # `pop_preallocated`. Retracted requests reset `last_node`,
-                # so re-match only when that state is missing.
-                if get_disagg().disaggregation_decode_enable_radix_cache:
-                    tree_cache = self.tree_cache if req.last_node is None else None
-                else:
-                    tree_cache = self.tree_cache
+                # Radix hits and session continuations already matched before
+                # preallocation. A second session match would trim the row
+                # after its destinations were published to prefill.
+                tree_cache = self.tree_cache if req.last_node is None else None
                 req.init_next_round_input(tree_cache)
                 # Truncate fill_len to kv_committed_len so cache_unfinished_req
                 # only sees committed KV (full array includes one uncommitted
