@@ -239,6 +239,15 @@ class _FusedQKVIndexProj(nn.Module):
         return self._qm.apply(self, x, None)
 
 
+def _normalize_qknorm_rope_positions_for_cuda_graph(
+    positions: torch.Tensor, hidden_states: torch.Tensor
+) -> torch.Tensor:
+    """Drop tc_piecewise graph padding before fused QKNorm/RoPE."""
+    if positions.shape[0] <= hidden_states.shape[0]:
+        return positions
+    return positions[: hidden_states.shape[0]]
+
+
 def build_minimax_fused_qkv_index(model: nn.Module) -> None:
     for module in model.modules():
         if isinstance(module, MiniMaxM3Attention):
@@ -1120,6 +1129,13 @@ class MiniMaxM3Attention(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
     ):
+        if (
+            self._use_fused_qknorm_rope or self._combined_qknorm_ok
+        ) and check_cuda_graph_backend(Phase.PREFILL, Backend.TC_PIECEWISE):
+            positions = _normalize_qknorm_rope_positions_for_cuda_graph(
+                positions, hidden_states
+            )
+
         fused_out = None
         if self._fused_qkv_index is not None:
             fused_out = self.fused_qkv_index_proj(hidden_states)
