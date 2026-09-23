@@ -43,6 +43,16 @@ def handle_pd_disaggregation(server_args: ServerArgs) -> None:
             "with MC_FORCE_TCP=1 (TCP transport, no RDMA)"
         )
 
+    if cfg.disaggregation_decode_allocation_policy == "prefill_complete":
+        _validate_prefill_complete(server_args)
+        if (
+            cfg.disaggregation_mode == "prefill"
+            and cfg.optimistic_prefill_attempts == 0
+        ):
+            declare_resolution(
+                server_args, "handle_pd_disaggregation", optimistic_prefill_attempts=1
+            )
+
     if cfg.disaggregation_mode == "prefill" and cfg.dcp_size > 1:
         logger.warning(
             "DCP on a PD prefill server is supported when prefill and decode "
@@ -169,6 +179,50 @@ def handle_pd_disaggregation(server_args: ServerArgs) -> None:
                     + ", ".join(unsupported)
                     + ". Remove these options or drop --enable-pd-role-switch."
                 )
+
+
+def _validate_prefill_complete(server_args: ServerArgs) -> None:
+    cfg = resolving_view(server_args)
+    unsupported = []
+    if cfg.disaggregation_mode not in ("prefill", "decode"):
+        unsupported.append("aggregated serving")
+    if cfg.disaggregation_transfer_backend != "mooncake":
+        unsupported.append("transfer backends other than Mooncake")
+    if cfg.pp_size != 1 or cfg.attn_cp_size != 1 or cfg.dcp_size != 1:
+        unsupported.append("pipeline or attention context parallelism")
+    attn_dp_size = cfg.dp_size if cfg.enable_dp_attention else 1
+    if cfg.tp_size != attn_dp_size:
+        unsupported.append("attention tensor parallelism greater than one")
+    if cfg.enable_pdmux or cfg.decoupled_spec_role != "null":
+        unsupported.append("PD multiplexing or decoupled speculation")
+    if cfg.enable_pd_role_switch:
+        unsupported.append("runtime PD role switching")
+    if cfg.encoder_only or cfg.language_only:
+        unsupported.append("encoder disaggregation")
+    if cfg.enable_hisparse:
+        unsupported.append("HiSparse")
+    if cfg.disaggregation_mode == "decode" and (
+        cfg.disaggregation_decode_enable_radix_cache or cfg.enable_hierarchical_cache
+    ):
+        unsupported.append("decode radix cache or decode HiCache")
+    if (
+        cfg.disaggregation_mode == "prefill"
+        and cfg.enable_hierarchical_cache
+        and (
+            cfg.hicache_storage_backend is not None
+            or cfg.hicache_write_policy != "write_back"
+        )
+    ):
+        unsupported.append("prefill HiCache other than L2 write_back")
+    if envs.SGLANG_DISAGG_STAGING_BUFFER.get():
+        unsupported.append("staging buffers")
+    if envs.SGLANG_RUST_SERVER.get():
+        unsupported.append("the Rust bootstrap registry")
+    if unsupported:
+        raise ValueError(
+            "--disaggregation-decode-allocation-policy prefill_complete does not "
+            "yet support " + ", ".join(unsupported)
+        )
 
 
 def _alias_bootstrap_port_to_api_port(server_args: ServerArgs) -> None:

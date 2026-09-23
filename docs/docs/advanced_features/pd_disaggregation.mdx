@@ -20,6 +20,46 @@ For the design details, please refer to [link](https://docs.google.com/document/
 
 Currently, we support Mooncake and NIXL as the transfer engine.
 
+## Decode allocation policy
+
+By default, decode reserves each request's destination KV slots before prefill
+finishes. Long prefills can hold these slots while decode waits for the KV data.
+To delay this reservation, set the following flag on **both prefill and decode**:
+
+```bash
+--disaggregation-decode-allocation-policy prefill_complete
+```
+
+With `prefill_complete`, prefill computes without waiting for destination slots,
+then signals readiness after accepting its final prefill result. Decode reserves
+slots and starts the existing KV transfer handshake only after that signal.
+This changes per-request KV reservation, not the size or creation of the global
+KV pool. The default `early` policy preserves the existing behavior.
+
+Deferring allocation can help when long prefills compete with active decode
+requests for destination KV capacity. It also retains KV on prefill longer and
+removes overlap between chunked prefill and KV transfer. Compare both policies
+for your workload; this option is not a general throughput improvement.
+
+This initial implementation requires Mooncake (RDMA or `mooncake_tcp`), the Python
+bootstrap registry, and attention TP/CP and pipeline sizes of one. Attention DP
+is allowed when each DP rank has attention TP size one. Prefill automatically
+resolves `--optimistic-prefill-attempts` from zero to one; configurations that
+disable optimistic prefill after model validation are rejected.
+Retries remain eligible for prefill after the optimistic attempt budget is
+exhausted and remain subject to the existing cancellation and timeout handling.
+
+The option does not support staging buffers, runtime PD role switching, PD
+multiplexing, encoder disaggregation, decoupled speculation, HiSparse, decode radix cache, decode
+HiCache, or non-DSA auxiliary state pools. Prefill HiCache is limited to L2 with
+`write_back` and no storage backend. Unsupported configurations fail validation.
+
+All communicating workers must implement and enable the same policy. This
+version of the decode worker rejects policy or peer-layout mismatches before
+destination registration. Older decode workers do not enforce this check. Keep
+`early` on both sides until every worker has been upgraded, then enable the new
+policy on both sides.
+
 ## Profiling in PD Disaggregation Mode
 
 When you need to profile prefill or decode workers in PD disaggregation mode, please refer to the [Profile In PD Disaggregation Mode](../developer_guide/benchmark_and_profiling#profile-in-pd-disaggregation-mode) section in the Benchmark and Profiling guide. Due to torch profiler limitations, prefill and decode workers must be profiled separately using dedicated command-line options.
