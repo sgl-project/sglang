@@ -93,6 +93,7 @@ class SchedulerWeightUpdaterManager:
     metrics_collector: Optional[Any] = None
     offload_tags: set = field(default_factory=set)
     stashed_model_static_state: Any = None
+    # replicated on every TP rank, so a rejected call returns on all ranks before any barrier
     _session_open: bool = False
     _session_loaded_weights: bool = False
     # recorded at begin so end finalizes the same runners
@@ -176,9 +177,12 @@ class SchedulerWeightUpdaterManager:
         recv_req: UpdateWeightsFromDistributedReqInput,
     ) -> Tuple[bool, str]:
         """Update the online model parameter, fanning out to the selected runners."""
-        assert self._session_open, (
-            "update_weights_from_distributed requires an open begin_weight_update session"
-        )
+        if not self._session_open:
+            return UpdateWeightsFromDistributedReqOutput(
+                success=False,
+                message="update_weights_from_distributed must run between "
+                "begin_weight_update() and end_weight_update()",
+            )
         with self._observe_weight_load("distributed"):
             # only the target runner joined the update group; drafts load its receive
             try:
@@ -209,9 +213,12 @@ class SchedulerWeightUpdaterManager:
 
     def update_weights_from_tensor(self, recv_req: UpdateWeightsFromTensorReqInput):
         """Update the online model parameter from tensors on the selected runners."""
-        assert self._session_open, (
-            "update_weights_from_tensor requires an open begin_weight_update session"
-        )
+        if not self._session_open:
+            return UpdateWeightsFromTensorReqOutput(
+                success=False,
+                message="update_weights_from_tensor must run between "
+                "begin_weight_update() and end_weight_update()",
+            )
         with self._observe_weight_load("tensor"):
             monkey_patch_torch_reductions()
             named_tensors = MultiprocessingSerializer.deserialize(
@@ -278,9 +285,12 @@ class SchedulerWeightUpdaterManager:
 
     def begin_weight_update(self, recv_req: BeginWeightUpdateReqInput):
         """Open the session: restore in-place-packed weights on the selected runners."""
-        assert not self._session_open, (
-            "begin_weight_update called while a weight-update session is already open"
-        )
+        if self._session_open:
+            return BeginWeightUpdateReqOutput(
+                success=False,
+                message="a weight-update session is already open; "
+                "call end_weight_update() first",
+            )
         self._session_selector = recv_req.selector
         for _, runner in self._select_runners(recv_req.selector):
             runner.begin_weight_update()
@@ -291,9 +301,11 @@ class SchedulerWeightUpdaterManager:
 
     def end_weight_update(self, recv_req: EndWeightUpdateReqInput):
         """Finalize the runners begin opened; post_load_weights only if no load ran (P2P/RDMA)."""
-        assert self._session_open, (
-            "end_weight_update called without begin_weight_update"
-        )
+        if not self._session_open:
+            return EndWeightUpdateReqOutput(
+                success=False,
+                message="no weight-update session is open; call begin_weight_update() first",
+            )
         run_post_load = not self._session_loaded_weights
         for _, runner in self._select_runners(self._session_selector):
             runner.end_weight_update(run_post_load=run_post_load)

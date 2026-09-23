@@ -330,7 +330,7 @@ This path trades some I/O overhead for simplicity and flexibility. It integrates
 
 ### Weight Update Session
 
-`update_weights_from_tensor` and `update_weights_from_distributed` must run inside a weight-update session. `begin_weight_update` restores in-place-packed quantized weights (e.g. Marlin, UE8M0) to a loadable state; `end_weight_update` finalizes them back into kernel layout, and runs `post_load_weights` if no weights were loaded through the engine during the session (P2P/RDMA writes). One session can span many update calls, so the finalize cost is paid once per refit rather than once per bucket.
+`update_weights_from_tensor` and `update_weights_from_distributed` must run inside a weight-update session. `begin_weight_update` restores in-place-packed quantized weights (e.g. Marlin, UE8M0) to a loadable state; `end_weight_update` finalizes them back into kernel layout, and runs `post_load_weights` if no weights were loaded through the engine during the session (P2P/RDMA writes). One session can span many update calls, so the finalize cost is paid once per refit rather than once per bucket. A call outside a session, a second `begin_weight_update`, or an `end_weight_update` without one is rejected with `success: false` (HTTP 400) and leaves the weights untouched.
 
 **Endpoints:** `POST /begin_weight_update`, `POST /end_weight_update`
 

@@ -216,12 +216,44 @@ def test_end_weight_update_reuses_session_selector_from_begin():
 
 def test_begin_weight_update_rejects_reentry():
     """A second begin would leave the first session's runners unfinalized."""
-    manager = _session_manager(Mock(), Mock())
+    target_runner = Mock()
+    manager = _session_manager(target_runner, Mock())
     manager._session_open = True
 
-    with patch("torch.distributed.barrier"):
-        with pytest.raises(AssertionError, match="already open"):
-            manager.begin_weight_update(BeginWeightUpdateReqInput())
+    output = manager.begin_weight_update(BeginWeightUpdateReqInput())
+
+    assert output.success is False and "already open" in output.message
+    target_runner.begin_weight_update.assert_not_called()
+
+
+def test_end_weight_update_without_session_is_rejected():
+    """Finalizing runners begin never restored would repack weights twice."""
+    target_runner = Mock()
+    manager = _session_manager(target_runner, Mock())
+    manager._session_open = False
+
+    output = manager.end_weight_update(EndWeightUpdateReqInput())
+
+    assert output.success is False and "begin_weight_update" in output.message
+    target_runner.end_weight_update.assert_not_called()
+
+
+def test_update_without_session_is_rejected_without_loading():
+    """A caller that skips begin gets an error back instead of crashing the scheduler."""
+    target_runner = Mock()
+    manager = _manager(
+        tp_worker=SimpleNamespace(
+            model_runner=target_runner,
+            weight_update_runners=lambda: [("target", target_runner)],
+        ),
+        draft_worker=None,
+    )
+    manager._session_open = False
+
+    output = manager.update_weights_from_distributed(_distributed_req())
+
+    assert output.success is False and "begin_weight_update" in output.message
+    target_runner.weight_updater.receive_weights_from_distributed.assert_not_called()
 
 
 if __name__ == "__main__":
