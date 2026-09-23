@@ -286,6 +286,12 @@ def _resolve_deferred_qkv_scale_inv(
         )
 
 
+def get_attention_sliding_window_size(config):
+    # RadixAttention's window excludes the query token, while config.sliding_window_size
+    # counts it (HF attends that many keys including the query).
+    return config.sliding_window_size - 1
+
+
 class MiMoV2MLP(nn.Module):
     def __init__(
         self,
@@ -797,9 +803,7 @@ class MiMoV2DecoderLayer(nn.Module):
                 head_dim=config.swa_head_dim,
                 v_head_dim=getattr(config, "swa_v_head_dim", None),
                 v_scale=getattr(config, "attention_value_scale", None),
-                # RadixAttention's window excludes the query token; the HF reference (and Megatron) attend
-                # sliding_window_size keys including it, as Gemma's get_attention_sliding_window_size does.
-                sliding_window_size=config.sliding_window_size - 1,
+                sliding_window_size=get_attention_sliding_window_size(config),
                 attention_bias=config.attention_bias,
                 attention_sink_bias=getattr(
                     config, "add_swa_attention_sink_bias", False
@@ -1694,6 +1698,9 @@ class MiMoV2ForCausalLM(nn.Module, AudioEncoderMixin):
     def load_kv_cache_scales(self, quantization_param_path: str) -> None:
         if self.model is not None:
             self.model.load_kv_cache_scales(quantization_param_path)
+
+    def get_attention_sliding_window_size(self):
+        return get_attention_sliding_window_size(self.config)
 
     @classmethod
     def get_model_config_for_expert_location(cls, config):
