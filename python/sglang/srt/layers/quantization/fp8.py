@@ -724,30 +724,34 @@ class Fp8LinearMethod(LinearMethodBase):
         if self.convert_mxfp8_to_block:
             from sglang.srt.layers.quantization.mxfp8_block_convert import (
                 convert_mxfp8_weight_to_block_fp8,
+                dequant_mxfp8_2d_to_bf16,
             )
 
-            if _is_gfx95_supported:
-                from sglang.srt.layers.quantization.mxfp8_block_convert import (
-                    dequant_mxfp8_2d_to_bf16,
-                )
-
-                bf16_weight = dequant_mxfp8_2d_to_bf16(
-                    layer.weight.data, layer.weight_scale_inv.data
-                )
+            mx_weight, mx_scale = layer.weight.data, layer.weight_scale_inv.data
             qweight, scale = convert_mxfp8_weight_to_block_fp8(
-                layer.weight.data, layer.weight_scale_inv.data, block=128
+                mx_weight, mx_scale, block=128
             )
             layer.weight = Parameter(qweight, requires_grad=False)
-            # Small-M fast-path weights, consumed by aiter_w8a8_block_fp8_linear;
-            # attrs survive the later in-place bpreshuffle (copy_ keeps the object).
-            if _is_gfx95_supported:
-                w32 = bf16_weight.float()
-                row_scale = w32.abs().amax(dim=1, keepdim=True).clamp(min=1e-12) / 448.0
+            if (
+                _use_aiter
+                and _is_gfx95_supported
+                and self.w8a8_block_fp8_linear is aiter_w8a8_block_fp8_linear
+            ):
+                # rowwise-fp8 copy for the small-M path of aiter_w8a8_block_fp8_linear;
+                # the later bpreshuffle is an in-place copy_, so these attrs survive
+                weight_fp32 = dequant_mxfp8_2d_to_bf16(mx_weight, mx_scale).float()
+                fp8_max = torch.finfo(torch.float8_e4m3fn).max
+                row_scale = (
+                    weight_fp32.abs().amax(dim=1, keepdim=True).clamp(min=1e-12)
+                    / fp8_max
+                )
                 layer.weight._ptpc_weight = shuffle_weight(
-                    (w32 / row_scale).clamp(-448.0, 448.0).to(torch.float8_e4m3fn),
+                    (weight_fp32 / row_scale)
+                    .clamp(-fp8_max, fp8_max)
+                    .to(torch.float8_e4m3fn),
                     (16, 16),
                 )
-                layer.weight._ptpc_scale = row_scale.to(torch.float32)
+                layer.weight._ptpc_scale = row_scale
             layer.weight_scale_inv = Parameter(scale, requires_grad=False)
             self.use_mxfp8 = False
             self.convert_mxfp8_to_block = False
