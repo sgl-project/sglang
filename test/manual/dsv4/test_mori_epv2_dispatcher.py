@@ -6,7 +6,8 @@ from types import SimpleNamespace
 import torch
 import torch.distributed as dist
 
-import sglang.srt.layers.moe.token_dispatcher.moriepv2 as adapter
+import sglang.srt.layers.moe.token_dispatcher.moriep as adapter
+from sglang.srt.environ import envs
 from sglang.srt.layers.moe.topk import StandardTopKOutput
 from sglang.srt.layers.moe.utils import DeepEPMode
 
@@ -99,7 +100,8 @@ def main():
         world_rank=rank,
     )
     group = _Group(dist.group.WORLD)
-    dispatcher = adapter.MoriEPv2Dispatcher(
+    envs.SGLANG_MORI_EP_VERSION.set("epv2")
+    dispatcher = adapter.MoriEPDispatcher(
         group=group,
         router_topk=topk,
         num_experts=num_experts,
@@ -140,7 +142,7 @@ def main():
         )
     )
     torch.cuda.synchronize()
-    dispatcher.op.comm.barrier()
+    dispatcher._get_impl().mori_op.comm.barrier()
 
     expected = (
         _expected_unique_destinations(topk_ids, experts_per_rank) * hidden.float().cpu()
@@ -178,11 +180,11 @@ def main():
                 )
             )
         torch.cuda.synchronize()
-        dispatcher.op.comm.barrier()
+        dispatcher._get_impl().mori_op.comm.barrier()
         for _ in range(graph_replays):
             graph.replay()
             torch.cuda.synchronize()
-            dispatcher.op.comm.barrier()
+            dispatcher._get_impl().mori_op.comm.barrier()
         graph_ok = torch.allclose(
             graph_combined.float().cpu(),
             expected.float(),
@@ -201,7 +203,7 @@ def main():
             )
         )
         torch.cuda.synchronize()
-        dispatcher.op.comm.barrier()
+        dispatcher._get_impl().mori_op.comm.barrier()
         eager_after_graph_ok = torch.allclose(
             eager_after_graph.float().cpu(),
             expected.float(),
@@ -223,8 +225,8 @@ def main():
                 flush=True,
             )
 
-    dispatcher.op.close()
-    dispatcher.op.comm.destroy()
+    dispatcher._get_impl().mori_op.close()
+    dispatcher._get_impl().mori_op.comm.destroy()
     dist.destroy_process_group()
     raise SystemExit(int(failures.item() != 0))
 
