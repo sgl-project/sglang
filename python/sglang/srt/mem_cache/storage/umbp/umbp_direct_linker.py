@@ -42,6 +42,20 @@ CHUNK_PAGES = 64
 RANGES_PER_CALL = int(os.getenv("UMBP_RANGES_PER_CALL", "8192"))
 
 
+def _storage_suffix(
+    *, rank_replicated: bool, tp_rank: int, attn_cp_rank: int, pp_rank: int
+) -> str:
+    # A rank-replicated group (MLA / DSA) holds byte-identical pages on every
+    # attention TP rank, so a tp term stores tp_size copies of the same page.
+    # Only the key collapses -- every rank still writes, because a Local-mode
+    # tier is private to its rank and a standalone server is per node.
+    parts = []
+    if not rank_replicated:
+        parts.append(f"tp{tp_rank}")
+    parts.extend((f"cp{attn_cp_rank}", f"pp{pp_rank}"))
+    return "_".join(parts)
+
+
 def _ordered_layers(entry) -> list[int]:
     component_lengths = {len(component) for component in entry.components}
     if len(component_lengths) != 1:
@@ -214,6 +228,7 @@ class UMBPDirectLinker(UnifiedCacheLinker):
             params=params,
             components=components,
         )
+        rank_replicated = self.pool_group.rank_replicated
         self.pools = self.pool_group.entry_map
         self.num_layers = self.pool_group.num_layers
         if self.num_layers <= 0:
@@ -346,7 +361,12 @@ class UMBPDirectLinker(UnifiedCacheLinker):
             self.storage.mem_pool_host = self.pool_group
             self.storage._kv_anchor_is_logical = True
             self.storage.registered_pools = self.pools
-            rank_suffix = f"tp{tp_rank}_cp{params.attn_cp_rank}_pp{params.pp_rank}"
+            rank_suffix = _storage_suffix(
+                rank_replicated=rank_replicated,
+                tp_rank=tp_rank,
+                attn_cp_rank=params.attn_cp_rank,
+                pp_rank=params.pp_rank,
+            )
             self.storage.mla_suffix = rank_suffix
             self.storage.mha_suffix = rank_suffix
             self._register_buffers()
@@ -355,9 +375,12 @@ class UMBPDirectLinker(UnifiedCacheLinker):
             # all, and it used to say "standalone_process" unconditionally, so
             # it could not have shown an embedded run for what it was.
             logger.info(
-                "UMBPDirectLinker topology=%s+%s ranged_io=yes",
+                "UMBPDirectLinker topology=%s+%s ranged_io=yes "
+                "rank_replicated=%s suffix=%s",
                 mode.name,
                 self.backend_mode.name if self.backend_mode is not None else None,
+                rank_replicated,
+                rank_suffix,
             )
         except BaseException:
             self.storage.close()

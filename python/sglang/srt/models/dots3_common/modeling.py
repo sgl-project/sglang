@@ -19,6 +19,7 @@
 import concurrent.futures
 import logging
 import math
+from array import array
 from dataclasses import dataclass
 from enum import IntEnum, auto
 from typing import (
@@ -514,7 +515,7 @@ class Dots3MoE(nn.Module):
             topk_output = self.topk(
                 hidden_states,
                 router_logits,
-                num_token_non_padded=forward_batch.num_token_non_padded,
+                num_token_non_padded=forward_batch.moe_num_token_non_padded(),
                 expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
                     layer_id=self.layer_id,
                 ),
@@ -576,7 +577,7 @@ class Dots3MoE(nn.Module):
                 state.topk_weights_local, state.topk_idx_local, _ = self.topk(
                     hidden_states=hidden_states,
                     router_logits=router_logits,
-                    num_token_non_padded=state.forward_batch.num_token_non_padded,
+                    num_token_non_padded=state.forward_batch.moe_num_token_non_padded(),
                     expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
                         layer_id=self.layer_id,
                     ),
@@ -1921,10 +1922,10 @@ class Dots3LanguageModelForCausalLM(nn.Module):
 
     def pad_input_ids(
         self,
-        input_ids: List[int],
+        input_ids: array,
         mm_inputs: MultimodalInputs,
         **kwargs,
-    ) -> List[int]:
+    ) -> array:
         token_pairs = []
         if mm_inputs.im_start_id is not None and mm_inputs.im_end_id is not None:
             token_pairs.append((mm_inputs.im_start_id, mm_inputs.im_end_id))
@@ -2637,7 +2638,7 @@ class DotsNoteOmniThinkerForConditionalGeneration(nn.Module):
     def get_input_embeddings(self):
         return self.language_model.get_input_embeddings()
 
-    def pad_input_ids(self, input_ids, mm_inputs, **kwargs):
+    def pad_input_ids(self, input_ids: array, mm_inputs, **kwargs) -> array:
         return self.language_model.pad_input_ids(input_ids, mm_inputs, **kwargs)
 
     def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:

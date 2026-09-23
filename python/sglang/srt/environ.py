@@ -163,7 +163,7 @@ class _DeprecatedEnvFallback:
     check *deprecated_name* and emit DeprecationWarning before reading it.
 
     Usage:
-        SGLANG_DSA_FUSE_TOPK = EnvBoolWithAlias(True, deprecated_name="SGLANG_NSA_FUSE_TOPK")
+        SGLANG_NEW_NAME = EnvBoolWithAlias(True, deprecated_name="SGLANG_OLD_NAME")
     """
 
     def __init__(self, default: Any, deprecated_name: str, secret: bool = False):
@@ -455,12 +455,8 @@ class Envs:
     # reaches this many requests (0 = first decode batch). Lets a batch-size bench
     # capture steady-state full-admission decode steps instead of the ramp-up.
     SGLANG_PROFILE_BY_STAGE_DECODE_MIN_BS = EnvInt(0)
-    SGLANG_ENABLE_NVTX_SCHEDULER = EnvBoolWithAlias(
-        False, deprecated_name="SGLANG_ENABLE_NVTX"
-    )
-    SGLANG_ENABLE_NVTX_OPERATIONS = EnvBoolWithAlias(
-        False, deprecated_name="SGLANG_OPERATIONS_ENABLE_PROFILE"
-    )
+    SGLANG_ENABLE_NVTX_SCHEDULER = EnvBool(False)
+    SGLANG_ENABLE_NVTX_OPERATIONS = EnvBool(False)
     SGLANG_RECORD_STEP_TIME = EnvBool(False)
     SGLANG_ENABLE_CUDA_GRAPH_CAPTURE_TRACE = EnvBool(False)
     # Opt-in: emit one CUDA-graph capture trace per captured batch size (per-bs).
@@ -662,7 +658,6 @@ class Envs:
     # ===================================================================
     # Radix and sparse KV caches
     # ===================================================================
-    SGLANG_EXPERIMENTAL_CPP_RADIX_TREE = EnvBool(False)
     SGLANG_RADIX_FORCE_MISS = EnvBool(False)
     SGLANG_CHUNKED_PREFIX_CACHE_THRESHOLD = EnvInt(8192)
     SGLANG_MAX_KV_CHUNK_CAPACITY = EnvInt(128 * 1024)
@@ -672,10 +667,6 @@ class Envs:
     SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS = EnvBool(True)
     # Decode batches between SWA out-of-window evictions.
     SGLANG_SWA_EVICTION_INTERVAL = EnvInt(128)
-    # Deprecated: the unified radix tree is the default tree cache now, so the
-    # registry no longer reads this. Kept because a few model/arch call sites
-    # still assert on it; do not use in new code.
-    SGLANG_ENABLE_UNIFIED_RADIX_TREE = EnvBool(False)
     # Registered TreeCore backend serving the unified radix cache.
     SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND = EnvStr("python")
     SGLANG_OPT_SWA_RELEASE_LEAF_LOCK_AFTER_WINDOW = EnvBool(False)
@@ -750,6 +741,9 @@ class Envs:
     # ===================================================================
     # Per-call cudaHostRegister limit in GB.
     SGLANG_HICACHE_HOST_REGISTER_CHUNK_GB = EnvInt(256)
+    # HiCache host<->device transfers use the TMA staging kernel when the GPU
+    # (sm_90+), row size and page size allow; set to 0 to force the register kernel.
+    SGLANG_HICACHE_TMA_TRANSFER = EnvBool(True)
     # Base token count for each MLA/DSA dedup broadcast chunk.
     SGLANG_MLA_DEDUP_CHUNK_TOKENS = EnvInt(2048)
     SGLANG_HICACHE_HF3FS_CONFIG_PATH = EnvStr(None)
@@ -976,14 +970,13 @@ class Envs:
     # Enable int4x2 weights loading
     SGLANG_NPU_W4A4_NEW_PACKING = EnvBool(False)
     # Use the graph-safe Triton-Ascend kernel for masked speculative KV commits.
-    SGLANG_NPU_USE_TRITON_PREFIX_KV_CACHE_STORE = EnvBoolWithAlias(
-        False, deprecated_name="SGLANG_NPU_USE_TRITON_KV_CACHE_STORE"
-    )
+    SGLANG_NPU_USE_TRITON_PREFIX_KV_CACHE_STORE = EnvBool(False)
     # Quantize x to int8 in the dispatch operator (vendor alias consumed by the
     # Ascend DeepEP library; the MTP draft-build scopes override it to False).
     DEEP_NORMAL_MODE_USE_INT8_QUANT = EnvBool(False)
     SGLANG_ZBAL_LOCAL_MEM_SIZE = EnvInt(0)
     SGLANG_ZBAL_BOOTSTRAP_URL = EnvStr("")
+    SGLANG_NPU_ENABLE_PIECEWISE_CUDA_GRAPH = EnvBool(False)  # prefill cuda graph on NPU
 
     # ===================================================================
     # MUSA
@@ -1300,12 +1293,8 @@ class Envs:
     # Sanitize NaN logits before sampling kernels and log a throttled warning
     # (see sanitize_nan_logits).
     SGLANG_SANITIZE_NAN_LOGITS = EnvBool(False)
-    SGLANG_ENABLE_LOGPROB_CHUNK = EnvBoolWithAlias(
-        True, deprecated_name="SGLANG_ENABLE_LOGITS_PROCESSER_CHUNK"
-    )
-    SGLANG_LOGPROB_CHUNK_SIZE = EnvIntWithAlias(
-        2048, deprecated_name="SGLANG_LOGITS_PROCESSER_CHUNK_SIZE"
-    )
+    SGLANG_ENABLE_LOGPROB_CHUNK = EnvBool(True)
+    SGLANG_LOGPROB_CHUNK_SIZE = EnvInt(2048)
     # Compute input logprobs from logits via per-row logsumexp instead of
     # materializing the full-vocab log-softmax. Escape hatch only; the two
     # paths are mathematically identical.
@@ -1638,19 +1627,13 @@ class Envs:
     # ===================================================================
     # DSA backend (GLM 5 and DeepSeek V3.2)
     # ===================================================================
-    SGLANG_DSA_FUSE_TOPK = EnvBoolWithAlias(
-        True, deprecated_name="SGLANG_NSA_FUSE_TOPK"
-    )
+    SGLANG_DSA_FUSE_TOPK = EnvBool(True)
     # Enabled for supported CUDA KPool geometry; set to 0 to use ordinary metadata.
     SGLANG_EXPERIMENTAL_DSA_KPOOL_METADATA_FUSION = EnvBool(True)
     SGLANG_DSA_TOPK_FLASHINFER_DETERMINISTIC = EnvBool(False)
     SGLANG_DSA_TOPK_FLASHINFER_TIE_BREAK = EnvStr(None)
-    SGLANG_DSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD = EnvIntWithAlias(
-        2048, deprecated_name="SGLANG_NSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD"
-    )
-    SGLANG_DSA_HIP_DISABLE_PRESHUFFLE = EnvBoolWithAlias(
-        False, deprecated_name="SGLANG_NSA_HIP_DISABLE_PRESHUFFLE"
-    )
+    SGLANG_DSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD = EnvInt(2048)
+    SGLANG_DSA_HIP_DISABLE_PRESHUFFLE = EnvBool(False)
     SGLANG_DSA_MQA_LOGITS_FREE_MEM_FRACTION = EnvFloat(0.2)
     SGLANG_ENABLE_PCG_DSV2_DUAL_STREAM = EnvBool(False)
     SGLANG_DSA_TOPK_BROADCAST = EnvBool(False)
@@ -1885,70 +1868,20 @@ class _DeprecatedEnv:
             os.environ[self.replacement] = value
 
 
-def _ms_to_s(value: str) -> str:
-    return str(float(value) / 1000.0)
-
-
-def _invert_bool(value: str) -> str:
-    return "0" if value.lower() in ("true", "1", "yes", "y") else "1"
-
-
 # The single registry for deprecated environment variables, processed once at
 # import by _handle_deprecated_envs(). Add new deprecations here instead of
 # ad-hoc warnings. For a rename where the old name must keep working through a
 # descriptor, use EnvBoolWithAlias / EnvIntWithAlias instead.
 _DEPRECATED_ENVS: Dict[str, _DeprecatedEnv] = {
-    # Renamed: the value is forwarded to the replacement.
-    "SGLANG_GC_LOG": _DeprecatedEnv(replacement="SGLANG_LOG_GC"),
-    "SGLANG_CUTEDSL_MOE_NVFP4_DISPATCH": _DeprecatedEnv(
-        replacement="SGLANG_MOE_NVFP4_DISPATCH"
-    ),
-    "SGLANG_ENABLE_THINKING": _DeprecatedEnv(replacement="SGLANG_DEFAULT_THINKING"),
-    "SGLANG_REASONING_EFFORT": _DeprecatedEnv(
-        replacement="SGLANG_DSV4_REASONING_EFFORT"
-    ),
-    "SGLANG_USE_JIT_ALL_REDUCE": _DeprecatedEnv(
-        replacement="SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2"
-    ),
-    # The legacy DISABLE flags have the opposite polarity of their replacement.
-    "SGLANG_DISABLE_TP_MEMORY_INBALANCE_CHECK": _DeprecatedEnv(
-        replacement="SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK", transform=_invert_bool
-    ),
-    # Renamed with a unit change.
-    "SGLANG_QUEUED_TIMEOUT_MS": _DeprecatedEnv(
-        replacement="SGLANG_REQ_WAITING_TIMEOUT",
-        transform=_ms_to_s,
-        note="Note the unit change: milliseconds -> seconds.",
-    ),
-    "SGLANG_FORWARD_TIMEOUT_MS": _DeprecatedEnv(
-        replacement="SGLANG_REQ_RUNNING_TIMEOUT",
-        transform=_ms_to_s,
-        note="Note the unit change: milliseconds -> seconds.",
-    ),
     # Removed without replacement.
     "SGLANG_ENABLE_CP_V2": _DeprecatedEnv(
         note="Strategy-based prefill context parallelism is now the only generic implementation."
     ),
-    "SGLANG_PER_TOKEN_GROUP_QUANT_8BIT_V2": _DeprecatedEnv(),
-    # Superseded by the unified JIT per_token_group_quant, the default CUDA path.
-    "SGLANG_OPT_USE_JIT_PER_TOKEN_GROUP_QUANT": _DeprecatedEnv(),
-    "SGLANG_MASKED_GEMM_FAST_ACT": _DeprecatedEnv(),
-    # The unified free list is kept unsorted between flushes by design; the
-    # sort-after-merge A/B knob never left its off default and is gone.
-    "SGLANG_SORT_FREE_LIST_AFTER_MERGE": _DeprecatedEnv(),
-    "SGLANG_OPT_SWA_EVICT_DROP_PAGE_MARGIN": _DeprecatedEnv(),
-    # sconv-family kernels always use the CUDA-JIT ports when supported; no toggle.
-    "SGLANG_OPT_USE_CUDA_SCONV": _DeprecatedEnv(),
-    # DSV4 compressor V2 is always used.
-    "SGLANG_OPT_USE_COMPRESSOR_V2": _DeprecatedEnv(),
     "SGLANG_ENABLE_HICACHE_BUFFER_ANCHOR_LOCK": _DeprecatedEnv(
         note="Buffer-mode anchor pinning is always on; set "
         "SGLANG_HICACHE_BUFFER_ANCHOR_LOCK_CAP=0 to disable it."
     ),
     # Replaced by CLI flags.
-    "SGLANG_ENABLE_GRPC": _DeprecatedEnv(
-        note="Please use '--grpc-port' to enable the native gRPC server."
-    ),
     "SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE": _DeprecatedEnv(
         note="Please use '--enable-prefill-delayer' instead."
     ),
@@ -1958,23 +1891,8 @@ _DEPRECATED_ENVS: Dict[str, _DeprecatedEnv] = {
     "SGLANG_PREFILL_DELAYER_TOKEN_USAGE_LOW_WATERMARK": _DeprecatedEnv(
         note="Please use '--prefill-delayer-token-usage-low-watermark' instead."
     ),
-    "SGLANG_CUTLASS_MOE": _DeprecatedEnv(
-        note="Please use '--moe-runner-backend=cutlass' and/or "
-        "'--speculative-moe-runner-backend=cutlass' instead."
-    ),
-    "SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_FP4_ACTS": _DeprecatedEnv(
-        note="Please use '--enable-w4a4-mxfp4-megamoe' instead."
-    ),
-    "SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_MXF4_KIND": _DeprecatedEnv(
-        note="Please use '--enable-w4a4-mxfp4-megamoe' instead."
-    ),
-    "SGLANG_DFLASH_PREFILL_REFILL_TARGET": _DeprecatedEnv(
-        note="DFlash now auto-enables the min-free-slots delay; unset this env. "
-        "To override the threshold, use '--min-free-slots-delay'."
-    ),
     "SGLANG_ENABLE_UNIFIED_RADIX_TREE": _DeprecatedEnv(
-        note="The unified radix tree is the default tree cache now; unset this "
-        "env. The field is still defined for legacy call sites."
+        note="The unified radix tree is the default tree cache now; unset this env."
     ),
 }
 

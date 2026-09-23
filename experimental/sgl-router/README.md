@@ -69,6 +69,25 @@ The Indexer replaces the Router-local radix tree as the native Cache-Aware
 signal. Query timeouts and local concurrency are bounded by the two Indexer
 options, which default to 100 ms and 32 respectively.
 
+### Reorg routing
+
+Use `--chat-routing reorg` to select the new bucket engine. The existing `--policy`
+and cache/session flags configure its policies; no separate file is required.
+
+```bash
+sgl-router --model-id qwen3 --worker-urls http://localhost:30001 \
+  --chat-routing reorg --policy cache_aware
+```
+
+Reorg supports `power_of_two` (its default), `cache_aware`, and `session_aware`.
+Discovery supplies the plain or PD workers; decode uses power-of-two. Cache
+settings, external indexers, session headers/timeouts, and `--filter overloaded`
+with `--max-in-flight` retain their existing flags. Unsupported legacy options
+fail at startup. Legacy `--bucket-config` files cannot define complete reorg PD
+buckets and are not accepted on this path.
+
+Omitting `--chat-routing` keeps the existing policies and defaults.
+
 ### Fleet-wide sampling contract
 
 `--override-sampling-params` fixes the sampling configuration for every client

@@ -3,14 +3,17 @@ import os
 import time
 from typing import List, Optional
 
-import msgspec
 import torch
 import torch.distributed as dist
 
 from sglang.srt.configs.model_config import ModelConfig
-from sglang.srt.distributed import (
+from sglang.srt.distributed.device_communicators.mooncake_transfer_engine import (
+    maybe_init_shared_mooncake_transfer_engine,
+)
+from sglang.srt.distributed.gated_launch import maybe_wait_for_gated_launch
+from sglang.srt.distributed.parallel_state import (
+    _tag_groups_for_flashinfer_allreduce_only,
     get_default_distributed_backend,
-    get_pp_group,
     get_tp_group,
     get_world_group,
     init_distributed_environment,
@@ -20,16 +23,15 @@ from sglang.srt.distributed import (
     set_mscclpp_all_reduce,
     set_torch_symm_mem_all_reduce,
 )
-from sglang.srt.distributed.gated_launch import maybe_wait_for_gated_launch
-from sglang.srt.distributed.parallel_state import (
-    _tag_groups_for_flashinfer_allreduce_only,
-)
-from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.environ import envs
-from sglang.srt.layers.dp_attention import initialize_dp_attention
+from sglang.srt.layers.dp_attention import (
+    init_dp_gathered_buffer,
+    initialize_dp_attention,
+)
 from sglang.srt.layers.layernorm_sp import initialize_layernorm_sp
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import (
+    get_device,
     get_disagg,
     get_exec,
     get_parallel,
@@ -60,117 +62,155 @@ _is_cpu_arm64 = is_host_cpu_arm64()
 _TP_ALL_TO_ALL_WARMUP_BYTES_PER_PEER = 4 << 20
 
 
-class TorchDistributedResult(msgspec.Struct, frozen=True, kw_only=True):
-    tp_group: object
-    pp_group: object
-    attention_tp_group: object
-    pre_model_load_memory: float
+#: Cleared by `destroy_model_parallel`.
+_PARALLEL_INITIALISED = False
 
 
-def init_torch_distributed(
+def reset_parallel_initialised() -> None:
+    """Reset the initialization guard when model-parallel groups are destroyed."""
+    global _PARALLEL_INITIALISED
+    _PARALLEL_INITIALISED = False
+
+
+def _bind_threads_if_cpu(*, device: str) -> "Optional[List[int]]":
+    """Bind OpenMP threads to the NUMA node before CPU group initialization."""
+    if device != "cpu":
+        return None
+    from sglang.srt.utils import numa_utils
+
+    parallel = get_parallel()
+    # With --enable-dp-attention, dp partitions the existing TP group rather
+    # than spawning additional processes, so dp_size must not be multiplied
+    # into the process count here (unlike regular DP, where dp_size * tp_size *
+    # pp_size is the true worker count).
+    dp_size = 1 if parallel.enable_dp_attention else parallel.dp_size
+    return numa_utils.init_threads_binding(
+        numa_index=get_device().gpu_id,
+        world_size=dp_size * parallel.tp_size * parallel.pp_size,
+    )
+
+
+def init_parallel_runtime(
     *,
     server_args: ServerArgs,
-    model_config: ModelConfig,
     device: str,
-    ps: ParallelState,
     dist_port: int,
-    is_draft_worker: bool,
-    local_omp_cpuid: Optional[List[int]],
-):
+) -> None:
+    """Initialize the parallel runtime once, after publishing configuration.
+
+    Set up CPU thread binding, the current device, and the shared Mooncake
+    engine before creating process groups. Draft workers reuse their target's
+    groups and must not call this function.
+    """
+    global _PARALLEL_INITIALISED
+    if _PARALLEL_INITIALISED:
+        raise RuntimeError(
+            "init_parallel_runtime() ran twice in this process. The groups are built "
+            "once, before anything that reads one exists; a second build is "
+            "either a lost race between two entries or a runner trying to "
+            "bring up its own. An elastic scale-up joins an existing WORLD "
+            "through initialize_model_parallel directly and does not come "
+            "through here."
+        )
+    _PARALLEL_INITIALISED = True
+
     tic = time.perf_counter()
-    logger.info("Init torch distributed begin.")
+    logger.info("Init parallel begin.")
 
     backend = _resolve_backend(device=device)
-
-    before_avail_memory = get_available_gpu_memory(device, ps.gpu_id)
     if not get_parallel().enable_p2p_check:
         monkey_patch_p2p_access_check()
 
     dist_init_method = _resolve_dist_init_method(dist_port=dist_port)
     _set_all_reduce_flags()
 
-    if not is_draft_worker:
-        if device == "cpu":
-            _init_cpu_threads_env(
-                tp_size=ps.tp_size,
-                tp_rank=ps.tp_rank,
-                local_omp_cpuid=local_omp_cpuid,
-                dist_init_method=dist_init_method,
-            )
+    local_omp_cpuid = _bind_threads_if_cpu(device=device)
+    # Select the local device before communicator allocation and warmup.
+    try:
+        torch.get_device_module(device).set_device(get_device().gpu_id)
+    except Exception:
+        logger.warning(
+            "Context: device=%s gpu_id=%s CUDA_VISIBLE_DEVICES=%s tp_rank=%s",
+            device,
+            get_device().gpu_id,
+            os.environ.get("CUDA_VISIBLE_DEVICES"),
+            get_parallel().tp_rank,
+        )
+        raise
+    maybe_init_shared_mooncake_transfer_engine(gpu_id=get_device().gpu_id)
 
-        # Only initialize the distributed environment on the target model worker.
-        # This builds the groups behind the context's live group-handle reads.
-        _init_parallel_groups(
-            backend=backend,
+    parallel = get_parallel()
+    if device == "cpu":
+        _init_cpu_threads_env(
+            tp_size=parallel.tp_size,
+            tp_rank=parallel.tp_rank,
+            local_omp_cpuid=local_omp_cpuid,
             dist_init_method=dist_init_method,
-            server_args=server_args,
-            model_config=model_config,
-            gpu_id=ps.gpu_id,
-            tp_rank=ps.tp_rank,
-            tp_size=ps.tp_size,
-            pp_rank=ps.pp_rank,
-            pp_size=ps.pp_size,
-            attn_dp_size=ps.attn_dp_size,
-            attn_cp_size=ps.attn_cp_size,
-            moe_ep_size=ps.moe_ep_size,
-            moe_dp_size=ps.moe_dp_size,
-            dcp_size=ps.attn_dcp_size,
         )
 
-        # Pre-warm NCCL/RCCL/HCCL to eliminate cold-start latency in first request
-        # Controlled by --pre-warm-nccl flag (default: enabled on AMD GPUs)
-        if get_exec().comm.pre_warm_nccl and (
-            ps.tp_size > 1 or ps.pp_size > 1 or ps.moe_ep_size > 1
-        ):
-            _prewarm_nccl(
-                tp_size=ps.tp_size, pp_size=ps.pp_size, moe_ep_size=ps.moe_ep_size
-            )
+    _init_parallel_groups(
+        backend=backend,
+        dist_init_method=dist_init_method,
+        server_args=server_args,
+        gpu_id=get_device().gpu_id,
+    )
 
-        # CUDA graph capture enables the PyNCCL communicator for TP LM-head
-        # all-to-all. Exercise that exact send/recv path before measuring
-        # pre_model_load_memory so its persistent transport allocations are
-        # included in later KV-cache sizing instead of appearing during capture.
-        if (
-            device == "cuda"
-            and get_parallel().enable_tp_lm_head_all_to_all
-            and ps.tp_size > 1
-        ):
-            _prewarm_tp_lm_head_all_to_all()
+    # Pre-warm NCCL/RCCL/HCCL to eliminate cold-start latency in first request
+    # Controlled by --pre-warm-nccl flag (default: enabled on AMD GPUs)
+    if get_exec().comm.pre_warm_nccl and (
+        parallel.tp_size > 1 or parallel.pp_size > 1 or parallel.moe_ep_size > 1
+    ):
+        _prewarm_nccl(
+            tp_size=parallel.tp_size,
+            pp_size=parallel.pp_size,
+            moe_ep_size=parallel.moe_ep_size,
+        )
+
+    # CUDA graph capture enables the PyNCCL communicator for TP LM-head
+    # all-to-all. Exercise that exact send/recv path before measuring
+    # pre_model_load_memory so its persistent transport allocations are
+    # included in later KV-cache sizing instead of appearing during capture.
+    if (
+        device == "cuda"
+        and parallel.enable_tp_lm_head_all_to_all
+        and parallel.tp_size > 1
+    ):
+        _prewarm_tp_lm_head_all_to_all()
+
+    logger.info(f"Init parallel ends. elapsed={time.perf_counter() - tic:.2f} s")
+
+
+def measure_pre_model_load_memory(*, device: str, is_draft_worker: bool) -> float:
+    """Measure available memory for KV-cache sizing before this runner loads.
+
+    Call after parallel initialization and before allocating model weights.
+    """
+    before_avail_memory = get_available_gpu_memory(device, get_device().gpu_id)
 
     maybe_wait_for_gated_launch(
         host=get_serving().host, port=get_parallel().gated_launch_port
     )
 
-    # Draft workers reuse the target pool config and may exist on only one PP stage;
-    # including them in this WORLD reduction would deadlock on absent peers.
+    # Draft workers reuse the target pool config and may exist on only one PP
+    # stage; including them in this WORLD reduction would deadlock on absent
+    # peers.
     pre_model_load_memory = get_available_gpu_memory(
         device,
-        ps.gpu_id,
+        get_device().gpu_id,
         distributed=get_world_group().world_size > 1 and not is_draft_worker,
         cpu_group=get_world_group().cpu_group,
     )
-    tp_group = get_tp_group()
-    pp_group = get_pp_group()
-    attention_tp_group = get_parallel().attn_tp_group
-
-    # Check memory for tensor parallelism
-    local_gpu_memory = get_available_gpu_memory(device, ps.gpu_id)
-    if ps.tp_size > 1 and not is_draft_worker:
+    local_gpu_memory = get_available_gpu_memory(device, get_device().gpu_id)
+    if get_parallel().tp_size > 1 and not is_draft_worker:
         _check_tp_memory_balance(
             pre_model_load_memory=pre_model_load_memory,
             local_gpu_memory=local_gpu_memory,
         )
-
     logger.info(
-        f"Init torch distributed ends. elapsed={time.perf_counter() - tic:.2f} s, "
-        f"mem usage={(before_avail_memory - local_gpu_memory):.2f} GB"
+        f"Memory baseline taken. mem usage="
+        f"{(before_avail_memory - local_gpu_memory):.2f} GB"
     )
-    return TorchDistributedResult(
-        tp_group=tp_group,
-        pp_group=pp_group,
-        attention_tp_group=attention_tp_group,
-        pre_model_load_memory=pre_model_load_memory,
-    )
+    return pre_model_load_memory
 
 
 def _resolve_backend(*, device: str) -> str:
@@ -253,21 +293,14 @@ def _init_parallel_groups(
     backend: str,
     dist_init_method: str,
     server_args: ServerArgs,
-    model_config: ModelConfig,
     gpu_id: int,
-    tp_rank: int,
-    tp_size: int,
-    pp_rank: int,
-    pp_size: int,
-    attn_dp_size: int,
-    attn_cp_size: int,
-    moe_ep_size: int,
-    moe_dp_size: int,
-    dcp_size: int,
 ) -> None:
+    parallel = get_parallel()
+    tp_size, pp_size = parallel.tp_size, parallel.pp_size
+    tp_rank, pp_rank = parallel.tp_rank, parallel.pp_rank
     is_ep_joiner = get_exec().moe.is_ep_joiner
     is_scale_joiner = get_exec().moe.is_ep_scale_joiner
-    rank_offset = get_parallel().ep_join_rank_offset if is_scale_joiner else 0
+    rank_offset = parallel.ep_join_rank_offset if is_scale_joiner else 0
     world_size = (
         rank_offset + tp_size * pp_size if is_scale_joiner else tp_size * pp_size
     )
@@ -285,14 +318,6 @@ def _init_parallel_groups(
         max_world_size=get_parallel().max_ep_size,
     )
     initialize_model_parallel(
-        tensor_model_parallel_size=tp_size,
-        attention_data_parallel_size=attn_dp_size,
-        pipeline_model_parallel_size=pp_size,
-        expert_model_parallel_size=moe_ep_size,
-        attention_context_model_parallel_size=attn_cp_size,
-        moe_data_model_parallel_size=moe_dp_size,
-        decode_context_parallel_size=dcp_size,
-        shared_experts_tensor_parallel_size=get_parallel().shared_experts_tp_size,
         duplicate_tp_group=get_disagg().enable_pdmux,
         enable_symm_mem=get_exec().comm.enable_symm_mem,
         # Only WORLD is extended during scale-up. The joiner's model-parallel
@@ -302,13 +327,15 @@ def _init_parallel_groups(
         max_world_size=None if is_scale_joiner else get_parallel().max_ep_size,
     )
     _tag_groups_for_flashinfer_allreduce_only()
-    initialize_dp_attention(
-        server_args=server_args,
-        model_config=model_config,
-    )
-    initialize_layernorm_sp(model_config=model_config)
+    initialize_dp_attention(server_args=server_args)
     if is_npu():
         register_sgl_tp_rank(gpu_id)
+
+
+def init_layer_runtime(*, model_config: ModelConfig) -> None:
+    """Size the DP gathered buffer and resolve layernorm SP from the model."""
+    init_dp_gathered_buffer(model_config)
+    initialize_layernorm_sp(model_config=model_config)
 
 
 def _prewarm_nccl(*, tp_size: int, pp_size: int, moe_ep_size: int) -> None:
