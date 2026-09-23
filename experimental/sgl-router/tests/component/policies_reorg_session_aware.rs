@@ -6,12 +6,10 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use sgl_router::discovery::{ModelId, WorkerId, WorkerSpec};
-use sgl_router::policies_reorg::admission::{Decision, EngineAdmission};
+use sgl_router::policies_reorg::admission::{Decision, EngineAdmission, EngineMetrics};
 use sgl_router::policies_reorg::session_aware::SessionAwarePolicy;
 use sgl_router::policies_reorg::{PickError, PickRequest, Policy, Stage};
-use sgl_router::state::load_monitor::engine_reported_load::{
-    EngineReportedLoadTable, EngineReportedWorkerLoad, LoadStat,
-};
+use sgl_router::state::load_monitor::engine_reported_load::{EngineReportedLoadTable, LoadStat};
 use sgl_router::state::load_monitor::router_inflight_load::MockClock;
 use sgl_router::state::AffinityStore;
 use sgl_router::workers::Worker;
@@ -52,16 +50,11 @@ struct Admission {
 }
 
 impl EngineAdmission for Admission {
-    fn check(
-        &self,
-        engine: &Worker,
-        _: &PickRequest<'_>,
-        load: Option<&EngineReportedWorkerLoad>,
-    ) -> Result<Decision, PickError> {
+    fn check(&self, engine: &Worker, metrics: &EngineMetrics) -> Result<Decision, PickError> {
         self.calls
             .lock()
             .unwrap()
-            .push((engine.id.0.clone(), load.map(|load| load.num_waiting_reqs)));
+            .push((engine.id.0.clone(), metrics.waiting_requests));
         if self.invalid.load(Ordering::Relaxed) {
             return Err(PickError::InvalidSignal("invalid admission input".into()));
         }
@@ -339,6 +332,7 @@ async fn shared_store_refreshes_active_sessions_and_expires_idle_ones() {
 
 #[derive(Debug)]
 struct RacingAdmission {
+    model: ModelId,
     competitor: SessionAwarePolicy,
     winner: Arc<Worker>,
     reject_winner: bool,
@@ -346,19 +340,14 @@ struct RacingAdmission {
 }
 
 impl EngineAdmission for RacingAdmission {
-    fn check(
-        &self,
-        engine: &Worker,
-        request: &PickRequest<'_>,
-        _: Option<&EngineReportedWorkerLoad>,
-    ) -> Result<Decision, PickError> {
+    fn check(&self, engine: &Worker, _: &EngineMetrics) -> Result<Decision, PickError> {
         self.calls.lock().unwrap().push(engine.id.0.clone());
         if engine.id.0 == "a" {
             // Complete a competing first request after this request selected a,
             // but before it can commit. The effective binding is now b.
             futures::executor::block_on(
                 self.competitor
-                    .pick(std::slice::from_ref(&self.winner), request),
+                    .pick(std::slice::from_ref(&self.winner), &request(&self.model)),
             )?;
         }
         Ok(if self.reject_winner && engine.id == self.winner.id {
@@ -375,6 +364,7 @@ async fn concurrent_assignment_winner_is_checked_and_preserved_on_rejection() {
         let (mut policy, store) = policy();
         let engines = [engine("a", 0), engine("b", 9)];
         let admission = Arc::new(RacingAdmission {
+            model: ModelId("m".into()),
             competitor: SessionAwarePolicy::new(store.clone(), EngineReportedLoadTable::new()),
             winner: engines[1].clone(),
             reject_winner,

@@ -105,12 +105,10 @@ replay only matching warmup signatures, including condition-prefix length;
 other shapes run eagerly. VAE tiling is opt-in and can change numerical results.
 Do not infer compatibility from the older Qwen-Image row.
 
-Use an authorized local checkpoint with `--model-id Qwen-Image-2.1`.
+Use the public `Qwen/Qwen-Image-2.1` checkpoint; no Hugging Face token is required.
 See the [Qwen-Image 2.1 cookbook](/cookbook/diffusion/Qwen-Image/Qwen-Image-2.1)
-for checkpoint layout and usage. This entry does not assert public weight
-availability. The standard two-GPU E2E suite includes `qwen_image21_t2i_tp2`
+for checkpoint layout and usage. The standard two-GPU E2E suite includes `qwen_image21_t2i_tp2`
 with TP2, 1024px/40-step generation, two requests, and image consistency checks.
-Its runners need access to `Qwen/Qwen-Image-2.1`.
 
 The additional opt-in HTTP cases check repeated generation, editing, and real
 RGBA alpha output from a local checkpoint:

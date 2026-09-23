@@ -9,6 +9,7 @@
 import logging
 import os
 import re
+from array import array
 from collections.abc import Iterable
 from functools import cached_property
 from types import SimpleNamespace
@@ -22,7 +23,6 @@ from sglang.srt.configs.kimi_k3 import KimiK3Config
 from sglang.srt.configs.kimi_linear import KimiLinearConfig
 from sglang.srt.distributed import (
     divide,
-    get_shared_experts_tp_group,
     tensor_model_parallel_all_reduce,
 )
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
@@ -582,7 +582,7 @@ class KimiK3MoE(nn.Module):
             shared_experts_tp_kwargs = dict(tp_rank=0, tp_size=1)
         elif self._shared_experts_tp_comm:
             group = (
-                get_shared_experts_tp_group()
+                parallel.shared_experts_tp_group
                 if requested_shared_tp is not None
                 else parallel.attn_tp_group
             )
@@ -2030,7 +2030,8 @@ class KimiK3DeltaAttention(nn.Module):
                     qkv, g_proj_states, f_a, beta, _pad = torch.split(
                         fused_states, self._qkvgbfa_sizes, dim=-1
                     )
-                    forget_gate = gemm(f_a, self._bfa_f_b_w)
+                    # Fused KDA decode consumes f_a and applies f_b itself.
+                    forget_gate = f_a if defer_f_b else gemm(f_a, self._bfa_f_b_w)
                     return qkv, beta, forget_gate, g_proj_states
 
                 if (
@@ -2038,12 +2039,12 @@ class KimiK3DeltaAttention(nn.Module):
                     and get_is_capture_mode()
                     and 0 < hidden_states.shape[0] <= self._bfa_bs_limit
                 ):
-                    # Issue the tiny [f_a|b] + f_b GEMVs on the side stream,
-                    # then the wide [q,k,v,g] GEMM on the main stream (both
-                    # read only hidden_states); join before the consumers.
+                    # Fork before both branches; capture the main projection
+                    # first to avoid CUDA graph replay stream expansion.
                     alt = self._bfa_alt_stream
                     cur = torch.cuda.current_stream()
                     alt.wait_stream(cur)
+                    fused_states, _ = self.fused_qkvg_proj(hidden_states)
                     with torch.cuda.stream(alt):
                         bfa = gemm(hidden_states, w)
                         forget_gate = (
@@ -2052,7 +2053,6 @@ class KimiK3DeltaAttention(nn.Module):
                             else gemm(bfa[..., :n_fa], self._bfa_f_b_w)
                         )
                         beta = bfa[..., n_fa : n_fa + n_b]
-                    fused_states, _ = self.fused_qkvg_proj(hidden_states)
                     qkv, g_proj_states = torch.split(
                         fused_states, self.split_sizes, dim=-1
                     )
@@ -2280,9 +2280,7 @@ class KimiK3MLAAttention(DeepseekV2AttentionMLA):
             # DeepseekV2AttentionMLA forward cores, so wrap its forward at
             # the instance level (weights, reduce_results, loading untouched).
             self._gate_hidden_states = None
-            # (gate, producer stream) issued on the alt stream by forward();
-            # None when the lazy path computes the gate here instead.
-            self._gate_precomputed = None
+            self._gate_pending_stream = None
             self._gate_alt_stream = gate_alt_stream
             # Above this token count the attention-core kernels fill the SMs
             # on their own and the overlap only adds sync overhead (same
@@ -2297,19 +2295,8 @@ class KimiK3MLAAttention(DeepseekV2AttentionMLA):
             def _gated_o_proj_forward(x, *args, **kwargs):
                 gate_input = self._gate_hidden_states
                 self._gate_hidden_states = None
-                precomputed = self._gate_precomputed
-                self._gate_precomputed = None
-                if precomputed is not None:
-                    # Use wait_stream rather than an explicit event so the
-                    # breakable-CUDA-graph runner can track the side-stream
-                    # join across graph-segment boundaries.
-                    torch.cuda.current_stream().wait_stream(precomputed[1])
                 if gate_input is not None and not isinstance(x, tuple):
-                    gate = (
-                        precomputed[0]
-                        if precomputed is not None
-                        else self.g_proj(gate_input)[0]
-                    )
+                    gate = self._compute_output_gate(gate_input)
                     from sglang.kernels.ops.kimi_k3 import mla_output_gate
 
                     if mla_output_gate.covered(x, gate):
@@ -2318,6 +2305,10 @@ class KimiK3MLAAttention(DeepseekV2AttentionMLA):
                         x = mla_output_gate.kimi_k3_mla_output_gate(x, gate)
                     else:
                         x = x * torch.sigmoid(gate)
+                elif self._gate_pending_stream is not None:
+                    # Even a skipped gate must close its capture branch.
+                    torch.cuda.current_stream().wait_stream(self._gate_pending_stream)
+                    self._gate_pending_stream = None
                 return _orig_o_proj_forward(x, *args, **kwargs)
 
             self.o_proj.forward = _gated_o_proj_forward
@@ -2340,27 +2331,29 @@ class KimiK3MLAAttention(DeepseekV2AttentionMLA):
             return AttnForwardMethod.MLA
         return method
 
-    def _precompute_output_gate(self, hidden_states: torch.Tensor) -> None:
-        """Issue the output-gate GEMM on the alt stream so it overlaps the
-        attention core; the lazy path in the o_proj wrap otherwise computes
-        it on the critical path right before the gate multiply. The gate
-        tensor stays referenced via _gate_precomputed until the wrap joins,
-        so its memory cannot be reused while the alt stream still writes."""
-        self._gate_precomputed = None
+    def _fork_output_gate(self, hidden_states: torch.Tensor) -> None:
+        """Fork early, but record the gate after attention to limit replay streams."""
+        self._gate_pending_stream = None
         if (
             self._gate_alt_stream is not None
             and get_is_capture_mode()
-            # The attention-core break ends the segment between the alt-stream
-            # event record and the o_proj-side wait, so under breakable capture
-            # the wait would cross graph segments; use the lazy path instead.
+            # Keep the fork and join within one capture segment.
             and not is_in_breakable_cuda_graph()
             and (0 < hidden_states.shape[0] <= self._gate_bs_limit)
         ):
             alt = self._gate_alt_stream
             alt.wait_stream(torch.cuda.current_stream())
-            with torch.cuda.stream(alt):
-                gate, _ = self.g_proj(hidden_states)
-            self._gate_precomputed = (gate, alt)
+            self._gate_pending_stream = alt
+
+    def _compute_output_gate(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        alt = self._gate_pending_stream
+        self._gate_pending_stream = None
+        if alt is None:
+            return self.g_proj(hidden_states)[0]
+        with torch.cuda.stream(alt):
+            gate, _ = self.g_proj(hidden_states)
+        torch.cuda.current_stream().wait_stream(alt)
+        return gate
 
     def forward(
         self,
@@ -2372,7 +2365,7 @@ class KimiK3MLAAttention(DeepseekV2AttentionMLA):
     ):
         if self.use_output_gate:
             self._gate_hidden_states = hidden_states
-            self._precompute_output_gate(hidden_states)
+            self._fork_output_gate(hidden_states)
         return super().forward(
             positions, hidden_states, forward_batch, zero_allocator, **kwargs
         )
@@ -3823,7 +3816,7 @@ class KimiK3ForConditionalGeneration(nn.Module):
         image_embeds = self.vision_tower(pixel_values, grid_thws_host.to(device))
         return self.mm_projector(image_embeds)
 
-    def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
+    def pad_input_ids(self, input_ids: array, mm_inputs: MultimodalInputs) -> array:
         pattern = MultiModalityDataPaddingPatternMultimodalTokens()
         return pattern.pad_input_tokens(input_ids, mm_inputs)
 
