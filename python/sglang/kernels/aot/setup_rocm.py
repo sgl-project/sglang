@@ -59,24 +59,29 @@ sources = [
     "csrc/elementwise/pos_enc.cu",
 ]
 
-cxx_flags = ["-O3"]
+cxx_flags = ["-O3", "-std=c++20"]
 libraries = ["hiprtc", "amdhip64", "c10", "torch", "torch_python"]
 extra_link_args = ["-Wl,-rpath,$ORIGIN/../../torch/lib", f"-L/usr/lib/{arch}-linux-gnu"]
 
 default_target = "gfx942"
 amdgpu_target = os.environ.get("AMDGPU_TARGET", default_target)
 
-if torch.cuda.is_available():
-    try:
-        amdgpu_target = torch.cuda.get_device_properties(0).gcnArchName.split(":")[0]
-    except Exception as e:
-        print(f"Warning: Failed to detect GPU properties: {e}")
-else:
-    print(f"Warning: torch.cuda not available. Using default target: {amdgpu_target}")
+if "AMDGPU_TARGET" not in os.environ:
+    if torch.cuda.is_available():
+        try:
+            amdgpu_target = torch.cuda.get_device_properties(0).gcnArchName.split(":")[
+                0
+            ]
+        except Exception as e:
+            print(f"Warning: Failed to detect GPU properties: {e}")
+    else:
+        print(
+            f"Warning: torch.cuda not available. Using default target: {amdgpu_target}"
+        )
 
-if amdgpu_target not in ["gfx942", "gfx950", "gfx1250"]:
+if amdgpu_target not in ["gfx942", "gfx950", "gfx1151", "gfx1250"]:
     print(
-        f"Warning: Unsupported GPU architecture detected '{amdgpu_target}'. Expected 'gfx942', 'gfx950', or 'gfx1250'."
+        f"Warning: Unsupported GPU architecture detected '{amdgpu_target}'. Expected 'gfx942', 'gfx950', 'gfx1151', or 'gfx1250'."
     )
     sys.exit(1)
 
@@ -89,7 +94,10 @@ fp8_macro = (
 #   (leaves room for static shared allocations in the kernel).
 # - gfx95x (MI350) and gfx1250: LDS is larger. Large dynamic budget wastes LDS
 #   and pins occupancy to 1 block/CU. Keep it small (40KB) for better occupancy.
-topk_dynamic_smem_bytes = 48 * 1024 if amdgpu_target == "gfx942" else 40 * 1024
+# gfx1151 has 64KB LDS like gfx942; use the 48KB budget.
+topk_dynamic_smem_bytes = (
+    48 * 1024 if amdgpu_target in ("gfx942", "gfx1151") else 40 * 1024
+)
 
 hipcc_flags = [
     "-DNDEBUG",
@@ -97,7 +105,7 @@ hipcc_flags = [
     "-O3",
     "-Xcompiler",
     "-fPIC",
-    "-std=c++17",
+    "-std=c++20",
     f"--amdgpu-target={amdgpu_target}",
     "-DENABLE_BF16",
     "-DENABLE_FP8",
