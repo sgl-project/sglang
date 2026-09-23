@@ -295,10 +295,7 @@ pub async fn create_test_context(config: RouterConfig) -> Arc<AppContext> {
     let rate_limiter = match config.max_concurrent_requests {
         n if n <= 0 => None,
         n => {
-            let rate_limit_tokens = config
-                .rate_limit_tokens_per_second
-                .filter(|&t| t > 0)
-                .unwrap_or(n);
+            let rate_limit_tokens = config.rate_limit_tokens_per_second.unwrap_or(n);
             Some(Arc::new(TokenBucket::new(
                 n as usize,
                 rate_limit_tokens as usize,
@@ -414,10 +411,7 @@ pub async fn create_test_context_with_parsers(config: RouterConfig) -> Arc<AppCo
     let rate_limiter = match config.max_concurrent_requests {
         n if n <= 0 => None,
         n => {
-            let rate_limit_tokens = config
-                .rate_limit_tokens_per_second
-                .filter(|&t| t > 0)
-                .unwrap_or(n);
+            let rate_limit_tokens = config.rate_limit_tokens_per_second.unwrap_or(n);
             Some(Arc::new(TokenBucket::new(
                 n as usize,
                 rate_limit_tokens as usize,
@@ -543,10 +537,7 @@ pub async fn create_test_context_with_mcp_config(
     let rate_limiter = match config.max_concurrent_requests {
         n if n <= 0 => None,
         n => {
-            let rate_limit_tokens = config
-                .rate_limit_tokens_per_second
-                .filter(|&t| t > 0)
-                .unwrap_or(n);
+            let rate_limit_tokens = config.rate_limit_tokens_per_second.unwrap_or(n);
             Some(Arc::new(TokenBucket::new(
                 n as usize,
                 rate_limit_tokens as usize,
