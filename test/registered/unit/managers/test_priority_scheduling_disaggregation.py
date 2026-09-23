@@ -966,6 +966,7 @@ class TestDecodePrebuilt(unittest.TestCase):
 
         scheduler.get_new_prebuilt_batch.reset_mock()
         updated = MagicMock(name="updated")
+        updated.is_empty.return_value = False
         scheduler.update_running_batch = MagicMock(return_value=updated)
 
         second = SchedulerDisaggregationDecodeMixin.get_next_disagg_decode_batch_to_run(
