@@ -980,7 +980,6 @@ class Envs:
     DEEP_NORMAL_MODE_USE_INT8_QUANT = EnvBool(False)
     SGLANG_ZBAL_LOCAL_MEM_SIZE = EnvInt(0)
     SGLANG_ZBAL_BOOTSTRAP_URL = EnvStr("")
-    SGLANG_NPU_ENABLE_PIECEWISE_CUDA_GRAPH = EnvBool(False)  # prefill cuda graph on NPU
 
     # ===================================================================
     # MUSA
