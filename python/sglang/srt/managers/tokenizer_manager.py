@@ -2305,13 +2305,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         if threading.current_thread() is threading.main_thread():
             signal_handler = self.signal_handler_class(self)
             loop.add_signal_handler(signal.SIGTERM, signal_handler.sigterm_handler)
-            # Ctrl+C (SIGINT): uvicorn also stops HTTP on SIGINT; set gracefully_exit
-            # so sigterm_watchdog (and lifespan) can ShutdownReq + wait for FlexKV unpin.
-            # Schedulers ignore SIGINT so process-group Ctrl+C does not kill them first.
-            try:
-                loop.add_signal_handler(signal.SIGINT, signal_handler.sigterm_handler)
-            except (NotImplementedError, RuntimeError, ValueError):
-                pass
             # Update the signal handler for the process. It overrides the sigquit handler in the launch phase.
             loop.add_signal_handler(
                 signal.SIGQUIT, signal_handler.running_phase_sigquit_handler
@@ -3330,7 +3323,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             os.getenv(
                 "SGLANG_SCHEDULER_SHUTDOWN_WAIT_S",
                 "1200"
-                if self.server_args.enable_flexkv
+                if (
+                    self.server_args.enable_flexkv
+                    or self.server_args.radix_cache_backend == "flexkv"
+                )
                 else str(_SCHEDULER_EXIT_TIMEOUT_SECS),
             )
         )
@@ -3835,10 +3831,6 @@ class SignalHandler:
         logger.warning(
             f"SIGTERM received. {signum=} {frame=}. Draining requests and shutting down..."
         )
-        # Stop watchdog immediately: process-group Ctrl+C may SIGINT children
-        # (e.g. detokenizer) before ShutdownReq; their exit must not become SIGQUIT.
-        if self.tokenizer_manager._subprocess_watchdog is not None:
-            self.tokenizer_manager._subprocess_watchdog.stop()
         self.tokenizer_manager.gracefully_exit = True
 
     def running_phase_sigquit_handler(self, signum=None, frame=None):

@@ -18,6 +18,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     EvictParams,
     InitLoadBackParams,
     MatchPrefixParams,
+    MatchResult,
 )
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -55,6 +56,78 @@ def _load_flexkv_radix_cache_class():
 FlexKVRadixCache = _load_flexkv_radix_cache_class()
 
 
+@pytest.mark.parametrize("extra_key,cache_salt", [("lora-a", None), (None, "tenant-a")])
+def test_namespaced_lookup_does_not_read_unscoped_host_kv(extra_key, cache_salt):
+    cache, _ = _make_cache()
+    cache.flexkv_connector.lookup_kv.return_value = (7, 4)
+    req = SimpleNamespace(
+        cache_request_handle=CacheRequestHandle("scoped", 0), rid="scoped"
+    )
+    key = RadixKey(array("q", range(4)), extra_key=extra_key, cache_salt=cache_salt)
+
+    result = cache.match_prefix(MatchPrefixParams(key=key, req=req))
+
+    assert result.host_hit_length == 0
+    cache.flexkv_connector.lookup_kv.assert_not_called()
+
+
+@pytest.mark.parametrize("extra_key,cache_salt", [("lora-a", None), (None, "tenant-a")])
+def test_namespaced_completion_does_not_publish_unscoped_host_kv(extra_key, cache_salt):
+    cache, _ = _make_cache()
+    req = SimpleNamespace(
+        cache_request_handle=CacheRequestHandle("scoped", 0),
+        rid="scoped",
+        extra_key=extra_key,
+        cache_salt=cache_salt,
+        origin_input_ids=[1, 2, 3, 4],
+        output_ids=[],
+    )
+    with (
+        patch.object(RadixCache, "cache_finished_req") as finish,
+        patch.object(
+            RadixCache,
+            "match_prefix",
+            return_value=MatchResult(
+                device_indices=torch.empty(0, dtype=torch.int64),
+                last_device_node=cache.root_node,
+                last_host_node=cache.root_node,
+                best_match_node=cache.root_node,
+            ),
+        ) as match,
+    ):
+        cache.cache_finished_req(req, owned_kv_len=4)
+
+    finish.assert_called_once_with(req, is_insert=True, owned_kv_len=4)
+    match.assert_not_called()
+    cache.flexkv_connector.store_kv.assert_not_called()
+
+
+@pytest.mark.parametrize("stage", ["mapping", "transfer"])
+def test_abort_retains_store_source_until_transfer_completion(stage):
+    cache, _ = _make_cache()
+    handle = CacheRequestHandle("stored", 0)
+    rid = _tracking_key(handle.rid)
+    node = object()
+    pending = SimpleNamespace(node=node, ready_event=MagicMock())
+    if stage == "mapping":
+        cache._pending_store_copies[rid] = pending
+    else:
+        cache._inflight_store_nodes[rid] = node
+    cache.dec_lock_ref = MagicMock()
+
+    cache.release_aborted_request(handle)
+
+    cache.dec_lock_ref.assert_not_called()
+    if stage == "mapping":
+        assert cache._pending_store_copies[rid] is pending
+    else:
+        assert cache._inflight_store_nodes[rid] is node
+        cache.flexkv_connector.check_completed_stores.return_value = [rid]
+        cache._drain_completed_stores()
+        cache.dec_lock_ref.assert_called_once_with(node)
+        assert rid not in cache._inflight_store_nodes
+
+
 def _make_cache(page_size=4):
     allocator = MagicMock()
     allocator.device = torch.device("cpu")
@@ -68,11 +141,12 @@ def _make_cache(page_size=4):
         return slots
 
     allocator.alloc.side_effect = alloc
-    cache = RadixCache.create_simulated(
+    base_cache = RadixCache.create_simulated(
         mock_allocator=allocator,
         page_size=page_size,
     )
-    cache.__class__ = FlexKVRadixCache
+    cache = FlexKVRadixCache.__new__(FlexKVRadixCache)
+    cache.__dict__.update(base_cache.__dict__)
     cache._mode = FlexKVRadixCache.match_prefix.__globals__["FlexKVMode"].IP
     cache.flexkv_connector = MagicMock()
     cache.store_stream = MagicMock()
@@ -338,19 +412,12 @@ def test_partial_duplicate_restore_keeps_reused_prefix_when_alloc_fails():
 def test_ip_match_is_lookup_only_until_request_admission():
     cache, _allocator = _make_cache()
     key = RadixKey(array("q", range(4)))
-    base_res = RadixCache.match_prefix(cache, MatchPrefixParams(key=key))
     cache.flexkv_connector.lookup_kv.return_value = (17, 4)
     req = SimpleNamespace(
         rid="ip-request", cache_request_handle=CacheRequestHandle("ip-request", 0)
     )
 
-    result = cache._ip_match_prefix(
-        key,
-        base_res,
-        base_res.device_indices,
-        base_res.last_device_node,
-        req,
-    )
+    result = cache.match_prefix(MatchPrefixParams(key=key, req=req))
 
     assert result.device_indices.numel() == 0
     assert result.host_hit_length == 4
@@ -403,6 +470,8 @@ def test_finished_request_restores_tree_owned_boundary_before_duplicate_cleanup(
         kv=SimpleNamespace(kv_committed_len=0, cache_protected_len=4),
         _flexkv_uncached_restore=True,
         _flexkv_restore_tree_owned_len=0,
+        extra_key=None,
+        cache_salt=None,
     )
     observed_protected_lengths = []
 

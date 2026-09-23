@@ -114,6 +114,29 @@ class TestRegisterRadixCacheBackend(_RegistryIsolationMixin, CustomTestCase):
 
 
 class TestCreateTreeCacheRouting(_RegistryIsolationMixin, CustomTestCase):
+    def test_flexkv_rejects_conflicting_cache_lifecycles_before_initialization(self):
+        from sglang.srt.mem_cache.storage.flexkv import _flexkv_factory
+
+        for options, message in (
+            ({"enable_streaming": True}, "enable-streaming-session"),
+            ({"enable_hierarchical_cache": True}, "enable-hierarchical-cache"),
+        ):
+            with self.subTest(options=options):
+                with self.assertRaisesRegex(ValueError, message):
+                    _flexkv_factory(_make_ctx(self, **options))
+
+    def test_explicit_flexkv_backend_is_loaded_without_prior_registration(self):
+        _RADIX_CACHE_REGISTRY.pop("flexkv", None)
+        ctx = _make_ctx(self, backend="flexkv")
+        cache = MagicMock()
+        with patch(
+            "sglang.srt.mem_cache.storage.flexkv._flexkv_factory", return_value=cache
+        ) as factory:
+            _RADIX_CACHE_REGISTRY.pop("flexkv", None)
+            result = create_tree_cache(ctx)
+        factory.assert_called_once_with(ctx)
+        self.assertIs(result, cache)
+
     def test_dispatches_to_registered_factory(self):
         cache = MagicMock()
         cache.supports_streaming_session.return_value = True

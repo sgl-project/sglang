@@ -77,8 +77,16 @@ def test_flexkv_radix_prefetch_request_page_aligns_and_launches():
     assert list(args[1]) == [1, 2, 3, 4]
 
 
-def test_scheduler_wait_gate_uses_existing_or_condition():
-    """Document the only scheduler wait change: or-in enable_flexkv."""
-    enable_hicache_storage = False
-    enable_flexkv = True
-    assert (enable_hicache_storage or enable_flexkv) is True
+def test_scheduler_polls_explicit_flexkv_backend_without_legacy_flag():
+    sched = Scheduler.__new__(Scheduler)
+    sched.enable_hierarchical_cache = False
+    sched.enable_unified_cache_external_linker = False
+    sched.enable_hicache_storage = False
+    sched.enable_flexkv = True
+    sched.tree_cache = MagicMock()
+    with patch(
+        "sglang.srt.managers.scheduler.get_memory",
+        return_value=SimpleNamespace(enable_flexkv=False),
+    ):
+        sched._process_hicache_events()
+    sched.tree_cache.check_hicache_events.assert_called_once_with()

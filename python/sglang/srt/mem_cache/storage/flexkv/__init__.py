@@ -12,8 +12,10 @@ so the second form is available without further wiring.
 from __future__ import annotations
 
 import logging
+import os
 
 from sglang.srt.mem_cache.registry import register_radix_cache_backend
+from sglang.srt.runtime_context import get_memory, get_serving
 
 logger = logging.getLogger(__name__)
 
@@ -26,6 +28,15 @@ def _flexkv_factory(ctx):
     FlexKV needs them to fan out lookup/store decisions across the full
     TP × CP × PP topology.
     """
+    if get_serving().enable_streaming_session:
+        # StreamingSession can retain KV without calling the inner cache's
+        # completion hooks. It cannot currently commit FlexKV restore leases.
+        raise ValueError("FlexKV does not support --enable-streaming-session yet")
+    if ctx.enable_hierarchical_cache:
+        raise ValueError("FlexKV cannot be combined with --enable-hierarchical-cache")
+    if ctx.is_hybrid_ssm:
+        raise NotImplementedError("FlexKV does not support Mamba/SSM pools yet")
+
     try:
         from flexkv.integration.sglang.connector import FlexKVConnector  # noqa: F401
     except ImportError as exc:
@@ -46,6 +57,8 @@ def _flexkv_factory(ctx):
     from sglang.srt.runtime_context import get_parallel
 
     server_args = ctx.server_args
+    if get_memory().flexkv_config_file and not os.environ.get("FLEXKV_CONFIG_PATH"):
+        os.environ["FLEXKV_CONFIG_PATH"] = get_memory().flexkv_config_file
 
     # PP group is always available; attn TP / attn CP groups may share
     # the regular TP group when attn DP is off — that's fine, the
@@ -86,9 +99,6 @@ def _flexkv_factory(ctx):
         attn_tp_group=attn_tp_group,
         attn_cp_group=attn_cp_group,
     )
-
-    if ctx.is_hybrid_ssm:
-        raise NotImplementedError("FlexKV does not support Mamba/SSM pools yet")
 
     if ctx.is_hybrid_swa:
         from sglang.srt.mem_cache.storage.flexkv.flexkv_hybrid_radix_cache import (

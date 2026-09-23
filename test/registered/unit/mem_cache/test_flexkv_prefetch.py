@@ -38,8 +38,20 @@ def method(path, cls, name):
         n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == cls
     )
     body = next(
-        n for n in class_node.body if isinstance(n, ast.FunctionDef) and n.name == name
+        (
+            n
+            for n in class_node.body
+            if isinstance(n, ast.FunctionDef) and n.name == name
+        ),
+        None,
     )
+    if body is None and path in (SOURCE, HYBRID):
+        return method(
+            SOURCE.with_name("flexkv_cache_lifecycle.py"),
+            "FlexKVCacheLifecycleMixin",
+            name,
+        )
+    assert body is not None
     body.decorator_list = []
     namespace = {
         "TreeNode": object,
@@ -201,6 +213,7 @@ def hybrid_restore():
         HYBRID, "FlexKVHybridRadixCache", "_restore_lease_matches_req"
     )
     for name in (
+        "_register_restore_lease",
         "_commit_restore",
         "_validate_restore_lease",
         "_forget_restore_lease",

@@ -499,7 +499,9 @@ class Scheduler(
         self.enable_hierarchical_cache = get_memory().enable_hierarchical_cache
         self.enable_session_radix_cache = get_memory().enable_session_radix_cache
         self.enable_hicache_storage = get_memory().hicache_storage_backend is not None
-        self.enable_flexkv = bool(get_memory().enable_flexkv)
+        self.enable_flexkv = bool(
+            get_memory().enable_flexkv or get_memory().radix_cache_backend == "flexkv"
+        )
         self.enable_unified_cache_external_linker = (
             get_memory().enable_unified_cache_external_linker
         )
@@ -3628,7 +3630,7 @@ class Scheduler(
         # decisions (_should_defer_prefill) or ranks enter different collectives.
         if (
             self.enable_hierarchical_cache
-            or get_memory().enable_flexkv
+            or self.enable_flexkv
             or self.enable_unified_cache_external_linker
         ):
             self.tree_cache.check_hicache_events()
@@ -4031,7 +4033,7 @@ class Scheduler(
                 if res == AddReqResult.NO_TOKEN:
                     if (
                         self.enable_hierarchical_cache
-                        or get_memory().enable_flexkv
+                        or self.enable_flexkv
                         or self.enable_unified_cache_external_linker
                     ):
                         # An idle FlexKV batch must retry when host-cache pressure

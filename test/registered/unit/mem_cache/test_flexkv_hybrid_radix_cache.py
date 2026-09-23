@@ -54,6 +54,35 @@ def _load_hybrid_cache_class():
 FlexKVHybridRadixCache = _load_hybrid_cache_class()
 
 
+@pytest.mark.parametrize("extra_key,cache_salt", [("lora-a", None), (None, "tenant-a")])
+def test_namespaced_lookup_does_not_read_unscoped_host_kv(extra_key, cache_salt):
+    cache, req, _, _ = _make_layerwise_restore()
+    result = MatchResult(
+        device_indices=torch.empty(0, dtype=torch.int64),
+        last_device_node=req.last_node,
+        last_host_node=req.last_node,
+        best_match_node=req.last_node,
+    )
+    cache._inner_cache.match_prefix.return_value = result
+    cache.flexkv_connector.lookup_kv.return_value = (7, 4)
+    key = RadixKey(array("q", range(4)), extra_key=extra_key, cache_salt=cache_salt)
+
+    assert cache.match_prefix(MatchPrefixParams(key=key, req=req)).host_hit_length == 0
+    cache.flexkv_connector.lookup_kv.assert_not_called()
+
+
+@pytest.mark.parametrize("extra_key,cache_salt", [("lora-a", None), (None, "tenant-a")])
+def test_namespaced_store_does_not_publish_unscoped_host_kv(extra_key, cache_salt):
+    cache, req, _, _ = _make_layerwise_restore()
+    req.extra_key, req.cache_salt = extra_key, cache_salt
+    cache._inner_cache.is_root.return_value = True
+
+    cache._store_prefix(req, [1, 2, 3, 4])
+
+    cache._inner_cache.match_prefix.assert_not_called()
+    cache.flexkv_connector.store_kv.assert_not_called()
+
+
 def test_pool_accounting_delegates_to_inner_cache():
     inner = MagicMock()
     inner.is_root.return_value = False
@@ -359,6 +388,7 @@ def test_prefill_boundary_is_stored_with_an_independent_tracking_key():
         rid="request",
         cache_request_handle=CacheRequestHandle("request", 0),
         extra_key=None,
+        cache_salt=None,
         kv=SimpleNamespace(swa_evicted_seqlen=0),
         get_fill_ids=lambda: array("q", [1, 2, 3, 4]),
     )
@@ -499,8 +529,6 @@ def _make_layerwise_restore(loaded=4):
     cache._restore_generation = 0
     cache._node_lock = threading.Lock()
     cache._inflight_store_nodes = {}
-    cache._pending_store_launches = {}
-    cache._pending_store_copies = {}
     restored = torch.arange(20, 24, dtype=torch.int64)
     cache._alloc_restore_slots = MagicMock(return_value=restored)
     req = SimpleNamespace(
@@ -513,6 +541,8 @@ def _make_layerwise_restore(loaded=4):
         ),
         origin_input_ids=array("q", range(4)),
         output_ids=array("q"),
+        extra_key=None,
+        cache_salt=None,
     )
     params = InitLoadBackParams(
         best_match_node=req.last_node, host_hit_length=4, req=req
@@ -660,34 +690,28 @@ def test_hybrid_reset_reclaims_orphaned_abort_despite_stale_request_fields(stale
     assert cache._aborted_restore_leases == {}
 
 
-@pytest.mark.parametrize("failure", [None, "copy", "connector"])
-def test_hybrid_reset_waits_for_staged_copy_and_connector_before_free(failure):
+@pytest.mark.parametrize("failure", [False, True])
+def test_hybrid_reset_fences_connector_before_reclaiming_slots(failure):
     cache, req, params, _ = _make_layerwise_restore()
     cache.init_load_back(params)
-    event = MagicMock()
-    pending = SimpleNamespace(ready_event=event, cpu_indices=object())
-    cache._pending_store_copies[_tracking_key("store")] = pending
     order = []
 
-    def drain(stage):
-        order.append(stage)
-        if stage == failure:
+    def drain():
+        order.append("connector")
+        if failure:
             raise RuntimeError("transfer still active")
 
-    event.synchronize.side_effect = lambda: drain("copy")
-    cache.flexkv_connector.reset.side_effect = lambda: drain("connector")
+    cache.flexkv_connector.reset.side_effect = drain
     cache.token_to_kv_pool_allocator.free.side_effect = lambda _s: order.append("free")
     cache._inner_cache.reset.side_effect = lambda: order.append("tree")
-    if failure is None:
+    if not failure:
         cache.reset()
-        assert order == ["copy", "connector", "free", "tree"]
+        assert order == ["connector", "free", "tree"]
         assert not cache.has_uncommitted_restore(req)
-        assert cache._pending_store_copies == {}
     else:
         with pytest.raises(RuntimeError, match="transfer still active"):
             cache.reset()
-        assert order == (["copy"] if failure == "copy" else ["copy", "connector"])
+        assert order == ["connector"]
         assert cache.has_uncommitted_restore(req)
-        assert cache._pending_store_copies[_tracking_key("store")] is pending
         cache.token_to_kv_pool_allocator.free.assert_not_called()
         cache._inner_cache.reset.assert_not_called()
