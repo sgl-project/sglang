@@ -379,6 +379,51 @@ class TestFlashInferSWAAttentionBackendCorrectness(CustomTestCase):
                     rtol=0,
                 )
 
+    def test_full_layer_with_cached_prefix_reads_prefix_only(self):
+        """Full attention must ignore stale K/V in unwritten extend slots."""
+        case = DenseAttentionCase(
+            name="swa_full_layer_prefix_only_paged",
+            backend="flashinfer",
+            forward_mode=ForwardMode.EXTEND,
+            num_heads=4,
+            num_kv_heads=4,
+            page_size=16,
+            prefix_lens=(7,),
+            extend_lens=(7,),
+            sliding_window_size=4,
+        )
+        with self._swa_fixture(case, head_dim=128, max_context_len=32) as fixture:
+            full = RadixAttention(
+                num_heads=4,
+                head_dim=128,
+                scaling=fixture.actual_module.attn.scaling,
+                num_kv_heads=4,
+                layer_id=0,
+                sliding_window_size=-1,
+            )
+            q = torch.zeros(7, 4, 128, device="cuda", dtype=torch.bfloat16)
+            k = torch.zeros(14, 4, 128, device="cuda", dtype=torch.bfloat16)
+            v = torch.zeros_like(k)
+            q[:, :, 0] = 16
+            k[0, :, 0] = 16
+            v[0] = 8
+            pool = fixture.runner.token_to_kv_pool
+            prefix_locs = fixture.runner.req_to_token_pool.req_to_token[0, :7].long()
+            pool.set_kv_buffer(full, prefix_locs, k[:7], v[:7])
+            batch = fixture.forward_batch
+            poison_k = torch.zeros_like(k[7:])
+            poison_k[:, :, 0] = 16
+            pool.set_kv_buffer(
+                full, batch.out_cache_loc.long(), poison_k, torch.full_like(v[7:], -8)
+            )
+
+            fixture.backend.init_forward_metadata(batch)
+            actual = full(q, k[7:], v[7:], batch, save_kv_cache=False).view(7, 4, 128)
+
+            torch.testing.assert_close(
+                actual, actual.new_full((7, 4, 128), 8), atol=0.04, rtol=0
+            )
+
     def test_sliding_and_full_layers_reuse_same_prefill_metadata(self):
         case = DenseAttentionCase(
             name="swa_full_swa_shared_prefill_metadata",

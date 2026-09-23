@@ -53,7 +53,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.runtime_context import attention_backends, get_exec, get_parallel
+from sglang.srt.runtime_context import get_exec, get_parallel
 from sglang.srt.utils import add_prefix, make_layers, set_weight_attrs
 
 
@@ -454,12 +454,6 @@ class BeamForCausalLM(nn.Module):
         super().__init__()
         if quant_config is not None:
             raise NotImplementedError("Beam currently supports unquantized weights")
-        # Keep FlashInfer integration for re-enablement after numerical validation.
-        assert "flashinfer" not in attention_backends(), (
-            "Beam temporarily disables FlashInfer attention due to numerical "
-            "mismatches in chunked/cached prefill. Use trtllm_mha for prefill "
-            "and decode until the fix is validated."
-        )
         if get_parallel().enable_dp_attention or get_parallel().enable_dp_lm_head:
             raise NotImplementedError(
                 "Beam does not yet support attention data parallelism or a "
