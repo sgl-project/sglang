@@ -280,19 +280,6 @@ class TreeNode:
     def evicted(self):
         return self.value is None
 
-    def get_last_hash_value(self) -> Optional[str]:
-        """Returns the hash value of the last page in this node."""
-        if self.hash_value is None or len(self.hash_value) == 0:
-            return None
-        return self.hash_value[-1]
-
-    def get_prefix_hash_values(self, node: TreeNode) -> List[str]:
-        chunks = []
-        while node is not None and node.hash_value is not None:
-            chunks.append(node.hash_value)
-            node = node.parent
-        return [value for chunk in reversed(chunks) for value in chunk]
-
     def __lt__(self, other: TreeNode):
         return self.last_access_time < other.last_access_time
 
