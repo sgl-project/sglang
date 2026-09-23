@@ -752,3 +752,12 @@ python -m  sglang_router.launch_router --prefill ${P_IP}:8000 \
 --pd-disaggregation \
 --health-check-interval-secs 3600 \
 ```
+
+
+### Independent prefill affinity and decode workload routing
+
+On a DP-attention decode server, you can enable `--disaggregation-decode-workload-balancing` with `--load-balance-method total_tokens`. This opt-in mode overrides the router's decode rank hint using the existing DP token budget while preserving `disagg_prefill_dp_rank` and the bootstrap identity. The default is off. It balances ranks within one decode replica, not separate replicas, and cannot be combined with decode prefix caching or elastic EP above the launch DP size.
+
+For a fixed fleet of DP-aware routers using the `consistent_hashing` prefill policy, the optional `python -m sglang_router.pd_session_admission` edge assigns new session keys to the registered prefill URL with the least in-flight request-body bytes and pins later requests to that URL. Run `--help` for its backend and inventory arguments. Set `SGLANG_ROUTER_REQUIRE_CTX_URL_TARGET=1` on these routers to require canonical URL targets. Clients provide `X-SMG-Routing-Key`; only the admission edge supplies `X-SMG-Target-Worker`.
+
+Run one admission owner per session namespace behind a trusted ingress. The policy is a byte-pressure heuristic, not a KV-cache index or a remaining-compute predictor. It does not migrate existing sessions, replicate ownership, or retry requests. Inventory changes, unavailable owners, and ownership-capacity exhaustion fail closed rather than silently losing affinity.

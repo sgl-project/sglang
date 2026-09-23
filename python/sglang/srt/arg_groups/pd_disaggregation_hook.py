@@ -23,6 +23,12 @@ def handle_pd_disaggregation(server_args: ServerArgs) -> None:
     """Validate and normalize PD-disaggregation server args."""
     cfg = resolving_view(server_args)
 
+    from sglang.srt.managers.decode_workload_routing import (
+        validate_decode_workload_config,
+    )
+
+    validate_decode_workload_config(cfg)
+
     # "mooncake_tcp" is mooncake with the TCP transport forced: set MC_FORCE_TCP
     # so mooncake installs TcpTransport instead of RDMA, rewrite the backend to
     # mooncake, and skip RDMA HCA selection. Must run before backend-name checks.
