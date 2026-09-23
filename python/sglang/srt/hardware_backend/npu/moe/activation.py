@@ -7,7 +7,6 @@ import torch.nn.functional as F
 from sglang.srt.distributed.communication_op import (
     tensor_model_parallel_all_gather,
 )
-from sglang.srt.layers.activation import GeluAndMul
 from sglang.srt.runtime_context import get_parallel
 
 
@@ -148,8 +147,35 @@ class NPUSitu(BaseActivation):
         )
 
 
+class NPUSituMXFP8Quant(BaseActivation):
+    """A5 AscendC grouped SiTU with valid-row MXFP8 quantization."""
+
+    def __init__(self, *, beta: float = 4.0, linear_beta: float = 25.0):
+        from sgl_kernel_npu.activation.situ_mxfp8_quant import situ_mxfp8_quant
+
+        self.situ_mxfp8_quant = situ_mxfp8_quant
+        self.beta = float(beta)
+        self.linear_beta = float(linear_beta)
+
+    def _apply_activation(
+        self,
+        hidden_states: torch.Tensor,
+        group_list: torch.Tensor,
+        group_list_type: int,
+    ):
+        return self.situ_mxfp8_quant(
+            hidden_states,
+            group_list,
+            group_list_type,
+            beta=self.beta,
+            linear_beta=self.linear_beta,
+        )
+
+
 class NPUGeluAndMul(BaseActivation):
     def __init__(self):
+        from sglang.srt.layers.activation import GeluAndMul
+
         self._gelu = GeluAndMul()
 
     def _apply_activation(self, hidden_states: torch.Tensor):
@@ -199,6 +225,35 @@ class NPUSwigluStepAndMul(BaseActivation):
         gate = F.silu(gate).clamp(max=limit)
         up = up.clamp(min=-limit, max=limit)
         return gate * up
+
+
+class NPUSwigluMxfp8Quant(BaseActivation):
+    """DeepSeek-V4 grouped SwiGLU with MXFP8 requantization for GMM2."""
+
+    def __init__(self, limit: float):
+        self._limit = float(limit)
+
+    def _apply_activation(
+        self,
+        hidden_states: torch.Tensor,
+        group_list: torch.Tensor,
+        group_list_type: int,
+    ):
+        # The op sums the group list as per-expert counts and has no cumulative layout;
+        # a cusum list passed through would silently process the wrong rows.
+        if group_list_type != 1:
+            raise ValueError(
+                "swiglu_group_quant takes a per-expert count group list, got "
+                f"group_list_type={group_list_type}"
+            )
+        out, scale, _ = torch.ops.npu.swiglu_group_quant(
+            x=hidden_states,
+            group_index=group_list,
+            quant_mode=2,  # MX: one e8m0 scale per 32-element block
+            group_list_type=0,  # sglang numbers the count layout 1, the op numbers it 0
+            clamp_value=self._limit,
+        )
+        return out, scale
 
 
 # =============================================================================

@@ -38,6 +38,7 @@ from sglang.kernels.spec import (
 )
 
 _CUDA = frozenset({CapabilityRequirement.CUDA})
+_CUDA_SM90_PLUS = frozenset({CapabilityRequirement.cuda(min_sm=(9, 0))})
 _CUDA_SM100_PLUS = frozenset({CapabilityRequirement.cuda(min_sm=(10, 0))})
 _HIP = frozenset({CapabilityRequirement.HIP})
 
@@ -241,7 +242,7 @@ _SPECS: tuple[tuple[str, KernelBackend, str, frozenset, str], ...] = (
         "diffusion.qwen_qkv_epilogue",
         KernelBackend.JIT,
         "rope.qwen_qkv_epilogue_jit:try_fused_qwen_qkv_epilogue",
-        _CUDA_SM100_PLUS,
+        _CUDA_SM90_PLUS,
         "Qwen-Image QK RMS-norm, RoPE, and joint QKV writes.",
     ),
     (
@@ -280,11 +281,25 @@ _SPECS: tuple[tuple[str, KernelBackend, str, frozenset, str], ...] = (
         "Paired in-place Helios transposed Q/K RoPE.",
     ),
     (
+        "diffusion.complex_rope",
+        KernelBackend.TRITON,
+        "rope.complex_rope_triton:fused_complex_rope",
+        _CUDA,
+        "Paired RoPE preserving PyTorch complex64 multiplication rounding.",
+    ),
+    (
         "diffusion.hunyuan_qkv_rope_pack",
         KernelBackend.TRITON,
         "rope.hunyuan_qkv_pack_triton:hunyuan_qkv_rope_pack",
         _CUDA,
         "HunyuanVideo QKV pack + RoPE.",
+    ),
+    (
+        "diffusion.rmsnorm_preserve_reduction",
+        KernelBackend.TRITON,
+        "norm.rmsnorm_preserve_reduction:rmsnorm_preserve_reduction",
+        _CUDA,
+        "Cast-before-weight RMSNorm preserving the native FP32 mean reduction.",
     ),
     (
         "diffusion.silu_mul",
@@ -327,6 +342,76 @@ _SPECS: tuple[tuple[str, KernelBackend, str, frozenset, str], ...] = (
         "attention.sana_wm_gdn_triton:fused_bigdn_func",
         _CUDA,
         "Sana-WM bidirectional gated delta-net.",
+    ),
+    (
+        "diffusion.fused_qknorm_rope_out_of_place",
+        KernelBackend.JIT,
+        "rope.qknorm_rope_jit:fused_qknorm_rope_out_of_place",
+        _CUDA,
+        "Out-of-place fused QK-norm + RoPE (raw q/k preserved).",
+    ),
+    (
+        "diffusion.vdn_delta_factors",
+        KernelBackend.JIT,
+        "attention.vdn_delta_factors_jit:vdn_delta_factors",
+        _CUDA,
+        "VDN-H3 delta rule: fused (I + A)^-1 -> transition / injection (fp32, head_dim 128).",
+    ),
+    (
+        "diffusion.vdn_temporal_conv_act",
+        KernelBackend.TRITON,
+        "attention.vdn_linear_branch_triton:vdn_temporal_conv_act",
+        _CUDA,
+        "VDN-H3 linear branch: 5-tap temporal conv + SiLU + L2 norm.",
+    ),
+    (
+        "diffusion.vdn_silu_l2norm",
+        KernelBackend.TRITON,
+        "attention.vdn_linear_branch_triton:vdn_silu_l2norm",
+        _CUDA,
+        "VDN-H3 linear branch: SiLU + L2 norm over head_dim.",
+    ),
+    (
+        "diffusion.vdn_frame_stats_prep",
+        KernelBackend.TRITON,
+        "attention.vdn_linear_branch_triton:vdn_frame_stats_prep",
+        _CUDA,
+        "VDN-H3 linear branch: frame-statistics GEMM operands in one pass.",
+    ),
+    (
+        "diffusion.vdn_gather_linear_state",
+        KernelBackend.TRITON,
+        "attention.vdn_linear_branch_triton:vdn_gather_linear_state",
+        _CUDA,
+        "VDN-H3 linear branch: alpha-bridged boundary gather in one pass.",
+    ),
+    (
+        "diffusion.vdn_linear_epilogue",
+        KernelBackend.TRITON,
+        "attention.vdn_linear_branch_triton:vdn_linear_epilogue",
+        _CUDA,
+        "VDN-H3 linear branch: RMSNorm * gate readout epilogue.",
+    ),
+    (
+        "diffusion.mxfp8_quantize_swizzled",
+        KernelBackend.TRITON,
+        "quantization.mxfp8_swizzled_triton:mxfp8_quantize_swizzled",
+        _CUDA,
+        "bf16 -> MXFP8 (e4m3, block-32 E8M0 scales in the cuBLASLt swizzled layout).",
+    ),
+    (
+        "diffusion.silu_mul_mxfp8",
+        KernelBackend.TRITON,
+        "quantization.mxfp8_swizzled_triton:silu_mul_mxfp8",
+        _CUDA,
+        "SwiGLU + MXFP8 quant for the online mxfp8 fc2 input.",
+    ),
+    (
+        "diffusion.indexed_scale_shift_mxfp8_",
+        KernelBackend.TRITON,
+        "quantization.mxfp8_swizzled_triton:indexed_scale_shift_mxfp8_",
+        _CUDA,
+        "Indexed adaLN modulation + MXFP8 quant for the online mxfp8 qkv/fc1 inputs.",
     ),
     (
         "diffusion.group_limited_topk",
@@ -441,7 +526,9 @@ _EXPORTS: dict[str, str] = {
     "can_use_flux2_gated_resnorm": "norm.flux2_gated_resnorm_jit",
     "flux2_gated_resnorm_raw": "norm.flux2_gated_resnorm_jit",
     "FLYDSL_NORM_MIN_ALIGNED_DIM": "norm.fused_residual_norm_flydsl",
+    "can_use_fused_scale_residual_norm_scale_shift_triton": "norm.scale_residual_norm_scale_shift_triton",
     "flydsl_fused_residual_norm_scale_shift": "norm.fused_residual_norm_flydsl",
+    "fused_scale_residual_norm_scale_shift_triton": "norm.scale_residual_norm_scale_shift_triton",
     "flydsl_norm_scale_shift": "norm.fused_residual_norm_flydsl",
     "apply_group_norm_silu": "norm.group_norm_silu",
     "triton_group_norm_silu": "norm.group_norm_silu_triton",
@@ -463,6 +550,8 @@ _EXPORTS: dict[str, str] = {
     "try_fused_bias_mul_add": "sglang.kernels.kda_kernels.norm_scale_shift_jit",
     "try_fused_bias_scale_residual_norm_scale_shift": "sglang.kernels.kda_kernels.norm_scale_shift_jit",
     "triton_one_pass_rms_norm": "norm.rmsnorm_onepass_triton",
+    "can_use_rmsnorm_preserve_reduction": "norm.rmsnorm_preserve_reduction",
+    "rmsnorm_preserve_reduction": "norm.rmsnorm_preserve_reduction",
     "can_use_fused_rmsnorm_scale_shift": "norm.rmsnorm_scale_shift_bitexact",
     "can_use_fused_scale_residual_rmsnorm_scale_shift": "norm.rmsnorm_scale_shift_bitexact",
     "fused_rmsnorm_scale_shift_bitexact": "norm.rmsnorm_scale_shift_bitexact",
@@ -516,6 +605,8 @@ _EXPORTS: dict[str, str] = {
     "can_use_helios_qk_rope": "rope.helios_qk_rope_jit",
     "fused_inplace_helios_qk_rope": "rope.helios_qk_rope_jit",
     "apply_rotary_embedding": "rope.rotary_triton",
+    "can_use_fused_complex_rope": "rope.complex_rope_triton",
+    "fused_complex_rope": "rope.complex_rope_triton",
     # Tensor layout transformations fused with downstream quantization
     "try_flux2_token_cat_fp8": "sglang.kernels.kda_kernels.flux2_token_cat_fp8_triton",
     # Activation-function fusions
@@ -541,6 +632,24 @@ _EXPORTS: dict[str, str] = {
     "fused_causal_conv3d_cat_pad_cuda": "sglang.kernels.kda_kernels.causal_conv3d_cat_pad_jit",
     "fused_causal_conv3d_cat_pad": "layout.causal_conv3d_cat_pad_triton",
     "pack_qkv_destination_major": "layout.ulysses_qkv_triton",
+    "fused_qknorm_rope_out_of_place": "rope.qknorm_rope_jit",
+    "vdn_delta_factors": "attention.vdn_delta_factors_jit",
+    "can_use_vdn_delta_factors": "attention.vdn_delta_factors_jit",
+    "vdn_temporal_conv_act": "attention.vdn_linear_branch_triton",
+    "can_use_vdn_temporal_conv_act": "attention.vdn_linear_branch_triton",
+    "can_use_vdn_silu_l2norm": "attention.vdn_linear_branch_triton",
+    "can_use_vdn_frame_stats_prep": "attention.vdn_linear_branch_triton",
+    "can_use_vdn_gather_linear_state": "attention.vdn_linear_branch_triton",
+    "can_use_vdn_linear_epilogue": "attention.vdn_linear_branch_triton",
+    "vdn_silu_l2norm": "attention.vdn_linear_branch_triton",
+    "vdn_frame_stats_prep": "attention.vdn_linear_branch_triton",
+    "vdn_gather_linear_state": "attention.vdn_linear_branch_triton",
+    "vdn_linear_epilogue": "attention.vdn_linear_branch_triton",
+    "can_use_mxfp8_swizzled": "quantization.mxfp8_swizzled_triton",
+    "can_use_silu_mul_mxfp8": "quantization.mxfp8_swizzled_triton",
+    "indexed_scale_shift_mxfp8_": "quantization.mxfp8_swizzled_triton",
+    "mxfp8_quantize_swizzled": "quantization.mxfp8_swizzled_triton",
+    "silu_mul_mxfp8": "quantization.mxfp8_swizzled_triton",
     "can_use_usp_merge_heads": "layout.usp_relayout_jit",
     "usp_merge_heads": "layout.usp_relayout_jit",
     "build_inv_indices": "layout.varlen_pack_pad_triton",
@@ -627,6 +736,7 @@ _EXPORTS: dict[str, str] = {
     "interpolate": "ext.hunyuan3d_rasterizer",
     "rasterize": "ext.hunyuan3d_rasterizer",
     "meshVerticeInpaint": "ext.mesh_processor",
+    "load_mesh_processor": "ext.mesh_processor",
 }
 
 

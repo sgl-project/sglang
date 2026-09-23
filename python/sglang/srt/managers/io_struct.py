@@ -454,8 +454,18 @@ class GenerateReqInput:
             self.input_embeds = None
         elif self.input_ids is not None:
             if len(self.input_ids) == 0:
-                raise ValueError("input_ids cannot be empty.")
-            if isinstance(self.input_ids[0], int):
+                # Session history may supply the entire prompt. The scheduler
+                # rejects requests that are still empty after reconstruction.
+                session_id = (
+                    self.session_params.get("id")
+                    if isinstance(self.session_params, dict)
+                    else None
+                )
+                if not session_id:
+                    raise ValueError("input_ids cannot be empty.")
+                self.is_single = True
+                self.batch_size = 1
+            elif isinstance(self.input_ids[0], int):
                 self.is_single = True
                 self.batch_size = 1
             else:
@@ -1067,6 +1077,10 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
 
     # Cache namespace used to isolate otherwise-identical prefixes.
     cache_salt: Optional[str] = None
+
+    # Internal PP control bit, set by PP0 before forwarding the request.
+    # Keep at the end to preserve the positional Rust wire schema.
+    pp_prefetch_ticketed: bool = False
 
     def wrap_pickle_fields(self):
         self.time_stats = wrap_as_pickle(self.time_stats)
@@ -2037,6 +2051,24 @@ class SlowDownReqInput(BaseReq, kw_only=True):
 
 class SlowDownReqOutput(BaseReq, kw_only=True):
     pass
+
+
+class PdRoleSwitchReqInput(BaseReq, kw_only=True):
+    # Target role; "" is an invalid sentinel rejected by the handler.
+    new_role: Literal["prefill", "decode", ""] = ""
+    # Optional decode bs to capture on a flip to decode (capture-to-fit);
+    # None uses the server's configured decode bs list.
+    decode_cuda_graph_bs: Optional[List[int]] = None
+    # Measured graph footprint from a matching decode peer.
+    decode_cuda_graph_memory_gb: Optional[float] = None
+
+
+class PdRoleSwitchReqOutput(BaseReq, kw_only=True):
+    success: bool = False
+    message: str = ""
+    old_role: str = ""
+    new_role: str = ""
+    safe_to_restore: bool = False
 
 
 class AbortReq(BaseReq, kw_only=True):

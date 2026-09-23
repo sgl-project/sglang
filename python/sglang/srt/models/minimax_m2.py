@@ -29,7 +29,6 @@ from transformers import PretrainedConfig
 from sglang.kernels.kernel_api_logging import debug_kernel_api
 from sglang.srt.batch_overlap.two_batch_overlap import model_forward_maybe_tbo
 from sglang.srt.distributed import (
-    get_pp_group,
     tensor_model_parallel_all_reduce,
 )
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
@@ -619,7 +618,7 @@ class MiniMaxM2MoE(nn.Module):
             topk_output = self.topk(
                 hidden_states,
                 router_logits,
-                num_token_non_padded=forward_batch.num_token_non_padded,
+                num_token_non_padded=forward_batch.moe_num_token_non_padded(),
                 expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
                     layer_id=self.layer_id,
                 ),
@@ -660,7 +659,7 @@ class MiniMaxM2MoE(nn.Module):
                 state.topk_weights_local, state.topk_idx_local, _ = self.topk(
                     hidden_states=hidden_states,
                     router_logits=router_logits,
-                    num_token_non_padded=state.forward_batch.num_token_non_padded,
+                    num_token_non_padded=state.forward_batch.moe_num_token_non_padded(),
                     expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
                         layer_id=self.layer_id,
                     ),
@@ -1123,7 +1122,7 @@ class MiniMaxM2Model(nn.Module):
 
         self.padding_idx = getattr(config, "pad_token_id", 0)
         self.vocab_size = config.vocab_size
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
 
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size,
@@ -1252,7 +1251,7 @@ class MiniMaxM2ForCausalLM(nn.Module):
             config, quant_config, prefix=add_prefix("model", prefix)
         )
 
-        if get_pp_group().is_last_rank:
+        if get_parallel().pp_group.is_last_rank:
             self.lm_head = ParallelLMHead(
                 config.vocab_size,
                 config.hidden_size,
@@ -1263,7 +1262,7 @@ class MiniMaxM2ForCausalLM(nn.Module):
             self.lm_head = PPMissingLayer()
 
         self.logits_processor = LogitsProcessor(config)
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
 
         # For EAGLE3
         self.capture_aux_hidden_states = False
@@ -1272,7 +1271,7 @@ class MiniMaxM2ForCausalLM(nn.Module):
         return self.model.get_input_embeddings(input_ids)
 
     def set_eagle3_layers_to_capture(self, layer_ids: Optional[list[int]] = None):
-        if not get_pp_group().is_last_rank:
+        if not get_parallel().pp_group.is_last_rank:
             return
 
         self.capture_aux_hidden_states = True
