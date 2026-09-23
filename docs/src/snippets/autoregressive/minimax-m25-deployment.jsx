@@ -121,7 +121,7 @@ export const MiniMaxM25Deployment = () => {
       const environment = [
         '# Ascend A2: 8 x 910B4, 32 GiB per device, single-request smoke configuration',
         '# Complete the A2 prerequisites in this guide before launching.',
-        '# Observed KV pool: 896 tokens; inputs above 890 tokens were rejected.',
+        '# Observed KV pool: 4096 tokens; synthetic input up to 3500 + 128 output tested.',
         '# Tool-call parser configured; tool calling has not been tested.',
         `MODEL_PATH=${shellQuote(modelPath)}`,
         `TOKENIZER_PATH=${shellQuote(tokenizerPath)}`,
@@ -140,7 +140,8 @@ export const MiniMaxM25Deployment = () => {
         '    --host 127.0.0.1 --port 31216',
         '    --context-length 4096 --max-running-requests 1',
         '    --chunked-prefill-size 128 --max-prefill-tokens 4096',
-        '    --mem-fraction-static 0.95 --disable-cuda-graph --disable-radix-cache'
+        '    --mem-fraction-static 0.96 --max-total-tokens 4096',
+        '    --disable-cuda-graph --disable-radix-cache'
       ];
       return environment.join('\n') + '\n' + launch.join(' \\\n');
     }
