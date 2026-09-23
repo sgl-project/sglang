@@ -2225,6 +2225,9 @@ def _execute_server_warmup(server_args: ServerArgs):
         kill_process_tree(os.getpid())
         return success
 
+    if get_disagg().afd_role == "ffn":
+        return True
+
     model_info = res.json()
 
     # Construct a warmup request (MLX: text warmup for VLM-advertising models; TODO: enable image warmup).
@@ -2406,6 +2409,8 @@ def _wait_and_warmup(
         if not execute_warmup_func(server_args):
             return
     else:
+        if get_disagg().afd_role == "ffn" and not _execute_server_warmup(server_args):
+            return
         _global_state.tokenizer_manager.server_status = ServerStatus.Up
 
     _freeze_gc_after_server_warmup(server_args)

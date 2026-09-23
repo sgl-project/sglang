@@ -3836,7 +3836,7 @@ def require_mlp_tp_gather():
             return True
         elif not get_parallel().enable_dp_lm_head:
             return True
-        elif get_moe_a2a_backend().is_none():
+        elif get_moe_a2a_backend().is_none() or get_moe_a2a_backend().is_afd_attn():
             return True
         elif get_moe_a2a_backend().is_flashinfer():
             # FlashInfer MoE A2A needs a rank-invariant, DP-synchronized per-rank

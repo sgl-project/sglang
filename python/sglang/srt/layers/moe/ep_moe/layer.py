@@ -352,6 +352,10 @@ class DeepEPMoE(FusedMoE):
 
 
 def get_moe_impl_class(quant_config: Optional[QuantizationConfig]):
+    if get_moe_a2a_backend().is_afd_attn():
+        from sglang.srt.afd.layers import AFDAttnMoE
+
+        return AFDAttnMoE
     # [TODO] kk, temporary solution
     if (
         get_moe_a2a_backend().is_mori()

@@ -425,7 +425,10 @@ class LayerScatterModes:
         if context.is_layer_sparse:
             if (
                 # Token dispatch/combine will be handled outside of LayerCommunicator for these modes.
-                not get_moe_a2a_backend().is_none()
+                (
+                    not get_moe_a2a_backend().is_none()
+                    and not get_moe_a2a_backend().is_afd_attn()
+                )
                 or should_use_flashinfer_cutlass_moe_fp4_allgather()
                 or enable_dwdp()
             ):

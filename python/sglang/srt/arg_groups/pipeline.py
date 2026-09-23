@@ -295,6 +295,10 @@ def run_resolution_pipeline(server_args: Any) -> None:
     handle_context_parallelism(server_args)
 
     # Handle MoE configurations.
+    from sglang.srt.afd.afd_config import (
+        check_afd_server_args,
+        prepare_afd_ffn_moe_backend,
+    )
     from sglang.srt.arg_groups.moe_hook import (
         handle_a2a_moe,
         handle_moe_kernel_config,
@@ -304,11 +308,14 @@ def run_resolution_pipeline(server_args: Any) -> None:
     )
 
     handle_moe_kernel_config(server_args)
+    prepare_afd_ffn_moe_backend(server_args)
     handle_a2a_moe(server_args)
     handle_eplb_and_dispatch(server_args)
     handle_expert_distribution_metrics(server_args)
     handle_elastic_ep(server_args)
     validate_experimental_sgl_marlin(server_args)
+
+    check_afd_server_args(server_args)
 
     # Handle pipeline parallelism.
     run_post_process_pass(server_args, _pipeline_parallel_overlap_disable)

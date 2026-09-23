@@ -44,6 +44,7 @@ class MoeA2ABackend(Enum):
     DEEPEP_V2 = "deepep_v2"
     PPLX = "pplx"
     CUSTOMIZED = "customized"
+    AFD_ATTN = "afd"
 
     @classmethod
     def _missing_(cls, value):
@@ -89,6 +90,9 @@ class MoeA2ABackend(Enum):
 
     def is_customized(self):
         return self == MoeA2ABackend.CUSTOMIZED
+
+    def is_afd_attn(self):
+        return self == MoeA2ABackend.AFD_ATTN
 
     def supports_aiter(self) -> bool:
         return self in (

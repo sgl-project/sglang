@@ -298,6 +298,8 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: Optional[ForwardBatch] = None,
     ) -> torch.Tensor:
+        if get_moe_a2a_backend().is_afd_attn():
+            return self.forward_normal(hidden_states)
 
         if (
             not is_deepep_class_backend()

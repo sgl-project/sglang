@@ -2403,6 +2403,7 @@ class ServerArgs:
             "ascend_fuseep",
             "flashinfer",
             "megamoe",
+            "afd",
             "deepep_v2",
             "ascend_tp",
             "pplx",
@@ -2418,6 +2419,7 @@ class ServerArgs:
                 "ascend_fuseep",
                 "flashinfer",
                 "megamoe",
+                "afd",
                 "deepep_v2",
                 "pplx",
                 "ascend_tp",
@@ -3288,6 +3290,32 @@ class ServerArgs:
         "Number of optimistic prefill forward passes that skip the bootstrap wait.",
         NS("disagg"),
     ] = 0
+
+    # -------------------------------------------------------------------------
+    # AFD (Attention-FFN Disaggregation)
+    # -------------------------------------------------------------------------
+    afd_role: A[
+        Optional[Literal["attn", "ffn"]],
+        'AFD (Attention-FFN Disaggregation) role of this instance. "attn" runs '
+        'the model without routed experts; "ffn" serves expert computation. '
+        "If not specified, AFD is disabled.",
+        NS("disagg"),
+    ] = None
+    afd_ffn_addr: A[
+        Optional[str],
+        "host:port of the AFD ffn instance's server (its --host/--port). The "
+        "internal handshake port is derived from it. Required for --afd-role "
+        "attn; must not be set for --afd-role ffn.",
+        NS("disagg"),
+    ] = None
+    afd_backend: A[
+        Literal["nccl"],
+        "The AFD data-plane backend for transferring routed expert tensors.",
+        NS("disagg"),
+    ] = "nccl"
+    afd_ffn_moe_backend: A[str, Arg(no_cli=True, resolvable=True), NS("disagg")] = (
+        "none"
+    )
 
     # -------------------------------------------------------------------------
     # Encode prefill disaggregation

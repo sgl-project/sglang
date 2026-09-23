@@ -2394,12 +2394,13 @@ class DeepseekV4DecoderLayer(nn.Module):
         _use_tp_moe_gather = (
             not _use_cp
             and get_parallel().attn_dp_size > 1
-            and get_moe_a2a_backend().is_none()
+            and (get_moe_a2a_backend().is_none() or get_moe_a2a_backend().is_afd_attn())
         )
         _use_tp_attn_a2a_scatter = (
             not _use_cp
             and get_parallel().attn_tp_size > 1
             and not get_moe_a2a_backend().is_none()
+            and not get_moe_a2a_backend().is_afd_attn()
         )
         # symmetric gather+scatter for the no-EP TP-MoE dp-attn path:
         # all_gatherv gather (in self.mlp's dp_gather) + reduce_scatterv combine.
@@ -3240,7 +3241,9 @@ class DeepseekV4Model(nn.Module):
                     hidden_states.shape[0], self.hc_mult, self.hidden_size
                 )
 
-        if get_parallel().attn_dp_size > 1 and get_moe_a2a_backend().is_none():
+        if get_parallel().attn_dp_size > 1 and (
+            get_moe_a2a_backend().is_none() or get_moe_a2a_backend().is_afd_attn()
+        ):
             input_ids_global = torch.empty(
                 (get_global_dp_buffer_len(), 1),
                 dtype=input_ids.dtype,
@@ -4034,7 +4037,10 @@ class DeepseekV4ForCausalLM(nn.Module):
                                             )
                                             break
                                 if name not in params_dict:
-                                    if not name.startswith("mtp"):
+                                    if not name.startswith("mtp") and not (
+                                        get_moe_a2a_backend().is_afd_attn()
+                                        and ".mlp.experts." in name
+                                    ):
                                         logger.warning(
                                             f"{name} not found in params_dict."
                                         )

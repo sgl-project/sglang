@@ -406,6 +406,66 @@ class TestPrefetchDispatch(CustomTestCase):
             )
         )
 
+    def test_afd_filters_only_target_routed_experts(self):
+        weights = {
+            "model.layers.0.self_attn.q_proj.weight": torch.tensor([1.0]),
+            "model.layers.0.mlp.gate.weight": torch.tensor([2.0]),
+            "model.layers.0.mlp.shared_experts.gate_proj.weight": torch.tensor([3.0]),
+            "model.layers.0.mlp.experts.0.gate_proj.weight": torch.tensor([4.0]),
+        }
+        expert_name = "model.layers.0.mlp.experts.0.gate_proj.weight"
+        with tempfile.TemporaryDirectory() as directory:
+            checkpoint = os.path.join(directory, "model.safetensors")
+            safetensors.torch.save_file(weights, checkpoint)
+            for multithread in (False, True):
+                loader = self._make_loader(
+                    {"enable_multithread_load": multithread, "num_threads": 2}
+                )
+                for disable_mmap in (False, True):
+                    for role, is_draft in (
+                        (None, False),
+                        ("attn", False),
+                        ("attn", True),
+                        ("ffn", False),
+                    ):
+                        with (
+                            self.subTest(
+                                multithread=multithread,
+                                disable_mmap=disable_mmap,
+                                role=role,
+                                is_draft=is_draft,
+                            ),
+                            patch(
+                                "sglang.srt.model_loader.loader.get_model",
+                                return_value=self._server_args(False, disable_mmap),
+                            ),
+                            patch(
+                                "sglang.srt.model_loader.loader.get_disagg",
+                                return_value=SimpleNamespace(afd_role=role),
+                            ),
+                        ):
+                            source = self._make_source()
+                            source.model_config = SimpleNamespace(
+                                is_draft_model=is_draft
+                            )
+                            resolved = DefaultModelLoader.ResolvedSource(
+                                source=source,
+                                hf_folder=directory,
+                                weight_files=(checkpoint,),
+                                use_safetensors=True,
+                            )
+                            actual = dict(
+                                loader._get_weights_iterator(
+                                    source, resolved_source=resolved
+                                )
+                            )
+                            expected_names = set(weights)
+                            if role == "attn" and not is_draft:
+                                expected_names.remove(expert_name)
+                            self.assertEqual(set(actual), expected_names)
+                            for name, tensor in actual.items():
+                                torch.testing.assert_close(tensor, weights[name])
+
     def _patch_dispatch(self, prefetch, disable_mmap=False, drop_cache=False):
         return (
             patch.object(

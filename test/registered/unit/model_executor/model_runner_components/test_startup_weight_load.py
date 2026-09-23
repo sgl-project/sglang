@@ -738,6 +738,7 @@ class TestStartupWeightLoadSchedulerRouting(CustomTestCase):
         scheduler.spec_algorithm = SimpleNamespace(is_none=stop_after_startup)
 
         with (
+            get_context().override_server_args(),
             patch(
                 "sglang.srt.managers.scheduler.get_exec",
                 return_value=SimpleNamespace(
@@ -756,6 +757,42 @@ class TestStartupWeightLoadSchedulerRouting(CustomTestCase):
             scheduler.init_model_worker()
 
         return trace
+
+    def test_ffn_role_skips_attention_and_kv_startup(self):
+        for mode in ("serial", "overlap"):
+            with self.subTest(mode=mode):
+                trace = []
+                worker = _SchedulerWorker(trace, post_capture_active=True)
+                scheduler = self._scheduler(worker, trace, mode=mode)
+                with (
+                    patch(
+                        "sglang.srt.managers.scheduler.get_disagg",
+                        return_value=SimpleNamespace(afd_role="ffn"),
+                    ),
+                    patch(
+                        "sglang.srt.afd.ffn.scheduler.init_ffn_model_worker_state",
+                        side_effect=lambda value: trace.append(
+                            ("ffn_init", value.tp_worker)
+                        ),
+                    ),
+                ):
+                    scheduler.init_model_worker()
+                self.assertEqual(trace, [("ffn_init", worker)])
+
+    def test_afd_attention_keeps_native_runner_initialization(self):
+        from sglang.srt.managers.scheduler import Scheduler
+
+        trace = []
+        scheduler = Scheduler.__new__(Scheduler)
+        scheduler.maybe_init_afd = lambda: trace.append("afd_handshake")
+        scheduler.tp_worker = SimpleNamespace(
+            init_cuda_graphs=lambda: trace.append("native_runners")
+        )
+        scheduler.draft_worker = None
+
+        scheduler.init_all_cuda_graphs()
+
+        self.assertEqual(trace, ["afd_handshake", "native_runners"])
 
     def test_serial_path_skips_overlap_hooks(self):
         self.assertEqual(
