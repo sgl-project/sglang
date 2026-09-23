@@ -342,3 +342,4 @@ def _apply_delta(local_checkpoint_dir: str, version_dir: str) -> None:
             f"checksum mismatch for {len(mismatches)} tensors after applying {version_dir}: "
             f"{mismatches[:20]}"
         )
+    _write_applied_version(local_checkpoint_dir, int(meta["version"]))
