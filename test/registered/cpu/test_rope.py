@@ -316,9 +316,7 @@ class TestROPE(CustomTestCase):
                 )
                 # 3D with GQA, q/k split from qkv (non-contiguous)
                 single_test(
-                    *split_qk(
-                        (num_tokens,), num_heads, num_kv_heads, head_size, dtype
-                    ),
+                    *split_qk((num_tokens,), num_heads, num_kv_heads, head_size, dtype),
                     (num_tokens, head_size),
                     1,
                     sincos_dtype,
@@ -326,9 +324,7 @@ class TestROPE(CustomTestCase):
                 # 4D: [batch, num_heads, seq_len, head_size], unsqueeze_dim=1
                 single_test(
                     torch.randn(batch_size, num_heads, seq_len, head_size).to(dtype),
-                    torch.randn(batch_size, num_kv_heads, seq_len, head_size).to(
-                        dtype
-                    ),
+                    torch.randn(batch_size, num_kv_heads, seq_len, head_size).to(dtype),
                     (batch_size, seq_len, head_size),
                     1,
                     sincos_dtype,
@@ -347,9 +343,7 @@ class TestROPE(CustomTestCase):
                 # 4D: [batch, seq_len, num_heads, head_size], unsqueeze_dim=2
                 single_test(
                     torch.randn(batch_size, seq_len, num_heads, head_size).to(dtype),
-                    torch.randn(batch_size, seq_len, num_kv_heads, head_size).to(
-                        dtype
-                    ),
+                    torch.randn(batch_size, seq_len, num_kv_heads, head_size).to(dtype),
                     (batch_size, seq_len, head_size),
                     2,
                     sincos_dtype,
@@ -357,9 +351,7 @@ class TestROPE(CustomTestCase):
                 # 4D: [batch, seq_len, num_heads, head_size], negative unsqueeze_dim=-2
                 single_test(
                     torch.randn(batch_size, seq_len, num_heads, head_size).to(dtype),
-                    torch.randn(batch_size, seq_len, num_kv_heads, head_size).to(
-                        dtype
-                    ),
+                    torch.randn(batch_size, seq_len, num_kv_heads, head_size).to(dtype),
                     (batch_size, seq_len, head_size),
                     -2,
                     sincos_dtype,
