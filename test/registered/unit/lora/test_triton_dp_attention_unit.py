@@ -102,6 +102,7 @@ class TestDPAttentionBackendContract(CustomTestCase):
                 )
                 pool = LoRAMemoryPool.__new__(LoRAMemoryPool)
                 pool.max_loras_per_batch = 3
+                pool.invalid_uids = set()
                 pool.uid_to_buffer_id = {None: 0, "adapter": 1}
                 manager = LoRAManager.__new__(LoRAManager)
                 manager.enable_dp_attention = enable_dp_attention

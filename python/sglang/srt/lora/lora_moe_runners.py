@@ -336,6 +336,15 @@ def _add_lora_gate_up_delta(
     is_gated = gate_up_a.shape[2] > r
     if is_gated:
         inter_size = gate_up_b.shape[2] // 2
+        # Marlin may pad the intermediate: the base output is [gate | up] at the padded width
+        padded_inter_size = gate_up_dim // 2
+        assert inter_size <= padded_inter_size, (
+            f"gate/up LoRA output {inter_size} is wider than the base intermediate {padded_inter_size}"
+        )
+        if lora_info.lora_use_virtual_experts and inter_size != padded_inter_size:
+            raise NotImplementedError(
+                "virtual-expert MoE LoRA does not support padded Marlin outputs"
+            )
         lora_a_stacked = [gate_up_a[:, :, :r, :], gate_up_a[:, :, r : 2 * r, :]]
         # B halves are also the tuple form the virtual-experts kernel wants
         # (one shrink at K=2*r, two expands at K=r each).
@@ -418,6 +427,13 @@ def _add_lora_down_delta(
 
     down_lora_a = lora_info.down_lora_a_weights
     down_lora_b = lora_info.down_lora_b_weights
+    # the Marlin activation carries the padded intermediate; LoRA A is only the logical width
+    inter_size = down_lora_a.shape[-1]
+    assert inter_size <= intermediate_input.shape[-1], (
+        f"down LoRA input {inter_size} is wider than the base activation {intermediate_input.shape[-1]}"
+    )
+    if inter_size != intermediate_input.shape[-1]:
+        intermediate_input = intermediate_input[:, :inter_size]
     if lora_info.experts_shared_outer_loras and not lora_info.lora_use_virtual_experts:
         # fused_moe_lora requires B's expert_dim to match A's; expand the
         # shared B view.
