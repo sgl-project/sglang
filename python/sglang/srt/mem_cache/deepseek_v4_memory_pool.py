@@ -40,7 +40,7 @@ from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
 from sglang.srt.mem_cache.deepseek_v4_compress_state import CompressStatePool
 from sglang.srt.mem_cache.memory_pool import KVCache
 from sglang.srt.model_executor.cuda_graph_config import Backend
-from sglang.srt.runtime_context import get_exec, get_platform, get_spec
+from sglang.srt.runtime_context import get_disagg, get_exec, get_platform, get_spec
 from sglang.srt.utils import ceil_div, is_gfx95_supported, is_hip
 from sglang.srt.utils.common import get_cuda_graph_max_batch_size
 
@@ -1128,7 +1128,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         # wrote: the ring restarts at the cached prefix, and a PD decode receives
         # the prefill's mark as request-row state.
         self.swa_valid_from: Optional[torch.Tensor] = None
-        encoder_replay = get_exec().features.enable_encoder_swa_bounded_replay
+        encoder_replay = (get_exec().features.enable_encoder_swa_bounded_replay and not get_disagg().dsv41_encoder_only_prefill)
         # Under encoder replay the target keeps SWA in a per-request window. A
         # draft without its own ring still reads the target's full-to-SWA mapping,
         # so the target then keeps its paged SWA allocator.
