@@ -1589,25 +1589,44 @@ EOF
     # glance, from a model bug. Observed on glm52-fp4-1k1k-2p1d-ep16 2026-09-17.
     # Retry only on that signature; a genuinely bad sbatch request must still
     # fail immediately rather than being retried six times.
-    SPUR_LEG_JOB_ID=""
-    for _attempt in 1 2 3 4 5 6; do
-        SBATCH_MSG=$(sbatch -p "$SLURM_PARTITION" -N"$TOTAL_NODES" "${NODELIST_ARG[@]}" \
-            "${EXCLUDE_ARG[@]}" "${EXCLUSIVE_ARG[@]}" "${ACCT_ARG[@]}" \
-            --job-name "$JOB_NAME" -t "$TIME_LIMIT" \
-            --output "$SBATCH_OUT" --error "$SBATCH_OUT" \
-            "$WORKDIR/drive_batch.sh" 2>&1)
-        echo "$SBATCH_MSG"
-        SPUR_LEG_JOB_ID="${SBATCH_MSG##* }"
-        [[ "$SPUR_LEG_JOB_ID" =~ ^[0-9]+$ ]] && break
-        if [[ "$SBATCH_MSG" == *"not the Raft leader"* \
-           || "$SBATCH_MSG" == *"service is currently unavailable"* ]]; then
-            echo "[launch] spur controller unavailable (attempt $_attempt/6); retrying in 20s" >&2
-            SPUR_LEG_JOB_ID=""
-            sleep 20
-            continue
-        fi
-        break
-    done
+    spur_submit_leg() {
+        SPUR_LEG_JOB_ID=""
+        : > "$SBATCH_OUT"
+        for _attempt in 1 2 3 4 5 6; do
+            SBATCH_MSG=$(sbatch -p "$SLURM_PARTITION" -N"$TOTAL_NODES" "${NODELIST_ARG[@]}" \
+                "${EXCLUDE_ARG[@]}" "${EXCLUSIVE_ARG[@]}" "${ACCT_ARG[@]}" \
+                --job-name "$JOB_NAME" -t "$TIME_LIMIT" \
+                --output "$SBATCH_OUT" --error "$SBATCH_OUT" \
+                "$WORKDIR/drive_batch.sh" 2>&1)
+            echo "$SBATCH_MSG"
+            SPUR_LEG_JOB_ID="${SBATCH_MSG##* }"
+            [[ "$SPUR_LEG_JOB_ID" =~ ^[0-9]+$ ]] && break
+            if [[ "$SBATCH_MSG" == *"not the Raft leader"* \
+               || "$SBATCH_MSG" == *"service is currently unavailable"* ]]; then
+                echo "[launch] spur controller unavailable (attempt $_attempt/6); retrying in 20s" >&2
+                SPUR_LEG_JOB_ID=""
+                sleep 20
+                continue
+            fi
+            break
+        done
+    }
+
+    # Spur does not hold a job it cannot place. When the partition is full it
+    # cancels the submission within seconds -- JobState=CANCELLED,
+    # Reason=QOSGrpNodeLimit, StartTime=N/A -- and the monitor below then sees the
+    # job leave the queue having produced nothing, which it reports as an
+    # incomplete sweep. That is a red result for a test that never ran. Observed
+    # 2026-09-23 on jobs 4124 and 4125, both cancelled inside 40s while the four
+    # amd-sglang nodes were held by another run.
+    spur_never_started() {
+        local _info
+        _info=$(scontrol show job "$1" 2>/dev/null) || return 1
+        [[ "$_info" == *"JobState=CANCELLED"* && "$_info" == *"StartTime=N/A"* ]]
+    }
+    SPUR_RESUBMITS_LEFT=${SPUR_RESUBMITS_LEFT:-20}
+
+    spur_submit_leg
     if [[ ! "$SPUR_LEG_JOB_ID" =~ ^[0-9]+$ ]]; then
         echo "ERROR: could not parse a job id out of: $SBATCH_MSG" >&2
         SALLOC_RC=1
@@ -1621,6 +1640,24 @@ EOF
         while :; do
             [[ -f "$WORKDIR/drive_exit" ]] && break
             if ! squeue -h -o "%i" 2>/dev/null | grep -qx "$SPUR_LEG_JOB_ID"; then
+                # Cancelled before it ever ran: wait for the nodes and submit
+                # again rather than reporting a result we never measured.
+                if spur_never_started "$SPUR_LEG_JOB_ID" && (( SPUR_RESUBMITS_LEFT > 0 )); then
+                    SPUR_RESUBMITS_LEFT=$((SPUR_RESUBMITS_LEFT - 1))
+                    echo "[launch] spur job $SPUR_LEG_JOB_ID cancelled before start;" \
+                         "resubmitting in 5m ($SPUR_RESUBMITS_LEFT left)" >&2
+                    kill "$SPUR_TAIL_PID" 2>/dev/null || true
+                    sleep 300
+                    spur_submit_leg
+                    if [[ ! "$SPUR_LEG_JOB_ID" =~ ^[0-9]+$ ]]; then
+                        echo 1 > "$WORKDIR/drive_exit"
+                        break
+                    fi
+                    echo "[launch] spur job $SPUR_LEG_JOB_ID submitted; streaming $SBATCH_OUT"
+                    tail -F "$SBATCH_OUT" 2>/dev/null &
+                    SPUR_TAIL_PID=$!
+                    continue
+                fi
                 # The job has left the queue. drive_exit is written on a compute
                 # node and read here on the login node, so NFS close-to-open
                 # visibility can delay it well past a single short sleep. A five
