@@ -1038,6 +1038,17 @@ class FusedMoE(torch.nn.Module):
                 param.data[:, :dim1, :dim2].copy_(loaded_weight)
             return
 
+        for local_expert_id in self._weight_loader_expert_ids(param, expert_id):
+            self._weight_loader_impl(
+                param=param,
+                loaded_weight=loaded_weight,
+                weight_name=weight_name,
+                shard_id=shard_id,
+                expert_id=local_expert_id,
+            )
+
+    def _weight_loader_expert_ids(self, param: torch.nn.Parameter, expert_id: int):
+        """Resolve checkpoint experts to destinations before allocating weights."""
         global_expert_location_metadata = get_global_expert_location_metadata()
         if global_expert_location_metadata is None:
             if not getattr(param, "_sglang_require_global_experts", False):
@@ -1045,13 +1056,7 @@ class FusedMoE(torch.nn.Module):
                 if expert_id == -1:
                     return
 
-            self._weight_loader_impl(
-                param=param,
-                loaded_weight=loaded_weight,
-                weight_name=weight_name,
-                shard_id=shard_id,
-                expert_id=expert_id,
-            )
+            yield expert_id
             return
 
         require_global_experts = getattr(param, "_sglang_require_global_experts", False)
@@ -1079,44 +1084,22 @@ class FusedMoE(torch.nn.Module):
                 )
             )
 
-        for physical_expert_id in physical_expert_ids:
-            self._weight_loader_physical(
-                param=param,
-                loaded_weight=loaded_weight,
-                weight_name=weight_name,
-                shard_id=shard_id,
-                expert_id=physical_expert_id,
-            )
+        for expert_id in physical_expert_ids:
+            # WARN: This makes the `expert_id` mean "local" and "global" in different cases
+            if not getattr(param, "_sglang_require_global_experts", False):
+                expert_id = self._map_global_expert_id_to_local_expert_id(expert_id)
+                if expert_id < 0 or expert_id >= self.num_local_experts:
+                    continue
 
-    def _weight_loader_physical(
-        self,
-        param: torch.nn.Parameter,
-        loaded_weight: torch.Tensor,
-        weight_name: str,
-        shard_id: str,
-        expert_id: int,
-    ) -> None:
-        # WARN: This makes the `expert_id` mean "local" and "global" in different cases
-        if not getattr(param, "_sglang_require_global_experts", False):
-            expert_id = self._map_global_expert_id_to_local_expert_id(expert_id)
-            if expert_id < 0 or expert_id >= self.num_local_experts:
-                return
+            if isinstance(
+                self.quant_method,
+                KTEPWrapperMethod,
+            ):
+                if self.quant_method.num_gpu_experts != -1:
+                    if expert_id >= self.quant_method.num_gpu_experts:
+                        continue
 
-        if isinstance(
-            self.quant_method,
-            KTEPWrapperMethod,
-        ):
-            if self.quant_method.num_gpu_experts != -1:
-                if expert_id >= self.quant_method.num_gpu_experts:
-                    return
-
-        self._weight_loader_impl(
-            param=param,
-            loaded_weight=loaded_weight,
-            weight_name=weight_name,
-            shard_id=shard_id,
-            expert_id=expert_id,
-        )
+            yield expert_id
 
     def _load_gguf_weight(
         self,

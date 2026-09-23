@@ -346,6 +346,13 @@ class NPUOnlineMoEWeightLoader:
         shard_id: str,
         expert_id: int,
     ) -> None:
+        # Nonlocal checkpoint entries remain no-ops after conversion and on reload.
+        current = getattr(self.layer, f"{self._weight_prefix(weight_name)}_weight")
+        if not any(
+            True for _ in self.layer._weight_loader_expert_ids(current, expert_id)
+        ):
+            return
+
         weight_prefix = self._weight_prefix(weight_name)
         weight_attr = f"{weight_prefix}_weight"
 
