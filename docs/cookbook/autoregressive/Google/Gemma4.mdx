@@ -97,6 +97,8 @@ For other installation methods, please refer to the [official SGLang installatio
 
 ### 3.1 Basic Configuration
 
+The Gemma 4 series offers models in various sizes and architectures, optimized for different hardware platforms including NVIDIA GPUs, AMD GPUs, and Intel Arc Pro B-Series GPUs(codename: BMG (Battlemage)). The recommended launch configurations vary by hardware and model size.
+
 **Interactive Command Generator**: Use the configuration selector below to automatically generate the appropriate deployment command for your hardware platform and model variant.
 
 <Gemma4Deployment />
@@ -1641,7 +1643,7 @@ sgl-eval run mmlu  --base-url http://localhost:30000/v1 --num-examples 2000
 
 **gemma-4-E2B-it**
 ```shell Command
-$ python -m sglang.bench_one_batch --correct --model google/gemma-4-E2B-it ....
+$ python -m sglang.benchmark.one_batch --correct --model google/gemma-4-E2B-it ....
 prefill logits (final): tensor([[-25.3063,  -2.5718, -10.3674,  ..., -25.3779, -25.5181, -25.2337]],
        device='cuda:0')
 ....
@@ -1656,7 +1658,7 @@ prefill logits (final) tensor([-25.3281,  -2.1367, -10.2266,  ..., -25.4375, -25
 **gemma-4-E4B-it**
 
 ```shell Command
-$ python -m sglang.bench_one_batch --correct --model google/gemma-4-E4B-it ....
+$ python -m sglang.benchmark.one_batch --correct --model google/gemma-4-E4B-it ....
 prefill logits (final): tensor([[-17.6478,   7.9901,  -5.6505,  ..., -17.5658, -17.6478, -17.7293]],
        device='cuda:0')
 ....
@@ -1670,7 +1672,7 @@ prefill logits (final) tensor([-17.5625,   8.0469,  -5.5742,  ..., -17.4688, -17
 
 **gemma-4-31B-it**
 ```shell Command
-$ python -m sglang.bench_one_batch --correct --model google/gemma-4-31B-it ....
+$ python -m sglang.benchmark.one_batch --correct --model google/gemma-4-31B-it ....
 prefill logits (final): tensor([[-2.0748,  1.1245, -7.4356,  ..., -2.1059, -2.1525, -2.2303]],
        device='cuda:0')
 ....

@@ -86,8 +86,42 @@ permissions:
   issues: read
 
 jobs:
+  prepare-partitions:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    outputs:
+      matrix: ${{ steps.partition.outputs.matrix }}
+    steps:
+      - name: Checkout partition script
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Checkout test registrations
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.pr_head_sha || github.sha }}
+          path: partition-source
+          persist-credentials: false
+
+      - name: Partition tests by estimated duration
+        id: partition
+        env:
+          TEST_COMMAND: ${{ inputs.test_command }}
+          TEST_ROOT: partition-source
+          MODE: ${{ inputs.mode }}
+        run: python3 scripts/ci/partition_rerun_tests.py
+
   rerun-test-cuda:
+    name: rerun-test-cuda (partition ${{ matrix.partition }})
+    needs: prepare-partitions
     if: inputs.mode == 'cuda'
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.prepare-partitions.outputs.matrix) }}
     runs-on: ${{ inputs.runs_on }}
     timeout-minutes: 120
     permissions:
@@ -150,7 +184,8 @@ jobs:
       - name: Run test
         timeout-minutes: 60
         env:
-          TEST_COMMAND: ${{ inputs.test_command }}
+          TEST_COMMAND: ${{ matrix.test_command }}
+          REQUESTED_TEST_COMMAND: ${{ inputs.test_command }}
           SGLANG_PRECISION_HF_TOKEN: ${{ inputs.refresh_precision_baseline && inputs.mode == 'cuda' && inputs.runs_on == '8-gpu-h200' && inputs.test_command == 'registered/debug_utils/test_nightly_precision_regression.py' && inputs.pr_head_sha == '' && secrets.HF_TOKEN_PRECISION_STORE || '' }}
         run: |
           if [[ "${{ inputs.refresh_precision_baseline }}" == "true" ]]; then
@@ -158,7 +193,7 @@ jobs:
             if [[ "${{ inputs.mode }}" != "cuda" \
                || "${{ inputs.runs_on }}" != "8-gpu-h200" \
                || -n "${{ inputs.pr_head_sha }}" \
-               || "$TEST_COMMAND" != "$expected" ]]; then
+               || "$REQUESTED_TEST_COMMAND" != "$expected" ]]; then
               echo "::error::Precision baseline refresh only accepts $expected on 8-gpu-h200"
               exit 1
             fi
@@ -201,9 +236,16 @@ jobs:
 
       - uses: ./.github/actions/upload-cuda-coredumps
         if: failure()
+        with:
+          artifact-suffix: ${{ matrix.partition }}
 
   rerun-test-multimodal-gen:
+    name: rerun-test-multimodal-gen (partition ${{ matrix.partition }})
+    needs: prepare-partitions
     if: inputs.mode == 'multimodal_gen'
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.prepare-partitions.outputs.matrix) }}
     runs-on: ${{ inputs.runs_on }}
     timeout-minutes: 120
     permissions:
@@ -244,12 +286,14 @@ jobs:
 
       - name: Run test
         timeout-minutes: 60
+        env:
+          TEST_COMMAND: ${{ matrix.test_command }}
         run: |
           cmds=()
           while IFS= read -r cmd; do
             [ -z "$cmd" ] && continue
             cmds+=("$cmd")
-          done <<< "${{ inputs.test_command }}"
+          done <<< "$TEST_COMMAND"
           total=${#cmds[@]}
           suite_start=$SECONDS
           for idx in "${!cmds[@]}"; do
@@ -272,9 +316,16 @@ jobs:
 
       - uses: ./.github/actions/upload-cuda-coredumps
         if: failure()
+        with:
+          artifact-suffix: ${{ matrix.partition }}
 
   rerun-test-cpu:
+    name: rerun-test-cpu (partition ${{ matrix.partition }})
+    needs: prepare-partitions
     if: inputs.mode == 'cpu'
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.prepare-partitions.outputs.matrix) }}
     runs-on: ubuntu-latest
     timeout-minutes: 120
     permissions:
@@ -343,13 +394,15 @@ jobs:
 
       - name: Run test
         timeout-minutes: 60
+        env:
+          TEST_COMMAND: ${{ matrix.test_command }}
         run: |
           cd test/
           cmds=()
           while IFS= read -r cmd; do
             [ -z "$cmd" ] && continue
             cmds+=("$cmd")
-          done <<< "${{ inputs.test_command }}"
+          done <<< "$TEST_COMMAND"
           total=${#cmds[@]}
           suite_start=$SECONDS
           for idx in "${!cmds[@]}"; do
@@ -371,7 +424,7 @@ jobs:
           echo "All $total test(s) passed in ${total_elapsed}s"
 
   write-back-result:
-    needs: [rerun-test-cuda, rerun-test-multimodal-gen, rerun-test-cpu]
+    needs: [prepare-partitions, rerun-test-cuda, rerun-test-multimodal-gen, rerun-test-cpu]
     if: always() && inputs.reply_comment_id != '' && inputs.reply_marker != ''
     runs-on: ubuntu-latest
     permissions:
