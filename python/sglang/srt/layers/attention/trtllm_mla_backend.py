@@ -49,6 +49,7 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.attention.flashinfer_mla_backend import (
     FlashInferMLAAttnBackend,
     FlashInferMLAMultiStepDraftBackend,
+    lse_log2_to_ln,
 )
 from sglang.srt.layers.attention.kv_shard_hooks import (
     get_kv_shard_pool,
@@ -1114,11 +1115,12 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
     ):
         """Hook for subclasses to swap the ragged prefill kernel. Q/K/V arrive
         in model-native dtype; subclasses do any kernel-specific quantization.
-        Returns the output tensor or (output, lse) if return_lse."""
+        Returns the output tensor or (output, lse) if return_lse; the lse must
+        be natural log, as the chunked-prefix merge expects."""
         q_scale = k_scale = v_scale = 1.0
         if self.data_type == torch.float8_e4m3fn:
             q, k, v, k_scale, v_scale = _quantize_fp8_qkv(q, k, v, layer)
-        return flashinfer.prefill.trtllm_ragged_attention_deepseek(
+        result = flashinfer.prefill.trtllm_ragged_attention_deepseek(
             query=q,
             key=k,
             value=v,
@@ -1139,6 +1141,10 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             out=out_buffer,
             skip_softmax_threshold_scale_factor=envs.SGLANG_SKIP_SOFTMAX_PREFILL_THRESHOLD_SCALE_FACTOR.get(),
         )
+        if return_lse:
+            out, lse = result
+            return out, lse_log2_to_ln(lse)
+        return result
 
     def _set_kv_and_concat_q_fused(
         self,

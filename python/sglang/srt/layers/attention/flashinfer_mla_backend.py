@@ -18,6 +18,7 @@ and uses BatchMLAPaged wrapper for decoding.
 More details can be found in https://docs.flashinfer.ai/api/mla.html
 """
 
+import math
 from dataclasses import dataclass
 from functools import partial
 from typing import TYPE_CHECKING, Callable, Optional, Union
@@ -70,6 +71,15 @@ if is_flashinfer_available():
         BatchMLAPagedAttentionWrapper,
         BatchPrefillWithRaggedKVCacheWrapper,
     )
+
+_LN2 = math.log(2.0)
+
+
+def lse_log2_to_ln(lse: torch.Tensor) -> torch.Tensor:
+    """FlashInfer-family ragged prefill kernels return log2-sum-exp2 LSE, while
+    the chunked-prefix merge (merge_state_v2 / Triton) expects natural log.
+    See https://github.com/sgl-project/sglang/issues/40903."""
+    return lse.mul_(_LN2)
 
 
 @dataclass
@@ -190,6 +200,7 @@ class FlashInferMhaChunkKVRunner:
                 sm_scale=layer.scaling,
                 logits_soft_cap=logits_soft_cap,
             )
+            o = (o[0], lse_log2_to_ln(o[1]))
         else:
             forward = (
                 self.ragged_wrapper.forward_return_lse
@@ -204,6 +215,8 @@ class FlashInferMhaChunkKVRunner:
                 sm_scale=layer.scaling,
                 logits_soft_cap=logits_soft_cap,
             )
+            if forward_batch.mha_return_lse:
+                o = (o[0], lse_log2_to_ln(o[1]))
         return o
 
 
