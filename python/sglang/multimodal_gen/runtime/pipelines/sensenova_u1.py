@@ -44,6 +44,7 @@ class SenseNovaU1Pipeline(LoRAPipeline):
         server_args: ServerArgs,
         loaded_modules: dict[str, torch.nn.Module] | None = None,
     ) -> dict[str, Any]:
+        SenseNovaU1PipelineConfig.validate_parallelism(server_args)
         if loaded_modules is not None and {"model", "tokenizer"} <= set(loaded_modules):
             modules = dict(loaded_modules)
         else:

@@ -38,9 +38,20 @@ from sglang.multimodal_gen.registry import (
 from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
     process_generation_batch,
 )
+from sglang.multimodal_gen.runtime.layers import linear as parallel_linear
+from sglang.multimodal_gen.runtime.layers import (
+    vocab_parallel_embedding as parallel_embedding,
+)
 from sglang.multimodal_gen.runtime.managers.gpu_worker import GPUWorker
 from sglang.multimodal_gen.runtime.managers.scheduler import Scheduler
+from sglang.multimodal_gen.runtime.models.sensenova_u1.loader import (
+    _validate_supported_checkpoint,
+)
+from sglang.multimodal_gen.runtime.models.sensenova_u1.neo_unify import (
+    modeling_qwen3,
+)
 from sglang.multimodal_gen.runtime.models.sensenova_u1.neo_unify.configuration_neo_chat import (
+    NEOChatConfig,
     NEOLLMConfig,
 )
 from sglang.multimodal_gen.runtime.models.sensenova_u1.neo_unify.configuration_neo_vit import (
@@ -58,7 +69,9 @@ from sglang.multimodal_gen.runtime.models.sensenova_u1.neo_unify.modeling_neo_ch
 )
 from sglang.multimodal_gen.runtime.models.sensenova_u1.neo_unify.modeling_qwen3 import (
     Qwen3Attention,
+    Qwen3ForCausalLM,
     Qwen3MLP,
+    Qwen3RotaryEmbedding,
     _flash_or_sdpa,
     _sdpa_attn_func,
     create_block_causal_mask,
@@ -139,6 +152,26 @@ class _FakeTokenizer:
         del return_tensors
         token_count = len(text.split()) + 1
         return {"input_ids": torch.arange(1, token_count + 1).unsqueeze(0)}
+
+
+def _supported_sensenova_config(**llm_overrides):
+    llm_config = {
+        "architectures": ["Qwen3ForCausalLM"],
+        "hidden_size": 4096,
+        "intermediate_size": 12288,
+        "num_hidden_layers": 42,
+        "num_attention_heads": 32,
+        "num_key_value_heads": 8,
+        "head_dim": 128,
+        "vocab_size": 151936,
+        "tie_word_embeddings": False,
+        **llm_overrides,
+    }
+    return NEOChatConfig(
+        architectures=["NEOChatModel"],
+        llm_config=llm_config,
+        vision_config={"architectures": ["NEOVisionModel"]},
+    )
 
 
 def _install_sensenova_cache_dit_stub(
@@ -688,6 +721,64 @@ def test_sensenova_u1_fused_dense_mlp_matches_original(monkeypatch):
     )
 
 
+def test_sensenova_u1_tp_layers_use_rank_local_shapes(monkeypatch):
+    tp_group = SimpleNamespace(world_size=2, rank_in_group=0)
+    monkeypatch.setattr(parallel_linear, "get_tp_group", lambda: tp_group)
+    monkeypatch.setattr(parallel_embedding, "get_tp_group", lambda: tp_group)
+    monkeypatch.setattr(modeling_qwen3, "get_tp_world_size", lambda: 2)
+
+    config = NEOLLMConfig(
+        hidden_size=64,
+        intermediate_size=128,
+        num_hidden_layers=1,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=16,
+        vocab_size=128,
+        pad_token_id=0,
+        use_sglang_tp=True,
+    )
+    model = Qwen3ForCausalLM(config)
+    layer = model.model.layers[0]
+
+    assert layer.self_attn.q_proj.weight.shape == (32, 64)
+    assert layer.self_attn.k_proj.weight.shape == (16, 64)
+    assert layer.self_attn.v_proj.weight.shape == (16, 64)
+    assert layer.self_attn.o_proj.weight.shape == (64, 32)
+    assert layer.mlp.gate_proj.weight.shape == (64, 64)
+    assert layer.mlp.up_proj.weight.shape == (64, 64)
+    assert layer.mlp.down_proj.weight.shape == (64, 64)
+    assert model.model.embed_tokens.weight.shape == (64, 64)
+    assert model.lm_head.weight.shape == (64, 64)
+
+
+def test_sensenova_u1_post_load_rebuilds_meta_rotary_buffers():
+    config = NEOLLMConfig(
+        hidden_size=64,
+        intermediate_size=128,
+        num_hidden_layers=1,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=16,
+        vocab_size=128,
+        pad_token_id=0,
+    )
+    with torch.device("meta"):
+        rotary = Qwen3RotaryEmbedding(config)
+
+    model = torch.nn.Module()
+    model.anchor = torch.nn.Parameter(torch.empty(1))
+    model.rotary = rotary
+
+    assert model.rotary.inv_freq.is_meta
+    NEOChatModel.post_load_weights(model)
+
+    expected, _ = model.rotary.rope_init_fn(config, torch.device("cpu"))
+    assert model.rotary.inv_freq.device.type == "cpu"
+    torch.testing.assert_close(model.rotary.inv_freq, expected)
+    assert model.rotary.original_inv_freq is model.rotary.inv_freq
+
+
 def test_sensenova_u1_batched_gqa_matches_unpadded_singletons():
     generator = torch.Generator().manual_seed(17)
     q = torch.randn(2, 3, 4, 8, generator=generator)
@@ -825,6 +916,21 @@ def test_sensenova_u1_registry_resolves_local_and_hf_paths(tmp_path):
     assert get_non_diffusers_pipeline_name(modelscope_id) == "SenseNovaU1Pipeline"
     assert get_model_info(modelscope_id) is not None
     get_model_info.cache_clear()
+
+
+def test_sensenova_u1_tp_loader_accepts_only_the_u15_dense_layout():
+    _validate_supported_checkpoint(_supported_sensenova_config())
+
+    with pytest.raises(TypeError, match="MoE backbones are unsupported"):
+        _validate_supported_checkpoint(SimpleNamespace(llm_config=SimpleNamespace()))
+
+    with pytest.raises(ValueError, match="incompatible config: hidden_size=2048"):
+        _validate_supported_checkpoint(_supported_sensenova_config(hidden_size=2048))
+
+    with pytest.raises(ValueError, match="independent embedding and lm_head"):
+        _validate_supported_checkpoint(
+            _supported_sensenova_config(tie_word_embeddings=True)
+        )
 
 
 def test_sensenova_u1_registry_requires_exact_hub_id(monkeypatch):
@@ -1177,17 +1283,88 @@ def test_sensenova_u1_scheduler_merge_and_split_preserve_request_order():
     assert scheduler._try_merge_generation_reqs(requests) is None
 
 
-def test_sensenova_u1_rejects_multi_gpu_during_arg_validation():
+@pytest.mark.parametrize(
+    ("num_gpus", "dp_size", "tp_size"),
+    [(1, 1, 1), (2, 2, 1), (2, 1, 2), (4, 1, 4), (4, 2, 2), (8, 1, 8)],
+)
+def test_sensenova_u1_allows_dp_and_tp(num_gpus, dp_size, tp_size):
     config = SenseNovaU1PipelineConfig()
 
-    with pytest.raises(ValueError, match="num_gpus=1"):
+    config.validate_server_args(
+        SimpleNamespace(
+            num_gpus=num_gpus,
+            dp_size=dp_size,
+            tp_size=tp_size,
+            sp_degree=1,
+            enable_cfg_parallel=False,
+            cfg_parallel_degree=1,
+            enable_torch_compile=False,
+            lora_path=None,
+            attention_backend=None,
+            component_attention_backends={},
+        )
+    )
+
+
+@pytest.mark.parametrize(
+    ("num_gpus", "dp_size", "tp_size"), [(2, 1, 1), (4, 2, 1), (4, 1, 2)]
+)
+def test_sensenova_u1_rejects_unassigned_replica_gpus(num_gpus, dp_size, tp_size):
+    config = SenseNovaU1PipelineConfig()
+
+    with pytest.raises(ValueError, match=r"num_gpus == dp_size \* tp_size"):
         config.validate_server_args(
             SimpleNamespace(
-                num_gpus=2,
+                num_gpus=num_gpus,
+                dp_size=dp_size,
+                tp_size=tp_size,
+                sp_degree=1,
+                enable_cfg_parallel=False,
+                cfg_parallel_degree=1,
                 enable_torch_compile=False,
                 lora_path=None,
                 attention_backend=None,
                 component_attention_backends={},
+            )
+        )
+
+
+@pytest.mark.parametrize("tp_size", [3, 16])
+def test_sensenova_u1_rejects_unsupported_tp_size(tp_size):
+    with pytest.raises(ValueError, match="--tp-size 1, 2, 4, or 8"):
+        SenseNovaU1PipelineConfig.validate_parallelism(
+            SimpleNamespace(
+                num_gpus=tp_size,
+                dp_size=1,
+                tp_size=tp_size,
+                sp_degree=1,
+                enable_cfg_parallel=False,
+                cfg_parallel_degree=1,
+            )
+        )
+
+
+def test_sensenova_u1_rejects_sp_and_cfg_parallelism():
+    with pytest.raises(ValueError, match="--sp-degree 1"):
+        SenseNovaU1PipelineConfig.validate_parallelism(
+            SimpleNamespace(
+                num_gpus=4,
+                dp_size=1,
+                tp_size=2,
+                sp_degree=2,
+                enable_cfg_parallel=False,
+                cfg_parallel_degree=1,
+            )
+        )
+    with pytest.raises(ValueError, match="CFG parallelism"):
+        SenseNovaU1PipelineConfig.validate_parallelism(
+            SimpleNamespace(
+                num_gpus=4,
+                dp_size=1,
+                tp_size=2,
+                sp_degree=1,
+                enable_cfg_parallel=True,
+                cfg_parallel_degree=2,
             )
         )
 
@@ -1273,6 +1450,8 @@ def test_sensenova_u1_allows_explicit_resident_component_residency():
 @pytest.mark.parametrize(
     ("override", "expected"),
     [
+        ({"use_fsdp_inference": True}, "FSDP inference"),
+        ({"direct_gpu_weight_loading": True}, "direct-gpu-weight-loading"),
         ({"enable_torch_compile": True}, "torch.compile"),
         (
             {"component_residency": {"transformer": "component-offload"}},
@@ -1314,6 +1493,8 @@ def test_sensenova_u1_rejects_unsupported_runtime_modes(override, expected):
     config = SenseNovaU1PipelineConfig()
     args = {
         "num_gpus": 1,
+        "use_fsdp_inference": False,
+        "direct_gpu_weight_loading": False,
         "enable_torch_compile": False,
         "lora_path": None,
         "component_residency": None,
