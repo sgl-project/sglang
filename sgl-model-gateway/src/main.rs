@@ -349,7 +349,7 @@ struct CliArgs {
     #[arg(long, default_value_t = 60, help_heading = "Rate Limiting")]
     queue_timeout_secs: u64,
 
-    /// Token bucket refill rate (tokens per second)
+    /// Token bucket refill rate (tokens per second; 0 means concurrency-only)
     #[arg(long, help_heading = "Rate Limiting")]
     rate_limit_tokens_per_second: Option<i32>,
 
