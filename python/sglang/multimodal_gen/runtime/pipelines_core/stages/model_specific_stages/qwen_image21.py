@@ -4,12 +4,16 @@ import math
 import torch
 from PIL import Image
 
+from sglang.multimodal_gen.configs.sample.sampling_params import (
+    quality_allows_kernel_fusions,
+)
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
     ComponentUse,
 )
 from sglang.multimodal_gen.runtime.models.dits.qwen_image21 import build_layout
+from sglang.multimodal_gen.runtime.models.vaes.fast_path_gate import use_vae_fast_path
 from sglang.multimodal_gen.runtime.pipelines_core.diffusion_scheduler_utils import (
     calculate_linear_shift,
 )
@@ -147,9 +151,14 @@ class QwenImage21EncodingStage(PipelineStage):
             )
             shapes.append((1, height // 16, width // 16))
         if resized:
-            with self.use_declared_component(
-                component_name="vae", module=self.vae
-            ) as vae:
+            # the decode stage gates the VAE fast path per request; encode must follow
+            fast_path = quality_allows_kernel_fusions(batch.sampling_params.quality)
+            with (
+                self.use_declared_component(
+                    component_name="vae", module=self.vae
+                ) as vae,
+                use_vae_fast_path(vae, fast_path),
+            ):
                 vae.use_tiling = config.vae_tiling
                 for image in resized:
                     pixels = torch.frombuffer(
