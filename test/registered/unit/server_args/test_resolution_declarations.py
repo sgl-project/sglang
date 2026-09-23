@@ -282,7 +282,9 @@ class TestResolutionDeclarations(CustomTestCase):
         from sglang.srt.runtime_context import publish, reset_context
 
         mapping = namespace_of(ServerArgs)
-        self.assertGreater(len(mapping), 400, "the namespace mapping collapsed")
+        self.assertEqual(
+            set(mapping), {field.name for field in msgspec.structs.fields(ServerArgs)}
+        )
 
         self.assertEqual(
             set(),
