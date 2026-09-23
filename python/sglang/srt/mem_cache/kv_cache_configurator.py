@@ -1845,11 +1845,7 @@ class KVCacheConfigurator:
         # widening-dequant contract.
         if m3_fp8_attn_gemm_enabled(resolving_view(self.server_args)):
             return self.kv_cache_dtype
-        if (
-            _is_hip
-            and _is_gfx95_supported
-            and envs.SGLANG_OPT_MINIMAX_M3_FP8_INDEX_CACHE.get()
-        ):
+        if _is_gfx95_supported and envs.SGLANG_OPT_MINIMAX_M3_FP8_INDEX_CACHE.get():
             return torch.float8_e4m3fn
         return self.model_dtype
 
