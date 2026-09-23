@@ -27,8 +27,6 @@ _is_hip = is_hip()
 
 
 if _is_hip:
-    from aiter.ops.shuffle import shuffle_weight
-
     ON_GFX950 = "gfx950" in torch.cuda.get_device_properties("cuda").gcnArchName
 
 logger = logging.getLogger(__name__)
@@ -349,6 +347,8 @@ class QuarkInt4Fp8MoEMethod(FusedMoEMethodBase):
         tqdm_reset_no_print(self.online_quant_progress_bar, total=total)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        from aiter.ops.shuffle import shuffle_weight
+
         if _is_hip and not ON_GFX950:
             # CDNA3 does not support OCP FP8E4M3FN, but uses FP8E4M3FNUZ.
             # CDNA4 supports OCP FP8E4M3FN.

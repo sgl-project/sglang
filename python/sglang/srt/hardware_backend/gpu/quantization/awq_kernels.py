@@ -77,6 +77,14 @@ else:
 _, scalar_types = get_scalar_types()
 
 
+def _use_awq_packed_gemm(x: torch.Tensor) -> bool:
+    return (
+        awq_gemm is not None
+        and 0 < x.shape[0] <= 16
+        and torch.cuda.get_device_properties(x.device).gcnArchName.startswith("gfx1151")
+    )
+
+
 class AWQLinearKernel:
     def __init__(self, quant_config: Optional[QuantizationConfig] = None):
         self.quant_config = quant_config
@@ -98,7 +106,7 @@ class AWQLinearKernel:
         pack_factor = self.quant_config.pack_factor
         out_shape = x.shape[:-1] + (qweight.shape[-1] * pack_factor,)
         reshaped_x = x.reshape(-1, x.shape[-1])
-        if awq_gemm is not None and 0 < reshaped_x.shape[0] <= 16:
+        if _use_awq_packed_gemm(reshaped_x):
             out = awq_gemm(
                 reshaped_x.contiguous(),
                 qweight,

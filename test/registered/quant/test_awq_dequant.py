@@ -102,6 +102,22 @@ class TestAWQTriton(CustomTestCase):
                     torch.testing.assert_close(
                         actual, x @ weight + bias, atol=0.03, rtol=0.01
                     )
+            x = torch.randn((1, 512), device=device, dtype=dtype)
+            with patch.object(
+                torch.cuda,
+                "get_device_properties",
+                return_value=SimpleNamespace(gcnArchName="gfx942"),
+            ):
+                self.assertFalse(awq_kernels._use_awq_packed_gemm(x))
+            with (
+                patch.object(awq_kernels, "_use_awq_packed_gemm", return_value=False),
+                patch.object(
+                    awq_kernels, "awq_gemm", wraps=awq_kernels.awq_gemm
+                ) as packed,
+            ):
+                fallback = kernel.apply(layer, x)
+            packed.assert_not_called()
+            torch.testing.assert_close(fallback, x @ weight, atol=0.03, rtol=0.01)
 
     def test_dequantize(self):
         rows_list = [3584, 18944, 128, 256, 512, 1024]
