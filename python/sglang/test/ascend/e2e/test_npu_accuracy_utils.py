@@ -149,6 +149,10 @@ def run_evalscope(
     if dataset_dir:
         config_dict["dataset_dir"] = dataset_dir
     if judge_model_args:
+        judge_url = judge_model_args.get("api_url", "")
+        if "127.0.0.1" in judge_url or "localhost" in judge_url:
+            judge_model_args = dict(judge_model_args)
+            judge_model_args["api_url"] = f"http://{host}:{port}/v1"
         config_dict["judge_model_args"] = judge_model_args
     if api_key:
         config_dict["api_key"] = api_key
