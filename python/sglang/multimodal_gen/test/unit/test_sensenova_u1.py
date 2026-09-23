@@ -3210,7 +3210,15 @@ def test_sensenova_u1_pipeline_is_lora_capable_and_aliases_the_model():
     pipeline = SenseNovaU1Pipeline.__new__(SenseNovaU1Pipeline)
     model, tokenizer = object(), object()
     loaded = {"model": model, "tokenizer": tokenizer}
-    modules = pipeline.load_modules(server_args=None, loaded_modules=loaded)
+    server_args = SimpleNamespace(
+        num_gpus=1,
+        dp_size=1,
+        tp_size=1,
+        sp_degree=1,
+        enable_cfg_parallel=False,
+        cfg_parallel_degree=1,
+    )
+    modules = pipeline.load_modules(server_args=server_args, loaded_modules=loaded)
 
     assert modules["transformer"] is model
     assert modules["model"] is model
