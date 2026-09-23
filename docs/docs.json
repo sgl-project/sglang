@@ -650,6 +650,10 @@
       "destination": "/docs/hardware-platforms/ascend-npus/model-deployment/best-practices/mimo_v2_flash"
     },
     {
+      "source": "/docs/hardware-platforms/ascend-npus/best_practice/mimo_v2_5_pro",
+      "destination": "/docs/hardware-platforms/ascend-npus/model-deployment/best-practices/mimo_v2_5_pro"
+    },
+    {
       "source": "/docs/hardware-platforms/ascend-npus/best_practice/qwen3-8b",
       "destination": "/docs/hardware-platforms/ascend-npus/model-deployment/best-practices/qwen3_8b"
     },
@@ -1142,6 +1146,7 @@
                           "docs/hardware-platforms/ascend-npus/model-deployment/best-practices/kimi_k2_6",
                           "docs/hardware-platforms/ascend-npus/model-deployment/best-practices/minimax_m2_5",
                           "docs/hardware-platforms/ascend-npus/model-deployment/best-practices/mimo_v2_flash",
+                          "docs/hardware-platforms/ascend-npus/model-deployment/best-practices/mimo_v2_5_pro",
                           "docs/hardware-platforms/ascend-npus/model-deployment/best-practices/qwen3_8b",
                           "docs/hardware-platforms/ascend-npus/model-deployment/best-practices/qwen3_32b",
                           "docs/hardware-platforms/ascend-npus/model-deployment/best-practices/qwen3_30b_a3b",
@@ -1428,6 +1433,7 @@
                   {
                     "group": "Xiaomi",
                     "pages": [
+                      "cookbook/autoregressive/Xiaomi/MiMo-V2.6",
                       "cookbook/autoregressive/Xiaomi/MiMo-V2.5",
                       "cookbook/autoregressive/Xiaomi/MiMo-V2-Flash"
                     ]
@@ -1509,6 +1515,7 @@
                   {
                     "group": "Qwen-Image",
                     "pages": [
+                      "cookbook/diffusion/Qwen-Image/Qwen-Image-2.1",
                       "cookbook/diffusion/Qwen-Image/Qwen-Image",
                       "cookbook/diffusion/Qwen-Image/Qwen-Image-Edit"
                     ]
@@ -1669,7 +1676,8 @@
               {
                 "group": "References",
                 "pages": [
-                  "docs/sglang-diffusion/environment_variables"
+                  "docs/sglang-diffusion/environment_variables",
+                  "docs/sglang-diffusion/production_metrics"
                 ]
               },
               {

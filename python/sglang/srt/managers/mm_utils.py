@@ -4,13 +4,15 @@ Multi-modality utils
 
 import copy
 import hashlib
+import mmap
 import os
 import pickle
 import sys
 from abc import abstractmethod
+from array import array
 from collections import defaultdict
 from multiprocessing import shared_memory
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -48,7 +50,11 @@ from sglang.srt.runtime_context import (
     get_server_args,
     get_serving,
 )
-from sglang.srt.utils import flatten_nested_list, print_warning_once
+from sglang.srt.utils import (
+    assert_int64_array,
+    flatten_nested_list,
+    print_warning_once,
+)
 from sglang.srt.utils.stale_shm_cleanup import make_shm_name
 from sglang.utils import logger
 
@@ -231,6 +237,19 @@ class TransportProxyTensor(torch.Tensor):
         return self._metadata.get("transport_mode", "default")
 
 
+def duplicate_pad_mm_input_ids(
+    input_ids: array,
+    mm_inputs: MultimodalInputs,
+    pad_input_ids_func: Callable[[array, MultimodalInputs], array],
+) -> array:
+    """Validate and duplicate model-padded tokens for scheduler ownership."""
+    padded_ids = pad_input_ids_func(input_ids, mm_inputs)
+    assert_int64_array(padded_ids, "pad_input_ids result")
+    # Preserve scheduler ownership: no-op models return the unpadded input,
+    # and other models can retain the result in multimodal metadata.
+    return padded_ids[:]
+
+
 class MultiModalityDataPaddingPattern:
     """
     Data tokens (like image tokens) often need special handling during padding
@@ -239,11 +258,10 @@ class MultiModalityDataPaddingPattern:
     """
 
     @abstractmethod
-    def pad_input_tokens(
-        self, input_ids: List[int], mm_inputs: MultimodalInputs
-    ) -> List[int]:
+    def pad_input_tokens(self, input_ids: array, mm_inputs: MultimodalInputs) -> array:
         """
-        Pad the input ids sequence containing data tokens, and replace them with pad_values
+        Replace data tokens with pad_values using native int64 arrays.
+        Implementations must not mutate the original input.
         """
         pass
 
@@ -272,12 +290,11 @@ class MultiModalityDataPaddingPatternTokenPairs(MultiModalityDataPaddingPattern)
             s for s, _e in data_token_pairs
         ]
 
-    def pad_input_tokens(
-        self, input_ids: List[int], mm_inputs: MultimodalInputs
-    ) -> List[int]:
+    def pad_input_tokens(self, input_ids: array, mm_inputs: MultimodalInputs) -> array:
         """
         This function will replace the data-tokens in between with pad_values accordingly
         """
+        assert_int64_array(input_ids, "input_ids")
         pad_values = [item.pad_value for item in mm_inputs.mm_items]
         data_token_pairs = self.data_token_id_pairs
         mm_inputs.data_offsets = []
@@ -291,7 +308,7 @@ class MultiModalityDataPaddingPatternTokenPairs(MultiModalityDataPaddingPattern)
         start_token_ids = {s for s, _e in data_token_pairs}
         end_tokens_ids = {e for _s, e in data_token_pairs}
 
-        padded_ids = []
+        padded_ids = array("q")
         last_idx = 0
         data_idx = -1
 
@@ -313,7 +330,8 @@ class MultiModalityDataPaddingPatternTokenPairs(MultiModalityDataPaddingPattern)
 
             num_tokens = end_idx - start_idx - 1
             pad_value = pad_values[data_idx]
-            padded_ids.extend([pad_value] * num_tokens)
+            if num_tokens > 0:
+                padded_ids.extend(array("q", [pad_value]) * num_tokens)
 
             last_idx = end_idx
 
@@ -328,17 +346,19 @@ class MultiModalityDataPaddingPatternMultimodalTokens(MultiModalityDataPaddingPa
     e.g. <image><image>....<image>, or <audio><audio>...<audio>
     """
 
-    def pad_input_tokens(
-        self, input_ids: List[int], mm_inputs: MultimodalInputs
-    ) -> List[int]:
+    def pad_input_tokens(self, input_ids: array, mm_inputs: MultimodalInputs) -> array:
         """
         Replaces multimodal tokens in input_ids with corresponding pad_values from mm_items.
         Each modality (image, audio, video) is handled separately based on its token_id.
         """
+        assert_int64_array(input_ids, "input_ids")
         if not input_ids or not mm_inputs.mm_items:
             return input_ids
 
-        input_ids_tensor = torch.as_tensor(input_ids)
+        # as_tensor(array) walks and boxes every token. View a bulk copy instead,
+        # keeping the original request's unpadded token buffer unchanged.
+        padded_input_ids = input_ids[:]
+        input_ids_tensor = torch.frombuffer(padded_input_ids, dtype=torch.int64)
 
         # Replace multimodal tokens using per-item offsets
         items_by_modality = defaultdict(list)
@@ -361,8 +381,7 @@ class MultiModalityDataPaddingPatternMultimodalTokens(MultiModalityDataPaddingPa
                 for offset in items[i].offsets:
                     input_ids_tensor[offset[0] : offset[1] + 1] = item.pad_value
 
-        ret_input_ids = input_ids_tensor.tolist()
-        return ret_input_ids
+        return padded_input_ids
 
 
 # masked_scatter_ materializes the expanded [num_tokens, hidden] bool mask plus
@@ -441,10 +460,19 @@ def embed_mm_inputs(
             embedder = getattr(multimodal_model, f"get_{modality_id}_feature", None)
         if len(items) != 0:
             assert embedder is not None, f"no embedding method found for {modality}"
-            placeholder_tensor = torch.as_tensor(
-                [item.pad_value for item in items],
-                device=input_ids.device,
-            )
+            pad_values = [item.pad_value for item in items]
+            if input_ids.device.type == "cuda":
+                # Pinned staging keeps the placeholder copy asynchronous on CUDA.
+                placeholder_cpu = torch.tensor(
+                    pad_values, dtype=torch.int64, device="cpu", pin_memory=True
+                )
+                placeholder_tensor = placeholder_cpu.to(
+                    input_ids.device, non_blocking=True
+                )
+            else:
+                placeholder_tensor = torch.as_tensor(
+                    pad_values, device=input_ids.device
+                )
             # calculate per request items length offset
             items_size = [0]
             items_offsets = []
@@ -736,7 +764,12 @@ def general_mm_embed_routine(
                                         )
                                     )
             forward_batch.mm_inputs = None
-            forward_batch.mm_input_embeds = input_embeds
+            forward_batch.mm_input_embeds = (
+                input_embeds.clone()
+                if forward_batch.spec_algorithm is not None
+                and forward_batch.spec_algorithm.is_eagle()
+                else input_embeds
+            )
         else:
             input_embeds = embed_tokens(input_ids)
         # Copy to pre-allocated buffer if available (for CUDA graph address stability)
@@ -754,66 +787,6 @@ def general_mm_embed_routine(
             **kwargs,
         )
     return hidden_states
-
-
-def get_multimodal_data_bounds(
-    input_ids: torch.Tensor, pad_values: List[int], token_pairs: List[Tuple[int, int]]
-) -> torch.Tensor:
-    """
-    Returns a tensor indicating the bounds of multimodal data (images, video, audio, etc.)
-
-    Returns:
-        [bounds_count, 2]
-    """
-    # All the multimodal data in the batch should share the same special bound token ids.
-    start_tokens = {s for s, _e in token_pairs}
-    end_tokens = {e for _s, e in token_pairs}
-
-    assert all(isinstance(t, int) for t in start_tokens)
-    assert all(isinstance(t, int) for t in end_tokens)
-
-    start_cond = torch.isin(
-        input_ids, torch.as_tensor(start_tokens, device=input_ids.device)
-    )
-    end_cond = torch.isin(
-        input_ids, torch.as_tensor(end_tokens, device=input_ids.device)
-    )
-
-    (data_start_tokens,) = torch.where(start_cond)
-    (data_end_tokens,) = torch.where(end_cond)
-
-    data_start_tokens_cpu = data_start_tokens.cpu().tolist()
-    data_end_tokens_cpu = data_end_tokens.cpu().tolist()
-
-    # the im_start_id sometimes can be cached as prefix, but it is needed for the embedding of the multimodal data
-    if len(data_start_tokens_cpu) != len(data_end_tokens_cpu):
-        if (
-            len(data_start_tokens_cpu) + 1 == len(data_end_tokens_cpu)
-            and input_ids[0].item() in pad_values
-            and data_end_tokens_cpu
-            and data_start_tokens_cpu
-            and data_end_tokens_cpu[0] < data_start_tokens_cpu[0]
-        ):
-            data_start_tokens_cpu.insert(0, 0)
-    valid_mm_data_nums = min(len(data_start_tokens_cpu), len(data_end_tokens_cpu))
-
-    if valid_mm_data_nums == 0:
-        return torch.zeros((0, 2), device=input_ids.device)
-
-    # Filter out pairs where start_token >= end_token
-    valid_pairs = []
-    for i in range(valid_mm_data_nums):
-        start_token = data_start_tokens_cpu[i]
-        end_token = data_end_tokens_cpu[i]
-        if start_token < end_token:
-            valid_pairs.append((start_token + 1, end_token - 1))
-
-    if not valid_pairs:
-        return torch.zeros((0, 2), device=input_ids.device)
-
-    # Convert valid pairs to tensor
-    valid_pairs_tensor = torch.as_tensor(valid_pairs, device=input_ids.device)
-    return valid_pairs_tensor
 
 
 def data_hash(data) -> int:
@@ -1354,10 +1327,28 @@ class ShmPointerMMData:
             self._materialization_error = f"{type(error).__name__}: {error}"
 
     def materialize(self) -> torch.Tensor:
-        """Clone tensor from shm to owned memory, then release shm handle."""
+        """Return independently writable storage, then release the SHM handle.
+
+        On Linux the tensor owns a private copy-on-write mapping. Reading the
+        pixels needs no clone, and writes remain local to this receiver just
+        as with the old clone. torch.frombuffer keeps the mapping alive until
+        the tensor and all derived views are released. Other platforms retain
+        the clone path.
+        """
         try:
             if self._materialization_error is not None:
                 raise RuntimeError(self._materialization_error)
+            if sys.platform == "linux":
+                owned = mmap.mmap(
+                    self._shm_handle._fd,
+                    self.tensor.numel() * self.tensor.element_size(),
+                    access=mmap.ACCESS_COPY,
+                )
+                try:
+                    return torch.frombuffer(owned, dtype=self.dtype).reshape(self.shape)
+                except BaseException:
+                    owned.close()
+                    raise
             return self.tensor.clone()
         finally:
             self.close_and_unlink()

@@ -1,6 +1,6 @@
 import torch
 
-from sglang.srt.distributed import get_world_group
+from sglang.srt.runtime_context import get_parallel
 
 
 class PollBasedBarrier:
@@ -26,6 +26,6 @@ class PollBasedBarrier:
         torch.distributed.all_reduce(
             global_arrived,
             torch.distributed.ReduceOp.MIN,
-            group=get_world_group().cpu_group,
+            group=get_parallel().world_group.cpu_group,
         )
         return global_arrived.item()

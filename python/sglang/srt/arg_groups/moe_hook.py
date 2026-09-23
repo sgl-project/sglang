@@ -22,6 +22,7 @@ from sglang.srt.arg_groups.overrides import (
     resolving_view,
     run_post_process_pass,
 )
+from sglang.srt.configs.moe_model_registry import model_supports_deepep_v2
 from sglang.srt.connector import ConnectorType
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.cuda_graph_config import Backend, Phase, with_phase
@@ -325,13 +326,6 @@ def handle_a2a_moe(server_args: Any):
 
     if a2a_backend == "deepep_v2":
         validate_deepep_v2_model_architecture(server_args)
-        if resolved_view(server_args).enable_deterministic_inference:
-            raise ValueError(
-                "DeepEP v2 does not forward deterministic=True to "
-                "ElasticBuffer, so deterministic sorting remains disabled. "
-                "Disable --enable-deterministic-inference or use "
-                "--moe-a2a-backend deepep."
-            )
         # ElasticBuffer requires CUMEM, but not NVLS or its preallocation.
         os.environ.setdefault("NCCL_CUMEM_ENABLE", "1")
         # Respect model-level runner declarations before resolving auto.
@@ -594,7 +588,7 @@ def validate_deepep_v2_dispatch_token_budget(server_args: Any) -> None:
 
 
 def validate_deepep_v2_model_architecture(server_args: Any) -> None:
-    """Allow DeepEP v2 only where its model workflow is validated."""
+    """Allow DeepEP v2 only for registered model architectures."""
 
     if (
         parse_connector_type(resolved_view(server_args).model_path)
@@ -606,24 +600,15 @@ def validate_deepep_v2_model_architecture(server_args: Any) -> None:
             "--moe-a2a-backend deepep."
         )
 
-    architectures = (
-        getattr(model_config_of(server_args).hf_config, "architectures", None) or []
-    )
-
-    architecture = architectures[0] if architectures else None
-    # These architectures take the A2A MoE path and skip post-expert
-    # all-reduce.
-    validated_architectures = (
-        "DeepseekV3ForCausalLM",
-        "DeepseekV4ForCausalLM",
-        "Qwen3MoeForCausalLM",
-    )
-    if architecture not in validated_architectures:
+    hf_config = model_config_of(server_args).hf_config
+    if not model_supports_deepep_v2(hf_config):
+        architectures = getattr(hf_config, "architectures", None) or []
+        architecture = architectures[0] if architectures else None
         raise ValueError(
-            f"DeepEP v2 MoE is not validated for {architecture!r}; supported "
-            f"architectures are {sorted(validated_architectures)}. "
-            "Other model workflows may require an all-reduce after A2A "
-            "combine. Use --moe-a2a-backend deepep."
+            f"DeepEP v2 MoE is not validated for {architecture!r}. The model "
+            "package must register its architecture with "
+            "register_deepep_v2_model, because its combine and post-expert "
+            "reduction semantics must be validated first."
         )
 
 

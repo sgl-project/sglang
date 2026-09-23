@@ -7,6 +7,10 @@ import torch.fx as fx
 
 from sglang.srt.compilation.compilation_config import CompilationConfig
 from sglang.srt.compilation.compilation_counter import compilation_counter
+from sglang.srt.compilation.compile_phase import (
+    get_pcg_capture_stream,
+    is_in_torch_compile_warmup,
+)
 from sglang.srt.compilation.cuda_piecewise_backend import (
     CUDAPiecewiseBackend,
     weak_ref_tensors,
@@ -39,6 +43,12 @@ class NPUPiecewiseBackend(CUDAPiecewiseBackend):
         )
 
     def __call__(self, *args):
+        if is_in_torch_compile_warmup():
+            return self.compiled_graph_for_general_shape(*args)
+
+        if len(self.sym_shape_indices) == 0:
+            return self.compiled_graph_for_general_shape(*args)
+
         runtime_shape = args[self.sym_shape_indices[0]]
         if runtime_shape not in self.concrete_size_entries:
             # we don't need to do anything for this shape
@@ -73,7 +83,12 @@ class NPUPiecewiseBackend(CUDAPiecewiseBackend):
                     stack.enter_context(patch("torch.npu.empty_cache", lambda: None))
 
                 # mind-exploding: carefully manage the reference and memory.
-                with torch.npu.graph(npugraph, pool=self.graph_pool):
+                with torch.npu.graph(
+                    npugraph,
+                    pool=self.graph_pool,
+                    stream=get_pcg_capture_stream(),
+                    auto_dispatch_capture=True,
+                ):
                     # `output` is managed by pytorch's cudagraph pool
                     output = entry.runnable(*args)
                     if self.is_last_graph:
