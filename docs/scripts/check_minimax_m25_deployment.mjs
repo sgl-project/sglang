@@ -14,6 +14,53 @@ const { options, generateCommand, getInitialState, getUpdatedValues } = new Func
 const defaults = getInitialState();
 const build = (selection) => generateCommand({ ...defaults, ...selection });
 
+test('A2 exposes editable paths and hides controls that cannot change its tested configuration', () => {
+  assert.ok(options.hardware.items.some((item) => item.id === 'a2'));
+  for (const name of ['gpuCount', 'thinking', 'toolcall', 'ascendPreset', 'draftModelPath', 'networkInterface']) {
+    assert.equal(options[name].condition({ hardware: 'a2' }), false, name);
+  }
+  for (const name of ['modelPath', 'tokenizerPath']) {
+    assert.equal(options[name].condition({ hardware: 'a2' }), true, name);
+  }
+});
+
+test('A2 emits the tested eight-device low-concurrency command regardless of GPU selections', () => {
+  const command = build({ hardware: 'a2', gpuCount: '2gpu', thinking: 'disabled', toolcall: 'disabled' });
+  for (const expected of [
+    'export HCCL_BUFFSIZE=128', 'export OMP_NUM_THREADS=1',
+    'export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True',
+    '--device npu', '--tp-size 8', '--quantization modelslim', '--dtype bfloat16',
+    '--reasoning-parser minimax \\\n', '--tool-call-parser minimax-m2',
+    '--host 127.0.0.1 --port 31216', '--context-length 4096', '--max-running-requests 1',
+    '--chunked-prefill-size 128', '--max-prefill-tokens 4096', '--mem-fraction-static 0.95',
+    '--disable-cuda-graph', '--disable-radix-cache',
+  ]) assert.ok(command.includes(expected), `Missing ${expected}`);
+  assert.doesNotMatch(command, /EAGLE3|custom_eagle3|speculative|ascend_fuseep|--dp-size|flashinfer|fp8_e4m3/);
+  assert.ok(command.includes('MODEL_PATH=\'/models/MiniMax-M2.5-w8a8-QuaRot\''));
+  assert.ok(command.includes('TOKENIZER_PATH=\'/models/MiniMax-M2.5-w8a8-QuaRot\''));
+});
+
+test('A2 quotes both editable directories and refuses incomplete or multiline paths', () => {
+  const command = build({ hardware: 'a2', modelPath: "/models/owner's $(model)", tokenizerPath: '/models/tokenizer files' });
+  assert.ok(command.includes("MODEL_PATH='/models/owner'\\''s $(model)'"));
+  assert.ok(command.includes("TOKENIZER_PATH='/models/tokenizer files'"));
+  assert.ok(command.includes('--model-path "$MODEL_PATH"'));
+  assert.ok(command.includes('--tokenizer-path "$TOKENIZER_PATH"'));
+  for (const input of [
+    { modelPath: '' }, { modelPath: 'relative/model' }, { modelPath: '/models/main\nextra' },
+    { tokenizerPath: '' }, { tokenizerPath: 'relative/tokenizer' }, { tokenizerPath: '/models/tokenizer\nextra' },
+  ]) assert.doesNotMatch(build({ hardware: 'a2', ...input }), /python3? -m sglang\.launch_server/);
+});
+
+test('switching through A2 preserves A3 and restores a valid NVIDIA count', () => {
+  const a2 = getUpdatedValues({ ...defaults, hardware: 'mi300x', gpuCount: '2gpu' }, 'hardware', 'a2');
+  assert.match(generateCommand(a2), /--tp-size 8/);
+  assert.match(generateCommand(getUpdatedValues(a2, 'hardware', 'a3')), /--tp-size 16/);
+  const nvidia = getUpdatedValues(a2, 'hardware', 'h200');
+  assert.equal(nvidia.gpuCount, '4gpu');
+  assert.doesNotMatch(generateCommand(nvidia), /TOKENIZER_PATH|HCCL_BUFFSIZE|modelslim|--device npu/);
+});
+
 test('the existing default NVIDIA recipe retains its fusion and tensor parallel flags', () => {
   const command = build({ hardware: 'h200', gpuCount: '4gpu' });
   assert.match(command, /^SGLANG_USE_FUSED_PARALLEL_QKNORM=1/);
