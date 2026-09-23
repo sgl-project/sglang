@@ -8,7 +8,6 @@ and never give it a `moe_runner_config` (issue #36264).
 """
 
 import unittest
-from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
@@ -16,6 +15,10 @@ import torch
 from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
 from sglang.srt.layers.moe.utils import MoeRunnerBackend
 from sglang.srt.layers.quantization.fp8 import Fp8Config, Fp8MoEMethod
+from sglang.srt.managers.scheduler_components.weight_updater import (
+    _export_static_state,
+    _import_static_state,
+)
 from sglang.srt.runtime_context import get_flags
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -46,18 +49,18 @@ class TestFp8MoERunnerOwnership(CustomTestCase):
         )
 
     @staticmethod
-    def _make_layer(num_local_experts: int = 2) -> SimpleNamespace:
-        return SimpleNamespace(
-            num_local_experts=num_local_experts,
-            w13_weight=torch.empty(num_local_experts, 4),
-        )
+    def _make_layer(num_local_experts: int = 2) -> torch.nn.Module:
+        layer = torch.nn.Module()
+        layer.num_local_experts = num_local_experts
+        layer.w13_weight = torch.nn.Parameter(torch.empty(num_local_experts, 4))
+        return layer
 
-    def _run_post_load(self, method: Fp8MoEMethod, layer: SimpleNamespace) -> None:
+    def _run_post_load(self, method: Fp8MoEMethod, layer: torch.nn.Module) -> None:
         with patch.object(method, "process_weights_after_loading_block_quant") as work:
             method.process_weights_after_loading(layer)
         work.assert_called_once_with(layer)
 
-    def _assert_activation_params_absent(self, layer: SimpleNamespace) -> None:
+    def _assert_activation_params_absent(self, layer: torch.nn.Module) -> None:
         for name in _ACTIVATION_PARAMS:
             self.assertFalse(hasattr(layer, f"_flashinfer_trtllm_{name}"))
 
@@ -112,6 +115,36 @@ class TestFp8MoERunnerOwnership(CustomTestCase):
         self._run_post_load(method=method, layer=layer)
 
         self._assert_activation_params_absent(layer)
+
+    def test_activation_params_survive_memory_release_and_reload(self):
+        """Offload must restore activation constants at the addresses retained by CUDA graphs."""
+        method = self._make_block_fp8_method()
+        layer = self._make_layer()
+        method.create_moe_runner(
+            layer=layer,
+            moe_runner_config=MoeRunnerConfig(
+                gemm1_alpha=1.5, gemm1_beta=0.25, gemm1_clamp_limit=10.0
+            ),
+        )
+        self._run_post_load(method, layer)
+        retained = {
+            f"_flashinfer_trtllm_{name}": getattr(layer, f"_flashinfer_trtllm_{name}")
+            for name in _ACTIVATION_PARAMS
+        }
+        expected = {name: tensor.clone() for name, tensor in retained.items()}
+        backup = _export_static_state(layer)
+        # Discarded weight-region pages do not retain non-checkpoint constants.
+        for tensor in retained.values():
+            tensor.zero_()
+        _import_static_state(layer, backup)
+        for name, tensor in retained.items():
+            torch.testing.assert_close(tensor, expected[name], rtol=0, atol=0)
+
+        self._run_post_load(method, layer)
+        for name, tensor in retained.items():
+            self.assertIs(getattr(layer, name), tensor)
+            torch.testing.assert_close(tensor, expected[name], rtol=0, atol=0)
+            self.assertNotIn(name, layer.state_dict())
 
 
 if __name__ == "__main__":

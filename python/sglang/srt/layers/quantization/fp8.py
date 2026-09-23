@@ -2339,7 +2339,15 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                     device=device,
                 )
             )
-            setattr(layer, f"_flashinfer_trtllm_{name}", tensor)
+            buffer_name = f"_flashinfer_trtllm_{name}"
+            existing = getattr(layer, buffer_name, None)
+            if existing is not None and tensor is not None:
+                # CUDA graphs retain this storage across online weight updates.
+                existing.copy_(tensor)
+            else:
+                # Memory-saver weight offload preserves registered buffers, not
+                # arbitrary tensor attributes. These have no checkpoint payload.
+                layer.register_buffer(buffer_name, tensor, persistent=False)
 
     def _prepare_hpc_ops_weights(self, layer: Module) -> None:
         """Precompute the scale layouts consumed by the HPC-Ops fused MoE kernels.
