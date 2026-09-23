@@ -12,14 +12,13 @@ from tqdm import tqdm
 
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import (
-    get_attention_dp_rank,
-    get_attention_dp_size,
     is_dp_attention_enabled,
     set_is_extend_in_batch,
 )
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.mem_cache.common import release_kv_cache
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.utils import broadcast_pyobj
 from sglang.srt.utils.common import get_device_module
@@ -196,9 +195,9 @@ class DynamicChunkSizer:
 
             if is_dp_attention_enabled():
                 # Profiling runs one request on this rank; other DP ranks report 0.
-                dp_size = get_attention_dp_size()
+                dp_size = get_parallel().attn_dp_size
                 global_num_tokens = [0] * dp_size
-                dp_rank = get_attention_dp_rank()
+                dp_rank = get_parallel().attn_dp_rank
                 global_num_tokens[dp_rank] = current_seq_len
                 batch.global_num_tokens = global_num_tokens
                 batch.global_num_tokens_for_logprob = global_num_tokens

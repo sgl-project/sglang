@@ -103,6 +103,7 @@ class PrefillStats:
     log_host_hit_tokens: int = 0
     log_storage_hit_tokens: int = 0
     num_pending_tokens: int = 0
+    log_replay_tokens: int = 0
 
     @classmethod
     def from_adder(
@@ -114,6 +115,7 @@ class PrefillStats:
     ):
         return cls(
             log_input_tokens=adder.log_input_tokens,
+            log_replay_tokens=adder.log_replay_tokens,
             log_hit_tokens=adder.log_hit_tokens,
             reprocessed_log_input_tokens=adder.reprocessed_log_input_tokens,
             reprocessed_log_hit_tokens=adder.reprocessed_log_hit_tokens,
@@ -306,17 +308,15 @@ class SchedulerMetricsReporter:
         self.scheduler.enable_fpm = False
         if (
             get_observability().enable_forward_pass_metrics
-            and self.scheduler.ps.attn_tp_rank == 0
-            and self.scheduler.ps.pp_rank == self.scheduler.ps.pp_size - 1
+            and get_parallel().attn_tp_rank == 0
+            and get_parallel().pp_rank == get_parallel().pp_size - 1
         ):
             from sglang.srt.observability.forward_pass_metrics import (
                 _FpmPublisherThread,
             )
 
             self.scheduler._fpm_dp_rank = (
-                self.scheduler.ps.dp_rank
-                if self.scheduler.ps.dp_rank is not None
-                else 0
+                get_parallel().dp_rank if get_parallel().dp_rank is not None else 0
             )
             self.scheduler._fpm_worker_id = (
                 get_observability().forward_pass_metrics_worker_id
@@ -481,9 +481,9 @@ class SchedulerMetricsReporter:
         num_layers = float(getattr(model_config, "num_attention_layers", 0))
         head_dim = float(getattr(model_config, "head_dim", 0))
         num_attn_heads = float(
-            model_config.get_num_attention_heads(self.scheduler.ps.tp_size)
+            model_config.get_num_attention_heads(get_parallel().tp_size)
         )
-        num_kv_heads = float(model_config.get_num_kv_heads(self.scheduler.ps.tp_size))
+        num_kv_heads = float(model_config.get_num_kv_heads(get_parallel().tp_size))
         intermediate_size = getattr(hf_text_config, "intermediate_size", None)
         if intermediate_size is None:
             intermediate_size = getattr(hf_text_config, "ffn_hidden_size", 0)
@@ -660,7 +660,10 @@ class SchedulerMetricsReporter:
         gap_latency = now - self.last_prefill_stats_tic
         self.last_prefill_stats_tic = now
         self.last_input_throughput = (
-            prefill_stats.log_input_tokens / gap_latency if gap_latency > 0 else 0.0
+            (prefill_stats.log_input_tokens + prefill_stats.log_replay_tokens)
+            / gap_latency
+            if gap_latency > 0
+            else 0.0
         )
 
         pool_stats = self.scheduler.pool_stats_observer.get_pool_stats()
@@ -685,6 +688,8 @@ class SchedulerMetricsReporter:
             f"#pending-token: {prefill_stats.num_pending_tokens}, "
         )
 
+        if prefill_stats.log_replay_tokens:
+            msg += f"#replay-token: {prefill_stats.log_replay_tokens}, "
         if self.scheduler.disaggregation_mode == DisaggregationMode.PREFILL:
             msg += f"#bootstrap-req: {len(self.scheduler.disagg_prefill_bootstrap_queue.queue)}, "
             msg += (
@@ -728,7 +733,9 @@ class SchedulerMetricsReporter:
                 value=can_run_cuda_graph
             )
             self.metrics_collector.increment_realtime_tokens(
-                prefill_compute_tokens=prefill_stats.log_input_tokens,
+                prefill_compute_tokens=(
+                    prefill_stats.log_input_tokens + prefill_stats.log_replay_tokens
+                ),
                 prefill_cache_tokens=prefill_stats.log_hit_tokens,
                 dp_cooperation_info=dp_cooperation_info,
             )

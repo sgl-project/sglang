@@ -41,6 +41,7 @@ def _make_backend():
     backend.score_type = "indexer"
     backend._prefill_seqblock_meta = None
     backend.index_cache_enabled = False
+    backend._loc_mapping = None
     return backend
 
 

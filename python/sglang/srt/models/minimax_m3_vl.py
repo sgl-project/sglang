@@ -1,14 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import logging
+from array import array
 from typing import Iterable, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
 
-from sglang.srt.distributed import (
-    get_pp_group,
-)
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe.utils import (
     get_moe_a2a_backend,
@@ -86,7 +84,7 @@ class MiniMaxM3SparseForConditionalGeneration(nn.Module):
         super().__init__()
         self.config = config
         self.quant_config = quant_config
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
 
         self.use_data_parallel = get_mm().mm_enable_dp_encoder
 
@@ -144,6 +142,7 @@ class MiniMaxM3SparseForConditionalGeneration(nn.Module):
         )
 
         self.logits_processor = LogitsProcessor(text_config)
+
         # For EAGLE3 support
         self.capture_aux_hidden_states = False
 
@@ -204,7 +203,7 @@ class MiniMaxM3SparseForConditionalGeneration(nn.Module):
             )
         self.set_eagle3_layers_to_capture(layer_ids)
 
-    def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
+    def pad_input_ids(self, input_ids: array, mm_inputs: MultimodalInputs) -> array:
         return MultiModalityDataPaddingPatternMultimodalTokens().pad_input_tokens(
             input_ids, mm_inputs
         )
@@ -268,9 +267,9 @@ class MiniMaxM3SparseForConditionalGeneration(nn.Module):
             pp_proxy_tensors=pp_proxy_tensors,
         )
 
-        # EAGLE3/DSpark: when layers_to_capture is set, MiniMaxM3Model.forward
-        # returns (hidden_states, aux_hidden_states) once aux is non-empty; on
-        # idle/warmup forwards with no captured tokens it returns a bare tensor.
+        # EAGLE3: when layers_to_capture is set, MiniMaxM3Model.forward returns
+        # (hidden_states, aux_hidden_states) once aux is non-empty; on idle/warmup
+        # forwards with no captured tokens it returns a bare hidden tensor.
         aux_hidden_states = None
         if self.capture_aux_hidden_states and isinstance(hidden_states, tuple):
             hidden_states, aux_hidden_states = hidden_states

@@ -5,13 +5,13 @@ description: Guide for writing SGLang CI/UT tests. Covers CustomTestCase, CI reg
 
 # Writing SGLang CI / UT Tests
 
-This skill covers **how to write and register tests**. For CI pipeline internals (stage ordering, fast-fail, gating, partitioning, debugging CI failures), see the [CI workflow guide](../ci-workflow-guide/SKILL.md). Whether a case is worth adding at all is decided by [`unit-test-admission`](../../rules/unit-test-admission.md) — read it before writing the case, not after.
+This skill covers **how to write and register tests**. For CI pipeline internals (stage ordering, fail-fast, gating, partitioning, debugging CI failures), see the [CI workflow guide](../ci-workflow-guide/SKILL.md). Whether a case is worth adding at all is decided by [`unit-test-admission`](../../rules/unit-test-admission.md) — read it before writing the case, not after.
 
 ## Core Rules
 
 1. **Always use `CustomTestCase`** — never raw `unittest.TestCase`. It ensures `tearDownClass` runs even when `setUpClass` fails, preventing resource leaks in CI.
 2. **`tearDownClass` must shut the server down gracefully** — call `terminate_and_kill_process_tree(cls.process)`, never a bare `kill_process_tree`. SIGKILL alone skips the server's userspace cleanup and leaves its GPU memory charged to the dead process; the next class then OOMs while loading weights. Keep it defensive too: `hasattr`/null checks before accessing resources (e.g. `cls.process`) that `setUpClass` may not have finished allocating.
-3. **Place tests in `test/registered/<kind>/<subsystem>/`** — `<kind>` is `unit`, `kernel`, `e2e`, `accuracy`, `perf`, or `stress`; hardware belongs in registrations, not directory names
+3. **Place non-kernel tests in `test/registered/<kind>/<subsystem>/`** — `<kind>` is `unit`, `e2e`, `accuracy`, `perf`, or `stress`; kernel tests use `test/registered/kernels/{ops,benchmark}/<group>/`; hardware belongs in registrations, not directory names
 4. **Reuse server fixtures** — inherit from `DefaultServerBase` or write `setUpClass`/`tearDownClass` with `popen_launch_server`
 5. **Mock boundaries, not SGLang behavior** — mock slow or external dependencies only when the assertion still checks an observable result, state transition, or error. A test whose evidence is only `assert_called*` mirrors its mock and is not admissible. Launch a real server only when inference results or lifecycle behavior are the contract under test.
 
@@ -31,10 +31,8 @@ This skill covers **how to write and register tests**. For CI pipeline internals
 
 JIT kernel notes:
 - If the task is adding or updating code under `python/sglang/kernels/jit/`, prefer the `add-jit-kernel` skill first.
-- New JIT kernel correctness tests use `test/registered/kernel/jit/**/test_*.py`.
-- New JIT kernel benchmarks use `test/registered/kernel/jit/benchmark/**/bench_*.py`.
-- `test/registered/jit/` also exists and still runs. It is a leftover from the kernel
-  reclassification (RFC #29630) that was never finished; do not add files there.
+- JIT kernel correctness tests use `test/registered/kernels/ops/<group>/test_*.py`.
+- JIT kernel benchmarks use `test/registered/kernels/benchmark/<group>/bench_*.py`.
 - Those files are executed by `test/run_suite.py` through dedicated kernel suites (`base-b-kernel-*`); a `register_*_ci(...)` call placed under `python/sglang/` is rejected by the `check-no-registered-tests-in-package` pre-commit hook.
 
 ---
@@ -336,12 +334,12 @@ They are ordinary registered tests; only their stage differs:
 ```python
 from sglang.test.ci.ci_register import register_cuda_ci
 
-# Correctness tests in test/registered/kernel/jit/
+# Correctness tests in test/registered/kernels/ops/<group>/
 register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
 register_cuda_ci(est_time=120, stage="base-b-kernel-unit", runner_config="8-gpu-h200")
 
-# Benchmarks in test/registered/kernel/jit/benchmark/
+# Benchmarks in test/registered/kernels/benchmark/<group>/
 register_cuda_ci(est_time=6, stage="base-b-kernel-benchmark", runner_config="1-gpu-large")
 
 # Optional nightly registration — same form, stage is just "nightly"
@@ -375,8 +373,9 @@ A `register_*_ci(...)` under `python/sglang/` is rejected by the
 
 **Decision rule** (see also `test/registered/README.md`):
 - CPU component logic, no server → `registered/unit/<subsystem>/`
-- JIT kernel correctness / benchmarks → `registered/kernel/jit/`
-- Other accelerator operator correctness → `registered/kernel/<group>/`
+- JIT kernel correctness → `registered/kernels/ops/<group>/`
+- JIT kernel benchmarks → `registered/kernels/benchmark/<group>/`
+- Other accelerator operator correctness → `registered/kernels/ops/<group>/`
 - Server needed → `registered/e2e/<subsystem>/`
 - Eval floor / performance contract → `registered/{accuracy,perf}/<family>/`
 - Local debugging → `manual/`
@@ -422,7 +421,7 @@ Before submitting a test:
 - [ ] Inherits from `CustomTestCase` (not `unittest.TestCase`)
 - [ ] Has `register_*_ci(...)` call at module level
 - [ ] Placed in `test/registered/<kind>/<subsystem>/`
-- [ ] JIT kernel work: test files live in `test/registered/kernel/jit/`; only test-only helpers stay under `python/sglang/kernels/jit/`
+- [ ] JIT kernel work: correctness tests live in `test/registered/kernels/ops/<group>/`, benchmarks live in `test/registered/kernels/benchmark/<group>/`, and only test-only helpers stay under `python/sglang/kernels/jit/`
 - [ ] Backend-independent tests: `register_cuda_ci` only + smallest model
 - [ ] Logic that doesn't need a server / engine launch → unit test in `registered/unit/` (see Unit Tests section)
 - [ ] `tearDownClass` is defensive — uses `hasattr`/null checks before accessing resources that may not have been allocated
