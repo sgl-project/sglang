@@ -588,13 +588,16 @@ def calculate_utilization(
     skipped_non_gpu = 0
     skipped_lookback = 0
     for r in all_runs:
-        # Skipped/unapproved runs and first attempts that finished within a
-        # minute (gate jobs on ubuntu-latest) never touch a self-hosted runner.
+        # Skipped/unapproved runs, and PR/push first attempts that finished
+        # within a minute (gate jobs on ubuntu-latest), never touch a
+        # self-hosted runner. Dispatched runs (e.g. rerun-test) go straight
+        # to a GPU runner, so they are always fetched.
         if (
             _likely_no_gpu_jobs(r.get("name", ""))
             or r.get("conclusion") in ("skipped", "action_required")
             or (
-                r.get("status") == "completed"
+                r.get("event") in ("pull_request", "push")
+                and r.get("status") == "completed"
                 and r.get("run_attempt") == 1
                 and parse_time(r["updated_at"]) - parse_time(r["run_started_at"])
                 < timedelta(minutes=1)
@@ -705,16 +708,6 @@ def calculate_utilization(
                     f"Fetched jobs for {completed}/{total_runs} runs "
                     f"({len(failed_runs)} failed so far)..."
                 )
-                # The token's quota is shared with PR CI; leave it headroom.
-                if (
-                    run_gh_command(["rate_limit"])["resources"]["core"]["remaining"]
-                    < 5000
-                ):
-                    for f in futures:
-                        f.cancel()
-            if future.cancelled():
-                failed_runs.append((None, "skipped: API quota below 5000"))
-                continue
             run_id, jobs, err = future.result()
             if err:
                 failed_runs.append((run_id, err))
