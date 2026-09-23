@@ -12,8 +12,6 @@ added there (see ``test_base_processor_bad_input.py`` /
 unfetchable/empty ``image_url`` or an undecodable image must raise
 ``ValueError`` (-> HTTP 400 in serving_base.py), not surface as an
 unclassified exception (-> HTTP 500).
-
-No server, no model loading — pure CPU.
 """
 
 from sglang.test.ci.ci_register import register_cpu_ci
