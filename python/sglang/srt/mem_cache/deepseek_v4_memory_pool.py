@@ -2104,6 +2104,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         return self.kv_layout
 
     def get_swa_key_page_size(self) -> int:
+        """Return the physical page size for the active SWA storage."""
         if self.request_window is not None:
             return self.request_window.page_size
         return self.swa_kv_pool.page_size
