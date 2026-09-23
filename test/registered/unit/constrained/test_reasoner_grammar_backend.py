@@ -174,6 +174,9 @@ class TestReasonerGrammarBackend(CustomTestCase):
             think_start_token="<think>",
             think_end_token="</think>",
             think_excluded_tokens=["<tool_call>", "</tool_call>"],
+            get_think_end_token_ids=lambda tokenizer: tokenizer.encode(
+                "</think>", add_special_tokens=False
+            ),
         )
         return SimpleNamespace(detector=detector)
 
@@ -472,13 +475,36 @@ class TestReasonerGrammarBackend(CustomTestCase):
                     else:
                         self.assertIs(grammar, inner_grammar)
 
+    def test_inkling_backend_matches_native_think_end_id(self):
+        """Strict mode and other constraints must see the native END_MESSAGE id."""
+        tokenizer = _DummyTokenizer({END_MESSAGE: [27, 91, 406, 62, 65752, 91, 29]})
+        for strict in (False, True):
+            with self.subTest(strict=strict):
+                reasoner = ReasonerGrammarBackend(
+                    _DummyGrammarBackend(),
+                    SimpleNamespace(detector=InklingDetector()),
+                    tokenizer,
+                    enable_strict_thinking=strict,
+                )
+                self.assertEqual(
+                    reasoner.think_end_ids, [INKLING_SPECIAL_TOKEN_IDS[END_MESSAGE]]
+                )
+
+                grammar = reasoner._make_grammar_object(MagicMock(), reasoning=True)
+                self.assertFalse(grammar._is_generation())
+                grammar.accept_token(INKLING_SPECIAL_TOKEN_IDS[END_MESSAGE])
+                self.assertTrue(grammar._is_generation())
+
     def test_other_grammars_still_defer_until_reasoning_ends(self):
-        tag = InklingToolDetector().get_auto_tool_call_structural_tag().model_dump()
+        canonical = InklingToolDetector().get_auto_tool_call_structural_tag()
+        tag = canonical.model_dump()
         tag["format"] = {"type": "sequence", "elements": [tag["format"]]}
         keys = [
             ("json", "{}"),
             ("structural_tag", '{"structures": [], "triggers": []}'),
             ("structural_tag", json.dumps(tag)),
+            # The canonical schema owns the full turn only under the Inkling detector.
+            ("structural_tag", canonical.model_dump_json()),
         ]
         for key in keys:
             with self.subTest(key=key):
