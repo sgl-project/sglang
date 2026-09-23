@@ -23,7 +23,9 @@
 <a href="https://drive.google.com/drive/folders/18ybvDAmtEaj3IdqsVrwJUsxasyg9kC4V"><b>Slides</b></a>
 </p>
 
-Meet the SGLang community at upcoming [meetups, talks, and workshops](https://www.sglang.io/events).
+<p align="center">
+Meet the SGLang community at upcoming <a href="https://www.sglang.io/events">meetups, talks, and workshops</a>.
+</p>
 
 ## News
 - [2026/09] RLinf × SGLang: Cosmos3 fine-tuning and efficient parallel evaluation ([blog](https://www.sglang.io/blog/rlinf-sglang-cosmos3)).
