@@ -140,7 +140,10 @@ def _forward_megamoe_legacy(mega: Any, tensors: Any) -> torch.Tensor:
 def _select_megamoe_forward(mega: Any) -> Callable[[Any, Any], torch.Tensor]:
     import inspect
 
-    if "return_workspace_view" in inspect.signature(mega.forward).parameters:
+    if (
+        getattr(mega, "supports_output_view", False)
+        and "return_workspace_view" in inspect.signature(mega.forward).parameters
+    ):
         return _forward_megamoe_with_workspace_view
     return _forward_megamoe_legacy
 
