@@ -38,7 +38,12 @@ def deep_compare(dict1: Any, dict2: Any) -> bool:
             return False
         return all(deep_compare(dict1[k], dict2[k]) for k in dict1)
     elif isinstance(dict1, list):
-        return set(dict1) == set(dict2)
+        # A quark config list may hold dicts, which are unhashable, and its
+        # order is meaningful (a block shape [1, 128] is not [128, 1]), so
+        # compare element by element rather than as sets.
+        return len(dict1) == len(dict2) and all(
+            deep_compare(item1, item2) for item1, item2 in zip(dict1, dict2)
+        )
     else:
         return dict1 == dict2
 
