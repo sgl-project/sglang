@@ -35,7 +35,7 @@ class TestUnifiedRadixLockRefScenarios(unittest.TestCase):
             swa_prefix_lock_released=False,
         )
 
-        cache.cache_finished_req(req, is_insert=False, kv_len_to_handle=3)
+        cache.cache_finished_req(req, is_insert=False, owned_kv_len=3)
 
         cache.free_kv_row.assert_called_once_with(kv, [(0, 3)])
         cache._dec_req_lock.assert_not_called()

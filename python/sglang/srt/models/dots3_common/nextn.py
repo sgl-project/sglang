@@ -7,7 +7,6 @@ import torch
 from torch import nn
 from transformers import PretrainedConfig
 
-from sglang.srt.distributed import get_pp_group
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.layernorm import RMSNorm
@@ -148,7 +147,7 @@ class Dots3NoteForCausalLMNextN(Dots3LanguageModelForCausalLM):
         self.config = config
         self.tp_size = get_parallel().tp_size
         self.quant_config = quant_config
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
         self.fuse_qkv_a_g_proj = True
         self.packed_modules_mapping = {
             "fused_qkv_a_g_proj_with_mqa": [

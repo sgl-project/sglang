@@ -736,6 +736,72 @@ SGLang projects those adapter factors onto the pruned coordinates at load time.
 A structurally modified checkpoint without that metadata still fails closed,
 and packed GGUF weights remain incompatible with LoRA.
 
+### PDD acceleration LoRAs
+
+[Alibaba PAI's MiniMax-H3-Acc-LoRAs](https://huggingface.co/alibaba-pai/MiniMax-H3-Acc-LoRAs)
+use Parallel Decoding Distillation (PDD) for eight denoiser evaluations. These
+checkpoints contain backbone LoRA weights and interval-specific output heads.
+Merge the backbone weights offline, then fuse the output heads before serving.
+The `--lora-path` recipe above does not perform these preparation steps.
+
+Match the adapter and original MiniMax-H3 transformer weights to the server's
+model variant:
+
+| Model variant | Adapter file | Tasks |
+| --- | --- | --- |
+| `fl2va` | `MiniMax-H3-FL2VA-Acc-8Step.safetensors` | `t2va`, `fl2va` |
+| `ref2va` | `MiniMax-H3-Ref2VA-Acc-8Step.safetensors` | `ref2va` |
+
+`BASE_TRANSFORMER_DIR` is the directory containing the original model's
+BF16/FP32 transformer weight files, not the model root or the LoRA directory.
+If you downloaded `MiniMaxAI/MiniMax-H3` to `/path/to/MiniMax-H3`, use
+`/path/to/MiniMax-H3/FL2VA/transformer` for T2VA/FL2VA or
+`/path/to/MiniMax-H3/Ref2VA/transformer` for Ref2VA. This directory contains
+`model-*.safetensors`, `model.safetensors.index.json`, and `config.json`.
+The builder reads these files and writes the merged weights to
+`$PDD_DIR/transformer`, leaving the original weights unchanged.
+
+The following example prepares FL2VA
+weights and serves them on eight NVIDIA CUDA GPUs with TP2 + Ulysses4:
+
+```bash Command
+BASE_TRANSFORMER_DIR=/path/to/MiniMax-H3/FL2VA/transformer
+LORA_DIR=/path/to/h3-acc-loras
+PDD_DIR=/path/to/h3-fl2va-pdd
+
+hf download alibaba-pai/MiniMax-H3-Acc-LoRAs \
+  MiniMax-H3-FL2VA-Acc-8Step.safetensors --local-dir "$LORA_DIR"
+
+python3 -m sglang.multimodal_gen.tools.build_minimax_h3_pdd_weights \
+  "$BASE_TRANSFORMER_DIR" \
+  "$LORA_DIR/MiniMax-H3-FL2VA-Acc-8Step.safetensors" \
+  "$PDD_DIR"
+
+python3 -m sglang.multimodal_gen.tools.fuse_minimax_h3_pdd_heads \
+  "$PDD_DIR" --video-shift 12.0 --audio-shift 3.0
+
+SGLANG_DIFFUSION_MINIMAX_H3_PDD_HEADS="$PDD_DIR/pdd_fused_heads.safetensors" \
+sglang serve \
+  --model-path MiniMaxAI/MiniMax-H3 \
+  --model-variant fl2va \
+  --transformer-weights-path "$PDD_DIR/transformer" \
+  --num-gpus 8 \
+  --tp-size 2 \
+  --ulysses-degree 4 \
+  --performance-mode speed \
+  --port 30010
+```
+
+Keep `pdd_config.json` beside `pdd_fused_heads.safetensors`, outside the
+`transformer/` directory. For Ref2VA, use its adapter and base transformer,
+a separate output directory, and `--model-variant ref2va`.
+
+Use the requests in [Generate video and audio](#4-generate-video-and-audio)
+with `num_inference_steps: 9`, `flow_shift: 12.0`, and `audio_flow_shift: 3.0`.
+The nine sigma grid points give eight denoiser evaluations. These settings
+must match the fused heads; the server rejects a different step count or
+shift. Use `quality: "lossless"` in requests.
+
 ## 6. FastH3: 4-step distilled preview
 
 [FastVideo/FastVideo-FastH3-4-step-Preview-v1-VSA-DataFree](https://huggingface.co/FastVideo/FastVideo-FastH3-4-step-Preview-v1-VSA-DataFree)
@@ -1342,7 +1408,7 @@ fold decision is not node-boundary aware:
 - V2V uses `task: "ref2va"` with a `video` or `video_audio` reference; it is served by the `Ref2VA` partition and is not a separate public task value.
 - `conditions[].start_time_seconds` selects a non-negative offset for a video reference. Its visual and audio streams are always sought together.
 - Ref2VA condition order is semantic and must match the one-based material tags in the prompt. For Ref2VA, `target.aspect_ratio: "auto"` resolves to the model's 16:9 fallback rather than inheriting a reference asset's geometry.
-- The distilled pipeline uses a single denoising branch, so CFG parallelism does not apply. Do not enable it: `--enable-cfg-parallel true` or `--cfg-parallel-size` greater than 1 is rejected instead of duplicating the positive branch. Explicitly disabling CFG, or setting its size to 1, remains a valid no-op.
+- The distilled pipeline uses a single denoising branch, so CFG parallelism does not apply. Keep it disabled: a CFG degree greater than 1 is accepted for request compatibility, but the extra ranks only recompute the same branch and do not accelerate the request. Explicitly disabling CFG, or setting its size to 1, remains a valid no-op.
 - The released visual VAE quality recipe uses overlapping tiled decode. SGLang keeps that recipe by default and distributes complete tiles across the decode group; this changes scheduling, not the computation inside each tile.
 - H3 rejects `--vae-config.parallel-decode-mode spatial` and `spatial_shard`: validation found output mismatches. Use the default released tiled recipe.
 - Keep the default `--encoder-parallel auto`. With the server’s default `batching_max_size` of 1, single-node H100/H200/B200/B300 recipes with peer-to-peer access fold the Qwen text encoder over otherwise idle Ulysses ranks. This is separate from DiT tensor parallelism. A pure-TP recipe already shards the encoder over its TP group and does not add a world fold.
@@ -2055,3 +2121,9 @@ For a measured lower-count AMD deployment, set both `--num-gpus` and
 `--ulysses-degree` to 4, 2, or 1. AITER packed attention matched segment-wise
 BF16 SDPA at cosine similarity `0.9999991655` on MI355X and `0.9999991059` on
 MI300X.
+
+## 10. Run in ComfyUI
+
+import { ComfyUISupport } from '/src/snippets/diffusion/comfyui-support.jsx';
+
+<ComfyUISupport model="minimax-h3" />
