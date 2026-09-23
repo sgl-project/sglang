@@ -183,6 +183,10 @@ QWEN3_5_397B_W8A8_MODEL_PATH = (
 DEEPSEEK_V4_FLASH_0731_W8A8_MODEL_PATH = (
     "/root/.cache/modelscope/hub/models/Eco-Tech/DeepSeek-V4-Flash-0731-w8a8"
 )
+# DeepSeek-V4-Flash default model for a5 testcase
+DEEPSEEK_V4_FLASH_DEFAULT_MODEL_PATH = (
+    "/root/.cache/modelscope/hub/models/deepseek-ai/DeepSeek-V4-Flash"
+)
 QWEN3_5_397B_W4A8_MODEL_PATH = (
     "/root/.cache/modelscope/hub/models/Eco-Tech/Qwen3.5-397B-A17B-w4a8-mtp"
 )
@@ -223,6 +227,20 @@ TPOT_TOLERANCE_HIGH = 1.02  # +2%
 TTFT_TOLERANCE = 1.02  # +2%
 E2E_TOLERANCE = 1.02  # +2%
 OUTPUT_TOKEN_THROUGHPUT_TOLERANCE = 0.98  # -2%
+
+
+def _get_spec_num_draft_tokens(other_args):
+    """Extract the value of --speculative-num-draft-tokens from server args."""
+    if not other_args:
+        return None
+    args = [str(arg) for arg in other_args]
+    if "--speculative-num-draft-tokens" not in args:
+        return None
+    idx = args.index("--speculative-num-draft-tokens")
+    if idx + 1 >= len(args):
+        return None
+    return int(args[idx + 1])
+
 
 # Package filtering keywords
 PACKAGE_FILTER_KEYWORDS = [
@@ -566,6 +584,11 @@ def run_bench_serving(
                     parts = stripped_line.split()
                     if len(parts) >= 5:
                         metrics["mean_e2e_latency"] = parts[4]
+                elif "Accept length" in stripped_line:
+                    # Format: "Accept length:                           4.35"
+                    parts = stripped_line.split()
+                    if len(parts) >= 3:
+                        metrics["accept_length"] = parts[2]
         reader_done.set()
         process.wait()
         if process.returncode != 0:
@@ -915,6 +938,29 @@ def assert_metrics(self, metrics):
             labels={"test_case": tc_name, "type": "perf"},
         )
 
+    spec_num_draft_tokens = _get_spec_num_draft_tokens(
+        getattr(self, "other_args", None)
+    )
+    # accept_rate = accept_length / --speculative-num-draft-tokens.
+    # Dump only when all inputs are present; the mandatory checks below
+    # decide pass/fail when the baseline is set.
+    if (
+        getattr(self, "accept_rate", None)
+        and metrics.get("accept_length")
+        and spec_num_draft_tokens
+    ):
+        accept_rate = float(metrics["accept_length"]) / spec_num_draft_tokens
+        dump_metric(
+            "accept_rate",
+            accept_rate,
+            labels={"test_case": tc_name, "type": "perf"},
+        )
+        dump_metric(
+            "accept_rate_baseline",
+            float(self.accept_rate),
+            labels={"test_case": tc_name, "type": "perf"},
+        )
+
     if self.tpot:
         if self.tpot < TPOT_THRESHOLD:
             self.assertLessEqual(
@@ -940,6 +986,25 @@ def assert_metrics(self, metrics):
         self.assertLessEqual(
             float(metrics["mean_e2e_latency"]),
             self.mean_e2e_latency * E2E_TOLERANCE,
+        )
+    # Once an accept_rate baseline is set, a missing "Accept length" line
+    # (e.g. server_info request failed or spec decoding inactive) or a
+    # missing --speculative-num-draft-tokens arg must fail the test
+    # instead of being silently skipped.
+    if getattr(self, "accept_rate", None):
+        self.assertIsNotNone(
+            metrics.get("accept_length"),
+            "accept_length not found in bench_serving output "
+            "while accept_rate baseline is set",
+        )
+        self.assertIsNotNone(
+            spec_num_draft_tokens,
+            "--speculative-num-draft-tokens not found in other_args "
+            "while accept_rate baseline is set",
+        )
+        self.assertGreaterEqual(
+            float(metrics["accept_length"]) / spec_num_draft_tokens,
+            self.accept_rate,
         )
 
 
@@ -971,6 +1036,9 @@ class TestNpuPerformanceTestCaseBase(CustomTestCase):
     tpot = None
     mean_e2e_latency = None
     output_token_throughput = None
+    # Baseline for accept_length / speculative-num-draft-tokens; None disables
+    # the assertion.
+    accept_rate = None
 
     dp = None
     generation_kwargs = None

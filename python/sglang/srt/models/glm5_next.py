@@ -1,4 +1,5 @@
 import logging
+from array import array
 from contextlib import nullcontext
 from functools import partial
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
@@ -16,7 +17,6 @@ from sglang.srt.batch_overlap.two_batch_overlap import (
 )
 from sglang.srt.configs.glm5_next import Glm5NextConfig, Glm5NextTextConfig
 from sglang.srt.configs.model_config import is_deepseek_dsa
-from sglang.srt.distributed.parallel_state import get_pp_group
 from sglang.srt.distributed.utils import divide
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import (
@@ -36,6 +36,7 @@ from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     ColumnParallelBatchedLinear,
     ColumnParallelLinear,
+    LinearBase,
     MergedColumnParallelLinear,
     MergedColumnParallelRepeatedLinear,
     QKVParallelLinear,
@@ -49,6 +50,7 @@ from sglang.srt.layers.moe.utils import (
     is_shared_experts_fusion_disabled,
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.utils.common import PPMissingLayer
@@ -75,6 +77,10 @@ from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     sharded_weight_loader,
 )
+from sglang.srt.models.deepseek_common.amd.deepseek_v4_fused_mhc import (
+    apply_mhc_post_pre_boundary,
+    is_cross_layer_mhc_fusion_enabled,
+)
 from sglang.srt.models.deepseek_common.deepseek_weight_loader import (
     DeepseekV2WeightLoaderMixin,
 )
@@ -99,7 +105,13 @@ from sglang.srt.multimodal.mm_utils import (
     run_dp_presharded_mrope_vision_model,
     run_dp_sharded_mrope_vision_model,
 )
-from sglang.srt.runtime_context import get_forward, get_mm, get_parallel, get_spec
+from sglang.srt.runtime_context import (
+    get_forward,
+    get_lora,
+    get_mm,
+    get_parallel,
+    get_spec,
+)
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils.common import (
     BumpAllocator,
@@ -116,6 +128,15 @@ if _use_aiter_gfx95:
     )
 
 logger = logging.getLogger(__name__)
+
+# Matches DeepSeek-V4's _MHC_POST_MULT_VALUE; the fused and unfused boundaries
+# must agree on it.
+_MHC_POST_MULT_VALUE = 2.0
+
+# Conservative cap, not the crossover: at GLM-5.3-Flash's hc_mult=4 and
+# hidden_size=4096 the fusion wins to 16 tokens and reaches parity at 24, with
+# 17-23 unmeasured. Past it the pre-norm GEMM drops mhc_pre's split-K kernel.
+_MHC_FUSED_BOUNDARY_MAX_TOKENS = 16
 
 
 @torch.compile
@@ -304,6 +325,55 @@ class Glm5NextVisionModel(GlmOcrVisionModel):
 
 
 class Glm5NextLinearAttention(nn.Module):
+    _PACKED_MODULES_MAPPING = {
+        "fused_qkvbfg_a_proj": [
+            "q_proj",
+            "k_proj",
+            "v_proj",
+            "b_proj",
+            "f_a_proj",
+            "g_a_proj",
+        ],
+        "fused_bfg_a_proj": ["b_proj", "f_a_proj", "g_a_proj"],
+        "fused_fg_b_proj": ["f_b_proj", "g_b_proj"],
+    }
+
+    @classmethod
+    def _can_fuse_proj(
+        cls,
+        quant_config: Optional[QuantizationConfig],
+        prefix: str,
+        *fused_projs: str,
+    ) -> bool:
+        if get_lora().enable_lora or get_lora().lora_paths:
+            return False
+        if quant_config is None:
+            return True
+        if quant_config.get_name() not in {
+            "fp8",
+            "mxfp8",
+            "modelopt_fp8",
+            "modelopt_fp4",
+            "modelopt_mixed",
+        }:
+            return False
+
+        probe = LinearBase(1, 1)
+        source_projs = [
+            proj
+            for fused_proj in fused_projs
+            for proj in cls._PACKED_MODULES_MAPPING[fused_proj]
+        ]
+        if "fused_qkvbfg_a_proj" in fused_projs:
+            source_projs.append("qkv_proj")
+        return all(
+            isinstance(
+                quant_config.get_quant_method(probe, prefix=f"{prefix}.{proj}"),
+                UnquantizedLinearMethod,
+            )
+            for proj in source_projs
+        )
+
     def __init__(
         self,
         layer_idx: int,
@@ -337,7 +407,12 @@ class Glm5NextLinearAttention(nn.Module):
         projection_size = self.head_dim * self.num_heads
         self.conv_size = config.linear_attn_config["short_conv_kernel_size"]
 
-        self.do_fuse_qkvbfg = quant_config is None and head_shard_size == self.tp_size
+        self.do_fuse_qkvbfg = self._can_fuse_proj(
+            quant_config, prefix, "fused_qkvbfg_a_proj", "fused_fg_b_proj"
+        )
+        self.fuse_bfg = not self.do_fuse_qkvbfg and self._can_fuse_proj(
+            quant_config, prefix, "fused_bfg_a_proj", "fused_fg_b_proj"
+        )
         if self.do_fuse_qkvbfg:
             self.qkvb_sizes = [
                 projection_size,
@@ -351,21 +426,23 @@ class Glm5NextLinearAttention(nn.Module):
                 self.hidden_size,
                 self.qkvb_sizes,
                 self.fg_sizes,
-                quant_config=quant_config,
+                quant_config=None,
                 prefix=f"{prefix}.fused_qkvbfg_a_proj",
+                tp_rank=head_shard_rank,
+                tp_size=head_shard_size,
             )
             self.split_sizes = [
                 3 * projection_size // head_shard_size,
                 self.num_heads // head_shard_size,
                 2 * self.head_dim,
             ]
-            fused_dtype = (
-                getattr(config, "dtype", None)
-                or getattr(config, "torch_dtype", None)
-                or torch.get_default_dtype()
-            )
             self.fused_fg_b_proj = ColumnParallelBatchedLinear(
-                2, self.head_dim, projection_size, dtype=fused_dtype
+                2,
+                self.head_dim,
+                projection_size,
+                dtype=self.fused_qkvbfg_a_proj.params_dtype,
+                tp_rank=head_shard_rank,
+                tp_size=head_shard_size,
             )
         else:
             self.qkv_proj = QKVParallelLinear(
@@ -380,50 +457,70 @@ class Glm5NextLinearAttention(nn.Module):
                 prefix=f"{prefix}.qkv_proj",
             )
 
-            self.f_a_proj = ReplicatedLinear(
-                self.hidden_size,
-                self.head_dim,
-                bias=False,
-                quant_config=quant_config,
-                prefix=f"{prefix}.f_a_proj",
-            )
+            if self.fuse_bfg:
+                self.fused_bfg_a_proj = MergedColumnParallelRepeatedLinear(
+                    self.hidden_size,
+                    [self.num_heads],
+                    [self.head_dim, self.head_dim],
+                    quant_config=None,
+                    prefix=f"{prefix}.fused_bfg_a_proj",
+                    tp_rank=head_shard_rank,
+                    tp_size=head_shard_size,
+                )
+                self.bfg_split_sizes = [self.local_num_heads, 2 * self.head_dim]
+                self.fused_fg_b_proj = ColumnParallelBatchedLinear(
+                    2,
+                    self.head_dim,
+                    projection_size,
+                    dtype=self.fused_bfg_a_proj.params_dtype,
+                    tp_rank=head_shard_rank,
+                    tp_size=head_shard_size,
+                )
+            else:
+                self.f_a_proj = ReplicatedLinear(
+                    self.hidden_size,
+                    self.head_dim,
+                    bias=False,
+                    quant_config=quant_config,
+                    prefix=f"{prefix}.f_a_proj",
+                )
 
-            self.f_b_proj = ColumnParallelLinear(
-                self.head_dim,
-                projection_size,
-                bias=False,
-                quant_config=quant_config,
-                prefix=f"{prefix}.f_b_proj",
-                tp_rank=head_shard_rank,
-                tp_size=head_shard_size,
-            )
+                self.f_b_proj = ColumnParallelLinear(
+                    self.head_dim,
+                    projection_size,
+                    bias=False,
+                    quant_config=quant_config,
+                    prefix=f"{prefix}.f_b_proj",
+                    tp_rank=head_shard_rank,
+                    tp_size=head_shard_size,
+                )
 
-            self.b_proj = ColumnParallelLinear(
-                self.hidden_size,
-                self.num_heads,
-                bias=False,
-                quant_config=quant_config,
-                prefix=f"{prefix}.b_proj",
-                tp_rank=head_shard_rank,
-                tp_size=head_shard_size,
-            )
+                self.b_proj = ColumnParallelLinear(
+                    self.hidden_size,
+                    self.num_heads,
+                    bias=False,
+                    quant_config=quant_config,
+                    prefix=f"{prefix}.b_proj",
+                    tp_rank=head_shard_rank,
+                    tp_size=head_shard_size,
+                )
 
-            self.g_a_proj = ReplicatedLinear(
-                self.hidden_size,
-                self.head_dim,
-                bias=False,
-                quant_config=quant_config,
-                prefix=f"{prefix}.g_a_proj",
-            )
-            self.g_b_proj = ColumnParallelLinear(
-                self.head_dim,
-                projection_size,
-                bias=False,
-                quant_config=quant_config,
-                prefix=f"{prefix}.g_b_proj",
-                tp_rank=head_shard_rank,
-                tp_size=head_shard_size,
-            )
+                self.g_a_proj = ReplicatedLinear(
+                    self.hidden_size,
+                    self.head_dim,
+                    bias=False,
+                    quant_config=quant_config,
+                    prefix=f"{prefix}.g_a_proj",
+                )
+                self.g_b_proj = ColumnParallelLinear(
+                    self.head_dim,
+                    projection_size,
+                    bias=False,
+                    quant_config=quant_config,
+                    prefix=f"{prefix}.g_b_proj",
+                    tp_rank=head_shard_rank,
+                    tp_size=head_shard_size,
+                )
 
         self.dt_bias = nn.Parameter(
             torch.empty(divide(projection_size, head_shard_size), dtype=torch.float32)
@@ -491,9 +588,16 @@ class Glm5NextLinearAttention(nn.Module):
     def forward_qkvbfg(self, hidden_states: torch.Tensor, forward_batch: ForwardBatch):
         qkv, _ = self.qkv_proj(hidden_states)
 
-        beta = self.b_proj(hidden_states)[0]
-        forget_gate = self.f_b_proj(self.f_a_proj(hidden_states)[0])[0]
-        g_proj_states = self.g_b_proj(self.g_a_proj(hidden_states)[0])[0]
+        if self.fuse_bfg:
+            fused_states = self.fused_bfg_a_proj(hidden_states)
+            beta, fg_a_states = torch.split(fused_states, self.bfg_split_sizes, dim=-1)
+            forget_gate, g_proj_states = self.fused_fg_b_proj(
+                fg_a_states.view(-1, 2, self.head_dim).transpose(0, 1)
+            )
+        else:
+            beta = self.b_proj(hidden_states)[0]
+            forget_gate = self.f_b_proj(self.f_a_proj(hidden_states)[0])[0]
+            g_proj_states = self.g_b_proj(self.g_a_proj(hidden_states)[0])[0]
 
         return (
             qkv,
@@ -698,6 +802,13 @@ class Glm5NextDecoderLayer(nn.Module):
                 hc_attn_pre=self.hc_attn_pre,
                 hc_ffn_pre=self.hc_ffn_pre,
                 hc_post=self.hc_post,
+                # Resolved once: env and platform are frozen after startup,
+                # and None keeps the dispatch off the per-boundary path.
+                hc_ffn_post_pre=(
+                    self.hc_ffn_post_pre
+                    if is_cross_layer_mhc_fusion_enabled()
+                    else None
+                ),
             )
             self.layer_communicator = MHCLayerCommunicator(
                 **shared_kwargs,
@@ -718,7 +829,7 @@ class Glm5NextDecoderLayer(nn.Module):
             rms_eps=self.config.rms_norm_eps,
             hc_eps=self.config.hc_eps,
             sinkhorn_iters=self.config.hc_sinkhorn_iters,
-            post_mult_value=2.0,
+            post_mult_value=_MHC_POST_MULT_VALUE,
             hc_norm_weight=None,
             out_norm_weight=out_norm_weight,
             out_norm_eps=out_norm_eps,
@@ -742,6 +853,46 @@ class Glm5NextDecoderLayer(nn.Module):
             hidden_states,
             out_norm_weight,
             out_norm_eps,
+        )
+
+    def hc_ffn_post_pre(
+        self, hidden_states, residual, h_res, h_post, out_norm_weight, out_norm_eps
+    ):
+        # Fuses hc_post into the pre-norm GEMM; the mhc_pre big-fuse stage
+        # still launches separately, so this is two launches instead of three.
+        assert self.config.mhc, "hc_ffn_post_pre is only valid when config.mhc=True"
+        num_tokens, hidden_size = hidden_states.shape
+        if num_tokens > _MHC_FUSED_BOUNDARY_MAX_TOKENS:
+            return None
+        hc_mult = self.config.hc_mult
+        fused = apply_mhc_post_pre_boundary(
+            layer_input=hidden_states,
+            residual=residual.view(num_tokens, hc_mult, hidden_size),
+            post=h_post.view(num_tokens, hc_mult),
+            comb=h_res.view(num_tokens, hc_mult, hc_mult),
+            hc_fn=self.hc_ffn_fn,
+            hc_scale=self.hc_ffn_scale,
+            hc_base=self.hc_ffn_base,
+            hc_mult=hc_mult,
+            rms_eps=self.config.rms_norm_eps,
+            hc_eps=self.config.hc_eps,
+            hc_post_mult=_MHC_POST_MULT_VALUE,
+            sinkhorn_iters=self.config.hc_sinkhorn_iters,
+            norm_weight=out_norm_weight,
+            norm_eps=out_norm_eps,
+            # Matches DeepSeek-V4's two hc_ffn_fn boundaries; the Triton tier's
+            # parameter is hc_fn_t and this fn has the same [mix_hc, hc_dim] layout.
+            fn_transpose=True,
+        )
+        if fused is None:
+            return None
+        next_residual, layer_input, post, comb, norm_fused = fused
+        return (
+            layer_input,
+            next_residual.reshape(num_tokens, -1),
+            comb.reshape(num_tokens, hc_mult * hc_mult),
+            post.reshape(num_tokens, hc_mult),
+            norm_fused,
         )
 
     def hc_post(self, hidden_states, residual, h_res, h_post):
@@ -861,7 +1012,7 @@ class Glm5NextModel(nn.Module):
         self.padding_id = config.pad_token_id
         self.vocab_size = config.vocab_size
         self.first_k_dense_replace = config.first_k_dense_replace
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
 
         if self.pp_group.is_first_rank:
             self.embed_tokens = VocabParallelEmbedding(
@@ -943,7 +1094,11 @@ class Glm5NextModel(nn.Module):
             )
         self.layers_to_capture = []
         self.dflash_capture = False
-        if get_moe_a2a_backend().is_deepep() or get_moe_a2a_backend().is_mooncake():
+        if (
+            get_moe_a2a_backend().is_deepep()
+            or get_moe_a2a_backend().is_mooncake()
+            or get_moe_a2a_backend().is_deepep_v2()
+        ):
             self.enable_a2a_moe = True
         else:
             self.enable_a2a_moe = False
@@ -981,7 +1136,8 @@ class Glm5NextModel(nn.Module):
         else:
             assert pp_proxy_tensors is not None
             hidden_states = pp_proxy_tensors["hidden_states"]
-            residual = pp_proxy_tensors["residual"]
+            # mHC carries its residual streams in hidden_states across PP stages.
+            residual = None if self.config.mhc else pp_proxy_tensors["residual"]
         device = hidden_states.device
         zero_allocator = BumpAllocator(
             buffer_size=total_num_layers * 2 * (2 if forward_batch.can_run_tbo else 1),
@@ -1059,6 +1215,8 @@ class Glm5NextModel(nn.Module):
             )
 
         if not self.pp_group.is_last_rank:
+            if self.config.mhc:
+                return PPProxyTensors({"hidden_states": hidden_states})
             return PPProxyTensors(
                 {
                     "hidden_states": hidden_states,
@@ -1080,22 +1238,16 @@ class Glm5NextModel(nn.Module):
 class Glm5NextForConditionalGeneration(nn.Module):
     hf_to_sglang_mapper = WeightsMapper(
         orig_to_new_substr={
-            "model.language_model.": "model.",
             "model.visual": "visual",
-        }
+        },
+        orig_to_new_prefix={
+            "model.language_model.": "model.",
+        },
+        orig_to_new_suffix={".attn.qkv": ".attn.qkv_proj"},
     )
-
     packed_modules_mapping = {
         "fused_qkv_a_proj_with_mqa": ["q_a_proj", "kv_a_proj_with_mqa"],
-        "fused_qkvbfg_a_proj": [
-            "q_proj",
-            "k_proj",
-            "v_proj",
-            "b_proj",
-            "f_a_proj",
-            "g_a_proj",
-        ],
-        "fused_fg_b_proj": ["f_b_proj", "g_b_proj"],
+        **Glm5NextLinearAttention._PACKED_MODULES_MAPPING,
         "qkv_proj": ["q_proj", "k_proj", "v_proj"],
         "qkv_conv1d": ["q_conv1d", "k_conv1d", "v_conv1d"],
         "gate_up_proj": ["gate_proj", "up_proj"],
@@ -1120,7 +1272,7 @@ class Glm5NextForConditionalGeneration(nn.Module):
             and getattr(text_config, "q_lora_rank", None) is not None
         )
 
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
         self.config = text_config
         self.tp_size = get_parallel().tp_size
         self.quant_config = quant_config
@@ -1272,7 +1424,7 @@ class Glm5NextForConditionalGeneration(nn.Module):
         # Capturing before layer k + 1 gives the completed output of layer k.
         self.model.layers_to_capture = [val + 1 for val in layer_ids]
 
-    def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
+    def pad_input_ids(self, input_ids: array, mm_inputs: MultimodalInputs) -> array:
         pattern = MultiModalityDataPaddingPatternMultimodalTokens()
         return pattern.pad_input_tokens(input_ids, mm_inputs)
 
@@ -1389,6 +1541,9 @@ class Glm5NextForConditionalGeneration(nn.Module):
             (".fused_qkvbfg_a_proj", ".g_a_proj", 5),
             (".fused_fg_b_proj", ".f_b_proj", 0),
             (".fused_fg_b_proj", ".g_b_proj", 1),
+            (".fused_bfg_a_proj", ".b_proj", 0),
+            (".fused_bfg_a_proj", ".f_a_proj", 1),
+            (".fused_bfg_a_proj", ".g_a_proj", 2),
             (".qkv_proj", ".q_proj", "q"),
             (".qkv_proj", ".k_proj", "k"),
             (".qkv_proj", ".v_proj", "v"),
@@ -1422,6 +1577,14 @@ class Glm5NextForConditionalGeneration(nn.Module):
             fused_cat_dim = 0
 
         params_dict = dict(self.named_parameters())
+
+        def maybe_map_fp8_block_scale_name(name: str) -> str:
+            if name.endswith("weight_scale"):
+                candidate = name.removesuffix("weight_scale") + "weight_scale_inv"
+                if candidate in params_dict:
+                    return candidate
+            return name
+
         weight_names = []
         for name, loaded_weight in weights:
             is_visual_weight = "visual" in name
@@ -1485,10 +1648,12 @@ class Glm5NextForConditionalGeneration(nn.Module):
                 if "mlp.experts" in name:
                     continue
                 candidate = name.replace(weight_name, param_name)
+                candidate = maybe_map_fp8_block_scale_name(candidate)
                 if (
                     param_name
                     in {
                         ".fused_qkvbfg_a_proj",
+                        ".fused_bfg_a_proj",
                         ".fused_fg_b_proj",
                         ".qkv_proj",
                         ".qkv_conv1d",
@@ -1513,6 +1678,7 @@ class Glm5NextForConditionalGeneration(nn.Module):
                         continue
                     is_expert_weight = True
                     name = name.replace(weight_name, param_name)
+                    name = maybe_map_fp8_block_scale_name(name)
                     if name not in params_dict:
                         continue
                     param = params_dict[name]
@@ -1564,6 +1730,7 @@ class Glm5NextForConditionalGeneration(nn.Module):
                                     "fused_qkv_a_proj_with_mqa",
                                 )
                             )
+                            target = maybe_map_fp8_block_scale_name(target)
                             if target in params_dict:
                                 param = params_dict[target]
                                 weight_loader = getattr(
@@ -1574,6 +1741,7 @@ class Glm5NextForConditionalGeneration(nn.Module):
                             cached_a_proj.pop(kv_a_proj_name, None)
                         continue
 
+                    name = maybe_map_fp8_block_scale_name(name)
                     if name not in params_dict:
                         continue
 

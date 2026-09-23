@@ -1,11 +1,10 @@
 import unittest
 
-from sglang.srt.environ import envs
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kits.eval_accuracy_kit import GSM8KMixin
 from sglang.test.server_fixtures.mmmu_fixture import MMMUServerBase
 
-register_cuda_ci(est_time=317, stage="base-c", runner_config="8-gpu-h200")
+register_cuda_ci(est_time=317, stage="extra-b", runner_config="8-gpu-h200")
 
 MIMO_V2_MODEL = "XiaomiMiMo/MiMo-V2.5"
 MIMO_V2_OTHER_ARGS = [
@@ -49,11 +48,6 @@ class TestMiMoV2(GSM8KMixin, MMMUServerBase):
     mem_fraction_static = 0.65
     server_api_key = None
     other_args = MIMO_V2_MTP_OTHER_ARGS
-
-    @classmethod
-    def setUpClass(cls):
-        with envs.SGLANG_ENABLE_UNIFIED_RADIX_TREE.override(True):
-            super().setUpClass()
 
 
 if __name__ == "__main__":
