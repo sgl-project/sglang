@@ -2584,6 +2584,28 @@ class TestOffloadDefaults(unittest.TestCase):
 
         self.assertFalse(args.use_fsdp_inference)
 
+    def test_auto_probe_tolerates_xpu_invalid_device_value_error(self):
+        with self.assertLogs(
+            "sglang.multimodal_gen.runtime.server_args.auto_tune", level="WARNING"
+        ) as captured:
+            args = self._from_dict_with_pipeline_config(
+                ZImagePipelineConfig(),
+                available_memory_gb={
+                    0: 80,
+                    1: ValueError("Invalid XPU device_id=1. num_gpus=1"),
+                },
+                kwargs={
+                    "model_path": "Tongyi-MAI/Z-Image",
+                    "num_gpus": 2,
+                    "performance_mode": "auto",
+                },
+            )
+
+        self.assertFalse(args.use_fsdp_inference)
+        self.assertTrue(
+            any("Unable to inspect available memory" in msg for msg in captured.output)
+        )
+
     def test_auto_probe_only_checks_local_devices_on_each_node(self):
         args = self._from_dict_with_pipeline_config(
             QwenImagePipelineConfig(),

@@ -774,7 +774,7 @@ class ServerArgsAutoTuner:
                 )
                 for device_id in device_ids
             )
-        except (AssertionError, IndexError, RuntimeError) as exc:
+        except (AssertionError, IndexError, RuntimeError, ValueError) as exc:
             # This probe only selects automatic residency/offload defaults.  A
             # parent process can have a stale or narrower visible-device map
             # than the workers (for example under an external launcher), so a

@@ -146,12 +146,8 @@ def launch_server(server_args: ServerArgs, launch_http_server: bool = True):
         configure_metrics()
     logger.info("Starting server...")
 
-    # num_gpus is the total world size across every node; each node runs
-    # its own num_gpus // nnodes local workers, offset by node_rank into the
-    # global rank space (mirrors srt's tp_size_per_node convention). With
-    # nnodes == 1 this is exactly the prior single-node arithmetic.
-    num_gpus = server_args.num_gpus
-    nnodes = server_args.nnodes
+    # get_local_gpu_ids resolves the node-local logical devices from the global
+    # world size. Offset them by node_rank to obtain their global ranks.
     node_rank = server_args.node_rank
     local_gpu_ids = server_args.get_local_gpu_ids()
     local_num_gpus = len(local_gpu_ids)
