@@ -163,8 +163,7 @@ def resolve_layer_indices(
         is_draft_worker
         and draft_model_idx is not None
         and model_config.is_hybrid_swa
-        and getattr(model_config.hf_text_config, "mtp_local_layer_ids", None)
-        is not None
+        and getattr(model, "mtp_layer_id_is_depth", False)
     )
     owned_layers = (
         range(draft_model_idx, draft_model_idx + 1)
@@ -193,13 +192,11 @@ def _resolve_local_hybrid_swa_layer_ids(
     owned_layers: range,
 ) -> tuple[Optional[list[int]], Optional[list[int]]]:
     # Read-only: multi-layer MTP draft runners share one ModelConfig instance.
-    swa_attention_layer_ids = getattr(model_config, "swa_attention_layer_ids", None)
-    full_attention_layer_ids = getattr(model_config, "full_attention_layer_ids", None)
-    if swa_attention_layer_ids is None or full_attention_layer_ids is None:
+    if model_config.swa_attention_layer_ids is None:
         return None, None
     return (
-        [i for i in swa_attention_layer_ids if i in owned_layers],
-        [i for i in full_attention_layer_ids if i in owned_layers],
+        [i for i in model_config.swa_attention_layer_ids if i in owned_layers],
+        [i for i in model_config.full_attention_layer_ids if i in owned_layers],
     )
 
 

@@ -180,8 +180,8 @@ def _make_model_runner(
         start_layer=0,
         end_layer=num_layers,
         num_effective_layers=num_layers,
-        swa_attention_layer_ids=mc.swa_attention_layer_ids,
-        full_attention_layer_ids=mc.full_attention_layer_ids,
+        swa_attention_layer_ids=list(mc.swa_attention_layer_ids),
+        full_attention_layer_ids=list(mc.full_attention_layer_ids),
         is_hybrid_swa_mtp_draft=False,
     )
     mr.attn_dp_size = 1

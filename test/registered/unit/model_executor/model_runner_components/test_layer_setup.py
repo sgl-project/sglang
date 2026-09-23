@@ -55,10 +55,9 @@ GLOBAL_FULL_IDS = list(range(1, NUM_LAYERS, 2))
 GLOBAL_SWA_IDS = list(range(0, NUM_LAYERS, 2))
 
 
-def _hybrid_swa_model_config(*, architecture="Hybrid", mtp_local_layer_ids=None):
+def _hybrid_swa_model_config(*, architecture="Hybrid"):
     return SimpleNamespace(
         hf_config=SimpleNamespace(architectures=[architecture]),
-        hf_text_config=SimpleNamespace(mtp_local_layer_ids=mtp_local_layer_ids),
         num_hidden_layers=NUM_LAYERS,
         num_attention_layers=NUM_LAYERS,
         num_nextn_predict_layers=None,
@@ -112,8 +111,7 @@ class TestResolveHybridSWALayerIds(unittest.TestCase):
     def test_multi_layer_mtp_draft_owns_its_depth(self):
         """Each MTP draft runner owns the depth it serves, not layer 0."""
         model_config = _hybrid_swa_model_config(
-            architecture="InklingForConditionalGenerationMTP",
-            mtp_local_layer_ids=[0, 2],
+            architecture="InklingForConditionalGenerationMTP"
         )
         model_config.swa_attention_layer_ids = [0, 2]
         model_config.full_attention_layer_ids = [1]
@@ -122,7 +120,7 @@ class TestResolveHybridSWALayerIds(unittest.TestCase):
         for depth, swa, full in ((0, [0], []), (1, [], [1]), (2, [2], [])):
             with self.subTest(depth=depth):
                 layer_info = resolve_layer_indices(
-                    model=SimpleNamespace(),
+                    model=SimpleNamespace(mtp_layer_id_is_depth=True),
                     model_config=model_config,
                     is_draft_worker=True,
                     draft_model_idx=depth,
@@ -133,7 +131,7 @@ class TestResolveHybridSWALayerIds(unittest.TestCase):
                 self.assertEqual(layer_info.full_attention_layer_ids, full)
 
     def test_single_block_mtp_draft_keeps_layer_range_view(self):
-        """Without mtp_local_layer_ids a draft runner is an ordinary [0, 1) slice."""
+        """A draft whose block is always layer 0 is an ordinary [0, 1) slice."""
         model_config = _hybrid_swa_model_config(architecture="MiMoV2MTP")
         model_config.swa_attention_layer_ids = [0]
         model_config.full_attention_layer_ids = []
@@ -152,8 +150,8 @@ class TestResolveHybridSWALayerIds(unittest.TestCase):
     def test_non_hybrid_model_has_no_split(self):
         model_config = _hybrid_swa_model_config()
         model_config.is_hybrid_swa = False
-        del model_config.swa_attention_layer_ids
-        del model_config.full_attention_layer_ids
+        model_config.swa_attention_layer_ids = None
+        model_config.full_attention_layer_ids = None
 
         layer_info = resolve_layer_indices(
             model=SimpleNamespace(),
