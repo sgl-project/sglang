@@ -4350,7 +4350,6 @@ class DeepseekV4AttnBackend(
                 capacity=self.token_to_kv_pool.request_window.capacity,
                 floor=swa_replay_start,
                 num_groups=num_groups,
-                direct=not is_prefill,
             )
             swa_page_indices = _pad_last_dim(request_layout.indices)
             swa_topk_lengths = request_layout.lengths
