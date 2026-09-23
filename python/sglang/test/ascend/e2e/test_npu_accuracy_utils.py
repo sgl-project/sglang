@@ -120,13 +120,14 @@ def run_evalscope(
     eval_type="openai_api",
     judge_model_args=None,
     api_key=None,
+    api_url_path="/v1/chat/completions",
 ):
 
     metrics_path = os.getenv("METRICS_DATA_FILE")
     result_path = "./evalscope_result" if not metrics_path else metrics_path
     logger.info(f"The metrics result file: {result_path}")
 
-    api_url = f"http://{host}:{port}/v1/chat/completions"
+    api_url = f"http://{host}:{port}{api_url_path}"
 
     if generation_config is None:
         generation_config = {"max_tokens": 512}
@@ -326,6 +327,7 @@ class TestNpuAccuracyTestCaseBase(CustomTestCase):
     test_type = "accuracy"
     judge_model_args = None
     api_key = None
+    eval_api_url_path = "/v1/chat/completions"
 
     @classmethod
     def _get_tc_name(cls):
@@ -511,6 +513,7 @@ class TestNpuAccuracyTestCaseBase(CustomTestCase):
                     eval_type=self.eval_type,
                     judge_model_args=getattr(self, "judge_model_args", None),
                     api_key=getattr(self, "api_key", None),
+                    api_url_path=getattr(self, "eval_api_url_path", "/v1/chat/completions"),
                 )
                 if best_metrics is None or float(metrics.get("accuracy", 0)) > float(
                     best_metrics.get("accuracy", 0)
@@ -546,6 +549,7 @@ class TestNpuAccuracyMultiNodePdMixTestCaseBase(CustomTestCase):
     accuracy = 0.1
     judge_model_args = None
     api_key = None
+    eval_api_url_path = "/v1/chat/completions"
 
     @classmethod
     def setUpClass(cls):
@@ -651,6 +655,7 @@ class TestNpuAccuracyMultiNodePdSepTestCaseBase(CustomTestCase):
     accuracy = 0.1
     judge_model_args = None
     api_key = None
+    eval_api_url_path = "/v1/chat/completions"
 
     @classmethod
     def setUpClass(cls):
@@ -738,6 +743,7 @@ class TestNpuAccuracyMultiNodePdSepTestCaseBase(CustomTestCase):
                     eval_type=self.eval_type,
                     judge_model_args=getattr(self, "judge_model_args", None),
                     api_key=getattr(self, "api_key", None),
+                    api_url_path=getattr(self, "eval_api_url_path", "/v1/chat/completions"),
                 )
                 if best_metrics is None or float(metrics.get("accuracy", 0)) > float(
                     best_metrics.get("accuracy", 0)

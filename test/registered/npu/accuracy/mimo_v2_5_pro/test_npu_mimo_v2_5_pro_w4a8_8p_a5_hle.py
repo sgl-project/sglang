@@ -91,6 +91,7 @@ class TestNPUMiMoV2_5_Pro_W4A8_8P_A5_HLE(TestNpuAccuracyTestCaseBase):
     accuracy = 0.33
     datasets = ["hle"]
     api_key = "EMPTY"
+    eval_api_url_path = "/v1"
     dataset_args = {
         "hle": {
             "local_path": HLE_DATASET_PATH,
