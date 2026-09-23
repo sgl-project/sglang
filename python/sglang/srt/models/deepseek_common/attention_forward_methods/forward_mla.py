@@ -17,6 +17,7 @@ from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.attention.dsa.utils import is_graph_dsa_split_op_surface
 from sglang.srt.layers.attention.dsa_backend import prepare_kv_for_attention
 from sglang.srt.layers.communicator import get_attn_tp_context
+from sglang.srt.layers.cp.utils import is_cp_active
 from sglang.srt.layers.dcp import (
     all_gather_kv_cache_for_mla_extend,
     all_gather_q_for_mla_decode,
@@ -556,6 +557,13 @@ class DeepseekMLAForwardMixin:
                             if _is_cublas_ge_129
                             else zero_allocator.allocate(1)
                         ),
+                        # CP has its own token layout; the global prefix bound
+                        # applies to the replicated attention axis (including SP).
+                        num_valid_tokens=(
+                            None
+                            if is_cp_active(forward_batch)
+                            else forward_batch.global_num_token_non_padded
+                        ),
                     )
                     q_nope_out = bmm_fp8(
                         q_nope_val,
@@ -866,6 +874,11 @@ class DeepseekMLAForwardMixin:
                         )
                         if _is_cublas_ge_129
                         else zero_allocator.allocate(1)
+                    ),
+                    num_valid_tokens=(
+                        None
+                        if is_cp_active(forward_batch)
+                        else forward_batch.global_num_token_non_padded
                     ),
                 )
                 attn_bmm_output = bmm_fp8(
