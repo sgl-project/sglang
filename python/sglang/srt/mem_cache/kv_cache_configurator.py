@@ -2228,10 +2228,11 @@ class KVCacheConfigurator:
         # measured against an understated free-memory figure and the pool can be
         # sized orders of magnitude too small while GPU memory sits idle.
         gc.collect()
+        solo_join = get_exec().moe.is_ep_offset_joiner  # No WORLD peers to poll.
         available_gpu_memory = get_available_gpu_memory(
             self.device,
             self.gpu_id,
-            distributed=get_parallel().launch_world_size > 1,
+            distributed=not solo_join and get_parallel().launch_world_size > 1,
             cpu_group=get_parallel().world_group.cpu_group,
         )
 
