@@ -890,7 +890,6 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         """Read token-level MLA KV rows from the physical NPU paged layout."""
         layer_id = layer.layer_id
         dst_dtype = dst_dtype or self.dtype
-        loc = loc.to(dtype=torch.long)
         cache_k = self.get_key_buffer(layer_id).view(-1, 1, self.kv_lora_rank)
         cache_v = self.get_value_buffer(layer_id).view(-1, 1, self.qk_rope_head_dim)
         cache_k = torch.index_select(cache_k, 0, loc)

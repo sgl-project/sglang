@@ -191,6 +191,48 @@ class TestNpuMlaDcpWrite(unittest.TestCase):
                                 torch.testing.assert_close(call.args[2], values)
 
 
+class TestNpuMlaDcpRead(unittest.TestCase):
+    def test_read_preserves_index_dtype_and_output_dtype(self):
+        from sglang.srt.hardware_backend.npu import memory_pool_npu
+
+        cache_k = torch.arange(32, dtype=torch.bfloat16).view(2, 4, 1, 4)
+        cache_v = torch.arange(16, dtype=torch.bfloat16).view(2, 4, 1, 2)
+        pool = SimpleNamespace(
+            dtype=torch.bfloat16,
+            kv_lora_rank=4,
+            qk_rope_head_dim=2,
+            get_key_buffer=MagicMock(return_value=cache_k),
+            get_value_buffer=MagicMock(return_value=cache_v),
+        )
+        for index_dtype in (torch.int32, torch.int64):
+            for loc in (
+                torch.empty(0, dtype=index_dtype),
+                torch.tensor([7, 0, 1, 2, 7, 3], dtype=index_dtype)[::2],
+            ):
+                for dst_dtype in (None, torch.float32):
+                    with (
+                        self.subTest(
+                            index_dtype=index_dtype, loc=loc, dst_dtype=dst_dtype
+                        ),
+                        patch.object(
+                            torch, "index_select", wraps=torch.index_select
+                        ) as select,
+                    ):
+                        result = memory_pool_npu.NPUMLATokenToKVPool.get_mla_kv_buffer(
+                            pool, SimpleNamespace(layer_id=3), loc, dst_dtype
+                        )
+                        self.assertEqual(select.call_count, 2)
+                        for call in select.call_args_list:
+                            self.assertIs(call.args[2], loc)
+                        for actual, cached in zip(result, (cache_k, cache_v)):
+                            expected = cached.flatten(0, 1)[loc.long()].to(
+                                dst_dtype or pool.dtype
+                            )
+                            torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+                        pool.get_key_buffer.assert_called_with(3)
+                        pool.get_value_buffer.assert_called_with(3)
+
+
 class TestNpuDcpMetadata(unittest.TestCase):
     def test_graph_mtp_mask_keeps_fixed_shape_for_padding_row(self):
         mask, local_lens = build_mla_dcp_mtp_mask(
