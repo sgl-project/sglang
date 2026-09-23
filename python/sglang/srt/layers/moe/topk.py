@@ -2527,7 +2527,7 @@ def select_experts(
                 renormalize=renormalize,
                 num_expert_group=num_expert_group,
                 topk_group=topk_group,
-                num_fused_shared_experts=num_fused_shared_experts,
+                num_fused_shared_experts=num_fused_shared_experts_for_gate,
                 routed_scaling_factor=routed_scaling_factor,
                 apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
                 scoring_func=scoring_func,
@@ -2541,7 +2541,7 @@ def select_experts(
                 renormalize=renormalize,
                 num_expert_group=num_expert_group,
                 topk_group=topk_group,
-                num_fused_shared_experts=num_fused_shared_experts,
+                num_fused_shared_experts=num_fused_shared_experts_for_gate,
                 routed_scaling_factor=routed_scaling_factor,
                 apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
             )
