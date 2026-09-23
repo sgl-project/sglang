@@ -91,7 +91,8 @@ class TestProvidedLatentsPreparation(unittest.TestCase):
 
         self.assertEqual(pipeline_config.pack_calls, 0)
         self.assertIsNone(result.latent_ids)
-        self.assertTrue(torch.equal(result.latents, packed))
+        # forward moves latents onto the execution device without changing values.
+        self.assertTrue(torch.equal(result.latents.cpu(), packed))
 
     def test_randn_and_provided_latents_agree_on_shapes(self):
         """Leave generated and unpacked provided latents in the same shape."""
