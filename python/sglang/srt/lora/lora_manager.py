@@ -1030,6 +1030,13 @@ class LoRAManager:
                     self.lm_head_module = lora_module
                     continue
 
+            # Let models exclude modules by full name (skip-only). Multimodal
+            # models use this to keep LoRA off their vision/audio towers, whose
+            # projections share suffixes such as `o_proj` with the language model.
+            should_apply_lora = getattr(self.base_model, "should_apply_lora", None)
+            if should_apply_lora is not None and not should_apply_lora(module_name):
+                continue
+
             # Handle DeepSeek MLA fused projection: set the boundary
             # between q_a and kv_a output partitions so the LoRA layer
             # can apply separate B projections for each.
