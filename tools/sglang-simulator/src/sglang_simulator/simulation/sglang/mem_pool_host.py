@@ -1,6 +1,8 @@
 from abc import ABC, abstractmethod
+from contextlib import contextmanager
 from enum import Enum
 from functools import lru_cache
+from types import SimpleNamespace
 
 import numpy as np
 import torch
@@ -104,11 +106,34 @@ def _install_meta_allocators() -> None:
 _SIMULATED_AVAILABLE_HOST_MEMORY_BYTES = 1 << 60
 
 
+@contextmanager
+def _simulated_host_memory_budget():
+    """Provide one host-memory override across old and current SGLang cores."""
+    try:
+        from sglang.srt.mem_cache.pool_host.base import host_memory_budget_scope
+    except ImportError:
+        # SGLang 0.5.17 performs the capacity check directly through psutil.
+        # The simulator allocates payload tensors on the meta device, so patch
+        # only that process-local query during construction and restore it even
+        # when the wrapped initializer fails.
+        import psutil
+
+        original_virtual_memory = psutil.virtual_memory
+        psutil.virtual_memory = lambda: SimpleNamespace(
+            available=_SIMULATED_AVAILABLE_HOST_MEMORY_BYTES
+        )
+        try:
+            yield
+        finally:
+            psutil.virtual_memory = original_virtual_memory
+    else:
+        with host_memory_budget_scope(_SIMULATED_AVAILABLE_HOST_MEMORY_BYTES):
+            yield
+
+
 def _call_with_meta_host_memory(original_init, self, *args, **kwargs):
     """Bypass physical host-payload checks while meta allocation is active."""
-    from sglang.srt.mem_cache.pool_host.base import host_memory_budget_scope
-
-    with host_memory_budget_scope(_SIMULATED_AVAILABLE_HOST_MEMORY_BYTES):
+    with _simulated_host_memory_budget():
         return original_init(self, *args, **kwargs)
 
 
