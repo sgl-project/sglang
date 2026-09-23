@@ -7,8 +7,9 @@ from contextlib import contextmanager, nullcontext
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
-from sglang.srt.entrypoints import engine, grpc_metadata
+from sglang.srt.entrypoints import engine
 from sglang.srt.runtime_context import get_context
+from sglang.srt.utils import common
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
@@ -66,7 +67,7 @@ class TestGrpcMetadata(unittest.TestCase):
                 get_context().override_server_args(**config),
                 patch("sglang.srt.rust_extensions.load_rust_extension") as load,
             ):
-                self.assertIsNone(grpc_metadata.start_follower_grpc_server(None, {}))
+                self.assertIsNone(common.start_follower_grpc_server(None, {}))
                 load.assert_not_called()
 
 
@@ -115,9 +116,7 @@ class TestFollowerGrpcLifecycle(unittest.TestCase):
             patch(
                 "sglang.srt.rust_extensions.load_rust_extension", return_value=native
             ),
-            patch.object(
-                grpc_metadata, "describe_kv_events_publisher", return_value=None
-            ),
+            patch.object(common, "describe_kv_events_publisher", return_value=None),
             patch.object(engine, "launch_dummy_health_check_server"),
             patch.object(engine, "kill_process_tree") as kill,
         ):

@@ -169,6 +169,7 @@ from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import (
     add_prometheus_middleware,
     add_prometheus_track_response_middleware,
+    build_server_info,
     delete_directory,
     get_bool_env_var,
     is_mps,
@@ -486,7 +487,6 @@ app.include_router(v1_loads_router)
 from sglang.srt.arg_groups.serving_hook import ssl_verify_of
 from sglang.srt.entrypoints.elastic_ep import router as elastic_ep_router
 from sglang.srt.runtime_context import (
-    describe_kv_events_publisher,
     get_disagg,
     get_exec,
     get_lora,
@@ -829,16 +829,10 @@ async def server_info():
 
     return msgspec_to_builtins(
         {
-            **server_args.resolved_dict(),
-            "launch_command": server_args.launch_command,
-            **_global_state.scheduler_info,
+            **build_server_info(server_args, _global_state.scheduler_info),
             "startup_time": _global_state.tokenizer_manager.startup_time,
             "internal_states": internal_states,
             "version": __version__,
-            # Structured KV-event publisher descriptor for KV-aware routers.
-            # `None` when publishing is disabled or misconfigured; see
-            # `runtime_context.describe_kv_events_publisher` for the contract.
-            "kv_events": describe_kv_events_publisher(server_args),
         }
     )
 

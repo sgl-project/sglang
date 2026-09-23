@@ -102,13 +102,16 @@ from sglang.srt.environ import envs
 from sglang.srt.observability.func_timer import enable_func_timer
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import (
+    describe_kv_events_publisher,
     get_exec,
     get_flags,
     get_model,
     get_parallel,
     get_platform,
+    get_serving,
     get_spec,
 )
+from sglang.srt.utils.msgspec_utils import msgspec_to_builtins
 from sglang.srt.utils.video_decoder import _BACKEND, VideoDecoderWrapper
 
 if TYPE_CHECKING:
@@ -3359,6 +3362,44 @@ def _configure_uvicorn_access_log_filter(
             loggers_cfg["uvicorn.access"]["filters"] = filters_list
         if filter_name not in filters_list:
             filters_list.append(filter_name)
+
+
+def build_server_info(server_args, scheduler_info: Dict[str, Any]) -> Dict[str, Any]:
+    """Build startup metadata shared by HTTP and native gRPC servers.
+
+    Scheduler readiness supplies ``kv_event_sources`` for actual node-local
+    publishers. The legacy ``kv_events`` descriptor remains global; consumers
+    must not use it to infer node-local ownership. Callers add transport-specific
+    fields and serialize the result.
+    """
+    result = server_args.resolved_dict()
+    result["launch_command"] = server_args.launch_command
+    result.update(scheduler_info)
+    result["kv_events"] = describe_kv_events_publisher(server_args)
+    return result
+
+
+def start_follower_grpc_server(server_args, scheduler_info: Dict[str, Any]):
+    """Expose GetServerInfo only, without constructing a TokenizerManager.
+
+    The snapshot is taken after scheduler readiness. This does not launch a
+    sidecar or enable inference/control RPCs.
+    """
+    serving = get_serving()
+    if serving.grpc_port is None or serving.smg_grpc_mode or serving.grpc_mode:
+        return None
+
+    from sglang.srt.rust_extensions import load_rust_extension
+
+    grpc_native = load_rust_extension("sglang.srt.rust_extensions._grpc")
+    return grpc_native.start_metadata_server(
+        host=serving.host,
+        port=serving.grpc_port,
+        server_info_json=json.dumps(
+            msgspec_to_builtins(build_server_info(server_args, scheduler_info)),
+            default=str,
+        ),
+    )
 
 
 def launch_dummy_health_check_server(host, port, enable_metrics):

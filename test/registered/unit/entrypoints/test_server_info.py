@@ -24,16 +24,19 @@ import asyncio
 import json
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import msgspec
 import msgspec.structs
 
 from sglang.srt.arg_groups.validation_hook import check_load_publish_args
 from sglang.srt.entrypoints import http_server
+from sglang.srt.entrypoints.grpc_bridge import RuntimeHandle
 from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
 from sglang.srt.runtime_context import publish, reset_context
 from sglang.srt.server_args import ServerArgs
+from sglang.srt.utils import common
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -143,6 +146,45 @@ def _call_server_info_with(
         http_server._global_state = prior_state
         if published:
             reset_context()
+
+
+class TestServerInfoTransportParity(CustomTestCase):
+    def test_http_and_both_grpc_roles_share_startup_metadata(self):
+        for config in (None, '{"publisher": "zmq", "endpoint": "tcp://*:5557"}'):
+            with self.subTest(kv_events_config=config):
+                args = ServerArgs(
+                    model_path="dummy", kv_events_config=config, page_size=64
+                )
+                http_info = _call_server_info_with(args)
+                for field in ("startup_time", "internal_states", "version"):
+                    self.assertIn(field, http_info)
+                    http_info.pop(field)
+
+                bridge = RuntimeHandle.__new__(RuntimeHandle)
+                bridge.tokenizer_manager = SimpleNamespace(server_args=args)
+                bridge.scheduler_info = {"max_req_input_len": 1024}
+                leader_json = bridge.get_server_info()
+                self.assertEqual(
+                    json.loads(leader_json), json.loads(json.dumps(http_info))
+                )
+
+                with (
+                    patch.object(
+                        common,
+                        "get_serving",
+                        return_value=SimpleNamespace(
+                            host="127.0.0.1",
+                            grpc_port=50051,
+                            smg_grpc_mode=False,
+                            grpc_mode=False,
+                        ),
+                    ),
+                    patch("sglang.srt.rust_extensions.load_rust_extension") as load,
+                ):
+                    common.start_follower_grpc_server(args, bridge.scheduler_info)
+                load.return_value.start_metadata_server.assert_called_once_with(
+                    host="127.0.0.1", port=50051, server_info_json=leader_json
+                )
 
 
 class TestServerInfoKvEventsField(CustomTestCase):

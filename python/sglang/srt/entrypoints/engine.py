@@ -132,6 +132,7 @@ from sglang.srt.utils import (
     numa_utils,
     set_prometheus_multiproc_dir,
     set_ulimit,
+    start_follower_grpc_server,
 )
 from sglang.srt.utils.msgspec_utils import msgspec_to_builtins
 from sglang.srt.utils.network import (
@@ -1175,8 +1176,6 @@ class Engine(EngineScoreMixin, EngineBase):
         if get_parallel().node_rank >= 1:
             # Non-zero-rank nodes do not run tokenizer processes.
             scheduler_init_result.wait_for_ready()
-
-            from sglang.srt.entrypoints.grpc_metadata import start_follower_grpc_server
 
             try:
                 scheduler_init_result.grpc_server = start_follower_grpc_server(

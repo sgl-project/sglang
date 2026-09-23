@@ -16,8 +16,9 @@ from pydantic import ValidationError
 
 from sglang.srt.arg_groups.overrides import resolving_view
 from sglang.srt.configs.embedding_model_spec import resolved_embedding_plan
-from sglang.srt.entrypoints.grpc_metadata import get_server_info_json
 from sglang.srt.runtime_context import get_lora, get_serving
+from sglang.srt.utils.common import build_server_info
+from sglang.srt.utils.msgspec_utils import msgspec_to_builtins
 
 logger = logging.getLogger(__name__)
 
@@ -418,8 +419,13 @@ class RuntimeHandle:
         return json.dumps(result, default=str)
 
     def get_server_info(self) -> str:
-        return get_server_info_json(
-            self.tokenizer_manager.server_args, self.scheduler_info
+        return json.dumps(
+            msgspec_to_builtins(
+                build_server_info(
+                    self.tokenizer_manager.server_args, self.scheduler_info
+                )
+            ),
+            default=str,
         )
 
     def health_check(self) -> bool:
