@@ -249,6 +249,9 @@ def test_native_bf16_rmsnorm_rejects_unsupported_inputs(on_host):
 
 
 @torch.no_grad()
+# Wan 2.1 base width, and the Qwen-Image 2.1 decoder's deepest level (above
+# the old 1024-channel cap, so it exercises the 2048-wide 8-warp block).
+@pytest.mark.parametrize("channels", [96, 1152])
 @pytest.mark.parametrize(
     "x_dtype,affine_dtype,atol,rtol",
     [
@@ -256,12 +259,13 @@ def test_native_bf16_rmsnorm_rejects_unsupported_inputs(on_host):
         (torch.bfloat16, torch.float32, 1.5e-1, 3e-2),  # Wan2.1 bf16 autocast
     ],
 )
-def test_wan_rmsnorm_silu_numerics(x_dtype, affine_dtype, atol, rtol):
-    x = _cl3d((1, 96, 3, 10, 14), x_dtype)
-    gamma = torch.randn((96, 1, 1, 1), device=DEVICE, dtype=affine_dtype)
+def test_wan_rmsnorm_silu_numerics(channels, x_dtype, affine_dtype, atol, rtol):
+    x = _cl3d((1, channels, 3, 10, 14), x_dtype)
+    gamma = torch.randn((channels, 1, 1, 1), device=DEVICE, dtype=affine_dtype)
     for bias in (None, torch.randn_like(gamma)):
         expected = F.silu(
-            F.normalize(x, dim=1) * 96**0.5 * gamma + (0 if bias is None else bias)
+            F.normalize(x, dim=1) * channels**0.5 * gamma
+            + (0 if bias is None else bias)
         )
         actual = wan_rmsnorm_silu(x, gamma, bias)
         assert actual.dtype == expected.dtype
