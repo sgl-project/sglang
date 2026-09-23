@@ -1,6 +1,8 @@
 """Unit tests for srt/parser/reasoning_parser.py"""
 
+import os
 import unittest
+from unittest.mock import patch
 
 from sglang.srt.parser.reasoning_parser import (
     Apertus2509Detector,
@@ -255,6 +257,356 @@ class TestDeepSeekV4Detector(CustomTestCase):
         )
         self.assertEqual(result.reasoning_text, "pick a tool")
         self.assertTrue(result.normal_text.startswith("<｜DSML｜tool_calls>"))
+
+
+class TestDeepSeekV4StrictToolBoundary(CustomTestCase):
+    tool = (
+        '<｜DSML｜tool_calls>\n<｜DSML｜invoke name="run">'
+        '<｜DSML｜parameter name="cmd" string="true">'
+        'echo "<think>literal</think>"'
+        "</｜DSML｜parameter></｜DSML｜invoke></｜DSML｜tool_calls>"
+    )
+
+    def _detector(self, **kwargs):
+        options = {"force_reasoning": True, "tool_call_parser_active": True}
+        options.update(kwargs)
+        return DeepSeekV4Detector(**options)
+
+    def _stream(self, chunks, **kwargs):
+        detector = self._detector(**kwargs)
+        results = [detector.parse_streaming_increment(chunk) for chunk in chunks]
+        results.append(detector.finish())
+        self.assertEqual(detector.finish().normal_text, "")
+        self.assertEqual(detector.finish().reasoning_text, "")
+        return (
+            "".join(result.reasoning_text for result in results),
+            "".join(result.normal_text for result in results),
+        )
+
+    def _assert_parses(self, text, reasoning, normal, **kwargs):
+        result = self._detector(**kwargs).detect_and_parse(text)
+        self.assertEqual(
+            (result.reasoning_text, result.normal_text), (reasoning, normal)
+        )
+        for size in [1, 2, 3, 7, 19, len(text)]:
+            with self.subTest(size=size, **kwargs):
+                self.assertEqual(
+                    self._stream(
+                        [text[i : i + size] for i in range(0, len(text), size)],
+                        **kwargs,
+                    ),
+                    (reasoning, normal),
+                )
+
+    def test_duplicate_closer_preserves_preamble_and_tool_payload(self):
+        text = "Inspect.</think>Now run checks.\n\n</think>\n\n" + self.tool
+        normal = "Now run checks.\n\n\n\n" + self.tool
+        for stream_reasoning in [True, False]:
+            self._assert_parses(
+                text, "Inspect.", normal, stream_reasoning=stream_reasoning
+            )
+        for split in range(len(text) + 1):
+            with self.subTest(split=split):
+                self.assertEqual(
+                    self._stream([text[:split], text[split:]]), ("Inspect.", normal)
+                )
+
+    def test_explicit_thinking_and_bare_invoke(self):
+        tool = self.tool.removeprefix("<｜DSML｜tool_calls>\n").removesuffix(
+            "</｜DSML｜tool_calls>"
+        )
+        self._assert_parses(
+            "<think>Inspect.</think>Now run.\n</think>\n" + tool,
+            "Inspect.",
+            "Now run.\n\n" + tool,
+            force_reasoning=False,
+        )
+
+    def test_inline_duplicate_closer_at_tool_boundary(self):
+        for prefix, expected in [
+            ("Now run.</think>\n\n", "Now run.\n\n"),
+            ("Now run:</think>", "Now run:"),
+            ("Now run. </think> \t\r\n", "Now run.  \t\r\n"),
+            ("Now run.</think>\n</think>\n", "Now run.\n\n"),
+            (
+                "Mention </think> here, then run.</think>\n",
+                "Mention </think> here, then run.\n",
+            ),
+        ]:
+            text = "Inspect.</think>" + prefix + self.tool
+            normal = expected + self.tool
+            for stream_reasoning in [True, False]:
+                with self.subTest(prefix=prefix, stream_reasoning=stream_reasoning):
+                    self._assert_parses(
+                        text, "Inspect.", normal, stream_reasoning=stream_reasoning
+                    )
+            for split in range(len(text) + 1):
+                with self.subTest(prefix=prefix, split=split):
+                    self.assertEqual(
+                        self._stream([text[:split], text[split:]]), ("Inspect.", normal)
+                    )
+
+    def test_consecutive_closers_and_crlf(self):
+        self._assert_parses(
+            "Inspect.</think>Now run.\r\n </think>\r\n\t</think>\r\n" + self.tool,
+            "Inspect.",
+            "Now run.\r\n \r\n\t\r\n" + self.tool,
+        )
+
+    def test_tool_payload_does_not_reopen_reasoning(self):
+        self._assert_parses(
+            "Inspect.</think>Now run.\n" + self.tool,
+            "Inspect.",
+            "Now run.\n" + self.tool,
+        )
+        self._assert_parses("Inspect." + self.tool, "Inspect.", self.tool)
+
+    def test_literals_and_unconfirmed_boundaries_are_preserved(self):
+        for normal in [
+            "Keep </think> as text.\n" + self.tool,
+            "</think>\nThere is still prose.\n" + self.tool,
+            "</think>",
+            "</think>\n",
+            "</think>\n<｜DSML｜tool_",
+            "`</think>`\n" + self.tool,
+            "> </think>\n" + self.tool,
+            "\\</think>\n" + self.tool,
+            "An escaped closer: \\</think>\n" + self.tool,
+            "An escaped closer: \\\\</think>\n" + self.tool,
+            "Quoted `</think>`\n" + self.tool,
+            "<think>example\n</think>\n" + self.tool,
+            "```\n</think>\n" + self.tool + "\n```",
+            '"an open quotation\n</think>\n' + self.tool,
+            "cat <<'EOF'\n</think>\n" + self.tool + "\nEOF",
+            "</think>\n`" + self.tool + "`",
+            "```xml\n</think>\n```\n" + self.tool,
+            'Quoted "</think>"\n' + self.tool,
+        ]:
+            with self.subTest(normal=normal):
+                self._assert_parses("Inspect.</think>" + normal, "Inspect.", normal)
+
+    def test_quoted_tool_block_does_not_hide_later_real_boundary(self):
+        example = "```\n" + self.tool + "\n```\n"
+        self._assert_parses(
+            "Inspect.</think>" + example + "</think>\n" + self.tool,
+            "Inspect.",
+            example + "\n" + self.tool,
+        )
+
+    def test_inactive_tool_parser_behavior_is_unchanged(self):
+        tool = "<｜DSML｜tool_calls>"
+        text = "<think>Inspect.</think>Now run.\n</think>\n" + tool
+        normal = "Now run.\n</think>\n" + tool
+        self._assert_parses(text, "Inspect.", normal, tool_call_parser_active=False)
+
+    def test_continue_final_message_is_unchanged(self):
+        normal = "Now run.\n</think>\n<｜DSML｜tool_calls>"
+        self._assert_parses(
+            normal,
+            "",
+            normal,
+            continue_final_message=True,
+            previous_content="<think>Earlier.</think>",
+        )
+
+    def test_truncated_reasoning_and_reasoning_literals_are_preserved(self):
+        for stream_reasoning in [True, False]:
+            self._assert_parses(
+                "Reasoning </parameter> ends mid-tag </thi",
+                "Reasoning </parameter> ends mid-tag </thi",
+                "",
+                stream_reasoning=stream_reasoning,
+            )
+        self._assert_parses(
+            "Reasoning </parameter></think>\n" + self.tool,
+            "Reasoning </parameter>",
+            "\n" + self.tool,
+        )
+
+    def test_reasoning_parser_passes_active_tool_flag(self):
+        parser = ReasoningParser(
+            "deepseek-v4", force_reasoning=True, tool_call_parser_active=True
+        )
+        reasoning, normal = parser.parse_stream_chunk(
+            "Inspect.</think>Now run.\n</think>\n" + self.tool
+        )
+        self.assertEqual(reasoning, "Inspect.")
+        self.assertEqual(normal, "Now run.\n\n" + self.tool)
+        self.assertEqual(parser.parse_stream_end(), ("", ""))
+
+
+class TestDeepSeekV4ReasoningBoundaryCleanup(TestDeepSeekV4StrictToolBoundary):
+    def test_orphan_closer_at_confirmed_reasoning_end(self):
+        for stream_reasoning in [True, False]:
+            for closer in [
+                "</parameter>",
+                "</invoke>",
+                "</tool_calls>",
+                "</function_calls>",
+            ]:
+                self._assert_parses(
+                    "Plan.\n" + closer + "</think>Now run.\n" + self.tool,
+                    "Plan.\n",
+                    "Now run.\n" + self.tool,
+                    stream_reasoning=stream_reasoning,
+                )
+        source = "Plan.\n</parameter></think>Now run.</think>\n\n" + self.tool
+        for split in range(len(source) + 1):
+            with self.subTest(split=split):
+                self.assertEqual(
+                    self._stream([source[:split], source[split:]]),
+                    ("Plan.\n", "Now run.\n\n" + self.tool),
+                )
+
+    def test_multiple_closers_and_crlf_are_handled_without_losing_whitespace(self):
+        self._assert_parses(
+            "Plan.\r\n  </parameter>\r\n</invoke>\r\n</think>Done.",
+            "Plan.\r\n  \r\n\r\n",
+            "Done.",
+        )
+
+    def test_quoted_balanced_inline_and_intervening_text_are_preserved(self):
+        bodies = [
+            "An inline </parameter> marker.",
+            "Inline ending: </parameter>",
+            "A middle marker:\n</parameter>\nMore reasoning.",
+            "```xml\n</parameter>\n```",
+            "```xml\n</parameter>",
+            "An open quote: '\n</parameter>",
+            '<parameter description="a > b">\nvalue\n</parameter>',
+            "\\</parameter>",
+            "> </parameter>",
+            "cat <<'EOF'\n</parameter>",
+            "<!--\n</parameter>",
+            "<![CDATA[\n</parameter>",
+            "<parameter>\n<!-- </parameter> -->\n</parameter>",
+            "<parameter>\n<![CDATA[</parameter>]]>\n</parameter>",
+            "<parameter>\n<!-- ' -->\n</parameter>",
+        ]
+        for body in bodies:
+            with self.subTest(body=body):
+                for stream_reasoning in [True, False]:
+                    self._assert_parses(
+                        body + "</think>Done.",
+                        body,
+                        "Done.",
+                        stream_reasoning=stream_reasoning,
+                    )
+
+    def test_closed_literal_openers_do_not_pair_with_orphan_suffix(self):
+        for prefix in ["<!-- <parameter> -->\n", "<![CDATA[<parameter>]]>\n"]:
+            self._assert_parses(prefix + "</parameter></think>Done.", prefix, "Done.")
+
+    def test_streaming_thoughts_are_not_buffered_in_full(self):
+        detector = self._detector()
+        self.assertEqual(
+            detector.parse_streaming_increment("Thinking normally").reasoning_text,
+            "Thinking normally",
+        )
+        self.assertEqual(
+            detector.parse_streaming_increment("\n</para").reasoning_text, "\n"
+        )
+        self.assertEqual(
+            detector.parse_streaming_increment("meter>").reasoning_text, ""
+        )
+        closed = detector.parse_streaming_increment("</think>Done.")
+        self.assertEqual(closed.reasoning_text, "")
+        self.assertEqual(detector.finish().normal_text, "Done.")
+        self.assertEqual(detector.finish().reasoning_text, "")
+
+    def test_unconfirmed_eof_or_tool_interruption_does_not_erase_closer(self):
+        for stream_reasoning in [True, False]:
+            for ending in ["</para", "</parameter>", "</parameter>\n\n"]:
+                body = "Plan.\n" + ending
+                self._assert_parses(body, body, "", stream_reasoning=stream_reasoning)
+        self._assert_parses(
+            "Plan.\n</parameter>" + self.tool,
+            "Plan.\n</parameter>",
+            self.tool,
+        )
+
+    def test_inactive_tool_parser_and_continuation_keep_original_reasoning(self):
+        body = "Plan.\n</parameter>"
+        self._assert_parses(
+            body + "</think>Done.", body, "Done.", tool_call_parser_active=False
+        )
+        self._assert_parses(
+            body + "</think>Done.",
+            body,
+            "Done.",
+            continue_final_message=True,
+            previous_content="<think>Earlier.",
+        )
+
+    def test_force_nonempty_eof_preserves_held_reasoning(self):
+        detector = self._detector(force_nonempty_content=True)
+        detector.parse_streaming_increment("Plan.\n</parameter>")
+        self.assertEqual(detector.finish().normal_text, "Plan.\n</parameter>")
+
+
+class TestDanglingThinkEnd(CustomTestCase):
+    """Hybrid models (thinks_internally=True) keep the opening <think> in the
+    chat template, so a model that enters thinking on its own emits only
+    ``reasoning</think>answer``. Without special handling the whole thought
+    leaks into normal_text with the dangling tag embedded (observed live on
+    DeepSeek-V4-Flash behind a proxy that surfaces content verbatim)."""
+
+    def _detector(self):
+        return ReasoningParser(model_type="deepseek-v4").detector
+
+    def test_detect_and_parse_dangling_end_splits(self):
+        result = self._detector().detect_and_parse(
+            "Let me reason it out.</think>The answer is 42."
+        )
+        self.assertEqual(result.reasoning_text, "Let me reason it out.")
+        self.assertEqual(result.normal_text, "The answer is 42.")
+
+    def test_detect_and_parse_without_thinks_internally_unchanged(self):
+        detector = BaseReasoningFormatDetector("<think>", "</think>")
+        text = "The tag is spelled </think> in that format."
+        result = detector.detect_and_parse(text)
+        self.assertEqual(result.normal_text, text)
+        self.assertEqual(result.reasoning_text, "")
+
+    def test_detect_and_parse_second_closer_after_real_block_stays_content(self):
+        detector = self._detector()
+        result = detector.detect_and_parse("<think>plan</think>use </think> here")
+        self.assertEqual(result.reasoning_text, "plan")
+        self.assertEqual(result.normal_text, "use </think> here")
+
+    def test_streaming_dangling_end_single_chunk(self):
+        result = self._detector().parse_streaming_increment(
+            "Let me reason it out.</think>The answer is 42."
+        )
+        self.assertEqual(result.reasoning_text, "Let me reason it out.")
+        self.assertEqual(result.normal_text, "The answer is 42.")
+
+    def test_streaming_dangling_end_tag_split_across_chunks(self):
+        detector = self._detector()
+        first = detector.parse_streaming_increment("reasoning tail</thi")
+        # The possible tag prefix is held back, everything before it flushes.
+        self.assertEqual(first.normal_text, "reasoning tail")
+        self.assertEqual(first.reasoning_text, "")
+        second = detector.parse_streaming_increment("nk>The answer.")
+        self.assertEqual(second.reasoning_text, "")
+        self.assertEqual(second.normal_text, "The answer.")
+        self.assertNotIn("</think>", first.normal_text + second.normal_text)
+
+    def test_streaming_closer_after_reasoning_closed_stays_content(self):
+        detector = self._detector()
+        detector.parse_streaming_increment("<think>plan")
+        detector.parse_streaming_increment("</think>")
+        result = detector.parse_streaming_increment("use </think> here")
+        self.assertEqual(result.normal_text, "use </think> here")
+        self.assertEqual(result.reasoning_text, "")
+
+    def test_streaming_heldback_partial_flushes_on_finish(self):
+        detector = self._detector()
+        result = detector.parse_streaming_increment("ends with </thi")
+        self.assertEqual(result.normal_text, "ends with ")
+        tail = detector.finish()
+        self.assertEqual(tail.normal_text, "</thi")
+        self.assertEqual(tail.reasoning_text, "")
 
 
 class TestInklingDetector(CustomTestCase):

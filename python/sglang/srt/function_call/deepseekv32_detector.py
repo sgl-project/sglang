@@ -2,9 +2,6 @@ import json
 import logging
 import re
 
-from partial_json_parser.core.exceptions import MalformedJSON
-from partial_json_parser.core.options import Allow
-
 from sglang.srt.entrypoints.openai.protocol import Tool
 from sglang.srt.function_call.base_format_detector import BaseFormatDetector
 from sglang.srt.function_call.core_types import (
@@ -13,7 +10,7 @@ from sglang.srt.function_call.core_types import (
     ToolCallItem,
     _GetInfoFunc,
 )
-from sglang.srt.function_call.utils import _find_common_prefix, _partial_json_loads
+from sglang.srt.function_call.utils import _find_common_prefix
 
 logger = logging.getLogger(__name__)
 
@@ -93,6 +90,7 @@ class DeepSeekV32Detector(BaseFormatDetector):
         self.prefix_parameter_end_call = ["</", "｜DSML｜", "parameter"]
         self.prefix_invoke_end_call = ["</", "｜DSML｜", "inv", "oke"]
         self.current_tool_id = -1
+        self._pending_non_string_parameter = False
 
     def has_tool_call(self, text: str) -> bool:
         """Check if the text contains a deepseek v32 format tool call."""
@@ -122,6 +120,7 @@ class DeepSeekV32Detector(BaseFormatDetector):
         1. XML parameter tags: <｜DSML｜parameter name="..." string="...">value</｜DSML｜parameter>
         2. Direct JSON: { "key": "value" }
         """
+        self._pending_non_string_parameter = False
         # First, try to parse as direct JSON (new format)
         invoke_content_stripped = invoke_content.strip()
         if invoke_content_stripped.startswith("{"):
@@ -171,17 +170,14 @@ class DeepSeekV32Detector(BaseFormatDetector):
                 self.partial_parameter_regex, remaining_content, re.DOTALL
             )
 
-            if partial_match and (param_value := partial_match.group(3)):
-                param_name = partial_match.group(1)
-                if partial_match.group(2) == "true":
-                    parameters[param_name] = param_value.strip()
-                else:
-                    try:
-                        parameters[param_name] = _partial_json_loads(
-                            param_value, Allow.ALL
-                        )[0]
-                    except (json.JSONDecodeError, MalformedJSON, ValueError):
-                        parameters[param_name] = param_value.strip()
+            # Repaired partial JSON is not an append-only prefix: e.g. 12345e-3
+            # changes a previously parsed 12345 to 12.345. Wait for the closing
+            # parameter tag before serializing non-string values.
+            if partial_match:
+                if partial_match.group(2) != "true":
+                    self._pending_non_string_parameter = True
+                elif param_value := partial_match.group(3):
+                    parameters[partial_match.group(1)] = param_value.strip()
 
         return json.dumps(parameters, ensure_ascii=False)
 
@@ -266,11 +262,7 @@ class DeepSeekV32Detector(BaseFormatDetector):
             # Loop to handle multiple consecutive invoke blocks
             while True:
                 # Try to match an invoke block (may be partial)
-                invoke_match = re.search(
-                    pattern=self.invoke_regex,
-                    string=current_text,
-                    flags=re.DOTALL,
-                )
+                invoke_match = self._find_invoke(current_text)
                 if not invoke_match:
                     break
 
@@ -283,12 +275,9 @@ class DeepSeekV32Detector(BaseFormatDetector):
                     self.current_tool_id = 0
                     self.prev_tool_call_arr = []
                     self.streamed_args_for_tool = [""]
-                    call_start = invoke_match.start()
-                    bot_pos = current_text.rfind(self.bot_token, 0, call_start)
-                    if bot_pos != -1:
-                        call_start = bot_pos
-                    # Same trailing-newline trim as detect_and_parse, so both agree.
-                    preamble = current_text[:call_start].removesuffix("\n\n")
+                    preamble = self._extract_preamble(
+                        current_text, invoke_match.start()
+                    )
 
                 # Ensure arrays are large enough for current tool
                 while len(self.prev_tool_call_arr) <= self.current_tool_id:
@@ -310,6 +299,9 @@ class DeepSeekV32Detector(BaseFormatDetector):
                 # 2. Parse current parameters (partial or complete)
                 current_params = self._parse_parameters_from_xml(
                     invoke_content, allow_partial=not is_tool_end
+                )
+                self._validate_arguments(
+                    func_name, current_params, tools, complete=is_tool_end
                 )
 
                 # 3. Calculate and send incremental arguments
@@ -368,6 +360,7 @@ class DeepSeekV32Detector(BaseFormatDetector):
 
         except Exception as e:
             logger.error(f"Error in parse_streaming_increment: {e}")
+            self._raise_parse_error(e)
             # Re-emit verbatim rather than swallowing the turn; the preamble is
             # still inside current_text unless a completed call advanced past it.
             # Calls are dropped on purpose: the failure can land between a tool's
@@ -376,6 +369,36 @@ class DeepSeekV32Detector(BaseFormatDetector):
             if not current_text.startswith(preamble):
                 current_text = preamble + current_text
             return StreamingParseResult(normal_text=current_text)
+
+    def _find_invoke(self, text: str) -> re.Match | None:
+        return re.search(self.invoke_regex, text, re.DOTALL)
+
+    def _extract_preamble(self, text: str, invoke_start: int) -> str:
+        start = text.rfind(self.bot_token, 0, invoke_start)
+        if start == -1:
+            start = invoke_start
+        return text[:start].removesuffix("\n\n")
+
+    def _raise_parse_error(self, error: Exception) -> None:
+        """Allow subclasses to reject the legacy raw-text fallback."""
+
+    def _validate_arguments(
+        self,
+        name: str,
+        arguments: str,
+        tools: list[Tool],
+        *,
+        complete: bool,
+    ) -> None:
+        """Allow subclasses to validate arguments before appending stream bytes."""
+
+    def finish(self, tools: list[Tool]) -> StreamingParseResult:
+        if self._pending_non_string_parameter:
+            raise ValueError(
+                "Incomplete DSML non-string parameter at end of stream; "
+                "refusing to emit guessed tool arguments"
+            )
+        return super().finish(tools)
 
     def structure_info(self) -> _GetInfoFunc:
         return lambda name: StructureInfo(

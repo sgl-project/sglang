@@ -1454,6 +1454,9 @@ class Envs:
     SGLANG_DSV4_FP4_DEQUANT = EnvBool(False)
     # Flash-0731 also accepts "low"; the active profile is checkpoint-resolved.
     SGLANG_DSV4_REASONING_EFFORT = EnvStr("")
+    # Raw model output may be sensitive; a directory alone does not enable logging.
+    SGLANG_ENABLE_MODEL_OUTPUT_LOGGING = EnvBool(False)
+    SGLANG_MODEL_OUTPUT_TRACE_DIR = EnvStr("")
     # Quantize the SWA fp8 KV cache from bf16-rounded values (matches
     # trainer-side QAT and the DSA-CP path) instead of fp32 registers.
     SGLANG_DSV4_USE_BF16_KV_QUANT_SOURCE = EnvBool(False)

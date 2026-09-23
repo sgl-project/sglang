@@ -11,6 +11,13 @@ from sglang.srt.entrypoints.openai.encoding_dsv4 import (
     thinking_start_token as dsv4_thinking_start_token,
 )
 from sglang.srt.entrypoints.openai.protocol import ChatCompletionRequest
+from sglang.srt.function_call.deepseekv4_format import (
+    mask_literals as mask_dsv4_literals,
+)
+from sglang.srt.function_call.deepseekv4_format import (
+    reasoning_boundary_suffix_start,
+    strip_orphan_reasoning_suffix,
+)
 from sglang.srt.function_call.hunyuan_detector import resolve_hunyuan_tokens
 from sglang.srt.function_call.kimik3_format import (
     MESSAGE_CLOSE,
@@ -105,6 +112,16 @@ class BaseReasoningFormatDetector:
             self._in_reasoning = True
         if self.think_end_token in self.previous_content:
             self._in_reasoning = False
+        # Whether a think_end_token has already closed reasoning (in the
+        # previous content or during this stream). Guards the dangling-closer
+        # handling below: a closer that arrives after reasoning ended is
+        # payload the model wrote, not a reasoning boundary.
+        self._saw_think_end = self.think_end_token in self.previous_content
+        # Rolling tail of text already streamed out as normal, long enough to
+        # recognise a think_start_token split across chunk boundaries. Once an
+        # opener has passed through as content, a later bare closer pairs with
+        # it (quoted markup), so dangling-closer handling turns itself off.
+        self._normal_tail = ""
 
     def _maybe_apply_force_nonempty_content(
         self, ret: StreamingParseResult
@@ -124,6 +141,22 @@ class BaseReasoningFormatDetector:
 
     def _detect_and_parse_impl(self, text: str) -> StreamingParseResult:
         in_reasoning = self._in_reasoning or self.think_start_token in text
+
+        if (
+            not in_reasoning
+            and self.thinks_internally
+            and not self._saw_think_end
+            and self.think_end_token in text
+        ):
+            # Dangling closer from a hybrid model: these models keep the
+            # opening tag in the chat template, so one that entered thinking
+            # on its own emits only reasoning followed by the closing tag —
+            # the same shape DeepSeek-R1 always produces. Without this the
+            # whole thought lands in normal_text with the tag embedded.
+            reasoning_text, normal_text = text.split(self.think_end_token, maxsplit=1)
+            return StreamingParseResult(
+                normal_text=normal_text, reasoning_text=reasoning_text
+            )
 
         if not in_reasoning:
             return StreamingParseResult(normal_text=text)
@@ -218,6 +251,7 @@ class BaseReasoningFormatDetector:
 
             self._buffer = ""
             self._in_reasoning = False
+            self._saw_think_end = True
             normal_text = current_text[end_idx + len(self.think_end_token) :]
 
             return StreamingParseResult(
@@ -259,10 +293,64 @@ class BaseReasoningFormatDetector:
 
         # If we're not in a reasoning block return as normal text
         if not self._in_reasoning:
+            if self._dangling_end_possible(current_text):
+                # Hybrid models keep the opening tag in the chat template, so
+                # one that entered thinking on its own emits only a closing
+                # tag. Reclassify what is still buffered as reasoning (chunks
+                # already streamed out are gone) and strip the tag itself.
+                end_idx = current_text.find(self.think_end_token)
+                if end_idx != -1:
+                    self._buffer = ""
+                    self._saw_think_end = True
+                    return StreamingParseResult(
+                        normal_text=current_text[end_idx + len(self.think_end_token) :],
+                        reasoning_text=current_text[:end_idx],
+                    )
+                # Hold back a tail that could be the closing tag split across
+                # chunks; finish() flushes it as content if it never is.
+                holdback = self._ends_with_partial_token(
+                    current_text, self.think_end_token
+                )
+                if holdback:
+                    emitted = current_text[: len(current_text) - holdback]
+                    self._buffer = current_text[len(current_text) - holdback :]
+                    self._track_normal_tail(emitted)
+                    return StreamingParseResult(normal_text=emitted)
             self._buffer = ""
+            self._track_normal_tail(current_text)
             return StreamingParseResult(normal_text=current_text)
 
         return StreamingParseResult()
+
+    def _dangling_end_possible(self, current_text: str) -> bool:
+        """Whether a bare think_end_token in `current_text` should still be
+        read as the close of template-opened reasoning. Only for hybrid
+        models (thinks_internally), and only while nothing has contradicted
+        that reading: reasoning was never explicitly entered or closed, and
+        no opening tag has passed through as content (which would make a
+        later bare closer quoted markup, not a boundary)."""
+        if not self.thinks_internally:
+            return False
+        if self.force_reasoning or self.stripped_think_start or self._saw_think_end:
+            return False
+        think_start_text = self.think_start_token + self.think_start_self_label
+        return think_start_text not in self._normal_tail + current_text
+
+    def _track_normal_tail(self, emitted: str) -> None:
+        """Remember enough streamed-out content to recognise an opening tag
+        that straddled chunk boundaries (see _dangling_end_possible)."""
+        if not self.thinks_internally:
+            return
+        think_start_text = self.think_start_token + self.think_start_self_label
+        combined = self._normal_tail + emitted
+        if think_start_text in combined:
+            # Latch: an opener went out as content, so dangling handling is
+            # off for the rest of the stream however far the tail rolls.
+            self._normal_tail = think_start_text
+        else:
+            self._normal_tail = combined[
+                max(0, len(combined) - len(think_start_text) + 1) :
+            ]
 
     def _strip_leading_think_start(self, text: str) -> str:
         think_start_text = self.think_start_token + self.think_start_self_label
@@ -1441,6 +1529,7 @@ class DeepSeekV4Detector(BaseReasoningFormatDetector):
         continue_final_message: bool = False,
         previous_content: str = "",
         force_nonempty_content: bool = False,
+        tool_call_parser_active: bool = False,
     ):
         super().__init__(
             dsv4_thinking_start_token,
@@ -1456,6 +1545,118 @@ class DeepSeekV4Detector(BaseReasoningFormatDetector):
             reasoning_default="explicit_thinking",
             force_nonempty_content=force_nonempty_content,
         )
+        self._tool_boundary_enabled = (
+            tool_call_parser_active and not continue_final_message
+        )
+        self._content_pending = ""
+        self._reasoning_finished = False
+        self._tool_payload_started = False
+        self._reasoning_suffix = ""
+        self._reasoning_history: list[str] = []
+        self._reasoning_at_line_start = True
+
+    def _filter_reasoning_boundary(self, text: str) -> str:
+        if not self._tool_boundary_enabled:
+            return text
+        if text:
+            self._reasoning_history.append(text)
+        combined = self._reasoning_suffix + text
+        start = reasoning_boundary_suffix_start(
+            combined, at_line_start=self._reasoning_at_line_start
+        )
+        emitted, self._reasoning_suffix = combined[:start], combined[start:]
+        if self._reasoning_finished:
+            suffix = self._reasoning_suffix
+            if suffix and self._saw_think_end:
+                history = "".join(self._reasoning_history)
+                suffix = strip_orphan_reasoning_suffix(
+                    history, len(history) - len(suffix)
+                )
+            self._reasoning_suffix = ""
+            self._reasoning_history.clear()
+            self._reasoning_at_line_start = True
+            return emitted + suffix
+        last_newline = max(emitted.rfind("\n"), emitted.rfind("\r"))
+        if last_newline >= 0:
+            self._reasoning_at_line_start = not emitted[last_newline + 1 :].strip(" \t")
+        elif emitted.strip(" \t"):
+            self._reasoning_at_line_start = False
+        return emitted
+
+    def _parse_tool_boundary(self, text: str) -> str:
+        if self._tool_payload_started:
+            return text
+        self._content_pending += text
+        visible = mask_dsv4_literals(self._content_pending, heredocs=True)
+        marker = re.search(
+            rf"<{re.escape(dsv4_dsml_token)}(?:tool_calls>|invoke(?=\s|>))", visible
+        )
+        if marker is None:
+            return ""
+        prefix = self._content_pending[: marker.start()]
+        visible_prefix = visible[: marker.start()]
+        if self._saw_think_end and self.think_start_token not in visible_prefix:
+            # A redundant closer at an established tool boundary is structural
+            # even when attached to prose. Keep quoted or escaped literals.
+            pattern = r"(?<!\\)(</think>)[ \t\r\n]*\Z"
+            while match := re.search(pattern, prefix):
+                start, end = match.span(1)
+                if visible_prefix[start:end] != self.think_end_token:
+                    break
+                prefix = prefix[:start] + prefix[end:]
+                visible_prefix = visible_prefix[:start] + visible_prefix[end:]
+        normal = prefix + self._content_pending[marker.start() :]
+        self._content_pending = ""
+        self._tool_payload_started = True
+        return normal
+
+    def _parse_streaming_increment_impl(self, new_text: str) -> StreamingParseResult:
+        if not self._tool_boundary_enabled:
+            return super()._parse_streaming_increment_impl(new_text)
+        if self._reasoning_finished:
+            return StreamingParseResult(normal_text=self._parse_tool_boundary(new_text))
+
+        # Do not let the base parser inspect tool payload in this same chunk:
+        # a literal <think> there must not reopen reasoning or be removed.
+        current = self._buffer + new_text
+        boundaries = [
+            (current.find(token), token)
+            for token in (self.think_end_token, self.tool_start_token)
+            if token in current
+        ]
+        if boundaries:
+            index, token = min(boundaries)
+            split = index + len(token) - len(self._buffer)
+            result = super()._parse_streaming_increment_impl(new_text[:split])
+            result.normal_text += new_text[split:]
+            self._reasoning_finished = not self._in_reasoning
+        else:
+            result = super()._parse_streaming_increment_impl(new_text)
+        result.reasoning_text = self._filter_reasoning_boundary(result.reasoning_text)
+        result.normal_text = self._parse_tool_boundary(result.normal_text)
+        return result
+
+    def _detect_and_parse_impl(self, text: str) -> StreamingParseResult:
+        if not self._tool_boundary_enabled:
+            return super()._detect_and_parse_impl(text)
+        result = self._parse_streaming_increment_impl(text)
+        tail = self.finish()
+        return StreamingParseResult(
+            normal_text=result.normal_text + tail.normal_text,
+            reasoning_text=result.reasoning_text + tail.reasoning_text,
+        )
+
+    def finish(self) -> StreamingParseResult:
+        # Without a confirmed reasoning end, flush held text unchanged at EOF.
+        if self._reasoning_suffix:
+            self._buffer = self._reasoning_suffix + self._buffer
+            self._reasoning_suffix = ""
+        self._reasoning_history.clear()
+        result = super().finish()
+        if self._tool_boundary_enabled:
+            result.normal_text = self._content_pending + result.normal_text
+            self._content_pending = ""
+        return result
 
 
 class _MimoDetector(Qwen3Detector):
