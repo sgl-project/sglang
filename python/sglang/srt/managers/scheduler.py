@@ -3951,7 +3951,8 @@ class Scheduler(
             candidate_beam_width = (
                 req.beam_group.beam_width if req.beam_group is not None else None
             )
-            if len(adder.can_run_list) >= self.get_num_allocatable_reqs(
+            # Corner case: chunk_reqs + 1, allow chunk req and new req to process
+            if len(adder.can_run_list) - adder.num_chunked_req >= self.get_num_allocatable_reqs(
                 running_bs,
                 candidate_beam_width,
                 running_batch=running_batch,

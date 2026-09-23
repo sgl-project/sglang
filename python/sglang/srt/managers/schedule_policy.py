@@ -661,6 +661,7 @@ class PrefillAdder:
         self.req_states = None
         self.can_run_list = []
         self.preempt_list = []
+        self.num_chunked_req = 0
         self.new_chunked_req = None
         self.log_hit_tokens = 0
         self.reprocessed_log_hit_tokens = 0
@@ -1096,6 +1097,7 @@ class PrefillAdder:
         new_len = min(cand_extend_input_len, _rem_tokens)
         req.set_extend_range(len(req.prefix_indices), len(req.prefix_indices) + new_len)
         self.can_run_list.append(req)
+        self.num_chunked_req += 1
         self._update_prefill_budget(
             0,
             req.extend_range.length,
