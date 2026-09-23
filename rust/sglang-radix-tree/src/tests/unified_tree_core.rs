@@ -1900,6 +1900,222 @@ fn tracked_insert_params<'k>(key: &'k Vec<i64>, value: &[i64]) -> InsertParams<'
     }
 }
 
+fn tlru_core(tail_budget: usize) -> UnifiedTreeCore<Vec<i64>> {
+    UnifiedTreeCore::new(
+        CacheInitParams {
+            eviction_policy: "tlru".to_string(),
+            tlru_tail_budget: tail_budget,
+            ..Default::default()
+        },
+        vec![FULL],
+    )
+}
+
+fn tlru_lens(tc: &UnifiedTreeCore<Vec<i64>>, node_id: NodeId) -> (usize, usize) {
+    let node = tc.arena.node(tc.arena.resolve(node_id).expect("live node"));
+    (node.tlru_cached_prefix_len, node.tlru_history_len)
+}
+
+#[test]
+fn tlru_device_splits_inherit_branch_history_without_changing_suffix_depth() {
+    let mut tc = tlru_core(2);
+    let a = tc
+        .insert(&insert_params(
+            &vec![1, 2, 3, 4, 5, 6],
+            &[10, 11, 12, 13, 14, 15],
+        ))
+        .last_device_node_id
+        .expect("inserted device node");
+    let b = tc
+        .insert(&insert_params(
+            &vec![1, 2, 3, 4, 5, 6, 7, 8],
+            &[10, 11, 12, 13, 14, 15, 16, 17],
+        ))
+        .last_device_node_id
+        .expect("inserted device node");
+    assert_eq!(tlru_lens(&tc, a), (6, 8));
+    assert_eq!(tlru_lens(&tc, b), (8, 8));
+    let sibling = tc
+        .insert(&insert_params(&vec![1, 2, 9, 10], &[20, 21, 22, 23]))
+        .last_device_node_id
+        .expect("inserted device node");
+    let prefix = tc.arena.node(tc.arena.resolve(a).unwrap()).parent();
+    let prefix_id = tc.arena.node(prefix).id;
+    assert_eq!(tlru_lens(&tc, prefix_id), (2, 8));
+    assert_eq!(tlru_lens(&tc, a), (6, 8));
+    assert_eq!(tlru_lens(&tc, b), (8, 8));
+    assert_eq!(tlru_lens(&tc, sibling), (4, 4));
+
+    // Tail removal must not turn the ancestor's historical depth into its
+    // shorter current residency. Otherwise each subsequent pass over-trims.
+    tc.evict_device_leaf(b, false).expect("unlocked leaf");
+    assert!(tc.arena.resolve(b).is_err());
+    assert_eq!(tlru_lens(&tc, a), (6, 8));
+    assert_eq!(tlru_lens(&tc, prefix_id), (2, 8));
+
+    // A longer extension raises only its own ancestry, not the other branch.
+    let extended = tc
+        .insert(&insert_params(
+            &vec![1, 2, 9, 10, 11, 12, 13, 14, 15, 16],
+            &[20, 21, 22, 23, 24, 25, 26, 27, 28, 29],
+        ))
+        .last_device_node_id
+        .expect("inserted device node");
+    assert_eq!(tlru_lens(&tc, extended), (10, 10));
+    assert_eq!(tlru_lens(&tc, sibling), (4, 10));
+    assert_eq!(tlru_lens(&tc, prefix_id), (2, 10));
+    assert_eq!(tlru_lens(&tc, a), (6, 8));
+    tc.sanity_check(&[], &[]);
+}
+
+#[test]
+fn tlru_repeated_small_evictions_stop_trimming_at_the_historical_tail_budget() {
+    let mut tc = tlru_core(2);
+    let older = tc
+        .insert(&insert_params(&vec![90, 91, 92, 93], &[90, 91, 92, 93]))
+        .last_device_node_id
+        .expect("inserted device node");
+    let mut chain = Vec::new();
+    for size in [2, 4, 6, 8] {
+        let key: Vec<i64> = (1..=size).collect();
+        let values: Vec<i64> = (10..10 + size).collect();
+        chain.push(
+            tc.insert(&insert_params(&key, &values))
+                .last_device_node_id
+                .expect("inserted device node"),
+        );
+    }
+    // The newest two-token tail is safe; the old four-token branch is not.
+    // After the tail is gone, history remains eight and ordinary recency
+    // chooses the old branch rather than stripping another two tail tokens.
+    for expected in [chain[3], older] {
+        tc.evict_device_start(FULL, 1);
+        let (candidate, step) = tc.evict_device_next_node(FULL, &HashMap::new());
+        assert!(step.device_frees.is_empty());
+        assert_eq!(candidate, Some(expected));
+        let (_, freed) = tc
+            .evict_device_leaf(expected, false)
+            .expect("unlocked leaf");
+        assert!(freed.tracker[&FULL] > 0);
+        tc.evict_device_end(FULL);
+        assert_eq!(tlru_lens(&tc, chain[2]), (6, 8));
+        tc.sanity_check(&[], &[]);
+    }
+}
+
+#[test]
+fn tlru_host_insert_and_split_keep_history_after_host_tail_reclamation() {
+    let mut tc = tlru_core(2);
+    let root_id = tc.arena.node(tc.arena.root()).id;
+    let a = tc
+        .insert_host(
+            root_id,
+            None,
+            vec![1, 2, 3, 4, 5, 6],
+            Tensor::from_slice(&[100i64, 101, 102, 103, 104, 105]),
+            (0..6).map(|i| format!("h{i}")).collect(),
+        )
+        .unwrap()
+        .inserted_host_node
+        .unwrap();
+    let b = tc
+        .insert_host(
+            a,
+            None,
+            vec![7, 8],
+            Tensor::from_slice(&[106i64, 107]),
+            vec!["h6".to_string(), "h7".to_string()],
+        )
+        .unwrap()
+        .inserted_host_node
+        .unwrap();
+    assert_eq!(tlru_lens(&tc, a), (6, 8));
+    assert_eq!(tlru_lens(&tc, b), (8, 8));
+    let reclaimed = tc.drive_host_eviction(FULL, 1);
+    assert_eq!(reclaimed.tracker[&FULL], 2);
+    assert!(tc.arena.resolve(b).is_err());
+    assert_eq!(tlru_lens(&tc, a), (6, 8));
+    let branch = tc
+        .insert_host(
+            root_id,
+            None,
+            vec![1, 2, 9, 10],
+            Tensor::from_slice(&[200i64, 201, 202, 203]),
+            (0..4).map(|i| format!("g{i}")).collect(),
+        )
+        .unwrap()
+        .inserted_host_node
+        .unwrap();
+    let prefix = tc.arena.node(tc.arena.resolve(a).unwrap()).parent();
+    assert_eq!(tlru_lens(&tc, tc.arena.node(prefix).id), (2, 8));
+    assert_eq!(tlru_lens(&tc, a), (6, 8));
+    assert_eq!(tlru_lens(&tc, branch), (4, 4));
+    assert_eq!(tlru_lens(&tc, root_id), (0, 8));
+    tc.sanity_check(&[], &[]);
+}
+
+#[test]
+fn tlru_reused_node_slots_and_reset_do_not_inherit_old_branch_history() {
+    let mut tc = tlru_core(2);
+    let old = tc
+        .insert(&insert_params(
+            &vec![1, 2, 3, 4, 5, 6],
+            &[10, 11, 12, 13, 14, 15],
+        ))
+        .last_device_node_id
+        .expect("inserted device node");
+    let old_slot = tc.arena.resolve(old).unwrap();
+    tc.evict_device_leaf(old, false).expect("unlocked leaf");
+    let fresh = tc
+        .insert(&insert_params(&vec![9, 8], &[90, 80]))
+        .last_device_node_id
+        .expect("inserted device node");
+    assert_eq!(tc.arena.resolve(fresh).unwrap(), old_slot);
+    assert!(tc.arena.resolve(old).is_err());
+    assert_eq!(tlru_lens(&tc, fresh), (2, 2));
+    assert_eq!(tlru_lens(&tc, tc.arena.node(tc.arena.root()).id), (0, 6));
+    tc.reset();
+    assert!(tc.arena.resolve(fresh).is_err());
+    assert_eq!(tlru_lens(&tc, tc.arena.node(tc.arena.root()).id), (0, 0));
+    let after_reset = tc
+        .insert(&insert_params(&vec![7], &[70]))
+        .last_device_node_id
+        .expect("inserted device node");
+    assert_eq!(tlru_lens(&tc, after_reset), (1, 1));
+    assert_eq!(tlru_lens(&tc, tc.arena.node(tc.arena.root()).id), (0, 1));
+    tc.sanity_check(&[], &[]);
+}
+
+#[test]
+fn non_tlru_policies_leave_history_bookkeeping_disabled_for_both_tiers() {
+    for policy in ["lru", "slru", "priority"] {
+        let mut tc = UnifiedTreeCore::new(
+            CacheInitParams {
+                eviction_policy: policy.to_string(),
+                tlru_tail_budget: usize::MAX,
+                ..Default::default()
+            },
+            vec![FULL],
+        );
+        tc.insert(&insert_params(&vec![1, 2, 3, 4], &[10, 11, 12, 13]));
+        tc.insert(&insert_params(&vec![1, 2, 9], &[20, 21, 29]));
+        tc.insert_host(
+            tc.arena.node(tc.arena.root()).id,
+            None,
+            vec![8, 9],
+            Tensor::from_slice(&[80i64, 90]),
+            vec!["h0".to_string(), "h1".to_string()],
+        )
+        .unwrap();
+        for node in tc.collect_all_nodes_() {
+            let node = tc.arena.node(node);
+            assert_eq!(node.tlru_cached_prefix_len, 0, "{policy}");
+            assert_eq!(node.tlru_history_len, 0, "{policy}");
+        }
+        tc.sanity_check(&[], &[]);
+    }
+}
+
 #[test]
 fn adopted_ranges_are_opt_in_and_coalesce() {
     let mut untracked = InsertResult::default();

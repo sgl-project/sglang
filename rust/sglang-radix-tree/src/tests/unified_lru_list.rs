@@ -601,6 +601,8 @@ fn arena_with_node() -> (NodeArena<Vec<i64>>, NodeIdx_) {
     node.last_access_counter = 5;
     node.creation_counter = 7;
     node.hit_count = 3;
+    node.tlru_cached_prefix_len = 1;
+    node.tlru_history_len = 1;
     (arena, NodeIdx_(a.0))
 }
 
@@ -641,6 +643,71 @@ fn slru_segments_on_the_protected_threshold() {
 }
 
 #[test]
+fn tlru_evicts_a_whole_node_only_when_its_uncached_history_fits_the_budget() {
+    let (mut arena, a) = arena_with_node();
+    let node = arena.node_mut(a);
+    // This one-token node ends at depth 6; its branch once reached depth 8.
+    // Removing it leaves three history tokens uncached, not just its own one.
+    node.tlru_cached_prefix_len = 6;
+    node.tlru_history_len = 8;
+    for (tail_budget, expected_class) in [(0, 0), (2, 0), (3, -1), (4, -1)] {
+        assert_eq!(
+            TlruStrategy { tail_budget }.get_priority(node),
+            PriorityKey(expected_class, 5),
+            "tail budget {tail_budget}"
+        );
+    }
+}
+
+#[test]
+fn tlru_safe_nodes_precede_older_unsafe_nodes_but_keep_recency_within_each_phase() {
+    let (mut arena, a) = arena_with_node();
+    let strategy = TlruStrategy { tail_budget: 2 };
+    let node = arena.node_mut(a);
+    node.tlru_cached_prefix_len = 4;
+    node.tlru_history_len = 8;
+    node.last_access_counter = 1;
+    let old_unsafe = strategy.get_priority(node);
+    node.last_access_counter = 2;
+    let new_unsafe = strategy.get_priority(node);
+    node.tlru_history_len = 4;
+    node.last_access_counter = 100;
+    let old_safe = strategy.get_priority(node);
+    node.last_access_counter = 101;
+    let new_safe = strategy.get_priority(node);
+    assert!(old_safe < new_safe);
+    assert!(new_safe < old_unsafe);
+    assert!(old_unsafe < new_unsafe);
+}
+
+#[test]
+fn tlru_handles_full_usize_depths_and_budgets_without_overflow() {
+    let (mut arena, a) = arena_with_node();
+    let node = arena.node_mut(a);
+    node.tlru_history_len = usize::MAX;
+    // Valid cumulative metadata can span the entire unsigned domain even
+    // though this leaf itself has only one atom. Check exact boundaries.
+    for (prefix, budget, expected_class) in [
+        (usize::MAX, 0, 0),
+        (usize::MAX, 1, -1),
+        (usize::MAX - 5, 5, 0),
+        (usize::MAX - 5, 6, -1),
+        (1, usize::MAX - 1, 0),
+        (1, usize::MAX, -1),
+    ] {
+        node.tlru_cached_prefix_len = prefix;
+        assert_eq!(
+            TlruStrategy {
+                tail_budget: budget
+            }
+            .get_priority(node),
+            PriorityKey(expected_class, 5),
+            "prefix {prefix}, budget {budget}"
+        );
+    }
+}
+
+#[test]
 fn get_eviction_strategy_resolves_each_policy_name() {
     let (arena, a) = arena_with_node();
     let node = arena.node(NodeIdx_(a.0));
@@ -653,10 +720,11 @@ fn get_eviction_strategy_resolves_each_policy_name() {
         ("filo", PriorityKey(-7, 0)),
         ("priority", PriorityKey(9, 5)),
         ("slru", PriorityKey(1, 5)),
+        ("tlru", PriorityKey(0, 5)),
     ];
     for (policy, expected) in cases {
         assert_eq!(
-            get_eviction_strategy::<Vec<i64>>(policy, 2).get_priority(node),
+            get_eviction_strategy::<Vec<i64>>(policy, 2, 0).get_priority(node),
             expected,
             "policy {policy}"
         );
@@ -669,11 +737,11 @@ fn eviction_policy_names_are_case_insensitive() {
     let node = arena.node(NodeIdx_(a.0));
     // Mixed-case names resolve to the same strategies as their lowercase forms.
     assert_eq!(
-        get_eviction_strategy::<Vec<i64>>("LRU", 2).get_priority(node),
+        get_eviction_strategy::<Vec<i64>>("LRU", 2, 0).get_priority(node),
         PriorityKey(5, 0)
     );
     assert_eq!(
-        get_eviction_strategy::<Vec<i64>>("Priority", 2).get_priority(node),
+        get_eviction_strategy::<Vec<i64>>("Priority", 2, 0).get_priority(node),
         PriorityKey(9, 5)
     );
 }
@@ -681,7 +749,7 @@ fn eviction_policy_names_are_case_insensitive() {
 #[test]
 fn get_eviction_strategy_slru_default_threshold_is_two() {
     let (mut arena, a) = arena_with_node();
-    let slru = get_eviction_strategy::<Vec<i64>>("slru", 2);
+    let slru = get_eviction_strategy::<Vec<i64>>("slru", 2, 0);
     // Exactly 2 hits is protected under the factory default; 1 is not.
     arena.node_mut(NodeIdx_(a.0)).hit_count = 2;
     assert_eq!(
@@ -696,9 +764,23 @@ fn get_eviction_strategy_slru_default_threshold_is_two() {
 }
 
 #[test]
+fn tlru_factory_uses_the_tail_budget_and_accepts_mixed_case_names() {
+    let (arena, a) = arena_with_node();
+    let node = arena.node(a);
+    assert_eq!(
+        get_eviction_strategy::<Vec<i64>>("TLrU", 999, 0).get_priority(node),
+        PriorityKey(0, 5)
+    );
+    assert_eq!(
+        get_eviction_strategy::<Vec<i64>>("TLrU", 999, 1).get_priority(node),
+        PriorityKey(-1, 5)
+    );
+}
+
+#[test]
 #[should_panic(expected = "Unknown eviction policy: random. Supported policies:")]
 fn get_eviction_strategy_panics_on_an_unknown_policy() {
-    get_eviction_strategy::<Vec<i64>>("Random", 2);
+    get_eviction_strategy::<Vec<i64>>("Random", 2, 0);
 }
 
 #[test]

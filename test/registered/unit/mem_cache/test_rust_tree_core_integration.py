@@ -228,6 +228,174 @@ def test_slru_config_changes_which_leaf_is_evicted(config, evict_recent):
         core.evict_device_end(ComponentType.FULL)
 
 
+def _tlru_tree_core(backend, config=None, page_size=1, is_eagle=False):
+    from sglang.srt.mem_cache.unified_cache.components.full import FullComponent
+    from sglang.srt.mem_cache.unified_cache.unified_tree_core import UnifiedTreeCore
+
+    params = CacheInitParams(
+        disable=False,
+        req_to_token_pool=None,
+        token_to_kv_pool_allocator=None,
+        page_size=page_size,
+        is_eagle=is_eagle,
+        tree_components=(ComponentType.FULL,),
+        eviction_policy="tlru",
+        eviction_policy_config=config,
+    )
+    if backend == "rust":
+        return RustUnifiedTreeCore(params)
+    cache = SimpleNamespace(enable_session_radix_cache=False)
+    return UnifiedTreeCore(params, {ComponentType.FULL: FullComponent(cache, params)})
+
+
+def _tlru_insert(core, token_ids, indices, tier):
+    key = RadixKey(array("q", token_ids), is_bigram=core.is_eagle)
+    if tier == "device":
+        return _pump_insert(
+            core, InsertParams(key=key, value=torch.tensor(indices, dtype=torch.int64))
+        ).last_device_node
+    core.set_hicache_enabled()
+    return core.insert_host(
+        core.root_node_handle(),
+        key,
+        torch.tensor(indices, dtype=torch.int64),
+        [f"{index:064x}" for index in range(len(indices) // core.page_size)],
+    ).inserted_host_node
+
+
+def _tlru_evict_one_leaf(core, tier):
+    tracker, device_frees, host_frees = {}, {}, {}
+    if tier == "host":
+        _accumulate_step(
+            core.drive_host_eviction(ComponentType.FULL, 1),
+            tracker,
+            device_frees,
+            host_frees,
+        )
+        return torch.cat(host_frees[ComponentType.FULL]).tolist()
+
+    core.evict_device_start(ComponentType.FULL, 1)
+    try:
+        step = core.evict_device_next_node(ComponentType.FULL, tracker)
+        node = step.node_id
+        _accumulate_step(step, tracker, device_frees, host_frees)
+        assert node is not None
+        _accumulate_step(
+            core.evict_device_leaf(node, is_write_back=False),
+            tracker,
+            device_frees,
+            host_frees,
+        )
+        assert core.evict_device_next_node(ComponentType.FULL, tracker).node_id is None
+    finally:
+        core.evict_device_end(ComponentType.FULL)
+    return torch.cat(device_frees[ComponentType.FULL]).tolist()
+
+
+@pytest.mark.parametrize("backend", ["python", "rust"])
+@pytest.mark.parametrize(
+    "config,evict_recent",
+    [
+        (None, False),
+        ({"threshold": 4, "next_prompt_estimate": 0}, True),
+        ({"threshold": 4, "next_prompt_estimate": 2}, True),
+        ({"threshold": 4, "next_prompt_estimate": 4}, False),
+        ({"threshold": 4, "next_prompt_estimate": 6}, False),
+        ({"threshold": -2, "next_prompt_estimate": 0}, False),
+        ({"threshold": 2, "next_prompt_estimate": -2}, True),
+        ({"threshold": 2**100, "next_prompt_estimate": 2**100 - 2}, True),
+        ({"threshold": 2**100, "next_prompt_estimate": 2**100 + 2}, False),
+        ({"threshold": 2**100, "next_prompt_estimate": -(2**100)}, False),
+        ({"threshold": -(2**100), "next_prompt_estimate": 2**100}, False),
+    ],
+)
+def test_tlru_config_prioritizes_safe_tails_then_recency(backend, config, evict_recent):
+    core = _tlru_tree_core(backend, config)
+    # The older conversation occupies one oversized node, so trimming it would
+    # exceed the tail budget. The recent short conversation can fit entirely.
+    _insert(core, list(range(100, 108)), list(range(200, 208)))
+    _insert(core, [1, 2], [10, 11])
+
+    assert _tlru_evict_one_leaf(core, "device") == (
+        [10, 11] if evict_recent else list(range(200, 208))
+    )
+    core.sanity_check([], [])
+
+
+@pytest.mark.parametrize("backend", ["python", "rust"])
+@pytest.mark.parametrize("tier", ["device", "host"])
+@pytest.mark.parametrize("page_size", [1, 2])
+@pytest.mark.parametrize("is_eagle", [False, True])
+def test_tlru_repeated_tail_eviction_preserves_history(
+    backend, tier, page_size, is_eagle
+):
+    core = _tlru_tree_core(
+        backend, {"threshold": 6, "next_prompt_estimate": 2}, page_size, is_eagle
+    )
+    _tlru_insert(
+        core,
+        list(range(100, 108 + is_eagle)),
+        list(range(200, 208)),
+        tier,
+    )
+    for length in (2, 4, 6, 8):
+        _tlru_insert(
+            core, list(range(length + is_eagle)), list(range(10, 10 + length)), tier
+        )
+
+    # Four tokens are safe. A fresh eviction walk must retain the original
+    # eight-token high-water mark and protect the shortened conversation.
+    assert _tlru_evict_one_leaf(core, tier) == [16, 17]
+    assert _tlru_evict_one_leaf(core, tier) == [14, 15]
+    assert _tlru_evict_one_leaf(core, tier) == list(range(200, 208))
+    core.sanity_check([], [])
+
+
+@pytest.mark.parametrize("backend", ["python", "rust"])
+@pytest.mark.parametrize("tier", ["device", "host"])
+@pytest.mark.parametrize("page_size", [1, 2])
+def test_tlru_split_and_compacted_branch_preserve_history(backend, tier, page_size):
+    core = _tlru_tree_core(
+        backend, {"threshold": 6, "next_prompt_estimate": 2}, page_size
+    )
+    _tlru_insert(core, list(range(100, 108)), list(range(200, 208)), tier)
+    _tlru_insert(core, list(range(8)), list(range(10, 18)), tier)
+    # Matching splits the long turn at depth four; inserting a compacted turn
+    # then splits that prefix again at depth two. Neither split shortens history.
+    core.match_prefix(MatchPrefixParams(key=_key(list(range(4)))))
+    _tlru_insert(core, [0, 1, 90, 91], [10, 11, 30, 31], tier)
+
+    assert _tlru_evict_one_leaf(core, tier) == [14, 15, 16, 17]
+    assert _tlru_evict_one_leaf(core, tier) == [30, 31]
+    assert _tlru_evict_one_leaf(core, tier) == list(range(200, 208))
+    core.sanity_check([], [])
+
+
+@pytest.mark.parametrize("backend", ["python", "rust"])
+def test_tlru_host_refill_raises_device_ancestor_history(backend):
+    core = _tlru_tree_core(backend, {"threshold": 6, "next_prompt_estimate": 2})
+    core.set_hicache_enabled()
+    old = _insert(core, list(range(100, 108)), list(range(200, 208))).last_device_node
+    prefix = _insert(core, [0, 1], [10, 11]).last_device_node
+    _complete_backup(core, prefix)
+    inserted = core.insert_host(
+        prefix,
+        _key(list(range(2, 8))),
+        torch.arange(1012, 1018),
+        [f"{index:064x}" for index in range(6)],
+    )
+    assert inserted.inserted_host_node is not None
+
+    # Prefetch creates no new device KV, but its depth must protect the short
+    # device ancestor from T-LRU's first phase.
+    core.evict_device_start(ComponentType.FULL, 1)
+    try:
+        assert core.evict_device_next_node(ComponentType.FULL, {}).node_id == old
+    finally:
+        core.evict_device_end(ComponentType.FULL)
+    core.sanity_check([], [])
+
+
 @pytest.mark.parametrize(
     "policy,config",
     [("lru", {"protected_threshold": 4}), ("slru", {"unknown_option": 4})],

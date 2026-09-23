@@ -8,7 +8,7 @@ Rust is the default tree core. The centralized tree-core registry falls back to
 Python in these cases:
 
 - Session-aware caching.
-- T-LRU eviction.
+- T-LRU configurations with non-integer token counts.
 - C128 or other unsupported components.
 - Custom component overrides.
 - Non-Linux platforms.
@@ -18,6 +18,11 @@ Python in these cases:
 
 This policy also applies when Rust is explicitly selected.
 Build, import, and runtime failures in supported configurations remain errors.
+
+T-LRU supports the same integer `threshold` and `next_prompt_estimate` token
+counts as Python. Its per-node path depth and branch history preserve the tail
+budget across splits, host refills, and repeated eviction. The ancestor history
+walk runs only when T-LRU is selected.
 
 Select a backend explicitly with:
 

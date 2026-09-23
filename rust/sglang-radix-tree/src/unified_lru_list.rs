@@ -483,10 +483,29 @@ impl<K: ChildKeyType> EvictionStrategy<K> for SlruStrategy {
     }
 }
 
+/// Tail-optimized LRU: reclaim whole nodes within the conversation's tail
+/// budget before other nodes, using recency within each group.
+pub struct TlruStrategy {
+    /// max(threshold - next_prompt_estimate, 0), in logical tokens.
+    pub tail_budget: usize,
+}
+
+impl<K: ChildKeyType> EvictionStrategy<K> for TlruStrategy {
+    fn get_priority(&self, node: &Node<K>) -> PriorityKey {
+        let cached_without_node = node.tlru_cached_prefix_len - node.key.atom_len();
+        let tail_len = node.tlru_history_len - cached_without_node;
+        PriorityKey(
+            if tail_len <= self.tail_budget { -1 } else { 0 },
+            node.last_access_counter,
+        )
+    }
+}
+
 /// The strategy for an eviction-policy name.
 pub fn get_eviction_strategy<K: ChildKeyType>(
     policy: &str,
     slru_protected_threshold: i64,
+    tlru_tail_budget: usize,
 ) -> Box<dyn EvictionStrategy<K> + Send> {
     match policy.to_lowercase().as_str() {
         "lru" => Box::new(LruStrategy),
@@ -498,9 +517,12 @@ pub fn get_eviction_strategy<K: ChildKeyType>(
         "slru" => Box::new(SlruStrategy {
             protected_threshold: slru_protected_threshold,
         }),
+        "tlru" => Box::new(TlruStrategy {
+            tail_budget: tlru_tail_budget,
+        }),
         other => panic!(
             "Unknown eviction policy: {other}. Supported policies: \
-             'lru', 'lfu', 'fifo', 'mru', 'filo', 'priority', 'slru'."
+             'lru', 'lfu', 'fifo', 'mru', 'filo', 'priority', 'slru', 'tlru'."
         ),
     }
 }

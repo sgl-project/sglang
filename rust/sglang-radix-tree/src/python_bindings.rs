@@ -434,6 +434,7 @@ fn frees_to_py(py: Python<'_>, frees: HashMap<ComponentType, Vec<Tensor>>) -> Py
 pub struct TreeCoreInitParamsBinding {
     pub eviction_policy: String,
     pub slru_protected_threshold: i64,
+    pub tlru_tail_budget: usize,
     pub page_size: usize,
     pub is_write_back: bool,
     pub enable_hicache: bool,
@@ -452,6 +453,7 @@ impl TreeCoreInitParamsBinding {
         Ok(CacheInitParams {
             eviction_policy: self.eviction_policy.clone(),
             slru_protected_threshold: self.slru_protected_threshold,
+            tlru_tail_budget: self.tlru_tail_budget,
             page_size: self.page_size,
             is_write_back: self.is_write_back,
             enable_hicache: self.enable_hicache,
@@ -471,7 +473,7 @@ impl TreeCoreInitParamsBinding {
 #[pymethods]
 impl TreeCoreInitParamsBinding {
     #[new]
-    #[pyo3(signature = (eviction_policy = "lru".to_string(), page_size = 1, is_write_back = false, enable_hicache = false, write_through_threshold = 256, device = "cpu".to_string(), swa_sliding_window_size = None, enable_kv_cache_events = false, mamba_cache_chunk_size = None, mamba_max_states_per_path = None, slru_protected_threshold = 2, swa_req_ring = false))]
+    #[pyo3(signature = (eviction_policy = "lru".to_string(), page_size = 1, is_write_back = false, enable_hicache = false, write_through_threshold = 256, device = "cpu".to_string(), swa_sliding_window_size = None, enable_kv_cache_events = false, mamba_cache_chunk_size = None, mamba_max_states_per_path = None, slru_protected_threshold = 2, swa_req_ring = false, tlru_tail_budget = 0))]
     fn new(
         eviction_policy: String,
         page_size: usize,
@@ -485,10 +487,12 @@ impl TreeCoreInitParamsBinding {
         mamba_max_states_per_path: Option<usize>,
         slru_protected_threshold: i64,
         swa_req_ring: bool,
+        tlru_tail_budget: usize,
     ) -> Self {
         TreeCoreInitParamsBinding {
             eviction_policy,
             slru_protected_threshold,
+            tlru_tail_budget,
             page_size,
             is_write_back,
             enable_hicache,
@@ -957,11 +961,11 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
         let eviction_policy = init_params.eviction_policy.to_lowercase();
         if !matches!(
             eviction_policy.as_str(),
-            "lru" | "lfu" | "fifo" | "mru" | "filo" | "priority" | "slru"
+            "lru" | "lfu" | "fifo" | "mru" | "filo" | "priority" | "slru" | "tlru"
         ) {
             return Err(PyValueError::new_err(format!(
                 "Unknown eviction policy: {eviction_policy}. Supported policies: \
-                 'lru', 'lfu', 'fifo', 'mru', 'filo', 'priority', 'slru'."
+                 'lru', 'lfu', 'fifo', 'mru', 'filo', 'priority', 'slru', 'tlru'."
             )));
         }
         let params = init_params.to_cache_init_params()?;

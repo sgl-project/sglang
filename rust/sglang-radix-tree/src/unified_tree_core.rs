@@ -500,6 +500,8 @@ pub struct CacheInitParams {
     pub eviction_policy: String,
     /// Hit count at which SLRU promotes a node to the protected segment.
     pub slru_protected_threshold: i64,
+    /// Nonnegative T-LRU threshold minus the next-prompt estimate, in tokens.
+    pub tlru_tail_budget: usize,
     /// Atoms per radix page; children are keyed by their key's first page.
     pub page_size: usize,
     /// Whether the cache runs the write-back (vs write-through) policy.
@@ -529,6 +531,7 @@ impl Default for CacheInitParams {
         CacheInitParams {
             eviction_policy: "lru".to_string(),
             slru_protected_threshold: 2,
+            tlru_tail_budget: 0,
             page_size: 1,
             is_write_back: false,
             enable_hicache: false,
@@ -584,6 +587,8 @@ pub struct UnifiedTreeCore<K: ChildKeyType> {
     pub(crate) full_evict_device_heap: BinaryHeap<Reverse<(PriorityKey, NodeIdx_)>>,
     /// Eviction-priority strategy; lower priority evicts first.
     pub(crate) eviction_strategy: Box<dyn EvictionStrategy<K> + Send>,
+    /// Keep path depths and branch high-water marks only for T-LRU.
+    pub(crate) tlru_bookkeeping: bool,
     /// Atoms per radix page; children are keyed by their key's first page.
     pub(crate) page_size: usize,
     /// Whether the cache runs the write-back (vs write-through) policy.
@@ -780,7 +785,9 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             eviction_strategy: get_eviction_strategy(
                 &params.eviction_policy,
                 params.slru_protected_threshold,
+                params.tlru_tail_budget,
             ),
+            tlru_bookkeeping: params.eviction_policy.eq_ignore_ascii_case("tlru"),
             page_size: params.page_size,
             is_write_back: params.is_write_back,
             enable_hicache: params.enable_hicache,
@@ -1971,6 +1978,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         let child_namespace = child.namespace.clone();
         let child_external_cache_stored = child.external_cache_stored;
         let child_rotation_base = child.rotation_base;
+        let child_tlru_history_len = child.tlru_history_len;
         let (key_head, key_tail) = child.key.split_at(split_len);
         // key_head keeps the original key's first page, which keys the parent's child map.
         let parent_map_key = key_head.child_key(page_size);
@@ -1988,6 +1996,18 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         );
         self.arena.node_mut(new_node_id).external_cache_stored = child_external_cache_stored;
         self.arena.node_mut(new_node_id).rotation_base = child_rotation_base;
+        if self.tlru_bookkeeping {
+            // Splitting preserves the suffix's depth and branch history.
+            let prefix_len = self
+                .arena
+                .node(parent_id)
+                .tlru_cached_prefix_len
+                .checked_add(split_len)
+                .expect("T-LRU path length overflow");
+            let prefix = self.arena.node_mut(new_node_id);
+            prefix.tlru_cached_prefix_len = prefix_len;
+            prefix.tlru_history_len = child_tlru_history_len;
+        }
 
         let child = self.arena.node_mut(child_id);
         child.parent = Some(new_node_id);
@@ -2053,6 +2073,32 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         (new_node_id, action)
     }
 
+    /// Record a new tail's depth and raise ancestor history without shrinking
+    /// it on eviction. Only T-LRU needs this O(path nodes) worst-case walk.
+    fn set_tlru_lens_and_raise_history_(&mut self, node_id: NodeIdx_, parent_id: NodeIdx_) {
+        if !self.tlru_bookkeeping {
+            return;
+        }
+        let depth = self
+            .arena
+            .node(parent_id)
+            .tlru_cached_prefix_len
+            .checked_add(self.arena.node(node_id).key.atom_len())
+            .expect("T-LRU path length overflow");
+        let node = self.arena.node_mut(node_id);
+        node.tlru_cached_prefix_len = depth;
+        node.tlru_history_len = node.tlru_history_len.max(depth);
+        let mut ancestor = Some(parent_id);
+        while let Some(ancestor_id) = ancestor {
+            let node = self.arena.node_mut(ancestor_id);
+            if node.tlru_history_len >= depth {
+                break;
+            }
+            node.tlru_history_len = depth;
+            ancestor = node.try_parent();
+        }
+    }
+
     /// Create a leaf holding `value` under `parent`.
     pub fn add_new_node_(
         &mut self,
@@ -2088,6 +2134,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             namespace,
         );
         self.arena.set_device_value(new_node_id, FULL, value.copy());
+        self.set_tlru_lens_and_raise_history_(new_node_id, parent_id);
         let displaced = self
             .arena
             .insert_child_edge(parent_id, child_map_key, new_node_id);
@@ -3373,6 +3420,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             /* creation_counter = */ None,
             namespace,
         );
+        self.set_tlru_lens_and_raise_history_(new_node_id, node_id);
         {
             // The suffix moves into a right-sized list; the matched head drops.
             let mut hash_value = hash_value;

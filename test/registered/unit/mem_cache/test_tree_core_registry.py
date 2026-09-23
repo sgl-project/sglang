@@ -363,10 +363,33 @@ class TreeCoreDefaultCompatibilityTest(CustomTestCase):
             self.assertEqual(select_tree_core_backend(params), "python")
         self.assertEqual(resolve_tree_core_backend("rust", params), "python")
 
-    def test_tlru_uses_python_and_preserves_policy_configuration(self):
+    def test_integer_tlru_uses_rust_and_preserves_policy_configuration(self):
+        for config in (
+            {"threshold": 4096, "next_prompt_estimate": 1024},
+            {"threshold": 2**100 + 4, "next_prompt_estimate": 2**100},
+        ):
+            with self.subTest(config=config):
+                params = _cache_init_params(
+                    eviction_policy="TLRU", eviction_policy_config=config
+                )
+                self.assertEqual(select_tree_core_backend(params), "rust")
+                with envs.SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND.override("rust"):
+                    self.assertEqual(select_tree_core_backend(params), "rust")
+                components = {ComponentType.FULL: mock.MagicMock()}
+                factory = mock.MagicMock()
+                with mock.patch.dict(_TREE_CORE_REGISTRY, {"rust": factory}):
+                    core = create_tree_core("rust", params, components)
+                factory.assert_called_once_with(params, components)
+                self.assertIs(core, factory.return_value)
+                self.assertEqual(params.eviction_policy_config, config)
+
+    def test_non_integer_tlru_uses_python_and_preserves_policy_configuration(self):
         params = _cache_init_params(
             eviction_policy="tlru",
-            eviction_policy_config={"threshold": 4096, "next_prompt_estimate": 1024},
+            eviction_policy_config={
+                "threshold": 4096.5,
+                "next_prompt_estimate": 1024.25,
+            },
         )
         self.assertEqual(select_tree_core_backend(params), "python")
         with envs.SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND.override("rust"):
@@ -381,8 +404,8 @@ class TreeCoreDefaultCompatibilityTest(CustomTestCase):
         self.assertIsInstance(core, UnifiedTreeCore)
         self.assertIs(component.tree_core, core)
         self.assertIsInstance(core.eviction_strategy, TLRUStrategy)
-        self.assertEqual(core.eviction_strategy.threshold, 4096)
-        self.assertEqual(core.eviction_strategy.next_prompt_estimate, 1024)
+        self.assertEqual(core.eviction_strategy.threshold, 4096.5)
+        self.assertEqual(core.eviction_strategy.next_prompt_estimate, 1024.25)
         self.assertTrue(core.tlru_bookkeeping)
 
     def test_python_and_custom_backend_selections_are_unchanged(self):

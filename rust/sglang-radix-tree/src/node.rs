@@ -190,6 +190,10 @@ pub struct Node<K: ChildKeyType> {
     pub creation_counter: i64,
     /// Match hits accumulated for write-through and LFU decisions.
     pub hit_count: i64,
+    /// Logical root-path length; maintained only for T-LRU.
+    pub tlru_cached_prefix_len: usize,
+    /// Greatest subtree depth reached, retained when cached tails are evicted.
+    pub tlru_history_len: usize,
     /// Eviction priority; the root uses `i64::MIN` and is never a leaf.
     pub priority: i64,
     /// This node's external handle; minted once, never recycled.
@@ -408,6 +412,8 @@ impl<K: ChildKeyType> Node<K> {
             last_access_counter: 0,
             creation_counter: 0,
             hit_count: 0,
+            tlru_cached_prefix_len: 0,
+            tlru_history_len: 0,
             priority: i64::MIN,
             id,
             idx: NodeIdx_(id),
@@ -432,6 +438,8 @@ impl<K: ChildKeyType> Node<K> {
             last_access_counter: 0,
             creation_counter: 0,
             hit_count: 0,
+            tlru_cached_prefix_len: 0,
+            tlru_history_len: 0,
             priority,
             id,
             idx: NodeIdx_(id),

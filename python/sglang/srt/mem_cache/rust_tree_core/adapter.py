@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import sys
 from array import array
 from typing import TYPE_CHECKING, Optional, Sequence
 
@@ -330,10 +331,24 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
                 "Rust TreeCore does not support component_registry_override"
             )
         # Validate the same constructor options as Python before passing the
-        # SLRU threshold to the native strategy.
+        # configured eviction parameters to the native strategy.
         eviction_strategy = get_eviction_strategy(
             params.eviction_policy, params.eviction_policy_config
         )
+        tlru_tail_budget = 0
+        if params.eviction_policy.lower() == "tlru":
+            threshold = eviction_strategy.threshold
+            next_prompt_estimate = eviction_strategy.next_prompt_estimate
+            if not isinstance(threshold, int) or not isinstance(
+                next_prompt_estimate, int
+            ):
+                raise ValueError("Rust T-LRU requires integer token counts")
+            # Subtract before clamping so arbitrary-sized Python integers keep
+            # their exact difference. Native compares this budget with a usize
+            # path length; larger budgets make every non-root node TEL-safe.
+            tlru_tail_budget = min(
+                max(threshold - next_prompt_estimate, 0), 2 * sys.maxsize + 1
+            )
         if ComponentType.SWA in self.tree_components and (
             params.sliding_window_size is None or params.sliding_window_size <= 0
         ):
@@ -370,6 +385,7 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
                 slru_protected_threshold=getattr(
                     eviction_strategy, "protected_threshold", 2
                 ),
+                tlru_tail_budget=tlru_tail_budget,
                 page_size=params.page_size,
                 is_write_back=False,
                 enable_hicache=False,
