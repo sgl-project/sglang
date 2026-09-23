@@ -213,13 +213,13 @@ def adjust_hybrid_swa_layer_ids(
 
     full_attention_layer_ids = [
         layer_idx
-        for layer_idx in range(start_layer, end_layer + 1)
+        for layer_idx in range(start_layer, end_layer)
         if hasattr(model_config, "full_attention_layer_ids")
         and layer_idx in model_config.full_attention_layer_ids
     ]
     swa_attention_layer_ids = [
         layer_idx
-        for layer_idx in range(start_layer, end_layer + 1)
+        for layer_idx in range(start_layer, end_layer)
         if hasattr(model_config, "swa_attention_layer_ids")
         and layer_idx in model_config.swa_attention_layer_ids
     ]
