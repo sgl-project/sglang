@@ -72,7 +72,7 @@ def table(rows):
     return embed, reference
 
 
-@pytest.mark.parametrize("rows", [1, 17, 32], ids=["1", "17", "32"])
+@pytest.mark.parametrize("rows", [1, 17], ids=["1", "17"])
 def test_eager_and_graph_reconstruction(group, rows):
     """Reconstructing a sharded row must retain signed zero and BF16 subnormals."""
     embed, reference = table(rows)

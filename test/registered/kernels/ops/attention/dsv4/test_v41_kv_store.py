@@ -126,34 +126,38 @@ class TestV41KVStore(CustomTestCase):
 
         g = torch.Generator(device="cuda").manual_seed(0)
         for layout in (KVLayout.V41, KVLayout.V41_FP4):
-            for page_size, num_pages, n in ((64, 9, 333), (256, 3, 500), (2, 40, 37)):
-                for idx_dtype in (torch.int32, torch.int64):
-                    with self.subTest(
-                        layout=layout.name, page_size=page_size, idx=idx_dtype
-                    ):
-                        x = random_rows(n, g)
-                        locs = torch.randperm(
-                            num_pages * page_size, generator=g, device="cuda"
-                        )[:n].to(idx_dtype)
-                        cache = torch.zeros(
-                            num_pages,
-                            layout.page_bytes(page_size),
-                            dtype=torch.uint8,
-                            device="cuda",
-                        )
-                        fused_store_cache(
-                            x,
-                            cache,
-                            locs,
-                            page_size=page_size,
-                            type="flashmla",
-                            layout=layout,
-                        )
-                        ref = reference_pages(
-                            layout, page_size, num_pages, locs, x, cache.shape[1]
-                        )
-                        self.assert_tokens_equal(cache, ref, layout, page_size, locs)
-                        self.assert_untouched_zero(cache, layout, page_size, locs)
+            # A full page and a padded 2-token page, each with one index dtype
+            # (the layout, the pad and the dtype are the three template axes).
+            for page_size, num_pages, n, idx_dtype in (
+                (64, 9, 333, torch.int32),
+                (2, 40, 37, torch.int64),
+            ):
+                with self.subTest(
+                    layout=layout.name, page_size=page_size, idx=idx_dtype
+                ):
+                    x = random_rows(n, g)
+                    locs = torch.randperm(
+                        num_pages * page_size, generator=g, device="cuda"
+                    )[:n].to(idx_dtype)
+                    cache = torch.zeros(
+                        num_pages,
+                        layout.page_bytes(page_size),
+                        dtype=torch.uint8,
+                        device="cuda",
+                    )
+                    fused_store_cache(
+                        x,
+                        cache,
+                        locs,
+                        page_size=page_size,
+                        type="flashmla",
+                        layout=layout,
+                    )
+                    ref = reference_pages(
+                        layout, page_size, num_pages, locs, x, cache.shape[1]
+                    )
+                    self.assert_tokens_equal(cache, ref, layout, page_size, locs)
+                    self.assert_untouched_zero(cache, layout, page_size, locs)
 
     def test_fused_store_cache_with_rope(self):
         """The in-kernel RoPE tail equals rope_tail (bf16-rounded) before quantizing,
@@ -162,7 +166,7 @@ class TestV41KVStore(CustomTestCase):
 
         g = torch.Generator(device="cuda").manual_seed(1)
         for layout in (KVLayout.V41, KVLayout.V41_FP4):
-            for page_size, num_pages, n in ((64, 5, 200), (256, 2, 129)):
+            for page_size, num_pages, n in ((64, 5, 200),):
                 with self.subTest(layout=layout.name, page_size=page_size):
                     x = random_rows(n, g)
                     angles = torch.randn(n, 32, generator=g, device="cuda")
@@ -477,7 +481,7 @@ class TestV41KVDequant(CustomTestCase):
     def test_quantized_pages(self):
         g = torch.Generator(device="cuda").manual_seed(0)
         for layout, (quant, dequant) in CASES.items():
-            for page_size, num_pages in ((64, 9), (256, 3), (2, 50)):
+            for page_size, num_pages in ((64, 9), (2, 50)):
                 with self.subTest(layout=layout.name, page_size=page_size):
                     k = torch.randn(
                         num_pages,

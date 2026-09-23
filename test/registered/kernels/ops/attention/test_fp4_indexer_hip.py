@@ -28,6 +28,7 @@ from sglang.kernels.ops.attention.dsv4 import (
     compress_norm_rope_store,
 )
 from sglang.kernels.ops.attention.dsv4.compress import CompressorPrefillPlan
+from sglang.kernels.ops.attention.dsv4.fp4_indexer import quantize_fp4_indexer_tensor
 from sglang.kernels.ops.attention.dsv4.fp4_indexer_hip import (
     FP4KWriteMetadata,
     _decode_cta_count,
@@ -35,17 +36,16 @@ from sglang.kernels.ops.attention.dsv4.fp4_indexer_hip import (
     aiter_fp4_paged_mqa_logits,
     aiter_k_indexer_fp4_cache_write,
     aiter_q_indexer_fp4,
+    pack_fp4_query_flydsl,
     prepare_fp4_decode_workspace,
     prepare_fp4_k_write_metadata,
     prepare_fp4_prefill_workspace,
-    sort_selection_rows,
 )
-from sglang.kernels.ops.attention.dsv4.topk import topk_transform_paged
 from sglang.srt.utils import get_device, is_gfx95_supported, is_hip
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_amd_ci(est_time=40, suite="stage-b-test-1-gpu-small-amd-mi35x")
+register_amd_ci(est_time=120, suite="stage-b-test-1-gpu-small-amd-mi35x")
 
 pytestmark = pytest.mark.skipif(
     not (is_hip() and is_gfx95_supported()),
@@ -285,7 +285,7 @@ def test_quantize_fp4_indexer_tensor(num_tokens: int) -> None:
     torch.testing.assert_close(_canonical_zero(stored_fp4), _canonical_zero(ref_fp4))
 
 
-@pytest.mark.parametrize("num_tokens", [1, 16], ids=["1", "16"])
+@pytest.mark.parametrize("num_tokens", [16], ids=["16"])
 @pytest.mark.parametrize("num_heads", [32], ids=["32"])
 def test_index_q_pack_weights_matches_standalone(
     num_tokens: int, num_heads: int
@@ -895,40 +895,71 @@ def test_row_chunks_reproduce_the_unsplit_batch() -> None:
             )
 
 
-@pytest.mark.parametrize("seq_len", [1024], ids=["1024"])
-def test_selection_past_index_topk_is_repeatable(seq_len: int) -> None:
-    """Rows longer than k: the AOT top-k emits its picks in atomic-counter order, so two launches
-    on the same scores differ; ordered by position they are identical, -1 padding last."""
-    torch.manual_seed(seq_len)
-    k, rows = 512, seq_len
-    scores = torch.randn(rows, seq_len, device=get_device())
-    seq_lens = torch.arange(1, rows + 1, device=get_device(), dtype=torch.int32)
-    pages = -(-seq_len // PAGE_SIZE)
-    page_table = (
-        torch.randperm(pages, device=get_device())
-        .to(torch.int32)
-        .expand(rows, -1)
-        .contiguous()
+def pack_fp4_query_flydsl_torch(q: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """The three-launch form of ``pack_fp4_query_flydsl``: the shared quantizer, then
+    zeros and a permuted copy into the scale layout."""
+    num_tokens, heads = q.shape[0], q.shape[1]
+    assert heads % 16 == 0 and heads <= 64, heads
+    q_fp4, q_sf = quantize_fp4_indexer_tensor(q.flatten(0, 1), rne=True)
+    q_fp4 = q_fp4.view(num_tokens, heads, 64)
+    sf_bytes = q_sf.view(torch.uint8).view(num_tokens, heads // 16, 16, 4)
+    q_scale = torch.zeros((num_tokens, 1, 4, 16, 4), dtype=torch.uint8, device=q.device)
+    q_scale[:, 0, :, :, : heads // 16] = sf_bytes.permute(0, 3, 2, 1)
+    return q_fp4, q_scale
+
+
+@pytest.mark.parametrize("heads", [32], ids=["32"])
+@pytest.mark.parametrize("dtype", [torch.bfloat16], ids=["torch.bfloat16"])
+def test_pack_fp4_query_flydsl_single_launch(heads: int, dtype):
+    torch.manual_seed(17)
+    for tokens in (1, 40):
+        q = torch.randn(tokens, heads, 128, device=get_device(), dtype=dtype) * 4
+        # exact fp4 grid points and tie values, zeros and a huge group
+        q[0, 0, :32] = torch.tensor(
+            [0.0, 0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0] * 4,
+            device=get_device(),
+            dtype=dtype,
+        )
+        q[0, 0, 32:64] = 0.0
+        q[0, 0, 64:96] = 3.0e4
+        ref_fp4, ref_scale = pack_fp4_query_flydsl_torch(q)
+        fp4, scale = pack_fp4_query_flydsl(q)
+        assert fp4.dtype is ref_fp4.dtype and scale.dtype is ref_scale.dtype
+        assert fp4.shape == ref_fp4.shape and scale.shape == ref_scale.shape
+        assert torch.equal(fp4, ref_fp4)
+        assert torch.equal(scale, ref_scale)
+    empty = torch.empty(0, heads, 128, device=get_device(), dtype=dtype)
+    fp4, scale = pack_fp4_query_flydsl(empty)
+    assert fp4.shape == (0, heads, 64) and scale.shape == (0, 1, 4, 16, 4)
+
+
+@pytest.mark.parametrize("compressed_kv", [False, True], ids=["False", "True"])
+def test_rope_fake_quant_gathers_freqs_by_position(compressed_kv: bool):
+    from sglang.kernels.ops.attention.dsv4.fp4_rope_fake_quant import (
+        rope_tail_fake_quant_fp4,
     )
 
-    def select():
-        page = torch.empty((rows, k), dtype=torch.int32, device=get_device())
-        raw = torch.empty_like(page)
-        topk_transform_paged(scores, seq_lens, page_table, page, PAGE_SIZE, raw)
-        sort_selection_rows(page, raw)
-        return page, raw
-
-    page_a, raw_a = select()
-    page_b, raw_b = select()
-    assert torch.equal(raw_a, raw_b) and torch.equal(page_a, page_b)
-    valid = raw_a >= 0
-    assert torch.equal(valid.sum(1), seq_lens.clamp_max(k))
-    # ascending positions inside the valid prefix, padding after it
-    assert bool((raw_a[:, 1:][valid[:, 1:]] > raw_a[:, :-1][valid[:, 1:]]).all())
-    assert bool((valid[:, :-1] | ~valid[:, 1:]).all())
-    pos = raw_a.clamp_min(0)
-    slots = page_table.gather(1, pos // PAGE_SIZE) * PAGE_SIZE + pos % PAGE_SIZE
-    assert torch.equal(page_a, torch.where(valid, slots, -1))
+    torch.manual_seed(19)
+    table = torch.polar(
+        torch.ones(4096, 32, device=get_device()),
+        torch.rand(4096, 32, device=get_device()) * 6.283,
+    )
+    for tokens, heads in ((1, 32), (17, 32)):
+        x = (
+            torch.randn(tokens, heads, 128, device=get_device(), dtype=torch.bfloat16)
+            * 3
+        )
+        for pos_dtype in (torch.int64, torch.int32):
+            pos = torch.randint(
+                0, 4096, (tokens,), device=get_device(), dtype=pos_dtype
+            )
+            ref = rope_tail_fake_quant_fp4(
+                x, table[pos], 64, compressed_kv=compressed_kv
+            )
+            out = rope_tail_fake_quant_fp4(
+                x, table, 64, compressed_kv=compressed_kv, positions=pos
+            )
+            assert torch.equal(out, ref)
 
 
 E2M1 = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0])

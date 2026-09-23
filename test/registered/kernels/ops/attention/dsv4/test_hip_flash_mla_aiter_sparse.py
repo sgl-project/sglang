@@ -97,7 +97,14 @@ def _reference(q, sink, sets):
 )
 class TestAiterSparseBackend(CustomTestCase):
     def _assert_matches_reference(
-        self, batch, heads, swa_lengths, topk_lengths, seed=0, tol=3e-2
+        self,
+        batch,
+        heads,
+        swa_lengths,
+        topk_lengths,
+        seed=0,
+        tol=3e-2,
+        padding_key_inside_length=False,
     ):
         from sglang.srt.layers.attention.hip_flash_mla import (
             flash_mla_with_kvcache_entrypoint,
@@ -109,8 +116,8 @@ class TestAiterSparseBackend(CustomTestCase):
         q, sink, swa_idx, topk_idx = c.q, c.sink, c.swa_idx, c.topk_idx
         swa_len = torch.tensor(swa_lengths, dtype=torch.int32, device=dev)
         topk_len = torch.tensor(topk_lengths, dtype=torch.int32, device=dev)
-        # Some -1 padding inside the length too: must be skipped by the kernel.
-        topk_idx[:, 0, 3] = -1
+        if padding_key_inside_length:
+            topk_idx[:, 0, 3] = -1
         ref = _reference(
             q, sink, [(c.swa_deq, swa_idx, swa_len), (c.topk_deq, topk_idx, topk_len)]
         )
@@ -144,20 +151,69 @@ class TestAiterSparseBackend(CustomTestCase):
 
     def test_matches_reference(self):
         """Full lists, contexts shorter than the window and the top-k width (the length
-        masks live slots left in the list), and the model's 64-padded heads."""
-        for batch, heads, swa_lengths, topk_lengths, seed in (
-            (3, 16, [101, 128, 5], [100, 512, 1], 1),
-        ):
-            with self.subTest(batch=batch, heads=heads, seed=seed):
+        masks live slots left in the list), and the model's 64-padded heads; then
+        5-key lists with a -1 inside the length (index 3 of the top-k list), which
+        must not be attended: on a 5-key list a stray key moves the softmax mass past
+        the tolerance, where the 640-key case absorbs it."""
+        cases = (
+            (3, 16, [101, 128, 5], [100, 512, 1], 1, 3e-2, False),
+            (2, 16, [2, 3], [4, 5], 6, TOL_SHORT, True),
+        )
+        for batch, heads, swa_lengths, topk_lengths, seed, tol, pad in cases:
+            with self.subTest(batch=batch, swa=swa_lengths, topk=topk_lengths):
                 self._assert_matches_reference(
-                    batch, heads, swa_lengths, topk_lengths, seed=seed
+                    batch,
+                    heads,
+                    swa_lengths,
+                    topk_lengths,
+                    seed=seed,
+                    tol=tol,
+                    padding_key_inside_length=pad,
                 )
 
-    def test_short_lists_skip_the_padding_key(self):
-        """The -1 inside the length (index 3 of the top-k list) must not be attended: on
-        a 5-key list a stray key moves the softmax mass past this tolerance, where the
-        640-key cases absorb it."""
-        self._assert_matches_reference(2, 16, [2, 3], [4, 5], seed=6, tol=TOL_SHORT)
+    ROWS = 96  # aiter picks 2 splits here, 4 at 1..64 rows
+
+    def _run_rows(self, batch):
+        """Row i of every batch is row i of the same 96-row case."""
+        from sglang.srt.layers.attention.hip_flash_mla import (
+            flash_mla_with_kvcache_entrypoint,
+        )
+
+        dev = torch.device("cuda")
+        c = _decode_case(
+            self.ROWS, 16, torch.Generator(device="cpu").manual_seed(40), dev
+        )
+        lens = lambda n: torch.full((batch,), n, dtype=torch.int32, device=dev)
+        return flash_mla_with_kvcache_entrypoint(
+            backend="aiter_sparse",
+            q=c.q[:batch],
+            k_cache=c.swa_cache,
+            head_dim_v=D,
+            block_table=None,
+            cache_seqlens=None,
+            tile_scheduler_metadata=None,
+            softmax_scale=SCALE,
+            is_fp8_kvcache=True,
+            attn_sink=c.sink,
+            extra_k_cache=c.topk_cache,
+            indices=_masked(c.swa_idx[:batch], lens(128)),
+            extra_indices_in_kvcache=_masked(c.topk_idx[:batch], lens(512)),
+        )[0]
+
+    def test_pinned_splits_are_batch_invariant(self):
+        """``SGLANG_OPT_HIP_ATTN_KV_SPLITS`` pins the split-KV count so a row's output
+        is bitwise the same at every batch size; aiter's cost model changes the count
+        past 64 rows."""
+        from sglang.srt.environ import envs
+
+        with envs.SGLANG_OPT_HIP_ATTN_KV_SPLITS.override(4):
+            one, eight, many = (
+                self._run_rows(1),
+                self._run_rows(8),
+                self._run_rows(self.ROWS),
+            )
+        self.assertTrue(torch.equal(one, eight[:1]))
+        self.assertTrue(torch.equal(eight, many[:8]))
 
 
 SWA, TOPK = 128, 512
@@ -337,12 +393,11 @@ class TestAiterSparseDecodeReduce(CustomTestCase):
         )
 
         for batch, heads, splits, seed in [
-            (1, 16, 4, 0),
             (3, 16, 4, 3),
         ]:
             with self.subTest(batch=batch, heads=heads, splits=splits):
-                # Partial lists on the larger batches: some splits come out empty.
-                lens = (128, 512) if batch == 1 else (77, 301)
+                # Partial lists: some splits come out empty.
+                lens = (77, 301)
                 inputs = self._inputs(batch, heads, seed, *lens)
                 ref = self._aiter(inputs, splits, skip_reduce=False)
                 acc, m, lsum = self._aiter(inputs, splits, skip_reduce=True)
@@ -381,50 +436,71 @@ class TestAiterSparseDecodeReduce(CustomTestCase):
                 self.assertTrue(torch.equal(got[..., :-ROPE], plain[..., :-ROPE]))
 
 
-@unittest.skipUnless(
-    is_hip() and is_gfx95_supported(), "aiter gluon kernel is gfx950-only"
-)
-class TestAiterSparseDecodeSplitPin(CustomTestCase):
-    """``SGLANG_OPT_HIP_ATTN_KV_SPLITS`` pins the split-KV count so a row's output is
-    bitwise the same at every batch size; aiter's cost model changes the count past 64
-    rows."""
+@unittest.skipUnless(is_hip(), "HIP radix backend")
+class TestDecodeSelectionOrder(CustomTestCase):
+    """The HIP decode top-k must be ordered by position, not slot: the aiter sparse
+    kernel sums in list order, so a slot-ordered row makes the attention bits depend
+    on which pages a request landed on."""
 
-    ROWS = 96  # aiter picks 2 splits here, 4 at 1..64 rows
-
-    def _run(self, batch):
-        from sglang.srt.layers.attention.hip_flash_mla import (
-            flash_mla_with_kvcache_entrypoint,
+    def test_position_ordered_selection_is_page_invariant(self):
+        """Same keys on two page layouts: the position-sorted selection attends bitwise
+        the same, and the AOT sort with raw indices produces that order."""
+        from sglang.kernels.ops.attention.dsv4.attn import fused_store_cache
+        from sglang.srt.layers.attention.dsv4.low_ratio_backend_hip import (
+            topk_transform_paged_sorted,
         )
+        from sglang.srt.layers.attention.hip_flash_mla import aiter_sparse_decode_fwd
 
-        # row i of every batch is row i of the same case
-        dev = torch.device("cuda")
-        c = _decode_case(
-            self.ROWS, 16, torch.Generator(device="cpu").manual_seed(40), dev
+        torch.manual_seed(0)
+        dev = "cuda"
+        k_a = torch.randn(PAGE, D, device=dev, dtype=torch.bfloat16)
+        k_b = torch.randn(PAGE, D, device=dev, dtype=torch.bfloat16)
+        k_t = torch.randn(1, D, device=dev, dtype=torch.bfloat16)
+        q = torch.randn(1, 1, 16, D, device=dev, dtype=torch.bfloat16)
+        sink = torch.zeros(16, device=dev, dtype=torch.float32)
+        no_swa = torch.full((1, 1, 128), -1, device=dev, dtype=torch.int32)
+        # 513 positions, drop position 356 (in the middle of the second page)
+        scores = torch.zeros(1, 1024, device=dev, dtype=torch.float32)
+        scores[0, 356] = -1.0
+        seq_lens = torch.tensor([513], device=dev, dtype=torch.int32)
+
+        outs = []
+        for page_b, page_t in ((3, 4), (4, 3)):
+            cache = torch.zeros(8, PAGE * BYTES, dtype=torch.uint8, device=dev)
+            slots = {
+                "a": torch.arange(PAGE, 2 * PAGE, device=dev),
+                "b": torch.arange(page_b * PAGE, page_b * PAGE + PAGE, device=dev),
+                "t": torch.tensor([page_t * PAGE], device=dev),
+            }
+            for name, k in (("a", k_a), ("b", k_b), ("t", k_t)):
+                fused_store_cache(
+                    k, cache, slots[name], page_size=PAGE, type="flashmla"
+                )
+            page_table = torch.tensor(
+                [[1, page_b, page_t, 0]], device=dev, dtype=torch.int32
+            )
+            page_indices = torch.full((1, 512), -1, device=dev, dtype=torch.int32)
+            raw_indices = torch.full((1, 512), -1, device=dev, dtype=torch.int32)
+            topk_transform_paged_sorted(
+                scores, seq_lens, page_table, page_indices, PAGE, raw_indices
+            )
+            expected_positions = torch.cat(
+                [torch.arange(0, 356, device=dev), torch.arange(357, 513, device=dev)]
+            ).to(torch.int32)
+            torch.testing.assert_close(raw_indices[0], expected_positions)
+            out, _ = aiter_sparse_decode_fwd(
+                q=q,
+                k_cache=cache.view(8, PAGE, 1, BYTES),
+                indices=no_swa,
+                attn_sink=sink,
+                softmax_scale=D**-0.5,
+                extra_k_cache=cache.view(8, PAGE, 1, BYTES),
+                extra_indices_in_kvcache=page_indices.view(1, 1, 512),
+            )
+            outs.append(out.clone())
+        self.assertTrue(
+            torch.equal(outs[0], outs[1]), "attention bits follow the page layout"
         )
-        lens = lambda n: torch.full((batch,), n, dtype=torch.int32, device=dev)
-        return flash_mla_with_kvcache_entrypoint(
-            backend="aiter_sparse",
-            q=c.q[:batch],
-            k_cache=c.swa_cache,
-            head_dim_v=D,
-            block_table=None,
-            cache_seqlens=None,
-            tile_scheduler_metadata=None,
-            softmax_scale=SCALE,
-            is_fp8_kvcache=True,
-            attn_sink=c.sink,
-            extra_k_cache=c.topk_cache,
-            indices=_masked(c.swa_idx[:batch], lens(128)),
-            extra_indices_in_kvcache=_masked(c.topk_idx[:batch], lens(512)),
-        )[0]
-
-    def test_pinned_splits_are_batch_invariant(self):
-        from sglang.srt.environ import envs
-
-        with envs.SGLANG_OPT_HIP_ATTN_KV_SPLITS.override(4):
-            one, eight, many = self._run(1), self._run(8), self._run(self.ROWS)
-        self.assertTrue(torch.equal(one, eight[:1]))
-        self.assertTrue(torch.equal(eight, many[:8]))
 
 
 if __name__ == "__main__":

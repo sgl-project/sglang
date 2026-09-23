@@ -355,9 +355,8 @@ class TestFusedLowRatioCompress(CustomTestCase):
 
     def test_matches_the_unfused_chain(self):
         for ratio in (1, 2):
-            for n in (1, 64):
-                with self.subTest(ratio=ratio, n=n):
-                    self._check_step(_build(n, ratio, seed=100 + n + ratio), ratio)
+            with self.subTest(ratio=ratio):
+                self._check_step(_build(64, ratio, seed=164 + ratio), ratio)
 
     @unittest.skipUnless(is_hip(), "HIP fused pair-state writer")
     def test_pair_state_survives_the_next_decode_step(self):

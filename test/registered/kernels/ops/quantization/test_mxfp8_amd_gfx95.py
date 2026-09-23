@@ -11,12 +11,10 @@ from sglang.kernels.ops.quantization.mxfp8_amd_gfx95 import (
     mxfp8_e4m3_quantize,
 )
 from sglang.kernels.ops.quantization.mxfp8_native_amd_gfx95 import (
-    large_m_plan,
     mxfp8_gemv,
     mxfp8_native_blockscaled_linear,
     native_route_plan,
     prepare_mxfp8_native_weight,
-    select_config,
     shuffle_mxfp8_weight,
     ue8m0_weight_scale,
 )
@@ -86,6 +84,20 @@ class TestMxfp8GemvGfx95(CustomTestCase):
 
 
 ROUTE_SHAPES = [(1856, 5120)]
+
+
+# The plan each M takes on the TP4 dense shape: a decode row through the gemv, a
+# small prefill through hipBLASLt (bf16 mirror) or the dot_scaled GEMM without one,
+# a large prefill through the dot_scaled GEMM. Pinned so a routing change shows up
+# here instead of only as a numerics drift elsewhere.
+def _expected_plan(m: int, has_bf16: bool) -> str:
+    if m <= 32:
+        return "gemv"
+    if m <= 1024:
+        return "hipblaslt_bf16" if has_bf16 else "dot_scaled"
+    return "dot_scaled"
+
+
 MS = (1, 33, 1025)
 
 
@@ -106,7 +118,13 @@ class TestMxfp8NativeRouteGfx95(CustomTestCase):
     def test_within_one_bf16_ulp_of_the_bf16_route(self):
         for n, k in ROUTE_SHAPES:
             wq, ws, w_sh, ws8, w_small, w_bf16 = self._weights(n, k)
+            has_bf16 = w_small is not None
             for m in MS:
+                plan = _expected_plan(m, has_bf16)
+                self.assertEqual(native_route_plan(m, n, k, has_bf16), plan, m)
+                # A free fp8 input must not change the kernel, or the bf16 and the
+                # fp8 entry points of one layer would sum in different orders.
+                self.assertEqual(native_route_plan(m, n, k, has_bf16, True), plan, m)
                 x = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
                 ref = bf16_dequant_blockscaled_linear(x, w_bf16)
                 out = mxfp8_native_blockscaled_linear(x, w_sh, ws8, w_small)
@@ -117,13 +135,7 @@ class TestMxfp8NativeRouteGfx95(CustomTestCase):
                 diff = (out.float() - ref.float()).abs()
                 self.assertTrue(
                     bool((diff <= ulp_of_row_max).all()),
-                    (
-                        n,
-                        k,
-                        m,
-                        native_route_plan(m, n, k, w_small is not None),
-                        (diff / ulp_of_row_max).max().item(),
-                    ),
+                    (n, k, m, plan, (diff / ulp_of_row_max).max().item()),
                 )
                 self.assertLess(
                     _bf16_ulp_diff(out, ref).gt(1).float().mean().item(),
@@ -140,33 +152,18 @@ class TestMxfp8NativeRouteGfx95(CustomTestCase):
                 out_q = mxfp8_native_blockscaled_linear(
                     xq, w_sh, ws8, w_small, input_scale=xs
                 )
-                has_bf16 = w_small is not None
-                if native_route_plan(m, n, k, has_bf16, False) == native_route_plan(
-                    m, n, k, has_bf16, True
-                ) and large_m_plan(m, n, k, False) == large_m_plan(m, n, k, True):
-                    self.assertTrue(torch.equal(out_q, out), (n, k, m))
-                else:  # a free fp8 input may pick another kernel: same operands
-                    diff_q = (out_q.float() - ref.float()).abs()
-                    self.assertTrue(bool((diff_q <= ulp_of_row_max).all()), (n, k, m))
-
-    def _kernel_identity(self, m, n, k, has_bf16):
-        """What decides the summation order for m tokens: the plan plus its tile."""
-        plan = native_route_plan(m, n, k, has_bf16)
-        if plan == "gemv":
-            cfg = select_config(m, n, k)
-            return ("gemv", cfg.waves, cfg.rows, cfg.ksplit, cfg.steps)
-        if plan == "dot_scaled":
-            return ("dot_scaled", large_m_plan(m, n, k))
-        return (plan, m)  # hipBLASLt picks its own kernel per M
+                self.assertTrue(torch.equal(out_q, out), (n, k, m))
 
     def test_repeatable_and_batch_invariant_inside_each_kernel(self):
+        """Rows that share a kernel (the gemv below 32 tokens; the dot_scaled GEMM
+        above 1024) sum in the same order at every batch size, so a prefix of a batch
+        is bitwise the batch's prefix."""
         n, k = 1856, 5120
         _, _, w_sh, ws8, w_small, _ = self._weights(n, k, seed=1)
         has_bf16 = w_small is not None
-        for m_lo, m_hi in (
-            (1, 32),
-            (1025, 1100),
-        ):
+        for plan, m_lo, m_hi in (("gemv", 1, 32), ("dot_scaled", 1025, 1100)):
+            for m in (m_lo, m_hi):
+                self.assertEqual(native_route_plan(m, n, k, has_bf16), plan, m)
             x = torch.randn(m_hi, k, device="cuda", dtype=torch.bfloat16)
             full = mxfp8_native_blockscaled_linear(x, w_sh, ws8, w_small)
             self.assertTrue(
@@ -174,18 +171,11 @@ class TestMxfp8NativeRouteGfx95(CustomTestCase):
                     mxfp8_native_blockscaled_linear(x, w_sh, ws8, w_small), full
                 )
             )
-            compared = 0
             for m in (m_lo, (m_lo + m_hi) // 2):
-                if self._kernel_identity(m, n, k, has_bf16) != self._kernel_identity(
-                    m_hi, n, k, has_bf16
-                ):
-                    continue  # a different tile or a per-M hipBLASLt kernel: another summation order
                 part = mxfp8_native_blockscaled_linear(
                     x[:m].contiguous(), w_sh, ws8, w_small
                 )
-                self.assertTrue(torch.equal(part, full[:m]), (m_lo, m_hi, m))
-                compared += 1
-            self.assertGreater(compared, 0, f"no M shared a kernel with {m_hi}: nothing compared")
+                self.assertTrue(torch.equal(part, full[:m]), (plan, m_hi, m))
 
 
 if __name__ == "__main__":

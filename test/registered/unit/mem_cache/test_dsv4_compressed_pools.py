@@ -275,7 +275,11 @@ class TestV41KVPoolLayouts(CustomTestCase):
             self.assertEqual(view.stride(0), pool.bytes_per_page_padded)
 
     def test_v41_pool_buffers(self):
-        for option, expect in ((None, KVLayout.V41_FP4), ("fp8", KVLayout.V41)):
+        for option, expect in (
+            (None, KVLayout.V41_FP4),
+            ("fp8", KVLayout.V41),
+            ("fp4", KVLayout.V41_FP4),
+        ):
             with self.subTest(compressed=option):
                 pool = self.make_pool([0, 0, 2, 1, 1], [2, 3], KVLayout.V41, option)
                 self.assert_kernel_requirements(pool.swa_kv_pool, KVLayout.V41)
@@ -289,6 +293,7 @@ class TestV41KVPoolLayouts(CustomTestCase):
                     )
                     self.assertTrue(is_valid_kv_layout_pair(pool.kv_layout, expect))
                     self.assert_kernel_requirements(pool.kv_pools[ratio], expect)
+                    self.assertEqual(pool.kv_pools[ratio].page_size, PAGE_SIZE // ratio)
         # A pool of the fp4 layout cannot be the main cache.
         with self.assertRaises(AssertionError):
             self.make_pool([0], [], KVLayout.V41_FP4)
@@ -401,8 +406,7 @@ class TestPagedDSparkWithEncoderReplay(CustomTestCase):
             spec_algorithm=spec,
             spec_aux_config=SimpleNamespace(dflash_draft_num_layers=3),
         )
-        with patch("sglang.srt.model_executor.pool_configurator._is_hip", True):
-            planner = DSV4PoolConfigurator(kvc)
+        planner = DSV4PoolConfigurator(kvc)
         self.assertEqual(planner.bytes_per_swa_token, 3 * 584)
         self.assertGreater(planner.swa_cap_tokens, 0)
         budget = 256 * 1024 * 1024

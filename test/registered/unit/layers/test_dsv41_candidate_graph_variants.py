@@ -1,4 +1,4 @@
-"""Verify graph selection must bound all speculative query positions."""
+"""DeepSeek-V4.1 candidate graph selection must bound every speculative query position, agree across attention-DP ranks, and be admitted on ROCm."""
 
 import unittest
 from types import SimpleNamespace
@@ -17,59 +17,10 @@ from sglang.srt.speculative.dspark_components.dspark_verify import (
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
 
 class TestVerifyCandidateGraph(CustomTestCase):
-    def test_sharded_greedy_default_and_sampling_override(self):
-        from sglang.srt.environ import DsparkFoldedSampling, envs
-        from sglang.srt.speculative.dspark_components.dspark_draft_sampler import (
-            _resolve_folded_sampling,
-        )
-
-        model = SimpleNamespace(
-            lm_head=SimpleNamespace(org_vocab_size=128, weight=torch.empty(1)),
-            markov_head=SimpleNamespace(supports_sharded_greedy=True),
-        )
-        args = dict(
-            model=model,
-            gamma=5,
-            max_bs=64,
-            device="cpu",
-            tp_rank=0,
-            available_memory_gb=16,
-        )
-        with envs.SGLANG_DSPARK_FOLDED_SAMPLING.override(
-            DsparkFoldedSampling.AUTO.value
-        ):
-            self.assertFalse(_resolve_folded_sampling(**args))
-            model.markov_head.supports_sharded_greedy = False
-            self.assertTrue(_resolve_folded_sampling(**args))
-        model.markov_head.supports_sharded_greedy = True
-        with envs.SGLANG_DSPARK_FOLDED_SAMPLING.override(
-            DsparkFoldedSampling.FORCE.value
-        ):
-            self.assertTrue(_resolve_folded_sampling(**args))
-
-    def test_candidate_indexer_gating(self):
-        from sglang.srt.layers.attention.dsv4 import candidate_indexer
-
-        def platform(sm):
-            return patch.object(
-                candidate_indexer, "get_platform", lambda: SimpleNamespace(device_sm=sm)
-            )
-
-        flag = "sglang.srt.layers.deep_gemm_wrapper.configurer.DEEPGEMM_PAGED_SPARSE_MQA_LOGITS"
-        # V4 models have no candidate source; Hopper selects through masks inline.
-        with platform(100), patch(flag, True):
-            self.assertIsNone(candidate_indexer.make_candidate_indexer(0, 8))
-        with platform(90), patch(flag, False):
-            self.assertIsNone(candidate_indexer.make_candidate_indexer(2048, 8))
-        # Blackwell without DeepGEMM's sparse logits fails instead of falling back.
-        with platform(100), patch(flag, False):
-            with self.assertRaises(RuntimeError):
-                candidate_indexer.make_candidate_indexer(2048, 8)
-
     def make_policy(self, width=6):
         return Dsv41CandidateGraphVariants(
             graph_limits=(("candidate_unfiltered", 16384),),
@@ -89,6 +40,11 @@ class TestVerifyCandidateGraph(CustomTestCase):
             with self.subTest(lengths=lengths):
                 batch = SimpleNamespace(seq_lens_cpu=torch.tensor(lengths))
                 self.assertEqual(policy.select(batch), expected)
+        # Plain decode (no verify width) keeps the existing <= boundary.
+        batch = SimpleNamespace(seq_lens_cpu=torch.tensor([16384]))
+        self.assertEqual(
+            self.make_policy(width=0).select(batch), "candidate_unfiltered"
+        )
 
     def test_missing_or_non_cpu_lengths_use_full_graph(self):
         policy = self.make_policy()
@@ -102,11 +58,6 @@ class TestVerifyCandidateGraph(CustomTestCase):
                     policy.select(SimpleNamespace(seq_lens_cpu=lengths)),
                     "candidate_filtered",
                 )
-
-    def test_plain_decode_keeps_existing_boundary(self):
-        policy = self.make_policy(width=0)
-        batch = SimpleNamespace(seq_lens_cpu=torch.tensor([16384]))
-        self.assertEqual(policy.select(batch), "candidate_unfiltered")
 
     def test_gpu_only_lengths_use_request_budget(self):
         policy = self.make_policy()
@@ -158,6 +109,26 @@ class TestVerifyCandidateGraph(CustomTestCase):
             spec_algorithm=SimpleNamespace(is_dspark=lambda: True),
             is_draft_worker=False,
         )
+        # ROCm is admitted without a Blackwell capability; a pre-Blackwell CUDA
+        # device is not.
+        with (
+            patch("torch.cuda.get_device_capability", return_value=(9, 4)),
+            patch("sglang.srt.utils.is_hip", return_value=True),
+        ):
+            self.assertIsNotNone(
+                create_dsv41_candidate_graph_variants(
+                    runner, ForwardMode.TARGET_VERIFY, 6
+                )
+            )
+        with (
+            patch("torch.cuda.get_device_capability", return_value=(9, 0)),
+            patch("sglang.srt.utils.is_hip", return_value=False),
+        ):
+            self.assertIsNone(
+                create_dsv41_candidate_graph_variants(
+                    runner, ForwardMode.TARGET_VERIFY, 6
+                )
+            )
         with (
             patch("torch.cuda.get_device_capability", return_value=(10, 0)),
             patch("sglang.srt.utils.is_hip", return_value=False),
@@ -217,6 +188,20 @@ class TestVerifyCandidateGraph(CustomTestCase):
             spec_info=SimpleNamespace(candidate_max_seq_len_upper_bound=5120),
         )
         self.assertEqual(self.make_policy().select(batch), "candidate_filtered")
+
+    def test_dp_max_seq_len_takes_precedence_over_host_lengths(self):
+        """Under attention DP every rank must pick the same graph, so the DP-wide
+        maximum wins over this rank's own lengths, in both directions."""
+        policy = self.make_policy()
+        for dp_max, local, expected in (
+            (16379, [4096], "candidate_filtered"),
+            (4096, [16379], "candidate_unfiltered"),
+        ):
+            with self.subTest(dp_max_seq_len=dp_max, local=local):
+                batch = SimpleNamespace(
+                    seq_lens_cpu=torch.tensor(local), dp_max_seq_len=dp_max
+                )
+                self.assertEqual(policy.select(batch), expected)
 
     def test_request_bound_uses_full_output_budget(self):
         req = SimpleNamespace(

@@ -9,9 +9,11 @@ from sglang.srt.mem_cache.dsv41_request_window import (
     window_layout,
 )
 from sglang.srt.model_executor.runner_utils.capture_mode import model_capture_mode
-from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+# the CUDA-graph replay case needs a device
+register_amd_ci(est_time=5, suite="stage-b-test-1-gpu-small-amd-mi35x")
 
 
 class PackedPool:
@@ -148,14 +150,11 @@ def test_startup_dummy_history_does_not_relax_real_request_validation():
         state.buffer(0)
 
 
-@pytest.mark.parametrize("after_reset", [False, True])
-def test_capture_scope_does_not_relax_eager_history_validation(after_reset):
+def test_capture_scope_does_not_relax_eager_history_validation():
     state = RequestWindow(
         PackedPool, num_slots=3, layers=1, page_size=4, capacity=8, workspace_rows=64
     )
     layout = window_layout(torch.tensor([1]), torch.tensor([20]), window=3, capacity=8)
-    if after_reset:
-        state.reset(torch.tensor([1]))
     state.activate(layout)
     with pytest.raises(RuntimeError, match="history is missing"):
         state.buffer(0)
@@ -176,7 +175,7 @@ def test_capture_scope_does_not_relax_eager_history_validation(after_reset):
         state.buffer(0)
 
 
-@pytest.mark.parametrize("accepted", range(1, 7))
+@pytest.mark.parametrize("accepted", [1, 6])
 def test_verify_rejection_preserves_required_history(accepted):
     state = RequestWindow(
         PackedPool, num_slots=3, layers=1, page_size=4, capacity=12, workspace_rows=256

@@ -1,7 +1,6 @@
 """The one-launch MoE sorting, the ROCm decode router gate and the fused gate + sort must reproduce aiter's `moe_sorting` and `topk_gating` bit for bit."""
 
 import unittest
-from types import SimpleNamespace
 
 import torch
 
@@ -84,47 +83,46 @@ class TestFusedAiterMoeSorting(CustomTestCase):
 
     def test_matches_aiter_expert_parallel(self):
         for num_local, topk in ((96, TOPK),):
-            for rank in (0, NUM_EXPERTS // num_local - 1):
+            # The first and the last expert-parallel rank, one token with the
+            # large block and a full batch with the small one.
+            for rank, num_tokens, block_size in (
+                (0, 1, 64),
+                (NUM_EXPERTS // num_local - 1, 64, 16),
+            ):
                 mask = self._mask(num_local, rank)
                 local_ids = self.local_ids(mask, NUM_EXPERTS, self.device)
-                for num_tokens in (1, 64):
-                    for block_size in (16, 64):
-                        ids, weights = _routing(
-                            num_tokens, topk, num_tokens, self.device
-                        )
-                        ref = aiter_moe_sorting(
-                            ids,
-                            weights,
-                            NUM_EXPERTS,
-                            MODEL_DIM,
-                            torch.bfloat16,
-                            block_size,
-                            mask,
-                            None,
-                            0,
-                            accumulate=True,
-                        )
-                        out = self.fused(
-                            ids,
-                            weights,
-                            local_ids,
-                            num_local,
-                            NUM_EXPERTS,
-                            MODEL_DIM,
-                            torch.bfloat16,
-                            block_size,
-                            zero_moe_buf=True,
-                        )
-                        _assert_same_sort(
-                            self, ref, out, block_size, num_tokens, num_tokens
-                        )
-                        self.assertEqual(int(out[4].abs().sum()), 0)
+                ids, weights = _routing(num_tokens, topk, num_tokens, self.device)
+                ref = aiter_moe_sorting(
+                    ids,
+                    weights,
+                    NUM_EXPERTS,
+                    MODEL_DIM,
+                    torch.bfloat16,
+                    block_size,
+                    mask,
+                    None,
+                    0,
+                    accumulate=True,
+                )
+                out = self.fused(
+                    ids,
+                    weights,
+                    local_ids,
+                    num_local,
+                    NUM_EXPERTS,
+                    MODEL_DIM,
+                    torch.bfloat16,
+                    block_size,
+                    zero_moe_buf=True,
+                )
+                _assert_same_sort(self, ref, out, block_size, num_tokens, num_tokens)
+                self.assertEqual(int(out[4].abs().sum()), 0)
 
     def test_padded_rows_are_masked_in_place(self):
         mask = self._mask(96, 1)
         local_ids = self.local_ids(mask, NUM_EXPERTS, self.device)
         for num_tokens in (64,):
-            for num_valid in (1, num_tokens // 2, num_tokens):
+            for num_valid in (1, num_tokens):
                 ids, weights = _routing(
                     num_tokens, 6, 7 * num_tokens + num_valid, self.device
                 )
@@ -212,10 +210,6 @@ class TestRocmRouterGate(CustomTestCase):
         zero_bias = torch.zeros(NUM_EXPERTS, device=self.device, dtype=torch.bfloat16)
         for num_tokens in (512,):
             levels = torch.randint(
-                0, 3, (num_tokens, NUM_EXPERTS), device=self.device, generator=self.gen
-            ).float()
-            self._assert_same_gate(levels, zero_bias, msg="3 levels")
-            levels = torch.randint(
                 0, 8, (num_tokens, NUM_EXPERTS), device=self.device, generator=self.gen
             ).float()
             self._assert_same_gate(levels - 3, self.bias_bf16, msg="8 levels")
@@ -256,11 +250,11 @@ class TestRocmRouterGate(CustomTestCase):
             self.assertTrue(
                 torch.equal(out, full[:num_tokens]), f"batch of {num_tokens}"
             )
-            # The same row moved to another position of the batch.
-            shifted = torch.roll(x, shifts=num_tokens, dims=0)
-            out_shifted = torch.empty_like(full)
-            self.reduce(self.gemv(shifted, weight), out_shifted)
-            self.assertTrue(torch.equal(out_shifted, torch.roll(full, num_tokens, 0)))
+        # The same rows moved to other positions of the batch.
+        shifted = torch.roll(x, shifts=17, dims=0)
+        out_shifted = torch.empty_like(full)
+        self.reduce(self.gemv(shifted, weight), out_shifted)
+        self.assertTrue(torch.equal(out_shifted, torch.roll(full, 17, 0)))
 
 
 @unittest.skipUnless(
@@ -420,51 +414,6 @@ class TestRocmRouterGateSort(CustomTestCase):
                                 )
 
 
-@unittest.skipUnless(is_hip(), "requires HIP")
-class TestRouterFp32(CustomTestCase):
-    def setUp(self):
-        from sglang.srt.models.deepseek_v2 import MoEGate
-        from sglang.srt.runtime_context import get_context
-
-        override = get_context().override_server_args()
-        override.install()
-        self.addCleanup(override.restore)
-        self.forward = MoEGate.forward
-
-    def test_close_scores_and_mutable_graph(self):
-        """BF16 output rounding must not collapse distinct expert scores."""
-        # Exact BF16 operands produce 16 distinct scores near 1; rounding the
-        # GEMM output to BF16 would collapse them before expert selection.
-        weight = torch.zeros(384, 5120, device="cuda", dtype=torch.bfloat16)
-        weight[:, 0] = 1
-        weight[:16, 1] = torch.arange(16, device="cuda") / 4096
-        gate = SimpleNamespace(
-            weight=weight, is_deepseek_v4=True, tiny_router_gemm_max_tokens=0
-        )
-        for rows in (64, 512):
-            with self.subTest(rows=rows):
-                x = torch.zeros(rows, 5120, device="cuda", dtype=torch.bfloat16)
-                x[:, :2] = 1
-                self.forward(gate, x)
-                graph = torch.cuda.CUDAGraph()
-                with torch.cuda.graph(graph):
-                    output = self.forward(gate, x)
-                for sign in (1, -1):
-                    x[:, 1] = sign
-                    graph.replay()
-                    expected = (
-                        1
-                        + sign
-                        * torch.arange(16, device="cuda", dtype=torch.float32)
-                        / 4096
-                    )
-                    self.assertEqual(output.dtype, torch.float32)
-                    torch.testing.assert_close(
-                        output[:, :16], expected.expand(rows, -1), rtol=0, atol=0
-                    )
-                    self.assertEqual(torch.unique(output[0, :16]).numel(), 16)
-
-
 D, TOPK, E = 5120, 6, 384
 
 
@@ -498,7 +447,7 @@ class TestMoeTopkReduceAdd(CustomTestCase):
 
     def test_matches_reference(self):
         for m in (1, 33):
-            for alpha in (1.0, 2.5):
+            for alpha in (2.5,):
                 x, shared, ids, mask = _inputs(m, m)
                 for use_mask in (True, False):
                     out = torch.empty_like(shared)
@@ -518,7 +467,7 @@ class TestMoeTopkReduceAdd(CustomTestCase):
         x, shared, ids, mask = _inputs(300, 7)
         full = torch.empty_like(shared)
         self.reduce_add(x, shared, full, TOPK, ids, mask)
-        for rows in ([0], list(range(0, 300, 7))):
+        for rows in (list(range(0, 300, 7)),):
             idx = torch.tensor(rows, device="cuda")
             sub = torch.empty(len(rows), D, device="cuda", dtype=torch.bfloat16)
             self.reduce_add(

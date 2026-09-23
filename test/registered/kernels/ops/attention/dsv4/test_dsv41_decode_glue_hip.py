@@ -1,4 +1,4 @@
-"""Single-launch replacements for the DeepSeek-V4.1 decode glue on HIP must be bitwise the torch chains they replace."""
+"""The DeepSeek-V4.1 decode glue on HIP: single-launch replacements must be bitwise the torch chains they replace, and the two-level top-k must select the reference's blocks and positions without reading past a row's reach."""
 
 from __future__ import annotations
 
@@ -12,11 +12,8 @@ from sglang.kernels.ops.attention.dsv4.attn_glue_hip import (
     expand_index_page_table,
     low_ratio_compression_metadata,
 )
-from sglang.kernels.ops.attention.dsv4.fp4_indexer import quantize_fp4_indexer_tensor
-from sglang.kernels.ops.attention.dsv4.fp4_indexer_hip import (
-    pack_fp4_query_flydsl,
-    sort_selection_rows,
-)
+from sglang.kernels.ops.attention.dsv4.fp4_indexer_hip import sort_selection_rows
+from sglang.kernels.ops.attention.dsv4.topk import topk_transform_paged
 from sglang.srt.layers.attention.deepseek_v4_backend import (
     _low_ratio_compression_metadata,
 )
@@ -31,6 +28,7 @@ from sglang.srt.layers.attention.dsv4.low_ratio_backend_hip import (
 )
 from sglang.srt.utils import is_gfx95_supported, is_hip
 from sglang.test.ci.ci_register import register_amd_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_amd_ci(est_time=25, suite="stage-b-kernel-test-1-gpu-amd-mi35x")
 
@@ -40,6 +38,167 @@ pytestmark = pytest.mark.skipif(
 )
 
 DEVICE = "cuda"
+
+INDEX_PAGE_SIZE = 64
+TOPK = 512
+# Released V4.1 config; the span 2048 x 8 = 16384 is where level one starts to bind.
+TOPK_BLOCKS, BLOCK_SIZE = 2048, 8
+
+
+def index_slots(page_table, pos):
+    """Slot of compressed position `pos` through the expanded indexer page table."""
+    return (
+        page_table.gather(1, pos // INDEX_PAGE_SIZE) * INDEX_PAGE_SIZE
+        + pos % INDEX_PAGE_SIZE
+    )
+
+
+def reference_position_mask(logits, lens, topk_blocks, block_size):
+    """The reference's level one on logits whose tail past the reach is -inf."""
+    from sglang.srt.layers.attention.dsv4.candidate_indexer import (
+        select_candidate_blocks,
+    )
+
+    col = torch.arange(logits.shape[1], device=logits.device)
+    pre = logits.masked_fill(col >= lens[:, None], -torch.inf)
+    return select_candidate_blocks(
+        pre, lens[:, None], topk_blocks=topk_blocks, block_size=block_size
+    )
+
+
+def candidate_block_ids_to_mask(ids, num_blocks):
+    """bool [rows, num_blocks] block mask of `CandidateBlocks.ids`."""
+    rows = ids.shape[0]
+    # column num_blocks is the sink for the -1 padding; the mask is the view before it
+    keep = torch.zeros((rows, num_blocks + 1), dtype=torch.bool, device=ids.device)
+    keep.scatter_(1, ids.masked_fill(ids < 0, num_blocks).to(torch.int64), True)
+    return keep[:, :num_blocks]
+
+
+def ids_to_position_mask(ids, block_size, width):
+    num_blocks = (width + block_size - 1) // block_size
+    keep = candidate_block_ids_to_mask(ids, num_blocks)
+    return keep.repeat_interleave(block_size, dim=-1)[:, :width]
+
+
+def reference_consumer_rows(logits, lens, pos_mask, topk):
+    """Per row: the set the reference consumer selects among the reachable candidates
+    and its valid count; tie-free logits make it exact."""
+    col = torch.arange(logits.shape[1], device=logits.device)
+    out = []
+    for b in range(logits.shape[0]):
+        n = int(lens[b])
+        cand = pos_mask[b] & (col < n)
+        n_cand = int(cand.sum())
+        k = min(topk, n_cand)
+        s = logits[b].masked_fill(~cand, -torch.inf)
+        out.append((set(s.topk(k).indices.tolist()), k))
+    return out
+
+
+class TestTwoLevelDecodeHip(CustomTestCase):
+    """Level one of the two-level top-k: the source keeps TOPK_BLOCKS x BLOCK_SIZE positions, later ratio-1 sources select inside them."""
+
+    def _garbage_tail(self, logits, lens):
+        """Kernel garbage past each row's reach (large positives on even rows, NaN on
+        odd), so a helper reading the tail fails loudly."""
+        col = torch.arange(logits.shape[1], device=logits.device)
+        tail = col[None, :] >= lens[:, None]
+        odd = (torch.arange(logits.shape[0], device=logits.device) % 2 == 1)[:, None]
+        logits = logits.masked_fill(tail & ~odd, 1e4)
+        return logits.masked_fill(tail & odd, torch.nan)
+
+    def _assert_consumer_matches_reference(self, logits, seq, cands, page_table, msg):
+        from sglang.srt.layers.attention.dsv4.low_ratio_backend_hip import (
+            topk_within_candidate_blocks_hip,
+        )
+
+        rows, width = logits.shape
+        page_indices = torch.full((rows, TOPK), 7, dtype=torch.int32, device="cuda")
+        raw_indices = torch.full((rows, TOPK), 7, dtype=torch.int32, device="cuda")
+        topk_within_candidate_blocks_hip(
+            logits,
+            seq,
+            cands,
+            page_table=page_table,
+            page_size=INDEX_PAGE_SIZE,
+            page_indices=page_indices,
+            raw_indices=raw_indices,
+        )
+        pos_mask = ids_to_position_mask(cands.ids, cands.block_size, width)
+        for b, (want, k) in enumerate(
+            reference_consumer_rows(logits, seq, pos_mask, TOPK)
+        ):
+            got = raw_indices[b]
+            self.assertTrue(bool((got[:k] >= 0).all()), f"{msg}: prefix row {b}")
+            self.assertTrue(bool((got[k:] == -1).all()), f"{msg}: padding row {b}")
+            self.assertEqual(set(got[:k].tolist()), want, f"{msg}: selection row {b}")
+            sel = got[:k].to(torch.int64)
+            expect = index_slots(page_table[b : b + 1], sel[None])[0]
+            self.assertTrue(
+                torch.equal(page_indices[b, :k].to(torch.int64), expect),
+                f"{msg}: slots row {b}",
+            )
+            self.assertTrue(bool((page_indices[b, k:] == -1).all()))
+
+    def test_level_one_matches_reference_under_garbage_tail(self):
+        """The HIP block top-k (AOT row-split and torch fallback) must publish the
+        reference's blocks and never read past a row's reach."""
+        from sglang.srt.layers.attention.dsv4.low_ratio_backend_hip import (
+            select_candidate_blocks_hip,
+        )
+
+        torch.manual_seed(11)
+        cases = (
+            # Released blocks, a rectangle just wider than the longest row.
+            (TOPK_BLOCKS, BLOCK_SIZE, 40000, [3, 8, 16384, 16385, 20000, 40000, 1]),
+            # Released blocks on a 1M-wide rectangle, the page table's capacity on
+            # a 1M-context server: the block top-k takes the AOT row-split path.
+            (TOPK_BLOCKS, BLOCK_SIZE, 1 << 20, [16385, 131072, 7, 600]),
+        )
+        for topk_blocks, block_size, width, lens in cases:
+            with self.subTest(topk_blocks=topk_blocks, width=width, lens=lens):
+                seq = torch.tensor(lens, dtype=torch.int32, device="cuda")
+                raw = torch.randn(len(lens), width, device="cuda")
+                raw = self._garbage_tail(raw, seq)
+                expected = reference_position_mask(raw, seq, topk_blocks, block_size)
+
+                cands = select_candidate_blocks_hip(
+                    raw, seq, topk_blocks=topk_blocks, block_size=block_size
+                )
+                ids = cands.ids
+                self.assertEqual(ids.shape, (len(lens), topk_blocks))
+                self.assertTrue(
+                    torch.equal(
+                        cands.compact_lens.cpu(),
+                        torch.tensor(
+                            [
+                                min((n + block_size - 1) // block_size, topk_blocks)
+                                * block_size
+                                for n in lens
+                            ],
+                            dtype=torch.int32,
+                        ),
+                    )
+                )
+                self.assertEqual(ids.dtype, torch.int32)
+                got = ids_to_position_mask(ids, block_size, width)
+                self.assertTrue(torch.equal(got, expected), "published blocks")
+                for b, n in enumerate(lens):
+                    row = ids[b]
+                    n_ids = int((row >= 0).sum())
+                    self.assertTrue(bool((row[:n_ids] >= 0).all()), "padding last")
+                    self.assertLessEqual(
+                        int(got[b, :n].sum()), topk_blocks * block_size
+                    )
+
+                n_pages = (width + INDEX_PAGE_SIZE - 1) // INDEX_PAGE_SIZE
+                page_table = torch.stack(
+                    [torch.randperm(n_pages, device="cuda") for _ in lens]
+                ).to(torch.int32)
+                self._assert_consumer_matches_reference(
+                    raw, seq, cands, page_table, "consumer"
+                )
 
 
 def _seed(seed: int) -> random.Random:
@@ -223,64 +382,43 @@ def test_low_ratio_compression_metadata(loc_dtype, ratios):
             assert torch.equal(out[f"c{r}_topk_lengths_clamp1"], ref_clamp1)
 
 
-def pack_fp4_query_flydsl_torch(q: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """The three-launch form of ``pack_fp4_query_flydsl``: the shared quantizer, then
-    zeros and a permuted copy into the scale layout."""
-    num_tokens, heads = q.shape[0], q.shape[1]
-    assert heads % 16 == 0 and heads <= 64, heads
-    q_fp4, q_sf = quantize_fp4_indexer_tensor(q.flatten(0, 1), rne=True)
-    q_fp4 = q_fp4.view(num_tokens, heads, 64)
-    sf_bytes = q_sf.view(torch.uint8).view(num_tokens, heads // 16, 16, 4)
-    q_scale = torch.zeros((num_tokens, 1, 4, 16, 4), dtype=torch.uint8, device=q.device)
-    q_scale[:, 0, :, :, : heads // 16] = sf_bytes.permute(0, 3, 2, 1)
-    return q_fp4, q_scale
-
-
-@pytest.mark.parametrize("heads", [32], ids=["32"])
-@pytest.mark.parametrize("dtype", [torch.bfloat16], ids=["torch.bfloat16"])
-def test_pack_fp4_query_flydsl_single_launch(heads: int, dtype):
-    _seed(17)
-    for tokens in (1, 40):
-        q = torch.randn(tokens, heads, 128, device=DEVICE, dtype=dtype) * 4
-        # exact fp4 grid points and tie values, zeros and a huge group
-        q[0, 0, :32] = torch.tensor(
-            [0.0, 0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0] * 4, device=DEVICE, dtype=dtype
-        )
-        q[0, 0, 32:64] = 0.0
-        q[0, 0, 64:96] = 3.0e4
-        ref_fp4, ref_scale = pack_fp4_query_flydsl_torch(q)
-        fp4, scale = pack_fp4_query_flydsl(q)
-        assert fp4.dtype is ref_fp4.dtype and scale.dtype is ref_scale.dtype
-        assert fp4.shape == ref_fp4.shape and scale.shape == ref_scale.shape
-        assert torch.equal(fp4, ref_fp4)
-        assert torch.equal(scale, ref_scale)
-    empty = torch.empty(0, heads, 128, device=DEVICE, dtype=dtype)
-    fp4, scale = pack_fp4_query_flydsl(empty)
-    assert fp4.shape == (0, heads, 64) and scale.shape == (0, 1, 4, 16, 4)
-
-
-@pytest.mark.parametrize("compressed_kv", [False, True], ids=["False", "True"])
-def test_rope_fake_quant_gathers_freqs_by_position(compressed_kv: bool):
-    from sglang.kernels.ops.attention.dsv4.fp4_rope_fake_quant import (
-        rope_tail_fake_quant_fp4,
+@pytest.mark.parametrize("seq_len", [1024], ids=["1024"])
+def test_selection_past_index_topk_is_repeatable(seq_len: int) -> None:
+    """Rows longer than k: the AOT top-k emits its picks in atomic-counter order, so two launches
+    on the same scores differ; ordered by position they are identical, -1 padding last."""
+    torch.manual_seed(seq_len)
+    k, rows = 512, seq_len
+    scores = torch.randn(rows, seq_len, device=DEVICE)
+    seq_lens = torch.arange(1, rows + 1, device=DEVICE, dtype=torch.int32)
+    pages = -(-seq_len // INDEX_PAGE_SIZE)
+    page_table = (
+        torch.randperm(pages, device=DEVICE)
+        .to(torch.int32)
+        .expand(rows, -1)
+        .contiguous()
     )
 
-    _seed(19)
-    table = torch.polar(
-        torch.ones(4096, 32, device=DEVICE),
-        torch.rand(4096, 32, device=DEVICE) * 6.283,
+    def select():
+        page = torch.empty((rows, k), dtype=torch.int32, device=DEVICE)
+        raw = torch.empty_like(page)
+        topk_transform_paged(scores, seq_lens, page_table, page, INDEX_PAGE_SIZE, raw)
+        sort_selection_rows(page, raw)
+        return page, raw
+
+    page_a, raw_a = select()
+    page_b, raw_b = select()
+    assert torch.equal(raw_a, raw_b) and torch.equal(page_a, page_b)
+    valid = raw_a >= 0
+    assert torch.equal(valid.sum(1), seq_lens.clamp_max(k))
+    # ascending positions inside the valid prefix, padding after it
+    assert bool((raw_a[:, 1:][valid[:, 1:]] > raw_a[:, :-1][valid[:, 1:]]).all())
+    assert bool((valid[:, :-1] | ~valid[:, 1:]).all())
+    pos = raw_a.clamp_min(0)
+    slots = (
+        page_table.gather(1, pos // INDEX_PAGE_SIZE) * INDEX_PAGE_SIZE
+        + pos % INDEX_PAGE_SIZE
     )
-    for tokens, heads in ((1, 32), (17, 32)):
-        x = torch.randn(tokens, heads, 128, device=DEVICE, dtype=torch.bfloat16) * 3
-        for pos_dtype in (torch.int64, torch.int32):
-            pos = torch.randint(0, 4096, (tokens,), device=DEVICE, dtype=pos_dtype)
-            ref = rope_tail_fake_quant_fp4(
-                x, table[pos], 64, compressed_kv=compressed_kv
-            )
-            out = rope_tail_fake_quant_fp4(
-                x, table, 64, compressed_kv=compressed_kv, positions=pos
-            )
-            assert torch.equal(out, ref)
+    assert torch.equal(page_a, torch.where(valid, slots, -1))
 
 
 def test_page_table_from_req_to_token_matches_torch():

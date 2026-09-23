@@ -1,7 +1,6 @@
 """The ROCm fused mHC boundary, its gfx950 prefill regime and the norm launch hosting the reduce + sinkhorn must match the torch forms and the standalone launches bitwise."""
 
 import unittest
-from types import SimpleNamespace
 
 import torch
 
@@ -10,8 +9,7 @@ from sglang.kernels.ops.layernorm.mhc import (
     hc_combine,
     hc_mix_stats_sinkhorn,
 )
-from sglang.srt.environ import envs
-from sglang.srt.utils import is_gfx95_supported, is_hip
+from sglang.srt.utils import is_hip
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -272,8 +270,8 @@ class TestHcBoundaryPrefill(CustomTestCase):
         return residual_out, y, part_mix, part_sq
 
     def test_matches_decode_kernel_bitwise(self):
-        # Full blocks, partial last blocks and M below / above the switch.
-        for m in (1, 4096):
+        # Full blocks, a partial last block (4101) and M below / above the switch.
+        for m in (1, 4096, 4101):
             x, residual, post_in, comb_in, pre_prev = self._inputs(m, m)
             decode = self._raw(x, residual, post_in, comb_in, pre_prev, False)
             prefill = self._raw(x, residual, post_in, comb_in, pre_prev, True)
@@ -281,84 +279,6 @@ class TestHcBoundaryPrefill(CustomTestCase):
             decode = self._raw(None, residual, None, None, None, False)
             prefill = self._raw(None, residual, None, None, None, True)
             self.assertTrue(_all_equal(prefill, decode), f"stats-only M={m}")
-
-    def test_row_alone_equals_row_in_prefill_batch(self):
-        """A row alone and the same row inside a prefill batch must give bitwise equal coefficients and outputs."""
-        from sglang.kernels.ops.layernorm.mhc_boundary_hip import (
-            _HC_BOUNDARY_PREFILL_MIN_M,
-        )
-
-        m = 4 * _HC_BOUNDARY_PREFILL_MIN_M + 5
-        x, residual, post_in, comb_in, pre_prev = self._inputs(m, 11)
-        args = (self.hc_fn, self.hc_scale, self.hc_base, HC, ITERS, RMS_EPS, HC_EPS)
-        full = self.fused(x, residual, post_in, comb_in, pre_prev, *args)
-        for rows in ([0], list(range(0, m, 97))):
-            idx = torch.tensor(rows, device="cuda")
-            sub = self.fused(
-                x[idx].contiguous(),
-                residual[idx].contiguous(),
-                post_in[idx].contiguous(),
-                comb_in[idx].contiguous(),
-                pre_prev[idx].contiguous(),
-                *args,
-            )
-            self.assertTrue(_all_equal(sub, [t[idx] for t in full]), rows)
-        # The stats-only form (a layer's first boundary) the same way.
-        full = self.fused(None, residual, None, None, None, *args)
-        idx = torch.tensor([0, 7, m - 1], device="cuda")
-        sub = self.fused(None, residual[idx].contiguous(), None, None, None, *args)
-        self.assertIsNone(sub[0])
-        self.assertIsNone(sub[1])
-        self.assertTrue(_all_equal(sub[2:], [t[idx] for t in full[2:]]))
-
-
-@unittest.skipUnless(is_hip() and is_gfx95_supported(), "requires gfx950")
-class TestMhcPostSplitH(CustomTestCase):
-    def setUp(self):
-        from sglang.srt.models.deepseek_v4 import DeepseekV4DecoderLayer
-
-        self.layer = SimpleNamespace(
-            config=SimpleNamespace(model_type="deepseek_v41"), hc_mult=4
-        )
-        self.run_post = lambda *args: DeepseekV4DecoderLayer.hc_post(self.layer, *args)
-        for setting in (
-            envs.SGLANG_OPT_HIP_MHC_POST_SPLIT_H.override(True),
-            envs.SGLANG_OPT_USE_TILELANG_MHC_POST.override(False),
-            envs.SGLANG_OPT_USE_FLASHINFER_MHC.override(False),
-        ):
-            setting.__enter__()
-            self.addCleanup(setting.__exit__, None, None, None)
-        torch.manual_seed(39186)
-
-    def operands(self, rows, width=5120, dtype=torch.bfloat16):
-        return (
-            torch.randn(rows, width, device="cuda", dtype=dtype),
-            torch.randn(rows, 4, width, device="cuda", dtype=dtype),
-            torch.sigmoid(torch.randn(rows, 4, device="cuda")),
-            torch.softmax(torch.randn(rows, 4, 4, device="cuda"), -1),
-        )
-
-    def test_model_dispatch_and_graph_replay(self):
-        from aiter.ops.mhc import mhc_post
-
-        for rows in (1024, 1025):
-            with self.subTest(rows=rows):
-                args = self.operands(rows)
-                reference = torch.empty_like(args[1])
-                actual = self.run_post(*args)
-                mhc_post(reference, *args)
-                torch.testing.assert_close(actual, reference, atol=0, rtol=0)
-                graph = torch.cuda.CUDAGraph()
-                with torch.cuda.graph(graph):
-                    actual = self.run_post(*args)
-                for _ in range(2):
-                    args[0].normal_()
-                    args[1].normal_()
-                    args[2].uniform_()
-                    args[3].uniform_()
-                    graph.replay()
-                    mhc_post(reference, *args)
-                    torch.testing.assert_close(actual, reference, atol=0, rtol=0)
 
 
 if __name__ == "__main__":

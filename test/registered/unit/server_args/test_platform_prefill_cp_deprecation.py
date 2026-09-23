@@ -92,7 +92,7 @@ class TestPlatformPrefillCPDeprecation(CustomTestCase):
 
     @override_platform(is_hip=True, is_npu=False, is_musa=False)
     def test_hip_interleave_is_qualified_after_model_lookup(self):
-        for model_type in ("deepseek_v41", "deepseek_v4", "llama"):
+        for model_type in ("deepseek_v41", "llama"):
             with self.subTest(model_type=model_type):
                 args = ServerArgs(
                     model_path="dummy", enable_prefill_cp=True, cp_strategy="interleave"

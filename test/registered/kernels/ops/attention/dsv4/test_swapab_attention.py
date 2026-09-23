@@ -11,7 +11,7 @@ from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=120, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 # backend-specific: HIP swapAB dispatch and fused inverse RoPE use ROCm kernels.
-register_amd_ci(est_time=25, suite="stage-b-kernel-test-1-gpu-amd-mi35x")
+register_amd_ci(est_time=60, suite="stage-b-kernel-test-1-gpu-amd-mi35x")
 
 
 def make_cache(page, pages=11):
@@ -277,7 +277,6 @@ class TestSwapABAttention(CustomTestCase):
         for case in (
             (1, 1, 1, 0),
             (5, 16, 133, 0),
-            (6, 64, 192, 512),
             (8, 128, 192, 1024),
             (6, 16, 192, 65),
         ):

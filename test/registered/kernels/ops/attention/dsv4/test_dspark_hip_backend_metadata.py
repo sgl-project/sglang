@@ -99,14 +99,15 @@ class TestDsparkDraftBlockWindowHip(CustomTestCase):
         self.device = torch.device("cuda")
 
     def test_graph_capture_and_replay_route_the_draft_through_the_block_window(self):
-        self._check_block_window_replay(cpu_mirror=True)
-
-    def test_block_window_replay_without_cpu_lengths(self):
-        self._check_block_window_replay(cpu_mirror=False)
+        """A TARGET_VERIFY capture on the DSpark draft must build the block window, and
+        a replay must refresh it in place for new lengths and slots, whether or not the
+        replay batch carries a CPU mirror of the lengths (the draft-window bucket must
+        not read ``seq_lens_cpu``)."""
+        for cpu_mirror in (True, False):
+            with self.subTest(cpu_mirror=cpu_mirror):
+                self._check_block_window_replay(cpu_mirror=cpu_mirror)
 
     def _check_block_window_replay(self, *, cpu_mirror):
-        """A TARGET_VERIFY capture on the DSpark draft must build the block window, and
-        a replay must refresh it in place for new lengths and slots."""
         block = 3
         bs = 2
         backend = _make_backend(block_size=block, device=self.device)
