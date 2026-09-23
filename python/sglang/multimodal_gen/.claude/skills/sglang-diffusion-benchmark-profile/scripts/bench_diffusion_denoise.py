@@ -523,6 +523,32 @@ MODELS = {
             "--height=1024",
         ],
     },
+    # Qwen-Image 2.1 has its own native pipeline (block-causal DiT with a
+    # request-scoped condition-prefix KV cache); both presets use the cookbook
+    # defaults of 40 Euler steps and CFG off on one GPU.
+    "qwen21": {
+        "path": "Qwen/Qwen-Image-2.1",
+        "prompt": "A capybara reading a book by candlelight",
+        "extra_args": [
+            "--width=1024",
+            "--height=1024",
+            "--num-inference-steps=40",
+            "--guidance-scale=1",
+            "--performance-mode=speed",
+        ],
+    },
+    "qwen21-edit": {
+        "path": "Qwen/Qwen-Image-2.1",
+        "prompt": "Move the scene to a snowy mountain at sunrise",
+        "image_path": "https://github.com/lm-sys/lm-sys.github.io/releases/download/test/TI2I_Qwen_Image_Edit_Input.jpg",
+        "extra_args": [
+            "--width=1024",
+            "--height=1024",
+            "--num-inference-steps=40",
+            "--guidance-scale=1",
+            "--performance-mode=speed",
+        ],
+    },
     "qwen-image-layered": {
         "path": "Qwen/Qwen-Image-Layered",
         "prompt": "a high quality, cute halloween themed illustration, consistent style and lighting",
