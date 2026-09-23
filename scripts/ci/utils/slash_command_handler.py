@@ -1,5 +1,6 @@
 import difflib
 import glob
+import importlib.util
 import json
 import os
 import re
@@ -14,6 +15,26 @@ from github import Auth, Github
 # Import scripts/ci/runner_configs.py (sibling-up dir) for runner_config -> runs_on lookup.
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 import runner_configs as _runner_configs  # noqa: E402
+
+# ci_register.py is loaded by path, not as `sglang.test.ci.ci_register`:
+# sglang.__init__ pulls torch, which is absent on the ubuntu-latest runner.
+_CI_REGISTER_PATH = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    "..",
+    "..",
+    "..",
+    "python",
+    "sglang",
+    "test",
+    "ci",
+    "ci_register.py",
+)
+_ci_register_spec = importlib.util.spec_from_file_location(
+    "ci_register", _CI_REGISTER_PATH
+)
+_ci_register = importlib.util.module_from_spec(_ci_register_spec)
+_ci_register_spec.loader.exec_module(_ci_register)
+_HWBackend = _ci_register.HWBackend
 
 # rerun-test workflow doesn't build sgl-kernel, so b200 stages always use the
 # non-kernel pool when resolving the `$b200_runner` sentinel from runner_configs.yml.
@@ -898,62 +919,41 @@ def detect_multimodal_suite(file_path):
     return MULTIMODAL_DEFAULT_RUNNER, None
 
 
-def _extract_runner_configs(content):
-    """Pull `(runner_config, args_str)` from EVERY `register_cuda_ci(...)` call.
-
-    A test file can register itself on multiple pools (e.g. both
-    `4-gpu-b200` and `1-gpu-large`). The earlier `re.search` variant
-    returned only the first match, so /rerun-test silently dropped every
-    registration after the first — multi-pool files only ever ran on the
-    pool listed first. `re.finditer` is what makes the fan-out happen.
-    """
-    out = []
-    for args in re.finditer(
-        r"^[^#\n]*register_cuda_ci\s*\(([^)]*)\)", content, re.MULTILINE
-    ):
-        m = re.search(r'runner_config\s*=\s*["\']([^"\']+)["\']', args.group(1))
-        if m:
-            out.append((m.group(1), args.group(1)))
-    return out
-
-
-def _extract_suites(content, register_fn):
-    """Pull every single-string `suite=` from `<register_fn>(...)` calls."""
-    out = []
-    for args in re.finditer(
-        rf"^[^#\n]*{register_fn}\s*\(([^)]*)\)", content, re.MULTILINE
-    ):
-        m = re.search(r'suite\s*=\s*["\']([^"\']+)["\']', args.group(1))
-        if m:
-            out.append(m.group(1))
-    return out
-
-
-def _extract_legacy_suites(content):
-    """Pull every legacy single-string `suite=` from `register_cuda_ci(...)`
-    calls. Used only to report why such a file is not dispatchable."""
-    return _extract_suites(content, "register_cuda_ci")
+def _parse_registrations(full_path):
+    """`(CIRegistry list, None)`, or `(None, message)` if the file won't parse."""
+    try:
+        registries, _ = _ci_register.ut_parse_one_file(full_path)
+    except (SyntaxError, ValueError) as exc:
+        return None, f"Could not parse `{full_path}`: {exc}"
+    return registries, None
 
 
 # Backends with no job in rerun-test.yml (cuda / multimodal_gen / cpu only) and
 # no runner_config in runner_configs.yml, so no dispatch can be built for them.
-# Mirrors `REGISTER_MAPPING` in python/sglang/test/ci/ci_register.py.
-_OTHER_BACKEND_REGISTERS = {
-    "register_amd_ci": "AMD",
-    "register_npu_ci": "NPU",
-    "register_xpu_ci": "XPU",
-    "register_musa_ci": "MUSA",
-    "register_mlx_ci": "MLX",
+_OTHER_BACKEND_LABELS = {
+    _HWBackend.AMD: "AMD",
+    _HWBackend.NPU: "NPU",
+    _HWBackend.XPU: "XPU",
+    _HWBackend.MUSA: "MUSA",
+    _HWBackend.MLX: "MLX",
 }
 
 
-def _extract_other_backends(content):
-    """Return (backend labels, suite names) for every non-CUDA/CPU registration."""
+def _other_backends(registries):
+    """`(backend labels, suite names)` for every non-CUDA/CPU registration.
+
+    Label order follows `_OTHER_BACKEND_LABELS`, so it is stable across files.
+    """
+    present = {r.backend for r in registries}
     labels, suites = [], []
-    for register_fn, label in _OTHER_BACKEND_REGISTERS.items():
-        if re.search(rf"^[^#\n]*{register_fn}\s*\(", content, re.MULTILINE):
+    for backend, label in _OTHER_BACKEND_LABELS.items():
+        if backend in present:
             labels.append(label)
-            suites.extend(_extract_suites(content, register_fn))
+            suites.extend(
+                r.effective_suite
+                for r in registries
+                if r.backend is backend and r.effective_suite
+            )
     return labels, sorted(set(suites))
 
 
@@ -1032,21 +1032,40 @@ def detect_suite(file_path_from_test):
     install_timeout, rdma_devices, is_cpu, error.
     """
     full_path = f"test/{file_path_from_test}"
-    with open(full_path, "r") as f:
-        content = f.read()
+    registries, parse_error = _parse_registrations(full_path)
+    if parse_error is not None:
+        return [_dispatch_err(None, parse_error)]
 
-    cuda_calls = _extract_runner_configs(content)
+    cuda_calls = [
+        r
+        for r in registries
+        if r.backend is _HWBackend.CUDA and r.runner_config is not None
+    ]
     if cuda_calls:
         results = []
-        for rc, args_str in cuda_calls:
-            stage_m = re.search(r'stage\s*=\s*["\']([^"\']+)["\']', args_str)
-            suite = f"{stage_m.group(1)}-test-{rc}" if stage_m else rc
-            results.append(_resolve_runner_config(rc, full_path, suite))
+        for r in cuda_calls:
+            suite = r.effective_suite
+            # Per registration, not per file, and the same field run_suite.py's
+            # filter_tests() reads, so dispatch cannot diverge from the suite run.
+            if r.disabled is not None:
+                results.append(
+                    _dispatch_err(
+                        suite,
+                        f"`{full_path}` is registered to `{suite}` with "
+                        f"`disabled=`, so run_suite.py skips it and "
+                        f"/rerun-test will not dispatch it either.\n\n"
+                        f"Reason: {r.disabled}",
+                    )
+                )
+                continue
+            results.append(_resolve_runner_config(r.runner_config, full_path, suite))
         return results
 
-    legacy_suites = _extract_legacy_suites(content)
+    legacy_suites = [
+        r.suite for r in registries if r.backend is _HWBackend.CUDA and r.suite
+    ]
 
-    if re.search(r"^[^#\n]*register_cpu_ci\s*\(", content, re.MULTILINE):
+    if any(r.backend is _HWBackend.CPU for r in registries):
         return [
             {
                 "suite": "cpu",
@@ -1072,7 +1091,7 @@ def detect_suite(file_path_from_test):
             )
         ]
 
-    labels, suites = _extract_other_backends(content)
+    labels, suites = _other_backends(registries)
     if labels:
         backends = ", ".join(labels)
         where = f" (suite `{suites[0]}`)" if suites else ""
