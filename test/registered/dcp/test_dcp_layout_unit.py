@@ -26,7 +26,6 @@ from sglang.srt.layers.dcp.comm import all_gather_q_for_mla_decode
 from sglang.srt.layers.dcp.layout import (
     filter_dcp_local_chunk_kv_indices,
     get_dcp_lens,
-    remap_dcp_write_locations_fixed_shape,
 )
 from sglang.srt.layers.dcp.planner import prepare_decode_context_parallel_metadata
 from sglang.srt.layers.linear import QKVParallelLinear
@@ -163,41 +162,6 @@ class TestGetDcpLens(CustomTestCase):
         symmetric.assert_called_once_with(group, disabled=True)
         torch.testing.assert_close(nope, torch.cat([q_nope, q_nope + 100], dim=1))
         torch.testing.assert_close(rope, torch.cat([q_rope, q_rope + 100], dim=1))
-
-    def test_fixed_shape_write_remap_uses_reserved_dummy_slot(self):
-        virtual = torch.tensor([256, 257, 258, 259, 512, 513], dtype=torch.int32)
-        rank0 = remap_dcp_write_locations_fixed_shape(virtual, 2, 0)
-        rank1 = remap_dcp_write_locations_fixed_shape(virtual, 2, 1)
-
-        self.assertEqual(rank0.tolist(), [128, 0, 129, 0, 256, 0])
-        self.assertEqual(rank1.tolist(), [0, 128, 0, 129, 0, 256])
-        self.assertEqual(rank0.shape, virtual.shape)
-        self.assertEqual(rank1.shape, virtual.shape)
-
-    def test_fixed_shape_write_remap_rejects_invalid_topology(self):
-        with self.assertRaises(ValueError):
-            remap_dcp_write_locations_fixed_shape(torch.arange(4), 0, 0)
-        with self.assertRaises(ValueError):
-            remap_dcp_write_locations_fixed_shape(torch.arange(4), 2, 2)
-
-    def test_fixed_shape_write_remap_scalar_dummy_matches_tensor(self):
-        for dtype in (torch.int32, torch.int64):
-            virtual = torch.tensor([0, 256, 257, 259, 512, 513], dtype=dtype)
-            if dtype == torch.int64:
-                virtual += 2**34
-            for loc in (virtual[:0], virtual[::2], virtual):
-                for size in (1, 2, 4):
-                    for rank in range(size):
-                        for dummy in (0, 17):
-                            local = loc // size
-                            expected = torch.where(
-                                loc % size == rank, local, torch.full_like(local, dummy)
-                            )
-                            actual = remap_dcp_write_locations_fixed_shape(
-                                loc, size, rank, dummy_loc=dummy
-                            )
-                            torch.testing.assert_close(actual, expected, atol=0, rtol=0)
-                            self.assertEqual(actual.device, loc.device)
 
     def test_start_none_matches_owner_count(self):
         for n in DCP_SIZES:

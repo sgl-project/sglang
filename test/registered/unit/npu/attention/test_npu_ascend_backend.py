@@ -140,7 +140,7 @@ class TestNormalizeMlaKRoPECache(unittest.TestCase):
 
 
 class TestNpuMlaDcpWrite(unittest.TestCase):
-    def test_pool_write_uses_dcp_topology_without_a_pool_flag(self):
+    def test_pool_write_uses_shared_kernel_only_for_dcp(self):
         from sglang.srt.hardware_backend.npu import memory_pool_npu
 
         loc = torch.tensor([256, 257, 512, 259, 258, 513], dtype=torch.int32)
@@ -167,28 +167,42 @@ class TestNpuMlaDcpWrite(unittest.TestCase):
                         dcp_rank=rank,
                     ),
                     patch.object(memory_pool_npu, "torch_npu", create=True) as npu,
+                    patch.object(memory_pool_npu, "set_mla_kv_buffer_kernel") as kernel,
                 ):
-                    expected = (
-                        loc
-                        if dcp_size == 1
-                        else torch.where(loc % dcp_size == rank, loc // dcp_size, 0)
-                    )
                     for k, v in (
                         (cache_k, cache_v),
                         (torch.cat((cache_k, cache_v), dim=-1), None),
                     ):
                         with self.subTest(combined_input=v is None):
                             npu.reset_mock()
+                            kernel.reset_mock()
                             memory_pool_npu.NPUMLATokenToKVPool.set_kv_buffer(
                                 pool, SimpleNamespace(layer_id=0), loc, k, v
                             )
-                            calls = npu.npu_scatter_nd_update_.call_args_list
+                            if dcp_size > 1:
+                                npu.npu_scatter_nd_update_.assert_not_called()
+                                calls = kernel.__getitem__.return_value.call_args_list
+                            else:
+                                kernel.__getitem__.assert_not_called()
+                                calls = npu.npu_scatter_nd_update_.call_args_list
                             self.assertEqual(len(calls), 2)
                             for call, values in zip(calls, (cache_k, cache_v)):
-                                torch.testing.assert_close(
-                                    call.args[1], expected.view(-1, 1)
-                                )
-                                torch.testing.assert_close(call.args[2], values)
+                                if dcp_size > 1:
+                                    torch.testing.assert_close(call.args[3], loc)
+                                    torch.testing.assert_close(
+                                        call.args[1], values.squeeze(1)
+                                    )
+                                    self.assertEqual(call.kwargs["DCP_RANK"], rank)
+                                    self.assertEqual(
+                                        call.kwargs["DCP_WORLD_SIZE"], dcp_size
+                                    )
+                                    self.assertEqual(call.kwargs["rope_dim"], 0)
+                                    self.assertFalse(call.kwargs["USE_GDC"])
+                                else:
+                                    torch.testing.assert_close(
+                                        call.args[1], loc.view(-1, 1)
+                                    )
+                                    torch.testing.assert_close(call.args[2], values)
 
 
 class TestNpuMlaDcpRead(unittest.TestCase):

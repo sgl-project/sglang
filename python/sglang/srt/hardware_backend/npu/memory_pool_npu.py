@@ -1,10 +1,11 @@
 from typing import TYPE_CHECKING, Optional, Sequence
 
 import torch
+import triton
 
+from sglang.kernels.ops.kvcache.mla_buffer import set_mla_kv_buffer_kernel
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.environ import envs
-from sglang.srt.layers.dcp.layout import remap_dcp_write_locations_fixed_shape
 from sglang.srt.mem_cache.memory_pool import (
     MHATokenToKOnlyPool,
     MHATokenToKVPool,
@@ -826,18 +827,6 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         loc, _, _ = unwrap_write_loc(loc_info)
         self._raise_if_native_kv_cache_disabled()
         layer_id = layer.layer_id
-        parallel = get_parallel()
-        if parallel.dcp_enabled:
-            # Preserve the row count and redirect non-owned rows to the
-            # allocator-reserved dummy slot.  Boolean compaction here lowers to
-            # aclnnNonzeroV2 on Ascend and crashes the 64-rank DSpark
-            # target-verify path with an AICore MTE out-of-range fault.
-            loc = remap_dcp_write_locations_fixed_shape(
-                loc,
-                parallel.dcp_size,
-                parallel.dcp_rank,
-            )
-
         if loc.numel() == 0:
             return
 
@@ -867,6 +856,37 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             cache_k, cache_v = cache_k.split(
                 [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
             )
+
+        parallel = get_parallel()
+        if parallel.dcp_enabled:
+            # Separate NPU latent/RoPE buffers share the DCP-aware Triton body,
+            # not the CUDA host wrapper or its non-DCP no-RoPE specialization.
+            loc = loc.contiguous()
+            for dst, src in (
+                (self.k_buffer[layer_id - self.start_layer], cache_k),
+                (self.v_buffer[layer_id - self.start_layer], cache_v),
+            ):
+                src = src.reshape(-1, src.shape[-1])
+                if src.stride(-1) != 1:
+                    src = src.contiguous()
+                dst = dst.view(-1, src.shape[-1])
+                set_mla_kv_buffer_kernel[(loc.numel(), 1)](
+                    dst,
+                    src,
+                    src,
+                    loc,
+                    0,
+                    buffer_stride=dst.stride(0),
+                    nope_stride=src.stride(0),
+                    rope_stride=src.stride(0),
+                    nope_dim=src.shape[-1],
+                    rope_dim=0,
+                    BLOCK=triton.next_power_of_2(src.shape[-1]),
+                    DCP_RANK=parallel.dcp_rank,
+                    DCP_WORLD_SIZE=parallel.dcp_size,
+                    USE_GDC=False,
+                )
+            return
 
         torch_npu.npu_scatter_nd_update_(
             self.k_buffer[layer_id - self.start_layer].view(-1, 1, self.kv_lora_rank),

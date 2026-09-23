@@ -24,32 +24,144 @@ def _npu_is_available() -> bool:
 class TestNpuDcpCompactKernels(CustomTestCase):
     device = "npu"
 
-    def test_fixed_shape_write_remap_scalar_dummy_graph(self):
-        from sglang.srt.layers.dcp.layout import remap_dcp_write_locations_fixed_shape
+    def test_pool_shared_dcp_writer_eager_and_graph(self):
+        from sglang.srt import runtime_context as rc
+        from sglang.srt.hardware_backend.npu.memory_pool_npu import NPUMLATokenToKVPool
 
-        for dtype in (torch.int32, torch.int64):
-            for dummy in (0, 17):
-                loc_cpu = torch.tensor([0, 256, 257, 259, 512, 513], dtype=dtype)
-                if dtype == torch.int64:
-                    loc_cpu += 2**34
-                loc = loc_cpu.to(self.device)
-                for _ in range(3):
-                    remap_dcp_write_locations_fixed_shape(loc, 2, 0, dummy_loc=dummy)
-                torch.npu.synchronize()
-                graph = torch.npu.NPUGraph()
-                with torch.npu.graph(graph):
-                    output = remap_dcp_write_locations_fixed_shape(
-                        loc, 2, 0, dummy_loc=dummy
+        for dtype in (torch.bfloat16, torch.float16):
+            for index_dtype in (torch.int32, torch.int64):
+                # Split input views retain a wider token stride; both source
+                # data and loc exercise non-contiguous-input normalization.
+                source = torch.randn(7, 1, 1152, device=self.device, dtype=dtype)[
+                    ..., ::2
+                ]
+                latent, rope = source.split((512, 64), dim=-1)
+                loc_storage = torch.zeros(14, device=self.device, dtype=index_dtype)
+                loc = loc_storage[::2]
+                pool = SimpleNamespace(
+                    dtype=dtype,
+                    store_dtype=dtype,
+                    start_layer=0,
+                    kv_lora_rank=512,
+                    qk_rope_head_dim=64,
+                    dsa_kv_cache_store_fp8=False,
+                    k_buffer=[
+                        torch.full((512, 1, 512), -3, device=self.device, dtype=dtype)
+                    ],
+                    v_buffer=[
+                        torch.full((512, 1, 64), -3, device=self.device, dtype=dtype)
+                    ],
+                    _raise_if_native_kv_cache_disabled=lambda: None,
+                )
+                for size in (2, 4):
+                    for rank in range(size):
+                        with rc.get_parallel().override(
+                            dcp_enabled=True, dcp_size=size, dcp_rank=rank
+                        ):
+                            positions = torch.tensor(
+                                [0, 0, 512, 513, 514, 515, 519], dtype=index_dtype
+                            )
+                            loc.copy_(positions)
+
+                            def write():
+                                NPUMLATokenToKVPool.set_kv_buffer(
+                                    pool, SimpleNamespace(layer_id=0), loc, latent, rope
+                                )
+
+                            for _ in range(3):
+                                write()
+                            torch.npu.synchronize()
+                            graph = torch.npu.NPUGraph()
+                            with torch.npu.graph(graph):
+                                write()
+                            pointers = (
+                                loc.data_ptr(),
+                                *(
+                                    buf.data_ptr()
+                                    for buf in pool.k_buffer + pool.v_buffer
+                                ),
+                            )
+                            for shift in (0, 1, 2):
+                                current = torch.where(
+                                    positions == 0, positions, positions + shift
+                                )
+                                loc.copy_(current)
+                                source.add_(1)
+                                for replay in (False, True):
+                                    for buf in pool.k_buffer + pool.v_buffer:
+                                        buf.fill_(-3)
+                                    graph.replay() if replay else write()
+                                    torch.npu.synchronize()
+                                    owned = (current != 0) & (current % size == rank)
+                                    for buf, values in zip(
+                                        pool.k_buffer + pool.v_buffer, (latent, rope)
+                                    ):
+                                        expected = torch.full_like(
+                                            buf, -3, device="cpu"
+                                        )
+                                        expected[current[owned].long() // size] = (
+                                            values.cpu()[owned]
+                                        )
+                                        torch.testing.assert_close(
+                                            buf.cpu(), expected, atol=0, rtol=0
+                                        )
+                                    self.assertEqual(
+                                        pointers,
+                                        (
+                                            loc.data_ptr(),
+                                            *(
+                                                buf.data_ptr()
+                                                for buf in pool.k_buffer + pool.v_buffer
+                                            ),
+                                        ),
+                                    )
+
+    def test_pool_shared_dcp_writer_empty_and_cast_inputs(self):
+        from sglang.srt import runtime_context as rc
+        from sglang.srt.hardware_backend.npu.memory_pool_npu import NPUMLATokenToKVPool
+
+        pool = SimpleNamespace(
+            dtype=torch.bfloat16,
+            store_dtype=torch.bfloat16,
+            start_layer=0,
+            kv_lora_rank=512,
+            qk_rope_head_dim=64,
+            dsa_kv_cache_store_fp8=False,
+            k_buffer=[
+                torch.full((256, 1, 512), -3, device=self.device, dtype=torch.bfloat16)
+            ],
+            v_buffer=[
+                torch.full((256, 1, 64), -3, device=self.device, dtype=torch.bfloat16)
+            ],
+            _raise_if_native_kv_cache_disabled=lambda: None,
+        )
+        with rc.get_parallel().override(dcp_enabled=True, dcp_size=2, dcp_rank=0):
+            for count in (0, 1, 7, 128):
+                loc = torch.arange(count, device=self.device, dtype=torch.int32) + 256
+                for combined in (False, True):
+                    values = torch.randn(
+                        count,
+                        1,
+                        576,
+                        device=self.device,
+                        dtype=torch.bfloat16 if combined else torch.float32,
                     )
-                pointers = (loc.data_ptr(), output.data_ptr())
-                for shift in (0, 1, 2):
-                    current = loc_cpu + shift
-                    loc.copy_(current)
-                    graph.replay()
+                    k, v = (values, None) if combined else values.split((512, 64), -1)
+                    for buf in pool.k_buffer + pool.v_buffer:
+                        buf.fill_(-3)
+                    NPUMLATokenToKVPool.set_kv_buffer(
+                        pool, SimpleNamespace(layer_id=0), loc, k, v
+                    )
                     torch.npu.synchronize()
-                    expected = torch.where(current % 2 == 0, current // 2, dummy)
-                    torch.testing.assert_close(output.cpu(), expected, atol=0, rtol=0)
-                    self.assertEqual(pointers, (loc.data_ptr(), output.data_ptr()))
+                    owned = loc.cpu() % 2 == 0
+                    for buf, source in zip(
+                        pool.k_buffer + pool.v_buffer, values.cpu().split((512, 64), -1)
+                    ):
+                        expected = torch.full_like(buf, -3, device="cpu")
+                        expected[loc.cpu()[owned].long() // 2] = source[
+                            owned
+                        ].bfloat16()
+                        torch.testing.assert_close(buf.cpu(), expected, atol=0, rtol=0)
 
     def test_shared_dcp_prefix_index_kernel(self):
         from sglang.kernels.ops.kvcache.kv_indices import (
