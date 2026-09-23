@@ -25,12 +25,9 @@ class TestFusedFp8WriterHip(CustomTestCase):
         self.assertFalse(fused_fp8_writer_geometry_supported(128, 64, 64))
 
     def test_available_rejects_mi300(self):
-        props = MagicMock()
-        props.gcnArchName = "gfx942"
-        with (
-            patch("torch.version.hip", "6.4.0"),
-            patch("torch.cuda.is_available", return_value=True),
-            patch("torch.cuda.get_device_properties", return_value=props),
+        with patch(
+            "sglang.srt.utils.is_gfx95_supported",
+            return_value=False,
         ):
             self.assertFalse(aiter_fused_fp8_writer_available())
 

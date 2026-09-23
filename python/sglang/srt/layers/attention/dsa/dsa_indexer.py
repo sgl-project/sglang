@@ -269,7 +269,9 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             and getattr(config, "index_k_norm_type", "layer") == "rms"
         )
         aiter_fused_fp8_requested = (
-            _is_hip and _use_aiter and envs.SGLANG_AITER_FUSED_FP8_DSA_INDEXER.get()
+            _is_hip
+            and _use_aiter
+            and not envs.SGLANG_DISABLE_AITER_FUSED_FP8_DSA_INDEXER.get()
         )
         self.use_aiter_fused_fp8_writer = (
             aiter_fused_fp8_requested
@@ -355,10 +357,10 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         if (
             aiter_fused_fp8_requested
             and not self.use_aiter_fused_fp8_writer
-            and envs.SGLANG_AITER_FUSED_FP8_DSA_INDEXER.is_set()
+            and envs.SGLANG_DISABLE_AITER_FUSED_FP8_DSA_INDEXER.is_set()
         ):
             logger.warning(
-                "SGLANG_AITER_FUSED_FP8_DSA_INDEXER is set but unsupported; "
+                "SGLANG_DISABLE_AITER_FUSED_FP8_DSA_INDEXER=0 but unsupported; "
                 "using the legacy ROCm indexer writer"
             )
         elif self.use_aiter_fused_fp8_writer:
@@ -537,9 +539,11 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         return q_fp8, weights.unsqueeze(-1)
 
     def _maybe_rotate(self, x: torch.Tensor) -> torch.Tensor:
-        # Fusion drops the (logit-preserving) Hadamard rotation; without it the
-        # index-K cache here matches the fused path that decode reads back.
-        return x if self.use_dsa_indexer_fusion else rotate_activation(x)
+        # CUDA and HIP fused writers omit Hadamard; skip it on fallbacks too so
+        # the index-K cache matches the fused path that decode reads back.
+        if self.use_dsa_indexer_fusion or self.use_aiter_fused_fp8_writer:
+            return x
+        return rotate_activation(x)
 
     def _should_skip_logits_computation(self, forward_batch: ForwardBatch) -> bool:
         # topk_transform selects every valid page slot when kv_len <= index_topk;
