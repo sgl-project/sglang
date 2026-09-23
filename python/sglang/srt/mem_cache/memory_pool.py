@@ -5449,6 +5449,8 @@ class MiniMaxSparseKVPool(KVCache):
         main_pool_cls=MHATokenToKVPool,
         index_kv_pool_cls=MHATokenToKVPool,
         index_k_pool_cls=MHATokenToKOnlyPool,
+        idx_head_num: int = 1,
+        global_index_head_num: int = 1,
         enable_hisparse: bool = False,
         host_to_device_ratio: int = 2,
     ):
@@ -5457,6 +5459,8 @@ class MiniMaxSparseKVPool(KVCache):
         self.page_size = page_size
         self.dtype = dtype
         self.device = device
+        self.index_head_num = idx_head_num
+        self.global_index_head_num = global_index_head_num
         self.use_minimax_fused_kv_index_store = (
             envs.SGLANG_OPT_USE_MINIMAX_FUSED_KV_INDEX_STORE.get()
         )
@@ -5467,6 +5471,7 @@ class MiniMaxSparseKVPool(KVCache):
         local_sparse_layer_ids = [
             lid for lid in sparse_layer_ids if start_layer <= lid < end_layer
         ]
+        self.main_kv_layer_ids = local_dense_layer_ids + local_sparse_layer_ids
 
         index_dtype = index_dtype if index_dtype is not None else dtype
         index_pool_size = size * host_to_device_ratio if enable_hisparse else size
@@ -5548,7 +5553,7 @@ class MiniMaxSparseKVPool(KVCache):
                 size=index_pool_size,
                 page_size=page_size,
                 dtype=index_dtype,
-                head_num=1,
+                head_num=idx_head_num,
                 head_dim=idx_head_dim,
                 layer_num=len(local_kv_sparse_layer_ids),
                 device=device,
@@ -5563,7 +5568,7 @@ class MiniMaxSparseKVPool(KVCache):
                 size=index_pool_size,
                 page_size=page_size,
                 dtype=index_dtype,
-                head_num=1,
+                head_num=idx_head_num,
                 head_dim=idx_head_dim,
                 layer_num=len(local_k_only_sparse_layer_ids),
                 device=device,
@@ -5864,6 +5869,14 @@ class MiniMaxSparseKVPool(KVCache):
             layer_ids=sorted(self.sparse_layer_id_mapping)
         )
 
+    def get_kv_layer_ids(self):
+        layer_ids = (
+            sorted(self.sparse_layer_id_mapping)
+            if self.dense_pool is not None
+            else self.main_kv_layer_ids
+        )
+        return layer_ids * 2
+
     def get_dense_kv_state_buf_infos(self):
         # Dense KV uses logical device slots, independently of sparse host slots.
         return self._get_layer_kv_buf_infos(layer_ids=sorted(self._dense_layer_ids))
@@ -5882,6 +5895,10 @@ class MiniMaxSparseKVPool(KVCache):
         # Per-page item_len (MHATokenToKVPool convention); index rows share the
         # main-KV `loc`, so the transfer reuses the same page-ids.
         pool = self.index_k_pool
+        if getattr(pool, "use_hnd", False):
+            raise RuntimeError(
+                "MiniMax index-K disaggregation requires NHD cache layout"
+            )
         n = pool.layer_num
         data_ptrs = [pool.k_buffer[i].data_ptr() for i in range(n)]
         data_lens = [pool.k_buffer[i].nbytes for i in range(n)]

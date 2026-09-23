@@ -83,6 +83,162 @@ FAILED_SESSION_RECOVERIES = Counter(
 )
 
 
+def build_minimax_index_k_transfer_blocks(
+    *,
+    src_data_ptrs: List[int],
+    src_data_lens: List[int],
+    src_item_lens: List[int],
+    src_layer_ids: List[int],
+    src_indices: List[int],
+    dst_data_ptrs: List[int],
+    dst_data_lens: List[int],
+    dst_item_lens: List[int],
+    dst_layer_ids: List[int],
+    dst_indices: List[int],
+    page_size: int,
+    src_attn_tp_size: int,
+    src_tp_rank: int,
+    dst_attn_tp_size: int,
+    dst_tp_rank: int,
+    src_index_head_num: int,
+    dst_index_head_num: int,
+    global_index_head_num: int,
+    layout: str = "nhd",
+) -> List[Tuple[int, int, int]]:
+    """Plan MiniMax index-K copies in logical-head space."""
+    if global_index_head_num <= 0:
+        raise ValueError("MiniMax global index head count must be positive")
+    if min(page_size, src_attn_tp_size, dst_attn_tp_size) <= 0:
+        raise ValueError("MiniMax index-K page size and TP sizes must be positive")
+    if layout != "nhd":
+        raise ValueError(f"Unsupported MiniMax index-K layout: {layout}")
+    if not 0 <= src_tp_rank < src_attn_tp_size:
+        raise ValueError("MiniMax source TP rank is out of bounds")
+    if not 0 <= dst_tp_rank < dst_attn_tp_size:
+        raise ValueError("MiniMax destination TP rank is out of bounds")
+
+    def rank_layout(tp_size: int, rank: int, advertised_heads: int, side: str):
+        logical_ranks = min(tp_size, global_index_head_num)
+        if global_index_head_num % logical_ranks or tp_size % logical_ranks:
+            raise ValueError(
+                f"MiniMax {side} TP={tp_size} cannot express "
+                f"{global_index_head_num} global index heads"
+            )
+        expected_heads = global_index_head_num // logical_ranks
+        if advertised_heads != expected_heads:
+            raise ValueError(
+                f"MiniMax {side} logical head count mismatch: "
+                f"expected={expected_heads}, advertised={advertised_heads}"
+            )
+        replicas = tp_size // logical_ranks
+        logical_rank = rank // replicas
+        return logical_rank * expected_heads, expected_heads, replicas
+
+    src_head_start, src_heads, src_replicas = rank_layout(
+        src_attn_tp_size, src_tp_rank, src_index_head_num, "source"
+    )
+    dst_head_start, dst_heads, _ = rank_layout(
+        dst_attn_tp_size, dst_tp_rank, dst_index_head_num, "destination"
+    )
+
+    src_count = len(src_data_ptrs)
+    dst_count = len(dst_data_ptrs)
+    if not (
+        len(src_data_lens) == len(src_item_lens) == len(src_layer_ids) == src_count
+    ):
+        raise ValueError("MiniMax source index-K metadata length mismatch")
+    if not (
+        len(dst_data_lens) == len(dst_item_lens) == len(dst_layer_ids) == dst_count
+    ):
+        raise ValueError("MiniMax destination index-K metadata length mismatch")
+    for layer_ids, side in (
+        (src_layer_ids, "source"),
+        (dst_layer_ids, "destination"),
+    ):
+        if len(set(layer_ids)) != len(layer_ids):
+            raise RuntimeError(
+                f"MiniMax {side} index-K metadata has duplicate layer ids"
+            )
+    if len(src_indices) != len(dst_indices):
+        raise ValueError(
+            "MiniMax index-K state index length mismatch: "
+            f"prefill={len(src_indices)}, dst={len(dst_indices)}"
+        )
+    if any(index < 0 for index in src_indices + dst_indices):
+        raise ValueError("MiniMax index-K state indices must be non-negative")
+
+    pairs = build_transfer_entry_pairs(
+        src_layer_ids,
+        dst_layer_ids,
+        src_count,
+        dst_count,
+        allow_positional_fallback=False,
+    )
+    src_end = src_head_start + src_heads
+    dst_end = dst_head_start + dst_heads
+    overlap_start = max(src_head_start, dst_head_start)
+    overlap_end = min(src_end, dst_end)
+
+    transfer_blocks: List[Tuple[int, int, int]] = []
+    for src_entry, dst_entry in pairs:
+        src_item_len = int(src_item_lens[src_entry])
+        dst_item_len = int(dst_item_lens[dst_entry])
+        src_denominator = page_size * src_heads
+        dst_denominator = page_size * dst_heads
+        if (
+            src_item_len <= 0
+            or dst_item_len <= 0
+            or src_item_len % src_denominator
+            or dst_item_len % dst_denominator
+        ):
+            raise ValueError(
+                "MiniMax index-K item length is incompatible with page/head layout"
+            )
+        src_head_bytes = src_item_len // src_denominator
+        dst_head_bytes = dst_item_len // dst_denominator
+        if src_head_bytes != dst_head_bytes:
+            raise ValueError(
+                "MiniMax index-K per-head layout mismatch: "
+                f"src={src_head_bytes}, dst={dst_head_bytes}"
+            )
+        for data_len, item_len, indices, side in (
+            (src_data_lens[src_entry], src_item_len, src_indices, "source"),
+            (dst_data_lens[dst_entry], dst_item_len, dst_indices, "destination"),
+        ):
+            if data_len < 0 or data_len % item_len:
+                raise ValueError(
+                    f"MiniMax index-K {side} buffer length is not item-aligned"
+                )
+            if indices and (max(indices) + 1) * item_len > data_len:
+                raise ValueError(f"MiniMax index-K {side} index exceeds buffer bounds")
+
+        if src_tp_rank % src_replicas or overlap_start >= overlap_end:
+            continue
+        src_local_head = overlap_start - src_head_start
+        dst_local_head = overlap_start - dst_head_start
+        copy_heads = overlap_end - overlap_start
+        copy_bytes = copy_heads * src_head_bytes
+        for src_index, dst_index in zip(src_indices, dst_indices, strict=True):
+            src_page = src_data_ptrs[src_entry] + src_index * src_item_len
+            dst_page = dst_data_ptrs[dst_entry] + dst_index * dst_item_len
+            if copy_heads == src_heads == dst_heads:
+                transfer_blocks.append((src_page, dst_page, src_item_len))
+                continue
+            for token in range(page_size):
+                transfer_blocks.append(
+                    (
+                        src_page
+                        + token * src_heads * src_head_bytes
+                        + src_local_head * src_head_bytes,
+                        dst_page
+                        + token * dst_heads * dst_head_bytes
+                        + dst_local_head * dst_head_bytes,
+                        copy_bytes,
+                    )
+                )
+    return transfer_blocks
+
+
 # decode
 @dataclasses.dataclass
 class TransferInfo:
@@ -159,6 +315,11 @@ class KVArgsRegisterInfo:
     staging_base_ptr: int = 0
     staging_total_size: int = 0
     staging: Optional[StagingRegisterInfo] = None
+    dst_state_data_lens: List[List[int]] = dataclasses.field(default_factory=list)
+    dst_page_size: int = 0
+    dst_minimax_index_head_num: int = 0
+    dst_minimax_global_index_head_num: int = 0
+    dst_minimax_index_k_layout: str = ""
 
     @classmethod
     def from_zmq(cls, msg: List[bytes]):
@@ -207,6 +368,21 @@ class KVArgsRegisterInfo:
                 list(struct.unpack(f"{len(msg[19]) // 8}Q", msg[19]))
                 if len(msg) > 19 and msg[19]
                 else []
+            ),
+            dst_state_data_lens=(
+                unpack_int_lists(msg[20], "Q") if len(msg) > 20 and msg[20] else []
+            ),
+            dst_page_size=(
+                int(msg[21].decode("ascii")) if len(msg) > 21 and msg[21] else 0
+            ),
+            dst_minimax_index_head_num=(
+                int(msg[22].decode("ascii")) if len(msg) > 22 and msg[22] else 0
+            ),
+            dst_minimax_global_index_head_num=(
+                int(msg[23].decode("ascii")) if len(msg) > 23 and msg[23] else 0
+            ),
+            dst_minimax_index_k_layout=(
+                msg[24].decode("ascii") if len(msg) > 24 and msg[24] else ""
             ),
             # Note: always put the staging field at the final
             staging=StagingRegisterInfo.from_zmq_fields(msg, 14, slot_ids_index=18),
@@ -1642,6 +1818,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             if indices is None:
                 continue
             src_data_ptrs = self.kv_args.state_data_ptrs[i]
+            all_src_data_lens = getattr(self.kv_args, "state_data_lens", [])
+            src_data_lens = all_src_data_lens[i] if i < len(all_src_data_lens) else []
             src_item_lens = self.kv_args.state_item_lens[i]
             src_dim_per_tensor = (
                 self.kv_args.state_dim_per_tensor[i]
@@ -1861,33 +2039,104 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                     )
                     or rc
                 )
-            elif st in (StateType.MINIMAX_INDEX_K, StateType.MINIMAX_DENSE_KV):
-                # Compacted layer lists require equal TP and PP=1 on both peers.
-                if self.pp_size is not None and self.pp_size > 1:
+            elif st == StateType.MINIMAX_INDEX_K:
+                src_indices = list(indices)
+                dst_indices_local = list(dst_indices)
+                if len(src_indices) != len(dst_indices_local):
                     raise RuntimeError(
-                        "PD disagg: PP>1 not supported for MiniMax state yet."
+                        f"{st.value} state index length mismatch: "
+                        f"prefill={len(src_indices)}, dst={len(dst_indices_local)}"
                     )
-                if (
+                src_layout = getattr(self.kv_args, "minimax_index_k_layout", "") or ""
+                dst_layout = (
+                    getattr(
+                        target_rank_registration_info,
+                        "dst_minimax_index_k_layout",
+                        "",
+                    )
+                    if target_rank_registration_info is not None
+                    else ""
+                ) or ""
+                src_has_index_layout = bool(src_layout)
+                dst_has_index_layout = bool(dst_layout)
+                if src_has_index_layout != dst_has_index_layout:
+                    raise RuntimeError(
+                        "MiniMax index-K layout metadata must be provided by both "
+                        "peers or neither"
+                    )
+                has_index_layout = src_has_index_layout and dst_has_index_layout
+                is_heterogeneous = (
                     target_rank_registration_info is not None
                     and self.attn_tp_size
                     != target_rank_registration_info.dst_attn_tp_size
-                ):
+                )
+                if is_heterogeneous and not has_index_layout:
                     raise RuntimeError(
-                        "PD disagg: heterogeneous TP not supported for MiniMax "
-                        "state yet."
+                        "MiniMax heterogeneous index-K transfer requires logical "
+                        "and global index-head metadata from both peers"
                     )
-                src_indices = list(indices)
-                dst_indices_local = list(dst_indices)
-                if st == StateType.MINIMAX_DENSE_KV:
-                    if len(src_indices) != len(dst_indices_local):
+                if has_index_layout:
+                    dst_global_heads = (
+                        target_rank_registration_info.dst_minimax_global_index_head_num
+                    )
+                    src_global_heads = self.kv_args.minimax_global_index_head_num
+                    if src_global_heads != dst_global_heads:
                         raise RuntimeError(
-                            f"{st.value} state index length mismatch: "
-                            f"prefill={len(src_indices)}, dst={len(dst_indices_local)}"
+                            "MiniMax global index head count mismatch: "
+                            f"prefill={src_global_heads}, dst={dst_global_heads}"
                         )
-                elif len(src_indices) > len(dst_indices_local):
-                    src_indices = src_indices[: len(dst_indices_local)]
-                elif len(src_indices) < len(dst_indices_local):
-                    dst_indices_local = dst_indices_local[: len(src_indices)]
+                    if (
+                        self.kv_args.page_size
+                        != target_rank_registration_info.dst_page_size
+                    ):
+                        raise RuntimeError(
+                            "MiniMax index-K page layout mismatch: "
+                            f"prefill={self.kv_args.page_size}, "
+                            f"dst={target_rank_registration_info.dst_page_size}"
+                        )
+                    if src_layout != dst_layout:
+                        raise RuntimeError(
+                            "MiniMax index-K layout mismatch: "
+                            f"prefill={src_layout}, dst={dst_layout}"
+                        )
+                    dst_state_data_lens = (
+                        target_rank_registration_info.dst_state_data_lens[i]
+                        if i < len(target_rank_registration_info.dst_state_data_lens)
+                        else []
+                    )
+                    transfer_blocks = build_minimax_index_k_transfer_blocks(
+                        src_data_ptrs=src_data_ptrs,
+                        src_data_lens=src_data_lens,
+                        src_item_lens=src_item_lens,
+                        src_layer_ids=src_state_layer_ids,
+                        src_indices=src_indices,
+                        dst_data_ptrs=dst_data_ptrs,
+                        dst_data_lens=dst_state_data_lens,
+                        dst_item_lens=dst_item_lens,
+                        dst_layer_ids=dst_state_layer_ids,
+                        dst_indices=dst_indices_local,
+                        page_size=self.kv_args.page_size,
+                        src_attn_tp_size=self.attn_tp_size,
+                        src_tp_rank=self.kv_args.engine_rank % self.attn_tp_size,
+                        dst_attn_tp_size=(
+                            target_rank_registration_info.dst_attn_tp_size
+                        ),
+                        dst_tp_rank=(
+                            target_rank_registration_info.dst_tp_rank
+                            % target_rank_registration_info.dst_attn_tp_size
+                        ),
+                        src_index_head_num=self.kv_args.minimax_index_head_num,
+                        dst_index_head_num=(
+                            target_rank_registration_info.dst_minimax_index_head_num
+                        ),
+                        global_index_head_num=src_global_heads,
+                        layout=src_layout,
+                    )
+                    rc = (
+                        self._transfer_data(req.mooncake_session_id, transfer_blocks)
+                        or rc
+                    )
+                    continue
                 rc = (
                     self._send_kvcache_generic(
                         mooncake_session_id=req.mooncake_session_id,
@@ -1898,6 +2147,40 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                         dst_data_indices=np.array(dst_indices_local, dtype=np.int32),
                         executor=executor,
                         force_flat=True,
+                        src_layer_ids=src_state_layer_ids,
+                        dst_layer_ids=dst_state_layer_ids,
+                    )
+                    or rc
+                )
+            elif st == StateType.MINIMAX_DENSE_KV:
+                src_indices = list(indices)
+                dst_indices_local = list(dst_indices)
+                if len(src_indices) != len(dst_indices_local):
+                    raise RuntimeError(
+                        f"{st.value} state index length mismatch: "
+                        f"prefill={len(src_indices)}, dst={len(dst_indices_local)}"
+                    )
+                if (
+                    target_rank_registration_info is not None
+                    and self.attn_tp_size
+                    != target_rank_registration_info.dst_attn_tp_size
+                ):
+                    raise RuntimeError(
+                        "PD disagg: heterogeneous TP not supported for MiniMax "
+                        "dense state."
+                    )
+                rc = (
+                    self._send_kvcache_generic(
+                        mooncake_session_id=req.mooncake_session_id,
+                        src_data_ptrs=src_data_ptrs,
+                        dst_data_ptrs=dst_data_ptrs,
+                        item_lens=src_item_lens,
+                        prefill_data_indices=np.array(src_indices, dtype=np.int32),
+                        dst_data_indices=np.array(dst_indices_local, dtype=np.int32),
+                        executor=executor,
+                        force_flat=True,
+                        src_layer_ids=src_state_layer_ids,
+                        dst_layer_ids=dst_state_layer_ids,
                     )
                     or rc
                 )
@@ -2894,6 +3177,9 @@ class MooncakeKVReceiver(MooncakeFailureExceptionMixin, CommonKVReceiver):
             packed_state_item_lens = pack_int_lists(
                 self.kv_mgr.kv_args.state_item_lens, "I"
             )
+            packed_state_data_lens = pack_int_lists(
+                self.kv_mgr.kv_args.state_data_lens, "Q"
+            )
             packed_state_dim_per_tensor = pack_int_lists(
                 getattr(self.kv_mgr.kv_args, "state_dim_per_tensor", []) or [], "I"
             )
@@ -2962,6 +3248,27 @@ class MooncakeKVReceiver(MooncakeFailureExceptionMixin, CommonKVReceiver):
                                 f"{len(self.kv_mgr.kv_args.kv_item_lens)}Q",
                                 *self.kv_mgr.kv_args.kv_item_lens,
                             ),
+                            packed_state_data_lens,
+                            str(self.kv_mgr.kv_args.page_size).encode("ascii"),
+                            str(
+                                getattr(
+                                    self.kv_mgr.kv_args,
+                                    "minimax_index_head_num",
+                                    0,
+                                )
+                            ).encode("ascii"),
+                            str(
+                                getattr(
+                                    self.kv_mgr.kv_args,
+                                    "minimax_global_index_head_num",
+                                    0,
+                                )
+                            ).encode("ascii"),
+                            getattr(
+                                self.kv_mgr.kv_args,
+                                "minimax_index_k_layout",
+                                "",
+                            ).encode("ascii"),
                         ]
                     )
             except zmq.ZMQError:

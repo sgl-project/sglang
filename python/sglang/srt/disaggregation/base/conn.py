@@ -65,6 +65,10 @@ class KVArgs:
     state_dim_per_tensor: List[List[int]]
     # Number of rows before the slice axis in each per-slot state tensor.
     state_slice_outer_counts: List[List[int]]
+    # MiniMax sparse index-K has a logical head count independent of physical TP.
+    minimax_index_head_num: int
+    minimax_global_index_head_num: int
+    minimax_index_k_layout: str
     is_hybrid_mla_backend: bool
     # Per-tensor conv sub-block dims (GDN: [key_dim, key_dim, value_dim]) so the
     # scatter transfer can slice each independently head-sharded sub-block; None

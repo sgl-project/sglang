@@ -1550,6 +1550,14 @@ class KVCacheConfigurator:
             head_num=self.model_config.get_num_kv_heads(get_parallel().attn_tp_size),
             head_dim=self.model_config.head_dim,
             idx_head_dim=sparse_cfg["sparse_index_dim"],
+            idx_head_num=(
+                sparse_cfg["sparse_num_index_heads"]
+                // min(
+                    get_parallel().attn_tp_size,
+                    sparse_cfg["sparse_num_index_heads"],
+                )
+            ),
+            global_index_head_num=sparse_cfg["sparse_num_index_heads"],
             dense_layer_ids=dense_layer_ids,
             sparse_layer_ids=sparse_layer_ids,
             disable_value_sparse_layer_ids=disable_value_sparse_layer_ids,
@@ -1869,6 +1877,14 @@ class KVCacheConfigurator:
             ),
             head_dim=self.model_config.head_dim,
             idx_head_dim=sparse_cfg["sparse_index_dim"],
+            idx_head_num=(
+                sparse_cfg["sparse_num_index_heads"]
+                // min(
+                    get_parallel().attn_tp_size,
+                    sparse_cfg["sparse_num_index_heads"],
+                )
+            ),
+            global_index_head_num=sparse_cfg["sparse_num_index_heads"],
             dense_layer_ids=dense_layer_ids,
             sparse_layer_ids=sparse_layer_ids,
             disable_value_sparse_layer_ids=disable_value_sparse_layer_ids,
