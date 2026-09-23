@@ -155,7 +155,13 @@ jobs:
           # the NPU stages; only the Ascend-only wheels are left out.
           rm -f python/pyproject.toml
           mv python/pyproject_npu.toml python/pyproject.toml
-          uv pip install torch==2.10.0 torchvision==0.25.0 torchaudio==2.10.0 \
+          # Versions mirror npu_ci_install_dependency.sh's PYTORCH_VERSION /
+          # TORCHVISION_VERSION / TORCHAUDIO_VERSION defaults -- keep them in sync.
+          # triton is spelled out because sglang.srt.utils.common imports it
+          # unconditionally, and the CPU-only torch wheel (unlike the PyPI one the
+          # CUDA stages resolve) does not pull it in; the NPU image gets
+          # triton_ascend from that same script instead.
+          uv pip install torch==2.10.0 torchvision==0.25.0 torchaudio==2.10.0 triton \
             --index-url https://download.pytorch.org/whl/cpu \
             --extra-index-url https://pypi.org/simple/
           uv pip install -e "python[dev_npu]" --index-strategy unsafe-best-match
