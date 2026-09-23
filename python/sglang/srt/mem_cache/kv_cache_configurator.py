@@ -1782,6 +1782,7 @@ class KVCacheConfigurator:
             device=self.device,
             enable_kv_cache_copy=(get_spec().speculative_algorithm is not None),
             token_to_kv_pool_class=swa_pool_class,
+            enable_memory_saver=get_exec().features.enable_memory_saver,
             **kwargs,
         )
         return token_to_kv_pool
