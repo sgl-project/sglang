@@ -297,8 +297,10 @@ def _model_logits_soft_cap(model: torch.nn.Module) -> float:
     forward batch, so plan with the single cap the layers share (gemma-2: 50.0,
     grok: 30.0; every capped in-tree model uses one value for all layers).
     """
+    # A null cap (gemma-2 configs may set ``attn_logit_softcapping: null``)
+    # means uncapped, like 0.0.
     caps = {
-        module.logit_cap
+        module.logit_cap or 0.0
         for module in model.modules()
         if isinstance(module, RadixAttention)
     }
