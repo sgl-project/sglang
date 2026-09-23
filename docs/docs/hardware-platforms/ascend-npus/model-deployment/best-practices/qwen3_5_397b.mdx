@@ -9,28 +9,28 @@ This page focuses on optimal configuration and benchmark results for Qwen3.5-397
 setup, model weight download, feature configuration, and deployment instructions, etc., see
 the [Qwen3.5-397B-A17B Model Tutorial](/docs/hardware-platforms/ascend-npus/model-deployment/tutorials/qwen3_5_397b).
 
-On A3 each card has 2 dies, so `--tp-size` is twice the card count; see [Ascend NPU Reference](/docs/hardware-platforms/ascend-npus/reference/glossary#hardware) for details.
+On the A3 Series, each card has 2 dies, so `--tp-size` is twice the card count; see [Ascend NPU Reference](/docs/hardware-platforms/ascend-npus/reference/glossary#hardware) for details.
 </Note>
 
 ### Low Latency
 
 | Model | Hardware | Cards | Deploy Mode | Dataset | TPOT | Quantization | Configuration |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| Qwen3.5-397B-A17B | Atlas 800I A3 | 8 | PD Mixed | 128k+1k | 20ms | W4A8 INT8 | [Optimal Configuration](#qwen3-5-397b-a17b-w4a8-8p-in128k-out1k-20ms) |
-| Qwen3.5-397B-A17B | Atlas 800I A3 | 8 | PD Mixed | 16k+1k | 20ms | W4A8 INT8 | [Optimal Configuration](#qwen3-5-397b-a17b-w4a8-8p-in16k-out1k-20ms) |
-| Qwen3.5-397B-A17B | Atlas 800I A3 | 8 | PD Mixed | 3.5k+1.5k | 22.2ms | W4A8 INT8 | [Optimal Configuration](#qwen3-5-397b-a17b-w4a8-8p-in3k5-out1k5-22-2ms) |
-| Qwen3.5-397B-A17B | Atlas 800I A3 | 8 | PD Mixed | 64k+1k | 20ms | W4A8 INT8 | [Optimal Configuration](#qwen3-5-397b-a17b-w4a8-8p-in64k-out1k-20ms) |
+| Qwen3.5-397B-A17B | Ascend A3 Series Products | 8 | PD Mixed | 128k+1k | 20ms | W4A8 INT8 | [Optimal Configuration](#qwen3-5-397b-a17b-w4a8-8p-in128k-out1k-20ms) |
+| Qwen3.5-397B-A17B | Ascend A3 Series Products | 8 | PD Mixed | 16k+1k | 20ms | W4A8 INT8 | [Optimal Configuration](#qwen3-5-397b-a17b-w4a8-8p-in16k-out1k-20ms) |
+| Qwen3.5-397B-A17B | Ascend A3 Series Products | 8 | PD Mixed | 3.5k+1.5k | 22.2ms | W4A8 INT8 | [Optimal Configuration](#qwen3-5-397b-a17b-w4a8-8p-in3k5-out1k5-22-2ms) |
+| Qwen3.5-397B-A17B | Ascend A3 Series Products | 8 | PD Mixed | 64k+1k | 20ms | W4A8 INT8 | [Optimal Configuration](#qwen3-5-397b-a17b-w4a8-8p-in64k-out1k-20ms) |
 
 ### High Throughput
 
 | Model | Hardware | Cards | Deploy Mode | Dataset | TPOT | Quantization | Configuration |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| Qwen3.5-397B-A17B | Atlas 800I A3 | 8 | PD Mixed | 128k+1k | 50ms | W4A8 INT8 | [Optimal Configuration](#qwen3-5-397b-a17b-w4a8-8p-in128k-out1k-50ms) |
-| Qwen3.5-397B-A17B | Atlas 800I A3 | 8 | PD Mixed | 128k+1k (90% prefix cache hit rate) | 50ms | W4A8 INT8 | [Optimal Configuration](#qwen3-5-397b-a17b-w4a8-8p-in128k-out1k-prefix90-50ms) |
-| Qwen3.5-397B-A17B | Atlas 800I A3 | 8 | PD Mixed | 16k+1k | 50ms | W4A8 INT8 | [Optimal Configuration](#qwen3-5-397b-a17b-w4a8-8p-in16k-out1k-50ms) |
-| Qwen3.5-397B-A17B | Atlas 800I A3 | 8 | PD Mixed | 3.5k+1.5k | 50ms | W4A8 INT8 | [Optimal Configuration](#qwen3-5-397b-a17b-w4a8-8p-in3k5-out1k5-50ms) |
-| Qwen3.5-397B-A17B | Atlas 800I A3 | 8 | PD Mixed | 64k+1k | 50ms | W4A8 INT8 | [Optimal Configuration](#qwen3-5-397b-a17b-w4a8-8p-in64k-out1k-50ms) |
-| Qwen3.5-397B-A17B | Atlas 800I A3 | 8 | PD Mixed | 64k+1k (90% prefix cache hit rate) | 50ms | W4A8 INT8 | [Optimal Configuration](#qwen3-5-397b-a17b-w4a8-8p-in64k-out1k-prefix90-50ms) |
+| Qwen3.5-397B-A17B | Ascend A3 Series Products | 8 | PD Mixed | 128k+1k | 50ms | W4A8 INT8 | [Optimal Configuration](#qwen3-5-397b-a17b-w4a8-8p-in128k-out1k-50ms) |
+| Qwen3.5-397B-A17B | Ascend A3 Series Products | 8 | PD Mixed | 128k+1k (90% prefix cache hit rate) | 50ms | W4A8 INT8 | [Optimal Configuration](#qwen3-5-397b-a17b-w4a8-8p-in128k-out1k-prefix90-50ms) |
+| Qwen3.5-397B-A17B | Ascend A3 Series Products | 8 | PD Mixed | 16k+1k | 50ms | W4A8 INT8 | [Optimal Configuration](#qwen3-5-397b-a17b-w4a8-8p-in16k-out1k-50ms) |
+| Qwen3.5-397B-A17B | Ascend A3 Series Products | 8 | PD Mixed | 3.5k+1.5k | 50ms | W4A8 INT8 | [Optimal Configuration](#qwen3-5-397b-a17b-w4a8-8p-in3k5-out1k5-50ms) |
+| Qwen3.5-397B-A17B | Ascend A3 Series Products | 8 | PD Mixed | 64k+1k | 50ms | W4A8 INT8 | [Optimal Configuration](#qwen3-5-397b-a17b-w4a8-8p-in64k-out1k-50ms) |
+| Qwen3.5-397B-A17B | Ascend A3 Series Products | 8 | PD Mixed | 64k+1k (90% prefix cache hit rate) | 50ms | W4A8 INT8 | [Optimal Configuration](#qwen3-5-397b-a17b-w4a8-8p-in64k-out1k-prefix90-50ms) |
 
 ## Optimal Configuration
 
@@ -40,7 +40,7 @@ On A3 each card has 2 dies, so `--tp-size` is twice the card count; see [Ascend 
 
 **Model**: Qwen3.5-397B-A17B
 
-**Hardware**: Atlas 800I A3
+**Hardware**: Ascend A3 Series Products
 
 **Cards**: 8
 
@@ -89,7 +89,6 @@ export HCCL_SOCKET_IFNAME=<network-interface>
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=128
 export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
-export SGLANG_ENABLE_SPEC_V2=1
 export SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK=0
 export SGLANG_SET_CPU_AFFINITY=1
 export SGLANG_ZBAL_BOOTSTRAP_URL=tcp://127.0.0.1:24669
@@ -111,7 +110,7 @@ python3 -m sglang.launch_server \
     --trust-remote-code \
     --max-running-requests 16 \
     --mem-fraction-static 0.6 \
-    --cuda-graph-bs 2 3 4 5 6 8 10 12 14 16 \
+    --cuda-graph-bs-decode 2 3 4 5 6 8 10 12 14 16 \
     --quantization modelslim \
     --enable-multimodal \
     --moe-a2a-backend deepep \
@@ -154,7 +153,7 @@ python -m sglang.bench_serving \
 
 **Model**: Qwen3.5-397B-A17B
 
-**Hardware**: Atlas 800I A3
+**Hardware**: Ascend A3 Series Products
 
 **Cards**: 8
 
@@ -203,7 +202,6 @@ export HCCL_SOCKET_IFNAME=<network-interface>
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=128
 export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
-export SGLANG_ENABLE_SPEC_V2=1
 export SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK=0
 export SGLANG_SET_CPU_AFFINITY=1
 export SGLANG_ZBAL_BOOTSTRAP_URL=tcp://127.0.0.1:24669
@@ -267,7 +265,7 @@ python -m sglang.bench_serving \
 
 **Model**: Qwen3.5-397B-A17B
 
-**Hardware**: Atlas 800I A3
+**Hardware**: Ascend A3 Series Products
 
 **Cards**: 8
 
@@ -316,7 +314,6 @@ export HCCL_SOCKET_IFNAME=<network-interface>
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=128
 export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
-export SGLANG_ENABLE_SPEC_V2=1
 export SGLANG_SET_CPU_AFFINITY=1
 export STREAMS_PER_DEVICE=32
 
@@ -330,7 +327,7 @@ python3 -m sglang.launch_server \
     --max-prefill-tokens 131072 \
     --max-mamba-cache-size 320 \
     --prefill-max-requests 10 \
-    --mamba-scheduler-strategy extra_buffer \
+    --mamba-radix-cache-strategy extra_buffer \
     --trust-remote-code \
     --max-running-requests 64 \
     --mem-fraction-static 0.6 \
@@ -379,7 +376,7 @@ python -m sglang.bench_serving \
 
 **Model**: Qwen3.5-397B-A17B
 
-**Hardware**: Atlas 800I A3
+**Hardware**: Ascend A3 Series Products
 
 **Cards**: 8
 
@@ -428,7 +425,6 @@ export HCCL_SOCKET_IFNAME=<network-interface>
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=128
 export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
-export SGLANG_ENABLE_SPEC_V2=1
 export SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK=0
 export SGLANG_SET_CPU_AFFINITY=1
 export SGLANG_ZBAL_BOOTSTRAP_URL=tcp://127.0.0.1:24669
@@ -451,7 +447,7 @@ python3 -m sglang.launch_server \
     --max-running-requests 48 \
     --mem-fraction-static 0.8 \
     --max-total-tokens 210000 \
-    --cuda-graph-bs 2 4 6 8 10 12 \
+    --cuda-graph-bs-decode 2 4 6 8 10 12 \
     --quantization modelslim \
     --enable-multimodal \
     --moe-a2a-backend deepep \
@@ -497,7 +493,7 @@ python -m sglang.bench_serving \
 
 **Model**: Qwen3.5-397B-A17B
 
-**Hardware**: Atlas 800I A3
+**Hardware**: Ascend A3 Series Products
 
 **Cards**: 8
 
@@ -546,7 +542,6 @@ export HCCL_SOCKET_IFNAME=<network-interface>
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=128
 export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
-export SGLANG_ENABLE_SPEC_V2=1
 export SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK=0
 export SGLANG_SET_CPU_AFFINITY=1
 export SGLANG_ZBAL_BOOTSTRAP_URL=tcp://127.0.0.1:24669
@@ -569,7 +564,7 @@ python3 -m sglang.launch_server \
     --max-running-requests 144 \
     --mem-fraction-static 0.8 \
     --max-total-tokens 635000 \
-    --cuda-graph-bs 2 4 6 8 12 14 16 18 20 24 26 28 30 32 34 36 \
+    --cuda-graph-bs-decode 2 4 6 8 12 14 16 18 20 24 26 28 30 32 34 36 \
     --quantization modelslim \
     --enable-multimodal \
     --moe-a2a-backend deepep \
@@ -615,7 +610,7 @@ python -m sglang.bench_serving \
 
 **Model**: Qwen3.5-397B-A17B
 
-**Hardware**: Atlas 800I A3
+**Hardware**: Ascend A3 Series Products
 
 **Cards**: 8
 
@@ -664,7 +659,6 @@ export HCCL_SOCKET_IFNAME=<network-interface>
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=128
 export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
-export SGLANG_ENABLE_SPEC_V2=1
 export SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK=0
 export SGLANG_SET_CPU_AFFINITY=1
 export SGLANG_ZBAL_BOOTSTRAP_URL=tcp://127.0.0.1:24669
@@ -686,7 +680,7 @@ python3 -m sglang.launch_server \
     --trust-remote-code \
     --max-running-requests 160 \
     --mem-fraction-static 0.8 \
-    --cuda-graph-bs 2 4 6 8 10 12 14 16 18 20 \
+    --cuda-graph-bs-decode 2 4 6 8 10 12 14 16 18 20 \
     --quantization modelslim \
     --enable-multimodal \
     --moe-a2a-backend deepep \
@@ -732,7 +726,7 @@ python -m sglang.bench_serving \
 
 **Model**: Qwen3.5-397B-A17B
 
-**Hardware**: Atlas 800I A3
+**Hardware**: Ascend A3 Series Products
 
 **Cards**: 8
 
@@ -781,7 +775,6 @@ export HCCL_SOCKET_IFNAME=<network-interface>
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=128
 export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
-export SGLANG_ENABLE_SPEC_V2=1
 export SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK=0
 export SGLANG_SET_CPU_AFFINITY=1
 export SGLANG_ZBAL_BOOTSTRAP_URL=tcp://127.0.0.1:24669
@@ -803,7 +796,7 @@ python3 -m sglang.launch_server \
     --trust-remote-code \
     --max-running-requests 432 \
     --mem-fraction-static 0.8 \
-    --cuda-graph-bs 2 4 6 8 12 16 20 24 28 32 36 40 44 48 50 52 54 \
+    --cuda-graph-bs-decode 2 4 6 8 12 16 20 24 28 32 36 40 44 48 50 52 54 \
     --quantization modelslim \
     --enable-multimodal \
     --moe-a2a-backend deepep \
@@ -849,7 +842,7 @@ python -m sglang.bench_serving \
 
 **Model**: Qwen3.5-397B-A17B
 
-**Hardware**: Atlas 800I A3
+**Hardware**: Ascend A3 Series Products
 
 **Cards**: 8
 
@@ -898,7 +891,6 @@ export HCCL_SOCKET_IFNAME=<network-interface>
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=128
 export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
-export SGLANG_ENABLE_SPEC_V2=1
 export SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK=0
 export SGLANG_SET_CPU_AFFINITY=1
 export SGLANG_ZBAL_BOOTSTRAP_URL=tcp://127.0.0.1:24669
@@ -921,7 +913,7 @@ python3 -m sglang.launch_server \
     --max-running-requests 16 \
     --mem-fraction-static 0.6 \
     --max-total-tokens 1065000 \
-    --cuda-graph-bs 2 4 6 8 10 12 14 16 \
+    --cuda-graph-bs-decode 2 4 6 8 10 12 14 16 \
     --quantization modelslim \
     --enable-multimodal \
     --moe-a2a-backend deepep \
@@ -967,7 +959,7 @@ python -m sglang.bench_serving \
 
 **Model**: Qwen3.5-397B-A17B
 
-**Hardware**: Atlas 800I A3
+**Hardware**: Ascend A3 Series Products
 
 **Cards**: 8
 
@@ -1016,7 +1008,6 @@ export HCCL_SOCKET_IFNAME=<network-interface>
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=128
 export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
-export SGLANG_ENABLE_SPEC_V2=1
 export SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK=0
 export SGLANG_SET_CPU_AFFINITY=1
 export SGLANG_ZBAL_BOOTSTRAP_URL=tcp://127.0.0.1:24669
@@ -1039,7 +1030,7 @@ python3 -m sglang.launch_server \
     --max-running-requests 32 \
     --mem-fraction-static 0.6 \
     --max-total-tokens 1065000 \
-    --cuda-graph-bs 2 4 6 8 12 14 16 \
+    --cuda-graph-bs-decode 2 4 6 8 12 14 16 \
     --quantization modelslim \
     --enable-multimodal \
     --moe-a2a-backend deepep \
@@ -1085,7 +1076,7 @@ python -m sglang.bench_serving \
 
 **Model**: Qwen3.5-397B-A17B
 
-**Hardware**: Atlas 800I A3
+**Hardware**: Ascend A3 Series Products
 
 **Cards**: 8
 
@@ -1134,7 +1125,6 @@ export HCCL_SOCKET_IFNAME=<network-interface>
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=128
 export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
-export SGLANG_ENABLE_SPEC_V2=1
 export SGLANG_SET_CPU_AFFINITY=1
 export STREAMS_PER_DEVICE=32
 
@@ -1147,7 +1137,7 @@ python3 -m sglang.launch_server \
     --chunked-prefill-size -1 \
     --max-prefill-tokens 65536 \
     --max-mamba-cache-size 640 \
-    --mamba-scheduler-strategy extra_buffer \
+    --mamba-radix-cache-strategy extra_buffer \
     --trust-remote-code \
     --max-running-requests 128 \
     --mem-fraction-static 0.6 \

@@ -14,6 +14,18 @@ from sglang.srt.layers.attention.dsa.dsa_indexer import (
     rotate_activation,
 )
 from sglang.srt.layers.attention.dsa.dsa_topk_backend import TopkTransformMethod
+from sglang.srt.layers.attention.dsa.paged_mqa_logits_backend import (
+    DSAPagedMQALogitsBackend,
+)
+from sglang.srt.layers.attention.dsa.utils import (
+    aiter_can_use_preshuffle_paged_mqa,
+    dsa_use_prefill_cp,
+)
+from sglang.srt.layers.attention.mqa_logits_utils import (
+    MQA_LOGITS_BYTES_PER_ELEM,
+    MQA_LOGITS_MAX_BYTES_ROCM,
+    mqa_logits_rows_per_chunk,
+)
 from sglang.srt.layers.layernorm import LayerNorm
 from sglang.srt.layers.utils import MultiPlatformOp
 from sglang.srt.utils import add_prefix, ceil_align, is_cuda, is_hip, is_npu
@@ -25,7 +37,10 @@ if is_cuda():
         deep_gemm = e
 
 if is_npu():
-    import custom_ops  # noqa: F401
+    try:
+        import custom_ops  # noqa: F401
+    except ImportError:
+        pass
 
 from sglang.srt.environ import envs
 from sglang.srt.layers import deep_gemm_wrapper
@@ -39,10 +54,19 @@ from sglang.srt.model_executor.forward_context import (
     get_token_to_kv_pool,
 )
 from sglang.srt.model_executor.runner import get_is_capture_mode
-from sglang.srt.runtime_context import get_device
+from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
+    is_in_breakable_cuda_graph,
+)
+from sglang.srt.runtime_context import get_device, get_exec
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
+
+
+def _should_fuse_kpool_topk(metadata: BaseIndexerMetadata) -> bool:
+    return envs.SGLANG_DSA_FUSE_TOPK.get() and not getattr(
+        metadata, "force_unfused_topk", False
+    )
 
 
 class IndexerKPool(MultiPlatformOp):
@@ -95,6 +119,11 @@ class IndexerKPool(MultiPlatformOp):
         )
         assert 64 % self.index_kpool == 0, (
             f"index_kpool ({self.index_kpool}) must divide page_size (64)"
+        )
+
+        # resolve() pins ROCm to AITER and lets --dsa-paged-mqa-logits-backend reach this path
+        self.paged_mqa_logits_backend = DSAPagedMQALogitsBackend.resolve(
+            get_exec().kernel.dsa_paged_mqa_logits_backend
         )
 
         self.index_kpool_compress_ape = nn.Parameter(
@@ -156,6 +185,36 @@ class IndexerKPool(MultiPlatformOp):
         weights = weights * self.n_heads**-0.5
         weights = weights.unsqueeze(-1) * q_scale * self.softmax_scale
         return weights
+
+    @torch.compile(dynamic=True)
+    def _project_and_scale_head_gates(self, x: torch.Tensor) -> torch.Tensor:
+        weights, _ = self.weights_proj(x.float())
+        return weights * self.n_heads**-0.5
+
+    @torch.compile(dynamic=True)
+    def _apply_q_scale_and_softmax_scale(
+        self, weights: torch.Tensor, q_scale: torch.Tensor
+    ) -> torch.Tensor:
+        return weights.unsqueeze(-1) * q_scale * self.softmax_scale
+
+    def _resolve_head_gate_weights(self, x, q_scale, head_weights):
+        if head_weights is not None:
+            return self._apply_q_scale_and_softmax_scale(head_weights, q_scale)
+        return self._get_logits_head_gate(x, q_scale)
+
+    def _can_overlap_prefill(
+        self,
+        forward_batch: ForwardBatch,
+        return_indices: bool,
+    ) -> bool:
+        return (
+            self.alt_stream is not None
+            and return_indices
+            and forward_batch.forward_mode.is_extend_without_speculative()
+            and not get_is_capture_mode()
+            and not is_in_breakable_cuda_graph()
+            and not dsa_use_prefill_cp(forward_batch)
+        )
 
     @staticmethod
     def _get_index_k_read_buffer(pool, layer_id: int) -> torch.Tensor:
@@ -532,8 +591,11 @@ class IndexerKPool(MultiPlatformOp):
         enable_dual_stream: bool,
         forward_batch: ForwardBatch,
         precompute_compress_gate: bool = False,
+        precompute_head_gate: bool = False,
     ):
         gate_score = None
+        head_weights = None
+        apply_rope = not self.skip_rope and self.rope_head_dim > 0
         if enable_dual_stream:
             current_stream = torch.cuda.current_stream()
             self.alt_stream.wait_stream(current_stream)
@@ -551,6 +613,10 @@ class IndexerKPool(MultiPlatformOp):
                     [self.rope_head_dim, self.head_dim - self.rope_head_dim],
                     dim=-1,
                 )
+            if precompute_head_gate:
+                head_weights = self._project_and_scale_head_gates(x)
+            if not apply_rope:
+                query = rotate_activation(query)
             with torch.cuda.stream(self.alt_stream):
                 key, _ = self.wk(x)
                 key = self.k_norm(key)
@@ -578,15 +644,16 @@ class IndexerKPool(MultiPlatformOp):
                 key, [self.rope_head_dim, self.head_dim - self.rope_head_dim], dim=-1
             )
 
-        if not self.skip_rope:
+        if apply_rope:
             q_rope, k_rope = self.rotary_emb(positions, q_rope, k_rope)
 
             query[..., : self.rope_head_dim] = q_rope
             key[..., : self.rope_head_dim] = k_rope
 
-        query = rotate_activation(query)
+        if apply_rope or not enable_dual_stream:
+            query = rotate_activation(query)
 
-        return query, key, gate_score
+        return query, key, gate_score, head_weights
 
     def _get_k_bf16(
         self,
@@ -739,7 +806,7 @@ class IndexerKPool(MultiPlatformOp):
         paged_page_table: Optional[torch.Tensor] = None,
         paged_page_table_row_index: Optional[torch.Tensor] = None,
     ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]:
-        if not envs.SGLANG_DSA_FUSE_TOPK.get():
+        if not _should_fuse_kpool_topk(metadata):
             return None, None, None
 
         topk_method = metadata.topk_transform_method
@@ -758,11 +825,65 @@ class IndexerKPool(MultiPlatformOp):
         return None, None, None
 
     @staticmethod
+    def _fp8_mqa_logits(
+        q_fp8: torch.Tensor,
+        k_fp8: torch.Tensor,
+        k_scale: torch.Tensor,
+        weights: torch.Tensor,
+        starts: torch.Tensor,
+        ends: torch.Tensor,
+        *,
+        clean_logits: bool,
+    ) -> torch.Tensor:
+        """Ragged MQA logits: DeepGEMM on CUDA, AITER's Triton kernel on ROCm."""
+        if is_hip():
+            from aiter.ops.triton.fp8_mqa_logits import fp8_mqa_logits
+
+            # above 2 GiB of fp32 logits the kernel miscompiles and abort()s the
+            # process (ROCm/aiter#5114); rows are independent, so block the queries
+            num_q, num_k = q_fp8.shape[0], k_fp8.shape[0]
+            rows_per_call = mqa_logits_rows_per_chunk(
+                num_rows=num_q,
+                row_bytes=num_k * MQA_LOGITS_BYTES_PER_ELEM,
+                budget_bytes=MQA_LOGITS_MAX_BYTES_ROCM,
+            )
+            if rows_per_call is None:
+                return fp8_mqa_logits(
+                    q_fp8,
+                    k_fp8,
+                    k_scale,
+                    weights,
+                    starts,
+                    ends,
+                    clean_logits=clean_logits,
+                )
+            logits = torch.empty(
+                (num_q, num_k), dtype=torch.float32, device=q_fp8.device
+            )
+            for i in range(0, num_q, rows_per_call):
+                rows = slice(i, i + rows_per_call)
+                logits[rows] = fp8_mqa_logits(
+                    q_fp8[rows],
+                    k_fp8,
+                    k_scale,
+                    weights[rows],
+                    starts[rows],
+                    ends[rows],
+                    clean_logits=clean_logits,
+                )
+            return logits
+
+        return deep_gemm.fp8_mqa_logits(
+            q_fp8, (k_fp8, k_scale), weights, starts, ends, clean_logits=clean_logits
+        )
+
+    @staticmethod
     def _should_use_tilelang_paged_mqa_logits(q_fp8: torch.Tensor) -> bool:
+        # q_fp8 is [tokens, heads, dim], without the next_n dim
         if not is_cuda():
             return False
         arch_major, _ = torch.cuda.get_device_capability(q_fp8.device)
-        num_heads = q_fp8.shape[2]
+        num_heads = q_fp8.shape[1]
         return arch_major == 9 and num_heads not in (32, 64)
 
     def _get_topk_paged(
@@ -799,7 +920,7 @@ class IndexerKPool(MultiPlatformOp):
         if n_real < num_q_padded:
             q_fp8 = q_fp8[:n_real]
             weights = weights[:n_real]
-        q_fp8 = q_fp8.unsqueeze(1)  # the next_n dim is 1 now
+        # aiter_paged_mqa_logits adds the next_n dim itself; the other two want it already there
         assert len(kv_cache_fp8.shape) == 2
         block_kv = 64
         num_heads_kv = 1
@@ -809,7 +930,11 @@ class IndexerKPool(MultiPlatformOp):
         )
         assert len(weights.shape) == 3
         weights = weights.squeeze(2)
-        use_tilelang_paged_mqa = self._should_use_tilelang_paged_mqa_logits(q_fp8)
+        use_aiter_paged_mqa = self.paged_mqa_logits_backend.is_aiter()
+        use_tilelang_paged_mqa = (
+            not use_aiter_paged_mqa
+            and self._should_use_tilelang_paged_mqa_logits(q_fp8)
+        )
 
         pool_seqlens, pool_context_lens, pool_block_tables, pool_schedule_metadata = (
             self._get_kpool_decode_metadata(
@@ -817,17 +942,40 @@ class IndexerKPool(MultiPlatformOp):
                 block_tables,
                 seqlens_32,
                 blocksize,
-                build_schedule_metadata=not use_tilelang_paged_mqa,
+                build_schedule_metadata=not (
+                    use_aiter_paged_mqa or use_tilelang_paged_mqa
+                ),
             )
         )
         pool_max_seq_len = pool_block_tables.shape[1] * blocksize
-        if use_tilelang_paged_mqa:
+        if use_aiter_paged_mqa:
+            # kpool_fp8_index writes in AITER's tile order, so a row-major reader would misread the cache
+            if not aiter_can_use_preshuffle_paged_mqa():
+                raise RuntimeError(
+                    "The ROCm k-pool indexer needs AITER's preshuffle paged-MQA "
+                    "kernel. It requires Triton >= 3.5.0, or "
+                    "AITER_ENABLE_AOT_GLUON_PA_MQA_LOGITS=1 with the AOT gluon "
+                    "artifacts present in the image."
+                )
+            from sglang.kernels.ops.attention.dsa import aiter_paged_mqa_logits
+
+            logits = aiter_paged_mqa_logits(
+                q_fp8,
+                kv_cache_fp8,
+                weights,
+                pool_seqlens,
+                pool_block_tables,
+                pool_max_seq_len,
+                preshuffle=True,
+                kv_block_size=block_kv,
+            )
+        elif use_tilelang_paged_mqa:
             from sglang.kernels.ops.attention.dsa.tilelang_kernel import (
                 tilelang_fp8_paged_mqa_logits,
             )
 
             logits = tilelang_fp8_paged_mqa_logits(
-                q_fp8,
+                q_fp8.unsqueeze(1),
                 kv_cache_fp8,
                 weights,
                 pool_seqlens,
@@ -838,7 +986,7 @@ class IndexerKPool(MultiPlatformOp):
             )
         else:
             logits = deep_gemm.fp8_paged_mqa_logits(
-                q_fp8,
+                q_fp8.unsqueeze(1),
                 kv_cache_fp8,
                 weights,
                 pool_context_lens,
@@ -916,9 +1064,10 @@ class IndexerKPool(MultiPlatformOp):
                 scale_out=k_scale,
             )
             k_fp8 = k_u8.view(torch.float8_e4m3fn)
-            logits = deep_gemm.fp8_mqa_logits(
+            logits = self._fp8_mqa_logits(
                 q_fp8[:n_real].contiguous(),
-                (k_fp8.contiguous(), k_scale.contiguous()),
+                k_fp8.contiguous(),
+                k_scale.contiguous(),
                 weights[:n_real].contiguous(),
                 ks_per_q,
                 ke_per_q,
@@ -932,7 +1081,7 @@ class IndexerKPool(MultiPlatformOp):
         page_table_all = None
         page_table_row_index_all = None
         topk_offsets_all = None
-        if envs.SGLANG_DSA_FUSE_TOPK.get():
+        if _should_fuse_kpool_topk(metadata):
             if topk_method == TopkTransformMethod.PAGED:
                 page_table_all = plan.ragged_paged_page_table
                 page_table_row_index_all = plan.ragged_paged_page_table_row_index
@@ -1148,9 +1297,10 @@ class IndexerKPool(MultiPlatformOp):
                     and zero_starts_by_batch[i] is not None
                     else torch.zeros((q_len,), dtype=torch.int32, device=q_fp8.device)
                 )
-                local_logits = deep_gemm.fp8_mqa_logits(
+                local_logits = self._fp8_mqa_logits(
                     q_fp8[q_slice].contiguous(),
-                    (k_fp8.contiguous(), k_scale.contiguous()),
+                    k_fp8.contiguous(),
+                    k_scale.contiguous(),
                     weights[q_slice].contiguous(),
                     row_starts,
                     local_pool_lens,
@@ -1164,7 +1314,7 @@ class IndexerKPool(MultiPlatformOp):
             page_table_local = None
             topk_offsets_local = None
             if (
-                envs.SGLANG_DSA_FUSE_TOPK.get()
+                _should_fuse_kpool_topk(metadata)
                 and topk_method == TopkTransformMethod.PAGED
             ):
                 page_table_local = (
@@ -1174,7 +1324,7 @@ class IndexerKPool(MultiPlatformOp):
                 )
                 page_table_local = page_table_local.unsqueeze(0).expand(q_len, -1)
             elif (
-                envs.SGLANG_DSA_FUSE_TOPK.get()
+                _should_fuse_kpool_topk(metadata)
                 and topk_method == TopkTransformMethod.RAGGED
                 and topk_offsets is not None
             ):
@@ -1282,12 +1432,12 @@ class IndexerKPool(MultiPlatformOp):
         enable_dual_stream: bool,
         return_indices: bool = True,
     ) -> Optional[torch.Tensor]:
-        assert is_cuda(), "DSA kpool target_verify is CUDA-only"
+        assert is_cuda() or is_hip(), "DSA kpool target_verify needs CUDA or ROCm"
         plan = metadata.attn_metadata.kpool_write_plan
         assert plan is not None, "DSA kpool target_verify requires kpool_write_plan"
         num_draft_tokens = plan.num_draft_tokens
 
-        query, key, gate_score_maybe = self._get_q_k_bf16(
+        query, key, gate_score_maybe, head_weights = self._get_q_k_bf16(
             q_lora,
             x,
             positions,
@@ -1296,6 +1446,7 @@ class IndexerKPool(MultiPlatformOp):
             precompute_compress_gate=(
                 enable_dual_stream and self.compress_gate_stream is not None
             ),
+            precompute_head_gate=enable_dual_stream and return_indices,
         )
 
         pool = get_token_to_kv_pool()
@@ -1334,7 +1485,7 @@ class IndexerKPool(MultiPlatformOp):
                 self.alt_stream.wait_stream(self.compress_gate_stream)
             if return_indices:
                 q_fp8, q_scale = act_quant(query, self.block_size, self.scale_fmt)
-                weights = self._get_logits_head_gate(x, q_scale)
+                weights = self._resolve_head_gate_weights(x, q_scale, head_weights)
             with torch.cuda.stream(self.alt_stream):
                 _compress_write()
             current_stream.wait_stream(self.alt_stream)
@@ -1342,13 +1493,49 @@ class IndexerKPool(MultiPlatformOp):
             _compress_write()
             if return_indices:
                 q_fp8, q_scale = act_quant(query, self.block_size, self.scale_fmt)
-                weights = self._get_logits_head_gate(x, q_scale)
+                weights = self._resolve_head_gate_weights(x, q_scale, head_weights)
 
         if not return_indices:
             return None
         return self._get_topk_paged(forward_batch, layer_id, q_fp8, weights, metadata)
 
     def forward_cuda(
+        self,
+        x: torch.Tensor,
+        q_lora: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        layer_id: int,
+        return_indices: bool = True,
+    ) -> Optional[torch.Tensor]:
+        if (
+            is_in_breakable_cuda_graph()
+            and forward_batch.forward_mode.is_extend_without_speculative()
+        ):
+            from sglang.srt.layers.attention.dsa.kpool_prefill_cuda_graph import (
+                bcg_kpool_indexer_prefill_with_output,
+            )
+
+            # K-pool prefill plans contain request-specific tensors and launch
+            # counts. Like the ordinary DSA indexer, execute them eagerly and
+            # bridge the result into a stable buffer for captured attention.
+            output = torch.empty(
+                (
+                    x.shape[0] if return_indices else 0,
+                    self.index_topk + self.index_kpool - 1,
+                ),
+                dtype=torch.int32,
+                device=x.device,
+            )
+            bcg_kpool_indexer_prefill_with_output(
+                self, x, q_lora, positions, output, layer_id
+            )
+            return output if return_indices else None
+        return self._forward_cuda_impl(
+            x, q_lora, positions, forward_batch, layer_id, return_indices
+        )
+
+    def _forward_cuda_impl(
         self,
         x: torch.Tensor,
         q_lora: torch.Tensor,
@@ -1372,6 +1559,12 @@ class IndexerKPool(MultiPlatformOp):
             and get_is_capture_mode()
             and q_lora.shape[0] > 0
             and q_lora.shape[0] <= DUAL_STREAM_TOKEN_THRESHOLD
+            # The BCG eager break must finish its indexer work before starting
+            # the next capture segment; keep its projections on one stream.
+            and not (
+                is_in_breakable_cuda_graph()
+                and forward_batch.forward_mode.is_extend_without_speculative()
+            )
         )
 
         # Skip DSA if the attention backend chooses to skip this batch.
@@ -1428,44 +1621,24 @@ class IndexerKPool(MultiPlatformOp):
             and forward_batch.forward_mode.is_decode_or_idle()
             and self.compress_gate_stream is not None
         )
-        query, key, gate_score = self._get_q_k_bf16(
+        query, key, gate_score, head_weights = self._get_q_k_bf16(
             q_lora,
             x,
             positions,
             enable_dual_stream,
             forward_batch=forward_batch,
             precompute_compress_gate=precompute_compress_gate,
+            precompute_head_gate=enable_dual_stream and return_indices,
         )
 
-        weights = None
-        kpool_extend_cache = None
-        if enable_dual_stream and forward_batch.forward_mode.is_decode_or_idle():
-            current_stream = torch.cuda.current_stream()
-            self.alt_stream.wait_stream(current_stream)
-            if gate_score is not None:
-                self.alt_stream.wait_stream(self.compress_gate_stream)
-            with torch.cuda.stream(self.alt_stream):
-                self._compress_write(
-                    x=x,
-                    key=key,
-                    positions=positions,
-                    forward_batch=forward_batch,
-                    layer_id=layer_id,
-                    metadata=metadata,
-                    gate_score=gate_score,
-                )
-            q_fp8, q_scale = act_quant(query, self.block_size, self.scale_fmt)
-            weights = self._get_logits_head_gate(x, q_scale)
-            current_stream.wait_stream(self.alt_stream)
-        else:
-            q_fp8, q_scale = act_quant(query, self.block_size, self.scale_fmt)
-            has_kpool_extend_plan = metadata.attn_metadata.kpool_extend_plan is not None
-            defer_kpool_cache_write = (
-                forward_batch.forward_mode.is_extend_without_speculative()
-                and return_indices
-                and not has_kpool_extend_plan
-            )
-            kpool_extend_cache = self._compress_write(
+        has_kpool_extend_plan = metadata.attn_metadata.kpool_extend_plan is not None
+        is_prefill = forward_batch.forward_mode.is_extend_without_speculative()
+        defer_kpool_cache_write = (
+            is_prefill and return_indices and not has_kpool_extend_plan
+        )
+
+        def compress_write():
+            return self._compress_write(
                 x=x,
                 key=key,
                 positions=positions,
@@ -1473,22 +1646,35 @@ class IndexerKPool(MultiPlatformOp):
                 layer_id=layer_id,
                 metadata=metadata,
                 gate_score=gate_score,
-                return_compressed=(
-                    forward_batch.forward_mode.is_extend_without_speculative()
-                    and return_indices
-                ),
+                return_compressed=is_prefill and return_indices,
                 write_cache=not defer_kpool_cache_write,
             )
-            if (
-                forward_batch.forward_mode.is_extend_without_speculative()
-                and not return_indices
-            ):
-                return None
 
-        if weights is None:
-            weights = self._get_logits_head_gate(x, q_scale)
+        overlap_decode = (
+            enable_dual_stream and forward_batch.forward_mode.is_decode_or_idle()
+        )
+        if overlap_decode or self._can_overlap_prefill(forward_batch, return_indices):
+            current_stream = torch.cuda.current_stream()
+            self.alt_stream.wait_stream(current_stream)
+            if gate_score is not None:
+                self.alt_stream.wait_stream(self.compress_gate_stream)
+            with torch.cuda.stream(self.alt_stream):
+                kpool_extend_cache = compress_write()
+            if return_indices:
+                q_fp8, q_scale = act_quant(query, self.block_size, self.scale_fmt)
+                weights = self._resolve_head_gate_weights(x, q_scale, head_weights)
+            current_stream.wait_stream(self.alt_stream)
+        else:
+            if return_indices:
+                q_fp8, q_scale = act_quant(query, self.block_size, self.scale_fmt)
+            kpool_extend_cache = compress_write()
+            if return_indices:
+                weights = self._resolve_head_gate_weights(x, q_scale, head_weights)
 
-        if is_cuda():
+        if not return_indices:
+            return None
+
+        if is_cuda() or is_hip():
             if (
                 forward_batch.forward_mode.is_decode_or_idle()
                 or forward_batch.forward_mode.is_target_verify()
@@ -1516,5 +1702,7 @@ class IndexerKPool(MultiPlatformOp):
                         kpool_extend_cache=kpool_extend_cache,
                     )
         else:
-            raise NotImplementedError("kpool indexer is only supported on CUDA")
+            raise NotImplementedError(
+                "kpool indexer is only supported on CUDA and ROCm"
+            )
         return topk_result
