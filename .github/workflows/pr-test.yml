@@ -144,7 +144,6 @@ jobs:
           jobs: |
             [
               {"prefix": "base-b-test-1-gpu-small", "expected_count": ${{ fromJson(needs.check-changes.outputs.partitions)['base-b-test-1-gpu-small'].size }}},
-              {"prefix": "base-b-test-1-gpu-large", "expected_count": ${{ fromJson(needs.check-changes.outputs.partitions)['base-b-test-1-gpu-large'].size }}},
               {"prefix": "base-b-test-1-gpu-h200", "expected_count": ${{ fromJson(needs.check-changes.outputs.partitions)['base-b-test-1-gpu-h200'].size }}},
               {"prefix": "base-b-test-2-gpu-large", "expected_count": ${{ fromJson(needs.check-changes.outputs.partitions)['base-b-test-2-gpu-large'].size }}},
               {"prefix": "base-b-test-4-gpu-b200", "expected_count": ${{ fromJson(needs.check-changes.outputs.partitions)['base-b-test-4-gpu-b200'].size }}}
@@ -352,7 +351,6 @@ jobs:
         include:
           # 5090 (32GB, SM120)
           - { runner_config: 1-gpu-small, run_timeout: '30', timeout_per_file: '' }
-          - { runner_config: 1-gpu-large, run_timeout: '60', timeout_per_file: '1800' }
           # H200 (141GB, SM90) - same sm_90a gates as H100, larger HBM pool
           - { runner_config: 1-gpu-h200, run_timeout: '60', timeout_per_file: '1800' }
           - { runner_config: 2-gpu-large, run_timeout: '30', timeout_per_file: '' }

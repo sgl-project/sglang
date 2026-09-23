@@ -29,7 +29,7 @@ from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=15, stage="base-b", runner_config="4-gpu-b200")
 register_cuda_ci(est_time=11, stage="base-b", runner_config="1-gpu-small")
-register_cuda_ci(est_time=12, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=12, stage="base-b", runner_config="1-gpu-h200")
 
 FP8_MAX = 448.0
 
