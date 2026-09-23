@@ -105,7 +105,7 @@ def routed_hidden_size(layer: Module) -> int:
 
 
 class Mxfp8RoutedInputPreQuant(NamedTuple):
-    """MXFP8 linear-layout quant of the routed MoE input. ready is recorded on
+    """MXFP8 linear-layout quant of the routed MoE input. ``ready`` is recorded on
     the producing stream; the consumer must wait on it before the routed MoE op."""
 
     x_q: torch.Tensor

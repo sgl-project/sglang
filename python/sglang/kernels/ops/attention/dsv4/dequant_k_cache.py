@@ -102,8 +102,8 @@ def dequantize_k_cache_paged_v41(
     out: Optional[torch.Tensor] = None,
     layout: KVLayout = KVLayout.V41,
 ) -> torch.Tensor:
-    """Dequantize a V4.1 paged cache (fp8 V41 or fp4 V41_FP4) for a list
-    of token IDs into (num_tokens, 1, 512) bf16.
+    """Dequantize a V4.1 paged cache (fp8 ``V41`` or fp4 ``V41_FP4``) for a list
+    of token IDs into ``(num_tokens, 1, 512)`` bf16.
 
     Bit-exact with the pure-torch dequantizer of these formats.
     """
@@ -175,9 +175,9 @@ def gather_dequant_requant_fp8_paged(
     This is the Q8KV8 sparse-prefill adapter for the DeepSeek-V4 packed layout.
     It gathers token IDs from the existing paged cache, dequantizes the 448-dim
     nope region with its UE8M0 per-64 scales, casts the 64-dim BF16 rope tail to
-    FP8, and writes the result as (num_tokens + extra_rows, 1, 512) FP8.
+    FP8, and writes the result as ``(num_tokens + extra_rows, 1, 512)`` FP8.
 
-    extra_rows appends zero rows for kernels that map masked sparse indices
+    ``extra_rows`` appends zero rows for kernels that map masked sparse indices
     to a valid zero landing pad.
     """
     assert quant_k_cache.is_contiguous()
@@ -251,7 +251,7 @@ def cast_q_fp8_for_q8kv8_prefill(
     """Cast DeepSeek-V4 sparse-prefill Q to the Q8KV8 kernel format.
 
     The incoming Q is the model-produced BF16/FP16 tensor already shaped as
-    (num_tokens, num_heads, 512) after removing the singleton MQA axis.
+    ``(num_tokens, num_heads, 512)`` after removing the singleton MQA axis.
 
     The SM90 kernel processes query heads in 64-head blocks. Tensor parallelism
     commonly leaves fewer than 64 local heads, so the active heads are copied
@@ -519,7 +519,7 @@ def dequantize_k_cache_paged_ref(
     """Pure-torch reference for dequantize_k_cache_paged.
 
     Decodes the same v4 paged layout with vectorized torch indexing instead of
-    a Triton kernel. Used to validate the kernel (see the __main__ block
+    a Triton kernel. Used to validate the kernel (see the ``__main__`` block
     below); not on any hot path.
     """
     assert page_table_1_flattened.dtype in (torch.int32, torch.int64)

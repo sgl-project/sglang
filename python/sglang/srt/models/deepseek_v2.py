@@ -3277,7 +3277,7 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
         """Why this checkpoint cannot fuse its shared expert, or None.
 
         Evaluated by the loader once per runner, before any layer is built (see
-        install_shared_experts_fusion_decision), so it takes the config and
+        ``install_shared_experts_fusion_decision``), so it takes the config and
         quantization it is asked about rather than reading an instance.
         """
         # Need to disable if quant precision mismatch, even if

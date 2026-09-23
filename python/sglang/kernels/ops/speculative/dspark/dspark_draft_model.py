@@ -210,7 +210,7 @@ _MARKOV_BLOCK_R = 32
 class MarkovGreedyStep:
     """One greedy markov draft step, fused.
 
-    Computes argmax_v(base_logits[:, v] + dot(w2_weight[v, :], prev_embeds))
+    Computes ``argmax_v(base_logits[:, v] + dot(w2_weight[v, :], prev_embeds))``
     in a single pass over the (vocab x rank) weight: no full-vocab bias or
     step-logits materialization, no separate GEMV / add / two-pass argmax
     launches. Numerics: the dot and the add accumulate in fp32, while the eager

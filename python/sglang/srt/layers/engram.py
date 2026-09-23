@@ -387,7 +387,7 @@ class EngramHasher(nn.Module):
         starts: Optional[torch.Tensor],
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Non-CUDA fallback of the hash kernel: predecessor table [T, n] and hash ids.
-        history is already the per-request [bs, n - 1] rows of this batch."""
+        ``history`` is already the per-request [bs, n - 1] rows of this batch."""
         n = self.max_ngram_size
         num_tokens = input_ids.shape[0]
         device = input_ids.device

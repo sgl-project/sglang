@@ -2,12 +2,12 @@
 """Native MXFP8 (1x32 block, E8M0 scale) ops for AMD CDNA4 (gfx950).
 
   * per-token MXFP8 activation quant (single fused Triton pass)
-  * dense GEMM via Triton tl.dot_scaled (consumes FP8 E4M3 weights + E8M0
+  * dense GEMM via Triton ``tl.dot_scaled`` (consumes FP8 E4M3 weights + E8M0
     block scales directly, no dequant-to-BF16), lowering to the CDNA4 native MX
-    matrix-core ops; K % 128 != 0 falls back to dequant + F.linear.
+    matrix-core ops; ``K % 128 != 0`` falls back to dequant + ``F.linear``.
 
-Replaces the FlyDSL v_mfma_scale_f32_32x32x64 dense path with a single
-Triton dot_scaled GEMM: no load-time weight reformat (fp8 + E8M0 are
+Replaces the FlyDSL ``v_mfma_scale_f32_32x32x64`` dense path with a single
+Triton ``dot_scaled`` GEMM: no load-time weight reformat (fp8 + E8M0 are
 consumed as-is) and the activation is MXFP8-quantized in one fused pass.
 """
 
@@ -37,11 +37,11 @@ def _mxfp8_e4m3_quantize_torch(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Ten
 
     For each block of 32 elements along the last dim, compute a shared E8M0
     scale and quantize each element to float8_e4m3fn. The E8M0 exponent is
-    rounded *up* -- ceil(log2(amax / e4m3_max)) + 127 -- so the block amax
+    rounded *up* -- ``ceil(log2(amax / e4m3_max)) + 127`` -- so the block amax
     stays inside the e4m3 range (no clipping) and the full dynamic range is
-    used, matching triton_kernels downcast_to_mxfp (ROUND_UP) and the
-    SGLang fp8 quant kernels. Returns (values [same shape, fp8], scales
-    [..., K//32] u8).
+    used, matching ``triton_kernels`` ``downcast_to_mxfp`` (ROUND_UP) and the
+    SGLang fp8 quant kernels. Returns ``(values [same shape, fp8], scales
+    [..., K//32] u8)``.
     """
     assert x.shape[-1] % MXFP8_BLOCK_SIZE == 0
     orig_shape = x.shape
@@ -80,7 +80,7 @@ def _mxfp8_quant_kernel(
     ssk,
     BLOCK_M: tl.constexpr,
 ):
-    """Per-32-block E8M0 scale + FP8-E4M3 quant, one program per [BLOCK_M, 32]."""
+    """Per-32-block E8M0 scale + FP8-E4M3 quant, one program per ``[BLOCK_M, 32]``."""
     pid_m = tl.program_id(0)
     pid_b = tl.program_id(1)  # which 32-element block along K
     offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
@@ -138,7 +138,7 @@ def _mxfp8_e4m3_quantize_triton(
 def mxfp8_e4m3_quantize(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     """Per-token MXFP8 quant -> (fp8 values, [.., K//32] uint8 UE8M0 scales).
 
-    Uses the single fused Triton kernel for the common 2D, K % 32 == 0 case
+    Uses the single fused Triton kernel for the common 2D, ``K % 32 == 0`` case
     (activations); falls back to the torch reference otherwise.
     """
     if x.ndim == 2 and x.shape[-1] % MXFP8_BLOCK_SIZE == 0 and x.is_cuda:
@@ -278,11 +278,11 @@ def dot_scaled_mxfp8_blockscaled_linear(
     bias: Optional[torch.Tensor] = None,
     output_dtype: Optional[torch.dtype] = None,
 ) -> torch.Tensor:
-    """Native dense MXFP8 linear (CDNA4 tl.dot_scaled).
+    """Native dense MXFP8 linear (CDNA4 ``tl.dot_scaled``).
 
-    Consumes FP8 E4M3 weight + canonical 2D UE8M0 weight_scale [N, K//32]
+    Consumes FP8 E4M3 ``weight`` + canonical 2D UE8M0 ``weight_scale`` [N, K//32]
     directly. Activations are MXFP8-quantized per token inside the kernel path.
-    Drop-in for the SGLang w8a8_mxfp8_linear callable signature.
+    Drop-in for the SGLang ``w8a8_mxfp8_linear`` callable signature.
     """
     assert weight.dtype == torch.float8_e4m3fn, "MXFP8 weight must be FP8 E4M3."
     assert weight_scale.dtype == torch.uint8, "MXFP8 weight_scale must be UE8M0 uint8."

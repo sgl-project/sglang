@@ -223,7 +223,7 @@ def _get_mhc_ops() -> MhcOps:
     """Load MHC kernels only when a DeepSeek-V4 layer needs them.
 
     Model modules are imported eagerly by the registry.  Importing
-    sglang.kernels.ops.layernorm.mhc owns TileLang-backed MHC kernels.
+    ``sglang.kernels.ops.layernorm.mhc`` owns TileLang-backed MHC kernels.
     Import it only when a DeepSeek-V4 layer executes so registry discovery
     cannot initialize an optional CUDA runtime before unrelated models set up
     their communication workspaces.  DeepSeek-V4 is the sole consumer here.
@@ -380,19 +380,19 @@ if _use_aiter:
 def _wo_a_aiter_gemm_eligible(
     flag: bool, use_aiter: bool, is_hip: bool, is_gfx95: bool
 ) -> bool:
-    """Static eligibility for the aiter wo_a reroute.
+    """Static eligibility for the aiter ``wo_a`` reroute.
 
-    Folds the opt-in flag, the global SGLANG_USE_AITER switch, and the
+    Folds the opt-in flag, the global ``SGLANG_USE_AITER`` switch, and the
     HIP/gfx95 platform gates into one predicate. Evaluated once at import (see
-    _wo_a_aiter_batched_gemm_enabled) so none of it runs on the per-token
+    ``_wo_a_aiter_batched_gemm_enabled``) so none of it runs on the per-token
     decode critical path.
     """
     return bool(flag and use_aiter and is_hip and is_gfx95)
 
 
 # Read the opt-in flag and import the aiter kernel ONCE at module import: the
-# decode wo_a matmul runs per layer/token on the critical path, so it must
-# not pay an EnvBool.get() plus a function-local import on every call. If the
+# decode ``wo_a`` matmul runs per layer/token on the critical path, so it must
+# not pay an ``EnvBool.get()`` plus a function-local import on every call. If the
 # path is eligible but the kernel import fails, disable it here and fall back to
 # the einsum for the process (logged once) instead of retrying every step.
 _wo_a_aiter_batched_gemm_enabled = _wo_a_aiter_gemm_eligible(
@@ -423,7 +423,7 @@ _wo_a_aiter_batched_gemm_disabled = False
 # ROCm fp8 wo_a. The CUDA fp8 path below is built on DeepGEMM's fp8_einsum, so
 # gfx950 runs the equivalent aiter e8m0 block-scale batched GEMM instead. Both
 # the kernel availability and the weight-scale converter resolve once at import;
-# None here means the platform keeps the bf16 absorb GEMM.
+# ``None`` here means the platform keeps the bf16 absorb GEMM.
 _wo_a_fp8_mxscale = None
 _wo_a_fp8_mxscale_fused_invrope = None
 _wo_a_weight_scale_to_e8m0 = None
@@ -1274,7 +1274,7 @@ class MQALayer(MqaAttentionBase):
         dtype: torch.dtype,
         inverse: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        # rotary_emb is shared by layers with the same RoPE configuration and
+        # ``rotary_emb`` is shared by layers with the same RoPE configuration and
         # can also be shared by the target and NextN models.  Only the immutable
         # full table is cached on it; position-gathered tensors are memoized per
         # forward (prime_rope_cos_sin / rope_cos_sin), never across forwards --
@@ -2710,8 +2710,8 @@ class MQALayer(MqaAttentionBase):
         """Run the attention forward as a single TBO op.
 
         Consumes the post-input-norm hidden states produced by
-        DeepseekV4DecoderLayer.op_mhc_prepare_attn and stores the attention
-        output for op_mhc_post_attn_pre_mlp.
+        ``DeepseekV4DecoderLayer.op_mhc_prepare_attn`` and stores the attention
+        output for ``op_mhc_post_attn_pre_mlp``.
         """
         state.hidden_states_after_attn = self.forward(
             x=state.pop("hidden_states_after_input_norm"),
@@ -4092,13 +4092,13 @@ class DeepseekV4DecoderLayer(nn.Module):
     # ------------------------------------------------------------------
     # TBO op decomposition (prefill two-batch-overlap, EP / mori path)
     #
-    # These mirror the NON-fused branch of forward (cross-layer mHC
+    # These mirror the NON-fused branch of ``forward`` (cross-layer mHC
     # fusion is disabled under TBO, so every layer is self-contained), split
     # into ops so the operations engine can overlap one ubatch's MoE a2a
     # dispatch/combine with the other ubatch's attention + expert GEMM.
     # The MoE ops themselves (op_gate / op_select_experts / op_dispatch_a/b /
     # op_experts / op_combine_a/b / op_shared_experts / op_output) are reused
-    # as-is from self.mlp (DeepseekV2MoE) — they decompose forward_deepep.
+    # as-is from ``self.mlp`` (DeepseekV2MoE) — they decompose ``forward_deepep``.
     # ------------------------------------------------------------------
     def op_mhc_prepare_attn(
         self,
@@ -5181,7 +5181,7 @@ class DeepseekV4ForCausalLM(nn.Module):
         return getattr(self.config, "model_type", None) == "deepseek_v41"
 
     def autotune_prefill_kernels(self, num_tokens: int, *, dtype: torch.dtype) -> int:
-        """Tune resident MXFP8 linears for every M bucket up to num_tokens.
+        """Tune resident MXFP8 linears for every M bucket up to ``num_tokens``.
         The quant method is called directly, so no TP collectives run and no
         request/KV/draft state is touched; the runner owns the autotune context."""
         if getattr(self.config, "model_type", None) != "deepseek_v41":

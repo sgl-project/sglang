@@ -251,7 +251,7 @@ def prepare_fp4_prefill_workspace(
     fall back to AITER's prefill scheduler, which frees the scratch its own
     schedule kernel reads, so a captured build would replay against recycled
     graph-pool memory. Callers instead refresh this workspace per step and let
-    the graph read only the pinned cta_info / logits / page-table
+    the graph read only the pinned ``cta_info`` / ``logits`` / page-table
     buffers.
     """
     from aiter.ops.flydsl.kernels.mqa_logits.pa_mqa_logits_fp4_prefill import (

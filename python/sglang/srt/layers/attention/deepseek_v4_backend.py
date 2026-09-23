@@ -988,7 +988,7 @@ class DSV4Metadata:
     candidate_metadata: Optional[CandidateMetadata] = None
 
     # Built at the runner's prefill WAR boundary when the fast path is on,
-    # otherwise lazily by _forward_prefill_sparse.
+    # otherwise lazily by ``_forward_prefill_sparse``.
     sparse_prefill_cache: Optional[SparsePrefillChunkCache] = None
     prefill_shared_reads_snapshotted: bool = False
 
@@ -3964,7 +3964,7 @@ class DeepseekV4AttnBackend(
         cache (c4/c128) into a flat bf16 workspace, then lets
         flash_mla_sparse_fwd consume the workspace via per-query rebased
         indices. Chunk-invariant scaffolding lives in
-        self.forward_metadata.sparse_prefill_cache.
+        ``self.forward_metadata.sparse_prefill_cache``.
         """
         if _is_xpu:
             from sgl_kernel import flash_mla_sparse_fwd
@@ -4097,10 +4097,10 @@ class DeepseekV4AttnBackend(
     ) -> torch.Tensor:
         """Experimental DeepSeek-V4 sparse prefill path using Q8KV8 kernels.
 
-        This mirrors _forward_prefill_sparse's cache/index construction, but
+        This mirrors ``_forward_prefill_sparse``'s cache/index construction, but
         writes the gathered KV workspace as FP8 and calls the SM90 Q8KV8 sparse
-        prefill kernel. The path is selected by --dsv4-prefill-backend
-        flashmla_sparse_q8; SGLANG_DSV4_Q8KV8_PREFILL remains as a debug
+        prefill kernel. The path is selected by ``--dsv4-prefill-backend
+        flashmla_sparse_q8``; ``SGLANG_DSV4_Q8KV8_PREFILL`` remains as a debug
         override for focused runtime validation.
         """
 

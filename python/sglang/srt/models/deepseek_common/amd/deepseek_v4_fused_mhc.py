@@ -83,7 +83,7 @@ def is_cross_layer_mhc_fusion_enabled() -> bool:
     """Whether DeepSeek-V4 may defer mHC post across the attn/MoE boundary.
 
     Cross-layer fusion requires a fused post+pre kernel to be available: either
-    the TileLang path (SGLANG_OPT_FUSE_MHC_POST_PRE + TileLang pre/post) or
+    the TileLang path (``SGLANG_OPT_FUSE_MHC_POST_PRE`` + TileLang pre/post) or
     the aiter HIP path on a supported gfx95 device.
     """
     return _is_production_mhc_enabled()
@@ -251,8 +251,8 @@ def try_aiter_fused_mhc_post_pre(
 ) -> Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, bool]]:
     """Fused mhc_post + next-layer mhc_pre via the aiter HIP kernel.
 
-    Returns (next_residual, layer_input, post_mix, comb_mix, norm_applied) or
-    None to let the caller fall back. The aiter kernel internally chooses
+    Returns ``(next_residual, layer_input, post_mix, comb_mix, norm_applied)`` or
+    ``None`` to let the caller fall back. The aiter kernel internally chooses
     between its fused and unfused (mhc_post + mhc_pre) implementations based on the
     token count and detected arch, so no token threshold is applied here.
     """
@@ -335,12 +335,12 @@ def try_mhc_fused_post_pre_boundary(
     """Dispatch the fused mHC post+pre across the attn/MoE boundary.
 
     Preference order (first available wins): aiter HIP kernel, then the Triton
-    kernel. Returns None when neither fires so the caller can fall back to the
-    TileLang path or the unfused hc_post + hc_pre sequence.
+    kernel. Returns ``None`` when neither fires so the caller can fall back to the
+    TileLang path or the unfused ``hc_post`` + ``hc_pre`` sequence.
 
-    The aiter and Triton kernels expect opposite fn orientations: the Triton
-    kernel takes hc_fn transposed (fn_transpose), while aiter consumes it
-    in the native mhc_pre layout.
+    The aiter and Triton kernels expect opposite ``fn`` orientations: the Triton
+    kernel takes ``hc_fn`` transposed (``fn_transpose``), while aiter consumes it
+    in the native ``mhc_pre`` layout.
     """
     aiter_result = try_aiter_fused_mhc_post_pre(
         layer_input,

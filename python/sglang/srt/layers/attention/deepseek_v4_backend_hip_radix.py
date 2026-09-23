@@ -2452,10 +2452,10 @@ class DeepseekV4HipRadixBackend(
     ) -> torch.Tensor:
         """unified_kv paged-attention path over the unified_kv pool.
 
-        q_rope is what tells the two layouts apart: present means q is a
+        ``q_rope`` is what tells the two layouts apart: present means ``q`` is a
         packed fp8 row and the pool is the two-pool fp8 one, so decode goes to
         the asm reader; absent means both are plain bf16 and it goes to Triton.
-        Prefill needs k_rope alongside it, because there the current chunk is
+        Prefill needs ``k_rope`` alongside it, because there the current chunk is
         a KV source of its own and not just something to store.
         """
         from sglang.kernels.ops.attention.dsv4.unified_kv_kernels import runtime
