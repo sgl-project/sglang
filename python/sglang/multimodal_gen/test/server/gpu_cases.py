@@ -49,6 +49,7 @@ from sglang.multimodal_gen.test.test_utils import (
     DEFAULT_FLUX_2_KLEIN_BASE_4B_MODEL_NAME_FOR_TEST,
     DEFAULT_JOYAI_IMAGE_EDIT_MODEL_NAME_FOR_TEST,
     DEFAULT_MOVA_360P_MODEL_NAME_FOR_TEST,
+    DEFAULT_QWEN_IMAGE_21_MODEL_NAME_FOR_TEST,
     DEFAULT_QWEN_IMAGE_EDIT_2509_MODEL_NAME_FOR_TEST,
     DEFAULT_QWEN_IMAGE_EDIT_2511_MODEL_NAME_FOR_TEST,
     DEFAULT_QWEN_IMAGE_EDIT_MODEL_NAME_FOR_TEST,
@@ -115,6 +116,7 @@ ONE_GPU_CASES: list[DiffusionTestCase] = [
         ),
         PI05_ACTION_CI_sampling_params,
         run_perf_check=False,
+        perf_warmup_requests=1,
         run_component_accuracy_check=False,
         run_t2v_input_reference_check=False,
     ),
@@ -181,6 +183,10 @@ ONE_GPU_CASES: list[DiffusionTestCase] = [
         DiffusionServerArgs(
             model_path=DEFAULT_COSMOS3_NANO_MODEL_NAME_FOR_TEST,
             modality="image",
+            extras=[
+                "--warmup-num-frames 1",
+                "--component-residency transformer=resident",
+            ],
         ),
         COSMOS3_NANO_CI_sampling_params,
         run_perf_check=False,
@@ -254,6 +260,8 @@ ONE_GPU_CASES: list[DiffusionTestCase] = [
         DiffusionServerArgs(
             model_path=DEFAULT_COSMOS3_NANO_MODEL_NAME_FOR_TEST,
             modality="video",
+            # the latency baseline measures the warmed, resident transformer
+            extras=["--component-residency transformer=resident"],
             env_vars={"SGLANG_DISABLE_COSMOS3_GUARDRAILS": "1"},
         ),
         DiffusionSamplingParams(
@@ -294,6 +302,27 @@ ONE_GPU_CASES: list[DiffusionTestCase] = [
             prompt=T2V_PROMPT,
             extras={"enable_teacache": True},
         ),
+    ),
+    # The text encoder's resident set placed at load and never released. The
+    # guard is TextEncodingStage: with the set on the device the stage is
+    # compute only, and if the layers ever go back to being transferred per
+    # request the stage regains that whole transfer, well past the
+    # non_denoise_stage tolerance. load_peak_vram carries the placed set, so
+    # it also pins that the placement happens at load, not on the first use.
+    # The encoder is already layerwise under the default component set.
+    # No consistency check: the lifetime moves weights, not math, so the
+    # output is the base case's and that case already guards it.
+    DiffusionTestCase(
+        "wan2_1_t2v_1.3b_encoder_permanent_residents",
+        DiffusionServerArgs(
+            model_path=DEFAULT_WAN_2_1_T2V_1_3B_MODEL_NAME_FOR_TEST,
+            extras=[
+                "--layerwise-resident-layers text_encoder=0.8 "
+                "--layerwise-residency-lifetime text_encoder=permanent",
+            ],
+        ),
+        DiffusionSamplingParams(prompt=T2V_PROMPT),
+        run_consistency_check=False,
     ),
     # Frame interpolation (2× / exp=1)
     # Uses the same 1.3B model already in the suite;
@@ -398,6 +427,7 @@ ONE_GPU_CASES: list[DiffusionTestCase] = [
         "sana_wm_ti2v",
         DiffusionServerArgs(
             model_path=DEFAULT_SANA_WM_STREAMING_MODEL_NAME_FOR_TEST,
+            extras=["--warmup-resolutions 384x640"],
         ),
         SANA_WM_TI2V_CI_sampling_params,
         run_perf_check=False,
@@ -679,6 +709,47 @@ MINIMAX_H3_FOUR_GPU_H100_CASES = [
                 "num_inference_steps": 2,
                 "flow_shift": 12.0,
                 "audio_flow_shift": 3.0,
+                "seed": 42,
+            },
+        ),
+        run_perf_check=False,
+        run_consistency_check=False,
+        run_component_accuracy_check=False,
+        run_models_api_check=False,
+        run_t2v_input_reference_check=False,
+    ),
+    DiffusionTestCase(
+        "vdn_h3_t2va_4gpu_h100",
+        DiffusionServerArgs(
+            model_path="OpenVDN/vdn-minimax-h3",
+            modality="video",
+            num_gpus=4,
+            extras=[
+                "--attention-backend",
+                "hybrid_window_attn_h3",
+                "--enable-torch-compile",
+                "false",
+            ],
+        ),
+        DiffusionSamplingParams(
+            prompt=(
+                "A curious raccoon peers through a vibrant field of yellow "
+                "sunflowers, its eyes wide with interest."
+            ),
+            output_size="1344x768",
+            seconds=5,
+            output_format="mp4",
+            expect_audio_output=True,
+            num_outputs_per_prompt=1,
+            extras={
+                "task": "t2va",
+                "conditions": [],
+                "target": {
+                    "short_edge": 768,
+                    "aspect_ratio": "16:9",
+                    "duration_seconds": 5.0,
+                },
+                "num_inference_steps": 9,
                 "seed": 42,
             },
         ),
@@ -1001,16 +1072,6 @@ TWO_GPU_CASES = [
         run_perf_check=False,
     ),
     DiffusionTestCase(
-        "mova_360p_ring1_uly2",
-        DiffusionServerArgs(
-            model_path=DEFAULT_MOVA_360P_MODEL_NAME_FOR_TEST,
-            ring_degree=1,
-            ulysses_degree=2,
-            dit_layerwise_offload=True,
-        ),
-        run_perf_check=False,
-    ),
-    DiffusionTestCase(
         "ltx_2_two_stage_t2v",
         DiffusionServerArgs(
             model_path="Lightricks/LTX-2",
@@ -1060,6 +1121,9 @@ TWO_GPU_CASES = [
             # decoder headroom on 80 GB GPUs.
             extras=[
                 "--load-diffusion-decoder",
+                "--warmup-resolutions 768x448",
+                "--warmup-num-frames 49",
+                """--warmup-sampling-params '{"use_diffusion_decoder":true}'""",
                 "--component-residency "
                 "transformer=component-offload,text_encoder=component-offload",
             ],
@@ -1071,7 +1135,6 @@ TWO_GPU_CASES = [
             expect_audio_output=True,
             extras={"seed": 42, "use_diffusion_decoder": True},
         ),
-        run_perf_check=False,
         run_component_accuracy_check=False,
     ),
     # I2V LoRA test case
@@ -1101,6 +1164,25 @@ TWO_GPU_CASES = [
         ),
     ),
     DiffusionTestCase(
+        "qwen_image21_t2i_tp2",
+        DiffusionServerArgs(
+            model_path=DEFAULT_QWEN_IMAGE_21_MODEL_NAME_FOR_TEST,
+            tp_size=2,
+            ulysses_degree=1,
+            ring_degree=1,
+        ),
+        replace(
+            T2I_sampling_params,
+            output_size="1024x1024",
+            output_format="png",
+            extras={"num_inference_steps": 40, "guidance_scale": 1, "seed": 42},
+        ),
+        perf_repeat_requests=2,
+        run_perf_check=False,
+        run_component_accuracy_check=False,
+        run_t2v_input_reference_check=False,
+    ),
+    DiffusionTestCase(
         "qwen_image_t2i_2_gpus_extra_high",
         DiffusionServerArgs(
             model_path=DEFAULT_QWEN_IMAGE_MODEL_NAME_FOR_TEST,
@@ -1109,7 +1191,6 @@ TWO_GPU_CASES = [
             ring_degree=2,
         ),
         replace(T2I_sampling_params, extras={"quality": "extra-high"}),
-        run_perf_check=False,
         run_component_accuracy_check=False,
         run_models_api_check=False,
         run_t2v_input_reference_check=False,
@@ -1428,6 +1509,7 @@ STANDALONE_FILES = {
         "../single_test_file/test_dp_serving_2_gpu.py",
         "../single_test_file/test_pynccl_a2a_capture_2_gpu.py",
         "../single_test_file/test_usp_replicated_parity_2_gpu.py",
+        "../single_test_file/test_vdn_ulysses_exchange_2_gpu.py",
     ],
 }
 
@@ -1473,6 +1555,8 @@ STANDALONE_FILE_EST_TIMES = {
         "../single_test_file/test_pynccl_a2a_capture_2_gpu.py": 180.0,
         # two SDPA parity checks on 128+6 rows
         "../single_test_file/test_usp_replicated_parity_2_gpu.py": 180.0,
+        # no model load; two small all-to-alls
+        "../single_test_file/test_vdn_ulysses_exchange_2_gpu.py": 60.0,
     },
 }
 

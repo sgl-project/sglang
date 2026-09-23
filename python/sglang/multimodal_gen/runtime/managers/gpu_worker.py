@@ -47,15 +47,14 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_ulysses_parallel_world_size,
 )
 from sglang.multimodal_gen.runtime.entrypoints.utils import (
+    map_request_outputs,
     materialize_output_sample,
     post_process_sample,
     save_outputs,
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.auto_residency import (
-    DefaultWorkload,
     WarmupMemoryRecord,
     estimate_default_workload_peak_bytes,
-    resolve_default_workload,
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
     get_global_component_residency_manager,
@@ -68,6 +67,10 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload im
 from sglang.multimodal_gen.runtime.managers.memory_managers.memory_occupation_controller import (
     MemoryOccupationController,
 )
+from sglang.multimodal_gen.runtime.observability.metrics import (
+    DiffusionMetrics,
+    init_metrics,
+)
 from sglang.multimodal_gen.runtime.pipelines_core import (
     ComposedPipelineBase,
     LoRAPipeline,
@@ -75,7 +78,10 @@ from sglang.multimodal_gen.runtime.pipelines_core import (
     build_pipeline,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
-from sglang.multimodal_gen.runtime.platforms import current_platform
+from sglang.multimodal_gen.runtime.platforms import (
+    current_platform,
+    initialize_current_platform,
+)
 from sglang.multimodal_gen.runtime.post_training.gpu_worker_post_training_mixin import (
     GPUWorkerPostTrainingMixin,
 )
@@ -105,6 +111,24 @@ from sglang.srt.environ import third_party_cache_defaults
 from sglang.srt.utils.network import NetworkAddress
 
 logger = init_logger(__name__)
+
+
+def _device_has_allocator_cache() -> bool:
+    return (
+        current_platform.is_cuda()
+        or current_platform.is_rocm()
+        or current_platform.is_xpu()
+    )
+
+
+def _device_module():
+    return torch.get_device_module(current_platform.device_type)
+
+
+def _device_initialized() -> bool:
+    if not _device_has_allocator_cache():
+        return False
+    return _device_module().is_initialized()
 
 
 @dataclass
@@ -197,6 +221,8 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
     A worker that executes the model on a single GPU.
     """
 
+    metrics: DiffusionMetrics | None = None
+
     def __init__(
         self,
         local_rank: int,
@@ -213,6 +239,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         self.master_port = master_port
         # FIXME: should we use tcp as distribute init method?
         self.server_args = server_args
+        self.metrics = init_metrics(server_args, rank)
         self.pipeline: ComposedPipelineBase = None
 
         self.init_device_and_model()
@@ -243,23 +270,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         # per-rank memory measurements of server warmup forwards; consumed by
         # the auto-residency placement decision before the server turns ready
         self._auto_residency_warmup_records: list[WarmupMemoryRecord] = []
-        # default workload resolved once for the per-request residency hint
-        self._cached_default_workload: DefaultWorkload | None = None
-        self._cached_default_workload_failed = False
-
-    def _default_workload_for_hint(self) -> DefaultWorkload | None:
-        if (
-            self._cached_default_workload is None
-            and not self._cached_default_workload_failed
-        ):
-            try:
-                self._cached_default_workload = resolve_default_workload(
-                    self.server_args
-                )
-            except Exception:
-                logger.debug("Default workload unresolvable", exc_info=True)
-                self._cached_default_workload_failed = True
-        return self._cached_default_workload
+        self._update_lora_metrics()
 
     def release_realtime_session(self, session_id: str) -> OutputBatch:
         """release the session of a realtime connection"""
@@ -274,8 +285,8 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
 
         released = self._realtime_sessions.release(session_id)
         if released:
-            if torch.cuda.is_initialized():
-                torch.cuda.empty_cache()
+            if _device_initialized():
+                _device_module().empty_cache()
         return OutputBatch(output={"released": released, "session_id": session_id})
 
     def _configure_persistent_torch_compile_cache(self) -> None:
@@ -934,9 +945,9 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
 
         if (
             os.environ.get("SGLANG_DIFFUSION_SYNC_STAGE_PROFILING", "0") == "1"
-            and torch.cuda.is_initialized()
+            and _device_initialized()
         ):
-            torch.cuda.synchronize()
+            _device_module().synchronize()
         start_time = time.perf_counter()
         output_batch.output = [
             self._materialize_frame_output(output, output_batch, req)
@@ -945,9 +956,9 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         if output_batch.metrics is not None:
             if (
                 os.environ.get("SGLANG_DIFFUSION_SYNC_STAGE_PROFILING", "0") == "1"
-                and torch.cuda.is_initialized()
+                and _device_initialized()
             ):
-                torch.cuda.synchronize()
+                _device_module().synchronize()
             output_batch.metrics.record_stage(
                 "GPUWorker.frame_materialize_for_return",
                 time.perf_counter() - start_time,
@@ -1196,9 +1207,10 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
     ) -> None:
         if not self.is_output_rank or output_batch.output is None:
             return
-        if len(output_batch.output) != len(reqs):
+        output_requests = map_request_outputs(reqs)
+        if len(output_batch.output) != len(output_requests):
             raise RuntimeError(
-                f"Expected {len(reqs)} grouped outputs, got {len(output_batch.output)}"
+                f"Expected {len(output_requests)} grouped outputs, got {len(output_batch.output)}"
             )
 
         first_req = reqs[0]
@@ -1207,7 +1219,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             first_req.data_type,
             first_req.fps,
             True,
-            lambda idx: reqs[idx].output_file_path(1, 0),
+            lambda idx: output_requests[idx].output_file_path(),
             audio=output_batch.audio,
             audio_sample_rate=output_batch.audio_sample_rate,
             output_compression=first_req.output_compression,
@@ -1457,14 +1469,17 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         """
         if not isinstance(self.pipeline, LoRAPipeline):
             return OutputBatch(error="Lora is not enabled")
-        self.pipeline.set_lora(
-            lora_nickname,
-            lora_path,
-            target,
-            strength,
-            merge_mode=merge_mode,
-            lora_alpha=lora_alpha,
-        )
+        try:
+            self.pipeline.set_lora(
+                lora_nickname,
+                lora_path,
+                target,
+                strength,
+                merge_mode=merge_mode,
+                lora_alpha=lora_alpha,
+            )
+        finally:
+            self._update_lora_metrics()
         return OutputBatch()
 
     def merge_lora_weights(
@@ -1479,7 +1494,10 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         """
         if not isinstance(self.pipeline, LoRAPipeline):
             return OutputBatch(error="Lora is not enabled")
-        self.pipeline.merge_lora_weights(target, strength)
+        try:
+            self.pipeline.merge_lora_weights(target, strength)
+        finally:
+            self._update_lora_metrics()
         return OutputBatch()
 
     def unmerge_lora_weights(self, target: str = "all") -> OutputBatch:
@@ -1491,8 +1509,15 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         """
         if not isinstance(self.pipeline, LoRAPipeline):
             return OutputBatch(error="Lora is not enabled")
-        self.pipeline.unmerge_lora_weights(target)
+        try:
+            self.pipeline.unmerge_lora_weights(target)
+        finally:
+            self._update_lora_metrics()
         return OutputBatch()
+
+    def _update_lora_metrics(self) -> None:
+        if self.metrics is not None and isinstance(self.pipeline, LoRAPipeline):
+            self.metrics.update_lora(self.pipeline.get_lora_status())
 
     def list_loras(self) -> OutputBatch:
         """
@@ -1541,36 +1566,24 @@ OOM detected. Possible solutions:
 
 
 def _oom_exceptions():
-    # torch.OutOfMemoryError exists only in some PyTorch builds
-    types = [torch.cuda.OutOfMemoryError]
-    if hasattr(torch, "OutOfMemoryError"):
-        types.append(torch.OutOfMemoryError)
-    return tuple(types)
+    return (torch.OutOfMemoryError,)
 
 
 def run_scheduler_process(
     local_rank: int,
     rank: int,
-    master_port: int,
     server_args: ServerArgs,
     pipe_writer: mp.connection.Connection,
-    # For all workers: pipe to receive tasks from rank 0
-    task_pipe_r: mp.connection.Connection,
-    # For slave workers: pipe to send results back to rank 0
-    result_pipe_w: mp.connection.Connection | None,
-    # For rank 0 worker only: pipes to send tasks to slaves
-    task_pipes_to_slaves: list[mp.connection.Connection] | None = None,
-    # For rank 0 worker only: pipes to receive results from slaves
-    result_pipes_from_slaves: list[mp.connection.Connection] | None = None,
 ) -> None:
-    """
-    The entry point for the worker process.
-    Rank 0 acts as the master, handling ZMQ requests and coordinating slaves.
-    Ranks > 0 act as slaves, waiting for tasks from the master.
-    """
+    """Run a rank's scheduler and report readiness to the launching process."""
+    # Idempotent safeguard for direct callers; process bootstraps already
+    # initialized the platform before this module was imported.
+    initialize_current_platform()
+
     kill_itself_when_parent_died()
     configure_logger(server_args)
     globally_suppress_loggers()
+
     if current_platform.is_cuda():
         set_cuda_arch()
     elif current_platform.is_musa():
@@ -1581,8 +1594,6 @@ def run_scheduler_process(
     port_args = PortArgs.from_server_args(server_args)
 
     # start the scheduler event loop
-    assert task_pipes_to_slaves is not None
-    assert result_pipes_from_slaves is not None
     from sglang.multimodal_gen.runtime.managers.scheduler import Scheduler
 
     try:
@@ -1590,8 +1601,6 @@ def run_scheduler_process(
             server_args,
             gpu_id=rank,
             port_args=port_args,
-            task_pipes_to_slaves=task_pipes_to_slaves,
-            result_pipes_from_slaves=result_pipes_from_slaves,
             local_rank=local_rank,
         )
         logger.info(f"Worker {rank}: Scheduler loop started.")
@@ -1609,8 +1618,8 @@ def run_scheduler_process(
         if "scheduler" in locals():
             del scheduler
         gc.collect()
-        if torch.cuda.is_initialized():
-            torch.cuda.empty_cache()
+        if _device_initialized():
+            _device_module().empty_cache()
         if torch.distributed.is_available() and torch.distributed.is_initialized():
             torch.distributed.destroy_process_group()
         logger.info(f"Worker {rank}: Shutdown complete.")

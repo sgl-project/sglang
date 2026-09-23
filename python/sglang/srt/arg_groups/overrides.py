@@ -68,6 +68,7 @@ from sglang.srt.arg_groups.model_override_base import (  # noqa: F401
     resolving_view,
     use_mla_backend,
 )
+from sglang.srt.arg_groups.prefill_buffer_ceiling import prefill_buffer_ceiling_of
 
 logger = logging.getLogger(__name__)
 from sglang.srt.environ import envs
@@ -78,6 +79,7 @@ from sglang.srt.runtime_context import (
 )
 from sglang.srt.utils.common import (
     get_quantization_config,
+    is_fi_a2a_supported,
     is_gfx95_supported,
     xpu_has_xmx_support,
 )
@@ -126,17 +128,8 @@ def run_post_process_pass(server_args: Any, fn: Callable[..., dict]) -> None:
             f"got {type(declared).__name__}"
         )
     if declared:
-        # Refused only once there is something to record. A pass that declares
-        # nothing is a validation, and `check_server_args` runs those again on
-        # a rebuild: `Engine(server_args=sa)` after `Engine.shutdown()` hands
-        # back the same instance while the context still holds it, and
-        # refusing on identity alone would fail that launch.
-        # Only a non-empty return is a declaration. An empty one is a
-        # validation and may run on the published instance -- see above -- so it
-        # must not reach the guard in `declare_resolution`.
-        if declared:
-            declare_resolution(server_args, fn.__qualname__, **declared)
-            validate_declarations(server_args, [(fn.__qualname__, dict(declared))])
+        declare_resolution(server_args, fn.__qualname__, **declared)
+        validate_declarations(server_args, [(fn.__qualname__, dict(declared))])
 
 
 def declare_resolution(server_args: Any, source: str, **fields: Any) -> None:
@@ -145,8 +138,7 @@ def declare_resolution(server_args: Any, source: str, **fields: Any) -> None:
     The stash *is* the resolution result: the bags are projected from it,
     `resolution_result` answers from it, and no field is written. A resolver
     reading a field another resolver may have decided must read `resolving_view`
-    (or `resolved_view(server_args)`), which
-    `test_resolution_reads_the_declarations` pins.
+    (or `resolved_view(server_args)`).
 
     Every declaration goes through here, whenever it is made: inside
     ``__post_init__``, at launcher stage (LoRA normalization, the auto-detected
@@ -443,6 +435,7 @@ _MAMBA_RADIX_CACHE_ARCHS = frozenset(
         "KimiK3ForConditionalGeneration",
         "BailingMoeV2_5ForCausalLM",
         "BailingMoeV3ForCausalLM",
+        "BailingMoeV3VLForConditionalGeneration",
         "Qwen3NextForCausalLM",
         "Qwen3_5MoeForConditionalGeneration",
         "InternS2PreviewForConditionalGeneration",
@@ -456,6 +449,7 @@ _MAMBA_RADIX_CACHE_ARCHS = frozenset(
         "MiniCPMV4_6ForConditionalGeneration",
         "NemotronHForCausalLM",
         "NemotronHPuzzleForCausalLM",
+        "NemotronH_Omni_Reasoning_V3",
         "FalconH1ForCausalLM",
         "JetNemotronForCausalLM",
         "JetVLMForConditionalGeneration",
@@ -483,15 +477,21 @@ _MAMBA_EXTRA_BUFFER_ARCHS = frozenset(
         "MiniCPMV4_6ForConditionalGeneration",
         "BailingMoeV2_5ForCausalLM",
         "BailingMoeV3ForCausalLM",
+        "BailingMoeV3VLForConditionalGeneration",
         "FalconH1ForCausalLM",
         "GraniteMoeHybridForCausalLM",
         "Glm5NextForConditionalGeneration",
         "NemotronHForCausalLM",
         "NemotronHPuzzleForCausalLM",
+        "NemotronH_Omni_Reasoning_V3",
         # KDA-based: same MambaPool ping-pong machinery as GDN; requires the
         # KDA backend's track-snapshot writes (decode + extend) so donated
         # slots hold real states for prefix-cache restores.
         "KimiK3ForConditionalGeneration",
+        # Inkling asserts enable_mamba_extra_buffer and _inkling_overrides pins it,
+        # so validate_mamba_extra_buffer runs for these archs and must accept them.
+        "InklingForConditionalGeneration",
+        "InklingForConditionalGenerationMTP",
     }
 )
 
@@ -614,6 +614,35 @@ def _dsa_kv_cache_dtype_default(view: Any) -> dict:
     return {}
 
 
+def _check_dsa_backend_constraints(
+    kv_cache_dtype: str,
+    prefill_backend: Optional[str],
+    decode_backend: Optional[str],
+    *,
+    hip: bool,
+) -> None:
+    """Validate DSA backend / platform / kv-cache-dtype constraints."""
+    chosen = {prefill_backend, decode_backend}
+
+    rocm_only = {"triton"} & chosen
+    if not hip and rocm_only:
+        raise ValueError(
+            f"The {'/'.join(sorted(rocm_only))} DSA backend is only supported on "
+            "ROCm/HIP. Pick an alternative DSA backend for CUDA "
+            "(flashmla_kv on Hopper, trtllm on Blackwell)."
+        )
+
+    cuda_fp8_unsupported = {"tilelang"} & chosen
+    if not hip and kv_cache_dtype == "fp8_e4m3" and cuda_fp8_unsupported:
+        raise ValueError(
+            f"The {'/'.join(sorted(cuda_fp8_unsupported))} DSA prefill/decode kernels "
+            "only support an fp8_e4m3 KV cache on ROCm/HIP; on CUDA they require "
+            "a bfloat16 KV cache. Use --kv-cache-dtype bfloat16, or keep "
+            "--kv-cache-dtype fp8_e4m3 and pick an fp8-capable DSA backend "
+            "(flashmla_kv on Hopper, trtllm on Blackwell)."
+        )
+
+
 def _check_tilelang_dsa_fp8_kv(
     kv_cache_dtype: str,
     prefill_backend: Optional[str],
@@ -621,20 +650,10 @@ def _check_tilelang_dsa_fp8_kv(
     *,
     hip: bool,
 ) -> None:
-    """tilelang's fp8 KV path is ROCm-only; the CUDA kernel hardcodes bfloat16.
-    Reject here instead of crashing at decode CUDA-graph capture."""
-    if (
-        not hip
-        and kv_cache_dtype == "fp8_e4m3"
-        and "tilelang" in {prefill_backend, decode_backend}
-    ):
-        raise ValueError(
-            "The tilelang DSA prefill/decode kernels only support an fp8_e4m3 KV "
-            "cache on ROCm/HIP; on CUDA they require a bfloat16 KV cache. Use "
-            "--kv-cache-dtype bfloat16 with the tilelang backend, or keep "
-            "--kv-cache-dtype fp8_e4m3 and pick an fp8-capable DSA backend "
-            "(flashmla_kv on Hopper, trtllm on Blackwell)."
-        )
+    """Backward-compatible entry point for the TileLang DSA validation."""
+    _check_dsa_backend_constraints(
+        kv_cache_dtype, prefill_backend, decode_backend, hip=hip
+    )
 
 
 @register_post_process
@@ -728,15 +747,23 @@ def _dsa_split_backend_resolution(view: Any) -> dict:
             declared["dsa_decode_backend"] = backend
         prefill = declared.get("dsa_prefill_backend", view.dsa_prefill_backend)
         decode = declared.get("dsa_decode_backend", view.dsa_decode_backend)
+        # The hisparse allow-list in hisparse_hook is platform- but not
+        # dtype-aware, so an explicitly requested backend still has to clear the
+        # shared backend/kv-cache-dtype rules before this arm returns early.
+        _check_dsa_backend_constraints(
+            kv_cache_dtype, prefill, decode, hip=get_platform().is_hip
+        )
         logger.warning(
             f"HiSparse enabled ({kv_cache_dtype}): using DSA backends "
             f"prefill={prefill}, decode={decode}."
         )
         return declared
 
-    if not user_set_prefill and not user_set_decode and get_platform().is_hip:
-        declared["dsa_prefill_backend"] = "tilelang"
-        declared["dsa_decode_backend"] = "tilelang"
+    if get_platform().is_hip:
+        if not user_set_prefill:
+            declared["dsa_prefill_backend"] = "triton"
+        if not user_set_decode:
+            declared["dsa_decode_backend"] = "triton"
     elif kv_cache_dtype == "fp8_e4m3":
         # Blackwell FP8 defaults to trtllm; Hopper FP8 to flashmla_kv.
         default = "trtllm" if major >= 10 else "flashmla_kv"
@@ -753,7 +780,7 @@ def _dsa_split_backend_resolution(view: Any) -> dict:
 
     prefill = declared.get("dsa_prefill_backend", view.dsa_prefill_backend)
     decode = declared.get("dsa_decode_backend", view.dsa_decode_backend)
-    _check_tilelang_dsa_fp8_kv(
+    _check_dsa_backend_constraints(
         kv_cache_dtype, prefill, decode, hip=get_platform().is_hip
     )
     logger.warning(
@@ -974,6 +1001,7 @@ _FLASHINFER_ALLREDUCE_FUSION_ARCHS = frozenset(
         "Qwen3_5ForConditionalGeneration",
         "NemotronHForCausalLM",
         "NemotronHPuzzleForCausalLM",
+        "NemotronH_Omni_Reasoning_V3",
     }
 )
 
@@ -986,7 +1014,17 @@ def _flashinfer_allreduce_fusion_auto_enable(view: Any) -> dict:
     single-node systems. Reads the mid-resolution enable_dp_attention /
     moe_a2a_backend (after the DeepSeek CP and a2a declarations), exactly
     like the legacy tail block."""
-    model_arch = model_config_of(view).hf_config.architectures[0]
+    hf_config = model_config_of(view).hf_config
+    model_arch = hf_config.architectures[0]
+    # V4.1 TP4 uses the custom push plane for decode and fused MoE finalize.
+    prefer_custom_dsv41 = (
+        getattr(hf_config, "model_type", None) == "deepseek_v41"
+        and getattr(hf_config, "hidden_size", None) == 5120
+        and get_platform().is_blackwell
+        and view.tp_size == 4
+        and view.nnodes == 1
+        and not view.disable_custom_all_reduce
+    )
     if envs.SGLANG_FLASHINFER_MNNVL_CUTEDSL_AR_FUSION.get() and model_arch in {
         "Qwen3_5MoeForCausalLM",
         "Qwen3_5MoeForConditionalGeneration",
@@ -1004,6 +1042,7 @@ def _flashinfer_allreduce_fusion_auto_enable(view: Any) -> dict:
     if (
         view.flashinfer_allreduce_fusion_backend is None
         and model_arch in _FLASHINFER_ALLREDUCE_FUSION_ARCHS
+        and not prefer_custom_dsv41
         and (get_platform().is_sm90 or get_platform().is_sm100)
         and view.tp_size > 1
         and not view.enable_dp_attention
@@ -1154,14 +1193,6 @@ def _mla_backend_page_constraints(view: Any) -> dict:
         )
         page_size = 64
     if (
-        view.attention_backend == "cutlass_mla"
-        or view.decode_attention_backend == "cutlass_mla"
-    ):
-        logger.warning(
-            "Cutlass MLA only supports a page_size of 128, change page_size to 128."
-        )
-        page_size = 128
-    if (
         view.attention_backend == "trtllm_mla"
         or view.decode_attention_backend == "trtllm_mla"
     ):
@@ -1232,9 +1263,9 @@ def _mla_kv_cache_dtype_checks(view: Any) -> dict:
             raise ValueError(
                 "TRTLLM MLA backend is only supported on Blackwell GPUs (SM100/SM12x). Please use a different backend."
             )
-        if view.kv_cache_dtype not in ["fp8_e4m3", "fp4_e2m1", "bf16", "auto"]:
+        if view.kv_cache_dtype not in ["fp8_e4m3", "bf16", "auto"]:
             raise ValueError(
-                "TensorRT-LLM MLA backend only supports kv-cache-dtype of fp8_e4m3, fp4_e2m1, bf16, or auto."
+                "TensorRT-LLM MLA backend only supports kv-cache-dtype of fp8_e4m3, bf16, or auto."
             )
     if (
         view.attention_backend == "tokenspeed_mla"
@@ -1370,23 +1401,6 @@ def _intel_xpu_page_constraint(view: Any) -> dict:
 
 
 @register_post_process
-def _attention_backend_dual_chunk(view: Any) -> dict:
-    if (
-        getattr(model_config_of(view).hf_config, "dual_chunk_attention_config", None)
-        is not None
-    ):
-        if view.attention_backend is None:
-            logger.info("Dual chunk attention is turned on by default.")
-            return {"attention_backend": "dual_chunk_flash_attn"}
-        elif view.attention_backend != "dual_chunk_flash_attn":
-            raise ValueError(
-                "Dual chunk attention is enabled, but attention backend is set to "
-                f"{view.attention_backend}. Please set it to 'dual_chunk_flash_attn'."
-            )
-    return {}
-
-
-@register_post_process
 def _page_size_default(view: Any) -> dict:
     if view.page_size is not None:
         return {}
@@ -1417,6 +1431,32 @@ def _data_parallelism_defaults(view: Any) -> dict:
     if view.dp_size == 1 and view.ep_join_mode != "scale":
         return {"enable_dp_attention": False, "enable_dp_lm_head": False}
     return {}
+
+
+@register_post_process
+def _dcp_comm_backend_default(view: Any) -> dict:
+    if view.dcp_comm_backend is not None:
+        return {}
+    if view.dcp_size <= 1:
+        return {"dcp_comm_backend": "ag_rs"}
+    platform = get_platform()
+    if is_fi_a2a_supported(
+        dcp_size=view.dcp_size,
+        tp_size=view.tp_size,
+        pp_size=view.pp_size,
+        nnodes=view.nnodes,
+    ):
+        backend = "fi_a2a"
+    elif platform.is_cuda or platform.is_hip:
+        backend = "a2a"
+    else:
+        backend = "ag_rs"
+    logger.info(
+        "DCP (dcp_size=%d) selects communication backend %r.",
+        view.dcp_size,
+        backend,
+    )
+    return {"dcp_comm_backend": backend}
 
 
 @register_post_process
@@ -1508,7 +1548,12 @@ def _moe_runner_backend_quant_constraints(view: Any) -> dict:
         allowed = list(MXFP8_MOE_RUNNER_BACKEND_CHOICES)
         if is_gfx95_mxfp8:
             allowed.append("triton")
-        mxfp8_default = "triton" if is_gfx95_mxfp8 else "flashinfer_trtllm"
+
+        if view.moe_a2a_backend == "flashinfer_megamoe":
+            mxfp8_default = "flashinfer_megamoe"
+        else:
+            mxfp8_default = "triton" if is_gfx95_mxfp8 else "flashinfer_trtllm"
+
         if moe_runner_backend == "auto":
             moe_runner_backend = mxfp8_default
         elif moe_runner_backend not in allowed:
@@ -1562,7 +1607,8 @@ def _moe_runner_fusion_disable(view: Any) -> dict:
 def _a2a_fusion_adjustments(view: Any) -> dict:
     """A2A-backend-driven shared-experts fusion adjustments, declared at the
     legacy write slots in _handle_a2a_moe: Waterfill requires the
-    fusion enabled; FlashInfer and DeepEP v2 A2A require it disabled."""
+    fusion enabled; FlashInfer, FlashInfer MegaMOE, and DeepEP v2 A2A require it disabled.
+    """
     if view.moe_a2a_backend in ("deepep", "megamoe") and view.enable_waterfill:
         if view.disable_shared_experts_fusion:
             logger.warning(
@@ -1570,7 +1616,7 @@ def _a2a_fusion_adjustments(view: Any) -> dict:
             )
             return {"disable_shared_experts_fusion": False}
         return {}
-    if view.moe_a2a_backend == "flashinfer":
+    if view.moe_a2a_backend in ("flashinfer", "flashinfer_megamoe"):
         logger.warning(
             "Flashinfer MoE A2A is enabled. --disable-shared-experts-fusion is automatically set."
         )
@@ -1591,6 +1637,7 @@ _A2A_EP_SPANNING_BACKENDS = frozenset(
         "nixl",
         "ascend_fuseep",
         "flashinfer",
+        "flashinfer_megamoe",
         "mori",
         "pplx",
         "deepep_v2",
@@ -1659,6 +1706,23 @@ def _gguf_quantization(view: Any) -> dict:
 def _dllm_attention_backend(view: Any) -> dict:
     if view.dllm_algorithm is None:
         return {}
+    from sglang.srt.dllm.algorithm import get_algorithm_cls
+
+    algorithm_cls = get_algorithm_cls(view.dllm_algorithm)
+    if backend := algorithm_cls.required_attention_backend:
+        fields = (
+            "attention_backend",
+            "prefill_attention_backend",
+            "decode_attention_backend",
+        )
+        overrides = {
+            field: backend for field in fields if getattr(view, field, None) != backend
+        }
+        if overrides:
+            logger.warning(
+                "%s requires the %s attention backend", view.dllm_algorithm, backend
+            )
+        return overrides
     if get_platform().is_hip:
         if view.attention_backend not in ["triton", "aiter"]:
             logger.warning(
@@ -1768,19 +1832,27 @@ def post_capture_kv_sizing_planned(server_args: Any) -> bool:
     mla_enabled = use_mla_backend(server_args)
     if not envs.SGLANG_ENABLE_POST_CAPTURE_KV_SIZING.get():
         return False
+    # Unified arenas are fully backed before capture and cannot resize afterward.
+    if cfg.enable_unified_memory:
+        return False
     if cfg.device != "cuda":
         return False
     if cfg.dcp_size != 1:
         return False
     if mla_enabled:
         return False
-    if cfg.kv_cache_dtype == "fp4_e2m1":
-        return False
     if cfg.prefill_only_disable_kv_cache:
         return False
     if cfg.enable_memory_saver:
         return False
     if envs.SGLANG_MOONCAKE_CUSTOM_MEM_POOL.get() is not None:
+        return False
+    # Mooncake over EFA cannot register the CUDA VMM allocation used by
+    # post-capture KV sizing. Fall back to the regular cudaMalloc-backed pool.
+    if (
+        cfg.disaggregation_transfer_backend == "mooncake"
+        and envs.MOONCAKE_PROTOCOL.get().lower() == "efa"
+    ):
         return False
 
     if (
@@ -1834,7 +1906,10 @@ def cutedsl_moe_max_num_tokens(server_args: Any) -> int:
 
 def max_prefill_buffer_tokens(server_args: Any) -> int:
     """Prefill-buffer ceiling: chunked_prefill_size, except PP dynamic
-    chunking can grow chunks toward max_prefill_tokens and probe at 1.25x."""
+    chunking can grow chunks toward max_prefill_tokens and probe at 1.25x.
+
+    Records with a registered ceiling provider (see
+    ``register_prefill_buffer_ceiling``) answer through it."""
     cfg = resolving_view(server_args)
     chunked = (
         cfg.chunked_prefill_size
@@ -1844,7 +1919,10 @@ def max_prefill_buffer_tokens(server_args: Any) -> int:
     tokens = chunked
     if cfg.enable_dynamic_chunking and cfg.pp_size > 1 and chunked:
         tokens = max(tokens, cfg.max_prefill_tokens or 0, math.ceil(chunked * 1.25))
-    return tokens
+    record = server_args
+    if isinstance(server_args, (ResolvedView, ResolvingConfig)):
+        record = record_of(server_args)
+    return prefill_buffer_ceiling_of(record, tokens)
 
 
 def mamba_cache_chunk_size(server_args: Any) -> int:

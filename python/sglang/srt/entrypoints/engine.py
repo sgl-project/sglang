@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import asyncio
 import atexit
+import copy
 import dataclasses
 import gc
 import logging
@@ -31,6 +32,7 @@ import signal
 import tempfile
 import threading
 import time
+import types
 from typing import (
     Any,
     AsyncIterator,
@@ -94,7 +96,11 @@ from sglang.srt.managers.io_struct import (
 )
 from sglang.srt.managers.multi_tokenizer_mixin import (
     MultiTokenizerRouter,
+    get_main_process_id,
+    get_tokenizer_worker_class,
+    read_from_shared_memory,
     run_multi_detokenizer_router_process,
+    write_data_for_multi_tokenizer,
 )
 from sglang.srt.managers.scheduler import run_scheduler_process
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
@@ -243,6 +249,11 @@ class Engine(EngineScoreMixin, EngineBase):
     # Backend-specific launch handle: the Ray engine schedules its actors onto a
     # placement group. Not config — a live cluster object.
     _placement_group = None
+    # Set by attach_tokenizer_worker(): this instance only owns a TokenizerWorker,
+    # the engine subprocesses belong to the parent Engine.
+    _attached = False
+    tokenizer_router: Optional[MultiTokenizerRouter] = None
+    _multi_tokenizer_shm = None
 
     def __init__(self, **kwargs):
         """
@@ -316,6 +327,25 @@ class Engine(EngineScoreMixin, EngineBase):
             tokenizer_manager._subprocess_watchdog = subprocess_watchdog
         self.port_args = port_args
 
+        if isinstance(tokenizer_manager, MultiTokenizerRouter):
+            # --tokenizer-worker-num > 1: the router only bridges TokenizerWorkers to
+            # the scheduler and has no generate_request. Publish the launch data the
+            # workers need (same shared-memory contract as `sglang serve`) and give
+            # this process its own worker so Engine.generate() keeps working here;
+            # more processes join with Engine.attach_tokenizer_worker().
+            self.tokenizer_router = tokenizer_manager
+            scheduler_info = {
+                **scheduler_init_result.scheduler_infos[0],
+                "startup_time": tokenizer_manager.startup_time,
+            }
+            self._multi_tokenizer_shm = write_data_for_multi_tokenizer(
+                port_args, server_args, scheduler_info
+            )
+            self.tokenizer_manager, self.template_manager = self._init_tokenizer_worker(
+                server_args, port_args, scheduler_info
+            )
+            self.tokenizer_manager._subprocess_watchdog = subprocess_watchdog
+
         # Initialize ZMQ sockets
         context = zmq.Context(2)
         if get_parallel().node_rank == 0:
@@ -329,7 +359,7 @@ class Engine(EngineScoreMixin, EngineBase):
         if get_observability().enable_trace:
             process_tracing_init(
                 get_observability().otlp_traces_endpoint,
-                "sglang",
+                get_observability().otlp_service_name,
                 trace_modules=get_observability().trace_modules,
             )
             thread_label = "Tokenizer"
@@ -339,11 +369,7 @@ class Engine(EngineScoreMixin, EngineBase):
                 thread_label = "Decode Tokenizer"
             trace_set_thread_info(thread_label)
 
-        try:
-            self.loop = asyncio.get_running_loop()
-        except RuntimeError:
-            self.loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(self.loop)
+        self.loop = self._ensure_event_loop()
 
     def get_all_child_pids(self) -> List[int]:
         """Returns a list of all child process PIDs."""
@@ -1270,10 +1296,91 @@ class Engine(EngineScoreMixin, EngineBase):
             weight_cache_daemon_procs,
         )
 
+    @staticmethod
+    def _init_tokenizer_worker(
+        server_args: ServerArgs, port_args: PortArgs, scheduler_info: Dict[str, Any]
+    ) -> Tuple[TokenizerManager, TemplateManager]:
+        # TokenizerWorker.__init__ registers with the router over a zmq.asyncio
+        # socket, which needs the loop the Engine will later run to be current.
+        Engine._ensure_event_loop()
+        port_args = copy.copy(port_args)
+        port_args.tokenizer_ipc_name = (
+            f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}"
+        )
+        tokenizer_manager, template_manager = init_tokenizer_manager(
+            server_args,
+            port_args,
+            TokenizerManagerClass=get_tokenizer_worker_class(server_args),
+        )
+        tokenizer_manager.max_req_input_len = scheduler_info["max_req_input_len"]
+        tokenizer_manager.set_startup_time(scheduler_info["startup_time"])
+        return tokenizer_manager, template_manager
+
+    @staticmethod
+    def _ensure_event_loop() -> asyncio.AbstractEventLoop:
+        try:
+            return asyncio.get_running_loop()
+        except RuntimeError:
+            pass
+        try:
+            return asyncio.get_event_loop_policy().get_event_loop()
+        except RuntimeError:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            return loop
+
+    @classmethod
+    def attach_tokenizer_worker(cls, parent_pid: Optional[int] = None) -> Engine:
+        """Join an Engine launched with ``tokenizer_worker_num > 1`` from another
+        process on the same host.
+
+        The returned Engine has no subprocesses of its own: it holds a
+        ``TokenizerWorker`` registered with the parent's ``MultiTokenizerRouter``, so
+        ``generate``/``async_generate`` run on this process while prefill and decode
+        stay on the parent's schedulers. Use it to spread the per-request Python
+        work of one engine over several processes (what ``sglang serve`` does with
+        uvicorn workers). ``parent_pid`` defaults to the multiprocessing parent, so
+        children spawned by the parent can omit it. Weight updates and other RPCs
+        must go through the parent Engine.
+        """
+        parent_pid = get_main_process_id() if parent_pid is None else parent_pid
+        port_args, server_args, scheduler_info = read_from_shared_memory(
+            f"multi_tokenizer_args_{parent_pid}"
+        )
+        publish(server_args, role="tokenizer")
+        self = cls.__new__(cls)
+        self._attached = True
+        self.server_args = server_args
+        self.port_args = port_args
+        self._scheduler_init_result = types.SimpleNamespace(
+            scheduler_infos=[scheduler_info], all_child_pids=[]
+        )
+        self._weight_cache_daemon_procs = []
+        self.send_to_rpc = None
+        self.tokenizer_manager, self.template_manager = self._init_tokenizer_worker(
+            server_args, port_args, scheduler_info
+        )
+        self.loop = self._ensure_event_loop()
+        return self
+
     def shutdown(self):
         """Shutdown the engine; block until the scheduler subprocess releases
         its GPU context so the caller can immediately reallocate on the same
         device."""
+        if self._attached:
+            if isinstance(self.tokenizer_manager, TokenizerManager):
+                mm_processor = getattr(self.tokenizer_manager, "mm_processor", None)
+                if mm_processor is not None:
+                    mm_processor.shutdown()
+                self.tokenizer_manager.cuda_vmm_feature_transport.shutdown()
+            return
+        shm = getattr(self, "_multi_tokenizer_shm", None)
+        if shm is not None:
+            try:
+                shm.unlink()
+            except FileNotFoundError:
+                pass
+            self._multi_tokenizer_shm = None
         try:
             if (
                 self.tokenizer_manager is not None
@@ -1407,6 +1514,7 @@ class Engine(EngineScoreMixin, EngineBase):
             "load_format": tm.config_value("load_format"),
             "reasoning_parser": tm.config_value("reasoning_parser"),
             "tool_call_parser": tm.config_value("tool_call_parser"),
+            "disaggregation_mode": tm.config_value("disaggregation_mode"),
         }
 
     def init_weights_update_group(
@@ -1732,7 +1840,7 @@ def _set_envs_and_config(server_args: ServerArgs):
         if _is_cuda:
             assert_pkg_version(
                 "sglang-kernel",
-                "0.4.6.post1",
+                "0.4.7",
                 "Please reinstall the latest version with `pip install sglang-kernel --force-reinstall`",
             )
 
@@ -1768,34 +1876,6 @@ def _set_envs_and_config(server_args: ServerArgs):
     # Set gc threshold
     if gc_threshold := cfg.gc_threshold:
         gc.set_threshold(*gc_threshold)
-
-    _log_legacy_kernel_cache_dirs()
-
-
-def _log_legacy_kernel_cache_dirs():
-    """Note the pre-SGLANG_CACHE_DIR cache dirs without touching them: other
-    frameworks on the box may still be using them."""
-    # TODO(shuwang21): drop once SGLANG_CACHE_DIR has been the default for a
-    # few releases.
-    legacy_dirs = [
-        d
-        for d in (
-            os.path.expanduser("~/.triton"),
-            os.path.expanduser("~/.cache/flashinfer"),
-            os.path.expanduser("~/.cache/deep_gemm"),
-        )
-        if os.path.isdir(d)
-    ]
-    if not legacy_dirs:
-        return
-    logger.info(
-        "Compiled-kernel caches now live under SGLANG_CACHE_DIR (%s). These "
-        "older directories are no longer used by sglang, but may still be "
-        "used by other frameworks on this machine, so they were left alone: "
-        "%s. Remove them yourself if nothing else needs them.",
-        envs.SGLANG_CACHE_DIR.get(),
-        ", ".join(legacy_dirs),
-    )
 
 
 def _scheduler_died_error(rank: int, proc) -> RuntimeError:
