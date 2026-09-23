@@ -1068,7 +1068,9 @@ class PrefillAdder:
                 return req
 
         # A mid-chunk rank prefills this pass regardless of the delayer
-        # verdict, so report prefillable=True and ignore the result.
+        # verdict, so report prefillable=True and ignore the result. The
+        # in-flight bit is set here, past the hybrid-SWA park above, so only a
+        # chunk that is actually admitted claims the pass as prefill.
         if self.prefill_delayer_single_pass is not None:
             self.prefill_delayer_single_pass.negotiate_should_allow_prefill(
                 local_prefillable=True,
@@ -1076,6 +1078,7 @@ class PrefillAdder:
                 max_prefill_bs=self.max_prefill_bs,
                 max_running_requests=self.max_running_requests,
                 waiting_queue_len=self.waiting_queue_len,
+                prefill_in_flight=True,
             )
 
         if self.chunked_req_limit is not None:
