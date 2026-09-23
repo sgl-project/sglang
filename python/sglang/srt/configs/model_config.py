@@ -76,13 +76,15 @@ def unwrap_modelopt_quantization_config(quant_config: dict) -> dict:
 
 def get_mimo_v2_fused_qkv_expected_tp_size(hf_config):
     layout = getattr(hf_config, "attention_projection_layout", None)
-    if layout is None:
+    # MiMoV2Config fills in "split" when the checkpoint omits the field; split
+    # q/k/v projections load through the regular stacked-params path.
+    if layout in (None, "split"):
         return None
     if layout != "fused_qkv":
         raise ValueError(
             "MiMoV2 hf_config has unsupported "
-            f"attention_projection_layout={layout!r}; expected 'fused_qkv' "
-            "or unset."
+            f"attention_projection_layout={layout!r}; expected 'fused_qkv', "
+            "'split' or unset."
         )
 
     num_key_value_heads = getattr(hf_config, "num_key_value_heads", None)
