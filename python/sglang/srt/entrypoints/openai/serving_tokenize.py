@@ -36,6 +36,18 @@ class OpenAIServingTokenize(OpenAIServingBase):
     ) -> tuple[TokenizeRequest, TokenizeRequest]:
         return request, request
 
+    async def _handle_streaming_request(
+        self,
+        adapted_request: TokenizeRequest,
+        request: TokenizeRequest,
+        raw_request: Request,
+    ) -> Union[TokenizeResponse, ErrorResponse]:
+        # Tokenization always returns one JSON response. Accept and ignore the
+        # stream flag when callers reuse a chat-completion request payload.
+        return await self._handle_non_streaming_request(
+            adapted_request, request, raw_request
+        )
+
     async def _handle_non_streaming_request(
         self,
         adapted_request: TokenizeRequest,
