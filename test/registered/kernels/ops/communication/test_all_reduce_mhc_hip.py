@@ -97,6 +97,7 @@ def _layer(group):
     layer = SimpleNamespace(
         config=SimpleNamespace(model_type="deepseek_v41"),
         dsa_enable_prefill_cp=False,
+        hc_pre_from_prev_sublayer=False,
         self_attn=_Attention(group),
         mlp=SimpleNamespace(tp_size=1),
         hc_mult=4,
@@ -150,7 +151,15 @@ def test_model_handoff_and_graph_replay(group, rows, verify):
         return next_pre, *pending
 
     with (
-        get_parallel().override(tp_size=4, attn_dp_size=1),
+        # the full four-rank topology: main validates every width against tp_size
+        get_parallel().override(
+            tp_size=4,
+            tp_rank=group.rank_in_group,
+            attn_tp_size=4,
+            attn_tp_rank=group.rank_in_group,
+            attn_dp_size=1,
+            moe_tp_size=4,
+        ),
         get_forward().scoped(sp_active=False),
         patch(
             "sglang.srt.distributed.parallel_state.get_attn_tp_group",
@@ -165,7 +174,11 @@ def test_model_handoff_and_graph_replay(group, rows, verify):
     ):
         graphs = []
         for enabled in (False, True):
-            with envs.SGLANG_OPT_HIP_ALL_REDUCE_MHC.override(enabled):
+            # the server hook turns the tilelang post off on ROCm at model load
+            with (
+                envs.SGLANG_OPT_USE_TILELANG_MHC_POST.override(False),
+                envs.SGLANG_OPT_HIP_ALL_REDUCE_MHC.override(enabled),
+            ):
                 graph = torch.cuda.CUDAGraph()
                 with group.graph_capture() as capture:
                     run()
@@ -201,6 +214,7 @@ def _moe(group, dual, shared_tp1):
         def __init__(self):
             torch.nn.Module.__init__(self)
             self.tp_size = 4
+            self.is_deepseek_v4 = True
             self._shared_expert_tp1 = shared_tp1
             self.layer_id = 0
             self.is_nextn = False
@@ -274,7 +288,14 @@ def test_moe_model_handoff(group, rows, dual, defer, shared_tp1):
         return hidden, next_pre
 
     with (
-        get_parallel().override(tp_size=4, attn_tp_size=4, attn_dp_size=1),
+        get_parallel().override(
+            tp_size=4,
+            tp_rank=group.rank_in_group,
+            attn_tp_size=4,
+            attn_tp_rank=group.rank_in_group,
+            attn_dp_size=1,
+            moe_tp_size=4,
+        ),
         get_forward().scoped(
             sp_active=False, fuse_mlp_allreduce=False, flashinfer_trtllm_bypass=False
         ),
@@ -284,7 +305,7 @@ def test_moe_model_handoff(group, rows, dual, defer, shared_tp1):
         ),
         patch("sglang.srt.distributed.parallel_state.get_tp_group", return_value=group),
         patch(
-            "sglang.srt.models.deepseek_v2.tensor_model_parallel_all_reduce",
+            "sglang.srt.models.deepseek_v2.post_experts_all_reduce",
             side_effect=group.all_reduce,
         ) as original_reduce,
         patch(
@@ -307,7 +328,11 @@ def test_moe_model_handoff(group, rows, dual, defer, shared_tp1):
     ):
         graphs = []
         for enabled in (False, True):
-            with envs.SGLANG_OPT_HIP_ALL_REDUCE_MHC.override(enabled):
+            # the server hook turns the tilelang post off on ROCm at model load
+            with (
+                envs.SGLANG_OPT_USE_TILELANG_MHC_POST.override(False),
+                envs.SGLANG_OPT_HIP_ALL_REDUCE_MHC.override(enabled),
+            ):
                 graph = torch.cuda.CUDAGraph()
                 with group.graph_capture() as capture:
                     run()
@@ -347,9 +372,14 @@ def test_moe_skipped_reduction_does_not_apply_post(group, dual, flag):
     with (
         get_forward().scoped(**{flag: True}, flashinfer_trtllm_bypass=False),
         use_mhc_post_fusion(state),
+        # the skip predicate lives inside post_experts_all_reduce: mock the
+        # collectives it would issue
         patch(
-            "sglang.srt.models.deepseek_v2.tensor_model_parallel_all_reduce"
+            "sglang.srt.distributed.communication_op.tensor_model_parallel_all_reduce"
         ) as reduction,
+        patch(
+            "sglang.srt.distributed.communication_op.moe_tensor_model_parallel_all_reduce"
+        ) as moe_reduction,
         patch(
             "sglang.srt.models.deepseek_v2.get_exec",
             return_value=SimpleNamespace(moe=SimpleNamespace(enable_eplb=False)),
@@ -358,6 +388,7 @@ def test_moe_skipped_reduction_does_not_apply_post(group, dual, flag):
         actual = moe(x)
         assert state.output is None
         reduction.assert_not_called()
+        moe_reduction.assert_not_called()
         torch.testing.assert_close(
             actual, x * (group.rank_in_group + 1.5), atol=0, rtol=0
         )

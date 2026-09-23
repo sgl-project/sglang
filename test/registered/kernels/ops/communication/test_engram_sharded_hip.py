@@ -16,10 +16,11 @@ from sglang.srt.distributed.parallel_state import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers.engram import EngramEmbedding
-from sglang.srt.runtime_context import get_context, get_parallel
+from sglang.srt.runtime_context import get_parallel, reset_context
 from sglang.srt.utils import is_hip
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.kernels.utils import multigpu_pytest_main
+from sglang.test.test_utils import publish_build_topology
 
 register_amd_ci(est_time=60, suite="stage-c-kernel-test-4-gpu-amd-mi35x")
 pytestmark = pytest.mark.skipif(
@@ -33,15 +34,16 @@ def group():
     rank, world = int(os.environ["LOCAL_RANK"]), int(os.environ["WORLD_SIZE"])
     torch.cuda.set_device(rank)
     torch.cuda.set_stream(torch.cuda.Stream())
-    with get_context().override_server_args():
-        init_distributed_environment(
-            world_size=world, rank=rank, local_rank=rank, backend="nccl"
-        )
-        initialize_model_parallel(tensor_model_parallel_size=world)
-        with get_parallel().override(tp_size=world, tp_rank=rank):
-            yield get_tp_group()
-        destroy_model_parallel()
-        destroy_distributed_environment()
+    init_distributed_environment(
+        world_size=world, rank=rank, local_rank=rank, backend="nccl"
+    )
+    # initialize_model_parallel reads the widths from the published topology
+    publish_build_topology(tp_size=world, world_rank=rank)
+    initialize_model_parallel()
+    yield get_tp_group()
+    destroy_model_parallel()
+    destroy_distributed_environment()
+    reset_context()
 
 
 def table(rows):
@@ -66,7 +68,7 @@ def table(rows):
         embed = EngramEmbedding(rows, 128, layer_id=1)
     embed.weight.weight_loader(embed.weight, weight)
     embed.scale.weight_loader(embed.scale, scale.view(torch.float8_e8m0fnu))
-    embed.finish_load()
+    embed.finish_load(label="test")
     return embed, reference
 
 
@@ -75,22 +77,22 @@ def test_eager_and_graph_reconstruction(group, rows):
     """Reconstructing a sharded row must retain signed zero and BF16 subnormals."""
     embed, reference = table(rows)
     ids = torch.arange(16, device="cuda", dtype=torch.int64).view(-1, 1) % rows
-    with patch("sglang.srt.layers.engram.get_attention_dp_size", return_value=1):
-        eager = embed(ids)
+    # the fixture publishes plain TP (attn_dp_size == 1): the all-reduce path
+    eager = embed(ids)
+    assert torch.equal(
+        eager.cpu().view(torch.int16), reference[ids.cpu()].view(torch.int16)
+    )
+    graph = torch.cuda.CUDAGraph()
+    with group.graph_capture() as capture:
+        embed(ids)
+        with torch.cuda.graph(graph, stream=capture.stream):
+            output = embed(ids)
+    for shift in (1, 3):
+        ids.add_(shift).remainder_(rows)
+        graph.replay()
         assert torch.equal(
-            eager.cpu().view(torch.int16), reference[ids.cpu()].view(torch.int16)
+            output.cpu().view(torch.int16), reference[ids.cpu()].view(torch.int16)
         )
-        graph = torch.cuda.CUDAGraph()
-        with group.graph_capture() as capture:
-            embed(ids)
-            with torch.cuda.graph(graph, stream=capture.stream):
-                output = embed(ids)
-        for shift in (1, 3):
-            ids.add_(shift).remainder_(rows)
-            graph.replay()
-            assert torch.equal(
-                output.cpu().view(torch.int16), reference[ids.cpu()].view(torch.int16)
-            )
 
 
 @pytest.mark.parametrize("scatter", [False, True], ids=["False", "True"])
@@ -105,11 +107,26 @@ def test_dp_shard_reconstruction(group, scatter):
     def gather(dst, src, _batch):
         group.all_gather_into_tensor(dst, src)
 
+    # The fixture built plain TP groups; present them to the layer and the DP
+    # helpers as a TP-wide attention-DP layout (one attention rank per GPU).
+    real = get_parallel()
+    dp_layout = SimpleNamespace(
+        tp_size=world,
+        tp_rank=rank,
+        tp_group=real.tp_group,
+        attn_tp_group=real.tp_group,
+        attn_dp_size=world,
+        attn_dp_rank=rank,
+        attn_tp_size=1,
+        attn_tp_rank=0,
+        attn_cp_size=1,
+        attn_cp_rank=0,
+    )
     with (
         patch("sglang.srt.layers.engram.get_global_dp_buffer_len", return_value=world),
-        patch("sglang.srt.layers.engram.get_attention_dp_size", return_value=world),
+        patch("sglang.srt.layers.engram.get_parallel", return_value=dp_layout),
+        patch("sglang.srt.layers.dp_attention.get_parallel", return_value=dp_layout),
         patch("sglang.srt.layers.engram.dp_gather_replicate", side_effect=gather),
-        patch("sglang.srt.layers.dp_attention._ATTN_DP_SIZE", world),
         patch(
             "sglang.srt.layers.dp_attention.get_dp_local_info",
             return_value=(

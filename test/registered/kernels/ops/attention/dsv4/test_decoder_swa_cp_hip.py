@@ -94,7 +94,15 @@ class TestDecoderSwaContextParallel(CustomTestCase):
                 total_seq_lens=len(positions),
             )
             with (
-                get_parallel().override(attn_cp_size=4, attn_cp_rank=rank),
+                # a consistent four-rank CP topology: the published tp_size and
+                # its MoE decomposition must agree with attn_cp_size
+                get_parallel().override(
+                    tp_size=4,
+                    tp_rank=rank,
+                    moe_tp_size=4,
+                    attn_cp_size=4,
+                    attn_cp_rank=rank,
+                ),
                 patch.object(cp_base, "_STRATEGY", InterleaveCPStrategy(cp_size=4)),
             ):
                 metadata = backend._build_late_layer_tail_metadata(batch)
