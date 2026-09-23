@@ -158,6 +158,21 @@ class ExecKernel(msgspec.Struct):
             resolvable=True,
         ),
     ] = None
+    prefill_kv_cache_dequant_dtype: A[
+        str,
+        Arg(
+            help=(
+                "Online dequantization dtype used by prefill attention when "
+                "--kv-cache-dtype=nvfp4. 'nvfp4' reads the packed cache directly "
+                "without additional dequantization; 'fp8_e4m3' dequantizes it "
+                "into a temporary FP8 workspace. This does not change the stored "
+                "KV-cache dtype. 'auto' selects NVFP4 without additional "
+                "dequantization on SM100 and FP8 E4M3 otherwise."
+            ),
+            choices=["auto", "nvfp4", "fp8_e4m3"],
+            resolvable=True,
+        ),
+    ] = "auto"
     sampling_backend: A[
         Optional[str],
         Arg(
@@ -641,6 +656,28 @@ class ExecComm(msgspec.Struct):
     enable_aiter_allreduce_fusion: A[
         bool, Arg(help="Enable Aiter AllReduce Fusion.", resolvable=True)
     ] = False
+    disable_aiter_allreduce_fusion_in_prefill: A[
+        bool,
+        Arg(
+            help=(
+                "Disable Aiter AllReduce Fusion for prefill batches "
+                "(EXTEND / MIXED / SPLIT_PREFILL) while keeping it for decode. "
+                "Only meaningful with --enable-aiter-allreduce-fusion."
+            ),
+            resolvable=True,
+        ),
+    ] = False
+    disable_aiter_allreduce_fusion_in_decode: A[
+        bool,
+        Arg(
+            help=(
+                "Disable Aiter AllReduce Fusion for decode batches (DECODE / "
+                "TARGET_VERIFY / draft-extend / IDLE) while keeping it for prefill. "
+                "Only meaningful with --enable-aiter-allreduce-fusion."
+            ),
+            resolvable=True,
+        ),
+    ] = False
 
 
 class ExecMoe(msgspec.Struct):
@@ -806,10 +843,6 @@ class ExecMoe(msgspec.Struct):
     elastic_ep_scale_timeout: A[
         float, "Timeout in seconds for a pending elastic EP scale operation."
     ] = 600
-    elastic_ep_rejoin: A[
-        bool,
-        "[Deprecated] Alias for --elastic-ep-join-mode recover.",
-    ] = False
     disable_flashinfer_cutlass_moe_fp4_allgather: A[
         bool, "Disables quantize before all-gather for flashinfer cutlass moe."
     ] = False

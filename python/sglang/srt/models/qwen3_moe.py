@@ -26,9 +26,6 @@ import torch
 from torch import nn
 from transformers import PretrainedConfig
 
-from sglang.srt.distributed import (
-    get_pp_group,
-)
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
@@ -46,7 +43,7 @@ from sglang.srt.layers.moe import (
 )
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
-from sglang.srt.layers.moe.topk import TopK
+from sglang.srt.layers.moe.topk import TopK, TopKOutputChecker
 from sglang.srt.layers.moe.utils import (
     RoutingMethodType,
     filter_moe_weight_param_global_expert,
@@ -76,6 +73,7 @@ from sglang.srt.utils import (
     is_non_idle_and_non_empty,
     is_npu,
 )
+from sglang.srt.utils.custom_op import register_custom_op
 from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
 _is_cuda = is_cuda()
@@ -105,6 +103,55 @@ _is_npu = is_npu()
 
 if _is_npu:
     from sgl_kernel_npu.norm.split_qkv_rmsnorm_rope import split_qkv_rmsnorm_rope
+
+    def _split_qkv_rmsnorm_rope_fake_impl(
+        qkv: torch.Tensor,
+        sin: torch.Tensor,
+        cos: torch.Tensor,
+        q_size: int,
+        kv_size: int,
+        head_dim: int,
+        eps: float = 1e-6,
+        q_weight: Optional[torch.Tensor] = None,
+        k_weight: Optional[torch.Tensor] = None,
+        q_bias: Optional[torch.Tensor] = None,
+        k_bias: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        del sin, cos, head_dim, eps, q_weight, k_weight, q_bias, k_bias
+        output_shape = qkv.shape[:-1]
+        return (
+            qkv.new_empty((*output_shape, q_size)),
+            qkv.new_empty((*output_shape, kv_size)),
+            qkv.new_empty((*output_shape, kv_size)),
+        )
+
+    @register_custom_op(fake_impl=_split_qkv_rmsnorm_rope_fake_impl)
+    def _split_qkv_rmsnorm_rope_custom(
+        qkv: torch.Tensor,
+        sin: torch.Tensor,
+        cos: torch.Tensor,
+        q_size: int,
+        kv_size: int,
+        head_dim: int,
+        eps: float = 1e-6,
+        q_weight: Optional[torch.Tensor] = None,
+        k_weight: Optional[torch.Tensor] = None,
+        q_bias: Optional[torch.Tensor] = None,
+        k_bias: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        return split_qkv_rmsnorm_rope(
+            qkv,
+            sin,
+            cos,
+            q_size,
+            kv_size,
+            head_dim,
+            eps=eps,
+            q_weight=q_weight,
+            k_weight=k_weight,
+            q_bias=q_bias,
+            k_bias=k_bias,
+        )
 
 
 def compute_yarn_parameters(
@@ -294,12 +341,19 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
             )
             self.top_k = config.num_experts_per_tok
 
+        self._use_mega_moe = get_moe_a2a_backend().is_megamoe()
+        self._mega_top_k = config.num_experts_per_tok
+        self._mega_intermediate_size = config.moe_intermediate_size
+        self._mega_hidden_size = config.hidden_size
+
     def forward(
         self,
         hidden_states: torch.Tensor,
         forward_batch: Optional[ForwardBatch] = None,
     ) -> torch.Tensor:
 
+        if self._use_mega_moe:
+            return self._forward_mega_moe(hidden_states, forward_batch)
         if (
             not is_deepep_class_backend()
             and not get_moe_a2a_backend().is_ascend_fuseep()
@@ -346,7 +400,7 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
             topk_output = self.topk(
                 hidden_states,
                 router_logits,
-                num_token_non_padded=forward_batch.num_token_non_padded,
+                num_token_non_padded=forward_batch.moe_num_token_non_padded(),
                 expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
                     layer_id=self.layer_id,
                 ),
@@ -358,6 +412,58 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
             topk_output=topk_output,
         )
         return final_hidden_states
+
+    def _forward_mega_moe(
+        self, hidden_states: torch.Tensor, forward_batch: Optional[ForwardBatch]
+    ) -> torch.Tensor:
+        # Same contract as forward_deepep: combined rows, no TP all-reduce.
+        from sglang.srt.layers.moe.mega_moe import (
+            is_mega_moe_experts_ready,
+            run_mega_routed_experts,
+        )
+
+        if not is_mega_moe_experts_ready(self.experts):
+            raise RuntimeError(
+                "moe_a2a_backend=megamoe needs MegaMoE expert weights on this "
+                "model: on SM100 load a checkpoint with MXFP4 or NVFP4 routed "
+                "experts; on SM90 load a block-FP8 checkpoint with a DeepGEMM "
+                "that ships fp8_mega_moe."
+            )
+
+        num_tokens = hidden_states.shape[0]
+        topk_ids = None
+        topk_weights = None
+        if num_tokens > 0:
+            router_logits, _ = self.gate(hidden_states)
+            topk_output = self.topk(
+                hidden_states,
+                router_logits,
+                num_token_non_padded=(
+                    forward_batch.moe_num_token_non_padded()
+                    if forward_batch is not None
+                    else None
+                ),
+                expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
+                    layer_id=self.layer_id,
+                ),
+            )
+            assert TopKOutputChecker.format_is_standard(topk_output), (
+                "MegaMoE pre-dispatch consumes raw topk ids/weights; "
+                "pick a MoE runner backend that emits standard TopK output"
+            )
+            topk_ids = topk_output.topk_ids
+            topk_weights = topk_output.topk_weights
+
+        return run_mega_routed_experts(
+            self.experts,
+            hidden_states,
+            topk_ids,
+            topk_weights,
+            hidden_size=self._mega_hidden_size,
+            intermediate_size=self._mega_intermediate_size,
+            top_k=self._mega_top_k,
+            num_tokens=num_tokens,
+        )
 
     def op_gate(self, state):
         if is_non_idle_and_non_empty(
@@ -378,7 +484,7 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
                 state.topk_output = self.topk(
                     hidden_states=hidden_states,
                     router_logits=router_logits,
-                    num_token_non_padded=state.forward_batch.num_token_non_padded,
+                    num_token_non_padded=state.forward_batch.moe_num_token_non_padded(),
                     expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
                         layer_id=self.layer_id,
                     ),
@@ -566,7 +672,7 @@ class Qwen3MoeAttention(nn.Module):
         qkv, _ = self.qkv_proj(hidden_states)
         if self.attn.layer_id == self.start_layer:
             self.rotary_emb.get_cos_sin_with_position(positions)
-        q, k, v = split_qkv_rmsnorm_rope(
+        q, k, v = _split_qkv_rmsnorm_rope_custom(
             qkv,
             self.rotary_emb.position_sin,
             self.rotary_emb.position_cos,
@@ -972,7 +1078,7 @@ class Qwen3MoeForCausalLM(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
         self.config = config
         self.quant_config = quant_config
         self.model = Qwen3MoeModel(
