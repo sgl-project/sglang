@@ -79,6 +79,12 @@ def _parse_runner_selector(selector: str) -> Set[str]:
     )
 
 
+class _WeightUpdateSession(msgspec.Struct, frozen=True):
+    # recorded at begin so end finalizes the same runners
+    selector: str
+    loaded_weights: bool = False
+
+
 @dataclass(kw_only=True, slots=True)
 class SchedulerWeightUpdaterManager:
     tp_worker: Any
@@ -92,10 +98,7 @@ class SchedulerWeightUpdaterManager:
     offload_tags: set = field(default_factory=set)
     stashed_model_static_state: Any = None
     # replicated on every TP rank, so a rejected call returns on all ranks before any barrier
-    _session_open: bool = False
-    _session_loaded_weights: bool = False
-    # recorded at begin so end finalizes the same runners
-    _session_selector: str = "all"
+    _session: Optional[_WeightUpdateSession] = None
 
     @contextmanager
     def _observe_weight_load(self, source: str) -> Iterator[None]:
@@ -175,7 +178,7 @@ class SchedulerWeightUpdaterManager:
         recv_req: UpdateWeightsFromDistributedReqInput,
     ) -> Tuple[bool, str]:
         """Update the online model parameter, fanning out to the selected runners."""
-        if not self._session_open:
+        if self._session is None:
             return UpdateWeightsFromDistributedReqOutput(
                 success=False,
                 message="update_weights_from_distributed must run between "
@@ -204,7 +207,9 @@ class SchedulerWeightUpdaterManager:
                     if not success:
                         break
             if success:
-                self._session_loaded_weights = True
+                self._session = msgspec.structs.replace(
+                    self._session, loaded_weights=True
+                )
                 self.flush_cache_after_weight_update(recv_req)
                 self.record_weight_version_after_update(recv_req.weight_version)
             return UpdateWeightsFromDistributedReqOutput(
@@ -213,7 +218,7 @@ class SchedulerWeightUpdaterManager:
 
     def update_weights_from_tensor(self, recv_req: UpdateWeightsFromTensorReqInput):
         """Update the online model parameter from tensors on the selected runners."""
-        if not self._session_open:
+        if self._session is None:
             return UpdateWeightsFromTensorReqOutput(
                 success=False,
                 message="update_weights_from_tensor must run between "
@@ -232,7 +237,9 @@ class SchedulerWeightUpdaterManager:
                 if not success:
                     break
             if success:
-                self._session_loaded_weights = True
+                self._session = msgspec.structs.replace(
+                    self._session, loaded_weights=True
+                )
                 self.flush_cache_after_weight_update(recv_req)
                 self.record_weight_version_after_update(recv_req.weight_version)
             else:
@@ -284,31 +291,29 @@ class SchedulerWeightUpdaterManager:
 
     def begin_weight_update(self, recv_req: BeginWeightUpdateReqInput):
         """Open the session: restore in-place-packed weights on the selected runners."""
-        if self._session_open:
+        if self._session is not None:
             return BeginWeightUpdateReqOutput(
                 success=False,
                 message="a weight-update session is already open; "
                 "call end_weight_update() first",
             )
-        self._session_selector = recv_req.selector
         for _, runner in self._select_runners(recv_req.selector):
             runner.weight_updater.begin_weight_update()
-        self._session_open = True
-        self._session_loaded_weights = False
+        self._session = _WeightUpdateSession(selector=recv_req.selector)
         torch.distributed.barrier(group=self.tp_cpu_group)
         return BeginWeightUpdateReqOutput(success=True, message="Success")
 
     def end_weight_update(self, recv_req: EndWeightUpdateReqInput):
         """Finalize the runners begin opened; post_load_weights only if no load ran (P2P/RDMA)."""
-        if not self._session_open:
+        if self._session is None:
             return EndWeightUpdateReqOutput(
                 success=False,
                 message="no weight-update session is open; call begin_weight_update() first",
             )
-        run_post_load = not self._session_loaded_weights
-        for _, runner in self._select_runners(self._session_selector):
+        run_post_load = not self._session.loaded_weights
+        for _, runner in self._select_runners(self._session.selector):
             runner.weight_updater.end_weight_update(run_post_load=run_post_load)
-        self._session_open = False
+        self._session = None
         torch.distributed.barrier(group=self.tp_cpu_group)
         return EndWeightUpdateReqOutput(success=True, message="Success")
 

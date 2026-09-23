@@ -5,6 +5,7 @@ from unittest.mock import patch
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.scheduler_components.weight_updater import (
     SchedulerWeightUpdaterManager,
+    _WeightUpdateSession,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -161,8 +162,8 @@ class TestRecordWeightVersionAfterUpdate(CustomTestCase):
                 )
             ),
         )
-        # update_weights_from_* assert an open begin_weight_update session.
-        manager._session_open = True
+        # update_weights_from_* require an open session
+        manager._session = _WeightUpdateSession(selector="all")
         return manager
 
     def _runner_request(self, **fields):

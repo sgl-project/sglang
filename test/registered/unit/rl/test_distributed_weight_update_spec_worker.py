@@ -15,6 +15,7 @@ from sglang.srt.managers.io_struct import (
 )
 from sglang.srt.managers.scheduler_components.weight_updater import (
     SchedulerWeightUpdaterManager,
+    _WeightUpdateSession,
 )
 
 
@@ -41,8 +42,8 @@ def _manager(tp_worker, draft_worker):
             record_weight_version_change=lambda new_version: None
         ),
     )
-    # update_weights_from_* assert an open begin_weight_update session.
-    manager._session_open = True
+    # update_weights_from_* require an open session
+    manager._session = _WeightUpdateSession(selector="all")
     return manager
 
 
@@ -126,7 +127,7 @@ def test_end_weight_update_runs_post_load_on_both_when_load_was_bypassed():
     target_runner = Mock()
     draft_runner = Mock()
     manager = _session_manager(target_runner, draft_runner)
-    manager._session_loaded_weights = False
+    manager._session = _WeightUpdateSession(selector="all")
 
     with patch("torch.distributed.barrier"):
         output = manager.end_weight_update(EndWeightUpdateReqInput())
@@ -138,7 +139,7 @@ def test_end_weight_update_runs_post_load_on_both_when_load_was_bypassed():
     draft_runner.weight_updater.end_weight_update.assert_called_once_with(
         run_post_load=True
     )
-    assert manager._session_open is False
+    assert manager._session is None
 
 
 def test_end_weight_update_skips_post_load_on_both_when_weights_loaded():
@@ -146,7 +147,7 @@ def test_end_weight_update_skips_post_load_on_both_when_weights_loaded():
     target_runner = Mock()
     draft_runner = Mock()
     manager = _session_manager(target_runner, draft_runner)
-    manager._session_loaded_weights = True
+    manager._session = _WeightUpdateSession(selector="all", loaded_weights=True)
 
     with patch("torch.distributed.barrier"):
         manager.end_weight_update(EndWeightUpdateReqInput())
@@ -164,14 +165,14 @@ def test_begin_weight_update_selector_restores_only_selected_and_is_recorded():
     target_runner = Mock()
     draft_runner = Mock()
     manager = _session_manager(target_runner, draft_runner)
-    manager._session_open = False
+    manager._session = None
 
     with patch("torch.distributed.barrier"):
         manager.begin_weight_update(BeginWeightUpdateReqInput(selector="draft"))
 
     target_runner.weight_updater.begin_weight_update.assert_not_called()
     draft_runner.weight_updater.begin_weight_update.assert_called_once_with()
-    assert manager._session_selector == "draft"
+    assert manager._session.selector == "draft"
 
 
 def test_end_weight_update_reuses_session_selector_from_begin():
@@ -179,7 +180,7 @@ def test_end_weight_update_reuses_session_selector_from_begin():
     target_runner = Mock()
     draft_runner = Mock()
     manager = _session_manager(target_runner, draft_runner)
-    manager._session_open = False
+    manager._session = None
 
     with patch("torch.distributed.barrier"):
         manager.begin_weight_update(BeginWeightUpdateReqInput(selector="draft"))
@@ -193,7 +194,7 @@ def test_begin_weight_update_rejects_reentry():
     """A second begin would leave the first session's runners unfinalized."""
     target_runner = Mock()
     manager = _session_manager(target_runner, Mock())
-    manager._session_open = True
+    manager._session = _WeightUpdateSession(selector="all")
 
     output = manager.begin_weight_update(BeginWeightUpdateReqInput())
 
@@ -205,7 +206,7 @@ def test_end_weight_update_without_session_is_rejected():
     """Finalizing runners begin never restored would repack weights twice."""
     target_runner = Mock()
     manager = _session_manager(target_runner, Mock())
-    manager._session_open = False
+    manager._session = None
 
     output = manager.end_weight_update(EndWeightUpdateReqInput())
 
@@ -223,7 +224,7 @@ def test_update_without_session_is_rejected_without_loading():
         ),
         draft_worker=None,
     )
-    manager._session_open = False
+    manager._session = None
 
     output = manager.update_weights_from_distributed(_distributed_req())
 
