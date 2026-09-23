@@ -245,7 +245,17 @@ class TestTheBuildStatesEveryGroup(_IsolatedOverrides):
             and isinstance(node.func, ast.Attribute)
             and node.func.attr == "override_permanently"
         )
-        self.assertIn("is not None", ast.unparse(stamp))
+        self.assertEqual([keyword.arg for keyword in stamp.keywords], [None])
+        mapping = stamp.keywords[0].value
+        self.assertIsInstance(mapping, ast.DictComp)
+        self.assertEqual(len(mapping.generators), 1)
+        guards = mapping.generators[0].ifs
+        self.assertEqual(len(guards), 1)
+        guard = guards[0]
+        self.assertIsInstance(guard, ast.Compare)
+        self.assertEqual([type(op) for op in guard.ops], [ast.IsNot])
+        self.assertEqual([c.value for c in guard.comparators], [None])
+        self.assertEqual(ast.unparse(guard.left), ast.unparse(mapping.value))
 
 
 class TestParallelDelegation(_IsolatedOverrides):
@@ -2585,27 +2595,39 @@ class TestTheTopologyIdentities(CustomTestCase):
 
     def test_a_refused_write_leaves_nothing_behind(self):
         self._publish_square()
+        written = dict(tp_size=4, attn_tp_size=3, attn_dp_size=1, attn_cp_size=1)
+        before = {name: getattr(get_parallel(), name) for name in written}
         with self.assertRaises(ValueError):
-            with get_parallel().override(
-                tp_size=4, attn_tp_size=3, attn_dp_size=1, attn_cp_size=1
-            ):
+            with get_parallel().override(**written):
                 pass
-        self.assertEqual(get_parallel().attn_tp_size, 2)
+        self.assertEqual(
+            {name: getattr(get_parallel(), name) for name in written}, before
+        )
+        self.assertEqual(before["attn_tp_size"], 2)
 
     def test_a_group_built_at_another_width_is_refused(self):
         from sglang.srt.distributed.parallel_state import GroupCoordinator
+        from sglang.srt.runtime_context import _WIDTH_AND_GROUP
 
-        self._publish_square()
-        wrong = GroupCoordinator.__new__(GroupCoordinator)
-        wrong.world_size = 8
-        wrong.rank_in_group = 0
-        with self.assertRaises(ValueError) as caught:
-            get_parallel().override_permanently(tp_group=wrong)
-        message = str(caught.exception)
-        self.assertIn("tp_group.world_size == tp_size", message)
-        self.assertIn("built 8, configured 4", message)
-        with self.assertRaises(RuntimeError):
-            get_parallel().tp_group
+        exercised = set()
+        for size_name, group_name in _WIDTH_AND_GROUP:
+            with self.subTest(group=group_name):
+                self._publish_square()
+                configured = getattr(get_parallel(), size_name)
+                wrong = GroupCoordinator.__new__(GroupCoordinator)
+                wrong.world_size = configured + 4
+                wrong.rank_in_group = 0
+                with self.assertRaises(ValueError) as caught:
+                    get_parallel().override_permanently(**{group_name: wrong})
+                message = str(caught.exception)
+                self.assertIn(f"{group_name}.world_size == {size_name}", message)
+                self.assertIn(
+                    f"built {configured + 4}, configured {configured}", message
+                )
+                with self.assertRaises(RuntimeError):
+                    getattr(get_parallel(), group_name)
+                exercised.add((size_name, group_name))
+        self.assertEqual(exercised, set(_WIDTH_AND_GROUP))
 
     def test_a_group_built_at_the_configured_width_is_quiet(self):
         from sglang.srt.distributed.parallel_state import GroupCoordinator
@@ -2632,6 +2654,101 @@ class TestTheTopologyIdentities(CustomTestCase):
 class TestTheParallelPhase(CustomTestCase):
     """Entry points initialize parallel groups before constructing runners."""
 
+    def test_the_layer_phase_leaves_a_stated_placement_alone(self):
+        """A server that runs its own WORLD states its attention placement, and
+        the layer phase reads the model's shape only."""
+        import torch
+
+        from sglang.srt.distributed import bootstrap
+        from sglang.srt.layers.dp_attention import initialize_dp_attention_flags
+
+        reset_context()
+        self.addCleanup(reset_context)
+        publish(
+            ServerArgs(
+                model_path="dummy",
+                tp_size=4,
+                dp_size=2,
+                enable_dp_attention=True,
+                device="cpu",
+            ),
+            role="test",
+            ranks=SpawnRanks(world_rank=3, dp_rank=1),
+        )
+        get_parallel().override_permanently(
+            attn_dp_size=1,
+            attn_dp_rank=0,
+            attn_tp_size=4,
+            attn_tp_rank=3,
+            attn_cp_size=1,
+            attn_cp_rank=0,
+        )
+
+        initialize_dp_attention_flags(get_server_args())
+        bootstrap.init_layer_runtime(
+            model_config=SimpleNamespace(
+                hf_config=SimpleNamespace(architectures=["Qwen2ForCausalLM"]),
+                hidden_size=8,
+                dtype=torch.float16,
+            )
+        )
+
+        self.assertTrue(get_flags().dp.enabled)
+        self.assertEqual(get_parallel().attn_dp_size, 1)
+        self.assertEqual(get_parallel().attn_dp_rank, 0)
+
+    def test_encoder_cp_mlp_reduces_over_attention_tp(self):
+        from unittest.mock import Mock
+
+        import torch
+
+        from sglang.srt.layers.dp_attention import (
+            init_dp_gathered_buffer,
+            initialize_dp_attention_flags,
+        )
+        from sglang.srt.models.qwen3_vl import Qwen3_VisionMLP
+
+        reset_context()
+        self.addCleanup(reset_context)
+        server_args = ServerArgs(
+            model_path="dummy",
+            device="cpu",
+            tp_size=4,
+            attn_cp_size=2,
+            enable_dp_attention=True,
+        )
+        publish(server_args, role="test", ranks=SpawnRanks(world_rank=0))
+        # Identical shards contribute equally; reducing across CP replicas
+        # would double the output even though the layer uses attention TP.
+        tp_group = SimpleNamespace(
+            world_size=4,
+            rank_in_group=0,
+            all_reduce=Mock(side_effect=lambda x: x * 4),
+        )
+        attn_tp_group = SimpleNamespace(
+            world_size=2,
+            rank_in_group=0,
+            all_reduce=Mock(side_effect=lambda x: x * 2),
+        )
+        get_parallel().override_permanently(
+            tp_group=tp_group, attn_tp_group=attn_tp_group
+        )
+        initialize_dp_attention_flags(server_args)
+        init_dp_gathered_buffer(
+            SimpleNamespace(
+                hf_config=SimpleNamespace(), hidden_size=4, dtype=torch.float32
+            )
+        )
+        mlp = Qwen3_VisionMLP(4, 4, bias=False, hidden_act="relu")
+        with torch.no_grad():
+            for parameter in mlp.parameters():
+                parameter.fill_(1)
+            output = mlp(torch.ones(1, 4))
+
+        torch.testing.assert_close(output, torch.full((1, 4), 16.0))
+        attn_tp_group.all_reduce.assert_called_once()
+        tp_group.all_reduce.assert_not_called()
+
     def test_building_twice_is_refused(self):
         from sglang.srt.distributed import bootstrap
 
@@ -2656,7 +2773,6 @@ class TestTheParallelPhase(CustomTestCase):
             )
             kwargs = dict(
                 server_args=ServerArgs(model_path="dummy"),
-                model_config=None,
                 device="cpu",
                 dist_port=12345,
             )
@@ -2682,13 +2798,16 @@ class TestTheParallelPhase(CustomTestCase):
             )
             if not builds:
                 continue
-            if "init_parallel_runtime(" not in text:
-                offenders.append(str(path))
+            for phase in ("init_parallel_runtime(", "init_layer_runtime("):
+                if phase not in text:
+                    offenders.append(f"{path} ({phase[:-1]})")
         self.assertEqual(
             offenders,
             [],
-            "these publish and then build a ModelRunner without bringing the "
-            "parallel runtime up first:\n  " + "\n  ".join(offenders),
+            "these publish and then build a ModelRunner without running both "
+            "phases first -- the group build derives the topology, and the "
+            "layer phase sizes what the model's shape decides:\n  "
+            + "\n  ".join(offenders),
         )
 
 
@@ -2888,10 +3007,64 @@ class TestTheRecordIsNeverWrittenTo(CustomTestCase):
 class TestTheRetiredNamesAreGoneEverywhere(CustomTestCase):
     """Reject retired getter imports and group-initialization width arguments."""
 
+    #: Getters that answer something other than a place in the topology.
+    NOT_A_PLACEMENT = {
+        "get_default_distributed_backend",
+        "get_mooncake_transfer_engine",
+        "get_torch_distributed_pg_options",
+    }
+    #: Widths whose group is not in ``_WIDTH_AND_GROUP``.
+    WIDTH_WITHOUT_A_CHECKED_GROUP = {
+        "get_dcp_world_size",
+        "get_moe_data_parallel_world_size",
+        "get_moe_tensor_parallel_world_size",
+    }
+    #: Variants that answer a group the map already covers.
+    VARIANT_OF_A_MAPPED_GROUP = {
+        "get_dcp_group_no_assert",
+        "get_self_pp_group",
+    }
+
     def _retired(self):
         from sglang.srt.distributed.parallel_state import _CONTEXT_NAME_OF
 
         return set(_CONTEXT_NAME_OF)
+
+    def test_every_getter_the_module_defines_is_classified(self):
+        """Every getter the module defines is deprecated or classified here."""
+        from sglang.srt.distributed import parallel_state
+
+        defined = {
+            name
+            for name in dir(parallel_state)
+            if name.startswith("get_")
+            and callable(getattr(parallel_state, name))
+            and getattr(getattr(parallel_state, name), "__module__", None)
+            == parallel_state.__name__
+        }
+        self.assertTrue(defined, "no getters found; this proves nothing")
+        unclassified = (
+            defined
+            - self._retired()
+            - self.NOT_A_PLACEMENT
+            - self.WIDTH_WITHOUT_A_CHECKED_GROUP
+            - self.VARIANT_OF_A_MAPPED_GROUP
+        )
+        self.assertEqual(
+            unclassified,
+            set(),
+            "these getters are neither deprecated nor classified; say which "
+            "kind each one is, or route it through get_parallel():\n  "
+            + "\n  ".join(sorted(unclassified)),
+        )
+        stale = (
+            self.NOT_A_PLACEMENT
+            | self.WIDTH_WITHOUT_A_CHECKED_GROUP
+            | self.VARIANT_OF_A_MAPPED_GROUP
+        ) - defined
+        self.assertEqual(
+            stale, set(), f"these are named here but no longer defined: {stale}"
+        )
 
     def test_nothing_imports_a_retired_name_from_the_package(self):
         import ast as _ast

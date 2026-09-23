@@ -33,7 +33,6 @@ if TYPE_CHECKING:
     import torch
 
     from sglang.srt.mem_cache.cache_init_params import CacheInitParams
-    from sglang.srt.mem_cache.hiradix_cache import HiRadixCache
     from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
     from sglang.srt.server_args import ServerArgs
 
@@ -181,7 +180,9 @@ def _split_hicache_size(
 ) -> tuple[float, ...]:
     device_pool_sizes = []
     for kv_pool in kv_pools:
-        size_bytes = kv_pool.get_kv_size_bytes()
+        size_bytes = getattr(kv_pool, "host_capacity_bytes", None)
+        if size_bytes is None:
+            size_bytes = kv_pool.get_kv_size_bytes()
         device_pool_sizes.append(
             sum(size_bytes) if isinstance(size_bytes, tuple) else size_bytes
         )
@@ -204,6 +205,7 @@ def build_pool_entry(
     device_evict_fn: Optional[Callable[[int], Any]] = None,
     device_alloc_fn: Optional[Callable[[int], Any]] = None,
     device_free_fn: Optional[Callable[[Any], Any]] = None,
+    device_indices_from_anchor_fn: Optional[Callable[[Any], Any]] = None,
     packed_draft_device_pools: tuple[Any, ...] = (),
 ) -> PoolEntry:
     return PoolEntry(
@@ -216,6 +218,7 @@ def build_pool_entry(
         device_evict_fn=device_evict_fn,
         device_alloc_fn=device_alloc_fn,
         device_free_fn=device_free_fn,
+        device_indices_from_anchor_fn=device_indices_from_anchor_fn,
         packed_draft_device_pools=packed_draft_device_pools,
     )
 
@@ -263,6 +266,19 @@ def build_kv_only_group(
     )
 
 
+def _swa_allocation_callbacks(allocator, bind=None, free_bound=None) -> dict:
+    """Keep allocation and rollback in the same ID space for every SWA stack."""
+    if bind is not None:
+        assert free_bound is not None
+        return dict(
+            device_indices_from_anchor_fn=bind,
+            device_free_fn=free_bound,
+        )
+    if allocator is None:
+        return {}
+    return dict(device_alloc_fn=allocator.alloc, device_free_fn=allocator.free)
+
+
 def build_hybrid_swa_group(
     *,
     page_size: int,
@@ -276,6 +292,8 @@ def build_hybrid_swa_group(
     host_swa_evict_fn: Optional[Callable[[int], Any]] = None,
     device_swa_evict_fn: Optional[Callable[[int], Any]] = None,
     swa_attn_allocator: Any = None,
+    swa_indices_from_anchor_fn: Optional[Callable[[Any], Any]] = None,
+    swa_free_from_anchor_fn: Optional[Callable[[Any], Any]] = None,
     mtp_swa_device_pools: tuple[Any, ...] = (),
 ) -> HostPoolGroup:
     """Anchor (full) + SWA host pool group for a hybrid-SWA device pool."""
@@ -322,11 +340,10 @@ def build_hybrid_swa_group(
                 transfer_layer_id_max=transfer_layer_id_max + len(mtp_swa_device_pools),
                 host_evict_fn=host_swa_evict_fn,
                 device_evict_fn=device_swa_evict_fn,
-                device_alloc_fn=(
-                    swa_attn_allocator.alloc if swa_attn_allocator is not None else None
-                ),
-                device_free_fn=(
-                    swa_attn_allocator.free if swa_attn_allocator is not None else None
+                **_swa_allocation_callbacks(
+                    swa_attn_allocator,
+                    swa_indices_from_anchor_fn,
+                    swa_free_from_anchor_fn,
                 ),
                 packed_draft_device_pools=mtp_swa_device_pools,
             ),
@@ -423,6 +440,17 @@ def build_hybrid_swa_stack(
         device_swa_evict_fn=device_swa_evict_fn,
         # For SWA hybrid, device allocation goes through the inner allocator.
         swa_attn_allocator=params.token_to_kv_pool_allocator.swa_attn_allocator,
+        # Unified SWA binds pages to the full pool's virtual IDs instead.
+        swa_indices_from_anchor_fn=(
+            params.token_to_kv_pool_allocator.bind_swa_for_loaded_rows
+            if get_memory().enable_unified_memory
+            else None
+        ),
+        swa_free_from_anchor_fn=(
+            params.token_to_kv_pool_allocator.free_swa
+            if get_memory().enable_unified_memory
+            else None
+        ),
         mtp_swa_device_pools=mtp_swa_device_pools,
     )
     cache_controller = HybridCacheController(
@@ -1226,8 +1254,15 @@ def build_hybrid_mamba_swa_stack(
             transfer_layer_id_max=transfer_layer_id_max,
             host_evict_fn=host_swa_evict_fn,
             device_evict_fn=device_swa_evict_fn,
-            device_alloc_fn=swa_attn_allocator.alloc,
-            device_free_fn=swa_attn_allocator.free,
+            **_swa_allocation_callbacks(
+                swa_attn_allocator,
+                params.token_to_kv_pool_allocator.bind_swa_for_loaded_rows
+                if get_memory().enable_unified_memory
+                else None,
+                params.token_to_kv_pool_allocator.free_swa
+                if get_memory().enable_unified_memory
+                else None,
+            ),
         ),
         build_pool_entry(
             name=PoolName.MAMBA,
@@ -2193,7 +2228,7 @@ def build_minimax_sparse_hicache_stack(
             "MiniMax-M3 sparse HiCache does not support pipeline parallelism "
             "(pp_size>1) yet."
         )
-    # mirror HiRadix's guard, which the Unified-tree strategy path otherwise skips.
+    # The Unified-tree strategy path does not reject value-bearing index layers.
     if sparse_pool.index_kv_pool is not None:
         raise ValueError(
             "MiniMax sparse HiCache currently supports index-k-only sparse layers; "
@@ -2265,124 +2300,3 @@ def build_minimax_sparse_hicache_stack(
         enable_storage_metrics=enable_storage_metrics,
     )
     return host_pool_group, cache_controller
-
-
-def attach_hybrid_minimax_sparse_pool_to_hiradix_cache(
-    radix_cache: HiRadixCache,
-    params: CacheInitParams,
-    *,
-    extra_config: dict,
-    prefetch_threshold: int,
-    enable_storage_metrics: bool,
-    load_cache_event,
-) -> None:
-    """Attach HostPoolGroup (KV + index K) + HybridCacheController for HiRadixCache."""
-    from sglang.srt.mem_cache.memory_pool import MiniMaxSparseKVPool
-
-    try:
-        sparse_pool = radix_cache.kv_cache
-        if not isinstance(sparse_pool, MiniMaxSparseKVPool):
-            raise TypeError(
-                f"Expected MiniMaxSparseKVPool, got {type(sparse_pool).__name__}"
-            )
-        if sparse_pool.index_kv_pool is not None:
-            raise ValueError(
-                "MiniMax M3 HiCache L2 currently supports index-k-only sparse layers "
-                "(sparse_disable_index_value=1 for all sparse layers). "
-                "This model has index_kv_pool layers; INDEXER_KV sidecar is not "
-                "implemented yet."
-            )
-
-        main_pool = sparse_pool.main_pool
-        if sparse_pool.index_k_pool is None:
-            host_pool_group, cache_controller = build_kv_only_stack(
-                params=params,
-                kv_pool=main_pool,
-                full_layer_mapping={
-                    layer_id: layer_id for layer_id in range(main_pool.layer_num)
-                },
-                load_cache_event=load_cache_event,
-                storage_backend=get_memory().hicache_storage_backend,
-                use_mla=False,
-                prefetch_threshold=prefetch_threshold,
-                model_name=get_serving().served_model_name,
-                storage_backend_extra_config=extra_config,
-                enable_storage_metrics=enable_storage_metrics,
-            )
-            pools_desc = "KV"
-        else:
-            host_pool_group, cache_controller = build_minimax_sparse_hicache_stack(
-                params=params,
-                sparse_pool=sparse_pool,
-                load_cache_event=load_cache_event,
-                storage_backend=get_memory().hicache_storage_backend,
-                prefetch_threshold=prefetch_threshold,
-                model_name=get_serving().served_model_name,
-                storage_backend_extra_config=extra_config,
-                enable_storage_metrics=enable_storage_metrics,
-            )
-            pools_desc = "KV + INDEXER(k-only)"
-
-        sparse_pool.register_layer_transfer_counter(cache_controller.layer_done_counter)
-        radix_cache.full_kv_pool_host = host_pool_group.get_pool(PoolName.KV)
-        radix_cache.token_to_kv_pool_host = host_pool_group
-        radix_cache.cache_controller = cache_controller
-        logger.info(
-            "Attached hybrid MiniMax sparse pool stack to HiRadixCache: pools=%s, "
-            "transfer_layer_id_max=%s, sparse_index_k_layers=%s",
-            pools_desc,
-            main_pool.layer_num,
-            len(sparse_pool.index_k_layer_id_mapping),
-        )
-    except Exception:
-        logger.exception("attach_hybrid_minimax_sparse_pool_to_hiradix_cache failed")
-        raise
-
-
-def attach_hybrid_dsa_pool_to_hiradix_cache(
-    radix_cache: HiRadixCache,
-    params: CacheInitParams,
-    *,
-    extra_config: dict,
-    prefetch_threshold: int,
-    enable_storage_metrics: bool,
-    load_cache_event,
-) -> None:
-    """Attach HostPoolGroup (KV + indexer) + HybridCacheController for HiRadixCache.
-
-    This entrypoint is currently intended only for HiRadixCache's DSA path.
-    """
-    try:
-        kv = radix_cache.kv_cache
-        layer_mapping = {layer_id: layer_id for layer_id in range(kv.layer_num)}
-        host_pool_group, cache_controller = build_anchor_sidecar_stack(
-            params=params,
-            kv_pool=kv,
-            sidecar_pool_name=PoolName.INDEXER,
-            full_layer_mapping=layer_mapping,
-            load_cache_event=load_cache_event,
-            storage_backend=get_memory().hicache_storage_backend,
-            use_mla=True,
-            override_kv_cache_dim=kv.kv_cache_dim,
-            prefetch_threshold=prefetch_threshold,
-            sidecar_host_pool_factory=lambda kv_host_pool: DSAIndexerPoolHost(
-                kv,
-                kv_host_pool,
-                get_memory().hicache_mem_layout,
-                allocator_type=_get_allocator_type(),
-            ),
-            model_name=get_serving().served_model_name,
-            storage_backend_extra_config=extra_config,
-            enable_storage_metrics=enable_storage_metrics,
-        )
-        radix_cache.full_kv_pool_host = host_pool_group.get_pool(PoolName.KV)
-        radix_cache.token_to_kv_pool_host = host_pool_group
-        radix_cache.cache_controller = cache_controller
-        logger.info(
-            "Attached hybrid DSA pool stack to HiRadixCache: pools=KV + INDEXER, "
-            "transfer_layer_id_max=%s",
-            len(layer_mapping),
-        )
-    except Exception:
-        logger.exception("attach_hybrid_dsa_pool_to_hiradix_cache failed")
-        raise

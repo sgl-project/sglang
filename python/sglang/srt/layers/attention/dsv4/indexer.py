@@ -475,27 +475,40 @@ def topk_transform_paged_from_metadata(
     metadata,
     page_indices: torch.Tensor,
     raw_indices: Optional[torch.Tensor] = None,
+    *,
+    rows: Optional[slice] = None,
+    topk_metadata: Optional[torch.Tensor] = None,
 ) -> None:
     """Pool slots into ``page_indices`` (``-1`` past the valid count) and, when given,
     positions into ``raw_indices``; ``metadata`` is a ``PagedIndexerMetadata``."""
+    if rows is None:
+        seq_lens = metadata.compressed_seq_lens
+        page_table = metadata.page_table
+        out_page_indices = page_indices
+        out_raw_indices = raw_indices
+    else:
+        seq_lens = metadata.compressed_seq_lens[rows]
+        page_table = metadata.page_table[rows]
+        out_page_indices = page_indices[rows]
+        out_raw_indices = raw_indices[rows] if raw_indices is not None else None
     if metadata.use_topk_v2:
         topk_transform_paged_v2(
             logits,
-            metadata.compressed_seq_lens,
-            metadata.page_table,
-            page_indices,
+            seq_lens,
+            page_table,
+            out_page_indices,
             metadata.compressed_page_size,
-            metadata.topk_metadata,
-            raw_indices,
+            metadata.topk_metadata if topk_metadata is None else topk_metadata,
+            out_raw_indices,
         )
     else:
         topk_transform_paged(
             logits,
-            metadata.compressed_seq_lens,
-            metadata.page_table,
-            page_indices,
+            seq_lens,
+            page_table,
+            out_page_indices,
             metadata.compressed_page_size,
-            raw_indices,
+            out_raw_indices,
         )
 
 
