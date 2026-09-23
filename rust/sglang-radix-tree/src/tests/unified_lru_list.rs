@@ -1,6 +1,7 @@
 use super::*;
 use crate::components::FULL;
 use crate::node::{NodeArena, NodeIdx_, ValueSlotIdx};
+use num_bigint::BigInt;
 
 fn order(list: &UnifiedLRUList) -> Vec<NodeIdx_> {
     list.iter().collect()
@@ -848,6 +849,7 @@ fn tlru_float_budget_compares_cached_integer_lengths_without_rounding_them() {
     assert!(
         !strategy
             .float_config
+            .as_ref()
             .unwrap()
             .is_tel_safe(usize::MAX, usize::MAX)
     );
@@ -859,40 +861,31 @@ fn tlru_float_budget_compares_cached_integer_lengths_without_rounding_them() {
 }
 
 #[test]
-fn tlru_large_integer_estimates_switch_at_the_normalized_rounding_cutoff() {
+fn tlru_large_integer_estimates_preserve_exact_sums_at_float_rounding_ties() {
     let (mut arena, a) = arena_with_node();
     let node = arena.node_mut(a);
-    let positive = 2.0_f64.powi(130);
-    let adjacent = f64::from_bits(positive.to_bits() + 1);
-    // Q = 2**130 + 2**77 - 2 lies two tokens below the midpoint.
-    // The tie at H=2 rounds down; H=3 is the first rounded value above it.
-    let strategy = tlru_float_strategy(
-        positive,
-        TlruPromptEstimate::RoundedInteger {
-            below: positive,
-            cutoff: 3,
-            above: adjacent,
-        },
-    );
-    for (history, expected_class) in [(1, -1), (2, -1), (3, 0), (4, 0)] {
-        node.tlru_history_len = history;
-        node.tlru_cached_prefix_len = history;
-        assert_eq!(strategy.get_priority(node), PriorityKey(expected_class, 5));
-    }
-    // At the corresponding negative midpoint the tie rounds toward the
-    // upper value, so the first transition occurs one history token earlier.
-    let strategy = tlru_float_strategy(
-        -adjacent,
-        TlruPromptEstimate::RoundedInteger {
-            below: -adjacent,
-            cutoff: 2,
-            above: -positive,
-        },
-    );
-    for (history, expected_class) in [(1, -1), (2, 0), (3, 0)] {
-        node.tlru_history_len = history;
-        node.tlru_cached_prefix_len = history;
-        assert_eq!(strategy.get_priority(node), PriorityKey(expected_class, 5));
+    for exponent in [130_usize, 1023] {
+        let positive = 2.0_f64.powi(exponent as i32);
+        let adjacent = f64::from_bits(positive.to_bits() + 1);
+        let midpoint = (BigInt::from(1_u8) << exponent) + (BigInt::from(1_u8) << (exponent - 53));
+        // The estimate lies two tokens below a float midpoint. The exact
+        // integer sum at H=2 rounds down; H=3 is the first value above it.
+        let strategy =
+            tlru_float_strategy(positive, TlruPromptEstimate::BigInteger(&midpoint - 2_u8));
+        for (history, expected_class) in [(1, -1), (2, -1), (3, 0), (4, 0)] {
+            node.tlru_history_len = history;
+            node.tlru_cached_prefix_len = history;
+            assert_eq!(strategy.get_priority(node), PriorityKey(expected_class, 5));
+        }
+        // At the corresponding negative midpoint the tie rounds toward the
+        // upper value, so the first transition occurs one history token earlier.
+        let strategy =
+            tlru_float_strategy(-adjacent, TlruPromptEstimate::BigInteger(-midpoint - 2_u8));
+        for (history, expected_class) in [(1, -1), (2, 0), (3, 0)] {
+            node.tlru_history_len = history;
+            node.tlru_cached_prefix_len = history;
+            assert_eq!(strategy.get_priority(node), PriorityKey(expected_class, 5));
+        }
     }
 }
 

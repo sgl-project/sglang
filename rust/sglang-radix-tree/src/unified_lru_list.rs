@@ -492,42 +492,35 @@ pub struct TlruStrategy {
     pub float_config: Option<TlruFloatConfig>,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct TlruFloatConfig {
     pub threshold: f64,
     pub next_prompt_estimate: TlruPromptEstimate,
 }
 
 /// How Python evaluates history + next_prompt_estimate before subtraction.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub enum TlruPromptEstimate {
     Float(f64),
-    /// The adapter ensures adding any native history length fits in i128.
+    /// The binding ensures adding any native history length fits in i128.
     Integer(i128),
-    /// Larger integers cross at most one float rounding boundary over the
-    /// native history-length range. The adapter computes that boundary once.
-    RoundedInteger {
-        below: f64,
-        cutoff: usize,
-        above: f64,
-    },
+    /// Preserve Python's exact addition for estimates beyond the i128 range.
+    BigInteger(num_bigint::BigInt),
+}
+
+pub(crate) fn tlru_big_integer_to_float(value: &num_bigint::BigInt) -> f64 {
+    // Decimal parsing retains every digit and rounds ties like Python. The
+    // num-bigint to_f64 conversion can lose low bits near a rounding boundary.
+    value.to_string().parse().expect("valid integer literal")
 }
 
 impl TlruFloatConfig {
     pub(crate) fn is_tel_safe(&self, history: usize, cached_without_node: usize) -> bool {
-        let next_prompt = match self.next_prompt_estimate {
-            TlruPromptEstimate::Float(estimate) => history as f64 + estimate,
-            TlruPromptEstimate::Integer(estimate) => (history as i128 + estimate) as f64,
-            TlruPromptEstimate::RoundedInteger {
-                below,
-                cutoff,
-                above,
-            } => {
-                if history < cutoff {
-                    below
-                } else {
-                    above
-                }
+        let next_prompt = match &self.next_prompt_estimate {
+            TlruPromptEstimate::Float(estimate) => history as f64 + *estimate,
+            TlruPromptEstimate::Integer(estimate) => (history as i128 + *estimate) as f64,
+            TlruPromptEstimate::BigInteger(estimate) => {
+                tlru_big_integer_to_float(&(estimate + history))
             }
         };
         let budget = next_prompt - self.threshold;
@@ -542,7 +535,7 @@ impl TlruFloatConfig {
 impl<K: ChildKeyType> EvictionStrategy<K> for TlruStrategy {
     fn get_priority(&self, node: &Node<K>) -> PriorityKey {
         let cached_without_node = node.tlru_cached_prefix_len - node.key.atom_len();
-        let tel_safe = match self.float_config {
+        let tel_safe = match self.float_config.as_ref() {
             Some(config) => config.is_tel_safe(node.tlru_history_len, cached_without_node),
             None => node.tlru_history_len - cached_without_node <= self.tail_budget,
         };

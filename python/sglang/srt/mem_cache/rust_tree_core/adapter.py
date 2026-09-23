@@ -74,37 +74,16 @@ if TYPE_CHECKING:
 
 
 def _tlru_float_config(native_bindings, threshold, next_prompt_estimate):
-    """Preserve Python's mixed arithmetic without allocating during eviction."""
+    """Pass numeric values without changing Python's integer/float distinction."""
     if not all(
         isinstance(value, (int, float)) for value in (threshold, next_prompt_estimate)
     ):
         raise TypeError("T-LRU parameters must be integer or floating-point numbers")
     threshold = float(threshold)
-    max_history = 2 * sys.maxsize + 1
     if isinstance(next_prompt_estimate, int):
-        # Python adds the integer history before converting the sum to float.
-        if -(2**127) <= next_prompt_estimate <= 2**127 - 1 - max_history:
-            return native_bindings.TlruFloatConfig(
-                threshold, 0.0, integer_estimate=next_prompt_estimate
-            )
-
-        # Beyond i128, adjacent float rounding boundaries are farther apart
-        # than the entire native history range. Find the one possible change
-        # once, using Python's exact integers and ties-to-even conversion.
-        below = float(next_prompt_estimate)
-        above = float(next_prompt_estimate + max_history)
-        if below != above:
-            lo, hi = 0, max_history
-            while lo < hi:
-                mid = (lo + hi) // 2
-                if float(next_prompt_estimate + mid) == below:
-                    lo = mid + 1
-                else:
-                    hi = mid
-            return native_bindings.TlruFloatConfig(
-                threshold, below, rounded_estimate_transition=(lo, above)
-            )
-        next_prompt_estimate = below
+        return native_bindings.TlruFloatConfig(
+            threshold, 0.0, integer_estimate=next_prompt_estimate
+        )
     return native_bindings.TlruFloatConfig(threshold, float(next_prompt_estimate))
 
 
