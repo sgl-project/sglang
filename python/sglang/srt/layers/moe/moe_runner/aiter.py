@@ -387,7 +387,10 @@ def _install_fused_sorting_override() -> bool:
         if request is None:
             return original(*args, **kwargs)
         arg = read_arguments(args, kwargs)
-        if any(arg[name] not in (None, False) for name in extra_params):
+        # a set trailing parameter (a tensor compares elementwise, so no `in` test)
+        if any(
+            arg[name] is not None and arg[name] is not False for name in extra_params
+        ):
             return original(*args, **kwargs)
         topk_ids, topk_weights = arg["topk_ids"], arg["topk_weights"]
         expert_mask = arg["expert_mask"]
