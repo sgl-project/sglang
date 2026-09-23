@@ -58,7 +58,11 @@ def controller_types(sent):
         ),
         scope,
     )
-    return scope["DataParallelController"], scope["DPBudget"], scope["LoadBalanceMethod"]
+    return (
+        scope["DataParallelController"],
+        scope["DPBudget"],
+        scope["LoadBalanceMethod"],
+    )
 
 
 class TestDecodeWorkloadRouting(unittest.TestCase):
