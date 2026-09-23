@@ -211,6 +211,69 @@ def _store_fp4_index_k_cache_kernel(
     )
 
 
+@triton.jit
+def _gather_fp4_index_k_cache_masked_kernel(
+    cache,
+    req_to_token,
+    req_ids,
+    req_lens,
+    out_payload,
+    out_scales,
+    req_stride: tl.constexpr,
+    cache_stride: tl.constexpr,
+    width: tl.constexpr,
+    compress_ratio: tl.constexpr,
+    page_size: tl.constexpr,
+    block_rows: tl.constexpr,
+):
+    """Gather only the valid compressed-K prefix of each fixed graph slot."""
+    request = tl.program_id(0)
+    row_block = tl.program_id(1)
+    logical_k = row_block * block_rows + tl.arange(0, block_rows)
+    valid = logical_k < tl.load(req_lens + request) // compress_ratio
+
+    req_id = tl.load(req_ids + request)
+    full_slot = tl.load(
+        req_to_token + req_id * req_stride + logical_k.to(tl.int64) * compress_ratio,
+        mask=valid,
+        other=0,
+    )
+    compressed_slot = full_slot // compress_ratio
+    page = compressed_slot // page_size
+    page_offset = compressed_slot - page * page_size
+    out_row = request * width + logical_k
+
+    payload_cols = tl.arange(0, INDEX_K_PAYLOAD_BYTES)
+    payload = tl.load(
+        cache
+        + page[:, None] * cache_stride
+        + page_offset[:, None] * INDEX_K_PAYLOAD_BYTES
+        + payload_cols[None, :],
+        mask=valid[:, None],
+        other=0,
+    )
+    tl.store(
+        out_payload
+        + out_row[:, None].to(tl.int64) * INDEX_K_PAYLOAD_BYTES
+        + payload_cols[None, :],
+        payload,
+        mask=valid[:, None],
+    )
+
+    scale_cols = tl.arange(0, INDEX_K_SCALE_BYTES)
+    scale_bytes = tl.load(
+        cache
+        + page[:, None] * cache_stride
+        + page_size * INDEX_K_PAYLOAD_BYTES
+        + page_offset[:, None] * INDEX_K_SCALE_BYTES
+        + scale_cols[None, :],
+        mask=valid[:, None],
+        other=0,
+    ).to(tl.int32)
+    packed_scale = tl.sum(scale_bytes << (scale_cols[None, :] * 8), axis=1)
+    tl.store(out_scales + out_row, packed_scale, mask=valid)
+
+
 def quantize_fp4_indexer_tensor(
     x: torch.Tensor, rne: bool = False
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -271,6 +334,57 @@ def store_fp4_index_k_cache(
         cache.stride(0),
         BLOCK=64,
     )
+
+
+def gather_fp4_index_k_cache_masked(
+    cache: torch.Tensor,
+    req_to_token: torch.Tensor,
+    req_ids: torch.Tensor,
+    req_lens: torch.Tensor,
+    *,
+    width: int,
+    compress_ratio: int,
+    page_size: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Pack graph-stable contiguous FP4 K without touching padded K slots.
+
+    The result reserves ``width`` rows for every request slot because
+    DeepGEMM needs fixed offsets under CUDA graph replay. Only
+    ``req_lens[r] // compress_ratio`` rows are populated. DeepGEMM and top-k
+    consume the same real lengths, so the untouched suffix is never read.
+    """
+    assert cache.ndim == 2 and cache.element_size() == 1
+    assert cache.shape[1] == page_size * INDEX_K_SLOT_BYTES
+    assert req_to_token.ndim == 2 and req_to_token.dtype == torch.int32
+    assert req_ids.ndim == 1 and req_lens.shape == req_ids.shape
+    assert width > 0 and compress_ratio > 0
+
+    num_rows = req_ids.shape[0] * width
+    payload = torch.empty(
+        (num_rows, INDEX_K_PAYLOAD_BYTES.value),
+        dtype=torch.int8,
+        device=cache.device,
+    )
+    scales = torch.empty((num_rows,), dtype=torch.int32, device=cache.device)
+    block_rows = 32
+    _gather_fp4_index_k_cache_masked_kernel[
+        (req_ids.shape[0], triton.cdiv(width, block_rows))
+    ](
+        cache,
+        req_to_token,
+        req_ids,
+        req_lens,
+        payload,
+        scales,
+        req_to_token.stride(0),
+        cache.stride(0),
+        width,
+        compress_ratio,
+        page_size,
+        block_rows,
+        num_warps=8,
+    )
+    return payload, scales
 
 
 @triton.jit

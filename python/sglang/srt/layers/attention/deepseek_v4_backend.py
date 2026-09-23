@@ -45,6 +45,7 @@ from sglang.kernels.ops.attention.dsv4.online_c128_mtp import OnlineC128MTPContr
 from sglang.kernels.ops.attention.dsv4.prefill_candidates import (
     topk_prefill_candidates,
 )
+from sglang.kernels.ops.attention.dsv4.topk import topk_transform_bf16_small
 from sglang.kernels.ops.attention.dsv4_attn_metadata_kernels import (
     BuildCausalSwaPageIndices,
     BuildPageTablePositions,
@@ -75,6 +76,11 @@ from sglang.srt.layers.attention.dsv4.candidate_indexer import (
     published_masks,
     select_candidate_block_mask_v2,
     select_candidate_blocks,
+)
+from sglang.srt.layers.attention.dsv4.candidate_indexer_deep_gemm import (
+    CapturedPrefillSparseBlockTable,
+    captured_prefill_sparse_table,
+    sparse_logits,
 )
 from sglang.srt.layers.attention.dsv4.compressor_v2 import (
     CompressorBackendMixin,
@@ -315,24 +321,14 @@ def _dense_fp4_mqa_logits(
     return fn(q_fp4, kv_fp4, weights, ks, ke, False, max_seqlen_k)
 
 
-def _prefill_graph_dense_k_layout(
-    req_to_token: torch.Tensor,
-    ratio: int,
+def _prefill_graph_dense_k_offsets(
     width: int,
     local_req_ids: torch.Tensor,
     req_ids: torch.Tensor,
-    req_lens: torch.Tensor,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Build capture-stable offsets and slots for up to eight requests."""
+) -> torch.Tensor:
+    """Map each query row to its request's fixed contiguous-K segment."""
     req_ord = (local_req_ids[:, None] == req_ids[None, :]).to(torch.int32).argmax(1)
-    ks = req_ord.to(torch.int32) * width
-    logical_k = torch.arange(width, device=req_to_token.device)
-    valid_k = logical_k[None, :] < (req_lens[:, None] // ratio)
-    logical_pos = (logical_k[None, :] * ratio).expand_as(valid_k)
-    logical_pos = logical_pos.masked_fill(~valid_k, 0)
-    k_slots = req_to_token[req_ids[:, None], logical_pos].to(torch.int64) // ratio
-    k_slots = k_slots.masked_fill(~valid_k, 0).clamp_min_(0).flatten()
-    return ks, k_slots
+    return req_ord.to(torch.int32) * width
 
 
 def _low_ratio_source_projections(layer, x, q_lora, positions, bufs):
@@ -1056,12 +1052,9 @@ class DSV4Metadata:
     low_ratio_dense_req_indices: Optional[torch.Tensor] = None
     low_ratio_dense_seq_lens: Optional[torch.Tensor] = None
     prefill_graph_dense_indexer: bool = False
-    # Request layout is shared by every indexer layer at the same ratio. Its
-    # captured kernels replay once per ratio; only the layer-specific K gather
-    # remains in each indexer layer.
-    low_ratio_dense_k_layouts: Dict[int, Tuple[torch.Tensor, torch.Tensor]] = field(
-        default_factory=dict
-    )
+    # Request offsets are shared by every indexer layer at the same ratio. The
+    # captured mapping replays once per ratio; each layer gathers its own K.
+    low_ratio_dense_k_offsets: Dict[int, torch.Tensor] = field(default_factory=dict)
 
     # Per-step scratch for TP-padded query heads, zeroed by the first user.
     # Later layers overwrite real heads and preserve the zero padding.
@@ -3007,16 +3000,7 @@ class DeepseekV4AttnBackend(
                 x_global = x_global[:total]
             self._low_ratio_compress_torch(layer, x_global, req_global, pos_global)
         if run_indexer and layer.indexer is not None:
-            # Small graph buckets keep the existing eager dense indexer. Its K
-            # packing scales with the live request count; the captured dense
-            # path amortizes its fixed eight-request capacity on a full bucket.
-            use_dense_graph = (
-                self._low_ratio_in_prefill_graph()
-                and x.shape[0]
-                >= _PREFILL_GRAPH_DENSE_INDEXER_MAX_REQUESTS
-                * _PREFILL_GRAPH_INDEXER_ROW_CHUNK
-            )
-            if use_dense_graph:
+            if self._low_ratio_in_prefill_graph():
                 # CP-local rows were already reindexed in the captured metadata.
                 q = layer.indexer.queries(q_lora, layer.freqs_cis[positions])
                 w = layer.indexer.head_weights(x)
@@ -3523,6 +3507,7 @@ class DeepseekV4AttnBackend(
 
     def _low_ratio_index_topk_prefill_graph(self, layer, pos, q, w) -> None:
         from sglang.kernels.ops.attention.dsv4.fp4_indexer import (
+            gather_fp4_index_k_cache_masked,
             quantize_fp4_indexer_tensor,
         )
 
@@ -3538,14 +3523,33 @@ class DeepseekV4AttnBackend(
         assert metadata is not None, f"no prefill graph indexer metadata for {ratio = }"
         assert indexer.n_local_heads == indexer.n_heads
         width = metadata.max_compressed_seq_len
+        dense = self.forward_metadata.prefill_graph_dense_indexer
         two_level = (
             width > indexer.candidate_topk_blocks * indexer.candidate_block_size
             and (indexer.is_candidate_source or indexer.uses_candidates)
         )
-        candidate_blocks = [] if two_level and indexer.is_candidate_source else None
+        publish_sparse = dense and two_level and indexer.is_candidate_source
+        candidate_masks = (
+            [] if not dense and two_level and indexer.is_candidate_source else None
+        )
+        sparse_table = None
+        if (
+            dense
+            and two_level
+            and indexer.uses_candidates
+            and not indexer.is_candidate_source
+        ):
+            candidate_metadata = self.forward_metadata.candidate_metadata
+            assert isinstance(candidate_metadata, CapturedPrefillSparseBlockTable), (
+                "captured prefill candidate blocks missing"
+            )
+            sparse_table = candidate_metadata
         consume = (
             published_masks(self.forward_metadata.candidate_metadata).block_mask
-            if two_level and indexer.uses_candidates and candidate_blocks is None
+            if not dense
+            and two_level
+            and indexer.uses_candidates
+            and not indexer.is_candidate_source
             else None
         )
         if consume is not None:
@@ -3564,49 +3568,64 @@ class DeepseekV4AttnBackend(
         page_indices = core.sparse_page_indices(ratio)
         raw_indices = core.sparse_raw_indices(ratio)
         topk = min(indexer.index_topk, width)
-        # CP only enters the dense graph path for a full bucket. Keep the same
-        # guard here so other prefill graph callers retain the paged path.
-        dense = (
-            self.forward_metadata.prefill_graph_dense_indexer
-            and num_tokens
-            >= _PREFILL_GRAPH_DENSE_INDEXER_MAX_REQUESTS
-            * _PREFILL_GRAPH_INDEXER_ROW_CHUNK
-        )
+        page_size = metadata.compressed_page_size
+        ks = None
         if dense:
             req_ids = self.forward_metadata.low_ratio_dense_req_indices
             req_lens = self.forward_metadata.low_ratio_dense_seq_lens
             local_req_ids = self.forward_metadata.low_ratio_local_req_indices
             assert req_ids is not None and req_lens is not None
             assert local_req_ids is not None and local_req_ids.shape[0] == num_tokens
-            # The graph key contains token count but not request count. Rebuild
-            # the contiguous K layout from the replayed eight-slot request data.
-            layout = self.forward_metadata.low_ratio_dense_k_layouts.get(ratio)
-            if layout is None:
-                layout = _prefill_graph_dense_k_layout(
-                    self.req_to_token,
-                    ratio,
+            # The graph key contains token count but not request count. Keep
+            # fixed segment offsets, but gather only each live request's real K
+            # prefix; padded request slots and context suffixes do no memory IO.
+            ks = self.forward_metadata.low_ratio_dense_k_offsets.get(ratio)
+            if ks is None:
+                ks = _prefill_graph_dense_k_offsets(
                     width,
                     local_req_ids,
                     req_ids,
-                    req_lens,
                 )
-                self.forward_metadata.low_ratio_dense_k_layouts[ratio] = layout
-            ks, k_slots = layout
-            k_fp4 = pool.get_low_ratio_index_k_fp4(layer.layer_id, k_slots)
-            q_fp4 = q_fp4.view(num_tokens, num_heads, 64)
-            q_sf = q_sf.view(num_tokens, num_heads)
+                self.forward_metadata.low_ratio_dense_k_offsets[ratio] = ks
+            if sparse_table is None:
+                k_fp4 = gather_fp4_index_k_cache_masked(
+                    pool.get_index_k_with_scale_buffer(layer.layer_id),
+                    self.req_to_token,
+                    req_ids,
+                    req_lens,
+                    width=width,
+                    compress_ratio=ratio,
+                    page_size=page_size,
+                )
+                q_fp4 = q_fp4.view(num_tokens, num_heads, 64)
+                q_sf = q_sf.view(num_tokens, num_heads)
+            else:
+                k_cache = pool.get_index_k_with_scale_buffer(layer.layer_id)
+                assert k_cache.dim() == 2
+                k_cache = k_cache.view(k_cache.shape[0], page_size, 1, 68)
+                q_fp4 = q_fp4.view(num_tokens, 1, num_heads, 64)
+                q_sf = q_sf.view(num_tokens, 1, num_heads)
             row_chunks = [(slice(0, num_tokens), None)]
         else:
             k_cache = pool.get_index_k_with_scale_buffer(layer.layer_id)
             assert k_cache.dim() == 2
-            page_size = metadata.compressed_page_size
             k_cache = k_cache.view(k_cache.shape[0], page_size, 1, 68)
             q_fp4 = q_fp4.view(num_tokens, 1, num_heads, 64)
             q_sf = q_sf.view(num_tokens, 1, num_heads)
             row_chunks = metadata.row_chunks()
 
+        published_sparse = None
         for chunk_index, (rows, plan) in enumerate(row_chunks):
-            if dense:
+            if sparse_table is not None:
+                logits = sparse_logits(
+                    q_fp4[rows],
+                    q_sf[rows],
+                    k_cache,
+                    w[rows].to(torch.bfloat16),
+                    sparse_table,
+                )
+            elif dense:
+                assert ks is not None
                 logits = _dense_fp4_mqa_logits(
                     (q_fp4[rows], q_sf[rows]),
                     k_fp4,
@@ -3625,8 +3644,19 @@ class DeepseekV4AttnBackend(
                     plan,
                     width,
                 )
-            if candidate_blocks is not None:
-                candidate_blocks.append(
+            if publish_sparse:
+                assert ks is not None and local_req_ids is not None
+                published_sparse = captured_prefill_sparse_table(
+                    logits,
+                    lens[rows],
+                    page_table[rows],
+                    page_size,
+                    local_req_ids[rows].to(torch.int32).contiguous(),
+                    indexer.candidate_topk_blocks,
+                    q_fp4.dtype,
+                )
+            elif candidate_masks is not None:
+                candidate_masks.append(
                     select_candidate_block_mask_v2(
                         logits,
                         lens[rows],
@@ -3637,7 +3667,15 @@ class DeepseekV4AttnBackend(
             selected = torch.empty(
                 (logits.shape[0], topk), dtype=torch.int32, device=logits.device
             )
-            if consume is not None:
+            if sparse_table is not None:
+                topk_transform_bf16_small(
+                    logits,
+                    sparse_table.valid_lens[rows],
+                    sparse_table.blocks[rows],
+                    selected,
+                    indexer.candidate_block_size,
+                )
+            elif consume is not None:
                 offsets = ks[rows] if dense else torch.zeros_like(lens[rows])
                 topk_prefill_candidates(
                     logits,
@@ -3648,10 +3686,12 @@ class DeepseekV4AttnBackend(
                     selected,
                 )
                 if dense:
+                    assert ks is not None
                     selected = torch.where(
                         selected >= 0, selected - ks[rows, None], selected
                     )
             elif dense:
+                assert ks is not None
                 topk_transform_ragged_v2(
                     logits,
                     lens[rows],
@@ -3676,7 +3716,12 @@ class DeepseekV4AttnBackend(
             reach = selected != unselected
             idx = selected.clamp_max(width - 1).to(torch.int64)
             if dense:
-                slots = k_slots[ks[rows, None] + idx]
+                slots = (
+                    self.req_to_token[local_req_ids[rows, None], idx * ratio].to(
+                        torch.int64
+                    )
+                    // ratio
+                )
             else:
                 slots = page_table[rows].gather(-1, idx // page_size) * page_size + (
                     idx % page_size
@@ -3686,12 +3731,14 @@ class DeepseekV4AttnBackend(
                 raw_indices[rows, :topk] = torch.where(reach, selected, -1).to(
                     torch.int32
                 )
-        if candidate_blocks is not None:
+        if published_sparse is not None:
+            self.forward_metadata.candidate_metadata = published_sparse
+        elif candidate_masks is not None:
             self.forward_metadata.candidate_metadata = CandidateMasks(
                 block_mask=(
-                    candidate_blocks[0]
-                    if len(candidate_blocks) == 1
-                    else torch.cat(candidate_blocks, dim=0)
+                    candidate_masks[0]
+                    if len(candidate_masks) == 1
+                    else torch.cat(candidate_masks, dim=0)
                 )
             )
 
