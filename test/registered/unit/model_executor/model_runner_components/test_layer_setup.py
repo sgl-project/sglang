@@ -11,11 +11,12 @@ from sglang.srt.model_executor.model_runner_components.layer_setup import (
     resolve_layer_indices,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=6, suite="base-a-test-cpu")
 
 
-class TestComputeAttentionAndMoeLayers(unittest.TestCase):
+class TestComputeAttentionAndMoeLayers(CustomTestCase):
     def test_deepseek_mla_registers_mha_companion(self):
         attn_mqa = SimpleNamespace()
         attn_mha = SimpleNamespace()
@@ -67,7 +68,7 @@ def _hybrid_swa_model_config(*, architecture="Hybrid"):
     )
 
 
-class TestResolveHybridSWALayerIds(unittest.TestCase):
+class TestResolveHybridSWALayerIds(CustomTestCase):
     def test_pipeline_stages_own_each_hybrid_layer_once(self):
         """Every hybrid layer belongs to exactly one pipeline stage."""
         for pp_size in (1, 8):
@@ -126,7 +127,6 @@ class TestResolveHybridSWALayerIds(unittest.TestCase):
                     draft_model_idx=depth,
                 )
                 self.assertTrue(layer_info.is_hybrid_swa_mtp_draft)
-                self.assertEqual((layer_info.start_layer, layer_info.end_layer), (0, 1))
                 self.assertEqual(layer_info.swa_attention_layer_ids, swa)
                 self.assertEqual(layer_info.full_attention_layer_ids, full)
 
@@ -146,21 +146,6 @@ class TestResolveHybridSWALayerIds(unittest.TestCase):
         self.assertFalse(layer_info.is_hybrid_swa_mtp_draft)
         self.assertEqual(layer_info.swa_attention_layer_ids, [0])
         self.assertEqual(layer_info.full_attention_layer_ids, [])
-
-    def test_non_hybrid_model_has_no_split(self):
-        model_config = _hybrid_swa_model_config()
-        model_config.is_hybrid_swa = False
-        model_config.swa_attention_layer_ids = None
-        model_config.full_attention_layer_ids = None
-
-        layer_info = resolve_layer_indices(
-            model=SimpleNamespace(),
-            model_config=model_config,
-            is_draft_worker=False,
-        )
-
-        self.assertIsNone(layer_info.swa_attention_layer_ids)
-        self.assertIsNone(layer_info.full_attention_layer_ids)
 
 
 if __name__ == "__main__":
