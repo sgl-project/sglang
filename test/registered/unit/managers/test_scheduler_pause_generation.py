@@ -1,17 +1,23 @@
 import unittest
+from array import array
 from collections import deque
 from types import SimpleNamespace
-from typing import List, Optional
+from typing import List, Optional, Tuple
 from unittest.mock import MagicMock, patch
+from weakref import WeakKeyDictionary
 
 import torch
 
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import maybe_stub_sgl_kernel
+from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
+from sglang.srt.disaggregation.decode_kvcache_offload_manager import (
+    DecodeKVCacheOffloadManager,
+)
 from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.managers.cache_controller import HiCacheAck
 from sglang.srt.managers.io_struct import (
     ContinueGenerationReqInput,
     PauseGenerationReqInput,
@@ -22,12 +28,21 @@ from sglang.srt.managers.scheduler_components.pool_stats_observer import PoolSta
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.runtime_context import publish, reset_context
 from sglang.srt.sampling.sampling_params import SamplingParams
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 register_cpu_ci(est_time=8, suite="stage-b-test-cpu-intel")
 
 
-class TestSchedulerPauseGeneration(unittest.TestCase):
+class _PendingCopy:
+    def __init__(self):
+        self.done = False
+
+    def synchronize(self):
+        self.done = True
+
+
+class TestSchedulerPauseGeneration(CustomTestCase):
     def setUp(self):
         # The scheduler runs after its process publishes; retraction reads the
         # disaggregation and schedule bags rather than the record it is handed.
@@ -68,6 +83,7 @@ class TestSchedulerPauseGeneration(unittest.TestCase):
         )
         scheduler.disaggregation_mode = DisaggregationMode.NULL
         scheduler.hisparse_coordinator = None
+        scheduler.decode_offload_manager = None
         scheduler.server_args = MagicMock()
         scheduler.waiting_queue = []
         # pause_generation zeros gen_throughput and flushes KV events.
@@ -123,6 +139,57 @@ class TestSchedulerPauseGeneration(unittest.TestCase):
 
         scheduler._add_request_to_queue = MagicMock(side_effect=record)
         return requeue_log
+
+    def _decode_req_with_pending_offload(
+        self, scheduler: Scheduler
+    ) -> Tuple[Req, List[Tuple[str, bool]]]:
+        req = Req(
+            rid="run",
+            origin_input_text="",
+            origin_input_ids=array("q", [1, 2, 3]),
+            sampling_params=SamplingParams(),
+        )
+        req.output_ids.extend([4, 5, 6])
+        req.kv.req_pool_idx = 0
+        req.kv.kv_committed_len = 5
+        req.kv.kv_allocated_len = 6
+
+        copy = _PendingCopy()
+        controller = MagicMock(ack_write_queue=[])
+        controller.ack_backup_queue.qsize.return_value = 0
+
+        def write(device_indices, node_id):
+            controller.ack_write_queue.append(HiCacheAck(None, copy, [node_id]))
+            return torch.arange(len(device_indices))
+
+        controller.write.side_effect = write
+
+        manager = object.__new__(DecodeKVCacheOffloadManager)
+        manager.req_to_token_pool = SimpleNamespace(
+            req_to_token=torch.arange(8).unsqueeze(0)
+        )
+        manager.page_size = 1
+        manager.offload_stride = 1
+        manager.request_counter = 0
+        manager.tp_world_size = 1
+        manager.cache_controller = controller
+        manager.decode_host_mem_pool = MagicMock()
+        manager.ongoing_offload = {}
+        manager.ongoing_backup = {}
+        manager.offloaded_state = WeakKeyDictionary()
+        manager.offload_inflight = WeakKeyDictionary()
+        self.assertTrue(manager.offload_kv_cache(req))
+        scheduler.decode_offload_manager = manager
+
+        frees: List[Tuple[str, bool]] = []
+
+        def free_kv_row(released_req, **kwargs):
+            frees.append((released_req.rid, copy.done))
+            released_req.kv.req_pool_idx = None
+            released_req.kv.mark_kv_released()
+
+        scheduler.tree_cache.cache_finished_req.side_effect = free_kv_row
+        return req, frees
 
     def test_inplace_only_sets_flag(self):
         """in_place pause should only set _engine_paused and return."""
@@ -491,6 +558,42 @@ class TestSchedulerPauseGeneration(unittest.TestCase):
         # the device->host KV offload rather than offload-then-delete it.
         mock_retract_all.assert_called_once()
         self.assertEqual(mock_retract_all.call_args.kwargs["offload_kv"], False)
+
+    def test_pd_decode_retract_completes_offload_before_free(self):
+        """PD decode retract must not free KV an offload copy is still reading, and
+        must not leave offload acks that keep the paused engine from going idle."""
+        scheduler = self._new_scheduler()
+        scheduler.disaggregation_mode = DisaggregationMode.DECODE
+        scheduler.disagg_decode_prealloc_queue = MagicMock()
+        req, frees = self._decode_req_with_pending_offload(scheduler)
+        scheduler.running_batch = self._make_batch(
+            scheduler, reqs=[req], with_tensors=True
+        )
+
+        scheduler.pause_generation(PauseGenerationReqInput(mode="retract"))
+
+        self.assertEqual(frees, [("run", True)])
+        self.assertEqual(scheduler.decode_offload_manager.ongoing_offload, {})
+
+    def test_kv_full_retract_completes_offload_before_free(self):
+        """A KV-full retract that aborts the last decode request must not free KV an
+        offload copy is still reading."""
+        scheduler = self._new_scheduler()
+        req, frees = self._decode_req_with_pending_offload(scheduler)
+        batch = self._make_batch(
+            scheduler, reqs=[req], forward_mode=ForwardMode.DECODE, with_tensors=True
+        )
+        batch.spec_algorithm = SpeculativeAlgorithm.NONE
+        scheduler.token_to_kv_pool_allocator.page_size = 1
+        scheduler.token_to_kv_pool_allocator.check_decode_capacity.return_value = False
+        scheduler.tree_cache.req_to_token_pool.mamba_allocator = None
+        scheduler.new_token_ratio_tracker = SimpleNamespace(current=1.0)
+        scheduler.ipc_channels = MagicMock()
+        scheduler.beam_coordinator = MagicMock()
+
+        scheduler.update_running_batch(batch)
+
+        self.assertEqual(frees, [("run", True)])
 
     def test_pd_decode_continue_releases_held_rebootstrap(self):
         """continue_generation must enqueue staged rebootstrap reqs on resume."""
