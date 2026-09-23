@@ -2023,6 +2023,17 @@ class DeepseekV4AscendAttnBackend(
             f"kv={_h(getattr(fm, 'actual_seq_lengths_kv', None))}",
             flush=True,
         )
+        if os.environ.get("DSV4_DUMP_META_VALS"):
+            # Page ids legitimately differ on a hit (prefix from cache, suffix
+            # freshly allocated), so the hashes alone cannot tell a benign
+            # remap from a wrong window; this prints the mapping itself.
+            swa_t = getattr(fm, "swa_page_table", None)
+            row = swa_t[0].tolist() if torch.is_tensor(swa_t) and swa_t.dim() >= 2 else []
+            print(
+                f"[METAV] start_pos={_l(getattr(fm, 'start_pos', None))} "
+                f"swa_len={len(row)} swa_row0={row}",
+                flush=True,
+            )
 
     def _compute_kernel_metadata(self, forward_batch: ForwardBatch) -> dict:
         fm = self.forward_metadata
