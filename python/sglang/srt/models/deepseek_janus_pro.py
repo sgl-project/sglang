@@ -1093,7 +1093,7 @@ def create_siglip_vit(
     return model
 
 
-class Normalize(torch.nn.Module):
+class ImageNormalize(torch.nn.Module):
     """Normalize a tensor image with mean and standard deviation.
     This transform does not support PIL Image.
     Given mean: ``(mean[1],...,mean[n])`` and std: ``(std[1],..,std[n])`` for ``n``
@@ -1164,7 +1164,7 @@ class CLIPVisionTower(nn.Module):
         )
 
         if pixel_mean is not None and pixel_std is not None:
-            image_norm = Normalize(mean=pixel_mean, std=pixel_std)
+            image_norm = ImageNormalize(mean=pixel_mean, std=pixel_std)
         else:
             image_norm = None
 
