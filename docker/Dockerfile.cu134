@@ -6,10 +6,10 @@ ARG TORCHVISION_NIGHTLY_VERSION=0.30.0.dev20260819+cu134
 ARG TORCHAUDIO_NIGHTLY_VERSION=2.11.0.dev20260818+cu134
 # Wheel build args
 ARG MANYLINUX_IMAGE=pytorch/manylinuxaarch64-builder:cuda13.4
-ARG DEEPGEMM_REF=dev
+ARG DEEPGEMM_REF=v0.2.0
 ARG DEEPEP_SOURCE_REF=sgl-deepep
 ARG DEEPEP_PACKAGING_REF=sgl-deepep-packaging
-ARG SGL_DEEP_EP_VERSION=0.1.0
+ARG SGL_DEEP_EP_VERSION=0.1.2
 
 ARG CUDA_VERSION=13.4.1
 FROM nvidia/cuda:${CUDA_VERSION}-cudnn-devel-ubuntu24.04 AS base
@@ -17,9 +17,9 @@ FROM nvidia/cuda:${CUDA_VERSION}-cudnn-devel-ubuntu24.04 AS base
 ARG TARGETARCH
 ARG BUILD_TYPE=all
 ARG BRANCH_TYPE=remote
-ARG SGL_KERNEL_VERSION=0.4.6.post1
+ARG SGL_KERNEL_VERSION=0.4.7
 ARG SGL_VERSION
-ARG SGL_DEEP_GEMM_VERSION=0.1.5.post2
+ARG SGL_DEEP_GEMM_VERSION=0.2.0
 ARG USE_LATEST_SGLANG=0
 ARG GDRCOPY_VERSION=2.5.1
 ARG SGL_NCCL_VERSION=2.30.7
@@ -279,7 +279,7 @@ RUN --mount=type=cache,id=cu134-sgl-kernel-ccache,target=/ccache \
 FROM cu134_wheel_base AS cu134_wheel_deepgemm
 
 ARG DEEPGEMM_REF
-ARG SGL_DEEP_GEMM_VERSION=0.1.5.post2
+ARG SGL_DEEP_GEMM_VERSION=0.2.0
 ARG TVM_FFI_VERSION=0.1.11
 
 # DeepJIT's exception handling requires elfutils/libdwfl.h and libelf headers.
@@ -298,8 +298,6 @@ COPY scripts/rename_sgl_deep_gemm_whl.sh /rename_sgl_deep_gemm_whl.sh
 RUN --mount=type=cache,id=cu134-wheels-pip,target=/root/.cache/pip \
     set -eux; \
     cd /deepgemm; \
-    sed -i "s/'-std=c++17'/'-std=c++20'/g" \
-        build_sgl_deep_gemm.sh setup.py sgl_deep_gemm/__init__.py; \
     printf '%s' "${SGL_DEEP_GEMM_VERSION}" > sgl_deep_gemm/VERSION; \
     bash build_sgl_deep_gemm.sh; \
     bash /rename_sgl_deep_gemm_whl.sh dist cu134 "$(uname -m)"; \
@@ -342,7 +340,6 @@ RUN git clone --recursive --depth 1 --branch "${DEEPEP_SOURCE_REF}" \
 
 RUN set -eux; \
     printf '%s' "${SGL_DEEP_EP_VERSION}" > /deepep-packaging/sgl_deep_ep/VERSION; \
-    sed -i 's/"-std=c++17"/"-std=c++20"/g' /deepep-source/setup.py; \
     ${PYTHON_ROOT_PATH}/bin/python - <<'PY'
 import pathlib
 p = pathlib.Path("/deepep-packaging/sgl_deep_ep/build_sgl_deep_ep.sh")
