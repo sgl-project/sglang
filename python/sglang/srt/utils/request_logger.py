@@ -30,10 +30,11 @@ logger = logging.getLogger(__name__)
 
 
 class ModelOutputTrace:
-    """解析前原始输出，仅在 SGLANG_ENABLE_MODEL_OUTPUT_LOGGING=1 时记录。
+    """Record raw pre-parser output only with SGLANG_ENABLE_MODEL_OUTPUT_LOGGING=1.
 
-    内容包含 reasoning 和工具参数，并非脱敏日志；输出目录由
-    SGLANG_MODEL_OUTPUT_TRACE_DIR 配置。普通请求日志沿用原有开关。
+    The output includes reasoning and tool arguments and is not redacted.
+    SGLANG_MODEL_OUTPUT_TRACE_DIR selects the destination. Standard request
+    logging retains its independent controls.
     """
 
     def __init__(self, targets: List[logging.Logger], model: str):

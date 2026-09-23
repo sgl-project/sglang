@@ -130,14 +130,14 @@ def mask_literals(text: str, *, heredocs: bool = False) -> str:
 
 
 def reasoning_boundary_suffix_start(text: str, *, at_line_start: bool) -> int:
-    """只暂存行尾可能跨分片的协议闭合标签，等待确认 reasoning 边界。"""
+    """Hold closing-tag-like line suffixes, including tags split across chunks."""
     prefix = "" if at_line_start else "x"
     match = _REASONING_SUFFIX.search(prefix + text.replace("\r", "\n"))
     return match.start("tail") - len(prefix) if match else len(text)
 
 
 def strip_orphan_reasoning_suffix(text: str, suffix_start: int) -> str:
-    """仅在已确认的边界尾部去掉未配对、未引用的协议闭合标签。"""
+    """Remove unpaired, unquoted control closers only at a confirmed boundary."""
     visible = re.sub(
         r"<!--.*?(?:-->|\Z)|<!\[CDATA\[.*?(?:\]\]>|\Z)",
         lambda match: re.sub(r"[^\r\n]", " ", match.group()),

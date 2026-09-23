@@ -1654,7 +1654,7 @@ class DeepSeekV4Detector(BaseReasoningFormatDetector):
         )
 
     def finish(self) -> StreamingParseResult:
-        # 未确认 reasoning 闭合时，EOF 必须原样释放暂存片段。
+        # Without a confirmed reasoning end, flush held text unchanged at EOF.
         if self._reasoning_suffix:
             self._buffer = self._reasoning_suffix + self._buffer
             self._reasoning_suffix = ""

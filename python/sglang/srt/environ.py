@@ -1462,7 +1462,7 @@ class Envs:
     SGLANG_DSV4_REJECT_REASONING_MARKERS_IN_TOOL_ARGS = EnvBool(False)
     # Opt-in lexical gate, including quoted examples, for tool-parser output.
     SGLANG_DSV4_REJECT_PROTOCOL_MARKERS = EnvBool(False)
-    # 原始模型输出可能含敏感内容；仅配置目录不会开启采集。
+    # Raw model output may be sensitive; a directory alone does not enable logging.
     SGLANG_ENABLE_MODEL_OUTPUT_LOGGING = EnvBool(False)
     SGLANG_MODEL_OUTPUT_TRACE_DIR = EnvStr("")
     # Quantize the SWA fp8 KV cache from bf16-rounded values (matches

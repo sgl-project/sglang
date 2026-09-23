@@ -168,10 +168,11 @@ class DeepSeekV4Detector(DeepSeekV32Detector):
     markers and bare protocol closers in normal tool-parser content and tool
     names/arguments. This strict-only, default-off policy also rejects quoted
     protocol examples rather than silently deleting or rewriting their bytes.
-    此 gate 不扫描独立 reasoning 通道；启用同一开关的 reasoning parser
-    仅在明确的 </think> 边界清理独立行尾未配对的裸协议闭合标签。
-    不处理行内示例、引用、成对 XML、未闭合 EOF 或工具中断边界，
-    因此不能视为任意 reasoning 内容均无协议标记的保证。
+    This gate does not inspect the separate reasoning channel. With the same
+    flag enabled, the reasoning parser only removes unpaired bare control
+    closers on trailing lines at an explicit </think> boundary. It preserves
+    inline examples, quoted or balanced XML, truncated reasoning at EOF, and
+    tool interruptions. It therefore does not guarantee marker-free reasoning.
 
     Reference: DeepSeek V4 format specification
     """
