@@ -116,11 +116,15 @@ RGBA alpha output from a local checkpoint:
 ```bash
 export SGLANG_QWEN_IMAGE21_TEST_MODEL=/models/Qwen-Image-2.1
 export SGLANG_QWEN_IMAGE21_TEST_IMAGE=/path/to/reference.png
+export SGLANG_GEN_BASELINE=1
 python -m pytest -q python/sglang/multimodal_gen/test/server/test_server_qwen_image21.py
 ```
 
 The module skips without the model variable; only editing skips when the image
-variable is absent. Credentials stay in the runner environment.
+variable is absent. The server harness validates every case against a scenario
+in `test/server/perf_baselines/<platform>.json`, and these opt-in cases have
+none, so `SGLANG_GEN_BASELINE=1` records their measurements instead of failing
+on the missing scenario. Credentials stay in the runner environment.
 
 ## Supported model inventory
 
