@@ -1,3 +1,4 @@
+import inspect
 import logging
 
 from sglang.srt.environ import envs
@@ -15,7 +16,44 @@ def patch_tokenizer(tokenizer):
         )
         return _SpecialTokensCachePatcher.patch(tokenizer)
 
+    if _needs_pad_padding_side_shim(tokenizer):
+        logger.info(
+            f"Applying _pad(padding_side=...) compat shim for {type(tokenizer)} "
+            "(custom remote-code tokenizer's _pad() override predates "
+            "transformers passing padding_side to it)"
+        )
+        return _PadPaddingSideShim.patch(tokenizer)
+
     return tokenizer
+
+
+def _needs_pad_padding_side_shim(tokenizer) -> bool:
+    """
+    Some custom remote-code tokenizers (e.g. zai-org/chatglm2-6b's
+    ChatGLMTokenizer, unchanged for years -- see tokenization_chatglm.py's
+    own _pad() override) declare a fixed _pad() signature with no
+    padding_side parameter and no **kwargs catch-all, predating a newer
+    transformers version's PreTrainedTokenizerBase.pad() always forwarding
+    padding_side down to _pad(). Every tokenizer.encode()/pad() call then
+    raises "TypeError: <Tokenizer>._pad() got an unexpected keyword argument
+    'padding_side'" -- not an sglang bug, a real installed-transformers-
+    version vs custom-tokenizer mismatch that breaks EVERY generation
+    request for that model regardless of memory/backend settings (confirmed:
+    SGLANGT-1689, chatglm2-6b). Detected structurally via inspect rather
+    than a name/class check, so any other custom tokenizer with the same
+    stale-signature bug is covered too, not just this one model.
+    """
+    pad_fn = getattr(type(tokenizer), "_pad", None)
+    if pad_fn is None:
+        return False
+    try:
+        sig = inspect.signature(pad_fn)
+    except (TypeError, ValueError):
+        return False
+    params = sig.parameters
+    if "padding_side" in params:
+        return False
+    return not any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
 
 
 def unpatch_tokenizer(tokenizer):
@@ -38,6 +76,38 @@ def decode_without_hf_kwargs(tokenizer, token_ids, skip_special_tokens):
             special_ids_set = set(special_ids)
             token_ids = [tid for tid in token_ids if tid not in special_ids_set]
     return tokenizer.decode(token_ids)
+
+
+class _PadPaddingSideShim:
+    """
+    Wraps a stale custom _pad() override (see _needs_pad_padding_side_shim's
+    docstring) so it tolerates the padding_side kwarg newer transformers
+    versions always pass -- dropped before delegating to the original
+    _pad(), which already reads self.padding_side directly (the standard
+    HF tokenizer instance attribute), so behavior is unchanged from before
+    transformers started passing it explicitly.
+    """
+
+    _PATCHED_FLAG = "_sglang_pad_padding_side_patched"
+
+    @classmethod
+    def patch(cls, tokenizer):
+        tokenizer_cls = type(tokenizer)
+
+        if getattr(tokenizer_cls, cls._PATCHED_FLAG, False):
+            return tokenizer
+
+        original_pad = tokenizer_cls._pad
+
+        def patched_pad(self, *args, **kwargs):
+            kwargs.pop("padding_side", None)
+            return original_pad(self, *args, **kwargs)
+
+        tokenizer_cls._original_pad = original_pad
+        tokenizer_cls._pad = patched_pad
+        setattr(tokenizer_cls, cls._PATCHED_FLAG, True)
+
+        return tokenizer
 
 
 class _SpecialTokensCachePatcher:
