@@ -1,0 +1,193 @@
+---
+title: Semantic decisions with SemIf
+sidebarTitle: SemIf
+description: Run SemIf's direct candidate scoring with SGLang, without generating answer tokens.
+---
+
+[SemIf](https://github.com/TheoLeeCJ/SemIf) turns a state, a question, and a set of
+options into conditional option probabilities. It uses an existing language model,
+not a separate SemIf checkpoint. This recipe serves `Qwen/Qwen3.5-4B` with SGLang
+and reuses SemIf's official prompt encoder on the client.
+
+## Prerequisites
+
+- Linux and an NVIDIA CUDA GPU with room for the BF16 model and runtime cache.
+  This recipe uses one GPU, with tensor and data parallelism both set to 1.
+- Python 3.10 or newer and a [source installation](/docs/get-started/install#method-2-from-source)
+  of SGLang containing per-item candidate scoring, `temperature`, and
+  `return_token_logprobs`. Follow the installation guide for CUDA requirements.
+- Separate server and client Python environments. The client only needs the
+  tokenizer and prompt encoder, not a second copy of the model weights.
+
+The checkpoint is public; this recipe does not require `HF_TOKEN` or an API key.
+The server binds to localhost. See [server arguments](/docs/advanced_features/server_arguments)
+before exposing it remotely.
+
+<Note>
+  While this feature is unreleased, use the source from
+  [PR #40826](https://github.com/sgl-project/sglang/pull/40826), not a released wheel.
+  The commands below assume that checkout is at `/path/to/sglang`.
+</Note>
+
+## Start the server
+
+In your SGLang server environment, run:
+
+```bash
+python -m sglang.launch_server \
+  --model-path Qwen/Qwen3.5-4B \
+  --revision 851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a \
+  --dtype bfloat16 \
+  --context-length 8192 \
+  --tp-size 1 --dp-size 1 \
+  --host 127.0.0.1 --port 30000
+```
+
+Keep this process running. In another terminal, wait until the health check succeeds:
+
+```bash
+curl --fail http://127.0.0.1:30000/health
+```
+
+Use the same model revision on the server and client. The client's `--revision`
+selects its tokenizer; it does not change the server's loaded checkpoint.
+
+## Set up the client
+
+Create a separate working directory and environment, then pin the SemIf source:
+
+```bash
+mkdir semif-sglang-client
+cd semif-sglang-client
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install 'transformers==5.12.1' 'jinja2>=3.1.0' requests
+
+git clone https://github.com/TheoLeeCJ/SemIf.git
+git -C SemIf checkout 1f2dea3e25379f9dfc98cb83c324f00ab5deda37
+python -m pip install --no-deps -e ./SemIf
+```
+
+`--no-deps` is intentional: this client imports only SemIf's prompt encoder and
+uses SGLang for inference. It does not install SemIf's native inference stack or
+support running its native `semif-score` command in this environment.
+
+## Score decisions
+
+Run the client included in the SGLang checkout against SemIf's example JSONL:
+
+```bash
+python /path/to/sglang/examples/runtime/semantic_scoring/semif.py \
+  --base-url http://127.0.0.1:30000 \
+  --model Qwen/Qwen3.5-4B \
+  --revision 851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a \
+  --input SemIf/examples/decisions.jsonl \
+  --output decisions-sglang.jsonl \
+  --batch-size 32 --max-tokens 4096 --temperature 1.0
+```
+
+Choose a new output filename on each run; the client refuses to overwrite existing
+results. `--max-tokens` limits each encoded prompt, including the template and
+options. Overlong inputs are rejected, not truncated.
+
+For your own workload, supply one JSON object per line with this shape:
+
+```json
+{"id":"route-1","state":"The customer was charged twice for one subscription.","question":"Which team should handle the request?","options":[{"id":"billing","description":"Payment and invoice support."},{"id":"access","description":"Account access support."},{"id":"unknown","description":"The evidence is insufficient to route the request."}]}
+```
+
+SemIf accepts 2–16 options per row. `state` may be a nonempty string, object, or
+array. Its encoder applies the model's chat template with thinking disabled and
+checks that each answer slot is one token at the answer boundary. Do not apply
+another chat template on the server.
+
+Read the selected option without parsing generated text:
+
+```python
+import json
+
+with open("decisions-sglang.jsonl") as results:
+    for line in results:
+        row = json.loads(line)
+        choices = list(zip(row["option_ids"], row["probabilities"], strict=True))
+        option_id, probability = max(choices, key=lambda choice: choice[1])
+        print(row["id"], option_id, probability)
+```
+
+Results also contain `token_logprobs`, `prompt_sha256`, `prompt_version`,
+`input_tokens`, and `temperature`. Input row order and option order are preserved.
+
+## Use the scoring API directly
+
+The example client sends this request after calling SemIf's encoder. You can use
+the same interface with another model or prompt format; SGLang does not hardcode
+SemIf's template or answer letters.
+
+```python
+import json
+
+import requests
+from semif_phase1.direct import encode_prompt
+from transformers import AutoTokenizer
+
+model = "Qwen/Qwen3.5-4B"
+revision = "851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a"
+tokenizer = AutoTokenizer.from_pretrained(model, revision=revision)
+with open("SemIf/examples/decisions.jsonl") as inputs:
+    rows = [json.loads(line) for line in inputs if line.strip()]
+encoded = [encode_prompt(tokenizer, row, 4096) for row in rows]
+
+response = requests.post(
+    "http://127.0.0.1:30000/v1/score",
+    json={
+        "model": model,
+        "query": [],
+        "items": [ids for ids, _, _ in encoded],
+        "label_token_ids": [slots for _, slots, _ in encoded],
+        "apply_softmax": True,
+        "temperature": 1.0,
+        "return_token_logprobs": True,
+    },
+    timeout=300,
+)
+response.raise_for_status()
+print(response.json()["scores"])
+```
+
+`query=[]` means each tokenized item is already a complete prompt. Nested
+`label_token_ids` allows different candidate counts and order per item; a flat list
+shares the same candidates across the batch. `Engine.score` and `Engine.async_score`
+accept the same scoring fields without HTTP.
+
+## Probabilities and calibration
+
+- With `apply_softmax=True`, each row is `softmax(candidate_logits / temperature)`.
+  It sums to 1 over the supplied options, not the whole vocabulary.
+- `token_logprobs` contains the original full-vocabulary logprobs at those token
+  IDs. These are not raw logits and are not temperature-scaled. Applying softmax
+  to `token_logprobs / temperature` recovers the same candidate probabilities.
+- Without `apply_softmax`, causal-LM scores remain vocabulary probabilities.
+  A non-unit temperature requires `apply_softmax=True`.
+
+Pass a positive, finite `--temperature` fitted on held-out data from your workload.
+The client applies it but does not fit it. Temperature alone does not change argmax
+for fixed logits. Conditional option probability is not a guarantee that the
+decision is correct; validate any confidence threshold or abstention policy.
+
+## Scope and limitations
+
+- This is an adapter for SemIf's **direct scoring** workflow, not a registered
+  backend in SemIf's CLI. It preserves the official prompt encoder and option
+  mapping, but its output is not a drop-in replacement for SemIf's complete schema:
+  in particular, `token_logprobs` must not be relabeled as `option_logits`.
+- Scoring uses `max_new_tokens=0`; no answer tokens are generated. Candidate
+  answers must each occupy one token. Multi-token answer scoring is not included.
+- Existing scheduling and prefix caching still apply. A cold batch of prompts with
+  the same state does not guarantee a single shared prefill. SemIf's explicit
+  shared-state prefill/fan-out mode is not implemented by this adapter. Do not add
+  `--enable-mis` to this recipe: packed MIS scoring is a different execution mode.
+- Match checkpoint revision, dtype, input order, and batching when comparing with
+  a reference. Check prompt hashes and option IDs before comparing probabilities;
+  BF16 kernels and cache execution can change close decisions. No speedup or
+  bitwise Hugging Face equivalence is claimed here.

@@ -1212,6 +1212,12 @@
             "pages": [
               "cookbook/intro",
               {
+                "group": "Semantic Scoring",
+                "pages": [
+                  "cookbook/semantic-scoring/semif"
+                ]
+              },
+              {
                 "group": "Autoregressive Models",
                 "pages": [
                   "cookbook/autoregressive/intro",

@@ -49,6 +49,10 @@ generic switch for shared-state branching.
 
 ## SemIf client
 
+See the [SemIf cookbook](../../../docs/cookbook/semantic-scoring/semif.mdx) for
+client setup, JSONL inputs, result handling, and direct HTTP usage. This is a
+direct-scoring adapter, not a backend registered in SemIf's CLI.
+
 Run a current SGLang server on NVIDIA CUDA/Linux, using the same model revision
 and dtype as the reference. This example uses one GPU and BF16:
 
