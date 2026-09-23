@@ -38,6 +38,9 @@ from pathlib import Path
 
 import requests
 
+sys.path.insert(0, str(Path(__file__).parent))
+import comfyui_adapter  # noqa: E402  (same-directory helper, not an installed package)
+
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
@@ -208,11 +211,28 @@ def _build_lightx2v_cmd(case: dict, fw_cfg: dict, port: int) -> list[str]:
     return cmd
 
 
+def _build_comfyui_cmd(case: dict, fw_cfg: dict, port: int) -> list[str]:
+    """Launch headless ComfyUI from its own checkout.
+
+    Warn rather than inject when the precision flags are absent: without them
+    ComfyUI casts the text encoder to fp16, so the run stops being the
+    lossless comparison even though everything else matches.
+    """
+    missing = comfyui_adapter.describe_parity(fw_cfg)
+    if missing:
+        print(
+            f"  WARNING: ComfyUI case {case['id']} omits {' '.join(missing)}; "
+            "this is not a bf16-parity comparison"
+        )
+    return comfyui_adapter.build_launch_cmd(fw_cfg, port, DEFAULT_HOST)
+
+
 def build_server_cmd(framework: str, case: dict, fw_cfg: dict, port: int) -> list[str]:
     builders = {
         "sglang": _build_sglang_cmd,
         "vllm-omni": _build_vllm_cmd,
         "lightx2v": _build_lightx2v_cmd,
+        "comfyui": _build_comfyui_cmd,
     }
     builder = builders.get(framework)
     if builder is None:
@@ -229,6 +249,7 @@ HEALTH_ENDPOINTS = {
     "sglang": "/health",
     "vllm-omni": "/health",
     "lightx2v": "/v1/service/status",
+    "comfyui": comfyui_adapter.HEALTH_ENDPOINT,
 }
 
 
@@ -712,12 +733,17 @@ def send_request(
     framework: str = "sglang",
     config: dict | None = None,
     perf_dump_path: str | None = None,
+    fw_cfg: dict | None = None,
 ) -> float:
     config = config or {}
     if framework == "vllm-omni":
         return send_request_vllm_omni(base_url, case, config)
     elif framework == "lightx2v":
         return send_request_lightx2v(base_url, case, config)
+    elif framework == "comfyui":
+        return comfyui_adapter.send_request(
+            base_url, case, fw_cfg or {}, config, REQUEST_TIMEOUT
+        )
     # SGLang — use OpenAI-compatible endpoints with optional perf log
     task = case["task"]
     if case.get("reference_image"):
@@ -877,7 +903,12 @@ def run_single(
                 f"{measurement_repeats}..."
             )
             latency = send_request(
-                base_url, case, framework, config, perf_dump_path=perf_dump_path
+                base_url,
+                case,
+                framework,
+                config,
+                perf_dump_path=perf_dump_path,
+                fw_cfg=fw_cfg,
             )
             latency_samples.append(round(latency, 3))
 

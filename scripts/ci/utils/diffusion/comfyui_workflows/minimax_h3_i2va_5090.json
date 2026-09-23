@@ -1,0 +1,113 @@
+{
+  "_comment": [
+    "MiniMax-H3 image-to-video+audio, API-format graph for the consumer-GPU case.",
+    "Unpruned bf16 weights only: the shipped pruned/int8 checkpoint plus the NVFP4",
+    "text encoder is not the path SGLang runs, so it cannot answer a lossless",
+    "comparison. Launch flags must carry --bf16-text-enc --bf16-unet.",
+    "Sampler, sigma shift, steps, cfg and seed mirror the SGLang case; see",
+    "comfyui_adapter.validate_workflow, which checks every class and input",
+    "against the server's /object_info before this graph is submitted.",
+    "SaveWEBM rather than SaveVideo: the latter's codec input is a dynamic combo",
+    "that rejects a plain string in API format."
+  ],
+  "1": {
+    "class_type": "UNETLoader",
+    "inputs": {
+      "unet_name": "${unet_name}",
+      "weight_dtype": "default"
+    }
+  },
+  "2": {
+    "class_type": "CLIPLoader",
+    "inputs": {
+      "clip_name": "${clip_name}",
+      "type": "minimax"
+    }
+  },
+  "3": {
+    "class_type": "VAELoader",
+    "inputs": {
+      "vae_name": "${video_vae_name}"
+    }
+  },
+  "4": {
+    "class_type": "VAELoader",
+    "inputs": {
+      "vae_name": "${audio_vae_name}"
+    }
+  },
+  "5": {
+    "class_type": "LoadImage",
+    "inputs": {
+      "image": "${image_path}",
+      "upload": "image"
+    }
+  },
+  "6": {
+    "class_type": "CLIPTextEncode",
+    "inputs": {
+      "text": "${prompt}",
+      "clip": ["2", 0]
+    }
+  },
+  "7": {
+    "class_type": "CLIPTextEncode",
+    "inputs": {
+      "text": "${negative_prompt}",
+      "clip": ["2", 0]
+    }
+  },
+  "8": {
+    "class_type": "MiniMaxH3ImageToVideo",
+    "inputs": {
+      "positive": ["6", 0],
+      "negative": ["7", 0],
+      "vae": ["3", 0],
+      "start_image": ["5", 0],
+      "width": ${width},
+      "height": ${height},
+      "length": ${num_frames},
+      "batch_size": 1
+    }
+  },
+  "9": {
+    "class_type": "MiniMaxH3SigmaShift",
+    "inputs": {
+      "model": ["1", 0],
+      "video_shift": ${video_sigma_shift},
+      "audio_shift": ${audio_sigma_shift}
+    }
+  },
+  "10": {
+    "class_type": "KSampler",
+    "inputs": {
+      "model": ["9", 0],
+      "positive": ["8", 0],
+      "negative": ["8", 1],
+      "latent_image": ["8", 2],
+      "seed": ${seed},
+      "steps": ${steps},
+      "cfg": ${cfg},
+      "sampler_name": "euler_ancestral",
+      "scheduler": "normal",
+      "denoise": 1.0
+    }
+  },
+  "11": {
+    "class_type": "VAEDecode",
+    "inputs": {
+      "samples": ["10", 0],
+      "vae": ["3", 0]
+    }
+  },
+  "12": {
+    "class_type": "SaveWEBM",
+    "inputs": {
+      "images": ["11", 0],
+      "filename_prefix": "bench/minimax_h3",
+      "codec": "vp9",
+      "fps": ${fps},
+      "crf": 32
+    }
+  }
+}
