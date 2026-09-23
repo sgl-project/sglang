@@ -101,7 +101,7 @@ class TestNPUMiMoV2_5_Pro_W4A8_8P_A5_HLE(TestNpuAccuracyTestCaseBase):
         }
     }
     eval_batch_size = 5
-    limit = 1
+    limit = 3
     generation_config = {
         "temperature": 0,
         "parallel_tool_calls": True,
