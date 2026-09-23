@@ -10,7 +10,7 @@ from sglang.kernels.ops.sampling.textseal_selector import (
     prepare_watermark_contexts_triton,
     select_watermark_tokens_triton,
 )
-from sglang.srt.sampling.watermark import (
+from sglang.srt.sampling.watermarking.core import (
     WatermarkState,
     _dual_key_a_mask_torch,
     _hash_contexts,

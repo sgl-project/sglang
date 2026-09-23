@@ -7,10 +7,12 @@ from typing import TYPE_CHECKING, Any, Optional, Sequence
 import msgspec
 import torch
 
-from sglang.srt.sampling.watermark_config import (
+from sglang.srt.sampling.watermarking.config import (
+    MAX_WATERMARKED_CONTEXTS_PER_REQUEST,
     WatermarkServerConfig,
     parse_watermark_key,
 )
+from sglang.srt.sampling.watermarking.detector import hash_context
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import ScheduleBatch
@@ -19,7 +21,6 @@ if TYPE_CHECKING:
 
 _MASK32 = 0xFFFFFFFF
 _UINT32_SCALE = float(1 << 32)
-_MAX_WATERMARKED_CONTEXTS_PER_REQUEST = 4096
 
 
 def redact_watermark_secrets(value: Any, *, in_watermark_config: bool = False) -> Any:
@@ -295,24 +296,6 @@ def _fmix32(value: torch.Tensor) -> torch.Tensor:
     return value ^ (value >> 16)
 
 
-def _hash_context_token_ids(token_ids: Sequence[int]) -> int:
-    state = 0
-    for token_id in token_ids:
-        value = (int(token_id) * 0xCC9E2D51) & _MASK32
-        value = ((value << 15) | (value >> 17)) & _MASK32
-        value = (value * 0x1B873593) & _MASK32
-        state ^= value
-        state = ((state << 13) | (state >> 19)) & _MASK32
-        state = (state * 5 + 0xE6546B64) & _MASK32
-    state ^= len(token_ids) * 4
-    state ^= state >> 16
-    state = (state * 0x85EBCA6B) & _MASK32
-    state ^= state >> 13
-    state = (state * 0xC2B2AE35) & _MASK32
-    state ^= state >> 16
-    return state
-
-
 def _as_signed_int32(value: int) -> int:
     return value if value < (1 << 31) else value - (1 << 32)
 
@@ -538,7 +521,7 @@ class WatermarkState:
         self.enforce_all = enforce_all
         self.context_window = context_window
         history_capacity = min(
-            max_contexts_per_req, _MAX_WATERMARKED_CONTEXTS_PER_REQUEST
+            max_contexts_per_req, MAX_WATERMARKED_CONTEXTS_PER_REQUEST
         )
         self.token_ids = torch.zeros(
             (max_num_reqs, context_window), dtype=torch.int32, device=device
@@ -681,7 +664,7 @@ class WatermarkState:
                 context = token_ids[max(0, position - context_window) : position]
                 if not context:
                     continue
-                context_hash = _hash_context_token_ids(context)
+                context_hash = hash_context(context)
                 if context_hash in seen:
                     continue
                 seen.add(context_hash)

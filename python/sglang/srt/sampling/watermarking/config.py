@@ -13,6 +13,7 @@ logger = logging.getLogger(__name__)
 
 _MAX_CONFIG_BYTES = 4096
 MAX_WATERMARK_CONTEXT_WINDOW = 64
+MAX_WATERMARKED_CONTEXTS_PER_REQUEST = 4096
 
 
 class WatermarkConfigError(ValueError):

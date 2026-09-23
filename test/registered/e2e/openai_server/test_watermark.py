@@ -1,5 +1,4 @@
 import json
-import math
 import os
 import sys
 import tempfile
@@ -7,6 +6,7 @@ import tempfile
 import pytest
 import requests
 
+from sglang.srt.sampling.watermarking import WatermarkDetector
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import (
@@ -21,59 +21,18 @@ register_cuda_ci(est_time=320, stage="base-b", runner_config="1-gpu-small")
 _MODEL = "Qwen/Qwen2.5-0.5B-Instruct"
 _KEY_A = "0123456789abcdef"
 _KEY_B = "fedcba9876543210"
-_MASK32 = 0xFFFFFFFF
-_UINT32_SCALE = float(1 << 32)
 _OMITTED = object()
 
 
-def _rotl32(value, shift):
-    return ((value << shift) | (value >> (32 - shift))) & _MASK32
-
-
-def _mix(state, value):
-    value = (value * 0xCC9E2D51) & _MASK32
-    value = _rotl32(value, 15)
-    value = (value * 0x1B873593) & _MASK32
-    state = _rotl32(state ^ value, 13)
-    return (state * 5 + 0xE6546B64) & _MASK32
-
-
-def _fmix32(value):
-    value ^= value >> 16
-    value = (value * 0x85EBCA6B) & _MASK32
-    value ^= value >> 13
-    value = (value * 0xC2B2AE35) & _MASK32
-    return value ^ (value >> 16)
-
-
-def _context_hash(token_ids):
-    state = 0
-    for token_id in token_ids:
-        state = _mix(state, token_id & _MASK32)
-    return _fmix32(state ^ (len(token_ids) * 4))
-
-
-def _token_uniform(key, context, token_id):
-    state = _mix(0, key & _MASK32)
-    state = _mix(state, (key >> 32) & _MASK32)
-    state = _mix(state, _context_hash(context))
-    state = _mix(state, token_id & _MASK32)
-    return (_fmix32(state ^ 16) + 0.5) / _UINT32_SCALE
-
-
-def _watermark_z_score(prompt_token_ids, response_token_ids, key, context_window=4):
-    token_ids = prompt_token_ids + response_token_ids
-    start = len(prompt_token_ids)
-    seen = set()
-    score = 0.0
-    for position in range(start, len(token_ids)):
-        context = tuple(token_ids[max(0, position - context_window) : position])
-        if not context or context in seen:
-            continue
-        seen.add(context)
-        uniform = _token_uniform(key, context, token_ids[position])
-        score -= math.log1p(-uniform)
-    return len(seen), (score - len(seen)) / math.sqrt(len(seen))
+def _watermark_statistics(choice, key):
+    return (
+        WatermarkDetector(key)
+        .detect_tokens(
+            choice["response_token_ids"],
+            prompt_token_ids=choice["prompt_token_ids"],
+        )
+        .combined
+    )
 
 
 def _chat_payload(watermark=_OMITTED, *, max_tokens):
@@ -102,22 +61,12 @@ def _chat_payload(watermark=_OMITTED, *, max_tokens):
 def _assert_detected(response, key, *, other_key=None):
     assert response.status_code == 200, response.text
     choice = response.json()["choices"][0]
-    prompt_token_ids = choice["prompt_token_ids"]
-    response_token_ids = choice["response_token_ids"]
-    count, z_score = _watermark_z_score(
-        prompt_token_ids,
-        response_token_ids,
-        int(key, 16),
-    )
-    assert count >= 100
-    assert z_score >= 5.0
+    statistics = _watermark_statistics(choice, key)
+    assert statistics.num_contexts >= 100
+    assert statistics.z_score >= 5.0
     if other_key is not None:
-        _, other_z = _watermark_z_score(
-            prompt_token_ids,
-            response_token_ids,
-            int(other_key, 16),
-        )
-        assert z_score - other_z >= 4.0
+        other = _watermark_statistics(choice, other_key)
+        assert statistics.z_score - other.z_score >= 4.0
 
 
 class WatermarkServerTest(CustomTestCase):
@@ -262,13 +211,9 @@ class TestWatermarkDefaultEnabledEndpoint(WatermarkServerTest):
         assert response.status_code == 200, response.text
         choice = response.json()["choices"][0]
         assert len(json.loads(choice["message"]["content"])["entries"]) == 8
-        count, z_score = _watermark_z_score(
-            choice["prompt_token_ids"],
-            choice["response_token_ids"],
-            int(_KEY_A, 16),
-        )
-        assert count >= 100
-        assert z_score >= 3.0
+        statistics = _watermark_statistics(choice, _KEY_A)
+        assert statistics.num_contexts >= 100
+        assert statistics.z_score >= 3.0
 
 
 class TestWatermarkEnforceAllEndpoint(WatermarkServerTest):

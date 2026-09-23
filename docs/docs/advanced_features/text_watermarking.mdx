@@ -1,7 +1,7 @@
 ---
 title: "Text Watermarking"
 metatags:
-    description: "Configure Aaronson-Gumbel text watermarking and implement a compatible detector."
+    description: "Configure Aaronson-Gumbel text watermarking and detect watermarked text."
 ---
 
 SGLang provides opt-in Aaronson-Gumbel watermarking for sampled text. The
@@ -154,6 +154,30 @@ In dual-key mode, each eligible context deterministically selects key A with
 probability `P` and key B otherwise. Both token hashes are evaluated in the same
 selector pass; the ordinary truncation, repeated-context, and greedy rules do
 not change.
+
+## Detection library
+
+`sglang.srt.sampling.watermarking.WatermarkDetector` implements the detector
+specification below. It needs only the key and token IDs, not the model or a
+GPU. Construct it with the server's key, optional key B, mixing probability,
+and context window:
+
+```python
+from sglang.srt.sampling.watermarking import WatermarkDetector
+
+detector = WatermarkDetector("0123456789abcdef", key_b="fedcba9876543210")
+result = detector.detect_tokens(
+    completion_token_ids,
+    prompt_token_ids=prompt_token_ids,
+)
+print(result.combined.p_value, result.combined.z_score)
+```
+
+OpenAI-compatible responses include both token ID arrays when the request sets
+`"return_token_ids": true`. `detect_text` encodes a completion with a Hugging
+Face-compatible tokenizer and no special tokens; prefer the returned token IDs
+when available. In dual-key mode, the result also reports each key's partition.
+`log_p_value` stays finite when the p-value underflows to zero on long texts.
 
 ## Detector specification
 

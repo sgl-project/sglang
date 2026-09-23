@@ -5,15 +5,15 @@ from unittest.mock import Mock
 import pytest
 import torch
 
-from sglang.srt.sampling.watermark import (
+from sglang.srt.sampling.watermarking.core import (
     WatermarkState,
     _dual_key_a_mask_torch,
-    _hash_context_token_ids,
     _hash_contexts,
     _truncate_probabilities,
     normalize_watermark_request,
     select_watermark_tokens_torch,
 )
+from sglang.srt.sampling.watermarking.detector import hash_context
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=10, stage="base-b-kernel-unit", runner_config="1-gpu-large")
@@ -168,8 +168,8 @@ def test_retracted_request_restores_context_history():
     history = state.retracted_context_hashes(batch)
     assert history is not None
     expected_hashes = {
-        _hash_context_token_ids([10, 11]),
-        _hash_context_token_ids([11, 10]),
+        hash_context([10, 11]),
+        hash_context([11, 10]),
     }
     assert {
         value if value >= 0 else value + 2**32 for value in history[0]

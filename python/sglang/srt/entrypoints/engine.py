@@ -116,7 +116,7 @@ from sglang.srt.runtime_context import (
     restore_context,
     snapshot_context,
 )
-from sglang.srt.sampling.watermark import redact_watermark_secrets
+from sglang.srt.sampling.watermarking import redact_watermark_secrets
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import (
     MultiprocessingSerializer,

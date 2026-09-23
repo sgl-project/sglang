@@ -18,13 +18,11 @@ from sglang.srt.managers.tokenizer_manager import (
 )
 from sglang.srt.runtime_context import publish, reset_context
 from sglang.srt.sampling.sampling_params import SamplingParams
-from sglang.srt.sampling.watermark import (
-    redact_watermark_command_line,
-    redact_watermark_secrets,
-)
-from sglang.srt.sampling.watermark_config import (
+from sglang.srt.sampling.watermarking import (
     WatermarkConfigError,
     load_watermark_config,
+    redact_watermark_command_line,
+    redact_watermark_secrets,
 )
 from sglang.srt.server_args import ServerArgs, prepare_server_args
 from sglang.srt.utils.request_logger import (
