@@ -8,7 +8,10 @@ the fixture's precision tests do not exercise the cache at all.
 
 The server prefills in 256-token chunks, so every LongBench prompt crosses the
 512-token window and several chunk boundaries before its prefix is reused.
-The default breakable prefill CUDA graphs and decode graphs stay enabled.
+The default breakable prefill CUDA graphs and decode graphs stay enabled; the
+eager variant disables both so graph replay and eager execution answer to the
+same gate. The scheduler never mixes logprob requests into running decodes, so
+test_beam_mixed_chunk.py covers mixed prefill/decode batches.
 """
 
 import tempfile
@@ -27,7 +30,7 @@ from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kits.kl_divergence_kit import KLDivergenceMixin
 from sglang.test.server_fixtures.default_fixture import DefaultServerBase
 
-register_cuda_ci(est_time=600, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=900, stage="base-b", runner_config="1-gpu-large")
 
 
 class TestBeamKL(KLDivergenceMixin, DefaultServerBase):
@@ -68,6 +71,15 @@ class TestBeamKL(KLDivergenceMixin, DefaultServerBase):
             super().tearDownClass()
         if hasattr(cls, "checkpoint"):
             cls.checkpoint.cleanup()
+
+
+class TestBeamKLEager(TestBeamKL):
+    other_args = TestBeamKL.other_args + [
+        "--cuda-graph-backend-prefill",
+        "disabled",
+        "--cuda-graph-backend-decode",
+        "disabled",
+    ]
 
 
 class TestBeamKLFlashInferChunked(TestBeamKL):

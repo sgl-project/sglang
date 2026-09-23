@@ -760,7 +760,10 @@ def build_decode_registry(
             def _pp_source(key):
                 def _fn(_fb, ctx):
                     ppx = ctx.pp_proxy_tensors
-                    return None if ppx is None else ppx.tensors[key]
+                    # A model whose residual is folded into hidden_states
+                    # sends fewer keys than the capture buffers hold; the
+                    # unsent slot keeps its zeros.
+                    return None if ppx is None else ppx.tensors.get(key)
 
                 return _fn
 
