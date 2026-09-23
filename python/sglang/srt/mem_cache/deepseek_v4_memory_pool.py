@@ -1033,47 +1033,11 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         kv_pool_cls: type = DeepSeekV4SingleKVPool
 
         self.request_window = None
-        encoder_replay = get_exec().features.enable_encoder_swa_bounded_replay
-        # DSpark's draft shares the target's full-to-SWA mapping, so the target
-        # keeps its paged SWA allocator even under encoder replay.
-        self.needs_paged_swa_allocator = (
-            not encoder_replay
-            or is_draft_worker
-            or get_spec().speculative_algorithm is not None
-        )
-        if encoder_replay and not is_draft_worker:
-            from sglang.srt.mem_cache.dsv41_request_window import RequestWindow
-
-            def make_window_pool(size, layers):
-                return self._make_kv_pool(
-                    size=size,
-                    page_size=swa_page_size,
-                    dtype=dtype,
-                    layer_num=layers,
-                    device=device,
-                    enable_memory_saver=enable_memory_saver,
-                    global_page_size=swa_page_size,
-                    kv_layout=self.kv_layout,
-                )
-
-            self.swa_kv_pool = None
-            self.unified_kv_pool = None
-            from sglang.srt.runtime_context import get_schedule
-
-            chunk = get_schedule().chunked_prefill_size or 0
-            self.request_window = RequestWindow(
-                make_window_pool,
-                num_slots=self.num_req_slots,
-                layers=stage_layer_num,
-                page_size=swa_page_size,
-                capacity=self.sliding_window + (online_mtp_max_draft_tokens or 0),
-                workspace_rows=(self.num_req_slots + 1) * self.sliding_window
-                + max(
-                    chunk,
-                    (self.num_req_slots + 1) * (1 + (online_mtp_max_draft_tokens or 0)),
-                ),
-            )
-        elif self._unified_kv:
+        # Encoder-only PD reconstructs the SWA tail into the existing paged
+        # allocator. This keeps ordinary decode on its standard zero-copy
+        # full->SWA mapping instead of copying a request window per layer/token.
+        self.needs_paged_swa_allocator = True
+        if self._unified_kv:
             assert self.kv_layout is KVLayout.V4, (
                 "unified_kv keeps bf16 rows, not a paged FlashMLA layout"
             )
