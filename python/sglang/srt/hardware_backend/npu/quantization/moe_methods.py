@@ -792,7 +792,19 @@ class NPUW4A8Int8MoEMethod(_NPUMoEMethodBase):
         scale_bias_name = f"{weight_prefix}_scale_bias"
         if hasattr(layer, scale_bias_name):
             scale_bias = getattr(layer, scale_bias_name)
-            scale_bias.data = scale_bias.data.transpose(1, 2).contiguous().sum(dim=1)
+            bias = scale_bias.data
+            if weight_prefix == "w2":
+                # The loader copies all checkpoint compensation segments, but
+                # w2 is sharded along K. Sum only the matching MoE TP partition.
+                tp_size = layer.moe_tp_size
+                num_segments = bias.shape[-1]
+                assert num_segments % tp_size == 0, (
+                    f"w2 scale_bias has {num_segments} segments, which must be "
+                    f"divisible by MoE TP size {tp_size}"
+                )
+                shard_size = num_segments // tp_size
+                bias = bias.narrow(2, layer.moe_tp_rank * shard_size, shard_size)
+            scale_bias.data = bias.transpose(1, 2).contiguous().sum(dim=1)
 
     def _process_scale(
         self,
