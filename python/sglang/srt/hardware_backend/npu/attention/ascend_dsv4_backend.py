@@ -451,9 +451,14 @@ class CompressorAscendBackendMixin:
 
             _tag = f"L{compressor.layer_id} r{ratio} idx={int(compressor.is_in_indexer)}"
 
-            for _name, _t in (("x", x), ("state_cache", state_cache), ("table", state_block_table)):
+            for _name, _t in (("x", x), ("table", state_block_table)):
                 _s, _ = _fmt(_t)
                 print(f"[CIN] {_tag} {_name} shape={tuple(_t.shape)} {_s}", flush=True)
+            print(
+                f"[CIN] {_tag} state_cache shape={tuple(state_cache.shape)} "
+                f"ptr={state_cache.data_ptr()}",
+                flush=True,
+            )
             print(
                 f"[CIN] {_tag} start_pos={fm.start_pos.tolist()} "
                 f"seqused={fm.seqused.tolist()} cu={fm.actual_seq_lengths_q_pa.tolist()}",
