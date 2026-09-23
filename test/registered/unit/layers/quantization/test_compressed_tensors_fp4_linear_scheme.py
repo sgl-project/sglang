@@ -1,11 +1,13 @@
 """CPU tests for FP4 linear scheme selection in compressed-tensors.
 
-Two failure modes are guarded here. NVFP4 checkpoints used to be unservable on
+Three failure modes are guarded here. NVFP4 checkpoints used to be unservable on
 pre-Blackwell GPUs: the w4a4 scheme is the only FP4 linear scheme and it reports
 a min capability of 100, so an SM90 host raised NotImplementedError instead of
 falling back to the weight-only FP4 Marlin kernel. Separately, weight-only FP4
 configs were diverted into the WNA16 branch -- which only checked strategy, not
-weight type -- and died with a misleading error naming W4A16Sparse24.
+weight type -- and died with a misleading error naming W4A16Sparse24. MXFP4
+linears reached the NVFP4 branches and were rejected for an unsupported
+group_size instead of taking the weight-only path.
 
 Scheme selection is pure config parsing, so it runs on CPU with the reported
 device capability mocked.
@@ -28,6 +30,7 @@ from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import
 from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsW4A4Fp4,
     CompressedTensorsW4A16Fp4,
+    CompressedTensorsW4A16Mxfp4,
     CompressedTensorsWNA16,
 )
 from sglang.test.test_utils import CustomTestCase
@@ -150,23 +153,50 @@ class TestFp4LinearSchemeSelection(CustomTestCase):
         self.assertIsInstance(scheme, CompressedTensorsWNA16)
         self.assertEqual(scheme.group_size, 128)
 
-    def test_mxfp4_reports_no_compatible_scheme(self):
-        """MXFP4 linears have no kernel yet (the dense FP4 Marlin kernel is only
-        instantiated for group_size 16 and cannot decode E8M0 scales). The error
-        must say that, not name an unrelated sparse-24 scheme."""
+    def test_mxfp4_selects_weight_only_marlin(self):
+        """Both MXFP4 variants are served weight-only, on Hopper and Blackwell
+        alike: no native MXFP4 dense-linear kernel exists on any architecture, so
+        get_min_capability is a floor rather than a Blackwell-only gate."""
         for name, input_activations in (
             ("mxfp4a16", None),
             ("mxfp4", dict(MXFP4_WEIGHTS, dynamic=True)),
         ):
-            with self.subTest(variant=name):
-                with self.assertRaises(NotImplementedError) as ctx:
-                    _get_scheme(
+            for capability in ((9, 0), (10, 0)):
+                with self.subTest(variant=name, capability=capability):
+                    scheme = _get_scheme(
                         _make_config(
                             "mxfp4-pack-quantized", MXFP4_WEIGHTS, input_activations
                         ),
-                        (9, 0),
+                        capability,
                     )
-                self.assertNotIn("Sparse24", str(ctx.exception))
+                    self.assertIsInstance(scheme, CompressedTensorsW4A16Mxfp4)
+                    self.assertEqual(
+                        scheme.has_input_activations, input_activations is not None
+                    )
+
+    def test_mxfp4_predicate_does_not_capture_nvfp4(self):
+        """The MXFP4 branch is dispatched ahead of the NVFP4 ones, so an
+        over-broad predicate would silently reroute NVFP4 to the E8M0 path."""
+        scheme = _get_scheme(
+            _make_config("nvfp4-pack-quantized", NVFP4_WEIGHTS), (9, 0)
+        )
+        self.assertIsInstance(scheme, CompressedTensorsW4A16Fp4)
+
+    def test_mxfp4_w4a4_warns_and_a16_does_not(self):
+        """MXFP4 w4a4 drops activation quantization, which is user-facing."""
+        logging.Logger.warning_once.cache_clear()
+        self.addCleanup(logging.Logger.warning_once.cache_clear)
+
+        w4a4_config = _make_config(
+            "mxfp4-pack-quantized", MXFP4_WEIGHTS, dict(MXFP4_WEIGHTS, dynamic=True)
+        )
+        with self.assertLogs(SCHEME_LOGGER, level="WARNING") as captured:
+            _get_scheme(w4a4_config, (9, 0))
+        self.assertIn("weight-only", "\n".join(captured.output))
+
+        with mock.patch.object(SCHEME_LOGGER, "warning_once") as warn:
+            _get_scheme(_make_config("mxfp4-pack-quantized", MXFP4_WEIGHTS), (9, 0))
+        warn.assert_not_called()
 
     def test_fp4_weights_with_non_nvfp4_activations_raise(self):
         """A float4 weight config with activation quantization that is not the
@@ -222,6 +252,46 @@ class TestWeightOnlyFp4WeightCreation(CustomTestCase):
         layer, _ = self._create(has_input_global_scale=False)
         self.assertEqual(layer.params_dtype, torch.bfloat16)
         self.assertEqual(layer.quant_config.group_size, 16)
+
+
+class TestWeightOnlyMxfp4WeightCreation(CustomTestCase):
+    """MXFP4's registered parameters differ from NVFP4's in the two ways that
+    matter to the loader: uint8 scales rather than float8_e4m3fn, and no global
+    scale tensor at all."""
+
+    def _create(self, has_input_activations=False):
+        layer = torch.nn.Module()
+        scheme = CompressedTensorsW4A16Mxfp4(
+            has_input_activations=has_input_activations
+        )
+        scheme.create_weights(
+            layer=layer,
+            output_partition_sizes=[512],
+            input_size_per_partition=2048,
+            params_dtype=torch.bfloat16,
+            weight_loader=lambda *args, **kwargs: None,
+        )
+        return layer, scheme
+
+    def test_registered_parameters_match_checkpoint_layout(self):
+        layer, _ = self._create()
+        self.assertEqual(layer.weight_packed.shape, (512, 1024))
+        self.assertEqual(layer.weight_packed.dtype, torch.uint8)
+        # One raw E8M0 exponent byte per 32 input elements.
+        self.assertEqual(layer.weight_scale.shape, (512, 64))
+        self.assertEqual(layer.weight_scale.dtype, torch.uint8)
+
+    def test_no_global_scales_are_registered(self):
+        """MXFP4 folds its outer scale into the E8M0 group scales; registering a
+        destination for a tensor the checkpoint lacks would leave it unfilled."""
+        layer, _ = self._create(has_input_activations=True)
+        self.assertFalse(hasattr(layer, "weight_global_scale"))
+        self.assertFalse(hasattr(layer, "input_global_scale"))
+
+    def test_marlin_prep_attributes_are_set(self):
+        layer, _ = self._create()
+        self.assertEqual(layer.params_dtype, torch.bfloat16)
+        self.assertEqual(layer.quant_config.group_size, 32)
 
 
 if __name__ == "__main__":

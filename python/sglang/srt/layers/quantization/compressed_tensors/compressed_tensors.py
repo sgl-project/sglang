@@ -45,6 +45,7 @@ from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsW4A4Fp4,
     CompressedTensorsW4A4Nvfp4MoE,
     CompressedTensorsW4A16Fp4,
+    CompressedTensorsW4A16Mxfp4,
     CompressedTensorsW4A16Nvfp4MoE,
     CompressedTensorsW4AFP8MoE,
     CompressedTensorsW8A8Fp8,
@@ -628,6 +629,25 @@ class CompressedTensorsConfig(QuantizationConfig):
             and weight_quant.symmetric
         )
 
+    def _is_mxfp4_linear(self, weight_quant: QuantizationArgs) -> bool:
+        """MXFP4 dense linear: fp4 weights with E8M0 group scales, group_size 32.
+
+        Selects the weight-only FP4 Marlin scheme, the only MXFP4 linear path in
+        tree; MoE is handled separately by Mxfp4MoEMethod via _is_mxfp4_moe.
+        Predicated on the weights alone so it covers both mxfp4a16 and the w4a4
+        variant, whose weights blocks are byte-identical.
+        """
+        if weight_quant is None:
+            return False
+
+        return (
+            weight_quant.strategy == QuantizationStrategy.GROUP.value
+            and weight_quant.type == QuantizationType.FLOAT
+            and weight_quant.num_bits == 4
+            and weight_quant.group_size == 32
+            and weight_quant.symmetric
+        )
+
     def _is_wNa16_group_channel(
         self, weight_quant: BaseModel, input_quant: BaseModel
     ) -> bool:
@@ -744,6 +764,24 @@ class CompressedTensorsConfig(QuantizationConfig):
                 raise ImportError(
                     "Other method (CompressedTensorsW4A16Sparse24) is not supported now"
                 )
+
+        # Dispatched ahead of the fp4 branches below: a w4a4 MXFP4 checkpoint
+        # would otherwise reach the non-nvfp4 NotImplementedError, which reports
+        # an unsupported group_size rather than selecting the weight-only path.
+        if self._is_mxfp4_linear(weight_quant):
+            # FP4 Marlin is weight-only on every architecture: there is no native
+            # MXFP4 linear kernel, on Blackwell or elsewhere. A w4a4 checkpoint
+            # therefore runs with unquantized activations, and unlike NVFP4 it
+            # carries no input_global_scale to drop.
+            if input_quant is not None:
+                logger.warning_once(
+                    "MXFP4 w4a4 has no native kernel; serving this checkpoint "
+                    "weight-only via FP4 Marlin instead. Activation "
+                    "quantization is ignored."
+                )
+            return CompressedTensorsW4A16Mxfp4(
+                has_input_activations=input_quant is not None
+            )
 
         if is_activation_quantization_format(quant_format):
             if self._is_fp4a16_nvfp4(weight_quant, input_quant):
