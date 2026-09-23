@@ -924,11 +924,14 @@ class DeepseekV2MoE(nn.Module):
                 input_ids_global=input_ids_global,
             )
 
-        num_token_non_padded = (
-            forward_batch.moe_num_token_non_padded()
-            if forward_batch is not None
-            else None
-        )
+        if _is_hip:
+            num_token_non_padded = None
+        else:
+            num_token_non_padded = (
+                forward_batch.moe_num_token_non_padded()
+                if forward_batch is not None
+                else None
+            )
         if not self._enable_a2a_moe:
             if self._can_dual_stream_graph(hidden_states):
                 fwd = get_forward()
