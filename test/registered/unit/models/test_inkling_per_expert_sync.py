@@ -1,7 +1,7 @@
 """CPU unit test for Inkling per-expert RL weight-sync loading.
 
-Exercises ``_load_per_expert_param`` on a simulated EP x MoE-TP grid (parallel
-helpers monkeypatched, no process groups) and checks every (ep_rank, tp_rank)
+Exercises ``_load_per_expert_param`` on a simulated EP x MoE-TP grid (topology
+published on the runtime context, no process groups) and checks every (ep_rank, tp_rank)
 against a reference fused stack built directly from the full per-expert weights:
 
   - EP: global expert id remapped to the rank's contiguous local block,
@@ -11,7 +11,7 @@ against a reference fused stack built directly from the full per-expert weights:
     (lora_compatible_layout_enabled() or inference_moe_w13_interleaved=False)
   - trtllm MoE layouts rejected loudly
 
-Run: python3 test/srt/models/test_inkling_per_expert_sync.py
+Run: python3 test/registered/unit/models/test_inkling_per_expert_sync.py
 """
 
 import types
@@ -20,6 +20,11 @@ import unittest
 import torch
 
 import sglang.srt.models.inkling as inkling_mod
+from sglang.srt.runtime_context import reset_context
+from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import publish_build_topology
+
+register_cpu_ci(est_time=15, stage="weekly", runner_config="cpu")
 
 N_EXPERTS, I_FULL, H = 8, 6, 4
 
@@ -74,30 +79,26 @@ def _expected_stacks(full, ep_size, ep_rank, tp_size, tp_rank, contiguous):
 
 class TestPerExpertSync(unittest.TestCase):
     def setUp(self):
-        self._saved = {
-            n: getattr(inkling_mod, n)
-            for n in (
-                "get_moe_expert_parallel_world_size",
-                "get_moe_expert_parallel_rank",
-                "get_moe_tensor_parallel_rank",
-                "lora_compatible_layout_enabled",
-            )
-        }
+        self._saved_layout = inkling_mod.lora_compatible_layout_enabled
+        self.addCleanup(reset_context)
 
     def tearDown(self):
-        for n, f in self._saved.items():
-            setattr(inkling_mod, n, f)
+        inkling_mod.lora_compatible_layout_enabled = self._saved_layout
 
-    def _patch(self, ep_size, ep_rank, tp_rank, lora_layout=False):
-        inkling_mod.get_moe_expert_parallel_world_size = lambda: ep_size
-        inkling_mod.get_moe_expert_parallel_rank = lambda: ep_rank
-        inkling_mod.get_moe_tensor_parallel_rank = lambda: tp_rank
+    def _patch(self, ep_size, ep_rank, tp_rank, lora_layout=False, tp_size=1):
+        # MoE-TP is what is left of TP after EP takes its share, so the global
+        # rank decomposes into (ep_rank, tp_rank) by that split.
+        publish_build_topology(
+            world_rank=ep_rank * tp_size + tp_rank,
+            tp_size=ep_size * tp_size,
+            ep_size=ep_size,
+        )
         inkling_mod.lora_compatible_layout_enabled = lambda: lora_layout
 
     def _run_rank(
         self, full, ep_size, ep_rank, tp_size, tp_rank, *, interleaved, lora_layout
     ):
-        self._patch(ep_size, ep_rank, tp_rank, lora_layout)
+        self._patch(ep_size, ep_rank, tp_rank, lora_layout, tp_size=tp_size)
         model = _FakeModel(interleaved)
         local, i_tp = N_EXPERTS // ep_size, I_FULL // tp_size
         params_dict = {
