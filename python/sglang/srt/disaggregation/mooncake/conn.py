@@ -2446,9 +2446,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         if notification is None:
             return True
         room = notification.room
-        room_active = (
-            room in self.request_status and self.check_status(room) != KVPoll.Success
-        )
+        status = self.request_status.get(room)
+        room_active = status is not None and status != KVPoll.Success
 
         if self.enable_deferred_decode_kv_release:
             self._handle_deferred_abort_notification(notification, room_active)

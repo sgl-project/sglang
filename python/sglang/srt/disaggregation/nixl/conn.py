@@ -1210,6 +1210,9 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                         room,
                     )
                     self._staging_outstanding.pop(room, None)
+                    if self.enable_deferred_decode_kv_release:
+                        # clear() keeps the target while a chunk is counted.
+                        self._maybe_ack_drained_abort(room)
                     continue
 
                 # Counted at dequeue, before the status check, so
@@ -1235,6 +1238,8 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                         room,
                     )
                     self._staging_outstanding.pop(room, None)
+                    if self.enable_deferred_decode_kv_release:
+                        self._maybe_ack_drained_abort(room)
                     continue
 
                 # Lazily build a per-worker staging strategy bound to this

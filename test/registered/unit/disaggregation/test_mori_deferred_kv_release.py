@@ -233,6 +233,35 @@ class TestMoriAbortAck(DeferredAbortNotificationScenarios, CustomTestCase):
             bootstrap_room=11, failure_reason="KV transfer exceeded SLA 1ms"
         )
 
+    def test_room_cleared_after_drain_handoff_keeps_single_owner(self):
+        manager = _manager()
+        manager.request_status[11] = KVPoll.Transferring
+        manager._transfer_timeout_ms = 1
+        status = MagicMock()
+        status.InProgress.return_value = True
+        manager._submit_kv_transfer = MagicMock(return_value=[status])
+
+        def wait_all(*args, **kwargs):
+            manager.request_status.pop(11)
+            return StatusCode.IN_PROGRESS
+
+        manager.engine = MagicMock()
+        manager.engine.wait_all.side_effect = wait_all
+        manager.conclude_failure = MagicMock()
+        queue = MagicMock()
+        queue.get.side_effect = (_chunk(), KeyboardInterrupt())
+
+        with patch(
+            "sglang.srt.disaggregation.mori.conn.time.perf_counter",
+            side_effect=(0.0, 0.002),
+        ):
+            with self.assertRaises(KeyboardInterrupt):
+                manager._transfer_worker(queue)
+
+        self.assertEqual(manager._staging_outstanding[11], 1)
+        self.assertEqual(manager._drain_queue.qsize(), 1)
+        manager.conclude_failure.assert_not_called()
+
     def test_sla_failure_keeps_legacy_early_return_when_disabled(self):
         manager = _manager(enabled=False)
         manager._transfer_timeout_ms = 1

@@ -2124,15 +2124,14 @@ class CommonKVReceiver(BaseKVReceiver):
             self._send_abort_notification()
             self.abort_notified = True
 
-    def abort_for_deferred_release(self) -> None:
-        """Arm ACK aggregation before the backend can emit an immediate ACK."""
-        if self.kv_mgr.enable_deferred_decode_kv_release and not self.abort_notified:
+    def _send_abort_notification(self):
+        # Both abort() and the waiting timeout reach here. Once metadata is
+        # published (init_time set) prefill may be writing, so arm the ACK
+        # tracker before the ABORT goes out and an immediate ACK can land.
+        if self.kv_mgr.enable_deferred_decode_kv_release and self.init_time is not None:
             self._abort_generation = self.kv_mgr.register_deferred_abort_room(
                 self.bootstrap_room
             )
-        self.abort()
-
-    def _send_abort_notification(self):
         for bootstrap_info in self.bootstrap_infos:
             # Best-effort notification to prefill side that this request was aborted.
             try:

@@ -8,6 +8,7 @@ that its transfer drained (CommonKVManager.is_abort_release_safe), or a timeout
 fires. See DecodeTransferQueue.resolve_deferred_releases.
 """
 
+import threading
 import unittest
 from types import SimpleNamespace
 from typing import NamedTuple
@@ -26,7 +27,6 @@ from sglang.srt.disaggregation.common.conn import (
     CommonKVSender,
 )
 from sglang.srt.disaggregation.decode import DecodeTransferQueue
-from sglang.srt.disaggregation.fake.conn import FakeKVReceiver
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -308,39 +308,82 @@ class TestCommonAbortAckDispatch(CustomTestCase):
         self.assertTrue(claimed)
         self.assertTrue(mgr.is_abort_release_safe(103, required_acks=1))
 
-    def test_abort_for_deferred_release_arms_before_abort(self):
-        mgr = _make_manager()
+    def _make_notifying_receiver(self, mgr, room, init_time):
         receiver = _TestReceiver.__new__(_TestReceiver)
         receiver.kv_mgr = mgr
-        receiver.bootstrap_room = 104
+        receiver.bootstrap_room = room
+        receiver.bootstrap_infos = [{"rank_ip": "10.0.0.2", "rank_port": 6000}]
+        receiver.init_time = init_time
         receiver.abort_notified = False
-        observed = []
-        receiver.abort = lambda: observed.append(104 in mgr._deferred_abort_ack_tracker)
+        receiver.conclude_state = None
+        receiver._abort_generation = None
+        mgr.local_ip = "10.0.0.1"
+        mgr.rank_port = 5000
+        mgr.failure_lock = threading.Lock()
+        mgr.failure_records = {}
+        mgr.request_status = {room: KVPoll.WaitingForInput}
+        sent = []
 
-        receiver.abort_for_deferred_release()
+        class _Sock:
+            def send_multipart(self, frames):
+                sent.append(
+                    (
+                        room in mgr._deferred_abort_ack_tracker,
+                        AbortNotification.from_zmq(frames),
+                    )
+                )
 
-        self.assertEqual(observed, [True])
+        receiver._connect_to_bootstrap_server = lambda info: (
+            _Sock(),
+            threading.Lock(),
+        )
+        return receiver, sent
 
-    def test_abort_for_deferred_release_skips_tracker_when_disabled(self):
+    def test_abort_arms_tracker_before_sending(self):
+        mgr = _make_manager()
+        receiver, sent = self._make_notifying_receiver(mgr, 104, init_time=1.0)
+
+        receiver.abort()
+
+        [(armed, notification)] = sent
+        self.assertTrue(armed)
+        self.assertEqual(
+            notification.generation,
+            mgr._deferred_abort_ack_tracker[104].generation,
+        )
+
+    def test_waiting_timeout_abort_is_armed(self):
+        mgr = _make_manager()
+        mgr.waiting_timeout = 0
+        receiver, sent = self._make_notifying_receiver(mgr, 105, init_time=1.0)
+        receiver.invalidate_cached_bootstrap_infos = lambda: None
+
+        self.assertEqual(receiver._check_waiting_timeout(), KVPoll.Failed)
+
+        [(armed, notification)] = sent
+        self.assertTrue(armed)
+        self.assertIsNotNone(notification.generation)
+        self.assertTrue(receiver.abort_notified)
+
+    def test_abort_before_metadata_skips_tracker(self):
+        mgr = _make_manager()
+        receiver, sent = self._make_notifying_receiver(mgr, 106, init_time=None)
+
+        receiver.abort()
+
+        [(armed, notification)] = sent
+        self.assertFalse(armed)
+        self.assertIsNone(notification.generation)
+
+    def test_abort_skips_tracker_when_disabled(self):
         mgr = _make_manager()
         mgr.enable_deferred_decode_kv_release = False
-        receiver = _TestReceiver.__new__(_TestReceiver)
-        receiver.kv_mgr = mgr
-        receiver.bootstrap_room = 105
-        receiver.abort_notified = False
-        receiver.abort = lambda: None
+        receiver, sent = self._make_notifying_receiver(mgr, 107, init_time=1.0)
 
-        receiver.abort_for_deferred_release()
+        receiver.abort()
 
-        self.assertNotIn(105, mgr._deferred_abort_ack_tracker)
-
-    def test_base_receiver_falls_back_to_plain_abort(self):
-        receiver = FakeKVReceiver.__new__(FakeKVReceiver)
-        receiver.conclude_state = None
-
-        receiver.abort_for_deferred_release()
-
-        self.assertEqual(receiver.conclude_state, KVPoll.Failed)
+        self.assertNotIn(107, mgr._deferred_abort_ack_tracker)
+        self.assertIsNone(sent[0][1].generation)
 
 
 class TestDeferredAckTargets(CustomTestCase):

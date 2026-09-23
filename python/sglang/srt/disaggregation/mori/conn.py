@@ -568,21 +568,21 @@ class MoriKVManager(CommonKVManager):
         failure_reason, is_quiescent = self._wait_for_chunk_completion(
             kv_chunk, statuses
         )
+        if not is_quiescent:
+            # The drainer now owns the decrement and the failure conclusion.
+            return False
         if self._should_skip_transfer(room):
-            return is_quiescent
+            return True
         if failure_reason is not None:
-            if is_quiescent:
-                self.conclude_failure(
-                    bootstrap_room=room, failure_reason=failure_reason
-                )
-            return is_quiescent
+            self.conclude_failure(bootstrap_room=room, failure_reason=failure_reason)
+            return True
 
         if kv_chunk.is_last_chunk:
             # conclude_transfer downgrades to Failed when a failure was recorded
             # while this chunk was in flight, and applies the same status locally
             # and on the wire.
             self.conclude_transfer(bootstrap_room=room, status=KVPoll.Success)
-        return is_quiescent
+        return True
 
     def _wait_for_chunk_completion(
         self, kv_chunk: TransferKVChunk, statuses: List[TransferStatus]
@@ -673,7 +673,9 @@ class MoriKVManager(CommonKVManager):
         self._mark_transfer_quiescent(kv_chunk)
 
     def _should_skip_transfer(self, room: int) -> bool:
-        if room not in self.request_status or self.check_status(room) == KVPoll.Failed:
+        # Single read: clear() may pop the room concurrently.
+        status = self.request_status.get(room)
+        if status is None or status == KVPoll.Failed:
             logger.debug(
                 "Skipping chunk for room %s because it has already failed or been aborted",
                 room,
