@@ -188,7 +188,7 @@ class BaseTpWorker(ABC):
         )
         return success, message
 
-    def _deserialize_own_rank(self, serialized_named_tensors):
+    def deserialize_own_rank(self, serialized_named_tensors):
         """Each rank deserializes only its own payload (index tp_rank);
         deserializing another rank's copy would break producer-side CUDA-IPC
         refcounting."""
@@ -216,7 +216,7 @@ class BaseTpWorker(ABC):
     ):
         # The LoRA code handles TP sharding internally using slice_lora_a_weights
         # and slice_lora_b_weights methods (see lora/layers.py and mem_pool.py).
-        data = self._deserialize_own_rank(recv_req.serialized_named_tensors)
+        data = self.deserialize_own_rank(recv_req.serialized_named_tensors)
         if recv_req.load_format == "flattened_bucket":
             bucket = FlattenedTensorBucket(
                 flattened_tensor=data["flattened_tensor"],

@@ -146,7 +146,9 @@ class TestRecordWeightVersionAfterUpdate(CustomTestCase):
         )
         manager = SchedulerWeightUpdaterManager(
             tp_worker=SimpleNamespace(
-                model_runner=runner, weight_update_runners=lambda: [("target", runner)]
+                model_runner=runner,
+                weight_update_runners=lambda: [("target", runner)],
+                deserialize_own_rank=lambda payloads: [],
             ),
             draft_worker=None,
             tp_cpu_group=None,
@@ -227,12 +229,7 @@ class TestRecordWeightVersionAfterUpdate(CustomTestCase):
         """The tensor refit records the version once the load reports success."""
         updater = self._runner_updater(target_result=(True, "ok"))
 
-        module = "sglang.srt.managers.scheduler_components.weight_updater"
-        with (
-            patch("torch.distributed.barrier"),
-            patch(f"{module}.monkey_patch_torch_reductions"),
-            patch(f"{module}.MultiprocessingSerializer.deserialize", return_value=[]),
-        ):
+        with patch("torch.distributed.barrier"):
             output = updater.update_weights_from_tensor(self._runner_request())
 
         self.assertTrue(output.success)

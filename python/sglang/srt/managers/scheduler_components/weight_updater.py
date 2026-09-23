@@ -45,8 +45,6 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromTensorReqOutput,
 )
 from sglang.srt.runtime_context import get_model
-from sglang.srt.utils import MultiprocessingSerializer
-from sglang.srt.utils.patch_torch import monkey_patch_torch_reductions
 from sglang.srt.utils.weight_checker import overall_checksum
 
 logger = logging.getLogger(__name__)
@@ -222,9 +220,8 @@ class SchedulerWeightUpdaterManager:
                 "begin_weight_update() and end_weight_update()",
             )
         with self._observe_weight_load("tensor"):
-            monkey_patch_torch_reductions()
-            named_tensors = MultiprocessingSerializer.deserialize(
-                recv_req.serialized_named_tensors[self.tp_worker.model_runner.tp_rank]
+            named_tensors = self.tp_worker.deserialize_own_rank(
+                recv_req.serialized_named_tensors
             )
             success, message = True, "Success"
             for _, runner in self._select_runners(recv_req.selector):
