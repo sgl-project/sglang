@@ -58,7 +58,11 @@ while [[ $# -gt 0 ]]; do
       echo ""
       echo "Environment:"
       echo "  ENABLE_CACHE_HOST=1|0"
-      echo "      Mount /home/runner/sglang-data to /sgl-data. Defaults to 1 when RUNNER_NAME contains 300 or 35x, otherwise 0. Missing host cache falls back to container-local /sgl-data."
+      echo "      Mount CACHE_HOST to /sgl-data. Defaults to 1 when RUNNER_NAME contains 300 or 35x, otherwise 0. Missing host cache falls back to container-local /sgl-data."
+      echo "  CACHE_HOST=PATH"
+      echo "      Host cache directory (default: /home/runner/sglang-data)."
+      echo "  AMD_CI_DEVICE_FLAG=\"--device /dev/dri/renderD128\""
+      echo "      Override the GPU device flags passed to docker run. Defaults to /etc/podinfo/gha-render-devices, else --device /dev/dri."
       exit 0
       ;;
     *) echo "Unknown option $1"; exit 1;;
@@ -96,7 +100,9 @@ esac
 
 
 # Set up DEVICE_FLAG based on Kubernetes pod info
-if [[ -f /etc/podinfo/gha-render-devices ]]; then
+if [[ -n "${AMD_CI_DEVICE_FLAG:-}" ]]; then
+  DEVICE_FLAG="${AMD_CI_DEVICE_FLAG}"
+elif [[ -f /etc/podinfo/gha-render-devices ]]; then
   DEVICE_FLAG=$(cat /etc/podinfo/gha-render-devices)
 else
   DEVICE_FLAG="--device /dev/dri"
@@ -263,7 +269,7 @@ else
   retry_with_backoff 6 docker pull "${IMAGE}"
 fi
 
-CACHE_HOST=/home/runner/sglang-data
+CACHE_HOST="${CACHE_HOST:-/home/runner/sglang-data}"
 if [[ -z "${ENABLE_CACHE_HOST:-}" ]]; then
   RUNNER_NAME_LOWER="${RUNNER_NAME:-}"
   RUNNER_NAME_LOWER="${RUNNER_NAME_LOWER,,}"
