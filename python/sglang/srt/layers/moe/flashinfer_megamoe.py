@@ -327,8 +327,8 @@ def ensure_fp4_moe_layer_for_flashinfer_megamoe(layer: FusedMoE) -> Any:
             top_k=layer.top_k,
             activation_clamp=layer.moe_runner_config.swiglu_limit,
         ),
-        w13_scale=layer.w13_weight_scale_inv,
-        w2_scale=layer.w2_weight_scale_inv,
+        w13_scale=layer.w13_weight_scale_inv_shuffled,
+        w2_scale=layer.w2_weight_scale_inv_shuffled,
     )
 
 
@@ -405,7 +405,9 @@ def prepare_fp4_moe_weights_for_flashinfer_megamoe(
     current moe_ep API owns backend-specific weight preprocessing, including
     DeepGEMM scale layout transforms.
     """
-    _init_flashinfer_megamoe_layer_state(layer)
+    # Captured graphs retain the runtime's workspace and transformed tensors.
+    # Same-geometry reloads refresh their storage without rebuilding the runtime.
+    _get_or_init_flashinfer_megamoe_layer_state(layer)
 
     from flashinfer.moe_ep import (
         MoEWeightPack,
@@ -423,11 +425,13 @@ def prepare_fp4_moe_weights_for_flashinfer_megamoe(
         intermediate_size=layer.intermediate_size_per_partition,
         hidden_size=layer.hidden_size,
     )
+    # Kernel scales pack four UE8M0 columns per INT32; loaders still need the
+    # original FP32 scale shape for the next checkpoint or tensor update.
     _bind_transformed_weights(
         layer,
         transformed_weights,
-        w13_scale_name="w13_weight_scale_inv",
-        w2_scale_name="w2_weight_scale_inv",
+        w13_scale_name="w13_weight_scale_inv_shuffled",
+        w2_scale_name="w2_weight_scale_inv_shuffled",
     )
 
 
