@@ -512,6 +512,10 @@ async def async_request_openai_chat_completions(
                                 pass
                             else:
                                 data = json.loads(chunk)
+                                if data.get("error") is not None:
+                                    raise RuntimeError(
+                                        f"Streaming request failed: {data['error']}"
+                                    )
                                 # Check for usage info in final chunks. OpenAI-compatible
                                 # servers may emit usage-only chunks with choices=[].
                                 output_len = (data.get("usage") or {}).get(
