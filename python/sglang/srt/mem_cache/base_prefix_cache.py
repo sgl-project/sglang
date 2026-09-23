@@ -89,6 +89,9 @@ class InsertParams:
     prev_prefix_len: int = 0
     swa_evicted_seqlen: int = 0
     swa_branching_seqlen: Optional[int] = None
+    component_evicted_seqlens: dict[ComponentType, int] = dataclasses.field(
+        default_factory=dict, kw_only=True
+    )
 
     # General
     chunked: bool = False
@@ -172,6 +175,9 @@ class IncLockRefResult:
     swa_uuid_for_lock: Optional[int] = None
     swa_uuid_for_host_lock: Optional[int] = None
     skipped_lock_components: tuple[ComponentType, ...] = ()
+    component_lock_uuids: dict[ComponentType, Optional[int]] = dataclasses.field(
+        default_factory=dict
+    )
 
     def to_dec_params(self) -> DecLockRefParams:
         """Convert to the corresponding DecLockRefParams for dec_lock_ref."""
@@ -180,6 +186,7 @@ class IncLockRefResult:
             swa_uuid_for_lock=self.swa_uuid_for_lock,
             swa_uuid_for_host_lock=self.swa_uuid_for_host_lock,
             skipped_lock_components=tuple(self.skipped_lock_components),
+            component_lock_uuids=dict(self.component_lock_uuids),
         )
 
 
@@ -197,6 +204,9 @@ class DecLockRefParams:
     swa_uuid_for_lock: Optional[int] = None
     swa_uuid_for_host_lock: Optional[int] = None
     skipped_lock_components: tuple[ComponentType, ...] = ()
+    component_lock_uuids: dict[ComponentType, Optional[int]] = dataclasses.field(
+        default_factory=dict
+    )
 
 
 @dataclasses.dataclass

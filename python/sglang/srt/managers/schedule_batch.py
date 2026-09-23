@@ -118,6 +118,7 @@ from sglang.srt.mem_cache.common import (
 )
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
+from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
@@ -933,6 +934,10 @@ class ReqKvInfo:
     # SWA slots in [swa_dead_lo(page_size), swa_evicted_seqlen) are already freed.
     swa_evict_floor: int = 0  # [0, here) never window-evicted (prefill-aware SWA)
     swa_evicted_seqlen: int = 0  # SWA eviction cursor
+    # Independent auxiliary windows move with KV ownership across session turns.
+    component_evicted_seqlens: dict[ComponentType, int] = dataclasses.field(
+        default_factory=dict
+    )
 
     # Host-side KV backup the request holds across a retraction (unified cache).
     retraction_backup: Optional[RetractionBackup] = None
@@ -967,11 +972,24 @@ class ReqKvInfo:
 
     @property
     def is_kv_released(self) -> bool:
-        return self.kv_allocated_len == 0 and self.swa_evicted_seqlen == 0
+        return self.kv_allocated_len == 0 and self.max_evicted_seqlen == 0
+
+    @property
+    def max_evicted_seqlen(self) -> int:
+        return max(
+            self.swa_evicted_seqlen,
+            max(self.component_evicted_seqlens.values(), default=0),
+        )
+
+    def clamp_evicted_seqlens(self, length: int) -> None:
+        self.swa_evicted_seqlen = min(self.swa_evicted_seqlen, length)
+        for component, cursor in self.component_evicted_seqlens.items():
+            self.component_evicted_seqlens[component] = min(cursor, length)
 
     def mark_kv_released(self) -> None:
         self.kv_allocated_len = 0
         self.swa_evicted_seqlen = 0
+        self.component_evicted_seqlens.clear()
 
 
 class Req(ReqDllmMixin):
