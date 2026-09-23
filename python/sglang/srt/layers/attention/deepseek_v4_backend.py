@@ -3505,12 +3505,76 @@ class DeepseekV4AttnBackend(
                 masks, tail_lens
             )
 
-    def _low_ratio_index_topk_prefill_graph(self, layer, pos, q, w) -> None:
+    def _low_ratio_quantize_q_prefill_graph(
+        self, q: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Quantize captured indexer queries on the caller's CUDA stream."""
         from sglang.kernels.ops.attention.dsv4.fp4_indexer import (
-            gather_fp4_index_k_cache_masked,
             quantize_fp4_indexer_tensor,
         )
 
+        return quantize_fp4_indexer_tensor(q.flatten(0, 1), rne=True)
+
+    def _low_ratio_gather_k_prefill_graph(
+        self, layer
+    ) -> Optional[Tuple[Tuple[torch.Tensor, torch.Tensor], torch.Tensor]]:
+        """Gather dense K after this layer has written its index-K cache."""
+        if not self.forward_metadata.prefill_graph_dense_indexer:
+            return None
+
+        from sglang.kernels.ops.attention.dsv4.fp4_indexer import (
+            gather_fp4_index_k_cache_masked,
+        )
+
+        ratio = layer.compress_ratio
+        indexer = layer.indexer
+        metadata = (
+            self.forward_metadata.c1_indexer_metadata
+            if ratio == 1
+            else self.forward_metadata.c2_indexer_metadata
+        )
+        assert metadata is not None, f"no prefill graph indexer metadata for {ratio = }"
+        width = metadata.max_compressed_seq_len
+        two_level = (
+            width > indexer.candidate_topk_blocks * indexer.candidate_block_size
+            and (indexer.is_candidate_source or indexer.uses_candidates)
+        )
+        if two_level and indexer.uses_candidates and not indexer.is_candidate_source:
+            # Candidate consumers read their sparse paged K directly.
+            return None
+
+        req_ids = self.forward_metadata.low_ratio_dense_req_indices
+        req_lens = self.forward_metadata.low_ratio_dense_seq_lens
+        local_req_ids = self.forward_metadata.low_ratio_local_req_indices
+        assert req_ids is not None and req_lens is not None
+        assert local_req_ids is not None
+        ks = self.forward_metadata.low_ratio_dense_k_offsets.get(ratio)
+        if ks is None:
+            ks = _prefill_graph_dense_k_offsets(width, local_req_ids, req_ids)
+            self.forward_metadata.low_ratio_dense_k_offsets[ratio] = ks
+        k_fp4 = gather_fp4_index_k_cache_masked(
+            self.token_to_kv_pool.get_index_k_with_scale_buffer(layer.layer_id),
+            self.req_to_token,
+            req_ids,
+            req_lens,
+            width=width,
+            compress_ratio=ratio,
+            page_size=metadata.compressed_page_size,
+        )
+        return k_fp4, ks
+
+    def _low_ratio_index_topk_prefill_graph(
+        self,
+        layer,
+        pos,
+        q,
+        w,
+        *,
+        prepared_q: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        prepared_dense_k: Optional[
+            Tuple[Tuple[torch.Tensor, torch.Tensor], torch.Tensor]
+        ] = None,
+    ) -> None:
         pool = self.token_to_kv_pool
         core = self.forward_metadata.core_metadata
         ratio = layer.compress_ratio
@@ -3560,7 +3624,11 @@ class DeepseekV4AttnBackend(
             ), "prefill graph candidate block layout does not match indexer"
 
         num_tokens, num_heads = q.shape[0], q.shape[1]
-        q_fp4, q_sf = quantize_fp4_indexer_tensor(q.flatten(0, 1), rne=True)
+        q_fp4, q_sf = (
+            self._low_ratio_quantize_q_prefill_graph(q)
+            if prepared_q is None
+            else prepared_q
+        )
         weights = w.float()
 
         lens = metadata.compressed_seq_lens
@@ -3576,27 +3644,14 @@ class DeepseekV4AttnBackend(
             local_req_ids = self.forward_metadata.low_ratio_local_req_indices
             assert req_ids is not None and req_lens is not None
             assert local_req_ids is not None and local_req_ids.shape[0] == num_tokens
-            # The graph key contains token count but not request count. Keep
-            # fixed segment offsets, but gather only each live request's real K
-            # prefix; padded request slots and context suffixes do no memory IO.
-            ks = self.forward_metadata.low_ratio_dense_k_offsets.get(ratio)
-            if ks is None:
-                ks = _prefill_graph_dense_k_offsets(
-                    width,
-                    local_req_ids,
-                    req_ids,
-                )
-                self.forward_metadata.low_ratio_dense_k_offsets[ratio] = ks
             if sparse_table is None:
-                k_fp4 = gather_fp4_index_k_cache_masked(
-                    pool.get_index_k_with_scale_buffer(layer.layer_id),
-                    self.req_to_token,
-                    req_ids,
-                    req_lens,
-                    width=width,
-                    compress_ratio=ratio,
-                    page_size=page_size,
+                prepared_dense_k = (
+                    self._low_ratio_gather_k_prefill_graph(layer)
+                    if prepared_dense_k is None
+                    else prepared_dense_k
                 )
+                assert prepared_dense_k is not None
+                k_fp4, ks = prepared_dense_k
                 q_fp4 = q_fp4.view(num_tokens, num_heads, 64)
                 q_sf = q_sf.view(num_tokens, num_heads)
             else:

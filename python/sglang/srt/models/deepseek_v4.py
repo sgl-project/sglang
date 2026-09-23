@@ -1551,8 +1551,9 @@ class MQALayer(MqaAttentionBase):
     ) -> torch.Tensor:
         """Overlap CP SWA/cache sources with the Q projection after allgather."""
         assert self.alt_streams is not None
+        assert len(self.alt_streams) >= 3
         current_stream = torch.cuda.current_stream()
-        stream_kv, stream_sources = self.alt_streams[0], self.alt_streams[-1]
+        stream_kv, stream_compressor, stream_indexer = self.alt_streams[:3]
         x_linear = x_quant if x_quant is not None else x
 
         qkv_a: Optional[torch.Tensor] = None
@@ -1578,10 +1579,12 @@ class MQALayer(MqaAttentionBase):
             )
 
         stream_kv.wait_stream(current_stream)
-        stream_sources.wait_stream(current_stream)
+        stream_compressor.wait_stream(current_stream)
+        stream_indexer.wait_stream(current_stream)
         with torch.cuda.stream(stream_kv):
             self._store_cp_swa_k(swa_k, forward_batch, attn_backend)
-        with torch.cuda.stream(stream_sources):
+        prepared_dense_k = None
+        with torch.cuda.stream(stream_compressor):
             if self.compressor is not None or (
                 self.indexer is not None and not captured
             ):
@@ -1595,22 +1598,34 @@ class MQALayer(MqaAttentionBase):
                     precomputed_x_global=x_global,
                 )
             if indexer_buffers is not None:
+                # The compressor above writes this layer's index-K cache. Gather
+                # its live dense prefixes on the same stream after that write.
+                prepared_dense_k = attn_backend._low_ratio_gather_k_prefill_graph(self)
+        prepared_q = None
+        with torch.cuda.stream(stream_indexer):
+            if indexer_buffers is not None:
                 # Capture the full CP-local bucket; the paged metadata masks
                 # padding when the indexer runs after the worker join.
                 indexer_buffers["q"].copy_(
                     self.indexer.queries(q_lora, self.freqs_cis[positions])
                 )
                 indexer_buffers["w"].copy_(self.indexer.head_weights(x))
+                prepared_q = attn_backend._low_ratio_quantize_q_prefill_graph(
+                    indexer_buffers["q"]
+                )
 
         q = self._compute_q_b(q_for_wqb, positions, q_out)
         current_stream.wait_stream(stream_kv)
-        current_stream.wait_stream(stream_sources)
+        current_stream.wait_stream(stream_compressor)
+        current_stream.wait_stream(stream_indexer)
         if indexer_buffers is not None:
             attn_backend._low_ratio_index_topk_prefill_graph(
                 self,
                 attn_backend.forward_metadata.low_ratio_pos_i64,
                 indexer_buffers["q"],
                 indexer_buffers["w"],
+                prepared_q=prepared_q,
+                prepared_dense_k=prepared_dense_k,
             )
         del qkv_a
         return q
