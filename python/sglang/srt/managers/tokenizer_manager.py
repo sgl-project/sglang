@@ -2939,6 +2939,12 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         i: int,
     ) -> None:
         """Calculate speculative decoding metrics, such as acceptance rate and acceptance length metrics."""
+        bootstrap_tokens = getattr(recv_obj, "pd_draft_bootstrap_tokens", None)
+        if bootstrap_tokens and i < len(bootstrap_tokens) and bootstrap_tokens[i]:
+            # Extra target-prefix replay, in addition to CTX's computed input.
+            # Keep cache hit accounting unchanged; consumers must add this cost
+            # explicitly rather than treating replay as a cache-reuse win.
+            meta_info["pd_draft_bootstrap_tokens"] = bootstrap_tokens[i]
         if (
             hasattr(recv_obj, "spec_verify_ct")
             and recv_obj.spec_verify_ct[i] > 0

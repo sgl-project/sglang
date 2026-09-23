@@ -22,6 +22,10 @@ def build_eagle_disagg_draft_input(
     last_tokens_tensor: torch.Tensor,
     future_map: FutureMap,
 ) -> EagleDraftInput:
+    if any(getattr(req, "pd_draft_bootstrap_pending", False) for req in batch.reqs):
+        raise RuntimeError(
+            "GEN draft bootstrap must finish before speculative batch construction"
+        )
     # Adaptive spec moves the step count after publish, and this runs once per
     # prebuilt batch.
     spec = get_spec()

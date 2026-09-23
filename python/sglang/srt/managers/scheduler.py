@@ -1488,7 +1488,14 @@ class Scheduler(
             else None
         )
 
-        if self.spec_algorithm.carries_draft_hidden_states():
+        receive_target_only = (
+            self.disaggregation_mode == DisaggregationMode.DECODE
+            and get_disagg().disaggregation_decode_draft_bootstrap
+        )
+        if (
+            self.spec_algorithm.carries_draft_hidden_states()
+            and not receive_target_only
+        ):
             # Derive the rank-uniform PD wire schema from config because only the
             # last prefill PP stage owns a draft runner.
             draft_model_config = ModelConfig.from_server_args(
@@ -1515,6 +1522,7 @@ class Scheduler(
         if (
             self.disaggregation_mode != DisaggregationMode.NULL
             and self.spec_algorithm.is_eagle()
+            and not receive_target_only
             and get_spec().speculative_use_rejection_sampling
         ):
             if get_spec().enable_multi_layer_eagle:

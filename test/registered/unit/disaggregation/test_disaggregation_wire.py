@@ -792,7 +792,9 @@ class TestEagleDsaSeedTransfer(CustomTestCase):
                         f"{module}.get_disagg",
                         return_value=SimpleNamespace(
                             disaggregation_mode=mode.value,
+                            disaggregation_decode_draft_bootstrap=False,
                             disaggregation_transfer_backend="fake",
+                            disaggregation_decode_draft_bootstrap=False,
                             language_only=False,
                         ),
                     ),
@@ -854,7 +856,9 @@ class TestEagleDsaSeedTransfer(CustomTestCase):
         ):
             buffers.set_buf(self._make_req(None))
 
-    def _commit_draft_probs(self, proposal_token, bootstrap_host, transfer_backend):
+    def _commit_draft_probs(
+        self, proposal_token, bootstrap_host, transfer_backend, bootstrap=False
+    ):
         buffers = MetadataBuffers(
             size=1,
             hidden_size=2,
@@ -888,10 +892,18 @@ class TestEagleDsaSeedTransfer(CustomTestCase):
             kv_receiver=Mock(),
         )
 
-        with patch(
-            "sglang.srt.disaggregation.utils.get_disagg",
-            return_value=SimpleNamespace(
-                disaggregation_transfer_backend=transfer_backend
+        with (
+            patch(
+                "sglang.srt.disaggregation.utils.get_disagg",
+                return_value=SimpleNamespace(
+                    disaggregation_transfer_backend=transfer_backend
+                ),
+            ),
+            patch(
+                "sglang.srt.disaggregation.decode.get_disagg",
+                return_value=SimpleNamespace(
+                    disaggregation_decode_draft_bootstrap=bootstrap
+                ),
             ),
         ):
             queue._commit_transfer_to_req(decode_req)
@@ -900,6 +912,18 @@ class TestEagleDsaSeedTransfer(CustomTestCase):
         self.assertTrue(torch.equal(buffers.output_draft_probs[0], original_probs))
         self.assertEqual(buffers.output_topk_index[0, 0].item(), proposal_token)
         return req
+
+    def test_target_only_transfer_defers_draft_initialization(self):
+        req = self._commit_draft_probs(2, "127.0.0.1", "mooncake", bootstrap=True)
+        self.assertTrue(req.pd_draft_bootstrap_pending)
+        for field in (
+            "output_topk_p",
+            "output_topk_index",
+            "hidden_states_tensor",
+            "output_draft_probs",
+            "output_dsa_topk_indices",
+        ):
+            self.assertIsNone(getattr(req, field), field)
 
     def test_fake_transfer_initializes_one_hot_draft_probs(self):
         for bootstrap_host, backend in (

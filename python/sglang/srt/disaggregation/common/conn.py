@@ -104,6 +104,7 @@ class PrefillServerInfo:
     enable_dsa_cache_layer_split: bool = False
     # None means an older peer did not advertise its metadata layout.
     speculative_use_rejection_sampling: Optional[bool] = None
+    speculative_draft_metadata: Optional[bool] = None
     dsv41_spec_layout: Optional[dict] = None
 
     # PD true-retraction rebootstrap: the prefill's HTTP API port. The decode
@@ -919,18 +920,18 @@ class CommonKVManager(BaseKVManager):
 
         # Sanity checks
         if self.disaggregation_mode == DisaggregationMode.DECODE:
-            prefill_rejection_sampling = info.speculative_use_rejection_sampling
-            decode_rejection_sampling = get_spec().speculative_use_rejection_sampling
-            if (
-                type(prefill_rejection_sampling) is not bool
-                or prefill_rejection_sampling != decode_rejection_sampling
-            ):
-                raise RuntimeError(
-                    "PD --speculative-use-rejection-sampling mismatch or unknown setting: "
-                    f"prefill={prefill_rejection_sampling}, "
-                    f"decode={decode_rejection_sampling} ({bootstrap_addr}). "
-                    "Both workers must run compatible versions and use the same flag."
-                )
+            from sglang.srt.disaggregation.draft_bootstrap import validate_draft_handoff
+            from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+
+            validate_draft_handoff(
+                prefill_has_draft=info.speculative_draft_metadata,
+                prefill_rs=info.speculative_use_rejection_sampling,
+                decode_has_draft=SpeculativeAlgorithm.from_string(
+                    get_spec().speculative_algorithm
+                ).carries_draft_hidden_states(),
+                decode_rs=get_spec().speculative_use_rejection_sampling,
+                decode_bootstrap=get_disagg().disaggregation_decode_draft_bootstrap,
+            )
 
         if info.page_size is not None and info.page_size != self.kv_args.page_size:
             raise RuntimeError(
@@ -1101,6 +1102,8 @@ class CommonKVManager(BaseKVManager):
 
     def register_to_bootstrap(self):
         """Register prefill server info to bootstrap server via HTTP PUT."""
+        from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+
         if self.dist_init_addr:
             # Multi-node case: bootstrap server's host is dist_init_addr
             host = NetworkAddress.parse(self.dist_init_addr).resolved().host
@@ -1134,6 +1137,9 @@ class CommonKVManager(BaseKVManager):
             "dsv41_spec_layout": self.dsv41_spec_layout,
             "load_balance_method": get_parallel().load_balance_method,
             "enable_dsa_cache_layer_split": get_parallel().enable_dsa_cache_layer_split,
+            "speculative_draft_metadata": SpeculativeAlgorithm.from_string(
+                get_spec().speculative_algorithm
+            ).carries_draft_hidden_states(),
             "speculative_use_rejection_sampling": get_spec().speculative_use_rejection_sampling,
             # Self-register the HTTP API port so the decode can derive the PD
             # retract rebootstrap /generate URL from bootstrap info instead of a
@@ -2050,6 +2056,7 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         self.follow_bootstrap_room: Optional[bool] = None
         self.enable_dsa_cache_layer_split: Optional[bool] = None
         self.speculative_use_rejection_sampling: Optional[bool] = None
+        self.speculative_draft_metadata: Optional[bool] = None
         self.prefill_http_port: Optional[int] = None
         self.prefill_port_table: Dict[
             int, Dict[int, Dict[int, Dict[int, PrefillRankInfo]]]
@@ -2159,6 +2166,12 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
                 data.get("enable_dsa_cache_layer_split", False)
             )
 
+        if self._registered_count == 0:
+            self.speculative_draft_metadata = data.get("speculative_draft_metadata")
+        elif self.speculative_draft_metadata != data.get("speculative_draft_metadata"):
+            # Poison the aggregate on mixed ranks. Never recover from unknown
+            # capability by accepting a later registration as the first one.
+            self.speculative_draft_metadata = None
         if self.speculative_use_rejection_sampling is None:
             self.speculative_use_rejection_sampling = data.get(
                 "speculative_use_rejection_sampling"
@@ -2229,6 +2242,7 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
                     else True
                 ),
                 enable_dsa_cache_layer_split=bool(self.enable_dsa_cache_layer_split),
+                speculative_draft_metadata=self.speculative_draft_metadata,
                 speculative_use_rejection_sampling=self.speculative_use_rejection_sampling,
                 prefill_http_port=self.prefill_http_port,
             )

@@ -31,6 +31,7 @@ class TestRegisterToBootstrap(CustomTestCase):
             load_balance_method="follow_bootstrap_room",
             port=30000,
             speculative_use_rejection_sampling=False,
+            speculative_algorithm=None,
         )
         override.install()
         self.addCleanup(override.restore)
@@ -188,6 +189,7 @@ class TestRegisterToBootstrap(CustomTestCase):
             "page_size",
             "kv_cache_dtype",
             "speculative_use_rejection_sampling",
+            "speculative_draft_metadata",
             # Self-registered HTTP API port used to derive the PD retract
             # rebootstrap /generate URL on the decode side.
             "prefill_http_port",
@@ -196,6 +198,34 @@ class TestRegisterToBootstrap(CustomTestCase):
             self.assertIn(field, payload)
         self.assertEqual(payload["prefill_http_port"], 30000)
         self.assertIs(payload["speculative_use_rejection_sampling"], False)
+        self.assertIs(payload["speculative_draft_metadata"], False)
+
+    @patch("sglang.srt.disaggregation.common.conn.requests.put")
+    def test_payload_capability_tracks_draft_algorithm_not_rs(self, mock_put):
+        mock_put.return_value.status_code = 200
+        for algorithm, expected in (
+            (None, False),
+            ("EAGLE", True),
+            ("EAGLE3", True),
+            ("FROZEN_KV_MTP", True),
+        ):
+            for rs in (False, True):
+                with self.subTest(algorithm=algorithm, rs=rs):
+                    override = get_context().override_server_args(
+                        speculative_algorithm=algorithm,
+                        speculative_use_rejection_sampling=rs,
+                    )
+                    override.install()
+                    try:
+                        self._make_manager().register_to_bootstrap()
+                        self.assertIs(
+                            mock_put.call_args.kwargs["json"][
+                                "speculative_draft_metadata"
+                            ],
+                            expected,
+                        )
+                    finally:
+                        override.restore()
 
     @patch("sglang.srt.disaggregation.common.conn.requests.put")
     def test_payload_advertises_rejection_sampling_enabled(self, mock_put):
@@ -431,6 +461,7 @@ class TestPDConfigCompatibility(unittest.IsolatedAsyncioTestCase):
             "page_size": 16,
             "kv_cache_dtype": "bfloat16",
             FLAG: enabled,
+            "speculative_draft_metadata": True,
         }
 
     async def _register(self, payload):
@@ -471,7 +502,15 @@ class TestPDConfigCompatibility(unittest.IsolatedAsyncioTestCase):
             patch(f"{CONN}.requests.get", return_value=response),
             patch(
                 f"{CONN}.get_spec",
-                return_value=SimpleNamespace(**{FLAG: decode_enabled}),
+                return_value=SimpleNamespace(
+                    **{FLAG: decode_enabled, "speculative_algorithm": "EAGLE"}
+                ),
+            ),
+            patch(
+                f"{CONN}.get_disagg",
+                return_value=SimpleNamespace(
+                    disaggregation_decode_draft_bootstrap=False
+                ),
             ),
         ):
             return manager.try_ensure_parallel_info("127.0.0.1:8998")

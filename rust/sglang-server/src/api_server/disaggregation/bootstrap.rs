@@ -45,6 +45,7 @@ struct PrefillServerInfo {
     follow_bootstrap_room: bool,
     enable_dsa_cache_layer_split: bool,
     speculative_use_rejection_sampling: Option<bool>,
+    speculative_draft_metadata: Option<bool>,
     prefill_http_port: Option<i64>,
 }
 
@@ -113,6 +114,7 @@ struct Topology {
     follow_bootstrap_room: Option<bool>,
     enable_dsa_cache_layer_split: Option<bool>,
     speculative_use_rejection_sampling: Option<bool>,
+    speculative_draft_metadata: Option<bool>,
     prefill_http_port: Option<i64>,
     /// Keyed `(dp_group, attn_cp_rank, attn_tp_rank, pp_rank)` — the flat form
     /// of Python's nested `prefill_port_table` dicts.
@@ -168,6 +170,7 @@ struct Route {
     enable_dsa_cache_layer_split: Option<bool>,
     #[serde(default)]
     speculative_use_rejection_sampling: Option<bool>,
+    speculative_draft_metadata: Option<bool>,
 }
 
 async fn route_put(State(state): State<Arc<Registry>>, Json(body): Json<Route>) -> Response {
@@ -213,6 +216,12 @@ async fn route_put(State(state): State<Arc<Registry>>, Json(body): Json<Route>) 
         );
         topo.enable_dsa_cache_layer_split
             .get_or_insert(body.enable_dsa_cache_layer_split.unwrap_or(false));
+        if topo.registered_count == 0 {
+            topo.speculative_draft_metadata = body.speculative_draft_metadata;
+        } else if topo.speculative_draft_metadata != body.speculative_draft_metadata {
+            // Mixed capabilities must fail closed at the decode handshake.
+            topo.speculative_draft_metadata = None;
+        }
         if topo.speculative_use_rejection_sampling.is_none() {
             topo.speculative_use_rejection_sampling = body.speculative_use_rejection_sampling;
         }
@@ -292,6 +301,7 @@ async fn route_get(
             follow_bootstrap_room: topo.follow_bootstrap_room.unwrap_or(true),
             enable_dsa_cache_layer_split: topo.enable_dsa_cache_layer_split.unwrap_or(false),
             speculative_use_rejection_sampling: topo.speculative_use_rejection_sampling,
+            speculative_draft_metadata: topo.speculative_draft_metadata,
             prefill_http_port: topo.prefill_http_port,
         })
         .into_response();
@@ -388,6 +398,36 @@ pub(crate) fn router_and_sweeper() -> (Router, impl std::future::Future<Output =
 #[cfg(test)]
 mod tests {
     #[test]
+    fn draft_metadata_capability_round_trip() {
+        for capability in [Some(false), Some(true), None] {
+            let (_rt, addr) = start_on_free_port();
+            let mut body = put_route(serde_json::json!({"speculative_draft_metadata": capability}));
+            if capability.is_none() {
+                body.as_object_mut().unwrap().remove("speculative_draft_metadata");
+            }
+            assert_eq!(request(addr, "PUT", "/route", Some(&body)).0, 200);
+            let (status, body) = request(addr, "GET", SENTINEL, None);
+            assert_eq!(status, 200);
+            let info: serde_json::Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(info.get("speculative_draft_metadata"), Some(&serde_json::json!(capability)));
+        }
+    }
+
+    #[test]
+    fn mixed_draft_capabilities_stay_unknown() {
+        let (_rt, addr) = start_on_free_port();
+        for capability in [false, true, true] {
+            let body = put_route(serde_json::json!({"speculative_draft_metadata": capability}));
+            assert_eq!(request(addr, "PUT", "/route", Some(&body)).0, 200);
+        }
+        let (status, body) = request(addr, "GET", SENTINEL, None);
+        assert_eq!(status, 200);
+        let info: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(info.get("speculative_draft_metadata"), Some(&serde_json::Value::Null));
+    }
+
+
+    #[test]
     fn rejection_sampling_flag_round_trip() {
         for enabled in [Some(false), Some(true), None] {
             let (_rt, addr) = start_on_free_port();
@@ -464,6 +504,7 @@ mod tests {
             "load_balance_method": "follow_bootstrap_room",
             "enable_dsa_cache_layer_split": false,
             "speculative_use_rejection_sampling": false,
+            "speculative_draft_metadata": false,
             "prefill_http_port": 30000,
         });
         body.as_object_mut()
@@ -554,6 +595,7 @@ mod tests {
                 "follow_bootstrap_room": true,
                 "enable_dsa_cache_layer_split": false,
                 "speculative_use_rejection_sampling": false,
+                "speculative_draft_metadata": false,
                 "prefill_http_port": 30000,
             })
         );
