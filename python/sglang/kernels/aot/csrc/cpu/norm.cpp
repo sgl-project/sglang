@@ -149,7 +149,7 @@ struct NormTraits<NormMode::RMSNormGated> : NormTraitsBase {
 };
 
 #if defined(CPU_CAPABILITY_AVX512)
-template <NormMode M, typename input_t, typename weight_t, typename bias_t, int D>
+template <NormMode M, typename input_t, typename param_t, int D, bool has_bias>
 struct NormReduce {
   static inline void apply(
       input_t* __restrict__ out,
@@ -157,9 +157,8 @@ struct NormReduce {
       const input_t* __restrict__ gate,
       const NormParams& params) {
     static_assert(D % 32 == 0);
+    static_assert(!has_bias || NormTraits<M>::has_bias);
     constexpr int COLS = D / 32;
-
-    const bool use_bias = params.bias != nullptr;
 
     __m512 va0[COLS], va1[COLS];
     __m512 vmean, vrscale;
@@ -199,7 +198,7 @@ struct NormReduce {
       value1 = _mm512_mul_ps(value1, vrscale);
       if constexpr (NormTraits<M>::has_weight) {
         // TODO: need to block B to hide weight reload
-        const weight_t* weight = static_cast<const weight_t*>(params.weight);
+        const param_t* weight = static_cast<const param_t*>(params.weight);
         __m512 weight0, weight1;
         std::tie(weight0, weight1) = load_float_vec2(weight + col * 32);
         if constexpr (NormTraits<M>::has_shift) {
@@ -209,14 +208,12 @@ struct NormReduce {
         value0 = NormTraits<M>::apply_weight(value0, weight0);
         value1 = NormTraits<M>::apply_weight(value1, weight1);
       }
-      if constexpr (NormTraits<M>::has_bias) {
-        if (use_bias) {
-          const bias_t* bias = static_cast<const bias_t*>(params.bias);
-          __m512 bias0, bias1;
-          std::tie(bias0, bias1) = load_float_vec2(bias + col * 32);
-          value0 = NormTraits<M>::apply_bias(value0, bias0);
-          value1 = NormTraits<M>::apply_bias(value1, bias1);
-        }
+      if constexpr (has_bias) {
+        const param_t* bias = static_cast<const param_t*>(params.bias);
+        __m512 bias0, bias1;
+        std::tie(bias0, bias1) = load_float_vec2(bias + col * 32);
+        value0 = NormTraits<M>::apply_bias(value0, bias0);
+        value1 = NormTraits<M>::apply_bias(value1, bias1);
       }
       if constexpr (NormTraits<M>::has_gate) {
         __m512 gate0, gate1;
@@ -235,7 +232,7 @@ struct NormReduce {
 };
 #endif
 
-template <NormMode M, typename input_t, bool has_residual, typename weight_t = input_t, typename bias_t = input_t>
+template <NormMode M, typename input_t, bool has_residual, typename param_t = input_t, bool has_bias = NormTraits<M>::has_bias>
 struct NormReduceGeneric {
   static inline void apply(
       input_t* __restrict__ out,
@@ -244,11 +241,11 @@ struct NormReduceGeneric {
       input_t* __restrict__ residual,
       const NormParams& params,
       int D) {
+    static_assert(!has_bias || NormTraits<M>::has_bias);
     using bVec = at::vec::Vectorized<input_t>;
     using fVec = at::vec::Vectorized<float>;
     constexpr int kVecSize = 2 * fVec::size();
 
-    const bool use_bias = params.bias != nullptr;
     fVec sum_fvec{0.f}, sum2_fvec{0.f};
     float sum_val{0.f}, sum2_val{0.f};
 
@@ -315,7 +312,7 @@ struct NormReduceGeneric {
       x_fvec0 = x_fvec0 * scale_fvec;
       x_fvec1 = x_fvec1 * scale_fvec;
       if constexpr (NormTraits<M>::has_weight) {
-        auto [w_fvec0, w_fvec1] = load_float_vec2(static_cast<const weight_t*>(params.weight) + d);
+        auto [w_fvec0, w_fvec1] = load_float_vec2(static_cast<const param_t*>(params.weight) + d);
         if constexpr (NormTraits<M>::has_shift) {
           w_fvec0 = NormTraits<M>::apply_shift(w_fvec0, shift_fvec);
           w_fvec1 = NormTraits<M>::apply_shift(w_fvec1, shift_fvec);
@@ -323,12 +320,10 @@ struct NormReduceGeneric {
         x_fvec0 = NormTraits<M>::apply_weight(x_fvec0, w_fvec0);
         x_fvec1 = NormTraits<M>::apply_weight(x_fvec1, w_fvec1);
       }
-      if constexpr (NormTraits<M>::has_bias) {
-        if (use_bias) {
-          auto [b_fvec0, b_fvec1] = load_float_vec2(static_cast<const bias_t*>(params.bias) + d);
-          x_fvec0 = NormTraits<M>::apply_bias(x_fvec0, b_fvec0);
-          x_fvec1 = NormTraits<M>::apply_bias(x_fvec1, b_fvec1);
-        }
+      if constexpr (has_bias) {
+        auto [b_fvec0, b_fvec1] = load_float_vec2(static_cast<const param_t*>(params.bias) + d);
+        x_fvec0 = NormTraits<M>::apply_bias(x_fvec0, b_fvec0);
+        x_fvec1 = NormTraits<M>::apply_bias(x_fvec1, b_fvec1);
       }
       if constexpr (NormTraits<M>::has_gate) {
         auto [g_fvec0, g_fvec1] = load_float_vec2(static_cast<const input_t*>(gate) + d);
@@ -355,17 +350,15 @@ struct NormReduceGeneric {
       }
       x_val *= rsqrt_var;
       if constexpr (NormTraits<M>::has_weight) {
-        float w_val = static_cast<float>(static_cast<const weight_t*>(params.weight)[d]);
+        float w_val = static_cast<float>(static_cast<const param_t*>(params.weight)[d]);
         if constexpr (NormTraits<M>::has_shift) {
           w_val = NormTraits<M>::apply_shift(w_val, params.shift);
         }
         x_val = NormTraits<M>::apply_weight(x_val, w_val);
       }
-      if constexpr (NormTraits<M>::has_bias) {
-        if (use_bias) {
-          float b_val = static_cast<float>(static_cast<const bias_t*>(params.bias)[d]);
-          x_val = NormTraits<M>::apply_bias(x_val, b_val);
-        }
+      if constexpr (has_bias) {
+        float b_val = static_cast<float>(static_cast<const param_t*>(params.bias)[d]);
+        x_val = NormTraits<M>::apply_bias(x_val, b_val);
       }
       if constexpr (NormTraits<M>::has_gate) {
         float g_val = static_cast<float>(static_cast<const input_t*>(gate)[d]);
@@ -393,11 +386,11 @@ struct NormReduceGeneric {
     LAUNCH_PARALLEL_LOOP(                                                                         \
         const input_t* __restrict__ gate_ptr{nullptr}; if constexpr (NormTraits<M>::has_gate) {   \
           gate_ptr = gate + p.output_offset(b, h, t);                                             \
-        } NormReduce<M, input_t, weight_t, bias_t, DIM>::                                         \
+        } NormReduce<M, input_t, param_t, DIM, has_bias>::                                        \
             apply(out + p.output_offset(b, h, t), input + p.input_offset(b, h, t), gate_ptr, p)); \
     return
 
-template <NormMode M, typename input_t, typename weight_t = input_t, typename bias_t = input_t>
+      template <NormMode M, typename input_t, typename param_t = input_t, bool has_bias = NormTraits<M>::has_bias>
 void norm4d_kernel_impl(
     input_t* __restrict__ out,
     const input_t* __restrict__ input,
@@ -419,11 +412,11 @@ void norm4d_kernel_impl(
   LAUNCH_PARALLEL_LOOP(
       const input_t* __restrict__ gate_ptr{nullptr}; if constexpr (NormTraits<M>::has_gate) {
         gate_ptr = gate + p.output_offset(b, h, t);
-      } NormReduceGeneric<M, input_t, false, weight_t, bias_t>::
+      } NormReduceGeneric<M, input_t, false, param_t, has_bias>::
           apply(out + p.output_offset(b, h, t), input + p.input_offset(b, h, t), gate_ptr, nullptr, p, p.D));
 }
 
-template <NormMode M, typename scalar_t>
+    template <NormMode M, typename scalar_t, bool has_bias = NormTraits<M>::has_bias>
 void fused_add_norm4d_kernel_impl(
     scalar_t* __restrict__ out,
     const scalar_t* __restrict__ input,
@@ -433,7 +426,7 @@ void fused_add_norm4d_kernel_impl(
   LAUNCH_PARALLEL_LOOP(
       const int64_t out_offset = output_uses_input_stride ? p.input_offset(b, h, t) : p.output_offset(b, h, t);
       scalar_t* __restrict__ residual_ptr = residual + p.output_offset(b, h, t);
-      NormReduceGeneric<M, scalar_t, true>::apply(
+        NormReduceGeneric<M, scalar_t, true, scalar_t, has_bias>::apply(
           out + out_offset, input + p.input_offset(b, h, t), nullptr, residual_ptr, p, p.D));
 }
 
@@ -757,6 +750,12 @@ layernorm_cpu(const at::Tensor& input, const at::Tensor& weight, const std::opti
   CHECK_NORM_PARAMETER(weight, hidden_size);
   if (bias.has_value()) {
     CHECK_NORM_PARAMETER(bias.value(), hidden_size);
+    TORCH_CHECK(
+        bias.value().scalar_type() == weight.scalar_type(),
+        "Expected bias dtype to match weight dtype, got ",
+        bias.value().scalar_type(),
+        " vs ",
+        weight.scalar_type());
   }
 
   NormParams p{input, static_cast<float>(eps)};
@@ -764,20 +763,10 @@ layernorm_cpu(const at::Tensor& input, const at::Tensor& weight, const std::opti
   p.bias = bias.has_value() ? bias.value().data_ptr() : nullptr;
 
   at::Tensor output = at::empty_like(input);
-  AT_DISPATCH_REDUCED_FLOATING_TYPES_AND(at::kFloat, st, "layernorm_input", [&] {
-    using input_t = scalar_t;
-    AT_DISPATCH_REDUCED_FLOATING_TYPES_AND(at::kFloat, weight.scalar_type(), "layernorm_weight", [&] {
-      using weight_t = scalar_t;
-      if (bias.has_value()) {
-        AT_DISPATCH_REDUCED_FLOATING_TYPES_AND(at::kFloat, bias.value().scalar_type(), "layernorm_bias", [&] {
-          using bias_t = scalar_t;
-          norm4d_kernel_impl<NormMode::LayerNorm, input_t, weight_t, bias_t>(
-              output.data_ptr<input_t>(), input.data_ptr<input_t>(), p);
-        });
-      } else {
-        norm4d_kernel_impl<NormMode::LayerNorm, input_t, weight_t, weight_t>(
-            output.data_ptr<input_t>(), input.data_ptr<input_t>(), p);
-      }
+  CPU_DISPATCH_FLOATING_TYPES_EXT(st, weight.scalar_type(), "layernorm_kernel", [&] {
+    AT_DISPATCH_BOOL(bias.has_value(), has_bias, [&] {
+      norm4d_kernel_impl<NormMode::LayerNorm, scalar_t, param_t, has_bias>(
+          output.data_ptr<scalar_t>(), input.data_ptr<scalar_t>(), p);
     });
   });
   return output;
@@ -878,8 +867,10 @@ at::Tensor fused_add_layernorm_cpu(
 
   at::Tensor output = at::empty_like(input);
   AT_DISPATCH_REDUCED_FLOATING_TYPES(st, "fused_add_layernorm_kernel", [&] {
-    fused_add_norm4d_kernel_impl<NormMode::LayerNorm, scalar_t>(
-        output.data_ptr<scalar_t>(), input.data_ptr<scalar_t>(), residual.data_ptr<scalar_t>(), p);
+    AT_DISPATCH_BOOL(bias.has_value(), has_bias, [&] {
+      fused_add_norm4d_kernel_impl<NormMode::LayerNorm, scalar_t, has_bias>(
+          output.data_ptr<scalar_t>(), input.data_ptr<scalar_t>(), residual.data_ptr<scalar_t>(), p);
+    });
   });
   return output;
 }
