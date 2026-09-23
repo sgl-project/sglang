@@ -3457,6 +3457,15 @@ class KimiK3ForConditionalGeneration(nn.Module):
         },
     )
 
+    @staticmethod
+    def get_lora_target_module_name(name: str) -> str:
+        parent, _, leaf = name.rpartition(".")
+        if ".experts" in parent:
+            return {"w1": "gate_proj", "w2": "down_proj", "w3": "up_proj"}.get(
+                leaf, name
+            )
+        return name
+
     def __init__(
         self,
         config: KimiK3Config,

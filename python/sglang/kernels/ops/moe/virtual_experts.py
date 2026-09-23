@@ -677,9 +677,10 @@ def _merged_experts_fused_moe_lora_add_impl(
         f"{topk_ids.shape[0]} (DP-gathered?) tokens; mapping was sized before the dp gather "
         f"length was known (see get_gathered_moe_num_tokens)"
     )
+    # Split-K atomic additions must accumulate before rounding to the activation dtype.
     intermediate = torch.zeros(
         [topk_ids.shape[0], topk_ids.shape[1], max_lora_rank],
-        dtype=hidden_states.dtype,
+        dtype=torch.float32,
         device=hidden_states.device,
     )
 
@@ -709,6 +710,7 @@ def _merged_experts_fused_moe_lora_add_impl(
         a_stage_config,
     )
 
+    intermediate = intermediate.to(hidden_states.dtype)
     b_stage_config = _get_stage_config(lora_b_virtuals[0], 1)
     (
         sorted_token_ids,

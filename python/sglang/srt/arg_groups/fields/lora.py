@@ -24,10 +24,6 @@ from sglang.srt.arg_groups.arg_utils import (
 )
 from sglang.srt.arg_groups.argparse_actions import LoRAPathAction
 from sglang.srt.lora.lora_registry import LoRARef
-from sglang.srt.utils.common import (
-    LORA_TARGET_ALL_MODULES,
-    SUPPORTED_LORA_TARGET_MODULES,
-)
 
 
 class Lora(msgspec.Struct):
@@ -53,9 +49,12 @@ class Lora(msgspec.Struct):
     lora_target_modules: A[
         Optional[Union[set[str], List[str]]],
         Arg(
-            help="The union set of all target modules where LoRA should be applied. If not specified, it will be automatically inferred from the adapters provided in --lora-paths. If 'all' is specified, all supported modules will be targeted.",
+            help=(
+                "HF module names or paths where LoRA should be applied; fused names are "
+                "resolved by the loaded model. If not specified, infer targets from "
+                "--lora-paths. Use 'all' to target all supported modules."
+            ),
             nargs="*",
-            choices=SUPPORTED_LORA_TARGET_MODULES + [LORA_TARGET_ALL_MODULES],
         ),
     ] = None
     lora_paths: A[

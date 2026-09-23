@@ -1114,6 +1114,20 @@ class InklingForConditionalGeneration(nn.Module):
             return hidden_size, config.vocab_size
         raise NotImplementedError(f"get_hidden_dim not implemented for {module_name}")
 
+    @staticmethod
+    def get_lora_target_module_name(name: str) -> str:
+        parent, _, leaf = name.rpartition(".")
+        if parent.endswith(".attn"):
+            mappings = ATTENTION_PARAMS_MAPPING
+        elif parent.endswith((".mlp.experts", ".mlp.shared_experts")):
+            mappings = STACKED_DENSE_PARAMS_MAPPING
+        else:
+            return name
+        for module_name, weight_name, _ in mappings:
+            if leaf == weight_name:
+                return module_name
+        return name
+
     def get_stacked_multiply(self, module_name: str) -> int:
         if module_name == "qkvr":
             return 4
