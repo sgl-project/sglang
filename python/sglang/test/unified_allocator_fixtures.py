@@ -24,7 +24,7 @@ from sglang.srt.server_args import ServerArgs
 
 def setup_allocator_context():
     reset_context()
-    publish(ServerArgs(model_path="Qwen/Qwen3-0.6B", device="cpu"), role="tokenizer")
+    publish(ServerArgs(model_path="dummy", device="cpu"), role="tokenizer")
 
 
 def build_swa_pool(
