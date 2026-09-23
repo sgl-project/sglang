@@ -107,6 +107,38 @@ async fn prefill_uses_estimated_queue_time_only_when_both_engines_have_rates() {
 }
 
 #[tokio::test]
+async fn queue_time_is_compared_only_when_every_sampled_engine_has_a_rate() {
+    let engines: Vec<_> = ["a", "b", "c"]
+        .into_iter()
+        .map(|id| engine(id, Stage::Prefill, 0))
+        .collect();
+    let table = EngineReportedLoadTable::new();
+    // Pairwise, C beats A on queue time, A beats B and B beats C on queued
+    // tokens. B has no rate, so the whole sample compares queued tokens.
+    for (worker, pending, prefilled) in [
+        (&engines[0], 10, Some(100)),
+        (&engines[1], 50, None),
+        (&engines[2], 100, Some(10_000)),
+    ] {
+        let mut report = load(1, 1, 10, 100, pending);
+        table.set(&worker.url, 0, report.clone(), Instant::now());
+        if let Some(prefilled) = prefilled {
+            let native = report.native_cache.as_mut().unwrap();
+            native.total_prefill_uncached_tokens = prefilled;
+            native.total_prefill_busy_us = 1_000_000;
+            table.set(&worker.url, 0, report, Instant::now());
+        }
+    }
+    let policy = PowerOfNPolicy::new(table).with_choices(3).unwrap();
+    let model = ModelId("m".into());
+    let request = PickRequest::new(&model, Stage::Prefill, 10);
+    for _ in 0..64 {
+        let pick = policy.pick(&engines, &request).await.unwrap();
+        assert!(Arc::ptr_eq(&pick.engine, &engines[0]));
+    }
+}
+
+#[tokio::test]
 async fn decode_orders_by_waiting_running_kv_fraction_then_tokens() {
     let cases = [
         (load(50, 1, 90, 100, 0), load(1, 2, 1, 100, 0)),

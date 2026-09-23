@@ -7,7 +7,7 @@ use std::time::Instant;
 use futures::future::BoxFuture;
 use rand::seq::index::sample;
 
-use crate::policies::admission::{compare_decode_pressure, compare_prefill_pressure};
+use crate::policies::admission::{least_decode_pressure, least_prefill_pressure};
 use crate::state::load_monitor::engine_reported_load::EngineReportedLoadTable;
 use crate::workers::Worker;
 
@@ -56,28 +56,20 @@ impl Policy for PowerOfNPolicy {
             }
             // Selection and admission use the same load observation.
             let load = self.engine_load.capture_snapshot(Instant::now());
-            let candidates = sample(
+            // The sample is shuffled, so keeping the first of tied engines is random.
+            let candidates: Vec<_> = sample(
                 &mut rand::thread_rng(),
                 engines.len(),
                 self.choices.min(engines.len()),
-            );
-            let engine = candidates
-                .iter()
-                .map(|i| &engines[i])
-                .reduce(|left, right| {
-                    let pressure = match request.stage {
-                        Stage::Plain | Stage::Prefill => {
-                            compare_prefill_pressure(left, right, Some(&load))
-                        }
-                        Stage::Decode => compare_decode_pressure(left, right, Some(&load)),
-                    };
-                    if pressure.is_gt() {
-                        right
-                    } else {
-                        left
-                    }
-                })
-                .expect("nonempty candidate sample");
+            )
+            .iter()
+            .map(|i| &engines[i])
+            .collect();
+            let best = match request.stage {
+                Stage::Plain | Stage::Prefill => least_prefill_pressure(&candidates, Some(&load)),
+                Stage::Decode => least_decode_pressure(&candidates, Some(&load)),
+            };
+            let engine = candidates[best.expect("nonempty candidate sample")];
             let metrics = EngineMetrics::observe(engine, &load);
             if let Decision::Reject(reason) = self.admission.check(engine, &metrics)? {
                 return Err(PickError::AdmissionRejected(Rejection {

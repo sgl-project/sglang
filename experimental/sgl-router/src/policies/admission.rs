@@ -1013,17 +1013,106 @@ fn compare_decode_load(
     left: &EngineReportedSchedulingLoad,
     right: &EngineReportedSchedulingLoad,
 ) -> Ordering {
-    let kv_usage = match (left.max_total_num_tokens, right.max_total_num_tokens) {
-        (left_cap, right_cap) if left_cap > 0 && right_cap > 0 => u128::from(left.num_used_tokens)
-            .saturating_mul(u128::from(right_cap))
-            .cmp(&u128::from(right.num_used_tokens).saturating_mul(u128::from(left_cap))),
-        _ => Ordering::Equal,
+    let kv_known = left.max_total_num_tokens > 0 && right.max_total_num_tokens > 0;
+    compare_decode_load_with(left, right, kv_known)
+}
+
+fn compare_decode_load_with(
+    left: &EngineReportedSchedulingLoad,
+    right: &EngineReportedSchedulingLoad,
+    compare_kv_usage: bool,
+) -> Ordering {
+    let kv_usage = if compare_kv_usage {
+        u128::from(left.num_used_tokens)
+            .saturating_mul(u128::from(right.max_total_num_tokens))
+            .cmp(
+                &u128::from(right.num_used_tokens)
+                    .saturating_mul(u128::from(left.max_total_num_tokens)),
+            )
+    } else {
+        Ordering::Equal
     };
     left.num_waiting_reqs
         .cmp(&right.num_waiting_reqs)
         .then_with(|| left.num_running_reqs.cmp(&right.num_running_reqs))
         .then(kv_usage)
         .then_with(|| left.num_used_tokens.cmp(&right.num_used_tokens))
+}
+
+/// Index of the least prefill-pressured worker; ties keep the earliest.
+///
+/// Unlike [`compare_prefill_pressure`], each signal is chosen once for the
+/// whole set: engine load only when every worker has a fresh report, and
+/// queue time only when every report has one. A per-pair choice is not
+/// transitive, so a k-way scan would depend on candidate order. For two
+/// workers the result matches the pairwise comparison.
+pub(crate) fn least_prefill_pressure(
+    workers: &[&Arc<Worker>],
+    snapshot: Option<&EngineReportedLoadSnapshot>,
+) -> Option<usize> {
+    let loads = all_fresh_loads(workers, snapshot);
+    let compare_queue_ms = loads.as_ref().is_some_and(|loads| {
+        loads
+            .iter()
+            .all(|load| load.estimated_prefill_queue_ms.is_some())
+    });
+    least_by_engine_load(workers, loads.as_deref(), |left, right| {
+        if compare_queue_ms {
+            compare_prefill_load(left, right)
+        } else {
+            prefill_pressure_key(left).cmp(&prefill_pressure_key(right))
+        }
+    })
+}
+
+/// Index of the least decode-pressured worker; ties keep the earliest.
+///
+/// Set-wide counterpart of [`compare_decode_pressure`]: KV usage is compared
+/// only when every worker reports a capacity.
+pub(crate) fn least_decode_pressure(
+    workers: &[&Arc<Worker>],
+    snapshot: Option<&EngineReportedLoadSnapshot>,
+) -> Option<usize> {
+    let loads = all_fresh_loads(workers, snapshot);
+    let compare_kv_usage = loads
+        .as_ref()
+        .is_some_and(|loads| loads.iter().all(|load| load.max_total_num_tokens > 0));
+    least_by_engine_load(workers, loads.as_deref(), |left, right| {
+        compare_decode_load_with(left, right, compare_kv_usage)
+    })
+}
+
+fn all_fresh_loads<'a>(
+    workers: &[&Arc<Worker>],
+    snapshot: Option<&'a EngineReportedLoadSnapshot>,
+) -> Option<Vec<&'a EngineReportedSchedulingLoad>> {
+    let snapshot = snapshot?;
+    workers
+        .iter()
+        .map(|worker| snapshot.fresh_native_cache_load_for_url(&worker.url))
+        .collect()
+}
+
+/// Linear scan by engine load, then Router-local in-flight load. Without a
+/// complete set of engine loads, only the Router-local load is compared.
+fn least_by_engine_load(
+    workers: &[&Arc<Worker>],
+    loads: Option<&[&EngineReportedSchedulingLoad]>,
+    compare: impl Fn(&EngineReportedSchedulingLoad, &EngineReportedSchedulingLoad) -> Ordering,
+) -> Option<usize> {
+    // Read each in-flight count once so concurrent dispatches cannot reorder the scan.
+    let inflight: Vec<usize> = workers
+        .iter()
+        .map(|worker| worker.router_inflight_load())
+        .collect();
+    (0..workers.len()).reduce(|best, index| {
+        let engine = loads.map_or(Ordering::Equal, |loads| compare(loads[index], loads[best]));
+        if engine.then(inflight[index].cmp(&inflight[best])).is_lt() {
+            index
+        } else {
+            best
+        }
+    })
 }
 
 fn pressure_guard_prefers_backup(
