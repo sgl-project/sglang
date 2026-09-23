@@ -242,3 +242,17 @@ KV is per layer: each block slices caches by `_layer_id`. Cache-DiT wraps
 `transformer_blocks` and forwards the same extras to every layer; without that
 slice, later layers reuse layer 0 and the image collapses to color noise.
 See the [Cache-DiT guide](/docs/sglang-diffusion/cache_dit).
+
+Measured on one A800 80GB at 1024×1024, 40 steps, CFG off, against the lossless
+output of the same seed (SSIM / PSNR of the RGBA PNG; one prompt each, so treat
+the values as a starting point, not a guarantee):
+
+| `--cache-dit-params` | Generation | Edit |
+| --- | --- | --- |
+| defaults (`residual_diff_threshold` 0.24, 4 warmup steps) | 2.7x, SSIM 0.954 / 30.9 dB | 2.6x, SSIM 0.997 / 39.0 dB |
+| `{"residual_diff_threshold": 0.12, "max_warmup_steps": 8, "enable_taylorseer": true}` | 2.2x, SSIM 0.986 / 37.2 dB | 2.2x, SSIM 0.998 / 41.2 dB |
+| `{"residual_diff_threshold": 0.08, "max_warmup_steps": 8, "max_continuous_cached_steps": 2}` | 1.7x, SSIM 0.989 / 39.0 dB | 1.7x, SSIM 0.999 / 46.6 dB |
+
+The defaults sit at the 0.95 SSIM threshold for generation, so start from the
+second row. Edits tolerate caching better because the condition prefix is
+recomputed only at prefill.
