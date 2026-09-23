@@ -79,7 +79,7 @@ class NPUDeepSeekV4SingleKVPool(DeepSeekV4SingleKVPool):
         # The HiCache assembler uses bytes_per_page_padded as host item_bytes.
         # For example: kernel_page_size * kv_dim * sizeof(bf16).
         self.bytes_per_page_padded = (
-            self.kernel_page_size * kv_dim * torch.bfloat16.itemsize
+            self.kernel_page_size * kv_dim * kv_dtype.itemsize
         )
         # Writes are flat-indexed by loc; kernel_page_size controls the physical
         # page layout exposed to the NPU operators.
