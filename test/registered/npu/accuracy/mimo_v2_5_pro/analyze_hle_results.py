@@ -89,9 +89,18 @@ def extract_answer_from_prediction(filepath: str) -> list:
                     .get("message", {})
                     .get("content", [])
                 )
-                # 提取 text 类型的内容
-                text_blocks = [b.get("text", "") for b in content if b.get("type") == "text"]
-                full_text = "\n".join(text_blocks)
+                # content 可能是 list[dict] 或纯字符串
+                if isinstance(content, str):
+                    full_text = content
+                elif isinstance(content, list):
+                    text_blocks = [
+                        b.get("text", b.get("reasoning", ""))
+                        for b in content
+                        if isinstance(b, dict) and b.get("type") in ("text", "reasoning")
+                    ]
+                    full_text = "\n".join(text_blocks)
+                else:
+                    full_text = ""
 
                 # 提取 Exact Answer: xxx 或 Answer: xxx
                 m = re.search(r"(?:Exact\s+)?Answer:\s*(.+)", full_text, re.IGNORECASE)
