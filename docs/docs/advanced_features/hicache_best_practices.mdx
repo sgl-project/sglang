@@ -29,6 +29,10 @@ L1 and L2 are private to a single inference instance; only L3 can be shared. Hos
 Notes:
 
 - Besides configuring `--hicache-storage-backend` at startup, SGLang also supports **runtime attach/detach** of the HiCache storage backend (no restart required) via HTTP admin endpoints. See [Runtime Attach/Detach HiCache Storage Backend](./hicache_storage_runtime_attach_detach).
+- On Intel XPU, standard MHA and MLA HiCache automatically use the
+  PyTorch-based `xpu` I/O backend with `layer_first` layout. HiSparse retains
+  its dedicated `kernel` backend; see
+  [HiCache on XPU](/docs/hardware-platforms/xpu#hicache-on-xpu-experimental).
 
 ## Key Configurations with Storage Backends Enabled
 
