@@ -13,7 +13,6 @@
 # ==============================================================================
 
 import math
-import os
 from typing import Iterable, Optional, Tuple
 
 import torch
@@ -25,6 +24,7 @@ from sglang.srt.distributed import (
     moe_expert_parallel_all_reduce,
     moe_tensor_model_parallel_all_reduce,
 )
+from sglang.srt.environ import envs
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
@@ -69,14 +69,13 @@ def apply_ssmax(q: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
 def use_fused_beam_kernels(x: torch.Tensor) -> bool:
     """Fused Triton paths run on CUDA half-precision activations.
 
-    `SGLANG_BEAM_DISABLE_FUSED=1` restores the eager reference sequence, for
+    `SGLANG_DISABLE_BEAM_FUSED=1` restores the eager reference sequence, for
     ablation and parity checks.
     """
     return (
         x.is_cuda
         and x.dtype in (torch.bfloat16, torch.float16)
-        and os.environ.get("SGLANG_BEAM_DISABLE_FUSED", "0").lower()
-        not in ("1", "true")
+        and not envs.SGLANG_DISABLE_BEAM_FUSED.get()
     )
 
 

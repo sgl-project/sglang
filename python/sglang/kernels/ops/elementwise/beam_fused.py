@@ -82,8 +82,10 @@ def _fused_sandwich_residual_rmsnorm_kernel(
     # `depth_scaled_residual` casts the residual to the branch dtype first.
     residual = residual.to(act_dtype).to(tl.float32)
     if COMBINE_IN_FP32:
-        # The launch disables FMA so both products round before the FP32 sum.
-        combined = (x * x_scale + residual * residual_scale).to(act_dtype)
+        # Explicit rounding also prevents ptxas from fusing packed FP32 ops.
+        xs = libdevice.mul_rn(x, x_scale)
+        rs = libdevice.mul_rn(residual, residual_scale)
+        combined = libdevice.add_rn(xs, rs).to(act_dtype)
     else:
         xs = (x * x_scale).to(act_dtype).to(tl.float32)
         rs = (residual * residual_scale).to(act_dtype).to(tl.float32)
