@@ -4,6 +4,7 @@ import torch
 
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.environ import envs
+from sglang.srt.layers.dcp.layout import localize_dcp_indices
 from sglang.srt.mem_cache.memory_pool import (
     MHATokenToKOnlyPool,
     MHATokenToKVPool,
@@ -733,8 +734,13 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
     def _copy_indices_for_buffer(self, indices, uses_global_slots):
         if uses_global_slots or self.dcp_size <= 1:
             return indices
-        owned = indices % self.dcp_size == self.dcp_rank
-        return indices[owned] // self.dcp_size
+        local_indices = localize_dcp_indices(
+            indices,
+            self.dcp_size,
+            self.dcp_rank,
+            self.page_size,
+        )
+        return local_indices[local_indices >= 0]
 
     def get_kv_size_bytes(self):
         kv_size_bytes = 0

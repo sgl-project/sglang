@@ -43,6 +43,7 @@ from sglang.srt.environ import envs
 from sglang.srt.kv_canary.req_to_expected_token_ids_manager import (
     compute_req_all_ids_info,
 )
+from sglang.srt.layers.dcp.layout import localize_dcp_indices
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
     dp_slot_in,
@@ -194,6 +195,7 @@ def _maybe_localize_npu_dcp_out_cache_loc(
     out_cache_loc: Optional[torch.Tensor],
     *,
     is_draft_worker: bool = False,
+    interleave_size: int = 1,
 ) -> Optional[torch.Tensor]:
     """Return rank-local NPU DCP slots while preserving allocator identities."""
     parallel = get_parallel()
@@ -204,11 +206,11 @@ def _maybe_localize_npu_dcp_out_cache_loc(
         or out_cache_loc is None
     ):
         return out_cache_loc
-    is_local = out_cache_loc % parallel.dcp_size == parallel.dcp_rank
-    return torch.where(
-        is_local,
-        out_cache_loc // parallel.dcp_size,
-        torch.full_like(out_cache_loc, -1),
+    return localize_dcp_indices(
+        out_cache_loc,
+        parallel.dcp_size,
+        parallel.dcp_rank,
+        interleave_size,
     )
 
 
@@ -1030,6 +1032,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         ret.out_cache_loc = _maybe_localize_npu_dcp_out_cache_loc(
             ret.out_cache_loc,
             is_draft_worker=model_runner.is_draft_worker,
+            interleave_size=model_runner.page_size,
         )
         ret._maybe_init_non_generation_fields(batch)
 

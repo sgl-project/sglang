@@ -42,6 +42,7 @@ try:
         filter_dcp_local_chunk_kv_indices,
         get_dcp_chain_spec_lens,
         get_dcp_lens,
+        localize_dcp_indices,
         remap_dcp_sparse_indices,
     )
 finally:
@@ -76,11 +77,20 @@ class _FakeGroup:
 
 
 class TestNpuDcpLengths(unittest.TestCase):
+    PAGE_SIZE = 4
+
     def test_owner_counts_cover_every_position(self):
         for size in (1, 2, 3, 4, 8):
             for length in range(0, 65):
                 lens = [
-                    int(get_dcp_lens(torch.tensor([length]), size, rank)[0])
+                    int(
+                        get_dcp_lens(
+                            torch.tensor([length]),
+                            size,
+                            rank,
+                            interleave_size=self.PAGE_SIZE,
+                        )[0]
+                    )
                     for rank in range(size)
                 ]
                 self.assertEqual(sum(lens), length)
@@ -96,27 +106,39 @@ class TestNpuDcpLengths(unittest.TestCase):
                                 size,
                                 rank,
                                 start=torch.tensor([start]),
+                                interleave_size=self.PAGE_SIZE,
                             )[0]
                         )
                         for rank in range(size)
                     ]
                     expected = [
-                        sum(pos % size == rank for pos in range(start, start + length))
+                        sum(
+                            pos // self.PAGE_SIZE % size == rank
+                            for pos in range(start, start + length)
+                        )
                         for rank in range(size)
                     ]
                     self.assertEqual(got, expected)
 
     def test_chain_lengths_are_request_major(self):
         total = torch.tensor([8, 11], dtype=torch.int32)
-        got = get_dcp_chain_spec_lens(total, 3, dcp_size=4, dcp_rank=1)
-        # Global frontiers are [6, 7, 8] and [9, 10, 11]. Rank 1 owns
-        # positions 1,5,9,..., hence [2, 2, 2] and [2, 3, 3].
-        self.assertEqual(got.tolist(), [2, 2, 2, 2, 3, 3])
+        got = get_dcp_chain_spec_lens(
+            total,
+            3,
+            dcp_size=4,
+            dcp_rank=1,
+            interleave_size=self.PAGE_SIZE,
+        )
+        # Global frontiers are [6, 7, 8] and [9, 10, 11]. Rank 1 owns the
+        # complete page at positions [4, 8), hence [2, 3, 4] and [4, 4, 4].
+        self.assertEqual(got.tolist(), [2, 3, 4, 4, 4, 4])
 
     def test_chain_lengths_zero_short_requests(self):
         total = torch.tensor([0, 1, 2], dtype=torch.int64)
         for rank in range(4):
-            got = get_dcp_chain_spec_lens(total, 3, 4, rank)
+            got = get_dcp_chain_spec_lens(
+                total, 3, 4, rank, interleave_size=self.PAGE_SIZE
+            )
             self.assertEqual(got.tolist(), [0] * 9)
 
     def test_chain_lengths_reject_non_positive_speculation(self):
@@ -135,23 +157,39 @@ class TestNpuDcpLengths(unittest.TestCase):
 
 
 class TestNpuDcpSparseIndexRemap(unittest.TestCase):
+    PAGE_SIZE = 4
+
     def test_rank_zero_compacts_valid_entries_stably(self):
         topk = torch.tensor([[7, 4, 2, -1, 8, 0], [3, 1, -1, 6, 5, -1]])
-        got = remap_dcp_sparse_indices(topk, dcp_size=2, dcp_rank=0)
-        expected = torch.tensor([[2, 1, 4, 0, -1, -1], [3, -1, -1, -1, -1, -1]])
+        got = remap_dcp_sparse_indices(
+            topk,
+            dcp_size=2,
+            dcp_rank=0,
+            interleave_size=self.PAGE_SIZE,
+        )
+        expected = torch.tensor([[2, 4, 0, -1, -1, -1], [3, 1, -1, -1, -1, -1]])
         self.assertTrue(torch.equal(got, expected))
 
     def test_rank_one_preserves_score_order_before_padding(self):
         topk = torch.tensor([[7, 4, 2, -1, 8, 0]])
-        got = remap_dcp_sparse_indices(topk, dcp_size=2, dcp_rank=1)
-        self.assertEqual(got.tolist(), [[3, -1, -1, -1, -1, -1]])
+        got = remap_dcp_sparse_indices(
+            topk,
+            dcp_size=2,
+            dcp_rank=1,
+            interleave_size=self.PAGE_SIZE,
+        )
+        self.assertEqual(got.tolist(), [[3, 0, -1, -1, -1, -1]])
 
     def test_negative_padding_never_becomes_a_valid_index(self):
         topk = torch.tensor([[-1, -3, 2, 6, -1]], dtype=torch.int64)
         for rank in range(3):
-            got = remap_dcp_sparse_indices(topk, 3, rank)
+            got = remap_dcp_sparse_indices(
+                topk, 3, rank, interleave_size=self.PAGE_SIZE
+            )
             self.assertTrue(torch.all((got == -1) | (got >= 0)))
-            expected_count = int(((topk >= 0) & (topk % 3 == rank)).sum())
+            expected_count = int(
+                ((topk >= 0) & (topk // self.PAGE_SIZE % 3 == rank)).sum()
+            )
             self.assertEqual(int((got >= 0).sum()), expected_count)
 
     def test_single_rank_is_identity_object(self):
@@ -163,16 +201,26 @@ class TestNpuDcpSparseIndexRemap(unittest.TestCase):
         # Values around 2**24 expose accidental float16 arithmetic.  The
         # implementation deliberately promotes to float32 before remainder.
         topk = torch.tensor(
-            [[16_777_216, 16_777_219, 16_777_218, -1]], dtype=torch.int64
+            [[16_777_216, 16_777_220, 16_777_218, -1]], dtype=torch.int64
         )
-        got = remap_dcp_sparse_indices(topk, 4, 2)
-        self.assertEqual(got.tolist(), [[4_194_304, -1, -1, -1]])
+        got = remap_dcp_sparse_indices(topk, 4, 0, interleave_size=self.PAGE_SIZE)
+        self.assertEqual(got.tolist(), [[4_194_304, 4_194_306, -1, -1]])
 
     def test_shape_and_dtype_are_preserved(self):
         topk = torch.tensor([[1, 2, 3], [4, 5, 6]], dtype=torch.int32)
-        got = remap_dcp_sparse_indices(topk, 4, 0)
+        got = remap_dcp_sparse_indices(topk, 4, 0, interleave_size=self.PAGE_SIZE)
         self.assertEqual(got.shape, topk.shape)
         self.assertEqual(got.dtype, topk.dtype)
+
+    def test_global_indices_map_one_page_at_a_time(self):
+        indices = torch.arange(0, 24)
+        got = localize_dcp_indices(
+            indices, dcp_size=3, dcp_rank=1, interleave_size=self.PAGE_SIZE
+        )
+        self.assertEqual(
+            got.tolist(),
+            [-1] * 4 + [0, 1, 2, 3] + [-1] * 8 + [4, 5, 6, 7] + [-1] * 4,
+        )
 
 
 class TestNpuDcpSparseAttentionContract(unittest.TestCase):
@@ -311,15 +359,15 @@ class TestNpuDcpSparseAttentionContract(unittest.TestCase):
 
 class TestNpuDcpBufferAndLseHelpers(unittest.TestCase):
     def test_retraction_indices_map_target_kv_to_rank_local_slots(self):
-        pool = SimpleNamespace(dcp_size=4, dcp_rank=2)
-        indices = torch.tensor([0, 1, 2, 3, 6, 7, 10, 11], dtype=torch.int64)
+        pool = SimpleNamespace(dcp_size=4, dcp_rank=2, page_size=2)
+        indices = torch.tensor([0, 1, 4, 5, 6, 7, 12, 13], dtype=torch.int64)
         got = NPUMLATokenToKVPool._copy_indices_for_buffer(
             pool, indices, uses_global_slots=False
         )
-        self.assertEqual(got.tolist(), [0, 1, 2])
+        self.assertEqual(got.tolist(), [0, 1, 2, 3])
 
     def test_retraction_indices_keep_indexer_slots_global(self):
-        pool = SimpleNamespace(dcp_size=4, dcp_rank=2)
+        pool = SimpleNamespace(dcp_size=4, dcp_rank=2, page_size=2)
         indices = torch.tensor([0, 1, 2, 7], dtype=torch.int64)
         got = NPUMLATokenToKVPool._copy_indices_for_buffer(
             pool, indices, uses_global_slots=True
@@ -327,7 +375,7 @@ class TestNpuDcpBufferAndLseHelpers(unittest.TestCase):
         self.assertTrue(torch.equal(got, indices))
 
     def test_retraction_indices_are_identity_without_dcp(self):
-        pool = SimpleNamespace(dcp_size=1, dcp_rank=0)
+        pool = SimpleNamespace(dcp_size=1, dcp_rank=0, page_size=2)
         indices = torch.tensor([0, 3, 8], dtype=torch.int64)
         got = NPUMLATokenToKVPool._copy_indices_for_buffer(
             pool, indices, uses_global_slots=False

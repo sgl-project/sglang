@@ -476,10 +476,14 @@ class AscendAttnBackend(AttentionBackend):
                 self.speculative_num_draft_tokens,
                 parallel.attn_dcp_size,
                 parallel.attn_dcp_rank,
+                interleave_size=self.page_size,
             )
         else:
             local_kv_lens = get_dcp_lens(
-                kv_lens_cpu, parallel.attn_dcp_size, parallel.attn_dcp_rank
+                kv_lens_cpu,
+                parallel.attn_dcp_size,
+                parallel.attn_dcp_rank,
+                interleave_size=self.page_size,
             ).int()
         page_stride = self.page_size * parallel.attn_dcp_size
         max_len = int(kv_lens_cpu.max().item()) if kv_lens_cpu.numel() else 0

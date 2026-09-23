@@ -25,20 +25,53 @@ def get_dcp_lens(
     dcp_size: int,
     dcp_rank: int,
     start: torch.Tensor | None = None,
+    interleave_size: int = 1,
 ) -> torch.Tensor:
-    """Per-rank visible KV length under the owner rule pos % dcp_size == dcp_rank.
+    """Return the KV length owned by one DCP rank.
 
-    Superset implementation (PR #25090): supports both start=None and a per-request
-    `start` offset. update_local_kv_lens_for_dcp is the start=None special case.
+    Consecutive runs of ``interleave_size`` positions rotate across ranks.  The
+    default value preserves the token-interleaved layout used by the generic
+    CUDA/ROCm DCP paths; NPU DSA passes its physical KV page size.
     """
     if dcp_size == 1:
         return lens
-    if start is None:
-        return lens // dcp_size + (dcp_rank < lens % dcp_size)
+    if interleave_size < 1:
+        raise ValueError(f"interleave_size must be positive, got {interleave_size}")
 
-    first = start + torch.remainder(dcp_rank - start, dcp_size)
-    remaining = start + lens - first
-    return torch.clamp((remaining + dcp_size - 1) // dcp_size, min=0)
+    cycle_size = dcp_size * interleave_size
+
+    def _count_before(end: torch.Tensor) -> torch.Tensor:
+        full_cycles = end // cycle_size
+        remainder = end % cycle_size
+        rank_remainder = torch.clamp(
+            remainder - dcp_rank * interleave_size,
+            min=0,
+            max=interleave_size,
+        )
+        return full_cycles * interleave_size + rank_remainder
+
+    if start is None:
+        return _count_before(lens)
+    return _count_before(start + lens) - _count_before(start)
+
+
+def localize_dcp_indices(
+    indices: torch.Tensor,
+    dcp_size: int,
+    dcp_rank: int,
+    interleave_size: int = 1,
+) -> torch.Tensor:
+    """Map global DCP indices to one rank, using ``-1`` for non-local rows."""
+    if dcp_size == 1:
+        return indices
+    if interleave_size < 1:
+        raise ValueError(f"interleave_size must be positive, got {interleave_size}")
+
+    interleave_block = torch.div(indices, interleave_size, rounding_mode="floor")
+    is_local = (indices >= 0) & (interleave_block % dcp_size == dcp_rank)
+    local_block = torch.div(interleave_block, dcp_size, rounding_mode="floor")
+    local_indices = local_block * interleave_size + indices % interleave_size
+    return torch.where(is_local, local_indices, torch.full_like(indices, -1))
 
 
 def maybe_dcp_kernel_indices(
@@ -85,7 +118,10 @@ def filter_dcp_local_chunk_kv_indices(
 
 
 def remap_dcp_sparse_indices(
-    topk_indices: torch.Tensor, dcp_size: int, dcp_rank: int
+    topk_indices: torch.Tensor,
+    dcp_size: int,
+    dcp_rank: int,
+    interleave_size: int = 1,
 ) -> torch.Tensor:
     """Map global sparse token indices to one rank's compact DCP KV layout.
 
@@ -94,16 +130,23 @@ def remap_dcp_sparse_indices(
     """
     if dcp_size == 1:
         return topk_indices
+    if interleave_size < 1:
+        raise ValueError(f"interleave_size must be positive, got {interleave_size}")
 
-    # Global token p belongs to rank p % dcp_size and maps to local position
-    # p // dcp_size.
+    # Float32 is faster than integer division/remainder on Ascend for this hot
+    # path.  Keep the math equivalent to localize_dcp_indices above.
     topk_indices_fp32 = topk_indices.to(torch.float32)
+    interleave_blocks = torch.floor(topk_indices_fp32 / interleave_size)
     local_owner_mask = (topk_indices_fp32 >= 0) & (
-        torch.remainder(topk_indices_fp32, dcp_size) == dcp_rank
+        torch.remainder(interleave_blocks, dcp_size) == dcp_rank
+    )
+    local_offsets = torch.remainder(topk_indices_fp32, interleave_size)
+    local_indices = (
+        torch.floor(interleave_blocks / dcp_size) * interleave_size + local_offsets
     )
     remapped_indices = torch.where(
         local_owner_mask,
-        torch.floor(topk_indices_fp32 / dcp_size),
+        local_indices,
         torch.full_like(topk_indices_fp32, -1.0),
     ).to(topk_indices.dtype)
 
@@ -122,6 +165,7 @@ def get_dcp_chain_spec_lens(
     tokens_per_req: int,
     dcp_size: int,
     dcp_rank: int,
+    interleave_size: int = 1,
 ) -> torch.Tensor:
     """Return request-major local KV frontiers for a speculative chain."""
     if tokens_per_req < 1:
@@ -136,7 +180,12 @@ def get_dcp_chain_spec_lens(
         global_query_lens,
         torch.zeros_like(global_query_lens),
     )
-    return get_dcp_lens(global_query_lens.reshape(-1), dcp_size, dcp_rank).int()
+    return get_dcp_lens(
+        global_query_lens.reshape(-1),
+        dcp_size,
+        dcp_rank,
+        interleave_size=interleave_size,
+    ).int()
 
 
 def update_local_kv_lens_for_dcp(kv_len_arr):
