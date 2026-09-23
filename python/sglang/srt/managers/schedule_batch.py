@@ -1334,6 +1334,9 @@ class Req(ReqDllmMixin):
         # and consumed in the decode transfer commit; never plumbed to prefill.
         self.pd_rebootstrap_forced_output_id: Optional[int] = None
         self.skip_radix_cache_insert = bootstrap_host == FAKE_BOOTSTRAP_HOST
+        # Set when the request's in-flight forward ran on KV that never landed:
+        # that forward's output is dropped and the request finishes with it.
+        self.discard_output_reason: Optional[FINISH_ABORT] = None
         self.disagg_kv_sender: Optional[BaseKVSender] = None
 
         self.routed_dp_rank: Optional[int] = routed_dp_rank

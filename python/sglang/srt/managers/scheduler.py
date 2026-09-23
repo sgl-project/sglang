@@ -3557,8 +3557,10 @@ class Scheduler(
             self.abort_request(AbortReq(rid=req.rid))
             return
 
-        prepare_abort(req, "Aborted")
-        req.time_stats.trace_ctx.abort(abort_info={"reason": "Aborted"})
+        reason = req.discard_output_reason
+        message = "Aborted" if reason is None else reason.message
+        prepare_abort(req, message, None if reason is None else reason.status_code)
+        req.time_stats.trace_ctx.abort(abort_info={"reason": message})
         req.to_finish = None
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             self.clear_pending_chunk_send(req)
@@ -3572,7 +3574,12 @@ class Scheduler(
 
         self.chunked_req = None
         self._pending_chunked_abort_req = None
-        self.ipc_channels.send_to_tokenizer.send_output(_make_abort_req(req), req)
+        self.ipc_channels.send_to_tokenizer.send_output(
+            _make_abort_req(
+                req, finished_reason=None if reason is None else reason.to_json()
+            ),
+            req,
+        )
         logger.debug(f"Abort chunked prefill request. {req.rid=}")
 
     def _build_hisparse_decode_batch(self, reqs):
@@ -4643,14 +4650,13 @@ class Scheduler(
             if req.rid not in failed_rids:
                 continue
             req.skip_radix_cache_insert = True
+            req.discard_output_reason = FINISH_ABORT(
+                "External KV cache load failed", HTTPStatus.SERVICE_UNAVAILABLE
+            )
             if req is self.chunked_req:
                 # Stops the next chunk and releases the request, as for a
-                # client abort.
+                # client abort. Otherwise result processing finishes it.
                 self._pending_chunked_abort_req = req
-            else:
-                req.to_finish = FINISH_ABORT(
-                    "External KV cache load failed", HTTPStatus.SERVICE_UNAVAILABLE
-                )
 
     def _maybe_report_active_ranks(self) -> None:
         if not (
