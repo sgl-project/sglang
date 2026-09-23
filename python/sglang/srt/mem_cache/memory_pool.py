@@ -799,6 +799,14 @@ class MambaPool:
                 # overlapping stores) and `fused_conv_window_scatter_with_mask`
                 # consume the view through its strides.
                 #
+                conv_intermediate_strip = cache_params.shape.conv_intermediate_strip
+                if conv_intermediate_strip and (
+                    speculative_eagle_topk is not None and speculative_eagle_topk > 1
+                ):
+                    raise ValueError(
+                        "conv_intermediate_strip requires a linear draft chain "
+                        f"(topk <= 1), got {speculative_eagle_topk=}"
+                    )
                 # Dedup the sliding-window conv-intermediate only when it is safe:
                 # CUDA + a linear draft chain (topk <= 1). NPU/CPU and EAGLE tree
                 # verify (topk > 1) keep the dense layout -- see
@@ -806,7 +814,8 @@ class MambaPool:
                 # `fused_conv_window_scatter_with_mask` scatter is layout-agnostic,
                 # so the dense fallback reads correctly through the same code path.
                 dedup_conv_window = (
-                    not cache_params.shape.disable_conv_window_dedup
+                    not conv_intermediate_strip
+                    and not cache_params.shape.disable_conv_window_dedup
                     and conv_window_dedup_enabled(
                         _is_npu, _is_cpu, speculative_eagle_topk, cache_params.is_kda
                     )
@@ -840,14 +849,22 @@ class MambaPool:
                         )
                         for conv_shape in conv_state_shape
                     ]
+                    if conv_intermediate_strip:
+                        dim_axis = cache_params.shape.conv_slice_axis
+                        self.conv_window_axis = 1 - dim_axis
+                        assert all(len(shape) == 2 for shape in conv_state_shape), (
+                            f"strip layout expects 2D conv shapes, got {conv_state_shape}"
+                        )
+                        dense_conv_shapes = [
+                            (shape[dim_axis],) for shape in conv_state_shape
+                        ]
                     intermediate_conv_window_cache = [
                         torch.zeros(
                             size=(
                                 num_mamba_layers,
                                 spec_state_size + 1,
                                 speculative_num_draft_tokens,
-                                conv_shape[0],
-                                conv_shape[1],
+                                *conv_shape,
                             ),
                             dtype=conv_dtype,
                             device=device,

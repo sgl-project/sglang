@@ -115,6 +115,24 @@ def check_server_args(server_args: Any):
 
     cfg = resolving_view(server_args)
 
+    if cfg.enable_inkling_sconv_strip_layout:
+        from sglang.srt.arg_groups.model_override_base import model_config_of
+
+        arch = model_config_of(server_args).hf_config.architectures[0]
+        if arch not in {
+            "InklingForConditionalGeneration",
+            "InklingForConditionalGenerationMTP",
+        }:
+            raise ValueError(
+                "--enable-inkling-sconv-strip-layout requires an Inkling model"
+            )
+        if not get_platform().is_cuda:
+            raise ValueError("--enable-inkling-sconv-strip-layout requires CUDA")
+        if cfg.speculative_algorithm is None or (cfg.speculative_eagle_topk or 1) != 1:
+            raise ValueError(
+                "--enable-inkling-sconv-strip-layout requires linear speculative decoding"
+            )
+
     # Check parallel size constraints
     if cfg.ep_join_mode != "scale":
         assert (cfg.tp_size * cfg.pp_size) % cfg.nnodes == 0, (

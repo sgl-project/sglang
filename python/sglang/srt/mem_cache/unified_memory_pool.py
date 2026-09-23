@@ -803,6 +803,7 @@ class UnifiedMambaPool(MambaPool):
         mamba_layer_ids: List[int],
         enable_memory_saver: bool = False,
         speculative_num_draft_tokens: Optional[int] = None,
+        conv_intermediate_strip: bool = False,
     ):
         spec = unified_buffer.mamba_spec(sub_pool_name)
         assert spec.layer_num == len(mamba_layer_ids)
@@ -850,6 +851,9 @@ class UnifiedMambaPool(MambaPool):
         # (spec_state_size+1), so they're NOT in the shared buffer; allocate locally.
         temporal_state_shape = spec.temporal_state_shape
         conv_state_shape = spec.conv_state_shapes
+        if conv_intermediate_strip:
+            assert spec.conv_slice_axis == 1
+            conv_state_shape = [(shape[1],) for shape in conv_state_shape]
         conv_dtype = spec.conv_dtype
         ssm_dtype = spec.temporal_dtype
         if speculative_num_draft_tokens is not None:
@@ -872,8 +876,7 @@ class UnifiedMambaPool(MambaPool):
                             self.num_mamba_layers,
                             spec_state_size + 1,
                             speculative_num_draft_tokens,
-                            cshape[0],
-                            cshape[1],
+                            *cshape,
                         ),
                         dtype=conv_dtype,
                         device=unified_buffer.device,
@@ -1132,6 +1135,7 @@ class UnifiedHybridReqToTokenPool(HybridReqToTokenPool):
             unified_buffer=self._unified_buffer,
             sub_pool_name=self._mamba_sub_pool_name,
             spec_state_size=mamba_spec_state_size,
+            conv_intermediate_strip=cache_params.shape.conv_intermediate_strip,
             mamba_layer_ids=mamba_layer_ids,
             enable_memory_saver=self.enable_memory_saver,
             speculative_num_draft_tokens=speculative_num_draft_tokens,
@@ -2008,6 +2012,7 @@ def init_unified_mamba_swa_pools(
         conv_dtype=cp.dtype.conv,
         temporal_state_shape=tuple(int(x) for x in cp.shape.temporal),
         temporal_dtype=cp.dtype.temporal,
+        conv_slice_axis=getattr(cp.shape, "conv_slice_axis", 0),
         grow_direction="up",
     )
     if unified_total_bytes is not None:
