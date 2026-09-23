@@ -987,7 +987,10 @@ class TestOffloadDefaults(unittest.TestCase):
     ):
         def get_available_gpu_memory(device_id=0, **_kwargs):
             if isinstance(available_memory_gb, dict):
-                return available_memory_gb[device_id]
+                result = available_memory_gb[device_id]
+                if isinstance(result, Exception):
+                    raise result
+                return result
             if available_memory_gb is not None:
                 return available_memory_gb
             return memory_gb
@@ -2536,6 +2539,26 @@ class TestOffloadDefaults(unittest.TestCase):
 
         self.assertFalse(args.use_fsdp_inference)
         self.assertTrue(args.enable_cfg_parallel)
+
+    def test_auto_multi_gpu_keeps_conservative_defaults_when_probe_fails(self):
+        args = self._from_dict_with_pipeline_config(
+            QwenImagePipelineConfig(),
+            available_memory_gb={
+                0: 80,
+                1: AssertionError("Invalid device id"),
+            },
+            kwargs={
+                "model_path": "Qwen/Qwen-Image",
+                "num_gpus": 2,
+                "tp_size": 2,
+                "performance_mode": "auto",
+            },
+        )
+
+        self.assertFalse(args.use_fsdp_inference)
+        self.assertFalse(args.enable_cfg_parallel)
+        self.assertTrue(args.text_encoder_cpu_offload)
+        self.assertTrue(args.image_encoder_cpu_offload)
 
     def test_auto_multi_gpu_qwen_keeps_vae_resident_with_headroom(self):
         args = self._from_dict_with_pipeline_config(

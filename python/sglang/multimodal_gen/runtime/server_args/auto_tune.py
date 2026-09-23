@@ -756,15 +756,28 @@ class ServerArgsAutoTuner:
             return None
 
         # Multi-GPU defaults are limited by the least-free selected GPU.
-        return min(
-            current_platform.get_available_gpu_memory(
-                device_id=device_id,
-                empty_cache=False,
+        try:
+            return min(
+                current_platform.get_available_gpu_memory(
+                    device_id=device_id,
+                    empty_cache=False,
+                )
+                for device_id in range(
+                    args.base_gpu_id, args.base_gpu_id + max(1, args.num_gpus)
+                )
             )
-            for device_id in range(
-                args.base_gpu_id, args.base_gpu_id + max(1, args.num_gpus)
+        except (AssertionError, IndexError, RuntimeError) as exc:
+            # This probe only selects automatic residency/offload defaults.  A
+            # parent process can have a stale or narrower visible-device map
+            # than the workers (for example under an external launcher), so a
+            # failed optional probe must not abort startup before the normal
+            # parallelism and worker device checks run.
+            logger.warning(
+                "Unable to inspect available memory on selected devices; "
+                "keeping conservative automatic residency defaults: %s",
+                exc,
             )
-        )
+            return None
 
     def _has_explicit_dit_residency(self) -> bool:
         args = self.server_args
