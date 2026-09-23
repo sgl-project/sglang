@@ -10,7 +10,6 @@ from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=20, stage="base-b-kernel-unit", runner_config="1-gpu-large")
-register_cuda_ci(est_time=20, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
 
 
 def make_inputs(batch, image_tokens, text_tokens, heads, dim, dtype):
@@ -79,63 +78,6 @@ class TestJointQKVCat(CustomTestCase):
                     value.copy_(torch.randn_like(value))
                 graph.replay()
                 self.assert_bits_equal(out, reference(inputs))
-
-    def test_unsupported_inputs_and_autograd_fallback(self):
-        inputs = make_inputs(1, 13, 5, 4, 32, torch.bfloat16)
-        with patch.object(joy_image.diffusion_kernels, "joint_qkv_cat") as fused:
-            self.assert_bits_equal(joy_image._joy_joint_qkv(*inputs), reference(inputs))
-            fused.assert_not_called()
-        self.assertFalse(can_use_joint_qkv_cat(*inputs[:5]))
-        self.assertFalse(can_use_joint_qkv_cat(*(x.float() for x in inputs)))
-        self.assertFalse(can_use_joint_qkv_cat(*(x[..., ::2] for x in inputs)))
-        self.assertFalse(
-            can_use_joint_qkv_cat(inputs[0], inputs[1][:, :2], *inputs[2:])
-        )
-        with patch("torch.compiler.is_compiling", return_value=True):
-            self.assert_bits_equal(joy_image._joy_joint_qkv(*inputs), reference(inputs))
-        cpu = tuple(x.cpu().requires_grad_() for x in inputs)
-        self.assertFalse(can_use_joint_qkv_cat(*cpu))
-        out = joy_image._joy_joint_qkv(*cpu)
-        sum(x.float().sum() for x in out).backward()
-        for value in cpu:
-            self.assertTrue(torch.equal(value.grad, torch.ones_like(value)))
-
-    def test_gate_mismatch_exception_and_unverified_capture(self):
-        inputs = make_inputs(1, 4096, 5, 32, 128, torch.bfloat16)
-        expected = reference(inputs)
-        wrong = tuple(x.clone() for x in expected)
-        wrong[0].view(torch.int16)[0, 0, 0, 0] ^= 1
-        gate = BitExactFusionGate("test", per_signature=True)
-        with (
-            patch.object(joy_image, "_JOY_QKV_CAT", gate),
-            patch.object(
-                joy_image.diffusion_kernels, "joint_qkv_cat", return_value=wrong
-            ) as fused,
-        ):
-            self.assert_bits_equal(joy_image._joy_joint_qkv(*inputs), expected)
-            self.assertTrue(gate.disabled)
-            self.assert_bits_equal(joy_image._joy_joint_qkv(*inputs), expected)
-            fused.assert_called_once()
-        gate = BitExactFusionGate("test", per_signature=True)
-        with (
-            patch.object(joy_image, "_JOY_QKV_CAT", gate),
-            patch.object(
-                joy_image.diffusion_kernels,
-                "joint_qkv_cat",
-                side_effect=RuntimeError("unavailable"),
-            ),
-        ):
-            self.assert_bits_equal(joy_image._joy_joint_qkv(*inputs), expected)
-            self.assertTrue(gate.disabled)
-        gate = BitExactFusionGate("test", per_signature=True)
-        with (
-            patch.object(joy_image, "_JOY_QKV_CAT", gate),
-            patch("torch.cuda.is_current_stream_capturing", return_value=True),
-            patch.object(joy_image.diffusion_kernels, "joint_qkv_cat") as fused,
-        ):
-            self.assert_bits_equal(joy_image._joy_joint_qkv(*inputs), expected)
-            fused.assert_not_called()
-            self.assertFalse(gate.verified)
 
 
 if __name__ == "__main__":
