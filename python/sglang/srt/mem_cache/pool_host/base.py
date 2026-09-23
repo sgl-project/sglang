@@ -46,19 +46,15 @@ def host_memory_budget_scope(budget_bytes: int):
 
 
 def ranks_per_host() -> int:
-    """Number of ranks of this job running on the same machine as this one.
+    """Return the launch ranks per host, assuming uniform placement.
 
-    Derived as the launch width // nnodes: the launcher slices ranks
-    uniformly across nodes (resolution asserts divisibility), so no hostname
-    collective is needed — a collective here would have to be issued the same
-    number of times on every rank, and ranks build different numbers of host
-    pools.
+    Avoid a collective: ranks may construct different numbers of host pools.
     """
     if not (torch.distributed.is_available() and torch.distributed.is_initialized()):
         return 1
     try:
         launch_world_size = get_parallel().launch_world_size
-    except AssertionError:
+    except (RuntimeError, ValueError):
         return 1
     if launch_world_size == 1:
         return 1
@@ -104,7 +100,7 @@ def sync_fixed_hicache_size(size: int, host_size: int) -> int:
         from sglang.srt.runtime_context import get_parallel
 
         pp_group = get_parallel().pp_group
-    except AssertionError:
+    except RuntimeError:
         return size
 
     if pp_group.world_size <= 1:
@@ -174,26 +170,31 @@ class HostKVCache(abc.ABC):
 
         self.dtype = device_pool.store_dtype
         self.size_per_token = self.get_size_per_token()
+        # Unified pools report token capacity separately from their buffer-row count.
+        device_capacity = getattr(device_pool, "host_capacity_tokens", None)
+        if device_capacity is None:
+            device_capacity = device_pool.size
+        self.device_capacity_tokens = device_capacity
         if host_size > 0:
             self.size = sync_fixed_hicache_size(
                 int(host_size * 1e9 // self.size_per_token), host_size
             )
         else:
-            self.size = int(device_pool.size * host_to_device_ratio)
+            self.size = int(device_capacity * host_to_device_ratio)
         # Align up the host memory pool size to the page size
         self.page_num = self.size // self.page_size + 1
         self.size = self.page_num * self.page_size
         self.start_layer = device_pool.start_layer
         self.end_layer = device_pool.end_layer
 
-        if self.size <= device_pool.size:
+        if self.size <= device_capacity:
             logger.warning(
                 "HiCache %s host pool (%d tokens) is smaller than the device pool (%d tokens);"
                 "L2 cache effectiveness is reduced."
                 "Consider increasing --hicache-ratio (or --hicache-size) for higher L2 cache hit rate.",
                 pool_label,
                 self.size,
-                device_pool.size,
+                device_capacity,
             )
 
         # Verify there is enough available host memory.

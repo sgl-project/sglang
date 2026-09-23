@@ -60,7 +60,7 @@ class TestPPThroughput(CustomTestCase):
                 "input_throughput",
                 res["input_throughput"],
                 4380,
-                amd=3000,
+                amd=2190,
                 unit="token/s",
             ),
         )

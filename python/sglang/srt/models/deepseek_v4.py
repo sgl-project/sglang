@@ -4,6 +4,7 @@ import concurrent.futures
 import functools
 import logging
 import time
+from array import array
 from contextlib import contextmanager, nullcontext
 from types import SimpleNamespace
 from typing import (
@@ -3852,25 +3853,17 @@ class DeepseekV4DecoderLayer(nn.Module):
             if _use_cp and get_moe_a2a_backend().is_none()
             else nullcontext()
         )
-        # The MoE sees DP-gathered rows, so this rank's local count cannot mask them.
-        # The standard dispatcher masks padding in the gathered buffer.
-        saved_num_token_non_padded = forward_batch.num_token_non_padded
-        if _use_tp_moe_gather:
-            forward_batch.num_token_non_padded = None
-        try:
-            with (
-                get_forward().scoped(mlp_reduce_scatter=mlp_reduce_scatter),
-                gathered_rows,
-            ):
-                hidden_states = self.mlp(
-                    hidden_states,
-                    forward_batch,
-                    input_ids=input_ids,
-                    input_ids_global=input_ids_global,
-                    skip_shared_experts=_do_shared_local,
-                )
-        finally:
-            forward_batch.num_token_non_padded = saved_num_token_non_padded
+        with (
+            get_forward().scoped(mlp_reduce_scatter=mlp_reduce_scatter),
+            gathered_rows,
+        ):
+            hidden_states = self.mlp(
+                hidden_states,
+                forward_batch,
+                input_ids=input_ids,
+                input_ids_global=input_ids_global,
+                skip_shared_experts=_do_shared_local,
+            )
         if _use_cp and get_moe_a2a_backend().is_none():
             hidden_states = dsa_cp_reduce_scatter_hidden_states(hidden_states)
         elif _use_tp_moe_gather:
@@ -4981,7 +4974,7 @@ class DeepseekV4ForCausalLM(nn.Module):
     def routed_experts_weights_of_layer(self):
         return self._routed_experts_weights_of_layer.value
 
-    def pad_input_ids(self, input_ids, mm_inputs):
+    def pad_input_ids(self, input_ids: array, mm_inputs) -> array:
         return MultiModalityDataPaddingPatternMultimodalTokens().pad_input_tokens(
             input_ids, mm_inputs
         )

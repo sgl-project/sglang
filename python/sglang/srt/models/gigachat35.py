@@ -23,7 +23,6 @@ from transformers import PretrainedConfig
 
 import sglang.srt.models.deepseek_v2 as deepseek_v2
 from sglang.srt.configs.gigachat35 import GigaChat35Config
-from sglang.srt.distributed import get_pp_group
 from sglang.srt.layers.communicator import get_attn_tp_context
 from sglang.srt.layers.layernorm import GemmaRMSNorm, RMSNorm
 from sglang.srt.layers.linear import ColumnParallelLinear
@@ -515,7 +514,7 @@ class GigaChat35Model(nn.Module):
         self.config = config
         self.padding_idx = getattr(config, "pad_token_id", None)
         self.vocab_size = config.vocab_size
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
 
         if self.pp_group.is_first_rank:
             self.embed_tokens = VocabParallelEmbedding(
@@ -605,7 +604,7 @@ class GigaChat35ForCausalLM(DeepseekV2WeightLoaderMixin, nn.Module):
         nn.Module.__init__(self)
         self.config = config
         self.quant_config = quant_config
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
         self.tp_size = get_parallel().tp_size
         self.num_fused_shared_experts = 0
 

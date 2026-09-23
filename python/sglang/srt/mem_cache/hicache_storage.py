@@ -48,15 +48,6 @@ class HiCacheStorageExtraInfo:
     extra_info: Optional[dict] = None
 
 
-@dataclass(frozen=True)
-class PrefetchTimeoutConfig:
-    """Knobs for the linear prefetch-timeout policy used by HiCache."""
-
-    base: float = 2.0  # seconds, fixed overhead unrelated to token count
-    per_ki_token: float = 0.1  # seconds per 1024 tokens
-    max: float = 30.0  # seconds, upper bound for the linear timeout
-
-
 class PoolName(str, Enum):
     """Well-known pool names used as PoolTransfer/PoolEntry identifiers."""
 
@@ -122,6 +113,9 @@ class PoolTransfer:
     hit_policy: PoolHitPolicy = PoolHitPolicy.ALL_PAGES
     nodes_to_load: Optional[List[Any]] = None
     indices_from_pool: Optional[PoolName] = None
+    # Full IDs backing a dependent device allocation: resident tensors or
+    # slices of the full rows allocated by this load, in transfer order.
+    anchor_index_parts: Optional[List[torch.Tensor | slice]] = None
 
 
 @dataclass(frozen=True)

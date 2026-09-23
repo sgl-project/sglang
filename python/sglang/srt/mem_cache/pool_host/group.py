@@ -22,6 +22,10 @@ class PoolEntry:
     device_evict_fn: Callable[[int], Any] | None = None
     device_alloc_fn: Callable[[int], Any] | None = None
     device_free_fn: Callable[[Any], Any] | None = None
+    # Bind rows to the anchor's virtual IDs when pools share an ID space.
+    # Return buffer indices, or None if allocation fails. Rollback through
+    # device_free_fn takes the anchor's virtual IDs, not the returned indices.
+    device_indices_from_anchor_fn: Callable[[Any], Any] | None = None
     packed_draft_device_pools: tuple[Any, ...] = ()
 
 

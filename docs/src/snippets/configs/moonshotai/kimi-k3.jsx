@@ -478,8 +478,8 @@ export const config = {
     gb200:  "lmsysorg/sglang:kimi-k3",
     // 20260903 or newer: the AITER SiTU A4W4/A8W4 layout fix (sgl-project/sglang#33838,
     // merged Sep 3) and the fused gfx950 KDA decode boundary (#34198) first ship here.
-    mi350x: "lmsysorg/sglang-rocm:v0.5.19-rocm720-mi35x-20260910",
-    mi355x: "lmsysorg/sglang-rocm:v0.5.19-rocm720-mi35x-20260910",
+    mi350x: "lmsysorg/sglang-rocm:v0.5.19-rocm720-mi35x-20260916",
+    mi355x: "lmsysorg/sglang-rocm:v0.5.19-rocm720-mi35x-20260916",
     // NVFP4 needs a build with sgl-project/sglang#35077; the purpose-built dev
     // image is cut from that PR's head (CUDA 13).
     "b300|nvfp4":  "lmsysorg/sglang:dev-dev-kimi-k3-nvfp4",
@@ -1217,7 +1217,7 @@ export const config = {
       ],
     },
     {
-      // MI350X and MI355X use the same single-node TP8 ROCm/AITER profile.
+      // MI350X and MI355X use the same single-node TP8/DCP8 ROCm/AITER profile.
       match: { hw: "mi350x", pdMode: "unified", strategy: "balanced" },
       nnodes: 1,
       verified: false,
@@ -1232,7 +1232,10 @@ export const config = {
         "--model-path {{MODEL_NAME}}",
         "--trust-remote-code",
         "--tp-size 8",
-        "--attention-backend triton",
+        "--dcp-size 8",
+        "--dcp-comm-backend a2a",
+        "--prefill-attention-backend aiter",
+        "--decode-attention-backend aiter",
         "--kv-cache-dtype fp8_e4m3",
         "--dtype bfloat16",
         "--mem-fraction-static 0.85",
@@ -1259,7 +1262,10 @@ export const config = {
         "--model-path {{MODEL_NAME}}",
         "--trust-remote-code",
         "--tp-size 8",
-        "--attention-backend triton",
+        "--dcp-size 8",
+        "--dcp-comm-backend a2a",
+        "--prefill-attention-backend aiter",
+        "--decode-attention-backend aiter",
         "--kv-cache-dtype fp8_e4m3",
         "--dtype bfloat16",
         "--mem-fraction-static 0.85",
@@ -2411,7 +2417,6 @@ export const config = {
         "SGLANG_K3_SHARED_EXPERTS_ATTN_TP=1",
         "SGLANG_K3_DENSE_MLP_ATTN_TP=1",
         "SGLANG_NPU_USE_TRITON_PREFIX_KV_CACHE_STORE=1",
-        "SGLANG_ENABLE_SPEC_V2=1",
         "SGLANG_RAGGED_VERIFY_MODE=static",
         "SGLANG_DSPARK_FOLDED_PROPOSAL=0",
         "SGLANG_DSPARK_FOLDED_SAMPLING=0",
@@ -2484,7 +2489,6 @@ export const config = {
         "SGLANG_NPU_USE_FIAS_V2_BSND=True",
         "SGLANG_NPU_FINE_GRAINED_MOE_DUAL_STREAM=True",
         "SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1",
-        "SGLANG_ENABLE_SPEC_V2=1",
         "SGLANG_RAGGED_VERIFY_MODE=static",
         "SGLANG_DSPARK_FOLDED_PROPOSAL=0",
         "SGLANG_DSPARK_FOLDED_SAMPLING=0",

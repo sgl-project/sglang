@@ -97,7 +97,7 @@ sgl-eval run aime25 \\
     gb300: "lmsysorg/sglang:latest",
     b300:  "lmsysorg/sglang:latest",
     mi355x: "lmsysorg/sglang-rocm:v0.5.13.post1-rocm720-mi35x-20260618",
-    "mi355x|mxfp4": "lmsysorg/sglang-rocm:v0.5.19-rocm720-mi35x-20260916",
+    "mi355x|mxfp4": "lmsysorg/sglang-rocm:v0.5.20-rocm720-mi35x-20260920",
     mi325x: "lmsysorg/sglang-rocm:v0.5.13.post1-rocm700-mi30x-20260616",
     mi300x: "lmsysorg/sglang-rocm:v0.5.13.post1-rocm700-mi30x-20260616",
   },
@@ -1011,7 +1011,7 @@ sgl-eval run aime25 \\
     // weights fit a 4-GPU slice, mirroring the amd/GLM-5.1-MXFP4 MI355X recipe (same DSA
     // architecture family) — --trust-remote-code (Quark custom quant config)
     // and --kv-cache-dtype fp8_e4m3 both come from that precedent. Pinned to a
-    // newer image (v0.5.19, see dockerImages["mi355x|mxfp4"]) than the FP8/BF16
+    // newer image (v0.5.20, see dockerImages["mi355x|mxfp4"]) than the FP8/BF16
     // mi355x cells. Low-Latency uses validated TP8/EP1; High-Throughput uses
     // validated TP4/EP4. Both use five-step MTP from InferenceX PR #2900.
     // DSA backend: triton (SGLang's ROCm default).
@@ -1075,6 +1075,8 @@ sgl-eval run aime25 \\
         "--speculative-num-steps 5",
         "--speculative-eagle-topk 1",
         "--speculative-num-draft-tokens 6",
+        "--enable-hierarchical-cache",
+        "--hicache-ratio 1.0",
         "--mem-fraction-static 0.85",
         "--cuda-graph-max-bs-decode 256",
         "--max-running-requests 256",
