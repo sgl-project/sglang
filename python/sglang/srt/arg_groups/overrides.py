@@ -435,6 +435,7 @@ _MAMBA_RADIX_CACHE_ARCHS = frozenset(
         "KimiK3ForConditionalGeneration",
         "BailingMoeV2_5ForCausalLM",
         "BailingMoeV3ForCausalLM",
+        "BailingMoeV3VLForConditionalGeneration",
         "Qwen3NextForCausalLM",
         "Qwen3_5MoeForConditionalGeneration",
         "InternS2PreviewForConditionalGeneration",
@@ -476,6 +477,7 @@ _MAMBA_EXTRA_BUFFER_ARCHS = frozenset(
         "MiniCPMV4_6ForConditionalGeneration",
         "BailingMoeV2_5ForCausalLM",
         "BailingMoeV3ForCausalLM",
+        "BailingMoeV3VLForConditionalGeneration",
         "FalconH1ForCausalLM",
         "GraniteMoeHybridForCausalLM",
         "Glm5NextForConditionalGeneration",
@@ -486,6 +488,10 @@ _MAMBA_EXTRA_BUFFER_ARCHS = frozenset(
         # KDA backend's track-snapshot writes (decode + extend) so donated
         # slots hold real states for prefix-cache restores.
         "KimiK3ForConditionalGeneration",
+        # Inkling asserts enable_mamba_extra_buffer and _inkling_overrides pins it,
+        # so validate_mamba_extra_buffer runs for these archs and must accept them.
+        "InklingForConditionalGeneration",
+        "InklingForConditionalGenerationMTP",
     }
 )
 
@@ -1008,7 +1014,17 @@ def _flashinfer_allreduce_fusion_auto_enable(view: Any) -> dict:
     single-node systems. Reads the mid-resolution enable_dp_attention /
     moe_a2a_backend (after the DeepSeek CP and a2a declarations), exactly
     like the legacy tail block."""
-    model_arch = model_config_of(view).hf_config.architectures[0]
+    hf_config = model_config_of(view).hf_config
+    model_arch = hf_config.architectures[0]
+    # V4.1 TP4 uses the custom push plane for decode and fused MoE finalize.
+    prefer_custom_dsv41 = (
+        getattr(hf_config, "model_type", None) == "deepseek_v41"
+        and getattr(hf_config, "hidden_size", None) == 5120
+        and get_platform().is_blackwell
+        and view.tp_size == 4
+        and view.nnodes == 1
+        and not view.disable_custom_all_reduce
+    )
     if envs.SGLANG_FLASHINFER_MNNVL_CUTEDSL_AR_FUSION.get() and model_arch in {
         "Qwen3_5MoeForCausalLM",
         "Qwen3_5MoeForConditionalGeneration",
@@ -1026,6 +1042,7 @@ def _flashinfer_allreduce_fusion_auto_enable(view: Any) -> dict:
     if (
         view.flashinfer_allreduce_fusion_backend is None
         and model_arch in _FLASHINFER_ALLREDUCE_FUSION_ARCHS
+        and not prefer_custom_dsv41
         and (get_platform().is_sm90 or get_platform().is_sm100)
         and view.tp_size > 1
         and not view.enable_dp_attention
@@ -1246,9 +1263,9 @@ def _mla_kv_cache_dtype_checks(view: Any) -> dict:
             raise ValueError(
                 "TRTLLM MLA backend is only supported on Blackwell GPUs (SM100/SM12x). Please use a different backend."
             )
-        if view.kv_cache_dtype not in ["fp8_e4m3", "fp4_e2m1", "bf16", "auto"]:
+        if view.kv_cache_dtype not in ["fp8_e4m3", "bf16", "auto"]:
             raise ValueError(
-                "TensorRT-LLM MLA backend only supports kv-cache-dtype of fp8_e4m3, fp4_e2m1, bf16, or auto."
+                "TensorRT-LLM MLA backend only supports kv-cache-dtype of fp8_e4m3, bf16, or auto."
             )
     if (
         view.attention_backend == "tokenspeed_mla"
@@ -1689,6 +1706,23 @@ def _gguf_quantization(view: Any) -> dict:
 def _dllm_attention_backend(view: Any) -> dict:
     if view.dllm_algorithm is None:
         return {}
+    from sglang.srt.dllm.algorithm import get_algorithm_cls
+
+    algorithm_cls = get_algorithm_cls(view.dllm_algorithm)
+    if backend := algorithm_cls.required_attention_backend:
+        fields = (
+            "attention_backend",
+            "prefill_attention_backend",
+            "decode_attention_backend",
+        )
+        overrides = {
+            field: backend for field in fields if getattr(view, field, None) != backend
+        }
+        if overrides:
+            logger.warning(
+                "%s requires the %s attention backend", view.dllm_algorithm, backend
+            )
+        return overrides
     if get_platform().is_hip:
         if view.attention_backend not in ["triton", "aiter"]:
             logger.warning(
@@ -1807,13 +1841,18 @@ def post_capture_kv_sizing_planned(server_args: Any) -> bool:
         return False
     if mla_enabled:
         return False
-    if cfg.kv_cache_dtype == "fp4_e2m1":
-        return False
     if cfg.prefill_only_disable_kv_cache:
         return False
     if cfg.enable_memory_saver:
         return False
     if envs.SGLANG_MOONCAKE_CUSTOM_MEM_POOL.get() is not None:
+        return False
+    # Mooncake over EFA cannot register the CUDA VMM allocation used by
+    # post-capture KV sizing. Fall back to the regular cudaMalloc-backed pool.
+    if (
+        cfg.disaggregation_transfer_backend == "mooncake"
+        and envs.MOONCAKE_PROTOCOL.get().lower() == "efa"
+    ):
         return False
 
     if (

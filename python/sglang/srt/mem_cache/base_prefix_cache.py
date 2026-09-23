@@ -406,10 +406,6 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         implementations that shard trees per cache namespace."""
         return self.root_node
 
-    def is_backuped(self, node: Any) -> bool:
-        """Whether the node's Full KV is present on host."""
-        return node.backuped
-
     def is_root(self, node: Any) -> bool:
         """Whether the node is a tree root."""
         return node is self.root_node
@@ -434,8 +430,18 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         return None
 
     @abstractmethod
-    def cache_finished_req(self, req: Req, is_insert: bool = True, **kwargs):
-        pass
+    def cache_finished_req(
+        self, req: Req, is_insert: bool = True, *, owned_kv_len: int, **kwargs
+    ):
+        """Dispose of a finished request's KV.
+
+        ``[0, req.kv.cache_protected_len)`` is cache-owned and must survive.
+        Every slot in ``[req.kv.cache_protected_len, owned_kv_len)`` is this
+        call's to account for: insert what can be keyed, release the rest.
+        Slicing the kv row by the token-id count instead strands whatever
+        lies between -- no caller releases those. ``release_kv_cache`` frees
+        everything past ``owned_kv_len``.
+        """
 
     @abstractmethod
     def cache_unfinished_req(self, req: Req, **kwargs):
@@ -549,6 +555,13 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         Check HiCache related activities to update radix tree and synchronize across TP workers if needed
         """
         raise NotImplementedError()
+
+    def flush_pending_backups(self) -> None:
+        """
+        Submit queued host backups.
+        Caches without deferred backups have nothing to flush.
+        """
+        pass
 
     def take_events(self):
         return [] if self.kv_events is None else self.kv_events.take()

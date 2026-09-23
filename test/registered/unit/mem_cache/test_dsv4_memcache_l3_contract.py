@@ -315,20 +315,17 @@ def test_logical_anchor_is_a_successful_noop():
     assert backend.batch_set_v1(["h0", "h1"], torch.arange(256)) == [True, True]
 
 
-def test_side_pool_registration_rejects_layer_first_layout():
+def test_side_pool_registration_does_not_precheck_layout():
     backend = _make_memcache()
-    backend.register_buffer = lambda _buffer: None
+    backend.register_buffer = Mock()
+    buffer = object()
     host_pool = SimpleNamespace(
         layout="layer_first",
-        get_hybrid_pool_buffer=lambda: [object()],
+        get_hybrid_pool_buffer=lambda: [buffer],
     )
 
-    try:
-        backend.register_mem_host_pool_v2(host_pool, PoolName.DEEPSEEK_V4_C4)
-    except ValueError as exc:
-        assert "page-first" in str(exc)
-    else:
-        raise AssertionError("layer_first side pool registration must fail")
+    backend.register_mem_host_pool_v2(host_pool, PoolName.DEEPSEEK_V4_C4)
+    backend.register_buffer.assert_called_once_with(buffer)
 
 
 def test_c128_exists_uses_explicit_terminal_key_for_aligned_candidate():

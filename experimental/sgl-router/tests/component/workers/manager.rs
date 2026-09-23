@@ -740,7 +740,7 @@ async fn removed_awaits_pending_added() {
 /// independently — 2N round-trips for N workers.
 #[tokio::test]
 async fn manager_emits_single_server_info_fetch_per_worker() {
-    use sgl_router::policies::kv_events::KvEventIndex;
+    use sgl_router::state::kv_events::KvEventIndex;
 
     let body = json!({
         "served_model_name": "m",
