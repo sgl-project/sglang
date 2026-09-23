@@ -85,7 +85,13 @@ class FanOutCommunicator(Generic[T]):
             return await self.watching_call(obj)
 
     def set_fan_out(self, fan_out: int):
+        # Shrink mid-call: lower in-flight expected replies (retirees already exited).
         self._fan_out = fan_out
+        if self._result_fan_out is not None and fan_out < self._result_fan_out:
+            self._result_fan_out = fan_out
+            values, event = self._result_values, self._result_event
+            if values is not None and event is not None and len(values) >= fan_out:
+                event.set()
 
     def handle_recv(self, recv_obj: T):
         if (
