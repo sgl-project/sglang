@@ -4,7 +4,7 @@ Local-only (not registered to CI): these cover the CUDA-graph capture/replay
 pattern, the DSv4 page-padded layout, and the SGLANG_DEBUG_HISPARSE_SKIP_IO
 probe, each of which JIT-compiles extra kernel instantiations. The cheap
 plan-replay correctness guards run in CI via
-test/registered/hisparse/test_hisparse.py, which this file imports
+test/registered/kernels/ops/kvcache/test_hisparse.py, which this file imports
 its fixtures from.
 
 Run: python3 test/manual/kernels/test_hisparse_prefetch.py
@@ -25,7 +25,13 @@ from sglang.srt.utils import is_hip
 
 sys.path.insert(
     0,
-    str(Path(__file__).resolve().parents[2] / "registered" / "hisparse"),
+    str(
+        Path(__file__).resolve().parents[2]
+        / "registered"
+        / "kernels"
+        / "ops"
+        / "kvcache"
+    ),
 )
 from test_hisparse import (  # noqa: F401  (GPU/platform guard applies here too); noqa: E402
     DEVICE,

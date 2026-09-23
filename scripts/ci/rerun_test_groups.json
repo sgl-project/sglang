@@ -1,4 +1,18 @@
 {
+  "hisparse": [
+    "registered/disaggregation/test_disaggregation_hisparse.py",
+    "registered/e2e/models/test_dsa_glm52_hisparse.py",
+    "registered/kernels/ops/kvcache/test_hisparse.py",
+    "registered/kernels/ops/kvcache/test_hisparse_slot_mapping.py",
+    "registered/kernels/ops/kvcache/test_hisparse_spec.py",
+    "registered/unit/managers/test_hisparse_unit.py",
+    "registered/unit/managers/test_schedule_batch_req_pool_indices.py",
+    "registered/unit/mem_cache/test_hisparse_allocator.py",
+    "registered/unit/mem_cache/test_hisparse_max_token_pool_size.py",
+    "registered/unit/mem_cache/test_hisparse_slot_translation.py",
+    "registered/unit/mem_cache/test_minimax_sparse_pool_pd_unit.py",
+    "registered/unit/model_executor/test_hisparse_pool_configurator.py"
+  ],
   "rust-server": [
     "registered/rust/test_run_rust_tests.py",
     "registered/core/test_srt_endpoint.py",
@@ -25,8 +39,8 @@
     "registered/unit/mem_cache/test_dsv4_unified_fp8_pool.py",
     "registered/unit/mem_cache/test_flashkda_strided_state_access.py",
     "registered/unit/mem_cache/test_full_loc_fast_path.py",
-    "registered/hisparse/test_hisparse_allocator.py",
-    "registered/hisparse/test_hisparse_max_token_pool_size.py",
+    "registered/unit/mem_cache/test_hisparse_allocator.py",
+    "registered/unit/mem_cache/test_hisparse_max_token_pool_size.py",
     "registered/unit/mem_cache/test_kda_fused_decode_strided_state.py",
     "registered/unit/mem_cache/test_kv_index_translator.py",
     "registered/unit/mem_cache/test_multi_ended_allocator.py",
