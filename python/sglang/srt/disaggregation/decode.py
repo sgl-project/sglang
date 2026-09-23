@@ -2811,10 +2811,7 @@ class SchedulerDisaggregationDecodeMixin:
         # admitting another replay so a steady replay stream cannot starve it.
         new_prebuilt_batch = (
             None
-            if (
-                not running_batch.is_empty()
-                and running_batch.dsv41_cache_only_replay
-            )
+            if (not running_batch.is_empty() and running_batch.dsv41_cache_only_replay)
             else self.get_new_prebuilt_batch(running_batch)
         )
         if new_prebuilt_batch:

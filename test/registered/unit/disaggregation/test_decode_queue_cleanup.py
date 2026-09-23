@@ -107,9 +107,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
 
     def test_request_window_does_not_cap_full_capacity_with_zero_paged_swa(self):
         queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
-        queue.scheduler = SimpleNamespace(
-            tp_worker=SimpleNamespace(is_hybrid_swa=True)
-        )
+        queue.scheduler = SimpleNamespace(tp_worker=SimpleNamespace(is_hybrid_swa=True))
         queue.token_to_kv_pool = SimpleNamespace(
             request_window=object(), swa_kv_pool=None
         )
@@ -119,9 +117,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
 
     def test_legacy_paged_swa_still_caps_full_capacity(self):
         queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
-        queue.scheduler = SimpleNamespace(
-            tp_worker=SimpleNamespace(is_hybrid_swa=True)
-        )
+        queue.scheduler = SimpleNamespace(tp_worker=SimpleNamespace(is_hybrid_swa=True))
         queue.token_to_kv_pool = SimpleNamespace(
             request_window=None, swa_kv_pool=object()
         )
