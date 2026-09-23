@@ -12,33 +12,53 @@
 # limitations under the License.
 # ==============================================================================
 
+import logging
+
 from sglang.srt.models.deepseek_nextn import DeepseekV3ForCausalLMNextN
 from sglang.srt.models.glm5_next import Glm5NextForConditionalGeneration
 from sglang.srt.models.utils import WeightsMapper
 
+logger = logging.getLogger(__name__)
+
 
 class Glm5NextForConditionalGenerationNextN(DeepseekV3ForCausalLMNextN):
-    _NEXTN_SPEC_WEIGHT_NAMES = ("shared_head.norm", "eh_proj", "enorm", "hnorm")
-
     @classmethod
     def get_hf_to_sglang_mapper(cls, config) -> WeightsMapper:
         text_config = getattr(config, "text_config", config)
-        layer_prefixes = (
-            f"model.layers.{text_config.num_hidden_layers}",
-            f"model.language_model.layers.{text_config.num_hidden_layers}",
+        n = text_config.num_hidden_layers
+        # lookups arrive as checkpoint and normalized names, so every rule has both forms
+        draft_rules: dict[str, str] = {}
+        for ckpt_prefix in (f"model.language_model.layers.{n}", f"model.layers.{n}"):
+            # eh_proj/enorm/hnorm sit beside the block under `model`, not in `decoder`
+            draft_rules[f"{ckpt_prefix}.eh_proj"] = "model.eh_proj"
+            draft_rules[f"{ckpt_prefix}.enorm"] = "model.enorm"
+            draft_rules[f"{ckpt_prefix}.hnorm"] = "model.hnorm"
+            draft_rules[ckpt_prefix] = "model.decoder"
+        # target rules still normalize the non-draft layers and vision tower in `exclude`
+        return Glm5NextForConditionalGeneration.hf_to_sglang_mapper | WeightsMapper(
+            orig_to_new_substr=draft_rules,
         )
-        special_mapping = {
-            f"{layer_prefix}.{name}": f"model.{name}"
-            for layer_prefix in layer_prefixes
-            for name in cls._NEXTN_SPEC_WEIGHT_NAMES
-        }
-        decoder_mapping = {
-            f"{layer_prefix}.": "model.decoder." for layer_prefix in layer_prefixes
-        }
-        return WeightsMapper(
-            orig_to_new_substr=special_mapping,
-            orig_to_new_prefix=decoder_mapping,
+
+    def _resolve_nextn_quant_config(self, config, quant_config):
+        """Mixed checkpoints list the BF16 NextN block in ``quantization_config.ignore``;
+        inheriting global FP8 quantization would corrupt its QKV weights."""
+        raw_quant_config = getattr(config, "quantization_config", None) or {}
+        if hasattr(raw_quant_config, "to_dict"):
+            raw_quant_config = raw_quant_config.to_dict()
+        ignored = (
+            raw_quant_config.get("ignore", [])
+            if isinstance(raw_quant_config, dict)
+            else []
         )
+        nextn_layer_pattern = f"model.layers.{config.num_hidden_layers}.*"
+        if nextn_layer_pattern in ignored:
+            logger.warning(
+                "GLM5 NextN layer %s is checkpoint-declared unquantized; "
+                "using BF16 draft modules",
+                nextn_layer_pattern,
+            )
+            return None
+        return super()._resolve_nextn_quant_config(config, quant_config)
 
     def __init__(self, config, quant_config=None, prefix: str = "") -> None:
         super().__init__(

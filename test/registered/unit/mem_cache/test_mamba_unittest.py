@@ -29,10 +29,6 @@ register_amd_ci(est_time=9, suite="stage-b-test-1-gpu-small-amd")
 register_xpu_ci(est_time=20, suite="stage-b-test-1-gpu-xpu")
 
 
-def _event_hashes(events):
-    return [block_hash for event in events for block_hash in event.block_hashes]
-
-
 class TestMamba(unittest.TestCase):
     @classmethod
     def setUpClass(cls):

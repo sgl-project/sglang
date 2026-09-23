@@ -7,9 +7,12 @@ from unittest.mock import Mock, patch
 import pytest
 import torch
 
-from sglang.kernels.ops.attention.dsa import paged_mqa_logits
+import sglang.kernels.ops.attention.dsa as dsa_ops
 from sglang.srt.layers.attention.dsa import dsa_indexer_kpool as kpool
 from sglang.srt.layers.attention.dsa import kpool_plan
+from sglang.srt.layers.attention.dsa.paged_mqa_logits_backend import (
+    DSAPagedMQALogitsBackend,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=8, suite="base-a-test-cpu")
@@ -42,6 +45,7 @@ def test_hip_paged_logits_backend_preserves_expanded_rows(mode):
     )
     select = Mock(return_value=selected)
     indexer = SimpleNamespace(
+        paged_mqa_logits_backend=DSAPagedMQALogitsBackend.AITER,
         _get_index_k_read_buffer=lambda pool, layer_id: cache,
         _should_use_tilelang_paged_mqa_logits=lambda q: False,
         _get_kpool_decode_metadata=decode_metadata,
@@ -49,13 +53,11 @@ def test_hip_paged_logits_backend_preserves_expanded_rows(mode):
         _topk_from_kpool_logits=select,
     )
     with (
-        patch.object(kpool, "is_hip", return_value=True),
+        patch.object(kpool, "aiter_can_use_preshuffle_paged_mqa", return_value=True),
         patch.object(
             kpool, "get_token_to_kv_pool", return_value=SimpleNamespace(page_size=64)
         ),
-        patch.object(
-            paged_mqa_logits, "aiter_paged_mqa_logits", return_value=logits
-        ) as aiter,
+        patch.object(dsa_ops, "aiter_paged_mqa_logits", return_value=logits) as aiter,
     ):
         result = kpool.IndexerKPool._get_topk_paged(
             indexer, SimpleNamespace(forward_mode=forward_mode), 0, q, weights, metadata
@@ -75,28 +77,6 @@ def test_hip_paged_logits_backend_preserves_expanded_rows(mode):
     assert select.call_args.args[0] is logits
     torch.testing.assert_close(select.call_args.kwargs["seq_lens"], seq_lens)
     assert select.call_args.kwargs["out_rows"] == padded_rows
-
-
-def test_hip_ragged_logits_keep_per_row_bounds_and_clean_padding():
-    q, keys, scales, weights = (torch.empty(n) for n in (4, 5, 6, 7))
-    starts = torch.tensor([0, 10], dtype=torch.int32)
-    ends = torch.tensor([5, 18], dtype=torch.int32)
-    logits = torch.empty(2, 24)
-    aiter = Mock(return_value=logits)
-    with (
-        patch.object(kpool, "is_hip", return_value=True),
-        patch.dict(
-            sys.modules,
-            {"aiter.ops.triton.fp8_mqa_logits": SimpleNamespace(fp8_mqa_logits=aiter)},
-        ),
-    ):
-        result = kpool.IndexerKPool._ragged_mqa_logits(
-            q, keys, scales, weights, starts, ends
-        )
-    assert result is logits
-    aiter.assert_called_once_with(
-        q, keys, scales, weights, starts, ends, clean_logits=True
-    )
 
 
 @pytest.mark.parametrize("mode", ["decode", "draft_extend_v2"])

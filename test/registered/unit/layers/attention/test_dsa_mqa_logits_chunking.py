@@ -5,19 +5,22 @@ On ROCm the `[num_q x num_k]` fp32 logits tensor goes to aiter's
 `fp8_mqa_logits`, which only compiles below 2 GiB, so the budget that decides
 chunking is a correctness bound there and not only an out-of-memory guard.
 
-The measured memory budget is stubbed: it is the only input the limit has to
-beat, and stubbing it keeps these tests on CPU.
+`Indexer` decides that with a budget; `IndexerKPool` splits the query rows
+around its aiter call. Both are stubbed down to CPU-sized inputs.
 """
 
+import sys
+import types
 from unittest import mock
 
 import pytest
 
 torch = pytest.importorskip("torch")
 
-from sglang.srt.layers.attention.dsa import dsa_indexer_kpool as kpool
+from sglang.srt.layers.attention.dsa import dsa_indexer_kpool  # noqa: E402
 from sglang.srt.layers.attention.mqa_logits_utils import (  # noqa: E402
     MQA_LOGITS_MAX_BYTES_ROCM,
+    mqa_logits_row_bytes,
     mqa_logits_should_chunk,
 )
 from sglang.test.ci.ci_register import register_cpu_ci  # noqa: E402
@@ -55,134 +58,59 @@ def test_off_rocm_the_budget_is_untouched():
     assert _decide(16_384, 32_768, is_hip=False) == (False, HUGE_MEM_BUDGET)
 
 
-# KPool builds on the same budget but caps rows by the padded HIP stride and
-# must preserve per-row page/offset metadata across logits chunks.
-@pytest.mark.parametrize(
-    "rows,keys,expected",
-    [
-        (0, 65536, 0),
-        (4, 0, 4),
-        (3, 16, 3),
-        (8191, 65536, 8191),
-        (8192, 65536, 8191),
-        (8192, 65535, 8191),
-        (20000, 32768, 16383),
-    ],
-)
-def test_kpool_hip_limit_includes_padded_stride(rows, keys, expected):
-    with mock.patch.object(kpool, "is_hip", return_value=True):
-        assert kpool.IndexerKPool._mqa_logits_chunk_rows(rows, keys) == expected
-    with mock.patch.object(kpool, "is_hip", return_value=False):
-        assert kpool.IndexerKPool._mqa_logits_chunk_rows(rows, keys) == rows
+def _kpool_mqa_logits(num_q, num_k, cap_bytes):
+    """Run `IndexerKPool._fp8_mqa_logits` over a stub that returns each row's
+    index plus its `starts`, so a misordered reassembly or an unsliced per-row
+    argument shows up in the logits."""
+    rows_per_call = []
+
+    def _kernel(q_fp8, k_fp8, k_scale, weights, starts, ends, *, clean_logits):
+        rows = q_fp8.shape[0]
+        assert weights.shape[0] == rows
+        assert starts.shape[0] == rows
+        assert ends.shape[0] == rows
+        rows_per_call.append(rows)
+        row_value = q_fp8[:, 0, 0] + starts
+        return row_value.unsqueeze(1).expand(-1, k_fp8.shape[0]).contiguous()
+
+    aiter_kernel_module = types.ModuleType("aiter.ops.triton.fp8_mqa_logits")
+    aiter_kernel_module.fp8_mqa_logits = _kernel
+    stub_modules = {
+        name: types.ModuleType(name)
+        for name in ("aiter", "aiter.ops", "aiter.ops.triton")
+    }
+    stub_modules["aiter.ops.triton.fp8_mqa_logits"] = aiter_kernel_module
+
+    q_fp8 = torch.arange(num_q, dtype=torch.float32).view(num_q, 1, 1).expand(-1, 4, 8)
+    k_fp8 = torch.zeros(num_k, 8, dtype=torch.float32)
+    with (
+        mock.patch.dict(sys.modules, stub_modules),
+        mock.patch.object(dsa_indexer_kpool, "is_hip", lambda: True),
+        mock.patch.object(dsa_indexer_kpool, "MQA_LOGITS_MAX_BYTES_ROCM", cap_bytes),
+    ):
+        logits = dsa_indexer_kpool.IndexerKPool._fp8_mqa_logits(
+            q_fp8,
+            k_fp8,
+            torch.ones(num_k),
+            torch.ones(num_q, 4),
+            torch.arange(num_q, dtype=torch.float32) * 10,
+            torch.full((num_q,), num_k, dtype=torch.int32),
+            clean_logits=True,
+        )
+    return logits, rows_per_call
 
 
-@pytest.mark.parametrize(
-    "mapping,chunk_rows",
-    [
-        ("direct", 2),
-        ("indexed", 8),
-        ("offset", 2),
-    ],
-)
-def test_kpool_chunked_topk_preserves_global_row_metadata(mapping, chunk_rows):
-    rows, keys, padded = 5, 16, 7
-    q = torch.arange(rows).reshape(rows, 1, 1).float()
-    k = torch.empty(keys, 1)
-    scales = torch.ones(keys)
-    weights = torch.arange(rows).reshape(rows, 1).float()
-    starts = torch.tensor([0, 0, 8, 8, 8], dtype=torch.int32)
-    ends = torch.tensor([2, 4, 11, 13, 16], dtype=torch.int32)
-    lengths = ends - starts
-    seq_lens = lengths * 4 + 3
-    table = torch.arange(5 * 64).reshape(5, 64)
-    row_indices = torch.tensor([2, 2, 0, 0, 1], dtype=torch.int32)
-    offsets = torch.tensor([11, 12, 13, 14, 15], dtype=torch.int32)
-    calls = []
+def test_kpool_splits_the_query_rows_to_stay_under_the_aiter_cap():
+    """Above 2 GiB of logits the aiter kernel abort()s the process instead of
+    raising, so the k-pool wrapper must never hand it a larger tensor. aiter
+    pads each row to 256 columns, so the cap counts padded rows."""
+    num_q, num_k = 8, 4
+    row_bytes = mqa_logits_row_bytes(num_k)
+    logits, rows_per_call = _kpool_mqa_logits(num_q, num_k, 3 * row_bytes + 1)
 
-    def logits(qc, kc, sc, wc, startc, endc):
-        begin = int(qc[0, 0, 0])
-        stop = begin + qc.shape[0]
-        calls.append((begin, stop))
-        assert kc is k and sc is scales
-        torch.testing.assert_close(wc, weights[begin:stop])
-        torch.testing.assert_close(startc, starts[begin:stop])
-        torch.testing.assert_close(endc, ends[begin:stop])
-        return qc[:, 0, :].expand(-1, keys)
-
-    def topk(lc, lengths_c, **kwargs):
-        begin = int(lc[0, 0])
-        stop = begin + lc.shape[0]
-        torch.testing.assert_close(lengths_c, lengths[begin:stop])
-        torch.testing.assert_close(kwargs["seq_lens"], seq_lens[begin:stop])
-        torch.testing.assert_close(kwargs["row_starts"], starts[begin:stop])
-        if mapping == "direct":
-            torch.testing.assert_close(kwargs["page_table"], table[begin:stop])
-            assert kwargs["page_table_row_index"] is None
-        elif mapping == "indexed":
-            assert kwargs["page_table"] is table
-            torch.testing.assert_close(
-                kwargs["page_table_row_index"], row_indices[begin:stop]
-            )
-        else:
-            assert kwargs["page_table"] is None
-            torch.testing.assert_close(kwargs["topk_offsets"], offsets[begin:stop])
-        return lc[:, :3].to(torch.int32)
-
-    indexer = mock.MagicMock()
-    indexer._mqa_logits_chunk_rows.side_effect = lambda m, n: min(m, chunk_rows)
-    indexer._ragged_mqa_logits.side_effect = logits
-    indexer._topk_from_kpool_logits.side_effect = topk
-    result = kpool.IndexerKPool._topk_from_ragged_kpool(
-        indexer,
-        q,
-        k,
-        scales,
-        weights,
-        starts,
-        ends,
-        lengths,
-        seq_lens,
-        page_table=table if mapping != "offset" else None,
-        page_table_row_index=row_indices if mapping == "indexed" else None,
-        topk_offsets=offsets if mapping == "offset" else None,
-        out_rows=padded,
-    )
-    assert calls == ([(0, 2), (2, 4), (4, 5)] if chunk_rows == 2 else [(0, 5)])
-    torch.testing.assert_close(
-        result[:rows], torch.arange(rows)[:, None].expand(-1, 3).int()
-    )
-    assert result.shape == (padded, 3)
-    assert bool((result[rows:] == -1).all())
-
-
-@pytest.mark.parametrize("rows,keys,out_rows", [(0, 16, 0), (0, 16, 3), (4, 0, 4)])
-def test_kpool_empty_rows_or_keys_do_not_launch_logits(rows, keys, out_rows):
-    def no_logits(*args):
-        pytest.fail("Empty queries or keys must not launch AITER")
-
-    indexer = mock.MagicMock()
-    indexer._mqa_logits_chunk_rows.side_effect = (
-        kpool.IndexerKPool._mqa_logits_chunk_rows
-    )
-    indexer._ragged_mqa_logits.side_effect = no_logits
-    indexer._topk_from_kpool_logits.side_effect = lambda logits, lengths, **kwargs: (
-        torch.full((logits.shape[0], 3), -1, dtype=torch.int32)
-    )
-    lengths = torch.zeros(rows, dtype=torch.int32)
-    result = kpool.IndexerKPool._topk_from_ragged_kpool(
-        indexer,
-        torch.empty(rows, 1, 1),
-        torch.empty(keys, 1) if keys else None,
-        None,
-        torch.empty(rows, 1),
-        lengths,
-        lengths,
-        lengths,
-        lengths,
-        out_rows=out_rows,
-    )
-    assert result.shape == (out_rows, 3)
-    assert bool((result == -1).all())
+    assert rows_per_call == [3, 3, 2]
+    rows = torch.arange(num_q, dtype=torch.float32)
+    assert torch.equal(logits, (rows + rows * 10).unsqueeze(1).expand(-1, num_k))
 
 
 if __name__ == "__main__":
