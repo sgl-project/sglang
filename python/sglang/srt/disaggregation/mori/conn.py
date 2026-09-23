@@ -1189,25 +1189,11 @@ class MoriKVManager(CommonKVManager):
         if token_item_lens is None:
             raise RuntimeError("Missing Mori DCP token item lengths")
 
-        if self.is_mla_backend:
-            src_descs, dst_descs, num_layers = self._get_mla_mem_desc_slices(
-                peer_info.dst_kv_mem_descs, peer_info.dst_kv_layer_ids
-            )
-            desc_pairs = zip(src_descs[:num_layers], dst_descs[:num_layers])
-        else:
-            (
-                src_k_descs,
-                src_v_descs,
-                dst_k_descs,
-                dst_v_descs,
-                num_layers,
-            ) = self._get_mha_mem_desc_slices(
-                peer_info.dst_kv_mem_descs, peer_info.dst_kv_layer_ids
-            )
-            desc_pairs = zip(
-                src_k_descs[:num_layers] + src_v_descs[:num_layers],
-                dst_k_descs[:num_layers] + dst_v_descs[:num_layers],
-            )
+        # DCP relayout supports MLA and hybrid MLA, both with latent KV entries.
+        src_descs, dst_descs, num_layers = self._get_mla_mem_desc_slices(
+            peer_info.dst_kv_mem_descs, peer_info.dst_kv_layer_ids
+        )
+        desc_pairs = zip(src_descs[:num_layers], dst_descs[:num_layers])
 
         statuses: List[TransferStatus] = []
         plan_cache: Dict[tuple[bool, int], BatchTransferPlan] = {}
@@ -1763,16 +1749,6 @@ class MoriKVSender(CommonKVSender):
         )
         self.conclude_state: Optional[KVPoll] = None
         self.init_time = time.time()
-
-    def supports_cached_prefix_early_send(self) -> bool:
-        # TODO: Support cached-prefix early send with DCP relayout.
-        with self.kv_mgr.transfer_lock:
-            infos = self.kv_mgr.transfer_infos.get(self.bootstrap_room, {})
-            for info in infos.values():
-                peer_info = self.kv_mgr.decode_kv_args_table.get(info.engine_key)
-                if peer_info is not None and peer_info.requires_dcp_relayout:
-                    return False
-        return True
 
     def send(
         self,

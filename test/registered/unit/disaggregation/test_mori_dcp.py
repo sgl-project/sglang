@@ -134,13 +134,6 @@ class TestMoriDCP(unittest.TestCase):
         self.assertEqual(kwargs["src_page_offset"], 2)
         self.assertEqual(kwargs["num_kv_tokens"], 13)
 
-        sender = object.__new__(mori_conn.MoriKVSender)
-        sender.kv_mgr = manager
-        sender.bootstrap_room = 7
-        self.assertFalse(sender.supports_cached_prefix_early_send())
-        peer.requires_dcp_relayout = False
-        self.assertTrue(sender.supports_cached_prefix_early_send())
-
     def test_pp_local_kv_descriptors_map_by_global_layer(self):
         manager = object.__new__(mori_conn.MoriKVManager)
         manager.kv_mem_descs = ["src-17", "src-23"]
@@ -222,19 +215,28 @@ class TestMoriDCP(unittest.TestCase):
             self.assertEqual(call.args[2], ["dst-17"])
             self.assertEqual(call.args[4], [[4]])
 
-    def test_cached_prefix_early_send_skips_dcp_relayout(self):
-        sender = SimpleNamespace(
-            supports_cached_prefix_early_send=Mock(return_value=False)
+    def test_cached_prefix_early_send_uses_shared_path(self):
+        req = SimpleNamespace(
+            pending_bootstrap=False,
+            prefix_indices=range(64),
+            host_hit_length=0,
+            start_send_idx=0,
         )
-        req = SimpleNamespace(pending_bootstrap=False, disagg_kv_sender=sender)
-        scheduler = SimpleNamespace(enable_staging=False, send_kv_chunk=Mock())
+        scheduler = SimpleNamespace(
+            enable_staging=False,
+            enable_overlap=False,
+            token_to_kv_pool_allocator=SimpleNamespace(page_size=64),
+            send_kv_chunk=Mock(),
+        )
 
         with envs.SGLANG_DISAGG_PREFILL_EARLY_SEND_CACHED_PREFIX.override(True):
             SchedulerDisaggregationPrefillMixin.maybe_send_cached_prefix_chunk(
                 scheduler, req
             )
 
-        scheduler.send_kv_chunk.assert_not_called()
+        scheduler.send_kv_chunk.assert_called_once_with(
+            req, last_chunk=False, end_idx=64
+        )
 
 
 if __name__ == "__main__":
