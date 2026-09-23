@@ -12,6 +12,7 @@ from sglang.kernels.ops.attention.dsv4.kv_layout import (
 from sglang.srt.managers.schedule_batch import ReqKvInfo
 from sglang.srt.mem_cache.allocation import alloc_for_extend
 from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
+from sglang.srt.mem_cache.dsv41_request_window import RequestWindow, window_layout
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
     DeepSeekV4SingleKVPool,
     DeepSeekV4TokenToKVPool,
@@ -26,6 +27,87 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
 class TestDSV4CompressedPools(CustomTestCase):
+    def test_request_window_direct_decode_layout_uses_request_ring(self):
+        layout = window_layout(
+            req=torch.tensor([2, 5]),
+            pos=torch.tensor([10, 2]),
+            window=4,
+            capacity=8,
+            direct=True,
+        )
+
+        self.assertTrue(layout.direct)
+        self.assertEqual(layout.write_loc.tolist(), [18, 42])
+        self.assertEqual(layout.indices.tolist(), [[18, 17, 16, 23], [42, 41, 40, -1]])
+        self.assertEqual(layout.lengths.tolist(), [4, 3])
+        self.assertEqual(layout.history_loc.numel(), 0)
+
+    def test_request_window_direct_decode_reuses_state_and_commits_tag(self):
+        def pool_factory(size, _layers):
+            return SimpleNamespace(
+                size=size,
+                kv_buffer=[torch.zeros((size, 1), dtype=torch.uint8)],
+            )
+
+        window = RequestWindow(
+            pool_factory,
+            num_slots=2,
+            layers=1,
+            page_size=1,
+            capacity=4,
+        )
+        layout = window_layout(
+            req=torch.tensor([1]),
+            pos=torch.tensor([5]),
+            window=4,
+            capacity=4,
+            direct=True,
+        )
+        window.tags[0, torch.tensor([4, 7, 6])] = torch.tensor([4, 3, 2])
+
+        with patch(
+            "sglang.srt.mem_cache.dsv41_request_window._capturing",
+            return_value=False,
+        ):
+            window.activate(layout)
+            self.assertIs(window.buffer(0), window.state.kv_buffer[0])
+            window.commit(0)
+
+        self.assertEqual(window.tags[0, 5].item(), 5)
+
+    def test_request_window_direct_decode_fails_on_missing_history(self):
+        def pool_factory(size, _layers):
+            return SimpleNamespace(
+                size=size,
+                kv_buffer=[torch.zeros((size, 1), dtype=torch.uint8)],
+            )
+
+        window = RequestWindow(
+            pool_factory,
+            num_slots=1,
+            layers=1,
+            page_size=1,
+            capacity=4,
+        )
+        window.activate(
+            window_layout(
+                req=torch.tensor([0]),
+                pos=torch.tensor([3]),
+                window=4,
+                capacity=4,
+                direct=True,
+            )
+        )
+
+        with (
+            patch(
+                "sglang.srt.mem_cache.dsv41_request_window._capturing",
+                return_value=False,
+            ),
+            self.assertRaisesRegex(RuntimeError, "SWA history is missing"),
+        ):
+            window.buffer(0)
+
     def test_swa_page_size_follows_active_storage(self):
         pool = DeepSeekV4TokenToKVPool.__new__(DeepSeekV4TokenToKVPool)
         pool.request_window = SimpleNamespace(page_size=256)

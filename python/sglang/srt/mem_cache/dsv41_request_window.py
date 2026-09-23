@@ -19,11 +19,13 @@ class WindowLayout(msgspec.Struct, frozen=True):
     history_valid: torch.Tensor
     commit_mask: torch.Tensor
     size: int
+    direct: bool
 
     def copy_(self, other: "WindowLayout") -> None:
         # Captured copy kernels read these tensors by address, so a graph replay
         # must refresh their contents in place, not rebind the object.
         assert self.size == other.size, (self.size, other.size)
+        assert self.direct == other.direct, (self.direct, other.direct)
         self.req.copy_(other.req)
         self.pos.copy_(other.pos)
         self.write_loc.copy_(other.write_loc)
@@ -61,6 +63,7 @@ def window_layout(
     capacity: int = 256,
     floor: Optional[torch.Tensor] = None,
     num_groups: Optional[int] = None,
+    direct: bool = False,
 ):
     n = pos.numel()
     if n == 0:
@@ -69,21 +72,45 @@ def window_layout(
     pos = pos.to(torch.int64)
     device = pos.device
     groups = n if num_groups is None else int(num_groups)
+    lookback = torch.arange(window, device=device)
+    seen_pos = pos[:, None] - lookback
+    valid = seen_pos >= 0
+    if floor is not None:
+        floor = floor.to(torch.int64)
+        valid &= seen_pos >= floor[:, None]
+
+    if direct:
+        write_loc = (req * capacity + pos % capacity).to(torch.int32)
+        indices = torch.where(
+            valid,
+            req[:, None] * capacity + seen_pos % capacity,
+            -1,
+        ).to(torch.int32)
+        empty = torch.empty(0, dtype=torch.int64, device=device)
+        return WindowLayout(
+            req,
+            pos,
+            write_loc,
+            indices,
+            valid.sum(-1).to(torch.int32),
+            empty,
+            empty,
+            empty,
+            torch.empty(0, dtype=torch.bool, device=device),
+            torch.ones(n, dtype=torch.bool, device=device),
+            n,
+            True,
+        )
+
     offset = torch.arange(n, device=device)
     group, group_first, group_last = _first_row_offsets(req)
     first_pos = pos - (offset - group_first)
     history_rows = groups * window
 
     write_loc = (history_rows + offset).to(torch.int32)
-    lookback = torch.arange(window, device=device)
-    seen_pos = pos[:, None] - lookback
     old = seen_pos < first_pos[:, None]
     old_loc = group[:, None] * window + (seen_pos - (first_pos[:, None] - window))
     new_loc = history_rows + group_first[:, None] + seen_pos - first_pos[:, None]
-    valid = seen_pos >= 0
-    if floor is not None:
-        floor = floor.to(torch.int64)
-        valid &= seen_pos >= floor[:, None]
     indices = torch.where(valid, torch.where(old, old_loc, new_loc), -1).to(torch.int32)
     lengths = valid.sum(-1).to(torch.int32)
 
@@ -119,6 +146,7 @@ def window_layout(
         history_valid,
         commit_mask,
         history_rows + n,
+        False,
     )
 
 
@@ -197,6 +225,8 @@ class RequestWindow:
             return
         self.layout = layout
         self.prepared = None
+        if layout.direct:
+            return
         if self.workspace is None:
             self._ensure_workspace(layout.size)
         elif self.workspace.size < layout.size:
@@ -231,6 +261,22 @@ class RequestWindow:
             layout = self.layout
             if layout is None:
                 raise RuntimeError("request-window metadata was not activated")
+            if layout.direct:
+                if not in_capture:
+                    valid = layout.indices[:, 1:] >= 0
+                    indices = torch.where(valid, layout.indices[:, 1:], self.zero_row)
+                    positions = layout.pos[:, None] - torch.arange(
+                        1, layout.indices.shape[1], device=layout.pos.device
+                    )
+                    if not torch.equal(
+                        self.tags[layer, indices][valid], positions[valid]
+                    ):
+                        raise RuntimeError(
+                            "SWA history is missing: replay or window ownership "
+                            "is invalid"
+                        )
+                self.prepared = prepared_key
+                return self.state.kv_buffer[layer]
             src = self._history_src(layout)
             if not in_capture:
                 valid = layout.history_valid
@@ -253,6 +299,9 @@ class RequestWindow:
 
     def commit(self, layer):
         layout = self.layout
+        if layout.direct:
+            self.tags[layer, layout.write_loc] = layout.pos
+            return
         dst = torch.where(
             layout.commit_mask,
             layout.req * self.capacity + layout.pos % self.capacity,
