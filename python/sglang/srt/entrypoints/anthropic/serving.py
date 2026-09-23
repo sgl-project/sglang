@@ -1172,7 +1172,7 @@ class AnthropicServing:
             if delta.reasoning_content:
                 for event in _ensure_content_block_events(
                     "thinking",
-                    ThinkingBlock(thinking=""),
+                    ThinkingBlock(thinking="", signature="sglang"),
                 ):
                     yield _emit(event)
 
@@ -1270,11 +1270,16 @@ class AnthropicServing:
         choice = response.choices[0]
         content: list[AnthropicContentBlock] = []
 
-        # Add reasoning content as a thinking block. signature is omitted
-        # entirely when the backend doesn't provide one — empty strings
-        # would fail downstream Anthropic signature verifiers.
+        # Open-weight backends do not produce Anthropic cryptographic
+        # signatures. Use a stable non-empty compatibility marker so strict
+        # SDKs still hydrate the block as a ThinkingBlock.
         if choice.message.reasoning_content:
-            content.append(ThinkingBlock(thinking=choice.message.reasoning_content))
+            content.append(
+                ThinkingBlock(
+                    thinking=choice.message.reasoning_content,
+                    signature="sglang",
+                )
+            )
 
         # Add text content
         if choice.message.content:
