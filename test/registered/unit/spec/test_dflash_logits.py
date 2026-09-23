@@ -212,6 +212,79 @@ def test_selector_gathers_global_candidates_across_vocab_shards(monkeypatch):
     torch.testing.assert_close(unary_logits, expected_logits.float())
 
 
+def _tied_embedding_model(k, vocab_size=12, hidden_size=4):
+    """A selector bound to a tied head the way Gemma 4 binds it: the target's
+    plain nn.Embedding, with neither org_vocab_size nor shard_indices."""
+    torch.manual_seed(0)
+    lm_head = torch.nn.Embedding(vocab_size, hidden_size)
+    assert not hasattr(lm_head, "org_vocab_size")
+    assert not hasattr(lm_head, "shard_indices")
+    return SimpleNamespace(
+        lm_head=lm_head,
+        candidate_selector=SimpleNamespace(top_k=k),
+        _transform_unary_logits=lambda logits: logits.float(),
+    )
+
+
+def test_selector_projects_a_tied_embedding_head_without_vocab_metadata(
+    monkeypatch,
+):
+    """Gemma ties lm_head to embed_tokens, a plain nn.Embedding. The single-rank
+    path must take the vocabulary from its weight rows instead of requiring
+    ParallelLMHead's org_vocab_size."""
+    k = 4
+    model = _tied_embedding_model(k)
+    hidden = torch.randn(3, 4)
+    monkeypatch.setattr(
+        "sglang.srt.models.dflash.get_parallel",
+        lambda: SimpleNamespace(tp_size=1),
+    )
+    monkeypatch.setattr(
+        "sglang.srt.models.dflash._flashinfer_top_k", _flashinfer_contract_topk
+    )
+
+    candidate_ids, unary_logits = DFlash2DraftModel.compute_candidates(model, hidden)
+
+    expected_logits, expected_ids = torch.topk(
+        torch.matmul(hidden, model.lm_head.weight.T), k, dim=-1
+    )
+    torch.testing.assert_close(candidate_ids, expected_ids)
+    torch.testing.assert_close(unary_logits, expected_logits)
+
+
+def test_selector_keeps_a_replicated_head_local_under_tp(monkeypatch):
+    """Under TP the worker sends a head without shard_indices to the eager
+    selector path. Such a head is replicated, so every rank already sees the
+    full vocabulary: the global candidates are the local top-k, with no id
+    offset and no all-gather."""
+    k = 4
+    model = _tied_embedding_model(k)
+    hidden = torch.randn(3, 4)
+
+    def forbidden_all_gather(x, dim):
+        raise AssertionError("a replicated head must not all-gather candidates")
+
+    monkeypatch.setattr(
+        "sglang.srt.models.dflash.get_parallel",
+        lambda: SimpleNamespace(tp_size=2),
+    )
+    monkeypatch.setattr(
+        "sglang.srt.models.dflash.tensor_model_parallel_all_gather",
+        forbidden_all_gather,
+    )
+    monkeypatch.setattr(
+        "sglang.srt.models.dflash._flashinfer_top_k", _flashinfer_contract_topk
+    )
+
+    candidate_ids, unary_logits = DFlash2DraftModel.compute_candidates(model, hidden)
+
+    expected_logits, expected_ids = torch.topk(
+        torch.matmul(hidden, model.lm_head.weight.T), k, dim=-1
+    )
+    torch.testing.assert_close(candidate_ids, expected_ids)
+    torch.testing.assert_close(unary_logits, expected_logits)
+
+
 def test_worker_folds_a_gate_admitted_quantized_selector_head(monkeypatch):
     """The pre-capture screen decides whether a quantized head reaches the
     graph-folded selector sampler or silently degrades to the eager per-round
