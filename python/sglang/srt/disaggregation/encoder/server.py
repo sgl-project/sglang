@@ -39,7 +39,10 @@ from sglang.srt.distributed.parallel_state import (
     initialize_model_parallel,
 )
 from sglang.srt.environ import envs
-from sglang.srt.layers.dp_attention import initialize_dp_attention
+from sglang.srt.layers.dp_attention import (
+    init_dp_gathered_buffer,
+    initialize_dp_attention_flags,
+)
 from sglang.srt.managers.io_struct import (
     ProfileReq,
     ProfileReqType,
@@ -589,11 +592,29 @@ class MMEncoder:
             distributed_init_method=dist_init_method,
             local_rank=rank,
         )
-        initialize_model_parallel(
-            tensor_model_parallel_size=get_parallel().tp_size,
-            attention_context_model_parallel_size=get_parallel().attn_cp_size,
+        # The encoder uses a separate WORLD with tensor and attention-CP parallelism.
+        parallel = get_parallel()
+        attn_cp_size = parallel.attn_cp_size
+        attn_tp_size = parallel.tp_size // attn_cp_size
+        attn_cp_rank, attn_tp_rank = divmod(rank, attn_tp_size)
+        parallel.override_permanently(
+            tp_rank=rank,
+            pp_size=1,
+            pp_rank=0,
+            attn_dp_size=1,
+            attn_dp_rank=0,
+            attn_tp_size=attn_tp_size,
+            attn_tp_rank=attn_tp_rank,
+            attn_cp_rank=attn_cp_rank,
+            attn_dcp_size=1,
+            moe_ep_size=1,
+            moe_ep_rank=0,
+            moe_dp_size=1,
+            moe_tp_size=parallel.tp_size,
         )
-        initialize_dp_attention(server_args, self.model_config)
+        initialize_model_parallel()
+        initialize_dp_attention_flags(server_args)
+        init_dp_gathered_buffer(self.model_config)
 
         self.model = load_model(
             model_config=self.model_config,
