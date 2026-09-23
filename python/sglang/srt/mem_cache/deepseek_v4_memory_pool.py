@@ -66,8 +66,8 @@ def get_compress_state_ring_size(
 
 
 def get_compress_state_write_pad(compress_ratio: int, ring_size: int) -> int:
-    """Largest draft-token count this ring can serve; mirrors mtp_pad in
-    c_plan.cuh, where the bound is derived."""
+    """Largest draft-token count this ring can serve; mirrors `mtp_pad` in
+    `c_plan.cuh`, where the bound is derived."""
     window_size = compress_ratio * (2 if compress_ratio == 4 else 1)
     return ring_size - window_size + 2 if ring_size > window_size else 0
 
@@ -136,13 +136,9 @@ def flashmla_supports_v41_kv_layouts() -> bool:
 
 
 def select_dsv4_kv_layout() -> Tuple[KVLayout, Optional[str]]:
-    """The (main-cache layout, compressed-cache option) of a new DeepSeek-V4
-    family pool, from SGLANG_DSV4_KV_LAYOUT (v4 | v41 | auto) and
-    SGLANG_DSV4_COMPRESSED_KV_LAYOUT (auto | fp8 | fp4).
-
-    Compact layouts require SM100/SM103 FlashMLA or gfx950 AITER attention.
-    v41 raises on unsupported backends; auto keeps v4 there.
-    """
+    """The (main-cache layout, compressed-cache option) for a new DeepSeek-V4
+    family pool; the V4.1 layouts exist only in SM100 / SM103 FlashMLA or gfx950
+    AITER attention."""
     mode = envs.SGLANG_DSV4_KV_LAYOUT.get().lower()
     option = envs.SGLANG_DSV4_COMPRESSED_KV_LAYOUT.get().lower()
     if mode == "v4":
@@ -689,7 +685,7 @@ class DeepSeekV4IndexerPool(KVCache):
     def get_index_k_fp4(
         self, layer_id: int, slots: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Packed fp4 rows at slots: (payload int8 [n, 64], scales int32 [n]),
+        """Packed fp4 rows at `slots`: (payload int8 [n, 64], scales int32 [n]),
         from the page layout [page_size * 64 payload | page_size * 4 scale]."""
         assert self.use_fp4_indexer, "packed readback only applies to the fp4 layout"
         if self.uses_aiter_fp4_layout:
@@ -718,7 +714,7 @@ class DeepSeekV4IndexerPool(KVCache):
     def get_index_k_dequant(
         self, layer_id: int, slots: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
-        """Dequantized bf16 [n, index_head_dim] index K; slots None reads the pool."""
+        """Dequantized bf16 [n, index_head_dim] index K; `slots` None reads the pool."""
         from sglang.srt.layers.quantization.fp8 import DSV4_DEQUANT_FP4_TABLE
 
         assert self.use_fp4_indexer, "dequant readback only applies to the fp4 layout"
@@ -1541,7 +1537,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         )
 
     def compressed_kv_layout(self, compress_ratio: int) -> KVLayout:
-        """See resolve_compressed_kv_layout."""
+        """See :func:`resolve_compressed_kv_layout`."""
         layout = resolve_compressed_kv_layout(
             self.kv_layout, compress_ratio, self.compressed_kv_layout_option
         )
@@ -1926,7 +1922,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
     def get_low_ratio_index_k_dequant(
         self, layer_id: int, slots: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
-        """Index-K rows at slots from the layer's latent source."""
+        """Index-K rows at `slots` from the layer's latent source."""
         compress_ratio, compress_layer_id, _ = self.layer_mapping[layer_id]
         return self._indexer_pool(compress_ratio).get_index_k_dequant(
             compress_layer_id, slots
@@ -1935,7 +1931,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
     def get_low_ratio_index_k_fp4(
         self, layer_id: int, slots: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Packed fp4 index-K rows at slots: (payload int8 [n, 64], ue8m0 scales
+        """Packed fp4 index-K rows at `slots`: (payload int8 [n, 64], ue8m0 scales
         packed int32 [n]), the input layout of quantize_fp4_indexer_tensor."""
         compress_ratio, compress_layer_id, _ = self.layer_mapping[layer_id]
         return self._indexer_pool(compress_ratio).get_index_k_fp4(

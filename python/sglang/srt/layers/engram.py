@@ -54,9 +54,9 @@ from sglang.srt.utils.hf_transformers.tokenizer import get_tokenizer
 logger = logging.getLogger(__name__)
 
 
-_is_hip = is_hip()
-
 _MILLER_RABIN_WITNESSES = (2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37)
+
+_is_hip = is_hip()
 
 
 def _is_prime(n: int) -> bool:
@@ -663,7 +663,7 @@ class _HostTable:
 
 
 class EngramEmbedding(nn.Module):
-    """Store one layer's FP8 hash table with e8m0 scales and dequantize lookups.
+    """One layer's fp8 hash table with e8m0 block scales, dequantized on lookup.
 
     Rows are sharded over the TP group in device memory; with
     SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE they live in host memory instead, as
@@ -791,7 +791,7 @@ class EngramEmbedding(nn.Module):
         )
 
     def _owned_rows(self, indices: torch.Tensor) -> torch.Tensor:
-        """Rows of indices this rank's shard holds, zero for the rest."""
+        """Rows of `indices` this rank's shard holds, zero for the rest."""
         if self.rows == 0:
             return self._empty(indices).zero_()
         if self.host_table is None and not indices.is_cuda:
@@ -861,10 +861,7 @@ def engram_gate(
     image_select: Optional[Tuple[torch.Tensor, int]] = None,
 ) -> torch.Tensor:
     """x [T, hc_mult, dim]; kv [T, (hc_mult + 1) * dim] holds one key per hc copy
-    followed by the shared value. Adds the gated value to every copy.
-    image_select = (input_ids, image_token_id) keeps x on the image-token rows.
-
-    The torch path below is the CPU fallback."""
+    followed by the shared value. Adds the gated value to every copy."""
     if (
         x.is_cuda
         and x.ndim == 3

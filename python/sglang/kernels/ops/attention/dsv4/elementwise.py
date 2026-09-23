@@ -302,10 +302,8 @@ def fused_k_norm_rope_flashmla(
     layout: Union[KVLayout, str] = KVLayout.V4,
     q: Optional[torch.Tensor] = None,
 ) -> None:
-    """RMSNorm + RoPE KV and store it in the selected paged cache layout.
-
-    On HIP, optional query heads are rotated in place by the same launch.
-    """
+    """RMSNorm + RoPE ``kv`` and write it into the ``layout`` paged FlashMLA
+    cache at ``out_loc``."""
     layout = KVLayout.parse(layout)
     freqs_real = torch.view_as_real(freqs_cis).flatten(-2)
     head_dim = kv.shape[-1]

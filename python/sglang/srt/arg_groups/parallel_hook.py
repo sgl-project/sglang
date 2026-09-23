@@ -644,7 +644,7 @@ def handle_expert_distribution_metrics(server_args: Any):
 
 
 def validate_prefill_cp_platform(server_args: Any):
-    """Reject unsupported platforms/strategies before resolving the model."""
+    """Reject deprecated platform CP before resolving models or CP topology."""
     cfg = resolving_view(server_args)
     platform = get_platform()
     # HIP interleave is model-qualified by handle_context_parallelism after lookup.

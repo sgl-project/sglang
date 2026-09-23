@@ -43,7 +43,7 @@ _PREFILL_BASE_CTA_TARGET = 1024
 _DECODE_CTA_INFO_WIDTH = 4
 
 # Budget for the pooled prefill logits block, in MiB. Rows are split to fit it
-# (see logits_rows_per_chunk), so this caps the indexer's transient footprint
+# (see `logits_rows_per_chunk`), so this caps the indexer's transient footprint
 # independently of context length and chunked-prefill size; smaller budgets only
 # buy more row chunks. 2 GiB covers 4096 rows over ~512K tokens of context.
 _LOGITS_BUDGET_ELEMS = (
@@ -172,11 +172,11 @@ def _alloc_logits(
     """Hand out the [num_tokens, max_seq_len] fp32 scratch the logits kernel fills.
 
     Prefill rectangles are served from one fixed-size pooled block. A fresh
-    torch.empty per call would instead feed the caching allocator a
+    `torch.empty` per call would instead feed the caching allocator a
     monotonically growing size sequence -- the width tracks context length, and
     an agentic session's context only ever grows -- so every request is slightly
     larger than any cached block, none can be reused, and each strands a whole
-    segment. reserved then climbs while allocated stays flat, and that
+    segment. `reserved` then climbs while `allocated` stays flat, and that
     stranded memory is invisible to allocators that bypass torch: Triton kernel
     scratch fails with HSA_STATUS_ERROR_OUT_OF_RESOURCES instead of surfacing as
     a clean torch OOM. Serving every rectangle out of one block keeps the

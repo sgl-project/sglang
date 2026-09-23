@@ -228,9 +228,9 @@ def _maybe_precompute_flashmla_sched_meta(
     extra_indices: Optional[torch.Tensor],
     extra_topk_length: Optional[torch.Tensor],
 ) -> None:
-    """Fill the split-KV schedule buffers so sparse_decode_fwd skips its own
-    <<<1, 32>>> scheduling kernel on the decode critical path;
-    flashmla_sched_meta produces the same schedule bit for bit."""
+    """Fill the split-KV schedule buffers so `sparse_decode_fwd` skips its own
+    `<<<1, 32>>>` scheduling kernel on the decode critical path;
+    `flashmla_sched_meta` produces the same schedule bit for bit."""
     if flashmla_metadata is None:
         return
     if getattr(flashmla_metadata, "tile_scheduler_metadata", None) is not None:

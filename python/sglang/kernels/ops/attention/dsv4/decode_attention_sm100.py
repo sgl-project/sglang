@@ -101,14 +101,8 @@ def swapab_attention(
     extra_lengths=None,
     inv_rope=None,
 ):
-    """SM100/gfx950 small-batch V4-layout attention on 16 actual TP4 heads.
-
-    Each CTA computes one 64-token split with the real heads on the MMA N
-    dimension. The second kernel merges FP32 partials and adds the attention
-    sink exactly once; extra_* is a second slot range appended to each
-    request's keys. Probability residual compensation keeps the PV product
-    close to FP32 probabilities while using BF16 Tensor Core operands.
-    """
+    """V4-layout attention on 16 heads; `extra_*` is a second slot range appended
+    to each request's keys, and the attention sink is folded in exactly once."""
     block = 64
     b, h, d = q.shape[0], q.shape[-2], q.shape[-1]
     assert q.ndim in (3, 4) and (q.ndim == 3 or q.shape[1] == 1)

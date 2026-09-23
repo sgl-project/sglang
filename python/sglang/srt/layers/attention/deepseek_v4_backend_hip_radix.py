@@ -795,7 +795,7 @@ class DeepseekV4HipRadixBackend(
     _low_ratio_write_group = DeepseekV4AttnBackend._low_ratio_write_group
     _low_ratio_index_topk_torch = DeepseekV4AttnBackend._low_ratio_index_topk_torch
     _low_ratio_compress_fused = DeepseekV4AttnBackend._low_ratio_compress_fused
-    # MIXED graph replay regresses HIP DP-attention throughput.
+    # MIXED BCG replay regresses ROCm DSV4 DP-attention serving throughput.
     prefer_eager_mixed_prefill_under_dp_attention: bool = True
 
     def __init__(
@@ -1521,7 +1521,9 @@ class DeepseekV4HipRadixBackend(
         if window is not None and isinstance(metadata, DSV4Metadata):
             window.activate(metadata.core_attn_metadata.request_window_layout)
 
-        # Capture the int32 SWA translation so replay reads live, possibly rebound out_cache_loc.
+        # Spec-v2 and DP padding can rebind out_cache_loc after out-graph prep;
+        # capture the translation here so replay reads live locations.
+        # FlashMLA requires int32 indices.
         if (
             isinstance(metadata, DSV4Metadata)
             and forward_batch.out_cache_loc is not None
@@ -1790,6 +1792,8 @@ class DeepseekV4HipRadixBackend(
                 seq_lens=seq_lens,
                 out_cache_loc=out_cache_loc_padded,
                 use_prefill_cuda_graph=True,
+                # CPU mirror already available here (== seq_lens, no D2H);
+                # pass it so target_verify skips the per-iter seq_lens.tolist() sync.
                 seq_lens_cpu=(
                     seq_lens_cpu.tolist() if seq_lens_cpu is not None else None
                 ),
@@ -2420,7 +2424,7 @@ class DeepseekV4HipRadixBackend(
             chunk_start = F.pad(chunk_start, (0, pad_size), value=0)
             cu_q = F.pad(cu_q, (0, pad_size), value=0)
             # Padded positions are zero. final_pos=win makes the SWA store's
-            # pos <= final_pos - win guard skip every padded row.
+            # `pos <= final_pos - win` guard skip every padded row.
             final_pos = F.pad(
                 final_pos,
                 (0, pad_size),
@@ -2687,11 +2691,7 @@ class DeepseekV4HipRadixBackend(
         return o
 
     def get_swa_out_cache_loc(self, forward_batch: ForwardBatch) -> torch.Tensor:
-        """Return cached SWA write locations, or translate the current batch's locations.
-
-        Idle batches always translate because their metadata may be stale.
-        Missing or differently padded metadata also falls back to translation.
-        """
+        # Idle metadata may be stale; zero-padded locations target the dummy slot.
         window = self.token_to_kv_pool.request_window
         if window is not None:
             layout = self.forward_metadata.core_attn_metadata.request_window_layout

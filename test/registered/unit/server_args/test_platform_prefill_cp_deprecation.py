@@ -1,4 +1,4 @@
-"""Qualify HIP interleave CP and reject unsupported platform strategies."""
+"""Reject deprecated platform CP before model loading or topology setup."""
 
 import unittest
 from types import SimpleNamespace

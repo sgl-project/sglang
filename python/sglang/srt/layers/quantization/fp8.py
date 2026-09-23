@@ -613,7 +613,7 @@ class Fp8LinearMethod(LinearMethodBase):
         **extra_weight_attrs,
     ):
         """
-        Registers weights into layer. This static method can be reused by other quantization methods that require loading FP8 checkpoints first (e.g. requantization to other formats as MXFP4).
+        Registers weights into `layer`. This static method can be reused by other quantization methods that require loading FP8 checkpoints first (e.g. requantization to other formats as MXFP4).
         """
         # Copy the layer attributes
         layer.logical_widths = output_partition_sizes
@@ -1362,7 +1362,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         **extra_weight_attrs,
     ):
         """
-        Registers weights into layer. This static method can be reused by other quantization methods that require loading FP8 checkpoints first (e.g. requantization to other formats as MXFP4).
+        Registers weights into `layer`. This static method can be reused by other quantization methods that require loading FP8 checkpoints first (e.g. requantization to other formats as MXFP4).
         """
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoeWeightScaleSupported
 

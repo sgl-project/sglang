@@ -1,4 +1,4 @@
-"""DeepSeek-V4.1 candidate graph selection must bound every speculative query position, agree across attention-DP ranks, and be admitted on ROCm."""
+"""DeepSeek-V4.1 candidate graph selection must bound every speculative query position and be admitted on ROCm."""
 
 import unittest
 from types import SimpleNamespace

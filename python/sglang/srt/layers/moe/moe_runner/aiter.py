@@ -136,11 +136,11 @@ def _aiter_quant_type(quant_type: AiterQuantType):
 
 @functools.cache
 def _aiter_fused_moe_supports_no_combine() -> bool:
-    """Probe whether the installed aiter.fused_moe accepts a no_combine kwarg.
+    """Probe whether the installed aiter.fused_moe accepts a `no_combine` kwarg.
 
     Older wheels don't expose it, so feature-detect once and forward
-    conditionally, matching the existing **extra conditional-kwarg pattern
-    used for num_local_tokens / dtype.
+    conditionally, matching the existing `**extra` conditional-kwarg pattern
+    used for `num_local_tokens` / `dtype`.
     """
     from aiter.fused_moe import fused_moe
 
@@ -502,12 +502,12 @@ def _mori_decode_recv_bound(recv_rows: int, topk: int) -> int:
     """Live rows mori's receive buffer can hold in decode, or 0 for "do not bound".
 
     Worst case fan-in is every rank routing all of its tokens to this one, so
-    sum(per-rank tokens) * topk, where topk already includes the fused shared
+    `sum(per-rank tokens) * topk`, where topk already includes the fused shared
     expert. The per-rank counts come from the DP sync, so this is the fan-in for
     the batch actually being run rather than an upper bound over all batches.
 
     That is only sound because enabling this gate also makes
-    require_mlp_tp_gather() true for mori, which gives every rank the same
+    `require_mlp_tp_gather()` true for mori, which gives every rank the same
     cuda-graph bucket. The value is baked into a captured graph and has to hold
     for every later replay; with per-rank buckets a rank on a narrow tier could
     be handed rows by a peer on a wider one, and the only bound valid under that
@@ -634,8 +634,8 @@ class AiterRunnerCore(MoeRunnerCore):
 
             # Default (INTERLEAVE) preserves the pre-fix behavior for paths
             # that prepare weights in the gate/up-interleaved layout. Set
-            # SGLANG_USE_AITER_MOE_GU_ITLV=0 to switch to SEPARATED, which
-            # matches the layout produced by Mxfp4MoEMethod (gpt-oss
+            # `SGLANG_USE_AITER_MOE_GU_ITLV=0` to switch to SEPARATED, which
+            # matches the layout produced by `Mxfp4MoEMethod` (gpt-oss
             # MXFP4) and the gptoss_fp4 tuned FlyDSL kernels.
             extra.setdefault(
                 "gate_mode",
@@ -834,7 +834,7 @@ def _pre_permute_deepep_to_aiter(
         is_fp4_dispatch = hidden_states.dtype == torch.float4_e2m1fn_x2
 
         # AITER fused_moe Clamped-SwiGLU is dispatched with
-        # gate_mode=INTERLEAVE, for which AITER picks a bf16/fp8 q_dtype_a
+        # gate_mode=INTERLEAVE, for which AITER picks a bf16/fp8 `q_dtype_a`
         # Refer to https://github.com/ROCm/aiter/blob/a2617c366dc7271a1662ecda2023d19f6ccefcec/aiter/fused_moe.py#L406-L412
         swiglu_interleave = quant_info.swiglu_limit > 0 and get_bool_env_var(
             "SGLANG_USE_AITER_MOE_GU_ITLV", "true"

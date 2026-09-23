@@ -1,4 +1,4 @@
-"""HC=4 post-mix with independent hidden-dimension CTAs."""
+"""Small-batch HC=4 post-mix with independent hidden-dimension CTAs."""
 
 import torch
 import triton

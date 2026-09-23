@@ -184,8 +184,7 @@ SGL_DEVICE void store_row_fp4(uint8_t* data_row, uint8_t* scale_row, uint32_t tx
   AlignedVector<uint8_t, kVecSize / 2> out;
 #pragma unroll
   for (uint32_t i = 0; i < kVecSize / 2; ++i) {
-    // IEEE division by the rounded scale, as the reference divides; a reciprocal multiply
-    // could land on the other side of an e2m1 tie.
+    // IEEE division by the rounded scale, as the reference does; a reciprocal multiply could cross an e2m1 tie.
 #ifdef USE_ROCM
     out[i] = static_cast<uint8_t>(fp4::e2m1x2_code({__fdiv_rn(v[2 * i], scale), __fdiv_rn(v[2 * i + 1], scale)}));
 #else

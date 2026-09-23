@@ -516,7 +516,7 @@ def dequantize_k_cache_paged_ref(
     page_table_1_flattened: torch.Tensor,
     page_size: int,
 ) -> torch.Tensor:
-    """Pure-torch reference for dequantize_k_cache_paged.
+    """Pure-torch reference for :func:`dequantize_k_cache_paged`.
 
     Decodes the same v4 paged layout with vectorized torch indexing instead of
     a Triton kernel. Used to validate the kernel (see the ``__main__`` block
@@ -577,7 +577,7 @@ def gather_dequant_requant_fp8_paged_ref(
     page_size: int,
     extra_rows: int = 0,
 ) -> torch.Tensor:
-    """Torch reference for gather_dequant_requant_fp8_paged."""
+    """Torch reference for :func:`gather_dequant_requant_fp8_paged`."""
     active = dequantize_k_cache_paged_ref(
         quant_k_cache,
         page_table_1_flattened,

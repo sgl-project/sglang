@@ -369,7 +369,7 @@ class Fp8GemmRunnerBackend(Enum):
 
 class Mxfp8DenseGemmBackend(Enum):
     """Enum for MXFP8 dense linear backend selection, resolved separately from
-    Fp8GemmRunnerBackend."""
+    `Fp8GemmRunnerBackend`."""
 
     FLASHINFER_CUTLASS = "flashinfer_cutlass"
     FLASHINFER_CUTEDSL = "flashinfer_cutedsl"
@@ -664,7 +664,7 @@ def torch_w8a8_block_fp8_linear(
 
 
 def resolve_mxfp8_dense_gemm_backend() -> Mxfp8DenseGemmBackend:
-    """Pick the MXFP8 dense linear backend, honoring --fp8-gemm-backend only when it
+    """Pick the MXFP8 dense linear backend, honoring `--fp8-gemm-backend` only when it
     names a backend that owns an MXFP8 dense kernel."""
     backend = get_fp8_gemm_runner_backend()
 
@@ -730,9 +730,7 @@ def _unsupported_mxfp8_linear(*args, **kwargs) -> torch.Tensor:
 
 
 def resolve_block_fp8_mxfp8_backend() -> Mxfp8DenseGemmBackend:
-    """The FlashInfer MXFP8 backend a 32-wide-K ue8m0 block-fp8 weight can run on.
-    On gfx950 the native scaled-MFMA kernels take the route unless the fp8 GEMM runner
-    backend is set to triton (the dot_scaled kernel)."""
+    """The FlashInfer MXFP8 backend a 32-wide-K ue8m0 block-fp8 weight can run on."""
     backend = get_fp8_gemm_runner_backend()
     # the Triton block kernel's ue8m0 activation quant is CUDA-only, so gfx950 takes an MXFP8 route
     if _is_hip and _is_gfx95_supported:
@@ -1509,7 +1507,7 @@ def flashinfer_mxfp8_blockscaled_linear(
     backend: str = "cutlass",
     pin_tactic: bool = False,
 ) -> torch.Tensor:
-    """MXFP8 dense linear via FlashInfer mm_mxfp8. weight_scale must be the layout
+    """MXFP8 dense linear via FlashInfer mm_mxfp8. `weight_scale` must be the layout
     the backend expects, prepared at load time.
 
     pin_tactic skips autotuning: tactics tuned per M bucket change the fp32
@@ -1627,7 +1625,7 @@ def block_quant_to_tensor_quant(
     block_size: List[int],
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """This function converts block-wise quantization to tensor-wise quantization.
-    The inputs are block-wise quantization tensor x_q_block, block-wise quantization scale
+    The inputs are block-wise quantization tensor `x_q_block`, block-wise quantization scale
     and the block size.
     The outputs are tensor-wise quantization tensor and tensor-wise quantization scale.
     Note only float8 is supported for now.
@@ -1671,7 +1669,7 @@ def block_quant_dequant(
     dtype: torch.dtype,
 ) -> torch.Tensor:
     """This function converts block-wise quantization to unquantized.
-    The inputs are block-wise quantization tensor x_q_block, block-wise quantization scale
+    The inputs are block-wise quantization tensor `x_q_block`, block-wise quantization scale
     and the block size.
     The output is an unquantized tensor with dtype.
     """
@@ -1895,7 +1893,7 @@ def _get_mn_major_tma_aligned_packed_ue8m0_tensor_torch_impl(
 
     assert x.dtype == torch.float and x.dim() in (2, 3)
 
-    # First, convert into UE8M0 uint8_t
+    # First, convert into UE8M0 `uint8_t`
     ue8m0_tensor = (x.view(torch.int) >> 23).to(torch.uint8)
 
     # Second, make padded packed tensors

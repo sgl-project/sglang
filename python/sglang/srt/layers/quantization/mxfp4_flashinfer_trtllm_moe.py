@@ -129,7 +129,7 @@ class Mxfp4FlashinferTrtllmMoEMethod:
     def create_moe_runner(self, layer, moe_runner_config):
         self.moe_runner_config = moe_runner_config
         # Applies flashinfer trtllm directly instead of going through a
-        # MoeRunner; FusedMoE still reads .runner, and this class is not a
+        # MoeRunner; FusedMoE still reads `.runner`, and this class is not a
         # FusedMoEMethodBase subclass so it inherits no default.
         self.runner = None
 
@@ -512,11 +512,11 @@ def maybe_fuse_routed_scale_and_shared_add(
     shared: torch.Tensor | None,
     routed_scaling_factor: float,
 ) -> torch.Tensor:
-    # When MxFP4 fusion is on, the upstream routed *= scale is skipped and
-    # the scaling is folded into the shared-add via shared.add_(routed,
-    # alpha=scale). With no shared output, the missing scale is applied
-    # in-place. Otherwise routed is already scale-final and we just add
-    # shared (or pass through if there is none).
+    # When MxFP4 fusion is on, the upstream `routed *= scale` is skipped and
+    # the scaling is folded into the shared-add via `shared.add_(routed,
+    # alpha=scale)`. With no shared output, the missing scale is applied
+    # in-place. Otherwise `routed` is already scale-final and we just add
+    # `shared` (or pass through if there is none).
     fused = isinstance(experts.quant_method, _shared_add_fused_methods())
     if fused:
         already_scaled = experts.should_fuse_routed_scaling_factor_in_topk

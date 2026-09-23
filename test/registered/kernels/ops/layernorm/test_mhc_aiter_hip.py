@@ -1,4 +1,4 @@
-"""The AITER mHC route on gfx950: gate, fallback latch, kernel numerics vs the Torch oracle, and the split-H post dispatch."""
+"""The AITER mHC route on gfx950: gate, fallback latch, and kernel numerics vs the Torch oracle."""
 
 import sys
 import types

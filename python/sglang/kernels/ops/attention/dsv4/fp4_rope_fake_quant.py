@@ -38,8 +38,7 @@ def rope_tail_fake_quant_fp4_row(
     im = tl.load(x_row_ptr + head_len + 2 * j + 1, mask=in_tail, other=0.0).to(
         tl.float32
     )
-    # freqs is a real/imag-interleaved view with stride 2 between complex pairs;
-    # index 2*j / 2*j+1 to preserve that layout.
+    # freqs is a real/imag-interleaved view: stride 2 between complex pairs.
     fr = tl.load(f_row_ptr + 2 * j, mask=in_tail, other=1.0)
     fi = tl.load(f_row_ptr + 2 * j + 1, mask=in_tail, other=0.0)
     if INVERSE:

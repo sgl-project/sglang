@@ -89,7 +89,7 @@ def _c2_decode_pool_kernel(
             mask=mask,
         )
 
-    # torch's pair-axis softmax order with an exact exp: libdevice on CUDA, tl.exp on gfx950
+    # libdevice.exp, not tl.exp: the approximate exponential changes the latent.
     m = tl.maximum(p_score, score)
     if LIBDEVICE:
         e0 = libdevice.exp(p_score - m)
@@ -98,8 +98,8 @@ def _c2_decode_pool_kernel(
         e0 = tl.exp(p_score - m)
         e1 = tl.exp(score - m)
     denom = e0 + e1
-    # The + 0.0 prevents FMA contraction: torch rounds both products before summing.
-    # torch's correctly rounded division: div_rn on CUDA, / on gfx950
+    # The + 0.0 below prevents FMA contraction: torch rounds both products first.
+    # libdevice.div_rn matches torch division; Triton's / is an approximate reciprocal.
     if LIBDEVICE:
         t0 = p_kv * libdevice.div_rn(e0, denom)
         t1 = kv * libdevice.div_rn(e1, denom)

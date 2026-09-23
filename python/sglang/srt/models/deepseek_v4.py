@@ -465,12 +465,8 @@ def _apply_wo_a_bf16_matmul(
     fast_path: bool = False,
     fp8_grid: bool = False,
 ) -> torch.Tensor | Mxfp8SwizzledInput | Fp8GridActivation | Mxfp8Activation:
-    """Compute BF16 wo_a: [T, G, D] @ [G, R, D] -> [T, G, R].
-
-    Supported shapes use native GEMV/split-K or write token-major output
-    directly. Other ROCm decode shapes can use AITER, optionally on the FP8
-    grid; unsupported cases fall back to torch.einsum.
-    """
+    # o [T, G, D] @ wo_a [G, R, D] -> [T, G, R]; the fast paths below are gated
+    # on the exact validated TP4 shapes and write token-major output directly.
     global _wo_a_aiter_batched_gemm_disabled
     hip_decode_verify = (
         _is_hip
@@ -641,9 +637,9 @@ _FREQS_CIS_TO_COS_SIN: dict[
 def _freqs_cis_to_cos_sin(
     freqs_cis: torch.Tensor, dtype: torch.dtype, device: torch.device
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Derive (cos, sin) bf16 contiguous tables from a complex64 freqs_cis,
-    cached by (id(freqs_cis), dtype, device) so that all layers sharing the
-    same freqs_cis (via precompute_freqs_cis's lru_cache) reuse one pair."""
+    """Derive (cos, sin) bf16 contiguous tables from a complex64 `freqs_cis`,
+    cached by `(id(freqs_cis), dtype, device)` so that all layers sharing the
+    same `freqs_cis` (via `precompute_freqs_cis`'s lru_cache) reuse one pair."""
     key = (id(freqs_cis), dtype, device)
     cached = _FREQS_CIS_TO_COS_SIN.get(key)
     if cached is not None:
@@ -1244,7 +1240,7 @@ class MQALayer(MqaAttentionBase):
         self._wq_b_native_consumer = None
 
         # KV cache write is always fused into the K kernel
-        # (_compute_kv_to_cache), so the legacy "overlap store cache" flag
+        # (`_compute_kv_to_cache`), so the legacy "overlap store cache" flag
         # has no effect here -- the fused path is on by default.
 
     def _apply(self, fn, recurse=True):
@@ -1309,8 +1305,7 @@ class MQALayer(MqaAttentionBase):
     def _normalize_q_lora(
         self, q: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor | Mxfp8SwizzledInput]:
-        # Keep the BF16 normalized row for the indexer while emitting the
-        # quantized input consumed by wq_b in the same launch.
+        # The indexer needs the BF16 normalized row; wq_b needs the quantized one.
         if _is_hip:
             return _hip.q_norm_for_wq_b(self, q)
         method = self.wq_b.quant_method
@@ -1788,8 +1783,8 @@ class MQALayer(MqaAttentionBase):
                 dtype=x.dtype,
             )
         else:
-            q_lora, q_for_wq_b = self._normalize_q_lora(q_lora)
-            q = self._compute_q_b(q_for_wq_b, positions, q_out)
+            q_lora, q_for_wqb = self._normalize_q_lora(q_lora)
+            q = self._compute_q_b(q_for_wqb, positions, q_out)
             self._compute_kv_to_cache(
                 x_linear, positions, forward_batch, attn_backend, qkv_a=qkv_a
             )
@@ -2049,18 +2044,18 @@ class MQALayer(MqaAttentionBase):
             if q_out is not None:
                 q_out.copy_(q)
         else:
-            q_lora, q_for_wq_b = self._normalize_q_lora(q_lora)
+            q_lora, q_for_wqb = self._normalize_q_lora(q_lora)
             fuse_q_rope = _is_hip and _hip.fuses_q_rope_into_k_store(
                 self, q_out, unified=unified, use_cp=use_cp
             )
             if fuse_q_rope:
                 # the K store launch below ropes the query heads
-                q = _hip.wq_b_unroped(self, q_for_wq_b)
+                q = _hip.wq_b_unroped(self, q_for_wqb)
             else:
-                q = self._compute_q_b(q_for_wq_b, positions, q_out)
-            if _is_hip and q_for_wq_b is not q_lora:
+                q = self._compute_q_b(q_for_wqb, positions, q_out)
+            if _is_hip and q_for_wqb is not q_lora:
                 # the indexer's wq_b would re-round onto the same grid, so hand it the fused operand
-                q_lora = q_for_wq_b
+                q_lora = q_for_wqb
             if unified:
                 # unified_kv prefill: keep bf16 kv; the backend writes
                 # the ring AFTER attention (2-source path).
@@ -2222,7 +2217,7 @@ class MQALayer(MqaAttentionBase):
                 forward_batch.forward_mode.is_decode()
                 or (
                     forward_batch.forward_mode.is_target_verify()
-                    # CUDA MXFP8 backends other than CuTeDSL may share workspace.
+                    # Other MXFP8 backends may share mutable GEMM workspace.
                     and (
                         _is_gfx95_supported
                         or getattr(self.wq_b.quant_method, "mxfp8_dense_backend", None)
@@ -2334,7 +2329,9 @@ class MQALayer(MqaAttentionBase):
                             except (AttributeError, TypeError):
                                 pass
                 elif _is_gfx942_supported:
-                    # gfx942 attention reads padded heads, so zero them to prevent NaNs.
+                    # Uninitialized padded TP heads inject NaN into attention on gfx942
+                    # (fnuz), so zero-init there; other archs tolerate new_empty and skip
+                    # the per-forward memset.
                     q_padded = x.new_zeros(x.shape[0], kernel_num_heads, self.head_dim)
                 else:
                     q_padded = x.new_empty(x.shape[0], kernel_num_heads, self.head_dim)
@@ -2398,8 +2395,8 @@ class MQALayer(MqaAttentionBase):
 
         # save_kv_cache = kv is not None selects who writes the ring. When kv is
         # None the store was already fused into _forward_prepare* (decode) or
-        # done inline, so the backend skips its own store_cache; pass q as a
-        # sentinel for the k is v assert (attention won't read it once
+        # done inline, so the backend skips its own store_cache; pass `q` as a
+        # sentinel for the `k is v` assert (attention won't read it once
         # save_kv_cache=False). When kv is not None (target-verify, or DSA-CP),
         # _forward_prepare* deliberately left the store off and the backend does
         # its normal causally-indexed store from attn_k = kv.
@@ -3216,7 +3213,9 @@ class DeepseekV4DecoderLayer(nn.Module):
             if fused is not None:
                 residual, hidden_states, post, comb, norm_fused = fused
                 if not norm_fused:
-                    # the Triton fused post+pre does not fold the input layernorm
+                    # Triton fused post+pre (gfx95 small-batch or gfx1250) returns
+                    # norm_fused=False — the input layernorm is NOT folded.
+                    # gfx95 takes the fp8-quant path; gfx1250 takes plain layernorm.
                     hidden_states, x_quant = self._input_norm(hidden_states)
                 else:
                     x_quant = None
@@ -4234,7 +4233,7 @@ class DeepseekV4DecoderLayer(nn.Module):
             else None
         )
         # Persistent grow-only scratch (keyed per ubatch) instead of a fresh
-        # torch.empty each layer -> stops the allocator's reserved from
+        # torch.empty each layer -> stops the allocator's `reserved` from
         # ballooning at large prefill chunks. input_ids_global is gathered ONCE
         # per ubatch in _forward_layers_tbo (cached on fb), not here.
         sub = state.tbo_subbatch_index
@@ -4726,7 +4725,7 @@ class DeepseekV4Model(nn.Module):
 
         TBO batch prep (tbo_split_seq_index / tbo_children) is populated
         model-agnostically when --enable-two-batch-overlap is set and the
-        DP-attention preparer allows it (mori normal mode permits prefill
+        DP-attention preparer allows it (mori `normal` mode permits prefill
         TBO). We additionally restrict to prefill (EXTEND), single PP, and
         non-CP paths supported by the DSV4 op strategy.
         """
@@ -5539,7 +5538,7 @@ class DeepseekV4ForCausalLM(nn.Module):
             else:
                 raise ValueError("num_nextn_predict_layers is not in the config")
 
-        # Must mirror MQALayer.__init__'s quantize_wo_a: dequantizing wo_a here
+        # Must mirror MQALayer.__init__'s `quantize_wo_a`: dequantizing wo_a here
         # while the layer allocated an FP8 parameter (or vice versa) fails the
         # weight loader's dtype check.
         if not (self.wo_a_fp8 or use_npu_arch35_mxfp8_wo_a(self.quant_config)):

@@ -93,9 +93,9 @@ def rope_tail(
 
 
 def fused_low_ratio_compress_supported() -> bool:
-    """Whether the fused c1 / c2 / index-K decode kernels can serve this process: Blackwell
-    (sm100+) CUDA or gfx95 ROCm. Decided once at load time, since the choice also fixes the
-    weight layout of the ratio-2 projection (one wkv_gate or wkv plus wgate)."""
+    """The fused c1 / c2 / index-K decode kernels pack fp4 with
+    `cvt.rn.satfinite.e2m1x2`, an sm100+ instruction; the answer also fixes the
+    ratio-2 weight layout (`wkv_gate`, or `wkv` plus `wgate`)."""
     if not torch.cuda.is_available():
         return False
     if torch.version.hip is not None:
@@ -105,7 +105,7 @@ def fused_low_ratio_compress_supported() -> bool:
 
 class DeepseekV41Compressor(nn.Module):
     """Pool consecutive tokens into one pre-RoPE KV latent; bf16 weights, fp32
-    projection and softmax pooling, rounded back to bf16 in finish."""
+    projection and softmax pooling, rounded back to bf16 in `finish`."""
 
     def __init__(
         self,
@@ -154,7 +154,7 @@ class DeepseekV41Compressor(nn.Module):
         return kv, score
 
     def project_fused(self, x: torch.Tensor) -> torch.Tensor:
-        """[n, 2D] fp32, | kv | score |."""
+        """`[n, 2D]` fp32, `| kv | score |`."""
         return linear_bf16_fp32(x, self.wkv_gate.weight)
 
     def finish(self, kv: torch.Tensor) -> torch.Tensor:
@@ -226,8 +226,7 @@ class DeepseekV41Indexer(nn.Module):
             self.weights_proj_hip_max_tokens = rocm_gemv_split_k_max_tokens(
                 n=self.n_heads, k=config.hidden_size, weight_dtype=torch.bfloat16
             )
-        # The decode GEMM matches tiny_gemm's reduction order, not cuBLAS's;
-        # wider batches use the linear path.
+        # The decode GEMM matches tiny_gemm's reduction order, not cuBLAS's.
         self.weights_proj_small_max_m = _small_weights_proj_max_m(
             self.n_heads, config.hidden_size
         )
@@ -268,7 +267,7 @@ class DeepseekV41Indexer(nn.Module):
         return _rope_fq4(q, freqs, self.rope_head_dim, positions=positions)
 
     def head_weights_raw(self, x: torch.Tensor) -> torch.Tensor:
-        """weights_proj(x) before the scale, [tokens, n_heads] bf16."""
+        """`weights_proj(x)` before the scale, [tokens, n_heads] bf16."""
         if 0 < x.shape[0] <= self.weights_proj_small_max_m and x.is_cuda:
             from sglang.kernels.ops.gemm.small_gemm_bf16 import n32k5120_gemm_bf16
 
