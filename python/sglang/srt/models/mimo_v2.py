@@ -1390,16 +1390,11 @@ class MiMoV2ForCausalLM(nn.Module, AudioEncoderMixin):
         )
 
         aux_hidden_states = None
-        if self.capture_aux_hidden_states:
-            hidden_states, hidden_states_before_norm, aux_hidden_states = self.model(
-                input_ids,
-                positions,
-                forward_batch,
-                input_embeds,
-                pp_proxy_tensors=pp_proxy_tensors,
-            )
-        elif self._is_multimodal:
-            hidden_states, hidden_states_before_norm = general_mm_embed_routine(
+        # Multimodal embedding must run even when aux hidden states are captured
+        # (DFLASH/MTP). Taking the capture branch first skipped image/audio
+        # feature placement and left placeholder tokens as plain text embeddings.
+        if self._is_multimodal:
+            model_out = general_mm_embed_routine(
                 input_ids=input_ids,
                 forward_batch=forward_batch,
                 language_model=self.model,
@@ -1408,13 +1403,17 @@ class MiMoV2ForCausalLM(nn.Module, AudioEncoderMixin):
                 pp_proxy_tensors=pp_proxy_tensors,
             )
         else:
-            hidden_states, hidden_states_before_norm = self.model(
+            model_out = self.model(
                 input_ids,
                 positions,
                 forward_batch,
                 input_embeds,
                 pp_proxy_tensors=pp_proxy_tensors,
             )
+        if self.capture_aux_hidden_states:
+            hidden_states, hidden_states_before_norm, aux_hidden_states = model_out
+        else:
+            hidden_states, hidden_states_before_norm = model_out
 
         if self.pp_group.is_last_rank:
             return self.logits_processor(
