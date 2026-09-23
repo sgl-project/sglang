@@ -1083,6 +1083,7 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
         prefix: str = "",
         alt_stream: Optional[torch.cuda.Stream] = None,
         is_nextn: bool = False,
+        allow_silu_fp8_quant: bool = False,
     ) -> None:
         super().__init__()
         self.config = config
@@ -1107,6 +1108,7 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
                 prefix=add_prefix("mlp", prefix.replace(".linear_attn", "")),
                 is_nextn=is_nextn,
                 support_shared_expert_fusion=not _disable_shared_experts_fusion(),
+                allow_silu_fp8_quant=allow_silu_fp8_quant and not is_nextn,
             )
             is_layer_sparse = True
             is_previous_layer_sparse = True
@@ -1248,6 +1250,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         prefix: str = "",
         alt_stream: Optional[torch.cuda.Stream] = None,
         is_nextn: bool = False,
+        allow_silu_fp8_quant: bool = False,
     ) -> None:
         super().__init__()
         self.config = config
@@ -1359,6 +1362,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
                 prefix=add_prefix("mlp", prefix.replace(".self_attn", "")),
                 is_nextn=is_nextn,
                 support_shared_expert_fusion=not _disable_shared_experts_fusion(),
+                allow_silu_fp8_quant=allow_silu_fp8_quant and not is_nextn,
             )
             is_layer_sparse = True
             is_previous_layer_sparse = True
@@ -1770,6 +1774,7 @@ class Qwen3_5ForCausalLM(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
         is_nextn: bool = False,
+        allow_silu_fp8_quant: bool = False,
     ) -> None:
         super().__init__()
         self.config = config
@@ -1796,6 +1801,7 @@ class Qwen3_5ForCausalLM(nn.Module):
                 prefix=prefix,
                 alt_stream=alt_stream,
                 is_nextn=is_nextn,
+                allow_silu_fp8_quant=allow_silu_fp8_quant and not is_nextn,
             )
 
         self.layers, self._start_layer, self._end_layer = make_layers(
@@ -2126,7 +2132,12 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
     ) -> None:
-        super().__init__(config=config, quant_config=quant_config, prefix=prefix)
+        super().__init__(
+            config=config,
+            quant_config=quant_config,
+            prefix=prefix,
+            allow_silu_fp8_quant=type(self) is Qwen3_5MoeForCausalLM,
+        )
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         weights = QWEN3_5_KV_SCALE_MAPPER.apply(weights)
