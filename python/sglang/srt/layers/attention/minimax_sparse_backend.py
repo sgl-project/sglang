@@ -28,7 +28,7 @@ from sglang.srt.runtime_context import (
     get_spec,
 )
 from sglang.srt.server_args import m3_fp8_attn_gemm_enabled
-from sglang.srt.utils import is_gfx942_supported, is_gfx95_supported, is_hip, is_npu
+from sglang.srt.utils import is_gfx95_supported, is_gfx942_supported, is_hip, is_npu
 
 
 def _rocm_sparse_decode_verify_supported() -> bool:
