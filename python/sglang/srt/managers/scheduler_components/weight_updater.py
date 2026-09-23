@@ -41,7 +41,8 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromTensorReqInput,
     UpdateWeightsFromTensorReqOutput,
 )
-from sglang.srt.runtime_context import get_model
+from sglang.srt.runtime_context import get_exec, get_model
+from sglang.srt.utils import is_npu
 
 logger = logging.getLogger(__name__)
 
@@ -209,6 +210,29 @@ class SchedulerWeightUpdaterManager:
                 f"Restart with --weight-cache-mode off to use this operation."
             )
 
+    def _cleanup_npu_cuda_graph_caches(self) -> None:
+        """Drop captured NPU graphs after the HCCL comms are destroyed: the
+        graphs bake in the buffer addresses of the old HCCL groups, so
+        replaying them after wake would touch freed memory. Correctness
+        first: the runner falls back to eager execution until graphs are
+        re-captured (e.g. after a restart)."""
+        model_runner = getattr(self.tp_worker, "model_runner", None)
+        if model_runner is None:
+            return
+        for runner_name in (
+            "decode_cuda_graph_runner",
+            "prefill_cuda_graph_runner",
+        ):
+            runner = getattr(model_runner, runner_name, None)
+            backend = getattr(runner, "backend", None)
+            cleanup = getattr(backend, "cleanup", None)
+            if callable(cleanup):
+                cleanup()
+                logger.info(
+                    f"[sleep-comm] Dropped captured graphs of {runner_name} "
+                    "because they referenced the destroyed HCCL buffers."
+                )
+
     def release_memory_occupation(self, recv_req: ReleaseMemoryOccupationReqInput):
         assert self.is_fully_idle(), (
             "release_memory_occupation should be called only when server is idle."
@@ -251,6 +275,16 @@ class SchedulerWeightUpdaterManager:
         if GPU_MEMORY_TYPE_CUDA_GRAPH in tags:
             self.memory_saver_adapter.pause(GPU_MEMORY_TYPE_CUDA_GRAPH)
 
+        if get_exec().features.enable_sleep_comm_cleanup and is_npu():
+            from sglang.srt.hardware_backend.npu.sleep_comm_manager import (
+                release_device_comms,
+            )
+
+            # Sleep: graphs are paused first (they may hold HCCL references),
+            # then the device comms are destroyed.
+            release_device_comms()
+            self._cleanup_npu_cuda_graph_caches()
+
         torch.get_device_module().synchronize()
 
         return ReleaseMemoryOccupationReqOutput()
@@ -263,6 +297,15 @@ class SchedulerWeightUpdaterManager:
 
         for tag in tags:
             self.offload_tags.remove(tag)
+
+        if get_exec().features.enable_sleep_comm_cleanup and is_npu():
+            from sglang.srt.hardware_backend.npu.sleep_comm_manager import (
+                restore_device_comms,
+            )
+
+            # Wake: rebuild the device comms before resuming graphs, since
+            # re-capture runs forward passes whose MoE layers communicate.
+            restore_device_comms()
 
         if GPU_MEMORY_TYPE_CUDA_GRAPH in tags:
             self.memory_saver_adapter.resume(GPU_MEMORY_TYPE_CUDA_GRAPH)

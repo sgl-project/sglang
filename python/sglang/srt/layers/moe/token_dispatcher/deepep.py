@@ -301,6 +301,18 @@ class DeepEPBuffer:
         return state.buffer
 
     @classmethod
+    def invalidate_buffer(cls):
+        """Drop the cached buffer; it is recreated lazily on the next
+        dispatch with the (possibly rebuilt) process group. Used by the NPU
+        sleep-mode comm cleanup after HCCL groups are rebuilt.
+
+        NOTE: if the underlying Buffer holds HCCL resources that are not
+        freed by reference dropping alone (leak visible in real-device
+        tests), call its explicit cleanup hook here before setting None.
+        """
+        cls._state().buffer = None
+
+    @classmethod
     def clean_buffer(cls):
         state = cls._state()
         if not state.buffer.low_latency_mode:
