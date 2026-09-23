@@ -117,17 +117,12 @@ jobs:
   # torch_npu / sgl_kernel_npu before importing, so they need neither an NPU card
   # nor the CANN image; a hosted runner keeps this fast-fail gate off the NPU queue.
   base-a-test-npu:
-    # TEMP(debug): pr-gate dropped from needs while the 120-min low-permission
-    # cooldown blocks it; restore `pr-gate` before review.
-    needs: [check-changes]
+    needs: [check-changes, pr-gate]
     if: ${{ !failure() && !cancelled() && inputs.coverage_mode != true && needs.check-changes.outputs.main_package == 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 45
     env:
       SGLANG_IS_IN_CI: true
-      # TEMP(debug): pr-gate fails on the cooldown and check-pr-test-health's
-      # run-wide fail-fast would cascade that failure onto this job.
-      SKIP_PR_TEST_HEALTH_CHECK: "true"
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
