@@ -349,6 +349,12 @@ def _estimate_dfa_states(schema: Any, depth: int = 0) -> int:
             )
         state_count += pattern_complexity
 
+    # Handle format constraints - xgrammar supports certain formats
+    # that add DFA states (e.g., email, date, uuid add ~2-3 states each)
+    format_name = schema.get("format")
+    if isinstance(format_name, str) and format_name in _XGRAMMAR_STRING_FORMATS:
+        state_count += 3  # Approximate DFA states per format constraint
+
     # Single subschema keywords
     for keyword in _SINGLE_SUBSCHEMA_KEYWORDS:
         child = schema.get(keyword)
