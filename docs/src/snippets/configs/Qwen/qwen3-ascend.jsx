@@ -204,9 +204,9 @@ export const config = {
         "strategy": "high-throughput",
         "nodes": "single"
       },
-      "verified": true,
-      "verificationStatus": "verified",
-      "warn": "Requires 1 A3 physical card on one node; uses 1 logical NPU device (TP=1). This reference recipe uses one die of the allocated card. See [Ascend reference workloads](#ascend-reference-workloads). Validated with the checkpoint pair and runtime recorded below.",
+      "verified": false,
+      "verificationStatus": "unverified",
+      "warn": "Requires 1 A3 physical card on one node; uses 1 logical NPU device (TP=1). Performance is measured. The recorded GPQA score includes one context-limit rejection; a separate full evaluation with the corrected output budget remains pending on A3. See [Ascend reference workloads](#ascend-reference-workloads).",
       "env": [
         "GLOO_SOCKET_IFNAME={{GLOO_IFNAME}}",
         "HCCL_OP_EXPANSION_MODE=AIV",
@@ -349,9 +349,9 @@ export const config = {
         "strategy": "low-latency",
         "nodes": "single"
       },
-      "verified": false,
-      "verificationStatus": "unverified",
-      "warn": "A2 validation candidate: 4 cards with 64 GB each on one node (TP=4). Starts with one concurrent request, chunked prefill, and no EAGLE3 or graph capture. Runtime, accuracy, and performance validation are pending; the A3 low-latency target does not apply.",
+      "verified": true,
+      "verificationStatus": "verified",
+      "warn": "Requires 4 A2 cards with 64 GB each on one node (TP=4). Allows eight concurrent requests, uses chunked prefill and decode graphs for batch sizes 1, 2, 4, and 8, without EAGLE3. Performance uses client concurrency 1; GSM8K uses 8. Validated with the checkpoint and runtime recorded below; the A3 low-latency target does not apply.",
       "env": [
         "GLOO_SOCKET_IFNAME={{GLOO_IFNAME}}",
         "HCCL_SOCKET_IFNAME={{HCCL_IFNAME}}",
@@ -366,11 +366,11 @@ export const config = {
         "--dtype bfloat16",
         "--tp-size 4",
         "--context-length 32768",
-        "--max-running-requests 1",
+        "--max-running-requests 8",
         "--chunked-prefill-size 4096",
         "--mem-fraction-static 0.85",
         "--disable-radix-cache",
-        "--disable-cuda-graph",
+        "--cuda-graph-bs-decode 1 2 4 8",
         "--reasoning-parser qwen3",
         "--tool-call-parser qwen",
         "--host {{HOST_IP}}",
@@ -385,9 +385,9 @@ export const config = {
         "strategy": "high-throughput",
         "nodes": "single"
       },
-      "verified": false,
-      "verificationStatus": "unverified",
-      "warn": "Requires 4 A2 cards with 64 GB each on one node (4 logical NPU devices, TP=4). This follows the A2 reference command, whose two-card heading conflicts with its TP4 setting; use four devices. See [Ascend reference workloads](#ascend-reference-workloads). Runtime, accuracy, and performance validation are pending.",
+      "verified": true,
+      "verificationStatus": "verified",
+      "warn": "Requires 4 A2 cards with 64 GB each on one node (4 logical NPU devices, TP=4). Validated on 910B3 with startup, temperature-0/1 inference, 400/400 performance requests, and a full 198-question GPQA run using a 38000-token output budget. The A2 reference's two-card heading conflicts with its TP4 command; use four devices. See [Ascend reference workloads](#ascend-reference-workloads).",
       "env": [
         "GLOO_SOCKET_IFNAME={{GLOO_IFNAME}}",
         "HCCL_OP_EXPANSION_MODE=AIV",

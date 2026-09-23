@@ -1,8 +1,15 @@
-// Measured on 2026-09-12; original Qwen3 checkpoints, PD co-located.
-// Source: sgl-project/sglang c389dd086340878934bf96bc209534f1fbb8440c.
+// A3 measured on 2026-09-12; original Qwen3 checkpoints, PD co-located.
+// A3 source: sgl-project/sglang c389dd086340878934bf96bc209534f1fbb8440c.
 // CANN 9.0.0, torch/torch-npu 2.10.0, sgl-kernel-npu 2026.9.0,
 // triton-ascend 3.2.1.dev20260530, transformers 5.8.1. This is the measured
 // platform environment, not a claim that every current-main dependency is pinned.
+// A2 32B W8A8 performance measured on 2026-09-22 at
+// b44e2486824e2fbde9cbcb09adad10bce5593c16: four Ascend 910B3 devices,
+// CANN 9.0.0, torch/torch-npu 2.10.0, A2 sgl-kernel-npu 2026.9.0,
+// triton-ascend 3.2.1.dev20260530, transformers 5.12.1,
+// memfabric-hybrid 1.1.4 and memfabric-zbal 1.1.2.
+// A2 ModelScope main revision: 9ecdf711a9629fbf2385b17b47359c8a604e39ed;
+// draft revision: d7272a49b25d36d75f7ec629503fb704f67268db.
 // The legacy tokens_per_sec_per_gpu field is divided by the logical NPU device
 // count; this config labels that denominator "NPU device" in the shared UI.
 // ShareGPT corpus SHA-256:
@@ -19,6 +26,36 @@
 // Original test.jsonl SHA-256:
 // 3730d312f6e3440559ace48831e51066acaca737f6eabec99bccb9e4b3c39d14.
 export const benchmarks = [
+  {
+    match: { hw: "a2", variant: "32b", quant: "bf16", strategy: "low-latency", nodes: "single" },
+    sglang_version: "main @ b44e248682",
+    latencyPercentile: "Mean",
+    speed: [
+      {
+        workload: { dataset: "random", isl: 18000, osl: 4000, max_concurrency: 1, num_prompts: 4 },
+        ttft_ms: 2888.82,
+        tpot_ms: 32.96,
+        tokens_per_sec_per_gpu: 40.83,
+      },
+    ],
+    accuracy: { gsm8k_pct: 86.68 },
+    notes: "Measured on 2026-09-23: 4 physical A2 cards, 4 logical NPU devices (TP4), Ascend 910B3. 4/4 performance requests succeeded; output throughput 29.69 tok/s for the service. Median TTFT 2887.23 ms and median TPOT 32.94 ms. GSM8K: 1139/1314 correct, 1314/1314 successful requests, no empty responses or invalid answer extractions. One full 5-shot completion run at temperature 0, maximum output 512 tokens, client concurrency 8; 178 output-budget stops remain included in the score. Performance uses client concurrency 1 with the same server configuration: maximum 8 running requests and decode graphs for batch sizes 1, 2, 4, and 8. Main checkpoint: Qwen/Qwen3-32B, ModelScope revision d64d397e66908737784bb9172614b88e085b2ad1. No EAGLE3. This is a single measured run, without a matched performance baseline.",
+  },
+  {
+    match: { hw: "a2", variant: "32b", quant: "w8a8", strategy: "high-throughput", nodes: "single" },
+    sglang_version: "main @ b44e248682",
+    latencyPercentile: "Mean",
+    speed: [
+      {
+        workload: { dataset: "random", isl: 3584, osl: 1536, max_concurrency: 100, num_prompts: 400 },
+        ttft_ms: 7326.95,
+        tpot_ms: 73.59,
+        tokens_per_sec_per_gpu: 890.40,
+      },
+    ],
+    accuracy: { gpqa_diamond_pct: 66.67 },
+    notes: "4 physical A2 cards, 4 logical NPU devices (TP4), Ascend 910B3. Performance measured on 2026-09-22: 400/400 requests succeeded; output throughput 1068.48 tok/s for the service. Median TTFT 972.87 ms and median TPOT 69.61 ms. GPQA Diamond measured on 2026-09-23: 132/198 correct, 198/198 successful generations, no rejected requests or empty final answers. One full 0-shot run at temperature 1.0 with a 38000-token output budget; all 198 responses stopped naturally. The initial 40000-token run scored 139/198 but included one context-limit rejection; it is retained separately and is not combined with this run. Native generation passed at temperatures 0 and 1.0. The selected EAGLE3 recipe uses no additional host tuning. Main checkpoint: vllm-ascend/Qwen3-32B-W8A8; draft: Zjcxy-SmartAI/Eagle3-Qwen3-32B-zh. This is not a matched comparison to the source's 55 ms reference.",
+  },
   {
     match: { hw: "a3", variant: "8b", quant: "w8a8", strategy: "low-latency", nodes: "single" },
     sglang_version: "main @ c389dd0863",
@@ -47,7 +84,7 @@ export const benchmarks = [
       },
     ],
     accuracy: { gpqa_diamond_pct: 61.11 },
-    notes: "1 physical A3 card allocated, 1 logical NPU device used (TP1). 256/256 performance requests succeeded; output throughput 1778.40 tok/s for the service. Median TTFT 1840.44 ms and median TPOT 28.18 ms. GPQA Diamond: 198/198 questions completed without request errors, one full 0-shot run at temperature 1.0 with a 40000-token output budget. One length-limit stop remains included in the score. Main checkpoint: vllm-ascend/Qwen3-8B-w8a8; draft: Zjcxy-SmartAI/Eagle3-Qwen3-8B-zh.",
+    notes: "1 physical A3 card allocated, 1 logical NPU device used (TP1). 256/256 performance requests succeeded; output throughput 1778.40 tok/s for the service. Median TTFT 1840.44 ms and median TPOT 28.18 ms. GPQA Diamond: 121/198 correct, 197 successful generations and one context-limit rejection retained as an incorrect answer. One full 0-shot run at temperature 1.0 with a 40000-token output budget; the rejected request was not an output-budget truncation. A separate full run with a 38000-token budget remains pending on A3. Main checkpoint: vllm-ascend/Qwen3-8B-w8a8; draft: Zjcxy-SmartAI/Eagle3-Qwen3-8B-zh.",
   },
   {
     match: { hw: "a3", variant: "30b-a3b", quant: "w8a8", strategy: "low-latency", nodes: "single" },
