@@ -1170,34 +1170,8 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
             )
             assert self.paged_draft_layers > 0, "DSpark draft layer count is required"
         self.request_window_bytes = 0
-        if self.encoder_replay:
-            slots = self.requested_max_running_requests_per_worker + 1
-            capacity = ceil_align(
-                self.sliding_window_size + self.online_c128_mtp_max_draft_tokens,
-                self.page_size,
-            )
-            layers = self.num_layers_total
-            scratch = (
-                max(
-                    get_schedule().chunked_prefill_size,
-                    slots * max(128, self.online_c128_mtp_max_draft_tokens),
-                )
-                + slots * 128
-                + self.page_size
-            )
-            self.request_window_bytes = (
-                (slots * capacity + self.page_size) * layers * (self.kv_bytes + 16)
-                + 4 * scratch * (self.kv_bytes + 16)
-                + slots * 3 * 16 * self.attn_head_dim * 8
-            )
-            if not self.paged_draft_layers:
-                self.swa_ratio = 0
         self.swa_prefix_tails = self._resolve_swa_prefix_tails()
-        self.swa_cap_tokens = (
-            0
-            if self.encoder_replay and not self.paged_draft_layers
-            else self._resolve_swa_cap_tokens()
-        )
+        self.swa_cap_tokens = self._resolve_swa_cap_tokens()
         self.bytes_per_swa_token = self._get_bytes_per_swa_token()
         self.bytes_per_full_token = self._get_bytes_per_full_token()
         if self.is_speculative and not self.encoder_replay:
@@ -1318,20 +1292,21 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
     def _get_bytes_per_swa_token(self) -> float:
         """Bytes one SWA slot costs across the stage. c4_state_pool_size = swa_tokens
         // page_size * ring, so c4 compress state is priced per SWA slot too."""
-        if self.encoder_replay:
-            # Target SWA lives in the request window; only the draft owns paged SWA
-            # bytes, and its layers carry no compressed state.
-            return self.kv_bytes * self.paged_draft_layers
         c4_state_dtype_size, _ = _get_dsv4_compress_state_dtype_sizes()
         c4_state_bytes = 2 * 2 * self.attn_head_dim * c4_state_dtype_size
         c4_indexer_state_bytes = 2 * 2 * self.indexer_head_dim * c4_state_dtype_size
 
         c4_state_ratio = self.ring_sizes.get(4, 0) / self.page_size
-        return self._get_paged_kv_bytes_per_token() * self.num_layers_total + (
+        bytes_per_token = self._get_paged_kv_bytes_per_token() * self.num_layers_total + (
             c4_state_ratio
             * (c4_state_bytes + c4_indexer_state_bytes)
             * self.num_layers(4)
         )
+        if self.encoder_replay:
+            # DSpark's draft pool shares the target allocator's virtual ids but
+            # owns one or more additional SWA layers in the same paged budget.
+            bytes_per_token += self.kv_bytes * self.paged_draft_layers
+        return bytes_per_token
 
     def _compressed_bytes_per_full_token(self, ratio: int) -> float:
         """Compressed KV (+ indexer) bytes one full token adds per layer of `ratio`;
@@ -1378,7 +1353,7 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         swa_tokens = self._get_swa_tokens(full_token, page_size)
         if self.swa_cap_tokens is None:
             # Only ratio sizing can under-size a request: cap mode sizes from the
-            # request floor, and encoder replay deliberately runs swa_tokens == 0.
+            # request floor.
             if not self._unified:
                 self.validate_swa_pool_size(
                     swa_tokens, self.sliding_window_size, page_size
