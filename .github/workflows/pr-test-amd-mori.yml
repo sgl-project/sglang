@@ -64,7 +64,7 @@ jobs:
         run: |
           bash scripts/ci/amd/amd_ci_exec.sh \
             -w /sglang-checkout/test \
-            python3 -m pytest -q registered/unit/disaggregation/test_mori_backend_basic.py
+            python3 -m pytest -q registered/amd/disaggregation/test_mori_backend_basic.py
 
       - name: Run Mori PD tests
         run: |
