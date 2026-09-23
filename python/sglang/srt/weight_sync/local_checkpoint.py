@@ -184,16 +184,11 @@ def _write_applied_version(local_checkpoint_dir: str, version: int) -> None:
 
 def _drop_page_cache(path: str) -> None:
     """Evict a file from the page cache (POSIX_FADV_DONTNEED)."""
-    if not hasattr(os, "posix_fadvise"):  # POSIX-only (absent on macOS/Windows)
-        return
+    fd = os.open(path, os.O_RDONLY)
     try:
-        fd = os.open(path, os.O_RDONLY)
-        try:
-            os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
-        finally:
-            os.close(fd)
-    except OSError:
-        pass
+        os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+    finally:
+        os.close(fd)
 
 
 def _reset_checkpoint(src_dir: str, local_checkpoint_dir: str, version: int) -> None:
@@ -274,7 +269,7 @@ def _apply_delta(local_checkpoint_dir: str, version_dir: str) -> None:
             file_bytes.append(blob)
             (header_len,) = struct.unpack("<Q", blob[:8])
             header = json.loads(blob[8 : 8 + header_len])
-            want_checksums = header.get("__metadata__", {})
+            want_checksums = header["__metadata__"]
             view = memoryview(blob)
             for name, info in header.items():
                 if name == "__metadata__":
@@ -292,17 +287,14 @@ def _apply_delta(local_checkpoint_dir: str, version_dir: str) -> None:
                         path,
                         offset,
                         nbytes,
-                        want_checksums.get(name),
+                        want_checksums[name],
                     )
                 )
 
         # prefetch into page cache (evicted during the rollout) so the apply
         # doesn't fault from cold storage
         for _, mm in open_mmaps.values():
-            try:
-                mm.madvise(mmap.MADV_WILLNEED)
-            except (OSError, AttributeError, ValueError):
-                pass
+            mm.madvise(mmap.MADV_WILLNEED)
 
         def apply_xor(item) -> None:
             name, compressed, path, offset, nbytes, want = item
