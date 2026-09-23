@@ -24,6 +24,7 @@ class StateType(str, enum.Enum):
     # only the live subrange of that row for the current open pool.
     DSA_TAIL = "dsa_tail"
     MINIMAX_INDEX_K = "minimax_index_k"
+    MINIMAX_DENSE_KV = "minimax_dense_kv"
     # DeepSeek-V4 unified_kv SWA ring: addressed per-row by ring slot
     # (req_pool_idx * ring_stride + pos % ring_stride), needs its own component.
     SWA_RING = "swa_ring"
@@ -127,6 +128,15 @@ class BaseKVManager(ABC):
         """Register prefill server info to the bootstrap server."""
         ...
 
+    # Opt-in per backend: set True and implement teardown() to support runtime PD
+    # role switch (release transfer resources; the scheduler owns the KV pool).
+    supports_role_switch: bool = False
+
+    def teardown(self) -> None:
+        raise NotImplementedError(
+            f"{type(self).__name__} does not support PD role switch teardown"
+        )
+
 
 class BaseKVSender(ABC):
     @abstractmethod
@@ -161,6 +171,10 @@ class BaseKVSender(ABC):
 
     def pop_decode_prefix_len(self) -> int:
         return 0
+
+    def get_max_transfer_tokens(self) -> Optional[int]:
+        """Optional page-aligned limit for one scheduler KV send."""
+        return None
 
     def should_send_kv_chunk(self, num_pages: int, last_chunk: bool) -> bool:
         return num_pages > 0

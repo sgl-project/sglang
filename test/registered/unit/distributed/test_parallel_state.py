@@ -44,6 +44,7 @@ import pytest
 import torch
 
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import publish_build_topology
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
@@ -232,11 +233,8 @@ def test_parallel_group_construction_tp8_attn_cp2():
             mock_world_group.return_value = mock_world
 
             # Call the actual function
-            parallel_state.initialize_model_parallel(
-                tensor_model_parallel_size=8,
-                pipeline_model_parallel_size=1,
-                attention_context_model_parallel_size=2,
-            )
+            publish_build_topology(tp_size=8, pp_size=1, attn_cp_size=2)
+            parallel_state.initialize_model_parallel()
 
             # Verify TP groups
             tp_groups = created_groups.get("tp", [])
@@ -330,12 +328,8 @@ def test_parallel_group_construction_tp8_moe_ep4_cp2():
             mock_world_group.return_value = mock_world
 
             # Call the actual function
-            parallel_state.initialize_model_parallel(
-                tensor_model_parallel_size=8,
-                expert_model_parallel_size=4,
-                pipeline_model_parallel_size=1,
-                moe_data_model_parallel_size=2,
-            )
+            publish_build_topology(tp_size=8, ep_size=4, pp_size=1, moe_dp_size=2)
+            parallel_state.initialize_model_parallel()
 
             # Verify TP groups
             tp_groups = created_groups.get("tp", [])
