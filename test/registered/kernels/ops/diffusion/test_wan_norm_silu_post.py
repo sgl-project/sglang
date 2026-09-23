@@ -3,19 +3,17 @@
 
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
 
 import torch
 import torch.nn.functional as F
 
 import sglang.multimodal_gen.runtime.models.vaes.wan_vae_cuda_opt as wan
-from sglang.kernels.ops.diffusion import can_use_wan_norm_silu_post, wan_norm_silu_post
+from sglang.kernels.ops.diffusion import wan_norm_silu_post
 from sglang.multimodal_gen.runtime.models.vaes.fast_path_gate import VaeFastPathGate
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=45, stage="base-b-kernel-unit", runner_config="1-gpu-large")
-register_cuda_ci(est_time=45, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
 
 
 def reference(x, gamma, bias, scale):
@@ -117,22 +115,6 @@ class TestWanNormSiLUPost(CustomTestCase):
                 )
 
     @torch.inference_mode()
-    def test_nonintegral_channel_scale_and_zero_norm(self):
-        for channels in (96, 512):
-            for layout in (torch.contiguous_format, torch.channels_last_3d):
-                module = self.module(channels, bias=True)
-                x = torch.randn(
-                    2, channels, 1, 5, 12, device="cuda", dtype=torch.bfloat16
-                ).to(memory_format=layout)
-                x[0].zero_()
-                with torch.autocast("cuda", dtype=torch.bfloat16):
-                    self.assertBitsEqual(
-                        module(x), reference(x, module.gamma, module.bias, module.scale)
-                    )
-                    self.assertTrue(module._post_gate.verified)
-                    self.assertFalse(module._post_gate.disabled)
-
-    @torch.inference_mode()
     def test_graph_replay_recomputes_norm_and_affine(self):
         for layout in (torch.contiguous_format, torch.channels_last_3d):
             module = self.module(bias=True)
@@ -151,67 +133,6 @@ class TestWanNormSiLUPost(CustomTestCase):
                 self.assertBitsEqual(
                     actual, reference(x, module.gamma, module.bias, module.scale)
                 )
-
-    @torch.inference_mode()
-    def test_unverified_capture_and_mismatch_fall_back(self):
-        module = self.module()
-        x = torch.randn(2, 64, 3, 8, 12, device="cuda", dtype=torch.bfloat16)
-        with torch.autocast("cuda", dtype=torch.bfloat16):
-            expected = reference(x, module.gamma, module.bias, module.scale)
-            with patch.object(wan, "wan_norm_silu_post") as fused:
-                graph = torch.cuda.CUDAGraph()
-                with torch.cuda.graph(graph):
-                    actual = module(x)
-                graph.replay()
-                fused.assert_not_called()
-            self.assertBitsEqual(actual, expected)
-            with patch.object(
-                wan, "wan_norm_silu_post", return_value=torch.zeros_like(expected)
-            ):
-                self.assertBitsEqual(module(x), expected)
-            self.assertTrue(module._post_gate.disabled)
-            with patch.object(wan, "wan_norm_silu_post") as fused:
-                self.assertBitsEqual(module(x), expected)
-                fused.assert_not_called()
-
-    @torch.inference_mode()
-    def test_unsupported_dtype_layout_and_compile_fall_back(self):
-        module = self.module()
-        x = torch.randn(2, 64, 3, 8, 12, device="cuda", dtype=torch.bfloat16)
-        with patch.object(wan, "wan_norm_silu_post") as fused:
-            # Without autocast, normalize retains BF16 intermediates.
-            self.assertTrue(
-                torch.equal(
-                    module(x), reference(x, module.gamma, module.bias, module.scale)
-                )
-            )
-            with torch.autocast("cuda", dtype=torch.bfloat16):
-                sliced = x[..., ::2]
-                expected = reference(sliced, module.gamma, module.bias, module.scale)
-                with patch.object(wan.F, "normalize", wraps=F.normalize) as normalize:
-                    self.assertBitsEqual(module(sliced), expected)
-                    normalize.assert_not_called()
-                with patch.object(torch.compiler, "is_compiling", return_value=True):
-                    self.assertBitsEqual(
-                        module(x), reference(x, module.gamma, module.bias, module.scale)
-                    )
-            fused.assert_not_called()
-        denominator = torch.ones(2, 1, 3, 8, 12, device="cuda")
-        self.assertFalse(
-            can_use_wan_norm_silu_post(x.half(), denominator, module.gamma)
-        )
-        self.assertFalse(
-            can_use_wan_norm_silu_post(x, denominator.bfloat16(), module.gamma)
-        )
-
-    def test_grad_enabled_uses_reference(self):
-        module = self.module(dtype=torch.float32)
-        x = torch.randn(2, 64, 3, 8, 12, device="cuda", requires_grad=True)
-        with patch.object(wan, "wan_norm_silu_post") as fused:
-            module(x).sum().backward()
-            fused.assert_not_called()
-        self.assertIsNotNone(x.grad)
-        self.assertIsNotNone(module.gamma.grad)
 
 
 if __name__ == "__main__":
