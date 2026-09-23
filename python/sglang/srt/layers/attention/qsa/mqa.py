@@ -6,7 +6,10 @@ from typing import Optional
 
 import torch
 
+from sglang.srt.utils import is_npu
 from sglang.srt.utils.common import is_hip
+
+_is_npu = is_npu()
 
 try:
     import flashinfer.comm  # noqa: F401
@@ -388,6 +391,12 @@ def qsa_mqa_prefill(
     row_ends: torch.Tensor,
     score_scale: Optional[float] = None,
 ) -> torch.Tensor:
+    if _is_npu:
+        if score_scale is not None:
+            raise ValueError("Custom MQA scale is outside the model contract")
+        from sgl_kernel_npu.qwen3_8_flash_next import qsa_mqa as npu_mqa
+
+        return npu_mqa.packed(q, k, row_starts, row_ends)
     if q.is_cuda and HAS_TILELANG:
         return tilelang_qsa_mqa_prefill(q, k, row_starts, row_ends, score_scale)
     return torch_qsa_mqa_prefill(q, k, row_starts, row_ends, score_scale)
@@ -401,6 +410,12 @@ def qsa_mqa_decode(
     max_model_len: int,
     score_scale: Optional[float] = None,
 ) -> torch.Tensor:
+    if _is_npu:
+        if score_scale is not None:
+            raise ValueError("Custom MQA scale is outside the model contract")
+        from sgl_kernel_npu.qwen3_8_flash_next import qsa_mqa as npu_mqa
+
+        return npu_mqa.paged(q, k_cache, page_table, context_lens, max_model_len)
     if q.is_cuda and HAS_TILELANG:
         return tilelang_qsa_mqa_decode(
             q, k_cache, page_table, context_lens, max_model_len, score_scale

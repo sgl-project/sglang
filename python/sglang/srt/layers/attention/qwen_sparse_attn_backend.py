@@ -37,11 +37,47 @@ from sglang.srt.layers.attention.qsa.sparse_attn import (
     sparse_gqa_fwd_interface_triton_ck,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.utils import is_npu
 
 logger = logging.getLogger(__name__)
 
+_is_npu = is_npu()
 
 _TRTLLM_SPARSE_PAGE_SIZE = 64
+
+
+def _flatten_qsa_kv_cache(cache: torch.Tensor, name: str) -> torch.Tensor:
+    """Adapt NPU KV cache layouts to rank-3 physical-token pools.
+
+    Sparse attention receives rank-3 [slots, heads, dim] caches.
+    NPU pools expose rank-4 paged or FIA layouts, requiring this NPU-only adapter.
+    The conversion must share the original storage; incompatible strides raise
+    instead of silently copying the KV pool.
+    """
+    if cache.ndim == 3:
+        return cache
+    if cache.ndim == 4:
+        # [pages, page_size, heads, dim], including FIA's [slots, 1, heads, dim].
+        # Unlike flatten/reshape, view cannot silently allocate a copy.
+        return cache.view(
+            cache.shape[0] * cache.shape[1], cache.shape[2], cache.shape[3]
+        )
+    raise ValueError(f"{name} must be rank 3 or 4, got shape {tuple(cache.shape)}")
+
+
+def _npu_sparse_attention(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    token_slots: torch.Tensor,
+    softmax_scale: Optional[float] = None,
+) -> torch.Tensor:
+    """Adapt NPU KV pools and call the model-contract sparse attention kernel."""
+    from sgl_kernel_npu.qwen3_8_flash_next.qsa_sparse_attention import sparse_attention
+
+    k_cache = _flatten_qsa_kv_cache(k_cache, "k_cache")
+    v_cache = _flatten_qsa_kv_cache(v_cache, "v_cache")
+    return sparse_attention(q, k_cache, v_cache, token_slots, softmax_scale)
 
 
 @lru_cache(maxsize=1)
@@ -99,6 +135,8 @@ class QwenSparseAttnMetadata(msgspec.Struct, frozen=True):
 
     sequence_lengths: torch.Tensor
     token_to_batch_idx: torch.Tensor
+    # This field holds the per-batch mapping in eager mode,
+    # but only a placeholder in graph mode.
     token_slot_table: torch.Tensor
     indexer_metadata: QSAIndexerMetadata
     row_req_pool_indices: Optional[torch.Tensor] = None
@@ -106,6 +144,9 @@ class QwenSparseAttnMetadata(msgspec.Struct, frozen=True):
     fa2_valid_counts: Optional[torch.Tensor] = None
     fa2_cu_seqlens_k: Optional[torch.Tensor] = None
     fa2_cu_seqlens_q: Optional[torch.Tensor] = None
+    # This field references the live request-pool table used by graph fallback
+    # instead of the placeholder. Updates must preserve its storage for replay.
+    req_to_token: Optional[torch.Tensor] = None
 
 
 class QSAMTPSharedSparseIndices:
@@ -254,16 +295,11 @@ class QwenSparseAttnBackend(AttentionBackend):
             )
             return max(1, int(sequence_lengths.max()))
         spec_info = forward_batch.spec_info
-        # Target verify exposes ``draft_token_num`` while draft-extend exposes
-        # ``num_tokens_per_req``. Both modes use this gather-width bound.
-        draft_window = int(
-            getattr(
-                spec_info,
-                "draft_token_num",
-                getattr(spec_info, "num_tokens_per_req", 0),
-            )
-            or 0
-        )
+        # EagleDraftExtendInput carries no draft_token_num; its seq_lens_cpu is
+        # already the post-write length (prepare_for_draft_extend adds
+        # num_draft_tokens).
+        draft_window = getattr(spec_info, "draft_token_num", None)
+        draft_window = 0 if draft_window is None else int(draft_window)
         return max(1, int(seq_lens_cpu.max()) + draft_window)
 
     @staticmethod
@@ -461,11 +497,13 @@ class QwenSparseAttnBackend(AttentionBackend):
         """Compact per-row block ranges into ``capacity`` write entries,
         a shape-derived bound (no sync); padding writes the inert reserved slot 0."""
         device = token_slot_table.device
-        # The table width is a host-side bound;
-        # assert on device so a short table fails loudly without a sync.
-        torch._assert_async(
-            (end_blocks * compress_ratio <= token_slot_table.shape[1]).all()
-        )
+        # The table width is a host-side bound. On NPU, _assert_async falls
+        # back to a CPU check and synchronizes; keep this diagnostic guard
+        # on other platforms without adding a host sync to the NPU path.
+        if not _is_npu:
+            torch._assert_async(
+                (end_blocks * compress_ratio <= token_slot_table.shape[1]).all()
+            )
         counts = (end_blocks - start_blocks).clamp_min(0)
         ends = torch.cumsum(counts, 0)
         starts = ends - counts
@@ -522,7 +560,9 @@ class QwenSparseAttnBackend(AttentionBackend):
         # Prefix sharing is page-granular and the page is a ratio
         # multiple, so a matched prefix always covers whole groups. A
         # misaligned prefix would leave a shared group half-written.
-        torch._assert_async((prefix_lens % ratio == 0).all())
+        # As in _qsa_write_plan, skip the CPU-fallback assertion on NPU.
+        if not _is_npu:
+            torch._assert_async((prefix_lens % ratio == 0).all())
         # Each row spans at most ceil(extend_len / ratio) blocks, so the
         # token count and row count bound the plan without a sync.
         capacity = int(forward_batch.input_ids.numel()) // ratio + int(lengths.numel())
@@ -906,6 +946,7 @@ class QwenSparseAttnBackend(AttentionBackend):
             fa2_valid_counts=self._graph_fa2_valid_counts[:metadata_rows],
             fa2_cu_seqlens_k=self._graph_fa2_cu_seqlens_k[: metadata_rows + 1],
             fa2_cu_seqlens_q=self._graph_cu_seqlens_q[: metadata_rows + 1],
+            req_to_token=self.req_to_token,
         )
         self._cuda_graph_metadata[(forward_mode, bs)] = metadata
         self.forward_metadata = metadata
@@ -970,6 +1011,9 @@ class QwenSparseAttnBackend(AttentionBackend):
         self.forward_metadata = metadata
 
     def _can_replay_with_gpu_kernels(self, metadata, seq_lens) -> bool:
+        # Guard NPU before the import, which precedes the is_cuda check below.
+        if _is_npu:
+            return False
         if self.req_to_token is None:
             return False
         from sglang.srt.layers.attention.qsa.graph_metadata import (
@@ -1252,10 +1296,26 @@ class QwenSparseAttnBackend(AttentionBackend):
             0, sequence_ids
         )
         valid = (logical_indices >= 0) & (logical_indices < row_lengths.unsqueeze(1))
-        safe = logical_indices.clamp(
-            min=0, max=metadata.token_slot_table.shape[1] - 1
-        ).long()
-        slots = metadata.token_slot_table[sequence_ids[:, None], safe]
+        if metadata.is_cuda_graph:
+            # Graph metadata holds a dummy token_slot_table, not the live KV
+            # mapping. Read the persistent request table so replay observes
+            # updated request IDs and physical slots, including MTP rows.
+            if metadata.req_to_token is None or metadata.row_req_pool_indices is None:
+                raise RuntimeError(
+                    "QSA graph fallback requires the live request-to-token mapping"
+                )
+            request_ids = metadata.row_req_pool_indices.long().index_select(
+                0, sequence_ids
+            )
+            safe = logical_indices.clamp(
+                min=0, max=metadata.req_to_token.shape[1] - 1
+            ).long()
+            slots = metadata.req_to_token[request_ids[:, None], safe]
+        else:
+            safe = logical_indices.clamp(
+                min=0, max=metadata.token_slot_table.shape[1] - 1
+            ).long()
+            slots = metadata.token_slot_table[sequence_ids[:, None], safe]
         return torch.where(valid, slots, torch.full_like(slots, -1)).to(torch.int32)
 
     def forward_extend(
@@ -1291,11 +1351,15 @@ class QwenSparseAttnBackend(AttentionBackend):
                 q, layer, forward_batch, topk_indices
             )
             return self._pad_extend_output(output, num_output_rows)
-        if not q.is_cuda:
+        if _is_npu or not q.is_cuda:
             metadata = self._resolve_metadata(forward_batch)
             slots = self._logical_to_physical(topk_indices, metadata)
             pool = self.token_to_kv_pool
-            output = qsa_sparse_attention(
+            if _is_npu:
+                attention = _npu_sparse_attention
+            else:
+                attention = qsa_sparse_attention
+            output = attention(
                 q,
                 pool.get_key_buffer(layer.layer_id),
                 pool.get_value_buffer(layer.layer_id),
@@ -1526,10 +1590,14 @@ class QwenSparseAttnBackend(AttentionBackend):
         pool = self.token_to_kv_pool
         k_buffer = pool.get_key_buffer(layer.layer_id)
         v_buffer = pool.get_value_buffer(layer.layer_id)
-        if not q.is_cuda:
+        if _is_npu or not q.is_cuda:
             metadata = self._resolve_metadata(forward_batch)
             slots = self._logical_to_physical(topk_indices, metadata)
-            output = qsa_sparse_attention(q, k_buffer, v_buffer, slots, layer.scaling)
+            if _is_npu:
+                attention = _npu_sparse_attention
+            else:
+                attention = qsa_sparse_attention
+            output = attention(q, k_buffer, v_buffer, slots, layer.scaling)
             return output.reshape(q.shape[0], -1)
 
         metadata = self._resolve_metadata(forward_batch)

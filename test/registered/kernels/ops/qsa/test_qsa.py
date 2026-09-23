@@ -7,6 +7,8 @@ import torch
 from sglang.kernels.ops.attention import qwen38_qsa_sm121_varlen
 from sglang.srt.configs.qwen4_exp import Qwen4ExpConfig
 from sglang.srt.layers.attention import qwen_sparse_attn_backend as qsa_backend_module
+from sglang.srt.layers.attention.qsa import kernel as qsa_kernel_module
+from sglang.srt.layers.attention.qsa import mqa as qsa_mqa_module
 from sglang.srt.layers.attention.qsa import qsa_indexer as qsa_indexer_module
 from sglang.srt.layers.attention.qsa.kernel import (
     expand_qsa_block_indices,
@@ -438,6 +440,54 @@ def _make_mtp_draft_batch(steps: int, seq_lens=(8, 16), loc_base: int = 40):
     return backend, forward_batch, pool
 
 
+@pytest.mark.parametrize("draft_window", [None, 0, 4])
+def test_qsa_speculative_row_bound_with_verify_window(draft_window):
+    batch = SimpleNamespace(
+        seq_lens_cpu=torch.tensor([8, 16], dtype=torch.int32),
+        spec_info=SimpleNamespace(draft_token_num=draft_window),
+    )
+    assert QwenSparseAttnBackend._speculative_max_row_length(
+        batch, batch.seq_lens_cpu + (draft_window or 0)
+    ) == 16 + (draft_window or 0)
+
+
+def test_qsa_speculative_row_bound_for_draft_extend():
+    from sglang.srt.speculative.eagle_info import EagleDraftExtendInput
+
+    # prepare_for_draft_extend already includes the four draft slots in
+    # these CPU lengths. The bound must neither access a missing field nor
+    # add the draft window a second time.
+    batch = SimpleNamespace(
+        seq_lens_cpu=torch.tensor([12, 20], dtype=torch.int32),
+        spec_info=EagleDraftExtendInput(),
+    )
+    assert not hasattr(batch.spec_info, "draft_token_num")
+    assert (
+        QwenSparseAttnBackend._speculative_max_row_length(
+            batch, torch.tensor([9, 10, 11, 12, 17, 18, 19, 20], dtype=torch.int32)
+        )
+        == 20
+    )
+
+
+def test_qsa_speculative_row_bound_without_spec_info():
+    batch = SimpleNamespace(seq_lens_cpu=torch.tensor([0]), spec_info=None)
+    assert (
+        QwenSparseAttnBackend._speculative_max_row_length(batch, torch.tensor([0])) == 1
+    )
+
+
+@pytest.mark.parametrize("cpu_lengths", [None, torch.empty(0, dtype=torch.int32)])
+def test_qsa_speculative_row_bound_without_cpu_lengths(cpu_lengths):
+    batch = SimpleNamespace(seq_lens_cpu=cpu_lengths, spec_info=SimpleNamespace())
+    assert (
+        QwenSparseAttnBackend._speculative_max_row_length(
+            batch, torch.tensor([12, 20], dtype=torch.int32)
+        )
+        == 20
+    )
+
+
 def test_qsa_cuda_graph_pads_dynamic_draft_extend_rows():
     row_lengths, row_req_pool_indices, row_prefix_lengths = (
         QwenSparseAttnBackend._graph_speculative_layout(
@@ -634,6 +684,7 @@ def test_qsa_cuda_extend_ignores_dp_attention_padding(monkeypatch):
 
 def _make_paged_extend_backend():
     metadata = SimpleNamespace(
+        is_cuda_graph=False,
         token_to_batch_idx=torch.zeros(3, dtype=torch.int32),
         sequence_lengths=torch.tensor([8], dtype=torch.int32),
         token_slot_table=torch.arange(16, dtype=torch.int32).reshape(1, 16),
@@ -657,15 +708,29 @@ def _make_paged_extend_backend():
     return backend, pool, layer
 
 
-def test_qsa_paged_extend_trims_padding_rows_and_restores_output(monkeypatch):
+@pytest.mark.parametrize("is_npu", [False, True])
+def test_qsa_paged_extend_trims_padding_rows_and_restores_output(monkeypatch, is_npu):
+    monkeypatch.setattr(qsa_backend_module, "_is_npu", is_npu)
+    # NPU dispatch must also win when transfer_to_npu reports is_cuda=True.
+    monkeypatch.setattr(torch.Tensor, "is_cuda", property(lambda self: is_npu))
     kernel_rows = []
 
     def fake_sparse_attention(q, k, v, slots, scale):
         kernel_rows.append((q.shape[0], slots.shape[0]))
         return q + 1
 
+    def forbidden(*args, **kwargs):
+        raise AssertionError("wrong sparse attention platform path")
+
     monkeypatch.setattr(
-        qsa_backend_module, "qsa_sparse_attention", fake_sparse_attention
+        qsa_backend_module,
+        "_npu_sparse_attention",
+        fake_sparse_attention if is_npu else forbidden,
+    )
+    monkeypatch.setattr(
+        qsa_backend_module,
+        "qsa_sparse_attention",
+        forbidden if is_npu else fake_sparse_attention,
     )
     backend, pool, layer = _make_paged_extend_backend()
     topk = torch.zeros(3, 2, dtype=torch.int32)
@@ -683,14 +748,26 @@ def test_qsa_paged_extend_trims_padding_rows_and_restores_output(monkeypatch):
 
     # DP attention pads the physical q rows past the semantic draft rows in
     # every speculative paged mode; padding must round-trip through the kernel.
-    for mode in (ForwardMode.TARGET_VERIFY, ForwardMode.DRAFT_EXTEND_V2):
+    for mode in (
+        ForwardMode.EXTEND,
+        ForwardMode.TARGET_VERIFY,
+        ForwardMode.DRAFT_EXTEND_V2,
+    ):
         unpadded = run(3, mode)
         padded = run(5, mode)
         torch.testing.assert_close(padded[:3], unpadded)
         torch.testing.assert_close(padded[3:], torch.zeros(2, 2))
         assert padded.shape == (5, 2)
-    # The reference path (and any kernel behind it) only ever saw valid rows.
-    assert kernel_rows == [(3, 3)] * 4
+    # Both platform paths only see valid rows, before output padding is restored.
+    assert kernel_rows == [(3, 3)] * 6
+
+    values = torch.zeros(3, 2)
+    batch = SimpleNamespace(forward_mode=ForwardMode.DECODE)
+    output = backend.forward_decode(
+        values, values, values, layer, batch, save_kv_cache=False, topk_indices=topk
+    )
+    torch.testing.assert_close(output, values + 1)
+    assert kernel_rows == [(3, 3)] * 7
 
     # More semantic rows than physical q rows is a bug and must not silently
     # truncate the top-k table.
@@ -775,6 +852,64 @@ def test_qsa_idle_metadata_builds_empty_rows():
     # Per-step out_cache_loc slicing must stay empty without allocating rows.
     for attn_backend in draft.attn_backends:
         assert attn_backend.forward_metadata.indexer_metadata.out_cache_loc.numel() == 0
+
+
+@pytest.mark.parametrize("is_npu", [False, True])
+@pytest.mark.parametrize("is_decode", [False, True])
+def test_qsa_write_plan_platform_assertions(monkeypatch, is_npu, is_decode):
+    monkeypatch.setattr(qsa_backend_module, "_is_npu", is_npu)
+    original_assert = torch._assert_async
+    checks = []
+
+    def check_invariant(condition):
+        if is_npu:
+            pytest.fail("NPU write planning must not call the CPU-fallback assertion")
+        checks.append(condition)
+        original_assert(condition)
+
+    monkeypatch.setattr(torch, "_assert_async", check_invariant)
+    backend = QwenSparseAttnBackend.__new__(QwenSparseAttnBackend)
+    backend.token_to_kv_pool = SimpleNamespace(qsa_compress_ratio=4)
+    batch = SimpleNamespace(
+        forward_mode=ForwardMode.DECODE if is_decode else ForwardMode.EXTEND,
+        extend_seq_lens=torch.tensor([4, 4]),
+        input_ids=torch.zeros(8, dtype=torch.int32),
+    )
+    # Both requests complete one group; extend also reserves two padding entries.
+    write_locs, end_positions, rows, member_rows = backend._qsa_build_write_plan(
+        forward_batch=batch,
+        speculative_paged=False,
+        token_slot_table=torch.arange(4, 28).reshape(2, 12),
+        sequence_lengths=torch.tensor([8, 12]),
+    )
+    assert len(checks) == (0 if is_npu else (1 if is_decode else 2))
+    assert write_locs.tolist() == ([2, 6] if is_decode else [2, 6, 0, 0])
+    assert end_positions.tolist() == ([7, 11] if is_decode else [7, 11, 3, 3])
+    assert rows.tolist() == ([0, 1] if is_decode else [0, 1, 0, 0])
+    if is_decode:
+        assert member_rows is None
+    else:
+        assert member_rows.tolist() == [0, 4, 0, 0]
+
+
+@pytest.mark.parametrize("invalid_case", ["short_table", "unaligned_prefix"])
+def test_qsa_write_plan_retains_non_npu_validation(monkeypatch, invalid_case):
+    monkeypatch.setattr(qsa_backend_module, "_is_npu", False)
+    backend = QwenSparseAttnBackend.__new__(QwenSparseAttnBackend)
+    backend.token_to_kv_pool = SimpleNamespace(qsa_compress_ratio=4)
+    batch = SimpleNamespace(
+        forward_mode=ForwardMode.EXTEND,
+        extend_seq_lens=torch.tensor([3 if invalid_case == "unaligned_prefix" else 4]),
+        input_ids=torch.zeros(4, dtype=torch.int32),
+    )
+    width = 4 if invalid_case == "short_table" else 8
+    with pytest.raises(RuntimeError, match="Expected Tensor with single nonzero value"):
+        backend._qsa_build_write_plan(
+            forward_batch=batch,
+            speculative_paged=False,
+            token_slot_table=torch.arange(width).reshape(1, width),
+            sequence_lengths=torch.tensor([8]),
+        )
 
 
 def test_qsa_decode_requires_one_query_row_per_request():
@@ -960,6 +1095,7 @@ class _DispatchIndexer:
     index_n_heads = 4
     compress_ratio = 4
     _pending_ring_slots = QSAIndexer._pending_ring_slots
+    forward_cuda = QSAIndexer.forward_cuda
 
     def __init__(self):
         self.selected = None
@@ -1047,7 +1183,8 @@ def test_qsa_row_ranges_do_not_cross_sequences():
     assert ends.tolist() == [2, 2, 3, 3]
 
 
-def test_qsa_weight_free_mqa_logits_matches_explicit_formula():
+def test_qsa_weight_free_mqa_logits_matches_explicit_formula(monkeypatch):
+    monkeypatch.setattr(qsa_mqa_module, "_is_npu", False)
     torch.manual_seed(1)
     q = torch.randn(3, 4, 128, dtype=torch.bfloat16)
     k = torch.randn(5, 1, 128, dtype=torch.bfloat16)
@@ -1065,6 +1202,9 @@ def test_qsa_weight_free_mqa_logits_matches_explicit_formula():
 
 
 def test_qsa_prefill_selection_microchunks_rows(monkeypatch):
+    # This is a CPU orchestration test, including a non-model token budget.
+    monkeypatch.setattr(qsa_kernel_module, "_is_npu", False)
+    monkeypatch.setattr(qsa_mqa_module, "_is_npu", False)
     rows, keys, heads, head_dim = 65, 64, 4, 8
     token_topk, compress_ratio = 8, 4
     indexer = SimpleNamespace(
@@ -1132,7 +1272,377 @@ def test_qsa_forward_cuda_dispatches_prefill_and_decode_mqa():
     assert decode_result.item() == 2
 
 
-def test_qsa_block_expansion_adds_only_incomplete_tail():
+@pytest.mark.parametrize("decode", [False, True])
+def test_qsa_npu_forward_reuses_orchestration(decode):
+    indexer = _DispatchIndexer()
+    actual = QSAIndexer.forward_npu(
+        indexer,
+        torch.zeros(1, 16),
+        torch.zeros(1, dtype=torch.int32),
+        SimpleNamespace(forward_mode=_ForwardMode(decode)),
+        _DispatchMetadata(),
+    )
+    assert indexer.selected == ("decode" if decode else "prefill")
+    assert actual.item() == (2 if decode else 1)
+
+
+def test_qsa_npu_dispatch_excludes_cuda_kernels(monkeypatch):
+    # transfer_to_npu may report is_cuda=True for NPU tensors. Platform
+    # guards must still keep CUDA-only kernels out of the fallback path.
+    monkeypatch.setattr(torch.Tensor, "is_cuda", property(lambda self: True))
+    for module in (
+        qsa_indexer_module,
+        qsa_kernel_module,
+        qsa_mqa_module,
+        qsa_backend_module,
+    ):
+        monkeypatch.setattr(module, "_is_npu", True)
+    monkeypatch.setattr(qsa_mqa_module, "HAS_TILELANG", True)
+
+    def cuda_only(*args, **kwargs):
+        pytest.fail("NPU dispatch reached a CUDA-only kernel")
+
+    monkeypatch.setattr(qsa_mqa_module, "tilelang_qsa_mqa_prefill", cuda_only)
+    monkeypatch.setattr(qsa_mqa_module, "tilelang_qsa_mqa_decode", cuda_only)
+    monkeypatch.setattr(qsa_kernel_module, "triton_expand_qsa_block_indices", cuda_only)
+    # This CPU routing test also runs in GPU CI, without the NPU package.
+    # Mock only its import boundary; real NPU execution is tested separately.
+    expansion_module = ModuleType("sgl_kernel_npu.qwen3_8_flash_next.qsa_expansion")
+    expansion_calls = []
+
+    def npu_expansion(*args):
+        expansion_calls.append(args)
+        return torch_expand_qsa_block_indices(*args)
+
+    expansion_module.expand_blocks = npu_expansion
+    monkeypatch.setitem(sys.modules, expansion_module.__name__, expansion_module)
+    topk_module = ModuleType("sgl_kernel_npu.qwen3_8_flash_next.qsa_topk")
+    topk_calls = []
+
+    def npu_topk(logits, lengths, topk, starts):
+        topk_calls.append((logits, lengths, topk, starts))
+        # This routing fixture has four equal-score blocks, all selected.
+        ranks = torch.arange(topk).expand(logits.shape[0], -1)
+        return torch.where(ranks < lengths[:, None], ranks, -1).int()
+
+    topk_module.fast_topk = npu_topk
+    monkeypatch.setitem(sys.modules, topk_module.__name__, topk_module)
+    mqa_module = ModuleType("sgl_kernel_npu.qwen3_8_flash_next.qsa_mqa")
+    mqa_calls = []
+
+    def npu_packed(*args):
+        mqa_calls.append("packed")
+        return qsa_mqa_module.torch_qsa_mqa_prefill(*args)
+
+    def npu_paged(*args):
+        mqa_calls.append("paged")
+        return qsa_mqa_module.torch_qsa_mqa_decode(*args)
+
+    mqa_module.packed, mqa_module.paged = npu_packed, npu_paged
+    monkeypatch.setitem(sys.modules, mqa_module.__name__, mqa_module)
+    # Module-style imports resolve the parent's attribute when already loaded.
+    package_name = "sgl_kernel_npu.qwen3_8_flash_next"
+    package = sys.modules.get(package_name)
+    if package is None:
+        package = ModuleType(package_name)
+        monkeypatch.setitem(sys.modules, package_name, package)
+    monkeypatch.setattr(package, "qsa_mqa", mqa_module, raising=False)
+    # The platform guard must short-circuit before inspecting rotary fields.
+    assert not QSAIndexer._use_fused_prep(SimpleNamespace(), torch.zeros(1, 128))
+    assert not QwenSparseAttnBackend._can_replay_with_gpu_kernels(
+        SimpleNamespace(req_to_token=torch.zeros(1)), None, torch.ones(1)
+    )
+    q = torch.ones(1, 4, 128, dtype=torch.bfloat16)
+    lengths = torch.tensor([4], dtype=torch.int32)
+    starts = torch.zeros_like(lengths)
+    logits = qsa_mqa_prefill(q, torch.ones(4, 1, 128, dtype=q.dtype), starts, lengths)
+    blocks = qsa_fast_topk(logits, starts, lengths, topk=512)
+    assert len(topk_calls) == 1
+    raw_lengths = lengths * 4
+    selected = expand_qsa_block_indices(blocks, raw_lengths - 1, raw_lengths, 4, 2048)
+    assert len(expansion_calls) == 1
+    # Equal scores do not define a block order; all four complete blocks survive.
+    assert sorted(selected[0, :16].tolist()) == list(range(16))
+    assert torch.all(selected[0, 16:] == -1)
+    qsa_mqa_decode(
+        q, torch.ones(1, 16, 1, 128, dtype=q.dtype), starts[:, None], lengths, 16
+    )
+    assert mqa_calls == ["packed", "paged"]
+
+
+@pytest.mark.parametrize(
+    "device,columns,topk",
+    [
+        ("cpu", 12, 8),
+        ("cpu", 900, 512),
+        ("cpu", 0, 8),
+        ("npu", 12, 512),
+        ("npu", 900, 512),
+        ("npu", 0, 2048),
+    ],
+)
+def test_qsa_npu_topk_fixed_width(monkeypatch, device, columns, topk):
+    if device == "npu" and not qsa_kernel_module._is_npu:
+        pytest.skip("NPU is not available")
+    # Exercise the CPU platform branch even when this test runs on an NPU host.
+    monkeypatch.setattr(qsa_kernel_module, "_is_npu", device == "npu")
+    original_topk = torch.topk
+    topk_input_dims = []
+
+    def record_topk(input, *args, **kwargs):
+        topk_input_dims.append(input.ndim)
+        return original_topk(input, *args, **kwargs)
+
+    monkeypatch.setattr(torch, "topk", record_topk)
+    # GPU-like NPU columns must be contiguous; the CPU reference still
+    # accepts the legacy column-strided input.
+    logits = torch.arange(columns * 2, dtype=torch.float32, device=device)[::2]
+    logits = logits.unsqueeze(0).expand(3, -1)
+    if device == "npu":
+        # contiguous() can be a no-op on an empty stride-2 view. Allocate
+        # the GPU-like column stride explicitly, including M=0.
+        logits = torch.empty(logits.shape, dtype=logits.dtype, device=device).copy_(
+            logits
+        )
+    starts = torch.tensor([0, min(4, columns), 0], dtype=torch.int32, device=device)
+    ends = torch.tensor([columns, min(7, columns), 0], dtype=torch.int32, device=device)
+    actual = qsa_fast_topk(logits, starts, ends, topk).cpu()
+    if columns == 0:
+        assert topk_input_dims == []
+    elif device == "npu":
+        assert topk_input_dims == []  # These shapes use shortcut/tiled Triton.
+    else:
+        assert topk_input_dims == [1, 1]  # One top-k per nonempty row.
+    assert actual.shape == (3, topk)
+    assert actual.dtype == torch.int32
+    for row, (start, end) in enumerate(zip(starts.cpu().tolist(), ends.cpu().tolist())):
+        count = min(topk, end - start)
+        expected = list(range(end - start - 1, end - start - count - 1, -1))
+        if device == "npu":
+            if end - start <= topk:
+                expected = list(range(count))
+            else:
+                # Long-row order is unspecified, even without score ties.
+                assert sorted(actual[row, :count].tolist()) == sorted(expected)
+                assert actual[row, count:].tolist() == [-1] * (topk - count)
+                continue
+        assert actual[row, :count].tolist() == expected
+        assert actual[row, count:].tolist() == [-1] * (topk - count)
+
+
+@pytest.mark.parametrize("device", ["cpu", "npu"])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("layout", ["flat", "paged", "fia"])
+def test_qsa_npu_sparse_attention_reference(monkeypatch, device, dtype, layout):
+    if device == "npu" and not qsa_kernel_module._is_npu:
+        pytest.skip("NPU is not available")
+    monkeypatch.setattr(qsa_kernel_module, "_is_npu", device == "npu")
+    generator = torch.Generator().manual_seed(123)
+    q = torch.randn(3, 4, 16, generator=generator).to(dtype)
+    k = torch.randn(8, 2, 16, generator=generator).to(dtype)
+    v = torch.randn(8, 2, 16, generator=generator).to(dtype)
+    slots = torch.tensor(
+        [[1, 5, -1, -1], [7, 0, 2, -1], [-1, -1, -1, -1]], dtype=torch.int32
+    )
+    expected = torch.zeros_like(q)
+    for row in range(2):
+        valid_slots = slots[row][slots[row] >= 0].long()
+        keys = k[valid_slots].float().repeat_interleave(2, dim=1)
+        values = v[valid_slots].float().repeat_interleave(2, dim=1)
+        scores = torch.einsum("hd,khd->hk", q[row].float(), keys) / 4
+        expected[row] = torch.einsum("hk,khd->hd", scores.softmax(-1), values).to(dtype)
+    if layout == "paged":
+        k, v = k.reshape(2, 4, 2, 16), v.reshape(2, 4, 2, 16)
+    elif layout == "fia":
+        k, v = k.unsqueeze(1), v.unsqueeze(1)
+    q, k, v, slots = q.to(device), k.to(device), v.to(device), slots.to(device)
+    if device == "npu":
+        # The legacy generic shape is intentionally outside the model wrapper.
+        with pytest.raises(ValueError, match="Unsupported NPU"):
+            qsa_backend_module._npu_sparse_attention(q, k, v, slots)
+        return
+    if device == "cpu" and layout != "flat":
+        with pytest.raises(ValueError, match="must be rank-3 tensors"):
+            qsa_sparse_attention(q, k, v, slots)
+        return
+    original_index_select = torch.Tensor.index_select
+    selected_widths = []
+
+    def record_index_select(tensor, dim, index):
+        selected_widths.append(index.numel())
+        return original_index_select(tensor, dim, index)
+
+    monkeypatch.setattr(torch.Tensor, "index_select", record_index_select)
+    actual = qsa_sparse_attention(q, k, v, slots)
+    assert selected_widths == [2, 2, 3, 3]
+    torch.testing.assert_close(actual.cpu(), expected, rtol=2e-2, atol=2e-2)
+
+
+@pytest.mark.parametrize("device", ["cpu", "npu"])
+@pytest.mark.parametrize("padding_value", [float("nan"), float("inf"), -float("inf")])
+def test_qsa_npu_sparse_attention_nonfinite_padding(monkeypatch, device, padding_value):
+    if device == "npu" and not qsa_kernel_module._is_npu:
+        pytest.skip("NPU is not available")
+    monkeypatch.setattr(qsa_kernel_module, "_is_npu", device == "npu")
+    q = torch.ones(2, 3, 256, device=device, dtype=torch.bfloat16)
+    k = torch.ones(3, 1, 256, device=device, dtype=q.dtype)
+    v = torch.ones_like(k)
+    k[0] = padding_value
+    v[0] = padding_value
+    slots = torch.full((2, 2051), -1, device=device, dtype=torch.int32)
+    slots[0, :2] = torch.tensor([1, 2], device=device, dtype=torch.int32)
+    expected = torch.zeros_like(q)
+    expected[0] = 1
+
+    attention = (
+        qsa_backend_module._npu_sparse_attention
+        if device == "npu"
+        else qsa_sparse_attention
+    )
+    actual = attention(q, k, v, slots)
+
+    torch.testing.assert_close(actual, expected)
+    # Masking the gathered values must not modify the underlying cache.
+    torch.testing.assert_close(
+        v[0], torch.full_like(v[0], padding_value), equal_nan=True
+    )
+
+
+@pytest.mark.parametrize("is_graph", [False, True])
+def test_qsa_npu_logical_to_physical_mapping(is_graph):
+    req_to_token = torch.tensor([[8, 6, 4, 2], [1, 3, 5, 7]])
+    metadata = qsa_backend_module.QwenSparseAttnMetadata(
+        indexer_metadata=None,
+        **({"req_to_token": req_to_token} if is_graph else {}),
+        is_cuda_graph=is_graph,
+        sequence_lengths=torch.tensor([2, 3]),
+        token_to_batch_idx=torch.tensor([1, 0, 1]),
+        row_req_pool_indices=torch.tensor([1, 0]),
+        token_slot_table=(
+            torch.zeros(2, 1, dtype=torch.int64) if is_graph else req_to_token[[1, 0]]
+        ),
+    )
+    logical = torch.tensor([[2, -1, 3], [0, 1, 2], [1, 0, -1]])
+    actual = QwenSparseAttnBackend._logical_to_physical(logical, metadata)
+    expected = torch.tensor([[4, -1, -1], [1, 3, -1], [6, 8, -1]], dtype=torch.int32)
+    torch.testing.assert_close(actual, expected)
+
+
+@pytest.mark.parametrize("missing", ["req_to_token", "row_req_pool_indices"])
+def test_qsa_npu_graph_mapping_requires_live_metadata(missing):
+    fields = dict(
+        sequence_lengths=torch.tensor([1]),
+        token_to_batch_idx=torch.tensor([0]),
+        token_slot_table=torch.zeros(1, 1, dtype=torch.int32),
+        indexer_metadata=None,
+        is_cuda_graph=True,
+        row_req_pool_indices=torch.tensor([0]),
+        req_to_token=torch.tensor([[5]]),
+    )
+    fields[missing] = None
+    metadata = qsa_backend_module.QwenSparseAttnMetadata(**fields)
+    with pytest.raises(
+        RuntimeError, match="requires the live request-to-token mapping"
+    ):
+        QwenSparseAttnBackend._logical_to_physical(torch.tensor([[0]]), metadata)
+
+
+def test_qsa_npu_operator_chain_graph_replay():
+    if not qsa_kernel_module._is_npu:
+        pytest.skip("NPU is not available")
+    device = "npu"
+    q = torch.ones(2, 3, 256, dtype=torch.bfloat16, device=device)
+    # Indexer MQA and sparse attention have distinct model head/dim contracts.
+    index_q = torch.ones(2, 4, 128, dtype=q.dtype, device=device)
+    cache = (
+        torch.arange(32 * 128, device=device, dtype=torch.float32)
+        .reshape(2, 16, 1, 128)
+        .to(q.dtype)
+        / 128
+    )
+    page_table = torch.tensor([[0, 1], [1, 0]], dtype=torch.int32, device=device)
+    lengths = torch.tensor([8, 0], dtype=torch.int32, device=device)
+    starts = torch.zeros_like(lengths)
+    k = torch.ones(32, 1, 256, device=device, dtype=q.dtype)
+    v = (
+        torch.arange(32, device=device, dtype=torch.float32)[:, None, None]
+        .expand(32, 1, 256)
+        .contiguous()
+        .to(q.dtype)
+    )
+    req_to_token = torch.stack(
+        [torch.arange(32, device=device), torch.arange(31, -1, -1, device=device)]
+    )
+    metadata = qsa_backend_module.QwenSparseAttnMetadata(
+        indexer_metadata=None,
+        req_to_token=req_to_token,
+        is_cuda_graph=True,
+        sequence_lengths=lengths * 4,
+        token_to_batch_idx=torch.arange(2, device=device),
+        row_req_pool_indices=torch.arange(2, device=device),
+        token_slot_table=torch.zeros(2, 1, dtype=torch.int64, device=device),
+    )
+
+    def forward():
+        logits = qsa_mqa_decode(index_q, cache, page_table, lengths, 32)
+        blocks = qsa_fast_topk(logits, starts, lengths, topk=512)
+        positions = lengths * 4 - 1
+        metadata.sequence_lengths.copy_(lengths * 4)
+        logical = expand_qsa_block_indices(blocks, positions, lengths * 4, 4, 2048)
+        slots = QwenSparseAttnBackend._logical_to_physical(logical, metadata)
+        return qsa_backend_module._npu_sparse_attention(q, k, v, slots)
+
+    for _ in range(2):
+        forward()
+    torch.npu.synchronize()
+    graph = torch.npu.NPUGraph()
+    with torch.npu.graph(graph):
+        actual = forward()
+    for next_lengths, request_ids, replace_mapping, expected_means in (
+        ([3, 5], [1, 0], False, [25.5, 9.5]),
+        ([0, 8], [0, 1], False, [0.0, 15.5]),
+        ([3, 5], [1, 0], True, [7.0, 3.0]),
+    ):
+        if replace_mapping:
+            # Mutate the pool's tensor, preserving the storage captured by graph.
+            req_to_token[0].fill_(3)
+            req_to_token[1].fill_(7)
+        lengths.copy_(torch.tensor(next_lengths, device=device, dtype=lengths.dtype))
+        metadata.row_req_pool_indices.copy_(torch.tensor(request_ids, device=device))
+        expected = forward()
+        graph.replay()
+        torch.npu.synchronize()
+        torch.testing.assert_close(actual, expected)
+        # All keys are identical, so attention is the mean of visible values.
+        expected_mean = torch.tensor(expected_means, device=device, dtype=q.dtype)
+        torch.testing.assert_close(actual[:, 0, 0], expected_mean)
+
+
+@pytest.mark.parametrize("is_npu", [False, True])
+def test_qsa_block_expansion_reference_keeps_integer_sort_keys(monkeypatch, is_npu):
+    original_argsort = torch.argsort
+    dtypes = []
+
+    def record_argsort(keys, **kwargs):
+        dtypes.append(keys.dtype)
+        return original_argsort(keys, **kwargs)
+
+    monkeypatch.setattr(qsa_kernel_module, "_is_npu", is_npu)
+    monkeypatch.setattr(torch, "argsort", record_argsort)
+    result = torch_expand_qsa_block_indices(
+        torch.tensor([[-1, 0]], dtype=torch.int32),
+        torch.tensor([5]),
+        torch.tensor([6]),
+        4,
+        8,
+    )
+    assert dtypes == [torch.int64]
+    assert result.tolist() == [[0, 1, 2, 3, 4, 5, -1, -1, -1, -1, -1]]
+
+
+def test_qsa_block_expansion_adds_only_incomplete_tail(monkeypatch):
+    # Keep CPU reference coverage independent of the host's NPU availability.
+    monkeypatch.setattr(qsa_kernel_module, "_is_npu", False)
     blocks = torch.full((2, BLOCK_TOPK), -1, dtype=torch.int32)
     blocks[0, 0] = 0
     blocks[1, :2] = torch.tensor([1, 0])
@@ -1186,7 +1696,9 @@ def test_qsa_triton_block_expansion_matches_torch_reference():
     assert torch.equal(actual, expected)
 
 
-def test_qsa_decode_mqa_reads_paged_cache():
+def test_qsa_decode_mqa_reads_paged_cache(monkeypatch):
+    # Keep the CPU reference's broader page-size behavior covered on NPU hosts.
+    monkeypatch.setattr(qsa_mqa_module, "_is_npu", False)
     torch.manual_seed(7)
     q = torch.randn(2, 4, 128, dtype=torch.bfloat16)
     cache = torch.randn(8, 64, 1, 128, dtype=torch.bfloat16)
