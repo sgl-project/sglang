@@ -397,9 +397,7 @@ class TestHybridDevicePoolAssembler(CustomTestCase):
                 group.entry_map[rope_name].layer_mapping,
                 group.entry_map[nope_name].layer_mapping,
             )
-            self.assertEqual(
-                group.sources[rope_name], group.sources[nope_name]
-            )
+            self.assertEqual(group.sources[rope_name], group.sources[nope_name])
 
         # One KV transfer must expand to both halves.
         resolved = group.resolve_transfers(
