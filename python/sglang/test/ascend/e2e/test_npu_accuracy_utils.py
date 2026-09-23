@@ -119,6 +119,7 @@ def run_evalscope(
     stream=True,
     eval_type="openai_api",
     judge=None,
+    judge_model_args=None,
     api_key=None,
 ):
 
@@ -149,6 +150,8 @@ def run_evalscope(
         config_dict["dataset_dir"] = dataset_dir
     if judge:
         config_dict["judge"] = judge
+    if judge_model_args:
+        config_dict["judge_model_args"] = judge_model_args
     if api_key:
         config_dict["api_key"] = api_key
 
@@ -325,6 +328,7 @@ class TestNpuAccuracyTestCaseBase(CustomTestCase):
     max_retries = None
     test_type = "accuracy"
     judge = None
+    judge_model_args = None
     api_key = None
 
     @classmethod
@@ -510,6 +514,7 @@ class TestNpuAccuracyTestCaseBase(CustomTestCase):
                     timeout=self.timeout,
                     eval_type=self.eval_type,
                     judge=getattr(self, "judge", None),
+                    judge_model_args=getattr(self, "judge_model_args", None),
                     api_key=getattr(self, "api_key", None),
                 )
                 if best_metrics is None or float(metrics.get("accuracy", 0)) > float(
@@ -545,6 +550,7 @@ class TestNpuAccuracyMultiNodePdMixTestCaseBase(CustomTestCase):
     envs = None
     accuracy = 0.1
     judge = None
+    judge_model_args = None
     api_key = None
 
     @classmethod
@@ -616,6 +622,7 @@ class TestNpuAccuracyMultiNodePdMixTestCaseBase(CustomTestCase):
                     timeout=self.timeout,
                     eval_type=self.eval_type,
                     judge=getattr(self, "judge", None),
+                    judge_model_args=getattr(self, "judge_model_args", None),
                     api_key=getattr(self, "api_key", None),
                 )
                 if best_metrics is None or float(metrics.get("accuracy", 0)) > float(
@@ -650,6 +657,7 @@ class TestNpuAccuracyMultiNodePdSepTestCaseBase(CustomTestCase):
     server_timeout = DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH
     accuracy = 0.1
     judge = None
+    judge_model_args = None
     api_key = None
 
     @classmethod
@@ -737,6 +745,7 @@ class TestNpuAccuracyMultiNodePdSepTestCaseBase(CustomTestCase):
                     timeout=self.timeout,
                     eval_type=self.eval_type,
                     judge=getattr(self, "judge", None),
+                    judge_model_args=getattr(self, "judge_model_args", None),
                     api_key=getattr(self, "api_key", None),
                 )
                 if best_metrics is None or float(metrics.get("accuracy", 0)) > float(
