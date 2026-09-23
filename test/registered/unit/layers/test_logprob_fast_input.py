@@ -267,7 +267,7 @@ class TestFastInputLogprobs(CustomTestCase):
             )
 
     def test_temperature_scales_input_logprobs_but_not_sampling_logits(self):
-        proc = InputLogprobProcessor()
+        proc = InputLogprobProcessor(vocab_size=VOCAB)
         batch = _build_batch([(3, 0)], torch.float32)
         batch[-1].input_logprob_temperatures = [0.5]
         result, sampled_logits = _run(proc, batch, False, None)
@@ -310,6 +310,36 @@ class TestFastInputLogprobs(CustomTestCase):
             logits_metadata=metadata,
         )
         self.assertIsNone(outputs[-2])
+
+    def test_multi_item_temperatures_align_with_delimiters(self):
+        torch.manual_seed(0)
+        logits = torch.randn(7, VOCAB)
+        metadata = SimpleNamespace(
+            extend_seq_lens_cpu=[4, 3],
+            mm_input_embeds=None,
+            input_logprob_temperatures=[0.5, 2.0],
+            token_ids_logprobs=[[0, 3], [1]],
+            extend_token_ids_logprob=True,
+            extend_return_top_logprob=False,
+        )
+        processor = LogitsProcessor.__new__(LogitsProcessor)
+        processor._get_logits = lambda states, *_: states
+        result = processor.compute_logprobs_for_multi_item_scoring(
+            input_ids=torch.arange(7),
+            hidden_states=logits,
+            lm_head=None,
+            logits_metadata=metadata,
+            multi_item_delimiter_indices=[torch.tensor([1, 3]), torch.tensor([2])],
+        )
+        expected = torch.log_softmax(
+            logits[[0, 2, 5]] / torch.tensor([0.5, 0.5, 2.0])[:, None], dim=-1
+        )
+        torch.testing.assert_close(
+            result.input_token_ids_logprobs_val[0], expected[:2, [0, 3]]
+        )
+        torch.testing.assert_close(
+            result.input_token_ids_logprobs_val[1], expected[2:, [1]]
+        )
 
     def test_fast_path_emits_fp32_logprobs(self):
         # Chosen dtype policy: the fast path returns fp32 token logprobs

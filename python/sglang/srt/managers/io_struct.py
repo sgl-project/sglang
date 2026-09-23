@@ -1069,8 +1069,6 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
     token_ids_logprob: Optional[List[int]]
     # Whether to stream output
     stream: bool
-    # Temperature applied only when computing input-token logprobs.
-    input_logprob_temperature: float = 1.0
     # Whether to return sparse output-token support from top-k/top-p/min-p sampling.
     return_sampling_mask: bool = False
     # Assemble prompt top logprobs as flat arrays scheduler-side (see
@@ -1155,8 +1153,11 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
     kv_hints: Optional[KvHintsEnvelope] = None
 
     # Internal PP control bit, set by PP0 before forwarding the request.
-    # Keep at the end to preserve the positional Rust wire schema.
+    # Keep new fields in this defaulted tail to preserve the Rust wire schema.
     pp_prefetch_ticketed: bool = False
+
+    # Temperature applied only when computing input-token logprobs.
+    input_logprob_temperature: float = 1.0
 
     def wrap_pickle_fields(self):
         self.time_stats = wrap_as_pickle(self.time_stats)
