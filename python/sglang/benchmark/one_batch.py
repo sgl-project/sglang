@@ -278,7 +278,6 @@ class BenchArgs:
         )
         parser.add_argument(
             "--profile-prefix",
-            "--profile-filename-prefix",  # deprecated alias, kept for back-compat
             dest="profile_prefix",
             type=str,
             default=BenchArgs.profile_prefix,
@@ -329,10 +328,10 @@ def load_model(server_args, port_args, gpu_id, tp_rank):
 
     bootstrap.init_parallel_runtime(
         server_args=server_args,
-        model_config=model_config,
         device=get_device().device,
         dist_port=port_args.nccl_port,
     )
+    bootstrap.init_layer_runtime(model_config=model_config)
 
     _use_mlx = use_mlx()
     if _use_mlx:

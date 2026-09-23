@@ -1047,14 +1047,21 @@ class KVCacheConfigurator:
 
         if not isinstance(self.mambaish_config, Qwen4ExpTextConfig):
             return {}
+        short_conv_layer_ids = [
+            i
+            for i in self.mambaish_config.short_conv_layer_ids
+            if self.layer_info.start_layer <= i < self.layer_info.end_layer
+        ]
         return {
-            "short_conv_layer_ids": [
-                i
-                for i in self.mambaish_config.short_conv_layer_ids
-                if self.layer_info.start_layer <= i < self.layer_info.end_layer
-            ],
-            "short_conv_state_shape": self.mambaish_config.short_conv_state_shape,
-            "ngram_context_len": self.mambaish_config.ngram_context_len,
+            "short_conv_layer_ids": short_conv_layer_ids,
+            "short_conv_state_shape": (
+                self.mambaish_config.short_conv_state_shape
+                if short_conv_layer_ids
+                else None
+            ),
+            "ngram_context_len": (
+                self.mambaish_config.ngram_context_len if short_conv_layer_ids else 0
+            ),
             "ngram_eos_token_id": int(self.mambaish_config.eos_token_id),
         }
 
@@ -1836,6 +1843,14 @@ class KVCacheConfigurator:
         disable_value_sparse_layer_ids = get_minimax_sparse_disable_value_layer_ids(
             sparse_cfg
         )
+        enable_hisparse = get_memory().enable_hisparse
+        hisparse_kwargs = {}
+        if enable_hisparse:
+            from sglang.srt.mem_cache.sparsity import parse_hisparse_config
+
+            hisparse_kwargs["host_to_device_ratio"] = (
+                parse_hisparse_config().host_to_device_ratio
+            )
         token_to_kv_pool = MiniMaxSparseKVPool(
             size=max_total_num_tokens,
             page_size=self.pool_page_size,
@@ -1861,6 +1876,8 @@ class KVCacheConfigurator:
             enable_memory_saver=get_exec().features.enable_memory_saver,
             start_layer=self.layer_info.start_layer,
             end_layer=self.layer_info.end_layer,
+            enable_hisparse=enable_hisparse,
+            **hisparse_kwargs,
         )
         return token_to_kv_pool
 
