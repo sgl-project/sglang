@@ -649,16 +649,13 @@ class DeepseekV2WeightLoaderMixin:
                         weight_scale = (weight_scale.to(torch.int32) << 23).view(
                             torch.float32
                         )
-                    elif (
-                        should_deepgemm_weight_requant_ue8m0(
-                            weight_block_size=(
-                                self.quant_config.weight_block_size
-                                if self.quant_config is not None
-                                else None
-                            )
+                    elif should_deepgemm_weight_requant_ue8m0(
+                        weight_block_size=(
+                            self.quant_config.weight_block_size
+                            if self.quant_config is not None
+                            else None
                         )
-                        and getattr(weight_scale, "format_ue8m0", False)
-                    ):
+                    ) and getattr(weight_scale, "format_ue8m0", False):
                         weight_scale = inverse_transform_scale_ue8m0(
                             weight_scale, mn=weight.shape[-2]
                         )
