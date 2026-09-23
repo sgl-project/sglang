@@ -25,6 +25,11 @@ import interegular
 from interegular import InvalidSyntax
 from outlines.caching import cache
 
+from sglang.srt.constrained.json_schema_validation import (
+    JSONSchemaStateExplosion,
+    build_fsm_with_budget,
+    check_regex_ast_complexity,
+)
 from sglang.srt.utils import get_bool_env_var
 
 try:
@@ -61,12 +66,19 @@ def disk_cache(expire: Optional[float] = None, typed=False, ignore=()):
 @disk_cache()
 def init_state_to_jump_forward(regex_string):
     try:
+        # Tier 1+2: Validate regex complexity and compile with budget
+        check_regex_ast_complexity(regex_string)
+        fsm = build_fsm_with_budget(regex_string)
+
         regex_pattern = interegular.parse_pattern(regex_string)
     except InvalidSyntax as e:
         logger.warning(f"skip invalid regex: {regex_string}, {e=}")
         return
+    except JSONSchemaStateExplosion as e:
+        logger.warning(f"skip regex state explosion: {regex_string}, {e=}")
+        return
 
-    byte_fsm = make_byte_level_fsm(regex_pattern.to_fsm().reduce(), keep_utf8=True)
+    byte_fsm = make_byte_level_fsm(fsm.reduce(), keep_utf8=True)
     regex_fsm, _ = make_deterministic_fsm(byte_fsm)
 
     fsm_info: FSMInfo = regex_fsm.fsm_info

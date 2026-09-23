@@ -1,8 +1,14 @@
 """Detect JSON Schema constraints that grammar backends silently ignore."""
 
+import concurrent.futures
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 from typing import Any
+
+try:
+    import re._parser as sre_parse
+except ImportError:
+    import sre_parse
 
 
 class JSONSchemaDepthExceeded(ValueError):
@@ -24,6 +30,130 @@ class JSONSchemaCircularRef(ValueError):
 
 
 # Maximum allowed nesting depth for JSON schema (increased from 16 to support valid deeply nested tool definitions)
+MAX_SCHEMA_DEPTH = 64
+# Maximum allowed total nodes in schema traversal (prevents pathological cases)
+MAX_TOTAL_NODES = 50000
+# Maximum allowed estimated DFA states (to prevent state explosion)
+MAX_DFA_STATES = 10000
+# Maximum regex AST nodes before rejecting
+MAX_REGEX_AST_NODES = 500
+# Maximum nested quantifier depth
+MAX_NESTED_QUANTIFIER_DEPTH = 5
+# Maximum DFA states after compilation
+MAX_COMPILED_DFA_STATES = 10000
+# Maximum time for FSM compilation (seconds)
+MAX_FSM_COMPILE_TIME = 0.5
+
+
+def check_regex_ast_complexity(
+    pattern: str,
+    max_ast_nodes: int = MAX_REGEX_AST_NODES,
+    max_nested_quantifiers: int = MAX_NESTED_QUANTIFIER_DEPTH,
+) -> None:
+    """
+    Analyze regex AST for structural complexity that causes DFA state explosion.
+
+    Uses Python's built-in sre_parse to detect:
+    - Excessive AST node count
+    - Deeply nested quantifiers (e.g., ((a+)+)+)
+    - Large bounded repetitions in nested contexts
+
+    Args:
+        pattern: The regex pattern string to analyze
+        max_ast_nodes: Maximum allowed AST nodes
+        max_nested_quantifiers: Maximum allowed quantifiers in a single nesting path
+
+    Raises:
+        JSONSchemaStateExplosion: If pattern exceeds complexity budget
+    """
+    try:
+        parsed = sre_parse.parse(pattern)
+    except Exception:
+        # Invalid regex syntax will be handled downstream by the parser
+        return
+
+    if len(parsed) > max_ast_nodes:
+        raise JSONSchemaStateExplosion(
+            f"Regex AST node count ({len(parsed)}) exceeds budget ({max_ast_nodes})"
+        )
+
+    def inspect_subpattern(subpattern, quantifier_depth=0):
+        # Track quantifier nesting depth along the current path
+        for op, arg in subpattern:
+            if op in (sre_parse.MAX_REPEAT, sre_parse.MIN_REPEAT):
+                min_rep, max_rep, nested = arg
+                new_quantifier_depth = quantifier_depth + 1
+
+                if new_quantifier_depth > max_nested_quantifiers:
+                    raise JSONSchemaStateExplosion(
+                        f"Excessive nested regex quantifiers (depth {new_quantifier_depth} > {max_nested_quantifiers}) in pattern: {pattern[:40]}"
+                    )
+
+                # Check for large bounded repetition in nested quantifier context
+                # max_rep != MAXREPEAT means it's a bounded quantifier {N} or {N,M}
+                # Check if the upper bound is large (> 100) while nested inside another quantifier
+                if (
+                    max_rep != sre_parse.MAXREPEAT
+                    and max_rep > 100
+                    and quantifier_depth > 0
+                ):
+                    raise JSONSchemaStateExplosion(
+                        f"Explosive bounded repetition in nested regex: {pattern[:40]}"
+                    )
+
+                inspect_subpattern(nested, new_quantifier_depth)
+            elif op == sre_parse.SUBPATTERN:
+                # SUBPATTERN (grouping) - continue with current quantifier depth
+                # arg is (group_id, group_name, flags, subpattern)
+                inspect_subpattern(arg[3], quantifier_depth)
+
+    inspect_subpattern(parsed)
+
+
+def build_fsm_with_budget(
+    pattern: str,
+    max_states: int = MAX_COMPILED_DFA_STATES,
+    timeout_sec: float = MAX_FSM_COMPILE_TIME,
+) -> Any:
+    """
+    Compile regex to FSM with hard timeout and state budget enforcement.
+
+    Tier 1: Fast AST pre-filter (check_regex_ast_complexity)
+    Tier 2: Bounded execution with timeout and state count verification
+
+    Args:
+        pattern: The regex pattern string to compile
+        max_states: Maximum allowed DFA states after compilation
+        timeout_sec: Maximum time allowed for compilation
+
+    Returns:
+        The compiled FSM object
+
+    Raises:
+        JSONSchemaStateExplosion: If timeout exceeded or state budget exceeded
+        interegular.patterns.InvalidSyntax: If pattern syntax is invalid
+    """
+    # Tier 1: Fast AST pre-filter
+    check_regex_ast_complexity(pattern)
+
+    # Tier 2: Bounded execution
+    import interegular
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(lambda: interegular.parse_pattern(pattern).to_fsm())
+        try:
+            fsm = future.result(timeout=timeout_sec)
+            if len(fsm.states) > max_states:
+                raise JSONSchemaStateExplosion(
+                    f"Compiled DFA states ({len(fsm.states)}) exceeds max limit ({max_states})"
+                )
+            return fsm
+        except concurrent.futures.TimeoutError:
+            raise JSONSchemaStateExplosion(
+                f"Regex DFA compilation timed out (> {timeout_sec}s), aborting to prevent DoS: {pattern[:40]}"
+            )
+
+
 MAX_SCHEMA_DEPTH = 64
 # Maximum allowed total nodes in schema traversal (prevents pathological cases)
 MAX_TOTAL_NODES = 50000

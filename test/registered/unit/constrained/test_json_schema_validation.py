@@ -8,6 +8,8 @@ from sglang.srt.constrained.json_schema_validation import (
     JSONSchemaDepthExceeded,
     JSONSchemaStateExplosion,
     UnsupportedJSONSchemaFeature,
+    build_fsm_with_budget,
+    check_regex_ast_complexity,
     validate_outlines_json_schema,
     validate_schema_bounds,
     validate_xgrammar_json_schema,
@@ -418,6 +420,90 @@ class TestSchemaBoundsValidation(unittest.TestCase):
         self.assertIsInstance(result, InvalidGrammarObject)
         self.assertIn("DFA states", result.error_message)
         backend.grammar_compiler.compile_structural_tag.assert_not_called()
+
+
+class TestRegexASTComplexityValidation(unittest.TestCase):
+    """Tests for regex AST complexity validation (Tier 1)."""
+
+    def test_check_regex_ast_complexity_accepts_email(self):
+        """Standard email regex should pass."""
+        check_regex_ast_complexity(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,4}")
+
+    def test_check_regex_ast_complexity_accepts_uuid(self):
+        """UUID regex should pass."""
+        check_regex_ast_complexity(
+            r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
+        )
+
+    def test_check_regex_ast_complexity_accepts_iso_date(self):
+        """ISO date regex should pass."""
+        check_regex_ast_complexity(r"\d{4}-\d{2}-\d{2}")
+
+    def test_check_regex_ast_complexity_rejects_nested_quantifiers(self):
+        """Deeply nested quantifiers like ((a+)+)+ should be rejected."""
+        with self.assertRaises(JSONSchemaStateExplosion):
+            check_regex_ast_complexity(r"(((((a+)+)+)+)+)+")  # 6 levels > 5
+
+    def test_check_regex_ast_complexity_accepts_shallow_nested_quantifiers(self):
+        """Shallow nested quantifiers (≤5 levels) should pass."""
+        check_regex_ast_complexity(r"((((a+)+)+)+)+")  # 5 levels = boundary
+
+    def test_check_regex_ast_complexity_rejects_large_bounded_in_nested(self):
+        """Large bounded repetition inside another quantifier should be rejected."""
+        with self.assertRaises(JSONSchemaStateExplosion):
+            check_regex_ast_complexity(r"(a{101})+")  # {101} inside +
+
+    def test_check_regex_ast_complexity_accepts_large_bounded_not_nested(self):
+        """Large bounded repetition not nested should pass."""
+        check_regex_ast_complexity(r"a{101}")
+
+    def test_check_regex_ast_complexity_accepts_boundary_bounded_in_nested(self):
+        """Bounded repetition of exactly 100 inside quantifier should pass."""
+        check_regex_ast_complexity(r"(a{100})+")
+
+    def test_check_regex_ast_complexity_rejects_excessive_ast_nodes(self):
+        """Pattern with >500 AST nodes should be rejected."""
+        pattern = "a" * 501  # Each literal is a node
+        with self.assertRaises(JSONSchemaStateExplosion):
+            check_regex_ast_complexity(pattern)
+
+    def test_check_regex_ast_complexity_accepts_boundary_ast_nodes(self):
+        """Pattern with exactly 500 AST nodes should pass."""
+        pattern = "a" * 500
+        check_regex_ast_complexity(pattern)
+
+
+class TestFSMBudgetValidation(unittest.TestCase):
+    """Tests for FSM compilation with budget enforcement (Tier 2)."""
+
+    def test_build_fsm_with_budget_accepts_email(self):
+        """Email regex should compile within budget."""
+        fsm = build_fsm_with_budget(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,4}")
+        self.assertLess(len(fsm.states), 100)
+
+    def test_build_fsm_with_budget_accepts_uuid(self):
+        """UUID regex should compile within budget."""
+        fsm = build_fsm_with_budget(
+            r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
+        )
+        self.assertLess(len(fsm.states), 100)
+
+    def test_build_fsm_with_budget_accepts_iso_date(self):
+        """ISO date regex should compile within budget."""
+        fsm = build_fsm_with_budget(r"\d{4}-\d{2}-\d{2}")
+        self.assertLess(len(fsm.states), 100)
+
+    def test_build_fsm_with_budget_rejects_explosive_pattern(self):
+        """Pattern [ab]*a[ab]{13} should timeout or exceed state budget."""
+        with self.assertRaises(JSONSchemaStateExplosion):
+            build_fsm_with_budget(r"[ab]*a[ab]{13}")
+
+    def test_build_fsm_with_budget_rejects_manual_unroll(self):
+        """Manually unrolled pattern should also be rejected by state budget."""
+        # [ab]*a[ab][ab]...{13 times} - equivalent to [ab]*a[ab]{13}
+        pattern = "[ab]*" + "a" + "[ab]" * 13
+        with self.assertRaises(JSONSchemaStateExplosion):
+            build_fsm_with_budget(pattern)
 
 
 if __name__ == "__main__":

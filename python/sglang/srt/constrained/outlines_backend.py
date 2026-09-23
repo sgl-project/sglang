@@ -32,6 +32,8 @@ from sglang.srt.constrained.json_schema_validation import (
     JSONSchemaCircularRef,
     JSONSchemaDepthExceeded,
     JSONSchemaStateExplosion,
+    build_fsm_with_budget,
+    check_regex_ast_complexity,
     validate_outlines_json_schema,
     validate_schema_bounds,
 )
@@ -151,6 +153,10 @@ class OutlinesGrammarBackend(BaseGrammarBackend):
 
     def _compile_regex(self, regex: str) -> BaseGrammarObject:
         try:
+            # Tier 1+2: Validate regex complexity and compile with budget
+            check_regex_ast_complexity(regex)
+            build_fsm_with_budget(regex)
+
             if hasattr(RegexGuide, "from_regex"):
                 # outlines >= 0.1.1
                 guide = RegexGuide.from_regex(regex, self.outlines_tokenizer)
@@ -159,6 +165,9 @@ class OutlinesGrammarBackend(BaseGrammarBackend):
                 guide = RegexGuide(regex, self.outlines_tokenizer)
         except interegular.patterns.InvalidSyntax as e:
             logger.error(f"Hit invalid regex schema: {regex=}, {e=}")
+            return InvalidGrammarObject(str(e))
+        except JSONSchemaStateExplosion as e:
+            logger.error(f"Hit regex state explosion: {regex=}, {e=}")
             return InvalidGrammarObject(str(e))
 
         jump_forward_map = None
