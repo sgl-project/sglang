@@ -15,9 +15,9 @@ from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
 from sglang.srt.layers.dp_attention import get_dp_global_num_tokens
-from sglang.srt.layers.moe.mega_moe_overlap import should_overlap_shared_and_routed
 from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 from sglang.srt.model_executor.runner import get_is_capture_mode
+from sglang.srt.runtime_context import get_parallel
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -55,10 +55,8 @@ def _mtpr() -> int:
 
 
 def _ep_rank_world():
-    from sglang.srt.distributed.parallel_state import get_moe_ep_group
-
-    group = get_moe_ep_group().device_group
-    return torch.distributed.get_rank(group), torch.distributed.get_world_size(group)
+    parallel = get_parallel()
+    return parallel.moe_ep_rank, parallel.moe_ep_size
 
 
 def _ensure_mori_shmem() -> None:
@@ -68,10 +66,8 @@ def _ensure_mori_shmem() -> None:
 
     import mori.shmem
 
-    from sglang.srt.distributed.parallel_state import get_moe_ep_group
-
     group_name = "megamoe_aiter"
-    cpu_group = get_moe_ep_group().cpu_group
+    cpu_group = get_parallel().moe_ep_group.cpu_group
     try:
         torch._C._distributed_c10d._register_process_group(group_name, cpu_group)
     except Exception as exc:
@@ -198,7 +194,7 @@ def forward_mega_moe(
     input_ids_global: torch.Tensor | None = None,
 ) -> torch.Tensor:
     num_tokens = hidden_states.shape[0]
-    overlap = should_overlap_shared_and_routed(moe, num_tokens)
+    overlap = _should_overlap_shared_and_routed(moe, num_tokens)
     if overlap:
         current_stream = torch.cuda.current_stream()
         moe.alt_stream.wait_stream(current_stream)
@@ -215,6 +211,20 @@ def forward_mega_moe(
     if shared_output is not None:
         output.add_(shared_output)
     return output
+
+
+def _should_overlap_shared_and_routed(
+    moe: DeepseekV2MoE,
+    num_tokens: int,
+) -> bool:
+    if envs.SGLANG_AITER_MEGA_RANK_SYNC.get():
+        return False
+    return (
+        moe.alt_stream is not None
+        and moe.num_fused_shared_experts == 0
+        and num_tokens > 0
+        and get_is_capture_mode()
+    )
 
 
 def _run_mega_routed(
