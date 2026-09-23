@@ -3,6 +3,7 @@ LoRA Virtual Experts Triton Ops.
 """
 
 import functools
+import logging
 from typing import Any
 
 import torch
@@ -10,8 +11,13 @@ import triton
 import triton.language as tl
 
 from sglang.kernels.ops.moe.moe_align import (
+    _jit_moe_align_module,
+)
+from sglang.kernels.ops.moe.moe_align import (
     moe_align_block_size as jit_moe_align_block_size,
 )
+
+logger = logging.getLogger(__name__)
 
 
 @triton.jit
@@ -484,6 +490,9 @@ def _align_block_size_torch(
     return sorted_token_ids, expert_ids, total_padded_tokens
 
 
+_jit_align_block_size_unavailable = False
+
+
 def _align_block_size_large(
     topk_ids: torch.Tensor,
     block_size: int,
@@ -492,10 +501,26 @@ def _align_block_size_large(
     """Dispatch to the CUDA JIT kernel when available, otherwise fall back to
     the pure-PyTorch torch.compile path (needed on AMD/ROCm or when the JIT
     module fails to load)."""
-    try:
-        return _align_block_size_jit(topk_ids, block_size, num_experts)
-    except Exception:
-        return _align_block_size_torch(topk_ids, block_size, num_experts)
+    global _jit_align_block_size_unavailable
+
+    if not _jit_align_block_size_unavailable:
+        module_loaded = False
+        try:
+            # Loading is cached only on success, so a platform that cannot build
+            # the module at all would rebuild it once per call and never finish a
+            # forward pass. Runtime errors stay retryable.
+            _jit_moe_align_module(topk_ids.dtype)
+            module_loaded = True
+            return _align_block_size_jit(topk_ids, block_size, num_experts)
+        except Exception:
+            if not module_loaded:
+                logger.warning(
+                    "moe_align_block_size JIT module unavailable; using the "
+                    "pure-PyTorch alignment fallback for the rest of this process.",
+                    exc_info=True,
+                )
+                _jit_align_block_size_unavailable = True
+    return _align_block_size_torch(topk_ids, block_size, num_experts)
 
 
 def _merged_experts_fused_moe_lora_add_fake(
