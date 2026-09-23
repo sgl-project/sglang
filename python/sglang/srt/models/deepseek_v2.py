@@ -1009,10 +1009,8 @@ class DeepseekV2MoE(nn.Module):
         return self.gate(hidden_states, gemm_output_zero_allocator), None
 
     def _all_reduce_output(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        """Post-experts all-reduce for the DeepSeek-V4 MoE. On ROCm a fused
-        all-reduce + mHC post serves the states the HIP boundary builds eagerly
-        (post/comb present, 1-8 rows); every other state takes the plain
-        reduction after starting the overlapped stats."""
+        """Post-experts all-reduce; on ROCm the eagerly built 1-8 row mHC states take the
+        fused all-reduce + post kernel."""
         from sglang.srt.layers.moe.mhc_post_fusion import current_mhc_post_fusion
 
         mhc = current_mhc_post_fusion()
@@ -1036,8 +1034,7 @@ class DeepseekV2MoE(nn.Module):
                 mhc.comb,
                 get_tp_group().ca_comm,
             )
-            # The decoder consumes mhc.output. Keep the normal tensor
-            # return contract for its DP synchronization wrapper.
+            # the decoder reads mhc.output; the return keeps the DP wrapper's tensor contract
             return hidden_states
         if mhc is not None:
             mhc.start_stats_before_all_reduce()

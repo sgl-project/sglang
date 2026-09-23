@@ -1532,14 +1532,15 @@ class Envs:
 
     # DeepSeek-V4.1 engram host table: keep the tables in host memory (layout
     # below) and gather rows from the GPU instead of sharding them over HBM.
-    # Overlap layer 14's shared-host lookup and WKV with earlier layers at BS=1.
-    SGLANG_ENABLE_DSV41_ENGRAM_KV_PREFETCH = EnvBool(False)
     SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE = EnvBool(False)
     # "shared" is one buffer for the whole TP group, mapped by every rank, with no
     # lookup all-reduce (the ranks must share a PID namespace); "per_rank" is one
     # anonymous mapping per rank holding only its rows, gathered with the
     # all-reduce, and the only layout that gets huge pages without shmem THP.
     SGLANG_DSV41_ENGRAM_HOST_TABLE_LAYOUT = EnvStr("shared")
+    # Overlap the engram layer's shared-host lookup and WKV projection with the earlier
+    # layers at batch size 1.
+    SGLANG_ENABLE_DSV41_ENGRAM_KV_PREFETCH = EnvBool(False)
 
     # Kernels and indexer
     SGLANG_OPT_DEEPGEMM_HC_PRENORM = EnvBool(True)

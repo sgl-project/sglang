@@ -486,8 +486,6 @@ def _apply_wo_a_bf16_matmul(
             is_batch_invariant_mode_enabled()
             or get_exec().deterministic.enable_deterministic_inference
         )
-    # The ROCm branches carry their own gfx950 / env / shape gates and do not
-    # depend on the caller's model-type ``fast_path`` flag.
     if (
         (
             fast_path
@@ -2658,8 +2656,7 @@ class MQALayer(MqaAttentionBase):
             mhc.start_stats_before_all_reduce()
             o = attn_tp_all_reduce(o)
         elif mhc is not None and _is_hip:
-            # The HIP fused boundary hands over post/comb directly; a lazily
-            # recorded state (main's MhcPostFusion) is materialized first.
+            # a lazily recorded state still needs its stats before the fused kernel reads them
             mhc.materialize_stats()
             if mhc.stats_stream is not None:
                 torch.cuda.current_stream().wait_stream(mhc.stats_stream)
