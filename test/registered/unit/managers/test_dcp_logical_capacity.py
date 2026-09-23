@@ -102,6 +102,7 @@ def make_worker(dcp_size):
         random_seed=0,
         device="cpu",
         graph_memory_usage={},
+        dllm_algorithm=None,
     )
 
 
