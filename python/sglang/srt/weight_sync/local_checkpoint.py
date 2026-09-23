@@ -163,6 +163,14 @@ def _read_applied_version(local_checkpoint_dir: str) -> Optional[int]:
         return None
 
 
+def _clear_applied_version(local_checkpoint_dir: str) -> None:
+    # a host with no marker reseeds on its next pull, so drop it before mutating
+    try:
+        os.remove(os.path.join(local_checkpoint_dir, SYNC_DIR, "state.json"))
+    except FileNotFoundError:
+        pass
+
+
 def _write_applied_version(local_checkpoint_dir: str, version: int) -> None:
     path = os.path.join(local_checkpoint_dir, SYNC_DIR, "state.json")
     tmp = path + ".tmp"
@@ -195,6 +203,7 @@ def _reset_checkpoint(src_dir: str, local_checkpoint_dir: str, version: int) -> 
         "Pulling full checkpoint v%d %s -> %s", version, src_dir, local_checkpoint_dir
     )
     os.makedirs(local_checkpoint_dir, exist_ok=True)
+    _clear_applied_version(local_checkpoint_dir)
     src_files = [entry for entry in os.scandir(src_dir) if entry.is_file()]
     for entry in src_files:
         shutil.copy2(entry.path, os.path.join(local_checkpoint_dir, entry.name))
@@ -250,6 +259,8 @@ def _apply_delta(local_checkpoint_dir: str, version_dir: str) -> None:
     encoding = meta["delta_encoding"]
     algorithm = meta["checksum_format"]
     locations = _tensor_locations(local_checkpoint_dir)
+    # xor is not idempotent: a retry over half-patched bytes must reseed, not xor again
+    _clear_applied_version(local_checkpoint_dir)
     open_mmaps = {}
     mismatches = []
     lock = threading.Lock()

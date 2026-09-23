@@ -157,16 +157,21 @@ class TestLocalCheckpointPull(unittest.TestCase):
         # seeded from v2 directly, so base-only files never came along
         self.assertFalse(os.path.exists(os.path.join(self.local, "config.json")))
 
-    def test_checksum_mismatch_raises_and_does_not_advance_the_version(self):
-        _write_delta_version(self._vdir(1), 1, self.V0, self.V1, "xor")
+    def test_a_failed_xor_apply_reseeds_on_the_next_pull(self):
+        """xor is not idempotent, so retrying over half-patched bytes must reseed instead."""
         # publish a v1 whose payload was computed against the wrong base
         wrong_base = {"a": bytes(16), "b": self.V0["b"]}
-        shutil.rmtree(self._vdir(1))
         _write_delta_version(self._vdir(1), 1, wrong_base, self.V1, "xor")
-
         with self.assertRaisesRegex(RuntimeError, "checksum mismatch"):
             self._pull(1)
-        self.assertEqual(local_checkpoint._read_applied_version(self.local), 0)
+        self.assertIsNone(local_checkpoint._read_applied_version(self.local))
+
+        shutil.rmtree(self._vdir(1))
+        _write_delta_version(self._vdir(1), 1, self.V0, self.V1, "xor")
+        self._pull(1)
+
+        self.assertEqual(_read_tensors(self.local), self.V1)
+        self.assertEqual(local_checkpoint._read_applied_version(self.local), 1)
 
     def test_out_of_order_delta_raises(self):
         _write_delta_version(self._vdir(1), 1, self.V0, self.V1, "xor")
