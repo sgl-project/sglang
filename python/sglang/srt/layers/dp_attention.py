@@ -10,7 +10,7 @@ import triton
 import triton.language as tl
 
 from sglang.srt.arg_groups.model_override_base import (
-    ep_scale_joiner_of,
+    ep_offset_joiner_of,
     resolving_view,
 )
 from sglang.srt.distributed import (
@@ -400,7 +400,9 @@ def initialize_dp_attention_flags(server_args: ServerArgs):
     dp.enabled = get_parallel().enable_dp_attention
 
     if get_exec().moe.elastic_ep_backend is not None and get_parallel().max_ep_size:
-        if ep_scale_joiner_of(resolving_view(server_args)):
+        # Resolution, not a bag: callers reach this from processes whose
+        # publish may not have happened. Offset covers a recover joiner too.
+        if ep_offset_joiner_of(resolving_view(server_args)):
             dp.joiner_skip_all_gather = True
 
 
@@ -436,6 +438,22 @@ def is_dp_attention_enabled() -> bool:
 
 def is_allocation_symmetric() -> bool:
     return not is_dp_attention_enabled() or is_dp_max_padding()
+
+
+def dp_capacity_for(dp_size: int) -> int:
+    """DP width graph-facing buffers are sized to: the pool ceiling, not the live width.
+
+    Retirees are the contiguous tail, so a shrink leaves surviving rank offsets put
+    and a retired slot reads as a rank with zero tokens. The ceiling is in EP ranks,
+    hence the divide by attention TP. Takes the width as an argument so the buffer
+    allocators can call it before DP attention is initialized.
+    """
+    if get_exec().moe.elastic_ep_backend is None:
+        return dp_size
+    max_ep_size = get_parallel().max_ep_size
+    if not max_ep_size:
+        return dp_size
+    return max(dp_size, max_ep_size * dp_size // get_parallel().tp_size)
 
 
 def get_dp_local_info(forward_batch: ForwardBatch) -> Tuple[torch.Tensor, torch.Tensor]:

@@ -90,6 +90,19 @@ REDUCE_OP_SUM = int(torch.distributed.ReduceOp.SUM)
 _MODEL_PARALLEL_GROUP_TIMEOUT: Optional[timedelta] = None
 
 
+# WORLD active_ranks handle (WORLD PG has no GroupCoordinator wrapper).
+_WORLD_BACKEND_ACTIVE_RANKS: Optional[torch.Tensor] = None
+_WORLD_BACKEND_RANKS: List[int] = []
+
+
+def get_world_backend_active_ranks() -> Optional[torch.Tensor]:
+    return _WORLD_BACKEND_ACTIVE_RANKS
+
+
+def get_world_backend_ranks() -> List[int]:
+    return list(_WORLD_BACKEND_RANKS)
+
+
 def get_torch_distributed_pg_options(group_name=None):
     if not _is_npu:
         return None
@@ -356,18 +369,21 @@ class GroupCoordinator:
                 pg_active_ranks_cpu = torch.zeros(pg_active_size, dtype=torch.int32)
                 pg_active_ranks_cpu[: len(ranks)] = 1
 
+                # AttachOrExtend needs a live group whose rank order is a prefix
+                # of this request, so only WORLD (rank_offset 0) qualifies. The
+                # cohort-local groups above are refused non-fatally: the group
+                # falls back to {self} and its collectives become no-ops.
+                is_extension = recovered_rank and rank_offset == 0
                 if max_world_size is not None:
                     dev_opts = MooncakeBackendOptions(
-                        pg_active_ranks, recovered_rank, max_world_size
+                        pg_active_ranks, is_extension, max_world_size
                     )
                     cpu_opts = MooncakeBackendOptions(
-                        pg_active_ranks_cpu, recovered_rank, max_world_size
+                        pg_active_ranks_cpu, is_extension, max_world_size
                     )
                 else:
-                    dev_opts = MooncakeBackendOptions(pg_active_ranks, recovered_rank)
-                    cpu_opts = MooncakeBackendOptions(
-                        pg_active_ranks_cpu, recovered_rank
-                    )
+                    dev_opts = MooncakeBackendOptions(pg_active_ranks, is_extension)
+                    cpu_opts = MooncakeBackendOptions(pg_active_ranks_cpu, is_extension)
 
                 active_ranks = pg_active_ranks[: len(ranks)]
                 active_ranks_cpu = pg_active_ranks_cpu[: len(ranks)]
@@ -2441,6 +2457,9 @@ def init_distributed_environment(
             from mooncake.pg import MooncakeBackendOptions
 
             use_max_ws = max_world_size and max_world_size > world_size
+            # Recover path also uses max_ws when equal to world_size (attach to pool).
+            if not use_max_ws and recovered_rank and max_world_size == world_size:
+                use_max_ws = True
             ar_size = max_world_size if use_max_ws else world_size
             active_ranks = torch.zeros(ar_size, dtype=torch.int32, device="cuda")
             active_ranks[:world_size] = 1
@@ -2463,8 +2482,16 @@ def init_distributed_environment(
             pg_options=pg_options,
         )
 
-        # Create a global TCPStore for coordination (used by NIXL)
-        if moe_a2a_backend == "nixl":
+        # Publish WORLD active_ranks handle for elastic-EP mask flips (no wrapper).
+        if backend == "mooncake":
+            global _WORLD_BACKEND_ACTIVE_RANKS, _WORLD_BACKEND_RANKS
+            _WORLD_BACKEND_ACTIVE_RANKS = active_ranks
+            _WORLD_BACKEND_RANKS = list(range(ar_size))
+
+            # Global TCPStore for NIXL and for the elastic-EP cohort barriers,
+            # which rendezvous over it rather than over a collective and so are
+            # needed whatever the a2a backend dispatches with.
+        if moe_a2a_backend == "nixl" or backend == "mooncake":
             _create_global_tcp_store(
                 rank,
                 world_size,
@@ -2916,6 +2943,7 @@ def initialize_model_parallel(
             use_custom_allreduce=False,
             group_name="self_pp",
             recovered_rank=recovered_rank,
+            # A joiner's world_size is local, so singletons would miss its global rank.
             rank_offset=rank_offset,
             max_world_size=max_world_size,
         )
