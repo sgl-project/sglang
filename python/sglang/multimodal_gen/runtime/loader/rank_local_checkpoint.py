@@ -18,6 +18,9 @@ from sglang.multimodal_gen.runtime.layers.linear import (
     ReplicatedLinear,
     RowParallelLinear,
 )
+from sglang.multimodal_gen.runtime.layers.vocab_parallel_embedding import (
+    VocabParallelEmbedding,
+)
 from sglang.multimodal_gen.runtime.loader.weight_utils import _scan_safetensors_files
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
@@ -254,6 +257,9 @@ def _resolve_tp_shard_dim(
     if isinstance(owner, RowParallelLinear):
         input_dim = actual_param.__dict__.get("input_dim")
         return True, input_dim
+    if isinstance(owner, VocabParallelEmbedding):
+        output_dim = actual_param.__dict__.get("output_dim")
+        return output_dim is not None, output_dim
     return False, None
 
 

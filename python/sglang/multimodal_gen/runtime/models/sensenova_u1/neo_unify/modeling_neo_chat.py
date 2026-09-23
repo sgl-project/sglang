@@ -2,7 +2,7 @@
 
 import contextlib
 import math
-from typing import List, Optional, Tuple, Union
+from typing import ClassVar, List, Optional, Tuple, Union
 
 import torch.utils.checkpoint
 import transformers
@@ -12,6 +12,13 @@ from transformers import GenerationConfig
 from transformers.modeling_outputs import CausalLMOutputWithPast
 from transformers.modeling_utils import PreTrainedModel
 from transformers.utils import logging
+
+from sglang.multimodal_gen.configs.sensenova_u1 import (
+    DEFAULT_IMG_CFG_SCALE,
+    SenseNovaGuidanceProfile,
+    derive_guidance_profile,
+)
+from sglang.multimodal_gen.runtime.cache.conditioning import cached_conditioning
 
 from .configuration_neo_chat import NEOChatConfig, NEOMoELLMConfig
 from .conversation import get_conv_template
@@ -23,6 +30,7 @@ from .modeling_fm_modules import (
 from .modeling_neo_vit import NEOVisionModel
 from .modeling_qwen3 import (
     Qwen3ForCausalLM,
+    Qwen3RotaryEmbedding,
     create_block_causal_mask,
     npu_fia_available,
 )
@@ -232,6 +240,25 @@ def _randn_with_seed(shape, *, device, dtype, seed: int | list[int]) -> torch.Te
     return torch.randn(shape, device=device, dtype=dtype, generator=generator)
 
 
+def _randn_with_generators(
+    shape, *, device, dtype, generators: list[torch.Generator]
+) -> torch.Tensor:
+    batch_size = shape[0]
+    if len(generators) != batch_size:
+        raise ValueError(
+            f"Generator length {len(generators)} is not consistent with batch size {batch_size}."
+        )
+    return torch.cat(
+        [
+            torch.randn(
+                (1, *shape[1:]), generator=generator, device=device, dtype=dtype
+            )
+            for generator in generators
+        ],
+        dim=0,
+    )
+
+
 def build_abs_positions_from_grid_hw(grid_hw: torch.Tensor, device=None):
     """
     Compute patch coordinates (x, y)
@@ -272,6 +299,8 @@ def build_abs_positions_from_grid_hw(grid_hw: torch.Tensor, device=None):
 
 class NEOChatModel(PreTrainedModel):
     config_class = NEOChatConfig
+    param_names_mapping: dict = {}
+    lora_param_names_mapping: dict = {}
     main_input_name = "pixel_values"
     base_model_prefix = "language_model"
     _supports_flash_attn_2 = True
@@ -285,9 +314,23 @@ class NEOChatModel(PreTrainedModel):
         "language_model.model.embed_tokens",
         "language_model.lm_head",
     )
+    # Native SGLang checkpoint loading contracts. SenseNova does not use FSDP,
+    # but the common loader requires these declarations for meta construction
+    # and rank-local TP materialization.
+    _fsdp_forward_methods: tuple[str, ...] = ()
+    param_names_mapping: ClassVar[dict] = {}
 
     # support transformers 4.51.+
     _tp_plan = ""
+
+    def post_load_weights(self) -> None:
+        """Rebuild derived buffers omitted from the checkpoint after meta loading."""
+        device = next(
+            parameter.device for parameter in self.parameters() if not parameter.is_meta
+        )
+        for module in self.modules():
+            if isinstance(module, Qwen3RotaryEmbedding) and module.inv_freq.is_meta:
+                module._init_inv_freq_buffer(device)
 
     def __init__(
         self,
@@ -484,12 +527,16 @@ class NEOChatModel(PreTrainedModel):
                 grid_hw=grid_hw,
             ).last_hidden_state
         else:
-            return self.vision_model(
-                pixel_values=pixel_values,
-                output_hidden_states=False,
-                return_dict=True,
-                grid_hw=grid_hw,
-            ).last_hidden_state
+            return self._reference_image_features(pixel_values, grid_hw)
+
+    @cached_conditioning
+    def _reference_image_features(self, pixel_values, grid_hw):
+        return self.vision_model(
+            pixel_values=pixel_values,
+            output_hidden_states=False,
+            return_dict=True,
+            grid_hw=grid_hw,
+        ).last_hidden_state
 
     def batch_chat(
         self,
@@ -591,6 +638,15 @@ class NEOChatModel(PreTrainedModel):
     def _euler_step(self, v_pred, z, t, t_next):
         z_next = z + (t_next - t) * v_pred
         return z_next
+
+    @staticmethod
+    def _build_cfg_schedule(timesteps, cfg_interval, needs_cfg):
+        # Compare on the original device to preserve rounding at boundaries.
+        if not needs_cfg:
+            return [False] * (timesteps.numel() - 1)
+        return (
+            (timesteps[:-1] >= cfg_interval[0]) & (timesteps[:-1] <= cfg_interval[1])
+        ).tolist()
 
     def _calculate_dynamic_mu(self, image_seq_len: int) -> float:
         denom = self.max_image_seq_len - self.base_image_seq_len
@@ -827,11 +883,7 @@ class NEOChatModel(PreTrainedModel):
 
         outputs = self.language_model.model(
             inputs_embeds=input_embeds,
-            image_gen_indicators=torch.ones(
-                (input_embeds.shape[0], input_embeds.shape[1]),
-                dtype=torch.bool,
-                device=input_embeds.device,
-            ),
+            image_only=True,
             indexes=indexes_image,
             attention_mask=attn_mask,
             past_key_values=past_key_values,
@@ -1975,6 +2027,7 @@ class NEOChatModel(PreTrainedModel):
         t_eps=0.02,
         think_mode=False,
         seed=0,
+        generators=None,
     ):
         assert cfg_norm in ["none", "global", "channel"]
         self._notify_layer_offload_phase("prefix")
@@ -2014,11 +2067,11 @@ class NEOChatModel(PreTrainedModel):
         merge_size = int(1 / self.downsample_ratio)
         question_condition = f"{prompt}"
         think_text = ""
-        needs_cfg = not (cfg_scale == 1 and img_cfg_scale == 1)
-        needs_img_condition = needs_cfg and (
-            img_cfg_scale == 1 or cfg_scale != img_cfg_scale
+        guidance_profile = derive_guidance_profile(
+            is_edit=True,
+            cfg_scale=cfg_scale,
+            img_cfg_scale=img_cfg_scale,
         )
-        needs_uncondition = needs_cfg and img_cfg_scale != 1
 
         think_content = (
             "<think>\n" if think_mode else "<think>\n\n</think>\n\n" + IMG_START_TOKEN
@@ -2030,12 +2083,12 @@ class NEOChatModel(PreTrainedModel):
         )
         query_img_condition = (
             self._build_t2i_query("<image>" * len(images), append_text=IMG_START_TOKEN)
-            if needs_img_condition
+            if guidance_profile.needs_image_condition
             else None
         )
         query_uncondition = (
             self._build_t2i_query("", append_text=IMG_START_TOKEN)
-            if needs_uncondition
+            if guidance_profile.needs_uncondition
             else None
         )
 
@@ -2245,12 +2298,21 @@ class NEOChatModel(PreTrainedModel):
             if self.noise_scale_mode == "dynamic_sqrt":
                 noise_scale = math.sqrt(noise_scale)
         noise_scale = min(noise_scale, self.noise_scale_max_value)
-        image_prediction = noise_scale * _randn_with_seed(
-            (batch_size, 3, image_size[1], image_size[0]),
-            device=device,
-            dtype=dtype,
-            seed=seed,
-        )
+
+        if generators is None:
+            image_prediction = noise_scale * _randn_with_seed(
+                (batch_size, 3, image_size[1], image_size[0]),
+                device=device,
+                dtype=dtype,
+                seed=seed,
+            )
+        else:
+            image_prediction = noise_scale * _randn_with_generators(
+                (batch_size, 3, image_size[1], image_size[0]),
+                device=device,
+                dtype=dtype,
+                generators=generators,
+            )
 
         attention_mask_condition = {"full_attention": None}
         attention_mask_img_condition = {"full_attention": None}
@@ -2316,11 +2378,9 @@ class NEOChatModel(PreTrainedModel):
                 image_size=image_size,
             )
 
-            if not use_cfg:
+            if not use_cfg or guidance_profile is SenseNovaGuidanceProfile.CONDITION:
                 v_pred = out_cond
-            elif cfg_scale == 1 and img_cfg_scale == 1:
-                v_pred = out_cond
-            elif img_cfg_scale == 1:
+            elif guidance_profile is SenseNovaGuidanceProfile.CONDITION_IMAGE:
                 out_img_cond = self._t2i_predict_v(
                     image_embeds,
                     indexes_image_img_condition,
@@ -2333,7 +2393,7 @@ class NEOChatModel(PreTrainedModel):
                     image_size=image_size,
                 )
                 v_pred = out_img_cond + cfg_scale * (out_cond - out_img_cond)
-            elif cfg_scale == img_cfg_scale:
+            elif guidance_profile is SenseNovaGuidanceProfile.CONDITION_UNCONDITIONAL:
                 out_uncond = self._t2i_predict_v(
                     image_embeds,
                     indexes_image_uncondition,
@@ -2347,6 +2407,10 @@ class NEOChatModel(PreTrainedModel):
                 )
                 v_pred = out_uncond + cfg_scale * (out_cond - out_uncond)
             else:
+                assert (
+                    guidance_profile
+                    is SenseNovaGuidanceProfile.CONDITION_IMAGE_UNCONDITIONAL
+                )
                 out_img_cond = self._t2i_predict_v(
                     image_embeds,
                     indexes_image_img_condition,
@@ -2426,6 +2490,7 @@ class NEOChatModel(PreTrainedModel):
         t_eps=0.02,
         think_mode=False,
         seed=0,
+        generators=None,
     ):
         assert self.concat_time_token_num == 0
         assert cfg_norm in ["cfg_zero_star", "global", "none", "channel"]
@@ -2447,7 +2512,11 @@ class NEOChatModel(PreTrainedModel):
 
         self.config.t_eps = t_eps
         think_text = ""
-        needs_cfg = cfg_scale > 1
+        guidance_profile = derive_guidance_profile(
+            is_edit=False,
+            cfg_scale=cfg_scale,
+            img_cfg_scale=DEFAULT_IMG_CFG_SCALE,
+        )
 
         think_content = (
             "<think>\n" if think_mode else "<think>\n\n</think>\n\n" + IMG_START_TOKEN
@@ -2465,7 +2534,7 @@ class NEOChatModel(PreTrainedModel):
         )
         query_uncondition = (
             self._build_t2i_query("", append_text=IMG_START_TOKEN)
-            if needs_cfg
+            if guidance_profile.needs_uncondition
             else None
         )
 
@@ -2618,12 +2687,21 @@ class NEOChatModel(PreTrainedModel):
             if self.noise_scale_mode == "dynamic_sqrt":
                 noise_scale = math.sqrt(noise_scale)
         noise_scale = min(noise_scale, self.noise_scale_max_value)
-        image_prediction = noise_scale * _randn_with_seed(
-            (batch_size, 3, image_size[1], image_size[0]),
-            device=device,
-            dtype=dtype,
-            seed=seed,
-        )
+
+        if generators is None:
+            image_prediction = noise_scale * _randn_with_seed(
+                (batch_size, 3, image_size[1], image_size[0]),
+                device=device,
+                dtype=dtype,
+                seed=seed,
+            )
+        else:
+            image_prediction = noise_scale * _randn_with_generators(
+                (batch_size, 3, image_size[1], image_size[0]),
+                device=device,
+                dtype=dtype,
+                generators=generators,
+            )
 
         attention_mask_condition = {"full_attention": None}
         if device.type == "npu" and batch_size > 1 and not npu_fia_available():
@@ -2660,6 +2738,27 @@ class NEOChatModel(PreTrainedModel):
                     "noise_scale_embedder"
                 ](noise_level)
 
+        # Noise scale is fixed for this request; only the timestep changes.
+        noise_embeddings = None
+        if (
+            denoise_embeddings is None
+            and self.add_noise_scale_embedding
+            and num_steps > 0
+        ):
+            noise_scale_tensor = timesteps.new_full(
+                (batch_size * token_h * token_w,),
+                noise_scale / self.noise_scale_max_value,
+            )
+            noise_embeddings = self.fm_modules["noise_scale_embedder"](
+                noise_scale_tensor
+            ).view(batch_size, token_h * token_w, -1)
+
+        # Preserve GPU timestep rounding and inclusive CFG boundaries, but
+        # transfer the decisions only once instead of synchronizing every step.
+        cfg_active = self._build_cfg_schedule(
+            timesteps, cfg_interval, guidance_profile.needs_uncondition
+        )
+
         for step_i in range(num_steps):
             t = timesteps[step_i]
             t_next = timesteps[step_i + 1]
@@ -2680,13 +2779,8 @@ class NEOChatModel(PreTrainedModel):
                 timestep_embeddings = self.fm_modules["timestep_embedder"](
                     t_expanded
                 ).view(batch_size, token_h * token_w, -1)
-                if self.add_noise_scale_embedding:
-                    noise_scale_tensor = torch.full_like(
-                        t_expanded, noise_scale / self.noise_scale_max_value
-                    )
-                    timestep_embeddings += self.fm_modules["noise_scale_embedder"](
-                        noise_scale_tensor
-                    ).view(batch_size, token_h * token_w, -1)
+                if noise_embeddings is not None:
+                    timestep_embeddings += noise_embeddings
             image_embeds = image_embeds + timestep_embeddings
 
             v_pred_condition = self._t2i_predict_v(
@@ -2701,7 +2795,7 @@ class NEOChatModel(PreTrainedModel):
                 image_size=image_size,
             )
 
-            if t >= cfg_interval[0] and t <= cfg_interval[1] and cfg_scale > 1:
+            if cfg_active[step_i]:
                 v_pred_uncondition = self._t2i_predict_v(
                     image_embeds,
                     indexes_image_uncondition,

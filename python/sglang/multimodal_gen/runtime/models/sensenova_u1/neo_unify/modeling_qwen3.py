@@ -29,6 +29,14 @@ from transformers.processing_utils import Unpack
 from transformers.utils import TransformersKwargs, can_return_tuple
 from transformers.utils.deprecation import deprecate_kwarg
 
+from sglang.multimodal_gen.runtime.distributed import get_tp_world_size
+from sglang.multimodal_gen.runtime.layers.linear import (
+    ColumnParallelLinear,
+    RowParallelLinear,
+)
+from sglang.multimodal_gen.runtime.layers.vocab_parallel_embedding import (
+    VocabParallelEmbedding,
+)
 from sglang.srt.layers.layernorm import RMSNorm
 
 from .transformers_compat import (
@@ -55,6 +63,12 @@ except ImportError:  # pragma: no cover - exercised only in CPU-only / no-flash 
 #                    debugging, even when flash-attn is available).
 _VALID_ATTN_BACKENDS = ("auto", "flash", "sdpa")
 _ATTN_BACKEND: str = "auto"
+
+
+def _linear_output(module: nn.Module, hidden_states: torch.Tensor) -> torch.Tensor:
+    """Run either a torch or SGLang linear layer and return only its output."""
+    output = module(hidden_states)
+    return output[0] if isinstance(output, tuple) else output
 
 
 def npu_fia_available() -> bool:
@@ -341,6 +355,47 @@ def visualize_mask(mask: torch.Tensor, i: int = 0, j: int = 12):
         print(" ".join(map(str, row)))
 
 
+def cache_dit_decoder_layers(
+    model: nn.Module,
+    *,
+    update_cache: bool,
+    exist_non_image_gen_tokens: bool,
+    exist_image_gen_tokens: bool,
+) -> nn.Module:
+    """Return the decoder layers this forward must run.
+
+    Cache-DiT replaces ``model.layers`` with a single unified wrapper while it
+    is mounted, which only suits the pure image denoising forwards.  The
+    genuine ModuleList is kept under ``_sensenova_cache_dit_native_layers`` by
+    the SenseNova generation stage before mounting, and every text, prefix, or
+    think forward has to select it back.
+    """
+    native_layers = getattr(model, "_sensenova_cache_dit_native_layers", None)
+    if native_layers is None:
+        return model.layers
+    if update_cache or exist_non_image_gen_tokens or not exist_image_gen_tokens:
+        return native_layers
+    return model.layers
+
+
+def cache_dit_attention_type(
+    model: nn.Module,
+    decoder_layer: nn.Module,
+) -> str:
+    """Attention type of one decoder layer, resolved under the Cache-DiT wrapper.
+
+    The wrapper forwards keyword arguments to every native block but exposes no
+    per-block attributes, so blocks running under it fall back to the type the
+    generation stage validated when it mounted the cache.
+    """
+    attention_type = getattr(decoder_layer, "attention_type", None)
+    if attention_type is not None:
+        return attention_type
+    if getattr(model, "_sensenova_cache_dit_native_layers", None) is None:
+        raise AttributeError("Decoder layer does not expose an attention_type.")
+    return model._sensenova_cache_dit_attention_type
+
+
 def make_qwen3_rms_norm(hidden_size: int, eps: float) -> RMSNorm:
     return RMSNorm(
         hidden_size,
@@ -355,9 +410,29 @@ class Qwen3MLP(nn.Module):
         self.config = config
         self.hidden_size = config.hidden_size
         self.intermediate_size = config.intermediate_size
-        self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
-        self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
-        self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
+        if getattr(config, "use_sglang_tp", False):
+            self.gate_proj = ColumnParallelLinear(
+                self.hidden_size, self.intermediate_size, bias=False
+            )
+            self.up_proj = ColumnParallelLinear(
+                self.hidden_size, self.intermediate_size, bias=False
+            )
+            self.down_proj = RowParallelLinear(
+                self.intermediate_size,
+                self.hidden_size,
+                bias=False,
+                input_is_parallel=True,
+            )
+        else:
+            self.gate_proj = nn.Linear(
+                self.hidden_size, self.intermediate_size, bias=False
+            )
+            self.up_proj = nn.Linear(
+                self.hidden_size, self.intermediate_size, bias=False
+            )
+            self.down_proj = nn.Linear(
+                self.intermediate_size, self.hidden_size, bias=False
+            )
         self.act_fn = ACT2FN[config.hidden_act]
         self._npu_gate_up_weight = None
 
@@ -377,8 +452,9 @@ class Qwen3MLP(nn.Module):
             packed = torch.cat(
                 [self.gate_proj.weight, self.up_proj.weight], dim=0
             ).contiguous()
-            self.gate_proj.weight.set_(packed[: self.intermediate_size])
-            self.up_proj.weight.set_(packed[self.intermediate_size :])
+            local_intermediate_size = self.gate_proj.weight.shape[0]
+            self.gate_proj.weight.set_(packed[:local_intermediate_size])
+            self.up_proj.weight.set_(packed[local_intermediate_size:])
         self._npu_gate_up_weight = packed
         return packed
 
@@ -397,8 +473,10 @@ class Qwen3MLP(nn.Module):
     def forward(self, x):
         if self._use_npu_fused_mlp(x):
             gate_up = F.linear(x, self._pack_npu_gate_up_weights())
-            return self.down_proj(torch.ops.npu.npu_swiglu(gate_up))
-        down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
+            return _linear_output(self.down_proj, torch.ops.npu.npu_swiglu(gate_up))
+        gate = _linear_output(self.gate_proj, x)
+        up = _linear_output(self.up_proj, x)
+        down_proj = _linear_output(self.down_proj, self.act_fn(gate) * up)
         return down_proj
 
 
@@ -429,6 +507,42 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
     Returns:
         `tuple(torch.Tensor)` comprising of the query and key tensors rotated using the Rotary Position Embedding.
     """
+    if (
+        q.is_cuda
+        and q.dtype is torch.bfloat16
+        and k.dtype is torch.bfloat16
+        and cos.dtype is torch.bfloat16
+        and sin.dtype is torch.bfloat16
+        and q.device == k.device == cos.device == sin.device
+        and not torch.is_grad_enabled()
+        and not torch.compiler.is_compiling()
+        and unsqueeze_dim == 1
+        and q.ndim == k.ndim == 4
+        and q.numel() > 0
+        and k.numel() > 0
+        and q.shape[2] >= 128
+        and q.shape[0] == k.shape[0]
+        and q.shape[2:] == k.shape[2:]
+        and q.shape[-1] in (32, 64)
+        and cos.shape == sin.shape == (q.shape[0], q.shape[2], q.shape[3])
+    ):
+        from sglang.kernels.ops.diffusion.rope.rope_rotate_half_bitexact import (
+            fused_rope_rotate_half_bitexact,
+        )
+
+        # The kernel rounds both products to bf16 before adding, matching
+        # the eager chain. Spatial axes are slices of the normalized HW
+        # heads; materialize those slices in the kernel's BSHD layout.
+        cos_rows = cos.reshape(-1, cos.shape[-1]).contiguous()
+        sin_rows = sin.reshape(-1, sin.shape[-1]).contiguous()
+        q_embed = fused_rope_rotate_half_bitexact(
+            q.transpose(1, 2).contiguous(), cos_rows, sin_rows
+        )
+        k_embed = fused_rope_rotate_half_bitexact(
+            k.transpose(1, 2).contiguous(), cos_rows, sin_rows
+        )
+        return q_embed.transpose(1, 2), k_embed.transpose(1, 2)
+
     cos = cos.unsqueeze(unsqueeze_dim)
     sin = sin.unsqueeze(unsqueeze_dim)
     q_embed = (q * cos) + (rotate_half(q) * sin)
@@ -540,6 +654,10 @@ class Qwen3RotaryEmbedding(nn.Module):
 
         self.rope_init_fn = _rope_init_fn_keep_freq_range
 
+        self._init_inv_freq_buffer(device)
+
+    def _init_inv_freq_buffer(self, device=None) -> None:
+        """Build the derived RoPE state omitted from model checkpoints."""
         inv_freq, self.attention_scaling = self.rope_init_fn(self.config, device)
         self.register_buffer("inv_freq", inv_freq, persistent=False)
         self.original_inv_freq = self.inv_freq
@@ -571,6 +689,11 @@ class Qwen3RotaryEmbedding(nn.Module):
         return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
 
 
+# RoPE runs on three axes: temporal, height, width, each a `(cos, sin)` pair.
+RopeTable = tuple[torch.Tensor, torch.Tensor]
+PositionEmbeddings = tuple[RopeTable, RopeTable, RopeTable]
+
+
 class Qwen3Attention(nn.Module):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
 
@@ -581,55 +704,85 @@ class Qwen3Attention(nn.Module):
         self.head_dim = getattr(
             config, "head_dim", config.hidden_size // config.num_attention_heads
         )
-        self.num_key_value_groups = (
-            config.num_attention_heads // config.num_key_value_heads
+        self.tp_size = (
+            get_tp_world_size() if getattr(config, "use_sglang_tp", False) else 1
         )
+        if config.num_attention_heads % self.tp_size != 0:
+            raise ValueError(
+                f"SenseNova attention heads ({config.num_attention_heads}) must be "
+                f"divisible by tp_size ({self.tp_size})"
+            )
+        if config.num_key_value_heads % self.tp_size != 0:
+            raise ValueError(
+                f"SenseNova KV heads ({config.num_key_value_heads}) must be divisible "
+                f"by tp_size ({self.tp_size})"
+            )
+        self.num_heads = config.num_attention_heads // self.tp_size
+        self.num_key_value_heads = config.num_key_value_heads // self.tp_size
+        self.num_key_value_groups = self.num_heads // self.num_key_value_heads
         self.scaling = self.head_dim**-0.5
         self.attention_dropout = config.attention_dropout
         self.is_causal = True
 
-        self.q_proj = nn.Linear(
+        linear_cls = (
+            ColumnParallelLinear
+            if getattr(config, "use_sglang_tp", False)
+            else nn.Linear
+        )
+        self.q_proj = linear_cls(
             config.hidden_size,
             config.num_attention_heads * self.head_dim,
             bias=config.attention_bias,
         )
-        self.q_proj_mot_gen = nn.Linear(
+        self.q_proj_mot_gen = linear_cls(
             config.hidden_size,
             config.num_attention_heads * self.head_dim,
             bias=config.attention_bias,
         )
-
-        self.k_proj = nn.Linear(
+        self.k_proj = linear_cls(
             config.hidden_size,
             config.num_key_value_heads * self.head_dim,
             bias=config.attention_bias,
         )
-        self.k_proj_mot_gen = nn.Linear(
+        self.k_proj_mot_gen = linear_cls(
             config.hidden_size,
             config.num_key_value_heads * self.head_dim,
             bias=config.attention_bias,
         )
-
-        self.v_proj = nn.Linear(
+        self.v_proj = linear_cls(
             config.hidden_size,
             config.num_key_value_heads * self.head_dim,
             bias=config.attention_bias,
         )
-        self.v_proj_mot_gen = nn.Linear(
+        self.v_proj_mot_gen = linear_cls(
             config.hidden_size,
             config.num_key_value_heads * self.head_dim,
             bias=config.attention_bias,
         )
-        self.o_proj = nn.Linear(
-            config.num_attention_heads * self.head_dim,
-            config.hidden_size,
-            bias=config.attention_bias,
-        )
-        self.o_proj_mot_gen = nn.Linear(
-            config.num_attention_heads * self.head_dim,
-            config.hidden_size,
-            bias=config.attention_bias,
-        )
+        if getattr(config, "use_sglang_tp", False):
+            self.o_proj = RowParallelLinear(
+                config.num_attention_heads * self.head_dim,
+                config.hidden_size,
+                bias=config.attention_bias,
+                input_is_parallel=True,
+            )
+            self.o_proj_mot_gen = RowParallelLinear(
+                config.num_attention_heads * self.head_dim,
+                config.hidden_size,
+                bias=config.attention_bias,
+                input_is_parallel=True,
+            )
+        else:
+            self.o_proj = nn.Linear(
+                config.num_attention_heads * self.head_dim,
+                config.hidden_size,
+                bias=config.attention_bias,
+            )
+            self.o_proj_mot_gen = nn.Linear(
+                config.num_attention_heads * self.head_dim,
+                config.hidden_size,
+                bias=config.attention_bias,
+            )
 
         self.q_norm = make_qwen3_rms_norm(
             self.head_dim // 2, eps=config.rms_norm_eps
@@ -678,6 +831,32 @@ class Qwen3Attention(nn.Module):
         hw_config.max_position_embeddings = config.max_position_embeddings_hw
         self.rotary_emb_hw = Qwen3RotaryEmbedding(config=hw_config)
 
+    def _resolve_rope_tables(
+        self,
+        indexes: torch.LongTensor,
+        hidden_states: torch.Tensor,
+        position_embeddings: Optional[PositionEmbeddings] = None,
+    ) -> PositionEmbeddings:
+        # Positions are fixed for the whole forward, so a table stays reusable
+        # for as long as the activation dtype does. All three axes share one
+        # dtype, and it follows the activation the table is built from: this
+        # attention is fed the normalized activation, which an fp32 RMSNorm
+        # weight promotes back to fp32 when the model input is bf16.
+        if (
+            position_embeddings is None
+            or position_embeddings[0][0].dtype != hidden_states.dtype
+        ):
+            t_positions = position_ids_from_indexes(indexes, 0)
+            h_positions = position_ids_from_indexes(indexes, 1)
+            w_positions = position_ids_from_indexes(indexes, 2)
+            # Temporal positions use `rotary_emb`; height and width use `rotary_emb_hw`.
+            position_embeddings = (
+                self.rotary_emb(hidden_states, t_positions),
+                self.rotary_emb_hw(hidden_states, h_positions),
+                self.rotary_emb_hw(hidden_states, w_positions),
+            )
+        return position_embeddings
+
     def forward_und(
         self,
         hidden_states: torch.Tensor,
@@ -685,42 +864,39 @@ class Qwen3Attention(nn.Module):
         attention_mask: Optional[torch.Tensor],
         past_key_values: Optional[Cache] = None,
         cache_position: Optional[torch.LongTensor] = None,
+        position_embeddings: Optional[PositionEmbeddings] = None,
         **kwargs: Unpack[FlashAttentionKwargs],
     ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
         assert self.config._attn_implementation == "eager"
         input_shape = hidden_states.shape[:-1]
         hidden_shape = (*input_shape, -1, self.head_dim)
 
-        query_states = self.q_proj(hidden_states).view(hidden_shape)
+        query_states = _linear_output(self.q_proj, hidden_states).view(hidden_shape)
         query_states_t, query_states_hw = query_states.chunk(2, dim=-1)
         query_states_t = self.q_norm(query_states_t).transpose(1, 2)
         query_states_hw = self.q_norm_hw(query_states_hw).transpose(1, 2)
         query_states_h, query_states_w = query_states_hw.chunk(2, dim=-1)
 
-        key_states = self.k_proj(hidden_states).view(hidden_shape)
+        key_states = _linear_output(self.k_proj, hidden_states).view(hidden_shape)
         key_states_t, key_states_hw = key_states.chunk(2, dim=-1)
         key_states_t = self.k_norm(key_states_t).transpose(1, 2)
         key_states_hw = self.k_norm_hw(key_states_hw).transpose(1, 2)
         key_states_h, key_states_w = key_states_hw.chunk(2, dim=-1)
 
-        value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+        value_states = (
+            _linear_output(self.v_proj, hidden_states)
+            .view(hidden_shape)
+            .transpose(1, 2)
+        )
 
-        cos_t, sin_t = self.rotary_emb(
-            hidden_states, position_ids_from_indexes(indexes, 0)
+        (cos_t, sin_t), (cos_h, sin_h), (cos_w, sin_w) = self._resolve_rope_tables(
+            indexes, hidden_states, position_embeddings
         )
         query_states_t, key_states_t = apply_rotary_pos_emb(
             query_states_t, key_states_t, cos_t, sin_t
         )
-
-        cos_h, sin_h = self.rotary_emb_hw(
-            hidden_states, position_ids_from_indexes(indexes, 1)
-        )
         query_states_h, key_states_h = apply_rotary_pos_emb(
             query_states_h, key_states_h, cos_h, sin_h
-        )
-
-        cos_w, sin_w = self.rotary_emb_hw(
-            hidden_states, position_ids_from_indexes(indexes, 2)
         )
         query_states_w, key_states_w = apply_rotary_pos_emb(
             query_states_w, key_states_w, cos_w, sin_w
@@ -770,7 +946,7 @@ class Qwen3Attention(nn.Module):
         )
 
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
-        attn_output = self.o_proj(attn_output)
+        attn_output = _linear_output(self.o_proj, attn_output)
         return attn_output, attn_weights
 
     # def forward_gen(
@@ -855,6 +1031,7 @@ class Qwen3Attention(nn.Module):
         attention_mask: Optional[torch.Tensor],
         past_key_values: Optional[Cache] = None,
         cache_position: Optional[torch.LongTensor] = None,
+        position_embeddings: Optional[PositionEmbeddings] = None,
         **kwargs: Unpack[FlashAttentionKwargs],
     ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
         input_shape = hidden_states.shape[:-1]
@@ -867,7 +1044,9 @@ class Qwen3Attention(nn.Module):
         # Flash layout:
         #   q/k/v: [B, S, H, D]
         # -----------------------------
-        query_states = self.q_proj_mot_gen(hidden_states).view(hidden_shape)
+        query_states = _linear_output(self.q_proj_mot_gen, hidden_states).view(
+            hidden_shape
+        )
         query_states_t, query_states_hw = query_states.chunk(2, dim=-1)
         query_states_t = self.q_norm_mot_gen(query_states_t).transpose(
             1, 2
@@ -875,33 +1054,29 @@ class Qwen3Attention(nn.Module):
         query_states_hw = self.q_norm_hw_mot_gen(query_states_hw).transpose(1, 2)
         query_states_h, query_states_w = query_states_hw.chunk(2, dim=-1)
 
-        key_states = self.k_proj_mot_gen(hidden_states).view(hidden_shape)
+        key_states = _linear_output(self.k_proj_mot_gen, hidden_states).view(
+            hidden_shape
+        )
         key_states_t, key_states_hw = key_states.chunk(2, dim=-1)
         key_states_t = self.k_norm_mot_gen(key_states_t).transpose(1, 2)  # [B,H,S,D/2]
         key_states_hw = self.k_norm_hw_mot_gen(key_states_hw).transpose(1, 2)
         key_states_h, key_states_w = key_states_hw.chunk(2, dim=-1)
 
         value_states = (
-            self.v_proj_mot_gen(hidden_states).view(hidden_shape).transpose(1, 2)
+            _linear_output(self.v_proj_mot_gen, hidden_states)
+            .view(hidden_shape)
+            .transpose(1, 2)
         )  # [B,H,S,D]
 
         # RoPE
-        cos_t, sin_t = self.rotary_emb(
-            hidden_states, position_ids_from_indexes(indexes, 0)
+        (cos_t, sin_t), (cos_h, sin_h), (cos_w, sin_w) = self._resolve_rope_tables(
+            indexes, hidden_states, position_embeddings
         )
         query_states_t, key_states_t = apply_rotary_pos_emb(
             query_states_t, key_states_t, cos_t, sin_t
         )
-
-        cos_h, sin_h = self.rotary_emb_hw(
-            hidden_states, position_ids_from_indexes(indexes, 1)
-        )
         query_states_h, key_states_h = apply_rotary_pos_emb(
             query_states_h, key_states_h, cos_h, sin_h
-        )
-
-        cos_w, sin_w = self.rotary_emb_hw(
-            hidden_states, position_ids_from_indexes(indexes, 2)
         )
         query_states_w, key_states_w = apply_rotary_pos_emb(
             query_states_w, key_states_w, cos_w, sin_w
@@ -1032,7 +1207,7 @@ class Qwen3Attention(nn.Module):
             )  # [B, S_q, H_q, D]
 
             attn_output = attn_output.reshape(*input_shape, -1).contiguous()
-            attn_output = self.o_proj_mot_gen(attn_output)
+            attn_output = _linear_output(self.o_proj_mot_gen, attn_output)
             return attn_output, None
 
         # ------------------------------------------------------------------
@@ -1069,7 +1244,7 @@ class Qwen3Attention(nn.Module):
         )
 
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
-        attn_output = self.o_proj_mot_gen(attn_output)
+        attn_output = _linear_output(self.o_proj_mot_gen, attn_output)
         return attn_output, attn_weights
 
     @deprecate_kwarg("past_key_value", new_name="past_key_values", version="4.58")
@@ -1083,6 +1258,7 @@ class Qwen3Attention(nn.Module):
         attention_mask: Optional[torch.Tensor],
         past_key_values: Optional[Cache] = None,
         cache_position: Optional[torch.LongTensor] = None,
+        position_embeddings: Optional[PositionEmbeddings] = None,
         **kwargs: Unpack[FlashAttentionKwargs],
     ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
         if exist_non_image_gen_tokens and not exist_image_gen_tokens:
@@ -1092,6 +1268,7 @@ class Qwen3Attention(nn.Module):
                 attention_mask,
                 past_key_values,
                 cache_position,
+                position_embeddings=position_embeddings,
                 **kwargs,
             )
         if not exist_non_image_gen_tokens and exist_image_gen_tokens:
@@ -1101,6 +1278,7 @@ class Qwen3Attention(nn.Module):
                 attention_mask,
                 past_key_values,
                 cache_position,
+                position_embeddings=position_embeddings,
                 **kwargs,
             )
 
@@ -1122,12 +1300,12 @@ class Qwen3Attention(nn.Module):
             (*input_shape, self.config.num_attention_heads * self.head_dim)
         )
         if exist_non_image_gen_tokens:
-            query_states[~image_gen_indicators] = self.q_proj(
-                hidden_states[~image_gen_indicators]
+            query_states[~image_gen_indicators] = _linear_output(
+                self.q_proj, hidden_states[~image_gen_indicators]
             )
         if exist_image_gen_tokens:
-            query_states[image_gen_indicators] = self.q_proj_mot_gen(
-                hidden_states[image_gen_indicators]
+            query_states[image_gen_indicators] = _linear_output(
+                self.q_proj_mot_gen, hidden_states[image_gen_indicators]
             )
         query_states = query_states.view(hidden_shape)  # [B, S, H, D]
         query_states_t, query_states_hw = query_states.chunk(2, dim=-1)
@@ -1159,12 +1337,12 @@ class Qwen3Attention(nn.Module):
             (*input_shape, self.config.num_key_value_heads * self.head_dim)
         )
         if exist_non_image_gen_tokens:
-            key_states[~image_gen_indicators] = self.k_proj(
-                hidden_states[~image_gen_indicators]
+            key_states[~image_gen_indicators] = _linear_output(
+                self.k_proj, hidden_states[~image_gen_indicators]
             )
         if exist_image_gen_tokens:
-            key_states[image_gen_indicators] = self.k_proj_mot_gen(
-                hidden_states[image_gen_indicators]
+            key_states[image_gen_indicators] = _linear_output(
+                self.k_proj_mot_gen, hidden_states[image_gen_indicators]
             )
         key_states = key_states.view(hidden_shape)  # [B, S, H_kv, D]
         key_states_t, key_states_hw = key_states.chunk(2, dim=-1)
@@ -1196,31 +1374,23 @@ class Qwen3Attention(nn.Module):
             (*input_shape, self.config.num_key_value_heads * self.head_dim)
         )
         if exist_non_image_gen_tokens:
-            value_states[~image_gen_indicators] = self.v_proj(
-                hidden_states[~image_gen_indicators]
+            value_states[~image_gen_indicators] = _linear_output(
+                self.v_proj, hidden_states[~image_gen_indicators]
             )
         if exist_image_gen_tokens:
-            value_states[image_gen_indicators] = self.v_proj_mot_gen(
-                hidden_states[image_gen_indicators]
+            value_states[image_gen_indicators] = _linear_output(
+                self.v_proj_mot_gen, hidden_states[image_gen_indicators]
             )
         value_states = value_states.view(hidden_shape).transpose(1, 2)
 
-        cos_t, sin_t = self.rotary_emb(
-            hidden_states, position_ids_from_indexes(indexes, 0)
+        (cos_t, sin_t), (cos_h, sin_h), (cos_w, sin_w) = self._resolve_rope_tables(
+            indexes, hidden_states, position_embeddings
         )
         query_states_t, key_states_t = apply_rotary_pos_emb(
             query_states_t, key_states_t, cos_t, sin_t
         )
-
-        cos_h, sin_h = self.rotary_emb_hw(
-            hidden_states, position_ids_from_indexes(indexes, 1)
-        )
         query_states_h, key_states_h = apply_rotary_pos_emb(
             query_states_h, key_states_h, cos_h, sin_h
-        )
-
-        cos_w, sin_w = self.rotary_emb_hw(
-            hidden_states, position_ids_from_indexes(indexes, 2)
         )
         query_states_w, key_states_w = apply_rotary_pos_emb(
             query_states_w, key_states_w, cos_w, sin_w
@@ -1273,12 +1443,12 @@ class Qwen3Attention(nn.Module):
 
         _attn_output = attn_output.new_zeros((*input_shape, self.config.hidden_size))
         if exist_non_image_gen_tokens:
-            _attn_output[~image_gen_indicators] = self.o_proj(
-                attn_output[~image_gen_indicators]
+            _attn_output[~image_gen_indicators] = _linear_output(
+                self.o_proj, attn_output[~image_gen_indicators]
             )
         if exist_image_gen_tokens:
-            _attn_output[image_gen_indicators] = self.o_proj_mot_gen(
-                attn_output[image_gen_indicators]
+            _attn_output[image_gen_indicators] = _linear_output(
+                self.o_proj_mot_gen, attn_output[image_gen_indicators]
             )
 
         attn_output = _attn_output
@@ -1320,6 +1490,7 @@ class Qwen3DecoderLayer(GradientCheckpointingLayer):
         past_key_values: Optional[Cache] = None,
         use_cache: Optional[bool] = False,
         cache_position: Optional[torch.LongTensor] = None,
+        position_embeddings: Optional[PositionEmbeddings] = None,
         **kwargs: Unpack[TransformersKwargs],
     ) -> torch.Tensor:
         residual = hidden_states
@@ -1336,6 +1507,7 @@ class Qwen3DecoderLayer(GradientCheckpointingLayer):
             past_key_values=past_key_values,
             use_cache=use_cache,
             cache_position=cache_position,
+            position_embeddings=position_embeddings,
             **kwargs,
         )
         hidden_states = residual + hidden_states
@@ -1359,6 +1531,7 @@ class Qwen3DecoderLayer(GradientCheckpointingLayer):
         past_key_values: Optional[Cache] = None,
         use_cache: Optional[bool] = False,
         cache_position: Optional[torch.LongTensor] = None,
+        position_embeddings: Optional[PositionEmbeddings] = None,
         **kwargs: Unpack[TransformersKwargs],
     ) -> torch.Tensor:
         residual = hidden_states
@@ -1375,6 +1548,7 @@ class Qwen3DecoderLayer(GradientCheckpointingLayer):
             past_key_values=past_key_values,
             use_cache=use_cache,
             cache_position=cache_position,
+            position_embeddings=position_embeddings,
             **kwargs,
         )
         hidden_states = residual + hidden_states
@@ -1399,6 +1573,7 @@ class Qwen3DecoderLayer(GradientCheckpointingLayer):
         past_key_values: Optional[Cache] = None,
         use_cache: Optional[bool] = False,
         cache_position: Optional[torch.LongTensor] = None,
+        position_embeddings: Optional[PositionEmbeddings] = None,
         **kwargs: Unpack[TransformersKwargs],
     ) -> torch.Tensor:
         if exist_non_image_gen_tokens and not exist_image_gen_tokens:
@@ -1413,6 +1588,7 @@ class Qwen3DecoderLayer(GradientCheckpointingLayer):
                 past_key_values,
                 use_cache,
                 cache_position,
+                position_embeddings=position_embeddings,
                 **kwargs,
             )
         if not exist_non_image_gen_tokens and exist_image_gen_tokens:
@@ -1427,6 +1603,7 @@ class Qwen3DecoderLayer(GradientCheckpointingLayer):
                 past_key_values,
                 use_cache,
                 cache_position,
+                position_embeddings=position_embeddings,
                 **kwargs,
             )
 
@@ -1461,6 +1638,7 @@ class Qwen3DecoderLayer(GradientCheckpointingLayer):
             past_key_values=past_key_values,
             use_cache=use_cache,
             cache_position=cache_position,
+            position_embeddings=position_embeddings,
             **kwargs,
         )
         hidden_states = residual + hidden_states
@@ -1510,9 +1688,14 @@ class Qwen3Model(Qwen3PreTrainedModel):
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
 
-        self.embed_tokens = nn.Embedding(
-            config.vocab_size, config.hidden_size, self.padding_idx
-        )
+        if getattr(config, "use_sglang_tp", False):
+            self.embed_tokens = VocabParallelEmbedding(
+                config.vocab_size, config.hidden_size
+            )
+        else:
+            self.embed_tokens = nn.Embedding(
+                config.vocab_size, config.hidden_size, self.padding_idx
+            )
         self.layers = nn.ModuleList(
             [
                 Qwen3DecoderLayer(config, layer_idx)
@@ -1543,6 +1726,7 @@ class Qwen3Model(Qwen3PreTrainedModel):
         inputs_embeds: Optional[torch.FloatTensor] = None,
         use_cache: Optional[bool] = None,
         cache_position: Optional[torch.LongTensor] = None,
+        image_only: bool = False,
         **kwargs: Unpack[TransformersKwargs],
     ) -> BaseModelOutputWithPast:
 
@@ -1550,7 +1734,11 @@ class Qwen3Model(Qwen3PreTrainedModel):
         # assert cache_position is not None
         # assert past_key_values is not None
 
-        if image_gen_indicators is None:
+        # Denoising callers know the token type without reading GPU scalars.
+        if image_only:
+            exist_non_image_gen_tokens = False
+            exist_image_gen_tokens = True
+        elif image_gen_indicators is None:
             exist_non_image_gen_tokens = True
             exist_image_gen_tokens = False
         else:
@@ -1623,18 +1811,34 @@ class Qwen3Model(Qwen3PreTrainedModel):
 
         hidden_states = inputs_embeds
 
-        for decoder_layer in self.layers[: self.config.num_hidden_layers]:
+        layers = cache_dit_decoder_layers(
+            self,
+            update_cache=kwargs.get("update_cache", True),
+            exist_non_image_gen_tokens=exist_non_image_gen_tokens,
+            exist_image_gen_tokens=exist_image_gen_tokens,
+        )
+        # Precompute shared RoPE tables. Attention layers rebuild them if
+        # normalization changes the activation dtype.
+        position_embeddings = None
+        if layers:
+            position_embeddings = layers[0].self_attn._resolve_rope_tables(
+                indexes, hidden_states
+            )
+
+        for decoder_layer in layers[: self.config.num_hidden_layers]:
+            attention_type = cache_dit_attention_type(self, decoder_layer)
             hidden_states = decoder_layer(
                 hidden_states,
                 image_gen_indicators=image_gen_indicators,
                 exist_non_image_gen_tokens=exist_non_image_gen_tokens,
                 exist_image_gen_tokens=exist_image_gen_tokens,
                 indexes=indexes,
-                attention_mask=causal_mask_mapping[decoder_layer.attention_type],
+                attention_mask=causal_mask_mapping[attention_type],
                 position_ids=position_ids,
                 past_key_values=past_key_values,
                 use_cache=use_cache,
                 cache_position=cache_position,
+                position_embeddings=position_embeddings,
                 **kwargs,
             )
         if not exist_image_gen_tokens:
@@ -1667,7 +1871,15 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
         super().__init__(config)
         self.model = Qwen3Model(config)
         self.vocab_size = config.vocab_size
-        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        if getattr(config, "use_sglang_tp", False):
+            self.lm_head = ColumnParallelLinear(
+                config.hidden_size,
+                config.vocab_size,
+                bias=False,
+                gather_output=True,
+            )
+        else:
+            self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
         # Initialize weights and apply final processing
         self.post_init()
@@ -1729,7 +1941,7 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
             if isinstance(logits_to_keep, int)
             else logits_to_keep
         )
-        logits = self.lm_head(hidden_states[:, slice_indices, :])
+        logits = _linear_output(self.lm_head, hidden_states[:, slice_indices, :])
 
         loss = None
         if labels is not None:

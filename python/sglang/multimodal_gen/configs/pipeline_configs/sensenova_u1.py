@@ -77,12 +77,20 @@ def _set_compatible_runtime_defaults(server_args) -> None:
 
 @dataclass
 class SenseNovaU1PipelineConfig(PipelineConfig):
-    """Native SenseNova-U1 text-to-image pipeline configuration."""
+    """Native SenseNova-U1 text-to-image and image-editing pipeline configuration."""
 
-    task_type: ModelTaskType = ModelTaskType.T2I
+    task_type: ModelTaskType = ModelTaskType.TI2I
     model_precision: str = "bf16"
     should_use_guidance: bool = True
     supports_cfg_parallel: bool = False
+
+    def calculate_condition_image_size(self, image, width, height):
+        del image, width, height
+        return None
+
+    def prepare_calculated_size(self, image):
+        del image
+        return None
 
     def supports_dynamic_batching(self):
         return True
@@ -107,24 +115,59 @@ class SenseNovaU1PipelineConfig(PipelineConfig):
         return False
 
     def supports_sequential_multi_output_inference(self):
-        return True
+        return False
+
+    @staticmethod
+    def validate_parallelism(server_args) -> None:
+        """Validate DP x TP serving for the supported U1.5 dense checkpoint."""
+        num_gpus = int(server_args.num_gpus)
+        dp_size = int(getattr(server_args, "dp_size", 1) or 1)
+        tp_size = int(getattr(server_args, "tp_size", 1) or 1)
+        sp_degree = int(getattr(server_args, "sp_degree", 1) or 1)
+        if tp_size not in (1, 2, 4, 8):
+            raise ValueError(
+                "SenseNova-U1.5-8B-MoT supports --tp-size 1, 2, 4, or 8; "
+                f"got {tp_size}."
+            )
+        if sp_degree != 1:
+            raise ValueError(
+                "SenseNova-U1.5-8B-MoT tensor parallelism requires --sp-degree 1."
+            )
+        if (
+            bool(getattr(server_args, "enable_cfg_parallel", False))
+            or int(getattr(server_args, "cfg_parallel_degree", 1) or 1) != 1
+        ):
+            raise ValueError(
+                "SenseNova-U1.5-8B-MoT does not support CFG parallelism yet."
+            )
+        if num_gpus != dp_size * tp_size:
+            raise ValueError(
+                "SenseNova-U1.5-8B-MoT requires num_gpus == dp_size * tp_size "
+                f"with SP/CFG disabled; got {num_gpus} != {dp_size} * {tp_size}."
+            )
+
+    @staticmethod
+    def validate_single_gpu_replica(server_args) -> None:
+        """Backward-compatible entry point for the former DP-only validation."""
+        SenseNovaU1PipelineConfig.validate_parallelism(server_args)
 
     def validate_server_args(self, server_args) -> None:
-        if server_args.num_gpus != 1:
+        self.validate_parallelism(server_args)
+        if getattr(server_args, "use_fsdp_inference", False):
+            raise ValueError("SenseNova-U1.5-8B-MoT does not support FSDP inference.")
+        if getattr(server_args, "direct_gpu_weight_loading", False):
             raise ValueError(
-                "SenseNovaU1Pipeline currently supports num_gpus=1. "
-                "Native tensor/pipeline parallelism is not implemented yet."
+                "SenseNova-U1.5-8B-MoT uses rank-local safetensors loading; "
+                "--direct-gpu-weight-loading is unsupported."
             )
         if getattr(server_args, "enable_torch_compile", False):
             raise ValueError(
                 "SenseNovaU1Pipeline does not support torch.compile yet. "
                 "Please omit --enable-torch-compile."
             )
-        if getattr(server_args, "lora_path", None):
-            raise ValueError(
-                "SenseNovaU1Pipeline does not support LoRA adapters yet. "
-                "Please omit --lora-path."
-            )
+        if getattr(server_args, "lora_target_modules", None) is None:
+            # The official adapter only targets the generation branch.
+            server_args.lora_target_modules = ["_mot_gen"]
         _set_compatible_runtime_defaults(server_args)
         if _is_arg_explicitly_set(
             server_args, "component_residency"

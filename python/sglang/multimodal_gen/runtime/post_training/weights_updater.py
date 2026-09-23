@@ -46,6 +46,9 @@ from typing import Any
 import torch
 from torch.distributed.tensor import DTensor, distribute_tensor
 
+from sglang.multimodal_gen.runtime.cache.conditioning import (
+    invalidate_conditioning_caches,
+)
 from sglang.multimodal_gen.runtime.cache.teacache import TeaCacheMixin
 from sglang.multimodal_gen.runtime.loader.utils import (
     _list_safetensors_files,
@@ -369,6 +372,7 @@ class WeightsUpdater:
         target_modules: list[str] | None = None,
     ) -> tuple[bool, str]:
         """Update model weights from disk without restarting the server."""
+        invalidate_conditioning_caches()
         logger.info(f"Updating weights from disk: {model_path}")
 
         try:
@@ -531,6 +535,7 @@ class WeightsUpdater:
         lora_alpha: int | None = None,
         lora_rank: int | None = None,
     ) -> tuple[bool, str]:
+        invalidate_conditioning_caches()
         if weight_update_mode == LORA_MERGE_WEIGHT_UPDATE_MODE:
             return self._update_lora_from_tensor(
                 named_tensors=named_tensors,

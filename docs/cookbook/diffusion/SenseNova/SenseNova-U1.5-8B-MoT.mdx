@@ -78,9 +78,104 @@ with open("output_sensenova_u15.png", "wb") as f:
     f.write(image_bytes)
 ```
 
+### 4.2 Generate Multiple Outputs per Prompt
+
+SenseNova-U1 multi-output generation: Requests with n > 1 use native batched generation. The prompt prefix is processed once and reused across outputs, while each output keeps an independent random generator/seed. This avoids repeated prefix computation compared with sequential per-output execution.
+
+```python API example
+import requests
+
+response = requests.post(
+    "http://localhost:30000/v1/images/generations",
+    json={
+        "model": "SenseNova/SenseNova-U1-8B-MoT",
+        "prompt": "A red fox standing in a snowy forest",
+        "n": 4,
+        "seed": 42,
+        "size": "1024x1024",
+    },
+)
+
+response.raise_for_status()
+```
+For a base seed of 42 and n=4, SGLang preserves deterministic per-output RNG streams corresponding to seeds 42, 43, 44, and 45.
+
+### 4.3 Edit an Image
+
+```python Example
+from openai import OpenAI
+
+client = OpenAI(api_key="EMPTY", base_url="http://localhost:30000/v1")
+
+response = client.images.edit(
+    model="sensenova/SenseNova-U1.5-8B-MoT",
+    image=open("image_google.png", "rb"),
+    prompt='Replace the text "Google" with "Goose".',
+    n=1,
+    response_format="url",
+    extra_body={
+        "seed": 42,
+        "guidance_scale": 4.0,
+        "num_inference_steps": 50,
+    },
+)
+```
+
 ## 5. Advanced usage
 
-### 5.1 Dynamic request batching
+### 5.1 Cache-DiT acceleration
+
+SGLang integrates [Cache-DiT](https://github.com/vipshop/cache-dit), a caching acceleration engine for Diffusion Transformers (DiT), to speed up inference with minimal quality loss. Enable it by setting `SGLANG_CACHE_DIT_ENABLED=true`. For more details, see the SGLang Cache-DiT [documentation](/docs/sglang-diffusion/cache_dit).
+
+**Basic usage**
+
+```bash Command
+SGLANG_CACHE_DIT_ENABLED=true sglang serve \
+  --model-path sensenova/SenseNova-U1.5-8B-MoT \
+  --port 30000
+```
+
+You can also enable it for a single offline job:
+
+```bash Command
+sglang generate \
+  --model-path sensenova/SenseNova-U1.5-8B-MoT \
+  --prompt "A cinematic mountain lake at sunrise, realistic photography." \
+  --width 2048 \
+  --height 2048 \
+  --guidance-scale 4.0 \
+  --num-inference-steps 50 \
+  --seed 42 \
+  --enable-cache-dit true \
+  --output-file-path output_sensenova_u15.png
+```
+
+**Advanced usage**
+
+SenseNova-U1 is supported for DBCache only, and only for requests that keep a stable cond/uncond pair per denoising step:
+
+- **DBCache knobs only.** `--cache-dit-params` accepts `Fn_compute_blocks`, `Bn_compute_blocks`, `max_warmup_steps`, `residual_diff_threshold`, and `max_continuous_cached_steps`. TaylorSeer and SCM keys are rejected with an error.
+- **Full-interval CFG only.** With `--guidance-scale` above `1.0`, Cache-DiT is skipped unless `cfg_interval` stays `(0, 1)`. Timestep-gated CFG produces a varying number of forwards per step, which the cache context cannot track.
+- **Breakable CUDA graphs win.** Under `--enable-breakable-cuda-graph` the per-request Cache-DiT switch is ignored and a warning is logged.
+
+SenseNova's text, prefix, and Think forwards share the Qwen3 decoder with the image denoising pass. Only the image denoising pass is wrapped, so enabling the cache does not change prompt understanding or the Think text.
+
+**Conservative preset for long-text benchmarks**
+
+For text-heavy evaluation datasets such as `longtext-bench`, start with the following conservative Cache-DiT settings:
+
+```bash
+export SGLANG_CACHE_DIT_ENABLED=true
+export SGLANG_CACHE_DIT_FN=4
+export SGLANG_CACHE_DIT_BN=2
+export SGLANG_CACHE_DIT_WARMUP=8
+export SGLANG_CACHE_DIT_RDT=0.10
+export SGLANG_CACHE_DIT_MC=1
+```
+
+This preset computes more transformer blocks, uses a longer warmup, applies a stricter residual threshold, and limits consecutive cached steps. It prioritizes text and layout fidelity over maximum acceleration. Treat it as a starting point and validate output quality on your target prompts.
+
+### 5.2 Dynamic request batching
 
 Start the server with dynamic batching enabled:
 
@@ -97,7 +192,60 @@ in one batch must use the same resolution, inference steps, guidance settings,
 and output options. Requests with multiple outputs or `think_mode=true` are
 executed sequentially.
 
-### 5.2 Ascend NPU optimizations
+### 5.2 Tensor-parallel serving
+
+On Linux with NVIDIA CUDA or Ascend NPU, shard the dense language backbone of
+`sensenova/SenseNova-U1.5-8B-MoT` across one replica when it does not fit on one
+device. This example uses two devices:
+
+```bash Command
+sglang serve \
+  --model-path sensenova/SenseNova-U1.5-8B-MoT \
+  --num-gpus 2 \
+  --dp-size 1 \
+  --tp-size 2 \
+  --sp-degree 1 \
+  --port 30000
+```
+
+The supported TP sizes are `1`, `2`, `4`, and `8`. TP shards the Qwen3 attention
+projections, MLP projections, token embedding, and LM head. The vision encoders
+and flow-matching modules remain replicated on every TP rank. Sequence
+parallelism, CFG parallelism, FSDP inference, and direct GPU weight loading are
+not supported for this checkpoint.
+
+### 5.3 Data-parallel serving
+
+Use one complete replica per GPU to increase throughput for concurrent requests:
+
+```bash Command
+sglang serve \
+  --model-path sensenova/SenseNova-U1.5-8B-MoT \
+  --num-gpus 2 \
+  --dp-size 2 \
+  --tp-size 1 \
+  --sp-degree 1 \
+  --port 30000
+```
+
+You can also combine DP and TP. The device count must equal `dp-size * tp-size`;
+for example, two TP2 replicas require four devices:
+
+```bash Command
+sglang serve \
+  --model-path sensenova/SenseNova-U1.5-8B-MoT \
+  --num-gpus 4 \
+  --dp-size 2 \
+  --tp-size 2 \
+  --sp-degree 1 \
+  --port 30000
+```
+
+Generation requests are distributed across DP replicas. DP does not reduce the
+latency of one request, and every replica must have enough aggregate memory for
+the complete model and its request-time activations.
+
+### 5.4 Ascend NPU optimizations
 
 On Ascend NPU, SenseNova-U1 automatically uses fused inference attention,
 RMSNorm, and SwiGLU MLP operators for supported inputs. FIA and SwiGLU fall back
@@ -109,7 +257,7 @@ first use.
 
 ### 6.1 Speedup benchmark
 
-#### 6.1.1 Single-run profile
+#### 6.1.1 Generate an Image
 
 <Tabs>
   <Tab title="NVIDIA A800">
@@ -182,3 +330,53 @@ first use.
 
   </Tab>
 </Tabs>
+
+#### 6.1.2 Edit an Image
+
+**Server Command**:
+
+```shell Command
+sglang serve \
+  --model-path sensenova/SenseNova-U1.5-8B-MoT \
+  --port 30000
+```
+
+**Benchmark Command**:
+
+```shell Command
+python3 -m sglang.multimodal_gen.benchmarks.bench_serving \
+  --dataset vbench \
+  --task image-to-image \
+  --num-prompts 1 \
+  --max-concurrency 1 \
+  --port 30000
+```
+
+**Result**:
+
+```text Output
+================= Serving Benchmark Result =================
+Task:                                         image-to-image
+Model:                                        /model/ModelScope/SenseNova/SenseNova-U1.5-8B-MoT
+Dataset:                                      vbench
+--------------------------------------------------
+Benchmark duration (s):                       55.73
+Request rate:                                 inf
+Max request concurrency:                      1
+Successful requests:                          1/1
+Completed outputs:                            1
+Outputs per prompt:                           1
+--------------------------------------------------
+Request throughput (req/s):                   0.02
+Output throughput (outputs/s):                0.02
+Latency Mean (s):                             55.73
+Latency Median (s):                           55.73
+Latency P90 (s):                              55.73
+Latency P95 (s):                              55.73
+Latency P99 (s):                              55.73
+--------------------------------------------------
+Peak Memory Max (MB):                         41554.00
+Peak Memory Mean (MB):                        41554.00
+Peak Memory Median (MB):                      41554.00
+------------------------------------------------------------
+```
