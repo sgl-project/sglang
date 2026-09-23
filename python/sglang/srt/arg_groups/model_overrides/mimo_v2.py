@@ -27,8 +27,14 @@ def _mimo_v2_overrides(server_args: Any, hf_config: Any) -> dict:
 
     # On Blackwell "auto" falls through to the triton fused-MoE runner, ~12%
     # slower at bs=1 decode. FP4 checkpoints use flashinfer_mxfp4 instead.
+    #
+    # Only when there is no EP all-to-all backend: flashinfer_trtllm has no fused
+    # func registered for deepep/deepep_v2, so forcing it there turns a working
+    # "auto" (which resolves to deep_gemm) into a NotImplementedError at model
+    # init. Same guard the glm4_moe / qwen3_moe / deepseek_v4 overrides carry.
     if (
         get_platform().is_sm100
+        and cfg.moe_a2a_backend == "none"
         and cfg.moe_runner_backend == "auto"
         and get_quantization_config(hf_config) == "fp8"
     ):
