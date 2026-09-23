@@ -550,7 +550,9 @@ class PixtralHFTransformerBlock(nn.Module):
         if hasattr(config, "original_num_attention_heads"):
             num_attention_heads = config.original_num_attention_heads
             num_dummy_heads = config.num_attention_heads - num_attention_heads
-            projection_size = projection_size // num_attention_heads * config.num_attention_heads
+            projection_size = (
+                projection_size // num_attention_heads * config.num_attention_heads
+            )
 
         # Use SGLang's VisionAttention instead of vLLM's PixtralHFAttention
         self.attention = VisionAttention(
