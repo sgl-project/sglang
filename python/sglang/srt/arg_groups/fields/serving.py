@@ -163,7 +163,7 @@ class Serving(msgspec.Struct):
     ] = None
     admin_api_key: A[
         Optional[str],
-        "Set admin API key for sensitive management endpoints (e.g. /clear_hicache_storage_backend). When set, admin endpoints require this key and do NOT accept --api-key.",
+        "Set admin API key for sensitive management endpoints (e.g. /hicache/storage-backend/clear). When set, admin endpoints require this key and do NOT accept --api-key.",
     ] = None
     served_model_name: A[
         Optional[str],
