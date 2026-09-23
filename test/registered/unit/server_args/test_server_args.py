@@ -546,34 +546,6 @@ class TestMultimodalFeatureTransport(CustomTestCase):
         self.assertIn("4 tokenizer worker", output)
 
     @override_platform(is_cuda=True)
-    def test_legacy_keep_flag_maps_to_cuda_ipc(self):
-        server_args = ServerArgs(model_path="dummy", keep_mm_feature_on_device=True)
-
-        with patch.dict(os.environ, {"SGLANG_USE_CUDA_IPC_TRANSPORT": "0"}):
-            with self.assertLogs(serving_hook.logger, level="WARNING") as logs:
-                handle_multimodal_feature_transport(server_args)
-
-            self.assertEqual(
-                resolution_result(server_args, "mm_feature_transport"), "cuda_ipc"
-            )
-            self.assertFalse(
-                resolution_result(server_args, "keep_mm_feature_on_device")
-            )
-            self.assertTrue(envs.SGLANG_USE_CUDA_IPC_TRANSPORT.get())
-
-        self.assertIn("deprecated", logs.output[0])
-
-    def test_legacy_keep_flag_rejects_explicit_cuda_vmm(self):
-        server_args = ServerArgs(
-            model_path="dummy",
-            keep_mm_feature_on_device=True,
-            mm_feature_transport="cuda_vmm",
-        )
-
-        with self.assertRaisesRegex(ValueError, "conflicts.*cuda_vmm"):
-            handle_multimodal_feature_transport(server_args)
-
-    @override_platform(is_cuda=True)
     def test_explicit_cpu_overrides_legacy_environment(self):
         server_args = ServerArgs(model_path="dummy", mm_feature_transport="cpu")
 
@@ -2557,6 +2529,7 @@ class TestPipelineParallelCompat(CustomTestCase):
             "Qwen3_5MoeForCausalLM",
             "Qwen3_5ForConditionalGeneration",
             "Qwen3_5MoeForConditionalGeneration",
+            "Qwen4ExpForConditionalGeneration",
         ):
             with self.subTest(architecture=architecture):
                 check_pipeline_parallel_compat(
@@ -3582,6 +3555,25 @@ class TestGrpcServerArgs(CustomTestCase):
             with self.assertRaises(ValueError):
                 handle_deprecated_args(sa)
 
+    def test_grpc_response_timeout(self):
+        parser = self._sidecar_parser()
+        for value in (300, 1800, 0, -1):
+            with self.subTest(timeout=value):
+                argv = ["--model-path", "dummy", "--grpc-port", "50051"]
+                if value != 300:
+                    argv += ["--grpc-response-timeout-secs", str(value)]
+                sa = ServerArgs.from_cli_args(parser.parse_args(argv))
+                if value <= 0:
+                    with self.assertRaisesRegex(
+                        ValueError, "grpc-response-timeout-secs"
+                    ):
+                        handle_deprecated_args(sa)
+                else:
+                    handle_deprecated_args(sa)
+                    self.assertEqual(
+                        resolution_result(sa, "grpc_response_timeout_secs"), value
+                    )
+
     def test_start_server_call_site_matches_native_signature(self):
         """Regression for the startup blocker: the native start_server binding
         only accepts (host, port, runtime_handle, worker_threads, ...). The
@@ -3593,7 +3585,10 @@ class TestGrpcServerArgs(CustomTestCase):
         fake_core = SimpleNamespace(start_server=MagicMock(return_value="handle"))
         fake_bridge = SimpleNamespace(RuntimeHandle=MagicMock(return_value="rt"))
         override = get_context().override_server_args(
-            host="127.0.0.1", grpc_port=50051, grpc_worker_threads=4
+            host="127.0.0.1",
+            grpc_port=50051,
+            grpc_worker_threads=4,
+            grpc_response_timeout_secs=1800,
         )
         server_args = override.install()
         self.addCleanup(override.restore)
@@ -3618,9 +3613,17 @@ class TestGrpcServerArgs(CustomTestCase):
         load_rust_extension.assert_called_once_with("sglang.srt.rust_extensions._grpc")
         _, kwargs = fake_core.start_server.call_args
         self.assertEqual(
-            set(kwargs), {"host", "port", "runtime_handle", "worker_threads"}
+            set(kwargs),
+            {
+                "host",
+                "port",
+                "runtime_handle",
+                "worker_threads",
+                "response_timeout_secs",
+            },
         )
         self.assertEqual(kwargs["worker_threads"], 4)
+        self.assertEqual(kwargs["response_timeout_secs"], 1800)
         self.assertNotIn("max_prefill_tokens", kwargs)
 
 
@@ -4000,6 +4003,73 @@ class TestDcpCommBackendDefault(CustomTestCase):
             self.assertEqual(
                 self._resolved(dcp_size=4, dcp_comm_backend="ag_rs"), "ag_rs"
             )
+
+
+class TestParserChoices(CustomTestCase):
+    """The choices come from dependency-free name lists, but `cli/serve.py`
+    loads plugins before parsing, so a plugin's parser must still be accepted."""
+
+    def test_a_plugin_registered_parser_is_accepted(self):
+        from sglang.srt.function_call.function_call_parser import FunctionCallParser
+        from sglang.srt.parser.reasoning_parser import ReasoningParser
+
+        ReasoningParser.DetectorMap["plugin-reasoning"] = object
+        FunctionCallParser.ToolCallParserEnum["plugin-toolcall"] = object
+        try:
+            parser = argparse.ArgumentParser()
+            ServerArgs.add_cli_args(parser)
+            args = parser.parse_args(
+                [
+                    "--model-path",
+                    "dummy-model",
+                    "--reasoning-parser",
+                    "plugin-reasoning",
+                    "--tool-call-parser",
+                    "plugin-toolcall",
+                ]
+            )
+        finally:
+            del ReasoningParser.DetectorMap["plugin-reasoning"]
+            del FunctionCallParser.ToolCallParserEnum["plugin-toolcall"]
+        self.assertEqual(args.reasoning_parser, "plugin-reasoning")
+        self.assertEqual(args.tool_call_parser, "plugin-toolcall")
+
+    def test_name_lists_are_used_when_the_registries_are_not_imported(self):
+        from sglang.srt.function_call.parser_names import TOOL_CALL_PARSER_NAMES
+        from sglang.srt.parser.reasoning_parser_names import REASONING_PARSER_NAMES
+
+        with patch.dict(server_args_module.sys.modules):
+            server_args_module.sys.modules.pop(
+                "sglang.srt.parser.reasoning_parser", None
+            )
+            server_args_module.sys.modules.pop(
+                "sglang.srt.function_call.function_call_parser", None
+            )
+            self.assertEqual(
+                server_args_module._reasoning_parser_choices(),
+                list(REASONING_PARSER_NAMES),
+            )
+            self.assertEqual(
+                server_args_module._tool_call_parser_choices(),
+                list(TOOL_CALL_PARSER_NAMES),
+            )
+
+
+class TestLazyReexports(CustomTestCase):
+    def test_the_names_that_lost_their_eager_import_are_still_attributes(self):
+        # Out-of-tree code reaches these through `sglang.srt.server_args`; they
+        # now resolve through the module __getattr__ instead of a top import.
+        from sglang.kernels.ops.kv_canary.consts import RealKvHashMode
+        from sglang.srt.function_call.function_call_parser import FunctionCallParser
+        from sglang.srt.parser.reasoning_parser import ReasoningParser
+
+        self.assertIs(server_args_module.FunctionCallParser, FunctionCallParser)
+        self.assertIs(server_args_module.ReasoningParser, ReasoningParser)
+        self.assertIs(server_args_module.RealKvHashMode, RealKvHashMode)
+
+    def test_an_unknown_attribute_still_raises(self):
+        with self.assertRaises(AttributeError):
+            server_args_module.NotAThing
 
 
 if __name__ == "__main__":

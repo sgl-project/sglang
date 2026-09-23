@@ -11,6 +11,7 @@ from unittest.mock import Mock, patch
 
 from parameterized import parameterized
 
+from sglang.srt.distributed import parallel_state
 from sglang.srt.managers import scheduler as scheduler_module
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import Scheduler
@@ -19,7 +20,11 @@ from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from sglang.test.test_utils import (
+    CustomTestCase,
+    enter_scope,
+    published_topology,
+)
 
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
@@ -57,6 +62,10 @@ def load_mlx_scheduler_module():
 
 
 class TestSchedulerIdleStepCounters(CustomTestCase):
+    def setUp(self):
+        super().setUp()
+        enter_scope(self, published_topology(role="scheduler"))
+
     @parameterized.expand(
         [
             (
@@ -168,11 +177,16 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
                 )
                 with (
                     patch(f"{PDMUX_MODULE}.get_current_stream_idx", return_value=0),
-                    patch(f"{PDMUX_MODULE}.set_pdmux_status"),
                     patch(f"{PDMUX_MODULE}.torch.cuda.empty_cache"),
                     patch(
                         f"{PDMUX_MODULE}.torch.cuda.stream",
                         side_effect=lambda stream: nullcontext(),
+                    ),
+                    # PD multiplexing requires a separate prefill communicator.
+                    patch.object(
+                        parallel_state,
+                        "_PDMUX_PREFILL_TP_GROUP",
+                        SimpleNamespace(world_size=1, rank_in_group=0),
                     ),
                 ):
                     self.run_and_check(
@@ -396,7 +410,6 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
         scheduler.forward_ct = 0
         scheduler.processed_tokens_counter = 0
         scheduler.spec_algorithm = SpeculativeAlgorithm.NONE
-        scheduler.ps = SimpleNamespace(pp_rank=0, attn_tp_rank=0, attn_cp_rank=0)
         scheduler._poll_timeout_aborts = Mock(return_value=[])
         scheduler.scheduler_stage_metrics = None
         scheduler.metrics_reporter = SimpleNamespace(record_scheduler_active=Mock())
@@ -445,7 +458,7 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
         return scheduler
 
     def prepare_pp_scheduler(self, scheduler):
-        scheduler.ps.pp_size = 2
+        enter_scope(self, get_parallel().override(pp_size=2, pp_rank=0))
         scheduler.pp_group = SimpleNamespace(is_last_rank=True)
         scheduler.forward_stream_ctx = nullcontext()
         scheduler.forward_stream = Mock()
