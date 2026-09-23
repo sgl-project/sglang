@@ -45,6 +45,7 @@ from sglang.srt.arg_groups.model_override_base import (  # noqa: F401
     _invoke_provider,
     _register_for,
     attention_backends_of,
+    ep_offset_joiner_of,
     get_default_attn_backend,
     is_attention_backend_not_set,
     mamba_extra_buffer_of,
@@ -1311,7 +1312,9 @@ def _page_size_default(view: Any) -> dict:
 
 @register_post_process
 def _data_parallelism_defaults(view: Any) -> dict:
-    if num_dp_ranks_of(view) == 1 and view.ep_join_mode != "scale":
+    # A recover joiner is excluded alongside a scale joiner: it also runs with one DP
+    # rank of its own and must keep the primary's dp_attention settings.
+    if num_dp_ranks_of(view) == 1 and view.ep_join_mode not in ("scale", "recover"):
         return {"enable_dp_lm_head": False}
     return {}
 
