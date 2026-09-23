@@ -439,20 +439,23 @@ class CompressorAscendBackendMixin:
         if os.environ.get("DSV4_DUMP"):
             import hashlib
 
-            def _dump_in(name, t):
-                _a = t.detach().to(torch.float32).cpu().numpy()
-                print(
-                    f"[CIN] L{compressor.layer_id} r{ratio} {name} shape={tuple(t.shape)} "
-                    f"sum={_a.sum():.4f} absmax={abs(_a).max():.4f} "
-                    f"md5={hashlib.md5(_a.tobytes()).hexdigest()[:16]}",
-                    flush=True,
+            def _fmt(t):
+                a = t.detach().to(torch.float32).cpu().numpy()
+                if a.size == 0:
+                    return "sum=0 absmax=0 md5=empty", a
+                return (
+                    f"sum={a.sum():.4f} absmax={abs(a).max():.4f} "
+                    f"md5={hashlib.md5(a.tobytes()).hexdigest()[:16]}",
+                    a,
                 )
 
-            _dump_in("x", x)
-            _dump_in("state_cache", state_cache)
-            _dump_in("table", state_block_table)
+            _tag = f"L{compressor.layer_id} r{ratio} idx={int(compressor.is_in_indexer)}"
+
+            for _name, _t in (("x", x), ("state_cache", state_cache), ("table", state_block_table)):
+                _s, _ = _fmt(_t)
+                print(f"[CIN] {_tag} {_name} shape={tuple(_t.shape)} {_s}", flush=True)
             print(
-                f"[CIN] L{compressor.layer_id} r{ratio} start_pos={fm.start_pos.tolist()} "
+                f"[CIN] {_tag} start_pos={fm.start_pos.tolist()} "
                 f"seqused={fm.seqused.tolist()} cu={fm.actual_seq_lengths_q_pa.tolist()}",
                 flush=True,
             )
@@ -508,10 +511,15 @@ class CompressorAscendBackendMixin:
             import hashlib
 
             _a = cmp_kv.detach().to(torch.float32).cpu().numpy()
+            _s = (
+                "sum=0 absmax=0 md5=empty"
+                if _a.size == 0
+                else f"sum={_a.sum():.4f} absmax={abs(_a).max():.4f} "
+                f"md5={hashlib.md5(_a.tobytes()).hexdigest()[:16]}"
+            )
             print(
-                f"[COUT] L{compressor.layer_id} r{ratio} n={cmp_kv.shape[0]} "
-                f"sum={_a.sum():.4f} absmax={abs(_a).max():.4f} "
-                f"md5={hashlib.md5(_a.tobytes()).hexdigest()[:16]}",
+                f"[COUT] L{compressor.layer_id} r{ratio} idx={int(compressor.is_in_indexer)} "
+                f"n={cmp_kv.shape[0]} {_s}",
                 flush=True,
             )
 
