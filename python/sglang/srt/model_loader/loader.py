@@ -180,31 +180,6 @@ def _get_quantization_config(
             }
         )
 
-    if _is_npu:
-        packed_modules_mapping.update(
-            {
-                "visual": {
-                    "qkv_proj": ["qkv"],
-                    "gate_up_proj": ["gate_proj", "up_proj"],
-                },
-                "vision_model": {
-                    "qkv_proj": ["q_proj", "k_proj", "v_proj"],
-                    "proj": ["out_proj"],
-                },
-                "model": {
-                    "qkv_proj": ["q_proj", "k_proj", "v_proj"],
-                    "gate_up_proj": ["gate_proj", "up_proj"],
-                    "fused_qkv_a_proj_with_mqa": [
-                        "q_a_proj",
-                        "kv_a_proj_with_mqa",
-                    ],
-                    "in_proj_qkvz": ["in_proj_qkv", "in_proj_z"],
-                    "in_proj_ba": ["in_proj_b", "in_proj_a"],
-                    "index_qkv_proj": ["index_q_proj", "index_k_proj"],
-                },
-            }
-        )
-
     if model_config.quantization is not None:
         quant_config = get_quant_config(
             model_config, load_config, packed_modules_mapping, remap_prefix

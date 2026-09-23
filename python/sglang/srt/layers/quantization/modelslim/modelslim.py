@@ -94,6 +94,33 @@ class ModelSlimConfig(QuantizationConfig):
 
     supports_kimi_k3_quantized_latent_projections = True
 
+    # Fused-name tables for the subtrees whose checkpoint naming differs from
+    # the language model. ModelSlim checkpoints fuse the vision tower
+    # differently: vision `attn.qkv_proj` reads one fused `attn.qkv`, while
+    # language `qkv_proj` reads the unfused q/k/v shards. One flat mapping
+    # cannot hold both meanings of `qkv_proj`, so each subtree carries its own
+    # table. `vision_model` is matched before `visual`, for a model that nests
+    # both names.
+    _VISION_PACKED_MODULES_MAPPING: Dict[str, Dict[str, List[str]]] = {
+        "vision_model": {
+            "qkv_proj": ["q_proj", "k_proj", "v_proj"],
+            "proj": ["out_proj"],
+        },
+        "visual": {
+            "qkv_proj": ["qkv"],
+            "gate_up_proj": ["gate_proj", "up_proj"],
+        },
+    }
+
+    # Defaults for the language model, used for the names a modeling file does
+    # not publish itself. The MLA models fuse q_a_proj + kv_a_proj_with_mqa at
+    # construction time and several never add the entry to their own mapping,
+    # so the fused name has no unfused counterpart without this.
+    _LANGUAGE_PACKED_MODULES_MAPPING: Dict[str, List[str]] = {
+        "gate_up_proj": ["gate_proj", "up_proj"],
+        "fused_qkv_a_proj_with_mqa": ["q_a_proj", "kv_a_proj_with_mqa"],
+    }
+
     def __init__(self, quant_config: Dict[str, Any] = {}):
         super().__init__()
         keys = [k for k in quant_config if isinstance(k, str)]
@@ -259,6 +286,22 @@ class ModelSlimConfig(QuantizationConfig):
     def from_config(cls, config: Dict[str, Any]) -> ModelSlimConfig:
         return cls(config)
 
+    def _packed_modules_mapping_for(self, prefix: str) -> Mapping[str, List[str]]:
+        """Fused-module mapping to use for `prefix`, scoped to its subtree.
+
+        A vision subtree uses its own table because a fused name there reads a
+        different checkpoint entry than the same name in the language model:
+        vision `qkv_proj` is one fused `attn.qkv`, language `qkv_proj` is the
+        unfused q/k/v shards. The subtree table therefore wins on the names it
+        declares, the model's own mapping wins over the language defaults, and
+        the defaults cover the fused names the model never published.
+        """
+        declared = self.packed_modules_mapping
+        for scope, mapping in self._VISION_PACKED_MODULES_MAPPING.items():
+            if scope in prefix:
+                return {**self._LANGUAGE_PACKED_MODULES_MAPPING, **declared, **mapping}
+        return {**self._LANGUAGE_PACKED_MODULES_MAPPING, **declared}
+
     def get_quant_method(
         self,
         layer: torch.nn.Module,
@@ -268,16 +311,10 @@ class ModelSlimConfig(QuantizationConfig):
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 
         if isinstance(layer, LinearBase):
-            # TODO: we should remove this code and switch to the packed_modules_mapping declared inside the modeling files
-            key = "model"
-            if "vision_model" in prefix:
-                key = "vision_model"
-            elif "visual" in prefix:
-                key = "visual"
             if "vision_tower" in prefix or "mm_projector" in prefix:
                 prefix = prefix.replace(r"attn.qkv_proj", r"wqkv")
                 prefix = prefix.replace(r"attn.proj", r"wo")
-            packed_modules_mapping_subset = self.packed_modules_mapping.get(key, {})
+            packed_modules_mapping_subset = self._packed_modules_mapping_for(prefix)
             prefix_in_quant_config = prefix
             proj_name = prefix.split(".")[-1]
             if proj_name in packed_modules_mapping_subset:
@@ -296,9 +333,7 @@ class ModelSlimConfig(QuantizationConfig):
                 if (resolved_component + ".weight") in self.quant_description:
                     prefix_in_quant_config = resolved_component
             prefix_in_quant_config = self._resolve_quant_prefix(prefix_in_quant_config)
-            if self.is_layer_skipped(
-                prefix, packed_modules_mapping_subset
-            ) or self.is_layer_skipped(prefix, self.packed_modules_mapping):
+            if self.is_layer_skipped(prefix, packed_modules_mapping_subset):
                 return UnquantizedLinearMethod()
             layer.scheme = self.get_linear_scheme(layer, prefix_in_quant_config)
             if layer.scheme is None:
