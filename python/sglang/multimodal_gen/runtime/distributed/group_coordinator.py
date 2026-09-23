@@ -395,12 +395,13 @@ class GroupCoordinator:
                 if output is not None:
                     return output
             if (
-                not async_op
+                current_platform.is_cpu()
+                and not async_op
                 and self.shm_handle is not None
                 and is_shm_available(input_.dtype, self.world_size, len(self.ranks))
-                and op == torch.distributed.ReduceOp.SUM
+                and op is torch.distributed.ReduceOp.SUM
             ):
-                # For CPU intra-node groups, use the group-aware SHM collective.
+                # for CPU platform, intra-node case we could speedup with shared memory based comm ops
                 torch.ops.sgl_kernel.shm_allreduce(
                     input_, int(torch.distributed.ReduceOp.SUM), self.shm_handle
                 )
@@ -432,8 +433,10 @@ class GroupCoordinator:
         )
 
         # Group-aware CPU SHM all-gather.
-        if self.shm_handle is not None and is_shm_available(
-            input_.dtype, self.world_size, len(self.ranks)
+        if (
+            current_platform.is_cpu()
+            and self.shm_handle is not None
+            and is_shm_available(input_.dtype, self.world_size, len(self.ranks))
         ):
             output_tensor = torch.ops.sgl_kernel.shm_allgather(
                 input_, dim, self.shm_handle

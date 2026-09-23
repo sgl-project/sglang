@@ -95,10 +95,7 @@ def _a2a_staging_buffer(
     return buffer[:required_numel].view(shape)
 
 
-def _usp_all_to_all_single(
-    x: torch.Tensor,
-    role: str | None = None,
-) -> torch.Tensor:
+def _usp_all_to_all_single(x: torch.Tensor, role: str | None = None) -> torch.Tensor:
     sp_group = get_sp_group()
     ulysses_pg = sp_group.ulysses_group
     assert ulysses_pg is not None, "Ulysses process group is not initialized."
@@ -109,6 +106,8 @@ def _usp_all_to_all_single(
     else:
         output = _a2a_staging_buffer(role, x.shape, x.dtype, x.device)
 
+    # USP calls this collective many times per denoising step and waits
+    # immediately, so avoid the extra wrapper overhead of functional collectives.
     if current_platform.is_cpu() and sp_group.ulysses_shm_handle >= 0:
         torch.ops.sgl_kernel.shm_alltoall(output, x, sp_group.ulysses_shm_handle)
     else:
