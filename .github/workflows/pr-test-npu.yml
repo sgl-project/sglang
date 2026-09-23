@@ -137,7 +137,11 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.12'
+          # 3.11 rather than the 3.12 the other hosted stages use: memfabric-zbal
+          # (an unconditional dependency in pyproject_npu.toml) only ships cp311
+          # wheels, and the NPU image is py3.11 too -- resolving on 3.11 keeps this
+          # job's dependency set aligned with the NPU stages.
+          python-version: '3.11'
 
       - name: Install uv
         uses: astral-sh/setup-uv@v5
@@ -161,9 +165,14 @@ jobs:
           # unconditionally, and the CPU-only torch wheel (unlike the PyPI one the
           # CUDA stages resolve) does not pull it in; the NPU image gets
           # triton-ascend from that same script instead.
+          # unsafe-best-match mirrors that script's UV_INDEX_STRATEGY: --index-url
+          # is the lowest-priority index, so under the default first-index strategy
+          # the PyPI extra wins and torch resolves to the CUDA build (~3.6 GB of
+          # nvidia-* wheels). best-match prefers 2.10.0+cpu over 2.10.0.
           uv pip install torch==2.10.0 torchvision==0.25.0 torchaudio==2.10.0 triton \
             --index-url https://download.pytorch.org/whl/cpu \
-            --extra-index-url https://pypi.org/simple/
+            --extra-index-url https://pypi.org/simple/ \
+            --index-strategy unsafe-best-match
           uv pip install -e "python[dev_npu]" --index-strategy unsafe-best-match
 
       - name: Run NPU unit tests
