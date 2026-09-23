@@ -14,7 +14,7 @@
 """Token layouts of the tensors handed across layer communication boundaries."""
 
 from enum import Enum, auto
-from typing import FrozenSet, Mapping
+from typing import FrozenSet, Mapping, Sequence, Tuple
 
 import msgspec
 
@@ -39,3 +39,22 @@ class Layout(msgspec.Struct, frozen=True):
         cls, *axes: TokenAxis, axis_sizes: Mapping[TokenAxis, int]
     ) -> "Layout":
         return cls(frozenset(axis for axis in axes if axis_sizes[axis] > 1))
+
+
+class GatheredRows(msgspec.Struct, frozen=True):
+    """Rows of a buffer all-gathered across a group: one chunk per rank in rank
+    order, each padded to the largest rank's row count."""
+
+    counts: Tuple[int, ...]
+
+    @classmethod
+    def of(cls, counts: Sequence[int]) -> "GatheredRows":
+        return cls(tuple(counts))
+
+    @property
+    def chunk(self) -> int:
+        return max(self.counts)
+
+    def rank_rows(self, rank: int) -> Tuple[int, int]:
+        """(start, length) of ``rank``'s real rows in the gathered buffer."""
+        return rank * self.chunk, self.counts[rank]

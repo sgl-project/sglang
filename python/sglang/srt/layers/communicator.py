@@ -35,7 +35,7 @@ from sglang.srt.layers.attention.dsa.utils import (
     is_dsa_enable_prefill_cp,
 )
 from sglang.srt.layers.aux_hidden_states import AuxHiddenStateAccumulator
-from sglang.srt.layers.boundary_layout import Layout, TokenAxis
+from sglang.srt.layers.boundary_layout import GatheredRows, Layout, TokenAxis
 from sglang.srt.layers.cp.utils import (
     is_mla_cp_active,
     is_mla_cp_enabled,
@@ -508,6 +508,19 @@ def _generic_prefill_cp_shards_tokens() -> bool:
     """Whether the strategy prefill CP path shards prefill tokens across CP ranks."""
     parallel = get_parallel()
     return parallel.attn_cp_size > 1 and parallel.enable_prefill_cp
+
+
+def moe_cp_gathered_rows(forward_batch: ForwardBatch) -> Optional[GatheredRows]:
+    """Rows of the ``MOE_FULL`` FFN input gathered over the MoE-CP group in this
+    forward, or None when it is not gathered: only a context-parallel extend
+    shards tokens across CP."""
+    if not (
+        forward_batch.forward_mode.is_context_parallel_extend()
+        and forward_batch.attn_cp_metadata is not None
+        and get_moe_cp_size() > 1
+    ):
+        return None
+    return GatheredRows.of(forward_batch.attn_cp_metadata.per_rank_actual_token)
 
 
 def enable_dwdp():
@@ -1460,7 +1473,7 @@ class CommunicateWithAllReduceAndLayerNormFn:
         # Early return on empty tensor is safe for MOE_CP because:
         # - During CP extend: zigzag split guarantees all CP ranks have non-zero tokens,
         #   so no rank hits this path while others proceed to the allgather.
-        # - During decode: moe_cp allgather is skipped (guarded by is_context_parallel_extend).
+        # - During decode: moe_cp allgather is skipped (moe_cp_gathered_rows returns None).
         # - CUDA graph warmup: not applicable when --cuda-graph-backend-prefill=disabled is used.
         if hidden_states.shape[0] == 0:
             return hidden_states, residual
@@ -1478,27 +1491,19 @@ class CommunicateWithAllReduceAndLayerNormFn:
         )
 
         # Step 2: moe_cp allgather — gather across cp_per_moe CP ranks.
-        # Only active during prefill (context-parallel extend); decode keeps existing path.
-        moe_cp_size = get_moe_cp_size()
-        if (
-            moe_cp_size > 1
-            and hidden_states.shape[0] > 0
-            and forward_batch.forward_mode.is_context_parallel_extend()
-            and forward_batch.attn_cp_metadata is not None
-        ):
-            # Zigzag split can produce unequal token counts across CP ranks
-            # (when seq_len % (cp_size * 2) != 0). NCCL allgather requires
-            # equal input sizes, so pad to the max per-rank token count.
-            per_rank_tokens = forward_batch.attn_cp_metadata.per_rank_actual_token
-            max_tokens = max(per_rank_tokens)
-            pad_size = max_tokens - hidden_states.shape[0]
+        rows = moe_cp_gathered_rows(forward_batch)
+        if rows is not None and hidden_states.shape[0] > 0:
+            # CP ranks can hold unequal token counts (e.g. zigzag when
+            # seq_len % (cp_size * 2) != 0). NCCL allgather requires equal
+            # input sizes, so pad to the max per-rank token count.
+            pad_size = rows.chunk - hidden_states.shape[0]
             if pad_size > 0:
                 hidden_states = torch.nn.functional.pad(
                     hidden_states, [0, 0, 0, pad_size]
                 )
 
             output = torch.empty(
-                (max_tokens * moe_cp_size, hidden_states.shape[1]),
+                (rows.chunk * get_moe_cp_size(), hidden_states.shape[1]),
                 dtype=hidden_states.dtype,
                 device=hidden_states.device,
             )
@@ -1662,21 +1667,11 @@ class CommunicateSummableTensorPairFn:
         # Only scatter back during prefill; decode was never allgathered so no-op.
         # Safe w.r.t. empty tensors: same reasoning as _gather_hidden_states_and_residual_moe
         # — CP extend always has non-zero tokens per rank, and decode skips this path.
-        moe_cp_size = get_moe_cp_size()
-        if (
-            moe_cp_size > 1
-            and forward_batch.forward_mode.is_context_parallel_extend()
-            and forward_batch.attn_cp_metadata is not None
-        ):
-            moe_cp_rank = get_moe_cp_rank()
-            # The allgather was padded to max_tokens_per_rank (equal chunks).
+        rows = moe_cp_gathered_rows(forward_batch)
+        if rows is not None:
             # Extract this rank's actual (non-padded) tokens from its chunk.
-            per_rank_tokens = forward_batch.attn_cp_metadata.per_rank_actual_token
-            max_tokens_per_rank = max(per_rank_tokens)
-            actual_local_tokens = per_rank_tokens[moe_cp_rank]
-            hidden_states = hidden_states.narrow(
-                0, moe_cp_rank * max_tokens_per_rank, actual_local_tokens
-            ).contiguous()
+            start, length = rows.rank_rows(get_moe_cp_rank())
+            hidden_states = hidden_states.narrow(0, start, length).contiguous()
 
         # DP scatter (if DP attention is enabled)
         if context.attn_dp_size > 1:

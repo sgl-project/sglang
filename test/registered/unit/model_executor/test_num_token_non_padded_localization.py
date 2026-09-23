@@ -22,6 +22,7 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
@@ -114,6 +115,10 @@ def _value(batch: ForwardBatch):
     return None if got is None else int(got)
 
 
+def _cp_metadata():
+    return SimpleNamespace(per_rank_actual_token=[3, 2])
+
+
 class TestMoeNumTokenNonPaddedTable(CustomTestCase):
     # (label, mode, sharded, attn_dp_size, expected). Decode forwards, so the
     # MOE_FULL rows follow the FULL layout: that config all-gathers over the
@@ -168,9 +173,9 @@ class TestMoeNumTokenNonPaddedTable(CustomTestCase):
         # get_moe_cp_size reads a live process group, so it is stubbed rather
         # than reached through a topology published without distributed init.
         for label, forward_mode, metadata, expected in [
-            ("cp_extend", ForwardMode.EXTEND, object(), None),
+            ("cp_extend", ForwardMode.EXTEND, _cp_metadata(), None),
             ("extend_without_cp_metadata", ForwardMode.EXTEND, None, LOCAL),
-            ("decode", ForwardMode.DECODE, object(), LOCAL),
+            ("decode", ForwardMode.DECODE, _cp_metadata(), LOCAL),
         ]:
             with (
                 self.subTest(case=label),
@@ -178,7 +183,7 @@ class TestMoeNumTokenNonPaddedTable(CustomTestCase):
                 patch.object(
                     comm, "sparse_mlp_scatter_mode", return_value=ScatterMode.MOE_FULL
                 ),
-                patch("sglang.srt.layers.dp_attention.get_moe_cp_size", return_value=2),
+                patch.object(comm, "get_moe_cp_size", return_value=2),
                 patch(
                     "sglang.srt.layers.attention.dsa.utils.dsa_use_prefill_cp",
                     return_value=False,
