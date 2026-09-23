@@ -94,6 +94,7 @@ class XverseMoE(nn.Module):
     def __init__(
         self,
         config: PretrainedConfig,
+        layer_id: int,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
     ):
@@ -134,6 +135,7 @@ class XverseMoE(nn.Module):
         )
         self.topk = TopK(
             top_k=self.top_k,
+            layer_id=layer_id,
             renormalize=getattr(self.config, "norm_topk_prob", False),
         )
 
@@ -305,6 +307,7 @@ class XverseDecoderLayer(nn.Module):
         if config.num_experts is not None:
             self.mlp = XverseMoE(
                 config=config,
+                layer_id=layer_id,
                 quant_config=quant_config,
                 prefix=add_prefix("mlp", prefix),
             )
