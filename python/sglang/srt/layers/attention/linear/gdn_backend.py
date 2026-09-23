@@ -271,10 +271,6 @@ class GDNKernelDispatcher:
     ):
         triton_kernel = TritonGDNKernel()
         self.tree_verify_kernel = triton_kernel
-        if verify_backend is not None and verify_backend.is_flydsl():
-            raise ValueError(
-                "The FlyDSL GDN backend is prefill-only and cannot be used for verify."
-            )
 
         cutedsl_kernel = None
         if decode_backend.is_triton():
@@ -304,11 +300,6 @@ class GDNKernelDispatcher:
 
             flashinfer_kernel = FlashInferGDNKernel()
             self.decode_kernel = flashinfer_kernel
-        elif decode_backend.is_flydsl():
-            raise ValueError(
-                "The FlyDSL GDN backend is prefill-only. Set "
-                "--linear-attn-prefill-backend flydsl."
-            )
         elif decode_backend.is_helion():
             raise ValueError(
                 "The Helion linear-attention backend supports KDA only, not GDN."

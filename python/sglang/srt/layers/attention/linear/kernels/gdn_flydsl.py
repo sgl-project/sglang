@@ -5,7 +5,6 @@ from collections.abc import Sequence
 import torch
 
 from sglang.srt.layers.attention.linear.kernels.gdn_triton import TritonGDNKernel
-from sglang.srt.utils.common import is_gfx95_supported
 
 
 def _load_aiter_flydsl_gdn():
@@ -26,19 +25,9 @@ def _load_aiter_flydsl_gdn():
 
 
 class FlyDSLGDNKernel(TritonGDNKernel):
-    """GDN prefill using AITER's fused FlyDSL prepare and state-scan kernels.
-
-    The AITER path consumes SGLang's native ``[N, H, V, K]`` state pool and
-    updates indexed slots in place. Batches that require per-chunk states, or
-    inputs outside the validated bf16 K=V=128 domain, retain the Triton path.
-    Decode and target verification are inherited from Triton.
-    """
+    """GDN prefill via AITER FlyDSL. Decode and verify stay on Triton."""
 
     def __init__(self):
-        if not is_gfx95_supported():
-            raise RuntimeError(
-                "The FlyDSL GDN prefill backend requires an AMD gfx95 GPU."
-            )
         self._prefill_fn, self._metadata_builder = _load_aiter_flydsl_gdn()
 
     def build_prefill_metadata(

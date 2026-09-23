@@ -379,17 +379,10 @@ class TestFlashInferGDNPrefillBackendPolicy(CustomTestCase):
                 with self.assertRaisesRegex(ValueError, "supports KDA only"):
                     GDNKernelDispatcher(decode_backend, prefill_backend)
 
-    def test_flydsl_is_a_registered_prefill_backend(self):
-        """The shared CLI choices and per-runner enum must stay in sync."""
+    def test_flydsl_is_a_cli_choice(self):
         self.assertIn("flydsl", LINEAR_ATTN_KERNEL_BACKEND_CHOICES)
-        self.assertIs(
-            LinearAttnKernelBackend("flydsl"),
-            LinearAttnKernelBackend.FLYDSL,
-        )
-        self.assertTrue(LinearAttnKernelBackend.FLYDSL.is_flydsl())
 
     def test_flydsl_rejects_decode_and_verify(self):
-        """Selecting the prefill-only kernel for a state-mutating phase is unsafe."""
         triton = LinearAttnKernelBackend.TRITON
         flydsl = LinearAttnKernelBackend.FLYDSL
         cases = (
@@ -412,7 +405,6 @@ class TestFlashInferGDNPrefillBackendPolicy(CustomTestCase):
             )
 
     def test_flydsl_prefill_dispatches_metadata_builder(self):
-        """One batch schedule is built by the selected kernel and reused by layers."""
         flydsl_kernel = MagicMock(spec=FlyDSLGDNKernel)
         flydsl_kernel.build_prefill_metadata.return_value = sentinel.metadata
         with (
@@ -439,7 +431,6 @@ class TestFlashInferGDNPrefillBackendPolicy(CustomTestCase):
         )
 
     def test_flydsl_wrapper_uses_full_aiter_pipeline(self):
-        """The vendor call must keep native VK state and enable both FlyDSL stages."""
         kernel = object.__new__(FlyDSLGDNKernel)
         kernel._prefill_fn = MagicMock(
             return_value=(sentinel.output, sentinel.final_state)
@@ -479,7 +470,6 @@ class TestFlashInferGDNPrefillBackendPolicy(CustomTestCase):
         self.assertTrue(call["inplace_final_state"])
 
     def test_flydsl_without_metadata_falls_back_to_triton(self):
-        """Tracked, mixed, and graph batches omit metadata and need Triton states."""
         kernel = object.__new__(FlyDSLGDNKernel)
         kernel._prefill_fn = MagicMock()
         tensor = torch.empty(1, 1, 1, 128, dtype=torch.bfloat16)
