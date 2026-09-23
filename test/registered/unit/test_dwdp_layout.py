@@ -6,10 +6,6 @@ part that is pure integer arithmetic, plus the import contract that keeps the
 package usable on non-CUDA hardware.
 """
 
-from sglang.test.ci.ci_register import register_cpu_ci
-
-register_cpu_ci(est_time=15, suite="base-a-test-cpu")
-
 import subprocess
 import sys
 import textwrap
@@ -22,6 +18,9 @@ from sglang.srt.layers.moe.dwdp.layout import (
     PageAlignedLayout,
     build_layer_weight_specs,
 )
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=15, suite="base-a-test-cpu")
 
 # 2 MiB is what both drivers report for objects this size; 64 KiB is the finest either
 # reports at all, so the pair brackets the arithmetic rather than pinning one device.
@@ -186,20 +185,18 @@ class TestWeightSpecAdmission(unittest.TestCase):
 
 
 class TestImportContract(unittest.TestCase):
-    def test_importing_dwdp_does_not_load_a_cuda_driver_module(self):
-        """Importing the package used to pull in ``cuda.bindings``, which raises on
-        any non-CUDA host and took the whole server down with it (issue #31995)."""
-        try:
-            import cuda.bindings.driver  # noqa: F401
-        except ImportError:
-            self.skipTest("cuda-python is not installed, nothing to leak")
-
+    def test_importing_dwdp_loads_no_per_driver_module(self):
+        """dwdp must import no per-driver module (issue #31995). Asserted over
+        sys.modules, not cuda.bindings, which torch.cuda imports on its own."""
         probe = textwrap.dedent(
             """
             import sys
             import sglang.srt.layers.moe.dwdp  # noqa: F401
-            leaked = sorted(m for m in sys.modules if m.split(".")[0] == "cuda")
-            print(",".join(leaked))
+            loaded = sorted(
+                m for m in sys.modules
+                if m.endswith(("cuda_vmm_utils", "xpu_vmm_utils"))
+            )
+            print(",".join(loaded))
             """
         )
         result = subprocess.run(
@@ -211,7 +208,9 @@ class TestImportContract(unittest.TestCase):
         self.assertEqual(
             result.stdout.strip(),
             "",
-            "importing dwdp pulled in a CUDA driver module",
+            "importing dwdp loaded a per-driver module; get_vmm_backend imports "
+            "cuda_vmm_utils / xpu_vmm_utils inside its methods to keep that out "
+            "of import time",
         )
 
 

@@ -23,7 +23,7 @@ import logging
 import os
 import subprocess
 from functools import cache
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import torch
 from torch.distributed import ProcessGroup
@@ -262,7 +262,7 @@ def check_ze(result: int, label: str) -> None:
 
 
 @cache
-def _driver_and_devices():
+def _driver_and_devices() -> Dict[bytes, Tuple[int, int]]:
     """Every (driver, device) pair keyed by the device's L0 UUID."""
     lib = _load_level_zero()
     count = ctypes.c_uint32(0)
@@ -272,7 +272,7 @@ def _driver_and_devices():
     drivers = (ctypes.c_void_p * count.value)()
     check_ze(lib.zeDriverGet(ctypes.byref(count), drivers), "zeDriverGet")
 
-    by_uuid = {}
+    by_uuid: Dict[bytes, Tuple[int, int]] = {}
     for driver in drivers[: count.value]:
         device_count = ctypes.c_uint32(0)
         check_ze(
@@ -342,7 +342,7 @@ def tensor_from_pointer(
     pointer: int,
     nbytes: int,
     *,
-    shape=None,
+    shape: Optional[Tuple[int, ...]] = None,
     dtype: torch.dtype = torch.uint8,
     device_id: int,
 ) -> torch.Tensor:
@@ -371,7 +371,7 @@ def make_device_allocation_prop(
     *,
     handle_types: int | str | None = "auto",
     gpu_direct_rdma: bool = False,
-):
+) -> XpuAllocationProp:
     """Build an allocation prop; ``handle_types=None`` means non-exportable.
     ``gpu_direct_rdma`` has no L0 equivalent and is rejected, not dropped."""
     if gpu_direct_rdma:
@@ -490,10 +490,11 @@ class VmmReservation:
             "zeVirtualMemReserve(local)",
         )
         self.base = int(base.value)
-        self._mappings = []
+        # (address, size, handle, release_at_close); handle is None for a peer's memory
+        self._mappings: List[Tuple[int, int, Optional[int], bool]] = []
         self._closed = False
 
-    def map(self, offset: int, size: int, *, retain_handle: bool):
+    def map(self, offset: int, size: int, *, retain_handle: bool) -> int:
         """Create and map local memory at ``base + offset``."""
         if self._closed:
             raise RuntimeError("VmmReservation.map after close")
@@ -520,7 +521,7 @@ class VmmReservation:
         self._mappings.append((address, size, handle, not retain_handle))
         return handle
 
-    def map_existing(self, offset: int, size: int, handle) -> None:
+    def map_existing(self, offset: int, size: int, handle: int) -> None:
         """Map a caller-owned physical allocation into this reservation."""
         if self._closed:
             raise RuntimeError("VmmReservation.map_existing after close")
@@ -583,24 +584,24 @@ class VmmReservation:
             try:
                 self._unmap(address, size)
             except RuntimeError as error:
-                logger.warning("%s", error)
+                logger.warning(f"close continues past a failed unmap: {error}")
             if handle is not None and (release_handles or privately_owned):
                 try:
                     release_physical_mem(handle, self._device_id)
                 except RuntimeError as error:
-                    logger.warning("%s", error)
+                    logger.warning(f"close continues past a failed release: {error}")
         result = lib.zeVirtualMemFree(
             ctypes.c_void_p(self._context),
             ctypes.c_void_p(self.base),
             ctypes.c_size_t(self.size),
         )
         if result != _ZE_RESULT_SUCCESS:
-            logger.warning("zeVirtualMemFree(local) -> 0x%x", result & 0xFFFFFFFF)
+            logger.warning(f"zeVirtualMemFree(local) -> 0x{result & 0xFFFFFFFF:x}")
 
 
 def export_shareable_handles(
-    retained_handles, group: ProcessGroup, rank: int, *, device_id: int
-):
+    retained_handles: List[int], group: ProcessGroup, rank: int, *, device_id: int
+) -> Tuple[List[bytes], List[int], bool]:
     """Export retained physical-memory handles as POSIX fds.
 
     Returns the CUDA backend's ``(fabric_handles, posix_fds, use_fabric)`` shape;
@@ -637,8 +638,8 @@ def export_shareable_handles(
                 )
             posix_fds.append(int(export_fd.fd))
         ok = True
-    except Exception as e:
-        error = e
+    except Exception as export_error:
+        error = export_error
         ok = False
         posix_fds = []
 
@@ -654,7 +655,13 @@ def export_shareable_handles(
 
 
 def import_peer_handle(
-    fabric_handle, fd, *, use_fabric: bool, peer_rank: int, device_id: int, size: int
+    fabric_handle: Optional[bytes],
+    fd: Optional[int],
+    *,
+    use_fabric: bool,
+    peer_rank: int,
+    device_id: int,
+    size: int,
 ) -> int:
     """Import a peer physical-memory object from a POSIX fd, duping it so the
     caller keeps the original.

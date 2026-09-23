@@ -10,15 +10,33 @@ import socket
 import struct
 import tempfile
 import threading
-from typing import List
+from typing import Dict, List, Optional, Protocol, Tuple
 
 import torch
 import torch.distributed as dist
 from torch.distributed import ProcessGroup
 
-# must stay in step with the "<QQQ" header _send_fd packs
+# must stay in step with the "<QQQ" header send_fd packs
 _FD_HEADER_BYTES = 24
-_FD_SEND_TIMEOUT_S = 120.0
+FD_SEND_TIMEOUT_S = 120.0
+
+
+class Reservation(Protocol):
+    """One VA range plus its mappings, as the device-neutral callers use it;
+    cuda_vmm_utils and xpu_vmm_utils each implement it. ``map`` returns a handle
+    that outlives the reservation only with ``retain_handle=True``.
+    """
+
+    base: int
+    size: int
+
+    def map(self, offset: int, size: int, *, retain_handle: bool) -> int: ...
+
+    def map_existing(self, offset: int, size: int, handle: int) -> None: ...
+
+    def unmap_existing(self, offset: int, size: int) -> None: ...
+
+    def close(self, *, release_handles: bool = True) -> None: ...
 
 
 def align_up(value: int, alignment: int) -> int:
@@ -38,7 +56,7 @@ def all_ranks_ok(group: ProcessGroup, ok: bool) -> bool:
     return flag.item() == 1
 
 
-def _send_fd(sock, fd: int, src_rank: int, base_idx: int) -> None:
+def send_fd(sock: socket.socket, fd: int, src_rank: int, base_idx: int) -> None:
     fds = array.array("i", [int(fd)])
     header = struct.pack("<QQQ", int(src_rank), int(base_idx), 1)
     sent = sock.sendmsg(
@@ -49,7 +67,7 @@ def _send_fd(sock, fd: int, src_rank: int, base_idx: int) -> None:
         raise RuntimeError(f"sendmsg sent {sent} bytes, expected {len(header)}")
 
 
-def _recv_fd(sock):
+def recv_fd(sock: socket.socket) -> Optional[Tuple[int, int, int]]:
     fd_item_size = array.array("i").itemsize
     data, ancdata, _, _ = sock.recvmsg(
         _FD_HEADER_BYTES, socket.CMSG_SPACE(fd_item_size)
@@ -80,7 +98,7 @@ def exchange_posix_fds(
     world_size: int,
     local_fds: List[int],
     peer_base_counts: List[int],
-):
+) -> Dict[Tuple[int, int], int]:
     """Exchange POSIX file descriptors across ranks via SCM_RIGHTS over a UNIX
     socket. Returns ``{(src_rank, base_idx): fd}`` for every peer. The caller
     owns the received fds and must close them.
@@ -93,18 +111,18 @@ def exchange_posix_fds(
     sock_dir = tempfile.mkdtemp(prefix="sgl_ar_fd_")
     sock_path = os.path.join(sock_dir, f"rank_{rank}.sock")
     server = socket.socket(socket.AF_UNIX, sock_kind)
-    server.settimeout(_FD_SEND_TIMEOUT_S)
-    received_fds = {}
-    errors = []
+    server.settimeout(FD_SEND_TIMEOUT_S)
+    received_fds: Dict[Tuple[int, int], int] = {}
+    errors: List[BaseException] = []
 
-    def recv_loop():
+    def recv_loop() -> None:
         try:
             for _ in range(world_size - 1):
                 conn, _ = server.accept()
                 with conn:
-                    conn.settimeout(_FD_SEND_TIMEOUT_S)
+                    conn.settimeout(FD_SEND_TIMEOUT_S)
                     while True:
-                        packet = _recv_fd(conn)
+                        packet = recv_fd(conn)
                         if packet is None:
                             break
                         src_rank, base_idx, fd = packet
@@ -113,8 +131,8 @@ def exchange_posix_fds(
                             os.close(fd)
                             raise RuntimeError(f"duplicate fd for {key}")
                         received_fds[key] = fd
-        except BaseException as e:
-            errors.append(e)
+        except BaseException as error:
+            errors.append(error)
 
     try:
         server.bind(sock_path)
@@ -129,12 +147,12 @@ def exchange_posix_fds(
                 if peer_rank == rank:
                     continue
                 with socket.socket(socket.AF_UNIX, sock_kind) as sock:
-                    sock.settimeout(_FD_SEND_TIMEOUT_S)
+                    sock.settimeout(FD_SEND_TIMEOUT_S)
                     sock.connect(peer_path)
                     for base_idx, fd in enumerate(local_fds):
-                        _send_fd(sock, fd, rank, base_idx)
+                        send_fd(sock, fd, rank, base_idx)
         finally:
-            thread.join(_FD_SEND_TIMEOUT_S)
+            thread.join(FD_SEND_TIMEOUT_S)
 
         if thread.is_alive():
             raise RuntimeError("timed out waiting for POSIX fd exchange")

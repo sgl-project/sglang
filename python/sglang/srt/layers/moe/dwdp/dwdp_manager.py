@@ -9,6 +9,7 @@ import torch
 import torch.distributed as dist
 from torch import nn
 
+from sglang.srt.distributed.parallel_state import GroupCoordinator
 from sglang.srt.layers.moe.dwdp.layout import (
     DwdpExpertLayout,
     build_layer_weight_specs,
@@ -16,11 +17,11 @@ from sglang.srt.layers.moe.dwdp.layout import (
 from sglang.srt.layers.moe.dwdp.transport import DWDPTransport
 from sglang.srt.layers.moe.dwdp.weight_buffer import WeightBuffer, fill_edge_experts
 from sglang.srt.layers.moe.dwdp.weight_manager import DWDPWeightManager
-from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils.common import get_device_module
 
 if TYPE_CHECKING:
+    from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
     from sglang.srt.server_args import ServerArgs
 
 logger = logging.getLogger(__name__)
@@ -161,7 +162,9 @@ class DwdpManager:
         for (li, name), param in local_params.items():
             if param.shape[0] != expected_rows:
                 shared = next(
-                    e.num_fused_shared_experts for idx, e in moe_layers if idx == li
+                    layer.num_fused_shared_experts
+                    for idx, layer in moe_layers
+                    if idx == li
                 )
                 raise RuntimeError(
                     f"DWDP layer {li} {name} has dim0={param.shape[0]}, expected "
@@ -173,6 +176,9 @@ class DwdpManager:
 
     @staticmethod
     def _collect_moe_layers(model: nn.Module) -> List[Tuple[int, FusedMoE]]:
+        # Module scope pulls cuda.bindings, absent on a non-CUDA host (issue #31995).
+        from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+
         decoder = model.model if hasattr(model, "model") else model
         moe_layers = []
         for layer_idx, layer in enumerate(decoder.layers):
@@ -184,7 +190,7 @@ class DwdpManager:
         return moe_layers
 
     def _allgather_small_params(
-        self, moe_layers: List[Tuple[int, FusedMoE]], group
+        self, moe_layers: List[Tuple[int, FusedMoE]], group: GroupCoordinator
     ) -> None:
         local_experts = self.layout.num_experts_per_worker
         num_total = self.layout.num_routed_experts

@@ -3,7 +3,8 @@
 Both drivers offer the same three primitives (reserve VA, create physical
 memory, map physical into VA) but spell them differently and disagree on who
 owns an exported fd, so callers use ``get_vmm_backend(device_id)`` instead of
-importing a driver module.
+importing a driver module. Driver imports stay inside the methods: cuda_vmm_utils
+raises at import on a host with no CUDA (issue #31995).
 """
 
 from __future__ import annotations
@@ -15,6 +16,7 @@ import torch
 from torch.distributed import ProcessGroup
 
 from sglang.srt.utils.common import is_xpu
+from sglang.srt.utils.vmm_common import Reservation
 
 
 class VmmBackend:
@@ -30,7 +32,9 @@ class VmmBackend:
 
     # ===== Reservations and physical memory =====
 
-    def make_reservation(self, size: int, *, exportable: bool, alignment: int = 0):
+    def make_reservation(
+        self, size: int, *, exportable: bool, alignment: int = 0
+    ) -> Reservation:
         """Reserve VA for ``size`` bytes. ``exportable`` decides whether physical
         memory created through ``reservation.map`` can be shared with peers."""
         raise NotImplementedError
@@ -75,7 +79,7 @@ class VmmBackend:
 
     def import_handle(
         self,
-        fabric_handle,
+        fabric_handle: Optional[bytes],
         fd: Optional[int],
         *,
         use_fabric: bool,
@@ -131,7 +135,9 @@ class CudaVmmBackend(VmmBackend):
 
         return get_device_granularity(self.device_id)
 
-    def make_reservation(self, size: int, *, exportable: bool, alignment: int = 0):
+    def make_reservation(
+        self, size: int, *, exportable: bool, alignment: int = 0
+    ) -> Reservation:
         from sglang.srt.utils.cuda_vmm_utils import (
             VmmReservation,
             make_device_allocation_prop,
@@ -172,15 +178,14 @@ class CudaVmmBackend(VmmBackend):
 
     def import_handle(
         self,
-        fabric_handle,
+        fabric_handle: Optional[bytes],
         fd: Optional[int],
         *,
         use_fabric: bool,
         peer_rank: int,
         size: int,
     ) -> int:
-        # cuMemImportFromShareableHandle reads the size out of the handle itself.
-        del size
+        # size unused: cuMemImportFromShareableHandle reads it out of the handle.
         from sglang.srt.utils.cuda_vmm_utils import import_peer_handle
 
         return int(
@@ -206,7 +211,9 @@ class XpuVmmBackend(VmmBackend):
 
         return get_device_granularity(self.device_id)
 
-    def make_reservation(self, size: int, *, exportable: bool, alignment: int = 0):
+    def make_reservation(
+        self, size: int, *, exportable: bool, alignment: int = 0
+    ) -> Reservation:
         from sglang.srt.utils.xpu_vmm_utils import (
             VmmReservation,
             make_device_allocation_prop,
@@ -245,7 +252,7 @@ class XpuVmmBackend(VmmBackend):
 
     def import_handle(
         self,
-        fabric_handle,
+        fabric_handle: Optional[bytes],
         fd: Optional[int],
         *,
         use_fabric: bool,

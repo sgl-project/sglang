@@ -22,6 +22,7 @@ from sglang.srt.layers.moe.dwdp.page_pool import (
     compute_slot_sizes,
 )
 from sglang.srt.utils.vmm_backend import get_vmm_backend
+from sglang.srt.utils.vmm_common import Reservation
 
 logger = logging.getLogger(__name__)
 
@@ -56,7 +57,7 @@ class WeightBuffer:
         self._remote_slices: Dict[
             int, Dict[str, List[Tuple[torch.Tensor, int, int]]]
         ] = {}
-        self._reservations: Dict[int, List] = {}
+        self._reservations: Dict[int, List[Reservation]] = {}
         self._pool_bindings: Dict[int, List[PoolBinding]] = {}
         self._bound_layers: Set[int] = set()
         self._rebinds_pool_pages = not self._backend.supports_aliased_mappings()
@@ -292,20 +293,24 @@ def fill_edge_experts(
             full_tensor = weight_buffer.get_full_tensor(li, name)
 
             if edge.leading_edge > 0 and local_start > 0:
-                prev = local_start - 1
-                peer = lookup_owner(prev, peer_ranges)
-                ps, _ = peer_ranges[peer]
+                leading_expert = local_start - 1
+                peer = lookup_owner(leading_expert, peer_ranges)
+                peer_start, _ = peer_ranges[peer]
                 key = (peer, li, name)
                 if key in peer_views:
-                    full_tensor[prev].copy_(peer_views[key][prev - ps])
+                    full_tensor[leading_expert].copy_(
+                        peer_views[key][leading_expert - peer_start]
+                    )
 
             if edge.trailing_edge > 0 and local_end < full_tensor.shape[0]:
-                nxt = local_end
-                peer = lookup_owner(nxt, peer_ranges)
-                ps, _ = peer_ranges[peer]
+                trailing_expert = local_end
+                peer = lookup_owner(trailing_expert, peer_ranges)
+                peer_start, _ = peer_ranges[peer]
                 key = (peer, li, name)
                 if key in peer_views:
-                    full_tensor[nxt].copy_(peer_views[key][nxt - ps])
+                    full_tensor[trailing_expert].copy_(
+                        peer_views[key][trailing_expert - peer_start]
+                    )
 
         if weight_buffer.rebinds_pool_pages:
             # the next layer takes these pool pages back, and unmapping does not

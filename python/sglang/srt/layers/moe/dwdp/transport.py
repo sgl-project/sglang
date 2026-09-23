@@ -5,11 +5,12 @@ from __future__ import annotations
 
 import logging
 import os
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, Iterable, List, Optional, Tuple
 
 import torch
 import torch.distributed as dist
 
+from sglang.srt.distributed.parallel_state import GroupCoordinator
 from sglang.srt.layers.moe.dwdp.layout import (
     DwdpExpertLayout,
     LayerWeightSpecs,
@@ -21,7 +22,7 @@ from sglang.srt.utils.vmm_common import align_down, align_up, exchange_posix_fds
 logger = logging.getLogger(__name__)
 
 
-def _close_fds(fds) -> None:
+def _close_fds(fds: Iterable[int]) -> None:
     for fd in fds:
         try:
             os.close(fd)
@@ -89,7 +90,7 @@ class DWDPTransport:
         cls,
         layer_weight_specs: LayerWeightSpecs,
         local_params: Dict[Tuple[int, str], torch.Tensor],
-        group: dist.ProcessGroup,
+        group: GroupCoordinator,
         layout: DwdpExpertLayout,
         device_id: int,
     ) -> DWDPTransport:
@@ -114,7 +115,7 @@ class DWDPTransport:
         self,
         sorted_keys: List[Tuple[int, str]],
         layer_weight_specs: LayerWeightSpecs,
-        group: dist.ProcessGroup,
+        group: GroupCoordinator,
         layout: DwdpExpertLayout,
     ) -> None:
         cpu_group = group.cpu_group

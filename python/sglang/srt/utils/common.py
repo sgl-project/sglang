@@ -430,10 +430,9 @@ def _xpu_memory_query_works(gpu_id: int) -> bool:
         get_device_memory_in_use(gpu_id)
     except (ImportError, RuntimeError, OSError) as error:
         logger.warning(
-            "Level Zero memory query unavailable for XPU %s (%s); falling back to "
-            "torch.xpu.memory_allocated, which sees only torch's own allocator.",
-            gpu_id,
-            error,
+            f"Level Zero memory query unavailable for XPU {gpu_id} ({error}); "
+            f"falling back to torch.xpu.memory_allocated, which sees only torch's "
+            f"own allocator."
         )
         return False
     return True
@@ -442,10 +441,9 @@ def _xpu_memory_query_works(gpu_id: int) -> bool:
 def _xpu_memory_in_use(gpu_id: int) -> int:
     """Device memory in use on an XPU, counting allocations torch cannot see.
 
-    torch.xpu.memory_allocated knows only its own allocator, so memory mapped
-    straight from the driver and memory held by another tenant both read as free;
-    torch.xpu.mem_get_info is no help, it forwards a free == total stub. Level Zero
-    sysman is the only source that reports the whole device.
+    torch.xpu.memory_allocated knows only its own allocator, and mem_get_info
+    forwards a free == total stub, so Level Zero sysman is the only whole-device
+    source.
     """
     torch_in_use = torch.xpu.memory_allocated(gpu_id)
     if not _xpu_memory_query_works(gpu_id):
@@ -453,21 +451,17 @@ def _xpu_memory_in_use(gpu_id: int) -> int:
 
     from sglang.srt.utils.xpu_vmm_utils import get_device_memory_in_use
 
-    # Telemetry can start failing after the one-time probe succeeded: the sysman
-    # process query counts then fills, so a process starting up between the two
-    # calls fails this query but not the next one. Retry before degrading, since
-    # the fallback sizes memory pools as if the untracked memory were free.
+    # The sysman process query counts then fills, so a process starting between the
+    # two calls fails this query but not the next one; retry before degrading.
     for _ in range(2):
         try:
             return max(torch_in_use, get_device_memory_in_use(gpu_id))
         except (RuntimeError, OSError) as error:
             last_error = error
     logger.warning(
-        "Level Zero memory query failed twice for XPU %s (%s); falling back to "
-        "torch.xpu.memory_allocated, which sees only torch's own allocator, so "
-        "memory pools may be sized too high.",
-        gpu_id,
-        last_error,
+        f"Level Zero memory query failed twice for XPU {gpu_id} ({last_error}); "
+        f"falling back to torch.xpu.memory_allocated, which sees only torch's own "
+        f"allocator, so memory pools may be sized too high."
     )
     return torch_in_use
 

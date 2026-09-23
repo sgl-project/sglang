@@ -10,6 +10,7 @@ from typing import Dict, List, Optional, Tuple
 import torch
 
 from sglang.srt.layers.moe.dwdp.layout import PeerRanges, lookup_owner
+from sglang.srt.layers.moe.dwdp.transport import DWDPTransport
 from sglang.srt.layers.moe.dwdp.weight_buffer import WeightBuffer
 from sglang.srt.utils.common import create_device_stream, device_stream_context
 
@@ -26,7 +27,7 @@ class DWDPWeightManager:
         weight_names: List[str],
         dwdp_rank: int,
         dwdp_size: int,
-        transport=None,
+        transport: Optional[DWDPTransport] = None,
     ) -> None:
         self._weight_buffer = weight_buffer
         self._peer_views = peer_views

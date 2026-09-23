@@ -4,12 +4,12 @@
 from __future__ import annotations
 
 import logging
-from typing import Any, Dict, List, Optional
+from typing import Dict, List, Optional
 
 import msgspec
 
 from sglang.srt.utils.vmm_backend import get_vmm_backend
-from sglang.srt.utils.vmm_common import align_up
+from sglang.srt.utils.vmm_common import Reservation, align_up
 
 logger = logging.getLogger(__name__)
 
@@ -21,7 +21,7 @@ class PoolBinding(msgspec.Struct, frozen=True):
     page ``page_offset`` of ``slot``, mapped at ``offset`` in ``reservation``."""
 
     slot: int
-    reservation: Any
+    reservation: Reservation
     offset: int
     num_pages: int
     page_offset: int
