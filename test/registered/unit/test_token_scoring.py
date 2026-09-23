@@ -1,0 +1,184 @@
+import asyncio
+import json
+import unittest
+from types import SimpleNamespace
+
+import torch
+
+from sglang.srt.entrypoints.engine_score_mixin import EngineScoreMixin
+from sglang.srt.entrypoints.openai.protocol import ScoringRequest
+from sglang.srt.entrypoints.openai.serving_score import OpenAIServingScore
+from sglang.srt.managers.tokenizer_manager_score_mixin import TokenizerManagerScoreMixin
+from sglang.srt.runtime_context import publish, restore_context, snapshot_context
+from sglang.srt.server_args import ServerArgs
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+
+
+class ScoringManager(TokenizerManagerScoreMixin):
+    """Replace only model execution; keep request construction and score extraction real."""
+
+    def __init__(self, enable_mis=False, generation=True):
+        self.server_args = ServerArgs(model_path="dummy", enable_mis=enable_mis)
+        publish(self.server_args, role="test")
+        self.is_generation = generation
+        self.tokenizer = SimpleNamespace(vocab_size=8)
+        self.logits = torch.tensor([-1000.0, -999.0, -997.0, -996.0, 0, 1, 2, 3])
+        self.requests = []
+
+    async def generate_request(self, request, raw_request):
+        self.requests.append(request)
+        request.normalize_batch_and_arguments()
+        results = []
+        for index, ids in enumerate(request.input_ids):
+            meta = {"prompt_tokens": len(ids)}
+            if self.is_generation:
+                assert request.sampling_params[index]["max_new_tokens"] == 0
+                labels = request.token_ids_logprob[index]
+                values = torch.log_softmax(self.logits, dim=0)
+                logprobs = [(values[token].item(), token, None) for token in labels]
+                if self.server_args.enable_mis:
+                    count = len(request.multi_item_delimiter_indices[index])
+                    meta["input_token_ids_logprobs"] = [logprobs] * count
+                else:
+                    meta["output_token_ids_logprobs"] = [logprobs]
+                results.append({"meta_info": meta})
+            else:
+                embedding = [1.0, 3.0]
+                if self.server_args.enable_mis:
+                    count = len(request.multi_item_delimiter_indices[index])
+                    embedding = [embedding] * count
+                results.append({"meta_info": meta, "embedding": embedding})
+        yield results
+
+
+class TestTokenScoring(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.addCleanup(restore_context, snapshot_context())
+
+    async def test_http_to_manager_ragged_candidates(self):
+        for enable_mis in (False, True):
+            with self.subTest(enable_mis=enable_mis):
+                manager = ScoringManager(enable_mis=enable_mis)
+                request = ScoringRequest(
+                    query=[4],
+                    items=[[5], [6, 7]],
+                    label_token_ids=[[3, 1], [0, 2, 1]],
+                    apply_softmax=True,
+                    temperature=2.0,
+                    return_token_logprobs=True,
+                )
+                handler = OpenAIServingScore(manager)
+                response = await handler._handle_non_streaming_request(
+                    request, request, None
+                )
+                body = json.loads(response.body)
+                for labels, scores, logprobs in zip(
+                    request.label_token_ids, body["scores"], body["token_logprobs"]
+                ):
+                    expected = torch.softmax(manager.logits[labels] / 2, dim=0)
+                    torch.testing.assert_close(torch.tensor(scores), expected)
+                    torch.testing.assert_close(
+                        torch.tensor(logprobs),
+                        torch.log_softmax(manager.logits, dim=0)[labels],
+                    )
+                self.assertEqual(body["usage"]["completion_tokens"], 0)
+
+    async def test_default_scores_are_vocabulary_probabilities(self):
+        manager = ScoringManager()
+        result = await manager.score_request(
+            query=[], items=[[4], [5]], label_token_ids=[7, 4]
+        )
+        expected = torch.softmax(manager.logits, dim=0)[[7, 4]]
+        for scores in result.scores:
+            torch.testing.assert_close(torch.tensor(scores), expected)
+        self.assertIsNone(result.token_logprobs)
+
+    async def test_async_engine_and_full_prompts(self):
+        manager = ScoringManager()
+        engine = EngineScoreMixin()
+        engine.tokenizer_manager = manager
+        kwargs = dict(
+            label_token_ids=[[1, 3], [2]],
+            apply_softmax=True,
+            temperature=0.5,
+            return_token_logprobs=True,
+        )
+        actual = await engine.async_score(query=[], items=[[4], [5]], **kwargs)
+        expected = await manager.score_prompts([[4], [5]], **kwargs)
+        self.assertEqual(actual, expected)
+        self.assertEqual(actual.scores[1], [1.0])
+
+    async def test_classification_temperature(self):
+        for enable_mis in (False, True):
+            manager = ScoringManager(enable_mis=enable_mis, generation=False)
+            result = await manager.score_request(
+                query=[4], items=[[5], [6]], apply_softmax=True, temperature=2.0
+            )
+            for scores in result.scores:
+                torch.testing.assert_close(
+                    torch.tensor(scores), torch.softmax(torch.tensor([0.5, 1.5]), 0)
+                )
+            with self.assertRaisesRegex(ValueError, "only supported for CausalLM"):
+                await manager.score_request(
+                    query=[], items=[[4]], return_token_logprobs=True
+                )
+
+    async def test_invalid_candidates_and_temperature(self):
+        manager = ScoringManager()
+        for labels in ([], [[]], [[1]], [[1], []], [1, 1], [-1], [8], [True], "bad"):
+            with self.subTest(labels=labels), self.assertRaises(ValueError):
+                await manager.score_request(
+                    query=[], items=[[4], [5]], label_token_ids=labels
+                )
+        for temperature in (0, -1, float("nan"), float("inf")):
+            with self.subTest(temperature=temperature), self.assertRaises(ValueError):
+                await manager.score_request(
+                    query=[],
+                    items=[[4]],
+                    label_token_ids=[1],
+                    temperature=temperature,
+                    apply_softmax=True,
+                )
+        with self.assertRaisesRegex(ValueError, "requires apply_softmax"):
+            await manager.score_request(
+                query=[], items=[[4]], label_token_ids=[1], temperature=2.0
+            )
+        self.assertEqual(manager.requests, [])
+
+    async def test_empty_batch(self):
+        manager = ScoringManager()
+        result = await manager.score_request(
+            query=[], items=[], label_token_ids=[], return_token_logprobs=True
+        )
+        self.assertEqual(result.scores, [])
+        self.assertEqual(result.token_logprobs, [])
+        self.assertEqual(manager.requests, [])
+
+
+class TestSyncTokenScoring(unittest.TestCase):
+    def test_engine_score(self):
+        self.addCleanup(restore_context, snapshot_context())
+        engine = EngineScoreMixin()
+        engine.tokenizer_manager = ScoringManager()
+        engine.loop = asyncio.new_event_loop()
+        try:
+            result = engine.score(
+                query=[],
+                items=[[4]],
+                label_token_ids=[[1, 3]],
+                apply_softmax=True,
+                temperature=2.0,
+                return_token_logprobs=True,
+            )
+            torch.testing.assert_close(
+                torch.tensor(result.scores[0]),
+                torch.softmax(engine.tokenizer_manager.logits[[1, 3]] / 2, 0),
+            )
+        finally:
+            engine.loop.close()
+
+
+if __name__ == "__main__":
+    unittest.main()
