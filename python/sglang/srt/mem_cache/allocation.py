@@ -607,7 +607,7 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
     # position L: the row stops satisfying
     # row[j] == page[j // page_size] * page_size + (j % page_size), which is the
     # invariant the paged free path relies on to release each page exactly once.
-    if batch.model_config.is_encoder_decoder:
+    if batch.model_config.is_encoder_decoder and _alloc_page_size(batch) > 1:
         row_lens_gpu = batch.encoder_lens + seq_lens_gpu
         row_lens_cpu = batch.seq_lens_cpu + torch.tensor(
             batch.encoder_lens_cpu, dtype=batch.seq_lens_cpu.dtype

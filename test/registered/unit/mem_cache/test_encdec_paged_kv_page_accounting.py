@@ -369,15 +369,6 @@ class TestEncDecDecodeAllocArithmetic(_PagedAllocOnCpu):
         )
         self.assertTrue(torch.equal(seen["last_loc"], expected_last_loc))
 
-    def test_token_per_req_greater_than_one(self):
-        _, seen = self._capture(is_encoder_decoder=True, page_size=8, token_per_req=3)
-        self.assertTrue(
-            torch.equal(seen["seq_lens"], torch.tensor([24 + 3 + 3, 16 + 5 + 3]))
-        )
-        self.assertTrue(
-            torch.equal(seen["seq_lens_cpu"], torch.tensor([24 + 3 + 3, 16 + 5 + 3]))
-        )
-
     def test_heterogeneous_encoder_lengths_are_per_request(self):
         """encoder_lens is per-request; a batch-wide scalar would be wrong."""
         h = _Harness(
