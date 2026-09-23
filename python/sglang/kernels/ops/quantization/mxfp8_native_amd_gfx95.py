@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import functools
 import json
+import logging
 import os
 import re
 from dataclasses import dataclass
@@ -22,6 +23,8 @@ from sglang.kernels.ops.quantization.mxfp8_amd_gfx95 import (
     fake_quant_fp8_activation,
     mxfp8_e4m3_quantize,
 )
+
+logger = logging.getLogger(__name__)
 
 # M <= 32: the scaled-MFMA skinny kernel (deepseek_v4/mxfp8_gemv_gfx95.cuh)
 MXFP8_GEMV_MAX_TOKENS = 32
@@ -85,7 +88,9 @@ def _config_table(section: str) -> Dict[str, str]:
     try:
         with open(CONFIG_FILE) as f:
             table = json.load(f)
-    except (OSError, ValueError):
+    except (OSError, ValueError) as err:
+        # every shape then takes the heuristic, so say so instead of silently losing the tuning
+        logger.warning("mxfp8 gfx95 tile table %s unreadable (%s); using heuristics", CONFIG_FILE, err)
         return {}
     return {str(key): str(value) for key, value in table.get(section, {}).items()}
 
