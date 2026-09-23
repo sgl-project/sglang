@@ -1263,9 +1263,9 @@ def _mla_kv_cache_dtype_checks(view: Any) -> dict:
             raise ValueError(
                 "TRTLLM MLA backend is only supported on Blackwell GPUs (SM100/SM12x). Please use a different backend."
             )
-        if view.kv_cache_dtype not in ["fp8_e4m3", "fp4_e2m1", "bf16", "auto"]:
+        if view.kv_cache_dtype not in ["fp8_e4m3", "bf16", "auto"]:
             raise ValueError(
-                "TensorRT-LLM MLA backend only supports kv-cache-dtype of fp8_e4m3, fp4_e2m1, bf16, or auto."
+                "TensorRT-LLM MLA backend only supports kv-cache-dtype of fp8_e4m3, bf16, or auto."
             )
     if (
         view.attention_backend == "tokenspeed_mla"
@@ -1823,8 +1823,6 @@ def post_capture_kv_sizing_planned(server_args: Any) -> bool:
     if cfg.dcp_size != 1:
         return False
     if mla_enabled:
-        return False
-    if cfg.kv_cache_dtype == "fp4_e2m1":
         return False
     if cfg.prefill_only_disable_kv_cache:
         return False
