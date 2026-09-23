@@ -21,6 +21,7 @@ class _ModuleStub(torch.nn.Module):
 def _config(**overrides):
     values = dict(
         use_sliding_window=False,
+        num_hidden_layers=8,
         no_rope_layers=[1, 1, 1, 0, 1, 1, 1, 0],  # every 4th layer is NoPE
         head_dim=8,
         partial_rotary_factor=1,
@@ -29,7 +30,7 @@ def _config(**overrides):
     return SimpleNamespace(**values)
 
 
-def _make_attention(config, layer_id):
+def _make_attention(config, layer_id, start_layer=0):
     parallel = SimpleNamespace(tp_size=1)
     with (
         patch.object(llama, "get_parallel", return_value=parallel),
@@ -44,6 +45,7 @@ def _make_attention(config, layer_id):
             num_heads=2,
             num_kv_heads=2,
             layer_id=layer_id,
+            start_layer=start_layer,
         )
 
 
@@ -55,6 +57,18 @@ class TestSmolLM3RopePolicy(CustomTestCase):
     def test_nope_layer_has_no_rotary_embedding(self):
         attention = _make_attention(_config(), layer_id=3)
         self.assertIsNone(attention.rotary_emb)
+
+    def test_npu_cos_sin_refresh_layer(self):
+        # forward_prepare_npu refreshes cos/sin on the layer matching start_layer;
+        # a PP stage that begins on a NoPE layer must defer it to the next RoPE layer.
+        config = _config()
+        for layer_id in range(8):
+            self.assertEqual(_make_attention(config, layer_id, 0).start_layer, 0)
+            self.assertEqual(_make_attention(config, layer_id, 2).start_layer, 2)
+            self.assertEqual(_make_attention(config, layer_id, 3).start_layer, 4)
+        # A stage with no RoPE layers left keeps its own start_layer.
+        all_nope_tail = _config(no_rope_layers=[1, 1, 1, 1, 1, 1, 0, 0])
+        self.assertEqual(_make_attention(all_nope_tail, 7, 6).start_layer, 6)
 
     def test_rejects_sliding_window(self):
         with self.assertRaises(NotImplementedError):

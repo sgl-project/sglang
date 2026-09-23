@@ -23,8 +23,12 @@ from sglang.srt.utils import add_prefix, make_layers
 class SmolLM3Attention(LlamaAttention):
     """Llama attention, minus RoPE on the layers config.no_rope_layers marks as NoPE."""
 
-    def __init__(self, *, config: SmolLM3Config, layer_id: int, **kwargs) -> None:
-        super().__init__(config=config, layer_id=layer_id, **kwargs)
+    def __init__(
+        self, *, config: SmolLM3Config, layer_id: int, start_layer: int = 0, **kwargs
+    ) -> None:
+        super().__init__(
+            config=config, layer_id=layer_id, start_layer=start_layer, **kwargs
+        )
 
         if config.use_sliding_window:
             raise NotImplementedError(
@@ -35,6 +39,17 @@ class SmolLM3Attention(LlamaAttention):
         # RoPE is only applied on configured layers
         if not config.no_rope_layers[layer_id]:
             self.rotary_emb = None
+
+        # forward_prepare_npu refreshes the shared cos/sin only on layer start_layer;
+        # a NoPE layer never refreshes it, so use the PP stage's first RoPE layer.
+        self.start_layer = next(
+            (
+                i
+                for i in range(start_layer, config.num_hidden_layers)
+                if config.no_rope_layers[i]
+            ),
+            start_layer,
+        )
 
     # forward_prepare_npu is intentionally not overridden: its fused kernel requires
     # a real rotary_emb, and LlamaAttention.forward's hasattr check already routes
