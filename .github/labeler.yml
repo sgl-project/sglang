@@ -6,11 +6,6 @@ model-gateway:
   - changed-files:
     - any-glob-to-any-file: 'sgl-model-gateway/**/*'
 
-# Renderer specific (Rust code in rust/sglang-renderer)
-renderer:
-  - changed-files:
-    - any-glob-to-any-file: 'rust/sglang-renderer/**/*'
-
 # Kernel specific
 sgl-kernel:
   - changed-files:
@@ -167,3 +162,7 @@ apple-silicon:
       - '**/*mlx*'
       - '**/mlx/**'
       - '**/*mps*'
+
+rust-renderer:
+  - changed-files:
+    - any-glob-to-any-file: 'rust/sglang-renderer/**/*'
