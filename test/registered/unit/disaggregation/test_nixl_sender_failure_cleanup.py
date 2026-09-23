@@ -35,6 +35,7 @@ class TestNixlSenderFailureCleanup(unittest.TestCase):
             transfer_infos={room: object()},
             _staging_outstanding={},
             _deferred_ack_targets={},
+            _maybe_ack_drained_abort=lambda room: None,
             exceptions={room: expected_exc},
             failure_records={room: "transfer failed"},
             failure_lock=threading.Lock(),

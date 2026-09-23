@@ -91,8 +91,6 @@ def _manager(enabled: bool = True) -> MoriKVManager:
     manager._submission_local = _SubmissionLocal()
     manager.req_to_decode_prefix_len = {}
     manager.transfer_infos = {}
-    manager._room_notify_lock = threading.Lock()
-    manager._room_status_notified = {}
     manager.failure_lock = threading.Lock()
     manager.failure_records = {}
     manager._sent = []
@@ -169,7 +167,7 @@ class TestMoriAbortAck(DeferredAbortNotificationScenarios, CustomTestCase):
         manager.request_status[11] = KVPoll.Transferring
         status = MagicMock()
         status.InProgress.return_value = False
-        manager._submit_kv_transfer = MagicMock(return_value=([status], None))
+        manager._submit_kv_transfer = MagicMock(return_value=[status])
         wait_results = iter((StatusCode.IN_PROGRESS, StatusCode.SUCCESS))
 
         def wait_all(*args, **kwargs):
@@ -203,8 +201,8 @@ class TestMoriAbortAck(DeferredAbortNotificationScenarios, CustomTestCase):
         manager.engine.wait_all.return_value = StatusCode.IN_PROGRESS
         status = MagicMock()
         status.InProgress.return_value = True
-        manager._submit_kv_transfer = MagicMock(return_value=([status], None))
-        manager._conclude_room_failure = MagicMock()
+        manager._submit_kv_transfer = MagicMock(return_value=[status])
+        manager.conclude_failure = MagicMock()
         chunk = _chunk()
         manager._mark_transfer_started(chunk)
 
@@ -218,7 +216,7 @@ class TestMoriAbortAck(DeferredAbortNotificationScenarios, CustomTestCase):
         manager.engine.wait_all.assert_called_once()
         self.assertEqual(manager._sent, [])
         self.assertEqual(manager._staging_outstanding[11], 1)
-        manager._conclude_room_failure.assert_not_called()
+        manager.conclude_failure.assert_not_called()
         manager._handle_abort_message(_abort_message())
         queued_chunk, queued_statuses, failure_reason = (
             manager._drain_queue.get_nowait()
@@ -231,8 +229,8 @@ class TestMoriAbortAck(DeferredAbortNotificationScenarios, CustomTestCase):
             [(11, AckTarget("10.0.0.3", 6000, ABORT_GENERATION))],
         )
         self.assertNotIn(11, manager._staging_outstanding)
-        manager._conclude_room_failure.assert_called_once_with(
-            11, "KV transfer exceeded SLA 1ms"
+        manager.conclude_failure.assert_called_once_with(
+            bootstrap_room=11, failure_reason="KV transfer exceeded SLA 1ms"
         )
 
     def test_sla_failure_keeps_legacy_early_return_when_disabled(self):
@@ -256,7 +254,7 @@ class TestMoriAbortAck(DeferredAbortNotificationScenarios, CustomTestCase):
     def test_wait_event_failure_releases_outstanding_count(self):
         manager = _manager()
         manager.request_status[11] = KVPoll.Transferring
-        manager._conclude_room_failure = MagicMock()
+        manager.conclude_failure = MagicMock()
         chunk = _chunk()
         chunk.wait_event = MagicMock()
         chunk.wait_event.synchronize.side_effect = RuntimeError("event failed")
@@ -268,16 +266,16 @@ class TestMoriAbortAck(DeferredAbortNotificationScenarios, CustomTestCase):
                 manager._transfer_worker(queue)
 
         self.assertNotIn(11, manager._staging_outstanding)
-        manager._conclude_room_failure.assert_called_once()
+        manager.conclude_failure.assert_called_once()
 
     def test_wait_all_exception_keeps_status_for_draining(self):
         manager = _manager()
         manager.request_status[11] = KVPoll.Transferring
         status = MagicMock()
-        manager._submit_kv_transfer = MagicMock(return_value=([status], None))
+        manager._submit_kv_transfer = MagicMock(return_value=[status])
         manager.engine = MagicMock()
         manager.engine.wait_all.side_effect = RuntimeError("wait failed")
-        manager._conclude_room_failure = MagicMock()
+        manager.conclude_failure = MagicMock()
 
         is_quiescent = manager._process_transfer_chunk(_chunk())
 
@@ -290,7 +288,7 @@ class TestMoriAbortAck(DeferredAbortNotificationScenarios, CustomTestCase):
         self.assertEqual(
             failure_reason, "Transfer completion failed: RuntimeError('wait failed')"
         )
-        manager._conclude_room_failure.assert_not_called()
+        manager.conclude_failure.assert_not_called()
 
     def test_partial_submission_failure_transfers_ownership_to_drainer(self):
         manager = _manager()
@@ -302,7 +300,7 @@ class TestMoriAbortAck(DeferredAbortNotificationScenarios, CustomTestCase):
             raise RuntimeError("later target failed")
 
         manager._submit_kv_transfer = submit
-        manager._conclude_room_failure = MagicMock()
+        manager.conclude_failure = MagicMock()
         chunk = _chunk()
         manager._mark_transfer_started(chunk)
 
@@ -320,7 +318,7 @@ class TestMoriAbortAck(DeferredAbortNotificationScenarios, CustomTestCase):
             "Transfer submission failed: later target failed",
         )
         self.assertEqual(manager._staging_outstanding[11], 1)
-        manager._conclude_room_failure.assert_not_called()
+        manager.conclude_failure.assert_not_called()
 
     def test_drain_worker_retries_same_item_after_exception(self):
         manager = _manager()
@@ -349,7 +347,7 @@ class TestMoriAbortAck(DeferredAbortNotificationScenarios, CustomTestCase):
         chunk = _chunk()
         status = MagicMock()
         status.InProgress.return_value = False
-        manager._conclude_room_failure = MagicMock(
+        manager.conclude_failure = MagicMock(
             side_effect=(RuntimeError("notification failed"), None)
         )
         manager._mark_transfer_quiescent = MagicMock()
@@ -360,7 +358,7 @@ class TestMoriAbortAck(DeferredAbortNotificationScenarios, CustomTestCase):
 
         manager._drain_transfer_statuses(chunk, [status], "transfer failed")
 
-        self.assertEqual(manager._conclude_room_failure.call_count, 2)
+        self.assertEqual(manager.conclude_failure.call_count, 2)
         manager._mark_transfer_quiescent.assert_called_once_with(chunk)
 
 

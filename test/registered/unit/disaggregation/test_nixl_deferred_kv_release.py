@@ -85,6 +85,8 @@ class TestNixlAbortNotification(
         manager._staging_outstanding = defaultdict(int)
         manager.transfer_infos = {ROOM: {}}
         manager.exceptions = {}
+        # No handle was posted, so the worker settles and notifies decode.
+        manager.conclude_failure = MagicMock()
         manager.check_status = MagicMock(side_effect=RuntimeError("worker error"))
         queue = SimpleNamespace(
             get=MagicMock(side_effect=(_chunk(), KeyboardInterrupt()))

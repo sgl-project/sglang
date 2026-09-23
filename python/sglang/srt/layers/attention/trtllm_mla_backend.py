@@ -50,6 +50,10 @@ from sglang.srt.layers.attention.flashinfer_mla_backend import (
     FlashInferMLAAttnBackend,
     FlashInferMLAMultiStepDraftBackend,
 )
+from sglang.srt.layers.attention.kv_shard_hooks import (
+    get_kv_shard_pool,
+    prepare_kv_shard_forward,
+)
 from sglang.srt.layers.attention.verify_mask import VerifyMask, maybe_create_verify_mask
 from sglang.srt.layers.dcp.layout import get_dcp_lens
 from sglang.srt.layers.logits_processor import get_in_autotune_dummy_run
@@ -239,6 +243,8 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         self.q_data_type = model_runner.dtype
         self.page_size = model_runner.page_size
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
+        self._kv_shard_pool = get_kv_shard_pool(model_runner.token_to_kv_pool)
+        self.needs_cpu_seq_lens |= self._kv_shard_pool is not None
 
         # Workspace allocation
         self.workspace_size = DEFAULT_WORKSPACE_SIZE_MB * 1024 * 1024
@@ -806,6 +812,13 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Initialize the metadata for a forward pass."""
+        if self._kv_shard_pool is not None:
+            prepare_kv_shard_forward(
+                self._kv_shard_pool,
+                self.req_to_token,
+                forward_batch,
+            )
+
         self._decode_kernel_loc = None
         # Delegate to parent for non-decode modes.
         if (
@@ -1483,14 +1496,29 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
 
         # TODO refactor to avoid code duplication
         merge_query = q_rope is not None
+        fused_fp8_query = None
         if (
             self.data_type == torch.float8_e4m3fn
         ) and forward_batch.forward_mode.is_target_verify():
             assert q_rope is not None and k_rope is not None
             if cos_sin_cache is None:
-                q, k, k_rope = mla_quantize_without_rope_for_fp8(
-                    q, q_rope, k.squeeze(1), k_rope.squeeze(1)
-                )
+                if save_kv_cache and self._fused_set_kv_concat_q_fp8:
+                    loc = self._resolve_fused_write_loc(forward_batch)
+                    if loc is not None:
+                        # Fused: bf16->fp8 quantize + KV scatter + q concat
+                        # in one launch; None when not covered.
+                        fused_fp8_query = self._set_kv_and_concat_q_fp8_fused(
+                            layer=layer,
+                            loc=loc,
+                            q=q,
+                            q_rope=q_rope,
+                            k=k,
+                            k_rope=k_rope,
+                        )
+                if fused_fp8_query is None:
+                    q, k, k_rope = mla_quantize_without_rope_for_fp8(
+                        q, q_rope, k.squeeze(1), k_rope.squeeze(1)
+                    )
             else:
                 q, k, k_rope = mla_quantize_and_rope_for_fp8(
                     q,
@@ -1505,8 +1533,8 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 )
             merge_query = False
 
-        # Save KV cache if requested
-        if save_kv_cache:
+        # Save KV cache if requested (the fused fp8 path already wrote it)
+        if save_kv_cache and fused_fp8_query is None:
             assert k is not None and k_rope is not None, (
                 "For populating trtllm_mla kv cache, both k_nope and k_rope should be not None."
             )
@@ -1520,8 +1548,11 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 )
 
         # TODO refactor to avoid code duplication
-        # Prepare query tensor inline
-        if merge_query:
+        # Prepare query tensor inline (already built when the fused fp8 path
+        # ran)
+        if fused_fp8_query is not None:
+            q = fused_fp8_query
+        elif merge_query:
             # For FP16 path, we merge the query and rope parts into a single tensor
             q_nope = q.view(-1, layer.tp_q_head_num, layer.v_head_dim)
             q_rope_reshaped = q_rope.view(
