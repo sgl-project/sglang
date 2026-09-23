@@ -21,6 +21,7 @@
 from typing import Iterable, Optional, Set, Tuple
 
 import torch
+import torch.nn.functional as F
 from torch import nn
 from transformers import PretrainedConfig
 
@@ -42,7 +43,7 @@ from sglang.srt.model_loader.weight_utils import (
     maybe_remap_kv_scale_name,
 )
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils import add_prefix, is_npu, make_layers
+from sglang.srt.utils import add_prefix, get_bool_env_var, is_npu, make_layers
 
 _is_npu = is_npu()
 
@@ -192,11 +193,127 @@ class Gemma2Attention(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
+        is_last_layer: bool = False,
     ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         q, k = self.rotary_emb(positions, q, k)
-        attn_output = self.attn(q, k, v, forward_batch)
+
+        can_optimize = (
+            is_last_layer
+            and forward_batch.forward_mode.is_extend()
+            and forward_batch.extend_seq_lens is not None
+            and q.shape[0] >= 2048
+            and not forward_batch.return_logprob
+            and not (
+                forward_batch.capture_hidden_mode
+                and forward_batch.capture_hidden_mode.is_full()
+            )
+            and not (
+                forward_batch.spec_info
+                and getattr(forward_batch.spec_info, "is_ragged_verify", False)
+            )
+            and not get_bool_env_var("SGLANG_DISABLE_FINAL_LAYER_OPT", "false")
+            and not (
+                torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
+            )
+        )
+
+        if can_optimize:
+            # 1. Save KV cache into SGLang memory pool for subsequent decode steps
+            try:
+                self.attn.save_kv_cache_only(k, v, forward_batch)
+            except Exception:
+                _ = self.attn(q, k, v, forward_batch, save_kv_cache=True)
+
+            # 2. Compute Single-Query Attention on terminal token(s)
+            num_groups = self.num_heads // self.num_kv_heads
+            logit_cap = getattr(self.attn, "logit_cap", 0.0) or 0.0
+            if forward_batch.extend_seq_lens.shape[0] == 1:
+                # Optimized fast path for single sequence (B=1)
+                q_b = q[-1:].view(1, 1, self.num_heads, self.head_dim).transpose(1, 2)
+                k_b = k.view(1, -1, self.num_kv_heads, self.head_dim).transpose(1, 2)
+                v_b = v.view(1, -1, self.num_kv_heads, self.head_dim).transpose(1, 2)
+                if num_groups > 1:
+                    k_b = k_b.repeat_interleave(num_groups, dim=1)
+                    v_b = v_b.repeat_interleave(num_groups, dim=1)
+                if logit_cap > 0.0:
+                    attn_weights = (
+                        torch.matmul(q_b, k_b.transpose(-1, -2)) * self.scaling
+                    )
+                    attn_weights = torch.tanh(attn_weights / logit_cap) * logit_cap
+                    attn_weights = F.softmax(
+                        attn_weights, dim=-1, dtype=torch.float32
+                    ).to(v_b.dtype)
+                    attn_output = (
+                        torch.matmul(attn_weights, v_b).transpose(1, 2).reshape(1, -1)
+                    )
+                else:
+                    attn_output = (
+                        F.scaled_dot_product_attention(
+                            q_b, k_b, v_b, is_causal=False, scale=self.scaling
+                        )
+                        .transpose(1, 2)
+                        .reshape(1, -1)
+                    )
+            else:
+                last_token_indices = (
+                    torch.cumsum(forward_batch.extend_seq_lens, dim=0) - 1
+                )
+                start_indices = torch.cat(
+                    [
+                        torch.zeros(1, dtype=torch.long, device=q.device),
+                        last_token_indices[:-1] + 1,
+                    ]
+                )
+                outs = []
+                for start_idx, end_idx in zip(start_indices, last_token_indices + 1):
+                    q_b = (
+                        q[end_idx - 1 : end_idx]
+                        .view(1, 1, self.num_heads, self.head_dim)
+                        .transpose(1, 2)
+                    )
+                    k_b = (
+                        k[start_idx:end_idx]
+                        .view(1, -1, self.num_kv_heads, self.head_dim)
+                        .transpose(1, 2)
+                    )
+                    v_b = (
+                        v[start_idx:end_idx]
+                        .view(1, -1, self.num_kv_heads, self.head_dim)
+                        .transpose(1, 2)
+                    )
+                    if num_groups > 1:
+                        k_b = k_b.repeat_interleave(num_groups, dim=1)
+                        v_b = v_b.repeat_interleave(num_groups, dim=1)
+                    if logit_cap > 0.0:
+                        attn_weights = (
+                            torch.matmul(q_b, k_b.transpose(-1, -2)) * self.scaling
+                        )
+                        attn_weights = (
+                            torch.tanh(attn_weights / logit_cap) * logit_cap
+                        )
+                        attn_weights = F.softmax(
+                            attn_weights, dim=-1, dtype=torch.float32
+                        ).to(v_b.dtype)
+                        out_b = (
+                            torch.matmul(attn_weights, v_b)
+                            .transpose(1, 2)
+                            .reshape(1, -1)
+                        )
+                    else:
+                        out_b = (
+                            F.scaled_dot_product_attention(
+                                q_b, k_b, v_b, is_causal=False, scale=self.scaling
+                            )
+                            .transpose(1, 2)
+                            .reshape(1, -1)
+                        )
+                    outs.append(out_b)
+                attn_output = torch.cat(outs, dim=0)
+        else:
+            attn_output = self.attn(q, k, v, forward_batch)
+
         output, _ = self.o_proj(attn_output)
         return output
 
@@ -250,6 +367,7 @@ class Gemma2DecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
         residual: Optional[torch.Tensor],
+        is_last_layer: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         if residual is None:
             residual = hidden_states
@@ -260,8 +378,38 @@ class Gemma2DecoderLayer(nn.Module):
             positions=positions,
             hidden_states=hidden_states,
             forward_batch=forward_batch,
+            is_last_layer=is_last_layer,
         )
         hidden_states = self.post_attention_layernorm(hidden_states)
+
+        can_optimize = (
+            is_last_layer
+            and forward_batch.forward_mode.is_extend()
+            and forward_batch.extend_seq_lens is not None
+            and hidden_states.shape[0] >= 2048
+            and not forward_batch.return_logprob
+            and not (
+                forward_batch.capture_hidden_mode
+                and forward_batch.capture_hidden_mode.is_full()
+            )
+            and not (
+                forward_batch.spec_info
+                and getattr(forward_batch.spec_info, "is_ragged_verify", False)
+            )
+            and not get_bool_env_var("SGLANG_DISABLE_FINAL_LAYER_OPT", "false")
+            and not (
+                torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
+            )
+        )
+
+        if can_optimize:
+            if forward_batch.extend_seq_lens.shape[0] == 1:
+                residual = residual[-1:]
+            else:
+                last_token_indices = (
+                    torch.cumsum(forward_batch.extend_seq_lens, dim=0) - 1
+                )
+                residual = residual[last_token_indices]
 
         hidden_states, residual = self.pre_feedforward_layernorm(
             hidden_states, residual
@@ -320,13 +468,16 @@ class Gemma2Model(nn.Module):
         hidden_states *= normalizer
 
         residual = None
-        for i in range(len(self.layers)):
+        num_layers = len(self.layers)
+        for i in range(num_layers):
             layer = self.layers[i]
+            is_last_layer = i == num_layers - 1
             hidden_states, residual = layer(
                 positions,
                 hidden_states,
                 forward_batch,
                 residual,
+                is_last_layer=is_last_layer,
             )
         hidden_states, _ = self.norm(hidden_states, residual)
         return hidden_states
