@@ -31,6 +31,7 @@ from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool, HybridLinearKVPoo
 from sglang.srt.mem_cache.pool_host import dsa as pool_host_dsa
 from sglang.srt.mem_cache.pool_host.host_pool_decl import (
     HostPoolDecl,
+    make_draft_sidecar_decls,
     make_kv_pool_decl,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -571,6 +572,40 @@ class TestDeclaredStackStructure(CustomTestCase):
                 self.assertEqual(stack.sidecars, [])
 
 
+class TestDraftSidecarDeclarations(CustomTestCase):
+    """Separate drafts reuse the target's declarations under DRAFT_* names."""
+
+    def test_dsa_draft_maps_to_draft_and_draft_indexer(self):
+        decls = make_draft_sidecar_decls(_dsa_pool_stub(layer_num=1).host_pool_decls())
+        self.assertEqual(
+            [(d.pool_name, d.indices_from_pool, d.layout_source) for d in decls],
+            [
+                (PoolName.DRAFT, PoolName.KV, None),
+                (PoolName.DRAFT_INDEXER, PoolName.KV, PoolName.DRAFT),
+            ],
+        )
+
+    def test_sidecar_group_plans_with_external_index_primary(self):
+        pool = _dsa_pool_stub(layer_num=2)
+        configs = prepare_host_pool_configs(
+            decls=make_draft_sidecar_decls(pool.host_pool_decls()),
+            full_layer_mapping={0: 0, 1: 1},
+            transfer_layer_id_max=2,
+            index_primary=PoolName.KV,
+        )
+        self.assertEqual(
+            [c.decl.pool_name for c in configs],
+            [PoolName.DRAFT, PoolName.DRAFT_INDEXER],
+        )
+        with self.assertRaisesRegex(ValueError, "every index from the target"):
+            prepare_host_pool_configs(
+                decls=pool.host_pool_decls(),
+                full_layer_mapping={0: 0, 1: 1},
+                transfer_layer_id_max=2,
+                index_primary=PoolName.KV,
+            )
+
+
 class TestPackedDraftPairing(CustomTestCase):
     """Packing appends draft layers to the target host_pools, so a draft must
     declare every target pool with an identical per-layer layout."""
@@ -668,6 +703,97 @@ class TestKvHostPoolRow(CustomTestCase):
         with self.assertRaisesRegex(ValueError, "KV row"):
             self._build(pool, (draft,))
         self._build(pool, (_dsa_pool_stub(layer_num=1),))
+
+
+class TestSeparateDraftStructure(CustomTestCase):
+    """Separate draft sidecars: DRAFT sized on the target's logical space, its
+    indexer laid out on DRAFT, both taking transfer indices from target KV; a
+    draft without index buffers gets no indexer sidecar."""
+
+    def _run(self, pool):
+        from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
+
+        real_indexer_host = pool_host_dsa.DSAIndexerPoolHost
+
+        def dummy_draft_host(
+            *, pool, host_to_device_ratio, page_size, layout, allocator_type, pool_label
+        ):
+            return MLATokenToKVPoolHost(
+                pool,
+                host_to_device_ratio=host_to_device_ratio,
+                host_size=0,
+                page_size=page_size,
+                layout=layout,
+                pin_memory=False,
+                is_dummy=True,
+                override_kv_cache_dim=pool.kv_cache_dim,
+                pool_label=pool_label,
+            )
+
+        def dummy_indexer_host(
+            decl, anchor_host, *, allocator_type, packed_draft_device_pools=()
+        ):
+            return real_indexer_host(
+                decl=decl,
+                anchor_host=anchor_host,
+                packed_draft_device_pools=packed_draft_device_pools,
+                allocator_type=allocator_type,
+                pin_memory=False,
+                is_dummy=True,
+            )
+
+        tree_cache = SimpleNamespace(
+            cache_controller=SimpleNamespace(
+                mem_pool_host=SimpleNamespace(size=8192, logical_size=8192),
+                page_size=64,
+            )
+        )
+        with (
+            patch.object(
+                hybrid_pool_assembler, "_build_mha_mla_host_pool", dummy_draft_host
+            ),
+            patch.object(pool_host_dsa, "DSAIndexerPoolHost", dummy_indexer_host),
+            patch.object(
+                hybrid_pool_assembler, "_get_allocator_type", return_value="default"
+            ),
+            patch.object(
+                hybrid_pool_assembler,
+                "get_memory",
+                return_value=SimpleNamespace(hicache_mem_layout="page_first"),
+            ),
+        ):
+            return build_full_draft_pools(draft_kv_pool=pool, tree_cache=tree_cache)
+
+    def test_dsa_draft_sidecars(self):
+        pool = _dsa_pool_stub(layer_num=2, size=4096)
+        specs, entries = self._run(pool)
+        self.assertEqual(
+            [(s.pool_name, s.indices_from_pool) for s in specs],
+            [(PoolName.DRAFT, PoolName.KV), (PoolName.DRAFT_INDEXER, PoolName.KV)],
+        )
+        # 8192 logical target tokens / 4096 draft tokens -> ratio 2, same geometry
+        mapper = (None, 0, 1, None, None)
+        self.assertEqual(
+            _entry_shape(SimpleNamespace(entries=entries), 2),
+            [
+                (PoolName.DRAFT, False, id(pool), (), mapper, _kv_shape(2)),
+                (
+                    PoolName.DRAFT_INDEXER,
+                    False,
+                    id(pool),
+                    (),
+                    mapper,
+                    _indexer_shape(2),
+                ),
+            ],
+        )
+
+    def test_draft_without_index_buffers_has_no_indexer_sidecar(self):
+        pool = _dsa_pool_stub(layer_num=2, size=4096)
+        pool.index_key_cache = SimpleNamespace(buffer=[])
+        specs, entries = self._run(pool)
+        self.assertEqual([s.pool_name for s in specs], [PoolName.DRAFT])
+        self.assertEqual([e.name for e in entries], [PoolName.DRAFT])
 
 
 class TestDeclaredPoolPlanning(CustomTestCase):
