@@ -2,6 +2,7 @@
 
 import unittest
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 from sglang.srt.lora.lora_manager import LoRAManager
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -29,6 +30,7 @@ class TestUnoInactiveLoRABatch(CustomTestCase):
         backend = _InactiveSkippingBackend()
         manager = LoRAManager.__new__(LoRAManager)
         manager.lora_backend = backend
+        manager.memory_pool = SimpleNamespace(check_valid=Mock())
         forward_batch = SimpleNamespace(lora_ids=[None], batch_size=1)
 
         manager.prepare_lora_batch(forward_batch)
