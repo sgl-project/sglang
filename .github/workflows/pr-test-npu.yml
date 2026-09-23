@@ -70,10 +70,18 @@ jobs:
         if: steps.run-mode.outputs.run_all_tests != 'true'
         with:
           filters: |
+            # Everything under python/sglang except multimodal_gen/ and kernels/ops/diffusion/.
+            # Exclusions have to be extglobs inside a single pattern: paths-filter ORs the
+            # patterns of a filter (predicate-quantifier defaults to "some"), so a standalone
+            # "!some/path/**" entry matches every file outside that path and makes the whole
+            # filter unconditionally true.
             main_package:
-              - "python/sglang/**/!(*.md)"
-              - "!python/sglang/multimodal_gen/**"
-              - "!python/sglang/kernels/ops/diffusion/**"
+              - "python/sglang/!(*.md)"
+              - "python/sglang/!(multimodal_gen|kernels)/**/!(*.md)"
+              - "python/sglang/kernels/!(*.md)"
+              - "python/sglang/kernels/!(ops)/**/!(*.md)"
+              - "python/sglang/kernels/ops/!(*.md)"
+              - "python/sglang/kernels/ops/!(diffusion)/**/!(*.md)"
               - "python/pyproject_npu.toml"
               - "scripts/ci/npu/npu_ci_install_dependency.sh"
               - "test/registered/npu/**"
