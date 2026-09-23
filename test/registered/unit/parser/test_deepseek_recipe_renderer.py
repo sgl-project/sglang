@@ -143,6 +143,55 @@ class TestDeepSeekRecipe(CustomTestCase):
         )
         self.assertEqual(thinking[-2:], self._ids("<｜Assistant｜>", "<think>"))
 
+    def _history_tool_call_prompt(self, arguments):
+        deepseek_recipe = renderer.DeepSeekRecipe("dsv4", self.tokenizer)
+        prompt_ids = deepseek_recipe.encode(
+            {
+                "messages": [
+                    {"role": "user", "content": "Run it."},
+                    {
+                        "role": "assistant",
+                        "content": "",
+                        "tool_calls": [
+                            {
+                                "id": "call_1",
+                                "type": "function",
+                                "function": {"name": "run", "arguments": arguments},
+                            }
+                        ],
+                    },
+                    {"role": "tool", "tool_call_id": "call_1", "content": "done"},
+                ],
+                "thinking": False,
+            }
+        )
+        return self.tokenizer.decode(prompt_ids, skip_special_tokens=False)
+
+    def test_history_dict_arguments_expand_per_key(self):
+        """History parameters must not teach the next call an extra arguments key."""
+        prompt = self._history_tool_call_prompt({"src": "a.py", "dst": "b.py"})
+        self.assertIn('parameter name="src" string="true">a.py<', prompt)
+        self.assertIn('parameter name="dst" string="true">b.py<', prompt)
+        self.assertNotIn('name="arguments"', prompt)
+
+    def test_history_json_string_arguments_expand_per_key(self):
+        prompt = self._history_tool_call_prompt('{"path": "/proj/a.py"}')
+        self.assertIn('parameter name="path" string="true">/proj/a.py<', prompt)
+        self.assertNotIn('name="arguments"', prompt)
+
+    def test_history_non_string_values_marked_not_string(self):
+        prompt = self._history_tool_call_prompt({"count": 3, "tags": ["a"]})
+        self.assertIn('parameter name="count" string="false">3<', prompt)
+        self.assertIn('parameter name="tags" string="false">["a"]<', prompt)
+        self.assertNotIn('name="arguments"', prompt)
+
+    def test_empty_history_arguments_produce_no_parameters(self):
+        for arguments in ({}, "{}"):
+            with self.subTest(arguments=arguments):
+                prompt = self._history_tool_call_prompt(arguments)
+                self.assertIn('<｜DSML｜invoke name="run">', prompt)
+                self.assertNotIn("<｜DSML｜parameter", prompt)
+
     def test_tasks_replace_or_follow_the_generation_header(self):
         for thinking in (False, True):
             body = {
