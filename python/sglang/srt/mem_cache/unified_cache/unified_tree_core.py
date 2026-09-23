@@ -367,18 +367,6 @@ class UnifiedLRUList:
             return None
         return x
 
-    def get_prev_leaf_no_lock(self, node: UnifiedTreeNode, check_id: bool = True):
-        if check_id:
-            assert node.id in self.cache
-        pt = self._pt
-        ct = self.component_type
-        x = node.lru_prev[pt]
-        while x.component_data[ct].lock_ref > 0 or len(x.children) > 0:
-            x = x.lru_prev[pt]
-        if x == self.head:
-            return None
-        return x
-
     def get_prev_no_host_lock(self, node: UnifiedTreeNode, check_id: bool = True):
         """Host-LRU walker: skip nodes whose component host_lock_ref > 0."""
         if check_id:
@@ -394,9 +382,6 @@ class UnifiedLRUList:
 
     def get_lru_no_lock(self):
         return self.get_prev_no_lock(self.tail, check_id=False)
-
-    def get_leaf_lru_no_lock(self):
-        return self.get_prev_leaf_no_lock(self.tail, check_id=False)
 
     def get_lru_no_host_lock(self):
         return self.get_prev_no_host_lock(self.tail, check_id=False)
@@ -2321,6 +2306,21 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                 nodes_to_load=[],
             )
             return empty_kv, {}
+        # SWA can be evicted independently of FULL, including holes between
+        # resident SWA nodes. Describe precisely which full rows back it.
+        full_load_slices = {}
+        offset = 0
+        for nid in kv_xfer.nodes_to_load or ():
+            count = len(self.node_by_id(nid).key)
+            full_load_slices[nid] = slice(offset, offset + count)
+            offset += count
+        for xfer in comp_xfers.get(ComponentType.SWA, ()):
+            xfer.anchor_index_parts = [
+                full_load_slices[nid]
+                if nid in full_load_slices
+                else self.node_by_id(nid).component_data[BASE_COMPONENT_TYPE].value
+                for nid in xfer.nodes_to_load or ()
+            ]
         return kv_xfer, comp_xfers
 
     def prefetch_anchor_info(
@@ -2863,16 +2863,20 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                         f"{ct} device LRU: "
                         f"+tree={tree_ids - lru_ids}, +lru={lru_ids - tree_ids}"
                     )
-                # Aux host-only states must match the host LRU.
+                # Aux host-only states must match the host LRU. A host lock
+                # delists its node, so locked nodes are exempt on both sides.
                 host_lru = self.host_lru_lists[ct]
+                host_locked_ids = {
+                    n.id for n in all_nodes if n.component_data[ct].host_lock_ref > 0
+                }
                 s3_ids = {
                     n.id
                     for n in all_nodes
                     if n is not self.root_node
                     and n.component_data[ct].value is None
                     and n.component_data[ct].host_value is not None
-                }
-                host_lru_ids = set(host_lru.cache.keys())
+                } - host_locked_ids
+                host_lru_ids = set(host_lru.cache.keys()) - host_locked_ids
                 if s3_ids != host_lru_ids:
                     E(
                         f"{ct} host LRU: "

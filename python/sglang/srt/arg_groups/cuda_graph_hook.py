@@ -14,6 +14,7 @@ from sglang.srt.arg_groups.overrides import (
     resolving_view,
 )
 from sglang.srt.connector import ConnectorType
+from sglang.srt.environ import envs
 from sglang.srt.model_executor.cuda_graph_config import (
     ALLOWED_BACKENDS_PER_PHASE,
     Backend,
@@ -78,6 +79,8 @@ def parse_cuda_graph_config(server_args: Any):
         _set(Phase.DECODE, "max_bs", cfg.cuda_graph_max_bs_decode)
     if cfg.cuda_graph_max_bs_prefill is not None:
         _set(Phase.PREFILL, "max_bs", cfg.cuda_graph_max_bs_prefill)
+    if cfg.cuda_graph_max_seq_len_prefill is not None:
+        _set(Phase.PREFILL, "max_seq_len", cfg.cuda_graph_max_seq_len_prefill)
     if cfg.cuda_graph_bs_decode is not None:
         _set(Phase.DECODE, "bs", cfg.cuda_graph_bs_decode)
     if cfg.cuda_graph_bs_prefill is not None:
@@ -191,7 +194,10 @@ def disable_tc_piecewise_cudagraph_if_incompatible(server_args: Any):
             "non-CUDA hardware (HIP/NPU/CPU/MPS/XPU)",
             lambda: (
                 get_platform().is_hip
-                or get_platform().is_npu
+                or (
+                    get_platform().is_npu
+                    and not envs.SGLANG_NPU_ENABLE_PIECEWISE_CUDA_GRAPH.get()
+                )
                 or is_cpu()
                 or is_mps()
                 or get_platform().is_xpu

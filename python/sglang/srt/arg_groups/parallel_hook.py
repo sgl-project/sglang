@@ -403,21 +403,6 @@ def handle_elastic_ep(server_args: Any):
     from sglang.srt.arg_groups.validation_hook import validate_ib_devices
 
     cfg = resolving_view(server_args)
-    if cfg.elastic_ep_rejoin:
-        if cfg.ep_join_mode is None:
-            logger.warning(
-                "--elastic-ep-rejoin is deprecated, use --elastic-ep-join-mode recover instead."
-            )
-            declare_resolution(
-                server_args,
-                "_handle_elastic_ep",
-                ep_join_mode="recover",
-            )
-        else:
-            assert cfg.ep_join_mode == "recover", (
-                "--elastic-ep-rejoin (deprecated) conflicts with "
-                f"--elastic-ep-join-mode {cfg.ep_join_mode}."
-            )
     if cfg.elastic_ep_backend is not None:
         if cfg.enable_eplb:
             if cfg.eplb_algorithm == "auto":
@@ -544,16 +529,37 @@ def handle_elastic_ep(server_args: Any):
             f"(got pp_size={cfg.pp_size}); WORLD must not span PP stages."
         )
 
-        decode_cuda_graph_disabled = (
-            cfg.cuda_graph_config.decode.backend == Backend.DISABLED
+        decode_backend = cfg.cuda_graph_config.decode.backend
+        assert decode_backend in (Backend.DISABLED, Backend.FULL), (
+            "Elastic EP runtime scale-up supports decode CUDA graph backend "
+            f"'full' or 'disabled' (got {decode_backend!r})."
         )
-        prefill_cuda_graph_disabled = (
-            cfg.cuda_graph_config.prefill.backend == Backend.DISABLED
+        assert cfg.cuda_graph_config.prefill.backend == Backend.DISABLED, (
+            "Elastic EP runtime scale-up requires prefill CUDA graph to be disabled."
         )
-        assert decode_cuda_graph_disabled and prefill_cuda_graph_disabled, (
-            "Elastic EP runtime scale-up requires decode and prefill CUDA "
-            "graphs to be disabled."
-        )
+        if decode_backend == Backend.FULL:
+            assert cfg.device == "cuda", (
+                "Elastic EP CUDA graph recapture requires CUDA "
+                f"(got device={cfg.device!r})."
+            )
+            assert cfg.speculative_algorithm is None, (
+                "Elastic EP CUDA graph recapture does not support speculative decoding."
+            )
+            assert not cfg.is_embedding, (
+                "Elastic EP CUDA graph recapture does not support embedding models."
+            )
+            assert cfg.dllm_algorithm is None, (
+                "Elastic EP CUDA graph recapture does not support diffusion models."
+            )
+            assert not cfg.encoder_only, (
+                "Elastic EP CUDA graph recapture does not support encoder-only models."
+            )
+            assert not cfg.forward_hooks, (
+                "Elastic EP CUDA graph recapture does not support forward hooks."
+            )
+            assert not cfg.enable_pdmux, (
+                "Elastic EP CUDA graph recapture does not support PDMux."
+            )
         assert resolved.enable_dp_attention, (
             "Elastic EP scale-up requires --enable-dp-attention; without it "
             "the TP group is not equivalent to WORLD and the post-scale "
@@ -632,13 +638,6 @@ def handle_eplb_and_dispatch(server_args: Any):
 
 def handle_expert_distribution_metrics(server_args: Any):
     cfg = resolving_view(server_args)
-    if "SGLANG_ENABLE_EPLB_BALANCEDNESS_METRIC" in os.environ:
-        raise ValueError(
-            "SGLANG_ENABLE_EPLB_BALANCEDNESS_METRIC is no longer supported. Use "
-            "--expert-balancedness-report-mode with one of: off, server_log, "
-            "prometheus, both."
-        )
-
     if should_report_expert_balancedness(server_args) and (
         cfg.expert_distribution_recorder_mode is None
     ):

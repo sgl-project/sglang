@@ -1257,6 +1257,28 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     ) -> None:
         """Validates that the input token count and the requested token count doesn't exceed the model's context length."""
         # FIXME: unify the length validation logic with the one in the scheduler.
+        if get_exec().features.enable_encoder_swa_bounded_replay:
+            if any(
+                value is not None
+                for value in (
+                    obj.image_data,
+                    obj.video_data,
+                    obj.audio_data,
+                    obj.input_embeds,
+                    obj.positional_embed_overrides,
+                )
+            ):
+                raise ValueError(
+                    "encoder SWA replay currently supports token-only text requests"
+                )
+            if (
+                isinstance(obj, GenerateReqInput)
+                and obj.return_logprob
+                and obj.logprob_start_len not in (None, -1, len(input_ids))
+            ):
+                raise ValueError(
+                    "encoder SWA replay cannot return cached prompt logprobs"
+                )
         _max_req_len = self.context_len
         input_token_num = len(input_ids) if input_ids is not None else 0
         input_token_num += self.num_reserved_tokens
@@ -1813,9 +1835,13 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         is_stream = getattr(obj, "stream", False)
         while True:
             try:
-                await asyncio.wait_for(
-                    state.event.wait(), timeout=_REQUEST_STATE_WAIT_TIMEOUT
-                )
+                if request is None:
+                    # Engine requests have no HTTP client to poll for disconnects.
+                    await state.event.wait()
+                else:
+                    await asyncio.wait_for(
+                        state.event.wait(), timeout=_REQUEST_STATE_WAIT_TIMEOUT
+                    )
             except asyncio.TimeoutError:
                 if (
                     request is not None
@@ -2956,10 +2982,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                         / recv_obj.spec_verify_ct[i]
                     )
 
-                # FIXME: backward-compat aliases, remove in next release.
-                meta_info["spec_accepted_drafts"] = num_correct_drafts
-                meta_info["spec_proposed_drafts"] = num_proposed_drafts
-
             # Acceptance histogram: tracks how many decoding steps accepted a certain number of draft tokens.
             if (
                 recv_obj.spec_correct_drafts_histogram
@@ -2967,10 +2989,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 and recv_obj.spec_correct_drafts_histogram[i]
             ):
                 meta_info["spec_correct_drafts_histogram"] = (
-                    recv_obj.spec_correct_drafts_histogram[i]
-                )
-                # FIXME: backward-compat alias, remove in next release.
-                meta_info["spec_accept_histogram"] = (
                     recv_obj.spec_correct_drafts_histogram[i]
                 )
             if (

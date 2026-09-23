@@ -24,6 +24,7 @@ from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.environ import envs
 from sglang.srt.runtime_context import (
     get_disagg,
+    get_spec,
 )
 from sglang.srt.utils import is_npu
 
@@ -184,6 +185,9 @@ def _apply_metadata_gate(polls, decode_reqs, metadata_buffers) -> None:
 
 def _all_reduce_polls(polls: List[int], group: dist.ProcessGroup) -> List[int]:
     """MIN-reduce poll states so no rank commits ahead of its peers."""
+    if dist.get_world_size(group) == 1:
+        return polls
+
     tensor_to_reduce = torch.tensor(polls, dtype=torch.uint8, device="cpu")
     dist.all_reduce(tensor_to_reduce, op=dist.ReduceOp.MIN, group=group)
     return tensor_to_reduce.tolist()
@@ -999,10 +1003,12 @@ def build_kv_layer_ids(
     draft_ids = _draft_entry_layer_ids(
         pool=draft_token_to_kv_pool, num_entries=num_draft_entries
     )
-    # Rank the draft's own ids by first appearance, so the band stays dense and
-    # contiguous whatever the draft config numbers its layers.
-    band_index = {lid: i for i, lid in enumerate(dict.fromkeys(draft_ids))}
-    return layer_ids + [num_hidden_layers + band_index[lid] for lid in draft_ids]
+    return layer_ids + _remap_draft_layer_ids(draft_ids, num_hidden_layers)
+
+
+def _remap_draft_layer_ids(layer_ids: List[int], num_hidden_layers: int) -> List[int]:
+    band_index = {layer_id: i for i, layer_id in enumerate(dict.fromkeys(layer_ids))}
+    return [num_hidden_layers + band_index[layer_id] for layer_id in layer_ids]
 
 
 def _draft_entry_layer_ids(*, pool, num_entries: int) -> List[int]:
@@ -1306,6 +1312,14 @@ def build_dsa_tail_transfer_blocks(
     return transfer_blocks
 
 
+def get_kv_transfer_buf_infos(pool):
+    from sglang.srt.mem_cache.memory_pool import MiniMaxSparseKVPool
+
+    if isinstance(pool, MiniMaxSparseKVPool):
+        return pool.get_sparse_kv_buf_infos()
+    return pool.get_contiguous_buf_infos()
+
+
 def setup_state_kv_args(
     kv_args: KVArgs,
     token_to_kv_pool,
@@ -1371,6 +1385,11 @@ def setup_state_kv_args(
         if token_to_kv_pool.index_k_pool is not None:
             dp, dl, il = token_to_kv_pool.get_index_k_state_buf_infos()
             append_state_component(kv_args, StateType.MINIMAX_INDEX_K, dp, dl, il)
+        append_state_component(
+            kv_args,
+            StateType.MINIMAX_DENSE_KV,
+            *token_to_kv_pool.get_dense_kv_state_buf_infos(),
+        )
     elif hasattr(token_to_kv_pool, "get_state_buf_infos"):
         data_ptrs, data_lens, item_lens = token_to_kv_pool.get_state_buf_infos()
 
@@ -1475,16 +1494,50 @@ def setup_state_kv_args(
                 qsa_ptrs, qsa_lens, qsa_item_lens = (
                     token_to_kv_pool.get_qsa_pending_state_buf_infos()
                 )
+                qsa_layer_ids = token_to_kv_pool.get_qsa_pending_state_layer_ids()
+                compressed_ptrs, compressed_lens, compressed_item_lens = (
+                    token_to_kv_pool.get_qsa_compressed_state_buf_infos()
+                )
+                compressed_layer_ids = (
+                    token_to_kv_pool.get_qsa_compressed_state_layer_ids()
+                )
+                if isinstance(draft_token_to_kv_pool, QSATokenToKVPool):
+                    if total_kv_layers is None:
+                        raise ValueError(
+                            "QSA draft state transfer requires total_kv_layers"
+                        )
+                    draft_ptrs, draft_lens, draft_item_lens = (
+                        draft_token_to_kv_pool.get_qsa_pending_state_buf_infos()
+                    )
+                    draft_layer_ids = _remap_draft_layer_ids(
+                        draft_token_to_kv_pool.get_qsa_pending_state_layer_ids(),
+                        total_kv_layers,
+                    )
+                    qsa_ptrs += draft_ptrs
+                    qsa_lens += draft_lens
+                    qsa_item_lens += draft_item_lens
+                    qsa_layer_ids += draft_layer_ids
+
+                    (
+                        draft_compressed_ptrs,
+                        draft_compressed_lens,
+                        draft_compressed_item_lens,
+                    ) = draft_token_to_kv_pool.get_qsa_compressed_state_buf_infos()
+                    draft_compressed_layer_ids = _remap_draft_layer_ids(
+                        draft_token_to_kv_pool.get_qsa_compressed_state_layer_ids(),
+                        total_kv_layers,
+                    )
+                    compressed_ptrs += draft_compressed_ptrs
+                    compressed_lens += draft_compressed_lens
+                    compressed_item_lens += draft_compressed_item_lens
+                    compressed_layer_ids += draft_compressed_layer_ids
                 append_state_component(
                     kv_args,
                     StateType.QSA_PENDING,
                     qsa_ptrs,
                     qsa_lens,
                     qsa_item_lens,
-                    layer_ids=token_to_kv_pool.get_qsa_pending_state_layer_ids(),
-                )
-                compressed_ptrs, compressed_lens, compressed_item_lens = (
-                    token_to_kv_pool.get_qsa_compressed_state_buf_infos()
+                    layer_ids=qsa_layer_ids,
                 )
                 append_state_component(
                     kv_args,
@@ -1492,7 +1545,7 @@ def setup_state_kv_args(
                     compressed_ptrs,
                     compressed_lens,
                     compressed_item_lens,
-                    layer_ids=token_to_kv_pool.get_qsa_compressed_state_layer_ids(),
+                    layer_ids=compressed_layer_ids,
                 )
         elif isinstance(token_to_kv_pool, (DSATokenToKVPool, NPUMLATokenToKVPool)):
             tail_ptrs, tail_lens, tail_item_lens = [], [], []
@@ -1672,6 +1725,29 @@ def setup_state_kv_args(
                 conv_shard_groups,
                 slice_outer_counts,
             )
+
+
+def get_dsv41_spec_layout(kv_args: KVArgs) -> Optional[dict]:
+    """Describe the positional transfer layout without pool capacities or pointers."""
+    ratios = getattr(kv_args, "mla_compression_ratios", None) or []
+    if 2 not in ratios or str(get_spec().speculative_algorithm).upper() != "DSPARK":
+        return None
+
+    from sglang.srt.disaggregation.base.conn import StateType
+
+    if kv_args.state_types.count(StateType.SWA) != 2:
+        raise RuntimeError(
+            "DeepSeek-V4.1 DSpark PD requires target and draft SWA state"
+        )
+
+    return {
+        "num_draft_tokens": get_spec().speculative_num_draft_tokens,
+        "compression_ratios": list(ratios),
+        "kv_layer_ids": list(kv_args.kv_layer_ids),
+        "kv_item_lens": list(kv_args.kv_item_lens),
+        "state_types": [state_type.value for state_type in kv_args.state_types],
+        "state_item_lens": [list(items) for items in kv_args.state_item_lens],
+    }
 
 
 def prepare_abort(req: Req, error_message: str, status_code=None):

@@ -105,6 +105,7 @@ class NPUMHATokenToKVPool(MHATokenToKVPool):
         **kwargs,
     ):
         self.use_fia = get_bool_env_var("ASCEND_USE_FIA", "False")
+        self.use_scatter_pa_kv_cache = envs.SGLANG_NPU_USE_SCATTER_PA_KV_CACHE.get()
         self.use_triton_prefix_kv_cache_store = (
             envs.SGLANG_NPU_USE_TRITON_PREFIX_KV_CACHE_STORE.get()
         )
@@ -276,22 +277,65 @@ class NPUMHATokenToKVPool(MHATokenToKVPool):
                     f"v_head_dim={self.v_head_dim}."
                 )
 
-            # aclnnScatterNdUpdate on the deployed CANN rejects the otherwise
-            # valid 4-D [slot, 1, head, dim] update during tiling. Flatten only
-            # the singleton FIA layout axis and scatter through an equivalent
-            # 3-D view; the underlying KV storage and attention layout stay
-            # unchanged.
-            loc_indices = loc.contiguous().view(-1, 1)
-            torch_npu.npu_scatter_nd_update_(
-                k_buffer_layer.view(-1, self.head_num, self.head_dim),
-                loc_indices,
-                cache_k.contiguous().view(num_rows, self.head_num, self.head_dim),
-            )
-            torch_npu.npu_scatter_nd_update_(
-                v_buffer_layer.view(-1, self.head_num, self.v_head_dim),
-                loc_indices,
-                cache_v.contiguous().view(num_rows, self.head_num, self.v_head_dim),
-            )
+            if self.use_scatter_pa_kv_cache:
+                # Single fused write for K and V: one kernel instead of the
+                # two aclnnScatterNdUpdate launches below. Bit-identical to
+                # the unfused path (same flat slot indexing, cross-page safe).
+                if not hasattr(torch_npu, "npu_scatter_pa_kv_cache"):
+                    raise RuntimeError(
+                        "The installed torch_npu does not provide "
+                        "npu_scatter_pa_kv_cache. Please upgrade torch_npu/CANN "
+                        "or unset SGLANG_NPU_USE_SCATTER_PA_KV_CACHE."
+                    )
+                if self.store_dtype not in (
+                    torch.float16,
+                    torch.bfloat16,
+                    torch.int8,
+                ):
+                    raise RuntimeError(
+                        "npu_scatter_pa_kv_cache only supports fp16, bf16, and "
+                        f"int8 KV cache, but got {self.store_dtype}."
+                    )
+                key = cache_k.reshape(-1, self.head_num, self.head_dim).contiguous()
+                value = cache_v.reshape(-1, self.head_num, self.v_head_dim).contiguous()
+                key_cache = k_buffer_layer.view(
+                    -1, self.page_size, self.head_num, self.head_dim
+                )
+                value_cache = v_buffer_layer.view(
+                    -1, self.page_size, self.head_num, self.v_head_dim
+                )
+                # int32/int64 slot mappings are both accepted by the op; avoid
+                # a per-layer dtype-cast kernel (prefill/spec paths hand over
+                # int64 locs).
+                slot_mapping = loc.reshape(-1)
+                if slot_mapping.dtype not in (torch.int32, torch.int64):
+                    slot_mapping = slot_mapping.to(torch.int32)
+
+                torch_npu.npu_scatter_pa_kv_cache(
+                    key,
+                    value,
+                    key_cache,
+                    value_cache,
+                    slot_mapping,
+                    cache_mode="Norm",
+                )
+            else:
+                # aclnnScatterNdUpdate on the deployed CANN rejects the otherwise
+                # valid 4-D [slot, 1, head, dim] update during tiling. Flatten only
+                # the singleton FIA layout axis and scatter through an equivalent
+                # 3-D view; the underlying KV storage and attention layout stay
+                # unchanged.
+                loc_indices = loc.contiguous().view(-1, 1)
+                torch_npu.npu_scatter_nd_update_(
+                    k_buffer_layer.view(-1, self.head_num, self.head_dim),
+                    loc_indices,
+                    cache_k.contiguous().view(num_rows, self.head_num, self.head_dim),
+                )
+                torch_npu.npu_scatter_nd_update_(
+                    v_buffer_layer.view(-1, self.head_num, self.v_head_dim),
+                    loc_indices,
+                    cache_v.contiguous().view(num_rows, self.head_num, self.v_head_dim),
+                )
         else:
             loc = loc.to(torch.int32)
             torch_npu._npu_reshape_and_cache(
