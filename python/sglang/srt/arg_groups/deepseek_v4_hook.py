@@ -312,7 +312,6 @@ def _validate_deepseek_v41_vision_prefill_cp(server_args: ServerArgs) -> None:
             f"interleave; got {cfg.cp_strategy!r}."
         )
     if cfg.cuda_graph_config.prefill.backend != Backend.DISABLED:
-        # The CP runner merges image features eagerly; no capture path replays it.
         locked = getattr(server_args, "_cuda_graph_config_locked", set())
         if (Phase.PREFILL, "backend") in locked:
             raise ValueError(

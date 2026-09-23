@@ -5101,8 +5101,6 @@ class DeepseekV4ForCausalLM(nn.Module):
         if has_images and input_embeds is not None:
             raise ValueError("Cannot combine input_embeds and image inputs")
         mm_owner = self._mm_owner_session(forward_batch) if has_images else None
-        # Peers may only enter the body or the CP shard once every rank has
-        # finished all of its fallible input preparation, the remap included.
         with mm_owner.fence() if mm_owner is not None else nullcontext():
             if has_images:
                 input_embeds = self._prepare_mm_embeddings(

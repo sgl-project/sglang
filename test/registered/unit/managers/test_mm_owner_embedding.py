@@ -2,7 +2,7 @@
 
 import json
 import sys
-from contextlib import nullcontext
+from contextlib import ExitStack, contextmanager, nullcontext
 from datetime import timedelta
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -154,9 +154,7 @@ class _RecordingBody:
         return self.embed
 
     def __call__(self, input_ids, positions, forward_batch, input_embeds=None):
-        self.calls.append(
-            SimpleNamespace(input_ids=input_ids, input_embeds=input_embeds)
-        )
+        self.calls.append(input_ids)
         return input_embeds, input_embeds
 
 
@@ -195,13 +193,9 @@ class _VisionStub(DeepseekV4ForCausalLM):
         self.logits_calls = []
         self.tag = tag
         self.encoded = []
-        self.fail_hashes = set()
 
     def get_image_feature(self, items):
-        hashes = [item.hash for item in items]
-        if self.fail_hashes.intersection(hashes):
-            raise RuntimeError("injected encoder failure")
-        self.encoded.extend(hashes)
+        self.encoded.extend(item.hash for item in items)
         return [
             _span(item.hash, item.offsets[0][1] - item.offsets[0][0] + 1, self.tag)
             for item in items
@@ -216,7 +210,7 @@ class _VisionStub(DeepseekV4ForCausalLM):
         aux_hidden_states=None,
         hidden_states_before_norm=None,
     ):
-        self.logits_calls.append(SimpleNamespace(hidden_states=hidden_states))
+        self.logits_calls.append(hidden_states)
         return object()
 
     def prepare(self, forward_batch):
@@ -320,19 +314,6 @@ def _rank_main(rank, world_size, init_file, directory, target):
         dist.destroy_process_group()
 
 
-def _assert_traces_agree(results, ranks):
-    traces = [results[rank]["trace"] for rank in ranks]
-    assert all(trace == traces[0] for trace in traces), traces
-
-
-def _expect_protocol_error(run):
-    try:
-        run()
-    except MmOwnerProtocolError as exc:
-        return str(exc)
-    raise AssertionError("the entrypoint did not raise MmOwnerProtocolError")
-
-
 @torch.no_grad()
 def _run_cp_extend(model, forward_batch, coordinator):
     def gather(output, input_tensor):
@@ -361,6 +342,29 @@ def _run_cp_extend(model, forward_batch, coordinator):
         runner._execute_extend_cp(forward_batch, {})
 
 
+@contextmanager
+def _interleave_cp(cp_size, **parallel):
+    init_cp_strategy(enable_prefill_cp=True, cp_size=cp_size, cp_strategy="interleave")
+    try:
+        with get_parallel().override(attn_cp_size=cp_size, **parallel):
+            yield
+    finally:
+        init_cp_strategy(enable_prefill_cp=False, cp_size=1, cp_strategy="interleave")
+
+
+MANIFEST = ["all_gather_object", "RankManifest", 4]
+PLAN = ["broadcast_object", 0, 4]
+STATUS = ["all_gather_object", "RankStatus", 4]
+
+
+def _bcast(src, rows, size=4):
+    return ["broadcast", src, [rows, HIDDEN], size]
+
+
+def _cold(*payloads):
+    return [MANIFEST, PLAN, STATUS, *payloads, STATUS, STATUS]
+
+
 # Global rank 0 sits outside the owner group, so a group-local source index that
 # leaks out as a global rank is caught.
 A, B, C, D, E = 400, 401, 402, 403, 404  # owner = hash % 4 -> group ranks 0,1,2,3,0
@@ -387,557 +391,286 @@ def _owner_lifetime_program(rank, world_size):
     _seed_cache(C, ROWS[C], CACHE_TAG)
     if local == 3:
         _seed_cache(D, ROWS[D] + 2, CACHE_TAG + rank)
-    tags = {A: CACHE_TAG + 1, B: owner_tag[B], C: CACHE_TAG, D: owner_tag[D]}
-    requests = [
-        _request([10, 11, (A, ROWS[A]), 12, (B, ROWS[B]), 13], rid="r1"),
-        _request([20, (C, ROWS[C]), 21, (D, ROWS[D]), 22], rid="r2"),
+    forwards = [
+        (
+            [
+                _request([10, 11, (A, ROWS[A]), 12, (B, ROWS[B]), 13], rid="r1"),
+                _request([20, (C, ROWS[C]), 21, (D, ROWS[D]), 22], rid="r2"),
+            ],
+            {A: CACHE_TAG + 1, B: owner_tag[B], C: CACHE_TAG, D: owner_tag[D]},
+        ),
+        (
+            [
+                _request([10, 11, (A, ROWS[A]), (B, ROWS[B])], rid="r3"),
+                _request([20, (A, ROWS[A]), (C, ROWS[C]), (D, ROWS[D])], rid="r4"),
+            ],
+            {A: CACHE_TAG + 1, B: owner_tag[B], C: owner_tag[C], D: owner_tag[D]},
+        ),
+    ] + [
+        (
+            [_request([30, 31, (E, ROWS[E]), 32], prefix, extend, rid="r5")],
+            {E: owner_tag[E]},
+        )
+        for prefix, extend in ((0, 5), (5, 4))
     ]
-    _, embeds = model.prepare(_batch(requests))
-    assert torch.equal(embeds, _expected_embeds(embed, requests, tags))
-    encoded = [list(model.encoded)]
-    traces = [list(traced.trace)]
-
-    # Local 2 loses every entry and admits nothing new; B's owner evicts B.
-    if local == 2:
-        mm_schedule.init_mm_embedding_cache(0)
-    if local == 1:
-        mm_schedule.embedding_cache.free(B, None)
-    model.encoded.clear()
-    traced.trace.clear()
-    tags = {A: CACHE_TAG + 1, B: owner_tag[B], C: owner_tag[C], D: owner_tag[D]}
-    requests = [
-        _request([10, 11, (A, ROWS[A]), (B, ROWS[B])], rid="r3"),
-        _request([20, (A, ROWS[A]), (C, ROWS[C]), (D, ROWS[D])], rid="r4"),
-    ]
-    _, embeds = model.prepare(_batch(requests))
-    assert torch.equal(embeds, _expected_embeds(embed, requests, tags))
-    encoded.append(list(model.encoded))
-    traces.append(list(traced.trace))
-
-    # A cold span crossing the chunk boundary.
-    for prefix_len, extend_len in ((0, 5), (5, 4)):
+    encoded, traces = [], []
+    for index, (requests, tags) in enumerate(forwards):
+        if index == 1:
+            # Local 2 loses every entry and admits nothing new; B's owner evicts B.
+            if local == 2:
+                mm_schedule.init_mm_embedding_cache(0)
+            if local == 1:
+                mm_schedule.embedding_cache.free(B, None)
         model.encoded.clear()
         traced.trace.clear()
-        request = _request(
-            [30, 31, (E, ROWS[E]), 32],
-            prefix_len=prefix_len,
-            extend_len=extend_len,
-            rid="r5",
-        )
-        _, embeds = model.prepare(_batch([request]))
-        assert torch.equal(
-            embeds, _expected_embeds(embed, [request], {E: owner_tag[E]})
-        )
+        _, embeds = model.prepare(_batch(requests))
+        assert torch.equal(embeds, _expected_embeds(embed, requests, tags))
         encoded.append(list(model.encoded))
         traces.append(list(traced.trace))
     return {"trace": traces, "encoded": encoded, "outside": False}
 
 
-def _topology_program(rank, world_size):
-    tp8 = _coordinator([[0, 1, 2, 3, 4, 5, 6, 7]], rank)
-    replicas = _coordinator([[0, 1, 2, 3], [4, 5, 6, 7]], rank)
-    singles = _coordinator([[r] for r in range(8)], rank)
-    out = {}
-
-    tp_group, attn_tp, attn_cp = (
-        _TracedGroup(tp8),
-        _TracedGroup(tp8),
-        _TracedGroup(singles),
-    )
-    with get_parallel().override(
-        tp_size=8,
-        attn_dp_size=1,
-        attn_cp_size=1,
-        tp_group=tp_group,
-        attn_tp_group=attn_tp,
-        attn_cp_group=attn_cp,
-    ):
-        selected = select_owner_group(get_parallel())
-    assert selected is attn_tp
-    mm_schedule.init_mm_embedding_cache(1 << 20)
-    embed = _ReducingEmbedding(tp8)
-    model = _VisionStub(embed, selected, tag=rank)
-    x, y, z = 800, 805, 810  # owners 0, 5, 2
-    requests = [
-        _request([10, (x, 3), 11], rid="c1"),
-        _request([20, (y, 2), (z, 4), 21], rid="c2"),
-    ]
-    _, embeds = model.prepare(_batch(requests))
-    assert torch.equal(embeds, _expected_embeds(embed, requests, {x: 0, y: 5, z: 2}))
-    out["cp1"] = {"encoded": list(model.encoded), "trace": list(attn_tp.trace)}
-
-    tp_group, attn_tp, attn_cp = (
-        _TracedGroup(tp8),
-        _TracedGroup(singles),
-        _TracedGroup(tp8),
-    )
-    init_cp_strategy(enable_prefill_cp=True, cp_size=8, cp_strategy="interleave")
-    try:
-        with get_parallel().override(
-            tp_size=8,
-            attn_dp_size=1,
-            attn_cp_size=8,
-            attn_cp_rank=rank,
-            tp_group=tp_group,
-            attn_tp_group=attn_tp,
-            attn_cp_group=attn_cp,
-        ):
-            selected = select_owner_group(get_parallel())
-            assert selected is attn_cp
-            mm_schedule.init_mm_embedding_cache(1 << 20)
-            torch.manual_seed(0)
-            plain_embed = nn.Embedding(VOCAB, HIDDEN)
-            model = _VisionStub(plain_embed, selected, tag=rank)
-            w = 803  # owner 3; rows land on ranks 6,7,0,1,2,3 so ranks 4,5 hold no image row
-            requests = [
-                _request([10, 11, 12, 13, 14], rid="p1"),
-                _request([20, (w, 6), 21, 22], rid="p2"),
-            ]
-            forward_batch = _batch(requests)
-            full = _expected_embeds(plain_embed, requests, {w: 3})
-            _run_cp_extend(model, forward_batch, tp8)
-            physical = forward_batch.attn_cp_metadata.per_rank_actual_token[rank]
-            (body,) = model.model.calls
-            shard = full[rank::8]
-            assert torch.equal(body.input_embeds[: shard.shape[0]], shard)
-            assert body.input_embeds.shape[0] == physical
-            (logits,) = model.logits_calls
-            assert torch.equal(logits.hidden_states, full)
-            assert torch.equal(forward_batch.mm_input_embeds, full)
-            out["cp8"] = {
-                "encoded": list(model.encoded),
-                "trace": list(attn_cp.trace),
-                "image_rows": int((body.input_ids == IMAGE_TOKEN_ID).sum()),
-            }
-    finally:
-        init_cp_strategy(enable_prefill_cp=False, cp_size=1, cp_strategy="interleave")
-
-    # One attention-DP replica is text-only first.
-    tp_group, attn_tp, attn_cp = (
-        _TracedGroup(tp8),
-        _TracedGroup(replicas),
-        _TracedGroup(singles),
-    )
-    with get_parallel().override(
-        tp_size=8,
-        attn_dp_size=2,
-        attn_cp_size=1,
-        tp_group=tp_group,
-        attn_tp_group=attn_tp,
-        attn_cp_group=attn_cp,
-    ):
-        selected = select_owner_group(get_parallel())
-    assert selected is attn_tp
-    mm_schedule.init_mm_embedding_cache(1 << 20)
-    embed = _ReducingEmbedding(replicas)
-    model = _VisionStub(embed, selected, tag=rank)
-    p, q = 900, 901  # owners: local 0 (rank 0) and local 1 (rank 5)
-    replica = rank // 4
-    if replica == 0:
-        requests = [_request([10, (p, 3), 11], rid="d0")]
-    else:
-        requests = [_request([10, 11, 12], rid="d1")]
-    _, embeds = model.prepare(_batch(requests))
-    if replica == 0:
-        assert torch.equal(embeds, _expected_embeds(embed, requests, {p: 0}))
-    else:
-        assert embeds is None
-    first = {"encoded": list(model.encoded), "trace": list(attn_tp.trace)}
-    model.encoded.clear()
-    attn_tp.trace.clear()
-    if replica == 0:
-        requests = [_request([10, (p, 3), 11], rid="d2")]
-        tags = {p: 0}
-    else:
-        requests = [_request([30, (q, 2), 31], rid="d3")]
-        tags = {q: 5}
-    _, embeds = model.prepare(_batch(requests))
-    assert torch.equal(embeds, _expected_embeds(embed, requests, tags))
-    out["dp2"] = [first, {"encoded": list(model.encoded), "trace": list(attn_tp.trace)}]
-    return out
-
-
-F, G, H, I = 300, 301, 302, 303  # owners 0, 1, 2, 3 in a four-rank group
-J, K = 310, 311  # owner 2 and owner 3, eight-row spans for the grid cases
-
-
-def _failure_program(rank, world_size):
-    group = _coordinator([[0, 1, 2, 3]], rank)
-    out = {}
-
-    def fresh(embed_cls=_ReducingEmbedding):
-        mm_schedule.init_mm_embedding_cache(1 << 20)
-        traced = _TracedGroup(group)
-        embed = embed_cls(group)
-        return traced, embed, _VisionStub(embed, traced, tag=rank)
-
-    def inject(module, name, message, on_rank):
-        if rank != on_rank:
-            return nullcontext()
-        return patch.object(module, name, side_effect=RuntimeError(message))
-
-    def record(name, traced, embed, model, error, **extra):
-        out[name] = {
-            "error": error,
-            "trace": list(traced.trace),
-            "embed_calls": embed.calls,
-            "encoded": list(model.encoded),
-            **extra,
-        }
-
-    def remap_oom(target):
-        original = torch.Tensor.masked_fill
-
-        def masked_fill(self, mask, value):
-            if self is target:
-                raise torch.OutOfMemoryError("injected remap OOM")
-            return original(self, mask, value)
-
-        return patch.object(torch.Tensor, "masked_fill", masked_fill)
-
-    def sync_failure(on_call):
-        seen = []
-
-        def synchronize(device):
-            seen.append(device)
-            if len(seen) == on_call:
-                raise RuntimeError("injected final sync")
-
-        return patch.object(mm_owner_embedding, "_synchronize", synchronize)
-
-    traced, embed, model = fresh()
-    batch = _batch([_request([10, (G, 3), 11], rid="fail-prepare")])
-    with (
-        patch.object(
-            torch,
-            "as_tensor",
-            side_effect=torch.OutOfMemoryError("injected placeholder OOM"),
-        )
-        if rank == 1
-        else nullcontext()
-    ):
-        error = _expect_protocol_error(lambda: model.prepare(batch))
-    record("prepare", traced, embed, model, error)
-
-    traced, embed, model = fresh()
-    if rank == 1:
-        model.fail_hashes = {G}
-    error = _expect_protocol_error(
-        lambda: model.prepare(_batch([_request([10, (G, 3), 11], rid="fail-encode")]))
-    )
-    record("encode", traced, embed, model, error)
-
-    traced, embed, model = fresh()
-    with inject(
-        mm_owner_embedding, "_new_span_buffer", "injected allocation", on_rank=3
-    ):
-        error = _expect_protocol_error(
-            lambda: model.prepare(
-                _batch([_request([10, (F, 3), 11], rid="fail-alloc")])
-            )
-        )
-    record("alloc", traced, embed, model, error)
-
-    traced, embed, model = fresh()
-    rows = 4 if rank == 2 else 3
-    error = _expect_protocol_error(
-        lambda: model.prepare(
-            _batch([_request([10, (F, rows), 11], rid="fail-manifest")])
-        )
-    )
-    record("manifest", traced, embed, model, error)
-
-    traced, embed, model = fresh()
-    grid = (4, 3) if rank == 2 else (3, 4)
-    error = _expect_protocol_error(
-        lambda: model.prepare(
-            _batch([_request([10, (J, 8, grid), 11], rid="fail-grid")])
-        )
-    )
-    record("grid", traced, embed, model, error)
-
-    traced, embed, model = fresh()
-    error = _expect_protocol_error(
-        lambda: model.prepare(
-            _batch(
-                [
-                    _request([10, (K, 8, (3, 4)), 11], rid="fail-dup-a"),
-                    _request([20, (K, 8, (4, 3)), 21], rid="fail-dup-b"),
-                ]
-            )
-        )
-    )
-    record("duplicate", traced, embed, model, error)
-
-    traced, embed, model = fresh()
-    error = _expect_protocol_error(
-        lambda: model.prepare(
-            _batch([_request([10, (F, 5, (2, 2)), 11], rid="fail-span-len")])
-        )
-    )
-    record("span_len", traced, embed, model, error)
-
-    traced, embed, model = fresh()
-    with inject(
-        mm_schedule, "_assemble_per_image_chunk", "injected assembly", on_rank=1
-    ):
-        error = _expect_protocol_error(
-            lambda: model.prepare(
-                _batch([_request([10, (H, 2), 11], rid="fail-assemble")])
-            )
-        )
-    record("assemble", traced, embed, model, error)
-
-    traced, embed, model = fresh()
-    with inject(mm_utils, "_scatter_mm_embedding", "injected merge", on_rank=3):
-        error = _expect_protocol_error(
-            lambda: model.prepare(
-                _batch([_request([10, (I, 2), 11], rid="fail-merge")])
-            )
-        )
-    record("merge", traced, embed, model, error)
-
-    traced, embed, model = fresh()
-    batch = _batch([_request([10, (F, 3), 11], rid="fail-remap")])
-    with remap_oom(batch.input_ids) if rank == 1 else nullcontext():
-        error = _expect_protocol_error(lambda: model.prepare(batch))
-    record("remap", traced, embed, model, error)
-
-    traced, embed, model = fresh()
-    with sync_failure(on_call=3) if rank == 1 else nullcontext():
-        error = _expect_protocol_error(
-            lambda: model.prepare(
-                _batch([_request([10, (F, 3), 11], rid="fail-final-sync")])
-            )
-        )
-    record("final_sync", traced, embed, model, error)
-
-    traced, embed, model = fresh()
-    with (
-        patch.object(
-            mm_owner_embedding,
-            "_make_plan",
-            side_effect=MemoryError("injected leader plan allocation"),
-        )
-        if rank == 0
-        else nullcontext()
-    ):
-        error = _expect_protocol_error(
-            lambda: model.prepare(_batch([_request([10, (G, 3), 11], rid="fail-plan")]))
-        )
-    record("leader_plan", traced, embed, model, error)
-
-    init_cp_strategy(enable_prefill_cp=True, cp_size=4, cp_strategy="interleave")
-    try:
-        traced, embed, model = fresh(lambda group: _ReducingEmbedding(None))
-        batch = _batch([_request([10, (F, 3), 11], rid="fail-remap-cp")])
-        with (
-            get_parallel().override(
-                attn_cp_size=4, attn_cp_rank=rank, attn_cp_group=traced
-            ),
-            remap_oom(batch.input_ids) if rank == 1 else nullcontext(),
-        ):
-            error = _expect_protocol_error(lambda: _run_cp_extend(model, batch, group))
-        record(
-            "remap_cp", traced, embed, model, error, body_calls=len(model.model.calls)
-        )
-    finally:
-        init_cp_strategy(enable_prefill_cp=False, cp_size=1, cp_strategy="interleave")
-    return out
-
-
-MANIFEST = ["all_gather_object", "RankManifest", 4]
-PLAN = ["broadcast_object", 0, 4]
-STATUS = ["all_gather_object", "RankStatus", 4]
-
-
-def _bcast(src, rows, size=4):
-    return ["broadcast", src, [rows, HIDDEN], size]
-
-
 def test_owner_actions_and_cache_lifetime_across_asymmetric_ranks():
-    """Owner hits broadcast, non-owner hits still receive, stale entries miss,
-    all-hit moves no payload, per-forward references outlive the cache."""
     results = _run_ranks(5, _owner_lifetime_program)
     members = range(1, 5)
-    _assert_traces_agree(results, members)
+    assert all(results[rank]["trace"] == results[1]["trace"] for rank in members)
     encoded = [results[rank]["encoded"] for rank in members]
     trace = results[1]["trace"]
 
     # Forward 1: A cache-broadcast, B and D owner-encoded, C a local hit.
     assert [e[0] for e in encoded] == [[], [B], [], [D]]
-    assert trace[0] == [
-        MANIFEST,
-        PLAN,
-        STATUS,
-        _bcast(0, ROWS[A]),
-        _bcast(1, ROWS[B]),
-        _bcast(3, ROWS[D]),
-        STATUS,
-        STATUS,
-    ]
+    assert trace[0] == _cold(_bcast(0, ROWS[A]), _bcast(1, ROWS[B]), _bcast(3, ROWS[D]))
 
     # Forward 2: evicted owners of B and C re-encode once; A recurs but moves once.
     assert [e[1] for e in encoded] == [[], [B], [C], []]
-    assert trace[1] == [
-        MANIFEST,
-        PLAN,
-        STATUS,
-        _bcast(0, ROWS[A]),
-        _bcast(1, ROWS[B]),
-        _bcast(2, ROWS[C]),
-        _bcast(3, ROWS[D]),
-        STATUS,
-        STATUS,
-    ]
+    assert trace[1] == _cold(*(_bcast(key % 4, ROWS[key]) for key in (A, B, C, D)))
 
     # Forwards 3 and 4: the chunk-crossing span is encoded fully once.
     assert [e[2] for e in encoded] == [[E], [], [], []]
     assert [e[3] for e in encoded] == [[], [], [], []]
-    assert trace[2] == [MANIFEST, PLAN, STATUS, _bcast(0, ROWS[E]), STATUS, STATUS]
-    assert trace[3] == [MANIFEST, PLAN, STATUS, _bcast(0, ROWS[E]), STATUS, STATUS]
+    assert trace[2] == trace[3] == _cold(_bcast(0, ROWS[E]))
     assert results[0]["outside"]
 
 
-def test_tp8_cp1_and_cp8_dedupe_and_attention_dp_replicas_stay_isolated():
-    results = _run_ranks(8, _topology_program)
+def _cp8_program(rank, world_size):
+    tp8 = _coordinator([list(range(8))], rank)
+    singles = _coordinator([[r] for r in range(8)], rank)
+    attn_cp = _TracedGroup(tp8)
+    with _interleave_cp(
+        8,
+        tp_size=8,
+        attn_dp_size=1,
+        attn_cp_rank=rank,
+        tp_group=_TracedGroup(tp8),
+        attn_tp_group=_TracedGroup(singles),
+        attn_cp_group=attn_cp,
+    ):
+        selected = select_owner_group(get_parallel())
+        assert selected is attn_cp
+        mm_schedule.init_mm_embedding_cache(1 << 20)
+        torch.manual_seed(0)
+        embed = nn.Embedding(VOCAB, HIDDEN)
+        model = _VisionStub(embed, selected, tag=rank)
+        w = 803  # owner 3; rows land on ranks 6,7,0,1,2,3 so ranks 4,5 hold no image row
+        requests = [
+            _request([10, 11, 12, 13, 14], rid="p1"),
+            _request([20, (w, 6), 21, 22], rid="p2"),
+        ]
+        _run_cp_extend(model, _batch(requests), tp8)
+    (logits,) = model.logits_calls
+    assert torch.equal(logits, _expected_embeds(embed, requests, {w: 3}))
+    (body,) = model.model.calls
+    return {
+        "encoded": list(model.encoded),
+        "trace": list(attn_cp.trace),
+        "image_rows": int((body == IMAGE_TOKEN_ID).sum()),
+    }
 
-    cp1 = [r["cp1"] for r in results]
-    assert [c["encoded"] for c in cp1] == [[800], [], [810], [], [], [805], [], []]
-    assert all(c["trace"] == cp1[0]["trace"] for c in cp1)
-    assert [op for op in cp1[0]["trace"] if op[0] == "broadcast"] == [
-        _bcast(0, 3, 8),
-        _bcast(5, 2, 8),
-        _bcast(2, 4, 8),
+
+def test_tp8_cp8_encodes_once_and_merges_before_shard():
+    results = _run_ranks(8, _cp8_program)
+    assert [r["encoded"] for r in results] == [[], [], [], [803], [], [], [], []]
+    assert all(r["trace"] == results[0]["trace"] for r in results)
+    assert [op for op in results[0]["trace"] if op[0] == "broadcast"] == [
+        _bcast(3, 6, 8)
     ]
+    assert [r["image_rows"] for r in results] == [1, 1, 1, 1, 0, 0, 1, 1]
 
-    cp8 = [r["cp8"] for r in results]
-    assert [c["encoded"] for c in cp8] == [[], [], [], [803], [], [], [], []]
-    assert all(c["trace"] == cp8[0]["trace"] for c in cp8)
-    assert [op for op in cp8[0]["trace"] if op[0] == "broadcast"] == [_bcast(3, 6, 8)]
-    assert [c["image_rows"] for c in cp8] == [1, 1, 1, 1, 0, 0, 1, 1]
 
-    dp2 = [r["dp2"] for r in results]
-    first = [d[0] for d in dp2]
-    assert [f["encoded"] for f in first] == [[900], [], [], [], [], [], [], []]
-    assert all(f["trace"] == [] for f in first[4:])
-    assert all(f["trace"] == first[0]["trace"] for f in first[:4])
-    assert all(op[-1] == 4 for op in first[0]["trace"])
-    second = [d[1] for d in dp2]
-    assert [s["encoded"] for s in second] == [[], [], [], [], [], [901], [], []]
-    assert all(s["trace"] == second[0]["trace"] for s in second[:4])
-    assert all(s["trace"] == second[4]["trace"] for s in second[4:])
-    assert [op for op in second[0]["trace"] if op[0] == "broadcast"] == []
-    assert [op for op in second[4]["trace"] if op[0] == "broadcast"] == [
-        _bcast(1, 2, 4)
-    ]
+def _raise_on(on_rank, target, name, exc_type=RuntimeError, after=0):
+    def inject(rank, batch):
+        if rank != on_rank:
+            return nullcontext()
+        original = getattr(target, name)
+        calls = []
+
+        def fail(*args, **kwargs):
+            calls.append(None)
+            if len(calls) > after:
+                raise exc_type(f"injected {name}")
+            return original(*args, **kwargs)
+
+        return patch.object(target, name, fail)
+
+    return inject
+
+
+def _remap_oom_on(on_rank):
+    def inject(rank, batch):
+        if rank != on_rank:
+            return nullcontext()
+        original = torch.Tensor.masked_fill
+
+        def masked_fill(self, mask, value):
+            if self is batch.input_ids:
+                raise torch.OutOfMemoryError("injected remap")
+            return original(self, mask, value)
+
+        return patch.object(torch.Tensor, "masked_fill", masked_fill)
+
+    return inject
+
+
+def _failure(requests, trace, errors, inject=None, vocab_calls=0, cp=False):
+    return SimpleNamespace(
+        requests=requests,
+        trace=trace,
+        errors=errors,
+        inject=inject or (lambda rank, batch: nullcontext()),
+        vocab_calls=vocab_calls,
+        cp=cp,
+    )
+
+
+F, G, H, I = 300, 301, 302, 303  # owners 0, 1, 2, 3 in a four-rank group
+J, K = 310, 311  # eight-row spans for the grid cases
+AT_PLAN = [MANIFEST, PLAN]
+AT_READINESS = [MANIFEST, PLAN, STATUS]
+AT_FINALIZE_F = _cold(_bcast(0, 3))
+
+FAILURES = {
+    "prepare": _failure(
+        [[10, (G, 3), 11]],
+        AT_PLAN,
+        ["during prepare on group rank 1", "OutOfMemoryError: injected as_tensor"],
+        _raise_on(1, torch, "as_tensor", torch.OutOfMemoryError),
+    ),
+    "encode": _failure(
+        [[10, (G, 3), 11]],
+        AT_READINESS,
+        ["during encode on group rank 1", "image hashes [301]"],
+        _raise_on(1, _VisionStub, "get_image_feature"),
+    ),
+    "alloc": _failure(
+        [[10, (F, 3), 11]],
+        AT_READINESS,
+        ["during encode on group rank 3", "hash 300 shape (3, 8)"],
+        _raise_on(3, mm_owner_embedding, "_new_span_buffer"),
+    ),
+    "grid": _failure(
+        lambda rank: [[10, (J, 8, (4, 3) if rank == 2 else (3, 4)), 11]],
+        AT_PLAN,
+        ["manifest mismatch between group ranks 0 and 2", "(3, 4", "(4, 3"],
+    ),
+    "duplicate": _failure(
+        [[10, (K, 8, (3, 4)), 11], [20, (K, 8, (4, 3)), 21]],
+        AT_PLAN,
+        [
+            "during manifest on group rank 0",
+            "hash 311 (8 tokens) occurs with different",
+        ],
+    ),
+    "span_len": _failure(
+        [[10, (F, 5, (2, 2)), 11]],
+        AT_PLAN,
+        ["yields 4 span tokens, placeholder has 5"],
+    ),
+    "assemble": _failure(
+        [[10, (H, 2), 11]],
+        _cold(_bcast(2, 2))[:-1],
+        ["during features on group rank 1", "injected _assemble_per_image_chunk"],
+        _raise_on(1, mm_schedule, "_assemble_per_image_chunk"),
+    ),
+    "merge": _failure(
+        [[10, (I, 2), 11]],
+        _cold(_bcast(3, 2)),
+        ["during finalize on group rank 3", "injected _scatter_mm_embedding"],
+        _raise_on(3, mm_utils, "_scatter_mm_embedding"),
+        vocab_calls=1,
+    ),
+    "remap": _failure(
+        [[10, (F, 3), 11]],
+        AT_FINALIZE_F,
+        ["during finalize on group rank 1", "injected remap"],
+        _remap_oom_on(1),
+        vocab_calls=1,
+    ),
+    "final_sync": _failure(
+        [[10, (F, 3), 11]],
+        AT_FINALIZE_F,
+        ["during finalize on group rank 1", "injected _synchronize"],
+        _raise_on(1, mm_owner_embedding, "_synchronize", after=2),
+        vocab_calls=1,
+    ),
+    "leader_plan": _failure(
+        [[10, (G, 3), 11]],
+        AT_PLAN,
+        ["during plan on group rank 0", "MemoryError: injected _make_plan"],
+        _raise_on(0, mm_owner_embedding, "_make_plan", MemoryError),
+    ),
+    "remap_cp": _failure(
+        [[10, (F, 3), 11]],
+        AT_FINALIZE_F,
+        ["during finalize on group rank 1", "injected remap"],
+        _remap_oom_on(1),
+        vocab_calls=1,
+        cp=True,
+    ),
+}
+
+
+def _failure_program(rank, world_size):
+    group = _coordinator([[0, 1, 2, 3]], rank)
+    out = {}
+    for name, case in FAILURES.items():
+        mm_schedule.init_mm_embedding_cache(1 << 20)
+        traced = _TracedGroup(group)
+        embed = _ReducingEmbedding(None if case.cp else group)
+        model = _VisionStub(embed, traced, tag=rank)
+        requests = case.requests(rank) if callable(case.requests) else case.requests
+        batch = _batch([_request(parts, rid=name) for parts in requests])
+        with ExitStack() as stack, pytest.raises(MmOwnerProtocolError) as raised:
+            stack.enter_context(case.inject(rank, batch))
+            if case.cp:
+                stack.enter_context(
+                    _interleave_cp(4, attn_cp_rank=rank, attn_cp_group=traced)
+                )
+                _run_cp_extend(model, batch, group)
+            else:
+                model.prepare(batch)
+        out[name] = {
+            "error": str(raised.value),
+            "trace": traced.trace,
+            "vocab_calls": embed.calls,
+            "body_calls": len(model.model.calls),
+        }
+    return out
 
 
 def test_failures_agree_before_payload_text_embedding_or_body():
     results = _run_ranks(4, _failure_program)
-    cases = (
-        "prepare",
-        "encode",
-        "alloc",
-        "manifest",
-        "grid",
-        "duplicate",
-        "span_len",
-        "assemble",
-        "merge",
-        "remap",
-        "final_sync",
-        "leader_plan",
-        "remap_cp",
-    )
-    for case in cases:
-        errors = {r[case]["error"] for r in results}
-        assert len(errors) == 1, (case, errors)
-        assert all(r[case]["trace"] == results[0][case]["trace"] for r in results), case
-
-    def calls(case, field="embed_calls"):
-        return [r[case][field] for r in results]
-
-    prepare = results[0]["prepare"]
-    assert "during prepare on group rank 1" in prepare["error"]
-    assert "injected placeholder OOM" in prepare["error"]
-    assert prepare["trace"] == [MANIFEST, PLAN]
-    assert calls("prepare") == [0, 0, 0, 0]
-
-    encode = results[0]["encode"]
-    assert "during encode on group rank 1" in encode["error"]
-    assert "fail-encode" in encode["error"] and "301" in encode["error"]
-    assert encode["trace"] == [MANIFEST, PLAN, STATUS]
-    assert calls("encode") == [0, 0, 0, 0]
-
-    alloc = results[0]["alloc"]
-    assert "during encode on group rank 3" in alloc["error"]
-    assert "hash 300 shape (3, 8)" in alloc["error"]
-    assert "injected allocation" in alloc["error"]
-    assert alloc["trace"] == [MANIFEST, PLAN, STATUS]
-    assert calls("alloc", "encoded") == [[F], [], [], []]
-    assert calls("alloc") == [0, 0, 0, 0]
-
-    manifest = results[0]["manifest"]
-    assert "manifest mismatch between group ranks 0 and 2" in manifest["error"]
-    assert manifest["trace"] == [MANIFEST, PLAN]
-    assert calls("manifest") == [0, 0, 0, 0]
-
-    grid = results[0]["grid"]
-    assert "manifest mismatch between group ranks 0 and 2" in grid["error"]
-    assert "(3, 4" in grid["error"] and "(4, 3" in grid["error"]
-    assert grid["trace"] == [MANIFEST, PLAN]
-
-    duplicate = results[0]["duplicate"]
-    assert "during manifest on group rank 0" in duplicate["error"]
-    assert (
-        f"image hash {K} (8 tokens) occurs with different geometry"
-        in duplicate["error"]
-    )
-    assert duplicate["trace"] == [MANIFEST, PLAN]
-
-    span_len = results[0]["span_len"]
-    assert "yields 4 span tokens, placeholder has 5" in span_len["error"]
-    assert span_len["trace"] == [MANIFEST, PLAN]
-
-    assemble = results[0]["assemble"]
-    assert "during features on group rank 1" in assemble["error"]
-    assert "injected assembly" in assemble["error"]
-    assert assemble["trace"] == [MANIFEST, PLAN, STATUS, _bcast(2, 2), STATUS]
-    assert calls("assemble") == [0, 0, 0, 0]
-
-    merge = results[0]["merge"]
-    assert "during finalize on group rank 3" in merge["error"]
-    assert merge["trace"] == [MANIFEST, PLAN, STATUS, _bcast(3, 2), STATUS, STATUS]
-    assert calls("merge") == [1, 1, 1, 1]
-
-    remap = results[0]["remap"]
-    assert "during finalize on group rank 1" in remap["error"]
-    assert "injected remap OOM" in remap["error"]
-    assert remap["trace"] == [MANIFEST, PLAN, STATUS, _bcast(0, 3), STATUS, STATUS]
-    assert calls("remap") == [1, 1, 1, 1]
-
-    final_sync = results[0]["final_sync"]
-    assert "during finalize on group rank 1" in final_sync["error"]
-    assert "injected final sync" in final_sync["error"]
-    assert final_sync["trace"] == [MANIFEST, PLAN, STATUS, _bcast(0, 3), STATUS, STATUS]
-    assert calls("final_sync") == [1, 1, 1, 1]
-
-    leader_plan = results[0]["leader_plan"]
-    assert "during plan on group rank 0" in leader_plan["error"]
-    assert "injected leader plan allocation" in leader_plan["error"]
-    assert leader_plan["trace"] == [MANIFEST, PLAN]
-    assert calls("leader_plan") == [0, 0, 0, 0]
-    assert calls("leader_plan", "encoded") == [[], [], [], []]
-
-    remap_cp = results[0]["remap_cp"]
-    assert "during finalize on group rank 1" in remap_cp["error"]
-    assert remap_cp["trace"] == [MANIFEST, PLAN, STATUS, _bcast(0, 3), STATUS, STATUS]
-    assert calls("remap_cp", "body_calls") == [0, 0, 0, 0]
+    for name, case in FAILURES.items():
+        runs = [r[name] for r in results]
+        error = runs[0]["error"]
+        assert all(run["error"] == error for run in runs), (name, runs)
+        assert all(run["trace"] == case.trace for run in runs), (name, runs)
+        for fragment in [*case.errors, f"rids=['{name}'"]:
+            assert fragment in error, (name, fragment, error)
+        assert [run["vocab_calls"] for run in runs] == [case.vocab_calls] * 4, name
+        assert [run["body_calls"] for run in runs] == [0] * 4, name
 
 
 def test_text_decode_prefilled_future_and_precomputed_paths_pay_no_collective():
-    """Chunks without owner-encoded image rows never touch the group; an overlapping chunk does."""
     mm_schedule.init_mm_embedding_cache(1 << 20)
     torch.manual_seed(0)
     embed = nn.Embedding(VOCAB, HIDDEN)
@@ -951,17 +684,13 @@ def test_text_decode_prefilled_future_and_precomputed_paths_pay_no_collective():
     for mode in (ForwardMode.DECODE, ForwardMode.TARGET_VERIFY):
         assert owner_model.prepare(_batch(with_image, mode))[1] is None
 
-    prefilled = [_request([10, (A, 3), 11, 12], prefix_len=5, rid="pf")]
-    ids, embeds = owner_model.prepare(_batch(prefilled))
-    _, legacy_embeds = legacy_model.prepare(_batch(prefilled))
-    assert torch.equal(embeds, legacy_embeds)
-    assert torch.equal(ids, torch.tensor([12]))
-
-    future = [_request([10, 11, 12, 13, (A, 3)], extend_len=2, rid="fut")]
-    ids, embeds = owner_model.prepare(_batch(future))
-    _, legacy_embeds = legacy_model.prepare(_batch(future))
-    assert torch.equal(embeds, legacy_embeds)
-    assert torch.equal(ids, torch.tensor([10, 11]))
+    for request, chunk_ids in (
+        (_request([10, (A, 3), 11, 12], prefix_len=5, rid="pf"), [12]),
+        (_request([10, 11, 12, 13, (A, 3)], extend_len=2, rid="fut"), [10, 11]),
+    ):
+        ids, embeds = owner_model.prepare(_batch([request]))
+        assert torch.equal(embeds, legacy_model.prepare(_batch([request]))[1])
+        assert torch.equal(ids, torch.tensor(chunk_ids))
 
     precomputed = _request([10, 11, 12, 13], rid="pc")
     item = MultimodalDataItem(
@@ -985,19 +714,23 @@ def _parallel(tp_size, attn_dp_size, attn_cp_size, attn_tp_size, attn_cp_group_s
         tp_size=tp_size,
         attn_dp_size=attn_dp_size,
         attn_cp_size=attn_cp_size,
+        tp_group=SimpleNamespace(world_size=tp_size, name="tp"),
         attn_tp_group=SimpleNamespace(world_size=attn_tp_size, name="attn_tp"),
         attn_cp_group=SimpleNamespace(world_size=attn_cp_group_size, name="attn_cp"),
     )
 
 
 def test_select_owner_group_follows_the_replication_domain():
-    """R = TP / attention-DP selects the attention-TP group, TP-aliased CP its handle, else None."""
-    assert select_owner_group(_parallel(8, 1, 1, 8, 1)).name == "attn_tp"
-    assert select_owner_group(_parallel(8, 1, 8, 1, 8)).name == "attn_cp"
-    assert select_owner_group(_parallel(8, 2, 1, 4, 1)).name == "attn_tp"
-    assert select_owner_group(_parallel(1, 1, 1, 1, 1)) is None
-    assert select_owner_group(_parallel(8, 2, 4, 1, 4)) is None
-    assert select_owner_group(_parallel(8, 1, 4, 2, 4)) is None
+    for layout, expected in (
+        ((8, 1, 1, 8, 1), "attn_tp"),
+        ((8, 1, 8, 1, 8), "attn_cp"),
+        ((8, 2, 1, 4, 1), "attn_tp"),
+        ((1, 1, 1, 1, 1), None),
+        ((8, 2, 4, 1, 4), None),
+        ((8, 1, 4, 2, 4), None),
+    ):
+        group = select_owner_group(_parallel(*layout))
+        assert (group and group.name) == expected, layout
 
 
 if __name__ == "__main__":

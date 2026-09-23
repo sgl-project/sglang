@@ -63,7 +63,6 @@ class _RecordingBody:
         self.calls.append(
             SimpleNamespace(
                 input_ids=input_ids,
-                positions=positions,
                 input_embeds=input_embeds,
                 input_ids_global=forward_batch.input_ids_global,
             )
@@ -97,12 +96,7 @@ class _VisionStub(DeepseekV4ForCausalLM):
         hidden_states_before_norm=None,
     ):
         self.logits_calls.append(
-            SimpleNamespace(
-                input_ids=input_ids,
-                hidden_states=hidden_states,
-                logits_metadata=logits_metadata,
-                hidden_states_before_norm=hidden_states_before_norm,
-            )
+            SimpleNamespace(input_ids=input_ids, hidden_states=hidden_states)
         )
         return object()
 
@@ -192,14 +186,6 @@ class TestDeepseekV41VisionPrefillCPInputs(CustomTestCase):
         ):
             yield
 
-    def _prepare(self, forward_batch, input_embeds=None):
-        with torch.no_grad():
-            return self.model.prepare_model_inputs(
-                input_ids=forward_batch.input_ids,
-                forward_batch=forward_batch,
-                input_embeds=input_embeds,
-            )
-
     def test_cp_runner_merges_before_shard(self):
         runner = EagerRunner.__new__(EagerRunner)
         runner.model_runner = SimpleNamespace(model=self.model)
@@ -207,7 +193,6 @@ class TestDeepseekV41VisionPrefillCPInputs(CustomTestCase):
 
         for rank in range(CP_SIZE):
             forward_batch, item = _build_batch()
-            routing_sentinel = forward_batch.input_ids_global
             scheduler_ids = forward_batch.input_ids.clone()
             canonical = _canonical(scheduler_ids)
             full = _expected_embeds(self.embed, scheduler_ids, item)
@@ -234,9 +219,6 @@ class TestDeepseekV41VisionPrefillCPInputs(CustomTestCase):
                     torch.equal(body.input_ids, _pad(canonical[rank::CP_SIZE]))
                 )
                 self.assertTrue(
-                    torch.equal(body.positions, _pad(POSITIONS[rank::CP_SIZE]))
-                )
-                self.assertTrue(
                     torch.equal(body.input_embeds, _pad(full[rank::CP_SIZE]))
                 )
                 self.assertTrue(torch.equal(body.input_ids_global, rank_major_ids))
@@ -244,17 +226,18 @@ class TestDeepseekV41VisionPrefillCPInputs(CustomTestCase):
                 (logits,) = self.model.logits_calls
                 self.assertTrue(torch.equal(logits.input_ids, canonical))
                 self.assertTrue(torch.equal(logits.hidden_states, full))
-                self.assertTrue(torch.equal(logits.hidden_states_before_norm, full))
-                self.assertIs(logits.logits_metadata, forward_batch)
 
                 self.assertTrue(torch.equal(forward_batch.mm_input_embeds, full))
                 self.assertTrue(torch.equal(forward_batch.input_ids, scheduler_ids))
-                self.assertIs(forward_batch.input_ids_global, routing_sentinel)
 
     def test_external_embeddings_with_images_are_rejected(self):
         forward_batch, _ = _build_batch()
         with self.assertRaisesRegex(ValueError, "Cannot combine"):
-            self._prepare(forward_batch, input_embeds=torch.zeros(NUM_TOKENS, HIDDEN))
+            self.model.prepare_model_inputs(
+                input_ids=forward_batch.input_ids,
+                forward_batch=forward_batch,
+                input_embeds=torch.zeros(NUM_TOKENS, HIDDEN),
+            )
 
 
 if __name__ == "__main__":

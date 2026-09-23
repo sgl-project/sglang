@@ -659,42 +659,34 @@ class TestEmbedOverridesRejectMultimodal(CustomTestCase):
         self.manager.num_reserved_tokens = 0
         self.manager.allow_auto_truncate = False
         self.manager.validate_total_tokens = False
-        self.manager.is_generation = True
 
-    def _request(self, **fields):
-        return GenerateReqInput(
-            input_ids=[10, 50, 20],
-            sampling_params={},
-            positional_embed_overrides=PositionalEmbeds(embeds=[_vec()], positions=[1]),
-            **fields,
-        )
-
-    def test_request_with_image_is_rejected(self):
-        req = self._request(image_data=["image.png"])
-        with self.assertRaisesRegex(ValueError, "overrides cannot be combined"):
-            self.manager._validate_one_request(req, req.input_ids)
-        text_only = self._request()
-        self.manager._validate_one_request(text_only, text_only.input_ids)
-
-    def test_unresolved_embedding_overrides_with_image_are_rejected(self):
+    def test_requests_with_overrides_and_images_are_rejected(self):
         """EmbeddingReqInput resolves embed_overrides only after validation, so
         the unresolved form must be caught at admission too."""
-        self.manager.is_generation = False
-        req = EmbeddingReqInput(
-            input_ids=[10, 50, 20],
-            sampling_params={},
-            embed_override_token_id=50,
-            embed_overrides=[_vec()],
-            image_data=["image.png"],
-        )
-        with self.assertRaisesRegex(ValueError, "overrides cannot be combined"):
-            self.manager._validate_one_request(req, req.input_ids)
-        req.image_data = None
-        self.manager._validate_one_request(req, req.input_ids)
+        overrides = PositionalEmbeds(embeds=[_vec()], positions=[1])
+        for build in (
+            lambda **mm: GenerateReqInput(
+                input_ids=[10, 50, 20],
+                sampling_params={},
+                positional_embed_overrides=overrides,
+                **mm,
+            ),
+            lambda **mm: EmbeddingReqInput(
+                input_ids=[10, 50, 20],
+                sampling_params={},
+                embed_override_token_id=50,
+                embed_overrides=[_vec()],
+                **mm,
+            ),
+        ):
+            req = build(image_data=["image.png"])
+            self.manager.is_generation = isinstance(req, GenerateReqInput)
+            with self.assertRaisesRegex(ValueError, "overrides cannot be combined"):
+                self.manager._validate_one_request(req, req.input_ids)
+            text_only = build()
+            self.manager._validate_one_request(text_only, text_only.input_ids)
 
     def test_mixed_extend_batch_is_rejected_before_embedding_lookup(self):
-        """Placeholder rows hold hash IDs, so the base lookup must never run
-        on a batch whose chunk also covers multimodal placeholders."""
         embed_layer = MagicMock(
             side_effect=AssertionError("embedding lookup must not run")
         )

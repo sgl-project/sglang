@@ -107,7 +107,6 @@ def validate_replace_embeds_batch(forward_batch: ForwardBatch) -> None:
         for item in mm_inputs.mm_items:
             for start, end in item.offsets or ():
                 if start < chunk_end and end >= prefix_len:
-                    # Placeholder rows carry hash IDs the base embedding lookup cannot index.
                     raise ValueError(
                         "Token embedding overrides cannot share an extend batch with "
                         "multimodal placeholders"

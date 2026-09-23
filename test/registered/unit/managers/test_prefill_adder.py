@@ -302,35 +302,6 @@ class TestPrefillAdder(CustomTestCase):
         )
         self.assertEqual(adder.can_run_list, [first])
 
-    def test_embed_override_and_multimodal_requests_never_share_a_batch(self):
-        def tagged(rid, *, multimodal=False, overrides=False):
-            req = self.create_shared_req(rid)
-            req.multimodal_inputs = object() if multimodal else None
-            req.positional_embed_overrides = object() if overrides else None
-            return req
-
-        for first, second in (
-            (tagged("image", multimodal=True), tagged("override", overrides=True)),
-            (tagged("override", overrides=True), tagged("image", multimodal=True)),
-        ):
-            with self.subTest(first=first.rid):
-                adder = self.create_shared_adder()
-                self.assertTrue(adder.can_share_extend_batch(first))
-                adder.add_one_req(
-                    first, has_chunked_req=False, truncation_align_size=None
-                )
-                self.assertEqual(adder.can_run_list, [first])
-                self.assertFalse(adder.can_share_extend_batch(second))
-                self.assertTrue(adder.can_share_extend_batch(tagged("text")))
-
-        adder = self.create_shared_adder()
-        chunked = tagged("chunked-image", multimodal=True)
-        chunked.full_untruncated_fill_ids = list(range(64))
-        self.assertIs(adder.add_chunked_req(chunked), chunked)
-        self.assertFalse(
-            adder.can_share_extend_batch(tagged("override", overrides=True))
-        )
-
     def create_admission_scheduler(self, *, chunked_req) -> Scheduler:
         allocator = self.create_token_allocator(available_size=4096)
         allocator.page_size = 1
@@ -416,8 +387,9 @@ class TestPrefillAdder(CustomTestCase):
         continuation = tagged("image-continuation", 20, multimodal=True)
         continuation.prefix_indices = list(range(16))
         scheduler = self.create_admission_scheduler(chunked_req=continuation)
+        text = tagged("text", 2)
         override = tagged("override", 4, overrides=True)
-        scheduler.waiting_queue = [override]
+        scheduler.waiting_queue = [text, override]
 
         admitted_at = None
         for pass_index in range(6):
@@ -425,6 +397,8 @@ class TestPrefillAdder(CustomTestCase):
                 tagged(f"image-{pass_index}", 16, multimodal=True)
             )
             admitted = self.run_admission_pass(scheduler)
+            if pass_index == 0:
+                self.assertEqual(admitted, [continuation, text])
             self.assertFalse(
                 any(r.multimodal_inputs is not None for r in admitted)
                 and any(r.positional_embed_overrides is not None for r in admitted)

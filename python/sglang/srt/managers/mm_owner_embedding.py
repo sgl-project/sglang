@@ -71,8 +71,8 @@ class RankStatus(msgspec.Struct, frozen=True):
 
 
 def select_owner_group(parallel) -> Optional[Any]:
-    """The group whose members all execute the same requests, or None when a
-    single rank already encodes every image it sees."""
+    """The group whose members all execute the same requests; None keeps each
+    rank encoding its own images."""
     replication = parallel.tp_size // parallel.attn_dp_size
     if replication <= 1:
         return None

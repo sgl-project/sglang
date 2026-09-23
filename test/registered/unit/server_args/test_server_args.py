@@ -4042,47 +4042,41 @@ class TestDeepseekV41VisionPrefillCPArgs(CustomTestCase):
         return server_args
 
     @override_platform(is_cuda=True, is_hip=False)
-    def test_encoder_swa_replay_is_rejected_in_model_hook_order(self):
-        """The V4.1 validator runs before the CP validator declares attn_cp_size,
-        so encoder SWA replay used to pass resolution with vision prefill CP."""
-        args = self._args(
-            enable_encoder_swa_bounded_replay=True,
-            max_running_requests=4,
-            chunked_prefill_size=128,
-        )
-        with self.assertRaisesRegex(
-            ValueError,
-            "encoder-swa-bounded-replay does not support context parallelism",
+    def test_guard_matrix_in_model_hook_order(self):
+        for overrides, error in (
+            (
+                dict(enable_encoder_swa_bounded_replay=True),
+                "encoder-swa-bounded-replay does not support context parallelism",
+            ),
+            (dict(cp_strategy="zigzag"), "requires --cp-strategy interleave"),
+            (
+                dict(prefill_backend=Backend.BREAKABLE, lock_prefill_backend=True),
+                "runs eager prefill",
+            ),
+            (
+                dict(
+                    speculative_algorithm="DSPARK",
+                    enable_decoder_swa_bounded_replay=True,
+                ),
+                "DSpark.*decoder-swa-bounded-replay",
+            ),
         ):
-            handle_model_specific_adjustments(args)
+            args = self._args(
+                max_running_requests=4, chunked_prefill_size=128, **overrides
+            )
+            with self.subTest(error=error), self.assertRaisesRegex(ValueError, error):
+                handle_model_specific_adjustments(args)
 
-    def test_zigzag_is_rejected_only_with_vision(self):
-        with self.assertRaisesRegex(ValueError, "requires --cp-strategy interleave"):
-            validate_deepseek_v41_features(self._args(cp_strategy="zigzag"))
+    def test_text_zigzag_and_default_prefill_graph_are_accepted(self):
         validate_deepseek_v41_features(
             self._args(cp_strategy="zigzag", vision_n_layers=0)
         )
-
-    def test_prefill_graph_explicit_rejects_and_default_resolves_eager(self):
-        with self.assertRaisesRegex(ValueError, "runs eager prefill"):
-            validate_deepseek_v41_features(
-                self._args(prefill_backend=Backend.BREAKABLE, lock_prefill_backend=True)
-            )
         args = self._args(prefill_backend=Backend.BREAKABLE)
         validate_deepseek_v41_features(args)
         self.assertEqual(
             resolution_result(args, "cuda_graph_config").prefill.backend,
             Backend.DISABLED,
         )
-
-    def test_dspark_with_decoder_swa_bounded_replay_is_rejected(self):
-        with self.assertRaisesRegex(ValueError, "DSpark.*decoder-swa-bounded-replay"):
-            validate_deepseek_v41_features(
-                self._args(
-                    speculative_algorithm="DSPARK",
-                    enable_decoder_swa_bounded_replay=True,
-                )
-            )
 
 
 class TestParserChoices(CustomTestCase):
