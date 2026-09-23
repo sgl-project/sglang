@@ -84,9 +84,15 @@ class AddLayer(torch.nn.Module):
     def __init__(self, amount):
         super().__init__()
         self.amount = amount
+        self.input_layernorm = torch.nn.Linear(1, 1, bias=False)
+        self.input_layernorm.weight.data.fill_(1)
 
     def forward(self, positions, hidden, batch):
         return hidden + self.amount
+
+    def forward_fused(self, positions, normed, residual, batch, next_weight):
+        hidden = self.forward(positions, residual, batch)
+        return hidden * next_weight, hidden
 
 
 def stub_beam_model(layers, norm, layers_to_capture):
@@ -841,14 +847,22 @@ class TestBeamDFlashCapture(CustomTestCase):
         norm = torch.nn.Linear(1, 1, bias=False)
         norm.weight.data.fill_(10)
         model = stub_beam_model([AddLayer(1), AddLayer(2), AddLayer(3)], norm, (0, 2))
-        hidden, aux = model(torch.zeros(2, 1), torch.arange(2), None)
-        torch.testing.assert_close(hidden, torch.full((2, 1), 60.0))
-        torch.testing.assert_close(aux[0], torch.ones(2, 1))
-        torch.testing.assert_close(aux[1], torch.full((2, 1), 6.0))
+        for cpu_offload_gb in (0, 1):
+            with (
+                self.subTest(cpu_offload_gb=cpu_offload_gb),
+                get_context().override_server_args(cpu_offload_gb=cpu_offload_gb),
+            ):
+                hidden, aux = model(torch.zeros(2, 1), torch.arange(2), None)
+                torch.testing.assert_close(hidden, torch.full((2, 1), 60.0))
+                torch.testing.assert_close(aux[0], torch.ones(2, 1))
+                torch.testing.assert_close(aux[1], torch.full((2, 1), 6.0))
 
     def test_no_capture_returns_only_the_normed_stream(self):
-        model = stub_beam_model([AddLayer(1)], torch.nn.Identity(), ())
-        hidden = model(torch.zeros(2, 1), torch.arange(2), None)
+        norm = torch.nn.Linear(1, 1, bias=False)
+        norm.weight.data.fill_(1)
+        model = stub_beam_model([AddLayer(1)], norm, ())
+        with get_context().override_server_args(cpu_offload_gb=0):
+            hidden = model(torch.zeros(2, 1), torch.arange(2), None)
         torch.testing.assert_close(hidden, torch.ones(2, 1))
 
     def test_dflash_rejects_ambiguous_capture_order(self):

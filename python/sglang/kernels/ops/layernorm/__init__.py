@@ -454,6 +454,17 @@ class BeamSandwichResidualRMSNormOp(BaseFusedOp):
         # Native compilation can remove the required intermediate rounding.
         return None
 
+    def forward_torch_compile(self, *args, **kwargs):
+        import torch
+
+        if self._compiled_native is None:
+            # Register and warm the opaque op before tracing its dispatch wrapper.
+            self.forward_triton(*args, **kwargs)
+            self._compiled_native = torch.compile(
+                self.forward_triton, options={"emulate_precision_casts": True}
+            )
+        return self._compiled_native(*args, **kwargs)
+
     def forward_native(
         self,
         branch: torch.Tensor,
@@ -490,10 +501,6 @@ class BeamSandwichResidualRMSNormOp(BaseFusedOp):
     ) -> tuple[Optional[torch.Tensor], torch.Tensor]:
         import torch
 
-        from sglang.kernels.ops.layernorm.beam_fused import (
-            fused_sandwich_residual_rmsnorm,
-        )
-
         if not branch.is_cuda or branch.dtype not in (torch.float16, torch.bfloat16):
             return self.forward_native(
                 branch,
@@ -504,6 +511,10 @@ class BeamSandwichResidualRMSNormOp(BaseFusedOp):
                 scales,
                 combine_in_fp32,
             )
+        from sglang.kernels.ops.layernorm.beam_fused import (
+            fused_sandwich_residual_rmsnorm,
+        )
+
         return fused_sandwich_residual_rmsnorm(
             branch,
             residual,

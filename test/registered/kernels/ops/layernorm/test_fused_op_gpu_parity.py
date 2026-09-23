@@ -233,7 +233,8 @@ def test_beam_custom_op_contracts(with_norms):
 
 
 @pytest.mark.parametrize("op_name", ["norm", "gate"])
-def test_beam_compiled_rounding(op_name):
+@pytest.mark.parametrize("forced_backend", [False, True])
+def test_beam_compiled_rounding(op_name, forced_backend):
     """Outer compilation must preserve residual cancellation and sigmoid rounding."""
     from torch._inductor import config as inductor_config
 
@@ -269,7 +270,11 @@ def test_beam_compiled_rounding(op_name):
     op.enter_torch_compile(1)
     try:
         with inductor_config.patch(compile_threads=1):
-            actual = torch.compile(op, fullgraph=True)(*args)
+            actual = (
+                op(*args, backend=KernelBackend.TORCH_COMPILE)
+                if forced_backend
+                else torch.compile(op, fullgraph=True)(*args)
+            )
         torch.testing.assert_close(actual, expected, atol=0, rtol=0)
     finally:
         op.leave_torch_compile()
