@@ -1,5 +1,3 @@
-"""Tests for memcpy_triton against memcpy_cpu, including counts larger than the tensors."""
-
 import unittest
 
 import torch
@@ -23,15 +21,10 @@ def _guarded_rows(rows: int) -> torch.Tensor:
     return base
 
 
+@unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
 class TestMemcpyTriton(CustomTestCase):
-    @classmethod
-    def setUpClass(cls):
-        if not torch.cuda.is_available():
-            raise unittest.SkipTest("CUDA required")
-
     def test_matches_cpu_and_stays_in_bounds(self):
-        # (src_rows, dst_rows, offset, count, offset_src); count > rows is the
-        # DP-attention gather/scatter when the logprob count exceeds local rows.
+        # (src_rows, dst_rows, offset, count, offset_src); count may exceed either tensor.
         for src_rows, dst_rows, offset, count, offset_src in [
             (5, 20, 3, 5, False),
             (2, 64, 10, 40, False),

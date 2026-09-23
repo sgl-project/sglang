@@ -23,19 +23,22 @@ def memcpy_triton_kernel(
     pid = tl.program_id(axis=0).to(tl.int64)
     offset = tl.load(offset_ptr).to(tl.int64) * chunk_size
     sz = tl.load(sz_ptr).to(tl.int64) * chunk_size
-
-    idx = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-    # Clamp to both tensors, as memcpy_cpu does: a rank count larger than the
-    # local rows (the EAGLE draft extend reuses the target's input-logprob
-    # counts) must not read or write past either tensor.
+    # Never copy past either tensor, as memcpy_cpu does.
     if offset_src:
-        mask = (idx < sz) & (offset + idx < src_numel) & (idx < dst_numel)
-        data = tl.load(src_ptr + offset + idx, mask=mask)
-        tl.store(dst_ptr + idx, data, mask=mask)
+        sz = tl.minimum(sz, tl.minimum(src_numel - offset, dst_numel))
     else:
-        mask = (idx < sz) & (idx < src_numel) & (offset + idx < dst_numel)
-        data = tl.load(src_ptr + idx, mask=mask)
-        tl.store(dst_ptr + offset + idx, data, mask=mask)
+        sz = tl.minimum(sz, tl.minimum(src_numel, dst_numel - offset))
+
+    start_index = pid * BLOCK_SIZE
+    offs = tl.arange(0, BLOCK_SIZE)
+    mask = start_index + offs < sz
+
+    if offset_src:
+        data = tl.load(src_ptr + offset + start_index + offs, mask=mask)
+        tl.store(dst_ptr + start_index + offs, data, mask=mask)
+    else:
+        data = tl.load(src_ptr + start_index + offs, mask=mask)
+        tl.store(dst_ptr + offset + start_index + offs, data, mask=mask)
 
 
 def prod(x):
