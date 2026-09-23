@@ -662,6 +662,56 @@ class TestDecodePrebuilt(unittest.TestCase):
             [req.rid for req in scheduler.waiting_queue], ["replay", "normal"]
         )
 
+    def test_cache_only_replay_uses_explicit_full_prompt_coverage(self):
+        for prompt_len in (127, 128, 129, 255, 256, 257):
+            with self.subTest(prompt_len=prompt_len):
+                scheduler = self._new_scheduler(enable_overlap=False)
+                req = MagicMock(rid=f"replay-{prompt_len}")
+                req.dsv41_cache_only_replay = True
+                req.dsv41_cache_only_coverage = prompt_len
+                req.origin_input_ids = list(range(prompt_len))
+                req.kv.req_pool_idx = 0
+                scheduler.waiting_queue = [req]
+                scheduler.running_batch.is_empty.return_value = True
+                scheduler.req_to_token_pool.req_to_token = torch.arange(
+                    512, dtype=torch.int32
+                ).reshape(1, 512)
+
+                new_batch = MagicMock()
+                with patch(
+                    "sglang.srt.disaggregation.decode.ScheduleBatch.init_new",
+                    return_value=new_batch,
+                ):
+                    ret = SchedulerDisaggregationDecodeMixin.get_new_prebuilt_batch(
+                        scheduler, scheduler.running_batch
+                    )
+
+                start = max(0, prompt_len - 128)
+                req.set_extend_range.assert_called_once_with(start, prompt_len)
+                self.assertTrue(
+                    torch.equal(
+                        req.prefix_indices,
+                        torch.arange(start, dtype=torch.int32),
+                    )
+                )
+                self.assertIs(ret, new_batch)
+                new_batch.prepare_for_extend.assert_called_once()
+
+    def test_cache_only_replay_rejects_non_full_coverage(self):
+        scheduler = self._new_scheduler(enable_overlap=False)
+        req = MagicMock(rid="partial")
+        req.dsv41_cache_only_replay = True
+        req.dsv41_cache_only_coverage = 255
+        req.origin_input_ids = list(range(256))
+        req.kv.req_pool_idx = 0
+        scheduler.waiting_queue = [req]
+        scheduler.running_batch.is_empty.return_value = True
+
+        with self.assertRaisesRegex(RuntimeError, "explicit full-prompt coverage"):
+            SchedulerDisaggregationDecodeMixin.get_new_prebuilt_batch(
+                scheduler, scheduler.running_batch
+            )
+
     def test_overlap_waits_for_forward_before_processing_prebuilt(self):
         scheduler = self._new_scheduler(enable_overlap=True)
         scheduler.waiting_queue = [MagicMock(rid="request")]

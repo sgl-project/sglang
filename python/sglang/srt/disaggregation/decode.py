@@ -52,6 +52,7 @@ from sglang.srt.disaggregation.decode_hicache_mixin import (
     HiCacheRestoreResult,
 )
 from sglang.srt.disaggregation.utils import (
+    CACHE_ONLY_COVERAGE_SLOT,
     CACHE_ONLY_METADATA_SLOT,
     DisaggregationMode,
     KVClassType,
@@ -2332,7 +2333,26 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         decode_req.req.mm_audio_tokens = cached_tokens[5].item()
         decode_req.req.mm_video_tokens = cached_tokens[6].item()
         if cache_only:
+            coverage = int(cached_tokens[CACHE_ONLY_COVERAGE_SLOT].item())
+            prompt_len = len(decode_req.req.origin_input_ids)
+            if coverage < 0 or coverage > prompt_len or coverage != prompt_len:
+                error_msg = (
+                    "Invalid DeepSeek-V4.1 cache-only coverage: "
+                    f"request={decode_req.req.rid} coverage={coverage} "
+                    f"prompt_len={prompt_len}; the current handoff requires "
+                    "full-prompt coverage"
+                )
+                logger.error(error_msg)
+                prepare_abort(
+                    decode_req.req,
+                    error_msg,
+                    status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+                )
+                decode_req.kv_receiver.clear()
+                decode_req.kv_receiver = None
+                return
             decode_req.req.dsv41_cache_only_replay = True
+            decode_req.req.dsv41_cache_only_coverage = coverage
             decode_req.kv_receiver.clear()
             decode_req.kv_receiver = None
             decode_req.req.time_stats.set_wait_queue_entry_time()
@@ -2914,7 +2934,14 @@ class SchedulerDisaggregationDecodeMixin:
                 can_run_list.append(req)
                 if cache_only_batch:
                     end = len(req.origin_input_ids)
-                    start = max(0, end - 128)
+                    coverage = req.dsv41_cache_only_coverage
+                    if coverage != end:
+                        raise RuntimeError(
+                            "cache-only replay requires explicit full-prompt "
+                            f"coverage: request={req.rid} coverage={coverage} "
+                            f"prompt_len={end}"
+                        )
+                    start = max(0, coverage - 128)
                     row = self.req_to_token_pool.req_to_token[req.kv.req_pool_idx]
                     req.prefix_indices = row[:start].clone()
                     req.set_extend_range(start, end)

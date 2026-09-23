@@ -262,6 +262,7 @@ def poll_and_all_reduce_with_staging(
 #########################
 
 CACHE_ONLY_METADATA_SLOT = 7
+CACHE_ONLY_COVERAGE_SLOT = 8
 
 
 class ReqToMetadataIdxAllocator:
@@ -462,9 +463,9 @@ class MetadataBuffers:
         if not cache_only:
             self.output_ids[req.metadata_buffer_index][0] = req.output_ids[0]
         # The cached_tokens buffer is (size, 16); slots 0-3 hold cached token
-        # counts and slots 4-6 are reused for multimodal prompt token counts
-        # (slots 7-15 remain spare). This avoids adding new RDMA buffers.
-        # Slot map: 0=cached 1=device 2=host 3=storage 4=image 5=audio 6=video.
+        # counts, slots 4-6 hold multimodal prompt counts, and cache-only
+        # handoffs use slot 7 as the profile marker plus slot 8 as explicit
+        # global-cache coverage H. Slots 9-15 remain spare.
         self.cached_tokens[req.metadata_buffer_index][0] = req.cached_tokens
         self.cached_tokens[req.metadata_buffer_index][1] = req.cached_tokens_device
         self.cached_tokens[req.metadata_buffer_index][2] = req.cached_tokens_host
@@ -481,6 +482,9 @@ class MetadataBuffers:
         self.cached_tokens[req.metadata_buffer_index][6] = video_t
         self.cached_tokens[req.metadata_buffer_index][CACHE_ONLY_METADATA_SLOT] = int(
             cache_only
+        )
+        self.cached_tokens[req.metadata_buffer_index][CACHE_ONLY_COVERAGE_SLOT] = (
+            int(getattr(req, "dsv41_cache_only_coverage", 0)) if cache_only else 0
         )
         # Store the readiness/corruption guard for every profile, including a
         # cache-only handoff which returns before token metadata below.

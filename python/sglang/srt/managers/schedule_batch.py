@@ -1041,6 +1041,10 @@ class Req(ReqDllmMixin):
         # Set on the decode worker when an asymmetric DeepSeek-V4.1 prefill
         # transfers cache without a sampled handoff token.
         self.dsv41_cache_only_replay = False
+        # Explicit number of prompt tokens covered by the P-side global cache.
+        # The initial contract requires full-prompt coverage, but keeping H on
+        # the wire prevents D from inferring it from the request length.
+        self.dsv41_cache_only_coverage = 0
         # Full untruncated sequence: origin + output (+ DLLM mask block).
         # Kept in sync by _refresh_fill_ids; admission only updates
         # extend_range, never mutates this array's length.
@@ -1953,6 +1957,8 @@ class Req(ReqDllmMixin):
         self.swa_branching_seqlen = None
         self.extend_range = None
         self.dllm_initialized = False
+        self.dsv41_cache_only_replay = False
+        self.dsv41_cache_only_coverage = 0
         self.is_retracted = True
         self.retracted_stain = True
         self.input_token_logprobs = None
@@ -3523,6 +3529,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self.dsv41_cache_only_replay = False
             for req in self.reqs:
                 req.dsv41_cache_only_replay = False
+                req.dsv41_cache_only_coverage = 0
 
         self.forward_mode = ForwardMode.DECODE
         self.mamba_track_seqlens_cpu = None

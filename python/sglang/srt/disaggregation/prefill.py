@@ -774,7 +774,27 @@ class SchedulerDisaggregationPrefillMixin:
                     if req.pending_bootstrap and should_force_retry(req):
                         self.optimistic_release_and_requeue(req)
                         continue
+                    coverage = (
+                        req.extend_range.end if req.extend_range is not None else 0
+                    )
+                    if coverage != len(req.origin_input_ids):
+                        error_message = (
+                            "DeepSeek-V4.1 cache-only Prefill finished without "
+                            f"full-prompt coverage: request={req.rid} "
+                            f"coverage={coverage} prompt_len={len(req.origin_input_ids)}"
+                        )
+                        logger.error(error_message)
+                        prepare_abort(
+                            req,
+                            error_message,
+                            status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+                        )
+                        if self._retire_aborted_prefill_result(req):
+                            req.time_stats.set_completion_time()
+                            aborted_reqs.append(req)
+                        continue
                     req.dsv41_cache_only_replay = True
+                    req.dsv41_cache_only_coverage = coverage
                     maybe_cache_unfinished_req(req, self.tree_cache)
                     self.disagg_prefill_inflight_queue.append(req)
                     if not req.pending_bootstrap:
