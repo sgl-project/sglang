@@ -343,24 +343,3 @@ def get_compute_dtype() -> torch.dtype:
     """Get the current compute dtype from mixed precision policy."""
     state = _mixed_precision_state.state
     return torch.get_default_dtype() if state is None else state.param_dtype
-
-
-@contextmanager
-def temporary_modules_dtype(
-    modules: List[nn.Module],
-    dtype: torch.dtype,
-    *,
-    enabled: Union[bool, List[bool]] = True,
-    restore_dtype: Optional[torch.dtype] = None,
-) -> Iterator[List[nn.Module]]:
-    """Temporarily cast multiple modules to the given dtype, restoring original dtype on exit."""
-    enabled_list = [enabled] * len(modules) if isinstance(enabled, bool) else enabled
-
-    original_dtypes = [restore_dtype or get_module_dtype(m) for m in modules]
-    modules = [m.to(dtype=dtype) if en else m for m, en in zip(modules, enabled_list)]
-    try:
-        yield modules
-    finally:
-        for m, orig_dtype, en in zip(modules, original_dtypes, enabled_list):
-            if en:
-                m.to(dtype=orig_dtype)
