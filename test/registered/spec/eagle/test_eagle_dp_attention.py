@@ -5,9 +5,6 @@ import requests
 
 from sglang.srt.environ import envs
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
-from sglang.test.kits.dp_spec_prefill_coordination_kit import (
-    DPSpecPrefillCoordinationKit,
-)
 from sglang.test.run_eval import run_eval
 from sglang.test.send_one import BenchArgs, send_one_prompt
 from sglang.test.test_utils import (
@@ -28,7 +25,7 @@ register_cuda_ci(est_time=112, stage="base-c", runner_config="4-gpu-h100")
 register_amd_ci(est_time=200, suite="stage-c-test-4-gpu-amd")
 
 
-class TestEAGLE3EngineDPAttention(DPSpecPrefillCoordinationKit, CustomTestCase):
+class TestEAGLE3EngineDPAttention(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         cls.model = DEFAULT_TARGET_MODEL_EAGLE_DP_ATTN
@@ -60,10 +57,7 @@ class TestEAGLE3EngineDPAttention(DPSpecPrefillCoordinationKit, CustomTestCase):
             "--cuda-graph-max-bs-decode",
             "64",
         ]
-        with (
-            envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.override(1),
-            envs.SGLANG_ENABLE_DP_SPEC_PREFILL_COORDINATION.override(True),
-        ):
+        with envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.override(1):
             cls.process = popen_launch_server(
                 cls.model,
                 cls.base_url,
