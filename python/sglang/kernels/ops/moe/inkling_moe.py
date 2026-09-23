@@ -3,7 +3,7 @@ import triton
 import triton.language as tl
 
 from sglang.kernels.jit.utils import is_arch_support_pdl
-from sglang.srt.utils.common import is_sm121
+from sglang.srt.utils.common import is_sm120_supported
 
 DEFAULT_BLOCK_SIZE = 4096
 BLOCK_SIZE_M = 128
@@ -553,6 +553,12 @@ FUSED_PREPROCESS_MAX_TOKENS = 2048
 FUSED_PREPROCESS_WIN_TOKENS = 1024
 
 
+def _small_m_grouped_gemm_num_stages() -> int:
+    # SM120 and SM121 cap per-block shared memory at 99 KiB. Four stages need
+    # 108 KiB for this tile, while three stages fit on both architectures.
+    return 3 if is_sm120_supported() else 4
+
+
 @triton.jit
 def _fused_moe_preprocess_kernel(
     topk_ids_ptr,  # [n] int32, unsorted
@@ -969,10 +975,7 @@ def grouped_gemm_triton(
             "BLOCK_SIZE_K": 128,
             "GROUP_SIZE_M": 8,
             "num_warps": 4,
-            # sm_121 (GB10 / DGX Spark) caps shared memory at 99 KB per block and
-            # num_stages=4 needs 108 KB. The BLOCK_SIZE_M=128 branch below fits at
-            # its default 3 (96 KB) and needs no gate.
-            "num_stages": 3 if is_sm121() else 4,
+            "num_stages": _small_m_grouped_gemm_num_stages(),
         }
     else:
         assert block_size_m == BLOCK_SIZE_M, f"{block_size_m=}"
