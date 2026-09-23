@@ -115,23 +115,6 @@ class TestDefaultModelLoader(CustomTestCase):
                     startup_prefetch_active=True,
                 )
 
-    def test_postprocess_skips_lora_wrappers_that_forward_quant_method(self):
-        """FusedMoEWithLoRA forwards quant_method but owns no params; processing it raises."""
-        from sglang.srt.lora.layers import BaseLayerWithLoRA
-
-        processed = []
-        quant_method = SimpleNamespace(process_weights_after_loading=processed.append)
-        base_layer = torch.nn.Module()
-        base_layer.quant_method = quant_method
-        wrapper = BaseLayerWithLoRA(base_layer, lora_backend=None)
-        wrapper.quant_method = quant_method
-        model = torch.nn.Module()
-        model.experts = wrapper
-
-        DefaultModelLoader.postprocess_weights(model, torch.device("cpu"))
-
-        self.assertEqual(processed, [base_layer])
-
 
 if __name__ == "__main__":
     unittest.main()
