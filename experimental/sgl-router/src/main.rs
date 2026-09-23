@@ -79,32 +79,17 @@ async fn main() -> Result<()> {
     let engine_state = start_engine_state_monitor(external_kv_indexer_client.is_some());
 
     // Build the policies that choose which workers receive each request.
-    let (routing_policies, chat_routing, reorg_cleanup) = match routing {
-        ChatRoutingKind::Legacy => (
-            Arc::new(
-                build_policy_registry(
-                    &config,
-                    engine_state.tree(),
-                    engine_state.block_size_oracle(),
-                )
-                .context("build policy registry")?,
-            ),
-            ChatRouting::Legacy,
-            None,
+    // Reorg policies are built after the app context, whose metrics registry they record into.
+    let routing_policies = match routing {
+        ChatRoutingKind::Legacy => Arc::new(
+            build_policy_registry(
+                &config,
+                engine_state.tree(),
+                engine_state.block_size_oracle(),
+            )
+            .context("build policy registry")?,
         ),
-        ChatRoutingKind::Reorg => {
-            let (resolver, cleanup) = build_reorg_resolver(
-                &config.model,
-                &engine_state,
-                external_kv_indexer_client.clone(),
-            )
-            .context("build reorg policies")?;
-            (
-                Arc::new(PolicyRegistry::default()),
-                ChatRouting::Reorg([(ModelId(config.model.id.clone()), resolver)].into()),
-                cleanup,
-            )
-        }
+        ChatRoutingKind::Reorg => Arc::new(PolicyRegistry::default()),
     };
 
     // Track this router's local view of in-flight requests.
@@ -128,9 +113,23 @@ async fn main() -> Result<()> {
         routing_policies,
         local_inflight_requests,
         &engine_state,
-        external_kv_indexer_client,
+        external_kv_indexer_client.clone(),
     )?;
-    app_context.chat_routing = chat_routing;
+    let reorg_cleanup = match routing {
+        ChatRoutingKind::Legacy => None,
+        ChatRoutingKind::Reorg => {
+            let (resolver, cleanup) = build_reorg_resolver(
+                &config.model,
+                &engine_state,
+                external_kv_indexer_client,
+                Arc::clone(&app_context.metrics),
+            )
+            .context("build reorg policies")?;
+            app_context.chat_routing =
+                ChatRouting::Reorg([(ModelId(config.model.id.clone()), resolver)].into());
+            cleanup
+        }
+    };
     let app_context = Arc::new(app_context);
     app_context.mark_ready();
 

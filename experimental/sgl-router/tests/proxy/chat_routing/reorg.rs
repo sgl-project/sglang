@@ -701,9 +701,13 @@ async fn default_pd_groups_apply_configured_inflight_admission() {
         min_prefix_share: None,
     });
     let state = sgl_router::state::kv_events::KvEventIndex::new();
-    let (resolver, _) =
-        sgl_router::policies_reorg::factory::build_resolver(&mutable.config.model, &state, None)
-            .unwrap();
+    let (resolver, _) = sgl_router::policies_reorg::factory::build_resolver(
+        &mutable.config.model,
+        &state,
+        None,
+        Arc::clone(&mutable.metrics),
+    )
+    .unwrap();
     mutable.chat_routing = ChatRouting::Reorg([(ModelId("tiny".into()), resolver)].into());
     let worker = ctx.registry.get(&WorkerId("d".into())).unwrap();
     let app = build_router(ctx);

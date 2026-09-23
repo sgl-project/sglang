@@ -8,6 +8,7 @@ use futures::future::BoxFuture;
 use rand::Rng;
 
 use crate::policies::admission::{compare_decode_pressure, compare_prefill_pressure};
+use crate::server::metrics::MetricsRegistry;
 use crate::state::load_monitor::engine_reported_load::EngineReportedLoadTable;
 use crate::workers::Worker;
 
@@ -21,6 +22,9 @@ pub struct PowerOfTwoPolicy {
     /// Shared application state; snapshots are local to each pick.
     engine_load: Arc<EngineReportedLoadTable>,
     pub admission: Arc<dyn EngineAdmission>,
+    /// Records admitted Plain/Prefill picks. Unset on fallback instances,
+    /// whose picks belong to the wrapping policy.
+    pub metrics: Option<Arc<MetricsRegistry>>,
 }
 
 impl PowerOfTwoPolicy {
@@ -28,6 +32,7 @@ impl PowerOfTwoPolicy {
         Self {
             engine_load,
             admission: Arc::new(AdmissionLimits::default()),
+            metrics: None,
         }
     }
 }
@@ -44,8 +49,8 @@ impl Policy for PowerOfTwoPolicy {
             }
             // Selection and admission use the same load observation.
             let load = self.engine_load.capture_snapshot(Instant::now());
-            let engine = match engines {
-                [engine] => Arc::clone(engine),
+            let (engine, load_source) = match engines {
+                [engine] => (Arc::clone(engine), "single_candidate"),
                 _ => {
                     let mut rng = rand::thread_rng();
                     let i = rng.gen_range(0..engines.len());
@@ -60,7 +65,18 @@ impl Policy for PowerOfTwoPolicy {
                         }
                         Stage::Decode => compare_decode_pressure(left, right, Some(&load)),
                     };
-                    Arc::clone(if pressure.is_gt() { right } else { left })
+                    // The comparators fall back to Router-local in-flight load
+                    // unless both engines have fresh, complete reports.
+                    let load_source = if [left, right]
+                        .iter()
+                        .all(|engine| load.fresh_native_cache_load_for_url(&engine.url).is_some())
+                    {
+                        "engine_load"
+                    } else {
+                        "router_local"
+                    };
+                    let winner = if pressure.is_gt() { right } else { left };
+                    (Arc::clone(winner), load_source)
                 }
             };
             let metrics = EngineMetrics::observe(&engine, &load);
@@ -69,6 +85,10 @@ impl Policy for PowerOfTwoPolicy {
                     engine: engine.id.clone(),
                     reason,
                 }));
+            }
+            if let (Some(registry), Stage::Plain | Stage::Prefill) = (&self.metrics, request.stage)
+            {
+                registry.record_policy_decision("power_of_two", load_source);
             }
             Ok(Pick {
                 engine,

@@ -6,8 +6,10 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use sgl_router::discovery::{ModelId, WorkerId, WorkerSpec};
+use sgl_router::policies_reorg::admission::AdmissionLimits;
 use sgl_router::policies_reorg::power_of_two::PowerOfTwoPolicy;
 use sgl_router::policies_reorg::{PickRequest, Policy, Stage};
+use sgl_router::server::metrics::MetricsRegistry;
 use sgl_router::state::load_monitor::engine_reported_load::{
     EngineReportedLoadTable, LoadStat, NativeCacheRankLoad,
 };
@@ -199,5 +201,52 @@ async fn multiple_candidates_never_select_the_unique_busiest_engine() {
         assert!(engines[..7]
             .iter()
             .any(|engine| Arc::ptr_eq(engine, &pick.engine)));
+    }
+}
+
+#[tokio::test]
+async fn admitted_prefill_picks_record_their_load_source() {
+    let decision = |reason: &str| {
+        format!("sgl_router_policy_decisions_total{{policy=\"power_of_two\",reason=\"{reason}\"}}")
+    };
+    let model = ModelId("m".into());
+    for stage in [Stage::Plain, Stage::Prefill, Stage::Decode] {
+        let engines = [engine("a", stage, 0), engine("b", stage, 0)];
+        let table = EngineReportedLoadTable::new();
+        let registry = MetricsRegistry::new();
+        let mut policy = PowerOfTwoPolicy::new(table.clone());
+        policy.metrics = Some(Arc::clone(&registry));
+        let request = PickRequest::new(&model, stage, 10);
+
+        policy.pick(&engines[..1], &request).await.unwrap();
+        table.set(&engines[0].url, 0, load(1, 0, 0, 100, 0), Instant::now());
+        policy.pick(&engines, &request).await.unwrap();
+        table.set(&engines[1].url, 0, load(1, 0, 0, 100, 0), Instant::now());
+        for _ in 0..2 {
+            policy.pick(&engines, &request).await.unwrap();
+        }
+        // A rejected pick is not a decision.
+        engines[0].active_requests.store(5, Ordering::Relaxed);
+        policy.admission = Arc::new(AdmissionLimits {
+            max_inflight_requests: Some(1),
+            ..Default::default()
+        });
+        assert!(policy.pick(&engines[..1], &request).await.is_err());
+
+        let out = registry.render();
+        if stage == Stage::Decode {
+            assert!(!out.contains("policy=\"power_of_two\""), "{out}");
+            continue;
+        }
+        for (reason, count) in [
+            ("single_candidate", 1),
+            ("router_local", 1),
+            ("engine_load", 2),
+        ] {
+            assert!(
+                out.contains(&format!("{} {count}\n", decision(reason))),
+                "{stage:?}: {out}"
+            );
+        }
     }
 }

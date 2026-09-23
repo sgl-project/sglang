@@ -86,6 +86,12 @@ with `--max-in-flight` retain their existing flags. Unsupported legacy options
 fail at startup. Legacy `--bucket-config` files cannot define complete reorg PD
 buckets and are not accepted on this path.
 
+With `--policy power_of_two`, each admitted plain/prefill pick increments
+`sgl_router_policy_decisions_total{policy="power_of_two",reason}`, where
+`reason` is `engine_load` (both sampled engines had fresh engine-reported load),
+`router_local` (at least one did not, so the pair was compared on Router-local
+in-flight load), or `single_candidate`.
+
 Omitting `--chat-routing` keeps the existing policies and defaults.
 
 ### Fleet-wide sampling contract

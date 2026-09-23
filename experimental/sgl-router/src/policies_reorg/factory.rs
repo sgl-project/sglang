@@ -8,6 +8,7 @@ use anyhow::{bail, ensure, Result};
 use crate::buckets_reorg::{Bucket, BucketGroups, BucketResolver, EngineGroup};
 use crate::config::{DecodePolicyKind, FilterKind, ModelConfig, PolicyKind, SessionAffinityMode};
 use crate::policies::prefix_provider::RadixTreePrefixProvider;
+use crate::server::metrics::MetricsRegistry;
 use crate::state::{
     kv_events::KvEventIndex, load_monitor::router_inflight_load::JanitorHandle, AffinityStore,
 };
@@ -64,6 +65,7 @@ pub fn build_resolver(
     model: &ModelConfig,
     state: &KvEventIndex,
     external_index: Option<Arc<dyn sgl_kv_indexer::PrefixIndex>>,
+    metrics: Arc<MetricsRegistry>,
 ) -> Result<(BucketResolver, Option<JanitorHandle>)> {
     let admission = Arc::new(AdmissionLimits {
         max_inflight_requests: model
@@ -75,6 +77,8 @@ pub fn build_resolver(
     });
     let mut decode = PowerOfTwoPolicy::new(state.engine_reported_load());
     decode.admission = admission.clone();
+    // Only Plain/Prefill picks are recorded, so this counts only when it is also the prefill policy.
+    decode.metrics = Some(metrics);
     let decode: Arc<dyn Policy> = Arc::new(decode);
     let affinity = model.affinity.clone().unwrap_or_default();
     let mut cleanup = None;
