@@ -176,7 +176,6 @@ FP8_GEMM_RUNNER_BACKEND_CHOICES = [
     "cutlass",
     "triton",
     "aiter",
-    "bf16",
 ]
 
 FP4_GEMM_RUNNER_BACKEND_CHOICES = [

@@ -340,7 +340,6 @@ class Fp8GemmRunnerBackend(Enum):
     DEEP_GEMM = "deep_gemm"
     TRITON = "triton"
     AITER = "aiter"
-    BF16 = "bf16"
 
     def is_auto(self) -> bool:
         return self == Fp8GemmRunnerBackend.AUTO
@@ -368,9 +367,6 @@ class Fp8GemmRunnerBackend(Enum):
 
     def is_aiter(self) -> bool:
         return self == Fp8GemmRunnerBackend.AITER
-
-    def is_bf16(self) -> bool:
-        return self == Fp8GemmRunnerBackend.BF16
 
 
 class Mxfp8DenseGemmBackend(Enum):
@@ -663,13 +659,6 @@ def resolve_mxfp8_dense_gemm_backend() -> Mxfp8DenseGemmBackend:
     names a backend that owns an MXFP8 dense kernel."""
     backend = get_fp8_gemm_runner_backend()
 
-    if backend.is_bf16():
-        if not (_is_hip and _is_gfx95_supported):
-            raise RuntimeError(
-                "--fp8-gemm-backend bf16 is supported only for MXFP8 on AMD gfx950."
-            )
-        return Mxfp8DenseGemmBackend.GFX95_DOT_SCALED
-
     if backend.is_flashinfer_trtllm():
         if not (get_platform().is_sm100 and is_flashinfer_available()):
             raise RuntimeError(
@@ -930,11 +919,6 @@ def _dispatch_explicit_backend(backend: Fp8GemmRunnerBackend) -> Callable:
     elif backend.is_triton():
         return triton_w8a8_block_fp8_linear
 
-    elif backend.is_bf16():
-        raise RuntimeError(
-            "--fp8-gemm-backend bf16 is supported only for MXFP8 on AMD gfx950."
-        )
-
     else:
         raise ValueError(f"Unknown FP8 GEMM backend: {backend}")
 
@@ -979,10 +963,6 @@ def initialize_fp8_gemm_config() -> None:
         backend = "cutlass"
 
     backend = Fp8GemmRunnerBackend(backend)
-    if backend.is_bf16() and not (_is_hip and _is_gfx95_supported):
-        raise ValueError(
-            "--fp8-gemm-backend bf16 is supported only for MXFP8 on AMD gfx950."
-        )
 
     FP8_GEMM_RUNNER_BACKEND = backend
 

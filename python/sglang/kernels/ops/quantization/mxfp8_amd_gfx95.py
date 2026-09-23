@@ -324,14 +324,6 @@ def _use_scaled_mm_mxfp8_gemm() -> bool:
     return (backend.is_auto() or backend.is_aiter()) and _scaled_mm_mxfp8_available()
 
 
-def _use_bf16_emulation_gemm() -> bool:
-    from sglang.srt.layers.quantization.fp8_utils import (
-        get_fp8_gemm_runner_backend,
-    )
-
-    return get_fp8_gemm_runner_backend().is_bf16()
-
-
 def _dispatch_mxfp8_gemm(
     x_q: torch.Tensor,
     x_scale: torch.Tensor,
@@ -374,19 +366,6 @@ def dot_scaled_mxfp8_blockscaled_linear(
         "dot_scaled MXFP8 linear expects canonical 2D [N, K//32] weight scales, "
         f"got {weight_scale.dim()}D."
     )
-
-    if _use_bf16_emulation_gemm():
-        w_bf16 = getattr(weight, "_bf16_emul", None)
-        if w_bf16 is None:
-            w_bf16 = dequant_mxfp8_to_bf16(weight, weight_scale)
-            weight._bf16_emul = w_bf16
-        if input_scale is not None:
-            input_2d = input.reshape(-1, input.shape[-1])
-            input_bf16 = dequant_mxfp8_to_bf16(input_2d, input_scale).view(*input.shape)
-        else:
-            input_bf16 = input.to(torch.bfloat16)
-        out = F.linear(input_bf16, w_bf16, bias)
-        return out if output_dtype is None else out.to(output_dtype)
 
     input_2d = input.view(-1, input.shape[-1]).contiguous()
     output_shape = [*input.shape[:-1], weight.shape[0]]
