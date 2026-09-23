@@ -369,12 +369,33 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         """
 
     def release_aborted_request(self, handle: CacheRequestHandle) -> None:
-        """Release attempt state; caches without prefetch state have nothing to drop."""
+        """Release attempt state; caches without prefetch state have nothing to drop.
+
+        Existing backends implement cancel-phase work here (pending lookup /
+        prefetch). New code should override
+        :meth:`cancel_aborted_request_work` / :meth:`finish_request_session`
+        instead; the default cancel path still delegates to this method.
+        """
+
+    def cancel_aborted_request_work(self, handle: CacheRequestHandle) -> None:
+        """Drop pending lookup/prefetch for an aborted attempt.
+
+        Must run *before* ``cache_finished_req``. FlexKV relies on this: an
+        in-flight async STORE registered there must keep its source-node lock.
+        """
+        self.release_aborted_request(handle)
+
+    def finish_request_session(self, handle: CacheRequestHandle) -> None:
+        """Close backend session state after optional STORE, or immediately if none.
+
+        LMCache must not ``end_session`` in the cancel phase: abort paths that
+        still ``cache_finished_req`` need the session open for STORE.
+        """
 
     def finish(self, handle: CacheRequestHandle, outcome: CacheRequestOutcome) -> None:
         """Finish an attempt without cancelling successful asynchronous cache work."""
         if outcome != CacheRequestOutcome.SUCCESS:
-            self.release_aborted_request(handle)
+            self.cancel_aborted_request_work(handle)
 
     @abstractmethod
     def reset(self):

@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, Optional, Tuple
 import torch
 
 from sglang.srt.mem_cache.base_prefix_cache import (
+    CacheRequestHandle,
     EvictParams,
     EvictResult,
     InitLoadBackParams,
@@ -447,7 +448,6 @@ class LMCRadixCache(RadixCache):
         if not is_insert:
             if self._mode is LMCacheMode.MP:
                 self._mp_load_back_markers.pop(req.rid, None)
-                self.lmcache_connector.end_session(req.rid)
             return
 
         topk = get_spec().speculative_eagle_topk
@@ -490,13 +490,37 @@ class LMCRadixCache(RadixCache):
             # MP store_kv blocks until the daemon's signal event fires, so the slots are safe to evict immediately.
             self._mp_load_back_markers.pop(req.rid, None)
             self.dec_lock_ref(new_last_node)
-            self.lmcache_connector.end_session(req.rid)
+            # Session close is finish_request_session, after this STORE.
         elif self._mode is LMCacheMode.IP:
             with device_stream_context(self.store_stream):
                 self.lmcache_connector.store_kv(store_md)
             # Layerwise store is async on store_stream; defer the unlock to evict()'s store_stream.synchronize().
             with self._node_lock:
                 self._in_flight_nodes.append(new_last_node)
+
+    def cancel_aborted_request_work(self, handle: CacheRequestHandle) -> None:
+        """Drop MP lookup state without closing the session.
+
+        ``end_session`` belongs in :meth:`finish_request_session` so abort
+        paths that still STORE keep the session open across
+        ``cache_finished_req``.
+        """
+        if self._mode is not LMCacheMode.MP:
+            return
+
+        # TODO: LMCache state is still keyed by rid rather than
+        # CacheRequestHandle, so overlapping attempts for the same rid are not
+        # independently isolated. Today the scheduler retires an attempt before
+        # starting the next one, which keeps this correct.
+        request_id = handle.rid
+        self._mp_load_back_markers.pop(request_id, None)
+        self.lmcache_connector.release_pending(request_id)
+
+    def finish_request_session(self, handle: CacheRequestHandle) -> None:
+        """Send END_SESSION after optional STORE, or immediately if none ran."""
+        if self._mode is not LMCacheMode.MP:
+            return
+        self.lmcache_connector.end_session(handle.rid)
 
     def evict(self, params: EvictParams) -> EvictResult:
         """Before base eviction, wait for any outstanding stores and release locks."""

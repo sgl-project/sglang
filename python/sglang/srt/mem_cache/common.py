@@ -11,7 +11,11 @@ from sglang.kernels.ops.memory.common import (
 )
 from sglang.kernels.ops.memory.common import get_last_loc_kernel as get_last_loc_kernel
 from sglang.srt.mem_cache.allocator.page_interleave import page_interleave_shard_size
-from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, EvictParams
+from sglang.srt.mem_cache.base_prefix_cache import (
+    BasePrefixCache,
+    CacheRequestOutcome,
+    EvictParams,
+)
 from sglang.srt.mem_cache.hicache_storage import PoolTransfer
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
 from sglang.srt.runtime_context import get_serving, get_spec
@@ -269,6 +273,31 @@ def retraction_discard(req: Req, tree_cache: BasePrefixCache, backend: str) -> N
     req.kv.retraction_backup = None
 
 
+def abort_prefix_cache_request(
+    req: Req,
+    tree_cache: BasePrefixCache,
+    *,
+    release_kv: bool = False,
+    is_insert: bool = True,
+) -> None:
+    """Cancel abort-phase cache work, optionally STORE, then close the session.
+
+    FlexKV must cancel in-flight lookup/prefetch *before* ``cache_finished_req``
+    (otherwise abort cleanup can drop the lock of an async STORE). LMCache must
+    ``end_session`` *after* that optional STORE, or immediately when no STORE
+    runs. See issue #40360.
+    """
+    handle = req.cache_request_handle
+    tree_cache.finish(handle, CacheRequestOutcome.ABORT)
+    if release_kv and (req.kv.holds_kv or req.kv.holds_mamba):
+        had_device_kv = req.kv.holds_kv
+        release_kv_cache(req, tree_cache, is_insert=is_insert)
+        if had_device_kv:
+            # ``release_kv_cache`` already closed the session after STORE.
+            return
+    tree_cache.finish_request_session(handle)
+
+
 def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = True):
     assert (not req.kv.holds_kv) == req.kv.is_kv_released
     # A mamba-capable cache may alloc mamba state before alloc KV cache
@@ -290,6 +319,7 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
         is_insert=is_insert and not getattr(req, "skip_radix_cache_insert", False),
         owned_kv_len=owned_kv_len,
     )
+    tree_cache.finish_request_session(req.cache_request_handle)
 
     # StreamingSession.cache_finished_req handles speculative tail trim
     # internally, then sets req_pool_idx = None.
