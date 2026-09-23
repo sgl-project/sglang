@@ -533,8 +533,6 @@ class SchedulerWeightUpdaterManager:
                     queue = getattr(scheduler, "disagg_prefill_bootstrap_queue", None)
                     if queue is not None:
                         queue.release_memory_occupation()
-            # Hybrid state pools (mamba, PLE short-conv / n-gram) live in the KV region and
-            # their clear() writes device memory, so flush while the region is still mapped.
             self.flush_cache()
             self.memory_saver_adapter.pause(GPU_MEMORY_TYPE_KV_CACHE)
 
