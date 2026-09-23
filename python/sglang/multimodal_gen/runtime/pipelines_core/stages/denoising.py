@@ -74,11 +74,13 @@ from sglang.multimodal_gen.runtime.cache.cache_dit_integration import (
     resolve_cache_dit_request_overrides,
 )
 from sglang.multimodal_gen.runtime.cache.dpcache import (
+    DPCacheCalibrationState,
     DPCacheRequestSignature,
     DPCacheState,
     checkpoint_identity,
     config_digest,
     load_schedule_dir,
+    save_calibration_capture,
     select_schedule,
 )
 from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
@@ -2083,38 +2085,61 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
 
         A request's own dpcache_budget must apply or the request fails. The
         server's default budget applies where it can; any other request runs
-        natively.
+        natively. A calibration request runs every step, scores PACT errors,
+        and writes them on success.
         """
-        explicit = batch.dpcache_budget is not None
-        budget = (
-            batch.dpcache_budget if explicit else server_args.dpcache_default_budget
-        )
-        if not budget or batch.is_warmup:
-            # a warmup copy runs fewer steps than any calibrated schedule
+        if batch.is_warmup:
+            # a warmup copy runs fewer steps than any calibrated configuration
             yield
             return
-        try:
-            full_steps = self._dpcache_full_steps(batch, server_args, budget)
-        except ValueError as exc:
-            if explicit:
-                raise
-            logger.info("DPCache default K=%d not applied: %s", budget, exc)
-            yield
-            return
+        branches = (False, True) if batch.do_classifier_free_guidance else (False,)
+        num_steps = len(batch.timesteps)
+        calibration = batch.dpcache_calibration
+        if calibration is not None:
+            if batch.dpcache_budget:
+                raise ValueError("dpcache_budget and dpcache_calibration are exclusive")
+            self._check_dpcache_supported(batch, server_args)
+            signature = self.dpcache_signature(batch, server_args)
+            max_gap = calibration.get("max_gap")
+            states = {n: DPCacheCalibrationState(num_steps, max_gap) for n in branches}
+            label = "calibration"
+        else:
+            explicit = batch.dpcache_budget is not None
+            budget = (
+                batch.dpcache_budget if explicit else server_args.dpcache_default_budget
+            )
+            if not budget:
+                yield
+                return
+            try:
+                full_steps = self._dpcache_full_steps(batch, server_args, budget)
+            except ValueError as exc:
+                if explicit:
+                    raise
+                logger.info("DPCache default K=%d not applied: %s", budget, exc)
+                yield
+                return
+            states = {n: DPCacheState(full_steps, num_steps) for n in branches}
+            label = f"K={budget}"
         if self._cache_dit_enabled:
             # a previous request left the wrapper mounted; this one runs without it
             self._unmount_cache_dit()
-        branches = (False, True) if batch.do_classifier_free_guidance else (False,)
-        batch.dpcache_states = {
-            negative: DPCacheState(full_steps, len(batch.timesteps))
-            for negative in branches
-        }
+        batch.dpcache_states = states
         try:
             yield
-            for negative, state in batch.dpcache_states.items():
+            if calibration is not None:
+                # the scope check rejects CFG, so the positive branch is the request
+                save_calibration_capture(
+                    calibration["output"],
+                    state=states[False],
+                    signature=signature,
+                    prompt=batch.prompt,
+                    seed=batch.seed,
+                )
+            for negative, state in states.items():
                 logger.info(
-                    "DPCache K=%d %s branch: full=%d predicted=%d",
-                    budget,
+                    "DPCache %s %s branch: full=%d predicted=%d",
+                    label,
                     "negative" if negative else "positive",
                     state.num_full,
                     state.num_predicted,

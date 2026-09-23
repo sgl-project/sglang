@@ -349,6 +349,10 @@ class SamplingParams:
     # from the server's --dpcache-schedule-dir. None follows the server's
     # --dpcache-default-budget; 0 turns DPCache off for this request.
     dpcache_budget: int | None = None
+    # Offline calibration for DPCache, not accepted by the HTTP APIs: run every
+    # step natively and write PACT errors to {"output": path, "max_gap": int}
+    # on the worker. Used by tools/dpcache_calibrate.py.
+    dpcache_calibration: dict[str, Any] | None = None
 
     # Profiling
     profile: bool = field(default=False, metadata={"batch_sig_exclude": True})
@@ -737,6 +741,14 @@ class SamplingParams:
             raise ValueError(
                 f"dpcache_budget must be 0 (off) or an int >= 2, got {budget!r}"
             )
+        if self.dpcache_calibration is not None:
+            from sglang.multimodal_gen.runtime.cache.dpcache import (
+                validate_calibration_request,
+            )
+
+            validate_calibration_request(self.dpcache_calibration)
+            if budget:
+                raise ValueError("dpcache_budget and dpcache_calibration are exclusive")
 
         RLRolloutArgs.validate_sampling_params(self)
 

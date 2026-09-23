@@ -112,10 +112,15 @@ class TestBootstrapImportBoundary(unittest.TestCase):
             ("sglang.multimodal_gen.runtime.platforms.plugins", False),
             (worker_bootstrap.__name__, False),
             (WORKER_MODULE, True),
+            ("sglang.multimodal_gen.tools", False),
         ):
+            # the tools directory is a namespace package: it runs no code
+            namespace = SimpleNamespace(
+                __spec__=SimpleNamespace(origin=None, submodule_search_locations=[])
+            )
             modules = {
                 "__main__": SimpleNamespace(__file__="offline.py"),
-                module: None,
+                module: namespace if module.endswith(".tools") else None,
             }
             with (
                 self.subTest(module=module),

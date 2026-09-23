@@ -605,7 +605,9 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
         return bool(req.realtime_session_id) or req.session is not None
 
     def _uses_dpcache(self, req: Req) -> bool:
-        # a DPCache schedule is calibrated for exactly one image per request
+        # DPCache schedules and calibrations cover exactly one image per request
+        if getattr(req, "dpcache_calibration", None) is not None:
+            return True
         budget = getattr(req, "dpcache_budget", None)
         if budget is None:
             budget = getattr(self.server_args, "dpcache_default_budget", None)

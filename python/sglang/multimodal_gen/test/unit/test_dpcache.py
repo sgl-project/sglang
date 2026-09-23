@@ -582,6 +582,8 @@ def make_stage(
 def make_batch(budget, height=64, **overrides):
     fields = dict(
         dpcache_budget=budget,
+        dpcache_calibration=None,
+        seed=42,
         enable_cache_dit=False,
         enable_teacache=False,
         enable_spectrum=False,
@@ -876,8 +878,10 @@ def test_request_budget_must_be_off_or_a_budget(budget):
     assert SamplingParams(dpcache_budget=0).dpcache_budget == 0
 
 
-def scheduler_request(budget):
-    sampling = SamplingParams(prompt="a cat", dpcache_budget=budget)
+def scheduler_request(budget, calibration=None):
+    sampling = SamplingParams(
+        prompt="a cat", dpcache_budget=budget, dpcache_calibration=calibration
+    )
     return SimpleNamespace(
         is_warmup=False,
         realtime_session_id=None,
@@ -888,6 +892,7 @@ def scheduler_request(budget):
         num_outputs_per_prompt=1,
         sampling_params=sampling,
         dpcache_budget=budget,
+        dpcache_calibration=calibration,
     )
 
 

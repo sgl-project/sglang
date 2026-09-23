@@ -113,56 +113,55 @@ do not let `performance_mode="auto"` choose torch compile or CUDA graphs.
 
 ## Calibrating a schedule
 
-SGLang does not ship a calibration harness or any pre-built schedule: you supply
-the JSON artifact, and the runtime only validates and applies it.
-`sglang.multimodal_gen.runtime.cache.dpcache` exposes the pieces needed to build
-one from features you captured yourself.
+SGLang ships no pre-built schedule. A schedule is bound to one checkpoint and
+request configuration, so calibrate once for each configuration you serve with
+`sglang.multimodal_gen.tools.dpcache_calibrate`. It takes two steps.
 
-```python
-import torch
+**Record.** Generate the calibration prompts natively. Each request runs every
+step, scores the prediction error of every usable anchor pair inside the worker,
+and writes one capture file per prompt. Features never leave the worker. Pass
+the same server flags you serve with (attention backend, offload, precision),
+because they are part of the recorded request signature:
 
-from sglang.multimodal_gen.runtime.cache.dpcache import (
-    build_schedule_artifact,
-    pact_costs,
-    pact_step_errors,
-    plan_schedule,
-)
-
-# samples[s] holds one calibration generation's final block features, in step
-# order, in the dtype and on the device the runtime uses.
-errors = torch.stack(
-    [pact_step_errors(features, max_gap=8) for features in samples]
-).mean(dim=0)
-costs = pact_costs(errors, max_gap=8)
-full_steps, calibrated_cost = plan_schedule(costs, num_full_steps=20, max_gap=8)
-
-schedule = build_schedule_artifact(
-    signature=signature,
-    full_steps=full_steps,
-    mandatory=(0, 1, 2),
-    calibrated_cost=calibrated_cost,
-    calibration={"manifest_sha256": corpus_digest, "num_samples": len(samples)},
-    source_commit=source_commit,
-    max_gap=8,
-)
+```bash
+python -m sglang.multimodal_gen.tools.dpcache_calibrate record \
+  --model-path Qwen/Qwen-Image-2.1 \
+  --prompts-file calibration-prompts.txt \
+  --height 1024 --width 1024 --num-inference-steps 40 \
+  --capture-dir dpcache-captures
 ```
 
-`signature` is a `DPCacheRequestSignature`. It includes the scheduler's timesteps
-and sigmas and a digest of its config, so capture it from the runtime rather than
-reconstructing it: `DenoisingStage.dpcache_signature(batch, server_args)`
-returns the signature for the request being served, and the server matches it
-against each schedule's recorded request.
+The prompts file is plain text (one prompt per line) or JSONL with a `prompt`
+and an optional `seed` per line. `--max-gap` (default 8) bounds the longest gap
+between full steps that is scored; scoring cost grows with it. To split the work
+across GPUs, run one process per GPU with `--shard i/n` and the same
+`--capture-dir`. Existing captures are skipped, so an interrupted run resumes.
 
-Calibration features must come from a native run of the same configuration.
-Using the same `max_gap` for scoring and planning avoids unnecessary calibration
-work. If scoring used a bound, planning must use that bound or a smaller one: a
-larger planner bound may need costs that were never computed. Unbounded scoring
-supports a bounded planner.
+**Plan.** Average the captures and write one schedule per budget `K`:
 
-Choose `K` on a validation split, freeze the choice, and only then measure a
-held-out split. A schedule carries no quality guarantee of its own, and the
-planner minimises the calibrated feature error, not the image difference you
-ultimately care about.
+```bash
+python -m sglang.multimodal_gen.tools.dpcache_calibrate plan \
+  --capture-dir dpcache-captures --budgets 12 16 20 24 --out-dir schedules
+```
+
+This writes `schedules/K12.json` and so on; serve them with
+`--dpcache-schedule-dir schedules/`. Captures for another resolution or step
+count go in their own capture directory, and their schedules can share the
+serving directory. Planning takes well under a second,
+so you can re-plan other budgets from the same captures. Every capture must come
+from the same request configuration, and a planning `--max-gap` may tighten the
+recorded bound but not loosen it.
+
+The same building blocks are exposed in
+`sglang.multimodal_gen.runtime.cache.dpcache` (`pact_step_errors`,
+`pact_costs`, `plan_schedule`, `plan_schedules`, `build_schedule_artifact`) if
+you capture features another way. `DenoisingStage.dpcache_signature(batch,
+server_args)` returns the signature of the request being served.
+
+Choose `K` on prompts you did not calibrate on, freeze the choice, and only then
+measure a held-out set. A schedule carries no quality guarantee of its own, and
+the planner minimises the calibrated feature error, not the image difference you
+ultimately care about. On Qwen-Image 2.1, 10 calibration prompts were enough.
 
 <Warning>
 A low mean image difference does not guarantee that each image is preserved.

@@ -125,6 +125,52 @@ class DPCacheState:
         return predict_feature(previous, last, previous_step, last_step, step)
 
 
+class DPCacheCalibrationState:
+    """Scores PACT errors online for one request and one CFG branch.
+
+    Every step is a full step. Each recorded final feature is scored against
+    the earlier anchor pairs as soon as it arrives, so a calibration request
+    never ships its features out of the worker; only the ``(T, T, T)`` error
+    tensor leaves. Features no later step can use are dropped.
+    """
+
+    def __init__(self, num_steps: int, max_gap: int | None = None):
+        _validate_max_gap(max_gap)
+        self.num_steps = num_steps
+        self.max_gap = max_gap
+        self.errors = torch.full((num_steps,) * 3, math.nan, dtype=torch.float64)
+        self._features: dict[int, torch.Tensor] = {}
+        self.num_full = 0
+        self.num_predicted = 0
+
+    def is_full_step(self, step: int) -> bool:
+        return True
+
+    def record(self, step: int, feature: torch.Tensor) -> None:
+        if feature.dtype != torch.bfloat16:
+            raise RuntimeError(
+                f"DPCache supports BF16 features only, got {feature.dtype}"
+            )
+        if step != self.num_full:
+            raise RuntimeError(
+                f"DPCache calibration needs every step in order: got {step} "
+                f"after {self.num_full} steps"
+            )
+        self._features[step] = feature.detach().clone()
+        _score_step(self.errors, self._features, step, self.max_gap)
+        if self.max_gap is not None:
+            # a later step t only uses anchors i > t - 2 * max_gap
+            self._features.pop(step - 2 * self.max_gap, None)
+        self.num_full += 1
+
+    def predict(self, step: int) -> torch.Tensor:
+        raise RuntimeError("DPCache calibration runs every step")
+
+    @property
+    def complete(self) -> bool:
+        return self.num_full == self.num_steps
+
+
 class DPCacheMixin:
     """DiT hook that runs or predicts the transformer block stack.
 
@@ -155,9 +201,13 @@ class DPCacheMixin:
         batch = None if context is None else context.forward_batch
         states = getattr(batch, "dpcache_states", None)
         if states is None:
-            if getattr(batch, "dpcache_budget", None) and not batch.is_warmup:
-                # a requested budget must never silently run uncached
-                raise RuntimeError("dpcache_budget is set but no state is attached")
+            requested = getattr(batch, "dpcache_budget", None) or getattr(
+                batch, "dpcache_calibration", None
+            )
+            if requested and not batch.is_warmup:
+                # a requested budget or calibration must never silently run
+                # without its state
+                raise RuntimeError("DPCache is requested but no state is attached")
             return run_blocks()
         state = states[batch.is_cfg_negative]
         step = context.current_timestep
@@ -178,6 +228,29 @@ def _allowed(i: int, j: int, k: int, max_gap: int | None) -> bool:
     return max_gap is None or (j - i <= max_gap and k - j <= max_gap)
 
 
+def _score_step(
+    errors: torch.Tensor,
+    features: Mapping[int, torch.Tensor] | Sequence[torch.Tensor],
+    step: int,
+    max_gap: int | None,
+) -> None:
+    """Fill ``errors[i, j, step]`` for every scorable anchor pair ``i < j``.
+
+    The single scoring routine: offline scoring and the runtime calibration
+    state both call it, so they produce identical errors from identical
+    features.
+    """
+    first_j = 1 if max_gap is None else max(1, step - max_gap + 1)
+    for j in range(first_j, step):
+        first_i = 0 if max_gap is None else max(0, j - max_gap)
+        for i in range(first_i, j):
+            predicted = predict_feature(features[i], features[j], i, j, step)
+            diff = predicted.float() - features[step].float()
+            errors[i, j, step] = (
+                diff.abs().sum(dtype=torch.float64).item() / diff.numel()
+            )
+
+
 def pact_step_errors(
     features: Sequence[torch.Tensor], max_gap: int | None = None
 ) -> torch.Tensor:
@@ -193,14 +266,8 @@ def pact_step_errors(
     """
     num_steps = len(features)
     errors = torch.full((num_steps,) * 3, math.nan, dtype=torch.float64)
-    for i, j in itertools.combinations(range(num_steps), 2):
-        if max_gap is not None and j - i > max_gap:
-            continue
-        stop = num_steps if max_gap is None else min(num_steps, j + max_gap)
-        for t in range(j + 1, stop):
-            predicted = predict_feature(features[i], features[j], i, j, t)
-            diff = predicted.float() - features[t].float()
-            errors[i, j, t] = diff.abs().sum(dtype=torch.float64).item() / diff.numel()
+    for step in range(2, num_steps):
+        _score_step(errors, features, step, max_gap)
     return errors
 
 
@@ -655,3 +722,122 @@ def select_schedule(
         f"no DPCache schedule with K={budget} for this request "
         f"({_describe(request)}); available: {', '.join(available)}"
     )
+
+
+# --------------------------------------------------------------------------
+# Calibration captures (runtime -> offline planner)
+# --------------------------------------------------------------------------
+
+CAPTURE_SCHEMA = "sglang-dpcache-calibration-capture-v1"
+_CALIBRATION_KEYS = {"output", "max_gap"}
+
+
+def validate_calibration_request(calibration: Mapping[str, Any]) -> None:
+    """Check a ``dpcache_calibration`` request field."""
+    if not isinstance(calibration, Mapping):
+        raise TypeError("dpcache_calibration must be a JSON object")
+    unknown = set(calibration) - _CALIBRATION_KEYS
+    if unknown:
+        raise ValueError(f"dpcache_calibration: unknown keys {sorted(unknown)}")
+    output = calibration.get("output")
+    if not isinstance(output, str) or not output:
+        raise ValueError("dpcache_calibration.output must be a nonempty path")
+    _validate_max_gap(calibration.get("max_gap"))
+
+
+def save_calibration_capture(
+    path: str,
+    *,
+    state: DPCacheCalibrationState,
+    signature: DPCacheRequestSignature,
+    prompt: str,
+    seed: int,
+) -> None:
+    """Write one calibration request's PACT errors and request signature."""
+    if not state.complete:
+        raise RuntimeError(
+            f"DPCache calibration scored {state.num_full} of {state.num_steps} steps"
+        )
+    parent = os.path.dirname(os.path.abspath(path))
+    os.makedirs(parent, exist_ok=True)
+    torch.save(
+        {
+            "schema": CAPTURE_SCHEMA,
+            "signature": _signature_dict(signature),
+            "max_gap": state.max_gap,
+            "prompt": prompt,
+            "seed": seed,
+            "errors": state.errors,
+        },
+        path,
+    )
+
+
+def load_calibration_capture(path: str) -> dict[str, Any]:
+    capture = torch.load(path, map_location="cpu", weights_only=True)
+    if capture.get("schema") != CAPTURE_SCHEMA:
+        raise ValueError(f"{path}: not a DPCache calibration capture")
+    return capture
+
+
+def plan_schedules(
+    captures: Sequence[Mapping[str, Any]],
+    budgets: Iterable[int],
+    *,
+    source_commit: str,
+    mandatory: Sequence[int] = DEFAULT_MANDATORY_FULL_STEPS,
+    max_gap: int | None = None,
+    force_last_full: bool = False,
+) -> dict[int, dict[str, Any]]:
+    """Schedule artifacts for each budget from one configuration's captures.
+
+    Errors are averaged over the captures (summed in the given order, then
+    divided). Every capture must share one request signature. ``max_gap`` may
+    tighten, never loosen, the bound the captures were scored with, because a
+    looser planner would need costs that were never computed.
+    """
+    if not captures:
+        raise ValueError("no calibration captures")
+    signature = captures[0]["signature"]
+    scored_gap = captures[0]["max_gap"]
+    for capture in captures[1:]:
+        if capture["signature"] != signature:
+            raise ValueError("calibration captures come from different requests")
+        if capture["max_gap"] != scored_gap:
+            raise ValueError("calibration captures were scored with different max_gap")
+    if scored_gap is not None and (max_gap is None or max_gap > scored_gap):
+        raise ValueError(
+            f"max_gap={max_gap} is looser than the scored bound {scored_gap}"
+        )
+    total = None
+    for capture in captures:
+        errors = capture["errors"]
+        total = errors if total is None else total + errors
+    costs = pact_costs(total / len(captures), max_gap=max_gap)
+    manifest = sorted([c["prompt"], c["seed"]] for c in captures)
+    calibration = {
+        "manifest_sha256": hashlib.sha256(json.dumps(manifest).encode()).hexdigest(),
+        "num_samples": len(captures),
+        "scored_max_gap": scored_gap,
+    }
+    request = msgspec.convert(signature, DPCacheRequestSignature)
+    schedules = {}
+    for budget in budgets:
+        full_steps, cost = plan_schedule(
+            costs,
+            budget,
+            mandatory=mandatory,
+            force_last_full=force_last_full,
+            max_gap=max_gap,
+        )
+        schedules[budget] = build_schedule_artifact(
+            signature=request,
+            full_steps=full_steps,
+            mandatory=mandatory,
+            calibrated_cost=cost,
+            calibration=calibration,
+            source_commit=source_commit,
+            force_last_full=force_last_full,
+            max_gap=max_gap,
+        )
+    return schedules
