@@ -563,5 +563,6 @@ POSITIONAL_FIELD_ORDER = (
     "paged_experts_enable_disk",
     "disable_normalize_embedding",
     "log_schedule_decisions",
+    "elastic_ep_retiree_lifecycle",
 )
 # fmt: on

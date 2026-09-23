@@ -14,7 +14,11 @@ from sglang.srt.arg_groups.arg_utils import (
     record_fields,
 )
 from sglang.srt.arg_groups.choices import BUILT_IN_SAMPLING_BACKENDS
-from sglang.srt.arg_groups.model_override_base import resolved_view, resolving_view
+from sglang.srt.arg_groups.model_override_base import (
+    ep_offset_joiner_of,
+    resolved_view,
+    resolving_view,
+)
 from sglang.srt.arg_groups.overrides import (
     _hisparse_validation,
     declare_resolution,
@@ -281,8 +285,8 @@ def check_server_args(server_args: Any):
 
     cfg = resolving_view(server_args)
 
-    # Check parallel size constraints
-    if cfg.ep_join_mode != "scale":
+    # Check parallel size constraints (offset joiners run per-cohort tp_size).
+    if not ep_offset_joiner_of(cfg):
         assert (cfg.tp_size * cfg.pp_size) % cfg.nnodes == 0, (
             "tp_size must be divisible by number of nodes"
         )
