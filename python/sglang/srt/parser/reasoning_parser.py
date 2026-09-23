@@ -2,6 +2,8 @@ import inspect
 import re
 from typing import Dict, List, Optional, Tuple, Type
 
+from transformers import PreTrainedTokenizerBase
+
 from sglang.srt.entrypoints.openai.encoding_dsv4 import dsml_token as dsv4_dsml_token
 from sglang.srt.entrypoints.openai.encoding_dsv4 import eos_token as dsv4_eos_token
 from sglang.srt.entrypoints.openai.encoding_dsv4 import (
@@ -43,6 +45,7 @@ from sglang.srt.parser.inkling_tokenizer import (
     CONTENT_THINKING,
     END_MESSAGE,
     INKLING_CONTROL_TOKENS,
+    INKLING_SPECIAL_TOKEN_IDS,
     MESSAGE_MODEL,
 )
 
@@ -110,6 +113,9 @@ class BaseReasoningFormatDetector:
             self._in_reasoning = True
         if self.think_end_token in self.previous_content:
             self._in_reasoning = False
+
+    def get_think_end_token_ids(self, tokenizer: PreTrainedTokenizerBase) -> List[int]:
+        return tokenizer.encode(self.think_end_token, add_special_tokens=False)
 
     def _maybe_apply_force_nonempty_content(
         self, ret: StreamingParseResult
@@ -1332,6 +1338,11 @@ class InklingDetector(BaseReasoningFormatDetector):
         self._kind: str | None = None
         self._pending_header = ""
         self._pending_reasoning = ""
+
+    def get_think_end_token_ids(self, tokenizer: PreTrainedTokenizerBase) -> List[int]:
+        del tokenizer
+        # Native framing IDs differ from encoding their printed names as plain text.
+        return [INKLING_SPECIAL_TOKEN_IDS[self.think_end_token]]
 
     def detect_and_parse(self, text: str) -> StreamingParseResult:
         self._buffer = ""

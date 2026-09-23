@@ -916,8 +916,8 @@ class Scheduler(
                 stream_reasoning=False,
                 tokenizer=self.tokenizer,
             )
-            think_end_ids = self.tokenizer.encode(
-                reasoning_parser.detector.think_end_token, add_special_tokens=False
+            think_end_ids = reasoning_parser.detector.get_think_end_token_ids(
+                self.tokenizer
             )
             if think_end_ids:
                 self.model_config.think_end_ids = think_end_ids
