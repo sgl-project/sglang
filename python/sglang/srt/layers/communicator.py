@@ -925,6 +925,11 @@ class LayerCommunicator:
             allow_reduce_scatter=self.allow_reduce_scatter,
         )
 
+    def ffn_exit(self, forward_batch: ForwardBatch) -> "FfnExit":
+        """Decide once how this layer's FFN output reduction completes. Use the
+        result as a context manager around the FFN call, then call ``finish``."""
+        return FfnExit(self, forward_batch)
+
     def should_use_reduce_scatter(self, forward_batch: ForwardBatch):
         if not self.allow_reduce_scatter:
             return False
@@ -1037,6 +1042,49 @@ def scatter_mode_layouts(
         mode: Layout.sharded_over(*axes, axis_sizes=axis_sizes)
         for mode, axes in _SCATTER_MODE_SHARDED_AXES.items()
     }
+
+
+class FfnExit:
+    """One FFN's reduction decision. Inside the ``with`` block it is published as
+    ``fuse_mlp_allreduce`` / ``mlp_reduce_scatter`` on ``get_forward()``."""
+
+    __slots__ = (
+        "communicator",
+        "forward_batch",
+        "fuse_mlp_allreduce",
+        "mlp_reduce_scatter",
+        "_scope",
+    )
+
+    def __init__(self, communicator: LayerCommunicator, forward_batch: ForwardBatch):
+        self.communicator = communicator
+        self.forward_batch = forward_batch
+        self.fuse_mlp_allreduce = (
+            communicator.should_fuse_mlp_allreduce_with_next_layer(forward_batch)
+        )
+        self.mlp_reduce_scatter = communicator.should_use_reduce_scatter(forward_batch)
+        self._scope = get_forward().scoped(
+            fuse_mlp_allreduce=self.fuse_mlp_allreduce,
+            mlp_reduce_scatter=self.mlp_reduce_scatter,
+        )
+
+    def __enter__(self) -> "FfnExit":
+        self._scope.__enter__()
+        return self
+
+    def __exit__(self, *exc_info):
+        return self._scope.__exit__(*exc_info)
+
+    def finish(
+        self, hidden_states: torch.Tensor, residual: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Leave the reduction to the next layer's input norm, or postprocess."""
+        if self.fuse_mlp_allreduce:
+            hidden_states._sglang_needs_allreduce_fusion = True
+            return hidden_states, residual
+        return self.communicator.postprocess_layer(
+            hidden_states, residual, self.forward_batch
+        )
 
 
 @dataclass
