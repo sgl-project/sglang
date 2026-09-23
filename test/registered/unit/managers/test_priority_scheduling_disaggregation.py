@@ -885,30 +885,97 @@ class TestDecodePrebuilt(unittest.TestCase):
         self.assertEqual([req.rid for req in selected_reqs], ["high"])
         self.assertEqual([req.rid for req in scheduler.waiting_queue], ["low"])
 
-    def test_priority_sorted_cache_only_replay_waits_for_running_batch(self):
+    def test_priority_sorted_cache_only_replay_can_pause_running_batch(self):
         scheduler = self._new_scheduler(enable_overlap=False)
         normal = MagicMock(rid="normal", priority=1)
         normal.dsv41_cache_only_replay = False
         replay = MagicMock(rid="replay", priority=10)
         replay.dsv41_cache_only_replay = True
+        replay.dsv41_cache_only_coverage = 128
+        replay.origin_input_ids = list(range(128))
+        replay.full_untruncated_fill_ids = list(range(128))
+        replay.kv.req_pool_idx = 0
+        replay.kv.kv_committed_len = 128
         scheduler.waiting_queue = [normal, replay]
         scheduler.running_batch.is_empty.return_value = False
+        scheduler.running_batch.batch_size.return_value = 1
+        scheduler.req_to_token_pool.size = 2
+        scheduler.max_running_requests = 2
+        scheduler.req_to_token_pool.req_to_token = torch.arange(
+            512, dtype=torch.int32
+        ).reshape(1, 512)
         scheduler.enable_priority_scheduling = True
+        priority_input = scheduler.waiting_queue
         scheduler.policy.calc_priority.side_effect = lambda waiting_queue, _: (
             waiting_queue.sort(key=lambda req: -req.priority)
         )
 
-        ret = SchedulerDisaggregationDecodeMixin.get_new_prebuilt_batch(
-            scheduler, scheduler.running_batch
+        new_batch = MagicMock()
+        with patch(
+            "sglang.srt.disaggregation.decode.ScheduleBatch.init_new",
+            return_value=new_batch,
+        ):
+            ret = SchedulerDisaggregationDecodeMixin.get_new_prebuilt_batch(
+                scheduler, scheduler.running_batch
+            )
+
+        self.assertIs(ret, new_batch)
+        scheduler.policy.calc_priority.assert_called_once_with(
+            priority_input, scheduler.running_batch
+        )
+        self.assertEqual([req.rid for req in priority_input], ["replay", "normal"])
+        self.assertEqual([req.rid for req in scheduler.waiting_queue], ["normal"])
+        replay.set_extend_range.assert_called_once_with(0, 128)
+        new_batch.prepare_for_extend.assert_called_once()
+
+    def test_cache_only_replay_suspends_then_restores_running_decode(self):
+        scheduler = self._new_scheduler(enable_overlap=False)
+        scheduler.dsv41_suspended_decode_batch = None
+        scheduler.chunked_req = None
+        scheduler.enable_hisparse = False
+        scheduler.dp_attn_adapter = MagicMock()
+        scheduler.dp_attn_adapter.maybe_prepare_mlp_sync_batch.side_effect = (
+            lambda batch: batch
         )
 
-        self.assertIsNone(ret)
-        scheduler.policy.calc_priority.assert_called_once_with(
-            scheduler.waiting_queue, scheduler.running_batch
+        running = MagicMock(name="running")
+        running.is_empty.return_value = False
+        running.dsv41_cache_only_replay = False
+        replay = MagicMock(name="replay")
+        replay.dsv41_cache_only_replay = True
+        scheduler.get_new_prebuilt_batch = MagicMock(return_value=replay)
+
+        first = SchedulerDisaggregationDecodeMixin.get_next_disagg_decode_batch_to_run(
+            scheduler, running
         )
-        self.assertEqual(
-            [req.rid for req in scheduler.waiting_queue], ["replay", "normal"]
+
+        self.assertIs(first.batch_to_run, replay)
+        self.assertIs(first.running_batch, replay)
+        self.assertIs(scheduler.dsv41_suspended_decode_batch, running)
+
+        restored = (
+            SchedulerDisaggregationDecodeMixin._restore_dsv41_suspended_decode_batch(
+                scheduler, replay
+            )
         )
+        replay.merge_batch.assert_called_once_with(running)
+        self.assertIs(restored, replay)
+        self.assertIsNone(scheduler.dsv41_suspended_decode_batch)
+
+        scheduler.get_new_prebuilt_batch.reset_mock()
+        replay.is_empty.return_value = False
+        updated = MagicMock(name="updated")
+        scheduler.update_running_batch = MagicMock(return_value=updated)
+
+        second = SchedulerDisaggregationDecodeMixin.get_next_disagg_decode_batch_to_run(
+            scheduler, restored
+        )
+
+        scheduler.get_new_prebuilt_batch.assert_not_called()
+        scheduler.update_running_batch.assert_called_once_with(replay)
+        self.assertIs(second.batch_to_run, updated)
+        self.assertIs(second.running_batch, updated)
+        self.assertIsNone(scheduler.dsv41_suspended_decode_batch)
 
     def test_cache_only_replay_uses_explicit_full_prompt_coverage(self):
         for prompt_len in (127, 128, 129, 255, 256, 257):

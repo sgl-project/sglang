@@ -2713,6 +2713,9 @@ class SchedulerDisaggregationDecodeMixin:
             if batch:
                 result = self.run_batch(batch)
                 self.process_batch_result(batch, result)
+                self.running_batch = self._restore_dsv41_suspended_decode_batch(
+                    self.running_batch
+                )
             else:
                 # When the server is idle, do self-check and re-init some states
                 self._sched_idled = True
@@ -2800,15 +2803,21 @@ class SchedulerDisaggregationDecodeMixin:
     ) -> NextBatchPlan:
         """Process prebuilt batch and schedule the next decode batch."""
         # Process pending prebuilt batch: output processing + filter + merge
-        new_prebuilt_batch = self.get_new_prebuilt_batch(running_batch)
+        # After a cache-only replay, run the restored Decode batch once before
+        # admitting another replay so a steady replay stream cannot starve it.
+        new_prebuilt_batch = (
+            None
+            if running_batch.dsv41_cache_only_replay
+            else self.get_new_prebuilt_batch(running_batch)
+        )
         if new_prebuilt_batch:
             assert self.chunked_req is None
             if new_prebuilt_batch.dsv41_cache_only_replay:
                 # This is a real EXTEND forward which reconstructs decoder-local
-                # state and samples the first output.  Overlap scheduling is
-                # rejected for this experimental path, so it is safe to install
-                # it as the running batch before the synchronous forward.
-                assert running_batch.is_empty()
+                # state and samples the first output. Keep an existing DECODE
+                # batch out of this forward, then merge it back next iteration.
+                if not running_batch.is_empty():
+                    self.dsv41_suspended_decode_batch = running_batch
                 set_schedule_time_batch(new_prebuilt_batch)
                 return NextBatchPlan(
                     batch_to_run=new_prebuilt_batch,
@@ -2837,6 +2846,20 @@ class SchedulerDisaggregationDecodeMixin:
         if ret:
             set_schedule_time_batch(ret)
         return NextBatchPlan(batch_to_run=ret, running_batch=running_batch)
+
+    def _restore_dsv41_suspended_decode_batch(
+        self, running_batch: ScheduleBatch
+    ) -> ScheduleBatch:
+        suspended_batch = getattr(self, "dsv41_suspended_decode_batch", None)
+        if suspended_batch is None:
+            return running_batch
+
+        self.dsv41_suspended_decode_batch = None
+        if running_batch.is_empty():
+            return suspended_batch
+        if not suspended_batch.is_empty():
+            running_batch.merge_batch(suspended_batch)
+        return running_batch
 
     def get_new_prebuilt_batch(
         self, running_batch: ScheduleBatch
@@ -2903,15 +2926,6 @@ class SchedulerDisaggregationDecodeMixin:
 
         if self.enable_priority_scheduling:
             self.policy.calc_priority(self.waiting_queue, running_batch)
-
-        if (
-            self.waiting_queue[0].dsv41_cache_only_replay
-            and not running_batch.is_empty()
-        ):
-            # Priority scheduling mutates waiting_queue in place, so gate on
-            # the final head. Cache-only replay is an EXTEND pass and cannot
-            # merge into a live DECODE batch; admit it when that batch drains.
-            return None
 
         curr_batch_size = running_batch.batch_size()
 

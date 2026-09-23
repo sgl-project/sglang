@@ -1462,6 +1462,11 @@ class Scheduler(
         self.disagg_prefill_inflight_queue = None
         self.disagg_decode_prealloc_queue = None
         self.disagg_decode_transfer_queue = None
+        # A cache-only replay is an EXTEND forward and therefore cannot share
+        # one ScheduleBatch with ordinary DECODE requests.  Decode scheduling
+        # may pause a live batch for that one forward and restore it on the
+        # following iteration.
+        self.dsv41_suspended_decode_batch = None
 
         self.disaggregation_mode = DisaggregationMode(get_disagg().disaggregation_mode)
         self.transfer_backend = TransferBackend(
