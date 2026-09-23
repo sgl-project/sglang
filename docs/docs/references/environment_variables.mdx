@@ -816,8 +816,8 @@ SGLang supports various environment variables that can be used to configure its 
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_FLASHINFER_MOE_FUSED_FINALIZE</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Use FlashInfer's fused atomic CUTLASS and CuTe DSL MoE finalize for best performance. Deterministic inference overrides this to <code>false</code>.</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>true</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Use FlashInfer's fused atomic CUTLASS and CuTe DSL MoE finalize. Disabled by default for better numerical accuracy. Set to <code>1</code> to opt in for more aggressive performance. Deterministic inference overrides this to <code>false</code>.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>FLASHINFER_NVFP4_4OVER6</code></td>
@@ -1413,16 +1413,6 @@ SGLang supports various environment variables that can be used to configure its 
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_SWA_EVICTION_INTERVAL_MULTIPLIER</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Multiplier applied to the sliding-window-attention eviction interval.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>1.0</code></td>
-    </tr>
-    <tr>
-      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_ENABLE_UNIFIED_RADIX_TREE</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Use the unified radix-tree cache implementation.</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
-    </tr>
-    <tr>
-      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_EXPERIMENTAL_CPP_RADIX_TREE</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Use the experimental C++ radix-tree implementation.</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_RADIX_FORCE_MISS</code></td>

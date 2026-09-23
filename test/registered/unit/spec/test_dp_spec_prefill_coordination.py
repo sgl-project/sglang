@@ -220,6 +220,10 @@ class TestDPSpecPrefillCoordinationWorker(unittest.TestCase):
                     record("draft_extend", current)
                     return object()
 
+                def draft_context(group, *, owns_attention):
+                    self.assertEqual(owns_attention, bool(rank % 2))
+                    return contextlib.nullcontext()
+
                 worker = object.__new__(EAGLEWorkerV2)
                 worker.device = "cpu"
                 worker.topk = 1
@@ -227,7 +231,8 @@ class TestDPSpecPrefillCoordinationWorker(unittest.TestCase):
                 worker._target_worker = SimpleNamespace(forward_batch_generation=target)
                 worker._draft_worker = SimpleNamespace(
                     draft_runner=SimpleNamespace(tp_group=None),
-                    draft_tp_context=lambda group: contextlib.nullcontext(),
+                    draft_owns_attention=bool(rank % 2),
+                    draft_tp_context=draft_context,
                     draft=draft,
                     _draft_extend_for_prefill=extend,
                     _draft_extend_for_decode=extend,

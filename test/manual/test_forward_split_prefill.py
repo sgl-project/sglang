@@ -15,7 +15,7 @@ import torch
 
 from sglang.benchmark.one_batch import TreeCacheNamespace
 from sglang.srt.configs.model_config import ModelConfig
-from sglang.srt.distributed.parallel_state_wrapper import ParallelState
+from sglang.srt.distributed import bootstrap
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_executor.forward_context import (
@@ -23,7 +23,7 @@ from sglang.srt.model_executor.forward_context import (
     set_forward_context,
 )
 from sglang.srt.model_executor.model_runner import ModelRunner
-from sglang.srt.runtime_context import publish
+from sglang.srt.runtime_context import SpawnRanks, publish
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -57,15 +57,24 @@ class TestForwardSplitPrefill(CustomTestCase):
 
         cls.port_args = PortArgs.init_new(cls.server_args)
 
-        publish(cls.server_args, role="scheduler")
+        publish(
+            cls.server_args,
+            role="scheduler",
+            ranks=SpawnRanks(world_rank=0, gpu_id=0),
+        )
 
         # Load model and tokenizer
         cls.model_config = ModelConfig.from_server_args(cls.server_args)
+        bootstrap.init_parallel_runtime(
+            server_args=cls.server_args,
+            device=cls.device,
+            dist_port=cls.port_args.nccl_port,
+        )
+        bootstrap.init_layer_runtime(model_config=cls.model_config)
         cls.model_runner = ModelRunner(
             model_config=cls.model_config,
             mem_fraction_static=cls.server_args.mem_fraction_static,
             gpu_id=0,
-            ps=ParallelState.trivial(tp_size=cls.tp_size),
             nccl_port=cls.port_args.nccl_port,
             server_args=cls.server_args,
         )

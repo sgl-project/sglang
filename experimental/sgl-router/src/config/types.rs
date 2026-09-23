@@ -2,33 +2,25 @@ use crate::config::sampling::SamplingOverrides;
 use serde::Deserialize;
 use std::num::NonZeroU32;
 
-/// In-memory router configuration, built from CLI flags by
-/// [`crate::config::cli::Cli::into_config`] and validated by
-/// [`Config::validate`]. The router serves exactly one model.
+/// Single-model configuration built and validated by [`crate::config::Cli::into_config`].
 #[derive(Debug, Clone)]
 pub struct Config {
     pub server: ServerConfig,
     pub observability: ObservabilityConfig,
     pub model: ModelConfig,
-    /// Selected discovery backend. Built from CLI flags by
-    /// [`crate::config::cli::Cli::into_config`]: the static-vs-k8s choice
-    /// and the k8s selector grammar are resolved there (the latter via
-    /// [`resolve_mode`]); static worker-URL validity is checked by
-    /// [`Config::validate`].
+    /// Discovery mode resolved from CLI options; static URLs are checked by [`Config::validate`].
     pub discovery: DiscoveryBackend,
     pub proxy: ProxyConfig,
-    pub active_load: ActiveLoadConfig,
+    pub router_inflight_load: InflightLoadConfig,
 }
 
-/// Outbound proxy tuning. Default mirrors SGLang's typical prefill /
-/// decode latency budget; e2e tests lower it so per-request failures
-/// trip the circuit breaker within the test's wall-time.
+/// Outbound request timeout settings.
 #[derive(Debug, Clone, Copy)]
 pub struct ProxyConfig {
-    /// Maximum time to wait for a single upstream HTTP request to
-    /// return headers + body. Default 300 s. The circuit breaker
-    /// records a failure when this fires.
+    /// Timeout for upstream response headers and body. Counts as a circuit-breaker failure.
     pub request_timeout_secs: u64,
+    /// Maximum silence between streamed upstream chunks before the stream fails.
+    pub stream_idle_timeout_secs: u64,
 }
 
 pub fn default_proxy_request_timeout_secs() -> u64 {
@@ -39,19 +31,15 @@ impl Default for ProxyConfig {
     fn default() -> Self {
         Self {
             request_timeout_secs: default_proxy_request_timeout_secs(),
+            stream_idle_timeout_secs: 180,
         }
     }
 }
 
-/// Active-load (per-request) tracking. Production default (10 min)
-/// sits above `proxy.request_timeout_secs` so the proxy timeout is the
-/// one users hit first for normal slow upstreams; tests lower it to
-/// let the janitor fire within their wall-time budget.
+/// Request-tracking timeout; defaults above the proxy timeout.
 #[derive(Debug, Clone, Copy)]
-pub struct ActiveLoadConfig {
-    /// How long a request entry can live in the registry before the
-    /// janitor fires its `cancel_token` and the chat handler returns
-    /// 504 `stale_request_expired`. Default 600 s.
+pub struct InflightLoadConfig {
+    /// Maximum request-entry lifetime before cancellation with 504 `stale_request_expired`.
     pub stale_request_timeout_secs: u64,
 }
 
@@ -59,7 +47,7 @@ pub fn default_stale_request_timeout_secs() -> u64 {
     600
 }
 
-impl Default for ActiveLoadConfig {
+impl Default for InflightLoadConfig {
     fn default() -> Self {
         Self {
             stale_request_timeout_secs: default_stale_request_timeout_secs(),
@@ -67,13 +55,7 @@ impl Default for ActiveLoadConfig {
     }
 }
 
-/// Routing policy selector — the enum form lets `clap` reject unknown
-/// values at parse time and removes the runtime string match in the
-/// policy factory.
-///
-/// Accepted on the CLI (`--policy`) as `round_robin` / `random` /
-/// `power_of_two` / `load_based` / `fused_score` / `score_policy` /
-/// `session_aware` / `cache_aware` / `sticky`.
+/// Routing strategies accepted by `--policy`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
 pub enum PolicyKind {
     #[default]
@@ -98,11 +80,7 @@ pub enum PolicyKind {
     /// Selects cache-affine prefill candidates from the configured prefix provider.
     #[value(name = "cache_aware")]
     CacheAware,
-    /// Sticky-session routing: pins a routing key (read from a
-    /// configurable request header) to a worker via an in-memory map, so
-    /// stateful sessions land on the same backend. Tuning — header name,
-    /// keyless-fallback policy, and TTL eviction — lives on
-    /// `ModelConfig::sticky`.
+    /// Pin a request-header routing key to a worker.
     #[value(name = "sticky")]
     Sticky,
 }
@@ -248,35 +226,16 @@ impl std::fmt::Display for StickyFallbackKind {
 pub struct ServerConfig {
     pub host: String,
     pub port: u16,
-    /// Seconds to keep serving after SIGTERM — with `/readyz` flipped to 503 —
-    /// before the HTTP server stops accepting. The default covers both
-    /// deregistration paths: endpoint removal reaching kube-proxy after the
-    /// pod's `deletionTimestamp` is stamped, and a probe-driven load balancer,
-    /// which cannot act until `failureThreshold * periodSeconds` of `/readyz`
-    /// failures have accumulated.
-    ///
-    /// Note that it equals the k8s default `terminationGracePeriodSeconds`, so
-    /// a pod that has not raised its grace period is left with nothing for the
-    /// in-flight drain that follows the pause, and
-    /// [`shutdown_drain_advisory`](crate::config::shutdown_drain_advisory)
-    /// warns at every startup. That is the intended reading rather than a
-    /// misconfigured default: a router whose completions stream for minutes
-    /// cannot terminate cleanly inside 30 s at all, and the grace period is the
-    /// thing to raise. 0 disables the pause.
+    /// Pause after SIGTERM with `/readyz` returning 503 before stopping accepts.
+    /// Allows endpoint removal or readiness-probe failures to reach load balancers.
+    /// Leave time in the pod grace period for in-flight draining; 0 disables the pause.
     pub shutdown_drain_secs: u64,
-    /// The pod's actual `terminationGracePeriodSeconds`, when the operator
-    /// declares it. The router cannot read its own pod spec, so without this
-    /// the startup advisory can only compare the drain against the k8s
-    /// default — and warns, wrongly, about a deployment that raised the grace
-    /// period on purpose. `None` means "assume the default".
+    /// Declared pod termination grace period; `None` uses the Kubernetes default for advisories.
     pub termination_grace_secs: Option<u64>,
 }
 
 impl ServerConfig {
-    /// [`Self::shutdown_drain_secs`] as a `Duration`. Keeps the seconds-to-
-    /// `Duration` conversion in the library, where a test can pin it, rather
-    /// than in `main.rs` where a `from_secs`/`from_millis` slip would silently
-    /// shorten every drain by a factor of 1000.
+    /// Shutdown pause as a duration.
     pub fn shutdown_drain(&self) -> std::time::Duration {
         std::time::Duration::from_secs(self.shutdown_drain_secs)
     }
@@ -294,10 +253,7 @@ pub fn default_shutdown_drain_secs() -> u64 {
     30
 }
 
-/// Exists so test fixtures can spell out only the fields they care about
-/// (`tests/` is a separate crate, so a `#[cfg(test)]` constructor cannot reach
-/// the integration fixtures). Keep `Cli::into_config` exhaustive so adding a
-/// field still forces a decision on the production path.
+/// Defaults for config construction; the CLI mapping remains exhaustive.
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
@@ -312,10 +268,7 @@ impl Default for ServerConfig {
 #[derive(Debug, Clone)]
 pub struct ObservabilityConfig {
     pub log_level: String,
-    /// Selects the tracing-subscriber output format. `clap` rejects
-    /// unrecognized values at parse time (`--log-format jsonl` and
-    /// similar typos surface as an error instead of silently degrading
-    /// to text).
+    /// Tracing output format.
     pub log_format: LogFormat,
 }
 
@@ -346,9 +299,8 @@ impl Default for ObservabilityConfig {
 #[derive(Debug, Clone)]
 pub struct ModelConfig {
     pub id: String,
-    /// Tokenizer source: a local `tokenizer.json` path or a HuggingFace repo
-    /// id (downloaded on demand). Defaults to `id` when `--tokenizer-path`
-    /// is omitted. Resolved by [`crate::tokenizer::adapter::load`].
+    /// Local tokenizer.json or HuggingFace repo id; defaults to `id`.
+    /// Resolved by [`crate::tokenizer::adapter::load`].
     pub tokenizer_path: String,
     /// Disable router-generated input IDs for this model; keep routing tokenization.
     /// Use when workers have rendering defaults or template stops the router cannot see.
@@ -361,25 +313,15 @@ pub struct ModelConfig {
     pub circuit_breaker: Option<CircuitBreakerConfig>,
     /// Cache-Aware prefix configuration.
     pub cache_aware: Option<CacheAwareConfig>,
-    /// Tuning for the sticky-session policy. `Some` exactly when
-    /// `policy = "sticky"` (built by [`crate::config::cli::Cli::into_config`]).
-    /// The chat handler reads `sticky.header_name` to populate
-    /// [`crate::policies::SelectionContext::routing_key`].
+    /// Present only for the sticky policy; the header supplies the request routing key.
     pub sticky: Option<StickyConfig>,
     /// Session and cache-affinity tuning.
     pub affinity: Option<AffinityConfig>,
-    /// Terms the score-composition policy sums. `Some` exactly when
-    /// `policy = "fused_score"` or `policy = "score_policy"` (built by
-    /// [`crate::config::cli::Cli::into_config`]), defaulting to
-    /// [`DEFAULT_FUSE`] when `--fuse` is omitted.
+    /// Terms for `fused_score` or `score_policy`; defaults to [`DEFAULT_FUSE`].
     pub fused: Option<Vec<FusedTerm>>,
     /// Hard constraints applied before policy selection.
     pub eligibility: Option<EligibilityConfig>,
-    /// Sampling parameters fixed fleet-wide for this model, and what happens
-    /// to a request that sends a different value: a 400 before admission, or
-    /// the client value forwarded untouched. Either way the configured value
-    /// is injected when the request omits the field — see
-    /// [`SamplingOverrides`]. Empty (default) preserves today's behavior.
+    /// Fleet sampling defaults and conflict behavior. See [`SamplingOverrides`].
     pub sampling_overrides: SamplingOverrides,
 }
 
@@ -458,9 +400,7 @@ pub struct CacheAwareConfig {
     pub kv_indexer_endpoint: Option<KvIndexerEndpointConfig>,
 }
 
-/// Default routing-key header for the sticky policy. The `x-sgl-` prefix
-/// matches the router's other emitted/consumed metadata headers
-/// (`x-sgl-decode-url`, `x-sgl-router-error-code`).
+/// Default request header for sticky routing.
 pub const DEFAULT_STICKY_HEADER: &str = "x-sgl-routing-key";
 
 /// Default request header for session-aware routing.
@@ -520,66 +460,23 @@ pub struct AffinityConfig {
     pub cache_candidate_ratio: f64,
     pub cache_candidate_max_workers: usize,
     pub cache_switch_margin_tokens: u64,
-    /// Queue gate (`--worker-queue-limit`): a worker whose engine reports at
-    /// least this many *waiting* requests cannot win a selection on cache
-    /// affinity — the request goes to another worker holding the same
-    /// prefix, or failing that to the least-loaded worker that is not
-    /// queueing. `None` disables the gate.
-    ///
-    /// Gating on the queue rather than on total depth is what makes this
-    /// targeted: `num_waiting_reqs` IS the question the request cares about
-    /// — will I sit behind other work before my prefill starts — whereas
-    /// depth only proxies it, and proxies it badly (an engine can queue at
-    /// 7-8 running on long-prompt traffic, far below its running cap, so a
-    /// depth threshold either fires on healthy busy workers or misses the
-    /// workers actually making requests wait).
-    ///
-    /// The gate reads the engine-published load sample and fails OPEN on a
-    /// worker with no fresh sample: the router-side in-flight counter cannot
-    /// separate a running request from a waiting one, so there is no honest
-    /// substitute to compare the limit against.
-    ///
-    /// Note the firing point scales with `dp_size`: the sample sums `waiting`
-    /// across a worker's DP ranks while a request lands on one of them, so
-    /// scale the limit with `--dp-size` on DP-attention deployments.
-    ///
-    /// The companion `saturation_queue_floor` cancels the gate's diversions
-    /// when they have no payoff (nothing in the fleet reads below the
-    /// floor).
+    /// Waiting-request limit for cache affinity; `None` disables.
+    /// Gates on the engine-published *waiting* count rather than total depth because
+    /// waiting is the question the request cares about — will it sit behind other work —
+    /// while depth proxies it badly (an engine can queue far below its running cap on
+    /// long-prompt traffic). Fails open without a fresh sample: the router-side
+    /// in-flight counter cannot separate running from waiting requests.
+    /// Counts sum across DP ranks, so scale the limit with `dp_size`.
     pub worker_queue_limit: Option<u64>,
-    /// Saturation pin (`--saturation-queue-floor`): cancels queue-gate
-    /// diversions that have no payoff. When no cache candidate survives
-    /// both `worker_queue_limit` and hard admission, at least one was over
-    /// the limit, AND no worker in the routable fleet has a fresh queue
-    /// reading strictly below this floor, the diverted request would wait
-    /// wherever it lands — so it pins to the least-pressured prefix owner
-    /// instead of cold-prefilling on a non-owner (which evicts other
-    /// prefixes and manufactures the next round of misses). `None` — the
-    /// default — preserves the pure gate behavior.
-    ///
-    /// Polarity note: a worker with no fresh sample does NOT count as idle
-    /// — the opposite of the gate's fail-open, and deliberately so. The
-    /// gate keeps affinity because that is the safe default action; the
-    /// pin asks whether a *provably better* destination exists, and an
-    /// unknown queue is not proof. Both polarities leave the request with
-    /// its prefix owner when the signal is missing.
-    ///
-    /// The CLI enforces `floor <= worker_queue_limit` and requires the
-    /// gate; like the limit, scale the floor with `dp_size`.
+    /// Keep the least-pressured prefix owner when the queue gate rejects all admitted
+    /// cache candidates and no fresh fleet queue is below this floor. Unknown queues
+    /// do not count as idle — the opposite of the gate's fail-open, deliberately: the
+    /// pin asks whether a provably better destination exists, and an unknown queue is
+    /// not proof. Requires `floor <= worker_queue_limit`; scale with `dp_size`.
     pub saturation_queue_floor: Option<u64>,
-    /// Number of random candidates sampled for the min-load fallback
-    /// (`--min-load-choices`); the least-pressured of the sample wins.
-    /// [`DEFAULT_MIN_LOAD_CHOICES`] is the pre-existing power-of-2
-    /// behavior, so upgrading changes nothing. `k >= pool` skips the
-    /// shuffle and returns the exact minimum, with ties broken randomly
-    /// (an idle fleet ties on every comparison, so a fixed order would pin
-    /// every fallback dispatch to one worker); `k = 1` is a uniform draw
-    /// within the tier, and its sample has no second member, so the
-    /// proposal carries no backup and admission loses its backup-admission
-    /// and pressure-guard paths. The
-    /// `--cache-candidate-*` knobs bound the cache-affinity OWNER candidate
-    /// set; this bounds the min-load FALLBACK sample used when no owner is
-    /// usable.
+    /// Min-load fallback sample size; defaults to power-of-two. At least the pool
+    /// size chooses the exact minimum with random ties; 1 draws uniformly without
+    /// a backup for admission or pressure guards. Separate from cache-owner limits.
     pub min_load_choices: usize,
 }
 
@@ -610,18 +507,13 @@ impl Default for AffinityConfig {
     }
 }
 
-/// Per-model sticky-session tuning. Built from the `--routing-key-header`
-/// / `--sticky-*` flags by [`crate::config::cli::Cli::into_config`], which
-/// also validates that `header_name` parses as an HTTP header name.
+/// Sticky routing settings; the CLI validates the header name and positive durations.
 #[derive(Debug, Clone)]
 pub struct StickyConfig {
     /// Request header carrying the routing key. Validated to parse as a
     /// `http::HeaderName` at config-build time.
     pub header_name: String,
-    /// Policy used to pick a worker when a request has no routing key, and
-    /// to pick the initial worker when a new key is first seen. One of
-    /// `round_robin` / `random` / `power_of_two` / `load_based` — the
-    /// dependency-free policies the factory can build standalone.
+    /// Fallback for new or missing routing keys.
     pub fallback_policy: StickyFallbackKind,
     /// Evict an assignment after it has been idle (unreferenced) this many
     /// seconds. Bounds the map against unbounded routing-key cardinality.
@@ -650,10 +542,7 @@ impl Default for StickyConfig {
 
 #[derive(Debug, Clone)]
 pub struct CircuitBreakerConfig {
-    /// Consecutive failures required before the breaker opens. Encoded
-    /// as `NonZeroU32` so `--cb-threshold 0` (which would open the
-    /// breaker before any failure) is rejected at CLI-parse time rather
-    /// than silently behaving as "always open".
+    /// Consecutive failures before opening the breaker; zero is invalid.
     pub threshold: NonZeroU32,
     pub cool_down_secs: u64,
 }
@@ -670,43 +559,15 @@ pub enum DiscoveryBackend {
     K8s(K8sDiscoveryConfig),
 }
 
-/// Fixed list of worker URLs. Each URL is registered once at startup;
-/// `mode`, `model_ids`, and `bootstrap_port` are resolved per-worker
-/// from `/server_info` (see [`crate::workers::introspect`]).
-///
-/// No file watcher, no hot-reload: topology change requires a restart.
+/// Workers registered at startup. Roles, models, and bootstrap ports come from
+/// `/server_info`; topology changes require a restart.
 #[derive(Debug, Clone)]
 pub struct StaticUrlsDiscoveryConfig {
     pub urls: Vec<String>,
 }
 
-/// Configuration for the Kubernetes `EndpointSlice` discovery backend.
-/// Built from the `--service-discovery*` / `--selector` / `--prefill-selector`
-/// / `--decode-selector` flags by [`crate::config::cli::Cli::build_discovery`].
-///
-/// Two operating modes, distinguished by which selector flags are set:
-///
-/// 1. **Plain** — all matched workers share the same role:
-///    `--service-discovery-namespace default --selector app=sglang`
-///
-/// 2. **PD disaggregation** — prefill and decode workers are separated by
-///    different selectors:
-///    `--service-discovery-namespace default
-///    --prefill-selector app=sglang,role=prefill
-///    --decode-selector app=sglang,role=decode`
-///
-/// In PD mode, the selectors drive **slice-classification** (which
-/// EndpointSlices feed the prefill pool vs the decode pool). The actual
-/// `WorkerMode` and `bootstrap_port` for each worker are filled in by
-/// the worker manager from each worker's `/server_info` introspection,
-/// so PD works without any pod-level annotations — see
-/// [`crate::workers::introspect`] for the `disaggregation_mode` and
-/// `disaggregation_bootstrap_port` extraction.
-///
-/// [`resolve_mode`] validates the selector flags and produces the
-/// resolved [`K8sDiscoveryMode`] once, at construction in
-/// [`crate::config::cli::Cli::build_discovery`] — so an invalid selector
-/// combination is unrepresentable here.
+/// Kubernetes EndpointSlice discovery. Selectors classify slices; worker roles
+/// and bootstrap ports come from `/server_info` introspection.
 #[derive(Debug, Clone)]
 pub struct K8sDiscoveryConfig {
     pub namespace: String,
@@ -714,14 +575,8 @@ pub struct K8sDiscoveryConfig {
     pub mode: K8sDiscoveryMode,
 }
 
-/// Resolved discovery mode, produced by [`resolve_mode`] from the CLI
-/// selector flags and stored on [`K8sDiscoveryConfig`].
-///
-/// The discovery backend uses this to:
-/// * pick the server-side `LIST` label selector (Plain: the single selector;
-///   PD: empty, with classification done client-side per slice), and
-/// * assign each `EndpointSlice` a [`crate::discovery::WorkerMode`] in
-///   `extract_workers`.
+/// Validated selector mode. Plain selectors run server-side; PD selectors
+/// classify EndpointSlices client-side.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum K8sDiscoveryMode {
     /// One global label selector; every matched EndpointSlice becomes a
@@ -774,52 +629,31 @@ pub enum ConfigError {
     IdenticalPdSelectors,
 }
 
-/// Returns `true` when `selector` has zero non-empty terms after
-/// trimming and splitting on `,`. `labels_match_selector` then returns
-/// `true` for every label set, which is the "matches everything"
-/// degenerate case PD mode must reject.
+/// An empty selector matches every slice, which is invalid for a PD role.
 fn is_selector_empty(selector: &str) -> bool {
     selector.split(',').all(|t| t.trim().is_empty())
 }
 
-/// Canonicalize a comma-separated equality selector to a sorted list of
-/// parsed `(key, value)` tuples. Comparison happens at the parsed-term
-/// level — *not* the raw string level — because `labels_match_selector`
-/// already strips whitespace and treats `key=value` and `key==value` as
-/// the same equality test. Comparing raw strings would let
-/// `"app=sglang"` vs `"app==sglang"` (and `"app = sglang"` vs
-/// `"app=sglang"`) past the identical-selector check, even though
-/// `classify_mode` would treat them identically at runtime — exactly
-/// the silent decode-pool-empty failure mode this check exists to
-/// prevent.
-///
-/// Returns an empty `Vec` for selectors with no parseable terms
-/// (whitespace-only, comma-only, or any term that doesn't match the
-/// `key=value` / `key==value` grammar). Callers must run
-/// [`is_equality_selector`] before this to surface malformed
-/// selectors as `UnsupportedSelectorGrammar`.
-fn canonical_selector(selector: &str) -> Vec<(String, String)> {
-    let mut terms: Vec<(String, String)> = selector
+/// Normalize validated equality terms for comparison, matching runtime whitespace
+/// and `=`/`==` handling. Term order does not affect matching.
+fn canonical_selector(selector: &str) -> Vec<(&str, &str)> {
+    let mut terms: Vec<_> = selector
         .split(',')
         .filter_map(|raw| {
             let term = raw.trim();
             if term.is_empty() {
                 return None;
             }
-            // Mirror `labels_match_selector`: prefer the `==` alias so a
-            // term like `key==value` parses to `(key, value)` instead of
-            // `(key, =value)`.
+            // Prefer `==` so its second equals sign does not become part of the value.
             let (k, v) = term.split_once("==").or_else(|| term.split_once('='))?;
-            Some((k.trim().to_string(), v.trim().to_string()))
+            Some((k.trim(), v.trim()))
         })
         .collect();
-    terms.sort();
+    terms.sort_unstable();
     terms
 }
 
-/// Returns `true` when `selector` parses as a comma-separated equality
-/// selector — every term has the shape `key=value` or `key==value`.
-/// See [`ConfigError::UnsupportedSelectorGrammar`] for rationale.
+/// Check the equality-only grammar supported by client-side PD matching.
 fn is_equality_selector(selector: &str) -> bool {
     for term in selector.split(',') {
         let term = term.trim();
@@ -835,9 +669,7 @@ fn is_equality_selector(selector: &str) -> bool {
             continue;
         }
         if let Some((k, _value)) = term.split_once('=') {
-            // Reject `!=` (rendered as `key!` + `=value` by split_once).
-            // Empty value is legal in K8s — `label_selector = "tier="`
-            // matches pods with `tier=""` — so we don't constrain it.
+            // Reject `!=`; empty label values are valid.
             if k.trim().is_empty() || k.trim().ends_with('!') {
                 return false;
             }
@@ -849,10 +681,7 @@ fn is_equality_selector(selector: &str) -> bool {
     true
 }
 
-/// Validate the selector combination and return the resolved
-/// [`K8sDiscoveryMode`]. Called once at construction by
-/// [`crate::config::cli::Cli::build_discovery`], so an invalid
-/// combination can never be stored on a [`K8sDiscoveryConfig`].
+/// Resolve and validate the plain or prefill/decode selector combination.
 pub fn resolve_mode(
     label_selector: Option<&str>,
     prefill_selector: Option<&str>,
@@ -860,57 +689,30 @@ pub fn resolve_mode(
 ) -> Result<K8sDiscoveryMode, ConfigError> {
     match (label_selector, prefill_selector, decode_selector) {
         (Some(label), None, None) => {
-            // Plain mode pushes `label` to the K8s API as the
-            // server-side `labelSelector` of the EndpointSlice
-            // watcher (`watcher::Config::default().labels(&label)`
-            // in `discovery::k8s::spawn`). K8s itself parses the
-            // full label-selector grammar — equality, set-based
-            // (`in` / `notin`), presence (`key` / `!key`), and
-            // `!=` — and rejects malformed selectors at
-            // watch-start time. So we don't grammar-check `label`
-            // here and let the K8s API be the syntax authority. PD
-            // mode, in contrast, evaluates selectors client-side via
-            // `labels_match_selector` which only understands
-            // equality — so PD selectors are still grammar-checked
-            // below.
+            // Plain selectors run on the Kubernetes API, which supports the full grammar.
+            // PD selectors are checked client-side and only support equality.
             Ok(K8sDiscoveryMode::Plain {
                 label_selector: label.to_string(),
             })
         }
         (None, Some(prefill), Some(decode)) => {
-            // Both selectors validated individually so the operator
-            // sees which one is malformed. WorkerMode + bootstrap_port
-            // for each prefill pod are filled in by the worker
-            // manager from each worker's `/server_info` — these
-            // selectors only drive client-side classification per
-            // EndpointSlice (see `classify_mode` in discovery/k8s.rs).
-            if !is_equality_selector(prefill) {
-                return Err(ConfigError::UnsupportedSelectorGrammar {
-                    selector: "prefill",
-                    value: prefill.to_string(),
-                });
+            // Validate both grammars before checking for empty or identical selectors.
+            let selectors = [("prefill", prefill), ("decode", decode)];
+            for (selector, value) in selectors {
+                if !is_equality_selector(value) {
+                    return Err(ConfigError::UnsupportedSelectorGrammar {
+                        selector,
+                        value: value.to_string(),
+                    });
+                }
             }
-            if !is_equality_selector(decode) {
-                return Err(ConfigError::UnsupportedSelectorGrammar {
-                    selector: "decode",
-                    value: decode.to_string(),
-                });
+            // Empty PD selectors match everything and starve the opposite role.
+            for (selector, value) in selectors {
+                if is_selector_empty(value) {
+                    return Err(ConfigError::EmptyPdSelector { selector });
+                }
             }
-            // Empty PD selector matches every EndpointSlice at
-            // runtime; combined with classify_mode's prefill-first
-            // ordering, an empty selector would silently funnel all
-            // workers into one role. Reject up front.
-            if is_selector_empty(prefill) {
-                return Err(ConfigError::EmptyPdSelector {
-                    selector: "prefill",
-                });
-            }
-            if is_selector_empty(decode) {
-                return Err(ConfigError::EmptyPdSelector { selector: "decode" });
-            }
-            // Identical selectors degrade the same way as an empty
-            // one: every slice matches both, prefill wins, decode
-            // stays empty.
+            // Prefill wins when both selectors match, leaving decode empty.
             if canonical_selector(prefill) == canonical_selector(decode) {
                 return Err(ConfigError::IdenticalPdSelectors);
             }
@@ -931,10 +733,6 @@ mod k8s_discovery_config_tests {
 
     #[test]
     fn mode_constructs_pd_disaggregation_from_prefill_and_decode_selectors() {
-        // K8s PD now works without per-pod annotations: each worker's
-        // `/server_info` carries `disaggregation_bootstrap_port`, and the
-        // worker manager applies it post-discovery. The K8s config layer's
-        // job is just to validate the selector combination.
         let m = resolve_mode(None, Some("app=sglang,role=p"), Some("app=sglang,role=d"))
             .expect("PD mode is now valid");
         assert_eq!(
@@ -948,9 +746,6 @@ mod k8s_discovery_config_tests {
 
     #[test]
     fn mode_pd_rejects_set_based_prefill_selector() {
-        // Both PD selectors get the same equality-only grammar check as
-        // the plain label_selector. A set-based prefill selector would
-        // silently match zero pods at runtime → fail-fast at load.
         let err =
             resolve_mode(None, Some("app in (sglang, vllm)"), Some("app=sglang")).unwrap_err();
         assert!(
@@ -992,12 +787,8 @@ mod k8s_discovery_config_tests {
         );
     }
 
-    /// Plain mode pushes its selector to the K8s API server-side
-    /// (`watcher::Config::default().labels(&selector)` in
-    /// `discovery::k8s::spawn`), so the full K8s label-selector grammar
-    /// — including set-based operators like `app in (a,b)` — is
-    /// supported and must not be grammar-checked at startup. PD mode
-    /// (checked client-side) is the opposite; see the PD tests below.
+    /// Plain selectors run on the Kubernetes API, which supports the full grammar.
+    /// PD selectors are checked client-side and only support equality.
     #[test]
     fn mode_accepts_set_based_selector_in_plain_mode() {
         let m = resolve_mode(Some("app in (sglang,sglang-small)"), None, None)
@@ -1010,9 +801,6 @@ mod k8s_discovery_config_tests {
         );
     }
 
-    /// `notin`, presence (`key`), absence (`!key`), and inequality (`!=`)
-    /// are all valid K8s server-side selector grammar — plain mode must
-    /// pass them through.
     #[test]
     fn mode_accepts_other_set_based_forms_in_plain_mode() {
         for raw in [
@@ -1033,15 +821,6 @@ mod k8s_discovery_config_tests {
         }
     }
 
-    /// PD mode evaluates selectors *client-side* via
-    /// `labels_match_selector`, which only handles equality. A set-based
-    /// PD selector would silently match zero pods → fail-fast at load.
-    /// Pins the plain-server-side / PD-client-side asymmetry: relaxing
-    /// the grammar check for plain (see `mode_accepts_set_based_*`
-    /// above) must not accidentally relax it for PD selectors. Uses
-    /// `notin` so this test covers a different set-based form than
-    /// `mode_pd_rejects_set_based_prefill_selector` (which uses `in`)
-    /// — both must keep failing.
     #[test]
     fn mode_pd_rejects_notin_prefill_selector() {
         let err =
@@ -1101,9 +880,6 @@ mod k8s_discovery_config_tests {
         );
     }
 
-    /// Empty plain `label_selector` is valid — matches every
-    /// EndpointSlice in the namespace (documented K8s behavior; the
-    /// operator opts in by setting plain mode at all).
     #[test]
     fn mode_accepts_empty_plain_label_selector() {
         let m = resolve_mode(Some(""), None, None).unwrap();
@@ -1115,12 +891,6 @@ mod k8s_discovery_config_tests {
         );
     }
 
-    /// PD mode is the *opposite* of plain: an empty selector would match
-    /// every EndpointSlice, and since `classify_mode` checks prefill
-    /// before decode, an empty `prefill_selector` would classify
-    /// everything as Prefill — decode pool stays empty and the resolver
-    /// surfaces the wrong `no_decode_workers_available` error. Fail-fast
-    /// at config load.
     #[test]
     fn mode_pd_rejects_empty_prefill_selector() {
         let err = resolve_mode(None, Some(""), Some("role=decode")).unwrap_err();
@@ -1144,9 +914,6 @@ mod k8s_discovery_config_tests {
         );
     }
 
-    /// Whitespace-only / comma-only PD selector parses to zero terms in
-    /// `labels_match_selector` and matches every slice at runtime — same
-    /// failure mode as a literal empty string.
     #[test]
     fn mode_pd_rejects_whitespace_only_prefill_selector() {
         let err = resolve_mode(None, Some("  ,  "), Some("role=decode")).unwrap_err();
@@ -1161,9 +928,6 @@ mod k8s_discovery_config_tests {
         );
     }
 
-    /// Identical prefill and decode selectors degrade silently: every
-    /// slice matches both, but `classify_mode` returns `Prefill` first,
-    /// so the decode pool stays empty.
     #[test]
     fn mode_pd_rejects_identical_prefill_and_decode_selectors() {
         let err = resolve_mode(None, Some("app=sglang"), Some("app=sglang")).unwrap_err();
@@ -1184,14 +948,6 @@ mod k8s_discovery_config_tests {
         );
     }
 
-    /// `labels_match_selector` accepts both `key=value` and `key==value`
-    /// for equality and parses them to the same `(key, value)` tuple.
-    /// Two selectors that differ only in this alias choice are runtime-
-    /// equivalent — they'd match the same EndpointSlices, then
-    /// `classify_mode`'s prefill-first ordering would funnel every slice
-    /// into Prefill, leaving decode empty. The check must canonicalize
-    /// at the term level (parsed `(key, value)` tuples), not the raw
-    /// string level.
     #[test]
     fn mode_pd_rejects_identical_selectors_under_eq_alias() {
         let err = resolve_mode(None, Some("app=sglang"), Some("app==sglang")).unwrap_err();
@@ -1201,11 +957,6 @@ mod k8s_discovery_config_tests {
         );
     }
 
-    /// Inner whitespace inside a term (`"app = sglang"`) is the same
-    /// label as no whitespace (`"app=sglang"`) — the runtime
-    /// `labels_match_selector` trims key and value independently
-    /// (see `key.trim()` / `expected.trim()` in `k8s.rs`). Canonical
-    /// form must agree.
     #[test]
     fn mode_pd_rejects_identical_selectors_under_inner_whitespace() {
         let err = resolve_mode(None, Some("app=sglang"), Some("app =  sglang")).unwrap_err();
@@ -1215,11 +966,6 @@ mod k8s_discovery_config_tests {
         );
     }
 
-    /// Term order doesn't matter for label matching, so `"a=1,b=2"` and
-    /// `"b=2,a=1"` must be treated as identical. (Implied by the sort
-    /// in `canonical_selector`, but pinned explicitly so a future
-    /// "preserve user order for diagnostics" refactor can't silently
-    /// reintroduce the silent-failure bug.)
     #[test]
     fn mode_pd_rejects_identical_selectors_under_term_order_permutation() {
         let err =
@@ -1230,9 +976,6 @@ mod k8s_discovery_config_tests {
         );
     }
 
-    /// Sanity: two selectors that genuinely differ at the term level
-    /// must still pass validation — the canonicalizer must not be so
-    /// aggressive that it false-positives on legitimate PD configs.
     #[test]
     fn mode_pd_accepts_truly_distinct_selectors() {
         let m = resolve_mode(
