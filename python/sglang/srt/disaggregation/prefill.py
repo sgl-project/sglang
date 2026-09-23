@@ -829,7 +829,7 @@ class SchedulerDisaggregationPrefillMixin:
                         continue
                     req.dsv41_cache_only_replay = True
                     req.dsv41_cache_only_coverage = coverage
-                    maybe_cache_unfinished_req(req, self.tree_cache)
+                    self.cache_unfinished_disagg_prefill(req)
                     self.disagg_prefill_inflight_queue.append(req)
                     if not req.pending_bootstrap:
                         self.send_kv_chunk(req, last_chunk=True)

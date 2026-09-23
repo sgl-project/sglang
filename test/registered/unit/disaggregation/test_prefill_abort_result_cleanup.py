@@ -65,6 +65,7 @@ class _Scheduler(SchedulerDisaggregationPrefillMixin):
         )
         self.spec_algorithm = SimpleNamespace(is_eagle=lambda: False)
         self.tree_cache = Mock()
+        self.cache_unfinished_disagg_prefill = Mock()
         self.disagg_prefill_inflight_queue = []
         self.disagg_prefill_pending_chunk_rids = {"aborted-prefill"}
         self.send_kv_chunk = Mock()
@@ -203,8 +204,7 @@ def test_cache_only_partial_coverage_aborts_before_transfer(
     assert scheduler.disagg_prefill_inflight_queue == []
 
 
-@patch("sglang.srt.disaggregation.prefill.maybe_cache_unfinished_req")
-def test_cache_only_full_coverage_is_published(maybe_cache_unfinished_req):
+def test_cache_only_full_coverage_is_published():
     scheduler = _Scheduler()
     req = _Req(inflight_middle_chunks=0)
     req.to_finish = None
@@ -215,7 +215,7 @@ def test_cache_only_full_coverage_is_published(maybe_cache_unfinished_req):
 
     assert req.dsv41_cache_only_replay
     assert req.dsv41_cache_only_coverage == len(req.origin_input_ids)
-    maybe_cache_unfinished_req.assert_called_once_with(req, scheduler.tree_cache)
+    scheduler.cache_unfinished_disagg_prefill.assert_called_once_with(req)
     scheduler.send_kv_chunk.assert_called_once_with(req, last_chunk=True)
     assert scheduler.disagg_prefill_inflight_queue == [req]
 
