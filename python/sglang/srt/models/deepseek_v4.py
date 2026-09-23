@@ -186,6 +186,7 @@ from sglang.srt.multimodal.deepseek_v41_image_processing import (
 )
 from sglang.srt.runtime_context import (
     get_device,
+    get_disagg,
     get_exec,
     get_forward,
     get_parallel,
@@ -3387,6 +3388,53 @@ class DeepseekV4CudaDecoderLayer(DeepseekV4DecoderLayerBase):
             )
         return hc_boundary.MoeTransport(self, hidden_states, batch, call, rows)
 
+    def write_global_cache_only(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+        prev_pre: Optional[torch.Tensor],
+        precomputed_attn: Optional[tuple] = None,
+        combined_attn: Optional[torch.Tensor] = None,
+        normalized_attn: Optional[torch.Tensor] = None,
+    ) -> None:
+        """Run the canonical attention pre-mix and write this layer's global KV.
+
+        The asymmetric prefill stops here: attention, FFN, later layers and the
+        language-model head are deliberately not evaluated.  The low-ratio
+        compressor write also writes the owner Indexer-K cache; index scoring is
+        decode-local and must not run on the prefill worker.
+        """
+        if self.self_attn.compress_ratio not in (1, 2):
+            raise RuntimeError("cache-only boundary must have compression ratio 1/2")
+        if (
+            self.self_attn.compressor is None
+            or self.self_attn.indexer is None
+            or not self.self_attn.indexer.owns_k
+        ):
+            raise RuntimeError(
+                "cache-only boundary must own both Main-KV and Indexer-K producers"
+            )
+        stats_stream = self._get_hc_stats_stream(hidden_states, forward_batch)
+        x = self._hc_combine(
+            hidden_states,
+            apply_pre=prev_pre,
+            norm=self.input_layernorm,
+            stats_stream=stats_stream,
+            precomputed=precomputed_attn,
+            combined=combined_attn,
+            normalized=normalized_attn,
+        )
+        get_attn_backend().forward_low_ratio_sources(
+            layer=self.self_attn,
+            x=x,
+            q_lora=None,
+            positions=positions,
+            forward_batch=forward_batch,
+            run_compressor=True,
+            run_indexer=False,
+        )
+
     def forward(
         self,
         positions,
@@ -3665,6 +3713,14 @@ class DeepseekV4Model(nn.Module):
             )
 
         self.dspark_layers_to_capture: Optional[List[int]] = None
+
+        self.encoder_only_prefill = (
+            get_disagg().dsv41_encoder_only_prefill
+            and get_disagg().disaggregation_mode == "prefill"
+        )
+        self.encoder_only_boundary_layer = (
+            max(config.kv_source_layer_ids) if self.encoder_only_prefill else None
+        )
 
         # Decoder SWA bounded replay: layers from late_layer_start on run over each
         # request's last SWA_WINDOW extend tokens only.
@@ -3961,6 +4017,17 @@ class DeepseekV4Model(nn.Module):
                 if tail is not None and i < self.late_layer_start:
                     aux = tail.rows(aux)
                 dspark_aux_hidden_states.append(aux.mean(dim=1))
+            if i == self.encoder_only_boundary_layer:
+                self.layers[i].write_global_cache_only(
+                    positions=positions,
+                    hidden_states=hidden_states,
+                    forward_batch=forward_batch,
+                    prev_pre=prev_pre,
+                    precomputed_attn=precomputed_attn,
+                    combined_attn=combined_attn,
+                    normalized_attn=normalized_attn,
+                )
+                return None, None, None
             ctx = (
                 nullcontext()
                 if check_cuda_graph_backend(Phase.PREFILL, Backend.TC_PIECEWISE)
@@ -4140,7 +4207,7 @@ class DeepseekV4Model(nn.Module):
         forward_batch: ForwardBatch,
         input_embeds: Optional[torch.Tensor],
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
-    ) -> Union[torch.Tensor, PPProxyTensors]:
+    ) -> Optional[Union[torch.Tensor, PPProxyTensors]]:
         if not _is_cuda:
             return self._forward_impl(
                 input_ids, positions, forward_batch, input_embeds, pp_proxy_tensors
@@ -4160,7 +4227,7 @@ class DeepseekV4Model(nn.Module):
         forward_batch: ForwardBatch,
         input_embeds: Optional[torch.Tensor],
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
-    ) -> Union[torch.Tensor, PPProxyTensors]:
+    ) -> Optional[Union[torch.Tensor, PPProxyTensors]]:
         if self.pp_group.is_first_rank:
             if input_embeds is None:
                 hidden_states = self.embed_tokens(input_ids)
@@ -4240,6 +4307,8 @@ class DeepseekV4Model(nn.Module):
                 capture_dspark,
                 dspark_aux_hidden_states,
             )
+            if hidden_states is None:
+                return None
         elif run_tbo:
             # Two-batch-overlap prefill (EP / mori). Cross-layer mHC fusion is
             # disabled here (each layer self-contained), so no trailing hc_post.
@@ -4663,6 +4732,8 @@ class DeepseekV4ForCausalLM(nn.Module):
             hidden_states = self.model.forward(
                 input_ids, positions, forward_batch, input_embeds, pp_proxy_tensors
             )
+        if hidden_states is None:
+            return None
         if not self.pp_group.is_last_rank:
             return hidden_states
 
