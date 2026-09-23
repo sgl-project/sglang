@@ -69,7 +69,8 @@ _use_aiter = (
     get_bool_env_var("SGLANG_USE_AITER") and _is_hip and not _is_gfx1250_supported
 )
 _use_aiter_gfx95 = _use_aiter and _is_gfx95_supported
-# Maximum token count for the MXFP8 dense PTPC decode fast path.
+# Conservative, not a tuned crossover: ptpc beat block-fp8 up to M=512 on
+# MiniMax-M3 TP4 gfx950 shapes, but lost past M=64 on narrow ones (K=768).
 MXFP8_DENSE_PTPC_DECODE_MAX_M = 128
 # ROCm 7.0 hipcc miscompiles gemm_a8w8_blockscale_bpreshuffle on gfx95 (#23319).
 _use_aiter_bpreshuffle_gfx95 = _use_aiter_gfx95 and get_hip_version() >= (7, 2, 0)
