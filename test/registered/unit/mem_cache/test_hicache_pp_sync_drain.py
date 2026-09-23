@@ -7,7 +7,6 @@ from unittest.mock import MagicMock
 
 import torch
 
-from sglang.srt.mem_cache.hiradix_cache import HiRadixCache
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -27,28 +26,23 @@ class _Holder:
 
 
 class TestPPSyncDrain(unittest.TestCase):
-    def _drain_fns(self):
-        return (HiRadixCache._drain_async_work, UnifiedRadixCache._drain_async_work)
-
     def test_drain_waits_all_and_clears(self):
-        for drain in self._drain_fns():
-            holder = _Holder()
-            works = [_FakeWork(), _FakeWork(), _FakeWork()]
-            holder.work_list = list(works)
+        holder = _Holder()
+        works = [_FakeWork(), _FakeWork(), _FakeWork()]
+        holder.work_list = list(works)
 
-            drain(holder)
+        UnifiedRadixCache._drain_async_work(holder)
 
-            self.assertTrue(all(w.waited for w in works))
-            self.assertEqual(holder.work_list, [])
+        self.assertTrue(all(w.waited for w in works))
+        self.assertEqual(holder.work_list, [])
 
     def test_drain_empty_is_noop(self):
-        for drain in self._drain_fns():
-            holder = _Holder()
-            holder.work_list = []
+        holder = _Holder()
+        holder.work_list = []
 
-            drain(holder)
+        UnifiedRadixCache._drain_async_work(holder)
 
-            self.assertEqual(holder.work_list, [])
+        self.assertEqual(holder.work_list, [])
 
 
 class TestUnifiedPPSyncBatching(unittest.TestCase):

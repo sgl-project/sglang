@@ -48,6 +48,9 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload_co
     LAYERWISE_OFFLOAD_IMAGE_ENCODER_GROUP,
     LAYERWISE_OFFLOAD_TEXT_ENCODER_GROUP,
     LAYERWISE_OFFLOAD_VAE_GROUP,
+    RESIDENCY_LIFETIME_FORWARD,
+    RESIDENCY_LIFETIME_PERMANENT,
+    RESIDENCY_LIFETIMES,
     RESIDENCY_POLICIES,
     RESIDENCY_POLICY_LEADING,
     cpu_offload_component_matches,
@@ -418,13 +421,19 @@ class ServerArgs(DisaggServerArgsMixin):
     dit_layerwise_resident_layers: float = 0.0
     # Which layers those are: the leading ones, or spread evenly over the stack.
     dit_layerwise_residency_policy: str = RESIDENCY_POLICY_LEADING
-    # Per-component overrides of the three knobs above; an entry wins for that
+    # How long they stay: while the DiT runs for a request, or for the life of
+    # the server.
+    dit_layerwise_residency_lifetime: str = RESIDENCY_LIFETIME_FORWARD
+    # Per-component overrides of the four knobs above; an entry wins for that
     # component.
     layerwise_prefetch_size: dict[str, float] | str | None = field(default_factory=dict)
     layerwise_resident_layers: dict[str, float] | str | None = field(
         default_factory=dict
     )
     layerwise_residency_policy: dict[str, str] | str | None = field(
+        default_factory=dict
+    )
+    layerwise_residency_lifetime: dict[str, str] | str | None = field(
         default_factory=dict
     )
     offload_during_compile: bool = True
@@ -1209,8 +1218,8 @@ class ServerArgs(DisaggServerArgsMixin):
 
     def layerwise_tuning_for(
         self, component_name: str | None, *, dit_group: bool
-    ) -> tuple[float, float, str]:
-        """Prefetch size, resident layers and residency policy for one component."""
+    ) -> tuple[float, float, str, str]:
+        """Prefetch size, resident layers, residency policy and lifetime for one component."""
         prefetch_map = self._parse_component_value_map(
             self.layerwise_prefetch_size, option="--layerwise-prefetch-size"
         )
@@ -1219,6 +1228,9 @@ class ServerArgs(DisaggServerArgsMixin):
         )
         policy_map = self._parse_component_value_map(
             self.layerwise_residency_policy, option="--layerwise-residency-policy"
+        )
+        lifetime_map = self._parse_component_value_map(
+            self.layerwise_residency_lifetime, option="--layerwise-residency-lifetime"
         )
 
         def _pick(mapping: dict[str, str], group_default, aux_default):
@@ -1240,7 +1252,19 @@ class ServerArgs(DisaggServerArgsMixin):
                 f"unknown residency policy {policy!r} for component "
                 f"{component_name!r}, expected one of {RESIDENCY_POLICIES}"
             )
-        return prefetch, resident, policy
+        lifetime = str(
+            _pick(
+                lifetime_map,
+                self.dit_layerwise_residency_lifetime,
+                RESIDENCY_LIFETIME_FORWARD,
+            )
+        )
+        if lifetime not in RESIDENCY_LIFETIMES:
+            raise ValueError(
+                f"unknown residency lifetime {lifetime!r} for component "
+                f"{component_name!r}, expected one of {RESIDENCY_LIFETIMES}"
+            )
+        return prefetch, resident, policy, lifetime
 
     @staticmethod
     def _parse_component_attention_backend_map(
@@ -2551,8 +2575,9 @@ class ServerArgs(DisaggServerArgsMixin):
             "streaming). Between 0.0 and 1.0 = ratio of layers; >= 1 = absolute "
             "count. Unlike raising the prefetch size, resident layers are transferred "
             "once per request rather than once per step, so this trades VRAM for "
-            "lower denoise latency when memory is available. They are released when "
-            "the request finishes, not kept for the life of the server.",
+            "lower denoise latency when memory is available. How long they stay on "
+            "the GPU is --dit-layerwise-residency-lifetime: released when the "
+            "request finishes by default, or kept for the life of the server.",
         )
         parser.add_argument(
             "--layerwise-prefetch-size",
@@ -2577,7 +2602,8 @@ class ServerArgs(DisaggServerArgsMixin):
             "a DiT across the denoise steps, a video VAE across the latent chunks. "
             "A component that runs its layers once per request, such as a text "
             "encoder, transfers the whole set again every request, so setting "
-            "this for one has no effect.",
+            "this for one has no effect unless --layerwise-residency-lifetime "
+            "keeps the layers for the life of the server.",
         )
         parser.add_argument(
             "--layerwise-residency-policy",
@@ -2586,6 +2612,17 @@ class ServerArgs(DisaggServerArgsMixin):
             help="Per-component override of --dit-layerwise-residency-policy, as "
             "component=value entries, e.g. --layerwise-residency-policy "
             "text_encoder=strided.",
+        )
+        parser.add_argument(
+            "--layerwise-residency-lifetime",
+            type=str,
+            default=None,
+            help="Per-component override of --dit-layerwise-residency-lifetime, as "
+            "component=value entries, e.g. --layerwise-residency-lifetime "
+            "transformer=permanent,video_vae=forward. 'forward' releases a "
+            "component's resident layers when it finishes running for a request; "
+            "'permanent' places them on the GPU at load time and never releases "
+            "them.",
         )
         parser.add_argument(
             "--dit-layerwise-residency-policy",
@@ -2600,6 +2637,21 @@ class ServerArgs(DisaggServerArgsMixin):
             "schedule. Worth trying when weight streaming overlaps "
             "memory-bound compute -- the transfers stop competing with it for "
             "L2 and DRAM bandwidth, which is where the gain comes from.",
+        )
+        parser.add_argument(
+            "--dit-layerwise-residency-lifetime",
+            type=str,
+            choices=RESIDENCY_LIFETIMES,
+            default=ServerArgs.dit_layerwise_residency_lifetime,
+            help="How long the DiT layers kept by --dit-layerwise-resident-layers "
+            "stay on the GPU. 'forward' (default): placed when the DiT starts its "
+            "denoise steps for a request and released when they finish, so they "
+            "are transferred once per request and keep a copy in host memory. "
+            "'permanent': placed at load time, no host copy, never released -- "
+            "one transfer for the life of the server. Choose 'permanent' when the "
+            "resident layers of every component fit on the GPU together; with "
+            "'forward' only the running component holds its set, so the peak is "
+            "the largest set rather than their sum.",
         )
 
         # offload flags
@@ -3623,6 +3675,27 @@ class ServerArgs(DisaggServerArgsMixin):
                     "--dit-layerwise-residency-policy has no effect because "
                     "--dit-layerwise-resident-layers is 0: every layer is streamed, "
                     "so there is no resident set to place."
+                )
+
+        if self.dit_layerwise_residency_lifetime not in RESIDENCY_LIFETIMES:
+            raise ValueError(
+                f"Invalid --dit-layerwise-residency-lifetime "
+                f"{self.dit_layerwise_residency_lifetime!r}; expected one of "
+                f"{RESIDENCY_LIFETIMES}."
+            )
+        if self.dit_layerwise_residency_lifetime == RESIDENCY_LIFETIME_PERMANENT:
+            if not self.is_dit_layerwise_offload_selected:
+                logger.warning(
+                    "--dit-layerwise-residency-lifetime has no effect because the "
+                    "DiT is not layerwise-offloaded. It only applies together with "
+                    "--dit-layerwise-offload (or 'dit' in "
+                    "--layerwise-offload-components)."
+                )
+            elif self.dit_layerwise_resident_layers <= 0:
+                logger.warning(
+                    "--dit-layerwise-residency-lifetime has no effect because "
+                    "--dit-layerwise-resident-layers is 0: there is no resident "
+                    "set to keep."
                 )
 
         # validate layerwise offload conflicts
