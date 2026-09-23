@@ -1162,7 +1162,7 @@ class HybridCacheController(BaseHiCacheController):
             results = {}
             for extra_info, transfers in _trailing_chain_groups(
                 operation.prefix_keys,
-                sidecar_hashes[:sidecar_hit_pages],
+                sidecar_hashes,
                 transfers_nonkv,
             ):
                 results.update(
