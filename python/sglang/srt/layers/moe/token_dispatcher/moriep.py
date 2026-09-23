@@ -1137,13 +1137,14 @@ class MoriEPDispatcher(BaseDispatcher):
         self._stage = _Stage.INITIAL
         self._deepep_dispatch_hooks = MoriEPPDispatchHooks()
 
-        # Mori dispatch produces global topk_ids in [0, num_experts); mask out
-        # experts that are not local to this rank.
+        # Mori dispatch produces global topk_ids in [0, num_experts). The AITER
+        # adapter appends a fake route after dispatch; reserve its masked ID at
+        # num_experts without adding an expert to Mori's communication layout.
         self.expert_mask_gpu = None
         if _use_aiter and num_experts is not None and num_local_experts is not None:
             ep_rank = get_parallel().moe_ep_rank
             expert_mask = torch.zeros(
-                num_experts,
+                num_experts + 1,
                 device=torch.cuda.current_device(),
                 dtype=torch.int32,
             )

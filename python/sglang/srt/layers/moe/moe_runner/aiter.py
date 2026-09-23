@@ -490,6 +490,14 @@ def _pre_permute_deepep_to_aiter(
             hidden_states.dtype, a1_scale, weight_quant
         )
 
+        if quant_info.expert_mask is not None:
+            # AITER's EP tuning lookup subtracts one always-masked route. Add
+            # it after dispatch and receive bounding, preserving real shared
+            # routes and the original IDs/weights used by Mori combine.
+            fake_expert_id = quant_info.expert_mask.numel() - 1
+            topk_ids = torch.nn.functional.pad(topk_ids, (0, 1), value=fake_expert_id)
+            topk_weights = torch.nn.functional.pad(topk_weights, (0, 1), value=0)
+
         running_state["aiter_combine_topk_ids"] = dispatch_output.origin_topk_ids
         running_state["aiter_combine_topk_weights"] = (
             dispatch_output.origin_topk_weights
