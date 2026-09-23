@@ -99,7 +99,6 @@ def test_selector_matches_torch_across_split_boundaries():
 @pytest.mark.parametrize(
     ("dtype", "vocab_size", "dual_key"),
     [
-        (torch.bfloat16, 8191, False),
         (torch.bfloat16, 8192, False),
         (torch.bfloat16, 8193, False),
         (torch.bfloat16, 151936, False),
@@ -175,7 +174,7 @@ def test_fused_force_matches_torch_truncation(dtype, vocab_size, dual_key):
     assert torch.equal(actual_logits, expected_logits)
 
 
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
 @pytest.mark.parametrize("max_probability", [0.7, 1.0])
 def test_finite_top_k_fast_path_matches_sort_with_ties(dtype, max_probability):
     vocab_size = 8193

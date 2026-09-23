@@ -2017,7 +2017,6 @@ class ModelRunner:
                 req_pool_indices,
                 forward_batch.watermark_prompt_tail_ids,
                 forward_batch.watermark_context_hash_history,
-                active=forward_batch.sampling_info.has_watermark_candidates,
             )
             watermark_state.force(
                 logits_output.next_token_logits,
@@ -2055,7 +2054,6 @@ class ModelRunner:
             watermark_state.append(
                 req_pool_indices,
                 next_token_ids,
-                active=forward_batch.sampling_info.has_watermark_candidates,
             )
         return next_token_ids
 

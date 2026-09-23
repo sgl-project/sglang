@@ -376,8 +376,6 @@ def select_watermark_tokens_torch(
     token_ids = torch.arange(probabilities.shape[-1], device=probabilities.device)
     hashed = _watermark_hash32_torch(keys, context_hashes, token_ids)
     if keys_b is not None:
-        if mixing_thresholds is None:
-            raise ValueError("dual-key watermark selection requires mixing thresholds")
         hashed_b = _watermark_hash32_torch(keys_b, context_hashes, token_ids)
         use_key_a = _dual_key_a_mask_torch(
             keys, keys_b, context_hashes, mixing_thresholds
@@ -699,10 +697,8 @@ class WatermarkState:
         req_pool_indices: torch.Tensor,
         prompt_tail_ids: Optional[Sequence[Optional[Sequence[int]]]],
         context_hash_history: Optional[Sequence[Optional[Sequence[int]]]] = None,
-        *,
-        active: bool = True,
     ) -> None:
-        if not active or prompt_tail_ids is None:
+        if prompt_tail_ids is None:
             return
         assert len(prompt_tail_ids) == req_pool_indices.shape[0]
 
@@ -1045,16 +1041,10 @@ class WatermarkState:
         req_pool_indices: torch.Tensor,
         accept_tokens: torch.Tensor,
         accept_lens: torch.Tensor,
-        *,
-        active: bool = True,
     ) -> None:
-        if not active:
-            return
         for position in range(accept_tokens.shape[1]):
             valid = position < accept_lens
-            self.append(
-                req_pool_indices[valid], accept_tokens[valid, position], active=active
-            )
+            self.append(req_pool_indices[valid], accept_tokens[valid, position])
 
     def force(
         self,
@@ -1197,11 +1187,7 @@ class WatermarkState:
         self,
         req_pool_indices: torch.Tensor,
         token_ids: torch.Tensor,
-        *,
-        active: bool = True,
     ) -> None:
-        if not active:
-            return
         if self.token_ids.is_cuda:
             try:
                 from sglang.kernels.ops.sampling.textseal_selector import (

@@ -638,7 +638,6 @@ def run_eagle_verify(
                 batch.req_pool_indices,
                 accept_tokens,
                 accept_lens,
-                active=batch.sampling_info.has_watermark_candidates,
             )
         bonus_tokens = torch.empty_like(accept_lens, dtype=torch.int32)
         # stride = accept_tokens per-req width = accept_index.shape[1]

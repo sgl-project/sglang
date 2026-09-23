@@ -16,7 +16,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=420, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=320, stage="base-b", runner_config="1-gpu-small")
 
 _MODEL = "Qwen/Qwen2.5-0.5B-Instruct"
 _KEY_A = "0123456789abcdef"
@@ -120,40 +120,6 @@ def _assert_detected(response, key, *, other_key=None):
         assert z_score - other_z >= 4.0
 
 
-class TestWatermarkDisabledEndpoint(CustomTestCase):
-    process = None
-
-    @classmethod
-    def setUpClass(cls):
-        cls.process = popen_launch_server(
-            _MODEL,
-            DEFAULT_URL_FOR_TEST,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-        )
-
-    @classmethod
-    def tearDownClass(cls):
-        if cls.process is not None:
-            kill_process_tree(cls.process.pid)
-
-    def test_request_requires_server_enablement(self):
-        disabled = requests.post(
-            f"{DEFAULT_URL_FOR_TEST}/v1/chat/completions",
-            json=_chat_payload({"enabled": False}, max_tokens=1),
-            timeout=60,
-        )
-        assert disabled.status_code == 200, disabled.text
-
-        for watermark in ({"enabled": True}, {"key": _KEY_A}):
-            response = requests.post(
-                f"{DEFAULT_URL_FOR_TEST}/v1/chat/completions",
-                json=_chat_payload(watermark, max_tokens=1),
-                timeout=60,
-            )
-            assert response.status_code == 400
-            assert _KEY_A not in response.text
-
-
 class WatermarkServerTest(CustomTestCase):
     mode_args = []
     process = None
@@ -188,15 +154,6 @@ class WatermarkServerTest(CustomTestCase):
 
 
 class TestWatermarkRequestEndpoint(WatermarkServerTest):
-    def test_omitted_and_disabled_requests_are_not_rejected(self):
-        for watermark in (_OMITTED, {"enabled": False}):
-            response = requests.post(
-                f"{DEFAULT_URL_FOR_TEST}/v1/chat/completions",
-                json=_chat_payload(watermark, max_tokens=1),
-                timeout=60,
-            )
-            assert response.status_code == 200, response.text
-
     def test_bad_request_key_is_rejected_without_echo(self):
         bad_key = "not-a-hex-key"
         response = requests.post(

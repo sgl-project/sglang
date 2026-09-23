@@ -509,7 +509,6 @@ class NGRAMWorker(BaseSpecWorker):
                     batch.req_pool_indices,
                     accept_tokens,
                     accept_lens,
-                    active=batch.sampling_info.has_watermark_candidates,
                 )
             next_token_ids = accept_tokens.flatten()
 

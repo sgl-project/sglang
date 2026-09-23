@@ -803,6 +803,7 @@ def eagle_sample(
     watermark_context_hashes = None
     watermark_selected = None
     if watermark_state is not None and sampling_info.has_watermark_candidates:
+        # compute_spec_logprobs reads logits_output after verify; force a copy.
         next_token_logits = next_token_logits.clone()
         contexts, context_lengths = watermark_state.speculative_contexts(
             req_pool_indices=batch.req_pool_indices,
@@ -1069,6 +1070,9 @@ def eagle_sample(
             spec_steps=verify_input.max_tree_depth - 1,
         )
 
+    # `num_correct_drafts` stays drafts-only inside this function; the returned
+    # tensor includes the trailing/bonus token via out-of-place +1 so the
+    # name no longer flips semantics mid-function (naming doc C2).
     accept_lens = num_correct_drafts + 1
     if watermark_state is not None and sampling_info.has_watermark_candidates:
         watermark_state.record_speculative(
