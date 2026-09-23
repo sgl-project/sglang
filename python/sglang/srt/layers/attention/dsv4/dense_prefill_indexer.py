@@ -35,7 +35,7 @@ def dense_prefill_topk(
     candidate_block_size: int,
     publish_candidates: bool,
     candidates: PrefillCandidateBlocks | None,
-    budget: PrefillIndexerBudget | None = None,
+    budget: PrefillIndexerBudget,
 ) -> tuple[torch.Tensor, PrefillCandidateBlocks | None]:
     selected = torch.full(
         (q[0].shape[0], topk), -1, dtype=torch.int32, device=weights.device
@@ -75,7 +75,7 @@ def dense_prefill_topk(
         width,
         heads=q[0].shape[1],
         device=weights.device,
-        budget=budget if budget is not None else PrefillIndexerBudget(),
+        budget=budget,
         scratch_row_bytes=scratch_row_bytes + 8,
         scratch_bytes=scratch_bytes,
     )

@@ -72,7 +72,7 @@ class PrefillIndexerInputs(msgspec.Struct, frozen=True):
     kv_page_table: torch.Tensor
     kv_page_size: int
     compress_ratio: int
-    budget: PrefillIndexerBudget = msgspec.field(default_factory=PrefillIndexerBudget)
+    budget: PrefillIndexerBudget
 
     @property
     def num_rows(self) -> int:
