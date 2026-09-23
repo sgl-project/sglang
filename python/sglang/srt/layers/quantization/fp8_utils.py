@@ -1336,21 +1336,14 @@ def aiter_w8a8_block_fp8_linear(
     input_2d = input.view(-1, input.shape[-1])
     output_shape = [*input.shape[:-1], weight.shape[0]]
 
-    # Skinny-M fast path: dense linears converted from MXFP8 may carry a cached
-    # rowwise-fp8 copy (small M -> aiter flydsl
-    # per-token x per-channel GEMM), which beats the block-fp8 GEMMs at
-    # decode-sized M.
+    # dense linears converted from MXFP8 carry a rowwise-fp8 copy; its ptpc GEMM
+    # beats the block-fp8 GEMMs at decode-sized M
     if input_scale is None:
         ptpc_weight = getattr(weight, "_ptpc_weight", None)
         if (
             ptpc_weight is not None
             and input_2d.shape[0] <= MXFP8_DENSE_PTPC_DECODE_MAX_M
         ):
-            # (fp8, scale) pre-quantized by the producing fused-add-RMSNorm
-            # kernel; skips per_token_quant_hip.
-            pre_quant = getattr(input, "_fp8_qinput", None)
-            if pre_quant is not None and pre_quant[0].shape[0] == input_2d.shape[0]:
-                input_2d = pre_quant
             out = apply_fp8_ptpc_linear(
                 input=input_2d,
                 weight=ptpc_weight,
