@@ -57,8 +57,8 @@ def fused_engram_gate(
     clamp_value: float,
     image_select: Optional[Tuple[torch.Tensor, int]] = None,
 ) -> torch.Tensor:
-    """``image_select = (input_ids [T], image_token_id)`` keeps ``x`` on the rows whose input id is
-    the image token, as the model's ``torch.where`` after the gate does (bitwise: the kept bf16
+    """image_select = (input_ids [T], image_token_id) keeps x on the rows whose input id is
+    the image token, as the model's torch.where after the gate does (bitwise: the kept bf16
     rows round-trip through fp32 exactly)."""
     assert x.ndim == 3 and kv.ndim == 2
     t, hc, d = x.shape

@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Batched bf16 GEMM ``Y[g] = X[g] @ W[g]^T`` with the consumer's fp8-grid rounding in the epilogue
-(the DeepSeek-V4 ``wo_a`` absorb GEMM on gfx950). Above ``_SPLIT_K_MAX_M`` rows aiter's tile loop,
+"""Batched bf16 GEMM Y[g] = X[g] @ W[g]^T with the consumer's fp8-grid rounding in the epilogue
+(the DeepSeek-V4 wo_a absorb GEMM on gfx950). Above _SPLIT_K_MAX_M rows aiter's tile loop,
 bitwise aiter's; at or below, the same tile split eight ways along K and reduced in a fixed order."""
 
 from __future__ import annotations
@@ -49,7 +49,7 @@ def _batched_gemm_bf16_fp8_grid_kernel(
     num_stages: tl.constexpr,
     waves_per_eu: tl.constexpr,
 ):
-    """aiter ``_batched_gemm_bf16_kernel`` (GROUP_SIZE_M = 1, NUM_KSPLIT = 1, no
+    """aiter _batched_gemm_bf16_kernel (GROUP_SIZE_M = 1, NUM_KSPLIT = 1, no
     bias) with the per-32 fp8 e4m3 quantize-dequantize of the bf16 result."""
     tl.assume(stride_ab > 0)
     tl.assume(stride_am > 0)
@@ -149,8 +149,8 @@ def _batched_gemm_bf16_split_k_partial_kernel(
     waves_per_eu: tl.constexpr,
 ):
     """Grid (G, row tiles x N tiles, SPLIT_K): the fp32 partial of one K slice, stored as
-    ``part[g, split, row_tile, m, n]``. ``K % (SPLIT_K * BLOCK_SIZE_K) == 0`` and
-    ``N % BLOCK_SIZE_N == 0`` (unmasked N tiles)."""
+    part[g, split, row_tile, m, n]. K % (SPLIT_K * BLOCK_SIZE_K) == 0 and
+    N % BLOCK_SIZE_N == 0 (unmasked N tiles)."""
     batch_id = tl.cast(tl.program_id(axis=0), tl.int64)
     pid = tl.program_id(axis=1)
     pid_k = tl.program_id(axis=2)
@@ -299,8 +299,8 @@ def batched_gemm_bf16_fp8_grid(
     eps: float = 1e-10,
     split_k: Optional[bool] = None,
 ) -> torch.Tensor:
-    """``x`` [T, G, D] bf16, ``w`` [G, R, D] bf16 -> [T, G * R] bf16 with ``out[t, g*R:(g+1)*R] =
-    x[t, g] @ w[g]^T``, on the fp8 grid when ``fp8_grid``; ``split_k`` forces a regime (tests)."""
+    """x [T, G, D] bf16, w [G, R, D] bf16 -> [T, G * R] bf16 with out[t, g*R:(g+1)*R] =
+    x[t, g] @ w[g]^T, on the fp8 grid when fp8_grid; split_k forces a regime (tests)."""
     assert x.dim() == 3 and w.dim() == 3, (x.shape, w.shape)
     T, G, D = x.shape
     assert w.shape[0] == G and w.shape[2] == D, (x.shape, w.shape)

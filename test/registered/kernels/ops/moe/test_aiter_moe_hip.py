@@ -1,4 +1,4 @@
-"""The one-launch MoE sorting, the ROCm decode router gate and the fused gate + sort must reproduce aiter's `moe_sorting` and `topk_gating` bit for bit."""
+"""The one-launch MoE sorting, the ROCm decode router gate and the fused gate + sort must reproduce aiter's moe_sorting and topk_gating bit for bit."""
 
 import unittest
 

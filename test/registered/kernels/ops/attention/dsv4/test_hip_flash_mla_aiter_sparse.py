@@ -1,4 +1,4 @@
-"""The ``aiter_sparse`` ROCm attention backend and its split-KV combine must match the torch reference and aiter's own reduce on the served packed fp8 KV layout, bitwise repeatable and batch-invariant."""
+"""The aiter_sparse ROCm attention backend and its split-KV combine must match the torch reference and aiter's own reduce on the served packed fp8 KV layout, bitwise repeatable and batch-invariant."""
 
 import math
 import unittest
@@ -49,7 +49,7 @@ def _pack_cache(num_blocks, device, gen, *, fp8_view=True):
 
 
 def _masked(indices, lengths):
-    """One length-folded list; ``_fold_lengths_into_index_lists`` returns the (main, extra) pair."""
+    """One length-folded list; _fold_lengths_into_index_lists returns the (main, extra) pair."""
     from sglang.srt.layers.attention.deepseek_v4_backend_hip_radix import (
         _fold_lengths_into_index_lists,
     )
@@ -83,7 +83,7 @@ def _decode_case(batch, heads, gen, dev):
 
 
 def _reference(q, sink, sets):
-    """Decode form of `_reference_prefill`: sets = [(deq_keys, indices [b, 1, w],
+    """Decode form of _reference_prefill: sets = [(deq_keys, indices [b, 1, w],
     lengths [b])], a slot at or past its row's length being padding."""
     folded = []
     for deq, idx, length in sets:
@@ -201,7 +201,7 @@ class TestAiterSparseBackend(CustomTestCase):
         )[0]
 
     def test_pinned_splits_are_batch_invariant(self):
-        """``SGLANG_OPT_HIP_ATTN_KV_SPLITS`` pins the split-KV count so a row's output
+        """SGLANG_OPT_HIP_ATTN_KV_SPLITS pins the split-KV count so a row's output
         is bitwise the same at every batch size; aiter's cost model changes the count
         past 64 rows."""
         from sglang.srt.environ import envs
@@ -333,8 +333,8 @@ def _freqs(device, max_pos=8192, seed=0):
 
 def _model_inverse_rope(x, freqs_real, positions):
     """The model's standalone inverse RoPE of the attention output:
-    `fused_rope_inplace(..., inverse=True)` with the batched flat kernel
-    (`set_batched_rope(True)`)."""
+    fused_rope_inplace(..., inverse=True) with the batched flat kernel
+    (set_batched_rope(True))."""
     from sglang.kernels.ops.attention.deepseek_v4_rope import set_batched_rope
     from sglang.kernels.ops.attention.dsv4.elementwise import fused_rope_inplace
 

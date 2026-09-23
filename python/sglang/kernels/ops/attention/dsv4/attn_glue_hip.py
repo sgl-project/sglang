@@ -60,9 +60,9 @@ def mask_indices_by_length(
     indices2: Optional[torch.Tensor] = None,
     lengths2: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-    """``torch.where(arange(w) < lengths.view(-1, 1, 1), indices, -1)`` for one or
-    two ``[b, s, w]`` index tensors in one launch (the sparse decode kernel takes
-    no per-row length and skips -1). ``lengths`` is ``[b]``; every ``s`` row of a
+    """torch.where(arange(w) < lengths.view(-1, 1, 1), indices, -1) for one or
+    two [b, s, w] index tensors in one launch (the sparse decode kernel takes
+    no per-row length and skips -1). lengths is [b]; every s row of a
     batch entry shares its length. Returns new tensors of the input dtypes."""
     rows, rows_per_len, w1 = _mask_shape(indices, lengths)
     out = torch.empty_like(indices)
@@ -123,9 +123,9 @@ def _expand_index_page_table_kernel(
 def expand_index_page_table(
     page_table: torch.Tensor, blocks_per_page: int
 ) -> torch.Tensor:
-    """``(page_table.to(int64) * bpp).unsqueeze(-1) + arange(bpp)`` reshaped to
-    ``[bs, n * bpp]`` int32: the block table of a low-ratio indexer-K pool that
-    pages at a fraction of a FULL page (see ``_expand_index_page_table``)."""
+    """(page_table.to(int64) * bpp).unsqueeze(-1) + arange(bpp) reshaped to
+    [bs, n * bpp] int32: the block table of a low-ratio indexer-K pool that
+    pages at a fraction of a FULL page (see _expand_index_page_table)."""
     if blocks_per_page == 1:
         return page_table
     assert blocks_per_page & (blocks_per_page - 1) == 0, blocks_per_page
@@ -183,9 +183,9 @@ def low_ratio_compression_metadata(
     raw_out_loc: torch.Tensor,
     low_ratios: Tuple[int, ...],
 ) -> dict:
-    """``_low_ratio_compression_metadata`` for ratios 1 and 2 in one launch: ``cR_out_loc =
-    where(seq_lens[:nw] % R == 0, raw_out_loc // R, -1)`` (int64) and ``cR_topk_lengths_clamp1 =
-    (seq_lens // R).clamp_min(1)`` (int32), keyed ``c{R}_...`` for the ratios present."""
+    """_low_ratio_compression_metadata for ratios 1 and 2 in one launch: cR_out_loc =
+    where(seq_lens[:nw] % R == 0, raw_out_loc // R, -1) (int64) and cR_topk_lengths_clamp1 =
+    (seq_lens // R).clamp_min(1) (int32), keyed c{R}_... for the ratios present."""
     assert seq_lens_casual.dtype is torch.int32 and seq_lens_casual.is_contiguous()
     assert raw_out_loc.dim() == 1 and raw_out_loc.is_contiguous()
     assert set(low_ratios) <= {1, 2}, low_ratios
@@ -286,9 +286,9 @@ def sparse_buffers(
     index_topk: int,
     page_index_align: int,
 ) -> dict:
-    """``init_flashmla_related``'s tensors in one launch, keyed by attribute name: the top-k
-    lengths clamped to ``index_topk`` and the ``-1``-filled int32 page-index buffers padded to
-    ``page_index_align``, for ratio 4 and the ratios whose clamp-1 lengths are given."""
+    """init_flashmla_related's tensors in one launch, keyed by attribute name: the top-k
+    lengths clamped to index_topk and the -1-filled int32 page-index buffers padded to
+    page_index_align, for ratio 4 and the ratios whose clamp-1 lengths are given."""
     for t in (
         c4_topk_lengths_clamp1,
         c4_topk_lengths_raw,
@@ -374,7 +374,7 @@ def page_table_from_req_to_token(
     max_seq_len: int,
     page_size: int,
 ) -> torch.Tensor:
-    """``(req_to_token[req_rows, :max_seq_len:page_size] // page_size).to(torch.int32)`` in one
+    """(req_to_token[req_rows, :max_seq_len:page_size] // page_size).to(torch.int32) in one
     launch (the gather, the floor division and the cast)."""
     assert req_to_token.dim() == 2 and req_to_token.stride(1) == 1
     assert req_rows.dim() == 1 and req_rows.stride(0) == 1
@@ -410,7 +410,7 @@ def _widen_pair_kernel(a_ptr, b_ptr, oa_ptr, ob_ptr, n, BLOCK: tl.constexpr):
 def widen_pair_i64(
     a: torch.Tensor, b: torch.Tensor
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """``(a.to(torch.int64), b.to(torch.int64))`` for two same-length integer vectors in one
+    """(a.to(torch.int64), b.to(torch.int64)) for two same-length integer vectors in one
     launch (the decode request slots and positions the low-ratio indexer takes widened)."""
     assert a.dim() == b.dim() == 1 and a.shape == b.shape, (a.shape, b.shape)
     assert a.stride(0) == 1 and b.stride(0) == 1

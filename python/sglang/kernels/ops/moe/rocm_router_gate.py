@@ -1,5 +1,5 @@
 """DeepSeek-V4 MoE router at decode row counts on ROCm: split-K bf16 GEMV partials and a
-sqrtsoftplus top-k gate bitwise aiter's ``topk_gating_kernel_opt``, ties included."""
+sqrtsoftplus top-k gate bitwise aiter's topk_gating_kernel_opt, ties included."""
 
 from __future__ import annotations
 
@@ -27,7 +27,7 @@ _FLT_MAX = tl.constexpr(3.4028234663852886e38)
 
 
 def rocm_gemv_split_k_max_tokens(*, n: int, k: int, weight_dtype: torch.dtype) -> int:
-    """Rows up to which :func:`rocm_router_gemv_split_k` serves an ``[M, k] @ [n, k].T`` bf16
+    """Rows up to which rocm_router_gemv_split_k serves an [M, k] @ [n, k].T bf16
     GEMV (one 16-wide N tile per 512 of K, 16-row tiles), -1 when the device or the shape
     rules it out."""
     if not (is_hip() and is_gfx95_supported()):
@@ -48,7 +48,7 @@ def rocm_router_max_tokens(
     topk: int,
     weight_dtype: torch.dtype,
 ) -> int:
-    """Rows up to which :func:`rocm_router_gemv_split_k` + :func:`rocm_router_gate`
+    """Rows up to which rocm_router_gemv_split_k + rocm_router_gate
     serve the router, -1 when the device or the shape rules them out."""
     if num_experts != _GATE_NUM_EXPERTS or not 0 < topk <= _MAX_TOPK:
         return -1
@@ -98,8 +98,8 @@ def _router_gemv_split_k_kernel(
 
 
 def rocm_router_gemv_split_k(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
-    """``x[M, K] @ w[N, K].T`` as fp32 split-K partials ``[K // 512, M, N]``, summed over dim 0 in
-    order by :func:`rocm_router_reduce_partials` or the fused gate."""
+    """x[M, K] @ w[N, K].T as fp32 split-K partials [K // 512, M, N], summed over dim 0 in
+    order by rocm_router_reduce_partials or the fused gate."""
     M, K = x.shape
     N, K_w = w.shape
     assert K == K_w and K % _BLOCK_K == 0 and N % _BLOCK_N == 0
@@ -153,7 +153,7 @@ def _reduce_partials_kernel(
 
 
 def rocm_router_reduce_partials(partials: torch.Tensor, out: torch.Tensor) -> None:
-    """``out[M, N] = partials[0] + partials[1] + ...`` in that order, in fp32:
+    """out[M, N] = partials[0] + partials[1] + ... in that order, in fp32:
     the same sum the fused gate computes."""
     split_k, M, N = partials.shape
     assert out.shape == (M, N) and out.dtype == torch.float32 and out.stride(1) == 1
@@ -235,8 +235,8 @@ def _gate_row(
     RENORM: tl.constexpr,
     TOPK: tl.constexpr,
 ):
-    """aiter's ``topk_gating_kernel_opt`` for one row on one 64-lane wave: returns the
-    scaled weights and the ids as ``[64]`` lane tensors (lane k < TOPK holds slot k)."""
+    """aiter's topk_gating_kernel_opt for one row on one 64-lane wave: returns the
+    scaled weights and the ids as [64] lane tensors (lane k < TOPK holds slot k)."""
     lane = tl.arange(0, 64)
     # Slot i of a lane holds expert lane + 64 * i, as in aiter's register kernel.
     i0 = lane
@@ -396,9 +396,9 @@ def rocm_router_gate(
     *,
     partials: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """aiter ``topk_gating(..., score_func="sqrtsoftplus")`` for 384 experts: fp32 weights and int32
-    ids ``[M, topk]``; with ``partials`` their fixed-order sum is gated and written into
-    ``gating_output``."""
+    """aiter topk_gating(..., score_func="sqrtsoftplus") for 384 experts: fp32 weights and int32
+    ids [M, topk]; with partials their fixed-order sum is gated and written into
+    gating_output."""
     M, num_experts = gating_output.shape
     assert num_experts == _GATE_NUM_EXPERTS and 0 < topk <= _MAX_TOPK
     assert gating_output.stride(1) == 1

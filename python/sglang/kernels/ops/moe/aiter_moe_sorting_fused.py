@@ -1,4 +1,4 @@
-"""One-launch replacement for aiter's ``moe_sorting`` at decode row counts, bitwise its five outputs,
+"""One-launch replacement for aiter's moe_sorting at decode row counts, bitwise its five outputs,
 with the padded-row fills folded in."""
 
 from __future__ import annotations
@@ -175,9 +175,9 @@ def fused_aiter_moe_sorting(
     zero_moe_buf: bool,
     num_token_non_padded: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """``aiter.fused_moe.moe_sorting`` in one launch: ``(sorted_ids, sorted_weights,
-    sorted_expert_ids, num_valid_ids, moe_buf)`` with aiter's shapes, ``moe_buf`` empty unless
-    ``zero_moe_buf``; rows at and past ``num_token_non_padded`` become (expert 0, weight 0)."""
+    """aiter.fused_moe.moe_sorting in one launch: (sorted_ids, sorted_weights,
+    sorted_expert_ids, num_valid_ids, moe_buf) with aiter's shapes, moe_buf empty unless
+    zero_moe_buf; rows at and past num_token_non_padded become (expert 0, weight 0)."""
     M, topk = topk_ids.shape
     if M > AITER_FUSED_SORT_MAX_TOKENS:
         raise ValueError(

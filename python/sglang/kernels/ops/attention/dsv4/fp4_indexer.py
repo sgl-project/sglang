@@ -82,9 +82,9 @@ def quantize_fp4_indexer_row(
     GROUP_N: tl.constexpr,
     RNE: tl.constexpr,
 ):
-    """One row of ``quantize_fp4_indexer_tensor``: ``values`` is the fp32 ``[BLOCK_N]`` row,
-    ``v0`` / ``v1`` its even / odd elements as fp32 ``[BLOCK_N // 2]``. Returns
-    ``(packed codes [BLOCK_N // 2], packed ue8m0 exponents)``, the two stores of the
+    """One row of quantize_fp4_indexer_tensor: values is the fp32 [BLOCK_N] row,
+    v0 / v1 its even / odd elements as fp32 [BLOCK_N // 2]. Returns
+    (packed codes [BLOCK_N // 2], packed ue8m0 exponents), the two stores of the
     standalone kernel below."""
     offs = tl.arange(0, BLOCK_N)
     abs_values = tl.abs(values)

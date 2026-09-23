@@ -32,7 +32,7 @@ EPS = 1e-6
 
 
 def _make_pool():
-    """The real `DeepSeekV4TokenToKVPool`, so the buffers, their dtypes, the page
+    """The real DeepSeekV4TokenToKVPool, so the buffers, their dtypes, the page
     sizes and the pair-state ring all come from the code under test."""
     from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 
@@ -81,7 +81,7 @@ def _build(n: int, ratio: int, seed: int):
         wk = torch.nn.Linear(
             HEAD_DIM, INDEX_HEAD_DIM, bias=False, dtype=torch.bfloat16
         ).cuda()
-    # Not `ones` anywhere: a constant weight cannot catch a wrong element index.
+    # Not ones anywhere: a constant weight cannot catch a wrong element index.
     with torch.no_grad():
         for module in (compressor, k_norm, wk):
             for param in module.parameters():
@@ -128,8 +128,8 @@ def _build(n: int, ratio: int, seed: int):
         rope_head_dim=ROPE_DIM,
         index_head_dim=INDEX_HEAD_DIM,
     )
-    # The real method, bound to the stand-in: it reads only `wk` and
-    # `index_head_dim`, and it is what decides whether the in-tree GEMM serves `wk`.
+    # The real method, bound to the stand-in: it reads only wk and
+    # index_head_dim, and it is what decides whether the in-tree GEMM serves wk.
     captured = {}
 
     def forward_wk(latent):
@@ -202,7 +202,7 @@ def _reference(t, ratio: int):
     else:
         fused = t.compressor.project_fused(t.x)
         kv, score = fused[..., :HEAD_DIM], fused[..., HEAD_DIM:]
-        # `translate_from_req_position_to_state_loc` for the slot `pos - 1`
+        # translate_from_req_position_to_state_loc for the slot pos - 1
         # left: the ring puts the read and the write on different rows.
         read = t.req * t.ring_size + (t.pos - 1) % t.ring_size
         partner_kv = t.pair_state[read, :HEAD_DIM]
@@ -263,7 +263,7 @@ def _reference(t, ratio: int):
         )
         from sglang.srt.layers.attention.dsv4.dsv41_sparse import _rope_fq4
 
-        # the unfused ROCm chain: `index_keys` then the split-layout writer
+        # the unfused ROCm chain: index_keys then the split-layout writer
         payload, scale = index_cache
         store_fp4_index_k_cache_split(
             _rope_fq4(t.k_norm(projected[live]), t.freqs[group_pos[live]], ROPE_DIM),
@@ -288,7 +288,7 @@ class TestFusedLowRatioCompress(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         super().setUpClass()
-        # The pool reads the scheduler's config bags (`spec`, for the pair-ring
+        # The pool reads the scheduler's config bags (spec, for the pair-ring
         # size), so they have to be published before one can be built.
         set_global_server_args_for_scheduler(
             ServerArgs(model_path="dummy", page_size=POOL_PAGE_SIZE)
@@ -459,7 +459,7 @@ class TestFusedLowRatioCompress(CustomTestCase):
 
     @unittest.skipUnless(is_hip(), "HIP fused compressor regression")
     def test_padded_rows_publish_nothing(self):
-        """A padded graph suffix carries `raw_out_loc == 0` and `out_loc == 0`, which
+        """A padded graph suffix carries raw_out_loc == 0 and out_loc == 0, which
         both kernels must read off the arrays (the caller passes no mask)."""
         n, pad = 8, 3
         for ratio in (1, 2):
@@ -488,7 +488,7 @@ class TestFusedLowRatioCompress(CustomTestCase):
     @unittest.skipUnless(is_hip(), "HIP fused compressor regression")
     def test_open_group_rows_publish_nothing(self):
         """A live ratio-2 token at an even position completes no group, so the metadata
-        gives it `c2_out_loc == -1`; an index-K writer taking that -1 straight from
+        gives it c2_out_loc == -1; an index-K writer taking that -1 straight from
         the array would wrap to the last slot."""
         from sglang.srt.layers.attention.deepseek_v4_backend import (
             _low_ratio_compression_metadata,
@@ -502,7 +502,7 @@ class TestFusedLowRatioCompress(CustomTestCase):
         out_loc, _ = _low_ratio_compression_metadata(ratio, t.pos + 1, core.raw_out_loc)
         self.assertTrue(bool((out_loc[-pending:] == -1).all()), out_loc.tolist())
         self.assertTrue(bool((out_loc[:-pending] > 0).all()), out_loc.tolist())
-        # `_build` hands the same tensor out as `c2_out_loc` and `t.out_loc`.
+        # _build hands the same tensor out as c2_out_loc and t.out_loc.
         core.c2_out_loc.copy_(out_loc)
         self._check_step(t, ratio)
 

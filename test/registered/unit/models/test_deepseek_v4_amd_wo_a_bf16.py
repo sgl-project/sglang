@@ -286,7 +286,7 @@ class TestWoABf16PrefillAndVerifyRoutes(unittest.TestCase):
 
 @unittest.skipUnless(is_hip(), "requires HIP")
 class TestRouterFp32(CustomTestCase):
-    """The HIP branch of ``MoEGate.forward`` keeps the router GEMM output in fp32."""
+    """The HIP branch of MoEGate.forward keeps the router GEMM output in fp32."""
 
     def setUp(self):
         from sglang.srt.models.deepseek_v2 import MoEGate

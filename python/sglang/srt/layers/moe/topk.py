@@ -349,7 +349,7 @@ class StandardTopKOutput(NamedTuple):
 
 
 class StandardTopKOutputDeferredPad(StandardTopKOutput):
-    """A STANDARD output whose rows at and past ``num_token_non_padded`` still hold the
+    """A STANDARD output whose rows at and past num_token_non_padded still hold the
     router's values, which the aiter runner masks in its fused sorting launch."""
 
     def __new__(cls, topk_weights, topk_ids, router_logits, num_token_non_padded):
@@ -674,8 +674,8 @@ class TopK(BaseFusedOp):
         dynamic_expert_bias: Optional[torch.Tensor] = None,
         router_logits_partials: Optional[torch.Tensor] = None,
     ) -> TopKOutput:
-        """``router_logits_partials`` (ROCm decode router): fp32 split-K partials whose
-        fixed-order sum is the logits; ``router_logits`` is then a buffer the fused gate
+        """router_logits_partials (ROCm decode router): fp32 split-K partials whose
+        fixed-order sum is the logits; router_logits is then a buffer the fused gate
         fills, and any other reader first reduces the partials into it."""
         if dynamic_expert_bias is not None:
             output_format = TopKOutputFormat.STANDARD
@@ -1432,7 +1432,7 @@ def biased_topk_impl(
 def _reduce_router_logits_partials(
     router_logits: torch.Tensor, router_logits_partials: torch.Tensor
 ) -> None:
-    """Fill ``router_logits`` with the split-K sum in the fused ROCm gate's order."""
+    """Fill router_logits with the split-K sum in the fused ROCm gate's order."""
     from sglang.kernels.ops.moe.rocm_router_gate import rocm_router_reduce_partials
 
     rocm_router_reduce_partials(router_logits_partials, router_logits)

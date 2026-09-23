@@ -896,7 +896,7 @@ def test_row_chunks_reproduce_the_unsplit_batch() -> None:
 
 
 def pack_fp4_query_flydsl_torch(q: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """The three-launch form of ``pack_fp4_query_flydsl``: the shared quantizer, then
+    """The three-launch form of pack_fp4_query_flydsl: the shared quantizer, then
     zeros and a permuted copy into the scale layout."""
     num_tokens, heads = q.shape[0], q.shape[1]
     assert heads % 16 == 0 and heads <= 64, heads
@@ -1007,7 +1007,7 @@ class TestDsv41Fp4TieRoundingHip(CustomTestCase):
         return 127 + int(torch.log2(torch.tensor(scale)))
 
     def test_low_ratio_triton_paths_round_half_to_even_like_cuda(self):
-        """Same Triton quantizer as CUDA (`rne=True`): ties to even on both."""
+        """Same Triton quantizer as CUDA (rne=True): ties to even on both."""
         from sglang.kernels.ops.attention.dsv4.fp4_indexer import (
             quantize_fp4_indexer_tensor,
         )

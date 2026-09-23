@@ -1,5 +1,5 @@
 """MoE top-k reduction with the shared-expert add folded in (ROCm): fp32 over the slots in
-ascending order as aiter's ``moe_reduction_kernel`` sums them, one rounding at the end."""
+ascending order as aiter's moe_reduction_kernel sums them, one rounding at the end."""
 
 from __future__ import annotations
 
@@ -60,8 +60,8 @@ def moe_topk_reduce_add(
     expert_mask: Optional[torch.Tensor] = None,
     alpha: float = 1.0,
 ) -> None:
-    """``out[t] = alpha * sum_k per_slot[t * topk + k] + shared[t]``, skipping slots whose expert
-    ``topk_ids`` maps outside ``expert_mask``; fp32 accumulation rounded once to ``out``'s dtype."""
+    """out[t] = alpha * sum_k per_slot[t * topk + k] + shared[t], skipping slots whose expert
+    topk_ids maps outside expert_mask; fp32 accumulation rounded once to out's dtype."""
     M, D = out.shape
     assert shared.shape == (M, D), (shared.shape, out.shape)
     assert per_slot.numel() == M * topk * D, (per_slot.shape, M, topk, D)

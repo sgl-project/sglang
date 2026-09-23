@@ -44,9 +44,9 @@ def index_k_norm_rope_pack_store_split(
     *,
     ratio: int,
 ) -> None:
-    """:func:`~sglang.kernels.ops.attention.dsv4.fp4_rope.index_k_norm_rope_pack_store` into the split
-    FlyDSL K layout (``payload`` ``[npages, 1, 4, page_size, 16]``, ``scale`` ``[npages, 1, 4,
-    page_size]`` uint8); the bytes equal ``store_fp4_index_k_cache_split``'s."""
+    """~sglang.kernels.ops.attention.dsv4.fp4_rope.index_k_norm_rope_pack_store into the split
+    FlyDSL K layout (payload [npages, 1, 4, page_size, 16], scale [npages, 1, 4,
+    page_size] uint8); the bytes equal store_fp4_index_k_cache_split's."""
     head_dim = input.shape[-1]
     page_size = payload.shape[3]
     assert payload.shape[1:] == (1, 4, page_size, 16), payload.shape

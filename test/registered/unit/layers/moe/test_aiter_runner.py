@@ -130,7 +130,7 @@ def _install_fake_moe_sorting(monkeypatch, moe_sorting):
 
 
 def _aiter_moe_sorting_signature(calls):
-    """aiter's ``moe_sorting`` parameters plus the trailing ``output`` newer builds add."""
+    """aiter's moe_sorting parameters plus the trailing output newer builds add."""
 
     def moe_sorting(
         topk_ids,
@@ -192,7 +192,7 @@ def _sort(num_tokens, ids, **overrides):
 
 def test_fused_sorting_hands_the_gate_launch_outputs_to_moe_sorting(monkeypatch):
     """First sight of a router records aiter's sorting arguments; the router's next gate
-    launch sorts too, and ``moe_sorting`` returns those outputs instead of launching.
+    launch sorts too, and moe_sorting returns those outputs instead of launching.
     Different arguments are re-sorted and re-recorded."""
     calls, launches = [], []
     _install_fake_moe_sorting(monkeypatch, _aiter_moe_sorting_signature(calls))
@@ -263,7 +263,7 @@ def test_fused_sorting_defers_to_aiter_and_stops_fusing_when_it_cannot_serve(
 
 
 def test_fused_sorting_override_needs_aiter_sorting_parameters(monkeypatch):
-    """An aiter whose ``moe_sorting`` leads with other parameters keeps its own kernel."""
+    """An aiter whose moe_sorting leads with other parameters keeps its own kernel."""
 
     def moe_sorting(topk_ids, weights, num_experts):
         return "aiter"

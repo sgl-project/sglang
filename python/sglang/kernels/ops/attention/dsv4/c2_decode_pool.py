@@ -10,7 +10,7 @@ from triton.language.extra import libdevice
 
 from sglang.srt.utils import is_hip
 
-# libdevice.exp / div_rn do not lower on HIP; tl.exp and `/` are exact against torch on gfx950
+# libdevice.exp / div_rn do not lower on HIP; tl.exp and / are exact against torch on gfx950
 _USE_LIBDEVICE = not is_hip()
 
 

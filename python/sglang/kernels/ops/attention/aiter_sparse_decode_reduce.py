@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Split-KV combine for aiter's gfx950 sparse decode kernel, bitwise ``_pa_decode_sparse_reduce``,
+"""Split-KV combine for aiter's gfx950 sparse decode kernel, bitwise _pa_decode_sparse_reduce,
 with the DeepSeek-V4 inverse RoPE folded in."""
 
 from __future__ import annotations
@@ -34,8 +34,8 @@ def _aiter_sparse_decode_reduce_kernel(
     HAS_SINK: tl.constexpr,
     INV_ROPE: tl.constexpr,
 ):
-    """Grid (num_queries, num_heads). Partials: ``part_m`` / ``part_l``
-    [T, S, H] fp32 (``m`` in the base-2 exponent domain), ``part_acc``
+    """Grid (num_queries, num_heads). Partials: part_m / part_l
+    [T, S, H] fp32 (m in the base-2 exponent domain), part_acc
     [T, S, H, D] fp32 -- the layout aiter's gluon main kernel stores."""
     RCP_LN2: tl.constexpr = 1.4426950408889634
     t = tl.program_id(0)
@@ -96,9 +96,9 @@ def aiter_sparse_split_reduce(
     out_dtype: torch.dtype = torch.bfloat16,
     inv_rope: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
 ) -> torch.Tensor:
-    """Combine ``pa_decode_sparse(..., skip_reduce=True)``'s partials into the
-    ``[T, H, D]`` output. ``inv_rope`` is ``(freqs_real [max_pos, rope_dim] fp32,
-    positions [T])``: the last ``rope_dim`` of every head are inverse-rotated."""
+    """Combine pa_decode_sparse(..., skip_reduce=True)'s partials into the
+    [T, H, D] output. inv_rope is (freqs_real [max_pos, rope_dim] fp32,
+    positions [T]): the last rope_dim of every head are inverse-rotated."""
     T, S, H, D = part_acc.shape
     assert part_m.shape == (T, S, H) and part_l.shape == (T, S, H), (
         part_m.shape,

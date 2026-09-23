@@ -46,7 +46,7 @@ TOPK_BLOCKS, BLOCK_SIZE = 2048, 8
 
 
 def index_slots(page_table, pos):
-    """Slot of compressed position `pos` through the expanded indexer page table."""
+    """Slot of compressed position pos through the expanded indexer page table."""
     return (
         page_table.gather(1, pos // INDEX_PAGE_SIZE) * INDEX_PAGE_SIZE
         + pos % INDEX_PAGE_SIZE
@@ -67,7 +67,7 @@ def reference_position_mask(logits, lens, topk_blocks, block_size):
 
 
 def candidate_block_ids_to_mask(ids, num_blocks):
-    """bool [rows, num_blocks] block mask of `CandidateBlocks.ids`."""
+    """bool [rows, num_blocks] block mask of CandidateBlocks.ids."""
     rows = ids.shape[0]
     # column num_blocks is the sink for the -1 padding; the mask is the view before it
     keep = torch.zeros((rows, num_blocks + 1), dtype=torch.bool, device=ids.device)
