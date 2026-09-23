@@ -117,6 +117,8 @@ class ServerArgsAutoTuner:
     def __init__(self, server_args: ServerArgs):
         self.server_args = server_args
         self._explicit_dit_residency = self._has_explicit_dit_residency()
+        self._device_memory_probe_done = False
+        self._min_available_device_memory_gb: float | None = None
 
     def _deployment_config(self) -> ModelDeploymentConfig:
         return self.server_args.pipeline_config.get_model_deployment_config()
@@ -755,16 +757,22 @@ class ServerArgsAutoTuner:
         if current_platform.is_cpu():
             return None
 
+        if self._device_memory_probe_done:
+            return self._min_available_device_memory_gb
+
+        device_ids = args.get_local_gpu_ids()
+        if not device_ids:
+            self._device_memory_probe_done = True
+            return None
+
         # Multi-GPU defaults are limited by the least-free selected GPU.
         try:
-            return min(
+            min_available_gb = min(
                 current_platform.get_available_gpu_memory(
                     device_id=device_id,
                     empty_cache=False,
                 )
-                for device_id in range(
-                    args.base_gpu_id, args.base_gpu_id + max(1, args.num_gpus)
-                )
+                for device_id in device_ids
             )
         except (AssertionError, IndexError, RuntimeError) as exc:
             # This probe only selects automatic residency/offload defaults.  A
@@ -777,7 +785,11 @@ class ServerArgsAutoTuner:
                 "keeping conservative automatic residency defaults: %s",
                 exc,
             )
-            return None
+            min_available_gb = None
+
+        self._min_available_device_memory_gb = min_available_gb
+        self._device_memory_probe_done = True
+        return min_available_gb
 
     def _has_explicit_dit_residency(self) -> bool:
         args = self.server_args
@@ -818,7 +830,11 @@ class ServerArgsAutoTuner:
         args = self.server_args
         min_available_gb = self._get_min_available_device_memory_gb()
         if min_available_gb is None:
-            return True
+            logger.info(
+                "Skipping automatic FSDP defaults because available device "
+                "memory could not be determined"
+            )
+            return False
 
         required_gb = self._deployment_config().fsdp_auto_min_available_memory_gb
         if required_gb is None:

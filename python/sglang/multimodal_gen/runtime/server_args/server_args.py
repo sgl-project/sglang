@@ -616,6 +616,24 @@ class ServerArgs(DisaggServerArgsMixin):
         """
         return self.host is None or self.port is None
 
+    def get_local_gpu_ids(self) -> list[int]:
+        """Return the device IDs used by workers launched on this host."""
+        if self.disagg_role == RoleType.SERVER:
+            return []
+
+        if self.disagg_role != RoleType.MONOLITHIC:
+            if self.gpu_ids is not None:
+                return list(self.gpu_ids)
+            return list(
+                range(self.base_gpu_id, self.base_gpu_id + max(0, self.num_gpus))
+            )
+
+        # num_gpus is the global world size for cross-node monolithic serving.
+        # Every node exposes its own devices through local logical IDs.
+        nnodes = max(1, self.nnodes)
+        local_num_gpus = max(0, self.num_gpus) // nnodes
+        return list(range(local_num_gpus))
+
     def _adjust_path(self):
         expand_path_fields(self)
         self._adjust_save_paths()
@@ -3738,6 +3756,16 @@ class ServerArgs(DisaggServerArgsMixin):
         if self.num_gpus % self.nnodes != 0:
             raise ValueError(
                 f"num_gpus ({self.num_gpus}) must be divisible by nnodes ({self.nnodes})"
+            )
+
+        if (
+            self.gpu_ids is not None
+            and self.disagg_role not in (RoleType.MONOLITHIC, RoleType.SERVER)
+            and len(self.gpu_ids) != self.num_gpus
+        ):
+            raise ValueError(
+                f"--gpu-ids provides {len(self.gpu_ids)} devices, but "
+                f"--num-gpus is {self.num_gpus}"
             )
 
         if self.sp_degree > self.num_gpus or self.num_gpus % self.sp_degree != 0:

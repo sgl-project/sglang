@@ -2525,13 +2525,12 @@ class TestOffloadDefaults(unittest.TestCase):
         )
         self.assertFalse(args.vae_cpu_offload)
 
-    def test_auto_multi_gpu_qwen_uses_selected_gpu_min_available_memory(self):
+    def test_auto_multi_gpu_qwen_uses_local_gpu_min_available_memory(self):
         args = self._from_dict_with_pipeline_config(
             QwenImagePipelineConfig(),
-            available_memory_gb={1: 50, 2: 80},
+            available_memory_gb={0: 50, 1: 80},
             kwargs={
                 "model_path": "Qwen/Qwen-Image",
-                "base_gpu_id": 1,
                 "num_gpus": 2,
                 "performance_mode": "auto",
             },
@@ -2541,32 +2540,73 @@ class TestOffloadDefaults(unittest.TestCase):
         self.assertTrue(args.enable_cfg_parallel)
 
     def test_auto_multi_gpu_keeps_conservative_defaults_when_probe_fails(self):
-        args = self._from_dict_with_pipeline_config(
-            QwenImagePipelineConfig(),
-            available_memory_gb={
-                0: 80,
-                1: AssertionError("Invalid device id"),
-            },
-            kwargs={
-                "model_path": "Qwen/Qwen-Image",
-                "num_gpus": 2,
-                "tp_size": 2,
-                "performance_mode": "auto",
-            },
-        )
+        with self.assertLogs(
+            "sglang.multimodal_gen.runtime.server_args.auto_tune", level="WARNING"
+        ) as captured:
+            args = self._from_dict_with_pipeline_config(
+                QwenImagePipelineConfig(),
+                available_memory_gb={
+                    0: 80,
+                    1: AssertionError("Invalid device id"),
+                },
+                kwargs={
+                    "model_path": "Qwen/Qwen-Image",
+                    "num_gpus": 2,
+                    "tp_size": 2,
+                    "performance_mode": "auto",
+                },
+            )
 
         self.assertFalse(args.use_fsdp_inference)
         self.assertFalse(args.enable_cfg_parallel)
         self.assertTrue(args.text_encoder_cpu_offload)
         self.assertTrue(args.image_encoder_cpu_offload)
+        probe_warnings = [
+            message
+            for message in captured.output
+            if "Unable to inspect available memory" in message
+        ]
+        self.assertEqual(len(probe_warnings), 1)
+
+    def test_auto_probe_failure_does_not_enable_fsdp(self):
+        args = self._from_dict_with_pipeline_config(
+            ZImagePipelineConfig(),
+            available_memory_gb={
+                0: 80,
+                1: AssertionError("Invalid device id"),
+            },
+            kwargs={
+                "model_path": "Tongyi-MAI/Z-Image",
+                "num_gpus": 2,
+                "performance_mode": "auto",
+            },
+        )
+
+        self.assertFalse(args.use_fsdp_inference)
+
+    def test_auto_probe_only_checks_local_devices_on_each_node(self):
+        args = self._from_dict_with_pipeline_config(
+            QwenImagePipelineConfig(),
+            available_memory_gb={0: 80, 1: 70},
+            kwargs={
+                "model_path": "Qwen/Qwen-Image",
+                "num_gpus": 4,
+                "nnodes": 2,
+                "node_rank": 0,
+                "dist_init_addr": "127.0.0.1:29500",
+                "tp_size": 4,
+                "performance_mode": "auto",
+            },
+        )
+
+        self.assertEqual(args.get_local_gpu_ids(), [0, 1])
 
     def test_auto_multi_gpu_qwen_keeps_vae_resident_with_headroom(self):
         args = self._from_dict_with_pipeline_config(
             QwenImagePipelineConfig(),
-            available_memory_gb={1: 72, 2: 80},
+            available_memory_gb={0: 72, 1: 80},
             kwargs={
                 "model_path": "Qwen/Qwen-Image",
-                "base_gpu_id": 1,
                 "num_gpus": 2,
                 "performance_mode": "auto",
             },
@@ -3135,6 +3175,35 @@ class TestPerRoleParallelism(unittest.TestCase):
     def test_gpu_ids_reject_duplicates(self):
         with self.assertRaisesRegex(ValueError, "duplicate GPU ids"):
             self._from_dict({"model_path": "/fake", "gpu_ids": ["0,1", "1"]})
+
+    def test_local_gpu_ids_follow_launch_topology(self):
+        args = self._from_dict({"model_path": "/fake"})
+        args.num_gpus = 4
+        args.nnodes = 2
+        args.base_gpu_id = 6
+
+        self.assertEqual(args.get_local_gpu_ids(), [0, 1])
+
+        from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
+
+        args.disagg_role = RoleType.DENOISER
+        args.nnodes = 1
+        args.num_gpus = 2
+        self.assertEqual(args.get_local_gpu_ids(), [6, 7])
+
+        args.gpu_ids = [1, 4]
+        self.assertEqual(args.get_local_gpu_ids(), [1, 4])
+
+    def test_disagg_gpu_ids_must_match_num_gpus(self):
+        args = self._from_dict({"model_path": "/fake"})
+
+        from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
+
+        args.disagg_role = RoleType.DENOISER
+        args.num_gpus = 2
+        args.gpu_ids = [3]
+        with self.assertRaisesRegex(ValueError, "--gpu-ids provides 1 devices"):
+            args._validate_parallelism()
 
     def test_pool_endpoints_use_role_and_scheduler_ports(self):
         args = self._from_dict(
