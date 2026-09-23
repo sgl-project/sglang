@@ -8,7 +8,11 @@ from typing import TYPE_CHECKING, Any, Callable, List, Optional, Tuple, Union
 import torch
 
 from sglang.srt.configs.load_config import LoadConfig
-from sglang.srt.model_loader.loader import DefaultModelLoader, get_model_loader
+from sglang.srt.model_loader.loader import (
+    DefaultModelLoader,
+    get_model_loader,
+    post_load_weights,
+)
 from sglang.srt.model_loader.utils import set_default_torch_dtype
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.platforms import current_platform
@@ -300,6 +304,18 @@ class WeightUpdater:
             group=self._model_update_group[group_name],
         )
         return bucket.reconstruct_tensors()
+
+    def begin_weight_update(self: WeightUpdater) -> None:
+        DefaultModelLoader.restore_weights_before_loading(
+            self.get_model(), torch.device(self.device)
+        )
+
+    def end_weight_update(self: WeightUpdater, *, run_post_load: bool) -> None:
+        if run_post_load:
+            post_load_weights(self.get_model())
+        DefaultModelLoader.postprocess_weights(
+            self.get_model(), torch.device(self.device)
+        )
 
     def load_weights_from_distributed(
         self: WeightUpdater, named_tensors: List[Tuple[str, torch.Tensor]]

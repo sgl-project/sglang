@@ -167,7 +167,6 @@ from sglang.srt.model_executor.runner import (
     EagerRunner,
     get_batch_sizes_to_capture,
 )
-from sglang.srt.model_loader.loader import DefaultModelLoader, post_load_weights
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import (
     assert_published,
@@ -2040,18 +2039,6 @@ class ModelRunner:
             forward_batch.top_logprobs_nums,
             forward_batch.token_ids_logprobs,
         )
-
-    def begin_weight_update(self) -> None:
-        """Restore in-place-packed weights to a loadable state."""
-        DefaultModelLoader.restore_weights_before_loading(
-            self.model, torch.device(self.device)
-        )
-
-    def end_weight_update(self, run_post_load: bool) -> None:
-        """Finalize quantized weights into kernel layout, after post_load_weights if requested."""
-        if run_post_load:
-            post_load_weights(self.model)
-        DefaultModelLoader.postprocess_weights(self.model, torch.device(self.device))
 
     def check_weights(
         self,

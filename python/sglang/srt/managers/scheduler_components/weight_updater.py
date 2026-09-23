@@ -295,7 +295,7 @@ class SchedulerWeightUpdaterManager:
             )
         self._session_selector = recv_req.selector
         for _, runner in self._select_runners(recv_req.selector):
-            runner.begin_weight_update()
+            runner.weight_updater.begin_weight_update()
         self._session_open = True
         self._session_loaded_weights = False
         torch.distributed.barrier(group=self.tp_cpu_group)
@@ -310,7 +310,7 @@ class SchedulerWeightUpdaterManager:
             )
         run_post_load = not self._session_loaded_weights
         for _, runner in self._select_runners(self._session_selector):
-            runner.end_weight_update(run_post_load=run_post_load)
+            runner.weight_updater.end_weight_update(run_post_load=run_post_load)
         self._session_open = False
         torch.distributed.barrier(group=self.tp_cpu_group)
         return EndWeightUpdateReqOutput(success=True, message="Success")

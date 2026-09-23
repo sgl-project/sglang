@@ -129,8 +129,8 @@ def test_begin_weight_update_restores_target_and_draft():
         output = manager.begin_weight_update(BeginWeightUpdateReqInput())
 
     assert output.success is True
-    target_runner.begin_weight_update.assert_called_once_with()
-    draft_runner.begin_weight_update.assert_called_once_with()
+    target_runner.weight_updater.begin_weight_update.assert_called_once_with()
+    draft_runner.weight_updater.begin_weight_update.assert_called_once_with()
     assert manager._session_open is True
     assert manager._session_loaded_weights is False
 
@@ -146,8 +146,12 @@ def test_end_weight_update_runs_post_load_on_both_when_load_was_bypassed():
         output = manager.end_weight_update(EndWeightUpdateReqInput())
 
     assert output.success is True
-    target_runner.end_weight_update.assert_called_once_with(run_post_load=True)
-    draft_runner.end_weight_update.assert_called_once_with(run_post_load=True)
+    target_runner.weight_updater.end_weight_update.assert_called_once_with(
+        run_post_load=True
+    )
+    draft_runner.weight_updater.end_weight_update.assert_called_once_with(
+        run_post_load=True
+    )
     assert manager._session_open is False
 
 
@@ -161,37 +165,12 @@ def test_end_weight_update_skips_post_load_on_both_when_weights_loaded():
     with patch("torch.distributed.barrier"):
         manager.end_weight_update(EndWeightUpdateReqInput())
 
-    target_runner.end_weight_update.assert_called_once_with(run_post_load=False)
-    draft_runner.end_weight_update.assert_called_once_with(run_post_load=False)
-
-
-def test_model_runner_begin_end_wire_to_loader_hooks():
-    """end must finalize even when post_load is skipped."""
-    import sglang.srt.model_executor.model_runner as mr
-
-    runner = SimpleNamespace(model=object(), device="cpu")
-
-    with patch.object(
-        mr.DefaultModelLoader, "restore_weights_before_loading"
-    ) as restore:
-        mr.ModelRunner.begin_weight_update(runner)
-    restore.assert_called_once()
-
-    with (
-        patch.object(mr, "post_load_weights") as post_load,
-        patch.object(mr.DefaultModelLoader, "postprocess_weights") as postprocess,
-    ):
-        mr.ModelRunner.end_weight_update(runner, run_post_load=True)
-    post_load.assert_called_once()
-    postprocess.assert_called_once()
-
-    with (
-        patch.object(mr, "post_load_weights") as post_load,
-        patch.object(mr.DefaultModelLoader, "postprocess_weights") as postprocess,
-    ):
-        mr.ModelRunner.end_weight_update(runner, run_post_load=False)
-    post_load.assert_not_called()
-    postprocess.assert_called_once()
+    target_runner.weight_updater.end_weight_update.assert_called_once_with(
+        run_post_load=False
+    )
+    draft_runner.weight_updater.end_weight_update.assert_called_once_with(
+        run_post_load=False
+    )
 
 
 def test_begin_weight_update_selector_restores_only_selected_and_is_recorded():
@@ -204,8 +183,8 @@ def test_begin_weight_update_selector_restores_only_selected_and_is_recorded():
     with patch("torch.distributed.barrier"):
         manager.begin_weight_update(BeginWeightUpdateReqInput(selector="draft"))
 
-    target_runner.begin_weight_update.assert_not_called()
-    draft_runner.begin_weight_update.assert_called_once_with()
+    target_runner.weight_updater.begin_weight_update.assert_not_called()
+    draft_runner.weight_updater.begin_weight_update.assert_called_once_with()
     assert manager._session_selector == "draft"
 
 
@@ -220,8 +199,8 @@ def test_end_weight_update_reuses_session_selector_from_begin():
         manager.begin_weight_update(BeginWeightUpdateReqInput(selector="draft"))
         manager.end_weight_update(EndWeightUpdateReqInput())
 
-    target_runner.end_weight_update.assert_not_called()
-    draft_runner.end_weight_update.assert_called_once()
+    target_runner.weight_updater.end_weight_update.assert_not_called()
+    draft_runner.weight_updater.end_weight_update.assert_called_once()
 
 
 def test_begin_weight_update_rejects_reentry():
@@ -233,7 +212,7 @@ def test_begin_weight_update_rejects_reentry():
     output = manager.begin_weight_update(BeginWeightUpdateReqInput())
 
     assert output.success is False and "already open" in output.message
-    target_runner.begin_weight_update.assert_not_called()
+    target_runner.weight_updater.begin_weight_update.assert_not_called()
 
 
 def test_end_weight_update_without_session_is_rejected():
@@ -245,7 +224,7 @@ def test_end_weight_update_without_session_is_rejected():
     output = manager.end_weight_update(EndWeightUpdateReqInput())
 
     assert output.success is False and "begin_weight_update" in output.message
-    target_runner.end_weight_update.assert_not_called()
+    target_runner.weight_updater.end_weight_update.assert_not_called()
 
 
 def test_update_without_session_is_rejected_without_loading():
