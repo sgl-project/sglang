@@ -892,8 +892,9 @@ class MqaAttentionBase(nn.Module):
 
         self.attn_sink = nn.Parameter(torch.empty(self.n_heads, dtype=torch.float32))
         self._attn_sink_local: Optional[torch.Tensor] = None
-        if _is_hip:
-            _hip.init_mqa_attention_base(self)
+        # gfx950: whether wo_b consumes the fp8-grid operand wo_a emits; resolved on
+        # first use, once the weights are loaded
+        self._wo_b_fp8_grid_operand: Optional[bool] = None
         if fuse:
             self.wqkv_a = ReplicatedLinear(
                 self.hidden_size,
@@ -1246,8 +1247,13 @@ class MQALayer(MqaAttentionBase):
             and self.wo_a.weight.shape == (self.n_local_groups * self.o_lora_rank, 4096)
             and (self.n_local_groups, self.o_lora_rank) == (2, 1024)
         )
-        if _is_hip:
-            _hip.init_mqa_layer(self, quant_config)
+        # gfx950 32-block route: q_norm also emits the fp8-grid operand of wq_b, and
+        # resolves on first use whether wq_b consumes native MXFP8
+        self.fused_rmsnorm_fake_quant = (
+            _is_hip and _hip.fused_rmsnorm_fake_quant_eligible(quant_config)
+        )
+        self._wq_b_native_consumer_checked = False
+        self._wq_b_native_consumer = None
 
         # KV cache write is always fused into the K kernel
         # (`_compute_kv_to_cache`), so the legacy "overlap store cache" flag
@@ -2811,8 +2817,21 @@ class DeepseekV4DecoderLayer(nn.Module):
         self.hc_pre_from_prev_sublayer = config.hc_pre_from_prev_sublayer
         if self.hc_pre_from_prev_sublayer:
             self.use_fused_mhc_post_pre = False
-        if _is_hip:
-            _hip.init_decoder_layer(self, quant_config)
+        # gfx950: input_layernorm also emits the pre-quantized operand of the dense
+        # projections, and resolves on first use whether wqkv_a consumes native MXFP8
+        self.fused_rmsnorm_fp8_quant = (
+            _is_hip and _hip.fused_rmsnorm_fp8_quant_eligible(quant_config)
+        )
+        self.fused_rmsnorm_fake_quant = (
+            _is_hip and _hip.fused_rmsnorm_fake_quant_eligible(quant_config)
+        )
+        self._wqkv_a_native_consumer_checked = False
+        self._wqkv_a_native_consumer = None
+        # ROCm: hc_post, pre-collapse and mixing stats in one launch; the kernel only
+        # supports hc_mult 4
+        self.hc_boundary_fused = (
+            _is_hip and self.hc_pre_from_prev_sublayer and self.hc_mult == 4
+        )
         self.engram = None
         if engram_layout is not None and layer_id in engram_layout.layer_ids:
             self.engram = Engram(

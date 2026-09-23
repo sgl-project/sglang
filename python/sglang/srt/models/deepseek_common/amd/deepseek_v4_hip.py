@@ -25,18 +25,14 @@ from sglang.srt.models.deepseek_common.amd.deepseek_v4_fused_mhc import (
     forward_hc_pre_from_prev_fused_boundary,
 )
 
+fused_rmsnorm_fake_quant_eligible = gfx95_dense.fused_rmsnorm_fake_quant_eligible
+fused_rmsnorm_fp8_quant_eligible = gfx95_dense.fused_rmsnorm_fp8_quant_eligible
 live_rows = gfx95_dense.live_rows
 wo_a_fp8_grid_matmul = gfx95_dense.wo_a_fp8_grid_matmul
 wo_b_takes_fp8_grid = gfx95_dense.wo_b_takes_fp8_grid
 
 
 # ---- MqaAttentionBase / MQALayer ----
-
-
-def init_mqa_attention_base(attn) -> None:
-    # resolved on first use by `wo_b_takes_fp8_grid`, once the weights are loaded
-    attn._wo_b_fp8_grid_checked = False
-    attn._wo_b_fp8_grid_operand = False
 
 
 def use_fused_qk_norm_rope(attn, quant_config) -> bool:
@@ -47,15 +43,6 @@ def use_fused_qk_norm_rope(attn, quant_config) -> bool:
         and isinstance(quant_config, Fp8Config)
         and quant_config.weight_block_size == [128, 128]
     )
-
-
-def init_mqa_layer(attn, quant_config) -> None:
-    # gfx950 32-block route: `q_norm` also emits the fp8-grid operand of `wq_b`
-    attn.fused_rmsnorm_fake_quant = gfx95_dense.fused_rmsnorm_fake_quant_eligible(
-        quant_config
-    )
-    attn._wq_b_native_consumer_checked = False
-    attn._wq_b_native_consumer = None
 
 
 def q_norm_for_wq_b(attn, q_lora: torch.Tensor) -> Tuple[torch.Tensor, object]:
@@ -105,19 +92,6 @@ def attention_inv_rope(
 
 
 # ---- DeepseekV4DecoderLayer ----
-
-
-def init_decoder_layer(layer, quant_config) -> None:
-    layer.fused_rmsnorm_fp8_quant = gfx95_dense.fused_rmsnorm_fp8_quant_eligible(
-        quant_config
-    )
-    layer.fused_rmsnorm_fake_quant = gfx95_dense.fused_rmsnorm_fake_quant_eligible(
-        quant_config
-    )
-    layer._wqkv_a_native_consumer_checked = False
-    layer._wqkv_a_native_consumer = None
-    # hc_post, pre-collapse and mixing stats in one launch; the kernel only supports hc_mult 4
-    layer.hc_boundary_fused = layer.hc_pre_from_prev_sublayer and layer.hc_mult == 4
 
 
 def input_norm(

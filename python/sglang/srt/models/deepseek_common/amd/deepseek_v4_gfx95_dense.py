@@ -212,7 +212,7 @@ def live_rows(activation, num_tokens: int):
 def wo_b_takes_fp8_grid(attn) -> bool:
     """Whether ``attn.wo_b`` consumes an ``Fp8GridActivation``, which the ``wo_a`` GEMM
     then emits from its epilogue; resolved on first use, once the weights are loaded."""
-    if not attn._wo_b_fp8_grid_checked:
+    if attn._wo_b_fp8_grid_operand is None:
         from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
 
         quant_method = getattr(attn.wo_b, "quant_method", None)
@@ -223,7 +223,6 @@ def wo_b_takes_fp8_grid(attn) -> bool:
             and attn.wo_b.block_fp8_mxfp8_ready
             and quant_method.mxfp8_dense_backend.takes_fp8_grid_activation()
         )
-        attn._wo_b_fp8_grid_checked = True
     return attn._wo_b_fp8_grid_operand
 
 
