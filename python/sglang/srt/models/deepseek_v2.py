@@ -947,8 +947,9 @@ class DeepseekV2MoE(nn.Module):
             else None
         )
         use_vision_topk = self.gate.e_score_correction_bias_vl is not None
-        # TODO: not ROCm-specific; propose for dev as its own PR
-        # image tokens exist only in extend batches with images; other batches take the fused top-k
+        # image tokens exist only in extend batches with images; other batches take
+        # the fused top-k. Not ROCm-specific: kevin-mii/sglang branch
+        # vision-topk-extend-only carries the platform-wide form for its own PR.
         if use_vision_topk and _is_hip and forward_batch is not None:
             use_vision_topk = (
                 forward_batch.forward_mode.is_extend()
