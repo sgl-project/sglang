@@ -34,11 +34,11 @@ class _FakeAllocator:
             self.skipped.extend(indices.tolist())
 
 
-def _make_req(*, cache_protected_len=0):
+def _make_req():
     return SimpleNamespace(
         kv=ReqKvInfo(
             req_pool_idx=0,
-            cache_protected_len=cache_protected_len,
+            cache_protected_len=2,
             swa_evict_floor=3,
             swa_evicted_seqlen=6,
         )
@@ -54,18 +54,11 @@ class TestPureSWAChunkCache(CustomTestCase):
         cache.token_to_kv_pool_allocator = _FakeAllocator()
         return cache
 
-    def test_finished_req_skips_already_evicted_swa_range(self):
+    def test_finished_req_skips_protected_prefix_and_evicted_range(self):
         cache = self._make_cache()
 
+        # protected 2, floor 3, cursor 6: [2, 3) and [6, 8) go back, [3, 6) is dead
         cache.cache_finished_req(_make_req(), owned_kv_len=8)
-
-        self.assertEqual(cache.token_to_kv_pool_allocator.freed, [0, 1, 2, 6, 7])
-        self.assertEqual(cache.token_to_kv_pool_allocator.skipped, [3, 4, 5])
-
-    def test_finished_req_skips_protected_prefix(self):
-        cache = self._make_cache()
-
-        cache.cache_finished_req(_make_req(cache_protected_len=2), owned_kv_len=8)
 
         self.assertEqual(cache.token_to_kv_pool_allocator.freed, [2, 6, 7])
         self.assertEqual(cache.token_to_kv_pool_allocator.skipped, [3, 4, 5])

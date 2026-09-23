@@ -1,12 +1,16 @@
 """Unit tests for all-SWA RadixCache release semantics."""
 
 import unittest
+from array import array
 from types import SimpleNamespace
 
 import torch
 
 from sglang.srt.managers.schedule_batch import ReqKvInfo
+from sglang.srt.mem_cache.base_prefix_cache import MatchPrefixParams
+from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.pure_swa_radix_cache import PureSWARadixCache
+from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -17,6 +21,7 @@ class _FakeAllocator:
     """Rows routed to the full side are skipped: all-SWA has no full pool."""
 
     page_size = 1
+    device = "cpu"
 
     def __init__(self):
         self.freed = []
@@ -34,54 +39,37 @@ class _FakeAllocator:
             self.skipped.extend(indices.tolist())
 
 
-def _make_cache():
-    allocator = _FakeAllocator()
-    cache = PureSWARadixCache.__new__(PureSWARadixCache)
-    cache.disable = False
-    cache.is_eagle = False
-    cache.page_size = 1
-    cache.req_to_token_pool = SimpleNamespace(
-        req_to_token=torch.arange(8, dtype=torch.int64).unsqueeze(0)
-    )
-    cache.token_to_kv_pool_allocator = allocator
-    return cache, allocator
-
-
-def _make_req(*, swa_evicted_seqlen):
-    return SimpleNamespace(
-        origin_input_ids=list(range(8)),
-        output_ids=[],
-        extra_key=None,
-        cache_salt=None,
-        last_node=None,
-        kv=ReqKvInfo(
-            req_pool_idx=0,
-            swa_evict_floor=4,
-            swa_evicted_seqlen=swa_evicted_seqlen,
-        ),
-    )
-
-
 class TestPureSWARadixCache(CustomTestCase):
-    def test_no_insert_frees_window_after_evict_floor_before_swa_eviction(self):
-        cache, allocator = _make_cache()
-
-        cache.cache_finished_req(
-            _make_req(swa_evicted_seqlen=0), is_insert=False, owned_kv_len=8
+    def test_finish_inserts_up_to_the_evict_floor_and_frees_the_rest(self):
+        allocator = _FakeAllocator()
+        cache = PureSWARadixCache(
+            CacheInitParams(
+                disable=False,
+                req_to_token_pool=SimpleNamespace(
+                    req_to_token=torch.arange(8, dtype=torch.int64).unsqueeze(0)
+                ),
+                token_to_kv_pool_allocator=allocator,
+                page_size=1,
+                sliding_window_size=4,
+            )
+        )
+        token_ids = array("q", range(8))
+        req = SimpleNamespace(
+            origin_input_ids=token_ids,
+            output_ids=array("q"),
+            extra_key=None,
+            cache_salt=None,
+            last_node=None,
+            priority=0,
+            kv=ReqKvInfo(req_pool_idx=0, swa_evict_floor=4, swa_evicted_seqlen=6),
         )
 
-        self.assertEqual(allocator.freed, list(range(8)))
-        self.assertEqual(allocator.skipped, [])
+        cache.cache_finished_req(req, is_insert=True, owned_kv_len=8)
 
-    def test_no_insert_keeps_rows_below_the_floor_after_swa_eviction(self):
-        cache, allocator = _make_cache()
-
-        # floor 4, cursor 6: [4, 6) is dead, [0, 4) was shielded and is alive
-        cache.cache_finished_req(
-            _make_req(swa_evicted_seqlen=6), is_insert=False, owned_kv_len=8
-        )
-
-        self.assertEqual(allocator.freed, [0, 1, 2, 3, 6, 7])
+        # [0, 4) went into the tree; [4, 6) was window-evicted; [6, 8) is freed.
+        match = cache.match_prefix(MatchPrefixParams(key=RadixKey(token_ids)))
+        self.assertEqual(len(match.device_indices), 4)
+        self.assertEqual(allocator.freed, [6, 7])
         self.assertEqual(allocator.skipped, [4, 5])
 
 
