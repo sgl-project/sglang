@@ -295,10 +295,6 @@ set(SOURCES
     "csrc/moe/prepare_moe_input.cu"
 
     "csrc/quantization/gguf/gguf_kernel.cu"
-    "csrc/speculative/eagle_utils.cu"
-    "csrc/speculative/ngram_utils.cu"
-    "csrc/speculative/packbit.cu"
-    "csrc/speculative/speculative_sampling.cu"
 
     "${repo-flashinfer_SOURCE_DIR}/csrc/norm.cu"
     "${repo-flashinfer_SOURCE_DIR}/csrc/renorm.cu"
