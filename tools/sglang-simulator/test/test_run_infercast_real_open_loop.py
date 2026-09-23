@@ -63,9 +63,7 @@ def test_group_same_timestamp_requests_preserves_indices_and_time_order():
 
 class _StreamingContent:
     def __init__(self, events):
-        self.lines = iter(
-            [f"data: {json.dumps(event)}\n".encode() for event in events]
-        )
+        self.lines = iter([f"data: {json.dumps(event)}\n".encode() for event in events])
 
     def __aiter__(self):
         return self
@@ -124,6 +122,7 @@ def test_send_request_group_uses_native_batch_and_demultiplexes_stream():
     assert [item.output_length for item in measurements] == [3, 3]
     assert [item.cached_tokens for item in measurements] == [63, 127]
     assert all(len(item.itl_ms) == 2 for item in measurements)
+
 
 def test_summarize_keeps_failures_out_of_latency_statistics():
     summary = MODULE.summarize(

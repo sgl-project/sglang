@@ -96,9 +96,8 @@ def main() -> None:
     repository_root = Path(__file__).resolve().parents[3]
     sys.path.insert(0, str(repository_root))
 
-    from sglang.srt.server_args import ServerArgs
-
     from benchmark.simulator.bench_runner import SGLangBenchmarkRunner
+    from sglang.srt.server_args import ServerArgs
 
     dataset = load_trace(trace_path)
     warmup_dataset = (

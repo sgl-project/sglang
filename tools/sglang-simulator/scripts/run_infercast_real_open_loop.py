@@ -109,8 +109,7 @@ async def flush_cache(
             return payload
         if status != 400 or time.monotonic() >= deadline:
             raise RuntimeError(
-                f"flush_cache failed after {attempts} attempt(s) "
-                f"({status}): {body}"
+                f"flush_cache failed after {attempts} attempt(s) ({status}): {body}"
             )
         await asyncio.sleep(retry_interval_seconds)
 
@@ -212,8 +211,7 @@ async def send_request_group(
                     meta.get("cached_tokens") or state["cached_tokens"]
                 )
                 state["cached_tokens_details"] = (
-                    meta.get("cached_tokens_details")
-                    or state["cached_tokens_details"]
+                    meta.get("cached_tokens_details") or state["cached_tokens_details"]
                 )
                 completion_tokens = int(meta.get("completion_tokens") or 0)
                 if completion_tokens <= state["output_length"]:

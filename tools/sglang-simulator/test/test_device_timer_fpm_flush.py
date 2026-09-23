@@ -5,7 +5,14 @@ from types import ModuleType, SimpleNamespace
 
 import pytest
 
-_SOURCE = Path(__file__).parents[3] / "python" / "sglang" / "srt" / "utils" / "device_timer.py"
+_SOURCE = (
+    Path(__file__).parents[3]
+    / "python"
+    / "sglang"
+    / "srt"
+    / "utils"
+    / "device_timer.py"
+)
 _INSERTED_TORCH_STUB = "torch" not in sys.modules
 if _INSERTED_TORCH_STUB:
     _TORCH = ModuleType("torch")
