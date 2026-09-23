@@ -331,7 +331,9 @@ class MiMoVisionTransformer(nn.Module):
 
     def _post_init(self):
         for name, param in self.named_parameters():
-            if "bias" in name:
+            # Also zero sinks: they are torch.empty at ctor and some checkpoints
+            # omit individual visual.blocks.*.attn.sinks keys.
+            if "bias" in name or name.endswith("sinks"):
                 param.data.zero_()
 
     def get_window_index_1d(self, grid_thw, col=True):
