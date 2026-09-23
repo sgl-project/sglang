@@ -18,11 +18,18 @@ from sglang.kernels.ops.attention.dsv4.elementwise import (
     fused_rope_inplace,
 )
 from sglang.kernels.ops.attention.dsv4.kv_layout import KVLayout
+from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
+    DeepSeekV4TokenToKVPool,
+)
+from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 from sglang.srt.utils import is_gfx95_supported, is_hip
 from sglang.test import dsv41_kv_quant_reference as tq
-from sglang.test.ci.ci_register import register_amd_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
+# the V4.1 store kernels are the SM100 / gfx950 JIT kernels; the only Blackwell runner
+# config is the four-GPU one
+register_cuda_ci(est_time=60, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
 register_amd_ci(est_time=25, suite="stage-b-kernel-test-1-gpu-amd-mi35x")
 
 REFERENCE = {
@@ -87,8 +94,43 @@ def reference_pages(layout, page_size, num_pages, locs, values, page_bytes):
     return REFERENCE[layout](full, page_bytes=page_bytes)
 
 
+def _make_pool(ratios, kv_source_layers, kv_layout, compressed_kv_layout=None, **sizes):
+    return DeepSeekV4TokenToKVPool(
+        max_num_reqs=16,
+        swa_size=FULL_SIZE,
+        c4_size=sizes.get("c4_size", 0),
+        c128_size=sizes.get("c128_size", 0),
+        c4_state_pool_size=sizes.get("c4_state_pool_size", 0),
+        c128_state_pool_size=sizes.get("c128_state_pool_size", 0),
+        page_size=PAGE_SIZE,
+        swa_page_size=PAGE_SIZE,
+        dtype=torch.float8_e4m3fn,
+        c4_state_dtype=torch.float32,
+        c128_state_dtype=torch.float32,
+        qk_nope_head_dim=HEAD_DIM - ROPE_DIM,
+        qk_rope_head_dim=ROPE_DIM,
+        indexer_head_dim=128,
+        layer_num=len(ratios),
+        device="cuda",
+        enable_memory_saver=False,
+        compression_ratios=ratios,
+        kv_source_layers=kv_source_layers,
+        full_size=FULL_SIZE,
+        kv_layout=kv_layout,
+        compressed_kv_layout=compressed_kv_layout,
+    )
+
+
+def _v41_store_kernels_available() -> bool:
+    if not torch.cuda.is_available():
+        return False
+    if is_hip():
+        return is_gfx95_supported()
+    return torch.cuda.get_device_capability()[0] >= 10
+
+
 @unittest.skipUnless(
-    is_hip() and is_gfx95_supported(), "V4.1 HIP KV stores require gfx950"
+    _v41_store_kernels_available(), "the V4.1 store kernels need gfx950 or SM100"
 )
 class TestV41KVStore(CustomTestCase):
     def assert_tokens_equal(self, cache, ref, layout, page_size, locs):
@@ -577,6 +619,9 @@ class TestV41KVDequant(CustomTestCase):
 
 
 HEAD_DIM, ROPE_DIM, NOPE_DIM = 512, 64, 448
+# the pool under test: one page size for the SWA and the compressed caches
+PAGE_SIZE = 256
+FULL_SIZE = 4 * PAGE_SIZE
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "needs a GPU")
@@ -650,6 +695,75 @@ class TestFusedKNormRopeFlashMLA(CustomTestCase):
                 self.assertTrue(torch.equal(got, expected))
                 self.assertTrue(torch.equal(got[..., :NOPE_DIM], q[..., :NOPE_DIM]))
                 self.assertTrue(torch.equal(cache_q, cache))
+
+
+@unittest.skipUnless(
+    _v41_store_kernels_available(), "the V4.1 store kernels need gfx950 or SM100"
+)
+class TestV41KVPoolWriters(CustomTestCase):
+    """The pool hands its fused writers the layout, page size and slots: a wrong
+    hand-off escapes every kernel-level case above."""
+
+    @classmethod
+    def setUpClass(cls):
+        set_global_server_args_for_scheduler(
+            ServerArgs(model_path="dummy", page_size=PAGE_SIZE)
+        )
+
+    def test_fused_writers_round_trip(self):
+        """SWA write (fp8) and compressed write with in-kernel RoPE (fp4) read back
+        through the layout-aware dequant as the reference values."""
+        from sglang.kernels.ops.attention.dsv4.dequant_k_cache import (
+            dequantize_k_cache_paged,
+        )
+        from sglang.srt.layers.attention.dsv4.dsv41_sparse import rope_tail
+
+        pool = _make_pool([0, 0, 2, 1], [2, 3], KVLayout.V41)
+        g = torch.Generator(device="cuda").manual_seed(3)
+        n = 100
+        # SWA: finished (normed, rotated) bf16 rows.
+        x = torch.randn(n, HEAD_DIM, generator=g, device="cuda", dtype=torch.bfloat16)
+        swa_loc = torch.randperm(FULL_SIZE, generator=g, device="cuda")[:n].to(
+            torch.int32
+        )
+        pool.set_swa_key_buffer_radix_fused(layer_id=0, swa_loc=swa_loc, cache_k=x)
+        got = dequantize_k_cache_paged(
+            pool.get_swa_key_buffer_radix(0),
+            swa_loc,
+            pool.swa_page_size,
+            layout=pool.get_swa_key_layout(),
+        )
+        ref = tq.dequantize_k_cache_v41(
+            tq.quantize_k_cache_v41(x.view(1, n, HEAD_DIM)), n
+        ).view(n, 1, HEAD_DIM)
+        self.assertTrue(torch.equal(got, ref))
+        # Compressed (fp4): the un-rotated latent plus its freqs; the cache holds
+        # exactly fake_quant_compressed_kv(rope_tail(latent)).
+        layer_id = pool.sources_by_ratio[1][0]
+        latent = torch.randn(
+            n, HEAD_DIM, generator=g, device="cuda", dtype=torch.bfloat16
+        )
+        angles = torch.randn(n, ROPE_DIM // 2, generator=g, device="cuda")
+        freqs = torch.polar(torch.ones_like(angles), angles)
+        loc = torch.randperm(FULL_SIZE, generator=g, device="cuda")[:n].to(torch.int64)
+        pool.set_extra_key_buffer_fused(
+            layer_id=layer_id, loc=loc, cache_k=latent, freqs_cis=freqs
+        )
+        got = dequantize_k_cache_paged(
+            pool.get_extra_key_buffer(layer_id),
+            loc,
+            pool.get_extra_key_page_size(layer_id),
+            layout=pool.get_extra_key_layout(layer_id),
+        )
+        self.assertTrue(
+            torch.equal(
+                got.squeeze(1),
+                tq.fake_quant_compressed_kv(rope_tail(latent, freqs, ROPE_DIM)),
+            )
+        )
+        # The (fp8 nope, bf16 rope) pack writer is the V4 layout only.
+        with self.assertRaises(AssertionError):
+            pool.set_swa_key_buffer(0, swa_loc, None)
 
 
 if __name__ == "__main__":

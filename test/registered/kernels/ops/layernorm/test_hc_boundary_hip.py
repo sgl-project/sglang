@@ -10,9 +10,12 @@ from sglang.kernels.ops.layernorm.mhc import (
     hc_mix_stats_sinkhorn,
 )
 from sglang.srt.utils import is_hip
-from sglang.test.ci.ci_register import register_amd_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
+# the mixing-stats + sinkhorn launch is the generic Triton kernel the model uses on
+# every platform; the boundary classes below are ROCm only
+register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-large")
 register_amd_ci(est_time=25, suite="stage-b-kernel-test-1-gpu-amd-mi35x")
 
 
@@ -63,7 +66,7 @@ def _boundary_inputs(m, seed, hc_fn, hc_scale, hc_base):
     return x, residual, post_in, comb_in, pre_prev
 
 
-@unittest.skipUnless(_IS_HIP, "HIP mHC reduction")
+@unittest.skipUnless(torch.cuda.is_available(), "mHC reduction kernel")
 class TestHcMixStatsSinkhorn(CustomTestCase):
     def test_matches_reference_and_is_invariant(self):
         hc_fn, hc_scale, hc_base = _params("cuda")

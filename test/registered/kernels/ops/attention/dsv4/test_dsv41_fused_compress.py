@@ -382,7 +382,6 @@ class TestFusedLowRatioCompress(CustomTestCase):
         self._check_step(t, 2)
         self.assertTrue(torch.equal(state, expected_state))
 
-    @unittest.skipUnless(is_hip(), "HIP fused compressor regression")
     def test_static_verify_dispatch_and_real_pool_writes(self):
         from sglang.kernels.ops.attention.dsv4.low_ratio_compress import (
             c2_decode_norm_rope_store,
