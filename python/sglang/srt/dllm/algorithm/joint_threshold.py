@@ -134,7 +134,6 @@ class JointThreshold(DllmAlgorithm):
 
     def init_step_state(self, forward_batch: ForwardBatch) -> List[Any]:
         batch_size = forward_batch.batch_size
-        input_ids = forward_batch.input_ids.view(batch_size, self.block_size)
         # Built once as a GPU tensor and reused across steps (no per-step
         # host/device transfer); the FDFO carry keeps it in-process.
         prompt_mask = self._prompt_mask(forward_batch)

@@ -146,6 +146,18 @@ def _from_dict_without_model_resolution(
         return ServerArgs.from_dict(kwargs)
 
 
+class TestPlatformLifecycleHooks(unittest.TestCase):
+    def test_server_args_applies_platform_defaults(self):
+        with patch.object(
+            current_platform, "apply_server_args_defaults"
+        ) as apply_defaults:
+            server_args = _from_dict_without_model_resolution(
+                {"model_path": "test/model"}
+            )
+
+        apply_defaults.assert_called_once_with(server_args)
+
+
 class TestServerArgsPathExpansion(unittest.TestCase):
     def _from_dict_without_model_resolution(self, kwargs):
         return _from_dict_without_model_resolution(kwargs)
@@ -3400,5 +3412,108 @@ class TestDirectGpuWeightLoading(unittest.TestCase):
                 tp_args._validate_direct_gpu_weight_loading()
 
 
+class TestLayerwiseResidencyLifetime(unittest.TestCase):
+    def _help_by_option(self):
+        parser = FlexibleArgumentParser()
+        ServerArgs.add_cli_args(parser)
+        return {
+            action.option_strings[0]: (action.help or "")
+            for action in parser._actions
+            if action.option_strings
+        }
+
+    def test_cli_accepts_the_two_lifetimes_and_rejects_others(self):
+        parser = FlexibleArgumentParser()
+        ServerArgs.add_cli_args(parser)
+        args = parser.parse_args(
+            ["--model-path", "/fake", "--dit-layerwise-residency-lifetime", "permanent"]
+        )
+        self.assertEqual(args.dit_layerwise_residency_lifetime, "permanent")
+        self.assertEqual(
+            parser.parse_args(
+                ["--model-path", "/fake"]
+            ).dit_layerwise_residency_lifetime,
+            "forward",
+        )
+        with self.assertRaises(SystemExit):
+            parser.parse_args(
+                [
+                    "--model-path",
+                    "/fake",
+                    "--dit-layerwise-residency-lifetime",
+                    "sometimes",
+                ]
+            )
+
+    def test_python_api_rejects_an_unknown_lifetime(self):
+        # argparse choices cover the CLI only; ServerArgs is also built directly.
+        with self.assertRaisesRegex(ValueError, "dit-layerwise-residency-lifetime"):
+            _from_dict_without_model_resolution(
+                {
+                    "model_path": "/data/my-model",
+                    "dit_layerwise_residency_lifetime": "sometimes",
+                }
+            )
+
+    def test_help_says_when_layers_are_placed_and_released(self):
+        """A user reads these to decide between the two; both answers must be there."""
+        help_by_option = self._help_by_option()
+        dit_help = help_by_option["--dit-layerwise-residency-lifetime"]
+        for claim in (
+            "'forward' (default)",
+            "'permanent'",
+            "load time",
+            "never released",
+        ):
+            self.assertIn(claim, dit_help)
+        per_component_help = help_by_option["--layerwise-residency-lifetime"]
+        for claim in ("transformer=permanent", "never releases"):
+            self.assertIn(claim, per_component_help)
+        # The resident-layer flags point at the lifetime knob instead of
+        # describing a lifetime of their own.
+        self.assertIn(
+            "--dit-layerwise-residency-lifetime",
+            help_by_option["--dit-layerwise-resident-layers"],
+        )
+        self.assertIn(
+            "--layerwise-residency-lifetime",
+            help_by_option["--layerwise-resident-layers"],
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
+
+
+def test_resident_layer_help_describes_the_actual_scope():
+    """The two resident-layer flags used to promise something they do not do.
+
+    `--dit-layerwise-resident-layers` said the layers were "permanently resident
+    on GPU" and `--layerwise-resident-layers` said they were "transferred once at
+    startup", with an auxiliary component that runs once per request still
+    benefiting. The resident set is released when a use ends, so a component
+    whose use is one forward pass re-transfers all of it every request --
+    measured on Qwen-Image-2.1, `text_encoder=0.8` reports `resident=53/66` and
+    changes neither memory nor latency.
+
+    Pinned here because a help string is exactly the kind of claim that drifts
+    back when someone edits nearby.
+    """
+    parser = FlexibleArgumentParser()
+    ServerArgs.add_cli_args(parser)
+    help_by_option = {
+        action.option_strings[0]: (action.help or "")
+        for action in parser._actions
+        if action.option_strings
+    }
+
+    dit_help = help_by_option["--dit-layerwise-resident-layers"]
+    assert "permanently resident" not in dit_help
+    assert "once per request" in dit_help
+    assert "life of the server" in dit_help
+
+    per_component_help = help_by_option["--layerwise-resident-layers"]
+    assert "once at startup" not in per_component_help
+    assert "still benefits" not in per_component_help
+    assert "once per request" in per_component_help
+    assert "has no effect" in per_component_help
