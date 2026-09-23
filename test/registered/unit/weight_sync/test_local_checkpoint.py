@@ -11,6 +11,7 @@ import zstandard
 
 from sglang.srt.weight_sync import local_checkpoint
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=6, suite="base-a-test-cpu")
 
@@ -95,7 +96,7 @@ def _write_delta_version(
         )
 
 
-class TestLocalCheckpointPull(unittest.TestCase):
+class TestLocalCheckpointPull(CustomTestCase):
     V0 = {"a": bytes(range(16)), "b": b"\x10" * 8}
     V1 = {"a": bytes(range(16, 32)), "b": b"\x10" * 8}
     V2 = {"a": bytes(range(16, 32)), "b": b"\x10\x11\x10\x10\x10\x10\x22\x10"}
