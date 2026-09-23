@@ -12,7 +12,7 @@ use sgl_router::discovery::{ModelId, WorkerId, WorkerSpec};
 use sgl_router::policies::prefix_provider::RadixTreePrefixProvider;
 use sgl_router::policies_reorg::admission::{Decision, EngineAdmission, EngineMetrics};
 use sgl_router::policies_reorg::cache_aware::{CacheAwarePolicy, CacheSource, PrefixMemo};
-use sgl_router::policies_reorg::power_of_two::PowerOfTwoPolicy;
+use sgl_router::policies_reorg::power_of_n::PowerOfNPolicy;
 use sgl_router::policies_reorg::{PickError, PickRequest, Policy, Stage};
 use sgl_router::state::kv_events::{
     compute_block_hashes, compute_block_hashes_bigram, BlockSizeOracle, HashTree, KvWorkerId,
@@ -549,7 +549,7 @@ async fn decode_group_and_invalid_configuration_are_rejected() {
             },
         )
     };
-    let load = Arc::new(PowerOfTwoPolicy::new(EngineReportedLoadTable::new()));
+    let load = Arc::new(PowerOfNPolicy::new(EngineReportedLoadTable::new()));
     assert!(matches!(
         BucketResolver::new(vec![pd(load.clone(), policy.clone())]),
         Err(PickError::InvalidConfiguration(_))

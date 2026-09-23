@@ -134,6 +134,7 @@ async fn static_urls_pd_role_resolved_end_to_end() {
             disable_input_ids_forwarding: false,
             policy: sgl_router::config::PolicyKind::RoundRobin,
             decode_policy: Default::default(),
+            power_of_n_choices: 2,
             bucket_config: None,
             circuit_breaker: None,
             cache_aware: None,

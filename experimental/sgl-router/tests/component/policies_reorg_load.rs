@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 use sgl_router::discovery::{ModelId, WorkerId, WorkerSpec};
 use sgl_router::policies_reorg::admission::{Decision, EngineAdmission, EngineMetrics};
-use sgl_router::policies_reorg::power_of_two::PowerOfTwoPolicy;
+use sgl_router::policies_reorg::power_of_n::PowerOfNPolicy;
 use sgl_router::policies_reorg::{PickError, PickRequest, Policy, Stage};
 use sgl_router::state::load_monitor::engine_reported_load::{EngineReportedLoadTable, LoadStat};
 use sgl_router::workers::Worker;
@@ -67,7 +67,7 @@ async fn selected_load_reaches_admission_and_next_pick_reads_fresh_state() {
         table: table.clone(),
         observations: Mutex::default(),
     });
-    let mut policy = PowerOfTwoPolicy::new(table);
+    let mut policy = PowerOfNPolicy::new(table);
     policy.admission = admission.clone();
     let model = ModelId("m".into());
     let request = PickRequest::new(&model, Stage::Plain, 10);
@@ -118,7 +118,7 @@ async fn missing_stale_and_incomplete_reports_reach_admission_as_unknown() {
             table: table.clone(),
             observations: Mutex::default(),
         });
-        let mut policy = PowerOfTwoPolicy::new(table);
+        let mut policy = PowerOfNPolicy::new(table);
         policy.admission = admission.clone();
         let model = ModelId("m".into());
         policy

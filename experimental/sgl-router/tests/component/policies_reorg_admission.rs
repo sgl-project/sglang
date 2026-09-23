@@ -9,7 +9,7 @@ use sgl_router::discovery::{ModelId, WorkerId, WorkerSpec};
 use sgl_router::policies_reorg::admission::{
     AdmissionLimits, Decision, EngineAdmission, EngineMetrics,
 };
-use sgl_router::policies_reorg::power_of_two::PowerOfTwoPolicy;
+use sgl_router::policies_reorg::power_of_n::PowerOfNPolicy;
 use sgl_router::policies_reorg::{PickError, PickRequest, Policy, Stage};
 use sgl_router::state::load_monitor::engine_reported_load::{
     EngineReportedLoadTable, LoadStat, NativeCacheRankLoad,
@@ -148,7 +148,7 @@ async fn metrics_come_from_the_selection_snapshot_and_live_inflight_count() {
         (Some(1), None, None)
     );
 
-    let mut policy = PowerOfTwoPolicy::new(table.clone());
+    let mut policy = PowerOfNPolicy::new(table.clone());
     policy.admission = Arc::new(AdmissionLimits {
         max_running_requests: Some(2),
         max_kv_tokens: Some(100),

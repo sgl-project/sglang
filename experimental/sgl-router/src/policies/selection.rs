@@ -818,7 +818,7 @@ mod tests {
     ) -> PrefillSelectionInputs<'a> {
         PrefillSelectionInputs {
             policy,
-            policy_kind: PolicyKind::PowerOfTwo,
+            policy_kind: PolicyKind::PowerOfN,
             bucket_selector,
             metrics,
             model_id,
@@ -847,7 +847,7 @@ mod tests {
         request_input_tokens: u64,
     ) -> DecodeSelectionInputs<'a> {
         DecodeSelectionInputs {
-            decode_policy_kind: DecodePolicyKind::PowerOfTwo,
+            decode_policy_kind: DecodePolicyKind::PowerOfN,
             bucket_selector,
             model_id,
             prefill_url: "http://prefill:30000",

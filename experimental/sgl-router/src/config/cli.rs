@@ -168,18 +168,22 @@ pub struct RoutingArgs {
     #[arg(long, value_enum, default_value = "legacy")]
     pub chat_routing: ChatRoutingKind,
 
-    /// Routing policy (defaults to power_of_two with reorg routing).
+    /// Routing policy (defaults to power_of_n with reorg routing).
     #[arg(
         long,
         value_enum,
         default_value = "round_robin",
-        default_value_if("chat_routing", "reorg", "power_of_two")
+        default_value_if("chat_routing", "reorg", "power_of_n")
     )]
     pub policy: PolicyKind,
 
     /// Policy used to select decode workers for PD requests.
-    #[arg(long, value_enum, default_value = "power_of_two")]
+    #[arg(long, value_enum, default_value = "power_of_n")]
     pub decode_policy: DecodePolicyKind,
+
+    /// Reorg power-of-N sample size, including decode and fallbacks (default: 2).
+    #[arg(long)]
+    pub power_of_n_choices: Option<std::num::NonZeroUsize>,
 
     /// Static P/D bucket configuration. Omit to use the global candidate domain.
     #[arg(long)]
@@ -342,6 +346,11 @@ pub struct AffinityArgs {
 impl Cli {
     /// Resolve CLI options and validate the resulting configuration.
     pub fn into_config(self) -> Result<Config> {
+        ensure!(
+            self.routing.power_of_n_choices.is_none()
+                || self.routing.chat_routing == ChatRoutingKind::Reorg,
+            "--power-of-n-choices requires --chat-routing reorg"
+        );
         if self.routing.chat_routing == ChatRoutingKind::Reorg {
             ensure!(
                 self.affinity.affinity_mode != Some(AffinityMode::Soft),
@@ -404,6 +413,10 @@ impl Cli {
                 disable_input_ids_forwarding: self.model.disable_input_ids_forwarding,
                 policy: self.routing.policy,
                 decode_policy: self.routing.decode_policy,
+                power_of_n_choices: self
+                    .routing
+                    .power_of_n_choices
+                    .map_or(2, std::num::NonZeroUsize::get),
                 bucket_config,
                 circuit_breaker,
                 cache_aware,
@@ -870,7 +883,22 @@ mod tests {
                 .unwrap()
                 .into_config()
         };
-        assert_eq!(parse(&[]).unwrap().model.policy, PolicyKind::PowerOfTwo);
+        assert_eq!(parse(&[]).unwrap().model.policy, PolicyKind::PowerOfN);
+        assert_eq!(parse(&[]).unwrap().model.power_of_n_choices, 2);
+        assert_eq!(
+            parse(&["--policy", "power_of_n", "--power-of-n-choices", "4"])
+                .unwrap()
+                .model
+                .power_of_n_choices,
+            4
+        );
+        for args in [
+            "--chat-routing reorg --power-of-n-choices 0",
+            "--chat-routing reorg --policy power_of_two",
+            "--power-of-n-choices 4",
+        ] {
+            assert!(cfg_of(args).is_err());
+        }
         let cache = parse(&[
             "--policy",
             "cache_aware",
@@ -1619,7 +1647,7 @@ mod tests {
             .unwrap()
             .0;
 
-        for value in ["round_robin", "random", "power_of_two", "load_based"] {
+        for value in ["round_robin", "random", "power_of_n", "load_based"] {
             assert!(choices.contains(value), "missing {value}: {choices}");
         }
         for value in [
@@ -2097,7 +2125,7 @@ mod tests {
             DEFAULT_KV_INDEXER_QUERY_TIMEOUT_MS
         );
 
-        let err = cfg_of("--policy power_of_two --stable-pair")
+        let err = cfg_of("--policy power_of_n --stable-pair")
             .unwrap_err()
             .to_string();
         assert!(
@@ -2140,7 +2168,7 @@ mod tests {
             None
         );
 
-        let err = cfg_of("--policy power_of_two --worker-queue-limit 4")
+        let err = cfg_of("--policy power_of_n --worker-queue-limit 4")
             .expect_err("the gate only governs cache-affinity selection")
             .to_string();
         assert!(
@@ -2158,7 +2186,7 @@ mod tests {
 
         // A zero limit is wrong under every policy, so the value error must
         // win over the policy error rather than being masked by it.
-        let err = cfg_of("--policy power_of_two --worker-queue-limit 0")
+        let err = cfg_of("--policy power_of_n --worker-queue-limit 0")
             .expect_err("a zero limit is rejected regardless of policy")
             .to_string();
         assert!(err.contains("--worker-queue-limit"), "got: {err}");
@@ -2223,7 +2251,7 @@ mod tests {
         .to_string();
         assert!(err.contains("--saturation-queue-floor"), "got: {err}");
 
-        let err = cfg_of("--policy power_of_two --worker-queue-limit 4 --saturation-queue-floor 2")
+        let err = cfg_of("--policy power_of_n --worker-queue-limit 4 --saturation-queue-floor 2")
             .expect_err("the pin only governs cache-affinity selection")
             .to_string();
         assert!(
@@ -2277,10 +2305,10 @@ mod tests {
 
     #[test]
     fn decode_policy_defaults_to_p2_and_accepts_legacy_compatibility_mode() {
-        let default_config = cfg_of("--policy power_of_two").unwrap();
+        let default_config = cfg_of("--policy power_of_n").unwrap();
         assert_eq!(
             default_config.model.decode_policy,
-            DecodePolicyKind::PowerOfTwo
+            DecodePolicyKind::PowerOfN
         );
 
         let legacy_config = cfg_of("--decode-policy legacy_host_affinity").unwrap();
@@ -2437,7 +2465,7 @@ mod tests {
             .to_string();
         assert!(err.contains("--min-load-choices"), "got: {err}");
 
-        let err = cfg_of("--policy power_of_two --min-load-choices 3")
+        let err = cfg_of("--policy power_of_n --min-load-choices 3")
             .expect_err("the knob only tunes the cache-aware fallback")
             .to_string();
         assert!(

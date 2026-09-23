@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use futures::future::BoxFuture;
-use rand::Rng;
+use rand::seq::index::sample;
 
 use crate::policies::admission::{compare_decode_pressure, compare_prefill_pressure};
 use crate::state::load_monitor::engine_reported_load::EngineReportedLoadTable;
@@ -14,25 +14,37 @@ use crate::workers::Worker;
 use super::admission::{AdmissionLimits, Decision, EngineAdmission, EngineMetrics};
 use super::{Pick, PickError, PickRequest, Policy, Rejection, Stage};
 
-/// Samples two distinct engines and selects the one with lower stage pressure.
+/// Samples up to N distinct engines and selects by stage pressure. Defaults to 2.
 /// Checks admission only on the selected engine; rejection never resamples.
 #[derive(Debug)]
-pub struct PowerOfTwoPolicy {
+pub struct PowerOfNPolicy {
     /// Shared application state; snapshots are local to each pick.
     engine_load: Arc<EngineReportedLoadTable>,
+    choices: usize,
     pub admission: Arc<dyn EngineAdmission>,
 }
 
-impl PowerOfTwoPolicy {
+impl PowerOfNPolicy {
     pub fn new(engine_load: Arc<EngineReportedLoadTable>) -> Self {
         Self {
             engine_load,
+            choices: 2,
             admission: Arc::new(AdmissionLimits::default()),
         }
     }
+
+    pub fn with_choices(mut self, choices: usize) -> Result<Self, PickError> {
+        if choices == 0 {
+            return Err(PickError::InvalidConfiguration(
+                "N must be at least 1".into(),
+            ));
+        }
+        self.choices = choices;
+        Ok(self)
+    }
 }
 
-impl Policy for PowerOfTwoPolicy {
+impl Policy for PowerOfNPolicy {
     fn pick<'a>(
         &'a self,
         engines: &'a [Arc<Worker>],
@@ -44,35 +56,38 @@ impl Policy for PowerOfTwoPolicy {
             }
             // Selection and admission use the same load observation.
             let load = self.engine_load.capture_snapshot(Instant::now());
-            let engine = match engines {
-                [engine] => Arc::clone(engine),
-                _ => {
-                    let mut rng = rand::thread_rng();
-                    let i = rng.gen_range(0..engines.len());
-                    let mut j = rng.gen_range(0..engines.len() - 1);
-                    if j >= i {
-                        j += 1;
-                    }
-                    let (left, right) = (&engines[i], &engines[j]);
+            let candidates = sample(
+                &mut rand::thread_rng(),
+                engines.len(),
+                self.choices.min(engines.len()),
+            );
+            let engine = candidates
+                .iter()
+                .map(|i| &engines[i])
+                .reduce(|left, right| {
                     let pressure = match request.stage {
                         Stage::Plain | Stage::Prefill => {
                             compare_prefill_pressure(left, right, Some(&load))
                         }
                         Stage::Decode => compare_decode_pressure(left, right, Some(&load)),
                     };
-                    Arc::clone(if pressure.is_gt() { right } else { left })
-                }
-            };
-            let metrics = EngineMetrics::observe(&engine, &load);
-            if let Decision::Reject(reason) = self.admission.check(&engine, &metrics)? {
+                    if pressure.is_gt() {
+                        right
+                    } else {
+                        left
+                    }
+                })
+                .expect("nonempty candidate sample");
+            let metrics = EngineMetrics::observe(engine, &load);
+            if let Decision::Reject(reason) = self.admission.check(engine, &metrics)? {
                 return Err(PickError::AdmissionRejected(Rejection {
                     engine: engine.id.clone(),
                     reason,
                 }));
             }
             Ok(Pick {
-                engine,
-                reason: "power_of_two",
+                engine: Arc::clone(engine),
+                reason: "power_of_n",
             })
         })
     }

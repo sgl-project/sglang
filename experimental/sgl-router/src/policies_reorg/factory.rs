@@ -15,7 +15,7 @@ use crate::state::{
 use super::{
     admission::AdmissionLimits,
     cache_aware::{CacheAwarePolicy, CacheSource},
-    power_of_two::PowerOfTwoPolicy,
+    power_of_n::PowerOfNPolicy,
     session_aware::SessionAwarePolicy,
     Policy,
 };
@@ -24,17 +24,17 @@ pub fn validate(model: &ModelConfig) -> Result<()> {
     ensure!(
         matches!(
             model.policy,
-            PolicyKind::PowerOfTwo | PolicyKind::CacheAware | PolicyKind::SessionAware
+            PolicyKind::PowerOfN | PolicyKind::CacheAware | PolicyKind::SessionAware
         ),
-        "reorg routing supports power_of_two, cache_aware, and session_aware"
+        "reorg routing supports power_of_n, cache_aware, and session_aware"
     );
     ensure!(
         model.bucket_config.is_none(),
         "legacy --bucket-config cannot define complete reorg buckets"
     );
     ensure!(
-        model.decode_policy == DecodePolicyKind::PowerOfTwo,
-        "reorg routing requires --decode-policy power_of_two"
+        model.decode_policy == DecodePolicyKind::PowerOfN,
+        "reorg routing requires --decode-policy power_of_n"
     );
     if let Some(filters) = &model.eligibility {
         ensure!(
@@ -73,18 +73,20 @@ pub fn build_resolver(
             .map(|n| n as u64),
         ..Default::default()
     });
-    let mut decode = PowerOfTwoPolicy::new(state.engine_reported_load());
+    let mut decode =
+        PowerOfNPolicy::new(state.engine_reported_load()).with_choices(model.power_of_n_choices)?;
     decode.admission = admission.clone();
     let decode: Arc<dyn Policy> = Arc::new(decode);
     let affinity = model.affinity.clone().unwrap_or_default();
     let mut cleanup = None;
     let policy: Arc<dyn Policy> = match model.policy {
-        PolicyKind::PowerOfTwo => decode.clone(),
+        PolicyKind::PowerOfN => decode.clone(),
         PolicyKind::SessionAware => {
             let store = AffinityStore::new(Duration::from_secs(affinity.session_idle_secs));
             cleanup =
                 store.spawn_sweeper(Duration::from_secs(affinity.session_eviction_interval_secs));
-            let mut policy = SessionAwarePolicy::new(store, state.engine_reported_load());
+            let mut policy = SessionAwarePolicy::new(store, state.engine_reported_load())
+                .with_choices(model.power_of_n_choices)?;
             policy.admission = admission;
             Arc::new(policy)
         }
@@ -101,6 +103,10 @@ pub fn build_resolver(
             };
             let mut policy =
                 CacheAwarePolicy::new(Arc::new(source), state.engine_reported_load(), affinity)?;
+            policy.fallback = Arc::new(
+                PowerOfNPolicy::new(state.engine_reported_load())
+                    .with_choices(model.power_of_n_choices)?,
+            );
             policy.admission = admission;
             Arc::new(policy)
         }

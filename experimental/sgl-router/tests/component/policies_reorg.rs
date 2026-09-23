@@ -438,8 +438,8 @@ async fn bucket_scopes_plain_pick_and_preserves_request_facts() {
 }
 
 #[tokio::test]
-async fn power_of_two_checks_selected_engine_and_propagates_rejection_without_fallback() {
-    use sgl_router::policies_reorg::power_of_two::PowerOfTwoPolicy;
+async fn power_of_n_checks_selected_engine_and_propagates_rejection_without_fallback() {
+    use sgl_router::policies_reorg::power_of_n::PowerOfNPolicy;
     use sgl_router::state::load_monitor::engine_reported_load::EngineReportedLoadTable;
 
     #[derive(Debug)]
@@ -474,7 +474,7 @@ async fn power_of_two_checks_selected_engine_and_propagates_rejection_without_fa
                 reject,
                 invalid,
             });
-            let mut policy = PowerOfTwoPolicy::new(EngineReportedLoadTable::new());
+            let mut policy = PowerOfNPolicy::new(EngineReportedLoadTable::new());
             policy.admission = check.clone();
             assert!(matches!(
                 policy.pick(&[], &request).await,

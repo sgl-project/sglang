@@ -79,14 +79,18 @@ sgl-router --model-id qwen3 --worker-urls http://localhost:30001 \
   --chat-routing reorg --policy cache_aware
 ```
 
-Reorg supports `power_of_two` (its default), `cache_aware`, and `session_aware`.
-Discovery supplies the plain or PD workers; decode uses power-of-two. Cache
+Reorg supports `power_of_n` (its default), `cache_aware`, and `session_aware`.
+Discovery supplies the plain or PD workers; decode uses power-of-N. Cache
 settings, external indexers, session headers/timeouts, and `--filter overloaded`
 with `--max-in-flight` retain their existing flags. Unsupported legacy options
 fail at startup. Legacy `--bucket-config` files cannot define complete reorg PD
 buckets and are not accepted on this path.
 
-Omitting `--chat-routing` keeps the existing policies and defaults.
+Use `--power-of-n-choices 4` to sample four distinct engines for selection and
+fallbacks. The default is 2; N must be positive and is capped at the pool size.
+This option requires `--chat-routing reorg`.
+
+Omitting `--chat-routing` keeps the existing routing implementation and defaults.
 
 ### Fleet-wide sampling contract
 

@@ -64,6 +64,7 @@ fn build_app_context(
             disable_input_ids_forwarding: false,
             policy,
             decode_policy: Default::default(),
+            power_of_n_choices: 2,
             bucket_config: Some(bucket_config),
             circuit_breaker: None,
             cache_aware: None,
@@ -345,7 +346,7 @@ async fn prefill_slo_first_uses_eligible_ttft_bucket_before_lower_rank_bucket() 
             worker_spec("d", decode.url.clone(), WorkerMode::Decode),
         ],
         bucket_config,
-        PolicyKind::PowerOfTwo,
+        PolicyKind::PowerOfN,
         None,
     );
 
@@ -382,7 +383,7 @@ async fn prefill_tries_later_compatible_bucket_before_capacity_fallback() {
             worker_spec("d", decode.url.clone(), WorkerMode::Decode),
         ],
         bucket_config,
-        PolicyKind::PowerOfTwo,
+        PolicyKind::PowerOfN,
         None,
     );
     set_native_load(&ctx, &full.url, 100, 100);
@@ -426,7 +427,7 @@ async fn decode_bucket_uses_input_plus_requested_output_budget() {
             worker_spec("d-long", long_decode.url.clone(), WorkerMode::Decode),
         ],
         bucket_config,
-        PolicyKind::PowerOfTwo,
+        PolicyKind::PowerOfN,
         None,
     );
 
@@ -474,7 +475,7 @@ async fn decode_tries_later_compatible_bucket_before_capacity_fallback() {
             worker_spec("d-available", available.url.clone(), WorkerMode::Decode),
         ],
         bucket_config,
-        PolicyKind::PowerOfTwo,
+        PolicyKind::PowerOfN,
         None,
     );
     set_native_load(&ctx, &full.url, 100, 100);
@@ -511,7 +512,7 @@ async fn prefill_only_bucket_configuration_keeps_global_decode_routing() {
             worker_spec("d", decode.url.clone(), WorkerMode::Decode),
         ],
         bucket_config,
-        PolicyKind::PowerOfTwo,
+        PolicyKind::PowerOfN,
         None,
     );
 

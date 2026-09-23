@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use sgl_router::discovery::{ModelId, WorkerId, WorkerSpec};
-use sgl_router::policies_reorg::power_of_two::PowerOfTwoPolicy;
+use sgl_router::policies_reorg::power_of_n::PowerOfNPolicy;
 use sgl_router::policies_reorg::{PickRequest, Policy, Stage};
 use sgl_router::state::load_monitor::engine_reported_load::{
     EngineReportedLoadTable, LoadStat, NativeCacheRankLoad,
@@ -42,7 +42,7 @@ fn load(running: u64, waiting: u64, tokens: u64, capacity: u64, pending: u64) ->
 }
 
 async fn assert_winner(
-    policy: &PowerOfTwoPolicy,
+    policy: &PowerOfNPolicy,
     engines: &[Arc<Worker>],
     stage: Stage,
     expected: &Arc<Worker>,
@@ -53,7 +53,7 @@ async fn assert_winner(
     for _ in 0..16 {
         let pick = policy.pick(engines, &request).await.unwrap();
         assert!(Arc::ptr_eq(&pick.engine, expected), "stage: {stage:?}");
-        assert_eq!(pick.reason, "power_of_two");
+        assert_eq!(pick.reason, "power_of_n");
     }
 }
 
@@ -66,7 +66,7 @@ async fn plain_and_prefill_use_pending_work_while_decode_uses_request_pressure()
         table.set(&engines[1].url, 0, load(1, 1, 10, 100, 100), Instant::now());
         let expected = if stage == Stage::Decode { 1 } else { 0 };
         assert_winner(
-            &PowerOfTwoPolicy::new(table),
+            &PowerOfNPolicy::new(table),
             &engines,
             stage,
             &engines[expected],
@@ -97,7 +97,7 @@ async fn prefill_uses_estimated_queue_time_only_when_both_engines_have_rates() {
         // estimated queue. Without B's rate, compare queued tokens for both.
         let expected = usize::from(both_have_rates);
         assert_winner(
-            &PowerOfTwoPolicy::new(table),
+            &PowerOfNPolicy::new(table),
             &engines,
             Stage::Prefill,
             &engines[expected],
@@ -123,7 +123,7 @@ async fn decode_orders_by_waiting_running_kv_fraction_then_tokens() {
         table.set(&engines[0].url, 0, left, Instant::now());
         table.set(&engines[1].url, 0, right, Instant::now());
         assert_winner(
-            &PowerOfTwoPolicy::new(table),
+            &PowerOfNPolicy::new(table),
             &engines,
             Stage::Decode,
             &engines[0],
@@ -168,7 +168,7 @@ async fn unusable_telemetry_falls_back_to_local_load_for_both_candidates() {
             if case != "missing" {
                 table.set(&engines[1].url, 0, right, at);
             }
-            assert_winner(&PowerOfTwoPolicy::new(table), &engines, stage, &engines[0]).await;
+            assert_winner(&PowerOfNPolicy::new(table), &engines, stage, &engines[0]).await;
         }
     }
 }
@@ -181,23 +181,31 @@ async fn equal_reported_pressure_uses_local_active_load_as_tiebreaker() {
         for worker in &engines {
             table.set(&worker.url, 0, load(1, 1, 10, 100, 10), Instant::now());
         }
-        assert_winner(&PowerOfTwoPolicy::new(table), &engines, stage, &engines[1]).await;
+        assert_winner(&PowerOfNPolicy::new(table), &engines, stage, &engines[1]).await;
     }
 }
 
 #[tokio::test]
-async fn multiple_candidates_never_select_the_unique_busiest_engine() {
+async fn sample_size_bounds_the_winners_load() {
     let engines: Vec<_> = (0..8)
         .map(|i| engine(&i.to_string(), Stage::Plain, i))
         .collect();
-    let policy = PowerOfTwoPolicy::new(EngineReportedLoadTable::new());
     let model = ModelId("m".into());
     let request = PickRequest::new(&model, Stage::Plain, 10);
-    for _ in 0..64 {
-        let pick = policy.pick(&engines, &request).await.unwrap();
-        // Every distinct pair has an engine less busy than the last candidate.
-        assert!(engines[..7]
-            .iter()
-            .any(|engine| Arc::ptr_eq(engine, &pick.engine)));
+    assert!(PowerOfNPolicy::new(EngineReportedLoadTable::new())
+        .with_choices(0)
+        .is_err());
+    for choices in [1, 2, 4, usize::MAX] {
+        let policy = PowerOfNPolicy::new(EngineReportedLoadTable::new())
+            .with_choices(choices)
+            .unwrap();
+        for _ in 0..64 {
+            let pick = policy.pick(&engines, &request).await.unwrap();
+            // N distinct samples exclude the N-1 busiest engines as winners.
+            let last = engines.len() - choices.min(engines.len());
+            assert!(engines[..=last]
+                .iter()
+                .any(|e| Arc::ptr_eq(e, &pick.engine)));
+        }
     }
 }

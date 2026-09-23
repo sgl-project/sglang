@@ -13,7 +13,7 @@ async fn existing_policy_flags_launch_reorg_routing() {
         .timeout(Duration::from_secs(2))
         .build()
         .unwrap();
-    for policy in ["power_of_two", "cache_aware", "session_aware"] {
+    for policy in ["power_of_n", "cache_aware", "session_aware"] {
         let port = std::net::TcpListener::bind("127.0.0.1:0")
             .unwrap()
             .local_addr()
@@ -38,6 +38,8 @@ async fn existing_policy_flags_launch_reorg_routing() {
                 "reorg",
                 "--policy",
                 policy,
+                "--power-of-n-choices",
+                "4",
             ])
             .stdout(Stdio::null())
             .stderr(Stdio::null())

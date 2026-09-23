@@ -185,7 +185,7 @@ class Gateway:
                          instances. The router uses ``static_urls`` discovery;
                          each worker's mode (plain) and any disaggregation
                          metadata are learned from ``/server_info``.
-            policy: Policy kind — ``round_robin``, ``random``, ``power_of_two``,
+            policy: Policy kind — ``round_robin``, ``random``, ``power_of_n``,
                     or ``cache_aware``.
             kv_indexer_endpoint: Optional external KV Indexer gRPC endpoint.
             timeout: How long to wait for ``/readyz`` before giving up.

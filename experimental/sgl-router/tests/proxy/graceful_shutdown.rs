@@ -56,6 +56,7 @@ fn build_ctx_with_worker(worker_url: &str) -> Arc<AppContext> {
             disable_input_ids_forwarding: false,
             policy: PolicyKind::RoundRobin,
             decode_policy: Default::default(),
+            power_of_n_choices: 2,
             bucket_config: None,
             circuit_breaker: None,
             cache_aware: None,
