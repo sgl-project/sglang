@@ -3412,7 +3412,9 @@ _EXEMPT_CALLERS = ("sglang.srt.distributed.",)
 _CONTEXT_NAME_OF = {
     "get_world_group": "world_group",
     "get_tp_group": "tp_group",
+    "get_tensor_model_parallel_group": "tp_group",
     "get_pp_group": "pp_group",
+    "get_pipeline_model_parallel_group": "pp_group",
     "get_moe_ep_group": "moe_ep_group",
     "get_moe_dp_group": "moe_dp_group",
     "get_moe_tp_group": "moe_tp_group",

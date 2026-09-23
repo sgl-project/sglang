@@ -821,10 +821,6 @@ class ExecMoe(msgspec.Struct):
     elastic_ep_scale_timeout: A[
         float, "Timeout in seconds for a pending elastic EP scale operation."
     ] = 600
-    elastic_ep_rejoin: A[
-        bool,
-        "[Deprecated] Alias for --elastic-ep-join-mode recover.",
-    ] = False
     disable_flashinfer_cutlass_moe_fp4_allgather: A[
         bool, "Disables quantize before all-gather for flashinfer cutlass moe."
     ] = False
