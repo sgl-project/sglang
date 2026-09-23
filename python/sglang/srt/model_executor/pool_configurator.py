@@ -220,7 +220,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             self._cell_size == 0
             and mambaish is not None
             and bool(mambaish.full_attention_layer_ids)
-            and kvc.ps.pp_size > 1
+            and kvc.pp_size > 1
         )
         self._zero_kv_max_tokens = (
             torch.iinfo(torch.int64).max
@@ -389,8 +389,18 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             indexer_head_dim = sparse_cfg["sparse_index_dim"]
             indexer_dtype_size = torch._utils._element_size(kvc.model_dtype)
 
+            full_pool_ratio = 1
+            if get_memory().enable_hisparse:
+                from sglang.srt.mem_cache.sparsity import parse_hisparse_config
+
+                full_pool_ratio = parse_hisparse_config().host_to_device_ratio
+
             main_pool_bytes = (
-                (num_dense + num_sparse) * 2 * kv_heads * head_dim * kv_size
+                (num_dense * full_pool_ratio + num_sparse)
+                * 2
+                * kv_heads
+                * head_dim
+                * kv_size
             )
             indexer_bytes = (
                 (num_indexer_kv * 2 + num_indexer_k_only)
@@ -399,7 +409,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             )
             # FP4 scale buffer adjustment doesn't apply to MiniMax sparse:
             # cell_size is already a sum over heterogeneous sub-pools.
-            return main_pool_bytes + indexer_bytes
+            return main_pool_bytes + indexer_bytes * full_pool_ratio
         else:
             n = model_config.get_num_kv_heads(tp_size, dcp_size)
             cell_size = (
@@ -877,7 +887,7 @@ class SWAChunkCapPoolConfigurator(HybridSWAPoolConfigurator):
         self._swa_cap = compute_swa_request_cap(
             page_size=kvc.page_size,
             window=kvc.sliding_window_size,
-            attn_dp_size=kvc.ps.attn_dp_size,
+            attn_dp_size=kvc.attn_dp_size,
         )
 
     @staticmethod
@@ -1015,7 +1025,7 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         self.compression_ratios = cfg.compress_ratios[
             kvc.layer_info.start_layer : kvc.layer_info.end_layer
         ]
-        if kvc.ps.pp_size > 1:
+        if kvc.pp_size > 1:
             logger.info(
                 f"DSV4 pool PP slice: rank={kvc.pp_group.rank_in_group} "
                 f"layers=[{kvc.layer_info.start_layer},{kvc.layer_info.end_layer}) "
@@ -1032,9 +1042,9 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         self.page_size = kvc.page_size
         self.is_speculative = get_spec().speculative_algorithm is not None
         self.online_c128_mtp_max_draft_tokens = max_speculative_num_draft_tokens() or 0
-        self.attn_dp_size = kvc.ps.attn_dp_size
+        self.attn_dp_size = kvc.attn_dp_size
         self.requested_max_running_requests_per_worker = (
-            get_schedule().max_running_requests // kvc.ps.attn_dp_size
+            get_schedule().max_running_requests // kvc.attn_dp_size
             if get_schedule().max_running_requests is not None
             else None
         )

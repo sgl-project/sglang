@@ -30,6 +30,7 @@ from sglang.srt.disaggregation.decode_schedule_batch_mixin import (
 from sglang.srt.disaggregation.mooncake.conn import (
     KVArgsRegisterInfo,
     MooncakeKVManager,
+    MooncakeKVSender,
     TransferInfo,
 )
 from sglang.srt.disaggregation.utils import (
@@ -68,6 +69,25 @@ register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 class TestDisaggregationWire(unittest.TestCase):
+    def test_sender_clear_keeps_abort_ack_until_writes_drain(self):
+        manager = object.__new__(MooncakeKVManager)
+        sender = object.__new__(MooncakeKVSender)
+        sender.kv_mgr, sender.bootstrap_room = manager, 42
+        for outstanding in (0, 1):
+            with self.subTest(outstanding=outstanding):
+                manager.request_status = {42: KVPoll.Failed}
+                manager._staging_outstanding = {42: outstanding}
+                manager._deferred_ack_targets = {42: ("127.0.0.1", 1234)}
+                with patch.object(manager, "_send_abort_ack") as ack:
+                    sender.clear()
+                    if outstanding:
+                        ack.assert_not_called()
+                        manager._staging_outstanding[42] = 0
+                        manager._maybe_ack_drained_abort(42)
+                    ack.assert_called_once_with("127.0.0.1", 1234, 42)
+                    manager._maybe_ack_drained_abort(42)
+                    ack.assert_called_once()
+
     def test_mooncake_registration_staging_fields(self):
         msg = [
             b"room",
@@ -319,15 +339,8 @@ class TestCPReplicatedStateTransfer(unittest.TestCase):
 
 
 class TestQwen4StateWire(unittest.TestCase):
-    def test_qsa_pending_payload_uses_nested_request_pool_row(self):
-        req = SimpleNamespace(kv=ReqKvInfo(req_pool_idx=7))
-
-        np.testing.assert_array_equal(
-            get_qsa_pending_state_indices(req),
-            np.array([7], dtype=np.int32),
-        )
-
-    def test_qsa_registers_request_ring_and_page_state_separately(self):
+    @staticmethod
+    def _qsa_pool(layer_id: int):
         pool = object.__new__(QSATokenToKVPool)
         pool.full_kv_pool = object()
         pool.get_state_buf_infos = lambda: ([10], [100], [20])
@@ -338,12 +351,24 @@ class TestQwen4StateWire(unittest.TestCase):
         pool.page_size = 4
         pool.qsa_compress_ratio = 2
         pool.qsa_compressed_page_size = 2
-        pool.full_attention_layer_id_mapping = {24: 0}
+        pool.full_attention_layer_id_mapping = {layer_id: 0}
         pool.qsa_key_state_buffer_pool = [torch.zeros((6, 1, 8), dtype=torch.bfloat16)]
         pool.qsa_rope_position_buffer = torch.zeros((6, 3), dtype=torch.int64)
         pool.qsa_compressed_k_buffer_pool = [
             torch.zeros((6, 1, 8), dtype=torch.bfloat16)
         ]
+        return pool
+
+    def test_qsa_pending_payload_uses_nested_request_pool_row(self):
+        req = SimpleNamespace(kv=ReqKvInfo(req_pool_idx=7))
+
+        np.testing.assert_array_equal(
+            get_qsa_pending_state_indices(req),
+            np.array([7], dtype=np.int32),
+        )
+
+    def test_qsa_registers_request_ring_and_page_state_separately(self):
+        pool = self._qsa_pool(24)
 
         kv_args = SimpleNamespace()
         setup_state_kv_args(kv_args, pool)
@@ -358,6 +383,34 @@ class TestQwen4StateWire(unittest.TestCase):
         self.assertEqual(
             kv_args.state_layer_ids[1:],
             [[24, QSA_ROPE_STATE_LAYER_ID], [24]],
+        )
+
+    def test_qsa_draft_state_uses_reserved_layer_id_band(self):
+        target_pool = self._qsa_pool(24)
+        draft_pool = self._qsa_pool(0)
+
+        kv_args = SimpleNamespace()
+        setup_state_kv_args(
+            kv_args,
+            target_pool,
+            draft_token_to_kv_pool=draft_pool,
+            total_kv_layers=48,
+        )
+
+        self.assertEqual(
+            kv_args.state_types,
+            [StateType.MAMBA, StateType.QSA_PENDING, StateType.QSA_COMPRESSED],
+        )
+        self.assertEqual(
+            kv_args.state_layer_ids[1:],
+            [
+                [24, QSA_ROPE_STATE_LAYER_ID, 48, 49],
+                [24, 48],
+            ],
+        )
+        self.assertEqual(
+            [len(entries) for entries in kv_args.state_data_ptrs[1:]],
+            [4, 2],
         )
 
     def test_qsa_stage_without_qsa_layers_does_not_register_rope_ring(self):
