@@ -1,7 +1,7 @@
 """Byte-exactness of the V4.1 (fp8 / fp4) FlashMLA KV cache store kernels.
 
 Every store kernel is compared byte for byte with the pure-torch quantizers of
-the two formats (``torch_quant.quantize_k_cache_v41`` / ``_v41_fp4``), which
+the two formats (torch_quant.quantize_k_cache_v41 / _v41_fp4), which
 follow the decode kernel's own reference quantizer.
 """
 
@@ -18,6 +18,11 @@ from sglang.kernels.ops.attention.dsv4.elementwise import (
     fused_rope_inplace,
 )
 from sglang.kernels.ops.attention.dsv4.kv_layout import KVLayout
+from sglang.kernels.ops.attention.dsv4.torch_quant import (
+    dequantize_k_cache_v41,
+    fake_quant_compressed_kv,
+    quantize_k_cache_v41,
+)
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
     DeepSeekV4TokenToKVPool,
 )
@@ -33,11 +38,11 @@ register_cuda_ci(est_time=60, stage="base-b-kernel-unit", runner_config="4-gpu-b
 register_amd_ci(est_time=60, suite="stage-b-kernel-test-1-gpu-amd-mi35x")
 
 REFERENCE = {
-    KVLayout.V41: tq.quantize_k_cache_v41,
+    KVLayout.V41: quantize_k_cache_v41,
     KVLayout.V41_FP4: tq.quantize_k_cache_v41_fp4,
 }
 DEQUANT = {
-    KVLayout.V41: tq.dequantize_k_cache_v41,
+    KVLayout.V41: dequantize_k_cache_v41,
     KVLayout.V41_FP4: tq.dequantize_k_cache_v41_fp4,
 }
 # One quantization step, relative: e4m3 has 3 mantissa bits, e2m1 one.
@@ -57,7 +62,7 @@ def rope_tail(
 
 
 def token_rows(pages, layout, page_size, locs):
-    """The (data row, scale row) bytes of the tokens at ``locs``."""
+    """The (data row, scale row) bytes of the tokens at locs."""
     locs = locs.long()
     page, offset = locs // page_size, locs % page_size
     data_cols = torch.arange(layout.data_bytes, device=pages.device)
@@ -241,7 +246,7 @@ class TestV41KVStore(CustomTestCase):
                             -1, 512
                         )[locs]
                         self.assertTrue(
-                            torch.equal(deq, tq.fake_quant_compressed_kv(rotated))
+                            torch.equal(deq, fake_quant_compressed_kv(rotated))
                         )
 
     def test_boundary_tiles(self):
@@ -505,7 +510,7 @@ class TestV41KVStore(CustomTestCase):
 
 
 CASES = {
-    KVLayout.V41: (tq.quantize_k_cache_v41, tq.dequantize_k_cache_v41),
+    KVLayout.V41: (quantize_k_cache_v41, dequantize_k_cache_v41),
     KVLayout.V41_FP4: (tq.quantize_k_cache_v41_fp4, tq.dequantize_k_cache_v41_fp4),
 }
 
@@ -567,14 +572,14 @@ class TestV41KVDequant(CustomTestCase):
                     # The fp4 cache dequantizes to the model's fake-quantized value
                     # (compared by value: the fake quant maps an exact -0.0 to +0.0).
                     if layout is KVLayout.V41_FP4:
-                        expect = tq.fake_quant_compressed_kv(
+                        expect = fake_quant_compressed_kv(
                             k.view(-1, 512)[ids.long()]
                         ).unsqueeze(1)
                         self.assertTrue(torch.equal(got, expect))
 
     def test_random_bytes_and_workspace_slice(self):
         """Arbitrary payload bytes (scales in the quantizer's range) and an
-        ``out`` that is a strided slice of a larger workspace."""
+        out that is a strided slice of a larger workspace."""
         g = torch.Generator(device="cuda").manual_seed(1)
         for layout, (_, dequant) in CASES.items():
             page_size, num_pages = 64, 7
@@ -632,7 +637,7 @@ class TestFusedKNormRopeFlashMLA(CustomTestCase):
         " kernel is claimed on gfx950 only",
     )
     def test_query_rope_in_the_k_launch(self):
-        """With `q` the K launch must rope every query head's trailing ROPE_DIM bitwise
+        """With q the K launch must rope every query head's trailing ROPE_DIM bitwise
         like the flat rope kernel, leave the cache bytes and the nope part untouched,
         and rope rows without a slot."""
         dev = "cuda"
@@ -733,8 +738,8 @@ class TestV41KVPoolWriters(CustomTestCase):
             pool.swa_page_size,
             layout=pool.get_swa_key_layout(),
         )
-        ref = tq.dequantize_k_cache_v41(
-            tq.quantize_k_cache_v41(x.view(1, n, HEAD_DIM)), n
+        ref = dequantize_k_cache_v41(
+            quantize_k_cache_v41(x.view(1, n, HEAD_DIM)), n
         ).view(n, 1, HEAD_DIM)
         self.assertTrue(torch.equal(got, ref))
         # Compressed (fp4): the un-rotated latent plus its freqs; the cache holds
@@ -758,7 +763,7 @@ class TestV41KVPoolWriters(CustomTestCase):
         self.assertTrue(
             torch.equal(
                 got.squeeze(1),
-                tq.fake_quant_compressed_kv(rope_tail(latent, freqs, ROPE_DIM)),
+                fake_quant_compressed_kv(rope_tail(latent, freqs, ROPE_DIM)),
             )
         )
         # The (fp8 nope, bf16 rope) pack writer is the V4 layout only.

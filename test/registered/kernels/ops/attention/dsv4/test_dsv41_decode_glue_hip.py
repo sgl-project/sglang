@@ -23,6 +23,7 @@ from sglang.srt.layers.attention.dsv4.candidate_indexer import (
 from sglang.srt.layers.attention.dsv4.low_ratio_backend_hip import (
     CandidateBlocks,
     _aot_topk_sorts_output,
+    _extend_k_slots,
     topk_transform_paged_sorted,
     topk_within_candidate_blocks_hip,
 )
@@ -419,6 +420,33 @@ def test_selection_past_index_topk_is_repeatable(seq_len: int) -> None:
         + pos % INDEX_PAGE_SIZE
     )
     assert torch.equal(page_a, torch.where(valid, slots, -1))
+
+
+def test_extend_k_slots_gathers_every_request_in_order():
+    """The one-shot gather of the visible compressed slots equals the per-request
+    walk, including a request with nothing visible and the start offsets."""
+    _seed(29)
+    ratio, lc_per_req = 2, [5, 0, 3, 1]
+    req_to_token = torch.randint(0, 4096, (8, 64), device=DEVICE, dtype=torch.int32)
+    req_pool_indices = torch.tensor([6, 1, 7, 0], device=DEVICE, dtype=torch.int32)
+    slots, starts = _extend_k_slots(
+        req_to_token,
+        ratio=ratio,
+        lc_per_req=lc_per_req,
+        req_pool_indices=req_pool_indices,
+        device=DEVICE,
+    )
+    expected = torch.cat(
+        [
+            req_to_token[int(r), torch.arange(lc, device=DEVICE) * ratio].to(
+                torch.int64
+            )
+            // ratio
+            for r, lc in zip(req_pool_indices, lc_per_req)
+        ]
+    )
+    assert torch.equal(slots, expected)
+    assert starts == [0, 5, 5, 8]
 
 
 def test_page_table_from_req_to_token_matches_torch():

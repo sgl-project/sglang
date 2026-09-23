@@ -38,10 +38,12 @@ class TestVerifyCandidateGraph(CustomTestCase):
             ([1000000], "candidate_filtered"),
         ):
             with self.subTest(lengths=lengths):
-                batch = SimpleNamespace(seq_lens_cpu=torch.tensor(lengths))
+                batch = SimpleNamespace(
+                    dp_max_seq_len=None, seq_lens_cpu=torch.tensor(lengths)
+                )
                 self.assertEqual(policy.select(batch), expected)
         # Plain decode (no verify width) keeps the existing <= boundary.
-        batch = SimpleNamespace(seq_lens_cpu=torch.tensor([16384]))
+        batch = SimpleNamespace(dp_max_seq_len=None, seq_lens_cpu=torch.tensor([16384]))
         self.assertEqual(
             self.make_policy(width=0).select(batch), "candidate_unfiltered"
         )
@@ -55,7 +57,9 @@ class TestVerifyCandidateGraph(CustomTestCase):
         ):
             with self.subTest(lengths=lengths):
                 self.assertEqual(
-                    policy.select(SimpleNamespace(seq_lens_cpu=lengths)),
+                    policy.select(
+                        SimpleNamespace(dp_max_seq_len=None, seq_lens_cpu=lengths)
+                    ),
                     "candidate_filtered",
                 )
 
@@ -69,6 +73,7 @@ class TestVerifyCandidateGraph(CustomTestCase):
         ):
             with self.subTest(bound=bound):
                 batch = SimpleNamespace(
+                    dp_max_seq_len=None,
                     seq_lens_cpu=None,
                     spec_info=SimpleNamespace(candidate_max_seq_len_upper_bound=bound),
                 )
@@ -85,6 +90,7 @@ class TestVerifyCandidateGraph(CustomTestCase):
         for length, expected in ((16378, True), (16379, False)):
             batch = SimpleNamespace(
                 forward_mode=ForwardMode.TARGET_VERIFY,
+                dp_max_seq_len=None,
                 seq_lens_cpu=torch.tensor([length]),
             )
             self.assertEqual(
@@ -177,6 +183,7 @@ class TestVerifyCandidateGraph(CustomTestCase):
     def test_decode_ignores_verify_request_budget(self):
         policy = self.make_policy(width=0)
         batch = SimpleNamespace(
+            dp_max_seq_len=None,
             seq_lens_cpu=None,
             spec_info=SimpleNamespace(candidate_max_seq_len_upper_bound=5120),
         )
@@ -184,6 +191,7 @@ class TestVerifyCandidateGraph(CustomTestCase):
 
     def test_host_lengths_take_precedence_over_request_budget(self):
         batch = SimpleNamespace(
+            dp_max_seq_len=None,
             seq_lens_cpu=torch.tensor([16379]),
             spec_info=SimpleNamespace(candidate_max_seq_len_upper_bound=5120),
         )

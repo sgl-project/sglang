@@ -5,6 +5,8 @@ import unittest
 import torch
 
 from sglang.kernels.ops.quantization.mxfp8_amd_gfx95 import (
+    Fp8GridActivation,
+    Mxfp8Activation,
     bf16_dequant_blockscaled_linear,
     dequant_block_fp8_weight_to_bf16,
     fake_quant_fp8_activation,
@@ -18,8 +20,14 @@ from sglang.kernels.ops.quantization.mxfp8_native_amd_gfx95 import (
     shuffle_mxfp8_weight,
     ue8m0_weight_scale,
 )
+from sglang.srt.layers.quantization.fp8 import Fp8Config
 from sglang.srt.utils import is_gfx95_supported, is_hip
 from sglang.test.ci.ci_register import register_amd_ci
+from sglang.test.layer_ut_utils import (
+    init_single_process_dist,
+    load_linear_weights,
+    make_tp1_column_parallel_linear,
+)
 from sglang.test.test_utils import CustomTestCase
 
 register_amd_ci(est_time=20, suite="stage-b-kernel-test-1-gpu-amd-mi35x")
@@ -176,6 +184,49 @@ class TestMxfp8NativeRouteGfx95(CustomTestCase):
                     x[:m].contiguous(), w_sh, ws8, w_small
                 )
                 self.assertTrue(torch.equal(part, full[:m]), (plan, m_hi, m))
+
+
+@unittest.skipUnless(is_hip() and is_gfx95_supported(), "gfx950 native MXFP8 route")
+class TestFp8LinearGfx95Routes(CustomTestCase):
+    """Fp8LinearMethod on a 32-block ue8m0 checkpoint: the plain bf16 input, the fused
+    producers' fp8-grid wrapper and their MXFP8 wrapper must give the same rows, on a
+    shape the native kernels tile and on one that keeps the bf16-dequant route."""
+
+    @classmethod
+    def setUpClass(cls):
+        init_single_process_dist()
+
+    def _linear(self, n, k):
+        quant_config = Fp8Config(
+            is_checkpoint_fp8_serialized=True,
+            activation_scheme="dynamic",
+            weight_block_size=[32, 32],
+            scale_fmt="ue8m0",
+        )
+        layer = make_tp1_column_parallel_linear(
+            quant_config, n, k, skip_block_quant_check=True
+        )
+        torch.manual_seed(n + k)
+        w = torch.randn(n, k, device="cuda", dtype=torch.bfloat16) / 10
+        wq, ws = _quant_weight_block32(w)
+        load_linear_weights(layer, weight=wq, weight_scale_inv=ws)
+        layer.quant_method.process_weights_after_loading(layer)
+        return layer
+
+    def test_wrapped_inputs_match_the_plain_input(self):
+        # K = 5152 is a 32-block width the 128-wide native K steps do not tile
+        for n, k, native in ((1856, 5120, True), (1856, 5152, False)):
+            layer = self._linear(n, k)
+            self.assertEqual(layer.mxfp8_native_ready, native, (n, k))
+            for m in (1, 33, 1025):
+                with self.subTest(n=n, m=m):
+                    x = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
+                    x_grid = fake_quant_fp8_activation(x)
+                    plain = layer(x)[0]
+                    on_grid = layer(Fp8GridActivation(x_grid))[0]
+                    quantized = layer(Mxfp8Activation(*mxfp8_e4m3_quantize(x)))[0]
+                    self.assertTrue(torch.equal(on_grid, plain))
+                    self.assertTrue(torch.equal(quantized, plain))
 
 
 if __name__ == "__main__":

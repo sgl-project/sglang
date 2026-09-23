@@ -46,14 +46,15 @@ def _dsv41_all_reduce_mhc_post(
 ) -> None: ...
 
 
-def all_reduce_mhc_post(input, residual, post, comb, communicator):
-    rows = input.shape[0]
-    assert 1 <= rows <= 8 and input.shape == (rows, 5120)
-    assert residual.shape == (rows, 4, 5120)
-    assert post.shape == (rows, 4) and comb.shape == (rows, 4, 4)
-    assert input.dtype == residual.dtype == torch.bfloat16
-    assert post.dtype == comb.dtype == torch.float32
-    assert all(t.is_contiguous() for t in (input, residual, post, comb))
+def all_reduce_mhc_post(
+    input: torch.Tensor,
+    residual: torch.Tensor,
+    post: torch.Tensor,
+    comb: torch.Tensor,
+    communicator,
+) -> torch.Tensor:
+    """TP4 all-reduce of input fused with hc_post onto residual; the kernel checks the
+    shapes (up to 8 rows of DeepSeek-V4.1's hidden size)."""
     assert communicator.world_size == 4 and not communicator.disabled
     capturing = torch.cuda.is_current_stream_capturing()
     # capture() registers the peer addresses when the enclosing graph scope exits.

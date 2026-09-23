@@ -1,6 +1,6 @@
-"""ROCm activation route of ``DeepseekV2MLP``: aiter's fused clamp + silu-and-mul for 128-wide half
-widths (fp8 out for a 128x128-block ``down_proj``), else the Triton silu-and-mul-clamp, whose gfx950
-epilogue lands on ``down_proj``'s fp8 grid or emits native MXFP8. Bound by ``deepseek_v2`` under ``_is_hip``."""
+"""ROCm activation route of DeepseekV2MLP: aiter's fused clamp + silu-and-mul for 128-wide half
+widths (fp8 out for a 128x128-block down_proj), else the Triton silu-and-mul-clamp, whose gfx950
+epilogue lands on down_proj's fp8 grid or emits native MXFP8. Bound by deepseek_v2 under _is_hip."""
 
 from __future__ import annotations
 
@@ -10,11 +10,14 @@ from sglang.kernels.ops.activation.silu_and_mul_clamp_hip import (
     silu_and_mul_clamp_fp8_grid_supported,
     silu_and_mul_clamp_triton,
 )
+from sglang.kernels.ops.quantization.mxfp8_native_amd_gfx95 import (
+    native_consumer_wants_fp8,
+)
 from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
 
 
 def resolve_fused_clamp_route(mlp, half_width: int) -> None:
-    """Fix ``mlp``'s activation route from ``down_proj``'s loaded weight (once per layer)."""
+    """Fix mlp's activation route from down_proj's loaded weight (once per layer)."""
     quant_method = getattr(mlp.down_proj, "quant_method", None)
     # the aiter kernel tiles and quantizes the half width per 128, the 128x128 block GEMM's layout
     mlp.use_fused_clamp_act_mul = half_width % 128 == 0
@@ -28,7 +31,7 @@ def resolve_fused_clamp_route(mlp, half_width: int) -> None:
         isinstance(quant_method, Fp8LinearMethod)
         and quant_method.block_fp8_as_mxfp8
         and mlp.down_proj.block_fp8_mxfp8_ready
-        and quant_method.mxfp8_dense_backend.takes_fp8_grid_activation()
+        and quant_method.mxfp8_dense_backend.is_gfx95_mxfp8_native()
         and silu_and_mul_clamp_fp8_grid_supported(half_width)
     )
     # the native MXFP8 route takes fp8 + ue8m0 straight from the epilogue at decode token counts
@@ -45,17 +48,13 @@ def _emit_fp8(mlp, num_tokens: int) -> bool:
     this token count consumes it directly (skinny range, or a measured dot_scaled bucket)."""
     if not mlp._hip_act_native_consumer:
         return False
-    from sglang.kernels.ops.quantization.mxfp8_native_amd_gfx95 import (
-        native_consumer_wants_fp8,
-    )
-
     tiles, steps, _ = mlp.down_proj.weight.shape  # lane-order [N/16, K/128, 2048]
     return native_consumer_wants_fp8(num_tokens, tiles * 16, steps * 128)
 
 
 def silu_and_mul_clamp(mlp, gate_up: torch.Tensor):
-    """``silu(clamp(g)) * clamp(u)`` for any half width (unlike the aiter kernel's
-    multiple of 128), emitted on ``down_proj``'s fp8 grid or as native fp8 + ue8m0
+    """silu(clamp(g)) * clamp(u) for any half width (unlike the aiter kernel's
+    multiple of 128), emitted on down_proj's fp8 grid or as native fp8 + ue8m0
     when the resolved route takes it."""
     return silu_and_mul_clamp_triton(
         gate_up,

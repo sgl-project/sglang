@@ -11,6 +11,8 @@ from typing import TYPE_CHECKING, Any, Optional, Union
 
 import torch
 
+from sglang.kernels.ops.moe.aiter_moe_sorting_fused import local_expert_ids_from_mask
+from sglang.kernels.ops.moe.fill_padded_rows import _fill_padded_rows
 from sglang.srt.layers.moe.moe_runner.base import (
     MoeQuantInfo,
     MoeRunnerConfig,
@@ -20,6 +22,13 @@ from sglang.srt.layers.moe.moe_runner.base import (
     register_post_permute,
     register_pre_permute,
 )
+from sglang.srt.layers.moe.rocm_fused_front import (
+    SortConfig,
+    disable_pending_sort,
+    pop_pending_sort,
+    take_pending_sort,
+)
+from sglang.srt.layers.moe.topk import StandardTopKOutputDeferredPad
 from sglang.srt.layers.moe.utils import (
     MoeRunnerBackend,
     get_moe_a2a_backend,
@@ -127,11 +136,11 @@ def _aiter_quant_type(quant_type: AiterQuantType):
 
 @functools.cache
 def _aiter_fused_moe_supports_no_combine() -> bool:
-    """Probe whether the installed aiter.fused_moe accepts a `no_combine` kwarg.
+    """Probe whether the installed aiter.fused_moe accepts a no_combine kwarg.
 
     Older wheels don't expose it, so feature-detect once and forward
-    conditionally, matching the existing `**extra` conditional-kwarg pattern
-    used for `num_local_tokens` / `dtype`.
+    conditionally, matching the existing **extra conditional-kwarg pattern
+    used for num_local_tokens / dtype.
     """
     from aiter.fused_moe import fused_moe
 
@@ -163,7 +172,6 @@ _AITER_MOE_SORTING_PARAMS = (
     "return_local_topk_ids",
     "accumulate",
     "flat",
-    "output_aux",
 )
 
 
@@ -194,8 +202,8 @@ _FLYDSL_REDUCTION_PARAMS = (
 
 
 def _argument_reader(signature: inspect.Signature):
-    """``(args, kwargs) -> {name: value}`` with the signature's defaults applied: the
-    per-call work of ``signature.bind`` done once, since the overrides run per launch."""
+    """(args, kwargs) -> {name: value} with the signature's defaults applied: the
+    per-call work of signature.bind done once, since the overrides run per launch."""
     names = tuple(signature.parameters)
     defaults = {
         name: p.default
@@ -214,9 +222,9 @@ def _argument_reader(signature: inspect.Signature):
 
 @functools.cache
 def _install_fused_reduce_override() -> bool:
-    """Wrap the FlyDSL stage2 reduction (``_run_moe_reduction``) once; False when aiter
-    differs. Inside ``aiter_fused_reduce_shared_add`` the dense bf16 / fp16 reduction
-    becomes one launch that also adds the shared expert (``moe_topk_reduce_add``)."""
+    """Wrap the FlyDSL stage2 reduction (_run_moe_reduction) once; False when aiter
+    differs. Inside aiter_fused_reduce_shared_add the dense bf16 / fp16 reduction
+    becomes one launch that also adds the shared expert (moe_topk_reduce_add)."""
     try:
         import aiter.ops.flydsl.moe_kernels as flydsl_moe
     except ImportError:
@@ -224,10 +232,7 @@ def _install_fused_reduce_override() -> bool:
     original = getattr(flydsl_moe, "_run_moe_reduction", None)
     if original is None:
         return False
-    try:
-        signature = inspect.signature(original)
-    except (TypeError, ValueError):
-        return False
+    signature = inspect.signature(original)
     if tuple(signature.parameters)[: len(_FLYDSL_REDUCTION_PARAMS)] != (
         _FLYDSL_REDUCTION_PARAMS
     ):
@@ -280,8 +285,8 @@ def _install_fused_reduce_override() -> bool:
 
 @contextlib.contextmanager
 def aiter_fused_reduce_shared_add(shared_output: torch.Tensor, alpha: float):
-    """While active, the FlyDSL stage2 top-k reduction writes ``alpha * routed + shared_output``.
-    Yields the request (``fired`` says whether it happened), or None when the override is unavailable."""
+    """While active, the FlyDSL stage2 top-k reduction writes alpha * routed + shared_output.
+    Yields the request (fired says whether it happened), or None when the override is unavailable."""
     if not (is_hip() and _install_fused_reduce_override()):
         yield None
         return
@@ -311,8 +316,6 @@ def fused_sorting_masks_padded_rows(
 
 def _fill_padded_rows_pair(topk_ids, topk_weights, num_token_non_padded) -> None:
     """The two fills select_experts deferred: ids to 0, weights to 0.0."""
-    from sglang.kernels.ops.moe.fill_padded_rows import _fill_padded_rows
-
     _fill_padded_rows(topk_ids, num_token_non_padded, 0)
     _fill_padded_rows(topk_weights, num_token_non_padded, 0.0)
 
@@ -323,16 +326,12 @@ def _local_expert_ids(
     device,
     cache: dict[tuple, tuple[torch.Tensor, int, Optional[torch.Tensor]]],
 ) -> Optional[tuple[torch.Tensor, int]]:
-    """``(local ids, local expert count)`` for a mask, cached by storage (the entry keeps the mask
+    """(local ids, local expert count) for a mask, cached by storage (the entry keeps the mask
     alive). None during CUDA-graph capture: counting the mask is a device sync."""
-    from sglang.kernels.ops.moe.aiter_moe_sorting_fused import (
-        local_expert_ids_from_mask,
-    )
-
     if expert_mask is None:
-        key = (None, num_experts, str(device))
+        key = (None, num_experts, device.index)
     else:
-        key = (expert_mask.data_ptr(), expert_mask.numel(), str(expert_mask.device))
+        key = (expert_mask.data_ptr(), expert_mask.numel(), expert_mask.device.index)
     entry = cache.get(key)
     if entry is None:
         if expert_mask is None:
@@ -352,7 +351,7 @@ def _local_expert_ids(
 
 @functools.cache
 def _install_fused_sorting_override() -> bool:
-    """Wrap ``aiter.fused_moe.moe_sorting`` once; False when aiter differs."""
+    """Wrap aiter.fused_moe.moe_sorting once; False when aiter differs."""
     try:
         import aiter.fused_moe as aiter_fused_moe
     except ImportError:
@@ -360,10 +359,7 @@ def _install_fused_sorting_override() -> bool:
     original = getattr(aiter_fused_moe, "moe_sorting", None)
     if original is None:
         return False
-    try:
-        signature = inspect.signature(original)
-    except (TypeError, ValueError):
-        return False
+    signature = inspect.signature(original)
     # aiter may append trailing parameters; the fused path needs the leading ones and
     # defers to aiter whenever a caller sets one it does not understand
     params = tuple(signature.parameters)
@@ -379,11 +375,6 @@ def _install_fused_sorting_override() -> bool:
     from sglang.kernels.ops.moe.aiter_moe_sorting_fused import (
         AITER_FUSED_SORT_MAX_TOKENS,
         fused_aiter_moe_sorting,
-    )
-    from sglang.srt.layers.moe.rocm_fused_front import (
-        SortConfig,
-        disable_pending_sort,
-        take_pending_sort,
     )
 
     # masks are static per layer, so the table lives with the override installed once per process
@@ -409,7 +400,6 @@ def _install_fused_sorting_override() -> bool:
             and arg["dispatch_policy"] == 0
             and not arg["return_local_topk_ids"]
             and not arg["flat"]
-            and not arg["output_aux"]
             and topk_ids.dtype == torch.int32
             and topk_ids.is_contiguous()
             and topk_weights.dtype == torch.float32
@@ -429,7 +419,12 @@ def _install_fused_sorting_override() -> bool:
             else None
         )
         if local_experts is None:
-            disable_pending_sort(topk_ids)
+            if eligible:
+                # capturing and the mask is not counted yet: this batch goes to aiter,
+                # the router keeps folding its sorting into later gate launches
+                pop_pending_sort(topk_ids)
+            else:
+                disable_pending_sort(topk_ids)
             if request.num_token_non_padded is not None:
                 _fill_padded_rows_pair(
                     topk_ids, topk_weights, request.num_token_non_padded
@@ -504,12 +499,12 @@ def _mori_decode_recv_bound(recv_rows: int, topk: int) -> int:
     """Live rows mori's receive buffer can hold in decode, or 0 for "do not bound".
 
     Worst case fan-in is every rank routing all of its tokens to this one, so
-    `sum(per-rank tokens) * topk`, where topk already includes the fused shared
+    sum(per-rank tokens) * topk, where topk already includes the fused shared
     expert. The per-rank counts come from the DP sync, so this is the fan-in for
     the batch actually being run rather than an upper bound over all batches.
 
     That is only sound because enabling this gate also makes
-    `require_mlp_tp_gather()` true for mori, which gives every rank the same
+    require_mlp_tp_gather() true for mori, which gives every rank the same
     cuda-graph bucket. The value is baked into a captured graph and has to hold
     for every later replay; with per-rank buckets a rank on a narrow tier could
     be handed rows by a peer on a wider one, and the only bound valid under that
@@ -636,8 +631,8 @@ class AiterRunnerCore(MoeRunnerCore):
 
             # Default (INTERLEAVE) preserves the pre-fix behavior for paths
             # that prepare weights in the gate/up-interleaved layout. Set
-            # `SGLANG_USE_AITER_MOE_GU_ITLV=0` to switch to SEPARATED, which
-            # matches the layout produced by `Mxfp4MoEMethod` (gpt-oss
+            # SGLANG_USE_AITER_MOE_GU_ITLV=0 to switch to SEPARATED, which
+            # matches the layout produced by Mxfp4MoEMethod (gpt-oss
             # MXFP4) and the gptoss_fp4 tuned FlyDSL kernels.
             extra.setdefault(
                 "gate_mode",
@@ -716,8 +711,11 @@ def pre_permute_standard_to_aiter(
     topk_weights, topk_ids, _ = dispatch_output.topk_output
     topk_weights = topk_weights.to(torch.float32)
     # Padded rows select_experts left for the fused sorting launch to mask.
-    num_token_non_padded = getattr(
-        dispatch_output.topk_output, "num_token_non_padded", None
+    topk_output = dispatch_output.topk_output
+    num_token_non_padded = (
+        topk_output.num_token_non_padded
+        if isinstance(topk_output, StandardTopKOutputDeferredPad)
+        else None
     )
 
     if runner_config.apply_router_weight_on_input and not quant_info.doweight_stage1:
@@ -833,7 +831,7 @@ def _pre_permute_deepep_to_aiter(
         is_fp4_dispatch = hidden_states.dtype == torch.float4_e2m1fn_x2
 
         # AITER fused_moe Clamped-SwiGLU is dispatched with
-        # gate_mode=INTERLEAVE, for which AITER picks a bf16/fp8 `q_dtype_a`
+        # gate_mode=INTERLEAVE, for which AITER picks a bf16/fp8 q_dtype_a
         # Refer to https://github.com/ROCm/aiter/blob/a2617c366dc7271a1662ecda2023d19f6ccefcec/aiter/fused_moe.py#L406-L412
         swiglu_interleave = quant_info.swiglu_limit > 0 and get_bool_env_var(
             "SGLANG_USE_AITER_MOE_GU_ITLV", "true"

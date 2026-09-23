@@ -4,6 +4,7 @@ payload / scale index-K pools, then the AOT top-k transform -- the DeepGEMM path
 from __future__ import annotations
 
 import functools
+import itertools
 import logging
 from typing import TYPE_CHECKING, Dict, List, NamedTuple, Optional, Tuple
 
@@ -26,6 +27,7 @@ from sglang.kernels.ops.attention.dsv4.fp4_indexer_hip import (
     rocm_indexer_head_weights,
     sort_selection_rows,
 )
+from sglang.kernels.ops.moe.rocm_router_gate import rocm_router_gemv_split_k
 from sglang.srt.layers.attention.deepseek_v4_backend import (
     _TORCH_INDEXER_SCORE_BUDGET_BYTES,
     _as_int_list,
@@ -43,7 +45,7 @@ _AOT_FAST_TOPK_K = 2048
 
 @functools.lru_cache(maxsize=1)
 def _aot_topk_sorts_output() -> bool:
-    """Whether the installed AOT top-k transform takes ``sort_output`` (orders each
+    """Whether the installed AOT top-k transform takes sort_output (orders each
     row in its epilogue). An older sgl_kernel build falls back to the sort launch."""
     import sgl_kernel  # noqa: F401  registers torch.ops.sgl_kernel
 
@@ -65,7 +67,7 @@ def topk_transform_paged_sorted(
     page_size: int,
     raw_indices: Optional[torch.Tensor],
 ) -> None:
-    """``topk_transform_paged`` followed by ``sort_selection_rows``: the -1 padded
+    """topk_transform_paged followed by sort_selection_rows: the -1 padded
     paged top-k of every row, ascending by position. One launch when the AOT
     kernel sorts in its epilogue (bitwise the same rows)."""
     if _aot_topk_sorts_output():
@@ -163,8 +165,8 @@ def candidate_block_scores(
     block_size: int,
     fill_tail: bool,
 ) -> torch.Tensor:
-    """[rows, num_blocks] fp32 block maxima of `logits` over the reachable positions
-    (see `_candidate_block_scores_kernel`). `seq_lens` int32 [rows], contiguous."""
+    """[rows, num_blocks] fp32 block maxima of logits over the reachable positions
+    (see _candidate_block_scores_kernel). seq_lens int32 [rows], contiguous."""
     assert logits.dim() == 2 and logits.dtype == torch.float32 and logits.stride(1) == 1
     assert block_size & (block_size - 1) == 0, f"{block_size = } must be a power of 2"
     rows, width = logits.shape
@@ -234,7 +236,7 @@ def _map_compact_selection_kernel(
 ):
     """Compact position c -> real position ids[c // BLOCK_SIZE] * BLOCK_SIZE + c % BLOCK_SIZE ->
     slot via the row's page table; reachable selections packed first, -1 after. With SORT the valid
-    prefix is ascending (the key rule of ``_sort_selection_rows_kernel``)."""
+    prefix is ascending (the key rule of _sort_selection_rows_kernel)."""
     row = tl.program_id(0)
     length = tl.load(seq_lens_ptr + row)
     j = tl.arange(0, BLOCK)
@@ -299,7 +301,7 @@ class CandidateBlocks(NamedTuple):
 
 
 def slice_candidate_blocks(candidates: CandidateBlocks, rows: slice) -> CandidateBlocks:
-    """The rows `rows` of a per-request publication."""
+    """The rows rows of a per-request publication."""
     return candidates._replace(
         ids=candidates.ids[rows],
         compact_lens=candidates.compact_lens[rows],
@@ -325,9 +327,9 @@ def select_candidate_blocks_hip(
     topk_blocks: int,
     block_size: int,
 ) -> CandidateBlocks:
-    """Level one over a [rows, capacity] logits rectangle, bounded by `seq_lens`: the `topk_blocks`
+    """Level one over a [rows, capacity] logits rectangle, bounded by seq_lens: the topk_blocks
     best blocks of each row, the block with its newest position always among them; as a set per
-    row the ids equal the reference's `select_candidate_blocks`. Graph-safe: no host sync."""
+    row the ids equal the reference's select_candidate_blocks. Graph-safe: no host sync."""
     seq_lens = seq_lens.to(torch.int32).contiguous()
     rows, width = logits.shape
     device = logits.device
@@ -376,7 +378,7 @@ def gather_candidate_blocks(
     block_size: int,
 ) -> torch.Tensor:
     """The compact [rows, topk_blocks * block_size] fp32 row of each request's
-    candidate positions in id order (see `_gather_candidate_blocks_kernel`)."""
+    candidate positions in id order (see _gather_candidate_blocks_kernel)."""
     rows, width = logits.shape
     topk_blocks = ids.shape[1]
     assert ids.shape[0] == rows and ids.dtype == torch.int32 and ids.stride(1) == 1
@@ -412,9 +414,9 @@ def topk_within_candidate_blocks_hip(
     raw_indices: Optional[torch.Tensor],
     sort_output: bool = False,
 ) -> None:
-    """Level two for a consumer layer: the top-k of ``logits`` inside the published candidate
+    """Level two for a consumer layer: the top-k of logits inside the published candidate
     blocks, written as the paged transform writes it (-1 padded, valid prefix first; ascending with
-    ``sort_output``, k a power of two). Runs on the compact row, so the cost stops growing with context."""
+    sort_output, k a power of two). Runs on the compact row, so the cost stops growing with context."""
     rows, width = logits.shape
     topk = page_indices.shape[1]
     block_size = candidates.block_size
@@ -461,7 +463,7 @@ def topk_within_candidate_blocks_hip(
 
 
 def _gemv_head_weight_rows(indexer, x: torch.Tensor) -> bool:
-    """Row counts `rocm_indexer_head_weights` / the split-K GEMV serve: a small contiguous bf16 batch."""
+    """Row counts rocm_indexer_head_weights / the split-K GEMV serve: a small contiguous bf16 batch."""
     return (
         0 < x.shape[0] <= indexer.weights_proj_hip_max_tokens
         and x.dim() == 2
@@ -471,8 +473,8 @@ def _gemv_head_weight_rows(indexer, x: torch.Tensor) -> bool:
 
 
 def _indexer_head_weights(indexer, x: torch.Tensor) -> torch.Tensor:
-    """`indexer.head_weights(x)` as the contiguous bf16 [T, H] the FlyDSL kernels take; decode row
-    counts run `rocm_indexer_head_weights` (same two roundings as aiter's GEMM plus the scale)."""
+    """indexer.head_weights(x) as the contiguous bf16 [T, H] the FlyDSL kernels take; decode row
+    counts run rocm_indexer_head_weights (same two roundings as aiter's GEMM plus the scale)."""
     if _gemv_head_weight_rows(indexer, x):
         return rocm_indexer_head_weights(
             x, indexer.weights_proj.weight, indexer.head_weight_scale
@@ -493,8 +495,6 @@ def _indexer_inputs(layer, x, q_lora, pos):
         and layer.freqs_cis.dtype == torch.complex64
     ):
         # decode rows: wq_b, split-K head-weight GEMV, then one launch for RoPE, fp4 pack and reduce
-        from sglang.kernels.ops.moe.rocm_router_gate import rocm_router_gemv_split_k
-
         q, _ = indexer.wq_b(q_lora)
         partials = rocm_router_gemv_split_k(x, indexer.weights_proj.weight)
         return index_q_pack_weights_hip(
@@ -531,7 +531,7 @@ def refresh_low_ratio_prefill_workspaces(
     metadata_by_ratio: Dict[int, PagedIndexerMetadata],
     previous: Optional[Dict[int, FP4PrefillWorkspace]],
 ) -> Dict[int, FP4PrefillWorkspace]:
-    """Must run outside CUDA-graph capture; see `prepare_fp4_prefill_workspace`."""
+    """Must run outside CUDA-graph capture; see prepare_fp4_prefill_workspace."""
     previous = previous or {}
     return {
         ratio: prepare_fp4_prefill_workspace(
@@ -552,13 +552,7 @@ def low_ratio_identity_skip_enabled(
     return -(-index_topk // max(candidate_block_size, 1)) <= candidate_topk_blocks
 
 
-def is_identity_request(seq_len: int, ratio: int, index_topk: int) -> bool:
-    """Every row of the request selects all its visible compressed positions."""
-    return seq_len // ratio <= index_topk
-
-
 def _fill_identity_request(
-    indexer,
     *,
     lc: int,
     slots_j: torch.Tensor,
@@ -645,10 +639,9 @@ def low_ratio_decode_rows_fit_candidate_span(backend, forward_batch) -> bool:
         )
     max_len = _decode_batch_max_seq_len(forward_batch)
     if forward_batch.forward_mode.is_target_verify():
-        width = getattr(backend, "speculative_num_draft_tokens", None)
-        if width is None or max_len is None:
+        if max_len is None:
             return False
-        max_len += width
+        max_len += backend.speculative_num_draft_tokens
     return max_len is not None and max_len <= span
 
 
@@ -743,40 +736,14 @@ def low_ratio_index_topk_hip_decode(
 def _extend_k_slots(req_to_token, *, ratio, lc_per_req, req_pool_indices, device):
     """Per request, the c1/c2 pool slots of its visible compressed positions, and
     each request's start offset in their concatenation."""
-    slot_chunks, starts, start = [], [], 0
-    for r, lc in enumerate(lc_per_req):
-        starts.append(start)
-        if lc == 0:
-            continue
-        j = torch.arange(lc, device=device)
-        slot_chunks.append(
-            req_to_token[req_pool_indices[r], j * ratio].to(torch.int64) // ratio
-        )
-        start += lc
-    return slot_chunks, starts
-
-
-def store_index_k_norm_rope_split(pool, layer, latent, pos, out_loc, freqs_cis) -> None:
-    """The index-K store of ``DeepseekV4AttnBackend._low_ratio_compress_fused`` in the FlyDSL
-    split payload / scale layout (same bytes as ``store_fp4_index_k_cache_split``); ``out_loc``
-    is -1 for an incomplete group and 0 for padding, and the kernel stores neither."""
-    from sglang.kernels.ops.attention.dsv4.fp4_rope_hip import (
-        index_k_norm_rope_pack_store_split,
+    starts = [0, *itertools.accumulate(lc_per_req)][:-1]
+    counts = torch.tensor(lc_per_req, dtype=torch.int64, device=device)
+    req_rows = torch.repeat_interleave(req_pool_indices.to(torch.int64), counts)
+    j = torch.arange(int(counts.sum()), device=device) - torch.repeat_interleave(
+        torch.tensor(starts, dtype=torch.int64, device=device), counts
     )
-
-    indexer = layer.indexer
-    layer_id = layer.layer_id
-    index_k_norm_rope_pack_store_split(
-        indexer.forward_wk(latent),
-        indexer.k_norm.weight.data,
-        indexer.k_norm.eps,
-        freqs_cis,
-        pos,
-        out_loc,
-        pool.get_index_k_fp4_payload_buffer(layer_id),
-        pool.get_index_k_fp4_scale_buffer(layer_id),
-        ratio=layer.compress_ratio,
-    )
+    slots = req_to_token[req_rows, j * ratio].to(torch.int64) // ratio
+    return slots, starts
 
 
 def low_ratio_index_topk_hip_extend(
@@ -819,9 +786,8 @@ def low_ratio_index_topk_hip_extend(
         return
 
     if backend.low_ratio_identity_skip:
-        is_identity = [
-            is_identity_request(s, ratio, indexer.index_topk) for s in seq_lens_cpu
-        ]
+        # identity: every row selects all its visible compressed positions
+        is_identity = [s // ratio <= indexer.index_topk for s in seq_lens_cpu]
     else:
         is_identity = [False] * len(seq_lens_cpu)
     compress_lens = ((pos + 1) // ratio).to(torch.int32)
@@ -829,14 +795,13 @@ def low_ratio_index_topk_hip_extend(
     publish = [] if indexer.is_candidate_source else None
     if any(is_identity):
         # only the score-free fill resolves slots itself; scored rows resolve in the top-k transform
-        slot_chunks, starts = _extend_k_slots(
+        k_slots, starts = _extend_k_slots(
             backend.req_to_token,
             ratio=ratio,
             lc_per_req=lc_per_req,
             req_pool_indices=forward_batch.req_pool_indices.to(torch.int64),
             device=pos.device,
         )
-        k_slots = torch.cat(slot_chunks)
 
     def fill_identity_requests(req_lo, req_hi, tok_lo):
         """Identity requests req_lo..req_hi: rows written without scores, None published per request."""
@@ -850,7 +815,6 @@ def low_ratio_index_topk_hip_extend(
                     publish.append(None)
                 continue
             _fill_identity_request(
-                indexer,
                 lc=lc,
                 slots_j=k_slots[starts[b] : starts[b] + lc],
                 lens=compress_lens[rows],
@@ -969,8 +933,8 @@ def _select_topk_extend_hip(
     consume: Optional[List[Optional[CandidateBlocks]]],
     publish: Optional[List[Optional[CandidateBlocks]]],
 ) -> None:
-    """Row t of ``logits`` scores its request's compressed positions in columns 0..lc-1, reachable
-    up to ``compress_lens[t]``. A source layer publishes one ``CandidateBlocks`` per request (None
+    """Row t of logits scores its request's compressed positions in columns 0..lc-1, reachable
+    up to compress_lens[t]. A source layer publishes one CandidateBlocks per request (None
     for identity / empty), a consumer selects inside its published blocks, others run one paged top-k."""
     assert page_indices.shape[1] == indexer.index_topk, (
         f"the paged top-k selects page_indices.shape[1] = {page_indices.shape[1]} "
@@ -1041,7 +1005,7 @@ def _select_topk_extend_hip(
 def _request_groups(
     extend_lens_cpu: List[int], rows_per_chunk: int
 ) -> List[Tuple[int, int, int, int]]:
-    """Consecutive request groups whose token rows fit `rows_per_chunk` (a single
+    """Consecutive request groups whose token rows fit rows_per_chunk (a single
     request always forms a group): (req_lo, req_hi, tok_lo, tok_hi)."""
     groups = []
     req_lo, tok_lo, tok = 0, 0, 0

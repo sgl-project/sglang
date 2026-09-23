@@ -10,6 +10,8 @@ from sglang.kernels.ops.attention.aiter_sparse_decode_reduce import (
     aiter_sparse_split_reduce,
 )
 
+RCP_LN2: gl.constexpr = 1.4426950408889634  # exp(x) = exp2(x * RCP_LN2)
+
 
 @gluon.jit
 def _load_compact(Cache, offset, valid, USE_BUFFER: gl.constexpr):
@@ -106,7 +108,7 @@ def _compact_qkpv(
         den,
         acc,
         head_mask,
-        SCALE * 1.4426950408889634,
+        SCALE * RCP_LN2,
         smem,
         MF,
         MF,
@@ -213,13 +215,11 @@ def _compact_attention_kernel(
         if segment == 0 or NE > 0:
             if segment == 0:
                 indices, lengths, width, stride, capacity = I, L, NK, IS, KN
-            else:
-                indices, lengths, width, stride, capacity = EI, EL, NE, EIS, EN
-            length = gl.minimum(gl.load(lengths + t), width)
-            if segment == 0:
                 cache, page, cache_stride, fp4, buffer = K, KP, KS, KFP4, KBUFFER
             else:
+                indices, lengths, width, stride, capacity = EI, EL, NE, EIS, EN
                 cache, page, cache_stride, fp4, buffer = E, EP, ES, EFP4, EBUFFER
+            length = gl.minimum(gl.load(lengths + t), width)
             if split * BLOCK < length:
                 kv, valid = _compact_tile(
                     cache,
@@ -262,10 +262,10 @@ def _compact_attention_kernel(
     if SPLITS == 1:
         if HAS_SINK:
             sink = gl.load(Sink + h, h < H, -float("inf"))
-            scaled_max = m * (SCALE * 1.4426950408889634)
-            final_max = gl.maximum(scaled_max, sink * 1.4426950408889634)
+            scaled_max = m * (SCALE * RCP_LN2)
+            final_max = gl.maximum(scaled_max, sink * RCP_LN2)
             weight = gl.exp2(scaled_max - final_max)
-            den = den * weight + gl.exp2(sink * 1.4426950408889634 - final_max)
+            den = den * weight + gl.exp2(sink * RCP_LN2 - final_max)
             acc = acc * weight[:, None]
         out = (acc / den[:, None]).to(gl.bfloat16)
         out = gl.convert_layout(out, QG)
@@ -283,7 +283,7 @@ def _compact_attention_kernel(
         gl.store(Out + (t * H + hq[:, None]) * 512 + dq[None, :], out, hq[:, None] < H)
     else:
         off = (t * SPLITS + split) * H + h
-        gl.store(Max + off, m * (SCALE * 1.4426950408889634), h < H)
+        gl.store(Max + off, m * (SCALE * RCP_LN2), h < H)
         gl.store(Sum + off, den, h < H)
         gl.store(Acc + off[:, None] * 512 + d[None, :], acc, h[:, None] < H)
 

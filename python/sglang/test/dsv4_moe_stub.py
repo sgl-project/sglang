@@ -1,5 +1,5 @@
-"""A ``DeepseekV2MoE`` with fake experts for the DeepSeek-V4 reduction tests: the routed
-output is ``x * (rank + 1)`` and the shared output ``x * 0.5``, so a reduction is visible
+"""A DeepseekV2MoE with fake experts for the DeepSeek-V4 reduction tests: the routed
+output is x * (rank + 1) and the shared output x * 0.5, so a reduction is visible
 in the result and a skipped one is too."""
 
 from __future__ import annotations
@@ -8,11 +8,13 @@ from types import SimpleNamespace
 
 import torch
 
+from sglang.srt.layers.moe.topk import TopKOutputFormat
+from sglang.srt.models.deepseek_v2 import DeepseekV2MoE
 
-def make_dsv4_moe_stub(rank: int, *, dual: bool, shared_tp1: bool, tp_size: int = 4):
-    from sglang.srt.layers.moe.topk import TopKOutputFormat
-    from sglang.srt.models.deepseek_v2 import DeepseekV2MoE
 
+def make_dsv4_moe_stub(
+    rank: int, *, dual: bool, shared_tp1: bool, tp_size: int = 4
+) -> DeepseekV2MoE:
     class Experts:
         quant_method = None
         moe_runner_config = SimpleNamespace(inplace=False)

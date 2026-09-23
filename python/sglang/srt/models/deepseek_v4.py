@@ -31,6 +31,7 @@ from sglang.kernels.ops.attention.dsv4 import (
     fused_rope_inplace,
     sglang_per_token_group_quant_fp8_dsv4_wo_a,
 )
+from sglang.kernels.ops.attention.dsv4.kv_layout import KVLayout
 from sglang.kernels.ops.attention.dsv4.wo_a import MAX_M as _FUSED_WO_A_MAX_TOKENS
 from sglang.kernels.ops.attention.dsv4.wo_a import (
     fused_rope_wo_a_bf16,
@@ -43,6 +44,7 @@ from sglang.kernels.ops.layernorm.mhc_post_split_h import mhc_post_split_h
 from sglang.kernels.ops.quantization.fp8_kernel import (
     sglang_per_token_group_quant_fp8,
 )
+from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
 from sglang.srt.compilation.compilation_config import register_split_op
 from sglang.srt.configs.deepseek_v4 import DeepSeekV4Config
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
@@ -221,7 +223,7 @@ def _get_mhc_ops() -> MhcOps:
     """Load MHC kernels only when a DeepSeek-V4 layer needs them.
 
     Model modules are imported eagerly by the registry.  Importing
-    ``sglang.kernels.ops.layernorm.mhc`` owns TileLang-backed MHC kernels.
+    sglang.kernels.ops.layernorm.mhc owns TileLang-backed MHC kernels.
     Import it only when a DeepSeek-V4 layer executes so registry discovery
     cannot initialize an optional CUDA runtime before unrelated models set up
     their communication workspaces.  DeepSeek-V4 is the sole consumer here.
@@ -378,19 +380,19 @@ if _use_aiter:
 def _wo_a_aiter_gemm_eligible(
     flag: bool, use_aiter: bool, is_hip: bool, is_gfx95: bool
 ) -> bool:
-    """Static eligibility for the aiter ``wo_a`` reroute.
+    """Static eligibility for the aiter wo_a reroute.
 
-    Folds the opt-in flag, the global ``SGLANG_USE_AITER`` switch, and the
+    Folds the opt-in flag, the global SGLANG_USE_AITER switch, and the
     HIP/gfx95 platform gates into one predicate. Evaluated once at import (see
-    ``_wo_a_aiter_batched_gemm_enabled``) so none of it runs on the per-token
+    _wo_a_aiter_batched_gemm_enabled) so none of it runs on the per-token
     decode critical path.
     """
     return bool(flag and use_aiter and is_hip and is_gfx95)
 
 
 # Read the opt-in flag and import the aiter kernel ONCE at module import: the
-# decode ``wo_a`` matmul runs per layer/token on the critical path, so it must
-# not pay an ``EnvBool.get()`` plus a function-local import on every call. If the
+# decode wo_a matmul runs per layer/token on the critical path, so it must
+# not pay an EnvBool.get() plus a function-local import on every call. If the
 # path is eligible but the kernel import fails, disable it here and fall back to
 # the einsum for the process (logged once) instead of retrying every step.
 _wo_a_aiter_batched_gemm_enabled = _wo_a_aiter_gemm_eligible(
@@ -421,12 +423,17 @@ _wo_a_aiter_batched_gemm_disabled = False
 # ROCm fp8 wo_a. The CUDA fp8 path below is built on DeepGEMM's fp8_einsum, so
 # gfx950 runs the equivalent aiter e8m0 block-scale batched GEMM instead. Both
 # the kernel availability and the weight-scale converter resolve once at import;
-# ``None`` here means the platform keeps the bf16 absorb GEMM.
+# None here means the platform keeps the bf16 absorb GEMM.
 _wo_a_fp8_mxscale = None
 _wo_a_fp8_mxscale_fused_invrope = None
 _wo_a_weight_scale_to_e8m0 = None
+# DeepSeek-V4.1 Flash: the Engram layer whose lookup the BS=1 decode prefetches
+ENGRAM_PREFETCH_LAYER_ID = 14
 _hip = None
 if _is_hip:
+    from sglang.kernels.ops.attention.dsv4.wo_a_bf16_hip import (
+        wo_a_bf16_small_batch_mxfp8_hip,
+    )
     from sglang.srt.models.deepseek_common.amd import deepseek_v4_hip as _hip
     from sglang.srt.models.deepseek_common.amd.deepseek_v4_wo_a_fp8 import (
         apply_wo_a_fp8_mxscale,
@@ -463,7 +470,7 @@ def _apply_wo_a_bf16_matmul(
     fast_path: bool = False,
     fp8_grid: bool = False,
 ) -> torch.Tensor | Mxfp8SwizzledInput | Fp8GridActivation | Mxfp8Activation:
-    """Compute BF16 wo_a: ``[T, G, D] @ [G, R, D] -> [T, G, R]``.
+    """Compute BF16 wo_a: [T, G, D] @ [G, R, D] -> [T, G, R].
 
     Supported shapes use native GEMV/split-K or write token-major output
     directly. Other ROCm decode shapes can use AITER, optionally on the FP8
@@ -480,8 +487,6 @@ def _apply_wo_a_bf16_matmul(
         )
     )
     if hip_decode_verify:
-        from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
-
         hip_decode_verify = not (
             is_batch_invariant_mode_enabled()
             or get_exec().deterministic.enable_deterministic_inference
@@ -533,10 +538,6 @@ def _apply_wo_a_bf16_matmul(
                 and not get_forward().sp_active
                 and envs.SGLANG_OPT_HIP_WO_A_MXFP8_EPILOGUE.get()
             ):
-                from sglang.kernels.ops.attention.dsv4.wo_a_bf16_hip import (
-                    wo_a_bf16_small_batch_mxfp8_hip,
-                )
-
                 return wo_a_bf16_small_batch_mxfp8_hip(o, wo_a)
             if fuse_mxfp8_quant and _is_cuda:
                 return Mxfp8SwizzledInput(*wo_a_bf16_small_batch_mxfp8(o, wo_a))
@@ -653,9 +654,9 @@ _FREQS_CIS_TO_COS_SIN: dict[
 def _freqs_cis_to_cos_sin(
     freqs_cis: torch.Tensor, dtype: torch.dtype, device: torch.device
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Derive (cos, sin) bf16 contiguous tables from a complex64 `freqs_cis`,
-    cached by `(id(freqs_cis), dtype, device)` so that all layers sharing the
-    same `freqs_cis` (via `precompute_freqs_cis`'s lru_cache) reuse one pair."""
+    """Derive (cos, sin) bf16 contiguous tables from a complex64 freqs_cis,
+    cached by (id(freqs_cis), dtype, device) so that all layers sharing the
+    same freqs_cis (via precompute_freqs_cis's lru_cache) reuse one pair."""
     key = (id(freqs_cis), dtype, device)
     cached = _FREQS_CIS_TO_COS_SIN.get(key)
     if cached is not None:
@@ -1256,7 +1257,7 @@ class MQALayer(MqaAttentionBase):
         self._wq_b_native_consumer = None
 
         # KV cache write is always fused into the K kernel
-        # (`_compute_kv_to_cache`), so the legacy "overlap store cache" flag
+        # (_compute_kv_to_cache), so the legacy "overlap store cache" flag
         # has no effect here -- the fused path is on by default.
 
     def _apply(self, fn, recurse=True):
@@ -1273,7 +1274,7 @@ class MQALayer(MqaAttentionBase):
         dtype: torch.dtype,
         inverse: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        # ``rotary_emb`` is shared by layers with the same RoPE configuration and
+        # rotary_emb is shared by layers with the same RoPE configuration and
         # can also be shared by the target and NextN models.  Only the immutable
         # full table is cached on it; position-gathered tensors are memoized per
         # forward (prime_rope_cos_sin / rope_cos_sin), never across forwards --
@@ -1429,7 +1430,7 @@ class MQALayer(MqaAttentionBase):
 
         Replaces the bf16-kv-intermediate path. Used everywhere except the DSA
         prefill-CP case (which needs bf16 kv for the cross-rank all-gather).
-        ``q_rope`` ([T, H, head_dim]) has its query heads roped by the same launch.
+        q_rope ([T, H, head_dim]) has its query heads roped by the same launch.
         """
         if envs.SGLANG_DSV4_USE_BF16_KV_QUANT_SOURCE.get():
             assert q_rope is None
@@ -1754,7 +1755,7 @@ class MQALayer(MqaAttentionBase):
 
         if (
             self.use_fused_qk_norm_rope
-            and get_token_to_kv_pool().kv_layout.value == "v4"
+            and get_token_to_kv_pool().kv_layout is KVLayout.V4
         ):
             if _is_gfx95_supported or _is_gfx1250_supported:
                 q_for_wqb, q_lora = _fused_rmsnorm_fp8_quant(
@@ -1906,7 +1907,7 @@ class MQALayer(MqaAttentionBase):
         ) or (
             not unified
             and self.use_fused_qk_norm_rope
-            and get_token_to_kv_pool().kv_layout.value == "v4"
+            and get_token_to_kv_pool().kv_layout is KVLayout.V4
         )
 
         if do_fused_qk_norm_rope:
@@ -2420,8 +2421,8 @@ class MQALayer(MqaAttentionBase):
 
         # save_kv_cache = kv is not None selects who writes the ring. When kv is
         # None the store was already fused into _forward_prepare* (decode) or
-        # done inline, so the backend skips its own store_cache; pass `q` as a
-        # sentinel for the `k is v` assert (attention won't read it once
+        # done inline, so the backend skips its own store_cache; pass q as a
+        # sentinel for the k is v assert (attention won't read it once
         # save_kv_cache=False). When kv is not None (target-verify, or DSA-CP),
         # _forward_prepare* deliberately left the store off and the backend does
         # its normal causally-indexed store from attn_k = kv.
@@ -2709,8 +2710,8 @@ class MQALayer(MqaAttentionBase):
         """Run the attention forward as a single TBO op.
 
         Consumes the post-input-norm hidden states produced by
-        ``DeepseekV4DecoderLayer.op_mhc_prepare_attn`` and stores the attention
-        output for ``op_mhc_post_attn_pre_mlp``.
+        DeepseekV4DecoderLayer.op_mhc_prepare_attn and stores the attention
+        output for op_mhc_post_attn_pre_mlp.
         """
         state.hidden_states_after_attn = self.forward(
             x=state.pop("hidden_states_after_input_norm"),
@@ -2932,11 +2933,17 @@ class DeepseekV4DecoderLayer(nn.Module):
         allow_aiter_quant: bool = True,
         coefficients=None,
     ) -> Tuple[torch.Tensor, Optional[Tuple]]:
-        """`input_layernorm(hidden_states)` as (the bf16 norm attention reads, the pre-quantized
-        operand of its dense projections or None); ``coefficients`` is a ROCm boundary's pending
+        """input_layernorm(hidden_states) as (the bf16 norm attention reads, the pre-quantized
+        operand of its dense projections or None); coefficients is a ROCm boundary's pending
         reduce + sinkhorn."""
         if _is_hip:
-            return _hip.input_norm(self, hidden_states, allow_aiter_quant, coefficients)
+            return _hip.input_norm(
+                self,
+                hidden_states,
+                allow_aiter_quant,
+                coefficients,
+                _fused_rmsnorm_fp8_quant,
+            )
         return self.input_layernorm(hidden_states), None
 
     def hc_pre(
@@ -4085,13 +4092,13 @@ class DeepseekV4DecoderLayer(nn.Module):
     # ------------------------------------------------------------------
     # TBO op decomposition (prefill two-batch-overlap, EP / mori path)
     #
-    # These mirror the NON-fused branch of ``forward`` (cross-layer mHC
+    # These mirror the NON-fused branch of forward (cross-layer mHC
     # fusion is disabled under TBO, so every layer is self-contained), split
     # into ops so the operations engine can overlap one ubatch's MoE a2a
     # dispatch/combine with the other ubatch's attention + expert GEMM.
     # The MoE ops themselves (op_gate / op_select_experts / op_dispatch_a/b /
     # op_experts / op_combine_a/b / op_shared_experts / op_output) are reused
-    # as-is from ``self.mlp`` (DeepseekV2MoE) — they decompose ``forward_deepep``.
+    # as-is from self.mlp (DeepseekV2MoE) — they decompose forward_deepep.
     # ------------------------------------------------------------------
     def op_mhc_prepare_attn(
         self,
@@ -4265,7 +4272,7 @@ class DeepseekV4DecoderLayer(nn.Module):
             else None
         )
         # Persistent grow-only scratch (keyed per ubatch) instead of a fresh
-        # torch.empty each layer -> stops the allocator's `reserved` from
+        # torch.empty each layer -> stops the allocator's reserved from
         # ballooning at large prefill chunks. input_ids_global is gathered ONCE
         # per ubatch in _forward_layers_tbo (cached on fb), not here.
         sub = state.tbo_subbatch_index
@@ -4471,12 +4478,14 @@ class DeepseekV4Model(nn.Module):
             # HIP preserves image-token rows after the prefetched projection.
             and (_is_hip or config.vision_n_layers == 0)
             and config.hc_pre_from_prev_sublayer
-            and self.start_layer <= 14 < self.end_layer
-            and self.layers[14].engram is not None
-            and self.layers[14].engram.embed._shared
+            and self.start_layer <= ENGRAM_PREFETCH_LAYER_ID < self.end_layer
+            and self.layers[ENGRAM_PREFETCH_LAYER_ID].engram is not None
+            and self.layers[ENGRAM_PREFETCH_LAYER_ID].engram.embed._shared
             # These backends use per-call scratch rather than a shared GEMM workspace.
             and getattr(
-                self.layers[14].engram.wkv.quant_method, "mxfp8_dense_backend", None
+                self.layers[ENGRAM_PREFETCH_LAYER_ID].engram.wkv.quant_method,
+                "mxfp8_dense_backend",
+                None,
             )
             in (
                 Mxfp8DenseGemmBackend.FLASHINFER_CUTEDSL,
@@ -4485,7 +4494,10 @@ class DeepseekV4Model(nn.Module):
             )
         ):
             self.engram_prefetch_stream = torch.cuda.Stream()
-            logger.info("Engram layer 14 KV prefetch enabled for BS=1 decode")
+            logger.info(
+                "Engram layer %d KV prefetch enabled for BS=1 decode",
+                ENGRAM_PREFETCH_LAYER_ID,
+            )
 
         self.use_fused_mhc_post_pre = (
             is_cross_layer_mhc_fusion_enabled() or _is_fused_mhc_post_pre_enabled_xpu()
@@ -4613,11 +4625,11 @@ class DeepseekV4Model(nn.Module):
             and forward_batch.forward_mode.is_decode()
             and hash_ids.shape[0] == 1
         ):
-            # Overlap layer 14's shared-host lookup and WKV projection with the
+            # Overlap the prefetch layer's shared-host lookup and WKV projection with the
             # earlier layers; the main stream joins right before the gate.
             prefetch_stream = self.engram_prefetch_stream
             prefetch_stream.wait_stream(torch.cuda.current_stream())
-            engram = self.layers[14].engram
+            engram = self.layers[ENGRAM_PREFETCH_LAYER_ID].engram
             with torch.cuda.stream(prefetch_stream):
                 prefetched_engram_kv = engram.project(
                     hash_ids[:, engram.layer_hash_index]
@@ -4669,7 +4681,7 @@ class DeepseekV4Model(nn.Module):
                     if _is_hip
                     else None
                 )
-                if i == 14 and prefetched_engram_kv is not None:
+                if i == ENGRAM_PREFETCH_LAYER_ID and prefetched_engram_kv is not None:
                     main_stream = torch.cuda.current_stream()
                     main_stream.wait_stream(self.engram_prefetch_stream)
                     prefetched_engram_kv.record_stream(main_stream)
@@ -4807,7 +4819,7 @@ class DeepseekV4Model(nn.Module):
 
         TBO batch prep (tbo_split_seq_index / tbo_children) is populated
         model-agnostically when --enable-two-batch-overlap is set and the
-        DP-attention preparer allows it (mori `normal` mode permits prefill
+        DP-attention preparer allows it (mori normal mode permits prefill
         TBO). We additionally restrict to prefill (EXTEND), single PP, and
         non-CP paths supported by the DSV4 op strategy.
         """
@@ -5169,7 +5181,7 @@ class DeepseekV4ForCausalLM(nn.Module):
         return getattr(self.config, "model_type", None) == "deepseek_v41"
 
     def autotune_prefill_kernels(self, num_tokens: int, *, dtype: torch.dtype) -> int:
-        """Tune resident MXFP8 linears for every M bucket up to ``num_tokens``.
+        """Tune resident MXFP8 linears for every M bucket up to num_tokens.
         The quant method is called directly, so no TP collectives run and no
         request/KV/draft state is touched; the runner owns the autotune context."""
         if getattr(self.config, "model_type", None) != "deepseek_v41":
@@ -5620,7 +5632,7 @@ class DeepseekV4ForCausalLM(nn.Module):
             else:
                 raise ValueError("num_nextn_predict_layers is not in the config")
 
-        # Must mirror MQALayer.__init__'s `quantize_wo_a`: dequantizing wo_a here
+        # Must mirror MQALayer.__init__'s quantize_wo_a: dequantizing wo_a here
         # while the layer allocated an FP8 parameter (or vice versa) fails the
         # weight loader's dtype check.
         if not (self.wo_a_fp8 or use_npu_arch35_mxfp8_wo_a(self.quant_config)):

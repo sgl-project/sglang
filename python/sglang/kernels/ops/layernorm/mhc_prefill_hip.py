@@ -1,7 +1,12 @@
 """Large HIP mHC boundaries with compensated BF16 projection."""
 
+from typing import Optional, Tuple
+
+import torch
 import triton
 import triton.language as tl
+
+from sglang.kernels.ops.layernorm.mhc import hc_mix_stats_bf16x3_partials
 
 
 @triton.jit
@@ -47,10 +52,15 @@ def _hc_post_combine(
 
 
 def hc_boundary_bf16x3_partials(
-    x, residual, post, comb, pre_prev, residual_out, y, weight_parts
-):
-    from .mhc import hc_mix_stats_bf16x3_partials
-
+    x: Optional[torch.Tensor],
+    residual: torch.Tensor,
+    post: Optional[torch.Tensor],
+    comb: Optional[torch.Tensor],
+    pre_prev: Optional[torch.Tensor],
+    residual_out: Optional[torch.Tensor],
+    y: Optional[torch.Tensor],
+    weight_parts: Tuple[torch.Tensor, ...],
+) -> Tuple[torch.Tensor, torch.Tensor]:
     m, _, h = residual.shape
     if x is not None or pre_prev is not None:
         _hc_post_combine[(m, triton.cdiv(h, 1024))](

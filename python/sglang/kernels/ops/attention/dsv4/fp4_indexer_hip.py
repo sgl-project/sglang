@@ -9,7 +9,10 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.kernels.ops.attention.dsv4.fp4_indexer import quantize_fp4_indexer_row
+from sglang.kernels.ops.attention.dsv4.fp4_indexer import (
+    quantize_fp4_indexer_row,
+    quantize_fp4_indexer_tensor,
+)
 from sglang.kernels.ops.attention.dsv4.fp4_rope_fake_quant import (
     FP4_AMAX_FLOOR,
     rope_tail_fake_quant_fp4_row,
@@ -40,7 +43,7 @@ _PREFILL_BASE_CTA_TARGET = 1024
 _DECODE_CTA_INFO_WIDTH = 4
 
 # Budget for the pooled prefill logits block, in MiB. Rows are split to fit it
-# (see `logits_rows_per_chunk`), so this caps the indexer's transient footprint
+# (see logits_rows_per_chunk), so this caps the indexer's transient footprint
 # independently of context length and chunked-prefill size; smaller budgets only
 # buy more row chunks. 2 GiB covers 4096 rows over ~512K tokens of context.
 _LOGITS_BUDGET_ELEMS = (
@@ -169,11 +172,11 @@ def _alloc_logits(
     """Hand out the [num_tokens, max_seq_len] fp32 scratch the logits kernel fills.
 
     Prefill rectangles are served from one fixed-size pooled block. A fresh
-    `torch.empty` per call would instead feed the caching allocator a
+    torch.empty per call would instead feed the caching allocator a
     monotonically growing size sequence -- the width tracks context length, and
     an agentic session's context only ever grows -- so every request is slightly
     larger than any cached block, none can be reused, and each strands a whole
-    segment. `reserved` then climbs while `allocated` stays flat, and that
+    segment. reserved then climbs while allocated stays flat, and that
     stranded memory is invisible to allocators that bypass torch: Triton kernel
     scratch fails with HSA_STATUS_ERROR_OUT_OF_RESOURCES instead of surfacing as
     a clean torch OOM. Serving every rectangle out of one block keeps the
@@ -248,7 +251,7 @@ def prepare_fp4_prefill_workspace(
     fall back to AITER's prefill scheduler, which frees the scratch its own
     schedule kernel reads, so a captured build would replay against recycled
     graph-pool memory. Callers instead refresh this workspace per step and let
-    the graph read only the pinned ``cta_info`` / ``logits`` / page-table
+    the graph read only the pinned cta_info / logits / page-table
     buffers.
     """
     from aiter.ops.flydsl.kernels.mqa_logits.pa_mqa_logits_fp4_prefill import (
@@ -568,13 +571,9 @@ def store_fp4_index_k_cache_split(
     page_size: int,
     rne: bool = False,
 ) -> None:
-    """Quantize `input` [n, 128] to fp4 (per-32 ue8m0) and scatter row i to slot
-    loc[i] of the split FlyDSL K layout (`payload` [pages, 1, 4, page_size, 16],
-    `scale` [pages, 1, 4, page_size] with the slot axis 16 x 4 transposed)."""
-    from sglang.kernels.ops.attention.dsv4.fp4_indexer import (
-        quantize_fp4_indexer_tensor,
-    )
-
+    """Quantize input [n, 128] to fp4 (per-32 ue8m0) and scatter row i to slot
+    loc[i] of the split FlyDSL K layout (payload [pages, 1, 4, page_size, 16],
+    scale [pages, 1, 4, page_size] with the slot axis 16 x 4 transposed)."""
     assert input.shape[-1] == _HEAD_DIM
     assert payload.shape[1:] == (1, 4, page_size, 16), payload.shape
     assert scale.shape[1:] == (1, 4, page_size), scale.shape
@@ -596,9 +595,9 @@ def store_fp4_index_k_cache_split(
 def read_fp4_index_k_split(
     payload: torch.Tensor, scale: torch.Tensor, slots: torch.Tensor, *, page_size: int
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Inverse of `store_fp4_index_k_cache_split`: (payload int8 [n, 64], scales
+    """Inverse of store_fp4_index_k_cache_split: (payload int8 [n, 64], scales
     int32 [n] with chunk c's e8m0 byte at bits 8c..8c+7), the layout of
-    `quantize_fp4_indexer_tensor`."""
+    quantize_fp4_indexer_tensor."""
     slots = slots.to(torch.int64)
     page, off = slots // page_size, slots % page_size
     rows = payload.view(torch.uint8)[page, 0, :, off, :]  # [n, 4, 16]
@@ -618,7 +617,7 @@ def _quantize_fp4_query_flydsl_kernel(
     BLOCK_N: tl.constexpr,
     GROUP_N: tl.constexpr,
 ):
-    """One program per (token, head slot of 64): ``quantize_fp4_indexer_row`` (RNE codes) with
+    """One program per (token, head slot of 64): quantize_fp4_indexer_row (RNE codes) with
     the e8m0 byte of chunk c stored straight into the FlyDSL scale layout
     [t, 0, c, h % 16, h // 16]; head slots past HEADS write zero bytes."""
     token_id = tl.program_id(0)
@@ -665,19 +664,6 @@ def pack_fp4_query_flydsl(q: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     return q_fp4, q_scale
 
 
-def rocm_indexer_head_weights_max_tokens(
-    n_heads: int, hidden_size: int, weight_dtype: torch.dtype
-) -> int:
-    """Rows up to which :func:`rocm_indexer_head_weights` serves ``weights_proj``,
-    -1 when the device (non-gfx95) or the shape rules it out."""
-    # lazy: the router module is ROCm-only and indexer init consults this on every platform
-    from sglang.kernels.ops.moe.rocm_router_gate import rocm_gemv_split_k_max_tokens
-
-    return rocm_gemv_split_k_max_tokens(
-        n=n_heads, k=hidden_size, weight_dtype=weight_dtype
-    )
-
-
 @triton.jit
 def _reduce_scale_bf16_block(
     block,
@@ -692,7 +678,7 @@ def _reduce_scale_bf16_block(
     SPLIT_K: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
-    """One ``BLOCK`` of ``_reduce_scale_bf16_kernel`` (shared with the fused index-Q launch)."""
+    """One BLOCK of _reduce_scale_bf16_kernel (shared with the fused index-Q launch)."""
     offs = block * BLOCK + tl.arange(0, BLOCK)
     m = offs // N
     n = offs % N
@@ -757,9 +743,9 @@ def _index_q_pack_weights_kernel(
     SPLIT_K: tl.constexpr,
     W_BLOCK: tl.constexpr,
 ):
-    """Grid (T * H + 1,). Program t * H + h: the query row through ``rope_tail_fake_quant_fp4_row``
-    (rounded to bf16 as the standalone kernel stores it) and ``quantize_fp4_indexer_row`` (RNE), in
-    the FlyDSL MQA-logits layout; program T * H: the head weights' ``_reduce_scale_bf16_block``."""
+    """Grid (T * H + 1,). Program t * H + h: the query row through rope_tail_fake_quant_fp4_row
+    (rounded to bf16 as the standalone kernel stores it) and quantize_fp4_indexer_row (RNE), in
+    the FlyDSL MQA-logits layout; program T * H: the head weights' _reduce_scale_bf16_block."""
     pid = tl.program_id(0)
     if pid < T * H:
         t = pid // H
@@ -819,10 +805,10 @@ def index_q_pack_weights_hip(
     *,
     num_heads: int,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """The HIP index-Q inputs in one launch: ``(q_fp4 [T, H, 64] int8, q_scale [T, 1, 4, 16, 4]
-    uint8, weights [T, H] bf16)``, bitwise ``pack_fp4_query_flydsl(_rope_fq4(q.view(T, H, 128),
-    freqs_cis[positions], rope_dim))`` and ``rocm_indexer_head_weights``'s reduce of the
-    ``[split_k, T, H]`` fp32 ``head_weight_partials``."""
+    """The HIP index-Q inputs in one launch: (q_fp4 [T, H, 64] int8, q_scale [T, 1, 4, 16, 4]
+    uint8, weights [T, H] bf16), bitwise pack_fp4_query_flydsl(_rope_fq4(q.view(T, H, 128),
+    freqs_cis[positions], rope_dim)) and rocm_indexer_head_weights's reduce of the
+    [split_k, T, H] fp32 head_weight_partials."""
     T = q.shape[0]
     H = num_heads
     assert q.dtype == torch.bfloat16 and q.dim() == 2 and q.shape[1] == H * 128
@@ -871,9 +857,9 @@ def index_q_pack_weights_hip(
 def rocm_indexer_head_weights(
     x: torch.Tensor, weight: torch.Tensor, scale: float
 ) -> torch.Tensor:
-    """``bf16(bf16(x @ weight.T) * scale)`` as a contiguous bf16 ``[M, N]``, the
-    layout the FlyDSL logits kernels take. ``x`` bf16 ``[M, K]`` with
-    ``M <= rocm_indexer_head_weights_max_tokens(...)``, ``weight`` bf16 ``[N, K]``."""
+    """bf16(bf16(x @ weight.T) * scale) as a contiguous bf16 [M, N], the
+    layout the FlyDSL logits kernels take. x bf16 [M, K] with
+    M <= rocm_indexer_head_weights_max_tokens(...), weight bf16 [N, K]."""
     from sglang.kernels.ops.moe.rocm_router_gate import rocm_router_gemv_split_k
 
     partials = rocm_router_gemv_split_k(x, weight)
@@ -924,7 +910,7 @@ def _sort_selection_rows_kernel(
 def sort_selection_rows(
     page_indices: torch.Tensor, raw_indices: Optional[torch.Tensor] = None
 ) -> None:
-    """Order every row of a top-k selection ascending by position (by slot without ``raw_indices``),
+    """Order every row of a top-k selection ascending by position (by slot without raw_indices),
     -1 padding last, in place: the sparse attention sums in the order given."""
     rows, k = page_indices.shape
     assert k & (k - 1) == 0, k

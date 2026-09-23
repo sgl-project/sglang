@@ -3,7 +3,7 @@
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 
-from .swapab_common import _load_v4
+from .swapab_common import load_v4
 
 
 @gluon.jit
@@ -50,16 +50,32 @@ def partial_gluon(
         length = gl.load(L + b)
         ids = gl.load(IDX + b * IS + at, at < NK, -1)
         valid = (at < NK) & (at < length) & (ids >= 0) & (ids < KTOKENS)
-        kv = _load_v4(
-            K, gl.maximum(ids, 0), valid, KP, KS, kv_layout, DATA_BYTES, SCALE_BYTES, TILE
+        kv = load_v4(
+            K,
+            gl.maximum(ids, 0),
+            valid,
+            KP,
+            KS,
+            kv_layout,
+            DATA_BYTES,
+            SCALE_BYTES,
+            TILE,
         )
     else:
         at = (t - KT) * BT + n
         length = gl.load(EL + b)
         ids = gl.load(EI + b * EIS + at, at < NE, -1)
         valid = (at < NE) & (at < length) & (ids >= 0) & (ids < ETOKENS)
-        kv = _load_v4(
-            E, gl.maximum(ids, 0), valid, EP, ES, kv_layout, DATA_BYTES, SCALE_BYTES, TILE
+        kv = load_v4(
+            E,
+            gl.maximum(ids, 0),
+            valid,
+            EP,
+            ES,
+            kv_layout,
+            DATA_BYTES,
+            SCALE_BYTES,
+            TILE,
         )
     qh = gl.arange(0, H, gl.SliceLayout(1, kv_layout))
     qd = gl.arange(0, 512, gl.SliceLayout(0, kv_layout))

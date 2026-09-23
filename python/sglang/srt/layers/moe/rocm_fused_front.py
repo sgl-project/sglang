@@ -1,5 +1,5 @@
-"""Glue for the one-launch ROCm MoE front (:func:`rocm_router_gate_sort`). aiter's sorting arguments
-appear only inside ``aiter.fused_moe``'s ``moe_sorting`` call, so the override records them per router
+"""Glue for the one-launch ROCm MoE front (rocm_router_gate_sort). aiter's sorting arguments
+appear only inside aiter.fused_moe's moe_sorting call, so the override records them per router
 on first sight and the next gate launch of that router sorts in the same launch; the override hands
 those outputs back only after checking they match its arguments, else it sorts the ids again."""
 
@@ -23,7 +23,7 @@ SortOutputs = Tuple[
 
 @dataclass(frozen=True)
 class SortConfig:
-    """What ``moe_sorting`` was asked for, beyond the ids themselves."""
+    """What moe_sorting was asked for, beyond the ids themselves."""
 
     local_expert_ids: torch.Tensor  # cached per expert mask, compared by storage
     num_experts: int
@@ -88,12 +88,13 @@ def gate_partials(
     partials: torch.Tensor,
     num_token_non_padded: Optional[torch.Tensor],
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """The ROCm decode gate on split-K partials: aiter's ``topk_gating`` weights and ids,
+    """The ROCm decode gate on split-K partials: aiter's topk_gating weights and ids,
     with aiter's sorting folded into the launch when this router's sorting arguments are
     known and the batch is small enough."""
     num_tokens, num_experts = gating_output.shape
     key = _router_key(correction_bias, num_tokens, topk, num_experts)
-    config = _sort_configs.get(key) if num_tokens <= ROCM_GATE_SORT_MAX_TOKENS else None
+    fusable = num_tokens <= ROCM_GATE_SORT_MAX_TOKENS
+    config = _sort_configs.get(key) if fusable else None
     if config is None:
         weights, ids = rocm_router_gate(
             gating_output,
@@ -122,7 +123,7 @@ def gate_partials(
         )
         weights, ids = gate_and_sort[0], gate_and_sort[1]
         outputs = gate_and_sort[2:]
-    if num_tokens <= ROCM_GATE_SORT_MAX_TOKENS:
+    if fusable:
         if len(_pending_sorts) >= _PENDING_LIMIT:
             _pending_sorts.clear()
         _pending_sorts[ids.data_ptr()] = _PendingSort(
@@ -131,7 +132,8 @@ def gate_partials(
     return weights, ids
 
 
-def _pop_pending(topk_ids: torch.Tensor) -> Optional[_PendingSort]:
+def pop_pending_sort(topk_ids: torch.Tensor) -> Optional[_PendingSort]:
+    """Drop and return what the gate launch of topk_ids recorded, if it still matches."""
     pending = _pending_sorts.pop(topk_ids.data_ptr(), None)
     if pending is None:
         return None
@@ -149,10 +151,10 @@ def take_pending_sort(
     config: SortConfig,
     num_token_non_padded: Optional[torch.Tensor],
 ) -> Optional[SortOutputs]:
-    """The sorting outputs the gate launch of ``topk_ids`` already produced for exactly
-    ``config`` and ``num_token_non_padded``, or None (and the arguments are recorded for the
+    """The sorting outputs the gate launch of topk_ids already produced for exactly
+    config and num_token_non_padded, or None (and the arguments are recorded for the
     router's next gate launch)."""
-    pending = _pop_pending(topk_ids)
+    pending = pop_pending_sort(topk_ids)
     if pending is None:
         return None
     if (
@@ -167,8 +169,8 @@ def take_pending_sort(
 
 
 def disable_pending_sort(topk_ids: torch.Tensor) -> None:
-    """``moe_sorting`` was called in a form the fused launch cannot serve: stop fusing the
+    """moe_sorting was called in a form the fused launch cannot serve: stop fusing the
     sorting for this router."""
-    pending = _pop_pending(topk_ids)
+    pending = pop_pending_sort(topk_ids)
     if pending is not None:
         _sort_configs[pending.key] = None

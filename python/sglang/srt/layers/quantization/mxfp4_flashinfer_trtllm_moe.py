@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import functools
 import logging
 from typing import TYPE_CHECKING, NamedTuple, Optional, Tuple
 
@@ -104,7 +105,7 @@ def routed_hidden_size(layer: Module) -> int:
 
 
 class Mxfp8RoutedInputPreQuant(NamedTuple):
-    """MXFP8 linear-layout quant of the routed MoE input. ``ready`` is recorded on
+    """MXFP8 linear-layout quant of the routed MoE input. ready is recorded on
     the producing stream; the consumer must wait on it before the routed MoE op."""
 
     x_q: torch.Tensor
@@ -128,7 +129,7 @@ class Mxfp4FlashinferTrtllmMoEMethod:
     def create_moe_runner(self, layer, moe_runner_config):
         self.moe_runner_config = moe_runner_config
         # Applies flashinfer trtllm directly instead of going through a
-        # MoeRunner; FusedMoE still reads `.runner`, and this class is not a
+        # MoeRunner; FusedMoE still reads .runner, and this class is not a
         # FusedMoEMethodBase subclass so it inherits no default.
         self.runner = None
 
@@ -478,6 +479,7 @@ class Mxfp4FlashinferTrtllmMoEMethod:
         return StandardCombineInput(hidden_states=output)
 
 
+@functools.cache
 def _shared_add_fused_methods() -> tuple:
     from sglang.srt.layers.quantization.expert_pack import ExpertPackMoEMethod
     from sglang.srt.layers.quantization.mxfp4_flashinfer_cutlass_moe import (
@@ -496,11 +498,10 @@ def _shared_add_fused_methods() -> tuple:
 
 
 def shared_add_alpha(experts, routed_scaling_factor: float) -> float:
-    """The ``alpha`` for which ``maybe_fuse_routed_scale_and_shared_add(experts, routed,
-    shared, routed_scaling_factor)`` computes ``shared + alpha * routed``."""
-    if isinstance(experts.quant_method, _shared_add_fused_methods()):
-        if experts.should_fuse_routed_scaling_factor_in_topk:
-            return 1.0
+    """The alpha for which maybe_fuse_routed_scale_and_shared_add(experts, routed,
+    shared, routed_scaling_factor) computes shared + alpha * routed."""
+    fused = isinstance(experts.quant_method, _shared_add_fused_methods())
+    if fused and not experts.should_fuse_routed_scaling_factor_in_topk:
         return float(routed_scaling_factor)
     return 1.0
 
@@ -511,11 +512,11 @@ def maybe_fuse_routed_scale_and_shared_add(
     shared: torch.Tensor | None,
     routed_scaling_factor: float,
 ) -> torch.Tensor:
-    # When MxFP4 fusion is on, the upstream `routed *= scale` is skipped and
-    # the scaling is folded into the shared-add via `shared.add_(routed,
-    # alpha=scale)`. With no shared output, the missing scale is applied
-    # in-place. Otherwise `routed` is already scale-final and we just add
-    # `shared` (or pass through if there is none).
+    # When MxFP4 fusion is on, the upstream routed *= scale is skipped and
+    # the scaling is folded into the shared-add via shared.add_(routed,
+    # alpha=scale). With no shared output, the missing scale is applied
+    # in-place. Otherwise routed is already scale-final and we just add
+    # shared (or pass through if there is none).
     fused = isinstance(experts.quant_method, _shared_add_fused_methods())
     if fused:
         already_scaled = experts.should_fuse_routed_scaling_factor_in_topk

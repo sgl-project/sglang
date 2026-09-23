@@ -54,12 +54,9 @@ from sglang.srt.utils.hf_transformers.tokenizer import get_tokenizer
 logger = logging.getLogger(__name__)
 
 
+_is_hip = is_hip()
+
 _MILLER_RABIN_WITNESSES = (2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37)
-
-
-def _gpu_kernels(t: torch.Tensor) -> bool:
-    """True where the Triton kernels apply; CPU tensors take the torch paths."""
-    return t.is_cuda
 
 
 def _is_prime(n: int) -> bool:
@@ -318,7 +315,7 @@ class EngramHasher(nn.Module):
             commit_rows = torch.where(lens > 0, req_slots, self.pad_row)
             commit_last = (starts + lens - 1).clamp(0, num_tokens - 1)
 
-        if _gpu_kernels(input_ids):
+        if input_ids.is_cuda:
             if kmode == MODE_DECODE:
                 # out_cache_loc 0 marks the CUDA-graph padded rows that must not commit.
                 assert forward_batch.out_cache_loc is not None
@@ -390,7 +387,7 @@ class EngramHasher(nn.Module):
         starts: Optional[torch.Tensor],
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Non-CUDA fallback of the hash kernel: predecessor table [T, n] and hash ids.
-        ``history`` is already the per-request [bs, n - 1] rows of this batch."""
+        history is already the per-request [bs, n - 1] rows of this batch."""
         n = self.max_ngram_size
         num_tokens = input_ids.shape[0]
         device = input_ids.device
@@ -453,7 +450,7 @@ class EngramHasher(nn.Module):
     ) -> None:
         """Commit anchor + accepted drafts; the bonus is the next block's anchor."""
         assert self.history is not None, "EngramHasher.init_history was not called"
-        if _gpu_kernels(self.history):
+        if self.history.is_cuda:
             engram_commit_history(
                 self.history, verify_ids_2d, req_pool_indices, commit_lens
             )
@@ -780,7 +777,7 @@ class EngramEmbedding(nn.Module):
         return values
 
     def _reduce_owned_rows(self, values: torch.Tensor) -> torch.Tensor:
-        if is_hip() and values.is_cuda:
+        if _is_hip and values.is_cuda:
             # Integer addition preserves all BF16 bits because exactly one shard owns each row.
             inplace_all_reduce(
                 values.view(torch.int32), group_name=get_parallel().tp_group.unique_name
@@ -794,10 +791,10 @@ class EngramEmbedding(nn.Module):
         )
 
     def _owned_rows(self, indices: torch.Tensor) -> torch.Tensor:
-        """Rows of `indices` this rank's shard holds, zero for the rest."""
+        """Rows of indices this rank's shard holds, zero for the rest."""
         if self.rows == 0:
             return self._empty(indices).zero_()
-        if self.host_table is None and not _gpu_kernels(indices):
+        if self.host_table is None and not indices.is_cuda:
             local = indices - self.row_start
             owned = (local >= 0) & (local < self.rows)
             local = local.masked_fill(~owned, 0)
@@ -843,7 +840,7 @@ class EngramEmbedding(nn.Module):
             and self.tp_size == get_parallel().attn_dp_size
             and rows == self.tp_size * local.shape[0]
         ) or is_dp_gatherv_active():
-            if is_hip() and values.is_cuda:
+            if _is_hip and values.is_cuda:
                 dp_reduce_scatter_tensor(
                     local.view(torch.int32), values.view(torch.int32)
                 )
@@ -865,11 +862,11 @@ def engram_gate(
 ) -> torch.Tensor:
     """x [T, hc_mult, dim]; kv [T, (hc_mult + 1) * dim] holds one key per hc copy
     followed by the shared value. Adds the gated value to every copy.
-    ``image_select = (input_ids, image_token_id)`` keeps ``x`` on the image-token rows.
+    image_select = (input_ids, image_token_id) keeps x on the image-token rows.
 
     The torch path below is the CPU fallback."""
     if (
-        _gpu_kernels(x)
+        x.is_cuda
         and x.ndim == 3
         and kv.shape == (x.shape[0], (x.shape[1] + 1) * x.shape[2])
         and x.dtype == kv.dtype

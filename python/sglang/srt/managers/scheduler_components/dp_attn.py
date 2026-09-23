@@ -210,9 +210,9 @@ class MLPSyncBatchInfo:
             )
         tp_info[tp_active_ranks[:num_ranks_in_tp_info] == 0] = fallback_tensor
 
-        # One D2H for every field: each `.item()` / `.tolist()` on a device
+        # One D2H for every field: each .item() / .tolist() on a device
         # tensor is its own stream sync. Copy the whole tensor, not the
-        # `[:, 0, :]` slice -- that slice is non-contiguous once
+        # [:, 0, :] slice -- that slice is non-contiguous once
         # attn_tp * attn_cp > 1, adding a gather kernel inside the wait.
         tp0_info_cpu = global_info_tensor.cpu()[:, 0, :]
         self.tp0_info_cpu = tp0_info_cpu
@@ -274,10 +274,11 @@ def should_skip_scheduler_all_gather(dp_size: int) -> bool:
 
 def _local_max_seq_len(local_batch: ScheduleBatch) -> int:
     """Longest sequence (prompt + generated so far) of this rank's batch."""
-    seq_lens_cpu = getattr(local_batch, "seq_lens_cpu", None)
+    seq_lens_cpu = local_batch.seq_lens_cpu
     if seq_lens_cpu is not None and seq_lens_cpu.numel() > 0:
         return int(seq_lens_cpu.max())
-    seq_lens = getattr(local_batch, "seq_lens", None)
+    # no host mirror after a no-sync verify merge: one scalar D2H per step
+    seq_lens = local_batch.seq_lens
     if seq_lens is not None and seq_lens.numel() > 0:
         return int(seq_lens.max().item())
     return 0
@@ -532,8 +533,8 @@ def prepare_mlp_sync_batch_raw(
             skip_global_metadata=not metadata_ready,
         )
 
-    # Set on `local_batch`, not `batch_to_gather`: for PREBUILT batches the
-    # scheduler's `last_batch` is the prebuilt batch, not its inner idle batch.
+    # Set on local_batch, not batch_to_gather: for PREBUILT batches the
+    # scheduler's last_batch is the prebuilt batch, not its inner idle batch.
     if local_batch is not None and metadata_ready:
         local_batch.recv_skipper_forward_mode = (
             SchedulerRecvSkipper.derive_forward_mode(

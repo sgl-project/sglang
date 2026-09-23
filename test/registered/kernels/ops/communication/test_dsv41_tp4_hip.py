@@ -97,6 +97,8 @@ def _layer(group):
         config=SimpleNamespace(model_type="deepseek_v41"),
         dsa_enable_prefill_cp=False,
         hc_pre_from_prev_sublayer=False,
+        _hc_attn_bf16_parts=None,
+        _hc_ffn_bf16_parts=None,
         self_attn=_Attention(group),
         mlp=SimpleNamespace(tp_size=1),
         hc_mult=4,
@@ -135,8 +137,8 @@ def _no_deterministic_inference():
 
 
 def _replay_fused_and_unfused(group, run, check, *, residual, pre):
-    """Capture ``run`` with the fused all-reduce off and on, then replay both on new
-    inputs and compare through ``check``."""
+    """Capture run with the fused all-reduce off and on, then replay both on new
+    inputs and compare through check."""
     graphs = []
     for enabled in (False, True):
         # the server hook turns the tilelang post off on ROCm at model load
@@ -280,7 +282,7 @@ def test_moe_model_handoff(group, rows, dual, defer, shared_tp1):
 
 
 def _replay_and_check(group, m, width, last, perturb):
-    """Capture the selection graph, then replay it under `perturb`."""
+    """Capture the selection graph, then replay it under perturb."""
     transport = make_vocab_gather(
         group, local_width=width, prefer_nvlink=False, symm_rows=0
     )

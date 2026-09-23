@@ -228,9 +228,9 @@ def _maybe_precompute_flashmla_sched_meta(
     extra_indices: Optional[torch.Tensor],
     extra_topk_length: Optional[torch.Tensor],
 ) -> None:
-    """Fill the split-KV schedule buffers so `sparse_decode_fwd` skips its own
-    `<<<1, 32>>>` scheduling kernel on the decode critical path;
-    `flashmla_sched_meta` produces the same schedule bit for bit."""
+    """Fill the split-KV schedule buffers so sparse_decode_fwd skips its own
+    <<<1, 32>>> scheduling kernel on the decode critical path;
+    flashmla_sched_meta produces the same schedule bit for bit."""
     if flashmla_metadata is None:
         return
     if getattr(flashmla_metadata, "tile_scheduler_metadata", None) is not None:
@@ -988,7 +988,7 @@ class DSV4Metadata:
     candidate_metadata: Optional[CandidateMetadata] = None
 
     # Built at the runner's prefill WAR boundary when the fast path is on,
-    # otherwise lazily by ``_forward_prefill_sparse``.
+    # otherwise lazily by _forward_prefill_sparse.
     sparse_prefill_cache: Optional[SparsePrefillChunkCache] = None
     prefill_shared_reads_snapshotted: bool = False
 
@@ -2985,12 +2985,20 @@ class DeepseekV4AttnBackend(
             assert out_loc is not None
             if pool.low_ratio_index_k_is_split(layer_id):
                 # ROCm keeps the index-K payload and scales in two buffers
-                from sglang.srt.layers.attention.dsv4.low_ratio_backend_hip import (
-                    store_index_k_norm_rope_split,
+                from sglang.kernels.ops.attention.dsv4.fp4_rope_hip import (
+                    index_k_norm_rope_pack_store_split,
                 )
 
-                store_index_k_norm_rope_split(
-                    pool, layer, latent, pos, out_loc, freqs_cis
+                index_k_norm_rope_pack_store_split(
+                    indexer.forward_wk(latent),
+                    indexer.k_norm.weight.data,
+                    indexer.k_norm.eps,
+                    freqs_cis,
+                    pos,
+                    out_loc,
+                    pool.get_index_k_fp4_payload_buffer(layer_id),
+                    pool.get_index_k_fp4_scale_buffer(layer_id),
+                    ratio=layer.compress_ratio,
                 )
                 return
             index_k_norm_rope_pack_store(
@@ -3956,7 +3964,7 @@ class DeepseekV4AttnBackend(
         cache (c4/c128) into a flat bf16 workspace, then lets
         flash_mla_sparse_fwd consume the workspace via per-query rebased
         indices. Chunk-invariant scaffolding lives in
-        ``self.forward_metadata.sparse_prefill_cache``.
+        self.forward_metadata.sparse_prefill_cache.
         """
         if _is_xpu:
             from sgl_kernel import flash_mla_sparse_fwd
@@ -4089,10 +4097,10 @@ class DeepseekV4AttnBackend(
     ) -> torch.Tensor:
         """Experimental DeepSeek-V4 sparse prefill path using Q8KV8 kernels.
 
-        This mirrors ``_forward_prefill_sparse``'s cache/index construction, but
+        This mirrors _forward_prefill_sparse's cache/index construction, but
         writes the gathered KV workspace as FP8 and calls the SM90 Q8KV8 sparse
-        prefill kernel. The path is selected by ``--dsv4-prefill-backend
-        flashmla_sparse_q8``; ``SGLANG_DSV4_Q8KV8_PREFILL`` remains as a debug
+        prefill kernel. The path is selected by --dsv4-prefill-backend
+        flashmla_sparse_q8; SGLANG_DSV4_Q8KV8_PREFILL remains as a debug
         override for focused runtime validation.
         """
 

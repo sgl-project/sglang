@@ -1,6 +1,6 @@
-"""ROCm glue of `deepseek_v4`: the branches the model takes under `_is_hip`, bound there as
-`_hip`. The gfx950 dense fp8 routes live in `deepseek_v4_gfx95_dense`, the fused mHC
-boundary in `deepseek_v4_fused_mhc`."""
+"""ROCm glue of deepseek_v4: the branches the model takes under _is_hip, bound there as
+_hip. The gfx950 dense fp8 routes live in deepseek_v4_gfx95_dense, the fused mHC
+boundary in deepseek_v4_fused_mhc."""
 
 from __future__ import annotations
 
@@ -18,10 +18,8 @@ from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context
     is_in_breakable_cuda_graph,
 )
 from sglang.srt.models.deepseek_common.amd import deepseek_v4_gfx95_dense as gfx95_dense
-from sglang.srt.models.deepseek_common.amd.deepseek_v4_fused_mhc import (
-    apply_attention_mhc as apply_attention_mhc,
-)
-from sglang.srt.models.deepseek_common.amd.deepseek_v4_fused_mhc import (
+from sglang.srt.models.deepseek_common.amd.deepseek_v4_fused_mhc import (  # noqa: F401  deepseek_v4 reaches apply_attention_mhc through this module
+    apply_attention_mhc,
     forward_hc_pre_from_prev_fused_boundary,
 )
 
@@ -46,7 +44,7 @@ def use_fused_qk_norm_rope(attn, quant_config) -> bool:
 
 
 def q_norm_for_wq_b(attn, q_lora: torch.Tensor) -> Tuple[torch.Tensor, object]:
-    """`attn.q_norm(q_lora)` as (the bf16 norm the indexer reads, the operand `wq_b`
+    """attn.q_norm(q_lora) as (the bf16 norm the indexer reads, the operand wq_b
     consumes); on the gfx950 32-block route the second is already on the fp8 grid."""
     if attn.fused_rmsnorm_fake_quant:
         return gfx95_dense.q_norm_fake_quant(attn, q_lora)
@@ -69,7 +67,7 @@ def fuses_q_rope_into_k_store(
 
 
 def wq_b_unroped(attn, q) -> torch.Tensor:
-    """`attn._compute_q_b` without the RoPE, which the K store launch applies."""
+    """attn._compute_q_b without the RoPE, which the K store launch applies."""
     q, _ = attn.wq_b(q)
     return q.view(-1, attn.n_local_heads, attn.head_dim)
 
@@ -82,7 +80,7 @@ def skip_head_pad(attn) -> bool:
 def attention_inv_rope(
     attn, positions: torch.Tensor, forward_batch, *, wo_a_applies_inv_rope: bool
 ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
-    """`(freqs_real, positions)` for the attention kernel to apply the inverse RoPE itself;
+    """(freqs_real, positions) for the attention kernel to apply the inverse RoPE itself;
     None where the fp8 wo_a front end or the prefill graph op keeps it."""
     if wo_a_applies_inv_rope:
         return None
@@ -95,18 +93,19 @@ def attention_inv_rope(
 
 
 def input_norm(
-    layer, hidden_states: torch.Tensor, allow_aiter_quant: bool, coefficients
+    layer,
+    hidden_states: torch.Tensor,
+    allow_aiter_quant: bool,
+    coefficients,
+    fused_rmsnorm_fp8_quant,
 ) -> Tuple[torch.Tensor, Optional[object]]:
-    """`layer.input_layernorm(hidden_states)` as (the bf16 norm attention reads, the
-    pre-quantized operand of its dense projections or None). ``coefficients`` is the fused
+    """layer.input_layernorm(hidden_states) as (the bf16 norm attention reads, the
+    pre-quantized operand of its dense projections or None). coefficients is the fused
     boundary's pending reduce + sinkhorn, hosted by the gfx950 norm launch when that one runs."""
     if layer.fused_rmsnorm_fp8_quant and allow_aiter_quant:
-        # deepseek_v4 binds this module at import, so the helper is read at call time
-        from sglang.srt.models.deepseek_v4 import _fused_rmsnorm_fp8_quant
-
         if coefficients is not None:
             coefficients.materialize()
-        x_quant, hidden_states = _fused_rmsnorm_fp8_quant(
+        x_quant, hidden_states = fused_rmsnorm_fp8_quant(
             hidden_states, layer.input_layernorm.weight, layer.rms_norm_eps
         )
         return hidden_states, x_quant
@@ -121,8 +120,8 @@ def input_norm(
 
 
 def engram_image_select(config, input_ids: torch.Tensor):
-    """`(input_ids, image_token_id)` when the fused Engram gate keeps the image-token rows
-    itself (the model's `torch.where` after the gate), else None."""
+    """(input_ids, image_token_id) when the fused Engram gate keeps the image-token rows
+    itself (the model's torch.where after the gate), else None."""
     if not (config.model_type == "deepseek_v41" and config.vision_n_layers > 0):
         return None
     if not (input_ids.is_cuda and hip_fused_decode_glue()):
@@ -143,9 +142,9 @@ def forward_layer_fused_boundary(
     pending_post: Optional[Tuple[torch.Tensor, ...]],
     capture_dspark: bool,
 ):
-    """Layer `i` through the fused mHC boundary. Its FFN hc_post stays pending for the next
+    """Layer i through the fused mHC boundary. Its FFN hc_post stays pending for the next
     layer's boundary launch unless that layer reads the residual stream first (Engram gate,
-    DSpark capture) or there is none; `hidden_states` is None while a post is pending."""
+    DSpark capture) or there is none; hidden_states is None while a post is pending."""
     nxt = i + 1
     defer_post = (
         nxt < model.end_layer

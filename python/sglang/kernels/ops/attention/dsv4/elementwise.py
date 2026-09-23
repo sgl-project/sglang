@@ -317,6 +317,7 @@ def fused_k_norm_rope_flashmla(
             kv, kv_weight, freqs_real, positions, out_loc, kvcache, eps, page_size
         )
     elif q is not None:
+        assert _is_hip, "only the ROCm K launch ropes q"
         module = _jit_main_k_norm_rope_q_flashmla_module(
             kv.dtype, head_dim, rope_dim, page_size, layout
         )

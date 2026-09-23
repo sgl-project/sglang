@@ -1,6 +1,6 @@
 """gfx950 dense route of the DeepSeek-V4 attention for 32-wide-block (V4.1) fp8 checkpoints: the
-fused RMSNorm + fake-quant producers hand ``wqkv_a`` / ``wq_b`` their operand on the fp8 grid
-(``Fp8GridActivation``) or as native MXFP8 (``Mxfp8Activation``); ``deepseek_v4`` binds it under ``_is_hip``."""
+fused RMSNorm + fake-quant producers hand wqkv_a / wq_b their operand on the fp8 grid
+(Fp8GridActivation) or as native MXFP8 (Mxfp8Activation); deepseek_v4 binds it under _is_hip."""
 
 from __future__ import annotations
 
@@ -25,33 +25,25 @@ _is_gfx95_supported = is_gfx95_supported()
 _is_gfx1250_supported = is_gfx1250_supported()
 _use_aiter = envs.SGLANG_USE_AITER.get() and _is_hip
 
-Fp8GridActivation = None
-Mxfp8Activation = None
-rmsnorm_fake_quant_fp8 = None
-rmsnorm_with_sinkhorn = None
-if _is_hip and _is_gfx95_supported:
-    from sglang.kernels.ops.layernorm.mhc_boundary_hip import rmsnorm_with_sinkhorn
-    from sglang.kernels.ops.quantization.mxfp8_amd_gfx95 import (
-        Fp8GridActivation,
-        Mxfp8Activation,
-    )
-    from sglang.kernels.ops.quantization.rmsnorm_fake_quant_amd_gfx95 import (
-        rmsnorm_fake_quant_fp8,
-    )
+from sglang.kernels.ops.layernorm.mhc_boundary_hip import rmsnorm_with_sinkhorn
+from sglang.kernels.ops.quantization.mxfp8_amd_gfx95 import (
+    Fp8GridActivation,
+    Mxfp8Activation,
+)
+from sglang.kernels.ops.quantization.mxfp8_native_amd_gfx95 import (
+    native_consumer_wants_fp8,
+)
+from sglang.kernels.ops.quantization.rmsnorm_fake_quant_amd_gfx95 import (
+    rmsnorm_fake_quant_fp8,
+)
+from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
 
 # aiter batched GEMM fork with wo_b's fp8-grid rounding in its epilogue; None keeps the aiter kernel
 _wo_a_fp8_grid_gemm = None
 if _use_aiter and _is_gfx95_supported and envs.SGLANG_OPT_USE_AITER_BATCHED_GEMM.get():
-    try:
-        from sglang.kernels.ops.gemm.gfx95_batched_gemm_bf16_fp8_grid import (
-            batched_gemm_bf16_fp8_grid as _wo_a_fp8_grid_gemm,
-        )
-    except (ImportError, RuntimeError) as err:
-        logger.warning(
-            "wo_a fp8-grid batched GEMM import failed; the aiter kernel and a "
-            "separate fake-quant serve wo_a -> wo_b for this process: %s",
-            err,
-        )
+    from sglang.kernels.ops.gemm.gfx95_batched_gemm_bf16_fp8_grid import (
+        batched_gemm_bf16_fp8_grid as _wo_a_fp8_grid_gemm,
+    )
 
 
 def fused_rmsnorm_fp8_quant_eligible(
@@ -70,28 +62,26 @@ def fused_rmsnorm_fp8_quant_eligible(
 def fused_rmsnorm_fake_quant_eligible(
     quant_config: Optional[QuantizationConfig],
 ) -> bool:
-    """Whether `rmsnorm_fake_quant_fp8` applies: gfx950 with a 32-wide-block checkpoint
+    """Whether rmsnorm_fake_quant_fp8 applies: gfx950 with a 32-wide-block checkpoint
     (V4.1), whose dense route takes the norm output already on the fp8 grid as an
-    `Fp8GridActivation`."""
+    Fp8GridActivation."""
     if not (_is_hip and _is_gfx95_supported and isinstance(quant_config, Fp8Config)):
         return False
     block = quant_config.weight_block_size
-    if (
-        block is None
-        or len(block) != 2
-        or block[1] != 32
-        or quant_config.scale_fmt != "ue8m0"
-    ):
-        return False
-    return resolve_block_fp8_mxfp8_backend().takes_fp8_grid_activation()
+    return (
+        block is not None
+        and block[1] == 32
+        and quant_config.scale_fmt == "ue8m0"
+        and resolve_block_fp8_mxfp8_backend().is_gfx95_mxfp8_native()
+    )
 
 
 def _native_mxfp8_consumer(linear: Optional[nn.Module]) -> Optional[Tuple[int, int]]:
-    """``(N, K)`` of ``linear`` when it runs the gfx950 native MXFP8 route with a weight the
+    """(N, K) of linear when it runs the gfx950 native MXFP8 route with a weight the
     native kernels tile (it then consumes fp8 + ue8m0 scales directly), else None."""
-    from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
-
-    quant_method = getattr(linear, "quant_method", None)
+    if linear is None:
+        return None
+    quant_method = linear.quant_method
     if not (
         isinstance(quant_method, Fp8LinearMethod)
         and quant_method.block_fp8_as_mxfp8
@@ -110,10 +100,6 @@ def _emit_native_fp8(consumer: Optional[Tuple[int, int]], num_tokens: int) -> bo
     buckets keep the fp8-grid bf16 operand)."""
     if consumer is None:
         return False
-    from sglang.kernels.ops.quantization.mxfp8_native_amd_gfx95 import (
-        native_consumer_wants_fp8,
-    )
-
     return native_consumer_wants_fp8(num_tokens, consumer[0], consumer[1])
 
 
@@ -122,7 +108,7 @@ def _fake_quant_applies(norm: nn.Module, x: torch.Tensor) -> bool:
 
 
 def q_norm_fake_quant(attn, q_lora: torch.Tensor) -> Tuple[torch.Tensor, object]:
-    """`attn.q_norm(q_lora)` as (the bf16 norm the indexer reads, the operand `wq_b`
+    """attn.q_norm(q_lora) as (the bf16 norm the indexer reads, the operand wq_b
     consumes, already on the fp8 grid); the plain norm, twice, when the rows are not
     a 2-D bf16 batch."""
     if not _fake_quant_applies(attn.q_norm, q_lora):
@@ -143,8 +129,8 @@ def q_norm_fake_quant(attn, q_lora: torch.Tensor) -> Tuple[torch.Tensor, object]
 def input_norm_fake_quant(
     layer, hidden_states: torch.Tensor, coefficients=None
 ) -> Tuple[torch.Tensor, Optional[object]]:
-    """`layer.input_layernorm(hidden_states)` as (the bf16 norm attention reads, the fp8-grid operand
-    of its dense projections, or None for non-2-D / non-bf16 rows). ``coefficients`` rides in the norm
+    """layer.input_layernorm(hidden_states) as (the bf16 norm attention reads, the fp8-grid operand
+    of its dense projections, or None for non-2-D / non-bf16 rows). coefficients rides in the norm
     launch when the fused kernel runs, else it is materialized here."""
     norm = layer.input_layernorm
     if not _fake_quant_applies(norm, hidden_states):
@@ -154,7 +140,7 @@ def input_norm_fake_quant(
     if not layer._wqkv_a_native_consumer_checked:
         # wqkv_a exists only when the q / kv projections are fused
         layer._wqkv_a_native_consumer = _native_mxfp8_consumer(
-            getattr(layer.self_attn, "wqkv_a", None)
+            layer.self_attn.wqkv_a if layer.self_attn.fuse_wqa_wkv else None
         )
         layer._wqkv_a_native_consumer_checked = True
     emit_fp8 = _emit_native_fp8(layer._wqkv_a_native_consumer, hidden_states.shape[0])
@@ -177,8 +163,8 @@ def input_norm_fake_quant(
 
 
 def post_attention_norm(layer, x: torch.Tensor, coefficients=None) -> torch.Tensor:
-    """`layer.post_attention_layernorm(x)`; with ``coefficients`` (``HcCoefficients`` of the
-    boundary that produced ``x``) still pending, the reduce + sinkhorn rides in the norm
+    """layer.post_attention_layernorm(x); with coefficients (HcCoefficients of the
+    boundary that produced x) still pending, the reduce + sinkhorn rides in the norm
     launch, which then is the Triton row norm rather than the aiter one."""
     norm = layer.post_attention_layernorm
     if (
@@ -197,39 +183,34 @@ def post_attention_norm(layer, x: torch.Tensor, coefficients=None) -> torch.Tens
 
 
 def live_rows(activation, num_tokens: int):
-    """The first ``num_tokens`` rows of a break input; the gfx950 fused q_norm
-    hands the indexer its ``Fp8GridActivation`` wrapper, whose rows live in ``.x``."""
-    if _is_hip and _is_gfx95_supported:
-        if isinstance(activation, Fp8GridActivation):
-            return Fp8GridActivation(activation.x[:num_tokens])
-        if isinstance(activation, Mxfp8Activation):
-            return Mxfp8Activation(
-                activation.q[:num_tokens], activation.scale[:num_tokens]
-            )
+    """The first num_tokens rows of a break input; the gfx950 fused q_norm
+    hands the indexer its Fp8GridActivation wrapper, whose rows live in .x."""
+    if isinstance(activation, Fp8GridActivation):
+        return Fp8GridActivation(activation.x[:num_tokens])
+    if isinstance(activation, Mxfp8Activation):
+        return Mxfp8Activation(activation.q[:num_tokens], activation.scale[:num_tokens])
     return activation[:num_tokens]
 
 
 def wo_b_takes_fp8_grid(attn) -> bool:
-    """Whether ``attn.wo_b`` consumes an ``Fp8GridActivation``, which the ``wo_a`` GEMM
+    """Whether attn.wo_b consumes an Fp8GridActivation, which the wo_a GEMM
     then emits from its epilogue; resolved on first use, once the weights are loaded."""
     if attn._wo_b_fp8_grid_operand is None:
-        from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
-
-        quant_method = getattr(attn.wo_b, "quant_method", None)
+        quant_method = attn.wo_b.quant_method
         attn._wo_b_fp8_grid_operand = bool(
             _wo_a_fp8_grid_gemm is not None
             and isinstance(quant_method, Fp8LinearMethod)
             and quant_method.block_fp8_as_mxfp8
             and attn.wo_b.block_fp8_mxfp8_ready
-            and quant_method.mxfp8_dense_backend.takes_fp8_grid_activation()
+            and quant_method.mxfp8_dense_backend.is_gfx95_mxfp8_native()
         )
     return attn._wo_b_fp8_grid_operand
 
 
 def wo_a_fp8_grid_matmul(o: torch.Tensor, wo_a: torch.Tensor, fp8_grid: bool):
-    """``o [T, G, D] @ wo_a [G, R, D]^T`` through the gfx950 fork of the aiter batched
-    GEMM: bf16 ``[T, G, R]``, or with ``fp8_grid`` rounded onto ``wo_b``'s fp8 grid as
-    an ``Fp8GridActivation`` ``[T, G * R]``; None when the fork did not import."""
+    """o [T, G, D] @ wo_a [G, R, D]^T through the gfx950 fork of the aiter batched
+    GEMM: bf16 [T, G, R], or with fp8_grid rounded onto wo_b's fp8 grid as
+    an Fp8GridActivation [T, G * R]; None when the fork did not import."""
     if _wo_a_fp8_grid_gemm is None:
         return None
     # the split-K regime ends at 64 rows, so a request's verify and decode rows would

@@ -19,7 +19,6 @@ def _silu_and_mul_clamp_kernel(
     x_ptr,
     out_ptr,
     scale_ptr,
-    M,
     inter_size,
     stride_xm,
     stride_om,
@@ -81,7 +80,7 @@ def silu_and_mul_clamp_triton(
     emit_fp8: bool = False,
 ):
     """gate_up [M, 2 * inter_size] -> [M, inter_size] = silu(min(g, lim)) * clamp(u, -lim, lim), as
-    ``Fp8GridActivation`` with ``fp8_grid`` or ``Mxfp8Activation`` with ``emit_fp8``."""
+    Fp8GridActivation with fp8_grid or Mxfp8Activation with emit_fp8."""
     assert gate_up.dim() == 2 and gate_up.shape[1] % 2 == 0, gate_up.shape
     M, N = gate_up.shape
     inter_size = N // 2
@@ -110,7 +109,6 @@ def silu_and_mul_clamp_triton(
         gate_up,
         out,
         scale if scale is not None else out,
-        M,
         inter_size,
         gate_up.stride(0),
         out.stride(0),

@@ -31,7 +31,7 @@ class DsaGraphVariants:
 
     def select(self, forward_batch: ForwardBatch) -> str:
         seq_lens_cpu = forward_batch.seq_lens_cpu
-        dp_max_seq_len = getattr(forward_batch, "dp_max_seq_len", None)
+        dp_max_seq_len = forward_batch.dp_max_seq_len
         if dp_max_seq_len is not None:
             max_kv_len = dp_max_seq_len
         elif seq_lens_cpu is not None and seq_lens_cpu.numel() > 0:
@@ -77,7 +77,7 @@ class Dsv41CandidateGraphVariants:
 
     def select(self, forward_batch: ForwardBatch) -> str:
         lengths = getattr(forward_batch, "seq_lens_cpu", None)
-        max_seq_len = getattr(forward_batch, "dp_max_seq_len", None)
+        max_seq_len = forward_batch.dp_max_seq_len
         if (
             max_seq_len is None
             and lengths is not None

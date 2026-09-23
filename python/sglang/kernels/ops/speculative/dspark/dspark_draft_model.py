@@ -210,7 +210,7 @@ _MARKOV_BLOCK_R = 32
 class MarkovGreedyStep:
     """One greedy markov draft step, fused.
 
-    Computes ``argmax_v(base_logits[:, v] + dot(w2_weight[v, :], prev_embeds))``
+    Computes argmax_v(base_logits[:, v] + dot(w2_weight[v, :], prev_embeds))
     in a single pass over the (vocab x rank) weight: no full-vocab bias or
     step-logits materialization, no separate GEMV / add / two-pass argmax
     launches. Numerics: the dot and the add accumulate in fp32, while the eager
@@ -484,11 +484,8 @@ def _block_quant_stack_applies(*, wkv_linears: list[torch.nn.Module]) -> bool:
     block_quant = hasattr(quant_method, "block_quant") and quant_method.block_quant
     if not (block_quant and hasattr(quant_method, "w8a8_block_fp8_linear")):
         return False
-    # gfx950 routes ue8m0 block-fp8 through the MXFP8 linear and leaves w8a8_block_fp8_linear unset
-    if _is_hip and (
-        quant_method.w8a8_block_fp8_linear is None
-        or getattr(quant_method, "block_fp8_as_mxfp8", False)
-    ):
+    # the MXFP8 route keeps the weight in a lane layout the dequant stack cannot read
+    if quant_method.w8a8_block_fp8_linear is None or quant_method.block_fp8_as_mxfp8:
         return False
     block_out = quant_method.quant_config.weight_block_size[0]
     return all(

@@ -51,6 +51,14 @@ def _ref_post(x, residual, post, comb):
     return out.to(residual.dtype)
 
 
+def _boundary(*args, **kwargs):
+    """The boundary with its reduce + sinkhorn materialized: (residual_out, y, pre, post, comb)."""
+    from sglang.kernels.ops.layernorm.mhc_boundary_hip import hc_boundary_fused_deferred
+
+    residual_out, y, coefficients = hc_boundary_fused_deferred(*args, **kwargs)
+    return (residual_out, y, *coefficients.tensors())
+
+
 def _all_equal(a, b):
     return all((u is None and v is None) or torch.equal(u, v) for u, v in zip(a, b))
 
@@ -97,9 +105,7 @@ class TestHcMixStatsSinkhorn(CustomTestCase):
 @unittest.skipUnless(_IS_HIP, "hc_boundary_fused is the ROCm path")
 class TestHcBoundaryFused(CustomTestCase):
     def setUp(self):
-        from sglang.kernels.ops.layernorm.mhc_boundary_hip import hc_boundary_fused
-
-        self.fused = hc_boundary_fused
+        self.fused = _boundary
         self.hc_fn, self.hc_scale, self.hc_base = _params("cuda")
 
     def _run(self, x, residual, post_in, comb_in, pre_prev):
@@ -170,7 +176,6 @@ class TestRmsnormWithSinkhorn(CustomTestCase):
 
     def setUp(self):
         from sglang.kernels.ops.layernorm.mhc_boundary_hip import (
-            hc_boundary_fused,
             hc_boundary_fused_deferred,
             rmsnorm_with_sinkhorn,
         )
@@ -178,7 +183,7 @@ class TestRmsnormWithSinkhorn(CustomTestCase):
             rmsnorm_fake_quant_fp8,
         )
 
-        self.fused = hc_boundary_fused
+        self.fused = _boundary
         self.deferred = hc_boundary_fused_deferred
         self.hosted = rmsnorm_with_sinkhorn
         self.norm = rmsnorm_fake_quant_fp8
@@ -239,11 +244,9 @@ class TestHcBoundaryPrefill(CustomTestCase):
     def setUp(self):
         from sglang.kernels.ops.layernorm.mhc_boundary_hip import (
             _hc_boundary_partials,
-            hc_boundary_fused,
         )
 
         self.partials = _hc_boundary_partials
-        self.fused = hc_boundary_fused
         self.hc_fn, self.hc_scale, self.hc_base = _params("cuda")
 
     def _inputs(self, m, seed):

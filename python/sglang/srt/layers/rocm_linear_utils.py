@@ -7,7 +7,6 @@ from aiter.tuned_gemm import tgemm
 
 from sglang.kernels.ops.moe.rocm_router_gate import (
     rocm_router_gemv_split_k,
-    rocm_router_max_tokens,
 )
 from sglang.srt.runtime_context import get_exec
 
@@ -22,22 +21,12 @@ def aiter_dsv3_router_gemm(
     return tgemm.mm(hidden_states, weight.detach(), otype=hidden_states.dtype)
 
 
-def aiter_dsv3_router_split_k_max_tokens(config, weight_dtype: torch.dtype) -> int:
-    """Rows up to which ``aiter_dsv3_router_split_k`` serves the router of ``config``."""
-    return rocm_router_max_tokens(
-        num_experts=config.n_routed_experts,
-        hidden_size=config.hidden_size,
-        topk=config.num_experts_per_tok,
-        weight_dtype=weight_dtype,
-    )
-
-
 def aiter_dsv3_router_split_k(
     gate, hidden_states: torch.Tensor
 ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
-    """The ROCm decode router for ``gate`` (a ``MoEGate``): an fp32 logits buffer plus
-    the split-K partials whose fixed-order sum fills it, or None when ``gate.forward``
-    applies. Only ``TopK.forward_cuda(..., router_logits_partials=partials)`` may read
+    """The ROCm decode router for gate (a MoEGate): an fp32 logits buffer plus
+    the split-K partials whose fixed-order sum fills it, or None when gate.forward
+    applies. Only TopK.forward_cuda(..., router_logits_partials=partials) may read
     the buffer: it sums the partials into it inside the fused gate launch."""
     num_tokens = hidden_states.shape[0]
     if not 0 < num_tokens <= gate.rocm_router_max_tokens:

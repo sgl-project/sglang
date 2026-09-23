@@ -50,6 +50,7 @@ def _make_backend(*, block_size, device, is_dspark_draft=True, low_ratios=()):
         full_to_swa_index_mapping=full_to_swa,
         translate_loc_from_full_to_swa=lambda idx: full_to_swa[idx.to(torch.int64)],
         unified_swa_pages=0,
+        request_window=None,
     )
     backend.index_topk = 512
     backend.present_ratios = tuple(sorted(low_ratios))
@@ -102,7 +103,7 @@ class TestDsparkDraftBlockWindowHip(CustomTestCase):
         """A TARGET_VERIFY capture on the DSpark draft must build the block window, and
         a replay must refresh it in place for new lengths and slots, whether or not the
         replay batch carries a CPU mirror of the lengths (the draft-window bucket must
-        not read ``seq_lens_cpu``)."""
+        not read seq_lens_cpu)."""
         for cpu_mirror in (True, False):
             with self.subTest(cpu_mirror=cpu_mirror):
                 self._check_block_window_replay(cpu_mirror=cpu_mirror)

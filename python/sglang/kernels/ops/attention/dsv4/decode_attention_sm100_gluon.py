@@ -12,7 +12,7 @@ from triton.experimental.gluon.language.nvidia.blackwell import (
     tcgen05_mma,
 )
 
-from .swapab_common import _load_v4
+from .swapab_common import load_v4
 
 
 @gluon.jit
@@ -59,7 +59,7 @@ def partial_gluon(
         length = gl.load(L + b)
         ids = gl.load(IDX + b * IS + at, at < NK, -1)
         valid = (at < NK) & (at < length) & (ids >= 0) & (ids < KTOKENS)
-        kv = _load_v4(
+        kv = load_v4(
             K,
             gl.maximum(ids, 0),
             valid,
@@ -75,7 +75,7 @@ def partial_gluon(
         length = gl.load(EL + b)
         ids = gl.load(EI + b * EIS + at, at < NE, -1)
         valid = (at < NE) & (at < length) & (ids >= 0) & (ids < ETOKENS)
-        kv = _load_v4(
+        kv = load_v4(
             E,
             gl.maximum(ids, 0),
             valid,

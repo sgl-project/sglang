@@ -5,7 +5,8 @@ import torch
 
 from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.environ import envs
-from sglang.srt.utils import is_hip
+from sglang.srt.runtime_context import get_exec
+from sglang.srt.utils import is_gfx95_supported, is_hip
 
 FP8_DTYPE = torch.float8_e4m3fnuz if is_fp8_fnuz() else torch.float8_e4m3fn
 
@@ -17,22 +18,20 @@ _AITER_SPARSE_SINGLE_SPLIT_MIN_TOKENS = 1024
 
 
 def hip_attn_kv_splits() -> int:
-    """Split-KV count for the HIP sparse decode kernels. ``SGLANG_OPT_HIP_ATTN_KV_SPLITS``
+    """Split-KV count for the HIP sparse decode kernels. SGLANG_OPT_HIP_ATTN_KV_SPLITS
     wins when set; otherwise deterministic inference pins 4 splits (a fixed combine order
     keeps the bits identical at every batch size) and everything else uses 0: adaptive
     splits plus the native 16-head attention for small TP4 decode batches."""
     if envs.SGLANG_OPT_HIP_ATTN_KV_SPLITS.is_set():
         return envs.SGLANG_OPT_HIP_ATTN_KV_SPLITS.get()
     try:
-        from sglang.srt.runtime_context import get_exec
-
         deterministic = get_exec().deterministic.enable_deterministic_inference
-    except (ValueError, ImportError):  # no published exec config (kernel tests, offline tools)
+    except ValueError:  # no published exec config (kernel tests, offline tools)
         deterministic = False
     return 4 if deterministic else 0
 
 
-@functools.lru_cache(maxsize=None)
+@functools.lru_cache(maxsize=None)  # a captured graph replays the cached address
 def _uniform_indptr(num_tokens: int, width: int, device: str) -> torch.Tensor:
     """Row pointers of the aiter sparse decode kernel (token t reads kv_indices[t*w : (t+1)*w]);
     cached so graph capture sees a stable address."""
@@ -50,11 +49,13 @@ def aiter_sparse_decode_fwd(
     extra_k_cache: Optional[torch.Tensor] = None,
     extra_indices_in_kvcache: Optional[torch.Tensor] = None,
     inv_rope: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
-    **_unused,
+    topk_length: Optional[torch.Tensor] = None,
+    extra_topk_length: Optional[torch.Tensor] = None,
+    **_,
 ):
-    """aiter's gfx950 gluon sparse decode kernel (``pa_decode_sparse``) behind the
-    ``flash_mla_with_kvcache`` shapes. Only ``-1`` entries are skipped, so callers fold
-    ``topk_length`` into the index lists; ``inv_rope`` folds the model's inverse RoPE into the output."""
+    """aiter's gfx950 gluon sparse decode kernel (pa_decode_sparse) behind the
+    flash_mla_with_kvcache shapes. Only -1 entries are skipped, so callers fold
+    topk_length into the index lists; inv_rope folds the model's inverse RoPE into the output."""
     if k_cache.shape[-1] in (528, 288):
         from sglang.kernels.ops.attention.dsv4.compact_attention_hip import (
             compact_attention_hip,
@@ -65,14 +66,12 @@ def aiter_sparse_decode_fwd(
             q.reshape(b * s, h, d),
             k_cache,
             indices,
-            _unused["topk_length"].reshape(-1),
+            topk_length.reshape(-1),
             attn_sink,
             extra_cache=extra_k_cache,
             extra_indices=extra_indices_in_kvcache,
             extra_lengths=(
-                _unused["extra_topk_length"].reshape(-1)
-                if extra_k_cache is not None
-                else None
+                extra_topk_length.reshape(-1) if extra_k_cache is not None else None
             ),
             softmax_scale=softmax_scale,
             inv_rope=inv_rope,
@@ -139,7 +138,7 @@ def aiter_sparse_decode_fwd(
 def _apply_inverse_rope(
     out: torch.Tensor, inv_rope: Tuple[torch.Tensor, torch.Tensor]
 ) -> None:
-    """The model's standalone inverse RoPE on ``out`` [n, h, d] (last 64 dims of
+    """The model's standalone inverse RoPE on out [n, h, d] (last 64 dims of
     every head), for the paths that did not fold it into their combine."""
     from sglang.kernels.ops.attention.dsv4.elementwise import fused_rope_inplace
 
@@ -168,8 +167,6 @@ def resolve_hip_flashmla_backend(backend: Optional[str] = None) -> str:
     if backend is None:
         backend = envs.SGLANG_HACK_FLASHMLA_BACKEND.get()
     if backend == "auto":
-        from sglang.srt.utils import is_gfx95_supported
-
         return "aiter_sparse" if is_gfx95_supported() else "tilelang"
     return backend
 
@@ -179,7 +176,7 @@ _HIP_BACKENDS_ANY_HEAD_COUNT = frozenset({"aiter_sparse", "triton"})
 
 
 def hip_attention_needs_head_pad() -> bool:
-    """Whether the kernel ``DeepseekV4HipRadixBackend.forward`` picks needs the per-rank query
+    """Whether the kernel DeepseekV4HipRadixBackend.forward picks needs the per-rank query
     heads padded to 64 (zero q, zero sink)."""
     return resolve_hip_flashmla_backend() not in _HIP_BACKENDS_ANY_HEAD_COUNT
 

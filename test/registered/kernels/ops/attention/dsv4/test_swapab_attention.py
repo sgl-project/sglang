@@ -228,7 +228,7 @@ class TestSwapABAttention(CustomTestCase):
             with (
                 envs.SGLANG_OPT_HIP_ATTN_KV_SPLITS.override(splits),
                 patch(
-                    "sglang.kernels.ops.attention.dsv4.decode_attention_sm100.swapab_attention",
+                    "sglang.srt.layers.attention.deepseek_v4_backend_hip_radix.swapab_attention",
                     wraps=swapab_attention,
                 ) as native,
             ):

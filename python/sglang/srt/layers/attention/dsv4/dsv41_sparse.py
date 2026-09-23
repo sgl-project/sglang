@@ -24,7 +24,7 @@ from sglang.srt.utils import add_prefix, is_gfx95_supported
 
 def _rope_fq4(x, freqs, rope_dim, *, compressed_kv=False, positions=None):
     """RoPE plus fake FP4 quantization, fused for bf16 inputs on CUDA and ROCm. With
-    ``positions``, ``freqs`` is the whole table and the fused kernel gathers ``freqs[positions]``."""
+    positions, freqs is the whole table and the fused kernel gathers freqs[positions]."""
     if x.is_cuda and x.dtype == torch.bfloat16:
         from sglang.kernels.ops.attention.dsv4.fp4_rope_fake_quant import (
             rope_tail_fake_quant_fp4,
@@ -95,7 +95,7 @@ def rope_tail(
 def fused_low_ratio_compress_supported() -> bool:
     """Whether the fused c1 / c2 / index-K decode kernels can serve this process: Blackwell
     (sm100+) CUDA or gfx95 ROCm. Decided once at load time, since the choice also fixes the
-    weight layout of the ratio-2 projection (one `wkv_gate` or `wkv` plus `wgate`)."""
+    weight layout of the ratio-2 projection (one wkv_gate or wkv plus wgate)."""
     if not torch.cuda.is_available():
         return False
     if torch.version.hip is not None:
@@ -105,7 +105,7 @@ def fused_low_ratio_compress_supported() -> bool:
 
 class DeepseekV41Compressor(nn.Module):
     """Pool consecutive tokens into one pre-RoPE KV latent; bf16 weights, fp32
-    projection and softmax pooling, rounded back to bf16 in `finish`."""
+    projection and softmax pooling, rounded back to bf16 in finish."""
 
     def __init__(
         self,
@@ -154,7 +154,7 @@ class DeepseekV41Compressor(nn.Module):
         return kv, score
 
     def project_fused(self, x: torch.Tensor) -> torch.Tensor:
-        """`[n, 2D]` fp32, `| kv | score |`."""
+        """[n, 2D] fp32, | kv | score |."""
         return linear_bf16_fp32(x, self.wkv_gate.weight)
 
     def finish(self, kv: torch.Tensor) -> torch.Tensor:
@@ -218,12 +218,13 @@ class DeepseekV41Indexer(nn.Module):
         )
         self.weights_proj_hip_max_tokens = -1
         if torch.version.hip is not None:
-            from sglang.kernels.ops.attention.dsv4.fp4_indexer_hip import (
-                rocm_indexer_head_weights_max_tokens,
+            # the router module is ROCm-only; -1 off gfx950 or for shapes it lacks
+            from sglang.kernels.ops.moe.rocm_router_gate import (
+                rocm_gemv_split_k_max_tokens,
             )
 
-            self.weights_proj_hip_max_tokens = rocm_indexer_head_weights_max_tokens(
-                self.n_heads, config.hidden_size, torch.bfloat16
+            self.weights_proj_hip_max_tokens = rocm_gemv_split_k_max_tokens(
+                n=self.n_heads, k=config.hidden_size, weight_dtype=torch.bfloat16
             )
         # The decode GEMM matches tiny_gemm's reduction order, not cuBLAS's;
         # wider batches use the linear path.
@@ -260,14 +261,14 @@ class DeepseekV41Indexer(nn.Module):
         freqs: torch.Tensor,
         positions: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """``freqs`` per token, or the whole table with ``positions`` (gathered inside the
+        """freqs per token, or the whole table with positions (gathered inside the
         fused RoPE launch)."""
         q, _ = self.wq_b(q_lora)
         q = q.view(q.shape[0], self.n_local_heads, self.index_head_dim)
         return _rope_fq4(q, freqs, self.rope_head_dim, positions=positions)
 
     def head_weights_raw(self, x: torch.Tensor) -> torch.Tensor:
-        """`weights_proj(x)` before the scale, [tokens, n_heads] bf16."""
+        """weights_proj(x) before the scale, [tokens, n_heads] bf16."""
         if 0 < x.shape[0] <= self.weights_proj_small_max_m and x.is_cuda:
             from sglang.kernels.ops.gemm.small_gemm_bf16 import n32k5120_gemm_bf16
 

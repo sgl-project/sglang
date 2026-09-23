@@ -1,5 +1,5 @@
 """HIP mHC sublayer boundary: hc_post + collapse + mixing statistics, with the
-reduce + sinkhorn launched alone or hosted by the layer's next RMSNorm (``HcCoefficients``)."""
+reduce + sinkhorn launched alone or hosted by the layer's next RMSNorm (HcCoefficients)."""
 
 from typing import Optional, Tuple, Union
 
@@ -7,16 +7,20 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.kernels.jit.utils import cache_once
-from sglang.kernels.ops.layernorm.mhc import _HC_MIX_DOT_PRECISION, _is_hip
+from sglang.kernels.jit.utils import cache_once, load_jit
+from sglang.kernels.ops.layernorm.mhc_prefill_hip import hc_boundary_bf16x3_partials
 from sglang.kernels.ops.quantization.rmsnorm_fake_quant_amd_gfx95 import (
     Fp8GridActivation,
     Mxfp8Activation,
-    _row_major_2d,
     rmsnorm_fake_quant_row,
     rmsnorm_row_chunk,
+    row_major_2d,
 )
-from sglang.srt.utils.common import is_gfx95_supported
+from sglang.srt.utils.common import is_gfx95_supported, is_hip
+
+_is_hip = is_hip()
+# CDNA has no tf32: the mixing dot runs in ieee fp32 (the CUDA kernel uses tf32x3)
+_HC_MIX_DOT_PRECISION = "ieee"
 
 # a CTA owns every HC copy of its tile: a row's fp32 operation order depends on (H, HC), not on M
 _HC_BOUNDARY_BLOCK_M = 16
@@ -49,7 +53,7 @@ def _hc_mix_reduce_sinkhorn_row(
     ITERS: tl.constexpr,
     EPS: tl.constexpr,
 ):
-    """``_hc_mix_reduce_sinkhorn_kernel`` for one row with a tree fixed by NUM_SLICES; ``scratch_ptr``
+    """_hc_mix_reduce_sinkhorn_kernel for one row with a tree fixed by NUM_SLICES; scratch_ptr
     ([m, 32] fp32) round-trips the reduced mixes so the sinkhorn starts from a plain layout."""
     j = tl.arange(0, HC)
     jj = j[:, None]
@@ -136,7 +140,7 @@ def _hc_mix_reduce_sinkhorn_vec_kernel(
     ITERS: tl.constexpr,
     EPS: tl.constexpr,
 ):
-    """One program per row of ``_hc_mix_reduce_sinkhorn_row``."""
+    """One program per row of _hc_mix_reduce_sinkhorn_row."""
     _hc_mix_reduce_sinkhorn_row(
         tl.program_id(0),
         part_mix_ptr,
@@ -197,8 +201,8 @@ def _rmsnorm_sinkhorn_kernel(
     ITERS: tl.constexpr,
     EPS: tl.constexpr,
 ):
-    """Grid (M + m,): programs [0, M) run ``rmsnorm_fake_quant_row`` on the norm's rows, programs
-    [M, M + m) ``_hc_mix_reduce_sinkhorn_row`` on the pending boundary's rows; each row keeps its
+    """Grid (M + m,): programs [0, M) run rmsnorm_fake_quant_row on the norm's rows, programs
+    [M, M + m) _hc_mix_reduce_sinkhorn_row on the pending boundary's rows; each row keeps its
     standalone kernel's arithmetic (same tiles, same warps)."""
     pid = tl.program_id(0)
     if pid < M:
@@ -292,8 +296,8 @@ def hc_mix_reduce_sinkhorn_vec(
 
 
 class HcCoefficients:
-    """One boundary's mixing coefficients, held as split-K partials until ``rmsnorm_with_sinkhorn``
-    hosts their reduce + sinkhorn or the first access of ``pre`` / ``post`` / ``comb`` launches it."""
+    """One boundary's mixing coefficients, held as split-K partials until rmsnorm_with_sinkhorn
+    hosts their reduce + sinkhorn or the first access of pre / post / comb launches it."""
 
     def __init__(
         self,
@@ -382,13 +386,13 @@ def rmsnorm_with_sinkhorn(
     emit_fp8: bool = False,
     fake_quant: bool = True,
 ) -> Tuple[Union[Fp8GridActivation, Mxfp8Activation, None], torch.Tensor]:
-    """``rmsnorm_fake_quant_fp8(x, weight, eps)`` (the plain bf16 RMSNorm when ``fake_quant`` is
-    False) with the pending reduce + sinkhorn of ``coefficients`` in the same launch; returns
-    ``(fake_quant or None, norm)``."""
+    """rmsnorm_fake_quant_fp8(x, weight, eps) (the plain bf16 RMSNorm when fake_quant is
+    False) with the pending reduce + sinkhorn of coefficients in the same launch; returns
+    (fake_quant or None, norm)."""
     assert x.dim() == 2 and x.shape[-1] % 32 == 0, x.shape
     assert weight.dim() == 1 and weight.shape[0] == x.shape[-1], weight.shape
     assert weight.dtype == x.dtype, (weight.dtype, x.dtype)
-    x = _row_major_2d(x)
+    x = row_major_2d(x)
     weight = weight.contiguous()
     M, K = x.shape
     assert coefficients.num_rows == M, (
@@ -489,8 +493,8 @@ def _hc_boundary_partial_kernel(
     HAS_COMBINE: tl.constexpr,
 ):
     """Grid (cdiv(M, BLOCK_M), H // BLOCK_K), one hidden slice of every copy per program. HAS_POST:
-    ``res_out[k] = post[k]*x + sum_j comb[j,k]*res[j]`` in aiter::mhc_post's order, read back as bf16
-    for the statistics; HAS_COMBINE: ``y = sum_k pre_prev[k] * copy_k`` in _hc_combine_kernel's order."""
+    res_out[k] = post[k]*x + sum_j comb[j,k]*res[j] in aiter::mhc_post's order, read back as bf16
+    for the statistics; HAS_COMBINE: y = sum_k pre_prev[k] * copy_k in _hc_combine_kernel's order."""
     tl.static_assert(HC == 4, "the weight tiles are prefetched by name")
     pid_m = tl.program_id(0)
     pid_t = tl.program_id(1)
@@ -588,15 +592,12 @@ def _hc_boundary_partial_kernel(
 _HC_BOUNDARY_PREFILL_MIN_M = 1024
 
 
-def _hc_boundary_prefill_available() -> bool:
-    """The prefill kernel needs gfx950 (v_permlane*_swap, 16-byte LDS DMA)."""
-    return _is_hip and torch.cuda.is_available() and is_gfx95_supported()
+# the prefill kernel needs gfx950 (v_permlane*_swap, 16-byte LDS DMA)
+_hc_boundary_prefill_available = is_gfx95_supported
 
 
 @cache_once
 def _hc_boundary_prefill_module():
-    from sglang.kernels.jit.utils import load_jit
-
     kernel = "mhc_boundary_hip::HcBoundaryPrefillKernel"
     return load_jit(
         "hc_boundary_prefill_hip",
@@ -639,9 +640,9 @@ def _hc_boundary_partials(
     hc_mult: int,
     prefill: Optional[bool] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """The boundary's first launch: writes ``residual_out`` / ``y`` when given
-    and returns the ``[slices, M, MIX]`` mixing partials and ``[slices, M]`` row
-    sums of squares. ``prefill`` forces a regime (tests); None selects by M."""
+    """The boundary's first launch: writes residual_out / y when given
+    and returns the [slices, M, MIX] mixing partials and [slices, M] row
+    sums of squares. prefill forces a regime (tests); None selects by M."""
     m, _, h = residual.shape
     mix = hc_fn.shape[0]
     dev = residual.device
@@ -722,9 +723,10 @@ def hc_boundary_fused_deferred(
     *,
     weight_parts=None,
 ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor], HcCoefficients]:
-    """``hc_boundary_fused`` with the reduce + sinkhorn left pending: returns
-    ``(residual_out, y, coefficients)``; see ``HcCoefficients`` for how the last launch is
-    hosted by the norm that follows the boundary."""
+    """HIP mHC sublayer boundary with the reduce + sinkhorn left pending: residual_out =
+    hc_post(x, residual, post_in, comb_in) when x is given, y = sum_k pre_prev[k] * copy_k
+    when pre_prev is; returns (residual_out, y, coefficients), see HcCoefficients for how
+    the last launch is hosted by the norm that follows the boundary."""
     assert _is_hip, "hc_boundary_fused_deferred launches HIP-only kernels"
     assert hc_mult == 4 and residual.dim() == 3 and residual.shape[1] == hc_mult
     assert residual.stride(2) == 1 and residual.stride(1) == residual.shape[2]
@@ -759,8 +761,6 @@ def hc_boundary_fused_deferred(
         and (x is None or x.is_contiguous())
         and _hc_boundary_prefill_available()
     ):
-        from .mhc_prefill_hip import hc_boundary_bf16x3_partials
-
         part_mix, part_sq = hc_boundary_bf16x3_partials(
             x, residual, post_in, comb_in, pre_prev, residual_out, y, weight_parts
         )
@@ -790,46 +790,3 @@ def hc_boundary_fused_deferred(
         hc_eps=hc_eps,
     )
     return residual_out, y, coefficients
-
-
-def hc_boundary_fused(
-    x: Optional[torch.Tensor],
-    residual: torch.Tensor,
-    post_in: Optional[torch.Tensor],
-    comb_in: Optional[torch.Tensor],
-    pre_prev: Optional[torch.Tensor],
-    hc_fn: torch.Tensor,
-    hc_scale: torch.Tensor,
-    hc_base: torch.Tensor,
-    hc_mult: int,
-    sinkhorn_iters: int,
-    rms_eps: float,
-    hc_eps: float,
-    *,
-    weight_parts=None,
-) -> Tuple[
-    Optional[torch.Tensor],
-    Optional[torch.Tensor],
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
-]:
-    """HIP mHC sublayer boundary: ``residual_out = hc_post(x, residual, post_in,
-    comb_in)`` when ``x`` is given, ``y = sum_k pre_prev[k] * copy_k`` when ``pre_prev`` is, and the
-    mixing coefficients of the (new) residual. Returns ``(residual_out, y, pre, post, comb)``."""
-    residual_out, y, coefficients = hc_boundary_fused_deferred(
-        x,
-        residual,
-        post_in,
-        comb_in,
-        pre_prev,
-        hc_fn,
-        hc_scale,
-        hc_base,
-        hc_mult,
-        sinkhorn_iters,
-        rms_eps,
-        hc_eps,
-        weight_parts=weight_parts,
-    )
-    return (residual_out, y, *coefficients.tensors())

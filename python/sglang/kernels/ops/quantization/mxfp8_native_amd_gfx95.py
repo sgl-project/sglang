@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """gfx950 native MXFP8 dense route for 32x32-block ue8m0 fp8 checkpoints: the weight stays fp8 in
-scaled-MFMA lane order; ``M <= 32`` runs the skinny gemv kernel, larger M the ``tl.dot_scaled`` GEMM
-or hipBLASLt bf16 per the tuned table in ``mxfp8_gemv_gfx95_configs.json``."""
+scaled-MFMA lane order; M <= 32 runs the skinny gemv kernel, larger M the tl.dot_scaled GEMM
+or hipBLASLt bf16 per the tuned table in mxfp8_gemv_gfx95_configs.json."""
 
 from __future__ import annotations
 
@@ -17,9 +17,10 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.kernels.jit.utils import cache_once, load_jit, make_cpp_args
+from sglang.kernels.jit.utils import cache_once, empty_sentinel, load_jit, make_cpp_args
 from sglang.kernels.ops.quantization.mxfp8_amd_gfx95 import (
     dequant_block_fp8_weight_to_bf16,
+    dequant_mxfp8_to_bf16,
     fake_quant_fp8_activation,
     mxfp8_e4m3_quantize,
 )
@@ -45,16 +46,13 @@ class GemvConfig:
     tokens: int = 16  # token columns per wave tile: 16, 32 (M <= tokens)
     ksplit: bool = True  # waves split K and reduce through LDS; else one tile per wave
 
-    def key(self) -> str:
-        return f"w{self.waves}s{self.steps}r{self.rows}t{self.tokens}{'k' if self.ksplit else 'n'}"
-
     @staticmethod
     def parse(key: str) -> GemvConfig:
         m = re.fullmatch(r"w(\d+)s(\d+)r(\d+)t(\d+)([kn])", key)
         assert m, key
         return GemvConfig(int(m[1]), int(m[2]), int(m[3]), int(m[4]), m[5] == "k")
 
-    def valid_for(self, m: int, n: int, k: int) -> bool:
+    def valid_for(self, m: int, n: int) -> bool:
         return (
             self.waves in (4, 8, 16)
             and self.steps in (1, 2, 4)
@@ -65,7 +63,7 @@ class GemvConfig:
         )
 
 
-def default_config(m: int, n: int, k: int) -> GemvConfig:
+def default_config(m: int, k: int) -> GemvConfig:
     """Heuristic for shapes without a tuned row."""
     tokens = 16 if m <= 16 else 32
     if k // _STEP_K > 40:
@@ -84,13 +82,17 @@ def m_bucket(m: int) -> int:
 
 @functools.lru_cache(maxsize=None)
 def _config_table(section: str) -> Dict[str, str]:
-    """One ``{'gfx950:N:K:M_bucket': entry}`` section of ``CONFIG_FILE``."""
+    """One {'gfx950:N:K:M_bucket': entry} section of CONFIG_FILE."""
     try:
         with open(CONFIG_FILE) as f:
             table = json.load(f)
     except (OSError, ValueError) as err:
         # every shape then takes the heuristic, so say so instead of silently losing the tuning
-        logger.warning("mxfp8 gfx95 tile table %s unreadable (%s); using heuristics", CONFIG_FILE, err)
+        logger.warning(
+            "mxfp8 gfx95 tile table %s unreadable (%s); using heuristics",
+            CONFIG_FILE,
+            err,
+        )
         return {}
     return {str(key): str(value) for key, value in table.get(section, {}).items()}
 
@@ -102,13 +104,18 @@ def gfx_name() -> str:
 
 def select_config(m: int, n: int, k: int) -> GemvConfig:
     """The tuned configuration for (gfx, N, K, M bucket), else the heuristic."""
+    return _select_config(m_bucket(m), n, k)
+
+
+@functools.lru_cache(maxsize=None)
+def _select_config(bucket: int, n: int, k: int) -> GemvConfig:
     table = _config_table("configs")
-    key = f"{gfx_name()}:{n}:{k}:{m_bucket(m)}"
+    key = f"{gfx_name()}:{n}:{k}:{bucket}"
     if key in table:
         cfg = GemvConfig.parse(table[key])
-        if cfg.valid_for(m, n, k):
+        if cfg.valid_for(bucket, n):
             return cfg
-    return default_config(m, n, k)
+    return default_config(bucket, k)
 
 
 @cache_once
@@ -123,9 +130,9 @@ def _jit_mxfp8_gemv_module(cfg: GemvConfig, x_bf16: bool):
 
 
 def shuffle_mxfp8_weight(weight: torch.Tensor) -> torch.Tensor:
-    """fp8 e4m3 ``[N, K]`` -> ``[N/16, K/128, 2048]`` uint8 in the gfx950 16x16x128 scaled-MFMA
-    lane order: for tile ``t``, K step ``s`` and lane ``l = 16 * g + r``, the lane's 32 bytes are
-    ``W[16t + r][128s + 32(g/2) + 16(g%2) : +16]`` followed by the same 16 bytes 64 K later."""
+    """fp8 e4m3 [N, K] -> [N/16, K/128, 2048] uint8 in the gfx950 16x16x128 scaled-MFMA
+    lane order: for tile t, K step s and lane l = 16 * g + r, the lane's 32 bytes are
+    W[16t + r][128s + 32(g/2) + 16(g%2) : +16] followed by the same 16 bytes 64 K later."""
     assert weight.dtype == torch.float8_e4m3fn, weight.dtype
     n, k = weight.shape
     assert n % _TILE_N == 0 and k % _STEP_K == 0, (n, k)
@@ -139,7 +146,7 @@ def shuffle_mxfp8_weight(weight: torch.Tensor) -> torch.Tensor:
 
 
 def ue8m0_weight_scale(weight_scale: torch.Tensor) -> torch.Tensor:
-    """fp32 power-of-two block scales ``[N/32, K/32]`` -> ue8m0 exponent bytes (exact)."""
+    """fp32 power-of-two block scales [N/32, K/32] -> ue8m0 exponent bytes (exact)."""
     s = weight_scale.float().contiguous()
     bits = s.view(torch.int32)
     assert bool(((bits & 0x807FFFFF) == 0).all()), (
@@ -155,15 +162,15 @@ def mxfp8_gemv(
     x_scale: Optional[torch.Tensor] = None,
     config: Optional[GemvConfig] = None,
 ) -> torch.Tensor:
-    """``out[M, N] bf16 = x[M, K] . W^T`` on the gfx950 scaled matrix core; ``x`` is fp8 e4m3 with
-    ``x_scale`` ue8m0 ``[M, K/32]`` or bf16 quantized in-kernel; ``config`` overrides the table."""
+    """out[M, N] bf16 = x[M, K] . W^T on the gfx950 scaled matrix core; x is fp8 e4m3 with
+    x_scale ue8m0 [M, K/32] or bf16 quantized in-kernel; config overrides the table."""
     assert x.dim() == 2 and x.is_contiguous(), x.shape
     m, k = x.shape
     n = weight_shuffled.shape[0] * _TILE_N
     assert 1 <= m <= MXFP8_GEMV_MAX_TOKENS, m
     x_bf16 = x.dtype == torch.bfloat16
     if x_bf16:
-        x_scale = torch.empty(0, dtype=torch.uint8, device=x.device)
+        x_scale = empty_sentinel(x.device, torch.uint8)
     else:
         assert x.dtype == torch.float8_e4m3fn and x_scale is not None, x.dtype
         assert x_scale.dtype == torch.uint8 and x_scale.shape == (m, k // 32), (
@@ -174,7 +181,7 @@ def mxfp8_gemv(
         x = x.view(torch.uint8)
     out = torch.empty(m, n, dtype=torch.bfloat16, device=x.device)
     cfg = config or select_config(m, n, k)
-    assert cfg.valid_for(m, n, k), (cfg, m, n, k)
+    assert cfg.valid_for(m, n), (cfg, m, n, k)
     _jit_mxfp8_gemv_module(cfg, x_bf16).run(
         weight_shuffled, weight_scale_ue8m0, x, x_scale, out
     )
@@ -194,16 +201,16 @@ def large_m_bucket(m: int) -> int:
 
 
 def _large_m_table(fp8_in: bool) -> Dict[str, str]:
-    """``{'gfx:N:K:bucket': 'hipblaslt_bf16' | 'ds:BM,BN,BK,warps,split_k'}``."""
+    """{'gfx:N:K:bucket': 'hipblaslt_bf16' | 'ds:BM,BN,BK,warps,split_k'}."""
     return _config_table("large_m_fp8in" if fp8_in else "large_m")
 
 
 def large_m_plan(
     m: int, n: int, k: int, fp8_in: bool = False
 ) -> Optional[Tuple[int, int, int, int, int]]:
-    """The dot_scaled tile (BM, BN, BK, warps, split_k) for ``m`` rows, or None when hipBLASLt
+    """The dot_scaled tile (BM, BN, BK, warps, split_k) for m rows, or None when hipBLASLt
     bf16 is the measured winner or the shape has no row (the caller then needs a bf16 copy).
-    ``fp8_in``: the activation arrives as fp8 + ue8m0 (no quant to pay)."""
+    fp8_in: the activation arrives as fp8 + ue8m0 (no quant to pay)."""
     entry = _large_m_table(fp8_in).get(f"{gfx_name()}:{n}:{k}:{large_m_bucket(m)}")
     if entry is None or entry == HIPBLASLT_BF16:
         return None
@@ -226,8 +233,8 @@ def weight_needs_bf16_copy(n: int, k: int) -> bool:
 
 
 def native_consumer_wants_fp8(m: int, n: int, k: int) -> bool:
-    """Whether a fused producer should hand the native route fp8 + ue8m0 for ``m`` tokens of
-    a consumer with weight ``[n, k]``: the skinny kernel's range, or an M bucket whose measured
+    """Whether a fused producer should hand the native route fp8 + ue8m0 for m tokens of
+    a consumer with weight [n, k]: the skinny kernel's range, or an M bucket whose measured
     winner with a free fp8 input is the dot_scaled tile (hipBLASLt bf16 wants bf16)."""
     if m <= MXFP8_GEMV_MAX_TOKENS:
         return True
@@ -242,8 +249,8 @@ def native_route_supports(n: int, k: int) -> bool:
 def prepare_mxfp8_native_weight(
     weight: torch.Tensor, weight_scale: torch.Tensor, block_size
 ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
-    """fp8 ``[N, K]`` + fp32 block scales -> (shuffled fp8 bytes ``[N/16, K/128, 2048]``,
-    ue8m0 scale bytes ``[N/32, K/32]``, bf16 copy or None)."""
+    """fp8 [N, K] + fp32 block scales -> (shuffled fp8 bytes [N/16, K/128, 2048],
+    ue8m0 scale bytes [N/32, K/32], bf16 copy or None)."""
     n, k = weight.shape
     assert tuple(block_size) == (32, 32), block_size
     assert native_route_supports(n, k), (n, k)
@@ -339,15 +346,13 @@ def mxfp8_shuffled_gemm(
     tile: Tuple[int, int, int, int],
     split_k: int,
 ) -> torch.Tensor:
-    """``[M, N] bf16 = xq[M, K] fp8 . W^T`` over the shuffled fp8 weight with the table's
-    ``tile`` (BM, BN, BK, warps). With ``split_k > 1`` the K partitions' fp32 partials are
+    """[M, N] bf16 = xq[M, K] fp8 . W^T over the shuffled fp8 weight with the table's
+    tile (BM, BN, BK, warps). With split_k > 1 the K partitions' fp32 partials are
     summed in partition order (deterministic)."""
     m, k = xq.shape
     n = weight_shuffled.shape[0] * 16
     bm, bn, bk, warps = tile
-    if k % bk != 0:
-        bk = 128
-    assert (k // bk) % split_k == 0, (k, bk, split_k)
+    assert k % bk == 0 and (k // bk) % split_k == 0, (k, bk, split_k)
     grid = (triton.cdiv(m, bm), triton.cdiv(n, bn), split_k)
     if split_k == 1:
         out = torch.empty(m, n, dtype=torch.bfloat16, device=xq.device)
@@ -382,7 +387,7 @@ def mxfp8_shuffled_gemm(
 def native_route_plan(
     m: int, n: int, k: int, has_bf16_copy: bool, fp8_in: bool = False
 ) -> str:
-    """Which kernel serves ``m`` tokens: 'gemv', 'hipblaslt_bf16' or 'dot_scaled'."""
+    """Which kernel serves m tokens: 'gemv', 'hipblaslt_bf16' or 'dot_scaled'."""
     if m <= MXFP8_GEMV_MAX_TOKENS:
         return "gemv"
     if has_bf16_copy and large_m_plan(m, n, k, fp8_in) is None:
@@ -400,8 +405,8 @@ def mxfp8_native_blockscaled_linear(
     output_dtype: Optional[torch.dtype] = None,
     input_on_fp8_grid: bool = False,
 ) -> torch.Tensor:
-    """Dense linear of the native route. ``input`` is bf16 (plain, or on the fp8 grid
-    when ``input_on_fp8_grid``), or fp8 e4m3 with ``input_scale`` ue8m0 ``[M, K/32]``."""
+    """Dense linear of the native route. input is bf16 (plain, or on the fp8 grid
+    when input_on_fp8_grid), or fp8 e4m3 with input_scale ue8m0 [M, K/32]."""
     input_2d = input.view(-1, input.shape[-1])
     m, k = input_2d.shape
     n = weight_shuffled.shape[0] * 16
@@ -424,9 +429,7 @@ def mxfp8_native_blockscaled_linear(
                 out = mxfp8_gemv(input_2d, weight_shuffled, weight_scale_ue8m0)
         elif plan == HIPBLASLT_BF16:
             if xq is not None:
-                x = (
-                    xq.float() * torch.exp2(xs.float() - 127).repeat_interleave(32, 1)
-                ).to(torch.bfloat16)
+                x = dequant_mxfp8_to_bf16(xq, xs)
             elif input_on_fp8_grid:
                 x = input_2d
             else:

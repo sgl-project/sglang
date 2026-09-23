@@ -42,8 +42,8 @@ def rmsnorm_fake_quant_row(
     CHUNK: tl.constexpr,
     NUM_CHUNKS: tl.constexpr,
 ):
-    """One row: (residual add,) RMSNorm in fp32, bf16 rounding, then, with ``FAKE_QUANT``, the
-    per-32 ue8m0 fp8 e4m3 quantize-dequantize of ``fake_quant_fp8_activation``."""
+    """One row: (residual add,) RMSNorm in fp32, bf16 rounding, then, with FAKE_QUANT, the
+    per-32 ue8m0 fp8 e4m3 quantize-dequantize of fake_quant_fp8_activation."""
     base = tl.arange(0, CHUNK)
     x_row = x_ptr + row * stride_xm
     res_row = res_ptr + row * stride_rm
@@ -122,7 +122,7 @@ def _rmsnorm_fake_quant_fp8_kernel(
     CHUNK: tl.constexpr,
     NUM_CHUNKS: tl.constexpr,
 ):
-    """One program per row of ``rmsnorm_fake_quant_row``."""
+    """One program per row of rmsnorm_fake_quant_row."""
     rmsnorm_fake_quant_row(
         tl.program_id(0).to(tl.int64),
         x_ptr,
@@ -149,13 +149,13 @@ def _rmsnorm_fake_quant_fp8_kernel(
 
 
 def rmsnorm_row_chunk(K: int) -> int:
-    """The per-row chunk of ``rmsnorm_fake_quant_row``: it depends on K alone, so the
+    """The per-row chunk of rmsnorm_fake_quant_row: it depends on K alone, so the
     reduction tree, and a row's result, is the same at every batch size."""
     return min(max(32, triton.next_power_of_2(K)), 2048)
 
 
-def _row_major_2d(x: torch.Tensor) -> torch.Tensor:
-    """A row-major view of ``x`` (rows may be strided, e.g. a column slice of a
+def row_major_2d(x: torch.Tensor) -> torch.Tensor:
+    """A row-major view of x (rows may be strided, e.g. a column slice of a
     wider projection output); copies only when the last dim is not unit-stride."""
     return x if x.stride(1) == 1 else x.contiguous()
 
@@ -169,13 +169,13 @@ def rmsnorm_fake_quant_fp8(
     quant_eps: float = 1e-10,
     emit_fp8: bool = False,
 ) -> Tuple[Union[Fp8GridActivation, Mxfp8Activation], Optional[torch.Tensor]]:
-    """``fake_quant_fp8_activation(RMSNorm(x))`` in one launch: ``(Fp8GridActivation, norm)``, or
-    ``(Mxfp8Activation, norm)`` with ``emit_fp8``; ``residual`` follows the ``fused_add_rmsnorm``
-    contract and ``norm`` is None unless ``return_norm``."""
+    """fake_quant_fp8_activation(RMSNorm(x)) in one launch: (Fp8GridActivation, norm), or
+    (Mxfp8Activation, norm) with emit_fp8; residual follows the fused_add_rmsnorm
+    contract and norm is None unless return_norm."""
     assert x.dim() == 2 and x.shape[-1] % 32 == 0, x.shape
     assert weight.dim() == 1 and weight.shape[0] == x.shape[-1], weight.shape
     assert weight.dtype == x.dtype, (weight.dtype, x.dtype)
-    x = _row_major_2d(x)
+    x = row_major_2d(x)
     weight = weight.contiguous()
     M, K = x.shape
     out_fq = torch.empty(

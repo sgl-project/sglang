@@ -7,8 +7,17 @@ import triton
 if TYPE_CHECKING:
     from sglang.kernels.ops.layernorm.mhc_boundary_hip import HcCoefficients
 
+from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
+from sglang.srt.distributed.parallel_state import get_attn_tp_group, get_tp_group
 from sglang.srt.environ import envs
-from sglang.srt.runtime_context import get_platform
+from sglang.srt.layers.moe import get_moe_a2a_backend
+from sglang.srt.layers.moe.mhc_post_fusion import MhcPostFusion, use_mhc_post_fusion
+from sglang.srt.runtime_context import (
+    get_exec,
+    get_forward,
+    get_parallel,
+    get_platform,
+)
 from sglang.srt.utils import is_gfx95_supported, is_hip
 from sglang.srt.utils.common import is_gfx1250_supported
 
@@ -17,6 +26,22 @@ logger = logging.getLogger(__name__)
 _is_hip = is_hip()
 _is_gfx95_supported = is_gfx95_supported()
 _is_gfx1250_supported = is_gfx1250_supported()
+
+if _is_hip:
+    from sglang.kernels.ops.communication.all_reduce_mhc_hip import (
+        all_reduce_mhc_post,
+    )
+    from sglang.kernels.ops.layernorm.mhc_boundary_hip import (
+        hc_boundary_fused_deferred,
+    )
+if _is_gfx95_supported:
+    from sglang.srt.models.deepseek_common.amd.deepseek_v4_gfx95_dense import (
+        post_attention_norm,
+    )
+
+# the fused all-reduce + hc_post kernel: DeepSeek-V4.1's hidden size, up to this many rows
+MHC_HIDDEN_SIZE = 5120
+ALL_REDUCE_MHC_MAX_ROWS = 8
 
 _FUSED_HC_POST_PRE_M_THRESHOLD = 64
 _FUSED_HC_POST_PRE_CACHE: dict[tuple, dict[str, torch.Tensor]] = {}
@@ -58,7 +83,7 @@ def is_cross_layer_mhc_fusion_enabled() -> bool:
     """Whether DeepSeek-V4 may defer mHC post across the attn/MoE boundary.
 
     Cross-layer fusion requires a fused post+pre kernel to be available: either
-    the TileLang path (``SGLANG_OPT_FUSE_MHC_POST_PRE`` + TileLang pre/post) or
+    the TileLang path (SGLANG_OPT_FUSE_MHC_POST_PRE + TileLang pre/post) or
     the aiter HIP path on a supported gfx95 device.
     """
     return _is_production_mhc_enabled()
@@ -226,8 +251,8 @@ def try_aiter_fused_mhc_post_pre(
 ) -> Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, bool]]:
     """Fused mhc_post + next-layer mhc_pre via the aiter HIP kernel.
 
-    Returns ``(next_residual, layer_input, post_mix, comb_mix, norm_applied)`` or
-    ``None`` to let the caller fall back. The aiter kernel internally chooses
+    Returns (next_residual, layer_input, post_mix, comb_mix, norm_applied) or
+    None to let the caller fall back. The aiter kernel internally chooses
     between its fused and unfused (mhc_post + mhc_pre) implementations based on the
     token count and detected arch, so no token threshold is applied here.
     """
@@ -310,12 +335,12 @@ def try_mhc_fused_post_pre_boundary(
     """Dispatch the fused mHC post+pre across the attn/MoE boundary.
 
     Preference order (first available wins): aiter HIP kernel, then the Triton
-    kernel. Returns ``None`` when neither fires so the caller can fall back to the
-    TileLang path or the unfused ``hc_post`` + ``hc_pre`` sequence.
+    kernel. Returns None when neither fires so the caller can fall back to the
+    TileLang path or the unfused hc_post + hc_pre sequence.
 
-    The aiter and Triton kernels expect opposite ``fn`` orientations: the Triton
-    kernel takes ``hc_fn`` transposed (``fn_transpose``), while aiter consumes it
-    in the native ``mhc_pre`` layout.
+    The aiter and Triton kernels expect opposite fn orientations: the Triton
+    kernel takes hc_fn transposed (fn_transpose), while aiter consumes it
+    in the native mhc_pre layout.
     """
     aiter_result = try_aiter_fused_mhc_post_pre(
         layer_input,
@@ -437,26 +462,15 @@ def hc_boundary(
     hc_scale: torch.Tensor,
     hc_base: torch.Tensor,
 ) -> Tuple[torch.Tensor, torch.Tensor, "HcCoefficients"]:
-    """Fused sublayer boundary (ROCm): apply the pending hc_post of ``x`` onto ``residual``, collapse
-    with ``pre_prev`` (copy 0 when None) and take the mixing statistics. Returns (new_residual, y,
-    coefficients); the coefficients' reduce + sinkhorn is still pending (see ``HcCoefficients``)."""
-    from sglang.kernels.ops.layernorm.mhc_boundary_hip import (
-        _HC_BOUNDARY_BF16X3_MIN_M,
-        hc_boundary_fused_deferred,
+    """Fused sublayer boundary (ROCm): apply the pending hc_post of x onto residual, collapse
+    with pre_prev (copy 0 when None) and take the mixing statistics. Returns (new_residual, y,
+    coefficients); the coefficients' reduce + sinkhorn is still pending (see HcCoefficients)."""
+    # the bf16x3 weight parts exist only when the layer enabled that prefill regime
+    weight_parts = (
+        layer._hc_attn_bf16_parts
+        if hc_fn is layer.hc_attn_fn
+        else layer._hc_ffn_bf16_parts
     )
-    from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
-
-    weight_parts = None
-    if (
-        residual.shape[0] >= _HC_BOUNDARY_BF16X3_MIN_M
-        and envs.SGLANG_OPT_HIP_MHC_BF16X3_PREFILL.get()
-        and not is_batch_invariant_mode_enabled()
-    ):
-        if hc_fn is layer.hc_attn_fn:
-            weight_parts = getattr(layer, "_hc_attn_bf16_parts", None)
-        elif hc_fn is layer.hc_ffn_fn:
-            weight_parts = getattr(layer, "_hc_ffn_bf16_parts", None)
-
     new_residual, y, coefficients = hc_boundary_fused_deferred(
         x,
         residual,
@@ -481,15 +495,12 @@ def hc_boundary(
     return new_residual, y, coefficients
 
 
-def _can_fuse_mhc(layer, residual, forward_batch):
-    from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
-    from sglang.srt.runtime_context import get_exec, get_forward, get_parallel
-
+def _can_fuse_mhc(layer, residual: torch.Tensor, forward_batch) -> bool:
     return (
         _is_gfx95_supported
         and envs.SGLANG_OPT_HIP_ALL_REDUCE_MHC.get()
-        and 1 <= residual.shape[0] <= 8
-        and residual.shape[1:] == (4, 5120)
+        and 1 <= residual.shape[0] <= ALL_REDUCE_MHC_MAX_ROWS
+        and residual.shape[1:] == (4, MHC_HIDDEN_SIZE)
         and residual.dtype == torch.bfloat16
         and residual.is_contiguous()
         and layer.config.model_type == "deepseek_v41"
@@ -506,17 +517,11 @@ def _can_fuse_mhc(layer, residual, forward_batch):
     )
 
 
-def _make_mhc_fusion(residual, coefficients, comm):
-    from aiter.dist.device_communicators.custom_all_reduce import CustomAllreduce
-
-    from sglang.srt.layers.moe.mhc_post_fusion import MhcPostFusion
-
-    if not (
-        isinstance(comm, CustomAllreduce)
-        and not comm.disabled
-        and comm.world_size == 4
-        and comm.enable_register_for_capturing
-    ):
+def _make_mhc_fusion(
+    residual: torch.Tensor, coefficients: "HcCoefficients", comm
+) -> Optional[MhcPostFusion]:
+    # comm is the group's aiter CustomAllreduce, or None when custom all-reduce is off
+    if comm is None or comm.disabled or not comm.enable_register_for_capturing:
         return None
     coefficients.materialize()
     return MhcPostFusion(
@@ -531,14 +536,10 @@ def attention_mhc_fusion(layer, residual, coefficients, forward_batch):
         and layer.self_attn.wo_b.reduce_results
     ):
         return None
-    from sglang.srt.distributed.parallel_state import get_attn_tp_group
-
     return _make_mhc_fusion(residual, coefficients, get_attn_tp_group().ca_comm)
 
 
 def moe_mhc_fusion(layer, residual, coefficients, forward_batch):
-    from sglang.srt.layers.moe import get_moe_a2a_backend
-
     if not (
         _can_fuse_mhc(layer, residual, forward_batch)
         and layer.mlp.tp_size == 4
@@ -546,15 +547,10 @@ def moe_mhc_fusion(layer, residual, coefficients, forward_batch):
         and get_moe_a2a_backend().is_none()
     ):
         return None
-    from sglang.srt.distributed.parallel_state import get_tp_group
-
     return _make_mhc_fusion(residual, coefficients, get_tp_group().ca_comm)
 
 
-def apply_attention_mhc(x, state):
-    from sglang.kernels.ops.communication.all_reduce_mhc_hip import all_reduce_mhc_post
-    from sglang.srt.distributed.parallel_state import get_attn_tp_group
-
+def apply_attention_mhc(x: torch.Tensor, state: MhcPostFusion) -> None:
     state.output = all_reduce_mhc_post(
         x, state.residual, state.post, state.comb, get_attn_tp_group().ca_comm
     )
@@ -571,36 +567,23 @@ def forward_hc_pre_from_prev_fused_boundary(
     pending_post: Optional[Tuple[torch.Tensor, ...]],
     defer_post: bool,
 ) -> Tuple[Optional[torch.Tensor], torch.Tensor, Optional[Tuple[torch.Tensor, ...]]]:
-    """ROCm form of ``DeepseekV4DecoderLayer.forward_hc_pre_from_prev``.
-    ``pending_post`` is the previous layer's unapplied FFN hc_post ``(x, residual, post,
-    comb)``; with ``defer_post`` this layer's is returned the same way and ``hidden_states`` is None."""
-    if pending_post is not None:
-        residual, x, attn_coefficients = hc_boundary(
-            layer,
-            *pending_post,
-            prev_pre,
-            layer.hc_attn_fn,
-            layer.hc_attn_scale,
-            layer.hc_attn_base,
-        )
-    else:
-        residual, x, attn_coefficients = hc_boundary(
-            layer,
-            None,
-            hidden_states,
-            None,
-            None,
-            prev_pre,
-            layer.hc_attn_fn,
-            layer.hc_attn_scale,
-            layer.hc_attn_base,
-        )
+    """ROCm form of DeepseekV4DecoderLayer.forward_hc_pre_from_prev.
+    pending_post is the previous layer's unapplied FFN hc_post (x, residual, post,
+    comb); with defer_post this layer's is returned the same way and hidden_states is None."""
+    if pending_post is None:
+        pending_post = (None, hidden_states, None, None)
+    residual, x, attn_coefficients = hc_boundary(
+        layer,
+        *pending_post,
+        prev_pre,
+        layer.hc_attn_fn,
+        layer.hc_attn_scale,
+        layer.hc_attn_base,
+    )
     # the boundary's reduce + sinkhorn rides in the norm launch
     x, x_quant = layer._input_norm(
         x, allow_aiter_quant=False, coefficients=attn_coefficients
     )
-    from sglang.srt.layers.moe.mhc_post_fusion import use_mhc_post_fusion
-
     with layer.self_attn.maybe_use_decode_attn_tp(forward_batch):
         mhc = attention_mhc_fusion(layer, residual, attn_coefficients, forward_batch)
         with use_mhc_post_fusion(mhc):
@@ -638,14 +621,10 @@ def forward_hc_pre_from_prev_fused_boundary(
 
 
 def _gfx95_dense_post_attention_norm(layer, x: torch.Tensor, coefficients):
-    """``layer.post_attention_layernorm(x)`` hosting the pending reduce + sinkhorn where
+    """layer.post_attention_layernorm(x) hosting the pending reduce + sinkhorn where
     the gfx950 norm kernel is available; the module norm plus a standalone reduce +
     sinkhorn elsewhere."""
     if _is_gfx95_supported:
-        from sglang.srt.models.deepseek_common.amd.deepseek_v4_gfx95_dense import (
-            post_attention_norm,
-        )
-
         return post_attention_norm(layer, x, coefficients)
     coefficients.materialize()
     return layer.post_attention_layernorm(x)

@@ -4,6 +4,9 @@ import torch
 import triton
 import triton.language as tl
 
+# blocks of the page-index row per program: a long capture context is not one serial loop
+PAGE_INDEX_BLOCKS_PER_PROGRAM = 4
+
 
 @triton.jit
 def _fill_all_compressed_indices_kernel(
@@ -214,11 +217,14 @@ def _init_compressed_attn_metadata_triton(
         if page_table is None:
             page_table = torch.empty(0, dtype=torch.int32, device=device)
 
-    # blocks of the page-index row per program: a long capture context is not one serial loop
-    ITERS_PER_PROGRAM = 4
     grid = (
         bs,
-        max(1, triton.cdiv(c128_cur_max_seq_len, ITERS_PER_PROGRAM * BLOCK_SIZE)),
+        max(
+            1,
+            triton.cdiv(
+                c128_cur_max_seq_len, PAGE_INDEX_BLOCKS_PER_PROGRAM * BLOCK_SIZE
+            ),
+        ),
     )
     _init_compressed_attn_metadata_kernel[grid](
         seq_lens,
@@ -245,7 +251,7 @@ def _init_compressed_attn_metadata_triton(
         c128_page_size,
         BLOCK_SIZE,
         compute_page_indices,
-        ITERS_PER_PROGRAM,
+        PAGE_INDEX_BLOCKS_PER_PROGRAM,
     )
 
     return (

@@ -116,19 +116,19 @@ def materialize_bpreshuffle_fp8_scale(scale: torch.Tensor) -> torch.Tensor:
 
 
 def view_aiter_fused_rms_transposed_fp8_scale(scale: torch.Tensor) -> torch.Tensor:
-    """Zero-copy view of a ``transpose_scale=True`` fp8 group scale.
+    """Zero-copy view of a transpose_scale=True fp8 group scale.
 
-    Producer-neutral counterpart of ``materialize_bpreshuffle_fp8_scale``. When an
-    AITER quant/fused-RMS kernel is asked for ``transpose_scale=True`` it writes the
-    per-token group scale directly in physical ``[num_groups, tokens]`` byte order
-    behind a row-major-looking ``[tokens, num_groups]`` tensor. Swapping the strides
-    restores logical ``[M, G]`` indexing over those same bytes -- i.e. the
+    Producer-neutral counterpart of materialize_bpreshuffle_fp8_scale. When an
+    AITER quant/fused-RMS kernel is asked for transpose_scale=True it writes the
+    per-token group scale directly in physical [num_groups, tokens] byte order
+    behind a row-major-looking [tokens, num_groups] tensor. Swapping the strides
+    restores logical [M, G] indexing over those same bytes -- i.e. the
     column-major layout the gfx95 bpreshuffle GEMM consumes -- with no copy. Callers
-    that instead take the row-major (``transpose_scale=False``) path relayout via
-    ``materialize_bpreshuffle_fp8_scale``; this is the bit-identical no-copy path.
+    that instead take the row-major (transpose_scale=False) path relayout via
+    materialize_bpreshuffle_fp8_scale; this is the bit-identical no-copy path.
 
-    Only valid for M(tokens) >= 2. At M == 1 the ``[1, G]`` and ``[G, 1]`` byte
-    orders coincide, so producers keep ``transpose_scale=False`` and materialize;
+    Only valid for M(tokens) >= 2. At M == 1 the [1, G] and [G, 1] byte
+    orders coincide, so producers keep transpose_scale=False and materialize;
     the stride swap here would be a no-op on shape but is never taken at M == 1.
     Non-2-D scales (e.g. per-tensor) pass through unchanged.
     """
@@ -138,7 +138,7 @@ def view_aiter_fused_rms_transposed_fp8_scale(scale: torch.Tensor) -> torch.Tens
 
 
 def unshuffle_aiter_fp8_weight(weight: torch.Tensor) -> torch.Tensor:
-    """Undo AITER ``shuffle_weight(..., layout=(16, 16))`` for FP8 weights."""
+    """Undo AITER shuffle_weight(..., layout=(16, 16)) for FP8 weights."""
     if weight.element_size() != 1:
         raise ValueError("AITER FP8 unshuffle requires a one-byte element type")
 
@@ -161,7 +161,7 @@ def unshuffle_aiter_fp8_weight(weight: torch.Tensor) -> torch.Tensor:
 def materialize_bpreshuffle_fp8_scale_tuple(
     value: Tuple[torch.Tensor, ...],
 ) -> Tuple[torch.Tensor, ...]:
-    """Materialize the scale slot in FP8 ``(q_input, x_scale, ...)`` tuples."""
+    """Materialize the scale slot in FP8 (q_input, x_scale, ...) tuples."""
     return (
         value[0],
         materialize_bpreshuffle_fp8_scale(value[1]),
@@ -172,7 +172,7 @@ def materialize_bpreshuffle_fp8_scale_tuple(
 def view_aiter_fused_rms_transposed_fp8_scale_tuple(
     value: Tuple[torch.Tensor, ...],
 ) -> Tuple[torch.Tensor, ...]:
-    """Zero-copy scale reinterpret for FP8 ``(q_input, x_scale, ...)`` tuples."""
+    """Zero-copy scale reinterpret for FP8 (q_input, x_scale, ...) tuples."""
     return (value[0], view_aiter_fused_rms_transposed_fp8_scale(value[1]), *value[2:])
 
 
@@ -180,11 +180,11 @@ def emit_transposed_bpreshuffle_scale(m: int, *, on_bpreshuffle_gfx95: bool) -> 
     """Whether a producer should emit its fp8 scale already transposed.
 
     Producer sites choose between two equivalent gfx95 bpreshuffle scale layouts:
-    ``transpose_scale=True`` + zero-copy ``view_aiter_fused_rms_transposed_fp8_scale`` (this
-    predicate True), or row-major ``transpose_scale=False`` +
-    ``materialize_bpreshuffle_fp8_scale`` (this predicate False). The transposed
+    transpose_scale=True + zero-copy view_aiter_fused_rms_transposed_fp8_scale (this
+    predicate True), or row-major transpose_scale=False +
+    materialize_bpreshuffle_fp8_scale (this predicate False). The transposed
     zero-copy path is only taken on gfx95 bpreshuffle and only for M(tokens) >= 2:
-    at M == 1 the ``[1, G]`` and ``[G, 1]`` byte orders coincide, so the transposed
+    at M == 1 the [1, G] and [G, 1] byte orders coincide, so the transposed
     emit buys nothing and the materialize path is used. Centralizes the gate shared
     by the MoE-down and MLA o_proj producer sites.
     """
@@ -369,7 +369,7 @@ class Fp8GemmRunnerBackend(Enum):
 
 class Mxfp8DenseGemmBackend(Enum):
     """Enum for MXFP8 dense linear backend selection, resolved separately from
-    `Fp8GemmRunnerBackend`."""
+    Fp8GemmRunnerBackend."""
 
     FLASHINFER_CUTLASS = "flashinfer_cutlass"
     FLASHINFER_CUTEDSL = "flashinfer_cutedsl"
@@ -406,11 +406,6 @@ class Mxfp8DenseGemmBackend(Enum):
             Mxfp8DenseGemmBackend.GFX95_DOT_SCALED,
             Mxfp8DenseGemmBackend.GFX95_MXFP8_NATIVE,
         )
-
-    def takes_fp8_grid_activation(self) -> bool:
-        """Whether the route consumes an ``Fp8GridActivation`` (bf16 already on the
-        fp8 grid) instead of quantizing the activation itself."""
-        return self == Mxfp8DenseGemmBackend.GFX95_MXFP8_NATIVE
 
     def is_unsupported(self) -> bool:
         return self == Mxfp8DenseGemmBackend.UNSUPPORTED
@@ -669,7 +664,7 @@ def torch_w8a8_block_fp8_linear(
 
 
 def resolve_mxfp8_dense_gemm_backend() -> Mxfp8DenseGemmBackend:
-    """Pick the MXFP8 dense linear backend, honoring `--fp8-gemm-backend` only when it
+    """Pick the MXFP8 dense linear backend, honoring --fp8-gemm-backend only when it
     names a backend that owns an MXFP8 dense kernel."""
     backend = get_fp8_gemm_runner_backend()
 
@@ -736,7 +731,8 @@ def _unsupported_mxfp8_linear(*args, **kwargs) -> torch.Tensor:
 
 def resolve_block_fp8_mxfp8_backend() -> Mxfp8DenseGemmBackend:
     """The FlashInfer MXFP8 backend a 32-wide-K ue8m0 block-fp8 weight can run on.
-    On gfx950 the Triton dot_scaled kernel takes the route by default."""
+    On gfx950 the native scaled-MFMA kernels take the route unless the fp8 GEMM runner
+    backend is set to triton (the dot_scaled kernel)."""
     backend = get_fp8_gemm_runner_backend()
     # the Triton block kernel's ue8m0 activation quant is CUDA-only, so gfx950 takes an MXFP8 route
     if _is_hip and _is_gfx95_supported:
@@ -1169,9 +1165,9 @@ def cutlass_w8a8_block_fp8_linear_with_fallback(
     shape_supported = weight.shape[0] % 128 == 0 and weight.shape[1] % 128 == 0
 
     if input_scale is not None:
-        # Pre-quantized activation (SGLANG_OPT_MOE_QUANT_ONCE): ``input`` is
+        # Pre-quantized activation (SGLANG_OPT_MOE_QUANT_ONCE): input is
         # the fp8 per-token-group-128 q (rows possibly padded to a multiple
-        # of 4), ``input_scale`` the matching column-major scales
+        # of 4), input_scale the matching column-major scales
         # (stride(0) == 1). Output keeps the (padded) row count; the caller
         # slices back to the true token count.
         assert shape_supported, (
@@ -1223,9 +1219,9 @@ def deepgemm_w8a8_block_fp8_linear_with_fallback(
     bias: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     if input_scale is not None:
-        # Pre-quantized activation (SGLANG_OPT_MOE_QUANT_ONCE): ``input`` is
+        # Pre-quantized activation (SGLANG_OPT_MOE_QUANT_ONCE): input is
         # the fp8 per-token-group-128 q with rows padded to a multiple of 4
-        # and ``input_scale`` the matching column-major fp32 scales
+        # and input_scale the matching column-major fp32 scales
         # (stride == (1, padded_rows)) -- identical to the MN-major
         # TMA-aligned layout this path's own quant would produce below.
         # Output keeps the padded row count; the caller slices back.
@@ -1445,7 +1441,7 @@ def triton_w8a8_block_fp8_linear(
     act_scale_ue8m0: bool = False,
 ) -> torch.Tensor:
     if input_scale is not None:
-        # Pre-quantized input: ``input`` is already fp8 and ``input_scale`` is
+        # Pre-quantized input: input is already fp8 and input_scale is
         # its per-group scale (row-major (M, cdiv(K, 128))). Produced on HIP by
         # fused act/rmsnorm+quant ops (e.g. fused_clamp_act_mul) that feed the
         # GEMM directly. Skip re-quantization and emit bf16.
@@ -1513,7 +1509,7 @@ def flashinfer_mxfp8_blockscaled_linear(
     backend: str = "cutlass",
     pin_tactic: bool = False,
 ) -> torch.Tensor:
-    """MXFP8 dense linear via FlashInfer mm_mxfp8. `weight_scale` must be the layout
+    """MXFP8 dense linear via FlashInfer mm_mxfp8. weight_scale must be the layout
     the backend expects, prepared at load time.
 
     pin_tactic skips autotuning: tactics tuned per M bucket change the fp32
@@ -1631,7 +1627,7 @@ def block_quant_to_tensor_quant(
     block_size: List[int],
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """This function converts block-wise quantization to tensor-wise quantization.
-    The inputs are block-wise quantization tensor `x_q_block`, block-wise quantization scale
+    The inputs are block-wise quantization tensor x_q_block, block-wise quantization scale
     and the block size.
     The outputs are tensor-wise quantization tensor and tensor-wise quantization scale.
     Note only float8 is supported for now.
@@ -1675,7 +1671,7 @@ def block_quant_dequant(
     dtype: torch.dtype,
 ) -> torch.Tensor:
     """This function converts block-wise quantization to unquantized.
-    The inputs are block-wise quantization tensor `x_q_block`, block-wise quantization scale
+    The inputs are block-wise quantization tensor x_q_block, block-wise quantization scale
     and the block size.
     The output is an unquantized tensor with dtype.
     """
@@ -1899,7 +1895,7 @@ def _get_mn_major_tma_aligned_packed_ue8m0_tensor_torch_impl(
 
     assert x.dtype == torch.float and x.dim() in (2, 3)
 
-    # First, convert into UE8M0 `uint8_t`
+    # First, convert into UE8M0 uint8_t
     ue8m0_tensor = (x.view(torch.int) >> 23).to(torch.uint8)
 
     # Second, make padded packed tensors
@@ -2105,7 +2101,7 @@ def apply_fp8_linear(
 
     # A pre-quantized fp8 activation (e.g. from a fused RMSNorm+quant kernel)
     # carries no original dtype: skip re-quant, reuse the supplied per-tensor
-    # input_scale, and emit ``pre_quant_output_dtype`` (the model's activation
+    # input_scale, and emit pre_quant_output_dtype (the model's activation
     # dtype, propagated by the producer) or bf16 if it was not provided.
     input_prequantized = input_2d.dtype in (
         torch.float8_e4m3fn,
@@ -2413,7 +2409,7 @@ def validate_fp8_block_shape(
 ) -> None:
     """Validate block quantization shapes for tensor parallelism."""
 
-    # Lazy: a ``getattr`` default would read the published bag even for a
+    # Lazy: a getattr default would read the published bag even for a
     # layer that carries its own tp_size.
     tp_size = layer.tp_size if hasattr(layer, "tp_size") else get_parallel().tp_size
     block_n, block_k = block_size[0], block_size[1]

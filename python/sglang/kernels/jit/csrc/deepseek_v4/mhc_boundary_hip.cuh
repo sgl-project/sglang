@@ -130,8 +130,10 @@ constexpr int kCoefRowBytes = 96;
 constexpr int kStageCoefBytes = kBlockM * kCoefRowBytes;
 constexpr int kStageBytes = kStageTilesBytes + kStageCoefBytes;
 
+// The wrapper instantiates <true, true> (post + combine) and <false, false> (stats only).
 template <bool kHasPost, bool kHasCombine>
 __device__ __forceinline__ void issue_coef_prefetch(const Params& p, int block, int lane, lds_u8* coef_stage) {
+  static_assert(kHasPost == kHasCombine, "the coefficient prefetch serves post + combine or neither");
   // chunk c: row c / 6, part c % 6 (post, comb x4, pre); rows past M read row M - 1, never stored
 #pragma unroll
   for (int a = 0; a < 2; ++a) {
@@ -148,10 +150,8 @@ __device__ __forceinline__ void issue_coef_prefetch(const Params& p, int block, 
         } else if (part <= 4) {
           src = p.comb_in + static_cast<int64_t>(row) * (kHc * kHc) + (part - 1) * 4;
         } else {
-          src = kHasCombine ? p.pre_prev + static_cast<int64_t>(row) * kHc : p.post_in;
+          src = p.pre_prev + static_cast<int64_t>(row) * kHc;
         }
-      } else {
-        src = p.pre_prev + static_cast<int64_t>(row) * kHc;  // parts other than 5 are unused
       }
       __builtin_amdgcn_global_load_lds(const_cast<float*>(src), coef_stage + a * 1024, 16, 0, 0);
     }
@@ -164,7 +164,7 @@ __device__ __forceinline__ void read_coefs(const lds_u8* coef_stage, int r, floa
   const lds_u8* row = coef_stage + r * kCoefRowBytes;
 #pragma unroll
   for (int i = 0; i < 6; ++i) {
-    const bool used = (i == 0 || (i >= 1 && i <= 4)) ? kHasPost : kHasCombine;
+    const bool used = i <= 4 ? kHasPost : kHasCombine;
     if (used) {
       const f32x4 v = *reinterpret_cast<const f32x4*>(row + 16 * i);
       cf[4 * i] = v[0];

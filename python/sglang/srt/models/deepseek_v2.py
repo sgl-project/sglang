@@ -53,6 +53,7 @@ from sglang.srt.configs.model_config import (
     is_glm_moe_dsa,
 )
 from sglang.srt.distributed import divide
+from sglang.srt.distributed.parallel_state import get_tp_group
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
@@ -100,6 +101,7 @@ from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.hash_topk import HashTopK
 from sglang.srt.layers.moe.kt_ep_wrapper import KTEPWrapperMethod
+from sglang.srt.layers.moe.mhc_post_fusion import current_mhc_post_fusion
 from sglang.srt.layers.moe.token_dispatcher.base import (
     BaseDispatcher,
     CombineInput,
@@ -211,11 +213,11 @@ from sglang.srt.utils import (
 from sglang.srt.utils.custom_op import register_custom_op
 
 if _use_aiter:
+    from sglang.kernels.ops.moe.rocm_router_gate import rocm_router_max_tokens
     from sglang.srt.layers.moe.moe_runner.aiter import aiter_fused_reduce_shared_add
     from sglang.srt.layers.rocm_linear_utils import (
         aiter_dsv3_router_gemm,
         aiter_dsv3_router_split_k,
-        aiter_dsv3_router_split_k_max_tokens,
     )
 
 if _use_aiter_gfx95:
@@ -227,7 +229,13 @@ if _use_aiter:
     pass
 
 if _is_hip:
+    from sglang.kernels.ops.communication.all_reduce_mhc_hip import (
+        all_reduce_mhc_post,
+    )
     from sglang.srt.models.deepseek_common.amd import deepseek_v2_hip_act as _hip_act
+    from sglang.srt.models.deepseek_common.amd.deepseek_v4_fused_mhc import (
+        ALL_REDUCE_MHC_MAX_ROWS,
+    )
 else:
     _hip_act = None
 
@@ -518,7 +526,12 @@ class MoEGate(nn.Module):
         )
         # Rows up to which the ROCm split-K router serves the gate (-1: never).
         self.rocm_router_max_tokens = (
-            aiter_dsv3_router_split_k_max_tokens(config, self.weight.dtype)
+            rocm_router_max_tokens(
+                num_experts=config.n_routed_experts,
+                hidden_size=config.hidden_size,
+                topk=config.num_experts_per_tok,
+                weight_dtype=self.weight.dtype,
+            )
             if _use_aiter and not is_hash_moe
             else -1
         )
@@ -948,8 +961,7 @@ class DeepseekV2MoE(nn.Module):
         )
         use_vision_topk = self.gate.e_score_correction_bias_vl is not None
         # image tokens exist only in extend batches with images; other batches take
-        # the fused top-k. Not ROCm-specific: kevin-mii/sglang branch
-        # vision-topk-extend-only carries the platform-wide form for its own PR.
+        # the fused top-k
         if use_vision_topk and _is_hip and forward_batch is not None:
             use_vision_topk = (
                 forward_batch.forward_mode.is_extend()
@@ -1002,8 +1014,8 @@ class DeepseekV2MoE(nn.Module):
         fused_gate: bool,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """The router logits and, on the ROCm decode router, the split-K partials
-        ``self.topk`` sums into them; ``fused_gate=False`` when anything else reads them."""
-        if fused_gate and _use_aiter and not getattr(self, "is_hash", False):
+        self.topk sums into them; fused_gate=False when anything else reads them."""
+        if fused_gate and _use_aiter and not self.is_hash:
             logits_and_partials = aiter_dsv3_router_split_k(self.gate, hidden_states)
             if logits_and_partials is not None:
                 return logits_and_partials
@@ -1012,22 +1024,15 @@ class DeepseekV2MoE(nn.Module):
     def _all_reduce_output(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Post-experts all-reduce; on ROCm the eagerly built 1-8 row mHC states take the
         fused all-reduce + post kernel."""
-        from sglang.srt.layers.moe.mhc_post_fusion import current_mhc_post_fusion
-
         mhc = current_mhc_post_fusion()
         if (
             mhc is not None
-            and get_platform().is_hip
+            and _is_hip
             and not self._shared_expert_tp1
             and not mhc.overlap_only
             and mhc.post is not None
-            and 1 <= hidden_states.shape[0] <= 8
+            and 1 <= hidden_states.shape[0] <= ALL_REDUCE_MHC_MAX_ROWS
         ):
-            from sglang.kernels.ops.communication.all_reduce_mhc_hip import (
-                all_reduce_mhc_post,
-            )
-            from sglang.srt.distributed.parallel_state import get_tp_group
-
             mhc.output = all_reduce_mhc_post(
                 hidden_states,
                 mhc.residual,
@@ -1087,10 +1092,6 @@ class DeepseekV2MoE(nn.Module):
             gemm_output_zero_allocator,
             fused_gate=not use_flashinfer_trtllm_bypass and not use_vision_topk,
         )
-        # What the routed experts receive as their pre-quantized input: the
-        # quant-once fp8 pair when that is on (also fed to the shared expert),
-        # otherwise the MXFP8 pre-quant issued on routed_quant_stream, whose
-        # layout the shared expert cannot take, or None.
         if use_flashinfer_trtllm_bypass:
             topk_output = BypassedTopKOutput(
                 hidden_states=hidden_states,
@@ -1291,7 +1292,7 @@ class DeepseekV2MoE(nn.Module):
         self, skip_shared_experts: bool, num_tokens: int
     ) -> bool:
         """aiter: the shared expert runs first so the experts' top-k reduction can add
-        it in one launch. ``shared_experts`` exists only when the checkpoint has one
+        it in one launch. shared_experts exists only when the checkpoint has one
         that is not fused into the routed kernel."""
         return bool(
             _use_aiter
@@ -3305,7 +3306,7 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
         """Why this checkpoint cannot fuse its shared expert, or None.
 
         Evaluated by the loader once per runner, before any layer is built (see
-        ``install_shared_experts_fusion_decision``), so it takes the config and
+        install_shared_experts_fusion_decision), so it takes the config and
         quantization it is asked about rather than reading an instance.
         """
         # Need to disable if quant precision mismatch, even if

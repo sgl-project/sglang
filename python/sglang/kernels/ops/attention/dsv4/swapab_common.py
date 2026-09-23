@@ -5,7 +5,7 @@ from triton.experimental.gluon import language as gl
 
 
 @gluon.jit
-def _load_v4(
+def load_v4(
     CACHE,
     ids,
     valid,

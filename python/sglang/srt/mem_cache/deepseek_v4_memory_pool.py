@@ -23,7 +23,6 @@ from sglang.kernels.ops.attention.dsv4.kv_layout import (
 from sglang.kernels.ops.attention.dsv4.unified_kv_kernels import layout
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.environ import envs
-from sglang.srt.mem_cache import deepseek_v4_index_k_hip as index_k_hip
 from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
 from sglang.srt.mem_cache.deepseek_v4_compress_state import CompressStatePool
 from sglang.srt.mem_cache.memory_pool import KVCache
@@ -67,8 +66,8 @@ def get_compress_state_ring_size(
 
 
 def get_compress_state_write_pad(compress_ratio: int, ring_size: int) -> int:
-    """Largest draft-token count this ring can serve; mirrors `mtp_pad` in
-    `c_plan.cuh`, where the bound is derived."""
+    """Largest draft-token count this ring can serve; mirrors mtp_pad in
+    c_plan.cuh, where the bound is derived."""
     window_size = compress_ratio * (2 if compress_ratio == 4 else 1)
     return ring_size - window_size + 2 if ring_size > window_size else 0
 
@@ -103,8 +102,8 @@ def _num_dsv4_physical_kv_pages(
 def resolve_compressed_kv_layout(
     kv_layout: KVLayout, compress_ratio: int, option: Optional[str] = None
 ) -> KVLayout:
-    """Layout of one compress ratio's cache next to a ``kv_layout`` main cache.
-    The ratio-1/2 latents are already e2m1 with per-16 e4m3 scales, so ``V41_FP4``
+    """Layout of one compress ratio's cache next to a kv_layout main cache.
+    The ratio-1/2 latents are already e2m1 with per-16 e4m3 scales, so V41_FP4
     is lossless for them; ratios 4 / 128 are not fp4-rounded and stay fp8."""
     if option is not None:
         option = option.lower()
@@ -138,11 +137,11 @@ def flashmla_supports_v41_kv_layouts() -> bool:
 
 def select_dsv4_kv_layout() -> Tuple[KVLayout, Optional[str]]:
     """The (main-cache layout, compressed-cache option) of a new DeepSeek-V4
-    family pool, from ``SGLANG_DSV4_KV_LAYOUT`` (``v4`` | ``v41`` | ``auto``) and
-    ``SGLANG_DSV4_COMPRESSED_KV_LAYOUT`` (``auto`` | ``fp8`` | ``fp4``).
+    family pool, from SGLANG_DSV4_KV_LAYOUT (v4 | v41 | auto) and
+    SGLANG_DSV4_COMPRESSED_KV_LAYOUT (auto | fp8 | fp4).
 
     Compact layouts require SM100/SM103 FlashMLA or gfx950 AITER attention.
-    ``v41`` raises on unsupported backends; ``auto`` keeps ``v4`` there.
+    v41 raises on unsupported backends; auto keeps v4 there.
     """
     mode = envs.SGLANG_DSV4_KV_LAYOUT.get().lower()
     option = envs.SGLANG_DSV4_COMPRESSED_KV_LAYOUT.get().lower()
@@ -300,8 +299,8 @@ class DeepSeekV4SingleKVPool(KVCache):
         cache_k: torch.Tensor,
         freqs_cis: Optional[torch.Tensor] = None,
     ) -> None:
-        """Quantize ``cache_k`` ``[n, 512]`` bf16 into this pool's layout at ``loc``.
-        ``freqs_cis`` (V4.1 only) rotates the RoPE tail in-kernel, so the input is
+        """Quantize cache_k [n, 512] bf16 into this pool's layout at loc.
+        freqs_cis (V4.1 only) rotates the RoPE tail in-kernel, so the input is
         the un-rotated latent and the fp4 / fp8 rounding happens once."""
         return fused_store_cache(
             input=cache_k,
@@ -662,8 +661,19 @@ class DeepSeekV4IndexerPool(KVCache):
         cache_k: torch.Tensor,
     ) -> None:
         if self.uses_aiter_fp4_layout:
-            return index_k_hip.store_fp4_index_k(
-                self, layer_id - self.start_layer, loc, cache_k
+            # the FlyDSL kernels read the fp4 payload and the packed ue8m0 scales
+            # from two buffers
+            from sglang.kernels.ops.attention.dsv4.fp4_indexer_hip import (
+                store_fp4_index_k_cache_split,
+            )
+
+            return store_fp4_index_k_cache_split(
+                cache_k,
+                self.index_k_payload_buffer[layer_id - self.start_layer],
+                self.index_k_scale_buffer[layer_id - self.start_layer],
+                loc,
+                page_size=self.page_size,
+                rne=self.index_k_rne,
             )
         from sglang.kernels.ops.attention.dsv4.fp4_indexer import (
             store_fp4_index_k_cache,
@@ -680,12 +690,19 @@ class DeepSeekV4IndexerPool(KVCache):
     def get_index_k_fp4(
         self, layer_id: int, slots: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Packed fp4 rows at `slots`: (payload int8 [n, 64], scales int32 [n]),
+        """Packed fp4 rows at slots: (payload int8 [n, 64], scales int32 [n]),
         from the page layout [page_size * 64 payload | page_size * 4 scale]."""
         assert self.use_fp4_indexer, "packed readback only applies to the fp4 layout"
         if self.uses_aiter_fp4_layout:
-            return index_k_hip.read_fp4_index_k(
-                self, layer_id - self.start_layer, slots
+            from sglang.kernels.ops.attention.dsv4.fp4_indexer_hip import (
+                read_fp4_index_k_split,
+            )
+
+            return read_fp4_index_k_split(
+                self.index_k_payload_buffer[layer_id - self.start_layer],
+                self.index_k_scale_buffer[layer_id - self.start_layer],
+                slots,
+                page_size=self.page_size,
             )
         buf = self.index_k_with_scale_buffer[layer_id - self.start_layer]
         slots = slots.to(torch.int64)
@@ -702,31 +719,17 @@ class DeepSeekV4IndexerPool(KVCache):
     def get_index_k_dequant(
         self, layer_id: int, slots: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
-        """Dequantized bf16 [n, index_head_dim] index K; `slots` None reads the pool."""
+        """Dequantized bf16 [n, index_head_dim] index K; slots None reads the pool."""
         from sglang.srt.layers.quantization.fp8 import DSV4_DEQUANT_FP4_TABLE
 
         assert self.use_fp4_indexer, "dequant readback only applies to the fp4 layout"
-        if self.uses_aiter_fp4_layout:
-            return index_k_hip.dequant_fp4_index_k(
-                self, layer_id - self.start_layer, slots
-            )
-        buf = self.index_k_with_scale_buffer[layer_id - self.start_layer]
         if slots is None:
-            slots = torch.arange(self.size, device=buf.device)
-        slots = slots.to(torch.int64)
-        # Page layout: see get_index_k_fp4.
-        p = self.page_size
-        page, off = (slots // p).unsqueeze(-1), slots % p
-        payload_cols = (off * 64).unsqueeze(-1) + torch.arange(64, device=buf.device)
-        scale_cols = (p * 64 + off * 4).unsqueeze(-1) + torch.arange(
-            4, device=buf.device
-        )
-        u = buf[page, payload_cols].view(torch.uint8)  # [n, 64]
+            slots = torch.arange(self.size, device=self.device)
+        payload, packed = self.get_index_k_fp4(layer_id, slots.to(torch.int64))
+        u = payload.view(torch.uint8)  # [n, 64]
         codes = torch.stack([u & 0x0F, (u >> 4) & 0x0F], dim=-1)  # [n, 64, 2]
-        vals = DSV4_DEQUANT_FP4_TABLE.to(buf.device)[codes.long()].flatten(
-            1
-        )  # [n, 128]
-        exps = buf[page, scale_cols].to(torch.int32) & 0xFF  # [n, 4]
+        vals = DSV4_DEQUANT_FP4_TABLE.to(u.device)[codes.long()].flatten(1)  # [n, 128]
+        exps = torch.stack([(packed >> (8 * c)) & 0xFF for c in range(4)], dim=-1)
         scales = torch.exp2(exps.float() - 127).repeat_interleave(32, dim=-1)
         return (vals * scales).to(torch.bfloat16)
 
@@ -774,17 +777,17 @@ def dsv4_unified_row_bytes(
 class DeepSeekV4UnifiedKVPool:
     """
     Layout (bf16):
-    unified_kv[L]: ``[swa_pages + padded_compress_rows, head_dim]`` bf16
+    unified_kv[L]: [swa_pages + padded_compress_rows, head_dim] bf16
 
-    Layout (fp8, ``SGLANG_DSV4_UNIFIED_KV_FP8``) -- two parallel pools with the
+    Layout (fp8, SGLANG_DSV4_UNIFIED_KV_FP8) -- two parallel pools with the
     same row count, so a row index means the same thing in both. Named after the
-    accessors, which under fp8 each return one half -- ``get_unified_kv`` the
-    nope, ``get_unified_kv_rope`` the rope:
-    unified_kv[L]      (nope): ``[rows, 512]`` fp8, see DSV4_FP8_NOPE_ROW_BYTES
-    unified_kv_rope[L] (rope): ``[rows, qk_rope_head_dim]`` bf16, never quantized
+    accessors, which under fp8 each return one half -- get_unified_kv the
+    nope, get_unified_kv_rope the rope:
+    unified_kv[L]      (nope): [rows, 512] fp8, see DSV4_FP8_NOPE_ROW_BYTES
+    unified_kv_rope[L] (rope): [rows, qk_rope_head_dim] bf16, never quantized
 
-    - rows ``[0, swa_pages)``   = SWA ring (``req_pool_indices * swa_window + pos % swa_window``)
-    - rows ``[swa_pages, ...)`` = compressed (``swa_pages + page_index``)
+    - rows [0, swa_pages)   = SWA ring (req_pool_indices * swa_window + pos % swa_window)
+    - rows [swa_pages, ...) = compressed (swa_pages + page_index)
     """
 
     K_PER_BLOCK = {0: 0, 4: 32, 128: 1}
@@ -1350,7 +1353,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         The bf16 rope half of an fp8 two-pool row, or None when there isn't one.
 
         A row index addresses both pools, so this mirrors exactly the rows
-        ``unified_region_buffers`` does and only the row width differs. It needs
+        unified_region_buffers does and only the row width differs. It needs
         its own host pool: offloading the nope half alone leaves whatever rope the
         row held before, which is wrong output rather than a crash.
         """
@@ -1520,11 +1523,11 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         cls: type = DeepSeekV4SingleKVPool,
         kv_layout: KVLayout = KVLayout.V4,
     ) -> DeepSeekV4SingleKVPool:
-        """Build a full / SWA / c4 / c128 single-KV pool. ``global_page_size``
+        """Build a full / SWA / c4 / c128 single-KV pool. global_page_size
         is the model-wide logical page size. CUDA pools use it to reserve enough
         physical rows for the allocator's dummy logical page.
-        Overridden by :class:`DSV4NPUTokenToKVPool` to swap in the NPU bf16
-        PA_ND variant, which needs ``global_page_size`` for its kernel view."""
+        Overridden by DSV4NPUTokenToKVPool to swap in the NPU bf16
+        PA_ND variant, which needs global_page_size for its kernel view."""
         return cls(
             size,
             page_size,
@@ -1539,7 +1542,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         )
 
     def compressed_kv_layout(self, compress_ratio: int) -> KVLayout:
-        """See :func:`resolve_compressed_kv_layout`."""
+        """See resolve_compressed_kv_layout."""
         layout = resolve_compressed_kv_layout(
             self.kv_layout, compress_ratio, self.compressed_kv_layout_option
         )
@@ -1558,8 +1561,8 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         force_fp4: bool = False,
     ) -> DeepSeekV4IndexerPool:
         """Build the c4 lightning-indexer K pool (packed CUDA layout).
-        Overridden by :class:`DSV4NPUTokenToKVPool` to swap in the
-        dedicated-buffer NPU variant. ``force_fp4`` forces the fp4 low-ratio layout."""
+        Overridden by DSV4NPUTokenToKVPool to swap in the
+        dedicated-buffer NPU variant. force_fp4 forces the fp4 low-ratio layout."""
         if force_fp4:
             pool = DeepSeekV4IndexerPool(
                 size,
@@ -1878,7 +1881,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         return compress_kv_pool.kv_layout
 
     def get_extra_key_bytes_per_token(self, layer_id: int) -> int:
-        """Last dim of the ``(pages, page_size, 1, bytes)`` view the attention
+        """Last dim of the (pages, page_size, 1, bytes) view the attention
         kernel detects the extra cache's format from."""
         _, _, compress_kv_pool = self.layer_mapping[layer_id]
         assert compress_kv_pool is not None
@@ -1889,7 +1892,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         return self.kv_layout
 
     def get_swa_key_bytes_per_token(self) -> int:
-        """Last dim of the ``(pages, page_size, 1, bytes)`` view the attention
+        """Last dim of the (pages, page_size, 1, bytes) view the attention
         kernel detects the SWA cache's format from."""
         if self.uniform_fp8:
             # The trtllm uniform-FP8 pool has no paged FlashMLA layout: 512 B/token.
@@ -1924,7 +1927,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
     def get_low_ratio_index_k_dequant(
         self, layer_id: int, slots: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
-        """Index-K rows at `slots` from the layer's latent source."""
+        """Index-K rows at slots from the layer's latent source."""
         compress_ratio, compress_layer_id, _ = self.layer_mapping[layer_id]
         return self._indexer_pool(compress_ratio).get_index_k_dequant(
             compress_layer_id, slots
@@ -1933,7 +1936,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
     def get_low_ratio_index_k_fp4(
         self, layer_id: int, slots: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Packed fp4 index-K rows at `slots`: (payload int8 [n, 64], ue8m0 scales
+        """Packed fp4 index-K rows at slots: (payload int8 [n, 64], ue8m0 scales
         packed int32 [n]), the input layout of quantize_fp4_indexer_tensor."""
         compress_ratio, compress_layer_id, _ = self.layer_mapping[layer_id]
         return self._indexer_pool(compress_ratio).get_index_k_fp4(
@@ -1952,7 +1955,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
 
     def low_ratio_index_k_is_split(self, layer_id: int) -> bool:
         """Whether the layer's index-K pool keeps payload and scale in the split
-        FlyDSL layout (ROCm) rather than one fused `[.., 68]`-byte row."""
+        FlyDSL layout (ROCm) rather than one fused [.., 68]-byte row."""
         compress_ratio, _, _ = self.layer_mapping[layer_id]
         return self._indexer_pool(compress_ratio).uses_aiter_fp4_layout
 
@@ -2054,7 +2057,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         positions: torch.Tensor,
         q: Optional[torch.Tensor] = None,
     ) -> None:
-        """``q`` ([B, H, head_dim]): rope its query heads in the same launch."""
+        """q ([B, H, head_dim]): rope its query heads in the same launch."""
         if self.uniform_fp8:
             assert q is None, "uniform FP8 store does not fuse query RoPE"
             # Uniform-FP8 (trtllm-gen) layout: norm + RoPE with the existing
@@ -2104,7 +2107,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         Under unified_kv the (fp8, paged) swa_kv_pool is None -- SWA K lives in
         the shared bf16 unified_kv ring instead. Norm+RoPE the draft KV in place
         (the same freqs_cis path the main model uses via _compute_kv_bf16) and
-        scatter it into ``unified_kv[swa_loc]``. Rows with swa_loc < 0
+        scatter it into unified_kv[swa_loc]. Rows with swa_loc < 0
         (uncommitted verify tokens) are skipped by the scatter.
         """
         from sglang.kernels.ops.attention.dsv4 import fused_norm_rope_inplace
@@ -2124,9 +2127,9 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         cache_k: torch.Tensor,
         freqs_cis: Optional[torch.Tensor] = None,
     ) -> None:
-        """Write ``cache_k`` ``[n, 512]`` bf16 into the layer's compressed cache.
-        For an fp4 (``V41_FP4``) cache pass the *un-quantized* latent, plus
-        ``freqs_cis`` if it is not rotated yet: the kernel rounds to e2m1 once."""
+        """Write cache_k [n, 512] bf16 into the layer's compressed cache.
+        For an fp4 (V41_FP4) cache pass the *un-quantized* latent, plus
+        freqs_cis if it is not rotated yet: the kernel rounds to e2m1 once."""
         _, compress_layer_id, compress_kv_pool = self.layer_mapping[layer_id]
         assert compress_kv_pool is not None
         if freqs_cis is not None:

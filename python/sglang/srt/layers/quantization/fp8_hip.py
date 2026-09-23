@@ -1,7 +1,7 @@
-"""gfx950 dense routes of `Fp8LinearMethod` for 32x32-block fp8 checkpoints served as
-MXFP8 (`block_fp8_as_mxfp8`): the Triton dot_scaled kernel, or the native scaled-MFMA
+"""gfx950 dense routes of Fp8LinearMethod for 32x32-block fp8 checkpoints served as
+MXFP8 (block_fp8_as_mxfp8): the Triton dot_scaled kernel, or the native scaled-MFMA
 kernels on a lane-ordered weight. The fused gfx950 producers hand these routes their
-operand as an `Fp8GridActivation` (bf16 already on the fp8 grid) or an `Mxfp8Activation`."""
+operand as an Fp8GridActivation (bf16 already on the fp8 grid) or an Mxfp8Activation."""
 
 from __future__ import annotations
 
@@ -13,13 +13,18 @@ from sglang.kernels.ops.quantization.mxfp8_amd_gfx95 import (
     Fp8GridActivation,
     Mxfp8Activation,
     bf16_dequant_blockscaled_linear,
+    dequant_block_fp8_weight_to_bf16,
     dequant_mxfp8_to_bf16,
+)
+from sglang.kernels.ops.quantization.mxfp8_native_amd_gfx95 import (
+    native_route_supports,
+    prepare_mxfp8_native_weight,
 )
 from sglang.srt.layers.utils import copy_or_rebind_param
 
 
 def process_dense_weights(method, layer: torch.nn.Module, scale_u8) -> None:
-    """The gfx950 branch of `Fp8LinearMethod.process_weights_after_loading`."""
+    """The gfx950 branch of Fp8LinearMethod.process_weights_after_loading."""
     backend = method.mxfp8_dense_backend
     if backend.is_gfx95_dot_scaled():
         # dot_scaled reads canonical [N, K // 32] e8m0 bytes; block scales stay for direct readers
@@ -27,14 +32,6 @@ def process_dense_weights(method, layer: torch.nn.Module, scale_u8) -> None:
             copy_or_rebind_param(layer, "weight_scale_inv_mx", scale_u8.contiguous())
         return
     assert backend.is_gfx95_mxfp8_native()
-    from sglang.kernels.ops.quantization.mxfp8_amd_gfx95 import (
-        dequant_block_fp8_weight_to_bf16,
-    )
-    from sglang.kernels.ops.quantization.mxfp8_native_amd_gfx95 import (
-        native_route_supports,
-        prepare_mxfp8_native_weight,
-    )
-
     n, k = layer.weight.shape
     layer.mxfp8_native_ready = False
     if native_route_supports(n, k):
@@ -64,20 +61,10 @@ def process_dense_weights(method, layer: torch.nn.Module, scale_u8) -> None:
         )
 
 
-def unwrap_activation(x):
-    """Off a gfx950 route the producer's wrapper is unwrapped; re-quantizing is
-    idempotent per-32 rounding."""
-    if isinstance(x, Mxfp8Activation):
-        x = Fp8GridActivation(dequant_mxfp8_to_bf16(x.q, x.scale))
-    if isinstance(x, Fp8GridActivation):
-        x = x.x
-    return x
-
-
 def apply_dense(
     method, layer: torch.nn.Module, x, bias: Optional[torch.Tensor]
 ) -> torch.Tensor:
-    """`Fp8LinearMethod.apply` on a gfx950 route. `x` is a bf16 tensor, an `(fp8, scale)`
+    """Fp8LinearMethod.apply on a gfx950 route. x is a bf16 tensor, an (fp8, scale)
     tuple from a fused quant kernel, or one of the wrappers the fused producers emit."""
     backend = method.mxfp8_dense_backend
     mxfp8_ready = layer.block_fp8_mxfp8_ready
@@ -122,7 +109,7 @@ def _apply_native(
     input_scale: Optional[torch.Tensor] = None,
     input_on_fp8_grid: bool = False,
 ) -> torch.Tensor:
-    """The native route (`mxfp8_native_amd_gfx95`); a layer whose shape the native
+    """The native route (mxfp8_native_amd_gfx95); a layer whose shape the native
     kernels do not tile keeps the bf16-dequant route."""
     if layer.mxfp8_native_ready:
         return method.w8a8_mxfp8_linear(
@@ -138,9 +125,5 @@ def _apply_native(
         x = dequant_mxfp8_to_bf16(x, input_scale)
         input_on_fp8_grid = True
     return bf16_dequant_blockscaled_linear(
-        input=x,
-        weight=layer.weight_bf16,
-        weight_scale=None,
-        bias=bias,
-        input_on_fp8_grid=input_on_fp8_grid,
+        x, layer.weight_bf16, bias=bias, input_on_fp8_grid=input_on_fp8_grid
     )
