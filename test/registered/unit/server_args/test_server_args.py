@@ -36,7 +36,10 @@ from sglang.srt.arg_groups.kv_cache_hook import (
     validate_prefill_only_disable_kv_cache_args,
 )
 from sglang.srt.arg_groups.mamba_hook import handle_mamba_backend
-from sglang.srt.arg_groups.memory_hook import handle_gpu_memory_settings
+from sglang.srt.arg_groups.memory_hook import (
+    handle_gpu_memory_settings,
+    handle_offload_compatibility,
+)
 from sglang.srt.arg_groups.model_path_hook import handle_load_format
 from sglang.srt.arg_groups.moe_hook import (
     handle_a2a_moe,
@@ -146,6 +149,26 @@ class TestPrepareServerArgs(CustomTestCase):
                     ple_offload_embedding=True,
                     **generic_offload,
                 ).resolve_once()
+
+    def test_ple_shared_backend_rejects_unsupported_topologies(self):
+        shared = {"ple_offload_embedding": True, "ple_offload_backend": "shared"}
+        handle_offload_compatibility(
+            ServerArgs(model_path="dummy", tp_size=4, **shared)
+        )
+        for unsupported in (
+            {"nnodes": 2},
+            {"enable_dp_attention": True, "dp_size": 2},
+            {"load_format": "presharded"},
+            {"weight_cache_mode": "client"},
+            {"elastic_ep_backend": "mooncake"},
+        ):
+            with (
+                self.subTest(unsupported=unsupported),
+                self.assertRaisesRegex(ValueError, "supports a single node only"),
+            ):
+                handle_offload_compatibility(
+                    ServerArgs(model_path="dummy", **shared, **unsupported)
+                )
 
     def test_weight_cache_daemon_allows_static_eplb(self):
         args = ServerArgs(

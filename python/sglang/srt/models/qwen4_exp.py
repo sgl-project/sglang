@@ -65,6 +65,7 @@ from sglang.srt.models.qwen3_5 import (
 from sglang.srt.models.qwen3_vl import Qwen3VLForConditionalGeneration
 from sglang.srt.models.qwen4_exp_ple_table import (
     allocate_ple_host_table,
+    allocate_shared_ple_host_table,
     make_ple_file_prefetcher,
     make_ple_file_rss_trimmer,
 )
@@ -819,17 +820,38 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
         self.quant_method = None
 
         source_weight = embedding.weight
-        host_table = allocate_ple_host_table(
-            shape=source_weight.shape,
-            dtype=source_weight.dtype,
-            backend=backend,
-            table_dir=table_dir,
-            # Each TP rank holds a different vocabulary shard of the same shape.
-            tag=(
-                f"rows{self.shard_indices.org_vocab_start_index}"
-                f"-{self.shard_indices.org_vocab_end_index}"
-            ),
-        )
+        self._shared_table = None
+        if backend != "shared":
+            host_table = allocate_ple_host_table(
+                shape=source_weight.shape,
+                dtype=source_weight.dtype,
+                backend=backend,
+                table_dir=table_dir,
+                # Each TP rank holds a different vocabulary shard of the same shape.
+                tag=(
+                    f"rows{self.shard_indices.org_vocab_start_index}"
+                    f"-{self.shard_indices.org_vocab_end_index}"
+                ),
+            )
+            gather_range = (
+                self.shard_indices.org_vocab_start_index,
+                self.shard_indices.org_vocab_end_index,
+            )
+        else:
+            self._shared_table = allocate_shared_ple_host_table(
+                shape=(self.num_embeddings_padded, self.embedding_dim),
+                dtype=source_weight.dtype,
+                group=get_tp_group(),
+            )
+            # The table is the TP partitions in rank order; the loaders write
+            # only this rank's partition, through this view.
+            start = self.shard_indices.padded_org_vocab_start_index
+            host_table = self._shared_table[start : start + source_weight.shape[0]]
+            gather_range = (0, self.org_vocab_size)
+        self._gather_vocab_start, self._gather_vocab_end = gather_range
+        # A per-rank shard gathers zeros for the rows it lacks; the all-reduce
+        # adds the peers' rows. A shared table gathers every row itself.
+        self._needs_all_reduce = self.tp_size > 1 and self._shared_table is None
         # Only the file backend has anything to prefetch (rows live on storage).
         self._file_prefetcher = make_ple_file_prefetcher(host_table)
         # ... and only it needs its resident set bounded: a fault maps a whole
@@ -850,7 +872,7 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
         self, shape: Tuple[int, ...], device: torch.device
     ) -> torch.Tensor:
         allocation_context = nullcontext()
-        if self.tp_size > 1:
+        if self._needs_all_reduce:
             allocation_context = use_symmetric_memory(
                 get_tp_group(), disabled=not is_allocation_symmetric()
             )
@@ -884,20 +906,21 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
                     vocab_start=self.shard_indices.org_vocab_start_index,
                     vocab_end=self.shard_indices.org_vocab_end_index,
                 )
+            table = self.weight if self._shared_table is None else self._shared_table
             _gather_ple_embedding_from_pinned_kernel[(flat_ids.numel(),)](
-                self.weight.data_ptr(),
+                table.data_ptr(),
                 flat_ids,
                 output,
                 embedding_dim=self.embedding_dim,
-                tp_vocab_start=self.shard_indices.org_vocab_start_index,
-                tp_vocab_end=self.shard_indices.org_vocab_end_index,
+                tp_vocab_start=self._gather_vocab_start,
+                tp_vocab_end=self._gather_vocab_end,
                 is_fp8=self.weight.dtype == torch.float8_e4m3fn,
                 BLOCK_D=self._block_d,
             )
         return output
 
     def reduce(self, output: torch.Tensor) -> torch.Tensor:
-        if self.tp_size > 1 and not get_attn_tp_context().input_scattered:
+        if self._needs_all_reduce and not get_attn_tp_context().input_scattered:
             if self.use_attn_tp_group:
                 return attn_tp_all_reduce(output)
             return tensor_model_parallel_all_reduce(output)
@@ -2158,7 +2181,17 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
             if isinstance(module, Qwen3_5GatedDeltaNet):
                 module.finalize_fused_in_proj()
 
+        self.post_load_weights()
         return loaded_params
+
+    def post_load_weights(self) -> None:
+        if (
+            self.config.ple_offload_embedding
+            and self.config.ple_offload_backend == "shared"
+        ):
+            # Each rank wrote only its own partition of the shared PLE tables and
+            # gathers from all of them, so no rank may run before every peer wrote.
+            get_tp_group().barrier()
 
     def precompile_kernels_after_loading(self) -> None:
         from sglang.srt.layers.quantization.unquant import precompile_splitk_tactics

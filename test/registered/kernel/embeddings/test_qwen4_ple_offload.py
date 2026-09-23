@@ -1,4 +1,5 @@
 import os
+import re
 import tempfile
 from types import SimpleNamespace
 
@@ -15,6 +16,7 @@ from sglang.srt.models.qwen4_exp import (
     Qwen4ExpPinnedHostEmbedding,
     Qwen4ExpPLELayer,
 )
+from sglang.srt.models.qwen4_exp_ple_table import allocate_shared_ple_host_table
 from sglang.srt.utils import set_weight_attrs
 from sglang.test.ci.ci_register import register_cuda_ci
 
@@ -156,6 +158,70 @@ def test_qwen4_ple_pinned_embedding_rejects_unsupported_weights():
         Qwen4ExpPinnedHostEmbedding(_make_source_embedding(dtype=torch.float16))
     with pytest.raises(NotImplementedError, match="added vocabulary"):
         Qwen4ExpPinnedHostEmbedding(_make_source_embedding(num_added_embeddings=1))
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])
+def test_qwen4_ple_shared_table_serves_every_partition(monkeypatch, dtype):
+    """A rank of a shared table loads only its partition but gathers every row
+    locally; ids outside the vocabulary stay zero and nothing is all-reduced."""
+    embedding_dim = 13
+    single_rank_group = SimpleNamespace(
+        rank_in_group=0,
+        broadcast_object=lambda obj, src=0: obj,
+        barrier=lambda: None,
+    )
+    monkeypatch.setattr(qwen4_exp_module, "get_tp_group", lambda: single_rank_group)
+
+    def no_all_reduce(_output):
+        raise AssertionError("a shared PLE table lookup must not all-reduce")
+
+    monkeypatch.setattr(
+        qwen4_exp_module, "tensor_model_parallel_all_reduce", no_all_reduce
+    )
+    # Rank 1 of 2 over an 8-row vocabulary: it owns and loads rows 4-7.
+    shared = Qwen4ExpPinnedHostEmbedding(
+        _make_source_embedding(
+            dtype=dtype,
+            embedding_dim=embedding_dim,
+            vocab_start=4,
+            vocab_end=8,
+            org_vocab_size=8,
+            tp_size=2,
+        ),
+        backend="shared",
+    )
+    rows = (
+        torch.arange(8 * embedding_dim, dtype=torch.float32, device="cuda").reshape(
+            8, embedding_dim
+        )
+        / 64
+    ).to(dtype)
+    _load_rows(shared, rows)
+    # What rank 0's loader writes into the same table.
+    shared._shared_table[:4].copy_(rows[:4])
+
+    ids = torch.tensor([[-1, 0, 3, 4], [7, 8, 100, 5]], device="cuda")
+    in_vocab = ((ids >= 0) & (ids < 8)).unsqueeze(-1)
+    expected = torch.where(in_vocab, rows.to(torch.bfloat16)[ids.clamp(0, 7)], 0.0)
+    torch.testing.assert_close(shared(ids), expected, rtol=0, atol=0)
+
+
+def test_qwen4_ple_shared_table_reports_registration_failure(monkeypatch):
+    """A failed cudaHostRegister must raise its CUDA status as a RuntimeError,
+    not a TypeError from formatting that status."""
+    cudart = torch.cuda.cudart()
+    out_of_memory = cudart.cudaError(2)
+    monkeypatch.setattr(cudart, "cudaHostRegister", lambda *_args: out_of_memory)
+    single_rank_group = SimpleNamespace(
+        rank_in_group=0,
+        broadcast_object=lambda obj, src=0: obj,
+        barrier=lambda: None,
+    )
+    status = re.escape(f"rc=2, {cudart.cudaGetErrorString(out_of_memory)}")
+    with pytest.raises(RuntimeError, match=status):
+        allocate_shared_ple_host_table(
+            shape=(8, 16), dtype=torch.float8_e4m3fn, group=single_rank_group
+        )
 
 
 def test_qwen4_ple_prefetch_buffer_lifecycle(monkeypatch):
