@@ -791,7 +791,7 @@ def prepare_server_args(argv: list[str]) -> ServerArgs:
     # the configuration was asked for. It rides along on the record so a
     # subprocess copy can answer the same question the launcher can.
     # lazy: watermark imports torch, outside server_args' top-level boundary.
-    from sglang.srt.sampling.watermarking import redact_watermark_command_line
+    from sglang.srt.sampling.watermarking.core import redact_watermark_command_line
 
     server_args._launch_command = redact_watermark_command_line(argv)
     return server_args

@@ -5,7 +5,7 @@ from unittest.mock import Mock, patch
 import pytest
 import torch
 
-from sglang.srt.sampling.watermarking import (
+from sglang.srt.sampling.watermarking.core import (
     build_watermark_batch_config,
     normalize_watermark_request,
     resolve_watermark_request,

@@ -18,7 +18,7 @@ from sglang.srt.arg_groups.overrides import (
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.cuda_graph_config import Backend, Phase, with_phase
 from sglang.srt.runtime_context import get_platform
-from sglang.srt.sampling.watermarking import load_watermark_config
+from sglang.srt.sampling.watermarking.config import load_watermark_config
 from sglang.srt.utils.common import (
     configure_media_url_security,
     get_device,

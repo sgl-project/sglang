@@ -18,7 +18,7 @@ import logging
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Tuple, Union
 
 from sglang.srt.environ import envs
-from sglang.srt.sampling.watermarking import redact_watermark_secrets
+from sglang.srt.sampling.watermarking.core import redact_watermark_secrets
 from sglang.srt.utils.log_utils import create_log_targets, log_json
 
 if TYPE_CHECKING:

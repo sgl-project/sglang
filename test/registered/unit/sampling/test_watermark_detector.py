@@ -12,8 +12,8 @@ from sglang.srt.sampling.watermarking import (
     WatermarkDetector,
     WatermarkStatistics,
     detect,
-    parse_watermark_key,
 )
+from sglang.srt.sampling.watermarking.config import parse_watermark_key
 from sglang.srt.sampling.watermarking.core import (
     _dual_key_a_mask_torch,
     _hash_contexts,

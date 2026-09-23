@@ -155,7 +155,7 @@ from sglang.srt.runtime_context import (
 )
 from sglang.srt.sampling.custom_logit_processor import supports_sampling_mask
 from sglang.srt.sampling.sampling_params import SamplingParams
-from sglang.srt.sampling.watermarking import (
+from sglang.srt.sampling.watermarking.core import (
     redact_watermark_command_line,
     redact_watermark_secrets,
     resolve_watermark_request,

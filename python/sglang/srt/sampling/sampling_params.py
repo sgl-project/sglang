@@ -19,7 +19,7 @@ from typing import Dict, List, Optional, Sequence, Set, Union
 
 import msgspec
 
-from sglang.srt.sampling.watermarking import (
+from sglang.srt.sampling.watermarking.core import (
     WatermarkRequestConfig,
     normalize_watermark_request,
 )
