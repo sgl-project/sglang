@@ -135,14 +135,21 @@ class Qwen3_5ForCausalLM(nn.Module):
             if isinstance(self.model.embed_tokens, PPMissingLayer)
             else self.model.embed_tokens.weight
         )
-        head = None if isinstance(self.lm_head, PPMissingLayer) else self.lm_head.weight
+        head = None
+        if not isinstance(self.lm_head, PPMissingLayer) and hasattr(
+            self.lm_head, "weight"
+        ):
+            # A packed lm_head has no dense weight; the draft shares the module instead.
+            head = self.lm_head.weight
         return embed, head
 
     def set_embed_and_head(self, embed, head):
-        del self.model.embed_tokens.weight
-        del self.lm_head.weight
-        self.model.embed_tokens.weight = embed
-        self.lm_head.weight = head
+        if embed is not None:
+            del self.model.embed_tokens.weight
+            self.model.embed_tokens.weight = embed
+        if head is not None:
+            del self.lm_head.weight
+            self.lm_head.weight = head
         current_platform.empty_cache()
         current_platform.synchronize()
 
