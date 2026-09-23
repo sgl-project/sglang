@@ -22,6 +22,7 @@ class TestGLM52NVFP4TPMTP(
     tp_size = 4
     mem_fraction_static = 0.8
     bs_1_speed_thres = 280
+    gsm8k_accuracy_thres = 0.92
     extra_server_args = [
         "--moe-runner-backend",
         "flashinfer_trtllm",

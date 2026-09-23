@@ -16,12 +16,26 @@ limitations under the License.
 from __future__ import annotations
 
 import abc
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Protocol
 
 import torch
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import KVCache
+
+
+class MambaFullCacheDonor(Protocol):
+    """Allocator capability for reclaiming Full KV on Mamba byte pressure."""
+
+    def flush_deferred_full_frees(self) -> None: ...
+
+    def full_tokens_before_mamba_recheck(self, target_size: int) -> int:
+        """Lower bound on new Full tokens before preparation can help."""
+        ...
+
+    def prepare_mamba_allocation(self, target_size: int) -> None:
+        """Expose layout-specific reclaim so Mamba capacity is queryable."""
+        ...
 
 
 class BaseTokenToKVPoolAllocator(abc.ABC):
@@ -55,17 +69,98 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
     # The scheduler calls these unconditionally, with no allocator-type branches
     # on its side; byte-accounted composites override the token-count defaults.
 
-    def evict_to_free_tokens(self, tree_cache, num_tokens: int) -> None:
+    def create_prefill_budget(self, tree_cache, *, num_mixed_decode_tokens=0):
+        from sglang.srt.mem_cache.prefill_budget import PrefillBudget
+
+        return PrefillBudget(
+            self, tree_cache, num_mixed_decode_tokens=num_mixed_decode_tokens
+        )
+
+    def max_new_tokens_for_memory(
+        self,
+        input_tokens: int,
+        max_new_tokens: int,
+        *,
+        token_capacity: int,
+        sliding_window_size: int | None,
+        chunk_size: int | None,
+    ) -> int | None:
+        """Clip generation to the empty-pool budget; None means prompt cannot fit.
+
+        token_capacity is the scheduler's configured capacity, including its
+        distributed token scaling. Shared pools use their physical byte layout.
+        """
+        paged_input = -(-input_tokens // self.page_size) * self.page_size
+        return max(
+            0, min(max_new_tokens, token_capacity - paged_input - self.page_size - 1)
+        )
+
+    def prealloc_fits_assumes_reclaim(self) -> bool:
+        """Whether `prealloc_fits` answers about the state reachable AFTER
+        reclaiming the evictable pages, so admitting on it still owes the
+        reclaim. False when the answer describes the pool as it stands.
+        """
+        return False
+
+    def prealloc_ceiling_fits(self, full_tokens: int, swa_tokens: int) -> bool | None:
+        """Whether a demand this size could EVER be preallocated, or None when
+        this pool has no ceiling of its own and the caller's token capacity is
+        the only bound.
+        """
+        return None
+
+    def prealloc_fits(
+        self,
+        tree_cache,
+        full_tokens: int,
+        swa_tokens: int,
+        *,
+        full_budget_tokens: int,
+        swa_budget_tokens: int | None = None,
+    ) -> bool:
+        """Whether a decode-node preallocation of this size fits.
+
+        The budgets are the scheduler's policy: what each side has left once
+        decode headroom and retraction are reserved. Separate buffers make the
+        two sides independent, so each is checked against its own budget and
+        ``tree_cache`` is never read -- what it could reclaim is already
+        inside that budget. A pool that cuts both sides from one buffer
+        overrides this to price them together, since a per-side token budget
+        cannot express a shared byte envelope.
+        """
+        return full_tokens <= full_budget_tokens and (
+            swa_budget_tokens is None or swa_tokens <= swa_budget_tokens
+        )
+
+    def evict_to_free_tokens(self, tree_cache, num_tokens: int) -> bool | None:
         """Evict unlocked prefix-cache entries until this allocator can serve
-        ``num_tokens`` or nothing evictable remains."""
-        from sglang.srt.mem_cache.common import evict_from_tree_cache
+        ``num_tokens`` or nothing evictable remains.
 
-        evict_from_tree_cache(tree_cache, num_tokens)
+        Return whether capacity was realized, or None if it still needs checking.
+        """
+        from sglang.srt.mem_cache.base_prefix_cache import EvictParams
+        from sglang.srt.mem_cache.common import _evict_until_allocatable
 
-    def check_decode_capacity(self, *, num_tokens: int, tree_cache) -> bool:
+        if tree_cache is None or tree_cache.is_chunk_cache():
+            return
+        shortfall = num_tokens - self.available_size()
+        if shortfall > 0:
+            tree_cache.evict_for_alloc(EvictParams(num_tokens=shortfall))
+            _evict_until_allocatable(tree_cache, self, num_tokens)
+
+    def check_decode_capacity(
+        self,
+        *,
+        num_tokens: int,
+        tree_cache,
+        requests=None,
+        spec_algorithm=None,
+    ) -> bool:
         """Whether the next decode step's ``num_tokens`` allocation fits after
         evicting reclaimable cache. The retract loop converges on this same
-        check, so a shortfall here retracts instead of failing in alloc."""
+        check, so a shortfall here retracts instead of failing in alloc.
+        ``requests`` and ``spec_algorithm`` provide optional request-level context for allocators
+        whose demand cannot be represented by a single token count."""
         self.evict_to_free_tokens(tree_cache, num_tokens)
         return self.available_size() >= num_tokens
 
@@ -73,6 +168,10 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
         """Idle-time diagnostic: recompute byte/slot accounting and return
         violation strings, empty when healthy. Static pools have no byte model."""
         return []
+
+    def mamba_full_cache_donor(self) -> MambaFullCacheDonor | None:
+        """Return the shared-pool donor capability, if this allocator has one."""
+        return None
 
     def debug_print(self) -> str:
         return ""

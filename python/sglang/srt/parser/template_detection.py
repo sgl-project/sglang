@@ -29,7 +29,7 @@ import jinja2.ext
 import jinja2.nodes
 import jinja2.sandbox
 
-from sglang.srt.arg_groups.overrides import declare_late_resolution, resolving_view
+from sglang.srt.arg_groups.overrides import declare_resolution, resolving_view
 
 logger = logging.getLogger(__name__)
 
@@ -167,6 +167,13 @@ REASONING_MODE_RULES = (
             and not ctx.has_text("enable_thinking")
             and not ctx.has_text("thinking")
         ),
+    ),
+    DetectionRule(
+        name="glm53_always_think",
+        value=ReasoningToggleConfig(special_case="always"),
+        # GLM-5.3's generation prompt opens <think>, so the output carries no
+        # opening tag; lambda because _is_glm53 is defined below.
+        predicate=lambda ctx: _is_glm53(ctx),
     ),
     DetectionRule(
         name="mistral_reasoning_effort",
@@ -314,6 +321,18 @@ def _is_k2_v3(ctx):
     )
 
 
+def _is_granite_thinking_parser(ctx):
+    # Nemotron-3 templates share the same <parameter= tool-call block, so it
+    # cannot discriminate; defer_loading is Granite's deferred tool loading.
+    return (
+        ctx.has_text("truncate_history_thinking")
+        and ctx.has_text("defer_loading")
+        and ctx.reasoning_config is not None
+        and ctx.reasoning_config.toggle_param == "enable_thinking"
+        and ctx.reasoning_config.default_enabled is True
+    )
+
+
 def _is_nemotron_3(ctx):
     return ctx.has_text("truncate_history_thinking") and (
         ctx.reasoning_config is not None
@@ -336,9 +355,26 @@ def _is_glm45(ctx):
     )
 
 
+def _is_glm53(ctx):
+    # GLM-5.3 keeps the GLM-4.5 prompt and tool-call format but replaces the
+    # enable_thinking toggle with an always-on "Reasoning Effort:" header.
+    return (
+        ctx.has_text("[gMASK]<sop>")
+        and ctx.has_text("Reasoning Effort:")
+        and not ctx.has_text("enable_thinking")
+        and ctx.has_text("<tool_call>")
+        and ctx.has_text("<arg_key>")
+        and ctx.has_text("<arg_value>")
+    )
+
+
+def _is_glm_family(ctx):
+    return _is_glm45(ctx) or _is_glm53(ctx)
+
+
 def _is_glm47(ctx):
-    return _is_glm45(ctx) and ctx.has_pattern(
-        r"\{\{[-\s]*['\"]<tool_call>['\"]\s*\+\s*tc\.name"
+    return _is_glm_family(ctx) and ctx.has_pattern(
+        r"\{\{[-\s]*['\"]<tool_call>['\"]\s*[+~]\s*tc\.name"
     )
 
 
@@ -362,6 +398,10 @@ def _is_deepseek_v32(ctx):
 
 def _is_deepseek_v4(ctx):
     return ctx.has_text("<｜DSML｜tool_calls>")
+
+
+def _is_deepseek_v41(ctx):
+    return ctx.has_text("<｜DSML｜ calls>")
 
 
 def _is_hunyuan(ctx):
@@ -458,6 +498,16 @@ def _is_qwen3(ctx):
     )
 
 
+def _is_ling3(ctx):
+    return (
+        ctx.has_text("<role>SYSTEM</role>")
+        and ctx.has_text("<role>ASSISTANT</role>")
+        and ctx.has_text("<|role_end|>")
+        and ctx.has_text("<arg_key>")
+        and ctx.has_text("<arg_value>")
+    )
+
+
 def _is_deepseek_v3(ctx):
     return ctx.reasoning_config == ReasoningToggleConfig(
         toggle_param="thinking", default_enabled=False
@@ -470,6 +520,10 @@ def _is_deepseek_r1(ctx):
 
 def _is_deepseek_r1_think_tags(ctx):
     return not _is_lfm2(ctx) and (ctx.has_text("<think>") or ctx.has_text("</think>"))
+
+
+def _is_gigachat35(ctx):
+    return ctx.has_text("<｜GCML｜tool_calls>")
 
 
 # ---------------------------------------------------------------------------
@@ -485,8 +539,13 @@ REASONING_PARSER_RULES = (
     DetectionRule(name="mistral", value="mistral", predicate=_is_mistral),
     DetectionRule(name="gpt_oss", value="gpt-oss", predicate=_is_gpt_oss),
     DetectionRule(name="kimi_k2", value="kimi_k2", predicate=_is_kimi_k2),
+    DetectionRule(
+        name="granite_thinking_parser",
+        value="granite_thinking_parser",
+        predicate=_is_granite_thinking_parser,
+    ),
     DetectionRule(name="nemotron_3", value="nemotron_3", predicate=_is_nemotron_3),
-    DetectionRule(name="glm45", value="glm45", predicate=_is_glm45),
+    DetectionRule(name="glm45", value="glm45", predicate=_is_glm_family),
     DetectionRule(name="hunyuan", value="hunyuan", predicate=_is_hunyuan),
     DetectionRule(name="poolside_v1", value="poolside_v1", predicate=_is_poolside_v1),
     DetectionRule(name="mimo", value="mimo", predicate=_is_mimo),
@@ -494,9 +553,14 @@ REASONING_PARSER_RULES = (
     DetectionRule(name="minimax", value="minimax", predicate=_is_minimax),
     DetectionRule(name="step3p5", value="step3p5", predicate=_is_step3p5),
     DetectionRule(name="step3", value="step3", predicate=_is_step3),
+    DetectionRule(name="ling3", value="ling3", predicate=_is_ling3),
     DetectionRule(name="qwen3", value="qwen3", predicate=_is_qwen3),
+    DetectionRule(
+        name="deepseek_v41", value="deepseek-v41", predicate=_is_deepseek_v41
+    ),
     DetectionRule(name="deepseek_v4", value="deepseek-v4", predicate=_is_deepseek_v4),
     DetectionRule(name="deepseek_v3", value="deepseek-v3", predicate=_is_deepseek_v3),
+    DetectionRule(name="gigachat35", value="gigachat35", predicate=_is_gigachat35),
     DetectionRule(
         name="deepseek_r1_force", value="deepseek-r1", predicate=_is_deepseek_r1
     ),
@@ -512,6 +576,7 @@ REASONING_PARSER_RULES = (
 # ---------------------------------------------------------------------------
 
 TOOL_CALL_PARSER_RULES = (
+    DetectionRule(name="gigachat35", value="gigachat35", predicate=_is_gigachat35),
     DetectionRule(name="k2_horizon", value="k2_horizon", predicate=_is_k2_v3),
     DetectionRule(name="apertus2509", value="apertus2509", predicate=_is_apertus2509),
     DetectionRule(name="gemma4", value="gemma4", predicate=_is_gemma4),
@@ -521,17 +586,19 @@ TOOL_CALL_PARSER_RULES = (
     DetectionRule(name="minimax", value="minimax-m2", predicate=_is_minimax),
     DetectionRule(name="interns1", value="interns1", predicate=_is_interns1),
     DetectionRule(name="mistral", value="mistral", predicate=_is_mistral),
+    DetectionRule(name="deepseek_v41", value="deepseekv41", predicate=_is_deepseek_v41),
     DetectionRule(name="deepseek_v4", value="deepseekv4", predicate=_is_deepseek_v4),
     DetectionRule(name="deepseek_v32", value="deepseekv32", predicate=_is_deepseek_v32),
     DetectionRule(name="deepseek_v31", value="deepseekv31", predicate=_is_deepseek_v31),
     DetectionRule(name="lfm2", value="lfm2", predicate=_is_lfm2),
     DetectionRule(name="glm47", value="glm47", predicate=_is_glm47),
-    DetectionRule(name="glm45", value="glm45", predicate=_is_glm45),
+    DetectionRule(name="glm45", value="glm45", predicate=_is_glm_family),
     DetectionRule(name="minicpm5", value="minicpm5", predicate=_is_minicpm5),
     DetectionRule(name="hunyuan", value="hunyuan", predicate=_is_hunyuan),
     DetectionRule(name="poolside_v1", value="poolside_v1", predicate=_is_poolside_v1),
     DetectionRule(name="step3p5", value="step3p5", predicate=_is_step3p5),
     DetectionRule(name="step3", value="step3", predicate=_is_step3),
+    DetectionRule(name="ling3", value="ling3", predicate=_is_ling3),
     DetectionRule(
         name="xml_kv_tool_call", value="glm45", predicate=_is_xml_kv_tool_call
     ),
@@ -712,6 +779,7 @@ def _log_undetected_parser(attr: str, label: str) -> None:
 
 def _architecture_auto_parsers(server_args, needs: Tuple[str, ...]) -> Dict[str, str]:
     """The parsers the model architecture implies, for the fields still on auto."""
+    from sglang.srt.entrypoints.openai.chat_encoding import is_deepseek_v41_arch
     from sglang.srt.utils.hf_transformers_utils import get_config
 
     cfg = resolving_view(server_args)
@@ -727,6 +795,13 @@ def _architecture_auto_parsers(server_args, needs: Tuple[str, ...]) -> Dict[str,
 
     if "KimiK3" in arch or model_type == "kimi_k3":
         reasoning_parser, tool_call_parser = "kimi_k3", "kimi_k3"
+    elif arch in (
+        "BailingMoeV3ForCausalLM",
+        "BailingMoeV3VLForConditionalGeneration",
+    ) or model_type in ("bailing_hybrid", "bailing_moe_v3_vl"):
+        reasoning_parser, tool_call_parser = "ling3", "ling3"
+    elif is_deepseek_v41_arch(arch=arch, model_type=model_type):
+        reasoning_parser, tool_call_parser = "deepseek-v41", "deepseekv41"
     elif "DeepseekV4" in arch:
         reasoning_parser, tool_call_parser = "deepseek-v4", "deepseekv4"
     elif "DeepseekV3" in arch:
@@ -829,4 +904,4 @@ def resolve_auto_parsers(server_args) -> None:
                 detected[attr] = _detect_auto_parser(attr, ctx, rules, label)
 
     if detected:
-        declare_late_resolution(server_args, "template-detection", **detected)
+        declare_resolution(server_args, "template-detection", **detected)
