@@ -333,7 +333,7 @@ def gemm_ag_up_fits(num_tokens: int) -> bool:
     )
 
 
-def front_gather_fits(num_tokens: int) -> bool:
+def gemm_ag_down_fits(num_tokens: int) -> bool:
     state = _get_state()
     # The FP32 consumer uses 128 threads x four elements, plus a cleanup block.
     num_blocks = (num_tokens * NORM_DIM + 511) // 512 + 1
@@ -346,14 +346,12 @@ def front_gather_fits(num_tokens: int) -> bool:
     )
 
 
-def gemm_ag_front(
-    *, x: torch.Tensor, weight: torch.Tensor
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+def gemm_ag_down_proj(*, x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
     from sglang.kernels.ops.kimi_k3 import gemm_ag as mod
 
     state = _get_state()
     assert state is not None
-    return mod.gemm_ag_front(world_size=state.world_size, x=x, weight=weight)
+    return mod.gemm_ag_down_proj(world_size=state.world_size, x=x, weight=weight)
 
 
 def gemm_ag_up_proj(
