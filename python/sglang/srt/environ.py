@@ -1698,6 +1698,9 @@ class Envs:
     # 2 is the accuracy-safe default: higher values reuse staler selections
     # in the skip layers.
     SGLANG_MINIMAX_M3_INDEX_TOPK_FREQ = EnvInt(2)
+    # Run the sparse prefill main attention through AITER's Gluon paged attention
+    # instead of the Triton kernel. Unsupported cases fall back to Triton.
+    SGLANG_OPT_USE_MINIMAX_GLUON_PREFILL = EnvBool(True)
     # MiniMax M3 NPU prefill MAIN-attention: route the sparse main attention through
     # the native Ascend FA op `torch.ops.npu.npu_fused_infer_attention_score` (FIA)
     # with a per-query CUSTOM block_table

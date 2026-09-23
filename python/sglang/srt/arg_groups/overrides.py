@@ -11,23 +11,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""Declarative model-override registry.
+"""Configuration declarations and model override dispatch.
 
-Model-identity adjustments to the server configuration are DECLARED here and
-appended to the record's declaration stash (gate order, last writer wins).
-Nothing here writes back onto ``ServerArgs``: the record holds the user's raw
-input, and a decision is read through ``resolution_result`` or the published
-config bags — model code never mutates ``ServerArgs`` fields imperatively. That
-holds without exception: a resolver this tree does not own assigns onto a
-stand-in (``record_foreign_defaults``), and what it set is declared.
-
-Two declaration forms, keyed on ``hf_config.architectures[0]``:
-
-- ``MODEL_OVERRIDES``: pure-constant cases — ``arch -> {field: value}``.
-- ``@register_model_override(arch)``: derived cases — a callable
-  ``fn(server_args, hf_config) -> dict`` that faithfully carries today's
-  conditional logic. ``server_args`` is pristine and must be treated
-  read-only: the callable returns declarations, it never writes.
+Declarations preserve raw ServerArgs inputs and are applied in order, last
+writer wins. Read them through ``resolution_result`` or published config bags.
+Model providers use ``MODEL_OVERRIDES`` for constants or
+``register_model_override`` for functions returning field-value dictionaries.
 """
 
 from __future__ import annotations
@@ -45,8 +34,7 @@ from sglang.srt.arg_groups.arg_utils import (
     with_fallback,
 )
 
-# Re-exported for the callers that already import these names from here; the
-# declarations under ``model_overrides/`` import them from the base directly.
+# Compatibility re-exports; model providers import model_override_base directly.
 from sglang.srt.arg_groups.model_override_base import (  # noqa: F401
     _MODEL_OVERRIDE_FNS,
     _PREDICATE_OVERRIDE_FNS,
@@ -100,25 +88,10 @@ def register_post_process(fn: Callable[..., dict]) -> Callable[..., dict]:
 
 
 def run_post_process_pass(server_args: Any, fn: Callable[..., dict]) -> None:
-    """Invoke one pass at its legacy handler slot.
+    """Run a pass against the current resolution snapshot and record its decisions.
 
-    Evaluates the pass on the resolving state (a read-only view with the
-    accumulated declarations overlaid from the stash) and appends its
-    declaration to the stash, which is what the config bags are projected from.
-    The fields stay untouched.
-
-    A slot that runs after resolution -- ``check_server_args`` hosts one -- lands
-    in the same stash, which publish projects from later, so it needs no field
-    write either. After *publish* there is no such later projection: the stash
-    would grow an entry nothing reads.
-
-    So what is refused is the *declaration*, not the record. A pass that returns
-    an empty dict is a validation, and it may run on the published instance --
-    it has to, because ``Engine(server_args=sa)`` after ``Engine.shutdown()``
-    re-runs ``check_server_args`` on the very instance the context still holds.
-    A pass that returns a non-empty dict there is refused by the guard in
-    ``declare_resolution``, as a late declaration is -- post-publish changes go
-    to the bags through ``get_context().override(...)``.
+    After publication, only validation passes returning an empty dict are allowed;
+    Engine restart may re-run those validations on the same record.
     """
 
     declared = fn(ResolvedView(server_args, overlay=_declaration_overlay(server_args)))
@@ -133,23 +106,10 @@ def run_post_process_pass(server_args: Any, fn: Callable[..., dict]) -> None:
 
 
 def declare_resolution(server_args: Any, source: str, **fields: Any) -> None:
-    """Record a resolution write in the declaration stash.
+    """Append field decisions without changing raw inputs.
 
-    The stash *is* the resolution result: the bags are projected from it,
-    `resolution_result` answers from it, and no field is written. A resolver
-    reading a field another resolver may have decided must read `resolving_view`
-    (or `resolved_view(server_args)`).
-
-    Every declaration goes through here, whenever it is made: inside
-    ``__post_init__``, at launcher stage (LoRA normalization, the auto-detected
-    parsers -- they decide what the process will run with, so they belong to the
-    pipeline even though they run after it), and on a copy about to cross a
-    process boundary. A name that is not a field is rejected here rather than
-    becoming an attribute nothing reads.
-
-    Refuses the published config. The stash is projected at publish and never
-    again, so a declaration afterwards is a silent no-op; post-publish changes
-    go to the bags through ``get_context().override(...)``.
+    Reject unknown fields and declarations on the published record. After
+    publication, use ``RuntimeContext.override`` to update config bags.
     """
     if is_record(server_args):
         unknown = sorted(set(fields) - field_names(type(server_args)))
@@ -174,14 +134,7 @@ def declare_resolution(server_args: Any, source: str, **fields: Any) -> None:
 
 
 class _ForeignDefaults:
-    """The stand-in handed to a resolver this tree does not own.
-
-    Reads fall through to the resolving view, so a plugin sees what resolution
-    has decided so far rather than the raw input -- better than what it used to
-    get, which was the record's own fields. Writes are captured here and
-    declared by the caller, so the record is never written and the write seal
-    has no exception.
-    """
+    """Capture plugin writes while reading through the current resolving view."""
 
     __slots__ = ("_cfg", "_written")
 
@@ -202,24 +155,9 @@ class _ForeignDefaults:
 def record_foreign_defaults(
     server_args: Any, source: str, resolve: Callable[[Any], Any]
 ) -> Any:
-    """Run a resolver this tree does not own, and declare what it set.
+    """Run a plugin resolver, declare its field writes, and return its result.
 
-    Out-of-tree platform plugins and registered speculative algorithms are
-    handed a configuration and assign fields on it. That interface is not ours
-    to change, so the assignment stays the contract -- it just lands on a
-    stand-in instead of the record, and what it set is declared like any other
-    decision. Nothing writes the record, which is why there is no longer a
-    named hole in the seal.
-
-    Returns whatever the resolver returned, so a provider with a return value
-    goes through the same capture.
-
-    Non-field names are dropped: a plugin scribbling on an attribute that is
-    not configuration is not a decision, and it was invisible to the previous
-    diff for the same reason.
-
-    A stand-in record (tests drive the hooks with a plain namespace) has no
-    view to read, so the resolver runs against it directly and uncaptured.
+    Ignore non-field writes. Non-record test objects are passed through directly.
     """
     if not is_record(server_args):
         return resolve(server_args)
@@ -236,20 +174,9 @@ def record_foreign_defaults(
 
 
 def resolution_result(server_args: Any, field: str, default: Any = None) -> Any:
-    """What resolution decided for ``field``: the declaration if there is one,
-    otherwise what the caller supplied, otherwise the field's declared
-    fallback.
+    """Read the last declaration, then raw input, then the declared fallback.
 
-    The fallback is last because it is what the field means when nobody said
-    anything -- an operator who types a value and a pass that decides one both
-    sit above it. It is read from the declaration rather than filled in by a
-    pass, so there is no slot to place and no second call to make idempotent.
-
-    This is what the config projection reads. Reading the field instead would
-    work whatever the caller passed onto the record -- and
-    the point of declaring is that they will not, so the projection must not
-    depend on it. A config that never ran the pipeline (a mock, a partial
-    fixture) carries no raw snapshot; its fields are all it has.
+    Records without a raw-input snapshot fall back to their current fields.
     """
     for _source, declared in reversed(
         getattr(server_args, "_resolved_overrides", None) or ()
@@ -263,12 +190,7 @@ def resolution_result(server_args: Any, field: str, default: Any = None) -> Any:
 
 
 def pre_capture_activation_reserve_mb_of(cfg: Any, gpu_mem: Optional[float]) -> float:
-    """The activation working-set reserve held back before cuda-graph capture.
-
-    The config-shaped half of the pair; `runtime_context` carries the
-    published-bag half, and `TestDerivedPredicatesAgreeAcrossTiers` pins the
-    two equal.
-    """
+    """Return the activation reserve in MB before CUDA graph capture."""
     if cfg.disaggregation_mode == "decode":
         running_requests = (
             cfg.max_running_requests or cfg.cuda_graph_config.decode.max_bs or 1
@@ -378,13 +300,6 @@ def collect_model_override_declarations(
     return declarations
 
 
-# ---------------------------------------------------------------------------
-# Derived per-family declarations (faithful ports of legacy arch branches).
-# Callables read the PRISTINE server_args, never write; logging is kept
-# verbatim from the legacy branch for operator-visible fidelity.
-# ---------------------------------------------------------------------------
-
-
 # Importing the package is what registers the per-model declarations.
 import sglang.srt.arg_groups.model_overrides  # noqa: F401
 
@@ -426,9 +341,7 @@ def _step3p_overrides(server_args: Any, hf_config: Any) -> dict:
 # ---------------------------------------------------------------------------
 
 
-# Architectures whose monolith branch routes through the mamba radix cache
-# handling (hybrid linear-attention models). Keep in sync with the branch
-# guards in _handle_model_specific_adjustments.
+# Keep this hybrid-model set in sync with model_hook.handle_model_specific_adjustments.
 _MAMBA_RADIX_CACHE_ARCHS = frozenset(
     {
         "KimiLinearForCausalLM",
@@ -508,15 +421,7 @@ def supports_mamba_cache_extra_buffer(view: Any, model_arch: str) -> bool:
 
 @register_post_process
 def _mamba_radix_cache_resolution(view: Any) -> dict:
-    """Resolve the hybrid-mamba radix cache fields (pure).
-
-    Slot pass: invoked at each legacy ``_handle_mamba_radix_cache`` slot —
-    the hybrid-spec call at the head of the monolith and the per-arch branch
-    calls — where it reads the mid-resolution ``page_size`` /
-    ``disable_overlap_schedule`` exactly as the legacy helper did. The arch
-    guard replicates the union of the legacy call-site guards so the pass is
-    self-sufficient in the end-state pass list.
-    """
+    """Resolve hybrid-Mamba cache settings using the current page size and overlap policy."""
     from sglang.srt.configs.linear_attn_model_registry import (
         get_linear_attn_spec_by_arch,
     )
@@ -553,10 +458,7 @@ def _mamba_radix_cache_resolution(view: Any) -> dict:
 
 @register_post_process
 def _dsa_kv_cache_dtype_default(view: Any) -> dict:
-    """Slot pass in the DSA arm, ordered before the split-backend
-    resolution: default the kv-cache dtype from the device capability
-    (Blackwell FP8, Hopper bf16) and normalize the bf16 alias. Reads the
-    PRISTINE dsa split backends (their resolution runs after this pass)."""
+    """Default DSA KV-cache dtype before resolving split attention backends."""
     from sglang.srt.configs.model_config import is_deepseek_dsa
 
     hf_config = model_config_of(view).hf_config
@@ -658,9 +560,10 @@ def _check_tilelang_dsa_fp8_kv(
 
 @register_post_process
 def _dsa_split_backend_resolution(view: Any) -> dict:
-    """Slot pass in the DSA arm: default the DSA prefill/decode split
-    backends from the mid-resolution kv-cache dtype and the device
-    capability. The hisparse arm takes precedence under --enable-hisparse."""
+    """Resolve DSA split backends from KV-cache dtype and device capability.
+
+    HiSparse settings take precedence when enabled.
+    """
     from sglang.srt.configs.model_config import is_deepseek_dsa
 
     hf_config = model_config_of(view).hf_config
@@ -811,10 +714,7 @@ _DEEPSEEK_FAMILY_ARCHS = frozenset(
 
 @register_post_process
 def _deepseek_moe_quant_resolution(view: Any) -> dict:
-    """Slot pass invoked from inside the DeepSeek arch branch ("Set moe
-    backend for DeepSeek"), NOT a dispatch-time declaration: the DSA
-    kv-cache-dtype default earlier in the branch must read the PRISTINE
-    quantization, so this resolution has to stay at its legacy slot."""
+    """Resolve DeepSeek MoE quantization after DSA has read the input quantization."""
     hf_config = model_config_of(view).hf_config
     model_arch = hf_config.architectures[0]
     if model_arch not in _DEEPSEEK_FAMILY_ARCHS:
@@ -897,10 +797,7 @@ def _deepseek_moe_quant_resolution(view: Any) -> dict:
 
 @register_post_process
 def _deepseek_spec_moe_resolution(view: Any) -> dict:
-    """Slot pass at the DeepSeek branch's HIP arm: draft (nextn) spec-MoE
-    backends for the DeepSeek fp4 checkpoint. Reads the mid-resolution
-    quantization (after _deepseek_moe_quant_resolution) and the pre-a2a
-    ep_size, exactly like the legacy in-branch writes."""
+    """Resolve HIP draft MoE backends after quantization and before A2A adjusts EP size."""
 
     hf_config = model_config_of(view).hf_config
     model_arch = hf_config.architectures[0]
@@ -1008,12 +905,10 @@ _FLASHINFER_ALLREDUCE_FUSION_ARCHS = frozenset(
 
 @register_post_process
 def _flashinfer_allreduce_fusion_auto_enable(view: Any) -> dict:
-    """Slot pass at the monolith tail: auto-enable FlashInfer AllReduce
-    Fusion on SM90/SM100 for models with explicit support. auto resolves to
-    mnnvl on Blackwell (single- and multi-node) and trtllm on SM90
-    single-node systems. Reads the mid-resolution enable_dp_attention /
-    moe_a2a_backend (after the DeepSeek CP and a2a declarations), exactly
-    like the legacy tail block."""
+    """Enable supported FlashInfer AllReduce fusion after CP and A2A resolution.
+
+    Auto selects MNNVL on Blackwell and TRTLLM on single-node SM90.
+    """
     hf_config = model_config_of(view).hf_config
     model_arch = hf_config.architectures[0]
     # V4.1 TP4 uses the custom push plane for decode and fused MoE finalize.
@@ -1091,8 +986,7 @@ def _deterministic_sampling_backend(view: Any) -> dict:
 
 
 def _deterministic_is_deepseek_model(view: Any) -> bool:
-    """Faithful copy of the deterministic handler's arch probe (pure read;
-    the handler keeps its own copy for the later deepseek validation)."""
+    """Check the model architecture for deterministic DeepSeek backend selection."""
     from sglang.srt.connector import ConnectorType
     from sglang.srt.utils.common import parse_connector_type
 
@@ -1179,10 +1073,7 @@ def _attention_backend_default(view: Any) -> dict:
 
 @register_post_process
 def _mla_backend_page_constraints(view: Any) -> dict:
-    """Page-size constraints of the MLA/TRTLLM backend family (the raises and
-    the cutedsl prefill fallback stay in the handler; only the page snaps are
-    declared). The snaps chain on a local value exactly as the legacy blocks
-    chained on self.page_size."""
+    """Resolve MLA/TRTLLM page-size constraints, chaining adjustments on the local value."""
     page_size = view.page_size
     if (
         view.attention_backend == "flashmla"
@@ -1251,10 +1142,7 @@ def _mla_backend_page_constraints(view: Any) -> dict:
 
 @register_post_process
 def _mla_kv_cache_dtype_checks(view: Any) -> dict:
-    """Read-only validation pass in the attention-backend compatibility
-    handler: the TRT-LLM and tokenspeed MLA backends constrain the resolved
-    kv-cache dtype (declarations never reach the field, so the checks read
-    the view)."""
+    """Validate resolved KV-cache dtype for TRTLLM and tokenspeed MLA backends."""
     if (
         view.attention_backend == "trtllm_mla"
         or view.decode_attention_backend == "trtllm_mla"
@@ -1296,10 +1184,7 @@ def _hisparse_validation(view: Any) -> dict:
 
 @register_post_process
 def _cutedsl_prefill_backend_fill(view: Any) -> dict:
-    """Slot pass in the attention-backend compatibility handler: CuteDSL MLA
-    is decode-only, so validate the combination and default the prefill side
-    to trtllm_mla. The trtllm_mha check that follows at the legacy slot reads
-    the resolved value through the view."""
+    """Validate decode-only CuteDSL MLA and default its prefill backend to trtllm_mla."""
     if not (
         view.attention_backend == "cutedsl_mla"
         or view.decode_attention_backend == "cutedsl_mla"
@@ -1484,9 +1369,7 @@ def _tp_lm_head_all_to_all_default(view: Any) -> dict:
 
 @register_post_process
 def _dp_lm_head_validation(view: Any) -> dict:
-    """Read-only validation pass: dp-attention is a prerequisite for the
-    dp LM head and the TP LM-head all-to-all path. Reads the mid-resolution
-    values through the view."""
+    """Require DP attention for DP LM head and TP LM-head all-to-all."""
     if view.enable_dp_lm_head:
         assert view.enable_dp_attention, (
             "Please enable dp attention when setting enable_dp_lm_head. "
@@ -1512,10 +1395,7 @@ def _dp_lm_head_validation(view: Any) -> dict:
 
 @register_post_process
 def _moe_runner_backend_quant_constraints(view: Any) -> dict:
-    """The quantization-driven moe_runner_backend resolutions at the head of
-    _handle_moe_kernel_config. The backend-compatibility asserts and the
-    disable_shared_experts_fusion writes (post-publish writers exist for that
-    field) stay in the handler."""
+    """Resolve MoE runner backends from quantization."""
     moe_runner_backend = view.moe_runner_backend
     if view.quantization == "nvfp4_online":
         if not get_platform().is_sm100:
@@ -1580,10 +1460,10 @@ def _moe_runner_backend_quant_constraints(view: Any) -> dict:
 
 @register_post_process
 def _moe_runner_fusion_disable(view: Any) -> dict:
-    """FlashInfer CuteDSL / TRT-LLM / TRT-LLM-routed MoE runners require the
-    shared-experts fusion disabled; declared at the legacy write slots in
-    _handle_moe_kernel_config (before the deprecated cutlass env override, so
-    the runner value observed is the pre-override one)."""
+    """Disable shared-expert fusion for incompatible MoE runners.
+
+    Runs before the deprecated cutlass environment override.
+    """
     runner = view.moe_runner_backend
     if runner == "flashinfer_cutedsl":
         logger.warning(
@@ -1605,10 +1485,7 @@ def _moe_runner_fusion_disable(view: Any) -> dict:
 
 @register_post_process
 def _a2a_fusion_adjustments(view: Any) -> dict:
-    """A2A-backend-driven shared-experts fusion adjustments, declared at the
-    legacy write slots in _handle_a2a_moe: Waterfill requires the
-    fusion enabled; FlashInfer, FlashInfer MegaMOE, and DeepEP v2 A2A require it disabled.
-    """
+    """Set shared-expert fusion requirements for the selected A2A backend."""
     if view.moe_a2a_backend in ("deepep", "megamoe") and view.enable_waterfill:
         if view.disable_shared_experts_fusion:
             logger.warning(
@@ -1769,8 +1646,7 @@ def _dllm_page_size(view: Any) -> dict:
         )
         return {"page_size": config.block_size}
     if view.page_size > config.block_size:
-        # Legacy scheduler-init fallback, folded into the pass: the page
-        # size must not exceed the dllm block size.
+        # The page size must not exceed the DLLM block size.
         logger.warning(
             "WARNING: "
             f"The page size {view.page_size} should not be larger than dllm block size {config.block_size}."
@@ -1784,10 +1660,7 @@ def validate_declarations(
     server_args: Any,
     declarations: Sequence[Tuple[str, Dict[str, Any]]],
 ) -> None:
-    """Fail-fast whitelist check at declaration time: a registry typo or a
-    not-yet-resolvable field must be rejected at its slot, not only at
-    publish time. Declarations never mutate ``server_args``.
-    """
+    """Reject unknown or non-resolvable fields before publication."""
     # Non-dataclass fixtures carry no Arg metadata (mirrors the
     # resolvable_fields escape); only real ServerArgs is validated.
     if not is_record(server_args):
@@ -1805,10 +1678,7 @@ def validate_declarations(
 
 @register_post_process
 def _hrm_text_attention_force(view: Any) -> dict:
-    """HRM-Text's bidirectional prefix attention only works on the Triton
-    backend. Invoked as the last attention declaration of the resolution
-    (mirroring the legacy runner-side force, which ran after the whole
-    pipeline)."""
+    """Force Triton for HRM-Text bidirectional prefix attention after backend resolution."""
     if view.attention_backend not in (None, "triton"):
         logger.warning(
             f"Overriding --attention-backend "

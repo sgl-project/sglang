@@ -1103,9 +1103,6 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
         cls,
         *,
         server_args: ServerArgs,
-        tp_rank: int,
-        pp_rank: int,
-        dp_rank: Optional[int],
         enable_priority_scheduling: bool,
         enable_lora: bool,
         enable_hierarchical_cache: bool,
@@ -1134,14 +1131,14 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
             labels = {
                 "model_name": get_serving().served_model_name,
                 "engine_type": engine_type,
-                "tp_rank": tp_rank,
-                "pp_rank": pp_rank,
+                "tp_rank": parallel.tp_rank,
+                "pp_rank": parallel.pp_rank,
                 "moe_ep_rank": parallel.moe_ep_rank,
             }
             if enable_priority_scheduling:
                 labels["priority"] = ""
-            if dp_rank is not None:
-                labels["dp_rank"] = dp_rank
+            if parallel.dp_rank is not None:
+                labels["dp_rank"] = parallel.dp_rank
             if get_observability().extra_metric_labels:
                 labels.update(get_observability().extra_metric_labels)
             scheduler_collector_cls = resolve_collector_class(

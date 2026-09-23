@@ -334,16 +334,27 @@ export const config = {
         {
           id: "dflash",
           label: "DFLASH",
-          // Listed so the axis is complete, but not selectable: no K3 DFLASH draft
-          // checkpoint has been published, so there is nothing to point
-          // --speculative-draft-model-path at. DFLASH is also CUDA-only, rejects DP
-          // attention, and requires pp_size == 1.
-          disabled: true,
-          disableReason:
-            "No K3 DFLASH draft checkpoint published yet — DSPARK is the available speculative path.",
-          flags: [
+          // DFLASH doesn't support pipeline parallelism yet and rejects DP attention
+          // off NPU, so pipelined and DP-attention recipes are unavailable. The NPU recipes ship DSPARK only. K3 DFLASH
+          // has only been validated on Blackwell, so Hopper and AMD stay off.
+          disabled: (s) =>
+            config.isNpuHw(s) ||
+            ["h100", "h200", "mi350x", "mi355x"].includes(s.hw) ||
+            config.isPipelined(s) ||
+            !!config.flagOf(config.cellFor(s), "--enable-dp-attention"),
+          disableReason: (s) =>
+            config.isNpuHw(s)
+              ? "Only DSPARK is supported on this recipe."
+              : ["h100", "h200", "mi350x", "mi355x"].includes(s.hw)
+                ? "K3 DFLASH has not been validated on this hardware yet; use DSPARK."
+                : "DFLASH doesn't support pipeline parallelism or DP attention yet. Pick a recipe that runs a single pipeline stage without DP attention, or use DSPARK.",
+          flags: (s) => [
             "--speculative-algorithm DFLASH",
-            "--speculative-draft-model-path <dflash-draft>",
+            "--speculative-draft-model-path modal-labs/Kimi-K3-DFlash",
+            // 8 is the recommended default block size for this draft.
+            "--speculative-dflash-block-size 8",
+            // Same ReplaySSM rule as DSPARK: the PD prefill role rejects the flag.
+            ...(s.pdMode !== "prefill" ? ["--enable-linear-replayssm-spec"] : []),
           ],
         },
       ],
@@ -785,7 +796,7 @@ export const config = {
         //   DSPARK  --speculative-dspark-block-size N   (gamma, == proposed)
         //   DFLASH  --speculative-dflash-block-size N+1 (verify window)
         //   EAGLE   --speculative-num-steps N           (chain; topk>1 is a tree)
-        // Only DSPARK is selectable today, so only its form is emitted.
+        // Only DSPARK's form is emitted; the DFLASH option pins its block size.
         id: "proposedDraftTokens", title: "Proposed Draft Tokens",
         // The NPU recipes pin the shipped block size (7).
         showWhen: (b) => b.spec === "dspark" && !config.isNpuHw(b),
