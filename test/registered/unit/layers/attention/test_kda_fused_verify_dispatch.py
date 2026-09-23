@@ -88,7 +88,7 @@ def test_hip_only_routes_supported_batch_range(monkeypatch, batch, tokens):
     "changes",
     [
         dict(tokens=4),
-        dict(heads=8),
+        dict(weight_dtype=torch.bfloat16),
     ],
 )
 def test_hip_unmeasured_shapes_fall_back(monkeypatch, changes):

@@ -333,9 +333,6 @@ class QuarkConfig(QuantizationConfig):
         self.num_nextn_predict_layers = int(
             getattr(hf_config, "num_nextn_predict_layers", 0) or 0
         )
-        self.num_routed_experts = getattr(
-            getattr(hf_config, "text_config", hf_config), "n_routed_experts", None
-        )
         self.is_prequantized = is_prequantized
         self.dequantization_config = dequantization_config
         # Load-as-is FP8 config for excluded layers of a mixed-precision source
@@ -451,18 +448,8 @@ class QuarkConfig(QuantizationConfig):
 
         from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 
-        # A fused MoE module owns every expert projection, so resolve it
-        # per-expert; other layers match their own name. Reuse the result for
-        # get_moe_scheme below so the pattern sweep only runs once per layer.
-        moe_quant_config = None
-        if isinstance(layer, FusedMoE):
-            moe_quant_config = self._find_moe_config(prefix, layer)
-            matched_config = moe_quant_config
-        else:
-            matched_config = self._find_matched_config(prefix, layer)
-
         block_fp8_config = self._get_block_fp8_config(
-            matched_config, self.packed_modules_mapping
+            self._find_matched_config(prefix, layer), self.packed_modules_mapping
         )
         if block_fp8_config is not None:
             if isinstance(layer, LinearBase):
@@ -482,9 +469,7 @@ class QuarkConfig(QuantizationConfig):
 
         if isinstance(layer, FusedMoE):
             self._online_quantized_layers.add(prefix)
-            layer.scheme = self.get_moe_scheme(
-                layer, prefix, layer_quant_config=moe_quant_config
-            )
+            layer.scheme = self.get_moe_scheme(layer, prefix)
             return QuarkFusedMoEMethod(self)
 
         return None
@@ -995,61 +980,12 @@ class QuarkConfig(QuantizationConfig):
 
         return scheme
 
-    def _find_moe_config(self, layer_name: str, module: torch.nn.Module):
-        parent = self._find_matched_config(layer_name, module)
-        if not getattr(self, "num_routed_experts", None) or not self.is_prequantized:
-            return parent
-
-        # Quark may name each logical expert's projections while SGLang owns
-        # one fused module. EPLB replicas do not add checkpoint expert IDs.
-        prefix_parts = layer_name.split(".")
-        layer_quant_config = self.quant_config.get("layer_quant_config") or {}
-        entries = [
-            (pattern, config)
-            for pattern, config in layer_quant_config.items()
-            if len(parts := pattern.split(".")) > len(prefix_parts)
-            and all(
-                fnmatch.fnmatch(part, pattern_part)
-                for part, pattern_part in zip(prefix_parts, parts)
-            )
-        ]
-        groups = [f"{layer_name}.{i}" for i in range(self.num_routed_experts)]
-        shared = f"{layer_name.rsplit('.', 1)[0]}.shared_experts"
-        if getattr(module, "num_fused_shared_experts", 0):
-            groups.append(shared)
-        configs = []
-        for group in groups:
-            for proj in ("gate_proj", "up_proj", "down_proj"):
-                name = f"{group}.{proj}"
-                if should_ignore_layer(name, self.exclude_layers):
-                    config = None
-                elif group == shared:
-                    config = self._find_matched_config(name, module)
-                else:
-                    config = next(
-                        (
-                            cfg
-                            for pattern, cfg in entries
-                            if fnmatch.fnmatch(name, pattern)
-                        ),
-                        parent,
-                    )
-                configs.append(config)
-        if any(config != configs[0] for config in configs[1:]):
-            raise ValueError(
-                f"All expert projections fused into {layer_name} must use the "
-                "same quantization configuration, including fused shared experts."
-            )
-        return configs[0]
-
     def get_moe_scheme(
         self,
         module: torch.nn.Module,
         layer_name: str,
-        layer_quant_config: Optional[dict[str, Any]] = None,
     ) -> "QuarkMoEScheme":
-        if layer_quant_config is None:
-            layer_quant_config = self._find_moe_config(layer_name, module)
+        layer_quant_config = self._find_matched_config(layer_name, module)
 
         if layer_quant_config.get("output_tensors") or layer_quant_config.get("bias"):
             raise NotImplementedError(

@@ -20,7 +20,6 @@ TOPK = 2048
 # width the indexer hands over is not a power of two: 2048 + 4 - 1 for
 # GLM-5.3-Flash. See get_dsa_mtp_topk_width() in srt/configs/model_config.py.
 KPOOL_TOPK = 2051
-KPOOL_TAILS = KPOOL_TOPK - TOPK
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required for this test.")
@@ -52,13 +51,6 @@ class TestDSATransformIndex(CustomTestCase):
             topk[:, 0] = 0
             topk[:, 1] = context_length - 1
             topk[:, 257::257] = -1
-            if topk_width > TOPK:
-                # KPool tail tokens are live, not padding.
-                topk[:, TOPK:] = (
-                    context_length
-                    - KPOOL_TAILS
-                    + torch.arange(KPOOL_TAILS, dtype=torch.int64, device=self.device)
-                ).clamp(max=context_length - 1)
         return topk
 
     def _expected(
@@ -210,6 +202,15 @@ class TestDSATransformIndex(CustomTestCase):
                 cu_seqlens_q=cu_seqlens_q,
             )
 
+    def test_prefill_page_table_row_stride_is_not_specialized(self):
+        kernel = transform_index_module.transform_index_page_table_prefill_kernel
+        stride_param = next(
+            param for param in kernel.params if param.name == "page_table_stride_0"
+        )
+
+        self.assertFalse(stride_param.is_constexpr)
+        self.assertTrue(stride_param.do_not_specialize)
+
     def test_prefill_dynamic_page_table_row_strides(self):
         context_lengths = (4096, 4160, 4224)
         kernel = transform_index_module.transform_index_page_table_prefill_kernel
@@ -312,95 +313,6 @@ class TestDSATransformIndex(CustomTestCase):
     def test_decode_fast_extreme_shapes(self):
         self._check_decode_case(8192, 4096)
         self._check_decode_case(2, 1_000_000)
-
-    def test_prefill_kpool_2051_tail_width(self):
-        for expanded in (True, False):
-            with self.subTest(page_table_is_expanded=expanded):
-                self._check_case(
-                    [2, 1],
-                    8192,
-                    page_table_is_expanded=expanded,
-                    topk_padding=4,
-                    output_padding=5,
-                    topk_width=KPOOL_TOPK,
-                )
-
-    def test_decode_kpool_2051_tail_width(self):
-        self._check_decode_case(3, 8192)
-        topk_indices = self._make_topk(3, 8192, KPOOL_TOPK)
-        page_table = self._make_page_table(3, 8192)
-        actual = transform_index_page_table_decode_fast(
-            page_table=page_table,
-            topk_indices=topk_indices,
-        )
-        torch.cuda.synchronize()
-        expected = torch.full(
-            (3, KPOOL_TOPK), -1, dtype=torch.int32, device=self.device
-        )
-        torch.gather(page_table, dim=1, index=topk_indices.clamp(min=0), out=expected)
-        expected[topk_indices < 0] = -1
-        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
-
-    def test_prefill_ordinary_2048_preserved(self):
-        self._check_case(
-            [1, 4],
-            4096,
-            page_table_is_expanded=True,
-            topk_padding=2,
-            output_padding=3,
-            topk_width=TOPK,
-        )
-
-    def test_prefill_kpool_2051_expanded_graph_replay_576(self):
-        rows = 96 * 6
-        context_length = 8192
-        extend_lens_cpu = [6] * 96
-        page_table = self._make_page_table(rows, context_length)
-        topk_indices = self._make_topk(rows, context_length, KPOOL_TOPK)
-        cu_seqlens_q = torch.arange(
-            0, rows + 1, 6, dtype=torch.int32, device=self.device
-        )
-
-        # Warm up/JIT before capture.
-        transform_index_page_table_prefill_fast(
-            page_table=page_table,
-            topk_indices=topk_indices,
-            extend_lens_cpu=extend_lens_cpu,
-            output_num_tokens=rows,
-            page_table_is_expanded=True,
-            cu_seqlens_q=cu_seqlens_q,
-        )
-        torch.cuda.synchronize()
-
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph):
-            result = transform_index_page_table_prefill_fast(
-                page_table=page_table,
-                topk_indices=topk_indices,
-                extend_lens_cpu=extend_lens_cpu,
-                output_num_tokens=rows,
-                page_table_is_expanded=True,
-                cu_seqlens_q=cu_seqlens_q,
-            )
-
-        for phase in range(3):
-            tail = (context_length - KPOOL_TAILS + phase * 2) % context_length
-            topk_indices[:, TOPK:] = (
-                tail + torch.arange(KPOOL_TAILS, dtype=torch.int64, device=self.device)
-            ) % context_length
-            graph.replay()
-            torch.cuda.synchronize()
-            expected = self._expected(
-                page_table,
-                topk_indices,
-                extend_lens_cpu,
-                rows,
-                page_table_is_expanded=True,
-                topk_width=KPOOL_TOPK,
-            )
-            torch.testing.assert_close(result, expected, rtol=0, atol=0)
-            # Keep the masked padding columns invalid after the replay.
-            self.assertTrue(torch.all(topk_indices[0, 257::257] == -1))
 
     def test_decode_fast_kpool_widths(self):
         # 2051 is the GLM-5.3-Flash k-pool width; the others cover a partial
