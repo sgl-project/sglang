@@ -434,6 +434,29 @@ class CompressorAscendBackendMixin:
             )
         state_block_table = table_cache[ratio]
 
+        import os
+
+        if os.environ.get("DSV4_DUMP"):
+            import hashlib
+
+            def _dump_in(name, t):
+                _a = t.detach().to(torch.float32).cpu().numpy()
+                print(
+                    f"[CIN] L{compressor.layer_id} r{ratio} {name} shape={tuple(t.shape)} "
+                    f"sum={_a.sum():.4f} absmax={abs(_a).max():.4f} "
+                    f"md5={hashlib.md5(_a.tobytes()).hexdigest()[:16]}",
+                    flush=True,
+                )
+
+            _dump_in("x", x)
+            _dump_in("state_cache", state_cache)
+            _dump_in("table", state_block_table)
+            print(
+                f"[CIN] L{compressor.layer_id} r{ratio} start_pos={fm.start_pos.tolist()} "
+                f"seqused={fm.seqused.tolist()} cu={fm.actual_seq_lengths_q_pa.tolist()}",
+                flush=True,
+            )
+
         cos, sin = Dsv4NpuRoPE.for_freqs(
             compressor.freqs_cis, getattr(compressor, "rotary_emb", None)
         ).get_cos_sin(
@@ -480,6 +503,17 @@ class CompressorAscendBackendMixin:
                     f"epilog: mode={forward_batch.forward_mode}, ratio={ratio}, "
                     f"loc={loc.numel()}, kv={cmp_kv.shape[0]}"
                 )
+
+        if os.environ.get("DSV4_DUMP"):
+            import hashlib
+
+            _a = cmp_kv.detach().to(torch.float32).cpu().numpy()
+            print(
+                f"[COUT] L{compressor.layer_id} r{ratio} n={cmp_kv.shape[0]} "
+                f"sum={_a.sum():.4f} absmax={abs(_a).max():.4f} "
+                f"md5={hashlib.md5(_a.tobytes()).hexdigest()[:16]}",
+                flush=True,
+            )
 
         if self.graph_mode or cmp_kv.shape[0] > 0:
             if compressor.rotate:

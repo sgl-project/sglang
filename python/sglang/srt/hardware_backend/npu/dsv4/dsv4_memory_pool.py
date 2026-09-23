@@ -343,9 +343,6 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
         )
         config = self.compressed_pool_configs[ratio]
         ring_size = self.get_ring_size(ratio)
-        # Explicit-location (A3-style) addressing: the C4 state follows the SWA
-        # pages, so the pool keeps the SWA-scaled ``config.state_size`` on every
-        # arch -- no per-request ring banks (the old A5 cycle ABI is gone).
         size = config.state_size
         return NPUCompressStatePool(
             size=size,

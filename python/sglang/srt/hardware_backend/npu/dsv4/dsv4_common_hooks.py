@@ -11,8 +11,7 @@ these hooks then:
 
 Compressor state is fixed ring storage and does not participate in this
 allocation/write path. PD reuses the public SWA/C128-state payloads and builds
-NPU-specific payloads for the independently addressed C128 KV pool and A5 C4
-compress-state rows.
+NPU-specific payloads for the independently addressed C128 KV pool.
 
 Non-DSV4 paths leave ``batch.out_cache_loc_dsv4`` None, so this module is a
 no-op for them.
