@@ -140,6 +140,18 @@ class TestSmallMMoeGfx950(CustomTestCase):
                 x, self.w13, self.w2, ids, None, False, True, False, None
             )
         )
+        # the TP2 shape (per-rank intermediate 512) is not dispatched yet
+        w13_512 = torch.empty(
+            self.E, 1024, self.DIM // 2, device=self.dev, dtype=torch.uint8
+        )
+        w2_512 = torch.empty(self.E, self.DIM, 256, device=self.dev, dtype=torch.uint8)
+        x = torch.randn(4, self.DIM, device=self.dev, dtype=torch.bfloat16)
+        ids, _ = self._routing(4)
+        self.assertFalse(
+            M.smallm_moe_supported(
+                x, w13_512, w2_512, ids, None, False, True, False, None
+            )
+        )
 
     def test_graph_replay_matches_eager(self):
         M = self.M

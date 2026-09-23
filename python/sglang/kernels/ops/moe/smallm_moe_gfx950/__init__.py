@@ -1,4 +1,4 @@
-"""gfx950 small-M MXFP4 fused-MoE kernel for the ROCm aiter MoE path (Qwen3.5-397B-A17B shapes).
+"""gfx950 small-M MXFP4 fused-MoE kernel for the ROCm aiter MoE path (Qwen3.5-397B-A17B TP4 shape: hidden 4096, per-rank intermediate 256).
 
 Two HIP kernels (source `smallm_moe.hip` next to this file, compiled with hipcc at first use) replace
 aiter.fused_moe for small token counts:
@@ -31,9 +31,10 @@ _SRC = os.path.join(_DIR, "smallm_moe.hip")
 _ENV = "SGLANG_ROCM_SMALLM_MOE"
 DIM = 4096
 MAX_TOK = 64  # kernel list capacity (tokens per expert) and workspace size
-MAX_TOK_DISPATCH = (
-    40  # above this token count aiter's flydsl path is faster (crossover ~44 at TP4)
-)
+# Dispatch cap: above this token count aiter's flydsl path is faster (crossover ~44
+# tokens at per-rank intermediate 256 / TP4). Only that shape is dispatched here; the
+# TP2 shape (intermediate 512) has a lower crossover and is left to a follow-up.
+MAX_TOK_DISPATCH = {256: 40}
 
 _hip = None
 _kernels: dict = {}
@@ -270,10 +271,8 @@ def smallm_moe_supported(
     if not smallm_moe_enabled():
         return False
     tok = hidden_states.shape[0]
-    cap = min(MAX_TOK, MAX_TOK_DISPATCH)
     if (
         tok < 1
-        or tok > cap
         or hidden_states.dtype != torch.bfloat16
         or hidden_states.shape[1] != DIM
     ):
@@ -287,11 +286,13 @@ def smallm_moe_supported(
         return False
     inter = w2.shape[2] * 2
     if (
-        inter not in (256, 512)
+        inter not in MAX_TOK_DISPATCH
         or w13.shape[1] != 2 * inter
         or w13.shape[2] != DIM // 2
         or w2.shape[1] != DIM
     ):
+        return False
+    if tok > min(MAX_TOK, MAX_TOK_DISPATCH[inter]):
         return False
     if topk_ids.shape[1] not in (10, 11) or tok * topk_ids.shape[1] > 704:
         return False
