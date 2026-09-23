@@ -20,6 +20,34 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _validate_dsv41_encoder_only_ratio_layout(hf_config) -> None:
+    """Validate target and bundled-MTP compression ratios independently."""
+
+    num_target_layers = getattr(hf_config, "num_hidden_layers", None)
+    num_mtp_layers = getattr(hf_config, "num_nextn_predict_layers", 0) or 0
+    ratios = tuple(getattr(hf_config, "compress_ratios", ()) or ())
+    expected_ratios = num_target_layers + num_mtp_layers
+    if len(ratios) != expected_ratios:
+        raise ValueError(
+            "--dsv41-encoder-only-prefill requires one compression ratio per "
+            "target and bundled MTP layer; "
+            f"got {len(ratios)}, expected {num_target_layers}+{num_mtp_layers}"
+        )
+
+    target_ratios = ratios[:num_target_layers]
+    mtp_ratios = ratios[num_target_layers:]
+    if (
+        target_ratios[20] not in (1, 2)
+        or any(ratio not in (0, 1, 2) for ratio in target_ratios)
+        or any(ratio != 0 for ratio in mtp_ratios)
+    ):
+        raise ValueError(
+            "--dsv41-encoder-only-prefill requires the official target-layer "
+            "ratio-0/1/2 layout, layer 20 to be a global-cache producer, and "
+            "bundled MTP layers to have ratio 0"
+        )
+
+
 def apply_deepseek_v4_defaults(server_args: ServerArgs, model_arch: str) -> None:
     """Residual imperative arm of the DeepSeek V4 defaults.
 
@@ -215,21 +243,7 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
                 "--dsv41-encoder-only-prefill boundary layer 20 cannot be an "
                 "Engram layer"
             )
-        ratios = tuple(getattr(hf_config, "compress_ratios", ()) or ())
-        if (
-            len(ratios) != 40
-            or ratios[20] not in (1, 2)
-            or any(ratio not in (0, 1, 2) for ratio in ratios)
-        ):
-            raise ValueError(
-                "--dsv41-encoder-only-prefill requires the official ratio-0/1/2 "
-                "layout and layer 20 to be a global-cache producer"
-            )
-        if getattr(hf_config, "vision_n_layers", 0):
-            raise ValueError(
-                "--dsv41-encoder-only-prefill initially supports text-only "
-                "DeepSeek-V4.1"
-            )
+        _validate_dsv41_encoder_only_ratio_layout(hf_config)
         incompatible = (
             ("overlap scheduler", not cfg.disable_overlap_schedule),
             ("pipeline parallelism", cfg.pp_size != 1),
