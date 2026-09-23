@@ -21,7 +21,11 @@ from sglang.srt.layers.attention.qsa.config import (
     is_qwen_qsa,
     parse_qsa_profile,
 )
-from sglang.srt.layers.attention.qsa.kernel import qsa_sparse_attention
+from sglang.srt.layers.attention.qsa.fused_kv import fused_kv_prepare
+from sglang.srt.layers.attention.qsa.kernel import (
+    expand_qsa_block_indices,
+    qsa_sparse_attention,
+)
 from sglang.srt.layers.attention.qsa.metadata import (
     QSAIndexerMetadata,
     build_group_ring_slots,
@@ -216,6 +220,7 @@ class QwenSparseAttnBackend(AttentionBackend):
         self._trtllm_sparse_tables = {}
         self._mtp_shared_sparse_indices = None
         self._trtllm_workspace = None
+        self._trtllm_counters = {}
         self._graph_extend_lens = None
         self._graph_extend_lens_pin = None
 
@@ -1258,6 +1263,104 @@ class QwenSparseAttnBackend(AttentionBackend):
         slots = metadata.token_slot_table[sequence_ids[:, None], safe]
         return torch.where(valid, slots, torch.full_like(slots, -1)).to(torch.int32)
 
+    def _uses_block_indices(self, indices):
+        profile = getattr(self, "qsa_profile", None)
+        return profile is not None and indices.shape[1] == profile.block_topk
+
+    def _expand_block_indices(self, indices, metadata):
+        if not self._uses_block_indices(indices):
+            return indices
+        indexer = metadata.indexer_metadata
+        return expand_qsa_block_indices(
+            indices,
+            indexer.decode_logical_positions,
+            indexer.get_seqlens_int32(),
+            self.compress_ratio,
+            self.qsa_profile.budget,
+        )
+
+    def _try_fused_kv_attention(self, q, k, v, layer, forward_batch, indices):
+        if not q.is_cuda or k is None or v is None:
+            return None
+        mode = forward_batch.forward_mode
+        if mode.is_decode():
+            width = 1
+        elif mode.is_target_verify():
+            width = int(forward_batch.spec_info.draft_token_num)
+        else:
+            return None
+        trtllm_decode = _resolve_trtllm_sparse_decode()
+        if trtllm_decode is None:
+            return None
+        from sglang.srt.mem_cache.memory_pool import (
+            HybridLinearKVPool,
+            MHATokenToKVPool,
+        )
+        from sglang.srt.mem_cache.qsa_kv_pool import QSATokenToKVPool
+
+        pool = self.token_to_kv_pool
+        if type(pool) in (HybridLinearKVPool, QSATokenToKVPool):
+            storage = pool.full_kv_pool
+        elif type(pool) is MHATokenToKVPool:
+            storage = pool
+        else:
+            return None
+        if type(storage) is not MHATokenToKVPool or storage.is_quantized_kv_cache:
+            return None
+        loc = forward_batch.out_cache_loc
+        rows = indices.shape[0]
+        if (
+            width <= 0
+            or width > 4
+            or rows == 0
+            or rows % width
+            or rows != forward_batch.req_pool_indices.numel() * width
+            or not isinstance(loc, torch.Tensor)
+            or loc.ndim != 1
+            or loc.numel() != rows
+            or not loc.is_contiguous()
+            or k.shape[0] != rows
+            or v.shape[0] != rows
+            or q.shape[0] != rows
+        ):
+            return None
+        kc = pool.get_key_buffer(layer.layer_id)
+        vc = pool.get_value_buffer(layer.layer_id)
+        if (
+            kc.ndim != 3
+            or vc.shape != kc.shape
+            or not kc.is_contiguous()
+            or not vc.is_contiguous()
+            or kc.shape[-1] != 256
+            or kc.dtype not in (torch.bfloat16, torch.float8_e4m3fn)
+            or vc.dtype != kc.dtype
+            or q.dtype != torch.bfloat16
+        ):
+            return None
+        k = k.reshape(rows, kc.shape[1], 256).to(kc.dtype)
+        v = v.reshape(rows, kc.shape[1], 256).to(vc.dtype)
+        if (
+            k.stride(1) != 256
+            or v.stride(1) != 256
+            or k.stride(2) != 1
+            or v.stride(2) != 1
+        ):
+            return None
+        metadata = self._resolve_metadata(forward_batch)
+        if metadata.sequence_lengths.numel() != rows:
+            return None
+        return self._forward_trtllm_sparse(
+            q.reshape(rows, layer.tp_q_head_num, layer.head_dim),
+            kc,
+            vc,
+            layer,
+            forward_batch,
+            metadata,
+            indices.to(torch.int32).contiguous(),
+            trtllm_decode,
+            new_kv=(k, v, loc, width),
+        )
+
     def forward_extend(
         self,
         q: torch.Tensor,
@@ -1272,6 +1375,11 @@ class QwenSparseAttnBackend(AttentionBackend):
         if topk_indices is None:
             raise ValueError("QSA sparse attention requires topk_indices")
         if save_kv_cache:
+            fused_output = self._try_fused_kv_attention(
+                q, k, v, layer, forward_batch, topk_indices
+            )
+            if fused_output is not None:
+                return fused_output
             self.token_to_kv_pool.set_kv_buffer(
                 layer, forward_batch.out_cache_loc, k, v
             )
@@ -1419,10 +1527,15 @@ class QwenSparseAttnBackend(AttentionBackend):
         metadata,
         topk_indices: torch.Tensor,
         trtllm_decode,
+        new_kv=None,
     ) -> torch.Tensor:
         """Pack selected KV at page-aligned row strides for FlashInfer's paged decode,
         driven by a static arange block table and the per-row valid counts."""
         batch, topk = topk_indices.shape
+        compress_ratio = (
+            self.compress_ratio if self._uses_block_indices(topk_indices) else 1
+        )
+        topk = topk * compress_ratio + compress_ratio - 1
         page = _TRTLLM_SPARSE_PAGE_SIZE
         pages_per_row = (topk + page - 1) // page
         stride = pages_per_row * page
@@ -1434,9 +1547,6 @@ class QwenSparseAttnBackend(AttentionBackend):
                 raise RuntimeError("QSA CUDA graph metadata is incomplete")
         else:
             valid_counts = torch.empty(batch, dtype=torch.int32, device=device)
-        qwen_sparse_valid_counts_triton(
-            sequence_lens, topk_indices, valid_counts, batch, topk
-        )
         cu_strided, block_tables = self._get_trtllm_sparse_tables(
             batch, pages_per_row, page, device
         )
@@ -1450,24 +1560,55 @@ class QwenSparseAttnBackend(AttentionBackend):
             q.dtype,
             k_buffer.device,
         )
-        qwen_sparse_kv_extraction_compact_triton(
-            k_buffer,
-            v_buffer,
-            self.req_to_token_pool.req_to_token,
-            (
-                metadata.row_req_pool_indices
-                if metadata.row_req_pool_indices is not None
-                else forward_batch.req_pool_indices
-            ),
-            topk_indices,
-            sequence_lens,
-            cu_strided,
-            packed_k,
-            packed_v,
-            batch,
-            topk,
-            zero_fill_cols=stride,
-        )
+        if new_kv is not None:
+            k, v, loc, width = new_kv
+            row_requests = metadata.row_req_pool_indices
+            if row_requests is None:
+                row_requests = forward_batch.req_pool_indices
+            fused_kv_prepare(
+                k_buffer,
+                v_buffer,
+                k,
+                v,
+                loc,
+                self.req_to_token_pool.req_to_token,
+                row_requests,
+                topk_indices,
+                sequence_lens,
+                valid_counts,
+                packed_k[: batch * stride],
+                packed_v[: batch * stride],
+                width,
+                compress_ratio=compress_ratio,
+                chain_positions=True,
+                query_positions=(
+                    metadata.indexer_metadata.decode_logical_positions
+                    if compress_ratio > 1
+                    else None
+                ),
+            )
+        else:
+            qwen_sparse_valid_counts_triton(
+                sequence_lens, topk_indices, valid_counts, batch, topk
+            )
+            qwen_sparse_kv_extraction_compact_triton(
+                k_buffer,
+                v_buffer,
+                self.req_to_token_pool.req_to_token,
+                (
+                    metadata.row_req_pool_indices
+                    if metadata.row_req_pool_indices is not None
+                    else forward_batch.req_pool_indices
+                ),
+                topk_indices,
+                sequence_lens,
+                cu_strided,
+                packed_k,
+                packed_v,
+                batch,
+                topk,
+                zero_fill_cols=stride,
+            )
         num_kv_heads = k_buffer.shape[1]
         head_dim = k_buffer.shape[2]
         kc = (
@@ -1484,6 +1625,18 @@ class QwenSparseAttnBackend(AttentionBackend):
             self._trtllm_workspace = torch.zeros(
                 128 * 1024 * 1024, dtype=torch.uint8, device=device
             )
+        from flashinfer.utils import get_trtllm_gen_multi_ctas_kv_counter_bytes
+
+        key = (batch, q.shape[1], device)
+        if key not in self._trtllm_counters:
+            size = get_trtllm_gen_multi_ctas_kv_counter_bytes(
+                batch,
+                q.shape[1],
+                torch.cuda.get_device_properties(device).multi_processor_count,
+            )
+            self._trtllm_counters[key] = torch.zeros(
+                size, dtype=torch.uint8, device=device
+            )
         output = trtllm_decode(
             query=q.contiguous(),
             kv_cache=(kc, vc),
@@ -1493,6 +1646,7 @@ class QwenSparseAttnBackend(AttentionBackend):
             max_seq_len=stride,
             bmm1_scale=layer.scaling,
             bmm2_scale=1.0,
+            multi_ctas_kv_counter_buffer=self._trtllm_counters[key],
         )
         return output.reshape(q.shape[0], -1)
 
@@ -1510,6 +1664,11 @@ class QwenSparseAttnBackend(AttentionBackend):
         if topk_indices is None:
             raise ValueError("QSA sparse attention requires topk_indices")
         if save_kv_cache:
+            fused_output = self._try_fused_kv_attention(
+                q, k, v, layer, forward_batch, topk_indices
+            )
+            if fused_output is not None:
+                return fused_output
             self.token_to_kv_pool.set_kv_buffer(
                 layer, forward_batch.out_cache_loc, k, v
             )
@@ -1526,13 +1685,13 @@ class QwenSparseAttnBackend(AttentionBackend):
         pool = self.token_to_kv_pool
         k_buffer = pool.get_key_buffer(layer.layer_id)
         v_buffer = pool.get_value_buffer(layer.layer_id)
+        metadata = self._resolve_metadata(forward_batch)
+        topk_indices = self._expand_block_indices(topk_indices, metadata)
         if not q.is_cuda:
-            metadata = self._resolve_metadata(forward_batch)
             slots = self._logical_to_physical(topk_indices, metadata)
             output = qsa_sparse_attention(q, k_buffer, v_buffer, slots, layer.scaling)
             return output.reshape(q.shape[0], -1)
 
-        metadata = self._resolve_metadata(forward_batch)
         topk_indices = topk_indices.to(torch.int32).contiguous()
         trtllm_decode = _resolve_trtllm_sparse_decode()
         if trtllm_decode is not None:
