@@ -1,0 +1,62 @@
+{{- if .Release.IsInstall }}
+{{- $defaultModel := dict "path" "" "tensorParallelSize" 1 -}}
+{{- $model := mustMerge (deepCopy (default dict .Values.model)) $defaultModel -}}
+Thank you for installing {{ .Chart.Name }}!
+
+Your release is named {{ .Release.Name }}.
+
+To learn more about the release, try:
+
+  $ helm status {{ .Release.Name }} -n {{ .Release.Namespace }}
+  $ helm get all {{ .Release.Name }} -n {{ .Release.Namespace }}
+
+{{ if eq .Values.service.type "LoadBalancer" -}}
+1. Get the application URL by running these commands:
+
+  NOTE: It may take a few minutes for the LoadBalancer IP to be available.
+        You can watch the status by running:
+
+  $ kubectl get svc {{ include "sglang.fullname" . }} -n {{ .Release.Namespace }} -w
+
+  Once the external IP is available, run:
+
+  $ export SERVICE_IP=$(kubectl get svc {{ include "sglang.fullname" . }} -n {{ .Release.Namespace }} -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
+  $ echo "SGLang endpoint: http://$SERVICE_IP:{{ .Values.service.port }}"
+
+{{- else if eq .Values.service.type "ClusterIP" -}}
+1. Access the application by port-forwarding:
+
+  $ kubectl port-forward -n {{ .Release.Namespace }} svc/{{ include "sglang.fullname" . }} {{ .Values.service.port }}:{{ .Values.service.port }}
+  
+  Then access: http://localhost:{{ .Values.service.port }}
+
+{{- else if eq .Values.service.type "NodePort" -}}
+1. Get the application URL by running these commands:
+
+  $ export NODE_PORT=$(kubectl get svc {{ include "sglang.fullname" . }} -n {{ .Release.Namespace }} -o jsonpath='{.spec.ports[0].nodePort}')
+  $ export NODE_IP=$(kubectl get nodes -o jsonpath='{.items[0].status.addresses[0].address}')
+  $ echo "SGLang endpoint: http://$NODE_IP:$NODE_PORT"
+
+{{- end }}
+
+2. Test the API:
+
+  $ curl http://localhost:{{ .Values.service.port }}/v1/models
+
+{{- if .Values.service.metrics.enabled }}
+
+3. Access metrics:
+
+  $ kubectl port-forward -n {{ .Release.Namespace }} svc/{{ include "sglang.fullname" . }}-metrics {{ .Values.service.metrics.port }}:{{ .Values.service.metrics.port }}
+  
+  Then access: http://localhost:{{ .Values.service.metrics.port }}/metrics
+{{- end }}
+
+Configuration:
+- Model: {{ $model.path }}
+- Replicas: {{ .Values.replicaCount }}
+{{- if gt (int .Values.replicaCount) 1 }}
+- Multi-node distributed mode enabled
+- Tensor parallel size: {{ $model.tensorParallelSize }}
+{{- end }}
+{{- end }}
