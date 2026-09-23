@@ -947,8 +947,9 @@ class Envs:
     SGLANG_OPT_HIP_FUSED_MOE_REDUCE_ADD = EnvBool(True)
     # HIP: fused decode glue launches (page table, index widening, image select); 0: torch
     SGLANG_OPT_HIP_FUSED_DECODE_GLUE = EnvBool(True)
-    # Fixed split-KV preserves batch-invariant reduction order; 0 enables adaptive splits and TP4 attention.
-    SGLANG_OPT_HIP_ATTN_KV_SPLITS = EnvInt(4)
+    # HIP sparse decode split-KV count. Unset: adaptive splits and the native TP4 16-head
+    # attention, or a fixed 4 under deterministic inference (hip_flash_mla.hip_attn_kv_splits).
+    SGLANG_OPT_HIP_ATTN_KV_SPLITS = EnvInt(None)
 
     # ===================================================================
     # Apple Silicon and MLX

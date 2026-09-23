@@ -38,6 +38,7 @@ from sglang.kernels.ops.speculative.dspark.dspark_attn_metadata import (
     ComputeDsparkWindowGather,
 )
 from sglang.srt.environ import envs
+from sglang.srt.layers.attention.hip_flash_mla import hip_attn_kv_splits
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.deepseek_v4_backend import (
     PAGE_INDEX_ALIGNED_SIZE,
@@ -2908,7 +2909,7 @@ class DeepseekV4HipRadixBackend(
                 and self.softmax_scale == 512**-0.5
                 and swa_k_cache.shape[-1] == 584
                 and (extra_k_cache is None or extra_k_cache.shape[-1] == 584)
-                and envs.SGLANG_OPT_HIP_ATTN_KV_SPLITS.get() == 0
+                and hip_attn_kv_splits() == 0
                 and (
                     forward_batch.forward_mode.is_decode()
                     or forward_batch.forward_mode.is_target_verify()

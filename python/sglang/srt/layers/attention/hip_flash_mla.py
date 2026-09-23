@@ -16,6 +16,22 @@ _HIP_BACKENDS = ("tilelang", "triton", "aiter_sparse", "torch", "comparison")
 _AITER_SPARSE_SINGLE_SPLIT_MIN_TOKENS = 1024
 
 
+def hip_attn_kv_splits() -> int:
+    """Split-KV count for the HIP sparse decode kernels. ``SGLANG_OPT_HIP_ATTN_KV_SPLITS``
+    wins when set; otherwise deterministic inference pins 4 splits (a fixed combine order
+    keeps the bits identical at every batch size) and everything else uses 0: adaptive
+    splits plus the native 16-head attention for small TP4 decode batches."""
+    if envs.SGLANG_OPT_HIP_ATTN_KV_SPLITS.is_set():
+        return envs.SGLANG_OPT_HIP_ATTN_KV_SPLITS.get()
+    try:
+        from sglang.srt.runtime_context import get_exec
+
+        deterministic = get_exec().deterministic.enable_deterministic_inference
+    except (ValueError, ImportError):  # no published exec config (kernel tests, offline tools)
+        deterministic = False
+    return 4 if deterministic else 0
+
+
 @functools.lru_cache(maxsize=None)
 def _uniform_indptr(num_tokens: int, width: int, device: str) -> torch.Tensor:
     """Row pointers of the aiter sparse decode kernel (token t reads kv_indices[t*w : (t+1)*w]);
@@ -63,7 +79,7 @@ def aiter_sparse_decode_fwd(
             splits=(
                 1
                 if b * s >= _AITER_SPARSE_SINGLE_SPLIT_MIN_TOKENS
-                else envs.SGLANG_OPT_HIP_ATTN_KV_SPLITS.get() or None
+                else hip_attn_kv_splits() or None
             ),
         )
         return out.view(b, s, h, d), None
@@ -96,9 +112,9 @@ def aiter_sparse_decode_fwd(
         )
     if n >= _AITER_SPARSE_SINGLE_SPLIT_MIN_TOKENS:
         extra_kwargs["kv_splits"] = 1
-    elif envs.SGLANG_OPT_HIP_ATTN_KV_SPLITS.get() > 0:
+    elif hip_attn_kv_splits() > 0:
         # a pinned split count keeps the combine order, hence the bits, the same at every batch size
-        extra_kwargs["kv_splits"] = envs.SGLANG_OPT_HIP_ATTN_KV_SPLITS.get()
+        extra_kwargs["kv_splits"] = hip_attn_kv_splits()
     out = pa_decode_sparse(
         q3,
         cache,
