@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+from unittest.mock import patch
+
 import pytest
 import torch
 from torch.nn import Module
@@ -18,6 +21,7 @@ from sglang.srt.layers.quantization.mxfp4_flashinfer_trtllm_moe import (
 )
 from sglang.srt.model_loader.loader import postprocess_weight, restore_weight
 from sglang.srt.utils import is_sm100_supported
+from sglang.test.test_utils import CustomTestCase
 
 if not is_sm100_supported():
     pytest.skip("FlashInfer TRT-LLM MXFP4 MoE requires SM100+", allow_module_level=True)
@@ -54,22 +58,31 @@ class _NoOpFp8:
         pass
 
 
-def _build_layer() -> Module:
+def _build_layer(
+    *,
+    num_experts=NUM_EXPERTS,
+    hidden_size=HIDDEN_SIZE,
+    intermediate_size=INTERMEDIATE_SIZE,
+) -> Module:
     layer = Module().to("cuda")
-    layer.num_local_experts = NUM_EXPERTS
+    layer.num_local_experts = num_experts
+    layer.num_experts = num_experts
+    layer.moe_ep_rank = 0
     method = Mxfp4FlashinferTrtllmMoEMethod.__new__(Mxfp4FlashinferTrtllmMoEMethod)
     method._fp8 = _NoOpFp8()
     method.prefix = "test"
+    method.flashinfer_mxfp4_moe_precision = "default"
     layer.quant_method = method
     with torch.device("cuda"):
         method.create_weights(
             layer,
-            NUM_EXPERTS,
-            HIDDEN_SIZE,
-            INTERMEDIATE_SIZE,
+            num_experts,
+            hidden_size,
+            intermediate_size,
             torch.bfloat16,
             weight_loader=lambda *args, **kwargs: None,
         )
+    method.create_moe_runner(layer, SimpleNamespace(swiglu_limit=10.0))
     return layer
 
 
@@ -152,3 +165,65 @@ def test_hot_reload_matches_fresh_load_and_preserves_kernel_addresses():
             initial[name].view(torch.uint8), tensor.view(torch.uint8)
         )
         assert torch.equal(expected[name].view(torch.uint8), tensor.view(torch.uint8))
+
+
+class TestMxfp4KernelForward(CustomTestCase):
+    @torch.inference_mode()
+    def test_mxfp8_forward_accepts_int8_load_parameters(self):
+        """Signed checkpoint bytes must remain loadable across real MoE forwards."""
+        from sglang.srt.layers.moe.token_dispatcher import StandardDispatchOutput
+        from sglang.srt.layers.moe.topk import StandardTopKOutput
+        from sglang.srt.layers.quantization import mxfp4_flashinfer_trtllm_moe
+
+        layer = _build_layer(num_experts=32, hidden_size=4096, intermediate_size=2048)
+        generator = torch.Generator(device="cuda").manual_seed(0)
+        hidden_states = torch.randn(
+            8, 4096, generator=generator, device="cuda", dtype=torch.bfloat16
+        )
+        dispatch = StandardDispatchOutput(
+            hidden_states=hidden_states,
+            hidden_states_scale=None,
+            topk_output=StandardTopKOutput(
+                topk_weights=torch.full(
+                    (8, 6), 1 / 6, device="cuda", dtype=torch.float32
+                ),
+                topk_ids=torch.arange(6, device="cuda", dtype=torch.int32).repeat(8, 1),
+                router_logits=None,
+            ),
+        )
+        outputs = []
+        # A local kernel call needs no distributed symmetric-memory allocator.
+        with (
+            patch.object(
+                mxfp4_flashinfer_trtllm_moe, "get_tp_group", return_value=None
+            ),
+            patch.object(
+                mxfp4_flashinfer_trtllm_moe,
+                "is_allocation_symmetric",
+                return_value=False,
+            ),
+        ):
+            for packed_byte in (-86, 34):
+                if outputs:
+                    restore_weight(layer, torch.device("cuda"))
+                for name in LOAD_PARAMS:
+                    getattr(layer, name).fill_(
+                        1 / 32 if "scale" in name else packed_byte
+                    )
+                postprocess_weight(layer, torch.device("cuda"))
+                output = layer.quant_method.apply(layer, dispatch).hidden_states
+                torch.cuda.synchronize()
+                self.assertEqual(output.shape, hidden_states.shape)
+                self.assertEqual(output.dtype, torch.bfloat16)
+                self.assertTrue(torch.isfinite(output).all().item())
+                self.assertGreater(torch.count_nonzero(output).item(), 0)
+                self.assertEqual(layer.w13_weight.dtype, torch.int8)
+                self.assertEqual(layer.w2_weight.dtype, torch.int8)
+                outputs.append(output.clone())
+        self.assertFalse(torch.equal(*outputs))
+
+
+if __name__ == "__main__":
+    import sys
+
+    sys.exit(pytest.main([__file__]))
