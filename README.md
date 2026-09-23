@@ -37,7 +37,7 @@ Meet the SGLang community at upcoming <a href="https://www.sglang.io/events">mee
 - [2026/07] RadixArk and Google bring full SGLang features to TPUs ([blog](https://lmsys.org/blog/2026-07-30-sglang-google-tpu/)).
 - [2026/07] Serving GLM5.2 NVFP4 agentic workloads with SGLang: Reaching 500 TPS in two weeks ([blog](https://lmsys.org/blog/2026-07-13-glm52-optimization/)).
 
-Read more on the [SGLang Blog](https://www.sglang.io/blog) and browse earlier posts on the [LMSYS Blog](https://lmsys.org/blog/).
+Read more on the [SGLang Blog](https://www.sglang.io/blog) ([also on LMSYS](https://lmsys.org/blog/)).
 
 <details>
 <summary>More</summary>
