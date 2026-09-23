@@ -177,6 +177,7 @@ class TestSyncTokenScoring(unittest.TestCase):
                 torch.softmax(engine.tokenizer_manager.logits[[1, 3]] / 2, 0),
             )
         finally:
+            engine.loop.run_until_complete(engine.loop.shutdown_asyncgens())
             engine.loop.close()
 
 
