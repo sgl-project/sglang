@@ -45,7 +45,6 @@ DEEPSEEK_V4_FLASH_W8A8_1P1D_PREFILL_ENVS = {
     # PD disagg
     "SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT": "60",
     # MTP
-    "SGLANG_ENABLE_SPEC_V2": "1",
     "SGLANG_ENABLE_OVERLAP_PLAN_STREAM": "1",
 }
 
@@ -77,7 +76,6 @@ DEEPSEEK_V4_FLASH_W8A8_1P1D_DECODE_ENVS = {
     "SGLANG_OPT_DEEPGEMM_HC_PRENORM": "False",
     "SGLANG_OPT_USE_TILELANG_MHC_POST": "False",
     # MTP
-    "SGLANG_ENABLE_SPEC_V2": "1",
     "SGLANG_ENABLE_OVERLAP_PLAN_STREAM": "1",
     "SGLANG_NPU_USE_MULTI_STREAM": "1",
 }
@@ -171,7 +169,7 @@ DEEPSEEK_V4_FLASH_W8A8_1P1D_DECODE_ARGS = [
     "--enable-dp-lm-head",
     "--kv-cache-dtype",
     "bfloat16",
-    "--cuda-graph-bs",
+    "--cuda-graph-bs-decode",
     1,
     2,
     4,

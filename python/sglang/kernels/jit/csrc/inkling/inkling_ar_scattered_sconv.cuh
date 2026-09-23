@@ -1028,7 +1028,7 @@ __global__ __launch_bounds__(1024, 1) void inkling_ar_col_decode_kernel(const __
           static_cast<const __nv_bfloat16*>(p.residual_in) + static_cast<int64_t>(t) * p.H + c0[i]);
     }
   }
-  asm volatile("griddepcontrol.wait;" ::: "memory");
+  device::PDLWaitPrimary<true>();
 
   // ---- 1. entry: peers' producer partials visible (block t <-> peer t) ----
   inkling_ar::block_system_barrier<kNumGPU>(p.state, p.flag_ptrs, p.rank);
@@ -1764,7 +1764,7 @@ __launch_bounds__(1024, 1) void inkling_ar_ssconv_norm_decode_kernel(const __gri
   }
 
   // ---- 1. push: this rank's partial row + its window shard ----
-  asm volatile("griddepcontrol.wait;" ::: "memory");
+  device::PDLWaitPrimary<true>();
   const auto* in_row = static_cast<const __nv_bfloat16*>(p.in) + t * p.in_stride_t;
   auto* slot = static_cast<__nv_bfloat16*>(p.mc_stage) + (static_cast<uint64_t>(p.rank) * p.T + t) * p.D;
   auto* wslot = static_cast<__nv_bfloat16*>(p.mc_wstage) + static_cast<uint64_t>(t) * W1 * p.D;

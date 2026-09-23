@@ -38,7 +38,7 @@ def minimax_h3_tasks_for_server(server_args: "ServerArgs") -> tuple[str, ...]:
     return tuple(
         task
         for task, task_partition in MINIMAX_H3_TASK_PARTITIONS.items()
-        if task_partition == partition
+        if partition == "hybrid" or task_partition == partition
     )
 
 

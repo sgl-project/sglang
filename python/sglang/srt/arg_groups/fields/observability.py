@@ -10,7 +10,6 @@ how config is shaped at runtime.
 from __future__ import annotations
 
 import argparse
-import dataclasses
 import json
 from typing import (
     Any,
@@ -19,6 +18,8 @@ from typing import (
     Optional,
 )
 
+import msgspec
+
 from sglang.srt.arg_groups.arg_utils import (
     A,
     Arg,
@@ -26,8 +27,7 @@ from sglang.srt.arg_groups.arg_utils import (
 from sglang.srt.utils.common import json_list_type
 
 
-@dataclasses.dataclass
-class Observability:
+class Observability(msgspec.Struct):
     """Namespace ``observability``."""
 
     _NS_PATH = "observability"
@@ -68,7 +68,7 @@ class Observability:
             help="Exclude uvicorn access logs whose request path starts with any of these prefixes. Defaults to empty (disabled). Example: --uvicorn-access-log-exclude-prefixes /metrics /health",
             nargs="*",
         ),
-    ] = dataclasses.field(default_factory=list)
+    ] = msgspec.field(default_factory=list)
     crash_dump_folder: A[
         Optional[str],
         "Folder path to dump requests from the last 5 min before a crash (if any). If not specified, crash dumping is disabled.",
@@ -177,6 +177,11 @@ class Observability:
         str,
         "Config opentelemetry collector endpoint if --enable-trace is set. format: <ip>:<port>",
     ] = "localhost:4317"
+    otlp_service_name: A[
+        Optional[str],
+        "Service name for OTLP traces (displayed as 'service.name' in trace backends). "
+        "If unset, falls back to the OTEL_SERVICE_NAME env var, then to 'sglang'.",
+    ] = None
     # RequestMetricsExporter configuration
     export_metrics_to_file: A[
         bool,

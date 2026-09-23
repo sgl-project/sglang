@@ -30,7 +30,7 @@ v0.5.16 or a later version.
 | PD Disaggregation             | `--disaggregation-mode prefill \`<br/>`--disaggregation-transfer-backend ascend`              |
 | Quantization                  | `--quantization modelslim`                                                                    |
 | Chunked Prefill               | auto based on device memory, or set explicit value;<br/>disable with `--chunked-prefill-size -1`; e.g., `--chunked-prefill-size 94208` |
-| NPU Graph                     | enabled by default; disable with `--disable-cuda-graph`;<br/>control range via `--cuda-graph-bs` or `--cuda-graph-max-bs-decode`; e.g., `--cuda-graph-bs 1 2 4 8 16 20 24 26 27` |
+| NPU Graph                     | enabled by default; disable with `--disable-cuda-graph`;<br/>control range via `--cuda-graph-bs-decode` or `--cuda-graph-max-bs-decode`; e.g., `--cuda-graph-bs-decode 1 2 4 8 16 20 24 26 27` |
 | Speculative Decoding          | `--speculative-algorithm EAGLE3 \`<br/>`--speculative-draft-model-path /path/to/draft-model-weights \`<br/>`--speculative-num-steps 3 \`<br/>`--speculative-eagle-topk 1 \`<br/>`--speculative-num-draft-tokens 4 \`<br/>`--speculative-draft-model-quantization unquant` |
 | Overlap Schedule              | `export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1`                                                  |
 | DP LM Head                    | `--enable-dp-lm-head`                                                                         |
@@ -71,15 +71,15 @@ For multi-node deployment, download the weights to a shared directory accessible
 
 <Info>
 The BF16 variant (470.21GB) can be deployed on 16 × 64GB of device memory (`--tp-size 16`), which corresponds to one full
-A3 node (8 cards, 16 dies) or two A2 nodes.
+A3 Series node (8 cards, 16 dies) or two A2 Series nodes.
 
-The W8A8 variant (236.80GB) can be deployed on 8 × 64GB (`--tp-size 8`), which corresponds to one full A2 node or 8 dies on A3 (4 cards).
+The W8A8 variant (236.80GB) can be deployed on 8 × 64GB (`--tp-size 8`), which corresponds to one full A2 Series node or 8 dies on A3 Series (4 cards).
 </Info>
 
 This is the minimum recommended configuration. For optimized configurations,
 see [Best practices](#best-practices), which may require additional cards or nodes.
 
-For the hardware specifications (memory per die, dies per card, and the difference between A2 and A3),
+For the hardware specifications (memory per die, dies per card, and the difference between A2 Series and A3 Series),
 see [Ascend NPU Reference — Hardware](/docs/hardware-platforms/ascend-npus/reference/glossary#hardware).
 
 ## Installation
@@ -95,7 +95,7 @@ Both **stable releases** and **daily builds** are available. The following comma
 For details, see [Docker image versions](/docs/hardware-platforms/ascend-npus/faq#8-docker-image-versions-stable-release-vs-daily-build).
 
 <Tabs>
-  <Tab title="Atlas 800I A3">
+  <Tab title="Ascend A3 Series">
 
 ```bash Command
 docker pull quay.io/ascend/sglang:cann9.0.0-a3-v0.5.16
@@ -130,7 +130,7 @@ quay.io/ascend/sglang:cann9.0.0-a3-v0.5.16
 ```
 
   </Tab>
-  <Tab title="Atlas 800I A2">
+  <Tab title="Ascend A2 Series">
 
 ```bash Command
 docker pull quay.io/ascend/sglang:cann9.0.0-910b-v0.5.16
@@ -172,13 +172,13 @@ quay.io/ascend/sglang:cann9.0.0-910b-v0.5.16
 Single-node deployment completes both prefill and decode within the same node (PD mixed mode), suitable for scenarios
 with limited hardware resources. This scenario is already covered in the best practice. For the complete, optimized
 deployment commands and benchmark data, see
-[Qwen3-235B-A22B Best Practice — PD Mixed On A3](/docs/hardware-platforms/ascend-npus/model-deployment/best-practices/qwen3_235b_a22b#single-node-pd-mixed).
+[Qwen3-235B-A22B Best Practice — PD Mixed On A3 Series](/docs/hardware-platforms/ascend-npus/model-deployment/best-practices/qwen3_235b_a22b#single-node-pd-mixed).
 
 ### Multi-node PD disaggregation deployment
 
-#### 256K long-sequence PD disaggregation on 2 x Atlas 800I A3 (without CP)
+#### 256K long-sequence PD disaggregation on 2 x Ascend A3 Series nodes (without CP)
 
-This configuration uses PD disaggregation for **256K long-sequence inference** on 2 x Atlas 800I A3 with context parallel disabled.
+This configuration uses PD disaggregation for **256K long-sequence inference** on 2 x Ascend A3 Series nodes with context parallel disabled.
 The following command is based on the **W8A8** quantized model.
 
 1. Set the shared environment variables on both prefill and decode nodes:
@@ -291,7 +291,7 @@ python3 -m sglang_router.launch_router \
     --prometheus-port 29010
 ```
 
-#### Prefill Context Parallel (PCP) on 2 x Atlas 800I A3
+#### Prefill Context Parallel (PCP) on 2 x Ascend A3 Series nodes
 
 This configuration enables **Prefill Context Parallel** (`--enable-prefill-context-parallel`) to split the context
 across CP ranks during prefill, reducing per-device memory pressure and improving TTFT for long sequences.
