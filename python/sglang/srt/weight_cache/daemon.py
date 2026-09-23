@@ -57,6 +57,7 @@ from sglang.srt.runtime_context import (
     publish,
     spawn_world_rank,
 )
+from sglang.srt.utils.common import is_npu
 
 from .protocol import (
     CacheConfig,
@@ -252,20 +253,23 @@ class WeightCacheDaemon:
 
     def load(self):
         """Full loading pipeline: disk → TP shard → quantize → export IPC handles."""
-        # CUDA IPC weight sharing relies on torch's _share_cuda_ handle export,
-        # which only exists on CUDA-alike platforms (CUDA / ROCm). Fail loud here
-        # instead of dying deep inside the export with an opaque error.
-        if not current_platform.is_cuda_alike():
+        # Zero-copy IPC weight sharing requires a platform whose tensors can be
+        # exported through multiprocessing reduction: CUDA-alike platforms
+        # (CUDA / ROCm) via _share_cuda_, and NPU via native torch_npu reduction.
+        # Fail loud here instead of dying deep inside the export with an opaque
+        # error on anything else.
+        if not current_platform.is_cuda_alike() and not is_npu():
             raise RuntimeError(
-                f"[WeightCacheDaemon] the weight cache daemon requires a CUDA-alike "
-                f"platform (CUDA or ROCm) for CUDA IPC weight sharing, but the "
-                f"active platform device type is {current_platform.device_type!r}. "
-                f"Disable the weight cache (--weight-cache-mode off)."
+                f"[WeightCacheDaemon] the weight cache daemon requires an "
+                f"IPC-capable platform (CUDA, ROCm, or NPU/Ascend) for zero-copy "
+                f"weight sharing, but the active platform device type is "
+                f"{current_platform.device_type!r}. Disable the weight cache "
+                f"(--weight-cache-mode off)."
             )
         # expandable_segments makes torch's caching allocator hand out memory
         # that cannot be exported via _share_cuda_, so the IPC export below would
         # die mid-way with an opaque CUDA error. Fail fast with an actionable
-        # message before touching the device.
+        # message before touching the device. Only CUDA's allocator is affected.
         self._assert_ipc_compatible_allocator()
         current_platform.set_device(current_platform.get_device(self.gpu_id))
 
@@ -356,7 +360,7 @@ class WeightCacheDaemon:
         )
 
         current_platform.empty_cache()
-        memory_before_load = torch.cuda.memory_reserved(self.gpu_id)
+        memory_before_load = self._reserved_memory_bytes(self.gpu_id)
 
         # Build load config
         load_config = LoadConfig(
@@ -390,7 +394,7 @@ class WeightCacheDaemon:
         current_platform.synchronize()
         current_platform.empty_cache()
         self.preloaded_weights_bytes = max(
-            0, torch.cuda.memory_reserved(self.gpu_id) - memory_before_load
+            0, self._reserved_memory_bytes(self.gpu_id) - memory_before_load
         )
 
         # Export all parameters and buffers as IPC handles
@@ -403,13 +407,31 @@ class WeightCacheDaemon:
         )
 
     @staticmethod
+    def _reserved_memory_bytes(gpu_id: int) -> int:
+        """Bytes of resident (reserved) device memory for ``gpu_id``.
+
+        CUDA uses ``torch.cuda.memory_reserved``; NPU uses the torch_npu
+        equivalent so preloaded-weight accounting stays platform-agnostic.
+        """
+        if is_npu():
+            import torch_npu  # noqa: F401
+
+            return int(torch.npu.memory_reserved(gpu_id))
+        return int(torch.cuda.memory_reserved(gpu_id))
+
+    @staticmethod
     def _assert_ipc_compatible_allocator() -> None:
         """Reject allocator configs incompatible with CUDA IPC export.
 
         The expandable-segments allocator returns memory that cannot be shared
         through torch's _share_cuda_ handle, which would make the export fail
         partway with an opaque error. Detect it up front and fail loud.
+
+        This only affects CUDA's caching allocator; other platforms (e.g. NPU /
+        Ascend) are not gated by ``expandable_segments`` and are skipped.
         """
+        if is_npu():
+            return
         for var in ("PYTORCH_CUDA_ALLOC_CONF", "PYTORCH_ALLOC_CONF"):
             conf = os.environ.get(var, "")
             for field in conf.split(","):

@@ -248,6 +248,12 @@ def compute_env_stamp() -> Dict[str, str]:
     map cleanly over IPC yet serve garbage; stamping these into CacheConfig turns
     that into a clean mismatch. Imported lazily so protocol.py stays cheap to
     import and usable on CPU-only hosts (both fields degrade to "").
+
+    On NPU/Ascend ``get_device_capability()`` always reports ``(0, 0)`` (it reads
+    ``TORCH_NPU_DEVICE_CAPABILITY`` and is not the real hardware capability), so
+    the capability fingerprint alone cannot distinguish NPU models. We append the
+    device name / uuid and the torch_npu version as the NPU-equivalent stamp so
+    mismatched Ascend hardware is still caught.
     """
     device_capability = ""
     torch_version = ""
@@ -265,7 +271,22 @@ def compute_env_stamp() -> Dict[str, str]:
             device_capability = f"{cap.major}.{cap.minor}"
     except Exception:
         pass
-    return {"device_capability": device_capability, "torch_version": torch_version}
+
+    stamp = {"device_capability": device_capability, "torch_version": torch_version}
+    try:
+        from sglang.srt.utils.common import is_npu
+
+        if is_npu():
+            import torch_npu  # noqa: F401
+
+            from sglang.srt.platforms import current_platform
+
+            stamp["device_name"] = current_platform.get_device_name(0)
+            stamp["device_uuid"] = current_platform.get_device_uuid(0)
+            stamp["torch_npu_version"] = str(torch_npu.__version__)
+    except Exception:
+        pass
+    return stamp
 
 
 def compute_global_rank(tp_size: int, pp_rank: int, tp_rank: int) -> int:
