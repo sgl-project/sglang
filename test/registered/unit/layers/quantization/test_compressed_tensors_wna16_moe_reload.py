@@ -47,12 +47,12 @@ QUANT_CONFIG = {
 
 
 def _random_checkpoint(seed):
-    """Per-expert checkpoint shards; any int32 is a valid pack of eight int4 values."""
     gen = torch.Generator(device=DEVICE).manual_seed(seed)
     shards = {}
     for expert_id in range(E):
         for shard_id, (rows, cols) in (("w1", (I, H)), ("w3", (I, H)), ("w2", (H, I))):
             shards[expert_id, shard_id] = {
+                # any int32 packs eight valid int4 values
                 "weight_packed": torch.randint(
                     -(2**31),
                     2**31 - 1,

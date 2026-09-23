@@ -69,7 +69,6 @@ def _merge_checksum_payloads(role_payloads: List[Tuple[str, Dict]]) -> Dict:
 
 
 def _parse_runner_selector(selector: str) -> Set[str]:
-    """Map a {target, draft, all} weight-op selector to the set of roles it covers."""
     if selector == "all":
         return {"target", "draft"}
     if selector in ("target", "draft"):
@@ -164,7 +163,6 @@ class SchedulerWeightUpdaterManager:
         return DestroyWeightsUpdateGroupReqOutput(success=success, message=message)
 
     def _select_runners(self, selector: str = "all") -> List[Tuple[str, Any]]:
-        """(role, ModelRunner) pairs a {target, draft, all} selector covers, target first."""
         roles = _parse_runner_selector(selector)
         runners: List[Tuple[str, Any]] = []
         if "target" in roles:

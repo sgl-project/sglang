@@ -458,10 +458,10 @@ class TokenizerControlMixin:
     async def _weight_update_session_call(
         self: TokenizerManager, communicator, obj
     ) -> Tuple[bool, str]:
-        """Session RPC under the pause-aware lock: a paused engine already holds the writer lock."""
         self.auto_create_handle_loop()
         async with self.is_pause_cond:
             is_paused = self.is_pause
+            # whoever paused the engine holds the writer lock; taking it again deadlocks
             if is_paused:
                 results = await communicator(obj)
         if not is_paused:
