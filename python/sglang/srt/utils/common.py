@@ -1281,6 +1281,13 @@ class Range(NamedTuple):
         return self.end - self.start
 
 
+def assert_int64_array(values: array, name: str) -> None:
+    """Require a signed int64 array suitable for zero-copy tensor views."""
+    assert (
+        isinstance(values, array) and values.typecode == "q" and values.itemsize == 8
+    ), f"{name} must be array('q') with 8-byte items"
+
+
 def flatten_arrays_to_pinned_cpu(parts: List[array[int]], pin: bool) -> torch.Tensor:
     """Flatten array.array('q') buffers into one int64 CPU tensor.
 

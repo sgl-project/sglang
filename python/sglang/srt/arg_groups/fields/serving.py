@@ -90,6 +90,11 @@ class Serving(msgspec.Struct):
         "default. In legacy --smg-grpc-mode this is the SMG server port and "
         "defaults to --port + 10000.",
     ] = None
+    grpc_response_timeout_secs: A[
+        int,
+        "Timeout in seconds waiting for each native gRPC response chunk, "
+        "including the first. Must be positive. Defaults to 300.",
+    ] = 300
     # Env-only (SGLANG_GRPC_WORKER_THREADS); a field so the projection sees it.
     grpc_worker_threads: A[Optional[int], Arg(no_cli=True)] = None
     sidecar: A[
