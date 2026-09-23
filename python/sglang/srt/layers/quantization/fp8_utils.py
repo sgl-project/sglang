@@ -796,13 +796,14 @@ def dispatch_w8a8_mxfp8_linear() -> Callable:
         return partial(flashinfer_mxfp8_blockscaled_linear, backend="cutlass")
     elif backend.is_flashinfer_cutedsl():
         return partial(flashinfer_mxfp8_blockscaled_linear, backend="cute-dsl")
-    elif backend.is_gfx95_dot_scaled():
-        from sglang.kernels.ops.quantization.mxfp8_amd_gfx95 import (
-            dot_scaled_mxfp8_blockscaled_linear,
-        )
+    elif backend.is_unsupported():
+        return _unsupported_mxfp8_linear
 
-        return dot_scaled_mxfp8_blockscaled_linear
-    return _unsupported_mxfp8_linear
+    from sglang.kernels.ops.quantization.mxfp8_amd_gfx95 import (
+        dot_scaled_mxfp8_blockscaled_linear,
+    )
+
+    return dot_scaled_mxfp8_blockscaled_linear
 
 
 def _deepgemm_w8a8_mxfp8_linear_with_fallback(
