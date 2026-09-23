@@ -287,7 +287,7 @@ def register_fake_ops(tp_size: int):
 
     @register_cpu_compile_fake("apply_rotary_pos_emb_cpu")
     def _(query, key, cos, sin, unsqueeze_dim=1):
-        return torch.empty_like(query), torch.empty_like(key)
+        return query.new_empty(query.shape), key.new_empty(key.shape)
 
     @register_cpu_compile_fake("qkv_proj_with_rope_fused_weight")
     def _(

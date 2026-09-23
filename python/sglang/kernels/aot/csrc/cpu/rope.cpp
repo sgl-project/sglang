@@ -404,6 +404,10 @@ apply_rotary_pos_emb_cpu(at::Tensor& query, at::Tensor& key, at::Tensor& cos, at
   CHECK_EQ(key.dim(), ndim);
   CHECK_EQ(cos.dim(), ndim - 1);
   CHECK_EQ(sin.dim(), ndim - 1);
+  // negative unsqueeze_dim counts from the end of query, as in cos.unsqueeze(unsqueeze_dim)
+  if (unsqueeze_dim < 0) {
+    unsqueeze_dim += ndim;
+  }
   TORCH_CHECK(unsqueeze_dim >= 0 && unsqueeze_dim < ndim - 1, "invalid unsqueeze_dim ", unsqueeze_dim);
 
   const auto input_dtype = query.scalar_type();
