@@ -168,19 +168,27 @@ class TestNpuMlaDcpWrite(unittest.TestCase):
                     ),
                     patch.object(memory_pool_npu, "torch_npu", create=True) as npu,
                 ):
-                    memory_pool_npu.NPUMLATokenToKVPool.set_kv_buffer(
-                        pool, SimpleNamespace(layer_id=0), loc, cache_k, cache_v
-                    )
                     expected = (
                         loc
                         if dcp_size == 1
                         else torch.where(loc % dcp_size == rank, loc // dcp_size, 0)
                     )
-                    calls = npu.npu_scatter_nd_update_.call_args_list
-                    self.assertEqual(len(calls), 2)
-                    for call, values in zip(calls, (cache_k, cache_v)):
-                        torch.testing.assert_close(call.args[1], expected.view(-1, 1))
-                        torch.testing.assert_close(call.args[2], values)
+                    for k, v in (
+                        (cache_k, cache_v),
+                        (torch.cat((cache_k, cache_v), dim=-1), None),
+                    ):
+                        with self.subTest(combined_input=v is None):
+                            npu.reset_mock()
+                            memory_pool_npu.NPUMLATokenToKVPool.set_kv_buffer(
+                                pool, SimpleNamespace(layer_id=0), loc, k, v
+                            )
+                            calls = npu.npu_scatter_nd_update_.call_args_list
+                            self.assertEqual(len(calls), 2)
+                            for call, values in zip(calls, (cache_k, cache_v)):
+                                torch.testing.assert_close(
+                                    call.args[1], expected.view(-1, 1)
+                                )
+                                torch.testing.assert_close(call.args[2], values)
 
 
 class TestNpuDcpMetadata(unittest.TestCase):
