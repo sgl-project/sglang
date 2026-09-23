@@ -438,27 +438,21 @@ class CompressorAscendBackendMixin:
         pool = self.token_to_kv_pool
         state_pool = pool._get_state_pool(compressor.layer_id, compressor.is_in_indexer)
         state_cache = state_pool.state_cache_3d
-        if is_npu_arch35():
-            # A5 cache_mode=2 is CYCLE: one request bank per row.  The
-            # compressor derives the in-bank offset from start_pos; passing
-            # the A3 explicit [B, width] table here would be an ABI violation.
-            state_block_table = fm.dsv4_cycle_state_block_table
-        else:
-            table_cache = fm.dsv4_explicit_state_block_tables
-            if ratio not in table_cache:
-                table_cache[ratio] = _build_explicit_state_block_table(
-                    compress_ratio=ratio,
-                    coff=coff,
-                    state_pool=state_pool,
-                    token_to_kv_pool=pool,
-                    req_to_token=self.req_to_token,
-                    req_pool_indices=forward_batch.req_pool_indices,
-                    start_pos=fm.start_pos,
-                    cu_seqlens=fm.actual_seq_lengths_q_pa,
-                    seqused=fm.seqused,
-                    max_input_capacity=fm.dsv4_max_input_capacity,
-                )
-            state_block_table = table_cache[ratio]
+        table_cache = fm.dsv4_explicit_state_block_tables
+        if ratio not in table_cache:
+            table_cache[ratio] = _build_explicit_state_block_table(
+                compress_ratio=ratio,
+                coff=coff,
+                state_pool=state_pool,
+                token_to_kv_pool=pool,
+                req_to_token=self.req_to_token,
+                req_pool_indices=forward_batch.req_pool_indices,
+                start_pos=fm.start_pos,
+                cu_seqlens=fm.actual_seq_lengths_q_pa,
+                seqused=fm.seqused,
+                max_input_capacity=fm.dsv4_max_input_capacity,
+            )
+        state_block_table = table_cache[ratio]
 
         cos, sin = Dsv4NpuRoPE.for_freqs(
             compressor.freqs_cis, getattr(compressor, "rotary_emb", None)
@@ -469,10 +463,7 @@ class CompressorAscendBackendMixin:
             allow_build=False,
         )
 
-        # TODO: torch.ops.npu.compressor does not support Atlas A5 yet.
-        compressor_op = (
-            torch.ops.custom.compressor if is_npu_arch35() else torch.ops.npu.compressor
-        )
+        compressor_op = torch.ops.npu.compressor
         cmp_kv = compressor_op(
             x,
             compressor._fused_wkv_w,
