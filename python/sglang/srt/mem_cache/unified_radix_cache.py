@@ -355,7 +355,7 @@ class UnifiedRadixCache(BasePrefixCache):
                 data,
                 group_src=self.pp_rank - 1,
                 group=self.pp_group,
-                tag=P2PTag.HIRADIX_PP_SYNC,
+                tag=P2PTag.HICACHE_PP_SYNC,
             )
         if self.pp_rank + 1 < self.pp_size:
             copy_of_data = data.clone()
@@ -363,7 +363,7 @@ class UnifiedRadixCache(BasePrefixCache):
                 copy_of_data,
                 group_dst=self.pp_rank + 1,
                 group=self.pp_group,
-                tag=P2PTag.HIRADIX_PP_SYNC,
+                tag=P2PTag.HICACHE_PP_SYNC,
             )
             self.work_list.append(send_work)
 
@@ -1112,6 +1112,46 @@ class UnifiedRadixCache(BasePrefixCache):
                 self.session_refs.register_session_ref(req)
 
     @rank_consensus(same_params=["req.rid", "chunked"])
+    def advance_unpublished_req(self, req: Req, chunked: bool = False) -> None:
+        assert not self.supports_mamba()
+        token_ids = req.get_fill_ids()
+        kv_indices = self.req_to_token_pool.req_to_token[
+            req.kv.req_pool_idx, : len(token_ids)
+        ]
+        insert_params = InsertParams(
+            prev_prefix_len=req.kv.cache_protected_len,
+            chunked=chunked,
+            priority=getattr(req, "priority", 0) or 0,
+            rotation_base=req.kv_rotation_base,
+        )
+        effective_cache_len = len(token_ids)
+        for comp in self._components_tuple:
+            cache_len = comp.prepare_for_caching_req(
+                req=req,
+                insert_params=insert_params,
+                token_ids_len=len(token_ids),
+                is_finished=False,
+            )
+            if cache_len is not None:
+                effective_cache_len = min(effective_cache_len, cache_len)
+
+        radix_key = RadixKey(
+            token_ids[:effective_cache_len],
+            req.extra_key,
+            is_bigram=self.tree_core.is_eagle,
+            cache_salt=req.cache_salt,
+        )
+        if envs.SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS.get():
+            for comp in self._components_tuple:
+                comp.free_out_of_window_slots(req, len(radix_key) - 1, insert_params)
+
+        req.prefix_indices = kv_indices.to(dtype=torch.int64, copy=True)
+        for comp in self._components_tuple:
+            comp.cleanup_after_caching_req(
+                req, is_finished=False, insert_params=insert_params
+            )
+
+    @rank_consensus(same_params=["req.rid", "chunked"])
     def cache_unfinished_req(self, req: Req, chunked: bool = False, **kwargs) -> None:
         if self.session.try_cache_unfinished_req(req, chunked=chunked, **kwargs):
             return
@@ -1537,6 +1577,20 @@ class UnifiedRadixCache(BasePrefixCache):
         self.host_pool_group.release_transfers(backup.pool_transfers)
 
     # ---- HiCache: Backup / LoadBack ----
+
+    def backup_node_for_write_back(self, node_id: NodeId) -> bool:
+        """Synchronously back up one node (Full KV plus any unbacked component
+        state) and drain the ack -- the deferred-demote shape the eviction
+        loop runs for leaves, reusable by component evictors ahead of an
+        internal-state tombstone. Returns True once the backup is committed.
+        """
+        written = self._execute_and_commit_kv_backup(
+            BackupKV(node_ids=[node_id]), write_back=True
+        )
+        if written == 0:
+            return False
+        self.writing_check(write_back=True)
+        return True
 
     def _execute_and_commit_kv_backup(
         self, action: BackupKV, write_back: bool = False
@@ -3463,8 +3517,8 @@ class UnifiedRadixCache(BasePrefixCache):
     def is_load_back_event_done(self, consumer_index: int) -> bool:
         """Return True after the local load-back event is complete.
 
-        Mirrors ``HiRadixCache`` so the disagg decode restore state machine
-        (``DecodeHiCacheTransferMixin``) can gate on load-back completion; the
+        Lets the disagg decode restore state machine
+        (``DecodeHiCacheTransferMixin``) gate on load-back completion; the
         controller-level ``layer_done_counter`` event is shared across cache
         implementations, while the tree-side bookkeeping runs in
         ``loading_check``.
