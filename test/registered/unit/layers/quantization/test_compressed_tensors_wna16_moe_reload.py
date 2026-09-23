@@ -12,6 +12,9 @@ from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import
 from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsWNA16MoE,
 )
+from sglang.srt.model_executor.model_runner_components.weight_updater import (
+    WeightUpdater,
+)
 from sglang.srt.model_loader.loader import DefaultModelLoader
 from sglang.srt.runtime_context import get_context, get_flags, get_parallel
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -126,9 +129,21 @@ class TestWNA16MoEMarlinReload(CustomTestCase):
 
     @staticmethod
     def _refit(model, shards):
-        DefaultModelLoader.restore_weights_before_loading(model, DEVICE)
+        # the component the scheduler drives for each runner in a session
+        updater = WeightUpdater(
+            tp_rank=0,
+            device="cuda",
+            gpu_id=0,
+            model_config=None,
+            custom_weight_loaders={},
+            get_model=lambda: model,
+            update_model_fields=None,
+            recapture_cuda_graph=None,
+            get_model_runner=None,
+        )
+        updater.begin_weight_update()
         _load(model.experts, shards)
-        DefaultModelLoader.postprocess_weights(model, DEVICE)
+        updater.end_weight_update(run_post_load=False)
 
     def _assert_same_weights(self, model, expected):
         expected_params = dict(expected.named_parameters())

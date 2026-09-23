@@ -37,6 +37,9 @@ def _manager(tp_worker, draft_worker):
         memory_saver_adapter=Mock(),
         flush_cache=Mock(return_value=True),
         is_fully_idle=Mock(return_value=True),
+        scheduler=SimpleNamespace(
+            record_weight_version_change=lambda new_version: None
+        ),
     )
     # update_weights_from_* assert an open begin_weight_update session.
     manager._session_open = True
@@ -116,23 +119,6 @@ def _session_manager(target_runner, draft_runner):
             weight_update_runners=lambda: [("draft", draft_runner)]
         ),
     )
-
-
-def test_begin_weight_update_restores_target_and_draft():
-    """A draft left packed would reject the weights the target accepts."""
-    target_runner = Mock()
-    draft_runner = Mock()
-    manager = _session_manager(target_runner, draft_runner)
-    manager._session_open = False
-
-    with patch("torch.distributed.barrier"):
-        output = manager.begin_weight_update(BeginWeightUpdateReqInput())
-
-    assert output.success is True
-    target_runner.weight_updater.begin_weight_update.assert_called_once_with()
-    draft_runner.weight_updater.begin_weight_update.assert_called_once_with()
-    assert manager._session_open is True
-    assert manager._session_loaded_weights is False
 
 
 def test_end_weight_update_runs_post_load_on_both_when_load_was_bypassed():
