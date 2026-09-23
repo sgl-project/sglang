@@ -293,6 +293,14 @@ class TransformerLoader(OnlineQuantizationComponentLoader):
         dit_config.update_model_arch(config)
 
         cls_name = config.pop("_class_name")
+        override_cls_name = server_args.pipeline_config.transformer_class_override
+        if override_cls_name is not None and override_cls_name != cls_name:
+            logger.info(
+                "Overriding transformer class from %s to %s",
+                cls_name,
+                override_cls_name,
+            )
+            cls_name = override_cls_name
         model_cls, _ = ModelRegistry.resolve_model_cls(cls_name)
         is_minimax_h3 = model_cls.__name__ == "MiniMaxH3DiTModel"
         if is_minimax_h3:

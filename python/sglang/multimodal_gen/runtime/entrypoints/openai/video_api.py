@@ -513,14 +513,15 @@ async def create_video(
     # Parse model-specific multipart metadata before creating request-owned
     # directories or saving uploads, so malformed JSON leaves no resources.
     if is_multipart:
-        if not prompt:
+        sampling_params_cls = resolve_sampling_params_cls(server_args)
+        if not prompt and not sampling_params_cls.video_prompt_optional():
             raise HTTPException(status_code=400, detail="prompt is required")
         raw_form = await request.form()
         extra_from_form = _multipart_video_extras(
             raw_form,
             extra_body=extra_body,
             extra_params=extra_params,
-            sampling_params_cls=resolve_sampling_params_cls(server_args),
+            sampling_params_cls=sampling_params_cls,
         )
 
     # Resolve input upload directory (may be a temp dir when saving is disabled)
@@ -606,7 +607,9 @@ async def create_video(
         num_frames_val = form_value("num_frames", num_frames)
 
         req = VideoGenerationsRequest(
-            prompt=prompt,
+            # An empty multipart prompt arrives as None; models that opted out of
+            # the prompt requirement above still need a string here.
+            prompt=prompt or "",
             input_reference=input_path,
             video_path=form_value("video_path", video_input_path),
             video_url=form_value("video_url", video_url),
@@ -828,6 +831,21 @@ async def delete_video(video_id: str = Path(...)):
     return VideoResponse(**job)
 
 
+_ARTIFACT_MEDIA_TYPES = {
+    ".mp4": "video/mp4",
+    ".safetensors": "application/octet-stream",
+}
+
+
+def _select_lidar_artifact_path(job: dict, variant: str | None) -> str | None:
+    """A joint camera/LiDAR job's extra artifact, addressed by its ``lidar.files`` key."""
+    lidar = job.get("lidar")
+    if not variant or not isinstance(lidar, dict):
+        return None
+    files = lidar.get("files")
+    return files.get(variant) if isinstance(files, dict) else None
+
+
 def _select_video_variant_path(job: dict, variant: str | None) -> str | None:
     file_paths = job.get("file_paths")
     if file_paths:
@@ -857,7 +875,9 @@ async def download_video_content(
             detail=f"Video has been uploaded to cloud storage. Please use the cloud URL: {job.get('url')}",
         )
 
-    file_path = _select_video_variant_path(job, variant)
+    file_path = _select_lidar_artifact_path(job, variant) or _select_video_variant_path(
+        job, variant
+    )
     if job.get("status") not in {"completed", "failed"}:
         raise HTTPException(status_code=404, detail="Generation is still in-progress")
     if not file_path or not os.path.exists(file_path):
@@ -865,7 +885,9 @@ async def download_video_content(
             status_code=404, detail=f"Video variant {variant} not found"
         )
 
-    media_type = "video/mp4"  # default variant
+    media_type = _ARTIFACT_MEDIA_TYPES.get(
+        os.path.splitext(file_path)[1].lower(), "video/mp4"
+    )
     return FileResponse(
         path=file_path, media_type=media_type, filename=os.path.basename(file_path)
     )

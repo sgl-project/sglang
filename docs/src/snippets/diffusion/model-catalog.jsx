@@ -245,6 +245,21 @@ export const DiffusionModelCatalog = ({ category }) => {
       cookbook: "/cookbook/diffusion/Cosmos/Cosmos3",
     },
     {
+      name: "Cosmos-Dreams (Cosmos3-Interactive)",
+      modelIds: ["nvidia/Cosmos3-Nano-Sim-Bimanual"],
+      note: "Causal action-conditioned Cosmos3; local checkpoints are also detected by the CosmosDreamsPipeline class name.",
+    },
+    {
+      name: "Cosmos-Dreams-Transfer",
+      modelIds: ["nvidia/Cosmos3-Nano-Sim-Transfer"],
+      note: "Causal control-video (edge/blur/depth/seg) Cosmos3; local checkpoints are also detected by the CosmosDreamsTransferPipeline class name.",
+    },
+    {
+      name: "Cosmos3 Multiview-AV",
+      modelIds: ["nvidia/Cosmos3-Nano-Transfer-Auto"],
+      note: "11-camera WSM-to-RGB transfer in one pass with block-sparse cross-camera attention (single GPU or 2-GPU CFG parallel; no SP/TP); local checkpoints are also detected by the Cosmos3MultiviewPipeline class name.",
+    },
+    {
       name: "LingBotWorld",
       modelIds: [
         "IPostYellow/lingbot-world-fast-diffusers",
