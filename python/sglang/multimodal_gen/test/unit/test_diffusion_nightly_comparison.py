@@ -155,3 +155,109 @@ def test_dashboard_uses_historical_median_and_shows_server_breakdown():
     assert "| 3 | 2/3 | **10.40** |" in markdown
     assert "## SGLang Server-Side Breakdown" in markdown
     assert "| model | 10.00 | 0.10 | 9.80 | 0.10 | 196.00 |" in markdown
+
+
+comfyui = _load_script(
+    "diffusion_comfyui_adapter",
+    "scripts/ci/utils/diffusion/comfyui_adapter.py",
+)
+
+
+def _comfyui_case():
+    import json
+
+    config = json.loads(
+        (REPO_ROOT / "scripts/ci/utils/diffusion/comparison_configs.json").read_text()
+    )
+    for case in config["cases"]:
+        if "comfyui" in case.get("frameworks", {}):
+            return case
+    raise AssertionError("no committed case exercises the comfyui framework")
+
+
+def test_comfyui_workflow_renders_the_cases_sampling_parameters():
+    case = _comfyui_case()
+    fw_cfg = case["frameworks"]["comfyui"]
+
+    workflow = comfyui.render_workflow(case, fw_cfg, {"comfyui_ref_image": "ref.png"})
+
+    # Documentation keys would be read as nodes and rejected by the server.
+    assert all(not key.startswith("_") for key in workflow)
+
+    sampler = next(
+        node for node in workflow.values() if node["class_type"] == "KSampler"
+    )
+    assert sampler["inputs"]["seed"] == case["seed"]
+    assert sampler["inputs"]["steps"] == case["num_inference_steps"]
+    assert sampler["inputs"]["cfg"] == case["guidance_scale"]
+
+    latent = next(
+        node
+        for node in workflow.values()
+        if node["class_type"] == "MiniMaxH3ImageToVideo"
+    )
+    assert latent["inputs"]["width"] == case["width"]
+    assert latent["inputs"]["height"] == case["height"]
+    assert latent["inputs"]["length"] == case["num_frames"]
+
+
+def test_comfyui_workflow_validation_reports_the_servers_schema():
+    workflow = {
+        "1": {"class_type": "KSampler", "inputs": {"stpes": 20}},
+        "2": {"class_type": "NoSuchNode", "inputs": {}},
+    }
+    schema = {
+        "KSampler": {"input": {"required": {"steps": ["INT", {}], "seed": ["INT", {}]}}}
+    }
+
+    class _Resp:
+        status_code = 200
+
+        @staticmethod
+        def raise_for_status():
+            return None
+
+        @staticmethod
+        def json():
+            return schema
+
+    original_get = comfyui.requests.get
+    comfyui.requests.get = lambda *a, **k: _Resp()
+    try:
+        error = None
+        try:
+            comfyui.validate_workflow("http://127.0.0.1:8188", workflow)
+        except ValueError as exc:
+            error = str(exc)
+    finally:
+        comfyui.requests.get = original_get
+
+    assert error is not None
+    # A typo must name the accepted inputs, not just fail.
+    assert "unknown input 'stpes'" in error
+    assert "'seed', 'steps'" in error
+    assert "unknown class_type 'NoSuchNode'" in error
+
+
+def test_comfyui_launch_env_always_carries_the_host_memory_hook():
+    case = _comfyui_case()
+    fw_cfg = case["frameworks"]["comfyui"]
+
+    env = comfyui.launch_env(fw_cfg)
+
+    assert str(comfyui.HOOK_DIR) in env["PYTHONPATH"]
+    # The cap itself is what makes the comparison symmetric.
+    assert env["COMFY_FORCE_HOST_GIB"] == fw_cfg["extra_env"]["COMFY_FORCE_HOST_GIB"]
+
+
+def test_comfyui_parity_flags_are_reported_when_missing():
+    assert comfyui.describe_parity({"serve_args": "--fast-disk"}) == [
+        "--bf16-text-enc",
+        "--bf16-unet",
+    ]
+    assert (
+        comfyui.describe_parity(
+            {"serve_args": "--fast-disk --bf16-text-enc --bf16-unet"}
+        )
+        == []
+    )

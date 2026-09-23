@@ -821,7 +821,12 @@ def run_single(
     print(f"\n  Command: {' '.join(cmd)}")
 
     env = os.environ.copy()
-    env.update(fw_cfg.get("extra_env", {}))
+    if framework == "comfyui":
+        # Includes the bundled host-memory hook, so the parity guarantee does
+        # not depend on remembering to set PYTHONPATH.
+        env.update(comfyui_adapter.launch_env(fw_cfg))
+    else:
+        env.update(fw_cfg.get("extra_env", {}))
 
     log_file = log_dir / f"{case['id']}_{framework}.log"
     log_fh = open(log_file, "w", encoding="utf-8", buffering=1)

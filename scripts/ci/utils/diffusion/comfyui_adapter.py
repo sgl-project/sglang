@@ -29,8 +29,34 @@ from typing import Any
 import requests
 
 WORKFLOWS_DIR = Path(__file__).parent / "comfyui_workflows"
+HOOK_DIR = Path(__file__).parent / "comfyui_hook"
 HEALTH_ENDPOINT = "/system_stats"
 POLL_INTERVAL_S = 1.0
+
+
+def launch_env(fw_cfg: dict) -> dict[str, str]:
+    """Environment additions for a ComfyUI launch.
+
+    The host-memory hook ships with the harness and is put on PYTHONPATH here
+    rather than configured per machine: forgetting it does not fail, it just
+    quietly turns the run into a comparison against ComfyUI's behaviour on a
+    larger machine than the one under test.
+    """
+    env = {
+        "PYTHONPATH": os.pathsep.join(
+            [str(HOOK_DIR)]
+            + ([os.environ["PYTHONPATH"]] if os.environ.get("PYTHONPATH") else [])
+        )
+    }
+    for key, value in (fw_cfg.get("extra_env") or {}).items():
+        if key == "PYTHONPATH":
+            # Config-supplied entries extend the hook path, never replace it.
+            expanded = os.path.expandvars(value)
+            if expanded and "$" not in expanded:
+                env["PYTHONPATH"] = os.pathsep.join([env["PYTHONPATH"], expanded])
+            continue
+        env[key] = os.path.expandvars(str(value))
+    return env
 
 
 def build_launch_cmd(fw_cfg: dict, port: int, host: str) -> list[str]:

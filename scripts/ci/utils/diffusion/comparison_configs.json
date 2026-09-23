@@ -258,7 +258,6 @@
         },
         "comfyui": {
           "extra_env": {
-            "PYTHONPATH": "${COMFY_HOOK_DIR}",
             "COMFY_FORCE_HOST_GIB": "60"
           },
           "comfy_root": "${COMFY_ROOT}",
