@@ -93,7 +93,7 @@ class TestFlashInferGDNPrefillBackendPolicy(CustomTestCase):
         return backend, nominal_capability
 
     def test_mis_requires_triton_prefill_backend(self):
-        make_runner(self, enable_mis=True)
+        runner = make_runner(self, enable_mis=True)
         with self.assertRaisesRegex(ValueError, "Triton linear-attention prefill"):
             validate_gdn_mis_backend(LinearAttnKernelBackend.FLASHINFER)
 
@@ -273,8 +273,7 @@ class TestFlashInferGDNPrefillBackendPolicy(CustomTestCase):
         backend = object.__new__(GDNAttnBackend)
         backend.device = "cpu"
         backend.kernel_dispatcher = SimpleNamespace(
-            extend_uses_state_checkpoints=True,
-            needs_prefill_metadata=False,
+            extend_uses_state_checkpoints=True, extend_kernel=None
         )
         metadata = SimpleNamespace(has_mamba_track_mask=True, track_ssm_h_src=None)
         forward_batch = SimpleNamespace(
@@ -394,19 +393,13 @@ class TestFlashInferGDNPrefillBackendPolicy(CustomTestCase):
                 with self.assertRaisesRegex(ValueError, "supports prefill only"):
                     _validate_gdn_linear_attn_backends(backends)
 
-    def test_flydsl_prefill_requires_gfx95(self):
-        with (
-            patch.object(gdn_backend, "is_gfx95_supported", return_value=False),
-            self.assertRaisesRegex(ValueError, "requires AMD gfx95"),
-        ):
-            GDNKernelDispatcher(
-                LinearAttnKernelBackend.TRITON,
-                LinearAttnKernelBackend.FLYDSL,
-            )
+    def test_flydsl_prefill_dispatch_requires_gfx95(self):
+        backends = (LinearAttnKernelBackend.TRITON, LinearAttnKernelBackend.FLYDSL)
+        with patch.object(gdn_backend, "is_gfx95_supported", return_value=False):
+            with self.assertRaisesRegex(ValueError, "requires AMD gfx95"):
+                GDNKernelDispatcher(*backends)
 
-    def test_flydsl_prefill_dispatches_metadata_builder(self):
         flydsl_kernel = MagicMock(spec=FlyDSLGDNKernel)
-        flydsl_kernel.build_prefill_metadata.return_value = sentinel.metadata
         with (
             patch.object(gdn_backend, "is_gfx95_supported", return_value=True),
             patch(
@@ -414,27 +407,12 @@ class TestFlashInferGDNPrefillBackendPolicy(CustomTestCase):
                 return_value=flydsl_kernel,
             ),
         ):
-            dispatcher = GDNKernelDispatcher(
-                LinearAttnKernelBackend.TRITON,
-                LinearAttnKernelBackend.FLYDSL,
-            )
+            self.assertIs(GDNKernelDispatcher(*backends).extend_kernel, flydsl_kernel)
 
-        result = dispatcher.build_prefill_metadata(
-            [63, 65],
-            cu_seqlens=sentinel.cu_seqlens,
-        )
-        self.assertIs(dispatcher.extend_kernel, flydsl_kernel)
-        self.assertIs(result, sentinel.metadata)
-        flydsl_kernel.build_prefill_metadata.assert_called_once_with(
-            [63, 65],
-            cu_seqlens=sentinel.cu_seqlens,
-        )
-
-    def test_flydsl_wrapper_uses_full_aiter_pipeline(self):
+    def test_flydsl_wrapper_returns_chunk_states(self):
         kernel = object.__new__(FlyDSLGDNKernel)
-        kernel._prefill_fn = MagicMock(
-            return_value=(sentinel.output, sentinel.final_state)
-        )
+        kernel._prefill_fn = MagicMock(return_value=(sentinel.output, sentinel.h))
+        kernel._prepare_supported = MagicMock(return_value=True)
         q = torch.empty(1, 1, 1, 128, dtype=torch.bfloat16)
         v = torch.empty_like(q)
         g = torch.empty(1, 1, 1, dtype=torch.float32)
@@ -457,17 +435,33 @@ class TestFlashInferGDNPrefillBackendPolicy(CustomTestCase):
 
         self.assertIs(output, sentinel.output)
         self.assertIsNone(final_state)
-        self.assertIsNone(chunk_states)
+        self.assertIs(chunk_states, sentinel.h)
         call = kernel._prefill_fn.call_args.kwargs
-        self.assertIs(call["initial_state"], state)
+        self.assertIs(call["ssm_states"], state)
         torch.testing.assert_close(
-            call["initial_state_indices"], torch.tensor([2], dtype=torch.int32)
+            call["cache_indices"], torch.tensor([2], dtype=torch.int32)
         )
+        self.assertIs(call["cu_seqlens"], cu_seqlens)
         self.assertIs(call["prefill_metadata"], sentinel.metadata)
         self.assertIs(call["o"], sentinel.output_buffer)
-        self.assertTrue(call["use_prepare_flydsl"])
-        self.assertTrue(call["use_chunk_flydsl"])
-        self.assertTrue(call["inplace_final_state"])
+
+        def run_layer(metadata):
+            kernel.extend(
+                q,
+                q,
+                v,
+                g,
+                g,
+                ssm_states=state,
+                cache_indices=indices,
+                query_start_loc=cu_seqlens,
+                prefill_metadata=metadata,
+            )
+            return kernel._prefill_fn.call_args.kwargs["cache_indices"]
+
+        # Later layers of the same batch reuse the remapped indices.
+        self.assertIs(run_layer(sentinel.metadata), call["cache_indices"])
+        self.assertIsNot(run_layer(sentinel.next_metadata), call["cache_indices"])
 
     def test_flydsl_without_metadata_falls_back_to_triton(self):
         kernel = object.__new__(FlyDSLGDNKernel)

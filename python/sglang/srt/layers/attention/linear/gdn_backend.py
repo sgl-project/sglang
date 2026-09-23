@@ -384,9 +384,6 @@ class GDNKernelDispatcher:
         self.supports_packed_decode = getattr(
             self.decode_kernel, "supports_packed_decode", False
         )
-        self._prefill_metadata_builder = getattr(
-            self.extend_kernel, "build_prefill_metadata", None
-        )
 
         rank0_log(
             f"GDN kernel dispatcher: decode={self.decode_kernel.__class__.__name__}, "
@@ -398,17 +395,6 @@ class GDNKernelDispatcher:
     @property
     def extend_uses_state_checkpoints(self) -> bool:
         return self.extend_kernel.uses_state_checkpoints
-
-    @property
-    def needs_prefill_metadata(self) -> bool:
-        return self._prefill_metadata_builder is not None
-
-    def build_prefill_metadata(self, seq_lens_cpu, *, cu_seqlens):
-        assert self._prefill_metadata_builder is not None
-        return self._prefill_metadata_builder(
-            seq_lens_cpu,
-            cu_seqlens=cu_seqlens,
-        )
 
     def packed_decode(
         self,
@@ -586,8 +572,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
         forward_batch: ForwardBatch,
         in_capture: bool = False,
     ):
-        # Graph replay must not reuse a schedule built for an earlier eager
-        # batch, so drop it on the way out.
+        # Graph replay must not reuse an eager batch's schedule.
         self.kernel_prefill_metadata = None
         super().init_forward_metadata_out_graph(forward_batch, in_capture=in_capture)
         self._init_target_verify_qkv_routing(forward_batch)
@@ -597,22 +582,19 @@ class GDNAttnBackend(MambaAttnBackendBase):
         self._init_target_verify_qkv_routing(forward_batch)
         self.mis_metadata = None
         self.kernel_prefill_metadata = None
+        build = getattr(
+            self.kernel_dispatcher.extend_kernel, "build_prefill_metadata", None
+        )
         if (
-            self.kernel_dispatcher.needs_prefill_metadata
+            build is not None
             and forward_batch.forward_mode.is_extend()
             and not forward_batch.forward_mode.is_target_verify()
             and not forward_batch.forward_mode.is_mixed()
             and forward_batch.extend_seq_lens_cpu is not None
-            and not self.forward_metadata.has_mamba_track_mask
         ):
-            seq_lens_cpu = forward_batch.extend_seq_lens_cpu
-            if isinstance(seq_lens_cpu, torch.Tensor):
-                seq_lens_cpu = seq_lens_cpu.tolist()
-            self.kernel_prefill_metadata = (
-                self.kernel_dispatcher.build_prefill_metadata(
-                    [int(seq_len) for seq_len in seq_lens_cpu],
-                    cu_seqlens=self.forward_metadata.query_start_loc,
-                )
+            self.kernel_prefill_metadata = build(
+                forward_batch.extend_seq_lens_cpu,
+                cu_seqlens=self.forward_metadata.query_start_loc,
             )
         if forward_batch.multi_item_delimiter_indices is not None:
             if not self.enable_mis:
