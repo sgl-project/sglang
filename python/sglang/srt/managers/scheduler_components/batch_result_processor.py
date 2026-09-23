@@ -126,7 +126,7 @@ class SchedulerBatchResultProcessor:
         skip accounting already performed before retraction.
         """
         cache_only_rebootstrap = bool(
-            batch.dsv41_cache_only_replay
+            getattr(batch, "dsv41_cache_only_replay", False)
             and getattr(req, "pd_rebootstrap_in_progress", False)
         )
         replayed_boundary = bool(

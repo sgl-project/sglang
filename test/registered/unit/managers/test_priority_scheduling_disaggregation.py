@@ -918,7 +918,9 @@ class TestDecodePrebuilt(unittest.TestCase):
                 req.dsv41_cache_only_replay = True
                 req.dsv41_cache_only_coverage = prompt_len
                 req.origin_input_ids = list(range(prompt_len))
+                req.full_untruncated_fill_ids = list(range(prompt_len))
                 req.kv.req_pool_idx = 0
+                req.kv.kv_committed_len = prompt_len
                 scheduler.waiting_queue = [req]
                 scheduler.running_batch.is_empty.return_value = True
                 scheduler.req_to_token_pool.req_to_token = torch.arange(
@@ -951,14 +953,51 @@ class TestDecodePrebuilt(unittest.TestCase):
         req.dsv41_cache_only_replay = True
         req.dsv41_cache_only_coverage = 255
         req.origin_input_ids = list(range(256))
+        req.full_untruncated_fill_ids = list(range(256))
         req.kv.req_pool_idx = 0
+        req.kv.kv_committed_len = 256
         scheduler.waiting_queue = [req]
         scheduler.running_batch.is_empty.return_value = True
 
-        with self.assertRaisesRegex(RuntimeError, "explicit full-prompt coverage"):
+        with self.assertRaisesRegex(RuntimeError, "explicit full-sequence coverage"):
             SchedulerDisaggregationDecodeMixin.get_new_prebuilt_batch(
                 scheduler, scheduler.running_batch
             )
+
+    def test_cache_only_rebootstrap_replays_generated_prefix_tail(self):
+        scheduler = self._new_scheduler(enable_overlap=False)
+        prompt_len, generated_len = 200, 20
+        coverage = prompt_len + generated_len
+        req = MagicMock(rid="rebootstrap")
+        req.dsv41_cache_only_replay = True
+        req.dsv41_cache_only_coverage = coverage
+        req.origin_input_ids = list(range(prompt_len))
+        req.output_ids = list(range(generated_len))
+        req.full_untruncated_fill_ids = req.origin_input_ids + req.output_ids
+        req.kv.req_pool_idx = 0
+        req.kv.kv_committed_len = coverage
+        scheduler.waiting_queue = [req]
+        scheduler.running_batch.is_empty.return_value = True
+        scheduler.req_to_token_pool.req_to_token = torch.arange(
+            512, dtype=torch.int32
+        ).reshape(1, 512)
+
+        new_batch = MagicMock()
+        with patch(
+            "sglang.srt.disaggregation.decode.ScheduleBatch.init_new",
+            return_value=new_batch,
+        ):
+            ret = SchedulerDisaggregationDecodeMixin.get_new_prebuilt_batch(
+                scheduler, scheduler.running_batch
+            )
+
+        start = coverage - 128
+        req.set_extend_range.assert_called_once_with(start, coverage)
+        self.assertTrue(
+            torch.equal(req.prefix_indices, torch.arange(start, dtype=torch.int32))
+        )
+        self.assertIs(ret, new_batch)
+        new_batch.prepare_for_extend.assert_called_once()
 
     def test_overlap_waits_for_forward_before_processing_prebuilt(self):
         scheduler = self._new_scheduler(enable_overlap=True)

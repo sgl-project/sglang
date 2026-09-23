@@ -44,6 +44,7 @@ class _Req:
         self.extend_range = None
         self.time_stats = SimpleNamespace(
             set_prefill_finished_time=Mock(),
+            set_prefill_transfer_queue_entry_time=Mock(),
             set_last_chunked_prefill_finish_time=Mock(),
             set_completion_time=Mock(),
         )
