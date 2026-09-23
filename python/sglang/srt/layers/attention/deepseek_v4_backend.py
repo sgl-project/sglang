@@ -3732,8 +3732,8 @@ class DeepseekV4AttnBackend(
 
             swa_kv_page_size = token_to_kv_pool.swa_kv_pool.page_size
             assert swa_k_cache.ndim == 2
-            # The kernel detects each cache's format from the last dim of this
-            # view: 584 (V4), 528 (V4.1 fp8) or 288 (V4.1 fp4, extra cache only).
+            # V4.1's 528-byte rows need an explicit format at the kernel call;
+            # their shape also matches V3.2 without RoPE.
             k_cache_total_dim = token_to_kv_pool.get_swa_key_bytes_per_token()
             swa_k_cache = swa_k_cache[:, : swa_kv_page_size * k_cache_total_dim].view(
                 swa_k_cache.shape[0], swa_kv_page_size, 1, k_cache_total_dim
@@ -3923,6 +3923,11 @@ class DeepseekV4AttnBackend(
                     extra_k_cache=extra_k_cache,
                     extra_indices_in_kvcache=extra_indices,
                     extra_topk_length=extra_topk_lengths,
+                    **(
+                        {"kv_format": "V41"}
+                        if token_to_kv_pool.get_swa_key_layout() is KVLayout.V41
+                        else {}
+                    ),
                 )[0]
 
             o = o.squeeze(1)

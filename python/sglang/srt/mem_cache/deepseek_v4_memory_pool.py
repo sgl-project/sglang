@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import logging
 from contextlib import nullcontext
 from typing import List, Literal, NamedTuple, Optional, Sequence, Tuple, Union
@@ -126,13 +127,12 @@ def resolve_compressed_kv_layout(
 
 
 def flashmla_supports_v41_kv_layouts() -> bool:
-    """Whether the installed FlashMLA decode kernel reads the V41 / V41_FP4
-    formats; its docstring lists the bytes-per-token it detects."""
+    """Whether the installed FlashMLA API can explicitly select V4.1 KV formats."""
     try:
         from sgl_kernel.flash_mla import flash_mla_with_kvcache
     except Exception:
         return False
-    return "528" in (flash_mla_with_kvcache.__doc__ or "")
+    return "kv_format" in inspect.signature(flash_mla_with_kvcache).parameters
 
 
 def select_dsv4_kv_layout() -> Tuple[KVLayout, Optional[str]]:

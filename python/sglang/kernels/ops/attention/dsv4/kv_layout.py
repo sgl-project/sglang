@@ -1,10 +1,11 @@
 """Paged fp8 / fp4 KV cache layouts of the DeepSeek-V4 family sparse MLA decode kernels.
 
 A page block stores ``page_size`` data rows followed by ``page_size`` scale rows.
-The reader selects the format from the bytes per token (the last dim of the
-``(num_pages, page_size, 1, bytes_per_token)`` view) and requires the page
-stride to be a multiple of its TMA row stride, which :meth:`KVLayout.page_bytes`
-pads to. Mirrors ``sgl_kernel/deepseek_v4/kv_layout.cuh``.
+The reader uses the bytes per token (the last dim of the
+``(num_pages, page_size, 1, bytes_per_token)`` view) and an explicit V41 format
+selector to distinguish layouts. The page stride must be a multiple of its
+TMA row stride, which :meth:`KVLayout.page_bytes` pads to.
+Mirrors ``sgl_kernel/deepseek_v4/kv_layout.cuh``.
 """
 
 from __future__ import annotations

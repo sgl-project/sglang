@@ -103,6 +103,7 @@ def flash_mla_with_kvcache(
     extra_indices_in_kvcache: Optional[torch.Tensor] = None,
     topk_length: Optional[torch.Tensor] = None,
     extra_topk_length: Optional[torch.Tensor] = None,
+    kv_format: Optional[str] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Arguments:
@@ -118,6 +119,7 @@ def flash_mla_with_kvcache(
         descale_q: (batch_size), torch.float32. Descaling factors for Q, used for fp8 quantization.
         descale_k: (batch_size), torch.float32. Descaling factors for K, used for fp8 quantization.
         is_fp8_kvcache: bool. Whether the k_cache and v_cache are in fp8 format. For the format of FP8 KV cache, please refer to README.md
+        kv_format: Explicit sparse KV format. V41 requires this because its 528-byte rows share the shape of V32_NO_ROPE.
         indices: (batch_size, seq_len_q, topk), torch.int32. If not None, sparse attention will be enabled, and only tokens in the `indices` array will be attended to. Invalid indices should be set to -1 or numbers >= total_seq_len_kv. For details about how to set up `indices`, please refer to README.md.
 
     Returns:
@@ -126,6 +128,11 @@ def flash_mla_with_kvcache(
     """
     if _flashmla_import_error is not None:
         raise _IMPORT_ERROR from _flashmla_import_error
+
+    if kv_format is not None and (
+        not isinstance(tile_scheduler_metadata, FlashMLASchedMeta) or indices is None
+    ):
+        raise ValueError("kv_format requires sparse attention with FlashMLASchedMeta")
 
     if softmax_scale is None:
         softmax_scale = q.shape[-1] ** (-0.5)
@@ -147,6 +154,7 @@ def flash_mla_with_kvcache(
             extra_indices_in_kvcache=extra_indices_in_kvcache,
             topk_length=topk_length,
             extra_topk_length=extra_topk_length,
+            kv_format=kv_format,
         )
 
     assert num_splits is not None
@@ -216,6 +224,7 @@ def _flash_mla_with_kvcache_sched_meta(
     extra_indices_in_kvcache: Optional[torch.Tensor],
     topk_length: Optional[torch.Tensor],
     extra_topk_length: Optional[torch.Tensor],
+    kv_format: Optional[str] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     assert num_splits is None, "num_splits must be None with FlashMLASchedMeta"
 
@@ -279,6 +288,7 @@ def _flash_mla_with_kvcache_sched_meta(
                 extra_topk_length,
                 head_dim_v,
                 softmax_scale,
+                kv_format,
             )
         )
     else:
