@@ -27,7 +27,8 @@ class SageAttentionBackend(AttentionBackend):
 
     @staticmethod
     def get_supported_head_sizes() -> list[int]:
-        return [32, 64, 96, 128, 160, 192, 224, 256]
+        # sageattn asserts `headdim in [64, 96, 128]` (SageAttention 1.x and 2.x)
+        return [64, 96, 128]
 
     @staticmethod
     def get_enum() -> AttentionBackendEnum:
