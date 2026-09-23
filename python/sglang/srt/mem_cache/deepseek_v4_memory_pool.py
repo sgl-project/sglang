@@ -61,15 +61,8 @@ def get_compress_state_ring_size(
         return 1
     if is_speculative:
         return 16 if compress_ratio == 4 else 256
-    if compress_ratio == 4:
-        # A5's fused c4 compressor only preserves ring rows beyond one window
-        # (pad = ring - coff*cmpRatio + 2) when ring exceeds the window; at
-        # ring == window == 8 pad collapses to 0 and a chunk's own writes
-        # clobber the history the next chunk still has to read.
-        from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
-
-        return 16 if is_npu_arch35() else 8
-    return 128
+    else:
+        return 8 if compress_ratio == 4 else 128
 
 
 def get_compress_state_write_pad(compress_ratio: int, ring_size: int) -> int:
