@@ -14,6 +14,7 @@
 #include <array>
 #include <cstdint>
 #include <optional>
+#include <type_traits>
 #include <utility>
 
 namespace sglang {
@@ -120,7 +121,7 @@ __global__ __launch_bounds__(K / kVecSize) void gemm_ag_gemv_kernel(
   PDLTriggerSecondary<kUsePDL>();
 }
 
-// Consumer: Lamport spin + add3, one 16B vector (8 bf16) per thread.
+// Consumer: Lamport spin + BF16 add3 or FP32 gather, one 16B vector per thread.
 
 struct ConsumerParams {
   uint8_t* ws_local;      // LOCAL VA of the push workspace base (poll + reset)
@@ -129,21 +130,23 @@ struct ConsumerParams {
   uint32_t half_bytes;    // bytes per phase half (world_size * slot_bytes)
   const bf16_t* b;        // [M, N]
   const bf16_t* c;        // may be null
-  bf16_t* out;            // [M, N]
+  void* out;              // [M, N], bf16 add3 or float gather
   uint32_t num_rows;      // M
 };
 
-template <uint32_t N, bool kHasC, bool kUsePDL>
+template <uint32_t N, bool kHasC, bool kUsePDL, bool kFP32 = false>
 __global__ void spin_add3_kernel(const __grid_constant__ ConsumerParams params) {
   using namespace device;
-  using vec_t = AlignedVector<bf16x2_t, kSpinVec / 2>;  // 8 bf16 as 4 pairs
+  constexpr uint32_t kSpinVec = kFP32 ? 4 : 8;
+  using output_t = std::conditional_t<kFP32, float, bf16_t>;
+  using vec_t = std::conditional_t<kFP32, AlignedVector<float, 4>, AlignedVector<bf16x2_t, 4>>;
   constexpr uint32_t kNLocal = N / kWorld;
   static_assert(N % kSpinVec == 0, "rows must stay 16B aligned");
   static_assert(kNLocal % kSpinVec == 0, "a vector must never cross a rank block");
   const auto bx = blockIdx.x;
   const auto tx = threadIdx.x;
   const uint32_t tid = bx * kSpinBlock + tx;
-  const uint32_t elem = tid * kSpinVec;  // first bf16 of this thread's vector
+  const uint32_t elem = tid * kSpinVec;  // first element of this thread's vector
   const uint32_t phase = params.counter[bx].get() & 1;
 
   PDLTriggerSecondary<kUsePDL>();
@@ -165,25 +168,30 @@ __global__ void spin_add3_kernel(const __grid_constant__ ConsumerParams params) 
     const auto col = elem % N;
     // out[row, col] lives at half[col / kNLocal][row][col % kNLocal] of the
     // dense [world][M][N / world] prefix of the current phase half
-    const auto base = reinterpret_cast<bf16_t*>(params.ws_local + phase * params.half_bytes);
+    const auto base = reinterpret_cast<output_t*>(params.ws_local + phase * params.half_bytes);
     const auto src = base + ((col / kNLocal) * params.num_rows + row) * kNLocal + col % kNLocal;
     vec_t b_vec, c_vec;
-    b_vec.load(params.b + elem);
-    if constexpr (kHasC) c_vec.load(params.c + elem);
-    // spin until all 4 packed pairs of the vector have landed
+    if constexpr (!kFP32) {
+      b_vec.load(params.b + elem);
+      if constexpr (kHasC) c_vec.load(params.c + elem);
+    }
     uint4 raw;
     do {
       ptx::ld_relaxed_16B(raw, src, 0);
     } while (raw.x == 0 || raw.y == 0 || raw.z == 0 || raw.w == 0);
     const auto& gathered = *reinterpret_cast<const vec_t*>(&raw);
-    vec_t out_vec;
+    if constexpr (kFP32) {
+      gathered.store(static_cast<float*>(params.out) + elem);
+    } else {
+      vec_t out_vec;
 #pragma unroll
-    for (uint32_t j = 0; j < kSpinVec / 2; ++j) {
-      using Trait = DTypeTrait<bf16x2_t>;
-      out_vec[j] = Trait::add(gathered[j], b_vec[j]);
-      if constexpr (kHasC) out_vec[j] = Trait::add(out_vec[j], c_vec[j]);
+      for (uint32_t j = 0; j < kSpinVec / 2; ++j) {
+        using Trait = DTypeTrait<bf16x2_t>;
+        out_vec[j] = Trait::add(gathered[j], b_vec[j]);
+        if constexpr (kHasC) out_vec[j] = Trait::add(out_vec[j], c_vec[j]);
+      }
+      out_vec.store(static_cast<bf16_t*>(params.out) + elem);
     }
-    out_vec.store(params.out + elem);
     AlignedVector<uint32_t, 4> zero;
     zero.fill(0);
     zero.store(src);

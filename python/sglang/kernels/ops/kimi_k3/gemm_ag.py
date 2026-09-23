@@ -41,6 +41,28 @@ MAX_TOKENS = 12
 
 
 @cache_once
+def _front_gather_module() -> Module:
+    return load_jit(
+        "k3_front_gather",
+        cuda_files=["kimi_k3/comm/front_gather.cuh"],
+        cuda_wrappers=[("run", "front_gather::Gather::run")],
+        extra_cuda_cflags=["-O3"],
+    )
+
+
+@register_custom_op(mutates_args=["out"])
+def _front_gather_op(world_size: int, front: torch.Tensor, out: torch.Tensor) -> None:
+    _front_gather_module().run(_COMM_MAP[world_size], front, out)
+
+
+def gather_front_latent(world_size: int, front: torch.Tensor) -> torch.Tensor:
+    """Assemble TP8 latent columns; serialized with the communicator's push ops."""
+    out = front.new_empty((front.shape[0], K))
+    _front_gather_op(world_size, front, out)
+    return out
+
+
+@cache_once
 def _jit_module() -> Module:
     args = make_cpp_args(K, N, MAX_TOKENS, is_arch_support_pdl())
     cls = f"GEMMAGKernel<{args}>"

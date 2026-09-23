@@ -333,6 +333,24 @@ def gemm_ag_up_fits(num_tokens: int) -> bool:
     )
 
 
+def front_gather_fits(num_tokens: int) -> bool:
+    state = _get_state()
+    return (
+        state is not None
+        and state.world_size == 8
+        and num_tokens in (8, 16)
+        and num_tokens * 448 * 4 <= state.comm.max_push_size
+        and (num_tokens * NORM_DIM + 511) // 512 + 1
+        <= state.comm.config.num_push_blocks
+    )
+
+
+def gather_front_latent(front: torch.Tensor) -> torch.Tensor:
+    from sglang.kernels.ops.kimi_k3.gemm_ag import gather_front_latent
+
+    return gather_front_latent(_get_state().world_size, front)
+
+
 def gemm_ag_up_proj(
     x: torch.Tensor,
     weight: torch.Tensor,

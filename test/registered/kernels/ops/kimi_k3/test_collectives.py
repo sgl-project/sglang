@@ -114,6 +114,46 @@ def _symmetric_tensor(shape):
 
 
 @torch.inference_mode()
+def test_front_gather_push_interleaving():
+    _require_sm100()
+    if int(os.environ["WORLD_SIZE"]) != 8:
+        pytest.skip("K3 front gather requires TP8")
+    comm = _init_comm()
+    rank = dist.get_rank()
+    fronts = [torch.zeros(m, 2880, device=_device()) for m in (8, 16)]
+    expected = [
+        torch.arange(m * 3584, device=_device()).float().view(m, 3584) for m in (8, 16)
+    ]
+    reduced = torch.empty(7168, device=_device(), dtype=torch.bfloat16)
+    residual = torch.zeros_like(reduced)
+
+    def run():
+        outputs = []
+        for front in fronts:
+            outputs.append(gemm_ag.gather_front_latent(8, front))
+            reduced.fill_(rank + 1)
+            all_reduce.all_reduce_push_res(8, reduced, residual)
+        return outputs
+
+    run()  # JIT before capture.
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        outputs = run()
+    for step in range(32):
+        scale = (0, 1, -1)[step % 3]
+        for front, ref in zip(fronts, expected):
+            front[:, 2432:].copy_(ref[:, rank * 448 : (rank + 1) * 448] * scale)
+        graph.replay()
+        for out, ref in zip(outputs, expected):
+            torch.testing.assert_close(out, ref * scale, rtol=0, atol=0)
+        torch.testing.assert_close(
+            reduced, torch.full_like(reduced, 36), rtol=0, atol=0
+        )
+    del graph
+
+
+@torch.inference_mode()
 def test_all_reduce_push():
     _require_sm100()
     comm = _init_comm()
