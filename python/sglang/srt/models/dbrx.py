@@ -97,6 +97,7 @@ class DbrxExperts(nn.Module):
     def __init__(
         self,
         config: DbrxConfig,
+        layer_id: int,
         quant_config: Optional[QuantizationConfig] = None,
         params_dtype: Optional[torch.dtype] = None,
         prefix: str = "",
@@ -115,6 +116,7 @@ class DbrxExperts(nn.Module):
         self.router = DbrxRouter(config, self.params_dtype)
         self.topk = TopK(
             self.top_k,
+            layer_id=layer_id,
             renormalize=True,
         )
         self.moe_runner_config = MoeRunnerConfig(inplace=True)
@@ -336,7 +338,7 @@ class DbrxBlock(nn.Module):
             quant_config=quant_config,
             prefix=add_prefix("norm_attn_norm", prefix),
         )
-        self.ffn = DbrxExperts(config, quant_config=quant_config)
+        self.ffn = DbrxExperts(config, layer_id, quant_config=quant_config)
 
     def forward(
         self,
