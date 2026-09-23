@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import logging
-from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import (
     TYPE_CHECKING,
@@ -343,7 +342,10 @@ class DeepseekSparseAttnBackend(
         self.needs_cpu_seq_lens = self.dsa_index_kpool > 1
         self._init_kpool_metadata_fusion()
         self.max_context_len = model_runner.model_config.context_len
-        self.enable_memory_saver = model_runner.server_args.enable_memory_saver
+        self._memory_saver_adapter = TorchMemorySaverAdapter.create(
+            enable=get_exec().features.enable_memory_saver
+            and envs.SGLANG_MEMORY_SAVER_CUDA_GRAPH.get()
+        )
         self.num_q_heads = (
             model_runner.model_config.num_attention_heads // get_parallel().attn_tp_size
         )
@@ -1225,16 +1227,6 @@ class DeepseekSparseAttnBackend(
             token_to_batch_idx = split_per_token(token_to_batch_idx)
         return (ks, ke), token_to_batch_idx
 
-    def _cuda_graph_memory_region(self):
-        """Region whose tensors are released while the engine is paused."""
-        adapter = TorchMemorySaverAdapter.create(
-            enable=self.enable_memory_saver
-            and envs.SGLANG_MEMORY_SAVER_CUDA_GRAPH.get()
-        )
-        if not adapter.enabled:
-            return nullcontext()
-        return adapter.region(tag=GPU_MEMORY_TYPE_CUDA_GRAPH)
-
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
         """Initialize CUDA graph state for the attention backend.
 
@@ -1276,7 +1268,7 @@ class DeepseekSparseAttnBackend(
         # flashmla metadata are rewritten in full before every replay, so they
         # can live in the pausable cuda-graph region. The others are written
         # once at init and would come back zeroed after a resume.
-        with self._cuda_graph_memory_region():
+        with self._memory_saver_adapter.region(tag=GPU_MEMORY_TYPE_CUDA_GRAPH):
             page_table = (
                 None
                 if self.dsa_drop_wide_page_table
