@@ -5,14 +5,15 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.kernels.ops.diffusion.norm.rmsnorm_preserve_reduction import (
-    can_use_rmsnorm_preserve_reduction,
-)
-from sglang.kernels.ops.diffusion.rope.complex_rope_triton import (
-    _fuse_real_sin,
-    can_use_fused_complex_rope,
-)
+from sglang.kernels.ops.diffusion.rope.complex_rope_triton import _fuse_real_sin
 from sglang.srt.utils.custom_op import register_custom_op
+
+
+@triton.jit
+def _bshd_row_offsets(row, HEADS: tl.constexpr, TOKEN_STRIDE: tl.constexpr):
+    # row enumerates (token, head) pairs; a packed QKV view keeps heads
+    # contiguous but strides tokens by the whole projection width
+    return (row // HEADS).to(tl.int64) * TOKEN_STRIDE + (row % HEADS) * 128
 
 
 @triton.jit
@@ -24,6 +25,7 @@ def _qknorm_complex_rope_rows(
     ROWS: tl.constexpr,
     SEQ: tl.constexpr,
     HEADS: tl.constexpr,
+    X_TOKEN_STRIDE: tl.constexpr,
     EPS: tl.constexpr,
     FUSE_REAL_SIN: tl.constexpr,
 ):
@@ -33,9 +35,8 @@ def _qknorm_complex_rope_rows(
     # Increasing rows per warp changes this order and is not bit-exact.
     column = tl.arange(0, 128)
     mask = row[:, None] < ROWS
-    value = tl.load(x_ptr + row[:, None] * 128 + column[None, :], mask, 0).to(
-        tl.float32
-    )
+    offset = _bshd_row_offsets(row, HEADS, X_TOKEN_STRIDE)
+    value = tl.load(x_ptr + offset[:, None] + column[None, :], mask, 0).to(tl.float32)
     square = tl.reshape(value * value, (4, 32, 2, 2))
     even, odd = tl.split(square)
     a, c = tl.split(even)
@@ -66,12 +67,22 @@ def _qknorm_complex_rope_onepass_kernel(
     ROWS: tl.constexpr,
     SEQ: tl.constexpr,
     HEADS: tl.constexpr,
+    X_TOKEN_STRIDE: tl.constexpr,
     EPS: tl.constexpr,
     FUSE_REAL_SIN: tl.constexpr,
 ):
     row = tl.program_id(0) * 4 + tl.arange(0, 4)
     out = _qknorm_complex_rope_rows(
-        x_ptr, weight_ptr, rope_ptr, row, ROWS, SEQ, HEADS, EPS, FUSE_REAL_SIN
+        x_ptr,
+        weight_ptr,
+        rope_ptr,
+        row,
+        ROWS,
+        SEQ,
+        HEADS,
+        X_TOKEN_STRIDE,
+        EPS,
+        FUSE_REAL_SIN,
     )
     tl.store(
         out_ptr + row[:, None] * 128 + tl.arange(0, 128)[None, :],
@@ -80,11 +91,34 @@ def _qknorm_complex_rope_onepass_kernel(
     )
 
 
+def is_bshd_head128(x: torch.Tensor) -> bool:
+    """``[B, S, H, 128]`` with contiguous heads; the token stride may exceed
+    ``H * 128`` so views into a packed ``[B, S, 3 * H * 128]`` projection qualify."""
+    return (
+        x.is_cuda
+        and torch.version.hip is None
+        and x.dtype in (torch.float16, torch.bfloat16)
+        and x.ndim == 4
+        and x.shape[-1] == 128
+        and x.numel() > 0
+        and x.stride(3) == 1
+        and x.stride(2) == 128
+        and x.stride(1) >= x.shape[2] * 128
+        and x.stride(0) == x.shape[1] * x.stride(1)
+    )
+
+
 def can_use_qknorm_complex_rope(x, weight, rope):
     return (
-        can_use_rmsnorm_preserve_reduction(x, weight)
-        and can_use_fused_complex_rope(x, rope)
-        and x.shape[-1] == 128
+        is_bshd_head128(x)
+        and weight.device == x.device
+        and weight.dtype == x.dtype
+        and weight.shape == (128,)
+        and weight.is_contiguous()
+        and rope.dtype == torch.complex64
+        and rope.device == x.device
+        and rope.shape == (x.shape[1], 64)
+        and rope.is_contiguous()
     )
 
 
@@ -114,6 +148,7 @@ def qknorm_complex_rope(
             x.numel() // 128,
             x.shape[1],
             x.shape[2],
+            x.stride(1),
             eps,
             _fuse_real_sin(x.device),
             num_warps=4,

@@ -210,9 +210,10 @@ def apply_swiglu(x):
     )
 
 
-def merges_ffn_projections(quant_config):
-    """Native weights pack gate/up into one GEMM; quantized checkpoints keep the
-    Diffusers layout so their scales and layout inference stay unchanged."""
+def merges_projections(quant_config):
+    """Native weights pack q/k/v and gate/up into single GEMMs; quantized
+    checkpoints keep the Diffusers layout so their scales and layout inference
+    stay unchanged."""
     return quant_config is None
 
 
@@ -266,7 +267,7 @@ class QwenImage21TimeEmbedding(nn.Module):
 class QwenImage21FeedForward(nn.Module):
     def __init__(self, dim, ratio, quant_config, prefix):
         super().__init__()
-        self.merged = merges_ffn_projections(quant_config)
+        self.merged = merges_projections(quant_config)
         if self.merged:
             # one GEMM emits [gate | up]; the checkpoint's gate_layer/proj load as shards 0/1
             self.gate_up = MergedColumnParallelLinear(
@@ -320,15 +321,26 @@ class QwenImage21Attention(nn.Module):
         dim = ac.hidden_size
         self.heads = ac.num_attention_heads // get_tp_world_size()
         self.head_dim = ac.attention_head_dim
-        self.to_q = ColumnParallelLinear(
-            dim, dim, bias=False, quant_config=quant_config, prefix=f"{prefix}.to_q"
-        )
-        self.to_k = ColumnParallelLinear(
-            dim, dim, bias=False, quant_config=quant_config, prefix=f"{prefix}.to_k"
-        )
-        self.to_v = ColumnParallelLinear(
-            dim, dim, bias=False, quant_config=quant_config, prefix=f"{prefix}.to_v"
-        )
+        self.merged = merges_projections(quant_config)
+        if self.merged:
+            # one GEMM emits [q | k | v]; the checkpoint's to_q/to_k/to_v load as shards 0/1/2
+            self.to_qkv = MergedColumnParallelLinear(
+                dim,
+                [dim] * 3,
+                bias=False,
+                quant_config=quant_config,
+                prefix=f"{prefix}.to_qkv",
+            )
+        else:
+            self.to_q = ColumnParallelLinear(
+                dim, dim, bias=False, quant_config=quant_config, prefix=f"{prefix}.to_q"
+            )
+            self.to_k = ColumnParallelLinear(
+                dim, dim, bias=False, quant_config=quant_config, prefix=f"{prefix}.to_k"
+            )
+            self.to_v = ColumnParallelLinear(
+                dim, dim, bias=False, quant_config=quant_config, prefix=f"{prefix}.to_v"
+            )
         self.to_out = nn.ModuleList(
             [
                 RowParallelLinear(
@@ -355,6 +367,10 @@ class QwenImage21Attention(nn.Module):
         )
 
     def project_qkv(self, x):
+        if self.merged:
+            # strided [B, S, H, D] views; the RoPE kernels read them through the token stride
+            qkv = self.to_qkv(x)[0].unflatten(-1, (3, self.heads, self.head_dim))
+            return qkv.unbind(-3)
         q = self.to_q(x)[0].unflatten(-1, (self.heads, self.head_dim))
         k = self.to_k(x)[0].unflatten(-1, (self.heads, self.head_dim))
         v = self.to_v(x)[0].unflatten(-1, (self.heads, self.head_dim))
@@ -374,6 +390,8 @@ class QwenImage21Attention(nn.Module):
             prefix_output = None
         else:
             qp, kp, vp = self.qkv(prefix, prefix_rope)
+            # the cache must own V outright, not a view into the packed projection
+            vp = vp.contiguous()
             outputs = []
             # text runs are causal; image blocks see the entire preceding sequence and themselves
             for start, end, is_image in segments:
@@ -417,7 +435,9 @@ class QwenImage21Attention(nn.Module):
             out = self.target_attn(q, *packed)
         else:
             k = apply_qk_norm_rope(k, self.norm_k, rope)
-            out = self.target_attn.forward_with_replicated_kv_prefix(q, kp, vp, k, v)
+            out = self.target_attn.forward_with_replicated_kv_prefix(
+                q, kp, vp, k, v.contiguous()
+            )
         return out, prefix_output
 
     def forward(self, x, ropes, prefixes, layouts, caches):
@@ -514,9 +534,25 @@ class QwenImage21OutputNorm(nn.Module):
         )
 
 
-# Diffusers checkpoints and LoRA adapters name the FFN halves gate_layer/proj;
-# the native model packs them into gate_up as shards 0/1 of one GEMM.
-_MERGED_FFN_PARAM_NAMES_MAPPING = {
+# Diffusers checkpoints and LoRA adapters name the projections to_q/to_k/to_v
+# and gate_layer/proj; the native model packs them into to_qkv (shards 0/1/2)
+# and gate_up (shards 0/1) of single GEMMs.
+_MERGED_PARAM_NAMES_MAPPING = {
+    r"^(transformer_blocks\.\d+\.attn)\.to_q\.(weight|lora_A|lora_B|alpha)$": (
+        r"\1.to_qkv.\2",
+        0,
+        3,
+    ),
+    r"^(transformer_blocks\.\d+\.attn)\.to_k\.(weight|lora_A|lora_B|alpha)$": (
+        r"\1.to_qkv.\2",
+        1,
+        3,
+    ),
+    r"^(transformer_blocks\.\d+\.attn)\.to_v\.(weight|lora_A|lora_B|alpha)$": (
+        r"\1.to_qkv.\2",
+        2,
+        3,
+    ),
     r"^(transformer_blocks\.\d+\.img_mlp)\.gate_layer\.(weight|lora_A|lora_B|alpha)$": (
         r"\1.gate_up.\2",
         0,
@@ -543,15 +579,18 @@ class QwenImage21Transformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin
     _compile_conditions = _fsdp_shard_conditions
     layer_names = ["transformer_blocks"]
     param_names_mapping = {}
-    packed_modules_mapping = {"gate_up": ["gate_layer", "proj"]}
+    packed_modules_mapping = {
+        "to_qkv": ["to_q", "to_k", "to_v"],
+        "gate_up": ["gate_layer", "proj"],
+    }
 
     def __init__(self, config, hf_config, quant_config=None, **kwargs):
         super().__init__(config, hf_config=hf_config, **kwargs)
         # Instance-local like Qwen-Image: the loaders and the LoRA adapter read
         # it from the model, and quantized builds keep the split projections.
         self.param_names_mapping = (
-            dict(_MERGED_FFN_PARAM_NAMES_MAPPING)
-            if merges_ffn_projections(quant_config)
+            dict(_MERGED_PARAM_NAMES_MAPPING)
+            if merges_projections(quant_config)
             else {}
         )
         ac = self.config
