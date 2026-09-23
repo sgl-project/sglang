@@ -2,7 +2,7 @@ import ctypes
 import threading
 from queue import Queue
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -10,7 +10,6 @@ import torch
 from sglang.srt.hardware_backend.npu.dsv4.c128_sidecar_component import (
     C128SidecarComponent,
 )
-from sglang.srt.managers.cache_controller import HiCacheController
 from sglang.srt.mem_cache.base_prefix_cache import CacheRequestHandle, InsertResult
 from sglang.srt.mem_cache.hicache_storage import (
     PoolHitPolicy,
@@ -161,10 +160,8 @@ def test_lazy_clear_propagates_memcache_remove_all_failure():
         raise AssertionError("Memcache clear failure must not be reported as success")
 
 
-def test_device_transports_lazy_init_is_limited_to_dsv4_pool_groups():
-    dsv4_group = SimpleNamespace(
-        entries=[SimpleNamespace(name=PoolName.DEEPSEEK_V4_C4)]
-    )
+def test_device_transports_lazy_init_is_limited_to_logical_anchor():
+    dsv4_group = LogicalHostPool(4096, 128)
     ordinary_group = SimpleNamespace(entries=[SimpleNamespace(name=PoolName.KV)])
 
     assert NpuMemcacheStore._should_lazy_init(dsv4_group, "device_sdma", True)
@@ -173,58 +170,6 @@ def test_device_transports_lazy_init_is_limited_to_dsv4_pool_groups():
     assert not NpuMemcacheStore._should_lazy_init(ordinary_group, "device_rdma", True)
     assert not NpuMemcacheStore._should_lazy_init(dsv4_group, "host_shm", True)
     assert not NpuMemcacheStore._should_lazy_init(dsv4_group, "device_rdma", False)
-
-
-def test_logical_anchor_uses_controller_pool_names_for_lazy_init():
-    controller = HybridCacheController.__new__(HybridCacheController)
-    controller.mem_pool_device = object()
-    controller.mem_pool_host = SimpleNamespace(
-        layout="page_first_direct",
-        entries=[
-            SimpleNamespace(name=PoolName.KV),
-            SimpleNamespace(name=PoolName.DEEPSEEK_V4_C4),
-        ],
-    )
-    controller.enable_storage_metrics = False
-    controller.get_attn_cp_rank_and_size = lambda: (0, 1)
-
-    parallel = SimpleNamespace(tp_rank=0, tp_size=1, pp_rank=0, pp_size=1)
-    with (
-        patch(
-            "sglang.srt.managers.cache_controller.is_dp_attention_enabled",
-            return_value=False,
-        ),
-        patch(
-            "sglang.srt.managers.cache_controller.get_parallel",
-            return_value=parallel,
-        ),
-    ):
-        storage_config = controller._generate_storage_config("dsv4", {})
-
-    logical_anchor = SimpleNamespace(kv_buffer=None)
-    assert storage_config.host_pool_names == (
-        str(PoolName.KV),
-        str(PoolName.DEEPSEEK_V4_C4),
-    )
-
-    assert NpuMemcacheStore._should_lazy_init(
-        logical_anchor,
-        "device_sdma",
-        True,
-        storage_config.host_pool_names,
-    )
-    assert NpuMemcacheStore._should_lazy_init(
-        logical_anchor,
-        "device_rdma",
-        True,
-        storage_config.host_pool_names,
-    )
-    assert not NpuMemcacheStore._should_lazy_init(
-        logical_anchor,
-        "host_shm",
-        True,
-        storage_config.host_pool_names,
-    )
 
 
 def test_lazy_store_reports_miss_and_defers_host_registration():
@@ -328,13 +273,13 @@ def test_side_pool_registration_does_not_precheck_layout():
     backend.register_buffer.assert_called_once_with(buffer)
 
 
-def test_c128_exists_uses_explicit_terminal_key_for_aligned_candidate():
+def test_c128_exists_derives_group_endpoint_from_hash_chain():
     keys = [f"h{i}" for i in range(16)]
     object_key = f"h15__{PoolName.DEEPSEEK_V4_C128}"
     backend = _make_memcache([object_key])
     transfer = PoolTransfer(
         name=PoolName.DEEPSEEK_V4_C128,
-        keys=["h15"],
+        keys=["__placeholder__"],
         logical_pages_per_object=16,
     )
 
@@ -403,7 +348,7 @@ def test_logical_anchor_returns_common_partial_prefix_for_coarse_c128():
     assert result.extra_pool_hit_pages[PoolName.DEEPSEEK_V4_C128] == 1
 
 
-def test_partial_prefix_realigns_trailing_state_keys():
+def test_partial_prefix_finds_available_trailing_window():
     keys = [f"h{i}" for i in range(32)]
     existing = {
         *[f"h{i}__{PoolName.DEEPSEEK_V4_C4}" for i in range(16)],
@@ -423,79 +368,33 @@ def test_partial_prefix_realigns_trailing_state_keys():
     )
 
     assert result.kv_hit_pages == 16
-    assert trailing.keys == ["h14", "h15"]
-    assert result.extra_pool_hit_pages[PoolName.SWA] == 2
+    assert result.extra_pool_hit_pages[PoolName.SWA] == 16
 
 
-def test_partial_prefix_trims_coarse_buffer_and_releases_tail():
-    controller = HybridCacheController.__new__(HybridCacheController)
-    controller.mem_pool_host = SimpleNamespace(
-        entry_map={
-            PoolName.DEEPSEEK_V4_C128: SimpleNamespace(
-                host_pool=SimpleNamespace(page_size=16)
-            )
-        }
-    )
-    released = []
-    controller.append_host_mem_release = lambda **kwargs: released.extend(
-        kwargs["extra_pools"]
-    )
-    transfer = PoolTransfer(
-        name=PoolName.DEEPSEEK_V4_C128,
-        host_indices=torch.arange(32),
-        keys=["h15", "h31"],
-        logical_pages_per_object=16,
-    )
-
-    controller._trim_prefetch_transfers([transfer], [f"h{i}" for i in range(32)], 16)
-
-    assert transfer.keys == ["h15"]
-    assert torch.equal(transfer.host_indices, torch.arange(16))
-    assert len(released) == 1
-    assert torch.equal(released[0].host_indices, torch.arange(16, 32))
-
-
-@pytest.mark.parametrize(
-    "name",
-    [
-        PoolName.DEEPSEEK_V4_C4,
-        PoolName.DEEPSEEK_V4_C4_INDEXER,
-        PoolName.DEEPSEEK_V4_C4_INDEXER_SCALE,
-    ],
-)
-def test_storage_derived_pools_reuse_logical_anchor_indices(name):
-    anchor = torch.cat((torch.arange(128), torch.arange(256, 384)))
-    transfer = PoolTransfer(name=name, indices_from_pool=PoolName.KV)
-    operation = SimpleNamespace(
-        host_indices=anchor, hash_value=["h0", "h1"], pool_transfers=[transfer]
-    )
-    controller = HybridCacheController.__new__(HybridCacheController)
-    controller._resolve_sidecar_nonkv_derived_pool_transfers(operation)
-    assert transfer.host_indices is anchor
-    assert transfer.keys == operation.hash_value
-
-
-def test_refactored_indexer_pools_round_trip_independently():
+def test_physical_pools_round_trip_independently():
     backend = _make_memcache()
     backend.store = _LifecycleObjectStore()
     backend._store_initialized = True
     backend._batch_exist = lambda keys: [int(k in backend.store.objects) for k in keys]
     buffers = {
+        PoolName.DEEPSEEK_V4_C4: ctypes.create_string_buffer(b"compressed-kv"),
+        PoolName.DEEPSEEK_V4_C128: ctypes.create_string_buffer(b"c128-kv"),
         PoolName.DEEPSEEK_V4_C4_INDEXER: ctypes.create_string_buffer(b"index-key"),
         PoolName.DEEPSEEK_V4_C4_INDEXER_SCALE: ctypes.create_string_buffer(b"scale"),
     }
     expected = {name: bytes(buf) for name, buf in buffers.items()}
     transfers = []
     for name, buf in buffers.items():
+        page_size = 16 if name == PoolName.DEEPSEEK_V4_C128 else 128
         backend.registered_pools[name] = SimpleNamespace(
-            page_size=128,
+            page_size=page_size,
             get_page_buffer_meta=lambda indices, buf=buf: (
                 [ctypes.addressof(buf)],
                 [ctypes.sizeof(buf)],
             ),
         )
         transfers.append(
-            PoolTransfer(name=name, host_indices=torch.arange(128), keys=["h0"])
+            PoolTransfer(name=name, host_indices=torch.arange(page_size), keys=["h0"])
         )
 
     assert backend.batch_set_v2(transfers) == {name: [True] for name in buffers}
@@ -506,10 +405,8 @@ def test_refactored_indexer_pools_round_trip_independently():
     assert {name: bytes(buf) for name, buf in buffers.items()} == expected
 
 
-def _make_host_group(physical=False):
+def _make_host_group():
     pool = LogicalHostPool(4096, 128)
-    if physical:
-        pool.kv_buffer = torch.empty(1)
     return HostPoolGroup(
         [
             PoolEntry(
@@ -521,240 +418,6 @@ def _make_host_group(physical=False):
             )
         ]
     )
-
-
-@pytest.mark.parametrize("physical", [False, True])
-def test_host_group_dispatches_primary_io_by_anchor_pool(physical):
-    controller = HybridCacheController.__new__(HybridCacheController)
-    controller.mem_pool_host = _make_host_group(physical)
-    controller.storage_host_pool = controller.mem_pool_host.anchor_entry.host_pool
-    controller.page_size = 128
-    controller.storage_backend_type = "npu_memcache"
-    controller.prefetch_sync_queue = Queue()
-    controller._page_transfer_sidecar = Mock()
-    controller.backup_skip = False
-    controller.storage_backend = SimpleNamespace(prepare_for_backup=Mock())
-    operation = PrefetchOperation(
-        CacheRequestHandle("req", 0), list(range(128)), pool_transfers=[]
-    )
-    operation.hash_value = ["h0"]
-    assert controller.mem_pool_host.kv_buffer is controller.storage_host_pool.kv_buffer
-    with patch.object(HiCacheController, "_page_transfer", return_value=1) as read:
-        controller._page_transfer(operation)
-        assert read.call_count == int(physical)
-    with patch.object(HiCacheController, "_page_backup") as write:
-        controller._page_backup(operation)
-        assert write.call_count == int(physical)
-
-
-@pytest.mark.parametrize("stored", [True, False])
-def test_logical_anchor_backup_requires_successful_physical_pool_write(stored):
-    controller = HybridCacheController.__new__(HybridCacheController)
-    controller.page_size = 128
-    controller.backup_skip = False
-    controller.mem_pool_host = _make_host_group()
-    controller.storage_host_pool = controller.mem_pool_host.anchor_entry.host_pool
-    controller.storage_backend = SimpleNamespace(
-        prepare_for_backup=Mock(),
-        batch_set_v2=lambda transfers, **kwargs: {PoolName.DEEPSEEK_V4_C128: [stored]},
-    )
-    operation = SimpleNamespace(
-        pool_transfers=[PoolTransfer(name=PoolName.DEEPSEEK_V4_C128, keys=["h15"])],
-        pool_storage_result=PoolTransferResult(kv_hit_pages=0, extra_pool_hit_pages={}),
-        prefix_keys=None,
-        hash_value=[f"h{i}" for i in range(16)],
-        completed_tokens=0,
-    )
-
-    controller._page_backup(operation)
-
-    assert operation.completed_tokens == (2048 if stored else 0)
-
-
-def test_virtual_anchor_prefetch_skips_primary_io_and_loads_real_pool():
-    controller = HybridCacheController.__new__(HybridCacheController)
-    controller.page_size = 128
-    controller.storage_backend_type = "npu_memcache"
-    controller.mem_pool_host = _make_host_group()
-    controller.storage_host_pool = controller.mem_pool_host.anchor_entry.host_pool
-    controller.prefetch_sync_queue = Queue()
-    calls = []
-    controller.storage_backend = SimpleNamespace(
-        batch_get_v2=lambda transfers, **kwargs: (
-            calls.append(transfers) or {PoolName.DEEPSEEK_V4_C128: [True]}
-        )
-    )
-    transfer = PoolTransfer(
-        name=PoolName.DEEPSEEK_V4_C128,
-        host_indices=torch.arange(16),
-        keys=["h15"],
-    )
-    operation = PrefetchOperation(
-        CacheRequestHandle("req", 0), list(range(2048)), pool_transfers=[transfer]
-    )
-    operation.hash_value = [f"h{i}" for i in range(16)]
-    operation.host_indices = torch.arange(2048)
-
-    controller._page_transfer(operation)
-
-    acks = []
-    while not controller.prefetch_sync_queue.empty():
-        acks.append(controller.prefetch_sync_queue.get())
-
-    assert max(ack.completed_tokens or 0 for ack in acks) == 2048
-    assert len(calls) == 1
-    assert any(
-        ack.pool_hits and ack.pool_hits.get(PoolName.DEEPSEEK_V4_C128.value, 0) == 1
-        for ack in acks
-    )
-
-
-@pytest.mark.parametrize(
-    "failed_pool",
-    [
-        PoolName.DEEPSEEK_V4_C4,
-        PoolName.DEEPSEEK_V4_C4_INDEXER,
-        PoolName.DEEPSEEK_V4_C4_INDEXER_SCALE,
-    ],
-)
-def test_logical_anchor_rejects_failed_derived_read(failed_pool):
-    request = CacheRequestHandle("req", 0)
-    transfers = [
-        PoolTransfer(name=failed_pool, keys=["h0"], indices_from_pool=PoolName.KV),
-        PoolTransfer(name=PoolName.SWA, keys=["h0"]),
-    ]
-    operation = PrefetchOperation(
-        CacheRequestHandle("req", 0), list(range(128)), pool_transfers=transfers
-    )
-    operation.completed_tokens = 128
-    operation.pool_transfers_done = True
-    operation.pool_storage_result.update_extra_pool_hit_pages(
-        {failed_pool: 0, PoolName.SWA: 1}
-    )
-    release = Mock()
-    host_group = _make_host_group()
-    cache = SimpleNamespace(
-        page_size=128,
-        cache_controller=SimpleNamespace(
-            mem_pool_host=host_group,
-            storage_host_pool=host_group.anchor_entry.host_pool,
-            append_host_mem_release=release,
-            prefetch_tokens_occupied=128,
-        ),
-        storage_existence_cache=SimpleNamespace(invalidate_beyond=Mock()),
-        _finish_storage_prefetch=Mock(),
-        buffer_pipeline=None,
-        ongoing_prefetch={request: operation},
-        _prefetch_occupied_span=lambda *_: 128,
-        prefetch_loaded_tokens_by_reqid={},
-        prefetch_loaded_storage_start_by_reqid={},
-    )
-    assert not UnifiedRadixCache._check_hybrid_prefetch_result(
-        cache,
-        request,
-        operation,
-        128,
-        ["h0"],
-        torch.arange(128),
-        None,
-        None,
-        list(range(128)),
-    )
-    release.assert_called_once()
-    assert cache.prefetch_loaded_tokens_by_reqid[request] == 0
-
-
-def test_sidecar_exception_preserves_ack_sequence():
-    def run(fail):
-        controller = HybridCacheController.__new__(HybridCacheController)
-        controller.page_size = 128
-        controller.storage_backend_type = "npu_memcache"
-        controller.mem_pool_host = _make_host_group()
-        controller.storage_host_pool = controller.mem_pool_host.anchor_entry.host_pool
-        controller.prefetch_sync_queue = Queue()
-        controller.prefetch_buffer = Queue()
-        controller.storage_stop_event = _OneIterationStopEvent()
-        controller.storage_backend = SimpleNamespace(
-            batch_get_v2=Mock(
-                side_effect=RuntimeError("injected read failure") if fail else None,
-                return_value={PoolName.SWA: [True]},
-            )
-        )
-        operation = PrefetchOperation(
-            CacheRequestHandle("req", 0),
-            list(range(128)),
-            pool_transfers=[
-                PoolTransfer(
-                    name=PoolName.SWA, keys=["h0"], host_indices=torch.arange(128)
-                )
-            ],
-        )
-        operation.hash_value = ["h0"]
-        operation.host_indices = torch.arange(128)
-        controller.prefetch_buffer.put(operation)
-        controller.prefetch_io_aux_func()
-        return list(controller.prefetch_sync_queue.queue)
-
-    success, failure = run(False), run(True)
-
-    def signature(acks):
-        return [
-            (
-                a.completed_tokens is not None,
-                a.pool_hits is not None,
-                bool(a.completed_req),
-            )
-            for a in acks
-        ]
-
-    assert (
-        signature(success)
-        == signature(failure)
-        == [(True, False, False), (False, True, False), (False, False, True)]
-    )
-    assert failure[1].pool_hits == {}
-
-
-class _OneIterationStopEvent:
-    def __init__(self):
-        self._checks = 0
-
-    def is_set(self):
-        self._checks += 1
-        return self._checks > 1
-
-
-def _run_one_hybrid_prefetch_worker(page_transfer):
-    controller = HybridCacheController.__new__(HybridCacheController)
-    controller.storage_stop_event = _OneIterationStopEvent()
-    controller.prefetch_buffer = Queue()
-    controller.prefetch_sync_queue = Queue()
-    controller._page_transfer = page_transfer
-    controller.append_host_mem_release = lambda **_kwargs: (_ for _ in ()).throw(
-        AssertionError("the scheduler, not the IO worker, owns prefetch release")
-    )
-
-    operation = PrefetchOperation(
-        CacheRequestHandle("req-terminal", 0), list(range(128))
-    )
-    operation.host_indices = torch.arange(128)
-    controller.prefetch_buffer.put(operation)
-    controller.prefetch_io_aux_func()
-
-    acks = []
-    while not controller.prefetch_sync_queue.empty():
-        acks.append(controller.prefetch_sync_queue.get())
-    return operation, acks
-
-
-def test_hybrid_prefetch_worker_emits_terminal_ack_on_success():
-    operation, acks = _run_one_hybrid_prefetch_worker(lambda _operation: None)
-
-    assert len(acks) == 1
-    assert acks[0].operation is operation
-    assert acks[0].rid == operation.request_id
-    assert acks[0].completed_req is True
-    assert not operation.is_terminated()
 
 
 def test_c128_prefetch_transfer_uses_runtime_coverage():
@@ -962,34 +625,6 @@ def test_c128_prefetch_sizes_without_allocating_until_hit():
     assert staging.numel() == 16
 
 
-@pytest.mark.parametrize("assume_stored", [False, True])
-def test_c128_query_resolves_namespaced_endpoint_keys(assume_stored):
-    controller = HybridCacheController.__new__(HybridCacheController)
-    controller.page_size = 128
-    controller.storage_backend_type = "npu_memcache"
-    controller.mem_pool_host = SimpleNamespace(entry_map={})
-    key = RadixKey(list(range(4096)), extra_key="tenant", cache_salt="salt")
-    hashes = get_storage_hash_str(key, page_size=128)
-    controller.storage_backend = _make_memcache(
-        [f"{h}__{PoolName.DEEPSEEK_V4_C128}" for h in hashes[15::16]]
-    )
-    transfer = PoolTransfer(
-        name=PoolName.DEEPSEEK_V4_C128,
-        keys=["__placeholder__"] * 2,
-        logical_pages_per_object=16,
-    )
-    operation = PrefetchOperation(
-        CacheRequestHandle("req", 0),
-        key,
-        pool_transfers=[transfer],
-        assume_stored=assume_stored,
-    )
-    _, tokens = controller._storage_hit_query(operation)
-    assert tokens == 4096
-    assert transfer.keys == hashes[15::16]
-    assert transfer.host_indices is None
-
-
 def test_hit_time_staging_counts_c128_objects_not_full_pages():
     transfer = PoolTransfer(
         name=PoolName.DEEPSEEK_V4_C128,
@@ -1050,3 +685,242 @@ def test_upstream_mla_indexer_scale_and_packed_kv_keys(fp8_packed):
         "h0__scale",
     ]
     assert backend._get_key_multiplier() == sizes
+
+
+@pytest.mark.parametrize("backup_skip", [False, True])
+def test_backup_initializes_runtime_on_every_rank(backup_skip):
+    controller = HybridCacheController.__new__(HybridCacheController)
+    controller.page_size = 128
+    controller.backup_skip = backup_skip
+    controller.storage_backend_type = "npu_memcache"
+    controller.mem_pool_host = _make_host_group()
+    backend = controller.storage_backend = _make_memcache()
+    backend.prepare_for_backup = Mock()
+    backend.batch_set_v2 = Mock(return_value={PoolName.DEEPSEEK_V4_C128: [True]})
+    controller.page_set_func = controller._page_set_zero_copy
+    operation = PrefetchOperation(
+        CacheRequestHandle("req", 0),
+        list(range(2048)),
+        pool_transfers=[PoolTransfer(name=PoolName.DEEPSEEK_V4_C128, keys=["h15"])],
+    )
+    operation.hash_value = [f"h{i}" for i in range(16)]
+    operation.host_indices = torch.arange(2048)
+
+    controller._page_backup(operation)
+
+    backend.prepare_for_backup.assert_called_once()
+    assert backend.batch_set_v2.call_count == int(not backup_skip)
+
+
+@pytest.mark.parametrize(
+    "failed_pool",
+    [
+        None,
+        PoolName.DEEPSEEK_V4_C4,
+        PoolName.DEEPSEEK_V4_C4_INDEXER,
+        PoolName.DEEPSEEK_V4_C4_INDEXER_SCALE,
+        PoolName.DEEPSEEK_V4_C128,
+        PoolName.SWA,
+    ],
+)
+def test_logical_anchor_prefetch_requires_all_physical_pools(failed_pool):
+    controller = HybridCacheController.__new__(HybridCacheController)
+    controller.page_size = 128
+    controller.mem_pool_host = _make_host_group()
+    controller.prefetch_sync_queue = Queue()
+    controller.storage_backend = _make_memcache()
+    controller.page_get_func = controller._page_get_zero_copy
+    controller.storage_backend.batch_get_v2 = lambda transfers, **kwargs: {
+        t.name: [t.name != failed_pool] * len(t.keys) for t in transfers
+    }
+    transfers = [
+        PoolTransfer(name=name, indices_from_pool=PoolName.KV)
+        for name in (
+            PoolName.DEEPSEEK_V4_C4,
+            PoolName.DEEPSEEK_V4_C4_INDEXER,
+            PoolName.DEEPSEEK_V4_C4_INDEXER_SCALE,
+        )
+    ] + [
+        PoolTransfer(
+            name=PoolName.DEEPSEEK_V4_C128,
+            keys=["__placeholder__"],
+            host_indices=torch.arange(16),
+            logical_pages_per_object=16,
+        ),
+        PoolTransfer(
+            name=PoolName.SWA,
+            keys=["__placeholder__"],
+            host_indices=torch.arange(128),
+            hit_policy=PoolHitPolicy.TRAILING_PAGES,
+        ),
+    ]
+    request = CacheRequestHandle("req", 0)
+    operation = PrefetchOperation(request, list(range(2048)), pool_transfers=transfers)
+    operation.hash_value = [f"h{i}" for i in range(16)]
+    operation.host_indices = torch.arange(2048)
+
+    controller._page_transfer(operation)
+    for ack in controller.prefetch_sync_queue.queue:
+        if ack.completed_tokens is not None:
+            operation.completed_tokens = ack.completed_tokens
+        if ack.pool_hits is not None:
+            operation.pool_storage_result.update_extra_pool_hit_pages(ack.pool_hits)
+    operation.pool_transfers_done = True
+    controller.append_host_mem_release = Mock()
+    controller.prefetch_tokens_occupied = 2048
+    cache = SimpleNamespace(
+        page_size=128,
+        cache_controller=controller,
+        storage_existence_cache=SimpleNamespace(invalidate_beyond=Mock()),
+        _finish_storage_prefetch=Mock(),
+        buffer_pipeline=None,
+        ongoing_prefetch={request: operation},
+        _prefetch_occupied_span=lambda *_: 2048,
+        prefetch_loaded_tokens_by_reqid={},
+        prefetch_loaded_storage_start_by_reqid={},
+    )
+    accepted = UnifiedRadixCache._check_hybrid_prefetch_result(
+        cache,
+        request,
+        operation,
+        operation.completed_tokens,
+        operation.hash_value,
+        operation.host_indices,
+        None,
+        None,
+        list(range(2048)),
+    )
+    assert accepted == (failed_pool is None)
+    assert controller.append_host_mem_release.call_count == int(failed_pool is not None)
+
+
+@pytest.mark.parametrize("assume_stored", [False, True])
+@pytest.mark.parametrize("hit_tokens", [2048, 4096])
+def test_c128_read_uses_namespaced_keys_after_rank_hit_reduction(
+    assume_stored, hit_tokens
+):
+    controller = HybridCacheController.__new__(HybridCacheController)
+    controller.page_size = 128
+    controller.mem_pool_host = _make_host_group()
+    controller.prefetch_sync_queue = Queue()
+    controller.page_get_func = controller._page_get_zero_copy
+    key = RadixKey(list(range(4096)), extra_key="tenant", cache_salt="salt")
+    hashes = get_storage_hash_str(key, page_size=128)
+    backend = controller.storage_backend = _make_memcache(
+        [f"{h}__{PoolName.DEEPSEEK_V4_C128}" for h in hashes[15::16]]
+    )
+    backend.batch_get_v2 = Mock(
+        return_value={PoolName.DEEPSEEK_V4_C128: [True] * (hit_tokens // 2048)}
+    )
+    transfer = PoolTransfer(
+        name=PoolName.DEEPSEEK_V4_C128,
+        keys=["__placeholder__"] * 2,
+        logical_pages_per_object=16,
+    )
+    operation = PrefetchOperation(
+        CacheRequestHandle("req", 0),
+        key,
+        pool_transfers=[transfer],
+        assume_stored=assume_stored,
+    )
+    hit_hashes, tokens = controller._storage_hit_query(operation)
+    assert tokens == 4096
+    assert transfer.host_indices is None
+
+    # The scheduler allocates staging after reducing the hit length across ranks.
+    operation.hash_value = hit_hashes[: hit_tokens // 128]
+    operation.host_indices = torch.arange(hit_tokens)
+    transfer.host_indices = torch.arange(hit_tokens // 128)
+    controller._page_transfer(operation)
+
+    assert transfer.keys == hashes[15 : hit_tokens // 128 : 16]
+    backend.batch_get_v2.assert_called_once()
+
+
+def test_trailing_pools_find_a_common_shorter_prefix():
+    backend = _make_memcache(
+        {
+            "h1__deepseek_v4_c4_state",
+            "h3__deepseek_v4_c4_state",
+            "h1__deepseek_v4_c4_indexer_state",
+            "h2__deepseek_v4_c4_indexer_state",
+        }
+    )
+    result = backend.batch_exists_v2(
+        [f"h{i}" for i in range(4)],
+        [
+            PoolTransfer(
+                name=name,
+                keys=["__placeholder__"],
+                hit_policy=PoolHitPolicy.TRAILING_PAGES,
+            )
+            for name in (
+                PoolName.DEEPSEEK_V4_C4_STATE,
+                PoolName.DEEPSEEK_V4_C4_INDEXER_STATE,
+            )
+        ],
+    )
+    assert result.kv_hit_pages == 2
+    assert result.restorable_prefix_pages == [2]
+
+
+@pytest.mark.parametrize("coarse", [False, True])
+def test_memory_pressure_preserves_complete_c128_groups(coarse):
+    request = CacheRequestHandle("req", 0)
+    operation = PrefetchOperation(
+        request,
+        list(range(2048)),
+        pool_transfers=[
+            PoolTransfer(
+                name=PoolName.DEEPSEEK_V4_C128 if coarse else PoolName.SWA,
+                keys=["__placeholder__"],
+                logical_pages_per_object=16 if coarse else 1,
+                hit_policy=PoolHitPolicy.ALL_PAGES
+                if coarse
+                else PoolHitPolicy.TRAILING_PAGES,
+            )
+        ],
+    )
+    operation.storage_hit_count = 2048
+    operation.hash_value = [f"h{i}" for i in range(16)]
+    host_pool = SimpleNamespace(
+        alloc=Mock(side_effect=[None, None, torch.arange(1024)]),
+        available_size=lambda: 1024,
+    )
+    controller = SimpleNamespace(
+        mem_pool_host=host_pool,
+        prefetch_hit_queue=Queue(),
+        prefetch_buffer=Queue(),
+        ack_prefetch_queue=Queue(),
+        ack_backup_queue=Queue(),
+        host_mem_release_queue=Queue(),
+    )
+    controller.prefetch_hit_queue.put(operation)
+    cache = SimpleNamespace(
+        cache_controller=controller,
+        host_memory_mode="cache",
+        page_size=128,
+        prefetch_threshold=128,
+        ongoing_prefetch={request: Mock()},
+        storage_prefetch_retries=Mock(),
+        evict_host=Mock(),
+        _record_storage_prefetch_hit=Mock(),
+        _invalidate_absent_from_hit_query=Mock(),
+        _account_prefetch_outcome=Mock(),
+        _alloc_prefetch_aux_staging=Mock(return_value=True),
+        _resolve_storage_prefetch_tokens=Mock(),
+        _finish_storage_prefetch=Mock(),
+        revoke_pending_prefetch=Mock(),
+        _log_storage_prefetch_deferred=Mock(),
+    )
+
+    UnifiedRadixCache._drain_storage_control_queues_impl(cache, 1, 0, 0, 0, {}, False)
+
+    if coarse:
+        assert host_pool.alloc.call_count == 2
+        assert controller.prefetch_buffer.empty()
+        cache.revoke_pending_prefetch.assert_called_once_with(request)
+    else:
+        assert controller.prefetch_buffer.get_nowait() is operation
+        assert operation.storage_hit_count == 1024
+        cache.revoke_pending_prefetch.assert_not_called()

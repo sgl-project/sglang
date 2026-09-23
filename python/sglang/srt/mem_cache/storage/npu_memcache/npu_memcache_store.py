@@ -31,7 +31,7 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolTransfer,
     PoolTransferResult,
 )
-from sglang.srt.mem_cache.memory_pool_host import HostKVCache
+from sglang.srt.mem_cache.memory_pool_host import HostKVCache, LogicalHostPool
 from sglang.srt.observability.metrics_collector import StorageMetrics
 
 SETUP_TIMEOUT = 600  # seconds
@@ -199,7 +199,6 @@ class NpuMemcacheStore(HiCacheStorage):
                 mem_pool=mem_pool,
                 protocol=self._protocol,
                 init_bm=init_bm,
-                host_pool_names=getattr(storage_config, "host_pool_names", ()),
             )
 
             self._memcache_metrics_url = ctrl.get("metrics_url") or ctrl.get(
@@ -244,28 +243,13 @@ class NpuMemcacheStore(HiCacheStorage):
         mem_pool: Any,
         protocol: Any,
         init_bm: bool,
-        host_pool_names: Any = (),
     ) -> bool:
         """Defer transport setup for DSV4 until after its first model forward."""
-        if not init_bm or str(protocol).lower() not in {
-            "device_sdma",
-            "device_rdma",
-        }:
-            return False
-        dsv4_pool_names = {
-            str(PoolName.DEEPSEEK_V4_C4),
-            str(PoolName.DEEPSEEK_V4_C4_INDEXER),
-            str(PoolName.DEEPSEEK_V4_C128),
-            str(PoolName.DEEPSEEK_V4_C4_STATE),
-            str(PoolName.DEEPSEEK_V4_C4_INDEXER_STATE),
-            str(PoolName.DEEPSEEK_V4_C128_STATE),
-        }
-        actual_pool_names = {
-            str(getattr(entry, "name", ""))
-            for entry in (getattr(mem_pool, "entries", None) or [])
-        }
-        actual_pool_names.update(str(name) for name in (host_pool_names or ()))
-        return not actual_pool_names.isdisjoint(dsv4_pool_names)
+        return (
+            init_bm
+            and str(protocol).lower() in {"device_sdma", "device_rdma"}
+            and isinstance(mem_pool, LogicalHostPool)
+        )
 
     def _register_buffer_meta(self, ptr: int, size: int) -> None:
         ret_code = self.store.register_buffer(ptr, size)
@@ -580,96 +564,52 @@ class NpuMemcacheStore(HiCacheStorage):
         pool_transfers: Optional[List[PoolTransfer]] = None,
         extra_info: Optional[HiCacheStorageExtraInfo] = None,
     ) -> PoolTransferResult:
-        logical_anchor = getattr(self.mem_pool_host, "kv_buffer", None) is None
-        if logical_anchor:
-            # Logical anchor: required physical pools decide the usable prefix.
-            kv_pages = len(keys)
-        else:
-            kv_pages = self.batch_exists(keys, extra_info)
+        qkeys = self._tag_keys(keys)
+        kv_pages = self.batch_exists(keys, extra_info)
 
         hit_count: dict = {PoolName.KV: kv_pages} if kv_pages else {}
-        final_pages = kv_pages
+        # Intersect valid endpoints: trailing pools may leave holes, and coarse
+        # pools can only restore prefixes ending at an object boundary.
+        restorable = list(range(1, kv_pages + 1))
 
-        transfers = pool_transfers or []
-        all_page_transfers = [
-            transfer
-            for transfer in transfers
-            if transfer.hit_policy == PoolHitPolicy.ALL_PAGES
-        ]
-        trailing_transfers = [
-            transfer
-            for transfer in transfers
-            if transfer.hit_policy == PoolHitPolicy.TRAILING_PAGES
-        ]
-
-        # Required prefix pools run first. Coarse objects report physical-object
-        # hits and convert them back to anchor/KV logical pages.
-        for transfer in all_page_transfers:
-            if final_pages == 0:
+        for transfer in pool_transfers or []:
+            if not restorable:
                 break
-            object_anchor_keys = (
-                list(transfer.keys) if transfer.keys else list(keys[:kv_pages])
-            )
-            if not object_anchor_keys:
-                final_pages = 0
-                continue
-
+            coverage = transfer.logical_pages_per_object
+            object_keys = qkeys[coverage - 1 : kv_pages : coverage]
             component_keys, key_multiplier = self._get_hybrid_page_component_keys(
-                object_anchor_keys, transfer
+                object_keys, transfer
             )
-            component_keys = self._tag_keys(component_keys)
             ex = self._batch_exist(component_keys)
             page_exists = [
                 all(r == 1 for r in ex[i * key_multiplier : (i + 1) * key_multiplier])
-                for i in range(len(object_anchor_keys))
+                for i in range(len(object_keys))
             ]
+            boundary = 0
+            pool_restorable = []
+            if transfer.hit_policy == PoolHitPolicy.ALL_PAGES:
+                try:
+                    boundary = page_exists.index(False)
+                except ValueError:
+                    boundary = len(object_keys)
+                pool_restorable = range(coverage, boundary * coverage + 1, coverage)
+            elif transfer.hit_policy == PoolHitPolicy.TRAILING_PAGES:
+                trailing = max(1, len(transfer.keys) if transfer.keys else 1)
+                for prefix_len in range(len(object_keys), 0, -1):
+                    if all(
+                        page_exists[i]
+                        for i in range(max(0, prefix_len - trailing), prefix_len)
+                    ):
+                        pool_restorable.append(prefix_len * coverage)
+                        if boundary == 0:
+                            boundary = prefix_len
+            if boundary:
+                hit_count[transfer.name] = boundary
+            pool_restorable_set = set(pool_restorable)
+            restorable = [p for p in restorable if p in pool_restorable_set]
 
-            successful_objects = (
-                page_exists.index(False) if False in page_exists else len(page_exists)
-            )
-            if successful_objects:
-                hit_count[transfer.name] = successful_objects
-
-            coverage = transfer.logical_pages_per_object
-            final_pages = min(final_pages, successful_objects * coverage)
-
-        # The usable prefix must end at every coarse pool's object boundary.
-        for transfer in all_page_transfers:
-            coverage = transfer.logical_pages_per_object
-            final_pages -= final_pages % coverage
-
-        # Window/state pools use the tail of the prefix selected above, not the
-        # tail of the original request, which may already have diverged.
-        for transfer in trailing_transfers:
-            if final_pages == 0:
-                break
-            trailing_n = len(transfer.keys) if transfer.keys else 1
-            if final_pages < trailing_n:
-                final_pages = 0
-                break
-            transfer.keys = list(keys[final_pages - trailing_n : final_pages])
-            component_keys, key_multiplier = self._get_hybrid_page_component_keys(
-                transfer.keys, transfer
-            )
-            ex = self._batch_exist(self._tag_keys(component_keys))
-            page_exists = [
-                all(
-                    result == 1
-                    for result in ex[
-                        index * key_multiplier : (index + 1) * key_multiplier
-                    ]
-                )
-                for index in range(len(transfer.keys))
-            ]
-            successful_objects = (
-                page_exists.index(False) if False in page_exists else len(page_exists)
-            )
-            if successful_objects:
-                hit_count[transfer.name] = successful_objects
-            if successful_objects != len(transfer.keys):
-                final_pages = 0
-
-        return PoolTransferResult(final_pages, hit_count)
+        final_pages = restorable[-1] if restorable else 0
+        return PoolTransferResult(final_pages, hit_count, restorable)
 
     def _batch_io_v2(self, transfers: List[PoolTransfer], is_set: bool):
         # Unified v2 I/O path: each PoolTransfer can expand to one or more
@@ -699,19 +639,11 @@ class NpuMemcacheStore(HiCacheStorage):
                     f"len(keys)={len(keys)}, len(host_indices)={len(host_indices)}, page_size={page_size}."
                 )
 
+            ptr_list, element_size_list = host_pool.get_page_buffer_meta(host_indices)
             key_strs, key_multiplier = self._get_hybrid_page_component_keys(
                 keys, transfer
             )
             key_strs = self._tag_keys(key_strs)
-
-            ptr_list, element_size_list = host_pool.get_page_buffer_meta(host_indices)
-            if not (len(key_strs) == len(ptr_list) == len(element_size_list)):
-                raise ValueError(
-                    f"PoolTransfer '{transfer.name}' physical object mismatch: "
-                    f"keys={len(key_strs)}, ptrs={len(ptr_list)}, "
-                    f"sizes={len(element_size_list)}. Use a storage-compatible "
-                    "page-first host layout."
-                )
 
             if is_set:
                 exist_result = self._batch_exist(key_strs)
@@ -1072,19 +1004,7 @@ class NpuMemcacheStore(HiCacheStorage):
         return len(query_keys) // key_multiplier
 
     def clear(self) -> None:
-        """Remove all MemCache objects without breaking deferred NPU init.
-
-        DSV4 deliberately delays BM/HYBM initialization until the first backup.
-        A clear request commonly arrives before that first backup (for example at
-        the beginning of an accuracy test).  Treating the uninitialized state as
-        an already-empty backend is incorrect because the external Holder can
-        still contain objects written by an earlier SGLang process.
-
-        Use a short-lived metadata-only client in that case.  ``init_bm=False``
-        connects to the metadata service but does not create the NPU-side BM/HYBM
-        resources whose early initialization the lazy lifecycle is designed to
-        avoid.
-        """
+        """Clear with a metadata-only client when BM/HYBM setup is deferred."""
         if self._store_initialized:
             result = self.store.remove_all()
         else:

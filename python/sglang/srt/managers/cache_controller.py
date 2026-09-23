@@ -747,10 +747,6 @@ class HiCacheController:
             should_split_heads=should_split_heads,
             dp_rank=self.dp_rank,
             extra_config=storage_backend_extra_config,
-            host_pool_names=tuple(
-                str(entry.name)
-                for entry in (getattr(self.mem_pool_host, "entries", None) or [])
-            ),
         )
 
     def reset(self):

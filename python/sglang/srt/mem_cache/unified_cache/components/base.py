@@ -680,12 +680,7 @@ class TreeComponent(ABC):
     def align_storage_prefetch_length(
         self, node: UnifiedTreeNode, prefetch_tokens: int
     ) -> int:
-        """Return the storage-safe prefix length for this component.
-
-        Most components use the FULL page-aligned candidate unchanged. Components
-        with a coarser correctness boundary may shorten it before storage keys and
-        host allocations are created.
-        """
+        """Align the prefetch span to this component's storage boundaries."""
         return prefetch_tokens
 
     def build_hicache_transfers(

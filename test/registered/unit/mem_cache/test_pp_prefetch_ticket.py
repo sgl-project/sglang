@@ -32,7 +32,6 @@ register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 class TestPPPrefetchTicket(unittest.TestCase):
     def setUp(self):
         self.c = c = HybridCacheController.__new__(HybridCacheController)
-        c.storage_backend_type = "file"
         c.page_size = c.prefetch_threshold = 4
         c.pp_rank = c.tp_rank = 0
         c.pp_size, c.tp_size = 4, 2
@@ -50,7 +49,6 @@ class TestPPPrefetchTicket(unittest.TestCase):
         c.storage_stop_event = threading.Event()
         c.prefetch_tokens_occupied = 0
         c.mem_pool_host = Mock(page_size=4)
-        c.storage_host_pool = c.mem_pool_host
         c.mem_pool_host.alloc.side_effect = lambda size, **_: torch.arange(size)
         c._storage_hit_query = Mock(return_value=(["h0", "h1"], 8))
         c._all_reduce = Mock()

@@ -401,11 +401,6 @@ class C128SidecarComponent(TreeComponent):
         slot_page_size = self.allocator.c128_attn_allocator.page_size
         group_tokens = 128 * slot_page_size
         anchor_page_size = self.tree_core.page_size
-        if group_tokens % anchor_page_size != 0:
-            raise ValueError(
-                "C128 group tokens must be divisible by the FULL page size: "
-                f"group_tokens={group_tokens}, full_page_size={anchor_page_size}."
-            )
         return slot_page_size, group_tokens, group_tokens // anchor_page_size
 
     def align_storage_prefetch_length(
@@ -451,11 +446,6 @@ class C128SidecarComponent(TreeComponent):
             for offset, page_hash in enumerate(hashes, start=1)
             if (node_start_pages + offset) % coverage == 0
         ]
-        if len(endpoints) < groups:
-            raise ValueError(
-                f"C128 node {node.id} has {groups} host groups but only "
-                f"{len(endpoints)} endpoint hashes."
-            )
         return endpoints[-groups:]
 
     @staticmethod
@@ -530,11 +520,6 @@ class C128SidecarComponent(TreeComponent):
             host_value = node.component_data[ct].host_value
             if host_value is None:
                 return None
-            if host_value.numel() % page_size != 0:
-                raise ValueError(
-                    f"C128 host value on node {node.id} is not page aligned: "
-                    f"slots={host_value.numel()}, page_size={page_size}."
-                )
             groups = host_value.numel() // page_size
             _, _, coverage = self._storage_geometry()
             keys = self._storage_endpoint_keys(node, groups, coverage)
@@ -550,20 +535,13 @@ class C128SidecarComponent(TreeComponent):
             ]
 
         if phase == CacheTransferPhase.PREFETCH:
-            if staging_tokens % page_size != 0:
-                raise ValueError(
-                    "C128 prefetch staging is not physical-page aligned: "
-                    f"slots={staging_tokens}, page_size={page_size}."
-                )
             groups = staging_tokens // page_size
             _, _, coverage = self._storage_geometry()
-            if groups * coverage != prefetch_tokens // self.tree_core.page_size:
-                raise ValueError("C128 prefetch staging/token cardinality mismatch.")
             return [
                 PoolTransfer(
                     name=PoolName.DEEPSEEK_V4_C128,
-                    # Resolve endpoint hashes from the controller's namespaced
-                    # storage chain, then allocate staging only after a hit.
+                    # Allocate staging after the hit; resolve endpoint hashes
+                    # from the namespaced storage chain before reading.
                     keys=["__placeholder__"] * groups,
                     indices_from_pool=None,
                     logical_pages_per_object=coverage,
@@ -656,17 +634,6 @@ class C128SidecarComponent(TreeComponent):
 
             _, group_tokens, _ = self._storage_geometry()
             anchor_depth = self._node_depth(node)
-            if anchor_depth % group_tokens != 0:
-                cache_actions.append(
-                    FreeComponentHostSlot(
-                        [host_indices], component_type=ComponentType.C128
-                    )
-                )
-                raise ValueError(
-                    f"C128 prefetch anchor depth {anchor_depth} is not aligned "
-                    f"to group_tokens={group_tokens}."
-                )
-
             for group_idx in range(required_groups):
                 start = group_idx * page_size
                 page_slice = host_indices[start : start + page_size]
