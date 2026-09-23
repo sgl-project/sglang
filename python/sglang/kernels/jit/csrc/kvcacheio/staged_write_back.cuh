@@ -2,6 +2,7 @@
 
 #include "hicache.cuh"
 #include "relayout.cuh"
+#include <cstdlib>
 #include <dlfcn.h>
 #include <limits>
 #include <vector>
@@ -103,7 +104,16 @@ inline bool try_copy_page_first_pages_batch(
   return false;
 #else
   host::RuntimeCheck(src_ptrs.size() == dst_ptrs.size(), "Source and destination tensors must have the same count");
-  constexpr size_t kLargeCopyThresholdBytes = 128 * 1024;
+  // Pages below this many bytes take the per-page fallback loop instead of one
+  // cudaMemcpyBatchAsync. Small-page MLA layouts (2304 B/page) never reach the
+  // 128 KiB default, so SGLANG_HICACHE_BATCH_COPY_THRESHOLD can lower it
+  // (read once, at first use).
+  static const size_t kLargeCopyThresholdBytes = []() {
+    if (const char* s = std::getenv("SGLANG_HICACHE_BATCH_COPY_THRESHOLD")) {
+      return static_cast<size_t>(std::strtoull(s, nullptr, 10));
+    }
+    return static_cast<size_t>(128 * 1024);
+  }();
   thread_local std::vector<CudaMemcpyBatchPtr> batch_srcs;
   thread_local std::vector<CudaMemcpyBatchPtr> batch_dsts;
   thread_local std::vector<size_t> batch_sizes;

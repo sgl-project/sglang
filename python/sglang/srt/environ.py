@@ -744,6 +744,11 @@ class Envs:
     # HiCache host<->device transfers use the TMA staging kernel when the GPU
     # (sm_90+), row size and page size allow; set to 0 to force the register kernel.
     SGLANG_HICACHE_TMA_TRANSFER = EnvBool(True)
+    # Pages must be at least this many bytes for the staged write-back to issue
+    # one cudaMemcpyBatchAsync instead of per-page cudaMemcpyAsync. None keeps
+    # the kernel's built-in 128 KiB default; the JIT kernel reads the value
+    # straight from the environment, once at first use.
+    SGLANG_HICACHE_BATCH_COPY_THRESHOLD = EnvInt(None)
     # Base token count for each MLA/DSA dedup broadcast chunk.
     SGLANG_MLA_DEDUP_CHUNK_TOKENS = EnvInt(2048)
     SGLANG_HICACHE_HF3FS_CONFIG_PATH = EnvStr(None)
