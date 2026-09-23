@@ -174,6 +174,7 @@ from sglang.srt.models.deepseek_common.utils import (
     _is_cpu,
     _is_cpu_amx_available,
     _is_cuda,
+    _is_gfx942_supported,
     _is_gfx95_supported,
     _is_hip,
     _is_musa,
@@ -539,6 +540,10 @@ class MoEGate(nn.Module):
                 out_dtype=torch.float32,
                 max_m=self.tiny_router_gemm_max_tokens,
             )
+        elif self.is_deepseek_v4 and _is_gfx942_supported:
+            # Ahead of the AITER branch: its tuned GEMM can accumulate split-K partials in
+            # BF16 on gfx942, so identical forwards could route tokens differently.
+            logits = F.linear(hidden_states.float(), self.weight.detach().float())
         elif _use_aiter:
             logits = aiter_dsv3_router_gemm(hidden_states, self.weight)
         elif not _is_cuda:
