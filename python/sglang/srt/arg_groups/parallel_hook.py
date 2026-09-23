@@ -121,6 +121,46 @@ def handle_context_parallelism(server_args: Any):
     )
 
 
+def handle_shared_experts_tp(server_args: Any):
+    cfg = resolving_view(server_args)
+    size = cfg.shared_experts_tp_size
+    if size is None:
+        return
+
+    from sglang.srt.runtime_context import derive_attention_widths
+
+    view = resolved_view(server_args)
+    _, attn_tp_size = derive_attention_widths(
+        tp_size=cfg.tp_size,
+        attn_cp_size=view.attn_cp_size,
+        dp_size=cfg.dp_size,
+        enable_dp_attention=view.enable_dp_attention,
+    )
+    if size < 1 or attn_tp_size % size != 0:
+        raise ValueError(
+            f"--shared-experts-tp-size ({size}) must be a positive divisor "
+            f"of attention TP size ({attn_tp_size})."
+        )
+    if parse_connector_type(cfg.model_path) == ConnectorType.INSTANCE:
+        raise ValueError(
+            "--shared-experts-tp-size requires a Kimi-K3 model configuration."
+        )
+    model_arch = model_config_of(server_args).hf_config.architectures[0]
+    if model_arch != "KimiK3ForConditionalGeneration":
+        raise ValueError("--shared-experts-tp-size is only supported for Kimi-K3.")
+    if cfg.moe_a2a_backend not in (
+        "deepep",
+        "megamoe",
+        "mooncake",
+        "ascend_fuseep",
+        "mori",
+    ):
+        raise ValueError(
+            "--shared-experts-tp-size requires an expert-parallel all-to-all "
+            "backend (deepep, megamoe, mooncake, ascend_fuseep or mori)."
+        )
+
+
 def handle_decode_context_parallelism(server_args: Any):
     run_post_process_pass(server_args, _dcp_comm_backend_default)
     cfg = resolving_view(server_args)
@@ -357,21 +397,6 @@ def handle_elastic_ep(server_args: Any):
     from sglang.srt.arg_groups.validation_hook import validate_ib_devices
 
     cfg = resolving_view(server_args)
-    if cfg.elastic_ep_rejoin:
-        if cfg.ep_join_mode is None:
-            logger.warning(
-                "--elastic-ep-rejoin is deprecated, use --elastic-ep-join-mode recover instead."
-            )
-            declare_resolution(
-                server_args,
-                "_handle_elastic_ep",
-                ep_join_mode="recover",
-            )
-        else:
-            assert cfg.ep_join_mode == "recover", (
-                "--elastic-ep-rejoin (deprecated) conflicts with "
-                f"--elastic-ep-join-mode {cfg.ep_join_mode}."
-            )
     if cfg.elastic_ep_backend is not None:
         if cfg.enable_eplb:
             if cfg.eplb_algorithm == "auto":
@@ -586,13 +611,6 @@ def handle_eplb_and_dispatch(server_args: Any):
 
 def handle_expert_distribution_metrics(server_args: Any):
     cfg = resolving_view(server_args)
-    if "SGLANG_ENABLE_EPLB_BALANCEDNESS_METRIC" in os.environ:
-        raise ValueError(
-            "SGLANG_ENABLE_EPLB_BALANCEDNESS_METRIC is no longer supported. Use "
-            "--expert-balancedness-report-mode with one of: off, server_log, "
-            "prometheus, both."
-        )
-
     if should_report_expert_balancedness(server_args) and (
         cfg.expert_distribution_recorder_mode is None
     ):
