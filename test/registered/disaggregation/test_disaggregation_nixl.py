@@ -151,7 +151,9 @@ class NixlPDDisaggregationServerBase(PDDisaggregationServerBase):
             "--tp",
             str(cls.prefill_tp_size),
         ] + list(cls.extra_prefill_args)
-        prefill_args += cls.transfer_backend + cls.rdma_devices
+        prefill_args += cls.transfer_backend + cls.rdma_devices_for(
+            range(cls.prefill_tp_size)
+        )
         cls.process_prefill = popen_launch_pd_server(
             cls.model,
             cls.prefill_url,
@@ -178,7 +180,9 @@ class NixlPDDisaggregationServerBase(PDDisaggregationServerBase):
             "--base-gpu-id",
             str(cls.decode_base_gpu_id),
         ] + list(cls.extra_decode_args)
-        decode_args += cls.transfer_backend + cls.rdma_devices
+        decode_args += cls.transfer_backend + cls.rdma_devices_for(
+            range(cls.decode_base_gpu_id, cls.decode_base_gpu_id + cls.decode_tp_size)
+        )
         cls.process_decode = popen_launch_pd_server(
             cls.model,
             cls.decode_url,

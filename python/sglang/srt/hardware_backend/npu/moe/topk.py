@@ -1,7 +1,16 @@
 from typing import TYPE_CHECKING, Optional
 
 import torch
-from sgl_kernel_npu.norm.l1_norm import l1_norm
+
+from sglang.srt.utils.custom_op import register_custom_op
+
+
+@register_custom_op(out_shape=0)
+def _l1_norm(x: torch.Tensor) -> torch.Tensor:
+    from sgl_kernel_npu.norm.l1_norm import l1_norm
+
+    return l1_norm(x)
+
 
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location_dispatch import topk_ids_logical_to_physical
@@ -16,20 +25,6 @@ if TYPE_CHECKING:
     from sglang.srt.layers.moe.topk import TopKConfig, TopKOutput
 
 
-def _apply_routed_scaling_after_renorm(
-    topk_weights: torch.Tensor,
-    topk_config: "TopKConfig",
-) -> torch.Tensor:
-    """Mirror GPU post-renorm scaling when apply_routed_scaling_factor_on_output is set."""
-    if (
-        topk_config.renormalize
-        and topk_config.apply_routed_scaling_factor_on_output
-        and topk_config.routed_scaling_factor is not None
-    ):
-        return topk_weights * topk_config.routed_scaling_factor
-    return topk_weights
-
-
 def fused_topk_npu(
     hidden_states: torch.Tensor,
     router_logits: torch.Tensor,
@@ -38,7 +33,6 @@ def fused_topk_npu(
     expert_location_dispatch_info: Optional["ExpertLocationDispatchInfo"] = None,
     layer_id: Optional[int] = None,
 ) -> "TopKOutput":
-
     use_grouped_topk = topk_config.use_grouped_topk
     renormalize = topk_config.renormalize
     correction_bias = topk_config.correction_bias
@@ -74,7 +68,7 @@ def fused_topk_npu(
         )
 
         if renormalize:
-            topk_weights = l1_norm(
+            topk_weights = _l1_norm(
                 topk_weights
                 if topk_config.num_fused_shared_experts == 0
                 else topk_weights[:, :-1]
