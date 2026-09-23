@@ -13,13 +13,14 @@ export const MiniMaxM25Deployment = () => {
         { id: 'mi300x', label: 'MI300X', default: false },
         { id: 'mi325x', label: 'MI325X', default: false },
         { id: 'mi355x', label: 'MI355X', default: false },
-        { id: 'a3', label: 'Ascend A3', default: false }
+        { id: 'a2', label: 'Ascend A2', subtitle: '8 × 910B4 / 32 GiB · smoke tested', default: false },
+        { id: 'a3', label: 'Ascend A3', subtitle: 'Reference · hardware validation pending', default: false }
       ]
     },
     gpuCount: {
       name: 'gpuCount',
       title: 'GPU Count',
-      condition: (values) => values.hardware !== 'a3',
+      condition: (values) => values.hardware !== 'a3' && values.hardware !== 'a2',
       getDynamicItems: (values) => {
         const isAMD = values.hardware === 'mi300x' || values.hardware === 'mi325x' || values.hardware === 'mi355x';
         return [
@@ -47,7 +48,7 @@ export const MiniMaxM25Deployment = () => {
     thinking: {
       name: 'thinking',
       title: 'Thinking Capabilities',
-      condition: (values) => values.hardware !== 'a3',
+      condition: (values) => values.hardware !== 'a3' && values.hardware !== 'a2',
       items: [
         { id: 'disabled', label: 'Disabled', default: true },
         { id: 'enabled', label: 'Enabled', default: false }
@@ -57,7 +58,7 @@ export const MiniMaxM25Deployment = () => {
     toolcall: {
       name: 'toolcall',
       title: 'Tool Call Parser',
-      condition: (values) => values.hardware !== 'a3',
+      condition: (values) => values.hardware !== 'a3' && values.hardware !== 'a2',
       items: [
         { id: 'disabled', label: 'Disabled', default: true },
         { id: 'enabled', label: 'Enabled', default: false }
@@ -82,7 +83,14 @@ export const MiniMaxM25Deployment = () => {
       title: 'W8A8 Model Directory',
       type: 'text',
       default: '/models/MiniMax-M2.5-w8a8-QuaRot',
-      condition: (values) => values.hardware === 'a3'
+      condition: (values) => values.hardware === 'a3' || values.hardware === 'a2'
+    },
+    tokenizerPath: {
+      name: 'tokenizerPath',
+      title: 'Tokenizer Directory',
+      type: 'text',
+      default: '/models/MiniMax-M2.5-w8a8-QuaRot',
+      condition: (values) => values.hardware === 'a2'
     },
     draftModelPath: {
       name: 'draftModelPath',
@@ -102,6 +110,40 @@ export const MiniMaxM25Deployment = () => {
 
   const generateCommand = (values) => {
     const { hardware, gpuCount, thinking, toolcall } = values;
+
+    if (hardware === 'a2') {
+      const { modelPath, tokenizerPath } = values;
+      const isAbsolutePath = (path) => typeof path === 'string' && path.startsWith('/') && !/[\u0000-\u001f\u007f]/.test(path);
+      if (!isAbsolutePath(modelPath) || !isAbsolutePath(tokenizerPath)) {
+        return '# Enter absolute model and tokenizer directory paths inside the container.';
+      }
+      const shellQuote = (value) => "'" + value.replace(/'/g, "'\\''") + "'";
+      const environment = [
+        '# Ascend A2: 8 x 910B4, 32 GiB per device, single-request smoke configuration',
+        '# Complete the A2 prerequisites in this guide before launching.',
+        '# Observed KV pool: 896 tokens; inputs above 890 tokens were rejected.',
+        '# Tool-call parser configured; tool calling has not been tested.',
+        `MODEL_PATH=${shellQuote(modelPath)}`,
+        `TOKENIZER_PATH=${shellQuote(tokenizerPath)}`,
+        'export HCCL_BUFFSIZE=128',
+        'export OMP_NUM_THREADS=1',
+        'export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True',
+        ''
+      ];
+      const launch = [
+        'python -m sglang.launch_server',
+        '    --model-path "$MODEL_PATH"',
+        '    --tokenizer-path "$TOKENIZER_PATH"',
+        '    --device npu --tp-size 8 --quantization modelslim --dtype bfloat16',
+        '    --reasoning-parser minimax',
+        '    --tool-call-parser minimax-m2',
+        '    --host 127.0.0.1 --port 31216',
+        '    --context-length 4096 --max-running-requests 1',
+        '    --chunked-prefill-size 128 --max-prefill-tokens 4096',
+        '    --mem-fraction-static 0.95 --disable-cuda-graph --disable-radix-cache'
+      ];
+      return environment.join('\n') + '\n' + launch.join(' \\\n');
+    }
 
     if (hardware === 'a3') {
       const { ascendPreset, modelPath, draftModelPath, networkInterface } = values;
@@ -271,7 +313,7 @@ export const MiniMaxM25Deployment = () => {
 
   const getUpdatedValues = (previous, optionName, value) => {
     const next = { ...previous, [optionName]: value };
-    if (optionName === 'hardware' && value !== 'a3') {
+    if (optionName === 'hardware' && value !== 'a3' && value !== 'a2') {
       const items = options.gpuCount.getDynamicItems(next);
       if (!items.some((item) => item.id === next.gpuCount && !item.disabled)) {
         next.gpuCount = items.find((item) => item.default && !item.disabled).id;
