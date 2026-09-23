@@ -1578,15 +1578,8 @@ def _moe_runner_backend_quant_constraints(view: Any) -> dict:
     return {}
 
 
-# MoE runner backends whose TopK forward never materializes per-token expert
-# ids (TopK.forward_cuda returns a BYPASSED / TRITON_KERNEL output and the
-# routing runs inside the fused kernel). topk.py's
-# capture_routed_experts_if_allowed is never reached on these paths, so the
-# routed-experts capturer (state_capturer/routed_experts.py) would return its
-# zero-initialized host buffer: every token appears routed to expert 0 x topk.
-# A miles R3 (--use-rollout-routing-replay) consumer then replays those
-# duplicate ids and the training engine's MoE dispatcher crashes in alltoall
-# ("Split sizes doesn't match total dim 0 size").
+# Routing runs inside the fused kernel, so capture_routed_experts_if_allowed is never
+# reached and the routed-experts capturer returns its zero-initialized buffer.
 _TOPK_BYPASSING_MOE_RUNNER_BACKENDS = frozenset(
     {
         "flashinfer_trtllm",
@@ -1599,16 +1592,9 @@ _TOPK_BYPASSING_MOE_RUNNER_BACKENDS = frozenset(
 
 @register_post_process
 def _routed_experts_capture_backend_guard(view: Any) -> dict:
-    """--enable-return-routed-experts needs a topk-id-materializing MoE runner.
-
-    Slot pass in moe_hook.handle_moe_kernel_config, after every
-    moe_runner_backend resolution (arch overrides like
-    _deepseek_moe_quant_resolution may have picked flashinfer_trtllm on
-    SM100): downgrade a topk-bypassing runner back to 'auto' when that is
-    safe for the quantization (auto resolves to a StandardTopKOutput-
-    consuming runner there), otherwise fail loudly instead of shipping an
-    all-zero routed-experts payload.
-    """
+    """--enable-return-routed-experts needs a MoE runner that materializes topk ids;
+    downgrade a bypassing one to 'auto' where that is safe for the quantization,
+    otherwise refuse instead of returning all-zero routed experts."""
     if not view.enable_return_routed_experts:
         return {}
     if view.moe_runner_backend not in _TOPK_BYPASSING_MOE_RUNNER_BACKENDS:
