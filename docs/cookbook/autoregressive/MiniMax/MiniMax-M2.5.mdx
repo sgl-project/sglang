@@ -1,6 +1,6 @@
 ---
 title: MiniMax-M2.5
-description: "Deploy MiniMax-M2.5 with SGLang on NVIDIA, AMD, and Ascend A3 hardware."
+description: "Deploy MiniMax-M2.5 with SGLang on NVIDIA, AMD, or Ascend A2, with an Ascend A3 reference configuration."
 metatags:
     description: "Deploy MiniMax-M2.5 with SGLang - community contribution guide for MiniMax M2.5 model deployment."
 ---
@@ -36,12 +36,28 @@ docker pull lmsysorg/sglang:v0.5.9-rocm720-mi30x
 docker pull lmsysorg/sglang:v0.5.9-rocm720-mi35x
 ```
 
-### Ascend A3 prerequisites
+### Ascend A2 prerequisites (smoke tested)
+
+Select **Ascend A2** for the tested **8 × Ascend 910B4, 32 GiB HBM per device** configuration. It loads the W8A8 main model with TP=8 and serves one request at a time, without a draft model. Loading, warm-up, and three short chat requests passed; see [the validation record](#5-4-ascend-a2-smoke-validation) for the runtime versions and test limits.
+
+1. Prepare a compatible Ascend NPU runtime using the [NPU installation guide](/docs/hardware-platforms/ascend-npus/getting-started/installation). The tested runtime was SGLang `0.5.14.dev172+gf308abc05`, TorchNPU 2.10.0, and sgl-kernel-npu 2026.5.1. An exact CANN version and image digest were not captured; the A3 image below was not validated for this A2 run.
+2. Run `npu-smi info` inside the container and confirm all eight 910B4 devices are visible and healthy. Reserve space for the approximately 230.82 GB main weights, download cache, and runtime.
+3. Download the complete main model repository, including tokenizer and configuration files:
+
+```bash Command
+python -m pip install modelscope
+modelscope download --model Eco-Tech/MiniMax-M2.5-w8a8-QuaRot \
+  --local_dir /models/MiniMax-M2.5-w8a8-QuaRot
+```
+
+Enter absolute paths inside your container in the selector. Both directories default to the complete model directory. If you keep tokenizer files separately, use files from the same model revision and set **Tokenizer Directory** accordingly. The original experiment used separate metadata and weights directories, as recorded in section 5.4.
+
+### Ascend A3 prerequisites (unvalidated reference)
 
 The A3 selector provides **one Ascend A3 node with 8 cards / 16 NPU dies**, running prefill and decode together (PD co-located). It uses W8A8 weights and EAGLE3 speculative decoding. Each A3 card contains two dies; a cloud allocation labelled "1 NPU" is not a full node. The [minimum recommended W8A8 configuration](/docs/hardware-platforms/ascend-npus/model-deployment/tutorials/minimax_m2_5#model-weights) is 4 cards / 8 dies with 64 GB per die, while this preset requires all 16 dies.
 
 <Note>
-This recipe is based on the upstream Ascend best practice. Hardware validation of the generated A3 cookbook command is pending; the reference accuracy and performance values below are not measurements of this recipe. A separate A2 low-concurrency smoke test is recorded in section 5.4 and does not validate the A3 preset.
+This recipe is based on the upstream Ascend best practice. Hardware validation of the generated A3 cookbook command is pending; the reference accuracy and performance values below are not measurements of this recipe. The tested A2 selector is a separate low-concurrency configuration and does not validate the A3 preset.
 </Note>
 
 1. Set up the Ascend runtime using the [MiniMax-M2.5 installation instructions](/docs/hardware-platforms/ascend-npus/model-deployment/tutorials/minimax_m2_5#installation). The reference environment uses CANN 9.0.0 and `quay.io/ascend/sglang:cann9.0.0-a3-v0.5.16`. Map `/dev/davinci0` through `/dev/davinci15` and mount your model directory into the container, for example `-v /path/to/models:/models`.
@@ -82,13 +98,13 @@ This section provides deployment configurations optimized for different hardware
 
 ### 3.1 Basic Configuration
 
-**Interactive Command Generator**: Select your hardware to generate the deployment command. For **Ascend A3**, complete the prerequisites above, enter both model directories as absolute paths inside the container, and set the HCCL / Gloo interface. The A3 preset uses 3,500 input and 1,500 output tokens as its reference workload.
+**Interactive Command Generator**: Select your hardware to generate the deployment command. For **Ascend A2**, complete the A2 prerequisites and enter the model and tokenizer directories; the command reproduces the tested single-request settings on port 31216. For **Ascend A3**, complete its separate prerequisites, enter both model directories as absolute paths inside the container, and set the HCCL / Gloo interface. The unvalidated A3 preset uses 3,500 input and 1,500 output tokens as its reference workload.
 
 <MiniMaxM25Deployment />
 
 ### 3.2 Configuration Tips
 
-**GPU parameters:** The following recommendations apply to the NVIDIA and AMD recipes. The Ascend preset uses the separate settings described below.
+**GPU parameters:** The following recommendations apply to the NVIDIA and AMD recipes. The Ascend presets use the separate settings described below.
 
 <table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
   <colgroup>
@@ -158,7 +174,7 @@ This section provides deployment configurations optimized for different hardware
 - **4-GPU deployment**: Requires 4× GPUs (e.g., MI300X, MI325X, MI355X) with TP=4, EP=4
 - **8-GPU deployment**: Requires 8× GPUs (e.g., MI300X, MI325X, MI355X) with TP=8, EP=8
 
-### 3.3 Ascend A3 configuration
+### 3.3 Ascend A3 configuration (unvalidated reference)
 
 The generated A3 command follows the [8-card throughput reference](/docs/hardware-platforms/ascend-npus/model-deployment/best-practices/minimax_m2_5#minimax-m2-5-w8a8-8p-in3k5-out1k5-50ms). Keep the environment variables and server arguments together when reproducing that workload.
 
@@ -174,9 +190,31 @@ The generated A3 command follows the [8-card throughput reference](/docs/hardwar
 
 The A3 preset fixes the reasoning parser to `minimax-append-think` and the tool parser to `minimax-m2`. It does not use the GPU count or parser toggles. To use fewer A3 cards or a different workload, follow the corresponding [Ascend best practice](/docs/hardware-platforms/ascend-npus/model-deployment/best-practices/minimax_m2_5) with its complete configuration.
 
+### 3.4 Ascend A2 configuration (smoke tested)
+
+The A2 selector fixes TP=8, ModelSlim quantization, BF16, `--context-length 4096`, and `--max-running-requests 1`. It uses prefill chunks of 128, maximum prefill tokens of 4096, static memory fraction 0.95, and disables graph capture and radix cache. No EAGLE3 draft model is required.
+
+The `minimax` reasoning parser separated reasoning from answer content in the tested runtime. The `minimax-m2` tool-call parser is configured, but tool calling was not tested. GPU count and parser toggles do not apply to this preset. **The configured 4096-token context is not usable capacity on this allocation:** the follow-up run allocated a 896-token KV pool and reported a maximum input length of 890 tokens. See section 5.4 for rejected requests and the short-input measurements. GPQA accuracy, standardized throughput, and sustained stability remain unmeasured.
+
 ## 4. Model Invocation
 
 For the **Ascend A3** preset, use [the A3 service checks](#4-3-verify-the-ascend-a3-service), which target port 6688 and read the deployed model identifier from `/v1/models`. The GPU examples below use their own model identifier and endpoints.
+
+For **Ascend A2**, use `http://127.0.0.1:31216/v1` from the same host or container network. After startup completes, this short request uses the settings from the smoke test:
+
+```python Example
+from openai import OpenAI
+
+client = OpenAI(base_url="http://127.0.0.1:31216/v1", api_key="EMPTY")
+model = client.models.list().data[0].id
+response = client.chat.completions.create(
+    model=model,
+    messages=[{"role": "user", "content": "What is the capital of France? Answer with the city name only."}],
+    temperature=0,
+    max_tokens=512,
+)
+print(response.choices[0].message.content)
+```
 
 ### 4.1 Basic Usage
 
@@ -527,7 +565,9 @@ Check that the final answer identifies Paris. Repeat requests and check the serv
 
 For **Ascend A3**, use [the A3 throughput and accuracy benchmarks](#5-3-ascend-a3-benchmarks) with the command generated in section 3.
 
-This section uses **industry-standard configurations** for comparable benchmark results.
+For **Ascend A2**, [section 5.4](#5-4-ascend-a2-smoke-validation) records short-request smoke validation only. No standardized throughput or accuracy benchmark has been completed for that preset.
+
+The benchmark sections below use **industry-standard configurations** for comparable benchmark results; the A2 smoke record has a separate, limited scope.
 
 ### 5.1 Speed Benchmark
 
@@ -1194,11 +1234,11 @@ Run the full **198-question** dataset and retain the EvalScope version, dataset 
 
 {/* TODO: Add A3 startup, accuracy, and performance evidence after validating the generated command on the target hardware. */}
 
-### 5.4 Supplemental A2 smoke validation
+### 5.4 Ascend A2 smoke validation
 
-On September 22, 2026, the W8A8 main model completed loading, warm-up, and three short chat requests on **8 Ascend 910B4 devices with 32 GiB HBM each**. Eight-rank HCCL all-reduce and BF16 matrix operations also passed. This experiment used no EAGLE3 draft model and is separate from the A3 selector above.
+On September 22, 2026, the W8A8 main model completed loading, warm-up, and three short chat requests on **8 Ascend 910B4 devices with 32 GiB HBM each**. Eight-rank HCCL all-reduce and BF16 matrix operations also passed. These are the settings exposed by the **Ascend A2** selector above. This experiment used no EAGLE3 draft model and is separate from the A3 reference configuration.
 
-The runtime was SGLang `0.5.14.dev172+gf308abc05` (commit `f308abc05212c2f5f455de22a525e14afa63ee4f`), Python 3.11.15, Torch 2.10.0+cpu, TorchNPU 2.10.0, Transformers 5.8.1, and sgl-kernel-npu 2026.5.1. The supplied environment had modified `python/pyproject.toml` and a deleted `python/pyproject_npu.toml`; this was not a clean source-build validation. An image digest, exact CANN version, and immutable model revision were not captured, so this record is not a fully pinned environment specification.
+The runtime was SGLang `0.5.14.dev172+gf308abc05` (commit `f308abc05212c2f5f455de22a525e14afa63ee4f`), Python 3.11.15, Torch 2.10.0+cpu, TorchNPU 2.10.0, Transformers 5.8.1, and sgl-kernel-npu 2026.5.1. A follow-up inspection of the same environment on September 23 recorded CANN 9.0.0 and driver 25.5.2. The supplied environment had modified `python/pyproject.toml` and a deleted `python/pyproject_npu.toml`; this was not a clean source-build validation. An image digest and immutable model revision were not captured, so this record is not a fully pinned environment specification.
 
 After downloading the W8A8 main model listed above, the tested service settings were:
 
@@ -1217,7 +1257,7 @@ python -m sglang.launch_server \
   --mem-fraction-static 0.95 --disable-cuda-graph --disable-radix-cache
 ```
 
-The paths above are the experiment paths: `model` contains the complete main weights, while `metadata` contains the tokenizer and configuration files from the same model repository, downloaded separately while weights were transferring. Replace both paths with your local directories. Keep tokenizer and weights from the same revision.
+The paths above are the experiment paths: `model` contains the complete main weights, while `metadata` contains the tokenizer and configuration files from the same model repository, downloaded separately while weights were transferring. Replace both paths with your local directories. The selector defaults both paths to one complete repository directory; this path convenience differs from the original experiment's separate metadata directory. Keep tokenizer and weights from the same revision.
 
 Requests used `/v1/chat/completions`, `temperature=0`, and `max_tokens=512`:
 
@@ -1229,4 +1269,18 @@ Requests used `/v1/chat/completions`, `temperature=0`, and `max_tokens=512`:
 
 The `minimax` reasoning parser separated reasoning from answer content in this runtime. The three answers contained no thinking tags, and the final health check returned HTTP 200. The tool-call parser was configured but tool calling was not tested.
 
-These checks establish short-request functionality only. They do not establish GPQA accuracy, long-context capacity, sustained stability, or performance under the A3 reference workload. The configured 4096-token context limit was not exercised with near-limit input. This observed 8×32 GiB low-concurrency run does not replace the upstream recommended hardware configuration.
+On September 23, a bounded serial follow-up used the same launch settings. After two warm-up requests, five of six simple answer checks passed; the JSON check exhausted its 128-token output budget and was inconclusive. Reasoning consumes that budget as well as final-answer tokens. This does not supersede the earlier successful JSON request with a 512-token budget.
+
+Three native `/generate` probes used exact input-token IDs from `/v1/tokenize`, requested 128 output tokens, and set `ignore_eos=true`. These are individual operational measurements, not a standardized throughput benchmark:
+
+| Input tokens | Output tokens | End-to-end time (s) | First observed output (s) |
+| --- | --- | --- | --- |
+| 64 | 128 | 37.265 | 8.102 |
+| 128 | 128 | 32.139 | 3.277 |
+| 256 | 128 | 32.780 | 3.548 |
+
+Timing includes HTTP/SSE processing; first output means the first nonempty text or positive output-token count observed by the client, not a kernel timing. Each input length was measured once at concurrency 1, so these results do not establish a latency percentile or saturation throughput.
+
+**Capacity limitation:** startup allocated only 896 KV tokens despite `--context-length 4096`. Requests with 1024 and 2048 input tokens were rejected with `BadRequestError`, reporting a maximum allowed input length of 890 tokens. The client stopped after these two consecutive failures; the planned 3500-token request was not attempted. A subsequent health check still returned HTTP 200. Do not infer usable context capacity from the configured limit or `/v1/models` alone; check the startup KV allocation and actual request limits.
+
+These checks establish short-request functionality only. They do not establish GPQA accuracy, long-context capacity, sustained stability, tool calling, or performance under the A3 reference workload. This observed 8×32 GiB low-concurrency run does not replace the upstream recommended hardware configuration.
