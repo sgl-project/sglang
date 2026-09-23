@@ -406,10 +406,6 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         implementations that shard trees per cache namespace."""
         return self.root_node
 
-    def is_backuped(self, node: Any) -> bool:
-        """Whether the node's Full KV is present on host."""
-        return node.backuped
-
     def is_root(self, node: Any) -> bool:
         """Whether the node is a tree root."""
         return node is self.root_node
