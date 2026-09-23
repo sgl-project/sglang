@@ -944,6 +944,7 @@ class TestDecodePrebuilt(unittest.TestCase):
         running.dsv41_cache_only_replay = False
         replay = MagicMock(name="replay")
         replay.dsv41_cache_only_replay = True
+        replay.is_empty.return_value = False
         scheduler.get_new_prebuilt_batch = MagicMock(return_value=replay)
 
         first = SchedulerDisaggregationDecodeMixin.get_next_disagg_decode_batch_to_run(
@@ -964,7 +965,6 @@ class TestDecodePrebuilt(unittest.TestCase):
         self.assertIsNone(scheduler.dsv41_suspended_decode_batch)
 
         scheduler.get_new_prebuilt_batch.reset_mock()
-        replay.is_empty.return_value = False
         updated = MagicMock(name="updated")
         scheduler.update_running_batch = MagicMock(return_value=updated)
 
