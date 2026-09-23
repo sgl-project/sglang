@@ -1,21 +1,19 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 The SGLang Authors
 // SPDX-License-Identifier: Apache-2.0
 
-//! Command-line interface. The router is configured entirely through
-//! flags — there is no config file. [`Cli::into_config`] resolves the
-//! flags into a validated [`Config`].
+//! Grouped CLI options and conversion into a validated [`Config`].
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, ensure, Result};
 use clap::Parser;
 use std::num::NonZeroU32;
 
-use crate::config::sampling::{parse_sampling_overrides, ConflictPolicy, SamplingOverrides};
+use crate::config::sampling::{parse_sampling_overrides, ConflictPolicy};
 use crate::config::{
     default_cb_cool_down, default_host, default_port, default_proxy_request_timeout_secs,
-    default_shutdown_drain_secs, default_stale_request_timeout_secs, resolve_mode,
-    ActiveLoadConfig, AffinityConfig, AffinityMode, CacheAwareConfig, CachePrefixProvider,
-    CircuitBreakerConfig, Config, DecodePolicyKind, DiscoveryBackend, EligibilityConfig,
-    FilterKind, FusedTerm, K8sDiscoveryConfig, KvIndexerEndpointConfig, LogFormat, ModelConfig,
+    default_shutdown_drain_secs, default_stale_request_timeout_secs, resolve_mode, AffinityConfig,
+    AffinityMode, CacheAwareConfig, CachePrefixProvider, ChatRoutingKind, CircuitBreakerConfig,
+    Config, DecodePolicyKind, DiscoveryBackend, EligibilityConfig, FilterKind, FusedTerm,
+    InflightLoadConfig, K8sDiscoveryConfig, KvIndexerEndpointConfig, LogFormat, ModelConfig,
     ObservabilityConfig, PolicyKind, ProxyConfig, ServerConfig, SessionAffinityMode,
     StaticUrlsDiscoveryConfig, StickyConfig, StickyFallbackKind, DEFAULT_FUSE,
 };
@@ -23,88 +21,66 @@ use crate::config::{
 const DEFAULT_KV_INDEXER_QUERY_TIMEOUT_MS: u64 = 100;
 const DEFAULT_KV_INDEXER_QUERY_MAX_INFLIGHT: usize = sgl_kv_indexer::DEFAULT_QUERY_MAX_INFLIGHT;
 
-/// `sgl-router` — slim KV-aware OpenAI-compatible router for SGLang workers.
-///
-/// Discovery is mutually exclusive: pass `--worker-urls` for a static
-/// worker list, or `--service-discovery` for Kubernetes EndpointSlice
-/// discovery — exactly one is required.
 #[derive(Parser, Debug)]
 #[command(
     name = "sgl-router",
     version,
-    about = "Slim KV-aware OpenAI-compatible router for SGLang workers"
+    about = "Slim KV-aware OpenAI-compatible router for SGLang workers",
+    after_help = "Examples:\n  sgl-router --model-id Qwen/Qwen3-0.6B --worker-urls http://localhost:30001\n  sgl-router --model-id Qwen/Qwen3-0.6B --service-discovery --selector app=sglang\n\nChoose exactly one discovery backend. Policy-specific options name their required policy in the descriptions."
 )]
 pub struct Cli {
-    // ---- server ----
-    /// Address to bind the HTTP server to.
-    #[arg(long, default_value_t = default_host())]
-    pub host: String,
-    /// Port to bind the HTTP server to.
-    #[arg(long, default_value_t = default_port())]
-    pub port: u16,
-    /// Seconds to keep serving after SIGTERM, with `/readyz` returning 503,
-    /// before the server stops accepting — so the endpoint removal reaches
-    /// kube-proxy first. Leave room under terminationGracePeriodSeconds for the
-    /// in-flight drain that follows. If you rely on a readiness probe (rather
-    /// than pod deletion) to deregister, size this above your
-    /// failureThreshold * periodSeconds. The default equals the k8s default
-    /// terminationGracePeriodSeconds, so on a pod that has not raised its grace
-    /// period startup warns until you do — and declare it with
-    /// --termination-grace-secs so the check uses the real budget.
-    /// 0 disables the pause.
-    #[arg(long, default_value_t = default_shutdown_drain_secs())]
-    pub shutdown_drain_secs: u64,
-    /// The pod's terminationGracePeriodSeconds, if you have raised it from the
-    /// k8s default of 30. Only used to check --shutdown-drain-secs leaves room
-    /// for the in-flight drain at startup: the router cannot read its own pod
-    /// spec, so without this it warns against the default and a deliberately
-    /// long drain has no way to say it is safe.
-    #[arg(long)]
-    pub termination_grace_secs: Option<u64>,
+    #[command(flatten, next_help_heading = "Model, tokenizer and sampling")]
+    pub model: ModelArgs,
+    #[command(flatten, next_help_heading = "Server, timeouts and logging")]
+    pub server: ServerArgs,
+    #[command(
+        flatten,
+        next_help_heading = "Worker discovery (static URLs or Kubernetes)"
+    )]
+    pub discovery: DiscoveryArgs,
+    #[command(
+        flatten,
+        next_help_heading = "Routing policies, admission and circuit breaker"
+    )]
+    pub routing: RoutingArgs,
+    #[command(
+        flatten,
+        next_help_heading = "Cache-aware routing (--policy cache_aware)"
+    )]
+    pub cache: CacheArgs,
+    #[command(
+        flatten,
+        next_help_heading = "Session affinity, sticky routing and pressure guards"
+    )]
+    pub affinity: AffinityArgs,
+}
 
-    // ---- model (exactly one) ----
+#[derive(clap::Args, Debug)]
+pub struct ModelArgs {
     /// Model id this router serves (the OpenAI `model` field).
     #[arg(long)]
     pub model_id: String,
-    /// Tokenizer source: a local `tokenizer.json` path, or a HuggingFace
-    /// repo id to download from. When omitted, falls back to `--model-id`
-    /// as the repo id (download honors `HF_TOKEN` / `HF_HOME`).
+
+    /// Local tokenizer.json or HuggingFace repo id. Defaults to --model-id; honors HF_TOKEN / HF_HOME.
     #[arg(long)]
     pub tokenizer_path: Option<String>,
-    /// Disable router-generated input_ids for this model. Workers tokenize messages
-    /// themselves; cache-aware routing still renders locally. Use for worker-only
-    /// thinking/effort defaults, parser/template overrides, or template stop strings.
+
+    /// Disable generated input_ids; workers tokenize messages, while routing still renders locally.
+    /// Use for worker-only thinking defaults, parser/template overrides, or template stop strings.
     #[arg(long)]
     pub disable_input_ids_forwarding: bool,
-    /// Routing policy.
-    #[arg(long, value_enum, default_value = "round_robin")]
-    pub policy: PolicyKind,
-    /// Policy used to select decode workers for PD requests.
-    #[arg(long, value_enum, default_value = "power_of_two")]
-    pub decode_policy: DecodePolicyKind,
-    /// Static P/D bucket configuration. Omit to use the global candidate domain.
-    #[arg(long)]
-    pub bucket_config: Option<String>,
 
-    // ---- fleet-wide sampling contract (opt-in) ----
-    /// Sampling parameters fixed fleet-wide, as one JSON object keyed by the
-    /// request-body field names — e.g. `{"temperature": 1, "top_p": 0.95}`.
-    /// Keys: temperature, top_p, top_k, min_p, repetition_penalty,
-    /// frequency_penalty, presence_penalty, n. Each value is a number, or an
-    /// inclusive band `{"min": LO, "max": HI}`.
-    ///
-    /// A configured value is injected whenever the request omits that field;
-    /// `--sampling-param-conflict` decides what a request that sends one gets.
-    /// Unknown or repeated keys, out-of-domain values and a band under `allow`
-    /// all fail the launch, naming the offending key. Full contract — domains,
-    /// `null` handling, cost — in the router README.
+    /// Fleet sampling defaults as JSON, e.g. {"temperature": 1, "top_p": 0.95}.
+    /// Accepts temperature, top_p, top_k, min_p, repetition_penalty,
+    /// frequency_penalty, presence_penalty, and n. Numeric values fill absent
+    /// fields; {"min": LO, "max": HI} bands only constrain supplied values
+    /// and require reject mode. See README for domains and null handling.
     #[arg(long, value_name = "JSON")]
     pub override_sampling_params: Option<String>,
-    /// What a request that sends a value differing from
-    /// `--override-sampling-params` gets: `reject` (the default) 400s it
-    /// before admission, quoting the configured value; `allow` forwards the
-    /// client's value untouched. Only accepted alongside
-    /// `--override-sampling-params`.
+
+    /// How to handle sampling values that differ from configured defaults:
+    /// reject returns 400 before admission; allow forwards the client value.
+    /// Defaults to reject. Requires --override-sampling-params.
     #[arg(
         long,
         value_enum,
@@ -112,604 +88,322 @@ pub struct Cli {
         requires = "override_sampling_params"
     )]
     pub sampling_param_conflict: Option<ConflictPolicy>,
+}
 
-    // ---- circuit breaker (opt-in via --cb-threshold) ----
-    /// Consecutive upstream failures before the circuit breaker opens.
-    /// Setting this enables the circuit breaker; `0` is rejected.
-    #[arg(long)]
-    pub cb_threshold: Option<NonZeroU32>,
-    /// Circuit-breaker cool-down in seconds. Only meaningful with
-    /// `--cb-threshold`; defaults to 30 when the breaker is enabled.
-    #[arg(long)]
-    pub cb_cool_down_secs: Option<u64>,
+#[derive(clap::Args, Debug)]
+pub struct ServerArgs {
+    /// Address to bind the HTTP server to.
+    #[arg(long, default_value_t = default_host())]
+    pub host: String,
 
-    /// External KV indexer gRPC endpoint used as the authoritative cache signal.
-    /// Needs an explicit scheme, e.g. `http://10.0.0.1:50051`.
-    #[arg(long)]
-    pub kv_indexer_endpoint: Option<String>,
-    /// KV Indexer query timeout in milliseconds. Requires
-    /// `--kv-indexer-endpoint`; defaults to 100.
-    #[arg(long)]
-    pub kv_indexer_query_timeout_ms: Option<u64>,
-    /// Maximum concurrent KV Indexer queries issued by this Router. Requires
-    /// `--kv-indexer-endpoint`; defaults to 32.
-    #[arg(long)]
-    pub kv_indexer_query_max_inflight: Option<usize>,
-    /// Prefix-match source for native Cache-Aware.
-    #[arg(long, value_enum)]
-    pub cache_prefix_provider: Option<CachePrefixProvider>,
+    /// Port to bind the HTTP server to.
+    #[arg(long, default_value_t = default_port())]
+    pub port: u16,
 
-    // ---- session-affinity tuning ----
-    /// Header carrying the session ID for `--policy session_aware`.
-    #[arg(long)]
-    pub session_id_header: Option<String>,
-    /// Idle timeout for a session assignment, in seconds.
-    #[arg(long)]
-    pub session_idle_secs: Option<u64>,
-    /// Session-assignment eviction cadence, in seconds.
-    #[arg(long)]
-    pub session_eviction_interval_secs: Option<u64>,
-    /// Use a deterministic backup for the affinity key and candidate range.
-    #[arg(long)]
-    pub stable_pair: bool,
-    /// Session-affinity admission mode.
-    #[arg(long, value_enum)]
-    pub affinity_mode: Option<AffinityMode>,
-    /// Session-affinity primary lookup and fallback behavior.
-    #[arg(long, value_enum)]
-    pub session_affinity_mode: Option<SessionAffinityMode>,
-    /// Disables the Session/Cache-Aware pressure guard.
-    #[arg(long)]
-    pub disable_pressure_guard: bool,
-    /// Absolute waiting-uncached-token gap required by the pressure guard.
-    #[arg(long)]
-    pub pressure_abs_threshold_tokens: Option<u64>,
-    /// Absolute millisecond gap when a Prefill queue estimate is available.
-    #[arg(long)]
-    pub pressure_abs_threshold_ms: Option<f64>,
-    /// Relative waiting-uncached-token multiplier required by the pressure guard.
-    #[arg(long)]
-    pub pressure_rel_threshold: Option<f64>,
-    /// Minimum cache-hit tokens for a cache-aware candidate.
-    #[arg(long)]
-    pub cache_affinity_min_matched_tokens: Option<u64>,
-    /// Minimum cache-hit ratio for a cache-aware candidate.
-    #[arg(long)]
-    pub cache_affinity_min_match_ratio: Option<f64>,
-    /// Minimum number of cache-aware candidates to try.
-    #[arg(long)]
-    pub cache_candidate_min_workers: Option<usize>,
-    /// Fraction of healthy prefill workers considered as cache-aware candidates.
-    #[arg(long)]
-    pub cache_candidate_ratio: Option<f64>,
-    /// Maximum number of cache-aware candidates to try.
-    #[arg(long)]
-    pub cache_candidate_max_workers: Option<usize>,
-    /// Maximum uncached-work difference that pressure may override.
-    #[arg(long)]
-    pub cache_switch_margin_tokens: Option<u64>,
-    /// Queue gate for cache affinity: a worker whose engine reports at least
-    /// this many waiting (queued) requests cannot win a selection on cache
-    /// affinity. The request goes to another worker holding the same prefix,
-    /// or failing that to the least-loaded worker that is not queueing; when
-    /// every worker is queueing the least-loaded worker overall keeps the
-    /// fleet routable. Unset disables the gate. Requires
-    /// `--policy cache_aware`; scale with the engine's `--dp-size` because
-    /// the published queue sums across a worker's DP ranks.
-    #[arg(long)]
-    pub worker_queue_limit: Option<u64>,
-    /// Saturation floor for `--worker-queue-limit` diversions: when no
-    /// cache candidate survives both the queue limit and hard admission,
-    /// at least one was over the limit, AND no worker in the routable
-    /// fleet has a fresh queue reading strictly below this floor, the
-    /// diverted request would wait wherever it lands, so it stays with the
-    /// least-pressured prefix owner instead — same wait, but prefilled
-    /// from cache instead of a full cold prefill that evicts other
-    /// prefixes and manufactures the next round of misses. Unset disables
-    /// the pin. Requires `--worker-queue-limit` (there is no diversion to
-    /// cancel without it) and must be at most the limit; scale with
-    /// `--dp-size` like the limit.
-    #[arg(long)]
-    pub saturation_queue_floor: Option<u64>,
+    /// Keep serving after SIGTERM with /readyz returning 503 before stopping accepts.
+    /// Leave time in the pod grace period for in-flight requests; cover readiness
+    /// probe failureThreshold * periodSeconds when probe-driven. 0 disables the pause.
+    #[arg(long, default_value_t = default_shutdown_drain_secs())]
+    pub shutdown_drain_secs: u64,
 
-    // ---- score composition ----
-    /// Policies to sum, spelled exactly as `--policy` spells them and each
-    /// optionally weighted: `--fuse prefix_cache=2.0,load_based=0.3`. An
-    /// omitted weight keeps that policy's own default. Requires `--policy
-    /// score_policy` or `fused_score`; when either policy is set and this flag
-    /// is omitted, the terms default to `prefix_cache,load_based`.
+    /// Pod terminationGracePeriodSeconds for the startup drain-budget check.
+    /// Omitting this assumes 30 seconds; this flag does not change the pod spec.
+    #[arg(long)]
+    pub termination_grace_secs: Option<u64>,
+
+    /// Per-request upstream timeout in seconds.
+    #[arg(long, default_value_t = default_proxy_request_timeout_secs())]
+    pub request_timeout_secs: u64,
+    /// Maximum silence between upstream stream chunks, in seconds.
+    #[arg(long, default_value_t = ProxyConfig::default().stream_idle_timeout_secs)]
+    pub stream_idle_timeout_secs: u64,
+
+    /// Maximum in-flight request lifetime in seconds, including streaming responses.
+    /// Expiry returns 504 `stale_request_expired` before response headers are sent;
+    /// after streaming starts, it aborts the body without changing the HTTP status.
+    #[arg(long, default_value_t = default_stale_request_timeout_secs())]
+    pub stale_request_timeout_secs: u64,
+
+    /// Default tracing level (overridden by `RUST_LOG`).
+    #[arg(long, default_value = "info")]
+    pub log_level: String,
+
+    /// Log output format.
+    #[arg(long, value_enum, default_value = "text")]
+    pub log_format: LogFormat,
+}
+
+#[derive(clap::Args, Debug)]
+pub struct DiscoveryArgs {
+    /// Static worker URLs, space-separated or repeated. Conflicts with --service-discovery.
+    #[arg(long, num_args = 1..)]
+    pub worker_urls: Vec<String>,
+
+    /// Enable Kubernetes EndpointSlice discovery.
+    #[arg(long)]
+    pub service_discovery: bool,
+
+    /// Namespace to watch. Unset/empty watches all namespaces (requires
+    /// cluster-wide RBAC).
+    #[arg(long)]
+    pub service_discovery_namespace: Option<String>,
+
+    /// Plain-mode label selector terms, AND-joined; Kubernetes selector grammar.
+    /// Mutually exclusive with --prefill-selector and --decode-selector.
+    #[arg(long, num_args = 1..)]
+    pub selector: Vec<String>,
+
+    /// Prefill equality selector terms (key=value or key==value). Requires --decode-selector.
+    #[arg(long, num_args = 1..)]
+    pub prefill_selector: Vec<String>,
+
+    /// Decode equality selector terms (key=value or key==value). Requires --prefill-selector.
+    #[arg(long, num_args = 1..)]
+    pub decode_selector: Vec<String>,
+}
+
+#[derive(clap::Args, Debug)]
+pub struct RoutingArgs {
+    /// Chat routing implementation; --policy selects a policy within it.
+    #[arg(long, value_enum, default_value = "legacy")]
+    pub chat_routing: ChatRoutingKind,
+
+    /// Routing policy (defaults to power_of_two with reorg routing).
+    #[arg(
+        long,
+        value_enum,
+        default_value = "round_robin",
+        default_value_if("chat_routing", "reorg", "power_of_two")
+    )]
+    pub policy: PolicyKind,
+
+    /// Policy used to select decode workers for PD requests.
+    #[arg(long, value_enum, default_value = "power_of_two")]
+    pub decode_policy: DecodePolicyKind,
+
+    /// Static P/D bucket configuration. Omit to use the global candidate domain.
+    #[arg(long)]
+    pub bucket_config: Option<String>,
+
+    /// Weighted scoring terms, e.g. prefix_cache=2.0,load_based=0.3.
+    /// Defaults to prefix_cache,load_based for score_policy or fused_score.
+    /// Requires --policy score_policy or fused_score. Omitted weights use each term's default.
     #[arg(long, value_delimiter = ',')]
     pub fuse: Vec<FusedTerm>,
 
     /// Ordered hard constraints applied before policy selection.
     #[arg(long, value_delimiter = ',')]
     pub filter: Vec<FilterKind>,
+
     /// Router-local in-flight limit for `--filter overloaded`.
     #[arg(long)]
     pub max_in_flight: Option<usize>,
+
     /// Minimum cached prompt share for `--filter prefix_cache`.
     #[arg(long)]
     pub prefix_cache_min_share: Option<f32>,
 
-    // ---- sticky-session policy (only used by `--policy sticky`) ----
-    /// Request header carrying the routing key for sticky-session routing.
-    /// Defaults to `x-sgl-routing-key` when `--policy sticky` is set.
+    /// Consecutive upstream failures before opening the breaker. Must be positive; enables the breaker.
+    #[arg(long)]
+    pub cb_threshold: Option<NonZeroU32>,
+
+    /// Circuit-breaker cool-down in seconds. Only meaningful with
+    /// `--cb-threshold`; defaults to 30 when the breaker is enabled.
+    #[arg(long)]
+    pub cb_cool_down_secs: Option<u64>,
+}
+
+#[derive(clap::Args, Debug)]
+pub struct CacheArgs {
+    /// Prefix-match source: indexer when --kv-indexer-endpoint is set, otherwise radix_tree.
+    #[arg(long, value_enum)]
+    pub cache_prefix_provider: Option<CachePrefixProvider>,
+
+    /// External KV indexer gRPC endpoint used as the authoritative cache signal.
+    /// Needs an explicit scheme, e.g. `http://10.0.0.1:50051`.
+    #[arg(long)]
+    pub kv_indexer_endpoint: Option<String>,
+
+    /// KV Indexer query timeout in milliseconds. Requires
+    /// `--kv-indexer-endpoint`; defaults to 100.
+    #[arg(long)]
+    pub kv_indexer_query_timeout_ms: Option<u64>,
+
+    /// Maximum concurrent KV Indexer queries issued by this Router. Requires
+    /// `--kv-indexer-endpoint`; defaults to 32.
+    #[arg(long)]
+    pub kv_indexer_query_max_inflight: Option<usize>,
+
+    /// Minimum cache-hit tokens for a candidate. Defaults to 1024.
+    #[arg(long)]
+    pub cache_affinity_min_matched_tokens: Option<u64>,
+
+    /// Minimum cache-hit ratio for a candidate. Unset by default.
+    #[arg(long)]
+    pub cache_affinity_min_match_ratio: Option<f64>,
+
+    /// Minimum number of cache candidates to try. Defaults to 8.
+    #[arg(long)]
+    pub cache_candidate_min_workers: Option<usize>,
+
+    /// Fraction of healthy prefill workers considered as cache candidates. Defaults to 0.05.
+    #[arg(long)]
+    pub cache_candidate_ratio: Option<f64>,
+
+    /// Maximum number of cache candidates to try. Defaults to 32.
+    #[arg(long)]
+    pub cache_candidate_max_workers: Option<usize>,
+
+    /// Maximum uncached-work difference that pressure may override. Defaults to 1024 tokens.
+    #[arg(long)]
+    pub cache_switch_margin_tokens: Option<u64>,
+
+    /// Divert cache-affine requests when an engine queue reaches this limit.
+    /// Prefer another prefix owner, then the least-loaded worker. Missing fresh
+    /// queue data leaves affinity intact. Unset disables; scale with engine --dp-size.
+    #[arg(long)]
+    pub worker_queue_limit: Option<u64>,
+
+    /// Keep the least-pressured prefix owner when the queue gate rejects all
+    /// admitted cache candidates and no worker has a fresh queue below this floor.
+    /// Requires --worker-queue-limit; must be positive and at most that limit.
+    /// Unset disables; scale with engine --dp-size.
+    #[arg(long)]
+    pub saturation_queue_floor: Option<u64>,
+
+    /// Min-load fallback sample size. Defaults to 2; requires --policy cache_aware.
+    /// Values at least the pool size choose the exact minimum with random ties.
+    /// A value of 1 draws uniformly with no backup for admission or pressure guards.
+    /// Unlike --cache-candidate-* (prefix owners), this bounds the fallback sample.
+    #[arg(long)]
+    pub min_load_choices: Option<usize>,
+}
+
+#[derive(clap::Args, Debug)]
+pub struct AffinityArgs {
+    /// Header carrying the session ID for `--policy session_aware`.
+    #[arg(long)]
+    pub session_id_header: Option<String>,
+
+    /// Session idle timeout in seconds (--policy session_aware). Defaults to 600.
+    #[arg(long)]
+    pub session_idle_secs: Option<u64>,
+
+    /// Session eviction interval in seconds (--policy session_aware). Defaults to 60.
+    #[arg(long)]
+    pub session_eviction_interval_secs: Option<u64>,
+
+    /// Use a deterministic session backup (--policy session_aware).
+    #[arg(long)]
+    pub stable_pair: bool,
+
+    /// Session admission mode (--policy session_aware). Defaults to soft (allow backup selection).
+    #[arg(long, value_enum)]
+    pub affinity_mode: Option<AffinityMode>,
+
+    /// Session lookup mode (--policy session_aware). Defaults to bucket (search the target bucket).
+    #[arg(long, value_enum)]
+    pub session_affinity_mode: Option<SessionAffinityMode>,
+
+    /// Routing-key header (--policy sticky). Defaults to x-sgl-routing-key.
     #[arg(long)]
     pub routing_key_header: Option<String>,
-    /// Policy used to select a worker for requests with no routing key, and
-    /// to pick the initial worker when a new key is first seen. One of
-    /// `round_robin` / `random` / `power_of_two` / `load_based`. Defaults
-    /// to `round_robin`.
+
+    /// Policy for new or missing routing keys (--policy sticky). Defaults to round_robin.
     #[arg(long, value_enum)]
     pub sticky_fallback_policy: Option<StickyFallbackKind>,
-    /// Evict a sticky assignment after it has been idle (unreferenced) this
-    /// many seconds. Defaults to 600.
+
+    /// Idle timeout in seconds (--policy sticky). Defaults to 600.
     #[arg(long)]
     pub sticky_idle_secs: Option<u64>,
-    /// Wall-clock cadence of the sticky idle-eviction sweep, in seconds.
+
+    /// Eviction sweep interval in seconds (--policy sticky).
     /// Defaults to 60.
     #[arg(long)]
     pub sticky_eviction_interval_secs: Option<u64>,
 
-    // ---- discovery: static ----
-    /// Static worker URLs (space-separated or repeated). Mutually
-    /// exclusive with `--service-discovery`.
-    #[arg(long, num_args = 1..)]
-    pub worker_urls: Vec<String>,
-
-    // ---- discovery: kubernetes ----
-    /// Enable Kubernetes EndpointSlice discovery.
+    /// Disable the pressure guard (--policy session_aware or cache_aware).
     #[arg(long)]
-    pub service_discovery: bool,
-    /// Namespace to watch. Unset/empty watches all namespaces (requires
-    /// cluster-wide RBAC).
+    pub disable_pressure_guard: bool,
+
+    /// Pressure-guard token gap (session_aware or cache_aware). Defaults to 1024.
     #[arg(long)]
-    pub service_discovery_namespace: Option<String>,
-    /// Plain-mode label selector terms, e.g. `app=engines-qwen3`
-    /// (space-separated or repeated `key=value`, AND-joined). Mutually
-    /// exclusive with the prefill/decode selectors.
-    #[arg(long, num_args = 1..)]
-    pub selector: Vec<String>,
-    /// PD-mode prefill label selector terms. Requires `--decode-selector`.
-    #[arg(long, num_args = 1..)]
-    pub prefill_selector: Vec<String>,
-    /// PD-mode decode label selector terms. Requires `--prefill-selector`.
-    #[arg(long, num_args = 1..)]
-    pub decode_selector: Vec<String>,
+    pub pressure_abs_threshold_tokens: Option<u64>,
 
-    // ---- proxy / active-load ----
-    /// Per-request upstream timeout in seconds.
-    #[arg(long, default_value_t = default_proxy_request_timeout_secs())]
-    pub request_timeout_secs: u64,
-    /// Max lifetime of an in-flight request entry before the janitor
-    /// reaps it (returns 504 `stale_request_expired`).
-    #[arg(long, default_value_t = default_stale_request_timeout_secs())]
-    pub stale_request_timeout_secs: u64,
+    /// Pressure-guard gap in ms (session_aware or cache_aware), when a queue estimate exists. Unset by default.
+    #[arg(long)]
+    pub pressure_abs_threshold_ms: Option<f64>,
 
-    // ---- observability ----
-    /// Default tracing level (overridden by `RUST_LOG`).
-    #[arg(long, default_value = "info")]
-    pub log_level: String,
-    /// Log output format.
-    #[arg(long, value_enum, default_value = "text")]
-    pub log_format: LogFormat,
+    /// Pressure-guard token multiplier (session_aware or cache_aware). Defaults to 1.5.
+    #[arg(long)]
+    pub pressure_rel_threshold: Option<f64>,
 }
 
 impl Cli {
-    /// Resolve parsed flags into a validated [`Config`].
-    ///
-    /// Builds the [`DiscoveryBackend`] (enforcing static-vs-k8s mutual
-    /// exclusivity and resolving the k8s selector grammar via
-    /// [`resolve_mode`]), assembles the single [`ModelConfig`], then runs
-    /// [`Config::validate`] for the remaining value-level invariants
-    /// (model id, static worker URLs).
+    /// Resolve CLI options and validate the resulting configuration.
     pub fn into_config(self) -> Result<Config> {
-        let discovery = self.build_discovery()?;
+        if self.routing.chat_routing == ChatRoutingKind::Reorg {
+            ensure!(
+                self.affinity.affinity_mode != Some(AffinityMode::Soft),
+                "reorg sessions do not support --affinity-mode soft"
+            );
+            ensure!(
+                self.routing.policy != PolicyKind::SessionAware
+                    || (self.affinity.pressure_abs_threshold_tokens.is_none()
+                        && self.affinity.pressure_abs_threshold_ms.is_none()
+                        && self.affinity.pressure_rel_threshold.is_none()
+                        && !self.affinity.disable_pressure_guard),
+                "reorg pressure guard options only apply to cache_aware"
+            );
+        }
+        let affinity = self
+            .affinity
+            .build_config(&self.cache, self.routing.policy)?;
+        let discovery = self.discovery.into_config()?;
         let bucket_config = self
+            .routing
             .bucket_config
             .as_deref()
             .map(load_bucket_config)
             .transpose()?;
-
-        // Reject knobs that only take effect alongside another flag, rather
-        // than silently dropping them — mirrors the discovery mutual-exclusion
-        // checks. Otherwise an operator believes they tuned something that has
-        // no effect.
-        if self.cb_cool_down_secs.is_some() && self.cb_threshold.is_none() {
-            return Err(anyhow!(
-                "--cb-cool-down-secs requires --cb-threshold (the circuit breaker is \
-                 enabled by --cb-threshold)"
-            ));
-        }
-        let cache_prefix_provider = self.cache_prefix_provider.unwrap_or_else(|| {
-            if self.kv_indexer_endpoint.is_some() {
-                CachePrefixProvider::Indexer
-            } else {
-                CachePrefixProvider::RadixTree
-            }
-        });
-        if self.cache_prefix_provider.is_some() && self.policy != PolicyKind::CacheAware {
-            return Err(anyhow!(
-                "--cache-prefix-provider requires --policy cache_aware"
-            ));
-        }
-        if self.kv_indexer_query_timeout_ms == Some(0) {
-            return Err(anyhow!(
-                "--kv-indexer-query-timeout-ms must be greater than zero"
-            ));
-        }
-        if self.kv_indexer_query_timeout_ms.is_some() && self.kv_indexer_endpoint.is_none() {
-            return Err(anyhow!(
-                "--kv-indexer-query-timeout-ms requires --kv-indexer-endpoint"
-            ));
-        }
-        if self.kv_indexer_query_max_inflight == Some(0) {
-            return Err(anyhow!(
-                "--kv-indexer-query-max-inflight must be greater than zero"
-            ));
-        }
-        if self.kv_indexer_query_max_inflight.is_some() && self.kv_indexer_endpoint.is_none() {
-            return Err(anyhow!(
-                "--kv-indexer-query-max-inflight requires --kv-indexer-endpoint"
-            ));
-        }
-        let cache_aware_uses_indexer = self.policy == PolicyKind::CacheAware
-            && cache_prefix_provider == CachePrefixProvider::Indexer;
-        if self.kv_indexer_endpoint.is_some() && !cache_aware_uses_indexer {
-            if self.policy == PolicyKind::CacheAware {
-                return Err(anyhow!(
-                    "--kv-indexer-endpoint requires --cache-prefix-provider indexer"
-                ));
-            }
-            return Err(anyhow!(
-                "--kv-indexer-endpoint requires --policy cache_aware"
-            ));
-        }
-        if cache_aware_uses_indexer && self.kv_indexer_endpoint.is_none() {
-            return Err(anyhow!(
-                "--cache-prefix-provider indexer requires --kv-indexer-endpoint"
-            ));
-        }
-        let tuned_cache_aware = self.policy == PolicyKind::CacheAware;
-        let affinity_policy = matches!(
-            self.policy,
-            PolicyKind::SessionAware | PolicyKind::CacheAware
-        );
-        let tuned_session_affinity = self.session_id_header.is_some()
-            || self.session_idle_secs.is_some()
-            || self.session_eviction_interval_secs.is_some()
-            || self.stable_pair
-            || self.affinity_mode.is_some()
-            || self.session_affinity_mode.is_some();
-        if tuned_session_affinity && self.policy != PolicyKind::SessionAware {
-            return Err(anyhow!(
-                "--session-id-header, --session-*-secs, --stable-pair, --affinity-mode, and \
-                 --session-affinity-mode require --policy session_aware"
-            ));
-        }
-        if self.disable_pressure_guard && !affinity_policy {
-            return Err(anyhow!(
-                "--disable-pressure-guard requires --policy session_aware or cache_aware"
-            ));
-        }
-        let tuned_cache_candidates = self.cache_affinity_min_matched_tokens.is_some()
-            || self.cache_affinity_min_match_ratio.is_some()
-            || self.cache_candidate_min_workers.is_some()
-            || self.cache_candidate_ratio.is_some()
-            || self.cache_candidate_max_workers.is_some()
-            || self.cache_switch_margin_tokens.is_some()
-            || self.worker_queue_limit.is_some()
-            || self.saturation_queue_floor.is_some();
-        // Value checks before the policy check: a value that is wrong under
-        // every policy should say so, rather than pointing at --policy.
-        if self.worker_queue_limit == Some(0) {
-            return Err(anyhow!("--worker-queue-limit must be at least 1"));
-        }
-        if let Some(floor) = self.saturation_queue_floor {
-            // The floor modifies the gate's diversion; without the gate
-            // there is no diversion to cancel and the knob would sit dead.
-            let Some(limit) = self.worker_queue_limit else {
-                return Err(anyhow!(
-                    "--saturation-queue-floor requires --worker-queue-limit (there is no \
-                     diversion to cancel without it)"
-                ));
-            };
-            if floor == 0 {
-                return Err(anyhow!("--saturation-queue-floor must be at least 1"));
-            }
-            // floor <= limit keeps the saturation label readable: a floor
-            // above the limit would declare the fleet saturated while
-            // workers the gate still admits exist.
-            if floor > limit {
-                return Err(anyhow!(
-                    "--saturation-queue-floor ({floor}) must be at most --worker-queue-limit \
-                     ({limit})"
-                ));
-            }
-        }
-        if tuned_cache_candidates && self.policy != PolicyKind::CacheAware {
-            return Err(anyhow!(
-                "cache candidate tuning flags require --policy cache_aware"
-            ));
-        }
-        if (self.pressure_abs_threshold_tokens.is_some()
-            || self.pressure_abs_threshold_ms.is_some()
-            || self.pressure_rel_threshold.is_some())
-            && !affinity_policy
-        {
-            return Err(anyhow!(
-                "pressure guard tuning requires --policy session_aware or cache_aware"
-            ));
-        }
-        let is_score_composition = matches!(
-            self.policy,
-            PolicyKind::FusedScore | PolicyKind::ScorePolicy
-        );
-        if !self.fuse.is_empty() && !is_score_composition {
-            return Err(anyhow!(
-                "--fuse requires --policy score_policy or fused_score"
-            ));
-        }
-        let fused = if is_score_composition {
-            let terms = if self.fuse.is_empty() {
-                DEFAULT_FUSE
-                    .iter()
-                    .map(|&kind| FusedTerm { kind, weight: None })
-                    .collect()
-            } else {
-                self.fuse.clone()
-            };
-            for (i, t) in terms.iter().enumerate() {
-                if terms[..i].iter().any(|p| p.kind == t.kind) {
-                    return Err(anyhow!("--fuse: `{}` is listed more than once", t.kind));
-                }
-            }
-            Some(terms)
-        } else {
-            None
-        };
-
-        for (i, kind) in self.filter.iter().enumerate() {
-            if self.filter[..i].contains(kind) {
-                return Err(anyhow!("--filter: `{kind}` is listed more than once"));
-            }
-        }
-        let has = |k: FilterKind| self.filter.contains(&k);
-        if self.max_in_flight.is_some() != has(FilterKind::Overloaded) {
-            return Err(anyhow!(
-                "--max-in-flight and `--filter overloaded` require each other"
-            ));
-        }
-        if self.max_in_flight == Some(0) {
-            return Err(anyhow!("--max-in-flight must be greater than 0"));
-        }
-        if self.prefix_cache_min_share.is_some() != has(FilterKind::PrefixCache) {
-            return Err(anyhow!(
-                "--prefix-cache-min-share and `--filter prefix_cache` require each other"
-            ));
-        }
-        if self
-            .prefix_cache_min_share
-            .is_some_and(|s| !(s > 0.0 && s <= 1.0))
-        {
-            return Err(anyhow!("--prefix-cache-min-share must be in (0, 1]"));
-        }
-        if self.policy == PolicyKind::Sticky && !self.filter.is_empty() {
-            return Err(anyhow!("--filter cannot be combined with --policy sticky"));
-        }
-        let eligibility = (!self.filter.is_empty()).then(|| EligibilityConfig {
-            filters: self.filter.clone(),
-            max_in_flight: self.max_in_flight,
-            min_prefix_share: self.prefix_cache_min_share,
-        });
-
-        let tuned_sticky = self.routing_key_header.is_some()
-            || self.sticky_fallback_policy.is_some()
-            || self.sticky_idle_secs.is_some()
-            || self.sticky_eviction_interval_secs.is_some();
-        if tuned_sticky && self.policy != PolicyKind::Sticky {
-            return Err(anyhow!(
-                "--routing-key-header / --sticky-fallback-policy / --sticky-idle-secs / \
-                 --sticky-eviction-interval-secs require --policy sticky"
-            ));
-        }
-
-        // Build and validate the sticky config exactly when the sticky
-        // policy is selected. The header name must parse as an HTTP header
-        // name so a typo fails at startup rather than silently never
-        // matching any request header.
-        let sticky = if self.policy == PolicyKind::Sticky {
-            let d = StickyConfig::default();
-            let header_name = self.routing_key_header.unwrap_or(d.header_name);
-            axum::http::HeaderName::try_from(header_name.as_str()).map_err(|e| {
-                anyhow!("--routing-key-header {header_name:?} is not a valid HTTP header name: {e}")
-            })?;
-            let fallback_policy = self.sticky_fallback_policy.unwrap_or(d.fallback_policy);
-            let idle_secs = self.sticky_idle_secs.unwrap_or(d.idle_secs);
-            let eviction_interval_secs = self
-                .sticky_eviction_interval_secs
-                .unwrap_or(d.eviction_interval_secs);
-            // Reject zero durations: `--sticky-eviction-interval-secs 0` would
-            // panic `tokio::time::interval` at startup, and `--sticky-idle-secs
-            // 0` would evict every assignment on the next sweep (defeating
-            // stickiness entirely). Fail fast with a clear message instead.
-            if eviction_interval_secs == 0 {
-                return Err(anyhow!(
-                    "--sticky-eviction-interval-secs must be greater than 0"
-                ));
-            }
-            if idle_secs == 0 {
-                return Err(anyhow!(
-                    "--sticky-idle-secs must be greater than 0 (0 would evict every \
-                     assignment immediately, defeating sticky routing)"
-                ));
-            }
-            Some(StickyConfig {
-                header_name,
-                fallback_policy,
-                idle_secs,
-                eviction_interval_secs,
-            })
-        } else {
-            None
-        };
-
-        let affinity = if affinity_policy {
-            let d = AffinityConfig::default();
-            let session_id_header = self.session_id_header.unwrap_or(d.session_id_header);
-            axum::http::HeaderName::try_from(session_id_header.as_str()).map_err(|e| {
-                anyhow!(
-                    "--session-id-header {session_id_header:?} is not a valid HTTP header name: {e}"
+        let circuit_breaker = self.routing.build_circuit_breaker()?;
+        let cache_aware = self.cache.into_config(self.routing.policy)?;
+        let fused = self.routing.build_fused()?;
+        let eligibility = self.routing.build_eligibility()?;
+        let sticky = self.affinity.into_sticky_config(self.routing.policy)?;
+        let sampling_overrides = self
+            .model
+            .override_sampling_params
+            .as_deref()
+            .map(|raw| {
+                parse_sampling_overrides(
+                    raw,
+                    self.model.sampling_param_conflict.unwrap_or_default(),
                 )
-            })?;
-            let pressure_rel_threshold = self
-                .pressure_rel_threshold
-                .unwrap_or(d.pressure_rel_threshold);
-            if !pressure_rel_threshold.is_finite() || pressure_rel_threshold <= 1.0 {
-                return Err(anyhow!(
-                    "--pressure-rel-threshold must be finite and greater than 1"
-                ));
-            }
-            if self
-                .pressure_abs_threshold_ms
-                .is_some_and(|threshold| !threshold.is_finite() || threshold < 0.0)
-            {
-                return Err(anyhow!(
-                    "--pressure-abs-threshold-ms must be finite and non-negative"
-                ));
-            }
-            let cache_affinity_min_match_ratio = self
-                .cache_affinity_min_match_ratio
-                .or(d.cache_affinity_min_match_ratio);
-            if cache_affinity_min_match_ratio
-                .is_some_and(|ratio| !ratio.is_finite() || !(0.0..=1.0).contains(&ratio))
-            {
-                return Err(anyhow!(
-                    "--cache-affinity-min-match-ratio must be finite and in [0, 1]"
-                ));
-            }
-            let cache_candidate_ratio = self
-                .cache_candidate_ratio
-                .unwrap_or(d.cache_candidate_ratio);
-            if !cache_candidate_ratio.is_finite() || !(0.0..=1.0).contains(&cache_candidate_ratio) {
-                return Err(anyhow!(
-                    "--cache-candidate-ratio must be finite and in [0, 1]"
-                ));
-            }
-            let cache_candidate_min_workers = self
-                .cache_candidate_min_workers
-                .unwrap_or(d.cache_candidate_min_workers);
-            let cache_candidate_max_workers = self
-                .cache_candidate_max_workers
-                .unwrap_or(d.cache_candidate_max_workers);
-            if cache_candidate_min_workers == 0
-                || cache_candidate_max_workers == 0
-                || cache_candidate_min_workers > cache_candidate_max_workers
-            {
-                return Err(anyhow!(
-                    "--cache-candidate-min-workers and --cache-candidate-max-workers must be \
-                     positive and min must not exceed max"
-                ));
-            }
-            let session_idle_secs = self.session_idle_secs.unwrap_or(d.session_idle_secs);
-            let session_eviction_interval_secs = self
-                .session_eviction_interval_secs
-                .unwrap_or(d.session_eviction_interval_secs);
-            if session_idle_secs == 0 {
-                return Err(anyhow!("--session-idle-secs must be greater than 0"));
-            }
-            if session_eviction_interval_secs == 0 {
-                return Err(anyhow!(
-                    "--session-eviction-interval-secs must be greater than 0"
-                ));
-            }
-            Some(AffinityConfig {
-                session_id_header,
-                session_idle_secs,
-                session_eviction_interval_secs,
-                stable_pair: self.stable_pair,
-                mode: self.affinity_mode.unwrap_or(d.mode),
-                session_affinity_mode: self
-                    .session_affinity_mode
-                    .unwrap_or(d.session_affinity_mode),
-                pressure_guard: !self.disable_pressure_guard && d.pressure_guard,
-                pressure_abs_threshold_tokens: self
-                    .pressure_abs_threshold_tokens
-                    .unwrap_or(d.pressure_abs_threshold_tokens),
-                pressure_abs_threshold_ms: self
-                    .pressure_abs_threshold_ms
-                    .or(d.pressure_abs_threshold_ms),
-                pressure_rel_threshold,
-                cache_affinity_min_matched_tokens: self
-                    .cache_affinity_min_matched_tokens
-                    .or(d.cache_affinity_min_matched_tokens),
-                cache_affinity_min_match_ratio,
-                cache_candidate_min_workers,
-                cache_candidate_ratio,
-                cache_candidate_max_workers,
-                cache_switch_margin_tokens: self
-                    .cache_switch_margin_tokens
-                    .unwrap_or(d.cache_switch_margin_tokens),
-                worker_queue_limit: self.worker_queue_limit.or(d.worker_queue_limit),
-                saturation_queue_floor: self.saturation_queue_floor.or(d.saturation_queue_floor),
             })
-        } else {
-            None
-        };
-
-        let circuit_breaker = self.cb_threshold.map(|threshold| CircuitBreakerConfig {
-            threshold,
-            cool_down_secs: self.cb_cool_down_secs.unwrap_or_else(default_cb_cool_down),
-        });
-
-        // Keep the selected prefix provider and optional Indexer settings
-        // together with the native Cache-Aware policy.
-        let kv_indexer_query_timeout_ms = self
-            .kv_indexer_query_timeout_ms
-            .unwrap_or(DEFAULT_KV_INDEXER_QUERY_TIMEOUT_MS);
-        let kv_indexer_query_max_inflight = self
-            .kv_indexer_query_max_inflight
-            .unwrap_or(DEFAULT_KV_INDEXER_QUERY_MAX_INFLIGHT);
-        let cache_aware = if tuned_cache_aware {
-            let kv_indexer_endpoint = self.kv_indexer_endpoint.map(|url| KvIndexerEndpointConfig {
-                url,
-                query_timeout_ms: kv_indexer_query_timeout_ms,
-                query_max_inflight: kv_indexer_query_max_inflight,
-            });
-            Some(CacheAwareConfig {
-                prefix_provider: cache_prefix_provider,
-                kv_indexer_endpoint,
-            })
-        } else {
-            None
-        };
-
-        let sampling_overrides = match &self.override_sampling_params {
-            None => SamplingOverrides::default(),
-            Some(raw) => {
-                parse_sampling_overrides(raw, self.sampling_param_conflict.unwrap_or_default())?
-            }
-        };
+            .transpose()?
+            .unwrap_or_default();
 
         let config = Config {
             server: ServerConfig {
-                host: self.host,
-                port: self.port,
-                shutdown_drain_secs: self.shutdown_drain_secs,
-                termination_grace_secs: self.termination_grace_secs,
+                host: self.server.host,
+                port: self.server.port,
+                shutdown_drain_secs: self.server.shutdown_drain_secs,
+                termination_grace_secs: self.server.termination_grace_secs,
             },
             observability: ObservabilityConfig {
-                log_level: self.log_level,
-                log_format: self.log_format,
+                log_level: self.server.log_level,
+                log_format: self.server.log_format,
             },
             model: ModelConfig {
-                // Default the tokenizer source to the model id (treated as a
-                // HuggingFace repo id) when --tokenizer-path is omitted.
-                tokenizer_path: self.tokenizer_path.unwrap_or_else(|| self.model_id.clone()),
-                id: self.model_id,
-                disable_input_ids_forwarding: self.disable_input_ids_forwarding,
-                policy: self.policy,
-                decode_policy: self.decode_policy,
+                tokenizer_path: self
+                    .model
+                    .tokenizer_path
+                    .unwrap_or_else(|| self.model.model_id.clone()),
+                id: self.model.model_id,
+                disable_input_ids_forwarding: self.model.disable_input_ids_forwarding,
+                policy: self.routing.policy,
+                decode_policy: self.routing.decode_policy,
                 bucket_config,
                 circuit_breaker,
                 cache_aware,
@@ -721,26 +415,23 @@ impl Cli {
             },
             discovery,
             proxy: ProxyConfig {
-                request_timeout_secs: self.request_timeout_secs,
+                request_timeout_secs: self.server.request_timeout_secs,
+                stream_idle_timeout_secs: self.server.stream_idle_timeout_secs,
             },
-            active_load: ActiveLoadConfig {
-                stale_request_timeout_secs: self.stale_request_timeout_secs,
+            router_inflight_load: InflightLoadConfig {
+                stale_request_timeout_secs: self.server.stale_request_timeout_secs,
             },
         };
         config.validate()?;
+        if self.routing.chat_routing == ChatRoutingKind::Reorg {
+            crate::policies_reorg::factory::validate(&config.model)?;
+        }
         Ok(config)
     }
+}
 
-    /// Resolve the discovery flags into a [`DiscoveryBackend`].
-    ///
-    /// `--worker-urls` (static) and `--service-discovery` (k8s) are
-    /// mutually exclusive and exactly one is required. K8s-only flags
-    /// passed without `--service-discovery` are rejected so a typo can't
-    /// silently fall back to the static (empty) path. The k8s selector
-    /// grammar (plain vs PD) is validated eagerly here by [`resolve_mode`]
-    /// before the `K8sDiscoveryConfig` is constructed, so an invalid
-    /// combination is never stored.
-    fn build_discovery(&self) -> Result<DiscoveryBackend> {
+impl DiscoveryArgs {
+    fn into_config(self) -> Result<DiscoveryBackend> {
         let has_static = !self.worker_urls.is_empty();
         let backend = match (has_static, self.service_discovery) {
             (true, true) => {
@@ -755,37 +446,390 @@ impl Cli {
                 ));
             }
             (true, false) => {
-                if self.service_discovery_namespace.is_some()
-                    || !self.selector.is_empty()
-                    || !self.prefill_selector.is_empty()
-                    || !self.decode_selector.is_empty()
-                {
-                    return Err(anyhow!(
-                        "--service-discovery-namespace / --selector / --prefill-selector / \
+                ensure!(
+                    self.service_discovery_namespace.is_none()
+                        && self.selector.is_empty()
+                        && self.prefill_selector.is_empty()
+                        && self.decode_selector.is_empty(),
+                    "--service-discovery-namespace / --selector / --prefill-selector / \
                          --decode-selector require --service-discovery"
-                    ));
-                }
+                );
                 DiscoveryBackend::StaticUrls(StaticUrlsDiscoveryConfig {
-                    urls: self.worker_urls.clone(),
+                    urls: self.worker_urls,
                 })
             }
             (false, true) => {
-                // Resolve (and validate) the selector flags into a
-                // K8sDiscoveryMode here, so an invalid combination can't be
-                // stored. Surfaces ConfigError as anyhow for the CLI.
                 let mode = resolve_mode(
                     join_selector(&self.selector).as_deref(),
                     join_selector(&self.prefill_selector).as_deref(),
                     join_selector(&self.decode_selector).as_deref(),
-                )
-                .map_err(|e| anyhow!("{e}"))?;
+                )?;
                 DiscoveryBackend::K8s(K8sDiscoveryConfig {
-                    namespace: self.service_discovery_namespace.clone().unwrap_or_default(),
+                    namespace: self.service_discovery_namespace.unwrap_or_default(),
                     mode,
                 })
             }
         };
         Ok(backend)
+    }
+}
+
+impl RoutingArgs {
+    fn build_circuit_breaker(&self) -> Result<Option<CircuitBreakerConfig>> {
+        ensure!(
+            self.cb_cool_down_secs.is_none() || self.cb_threshold.is_some(),
+            "--cb-cool-down-secs requires --cb-threshold (the circuit breaker is \
+                 enabled by --cb-threshold)"
+        );
+        let circuit_breaker = self.cb_threshold.map(|threshold| CircuitBreakerConfig {
+            threshold,
+            cool_down_secs: self.cb_cool_down_secs.unwrap_or_else(default_cb_cool_down),
+        });
+
+        Ok(circuit_breaker)
+    }
+
+    fn build_fused(&self) -> Result<Option<Vec<FusedTerm>>> {
+        let is_score_composition = matches!(
+            self.policy,
+            PolicyKind::FusedScore | PolicyKind::ScorePolicy
+        );
+        ensure!(
+            self.fuse.is_empty() || is_score_composition,
+            "--fuse requires --policy score_policy or fused_score"
+        );
+        if !is_score_composition {
+            return Ok(None);
+        }
+        let terms = if self.fuse.is_empty() {
+            DEFAULT_FUSE
+                .iter()
+                .map(|&kind| FusedTerm { kind, weight: None })
+                .collect()
+        } else {
+            self.fuse.clone()
+        };
+        for (i, t) in terms.iter().enumerate() {
+            ensure!(
+                !terms[..i].iter().any(|p| p.kind == t.kind),
+                "--fuse: `{}` is listed more than once",
+                t.kind
+            );
+        }
+        Ok(Some(terms))
+    }
+
+    fn build_eligibility(&self) -> Result<Option<EligibilityConfig>> {
+        for (i, kind) in self.filter.iter().enumerate() {
+            ensure!(
+                !self.filter[..i].contains(kind),
+                "--filter: `{kind}` is listed more than once"
+            );
+        }
+        let has = |k: FilterKind| self.filter.contains(&k);
+        ensure!(
+            (self.max_in_flight.is_some() == has(FilterKind::Overloaded)),
+            "--max-in-flight and `--filter overloaded` require each other"
+        );
+        ensure!(
+            self.max_in_flight != Some(0),
+            "--max-in-flight must be greater than 0"
+        );
+        ensure!(
+            (self.prefix_cache_min_share.is_some() == has(FilterKind::PrefixCache)),
+            "--prefix-cache-min-share and `--filter prefix_cache` require each other"
+        );
+        ensure!(
+            self.prefix_cache_min_share
+                .is_none_or(|s| s > 0.0 && s <= 1.0),
+            "--prefix-cache-min-share must be in (0, 1]"
+        );
+        ensure!(
+            self.policy != PolicyKind::Sticky || self.filter.is_empty(),
+            "--filter cannot be combined with --policy sticky"
+        );
+        let eligibility = (!self.filter.is_empty()).then_some(EligibilityConfig {
+            filters: self.filter.clone(),
+            max_in_flight: self.max_in_flight,
+            min_prefix_share: self.prefix_cache_min_share,
+        });
+
+        Ok(eligibility)
+    }
+}
+
+impl CacheArgs {
+    fn into_config(self, policy: PolicyKind) -> Result<Option<CacheAwareConfig>> {
+        let cache_prefix_provider = self.cache_prefix_provider.unwrap_or_else(|| {
+            if self.kv_indexer_endpoint.is_some() {
+                CachePrefixProvider::Indexer
+            } else {
+                CachePrefixProvider::RadixTree
+            }
+        });
+        ensure!(
+            self.cache_prefix_provider.is_none() || policy == PolicyKind::CacheAware,
+            "--cache-prefix-provider requires --policy cache_aware"
+        );
+        ensure!(
+            self.kv_indexer_query_timeout_ms != Some(0),
+            "--kv-indexer-query-timeout-ms must be greater than zero"
+        );
+        ensure!(
+            self.kv_indexer_query_timeout_ms.is_none() || self.kv_indexer_endpoint.is_some(),
+            "--kv-indexer-query-timeout-ms requires --kv-indexer-endpoint"
+        );
+        ensure!(
+            self.kv_indexer_query_max_inflight != Some(0),
+            "--kv-indexer-query-max-inflight must be greater than zero"
+        );
+        ensure!(
+            self.kv_indexer_query_max_inflight.is_none() || self.kv_indexer_endpoint.is_some(),
+            "--kv-indexer-query-max-inflight requires --kv-indexer-endpoint"
+        );
+        let cache_aware_uses_indexer = policy == PolicyKind::CacheAware
+            && cache_prefix_provider == CachePrefixProvider::Indexer;
+        if self.kv_indexer_endpoint.is_some() && !cache_aware_uses_indexer {
+            return Err(if policy == PolicyKind::CacheAware {
+                anyhow!("--kv-indexer-endpoint requires --cache-prefix-provider indexer")
+            } else {
+                anyhow!("--kv-indexer-endpoint requires --policy cache_aware")
+            });
+        }
+        ensure!(
+            !cache_aware_uses_indexer || self.kv_indexer_endpoint.is_some(),
+            "--cache-prefix-provider indexer requires --kv-indexer-endpoint"
+        );
+        let kv_indexer_query_timeout_ms = self
+            .kv_indexer_query_timeout_ms
+            .unwrap_or(DEFAULT_KV_INDEXER_QUERY_TIMEOUT_MS);
+        let kv_indexer_query_max_inflight = self
+            .kv_indexer_query_max_inflight
+            .unwrap_or(DEFAULT_KV_INDEXER_QUERY_MAX_INFLIGHT);
+        if policy != PolicyKind::CacheAware {
+            return Ok(None);
+        }
+        let kv_indexer_endpoint = self.kv_indexer_endpoint.map(|url| KvIndexerEndpointConfig {
+            url,
+            query_timeout_ms: kv_indexer_query_timeout_ms,
+            query_max_inflight: kv_indexer_query_max_inflight,
+        });
+        Ok(Some(CacheAwareConfig {
+            prefix_provider: cache_prefix_provider,
+            kv_indexer_endpoint,
+        }))
+    }
+}
+
+impl AffinityArgs {
+    fn build_config(
+        &self,
+        cache: &CacheArgs,
+        policy: PolicyKind,
+    ) -> Result<Option<AffinityConfig>> {
+        let affinity_policy = matches!(policy, PolicyKind::SessionAware | PolicyKind::CacheAware);
+        let tuned_session_affinity = self.session_id_header.is_some()
+            || self.session_idle_secs.is_some()
+            || self.session_eviction_interval_secs.is_some()
+            || self.stable_pair
+            || self.affinity_mode.is_some()
+            || self.session_affinity_mode.is_some();
+        ensure!(
+            !tuned_session_affinity || policy == PolicyKind::SessionAware,
+            "--session-id-header, --session-*-secs, --stable-pair, --affinity-mode, and \
+                 --session-affinity-mode require --policy session_aware"
+        );
+        ensure!(
+            !self.disable_pressure_guard || affinity_policy,
+            "--disable-pressure-guard requires --policy session_aware or cache_aware"
+        );
+        let tuned_cache_candidates = cache.cache_affinity_min_matched_tokens.is_some()
+            || cache.cache_affinity_min_match_ratio.is_some()
+            || cache.cache_candidate_min_workers.is_some()
+            || cache.cache_candidate_ratio.is_some()
+            || cache.cache_candidate_max_workers.is_some()
+            || cache.cache_switch_margin_tokens.is_some()
+            || cache.worker_queue_limit.is_some()
+            || cache.saturation_queue_floor.is_some()
+            || cache.min_load_choices.is_some();
+        // Value checks before the policy check: a value that is wrong under
+        // every policy should say so, rather than pointing at --policy.
+        ensure!(
+            cache.worker_queue_limit != Some(0),
+            "--worker-queue-limit must be at least 1"
+        );
+        if let Some(floor) = cache.saturation_queue_floor {
+            // The floor modifies the gate's diversion; without the gate
+            // there is no diversion to cancel and the knob would sit dead.
+            let Some(limit) = cache.worker_queue_limit else {
+                return Err(anyhow!(
+                    "--saturation-queue-floor requires --worker-queue-limit (there is no \
+                     diversion to cancel without it)"
+                ));
+            };
+            ensure!(floor != 0, "--saturation-queue-floor must be at least 1");
+            ensure!(
+                floor <= limit,
+                "--saturation-queue-floor ({floor}) must be at most --worker-queue-limit \
+                     ({limit})"
+            );
+        }
+        ensure!(
+            cache.min_load_choices != Some(0),
+            "--min-load-choices must be at least 1"
+        );
+        ensure!(
+            !tuned_cache_candidates || policy == PolicyKind::CacheAware,
+            "cache candidate tuning flags require --policy cache_aware"
+        );
+        ensure!(
+            affinity_policy
+                || (self.pressure_abs_threshold_tokens.is_none()
+                    && self.pressure_abs_threshold_ms.is_none()
+                    && self.pressure_rel_threshold.is_none()),
+            "pressure guard tuning requires --policy session_aware or cache_aware"
+        );
+        if !affinity_policy {
+            return Ok(None);
+        }
+        let defaults = AffinityConfig::default();
+        let session_id_header = self
+            .session_id_header
+            .clone()
+            .unwrap_or(defaults.session_id_header);
+        axum::http::HeaderName::try_from(session_id_header.as_str()).map_err(|e| {
+            anyhow!(
+                "--session-id-header {session_id_header:?} is not a valid HTTP header name: {e}"
+            )
+        })?;
+        let pressure_rel_threshold = self
+            .pressure_rel_threshold
+            .unwrap_or(defaults.pressure_rel_threshold);
+        ensure!(
+            pressure_rel_threshold.is_finite() && pressure_rel_threshold > 1.0,
+            "--pressure-rel-threshold must be finite and greater than 1"
+        );
+        ensure!(
+            self.pressure_abs_threshold_ms
+                .is_none_or(|threshold| threshold.is_finite() && threshold >= 0.0),
+            "--pressure-abs-threshold-ms must be finite and non-negative"
+        );
+        let cache_affinity_min_match_ratio = cache
+            .cache_affinity_min_match_ratio
+            .or(defaults.cache_affinity_min_match_ratio);
+        ensure!(
+            cache_affinity_min_match_ratio
+                .is_none_or(|ratio| ratio.is_finite() && (0.0..=1.0).contains(&ratio)),
+            "--cache-affinity-min-match-ratio must be finite and in [0, 1]"
+        );
+        let cache_candidate_ratio = cache
+            .cache_candidate_ratio
+            .unwrap_or(defaults.cache_candidate_ratio);
+        ensure!(
+            cache_candidate_ratio.is_finite() && (0.0..=1.0).contains(&cache_candidate_ratio),
+            "--cache-candidate-ratio must be finite and in [0, 1]"
+        );
+        let cache_candidate_min_workers = cache
+            .cache_candidate_min_workers
+            .unwrap_or(defaults.cache_candidate_min_workers);
+        let cache_candidate_max_workers = cache
+            .cache_candidate_max_workers
+            .unwrap_or(defaults.cache_candidate_max_workers);
+        ensure!(
+            cache_candidate_min_workers > 0
+                && cache_candidate_max_workers > 0
+                && cache_candidate_min_workers <= cache_candidate_max_workers,
+            "--cache-candidate-min-workers and --cache-candidate-max-workers must be \
+                 positive and min must not exceed max"
+        );
+        let session_idle_secs = self.session_idle_secs.unwrap_or(defaults.session_idle_secs);
+        let session_eviction_interval_secs = self
+            .session_eviction_interval_secs
+            .unwrap_or(defaults.session_eviction_interval_secs);
+        ensure!(
+            session_idle_secs != 0,
+            "--session-idle-secs must be greater than 0"
+        );
+        ensure!(
+            session_eviction_interval_secs != 0,
+            "--session-eviction-interval-secs must be greater than 0"
+        );
+        Ok(Some(AffinityConfig {
+            session_id_header,
+            session_idle_secs,
+            session_eviction_interval_secs,
+            stable_pair: self.stable_pair,
+            mode: self.affinity_mode.unwrap_or(defaults.mode),
+            session_affinity_mode: self
+                .session_affinity_mode
+                .unwrap_or(defaults.session_affinity_mode),
+            pressure_guard: !self.disable_pressure_guard && defaults.pressure_guard,
+            pressure_abs_threshold_tokens: self
+                .pressure_abs_threshold_tokens
+                .unwrap_or(defaults.pressure_abs_threshold_tokens),
+            pressure_abs_threshold_ms: self
+                .pressure_abs_threshold_ms
+                .or(defaults.pressure_abs_threshold_ms),
+            pressure_rel_threshold,
+            cache_affinity_min_matched_tokens: cache
+                .cache_affinity_min_matched_tokens
+                .or(defaults.cache_affinity_min_matched_tokens),
+            cache_affinity_min_match_ratio,
+            cache_candidate_min_workers,
+            cache_candidate_ratio,
+            cache_candidate_max_workers,
+            cache_switch_margin_tokens: cache
+                .cache_switch_margin_tokens
+                .unwrap_or(defaults.cache_switch_margin_tokens),
+            worker_queue_limit: cache.worker_queue_limit.or(defaults.worker_queue_limit),
+            saturation_queue_floor: cache
+                .saturation_queue_floor
+                .or(defaults.saturation_queue_floor),
+            min_load_choices: cache.min_load_choices.unwrap_or(defaults.min_load_choices),
+        }))
+    }
+
+    fn into_sticky_config(self, policy: PolicyKind) -> Result<Option<StickyConfig>> {
+        let tuned_sticky = self.routing_key_header.is_some()
+            || self.sticky_fallback_policy.is_some()
+            || self.sticky_idle_secs.is_some()
+            || self.sticky_eviction_interval_secs.is_some();
+        ensure!(
+            !tuned_sticky || policy == PolicyKind::Sticky,
+            "--routing-key-header / --sticky-fallback-policy / --sticky-idle-secs / \
+                 --sticky-eviction-interval-secs require --policy sticky"
+        );
+
+        if policy != PolicyKind::Sticky {
+            return Ok(None);
+        }
+        let defaults = StickyConfig::default();
+        let header_name = self.routing_key_header.unwrap_or(defaults.header_name);
+        axum::http::HeaderName::try_from(header_name.as_str()).map_err(|e| {
+            anyhow!("--routing-key-header {header_name:?} is not a valid HTTP header name: {e}")
+        })?;
+        let fallback_policy = self
+            .sticky_fallback_policy
+            .unwrap_or(defaults.fallback_policy);
+        let idle_secs = self.sticky_idle_secs.unwrap_or(defaults.idle_secs);
+        let eviction_interval_secs = self
+            .sticky_eviction_interval_secs
+            .unwrap_or(defaults.eviction_interval_secs);
+        ensure!(
+            eviction_interval_secs != 0,
+            "--sticky-eviction-interval-secs must be greater than 0"
+        );
+        ensure!(
+            idle_secs != 0,
+            "--sticky-idle-secs must be greater than 0 (0 would evict every \
+                 assignment immediately, defeating sticky routing)"
+        );
+        Ok(Some(StickyConfig {
+            header_name,
+            fallback_policy,
+            idle_secs,
+            eviction_interval_secs,
+        }))
     }
 }
 
@@ -796,22 +840,90 @@ fn load_bucket_config(path: &str) -> Result<crate::config::BucketConfig> {
         .map_err(|error| anyhow!("--bucket-config {path:?} is not valid JSON: {error}"))
 }
 
-/// Join space/repeated `key=value` selector terms into the single
-/// comma-joined string the k8s backend's `labels_match_selector`
-/// expects. `None` for an empty term list so [`resolve_mode`] can apply
-/// its plain-vs-PD rules (and surface `NoSelector`).
 fn join_selector(terms: &[String]) -> Option<String> {
-    if terms.is_empty() {
-        None
-    } else {
-        Some(terms.join(","))
-    }
+    (!terms.is_empty()).then(|| terms.join(","))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::{DiscoveryBackend, K8sDiscoveryMode, ScoreTermKind};
+
+    #[test]
+    fn chat_routing_selects_policy_implementation_without_another_config() {
+        let base = [
+            "router",
+            "--model-id",
+            "tiny",
+            "--worker-urls",
+            "http://localhost:30000",
+        ];
+        let legacy = Cli::try_parse_from(base).unwrap();
+        assert_eq!(legacy.routing.chat_routing, ChatRoutingKind::Legacy);
+        assert_eq!(
+            legacy.into_config().unwrap().model.policy,
+            PolicyKind::RoundRobin
+        );
+        let reorg = ["--chat-routing", "reorg"];
+        let parse = |args: &[&str]| {
+            Cli::try_parse_from(base.iter().chain(reorg.iter()).chain(args))
+                .unwrap()
+                .into_config()
+        };
+        assert_eq!(parse(&[]).unwrap().model.policy, PolicyKind::PowerOfTwo);
+        let cache = parse(&[
+            "--policy",
+            "cache_aware",
+            "--worker-queue-limit",
+            "3",
+            "--kv-indexer-endpoint",
+            "http://localhost:50051",
+        ])
+        .unwrap();
+        assert_eq!(cache.model.affinity.unwrap().worker_queue_limit, Some(3));
+        assert!(cache
+            .model
+            .cache_aware
+            .unwrap()
+            .kv_indexer_endpoint
+            .is_some());
+        let session = parse(&[
+            "--policy",
+            "session_aware",
+            "--session-id-header",
+            "x-session",
+        ])
+        .unwrap();
+        assert_eq!(
+            session.model.affinity.unwrap().session_id_header,
+            "x-session"
+        );
+        assert_eq!(
+            parse(&["--filter", "overloaded", "--max-in-flight", "2"])
+                .unwrap()
+                .model
+                .eligibility
+                .unwrap()
+                .max_in_flight,
+            Some(2)
+        );
+        for args in [
+            vec!["--policy", "round_robin"],
+            vec!["--decode-policy", "legacy_host_affinity"],
+            vec!["--policy", "session_aware", "--stable-pair"],
+            vec!["--policy", "session_aware", "--affinity-mode", "soft"],
+            vec!["--policy", "session_aware", "--pressure-rel-threshold", "2"],
+            vec!["--policy", "cache_aware", "--min-load-choices", "4"],
+            vec![
+                "--filter",
+                "prefix_cache",
+                "--prefix-cache-min-share",
+                "0.2",
+            ],
+        ] {
+            assert!(parse(&args).is_err(), "accepted {args:?}");
+        }
+    }
 
     /// Parse argv (without the leading binary name) into a `Config`.
     fn into_config(args: &[&str]) -> Result<Config> {
@@ -841,6 +953,59 @@ mod tests {
     }
 
     #[test]
+    fn help_groups_options_by_purpose() {
+        use clap::CommandFactory;
+
+        Cli::command().debug_assert();
+        for long in [false, true] {
+            let mut command = Cli::command();
+            let help = if long {
+                command.render_long_help()
+            } else {
+                command.render_help()
+            }
+            .to_string();
+            let headings: std::collections::HashSet<_> = command
+                .get_arguments()
+                .filter_map(|arg| arg.get_help_heading())
+                .collect();
+            assert_eq!(
+                headings.len(),
+                6,
+                "keep related options in six broad groups"
+            );
+            for arg in command
+                .get_arguments()
+                .filter(|arg| !matches!(arg.get_id().as_str(), "help" | "version"))
+            {
+                let heading = arg.get_help_heading().expect("every option has a group");
+                assert!(
+                    arg.get_help().is_some(),
+                    "missing help for {}",
+                    arg.get_id()
+                );
+                let section = help
+                    .split_once(&format!("{heading}:\n"))
+                    .unwrap_or_else(|| panic!("missing help section: {heading}"))
+                    .1
+                    .split("\n\n")
+                    .next()
+                    .unwrap();
+                // Long help separates individual options with blank lines.
+                if !long {
+                    assert!(
+                        section.contains(&format!("--{}", arg.get_long().unwrap())),
+                        "{} is outside {heading}",
+                        arg.get_id()
+                    );
+                }
+            }
+            assert!(help.contains("Examples:"));
+            assert!(help.contains("Choose exactly one discovery backend"));
+        }
+    }
+
+    #[test]
     fn defaults_host_port_and_policy() {
         let c = into_config_owned(with_model(&["--worker-urls", "http://10.0.0.1:30000"])).unwrap();
         assert_eq!(c.server.host, "127.0.0.1");
@@ -848,7 +1013,7 @@ mod tests {
         assert_eq!(c.model.policy, PolicyKind::RoundRobin);
         assert_eq!(c.model.id, "qwen3-0.6b");
         assert_eq!(c.proxy.request_timeout_secs, 300);
-        assert_eq!(c.active_load.stale_request_timeout_secs, 600);
+        assert_eq!(c.router_inflight_load.stale_request_timeout_secs, 600);
         assert_eq!(c.server.shutdown_drain_secs, 30);
     }
 
@@ -877,9 +1042,6 @@ mod tests {
         }
     }
 
-    /// The ceiling is enforced on the CLI path, not only on a hand-built
-    /// `Config`: a drain carrying a fat-fingered extra digit must fail at
-    /// startup rather than turn every later termination into a SIGKILL.
     #[test]
     fn shutdown_drain_secs_past_the_ceiling_is_rejected() {
         let error = into_config_owned(with_model(&[
@@ -896,10 +1058,6 @@ mod tests {
         );
     }
 
-    /// `--termination-grace-secs` exists only to feed the startup advisory, so
-    /// the one thing that matters is that it reaches the config — and that
-    /// omitting it stays `None` (assume the k8s default) rather than
-    /// defaulting to a number that would silently become the compared budget.
     #[test]
     fn termination_grace_secs_maps_into_config_and_defaults_to_none() {
         let c = into_config_owned(with_model(&["--worker-urls", "http://10.0.0.1:30000"])).unwrap();
@@ -942,19 +1100,6 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(c.model.tokenizer_path, "/models/qwen3/tokenizer.json");
-    }
-
-    #[test]
-    fn input_ids_forwarding_can_be_disabled_for_the_model() {
-        let defaults = into_config_owned(with_model(&["--worker-urls", "http://x:30000"])).unwrap();
-        assert!(!defaults.model.disable_input_ids_forwarding);
-        let disabled = into_config_owned(with_model(&[
-            "--worker-urls",
-            "http://x:30000",
-            "--disable-input-ids-forwarding",
-        ]))
-        .unwrap();
-        assert!(disabled.model.disable_input_ids_forwarding);
     }
 
     #[test]
@@ -1135,10 +1280,6 @@ mod tests {
         assert!(err.contains("none were set"), "got: {err}");
     }
 
-    /// `--prefill-selector` without `--decode-selector` is rejected through
-    /// the full CLI path — pins that `build_discovery` feeds the right
-    /// selectors into `resolve_mode` (a positional mix-up would surface a
-    /// different error or none).
     #[test]
     fn rejects_k8s_partial_pd_selectors() {
         let err = into_config_owned(with_model(&[
@@ -1427,9 +1568,6 @@ mod tests {
         assert_eq!(c.observability.log_format, LogFormat::Json);
     }
 
-    /// Pins that the two timeout overrides land in the right fields — they
-    /// are adjacent `u64`s with similar names, so a copy-paste swap would
-    /// otherwise go unnoticed (and `stale` must sit above `proxy`).
     #[test]
     fn timeout_overrides_land_in_distinct_fields() {
         let c = into_config_owned(with_model(&[
@@ -1442,7 +1580,7 @@ mod tests {
         ]))
         .unwrap();
         assert_eq!(c.proxy.request_timeout_secs, 120);
-        assert_eq!(c.active_load.stale_request_timeout_secs, 240);
+        assert_eq!(c.router_inflight_load.stale_request_timeout_secs, 240);
     }
 
     #[test]
@@ -1474,8 +1612,11 @@ mod tests {
             .split_once("--sticky-fallback-policy <STICKY_FALLBACK_POLICY>")
             .expect("sticky fallback option is documented");
         let choices = after
-            .split_once("--sticky-idle-secs")
-            .expect("sticky fallback precedes its tuning")
+            .split_once("[possible values:")
+            .expect("sticky fallback lists its choices")
+            .1
+            .split_once(']')
+            .unwrap()
             .0;
 
         for value in ["round_robin", "random", "power_of_two", "load_based"] {
@@ -1765,11 +1906,6 @@ mod tests {
         assert!(fused_of("").is_none(), "round_robin builds no term list");
     }
 
-    /// Non-finite and negative weights are refused, naming the term.
-    ///
-    /// `nan`/`inf` matter more than they look: `str::parse::<f32>` accepts
-    /// both, and a NaN weight makes every worker's fused total NaN, so argmax
-    /// discards them all and the router silently degrades to least-load.
     #[test]
     fn fuse_rejects_non_finite_and_negative_weights() {
         for bad in ["nan", "NaN", "inf", "-inf", "-0.5", "banana"] {
@@ -2259,5 +2395,54 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(err.contains("unknown parameter"), "got: {err}");
+    }
+    #[test]
+    fn input_ids_forwarding_can_be_disabled_for_the_model() {
+        let defaults = into_config_owned(with_model(&["--worker-urls", "http://x:30000"])).unwrap();
+        assert!(!defaults.model.disable_input_ids_forwarding);
+        let disabled = into_config_owned(with_model(&[
+            "--worker-urls",
+            "http://x:30000",
+            "--disable-input-ids-forwarding",
+        ]))
+        .unwrap();
+        assert!(disabled.model.disable_input_ids_forwarding);
+    }
+
+    #[test]
+    fn min_load_choices_is_plumbed_and_validated() {
+        let config = cfg_of("--policy cache_aware --min-load-choices 5").unwrap();
+        assert_eq!(
+            config
+                .model
+                .affinity
+                .expect("cache-aware needs affinity config")
+                .min_load_choices,
+            5
+        );
+
+        // Unset keeps the pre-existing power-of-2 behavior.
+        let defaults = cfg_of("--policy cache_aware").unwrap();
+        assert_eq!(
+            defaults
+                .model
+                .affinity
+                .expect("default affinity config")
+                .min_load_choices,
+            2
+        );
+
+        let err = cfg_of("--policy cache_aware --min-load-choices 0")
+            .expect_err("a zero sample size would select nothing")
+            .to_string();
+        assert!(err.contains("--min-load-choices"), "got: {err}");
+
+        let err = cfg_of("--policy power_of_two --min-load-choices 3")
+            .expect_err("the knob only tunes the cache-aware fallback")
+            .to_string();
+        assert!(
+            err.contains("cache candidate tuning flags require --policy cache_aware"),
+            "got: {err}"
+        );
     }
 }

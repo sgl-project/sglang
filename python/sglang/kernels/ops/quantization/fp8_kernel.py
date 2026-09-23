@@ -52,12 +52,12 @@ _is_xpu = is_xpu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
 if _is_cuda:
-    from sglang.kernels.ops.quantization import (
-        per_token_group_quant,
-        sgl_per_token_quant_fp8,
-    )
+    from sglang.kernels.ops.quantization import sgl_per_token_quant_fp8
     from sglang.kernels.ops.quantization.per_tensor_quant_fp8 import (
         per_tensor_quant_fp8 as sgl_per_tensor_quant_fp8,
+    )
+    from sglang.kernels.ops.quantization.per_token_group_quant import (
+        per_token_group_quant,
     )
 elif _is_xpu:
     from sgl_kernel import sgl_per_tensor_quant_fp8, sgl_per_token_quant_fp8
@@ -2071,12 +2071,17 @@ if _is_hip:
                 else:
                     _native_dynamic_per_token_quant_fp8(output, input, scale)
             else:
-                scale = torch.zeros(1, device=input.device, dtype=torch.float32)
+                # Only vLLM needs `scale` pre-zeroed: segmented_max_reduction
+                # accumulates into it with atomicMax. AITER zeroes it itself
+                # and the native path overwrites it.
                 if _use_aiter:
+                    scale = torch.empty(1, device=input.device, dtype=torch.float32)
                     dynamic_per_tensor_quant(output, input, scale)
                 elif _has_vllm:
+                    scale = torch.zeros(1, device=input.device, dtype=torch.float32)
                     torch.ops._C.dynamic_scaled_fp8_quant(output, input, scale)
                 else:
+                    scale = torch.empty(1, device=input.device, dtype=torch.float32)
                     _native_dynamic_per_tensor_quant_fp8(output, input, scale)
         else:
             # Static scaling

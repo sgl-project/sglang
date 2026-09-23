@@ -1,4 +1,7 @@
+from __future__ import annotations
+
 import weakref
+from typing import TYPE_CHECKING
 
 import torch
 
@@ -11,6 +14,9 @@ from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
 from sglang.srt.mem_cache.hisparse_memory_pool import HiSparseDSATokenToKVPool
 from sglang.srt.utils.common import get_num_new_pages
 
+if TYPE_CHECKING:
+    from sglang.srt.mem_cache.memory_pool import MiniMaxSparseKVPool
+
 
 class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     def __init__(
@@ -19,7 +25,7 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         page_size: int,
         dtype: torch.dtype,
         device: torch.device,
-        kvcache: HiSparseDSATokenToKVPool,
+        kvcache: HiSparseDSATokenToKVPool | MiniMaxSparseKVPool,
         need_sort: bool,
         host_to_device_ratio: int = 2,
     ):
@@ -349,10 +355,6 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     def translate_swa_indices_for_transfer(
         self, kv_indices: torch.Tensor
     ) -> torch.Tensor:
-        # Delegated like the read-path translate above: this composite is not a
-        # SWA allocator itself, so it inherits neither the default nor an
-        # override, and the PD payload path calls this on whatever allocator
-        # the scheduler holds.
         return self.logical_attn_allocator.translate_swa_indices_for_transfer(
             kv_indices
         )
@@ -379,6 +381,14 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
     def swa_available_size(self):
         return self.logical_attn_allocator.swa_available_size()
+
+    def reclaim_for_prealloc(
+        self, tree_cache, full_tokens: int, swa_tokens: int
+    ) -> str | None:
+        # C4 needs no reclaim here: full_available_size prices it into the budget.
+        return self.logical_attn_allocator.reclaim_for_prealloc(
+            tree_cache, full_tokens, swa_tokens
+        )
 
     def free_swa(self, free_indices: torch.Tensor):
         self.logical_attn_allocator.free_swa(free_indices)

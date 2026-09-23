@@ -24,6 +24,7 @@ Select one with `--radix-eviction-policy`. All of them fall back to least-recent
 | `lfu` | The prefix with the fewest cache hits, then the least recent. | A small set of prompts is reused far more than the rest, and you want those to survive bursts of one-off traffic. |
 | `slru` | Prefixes still in the probationary segment, then the least recent within a segment. | Like `lfu`, but you want a hard floor on how much a one-off prefix can displace a proven one. See [`slru` parameters](#slru-parameters). |
 | `priority` | The prefix belonging to the lowest-priority request, then the least recent. | You run [priority scheduling](/docs/advanced_features/server_arguments) and want cache retention to follow the same ranking as admission. |
+| `tlru` | The tail of a conversation beyond what its next prefill needs to meet the TTFT budget ("TEL-safe" tokens), then the least recent. | Agentic / multi-turn workloads where tail TTFT matters more than raw hit rate. See [`tlru` parameters](#tlru-parameters). Requires the unified radix cache (the default tree). |
 
 Notes on the scoring inputs:
 
@@ -55,7 +56,7 @@ TypeError: SLRUStrategy.__init__() got an unexpected keyword argument 'protected
 
 ### Policy parameters
 
-Only `slru` currently takes a parameter. `lru`, `lfu`, and `priority` take none, so `--radix-eviction-policy-config` has no effect with them and any key is an error.
+`slru` and `tlru` take parameters. `lru`, `lfu`, and `priority` take none, so `--radix-eviction-policy-config` has no effect with them and any key is an error.
 
 #### `slru` parameters
 
@@ -66,6 +67,24 @@ Only `slru` currently takes a parameter. `lru`, `lfu`, and `priority` take none,
 | `protected_threshold` | int | `2` | Hit count at which a prefix is promoted to the protected segment. |
 
 Raising it makes promotion harder, so the protected set stays small and closer to your genuinely hot prefixes; a prefix hit three times stays probationary at `4` but is protected at the default `2`. Lowering it to `1` promotes any prefix that is reused even once, which approaches `lru` with a one-hit grace period.
+
+#### `tlru` parameters
+
+`tlru` (Tail-Optimized LRU, [arXiv:2510.15152](https://arxiv.org/abs/2510.15152)) protects only the cached history a conversation's next prefill needs to stay under a TTFT budget; the rest of its tail is evicted first, and eviction continues in plain recency order once the TEL-safe tokens run out.
+
+| Key | Type | Meaning |
+|---|---|---|
+| `threshold` | int | Tail-latency threshold ξ, in tokens: a conversation only keeps enough cache to hold its next prefill under ξ uncached tokens. Convert from a TTFT target by dividing it by the measured ms per uncached token. The paper states ξ in blocks, so multiply its values by `--page-size`. |
+| `next_prompt_estimate` | int | Estimated tokens the next turn of a conversation will add; use the trace's empirical mean. |
+
+Both keys are required in practice: `threshold` must be greater than `next_prompt_estimate` (only the difference affects behaviour), and values at or above it reduce T-LRU to plain LRU, which startup rejects.
+
+```bash Command
+python3 -m sglang.launch_server \
+  --model-path MODEL_PATH \
+  --radix-eviction-policy tlru \
+  --radix-eviction-policy-config '{"threshold": 4096, "next_prompt_estimate": 512}'
+```
 
 ## Which policy to pick
 
