@@ -3414,7 +3414,55 @@ class DeepseekV4AttnBackend(
             else:
                 self.full_topk_indexer.topk_prefill(inputs)
 
-    def _low_ratio_index_topk_captured(self, layer, projected_q, projected_w) -> None:
+    @staticmethod
+    def _low_ratio_quantize_q_prefill_graph(q):
+        return quantize_index_q(q)
+
+    def _low_ratio_gather_k_prefill_graph(self, layer):
+        metadata = (
+            self.forward_metadata.c1_indexer_metadata
+            if layer.compress_ratio == 1
+            else self.forward_metadata.c2_indexer_metadata
+        )
+        assert metadata is not None
+        if not (
+            self.forward_metadata.prefill_graph_dense_indexer
+            and metadata.compressed_seq_lens.shape[0]
+            >= _PREFILL_GRAPH_DENSE_INDEXER_MAX_REQUESTS
+            * _PREFILL_GRAPH_INDEXER_ROW_CHUNK
+        ):
+            return None
+        indexer = layer.indexer
+        width = metadata.max_compressed_seq_len
+        two_level = (
+            width > indexer.candidate_topk_blocks * indexer.candidate_block_size
+            and (indexer.is_candidate_source or indexer.uses_candidates)
+        )
+        if two_level and indexer.uses_candidates and not indexer.is_candidate_source:
+            return None
+        req_ids = self.forward_metadata.low_ratio_dense_req_indices
+        req_lens = self.forward_metadata.low_ratio_dense_seq_lens
+        local_req_ids = self.forward_metadata.low_ratio_local_req_indices
+        assert req_ids is not None and req_lens is not None and local_req_ids is not None
+        ratio = layer.compress_ratio
+        ks = self.forward_metadata.low_ratio_dense_k_offsets.get(ratio)
+        if ks is None:
+            ks = _prefill_graph_dense_k_offsets(width, local_req_ids, req_ids)
+            self.forward_metadata.low_ratio_dense_k_offsets[ratio] = ks
+        k_fp4 = gather_fp4_index_k_cache_masked(
+            self.token_to_kv_pool.get_index_k_with_scale_buffer(layer.layer_id),
+            self.req_to_token,
+            req_ids,
+            req_lens,
+            width=width,
+            compress_ratio=ratio,
+            page_size=metadata.compressed_page_size,
+        )
+        return k_fp4, ks
+
+    def _low_ratio_index_topk_captured(
+        self, layer, projected_q, projected_w, *, prepared_q=None, prepared_dense_k=None
+    ) -> None:
         ratio = layer.compress_ratio
         indexer = layer.indexer
         core = self.forward_metadata.core_metadata
@@ -3450,7 +3498,9 @@ class DeepseekV4AttnBackend(
         if two_level:
             assert indexer.candidate_block_size == 8
 
-        q_fp4, q_sf = quantize_index_q(projected_q)
+        q_fp4, q_sf = (
+            quantize_index_q(projected_q) if prepared_q is None else prepared_q
+        )
         rows, heads = q_fp4.shape[:2]
         weights = projected_w.float()
         lens = metadata.compressed_seq_lens
@@ -3468,10 +3518,13 @@ class DeepseekV4AttnBackend(
             local_req_ids = self.forward_metadata.low_ratio_local_req_indices
             assert req_ids is not None and req_lens is not None
             assert local_req_ids is not None and local_req_ids.shape[0] == rows
-            ks = self.forward_metadata.low_ratio_dense_k_offsets.get(ratio)
-            if ks is None:
-                ks = _prefill_graph_dense_k_offsets(width, local_req_ids, req_ids)
-                self.forward_metadata.low_ratio_dense_k_offsets[ratio] = ks
+            if prepared_dense_k is not None:
+                k_fp4, ks = prepared_dense_k
+            else:
+                ks = self.forward_metadata.low_ratio_dense_k_offsets.get(ratio)
+                if ks is None:
+                    ks = _prefill_graph_dense_k_offsets(width, local_req_ids, req_ids)
+                    self.forward_metadata.low_ratio_dense_k_offsets[ratio] = ks
 
         sparse_consumer = (
             dense
@@ -3489,7 +3542,7 @@ class DeepseekV4AttnBackend(
             layer_id=layer.layer_id,
             page_size=page_size,
         )
-        if dense and not sparse_consumer:
+        if dense and not sparse_consumer and prepared_dense_k is None:
             k_fp4 = gather_fp4_index_k_cache_masked(
                 self.token_to_kv_pool.get_index_k_with_scale_buffer(layer.layer_id),
                 self.req_to_token,
