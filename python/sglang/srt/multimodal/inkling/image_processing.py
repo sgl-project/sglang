@@ -151,9 +151,16 @@ def _encode_image_bytes(
         rescale_image_max_upscaled_long_edge,
     )
 
-    from PIL import Image
+    from PIL import Image, UnidentifiedImageError
 
-    image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+    try:
+        image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+    except UnidentifiedImageError as e:
+        # Undecodable client-supplied image bytes are a 400, not a 500:
+        # UnidentifiedImageError is unclassified by default and would escape
+        # to the server fault path. Mirror BaseMultimodalProcessor's
+        # CLIENT_MEDIA_EXCEPTIONS handling.
+        raise ValueError(f"Could not decode image bytes: {e}") from e
     scaled_size = _scaled_image_dimensions(
         *image.size,
         rescale_image_frac=rescale_image_frac,

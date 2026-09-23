@@ -52,7 +52,10 @@ from sglang.srt.parser.inkling_tokenizer import IMAGE_TOKEN_ID as INKLING_IMAGE_
 from sglang.srt.parser.inkling_tokenizer import (
     INKLING_SPECIAL_TOKEN_IDS,
 )
-from sglang.srt.utils.common import download_remote_media
+from sglang.srt.utils.common import (
+    CLIENT_MEDIA_EXCEPTIONS,
+    download_remote_media,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -78,11 +81,23 @@ def _resolve_media_item(item):
         url = getattr(item, "url")
     if not isinstance(url, str):
         return item
+    if not url.strip():
+        # An empty media URL is a client request error, not a missing local
+        # file; raise ValueError so it follows the same 400 path as every
+        # other VLM processor (BaseMultimodalProcessor._load_single_item),
+        # instead of surfacing as FileNotFoundError / HTTP 500 later.
+        raise ValueError("Error while resolving media: media URL must not be empty.")
     if url.startswith("data:"):
         header, _, payload = url.partition(",")
         return base64.b64decode(payload) if ";base64" in header else payload.encode()
     if url.startswith(("http://", "https://")):
-        return download_remote_media(url, timeout=30)
+        try:
+            return download_remote_media(url, timeout=30)
+        except CLIENT_MEDIA_EXCEPTIONS as e:
+            # Network/DNS/timeout/oversized payloads are client errors, not
+            # server faults; mirror the base processor's classification so the
+            # OpenAI layer returns 400 rather than 500.
+            raise ValueError(f"Error while downloading media URL {url}: {e}") from e
     return url  # plain path / file:// -> handled by the per-modality byte loader
 
 
