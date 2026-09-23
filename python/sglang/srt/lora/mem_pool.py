@@ -37,6 +37,7 @@ from sglang.srt.lora.utils import (
     get_normalized_target_modules,
     get_stacked_multiply,
     get_target_module_name,
+    shared_experts_count,
 )
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import is_pin_memory_available
@@ -147,7 +148,13 @@ class LoRAMemoryPool:
         experts_shared_outer_loras: bool = False,
         strict_loading: bool = False,
         enable_lora_overlap_loading: bool = False,
+        lora_no_cpu_backup: bool = False,
     ):
+        assert not (lora_no_cpu_backup and enable_lora_overlap_loading), (
+            "--lora-no-cpu-backup drops the staged weights right after install, which overlap loading still reads"
+        )
+        self.lora_no_cpu_backup: bool = lora_no_cpu_backup
+        self.invalid_uids: Set[str] = set()
         self.base_hf_config: AutoConfig = base_hf_config
         self.num_layer: int = base_hf_config.num_hidden_layers
         self.max_loras_per_batch: int = max_loras_per_batch
@@ -745,9 +752,8 @@ class LoRAMemoryPool:
             if hasattr(cfg, "get_text_config"):
                 cfg = cfg.get_text_config()
             has_shared_experts = (
-                hasattr(cfg, "shared_expert_intermediate_size")
-                and cfg.shared_expert_intermediate_size > 0
-            ) or (getattr(cfg, "n_shared_experts", 0) or 0) > 0
+                getattr(cfg, "shared_expert_intermediate_size", 0) or 0
+            ) > 0 or (shared_experts_count(cfg) or 0) > 0
             has_moe = self._has_moe_module(base_model)
 
             # Shape functions automatically handle both 3D (standard) and 4D (MoE)
@@ -919,6 +925,7 @@ class LoRAMemoryPool:
         lora_embed_tokens_module: Optional[BaseLayerWithLoRA],
         lora_lm_head_module: Optional[BaseLayerWithLoRA],
     ):
+        self.check_valid()
         # Python hash seeds differ by TP process; slot and LRU updates must not.
         ordered_uids = sorted(cur_uids, key=lambda uid: (uid is not None, uid or ""))
 
@@ -964,6 +971,12 @@ class LoRAMemoryPool:
 
             # Select victim using eviction policy
             victim_uid = self.eviction_policy.select_victim(candidates_to_use)
+            if victim_uid is not None and self.lora_no_cpu_backup:
+                raise RuntimeError(
+                    f"Refusing to evict LoRA adapter '{victim_uid}': --lora-no-cpu-backup dropped its "
+                    "staged weights after installation, so it could never be reloaded. Increase "
+                    "--max-loras-per-batch."
+                )
 
             # Evict the selected victim
             victim_buffer_id = self.uid_to_buffer_id[victim_uid]
@@ -993,6 +1006,60 @@ class LoRAMemoryPool:
                 )
                 self.uid_to_buffer_id[uid] = buffer_id
                 self.buffer_id_to_uid[buffer_id] = uid
+                if self.lora_no_cpu_backup and lora_adapter is not None:
+                    lora_adapter.release_staged_weights()
+
+    def check_valid(self):
+        if self.invalid_uids:
+            raise RuntimeError(
+                f"LoRA adapters {sorted(self.invalid_uids)} have incomplete GPU installs; "
+                "reload or unload them before resuming inference."
+            )
+
+    def install_streamed_adapter(
+        self,
+        uid: str,
+        lora_adapter: LoRAAdapter,
+        lora_modules: List[Dict[str, torch.nn.Module]],
+        lora_embed_tokens_module: Optional[BaseLayerWithLoRA],
+        lora_lm_head_module: Optional[BaseLayerWithLoRA],
+    ) -> None:
+        """Validate a streamed adapter before overwriting its only resident copy."""
+        if uid in self.uid_to_buffer_id:
+            buffer_id = self.uid_to_buffer_id[uid]
+        elif EMPTY_SLOT in self.buffer_id_to_uid:
+            buffer_id = self.buffer_id_to_uid.index(EMPTY_SLOT)
+        elif None in self.uid_to_buffer_id:
+            buffer_id = self.uid_to_buffer_id[None]
+        else:
+            raise RuntimeError(
+                f"No free LoRA memory pool slot for streamed adapter '{uid}'; "
+                "--lora-no-cpu-backup cannot evict, increase --max-loras-per-batch."
+            )
+        load_args = (
+            uid,
+            buffer_id,
+            lora_adapter,
+            lora_modules,
+            lora_embed_tokens_module,
+            lora_lm_head_module,
+        )
+        self.load_lora_weight_to_buffer(*load_args, validate_only=True)
+
+        # No backup exists: a failed write must block inference until a complete reload.
+        self.invalid_uids.add(uid)
+        if self.buffer_id_to_uid[buffer_id] is None:
+            del self.uid_to_buffer_id[None]
+            self.eviction_policy.remove(None)
+        self.uid_to_buffer_id[uid] = buffer_id
+        self.buffer_id_to_uid[buffer_id] = uid
+        self.load_lora_weight_to_buffer(*load_args)
+        device = next(self.base_model.parameters()).device
+        if device.type == "cuda":
+            torch.cuda.current_stream(device).synchronize()
+        self.invalid_uids.remove(uid)
+        self.eviction_policy.mark_used(uid)
+        lora_adapter.release_staged_weights()
 
     def _clear_buffer_slot_for_base(self, buffer_id: int) -> None:
         """Make an evicted slot safe for graph-captured base-model replay."""
@@ -1019,6 +1086,7 @@ class LoRAMemoryPool:
         del self.uid_to_buffer_id[uid]
         self.buffer_id_to_uid[buffer_id] = EMPTY_SLOT
         self.eviction_policy.remove(uid)
+        self.invalid_uids.discard(uid)
         return buffer_id
 
     def load_lora_weight_to_buffer(
@@ -1029,21 +1097,25 @@ class LoRAMemoryPool:
         lora_modules: List[Dict[str, torch.nn.Module]],
         lora_embed_tokens_module: Optional[BaseLayerWithLoRA],
         lora_lm_head_module: Optional[BaseLayerWithLoRA],
+        *,
+        validate_only: bool = False,
     ):
         def load_lora_weight_tensor(
             buffer_view: torch.Tensor, weight: Optional[torch.Tensor]
         ):
-            if weight is None:
-                # If the particular weight is not present in the adapter, we initialize the buffer to zero
-                # to avoid contamination from the residual weight of the evicted adapters.
-                buffer_view.zero_()
-            else:
+            if weight is not None:
                 assert buffer_view.shape == weight.shape, (
                     f"LoRA buffer shape {buffer_view.shape} does not match weight shape {weight.shape}."
                 )
+            if validate_only:
+                return
+            if weight is None:
+                buffer_view.zero_()
+            else:
                 copy_weight_into_buffer(buffer_view, weight)
 
         if uid is None:
+            assert not validate_only
             self._clear_buffer_slot_for_base(buffer_id)
             return
 
@@ -1362,7 +1434,7 @@ class LoRAMemoryPool:
                         # Place each stacked component at max_rank-spaced
                         # positions so the kernel's [:max_r] / [max_r:2*max_r]
                         # slicing is correct.
-                        target_buffer[buffer_id, 0].zero_()
+                        load_lora_weight_tensor(target_buffer[buffer_id, 0], None)
                         if representative_weight is not None:
                             for ci in range(c):
                                 buffer_view = target_buffer[
@@ -1375,14 +1447,14 @@ class LoRAMemoryPool:
                                     ],
                                 )
                     elif weights is None:
-                        target_buffer[buffer_id].zero_()
+                        load_lora_weight_tensor(target_buffer[buffer_id], None)
                     elif isinstance(weights, (torch.Tensor, dict)):
                         # Zero first so any local-expert slot the adapter
                         # doesn't fill (e.g. out-of-rank under EP) is clean;
                         # then load owned slots at max_rank-spaced offsets so
                         # the MoE kernel's [:max_r] / [max_r:2*max_r] slicing
                         # is correct.
-                        target_buffer[buffer_id].zero_()
+                        load_lora_weight_tensor(target_buffer[buffer_id], None)
                         assert isinstance(weights_cache_key, (str, dict))
                         for (
                             local_eid,
@@ -1491,14 +1563,16 @@ class LoRAMemoryPool:
                                 f"shape={weights.shape if isinstance(weights, torch.Tensor) else 'N/A'}"
                             )
                         # Zero beyond loaded rank — MoE kernel reads full max_rank.
-                        target_buffer[buffer_id, 0, :, lora_rank:].zero_()
+                        load_lora_weight_tensor(
+                            target_buffer[buffer_id, 0, :, lora_rank:], None
+                        )
                     elif weights is None:
-                        target_buffer[buffer_id].zero_()
+                        load_lora_weight_tensor(target_buffer[buffer_id], None)
                     elif isinstance(weights, (torch.Tensor, dict)):
                         # Zero out slots this rank owns but the adapter
                         # doesn't fill (padded-out / out-of-rank experts);
                         # then scale+load the ones it does.
-                        target_buffer[buffer_id].zero_()
+                        load_lora_weight_tensor(target_buffer[buffer_id], None)
                         assert isinstance(weights_cache_key, (str, dict))
                         for (
                             local_eid,
@@ -1533,7 +1607,9 @@ class LoRAMemoryPool:
                     if _SGLANG_EXPERIMENTAL_LORA_OPTI:
                         # Zero beyond loaded rank: the experimental dense LoRA-B kernel
                         # contracts over the full padded max_rank, so the tail must be clean.
-                        target_buffer[buffer_id, :, lora_rank:].zero_()
+                        load_lora_weight_tensor(
+                            target_buffer[buffer_id, :, lora_rank:], None
+                        )
 
         if lora_adapter.embedding_layers:
             org_vocab_size = self.base_hf_config.vocab_size
@@ -1664,18 +1740,20 @@ class LoRAMemoryPool:
             # Zero out embedding/lm_head buffers for adapters without embedding LoRA
             # to avoid using garbage values from uninitialized memory
             for k in self.embedding_A_buffer.keys():
-                self.embedding_A_buffer[k][buffer_id].zero_()
+                load_lora_weight_tensor(self.embedding_A_buffer[k][buffer_id], None)
             for k in self.embedding_B_buffer.keys():
-                self.embedding_B_buffer[k][buffer_id].zero_()
+                load_lora_weight_tensor(self.embedding_B_buffer[k][buffer_id], None)
             for k in self.lm_head_A_buffer.keys():
-                self.lm_head_A_buffer[k][buffer_id].zero_()
+                load_lora_weight_tensor(self.lm_head_A_buffer[k][buffer_id], None)
             for k in self.lm_head_B_buffer.keys():
-                self.lm_head_B_buffer[k][buffer_id].zero_()
+                load_lora_weight_tensor(self.lm_head_B_buffer[k][buffer_id], None)
             if (
                 self.lora_added_tokens_size > 0
                 and "input_embeddings" in self.new_embeddings_buffer
             ):
-                self.new_embeddings_buffer["input_embeddings"][buffer_id].zero_()
+                load_lora_weight_tensor(
+                    self.new_embeddings_buffer["input_embeddings"][buffer_id], None
+                )
 
     def get_embedding_tensor(
         self, target_module: str, lora_type: LoRAType

@@ -106,6 +106,7 @@ class LoRAManager:
         )
         self.lora_use_virtual_experts: bool = get_lora().lora_use_virtual_experts
         self.lora_strict_loading: bool = get_lora().lora_strict_loading
+        self.lora_no_cpu_backup: bool = get_lora().lora_no_cpu_backup
         self.speculative_algorithm: Optional[str] = get_spec().speculative_algorithm
 
         # LoRA backend for running sgemm kernels
@@ -470,6 +471,7 @@ class LoRAManager:
         self.lora_backend.reset_batch_state()
 
     def prepare_lora_batch(self, forward_batch: ForwardBatch):
+        self.memory_pool.check_valid()
         # Some internal-only backends (currently UNO) use explicit token-row
         # routing for their adapted forwards and want all-base batches to run
         # through the plain model path.  Clear any routing retained by the
@@ -975,6 +977,7 @@ class LoRAManager:
             self.load_config,
             self.lora_backend,
             base_model=self.base_model,
+            keep_weights_on_device=self.lora_no_cpu_backup,
         )
         lora_adapter.initialize_weights_from_tensors(tensors)
 
@@ -1087,10 +1090,26 @@ class LoRAManager:
                 error_message=str(e),
             )
 
-        self.configs[uid] = new_config
-        self.loras[uid] = new_lora
-
         if (
+            self.lora_no_cpu_backup
+            and getattr(self, "memory_pool", None) is not None
+            and (tensors or (is_update and uid in self.memory_pool.uid_to_buffer_id))
+        ):
+            try:
+                if self.device.type == "cuda":
+                    torch.cuda.synchronize(self.device)
+                self.memory_pool.install_streamed_adapter(
+                    uid,
+                    new_lora,
+                    self.lora_modules,
+                    self.embed_tokens_module,
+                    self.lm_head_module,
+                )
+            except Exception as e:
+                return self.create_lora_update_result(
+                    success=False, error_message=str(e)
+                )
+        elif (
             is_update
             and getattr(self, "memory_pool", None) is not None
             and uid in self.memory_pool.uid_to_buffer_id
@@ -1136,6 +1155,8 @@ class LoRAManager:
                     error_message=str(e),
                 )
 
+        self.configs[uid] = new_config
+        self.loras[uid] = new_lora
         self.lora_refs[uid] = lora_ref
         # An upsert may change ``pinned``; track the delta against the replaced
         # ref so the counter stays consistent with lora_refs.
@@ -1161,6 +1182,7 @@ class LoRAManager:
             experts_shared_outer_loras=self.experts_shared_outer_loras,
             strict_loading=self.lora_strict_loading,
             enable_lora_overlap_loading=self.enable_lora_overlap_loading,
+            lora_no_cpu_backup=self.lora_no_cpu_backup,
         )
 
         # Initializing memory pool with base model

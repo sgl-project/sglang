@@ -404,6 +404,7 @@ POSITIONAL_FIELD_ORDER = (
     "experts_shared_outer_loras",
     "lora_use_virtual_experts",
     "lora_strict_loading",
+    "lora_no_cpu_backup",
     "lora_drain_wait_threshold",
     "enable_two_batch_overlap",
     "enable_single_batch_overlap",
