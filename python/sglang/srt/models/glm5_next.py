@@ -51,6 +51,7 @@ from sglang.srt.layers.moe.utils import (
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
+from sglang.srt.layers.quantization.utils import is_layer_skipped
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.utils.common import PPMissingLayer
@@ -1360,6 +1361,8 @@ class Glm5NextForConditionalGeneration(nn.Module):
         text_config = getattr(hf_config, "text_config", hf_config)
         if not getattr(text_config, "n_shared_experts", None):
             return "No shared experts are defined in the config."
+        if getattr(text_config, "n_shared_experts", None) != 1:
+            return "Shared experts fusion requires exactly one shared expert."
         if quant_config is not None and quant_config.get_name() == "modelopt_fp4":
             first_sparse_layer = getattr(text_config, "first_k_dense_replace", 0)
             for layer_id in range(first_sparse_layer, text_config.num_hidden_layers):
@@ -1371,20 +1374,78 @@ class Glm5NextForConditionalGeneration(nn.Module):
                         "ModelOpt FP4 keeps shared experts unquantized while routed "
                         "experts are quantized."
                     )
-        if not _is_cuda:
-            return "Shared experts fusion currently requires CUDA devices."
-        if _device_sm is not None and _device_sm < 80:
-            return "Shared experts fusion requires SM80 or newer GPUs."
         if get_parallel().moe_ep_size > 1:
             return (
                 "Shared experts fusion is not supported together with expert "
                 "parallelism yet."
             )
-        if get_moe_a2a_backend().is_deepep():
-            return (
-                "Shared experts fusion is not supported when Deepep MoE backend "
-                "is enabled."
-            )
+
+        if _is_cuda:
+            if _device_sm is not None and _device_sm < 80:
+                return "Shared experts fusion requires SM80 or newer GPUs."
+            if get_moe_a2a_backend().is_deepep():
+                return (
+                    "Shared experts fusion is not supported when Deepep MoE backend "
+                    "is enabled."
+                )
+        else:
+            if not _use_aiter_gfx95:
+                return "HIP shared experts fusion requires AITER on a gfx950 device."
+            if not get_moe_a2a_backend().is_none():
+                return (
+                    "HIP shared experts fusion is not supported when an MoE A2A "
+                    "backend is enabled."
+                )
+            parallel = get_parallel()
+            if (
+                parallel.tp_size not in (4, 8)
+                or parallel.moe_tp_size != parallel.tp_size
+            ):
+                return "HIP shared experts fusion is validated only for TP4 and TP8."
+            if (
+                getattr(text_config, "model_type", None) != "glm5_next_text"
+                or getattr(text_config, "hidden_size", None) != 4096
+                or getattr(text_config, "moe_intermediate_size", None) != 2048
+                or getattr(text_config, "n_routed_experts", None) != 288
+                or getattr(text_config, "num_experts_per_tok", None) != 8
+            ):
+                return (
+                    "HIP shared experts fusion is validated only for the "
+                    "GLM-5.3-Flash E=288/topk=8 expert geometry."
+                )
+            if (
+                getattr(text_config, "hidden_act", None) != "silu"
+                or getattr(text_config, "swiglu_limit", None) != 10.0
+            ):
+                return (
+                    "HIP shared experts fusion requires the validated "
+                    "clamped SiLU G1U1 activation."
+                )
+            if (
+                quant_config is None
+                or quant_config.get_name() != "fp8"
+                or not getattr(quant_config, "is_checkpoint_fp8_serialized", False)
+                or getattr(quant_config, "weight_block_size", None) != [128, 128]
+                or getattr(quant_config, "activation_scheme", None) != "dynamic"
+            ):
+                return (
+                    "HIP shared experts fusion requires serialized dynamic "
+                    "128x128 block-FP8 experts."
+                )
+            ignored_layers = getattr(quant_config, "ignored_layers", [])
+            packed_mapping = getattr(quant_config, "packed_modules_mapping", {})
+            first_sparse_layer = getattr(text_config, "first_k_dense_replace", 0)
+            for layer_id in range(first_sparse_layer, text_config.num_hidden_layers):
+                moe_prefix = f"model.layers.{layer_id}.mlp"
+                if is_layer_skipped(
+                    f"{moe_prefix}.experts", ignored_layers, packed_mapping
+                ) or is_layer_skipped(
+                    f"{moe_prefix}.shared_experts", ignored_layers, packed_mapping
+                ):
+                    return (
+                        "HIP shared experts fusion requires routed and shared "
+                        "experts to use the same block-FP8 layout."
+                    )
         return None
 
     def determine_num_fused_shared_experts(self):
