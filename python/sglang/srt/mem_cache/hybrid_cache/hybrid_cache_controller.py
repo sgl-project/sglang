@@ -726,7 +726,7 @@ class HybridCacheController(BaseHiCacheController):
                 def draft_layer_mapper(
                     layer_id: int,
                     *,
-                    expected_layer_id: int = min(depth, self.layer_num - 1),
+                    expected_layer_id: int = min(depth, self.transfer_layer_id_max - 1),
                     host_layer_id: int = draft_host_layer,
                 ) -> Optional[int]:
                     if layer_id == expected_layer_id:

@@ -56,30 +56,41 @@ def _mamba_pool(layer_ids: list[int], with_temporal: bool) -> MambaPool:
     ("io_backend", "layout"),
     [("kernel", "page_first"), ("direct", "page_first_direct")],
 )
+@pytest.mark.parametrize(
+    ("local_drafts", "draft_full_indices"),
+    [([0, 1, 2], True), ([0, 2], True), ([], True), ([0, 1, 2], False)],
+)
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("target_layers", [2, 4])
 @pytest.mark.parametrize("with_temporal", [False, True])
-def test_hicache_restores_all_swa_mtp_kv_and_conv_state(
+def test_hicache_restores_all_mtp_kv_and_conv_state(
     monkeypatch: pytest.MonkeyPatch,
     layout: str,
     io_backend: str,
+    local_drafts: list[int],
+    draft_full_indices: bool,
     dtype: torch.dtype,
     target_layers: int,
     with_temporal: bool,
 ) -> None:
+    # Cover both ratio sizing and a fixed budget, including draft sidecars.
+    host_size_gb = 0.01 if target_layers == 4 else 0
     get_context().set_server_args(
         ServerArgs(
             model_path="test",
             hicache_ratio=1.0,
+            hicache_size=host_size_gb,
             hicache_mem_layout=layout,
             hicache_io_backend=io_backend,
         )
     )
 
-    def kv_pool(full: list[int], swa: list[int]) -> SWAKVPool:
-        return SWAKVPool(
+    def kv_pool(
+        full: list[int], swa: list[int], full_indices: bool = False
+    ) -> SWAKVPool:
+        pool = SWAKVPool(
             size=128,
-            size_swa=64,
+            size_swa=128 if full_indices else 64,
             page_size=16,
             dtype=dtype,
             head_num=2,
@@ -96,11 +107,20 @@ def test_hicache_restores_all_swa_mtp_kv_and_conv_state(
                 "enable_memory_saver": False,
             },
         )
+        pool.swa_uses_full_indices = full_indices
+        return pool
 
     full_layers = list(range(1, target_layers, 2))
     swa_layers = list(range(0, target_layers, 2))
     target_kv = kv_pool(full_layers, swa_layers)
-    drafts = tuple(kv_pool([], [i]) for i in range(3))
+    drafts = tuple(
+        kv_pool(
+            [] if i in local_drafts else [i],
+            [i] if i in local_drafts else [],
+            draft_full_indices,
+        )
+        for i in range(3)
+    )
     target_mamba = _mamba_pool(list(range(target_layers)), with_temporal)
     draft_mamba = tuple(_mamba_pool([i], with_temporal) for i in range(3))
     allocator = SimpleNamespace(alloc=lambda n: None, free=lambda ids: None)
@@ -123,12 +143,12 @@ def test_hicache_restores_all_swa_mtp_kv_and_conv_state(
         _token_allocator: object,
         host_group: HostPoolGroup,
         *_args: object,
-        transfer_layer_num: int,
+        transfer_layer_id_max: int,
         **_kwargs: object,
     ) -> HybridCacheController:
         controller = object.__new__(HybridCacheController)
         monkeypatch.setattr(controller, "mem_pool_host", host_group, raising=False)
-        controller.layer_num = transfer_layer_num
+        controller.transfer_layer_id_max = transfer_layer_id_max
         controller.io_backend = io_backend
         controller.device = "cuda"
         return controller
@@ -148,6 +168,25 @@ def test_hicache_restores_all_swa_mtp_kv_and_conv_state(
         storage_backend=None,
     )
     try:
+        if host_size_gb:
+            host_bytes = sum(
+                entry.host_pool.size * entry.host_pool.size_per_token
+                for entry in group.entries
+            )
+            # Each pool rounds up by a page. A derived sidecar also inherits
+            # the anchor's rounding before rounding its own capacity.
+            page_padding = sum(
+                entry.host_pool.page_size
+                * entry.host_pool.size_per_token
+                * (2 if entry.name == PoolName.DRAFT_SWA else 1)
+                for entry in group.entries
+            )
+            assert host_bytes <= host_size_gb * 1e9 + page_padding
+        if PoolName.DRAFT_SWA in group.entry_map:
+            assert (
+                group.get_entry(PoolName.DRAFT_SWA).host_pool.size
+                >= group.anchor_entry.host_pool.size
+            )
         full_src, full_dst = (
             torch.arange(16, 32, device="cuda"),
             torch.arange(64, 80, device="cuda"),
@@ -165,9 +204,16 @@ def test_hicache_restores_all_swa_mtp_kv_and_conv_state(
         # convolution buffers and any temporal state.
         buffers = []
         for pool in (target_kv, *drafts):
+            # Inkling drafts use identity mapping, while the target's SWA
+            # allocation has different source AND destination token IDs.
+            draft_swa_src, draft_swa_dst = (
+                (full_src, full_dst)
+                if pool.swa_uses_full_indices
+                else (swa_src, swa_dst)
+            )
             for subpool, src, dst in (
                 (pool.full_kv_pool, full_src, full_dst),
-                (pool.swa_kv_pool, swa_src, swa_dst),
+                (pool.swa_kv_pool, draft_swa_src, draft_swa_dst),
             ):
                 assert isinstance(subpool, MHATokenToKVPool)
                 assert subpool.k_buffer is not None and subpool.v_buffer is not None
@@ -197,9 +243,11 @@ def test_hicache_restores_all_swa_mtp_kv_and_conv_state(
         )
 
         def transfers(
-            swa_indices: torch.Tensor, state_indices: torch.Tensor
+            full_indices: torch.Tensor,
+            swa_indices: torch.Tensor,
+            state_indices: torch.Tensor,
         ) -> list[PoolTransfer]:
-            return [
+            result = [
                 PoolTransfer(
                     PoolName.SWA, host_indices=swa_host, device_indices=swa_indices
                 ),
@@ -209,10 +257,27 @@ def test_hicache_restores_all_swa_mtp_kv_and_conv_state(
                     device_indices=state_indices,
                 ),
             ]
+            specs = assembler._mtp_swa_sidecar_specs(group)
+            assert bool(specs) == (draft_full_indices and bool(local_drafts))
+            for spec in specs:
+                assert spec.indices_from_pool == PoolName.KV
+                result.append(
+                    PoolTransfer(
+                        spec.pool_name, indices_from_pool=spec.indices_from_pool
+                    )
+                )
+            return group.resolve_host_transfers(
+                result,
+                primary_device_indices=full_indices,
+                primary_host_indices=full_host,
+            )
 
         engine = L2TransferEngine(io_backend)
         backup = CacheOperation(
-            full_host, full_src, 1, pool_transfers=transfers(swa_src, state_src)
+            full_host,
+            full_src,
+            1,
+            pool_transfers=transfers(full_src, swa_src, state_src),
         )
         engine.submit_device_to_host(
             controller._l2_transfers(*controller._move_write_operation(backup))
@@ -220,12 +285,17 @@ def test_hicache_restores_all_swa_mtp_kv_and_conv_state(
         for buf, _, _ in buffers:
             buf.zero_()
         restore = CacheOperation(
-            full_host, full_dst, 1, pool_transfers=transfers(swa_dst, state_dst)
+            full_host,
+            full_dst,
+            1,
+            pool_transfers=transfers(full_dst, swa_dst, state_dst),
         )
-        layer_done = [torch.cuda.Event() for _ in range(controller.layer_num)]
+        layer_done = [
+            torch.cuda.Event() for _ in range(controller.transfer_layer_id_max)
+        ]
         engine.submit_host_to_device(
             controller._l2_load_transfers(*controller._move_op_indices(restore)),
-            layer_num=controller.layer_num,
+            transfer_layer_id_max=controller.transfer_layer_id_max,
             on_layer_done=lambda layer: layer_done[layer].record(),
         )
         # Prefix reuse copies all target and draft convolution state on the

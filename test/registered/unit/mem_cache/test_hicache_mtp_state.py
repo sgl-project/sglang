@@ -9,9 +9,11 @@ import torch
 from sglang.srt.configs import model_config as model_config_module
 from sglang.srt.configs.inkling import InklingMMConfig
 from sglang.srt.configs.model_config import ModelConfig
-from sglang.srt.mem_cache.hybrid_cache import hybrid_pool_assembler as assembler
 from sglang.srt.mem_cache.pool_host import mamba as mamba_module
 from sglang.srt.mem_cache.pool_host.mamba import MambaPoolHost
+from sglang.srt.model_executor.model_runner_components.layer_setup import (
+    resolve_layer_indices,
+)
 from sglang.srt.speculative import base_spec_worker as spec
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -42,12 +44,13 @@ def _worker(monkeypatch, draft_config, target_pool, draft_pools):
     return worker, target, runners
 
 
-def test_inkling_checkpoint_packs_every_draft_pool(monkeypatch, tmp_path):
+@pytest.mark.parametrize("local_drafts", [[0, 1, 2], [0, 2], []])
+def test_inkling_checkpoint_packs_every_draft_pool(monkeypatch, tmp_path, local_drafts):
     # Checkpoints store the MTP depth outside the text config read by ModelConfig.
     config = InklingMMConfig(
         architectures=["InklingForConditionalGeneration"],
         num_nextn_predict_layers=3,
-        mtp_config={"n_layers": 3, "local_layer_ids": [0, 1, 2]},
+        mtp_config={"n_layers": 3, "local_layer_ids": local_drafts},
         text_config={
             "hidden_size": 128,
             "num_hidden_layers": 4,
@@ -66,7 +69,26 @@ def test_inkling_checkpoint_packs_every_draft_pool(monkeypatch, tmp_path):
         str(tmp_path), is_draft_model=True, is_multi_layer_eagle=True, dtype="bfloat16"
     )
     assert draft_config.num_nextn_predict_layers == 3
-    assert draft_config.swa_attention_layer_ids == [0, 1, 2]
+    # Each runner owns its draft depth while the checkpoint config is shared.
+    for depth in range(3):
+        layer_info = resolve_layer_indices(
+            model=SimpleNamespace(mtp_layer_id_is_depth=True),
+            model_config=draft_config,
+            is_draft_worker=True,
+            draft_model_idx=depth,
+        )
+        assert layer_info.num_effective_layers == 1
+        assert layer_info.is_hybrid_swa_mtp_draft
+        assert layer_info.swa_attention_layer_ids == (
+            [depth] if depth in local_drafts else []
+        )
+        assert layer_info.full_attention_layer_ids == (
+            [] if depth in local_drafts else [depth]
+        )
+    assert draft_config.swa_attention_layer_ids == local_drafts
+    assert draft_config.full_attention_layer_ids == [
+        i for i in range(3) if i not in local_drafts
+    ]
     assert draft_config.hf_config.architectures == [
         "InklingForConditionalGenerationMTP"
     ]
@@ -105,42 +127,6 @@ def test_separate_state_requires_compatible_slot_ownership(monkeypatch, missing_
     )
     with pytest.raises(AssertionError, match="target Mamba slot|separate state"):
         spec.BaseSpecWorker._build_hicache_draft_plan(worker)
-
-
-@pytest.mark.parametrize(
-    ("build_stack", "extra_kwargs"),
-    [
-        (assembler.build_hybrid_swa_stack, {"use_mla": False}),
-        (
-            assembler.build_hybrid_mamba_swa_stack,
-            {
-                "mamba_pool": object(),
-                "mamba_layer_mapping": {},
-                "page_size": 16,
-                "tp_group": None,
-            },
-        ),
-    ],
-)
-def test_swa_hicache_rejects_non_swa_drafts(build_stack, extra_kwargs):
-    drafts = tuple(
-        SimpleNamespace(
-            full_kv_pool=SimpleNamespace(layer_num=int(i == 1)),
-            swa_kv_pool=SimpleNamespace(layer_num=int(i != 1)),
-        )
-        for i in range(3)
-    )
-    with pytest.raises(AssertionError, match="requires SWA-only draft attention"):
-        build_stack(
-            params=SimpleNamespace(mtp_draft_device_pools=drafts),
-            full_kv_pool=object(),
-            swa_kv_pool=object(),
-            full_layer_mapping={0: 0},
-            swa_layer_mapping={1: 0},
-            load_cache_event=None,
-            storage_backend=None,
-            **extra_kwargs,
-        )
 
 
 def test_ascend_packed_state_roundtrip_uses_per_layer_destinations(monkeypatch):
