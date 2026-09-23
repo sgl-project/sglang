@@ -564,6 +564,17 @@ class TestPDConfigCompatibility(unittest.IsolatedAsyncioTestCase):
                     manager._resolve_rank_mapping.assert_not_called()
                     self.assertEqual(manager.prefill_info_table, {})
 
+    async def test_mixed_rank_flags_remain_unknown(self):
+        for flags in ((False, True, True), (None, True, True), (True, False, False)):
+            with self.subTest(flags=flags):
+                self.server = self._new_server()
+                for flag in flags:
+                    await self._register(self._registration(flag))
+                info = await self._prefill_info()
+                self.assertIsNone(info[FLAG])
+                with self.assertRaisesRegex(RuntimeError, "unknown setting"):
+                    self._ensure_info(self._decode_manager(), info, True)
+
     async def test_non_pd_skips_flag_check(self):
         await self._register(self._registration(True))
         info = await self._prefill_info()
