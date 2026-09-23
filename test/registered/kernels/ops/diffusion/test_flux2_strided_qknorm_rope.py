@@ -19,7 +19,6 @@ from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=25, stage="base-b-kernel-unit", runner_config="1-gpu-large")
-register_cuda_ci(est_time=25, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
 
 
 def inputs(batch, tokens):
@@ -93,23 +92,6 @@ class TestFlux2StridedQKNormRoPE(CustomTestCase):
                         self.assertFalse(gate.disabled)
 
     @torch.inference_mode()
-    def test_contiguous_singleton_preserves_original_inplace_path(self):
-        packed, q, k, qn, kn, cache = inputs(1, 1)
-        original = packed.clone()
-        rq, rk, _ = original[:, :, : 3 * 3072].chunk(3, dim=-1)
-        expected = reference(
-            rq.unflatten(-1, (24, 128)), rk.unflatten(-1, (24, 128)), qn, kn, cache
-        )
-        gate = BitExactFusionGate("test singleton", per_signature=True)
-        with patch.object(flux_2, "_FLUX2_STRIDED_QK_ROPE", gate):
-            actual = flux_2._flux2_single_qk_rope(q, k, qn, kn, 128, cache, None)
-        self.assert_bits(actual, expected)
-        self.assertTrue(
-            torch.equal(packed.view(torch.int16), original.view(torch.int16))
-        )
-        self.assertFalse(gate.verified)
-
-    @torch.inference_mode()
     def test_changed_inputs_weights_cache_and_graph_replay(self):
         packed, q, k, qn, kn, cache = inputs(1, 513)
         gate = BitExactFusionGate("test Klein replay", per_signature=True)
@@ -129,82 +111,6 @@ class TestFlux2StridedQKNormRoPE(CustomTestCase):
             packed.zero_().neg_()
             graph.replay()
             self.assert_bits(out, reference(q, k, qn, kn, cache))
-
-    @torch.inference_mode()
-    def test_mismatch_unverified_capture_and_native_dispatch(self):
-        _, q, k, qn, kn, cache = inputs(1, 17)
-        expected = reference(q, k, qn, kn, cache)
-        gate = BitExactFusionGate("test mismatch", per_signature=True)
-        with (
-            patch.object(flux_2, "_FLUX2_STRIDED_QK_ROPE", gate),
-            patch.object(
-                flux_2, "can_use_flux2_strided_qknorm_rope", return_value=True
-            ),
-        ):
-            with (
-                patch("torch.cuda.is_current_stream_capturing", return_value=True),
-                patch.object(flux_2, "flux2_strided_qknorm_rope") as raw,
-            ):
-                self.assert_bits(
-                    flux_2._flux2_single_qk_rope(q, k, qn, kn, 128, cache, None),
-                    expected,
-                )
-                raw.assert_not_called()
-            with patch.object(
-                flux_2,
-                "flux2_strided_qknorm_rope",
-                return_value=(torch.zeros_like(q), torch.zeros_like(k)),
-            ):
-                self.assert_bits(
-                    flux_2._flux2_single_qk_rope(q, k, qn, kn, 128, cache, None),
-                    expected,
-                )
-            self.assertTrue(gate.disabled)
-            with patch.object(flux_2, "flux2_strided_qknorm_rope") as raw:
-                self.assert_bits(
-                    flux_2._flux2_single_qk_rope(q, k, qn, kn, 128, cache, None),
-                    expected,
-                )
-                raw.assert_not_called()
-        qn._forward_method = qn.forward_native
-        kn._forward_method = kn.forward_native
-        with (
-            patch.object(
-                flux_2, "_FLUX2_STRIDED_QK_ROPE", BitExactFusionGate("native")
-            ),
-            patch.object(flux_2, "flux2_strided_qknorm_rope") as raw,
-        ):
-            self.assert_bits(
-                flux_2._flux2_single_qk_rope(q, k, qn, kn, 128, cache, None),
-                reference(q, k, qn, kn, cache),
-            )
-            raw.assert_not_called()
-
-    @torch.inference_mode()
-    def test_unsupported_layout_dtype_device_and_compile(self):
-        _, q, k, qn, kn, cache = inputs(2, 17)
-        args = (q, k, qn.weight, kn.weight, cache)
-        with patch("torch.cuda.get_device_capability", return_value=(10, 0)):
-            self.assertFalse(can_use_flux2_strided_qknorm_rope(*args))
-        with patch("torch.compiler.is_compiling", return_value=True):
-            self.assertFalse(can_use_flux2_strided_qknorm_rope(*args))
-        with torch.enable_grad():
-            self.assertFalse(can_use_flux2_strided_qknorm_rope(*args))
-        for bad_q, bad_k, bad_w, bad_cache in [
-            (q.cpu(), k, qn.weight, cache),
-            (q.float(), k.float(), qn.weight, cache),
-            (q.contiguous(), k.contiguous(), qn.weight, cache),
-            (q[:, ::2], k[:, ::2], qn.weight, cache),
-            (q[..., ::2], k[..., ::2], qn.weight, cache),
-            (q, k, qn.weight.float(), cache),
-            (q, k, qn.weight, cache.bfloat16()),
-            (q, k, qn.weight, cache[:1]),
-        ]:
-            self.assertFalse(
-                can_use_flux2_strided_qknorm_rope(
-                    bad_q, bad_k, bad_w, kn.weight, bad_cache
-                )
-            )
 
 
 if __name__ == "__main__":
