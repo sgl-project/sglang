@@ -1,7 +1,6 @@
 {
-  "schema_version": 2,
-  "contract": "infercast.sglang_simulator.provider",
-  "reduction_policy": "exact_tokens_ragged_v2",
+  "schema_version": 1,
+  "contract": "infercast-forward-latency",
   "supported_forward_modes": ["EXTEND", "MIXED"],
   "cases": [
     {

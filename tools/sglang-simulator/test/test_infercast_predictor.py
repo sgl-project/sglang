@@ -18,26 +18,12 @@ from sglang_simulator.time_predictor import (
     ScheduleRequest,
 )
 from sglang_simulator.time_predictor.infercast import (
-    PREFIX_REDUCTION_POLICY,
-    RAGGED_REDUCTION_POLICY,
-    REALIZATION_REDUCTION_POLICY,
-    PROFILED_DECODE_REDUCTION_POLICY,
+    PROVIDER_CONTRACT,
     InferCastTimePredictor,
+    _validate_batch,
     milliseconds_to_seconds,
-    reduce_batch,
-    validate_provider_contract,
     validate_topology,
 )
-
-_GRAPH_PROFILE = {
-    "schema_version": 1,
-    "prefill_graph_backend": "tc_piecewise",
-    "decode_graph_backend": "disabled",
-    "graph_capture_policy": "catalog_exact_shapes_v1",
-    "kv_page_size": 1,
-    "runtime_compatibility_id": "compat-v3",
-    "profile_id": "b" * 64,
-}
 
 _REALIZATION_PROFILE = {
     "schema_version": 2,
@@ -113,118 +99,6 @@ def _batch(mode, *requests):
 
 
 @pytest.mark.parametrize(
-    "batch,method,expected,raw_scale",
-    [
-        (
-            _batch("DECODE", (1, 127)),
-            "estimate_decode_forward_ms",
-            {"batch_size": 1, "history_len": 127},
-            None,
-        ),
-        (
-            _batch("DECODE", (1, 100), (1, 201)),
-            "estimate_decode_forward_ms",
-            {"batch_size": 2, "history_len": 150},
-            None,
-        ),
-        (
-            _batch("EXTEND", (1024, 0), (1024, 0)),
-            "estimate_extend_forward_ms",
-            {
-                "batch_size": 2,
-                "extend_len": 1024,
-                "prefix_len": 0,
-                "seq_imbalance_correction_scale": 1.0,
-            },
-            1.0,
-        ),
-        (
-            _batch("EXTEND", (1, 0)),
-            "estimate_extend_forward_ms",
-            {
-                "batch_size": 1,
-                "extend_len": 1,
-                "prefix_len": 0,
-                "seq_imbalance_correction_scale": 1.0,
-            },
-            1.0,
-        ),
-        (
-            _batch("EXTEND", (256, 768)),
-            "estimate_extend_forward_ms",
-            {
-                "batch_size": 1,
-                "extend_len": 256,
-                "prefix_len": 768,
-                "seq_imbalance_correction_scale": 1.0,
-            },
-            1.0,
-        ),
-        (
-            _batch("EXTEND", (512, 0)),
-            "estimate_extend_forward_ms",
-            {
-                "batch_size": 1,
-                "extend_len": 512,
-                "prefix_len": 0,
-                "seq_imbalance_correction_scale": 1.0,
-            },
-            1.0,
-        ),
-        (
-            _batch("EXTEND", (512, 512)),
-            "estimate_extend_forward_ms",
-            {
-                "batch_size": 1,
-                "extend_len": 512,
-                "prefix_len": 512,
-                "seq_imbalance_correction_scale": 1.0,
-            },
-            1.0,
-        ),
-        (
-            _batch("EXTEND", (4, 10), (2, 20)),
-            "estimate_extend_forward_ms",
-            {
-                "batch_size": 2,
-                "extend_len": 3,
-                "prefix_len": 15,
-                "seq_imbalance_correction_scale": 10 / 11,
-            },
-            10 / 11,
-        ),
-        (
-            _batch("MIXED", (1, 100), (8, 0)),
-            "estimate_extend_forward_ms",
-            {
-                "batch_size": 2,
-                "extend_len": 4,
-                "prefix_len": 50,
-                "seq_imbalance_correction_scale": 1.0,
-            },
-            530 / 1881,
-        ),
-        (
-            _batch("EXTEND", (2, 0), (3, 1)),
-            "estimate_extend_forward_ms",
-            {
-                "batch_size": 2,
-                "extend_len": 3,
-                "prefix_len": 0,
-                "seq_imbalance_correction_scale": 38 / 35,
-            },
-            38 / 35,
-        ),
-    ],
-)
-def test_mean_attention_flops_v1(batch, method, expected, raw_scale):
-    reduced = reduce_batch(batch)
-    assert reduced.method == method
-    assert reduced.arguments == pytest.approx(expected)
-    assert reduced.raw_attention_scale == pytest.approx(raw_scale)
-
-
-@pytest.mark.parametrize(
     "batch,code",
     [
         (_batch("DECODE"), "invalid_batch"),
@@ -239,7 +113,7 @@ def test_mean_attention_flops_v1(batch, method, expected, raw_scale):
 )
 def test_reduction_rejects_invalid_batches(batch, code):
     with pytest.raises(PredictorError) as exc_info:
-        reduce_batch(batch)
+        _validate_batch(batch)
     assert exc_info.value.code == code
 
 
@@ -249,7 +123,7 @@ def test_reduction_rejects_invalid_batches(batch, code):
 )
 def test_known_unsupported_modes_fail_explicitly(mode):
     with pytest.raises(PredictorError) as exc_info:
-        reduce_batch(_batch(mode, (1, 10)))
+        _validate_batch(_batch(mode, (1, 10)))
     assert exc_info.value.code == "unsupported_forward_mode"
 
 
@@ -306,11 +180,10 @@ def _predictor(
     config=None,
     model_revision="c" * 40,
     revision="a" * 40,
-    contract_version=1,
-    reduction_policy=None,
     execution_profile=None,
     decode_execution_profile=None,
     decode_attn_kernel_impl=None,
+    **extra,
 ):
     return InferCastTimePredictor(
         model or ModelInfo(),
@@ -330,20 +203,12 @@ def _predictor(
         kv_cache_dtype="fp8",
         model_revision=model_revision,
         provider_revision=revision,
-        contract_version=contract_version,
-        reduction_policy=reduction_policy,
         execution_profile=(
-            (
-                _REALIZATION_PROFILE
-                if contract_version in {4, 5}
-                else _GRAPH_PROFILE
-            )
-            if contract_version in {3, 4, 5} and execution_profile is None
-            else execution_profile
+            _REALIZATION_PROFILE if execution_profile is None else execution_profile
         ),
         decode_execution_profile=(
             _DECODE_PROFILE
-            if contract_version == 5 and decode_execution_profile is None
+            if decode_execution_profile is None
             else decode_execution_profile
         ),
         _provider=provider,
@@ -352,149 +217,22 @@ def _predictor(
         _decode_execution_profile_factory=_DecodeExecutionProfile,
         _provider_version="0.1.0",
         _stack_digest="b" * 64,
+        **extra,
     )
 
 
-def test_adapter_calls_one_forward_and_converts_units():
-    provider = _Provider()
-    latency = _predictor(provider).predict_infer_time(_batch("DECODE", (1, 127)))
-    assert latency == pytest.approx(0.0125)
-    assert len(provider.calls) == 1
-    method, arguments = provider.calls[0]
-    assert method == "estimate_decode_forward_ms"
-    assert arguments["history_len"] == 127
-    assert arguments["tp_size"] == 1
+def test_predictor_rejects_unknown_configuration_fields():
+    with pytest.raises(PredictorError) as exc_info:
+        _predictor(_Provider(), contract_version="obsolete")
+
+    assert exc_info.value.code == "provider_initialization_failed"
+    assert exc_info.value.details["unsupported_fields"] == ["contract_version"]
 
 
-def test_v4_selects_decode_kernel_impl_from_phase_profile():
-    provider = _Provider()
-    predictor = _predictor(provider, contract_version=4)
-
-    predictor.predict_infer_time(_batch("DECODE", (1, 127)))
-
-    assert provider.calls[0][1]["attn_kernel_impl"] == "eager"
-    runtime = predictor.get_metrics()["infercast"]["runtime"]
-    assert runtime["attn_kernel_impl"] == "cuda_graph"
-    assert runtime["decode_attn_kernel_impl"] == "eager"
-
-
-def test_v4_rejects_decode_kernel_impl_that_conflicts_with_profile():
-    provider = _Provider()
-
-    with pytest.raises(PredictorError, match="decode_attn_kernel_impl"):
-        _predictor(
-            provider,
-            contract_version=4,
-            decode_attn_kernel_impl="cuda_graph",
-        )
-
-
-@pytest.mark.parametrize("mode", ["EXTEND", "MIXED"])
-def test_v2_passes_one_ordered_request_level_call(mode):
+def test_decode_passes_ordered_histories_and_profile_once():
     provider = _Provider()
     predictor = _predictor(
         provider,
-        contract_version=2,
-        reduction_policy=RAGGED_REDUCTION_POLICY,
-    )
-
-    latency = predictor.predict_infer_time(
-        _batch(mode, (1, 1024), (127, 0))
-    )
-
-    assert latency == pytest.approx(0.0125)
-    assert provider.calls == [
-        (
-            "estimate_ragged_extend_forward_ms",
-            {
-                "forward_mode": mode,
-                "requests": (
-                    {"extend_len": 1, "prefix_len": 1024},
-                    {"extend_len": 127, "prefix_len": 0},
-                ),
-                "reduction_policy": RAGGED_REDUCTION_POLICY,
-                "tp_size": 1,
-                "pp_size": 1,
-                "moe_tp_size": 1,
-                "moe_ep_size": 1,
-                "attention_dp_size": 1,
-                "attn_kernel_impl": "cuda_graph",
-                "attn_dtype": "bfloat16",
-                "kv_cache_dtype": "fp8",
-            },
-        )
-    ]
-    metrics = predictor.get_metrics()["infercast"]
-    assert metrics["contract_version"] == 2
-    assert metrics["reduction_policy"] == RAGGED_REDUCTION_POLICY
-
-
-def test_v2_one_token_extend_is_not_decode():
-    provider = _Provider()
-    predictor = _predictor(provider, contract_version=2)
-
-    predictor.predict_infer_time(_batch("EXTEND", (1, 63), (1, 65)))
-
-    assert provider.calls[0][0] == "estimate_ragged_extend_forward_ms"
-    assert provider.calls[0][1]["forward_mode"] == "EXTEND"
-
-
-def test_v3_passes_profile_separately_from_the_ordered_workload():
-    provider = _Provider()
-    predictor = _predictor(
-        provider,
-        contract_version=3,
-        reduction_policy=PREFIX_REDUCTION_POLICY,
-    )
-
-    predictor.predict_infer_time(_batch("MIXED", (1, 1024), (127, 0)))
-
-    method, arguments = provider.calls[0]
-    assert method == "estimate_ragged_extend_forward_ms"
-    assert arguments["reduction_policy"] == PREFIX_REDUCTION_POLICY
-    assert arguments["execution_profile"].to_dict() == _GRAPH_PROFILE
-    assert arguments["requests"] == (
-        {"extend_len": 1, "prefix_len": 1024},
-        {"extend_len": 127, "prefix_len": 0},
-    )
-    metrics = predictor.get_metrics()["infercast"]
-    assert metrics["contract_version"] == 3
-    assert metrics["execution_profile"] == _GRAPH_PROFILE
-
-
-def test_v4_passes_realization_profile_and_exact_request_vector_once():
-    provider = _Provider()
-    predictor = _predictor(
-        provider,
-        contract_version=4,
-        reduction_policy=REALIZATION_REDUCTION_POLICY,
-    )
-
-    latency = predictor.predict_infer_time(
-        _batch("MIXED", (1, 8194), (127, 66))
-    )
-
-    assert latency == pytest.approx(0.0125)
-    assert len(provider.calls) == 1
-    method, arguments = provider.calls[0]
-    assert method == "estimate_ragged_extend_forward_ms"
-    assert arguments["reduction_policy"] == REALIZATION_REDUCTION_POLICY
-    assert arguments["execution_profile"].to_dict() == _REALIZATION_PROFILE
-    assert arguments["requests"] == (
-        {"extend_len": 1, "prefix_len": 8194},
-        {"extend_len": 127, "prefix_len": 66},
-    )
-    metrics = predictor.get_metrics()["infercast"]
-    assert metrics["contract_version"] == 4
-    assert metrics["execution_profile"] == _REALIZATION_PROFILE
-
-
-def test_v5_passes_ordered_decode_histories_and_phase_specific_profile_once():
-    provider = _Provider()
-    predictor = _predictor(
-        provider,
-        contract_version=5,
-        reduction_policy=PROFILED_DECODE_REDUCTION_POLICY,
     )
 
     latency = predictor.predict_infer_time(
@@ -509,36 +247,40 @@ def test_v5_passes_ordered_decode_histories_and_phase_specific_profile_once():
     assert arguments["execution_profile"].to_dict() == _DECODE_PROFILE
     assert "attn_kernel_impl" not in arguments
     metrics = predictor.get_metrics()["infercast"]
-    assert metrics["contract_version"] == 5
-    assert metrics["reduction_policy"] == PROFILED_DECODE_REDUCTION_POLICY
+    assert metrics["contract"] == PROVIDER_CONTRACT
     assert metrics["decode_execution_profile"] == _DECODE_PROFILE
     assert metrics["runtime"]["attn_kernel_impl"] == "cuda_graph"
     assert metrics["runtime"]["decode_attn_kernel_impl"] == "cuda_graph"
 
 
-def test_v5_context_keeps_v4_context_contract():
+@pytest.mark.parametrize("mode", ["EXTEND", "MIXED"])
+def test_context_passes_ordered_requests_and_profile_once(mode):
     provider = _Provider()
-    predictor = _predictor(provider, contract_version=5)
+    predictor = _predictor(provider)
 
-    predictor.predict_infer_time(_batch("MIXED", (1, 8194), (127, 66)))
+    predictor.predict_infer_time(_batch(mode, (1, 8194), (127, 66)))
 
     method, arguments = provider.calls[0]
     assert method == "estimate_ragged_extend_forward_ms"
-    assert arguments["reduction_policy"] == REALIZATION_REDUCTION_POLICY
+    assert "reduction_policy" not in arguments
     assert arguments["execution_profile"].to_dict() == _REALIZATION_PROFILE
+    assert arguments["requests"] == (
+        {"extend_len": 1, "prefix_len": 8194},
+        {"extend_len": 127, "prefix_len": 66},
+    )
 
 
-def test_v2_portable_vectors_preserve_mode_order_and_lengths():
+def test_portable_vectors_preserve_mode_order_and_lengths():
     fixture = json.loads(
-        (Path(__file__).parent / "fixtures" / "infercast_provider_v2.json").read_text(
+        (Path(__file__).parent / "fixtures" / "infercast_provider.json").read_text(
             encoding="utf-8"
         )
     )
-    assert fixture["schema_version"] == 2
-    assert fixture["reduction_policy"] == RAGGED_REDUCTION_POLICY
+    assert fixture["schema_version"] == 1
+    assert fixture["contract"] == PROVIDER_CONTRACT
     for case in fixture["cases"]:
         provider = _Provider()
-        predictor = _predictor(provider, contract_version=2)
+        predictor = _predictor(provider)
         requests = tuple(
             (request["extend_length"], request["past_kv_length"])
             for request in case["requests"]
@@ -559,21 +301,6 @@ def test_v2_portable_vectors_preserve_mode_order_and_lengths():
         ), case["id"]
 
 
-@pytest.mark.parametrize(
-    "version,policy",
-    [
-        (1, RAGGED_REDUCTION_POLICY),
-        (2, "mean_attention_flops_v1"),
-        (3, RAGGED_REDUCTION_POLICY),
-        (6, None),
-    ],
-)
-def test_contract_and_reduction_policy_must_match(version, policy):
-    with pytest.raises(PredictorError) as exc_info:
-        validate_provider_contract(version, policy)
-    assert exc_info.value.code == "unsupported_reduction_policy"
-
-
 def test_prefix_forward_reaches_provider_and_fails_without_time_accounting():
     StateManager.reset()
     provider = _Provider(error=NotImplementedError("prefix_len must be 0"))
@@ -583,7 +310,7 @@ def test_prefix_forward_reaches_provider_and_fails_without_time_accounting():
             _batch("EXTEND", (256, 768)),
         )
     assert exc_info.value.code == "prediction_failed"
-    assert provider.calls[0][1]["prefix_len"] == 768
+    assert provider.calls[0][1]["requests"] == ({"extend_len": 256, "prefix_len": 768},)
     assert StateManager.get_iteration() == 0
     assert StateManager.get_global_clock() == 0
 
@@ -609,16 +336,13 @@ def test_provider_errors_keep_stable_categories():
         "outside_calibrated_domain",
     ],
 )
-def test_v3_profile_errors_keep_stable_categories(infercast_code):
+def test_profile_errors_keep_stable_categories(infercast_code):
     error_type = type(
         "ProfileError",
         (RuntimeError,),
         {"code": infercast_code, "details": {"profile": "test"}},
     )
-    predictor = _predictor(
-        _Provider(error=error_type("profile failure")),
-        contract_version=3,
-    )
+    predictor = _predictor(_Provider(error=error_type("profile failure")))
 
     with pytest.raises(PredictorError) as exc_info:
         predictor.predict_infer_time(_batch("EXTEND", (64, 128)))
@@ -690,6 +414,9 @@ def test_production_binding_and_portable_provenance(tmp_path, monkeypatch):
         return provider
 
     sdk.build_umd_static_model = build_umd_static_model
+    sdk.ExtendRequestShape = lambda **values: values
+    sdk.ExtendExecutionProfile = _ExecutionProfile
+    sdk.DecodeExecutionProfile = _DecodeExecutionProfile
     package = ModuleType("infercast")
     package.__path__ = []
     package.__version__ = "0.1.0"
@@ -719,6 +446,8 @@ def test_production_binding_and_portable_provenance(tmp_path, monkeypatch):
             kv_cache_dtype="fp8",
             model_revision="c" * 40,
             provider_revision="a" * 40,
+            execution_profile=_REALIZATION_PROFILE,
+            decode_execution_profile=_DECODE_PROFILE,
         )
 
     predictor = make_predictor()

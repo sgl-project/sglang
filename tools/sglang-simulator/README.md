@@ -236,55 +236,30 @@ InferCast package cannot prove the configured source revision.
 Model/GEMM quantization comes from the pinned `model_id`; attention and KV-cache
 dtypes remain explicit predictor inputs.
 
-Prefix-hit, later chunk, and mixed shapes retain their prepared `(E, P)` values.
-Provider contract v1 keeps the frozen mean-shape reduction. Contract v2 passes
-the ordered request vector to InferCast with `exact_tokens_ragged_v2`; bounded
-DeepSeek-R1 signatures use exact MI350X eager or CUDA-graph rows and fail closed
-when the signature, execution mode, or runtime identity is unavailable.
+Prefix-hit, later chunk, and mixed shapes retain their prepared `(E, P)` values. The provider has
+one contract: context forwards pass the ordered request vector and exact `execution_profile`;
+decode forwards pass the ordered visible-history vector and exact `decode_execution_profile`.
+There is no contract-version or reduction-policy selector.
 
-Contract v3 uses `exact_request_vector_v3` and requires an `execution_profile`
-object in predictor configuration. The profile is passed separately from the
-ordered workload and binds the prefill/decode graph backends, capture policy,
-KV page size, and runtime-compatibility ID. InferCast owns profile validation,
-the homogeneous/ragged residual composition, short CUDA-graph regime, and
-calibration domain. The simulator continues to own cache hits, chunking, and
-scheduling and does not duplicate those formulas. V1/v2 remain unchanged.
+InferCast owns profile validation, exact homogeneous/ragged composition, calibration selection,
+and closed-domain checks. The simulator owns cache hits, chunking, and scheduling and makes exactly
+one provider call per prepared forward. Missing rows or anchors, uncaptured graph batches,
+out-of-domain workloads, and eager/CUDA-graph substitution fail closed. Simulated time advances
+only after a provider call succeeds.
 
-Contract v4 uses `realization_aware_request_vector_v4`. Its schema-v2 execution
-profile additionally binds the prefill compiler, complete graph-capture token
-set, whole-forward realization, component realization, and canonical runtime
-manifest digest. InferCast selects only an exact token/capture-stratum anchor;
-it never substitutes a neighboring shape or the other execution mode. The
-simulator still makes exactly one provider call and advances simulated time only
-after that call succeeds. V1-v3 remain byte-compatible.
+Attention execution mode is phase-specific. `attn_kernel_impl` selects context forwards;
+`decode_execution_profile` selects decode realization. If `decode_attn_kernel_impl` is supplied it
+must match the decode profile.
 
-Contract v5 keeps the v4 context-forward behavior and adds a separate
-`decode_execution_profile`. `DECODE` passes the complete ordered vector of
-visible history lengths to `estimate_profiled_decode_forward_ms`; InferCast
-selects an exact whole-forward anchor by topology, decode realization, and batch
-stratum, then applies its bounded MLA history contrast. Missing anchors,
-uncaptured graph batches, out-of-domain histories, and eager/CUDA-graph component
-substitution fail closed. The legacy scalar decode estimator remains the v1-v4
-compatibility path.
-
-Attention execution mode is phase-specific. `attn_kernel_impl` selects context
-forwards. For contracts v1/v2, optional `decode_attn_kernel_impl` selects decode
-and defaults to the context value for compatibility. Contracts v3/v4 derive the
-decode value from `execution_profile.decode_graph_backend`; an explicit value
-must match that profile. A prefill `tc_piecewise` profile with decode graphs
-disabled therefore sends `eager`, not `cuda_graph`, to the decode estimator.
-Contract v5 instead derives the mode from `decode_execution_profile`; the
-context profile no longer controls decode execution.
-
-For a CPU-only DeepSeek-R1 smoke against the MI350X TP4/EP2 silicon slice,
+For a CPU-only DeepSeek-R1 smoke against the MI355X TP8/EP2 silicon slice,
 replace the systems root and provider revision in
-[`examples/sim_configs/infercast_deepseek_r1_mi350x.json`](examples/sim_configs/infercast_deepseek_r1_mi350x.json),
+[`examples/sim_configs/infercast_deepseek_r1_mi355x.json`](examples/sim_configs/infercast_deepseek_r1_mi355x.json),
 then run:
 
 ```bash
 python3 tools/sglang-simulator/scripts/run_infercast_benchmark.py \
   --model-path /path/to/deepseek-r1-config \
-  --sim-config tools/sglang-simulator/examples/sim_configs/infercast_deepseek_r1_mi350x.json \
+  --sim-config tools/sglang-simulator/examples/sim_configs/infercast_deepseek_r1_mi355x.json \
   --output-dir /tmp/deepseek-r1-simulator \
   --output /tmp/deepseek-r1-simulator.json \
   --input-length 1024 \

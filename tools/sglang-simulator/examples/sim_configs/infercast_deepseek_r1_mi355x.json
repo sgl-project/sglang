@@ -1,0 +1,61 @@
+{
+  "platform": {
+    "accelerator": {
+      "name": "mi355x",
+      "vendor": "AMD",
+      "hbm_capacity_gb": 288
+    },
+    "num_device_per_node": 8
+  },
+  "predictor": {
+    "name": "infercast",
+    "model_id": "deepseek-ai/DeepSeek-R1",
+    "systems_root": "/path/to/perfdb",
+    "database_mode": "SILICON",
+    "attn_kernel_impl": "cuda_graph",
+    "decode_attn_kernel_impl": "cuda_graph",
+    "attn_dtype": "bfloat16",
+    "kv_cache_dtype": "fp8",
+    "model_revision": "56d4cbbb4d29f4355bab4b9a39ccb717a14ad5ad",
+    "provider_revision": "<full InferCast commit>",
+    "execution_profile": {
+      "schema_version": 2,
+      "prefill_graph_backend": "tc_piecewise",
+      "prefill_graph_compiler": "eager",
+      "prefill_graph_capture_tokens": [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 2048, 4096],
+      "graph_capture_policy": "catalog_exact_shapes_v2",
+      "decode_graph_backend": "disabled",
+      "kv_page_size": 1,
+      "runtime_compatibility_id": "sglang-cb05-realization-aware-prefix-v4",
+      "full_forward_realization": "sglang_tc_piecewise_fx_split_replay_v1",
+      "component_realization": "sglang_isolated_mla_cudagraph_module_v1",
+      "runtime_compatibility_manifest_sha256": "fb4c0fd7afd9bb22e9864b92ee8205c2aef023d48b938c2d564e6748b9daabce",
+      "profile_id": "af0848bf060c90fb75ccd1f5c5b67165059d46960a482e571b98eb3f8944e7b3"
+    },
+    "decode_execution_profile": {
+      "schema_version": 1,
+      "decode_graph_backend": "full",
+      "graph_capture_batches": [1, 2, 4, 8],
+      "graph_batch_policy": "exact_capture_only",
+      "fallback_policy": "reject",
+      "kv_page_size": 1,
+      "runtime_compatibility_id": "deepseek-r1-mi355x-sglang-cb05-fpm-flush-v1",
+      "full_forward_realization": "sglang-model-runner-full-decode-graph-v1",
+      "component_realization": "sglang-aiter-mla-cuda-graph-v1",
+      "runtime_compatibility_manifest_sha256": "c9ce35d88d5abd3dbc10732cd362f66bffefdb566aebc27bb98df67224b25bdd",
+      "profile_id": "4afb36df1f3b13d40a41c40f8034a9eec8693bb6eb74406a61c910e9371ea13b"
+    }
+  },
+  "scheduler": {
+    "tp_size": 8,
+    "ep_size": 2,
+    "dp_size": 1,
+    "pp_size": 1,
+    "cp_size": 1,
+    "data_type": "BF16",
+    "kv_cache_data_type": "FP8",
+    "backend_name": "sglang",
+    "backend_version": "0.5.17",
+    "max_total_tokens": 65536
+  }
+}

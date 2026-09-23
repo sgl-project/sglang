@@ -148,8 +148,6 @@ def test_config_manager_passes_infercast_configuration(tmp_path, monkeypatch):
                 "kv_cache_dtype": "fp8",
                 "model_revision": "b" * 40,
                 "provider_revision": "a" * 40,
-                "contract_version": 2,
-                "reduction_policy": "exact_tokens_ragged_v2",
             },
         },
     )
@@ -168,9 +166,33 @@ def test_config_manager_passes_infercast_configuration(tmp_path, monkeypatch):
     assert captured["system"] == "mi350x"
     assert captured["provider_revision"] == "a" * 40
     assert captured["model_revision"] == "b" * 40
-    assert captured["contract_version"] == 2
-    assert captured["reduction_policy"] == "exact_tokens_ragged_v2"
+    assert "contract_version" not in captured
+    assert "reduction_policy" not in captured
     assert captured["decode_attn_kernel_impl"] == "cuda_graph"
+
+
+@pytest.mark.parametrize("field", ["contract_version", "reduction_policy"])
+def test_config_manager_rejects_obsolete_infercast_configuration(field, monkeypatch):
+    monkeypatch.setattr(
+        ConfigManager,
+        "_raw_config",
+        {
+            "platform": {"accelerator": {"name": "mi355x"}},
+            "predictor": {"name": "infercast", field: "obsolete"},
+        },
+    )
+
+    with pytest.raises(ValueError, match="obsolete InferCast predictor"):
+        ConfigManager.get_inference_time_predictor(
+            ModelInfo(),
+            AcceleratorInfo(
+                name="mi355x",
+                vendor="AMD",
+                hbm_capacity_gb=1,
+                hbm_bandwidth_gb=1,
+            ),
+            SchedulerConfig(),
+        )
 
 
 def _batch(mode, **fields):

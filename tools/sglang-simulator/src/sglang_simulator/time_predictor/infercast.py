@@ -18,23 +18,7 @@ from sglang_simulator.time_predictor.base import (
     ScheduleBatch,
 )
 
-CONTRACT_VERSION = 1
-REDUCTION_POLICY = "mean_attention_flops_v1"
-RAGGED_CONTRACT_VERSION = 2
-RAGGED_REDUCTION_POLICY = "exact_tokens_ragged_v2"
-PREFIX_CONTRACT_VERSION = 3
-PREFIX_REDUCTION_POLICY = "exact_request_vector_v3"
-REALIZATION_CONTRACT_VERSION = 4
-REALIZATION_REDUCTION_POLICY = "realization_aware_request_vector_v4"
-PROFILED_DECODE_CONTRACT_VERSION = 5
-PROFILED_DECODE_REDUCTION_POLICY = "realization_aware_context_and_decode_v5"
-_CONTRACT_POLICIES = {
-    CONTRACT_VERSION: REDUCTION_POLICY,
-    RAGGED_CONTRACT_VERSION: RAGGED_REDUCTION_POLICY,
-    PREFIX_CONTRACT_VERSION: PREFIX_REDUCTION_POLICY,
-    REALIZATION_CONTRACT_VERSION: REALIZATION_REDUCTION_POLICY,
-    PROFILED_DECODE_CONTRACT_VERSION: PROFILED_DECODE_REDUCTION_POLICY,
-}
+PROVIDER_CONTRACT = "infercast-forward-latency"
 _CONTEXT_MODES = {"EXTEND", "MIXED"}
 _SUPPORTED_MODES = _CONTEXT_MODES | {"DECODE"}
 _FULL_COMMIT = re.compile(r"^[0-9a-f]{40}$")
@@ -84,67 +68,6 @@ def _validate_batch(batch: ScheduleBatch) -> str:
     return mode
 
 
-def reduce_batch(batch: ScheduleBatch) -> ReducedForward:
-    """Apply the frozen ``mean_attention_flops_v1`` reduction."""
-    mode = _validate_batch(batch)
-
-    batch_size = len(batch.reqs)
-    sum_prefix = sum(request.past_kv_length for request in batch.reqs)
-    if mode == "DECODE":
-        return ReducedForward(
-            "estimate_decode_forward_ms",
-            {
-                "batch_size": batch_size,
-                "history_len": sum_prefix // batch_size,
-            },
-        )
-
-    sum_extend = sum(request.extend_length for request in batch.reqs)
-    prefix_len = sum_prefix // batch_size
-    extend_len = (sum_prefix + sum_extend) // batch_size - prefix_len
-    raw_scale = (
-        batch_size
-        * sum(
-            request.extend_length * (2 * request.past_kv_length + request.extend_length)
-            for request in batch.reqs
-        )
-        / (sum_extend * (2 * sum_prefix + sum_extend))
-    )
-    applied_scale = raw_scale if raw_scale >= 0.4 else 1.0
-    return ReducedForward(
-        "estimate_extend_forward_ms",
-        {
-            "batch_size": batch_size,
-            "extend_len": extend_len,
-            "prefix_len": prefix_len,
-            "seq_imbalance_correction_scale": applied_scale,
-        },
-        raw_attention_scale=raw_scale,
-    )
-
-
-def validate_provider_contract(
-    contract_version: int, reduction_policy: str | None
-) -> tuple[int, str]:
-    if type(contract_version) is not int or contract_version not in _CONTRACT_POLICIES:
-        raise _error(
-            "unsupported_reduction_policy",
-            f"unsupported InferCast provider contract version {contract_version!r}",
-            contract_version=contract_version,
-        )
-    expected = _CONTRACT_POLICIES[contract_version]
-    selected = expected if reduction_policy is None else reduction_policy
-    if selected != expected:
-        raise _error(
-            "unsupported_reduction_policy",
-            "InferCast contract version and reduction policy do not match",
-            contract_version=contract_version,
-            reduction_policy=selected,
-            expected_reduction_policy=expected,
-        )
-    return contract_version, selected
-
-
 def validate_topology(config: SchedulerConfig) -> None:
     topology = {
         "tp": config.tp_size,
@@ -162,7 +85,7 @@ def validate_topology(config: SchedulerConfig) -> None:
     if config.dp_size != 1 or config.cp_size != 1:
         raise _error(
             "unsupported_topology",
-            "InferCast provider v1 requires dp_size=cp_size=1",
+            "InferCast provider requires dp_size=cp_size=1",
             **topology,
         )
     if config.tp_size % config.ep_size:
@@ -229,8 +152,6 @@ class InferCastTimePredictor(InferTimePredictor):
         kv_cache_dtype: str | None,
         model_revision: str | None,
         provider_revision: str | None,
-        contract_version: int = CONTRACT_VERSION,
-        reduction_policy: str | None = None,
         execution_profile: dict[str, Any] | None = None,
         decode_execution_profile: dict[str, Any] | None = None,
         _provider: Any | None = None,
@@ -241,12 +162,15 @@ class InferCastTimePredictor(InferTimePredictor):
         _stack_digest: str = "0" * 64,
         **kwargs,
     ) -> None:
+        if kwargs:
+            unsupported = ", ".join(sorted(kwargs))
+            raise _error(
+                "provider_initialization_failed",
+                f"unsupported InferCast predictor configuration: {unsupported}",
+                unsupported_fields=sorted(kwargs),
+            )
         super().__init__(model, hw, config)
         validate_topology(config)
-        self._contract_version, self._reduction_policy = validate_provider_contract(
-            contract_version, reduction_policy
-        )
-
         required = {
             "model_id": model_id,
             "system": system,
@@ -273,7 +197,7 @@ class InferCastTimePredictor(InferTimePredictor):
         if str(database_mode).upper() != "SILICON":
             raise _error(
                 "incompatible_runtime",
-                "InferCast provider v1 requires database_mode='SILICON'",
+                "InferCast provider requires database_mode='SILICON'",
             )
         if not _FULL_COMMIT.fullmatch(str(provider_revision)):
             raise _error(
@@ -292,9 +216,7 @@ class InferCastTimePredictor(InferTimePredictor):
         self._system = str(system)
         self._provider_revision = str(provider_revision)
         self._context_attn_kernel_impl = str(attn_kernel_impl)
-        self._decode_attn_kernel_impl = str(
-            decode_attn_kernel_impl or attn_kernel_impl
-        )
+        self._decode_attn_kernel_impl = str(decode_attn_kernel_impl or attn_kernel_impl)
         for name, value in (
             ("attn_kernel_impl", self._context_attn_kernel_impl),
             ("decode_attn_kernel_impl", self._decode_attn_kernel_impl),
@@ -327,112 +249,74 @@ class InferCastTimePredictor(InferTimePredictor):
             self._provider_version = _provider_version
             self._stack_digest = _stack_digest
         self._request_shape_factory = _request_shape_factory
-        if self._contract_version >= RAGGED_CONTRACT_VERSION:
-            if self._request_shape_factory is None:
-                try:
-                    from infercast.sdk import ExtendRequestShape
-                except ImportError as error:
-                    raise _error(
-                        "provider_initialization_failed",
-                        "InferCast request-level contract is unavailable",
-                    ) from error
-                self._request_shape_factory = ExtendRequestShape
-        self._execution_profile = None
-        if self._contract_version in {
-            PREFIX_CONTRACT_VERSION,
-            REALIZATION_CONTRACT_VERSION,
-            PROFILED_DECODE_CONTRACT_VERSION,
-        }:
-            if not isinstance(execution_profile, dict):
-                raise _error(
-                    "invalid_execution_profile",
-                    f"InferCast provider v{self._contract_version} requires an "
-                    "execution_profile object",
-                )
-            if _execution_profile_factory is None:
-                try:
-                    from infercast.sdk import ExtendExecutionProfile
-                except ImportError as error:
-                    raise _error(
-                        "provider_initialization_failed",
-                        "InferCast execution-profile contract is unavailable",
-                    ) from error
-                _execution_profile_factory = ExtendExecutionProfile
+        if self._request_shape_factory is None:
             try:
-                self._execution_profile = _execution_profile_factory.from_dict(
-                    execution_profile
-                )
-                self._execution_profile.validate_for_kernel_impl(
-                    str(attn_kernel_impl)
-                )
-                if self._contract_version != PROFILED_DECODE_CONTRACT_VERSION:
-                    profile_payload = self._execution_profile.to_dict()
-                    profile_decode_impl = (
-                        "eager"
-                        if profile_payload["decode_graph_backend"] == "disabled"
-                        else "cuda_graph"
-                    )
-                    if (
-                        decode_attn_kernel_impl is not None
-                        and self._decode_attn_kernel_impl != profile_decode_impl
-                    ):
-                        raise ValueError(
-                            "decode_attn_kernel_impl does not match "
-                            "execution_profile.decode_graph_backend"
-                        )
-                    self._decode_attn_kernel_impl = profile_decode_impl
-            except (TypeError, ValueError) as error:
+                from infercast.sdk import ExtendRequestShape
+            except ImportError as error:
                 raise _error(
-                    "invalid_execution_profile",
-                    f"invalid InferCast execution profile: {error}",
+                    "provider_initialization_failed",
+                    "InferCast request-level contract is unavailable",
                 ) from error
-        elif execution_profile is not None:
+            self._request_shape_factory = ExtendRequestShape
+        self._execution_profile = None
+        if not isinstance(execution_profile, dict):
             raise _error(
                 "invalid_execution_profile",
-                "execution_profile is valid only for InferCast provider v3, v4, or v5",
+                "InferCast provider requires an execution_profile object",
             )
-        self._decode_execution_profile = None
-        if self._contract_version == PROFILED_DECODE_CONTRACT_VERSION:
-            if not isinstance(decode_execution_profile, dict):
-                raise _error(
-                    "invalid_decode_execution_profile",
-                    "InferCast provider v5 requires a decode_execution_profile object",
-                )
-            if _decode_execution_profile_factory is None:
-                try:
-                    from infercast.sdk import DecodeExecutionProfile
-                except ImportError as error:
-                    raise _error(
-                        "provider_initialization_failed",
-                        "InferCast decode execution-profile contract is unavailable",
-                    ) from error
-                _decode_execution_profile_factory = DecodeExecutionProfile
+        if _execution_profile_factory is None:
             try:
-                self._decode_execution_profile = (
-                    _decode_execution_profile_factory.from_dict(
-                        decode_execution_profile
-                    )
-                )
-                profile_decode_impl = self._decode_execution_profile.kernel_impl
-                if (
-                    decode_attn_kernel_impl is not None
-                    and self._decode_attn_kernel_impl != profile_decode_impl
-                ):
-                    raise ValueError(
-                        "decode_attn_kernel_impl does not match "
-                        "decode_execution_profile.decode_graph_backend"
-                    )
-                self._decode_attn_kernel_impl = profile_decode_impl
-            except (TypeError, ValueError) as error:
+                from infercast.sdk import ExtendExecutionProfile
+            except ImportError as error:
                 raise _error(
-                    "invalid_decode_execution_profile",
-                    f"invalid InferCast decode execution profile: {error}",
+                    "provider_initialization_failed",
+                    "InferCast execution-profile contract is unavailable",
                 ) from error
-        elif decode_execution_profile is not None:
+            _execution_profile_factory = ExtendExecutionProfile
+        try:
+            self._execution_profile = _execution_profile_factory.from_dict(
+                execution_profile
+            )
+            self._execution_profile.validate_for_kernel_impl(str(attn_kernel_impl))
+        except (TypeError, ValueError) as error:
+            raise _error(
+                "invalid_execution_profile",
+                f"invalid InferCast execution profile: {error}",
+            ) from error
+        self._decode_execution_profile = None
+        if not isinstance(decode_execution_profile, dict):
             raise _error(
                 "invalid_decode_execution_profile",
-                "decode_execution_profile is valid only for InferCast provider v5",
+                "InferCast provider requires a decode_execution_profile object",
             )
+        if _decode_execution_profile_factory is None:
+            try:
+                from infercast.sdk import DecodeExecutionProfile
+            except ImportError as error:
+                raise _error(
+                    "provider_initialization_failed",
+                    "InferCast decode execution-profile contract is unavailable",
+                ) from error
+            _decode_execution_profile_factory = DecodeExecutionProfile
+        try:
+            self._decode_execution_profile = (
+                _decode_execution_profile_factory.from_dict(decode_execution_profile)
+            )
+            profile_decode_impl = self._decode_execution_profile.kernel_impl
+            if (
+                decode_attn_kernel_impl is not None
+                and self._decode_attn_kernel_impl != profile_decode_impl
+            ):
+                raise ValueError(
+                    "decode_attn_kernel_impl does not match "
+                    "decode_execution_profile.decode_graph_backend"
+                )
+            self._decode_attn_kernel_impl = profile_decode_impl
+        except (TypeError, ValueError) as error:
+            raise _error(
+                "invalid_decode_execution_profile",
+                f"invalid InferCast decode execution profile: {error}",
+            ) from error
         self._calls = dict.fromkeys(("total", "context", "mixed", "decode"), 0)
 
     @staticmethod
@@ -549,10 +433,7 @@ class InferCastTimePredictor(InferTimePredictor):
 
     def predict_infer_time(self, batch: ScheduleBatch) -> float:
         mode = _validate_batch(batch)
-        if (
-            mode == "DECODE"
-            and self._contract_version == PROFILED_DECODE_CONTRACT_VERSION
-        ):
+        if mode == "DECODE":
             reduced = ReducedForward(
                 "estimate_profiled_decode_forward_ms",
                 {
@@ -562,8 +443,6 @@ class InferCastTimePredictor(InferTimePredictor):
                     "execution_profile": self._decode_execution_profile,
                 },
             )
-        elif mode == "DECODE" or self._contract_version == CONTRACT_VERSION:
-            reduced = reduce_batch(batch)
         else:
             requests = tuple(
                 self._request_shape_factory(
@@ -577,17 +456,7 @@ class InferCastTimePredictor(InferTimePredictor):
                 {
                     "forward_mode": mode,
                     "requests": requests,
-                    "reduction_policy": (
-                        REALIZATION_REDUCTION_POLICY
-                        if self._contract_version
-                        == PROFILED_DECODE_CONTRACT_VERSION
-                        else self._reduction_policy
-                    ),
-                    **(
-                        {"execution_profile": self._execution_profile}
-                        if self._execution_profile is not None
-                        else {}
-                    ),
+                    "execution_profile": self._execution_profile,
                 },
             )
         phase = {
@@ -609,7 +478,7 @@ class InferCastTimePredictor(InferTimePredictor):
                 "prediction_failed",
                 f"InferCast does not support this forward yet: {error}",
                 forward_mode=batch.forward_mode,
-                **reduced.arguments,
+                provider_call=reduced.method,
             ) from error
         except Exception as error:
             infercast_code = getattr(error, "code", None)
@@ -641,8 +510,7 @@ class InferCastTimePredictor(InferTimePredictor):
     def get_metrics(self) -> dict:
         return {
             "infercast": {
-                "contract_version": self._contract_version,
-                "reduction_policy": self._reduction_policy,
+                "contract": PROVIDER_CONTRACT,
                 "provider_version": self._provider_version,
                 "provider_revision": self._provider_revision,
                 "model_id": self._model_id,
