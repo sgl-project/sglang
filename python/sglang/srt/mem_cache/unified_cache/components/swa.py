@@ -401,6 +401,10 @@ class SWAComponent(TreeComponent):
         alloc = self.cache.token_to_kv_pool_allocator
         if is_swa_req_ring(alloc):
             return
+        # unified_kv keeps SWA as a device-only ring; host-only nodes are not
+        # handled here (mirrors build_hicache_transfers' guard).
+        if self.tree_core.enable_hicache and not self.tree_core.has_swa_host_pool:
+            return
         ct = self.component_type
         root = self.tree_core.root_node
         node = self.tree_core.node_by_id(node_id)
@@ -409,8 +413,11 @@ class SWAComponent(TreeComponent):
         n_swa = 0
         while node.id != root.id and n_swa < self.sliding_window_size:
             cd = node.component_data[ct]
-            if cd.value is None:
-                break
+            assert cd.value is not None, (
+                f"swa window node {node.id} is a tombstone (no device value): the "
+                "window spans SWA-evicted nodes, so the full->swa mapping cannot "
+                "cover it (recover SWA from Full instead of re-pointing)"
+            )
             full_value = node.component_data[BASE_COMPONENT_TYPE].value
             assert full_value is not None and len(full_value) == len(cd.value), (
                 "swa node value is not element-wise aligned with its full value"
