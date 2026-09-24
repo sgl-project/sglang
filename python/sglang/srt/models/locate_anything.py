@@ -200,8 +200,8 @@ class LocateAnythingForConditionalGeneration(nn.Module):
             )
 
             if is_vision_weight:
-                # Map names from wqkv/wo -> qkv_proj/proj according to
-                # wrapped MoonVit's attention (VisionAttention)
+                # Map names from wqkv/wo -> attn.qkv_proj/attn.proj
+                # according to wrapped MoonVit's attention (VisionAttention)
                 # in python/sglang/srt/models/kimi_vl.py
                 name = name.replace("wqkv.", "attn.qkv_proj.").replace(
                     "wo.", "attn.proj."
