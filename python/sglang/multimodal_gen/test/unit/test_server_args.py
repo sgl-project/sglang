@@ -3412,6 +3412,75 @@ class TestDirectGpuWeightLoading(unittest.TestCase):
                 tp_args._validate_direct_gpu_weight_loading()
 
 
+class TestLayerwiseResidencyLifetime(unittest.TestCase):
+    def _help_by_option(self):
+        parser = FlexibleArgumentParser()
+        ServerArgs.add_cli_args(parser)
+        return {
+            action.option_strings[0]: (action.help or "")
+            for action in parser._actions
+            if action.option_strings
+        }
+
+    def test_cli_accepts_the_two_lifetimes_and_rejects_others(self):
+        parser = FlexibleArgumentParser()
+        ServerArgs.add_cli_args(parser)
+        args = parser.parse_args(
+            ["--model-path", "/fake", "--dit-layerwise-residency-lifetime", "permanent"]
+        )
+        self.assertEqual(args.dit_layerwise_residency_lifetime, "permanent")
+        self.assertEqual(
+            parser.parse_args(
+                ["--model-path", "/fake"]
+            ).dit_layerwise_residency_lifetime,
+            "forward",
+        )
+        with self.assertRaises(SystemExit):
+            parser.parse_args(
+                [
+                    "--model-path",
+                    "/fake",
+                    "--dit-layerwise-residency-lifetime",
+                    "sometimes",
+                ]
+            )
+
+    def test_python_api_rejects_an_unknown_lifetime(self):
+        # argparse choices cover the CLI only; ServerArgs is also built directly.
+        with self.assertRaisesRegex(ValueError, "dit-layerwise-residency-lifetime"):
+            _from_dict_without_model_resolution(
+                {
+                    "model_path": "/data/my-model",
+                    "dit_layerwise_residency_lifetime": "sometimes",
+                }
+            )
+
+    def test_help_says_when_layers_are_placed_and_released(self):
+        """A user reads these to decide between the two; both answers must be there."""
+        help_by_option = self._help_by_option()
+        dit_help = help_by_option["--dit-layerwise-residency-lifetime"]
+        for claim in (
+            "'forward' (default)",
+            "'permanent'",
+            "load time",
+            "never released",
+        ):
+            self.assertIn(claim, dit_help)
+        per_component_help = help_by_option["--layerwise-residency-lifetime"]
+        for claim in ("transformer=permanent", "never releases"):
+            self.assertIn(claim, per_component_help)
+        # The resident-layer flags point at the lifetime knob instead of
+        # describing a lifetime of their own.
+        self.assertIn(
+            "--dit-layerwise-residency-lifetime",
+            help_by_option["--dit-layerwise-resident-layers"],
+        )
+        self.assertIn(
+            "--layerwise-residency-lifetime",
+            help_by_option["--layerwise-resident-layers"],
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
 
