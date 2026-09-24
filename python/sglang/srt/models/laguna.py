@@ -17,9 +17,6 @@ import torch.nn.functional as F
 from torch import nn
 
 from sglang.srt.configs.laguna import LagunaConfig, normalize_gating
-from sglang.srt.distributed import (
-    tensor_model_parallel_all_reduce,
-)
 from sglang.srt.environ import envs
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.communicator import (
@@ -38,7 +35,7 @@ from sglang.srt.layers.linear import (
     RowParallelLinear,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
-from sglang.srt.layers.moe import should_skip_post_experts_all_reduce
+from sglang.srt.layers.moe import reduce_moe_output
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.topk import TopK
@@ -226,10 +223,7 @@ class LagunaMoE(nn.Module):
         else:
             final = routed_out + shared_out
 
-        if self.tp_size > 1 and not should_skip_post_experts_all_reduce(
-            is_tp_path=True,
-        ):
-            final = tensor_model_parallel_all_reduce(final)
+        final = reduce_moe_output(final)
         if self._shared_expert_tp1:
             final = final + shared_out
         return final

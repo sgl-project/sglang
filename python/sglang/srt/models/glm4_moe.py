@@ -29,7 +29,6 @@ from sglang.srt.batch_overlap.single_batch_overlap import SboFlags
 from sglang.srt.batch_overlap.two_batch_overlap import model_forward_maybe_tbo
 from sglang.srt.distributed import (
     get_pp_indices,
-    tensor_model_parallel_all_reduce,
 )
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
@@ -58,7 +57,7 @@ from sglang.srt.layers.linear import (
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe import (
     get_moe_a2a_backend,
-    should_skip_post_experts_all_reduce,
+    reduce_moe_output,
     should_use_flashinfer_cutlass_moe_fp4_allgather,
 )
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
@@ -621,10 +620,7 @@ class Glm4MoeSparseMoeBlock(nn.Module):
 
         current_stream.wait_stream(self.alt_stream)
         final_hidden_states += shared_output
-        if self.tp_size > 1 and not should_skip_post_experts_all_reduce(
-            is_tp_path=True,
-        ):
-            final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
+        final_hidden_states = reduce_moe_output(final_hidden_states)
         return final_hidden_states
 
     def forward_normal(
@@ -650,10 +646,7 @@ class Glm4MoeSparseMoeBlock(nn.Module):
                 final_hidden_states_out = torch.empty_like(final_hidden_states)
             torch.add(final_hidden_states, shared_output, out=final_hidden_states_out)
             final_hidden_states = final_hidden_states_out
-        if self.tp_size > 1 and not should_skip_post_experts_all_reduce(
-            is_tp_path=True,
-        ):
-            final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
+        final_hidden_states = reduce_moe_output(final_hidden_states)
         return final_hidden_states
 
     def forward_deepep(
