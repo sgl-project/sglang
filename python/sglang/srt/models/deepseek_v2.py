@@ -2062,6 +2062,13 @@ class DeepseekV2AttentionMLA(
                     indexer_kwargs["skip_rope"] = skip_rope
                 self.indexer = indexer_cls(**indexer_kwargs)
 
+            # A skip-topk layer only owns an indexer when it is also nextn; the
+            # others reuse the previous layer's topk and build none, so there are
+            # no weights to exempt.
+            if self.skip_topk and self.indexer is not None:
+                for p in self.indexer.parameters():
+                    p._skip_weight_check = True
+
         self.kv_b_proj = ColumnParallelLinear(
             self.kv_lora_rank,
             self.num_heads * (self.qk_nope_head_dim + self.v_head_dim),
