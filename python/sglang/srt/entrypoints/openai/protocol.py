@@ -1404,36 +1404,25 @@ class ScoringRequest(BaseModel):
     item_first: bool = False
     return_pooled_hidden_states: bool = False
 
-    # Multi-position pooling readout (setwise). SequenceClassification-only. When
-    # set, the classification head is pooled AT every occurrence of this token in
-    # each `query + item` sequence (instead of the last token). Each item is one
-    # candidate set (with one extraction token per candidate), and `scores` is
-    # returned nested — one `[Nᵢ x num_labels]` matrix per item. Symmetric with
-    # `embed_override_token_id`, but the head is pooled at these positions instead
-    # of scattering embeddings.
-    #
-    # Multiple items are supported in both execution modes: with `--enable-mis`
-    # the items are fused into one multi-item sequence (block-diagonal mask,
-    # shared query prefix); without MIS each item is scored as an independent
-    # `query + item` sequence in one batch.
+    # Setwise readout (SequenceClassification-only): when set, the head is pooled
+    # AT every occurrence of this token in each `query + item` sequence instead of
+    # the last token, and `scores` is returned nested (one `[Nᵢ x num_labels]`
+    # matrix per item). --enable-mis fuses items; otherwise each is scored alone.
     score_extraction_token: Optional[str] = None
 
     model: str = DEFAULT_MODEL_NAME
 
 
 class ScoringResponse(BaseModel):
-    # `scores` is either a single [num_rows x num_labels] matrix for pointwise
-    # scoring (no `score_extraction_token`: one row per item), or — when
-    # `score_extraction_token` is set (setwise) — one [Nᵢ x num_labels] matrix per
-    # item, i.e. nested [num_items][Nᵢ x num_labels] (always, regardless of item
-    # count or `--enable-mis`). The two shapes differ in nesting depth, so the
-    # union disambiguates them.
+    # Pointwise (no `score_extraction_token`): a single [num_rows x num_labels]
+    # matrix. Setwise: nested [num_items][Nᵢ x num_labels]. The nesting depth
+    # disambiguates the two shapes.
     scores: Union[
         List[List[float]],  # pointwise: [num_rows x num_labels]
         List[List[List[float]]],  # setwise: [num_items][Nᵢ x num_labels]
     ]
-    # Parallel to `scores`: a flat [num_rows x hidden] matrix (pointwise; rows may
-    # be null) or one such matrix per item for setwise scoring.
+    # Parallel to `scores`: flat [num_rows x hidden] (pointwise) or one such
+    # matrix per item (setwise).
     pooled_hidden_states: Optional[
         Union[
             List[Optional[List[float]]],  # pointwise: [num_rows x hidden]

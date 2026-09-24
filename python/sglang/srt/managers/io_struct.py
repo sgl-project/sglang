@@ -1219,11 +1219,9 @@ class EmbeddingReqInput:
     # Batch-level: List[List[int]] (one per request). After __getitem__: List[int].
     multi_item_delimiter_indices: Optional[Union[List[List[int]], List[int]]] = None
 
-    # Pre-computed token positions at which the pooler reads out per-position
-    # outputs (pools the head / hidden states) AT these positions, instead of the
-    # default LAST/CLS pooling. Generic multi-position pooling primitive (used by
-    # setwise scoring today; extensible to token classification, multi-vector
-    # embeddings, etc.). Unlike MIS, pooling is AT the position (no delimiter - 1).
+    # Token positions the pooler reads out AT (head / hidden states), instead of
+    # the default LAST/CLS pooling. Generic multi-position primitive (setwise
+    # scoring today). Unlike MIS, pooling is AT the position (no delimiter - 1).
     # Batch-level: List[List[int]] (one per request). After __getitem__: List[int].
     token_indices_to_pool: Optional[Union[List[List[int]], List[int]]] = None
 
@@ -1423,7 +1421,7 @@ class TokenizedEmbeddingReqInput(BaseReq, kw_only=True):
     return_pooled_hidden_states: bool = False
     # Pre-computed delimiter indices for multi-item scoring
     multi_item_delimiter_indices: Optional[List[int]] = None
-    # Pre-computed token positions for multi-position pooling readout
+    # Token positions for setwise pooling readout
     token_indices_to_pool: Optional[List[int]] = None
     # For observability
     # Pickled Optional[Union[APIServerReqTimeStats, DPControllerReqTimeStats]]

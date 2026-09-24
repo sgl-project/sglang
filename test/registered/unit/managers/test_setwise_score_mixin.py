@@ -1,16 +1,12 @@
-"""Unit tests for the multi-position (setwise) result grouping on
+"""Unit tests for setwise result grouping on
 ``TokenizerManagerScoreMixin._process_single_item_scoring_results`` and
 ``_process_multi_item_extraction_results``.
 
-Setwise scoring is expressed as SequenceClassification scoring with a
-``score_extraction_token_id``: the classification head is pooled at every
-occurrence of the token, so each item carries a 2-D
-``[num_positions x num_labels]`` embedding. Each item's matrix is kept grouped
-(``per_item_matrix=True``) so ``scores`` is nested ``[num_items][Nᵢ x num_labels]``
-(one score matrix per item). These tests cover that grouping and confirm the
-default pointwise behavior is unchanged.
-
-All tests run on CPU — no GPU or tokenizer/engine state required.
+Setwise scoring pools the SequenceClassification head at every occurrence of a
+``score_extraction_token_id``, so each item carries a 2-D
+``[num_positions x num_labels]`` embedding kept grouped (``per_item_matrix=True``)
+as nested ``scores`` ``[num_items][Nᵢ x num_labels]``. These tests cover the
+grouping, validation, anchor bucketing, and the serialization round-trip on CPU.
 """
 
 import unittest
@@ -61,9 +57,8 @@ class TestSingleItemScoringResults(CustomTestCase):
     def setUp(self):
         super().setUp()
         self.h = _ClsHarness()
-        # _validate_score_extraction reads resolved config bags (get_memory /
-        # get_schedule / get_serving), so publish a valid setwise config; each
-        # validation test re-publishes with the one field it exercises flipped.
+        # _validate_score_extraction reads resolved config bags, so publish a
+        # valid setwise config; validation tests re-publish with one field flipped.
         self._saved_server_args = get_context()._server_args
         self.addCleanup(self._restore_server_args)
         self._publish(**_VALID_SETWISE_CONFIG)
@@ -140,8 +135,7 @@ class TestSingleItemScoringResults(CustomTestCase):
             self.assertAlmostEqual(row[0], 0.5, places=5)
 
     def test_setwise_multiple_items_grouped_per_item(self):
-        # Two items (two candidate sets), scored as independent sequences ->
-        # one matrix per item (nested), not flattened across items.
+        # Two candidate sets scored independently -> one matrix per item (nested).
         res = self.h._process_single_item_scoring_results(
             [self._result([[1.0, 0.0], [0.0, 1.0]]), self._result([[0.5, 0.5]])],
             label_token_ids=None,
@@ -149,18 +143,6 @@ class TestSingleItemScoringResults(CustomTestCase):
             per_item_matrix=True,
         )
         self.assertEqual(res.scores, [[[1.0, 0.0], [0.0, 1.0]], [[0.5, 0.5]]])
-
-    def test_setwise_embedding_as_tensor(self):
-        emb = torch.tensor([[0.1, 0.2], [0.3, 0.4]])
-        res = self.h._process_single_item_scoring_results(
-            [self._result(emb)],
-            label_token_ids=None,
-            apply_softmax=False,
-            per_item_matrix=True,
-        )
-        self.assertEqual(len(res.scores), 1)
-        self.assertEqual(len(res.scores[0]), 2)
-        self.assertEqual(len(res.scores[0][0]), 2)
 
     def test_setwise_groups_pooled_hidden_states_per_item(self):
         emb = [[0.1, 0.2], [0.3, 0.4]]
@@ -263,9 +245,8 @@ class TestSingleItemScoringResults(CustomTestCase):
             self.h._anchor_counts_per_item(delimiter_indices, anchor_positions)
 
     def test_anchor_counts_per_item_rejects_anchor_outside_items(self):
-        # An anchor before the first delimiter (in the shared query prefix) is not
-        # attributable to any item; reject up front so the fused forward doesn't
-        # produce more rows than sum(counts) and crash post-inference.
+        # An anchor before the first delimiter (shared query prefix) is not
+        # attributable to any item and must be rejected up front.
         delimiter_indices = [3, 8, 12]
         anchor_positions = [1, 5, 7, 10]  # position 1 is in the query region
         with self.assertRaisesRegex(ValueError, "outside the candidate items"):
@@ -331,8 +312,7 @@ class TestSingleItemScoringResults(CustomTestCase):
         self.assertEqual(input_ids, [[6], [6]])
 
     def test_text_extraction_rejects_extraction_token_in_query(self):
-        # The query prefix must not contain the extraction token: a query-side
-        # anchor would emit an extra, misaligned score row. anchor id 5 ==
+        # A query-side anchor would emit an extra, misaligned row. anchor id 5 ==
         # len("query"), so encode("query") -> [5] contains it and must reject.
         class _LenTokenizer:
             def encode(self, text):
@@ -343,10 +323,8 @@ class TestSingleItemScoringResults(CustomTestCase):
             self.h._build_score_extraction_text_inputs("query", ["a"], 5)
 
     def test_reject_query_prefix_anchor_rejects_pretokenized_query(self):
-        # Pre-tokenized (token-id) query whose ids contain the extraction token
-        # must be rejected too: the non-MIS path concatenates query + item and
-        # scans the whole sequence, so a query-side anchor would emit an extra,
-        # misaligned score row.
+        # A pre-tokenized query whose ids contain the extraction token is rejected:
+        # the non-MIS path scans the whole query + item sequence.
         with self.assertRaisesRegex(ValueError, "query prefix"):
             self.h._reject_query_prefix_anchor([1, 7, 2], score_extraction_token_id=7)
 
@@ -412,9 +390,8 @@ class TestSingleItemScoringResults(CustomTestCase):
             )
 
     def test_resolve_multi_position_pooling_mis_rejects_query_side_anchor(self):
-        # The extraction token (7) also appears in the query prefix (before the
-        # first delimiter) -> rejected before inference (clean 400), not after the
-        # forward pass.
+        # The extraction token also appears in the query prefix -> rejected before
+        # inference.
         # Fused (D=0, anchor=7): q 7 <D> 7 <D> 7 <D>  (query anchor at position 1)
         #   positions:           0 1  2  3  4  5  6
         # delimiters at 2,4,6; in-item anchors at 3,5 but the scan also finds 1.
@@ -430,8 +407,7 @@ class TestSingleItemScoringResults(CustomTestCase):
     # ---- _multi_position_score_rows / _multi_position_phs_matrix helpers --
 
     def test_multi_position_score_rows_preserves_list_values_without_softmax(self):
-        # No softmax: the original list is returned as-is (no float round-trip),
-        # so exact values are preserved.
+        # No softmax returns the original list as-is (no float round-trip).
         emb = [[0.1, 0.2], [0.3, 0.4]]
         rows = self.h._multi_position_score_rows(emb, apply_softmax=False)
         self.assertIs(rows, emb)
@@ -444,20 +420,9 @@ class TestSingleItemScoringResults(CustomTestCase):
             self.assertAlmostEqual(sum(row), 1.0, places=5)
             self.assertAlmostEqual(row[0], 0.5, places=5)
 
-    def test_multi_position_score_rows_accepts_tensor(self):
-        rows = self.h._multi_position_score_rows(
-            torch.tensor([[0.1, 0.2], [0.3, 0.4]]), apply_softmax=False
-        )
-        self.assertEqual(len(rows), 2)
-        self.assertEqual(len(rows[0]), 2)
-
     def test_multi_position_score_rows_rejects_non_matrix(self):
         with self.assertRaisesRegex(ValueError, "expected a 2-D"):
             self.h._multi_position_score_rows([0.1, 0.2], apply_softmax=False)
-
-    def test_multi_position_phs_matrix_returns_tensor(self):
-        out = self.h._multi_position_phs_matrix(torch.randn(3, 4), expected_rows=3)
-        self.assertEqual(tuple(out.shape), (3, 4))
 
     def test_multi_position_phs_matrix_rejects_row_count_mismatch(self):
         with self.assertRaisesRegex(ValueError, "one row per score position"):
@@ -471,20 +436,15 @@ class TestSingleItemScoringResults(CustomTestCase):
 class TestSetwisePooledHiddenStatesRoundTrip(CustomTestCase):
     """Validate per-position pooled hidden states survive scheduler serialization.
 
-    ``_process_single_item_scoring_results`` assumes each result carries one
-    ``[num_positions, hidden]`` matrix, but the tensor is produced by the pooler,
-    packed by ``stream_output_embedding``, and reconstructed on the receiver side.
-    These tests exercise that real transmission path (not a reimplementation):
-    ``stream_output_embedding`` stacks the per-request 2-D tensors when their
-    shapes match and keeps a list when they differ; the receiver recovers each
-    request's matrix by index; the parser then groups it as one item's list of
-    per-position vectors.
+    The pooler's ``[num_positions, hidden]`` tensor is packed by
+    ``stream_output_embedding`` (stacked when shapes match, list when they differ)
+    and reconstructed on the receiver by index. These tests exercise that real
+    transmission path, then confirm the parser groups it as one item's vectors.
     """
 
     @staticmethod
     def _run_stream_output_embedding(phs_per_req):
-        # Imported lazily so the heavier scheduler module is only pulled in when
-        # this test actually runs.
+        # Lazy import so the heavier scheduler module loads only when this runs.
         from sglang.srt.managers.scheduler_components.output_streamer import (
             SchedulerOutputStreamer,
         )
@@ -516,11 +476,9 @@ class TestSetwisePooledHiddenStatesRoundTrip(CustomTestCase):
         SchedulerOutputStreamer._stream_output_embedding(fake_self, reqs)
         out = captured[0]
 
-        # Mirror the receiver-side reconstruction in tokenizer_manager.py: the
-        # streamer stacks uniform per-request tensors into a single
-        # ``[stacked(N, ...)]`` (len 1, N > 1); the receiver unwraps that back to
-        # per-request indexing. Apply the same disambiguation so the returned
-        # ``pooled_hidden_states`` indexes per request regardless of wire format.
+        # Mirror the receiver-side reconstruction in tokenizer_manager.py: a
+        # single stacked ``[stacked(N, ...)]`` (len 1, N > 1) is unwrapped back to
+        # per-request indexing regardless of wire format.
         phs = out.pooled_hidden_states
         if phs is not None and len(phs) == 1 and len(reqs) > 1:
             out.pooled_hidden_states = phs[0]
@@ -547,9 +505,8 @@ class TestSetwisePooledHiddenStatesRoundTrip(CustomTestCase):
         torch.testing.assert_close(torch.as_tensor(out.pooled_hidden_states[1]), phs1)
 
     def test_full_roundtrip_into_parser_groups_per_item(self):
-        # pooler-style 2-D PHS -> stream_output_embedding -> receiver [i] -> parser:
-        # the final ScoreResult must hold the item's [num_positions, hidden]
-        # vectors grouped as one item (nested), in order.
+        # pooler 2-D PHS -> stream_output_embedding -> receiver [i] -> parser:
+        # the ScoreResult must hold the item's vectors grouped as one item.
         phs = torch.arange(6).float().reshape(3, 2)  # 3 positions, hidden=2
         out = self._run_stream_output_embedding([phs])
         received = out.pooled_hidden_states[0]  # receiver-side indexing

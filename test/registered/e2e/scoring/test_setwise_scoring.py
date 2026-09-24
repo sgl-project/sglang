@@ -3,20 +3,14 @@
 Setwise scoring pools the SequenceClassification head at every occurrence of a
 ``score_extraction_token`` (one per candidate) instead of the last token. These
 tests verify the *numerical* correctness of that readout against a HuggingFace
-reference: run the same checkpoint through HF, gather the final hidden state at
-the anchor positions, apply the model's own classification head, and compare to
-the engine's setwise ``scores``.
-
-The head is the real (pretrained) head, so these tests assert the engine pools
-at the correct positions and applies the head correctly — a wrong pooling
+reference (run the checkpoint through HF, gather the final hidden state at the
+anchor positions, apply the model's own classification head), so a wrong pooling
 position or head application changes the numbers, not just the shape.
 
-Uses a public ``Qwen3ForSequenceClassification`` checkpoint. Like the MIS and
-other scoring tests, the engine runs ``float16`` on the ``flashinfer`` attention
-backend; the HF golden is computed in ``float32`` and compared with an
-fp16-appropriate tolerance. The setwise anchor token ``<|object_ref_start|>`` is
-a Qwen3 special token, so it tokenizes to a single dedicated id regardless of
-whether the checkpoint was trained on setwise.
+The engine runs ``float16`` on ``flashinfer`` (its scoring backend of record);
+the HF golden is ``float32`` and compared with an fp16-appropriate tolerance.
+The anchor token ``<|object_ref_start|>`` is a Qwen3 special token (single
+dedicated id). All model/dtype/tolerance knobs are overridable via env.
 """
 
 import asyncio
@@ -37,9 +31,8 @@ _SEQCLS_MODEL = os.environ.get(
     "tomaarsen/Qwen3-Reranker-0.6B-seq-cls",
 )
 _ANCHOR_TOKEN = os.environ.get("TEST_SCORE_EXTRACTION_TOKEN", "<|object_ref_start|>")
-# Match MIS / other scoring tests: float16 on the flashinfer backend (flashinfer
-# prefill has no float32 kernel). The HF golden is float32; the tolerance below
-# accounts for the fp16-vs-fp32 gap. All three are overridable via env.
+# float16 on flashinfer (no float32 prefill kernel); HF golden is float32 and the
+# tolerance below covers the fp16-vs-fp32 gap. All overridable via env.
 _DTYPE = os.environ.get("TEST_SEQCLS_DTYPE", "float16")
 _ATOL = float(os.environ.get("TEST_SETWISE_ATOL", "0.2"))
 _RTOL = float(os.environ.get("TEST_SETWISE_RTOL", "0.05"))
@@ -56,9 +49,6 @@ class TestSetwiseScoringHFParity(CustomTestCase):
             cls.anchor_id is not None and cls.anchor_id != cls.tokenizer.unk_token_id
         ), f"{_ANCHOR_TOKEN!r} did not resolve to a dedicated token id"
 
-        # float16 on the flashinfer backend, matching MIS and the other scoring
-        # tests (flashinfer prefill has no float32 kernel). Setwise uses standard
-        # prefill — no MIS mask — but flashinfer is the scoring backend of record.
         cls.engine = Engine(
             model_path=_SEQCLS_MODEL,
             disable_radix_cache=True,
@@ -172,12 +162,7 @@ class TestSetwiseScoringHFParity(CustomTestCase):
         self._assert_close(ref, item)
 
     def test_setwise_multiple_items_match_hf(self):
-        """Multiple items (candidate sets) -> one HF-matching matrix per item.
-
-        Without --enable-mis each item is scored as an independent ``query+item``
-        sequence, so ``scores`` is nested per item and each item's matrix must
-        match its own standalone HF reference.
-        """
+        """Multiple items -> one HF-matching matrix per item (independent, no MIS)."""
         prompt0 = self._build_prompt(3)
         prompt1 = self._build_prompt(2)
         ref0, anchors0 = self._hf_setwise_reference(prompt0)
@@ -213,11 +198,7 @@ class TestSetwiseScoringHFParity(CustomTestCase):
         self._assert_close(ref, sgl[0])
 
     def test_setwise_candidate_ranking_matches_hf(self):
-        """Ranking of candidates (argsort over label 0) agrees with HF.
-
-        Ranking is the property the setwise ranker actually consumes, and it is
-        robust to small floating-point differences.
-        """
+        """Ranking (argsort over label 0) agrees with HF — robust to fp noise."""
         prompt = self._build_prompt(5)
         ref, _ = self._hf_setwise_reference(prompt)
 
@@ -234,11 +215,7 @@ class TestSetwiseScoringHFParity(CustomTestCase):
         self.assertEqual(ref_order, sgl_order)
 
     def test_setwise_pooled_hidden_states_match_hf(self):
-        """return_pooled_hidden_states -> per-anchor pre-head vectors == HF.
-
-        Verifies the PHS path returns the raw hidden state at each anchor
-        position (one vector per candidate), not just the head logits.
-        """
+        """return_pooled_hidden_states -> per-anchor pre-head vectors == HF."""
         prompt = self._build_prompt(3)
         ref_hidden, anchor_positions = self._hf_anchor_hidden_states(prompt)
 
@@ -263,13 +240,7 @@ class TestSetwiseScoringHFParity(CustomTestCase):
         self._assert_close(ref_hidden, sgl_hidden)
 
     def test_setwise_tokenized_items_omitted_query_match_hf(self):
-        """Token-ID items with the query omitted take the token-ID path.
-
-        ``engine.score(items=[[token_ids]], score_extraction_token_id=...)`` with
-        no ``query`` (None) must normalize to an empty token-ID prefix and score
-        via the token-ID path, matching HF — instead of being routed to the text
-        builder and rejected.
-        """
+        """Token-ID items with the query omitted take the token-ID path (query -> [])."""
         prompt = self._build_prompt(3)
         ref, anchor_positions = self._hf_setwise_reference(prompt)
         token_ids = self.tokenizer.encode(prompt)
@@ -287,10 +258,9 @@ class TestSetwiseScoringHFParity(CustomTestCase):
     def test_mixed_setwise_and_pointwise_concurrent_batch(self):
         """Setwise and pointwise requests batched together must both succeed.
 
-        Both use the same ``/v1/score`` endpoint and scheduler queue, so a client
-        cannot ensure homogeneous batches. The scheduler partitions prefill
-        batches by pooling mode, so concurrent mixed traffic must not abort the
-        setwise requests (pre-fix, a mixed batch returned HTTP 400 for them).
+        Both share the ``/v1/score`` queue; the scheduler partitions prefill
+        batches by pooling mode, so mixed traffic must not abort the setwise
+        requests (pre-fix a mixed batch returned HTTP 400 for them).
         """
         setwise_prompt = self._build_prompt(3)
 
@@ -329,14 +299,10 @@ class TestSetwiseScoringHFParity(CustomTestCase):
 class TestSetwiseMultiItemMISScoring(CustomTestCase):
     """Multi-item setwise scoring under ``--enable-mis`` (fused sequence).
 
-    The fused path returns one score matrix per item (nested ``scores``), isolates
-    each set with the block-diagonal mask, and shares the query-prefix KV. It
-    carries the standard MIS delimiter tokens, so it is **not** bit-identical to
-    independent HF scoring — that trade-off is inherent to MIS, not to score
-    extraction. These tests therefore assert the nested per-item shape and set
-    isolation (a set's scores are unchanged by the presence of other sets) rather
-    than HF parity, which is covered for the batched path in
-    ``TestSetwiseScoringHFParity``.
+    The fused path carries the standard MIS delimiter tokens, so it is not
+    bit-identical to independent HF scoring (inherent to MIS). These tests assert
+    the nested per-item shape and block-diagonal set isolation rather than HF
+    parity, which ``TestSetwiseScoringHFParity`` covers for the batched path.
     """
 
     @classmethod
@@ -366,13 +332,10 @@ class TestSetwiseMultiItemMISScoring(CustomTestCase):
             _ANCHOR_TOKEN * n_anchors
         )
 
-    # atol=5e-2 is a floor set by fp16, not slack. With a 10-bit mantissa one ULP
-    # on these logits is already ~0.002 at magnitude ~2 and ~0.004 at magnitude ~7,
-    # so a single rounding step exceeds 1e-3. Fusing set0 with another set changes
-    # the batch shape (padding/tiling), which changes reduction order and stacks
-    # several such steps; the observed drift is ~0.012. 5e-2 clears that with margin
-    # while still catching real cross-set leakage, which would diverge far more.
-    # A tighter bound (e.g. 1e-3) is below fp16 resolution and cannot pass.
+    # atol=5e-2 is a floor set by fp16, not slack: one ULP on these logits is
+    # ~0.002-0.004, and fusing set0 with another set changes reduction order and
+    # stacks several such steps (observed drift ~0.012). 5e-2 clears that while
+    # still catching real cross-set leakage, which would diverge far more.
     def _assert_matrix_close(self, a, b, atol=5e-2):
         self.assertEqual(len(a), len(b), "row count mismatch")
         for i, (ra, rb) in enumerate(zip(a, b)):

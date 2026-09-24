@@ -67,10 +67,8 @@ class OpenAIServingScore(OpenAIServingBase):
                 else None
             )
 
-            # Multi-position pooling readout (setwise): resolve the extraction
-            # token to an id here (the tokenizer-manager process owns the tokenizer);
-            # score_request then scans each query+item sequence for it and pools the
-            # head at those positions.
+            # Resolve the extraction token to an id here (this process owns the
+            # tokenizer); score_request then scans for it and pools the head there.
             score_extraction_token_id = None
             if request.score_extraction_token is not None:
                 score_extraction_token_id = (
@@ -93,9 +91,8 @@ class OpenAIServingScore(OpenAIServingBase):
                 return_pooled_hidden_states=request.return_pooled_hidden_states,
             )
 
-            # pooled_hidden_states is a flat list of tensors (pointwise / single-set
-            # setwise) or a nested per-item list of tensors (multi-item setwise with
-            # --enable-mis). Convert tensors to lists at any depth.
+            # pooled_hidden_states is flat (pointwise / single-set setwise) or
+            # nested per item (multi-item setwise); convert tensors at any depth.
             def _tensors_to_lists(value):
                 if value is None:
                     return None

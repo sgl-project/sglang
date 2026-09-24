@@ -2396,10 +2396,8 @@ def is_cross_encoding_pooler_model(model_architectures: List[str]) -> bool:
 
 
 # SequenceClassification models whose forward routes the head through
-# score_and_pool (per-position pooling). Only these support multi-position
-# readout (token_indices_to_pool / setwise scoring); reward and embedding models
-# pool a single vector (last-token / CLS / mean) and ignore the readout positions.
-# Keep in sync with the models that call layers.pooler.score_and_pool.
+# score_and_pool (per-position pooling); only these support setwise readout
+# (token_indices_to_pool). Keep in sync with callers of layers.pooler.score_and_pool.
 _score_and_pool_archs = [
     "LlamaForSequenceClassification",
     "Qwen2ForSequenceClassification",

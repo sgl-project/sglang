@@ -123,10 +123,8 @@ def pool_at_positions(
 ) -> List[torch.Tensor]:
     """Pool a tensor exactly AT the given token positions for every request.
 
-    Setwise scoring reads the score head at each candidate's trailing anchor
-    token, so — unlike ``pool_at_delimiter_positions`` (which pools at
-    delimiter - 1) — this pools at the position itself with no offset shift and
-    no discarded first entry.
+    Unlike ``pool_at_delimiter_positions`` (which pools at delimiter - 1), this
+    pools at the position itself with no offset shift and no discarded entry.
 
     Args:
         data: 2-D tensor [total_tokens, dim] — hidden states or logits.
@@ -182,10 +180,8 @@ def score_and_pool(
         forward_batch.token_indices_to_pool is not None
         and forward_batch.is_prefill_only
     ):
-        # Multi-position pooling readout: pool the head AT each requested position
-        # (no -1 shift, no discarded boundary row). Setwise scoring uses this to
-        # read the score head at each candidate's trailing anchor token. Concat to
-        # call the head once, then split back per request.
+        # Setwise readout: pool the head AT each requested position (no -1 shift,
+        # no discarded boundary row). Concat to call the head once, then split.
         per_request_phs = pool_at_positions(
             hidden_states,
             forward_batch.token_indices_to_pool,

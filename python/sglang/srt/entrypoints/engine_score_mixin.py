@@ -54,8 +54,8 @@ class EngineScoreMixin:
 
         Setwise scoring is expressed via ``score_extraction_token_id``: pass a single
         item containing the whole candidate block with one extraction token per
-        candidate, and the classification head is pooled AT those positions, so
-        ``scores`` becomes the ``[N x num_labels]`` per-candidate matrix.
+        candidate, and the head is pooled AT those positions, so ``scores`` becomes
+        the ``[N x num_labels]`` per-candidate matrix.
 
         Args:
             query: The query text or pre-tokenized token IDs.
@@ -71,8 +71,7 @@ class EngineScoreMixin:
                 head at every occurrence of this token per sequence instead of the last
                 token; ``scores`` becomes nested — one ``[Ni x num_labels]`` matrix per
                 item (``len(scores) == len(items)``), where ``Ni`` is the number of
-                extraction tokens (candidates) in item ``i``. This is how setwise
-                scoring is expressed.
+                extraction tokens (candidates) in item ``i``.
             return_pooled_hidden_states: Whether to include raw pooled transformer
                 hidden states (before the task head) in the result. Only supported
                 for non-generation models (SequenceClassification, RewardModel).

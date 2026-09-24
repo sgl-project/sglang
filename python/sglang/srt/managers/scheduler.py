@@ -3952,11 +3952,9 @@ class Scheduler(
             if self.enable_lora and not self.can_schedule_lora_req(req, running_loras):
                 continue
 
-            # Partition prefill batches by pooling mode: a forward batch runs one
-            # pooling mode, so multi-position pooling-readout requests (setwise
-            # scoring, carrying token_indices_to_pool) cannot share a batch with
-            # standard last-token requests. Admit only the mode of the batch's
-            # first request; the other mode stays queued for the next batch.
+            # A forward batch runs one pooling mode, so setwise readout requests
+            # (token_indices_to_pool) cannot share a batch with last-token ones.
+            # Admit only the first request's mode; the other stays queued.
             if adder.can_run_list and (
                 (req.token_indices_to_pool is not None)
                 != (adder.can_run_list[0].token_indices_to_pool is not None)
