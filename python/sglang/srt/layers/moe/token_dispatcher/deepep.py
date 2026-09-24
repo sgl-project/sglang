@@ -45,6 +45,7 @@ _use_zbal = _is_npu and envs.SGLANG_ZBAL_LOCAL_MEM_SIZE.get() > 0
 if TYPE_CHECKING:
     from sglang.srt.batch_overlap.single_batch_overlap import CombineOverlapArgs
 
+_deepep_import_error: Optional[BaseException] = None
 try:
     if _use_zbal:
         from zbal.zbal.deepep_adaptor import Config
@@ -58,8 +59,14 @@ try:
         )
 
     use_deepep = True
-except ImportError:
+except Exception as exc:
+    # deep_ep runs host checks at import time (NCCL runtime match, CUDA home
+    # lookup, JIT init) that raise AssertionError/OSError/RuntimeError, not
+    # only ImportError. This module is imported by every server process, so a
+    # failed check must not stop models that never use DeepEP; the error is
+    # raised when a DeepEP dispatcher is created.
     use_deepep = False
+    _deepep_import_error = exc
 
 from enum import Enum, IntEnum, auto
 
@@ -375,9 +382,14 @@ class _DeepEPDispatcherImplBase:
     ):
         if not use_deepep:
             raise ImportError(
-                "DeepEP is not installed. Please install DeepEP package from "
+                "DeepEP is not available. Please install DeepEP package from "
                 "https://github.com/deepseek-ai/deepep."
-            )
+                + (
+                    f" Original import error: {_deepep_import_error}"
+                    if _deepep_import_error is not None
+                    else ""
+                )
+            ) from _deepep_import_error
 
         self.group = group
         self.router_topk = router_topk
