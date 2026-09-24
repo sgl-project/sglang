@@ -361,26 +361,12 @@ class SWAComponent(TreeComponent):
 
         n_swa = 0
         swa_host_hit = 0
-        resync_full_chunks: list[torch.Tensor] = []
-        resync_swa_chunks: list[torch.Tensor] = []
         node = result.best_match_node
         root = self.tree_core.root_node
         while node is not root and n_swa < self.sliding_window_size:
             cd = node.component_data[ct]
             if cd.value is not None:
                 n_swa += len(cd.value)
-                # The attention resolves a reused window's SWA pages from the
-                # allocator's global full -> swa table, but a prefix-cache hit
-                # restores only the Full rows. Re-point that table for this window
-                # from the tree's stored SWA value, exactly as
-                # RebuildFullToSWAMapping does after load-back. Must run per hit:
-                # the table is global and mutable. No-op where full and SWA share
-                # one id space (unified), and skipped for a request ring, whose
-                # window is re-prefilled instead.
-                full_value = node.component_data[BASE_COMPONENT_TYPE].value
-                if full_value is not None and len(full_value) == len(cd.value):
-                    resync_full_chunks.append(full_value)
-                    resync_swa_chunks.append(cd.value)
             elif cd.host_value is not None:
                 # TODO(hzh): load_back may currently restore a full host-tombstone
                 # segment whose length exceeds sliding_window_size. Once
@@ -394,17 +380,48 @@ class SWAComponent(TreeComponent):
                 break
             node = node.parent
 
-        if resync_full_chunks:
-            alloc = self.cache.token_to_kv_pool_allocator
-            if not is_swa_req_ring(alloc):
-                alloc.set_full_to_swa_mapping(
-                    torch.cat(resync_full_chunks), torch.cat(resync_swa_chunks)
-                )
-
         return result._replace(
             swa_host_hit_length=max(result.swa_host_hit_length, swa_host_hit),
             swa_branching_seqlen=branching_seqlen,
         )
+
+    def resync_window_full_to_swa_mapping(self, node: UnifiedTreeNode) -> None:
+        """Re-point the allocator's global full -> swa table for the reused window.
+
+        A prefix-cache hit restores only the Full req_to_token rows, while
+        attention resolves the window's SWA pages from the allocator-global
+        table -- which is mutable and may have been cleared or rebound since the
+        node was written. Call after the window is locked (cache_unfinished_req)
+        so the entries stay valid for the request's lifetime, and go through the
+        action path so the mutation stays on the audited call, not on every
+        (possibly discarded) match.
+        """
+        alloc = self.cache.token_to_kv_pool_allocator
+        if is_swa_req_ring(alloc):
+            return
+        ct = self.component_type
+        root = self.tree_core.root_node
+        full_chunks: list[torch.Tensor] = []
+        swa_chunks: list[torch.Tensor] = []
+        n_swa = 0
+        while node is not root and n_swa < self.sliding_window_size:
+            cd = node.component_data[ct]
+            if cd.value is None:
+                break
+            full_value = node.component_data[BASE_COMPONENT_TYPE].value
+            assert full_value is not None and len(full_value) == len(cd.value), (
+                "swa node value is not element-wise aligned with its full value"
+            )
+            full_chunks.append(full_value)
+            swa_chunks.append(cd.value)
+            n_swa += len(cd.value)
+            node = node.parent
+        if full_chunks:
+            self.apply_component_action(
+                RebuildFullToSWAMapping(
+                    full_indices=full_chunks, swa_indices=swa_chunks
+                )
+            )
 
     def update_component_on_insert_overlap(
         self,
