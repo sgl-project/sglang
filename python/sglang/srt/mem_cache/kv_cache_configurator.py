@@ -1661,7 +1661,7 @@ class KVCacheConfigurator:
         common = {
             "page_size": get_schedule().page_size,
             "device": self.device,
-            "enable_memory_saver": False,
+            "enable_memory_saver": get_exec().features.enable_memory_saver,
         }
         full_pool_kwargs = {
             **common,
