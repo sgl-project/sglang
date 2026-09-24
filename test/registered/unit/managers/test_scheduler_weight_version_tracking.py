@@ -227,8 +227,10 @@ class TestRecordWeightVersionAfterUpdate(_WeightUpdaterManagerTestBase):
         self.assertEqual(self.recorded, ["v2"])
 
     def test_successful_ipc_update_records_the_version(self):
-        """The checkpoint-engine IPC refit records the version like every other path."""
-        output = self._manager(_runner()).update_weights_from_ipc(_request())
+        """The checkpoint-engine IPC refit runs outside a session and records at once."""
+        output = self._manager(_runner(), session=False).update_weights_from_ipc(
+            _request()
+        )
 
         self.assertTrue(output.success)
         self.assertEqual(self.recorded, ["v2"])
