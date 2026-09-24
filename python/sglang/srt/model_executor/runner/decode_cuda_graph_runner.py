@@ -298,7 +298,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         )
 
         # In-graph metadata prep: shared buffers -> in-graph private data
-        self.in_graph_metadata_prep_done: Optional[torch.cuda.Event] = None
+        self.in_graph_metadata_prep_done: Optional[torch.Event] = None
         # SGLANG_OPT_DSV41_DSPARK_SKIP_PREFILLED_INPUTS: the (input_ids, positions)
         # tensors the plan-time load already copied into this runner's buffers.
         self._prefilled_inputs: Optional[tuple] = None
