@@ -34,7 +34,7 @@ from sglang.srt.configs.model_config import (
     is_minimax_sparse,
 )
 from sglang.srt.environ import envs
-from sglang.srt.mem_cache.allocation_sizing import get_alloc_len_per_decode
+from sglang.srt.mem_cache.allocation_sizing import get_alloc_reserve_per_decode
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
     get_compress_state_ring_size,
     get_compress_state_write_pad,
@@ -864,9 +864,9 @@ def compute_swa_request_cap(*, page_size: int, window: int, attn_dp_size: int) -
             speculative_num_draft_tokens=get_spec().speculative_num_draft_tokens,
         )
     else:
-        # spec-v2: the overlap allocator keeps 2 * alloc_len outstanding
-        # (eagle_utils.eagle_prepare_for_decode: kv_committed_len + 2 * alloc_len).
-        decode_alloc = 2 * get_alloc_len_per_decode()
+        # spec-v2: the overlap allocator keeps the per-decode reserve
+        # outstanding (eagle_utils.eagle_prepare_for_decode).
+        decode_alloc = get_alloc_reserve_per_decode()
     per_request = trailing_tokens + decode_alloc
 
     num_reqs = get_schedule().max_running_requests // attn_dp_size
