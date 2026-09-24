@@ -11,30 +11,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""Declarative model-override registry.
+"""Configuration declarations and model override dispatch.
 
-Model-identity adjustments to the server configuration are DECLARED here and
-appended to the record's declaration stash (gate order, last writer wins).
-Nothing here writes back onto ``ServerArgs``: the record holds the user's raw
-input, and a decision is read through ``resolution_result`` or the published
-config bags — model code never mutates ``ServerArgs`` fields imperatively. The
-one channel that still leaves a field changed is ``declare_direct_writes``,
-which does not perform the write: it captures one an out-of-tree plugin already
-made, and undoing it would surprise the plugin's own reads.
-
-Two declaration forms, keyed on ``hf_config.architectures[0]``:
-
-- ``MODEL_OVERRIDES``: pure-constant cases — ``arch -> {field: value}``.
-- ``@register_model_override(arch)``: derived cases — a callable
-  ``fn(server_args, hf_config) -> dict`` that faithfully carries today's
-  conditional logic. ``server_args`` is pristine and must be treated
-  read-only: the callable returns declarations, it never writes.
+Declarations preserve raw ServerArgs inputs and are applied in order, last
+writer wins. Read them through ``resolution_result`` or published config bags.
+Model providers use ``MODEL_OVERRIDES`` for constants or
+``register_model_override`` for functions returning field-value dictionaries.
 """
 
 from __future__ import annotations
 
-import copy
-import dataclasses
 import json
 import logging
 import math
@@ -43,12 +29,12 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 from sglang.srt.arg_groups import model_override_base
 from sglang.srt.arg_groups.arg_utils import (
     field_names,
+    is_record,
     resolvable_fields,
     with_fallback,
 )
 
-# Re-exported for the callers that already import these names from here; the
-# declarations under ``model_overrides/`` import them from the base directly.
+# Compatibility re-exports; model providers import model_override_base directly.
 from sglang.srt.arg_groups.model_override_base import (  # noqa: F401
     _MODEL_OVERRIDE_FNS,
     _PREDICATE_OVERRIDE_FNS,
@@ -70,6 +56,7 @@ from sglang.srt.arg_groups.model_override_base import (  # noqa: F401
     resolving_view,
     use_mla_backend,
 )
+from sglang.srt.arg_groups.prefill_buffer_ceiling import prefill_buffer_ceiling_of
 
 logger = logging.getLogger(__name__)
 from sglang.srt.environ import envs
@@ -80,6 +67,7 @@ from sglang.srt.runtime_context import (
 )
 from sglang.srt.utils.common import (
     get_quantization_config,
+    is_fi_a2a_supported,
     is_gfx95_supported,
     xpu_has_xmx_support,
 )
@@ -100,25 +88,10 @@ def register_post_process(fn: Callable[..., dict]) -> Callable[..., dict]:
 
 
 def run_post_process_pass(server_args: Any, fn: Callable[..., dict]) -> None:
-    """Invoke one pass at its legacy handler slot.
+    """Run a pass against the current resolution snapshot and record its decisions.
 
-    Evaluates the pass on the resolving state (a read-only view with the
-    accumulated declarations overlaid from the stash) and appends its
-    declaration to the stash, which is what the config bags are projected from.
-    The fields stay untouched.
-
-    A slot that runs after resolution -- ``check_server_args`` hosts one -- lands
-    in the same stash, which publish projects from later, so it needs no field
-    write either. After *publish* there is no such later projection: the stash
-    would grow an entry nothing reads.
-
-    So what is refused is the *declaration*, not the record. A pass that returns
-    an empty dict is a validation, and it may run on the published instance --
-    it has to, because ``Engine(server_args=sa)`` after ``Engine.shutdown()``
-    re-runs ``check_server_args`` on the very instance the context still holds.
-    A pass that returns a non-empty dict there is refused, as
-    ``declare_late_resolution`` is -- post-publish changes go to the bags through
-    ``get_context().override(...)``.
+    After publication, only validation passes returning an empty dict are allowed;
+    Engine restart may re-run those validations on the same record.
     """
 
     declared = fn(ResolvedView(server_args, overlay=_declaration_overlay(server_args)))
@@ -128,91 +101,31 @@ def run_post_process_pass(server_args: Any, fn: Callable[..., dict]) -> None:
             f"got {type(declared).__name__}"
         )
     if declared:
-        # Refused only once there is something to record. A pass that declares
-        # nothing is a validation, and `check_server_args` runs those again on
-        # a rebuild: `Engine(server_args=sa)` after `Engine.shutdown()` hands
-        # back the same instance while the context still holds it, and
-        # refusing on identity alone would fail that launch.
-        try:
-            published = get_context().server_args
-        except ValueError:
-            published = None
-        if published is server_args:
-            raise ValueError(
-                f"run_post_process_pass({fn.__qualname__!r}) declared "
-                f"{sorted(declared)} on the published config; the stash is "
-                "projected at publish and never again, so this would be a "
-                "silent no-op -- post-publish changes go to the bags via "
-                "get_context().override(...)"
-            )
-        entry = (fn.__qualname__, dict(declared))
-        stash = getattr(server_args, "_resolved_overrides", None)
-        if stash is None:
-            # Handlers hosting pass slots may be invoked directly on fixtures
-            # that never ran the monolith dispatch (which owns the stash);
-            # create it lazily. Real publishes always pass through the
-            # dispatch first — the dispatch ASSIGNS the stash, so pass slots
-            # must sit at or after it in __post_init__ order.
-            stash = server_args._resolved_overrides = []
-        stash.append(entry)
-        validate_declarations(server_args, [entry])
+        declare_resolution(server_args, fn.__qualname__, **declared)
+        validate_declarations(server_args, [(fn.__qualname__, dict(declared))])
 
 
 def declare_resolution(server_args: Any, source: str, **fields: Any) -> None:
-    """Record a resolution write in the declaration stash.
+    """Append field decisions without changing raw inputs.
 
-    The stash *is* the resolution result: the bags are projected from it,
-    `resolution_result` answers from it, and no field is written. A resolver
-    reading a field another resolver may have decided must read `resolving_view`
-    (or `resolved_view(server_args)`), which
-    `test_resolution_reads_the_declarations` pins.
-
-    For resolvers inside ``__post_init__``; launcher-stage resolution goes
-    through ``declare_late_resolution``. A name that is not a field is rejected
-    here rather than becoming an attribute nothing reads.
+    Reject unknown fields and declarations on the published record. After
+    publication, use ``RuntimeContext.override`` to update config bags.
     """
-    if dataclasses.is_dataclass(type(server_args)):
+    if is_record(server_args):
         unknown = sorted(set(fields) - field_names(type(server_args)))
         if unknown:
             raise AttributeError(f"{source}: {unknown} are not ServerArgs fields")
-    stash = getattr(server_args, "_resolved_overrides", None)
-    if stash is None:
-        stash = []
-        server_args._resolved_overrides = stash
-    stash.append((source, dict(fields)))
-
-
-def declare_late_resolution(server_args: Any, source: str, **fields: Any) -> None:
-    """Resolve fields on a config that is **not published yet**.
-
-    A few resolution rules cannot run inside ``__post_init__``: LoRA
-    normalization and the auto-parser detection need the launcher's validation
-    stage (and, for the parsers, a tokenizer / chat-template load). They still
-    belong to the resolution pipeline — they decide what the process will run
-    with — so their decision goes to the stash like any other, and the record
-    keeps what the caller passed. Every holder of that instance reads the
-    decision the same way the rest of the pipeline does: the bags it publishes,
-    or ``resolution_result``, both of which survive the pickle to a child.
-
-    Refuses to touch the published instance: after publish the bags exist and a
-    field write would desync them, which is what ``get_context().override`` is
-    for.
-    """
-
     try:
         published = get_context().server_args
     except ValueError:
         published = None
     if published is server_args:
         raise ValueError(
-            f"declare_late_resolution({source!r}) called on the published config; "
-            "post-publish changes go to the bags via get_context().override(...)"
+            f"{source}: declared on the published config; the stash is "
+            "projected at publish and never again, so this would be a silent "
+            "no-op -- post-publish changes go to the bags via "
+            "get_context().override(...)"
         )
-    log = getattr(server_args, "_runtime_mutations", None)
-    if log is None:
-        log = []
-        server_args._runtime_mutations = log
-    log.append((source, dict(fields)))
     stash = getattr(server_args, "_resolved_overrides", None)
     if stash is None:
         stash = []
@@ -220,77 +133,50 @@ def declare_late_resolution(server_args: Any, source: str, **fields: Any) -> Non
     stash.append((source, dict(fields)))
 
 
-def declare_direct_writes(
+class _ForeignDefaults:
+    """Capture plugin writes while reading through the current resolving view."""
+
+    __slots__ = ("_cfg", "_written")
+
+    def __init__(self, server_args: Any):
+        object.__setattr__(self, "_cfg", resolving_view(server_args))
+        object.__setattr__(self, "_written", {})
+
+    def __getattr__(self, name: str) -> Any:
+        written = object.__getattribute__(self, "_written")
+        if name in written:
+            return written[name]
+        return getattr(object.__getattribute__(self, "_cfg"), name)
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        object.__getattribute__(self, "_written")[name] = value
+
+
+def record_foreign_defaults(
     server_args: Any, source: str, resolve: Callable[[Any], Any]
 ) -> Any:
-    """Run a resolver that writes the fields directly, and declare what it moved.
+    """Run a plugin resolver, declare its field writes, and return its result.
 
-    Returns whatever the resolver returned, so a provider with a return value
-    can go through the same capture.
-
-    Out-of-tree platform plugins are handed the record and set fields on it.
-    Their implementations live outside this tree, so they cannot be converted
-    by editing the resolver; and the raw snapshot is taken before the pipeline
-    starts, so a plugin's default is neither declared nor raw. The write itself
-    stays: this captures it into the stash so the projection and the bags carry
-    it, but reverting the field would break the plugin's own reads of what it
-    just set. It is the only field a record still carries from resolution.
-
-    Rebinding is what the diff sees, and rebinding is all it needs to see: a
-    plugin that mutates a value in place reaches the projection anyway, because
-    the raw snapshot and the stash entries hold the same object it mutated.
-
-    A stand-in record (tests drive the hooks with a plain namespace) has no
-    fields to diff and no projection to feed, so the resolver runs uncaptured.
+    Ignore non-field writes. Non-record test objects are passed through directly.
     """
-    if not dataclasses.is_dataclass(server_args):
+    if not is_record(server_args):
         return resolve(server_args)
-    before = {
-        field.name: getattr(server_args, field.name)
-        for field in dataclasses.fields(server_args)
+    recorder = _ForeignDefaults(server_args)
+    result = resolve(recorder)
+    written = {
+        name: value
+        for name, value in object.__getattribute__(recorder, "_written").items()
+        if name in field_names(type(server_args))
     }
-    already = len(getattr(server_args, "_resolved_overrides", None) or ())
-    # The one place the input seal comes off. The plugin writes the record;
-    # the diff below captures what it moved into the stash so the projection
-    # and the bags carry it.
-    from sglang.srt.server_args import record_writable
-
-    with record_writable(server_args):
-        result = resolve(server_args)
-    stash = getattr(server_args, "_resolved_overrides", None)
-    if stash is None:
-        stash = []
-        server_args._resolved_overrides = stash
-    # A resolver reached this way can also declare properly -- the in-tree
-    # implementations of these hooks do. Those fields are already explained, and
-    # recording them again would attribute them to the wrapper and bury an
-    # actual direct write among the echoes.
-    declared = {name for _source, fields in stash[already:] for name in fields}
-    changed = {
-        name: getattr(server_args, name)
-        for name, previous in before.items()
-        if name not in declared and getattr(server_args, name) is not previous
-    }
-    if changed:
-        stash.append((source, changed))
+    if written:
+        declare_resolution(server_args, source, **written)
     return result
 
 
 def resolution_result(server_args: Any, field: str, default: Any = None) -> Any:
-    """What resolution decided for ``field``: the declaration if there is one,
-    otherwise what the caller supplied, otherwise the field's declared
-    fallback.
+    """Read the last declaration, then raw input, then the declared fallback.
 
-    The fallback is last because it is what the field means when nobody said
-    anything -- an operator who types a value and a pass that decides one both
-    sit above it. It is read from the declaration rather than filled in by a
-    pass, so there is no slot to place and no second call to make idempotent.
-
-    This is what the config projection reads. Reading the field instead would
-    work whatever the caller passed onto the record -- and
-    the point of declaring is that they will not, so the projection must not
-    depend on it. A config that never ran the pipeline (a mock, a partial
-    fixture) carries no raw snapshot; its fields are all it has.
+    Records without a raw-input snapshot fall back to their current fields.
     """
     for _source, declared in reversed(
         getattr(server_args, "_resolved_overrides", None) or ()
@@ -303,47 +189,8 @@ def resolution_result(server_args: Any, field: str, default: Any = None) -> Any:
     return with_fallback(type(server_args), field, getattr(server_args, field, default))
 
 
-def resolution_projection(server_args: Any) -> Dict[str, Any]:
-    """Every field's resolved value, nested dataclasses expanded.
-
-    The whole-object shape of ``resolution_result``, for the exits that hand out
-    the entire configuration (``/server_info``, the gRPC and engine readbacks).
-    They used ``dataclasses.asdict``, which reads the fields -- the operator's
-    input, not what resolution decided. Field values only: the private resolution
-    bookkeeping and the ``model_config`` memo that a ``vars()`` dump carried into
-    the readback are not configuration.
-    """
-    return {
-        field.name: _plain(resolution_result(server_args, field.name))
-        for field in dataclasses.fields(server_args)
-    }
-
-
-def _plain(value: Any) -> Any:
-    """``dataclasses.asdict``'s conversion, applied to one value: dataclasses
-    become dicts, containers recurse, everything else is deep-copied (a caller
-    mutating the dump must not reach the live configuration)."""
-    if dataclasses.is_dataclass(value) and not isinstance(value, type):
-        return {
-            field.name: _plain(getattr(value, field.name))
-            for field in dataclasses.fields(value)
-        }
-    if isinstance(value, tuple) and hasattr(value, "_fields"):  # namedtuple
-        return type(value)(*(_plain(item) for item in value))
-    if isinstance(value, (list, tuple)):
-        return type(value)(_plain(item) for item in value)
-    if isinstance(value, dict):
-        return type(value)((_plain(k), _plain(v)) for k, v in value.items())
-    return copy.deepcopy(value)
-
-
 def pre_capture_activation_reserve_mb_of(cfg: Any, gpu_mem: Optional[float]) -> float:
-    """The activation working-set reserve held back before cuda-graph capture.
-
-    The config-shaped half of the pair; `runtime_context` carries the
-    published-bag half, and `TestDerivedPredicatesAgreeAcrossTiers` pins the
-    two equal.
-    """
+    """Return the activation reserve in MB before CUDA graph capture."""
     if cfg.disaggregation_mode == "decode":
         running_requests = (
             cfg.max_running_requests or cfg.cuda_graph_config.decode.max_bs or 1
@@ -453,13 +300,6 @@ def collect_model_override_declarations(
     return declarations
 
 
-# ---------------------------------------------------------------------------
-# Derived per-family declarations (faithful ports of legacy arch branches).
-# Callables read the PRISTINE server_args, never write; logging is kept
-# verbatim from the legacy branch for operator-visible fidelity.
-# ---------------------------------------------------------------------------
-
-
 # Importing the package is what registers the per-model declarations.
 import sglang.srt.arg_groups.model_overrides  # noqa: F401
 
@@ -501,15 +341,14 @@ def _step3p_overrides(server_args: Any, hf_config: Any) -> dict:
 # ---------------------------------------------------------------------------
 
 
-# Architectures whose monolith branch routes through the mamba radix cache
-# handling (hybrid linear-attention models). Keep in sync with the branch
-# guards in _handle_model_specific_adjustments.
+# Keep this hybrid-model set in sync with model_hook.handle_model_specific_adjustments.
 _MAMBA_RADIX_CACHE_ARCHS = frozenset(
     {
         "KimiLinearForCausalLM",
         "KimiK3ForConditionalGeneration",
         "BailingMoeV2_5ForCausalLM",
         "BailingMoeV3ForCausalLM",
+        "BailingMoeV3VLForConditionalGeneration",
         "Qwen3NextForCausalLM",
         "Qwen3_5MoeForConditionalGeneration",
         "InternS2PreviewForConditionalGeneration",
@@ -519,9 +358,11 @@ _MAMBA_RADIX_CACHE_ARCHS = frozenset(
         # Qwen3.8-2.4T-A95B ships as Qwen3_5MoeForCausalLM.
         "Qwen3_5MoeForCausalLM",
         "Qwen3_5ForCausalLM",
+        "Qwen4ExpForConditionalGeneration",
         "MiniCPMV4_6ForConditionalGeneration",
         "NemotronHForCausalLM",
         "NemotronHPuzzleForCausalLM",
+        "NemotronH_Omni_Reasoning_V3",
         "FalconH1ForCausalLM",
         "JetNemotronForCausalLM",
         "JetVLMForConditionalGeneration",
@@ -544,19 +385,26 @@ _MAMBA_EXTRA_BUFFER_ARCHS = frozenset(
         "Qwen3_5MoeForCausalLM",
         "Qwen3_5ForCausalLM",
         "Qwen3NextForCausalLM",
+        "Qwen4ExpForConditionalGeneration",
         "InternS2PreviewForConditionalGeneration",
         "MiniCPMV4_6ForConditionalGeneration",
         "BailingMoeV2_5ForCausalLM",
         "BailingMoeV3ForCausalLM",
+        "BailingMoeV3VLForConditionalGeneration",
         "FalconH1ForCausalLM",
         "GraniteMoeHybridForCausalLM",
         "Glm5NextForConditionalGeneration",
         "NemotronHForCausalLM",
         "NemotronHPuzzleForCausalLM",
+        "NemotronH_Omni_Reasoning_V3",
         # KDA-based: same MambaPool ping-pong machinery as GDN; requires the
         # KDA backend's track-snapshot writes (decode + extend) so donated
         # slots hold real states for prefix-cache restores.
         "KimiK3ForConditionalGeneration",
+        # Inkling asserts enable_mamba_extra_buffer and _inkling_overrides pins it,
+        # so validate_mamba_extra_buffer runs for these archs and must accept them.
+        "InklingForConditionalGeneration",
+        "InklingForConditionalGenerationMTP",
     }
 )
 
@@ -564,6 +412,8 @@ _MAMBA_EXTRA_BUFFER_ARCHS = frozenset(
 def supports_mamba_cache_extra_buffer(view: Any, model_arch: str) -> bool:
     """Whether ``model_arch`` supports the extra_buffer strategy on the
     configured linear-attention backend (pure read)."""
+    if get_platform().is_xpu:
+        return False
     if model_arch in _MAMBA_EXTRA_BUFFER_ARCHS:
         return view.linear_attn_backend == "triton"
     return False
@@ -571,15 +421,7 @@ def supports_mamba_cache_extra_buffer(view: Any, model_arch: str) -> bool:
 
 @register_post_process
 def _mamba_radix_cache_resolution(view: Any) -> dict:
-    """Resolve the hybrid-mamba radix cache fields (pure).
-
-    Slot pass: invoked at each legacy ``_handle_mamba_radix_cache`` slot —
-    the hybrid-spec call at the head of the monolith and the per-arch branch
-    calls — where it reads the mid-resolution ``page_size`` /
-    ``disable_overlap_schedule`` exactly as the legacy helper did. The arch
-    guard replicates the union of the legacy call-site guards so the pass is
-    self-sufficient in the end-state pass list.
-    """
+    """Resolve hybrid-Mamba cache settings using the current page size and overlap policy."""
     from sglang.srt.configs.linear_attn_model_registry import (
         get_linear_attn_spec_by_arch,
     )
@@ -616,10 +458,7 @@ def _mamba_radix_cache_resolution(view: Any) -> dict:
 
 @register_post_process
 def _dsa_kv_cache_dtype_default(view: Any) -> dict:
-    """Slot pass in the DSA arm, ordered before the split-backend
-    resolution: default the kv-cache dtype from the device capability
-    (Blackwell FP8, Hopper bf16) and normalize the bf16 alias. Reads the
-    PRISTINE dsa split backends (their resolution runs after this pass)."""
+    """Default DSA KV-cache dtype before resolving split attention backends."""
     from sglang.srt.configs.model_config import is_deepseek_dsa
 
     hf_config = model_config_of(view).hf_config
@@ -677,6 +516,35 @@ def _dsa_kv_cache_dtype_default(view: Any) -> dict:
     return {}
 
 
+def _check_dsa_backend_constraints(
+    kv_cache_dtype: str,
+    prefill_backend: Optional[str],
+    decode_backend: Optional[str],
+    *,
+    hip: bool,
+) -> None:
+    """Validate DSA backend / platform / kv-cache-dtype constraints."""
+    chosen = {prefill_backend, decode_backend}
+
+    rocm_only = {"triton"} & chosen
+    if not hip and rocm_only:
+        raise ValueError(
+            f"The {'/'.join(sorted(rocm_only))} DSA backend is only supported on "
+            "ROCm/HIP. Pick an alternative DSA backend for CUDA "
+            "(flashmla_kv on Hopper, trtllm on Blackwell)."
+        )
+
+    cuda_fp8_unsupported = {"tilelang"} & chosen
+    if not hip and kv_cache_dtype == "fp8_e4m3" and cuda_fp8_unsupported:
+        raise ValueError(
+            f"The {'/'.join(sorted(cuda_fp8_unsupported))} DSA prefill/decode kernels "
+            "only support an fp8_e4m3 KV cache on ROCm/HIP; on CUDA they require "
+            "a bfloat16 KV cache. Use --kv-cache-dtype bfloat16, or keep "
+            "--kv-cache-dtype fp8_e4m3 and pick an fp8-capable DSA backend "
+            "(flashmla_kv on Hopper, trtllm on Blackwell)."
+        )
+
+
 def _check_tilelang_dsa_fp8_kv(
     kv_cache_dtype: str,
     prefill_backend: Optional[str],
@@ -684,27 +552,18 @@ def _check_tilelang_dsa_fp8_kv(
     *,
     hip: bool,
 ) -> None:
-    """tilelang's fp8 KV path is ROCm-only; the CUDA kernel hardcodes bfloat16.
-    Reject here instead of crashing at decode CUDA-graph capture."""
-    if (
-        not hip
-        and kv_cache_dtype == "fp8_e4m3"
-        and "tilelang" in {prefill_backend, decode_backend}
-    ):
-        raise ValueError(
-            "The tilelang DSA prefill/decode kernels only support an fp8_e4m3 KV "
-            "cache on ROCm/HIP; on CUDA they require a bfloat16 KV cache. Use "
-            "--kv-cache-dtype bfloat16 with the tilelang backend, or keep "
-            "--kv-cache-dtype fp8_e4m3 and pick an fp8-capable DSA backend "
-            "(flashmla_kv on Hopper, trtllm on Blackwell)."
-        )
+    """Backward-compatible entry point for the TileLang DSA validation."""
+    _check_dsa_backend_constraints(
+        kv_cache_dtype, prefill_backend, decode_backend, hip=hip
+    )
 
 
 @register_post_process
 def _dsa_split_backend_resolution(view: Any) -> dict:
-    """Slot pass in the DSA arm: default the DSA prefill/decode split
-    backends from the mid-resolution kv-cache dtype and the device
-    capability. The hisparse arm takes precedence under --enable-hisparse."""
+    """Resolve DSA split backends from KV-cache dtype and device capability.
+
+    HiSparse settings take precedence when enabled.
+    """
     from sglang.srt.configs.model_config import is_deepseek_dsa
 
     hf_config = model_config_of(view).hf_config
@@ -791,15 +650,23 @@ def _dsa_split_backend_resolution(view: Any) -> dict:
             declared["dsa_decode_backend"] = backend
         prefill = declared.get("dsa_prefill_backend", view.dsa_prefill_backend)
         decode = declared.get("dsa_decode_backend", view.dsa_decode_backend)
+        # The hisparse allow-list in hisparse_hook is platform- but not
+        # dtype-aware, so an explicitly requested backend still has to clear the
+        # shared backend/kv-cache-dtype rules before this arm returns early.
+        _check_dsa_backend_constraints(
+            kv_cache_dtype, prefill, decode, hip=get_platform().is_hip
+        )
         logger.warning(
             f"HiSparse enabled ({kv_cache_dtype}): using DSA backends "
             f"prefill={prefill}, decode={decode}."
         )
         return declared
 
-    if not user_set_prefill and not user_set_decode and get_platform().is_hip:
-        declared["dsa_prefill_backend"] = "tilelang"
-        declared["dsa_decode_backend"] = "tilelang"
+    if get_platform().is_hip:
+        if not user_set_prefill:
+            declared["dsa_prefill_backend"] = "triton"
+        if not user_set_decode:
+            declared["dsa_decode_backend"] = "triton"
     elif kv_cache_dtype == "fp8_e4m3":
         # Blackwell FP8 defaults to trtllm; Hopper FP8 to flashmla_kv.
         default = "trtllm" if major >= 10 else "flashmla_kv"
@@ -816,7 +683,7 @@ def _dsa_split_backend_resolution(view: Any) -> dict:
 
     prefill = declared.get("dsa_prefill_backend", view.dsa_prefill_backend)
     decode = declared.get("dsa_decode_backend", view.dsa_decode_backend)
-    _check_tilelang_dsa_fp8_kv(
+    _check_dsa_backend_constraints(
         kv_cache_dtype, prefill, decode, hip=get_platform().is_hip
     )
     logger.warning(
@@ -847,10 +714,7 @@ _DEEPSEEK_FAMILY_ARCHS = frozenset(
 
 @register_post_process
 def _deepseek_moe_quant_resolution(view: Any) -> dict:
-    """Slot pass invoked from inside the DeepSeek arch branch ("Set moe
-    backend for DeepSeek"), NOT a dispatch-time declaration: the DSA
-    kv-cache-dtype default earlier in the branch must read the PRISTINE
-    quantization, so this resolution has to stay at its legacy slot."""
+    """Resolve DeepSeek MoE quantization after DSA has read the input quantization."""
     hf_config = model_config_of(view).hf_config
     model_arch = hf_config.architectures[0]
     if model_arch not in _DEEPSEEK_FAMILY_ARCHS:
@@ -933,10 +797,7 @@ def _deepseek_moe_quant_resolution(view: Any) -> dict:
 
 @register_post_process
 def _deepseek_spec_moe_resolution(view: Any) -> dict:
-    """Slot pass at the DeepSeek branch's HIP arm: draft (nextn) spec-MoE
-    backends for the DeepSeek fp4 checkpoint. Reads the mid-resolution
-    quantization (after _deepseek_moe_quant_resolution) and the pre-a2a
-    ep_size, exactly like the legacy in-branch writes."""
+    """Resolve HIP draft MoE backends after quantization and before A2A adjusts EP size."""
 
     hf_config = model_config_of(view).hf_config
     model_arch = hf_config.architectures[0]
@@ -1030,25 +891,35 @@ _FLASHINFER_ALLREDUCE_FUSION_ARCHS = frozenset(
         "Qwen3MoeForCausalLM",
         "Qwen3VLMoeForConditionalGeneration",
         "Qwen3NextForCausalLM",
+        "Qwen4ExpForConditionalGeneration",
         "KimiK25ForConditionalGeneration",
         "Qwen3_5MoeForConditionalGeneration",
         "InternS2PreviewForConditionalGeneration",
         "Qwen3_5ForConditionalGeneration",
         "NemotronHForCausalLM",
         "NemotronHPuzzleForCausalLM",
+        "NemotronH_Omni_Reasoning_V3",
     }
 )
 
 
 @register_post_process
 def _flashinfer_allreduce_fusion_auto_enable(view: Any) -> dict:
-    """Slot pass at the monolith tail: auto-enable FlashInfer AllReduce
-    Fusion on SM90/SM100 for models with explicit support. auto resolves to
-    mnnvl on Blackwell (single- and multi-node) and trtllm on SM90
-    single-node systems. Reads the mid-resolution enable_dp_attention /
-    moe_a2a_backend (after the DeepSeek CP and a2a declarations), exactly
-    like the legacy tail block."""
-    model_arch = model_config_of(view).hf_config.architectures[0]
+    """Enable supported FlashInfer AllReduce fusion after CP and A2A resolution.
+
+    Auto selects MNNVL on Blackwell and TRTLLM on single-node SM90.
+    """
+    hf_config = model_config_of(view).hf_config
+    model_arch = hf_config.architectures[0]
+    # V4.1 TP4 uses the custom push plane for decode and fused MoE finalize.
+    prefer_custom_dsv41 = (
+        getattr(hf_config, "model_type", None) == "deepseek_v41"
+        and getattr(hf_config, "hidden_size", None) == 5120
+        and get_platform().is_blackwell
+        and view.tp_size == 4
+        and view.nnodes == 1
+        and not view.disable_custom_all_reduce
+    )
     if envs.SGLANG_FLASHINFER_MNNVL_CUTEDSL_AR_FUSION.get() and model_arch in {
         "Qwen3_5MoeForCausalLM",
         "Qwen3_5MoeForConditionalGeneration",
@@ -1066,6 +937,7 @@ def _flashinfer_allreduce_fusion_auto_enable(view: Any) -> dict:
     if (
         view.flashinfer_allreduce_fusion_backend is None
         and model_arch in _FLASHINFER_ALLREDUCE_FUSION_ARCHS
+        and not prefer_custom_dsv41
         and (get_platform().is_sm90 or get_platform().is_sm100)
         and view.tp_size > 1
         and not view.enable_dp_attention
@@ -1114,8 +986,7 @@ def _deterministic_sampling_backend(view: Any) -> dict:
 
 
 def _deterministic_is_deepseek_model(view: Any) -> bool:
-    """Faithful copy of the deterministic handler's arch probe (pure read;
-    the handler keeps its own copy for the later deepseek validation)."""
+    """Check the model architecture for deterministic DeepSeek backend selection."""
     from sglang.srt.connector import ConnectorType
     from sglang.srt.utils.common import parse_connector_type
 
@@ -1202,10 +1073,7 @@ def _attention_backend_default(view: Any) -> dict:
 
 @register_post_process
 def _mla_backend_page_constraints(view: Any) -> dict:
-    """Page-size constraints of the MLA/TRTLLM backend family (the raises and
-    the cutedsl prefill fallback stay in the handler; only the page snaps are
-    declared). The snaps chain on a local value exactly as the legacy blocks
-    chained on self.page_size."""
+    """Resolve MLA/TRTLLM page-size constraints, chaining adjustments on the local value."""
     page_size = view.page_size
     if (
         view.attention_backend == "flashmla"
@@ -1215,14 +1083,6 @@ def _mla_backend_page_constraints(view: Any) -> dict:
             "FlashMLA only supports a page_size of 64, change page_size to 64."
         )
         page_size = 64
-    if (
-        view.attention_backend == "cutlass_mla"
-        or view.decode_attention_backend == "cutlass_mla"
-    ):
-        logger.warning(
-            "Cutlass MLA only supports a page_size of 128, change page_size to 128."
-        )
-        page_size = 128
     if (
         view.attention_backend == "trtllm_mla"
         or view.decode_attention_backend == "trtllm_mla"
@@ -1282,10 +1142,7 @@ def _mla_backend_page_constraints(view: Any) -> dict:
 
 @register_post_process
 def _mla_kv_cache_dtype_checks(view: Any) -> dict:
-    """Read-only validation pass in the attention-backend compatibility
-    handler: the TRT-LLM and tokenspeed MLA backends constrain the resolved
-    kv-cache dtype (declarations never reach the field, so the checks read
-    the view)."""
+    """Validate resolved KV-cache dtype for TRTLLM and tokenspeed MLA backends."""
     if (
         view.attention_backend == "trtllm_mla"
         or view.decode_attention_backend == "trtllm_mla"
@@ -1294,9 +1151,9 @@ def _mla_kv_cache_dtype_checks(view: Any) -> dict:
             raise ValueError(
                 "TRTLLM MLA backend is only supported on Blackwell GPUs (SM100/SM12x). Please use a different backend."
             )
-        if view.kv_cache_dtype not in ["fp8_e4m3", "fp4_e2m1", "bf16", "auto"]:
+        if view.kv_cache_dtype not in ["fp8_e4m3", "bf16", "auto"]:
             raise ValueError(
-                "TensorRT-LLM MLA backend only supports kv-cache-dtype of fp8_e4m3, fp4_e2m1, bf16, or auto."
+                "TensorRT-LLM MLA backend only supports kv-cache-dtype of fp8_e4m3, bf16, or auto."
             )
     if (
         view.attention_backend == "tokenspeed_mla"
@@ -1327,10 +1184,7 @@ def _hisparse_validation(view: Any) -> dict:
 
 @register_post_process
 def _cutedsl_prefill_backend_fill(view: Any) -> dict:
-    """Slot pass in the attention-backend compatibility handler: CuteDSL MLA
-    is decode-only, so validate the combination and default the prefill side
-    to trtllm_mla. The trtllm_mha check that follows at the legacy slot reads
-    the resolved value through the view."""
+    """Validate decode-only CuteDSL MLA and default its prefill backend to trtllm_mla."""
     if not (
         view.attention_backend == "cutedsl_mla"
         or view.decode_attention_backend == "cutedsl_mla"
@@ -1416,36 +1270,18 @@ def _attention_backend_platform_fallbacks(view: Any) -> dict:
 
 @register_post_process
 def _intel_xpu_page_constraint(view: Any) -> dict:
-    _, decode_backend = attention_backends_of(view)
-    if decode_backend == "intel_xpu":
+    prefill_backend, decode_backend = attention_backends_of(view)
+    if "intel_xpu" in (prefill_backend, decode_backend):
+        supported_page_sizes = [64, 128]
+        msg = "Intel XPU attention backend"
         if use_mla_backend(view):
-            supported_page_sizes = [16, 32, 64, 128]
-            msg = "Intel XPU attention backend for MLA Decode"
-        else:
-            supported_page_sizes = [64, 128]
-            msg = "Intel XPU attention backend"
+            supported_page_sizes.extend([16, 32])
+            msg = msg + " for MLA"
         if view.page_size not in supported_page_sizes:
             logger.warning(
                 f"{msg} only supports page_sizes of {supported_page_sizes}, changing page_size from {view.page_size} to 128."
             )
             return {"page_size": 128}
-    return {}
-
-
-@register_post_process
-def _attention_backend_dual_chunk(view: Any) -> dict:
-    if (
-        getattr(model_config_of(view).hf_config, "dual_chunk_attention_config", None)
-        is not None
-    ):
-        if view.attention_backend is None:
-            logger.info("Dual chunk attention is turned on by default.")
-            return {"attention_backend": "dual_chunk_flash_attn"}
-        elif view.attention_backend != "dual_chunk_flash_attn":
-            raise ValueError(
-                "Dual chunk attention is enabled, but attention backend is set to "
-                f"{view.attention_backend}. Please set it to 'dual_chunk_flash_attn'."
-            )
     return {}
 
 
@@ -1483,6 +1319,32 @@ def _data_parallelism_defaults(view: Any) -> dict:
 
 
 @register_post_process
+def _dcp_comm_backend_default(view: Any) -> dict:
+    if view.dcp_comm_backend is not None:
+        return {}
+    if view.dcp_size <= 1:
+        return {"dcp_comm_backend": "ag_rs"}
+    platform = get_platform()
+    if is_fi_a2a_supported(
+        dcp_size=view.dcp_size,
+        tp_size=view.tp_size,
+        pp_size=view.pp_size,
+        nnodes=view.nnodes,
+    ):
+        backend = "fi_a2a"
+    elif platform.is_cuda or platform.is_hip:
+        backend = "a2a"
+    else:
+        backend = "ag_rs"
+    logger.info(
+        "DCP (dcp_size=%d) selects communication backend %r.",
+        view.dcp_size,
+        backend,
+    )
+    return {"dcp_comm_backend": backend}
+
+
+@register_post_process
 def _tp_lm_head_all_to_all_default(view: Any) -> dict:
     """Enable the TP LM-head all-to-all path only for pure-DP decode nodes.
 
@@ -1507,9 +1369,7 @@ def _tp_lm_head_all_to_all_default(view: Any) -> dict:
 
 @register_post_process
 def _dp_lm_head_validation(view: Any) -> dict:
-    """Read-only validation pass: dp-attention is a prerequisite for the
-    dp LM head and the TP LM-head all-to-all path. Reads the mid-resolution
-    values through the view."""
+    """Require DP attention for DP LM head and TP LM-head all-to-all."""
     if view.enable_dp_lm_head:
         assert view.enable_dp_attention, (
             "Please enable dp attention when setting enable_dp_lm_head. "
@@ -1535,10 +1395,7 @@ def _dp_lm_head_validation(view: Any) -> dict:
 
 @register_post_process
 def _moe_runner_backend_quant_constraints(view: Any) -> dict:
-    """The quantization-driven moe_runner_backend resolutions at the head of
-    _handle_moe_kernel_config. The backend-compatibility asserts and the
-    disable_shared_experts_fusion writes (post-publish writers exist for that
-    field) stay in the handler."""
+    """Resolve MoE runner backends from quantization."""
     moe_runner_backend = view.moe_runner_backend
     if view.quantization == "nvfp4_online":
         if not get_platform().is_sm100:
@@ -1571,7 +1428,12 @@ def _moe_runner_backend_quant_constraints(view: Any) -> dict:
         allowed = list(MXFP8_MOE_RUNNER_BACKEND_CHOICES)
         if is_gfx95_mxfp8:
             allowed.append("triton")
-        mxfp8_default = "triton" if is_gfx95_mxfp8 else "flashinfer_trtllm"
+
+        if view.moe_a2a_backend == "flashinfer_megamoe":
+            mxfp8_default = "flashinfer_megamoe"
+        else:
+            mxfp8_default = "triton" if is_gfx95_mxfp8 else "flashinfer_trtllm"
+
         if moe_runner_backend == "auto":
             moe_runner_backend = mxfp8_default
         elif moe_runner_backend not in allowed:
@@ -1598,10 +1460,10 @@ def _moe_runner_backend_quant_constraints(view: Any) -> dict:
 
 @register_post_process
 def _moe_runner_fusion_disable(view: Any) -> dict:
-    """FlashInfer CuteDSL / TRT-LLM / TRT-LLM-routed MoE runners require the
-    shared-experts fusion disabled; declared at the legacy write slots in
-    _handle_moe_kernel_config (before the deprecated cutlass env override, so
-    the runner value observed is the pre-override one)."""
+    """Disable shared-expert fusion for incompatible MoE runners.
+
+    Runs before the deprecated cutlass environment override.
+    """
     runner = view.moe_runner_backend
     if runner == "flashinfer_cutedsl":
         logger.warning(
@@ -1623,9 +1485,7 @@ def _moe_runner_fusion_disable(view: Any) -> dict:
 
 @register_post_process
 def _a2a_fusion_adjustments(view: Any) -> dict:
-    """A2A-backend-driven shared-experts fusion adjustments, declared at the
-    legacy write slots in _handle_a2a_moe: Waterfill requires the
-    fusion enabled; FlashInfer and DeepEP v2 A2A require it disabled."""
+    """Set shared-expert fusion requirements for the selected A2A backend."""
     if view.moe_a2a_backend in ("deepep", "megamoe") and view.enable_waterfill:
         if view.disable_shared_experts_fusion:
             logger.warning(
@@ -1633,7 +1493,7 @@ def _a2a_fusion_adjustments(view: Any) -> dict:
             )
             return {"disable_shared_experts_fusion": False}
         return {}
-    if view.moe_a2a_backend == "flashinfer":
+    if view.moe_a2a_backend in ("flashinfer", "flashinfer_megamoe"):
         logger.warning(
             "Flashinfer MoE A2A is enabled. --disable-shared-experts-fusion is automatically set."
         )
@@ -1654,6 +1514,7 @@ _A2A_EP_SPANNING_BACKENDS = frozenset(
         "nixl",
         "ascend_fuseep",
         "flashinfer",
+        "flashinfer_megamoe",
         "mori",
         "pplx",
         "deepep_v2",
@@ -1722,6 +1583,23 @@ def _gguf_quantization(view: Any) -> dict:
 def _dllm_attention_backend(view: Any) -> dict:
     if view.dllm_algorithm is None:
         return {}
+    from sglang.srt.dllm.algorithm import get_algorithm_cls
+
+    algorithm_cls = get_algorithm_cls(view.dllm_algorithm)
+    if backend := algorithm_cls.required_attention_backend:
+        fields = (
+            "attention_backend",
+            "prefill_attention_backend",
+            "decode_attention_backend",
+        )
+        overrides = {
+            field: backend for field in fields if getattr(view, field, None) != backend
+        }
+        if overrides:
+            logger.warning(
+                "%s requires the %s attention backend", view.dllm_algorithm, backend
+            )
+        return overrides
     if get_platform().is_hip:
         if view.attention_backend not in ["triton", "aiter"]:
             logger.warning(
@@ -1768,8 +1646,7 @@ def _dllm_page_size(view: Any) -> dict:
         )
         return {"page_size": config.block_size}
     if view.page_size > config.block_size:
-        # Legacy scheduler-init fallback, folded into the pass: the page
-        # size must not exceed the dllm block size.
+        # The page size must not exceed the DLLM block size.
         logger.warning(
             "WARNING: "
             f"The page size {view.page_size} should not be larger than dllm block size {config.block_size}."
@@ -1783,13 +1660,10 @@ def validate_declarations(
     server_args: Any,
     declarations: Sequence[Tuple[str, Dict[str, Any]]],
 ) -> None:
-    """Fail-fast whitelist check at declaration time: a registry typo or a
-    not-yet-resolvable field must be rejected at its slot, not only at
-    publish time. Declarations never mutate ``server_args``.
-    """
+    """Reject unknown or non-resolvable fields before publication."""
     # Non-dataclass fixtures carry no Arg metadata (mirrors the
     # resolvable_fields escape); only real ServerArgs is validated.
-    if not dataclasses.is_dataclass(type(server_args)):
+    if not is_record(server_args):
         return
     whitelist = resolvable_fields(type(server_args))
     for source, decl in declarations:
@@ -1804,10 +1678,7 @@ def validate_declarations(
 
 @register_post_process
 def _hrm_text_attention_force(view: Any) -> dict:
-    """HRM-Text's bidirectional prefix attention only works on the Triton
-    backend. Invoked as the last attention declaration of the resolution
-    (mirroring the legacy runner-side force, which ran after the whole
-    pipeline)."""
+    """Force Triton for HRM-Text bidirectional prefix attention after backend resolution."""
     if view.attention_backend not in (None, "triton"):
         logger.warning(
             f"Overriding --attention-backend "
@@ -1831,19 +1702,27 @@ def post_capture_kv_sizing_planned(server_args: Any) -> bool:
     mla_enabled = use_mla_backend(server_args)
     if not envs.SGLANG_ENABLE_POST_CAPTURE_KV_SIZING.get():
         return False
+    # Unified arenas are fully backed before capture and cannot resize afterward.
+    if cfg.enable_unified_memory:
+        return False
     if cfg.device != "cuda":
         return False
     if cfg.dcp_size != 1:
         return False
     if mla_enabled:
         return False
-    if cfg.kv_cache_dtype == "fp4_e2m1":
-        return False
     if cfg.prefill_only_disable_kv_cache:
         return False
     if cfg.enable_memory_saver:
         return False
     if envs.SGLANG_MOONCAKE_CUSTOM_MEM_POOL.get() is not None:
+        return False
+    # Mooncake over EFA cannot register the CUDA VMM allocation used by
+    # post-capture KV sizing. Fall back to the regular cudaMalloc-backed pool.
+    if (
+        cfg.disaggregation_transfer_backend == "mooncake"
+        and envs.MOONCAKE_PROTOCOL.get().lower() == "efa"
+    ):
         return False
 
     if (
@@ -1897,7 +1776,10 @@ def cutedsl_moe_max_num_tokens(server_args: Any) -> int:
 
 def max_prefill_buffer_tokens(server_args: Any) -> int:
     """Prefill-buffer ceiling: chunked_prefill_size, except PP dynamic
-    chunking can grow chunks toward max_prefill_tokens and probe at 1.25x."""
+    chunking can grow chunks toward max_prefill_tokens and probe at 1.25x.
+
+    Records with a registered ceiling provider (see
+    ``register_prefill_buffer_ceiling``) answer through it."""
     cfg = resolving_view(server_args)
     chunked = (
         cfg.chunked_prefill_size
@@ -1907,7 +1789,10 @@ def max_prefill_buffer_tokens(server_args: Any) -> int:
     tokens = chunked
     if cfg.enable_dynamic_chunking and cfg.pp_size > 1 and chunked:
         tokens = max(tokens, cfg.max_prefill_tokens or 0, math.ceil(chunked * 1.25))
-    return tokens
+    record = server_args
+    if isinstance(server_args, (ResolvedView, ResolvingConfig)):
+        record = record_of(server_args)
+    return prefill_buffer_ceiling_of(record, tokens)
 
 
 def mamba_cache_chunk_size(server_args: Any) -> int:

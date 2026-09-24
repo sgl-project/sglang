@@ -252,6 +252,10 @@ class TestDisaggregationMooncakeSpec(
             *spec_args,
             "--disaggregation-decode-retraction-backup",
             "host_pool",
+            # Pin the ratio: auto-sizing floors the pool at one max-length request,
+            # which no single request can overflow.
+            "--hicache-ratio",
+            str(BACKUP_ONLY_HICACHE_RATIO),
         ]
         cls.extra_decode_env = {"SGLANG_TEST_RETRACT": "true"}
         cls.launch_all()
@@ -459,29 +463,11 @@ class TestDisaggregationPauseResumeDecodeRetract(PDDisaggregationServerBase):
             self._run_pause_on_decode_running_batch("retract", weight_update=True)
         )
 
-    async def _get_decode_num_running_reqs(self, session):
-        """Query current decode running_batch size from /v1/loads."""
-        async with session.get(
-            self.decode_url + "/v1/loads?include=core",
-            timeout=aiohttp.ClientTimeout(total=5),
-        ) as resp:
-            resp.raise_for_status()
-            body = await resp.json()
-            return sum(load["num_running_reqs"] for load in body["loads"])
-
-    async def _wait_for_decode_running_batch(self, session, timeout):
-        deadline = asyncio.get_running_loop().time() + timeout
-        while asyncio.get_running_loop().time() < deadline:
-            if await self._get_decode_num_running_reqs(session) > 0:
-                return
-            await asyncio.sleep(0.2)
-
-        self.fail("Timed out waiting for decode running_batch to become non-empty")
-
     async def _run_pause_on_decode_running_batch(self, mode, weight_update=False):
         num_requests = 2
         max_new_tokens = 512
         prompt = "Write a detailed numbered explanation of distributed inference. " * 12
+        decode_started = [asyncio.Event() for _ in range(num_requests)]
 
         async def _post(session, url, json_data, timeout=30):
             async with session.post(
@@ -493,20 +479,37 @@ class TestDisaggregationPauseResumeDecodeRetract(PDDisaggregationServerBase):
                 return await resp.json()
 
         async def _generate(session, request_id):
-            return await _post(
-                session,
+            async with session.post(
                 self.lb_url + "/generate",
-                {
+                json={
                     "text": f"Request {request_id}: {prompt}",
                     "background": True,
+                    "stream": True,
                     "sampling_params": {
                         "temperature": 0,
                         "ignore_eos": True,
                         "max_new_tokens": max_new_tokens,
                     },
                 },
-                timeout=180,
-            )
+                timeout=aiohttp.ClientTimeout(total=180),
+            ) as resp:
+                resp.raise_for_status()
+                response = None
+                async for line in resp.content:
+                    line = line.strip()
+                    if not line.startswith(b"data: "):
+                        continue
+                    data = line[len(b"data: ") :]
+                    if data == b"[DONE]":
+                        break
+                    response = json.loads(data)
+                    self.assertNotIn("error", response)
+                    # Prefill produces the first token. A later token proves this
+                    # request has reached running_batch on the decode worker.
+                    if response["meta_info"]["completion_tokens"] > 1:
+                        decode_started[request_id].set()
+                self.assertIsNotNone(response, "Generation stream returned no output")
+                return response
 
         async with aiohttp.ClientSession() as session:
             tasks = [
@@ -515,12 +518,17 @@ class TestDisaggregationPauseResumeDecodeRetract(PDDisaggregationServerBase):
             decode_paused = False
 
             try:
-                await self._wait_for_decode_running_batch(session, timeout=30)
-                await asyncio.sleep(0.1)
+                # /v1/loads can still report a previous batch. Wait for every
+                # current request to decode so none can arrive in the prealloc
+                # queue after the pause and prevent the weight-update flush.
+                await asyncio.wait_for(
+                    asyncio.gather(*(event.wait() for event in decode_started)),
+                    timeout=30,
+                )
 
                 self.assertTrue(
-                    any(not task.done() for task in tasks),
-                    "All requests finished before decode retract pause was issued.",
+                    all(not task.done() for task in tasks),
+                    "A request finished before decode retract pause was issued.",
                 )
 
                 await _post(
@@ -580,6 +588,9 @@ class TestDisaggregationPauseResumeDecodeRetract(PDDisaggregationServerBase):
             for response in responses:
                 self.assertIn("text", response)
                 self.assertGreater(len(response["text"]), 0)
+                self.assertEqual(
+                    response["meta_info"]["completion_tokens"], max_new_tokens
+                )
 
             self.assertGreater(
                 sum(

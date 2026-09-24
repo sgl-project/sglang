@@ -20,6 +20,7 @@ Pure CPU; fakes stand in for the KV pools (data markers verify moves).
 
 import inspect
 import unittest
+from unittest.mock import MagicMock, patch
 
 import torch
 
@@ -30,6 +31,8 @@ from sglang.srt.mem_cache.allocator.unified_sub_pool import (
     FloatMultiEndedAllocator,
     MultiEndedAllocator,
 )
+from sglang.srt.mem_cache.base_prefix_cache import EvictParams
+from sglang.srt.mem_cache.unified_cache.components import ComponentType
 from sglang.srt.mem_cache.unified_memory_pool import (
     MambaSubPoolSpec,
     MHASubPoolSpec,
@@ -37,6 +40,7 @@ from sglang.srt.mem_cache.unified_memory_pool import (
     UnifiedMambaSlotAllocator,
     init_unified_mamba_swa_pools,
 )
+from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.test.ci.ci_register import register_cpu_ci
 
 # Hermetic convention of this directory's pool tests: plain unittest.TestCase,
@@ -113,6 +117,7 @@ class TestUnifiedTriPool(unittest.TestCase):
         n_full=32,
         n_swa=16,
         n_state=8,
+        page_size=1,
         lazy_compaction=False,
     ):
         full, swa, mamba = _tri_specs()
@@ -126,6 +131,7 @@ class TestUnifiedTriPool(unittest.TestCase):
             sub_pool_specs=[full, swa, mamba],
             device=_DEV,
             enable_memory_saver=False,
+            page_size=page_size,
         )
         kvcache = _FakeUnifiedSWAKVPool(pool)
         mamba_kv = _FakeKVCache(pool.max_slots("mamba"))
@@ -136,6 +142,7 @@ class TestUnifiedTriPool(unittest.TestCase):
             device=_DEV,
             full_max_total_num_tokens=n_full,
             swa_max_total_num_tokens=n_swa,
+            page_size=page_size,
             need_sort=False,
             forward_stream=None,
             lazy_compaction=lazy_compaction,
@@ -167,6 +174,85 @@ class TestUnifiedTriPool(unittest.TestCase):
         # KV pool got the allocators.
         self.assertIs(kvcache._full_allocator, fa)
         self.assertIs(kvcache._swa_allocator, sa)
+
+    def test_pd_preallocation_binds_only_swa_tail_pages(self):
+        _, allocator, _, _ = self._build(page_size=4)
+        before = allocator.available_size()
+        prefix = torch.tensor([0], dtype=torch.int64)
+        seq = torch.tensor([12], dtype=torch.int64)
+        # With an empty prefix, ordinary allocation supplies the same virtual
+        # pages without launching the GPU extend kernel. All page binding and
+        # capacity accounting still run through the real sub-allocators.
+        full = allocator.full_attn_allocator
+        with patch.object(
+            full, "alloc_extend", side_effect=lambda *a, **kw: full.alloc(12)
+        ):
+            virtual = allocator.alloc_extend_swa_tail(
+                prefix, prefix, seq, seq, torch.tensor([-1]), 12, swa_tail_len=5
+            )
+        self.assertIsNotNone(virtual)
+        self.assertEqual(len(virtual), 12)
+        self.assertEqual(allocator.full_attn_allocator.allocated_count(), 12)
+        self.assertEqual(allocator.swa_attn_allocator.allocated_count(), 8)
+        swa_pages = allocator.swa_v2p_page_table[virtual[::4] // 4]
+        self.assertLessEqual(swa_pages[0].item(), 0)
+        self.assertTrue(torch.all(swa_pages[1:] > 0).item())
+        allocator.free(virtual)
+        self.assertEqual(allocator.full_attn_allocator.allocated_count(), 0)
+        self.assertEqual(allocator.swa_attn_allocator.allocated_count(), 0)
+        self.assertEqual(allocator.available_size(), before)
+
+    def test_pd_short_tail_fits_beyond_joint_capacity(self):
+        for lazy in (False, True):
+            for tail_len in (0, 5):
+                with self.subTest(lazy=lazy, tail_len=tail_len):
+                    _, allocator, _, _ = self._build(page_size=4, lazy_compaction=lazy)
+                    full = allocator.full_attn_allocator
+                    length = allocator.available_size() + 4
+                    self.assertFalse(allocator.can_reserve(length, length))
+                    self.assertTrue(allocator.can_reserve(length, tail_len))
+                    prefix = torch.tensor([0], dtype=torch.int64)
+                    seq = torch.tensor([length], dtype=torch.int64)
+                    with patch.object(
+                        full,
+                        "alloc_extend",
+                        side_effect=lambda *a, **kw: full.alloc(length),
+                    ):
+                        virtual = allocator.alloc_extend_swa_tail(
+                            prefix,
+                            prefix,
+                            seq,
+                            seq,
+                            torch.tensor([-1]),
+                            length,
+                            tail_len,
+                        )
+                    self.assertIsNotNone(virtual)
+                    self.assertEqual(full.allocated_count(), length)
+                    self.assertEqual(
+                        allocator.swa_attn_allocator.allocated_count(),
+                        -(-tail_len // 4) * 4,
+                    )
+                    self.assertEqual(allocator.verify_byte_accounting(), [])
+                    allocator.free(virtual)
+                    self.assertEqual(full.allocated_count(), 0)
+                    self.assertEqual(allocator.swa_attn_allocator.allocated_count(), 0)
+
+    def test_pd_tail_rejects_full_capacity_shortfall(self):
+        _, allocator, _, _ = self._build(page_size=4)
+        full = allocator.full_attn_allocator
+        length = full.available_size() + 4
+        prefix = torch.tensor([0], dtype=torch.int64)
+        seq = torch.tensor([length], dtype=torch.int64)
+        with patch.object(full, "alloc_extend") as extend:
+            self.assertIsNone(
+                allocator.alloc_extend_swa_tail(
+                    prefix, prefix, seq, seq, torch.tensor([-1]), length, 0
+                )
+            )
+        extend.assert_not_called()
+        self.assertEqual(full.allocated_count(), 0)
+        self.assertEqual(allocator.swa_attn_allocator.allocated_count(), 0)
 
     def test_empty_float_is_transparent_to_the_ends(self):
         _, allocator, _, _ = self._build()
@@ -313,6 +399,90 @@ class TestUnifiedTriPool(unittest.TestCase):
         _relieve_for_alloc(allocator, 1)
         self.assertEqual(sa._hole_pages(), holes)  # holes are assets, not backlog
 
+    def test_full_donor_stops_after_float_exposes_mamba_capacity(self):
+        for page_size, lazy_compaction in ((1, False), (4, True)):
+            with self.subTest(page_size=page_size, lazy_compaction=lazy_compaction):
+                _, allocator, _, _ = self._build(
+                    page_size=page_size, lazy_compaction=lazy_compaction
+                )
+                mamba_slots = UnifiedMambaSlotAllocator(
+                    allocator.mamba_allocator,
+                    max_size=allocator.mamba_allocator.max_slots - 1,
+                    device=_DEV,
+                )
+
+                full_leaves = []
+                while True:
+                    indices = allocator.alloc(allocator.page_size)
+                    if indices is None:
+                        break
+                    full_leaves.append(indices)
+                self.assertTrue(full_leaves)
+                residual_mamba = mamba_slots.schedulable_available_size()
+                if residual_mamba:
+                    self.assertIsNotNone(mamba_slots.alloc(residual_mamba))
+                while mamba_slots.alloc(1) is not None:
+                    pass
+                self.assertGreater(mamba_slots.available_size(), 0)
+                self.assertEqual(mamba_slots.schedulable_available_size(), 0)
+
+                cache = object.__new__(UnifiedRadixCache)
+                cache.disable = False
+                cache.tree_components = (
+                    ComponentType.FULL,
+                    ComponentType.SWA,
+                    ComponentType.MAMBA,
+                )
+                cache.is_swa_enabled = True
+                cache.cache_controller = None
+                cache.metrics_collector = None
+                cache.token_to_kv_pool_allocator = allocator
+                cache.req_to_token_pool = MagicMock(mamba_allocator=mamba_slots)
+
+                tree_core = MagicMock()
+                tree_core.full_evictable_size.return_value = len(full_leaves)
+                tree_core.mamba_evictable_size.return_value = 0
+                walk = {"request_cnt": 0, "freed_leaves": 0}
+
+                def start(component_type, request_cnt):
+                    self.assertEqual(component_type, ComponentType.FULL)
+                    walk["request_cnt"] = request_cnt
+
+                def next_node(component_type, tracker):
+                    self.assertEqual(component_type, ComponentType.FULL)
+                    if tracker[ComponentType.FULL] >= walk["request_cnt"] or walk[
+                        "freed_leaves"
+                    ] >= len(full_leaves):
+                        return None, False
+                    return walk["freed_leaves"] + 1, True
+
+                def evict_leaf(node_id, tracker):
+                    self.assertEqual(node_id, walk["freed_leaves"] + 1)
+                    indices = full_leaves[-node_id]
+                    tracker[ComponentType.FULL] += int(indices.numel())
+                    allocator.full_attn_allocator.free(indices)
+                    walk["freed_leaves"] += 1
+                    return None
+
+                tree_core.evict_device_start.side_effect = start
+                cache.tree_core = tree_core
+                cache._evict_device_next_node = MagicMock(side_effect=next_node)
+                cache._evict_device_leaf = MagicMock(side_effect=evict_leaf)
+
+                swa_live_before = allocator.swa_attn_allocator._live_pages()
+                result = cache.evict_for_alloc(EvictParams(mamba_num=1))
+
+                self.assertEqual(walk["freed_leaves"], 1)
+                self.assertEqual(result.num_tokens_evicted, page_size)
+                self.assertEqual(result.swa_num_tokens_evicted, 0)
+                self.assertEqual(result.mamba_num_evicted, 0)
+                self.assertEqual(
+                    allocator.swa_attn_allocator._live_pages(), swa_live_before
+                )
+                self.assertGreaterEqual(mamba_slots.schedulable_available_size(), 1)
+                self.assertIsNotNone(mamba_slots.alloc(1))
+                self.assertEqual(allocator.verify_byte_accounting(), [])
+
 
 class TestTriPagedFreeGroup(unittest.TestCase):
     """The tri composite at PAGE SIZE > 1, driven through the production free
@@ -370,6 +540,30 @@ class TestTriPagedFreeGroup(unittest.TestCase):
         # Capacity fully recovered: the float parked, both ends rewound.
         self.assertTrue(allocator.swa_attn_allocator._is_frontier_transparent())
 
+    def test_mamba_donor_flushes_full_only_group_without_closing_it(self):
+        _, allocator = self._build_paged(page_size=1)
+        full_indices = allocator.alloc(8)
+        self.assertIsNotNone(full_indices)
+        allocator.free_swa(full_indices)
+        allocated_before = allocator.full_attn_allocator.allocated_count()
+
+        allocator.free_group_begin()
+        allocator.free_full_segment(full_indices, start_pos=0)
+        self.assertTrue(allocator.full_free_group)
+
+        donor = allocator.mamba_full_cache_donor()
+        self.assertIsNotNone(donor)
+        donor.flush_deferred_full_frees()
+
+        self.assertEqual(allocator.free_group, [])
+        self.assertEqual(allocator.free_page_reps_group, [])
+        self.assertEqual(allocator.full_free_group, [])
+        self.assertLess(
+            allocator.full_attn_allocator.allocated_count(), allocated_before
+        )
+        self.assertEqual(allocator.verify_byte_accounting(), [])
+        allocator.free_group_end()
+
     def test_ungrouped_segment_free_also_reaches_the_float(self):
         pool, allocator = self._build_paged()
         v = allocator.alloc(8)
@@ -407,7 +601,7 @@ class TestTriFreeSwaNoHostSync(unittest.TestCase):
                 torch.Tensor, "item", side_effect=AssertionError("item = host sync")
             ),
         ):
-            alloc.free_swa(v[: 4 * self.PS], start_pos=0)
+            alloc.free_swa_segment(v[: 4 * self.PS], start_pos=0)
         self.assertEqual(alloc.verify_byte_accounting(), [])
 
     def test_fallback_free_swa_still_correct_for_radix_shapes(self):
@@ -416,7 +610,7 @@ class TestTriFreeSwaNoHostSync(unittest.TestCase):
         a1, a2 = self._tri(), self._tri()
         v1, v2 = a1.alloc(6 * self.PS), a2.alloc(6 * self.PS)
         self.assertTrue(torch.equal(v1, v2))
-        a1.free_swa(v1[: 4 * self.PS], start_pos=0)
+        a1.free_swa_segment(v1[: 4 * self.PS], start_pos=0)
         a2.free_swa(v2[: 4 * self.PS])
         self.assertTrue(
             torch.equal(
@@ -715,7 +909,7 @@ class TestTriDeferredAbsorption(unittest.TestCase):
         v = alloc.alloc(8 * self.PS)
         sa = alloc.swa_attn_allocator
         span = sa._span_pages()
-        alloc.free_swa(v[6 * self.PS :], start_pos=6 * self.PS)  # high edge
+        alloc.free_swa_segment(v[6 * self.PS :], start_pos=6 * self.PS)  # high edge
         self.assertGreater(sa._hole_pages(), 0)  # deferred
         self.assertEqual(sa._span_pages(), span)
         moved = alloc.flush_opportunistic()
@@ -729,7 +923,7 @@ class TestTriDeferredAbsorption(unittest.TestCase):
         alloc = self._tri()
         v = alloc.alloc(8 * self.PS)
         sa = alloc.swa_attn_allocator
-        alloc.free_swa(v[6 * self.PS :], start_pos=6 * self.PS)
+        alloc.free_swa_segment(v[6 * self.PS :], start_pos=6 * self.PS)
         self.assertGreater(sa._hole_pages(), 0)
         moves_before = len(sa._inverse_history)
         from sglang.srt.mem_cache.allocator.unified_sub_pool import _relieve_for_alloc
@@ -743,7 +937,7 @@ class TestTriDeferredAbsorption(unittest.TestCase):
         value -- under-reporting is safe, over-reporting would over-admit."""
         alloc = self._tri()
         v = alloc.alloc(8 * self.PS)
-        alloc.free_swa(v[6 * self.PS :], start_pos=6 * self.PS)
+        alloc.free_swa_segment(v[6 * self.PS :], start_pos=6 * self.PS)
         deferred = alloc.available_size()
         alloc.swa_attn_allocator._flush(urgent=False)
         absorbed = alloc.available_size()
@@ -759,7 +953,7 @@ class TestTriDeferredAbsorption(unittest.TestCase):
 
         alloc = self._tri()
         v = alloc.alloc(8 * self.PS)
-        alloc.free_swa(v[2 * self.PS : 4 * self.PS], start_pos=2 * self.PS)
+        alloc.free_swa_segment(v[2 * self.PS : 4 * self.PS], start_pos=2 * self.PS)
         alloc.flush_opportunistic()  # consumes the dirty flag
         sa = alloc.swa_attn_allocator
         self.assertGreater(sa._hole_pages(), 0)  # interior holes remain
@@ -775,10 +969,10 @@ class TestTriDeferredAbsorption(unittest.TestCase):
         alloc = self._tri()
         v = alloc.alloc(8 * self.PS)
         sa = alloc.swa_attn_allocator
-        alloc.free_swa(v[: 2 * self.PS], start_pos=0)  # low-edge holes
+        alloc.free_swa_segment(v[: 2 * self.PS], start_pos=0)  # low-edge holes
         n_after_free = sa._hole_pages()
         alloc.alloc(2 * self.PS)  # drains them back to live
-        alloc.free_swa(v[6 * self.PS :], start_pos=6 * self.PS)  # high edge
+        alloc.free_swa_segment(v[6 * self.PS :], start_pos=6 * self.PS)  # high edge
         self.assertEqual(sa._hole_pages(), n_after_free)  # same COUNT as before
         span = sa._span_pages()
         self.assertGreater(alloc.flush_opportunistic(), 0)  # still absorbed
@@ -797,7 +991,7 @@ class TestTriDeferredAbsorption(unittest.TestCase):
         with mock.patch.object(
             torch.Tensor, "tolist", side_effect=AssertionError("tolist = D2H")
         ):
-            alloc.free_swa(v, start_pos=0)
+            alloc.free_swa_segment(v, start_pos=0)
         self.assertTrue(sa._is_frontier_transparent())
         self.assertEqual(sa._hole_pages(), 0)
 
@@ -846,11 +1040,19 @@ class TestTriFactorySizing(unittest.TestCase):
         return kw
 
     def test_budget_sizing_and_boot_signature(self):
+        from sglang.srt.mem_cache.allocator.unified_hybrid_swa import (
+            UnifiedSWAAllocatorBase,
+            UnifiedSWATokenToKVPoolAllocator,
+        )
+
         budget = 1 << 20
         bundle = init_unified_mamba_swa_pools(
             **self._factory_kwargs(unified_total_bytes=budget)
         )
         pool = bundle.unified_memory_pool
+        allocator = bundle.token_to_kv_pool_allocator
+        self.assertIsInstance(allocator, UnifiedSWAAllocatorBase)
+        self.assertNotIsInstance(allocator, UnifiedSWATokenToKVPoolAllocator)
         # Buffer = budget + the state pool's bytes (budget captured AFTER the
         # state carve-out), never the token-count re-sum.
         state_bytes = 4 * pool.spec("mamba").entry_bytes()
@@ -1256,6 +1458,65 @@ class TestFloatHoleCreditIsPerSide(unittest.TestCase):
         flt.available_size()
         flt.schedulable_available_size()
         self.assertEqual(flt._byte_accounting_violations(), [])
+
+
+class TestPreallocIsPricedOnTheSharedGrid(unittest.TestCase):
+    """REGRESSION: PD admission compared FULL and SWA against per-side token
+    budgets, but each side's `available_size` credits the peer's drainable
+    holes, so a pair that each side can host alone can be jointly infeasible.
+    Such a pair was admitted and then refused inside `alloc_extend_swa_tail`."""
+
+    def _build(self, **kw):
+        return TestUnifiedTriPool._build(self, **kw)
+
+    def test_a_pair_each_side_can_host_alone_is_still_refused(self):
+        # page_size 1 leaves no slack between the per-side and joint views;
+        # the double-count only has room to show on a paged grid.
+        _, allocator, _, _ = self._build(page_size=4)
+        full_demand = allocator.full_available_size()
+        swa_demand = allocator.swa_available_size()
+        self.assertGreater(min(full_demand, swa_demand), 0)
+        # Each side alone reports room for its own half ...
+        self.assertLessEqual(full_demand, allocator.full_available_size())
+        self.assertLessEqual(swa_demand, allocator.swa_available_size())
+        # ... yet the two draw on the same bytes, so the grid refuses the pair.
+        self.assertFalse(
+            allocator._fits_page_demand(
+                -(-full_demand // allocator.page_size),
+                -(-swa_demand // allocator.page_size),
+            )
+        )
+        self.assertFalse(
+            allocator.prealloc_fits(
+                MagicMock(),
+                full_demand,
+                swa_demand,
+                full_budget_tokens=full_demand,
+                swa_budget_tokens=swa_demand,
+            )
+        )
+
+    def test_the_scheduler_budget_still_binds(self):
+        _, allocator, _, _ = self._build()
+        page_size = allocator.page_size
+        self.assertTrue(
+            allocator.prealloc_fits(
+                MagicMock(),
+                page_size,
+                page_size,
+                full_budget_tokens=page_size,
+                swa_budget_tokens=page_size,
+            )
+        )
+        self.assertFalse(
+            allocator.prealloc_fits(
+                MagicMock(),
+                page_size,
+                page_size,
+                full_budget_tokens=page_size - 1,
+                swa_budget_tokens=page_size,
+            )
+        )
 
 
 if __name__ == "__main__":

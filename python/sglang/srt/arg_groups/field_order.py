@@ -1,14 +1,6 @@
-"""The order ``ServerArgs`` presents its fields in, frozen.
+"""Field order preserving the ServerArgs positional constructor signature.
 
-A dataclass turns field order into a positional constructor signature, so
-``ServerArgs(model_path, tokenizer_path)`` has to keep meaning what it means.
-Grouping the declarations by namespace would move the second argument onto
-another field, silently.
-
-A compatibility record and nothing else -- a field's namespace is the module it
-is declared in, and only ``collect_input_fields`` reads this. A name that is not
-here sorts after every name that is, which is the only backward-compatible
-position for a new field anyway.
+``collect_input_fields`` appends unlisted fields after these entries.
 """
 
 # fmt: off
@@ -96,10 +88,6 @@ POSITIONAL_FIELD_ORDER = (
     "enable_prefill_cp",
     "cp_strategy",
     "enable_dsa_cache_layer_split",
-    "enable_dsa_prefill_context_parallel",
-    "dsa_prefill_cp_mode",
-    "enable_prefill_context_parallel",
-    "prefill_cp_mode",
     "enable_cp_decode_attn_tp",
     "enable_dp_attention",
     "enable_dp_attention_local_control_broadcast",
@@ -107,6 +95,7 @@ POSITIONAL_FIELD_ORDER = (
     "enable_tp_lm_head_all_to_all",
     "enable_attn_tp_input_scattered",
     "enable_shared_experts_attn_tp",
+    "shared_experts_tp_size",
     "enable_dense_mlp_attn_tp",
     "enable_layernorm_sp",
     "disable_attn_tp_gather",
@@ -208,6 +197,7 @@ POSITIONAL_FIELD_ORDER = (
     "stat_loggers",
     "constrained_json_whitespace_pattern",
     "constrained_json_disable_any_whitespace",
+    "constrained_json_max_whitespace_cnt",
     "attention_backend",
     "decode_attention_backend",
     "enable_lean_attention",
@@ -234,6 +224,7 @@ POSITIONAL_FIELD_ORDER = (
     "cuda_graph_max_bs_prefill",
     "cuda_graph_bs_decode",
     "cuda_graph_bs_prefill",
+    "cuda_graph_prefill_max_context",
     "cuda_graph_tc_compiler",
     "disable_prefill_cuda_graph",
     "disable_decode_cuda_graph",
@@ -340,7 +331,6 @@ POSITIONAL_FIELD_ORDER = (
     "elastic_ep_initial_size",
     "max_ep_size",
     "elastic_ep_scale_timeout",
-    "elastic_ep_rejoin",
     "disable_flashinfer_cutlass_moe_fp4_allgather",
     "disable_shared_experts_fusion",
     "enforce_shared_experts_fusion",
@@ -394,7 +384,6 @@ POSITIONAL_FIELD_ORDER = (
     "mm_global_cache_backend",
     "disable_fast_image_processor",
     "mm_feature_transport",
-    "keep_mm_feature_on_device",
     "enable_lora",
     "enable_lora_overlap_loading",
     "max_lora_rank",
@@ -500,6 +489,7 @@ POSITIONAL_FIELD_ORDER = (
     "return_hidden_states_mode",
     "enable_return_routed_experts",
     "enable_return_indexer_topk",
+    "sampling_mask_max_tokens",
     "disable_outlines_disk_cache",
     "enable_mis",
     "weight_cache_mode",
@@ -507,5 +497,25 @@ POSITIONAL_FIELD_ORDER = (
     "weight_cache_timeout",
     "forward_hooks",
     "msprobe_dump_config",
+    "ple_offload_embedding",
+    "ple_offload_backend",
+    "ple_offload_dir",
+    "disaggregation_enable_kv_checksum",
+    "enable_pd_role_switch",
+    "speculative_domino_candidate_pool_size",
+    "flashinfer_a2a_dispatch_type",
+    "cuda_graph_max_seq_len_prefill",
+    "prefill_kv_cache_dequant_dtype",
+    "dsv4_attn_backend",
+    "otlp_service_name",
+    "_radix_eviction_policy_explicitly_set",
+    "hicache_host_memory_fraction",
+    "enable_linker_mla_dedup",
+    "_swa_full_tokens_ratio_explicitly_set",
+    "swa_prefix_tails",
+    "enable_encoder_swa_bounded_replay",
+    "enable_decoder_swa_bounded_replay",
+    "enable_response_store",
+    "disaggregation_decode_host_receive_threshold",
 )
 # fmt: on

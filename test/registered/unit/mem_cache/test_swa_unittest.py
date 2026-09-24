@@ -1,13 +1,12 @@
 import unittest
-from array import array
 from types import SimpleNamespace
 from unittest import mock
 from unittest.mock import patch
 
 import torch
 
-from sglang.srt.disaggregation.kv_events import BlockRemoved, BlockStored
 from sglang.srt.environ import InvariantCheckLevel, envs
+from sglang.srt.managers.schedule_batch import ReqKvInfo
 from sglang.srt.mem_cache.allocator.base import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.allocator.swa import (
     PureSWATokenToKVPoolAllocator,
@@ -15,21 +14,12 @@ from sglang.srt.mem_cache.allocator.swa import (
 )
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
-    DecLockRefParams,
-    EvictParams,
-    EvictResult,
-    InsertParams,
-    MatchPrefixParams,
 )
-from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.common import (
-    available_and_evictable_str,
     free_kv_row_segments,
 )
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
-from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
-from sglang.srt.mem_cache.swa_radix_cache import SWARadixCache
 from sglang.srt.utils import get_device
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
@@ -38,26 +28,13 @@ register_cuda_ci(est_time=9, stage="base-b", runner_config="1-gpu-large")
 register_amd_ci(est_time=10, suite="stage-b-test-1-gpu-small-amd")
 
 
-def _event_hashes(events):
-    return [block_hash for event in events for block_hash in event.block_hashes]
-
-
-class _DummyReq:
-    def __init__(self):
-        self._kv_committed_len = 0
-        self.swa_prefix_lock_released = False
-        self.kv = SimpleNamespace(swa_evicted_seqlen=0, cache_protected_len=0)
-
-
-def _build_swa_tree(
-    is_eagle: bool,
+def _build_swa_allocator(
     page_size: int = 1,
     req_size: int = 8,
     max_context_len: int = 64,
     kv_size: int = 64,
     kv_size_swa: int = 32,
-    sliding_window_size: int = 4,
-    enable_kv_cache_events: bool = False,
+    swa_req_ring_size: int | None = None,
 ):
     head_num = 8
     head_dim = 128
@@ -88,6 +65,7 @@ def _build_swa_tree(
         full_attention_layer_ids=full_attention_layer_ids,
         device=device,
     )
+    kv_pool.swa_req_ring_size = swa_req_ring_size
     allocator = SWATokenToKVPoolAllocator(
         size=kv_size,
         size_swa=kv_size_swa,
@@ -96,19 +74,9 @@ def _build_swa_tree(
         device=device,
         kvcache=kv_pool,
         need_sort=False,
+        req_to_token_pool=req_to_token_pool,
     )
-    tree = SWARadixCache(
-        params=CacheInitParams(
-            req_to_token_pool=req_to_token_pool,
-            token_to_kv_pool_allocator=allocator,
-            page_size=page_size,
-            disable=False,
-            is_eagle=is_eagle,
-            sliding_window_size=sliding_window_size,
-            enable_kv_cache_events=enable_kv_cache_events,
-        ),
-    )
-    return tree, allocator, req_to_token_pool
+    return allocator, req_to_token_pool
 
 
 def _sync_error(fn):
@@ -161,23 +129,6 @@ def _swa_alloc(allocator, need_size):
     return full_indices
 
 
-def _insert(tree, allocator, token_ids):
-    indices = _swa_alloc(allocator, len(token_ids))
-    assert indices is not None
-    tree.insert(InsertParams(key=RadixKey(array("q", token_ids)), value=indices))
-
-
-def _insert_chain(tree, allocator, token_ids):
-    _insert(tree, allocator, token_ids)
-    match = tree.match_prefix(MatchPrefixParams(key=RadixKey(array("q", token_ids))))
-    return match.last_device_node
-
-
-def _expected_tail_size(window: int, page_size: int) -> int:
-    """Mirror of _maybe_split_leaf_for_swa_lock's tail_size formula."""
-    return (window + page_size - 1) // page_size * page_size
-
-
 class TestSWA(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -187,76 +138,12 @@ class TestSWA(unittest.TestCase):
     def tearDownClass(cls):
         pass
 
-    def test_swa_radix_cache_kv_events(self):
-        tree, allocator, _ = _build_swa_tree(
-            is_eagle=False, enable_kv_cache_events=True
-        )
-        tree.take_events()  # Clear the reset event.
-
-        _insert(tree, allocator, [1, 2, 3, 4])
-        first_insert_events = [
-            e for e in tree.take_events() if isinstance(e, BlockStored)
-        ]
-        self.assertEqual(len(first_insert_events), 1)
-        self.assertEqual(list(first_insert_events[0].token_ids), [1, 2, 3, 4])
-
-        _insert(tree, allocator, [1, 2, 3, 4, 5, 6])
-        second_insert_events = [
-            e for e in tree.take_events() if isinstance(e, BlockStored)
-        ]
-        self.assertEqual(len(second_insert_events), 1)
-        self.assertEqual(list(second_insert_events[0].token_ids), [5, 6])
-
-        stored_hashes = [
-            block_hash
-            for event in first_insert_events + second_insert_events
-            for block_hash in event.block_hashes
-        ]
-
-        # Evicting only SWA tokens tombstones nodes but keeps full KV blocks.
-        result = tree.evict(EvictParams(num_tokens=0, swa_num_tokens=1))
-        self.assertEqual(result.num_tokens_evicted, 0)
-        self.assertGreaterEqual(result.swa_num_tokens_evicted, 1)
-        self.assertEqual(
-            [e for e in tree.take_events() if isinstance(e, BlockRemoved)], []
-        )
-
-        result = tree.evict(EvictParams(num_tokens=1, swa_num_tokens=0))
-        self.assertGreaterEqual(result.num_tokens_evicted, 1)
-        removed_hashes = _event_hashes(
-            [e for e in tree.take_events() if isinstance(e, BlockRemoved)]
-        )
-        self.assertCountEqual(removed_hashes, stored_hashes)
-
-    def test_swa_radix_cache_kv_events_split_hash(self):
-        tree, allocator, _ = _build_swa_tree(
-            is_eagle=False, enable_kv_cache_events=True
-        )
-        tree.take_events()  # Clear the reset event.
-
-        _insert(tree, allocator, [1, 2, 3, 4])
-        first_insert_events = [
-            e for e in tree.take_events() if isinstance(e, BlockStored)
-        ]
-        self.assertEqual(len(first_insert_events), 1)
-        split_parent_hash = first_insert_events[0].block_hashes[1]
-
-        _insert(tree, allocator, [1, 2, 5, 6])
-        second_insert_events = [
-            e for e in tree.take_events() if isinstance(e, BlockStored)
-        ]
-        self.assertEqual(len(second_insert_events), 1)
-        self.assertEqual(list(second_insert_events[0].token_ids), [5, 6])
-        self.assertEqual(second_insert_events[0].parent_block_hash, split_parent_hash)
-
     def test_swa_memory_pool_paged_free_clears_full_page_mapping(self):
         page_size = 4
-        _, allocator, _ = _build_swa_tree(
-            is_eagle=False,
+        allocator, _ = _build_swa_allocator(
             page_size=page_size,
             kv_size=16,
             kv_size_swa=16,
-            sliding_window_size=page_size,
         )
 
         full_indices = _swa_alloc(allocator, page_size)
@@ -278,7 +165,7 @@ class TestSWA(unittest.TestCase):
         """Clearing the full-to-SWA mapping must not block the stream; writing a
         host-resident scalar into it does.
         """
-        _, allocator, _ = _build_swa_tree(is_eagle=False)
+        allocator, _ = _build_swa_allocator()
         full_indices = _swa_alloc(allocator, 4)
         mapping = allocator.full_to_swa_index_mapping
 
@@ -299,14 +186,19 @@ class TestSWA(unittest.TestCase):
         )
 
     def test_free_swa_group_owns_deferred_indices(self):
-        _, allocator, _ = _build_swa_tree(
-            is_eagle=False,
-            kv_size=32,
-            kv_size_swa=32,
+        for page_size in (1, 4):
+            with self.subTest(page_size=page_size):
+                self._free_swa_group_owns_deferred_indices(page_size)
+
+    def _free_swa_group_owns_deferred_indices(self, page_size):
+        allocator, _ = _build_swa_allocator(
+            page_size=page_size,
+            kv_size=32 * page_size,
+            kv_size_swa=32 * page_size,
         )
         index_batches = []
         for size in (2, 3, 1, 4):
-            indices = _swa_alloc(allocator, size)
+            indices = _swa_alloc(allocator, size * page_size)
             assert indices is not None
             index_batches.append(indices)
         original_indices = torch.cat([indices.clone() for indices in index_batches])
@@ -314,9 +206,10 @@ class TestSWA(unittest.TestCase):
         available_before_free = allocator.swa_available_size()
         allocator.free_group_begin()
         for indices in index_batches:
-            allocator.free_swa(indices)
+            allocator.free_swa_segment(indices, start_pos=0)
 
-        self.assertEqual(len(allocator.swa_free_group), len(index_batches))
+        # The reps were gathered at enqueue time, not from these views.
+        self.assertEqual(len(allocator.swa_page_ids_group), len(index_batches))
         self.assertEqual(allocator.swa_available_size(), available_before_free)
         for indices in index_batches:
             indices.zero_()
@@ -334,8 +227,7 @@ class TestSWA(unittest.TestCase):
         )
 
     def test_free_swa_group_owns_mapping_at_enqueue_time(self):
-        _, allocator, _ = _build_swa_tree(
-            is_eagle=False,
+        allocator, _ = _build_swa_allocator(
             kv_size=8,
             kv_size_swa=8,
         )
@@ -366,8 +258,7 @@ class TestSWA(unittest.TestCase):
         )
 
     def _build_two_mapped_slots(self, page_size=1):
-        _, allocator, _ = _build_swa_tree(
-            is_eagle=False,
+        allocator, _ = _build_swa_allocator(
             page_size=page_size,
             kv_size=8 * page_size,
             kv_size_swa=8 * page_size,
@@ -437,526 +328,6 @@ class TestSWA(unittest.TestCase):
             allocator.full_to_swa_index_mapping[indices], indices
         )
 
-    def test_swa_radix_cache_1(self):
-        # args
-        req_size = 10
-        max_context_len = 128
-        kv_size = 128
-        kv_size_swa = 64
-        page_size = 1
-        sliding_window_size = 4
-        head_num = 8
-        head_dim = 128
-        num_layers = 48
-        global_interval = 4
-        dtype = torch.bfloat16
-        device = get_device()
-        full_attention_layer_ids = [i for i in range(0, num_layers, global_interval)]
-        full_attention_layer_ids_set = set(full_attention_layer_ids)
-        swa_attention_layer_ids = [
-            i for i in range(num_layers) if i not in full_attention_layer_ids_set
-        ]
-        # setup req to token pool
-        req_to_token_pool = ReqToTokenPool(
-            size=req_size,
-            max_context_len=max_context_len,
-            device=device,
-            enable_memory_saver=False,
-        )
-        # setup kv pool
-        kv_pool = SWAKVPool(
-            size=kv_size,
-            size_swa=kv_size_swa,
-            page_size=page_size,
-            dtype=dtype,
-            head_num=head_num,
-            head_dim=head_dim,
-            swa_attention_layer_ids=swa_attention_layer_ids,
-            full_attention_layer_ids=full_attention_layer_ids,
-            device=device,
-        )
-        # setup token to kv pool allocator
-        allocator = SWATokenToKVPoolAllocator(
-            size=kv_size,
-            size_swa=kv_size_swa,
-            page_size=page_size,
-            dtype=dtype,
-            device=device,
-            kvcache=kv_pool,
-            need_sort=False,
-        )
-        # setup radix cache
-        tree = SWARadixCache(
-            params=CacheInitParams(
-                req_to_token_pool=req_to_token_pool,
-                token_to_kv_pool_allocator=allocator,
-                disable=False,
-                page_size=page_size,
-                sliding_window_size=sliding_window_size,
-            ),
-        )
-
-        # test
-        print(
-            f"[Start] allocator swa available size: {allocator.swa_available_size()}, full available size: {allocator.full_available_size()}"
-        )
-        req1_token_ids, req1_kv_indices = [1, 2, 3], allocator.alloc(3)
-        self.assertEqual(len(req1_token_ids), len(req1_kv_indices))
-        print(
-            f"req1: inserting, req1_token_ids: {req1_token_ids}, req1_kv_indices: {req1_kv_indices}"
-        )
-        key = RadixKey(array("q", req1_token_ids))
-        result = tree.insert(InsertParams(key=key, value=req1_kv_indices[: len(key)]))
-        prefix_len = result.prefix_len
-        print(
-            f"req1: prefix_len: {prefix_len}, allocator swa available size: {allocator.swa_available_size()}, full available size: {allocator.full_available_size()}"
-        )
-        req2_token_ids, req2_kv_indices = [1, 2, 3, 4, 5, 6, 7], allocator.alloc(7)
-        self.assertEqual(len(req2_token_ids), len(req2_kv_indices))
-        print(
-            f"req2: inserting, req2_token_ids: {req2_token_ids}, req2_kv_indices: {req2_kv_indices}"
-        )
-        key = RadixKey(array("q", req2_token_ids))
-        result = tree.insert(InsertParams(key=key, value=req2_kv_indices[: len(key)]))
-        prefix_len = result.prefix_len
-        print(
-            f"req2: prefix_len: {prefix_len}, allocator swa available size: {allocator.swa_available_size()}, full available size: {allocator.full_available_size()}"
-        )
-        req3_token_ids, req3_kv_indices = [10, 11, 12], allocator.alloc(3)
-        self.assertEqual(len(req3_token_ids), len(req3_kv_indices))
-        print(
-            f"req3: inserting, req3_token_ids: {req3_token_ids}, req3_kv_indices: {req3_kv_indices}"
-        )
-        key = RadixKey(array("q", req3_token_ids))
-        result = tree.insert(InsertParams(key=key, value=req3_kv_indices[: len(key)]))
-        prefix_len = result.prefix_len
-        print(
-            f"req3: prefix_len: {prefix_len}, allocator swa available size: {allocator.swa_available_size()}, full available size: {allocator.full_available_size()}"
-        )
-        req4_token_ids, req4_kv_indices = [1, 2, 3, 4, 5, 60, 70], allocator.alloc(7)
-        self.assertEqual(len(req4_token_ids), len(req4_kv_indices))
-        print(
-            f"req4: inserting, req4_token_ids: {req4_token_ids}, req4_kv_indices: {req4_kv_indices}"
-        )
-        key = RadixKey(array("q", req4_token_ids))
-        result = tree.insert(InsertParams(key=key, value=req4_kv_indices[: len(key)]))
-        prefix_len = result.prefix_len
-        print(
-            f"req4: prefix_len: {prefix_len}, allocator swa available size: {allocator.swa_available_size()}, full available size: {allocator.full_available_size()}"
-        )
-
-        tree.pretty_print()
-        full_num_tokens, swa_num_tokens = 1, 0
-        print(f"evicting {full_num_tokens} full token and {swa_num_tokens} swa token")
-        tree.evict(
-            EvictParams(num_tokens=full_num_tokens, swa_num_tokens=swa_num_tokens)
-        )
-        tree.pretty_print()
-
-        full_num_tokens, swa_num_tokens = 0, 1
-        print(f"evicting {full_num_tokens} full token and {swa_num_tokens} swa token")
-        tree.evict(
-            EvictParams(num_tokens=full_num_tokens, swa_num_tokens=swa_num_tokens)
-        )
-        tree.pretty_print()
-
-        full_num_tokens, swa_num_tokens = 1, 2
-        print(f"evicting {full_num_tokens} full token and {swa_num_tokens} swa token")
-        tree.evict(
-            EvictParams(num_tokens=full_num_tokens, swa_num_tokens=swa_num_tokens)
-        )
-        tree.pretty_print()
-
-        req5_token_ids = [1, 2, 3, 4, 5]
-        result = tree.match_prefix(
-            MatchPrefixParams(key=RadixKey(array("q", req5_token_ids)))
-        )
-        kv_indices, last_node = result.device_indices, result.last_device_node
-        print(
-            f"req5: token_ids: {req5_token_ids}, matched kv_indices: {kv_indices}, last_node.key: {last_node.key}"
-        )
-        self.assertEqual(len(kv_indices), 0)
-
-        req6_token_ids = [1, 2, 3, 4, 5, 60, 70]
-        result = tree.match_prefix(
-            MatchPrefixParams(key=RadixKey(array("q", req6_token_ids)))
-        )
-        kv_indices, last_node = result.device_indices, result.last_device_node
-        print(
-            f"req6: token_ids: {req6_token_ids}, matched kv_indices: {kv_indices}, last_node.key: {last_node.key}"
-        )
-        self.assertEqual(len(kv_indices), 7)
-        self.assertEqual(len(last_node.key), 2)
-        self.assertEqual(last_node.key.token_ids[0], 60)
-        self.assertEqual(last_node.key.token_ids[1], 70)
-
-        print(tree.available_and_evictable_str())
-        print(available_and_evictable_str(tree))
-        tree.sanity_check()
-
-    def test_swa_radix_cache_eagle(self):
-        # args
-        req_size = 10
-        max_context_len = 128
-        kv_size = 128
-        kv_size_swa = 64
-        page_size = 1
-        sliding_window_size = 4
-        head_num = 8
-        head_dim = 128
-        num_layers = 48
-        global_interval = 4
-        dtype = torch.bfloat16
-        device = get_device()
-        full_attention_layer_ids = [i for i in range(0, num_layers, global_interval)]
-        full_attention_layer_ids_set = set(full_attention_layer_ids)
-        swa_attention_layer_ids = [
-            i for i in range(num_layers) if i not in full_attention_layer_ids_set
-        ]
-        # setup req to token pool
-        req_to_token_pool = ReqToTokenPool(
-            size=req_size,
-            max_context_len=max_context_len,
-            device=device,
-            enable_memory_saver=False,
-        )
-        # setup kv pool
-        kv_pool = SWAKVPool(
-            size=kv_size,
-            size_swa=kv_size_swa,
-            page_size=page_size,
-            dtype=dtype,
-            head_num=head_num,
-            head_dim=head_dim,
-            swa_attention_layer_ids=swa_attention_layer_ids,
-            full_attention_layer_ids=full_attention_layer_ids,
-            device=device,
-        )
-        # setup token to kv pool allocator
-        allocator = SWATokenToKVPoolAllocator(
-            size=kv_size,
-            size_swa=kv_size_swa,
-            page_size=page_size,
-            dtype=dtype,
-            device=device,
-            kvcache=kv_pool,
-            need_sort=False,
-        )
-        # setup radix cache
-        tree = SWARadixCache(
-            params=CacheInitParams(
-                req_to_token_pool=req_to_token_pool,
-                token_to_kv_pool_allocator=allocator,
-                page_size=page_size,
-                disable=False,
-                is_eagle=True,
-                sliding_window_size=sliding_window_size,
-            ),
-        )
-
-        # test
-        print(
-            f"[Start] allocator swa available size: {allocator.swa_available_size()}, full available size: {allocator.full_available_size()}"
-        )
-        req1_token_ids, req1_kv_indices = [1, 2, 3], allocator.alloc(3)
-        self.assertEqual(len(req1_token_ids), len(req1_kv_indices))
-        print(
-            f"req1: inserting, req1_token_ids: {req1_token_ids}, req1_kv_indices: {req1_kv_indices}"
-        )
-        key = RadixKey(array("q", req1_token_ids))
-        result = tree.insert(InsertParams(key=key, value=req1_kv_indices[: len(key)]))
-        prefix_len = result.prefix_len
-        self.assertEqual(prefix_len, 0)
-        print(
-            f"req1: prefix_len: {prefix_len}, allocator swa available size: {allocator.swa_available_size()}, full available size: {allocator.full_available_size()}"
-        )
-        req2_token_ids, req2_kv_indices = [1, 2, 3, 4, 5, 6, 7], allocator.alloc(7)
-        self.assertEqual(len(req2_token_ids), len(req2_kv_indices))
-        print(
-            f"req2: inserting, req2_token_ids: {req2_token_ids}, req2_kv_indices: {req2_kv_indices}"
-        )
-        key = RadixKey(array("q", req2_token_ids))
-        result = tree.insert(InsertParams(key=key, value=req2_kv_indices[: len(key)]))
-        prefix_len = result.prefix_len
-        self.assertEqual(prefix_len, 2)
-        print(
-            f"req2: prefix_len: {prefix_len}, allocator swa available size: {allocator.swa_available_size()}, full available size: {allocator.full_available_size()}"
-        )
-        req3_token_ids, req3_kv_indices = [10, 11, 12], allocator.alloc(3)
-        self.assertEqual(len(req3_token_ids), len(req3_kv_indices))
-        print(
-            f"req3: inserting, req3_token_ids: {req3_token_ids}, req3_kv_indices: {req3_kv_indices}"
-        )
-        key = RadixKey(array("q", req3_token_ids))
-        result = tree.insert(InsertParams(key=key, value=req3_kv_indices[: len(key)]))
-        prefix_len = result.prefix_len
-        self.assertEqual(prefix_len, 0)
-        print(
-            f"req3: prefix_len: {prefix_len}, allocator swa available size: {allocator.swa_available_size()}, full available size: {allocator.full_available_size()}"
-        )
-        req4_token_ids, req4_kv_indices = [1, 2, 3, 4, 5, 60, 70], allocator.alloc(7)
-        self.assertEqual(len(req4_token_ids), len(req4_kv_indices))
-        print(
-            f"req4: inserting, req4_token_ids: {req4_token_ids}, req4_kv_indices: {req4_kv_indices}"
-        )
-        key = RadixKey(array("q", req4_token_ids))
-        result = tree.insert(InsertParams(key=key, value=req4_kv_indices[: len(key)]))
-        prefix_len = result.prefix_len
-        self.assertEqual(prefix_len, 4)
-        print(
-            f"req4: prefix_len: {prefix_len}, allocator swa available size: {allocator.swa_available_size()}, full available size: {allocator.full_available_size()}"
-        )
-
-        tree.pretty_print()
-        full_num_tokens, swa_num_tokens = 1, 0
-        print(f"evicting {full_num_tokens} full token and {swa_num_tokens} swa token")
-        evict_result = tree.evict(
-            EvictParams(num_tokens=full_num_tokens, swa_num_tokens=swa_num_tokens)
-        )
-        assert isinstance(evict_result, EvictResult)
-        assert (
-            evict_result.num_tokens_evicted >= full_num_tokens
-        )  # May evict more due to node granularity
-        print(
-            f"evicted {evict_result.num_tokens_evicted} full tokens, {evict_result.swa_num_tokens_evicted} swa tokens"
-        )
-        tree.pretty_print()
-
-        full_num_tokens, swa_num_tokens = 0, 1
-        print(f"evicting {full_num_tokens} full token and {swa_num_tokens} swa token")
-        evict_result = tree.evict(
-            EvictParams(num_tokens=full_num_tokens, swa_num_tokens=swa_num_tokens)
-        )
-        assert isinstance(evict_result, EvictResult)
-        assert evict_result.swa_num_tokens_evicted >= swa_num_tokens, (
-            f"evicted {evict_result.swa_num_tokens_evicted} swa tokens, expected {swa_num_tokens}"
-        )
-        tree.pretty_print()
-
-        full_num_tokens, swa_num_tokens = 1, 2
-        print(f"evicting {full_num_tokens} full token and {swa_num_tokens} swa token")
-        evict_result = tree.evict(
-            EvictParams(num_tokens=full_num_tokens, swa_num_tokens=swa_num_tokens)
-        )
-        assert isinstance(evict_result, EvictResult)
-        assert evict_result.num_tokens_evicted >= full_num_tokens, (
-            f"evicted {evict_result.num_tokens_evicted} full tokens, expected {full_num_tokens}"
-        )
-        assert evict_result.swa_num_tokens_evicted >= swa_num_tokens, (
-            f"evicted {evict_result.swa_num_tokens_evicted} swa tokens, expected {swa_num_tokens}"
-        )
-        tree.pretty_print()
-
-        req5_token_ids = [1, 2, 3, 4, 5]
-        result = tree.match_prefix(
-            MatchPrefixParams(key=RadixKey(array("q", req5_token_ids)))
-        )
-        kv_indices, last_node = result.device_indices, result.last_device_node
-        print(
-            f"req5: token_ids: {req5_token_ids}, matched kv_indices: {kv_indices}, last_node.key: {last_node.key}"
-        )
-        self.assertEqual(len(kv_indices), 0)  # no swa prefix matched
-
-        req6_token_ids = [1, 2, 3, 4, 5, 60, 70]
-        result = tree.match_prefix(
-            MatchPrefixParams(key=RadixKey(array("q", req6_token_ids)))
-        )
-        kv_indices, last_node = result.device_indices, result.last_device_node
-        print(
-            f"req6: token_ids: {req6_token_ids}, matched kv_indices: {kv_indices}, last_node.key: {last_node.key}"
-        )
-        self.assertEqual(len(kv_indices), 6)
-        self.assertEqual(len(last_node.key), 2)
-        # Bigram view: token_ids holds raw tokens; iteration yields bigram tuples.
-        self.assertTrue(last_node.key.is_bigram)
-        self.assertEqual(list(last_node.key), [(5, 60), (60, 70)])
-
-    def test_swa_cache_finished_req_eagle_uses_cache_protected_len_and_bigram_key(self):
-        tree, allocator, req_to_token_pool = _build_swa_tree(is_eagle=True)
-
-        # Case 1: is_insert=True should pass bigram key and use cache_protected_len.
-        req = _DummyReq()
-        req.kv.req_pool_idx = 0
-        req.origin_input_ids = array("q", [1, 2, 3, 4, 5, 6])
-        req.output_ids = array("q")
-        req._kv_committed_len = len(req.origin_input_ids)
-        kv_indices = allocator.alloc(req._kv_committed_len)
-        req_to_token_pool.write(
-            (req.kv.req_pool_idx, slice(0, req._kv_committed_len)), kv_indices
-        )
-        req.extra_key = None
-        req.cache_salt = None
-        req.last_node = tree.root_node
-        req.swa_uuid_for_lock = None
-        req.kv.swa_evicted_seqlen = 0
-        req.kv.cache_protected_len = 1
-        # Intentionally mismatch to ensure code does not use len(prefix_indices).
-        req.prefix_indices = torch.tensor([7, 8, 9, 10, 11], device=tree.device)
-
-        captured = {}
-        original_insert = tree.insert
-
-        def wrapped_insert(params):
-            captured["prev_prefix_len"] = params.prev_prefix_len
-            captured["is_bigram"] = params.key.is_bigram
-            captured["key_len"] = len(params.key)
-            return original_insert(params)
-
-        tree.insert = wrapped_insert
-        tree.cache_finished_req(
-            req, is_insert=True, kv_len_to_handle=req._kv_committed_len
-        )
-
-        self.assertEqual(captured["prev_prefix_len"], req.kv.cache_protected_len)
-        self.assertTrue(captured["is_bigram"])
-        self.assertEqual(captured["key_len"], len(req.origin_input_ids) - 1)
-
-        # Case 2: is_insert=False should free [cache_protected_len:page_aligned_len]
-        # even when len(prefix_indices) is intentionally larger.
-        req2 = _DummyReq()
-        req2.kv.req_pool_idx = 1
-        req2.origin_input_ids = array("q", [11, 12, 13, 14, 15, 16])
-        req2.output_ids = array("q")
-        req2._kv_committed_len = len(req2.origin_input_ids)
-        kv_indices2 = allocator.alloc(req2._kv_committed_len)
-        req_to_token_pool.write(
-            (req2.kv.req_pool_idx, slice(0, req2._kv_committed_len)), kv_indices2
-        )
-        req2.extra_key = None
-        req2.cache_salt = None
-        req2.last_node = tree.root_node
-        req2.swa_uuid_for_lock = None
-        req2.kv.swa_evicted_seqlen = 0
-        req2.kv.cache_protected_len = 1
-        req2.prefix_indices = torch.tensor([21, 22, 23, 24, 25], device=tree.device)
-
-        freed_lens = []
-        original_free_segment = allocator.free_segment
-
-        def wrapped_free_segment(indices, *, start_pos):
-            freed_lens.append(int(indices.numel()))
-            return original_free_segment(indices, start_pos=start_pos)
-
-        allocator.free_segment = wrapped_free_segment
-        tree.cache_finished_req(
-            req2, is_insert=False, kv_len_to_handle=req2._kv_committed_len
-        )
-
-        # EAGLE + page_size=1 => page_aligned_len = committed_len - 1 = 5
-        # Expected frees:
-        #   overlap range [1:5] -> 4
-        #   tail range [5:]     -> 1
-        self.assertEqual(freed_lens, [4, 1])
-
-
-# Optimization: SGLANG_OPT_SWA_SPLIT_LEAF_ON_INSERT.
-# Splits a freshly-inserted leaf at the (page-aligned) sliding-window
-# boundary so a future inc_lock_ref protects only ~sliding_window_size SWA
-# tokens instead of the whole chunked-prefill chain.
-class TestSWASplitLeafOnInsert(CustomTestCase):
-    def _insert_and_lock(self, *, window, page_size, leaf_len, flag_on):
-        tree, allocator, _ = _build_swa_tree(
-            is_eagle=False,
-            kv_size=128,
-            kv_size_swa=64,
-            sliding_window_size=window,
-            page_size=page_size,
-        )
-        token_ids = list(range(leaf_len))
-        with envs.SGLANG_OPT_SWA_SPLIT_LEAF_ON_INSERT.override(flag_on):
-            leaf = _insert_chain(tree, allocator, token_ids)
-        result = tree.inc_lock_ref(leaf)
-        return tree, leaf, result
-
-    def test_flag_off_protects_full_leaf(self):
-        tree, leaf, _ = self._insert_and_lock(
-            window=4, page_size=1, leaf_len=12, flag_on=False
-        )
-        self.assertEqual(len(leaf.value), 12)
-        self.assertEqual(tree.swa_protected_size_, 12)
-
-    def test_flag_on_caps_protection_at_window(self):
-        # (window, page_size, leaf_len, expected_tail_size); leaf_len picked
-        # > tail_size and page-aligned for page_size > 1.
-        cases = [
-            (4, 1, 12, 4),
-            (4, 1, 5, 4),
-            (1, 1, 5, 1),
-            (4, 2, 12, 4),
-            (8, 2, 12, 8),
-            (4, 4, 12, 4),
-            # window NOT page-aligned -> tail rounds up to page boundary.
-            (3, 2, 12, 4),
-            (5, 4, 12, 8),
-            (3, 4, 12, 4),
-        ]
-        for window, page_size, leaf_len, expected_tail in cases:
-            with self.subTest(window=window, page_size=page_size, leaf_len=leaf_len):
-                self.assertEqual(_expected_tail_size(window, page_size), expected_tail)
-                tree, leaf, _ = self._insert_and_lock(
-                    window=window,
-                    page_size=page_size,
-                    leaf_len=leaf_len,
-                    flag_on=True,
-                )
-                self.assertEqual(len(leaf.value), expected_tail)
-                self.assertEqual(tree.swa_protected_size_, expected_tail)
-
-    def test_flag_on_no_split_when_leaf_within_window(self):
-        # leaf_len <= tail_size: split must no-op.
-        cases = [
-            (4, 1, 4),
-            (4, 1, 3),
-            (4, 2, 4),
-            (3, 2, 4),
-            (8, 2, 4),
-            (4, 4, 4),
-        ]
-        for window, page_size, leaf_len in cases:
-            with self.subTest(window=window, page_size=page_size, leaf_len=leaf_len):
-                tree, leaf, _ = self._insert_and_lock(
-                    window=window,
-                    page_size=page_size,
-                    leaf_len=leaf_len,
-                    flag_on=True,
-                )
-                self.assertEqual(len(leaf.value), leaf_len)
-                self.assertEqual(tree.swa_protected_size_, leaf_len)
-
-    def test_match_prefix_returns_full_chain_after_split(self):
-        tree, allocator, _ = _build_swa_tree(
-            is_eagle=False,
-            kv_size=128,
-            kv_size_swa=64,
-            sliding_window_size=4,
-            page_size=1,
-        )
-        token_ids = list(range(12))
-        with envs.SGLANG_OPT_SWA_SPLIT_LEAF_ON_INSERT.override(True):
-            inserted_leaf = _insert_chain(tree, allocator, token_ids)
-        self.assertEqual(len(inserted_leaf.value), 4)
-        match = tree.match_prefix(
-            MatchPrefixParams(key=RadixKey(array("q", token_ids)))
-        )
-        self.assertEqual(match.device_indices.shape[0], 12)
-        self.assertIs(match.last_device_node, inserted_leaf)
-
-    def test_dec_lock_ref_after_split_balances_to_zero(self):
-        tree, leaf, result = self._insert_and_lock(
-            window=4, page_size=1, leaf_len=12, flag_on=True
-        )
-        self.assertEqual(tree.swa_protected_size_, 4)
-        self.assertEqual(tree.full_protected_size_, 12)
-
-        tree.dec_lock_ref(
-            leaf,
-            params=DecLockRefParams(swa_uuid_for_lock=result.swa_uuid_for_lock),
-        )
-
-        self.assertEqual(tree.swa_protected_size_, 0)
-        self.assertEqual(tree.full_protected_size_, 0)
-        tree.sanity_check()
-
 
 class _SinglePoolAllocator(BaseTokenToKVPoolAllocator):
     """Minimal single-pool allocator: no SWA peer, so the whole range dies
@@ -987,7 +358,7 @@ class TestFreeFullPartition(CustomTestCase):
     """`free_full` releases only the full side of a hybrid SWA allocator."""
 
     def setUp(self):
-        _, self.allocator, _ = _build_swa_tree(is_eagle=False)
+        self.allocator, _ = _build_swa_allocator()
         self.full_baseline = self.allocator.full_available_size()
         self.swa_baseline = self.allocator.swa_available_size()
 
@@ -1035,7 +406,7 @@ class TestFreeKvRow(CustomTestCase):
     whole, the SWA side only from the floor up."""
 
     def setUp(self):
-        _, self.allocator, _ = _build_swa_tree(is_eagle=False)
+        self.allocator, _ = _build_swa_allocator()
         self.full_baseline = self.allocator.full_available_size()
         self.swa_baseline = self.allocator.swa_available_size()
 
@@ -1072,7 +443,7 @@ class TestFreeKvRow(CustomTestCase):
                 self.assertEqual(self._sizes(), (self.full_baseline, self.swa_baseline))
 
     def test_below_floor_pieces_go_back_through_the_full_side(self):
-        _, allocator, _ = _build_swa_tree(is_eagle=False, page_size=4)
+        allocator, _ = _build_swa_allocator(page_size=4)
         indices = _swa_alloc(allocator, 8)
         allocator.free_swa(indices)
         after_alloc = allocator.full_available_size()
@@ -1092,7 +463,7 @@ class TestFreeKvRow(CustomTestCase):
         self.assertEqual(allocator.full_available_size(), after_alloc + 8)
 
     def test_grouped_full_side_frees_defer_and_skip_the_unique_path(self):
-        _, allocator, _ = _build_swa_tree(is_eagle=False, page_size=4)
+        allocator, _ = _build_swa_allocator(page_size=4)
         indices = _swa_alloc(allocator, 12)
         allocator.free_swa(indices[:8])
         after_alloc = allocator.full_available_size()
@@ -1113,7 +484,7 @@ class TestFreeKvRow(CustomTestCase):
     def test_free_kv_row_reads_the_record_row_and_its_floor(self):
         indices = _swa_alloc(self.allocator, 8)
         cache = _RowCache(self.allocator, indices)
-        kv = SimpleNamespace(req_pool_idx=0, swa_evicted_seqlen=3)
+        kv = ReqKvInfo(req_pool_idx=0, swa_evicted_seqlen=3)
         self.allocator.free_swa(indices[:3])
 
         cache.free_kv_row(kv, [(1, 5)])
@@ -1125,7 +496,7 @@ class TestFreeKvRow(CustomTestCase):
     def test_single_pool_free_kv_row_still_frees_the_whole_range(self):
         allocator = _SinglePoolAllocator()
         cache = _RowCache(allocator, torch.arange(16, dtype=torch.int64))
-        kv = SimpleNamespace(req_pool_idx=0, swa_evicted_seqlen=4)
+        kv = ReqKvInfo(req_pool_idx=0, swa_evicted_seqlen=4)
 
         cache.free_kv_row(kv, [(2, 6)])
 
@@ -1136,6 +507,20 @@ class TestFreeKvRow(CustomTestCase):
         cache.free_kv_row(kv, [(6, 6)])
         self.assertEqual(len(allocator.freed), 2)
 
+    def test_rows_below_the_dead_floor_are_still_alive(self):
+        # all-SWA: only [swa_dead_lo, cursor) is dead; [start, swa_dead_lo) is alive
+        allocator = _build_pure_swa_allocator(size_swa=16)
+        baseline = allocator.swa_available_size()
+        indices = _swa_alloc(allocator, 8)
+        allocator.free_swa(indices[4:6])
+        self.assertEqual(allocator.swa_available_size(), baseline - 6)
+
+        cache = _RowCache(allocator, indices)
+        kv = ReqKvInfo(req_pool_idx=0, swa_evicted_seqlen=6, swa_evict_floor=4)
+        cache.free_kv_row(kv, [(2, 8)])
+
+        self.assertEqual(allocator.swa_available_size(), baseline - 2)
+
 
 class TestSWAPeerMappedContract(CustomTestCase):
     """page_size 1 gives back every peer the mapping names, without filtering:
@@ -1144,15 +529,59 @@ class TestSWAPeerMappedContract(CustomTestCase):
     def _strict(self):
         return envs.SGLANG_INVARIANT_CHECK.override(int(InvariantCheckLevel.STRICT))
 
-    def _condition_checked_by(self, allocator, indices):
+    def _condition_checked_by(self, allocator, indices, start_pos=None):
         """The predicate free_swa hands the async assert, as a python bool."""
         with self._strict():
             with mock.patch.object(torch, "_assert_async") as assert_async:
-                allocator.free_swa(indices)
+                if start_pos is None:
+                    allocator.free_swa(indices)
+                else:
+                    allocator.free_swa_segment(indices, start_pos=start_pos)
         return bool(assert_async.call_args.args[0])
 
+    def test_segment_free_flags_a_page_whose_peer_is_already_gone(self):
+        allocator, _ = _build_swa_allocator(page_size=4)
+        live = _swa_alloc(allocator, 8)
+        stale = _swa_alloc(allocator, 8)
+        allocator.clear_full_to_swa_mapping(stale)
+
+        self.assertTrue(self._condition_checked_by(allocator, live, start_pos=0))
+        self.assertFalse(self._condition_checked_by(allocator, stale, start_pos=0))
+
+    @unittest.skipUnless(torch.cuda.is_available(), "sync detection needs CUDA")
+    def test_segment_free_does_not_synchronize_on_pages(self):
+        """page_size > 1: page reps by stride replace the page expansion's
+        filter and the inner allocator's torch.unique, in and out of a group."""
+        ps = 4
+        allocator, _ = _build_swa_allocator(page_size=ps)
+
+        def grouped(indices):
+            allocator.free_group_begin()
+            allocator.free_swa_segment(indices, start_pos=0)
+            allocator.free_group_end()
+
+        # Warm up both paths outside the window: a first-time cudaMalloc can
+        # synchronize on its own, which the detector would blame on this call.
+        allocator.free_swa_segment(_swa_alloc(allocator, 2 * ps), start_pos=0)
+        grouped(_swa_alloc(allocator, 2 * ps))
+        first = _swa_alloc(allocator, 3 * ps)
+        second = _swa_alloc(allocator, 2 * ps)
+
+        # Gate on the pre-fix form: a detector blind to this sync class would pass
+        # the asserts below no matter how free_swa derives the pages.
+        if _sync_error(lambda: torch.unique(first // ps)) is None:
+            self.skipTest("sync debug mode does not flag a data-dependent shape here")
+
+        with self._strict():
+            self.assertIsNone(
+                _sync_error(
+                    lambda: allocator.free_swa_segment(first[: 3 * ps - 1], start_pos=0)
+                )
+            )
+            self.assertIsNone(_sync_error(lambda: grouped(second[: 2 * ps - 1])))
+
     def test_free_swa_flags_a_slot_whose_peer_is_already_gone(self):
-        _, allocator, _ = _build_swa_tree(is_eagle=False)
+        allocator, _ = _build_swa_allocator()
         live = _swa_alloc(allocator, 4)
         stale = _swa_alloc(allocator, 4)
         # Whoever released the peer left the mapping reading as the padding slot.
@@ -1165,7 +594,7 @@ class TestSWAPeerMappedContract(CustomTestCase):
     def test_free_swa_does_not_synchronize(self):
         """The filter's output shape was data-dependent, so it read a count back
         to the host; the gather that replaced it has a fixed shape."""
-        _, allocator, _ = _build_swa_tree(is_eagle=False)
+        allocator, _ = _build_swa_allocator()
         mapping = allocator.full_to_swa_index_mapping
 
         # Warm up outside the window: a first-time cudaMalloc can synchronize on
@@ -1183,59 +612,234 @@ class TestSWAPeerMappedContract(CustomTestCase):
             self.assertIsNone(_sync_error(lambda: allocator.free_swa(indices)))
 
 
-class TestCacheUnfinishedReqEvictedPrefix(CustomTestCase):
-    """An unfinished request whose SWA prefix is already gone must insert that
-    prefix as a tombstone, not as live SWA KV."""
+@unittest.skipUnless(torch.cuda.is_available(), "paged allocation kernels need CUDA")
+class TestSWAReqRingFree(CustomTestCase):
+    PS = 256
 
-    def test_evicted_prefix_inserts_as_tombstone(self):
-        page_size, window, num_tokens, evicted = 4, 4, 16, 8
-        tree, allocator, req_to_token_pool = _build_swa_tree(
-            is_eagle=False, page_size=page_size, sliding_window_size=window
+    def _allocated_ring(self):
+        ps = self.PS
+        allocator, req_pool = _build_swa_allocator(
+            page_size=ps,
+            req_size=2,
+            max_context_len=4 * ps,
+            kv_size=4 * ps,
+            kv_size_swa=2 * ps,
+            swa_req_ring_size=ps,
         )
-        kv_indices = _swa_alloc(allocator, num_tokens)
-        req_to_token_pool.write((0, slice(0, num_tokens)), kv_indices)
-        # Drop the prefix's SWA peers, as window eviction would.
-        allocator.free_swa(kv_indices[:evicted])
-        swa_before = allocator.swa_available_size()
-
-        token_ids = array("q", range(1, num_tokens + 1))
-        req = _DummyReq()
-        req.kv.req_pool_idx = 0
-        req.origin_input_ids = token_ids
-        req.output_ids = array("q")
-        req.get_fill_ids = lambda: token_ids
-        req.extra_key = None
-        req.cache_salt = None
-        req.kv.cache_protected_len = 0
-        req.last_node = tree.root_node
-        req.swa_uuid_for_lock = None
-        req.prefix_indices = torch.empty(0, dtype=torch.int64, device=tree.device)
-        req.kv.swa_evicted_seqlen = evicted
-
-        tree.cache_unfinished_req(req)
-
-        # The insert itself frees nothing.
-        self.assertEqual(allocator.swa_available_size(), swa_before)
-        # The live leaf holds a full window, so the whole key stays matchable.
-        self.assertEqual(req.kv.cache_protected_len, num_tokens)
-        # [0, evicted) is a tombstone; only [evicted, num_tokens) counts as SWA.
-        (first,) = tree.root_node.children.values()
-        self.assertTrue(first.swa_tombstone)
-        self.assertEqual(len(first.value), evicted)
-        self.assertEqual(
-            tree.swa_evictable_size_ + tree.swa_protected_size_,
-            num_tokens - evicted,
+        self.assertTrue(allocator.swa_req_ring)
+        self.assertIsNotNone(req_pool.alloc_rows(1))
+        device = allocator.device
+        prefix_cpu = torch.tensor([0], dtype=torch.int64)
+        seq_cpu = torch.tensor([2 * ps], dtype=torch.int64)
+        # Use the real ring allocation paths: only FULL pages are allocated.
+        indices = allocator.alloc_extend(
+            prefix_cpu.to(device),
+            prefix_cpu,
+            seq_cpu.to(device),
+            seq_cpu,
+            torch.tensor([-1], dtype=torch.int64, device=device),
+            2 * ps,
         )
-
-        # Finishing drops the locks, which sanity_check needs; the accounting
-        # must survive the re-walk.
-        tree.cache_finished_req(req, kv_len_to_handle=num_tokens)
-        self.assertEqual(allocator.swa_available_size(), swa_before)
-        self.assertEqual(
-            tree.swa_evictable_size_ + tree.swa_protected_size_,
-            num_tokens - evicted,
+        self.assertIsNotNone(indices)
+        decoded = allocator.alloc_decode(
+            (seq_cpu + 1).to(device), seq_cpu + 1, indices[-1:]
         )
-        tree.sanity_check()
+        self.assertIsNotNone(decoded)
+        indices = torch.cat((indices, decoded))
+        self.assertTrue(torch.all(allocator.full_to_swa_index_mapping[indices] == 0))
+        self.assertEqual(allocator.full_available_size(), ps)
+        return allocator, indices
+
+    def test_swa_only_frees_leave_the_paged_pool_untouched(self):
+        for segment in (False, True):
+            for grouped in (False, True):
+                with self.subTest(segment=segment, grouped=grouped):
+                    allocator, indices = self._allocated_ring()
+                    swa_pages = (
+                        allocator.swa_attn_allocator.get_all_free_pages().clone()
+                    )
+                    swa_available = allocator.swa_available_size()
+                    if grouped:
+                        allocator.free_group_begin()
+                    if segment:
+                        allocator.free_swa_segment(indices, start_pos=0)
+                    else:
+                        allocator.free_swa(indices)
+                    self.assertEqual(allocator.swa_free_group, [])
+                    self.assertEqual(allocator.swa_page_ids_group, [])
+                    if grouped:
+                        allocator.free_group_end()
+                    self.assertTrue(
+                        torch.equal(
+                            allocator.swa_attn_allocator.get_all_free_pages(), swa_pages
+                        )
+                    )
+                    self.assertEqual(allocator.swa_available_size(), swa_available)
+                    self.assertEqual(allocator.full_available_size(), self.PS)
+                    self.assertTrue(
+                        torch.all(allocator.full_to_swa_index_mapping[indices] == 0)
+                    )
+
+    def test_combined_frees_still_release_full_pages(self):
+        for segment in (False, True):
+            for grouped in (False, True):
+                with self.subTest(segment=segment, grouped=grouped):
+                    allocator, indices = self._allocated_ring()
+                    swa_pages = (
+                        allocator.swa_attn_allocator.get_all_free_pages().clone()
+                    )
+                    if grouped:
+                        allocator.free_group_begin()
+                    if segment:
+                        allocator.free_segment(indices, start_pos=0)
+                    else:
+                        allocator.free(indices)
+                    if grouped:
+                        self.assertEqual(allocator.full_available_size(), self.PS)
+                        allocator.free_group_end()
+                    self.assertEqual(
+                        allocator.full_available_size(), allocator.size_full
+                    )
+                    self.assertTrue(
+                        torch.equal(
+                            allocator.swa_attn_allocator.get_all_free_pages(), swa_pages
+                        )
+                    )
+                    full_pages = allocator.full_attn_allocator.get_all_free_pages()
+                    self.assertTrue(torch.all(full_pages > 0))
+                    self.assertEqual(torch.unique(full_pages).numel(), 4)
+
+    def test_swa_only_frees_do_not_synchronize(self):
+        allocator, indices = self._allocated_ring()
+        peers = allocator.full_to_swa_index_mapping[indices]
+        if _sync_error(lambda: peers[peers > 0]) is None:
+            self.skipTest("sync debug mode does not flag a data-dependent shape here")
+
+        with envs.SGLANG_INVARIANT_CHECK.override(int(InvariantCheckLevel.STRICT)):
+            for grouped in (False, True):
+                with self.subTest(grouped=grouped):
+                    if grouped:
+                        allocator.free_group_begin()
+                    self.assertIsNone(_sync_error(lambda: allocator.free_swa(indices)))
+                    self.assertIsNone(
+                        _sync_error(
+                            lambda: allocator.free_swa_segment(indices, start_pos=0)
+                        )
+                    )
+                    if grouped:
+                        self.assertIsNone(_sync_error(allocator.free_group_end))
+
+
+class TestSWAPageRepsFree(CustomTestCase):
+    """page_size > 1: with a start position the SWA side frees one representative
+    per page instead of expanding, filtering and dedup'ing through torch.unique."""
+
+    PS = 4
+
+    def _allocator(self):
+        allocator, _ = _build_swa_allocator(page_size=self.PS)
+        return allocator
+
+    def _sizes(self, allocator):
+        return allocator.full_available_size(), allocator.swa_available_size()
+
+    @unittest.skipUnless(torch.cuda.is_available(), "needs a tensor with is_cuda=True")
+    def test_free_swa_segment_npu_uses_reference_path(self):
+        for page_size in (1, 4):
+            with self.subTest(page_size=page_size):
+                allocator, _ = _build_swa_allocator(
+                    page_size=page_size,
+                    kv_size=8 * page_size,
+                    kv_size_swa=8 * page_size,
+                )
+                available_before = allocator.swa_available_size()
+                full_indices = _swa_alloc(allocator, page_size)
+                self.assertTrue(full_indices.is_cuda)
+
+                # transfer_to_npu makes NPU tensors report is_cuda=True as well.
+                with (
+                    patch("sglang.srt.mem_cache.allocator.swa._is_npu", True),
+                    patch(
+                        "sglang.srt.mem_cache.allocator.swa.get_and_clear_swa_pages",
+                        side_effect=AssertionError("NPU free reached Triton"),
+                    ),
+                ):
+                    allocator.free_swa_segment(full_indices[:1], start_pos=0)
+
+                self.assertEqual(allocator.swa_available_size(), available_before)
+                self.assertTrue(
+                    torch.all(allocator.full_to_swa_index_mapping[full_indices] == 0)
+                )
+
+    def test_free_swa_segment_debug_rejects_invalid_page_mappings(self):
+        page_size = 4
+
+        def leading_hole(mapping, full_indices, _swa_indices):
+            mapping[full_indices[0]] = 0
+
+        def multiple_peers(mapping, full_indices, swa_indices):
+            mapping[full_indices[2:page_size]] = swa_indices[
+                page_size + 2 : 2 * page_size
+            ]
+
+        def duplicate_peer(mapping, full_indices, swa_indices):
+            mapping[full_indices[page_size : 2 * page_size]] = swa_indices[:page_size]
+
+        def duplicate_representative(_mapping, full_indices, _swa_indices):
+            full_indices[-page_size:] = full_indices[:page_size]
+
+        for name, mutate, num_tokens in (
+            ("leading_hole", leading_hole, page_size),
+            ("multiple_peers", multiple_peers, page_size),
+            ("duplicate_peer", duplicate_peer, 2 * page_size),
+            # At page size 4, representatives 0 and 64 belong to separate programs.
+            ("duplicate_representative", duplicate_representative, 65 * page_size),
+        ):
+            with self.subTest(name=name):
+                num_allocated_tokens = max(2 * page_size, num_tokens)
+                kv_size = max(8 * page_size, num_allocated_tokens)
+                allocator, _ = _build_swa_allocator(
+                    page_size=page_size,
+                    kv_size=kv_size,
+                    kv_size_swa=kv_size,
+                )
+                full_indices = _swa_alloc(allocator, num_allocated_tokens)
+                mapping = allocator.full_to_swa_index_mapping
+                swa_indices = mapping[full_indices].clone()
+                mutate(mapping, full_indices, swa_indices)
+                allocator.swa_attn_allocator.debug_mode = True
+
+                # Exercise debug validation without CI's fatal async assertion.
+                with (
+                    patch.dict(
+                        "os.environ",
+                        {"SGLANG_INVARIANT_CHECK": str(int(InvariantCheckLevel.OFF))},
+                    ),
+                    self.assertRaisesRegex(
+                        AssertionError, "swa pages do not match the mapped pages"
+                    ),
+                ):
+                    allocator.free_swa_segment(full_indices[:num_tokens], start_pos=0)
+
+    def test_segment_free_releases_the_mapped_pages_for_every_tail(self):
+        ps = self.PS
+        for num_tokens in (1, ps, ps + 1, 3 * ps - 1, 3 * ps):
+            with self.subTest(num_tokens=num_tokens):
+                allocator = self._allocator()
+                indices = _swa_alloc(allocator, 3 * ps)
+                mapping = allocator.full_to_swa_index_mapping
+                expected = torch.unique(mapping[indices[:num_tokens]] // ps)
+                before = allocator.swa_attn_allocator.free_pages.numel()
+
+                allocator.free_swa_segment(indices[:num_tokens], start_pos=0)
+
+                free_pages = allocator.swa_attn_allocator.free_pages
+                freed = free_pages[: free_pages.numel() - before]
+                self.assertTrue(torch.equal(torch.sort(freed)[0], expected))
+                # The whole last page goes back, and its mapping with it.
+                touched = -(num_tokens // -ps) * ps
+                self.assertTrue(torch.all(mapping[indices[:touched]] == 0))
+                self.assertTrue(torch.all(mapping[indices[touched:]] > 0))
 
 
 if __name__ == "__main__":

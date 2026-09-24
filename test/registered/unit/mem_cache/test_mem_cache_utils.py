@@ -56,10 +56,11 @@ def _legacy_page_hashes(key, page_size, prior_hash=None):
 
 
 class _HashKey:
-    def __init__(self, token_ids, is_bigram=False, cache_salt=None):
+    def __init__(self, token_ids, is_bigram=False, cache_salt=None, extra_key=None):
         self.token_ids = token_ids
         self.is_bigram = is_bigram
         self.cache_salt = cache_salt
+        self.extra_key = extra_key
 
     def __len__(self):
         if self.is_bigram:
@@ -75,17 +76,19 @@ class _HashKey:
                     self.token_ids[start : stop + 1],
                     is_bigram=True,
                     cache_salt=self.cache_salt,
+                    extra_key=self.extra_key,
                 )
-            return _HashKey(self.token_ids[start:stop], cache_salt=self.cache_salt)
+            return _HashKey(
+                self.token_ids[start:stop],
+                cache_salt=self.cache_salt,
+                extra_key=self.extra_key,
+            )
         if self.is_bigram:
             return (self.token_ids[index], self.token_ids[index + 1])
         return self.token_ids[index]
 
     def raw_token_ids(self):
         return self.token_ids
-
-    def hash_page(self, start, end, prior_hash=None):
-        return _legacy_get_hash_str(self[start:end], prior_hash)
 
 
 def _single_hash_compatibility_cases():
@@ -257,13 +260,50 @@ class TestGetHashStr(unittest.TestCase):
             with self.subTest(tokens=tokens):
                 self.assertRegex(get_hash_str(tokens), r"^[0-9a-f]{64}$")
 
-    def test_hash_key_hash_page_matches_get_hash_str(self):
-        key = _HashKey(array("q", [1, 2, 3, 4, 5, 6]), is_bigram=True)
-        prior_hash = get_hash_str([(9, 10)])
 
+class TestStorageHashNamespace(unittest.TestCase):
+    def test_node_hashes_isolate_namespaces_and_continue_the_chain(self):
+        root = SimpleNamespace(parent=None, key=_HashKey(array("q")), hash_value=None)
+        tokens = array("q", range(1, 129))
+
+        def child(extra_key=None, cache_salt=None):
+            return SimpleNamespace(
+                parent=root,
+                key=_HashKey(tokens, extra_key=extra_key, cache_salt=cache_salt),
+                hash_value=None,
+            )
+
+        plain = compute_node_hash_values(child(), page_size=64)
+        self.assertEqual(plain, get_hash_str(tokens, None, page_size=64))
+        # Also guard ambiguous concatenations: ("a", "bc") vs ("ab", "c").
+        namespaced = [
+            compute_node_hash_values(child(*namespace), page_size=64)
+            for namespace in [
+                ("lora-a", None),
+                ("lora-b", None),
+                (None, "tenant-a"),
+                ("lora-a", "tenant-a"),
+                ("a", "bc"),
+                ("ab", "c"),
+            ]
+        ]
+        for i in range(len(plain)):
+            page_hashes = {plain[i], *(hashes[i] for hashes in namespaced)}
+            self.assertEqual(len(page_hashes), 1 + len(namespaced))
+
+        # Continue the parent chain without re-seeding.
+        parent = child("lora-a", "tenant-a")
+        parent.hash_value = namespaced[3]
+        grand = SimpleNamespace(
+            parent=parent,
+            key=_HashKey(
+                array("q", range(200, 264)), extra_key="lora-a", cache_salt="tenant-a"
+            ),
+            hash_value=None,
+        )
         self.assertEqual(
-            key.hash_page(1, 4, prior_hash),
-            get_hash_str(key[1:4], prior_hash),
+            compute_node_hash_values(grand, page_size=64),
+            get_hash_str(array("q", range(200, 264)), namespaced[3][-1], page_size=64),
         )
 
 
@@ -332,10 +372,6 @@ class TestComputeNodeHashValues(unittest.TestCase):
         self.assertEqual(
             compute_node_event_hash_values(self._make_node(key), page_size=8),
             _legacy_page_hashes(key, page_size=8, prior_hash=seed),
-        )
-        self.assertEqual(
-            compute_node_hash_values(self._make_node(key), page_size=8),
-            _legacy_page_hashes(key, page_size=8),
         )
 
         other = _HashKey(array("q", range(1, 17)), cache_salt="tenant-b")

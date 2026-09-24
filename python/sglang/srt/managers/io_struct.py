@@ -54,10 +54,12 @@ from sglang.srt.beam_search.types import BeamSearchSequence
 from sglang.srt.environ import envs
 from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.managers.embed_types import PositionalEmbeds
+from sglang.srt.managers.kv_hints import KvHintsEnvelope, decode_kv_hints_envelope
 from sglang.srt.managers.schedule_batch import (
     Modality,
     MultimodalProcessorOutput,
     ReturnHiddenStatesMode,
+    SamplingLogprobsMode,
     get_return_hidden_states_mode,
 )
 from sglang.srt.multimodal.mm_utils import has_valid_data
@@ -231,8 +233,14 @@ class GenerateReqInput:
     top_logprobs_num: Optional[Union[List[int], int]] = None
     # If return logprobs, the token ids to return logprob for.
     token_ids_logprob: Optional[Union[List[List[int]], List[int]]] = None
-    # Whether to return output-token sampling support and renormalized logprobs.
+    # Whether to return each output token's sampling support and behavior logprob.
     return_sampling_mask: Optional[Union[List[bool], bool]] = None
+    # Return either the selected token's behavior logprob or behavior logprobs for
+    # the full sampling support. When omitted, selected mode is used if
+    # return_sampling_mask is enabled.
+    sampling_logprobs_mode: Optional[
+        Union[List[Optional[SamplingLogprobsMode]], SamplingLogprobsMode]
+    ] = None
     # Whether to detokenize tokens in text in the returned logprobs.
     return_text_in_logprobs: bool = False
     # Return prompt top logprobs as flat arrays plus shape metadata instead of
@@ -351,6 +359,16 @@ class GenerateReqInput:
     # Cache namespace used to isolate otherwise-identical prefixes.
     cache_salt: Optional[Union[List[str], str]] = None
 
+    # Versioned KV-hint envelope, set by a trusted orchestrator after worker
+    # selection and never by an application client. Passed through untouched to
+    # the HiCache storage backends, each of which reads only the action types it
+    # implements. Accepts a plain dict from HTTP/gRPC; normalization converts it
+    # to KvHintsEnvelope. A hint describes one request's prefix, so a batch
+    # carries one envelope per request.
+    kv_hints: Optional[
+        Union[List[Optional[Union[Dict, KvHintsEnvelope]]], Dict, KvHintsEnvelope]
+    ] = None
+
     def regenerate_rid(self):
         """Generate a new request ID and return it."""
         if isinstance(self.rid, list):
@@ -454,8 +472,18 @@ class GenerateReqInput:
             self.input_embeds = None
         elif self.input_ids is not None:
             if len(self.input_ids) == 0:
-                raise ValueError("input_ids cannot be empty.")
-            if isinstance(self.input_ids[0], int):
+                # Session history may supply the entire prompt. The scheduler
+                # rejects requests that are still empty after reconstruction.
+                session_id = (
+                    self.session_params.get("id")
+                    if isinstance(self.session_params, dict)
+                    else None
+                )
+                if not session_id:
+                    raise ValueError("input_ids cannot be empty.")
+                self.is_single = True
+                self.batch_size = 1
+            elif isinstance(self.input_ids[0], int):
                 self.is_single = True
                 self.batch_size = 1
             else:
@@ -536,6 +564,11 @@ class GenerateReqInput:
                 )
             if value == "":
                 setattr(self, field_name, None)
+        if isinstance(self.kv_hints, list):
+            raise ValueError("kv_hints should be a single envelope for one request.")
+        self.kv_hints = (
+            decode_kv_hints_envelope(self.kv_hints) if self.kv_hints else None
+        )
 
     def _normalize_batch_inputs(self):
         """Normalize inputs for a batch of examples, including parallel sampling expansion."""
@@ -560,6 +593,7 @@ class GenerateReqInput:
         self._normalize_custom_logit_processor(num)
         self._normalize_extra_key(num)
         self._normalize_cache_salt(num)
+        self._normalize_kv_hints(num)
         self._normalize_bootstrap_params(num)
 
     def _expand_inputs(self, num):
@@ -741,6 +775,9 @@ class GenerateReqInput:
         self.return_sampling_mask = normalize_param(
             self.return_sampling_mask, False, "return_sampling_mask"
         )
+        self.sampling_logprobs_mode = normalize_param(
+            self.sampling_logprobs_mode, None, "sampling_logprobs_mode"
+        )
 
         # Handle token_ids_logprob specially due to its nested structure
         if not self.token_ids_logprob:  # covers both None and []
@@ -820,6 +857,25 @@ class GenerateReqInput:
             self.cache_salt = self.cache_salt * self.parallel_sample_num
         else:
             raise ValueError("cache_salt should be a list or a string.")
+
+    def _normalize_kv_hints(self, num):
+        """Normalize kv_hints for batch processing."""
+        if self.kv_hints is None:
+            return
+        if isinstance(self.kv_hints, (dict, KvHintsEnvelope)):
+            self.kv_hints = [decode_kv_hints_envelope(self.kv_hints)] * num
+        elif isinstance(self.kv_hints, list):
+            if len(self.kv_hints) != self.batch_size:
+                raise ValueError(
+                    "The length of kv_hints should be equal to the batch size."
+                )
+            self.kv_hints = [
+                decode_kv_hints_envelope(value) if value else None
+                for value in self.kv_hints
+            ]
+            self.kv_hints = self.kv_hints * self.parallel_sample_num
+        else:
+            raise ValueError("kv_hints should be a list or a dict.")
 
     def _normalize_bootstrap_params(self, num):
         """Normalize bootstrap parameters for batch processing."""
@@ -902,6 +958,7 @@ class GenerateReqInput:
             top_logprobs_num=self.top_logprobs_num[i],
             token_ids_logprob=self.token_ids_logprob[i],
             return_sampling_mask=self.return_sampling_mask[i],
+            sampling_logprobs_mode=self.sampling_logprobs_mode[i],
             return_text_in_logprobs=self.return_text_in_logprobs,
             return_flat_raw_top_logprobs=self.return_flat_raw_top_logprobs,
             return_flat_raw_top_logprobs_b64=self.return_flat_raw_top_logprobs_b64,
@@ -952,6 +1009,7 @@ class GenerateReqInput:
             priority=self.priority,
             extra_key=self.extra_key[i] if self.extra_key is not None else None,
             cache_salt=(self.cache_salt[i] if self.cache_salt is not None else None),
+            kv_hints=(self.kv_hints[i] if self.kv_hints is not None else None),
             no_logs=self.no_logs,
             custom_labels=self.custom_labels,
             return_bytes=self.return_bytes,
@@ -1067,6 +1125,18 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
 
     # Cache namespace used to isolate otherwise-identical prefixes.
     cache_salt: Optional[str] = None
+
+    # See GenerateReqInput.kv_hints. A defaulted tail field: the Rust server
+    # stops emitting at disagg_prefill_dp_rank, so this slot decodes as None
+    # from its shorter arrays.
+    kv_hints: Optional[KvHintsEnvelope] = None
+
+    # Internal PP control bit, set by PP0 before forwarding the request.
+    # Keep tail fields append-only to preserve the positional Rust wire schema.
+    pp_prefetch_ticketed: bool = False
+    # Shape of output_token_sampling_logprobs for each output token. This is a
+    # defaulted tail field so older IPC senders decode as selected mode.
+    sampling_logprobs_mode: SamplingLogprobsMode = "selected"
 
     def wrap_pickle_fields(self):
         self.time_stats = wrap_as_pickle(self.time_stats)
@@ -1458,10 +1528,10 @@ class BatchTokenIDOutput(BaseBatchReq, kw_only=True):
     output_token_entropy_val: Optional[List[Optional[float]]]
     # Per-request chunks of output-token sampling supports. None when no request
     # in the batch asks for return_sampling_mask.
-    output_token_sampling_mask: Optional[List[List]]
-    # Per-request chunks of selected-token logprobs renormalized over the
-    # corresponding sampling supports. None when sampling masks are not returned.
-    output_token_sampling_logprobs: Optional[List[List]]
+    output_token_sampling_mask: Optional[List[List[List[int]]]]
+    # Per-request chunks. Each output-token entry is a selected-token scalar or
+    # a list aligned with output_token_sampling_mask, according to the request.
+    output_token_sampling_logprobs: Optional[List[List[Union[float, List[float]]]]]
 
     # Hidden states
     output_hidden_states: OutputHiddenStates
@@ -1556,10 +1626,10 @@ class BatchStrOutput(BaseBatchReq, kw_only=True):
     output_token_ids_logprobs_val: TokenIdsLogprobValues
     output_token_ids_logprobs_idx: TokenIdsLogprobIndices
     output_token_entropy_val: Optional[List[Optional[float]]]
-    # Detokenizer pass-through for BatchTokenIDOutput.output_token_sampling_*.
-    # None when sampling masks are not returned.
-    output_token_sampling_mask: Optional[List[List]]
-    output_token_sampling_logprobs: Optional[List[List]]
+    # Detokenizer pass-through for BatchTokenIDOutput.output_token_sampling_*;
+    # support-mode logprobs are aligned elementwise with the token IDs.
+    output_token_sampling_mask: Optional[List[List[List[int]]]]
+    output_token_sampling_logprobs: Optional[List[List[Union[float, List[float]]]]]
 
     # Hidden states
     output_hidden_states: OutputHiddenStates
@@ -1819,6 +1889,8 @@ class UpdateWeightsFromDistributedReqInput(BaseReq, kw_only=True):
     weight_version: Optional[str] = None
     # Optional format specification for loading
     load_format: Optional[str] = None
+    # which runners the op applies to
+    selector: Literal["target", "draft", "all"] = "all"
     # Whether to call torch.cuda.empty_cache() during flush
     torch_empty_cache: bool = False
 
@@ -1845,8 +1917,8 @@ class UpdateWeightsFromTensorReqInput(BaseReq, kw_only=True):
     abort_all_requests: bool = False
     # Optional: Update weight version along with weights
     weight_version: Optional[str] = None
-    # Optional: Determine whether to disable updating the draft model
-    disable_draft_model: Optional[bool] = None
+    # which runners the op applies to
+    selector: Literal["target", "draft", "all"] = "all"
     # Whether to call torch.cuda.empty_cache() during flush
     torch_empty_cache: bool = False
 
@@ -1998,15 +2070,41 @@ class ResumeMemoryOccupationReqOutput(BaseReq, kw_only=True):
     pass
 
 
+class BeginWeightUpdateReqInput(BaseReq, kw_only=True):
+    """Open a weight-update session: restore in-place-packed weights so new ones can load."""
+
+    selector: Literal["target", "draft", "all"] = "all"
+
+
+class BeginWeightUpdateReqOutput(BaseReq, kw_only=True):
+    success: bool
+    message: str
+
+
+class EndWeightUpdateReqInput(BaseReq, kw_only=True):
+    """Close the weight-update session opened by BeginWeightUpdateReqInput."""
+
+
+class EndWeightUpdateReqOutput(BaseReq, kw_only=True):
+    success: bool
+    message: str
+
+
 class CheckWeightsReqInput(BaseReq, kw_only=True):
     action: str = "checksum"
     allow_quant_error: bool = False
+    # Substrings of tensor names to exclude from reset/compare/checksum.
+    skip_tensor_list: Optional[List[str]] = None
+    # which runners the op applies to
+    selector: Literal["target", "draft", "all"] = "all"
 
 
 # Wire versions of the pydantic ParallelismInfo/ChecksumInfo in
 # sglang.srt.utils.weight_checker. Not array_like: the payload is read by field
 # name and re-serialized to JSON, so it must stay a {field: value} map.
 class ParallelismInfo(msgspec.Struct, kw_only=True):
+    # "target", or a draft role such as "draft" / "draft_step_0"
+    role: str
     tp_rank: int
     tp_size: int
     dp_rank: int
@@ -2020,7 +2118,8 @@ class ParallelismInfo(msgspec.Struct, kw_only=True):
 class ChecksumInfo(msgspec.Struct, kw_only=True):
     checksums: Dict[str, str]
     per_gpu_checksum: str
-    parallelism_info: ParallelismInfo
+    # one entry per role (target plus each draft runner); all share the GPU rank
+    parallelism_info: List[ParallelismInfo]
 
 
 class CheckWeightsReqOutput(BaseReq, kw_only=True):
@@ -2037,6 +2136,24 @@ class SlowDownReqInput(BaseReq, kw_only=True):
 
 class SlowDownReqOutput(BaseReq, kw_only=True):
     pass
+
+
+class PdRoleSwitchReqInput(BaseReq, kw_only=True):
+    # Target role; "" is an invalid sentinel rejected by the handler.
+    new_role: Literal["prefill", "decode", ""] = ""
+    # Optional decode bs to capture on a flip to decode (capture-to-fit);
+    # None uses the server's configured decode bs list.
+    decode_cuda_graph_bs: Optional[List[int]] = None
+    # Measured graph footprint from a matching decode peer.
+    decode_cuda_graph_memory_gb: Optional[float] = None
+
+
+class PdRoleSwitchReqOutput(BaseReq, kw_only=True):
+    success: bool = False
+    message: str = ""
+    old_role: str = ""
+    new_role: str = ""
+    safe_to_restore: bool = False
 
 
 class AbortReq(BaseReq, kw_only=True):

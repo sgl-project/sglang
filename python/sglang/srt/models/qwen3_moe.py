@@ -19,22 +19,17 @@
 
 import logging
 import math
+from functools import lru_cache
 from typing import Any, Dict, Iterable, List, Optional, Tuple, TypeVar
 
 import torch
 from torch import nn
 from transformers import PretrainedConfig
 
-from sglang.srt.distributed import (
-    get_pp_group,
-    moe_expert_parallel_all_reduce,
-    moe_tensor_model_parallel_all_reduce,
-)
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.layers.communicator import LayerCommunicator, LayerScatterModes
-from sglang.srt.layers.cp.utils import enable_cp_v2
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     QKVParallelLinear,
@@ -44,11 +39,11 @@ from sglang.srt.layers.linear import (
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe import (
     get_moe_a2a_backend,
-    should_skip_post_experts_all_reduce,
+    post_experts_all_reduce,
 )
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
-from sglang.srt.layers.moe.topk import TopK
+from sglang.srt.layers.moe.topk import TopK, TopKOutputChecker
 from sglang.srt.layers.moe.utils import (
     RoutingMethodType,
     filter_moe_weight_param_global_expert,
@@ -58,11 +53,6 @@ from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import MRotaryEmbedding, get_rope
 from sglang.srt.layers.utils import get_layer_id
-from sglang.srt.layers.utils.cp_utils import (
-    can_cp_split,
-    is_prefill_context_parallel_enabled,
-    prepare_context_parallel_metadata,
-)
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import default_weight_loader
@@ -73,10 +63,11 @@ from sglang.srt.models.utils import (
     create_fused_set_kv_buffer_arg,
     enable_fused_set_kv_buffer,
 )
-from sglang.srt.runtime_context import get_exec, get_forward, get_parallel, get_stream
+from sglang.srt.runtime_context import get_exec, get_parallel, get_stream
 from sglang.srt.utils import (
     LazyValue,
     add_prefix,
+    is_cpu,
     is_cuda,
     is_flashinfer_available,
     is_non_idle_and_non_empty,
@@ -85,12 +76,19 @@ from sglang.srt.utils import (
 from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
 _is_cuda = is_cuda()
+_is_cpu = is_cpu()
 
 if _is_cuda:
     from sglang.kernels.ops.attention.fused_qknorm_rope import (
         can_use_fused_qk_norm_rope,
         fused_qk_norm_rope,
     )
+
+
+@lru_cache(maxsize=1)
+def _has_cpu_fused_qk_norm_rope() -> bool:
+    return hasattr(torch.ops.sgl_kernel, "fused_qk_norm_rope_cpu")
+
 
 TConfig = TypeVar("TConfig", bound=PretrainedConfig)
 
@@ -293,12 +291,19 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
             )
             self.top_k = config.num_experts_per_tok
 
+        self._use_mega_moe = get_moe_a2a_backend().is_megamoe()
+        self._mega_top_k = config.num_experts_per_tok
+        self._mega_intermediate_size = config.moe_intermediate_size
+        self._mega_hidden_size = config.hidden_size
+
     def forward(
         self,
         hidden_states: torch.Tensor,
         forward_batch: Optional[ForwardBatch] = None,
     ) -> torch.Tensor:
 
+        if self._use_mega_moe:
+            return self._forward_mega_moe(hidden_states, forward_batch)
         if (
             not is_deepep_class_backend()
             and not get_moe_a2a_backend().is_ascend_fuseep()
@@ -324,22 +329,15 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
 
-        # router_logits: (num_tokens, n_experts)
-        router_logits, _ = self.gate(hidden_states)
-        topk_output = self.topk(hidden_states, router_logits)
+        if hidden_states.shape[0] > 0:
+            # router_logits: (num_tokens, n_experts)
+            router_logits, _ = self.gate(hidden_states)
+            topk_output = self.topk(hidden_states, router_logits)
+        else:
+            topk_output = self.topk.empty_topk_output(hidden_states.device)
         final_hidden_states = self.experts(hidden_states, topk_output)
 
-        if self.ep_size > 1 and not should_skip_post_experts_all_reduce(
-            is_tp_path=False
-        ):
-            final_hidden_states = moe_expert_parallel_all_reduce(final_hidden_states)
-
-        if self.tp_size > 1 and not should_skip_post_experts_all_reduce(
-            is_tp_path=True
-        ):
-            final_hidden_states = moe_tensor_model_parallel_all_reduce(
-                final_hidden_states
-            )
+        final_hidden_states = post_experts_all_reduce(final_hidden_states)
 
         return final_hidden_states.view(num_tokens, hidden_dim)
 
@@ -352,7 +350,7 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
             topk_output = self.topk(
                 hidden_states,
                 router_logits,
-                num_token_non_padded=forward_batch.num_token_non_padded,
+                num_token_non_padded=forward_batch.moe_num_token_non_padded(),
                 expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
                     layer_id=self.layer_id,
                 ),
@@ -364,6 +362,58 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
             topk_output=topk_output,
         )
         return final_hidden_states
+
+    def _forward_mega_moe(
+        self, hidden_states: torch.Tensor, forward_batch: Optional[ForwardBatch]
+    ) -> torch.Tensor:
+        # Same contract as forward_deepep: combined rows, no TP all-reduce.
+        from sglang.srt.layers.moe.mega_moe import (
+            is_mega_moe_experts_ready,
+            run_mega_routed_experts,
+        )
+
+        if not is_mega_moe_experts_ready(self.experts):
+            raise RuntimeError(
+                "moe_a2a_backend=megamoe needs MegaMoE expert weights on this "
+                "model: on SM100 load a checkpoint with MXFP4 or NVFP4 routed "
+                "experts; on SM90 load a block-FP8 checkpoint with a DeepGEMM "
+                "that ships fp8_mega_moe."
+            )
+
+        num_tokens = hidden_states.shape[0]
+        topk_ids = None
+        topk_weights = None
+        if num_tokens > 0:
+            router_logits, _ = self.gate(hidden_states)
+            topk_output = self.topk(
+                hidden_states,
+                router_logits,
+                num_token_non_padded=(
+                    forward_batch.moe_num_token_non_padded()
+                    if forward_batch is not None
+                    else None
+                ),
+                expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
+                    layer_id=self.layer_id,
+                ),
+            )
+            assert TopKOutputChecker.format_is_standard(topk_output), (
+                "MegaMoE pre-dispatch consumes raw topk ids/weights; "
+                "pick a MoE runner backend that emits standard TopK output"
+            )
+            topk_ids = topk_output.topk_ids
+            topk_weights = topk_output.topk_weights
+
+        return run_mega_routed_experts(
+            self.experts,
+            hidden_states,
+            topk_ids,
+            topk_weights,
+            hidden_size=self._mega_hidden_size,
+            intermediate_size=self._mega_intermediate_size,
+            top_k=self._mega_top_k,
+            num_tokens=num_tokens,
+        )
 
     def op_gate(self, state):
         if is_non_idle_and_non_empty(
@@ -384,7 +434,7 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
                 state.topk_output = self.topk(
                     hidden_states=hidden_states,
                     router_logits=router_logits,
-                    num_token_non_padded=state.forward_batch.num_token_non_padded,
+                    num_token_non_padded=state.forward_batch.moe_num_token_non_padded(),
                     expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
                         layer_id=self.layer_id,
                     ),
@@ -530,6 +580,12 @@ class Qwen3MoeAttention(nn.Module):
                 _yarn_factor != 1.0,
             )
         )
+        self.use_fused_qk_norm_rope_cpu = (
+            _is_cpu
+            and not isinstance(self.rotary_emb, MRotaryEmbedding)
+            and self.rotary_emb.rotary_dim % 2 == 0
+            and _has_cpu_fused_qk_norm_rope()
+        )
         self._used_fused_qk_norm_rope_last_call = False
 
         self.attn = RadixAttention(
@@ -597,31 +653,53 @@ class Qwen3MoeAttention(nn.Module):
         return None, forward_batch, inner_state
 
     def apply_qk_norm_rope(self, qkv, positions, forward_batch):
-        use_fused = self.use_fused_qk_norm_rope and qkv.dtype == torch.bfloat16
+        use_fused = (self.use_fused_qk_norm_rope and qkv.dtype == torch.bfloat16) or (
+            self.use_fused_qk_norm_rope_cpu
+            and qkv.dtype in (torch.bfloat16, torch.float16)
+        )
         if use_fused:
-            theta = self.rope_theta
-            positions = (
-                positions.view(-1).to(dtype=torch.int32, device=qkv.device).contiguous()
-            )
-            factor, low, high, attention_factor = compute_yarn_parameters(self.config)
-            fused_qk_norm_rope(
-                qkv,
-                self.num_heads,
-                self.num_kv_heads,
-                self.num_kv_heads,
-                self.head_dim,
-                self.q_norm.variance_epsilon,
-                self.q_norm.weight,
-                self.k_norm.weight,
-                theta,
-                self.rotary_emb.is_neox_style,
-                positions,
-                factor,
-                low,
-                high,
-                attention_factor,
-            )
-            q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+            if _is_cuda:
+                theta = self.rope_theta
+                positions = (
+                    positions.view(-1)
+                    .to(dtype=torch.int32, device=qkv.device)
+                    .contiguous()
+                )
+                factor, low, high, attention_factor = compute_yarn_parameters(
+                    self.config
+                )
+                fused_qk_norm_rope(
+                    qkv,
+                    self.num_heads,
+                    self.num_kv_heads,
+                    self.num_kv_heads,
+                    self.head_dim,
+                    self.q_norm.variance_epsilon,
+                    self.q_norm.weight,
+                    self.k_norm.weight,
+                    theta,
+                    self.rotary_emb.is_neox_style,
+                    positions,
+                    factor,
+                    low,
+                    high,
+                    attention_factor,
+                )
+                q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+            elif _is_cpu:
+                q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+                self.rotary_emb._match_cos_sin_cache_dtype(q)
+                torch.ops.sgl_kernel.fused_qk_norm_rope_cpu(
+                    q,
+                    k,
+                    self.q_norm.weight,
+                    self.k_norm.weight,
+                    self.q_norm.variance_epsilon,
+                    self.rotary_emb.is_neox_style,
+                    positions.view(-1),
+                    self.rotary_emb.cos_sin_cache,
+                    self.rotary_emb.rotary_dim,
+                )
             self._used_fused_qk_norm_rope_last_call = True
         else:
             # Fallback to non-fused QK Norm & RoPE implementation
@@ -829,29 +907,9 @@ class Qwen3MoeDecoderLayer(nn.Module):
             hidden_states, residual, forward_batch
         )
 
-        fuse_mlp_allreduce = (
-            self.layer_communicator.should_fuse_mlp_allreduce_with_next_layer(
-                forward_batch
-            )
-        )
-
-        # For DP with padding, reduce scatter can be used instead of all-reduce.
-        mlp_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
-            forward_batch
-        )
-
-        with get_forward().scoped(
-            fuse_mlp_allreduce=fuse_mlp_allreduce,
-            mlp_reduce_scatter=mlp_reduce_scatter,
-        ):
+        with self.layer_communicator.ffn_exit(forward_batch) as ffn_exit:
             hidden_states = self.mlp(hidden_states, forward_batch)
-
-        if fuse_mlp_allreduce:
-            hidden_states._sglang_needs_allreduce_fusion = True
-        else:
-            hidden_states, residual = self.layer_communicator.postprocess_layer(
-                hidden_states, residual, forward_batch
-            )
+        hidden_states, residual = ffn_exit.finish(hidden_states, residual)
 
         return hidden_states, residual
 
@@ -950,7 +1008,7 @@ class Qwen3MoeForCausalLM(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
         self.config = config
         self.quant_config = quant_config
         self.model = Qwen3MoeModel(
@@ -975,7 +1033,6 @@ class Qwen3MoeForCausalLM(nn.Module):
         )
 
         self.attn_cp_size = get_parallel().attn_cp_size
-        self.attn_cp_rank = get_parallel().attn_cp_rank
         self.moe_dp_size = get_parallel().moe_dp_size
 
         assert self.attn_cp_size % self.moe_dp_size == 0, (
@@ -995,15 +1052,6 @@ class Qwen3MoeForCausalLM(nn.Module):
         input_embeds: torch.Tensor = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> torch.Tensor:
-        if is_prefill_context_parallel_enabled() and not enable_cp_v2():
-            if can_cp_split(len(input_ids), self.attn_cp_size, forward_batch):
-                forward_batch.attn_cp_metadata = prepare_context_parallel_metadata(
-                    len(input_ids),
-                    self.attn_cp_rank,
-                    self.attn_cp_size,
-                    forward_batch.seq_lens_cpu.tolist(),
-                    extend_seqs_len=forward_batch.extend_seq_lens_cpu,
-                )
 
         hidden_states = self.model(
             input_ids,
