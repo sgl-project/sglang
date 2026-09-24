@@ -37,6 +37,7 @@ from sglang.srt.lora.lora_config import LoRAConfig
 from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.lora.mem_pool import LoRAMemoryPool
 from sglang.srt.lora.utils import (
+    _KNOWN_LORA_TARGET_MODULES,
     DSA_INDEXER_LORA_NAMES,
     EMBEDDING_NAMES,
     LoRAType,
@@ -821,7 +822,9 @@ class LoRAManager:
             )
             target_modules = self.target_modules
         elif target_modules:
-            self.target_modules = get_normalized_target_modules(target_modules)
+            self.target_modules = get_normalized_target_modules(
+                target_modules, base_model=self.base_model
+            )
         else:
             self.target_modules = set()
 
@@ -865,7 +868,7 @@ class LoRAManager:
                 )
 
             adapter_target_modules = get_normalized_target_modules(
-                config.target_modules
+                config.target_modules, base_model=self.base_model
             )
 
             if target_modules is not None:
@@ -882,6 +885,12 @@ class LoRAManager:
             else:
                 # Otherwise, infer target_modules from adapter configs.
                 self.target_modules.update(adapter_target_modules)
+
+        unsupported_targets = self.target_modules - _KNOWN_LORA_TARGET_MODULES
+        if unsupported_targets:
+            raise ValueError(
+                f"Unsupported normalized LoRA targets: {sorted(unsupported_targets)}"
+            )
 
         # Fusion folds wk + weights_proj into wk_weights_proj, so the modules
         # LoRA wraps are absent and an indexer-targeted adapter is silently dropped.
