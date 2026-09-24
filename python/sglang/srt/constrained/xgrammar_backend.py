@@ -20,6 +20,7 @@ from typing import Dict, List, Optional, Tuple, Union
 
 import torch
 from xgrammar import (
+    BatchGrammarMatcher,
     CompiledGrammar,
     GrammarCompiler,
     GrammarMatcher,
@@ -33,6 +34,7 @@ from xgrammar import (
 from sglang.srt.constrained.base_grammar_backend import (
     BaseGrammarBackend,
     BaseGrammarObject,
+    GrammarRow,
     GrammarStats,
     InvalidGrammarObject,
 )
@@ -60,6 +62,13 @@ from sglang.srt.constrained.torch_ops.token_filter_torch_ops import (
 
 logger = logging.getLogger(__name__)
 MAX_ROLLBACK_TOKENS = 200
+
+# ponytail: CPU-screened calibration knobs. Below the gate the per-row loop
+# wins; more threads cost more at small batches and contend with other
+# scheduler processes on the host ("auto" spans all cores and is slower).
+_BATCH_FILL_MIN_ROWS = 32
+_BATCH_FILL_THREADS = 4
+_batch_matcher: Optional[BatchGrammarMatcher] = None
 
 
 def _allocate_token_bitmask(vocab_size: int, batch_size: int) -> torch.Tensor:
@@ -121,6 +130,25 @@ class XGrammarGrammar(BaseGrammarObject):
 
     def fill_vocab_mask(self, vocab_mask: torch.Tensor, idx: int) -> None:
         self.matcher.fill_next_token_bitmask(vocab_mask, idx)
+
+    @staticmethod
+    def fill_vocab_mask_batched(
+        entries: List[GrammarRow], vocab_mask: torch.Tensor
+    ) -> None:
+        """Fill large batches of plain xgrammar rows with a small thread pool."""
+        if len(entries) < _BATCH_FILL_MIN_ROWS or not all(
+            type(entry.grammar) is XGrammarGrammar for entry in entries
+        ):
+            BaseGrammarObject.fill_vocab_mask_batched(entries, vocab_mask)
+            return
+        global _batch_matcher
+        if _batch_matcher is None:
+            _batch_matcher = BatchGrammarMatcher(max_threads=_BATCH_FILL_THREADS)
+        _batch_matcher.batch_fill_next_token_bitmask(
+            [entry.grammar.matcher for entry in entries],
+            vocab_mask,
+            [entry.row for entry in entries],
+        )
 
     @staticmethod
     def move_vocab_mask(vocab_mask: torch.Tensor, device) -> torch.Tensor:
