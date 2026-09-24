@@ -105,6 +105,32 @@ class TestFfnExit(CustomTestCase):
         self.assertEqual(seen, (False, False))
         communicator.postprocess_layer.assert_called_once()
 
+    def test_deferral_implies_fusion_and_passes_the_handoff_through(self):
+        """A deferring communicator publishes both flags, and a non-tensor
+        handoff leaves finish() untouched for the next layer's input norm."""
+
+        class Defers(LayerCommunicator):
+            def should_defer_moe_finalize(self, forward_batch, m=None):
+                return True
+
+            def should_fuse_mlp_allreduce_with_next_layer(self, forward_batch):
+                return False
+
+        communicator = make_communicator(fuse=False, reduce_scatter=False, cls=Defers)
+        handoff = object()
+        with communicator.ffn_exit(self.forward_batch) as ffn_exit:
+            seen = published_flags() + (get_forward().defer_moe_finalize,)
+        self.assertEqual(seen, (True, False, True))
+        self.assertEqual(
+            ffn_exit.finish(handoff, self.residual), (handoff, self.residual)
+        )
+        communicator.postprocess_layer.assert_not_called()
+        self.assertFalse(get_forward().defer_moe_finalize)
+
+        # The MoE may decline per forward; a tensor then takes the fused exit.
+        hidden_states, _ = ffn_exit.finish(self.hidden_states * 2, self.residual)
+        self.assertTrue(hidden_states._sglang_needs_allreduce_fusion)
+
     def test_compiles_without_graph_breaks(self):
         communicator = LayerCommunicator.__new__(LayerCommunicator)
         communicator.should_fuse_mlp_allreduce_with_next_layer = lambda forward_batch: (

@@ -607,6 +607,8 @@ _EXPORTS: dict[str, str] = {
     "fuse_layernorm_scale_shift_gate_select01_kernel": "modulate.scale_shift_triton",
     "fuse_residual_layernorm_scale_shift_gate_select01_kernel": "modulate.scale_shift_triton",
     "fuse_scale_shift_kernel": "modulate.scale_shift_triton",
+    "try_fused_fp32_layernorm_bf16": "sglang.kernels.kda_kernels.layernorm_modulate_triton",
+    "try_fused_scaled_residual_bf16": "modulate.scale_shift_triton",
     "try_fused_scaled_residual_add_exact": "modulate.scale_shift_triton",
     "timestep_embedding": "modulate.timestep_embedding_jit",
     "can_use_fused_temb_table_slices": "modulate.wan_temb_table_slices_triton",

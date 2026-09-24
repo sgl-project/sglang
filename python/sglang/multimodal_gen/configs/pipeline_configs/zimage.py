@@ -515,3 +515,30 @@ class ZImagePipelineConfig(ZImageRolloutPipelineMixin, ImagePipelineConfig):
                 dtype=torch.long,
             ),
         }
+
+
+def register():
+    from sglang.multimodal_gen.configs.sample.zimage import (
+        ZImageSamplingParams,
+        ZImageTurboSamplingParams,
+    )
+    from sglang.multimodal_gen.registry import register_configs
+
+    register_configs(
+        sampling_param_cls=ZImageTurboSamplingParams,
+        pipeline_config_cls=ZImagePipelineConfig,
+        hf_model_paths=[
+            "Tongyi-MAI/Z-Image-Turbo",
+        ],
+        model_detectors=[lambda hf_id: "z-image-turbo" in hf_id.lower()],
+    )
+    register_configs(
+        sampling_param_cls=ZImageSamplingParams,
+        pipeline_config_cls=ZImagePipelineConfig,
+        hf_model_paths=[
+            "Tongyi-MAI/Z-Image",
+        ],
+        model_detectors=[
+            lambda hf_id: "z-image" in hf_id.lower() and "turbo" not in hf_id.lower()
+        ],
+    )
