@@ -1694,6 +1694,7 @@ class CommonKVReceiver(BaseKVReceiver):
         self.require_staging: bool = False
         self.init_time: Optional[float] = None
         self.abort_notified: bool = False
+        self.requires_host_drain_ack: bool = False
         self._connection_pool_entries: Dict[str, List[Dict]] = {}
         self.kv_mgr.addr_to_rooms_tracker[self.bootstrap_addr].add(self.bootstrap_room)
         self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Bootstrapping)
@@ -1986,6 +1987,10 @@ class CommonKVReceiver(BaseKVReceiver):
             self.abort_notified = True
 
     def _send_abort_notification(self):
+        if self.requires_host_drain_ack:
+            # The prefill rank can acknowledge immediately after receiving
+            # ABORT, so arm tracking before sending any notification.
+            self.kv_mgr.register_deferred_abort_room(self.bootstrap_room)
         for bootstrap_info in self.bootstrap_infos:
             # Best-effort notification to prefill side that this request was aborted.
             try:

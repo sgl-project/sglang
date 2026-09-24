@@ -9,12 +9,16 @@ destinations may also release on timeout; host destinations require the ack.
 """
 
 import unittest
+from contextlib import nullcontext
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
+
+import torch
 
 from sglang.srt.disaggregation import decode as decode_mod
-from sglang.srt.disaggregation.common.conn import CommonKVManager
-from sglang.srt.disaggregation.decode import DecodeTransferQueue
+from sglang.srt.disaggregation.base.conn import KVTransferDestination
+from sglang.srt.disaggregation.common.conn import CommonKVManager, CommonKVReceiver
+from sglang.srt.disaggregation.decode import DecodePreallocQueue, DecodeTransferQueue
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -30,6 +34,55 @@ def _make_manager():
 
 
 class TestAbortAckAggregation(CustomTestCase):
+    def test_host_metadata_marks_receiver_for_drain_ack(self):
+        queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
+        queue.req_to_metadata_buffer_idx_allocator = MagicMock()
+        queue.req_to_metadata_buffer_idx_allocator.alloc.return_value = 3
+        queue.transfer_queue = SimpleNamespace(enable_staging=False)
+        queue._num_published_destinations = 0
+        receiver = MagicMock(spec=CommonKVReceiver)
+        decode_req = SimpleNamespace(
+            req=MagicMock(),
+            kv_receiver=receiver,
+            metadata_buffer_index=-1,
+            is_rebootstrap=False,
+        )
+
+        queue._send_kv_metadata(
+            decode_req,
+            torch.tensor([0], dtype=torch.int64),
+            page_size=1,
+            destination=KVTransferDestination.HOST,
+        )
+
+        self.assertIs(receiver.requires_host_drain_ack, True)
+        receiver.send_metadata.assert_called_once()
+
+    def test_host_abort_arms_ack_tracking_before_sending_notification(self):
+        mgr = _make_manager()
+        mgr.local_ip = "127.0.0.1"
+        mgr.rank_port = 12345
+        room = 107
+        receiver = SimpleNamespace(
+            kv_mgr=mgr,
+            bootstrap_room=room,
+            bootstrap_infos=[{"rank_ip": "127.0.0.1", "rank_port": 12346}],
+            requires_host_drain_ack=True,
+        )
+
+        def send_multipart(_parts):
+            # An ack may arrive as soon as the notification is sent.
+            mgr.note_abort_ack(room, 0)
+
+        receiver._connect_to_bootstrap_server = lambda _info: (
+            SimpleNamespace(send_multipart=send_multipart),
+            nullcontext(),
+        )
+
+        CommonKVReceiver._send_abort_notification(receiver)
+
+        self.assertTrue(mgr.is_abort_release_safe(room, required_acks=1))
+
     def test_release_safe_only_after_all_required_ranks_ack(self):
         mgr = _make_manager()
         room = 100
