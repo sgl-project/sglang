@@ -312,6 +312,8 @@ def record_stream_for_v2_verify(batch, verify_input, fwd_stream):
                     "draft_token",
                     "custom_mask",
                     "positions",
+                    "prepared_out_cache_loc",
+                    "prepared_mrope_positions",
                     "retrieve_index",
                     "retrieve_next_token",
                     "retrieve_next_sibling",
@@ -924,6 +926,7 @@ def commit_mamba_states_after_verify(
     accept_lens: torch.Tensor,
     accept_index: torch.Tensor,
     draft_token_num: int,
+    prepared_step_indices: Optional[Tuple[torch.Tensor, Optional[torch.Tensor]]] = None,
 ) -> None:
     """Commit accepted per-step mamba states into the persistent caches.
 
@@ -967,12 +970,17 @@ def commit_mamba_states_after_verify(
 
         spec_state = req_pool.get_speculative_mamba2_params_all_layers()
         state_batch_indices = req_pool.get_mamba_indices(batch.req_pool_indices)
-        last_correct_step_indices, mamba_steps_to_track = _verify_commit_step_indices(
-            batch=batch,
-            accept_index=accept_index,
-            accept_lens=accept_lens,
-            draft_token_num=draft_token_num,
-        )
+        if prepared_step_indices is None:
+            last_correct_step_indices, mamba_steps_to_track = (
+                _verify_commit_step_indices(
+                    batch=batch,
+                    accept_index=accept_index,
+                    accept_lens=accept_lens,
+                    draft_token_num=draft_token_num,
+                )
+            )
+        else:
+            last_correct_step_indices, mamba_steps_to_track = prepared_step_indices
         commit_gdn_replayssm_fold_after_verify(
             spec_state=spec_state,
             state_batch_indices=state_batch_indices,
@@ -1003,12 +1011,17 @@ def commit_mamba_states_after_verify(
         bs = accept_lens.shape[0]
         state_batch_indices = req_pool.get_mamba_indices(batch.req_pool_indices)
         replay_indices = batch.req_pool_indices
-        last_correct_step_indices, mamba_steps_to_track = _verify_commit_step_indices(
-            batch=batch,
-            accept_index=accept_index,
-            accept_lens=accept_lens,
-            draft_token_num=draft_token_num,
-        )
+        if prepared_step_indices is None:
+            last_correct_step_indices, mamba_steps_to_track = (
+                _verify_commit_step_indices(
+                    batch=batch,
+                    accept_index=accept_index,
+                    accept_lens=accept_lens,
+                    draft_token_num=draft_token_num,
+                )
+            )
+        else:
+            last_correct_step_indices, mamba_steps_to_track = prepared_step_indices
         # Advance the per-request circular cursors by the accepted count (incl. the
         # bonus token). max_cache_len = ring length L = replayssm_d.shape[-2].
         commit_gdn_replayssm_spec(
@@ -1124,12 +1137,17 @@ def commit_mamba_states_after_verify(
     bs = accept_lens.shape[0]
     # `accept_lens` already includes the bonus token (drafts + 1 per req).
     if not batch.forward_mode.is_idle() and accept_index.numel() > 0:
-        last_correct_step_indices, mamba_steps_to_track = _verify_commit_step_indices(
-            batch=batch,
-            accept_index=accept_index,
-            accept_lens=accept_lens,
-            draft_token_num=draft_token_num,
-        )
+        if prepared_step_indices is None:
+            last_correct_step_indices, mamba_steps_to_track = (
+                _verify_commit_step_indices(
+                    batch=batch,
+                    accept_index=accept_index,
+                    accept_lens=accept_lens,
+                    draft_token_num=draft_token_num,
+                )
+            )
+        else:
+            last_correct_step_indices, mamba_steps_to_track = prepared_step_indices
 
         if hasattr(attn_backend, "update_mamba_state_after_mtp_verify"):
             attn_backend.update_mamba_state_after_mtp_verify(
