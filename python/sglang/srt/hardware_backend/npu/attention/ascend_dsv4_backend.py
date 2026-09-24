@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import logging
 import math
 import os
@@ -2167,7 +2168,8 @@ class DeepseekV4AscendAttnBackend(
                                             first = pid
                                         last = pid
                                     print(
-                                        f"[SWAF] start_pos={_l(getattr(fm, 'start_pos', None))} "
+                                        f"[SWAF] pid={os.getpid()} "
+                                        f"start_pos={_l(getattr(fm, 'start_pos', None))} "
                                         f"layer={layer} pos=[{f_lo},{f_hi}) unmapped={unmapped} "
                                         f"ids=[{first},{last}] win={hh.hexdigest()[:16]}",
                                         flush=True,
