@@ -159,20 +159,27 @@ def test_layout_selects_routing_without_shape_inference():
 
 @pytest.mark.parametrize("mlp_mode", [ScatterMode.FULL, ScatterMode.TP_ATTN_FULL])
 @pytest.mark.parametrize("num_tokens", [0, 2])
-@pytest.mark.parametrize("enable_dp_attention", [False, True])
+@pytest.mark.parametrize("publish_lora_layout", [False, True])
 def test_communicator_publishes_layout_at_each_transition(
-    monkeypatch, mlp_mode, num_tokens, enable_dp_attention
+    monkeypatch, mlp_mode, num_tokens, publish_lora_layout
 ):
     monkeypatch.setattr(
         "sglang.srt.layers.communicator.get_parallel",
-        lambda: SimpleNamespace(enable_dp_attention=enable_dp_attention),
+        lambda: SimpleNamespace(enable_dp_attention=publish_lora_layout),
     )
-    expected = (
+    # Start from TP_GLOBAL so an unpublished transition is distinguishable.
+    initial = LoRABatchLayout.TP_GLOBAL
+    expected_mlp = (
         LoRABatchLayout.TP_GLOBAL
-        if enable_dp_attention and mlp_mode is ScatterMode.FULL
+        if mlp_mode is ScatterMode.FULL
         else LoRABatchLayout.DP_LOCAL
     )
+    expected_attn = LoRABatchLayout.DP_LOCAL
+    if not publish_lora_layout:
+        # Without LoRA under DP attention, the communicator leaves the flag alone.
+        expected_mlp = expected_attn = initial
     communicator = LayerCommunicator.__new__(LayerCommunicator)
+    communicator._publish_lora_layout = publish_lora_layout
     communicator.layer_scatter_modes = SimpleNamespace(mlp_mode=mlp_mode)
     communicator._context = SimpleNamespace()
     communicator._sp_variant = None
@@ -189,12 +196,12 @@ def test_communicator_publishes_layout_at_each_transition(
         lambda: SimpleNamespace(input_scattered=False),
     )
     hidden = torch.zeros(num_tokens, 4)
-    with get_forward().scoped(lora_batch_layout=LoRABatchLayout.DP_LOCAL):
+    with get_forward().scoped(lora_batch_layout=initial):
         for _ in range(2):
             communicator.prepare_mlp(hidden, hidden, None)
-            assert get_forward().lora_batch_layout is expected
+            assert get_forward().lora_batch_layout is expected_mlp
             communicator.prepare_attn(hidden, None, None)
-            assert get_forward().lora_batch_layout is LoRABatchLayout.DP_LOCAL
+            assert get_forward().lora_batch_layout is expected_attn
 
 
 @pytest.mark.parametrize("can_run_decode_cuda_graph", [False, True])

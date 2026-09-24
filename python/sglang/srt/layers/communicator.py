@@ -78,6 +78,7 @@ from sglang.srt.runtime_context import (
     LoRABatchLayout,
     get_exec,
     get_forward,
+    get_lora,
     get_parallel,
     get_platform,
     get_spec,
@@ -549,6 +550,10 @@ class LayerCommunicator:
         self._speculative_algo = SpeculativeAlgorithm.from_string(
             get_spec().speculative_algorithm
         )
+        # LoRA kernels need the per-layer token layout only under DP attention.
+        self._publish_lora_layout = get_parallel().enable_dp_attention and bool(
+            get_lora().enable_lora
+        )
 
         # Under LayerNorm SP the norm/residual run on the sequence shard with no
         # collectives, so delegate to an all-SCATTERED sibling while the region is
@@ -657,12 +662,12 @@ class LayerCommunicator:
 
     def publish_attn_lora_layout(self) -> None:
         """Attention consumes the DP-local token batch."""
-        if get_parallel().enable_dp_attention:
+        if self._publish_lora_layout:
             get_forward().set("lora_batch_layout", LoRABatchLayout.DP_LOCAL)
 
     def publish_mlp_lora_layout(self) -> None:
         """The MLP consumes the TP-global batch only after a FULL DP gather."""
-        if get_parallel().enable_dp_attention:
+        if self._publish_lora_layout:
             get_forward().set(
                 "lora_batch_layout",
                 (
