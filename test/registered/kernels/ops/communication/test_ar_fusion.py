@@ -10,7 +10,7 @@ semaphore window cycling.
 
 Usage::
 
-    python test/registered/kernels/ops/kimi_k3/test_ar_fusion.py   # relaunches under torchrun (8 GPUs)
+    python test/registered/kernels/ops/communication/test_ar_fusion.py   # relaunches under torchrun (8 GPUs)
 """
 
 from __future__ import annotations
@@ -25,8 +25,8 @@ import torch.distributed as dist
 
 import sglang.srt.distributed.parallel_state as ps
 from sglang.kernels.jit.utils import cache_once, get_ci_test_range
+from sglang.kernels.ops.communication import all_reduce_residual as all_reduce
 from sglang.kernels.ops.communication.mp import register_comm_cleanup
-from sglang.kernels.ops.kimi_k3 import all_reduce
 from sglang.srt.distributed.device_communicators.custom_all_reduce_v2 import (
     CustomAllReduceV2,
 )

@@ -231,7 +231,7 @@ Kernels are written against a specific eager chain in a specific model, so cover
 | HunyuanVideo / Helios | QKV+RoPE pack, strided QK RMSNorm, linear+GELU; Helios also has paired in-place Q/K RoPE |
 | LingBot Video MoE | Default-on group-limited top-k expert selection; fused RMSNorm, per-token gated residual, and fused RMSNorm+modulate at `quality=extra-high` or `quality=high` |
 | Sana | LN+modulate, GLUMB bias+SiLU / bias+GLU, residual-gate add |
-| SANA-Video | Packed QKV/KV; paired fp64 interleaved RoPE; LN+modulate, GLUMB bias+SiLU / bias+GLU, and residual-gate add during BCG; BF16-input linear attention at `quality=extra-high` or `quality=high` |
+| SANA-Video | Packed QKV/KV; paired fp64 interleaved RoPE; GLUMB bias+SiLU / bias+GLU in eager and BCG; LN+modulate and residual-gate add during BCG; BF16-input linear attention at `quality=extra-high` or `quality=high` |
 | Sana-WM | bidirectional gated delta-net, fused QK inverse-RMS |
 | Wan / LongLive 2 VAE | temb table slices (Wan); VAE cat+pad and DupUp3D add; lossless FP32 normalization post-ops; full `channels_last_3d` RMSNorm+SiLU at `quality=extra-high` or `quality=high` |
 | Cosmos3 / Krea2 / MiniMax-H3 | QK-norm + RoPE (Krea2 also CuTe-DSL norm+scale/shift; MiniMax-H3 also indexed modulation) |
