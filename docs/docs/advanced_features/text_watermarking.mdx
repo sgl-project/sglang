@@ -4,7 +4,7 @@ metatags:
     description: "Configure Aaronson-Gumbel text watermarking and detect watermarked text."
 ---
 
-SGLang provides opt-in Aaronson-Gumbel watermarking for sampled text. The watermark replaces random token selection with a keyed, deterministic choice that follows the same output distribution, so anyone holding the secret key can later test whether a token sequence carries the watermark. Detection needs only the key and the token IDs; it does not need the model or a GPU.
+SGLang provides opt-in Aaronson-Gumbel watermarking for sampled text. The watermark replaces random token selection with a keyed, deterministic choice that follows the same output distribution under the ideal independent-uniform hash model, so anyone holding the secret key can later test whether a token sequence carries the watermark. Detection needs only the key and the token IDs; it does not need the model or a GPU.
 
 This feature can support transparency controls such as the machine-readable marking and detectability described in [Article 50 of the EU AI Act](https://eur-lex.europa.eu/eli/reg/2024/1689/oj). It is one technical signal, not a complete compliance program or proof of authorship.
 
@@ -26,10 +26,10 @@ A position is watermarked only when all of the following hold; otherwise the req
 - The request is not greedy. `temperature=0` is normalized to `top_k=1`, and `top_k=1` positions are never watermarked.
 - The context is not empty.
 - The context has not already been watermarked earlier in the same request. Runtime identifies a context by its 32-bit context hash.
-- The request has watermarked fewer than 4,096 contexts, or fewer than the server's maximum context length if that is smaller.
+- The request has watermarked fewer than `min(4,096, per-request token-pool capacity)` contexts.
 - The largest truncated probability is at most `--watermark-max-probability`. The default `1.0` disables this gate.
 
-Only a watermarked position enters the request's context history. A position skipped by the probability gate therefore leaves its context eligible for a later, higher-entropy occurrence, and once a request has watermarked 4,096 contexts the remaining tokens use ordinary sampling. The repeated-context rule keeps a repeated context from forcing the same token indefinitely.
+Only a watermarked position enters the request's context history. A position skipped by the probability gate therefore leaves its context eligible for a later, higher-entropy occurrence, and once a request reaches its context budget the remaining tokens use ordinary sampling. The repeated-context rule keeps a repeated context from forcing the same token indefinitely.
 
 The context for a position is the last `h` tokens before it, where `h` is the request's context window, taken from the prompt followed by the tokens generated so far. The first generated token therefore uses the last `h` prompt tokens. A context is shorter than `h` only when fewer than `h` tokens precede the position.
 
@@ -81,7 +81,7 @@ To match generation, a detector must follow these rules:
 
 1. Use the exact prompt token IDs that preceded the completion and the request's context window `h`. With prompt IDs, the first completion token's context is the last `h` prompt tokens. Without prompt IDs, the first `h` completion tokens have unknown contexts and are skipped.
 2. Score each distinct context once. The detector compares exact context token tuples, whereas generation compares 32-bit context hashes. After a hash collision, generation skips a later distinct context that the detector still scores. That extra score is an ordinary null sample, so the mismatch can only weaken detection, never create evidence.
-3. Stop after the first 4,096 distinct contexts and report a prefix test. Generation forces at most 4,096 contexts per request, so scoring the unforced tail adds null samples that dilute the statistic without adding evidence.
+3. Stop after the generation request's context budget and report a prefix test. The default detector budget is 4,096 distinct contexts. If the server's per-request token-pool capacity is lower, pass that lower value as `max_contexts`; scoring the unforced tail adds null samples that dilute the statistic without adding evidence. With a maximum-probability gate below `1.0`, the model-free detector cannot identify skipped positions, so this fixed prefix is conservative and may omit signal from later forced positions.
 
 Positions that generation left unforced (greedy positions, and positions skipped by `--watermark-max-probability`) are indistinguishable from ordinary text to the detector, which scores them as null samples; they dilute the statistic but cannot produce false evidence.
 
@@ -280,7 +280,7 @@ print(result.combined.p_value, result.key_a_partition.p_value, result.key_b_part
 
 ### Standalone, without SGLang or PyTorch
 
-`detector.py` and `config.py` import only the Python standard library and `msgspec`, and the package's `__init__.py` imports only the detector. To run detection in a separate application, copy the package directory and install `msgspec`:
+`detector.py` and `config.py` import only the Python standard library and `msgspec`, and the package's `__init__.py` imports only the detector. NumPy arrays are accepted as token-ID iterables, but NumPy is not required. To run detection in a separate application, copy the package directory and install `msgspec`:
 
 ```bash
 mkdir -p detector_app
@@ -335,6 +335,7 @@ A detector written from scratch instead of reusing this package must implement t
 | Parallel sampling (`n > 1`) | Verified | Each generated choice owns independent request state and history. |
 | Output log probabilities | Verified | Ordinary decode reports the effective distribution after forcing at watermarked positions; unforced positions retain ordinary log probabilities. Speculative decode reports the pre-watermark target distribution. |
 | Top-k, top-p, and min-p | Verified | The selector reproduces SGLang's combined truncation support before keyed selection. |
+| Maximum-probability gate | Verified | Positions above `--watermark-max-probability` use ordinary sampling and do not consume the repeated-context budget. |
 | Logit bias and frequency, presence, and repetition penalties | Verified | These transforms run before watermark selection. |
 | Chunked prefill | Verified | Each prefill chunk rebuilds the prompt tail from the request's complete logical fill IDs. |
 | Radix-cache prompt reuse | Verified | Prompt-tail initialization uses logical request IDs rather than only newly computed tokens. |
@@ -364,11 +365,11 @@ In speculative decoding, verification clones the target logits before forcing, s
 - Short completions provide few distinct contexts and therefore weak statistical power.
 - Paraphrasing, rewriting, translation, and re-tokenization can weaken or remove the signal.
 - Detection needs the matching key or keys, mixing probability, context window, and tokenizer, and is strongest with the exact prompt token IDs.
-- A request watermarks at most 4,096 distinct contexts; later tokens use ordinary sampling.
+- A request watermarks at most `min(4,096, per-request token-pool capacity)` distinct contexts; later tokens use ordinary sampling.
 - The hashes are MurmurHash3, a keyed but non-cryptographic mix. There is no indistinguishability or unforgeability guarantee, and anyone holding the key can both detect and forge the watermark.
 - Speculative decoding can accept fewer draft tokens when a draft proposal does not match the watermarked target token. The impact depends on tree width and workload.
 
-On one single-GPU node of each type with public `Qwen/Qwen3-8B`, TP1, TRT-LLM MHA, ordinary decoding, and 800-token sampled outputs, the fused selector measured the following mean output throughput over three repetitions per cell:
+On one single-GPU node of each type with public `Qwen/Qwen3-8B`, TP1, TRT-LLM MHA, ordinary decoding, temperature 1.0, top-p 0.95, unlimited top-k, and 800-token sampled outputs, the fused selector measured the following mean output throughput over three repetitions per cell:
 
 | Node | Concurrency | Watermark off | Watermark on | Change |
 | --- | ---: | ---: | ---: | ---: |
@@ -382,3 +383,5 @@ The GB300 concurrency-eight row was remeasured after the score-precision fix on 
 ## See also
 
 The fused Triton selector is adapted from Meta's Apache-2.0 [TextSeal](https://github.com/facebookresearch/textseal) implementation and re-implemented on the hash contract above, so detection follows this page rather than TextSeal's own tooling.
+
+The runtime and reference detector live in `python/sglang/srt/sampling/watermarking/`. Registered coverage lives in `test/registered/unit/sampling/test_watermark*.py`, `test/registered/kernels/ops/sampling/test_watermark_*.py`, and `test/registered/e2e/openai_server/test_watermark.py`.
