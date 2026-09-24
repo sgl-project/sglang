@@ -2080,10 +2080,25 @@ class DeepseekV4AscendAttnBackend(
                                     .tobytes()
                                 )
                                 nrows += 1
+                        # The read path derives (page, row) as (table[p // page],
+                        # p % page) from the page's first token, while the write
+                        # path uses each token's own swa loc. They agree only if
+                        # swa_loc(p) % page == p % page; count the violations.
+                        try:
+                            rp = forward_batch.req_pool_indices[:1].to(torch.int64)
+                            full = self.req_to_token[rp][0].to(torch.int64)
+                            lo_p = max(0, pos - (page_sz - 1))
+                            swa = pool.full_to_swa_index_mapping[full[lo_p : pos + 1]]
+                            pp = torch.arange(lo_p, pos + 1, device=swa.device)
+                            phase = int(
+                                (((swa % page_sz) != (pp % page_sz)) & (swa > 0)).sum()
+                            )
+                        except Exception:
+                            phase = -1
                         print(
                             f"[SWAKV] start_pos={_l(getattr(fm, 'start_pos', None))} layer={layer} "
                             f"ids={ids} span={span} md5={hashlib.md5(raw).hexdigest()[:16]} "
-                            f"win={h.hexdigest()[:16]} rows={nrows}",
+                            f"win={h.hexdigest()[:16]} rows={nrows} phase={phase}",
                             flush=True,
                         )
             except Exception as exc:
