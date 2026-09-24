@@ -527,7 +527,7 @@ for _op, _backend, _target, _caps, _description in _SPECS:
 # then symbol; a new public kernel belongs here and nowhere else.
 # ---------------------------------------------------------------------------
 _EXPORTS: dict[str, str] = {
-    "load_extension_with_recovery": "ext.loader",
+    "load_extension_with_recovery": "sglang.srt.utils.cpp_extension_loader",
     # Normalization: RMSNorm / LayerNorm / GroupNorm and their fused epilogues
     "can_defer_flux2_gated_residual": "norm.flux2_gated_resnorm_jit",
     "can_use_flux2_gated_resnorm": "norm.flux2_gated_resnorm_jit",
