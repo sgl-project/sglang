@@ -28,8 +28,8 @@ jobs:
   check-changes:
     runs-on: ubuntu-latest
     outputs:
-      changes_exist: ${{ steps.filter.outputs.main_package == 'true' || steps.filter.outputs.multimodal_gen == 'true' || steps.run-mode.outputs.run_all_tests == 'true' }}
-      main_package: ${{ steps.filter.outputs.main_package == 'true' || steps.run-mode.outputs.run_all_tests == 'true' }}
+      changes_exist: ${{ steps.filter.outputs.main_package == 'true' || steps.filter.outputs.multimodal_gen == 'true' || steps.xpu-tests.outputs.changed == 'true' || steps.run-mode.outputs.run_all_tests == 'true' }}
+      main_package: ${{ steps.filter.outputs.main_package == 'true' || steps.xpu-tests.outputs.changed == 'true' || steps.run-mode.outputs.run_all_tests == 'true' }}
       multimodal_gen: ${{ steps.filter.outputs.multimodal_gen == 'true' || steps.run-mode.outputs.run_all_tests == 'true' }}
     steps:
       - name: Checkout code
@@ -54,32 +54,18 @@ jobs:
         uses: dorny/paths-filter@v3
         if: steps.run-mode.outputs.run_all_tests != 'true'
         with:
+          list-files: json
           filters: |
+            # Per-commit XPU tests elsewhere in test/registered/ are found by the next step.
+            registered_tests:
+              - "test/registered/**/*.py"
             main_package:
-              # Extend test/registered/ entries when adding a non-nightly register_xpu_ci.
               - "python/sglang/!(multimodal_gen|kernels|cli|test)/**/!(*.md)"
               - "python/sglang/test/*.py"
               - "python/sglang/test/!(ascend|observability|mock_model|manual|external_models|kernels)/**/!(*.md)"
               - "python/pyproject_xpu.toml"
               - "test/registered/xpu/**/!(*.md)"
               - "test/registered/e2e/xpu/**/!(*.md)"
-              - "test/registered/disaggregation/test_disaggregation_xpu.py"
-              - "test/registered/attention/test_chunk_gated_delta_rule.py"
-              - "test/registered/attention/test_deterministic.py"
-              - "test/registered/kernels/ops/kvcache/test_hisparse.py"
-              - "test/registered/kv_canary/test_self_unit_future_tensor.py"
-              - "test/registered/kv_canary/test_self_unit_plan_input.py"
-              - "test/registered/kv_canary/test_self_unit_req_to_expected_token_ids_manager.py"
-              - "test/registered/kv_canary/test_self_unit_runner_swa_divergence.py"
-              - "test/registered/layers/mamba/test_mamba_slot_fused.py"
-              - "test/registered/lora/test_moe_lora_info.py"
-              - "test/registered/lora/test_virtual_experts_kernels.py"
-              - "test/registered/unit/layers/test_mamba_state_scatter_triton.py"
-              - "test/registered/unit/managers/test_hisparse_unit.py"
-              - "test/registered/unit/mem_cache/test_mamba_unittest.py"
-              - "test/registered/unit/sampling/test_sampling_params.py"
-              - "test/registered/unit/spec/test_adaptive_spec_params.py"
-              - "test/registered/unit/spec/test_ngram_corpus.py"
               - "test/run_suite.py"
               - "test/pytest.ini"
               - ".github/workflows/pr-test-xpu.yml"
@@ -104,6 +90,13 @@ jobs:
               - ".github/workflows/pr-test-xpu.yml"
               - "docker/xpu.Dockerfile"
               - "scripts/ci/xpu/**"
+
+      - name: Detect changed per-commit XPU tests
+        id: xpu-tests
+        if: steps.filter.outputs.registered_tests == 'true'
+        env:
+          CHANGED_FILES: ${{ steps.filter.outputs.registered_tests_files }}
+        run: echo "changed=$(python3 scripts/ci/xpu/detect_xpu_test_changes.py)" >> "$GITHUB_OUTPUT"
 
   # ==================== PR Gate ==================== #
   pr-gate:
