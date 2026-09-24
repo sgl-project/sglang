@@ -364,6 +364,9 @@ class StreamingSession(BasePrefixCache):
             return
         self.inner.cache_unfinished_req(req, **kwargs)
 
+    def unpin(self, req: Req) -> None:
+        self.inner.unpin(req)
+
     def finish(self, handle: CacheRequestHandle, outcome: CacheRequestOutcome) -> None:
         self.inner.finish(handle, outcome)
 

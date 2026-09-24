@@ -429,6 +429,10 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         Slicing the kv row by the token-id count instead strands whatever
         lies between -- no caller releases those. ``release_kv_cache`` frees
         everything past ``owned_kv_len``.
+
+        Every implementation is the same three steps: insert what can be
+        keyed (advancing ``cache_protected_len``), ``free_kv_row`` the rest
+        of ``[cache_protected_len, owned_kv_len)``, ``unpin``.
         """
 
     @abstractmethod
@@ -475,6 +479,13 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         self, node: Any, params: Optional[DecLockRefParams] = None
     ) -> DecLockRefResult:
         pass
+
+    def unpin(self, req: Req) -> None:
+        """Drop the tree lock the request holds on ``req.last_node``: the
+        request-level ``dec_lock_ref``. A cache whose acquire hands back a
+        receipt releases with that receipt here."""
+        if req.last_node is not None:
+            self.dec_lock_ref(req.last_node)
 
     def evictable_size(self):
         return 0

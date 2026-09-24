@@ -936,6 +936,11 @@ class UnifiedRadixCache(BasePrefixCache):
         receipt its acquire returned, so it never drops a lock it never took."""
         self.dec_lock_ref(req.last_node, req.lock_receipt, skip_swa=skip_swa)
 
+    def unpin(self, req: Req) -> None:
+        # Synthetic profiling requests may own KV without locking a tree node.
+        if req.last_node is not None:
+            self._dec_req_lock(req, skip_swa=req.swa_prefix_lock_released)
+
     def dec_swa_lock_only(
         self,
         node_id: NodeId,
@@ -1090,9 +1095,7 @@ class UnifiedRadixCache(BasePrefixCache):
         else:
             self.free_kv_row(req.kv, [(req.kv.cache_protected_len, owned_kv_len)])
 
-        # Synthetic profiling requests may own KV without locking a tree node.
-        if req.last_node is not None:
-            self._dec_req_lock(req, skip_swa=req.swa_prefix_lock_released)
+        self.unpin(req)
 
         if is_insert and result is not None and result.last_device_node is not None:
             req.last_node = result.last_device_node

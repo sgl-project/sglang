@@ -82,6 +82,7 @@ class ChunkCache(BasePrefixCache):
         # For decode server: if req.output_ids is empty, we want to free all req.origin_input_ids
         # The protected prefix is not this req's to free.
         self.free_kv_row(req.kv, [(req.kv.cache_protected_len, owned_kv_len)])
+        self.unpin(req)
 
     def cache_unfinished_req(self, req: Req, chunked=False):
         kv_indices = self.req_to_token_pool.req_to_token[
