@@ -14,8 +14,10 @@ export const config = {
   // Low-Latency, PP2 × DCPEP8 on Balanced and High-Throughput, while DSPARK
   // re-lays the same 16 as flat TP16 / DCPEP16), GB200 (4×4 TP16 MNNVL),
   // H200 (2×8 TP16/EP16, or 4×8 TP32/EP32 for High-Throughput), H100
-  // (4×8 TP32/EP32), and MI350X/MI355X (1×8 TP8) have serving recipes.
-  supportedHardware: ["b300", "gb300", "b200", "gb200", "h200", "h100", "mi350x", "mi355x", "a3"],
+  // (4×8 TP32/EP32), MI350X/MI355X (1×8 TP8), Ascend A3 Series (4×8, TP64
+  // over 2-die cards), and Ascend 950PR/DT Series (4×8, TP32, one rank per
+  // card) have serving recipes.
+  supportedHardware: ["b300", "gb300", "b200", "gb200", "h200", "h100", "mi350x", "mi355x", "a3", "a5"],
 
   // ---- Cell introspection (config-internal; the engines ignore these keys) ----
   //
@@ -46,6 +48,15 @@ export const config = {
   sizeOf(cell, name) {
     const f = config.flagOf(cell, name);
     return f ? Number(f.split(/[\s=]/)[1]) || 1 : 1;
+  },
+  // The two NPU recipes (A3 and A5) each ship exactly one operating point —
+  // Unified PD, the Balanced strategy, DSPARK, no HiCache, no tool calling —
+  // so every panel gate below keys off this helper instead of enumerating
+  // platforms. Shape differences between the two (TP64/DP4 vs TP32/dp1,
+  // Modelslim W4A8 vs the MXFP4 checkpoint, mamba-cache sizing) are handled by
+  // the cells, the TP/DP knob rules and the Quantization axis, not here.
+  isNpuHw(s) {
+    return s.hw === "a3" || s.hw === "a5";
   },
   // Does this recipe shard the TP-replicated MLA KV? Replaces the per-platform
   // "which cells carry DCP" tables the HiCache tiers used to hardcode.
@@ -139,14 +150,14 @@ export const config = {
         {
           id: "prefill",
           label: "Prefill",
-          disabled: (s) => s.hw === "a3",
-          disableReason: (s) => (s.hw === "a3" ? "Only Unified PD is supported on this recipe." : ""),
+          disabled: (s) => config.isNpuHw(s),
+          disableReason: (s) => (config.isNpuHw(s) ? "Only Unified PD is supported on this recipe." : ""),
         },
         {
           id: "decode",
           label: "Decode",
-          disabled: (s) => s.hw === "a3",
-          disableReason: (s) => (s.hw === "a3" ? "Only Unified PD is supported on this recipe." : ""),
+          disabled: (s) => config.isNpuHw(s),
+          disableReason: (s) => (config.isNpuHw(s) ? "Only Unified PD is supported on this recipe." : ""),
         },
       ],
     },
@@ -160,16 +171,16 @@ export const config = {
           id: "low-latency",
           label: "Low-Latency",
           showWhen: (s) => s.pdMode !== "prefill",
-          disabled: (s) => s.hw === "a3",
-          disableReason: (s) => (s.hw === "a3" ? "Only the Balanced operating point is supported on this recipe." : ""),
+          disabled: (s) => config.isNpuHw(s),
+          disableReason: (s) => (config.isNpuHw(s) ? "Only the Balanced operating point is supported on this recipe." : ""),
         },
         { id: "balanced",        label: "Balanced",        showWhen: (s) => s.pdMode !== "prefill" },
         {
           id: "high-throughput",
           label: "High-Throughput",
           showWhen: (s) => s.pdMode !== "prefill",
-          disabled: (s) => s.hw === "a3",
-          disableReason: (s) => (s.hw === "a3" ? "Only the Balanced operating point is supported on this recipe." : ""),
+          disabled: (s) => config.isNpuHw(s),
+          disableReason: (s) => (config.isNpuHw(s) ? "Only the Balanced operating point is supported on this recipe." : ""),
         },
         { id: "default",         label: "Default",         showWhen: (s) => s.pdMode === "prefill" },
         { id: "long-context",    label: "Long-Context",    showWhen: (s) => s.pdMode === "prefill" },
@@ -194,11 +205,15 @@ export const config = {
       default: "mxfp4",
       options: [
         { id: "mxfp4", label: "MXFP4", subtitle: "Moonshot AI checkpoint",
+          // The 950PR/DT recipe serves this checkpoint; the A3 Series recipe
+          // serves the W4A8 build under it instead.
           disabled: (s) => s.hw === "a3",
-          disableReason: (s) => (s.hw === "a3" ? "Only Modelslim (W4A8) is supported on this recipe." : ""),
+          disableReason: (s) => (s.hw === "a3" ? "The A3 Series recipe serves the sgl-npu Modelslim (W4A8) checkpoint." : ""),
         },
         {
-          // A3 Series only (NPU W4A8 checkpoint); hidden on the GPU recipes.
+          // A3 Series only (ModelSlim W4A8 checkpoint); hidden elsewhere — the
+          // 950PR/DT recipe serves the MXFP4 checkpoint above with no
+          // --quantization flag.
           id: "modelslim",
           label: "Modelslim (W4A8)",
           subtitle: "ModelScope NPU checkpoint",
@@ -227,7 +242,7 @@ export const config = {
       id: "mmTransport",
       title: "VLM Transport",
       default: "auto",
-      showWhen: (s) => s.pdMode !== "decode" && s.hw !== "a3",
+      showWhen: (s) => s.pdMode !== "decode" && !config.isNpuHw(s),
       options: [
         {
           id: "auto",
@@ -266,8 +281,8 @@ export const config = {
       options: [
         { id: "none", label: "Non-Spec",
           env: (s) => (["mi350x", "mi355x"].includes(s.hw) ? ["SGLANG_MLA_DECODE_TUNE=1"] : []),
-          disabled: (s) => s.hw === "a3",
-          disableReason: (s) => (s.hw === "a3" ? "Only DSPARK is supported on this recipe." : ""),
+          disabled: (s) => config.isNpuHw(s),
+          disableReason: (s) => (config.isNpuHw(s) ? "Only DSPARK is supported on this recipe." : ""),
         },
         {
           id: "dspark",
@@ -296,10 +311,10 @@ export const config = {
             "--speculative-algorithm DSPARK",
             "--speculative-draft-model-path RadixArk/Kimi-K3-DSpark",
             "--speculative-dspark-block-size 7",
-            // The NPU recipe adds the NPU draft path's own knobs (draft
-            // attention backend, topk 1, unquantized draft weights) on top of
-            // the common trio.
-            ...(s.hw === "a3"
+            // The NPU recipes (A3 and A5) add the NPU draft path's own knobs
+            // (draft attention backend, topk 1, unquantized draft weights) on
+            // top of the common trio.
+            ...(config.isNpuHw(s)
               ? [
                   "--speculative-draft-attention-backend ascend",
                   "--speculative-eagle-topk 1",
@@ -311,7 +326,7 @@ export const config = {
             // the Triton decode kernel, the K3 default). It is CUDA-only, and
             // the PD prefill role opts out — it never runs verify and rejects
             // the flag at startup.
-            ...(s.hw !== "a3" && s.pdMode !== "prefill"
+            ...(!config.isNpuHw(s) && s.pdMode !== "prefill"
               ? ["--enable-linear-replayssm-spec"]
               : []),
           ],
@@ -319,16 +334,27 @@ export const config = {
         {
           id: "dflash",
           label: "DFLASH",
-          // Listed so the axis is complete, but not selectable: no K3 DFLASH draft
-          // checkpoint has been published, so there is nothing to point
-          // --speculative-draft-model-path at. DFLASH is also CUDA-only, rejects DP
-          // attention, and requires pp_size == 1.
-          disabled: true,
-          disableReason:
-            "No K3 DFLASH draft checkpoint published yet — DSPARK is the available speculative path.",
-          flags: [
+          // DFLASH doesn't support pipeline parallelism yet and rejects DP attention
+          // off NPU, so pipelined and DP-attention recipes are unavailable. The NPU recipes ship DSPARK only. K3 DFLASH
+          // has only been validated on Blackwell, so Hopper and AMD stay off.
+          disabled: (s) =>
+            config.isNpuHw(s) ||
+            ["h100", "h200", "mi350x", "mi355x"].includes(s.hw) ||
+            config.isPipelined(s) ||
+            !!config.flagOf(config.cellFor(s), "--enable-dp-attention"),
+          disableReason: (s) =>
+            config.isNpuHw(s)
+              ? "Only DSPARK is supported on this recipe."
+              : ["h100", "h200", "mi350x", "mi355x"].includes(s.hw)
+                ? "K3 DFLASH has not been validated on this hardware yet; use DSPARK."
+                : "DFLASH doesn't support pipeline parallelism or DP attention yet. Pick a recipe that runs a single pipeline stage without DP attention, or use DSPARK.",
+          flags: (s) => [
             "--speculative-algorithm DFLASH",
-            "--speculative-draft-model-path <dflash-draft>",
+            "--speculative-draft-model-path modal-labs/Kimi-K3-DFlash",
+            // 8 is the recommended default block size for this draft.
+            "--speculative-dflash-block-size 8",
+            // Same ReplaySSM rule as DSPARK: the PD prefill role rejects the flag.
+            ...(s.pdMode !== "prefill" ? ["--enable-linear-replayssm-spec"] : []),
           ],
         },
       ],
@@ -346,8 +372,8 @@ export const config = {
         {
           id: "l2",
           label: "L1+L2 (host)",
-          disabled: (s) => s.hw === "a3",
-          disableReason: (s) => (s.hw === "a3"
+          disabled: (s) => config.isNpuHw(s),
+          disableReason: (s) => (config.isNpuHw(s)
             ? "NPU HiCache does not support mamba cache (K3's KDA state is one)."
             : ""),
           flags: [
@@ -370,8 +396,8 @@ export const config = {
         {
           id: "l3",
           label: "+ L3 (Mooncake)",
-          disabled: (s) => s.hw === "a3",
-          disableReason: (s) => (s.hw === "a3"
+          disabled: (s) => config.isNpuHw(s),
+          disableReason: (s) => (config.isNpuHw(s)
             ? "NPU HiCache does not support mamba cache (K3's KDA state is one)."
             : ""),
           flags: [
@@ -413,6 +439,10 @@ export const config = {
     default: "moonshotai/Kimi-K3",
     nvfp4: "nvidia/Kimi-K3-NVFP4",
     a3: "sgl-npu/Kimi-K3-W4A8",
+    // The 950PR/DT recipe serves the official Moonshot checkpoint (MXFP4) from
+    // ModelScope — the same id the NVIDIA recipes resolve to, fetched through
+    // SGLANG_USE_MODELSCOPE. The A3 Series recipe serves the W4A8 build.
+    a5: "moonshotai/Kimi-K3",
   },
 
   placeholders: {
@@ -459,8 +489,8 @@ export const config = {
     gb200:  "lmsysorg/sglang:kimi-k3",
     // 20260903 or newer: the AITER SiTU A4W4/A8W4 layout fix (sgl-project/sglang#33838,
     // merged Sep 3) and the fused gfx950 KDA decode boundary (#34198) first ship here.
-    mi350x: "lmsysorg/sglang-rocm:v0.5.19-rocm720-mi35x-20260910",
-    mi355x: "lmsysorg/sglang-rocm:v0.5.19-rocm720-mi35x-20260910",
+    mi350x: "lmsysorg/sglang-rocm:v0.5.19-rocm720-mi35x-20260916",
+    mi355x: "lmsysorg/sglang-rocm:v0.5.19-rocm720-mi35x-20260916",
     // NVFP4 needs a build with sgl-project/sglang#35077; the purpose-built dev
     // image is cut from that PR's head (CUDA 13).
     "b300|nvfp4":  "lmsysorg/sglang:dev-dev-kimi-k3-nvfp4",
@@ -468,6 +498,9 @@ export const config = {
     "b200|nvfp4":  "lmsysorg/sglang:dev-dev-kimi-k3-nvfp4",
     "gb200|nvfp4": "lmsysorg/sglang:dev-dev-kimi-k3-nvfp4",
     a3:     "quay.io/ascend/sglang:main-cann9.0.0-a3",
+    // 950PR/DT Series builds are CANN 9.1.0 and published from the Ascend SWR
+    // registry (the quay.io A2/A3 line carries no 950PR/DT tag).
+    a5:     "swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann9.1.0-950-B070",
   },
   // Pre-selects the issue template's `model` field on "Submit verified cell".
   github: {
@@ -492,6 +525,10 @@ export const config = {
                 when: { hw: ["a3"] },
                 reason: "Only TP64 is supported on this recipe.",
               },
+              {
+                when: { hw: ["a5"] },
+                reason: "Only TP32 is supported on this recipe.",
+              },
             ]; },
           },
           {
@@ -500,6 +537,10 @@ export const config = {
               {
                 when: { hw: ["a3"] },
                 reason: "Only TP64 is supported on this recipe.",
+              },
+              {
+                when: { hw: ["a5"] },
+                reason: "Only TP32 is supported on this recipe.",
               },
               {
                 when: { hw: ["b300", "gb300"] },
@@ -513,20 +554,37 @@ export const config = {
             ]; },
           },
           {
-            // A3 Series only: 64 ranks (4 nodes × 8 cards × 2 dies); hidden on the GPU recipes.
+            // 950PR/DT Series only: 32 ranks (4 nodes × 8 cards, one rank per
+            // card); hidden on the other recipes.
+            value: 32,
+            hide: { hw: ["b300", "gb300", "b200", "gb200", "h200", "h100", "mi350x", "mi355x", "a3"] },
+          },
+          {
+            // A3 Series only: 64 ranks (4 nodes × 8 cards × 2 dies); hidden on
+            // the other recipes.
             value: 64,
-            hide: { hw: ["b300", "gb300", "b200", "gb200", "h200", "h100", "mi350x", "mi355x"] },
+            hide: { hw: ["b300", "gb300", "b200", "gb200", "h200", "h100", "mi350x", "mi355x", "a5"] },
           },
         ]},
         { id: "dpAttn", label: "DP-Attention",
           values: [
             null,
             {
+              // 950PR/DT Series only: the recipe enables DP-Attention at dp=1
+              // (attn-TP 32), unlike A3's dp=4.
+              value: 1,
+              hide: { hw: ["b300", "gb300", "b200", "gb200", "h200", "h100", "mi350x", "mi355x", "a3"] },
+            },
+            {
               value: false,
               get disable() { return [
                 {
                   when: { hw: ["a3"] },
                   reason: "Only DP-Attention=4 is supported on this recipe.",
+                },
+                {
+                  when: { hw: ["a5"] },
+                  reason: "Only DP-Attention=1 is supported on this recipe.",
                 },
               ]; },
             },
@@ -537,15 +595,31 @@ export const config = {
                   when: { hw: ["a3"] },
                   reason: "Only DP-Attention=4 is supported on this recipe.",
                 },
+                {
+                  when: { hw: ["a5"] },
+                  reason: "Only DP-Attention=1 is supported on this recipe.",
+                },
               ]; },
             },
-            4,
+            {
+              value: 4,
+              get disable() { return [
+                {
+                  when: { hw: ["a5"] },
+                  reason: "Only DP-Attention=1 is supported on this recipe.",
+                },
+              ]; },
+            },
             {
               value: 8,
               get disable() { return [
                 {
                   when: { hw: ["a3"] },
                   reason: "Only DP-Attention=4 is supported on this recipe.",
+                },
+                {
+                  when: { hw: ["a5"] },
+                  reason: "Only DP-Attention=1 is supported on this recipe.",
                 },
                 {
                   when: { hw: ["b300", "gb300"] },
@@ -564,6 +638,10 @@ export const config = {
                 {
                   when: { hw: ["a3"] },
                   reason: "Only DP-Attention=4 is supported on this recipe.",
+                },
+                {
+                  when: { hw: ["a5"] },
+                  reason: "Only DP-Attention=1 is supported on this recipe.",
                 },
                 {
                   when: { hw: ["b300", "gb300"] },
@@ -595,10 +673,10 @@ export const config = {
           // Blackwell-only: runs FlashInfer's official trtllm-gen SiTU kernels.
           { id: "flashinfer_mxfp4", label: "FlashInfer (MXFP4)", flags: ["--moe-runner-backend flashinfer_mxfp4"],
             requiresHw: ["b200", "b300", "gb200", "gb300"],
-            disable: [{ when: { hw: ["a3"] },
+            disable: [{ when: { hw: ["a3", "a5"] },
               reason: "FlashInfer is a CUDA kernel and is not supported on NPU." }] },
           { id: "marlin",           label: "Marlin (W4A16)",    flags: ["--moe-runner-backend marlin"],
-            disable: [{ when: { hw: ["a3"] },
+            disable: [{ when: { hw: ["a3", "a5"] },
               reason: "Marlin is a CUDA kernel and is not supported on NPU." }] },
         ],
       },
@@ -614,7 +692,7 @@ export const config = {
         ],
       },
       ep: {
-        showWhen: (b) => b.hw !== "a3",
+        showWhen: (b) => !config.isNpuHw(b),
         label: "EP",
         values: [
           null, 1, 2, 4, 8,
@@ -640,9 +718,10 @@ export const config = {
     parsers: {
       items: [
         { id: "reasoning", label: "Reasoning Parser", flag: "--reasoning-parser kimi_k3" },
-        // Tool calling is not yet supported on the NPU, so the item hides on a3.
+        // Tool calling is not yet supported on the NPU recipes, so the item
+        // hides on a3 and a5.
         { id: "toolCall",  label: "Tool Call Parser", flag: "--tool-call-parser kimi_k3",
-          hide: { hw: ["a3"] } },
+          hide: { hw: ["a3", "a5"] } },
       ],
     },
 
@@ -717,10 +796,10 @@ export const config = {
         //   DSPARK  --speculative-dspark-block-size N   (gamma, == proposed)
         //   DFLASH  --speculative-dflash-block-size N+1 (verify window)
         //   EAGLE   --speculative-num-steps N           (chain; topk>1 is a tree)
-        // Only DSPARK is selectable today, so only its form is emitted.
+        // Only DSPARK's form is emitted; the DFLASH option pins its block size.
         id: "proposedDraftTokens", title: "Proposed Draft Tokens",
-        // The A3 Series recipe pins the shipped block size (7).
-        showWhen: (b) => b.spec === "dspark" && b.hw !== "a3",
+        // The NPU recipes pin the shipped block size (7).
+        showWhen: (b) => b.spec === "dspark" && !config.isNpuHw(b),
         control: "slider",
         stripPrefixes: [
           "--speculative-dspark-block-size",
@@ -743,10 +822,10 @@ export const config = {
         // Spec-only, so gate the row on DSPARK; every DSPARK recipe (except the PD
         // prefill role) turns it on in the base, so this row derives to On and
         // exists mainly as the opt-out.
-        // Needs the Triton linear-attn decode backend (the K3 default); the A3 Series
-        // script never sets it.
+        // Needs the Triton linear-attn decode backend (the K3 default); the NPU
+        // recipes never enable it.
         id: "replaySsm", title: "ReplaySSM (spec)",
-        showWhen: (b) => b.spec === "dspark" && b.hw !== "a3",
+        showWhen: (b) => b.spec === "dspark" && !config.isNpuHw(b),
         stripPrefixes: ["--enable-linear-replayssm-spec"],
         options: [
           { id: "off", label: "Off" },
@@ -766,8 +845,8 @@ export const config = {
         // without --speculative-dspark-sps-table-path (every step still
         // verifies full width); fails fast with ReplaySSM or DCP > 1.
         id: "raggedVerify", title: "Ragged Verify Mode (spec)",
-        // The A3 Series recipe pins static.
-        showWhen: (b) => b.spec === "dspark" && b.hw !== "a3",
+        // The NPU recipes pin static.
+        showWhen: (b) => b.spec === "dspark" && !config.isNpuHw(b),
         stripEnv: ["SGLANG_RAGGED_VERIFY_MODE"],
         options: [
           { id: "static",  label: "Auto (static)" },
@@ -776,7 +855,7 @@ export const config = {
       },
       {
         id: "kvCacheDtype", title: "KV Cache Precision",
-        showWhen: (b) => b.hw !== "a3",
+        showWhen: (b) => !config.isNpuHw(b),
         stripPrefixes: ["--kv-cache-dtype"],
         options: [
           { id: "auto", label: "Auto (BF16)" },
@@ -785,7 +864,7 @@ export const config = {
       },
       {
         id: "mambaSsmDtype", title: "KDA State Precision",
-        showWhen: (b) => b.hw !== "a3",
+        showWhen: (b) => !config.isNpuHw(b),
         stripPrefixes: ["--mamba-ssm-dtype"],
         options: [
           { id: "auto", label: "Auto (FP32)" },
@@ -800,7 +879,7 @@ export const config = {
         // Off suits prefix-free traffic (offline batch, evals): 1 state slot
         // per request instead of 4-5.
         id: "prefixCache", title: "Prefix Cache",
-        showWhen: (b) => b.hw !== "a3",
+        showWhen: (b) => !config.isNpuHw(b),
         stripPrefixes: ["--disable-radix-cache"],
         options: [
           { id: "on",  label: "On" },
@@ -812,7 +891,7 @@ export const config = {
         // prefix cache off, so the row hides (and stops emitting) there.
         // Slot cost per request: extra_buffer 5, extra_buffer_lazy 4.
         id: "mambaRadix", title: "KDA Radix Cache Strategy",
-        showWhen: (b, v, d) => (b.hw !== "a3")
+        showWhen: (b, v, d) => (!config.isNpuHw(b))
           && ((((v && v.prefixCache) ?? (d && d.prefixCache)) !== "off")),
         stripPrefixes: ["--mamba-radix-cache-strategy"],
         options: [
@@ -827,7 +906,7 @@ export const config = {
         // (extra_buffer 5→4, extra_buffer_lazy 4→3; no_buffer stays 3). Off by
         // default. Env var, not a flag, so it emits via env/stripEnv.
         id: "mambaSlotSaving", title: "KDA Slot Saving (experimental)",
-        showWhen: (b) => b.hw !== "a3",
+        showWhen: (b) => !config.isNpuHw(b),
         stripEnv: ["SGLANG_OPT_MAMBA_SKIP_DECODE_LOCK"],
         options: [
           { id: "off", label: "Off" },
@@ -863,7 +942,7 @@ export const config = {
       {
         // Only meaningful with EP a2a on (MoE card or a large-scale preset).
         id: "eplb", title: "Expert Rebalancing (EPLB)",
-        showWhen: (b) => b.hw !== "a3",
+        showWhen: (b) => !config.isNpuHw(b),
         stripPrefixes: ["--enable-eplb"],
         options: [
           { id: "off", label: "Off" },
@@ -875,7 +954,7 @@ export const config = {
         // Validated on the no-a2a MXFP4 runner; untested against SBO (EP a2a)
         // and DP attention.
         id: "prefillGraph", title: "Prefill CUDA Graph",
-        showWhen: (b) => b.hw !== "a3",
+        showWhen: (b) => !config.isNpuHw(b),
         stripPrefixes: ["--cuda-graph-backend-prefill"],
         options: [
           { id: "auto", label: "Auto (off)" },
@@ -898,7 +977,7 @@ export const config = {
         // resolves it into the full parallelism shape (tp/ep/dp/dcp; attn-tp =
         // tp/dp); pool sizing rides the calculator-driven ratio.
         id: "lsGpus", title: "Cluster Size (large-scale)",
-        showWhen: (b) => (b.hw !== "a3") && (b.pdMode === undefined || b.pdMode === "unified"),
+        showWhen: (b) => (!config.isNpuHw(b)) && (b.pdMode === undefined || b.pdMode === "unified"),
         // Default follows the base cell's own GPU count (tp8 lanes -> 8,
         // tp16 lanes -> 16), so a preset starts from "same hardware, new shape".
         default: (b) =>
@@ -914,7 +993,7 @@ export const config = {
       },
       {
         id: "lsPreset", title: "Large-Scale Preset",
-        showWhen: (b) => (b.hw !== "a3") && (b.pdMode === undefined || b.pdMode === "unified"),
+        showWhen: (b) => (!config.isNpuHw(b)) && (b.pdMode === undefined || b.pdMode === "unified"),
         stripPrefixes: [
           "--tp-size", "--tp", "--tensor-parallel-size",
           "--ep-size", "--ep", "--expert-parallel-size",
@@ -1149,7 +1228,7 @@ export const config = {
       ],
     },
     {
-      // MI350X and MI355X use the same single-node TP8 ROCm/AITER profile.
+      // MI350X and MI355X use the same single-node TP8/DCP8 ROCm/AITER profile.
       match: { hw: "mi350x", pdMode: "unified", strategy: "balanced" },
       nnodes: 1,
       verified: false,
@@ -1164,7 +1243,10 @@ export const config = {
         "--model-path {{MODEL_NAME}}",
         "--trust-remote-code",
         "--tp-size 8",
-        "--attention-backend triton",
+        "--dcp-size 8",
+        "--dcp-comm-backend a2a",
+        "--prefill-attention-backend aiter",
+        "--decode-attention-backend aiter",
         "--kv-cache-dtype fp8_e4m3",
         "--dtype bfloat16",
         "--mem-fraction-static 0.85",
@@ -1191,7 +1273,10 @@ export const config = {
         "--model-path {{MODEL_NAME}}",
         "--trust-remote-code",
         "--tp-size 8",
-        "--attention-backend triton",
+        "--dcp-size 8",
+        "--dcp-comm-backend a2a",
+        "--prefill-attention-backend aiter",
+        "--decode-attention-backend aiter",
         "--kv-cache-dtype fp8_e4m3",
         "--dtype bfloat16",
         "--mem-fraction-static 0.85",
@@ -2343,7 +2428,6 @@ export const config = {
         "SGLANG_K3_SHARED_EXPERTS_ATTN_TP=1",
         "SGLANG_K3_DENSE_MLP_ATTN_TP=1",
         "SGLANG_NPU_USE_TRITON_PREFIX_KV_CACHE_STORE=1",
-        "SGLANG_ENABLE_SPEC_V2=1",
         "SGLANG_RAGGED_VERIFY_MODE=static",
         "SGLANG_DSPARK_FOLDED_PROPOSAL=0",
         "SGLANG_DSPARK_FOLDED_SAMPLING=0",
@@ -2370,6 +2454,88 @@ export const config = {
         "--moe-a2a-backend deepep",
         "--deepep-mode auto",
         "--reasoning-parser kimi_k3",
+        "--watchdog-timeout 9000",
+        "--model-loader-extra-config '{\"enable_multithread_load\": true}'",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      // Ascend 950PR/DT Series: 4 nodes × 8 cards, one rank per card (TP32).
+      // Unified PD, Balanced, DSPARK-only, with the product-line kernels armed
+      // per env: FIAS V2 BSND for the DSpark target-verify/draft attention
+      // paths and the fine-grained dual-stream MoE overlap. DP-attention runs
+      // at dp=1 (attn-TP 32), and the shared experts / dense MLP shard across
+      // attention-TP through the server flags (--shared-experts-tp-size 4).
+      // Checkpoint: the official Moonshot MXFP4 build (moonshotai/Kimi-K3,
+      // fetched from ModelScope by SGLANG_USE_MODELSCOPE=1 above). Its routed
+      // experts declare compressed-tensors "mxfp4-pack-quantized", which the
+      // loader detects from the checkpoint itself — the NPU MXFP4 MoE scheme
+      // serves them — so the recipe passes no --quantization flag (attention,
+      // shared experts and the dense MLP are ignored by the checkpoint and stay
+      // BF16). A ModelSlim (W4A8) checkpoint would need --quantization modelslim
+      // and a modelslim-style --model-path instead; the two are not mixable.
+      // Pool sizing is internal to the Ascend path: the KDA state and MLA KV
+      // pools are sized by the runtime, so the recipe sets neither
+      // --mamba-full-memory-ratio nor --max-mamba-cache-size, and the radix
+      // cache is off (one KDA state slot per request) — the ratio calculator
+      // does not apply.
+      // --disable-custom-all-reduce is carried verbatim from the recipe script.
+      // Ascend has no custom all-reduce kernel, so the NPU backend resolves the
+      // flag to True on its own (hardware_backend/npu/utils.py); spelling it out
+      // keeps the panel command identical to the command that was measured.
+      // The `unset` lines of the source script (ASCEND_CUSTOM_OPP_PATH,
+      // SGLANG_NPU_FUSED_MOE_MODE, ENABLE_PROFILING, the K3 trace files) are
+      // launch-script hygiene against stale profiling state, not recipe env —
+      // a panel command starts clean, so they don't carry over.
+      match: { hw: "a5", pdMode: "unified", strategy: "balanced" },
+      nnodes: 4,
+      verified: false,
+      verificationStatus: "in-progress",
+      env: [
+        "SGLANG_USE_MODELSCOPE=1",
+        "GLOO_SOCKET_IFNAME={{NETWORK_IFACE}}",
+        "HCCL_SOCKET_IFNAME={{NETWORK_IFACE}}",
+        "PYTORCH_NPU_ALLOC_CONF=expandable_segments:True",
+        "SGLANG_NPU_USE_FIAS_V2_BSND=True",
+        "SGLANG_NPU_FINE_GRAINED_MOE_DUAL_STREAM=True",
+        "SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1",
+        "SGLANG_RAGGED_VERIFY_MODE=static",
+        "SGLANG_DSPARK_FOLDED_PROPOSAL=0",
+        "SGLANG_DSPARK_FOLDED_SAMPLING=0",
+        "SGLANG_DSPARK_STACKED_CTX_KV=0",
+        "SGLANG_DSPARK_EMBED_IN_GRAPH=0",
+        "STREAMS_PER_DEVICE=32",
+        "DEEP_NORMAL_MODE_USE_INT8_QUANT=1",
+        "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=128",
+        "HCCL_BUFFSIZE=2000",
+        "DEEPEP_NORMAL_LONG_SEQ_ROUND=64",
+        "DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS=512",
+        "HCCL_OP_EXPANSION_MODE=AIV",
+      ],
+      flags: [
+        "--trust-remote-code",
+        "--model-path {{MODEL_NAME}}",
+        "--tokenizer-path {{MODEL_NAME}}",
+        "--attention-backend ascend",
+        "--device npu",
+        "--dtype bfloat16",
+        "--tp-size 32",
+        "--enable-dp-attention",
+        "--enable-dp-lm-head",
+        "--mem-fraction-static 0.9",
+        "--chunked-prefill-size 8192",
+        "--cuda-graph-bs-decode 32",
+        "--max-running-requests 32",
+        "--enable-shared-experts-attn-tp",
+        "--enable-dense-mlp-attn-tp",
+        "--shared-experts-tp-size 4",
+        "--reasoning-parser kimi_k3",
+        "--moe-a2a-backend deepep",
+        "--deepep-mode auto",
+        "--linear-attn-verify-backend triton",
+        "--disable-radix-cache",
+        "--disable-custom-all-reduce",
         "--watchdog-timeout 9000",
         "--model-loader-extra-config '{\"enable_multithread_load\": true}'",
         "--host {{HOST_IP}}",
@@ -2417,6 +2583,16 @@ export const config = {
       "  HCCL_SOCKET_IFNAME=<your-nic>   # HCCL transport interface",
       "  SGLANG_HOST_IP=<this-node-ip>   # this node's IP on that NIC",
       "If running outside the official image, source set_env.sh on every node first.",
+    ],
+    a5: [
+      "Run the same command on all four nodes with --node-rank 0/1/2/3.",
+      "NPU collectives use HCCL. Pin the cross-node NIC on EVERY node:",
+      "  GLOO_SOCKET_IFNAME=<your-nic>   # bootstrap interface",
+      "  HCCL_SOCKET_IFNAME=<your-nic>   # HCCL transport interface",
+      "  SGLANG_HOST_IP=<this-node-ip>   # this node's IP on that NIC",
+      "If running outside the official image, source both set_env.sh scripts on every",
+      "node first: /usr/local/Ascend/ascend-toolkit/set_env.sh and",
+      "/usr/local/Ascend/nnal/atb/set_env.sh.",
     ],
   },
 };

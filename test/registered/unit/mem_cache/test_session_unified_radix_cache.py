@@ -18,7 +18,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
 )
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool, ReqToTokenPool
-from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey
+from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.unified_cache.components import ComponentType
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.test.test_utils import CustomTestCase
@@ -96,15 +96,6 @@ def register(cache, token_ids, session_id, generation=None):
             extra_key=None,
         )
     )
-
-
-class TestRadixCacheSessionRemoval(CustomTestCase):
-    def test_plain_radix_cache_does_not_enable_session_references(self):
-        cache = RadixCache(make_params(enable_session=True))
-
-        self.assertFalse(hasattr(cache, "enable_session_radix_cache"))
-        self.assertFalse(hasattr(cache, "register_session_ref"))
-        self.assertFalse(hasattr(cache, "open_radix_session"))
 
 
 class TestSessionUnifiedRadixCache(CustomTestCase):

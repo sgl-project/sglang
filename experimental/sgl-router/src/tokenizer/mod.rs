@@ -3,6 +3,8 @@
 
 pub mod adapter;
 pub mod chat_formatter;
+mod deepseek;
+mod kimi;
 
 use anyhow::Result;
 use chat_formatter::ChatFormatter;
@@ -83,7 +85,7 @@ impl TokenizerRegistry {
             tracing::warn!(model = %m.id,
                 "router-generated input_ids forwarding enabled: requires matching worker model \
                  files and template defaults; native DeepSeek assumes SGLANG_DEFAULT_THINKING=false \
-                 and no SGLANG_DSV4_REASONING_EFFORT preamble; worker parser overrides \
+                 and default SGLANG_DSV4_REASONING_EFFORT / SGLANG_DSV41_REASONING_EFFORT; worker parser overrides \
                  (including --tool-call-parser deepseekv32), content-format detection, and \
                  conversation-template stop strings are not replicated. Use \
                  --disable-input-ids-forwarding for array-only templates or when these assumptions do not hold");
@@ -186,7 +188,7 @@ mod tests {
                 },
             ),
             proxy: crate::config::ProxyConfig::default(),
-            active_load: crate::config::ActiveLoadConfig::default(),
+            router_inflight_load: crate::config::InflightLoadConfig::default(),
         }
     }
 
@@ -333,7 +335,7 @@ mod tests {
         assert_eq!(cfg["chat_template"], "X");
     }
 
-    /// Families the engine encodes in code skip a shipped template; V4.1 counts as V4.
+    /// Families the engine encodes in code skip a shipped template.
     #[test]
     fn chat_formatter_load_preserves_native_precedence() {
         let dir = tempfile::tempdir().unwrap();
@@ -350,9 +352,15 @@ mod tests {
             assert_eq!(resolve(model_type).unwrap().render(&request).unwrap(), "T");
         }
         assert!(resolve("inkling_mm_model").is_none());
-        assert!(resolve("kimi_k3").is_none());
+        assert!(resolve("kimi_k3")
+            .unwrap()
+            .render(&request)
+            .unwrap()
+            .contains("<|open|>message"));
+        assert_eq!(resolve("deepseek_v41").unwrap().render(&serde_json::json!({"messages":[{"role":"system","content":"S"},{"role":"user","content":"hi"}]})).unwrap(),
+            "<｜begin▁of▁sentence｜><｜System｜>S<｜User｜>hi<｜Assistant｜></think>");
         assert_eq!(
-            resolve("deepseek_v41").unwrap().render(&request).unwrap(),
+            resolve("deepseek_v4").unwrap().render(&request).unwrap(),
             "<｜begin▁of▁sentence｜><｜User｜>hi<｜Assistant｜></think>"
         );
     }

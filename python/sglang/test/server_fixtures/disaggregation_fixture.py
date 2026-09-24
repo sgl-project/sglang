@@ -490,7 +490,11 @@ def _maybe_set_ucx_net_devices(ib_devices) -> bool:
     devices = [d.strip() for d in ib_devices.split(",") if d.strip()]
     if not devices:
         return False
-    net_devices = ",".join(f"{d}:1" for d in devices)
+    # UCX applies this list to every network device, not just the RDMA ones, so
+    # an RDMA-only list also drops tcp. NIXL opens an endpoint to itself during
+    # createBackend and tcp is the only transport left that can serve it, so
+    # keep loopback here.
+    net_devices = ",".join([*(f"{d}:1" for d in devices), "lo"])
     # NIXL ignores --disaggregation-ib-device; without this UCX opens every RDMA
     # device on the host, and that full-device init can stall inside the driver.
     os.environ["UCX_NET_DEVICES"] = net_devices

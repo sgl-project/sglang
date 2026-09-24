@@ -1,0 +1,124 @@
+---
+title: MiMo-V2.6
+description: "Deploy MiMo-V2.6-Flash and Pro with SGLang on NVIDIA H200 and B300 GPUs, using MXFP4 MoE weights, BF16 routing, DFlash decoding, and a 1M-token context window."
+tag: NEW
+---
+
+## Deployment
+
+The recipes below target **MiMo-V2.6-Flash on 4× H200 or B300** and **MiMo-V2.6-Pro on 8× H200 or B300**, each on a single node. Both use MXFP4 MoE weights, a BF16 MoE router, and DFlash speculative decoding.
+
+<a id="install" />
+
+<Accordion title="Install SGLang with MiMo-V2.6 support">
+
+BF16 MoE routing and MXFP4 expert loading for MiMo V2.6 landed in [SGLang PR #40448](https://github.com/sgl-project/sglang/pull/40448) and are on `main`, so a recent nightly already carries them. Prepare an NVIDIA CUDA environment with FlashAttention 4, DeepGEMM, and DeepEP available. See the [installation guide](/docs/get-started/install) for platform prerequisites.
+
+<Tabs>
+<Tab title="Python (source)">
+
+Install from source. The commit below is the revision these recipes were captured at; build from `main` instead if you want later fixes.
+
+```bash Command
+git clone https://github.com/sgl-project/sglang.git sglang-mimo-v2.6
+cd sglang-mimo-v2.6
+git checkout 983e643854f15cf9ef4370a49dfd74b6af54c3e3
+python3 -m pip install -e ./python
+```
+
+Then run the **Python** command from the panel below. Checkpoint paths refer to directories on this host.
+
+</Tab>
+<Tab title="Docker (official image)">
+
+Pull the official nightly image, which already includes the MiMo-V2.6 support:
+
+```bash Command
+docker pull lmsysorg/sglang:dev
+```
+
+</Tab>
+</Tabs>
+
+</Accordion>
+
+Select **Flash** or **Pro** to generate its command. Each variant has one base recipe; **Balanced** identifies that recipe and does not imply a measured throughput or latency optimum. The `/model/...` checkpoint and DFlash paths in the generated command are editable defaults, not download locations — set them to your own paths under **⚙ Env** before launching. Use the panel's cURL example to send a request to port **30000** after the server is ready.
+
+import { Deployment } from "/src/snippets/_deployment.jsx";
+import { config } from "/src/snippets/configs/XiaomiMiMo/mimo-v2.6.jsx";
+
+<Deployment config={config} />
+
+## Playground
+
+Experiment with reasoning and tool-call parsers, or disable speculative decoding for comparison. These overrides inherit the selected Flash or Pro recipe; they require separate validation. Parallelism and attention backends remain at the PR settings.
+
+import { Playground } from "/src/snippets/_playground.jsx";
+
+<Playground config={config} />
+
+## 1. Model introduction
+
+**MiMo-V2.6-Flash** is an open-source foundation model developed by Xiaomi. Its Mixture-of-Experts architecture has **309B total parameters and 15B activated per token**, with hybrid attention for computational efficiency. It supports a **1M-token context window** and **native multimodal capabilities**, and is designed for coding, visual understanding, general-purpose assistance, and research in agentic workflows, including complex tasks that require many steps.
+
+**MiMo-V2.6-Pro** is Xiaomi's flagship foundation model, with **1.02T total parameters and 42B activated per token**, designed for demanding workloads. It also supports a **1M-token context window** and **native multimodal capabilities**, with an emphasis on coding, visual understanding, general-purpose assistance, research, and long-horizon agentic tasks.
+
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <thead>
+    <tr style={{borderBottom: "2px solid #d55816"}}>
+      <th style={{textAlign: "left", padding: "10px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Variant</th>
+      <th style={{textAlign: "left", padding: "10px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Total parameters</th>
+      <th style={{textAlign: "left", padding: "10px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Context window</th>
+      <th style={{textAlign: "left", padding: "10px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Recipe (H200 / B300)</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>MiMo-V2.6-Flash</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>309B (15B active)</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>1M tokens</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>4 GPUs, TP=EP=4</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>MiMo-V2.6-Pro</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>1.02T (42B active)</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>1M tokens</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>8 GPUs, TP=EP=8</td>
+    </tr>
+  </tbody>
+</table>
+
+**License:** MIT, continuing the MiMo-V2.5 licensing as confirmed by the model team.
+
+**Architecture references:** The [MiMo-V2.6-Flash-RL](https://huggingface.co/XiaomiMiMo/MiMo-V2.6-Flash-RL) and [MiMo-V2.6-Pro-RL](https://huggingface.co/XiaomiMiMo/MiMo-V2.6-Pro-RL) model cards document this generation directly — the hybrid sliding-window/global attention backbone, the omnimodal encoders, and the published evaluation scores — and each repository also ships the MiMo-V2.6 technical report. Both checkpoints declare `store_dtype: mxfp4` alongside `moe_router_dtype: bfloat16` in `config.json`, which is the expert-only MXFP4 quantization and BF16 routing these recipes depend on, and both carry the paired DFlash drafter in a `dflash/` subdirectory.
+
+## 2. Configuration tips
+
+### Parallelism and precision
+
+- **Flash:** `--tp 4 --ep 4`; **Pro:** `--tp 8 --ep 8`. Both keep `--dp 1 --pp-size 1`. TP and EP use the same GPU ranks; do not multiply them to determine the GPU count.
+- **MoE compute and communication:** Keep `--moe-runner-backend deep_gemm` on B300 and `--moe-runner-backend marlin` on H200, with `--moe-a2a-backend deepep --deepep-mode auto`, together with `--moe-dense-tp-size 1` and `--enable-dp-lm-head`, as in the PR.
+- **Precision:** MXFP4 describes the MoE expert weights, not the entire model. BF16 router weights are selected by the checkpoint's `moe_router_dtype`; the support commit computes router output logits in FP32. The PR relies on checkpoint quantization metadata and does not add a `--quantization` override.
+- **Attention:** Keep `--attention-backend fa4` and `--mm-attention-backend fa4` on both H200 and B300. The recipe also enables `--mm-enable-dp-encoder` for multimodal encoding.
+
+### Context length and memory
+
+Both commands set `--context-length 1048576`. This is the configured per-request context limit; it does not establish that 64 simultaneous 1M-token requests fit in memory.
+
+Flash uses `--mem-fraction-static 0.6 --swa-full-tokens-ratio 0.03`; Pro uses `--mem-fraction-static 0.7 --swa-full-tokens-ratio 0.08`. The memory fraction budgets weights and KV cache, while the SWA ratio controls sliding-window versus full-attention KV allocation. Preserve these model-specific values for the base recipe.
+
+The shared prefill settings are `--chunked-prefill-size 49152 --max-prefill-tokens 65536`. Both commands cap running requests and decode CUDA-graph batch size at **64**, disable prefill CUDA graphs, and use page size **1**. `--enable-cache-report` and `--log-level-http warning` retain the PR's reporting settings.
+
+### DFlash and caching
+
+The base recipe uses `--speculative-algorithm DFLASH --speculative-num-draft-tokens 8`. Supply the DFlash checkpoint paired with the selected target model; the draft path is independently editable and does not have to be a subdirectory of the target checkpoint.
+
+At the pinned commit, DFlash on NVIDIA GPUs requires PP=1 and rejects DP-attention. Do not add `--enable-dp-attention` or copy EAGLE-specific settings from the V2.5 cookbook.
+
+## 3. Reasoning and tool calling
+
+Both launch commands enable `--reasoning-parser mimo --tool-call-parser mimo`. The MiMo reasoning parser uses the request's `chat_template_kwargs.enable_thinking` setting: set it to `true` for reasoning or `false` for a direct answer. The command panel's cURL example enables reasoning explicitly.
+
+For OpenAI-compatible clients, read reasoning from `choices[0].message.reasoning_content`, the final answer from `choices[0].message.content`, and structured tool requests from `choices[0].message.tool_calls`. Preserve both reasoning and answer fields when inspecting responses. Use the checkpoint's generation defaults unless your application needs explicit sampling settings.
+
+Runtime throughput, latency, accuracy, and example responses for V2.6 will be added when measurements from these checkpoints are available.
