@@ -386,7 +386,9 @@ class SWAComponent(TreeComponent):
             swa_branching_seqlen=branching_seqlen,
         )
 
-    def resync_window_full_to_swa_mapping(self, node_id: int) -> None:
+    def resync_window_full_to_swa_mapping(
+        self, node_id: int, prefix_len: int | None = None
+    ) -> None:
         """Re-point the allocator's global full -> swa table for the reused window.
 
         A prefix-cache hit restores only the Full req_to_token rows, while
@@ -408,6 +410,20 @@ class SWAComponent(TreeComponent):
         ct = self.component_type
         root = self.tree_core.root_node
         node = self.tree_core.node_by_id(node_id)
+        # a hit's deepest match node can be the suffix, whose range starts at the
+        # boundary; the window to repair ends there, so step up past such nodes.
+        if prefix_len is not None:
+            while node.id != root.id:
+                fv = node.component_data[BASE_COMPONENT_TYPE].value
+                cd = node.component_data[ct]
+                if (
+                    fv is not None
+                    and cd.value is not None
+                    and fv.numel() > 0
+                    and int(fv.reshape(-1)[-1]) < prefix_len
+                ):
+                    break
+                node = node.parent
         full_chunks: list[torch.Tensor] = []
         swa_chunks: list[torch.Tensor] = []
         n_swa = 0
@@ -432,7 +448,8 @@ class SWAComponent(TreeComponent):
         swa = torch.cat(swa_chunks)
         if os.environ.get("DSV4_DUMP_META"):
             print(
-                f"[SWAGATE] resync node={node_id} W={self.sliding_window_size} "
+                f"[SWAGATE] resync node={node_id} prefix_len={prefix_len} "
+                f"W={self.sliding_window_size} "
                 f"n={full.numel()} full={full.tolist()[:2]}..{full.tolist()[-2:]} "
                 f"swa={swa.tolist()[:2]}..{swa.tolist()[-2:]}",
                 flush=True,

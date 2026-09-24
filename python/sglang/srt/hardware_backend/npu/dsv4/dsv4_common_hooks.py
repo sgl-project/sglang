@@ -53,7 +53,11 @@ def _resync_swa_window(batch: ScheduleBatch, prefix_lens_cpu: torch.Tensor) -> N
             continue
         node_id = getattr(req, "last_node", None)
         if node_id is not None:
-            component.resync_window_full_to_swa_mapping(node_id)
+            # deepest match node can be the freshly-extended suffix node; the
+            # window to repair ends at this req's cached prefix length instead.
+            component.resync_window_full_to_swa_mapping(
+                node_id, int(prefix_lens_cpu[i])
+            )
 
 
 def maybe_write_dsv4_extend(
