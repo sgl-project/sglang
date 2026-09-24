@@ -105,11 +105,48 @@ Several norms look interchangeable and are not. Start here.
 | `fused_rmsnorm_scale_shift_bitexact` | Triton | bit-exact vs flashinfer CuTe RMSNorm + aten modulate | bf16, contiguous rows, `H == 64 * threads_per_row` |
 | `fused_scale_residual_rmsnorm_scale_shift_bitexact` | Triton | bit-exact, incl. the preceding residual-gate add | as above |
 | `fused_layernorm_modulate` | Triton | bit-exact vs aten `vectorized_layer_norm` | bf16, `N % 4 == 0`, 16B-aligned |
+| `layernorm_modulate_rocm` | Triton / ROCm | 256-thread Welford + BF16 eager epilogue rounding; FLUX verifies exactness at runtime | **gfx90a only**, contiguous BF16 BLC, D=3072, strided BD or B1D modulation |
 | `fused_norm_scale_shift` / `fused_scale_residual_norm_scale_shift` | CuTe-DSL | fp32 statistics, close | fp16/bf16/fp32, LN or RMS, many broadcast modes |
 | `flydsl_norm_scale_shift` / `flydsl_fused_residual_norm_scale_shift` | FlyDSL | close | **ROCm gfx950 only** |
 | `try_fused_scale_residual_norm_scale_shift_nvfp4` | JIT CUDA | matches the selected NVFP4 producer contract | Qwen residual LayerNorm/modulation + FC1 NVFP4 quantization |
 | `fuse_layernorm_scale_shift_gate_select01_kernel` | Triton | close | per-token select between two modulation rows (Qwen-Image) |
 | `norm_infer` / `rms_norm_fn` | Triton (+torch/NPU/MPS fallbacks) | close | the generic entry point; use when nothing above fits |
+
+For operational rollback of this ROCm FLUX backend, set
+`SGLANG_DIFFUSION_DISABLE_ROCM_LN_MODULATE=1` before starting workers. This
+preserves the existing fallback and other fusion settings. The first call for
+each device/dtype/shape/stride/epsilon signature verifies exact equality;
+compiled model graphs do not select this eager-qualified backend, even for
+previously verified signatures. Cold signatures also do not launch during graph
+capture. Standalone kernel compilation is supported separately. Numerical
+validation and performance claims must name the tested
+PyTorch/Triton/ROCm stack. Only FLUX.1's D=3072 sites are supported.
+ROCm compiler builds can differ in online-variance multiply-add contraction.
+The backend exposes `variance_fma=False/True`; FLUX tries the alternate policy
+only on first-sight mismatch, requires exact equality, and caches the accepted
+policy per signature. Neither policy bypasses the exactness gate.
+
+ROCm regression entry points (run on an allocated GPU):
+
+```bash
+python test/registered/kernel/diffusion/test_rocm_norm_dispatch_guards.py
+python test/registered/kernel/diffusion/test_layernorm_modulate_rocm.py
+```
+
+The guard suite runs on ROCm GPUs; the numerical suite requires gfx90a and
+otherwise skips. In particular, registration on MI300/MI325 CI is not numerical
+coverage of this backend. Its cached-signature regression requires exact output
+for changing seeds/distributions and asserts that fallback cannot hide a failure.
+NVIDIA regression entry point:
+
+```bash
+python test/registered/kernel/diffusion/test_flux_rocm_cuda_regression.py
+```
+
+Benchmark scripts and raw qualification receipts belong in the PR's separate
+reproduction artifact, not this source tree. Scope is BF16 FLUX.1-schnell, eager,
+single-GPU gfx90a; do not infer MI300 support, compiled-model acceleration or
+concurrent-serving throughput from these checks.
 
 ### Norm variants
 

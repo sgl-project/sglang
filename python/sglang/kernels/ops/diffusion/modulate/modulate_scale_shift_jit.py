@@ -72,7 +72,8 @@ def can_use_modulate_scale_shift_cuda(
     x: torch.Tensor, scale: torch.Tensor, shift: torch.Tensor
 ) -> bool:
     if (
-        x.dtype not in _SUPPORTED_DTYPES
+        torch.version.hip
+        or x.dtype not in _SUPPORTED_DTYPES
         or scale.dtype != x.dtype
         or shift.dtype != x.dtype
         or not (x.is_cuda and scale.is_cuda and shift.is_cuda)
