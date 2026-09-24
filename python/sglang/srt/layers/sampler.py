@@ -35,9 +35,9 @@ from sglang.srt.utils.common import (
 if is_cuda():
     from flashinfer.sampling import (
         min_p_sampling_from_probs,
+        softmax as flashinfer_softmax,
         top_k_top_p_sampling_from_probs,
     )
-    from flashinfer.sampling import softmax as flashinfer_softmax
     from sgl_kernel import (
         top_k_renorm_prob,
         top_p_renorm_prob,
