@@ -21,6 +21,7 @@ from sglang.srt.multimodal.processors.base_processor import (
 from sglang.srt.multimodal.processors.base_processor import (
     MultimodalSpecialTokens,
 )
+from sglang.srt.multimodal.segmented_features import SegmentedFeatures
 
 Step3Image = Union[Image.Image, torch.Tensor]
 ImageWithPatches = tuple[Step3Image, list[Step3Image], list[int] | None]
@@ -491,7 +492,11 @@ class Step3VLProcessor:
                     patch_newline_mask_lst.extend(patch_newline_mask)
 
             image_inputs = {
-                "pixel_values": torch.cat(pixel_values_lst),
+                # One entry per image, which the scheduler splits back apart --
+                # keep the entries instead of packing and re-splitting them.
+                # patch_pixel_values below stays packed: its dim-0 counts
+                # patches, not images, so it is not one part per placeholder.
+                "pixel_values": SegmentedFeatures.from_parts(pixel_values_lst),
                 "num_patches": num_patches,
             }
             if patch_pixel_values_lst:
