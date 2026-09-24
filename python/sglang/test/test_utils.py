@@ -668,7 +668,6 @@ def unified_radix_tree_server_env(
         **os.environ,
         **extra_env,
         "SGLANG_ENABLE_RANK_CONSENSUS_CHECKER": "1",
-        "SGLANG_ENABLE_UNIFIED_RADIX_TREE": "1",
         "SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND": tree_core_backend,
     }
 

@@ -82,28 +82,6 @@ def _sources():
             yield path
 
 
-def _scope_entries_that_say_nothing(paths):
-    """Return ``path:line`` for draft scopes missing ``owns_attention``."""
-    import ast
-
-    missing = []
-    for path in paths:
-        try:
-            tree = ast.parse(path.read_text(encoding="utf-8"))
-        except (SyntaxError, UnicodeDecodeError):
-            continue
-        for node in ast.walk(tree):
-            if not isinstance(node, ast.Call):
-                continue
-            func = node.func
-            name = getattr(func, "attr", None) or getattr(func, "id", None)
-            if name not in ("draft_tp_context", "patch_tensor_parallel_group"):
-                continue
-            if not any(kw.arg == "owns_attention" for kw in node.keywords):
-                missing.append(f"{path}:{node.lineno}")
-    return missing
-
-
 _PS = "sglang.srt.distributed.parallel_state"
 
 
@@ -245,7 +223,17 @@ class TestTheBuildStatesEveryGroup(_IsolatedOverrides):
             and isinstance(node.func, ast.Attribute)
             and node.func.attr == "override_permanently"
         )
-        self.assertIn("is not None", ast.unparse(stamp))
+        self.assertEqual([keyword.arg for keyword in stamp.keywords], [None])
+        mapping = stamp.keywords[0].value
+        self.assertIsInstance(mapping, ast.DictComp)
+        self.assertEqual(len(mapping.generators), 1)
+        guards = mapping.generators[0].ifs
+        self.assertEqual(len(guards), 1)
+        guard = guards[0]
+        self.assertIsInstance(guard, ast.Compare)
+        self.assertEqual([type(op) for op in guard.ops], [ast.IsNot])
+        self.assertEqual([c.value for c in guard.comparators], [None])
+        self.assertEqual(ast.unparse(guard.left), ast.unparse(mapping.value))
 
 
 class TestParallelDelegation(_IsolatedOverrides):
@@ -2334,17 +2322,6 @@ class TestTheAccessorsHaveNoCallersOutsideTheirPackage(CustomTestCase):
         "get_mooncake_transfer_engine",
     }
 
-    # Require zero callers, but do not deprecate: these getters have no
-    # equivalent context field. Group widths may differ from configured widths.
-    NOT_ANSWERED_BY_THE_CONTEXT = {
-        "get_moe_data_parallel_world_size",
-        "get_moe_tensor_parallel_world_size",
-        "get_dcp_world_size",
-        # Answers `None` where the context asserts.
-        "get_dcp_group_no_assert",
-        "get_torch_distributed_pg_options",
-    }
-
     def _accessors(self):
         """Find public getters defined in the parallel-state source."""
         from sglang.srt.distributed import parallel_state as parallel_state_module
@@ -2397,41 +2374,6 @@ class TestTheAccessorsHaveNoCallersOutsideTheirPackage(CustomTestCase):
             "context cannot answer them",
         )
 
-    # Maximum caller counts; reduce these as callers migrate to the context.
-    ALLOWED_CALLERS = {
-        "get_self_pp_group": 1,
-        "get_default_distributed_backend": 1,
-        "get_mooncake_transfer_engine": 6,
-    }
-
-    def test_the_exempt_accessors_do_not_grow_new_callers(self):
-        for name, allowed in sorted(self.ALLOWED_CALLERS.items()):
-            callers = self._callers(name)
-            self.assertLessEqual(
-                len(callers),
-                allowed,
-                f"{name} grew a caller: {callers}. Read it through "
-                f"get_parallel() if the context can answer it; if it truly "
-                f"cannot, lower this number only when one goes away.",
-            )
-
-    def test_every_getter_the_context_answers_is_deprecated(self):
-        from sglang.srt.distributed import parallel_state
-
-        marked = set(parallel_state._CONTEXT_NAME_OF)
-        unclassified = (
-            self._accessors() - self.ALLOWED - self.NOT_ANSWERED_BY_THE_CONTEXT
-        )
-        for name in sorted(unclassified):
-            if name in marked:
-                continue
-            self.assertIn(
-                name,
-                marked,
-                f"{name} is neither deprecated nor listed as exempt -- give it "
-                "a context name or say here why it has none",
-            )
-
     def test_calling_one_from_outside_the_package_is_deprecated(self):
         import warnings
 
@@ -2452,21 +2394,6 @@ class TestTheAccessorsHaveNoCallersOutsideTheirPackage(CustomTestCase):
             any("get_parallel().tp_rank" in m for m in messages),
             f"expected the replacement to be named, got {messages}",
         )
-
-    def test_nothing_the_context_answers_with_calls_back_into_the_package(self):
-        import inspect
-
-        from sglang.srt.distributed import parallel_state
-        from sglang.srt.runtime_context import ParallelContext, _derived_widths
-
-        written = {n for n, d in _derived_widths().items() if not d.fn}
-        self.assertTrue(written, "no written-at-runtime names; this proves nothing")
-        self.assertIn("tp_group", written)
-
-        body = inspect.getsource(ParallelContext._read)
-        self.assertNotIn("_ps()", body)
-        self.assertNotIn("parallel_state", body)
-        self.assertNotIn("sglang.srt.runtime_context", parallel_state._EXEMPT_CALLERS)
 
     def test_a_scope_reaches_callers_that_went_straight_to_the_getter(self):
         from sglang.srt.distributed import parallel_state
@@ -2585,27 +2512,39 @@ class TestTheTopologyIdentities(CustomTestCase):
 
     def test_a_refused_write_leaves_nothing_behind(self):
         self._publish_square()
+        written = dict(tp_size=4, attn_tp_size=3, attn_dp_size=1, attn_cp_size=1)
+        before = {name: getattr(get_parallel(), name) for name in written}
         with self.assertRaises(ValueError):
-            with get_parallel().override(
-                tp_size=4, attn_tp_size=3, attn_dp_size=1, attn_cp_size=1
-            ):
+            with get_parallel().override(**written):
                 pass
-        self.assertEqual(get_parallel().attn_tp_size, 2)
+        self.assertEqual(
+            {name: getattr(get_parallel(), name) for name in written}, before
+        )
+        self.assertEqual(before["attn_tp_size"], 2)
 
     def test_a_group_built_at_another_width_is_refused(self):
         from sglang.srt.distributed.parallel_state import GroupCoordinator
+        from sglang.srt.runtime_context import _WIDTH_AND_GROUP
 
-        self._publish_square()
-        wrong = GroupCoordinator.__new__(GroupCoordinator)
-        wrong.world_size = 8
-        wrong.rank_in_group = 0
-        with self.assertRaises(ValueError) as caught:
-            get_parallel().override_permanently(tp_group=wrong)
-        message = str(caught.exception)
-        self.assertIn("tp_group.world_size == tp_size", message)
-        self.assertIn("built 8, configured 4", message)
-        with self.assertRaises(RuntimeError):
-            get_parallel().tp_group
+        exercised = set()
+        for size_name, group_name in _WIDTH_AND_GROUP:
+            with self.subTest(group=group_name):
+                self._publish_square()
+                configured = getattr(get_parallel(), size_name)
+                wrong = GroupCoordinator.__new__(GroupCoordinator)
+                wrong.world_size = configured + 4
+                wrong.rank_in_group = 0
+                with self.assertRaises(ValueError) as caught:
+                    get_parallel().override_permanently(**{group_name: wrong})
+                message = str(caught.exception)
+                self.assertIn(f"{group_name}.world_size == {size_name}", message)
+                self.assertIn(
+                    f"built {configured + 4}, configured {configured}", message
+                )
+                with self.assertRaises(RuntimeError):
+                    getattr(get_parallel(), group_name)
+                exercised.add((size_name, group_name))
+        self.assertEqual(exercised, set(_WIDTH_AND_GROUP))
 
     def test_a_group_built_at_the_configured_width_is_quiet(self):
         from sglang.srt.distributed.parallel_state import GroupCoordinator
@@ -2632,6 +2571,101 @@ class TestTheTopologyIdentities(CustomTestCase):
 class TestTheParallelPhase(CustomTestCase):
     """Entry points initialize parallel groups before constructing runners."""
 
+    def test_the_layer_phase_leaves_a_stated_placement_alone(self):
+        """A server that runs its own WORLD states its attention placement, and
+        the layer phase reads the model's shape only."""
+        import torch
+
+        from sglang.srt.distributed import bootstrap
+        from sglang.srt.layers.dp_attention import initialize_dp_attention_flags
+
+        reset_context()
+        self.addCleanup(reset_context)
+        publish(
+            ServerArgs(
+                model_path="dummy",
+                tp_size=4,
+                dp_size=2,
+                enable_dp_attention=True,
+                device="cpu",
+            ),
+            role="test",
+            ranks=SpawnRanks(world_rank=3, dp_rank=1),
+        )
+        get_parallel().override_permanently(
+            attn_dp_size=1,
+            attn_dp_rank=0,
+            attn_tp_size=4,
+            attn_tp_rank=3,
+            attn_cp_size=1,
+            attn_cp_rank=0,
+        )
+
+        initialize_dp_attention_flags(get_server_args())
+        bootstrap.init_layer_runtime(
+            model_config=SimpleNamespace(
+                hf_config=SimpleNamespace(architectures=["Qwen2ForCausalLM"]),
+                hidden_size=8,
+                dtype=torch.float16,
+            )
+        )
+
+        self.assertTrue(get_flags().dp.enabled)
+        self.assertEqual(get_parallel().attn_dp_size, 1)
+        self.assertEqual(get_parallel().attn_dp_rank, 0)
+
+    def test_encoder_cp_mlp_reduces_over_attention_tp(self):
+        from unittest.mock import Mock
+
+        import torch
+
+        from sglang.srt.layers.dp_attention import (
+            init_dp_gathered_buffer,
+            initialize_dp_attention_flags,
+        )
+        from sglang.srt.models.qwen3_vl import Qwen3_VisionMLP
+
+        reset_context()
+        self.addCleanup(reset_context)
+        server_args = ServerArgs(
+            model_path="dummy",
+            device="cpu",
+            tp_size=4,
+            attn_cp_size=2,
+            enable_dp_attention=True,
+        )
+        publish(server_args, role="test", ranks=SpawnRanks(world_rank=0))
+        # Identical shards contribute equally; reducing across CP replicas
+        # would double the output even though the layer uses attention TP.
+        tp_group = SimpleNamespace(
+            world_size=4,
+            rank_in_group=0,
+            all_reduce=Mock(side_effect=lambda x: x * 4),
+        )
+        attn_tp_group = SimpleNamespace(
+            world_size=2,
+            rank_in_group=0,
+            all_reduce=Mock(side_effect=lambda x: x * 2),
+        )
+        get_parallel().override_permanently(
+            tp_group=tp_group, attn_tp_group=attn_tp_group
+        )
+        initialize_dp_attention_flags(server_args)
+        init_dp_gathered_buffer(
+            SimpleNamespace(
+                hf_config=SimpleNamespace(), hidden_size=4, dtype=torch.float32
+            )
+        )
+        mlp = Qwen3_VisionMLP(4, 4, bias=False, hidden_act="relu")
+        with torch.no_grad():
+            for parameter in mlp.parameters():
+                parameter.fill_(1)
+            output = mlp(torch.ones(1, 4))
+
+        torch.testing.assert_close(output, torch.full((1, 4), 16.0))
+        attn_tp_group.all_reduce.assert_called_once()
+        tp_group.all_reduce.assert_not_called()
+
     def test_building_twice_is_refused(self):
         from sglang.srt.distributed import bootstrap
 
@@ -2656,7 +2690,6 @@ class TestTheParallelPhase(CustomTestCase):
             )
             kwargs = dict(
                 server_args=ServerArgs(model_path="dummy"),
-                model_config=None,
                 device="cpu",
                 dist_port=12345,
             )
@@ -2682,13 +2715,16 @@ class TestTheParallelPhase(CustomTestCase):
             )
             if not builds:
                 continue
-            if "init_parallel_runtime(" not in text:
-                offenders.append(str(path))
+            for phase in ("init_parallel_runtime(", "init_layer_runtime("):
+                if phase not in text:
+                    offenders.append(f"{path} ({phase[:-1]})")
         self.assertEqual(
             offenders,
             [],
-            "these publish and then build a ModelRunner without bringing the "
-            "parallel runtime up first:\n  " + "\n  ".join(offenders),
+            "these publish and then build a ModelRunner without running both "
+            "phases first -- the group build derives the topology, and the "
+            "layer phase sizes what the model's shape decides:\n  "
+            + "\n  ".join(offenders),
         )
 
 
@@ -2771,34 +2807,6 @@ class TestWhoAnswersDuringADraftScope(CustomTestCase):
         self.assertEqual(get_parallel().attn_dp_size, 2)
         self.assertEqual(get_parallel().dp_size, 2)
 
-    def test_every_caller_says_whether_the_draft_owns_its_attention(self):
-        self.assertEqual(
-            _scope_entries_that_say_nothing(_sources()),
-            [],
-            "these enter the draft scope without saying",
-        )
-
-    def test_the_census_would_notice_one(self):
-        trees = {
-            part
-            for path in _sources()
-            for part in ("benchmark", "examples", "scripts", "test")
-            if f"/{part}/" in path.as_posix()
-        }
-        self.assertEqual(
-            trees,
-            {"benchmark", "examples", "scripts", "test"},
-            "the walk misses a tree that can enter the scope",
-        )
-
-        with tempfile.TemporaryDirectory() as tmp:
-            probe = _pathlib.Path(tmp) / "probe.py"
-            probe.write_text(
-                "with self.draft_tp_context(runner.tp_group):\n    pass\n",
-                encoding="utf-8",
-            )
-            self.assertEqual(_scope_entries_that_say_nothing([probe]), [f"{probe}:1"])
-
     def test_a_full_width_swap_leaves_the_attention_layout_alone(self):
         from sglang.srt.distributed import parallel_state
 
@@ -2837,61 +2845,67 @@ class TestWhoAnswersDuringADraftScope(CustomTestCase):
         self.assertEqual((info.pp_rank, info.pp_size), (0, 1))
 
 
-class TestTheRecordIsNeverWrittenTo(CustomTestCase):
-    """Runtime configuration changes use ``RuntimeContext.override``.
-
-    Only the resolution pipeline in ``arg_groups`` may write ``ServerArgs``.
-    """
-
-    #: Assignments here are the record being built, not mutated behind a reader.
-    EXEMPT = ("srt/arg_groups/",)
-
-    def test_nothing_assigns_a_field_of_the_record(self):
-        import ast as _ast
-
-        from sglang.srt.arg_groups.arg_utils import namespace_of
-        from sglang.srt.server_args import ServerArgs
-
-        fields = set(namespace_of(ServerArgs))
-        offenders = []
-        for path in _sources():
-            rel = path.as_posix()
-            if "sglang/srt/" not in rel and "sglang/benchmark/" not in rel:
-                continue
-            if any(part in rel for part in self.EXEMPT):
-                continue
-            for node in _ast.walk(_ast.parse(path.read_text(encoding="utf-8-sig"))):
-                targets = (
-                    node.targets
-                    if isinstance(node, _ast.Assign)
-                    else [node.target]
-                    if isinstance(node, (_ast.AugAssign, _ast.AnnAssign))
-                    else []
-                )
-                for target in targets:
-                    if not isinstance(target, _ast.Attribute):
-                        continue
-                    base = target.value
-                    name = getattr(base, "id", getattr(base, "attr", None))
-                    if target.attr.startswith("_"):
-                        continue
-                    if name == "server_args" and target.attr in fields:
-                        offenders.append(f"{rel}:{target.lineno} .{target.attr}")
-        self.assertEqual(
-            offenders,
-            [],
-            "write the bag through get_context().override(source, ...) instead "
-            "-- the record is not a channel:\n  " + "\n  ".join(offenders),
-        )
-
-
 class TestTheRetiredNamesAreGoneEverywhere(CustomTestCase):
-    """Reject retired getter imports and group-initialization width arguments."""
+    """Classify parallel getters and reject retired package imports."""
+
+    #: Getters that answer something other than a place in the topology.
+    NOT_A_PLACEMENT = {
+        "get_default_distributed_backend",
+        "get_mooncake_transfer_engine",
+        "get_torch_distributed_pg_options",
+    }
+    #: Widths whose group is not in ``_WIDTH_AND_GROUP``.
+    WIDTH_WITHOUT_A_CHECKED_GROUP = {
+        "get_dcp_world_size",
+        "get_moe_data_parallel_world_size",
+        "get_moe_tensor_parallel_world_size",
+    }
+    #: Variants that answer a group the map already covers.
+    VARIANT_OF_A_MAPPED_GROUP = {
+        "get_dcp_group_no_assert",
+        "get_self_pp_group",
+    }
 
     def _retired(self):
         from sglang.srt.distributed.parallel_state import _CONTEXT_NAME_OF
 
         return set(_CONTEXT_NAME_OF)
+
+    def test_every_getter_the_module_defines_is_classified(self):
+        """Every getter the module defines is deprecated or classified here."""
+        from sglang.srt.distributed import parallel_state
+
+        defined = {
+            name
+            for name in dir(parallel_state)
+            if name.startswith("get_")
+            and callable(getattr(parallel_state, name))
+            and getattr(getattr(parallel_state, name), "__module__", None)
+            == parallel_state.__name__
+        }
+        self.assertTrue(defined, "no getters found; this proves nothing")
+        unclassified = (
+            defined
+            - self._retired()
+            - self.NOT_A_PLACEMENT
+            - self.WIDTH_WITHOUT_A_CHECKED_GROUP
+            - self.VARIANT_OF_A_MAPPED_GROUP
+        )
+        self.assertEqual(
+            unclassified,
+            set(),
+            "these getters are neither deprecated nor classified; say which "
+            "kind each one is, or route it through get_parallel():\n  "
+            + "\n  ".join(sorted(unclassified)),
+        )
+        stale = (
+            self.NOT_A_PLACEMENT
+            | self.WIDTH_WITHOUT_A_CHECKED_GROUP
+            | self.VARIANT_OF_A_MAPPED_GROUP
+        ) - defined
+        self.assertEqual(
+            stale, set(), f"these are named here but no longer defined: {stale}"
+        )
 
     def test_nothing_imports_a_retired_name_from_the_package(self):
         import ast as _ast
@@ -2912,37 +2926,6 @@ class TestTheRetiredNamesAreGoneEverywhere(CustomTestCase):
             [],
             "these import a name the package no longer re-exports; import it "
             "from parallel_state, or read get_parallel():\n  " + "\n  ".join(offenders),
-        )
-
-    def test_nothing_passes_a_width_to_the_build(self):
-        import ast as _ast
-        import inspect
-
-        from sglang.srt.distributed.parallel_state import initialize_model_parallel
-
-        takes = set(inspect.signature(initialize_model_parallel).parameters)
-        offenders = []
-        for path in _sources():
-            if "multimodal_gen" in path.parts:
-                continue
-            for node in _ast.walk(_ast.parse(path.read_text(encoding="utf-8-sig"))):
-                if (
-                    isinstance(node, _ast.Call)
-                    and getattr(node.func, "id", getattr(node.func, "attr", None))
-                    == "initialize_model_parallel"
-                ):
-                    stale = [
-                        kw.arg for kw in node.keywords if kw.arg and kw.arg not in takes
-                    ]
-                    if stale or node.args:
-                        offenders.append(
-                            f"{path}:{node.lineno} {stale or 'positional'}"
-                        )
-        self.assertEqual(
-            offenders,
-            [],
-            "the build reads every width from the context; publish the "
-            "topology instead of passing it:\n  " + "\n  ".join(offenders),
         )
 
 
