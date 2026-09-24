@@ -6,6 +6,7 @@ import multiprocessing as mp
 import os
 import re
 import threading
+import traceback
 from abc import ABC, abstractmethod
 from contextlib import contextmanager
 from typing import (
@@ -816,7 +817,18 @@ class BaseMultimodalProcessor(ABC):
 
     @contextmanager
     def _temporary_fast_processor_cuda_pool(self, device: Optional[str]):
-        """Release fast-processor CUDA temporaries after CPU feature transport."""
+        """Release fast-processor CUDA temporaries after CPU feature transport.
+
+        Callers must drop every tensor allocated inside the block before it
+        exits. The pool is released on exit, and a block that is still live
+        then keeps its segment reserved until the process empties its cache,
+        so each call that leaks one strands a segment on the serving GPU. For
+        the same reason an exception clears the finished frames of its
+        traceback before the pool is released. One bounded exception remains:
+        transformers caches its fused image mean and std per processor and
+        device on first use, in an lru cache of 10 entries, so the first call
+        for each keeps one small block.
+        """
         can_release = (
             device is not None
             and torch.device(device).type == "cuda"
@@ -830,7 +842,14 @@ class BaseMultimodalProcessor(ABC):
         with torch.cuda.device(device):
             pool = torch.cuda.MemPool()
         with torch.cuda.use_mem_pool(pool, device=device):
-            yield
+            try:
+                yield
+            except BaseException as error:
+                # A processor that raises leaves pool tensors in the finished
+                # frames of the traceback. Clearing them frees those blocks
+                # while the pool is live. Frames still running are skipped.
+                traceback.clear_frames(error.__traceback__)
+                raise
 
     def process_mm_data(
         self,
