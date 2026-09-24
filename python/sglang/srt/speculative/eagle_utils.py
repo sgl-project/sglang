@@ -797,36 +797,66 @@ def eagle_sample(
         grammar_mask.apply(next_token_logits)
 
     candidates = verify_input.draft_token.reshape(bs, verify_input.draft_token_num)
-    predict_shape = list(next_token_logits.shape)[:-1]
-    predict = torch.zeros(predict_shape, dtype=torch.int32, device=device).flatten()
-    accept_index = torch.full(
-        (bs, verify_input.max_tree_depth), -1, dtype=torch.int32, device=device
-    )
-    num_correct_drafts = torch.empty((bs,), dtype=torch.int32, device=device)
-
-    # Sample tokens
-    target_predict = None
     use_rejection_sampling = get_spec().speculative_use_rejection_sampling
-    if _verify_uses_greedy(
+    use_greedy = _verify_uses_greedy(
         is_all_greedy=sampling_info.is_all_greedy,
         is_cpu=_is_cpu,
         is_hip=_is_hip,
         is_xpu=_is_xpu,
         use_rejection_sampling=use_rejection_sampling,
-    ):
-        target_predict = torch.argmax(next_token_logits, dim=-1)
-        target_predict = target_predict.reshape(bs, verify_input.draft_token_num)
-        predict, accept_index, num_correct_drafts = verify_tree_greedy_func(
-            predicts=predict,  # mutable
-            accept_index=accept_index,  # mutable
-            accept_token_num=num_correct_drafts,  # mutable
-            candidates=candidates,
-            retrieve_index=verify_input.retrieve_index,
-            retrieve_next_token=verify_input.retrieve_next_token,
-            retrieve_next_sibling=verify_input.retrieve_next_sibling,
-            target_predict=target_predict,
-            topk=verify_input.tree_topk,
+    )
+    fused_chain_greedy = (
+        use_greedy
+        and _is_cuda
+        and verify_input.tree_topk == 1
+        and verify_input.draft_token_num == verify_input.max_tree_depth
+        and next_token_logits.dtype == torch.float32
+        and next_token_logits.stride(-1) == 1
+        and next_token_logits.shape[-1] >= 131072
+        and candidates.stride(-1) == 1
+        and verify_input.draft_token_num <= 16
+    )
+    target_predict = None
+    if fused_chain_greedy:
+        from sglang.kernels.ops.speculative.row_argmax import greedy_verify_chain
+
+        predict, accept_index, num_correct_drafts, target_predict = greedy_verify_chain(
+            next_token_logits, candidates
         )
+    else:
+        predict_shape = list(next_token_logits.shape)[:-1]
+        predict = torch.zeros(predict_shape, dtype=torch.int32, device=device).flatten()
+        accept_index = torch.full(
+            (bs, verify_input.max_tree_depth), -1, dtype=torch.int32, device=device
+        )
+        num_correct_drafts = torch.empty((bs,), dtype=torch.int32, device=device)
+
+    # Sample tokens
+    if use_greedy:
+        if not fused_chain_greedy:
+            if (
+                _is_cuda
+                and next_token_logits.dtype == torch.float32
+                and next_token_logits.stride(-1) == 1
+                and next_token_logits.shape[-1] >= 131072
+            ):
+                from sglang.kernels.ops.speculative.row_argmax import speculative_argmax
+
+                target_predict = speculative_argmax(next_token_logits)
+            else:
+                target_predict = torch.argmax(next_token_logits, dim=-1)
+            target_predict = target_predict.reshape(bs, verify_input.draft_token_num)
+            predict, accept_index, num_correct_drafts = verify_tree_greedy_func(
+                predicts=predict,  # mutable
+                accept_index=accept_index,  # mutable
+                accept_token_num=num_correct_drafts,  # mutable
+                candidates=candidates,
+                retrieve_index=verify_input.retrieve_index,
+                retrieve_next_token=verify_input.retrieve_next_token,
+                retrieve_next_sibling=verify_input.retrieve_next_sibling,
+                target_predict=target_predict,
+                topk=verify_input.tree_topk,
+            )
 
         if _is_hip:
             # On ROCm, the per-rank draft tokens can differ, so ranks accept a

@@ -1253,10 +1253,19 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         elif self.topk == 1 and not _is_hip:
             # Gated to CUDA: see #26358 — ROCm's argmax tie-break corrupts
             # MTP draft selection on FP8 logits.
-            ret_topk_index = torch.argmax(
-                draft_logits_output.next_token_logits, dim=-1, keepdim=True
-            )
-            ret_topk_p = torch.ones_like(ret_topk_index, dtype=torch.float32)
+            logits = draft_logits_output.next_token_logits
+            if (
+                _is_cuda
+                and logits.dtype == torch.float32
+                and logits.stride(-1) == 1
+                and logits.shape[-1] >= 131072
+            ):
+                from sglang.kernels.ops.speculative.row_argmax import speculative_argmax
+
+                ret_topk_p, ret_topk_index = speculative_argmax(logits, with_probs=True)
+            else:
+                ret_topk_index = torch.argmax(logits, dim=-1, keepdim=True)
+                ret_topk_p = torch.ones_like(ret_topk_index, dtype=torch.float32)
             ret_draft_probs = None
         else:
             probs = renorm_draft_probs(
