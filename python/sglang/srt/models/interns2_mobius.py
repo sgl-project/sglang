@@ -42,7 +42,7 @@ from sglang.srt.models.qwen3_5 import (
     Qwen3_5ForConditionalGeneration,
     Qwen3_5GatedDeltaNet,
     _enable_qwen35_fused_ar_quant,
-    _linear_accepts_fp8_tuple,
+    _linear_accepts_quant_tuple,
 )
 from sglang.srt.runtime_context import get_forward, get_parallel, get_stream
 from sglang.srt.utils import add_prefix, is_cuda, make_layers
@@ -508,7 +508,7 @@ class InternS2MobiusLinearDecoderLayer(_InternS2MobiusDecoderMixin, nn.Module):
         )
         enable_fused_ar_quant = (
             _enable_qwen35_fused_ar_quant()
-            and _linear_accepts_fp8_tuple(self.linear_attn.in_proj_qkvz)
+            and _linear_accepts_quant_tuple(self.linear_attn.in_proj_qkvz)
         )
         self.layer_communicator = LayerCommunicator(
             layer_scatter_modes=self.layer_scatter_modes,
@@ -642,7 +642,8 @@ class InternS2MobiusAttentionDecoderLayer(
         self.q_norm = GemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.k_norm = GemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
         enable_fused_ar_quant = (
-            _enable_qwen35_fused_ar_quant() and _linear_accepts_fp8_tuple(self.qkv_proj)
+            _enable_qwen35_fused_ar_quant()
+            and _linear_accepts_quant_tuple(self.qkv_proj)
         )
         self.layer_communicator = LayerCommunicator(
             layer_scatter_modes=self.layer_scatter_modes,
