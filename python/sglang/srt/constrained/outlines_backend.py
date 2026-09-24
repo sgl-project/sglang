@@ -17,7 +17,10 @@ import json
 import logging
 from typing import Dict, List, Optional, Tuple, Union
 
-import interegular
+try:
+    import interegular
+except ImportError:
+    interegular = None
 import torch
 from outlines.fsm.guide import RegexGuide
 from outlines.models.transformers import TransformerTokenizer
@@ -163,7 +166,7 @@ class OutlinesGrammarBackend(BaseGrammarBackend):
             else:
                 # outlines <= 0.0.46
                 guide = RegexGuide(regex, self.outlines_tokenizer)
-        except interegular.patterns.InvalidSyntax as e:
+        except interegular.patterns.InvalidSyntax if interegular else Exception as e:
             logger.error(f"Hit invalid regex schema: {regex=}, {e=}")
             return InvalidGrammarObject(str(e))
         except JSONSchemaStateExplosion as e:

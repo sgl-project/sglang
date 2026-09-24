@@ -1,6 +1,5 @@
 """Detect JSON Schema constraints that grammar backends silently ignore."""
 
-import concurrent.futures
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 from typing import Any
@@ -116,42 +115,43 @@ def build_fsm_with_budget(
     timeout_sec: float = MAX_FSM_COMPILE_TIME,
 ) -> Any:
     """
-    Compile regex to FSM with hard timeout and state budget enforcement.
+    Compile regex to FSM with state budget enforcement.
 
     Tier 1: Fast AST pre-filter (check_regex_ast_complexity)
-    Tier 2: Bounded execution with timeout and state count verification
+    Tier 2: Direct compilation with state count verification
 
     Args:
         pattern: The regex pattern string to compile
         max_states: Maximum allowed DFA states after compilation
-        timeout_sec: Maximum time allowed for compilation
+        timeout_sec: Maximum time allowed for compilation (reserved for future use)
 
     Returns:
         The compiled FSM object
 
     Raises:
-        JSONSchemaStateExplosion: If timeout exceeded or state budget exceeded
-        interegular.patterns.InvalidSyntax: If pattern syntax is invalid
+        JSONSchemaStateExplosion: If state budget exceeded
+        ImportError: If interegular is not installed
     """
     # Tier 1: Fast AST pre-filter
     check_regex_ast_complexity(pattern)
 
-    # Tier 2: Bounded execution
-    import interegular
+    # Tier 2: Direct compilation with state count verification
+    # Relies on AST complexity bounds to prevent pathological cases.
+    # Timeout enforcement moved to caller if needed (e.g., via process pool).
+    try:
+        import interegular
+    except ImportError as e:
+        raise ImportError(
+            "interegular is required for Outlines regex compilation but not installed. "
+            "Install it with: pip install interegular"
+        ) from e
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-        future = executor.submit(lambda: interegular.parse_pattern(pattern).to_fsm())
-        try:
-            fsm = future.result(timeout=timeout_sec)
-            if len(fsm.states) > max_states:
-                raise JSONSchemaStateExplosion(
-                    f"Compiled DFA states ({len(fsm.states)}) exceeds max limit ({max_states})"
-                )
-            return fsm
-        except concurrent.futures.TimeoutError:
-            raise JSONSchemaStateExplosion(
-                f"Regex DFA compilation timed out (> {timeout_sec}s), aborting to prevent DoS: {pattern[:40]}"
-            )
+    fsm = interegular.parse_pattern(pattern).to_fsm()
+    if len(fsm.states) > max_states:
+        raise JSONSchemaStateExplosion(
+            f"Compiled DFA states ({len(fsm.states)}) exceeds max limit ({max_states})"
+        )
+    return fsm
 
 
 MAX_SCHEMA_DEPTH = 64
@@ -315,7 +315,6 @@ def _estimate_dfa_states(schema: Any, depth: int = 0) -> int:
         import re
 
         # Match quantifiers properly: *, +, ?, {N}, {N,}, {N,M}
-        # Use raw strings for proper regex escaping
         quantifier_count = len(re.findall(r"[*+?]|\{\d+,?\d*\}", pattern))
         alt_count = pattern.count("|")
         group_count = pattern.count("(")
@@ -324,22 +323,34 @@ def _estimate_dfa_states(schema: Any, depth: int = 0) -> int:
         brace_quantifiers = re.findall(r"\{(\d+)(?:,\d*)?\}", pattern)
         large_quantifier_sum = sum(int(n) for n in brace_quantifiers if int(n) > 10)
         # Heuristic: each quantifier/alternation/group roughly multiplies states
-        # For patterns like [ab]*a[ab]{13}, the combination of * and {N} is problematic
-        # Use exponential estimation for bounded quantifiers combined with unbounded
+        # Check for nested quantifiers (e.g., (a+)+, (a{100})+) which are truly explosive
+        # vs independent linear concatenations (e.g., \d{4}-\d{2}-\d{2}) which are fine
         has_unbounded = "*" in pattern or "+" in pattern
         has_bounded = bool(brace_quantifiers)
-        if has_unbounded and has_bounded:
-            # This combination can cause exponential blowup
+        # Detect nested quantifier patterns: quantifier inside a capturing group that itself has a quantifier
+        # Pattern: \(...[+*?{].*[+*?}]\) or similar nesting indicators
+        nested_quantifier_pattern = r"\([^)]*[\+\*\?\{][^)]*\)[\+\*\?\{]"
+        has_nested_quantifiers = bool(re.search(nested_quantifier_pattern, pattern))
+        if has_unbounded and has_bounded and has_nested_quantifiers:
+            # Nested quantifiers (e.g., (a{100})+ ) can cause exponential blowup
             # Multiply by the product of bounded quantifiers
             bounded_product = 1
             for n in brace_quantifiers:
                 bounded_product *= max(1, int(n))
-            # Cap at reasonable value
             bounded_product = min(bounded_product, 10000)
             pattern_complexity = max(
                 1,
                 (quantifier_count + alt_count + group_count + char_class_count) * 100
                 + bounded_product * 100,
+            )
+        elif has_unbounded and has_bounded:
+            # Unbounded + bounded but no clear nesting (e.g., .*a{100})
+            # Linear blowup: sum of bounded quantifiers, not product
+            bounded_sum = sum(max(1, int(n)) for n in brace_quantifiers)
+            pattern_complexity = max(
+                1,
+                (quantifier_count + alt_count + group_count + char_class_count) * 100
+                + bounded_sum * 500,
             )
         else:
             pattern_complexity = max(
