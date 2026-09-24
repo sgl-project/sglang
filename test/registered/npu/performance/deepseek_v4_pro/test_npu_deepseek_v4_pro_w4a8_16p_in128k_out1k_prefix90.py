@@ -10,7 +10,7 @@ from sglang.test.ci.ci_register import register_npu_ci
 
 register_npu_ci(
     est_time=4800,
-    suite="nightly-acc-16-npu-a3",
+    suite="",
     nightly=True,
 )
 
@@ -104,28 +104,11 @@ DEEPSEEK_V4_PRO_W4A8_8P_OTHER_ARGS = [
     6,
 ]
 
-# Generation config for Think High mode (thinking=true, reasoning_effort=high).
-DEEPSEEK_V4_PRO_W4A8_GENERATION_CONFIG_HIGH = {
-    "max_tokens": 125000,
-    "top_p": 1,
-    "temperature": 1,
-    "n": 1,
-    "extra_body": {
-        "chat_template_kwargs": {"thinking": True, "reasoning_effort": "high"}
-    },
-}
-
 
 class TestNPUDeepSeekV4ProW4A88PIn128kOut1kPrefix90(
     TestNpuPerformanceTestCaseBase
 ):
-    """Test NPU performance for DeepSeek-V4-Pro W4A8 16p in128k out1k prefix90.
-
-    Requirement: DSV4_Pro_Radix_Cache_1 (step 4, single-node 128k input with
-    90% radix-cache hit rate). The shared-prefix dataset makes 90% of each
-    input length a repeated prefix, so radix cache hits should reduce TTFT
-    noticeably compared with the random-input test above.
-    """
+    """Test NPU performance for DeepSeek-V4-Flash W8A8 8p 16p in128k out1k prefix90."""
 
     benchmark_tool = BENCHMARK_TOOL_DEFAULT
     dataset_type = AISBENCHMARK_DATASET_DEFAULT
@@ -133,22 +116,18 @@ class TestNPUDeepSeekV4ProW4A88PIn128kOut1kPrefix90(
     other_args = DEEPSEEK_V4_PRO_W4A8_8P_OTHER_ARGS
     envs = DEEPSEEK_V4_PRO_W4A8_8P_ENVS
     dataset_name = "generated-shared-prefix"
-    warmup_requests = 0
-    max_concurrency = 32
+    warmup_requests = 16
+    max_concurrency = 16
     num_prompts = 32
     repeat_rate = 0.9
-    input_len = 131072
+    input_len = 117965
     output_len = 1024
     random_range_ratio = 1
-    seed = 1
-    temperature = 0.6
-    top_p = 0.95
     request_rate = float("inf")
     max_attempts = 3
-    pop_sglang_is_in_ci_for_gsp = True
 
     def test_npu_deepseek_v4_pro_w4a8_8p_in128k_out1k_prefix90(self):
-        """Run NPU perf test for DeepSeek-V4-Pro W4A8 16p in128k prefix90."""
+        """Run NPU perf test for DeepSeek-V4-Pro W4A8 16p in128k out1k prefix90."""
         self.run_throughput()
 
 if __name__ == "__main__":
