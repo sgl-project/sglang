@@ -329,6 +329,13 @@ class PrefillBootstrapQueue:
             self.scheduler.server_args,
             self.is_mla_backend,
         )
+        if num_draft_entries and hasattr(kv_manager, "set_draft_kv_buffer_tensors"):
+            draft_pool = draft_kv_pool
+            if hasattr(draft_pool, "full_kv_pool"):
+                draft_pool = draft_pool.full_kv_pool
+            kv_manager.set_draft_kv_buffer_tensors(
+                list(draft_pool.k_buffer), list(draft_pool.v_buffer)
+            )
         # Pass KV pool tensor refs to the manager for GPU gather (staging mode)
         if (
             envs.SGLANG_DISAGG_STAGING_BUFFER.get()

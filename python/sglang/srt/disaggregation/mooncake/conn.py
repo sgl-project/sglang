@@ -243,6 +243,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         self._stopped = False
         self._worker_threads: List[threading.Thread] = []
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
+            self._draft_kv_buffers = None
+            self._draft_pack_buffers = {}
             self.session_failures = defaultdict(int)
             self.failed_sessions = set()
             self.session_lock = threading.Lock()
@@ -358,6 +360,10 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         if regions:
             ptrs, _ = zip(*regions)
             self.engine.batch_deregister(list(ptrs))
+        if getattr(self, "_draft_pack_buffers", None):
+            self.engine.batch_deregister(
+                [buf.get_ptr() for buf in self._draft_pack_buffers.values()]
+            )
 
         if hasattr(self, "connection_pool"):
             with self.connection_lock:
@@ -474,6 +480,9 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             "page_size": page_size,
             "slot_layer_ids": list(slot_layer_ids or []),
         }
+
+    def set_draft_kv_buffer_tensors(self, k_buffers: list, v_buffers: list) -> None:
+        self._draft_kv_buffers = (k_buffers, v_buffers)
 
     def _register_staging_memory(self, ptr: int, size: int) -> None:
         self.engine.batch_register([ptr], [size])
@@ -1057,10 +1066,54 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         dst_device_kv_indices: Optional[npt.NDArray[np.int32]] = None,
         dst_kv_item_len: Optional[int] = None,
         dst_attn_tp_size: Optional[int] = None,
+        dst_kv_item_lens: Optional[List[int]] = None,
+        dst_tp_rank: Optional[int] = None,
     ):
         self._validate_envelope_kv_layout(
             dst_kv_ptrs, dst_kv_item_len, dst_attn_tp_size
         )
+        src_item_lens = self.kv_args.kv_item_lens
+        num_draft = self.kv_args.num_draft_entries
+        if (
+            num_draft
+            and self.server_args.speculative_algorithm == "DFLASH"
+            and dst_attn_tp_size != self.attn_tp_size
+        ):
+            if not dst_kv_item_lens or len(dst_kv_item_lens) != len(dst_kv_ptrs):
+                raise RuntimeError(
+                    "Asymmetric-TP DFlash requires destination KV item lengths"
+                )
+            if len(dst_kv_ptrs) != len(self.kv_args.kv_data_ptrs):
+                raise RuntimeError("Asymmetric-TP DFlash requires matching KV entries")
+            num_target = len(src_item_lens) - num_draft
+            if src_item_lens[:num_target] != dst_kv_item_lens[:num_target]:
+                raise RuntimeError("Asymmetric-TP target KV strides differ")
+            ret = self._send_kvcache_generic(
+                mooncake_session_id=mooncake_session_id,
+                src_data_ptrs=self.kv_args.kv_data_ptrs[:num_target],
+                dst_data_ptrs=dst_kv_ptrs[:num_target],
+                item_lens=src_item_lens[:num_target],
+                prefill_data_indices=prefill_kv_indices,
+                dst_data_indices=dst_kv_indices,
+                executor=executor,
+                src_layer_ids=self.kv_args.kv_layer_ids[:num_target],
+                dst_layer_ids=(dst_layer_ids or [])[:num_target],
+            )
+            if ret != 0:
+                return ret
+            return self._send_draft_kvcache_tp_slice(
+                mooncake_session_id,
+                prefill_kv_indices,
+                dst_kv_indices,
+                self.kv_args.kv_data_ptrs[num_target:],
+                dst_kv_ptrs[num_target:],
+                src_item_lens[num_target:],
+                dst_kv_item_lens[num_target:],
+                self.kv_args.kv_layer_ids[num_target:],
+                (dst_layer_ids or [])[num_target:],
+                dst_tp_rank,
+                dst_attn_tp_size,
+            )
         dst_device_kv_ptrs = None
         if dst_device_kv_indices is not None:
             compression_ratios = self.kv_args.mla_compression_ratios
@@ -1086,6 +1139,166 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             dst_device_data_indices=dst_device_kv_indices,
             dst_device_data_ptrs=dst_device_kv_ptrs,
         )
+
+    def _send_draft_kvcache_tp_slice(
+        self,
+        session_id: str,
+        src_indices: npt.NDArray[np.int32],
+        dst_indices: npt.NDArray[np.int32],
+        src_ptrs: List[int],
+        dst_ptrs: List[int],
+        src_item_lens: List[int],
+        dst_item_lens: List[int],
+        src_layer_ids: List[int],
+        dst_layer_ids: List[int],
+        dst_tp_rank: Optional[int],
+        dst_tp_size: int,
+    ) -> int:
+        """Head-slice DFlash draft KV for a smaller prefill TP than decode TP."""
+        src_tp_size = self.attn_tp_size
+        if (
+            dst_tp_rank is None
+            or dst_tp_size % src_tp_size
+            or dst_tp_size <= src_tp_size
+        ):
+            raise RuntimeError("Unsupported asymmetric-TP DFlash draft KV layout")
+        ratio = dst_tp_size // src_tp_size
+        src_tp_rank = self.kv_args.engine_rank % src_tp_size
+        dst_tp_rank %= dst_tp_size
+        if dst_tp_rank // ratio != src_tp_rank:
+            # Another prefill rank owns this decode rank's draft heads.
+            return 0
+        if len(src_indices) != len(dst_indices):
+            raise RuntimeError("DFlash draft source/destination page counts differ")
+        pairs = build_transfer_entry_pairs(
+            src_layer_ids,
+            dst_layer_ids,
+            len(src_ptrs),
+            len(dst_ptrs),
+            allow_positional_fallback=self.pp_size == 1,
+        )
+        page_size = self.kv_args.page_size
+        slice_num = dst_tp_rank % ratio
+        draft_buffers = self._draft_kv_buffers
+        if draft_buffers is not None:
+            k_buffers, v_buffers = draft_buffers
+            half = len(src_ptrs) // 2
+            can_pack = (
+                len(src_ptrs)
+                == len(dst_ptrs)
+                == len(src_item_lens)
+                == len(dst_item_lens)
+                and len(k_buffers) == len(v_buffers) == half
+                and all(
+                    buf.data_ptr() == ptr
+                    for buf, ptr in zip(k_buffers + v_buffers, src_ptrs)
+                )
+                and len(set(src_item_lens)) == len(set(dst_item_lens)) == 1
+                and all(
+                    src_item_lens[i] == dst_item_lens[j] * ratio
+                    for i, j in pairs
+                )
+            )
+            if can_pack:
+                from sglang.srt.disaggregation.common.staging_buffer import (
+                    StagingBuffer,
+                    gather_all_layers_to_staging,
+                )
+
+                src_heads = k_buffers[0].shape[1]
+                dst_heads = src_heads // ratio
+                dst_token_bytes = dst_item_lens[0] // page_size
+                can_pack = (
+                    src_heads % ratio == 0
+                    and dst_heads * k_buffers[0].shape[-1]
+                    * k_buffers[0].element_size()
+                    == dst_token_bytes
+                )
+            if can_pack:
+                thread_id = threading.get_ident()
+                required_bytes = 8 * sum(dst_item_lens)
+                pack_buffer = self._draft_pack_buffers.get(thread_id)
+                if pack_buffer is None:
+                    device = f"cuda:{self.kv_args.gpu_id}"
+                    pack_buffer = StagingBuffer(
+                        required_bytes, device, self.kv_args.gpu_id
+                    )
+                    self.engine.batch_register(
+                        [pack_buffer.get_ptr()], [pack_buffer.get_size()]
+                    )
+                    self._draft_pack_buffers[thread_id] = pack_buffer
+                    logger.info(
+                        "DFlash asymmetric-TP draft KV uses packed GPU staging: "
+                        "source TP=%s, destination TP=%s, buffer=%s bytes",
+                        src_tp_size,
+                        dst_tp_size,
+                        required_bytes,
+                    )
+                for start in range(0, len(src_indices), 8):
+                    page_count = min(8, len(src_indices) - start)
+                    written = gather_all_layers_to_staging(
+                        k_buffers,
+                        v_buffers,
+                        src_indices[start : start + page_count],
+                        pack_buffer,
+                        slice_num * dst_heads,
+                        dst_heads,
+                        page_size,
+                        self.kv_args.gpu_id,
+                    )
+                    if written != page_count * sum(dst_item_lens):
+                        raise RuntimeError("DFlash draft KV gather size mismatch")
+                    offsets = [0]
+                    for item_len in dst_item_lens:
+                        offsets.append(offsets[-1] + page_count * item_len)
+                    blocks = [
+                        (
+                            pack_buffer.get_ptr()
+                            + offsets[i]
+                            + page_pos * dst_item_lens[i],
+                            dst_ptrs[j] + int(dst_page) * dst_item_lens[j],
+                            dst_item_lens[j],
+                        )
+                        for i, j in pairs
+                        for page_pos, dst_page in enumerate(
+                            dst_indices[start : start + page_count]
+                        )
+                    ]
+                    ret = self._transfer_data(session_id, blocks)
+                    if ret != 0:
+                        return ret
+                return 0
+        for start in range(0, len(src_indices), 8):
+            blocks = []
+            for i, j in pairs:
+                src_stride = src_item_lens[i]
+                dst_stride = dst_item_lens[j]
+                if src_stride != dst_stride * ratio or dst_stride % page_size:
+                    raise RuntimeError(
+                        "Unsupported asymmetric-TP DFlash draft KV stride: "
+                        f"source={src_stride}, destination={dst_stride}, ratio={ratio}"
+                    )
+                src_token_stride = src_stride // page_size
+                dst_token_stride = dst_stride // page_size
+                head_offset = slice_num * dst_token_stride
+                for src_page, dst_page in zip(
+                    src_indices[start : start + 8],
+                    dst_indices[start : start + 8],
+                ):
+                    src_page_ptr = src_ptrs[i] + int(src_page) * src_stride
+                    dst_page_ptr = dst_ptrs[j] + int(dst_page) * dst_stride
+                    blocks.extend(
+                        (
+                            src_page_ptr + token * src_token_stride + head_offset,
+                            dst_page_ptr + token * dst_token_stride,
+                            dst_token_stride,
+                        )
+                        for token in range(page_size)
+                    )
+            ret = self._transfer_data(session_id, blocks)
+            if ret != 0:
+                return ret
+        return 0
 
     def send_kvcache_dcp(
         self,
@@ -2275,6 +2488,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                                 dst_device_kv_indices=chunked_dst_device_kv_indice,
                                 dst_kv_item_len=target_rank_registration_info.dst_kv_item_len,
                                 dst_attn_tp_size=target_rank_registration_info.dst_attn_tp_size,
+                                dst_kv_item_lens=target_rank_registration_info.dst_kv_item_lens,
+                                dst_tp_rank=target_rank_registration_info.dst_tp_rank,
                             )
                         elif (
                             self.enable_staging
