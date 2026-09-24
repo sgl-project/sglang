@@ -609,6 +609,29 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         )
         self.assertFalse(self._resolved(sa, "uses_mamba_radix_cache"))
 
+    def test_explicit_extra_buffer_accepts_predicate_registered_mamba_state(self):
+        from transformers import LlamaConfig
+
+        from sglang.srt.configs import linear_attn_model_registry as registry
+
+        spec = registry.LinearAttnModelSpec(
+            config_class=LlamaConfig,
+            backend_class_name="pkg.mod.Backend",
+            config_predicate=lambda cfg: getattr(cfg, "linear_attn", False),
+            support_mamba_cache_extra_buffer=True,
+        )
+        with (
+            patch.object(registry, "_LINEAR_ATTN_MODEL_REGISTRY", [spec]),
+            override_platform(is_cuda=True),
+        ):
+            sa = self._construct(
+                "LlamaForCausalLM",
+                "llama",
+                config_extra={"linear_attn": True},
+                mamba_radix_cache_strategy="extra_buffer",
+            )
+        self.assertTrue(self._resolved(sa, "uses_mamba_radix_cache"))
+
     def test_mistral_large3_forces_bfloat16(self):
         sa = self._construct("MistralLarge3ForCausalLM", "mistral")
         self.assertEqual(
@@ -2536,7 +2559,8 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         # extra-buffer support requires the triton linear-attn backend
         self.assertFalse(
             supports_mamba_cache_extra_buffer(
-                SimpleNamespace(linear_attn_backend="fla"), "Qwen3NextForCausalLM"
+                SimpleNamespace(linear_attn_backend="fla"),
+                SimpleNamespace(architectures=["Qwen3NextForCausalLM"]),
             )
         )
         self.assertTrue(
@@ -2545,9 +2569,114 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                     linear_attn_backend="triton",
                     linear_attn_prefill_backend="flashinfer",
                 ),
-                "Qwen3_5MoeForConditionalGeneration",
+                SimpleNamespace(architectures=["Qwen3_5MoeForConditionalGeneration"]),
             )
         )
+
+    def test_mamba_radix_cache_resolution_reads_registry_specs(self):
+        """A spec registered by config predicate (archs=[]) drives the leaves
+        exactly like an arch-registered one, and the spec's
+        `support_mamba_cache_extra_buffer` gates the extra_buffer strategy."""
+        from sglang.srt.arg_groups.overrides import (
+            ResolvedView,
+            _mamba_radix_cache_resolution,
+            supports_mamba_cache_extra_buffer,
+        )
+        from sglang.srt.configs import linear_attn_model_registry as registry
+
+        class _PredicateConfig:
+            def __init__(self, linear_attn):
+                self.architectures = ["PredicateHybridForCausalLM"]
+                self.linear_attn = linear_attn
+
+        class _ArchConfig:
+            architectures = ["ArchHybridForCausalLM"]
+
+        def _view(hf, **kw):
+            defaults = dict(
+                disable_radix_cache=False,
+                mamba_radix_cache_strategy="auto",
+                disable_overlap_schedule=False,
+                page_size=None,
+                linear_attn_backend="triton",
+                linear_attn_prefill_backend=None,
+            )
+            defaults.update(kw)
+            return ResolvedView(
+                SimpleNamespace(_model_config=SimpleNamespace(hf_config=hf), **defaults)
+            )
+
+        by_predicate = registry.LinearAttnModelSpec(
+            config_class=_PredicateConfig,
+            backend_class_name="pkg.mod.Backend",
+            config_predicate=lambda cfg: cfg.linear_attn,
+            support_mamba_cache_extra_buffer=True,
+        )
+        by_arch = registry.LinearAttnModelSpec(
+            config_class=_ArchConfig,
+            backend_class_name="pkg.mod.Backend",
+            arch_names=["ArchHybridForCausalLM"],
+        )
+        with patch.object(registry, "_LINEAR_ATTN_MODEL_REGISTRY", []):
+            registry.register_linear_attn_model(by_predicate)
+            registry.register_linear_attn_model(by_arch)
+
+            # predicate hit: the leaf is declared and the spec opts into
+            # extra_buffer on the triton linear-attn backend only
+            self.assertEqual(
+                _mamba_radix_cache_resolution(_view(_PredicateConfig(True))),
+                {
+                    "uses_mamba_radix_cache": True,
+                    "mamba_radix_cache_strategy": "extra_buffer",
+                },
+            )
+            self.assertEqual(
+                _mamba_radix_cache_resolution(
+                    _view(_PredicateConfig(True), linear_attn_backend="fla")
+                ),
+                {
+                    "uses_mamba_radix_cache": True,
+                    "mamba_radix_cache_strategy": "no_buffer",
+                    "disable_overlap_schedule": True,
+                },
+            )
+            self.assertTrue(
+                supports_mamba_cache_extra_buffer(
+                    SimpleNamespace(linear_attn_backend="triton"),
+                    _PredicateConfig(True),
+                )
+            )
+            # predicate miss: not a hybrid model at all
+            self.assertEqual(
+                _mamba_radix_cache_resolution(_view(_PredicateConfig(False))), {}
+            )
+            self.assertFalse(
+                supports_mamba_cache_extra_buffer(
+                    SimpleNamespace(linear_attn_backend="triton"),
+                    _PredicateConfig(False),
+                )
+            )
+            # arch-registered spec without the opt-in: unchanged, no_buffer
+            self.assertEqual(
+                _mamba_radix_cache_resolution(_view(_ArchConfig())),
+                {
+                    "uses_mamba_radix_cache": True,
+                    "mamba_radix_cache_strategy": "no_buffer",
+                    "disable_overlap_schedule": True,
+                },
+            )
+            self.assertFalse(
+                supports_mamba_cache_extra_buffer(
+                    SimpleNamespace(linear_attn_backend="triton"), _ArchConfig()
+                )
+            )
+            # hard-coded archs do not need a spec
+            self.assertEqual(
+                _mamba_radix_cache_resolution(
+                    _view(SimpleNamespace(architectures=["Qwen3NextForCausalLM"]))
+                )["mamba_radix_cache_strategy"],
+                "extra_buffer",
+            )
 
     def test_qwen3_5_hybrid_coupled_declaration(self):
         from sglang.srt.arg_groups.model_overrides.qwen3_5 import (
