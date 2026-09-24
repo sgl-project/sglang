@@ -10,6 +10,28 @@
 set +e
 set -u
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
+
+# Reclaim leaked sglang /dev/shm segments at teardown. SGLang processes are torn
+# down with SIGKILL, which skips their unlink paths, so sgl_shm_* /
+# multi_tokenizer_args_* segments accumulate and eventually fill /dev/shm — the
+# next scheduler then SIGBUSes at init ("Fatal Python error: Bus error",
+# scheduler died exit code -7).
+#
+# Reuse the canonical sweep (stale_shm_cleanup.py, the same one ci_install_
+# dependency.sh runs at job startup) rather than a flat age delete: it is
+# name-scoped and removes a segment only if its embedded creator pid is dead. So
+# a concurrent or long-running job's live segments — and any non-job files the
+# CI user owns (the runner agent, daemons, reparented supervisors) — are never
+# touched, and there is no age race to re-trigger the very SIGBUS this guards
+# against. Runs independent of venv mode (before the USE_VENV early-exit below).
+# Best effort: never fails the job.
+SHM_CLEANUP="${REPO_ROOT}/python/sglang/srt/utils/stale_shm_cleanup.py"
+if [ -f "$SHM_CLEANUP" ]; then
+    SGLANG_IS_IN_CI=true python3 "$SHM_CLEANUP" || true
+fi
+
 # Bound the persistent uv cache (~/.cache/uv, bind-mounted and shared across all
 # runner containers). Nothing else evicts it, so it grows unbounded — on the 5090
 # hosts it reached ~500 GB and filled the disk, failing jobs with ENOSPC at
