@@ -297,7 +297,7 @@ class TestPostprocessTensors(CustomTestCase):
         )
 
     def test_skip_set_marks_quantized_entry_not_compared(self):
-        qweight, sf_fp32, _ = _build_fp8_quant_pair()
+        qweight, sf_fp32 = _build_fp8_quant_pair()
         raw = {"x.weight": qweight, "x.weight_scale_inv": sf_fp32}
         quantized_set = {
             "x.weight": QuantizedWeight(Fp8BlockComparable, "x.weight_scale_inv")
