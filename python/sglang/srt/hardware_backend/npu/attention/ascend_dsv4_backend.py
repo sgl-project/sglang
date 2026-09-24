@@ -2093,12 +2093,31 @@ class DeepseekV4AscendAttnBackend(
                             phase = int(
                                 (((swa % page_sz) != (pp % page_sz)) & (swa > 0)).sum()
                             )
+                            n_zero = int((swa == 0).sum())
+                            mapped = swa[swa > 0]
+                            min_l = int(mapped.min()) if mapped.numel() else -1
+                            max_l = int(mapped.max()) if mapped.numel() else -1
                         except Exception:
                             phase = -1
+                            n_zero = -1
+                            min_l = -1
+                            max_l = -1
+                        try:
+                            slot0 = hashlib.md5(
+                                buf[0]
+                                .view(torch.uint8)
+                                .detach()
+                                .cpu()
+                                .numpy()
+                                .tobytes()
+                            ).hexdigest()[:16]
+                        except Exception:
+                            slot0 = "n/a"
                         print(
                             f"[SWAKV] start_pos={_l(getattr(fm, 'start_pos', None))} layer={layer} "
                             f"ids={ids} span={span} md5={hashlib.md5(raw).hexdigest()[:16]} "
-                            f"win={h.hexdigest()[:16]} rows={nrows} phase={phase}",
+                            f"win={h.hexdigest()[:16]} rows={nrows} phase={phase} "
+                            f"zero={n_zero} minl={min_l} maxl={max_l} slot0={slot0}",
                             flush=True,
                         )
             except Exception as exc:
