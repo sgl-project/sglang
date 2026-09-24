@@ -27,9 +27,10 @@ from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import MatchPrefixParams
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
-from sglang.srt.mem_cache.mamba_radix_cache import MambaRadixCache
 from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, HybridReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
+from sglang.srt.mem_cache.unified_cache.components.base import ComponentType
+from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 from sglang.srt.utils import get_device
@@ -104,6 +105,9 @@ class TestOptimisticPrefill(
             "3",
             "--chunked-prefill-size",
             "128",
+            "--enable-hierarchical-cache",
+            "--hicache-write-policy",
+            "write_through",
             "--enable-metrics",
             "--enable-request-time-stats-logging",
         ]
@@ -186,6 +190,9 @@ class TestOptimisticPrefillFailure(PDDisaggregationServerBase):
             "3",
             "--chunked-prefill-size",
             "128",
+            "--enable-hierarchical-cache",
+            "--hicache-write-policy",
+            "write_through",
             "--enable-metrics",
             "--enable-request-time-stats-logging",
             "--load-format",
@@ -344,26 +351,18 @@ class TestOptimisticPrefillMambaAdmission(CustomTestCase):
         server_args = self._make_args(pp_size=2, **self.BASE)
         self.assertEqual(self._resolved_attempts(server_args), 0)
 
-    def test_hicache_write_policy_restriction_retained(self):
+    def test_l2_write_through_allowed(self):
         server_args = self._make_args(
             enable_hierarchical_cache=True,
             hicache_write_policy="write_through",
             **self.BASE,
         )
-        self.assertEqual(self._resolved_attempts(server_args), 0)
+        self.assertEqual(self._resolved_attempts(server_args), 3)
 
 
 class TestOptimisticPrefillMambaRetryRelease(CustomTestCase):
-    """Optimistic retry cleanup must not treat the donated Mamba checkpoint
-    as a second donation.
-
-    Bug mechanism: the retry path first inserts the unfinished prefix, which
-    donates the tracked checkpoint and clears ``mamba_last_track_seqlen``.
-    Releasing with ``is_insert=True`` afterwards re-enters the donation path
-    with the cleared marker, inserting a zero-length radix entry that pins a
-    clone of the request's live state. Releasing with ``is_insert=False``
-    retains the donated prefix/checkpoint and frees only the uncached tail
-    and the request-owned Mamba buffers.
+    """An optimistic-prefill retry leaves the donated prefix and exactly one
+    Mamba checkpoint in the tree -- not zero, and not a second pinned clone.
     """
 
     SIZE = 128
@@ -373,7 +372,7 @@ class TestOptimisticPrefillMambaRetryRelease(CustomTestCase):
 
     def _setup_mamba_tree(self):
         server_args = ServerArgs(model_path="dummy", page_size=1)
-        # MambaRadixCache reads mamba_cache_chunk_size, whose property
+        # The mamba component reads mamba_cache_chunk_size, whose property
         # otherwise loads the HF config for the dummy model.
         server_args._mamba_cache_chunk_size = FLA_CHUNK_SIZE
         set_global_server_args_for_scheduler(server_args)
@@ -427,13 +426,14 @@ class TestOptimisticPrefillMambaRetryRelease(CustomTestCase):
             kvcache=pool,
             need_sort=False,
         )
-        tree = MambaRadixCache(
+        tree = UnifiedRadixCache(
             params=CacheInitParams(
                 disable=False,
                 req_to_token_pool=req_to_token_pool,
                 token_to_kv_pool_allocator=allocator,
                 page_size=1,
                 enable_mamba_extra_buffer=True,
+                tree_components=(ComponentType.FULL, ComponentType.MAMBA),
             )
         )
         return tree, allocator, req_to_token_pool
@@ -459,7 +459,7 @@ class TestOptimisticPrefillMambaRetryRelease(CustomTestCase):
         req.kv.kv_committed_len = len(self.PROMPT)
         req.kv.kv_allocated_len = len(self.PROMPT)
         req.kv.mamba_last_track_seqlen = self.TRACK_SEQLEN
-        req.last_node = tree.root_node
+        req.last_node = tree.root_node_handle()
 
         scheduler = SimpleNamespace(
             tree_cache=tree,
@@ -478,13 +478,15 @@ class TestOptimisticPrefillMambaRetryRelease(CustomTestCase):
                 scheduler, req
             )
 
-        # The donated prefix and exactly one checkpoint stay in the tree; the
-        # old double-donation path either asserts or pins a second state.
         self.assertEqual(tree.total_size(), (self.TRACK_SEQLEN, 1))
         match = tree.match_prefix(
             MatchPrefixParams(key=RadixKey(array("q", self.PROMPT)))
         )
-        self.assertIsNotNone(match.last_device_node.mamba_value)
+        self.assertIsNotNone(
+            tree.tree_core.get_component_device_value(
+                match.last_device_node, ComponentType.MAMBA
+            )
+        )
 
         # Only the uncached tail and the request-owned Mamba buffers are
         # freed; the tree keeps the donated checkpoint slot.

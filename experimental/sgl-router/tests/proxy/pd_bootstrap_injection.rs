@@ -21,7 +21,7 @@ use axum::http::{Request, StatusCode};
 use bytes::Bytes;
 use serde_json::{json, Value};
 use sgl_router::config::{
-    ActiveLoadConfig, Config, DiscoveryBackend, ModelConfig, ObservabilityConfig, PolicyKind,
+    Config, DiscoveryBackend, InflightLoadConfig, ModelConfig, ObservabilityConfig, PolicyKind,
     ProxyConfig, ServerConfig, StaticUrlsDiscoveryConfig,
 };
 use sgl_router::discovery::{ModelId, WorkerId, WorkerMode, WorkerSpec};
@@ -62,7 +62,7 @@ fn config() -> Config {
             urls: vec!["http://placeholder:0".into()],
         }),
         proxy: ProxyConfig::default(),
-        active_load: ActiveLoadConfig::default(),
+        router_inflight_load: InflightLoadConfig::default(),
     }
 }
 
@@ -225,7 +225,7 @@ async fn round_robin_pd_prefill_does_not_track_dispatch_timestamps() {
     let request = tokio::spawn(build_router(Arc::clone(&ctx)).oneshot(chat_request()));
 
     await_captured_body(&prefill, Duration::from_secs(2), "prefill").await;
-    assert_eq!(prefill_worker.active_load(), 1);
+    assert_eq!(prefill_worker.router_inflight_load(), 1);
     assert_eq!(prefill_worker.slots_acquired_since(cutoff), 0);
 
     assert_eq!(request.await.unwrap().unwrap().status(), StatusCode::OK);
@@ -375,4 +375,62 @@ async fn pd_mode_prefill_5xx_does_not_poison_decode_response() {
     let prefill_body = await_captured_body(&prefill, Duration::from_secs(2), "prefill").await;
     let pv = parse_body(&prefill_body);
     assert_eq!(bootstrap_port(&pv), Some(8997));
+}
+
+fn streaming_chat_request() -> Request<Body> {
+    Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::to_vec(&json!({
+                "model": "tiny",
+                "messages": [{"role": "user", "content": "hi"}],
+                "stream": true,
+            }))
+            .unwrap(),
+        ))
+        .unwrap()
+}
+
+#[tokio::test]
+async fn pd_mode_disconnect_does_not_abort_either_worker() {
+    let prefill = crate::common::mock_worker::MockWorker::start(vec![]).await;
+    let decode = crate::common::mock_worker::MockWorker::start_slow_stream(
+        vec!["data: a\n\n", "data: b\n\n", "data: c\n\n"],
+        Duration::from_millis(50),
+    )
+    .await;
+    let ctx = build_ctx(vec![
+        WorkerSpec {
+            id: WorkerId("p1".into()),
+            url: prefill.url.clone(),
+            mode: WorkerMode::Prefill,
+            model_ids: vec![ModelId("tiny".into())],
+            bootstrap_port: Some(8997),
+        },
+        WorkerSpec {
+            id: WorkerId("d1".into()),
+            url: decode.url.clone(),
+            mode: WorkerMode::Decode,
+            model_ids: vec![ModelId("tiny".into())],
+            bootstrap_port: None,
+        },
+    ]);
+    let app = build_router(ctx);
+
+    let res = app.oneshot(streaming_chat_request()).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+
+    use futures::StreamExt;
+    let mut data_stream = res.into_body().into_data_stream();
+    assert!(data_stream.next().await.is_some());
+    drop(data_stream);
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    for worker in [&prefill, &decode] {
+        assert!(worker.abort_log.lock().unwrap().is_empty());
+        let body = await_captured_body(worker, Duration::from_secs(2), "PD worker").await;
+        assert!(parse_body(&body).get("rid").is_none());
+    }
 }

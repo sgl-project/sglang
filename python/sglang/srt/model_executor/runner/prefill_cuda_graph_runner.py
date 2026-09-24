@@ -1191,6 +1191,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             padded_view.extend_seq_lens = s["extend_seq_lens"][:r]
             padded_view.extend_prefix_lens = s["extend_prefix_lens"][:r]
             padded_view.max_seq_len_override = static_forward_batch.max_seq_len_override
+            padded_view.input_ids = static_forward_batch.input_ids
             attn_backend.init_forward_metadata_out_graph(padded_view)
             return
         if not self.use_captured_attn_metadata:
@@ -1527,6 +1528,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                     column_starts=0,
                     req_lens=shape_inputs["extend_seq_lens"],
                 )
+            forward_batch = self.model_runner.prepare_dummy_forward_batch(forward_batch)
             self.tbo_plugin.capture_one_batch_size(forward_batch, num_tokens=num_tokens)
         return forward_batch, self.model_runner.attn_backend
 
@@ -1860,6 +1862,9 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         # The n-gram hasher runs outside the graph and reads this at replay.
         static_forward_batch.ngram_embedding_info = forward_batch.ngram_embedding_info
         static_forward_batch.engram_history = forward_batch.engram_history
+        static_forward_batch = self.model_runner.prepare_dummy_forward_batch(
+            static_forward_batch
+        )
         if self._is_full_backend:
             forward_batch.next_token_logits_buffer = (
                 static_forward_batch.next_token_logits_buffer
@@ -2070,6 +2075,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             input_token_ids_logprobs_val=output.input_token_ids_logprobs_val,
             input_token_ids_logprobs_idx=output.input_token_ids_logprobs_idx,
             input_logprobs_copy_done=output.input_logprobs_copy_done,
+            customized_info=output.customized_info,
             mm_input_embeds=mm_input_embeds,
         )
 
