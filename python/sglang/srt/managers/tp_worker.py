@@ -574,12 +574,7 @@ class TpModelWorker(BaseTpWorker):
         self.model_runner.hisparse_coordinator = coordinator
 
     def get_worker_info(self):
-        # Decode context parallelism and logical-page KV sharding each widen
-        # the scheduler-visible index space over the physical per-rank pool
-        # (dcp_size splits a sequence across ranks; KV sharding stripes each
-        # logical page across shard_size ranks). At most one factor is above 1
-        # -- they are validated mutually exclusive -- so the product is the
-        # active widening and degenerates to 1x when neither is on.
+        # DCP and KV sharding are mutually exclusive capacity multipliers.
         kv_capacity = (
             self.model_runner.effective_max_total_num_tokens
             * get_parallel().attn_dcp_size

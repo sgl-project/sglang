@@ -845,8 +845,7 @@ class TestPrefillAdder(CustomTestCase):
         )
         remaining = (adder.rem_total_tokens, adder.rem_chunk_tokens)
 
-        # Each 3-page prefix needs 2 pages per shard: 16 scratch tokens.
-        # Token capacity fits both requests, but prefix scratch only fits one.
+        # Both requests fit KV capacity, but prefix scratch fits only one.
         self.assertEqual(
             adder.add_one_req(
                 second, has_chunked_req=False, truncation_align_size=None
@@ -859,7 +858,7 @@ class TestPrefillAdder(CustomTestCase):
         self.assertEqual(adder.kv_shard_block_bound_pages, 2)
         self.assertEqual(adder.kv_shard_chunk_pages, 1)
 
-        # A rejected reservation must leave the remaining chunk scratch usable.
+        # Rejection leaves the remaining chunk scratch usable.
         third = self.create_sharded_req("no-prefix", prefix_len=0)
         self.assertEqual(
             adder.add_one_req(third, has_chunked_req=False, truncation_align_size=None),
@@ -906,8 +905,7 @@ class TestPrefillAdder(CustomTestCase):
                     result = adder.add_one_req(
                         req, has_chunked_req=False, truncation_align_size=None
                     )
-                    # The eighth request commits even when its verdict tells
-                    # the caller that the 8K compute budget is now exhausted.
+                    # The eighth request commits even if it exhausts the budget.
                     expected = (
                         AddReqResult.OTHER
                         if i == 7 and chunk_tokens == 8192
@@ -945,9 +943,7 @@ class TestPrefillAdder(CustomTestCase):
                     remaining,
                 )
                 if chunk_tokens == 16384:
-                    # With compute capacity remaining, the ninth long prefix
-                    # is deferred solely by scratch capacity. That deferral
-                    # must leave room for a request without a cached prefix.
+                    # Prefix scratch is full; a request without a prefix still fits.
                     no_prefix = self.create_sharded_req(
                         "no-prefix", prefix_len=0, extend_len=extend_len
                     )
@@ -962,8 +958,7 @@ class TestPrefillAdder(CustomTestCase):
                     self.assertEqual(adder.can_run_list, reqs[:8] + [no_prefix])
 
     def test_sharded_admission_reserves_only_selected_chunk(self):
-        # Normal admission page-rounds a partial remaining budget without a
-        # separate KV-sharding truncation alignment override.
+        # Use normal page rounding without a sharding alignment override.
         for remaining, selected, verdict in (
             (8, 8, AddReqResult.OTHER),
             (7, 4, AddReqResult.CONTINUE),

@@ -440,9 +440,7 @@ class Scheduler(
 ):
     """A scheduler that manages a tensor parallel GPU worker."""
 
-    # Factor by which KV sharding widens the allocator's index space over one
-    # rank's physical pool. Resolved in init_memory_pool_and_cache; the class
-    # default keeps readers that run before the pool exists at stock 1x units.
+    # Logical-to-physical KV capacity ratio; defaults to 1 before pool init.
     kv_shard_widening: int = 1
 
     # Class-level default so on_idle's stall gate works even if a fork
@@ -2369,9 +2367,7 @@ class Scheduler(
             enable_hisparse=self.enable_hisparse,
             full_tokens_per_layer=self.full_tokens_per_layer,
             swa_tokens_per_layer=self.swa_tokens_per_layer,
-            # DCP and logical-page KV sharding widen the allocator's index
-            # space; the observer's total must be in the same (logical) units
-            # as allocator.available_size() and the radix counters.
+            # Match the allocator and radix counters' logical units.
             max_total_num_tokens=self.max_total_num_tokens
             * get_parallel().attn_dcp_size
             * self.kv_shard_widening,
@@ -2443,8 +2439,7 @@ class Scheduler(
         self.load_inquirer = SchedulerLoadInquirer(
             disaggregation_mode=self.disaggregation_mode,
             server_args=self.server_args,
-            # KV sharding widens the allocator's index space, so the capacity
-            # reported to the router is widened too. DCP is deliberately not.
+            # Router capacity includes KV sharding but excludes DCP.
             max_total_num_tokens=self.max_total_num_tokens * self.kv_shard_widening,
             max_running_requests=self.max_running_requests,
             pool_stats_observer=self.pool_stats_observer,
@@ -2558,14 +2553,8 @@ class Scheduler(
                 self.max_req_len - input_len - 1,
             ),
         )
-        # PrefillAdder charges one page per shard class and measures the budget
-        # with allocator.available_size(), so the sharded budget is
-        # ceil_page(input_len) + max_new_tokens + page_size * N <
-        # max_total_num_tokens * N. `max_new_tokens_for_memory` already
-        # subtracts exactly one allocator page (the PHYSICAL page under
-        # sharding), so pre-charge the remaining N - 1 pages into the capacity.
-        # Otherwise a request can be accepted into the waiting queue but never
-        # scheduled, blocking the queue and eventually failing health checks.
+        # PrefillAdder reserves one page per shard; the allocator reserves one.
+        # Subtract the other N - 1 pages to keep queue admission schedulable.
         token_capacity = (
             self.max_total_num_tokens
             * get_parallel().attn_dcp_size

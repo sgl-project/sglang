@@ -720,32 +720,19 @@ class PrefillAdder:
             priority_scheduling_preemption_threshold
         )
         self.max_running_requests = max_running_requests
-        # Logical-page KV sharding: the physical-page quantum all mid-request
-        # chunk boundaries must land on; 0 when sharding is off. A sharded
-        # batch may hold several requests, but only as many as the assembly
-        # scratch fits — _kv_shard_reserve_scratch gates each admission.
+        # Align sharded chunk boundaries to physical pages; 0 disables alignment.
         kv_shard_size = page_interleave_shard_size(self.token_to_kv_pool_allocator)
         self.kv_shard_granule = (
             self.token_to_kv_pool_allocator.page_size if kv_shard_size > 1 else 0
         )
         self.kv_shard_size = kv_shard_size
-        # Assembly-scratch admission budget: a sharded batch's padded prefix
-        # gather spans N * sum_i ceil(prefix_pages_i / N) pages and its
-        # ps-ceiled extends fill the chunk region — both must fit the
-        # per-batch scratch the pool provisioned (PageShardSpec), so
-        # _kv_shard_reserve_scratch gates every admission below. None when
-        # sharding is off.
+        # Each admission must fit the batch's prefix and chunk scratch regions.
         self.kv_shard_scratch_spec = (
             self.token_to_kv_pool_allocator.shard_spec if kv_shard_size > 1 else None
         )
         self.kv_shard_block_bound_pages = 0
         self.kv_shard_chunk_pages = 0
-        # Per-request KV reserve charged at admission. Stock alloc_extend can
-        # consume up to one extra page per request beyond the extend length;
-        # under sharding the min-class admission gate needs one page per
-        # class (the ceil(K/N) rounding of cyclic class draws, phase-
-        # agnostic) -- reserve N*ps so admission defers (NO_TOKEN) instead of
-        # over-committing into the alloc path's fail-loud RuntimeError.
+        # Reserve one extra page per shard class for allocation rounding.
         self.per_req_token_overhead = (
             kv_shard_size * self.kv_shard_granule
             if self.kv_shard_granule
@@ -907,9 +894,7 @@ class PrefillAdder:
         self.memory_budget.reserve(
             extend_input_len,
             max_new_tokens,
-            # `reserve` charges one allocator page of alignment headroom; under
-            # sharding the reserve is one page per owner class, so top it up by
-            # the remaining N - 1 (0 for stock allocators).
+            # reserve() already charges one page; add the remaining shard pages.
             extra_tokens=(
                 mamba_gap_reserve + self.per_req_token_overhead - self.page_size
             ),
@@ -1018,16 +1003,10 @@ class PrefillAdder:
         req.lock_receipt = self.tree_cache.inc_lock_ref(req.last_node).to_dec_params()
 
     def _kv_shard_reserve_scratch(self, prefix_len: int, extend_len: int) -> bool:
-        """Reserve assembly-scratch capacity for one sharded admission.
+        """Reserve scratch or return False to defer; no-op when sharding is off.
 
-        The batch's prefix gather is padded to
-        ``N * sum_i ceil(prefix_pages_i / N)`` pages (each request's chain is
-        one cyclic rotation run, so a rank owns at most ceil(K_i/N) of its
-        pages) and each extend fills ``ceil(extend_i / ps)`` chunk pages.
-        Returns False — caller defers the request to a later batch — when
-        either region would overflow; a single request always fits (the
-        regions fit at least one full-context prefix and one max chunk).
-        True (no-op) when sharding is off.
+        Prefixes use N * sum_i ceil(prefix_pages_i / N) pages; extends use
+        sum_i ceil(extend_i / ps). A request must fit an empty batch or raise.
         """
         if self.kv_shard_scratch_spec is None:
             return True
@@ -1040,13 +1019,7 @@ class PrefillAdder:
             or chunk * ps > self.kv_shard_scratch_spec.chunk_tokens
         ):
             if self.kv_shard_block_bound_pages == 0 and self.kv_shard_chunk_pages == 0:
-                # First reservation of the pass: a single request must always
-                # fit (the regions hold at least one full-context prefix and
-                # one max chunk). Reaching here means an admission path
-                # bypassed the chunking the sizing assumes (e.g. chunked
-                # prefill silently disabled after the sharding validation) —
-                # deferring would retry the same queue head forever, a
-                # silent scheduling livelock. Fail loud instead.
+                # Deferring a request that cannot fit an empty batch would livelock.
                 raise RuntimeError(
                     "request cannot fit the sharded assembly scratch even in "
                     f"an empty batch (prefix_len={prefix_len}, extend_len="
@@ -1110,15 +1083,8 @@ class PrefillAdder:
             if _rem_tokens is None:
                 return req
             if self.kv_shard_granule:
-                # Logical-page KV sharding: mid-request chunk boundaries land
-                # on the physical page so the next chunk's prefix stays
-                # page-aligned (an off-page boundary would straddle one page
-                # across the prefix/chunk scratch regions and break the
-                # stride-ps wire sampling). Floor the ABSOLUTE boundary so
-                # alignment holds regardless of where the prefix hit landed.
-                # When flooring would leave no budget, fall back to
-                # rem_chunk_tokens like the <= 0 case above — alignment then
-                # self-heals on the next chunk.
+                # Align the absolute boundary to keep pages within one scratch region.
+                # If no budget remains, use a full chunk to make progress.
                 prefix_len = len(req.prefix_indices)
                 floored = (
                     prefix_len + _rem_tokens
@@ -1152,11 +1118,7 @@ class PrefillAdder:
             return req
         truncated = cand_extend_input_len > _rem_tokens
         new_len = min(cand_extend_input_len, _rem_tokens)
-        # The continuing chunk is admitted first and a single request always
-        # fits the scratch by construction (regions hold at least one
-        # full-context prefix + one max chunk). NOT inside an assert: the
-        # call carries the batch's reservation accounting and must survive
-        # python -O.
+        # The continuing chunk must fit. Keep reservation outside assert for -O.
         reserved = self._kv_shard_reserve_scratch(
             prefix_len=len(req.prefix_indices), extend_len=new_len
         )
@@ -1323,9 +1285,7 @@ class PrefillAdder:
             if (tile_stop := self._check_prefill_tile_budget(trunc_len)) is not None:
                 return tile_stop
 
-            # Keep this after the non-mutating tile gate: reserving shard
-            # scratch updates this pass's accounting and must only happen for
-            # a request that will actually be admitted.
+            # Reserve after the tile gate so rejected requests consume no scratch.
             if not self._kv_shard_reserve_scratch(prefix_len=0, extend_len=trunc_len):
                 return AddReqResult.OTHER
 
@@ -1453,9 +1413,7 @@ class PrefillAdder:
                 req.prefix_indices = torch.cat([req.prefix_indices, new_indices])
                 req.kv.cache_protected_len = len(req.prefix_indices)
 
-            # Sharded pools cannot load host KV. Reserve their shared scratch
-            # after the other gates, using the selected (possibly truncated)
-            # shape, so a deferred request consumes no scratch or KV budget.
+            # Sharded pools cannot load host KV; reserve scratch after all other gates.
             if not self._kv_shard_reserve_scratch(
                 prefix_len=admission.prefix_len, extend_len=admission.extend_len
             ):
