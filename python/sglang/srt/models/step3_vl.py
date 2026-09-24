@@ -1,5 +1,6 @@
 import logging
 import math
+from array import array
 from math import sqrt
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
@@ -94,8 +95,7 @@ class Step3TextMLP(nn.Module):
         )
         if hidden_act != "silu":
             raise ValueError(
-                f"Unsupported activation: {hidden_act}. "
-                "Only silu is supported for now."
+                f"Unsupported activation: {hidden_act}. Only silu is supported for now."
             )
         self.act_fn = SiluAndMul()
 
@@ -604,7 +604,6 @@ class Step3VisionAttention(nn.Module):
 
 
 class Step3VisionEmbeddings(nn.Module):
-
     def __init__(self, config: Step3VisionEncoderConfig):
         super().__init__()
         self.config = config
@@ -731,7 +730,6 @@ class Step3VisionEncoder(nn.Module):
 
 
 class Step3VLForConditionalGeneration(nn.Module):
-
     def __init__(
         self,
         config: Step3VLConfig,
@@ -898,7 +896,7 @@ class Step3VLForConditionalGeneration(nn.Module):
                 )
         return self._flatten_embeddings(merged_image_features)
 
-    def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
+    def pad_input_ids(self, input_ids: array, mm_inputs: MultimodalInputs) -> array:
         pattern = MultiModalityDataPaddingPatternMultimodalTokens()
         return pattern.pad_input_tokens(input_ids, mm_inputs)
 

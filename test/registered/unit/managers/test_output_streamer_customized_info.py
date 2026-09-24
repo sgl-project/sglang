@@ -14,8 +14,9 @@ from sglang.srt.utils.weight_versions import (
     record_weight_version_events,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import enter_scope, published_topology
 
-register_cpu_ci(est_time=1, suite="base-a-test-cpu")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 class _FakeReq:
@@ -35,6 +36,7 @@ class _FakeReq:
         )
         self.finished_output = False
         self.finished_len = None
+        self.beam_group = None
         self.stream = False
         self.sampling_params = SimpleNamespace(
             stream_interval=None,
@@ -101,6 +103,7 @@ class TestOutputStreamerCustomizedInfo(unittest.TestCase):
         )
         serving_patch.start()
         observability_patch.start()
+        enter_scope(self, published_topology(ranks={"dp_rank": 0}))
         self.addCleanup(serving_patch.stop)
         self.addCleanup(observability_patch.stop)
 
@@ -144,7 +147,6 @@ class TestOutputStreamerCustomizedInfo(unittest.TestCase):
         streamer = Streamer(
             send_to_detokenizer=SimpleNamespace(send_output=outputs.append),
             tree_cache=None,
-            ps=SimpleNamespace(dp_rank=0, attn_tp_rank=0),
             server_args=SimpleNamespace(
                 stream_interval=1,
                 enable_request_time_stats_logging=False,
@@ -177,7 +179,6 @@ class TestOutputStreamerCustomizedInfo(unittest.TestCase):
         streamer = Streamer(
             send_to_detokenizer=SimpleNamespace(send_output=outputs.append),
             tree_cache=None,
-            ps=SimpleNamespace(dp_rank=0, attn_tp_rank=0),
             server_args=SimpleNamespace(
                 stream_interval=1,
                 enable_request_time_stats_logging=False,
@@ -214,7 +215,6 @@ class TestOutputStreamerCustomizedInfo(unittest.TestCase):
         streamer = Streamer(
             send_to_detokenizer=SimpleNamespace(send_output=outputs.append),
             tree_cache=None,
-            ps=SimpleNamespace(dp_rank=0, attn_tp_rank=0),
             server_args=SimpleNamespace(
                 stream_interval=1,
                 enable_request_time_stats_logging=False,
@@ -254,7 +254,6 @@ class TestOutputStreamerCustomizedInfo(unittest.TestCase):
         streamer = Streamer(
             send_to_detokenizer=SimpleNamespace(send_output=outputs.append),
             tree_cache=None,
-            ps=SimpleNamespace(dp_rank=0, attn_tp_rank=0),
             server_args=SimpleNamespace(
                 stream_interval=1,
                 enable_request_time_stats_logging=False,
@@ -282,7 +281,6 @@ class TestOutputStreamerCustomizedInfo(unittest.TestCase):
         streamer = Streamer(
             send_to_detokenizer=SimpleNamespace(send_output=outputs.append),
             tree_cache=None,
-            ps=SimpleNamespace(dp_rank=0, attn_tp_rank=0),
             server_args=SimpleNamespace(),
             is_generation=True,
             spec_algorithm=SpeculativeAlgorithm.NONE,
@@ -308,7 +306,6 @@ class TestOutputStreamerCustomizedInfo(unittest.TestCase):
         streamer = Streamer(
             send_to_detokenizer=SimpleNamespace(send_output=outputs.append),
             tree_cache=None,
-            ps=SimpleNamespace(dp_rank=0, attn_tp_rank=0),
             server_args=SimpleNamespace(),
             is_generation=True,
             spec_algorithm=SpeculativeAlgorithm.NONE,
@@ -330,7 +327,6 @@ class TestOutputStreamerCustomizedInfo(unittest.TestCase):
             Streamer(
                 send_to_detokenizer=SimpleNamespace(),
                 tree_cache=None,
-                ps=SimpleNamespace(),
                 server_args=SimpleNamespace(),
                 is_generation=True,
                 spec_algorithm=SpeculativeAlgorithm.NONE,

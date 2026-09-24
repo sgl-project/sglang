@@ -42,9 +42,10 @@ from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.deepseek_v2 import DeepseekV2MLP as Ernie4MLP
 from sglang.srt.models.llama import LlamaAttention as Ernie4Attention
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils import add_prefix, is_npu, make_layers
+from sglang.srt.utils import add_prefix, is_cpu, is_npu, make_layers
 from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
+_is_cpu = is_cpu()
 _is_npu = is_npu()
 
 
@@ -89,8 +90,8 @@ class Ernie4Moe(nn.Module):
         self.gate = MoEGate(config=config, prefix=add_prefix("gate", prefix))
 
         correction_bias = self.gate.e_score_correction_bias
-        # npu only supports 1D, but current correction_bias is 2D
-        if _is_npu:
+        # npu/cpu only support 1D, but current correction_bias is 2D
+        if _is_npu or _is_cpu:
             correction_bias = correction_bias.squeeze(0)
         self.topk = TopK(
             top_k=config.moe_k,

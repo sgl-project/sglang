@@ -107,10 +107,10 @@ Adding one = a `MmFamilyProcessor` impl in `src/<model>/mod.rs` plus a
 
 `common::fetch` matches the Python `get_image_bytes` semantics
 (`REQUEST_TIMEOUT` env, `HTTP(S)_PROXY` / `ALL_PROXY` / `NO_PROXY` including
-IPv4-CIDR and `host:port` entries) with two deliberate differences: every
-source form is capped at 64 MiB — plus 64 items / 256 MiB per request in the
-driver — and `file://` URLs actually work (the Python helper passes the
-un-stripped URL to `open()`).
+IPv4-CIDR and `host:port` entries) with deliberate safety bounds: every media
+source contributes to a shared 64-item / 1.25 GiB request budget, and each
+remote I/O stream has an additional 64 MiB cap. `file://` URLs also work (the
+Python helper passes the un-stripped URL to `open()`).
 
 ## Python API
 

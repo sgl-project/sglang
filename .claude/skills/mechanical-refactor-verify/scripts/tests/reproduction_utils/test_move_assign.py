@@ -19,13 +19,7 @@ def test_move_assign_relocates_a_module_constant(tmp_path: Path) -> None:
     _apply(r, tmp_path)
     assert "LIMIT" not in (tmp_path / "src.py").read_text().split("def stay")[0]
     assert (tmp_path / "dst.py").read_text() == (
-        "import sys\n"
-        "\n"
-        "LIMIT = 480  # seconds\n"
-        "\n"
-        "\n"
-        "def keep():\n"
-        "    return 1\n"
+        "import sys\n\nLIMIT = 480  # seconds\n\n\ndef keep():\n    return 1\n"
     )
 
 
@@ -50,13 +44,7 @@ def test_move_assign_relocates_an_annotated_constant(tmp_path: Path) -> None:
     _apply(r, tmp_path)
     assert "LIMIT" not in (tmp_path / "src.py").read_text().split("def stay")[0]
     assert (tmp_path / "dst.py").read_text() == (
-        "import sys\n"
-        "\n"
-        "LIMIT: int = 480\n"
-        "\n"
-        "\n"
-        "def keep():\n"
-        "    return 1\n"
+        "import sys\n\nLIMIT: int = 480\n\n\ndef keep():\n    return 1\n"
     )
 
 
