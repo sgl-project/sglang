@@ -24,6 +24,7 @@ import atexit
 import copy
 import dataclasses
 import gc
+import json
 import logging
 import multiprocessing as mp
 import os
@@ -1774,6 +1775,63 @@ class Engine(EngineScoreMixin, EngineBase):
     # score() and async_score() are provided by EngineScoreMixin
 
 
+def _prepare_remote_code_modules(cfg):
+    """Copy the model's trust_remote_code files into the HF module cache once.
+
+    transformers' get_class_from_dynamic_module copies the checkpoint's .py
+    files into HF_MODULES_CACHE and then imports them. shutil.copy truncates
+    the destination before writing, so a scheduler that imports while another
+    is mid-copy sees a partial module and raises AttributeError on a class
+    that is plainly there -- e.g.
+
+        AttributeError: module 'transformers_modules...tokenization_kimi'
+        has no attribute 'TikTokenTokenizer'
+
+    Every scheduler on a node does this concurrently against one cache, so on
+    Kimi-K2.6 EP16 two ranks of sixteen lost the race and took the engine down
+    during init. Doing it once here, before any fork, leaves the schedulers
+    with nothing to copy: the files are present and the import is a read.
+
+    Best effort -- a failure here is not fatal, since the schedulers still do
+    their own load and will report a real problem with their own traceback.
+    """
+    if not cfg.trust_remote_code:
+        return
+    from transformers.dynamic_module_utils import get_class_from_dynamic_module
+
+    # auto_map lives in more than one file: the model classes are in
+    # config.json, while the tokenizer and processor declare their own in
+    # tokenizer_config.json and preprocessor_config.json. Kimi-K2.6 raced on
+    # the tokenizer, reached through the processor's entry. Read each file
+    # directly rather than via AutoConfig, which only surfaces config.json's.
+    paths = {cfg.model_path, cfg.tokenizer_path or cfg.model_path}
+    for path in paths:
+        for name in (
+            "config.json",
+            "tokenizer_config.json",
+            "preprocessor_config.json",
+            "processor_config.json",
+        ):
+            try:
+                with open(os.path.join(path, name)) as f:
+                    auto_map = json.load(f).get("auto_map") or {}
+            except (OSError, ValueError):
+                continue
+            for ref in auto_map.values():
+                for one in ref if isinstance(ref, (list, tuple)) else [ref]:
+                    if not one or "--" in one:
+                        # "repo--module.Class" resolves against a different
+                        # repo; leave those to the normal path rather than
+                        # guessing where the source lives.
+                        continue
+                    try:
+                        get_class_from_dynamic_module(
+                            one, path, code_revision=cfg.revision
+                        )
+                    except Exception as e:
+                        logger.debug("Could not pre-load %s from %s: %s", one, path, e)
+
+
 def _set_envs_and_config(server_args: ServerArgs):
 
     cfg = resolving_view(server_args)
@@ -1824,6 +1882,9 @@ def _set_envs_and_config(server_args: ServerArgs):
 
     # Set ulimit
     set_ulimit()
+
+    # Materialise trust_remote_code modules before the schedulers fork
+    _prepare_remote_code_modules(cfg)
 
     # Check flashinfer version
     if not get_bool_env_var("SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK"):
