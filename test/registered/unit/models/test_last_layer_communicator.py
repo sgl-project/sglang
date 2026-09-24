@@ -158,20 +158,37 @@ CASES = {
 }
 
 
-def is_last_layer_passed(case, num_layers, layer_id, **kwargs):
+def build(case, num_layers, layer_id, config=None, **kwargs):
+    """Construct one decoder layer with its submodules stubbed. Returns the
+    LayerCommunicator kwargs, the LayerScatterModes.init_new kwargs, and the
+    names of the stubbed submodules it built."""
     module_name, class_name, make_config, stubs, _ = CASES[case]
     module = import_model(module_name)
     communicator = MagicMock()
-    patches = dict(LayerCommunicator=communicator, LayerScatterModes=MagicMock())
-    patches.update({name: stub for name in stubs})
+    scatter_modes = MagicMock()
+    built = []
+
+    def recording_stub(name):
+        def make(*args, **kwargs):
+            built.append(name)
+            return StubModule()
+
+        return make
+
+    patches = dict(LayerCommunicator=communicator, LayerScatterModes=scatter_modes)
+    patches.update({name: recording_stub(name) for name in stubs})
     if hasattr(module, "get_parallel"):
         patches["get_parallel"] = lambda: PARALLEL
     with patch.multiple(module, **patches):
         getattr(module, class_name)(
-            make_config(num_layers), layer_id=layer_id, **kwargs
+            config or make_config(num_layers), layer_id=layer_id, **kwargs
         )
     communicator.assert_called_once()
-    return communicator.call_args.kwargs.get("is_last_layer", False)
+    return communicator.call_args.kwargs, scatter_modes.init_new.call_args.kwargs, built
+
+
+def is_last_layer_passed(case, num_layers, layer_id, **kwargs):
+    return build(case, num_layers, layer_id, **kwargs)[0].get("is_last_layer", False)
 
 
 class TestLastLayerCommunicator(CustomTestCase):
@@ -197,6 +214,29 @@ class TestLastLayerCommunicator(CustomTestCase):
                 self.assertTrue(
                     is_last_layer_passed(case, num_layers, layer_id, is_nextn=True)
                 )
+
+    def test_draft_model_layer_is_planned_as_a_one_layer_model(self):
+        """The layout plan of a NextN / MTP draft layer treats it as the first and
+        the last layer, so it takes the model's input layout and returns the
+        model's output layout even when its MLP runs on SCATTERED tokens."""
+        for case, (*_, draft) in CASES.items():
+            if draft is None:
+                continue
+            num_layers, layer_id = draft
+            with self.subTest(case=case):
+                _, planned, _ = build(case, num_layers, layer_id, is_nextn=True)
+                self.assertEqual((planned["layer_id"], planned["num_layers"]), (0, 1))
+
+    def test_bailing_hybrid_draft_layer_is_planned_as_sparse(self):
+        """The Bailing hybrid NextN layer builds an MoE, so its layout plan is
+        that of a sparse layer, also when the model's first layers are dense."""
+        config = bailing_hybrid_config(NUM_LAYERS)
+        config.first_k_dense_replace = 1
+        _, planned, built = build(
+            "bailing_moe_linear", NUM_LAYERS, 0, config=config, is_nextn=True
+        )
+        self.assertIn("BailingMoE", built)
+        self.assertTrue(planned["is_layer_sparse"])
 
 
 if __name__ == "__main__":

@@ -562,11 +562,10 @@ class Step3p5DecoderLayer(nn.Module):
             config.hidden_size, eps=config.rms_norm_eps
         )
 
+        # An MTP draft is a one-layer model; layer_id still indexes its config.
         self.layer_scatter_modes = LayerScatterModes.init_new(
-            layer_id=layer_id,
-            num_layers=(
-                config.num_hidden_layers if layer_id < config.num_hidden_layers else 1
-            ),  # 1 is for mtp
+            layer_id=0 if is_nextn else layer_id,
+            num_layers=1 if is_nextn else config.num_hidden_layers,
             is_layer_sparse=self.is_moe_layer,
             is_previous_layer_sparse=self.is_previous_layer_sparse,
             is_next_layer_sparse=self.is_next_layer_sparse,
