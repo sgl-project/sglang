@@ -41,6 +41,7 @@ from sglang.srt.utils import (
     is_flashinfer_available,
     is_gfx1250_supported,
     is_hip,
+    is_mlu,
     is_musa,
     is_npu,
     is_xpu,
@@ -51,6 +52,7 @@ _is_flashinfer_available = is_flashinfer_available()
 _is_hip = is_hip()
 _is_musa = is_musa()
 _is_npu = is_npu()
+_is_mlu = is_mlu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
@@ -183,6 +185,8 @@ logger = logging.getLogger(__name__)
 if _is_npu:
     import torch_npu
     from sgl_kernel_npu.norm.add_rmsnorm_bias import add_gemma_rms_norm
+if _is_mlu:
+    import torch_mlu_ops
 
 _NPU_GEMMA_RMS_NORM_TRITON_MAX_HIDDEN_SIZE = 5120
 
@@ -624,6 +628,35 @@ class RMSNorm(BaseFusedOp):
             return out, residual_out
         return torch_npu.npu_rms_norm(x, self.weight.data, self.variance_epsilon)[0]
 
+    def forward_mlu(
+        self,
+        x: torch.Tensor,
+        residual: Optional[torch.Tensor] = None,
+        post_residual_addition: Optional[torch.Tensor] = None,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        if residual is not None:
+            if post_residual_addition is not None:
+                residual = residual + post_residual_addition
+            out, residual_out = torch_mlu_ops.fused_rms_norm(
+                x,
+                residual,
+                self.weight.data,
+                None,
+                None,
+                self.variance_epsilon,
+                True,
+            )
+            return out, residual_out
+        return torch_mlu_ops.fused_rms_norm(
+            x,
+            None,
+            self.weight.data,
+            None,
+            None,
+            self.variance_epsilon,
+            False,
+        )
+
     def forward_aiter(
         self,
         x: torch.Tensor,
@@ -1056,6 +1089,22 @@ class LayerNorm(BaseFusedOp):
         x: torch.Tensor,
     ) -> torch.Tensor:
         return self.forward_native(x)
+
+    def forward_mlu(
+        self,
+        x: torch.Tensor,
+    ) -> torch.Tensor:
+        gamma = self.weight if self.elementwise_affine else None
+        bias = self.bias if self.use_bias else None
+        return torch_mlu_ops.fused_layer_norm(
+            x,
+            None,
+            gamma,
+            None,
+            bias,
+            self.variance_epsilon,
+            False,
+        )
 
     def forward_cpu(
         self,
