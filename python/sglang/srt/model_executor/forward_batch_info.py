@@ -564,6 +564,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     can_run_dp_prefill_cuda_graph: bool = False
     dp_prefill_cuda_graph_max_prefix_len: int = 0
     global_forward_mode: Optional[ForwardMode] = None
+    # Number of decode requests at the tail of a MIXED batch;
+    # prefill requests occupy the first batch_size - mix_decode_bs entries.
+    # None outside MIXED mode; a prefill-only TBO child has a count of zero.
+    mix_decode_bs: Optional[int] = None
 
     # Current layer-stack invocation; each TBO child owns a separate stream.
     residual_stream: Optional[ResidualStream] = None
@@ -979,6 +983,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             out_cache_loc_dsv4=batch.out_cache_loc_dsv4,
             engram_history=batch.engram_history,
             mamba_track_indices=batch.mamba_track_indices,
+            mix_decode_bs=batch.mix_decode_bs,
             mamba_track_mask=batch.mamba_track_mask,
             mamba_track_seqlens=batch.mamba_track_seqlens,
             mamba_prefill_track_mask_cpu=(
