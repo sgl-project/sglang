@@ -7,11 +7,16 @@ from sglang.srt.entrypoints.openai.protocol import Tool
 from sglang.srt.function_call.base_format_detector import BaseFormatDetector
 from sglang.srt.function_call.core_types import (
     StreamingParseResult,
+    ToolCallItem,
     StructureInfo,
     _GetInfoFunc,
 )
 
 logger = logging.getLogger(__name__)
+
+# Upper bound for the end-of-stream drain: each round releases at most one
+# pending unit (a tool name or one argument diff).
+_MAX_FINISH_DRAIN_ROUNDS = 1024
 
 
 class HermesDetector(BaseFormatDetector):
@@ -111,6 +116,41 @@ class HermesDetector(BaseFormatDetector):
         if result.normal_text:
             result.normal_text = self._clean_normal_text(result.normal_text)
         return result
+
+    def finish(self, tools: List[Tool]) -> StreamingParseResult:
+        """Release tool-call state the last delta left pending.
+
+        parse_streaming_increment emits at most one unit per call: a tool name
+        with empty parameters, then that call's argument diff, then the next
+        call. A delta carrying one or more complete calls therefore leaves work
+        pending for the following delta, and when that delta was the last one
+        (multi-token deltas from speculative decoding / MTP,
+        ``stream_interval > 1``, or a call short enough to be generated in a
+        single step) nothing picked it up: the second call of a pair was dropped
+        and the first arrived with empty arguments, while detect_and_parse
+        returned both.
+
+        Re-running the parser with an empty delta drains that queue. The markup
+        the parser releases along the way (``</tool_call>`` when a second call
+        follows) is framing, not assistant text -- detect_and_parse reports no
+        text for those inputs -- so protocol tokens are stripped before anything
+        is returned as content.
+        """
+        normal_parts: List[str] = []
+        calls: List[ToolCallItem] = []
+        for _ in range(_MAX_FINISH_DRAIN_ROUNDS):
+            result = self.parse_streaming_increment("", tools)
+            if not result.calls and not result.normal_text:
+                break
+            if result.calls:
+                calls.extend(result.calls)
+            text = result.normal_text or ""
+            for token in (self.bot_token, self.eot_token):
+                if token:
+                    text = text.replace(token, "")
+            if text.strip():
+                normal_parts.append(text)
+        return StreamingParseResult(normal_text="".join(normal_parts), calls=calls)
 
     def structure_info(self) -> _GetInfoFunc:
         return lambda name: StructureInfo(

@@ -27,6 +27,7 @@ from sglang.srt.function_call.gigachat3_detector import GigaChat3Detector
 from sglang.srt.function_call.glm4_moe_detector import Glm4MoeDetector
 from sglang.srt.function_call.glm47_moe_detector import Glm47MoeDetector
 from sglang.srt.function_call.gpt_oss_detector import GptOssDetector
+from sglang.srt.function_call.hermes_detector import HermesDetector
 from sglang.srt.function_call.inkling_detector import InklingDetector
 from sglang.srt.function_call.json_array_parser import JsonArrayParser
 from sglang.srt.function_call.kimik2_detector import KimiK2Detector
@@ -803,6 +804,132 @@ class TestPythonicDetector(unittest.TestCase):
 
         self.assertEqual([c.name for c in result.calls], ["get_weather"])
         self.assertEqual(json.loads(result.calls[0].parameters), {"location": "Tokyo"})
+
+
+class TestHermesDetector(unittest.TestCase):
+    def setUp(self):
+        """Set up test tools and detector."""
+        self.tools = [
+            Tool(
+                type="function",
+                function=Function(
+                    name="get_weather",
+                    description="Get weather information",
+                    parameters={
+                        "type": "object",
+                        "properties": {"city": {"type": "string"}},
+                        "required": ["city"],
+                    },
+                ),
+            ),
+            Tool(
+                type="function",
+                function=Function(
+                    name="search",
+                    description="Search",
+                    parameters={
+                        "type": "object",
+                        "properties": {"query": {"type": "string"}},
+                        "required": ["query"],
+                    },
+                ),
+            ),
+        ]
+        self.detector = HermesDetector()
+
+    @staticmethod
+    def _collect(chunks, tools):
+        """Feed deltas and merge the streamed calls the way a client would."""
+        store: dict = {}
+        order = []
+        text = ""
+        detector = HermesDetector()
+        for chunk in chunks:
+            result = detector.parse_streaming_increment(chunk, tools)
+            text += result.normal_text or ""
+            for call in result.calls:
+                if call.tool_index not in store:
+                    store[call.tool_index] = [call.name, ""]
+                    order.append(call.tool_index)
+                if call.name:
+                    store[call.tool_index][0] = call.name
+                store[call.tool_index][1] += call.parameters or ""
+        end = detector.finish(tools)
+        text += end.normal_text or ""
+        for call in end.calls:
+            if call.tool_index not in store:
+                store[call.tool_index] = [call.name, ""]
+                order.append(call.tool_index)
+            if call.name:
+                store[call.tool_index][0] = call.name
+            store[call.tool_index][1] += call.parameters or ""
+        return text, [(i, store[i][0], store[i][1]) for i in order]
+
+    def test_finish_releases_call_completed_in_a_single_delta(self):
+        """A call that completes inside one delta must reach the client.
+
+        A multi-token delta can carry a whole tool call; the parser then leaves
+        its arguments pending for the next delta, and at end of stream the call
+        used to reach the client with empty arguments while detect_and_parse
+        returned them.
+        """
+        text = '<tool_call>{"name": "get_weather", "arguments": {"city": "Tokyo"}}</tool_call>'
+        streamed_text, streamed = self._collect([text], self.tools)
+        non_stream = HermesDetector().detect_and_parse(text, self.tools)
+
+        self.assertEqual(
+            streamed,
+            [(c.tool_index, c.name, c.parameters) for c in non_stream.calls],
+        )
+        self.assertEqual(streamed, [(0, "get_weather", '{"city": "Tokyo"}')])
+        self.assertEqual(streamed_text, non_stream.normal_text)
+
+    def test_finish_releases_both_calls_of_a_single_delta(self):
+        """Two calls in one delta must both survive end of stream.
+
+        The second call was dropped entirely, and the framing between the two
+        calls leaked into the visible text as "</tool_call>".
+        """
+        text = (
+            '<tool_call>{"name": "get_weather", "arguments": {"city": "Beijing"}}</tool_call>'
+            '<tool_call>{"name": "search", "arguments": {"query": "restaurants"}}</tool_call>'
+        )
+        streamed_text, streamed = self._collect([text], self.tools)
+        non_stream = HermesDetector().detect_and_parse(text, self.tools)
+
+        self.assertEqual(
+            streamed,
+            [(c.tool_index, c.name, c.parameters) for c in non_stream.calls],
+        )
+        self.assertEqual([name for _, name, _ in streamed], ["get_weather", "search"])
+        self.assertEqual(streamed_text, non_stream.normal_text)
+        self.assertNotIn("</tool_call>", streamed_text)
+
+    def test_finish_keeps_text_and_does_not_leak_markup(self):
+        text = (
+            "Let me check. "
+            '<tool_call>{"name": "get_weather", "arguments": {"city": "Tokyo"}}</tool_call>'
+        )
+        streamed_text, streamed = self._collect([text], self.tools)
+        non_stream = HermesDetector().detect_and_parse(text, self.tools)
+
+        self.assertEqual(
+            streamed,
+            [(c.tool_index, c.name, c.parameters) for c in non_stream.calls],
+        )
+        self.assertIn("Let me check.", streamed_text)
+        self.assertNotIn("<tool_call>", streamed_text)
+        self.assertNotIn("</tool_call>", streamed_text)
+
+    def test_finish_is_a_noop_when_nothing_is_pending(self):
+        text = '<tool_call>{"name": "get_weather", "arguments": {"city": "Tokyo"}}</tool_call>'
+        detector = HermesDetector()
+        detector.parse_streaming_increment(text, self.tools)
+        detector.parse_streaming_increment("", self.tools)
+
+        end = detector.finish(self.tools)
+        self.assertEqual(end.calls, [])
+        self.assertEqual(end.normal_text, "")
 
 
 class TestMistralDetector(unittest.TestCase):
