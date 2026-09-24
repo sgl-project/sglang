@@ -3513,12 +3513,17 @@ class UnifiedRadixCache(BasePrefixCache):
         Applies to plain radix reuse as well as HiCache -- the ring is stale
         either way. Returns 0 once SWA has a host pool to restore exact contents
         from, and for every non-unified_kv layout, whose SWA slots are
-        content-stable.
+        content-stable by default but can opt in via
+        SGLANG_DSV4_NPU_REPREFILL_TAIL.
         """
         from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
             is_unified_kv_triton,
         )
 
+        # Opt-in tail re-prefill for DSV4-on-NPU (default 0 = unchanged).
+        override = envs.SGLANG_DSV4_NPU_REPREFILL_TAIL.get()
+        if override:
+            return override
         swa = self.components.get(ComponentType.SWA)
         if swa is None or not swa.sliding_window_size:
             return 0

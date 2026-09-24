@@ -1124,6 +1124,18 @@ def test_cache_without_swa_needs_no_reprefill():
     assert cache.swa_reprefill_tail_tokens() == 0
 
 
+def test_npu_tail_reprefill_override(monkeypatch):
+    from sglang.kernels.ops.attention.dsv4.unified_kv_kernels import env_gate
+
+    monkeypatch.setattr(env_gate, "is_unified_kv_triton", lambda: False)
+    monkeypatch.setenv("SGLANG_DSV4_NPU_REPREFILL_TAIL", "256")
+    component = SWAComponent.__new__(SWAComponent)
+    component.sliding_window_size = 128
+    cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
+    cache.components = {ComponentType.SWA: component}
+    assert cache.swa_reprefill_tail_tokens() == 256
+
+
 @pytest.fixture
 def full_linker_component():
     def build_transfer(phase, node, keys):
