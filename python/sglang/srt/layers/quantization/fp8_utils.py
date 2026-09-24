@@ -1351,6 +1351,10 @@ def aiter_w8a8_block_fp8_linear(
             ptpc_weight is not None
             and input_2d.shape[0] <= MXFP8_DENSE_PTPC_DECODE_MAX_M
         ):
+            # (fp8, scale) emitted by the producing fused norm; skips per_token_quant_hip
+            pre_quant = getattr(input, "_fp8_qinput", None)
+            if pre_quant is not None and pre_quant[0].shape[0] == input_2d.shape[0]:
+                input_2d = pre_quant
             out = apply_fp8_ptpc_linear(
                 input=input_2d,
                 weight=ptpc_weight,
