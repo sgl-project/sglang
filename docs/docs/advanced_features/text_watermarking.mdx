@@ -373,11 +373,11 @@ On one single-GPU node of each type with public `Qwen/Qwen3-8B`, TP1, TRT-LLM MH
 | Node | Concurrency | Watermark off | Watermark on | Change |
 | --- | ---: | ---: | ---: | ---: |
 | GB300 | 1 | 270.25 token/s | 260.44 token/s | -3.63% |
-| GB300 | 8, per stream | 215.37 token/s | 207.25 token/s | -3.77% |
+| GB300 | 8, per stream | 224.88 token/s | 212.84 token/s | -5.35% |
 | B300 | 1 | 258.84 token/s | 247.69 token/s | -4.31% |
 | B300 | 8, per stream | 196.26 token/s | 182.04 token/s | -7.24% |
 
-These measurements describe one model, GPU, sampling configuration, and output length. Benchmark your deployment before setting capacity targets. Finite-top-k selector latency at batch size one is also hardware-dependent: in one microbenchmark shape (`top_k=20`), the fast path was 58.8% slower than a full sort on H200 with bfloat16 logits and 6.4% faster on GB300 with float32 logits, and at batch size eight it was faster on both.
+The GB300 concurrency-eight row was remeasured after the score-precision fix on a default-off server by comparing omitted requests with request-level opt-in. These measurements describe one model, GPU, sampling configuration, and output length. Benchmark your deployment before setting capacity targets. Finite-top-k selector latency at batch size one is also hardware-dependent: in one microbenchmark shape (`top_k=20`), the fast path was 58.8% slower than a full sort on H200 with bfloat16 logits and 6.4% faster on GB300 with float32 logits, and at batch size eight it was faster on both.
 
 ## See also
 

@@ -32,6 +32,8 @@ def can_use_finite_topk_watermark(max_top_k: int | None, vocab_size: int) -> boo
 
 @triton.jit
 def _log_uniform_from_hash(hashed):
+    # fp32 (h + 0.5) / 2^32 rounds to 1.0 for h >= 2^32 - 128; log1p of the
+    # complement keeps log(u) strictly negative there.
     lower = tl.log((hashed.to(tl.float32) + 0.5) / _UINT32_SCALE)
     complement = (0xFFFFFFFF - hashed).to(tl.float32) + 0.5
     upper = libdevice.log1p(-complement / _UINT32_SCALE)

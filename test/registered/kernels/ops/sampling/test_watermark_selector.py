@@ -80,6 +80,32 @@ def test_hash_near_uint32_max_does_not_override_probability():
         == 0
     )
 
+    logits = probabilities.log().cuda()
+    expected_logits = torch.full_like(logits, -torch.inf)
+    expected_logits[0, 0] = 0.0
+    temperatures = torch.ones((1, 1), device="cuda")
+    top_ks = torch.tensor([2], dtype=torch.int32, device="cuda")
+    top_ps = torch.ones(1, device="cuda")
+    min_ps = torch.zeros(1, device="cuda")
+    eligible = torch.ones(1, dtype=torch.bool, device="cuda")
+
+    for max_top_k in (2, None):
+        actual_logits = logits.clone()
+        selected = force_watermark_tokens_triton(
+            actual_logits,
+            context_hashes.cuda(),
+            eligible,
+            temperatures,
+            top_ks,
+            top_ps,
+            min_ps,
+            keys.cuda(),
+            max_top_k=max_top_k,
+        )
+
+        assert selected.item() == 0
+        assert torch.equal(actual_logits, expected_logits)
+
 
 @pytest.mark.parametrize(
     ("dtype", "vocab_size", "dual_key"),
