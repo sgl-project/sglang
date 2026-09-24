@@ -348,16 +348,6 @@ class StandardTopKOutput(NamedTuple):
         return TopKOutputFormat.STANDARD
 
 
-class StandardTopKOutputDeferredPad(StandardTopKOutput):
-    """A STANDARD output whose rows at and past num_token_non_padded still hold the
-    router's values, which the aiter runner masks in its fused sorting launch."""
-
-    def __new__(cls, topk_weights, topk_ids, router_logits, num_token_non_padded):
-        self = super().__new__(cls, topk_weights, topk_ids, router_logits)
-        self.num_token_non_padded = num_token_non_padded
-        return self
-
-
 # Standard top-k output plus the FlashInfer routed-MoE packed ids that
 # ``moe_fused_gate`` writes; a separate type keeps the 3-tuple unpack valid.
 class StandardTopKOutputPacked(NamedTuple):
@@ -1459,17 +1449,16 @@ def biased_topk_jit_kernel_impl(
     if _use_aiter and scoring_func == "sqrtsoftplus" and num_fused_shared_experts == 0:
         assert packed_out is None, "aiter topk_gating cannot emit packed ids"
         if router_logits_partials is not None:
-            # ROCm decode router: split-K reduce + gate (+ the aiter sort for small batches) in one launch
-            from sglang.srt.layers.moe.rocm_fused_front import gate_partials
+            # ROCm decode router: split-K reduce + gate in one launch
+            from sglang.kernels.ops.moe.rocm_router_gate import rocm_router_gate
 
-            return gate_partials(
+            return rocm_router_gate(
                 gating_output,
                 correction_bias,
                 topk,
                 renormalize,
                 routed_scaling_factor,
-                router_logits_partials,
-                num_token_non_padded,
+                partials=router_logits_partials,
             )
 
         from aiter import topk_gating
@@ -2278,7 +2267,6 @@ def _post_process_topk_ids(
     num_token_non_padded: Optional[torch.Tensor] = None,
     expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
     padded_rows_masked: bool = False,
-    defer_hip_pad_fill: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     num_fused_shared_experts = topk_config.num_fused_shared_experts
     use_per_rank_shared_slots = has_per_rank_fused_shared_slots(
@@ -2351,8 +2339,7 @@ def _post_process_topk_ids(
             and use_per_rank_shared_slots
             and not _eplb_remap_enabled()
         )
-        # the aiter runner masks the padded rows itself
-        if not _fold_pad_into_append and not defer_hip_pad_fill:
+        if not _fold_pad_into_append:
             _mask_topk_ids_padded_region(topk_ids, num_token_non_padded, fill_value=0)
         # The logical->physical remap is only meaningful when a real
         # expert-location mapping exists. With a trivial placement and EPLB off
@@ -2461,7 +2448,7 @@ def _post_process_topk_ids(
             fused_shared_experts_scaling_factor
         )
 
-    if _is_hip and not _skip_hip_pad_mask and not defer_hip_pad_fill:
+    if _is_hip and not _skip_hip_pad_mask:
         # Shared-expert append/remap can introduce non-zero weights after the
         # initial HIP padding mask above. Ensure padded tokens leave this helper
         # with all expert weights zeroed.
@@ -2776,17 +2763,6 @@ def select_experts(
         # The override rewrote every row, including the router-masked ones.
         padded_rows_masked = False
 
-    defer_hip_pad_fill = False
-    if _use_aiter and num_token_non_padded is not None:
-        from sglang.srt.layers.moe.moe_runner.aiter import (
-            fused_sorting_masks_padded_rows,
-        )
-
-        defer_hip_pad_fill = fused_sorting_masks_padded_rows(
-            num_fused_shared_experts,
-            expert_location_dispatch_info,
-            eplb_remap=_eplb_remap_enabled(),
-        )
     topk_ids, topk_weights, recorder_topk_ids = _post_process_topk_ids(
         topk_ids=topk_ids,
         topk_weights=topk_weights,
@@ -2796,7 +2772,6 @@ def select_experts(
         layer_id=layer_id,
         expert_location_dispatch_info=expert_location_dispatch_info,
         padded_rows_masked=padded_rows_masked,
-        defer_hip_pad_fill=defer_hip_pad_fill,
     )
 
     get_global_expert_distribution_recorder().on_select_experts(
@@ -2806,10 +2781,6 @@ def select_experts(
     if packed_topk is not None:
         return StandardTopKOutputPacked(
             topk_weights, topk_ids, router_logits, packed_topk
-        )
-    if defer_hip_pad_fill:
-        return StandardTopKOutputDeferredPad(
-            topk_weights, topk_ids, router_logits, num_token_non_padded
         )
     return StandardTopKOutput(topk_weights, topk_ids, router_logits)
 

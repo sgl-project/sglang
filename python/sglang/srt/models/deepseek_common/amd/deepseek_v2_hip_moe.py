@@ -1,5 +1,5 @@
 """ROCm glue of DeepseekV2MoE: the fused all-reduce + mHC post of the DeepSeek-V4 decode
-batches and the aiter top-k reduction that adds the shared expert in the same launch."""
+batches."""
 
 from __future__ import annotations
 
@@ -33,16 +33,3 @@ def all_reduce_output(moe, hidden_states: torch.Tensor) -> torch.Tensor:
     if mhc is not None:
         mhc.start_stats_before_all_reduce()
     return post_experts_all_reduce(hidden_states)
-
-
-def fuse_shared_into_reduce(moe, skip_shared_experts: bool, num_tokens: int) -> bool:
-    """aiter: the shared expert runs first so the experts' top-k reduction can add it
-    in one launch. shared_experts exists only when the checkpoint has one that is not
-    fused into the routed kernel."""
-    return bool(
-        getattr(moe, "shared_experts", None) is not None
-        and not moe._shared_expert_tp1
-        and not moe._fuse_shared_experts_inside_sbo
-        and not skip_shared_experts
-        and num_tokens > 0
-    )
