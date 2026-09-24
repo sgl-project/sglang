@@ -101,9 +101,11 @@ def free_swa_out_of_window_slots(
     if owned_floor is not None:
         # Never free SWA the tree still owns (its nodes keep device values, and
         # SWA content is not recoverable once released); its LRU reclaims it.
-        new_swa_evicted_seqlen = min(
-            new_swa_evicted_seqlen, max(owned_floor, req.kv.swa_evicted_seqlen)
-        )
+        # The floor is a node boundary, so floor-align it before clamping.
+        cap = max(owned_floor, req.kv.swa_evicted_seqlen)
+        if page_size > 1:
+            cap = (cap // page_size) * page_size
+        new_swa_evicted_seqlen = min(new_swa_evicted_seqlen, cap)
 
     if new_swa_evicted_seqlen > req.kv.swa_evicted_seqlen:
         free_slots = req_to_token_pool.req_to_token[
