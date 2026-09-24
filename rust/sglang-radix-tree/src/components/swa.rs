@@ -762,6 +762,13 @@ impl<K: ChildKeyType> TreeComponent<K> for SwaComponent {
             tree_core.component_state(SWA).is_evict_device_ongoing,
             "Swa device eviction not started"
         );
+        assert!(
+            tree_core
+                .component_state(SWA)
+                .evict_device_pending_node
+                .is_none(),
+            "finish the pending internal SWA eviction before advancing"
+        );
         let mut cursor = tree_core.component_state(SWA).evict_device_cursor;
         // The cursor is re-validated (reset to LRU head) if the previous
         // node's eviction removed it.
@@ -793,7 +800,29 @@ impl<K: ChildKeyType> TreeComponent<K> for SwaComponent {
             if tree_core.evictable_device_leaves.contains(x) {
                 break 'step Some(x);
             }
-            // Internal nodes are tombstoned inline (no IO).
+            let node = tree_core.arena.node(x);
+            if tree_core.enable_hicache
+                && tree_core.is_write_back
+                && tree_core.has_swa_host_pool
+                && !node.has_host_value(SWA)
+                && !node.has_host_value(FULL)
+                && node.has_device_value(FULL)
+            {
+                // Backup may include several unbacked ancestors. Let the
+                // controller reserve that whole window outside the core lock.
+                let needed = self
+                    .collect_unbacked_swa_nodes_(tree_core, x)
+                    .iter()
+                    .map(|&idx| tree_core.arena.device_value(idx, SWA).numel())
+                    .sum();
+                if needed > 0 {
+                    let node_id = node.id;
+                    let state = tree_core.component_state_mut(SWA);
+                    state.evict_device_pending_node = Some(node_id);
+                    state.evict_device_pending_num_tokens = needed;
+                    break 'step None;
+                }
+            }
             tree_core.evict_component_and_detach_lru_(
                 x,
                 ct,

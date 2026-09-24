@@ -24,6 +24,7 @@ from sglang.srt.disaggregation.kv_events import (
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefParams,
+    EvictParams,
     InsertParams,
     InsertResult,
     MatchPrefixParams,
@@ -2099,9 +2100,9 @@ def test_hybrid_backup_pool_pressure_preserves_host_victim(backend):
         [transfer for xfers in transfers.values() for transfer in xfers]
     )
     assert resolved is not None
-    # SWA pressure frees A's complete host leaf, satisfying both side pools.
-    # Mamba-first allocation would instead free B's Full slots [200, 201].
-    assert freed_full == [100, 101]
+    # #40512 allocates by pool name, so Mamba pressure frees B's complete host
+    # leaf first, satisfying both side pools regardless of transfer-map order.
+    assert freed_full == [200, 201]
     core.sanity_check([], [])
 
 
@@ -2499,6 +2500,317 @@ def _swa_mamba_cache(backend, window):
             )
         )
     return cache, allocator
+
+
+def _internal_swa_write_back_case(
+    backend, page_size=1, window=8, with_mamba=False, prefix_nodes=1
+):
+    cache, allocator = (
+        _swa_mamba_cache(backend, window)
+        if with_mamba
+        else _swa_cache(window=window, page_size=page_size, backend=backend)
+    )
+    assert cache._tree_core_backend == backend
+    segment = 2 * page_size
+    child_length = math.ceil(window / page_size) * page_size
+    prefix_length = prefix_nodes * segment
+    total_length = prefix_length + child_length
+    if page_size == 1:
+        values = allocator.alloc(total_length)
+    else:
+        # Bulk page allocation is CPU-safe; alloc_extend runs a GPU kernel.
+        values = allocator.full_attn_allocator.alloc(total_length)
+        swa_values = allocator.swa_attn_allocator.alloc(total_length)
+        allocator.set_full_to_swa_mapping(values, swa_values)
+    sizes = list(range(segment, prefix_length + 1, segment)) + [len(values)]
+    nodes = []
+    previous = 0
+    for index, size in enumerate(sizes):
+        nodes.append(
+            cache.insert(
+                InsertParams(
+                    key=_key(list(range(size))),
+                    value=values[:size],
+                    prev_prefix_len=previous,
+                    mamba_value=torch.tensor([201 + index]) if with_mamba else None,
+                )
+            ).last_device_node
+        )
+        previous = size
+    cache.tree_core.set_hicache_enabled()
+    cache.tree_core.has_swa_host_pool = True
+    cache.is_write_back = True
+    cache.cache_controller = SimpleNamespace(write_policy="write_back")
+    cache._build_backup_sidecar = Mock(return_value=[])
+    # The child spans a complete window, so its request lock leaves the older
+    # internal SWA segments eligible while preventing a whole-leaf eviction.
+    leaf_lock = cache.inc_lock_ref(nodes[-1]).to_dec_params()
+    return SimpleNamespace(
+        cache=cache,
+        core=cache.tree_core,
+        nodes=nodes,
+        sizes=sizes,
+        segment=segment,
+        leaf_lock=leaf_lock,
+        full={
+            node: cache.tree_core.get_component_device_value(
+                node, ComponentType.FULL
+            ).clone()
+            for node in nodes
+        },
+        swa={
+            node: cache.tree_core.get_component_device_value(
+                node, ComponentType.SWA
+            ).clone()
+            for node in nodes
+        },
+    )
+
+
+def _mock_swa_write_back_io(case, backup="success"):
+    cache, core = case.cache, case.core
+    case.events, case.submissions, case.freed = [], [], []
+    host_pool = Mock()
+    host_pool.available_size.return_value = 0 if backup == "host_pressure" else 64
+    cache.components[ComponentType.SWA]._swa_kv_pool_host = host_pool
+    cache.host_pool_group = Mock()
+    cache.host_pool_group.get_pool.return_value = host_pool
+
+    def assert_resident(node, transfers):
+        assert torch.equal(
+            core.get_component_device_value(node, ComponentType.FULL),
+            case.full[node],
+        )
+        for transfer in transfers[ComponentType.SWA]:
+            assert torch.equal(
+                torch.cat(
+                    [
+                        core.get_component_device_value(source, ComponentType.SWA)
+                        for source in transfer.nodes_to_load
+                    ]
+                ),
+                transfer.device_indices,
+            )
+
+    def evict_host(count, component):
+        assert component == ComponentType.SWA
+        case.events.append(("host_evict", count))
+        host_pool.available_size.return_value = count
+        return count
+
+    def write(node, full, transfers, sidecars):
+        assert sidecars == []
+        assert_resident(node, transfers)
+        case.events.append(("write", node))
+        case.submissions.append((node, full.clone(), transfers))
+        if backup == "raised":
+            raise RuntimeError("DMA submission failed")
+        if backup == "failed":
+            return None
+        for component_transfers in transfers.values():
+            for transfer in component_transfers:
+                transfer.host_indices = transfer.device_indices + 20000
+        return full + 10000
+
+    def acknowledge(write_back=False):
+        assert write_back
+        for node, _, transfers in case.submissions:
+            if node in cache.ongoing_write_through:
+                assert_resident(node, transfers)
+                case.events.append(("ack", node))
+        if backup == "ack_raised":
+            raise RuntimeError("DMA completion failed")
+        for ack_id in list(cache.ongoing_write_through):
+            cache._finish_write_through_ack(ack_id)
+
+    original_free = cache._free_values
+
+    def free_values(device_frees, host_frees):
+        assert not host_frees
+        for component, tensors in device_frees.items():
+            if tensors:
+                case.freed.append((component, torch.cat(tensors).tolist()))
+                case.events.append(("free", component))
+        original_free(device_frees, host_frees)
+
+    cache.evict_host = evict_host
+    cache._execute_kv_backup = write
+    cache.writing_check = acknowledge
+    cache._free_values = free_values
+
+
+@pytest.mark.parametrize("backend", ["python", "rust"])
+@pytest.mark.parametrize(
+    "page_size,window,with_mamba", [(1, 8, False), (4, 5, False), (1, 8, True)]
+)
+@pytest.mark.parametrize(
+    "backup", ["success", "host_pressure", "failed", "raised", "ack_raised"]
+)
+def test_internal_swa_write_back_preserves_window_until_ack(
+    backend, page_size, window, with_mamba, backup
+):
+    from sglang.srt.mem_cache.unified_cache.components import CacheTransferPhase
+
+    # Real allocator, tree, backup planning, publication and eviction driver.
+    # The physical allocation/DMA boundary is simulated for CPU coverage.
+    case = _internal_swa_write_back_case(backend, page_size, window, with_mamba)
+    _mock_swa_write_back_io(case, backup)
+    cache, core = case.cache, case.core
+    parent, leaf = case.nodes
+    params = EvictParams(num_tokens=0, swa_num_tokens=case.segment)
+    if backup in ("raised", "ack_raised"):
+        with pytest.raises(RuntimeError, match="DMA .* failed"):
+            cache.evict(params)
+        assert [event[0] for event in case.events] == (
+            ["write"] if backup == "raised" else ["write", "ack"]
+        )
+        assert not case.freed
+        assert torch.equal(
+            core.get_component_device_value(parent, ComponentType.SWA),
+            case.swa[parent],
+        )
+        return
+
+    result = cache.evict(params)
+    assert result.swa_num_tokens_evicted == case.segment
+    assert result.num_tokens_evicted == 0
+    assert result.mamba_num_evicted == int(with_mamba)
+    if with_mamba:
+        assert core.get_component_device_value(parent, ComponentType.MAMBA) is None
+    assert (ComponentType.SWA, case.swa[parent].tolist()) in case.freed
+    assert not any(ct == ComponentType.FULL for ct, _ in case.freed)
+    assert core.get_component_device_value(parent, ComponentType.SWA) is None
+    assert torch.equal(
+        core.get_component_device_value(parent, ComponentType.FULL), case.full[parent]
+    )
+    assert torch.equal(
+        core.get_component_device_value(leaf, ComponentType.SWA), case.swa[leaf]
+    )
+    operations = [event[0] for event in case.events]
+    if backup == "failed":
+        assert operations == ["write"] + ["free"] * len(case.freed)
+        assert not core.component_has_host_value_only(parent, ComponentType.SWA)
+    else:
+        prefix = ["host_evict"] if backup == "host_pressure" else []
+        assert operations == prefix + ["write", "ack"] + ["free"] * len(case.freed)
+        assert core.component_has_host_value_only(parent, ComponentType.SWA)
+        matched = cache.match_prefix(
+            MatchPrefixParams(key=_key(list(range(case.segment))))
+        )
+        assert matched.best_match_node == parent
+        assert matched.device_indices.numel() == 0
+        assert matched.full_kv_hit_length == case.segment
+        assert matched.swa_host_hit_length == case.segment
+        assert matched.mamba_host_hit_length == int(with_mamba)
+        (transfer,) = core.build_hicache_transfers(
+            ComponentType.SWA, parent, CacheTransferPhase.LOAD_BACK
+        )
+        assert transfer.nodes_to_load == [parent]
+        assert torch.equal(transfer.host_indices, case.swa[parent] + 20000)
+    cache.dec_lock_ref(leaf, case.leaf_lock)
+    core.sanity_check([], [])
+
+
+@pytest.mark.parametrize("backend", ["python", "rust"])
+def test_internal_swa_write_back_reserves_entire_unbacked_window(backend):
+    case = _internal_swa_write_back_case(backend, prefix_nodes=2)
+    cache, core = case.cache, case.core
+    first, victim, leaf = case.nodes
+    # Refresh only the first segment; the next internal segment now heads the
+    # SWA LRU, and its backup window includes both unbacked prefix segments.
+    cache.match_prefix(MatchPrefixParams(key=_key(list(range(case.segment)))))
+    _mock_swa_write_back_io(case, "host_pressure")
+    result = cache.evict(EvictParams(num_tokens=0, swa_num_tokens=case.segment))
+    assert result.swa_num_tokens_evicted == case.segment
+    assert case.events[:2] == [("host_evict", 2 * case.segment), ("write", victim)]
+    (submission,) = case.submissions
+    (transfer,) = submission[2][ComponentType.SWA]
+    assert transfer.nodes_to_load == [first, victim]
+    assert transfer.device_indices.numel() == 2 * case.segment
+    assert case.freed == [(ComponentType.SWA, case.swa[victim].tolist())]
+    assert torch.equal(
+        core.get_component_device_value(first, ComponentType.SWA), case.swa[first]
+    )
+    assert core.component_has_host_value_only(victim, ComponentType.SWA)
+    cache.dec_lock_ref(leaf, case.leaf_lock)
+    core.sanity_check([], [])
+
+
+@pytest.mark.parametrize("backend", ["python", "rust"])
+@pytest.mark.parametrize("guard", ["request", "pending_dma"])
+def test_internal_swa_write_back_respects_active_window_locks(backend, guard):
+    case = _internal_swa_write_back_case(backend)
+    _mock_swa_write_back_io(case)
+    cache, core = case.cache, case.core
+    parent, leaf = case.nodes
+    if guard == "request":
+        lock = cache.inc_lock_ref(parent).to_dec_params()
+    else:
+        # A normal asynchronous backup takes real component locks and leaves
+        # its source pinned until publication of the physical completion ACK.
+        assert (
+            cache._execute_and_commit_kv_backup(
+                BackupKV(node_ids=[parent]), write_back=False
+            )
+            == case.segment
+        )
+        assert parent in cache.ongoing_write_through
+    submissions = len(case.submissions)
+    tracker = {ct: 0 for ct in cache.tree_components}
+    cache._evict_components(
+        {
+            ct: case.segment if ct == ComponentType.SWA else 0
+            for ct in cache.tree_components
+        },
+        tracker,
+    )
+    assert tracker[ComponentType.SWA] == 0 and not case.freed
+    assert len(case.submissions) == submissions
+    assert torch.equal(
+        core.get_component_device_value(parent, ComponentType.SWA), case.swa[parent]
+    )
+    if guard == "request":
+        cache.dec_lock_ref(parent, lock)
+    else:
+        cache._finish_write_through_ack(parent)
+    assert (
+        cache.evict(
+            EvictParams(num_tokens=0, swa_num_tokens=case.segment)
+        ).swa_num_tokens_evicted
+        == case.segment
+    )
+    assert core.component_has_host_value_only(parent, ComponentType.SWA)
+    cache.dec_lock_ref(leaf, case.leaf_lock)
+    core.sanity_check([], [])
+
+
+@pytest.mark.parametrize("backend", ["python", "rust"])
+def test_internal_swa_write_back_follows_runtime_policy_update(backend):
+    from sglang.srt.mem_cache.unified_cache.storage_attachment import StorageAttachment
+
+    case = _internal_swa_write_back_case(backend)
+    cache, core = case.cache, case.core
+    _mock_swa_write_back_io(case)
+    cache.is_write_back = False
+    cache.cache_controller.write_policy = "write_through"
+    cache.cache_controller.storage_backend_type = "file"
+    cache.enable_storage = True
+    cache.write_backup_storage = Mock()
+    success, _ = StorageAttachment(cache).attach(
+        "file", hicache_write_policy="write_back"
+    )
+    assert success and cache.is_write_back
+    assert cache._tree_core_backend == backend
+    assert (
+        cache.evict(
+            EvictParams(num_tokens=0, swa_num_tokens=case.segment)
+        ).swa_num_tokens_evicted
+        == case.segment
+    )
+    assert core.component_has_host_value_only(case.nodes[0], ComponentType.SWA)
+    cache.write_backup_storage.assert_called_once_with(case.nodes[0])
+    cache.dec_lock_ref(case.nodes[-1], case.leaf_lock)
+    core.sanity_check([], [])
 
 
 @pytest.mark.parametrize("backend", ["python", "rust"])
@@ -3711,7 +4023,7 @@ def test_mamba_path_cap_evicts_excess_states_through_the_adapter():
 def test_eagle_with_mamba_falls_back_to_the_unigram_binding():
     core = _mamba_tree_core(is_eagle=True)
     assert core.is_eagle is False
-    assert type(core._binding) is mem_cache.RustUnifiedTreeCoreBinding
+    assert type(core._binding._inner) is mem_cache.RustUnifiedTreeCoreBinding
 
 
 def test_mamba_prefetch_commit_round_trips_through_the_adapter():

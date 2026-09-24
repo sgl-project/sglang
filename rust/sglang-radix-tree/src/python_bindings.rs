@@ -826,6 +826,8 @@ fn tracker_to_py(tracker: HashMap<ComponentType, usize>) -> HashMap<u8, usize> {
 pub struct EvictDeviceNextNodeResultBinding {
     node_id: Option<NodeId>,
     mamba_backup_node_id: Option<NodeId>,
+    swa_backup_node_id: Option<NodeId>,
+    swa_backup_num_tokens: usize,
     made_progress: bool,
     unbacked_tokens: usize,
     tracker: HashMap<u8, usize>,
@@ -1366,7 +1368,7 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
     }
 
     /// Advance one component eviction step. Progress without a leaf can be
-    /// an internal tombstone or a Mamba backup request awaiting its finish;
+    /// an internal tombstone or a component backup request awaiting its finish;
     /// no progress means the walk is exhausted.
     fn evict_device_next_node(
         &self,
@@ -1380,10 +1382,13 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
             py.allow_threads(move || self.core().evict_device_next_node(ct, &baseline));
         let made_progress = node_id.is_some()
             || result.mamba_backup_node_id.is_some()
+            || result.swa_backup_node_id.is_some()
             || !result.tracker.is_empty();
         Ok(EvictDeviceNextNodeResultBinding {
             node_id,
             mamba_backup_node_id: result.mamba_backup_node_id,
+            swa_backup_node_id: result.swa_backup_node_id,
+            swa_backup_num_tokens: result.swa_backup_num_tokens,
             made_progress,
             unbacked_tokens: result.unbacked_tokens,
             tracker: tracker_to_py(result.tracker),
@@ -1399,9 +1404,29 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
         node_id: NodeId,
     ) -> PyResult<EvictDeviceNextNodeResultBinding> {
         let result = py.allow_threads(move || self.core().finish_mamba_state_eviction(node_id));
+        self.internal_eviction_finish_to_py(py, result)
+    }
+
+    /// Resume a pending internal SWA tombstone after the host backup attempt.
+    fn finish_swa_state_eviction(
+        &self,
+        py: Python<'_>,
+        node_id: NodeId,
+    ) -> PyResult<EvictDeviceNextNodeResultBinding> {
+        let result = py.allow_threads(move || self.core().finish_swa_state_eviction(node_id));
+        self.internal_eviction_finish_to_py(py, result)
+    }
+
+    fn internal_eviction_finish_to_py(
+        &self,
+        py: Python<'_>,
+        result: EvictionStepResult,
+    ) -> PyResult<EvictDeviceNextNodeResultBinding> {
         Ok(EvictDeviceNextNodeResultBinding {
             node_id: None,
             mamba_backup_node_id: None,
+            swa_backup_node_id: None,
+            swa_backup_num_tokens: 0,
             // Consuming the pending request advances the finite walk even
             // when intervening I/O pinned or removed this particular node.
             made_progress: true,
@@ -2791,6 +2816,15 @@ macro_rules! tree_core_binding {
                 self.inner.finish_mamba_state_eviction(py, node_id)
             }
 
+            /// Finish an internal SWA eviction after its host backup attempt.
+            fn finish_swa_state_eviction(
+                &self,
+                py: Python<'_>,
+                node_id: NodeId,
+            ) -> PyResult<EvictDeviceNextNodeResultBinding> {
+                self.inner.finish_swa_state_eviction(py, node_id)
+            }
+
             /// Evict one device leaf; an unbacked write-back leaf returns its backup
             /// action for the caller to execute before demoting.
             fn evict_device_leaf(
@@ -3765,6 +3799,10 @@ fn get_hash_str(
 }
 
 fn register_mem_cache_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add(
+        "PanicException",
+        m.py().get_type_bound::<pyo3::panic::PanicException>(),
+    )?;
     m.add_class::<TlruFloatConfigBinding>()?;
     m.add_function(wrap_pyfunction!(get_hash_str, m)?)?;
     m.add_class::<TreeCoreInitParamsBinding>()?;

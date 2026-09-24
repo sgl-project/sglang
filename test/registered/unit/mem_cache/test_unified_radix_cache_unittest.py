@@ -6172,8 +6172,6 @@ class UnifiedRadixCacheSuite:
         it stays servable."""
         if not self.cfg.has_mamba:
             self.skipTest("requires Mamba component")
-        if self.cfg.has_swa:
-            self.skipTest("no hicache strategy covers FULL+SWA+MAMBA")
         cache, req_to_token_pool, seq_a = self._build_internal_mamba_fixture(
             "write_back"
         )
@@ -6276,8 +6274,6 @@ class UnifiedRadixCacheSuite:
         """Non-write_back policies keep the legacy tombstone-and-drop."""
         if not self.cfg.has_mamba:
             self.skipTest("requires Mamba component")
-        if self.cfg.has_swa:
-            self.skipTest("no hicache strategy covers FULL+SWA+MAMBA")
         cache, _, seq_a = self._build_internal_mamba_fixture("write_through")
 
         cache.evict(EvictParams(num_tokens=0, mamba_num=10))
@@ -6309,15 +6305,10 @@ class UnifiedRadixCacheSuite:
         stays servable instead of losing a window of matchable prefix."""
         if not self.cfg.has_swa:
             self.skipTest("requires SWA component")
-        if self.cfg.has_mamba:
-            self.skipTest("no hicache strategy covers FULL+SWA+MAMBA")
-        # TODO(ShangmingCai): port the internal-node demote to the Rust core;
-        # its eviction walk still tombstones the SWA KV without a host backup.
-        if _selected_tree_core_test_backend() == "rust":
-            self.skipTest("internal-node SWA demote is Python-core only")
         cache, req_to_token_pool, seq_a, seq_b = self._build_internal_swa_fixture(
             "write_back"
         )
+        self.assertEqual(cache._tree_core_backend, _selected_tree_core_test_backend())
 
         result = cache.evict(EvictParams(num_tokens=0, swa_num_tokens=len(seq_b)))
         self.assertGreaterEqual(result.swa_num_tokens_evicted, len(seq_a))
@@ -6371,8 +6362,6 @@ class UnifiedRadixCacheSuite:
         """Non-write_back policies keep the legacy tombstone-and-drop."""
         if not self.cfg.has_swa:
             self.skipTest("requires SWA component")
-        if self.cfg.has_mamba:
-            self.skipTest("no hicache strategy covers FULL+SWA+MAMBA")
         cache, _, seq_a, seq_b = self._build_internal_swa_fixture("write_through")
 
         cache.evict(EvictParams(num_tokens=0, swa_num_tokens=len(seq_b)))
@@ -6547,8 +6536,6 @@ class UnifiedRadixCacheSuite:
         cache.dec_lock_ref(zeroed.best_match_node, lock.to_dec_params())
 
     def test_evict_host_drains_freed_host_values_to_the_pools(self):
-        if self.cfg.has_swa and self.cfg.has_mamba:
-            self.skipTest("no hicache strategy covers FULL+SWA+MAMBA")
         cache, allocator, req_to_token_pool = self._build_hicache_fixture()
         chain = self._build_chain_pages(cache, allocator, req_to_token_pool, 3)
         if len(chain) < 3:

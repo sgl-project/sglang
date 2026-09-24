@@ -18,6 +18,9 @@ Python in these cases:
 
 This policy also applies when Rust is explicitly selected.
 Build, import, and runtime failures in supported configurations remain errors.
+The adapter converts unexpected native panics into `RuntimeError` so Python's
+crash handlers can report them and coordinate shutdown. The original panic is
+preserved as the exception cause; a poisoned core remains unusable.
 
 T-LRU supports integer and floating-point `threshold` and `next_prompt_estimate`
 parameters. Integer configurations retain exact arithmetic; floating-point
@@ -54,8 +57,9 @@ External backends registered through `register_tree_core_backend` must implement
 the new `UnifiedTreeCoreInterface.swa_tombstone_ranges` and `attach_swa_window`
 methods for SWA buffer-mode repair. These methods are abstract, so existing
 subclasses need to add them before they can be instantiated. The new
-`finish_mamba_state_eviction` hook is optional for backends that complete Mamba
-backup inline and never return a deferred `mamba_backup_node_id`.
+`finish_mamba_state_eviction` and `finish_swa_state_eviction` hooks are optional
+for backends that complete these backups inline and never return a deferred
+`mamba_backup_node_id` or `swa_backup_node_id`.
 
 ```bash
 # Build (libtorch from the installed torch package):
@@ -88,3 +92,10 @@ SWA buffer-mode load-back can repair tombstoned windows in Rust. The core finds
 missing SWA spans and attaches loaded slots across node boundaries, preserving
 Full-KV ownership, lock accounting, and pending write-through split actions.
 The shared Python pipeline handles transfers and redundant-slot cleanup.
+
+HiCache write-back preserves eligible internal SWA windows before device eviction
+(#40712). Rust pauses the walk while the Python controller makes room for the
+whole unbacked window and completes its host backup. The walk then resumes,
+retaining reusable host state when the backup succeeds and still freeing device
+slots when allocation fails. The same transfer and ACK handling serves internal
+Mamba state backups (#40680).

@@ -2967,6 +2967,370 @@ fn swa_tracker() -> HashMap<ComponentType, usize> {
     HashMap::from([(FULL, 0), (SWA, 0)])
 }
 
+fn internal_swa_write_back_fixture(
+    window: usize,
+    page_size: usize,
+    with_mamba: bool,
+) -> (UnifiedTreeCore<Vec<i64>>, [NodeId; 3]) {
+    let mut tc = UnifiedTreeCore::new(
+        CacheInitParams {
+            page_size,
+            swa_sliding_window_size: Some(window),
+            mamba_cache_chunk_size: with_mamba.then_some(256),
+            enable_hicache: true,
+            has_swa_host_pool: true,
+            is_write_back: true,
+            ..Default::default()
+        },
+        if with_mamba {
+            vec![FULL, SWA, MAMBA]
+        } else {
+            vec![FULL, SWA]
+        },
+    );
+    let mut ids = [0; 3];
+    for (i, id) in ids.iter_mut().enumerate() {
+        let len = (i + 1) * page_size;
+        let key: Vec<_> = (1..=len as i64).collect();
+        let values: Vec<_> = (10..10 + len as i64).collect();
+        let mut params = insert_params_swa(&key, &values, 0, 0);
+        params.mamba_value = with_mamba.then(|| Tensor::from_slice(&[70 + i as i64]));
+        *id = tc.insert(&params).last_device_node_id.unwrap();
+        let idx = tc.arena.resolve(*id).unwrap();
+        store_swa_device(&mut tc, idx);
+    }
+    (tc, ids)
+}
+
+fn commit_internal_swa_backup(tc: &mut UnifiedTreeCore<Vec<i64>>, node_id: NodeId) {
+    let (full, mut transfers) = tc.build_backup_spec(node_id).unwrap();
+    let nodes = transfers[&SWA][0].nodes_to_load.clone().unwrap();
+    for transfer in transfers.values_mut().flatten() {
+        transfer.host_indices = Some(transfer.device_indices.as_ref().unwrap() + 1000);
+    }
+    tc.commit_backup(node_id, full + 1000, transfers).unwrap();
+    let nodes = tc.mark_write_through_pending(nodes, node_id).unwrap();
+    tc.finish_write_through(nodes, node_id).unwrap();
+}
+
+fn request_internal_swa_backup(tc: &mut UnifiedTreeCore<Vec<i64>>, node: NodeId, needed: usize) {
+    let (leaf, step) = tc.evict_device_next_node(SWA, &HashMap::new());
+    assert_eq!(leaf, None);
+    assert_eq!(step.swa_backup_node_id, Some(node));
+    assert_eq!(step.swa_backup_num_tokens, needed);
+    assert_eq!(step.mamba_backup_node_id, None);
+    assert!(step.tracker.is_empty());
+    assert!(step.device_frees.is_empty());
+    assert!(step.host_frees.is_empty());
+    assert_eq!(step.unbacked_tokens, 0);
+    assert!(
+        tc.arena
+            .has_device_value(tc.arena.resolve(node).unwrap(), SWA)
+    );
+}
+
+#[test]
+fn internal_swa_write_back_keeps_full_and_host_window_after_backup() {
+    let (mut tc, [a, b, c]) = internal_swa_write_back_fixture(2, 1, false);
+    tc.evict_device_start(SWA, 3);
+    request_internal_swa_backup(&mut tc, a, 1);
+    commit_internal_swa_backup(&mut tc, a);
+    let step = tc.finish_swa_state_eviction(a);
+    assert_eq!(step.tracker, HashMap::from([(SWA, 1)]));
+    assert!(step.device_frees[&SWA][0].equal(&Tensor::from_slice(&[10i64])));
+    assert_eq!(step.device_frees.len(), 1);
+    assert!(step.host_frees.is_empty());
+    assert_eq!(step.unbacked_tokens, 0);
+    let idx = tc.arena.resolve(a).unwrap();
+    let node = tc.arena.node(idx);
+    assert!(node.device_value(FULL).equal(&Tensor::from_slice(&[10i64])));
+    assert!(node.host_value(FULL).equal(&Tensor::from_slice(&[1010i64])));
+    assert!(node.host_value(SWA).equal(&Tensor::from_slice(&[1000i64])));
+    assert!(!node.has_device_value(SWA));
+    assert!(tc.host_lru_list(SWA).in_list(Some(idx)));
+    let matched = tc.match_prefix(&match_params(&vec![1]));
+    assert_eq!(matched.best_match_node_id, a);
+    assert_eq!(matched.swa_host_hit_length, 1);
+
+    // The next backup counts only B: A's SWA copy is already on host.
+    request_internal_swa_backup(&mut tc, b, 1);
+    tc.finish_swa_state_eviction(b);
+    let (leaf, step) = tc.evict_device_next_node(SWA, &HashMap::from([(SWA, 2)]));
+    assert_eq!(leaf, Some(c));
+    assert_eq!(step.swa_backup_node_id, None);
+    assert_eq!(step.swa_backup_num_tokens, 0);
+    tc.evict_device_end(SWA);
+    tc.sanity_check(&[], &[]);
+}
+
+#[test]
+fn internal_swa_failed_backup_still_frees_and_obeys_the_budget() {
+    let (mut tc, [a, b, _]) = internal_swa_write_back_fixture(2, 1, false);
+    tc.evict_device_start(SWA, 1);
+    request_internal_swa_backup(&mut tc, a, 1);
+    let step = tc.finish_swa_state_eviction(a);
+    assert_eq!(step.tracker, HashMap::from([(SWA, 1)]));
+    let node = tc.arena.node(tc.arena.resolve(a).unwrap());
+    assert!(node.has_device_value(FULL));
+    assert!(!node.has_device_value(SWA));
+    assert!(!node.has_host_value(SWA));
+    let (next, exhausted) = tc.evict_device_next_node(SWA, &step.tracker);
+    assert_eq!(next, None);
+    assert!(exhausted.tracker.is_empty());
+    assert_eq!(exhausted.swa_backup_node_id, None);
+    assert_eq!(exhausted.swa_backup_num_tokens, 0);
+    assert!(tc.arena.has_device_value(tc.arena.resolve(b).unwrap(), SWA));
+    tc.evict_device_end(SWA);
+    tc.sanity_check(&[], &[]);
+}
+
+#[test]
+fn internal_swa_backup_counts_the_collected_window_including_page_overshoot() {
+    for buffer_only in [false, true] {
+        // Two 2-token nodes cover a 3-token window. Buffer mode stages B alone.
+        let (mut tc, [a, b, c]) = internal_swa_write_back_fixture(3, 2, false);
+        tc.is_host_memory_buffer_only = buffer_only;
+        let a_idx = tc.arena.resolve(a).unwrap();
+        tc.device_lru_list_mut(SWA).reset_node_mru(a_idx);
+        tc.evict_device_start(SWA, 6);
+        let needed = if buffer_only { 2 } else { 4 };
+        request_internal_swa_backup(&mut tc, b, needed);
+        let (_, transfers) = tc.build_backup_spec(b).unwrap();
+        assert_eq!(
+            transfers[&SWA][0].device_indices.as_ref().unwrap().numel(),
+            needed
+        );
+        commit_internal_swa_backup(&mut tc, b);
+        assert_eq!(
+            tc.finish_swa_state_eviction(b).tracker,
+            HashMap::from([(SWA, 2)])
+        );
+        let a_node = tc.arena.node(a_idx);
+        assert!(a_node.has_device_value(SWA));
+        assert_eq!(a_node.has_host_value(SWA), !buffer_only);
+        let (next, _) = tc.evict_device_next_node(SWA, &HashMap::from([(SWA, 2)]));
+        assert_eq!(next, Some(c));
+        tc.evict_device_end(SWA);
+        tc.sanity_check(&[], &[]);
+    }
+}
+
+#[test]
+fn internal_swa_backup_guards_keep_the_existing_inline_tombstone() {
+    for guard in [
+        "no_hicache",
+        "write_through",
+        "no_swa_pool",
+        "full_host",
+        "swa_host",
+        "pending",
+    ] {
+        let (mut tc, [a, _, _]) = internal_swa_write_back_fixture(2, 1, false);
+        let idx = tc.arena.resolve(a).unwrap();
+        match guard {
+            "no_hicache" => tc.enable_hicache = false,
+            "write_through" => tc.is_write_back = false,
+            "no_swa_pool" => tc.has_swa_host_pool = false,
+            "full_host" => {
+                tc.commit_backup(a, Tensor::from_slice(&[100i64]), HashMap::new())
+                    .unwrap();
+                tc.mark_write_through_pending(vec![a], a).unwrap();
+                tc.finish_write_through(vec![a], a).unwrap();
+            }
+            "swa_host" => {
+                let (_, mut transfers) = tc.build_backup_spec(a).unwrap();
+                transfers.get_mut(&SWA).unwrap()[0].host_indices =
+                    Some(Tensor::from_slice(&[100i64]));
+                tc.commit_backup(a, Tensor::from_slice(&[] as &[i64]), transfers)
+                    .unwrap();
+            }
+            "pending" => tc.arena.node_mut(idx).write_through_pending_id = Some(a),
+            _ => unreachable!(),
+        }
+        tc.evict_device_start(SWA, 1);
+        let (next, step) = tc.evict_device_next_node(SWA, &HashMap::new());
+        assert_eq!(next, None, "{guard}");
+        assert_eq!(step.swa_backup_node_id, None, "{guard}");
+        assert_eq!(step.swa_backup_num_tokens, 0, "{guard}");
+        assert_eq!(step.tracker, HashMap::from([(SWA, 1)]), "{guard}");
+        assert!(tc.arena.has_device_value(idx, FULL));
+        assert!(!tc.arena.has_device_value(idx, SWA));
+        tc.arena.node_mut(idx).write_through_pending_id = None;
+        tc.evict_device_end(SWA);
+        tc.sanity_check(&[], &[]);
+    }
+}
+
+#[test]
+fn internal_swa_resume_preserves_new_request_and_dma_locks() {
+    for pending_backup in [false, true] {
+        let (mut tc, [a, b, _]) = internal_swa_write_back_fixture(2, 1, false);
+        tc.evict_device_start(SWA, 3);
+        request_internal_swa_backup(&mut tc, a, 1);
+        let idx = tc.arena.resolve(a).unwrap();
+        let swa = swa_component(2);
+        let lock = swa.acquire_component_lock(&mut tc, idx, IncLockRefResult::default(), false);
+        if pending_backup {
+            tc.arena.node_mut(idx).write_through_pending_id = Some(a);
+        }
+        let step = tc.finish_swa_state_eviction(a);
+        assert!(step.tracker.is_empty());
+        assert!(step.device_frees.is_empty());
+        assert!(tc.arena.has_device_value(idx, SWA));
+        tc.arena.node_mut(idx).write_through_pending_id = None;
+        swa.release_component_lock(
+            &mut tc,
+            idx,
+            &DecLockRefParams {
+                swa_uuid_for_lock: lock.swa_uuid_for_lock,
+                ..Default::default()
+            },
+            false,
+        );
+        request_internal_swa_backup(&mut tc, b, 2);
+        tc.evict_device_end(SWA);
+        tc.sanity_check(&[], &[]);
+    }
+}
+
+#[test]
+fn internal_swa_resume_ignores_other_components_pending_markers() {
+    for load_back in [false, true] {
+        let (mut tc, [a, _, c]) = internal_swa_write_back_fixture(2, 1, false);
+        tc.evict_device_start(SWA, 1);
+        request_internal_swa_backup(&mut tc, a, 1);
+        let idx = tc.arena.resolve(a).unwrap();
+        if load_back {
+            tc.arena.node_mut(idx).load_back_pending_id = Some(c);
+        } else {
+            tc.arena.node_mut(idx).write_through_pending_id = Some(c);
+        }
+        let step = tc.finish_swa_state_eviction(a);
+        assert_eq!(step.tracker, HashMap::from([(SWA, 1)]));
+        assert!(tc.arena.has_device_value(idx, FULL));
+        assert!(!tc.arena.has_device_value(idx, SWA));
+        let node = tc.arena.node_mut(idx);
+        assert_eq!(
+            if load_back {
+                node.load_back_pending_id
+            } else {
+                node.write_through_pending_id
+            },
+            Some(c)
+        );
+        node.load_back_pending_id = None;
+        node.write_through_pending_id = None;
+        tc.evict_device_end(SWA);
+        tc.sanity_check(&[], &[]);
+    }
+}
+
+#[test]
+fn internal_swa_resume_reselects_only_an_atomically_evictable_leaf() {
+    use crate::components::full::FullComponent;
+    for full_locked in [false, true] {
+        let (mut tc, [a, b, c]) = internal_swa_write_back_fixture(2, 1, false);
+        tc.evict_device_start(SWA, 1);
+        request_internal_swa_backup(&mut tc, a, 1);
+        tc.evict_device_leaf(c, false).unwrap();
+        tc.evict_device_leaf(b, false).unwrap();
+        let idx = tc.arena.resolve(a).unwrap();
+        if full_locked {
+            FullComponent.acquire_component_lock(&mut tc, idx, IncLockRefResult::default(), false);
+        }
+        let step = tc.finish_swa_state_eviction(a);
+        let (next, exhausted) = tc.evict_device_next_node(SWA, &step.tracker);
+        if full_locked {
+            // Full alone is pinned; SWA finishes rather than endlessly requeueing.
+            assert_eq!(step.tracker, HashMap::from([(SWA, 1)]));
+            assert_eq!(next, None);
+            assert!(!tc.arena.has_device_value(idx, SWA));
+            FullComponent.release_component_lock(&mut tc, idx, &DecLockRefParams::default(), false);
+        } else {
+            assert!(step.tracker.is_empty());
+            assert!(step.device_frees.is_empty());
+            assert_eq!(next, Some(a));
+            assert!(tc.arena.has_device_value(idx, SWA));
+        }
+        assert_eq!(exhausted.swa_backup_node_id, None);
+        assert!(tc.arena.has_device_value(idx, FULL));
+        tc.evict_device_end(SWA);
+        tc.sanity_check(&[], &[]);
+    }
+}
+
+#[test]
+fn internal_swa_resume_does_not_touch_a_recycled_node() {
+    let (mut tc, [a, b, c]) = internal_swa_write_back_fixture(2, 1, false);
+    tc.evict_device_start(SWA, 1);
+    request_internal_swa_backup(&mut tc, a, 1);
+    for id in [c, b, a] {
+        tc.evict_device_leaf(id, false).unwrap();
+    }
+    let replacement = tc
+        .insert(&insert_params_swa(&vec![9], &[90], 0, 0))
+        .last_device_node_id
+        .unwrap();
+    let idx = tc.arena.resolve(replacement).unwrap();
+    store_swa_device(&mut tc, idx);
+    assert!(tc.arena.resolve(a).is_err());
+    let step = tc.finish_swa_state_eviction(a);
+    assert!(step.tracker.is_empty());
+    assert!(step.device_frees.is_empty());
+    let (next, _) = tc.evict_device_next_node(SWA, &HashMap::new());
+    assert_eq!(next, Some(replacement));
+    assert!(tc.arena.has_device_value(idx, SWA));
+    tc.evict_device_end(SWA);
+    tc.sanity_check(&[], &[]);
+}
+
+#[test]
+fn internal_swa_pending_protocol_prevents_double_free_and_allows_abandonment() {
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+    let (mut tc, [a, b, _]) = internal_swa_write_back_fixture(2, 1, false);
+    tc.evict_device_start(SWA, 1);
+    request_internal_swa_backup(&mut tc, a, 1);
+    assert!(
+        catch_unwind(AssertUnwindSafe(
+            || tc.evict_device_next_node(SWA, &HashMap::new())
+        ))
+        .is_err()
+    );
+    assert!(catch_unwind(AssertUnwindSafe(|| tc.finish_swa_state_eviction(b))).is_err());
+    tc.evict_device_end(SWA);
+    assert!(tc.arena.has_device_value(tc.arena.resolve(a).unwrap(), SWA));
+    tc.evict_device_start(SWA, 1);
+    request_internal_swa_backup(&mut tc, a, 1);
+    assert_eq!(tc.finish_swa_state_eviction(a).tracker[&SWA], 1);
+    assert!(catch_unwind(AssertUnwindSafe(|| tc.finish_swa_state_eviction(a))).is_err());
+    tc.evict_device_end(SWA);
+    tc.sanity_check(&[], &[]);
+}
+
+#[test]
+fn internal_swa_write_back_preserves_host_mamba_before_device_cascade() {
+    for backup_succeeds in [false, true] {
+        let (mut tc, [a, _, _]) = internal_swa_write_back_fixture(2, 1, true);
+        tc.evict_device_start(SWA, 1);
+        request_internal_swa_backup(&mut tc, a, 1);
+        if backup_succeeds {
+            commit_internal_swa_backup(&mut tc, a);
+        }
+        let step = tc.finish_swa_state_eviction(a);
+        assert_eq!(step.tracker, HashMap::from([(SWA, 1), (MAMBA, 1)]));
+        assert!(step.device_frees[&MAMBA][0].equal(&Tensor::from_slice(&[70i64])));
+        assert!(!step.device_frees.contains_key(&FULL));
+        let node = tc.arena.node(tc.arena.resolve(a).unwrap());
+        assert!(node.has_device_value(FULL));
+        for ct in [SWA, MAMBA] {
+            assert!(!node.has_device_value(ct));
+            assert_eq!(node.has_host_value(ct), backup_succeeds);
+        }
+        tc.evict_device_end(SWA);
+        tc.sanity_check(&[], &[]);
+    }
+}
+
 #[test]
 fn evict_walk_advances_one_allocator_mutation_per_call() {
     let mut tc = swa_core(/* window = */ 2, /* page_size = */ 1);

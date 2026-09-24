@@ -769,6 +769,21 @@ class UnifiedRadixCache(BasePrefixCache):
                 self.evict_host(1, ComponentType.MAMBA)
             self.backup_node_for_write_back(node_id)
             result = self.tree_core.finish_mamba_state_eviction(node_id)
+        elif result.swa_backup_node_id is not None:
+            assert component_type == ComponentType.SWA and result.node_id is None
+            assert (
+                not result.device_frees and not result.host_frees and not result.tracker
+            )
+            # Internal SWA write-back (#40712) can cover several unbacked
+            # segments. Make room for the whole window before the D->H backup.
+            # A failed allocation still resumes eviction to free device slots.
+            node_id = result.swa_backup_node_id
+            needed = result.swa_backup_num_tokens
+            swa_host_pool = self.host_pool_group.get_pool(PoolName.SWA)
+            if swa_host_pool is not None and swa_host_pool.available_size() < needed:
+                self.evict_host(needed, ComponentType.SWA)
+            self.backup_node_for_write_back(node_id)
+            result = self.tree_core.finish_swa_state_eviction(node_id)
         self._free_values(result.device_frees, result.host_frees)
         if self._tracks_write_through_unbacked_evictions():
             self._record_dropped_tokens(
