@@ -154,15 +154,6 @@ class MHASubPoolSpec(SubPoolSpec):
     def page_bytes(self, page_size: int) -> int:
         return page_size * self.entry_bytes()
 
-    def layer_k_offset_in_page(self, layer_id: int, page_size: int) -> int:
-        return layer_id * page_size * (self.k_row_bytes() + self.v_row_bytes())
-
-    def layer_v_offset_in_page(self, layer_id: int, page_size: int) -> int:
-        return (
-            self.layer_k_offset_in_page(layer_id, page_size)
-            + page_size * self.k_row_bytes()
-        )
-
     def view_tail_pad_bytes(self, page_size: int) -> int:
         return page_size * self.entry_bytes()
 

@@ -1,5 +1,6 @@
 import logging
 import math
+from array import array
 from math import sqrt
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
@@ -895,7 +896,7 @@ class Step3VLForConditionalGeneration(nn.Module):
                 )
         return self._flatten_embeddings(merged_image_features)
 
-    def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
+    def pad_input_ids(self, input_ids: array, mm_inputs: MultimodalInputs) -> array:
         pattern = MultiModalityDataPaddingPatternMultimodalTokens()
         return pattern.pad_input_tokens(input_ids, mm_inputs)
 
