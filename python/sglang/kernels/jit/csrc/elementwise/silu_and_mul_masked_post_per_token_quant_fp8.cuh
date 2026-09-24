@@ -7,7 +7,7 @@
 #include <sgl_kernel/type.cuh>
 #include <sgl_kernel/utils.cuh>
 
-namespace {
+namespace sglang {
 
 constexpr int kWarpThreads = 32;
 constexpr int kElemPerThread = 8;
