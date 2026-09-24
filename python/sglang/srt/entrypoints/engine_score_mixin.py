@@ -30,13 +30,15 @@ class EngineScoreMixin:
         self,
         query: Optional[Union[str, List[int]]] = None,
         items: Optional[Union[str, List[str], List[List[int]]]] = None,
-        label_token_ids: Optional[List[int]] = None,
+        label_token_ids: Optional[Union[List[int], List[List[int]]]] = None,
         apply_softmax: bool = False,
         item_first: bool = False,
         embed_override_token_id: Optional[int] = None,
         query_embed_overrides: Optional[List[torch.Tensor]] = None,
         item_embed_overrides: Optional[List[Optional[List[torch.Tensor]]]] = None,
         return_pooled_hidden_states: bool = False,
+        temperature: float = 1.0,
+        return_token_logprobs: bool = False,
     ) -> ScoreResult:
         """
         Score items against a query using the loaded model.
@@ -54,8 +56,8 @@ class EngineScoreMixin:
         Args:
             query: The query text or pre-tokenized token IDs.
             items: The item text(s) or pre-tokenized token IDs.
-            label_token_ids: Token IDs to score (required for CausalLM; ignored for
-                SequenceClassification).
+            label_token_ids: Shared token IDs or one list per item, preserving candidate
+                order (required for CausalLM; ignored for SequenceClassification).
             apply_softmax: Whether to normalize scores using softmax.
             item_first: If True, prepend items before query (single-item mode only).
             embed_override_token_id: Placeholder token ID used to locate override positions.
@@ -64,6 +66,10 @@ class EngineScoreMixin:
             return_pooled_hidden_states: Whether to include raw pooled transformer
                 hidden states (before the task head) in the result. Only supported
                 for non-generation models (SequenceClassification, RewardModel).
+            temperature: Positive calibration temperature, applied before candidate/class
+                softmax. Requires apply_softmax=True when different from 1.
+            return_token_logprobs: Include uncalibrated full-vocabulary logprobs for
+                each item's candidates. Only supported for CausalLM, not raw logits.
 
         Returns:
             ScoreResult with scores (one list per item), prompt token count, and
@@ -81,6 +87,8 @@ class EngineScoreMixin:
                 item_embed_overrides=item_embed_overrides,
                 request=None,
                 return_pooled_hidden_states=return_pooled_hidden_states,
+                temperature=temperature,
+                return_token_logprobs=return_token_logprobs,
             )
         )
 
@@ -88,13 +96,15 @@ class EngineScoreMixin:
         self,
         query: Optional[Union[str, List[int]]] = None,
         items: Optional[Union[str, List[str], List[List[int]]]] = None,
-        label_token_ids: Optional[List[int]] = None,
+        label_token_ids: Optional[Union[List[int], List[List[int]]]] = None,
         apply_softmax: bool = False,
         item_first: bool = False,
         embed_override_token_id: Optional[int] = None,
         query_embed_overrides: Optional[List[torch.Tensor]] = None,
         item_embed_overrides: Optional[List[Optional[List[torch.Tensor]]]] = None,
         return_pooled_hidden_states: bool = False,
+        temperature: float = 1.0,
+        return_token_logprobs: bool = False,
     ) -> ScoreResult:
         """Asynchronous version of score(). See score() for full documentation."""
         return await self.tokenizer_manager.score_request(
@@ -108,4 +118,6 @@ class EngineScoreMixin:
             item_embed_overrides=item_embed_overrides,
             request=None,
             return_pooled_hidden_states=return_pooled_hidden_states,
+            temperature=temperature,
+            return_token_logprobs=return_token_logprobs,
         )
