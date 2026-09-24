@@ -310,15 +310,6 @@ class UnifiedRadixCache(BasePrefixCache):
         if not reduced and self.tp_world_size > 1:
             torch.distributed.all_reduce(tensor, op=op, group=self.tp_group)
 
-    def _barrier_attn_groups(self):
-        waited = False
-        for group in (self.attn_cp_group, self.attn_tp_group):
-            if group is not None and torch.distributed.get_world_size(group=group) > 1:
-                torch.distributed.barrier(group=group)
-                waited = True
-        if not waited and self.tp_world_size > 1:
-            torch.distributed.barrier(group=self.tp_group)
-
     def _drain_async_work(self):
         """
         Block until all outstanding async sends are consumed, then clear.
@@ -1112,6 +1103,46 @@ class UnifiedRadixCache(BasePrefixCache):
                 self.session_refs.register_session_ref(req)
 
     @rank_consensus(same_params=["req.rid", "chunked"])
+    def advance_unpublished_req(self, req: Req, chunked: bool = False) -> None:
+        assert not self.supports_mamba()
+        token_ids = req.get_fill_ids()
+        kv_indices = self.req_to_token_pool.req_to_token[
+            req.kv.req_pool_idx, : len(token_ids)
+        ]
+        insert_params = InsertParams(
+            prev_prefix_len=req.kv.cache_protected_len,
+            chunked=chunked,
+            priority=getattr(req, "priority", 0) or 0,
+            rotation_base=req.kv_rotation_base,
+        )
+        effective_cache_len = len(token_ids)
+        for comp in self._components_tuple:
+            cache_len = comp.prepare_for_caching_req(
+                req=req,
+                insert_params=insert_params,
+                token_ids_len=len(token_ids),
+                is_finished=False,
+            )
+            if cache_len is not None:
+                effective_cache_len = min(effective_cache_len, cache_len)
+
+        radix_key = RadixKey(
+            token_ids[:effective_cache_len],
+            req.extra_key,
+            is_bigram=self.tree_core.is_eagle,
+            cache_salt=req.cache_salt,
+        )
+        if envs.SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS.get():
+            for comp in self._components_tuple:
+                comp.free_out_of_window_slots(req, len(radix_key) - 1, insert_params)
+
+        req.prefix_indices = kv_indices.to(dtype=torch.int64, copy=True)
+        for comp in self._components_tuple:
+            comp.cleanup_after_caching_req(
+                req, is_finished=False, insert_params=insert_params
+            )
+
+    @rank_consensus(same_params=["req.rid", "chunked"])
     def cache_unfinished_req(self, req: Req, chunked: bool = False, **kwargs) -> None:
         if self.session.try_cache_unfinished_req(req, chunked=chunked, **kwargs):
             return
@@ -1438,7 +1469,7 @@ class UnifiedRadixCache(BasePrefixCache):
             return 0
         return self.evict_host(num_tokens)
 
-    def retraction_backup(self, req: Req) -> Optional[RetractionBackup]:
+    def backup_kv_cache(self, req: Req) -> Optional[RetractionBackup]:
         """Back up device KV to the host pool; None when it cannot fit after reclaim."""
         assert req.seqlen > 1
 
@@ -1481,11 +1512,11 @@ class UnifiedRadixCache(BasePrefixCache):
             )
             completion.finish_event.synchronize()
         except Exception:
-            self.retraction_discard(backup)
+            self.discard_kv_cache_backup(backup)
             raise
         return backup
 
-    def retraction_restore(self, req: Req, backup: RetractionBackup) -> None:
+    def restore_kv_cache(self, req: Req, backup: RetractionBackup) -> None:
         device_indices, current_transfers = self._retraction_device_transfers(req)
         assert len(backup.host_indices) == len(device_indices), (
             f"Host backup has {len(backup.host_indices)} slots, but restore has "
@@ -1530,9 +1561,9 @@ class UnifiedRadixCache(BasePrefixCache):
             transfer_layer_id_max=self.cache_controller.transfer_layer_id_max,
         )
         completion.finish_event.synchronize()
-        self.retraction_discard(backup)
+        self.discard_kv_cache_backup(backup)
 
-    def retraction_discard(self, backup: RetractionBackup) -> None:
+    def discard_kv_cache_backup(self, backup: RetractionBackup) -> None:
         self.host_pool_group.free(backup.host_indices)
         self.host_pool_group.release_transfers(backup.pool_transfers)
 

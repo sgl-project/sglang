@@ -894,6 +894,7 @@ class ChatCompletionRequest(BaseModel):
     return_input_ids_in_sglext: bool = False
     return_output_ids_in_sglext: bool = False
     return_sampling_mask: bool = False
+    sampling_logprobs_mode: Optional[Literal["selected", "support"]] = None
     reasoning_effort: ReasoningEffortType = Field(
         default=None,
         description="Constrains effort on reasoning for reasoning models. "
