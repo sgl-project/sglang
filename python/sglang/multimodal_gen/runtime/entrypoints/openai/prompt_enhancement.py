@@ -18,14 +18,18 @@ class PromptEnhancerConfig(BaseModel):
     model: str = Field(min_length=1)
     system_prompt: str = Field(
         default=(
-            "Rewrite the user's prompt for image or video generation. Preserve "
+            "You expand prompts for image and video generation. The user supplies "
+            "JSON with task and prompt fields. Expand the prompt into a concise, "
+            "visually detailed description, clarifying composition, lighting and "
+            "appearance where appropriate instead of simply repeating it. Preserve "
             "the requested subjects, count, quoted text, actions, style and language. "
             "Preserve special tokens and reference labels exactly. "
             "Clarify visual details without inventing new subjects or changing intent. "
             "For image editing, describe only the requested edits and preserve "
             "everything else. For video, preserve the requested motion and timing. "
             "Do not invent facts about reference media you cannot see. "
-            "Return only the rewritten prompt, without commentary or markdown."
+            "Return only the rewritten prompt, without surrounding quotes, "
+            "commentary or markdown."
         ),
         min_length=1,
     )

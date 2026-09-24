@@ -30,14 +30,14 @@ Start a text-only enhancer:
 ```bash
 CUDA_VISIBLE_DEVICES=0 sglang serve \
   --model-path Qwen/Qwen3-4B-Instruct-2507 \
-  --port 30001
+  --port 31000
 ```
 
 Create `enhancer.json` on the diffusion host:
 
 ```json
 {
-  "base_url": "http://127.0.0.1:30001/v1",
+  "base_url": "http://127.0.0.1:31000/v1",
   "model": "Qwen/Qwen3-4B-Instruct-2507"
 }
 ```
@@ -51,7 +51,9 @@ CUDA_VISIBLE_DEVICES=1 sglang serve \
   --port 30000
 ```
 
-For separate hosts, bind SRT to its service interface with `--host` and update
+Keep the SRT port separate from diffusion's HTTP and internal ports; diffusion
+reserves `--port + 1` for its broker. For separate hosts, bind SRT to its service
+interface with `--host` and update
 `base_url`. Restrict network access and configure SRT authentication. Do not
 expose an unauthenticated enhancer publicly. A shared enhancer can serve
 multiple diffusion servers; size its concurrency and memory independently.
@@ -167,11 +169,11 @@ directory with its tokenizer and retain the ERNIE-specific protocol:
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 sglang serve \
-  --model-path /models/ERNIE-Image/pe --port 30001
+  --model-path /models/ERNIE-Image/pe --port 31000
 
 CUDA_VISIBLE_DEVICES=1 sglang serve \
   --model-path /models/ERNIE-Image \
-  --pe-server-url http://127.0.0.1:30001 --port 30000
+  --pe-server-url http://127.0.0.1:31000 --port 30000
 ```
 
 `--pe-server-url` uses the checkpoint's PE tokenizer/template and SRT's
