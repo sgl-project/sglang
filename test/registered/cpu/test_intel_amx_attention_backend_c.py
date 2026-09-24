@@ -28,7 +28,6 @@ class TestIntelAMXAttnBackendQuant(CustomTestCase):
             "0.1",
         ],
         min_throughput=100,
-        single_numa_node=True,
     )
     def test_latency_w8a8_default_model(self):
         return DEFAULT_MODEL_NAME_FOR_TEST_W8A8
@@ -47,7 +46,6 @@ class TestIntelAMXAttnBackendQuant(CustomTestCase):
             "6",
         ],
         min_throughput=100,
-        single_numa_node=True,
     )
     def test_latency_w8a8_moe_model(self):
         return DEFAULT_MODEL_NAME_FOR_TEST_W8A8_WITH_MOE

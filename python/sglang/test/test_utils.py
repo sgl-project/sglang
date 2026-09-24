@@ -61,6 +61,7 @@ DEFAULT_SMALL_MOE_MODEL_NAME_FOR_TEST_BASE = "Qwen/Qwen1.5-MoE-A2.7B"
 DEFAULT_SMALL_MOE_MODEL_NAME_FOR_TEST_CHAT = "Qwen/Qwen1.5-MoE-A2.7B-Chat"
 
 # MLA test models
+DEFAULT_SMALL_EMBEDDING_MODEL_NAME_FOR_TEST = "Alibaba-NLP/gte-Qwen2-1.5B-instruct"
 DEFAULT_SMALL_CROSS_ENCODER_MODEL_NAME_FOR_TEST = "cross-encoder/ms-marco-MiniLM-L6-v2"
 DEFAULT_MLA_MODEL_NAME_FOR_TEST = "deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct"
 DEFAULT_MLA_FP8_MODEL_NAME_FOR_TEST = "neuralmagic/DeepSeek-Coder-V2-Lite-Instruct-FP8"
@@ -2653,10 +2654,15 @@ def get_available_cpu_ids(min_cpus):
 
 
 def get_tp_cpu_bind(tp_size):
-    """Bind string confining tp_size ranks to an already-set
-    SGLANG_CPU_OMP_THREADS_BIND, or None if the env var isn't set."""
-    cpu_ids = get_available_cpu_ids(tp_size)
-    return _bind_groups_from_cpu_ids(cpu_ids, tp_size) if cpu_ids is not None else None
+    """Align an existing SGLANG_CPU_OMP_THREADS_BIND with tp_size ranks."""
+    bind_value = os.environ.get("SGLANG_CPU_OMP_THREADS_BIND", "")
+    if not bind_value or bind_value == "all":
+        return None
+
+    bind_groups = bind_value.split("|")
+    if len(bind_groups) == 1 and tp_size > 1:
+        return _bind_groups_from_cpu_ids(get_available_cpu_ids(tp_size), tp_size)
+    return bind_value
 
 
 def _get_tp_size(args):
@@ -2670,7 +2676,7 @@ def _get_tp_size(args):
     return 1
 
 
-def intel_amx_benchmark(extra_args=None, min_throughput=None, single_numa_node=False):
+def intel_amx_benchmark(extra_args=None, min_throughput=None):
     def decorator(test_func):
         @wraps(test_func)
         def wrapper(self):
@@ -2684,10 +2690,9 @@ def intel_amx_benchmark(extra_args=None, min_throughput=None, single_numa_node=F
 
             model = test_func(self)
             env = None
-            if single_numa_node:
-                bind = get_tp_cpu_bind(_get_tp_size(full_args))
-                if bind is not None:
-                    env = {**os.environ, "SGLANG_CPU_OMP_THREADS_BIND": bind}
+            bind = get_tp_cpu_bind(_get_tp_size(full_args))
+            if bind is not None:
+                env = {**os.environ, "SGLANG_CPU_OMP_THREADS_BIND": bind}
             prefill_latency, decode_throughput, decode_latency = run_bench_one_batch(
                 model, full_args, env=env
             )
