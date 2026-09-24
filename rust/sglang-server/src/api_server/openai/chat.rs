@@ -18,13 +18,19 @@ use dynamo_parsers::tool_calling::jail::{Annotated, apply_tool_calling_jail};
 use dynamo_parsers::{ToolChoice as DynamoToolChoice, ToolDefinition};
 use dynamo_protocols::types::{
     ChatChoice, ChatChoiceLogprobs, ChatChoiceStream, ChatCompletionMessageContent,
-    ChatCompletionResponseMessage, ChatCompletionTokenLogprob, ChatCompletionToolChoiceOption,
-    CreateChatCompletionRequest, CreateChatCompletionResponse, CreateChatCompletionStreamResponse,
-    FinishReason as OpenAIFinishReason, ResponseFormat, Role, ServiceTier as ChatServiceTier, Stop,
-    TopLogprobs,
+    ChatCompletionRequestAssistantMessageContent, ChatCompletionRequestAssistantMessageContentPart,
+    ChatCompletionRequestDeveloperMessageContent, ChatCompletionRequestMessage,
+    ChatCompletionRequestSystemMessageContent, ChatCompletionRequestSystemMessageContentPart,
+    ChatCompletionRequestToolMessageContent, ChatCompletionRequestToolMessageContentPart,
+    ChatCompletionRequestUserMessage, ChatCompletionRequestUserMessageContent,
+    ChatCompletionRequestUserMessageContentPart, ChatCompletionResponseMessage,
+    ChatCompletionTokenLogprob, ChatCompletionToolChoiceOption, CreateChatCompletionRequest,
+    CreateChatCompletionResponse, CreateChatCompletionStreamResponse,
+    FinishReason as OpenAIFinishReason, ReasoningEffort, ResponseFormat, Role,
+    ServiceTier as ChatServiceTier, Stop, TopLogprobs,
 };
 use futures::StreamExt;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
 use super::super::guard::AbortGuard;
@@ -50,10 +56,96 @@ pub(super) fn routes() -> Router<Arc<AppState>> {
 }
 
 #[derive(Deserialize)]
+#[serde(try_from = "serde_json::Value")]
 struct ChatRequest {
-    #[serde(flatten)]
     request: CreateChatCompletionRequest,
     chat_template_kwargs: Option<ChatTemplateKwargs>,
+    continue_final_message: bool,
+    prompt_tools: serde_json::Value,
+}
+
+impl TryFrom<serde_json::Value> for ChatRequest {
+    type Error = String;
+
+    fn try_from(mut raw: serde_json::Value) -> Result<Self, Self::Error> {
+        use super::template::{normalize_prompt_tools, python_bool};
+        use serde_json::Value;
+
+        if !raw.is_object() {
+            return Err("chat request must be a JSON object".into());
+        }
+        let continue_final_message = raw
+            .get("continue_final_message")
+            .map(python_bool)
+            .transpose()?
+            .unwrap_or(false);
+        let chat_template_kwargs = serde_json::from_value(
+            raw.get("chat_template_kwargs")
+                .cloned()
+                .unwrap_or(Value::Null),
+        )
+        .map_err(|error| error.to_string())?;
+        let prompt_tools = normalize_prompt_tools(raw.get("tools").unwrap_or(&Value::Null))?
+            .unwrap_or(Value::Null);
+        if let (Some(raw_tools), Some(tools)) = (
+            raw.get_mut("tools").and_then(Value::as_array_mut),
+            prompt_tools.as_array(),
+        ) {
+            for (raw_tool, tool) in raw_tools.iter_mut().zip(tools) {
+                // The protocol's constraint/parser view only represents function
+                // tools. Keep Python's original type and field presence in the
+                // separate prompt value; do not add defaults to the typed view.
+                raw_tool["type"] = serde_json::json!("function");
+                if raw_tool["function"].get("strict").is_some() {
+                    raw_tool["function"]["strict"] = tool["function"]["strict"].clone();
+                }
+            }
+        }
+        let request = serde_json::from_value(raw).map_err(|error| error.to_string())?;
+        Ok(Self {
+            request,
+            chat_template_kwargs,
+            continue_final_message,
+            prompt_tools,
+        })
+    }
+}
+
+/// Match Python's direct OpenAI handler before generic Jinja rendering. A
+/// trailing plain-text assistant message becomes a user turn by default; when
+/// continuation is requested it is instead removed and returned for separate
+/// tokenization after the rendered prompt.
+fn prepare_final_assistant(
+    request: &mut CreateChatCompletionRequest,
+    continue_final_message: bool,
+    content_arrays: bool,
+) -> Option<String> {
+    let text = match request.messages.last() {
+        Some(ChatCompletionRequestMessage::Assistant(message)) => match message.content.as_ref() {
+            Some(ChatCompletionRequestAssistantMessageContent::Text(text)) => text.clone(),
+            Some(ChatCompletionRequestAssistantMessageContent::Array(parts)) if !content_arrays => {
+                join_assistant_text_parts(parts)?
+            }
+            None => String::new(),
+            _ => return None,
+        },
+        _ => return None,
+    };
+
+    if continue_final_message {
+        request.messages.pop();
+        Some(text)
+    } else {
+        *request
+            .messages
+            .last_mut()
+            .expect("trailing assistant message exists") =
+            ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage {
+                content: ChatCompletionRequestUserMessageContent::Text(text),
+                name: None,
+            });
+        None
+    }
 }
 
 async fn chat_completions(
@@ -63,6 +155,8 @@ async fn chat_completions(
     let ChatRequest {
         request,
         chat_template_kwargs,
+        continue_final_message,
+        prompt_tools,
     } = match body {
         Ok(Json(request)) => request,
         Err(rejection) => {
@@ -152,11 +246,50 @@ async fn chat_completions(
     });
     let tools_slice = tools.as_deref().unwrap_or_default();
 
-    let (request, prompt) =
-        match prepare_chat_request(&state, request, chat_template_kwargs.as_ref()).await {
-            Ok(prepared) => prepared,
-            Err(response) => return response,
-        };
+    let mut request = request;
+    let continuation_prefix = if let Some(formatter @ ChatFormatter::HuggingFace(_)) =
+        state.chat_formatter.as_ref()
+    {
+        // Python validates assistant tool arguments before a trailing assistant
+        // can be removed or converted to a user message.
+        for message in &request.messages {
+            if let ChatCompletionRequestMessage::Assistant(message) = message {
+                for call in message.tool_calls.iter().flatten() {
+                    if let Err(error) = serde_json::from_str::<
+                        serde_json::Map<String, serde_json::Value>,
+                    >(&call.function.arguments)
+                    {
+                        return openai_error(
+                            StatusCode::BAD_REQUEST,
+                            format!("assistant tool call arguments must be a JSON object: {error}"),
+                            false,
+                        );
+                    }
+                }
+            }
+        }
+        prepare_final_assistant(
+            &mut request,
+            continue_final_message,
+            formatter.requires_content_arrays(),
+        )
+    } else {
+        None
+    };
+    if request.messages.is_empty() {
+        return openai_error(StatusCode::BAD_REQUEST, "messages cannot be empty", false);
+    }
+    let (request, prompt) = match prepare_chat_request(
+        &state,
+        request,
+        chat_template_kwargs.as_ref(),
+        Some(&prompt_tools),
+    )
+    .await
+    {
+        Ok(prepared) => prepared,
+        Err(response) => return response,
+    };
 
     let sampling = match chat_sampling(
         &request,
@@ -209,6 +342,9 @@ async fn chat_completions(
         let native = GenerateRequest {
             rid: rid.clone(),
             text: Some(choice_prompt),
+            append_text: continuation_prefix
+                .clone()
+                .filter(|prefix| !prefix.is_empty()),
             // Rendered templates own their special tokens — the pool must not
             // add another BOS/EOS (Python's `add_special_tokens=False`).
             skip_special_tokens: true,
@@ -269,10 +405,100 @@ async fn chat_completions(
 /// formatter or a render failure to the standard 400. The rendered prompt is
 /// submitted as text — the tokenizer pool encodes it (with
 /// `skip_special_tokens`, since the template owns its special tokens).
+fn join_text_parts<'a>(parts: impl IntoIterator<Item = Option<&'a str>>) -> Option<String> {
+    Some(parts.into_iter().collect::<Option<Vec<_>>>()?.join(" "))
+}
+
+fn join_assistant_text_parts(
+    parts: &[ChatCompletionRequestAssistantMessageContentPart],
+) -> Option<String> {
+    join_text_parts(parts.iter().map(|part| match part {
+        ChatCompletionRequestAssistantMessageContentPart::Text(text) => Some(text.text.as_str()),
+        _ => None,
+    }))
+}
+
+// The pinned Dynamo protocol re-exports the developer content enum, but not
+// its one-variant text-part enum. Inspect only those typed parts; keep the
+// whole message history out of the serialization path.
+fn join_serialized_text_parts<T: Serialize>(parts: &[T]) -> Option<String> {
+    let parts = serde_json::to_value(parts).ok()?;
+    let texts = parts
+        .as_array()?
+        .iter()
+        .map(|part| part.get("text")?.as_str().map(str::to_owned))
+        .collect::<Option<Vec<_>>>()?;
+    Some(texts.join(" "))
+}
+
+fn normalize_text_message_content(messages: &mut [ChatCompletionRequestMessage]) {
+    for message in messages {
+        match message {
+            ChatCompletionRequestMessage::Developer(message) => {
+                if let ChatCompletionRequestDeveloperMessageContent::Array(parts) = &message.content
+                    && let Some(text) = join_serialized_text_parts(parts)
+                {
+                    message.content = ChatCompletionRequestDeveloperMessageContent::Text(text);
+                }
+            }
+            ChatCompletionRequestMessage::System(message) => {
+                if let ChatCompletionRequestSystemMessageContent::Array(parts) = &message.content
+                    && let Some(text) = join_text_parts(parts.iter().map(|part| match part {
+                        ChatCompletionRequestSystemMessageContentPart::Text(text) => {
+                            Some(text.text.as_str())
+                        }
+                    }))
+                {
+                    message.content = ChatCompletionRequestSystemMessageContent::Text(text);
+                }
+            }
+            ChatCompletionRequestMessage::User(message) => {
+                if let ChatCompletionRequestUserMessageContent::Array(parts) = &message.content
+                    && let Some(text) = join_text_parts(parts.iter().map(|part| match part {
+                        ChatCompletionRequestUserMessageContentPart::Text(text) => {
+                            Some(text.text.as_str())
+                        }
+                        _ => None,
+                    }))
+                {
+                    message.content = ChatCompletionRequestUserMessageContent::Text(text);
+                }
+            }
+            ChatCompletionRequestMessage::Assistant(message) => {
+                if message.content.is_none() {
+                    message.content = Some(ChatCompletionRequestAssistantMessageContent::Text(
+                        String::new(),
+                    ));
+                } else if let Some(ChatCompletionRequestAssistantMessageContent::Array(parts)) =
+                    &message.content
+                    && let Some(text) = join_assistant_text_parts(parts)
+                {
+                    message.content =
+                        Some(ChatCompletionRequestAssistantMessageContent::Text(text));
+                }
+            }
+            ChatCompletionRequestMessage::Tool(message) => {
+                if let ChatCompletionRequestToolMessageContent::Array(parts) = &message.content
+                    && let Some(text) = join_text_parts(parts.iter().map(|part| match part {
+                        ChatCompletionRequestToolMessageContentPart::Text(text) => {
+                            Some(text.text.as_str())
+                        }
+                        _ => None,
+                    }))
+                {
+                    message.content = ChatCompletionRequestToolMessageContent::Text(text);
+                }
+            }
+            ChatCompletionRequestMessage::Function(_) => {}
+        }
+    }
+}
+
 pub(super) async fn prepare_chat_request(
     state: &AppState,
     mut request: CreateChatCompletionRequest,
     kwargs: Option<&ChatTemplateKwargs>,
+    prompt_tools: Option<&serde_json::Value>,
 ) -> Result<(CreateChatCompletionRequest, String), Response> {
     let Some(formatter) = state.chat_formatter.clone() else {
         return Err(openai_error(
@@ -281,18 +507,77 @@ pub(super) async fn prepare_chat_request(
             false,
         ));
     };
+    // Python flattens text parts before Jinja rendering, independently of tool
+    // selection and template kwargs. Array-content and native formats retain
+    // their own content representation.
+    let mut derived_kwargs = None;
+    let mut prompt_messages = None;
+    let qwen3_jinja = state
+        .server_args
+        .model_config
+        .model_type
+        .as_deref()
+        .is_some_and(|model_type| model_type.to_ascii_lowercase().starts_with("qwen3"));
+    if matches!(formatter, ChatFormatter::HuggingFace(_)) {
+        if !formatter.requires_content_arrays() {
+            normalize_text_message_content(&mut request.messages);
+            let mut messages =
+                serde_json::to_value(&request.messages).expect("chat messages serialize");
+            if qwen3_jinja {
+                // Python parses retained assistant tool-call argument strings
+                // before rendering the selected Qwen Jinja profile. Keep this
+                // prompt-only view separate from typed parser/constraint data.
+                for message in messages.as_array_mut().expect("messages are an array") {
+                    if let Some(calls) = message
+                        .get_mut("tool_calls")
+                        .and_then(serde_json::Value::as_array_mut)
+                    {
+                        for call in calls {
+                            let arguments = &mut call["function"]["arguments"];
+                            if let Some(raw) = arguments.as_str()
+                                && let Ok(serde_json::Value::Object(parsed)) =
+                                    serde_json::from_str::<serde_json::Value>(raw)
+                            {
+                                *arguments = serde_json::Value::Object(parsed);
+                            }
+                        }
+                    }
+                }
+            }
+            // Serialize the prepared view once into MiniJinja's ordered values.
+            // Keep the typed request untouched for parser/constraint handling.
+            prompt_messages = Some(minijinja::Value::from_serialize(&messages));
+        }
+        if let Some(effort) = &request.reasoning_effort {
+            let mut extra = kwargs.cloned().unwrap_or_default();
+            extra
+                .entry("reasoning_effort".into())
+                .or_insert_with(|| serde_json::json!(effort));
+            let thinking = *effort != ReasoningEffort::None;
+            extra
+                .entry("thinking".into())
+                .or_insert(serde_json::json!(thinking));
+            extra
+                .entry("enable_thinking".into())
+                .or_insert(serde_json::json!(thinking));
+            derived_kwargs = Some(extra);
+        }
+    }
+    let kwargs = derived_kwargs.as_ref().or(kwargs);
     // Template stops first, then the request's own — Python
     // `_apply_conversation_template` (`conv.stop_str` + `request.stop`). A
     // token-id stop cannot be merged into the string list (Python has no such
     // field), so it is kept alone.
     merge_template_stops(&mut request, &formatter);
-    let prompt = formatter.render(&request, kwargs).map_err(|error| {
-        openai_error(
-            StatusCode::BAD_REQUEST,
-            format!("chat template render failed: {error}"),
-            false,
-        )
-    })?;
+    let prompt = formatter
+        .render_with_tools(&request, kwargs, prompt_tools, prompt_messages.as_ref())
+        .map_err(|error| {
+            openai_error(
+                StatusCode::BAD_REQUEST,
+                format!("chat template render failed: {error}"),
+                false,
+            )
+        })?;
     Ok((request, prompt))
 }
 
@@ -869,346 +1154,4 @@ pub(super) fn chat_logprobs(extras: Option<&ChunkExtras>) -> ChatChoiceLogprobs 
 }
 
 #[cfg(test)]
-mod tests {
-    use super::super::test_utils::{chat_submitted, chunk, senders};
-    use super::{
-        SamplingDefaults, chat_event_stream, chat_logprobs, chat_sampling_params,
-        merge_template_stops, unary_chat,
-    };
-    use crate::api_server::guard::AbortGuard;
-    use crate::message::config::DefaultSamplingParams;
-    use crate::message::response::ChunkExtras;
-    use axum::http::StatusCode;
-    use dynamo_protocols::types::{CreateChatCompletionRequest, Stop};
-    use futures::StreamExt;
-
-    fn request() -> CreateChatCompletionRequest {
-        serde_json::from_value(serde_json::json!({
-            "model": "test",
-            "messages": [{"role": "user", "content": "hi"}]
-        }))
-        .unwrap()
-    }
-
-    /// Python `to_sampling_params` priority: user value > model generation
-    /// config (`--sampling-defaults model`) > OpenAI terminal default.
-    #[test]
-    fn sampling_defaults_follow_python_priority_chain() {
-        let model = DefaultSamplingParams {
-            temperature: Some(0.6),
-            top_p: Some(0.9),
-            ..Default::default()
-        };
-        // Omitted → model defaults, not the 1.0 OpenAI terminals.
-        let sampling = chat_sampling_params(
-            &request(),
-            &SamplingDefaults::CHAT.with_model_defaults(&model),
-        )
-        .unwrap();
-        assert_eq!(sampling.temperature, 0.6);
-        assert_eq!(sampling.top_p, 0.9);
-        // Explicit request values win. `Option<f32>` loses precision in f64 —
-        // compare with tolerance.
-        let mut request = request();
-        request.temperature = Some(0.2);
-        request.top_p = Some(0.5);
-        let sampling = chat_sampling_params(
-            &request,
-            &SamplingDefaults::CHAT.with_model_defaults(&model),
-        )
-        .unwrap();
-        assert!((sampling.temperature - 0.2).abs() < 1e-6);
-        assert!((sampling.top_p - 0.5).abs() < 1e-6);
-    }
-
-    /// `--sampling-defaults openai` resolves an empty model-config slice, so the
-    /// conversion falls back to the OpenAI terminal defaults.
-    #[test]
-    fn sampling_defaults_fall_back_to_openai_terminals_in_openai_mode() {
-        let openai_mode = DefaultSamplingParams::default();
-        let sampling = chat_sampling_params(
-            &request(),
-            &SamplingDefaults::CHAT.with_model_defaults(&openai_mode),
-        )
-        .unwrap();
-        assert_eq!(sampling.temperature, 1.0);
-        assert_eq!(sampling.top_p, 1.0);
-    }
-
-    /// Python `_apply_conversation_template`: template `stop_str` first, then
-    /// the request's own stops.
-    #[test]
-    fn template_stops_merge_before_request_stops() {
-        let chatml = super::super::template::builtin_template("chatml").unwrap();
-        let formatter = super::super::ChatFormatter::Legacy(Box::new(
-            super::super::template::LegacyFormatter { spec: chatml },
-        ));
-        assert_eq!(
-            formatter.stop_strs(),
-            Some(crate::message::types::OneOrMany::Many(vec![
-                "<|endoftext|>".into(),
-                "<|im_end|>".into()
-            ]))
-        );
-        // No request stop → the template's delimiters alone.
-        let mut req = request();
-        merge_template_stops(&mut req, &formatter);
-        assert_eq!(
-            req.stop,
-            Some(Stop::StringArray(vec![
-                "<|endoftext|>".into(),
-                "<|im_end|>".into()
-            ]))
-        );
-        // A string request stop appends as one entry.
-        let mut req = request();
-        req.stop = Some(Stop::String("<stop>".into()));
-        merge_template_stops(&mut req, &formatter);
-        assert_eq!(
-            req.stop,
-            Some(Stop::StringArray(vec![
-                "<|endoftext|>".into(),
-                "<|im_end|>".into(),
-                "<stop>".into()
-            ]))
-        );
-        // A list request stop extends the list.
-        let mut req = request();
-        req.stop = Some(Stop::StringArray(vec!["a".into(), "b".into()]));
-        merge_template_stops(&mut req, &formatter);
-        assert_eq!(
-            req.stop,
-            Some(Stop::StringArray(vec![
-                "<|endoftext|>".into(),
-                "<|im_end|>".into(),
-                "a".into(),
-                "b".into()
-            ]))
-        );
-        // Token-id stops cannot be merged (Python has no such field) — kept alone.
-        let mut req = request();
-        req.stop = Some(Stop::TokenIdArray(vec![2, 3]));
-        merge_template_stops(&mut req, &formatter);
-        assert_eq!(req.stop, Some(Stop::TokenIdArray(vec![2, 3])));
-    }
-
-    /// The HuggingFace renderer carries no template stops (Python's jinja path
-    /// keeps only the request's stops), so the request is left unchanged.
-    #[test]
-    fn huggingface_formatter_leaves_request_stops_alone() {
-        let mut req = request();
-        req.stop = Some(Stop::String("x".into()));
-        // A prompt formatter is not constructible here without a tokenizer; the
-        // empty-legacy-spec twin proves the merge is formatter-gated, and the
-        // `HuggingFace` arm returns `None` by construction (see `stop_strs`).
-        let legacy = super::super::ChatFormatter::Legacy(Box::new(
-            super::super::template::LegacyFormatter {
-                spec: super::super::template::LegacySpec::default(),
-            },
-        ));
-        assert!(legacy.stop_strs().is_none());
-        merge_template_stops(&mut req, &legacy);
-        assert_eq!(req.stop, Some(Stop::String("x".into())));
-    }
-
-    /// A request with no `max_tokens`/`max_completion_tokens` stays unbounded —
-    /// no terminal default is imposed.
-    #[test]
-    fn chat_without_a_token_limit_stays_unbounded() {
-        let request: CreateChatCompletionRequest = serde_json::from_value(serde_json::json!({
-            "model": "test",
-            "messages": [{"role": "user", "content": "hello"}]
-        }))
-        .unwrap();
-        assert_eq!(
-            chat_sampling_params(&request, &SamplingDefaults::CHAT)
-                .unwrap()
-                .max_new_tokens,
-            None
-        );
-    }
-
-    #[test]
-    fn chat_logprobs_use_dynamo_wire_types() {
-        let extras = ChunkExtras {
-            out_lp_val: vec![-0.25],
-            out_lp_idx: vec![7],
-            out_lp_txt: vec!["x".into()],
-            out_top_val: vec![-0.25, -1.0],
-            out_top_idx: vec![7, 8],
-            out_top_lens: vec![2],
-            out_top_txt: vec!["x".into(), "y".into()],
-            ..Default::default()
-        };
-        let logprobs = chat_logprobs(Some(&extras));
-        let token = &logprobs.content.unwrap()[0];
-        assert_eq!(token.token, "x");
-        assert_eq!(token.token_id, Some(7));
-        assert_eq!(token.top_logprobs.len(), 2);
-        assert_eq!(token.top_logprobs[1].token, "y");
-    }
-
-    #[tokio::test]
-    async fn unary_chat_fans_in_choices_and_usage() {
-        let (choice0, tx0) = chat_submitted(0, "r0");
-        let (choice1, tx1) = chat_submitted(1, "r1");
-        tx0.send(chunk("r0", "Paris", true)).await.unwrap();
-        tx1.send(chunk("r1", "Paris", true)).await.unwrap();
-
-        let response = unary_chat(
-            vec![choice0, choice1],
-            AbortGuard::new_empty(senders()),
-            "chatcmpl-test".into(),
-            "model".into(),
-            1,
-            false,
-            None,
-            None,
-            None,
-            true,
-            None,
-        )
-        .await;
-        assert_eq!(response.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
-            .await
-            .unwrap();
-        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(value["choices"][0]["message"]["role"], "assistant");
-        assert_eq!(value["choices"][0]["message"]["content"], "Paris");
-        assert_eq!(value["choices"][1]["index"], 1);
-        assert_eq!(value["usage"]["prompt_tokens"], 5);
-        assert_eq!(value["usage"]["completion_tokens"], 2);
-    }
-
-    #[tokio::test]
-    async fn unary_chat_separates_reasoning_content_with_parser_configured() {
-        let (choice, tx) = chat_submitted(0, "r0");
-        tx.send(chunk(
-            "r0",
-            "<think>because Paris is famous</think>Paris",
-            true,
-        ))
-        .await
-        .unwrap();
-
-        let response = unary_chat(
-            vec![choice],
-            AbortGuard::new_empty(senders()),
-            "chatcmpl-test".into(),
-            "model".into(),
-            1,
-            false,
-            None,
-            Some("deepseek-r1".into()),
-            None,
-            true,
-            None,
-        )
-        .await;
-        assert_eq!(response.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
-            .await
-            .unwrap();
-        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(
-            value["choices"][0]["message"]["reasoning_content"],
-            "because Paris is famous"
-        );
-        assert_eq!(value["choices"][0]["message"]["content"], "Paris");
-        assert!(value["choices"][0]["message"]["reasoning_content"].is_string());
-    }
-
-    #[tokio::test]
-    async fn streaming_chat_separates_reasoning_into_own_deltas() {
-        let (choice, tx) = chat_submitted(0, "r0");
-        // Force mode starts in reasoning, so the opener is stripped and the first
-        // reasoning fragment streams immediately.
-        tx.send(chunk("r0", "<think>be", false)).await.unwrap();
-        tx.send(chunk("r0", "cause</think>Par", false))
-            .await
-            .unwrap();
-        tx.send(chunk("r0", "is", true)).await.unwrap();
-
-        let stream = chat_event_stream(
-            vec![choice],
-            AbortGuard::new_empty(senders()),
-            "chatcmpl-test".into(),
-            "model".into(),
-            1,
-            false,
-            true,
-            None,
-            Some("deepseek-r1".into()),
-            false,
-            None,
-            None,
-            false,
-            true,
-            None,
-        );
-        futures::pin_mut!(stream);
-        let frames: Vec<String> = stream.collect().await;
-        let role: serde_json::Value = serde_json::from_str(&frames[0]).unwrap();
-        let first_reasoning: serde_json::Value = serde_json::from_str(&frames[1]).unwrap();
-        let second_reasoning: serde_json::Value = serde_json::from_str(&frames[2]).unwrap();
-        let content: serde_json::Value = serde_json::from_str(&frames[3]).unwrap();
-        let terminal: serde_json::Value = serde_json::from_str(&frames[4]).unwrap();
-        assert_eq!(role["choices"][0]["delta"]["role"], "assistant");
-        assert_eq!(
-            first_reasoning["choices"][0]["delta"]["reasoning_content"],
-            "be"
-        );
-        assert!(first_reasoning["choices"][0]["delta"]["content"].is_null());
-        assert_eq!(
-            second_reasoning["choices"][0]["delta"]["reasoning_content"],
-            "cause"
-        );
-        assert_eq!(content["choices"][0]["delta"]["content"], "Par");
-        assert!(content["choices"][0]["delta"]["reasoning_content"].is_null());
-        assert_eq!(terminal["choices"][0]["delta"]["content"], "is");
-        assert_eq!(terminal["choices"][0]["finish_reason"], "stop");
-        assert_eq!(frames.len(), 7);
-    }
-
-    #[tokio::test]
-    async fn streaming_chat_emits_role_deltas_usage_and_done() {
-        let (choice, tx) = chat_submitted(0, "r0");
-        tx.send(chunk("r0", "Par", false)).await.unwrap();
-        tx.send(chunk("r0", "is", true)).await.unwrap();
-
-        let stream = chat_event_stream(
-            vec![choice],
-            AbortGuard::new_empty(senders()),
-            "chatcmpl-test".into(),
-            "model".into(),
-            1,
-            false,
-            true,
-            None,
-            None,
-            false,
-            None,
-            None,
-            false,
-            true,
-            None,
-        );
-        futures::pin_mut!(stream);
-        let frames: Vec<String> = stream.collect().await;
-        assert_eq!(frames.len(), 5);
-        let role: serde_json::Value = serde_json::from_str(&frames[0]).unwrap();
-        let delta: serde_json::Value = serde_json::from_str(&frames[1]).unwrap();
-        let terminal: serde_json::Value = serde_json::from_str(&frames[2]).unwrap();
-        let usage: serde_json::Value = serde_json::from_str(&frames[3]).unwrap();
-        assert_eq!(role["choices"][0]["delta"]["role"], "assistant");
-        assert!(role["choices"][0]["delta"]["reasoning_content"].is_null());
-        assert_eq!(delta["choices"][0]["delta"]["content"], "Par");
-        assert!(delta["choices"][0]["delta"]["reasoning_content"].is_null());
-        assert_eq!(terminal["choices"][0]["delta"]["content"], "is");
-        assert!(terminal["choices"][0]["delta"]["reasoning_content"].is_null());
-        assert_eq!(terminal["choices"][0]["finish_reason"], "stop");
-        assert_eq!(usage["usage"]["completion_tokens"], 2);
-        assert_eq!(frames[4], "[DONE]");
-    }
-}
+mod tests;
