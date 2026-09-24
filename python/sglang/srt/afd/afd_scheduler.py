@@ -11,6 +11,7 @@ import torch
 from sglang.srt.afd.afd_config import AFDRole, is_afd_attn_moe_scattered
 from sglang.srt.afd.afd_handshake import (
     AFDGraphCapturePlan,
+    AFDGraphCaptureVariant,
     AFDHandshakeResult,
     build_afd_graph_capture_plan,
     run_handshake_attn,
@@ -22,6 +23,7 @@ from sglang.srt.afd.dispatcher import (
     get_afd_dispatcher,
     select_token_bucket,
     set_afd_dispatcher,
+    split_afd_batch_size,
 )
 from sglang.srt.afd.layers import collect_afd_moe_layers
 from sglang.srt.afd.scheduler_common import (
@@ -85,6 +87,7 @@ class AFDSyncSender:
         tokens_per_rank: list[int],
         forward_mode: ForwardMode,
         wire_capacity: int,
+        child_wire_capacities: tuple[int, ...] = (),
     ) -> None:
         if self._pending is not None:
             raise RuntimeError("AFD control message from the previous batch is pending")
@@ -93,6 +96,7 @@ class AFDSyncSender:
             tokens_per_rank=tokens_per_rank,
             forward_mode=int(forward_mode),
             wire_capacity=wire_capacity,
+            child_wire_capacities=child_wire_capacities,
         )
 
     def send_prepared(self, communication_graph: bool) -> None:
@@ -174,7 +178,35 @@ def _effective_forward_mode(
     return ForwardMode.IDLE
 
 
+def _select_child_wire_capacities(
+    tokens_per_rank: Sequence[int],
+    token_buckets: Sequence[int],
+    num_microbatches: int,
+    *,
+    scattered: bool,
+) -> tuple[int, ...]:
+    logical_batch_sizes = [num_tokens for num_tokens in tokens_per_rank]
+    if any(batch_size < num_microbatches for batch_size in logical_batch_sizes):
+        return ()
+    per_rank_child_sizes = [
+        tuple(
+            child_batch_size
+            for child_batch_size in split_afd_batch_size(batch_size, num_microbatches)
+        )
+        for batch_size in logical_batch_sizes
+    ]
+    return tuple(
+        select_token_bucket(
+            token_buckets,
+            max(child_sizes) if scattered else sum(child_sizes),
+        )
+        for child_sizes in zip(*per_rank_child_sizes, strict=True)
+    )
+
+
 def prepare_afd_attn_batch(scheduler: Scheduler, batch: ScheduleBatch) -> None:
+    dispatcher = get_afd_dispatcher()
+    model_runner = scheduler.tp_worker.model_runner
     num_attn_ranks = scheduler.afd_handshake.local.num_ranks
     tokens_per_rank = _tokens_per_rank(batch, num_attn_ranks)
     forward_mode = _effective_forward_mode(batch, tokens_per_rank)
@@ -205,10 +237,58 @@ def prepare_afd_attn_batch(scheduler: Scheduler, batch: ScheduleBatch) -> None:
         control_wire_capacity = (
             max(tokens_per_rank, default=0) if scattered else wire_capacity
         )
-    step_id = get_afd_dispatcher().begin_batch(
+    child_wire_capacities: tuple[int, ...] = ()
+    parent_graph_variant: Optional[AFDGraphCaptureVariant] = None
+    num_microbatches = get_disagg().afd_decode_num_microbatches
+    fixed_shape_decode = forward_mode.is_decode()
+    # A captured parent bucket owns its child topology. Low-load DP ranks mask
+    # padded children; only the eager fallback requires nonempty children.
+    # Without padding, the runner requires an exact logical batch-size match.
+    if num_microbatches > 1 and fixed_shape_decode and batch.can_run_decode_cuda_graph:
+        graph_variant = dispatcher.select_graph_variant(minimum_wire_capacity)
+        if (
+            graph_variant is not None
+            and len(graph_variant.child_wire_capacities) == num_microbatches
+            and (
+                not get_exec().graph.disable_cuda_graph_padding
+                or graph_variant.attn_batch_size
+                == model_runner.afd_cuda_graph_batch_size
+            )
+        ):
+            parent_graph_variant = graph_variant
+            child_wire_capacities = graph_variant.child_wire_capacities
+
+    can_split_eager = (
+        num_microbatches > 1
+        and fixed_shape_decode
+        and all(num_tokens >= num_microbatches for num_tokens in tokens_per_rank)
+    )
+    eager_child_wire_capacities = (
+        _select_child_wire_capacities(
+            tokens_per_rank,
+            scheduler.afd_handshake.local.decode_token_buckets,
+            num_microbatches,
+            scattered=scattered,
+        )
+        if can_split_eager
+        else ()
+    )
+    if not child_wire_capacities:
+        child_wire_capacities = eager_child_wire_capacities
+    uses_microbatch_overlap = len(child_wire_capacities) > 1
+    if uses_microbatch_overlap:
+        wire_capacity = sum(child_wire_capacities)
+        control_wire_capacity = wire_capacity
+    else:
+        child_wire_capacities = ()
+        parent_graph_variant = None
+
+    step_id = dispatcher.begin_batch(
         forward_mode=forward_mode,
         dp_capacity=dp_capacity,
         wire_capacity=wire_capacity,
+        child_wire_capacities=child_wire_capacities,
+        graph_variant=parent_graph_variant,
     )
     if scheduler._afd_sync_sender is not None:
         scheduler._afd_sync_sender.prepare_for_batch(
@@ -216,6 +296,7 @@ def prepare_afd_attn_batch(scheduler: Scheduler, batch: ScheduleBatch) -> None:
             tokens_per_rank=tokens_per_rank,
             forward_mode=forward_mode,
             wire_capacity=control_wire_capacity,
+            child_wire_capacities=child_wire_capacities,
         )
 
 
@@ -245,6 +326,7 @@ def init_afd_attn(
         dtype=model_runner.dtype,
         device=torch.device(backend.config.device),
         scattered=handshake.local.afd_ffn_moe_backend == "deepep",
+        num_slots=handshake.local.decode_num_microbatches,
     )
     set_afd_dispatcher(dispatcher)
     _capture_afd_attn_communication_graphs(

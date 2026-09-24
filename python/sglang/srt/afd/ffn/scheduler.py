@@ -145,9 +145,9 @@ def event_loop_afd_ffn(scheduler: Scheduler) -> None:
     compute.configure_staged_capacity(capacity_plan)
     plan = build_afd_graph_capture_plan(handshake)
     backend = init_afd_comm_backend(scheduler, AFDRole.FFN, handshake)
+    executor = AFDFFNExecutor(scheduler, backend, compute, handshake)
     if not plan.enabled:
         compute.capture_compute_graphs()
-    executor = AFDFFNExecutor(scheduler, backend, compute, handshake)
     executor.capture_communication_graphs(plan)
 
     receiver = None

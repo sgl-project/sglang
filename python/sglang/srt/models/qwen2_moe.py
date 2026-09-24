@@ -1146,7 +1146,20 @@ class Qwen2MoeModel(nn.Module):
             positions = cp_split_and_rebuild_position(forward_batch, positions)
 
         aux_hidden_states = []
-        if forward_batch.can_run_tbo:
+        if forward_batch.can_run_afd_microbatch_overlap:
+            from sglang.srt.afd.microbatch_overlap import (
+                model_forward_afd_microbatch,
+            )
+
+            hidden_states, residual = model_forward_afd_microbatch(
+                layers=self.layers,
+                start_layer=self.start_layer,
+                end_layer=self.end_layer,
+                forward_batch=forward_batch,
+                hidden_states=hidden_states,
+                residual=residual,
+            )
+        elif forward_batch.can_run_tbo:
             hidden_states, residual = model_forward_maybe_tbo(
                 layers=self.layers,
                 enable_tbo=True,

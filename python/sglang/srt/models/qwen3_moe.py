@@ -19,6 +19,7 @@
 
 import logging
 import math
+from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Optional, Tuple, TypeVar
 
 import torch
@@ -26,6 +27,7 @@ from torch import nn
 from transformers import PretrainedConfig
 
 from sglang.srt.afd.afd_config import is_afd_attn_moe_scattered
+from sglang.srt.afd.layers import AFDDispatchHandle
 from sglang.srt.distributed import (
     get_pp_group,
     moe_expert_parallel_all_reduce,
@@ -105,6 +107,14 @@ _is_npu = is_npu()
 
 if _is_npu:
     from sgl_kernel_npu.norm.split_qkv_rmsnorm_rope import split_qkv_rmsnorm_rope
+
+
+@dataclass(frozen=True)
+class _Qwen3AFDLayerPending:
+    handle: AFDDispatchHandle
+    residual: Optional[torch.Tensor]
+    should_allreduce_fusion: bool
+    use_reduce_scatter: bool
 
 
 def compute_yarn_parameters(
@@ -333,7 +343,18 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         router_logits, _ = self.gate(hidden_states)
         topk_output = self.topk(hidden_states, router_logits)
         final_hidden_states = self.experts(hidden_states, topk_output)
+        return self.finalize_experts(
+            final_hidden_states,
+            num_tokens,
+            hidden_dim,
+        )
 
+    def finalize_experts(
+        self,
+        final_hidden_states: torch.Tensor,
+        num_tokens: int,
+        hidden_dim: int,
+    ) -> torch.Tensor:
         if self.ep_size > 1 and not should_skip_post_experts_all_reduce(
             is_tp_path=False
         ):
@@ -858,6 +879,84 @@ class Qwen3MoeDecoderLayer(nn.Module):
                 hidden_states, residual, forward_batch
             )
 
+        return hidden_states, residual
+
+    def forward_afd_microbatch_launch(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+        residual: Optional[torch.Tensor],
+    ) -> _Qwen3AFDLayerPending:
+        hidden_states, residual = (
+            self.layer_communicator.prepare_attn_and_capture_last_layer_outputs(
+                hidden_states,
+                residual,
+                forward_batch,
+                captured_last_layer_outputs=None,
+            )
+        )
+
+        if hidden_states.shape[0] != 0:
+            hidden_states = self.self_attn(
+                positions=positions,
+                hidden_states=hidden_states,
+                forward_batch=forward_batch,
+            )
+
+        hidden_states, residual = self.layer_communicator.prepare_mlp(
+            hidden_states, residual, forward_batch
+        )
+        should_allreduce_fusion = (
+            self.layer_communicator.should_fuse_mlp_allreduce_with_next_layer(
+                forward_batch
+            )
+        )
+        use_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
+            forward_batch
+        )
+
+        hidden_dim = hidden_states.shape[1]
+        hidden_states = hidden_states.view(-1, hidden_dim)
+        router_logits, _ = self.mlp.gate(hidden_states)
+        topk_output = self.mlp.topk(
+            hidden_states,
+            router_logits,
+            num_token_non_padded=(
+                forward_batch.num_token_non_padded
+                if is_afd_attn_moe_scattered()
+                else None
+            ),
+        )
+
+        return _Qwen3AFDLayerPending(
+            handle=self.mlp.experts.dispatch_afd(hidden_states, topk_output),
+            residual=residual,
+            should_allreduce_fusion=should_allreduce_fusion,
+            use_reduce_scatter=use_reduce_scatter,
+        )
+
+    def forward_afd_microbatch_finish(
+        self,
+        pending: _Qwen3AFDLayerPending,
+        forward_batch: ForwardBatch,
+    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+        input_tokens = pending.handle.input_tokens
+        hidden_states = self.mlp.experts.combine_afd(pending.handle)
+        with get_forward().scoped(
+            fuse_mlp_allreduce=pending.should_allreduce_fusion,
+            mlp_reduce_scatter=pending.use_reduce_scatter,
+        ):
+            hidden_states = self.mlp.finalize_experts(
+                hidden_states, input_tokens, hidden_states.shape[1]
+            )
+        residual = pending.residual
+        if pending.should_allreduce_fusion:
+            hidden_states._sglang_needs_allreduce_fusion = True
+        else:
+            hidden_states, residual = self.layer_communicator.postprocess_layer(
+                hidden_states, residual, forward_batch
+            )
         return hidden_states, residual
 
     def op_comm_prepare_attn(

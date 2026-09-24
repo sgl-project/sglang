@@ -599,6 +599,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     tbo_padded_len: Optional[int] = None
     tbo_children: Optional[List[ForwardBatch]] = None
 
+    # For AFD fixed-depth decode microbatch overlap
+    afd_microbatch_children: Optional[List[ForwardBatch]] = None
+
     attn_cp_metadata: Optional[ContextParallelMetadata] = None
 
     # For decode context parallel.
@@ -1795,6 +1798,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     @property
     def can_run_tbo(self):
         return self.tbo_split_seq_index is not None
+
+    @property
+    def can_run_afd_microbatch_overlap(self):
+        return self.afd_microbatch_children is not None
 
 
 def enable_num_token_non_padded():

@@ -69,6 +69,10 @@ def build_local_handshake_info(scheduler: Scheduler, role: AFDRole) -> AFDHandsh
         decode_token_buckets=decode_token_buckets,
         decode_graph_token_buckets=decode_graph_token_buckets,
         disable_cuda_graph_padding=get_exec().graph.disable_cuda_graph_padding,
+        decode_num_microbatches=(
+            get_disagg().afd_decode_num_microbatches if role.is_attn() else 1
+        ),
+        afd_comm_sm_budget=get_disagg().afd_comm_sm_budget,
         moe_layers=[
             {
                 "layer_id": layer.layer_id,

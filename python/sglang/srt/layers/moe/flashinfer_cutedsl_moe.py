@@ -7,6 +7,8 @@ from flashinfer import (
 )
 from flashinfer.cute_dsl.blockscaled_gemm import grouped_gemm_nt_masked
 
+from sglang.srt.layers.compute_sm import get_compute_num_sms
+
 
 def get_cute_dtype(input: torch.Tensor) -> str:
     if input.dtype == torch.bfloat16:
@@ -147,6 +149,10 @@ def flashinfer_cutedsl_moe_masked(
     sf_dtype = "float8_e4m3fn"
     c_dtype = "bfloat16"
 
+    num_sms = get_compute_num_sms()
+    if down_sm_count is None:
+        down_sm_count = num_sms
+
     # Gemm1
     grouped_gemm_nt_masked(
         (a_q, a_q_sf),
@@ -159,6 +165,7 @@ def flashinfer_cutedsl_moe_masked(
         sf_vec_size=sf_vec_size,
         alpha=w1_alpha.view(1, 1, num_experts),
         alpha_dtype=get_cute_dtype(w1_alpha),
+        **(dict(sm_count=num_sms) if num_sms is not None else {}),
     )  # in logical [m, n, l]
 
     # Activation + NVFP4 quantization of the GEMM2 input.

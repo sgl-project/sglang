@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import logging
 from contextlib import contextmanager, nullcontext
+from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
 import torch
@@ -37,6 +38,7 @@ from sglang.kernels.ops.quantization.fp8_kernel import (
     create_per_token_group_quant_fp8_output_scale,
 )
 from sglang.srt.afd.afd_config import is_afd_attn_moe_scattered
+from sglang.srt.afd.layers import AFDDispatchHandle
 from sglang.srt.batch_overlap.single_batch_overlap import SboFlags, compute_overlap_args
 from sglang.srt.batch_overlap.two_batch_overlap import (
     MaybeTboDeepEPDispatcher,
@@ -97,7 +99,10 @@ from sglang.srt.layers.linear import (
     ReplicatedLinear,
     RowParallelLinear,
 )
-from sglang.srt.layers.logits_processor import LogitsProcessor
+from sglang.srt.layers.logits_processor import (
+    LogitsProcessor,
+    get_in_autotune_dummy_run,
+)
 from sglang.srt.layers.moe import (
     get_moe_a2a_backend,
     get_moe_runner_backend,
@@ -574,6 +579,21 @@ class MoEGate(nn.Module):
         return logits
 
 
+@dataclass(frozen=True)
+class DeepseekAFDMoEPending:
+    handle: AFDDispatchHandle
+    shared_output: Optional[torch.Tensor]
+    use_reduce_scatter: bool
+    should_allreduce_fusion: bool
+
+
+@dataclass(frozen=True)
+class _DeepseekV2AFDLayerPending:
+    moe: DeepseekAFDMoEPending
+    residual: Optional[torch.Tensor]
+    topk_indices: Optional[torch.Tensor]
+
+
 class DeepseekV2MoE(nn.Module):
     def __init__(
         self,
@@ -894,6 +914,73 @@ class DeepseekV2MoE(nn.Module):
             )
         ]
 
+    def launch_afd_experts(
+        self,
+        hidden_states: torch.Tensor,
+        *,
+        num_token_non_padded: Optional[torch.Tensor],
+        use_reduce_scatter: bool,
+        input_ids_global: Optional[torch.Tensor],
+        skip_shared_experts: bool,
+        gemm_output_zero_allocator: Optional[BumpAllocator] = None,
+        should_allreduce_fusion: bool = False,
+    ) -> DeepseekAFDMoEPending:
+        router_logits = self.gate(hidden_states, gemm_output_zero_allocator)
+        topk_kwargs = (
+            {"input_ids": input_ids_global} if getattr(self, "is_hash", False) else {}
+        )
+        topk_output = self.topk(
+            hidden_states,
+            router_logits,
+            num_token_non_padded=num_token_non_padded,
+            **topk_kwargs,
+        )
+        handle = self.experts.dispatch_afd(hidden_states, topk_output)
+
+        shared_output = None
+        # Run shared experts after remote dispatch so their GEMMs overlap F-side
+        # work. This also consumes the DP buffer before the next child reuses it.
+        if (
+            hasattr(self, "shared_experts")
+            and not self._fuse_shared_experts_inside_sbo
+            and not skip_shared_experts
+        ):
+            shared_output = self._forward_shared_experts(
+                hidden_states, gemm_output_zero_allocator
+            )
+
+        return DeepseekAFDMoEPending(
+            handle=handle,
+            shared_output=shared_output,
+            use_reduce_scatter=use_reduce_scatter,
+            should_allreduce_fusion=should_allreduce_fusion,
+        )
+
+    def finish_afd_experts(
+        self,
+        pending: DeepseekAFDMoEPending,
+    ) -> torch.Tensor:
+        final_hidden_states = self.experts.combine_afd(pending.handle)
+        final_hidden_states = maybe_fuse_routed_scale_and_shared_add(
+            self.experts,
+            final_hidden_states,
+            None if self._shared_expert_tp1 else pending.shared_output,
+            self.routed_scaling_factor,
+        )
+        with get_forward().scoped(
+            mlp_reduce_scatter=pending.use_reduce_scatter,
+            fuse_mlp_allreduce=pending.should_allreduce_fusion,
+        ):
+            if self.tp_size > 1 and not should_skip_post_experts_all_reduce(
+                is_tp_path=True
+            ):
+                final_hidden_states = tensor_model_parallel_all_reduce(
+                    final_hidden_states
+                )
+        if pending.shared_output is not None and self._shared_expert_tp1:
+            final_hidden_states += pending.shared_output
+        return final_hidden_states
+
     def _can_dual_stream_graph(self, hidden_states: torch.Tensor) -> bool:
         return (
             _enable_pcg_dsv2_dual_stream
@@ -927,6 +1014,29 @@ class DeepseekV2MoE(nn.Module):
                 hidden_states,
                 forward_batch,
                 input_ids_global=input_ids_global,
+            )
+
+        if (
+            get_moe_a2a_backend().is_afd_attn()
+            and forward_batch is not None
+            and forward_batch.forward_mode.is_decode()
+            and hidden_states.shape[0] > 0
+            and not get_in_autotune_dummy_run()
+        ):
+            return self.finish_afd_experts(
+                self.launch_afd_experts(
+                    hidden_states,
+                    num_token_non_padded=(
+                        forward_batch.num_token_non_padded
+                        if is_afd_attn_moe_scattered()
+                        else None
+                    ),
+                    use_reduce_scatter=get_forward().mlp_reduce_scatter,
+                    input_ids_global=input_ids_global,
+                    skip_shared_experts=skip_shared_experts,
+                    gemm_output_zero_allocator=gemm_output_zero_allocator,
+                    should_allreduce_fusion=get_forward().fuse_mlp_allreduce,
+                )
             )
 
         if not self._enable_a2a_moe:
@@ -2602,6 +2712,79 @@ class DeepseekV2DecoderLayer(nn.Module):
 
         return hidden_states, residual, topk_indices
 
+    def forward_afd_microbatch_launch(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+        residual: Optional[torch.Tensor],
+        zero_allocator: BumpAllocator,
+        gemm_output_zero_allocator: Optional[BumpAllocator],
+        prev_topk_indices: Optional[torch.Tensor],
+    ) -> _DeepseekV2AFDLayerPending:
+        hidden_states, residual = (
+            self.layer_communicator.prepare_attn_and_capture_last_layer_outputs(
+                hidden_states,
+                residual,
+                forward_batch,
+                captured_last_layer_outputs=None,
+                quant_format=getattr(self, "_gfx95_quant_format", ""),
+            )
+        )
+
+        hidden_states = self.self_attn(
+            positions=positions,
+            hidden_states=hidden_states,
+            forward_batch=forward_batch,
+            zero_allocator=zero_allocator,
+            layer_scatter_modes=self.layer_scatter_modes,
+            prev_topk_indices=prev_topk_indices,
+        )
+        if isinstance(hidden_states, tuple):
+            hidden_states, topk_indices = hidden_states
+        else:
+            topk_indices = None
+        get_attn_tp_context().clear_attn_inputs()
+
+        hidden_states, residual = self.layer_communicator.prepare_mlp(
+            hidden_states, residual, forward_batch
+        )
+        use_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
+            forward_batch
+        )
+
+        return _DeepseekV2AFDLayerPending(
+            moe=self.mlp.launch_afd_experts(
+                hidden_states,
+                num_token_non_padded=(
+                    forward_batch.num_token_non_padded
+                    if is_afd_attn_moe_scattered()
+                    else None
+                ),
+                use_reduce_scatter=use_reduce_scatter,
+                input_ids_global=None,
+                skip_shared_experts=False,
+                gemm_output_zero_allocator=gemm_output_zero_allocator,
+            ),
+            residual=residual,
+            topk_indices=topk_indices,
+        )
+
+    def forward_afd_microbatch_finish(
+        self,
+        pending: _DeepseekV2AFDLayerPending,
+        forward_batch: ForwardBatch,
+    ) -> tuple[
+        torch.Tensor,
+        Optional[torch.Tensor],
+        Optional[torch.Tensor],
+    ]:
+        hidden_states = self.mlp.finish_afd_experts(pending.moe)
+        hidden_states, residual = self.layer_communicator.postprocess_layer(
+            hidden_states, pending.residual, forward_batch
+        )
+        return hidden_states, residual, pending.topk_indices
+
     def op_comm_prepare_attn(
         self,
         state,
@@ -2819,6 +3002,81 @@ class DeepseekV2Model(nn.Module):
         backend = getattr(backend, "primary", backend)
         return not getattr(backend, "use_mha", False)
 
+    def _forward_afd_microbatch(
+        self,
+        hidden_states: torch.Tensor,
+        residual: Optional[torch.Tensor],
+        forward_batch: ForwardBatch,
+        zero_allocator: BumpAllocator,
+        gemm_output_zero_allocator: Optional[BumpAllocator],
+    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+        from sglang.srt.afd.microbatch_overlap import (
+            run_afd_microbatch_serial_layers,
+            run_afd_microbatch_wavefront,
+        )
+
+        children = forward_batch.afd_microbatch_children
+        child_states = [
+            (
+                hidden_states[slice(*child.tbo_parent_token_range)],
+                None
+                if residual is None
+                else residual[slice(*child.tbo_parent_token_range)],
+                None,
+            )
+            for child in children
+        ]
+
+        def forward_child_layer(layer, child, state, _child_index):
+            child_hidden_states, child_residual, child_topk_indices = state
+            return layer(
+                child.positions,
+                child_hidden_states,
+                child,
+                child_residual,
+                zero_allocator,
+                gemm_output_zero_allocator,
+                prev_topk_indices=child_topk_indices,
+            )
+
+        moe_start_layer = max(self.start_layer, self.first_k_dense_replace)
+        child_states = run_afd_microbatch_serial_layers(
+            layers=self.layers,
+            start_layer=self.start_layer,
+            end_layer=moe_start_layer,
+            forward_batch=forward_batch,
+            child_states=child_states,
+            forward_child_layer=forward_child_layer,
+        )
+
+        def launch_child_layer(layer, child, state, _child_index):
+            child_hidden_states, child_residual, child_topk_indices = state
+            return layer.forward_afd_microbatch_launch(
+                child.positions,
+                child_hidden_states,
+                child,
+                child_residual,
+                zero_allocator,
+                gemm_output_zero_allocator,
+                child_topk_indices,
+            )
+
+        def finish_child_layer(layer, child, pending, _child_index):
+            return layer.forward_afd_microbatch_finish(pending, child)
+
+        child_states = run_afd_microbatch_wavefront(
+            layers=self.layers,
+            start_layer=moe_start_layer,
+            end_layer=self.end_layer,
+            forward_batch=forward_batch,
+            child_states=child_states,
+            launch_child_layer=launch_child_layer,
+            finish_child_layer=finish_child_layer,
+        )
+        child_residuals = [state[1] for state in child_states]
+        residual = None if child_residuals[0] is None else torch.cat(child_residuals)
+        return torch.cat([state[0] for state in child_states]), residual
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -2855,8 +3113,15 @@ class DeepseekV2Model(nn.Module):
                 "topk_indices from the previous stage."
             )
         device = hidden_states.device
+        afd_microbatch_count = (
+            len(forward_batch.afd_microbatch_children)
+            if forward_batch.can_run_afd_microbatch_overlap
+            else 1
+        )
         zero_allocator = BumpAllocator(
-            buffer_size=total_num_layers * 2 * (2 if forward_batch.can_run_tbo else 1),
+            buffer_size=total_num_layers
+            * 2
+            * (2 if forward_batch.can_run_tbo else afd_microbatch_count),
             dtype=torch.float32,
             device=device,
         )
@@ -2867,7 +3132,7 @@ class DeepseekV2Model(nn.Module):
 
         gemm_output_zero_allocator = (
             BumpAllocator(
-                buffer_size=self.gemm_output_zero_allocator_size,
+                buffer_size=self.gemm_output_zero_allocator_size * afd_microbatch_count,
                 dtype=torch.float32,
                 device=device,
             )
@@ -2911,46 +3176,55 @@ class DeepseekV2Model(nn.Module):
                 normal_end_layer = normal_start_layer = 0
         # Append-compatible, so the shared capture path below is unchanged.
         aux_hidden_states = AuxHiddenStatePacker(len(self.layers_to_capture))
-        for i in range(normal_start_layer, normal_end_layer):
-            # NOTE: torch dynamo does not support graph break in context manager
-            ctx = (
-                nullcontext()
-                if check_cuda_graph_backend(Phase.PREFILL, Backend.TC_PIECEWISE)
-                else get_global_expert_distribution_recorder().with_current_layer(i)
+        if forward_batch.can_run_afd_microbatch_overlap:
+            hidden_states, residual = self._forward_afd_microbatch(
+                hidden_states,
+                residual,
+                forward_batch,
+                zero_allocator,
+                gemm_output_zero_allocator,
             )
-            with ctx:
-                layer = self.layers[i]
-                hidden_states, residual, topk_indices = layer(
-                    positions,
-                    hidden_states,
-                    forward_batch,
-                    residual,
-                    zero_allocator,
-                    gemm_output_zero_allocator,
-                    llama_4_scaling,
-                    prev_topk_indices=index_topk_share.topk_indices,
-                    captured_last_layer_outputs=(
-                        aux_hidden_states if i in self.layers_to_capture else None
-                    ),
-                    next_full_attention_layer_id=self.next_full_attention_layer_id.get(
-                        i
-                    ),
+        else:
+            for i in range(normal_start_layer, normal_end_layer):
+                # NOTE: torch dynamo does not support graph break in context manager
+                ctx = (
+                    nullcontext()
+                    if check_cuda_graph_backend(Phase.PREFILL, Backend.TC_PIECEWISE)
+                    else get_global_expert_distribution_recorder().with_current_layer(i)
                 )
-                index_topk_share.update(topk_indices)
+                with ctx:
+                    layer = self.layers[i]
+                    hidden_states, residual, topk_indices = layer(
+                        positions,
+                        hidden_states,
+                        forward_batch,
+                        residual,
+                        zero_allocator,
+                        gemm_output_zero_allocator,
+                        llama_4_scaling,
+                        prev_topk_indices=index_topk_share.topk_indices,
+                        captured_last_layer_outputs=(
+                            aux_hidden_states if i in self.layers_to_capture else None
+                        ),
+                        next_full_attention_layer_id=self.next_full_attention_layer_id.get(
+                            i
+                        ),
+                    )
+                    index_topk_share.update(topk_indices)
 
-        if normal_end_layer != self.end_layer:
-            hidden_states, residual = model_forward_maybe_tbo(
-                layers=self.layers[normal_end_layer : self.end_layer],
-                enable_tbo=True,
-                positions=positions,
-                forward_batch=forward_batch,
-                hidden_states=hidden_states,
-                residual=residual,
-                input_data_scatter_mode=self.layers[
-                    normal_end_layer - 1
-                ].layer_scatter_modes.layer_output_mode,
-                zero_allocator=zero_allocator,
-            )
+            if normal_end_layer != self.end_layer:
+                hidden_states, residual = model_forward_maybe_tbo(
+                    layers=self.layers[normal_end_layer : self.end_layer],
+                    enable_tbo=True,
+                    positions=positions,
+                    forward_batch=forward_batch,
+                    hidden_states=hidden_states,
+                    residual=residual,
+                    input_data_scatter_mode=self.layers[
+                        normal_end_layer - 1
+                    ].layer_scatter_modes.layer_output_mode,
+                    zero_allocator=zero_allocator,
+                )
 
         if not self.pp_group.is_last_rank:
             proxy_tensors = {

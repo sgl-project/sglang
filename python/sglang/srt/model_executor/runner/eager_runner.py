@@ -58,6 +58,7 @@ from sglang.srt.model_executor.runner_utils import (
     maybe_publish_prefill_shared_read_done,
 )
 from sglang.srt.runtime_context import (
+    get_disagg,
     get_parallel,
     get_spec,
     mamba_extra_buffer_enabled,
@@ -250,6 +251,11 @@ class EagerRunner(BaseRunner):
         attn_backend, pdmux_ctx = self._resolve_decode_pdmux()
         if not enable_pdmux:
             forward_batch = self.load_batch(forward_batch, pp_proxy_tensors)
+        if (
+            get_disagg().afd_decode_num_microbatches > 1
+            and not model_runner.is_draft_worker
+        ):
+            attn_backend.prepare_forward_batch(forward_batch)
         if forward_batch.needs_forward_metadata_init():
             if hasattr(model_runner.model, "prepare_forward_batch"):
                 # Prepare model-specific attention metadata before planning,
@@ -450,6 +456,11 @@ class EagerRunner(BaseRunner):
         if forward_batch.batch_size > 0:
             if not self.enable_pdmux:
                 forward_batch = self.load_batch(forward_batch, pp_proxy_tensors)
+            if (
+                get_disagg().afd_decode_num_microbatches > 1
+                and not model_runner.is_draft_worker
+            ):
+                model_runner.attn_backend.prepare_forward_batch(forward_batch)
             model_runner.attn_backend.init_forward_metadata(forward_batch)
         else:
             model_runner.attn_backend.forward_metadata = None

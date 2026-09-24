@@ -3313,6 +3313,21 @@ class ServerArgs:
         "The AFD data-plane backend for transferring routed expert tensors.",
         NS("disagg"),
     ] = "nccl"
+    afd_decode_num_microbatches: A[
+        int,
+        "Number of AFD decode microbatches. Qwen3 and DeepSeek V3/V3.2/V4 "
+        "currently support 1, 2, or 3.",
+        NS("disagg"),
+    ] = 1
+    afd_comm_sm_budget: A[
+        Optional[int],
+        Arg(
+            help="F-side SM budget reserved for NCCL communication during AFD "
+            "decode microbatch overlap. Defaults to 8.",
+            resolvable=True,
+        ),
+        NS("disagg"),
+    ] = None
     afd_ffn_moe_backend: A[str, Arg(no_cli=True, resolvable=True), NS("disagg")] = (
         "none"
     )

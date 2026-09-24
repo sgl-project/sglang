@@ -5,6 +5,7 @@ import functools
 import logging
 import time
 from contextlib import contextmanager, nullcontext
+from dataclasses import dataclass
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -16,6 +17,7 @@ from typing import (
     Set,
     Tuple,
     Union,
+    cast,
 )
 
 import torch
@@ -1891,6 +1893,33 @@ class MQALayer(MqaAttentionBase):
         )
 
 
+@dataclass(frozen=True)
+class _DeepseekV4MoEContext:
+    use_cp: bool
+    use_tp_moe_gather: bool
+    use_reduce_scatterv: bool
+    use_reduce_scatter: bool
+    shared_local: Optional[torch.Tensor]
+    a2a_scatter_chunks: Optional[List[torch.Tensor]]
+
+
+@dataclass(frozen=True)
+class _DeepseekV4AFDChildState:
+    hidden_states: torch.Tensor
+    prev_residual: Optional[torch.Tensor]
+    prev_post: Optional[torch.Tensor]
+    prev_comb: Optional[torch.Tensor]
+
+
+@dataclass(frozen=True)
+class _DeepseekV4AFDLayerPending:
+    moe: deepseek_v2.DeepseekAFDMoEPending
+    context: _DeepseekV4MoEContext
+    residual: torch.Tensor
+    post: torch.Tensor
+    comb: torch.Tensor
+
+
 class DeepseekV4DecoderLayer(nn.Module):
     def __init__(
         self,
@@ -2208,11 +2237,16 @@ class DeepseekV4DecoderLayer(nn.Module):
         prev_residual: Optional[torch.Tensor] = None,
         prev_post: Optional[torch.Tensor] = None,
         prev_comb: Optional[torch.Tensor] = None,
-    ) -> Tuple[
-        torch.Tensor,
-        Optional[torch.Tensor],
-        Optional[torch.Tensor],
-        Optional[torch.Tensor],
+        *,
+        _afd_microbatch_launch: bool = False,
+    ) -> Union[
+        Tuple[
+            torch.Tensor,
+            Optional[torch.Tensor],
+            Optional[torch.Tensor],
+            Optional[torch.Tensor],
+        ],
+        _DeepseekV4AFDLayerPending,
     ]:
         use_fused = self.use_fused_mhc_post_pre
 
@@ -2368,12 +2402,23 @@ class DeepseekV4DecoderLayer(nn.Module):
             if not norm_fused:
                 hidden_states = self.post_attention_layernorm(hidden_states)
 
-        hidden_states = self._run_moe_ffn_dp_sync(
+        moe_output = self._run_moe_ffn_dp_sync(
             hidden_states,
             forward_batch,
             input_ids=input_ids,
             input_ids_global=input_ids_global,
+            afd_microbatch_launch=_afd_microbatch_launch,
         )
+        if _afd_microbatch_launch:
+            moe, context = moe_output
+            return _DeepseekV4AFDLayerPending(
+                moe=moe,
+                context=context,
+                residual=residual,
+                post=post,
+                comb=comb,
+            )
+        hidden_states = cast(torch.Tensor, moe_output)
 
         if not use_fused:
             hidden_states = self.hc_post(hidden_states, residual, post, comb)
@@ -2390,7 +2435,10 @@ class DeepseekV4DecoderLayer(nn.Module):
         *,
         input_ids: torch.Tensor,
         input_ids_global: torch.Tensor,
-    ) -> torch.Tensor:
+        afd_microbatch_launch: bool = False,
+    ) -> Union[
+        torch.Tensor, Tuple[deepseek_v2.DeepseekAFDMoEPending, _DeepseekV4MoEContext]
+    ]:
         _use_cp = self.dsa_enable_prefill_cp and dsa_use_prefill_cp(forward_batch)
         _use_tp_moe_gather = (
             not _use_cp
@@ -2487,6 +2535,32 @@ class DeepseekV4DecoderLayer(nn.Module):
             hidden_states = _a2a_scatter_chunks[r].contiguous()
             input_ids = input_ids.tensor_split(s)[r].contiguous()
             input_ids_global = input_ids_global.tensor_split(s)[r].contiguous()
+        context = _DeepseekV4MoEContext(
+            use_cp=_use_cp,
+            use_tp_moe_gather=_use_tp_moe_gather,
+            use_reduce_scatterv=_use_reduce_scatterv,
+            use_reduce_scatter=_use_reduce_scatter,
+            shared_local=_shared_local,
+            a2a_scatter_chunks=_a2a_scatter_chunks,
+        )
+        if afd_microbatch_launch:
+            return (
+                self.mlp.launch_afd_experts(
+                    hidden_states,
+                    num_token_non_padded=(
+                        forward_batch.num_token_non_padded
+                        if is_afd_attn_moe_scattered()
+                        else None
+                    ),
+                    use_reduce_scatter=(
+                        _use_cp or _use_reduce_scatterv or _use_reduce_scatter
+                    ),
+                    input_ids_global=input_ids_global,
+                    skip_shared_experts=_do_shared_local,
+                ),
+                context,
+            )
+
         # Skip the MoE-internal post-experts all_reduce when we will do the
         # reduce via reduce_scatterv/reduce_scatter at the combine below
         # (else double-reduce).
@@ -2498,6 +2572,22 @@ class DeepseekV4DecoderLayer(nn.Module):
                 input_ids_global=input_ids_global,
                 skip_shared_experts=_do_shared_local,
             )
+        return self._finish_moe_ffn_dp_sync(hidden_states, forward_batch, context)
+
+    def _finish_moe_ffn_dp_sync(
+        self,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+        context: _DeepseekV4MoEContext,
+    ) -> torch.Tensor:
+        _use_cp = context.use_cp
+        _use_tp_moe_gather = context.use_tp_moe_gather
+        _use_reduce_scatterv = context.use_reduce_scatterv
+        _use_reduce_scatter = context.use_reduce_scatter
+        _shared_local = context.shared_local
+        _a2a_scatter_chunks = context.a2a_scatter_chunks
+        _use_tp_attn_a2a_scatter = _a2a_scatter_chunks is not None
+
         if _use_cp and get_moe_a2a_backend().is_none():
             hidden_states = dsa_cp_reduce_scatter_hidden_states(hidden_states)
         elif _use_tp_moe_gather:
@@ -2865,6 +2955,49 @@ class DeepseekV4DecoderLayer(nn.Module):
         state.pop("cp_combine_keepalive")
         state.hidden_states_mlp_output = state.pop("local_out")
 
+    def forward_afd_microbatch_launch(
+        self,
+        child: ForwardBatch,
+        state: _DeepseekV4AFDChildState,
+        input_ids_global: torch.Tensor,
+    ) -> _DeepseekV4AFDLayerPending:
+        return cast(
+            _DeepseekV4AFDLayerPending,
+            self.forward(
+                child.positions,
+                state.hidden_states,
+                child.input_ids,
+                child,
+                input_ids_global,
+                state.prev_residual,
+                state.prev_post,
+                state.prev_comb,
+                _afd_microbatch_launch=True,
+            ),
+        )
+
+    def forward_afd_microbatch_finish(
+        self,
+        child: ForwardBatch,
+        pending: _DeepseekV4AFDLayerPending,
+    ) -> _DeepseekV4AFDChildState:
+        hidden_states = self.mlp.finish_afd_experts(pending.moe)
+        hidden_states = self._finish_moe_ffn_dp_sync(
+            hidden_states,
+            child,
+            pending.context,
+        )
+        residual, post, comb = pending.residual, pending.post, pending.comb
+        if not self.use_fused_mhc_post_pre:
+            hidden_states = self.hc_post(hidden_states, residual, post, comb)
+            residual, post, comb = None, None, None
+        return _DeepseekV4AFDChildState(
+            hidden_states=hidden_states,
+            prev_residual=residual,
+            prev_post=post,
+            prev_comb=comb,
+        )
+
 
 class DeepseekV4Model(nn.Module):
     fall_back_to_pt_during_load = False
@@ -3225,6 +3358,84 @@ class DeepseekV4Model(nn.Module):
         )
         return hidden_states
 
+    def _forward_afd_microbatch(
+        self,
+        hidden_states: torch.Tensor,
+        input_ids_global: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ) -> torch.Tensor:
+        from sglang.srt.afd.microbatch_overlap import (
+            run_afd_microbatch_wavefront,
+        )
+
+        children = forward_batch.afd_microbatch_children
+        if is_afd_attn_moe_scattered():
+            child_input_ids_global = [
+                input_ids_global[slice(*child.tbo_parent_token_range)]
+                for child in children
+            ]
+        else:
+            rank_input_ids = input_ids_global.split(forward_batch.global_num_tokens_cpu)
+            rank_offsets = [0] * len(rank_input_ids)
+            child_input_ids_global = []
+            for child in children:
+                child_parts = []
+                for rank_index, (rank_ids, child_size) in enumerate(
+                    zip(rank_input_ids, child.global_num_tokens_cpu, strict=True)
+                ):
+                    start = rank_offsets[rank_index]
+                    end = start + child_size
+                    child_parts.append(rank_ids[start:end])
+                    rank_offsets[rank_index] = end
+                child_input_ids_global.append(torch.cat(child_parts))
+
+        child_states = [
+            _DeepseekV4AFDChildState(
+                hidden_states=hidden_states[slice(*child.tbo_parent_token_range)],
+                prev_residual=None,
+                prev_post=None,
+                prev_comb=None,
+            )
+            for child in children
+        ]
+
+        def launch_child_layer(layer, child, state, child_index):
+            return layer.forward_afd_microbatch_launch(
+                child,
+                state,
+                child_input_ids_global[child_index],
+            )
+
+        def finish_child_layer(layer, child, pending, child_index):
+            state = layer.forward_afd_microbatch_finish(child, pending)
+            return state
+
+        child_states = run_afd_microbatch_wavefront(
+            layers=self.layers,
+            start_layer=self.start_layer,
+            end_layer=self.end_layer,
+            forward_batch=forward_batch,
+            child_states=child_states,
+            launch_child_layer=launch_child_layer,
+            finish_child_layer=finish_child_layer,
+        )
+
+        if self.use_fused_mhc_post_pre:
+            last_layer = self.layers[self.end_layer - 1]
+            child_hidden_states = [
+                last_layer.hc_post(
+                    state.hidden_states,
+                    state.prev_residual,
+                    state.prev_post,
+                    state.prev_comb,
+                )
+                for state in child_states
+            ]
+        else:
+            child_hidden_states = [state.hidden_states for state in child_states]
+
+        return torch.cat(child_hidden_states)
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -3291,7 +3502,11 @@ class DeepseekV4Model(nn.Module):
         for _attr in ("freqs_cis_c4", "freqs_cis_c128"):
             if hasattr(forward_batch, _attr):
                 delattr(forward_batch, _attr)
-        if run_tbo:
+        if forward_batch.can_run_afd_microbatch_overlap:
+            hidden_states = self._forward_afd_microbatch(
+                hidden_states, input_ids_global, forward_batch
+            )
+        elif run_tbo:
             # Two-batch-overlap prefill (EP / mori). Cross-layer mHC fusion is
             # disabled here (each layer self-contained), so no trailing hc_post.
             hidden_states = self._forward_layers_tbo(

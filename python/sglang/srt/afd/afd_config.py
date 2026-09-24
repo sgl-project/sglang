@@ -72,7 +72,10 @@ def check_afd_server_args(server_args: ServerArgs) -> None:
     """Resolve AFD roles and reject unsupported execution combinations."""
     cfg = resolving_view(server_args)
     role = afd_role_from_args(server_args)
+    _check_comm_sm_budget_args(server_args, role)
     if role is None:
+        if cfg.afd_decode_num_microbatches != 1:
+            raise ValueError("--afd-decode-num-microbatches requires --afd-role attn")
         if cfg.moe_a2a_backend == "afd":
             raise ValueError("--moe-a2a-backend afd requires --afd-role attn")
         return
@@ -80,6 +83,7 @@ def check_afd_server_args(server_args: ServerArgs) -> None:
     prepare_afd_ffn_moe_backend(server_args)
     _check_common_args(server_args)
     _configure_cuda_graph(server_args, role)
+    _check_decode_microbatch_args(server_args, role, cfg.afd_decode_num_microbatches)
     if role.is_attn():
         _check_attn_args(server_args)
     else:
@@ -269,3 +273,75 @@ def _check_ffn_args(server_args: ServerArgs) -> None:
         # would block forever waiting for a completion.
         logger.info("AFD ffn role: forcing skip_server_warmup=True")
         declare_resolution(server_args, "_check_ffn_args", skip_server_warmup=True)
+
+
+def _check_decode_microbatch_args(
+    server_args: ServerArgs,
+    role: AFDRole,
+    num_microbatches: int,
+) -> None:
+    cfg = resolving_view(server_args)
+    if num_microbatches == 1:
+        return
+    if not role.is_attn():
+        raise ValueError("--afd-decode-num-microbatches is an attn-side argument")
+    if num_microbatches not in (2, 3):
+        raise ValueError(
+            "--afd-decode-num-microbatches currently supports only 1, 2, or 3"
+        )
+    if not cfg.enable_dp_attention or cfg.dp_size <= 1:
+        raise ValueError(
+            "--afd-decode-num-microbatches greater than 1 requires DP attention with "
+            "--dp-size greater than 1"
+        )
+    if cfg.tp_size != cfg.dp_size:
+        raise ValueError(
+            "--afd-decode-num-microbatches greater than 1 currently requires "
+            "attention TP size 1 "
+            "(--tp must equal --dp-size)"
+        )
+    if cfg.enable_lora:
+        raise ValueError(
+            "--afd-decode-num-microbatches greater than 1 currently does not support LoRA"
+        )
+
+
+def _check_comm_sm_budget_args(
+    server_args: ServerArgs, role: Optional[AFDRole]
+) -> None:
+    cfg = resolving_view(server_args)
+    budget = cfg.afd_comm_sm_budget
+    if role is None:
+        if budget is not None:
+            raise ValueError("--afd-comm-sm-budget requires --afd-role ffn")
+        return
+    if role.is_attn():
+        declare_resolution(
+            server_args, "_check_comm_sm_budget_args", afd_comm_sm_budget=None
+        )
+        return
+    if budget is None:
+        declare_resolution(
+            server_args,
+            "_check_comm_sm_budget_args",
+            afd_comm_sm_budget=8,
+        )
+    elif budget <= 0:
+        raise ValueError("--afd-comm-sm-budget must be positive")
+
+
+def resolve_overlap_sm_partition(
+    *,
+    total_num_sms: int,
+    overlap_sm_budget: int,
+) -> tuple[int, int]:
+    communication_num_sms = overlap_sm_budget
+
+    compute_num_sms = total_num_sms - communication_num_sms
+    if compute_num_sms <= 0 or compute_num_sms % 2 != 0:
+        raise RuntimeError(
+            "AFD overlap requires a positive, even compute SM count: "
+            f"total={total_num_sms}, reserved={communication_num_sms}, "
+            f"compute={compute_num_sms}"
+        )
+    return compute_num_sms, communication_num_sms

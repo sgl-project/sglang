@@ -22,6 +22,7 @@ class AFDSyncMsg(msgspec.Struct, tag="sync", forbid_unknown_fields=True):
     wire_capacity: int
     # NCCL peers must both replay paired graphs or both execute eagerly.
     communication_graph: bool = False
+    child_wire_capacities: tuple[int, ...] = ()
 
 
 _sync_decoder = msgspec.msgpack.Decoder(AFDSyncMsg)

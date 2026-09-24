@@ -3,17 +3,25 @@
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Iterable, NamedTuple
 
 import torch
 
+from sglang.srt.afd.afd_config import resolve_overlap_sm_partition
 from sglang.srt.afd.afd_handshake import AFDGraphCapturePlan, AFDHandshakeResult
 from sglang.srt.afd.afd_sync import AFDSyncMsg
 from sglang.srt.afd.comm import AFDCommBackend
-from sglang.srt.afd.dispatcher import AFDFixedBufferPool, afd_work_generation
+from sglang.srt.afd.dispatcher import (
+    AFDFixedBufferPool,
+    AFDWorkHandle,
+    afd_work_generation,
+    is_afd_fixed_shape_mode,
+)
 from sglang.srt.afd.ffn.compute import AFDFFNCompute, _AFDFFNDecodeStepGraph
 from sglang.srt.afd.layers import AFDMoELayer
 from sglang.srt.distributed.parallel_state import graph_capture
+from sglang.srt.layers.compute_sm import compute_sm_budget
 from sglang.srt.layers.dp_attention import set_is_extend_in_batch
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.model_executor.runner.base_cuda_graph_runner import freeze_gc
@@ -46,6 +54,14 @@ def _prepare_source_segments(
     return tuple(segments)
 
 
+@dataclass(frozen=True)
+class _PreparedDecodeChild:
+    slot_id: int
+    source_segments: tuple[_SourceSegment, ...]
+    local_wire_capacity: int
+    staging_capacity: int
+
+
 class AFDFFNExecutor:
     """Receive AFD work, run experts, and return results."""
 
@@ -71,6 +87,22 @@ class AFDFFNExecutor:
             scattered=self._scattered,
         )
         self._decode_step_graph: _AFDFFNDecodeStepGraph | None = None
+        self._decode_num_microbatches = handshake.peer.decode_num_microbatches
+        staged_overlap = self._decode_num_microbatches > 1
+        self._communication_stream = (
+            torch.cuda.Stream(device=self._device) if staged_overlap else None
+        )
+        self._response_stream = self._communication_stream
+        self._request_ready = [
+            torch.cuda.Event()
+            for _ in range(self._decode_num_microbatches if staged_overlap else 0)
+        ]
+        self._response_ready = [
+            torch.cuda.Event()
+            for _ in range(self._decode_num_microbatches if staged_overlap else 0)
+        ]
+        self._compute_num_sms: int | None = None
+
         if compute.device != self._device:
             raise RuntimeError(
                 f"AFD ffn compute device {compute.device} does not match "
@@ -86,6 +118,29 @@ class AFDFFNExecutor:
                 f"tp_group={self._tp_group.rank_in_group}/"
                 f"{self._tp_group.world_size}"
             )
+
+        if self._decode_num_microbatches > 1:
+            overlap_sm_budget = handshake.local.afd_comm_sm_budget
+            assert overlap_sm_budget is not None
+            total_num_sms = torch.cuda.get_device_properties(
+                self._device
+            ).multi_processor_count
+            (
+                self._compute_num_sms,
+                communication_num_sms,
+            ) = resolve_overlap_sm_partition(
+                total_num_sms=total_num_sms,
+                overlap_sm_budget=overlap_sm_budget,
+            )
+            self._compute._graph_compute_num_sms = self._compute_num_sms
+            if self._rank == 0:
+                logger.info(
+                    "AFD ffn overlap SM partition: backend=%s compute=%d "
+                    "communication=%d",
+                    handshake.local.afd_backend,
+                    self._compute_num_sms,
+                    communication_num_sms,
+                )
 
         self._decode_edge_token_buckets = tuple(handshake.peer.decode_token_buckets)
         decode_token_buckets = self._decode_edge_token_buckets
@@ -104,7 +159,7 @@ class AFDFFNExecutor:
             device=self._device,
             role="ffn",
             with_router_logits=True,
-            num_slots=1,
+            num_slots=self._decode_num_microbatches,
         )
 
     def capture_communication_graphs(self, plan: AFDGraphCapturePlan) -> None:
@@ -174,6 +229,10 @@ class AFDFFNExecutor:
         wire_capacities: tuple[int, ...],
         compute_capacities: tuple[int, ...],
     ) -> None:
+        if len(wire_capacities) > 1:
+            children = self._prepare_decode_children_for_capacities(wire_capacities)
+            self._run_overlap_step(0, children, compute_capacities)
+            return
         edge_wire_capacity = wire_capacities[0]
         compute_capacity = compute_capacities[0]
         source_segments = self._decode_source_segments(edge_wire_capacity)
@@ -242,7 +301,6 @@ class AFDFFNExecutor:
         self._device_module.synchronize()
         self._tp_group.barrier()
 
-    @torch.inference_mode()
     def run_step(self, msg: AFDSyncMsg) -> None:
         dp_capacity = self._dp_capacity(msg)
         total_tokens = sum(msg.tokens_per_rank)
@@ -260,15 +318,15 @@ class AFDFFNExecutor:
                     f"AFD idle step has nonzero wire capacity {msg.wire_capacity}"
                 )
             return
-        if forward_mode.is_decode():
-            if msg.wire_capacity not in self._decode_edge_token_buckets:
-                raise RuntimeError(
-                    "AFD wire capacity is not a negotiated decode bucket: "
-                    f"{msg.wire_capacity}"
-                )
-            source_segments = self._decode_source_segments(msg.wire_capacity)
-        else:
-            source_segments = _prepare_source_segments(
+        fixed_shape = is_afd_fixed_shape_mode(forward_mode)
+        if msg.child_wire_capacities and not fixed_shape:
+            raise RuntimeError("AFD child plan requires DECODE")
+
+        decode_children = self._prepare_decode_children(msg) if fixed_shape else ()
+        source_segments = (
+            decode_children[0].source_segments
+            if len(decode_children) == 1
+            else _prepare_source_segments(
                 (
                     self._comm.config.attn_global_rank(attn_rank),
                     (
@@ -279,9 +337,16 @@ class AFDFFNExecutor:
                 )
                 for attn_rank in self._attn_ranks
             )
-        wire_capacity = sum(segment.capacity for segment in source_segments)
-        set_is_extend_in_batch(forward_mode.is_extend())
-        if forward_mode.is_decode():
+        )
+        wire_capacity = (
+            sum(child.local_wire_capacity for child in decode_children)
+            if decode_children
+            else sum(segment.capacity for segment in source_segments)
+        )
+        # Fixed-shape F execution is phase-neutral; capacity alone selects the
+        # paired graph for both FULL and SCATTERED layouts.
+        set_is_extend_in_batch(forward_mode.is_extend() and not fixed_shape)
+        if fixed_shape:
             if dp_capacity > wire_capacity:
                 raise RuntimeError(
                     f"AFD DP capacity {dp_capacity} exceeds wire capacity "
@@ -293,16 +358,40 @@ class AFDFFNExecutor:
                 f"dp={dp_capacity}, wire={wire_capacity}"
             )
 
-        if forward_mode.is_decode() and msg.communication_graph:
-            if self._decode_step_graph is not None and self._decode_step_graph.replay(
-                (msg.wire_capacity,)
-            ):
-                return
-            raise RuntimeError(
-                "AFD ffn has no communication graph for wire capacity "
-                f"{msg.wire_capacity}"
+        if len(decode_children) > 1:
+            child_wire_capacities = msg.child_wire_capacities or (msg.wire_capacity,)
+            with torch.inference_mode():
+                if msg.communication_graph:
+                    if (
+                        self._decode_step_graph is not None
+                        and self._decode_step_graph.replay(child_wire_capacities)
+                    ):
+                        return
+                    raise RuntimeError(
+                        "AFD ffn has no microbatch communication graph for child "
+                        f"wire capacities {child_wire_capacities}"
+                    )
+                self._run_overlap_step(msg.step_id, decode_children)
+            return
+
+        if fixed_shape and msg.communication_graph:
+            with torch.inference_mode():
+                if (
+                    self._decode_step_graph is not None
+                    and self._decode_step_graph.replay((msg.wire_capacity,))
+                ):
+                    return
+                raise RuntimeError(
+                    "AFD ffn has no communication graph for wire capacity "
+                    f"{msg.wire_capacity}"
+                )
+
+        with torch.inference_mode():
+            self._run_eager_step(
+                msg.step_id,
+                forward_mode,
+                source_segments,
             )
-        self._run_eager_step(msg.step_id, forward_mode, source_segments)
 
     def _run_eager_step(
         self,
@@ -367,6 +456,250 @@ class AFDFFNExecutor:
 
             if work is not None:
                 self._decode_pool.release(work)
+
+    def _prepare_decode_children(
+        self, msg: AFDSyncMsg
+    ) -> tuple[_PreparedDecodeChild, ...]:
+        forward_mode = ForwardMode(msg.forward_mode)
+        if not is_afd_fixed_shape_mode(forward_mode):
+            raise RuntimeError("AFD fixed-shape children require DECODE")
+        child_wire_capacities = msg.child_wire_capacities or (msg.wire_capacity,)
+        num_children = len(child_wire_capacities)
+        if msg.child_wire_capacities and num_children != self._decode_num_microbatches:
+            raise RuntimeError(
+                "AFD child plan does not match the configured microbatch count: "
+                f"children={num_children}, "
+                f"configured={self._decode_num_microbatches}"
+            )
+        children = self._prepare_decode_children_for_capacities(child_wire_capacities)
+        if msg.child_wire_capacities and (
+            sum(child_wire_capacities) != msg.wire_capacity
+        ):
+            raise RuntimeError(
+                "AFD child capacities do not match the parent wire "
+                f"capacity: children={child_wire_capacities}, "
+                f"parent={msg.wire_capacity}"
+            )
+        dp_capacity = self._dp_capacity(msg)
+        local_wire_capacity = sum(child.local_wire_capacity for child in children)
+        if dp_capacity > local_wire_capacity:
+            raise RuntimeError(
+                f"AFD DP capacity {dp_capacity} exceeds local wire capacity "
+                f"{local_wire_capacity}"
+            )
+        return children
+
+    def _prepare_decode_children_for_capacities(
+        self,
+        child_wire_capacities: tuple[int, ...],
+    ) -> tuple[_PreparedDecodeChild, ...]:
+        num_children = len(child_wire_capacities)
+        if num_children not in (1, self._decode_num_microbatches):
+            raise RuntimeError(
+                "AFD decode child count must be one or the configured "
+                f"microbatch count {self._decode_num_microbatches}, got "
+                f"{num_children}"
+            )
+        if any(capacity <= 0 for capacity in child_wire_capacities):
+            raise RuntimeError(
+                f"AFD decode child capacities must be positive: {child_wire_capacities}"
+            )
+        return tuple(
+            self._prepare_decode_child(wire_capacity, slot_id)
+            for slot_id, wire_capacity in enumerate(child_wire_capacities)
+        )
+
+    def _prepare_decode_child(
+        self, edge_wire_capacity: int, slot_id: int = 0
+    ) -> _PreparedDecodeChild:
+        if edge_wire_capacity not in self._decode_edge_token_buckets:
+            raise RuntimeError(
+                "AFD wire capacity is not a negotiated decode bucket: "
+                f"{edge_wire_capacity}"
+            )
+        source_segments = self._decode_source_segments(edge_wire_capacity)
+        source_count = len(source_segments)
+        return _PreparedDecodeChild(
+            slot_id=slot_id,
+            source_segments=source_segments,
+            local_wire_capacity=sum(segment.capacity for segment in source_segments),
+            staging_capacity=max(source_count, 1) * edge_wire_capacity,
+        )
+
+    def _enqueue_overlap_request(
+        self,
+        work: AFDWorkHandle,
+        layer_id: int,
+        child: _PreparedDecodeChild,
+        request_stream: torch.cuda.Stream,
+    ) -> None:
+        with torch.cuda.stream(request_stream):
+            self._recv_source_inputs(
+                child.source_segments,
+                work.hidden_states,
+                work.topk_ids,
+                work.topk_weights,
+            )
+            self._request_ready[child.slot_id].record(request_stream)
+
+    def _run_overlap_step(
+        self,
+        step_id: int,
+        children: tuple[_PreparedDecodeChild, ...],
+        child_compute_capacities: tuple[int, ...] | None = None,
+    ) -> None:
+        with compute_sm_budget(self._compute_num_sms):
+            self._run_overlap_step_impl(
+                step_id,
+                children,
+                child_compute_capacities,
+            )
+
+    def _run_overlap_step_impl(
+        self,
+        step_id: int,
+        children: tuple[_PreparedDecodeChild, ...],
+        child_compute_capacities: tuple[int, ...] | None = None,
+    ) -> None:
+        assert self._communication_stream is not None
+        assert self._response_stream is not None
+        compute_stream = torch.cuda.current_stream(self._device)
+        request_stream = self._communication_stream
+        response_stream = self._response_stream
+        request_stream.wait_stream(compute_stream)
+        num_children = len(children)
+        if num_children <= 1 or num_children != self._decode_num_microbatches:
+            raise RuntimeError(
+                "AFD overlap child count does not match the configured "
+                f"microbatch count: children={num_children}, "
+                f"configured={self._decode_num_microbatches}"
+            )
+        direct_integrated_inputs = tuple(
+            len(child.source_segments) == 1
+            and child_compute_capacities is not None
+            and child.local_wire_capacity <= child_compute_capacities[child_index]
+            for child_index, child in enumerate(children)
+        )
+        slot_work: list[AFDWorkHandle] = []
+
+        first_layer = self._layers[0]
+        for child_index, child in enumerate(children):
+            work_capacity = (
+                child_compute_capacities[child_index]
+                if direct_integrated_inputs[child_index]
+                else child.staging_capacity
+            )
+            work = self._decode_pool.acquire(
+                slot_id=child.slot_id,
+                layer_id=first_layer.layer_id,
+                generation=afd_work_generation(step_id, child_index),
+                capacity=work_capacity,
+                input_tokens=child.local_wire_capacity,
+            )
+            self._enqueue_overlap_request(
+                work,
+                first_layer.layer_id,
+                child,
+                request_stream,
+            )
+            slot_work.append(work)
+
+        for layer_index, layer in enumerate(self._layers):
+            for child_index in range(num_children):
+                work_index = layer_index * num_children + child_index
+                work = slot_work[child_index]
+                child = children[child_index]
+                compute_stream.wait_event(self._request_ready[child.slot_id])
+                if child_compute_capacities is None:
+                    if work.router_logits is None:
+                        raise RuntimeError("AFD ffn slot has no router logits buffer")
+                    output = self._compute.run(
+                        layer_index,
+                        work.hidden_states[: child.local_wire_capacity],
+                        work.topk_ids[: child.local_wire_capacity],
+                        work.topk_weights[: child.local_wire_capacity],
+                        work.router_logits[: child.local_wire_capacity],
+                        allow_graph=False,
+                        defer_output_scaling=True,
+                    )
+                else:
+                    direct_input = direct_integrated_inputs[child_index]
+                    compute_capacity = child_compute_capacities[child_index]
+                    input_capacity = (
+                        compute_capacity if direct_input else child.local_wire_capacity
+                    )
+                    output = self._compute.run_integrated_layer(
+                        layer_index,
+                        work.hidden_states[:input_capacity],
+                        work.topk_ids[:input_capacity],
+                        work.topk_weights[:input_capacity],
+                        child.local_wire_capacity,
+                        compute_capacity,
+                        defer_output_scaling=True,
+                        stage_inputs=not direct_input,
+                    )
+                self._response_ready[child.slot_id].record(compute_stream)
+                # Keep allocator-owned compute output alive until response
+                # staging on the response stream has consumed it.
+                output.record_stream(response_stream)
+                with torch.cuda.stream(response_stream):
+                    response_stream.wait_event(self._response_ready[child.slot_id])
+                    direct_output = (
+                        len(child.source_segments) == 1 and output.is_contiguous()
+                    )
+                    if direct_output:
+                        peer_global_rank, capacity, _ = child.source_segments[0]
+                        response_output = output[:capacity]
+                        self._compute.finalize_deferred_output_in_place(
+                            layer_index, response_output
+                        )
+                        self._comm.send_to(
+                            [response_output],
+                            peer_global_rank,
+                        )
+                    else:
+                        self._compute.stage_deferred_output(
+                            layer_index,
+                            work.output[: child.local_wire_capacity],
+                            output[: child.local_wire_capacity],
+                        )
+                        for (
+                            peer_global_rank,
+                            capacity,
+                            rows,
+                        ) in child.source_segments:
+                            self._comm.send_to(
+                                [work.output[rows]],
+                                peer_global_rank,
+                            )
+                self._decode_pool.release(work)
+
+                next_layer_index = layer_index + 1
+                if next_layer_index == len(self._layers):
+                    continue
+                next_layer = self._layers[next_layer_index]
+                next_work_index = work_index + num_children
+                next_work_capacity = (
+                    child_compute_capacities[child_index]
+                    if direct_integrated_inputs[child_index]
+                    else child.staging_capacity
+                )
+                next_work = self._decode_pool.acquire(
+                    slot_id=child.slot_id,
+                    layer_id=next_layer.layer_id,
+                    generation=afd_work_generation(step_id, next_work_index),
+                    capacity=next_work_capacity,
+                    input_tokens=child.local_wire_capacity,
+                )
+                self._enqueue_overlap_request(
+                    next_work,
+                    next_layer.layer_id,
+                    child,
+                    request_stream,
+                )
+                slot_work[child_index] = next_work
+
+        compute_stream.wait_stream(request_stream)
 
     def _dp_capacity(self, msg: AFDSyncMsg) -> int:
         num_attn_ranks = self._comm.config.num_attn_ranks

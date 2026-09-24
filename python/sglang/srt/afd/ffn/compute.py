@@ -18,6 +18,7 @@ from sglang.srt.afd.afd_handshake import (
 )
 from sglang.srt.afd.layers import AFDMoELayer, collect_afd_moe_layers
 from sglang.srt.distributed.parallel_state import graph_capture
+from sglang.srt.layers.compute_sm import compute_sm_budget
 from sglang.srt.layers.dp_attention import set_is_extend_in_batch
 from sglang.srt.layers.moe.topk import StandardTopKOutput
 from sglang.srt.model_executor.runner.base_cuda_graph_runner import freeze_gc
@@ -105,6 +106,7 @@ class AFDFFNCompute:
         self._graph_buckets: list[int] = []
         self._graph_buffers: dict[tuple[int, int, int], _GraphBuffers] = {}
         self._graph_buffer_capacity = 0
+        self._graph_compute_num_sms: int | None = None
         self._graph_backend: FullCudaGraphBackend | None = None
 
     @property
@@ -166,6 +168,8 @@ class AFDFFNCompute:
         self._allocate_graph_buffers(max_tokens)
 
     def capture_compute_graphs(self) -> None:
+        # Idempotent: with multiple attn sessions the shared compute graphs
+        # are captured once, on the first session that needs them.
         if not self._graph_buckets or self._graph_backend is not None:
             return
         self._prepare_graph_capture(self._graph_buckets[-1])
@@ -173,7 +177,8 @@ class AFDFFNCompute:
             self,
             enable_memory_saver=self._enable_memory_saver,
         )
-        self._capture(self._enable_cudagraph_gc)
+        with compute_sm_budget(self._graph_compute_num_sms):
+            self._capture(self._enable_cudagraph_gc)
 
     def run(
         self,
@@ -183,11 +188,13 @@ class AFDFFNCompute:
         topk_weights: torch.Tensor,
         router_logits: torch.Tensor,
         allow_graph: bool,
+        *,
+        defer_output_scaling: bool = False,
     ) -> torch.Tensor:
         num_tokens = hidden_states.shape[0]
         graph_capacity = (
             self.graph_capacity_for(num_tokens)
-            if allow_graph and not self._scattered
+            if allow_graph and not self._scattered and not defer_output_scaling
             else None
         )
         if graph_capacity is not None:
@@ -205,6 +212,7 @@ class AFDFFNCompute:
             topk_ids,
             topk_weights,
             router_logits,
+            defer_output_scaling=defer_output_scaling,
         )
         self._validate_output(self._layers[layer_index], output, num_tokens)
         return output
@@ -258,6 +266,8 @@ class AFDFFNCompute:
         topk_ids: torch.Tensor,
         topk_weights: torch.Tensor,
         router_logits: torch.Tensor,
+        *,
+        defer_output_scaling: bool = False,
     ) -> torch.Tensor:
         layer = self._layers[layer_index]
         scaling_mode = self._scaling_modes[layer_index]
@@ -272,9 +282,33 @@ class AFDFFNCompute:
                 router_logits=router_logits,
             ),
         )
-        if scaling_mode is _RoutedScalingMode.OUTPUT:
+        if scaling_mode is _RoutedScalingMode.OUTPUT and not defer_output_scaling:
             output.mul_(layer.routed_scaling_factor)
         return output
+
+    def stage_deferred_output(
+        self,
+        layer_index: int,
+        destination: torch.Tensor,
+        output: torch.Tensor,
+    ) -> None:
+        layer = self._layers[layer_index]
+        if self._scaling_modes[layer_index] is _RoutedScalingMode.OUTPUT:
+            torch.mul(
+                output,
+                layer.routed_scaling_factor,
+                out=destination,
+            )
+            return
+        destination.copy_(output)
+
+    def finalize_deferred_output_in_place(
+        self,
+        layer_index: int,
+        output: torch.Tensor,
+    ) -> None:
+        if self._scaling_modes[layer_index] is _RoutedScalingMode.OUTPUT:
+            output.mul_(self._layers[layer_index].routed_scaling_factor)
 
     def _capture(self, enable_cudagraph_gc: bool) -> None:
         assert self._graph_backend is not None
@@ -434,6 +468,7 @@ class AFDFFNCompute:
         wire_capacity: int,
         compute_capacity: int,
         *,
+        defer_output_scaling: bool = False,
         stage_inputs: bool = True,
     ) -> torch.Tensor:
         layer = self._layers[layer_index]
@@ -481,6 +516,7 @@ class AFDFFNCompute:
             expert_topk_ids,
             expert_topk_weights,
             buffers.router_logits[:compute_capacity],
+            defer_output_scaling=defer_output_scaling,
         )
         self._validate_output(layer, output, compute_capacity)
         return output

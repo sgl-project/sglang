@@ -104,6 +104,7 @@ from sglang.srt.model_executor.runner_utils.pool import (
 from sglang.srt.model_executor.runner_utils.shared_read_event import make_external_event
 from sglang.srt.multiplex.pdmux_context import get_current_stream_idx, get_stream_groups
 from sglang.srt.runtime_context import (
+    get_disagg,
     get_exec,
     get_flags,
     get_parallel,
@@ -944,6 +945,8 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             global_num_tokens_cpu = [num_tokens] * self.dp_size
         elif self.require_attn_tp_gather:
             global_num_tokens_cpu = [num_tokens]
+        elif get_disagg().afd_decode_num_microbatches > 1:
+            global_num_tokens_cpu = [num_tokens]
         else:
             global_num_tokens_cpu = None
 
@@ -1415,6 +1418,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             and not self._metadata_glue.disabled
             and raw_bs == bs
             and not self.enable_two_batch_overlap
+            and get_disagg().afd_decode_num_microbatches == 1
             and not self.enable_pdmux
             and self.model_runner.lora_manager is None
         ):

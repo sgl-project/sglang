@@ -82,7 +82,25 @@ def build_attention_backends(*, model_runner: ModelRunner) -> AttentionBackends:
         ),
     )
 
-    if get_disagg().enable_pdmux:
+    if (
+        get_disagg().afd_role == "attn"
+        and get_disagg().afd_decode_num_microbatches > 1
+        and not model_runner.is_draft_worker
+    ):
+        from sglang.srt.afd.microbatch_overlap import build_afd_attention_backend
+
+        attn_backend = build_afd_attention_backend(
+            model_config=model_runner.model_config,
+            creator=lambda: _build_resolved_backend(
+                model_runner=model_runner,
+                resolved=resolved,
+                init_new_workspace=False,
+            ),
+            num_microbatches=get_disagg().afd_decode_num_microbatches,
+        )
+        decode_attn_backend = None
+        decode_attn_backend_group = []
+    elif get_disagg().enable_pdmux:
         attn_backend = _build_resolved_backend(
             model_runner=model_runner, resolved=resolved, init_new_workspace=True
         )

@@ -71,7 +71,14 @@ class TestAFDControlWireProtocol(unittest.TestCase):
     def test_sync_roundtrip_preserves_types_and_step_order(self):
         sender, receiver = self._sync_channel()
         for step_id in range(2):
-            msg = AFDSyncMsg(step_id, [3, 4], 1, 8, communication_graph=step_id == 0)
+            msg = AFDSyncMsg(
+                step_id,
+                [3, 4],
+                1,
+                8,
+                communication_graph=step_id == 0,
+                child_wire_capacities=(4, 4),
+            )
             sender.send(msg)
             actual = receiver.recv()
             self.assertEqual(actual, msg)
@@ -102,6 +109,26 @@ class TestAFDControlWireProtocol(unittest.TestCase):
 
 
 class TestAFDHandshakeWireProtocol(unittest.TestCase):
+    def test_microbatch_graph_plan_uses_child_fanin_and_keeps_tiny_batches_serial(self):
+        for count in (2, 3):
+            with self.subTest(count=count):
+                attn, ffn = _handshake_info("attn"), _handshake_info("ffn")
+                attn.num_ranks, ffn.num_ranks = 4, 2
+                attn.afd_ffn_moe_backend = ffn.afd_ffn_moe_backend = "deepep"
+                attn.decode_num_microbatches = count
+                attn.decode_token_buckets = [1, 32, 64]
+                attn.decode_graph_token_buckets = [1, 64]
+                ffn.decode_graph_token_buckets = [2, 64]
+                plan = build_afd_graph_capture_plan(
+                    AFDHandshakeResult(attn, ffn, "localhost", 1, 2)
+                )
+                parent, tiny = plan.attn_graph_variants
+                self.assertEqual(parent.child_wire_capacities, (32,) * count)
+                self.assertEqual(parent.child_compute_capacities, (64,) * count)
+                self.assertEqual(tiny.child_wire_capacities, (1,))
+                self.assertEqual(tiny.child_compute_capacities, (2,))
+                self.assertEqual(plan.ffn_graph_variants, ())
+
     def test_asymmetric_graph_plan_agrees_on_wire_and_compute_capacities(self):
         for layout, num_attn, num_ffn in (
             ("none", 3, 2),

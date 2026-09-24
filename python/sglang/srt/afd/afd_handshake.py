@@ -17,7 +17,7 @@ from typing import Tuple
 import msgspec
 import zmq
 
-from sglang.srt.afd.dispatcher import build_decode_token_buckets
+from sglang.srt.afd.dispatcher import build_decode_token_buckets, split_afd_batch_size
 from sglang.srt.environ import envs
 from sglang.srt.utils.network import get_zmq_socket
 
@@ -42,6 +42,8 @@ class AFDHandshakeInfo:
     # Attn reports wire capacities; FFN reports expert-input capacities.
     decode_graph_token_buckets: list[int] = field(default_factory=list, repr=False)
     disable_cuda_graph_padding: bool = False
+    decode_num_microbatches: int = 1
+    afd_comm_sm_budget: int | None = None
 
 
 class _HandshakeRequest(msgspec.Struct, tag="request", forbid_unknown_fields=True):
@@ -116,12 +118,15 @@ def _build_attn_graph_shapes(
     attn_graph_capacities = tuple(
         sorted(set(attn.decode_graph_token_buckets), reverse=True)
     )
-    transport_capacities = tuple(sorted(set(attn.decode_token_buckets), reverse=True))
+    transport_buckets = sorted(set(attn.decode_token_buckets))
+    transport_capacities = tuple(reversed(transport_buckets))
     if not set(attn_graph_capacities).issubset(transport_capacities):
         raise RuntimeError(
             "AFD attn graph capacities must be transport capacities: "
-            f"graph={attn_graph_capacities}, transport={transport_capacities}"
+            f"graph={attn_graph_capacities}, "
+            f"transport={transport_capacities}"
         )
+
     wire_token_multiplier = (
         1 if attn.afd_ffn_moe_backend == "deepep" else attn.num_ranks
     )
@@ -131,15 +136,25 @@ def _build_attn_graph_shapes(
             raise RuntimeError(
                 "AFD attn graph capacity is not divisible by the fixed wire "
                 "rows per request: "
-                f"capacity={attn_wire_capacity}, rows_per_request={wire_token_multiplier}"
+                f"capacity={attn_wire_capacity}, "
+                f"rows_per_request={wire_token_multiplier}"
             )
-        shapes.append(
-            (
-                attn_wire_capacity // wire_token_multiplier,
-                attn_wire_capacity,
-                (attn_wire_capacity,),
+        attn_batch_size = attn_wire_capacity // wire_token_multiplier
+        num_microbatches = attn.decode_num_microbatches
+        if num_microbatches > 1 and attn_batch_size >= num_microbatches:
+            child_batch_sizes = split_afd_batch_size(attn_batch_size, num_microbatches)
+            child_wire_capacities = tuple(
+                transport_buckets[
+                    bisect.bisect_left(
+                        transport_buckets,
+                        child_batch_size * wire_token_multiplier,
+                    )
+                ]
+                for child_batch_size in child_batch_sizes
             )
-        )
+        else:
+            child_wire_capacities = (attn_wire_capacity,)
+        shapes.append((attn_batch_size, attn_wire_capacity, child_wire_capacities))
     return tuple(shapes)
 
 
@@ -152,7 +167,9 @@ def build_afd_ffn_capacity_plan(
     scattered = ffn.afd_ffn_moe_backend == "deepep"
     fan_in = (attn.num_ranks + ffn.num_ranks - 1) // ffn.num_ranks if scattered else 1
     graph_capacities = {
-        capacity * fan_in for _, capacity, _ in _build_attn_graph_shapes(attn)
+        child_capacity * fan_in
+        for _, _, child_capacities in _build_attn_graph_shapes(attn)
+        for child_capacity in child_capacities
     }
     graph_max_capacity = max(graph_capacities, default=0)
     deepep_dispatch_limit = None
@@ -194,11 +211,19 @@ def build_afd_ffn_capacity_plan(
     )
 
 
-def build_afd_graph_capture_plan(handshake: AFDHandshakeResult) -> AFDGraphCapturePlan:
+def build_afd_graph_capture_plan(
+    handshake: AFDHandshakeResult,
+) -> AFDGraphCapturePlan:
+
     attn = handshake.local if handshake.local.role == "attn" else handshake.peer
     ffn = handshake.local if handshake.local.role == "ffn" else handshake.peer
     attn_graph_shapes = _build_attn_graph_shapes(attn)
+    attn_graph_capacities = tuple(shape[1] for shape in attn_graph_shapes)
+
     scattered = attn.afd_ffn_moe_backend == "deepep"
+    wire_token_multiplier = (
+        1 if attn.afd_ffn_moe_backend == "deepep" else attn.num_ranks
+    )
     ffn_max_fan_in = (
         (attn.num_ranks + ffn.num_ranks - 1) // ffn.num_ranks if scattered else 1
     )
@@ -208,9 +233,18 @@ def build_afd_graph_capture_plan(handshake: AFDHandshakeResult) -> AFDGraphCaptu
         and attn.num_ranks % ffn.num_ranks != 0
     )
     ffn_buckets = sorted(set(ffn.decode_graph_token_buckets))
-    candidate_capacities = tuple(shape[1] for shape in attn_graph_shapes)
-    missing_capacities = []
-    ffn_capacity_by_wire = {}
+    if attn.decode_num_microbatches > 1:
+        # Eligible buckets become multi-child parent variants below; only
+        # undersized batches keep a single-child pairing.
+        candidate_capacities = tuple(
+            capacity
+            for capacity in attn_graph_capacities
+            if capacity // wire_token_multiplier < attn.decode_num_microbatches
+        )
+    else:
+        candidate_capacities = attn_graph_capacities
+    missing_capacities: list[tuple[int, int]] = []
+    ffn_capacity_by_wire: dict[int, int] = {}
     for wire_capacity in candidate_capacities:
         compute_capacity = (
             _select_ffn_graph_capacity(
@@ -225,29 +259,70 @@ def build_afd_graph_capture_plan(handshake: AFDHandshakeResult) -> AFDGraphCaptu
             missing_capacities.append((wire_capacity, wire_capacity * ffn_max_fan_in))
             continue
         ffn_capacity_by_wire[wire_capacity] = compute_capacity
-    if candidate_capacities and not ffn_graph_compatible:
+
+    if attn.afd_backend == "nccl" and candidate_capacities and not ffn_graph_compatible:
         raise RuntimeError(
             "AFD NCCL communication graph with non-uniform SCATTERED "
             "fan-in requires F-side CUDA graph padding; remove "
             "--disable-cuda-graph-padding"
         )
-    if missing_capacities:
+    if attn.afd_backend == "nccl" and missing_capacities:
         raise RuntimeError(
             "AFD NCCL communication graph requires an ffn graph bucket for "
             "every attn graph capacity: "
-            f"missing_edge_to_ffn={missing_capacities}, ffn_buckets={ffn_buckets}"
+            f"missing_edge_to_ffn={missing_capacities}, "
+            f"ffn_buckets={ffn_buckets}"
         )
-    return AFDGraphCapturePlan(
-        attn_graph_variants=tuple(
-            AFDGraphCaptureVariant(
-                attn_batch_size=batch_size,
-                attn_wire_capacity=wire_capacity,
-                child_wire_capacities=child_wire_capacities,
-                child_compute_capacities=(ffn_capacity_by_wire[wire_capacity],),
+    attn_variants: list[AFDGraphCaptureVariant] = []
+    for (
+        attn_batch_size,
+        attn_wire_capacity,
+        child_wire_capacities,
+    ) in attn_graph_shapes:
+        if len(child_wire_capacities) > 1:
+            child_compute_capacities = tuple(
+                (
+                    _select_ffn_graph_capacity(
+                        ffn_buckets,
+                        child_wire_capacity * ffn_max_fan_in,
+                        ffn.disable_cuda_graph_padding,
+                    )
+                    if ffn_graph_compatible
+                    else None
+                )
+                for child_wire_capacity in child_wire_capacities
             )
-            for batch_size, wire_capacity, child_wire_capacities in attn_graph_shapes
-        ),
-        ffn_graph_variants=tuple(ffn_capacity_by_wire.items()),
+            if any(capacity is None for capacity in child_compute_capacities):
+                raise RuntimeError(
+                    "AFD microbatch parent communication graph requires an ffn "
+                    "graph bucket for every child: "
+                    f"attn_batch_size={attn_batch_size}, "
+                    f"child_wire_capacities={child_wire_capacities}, "
+                    f"ffn_buckets={ffn_buckets}"
+                )
+        else:
+            child_wire_capacities = (attn_wire_capacity,)
+            child_compute_capacities = (ffn_capacity_by_wire.get(attn_wire_capacity),)
+
+        attn_variants.append(
+            AFDGraphCaptureVariant(
+                attn_batch_size=attn_batch_size,
+                attn_wire_capacity=attn_wire_capacity,
+                child_wire_capacities=child_wire_capacities,
+                child_compute_capacities=child_compute_capacities,
+            )
+        )
+
+    if attn.decode_num_microbatches > 1:
+        # All overlap F graphs are captured in the paired A/F phase via the attn
+        # variants above.
+        standalone_ffn_variants: tuple[tuple[int, int], ...] = ()
+    else:
+        standalone_ffn_variants = tuple(ffn_capacity_by_wire.items())
+
+    return AFDGraphCapturePlan(
+        attn_graph_variants=tuple(attn_variants),
+        ffn_graph_variants=standalone_ffn_variants,
     )
 
 

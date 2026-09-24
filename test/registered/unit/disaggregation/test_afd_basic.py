@@ -650,6 +650,10 @@ class TestAFDSchedulerRouting(unittest.TestCase):
                 dispatcher.begin_batch.return_value = 7
                 with (
                     patch(
+                        "sglang.srt.afd.afd_scheduler.get_disagg",
+                        return_value=SimpleNamespace(afd_decode_num_microbatches=1),
+                    ),
+                    patch(
                         "sglang.srt.afd.afd_scheduler.is_afd_attn_moe_scattered",
                         return_value=True,
                     ),
@@ -671,6 +675,8 @@ class TestAFDSchedulerRouting(unittest.TestCase):
                     forward_mode=ForwardMode.DECODE,
                     dp_capacity=expected[0],
                     wire_capacity=8 if max(expected) > 4 else 4,
+                    child_wire_capacities=(),
+                    graph_variant=None,
                 )
                 self.assertEqual(
                     scheduler.tp_worker.model_runner.afd_cuda_graph_batch_size,
@@ -681,6 +687,7 @@ class TestAFDSchedulerRouting(unittest.TestCase):
                     tokens_per_rank=expected,
                     forward_mode=ForwardMode.DECODE,
                     wire_capacity=8 if max(expected) > 4 else 4,
+                    child_wire_capacities=(),
                 )
 
     def test_control_publishes_final_graph_decision_and_eager_fallback(self):

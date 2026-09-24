@@ -9,7 +9,11 @@ import torch
 from torch import nn
 
 from sglang.srt.afd.afd_config import AFDRole
-from sglang.srt.afd.dispatcher import get_afd_dispatcher, get_afd_dispatcher_or_none
+from sglang.srt.afd.dispatcher import (
+    AFDWorkHandle,
+    get_afd_dispatcher,
+    get_afd_dispatcher_or_none,
+)
 from sglang.srt.layers.logits_processor import get_in_autotune_dummy_run
 from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
 from sglang.srt.layers.moe.topk import TopKOutput, TopKOutputChecker
@@ -30,6 +34,18 @@ class AFDMoELayer:
     num_experts: int
     num_fused_shared_experts: int
     routed_scaling_factor: Optional[float]
+
+
+@dataclass(frozen=True)
+class _AFDCommunicationGraphHandle:
+    handle: AFDWorkHandle
+
+    @property
+    def input_tokens(self) -> int:
+        return self.handle.input_tokens
+
+
+AFDDispatchHandle = AFDWorkHandle | _AFDCommunicationGraphHandle
 
 
 @eager_on_graph(True)
@@ -98,6 +114,39 @@ class AFDAttnMoE(nn.Module):
                 "AFD attention instance requires STANDARD topk output with explicit "
                 f"topk_ids/topk_weights; got {type(topk_output).__name__}."
             )
+
+    def dispatch_afd(
+        self,
+        hidden_states: torch.Tensor,
+        topk_output: TopKOutput,
+    ) -> AFDDispatchHandle:
+        self._check_topk_output(topk_output)
+        dispatcher = get_afd_dispatcher()
+        if get_is_capture_mode() and dispatcher.can_capture_communication_graph(
+            hidden_states.shape[0]
+        ):
+            return _AFDCommunicationGraphHandle(
+                handle=dispatcher.dispatch_decode_graph_wave(
+                    self.layer_id,
+                    hidden_states,
+                    topk_output.topk_ids,
+                    topk_output.topk_weights,
+                ),
+            )
+        return dispatcher.dispatch(
+            self.layer_id, hidden_states, topk_output.topk_ids, topk_output.topk_weights
+        )
+
+    def combine_afd(
+        self,
+        handle: AFDDispatchHandle,
+    ) -> torch.Tensor:
+        if isinstance(handle, _AFDCommunicationGraphHandle):
+            return get_afd_dispatcher().combine_decode_graph_wave(
+                self.layer_id,
+                handle.handle,
+            )
+        return get_afd_dispatcher().combine(handle)
 
     def forward(self, hidden_states: torch.Tensor, topk_output: TopKOutput):
         self._check_topk_output(topk_output)
