@@ -203,8 +203,8 @@ class TestSamplingMaskCapture(CustomTestCase):
                         simple_sampling_case=False,
                     )
                 output = self._materialize(sampled, capture, requested_rows=[0, 1])
-                support = output.next_token_sampling_mask_idx[0]
-                sampling_logprobs = output.next_token_sampling_logprobs[0]
+                support = output.next_token_sampling_mask_idx[0].tolist()
+                sampling_logprobs = output.next_token_sampling_logprobs[0].tolist()
                 self.assertEqual(set(support), {0, 1, 3})
                 self.assertIn(int(sampled[0]), support)
                 expected = original[0, sampled[0]] - original[0, support].logsumexp(0)
@@ -280,9 +280,13 @@ class TestSamplingMaskCapture(CustomTestCase):
 
         output = self._materialize(sampled, capture, requested_rows)
         self.assertIsNone(output.next_token_sampling_mask_idx[0])
-        self.assertEqual(set(output.next_token_sampling_mask_idx[1]), {0, 1, 2})
+        self.assertEqual(
+            set(output.next_token_sampling_mask_idx[1].tolist()), {0, 1, 2}
+        )
         self.assertIsNone(output.next_token_sampling_mask_idx[2])
-        self.assertEqual(set(output.next_token_sampling_mask_idx[3]), {0, 1, 2})
+        self.assertEqual(
+            set(output.next_token_sampling_mask_idx[3].tolist()), {0, 1, 2}
+        )
         self.assertIsNone(output.next_token_sampling_logprobs[0])
         self.assertIsNotNone(output.next_token_sampling_logprobs[1])
         self.assertIsNone(output.next_token_sampling_logprobs[2])
@@ -714,8 +718,20 @@ class TestSamplingMaskPacking(CustomTestCase):
             ],
             output,
         )
-        self.assertEqual(output.next_token_sampling_mask_idx, [[3], None, [5]])
-        self.assertEqual(output.next_token_sampling_logprobs, [[0.0], None, [0.0]])
+        self.assertEqual(
+            [
+                None if row is None else row.tolist()
+                for row in output.next_token_sampling_mask_idx
+            ],
+            [[3], None, [5]],
+        )
+        self.assertEqual(
+            [
+                None if row is None else row.tolist()
+                for row in output.next_token_sampling_logprobs
+            ],
+            [[0.0], None, [0.0]],
+        )
 
     def test_overflow_never_materializes_a_partial_mask(self):
         # Simulate a top-k cutoff tie: a nominal top_k below the cap can still

@@ -59,6 +59,7 @@ from sglang.srt.mem_cache.qsa_kv_pool import (
     QSATokenToKVPool,
 )
 from sglang.srt.runtime_context import get_context
+from sglang.srt.sampling.sampling_mask import SamplingMaskRows
 from sglang.srt.speculative.eagle_disaggregation import (
     build_eagle_disagg_draft_input,
 )
@@ -713,6 +714,13 @@ class TestEagleDsaSeedTransfer(CustomTestCase):
         sampling_logprobs=None,
         sampling_logprobs_mode="support",
     ):
+        sampling_mask_rows = None
+        if sampling_mask is not None:
+            sampling_mask_rows = SamplingMaskRows()
+            sampling_mask_rows.append(
+                np.array(sampling_mask, np.int32),
+                np.array(sampling_logprobs, np.float32),
+            )
         return SimpleNamespace(
             metadata_buffer_index=metadata_buffer_index,
             output_ids=[101],
@@ -724,12 +732,7 @@ class TestEagleDsaSeedTransfer(CustomTestCase):
             return_logprob=False,
             return_sampling_mask=sampling_mask is not None,
             sampling_logprobs_mode=sampling_logprobs_mode,
-            output_token_sampling_mask=(
-                None if sampling_mask is None else [sampling_mask]
-            ),
-            output_token_sampling_logprobs=(
-                None if sampling_logprobs is None else [sampling_logprobs]
-            ),
+            sampling_mask_rows=sampling_mask_rows,
             hidden_states_tensor=torch.tensor([1.0, 2.0]),
             output_topk_p=torch.tensor([1.0]),
             output_topk_index=torch.tensor([7]),
@@ -813,7 +816,7 @@ class TestEagleDsaSeedTransfer(CustomTestCase):
                 self._make_req(
                     None,
                     sampling_mask=[7, 8, 9],
-                    sampling_logprobs=-0.5,
+                    sampling_logprobs=[-0.5],
                     sampling_logprobs_mode="selected",
                 )
             )
