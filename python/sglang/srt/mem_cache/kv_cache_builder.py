@@ -25,7 +25,6 @@ class KVCacheBuildResult:
 
 from typing import TYPE_CHECKING
 
-from sglang.srt.arg_groups.overrides import resolving_view
 from sglang.srt.configs.hybrid_arch import (
     glm5_next_config,
     hybrid_gdn_config,
@@ -36,7 +35,6 @@ from sglang.srt.configs.hybrid_arch import (
 )
 from sglang.srt.configs.model_config import ModelImpl, is_deepseek_dsa
 from sglang.srt.environ import envs
-from sglang.srt.hardware_backend.mlx.runtime import use_mlx
 from sglang.srt.managers.mm_schedule import init_mm_embedding_cache
 from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
@@ -116,29 +114,6 @@ def prepare_hicache_staging(
                 pool.swa_kv_pool if isinstance(pool, BaseSWAKVPool) else pool,
                 sidecar=True,
             )
-
-
-def get_draft_kv_pool(
-    *,
-    draft_worker: BaseTpWorker,
-    spec_algorithm: SpeculativeAlgorithm,
-    server_args: ServerArgs,
-):
-    """Return the draft token-to-KV pool for the current draft worker,
-    or None when no draft KV pool is available."""
-    if draft_worker is None or spec_algorithm.is_ngram():
-        return None
-
-    # V2 draft workers exist only on their hosting PP stage; other ranks own no
-    # nested draft worker or draft KV pool.
-    if draft_worker.draft_worker is None:
-        return None
-
-    if resolving_view(server_args).enable_multi_layer_eagle:
-        draft_runner = draft_worker.draft_worker.draft_runner_list[0]
-    else:
-        draft_runner = draft_worker.draft_worker.draft_runner
-    return draft_runner.token_to_kv_pool
 
 
 def maybe_register_hicache_draft(
@@ -314,12 +289,6 @@ def build_kv_cache(
         and get_disagg().disaggregation_mode == "decode"
     ):
         if is_hybrid_swa:
-            if not (envs.SGLANG_ENABLE_UNIFIED_RADIX_TREE.get() or use_mlx()):
-                raise ValueError(
-                    "--disaggregation-decode-enable-radix-cache with sliding "
-                    "window attention (SWA) models requires the unified radix "
-                    "tree (set SGLANG_ENABLE_UNIFIED_RADIX_TREE=1)."
-                )
             if enable_hierarchical_cache:
                 raise ValueError(
                     "--disaggregation-decode-enable-radix-cache with sliding "
