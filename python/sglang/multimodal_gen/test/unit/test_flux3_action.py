@@ -23,17 +23,15 @@ from sglang.multimodal_gen.runtime.entrypoints.action.protocol import (
     build_action_sampling_params,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.flux3_action import (
+    cosmos_unipc,
     denormalize,
+    euler,
     normalize,
     pack_action,
     pack_video,
     parse_observation,
     targets_to_actions,
     text_ids,
-)
-from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.flux3_action_sampling import (
-    cosmos_unipc,
-    euler,
 )
 
 DROID_CONFIG = {
