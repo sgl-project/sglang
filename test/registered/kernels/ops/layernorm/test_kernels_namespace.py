@@ -168,12 +168,43 @@ def test_import_stays_metadata_only():
     # the JIT compilation infra (sglang.kernels.jit), which import torch / nvcc.
     code = (
         "import sys, sglang.kernels.ops; "
-        "print('DIRTY' if 'sgl_kernel' in sys.modules or any("
+        "print('DIRTY' if any(m in sys.modules for m in "
+        "('sgl_kernel', 'cutlass', 'flydsl', 'aiter', "
+        "'sglang.kernels.ops.gemm.kimi_k3')) or any("
         "m.startswith('sglang.kernels.jit') for m in sys.modules) else 'CLEAN')"
     )
     r = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
     assert r.returncode == 0, r.stderr
     assert "CLEAN" in r.stdout
+
+
+@pytest.mark.parametrize(
+    "op, backend, device",
+    [
+        ("activation.situ_and_mul", KernelBackend.JIT, "cuda"),
+        ("moe.situ_and_mul_masked_post_quant", KernelBackend.JIT, "cuda"),
+        ("attention.attn_res_fused_tma", KernelBackend.JIT, "cuda"),
+        ("attention.attn_res_hip", KernelBackend.TRITON, "hip"),
+        ("attention.kimi_k3_mla_output_gate", KernelBackend.JIT, "cuda"),
+        ("attention.fused_kda_decode_mtp_dspark", KernelBackend.CUTE_DSL, "cuda"),
+        ("attention.flydsl_kimi_k3_kda_decode", KernelBackend.FLYDSL, "hip"),
+        ("attention.flydsl_kimi_k3_kda_decode_with_f_b", KernelBackend.FLYDSL, "hip"),
+        ("communication.all_reduce_push_res", KernelBackend.JIT, "cuda"),
+        ("communication.gemm_ag_up_proj", KernelBackend.JIT, "cuda"),
+        ("communication.o_proj_gemm_ar", KernelBackend.JIT, "cuda"),
+        ("communication.reduce_scatter_res", KernelBackend.JIT, "cuda"),
+    ],
+)
+def test_kimi_k3_kernels_are_inventoried_by_operator(op, backend, device):
+    spec = K.select_kernel(op, backend=backend)
+    group = op.split(".")[0]
+    assert spec.target.startswith(f"sglang.kernels.ops.{group}.")
+    assert K.capabilities_satisfied(spec.capabilities, PlatformInfo(device_type=device))
+    assert not K.capabilities_satisfied(spec.capabilities, _CPU)
+
+
+def test_kimi_k3_model_namespace_is_retired():
+    assert importlib.util.find_spec("sglang.kernels.ops.kimi_k3") is None
 
 
 if __name__ == "__main__":

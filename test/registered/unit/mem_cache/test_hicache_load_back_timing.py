@@ -6,10 +6,11 @@ from unittest.mock import MagicMock, patch
 
 import torch
 
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=9, stage="base-b", runner_config="1-gpu-small")
+register_amd_ci(est_time=9, suite="stage-b-test-1-gpu-small-amd")
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
@@ -59,9 +60,26 @@ class TestLoadBackDurationMetric(CustomTestCase):
         self.assertIs(finish, events[1])
         self.assertIsNot(start, finish)
 
-    def test_loading_check_observes_duration_and_tokens(self):
-        from sglang.srt.mem_cache.hiradix_cache import HiRadixCache
+    def _make_unified_stub(self, ack):
+        from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 
+        stub = object.__new__(UnifiedRadixCache)
+        stub.cache_controller = SimpleNamespace(ack_load_queue=[ack])
+        stub.ongoing_load_back = {
+            node_id: (object(), None, None) for node_id in ack.node_ids
+        }
+        stub.buffer_pipeline = None
+        stub.tree_core = SimpleNamespace(
+            write_back_duplicate_reclaim_digest=0, finish_load_back=MagicMock()
+        )
+        stub.dec_lock_ref = MagicMock()
+        stub.dec_host_lock_ref = MagicMock()
+        stub.metrics_collector = MagicMock()
+        stub.pp_rank = 0
+        stub._all_reduce = MagicMock()
+        return stub
+
+    def test_loading_check_observes_duration_and_tokens(self):
         start, finish = self._completed_pair()
         ack = self.cc.HiCacheAck(
             start,
@@ -71,13 +89,7 @@ class TestLoadBackDurationMetric(CustomTestCase):
             timing_enabled=True,
             num_tokens_by_pool={"kv": 1024},
         )
-        stub = object.__new__(HiRadixCache)
-        stub.cache_controller = SimpleNamespace(ack_load_queue=[ack])
-        stub.ongoing_load_back = {1: object(), 2: object()}
-        stub.dec_lock_ref = MagicMock()
-        stub.metrics_collector = MagicMock()
-        stub.pp_rank = 0
-        stub._all_reduce = MagicMock()
+        stub = self._make_unified_stub(ack)
 
         stub.loading_check()
 
@@ -88,11 +100,10 @@ class TestLoadBackDurationMetric(CustomTestCase):
         (observed,), _ = stub.metrics_collector.observe_load_back_duration.call_args
         self.assertGreater(observed, 0.0)
         self.assertEqual(stub.cache_controller.ack_load_queue, [])
+        self.assertEqual(stub.ongoing_load_back, {})
 
     def test_loading_check_fallback_when_timing_unsupported(self):
         """On backends without enable_timing, count tokens but skip duration."""
-        from sglang.srt.mem_cache.hiradix_cache import HiRadixCache
-
         start = torch.cuda.Event()
         finish = torch.cuda.Event()
         start.record()
@@ -107,13 +118,7 @@ class TestLoadBackDurationMetric(CustomTestCase):
             timing_enabled=False,
             num_tokens_by_pool={"kv": 512},
         )
-        stub = object.__new__(HiRadixCache)
-        stub.cache_controller = SimpleNamespace(ack_load_queue=[ack])
-        stub.ongoing_load_back = {7: object()}
-        stub.dec_lock_ref = MagicMock()
-        stub.metrics_collector = MagicMock()
-        stub.pp_rank = 0
-        stub._all_reduce = MagicMock()
+        stub = self._make_unified_stub(ack)
 
         stub.loading_check()
 

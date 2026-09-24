@@ -53,9 +53,7 @@ class TestModelOptExport(unittest.TestCase):
         self.mock_logger.start()
 
         # Mock all distributed functions that might be called
-        self.mock_get_tp_group = patch(
-            "sglang.srt.distributed.parallel_state.get_tp_group"
-        )
+        self.mock_get_tp_group = patch("sglang.srt.distributed.parallel_state._TP")
         self.mock_get_tp_group.start()
 
         # Mock model parallel initialization check

@@ -71,6 +71,7 @@ def _staged_fixture(full_match=2):
         full_available_size=Mock(return_value=100)
     )
     cc = HybridCacheController.__new__(HybridCacheController)
+    cc.pp_prefetch_command_group = None
     cc.page_size = 2
     cc.get_hash_str = get_hash_str
     cc.prefetch_queue = Queue()

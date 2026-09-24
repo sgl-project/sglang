@@ -4,8 +4,9 @@ Auto-enabled on SM100/SM103 when CustomAllReduceV2 with multicast is
 available; ``SGLANG_K3_AR_FUSION`` overrides in either direction (0 = off,
 1 = attempt anywhere and warn when unavailable).
 
-Glue between the model and the ``kernels.ops.kimi_k3.all_reduce`` kernels. Small
-messages take the 1shot multicast-push through the group's CustomAllReduceV2
+Glue between the model and the
+``kernels.ops.communication.all_reduce_residual`` kernels. Small messages take
+the 1shot multicast-push through the group's CustomAllReduceV2
 workspace; large ones take the in-place NVLS 2shot, which needs its input to be a
 :func:`symm_buffer` slice and otherwise falls back to the regular all-reduce.
 
@@ -25,7 +26,6 @@ import torch
 import sglang.srt.runtime_context as ctx
 from sglang.kernels.jit.utils import cache_once
 from sglang.srt.environ import envs
-from sglang.srt.runtime_context import get_parallel
 
 if TYPE_CHECKING:
     from sglang.srt.distributed.device_communicators.custom_all_reduce_v2 import (
@@ -84,11 +84,11 @@ def _get_state() -> Optional[_State]:
     from sglang.srt.distributed.device_communicators.custom_all_reduce_v2 import (
         CustomAllReduceV2,
     )
-    from sglang.srt.distributed.parallel_state import get_tp_group
+    from sglang.srt.runtime_context import get_parallel
 
     if get_parallel().tp_size <= 1:
         return None
-    group = get_tp_group()
+    group = get_parallel().tp_group
     comm = group.ca_comm
     if (
         not isinstance(comm, CustomAllReduceV2)
@@ -106,7 +106,7 @@ def _get_state() -> Optional[_State]:
                 "multicast is unavailable; using the regular all-reduce path."
             )
         return None
-    from sglang.kernels.ops.kimi_k3 import all_reduce as mod
+    from sglang.kernels.ops.communication import all_reduce_residual as mod
 
     mod.register_comm(comm.obj)
     logger.info("K3 all-reduce fusion enabled (world_size=%d)", comm.world_size)
@@ -198,9 +198,9 @@ def symm_buffer(
     its own. Each name belongs to one group, so the name alone identifies it.
     """
     if group_name is None:
-        from sglang.srt.distributed.parallel_state import get_tp_group
+        from sglang.srt.runtime_context import get_parallel
 
-        group_name = get_tp_group().cpu_group.group_name
+        group_name = get_parallel().tp_group.cpu_group.group_name
     buf: _Buffer = ctx.get_buffer(
         f"k3_symm:{name}", lambda: _create_buffer(name, width, dtype, group_name)
     )
@@ -230,7 +230,7 @@ def all_reduce(
     residual: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """In-place ``x = allreduce(x) [+ residual]``; returns ``x``."""
-    from sglang.kernels.ops.kimi_k3 import all_reduce as mod
+    from sglang.kernels.ops.communication import all_reduce_residual as mod
 
     state = _get_state()
     assert state is not None
@@ -256,7 +256,7 @@ def all_reduce_low_sm(
     For side-stream use: push would fan out over many blocks and steal SMs from
     the GEMMs it overlaps. ``num_blocks`` / ``unroll`` default to the tuned tables.
     """
-    from sglang.kernels.ops.kimi_k3 import all_reduce as mod
+    from sglang.kernels.ops.communication import all_reduce_residual as mod
 
     state = _get_state()
     assert state is not None
@@ -281,7 +281,7 @@ def all_reduce_norm(
 ) -> torch.Tensor:
     """In-place ``x = allreduce(x)`` with a fused RMSNorm over the first
     ``num_tokens`` rows of the 2D ``[rows, NORM_DIM]`` input."""
-    from sglang.kernels.ops.kimi_k3 import all_reduce as mod
+    from sglang.kernels.ops.communication import all_reduce_residual as mod
 
     state = _get_state()
     assert state is not None
@@ -318,7 +318,7 @@ def finalize_push_fits(num_tokens: int) -> bool:
 def gemm_ag_up_fits(num_tokens: int) -> bool:
     """Whether :func:`gemm_ag_up_proj` covers this decode batch: TP8, within the
     kernel's win range, and the staging slice fits a push slot."""
-    from sglang.kernels.ops.kimi_k3 import gemm_ag as mod
+    from sglang.kernels.ops.communication import gemm_ag as mod
 
     state = _get_state()
     assert state is not None
@@ -343,7 +343,7 @@ def gemm_ag_up_proj(
     """``up_proj(x) + b (+ c)`` via column-parallel GEMV + multicast all-gather +
     fused add3. ``weight`` is the FULL replicated up_proj (the kernel slices this
     rank's rows). Caller checked :func:`gemm_ag_up_fits`."""
-    from sglang.kernels.ops.kimi_k3 import gemm_ag as mod
+    from sglang.kernels.ops.communication import gemm_ag as mod
 
     state = _get_state()
     assert state is not None
@@ -367,7 +367,7 @@ def finalize_all_reduce_push_norm(
 ) -> torch.Tensor:
     """Deferred MoE finalize fused into the 1shot push AR + RMSNorm; ``out`` is
     output-only. Caller checked :func:`finalize_push_fits`."""
-    from sglang.kernels.ops.kimi_k3 import all_reduce as mod
+    from sglang.kernels.ops.communication import all_reduce_residual as mod
 
     state = _get_state()
     assert state is not None

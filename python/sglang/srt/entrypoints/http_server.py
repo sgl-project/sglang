@@ -117,6 +117,7 @@ from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.managers.io_struct import (
     AbortReq,
     AttachHiCacheStorageReqInput,
+    BeginWeightUpdateReqInput,
     CheckWeightsReqInput,
     CloseSessionReqInput,
     ConfigureLoggingReq,
@@ -124,6 +125,7 @@ from sglang.srt.managers.io_struct import (
     DestroyWeightsUpdateGroupReqInput,
     DumperControlReqInput,
     EmbeddingReqInput,
+    EndWeightUpdateReqInput,
     GenerateReqInput,
     GetWeightsByNameReqInput,
     InitWeightsSendGroupForRemoteInstanceReqInput,
@@ -133,6 +135,7 @@ from sglang.srt.managers.io_struct import (
     OpenSessionReqInput,
     ParseFunctionCallReq,
     PauseGenerationReqInput,
+    PdRoleSwitchReqInput,
     ProfileReq,
     ReleaseMemoryOccupationReqInput,
     ResumeMemoryOccupationReqInput,
@@ -779,6 +782,9 @@ async def model_info():
         "tool_call_parser": _global_state.tokenizer_manager.config_value(
             "tool_call_parser"
         ),
+        "disaggregation_mode": _global_state.tokenizer_manager.config_value(
+            "disaggregation_mode"
+        ),
         "has_image_understanding": model_config.is_image_understandable_model,
         "has_audio_understanding": model_config.is_audio_understandable_model,
         "model_type": getattr(model_config.hf_config, "model_type", None),
@@ -793,16 +799,6 @@ async def model_info():
             model_config=model_config,
         )
     return msgspec_to_builtins(result)
-
-
-@app.get("/get_weight_version")
-@app.get("/weight_version")
-async def weight_version():
-    """Get the current weight version."""
-    raise HTTPException(
-        status_code=404,
-        detail="Endpoint '/get_weight_version' or '/weight_version' is deprecated. Please use '/model_info' instead.",
-    )
 
 
 @app.get("/get_server_info")
@@ -842,39 +838,13 @@ async def server_info():
             "startup_time": _global_state.tokenizer_manager.startup_time,
             "internal_states": internal_states,
             "version": __version__,
+            "frontend": "python",
             # Structured KV-event publisher descriptor for KV-aware routers.
             # `None` when publishing is disabled or misconfigured; see
             # `runtime_context.describe_kv_events_publisher` for the contract.
             "kv_events": describe_kv_events_publisher(server_args),
         }
     )
-
-
-@app.get("/get_load")
-async def get_load():
-    """Get load metrics (deprecated - use /v1/loads instead).
-
-    Legacy shim backed by /v1/loads. Projects the load snapshot down to the
-    historical field shape (dp_rank, num_reqs, num_waiting_reqs, num_tokens,
-    num_pending_tokens, ts_tic) so existing clients keep working.
-    """
-    logger.warning(
-        "Endpoint '/get_load' is deprecated and will be removed in a future version. "
-        "Please use '/v1/loads' instead."
-    )
-    load_results = await _global_state.tokenizer_manager.get_loads(include=["core"])
-    ts = time.perf_counter()
-    return [
-        {
-            "dp_rank": r.dp_rank,
-            "num_reqs": r.num_running_reqs + r.num_waiting_reqs,
-            "num_waiting_reqs": r.num_waiting_reqs,
-            "num_tokens": r.num_total_tokens,
-            "num_pending_tokens": r.num_total_tokens - r.num_used_tokens,
-            "ts_tic": ts,
-        }
-        for r in load_results
-    ]
 
 
 # example usage:
@@ -1063,22 +1033,8 @@ async def list_external_corpora():
     )
 
 
-@app.api_route("/clear_hicache_storage_backend", methods=["GET", "POST"])
-@auth_level(AuthLevel.ADMIN_OPTIONAL)
-async def clear_hicache_storage_backend_deprecated():
-    """Deprecated: use POST /hicache/storage-backend/clear."""
-    ret = await _global_state.tokenizer_manager.clear_hicache_storage()
-    return Response(
-        content=(
-            "Deprecated endpoint. Use POST /hicache/storage-backend/clear.\n"
-            "Hierarchical cache storage backend cleared.\n"
-        ),
-        status_code=200 if ret.success else HTTPStatus.BAD_REQUEST,
-    )
-
-
 # example usage:
-# curl -s -X POST http://127.0.0.1:30000/clear_hicache_storage_backend
+# curl -s -X POST http://127.0.0.1:30000/hicache/storage-backend/clear
 @app.api_route("/hicache/storage-backend/clear", methods=["POST"])
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def clear_hicache_storage_backend():
@@ -1414,6 +1370,36 @@ async def update_weights_from_tensor(
     )
 
 
+@app.post("/begin_weight_update")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def begin_weight_update(
+    obj: Annotated[BeginWeightUpdateReqInput, Body()], request: Request
+):
+    """Open a weight-update session so in-place-quantized weights become loadable."""
+    success, message = await _global_state.tokenizer_manager.begin_weight_update(
+        obj, request
+    )
+    return ORJSONResponse(
+        {"success": success, "message": message},
+        status_code=HTTPStatus.OK if success else HTTPStatus.BAD_REQUEST,
+    )
+
+
+@app.post("/end_weight_update")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def end_weight_update(
+    obj: Annotated[EndWeightUpdateReqInput, Body()], request: Request
+):
+    """Close the weight-update session and finalize quantized weights."""
+    success, message = await _global_state.tokenizer_manager.end_weight_update(
+        obj, request
+    )
+    return ORJSONResponse(
+        {"success": success, "message": message},
+        status_code=HTTPStatus.OK if success else HTTPStatus.BAD_REQUEST,
+    )
+
+
 @app.post("/update_weights_from_distributed")
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def update_weights_from_distributed(
@@ -1559,6 +1545,23 @@ async def slow_down(obj: Annotated[SlowDownReqInput, Body()], request: Request):
         await _global_state.tokenizer_manager.slow_down(obj, request)
     except Exception as e:
         return _create_error_response(e)
+
+
+@app.api_route("/pd_role_switch", methods=["POST"])
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def pd_role_switch(
+    obj: Annotated[PdRoleSwitchReqInput, Body()], request: Request
+):
+    """Switch this instance's PD disaggregation role (prefill<->decode) at runtime.
+    Requires --enable-pd-role-switch; the instance must be idle."""
+    try:
+        result = await _global_state.tokenizer_manager.pd_role_switch(obj, request)
+    except Exception as e:
+        return _create_error_response(e)
+    return ORJSONResponse(
+        msgspec_to_builtins(result),
+        status_code=HTTPStatus.OK if result.success else HTTPStatus.BAD_REQUEST,
+    )
 
 
 @app.api_route("/load_lora_adapter", methods=["POST"])
@@ -2248,6 +2251,7 @@ def _execute_server_warmup(server_args: ServerArgs):
         bool(model_info.get("has_image_understanding", False))
         and not get_disagg().language_only
         and not get_disagg().language_model_only
+        and not get_exec().features.enable_encoder_swa_bounded_replay
         and not is_mps()
     )
     if model_info["is_generation"]:
@@ -2805,6 +2809,7 @@ def _start_native_grpc_server_for_runtime(
         port=grpc_port,
         runtime_handle=runtime_handle,
         worker_threads=get_serving().grpc_worker_threads,
+        response_timeout_secs=get_serving().grpc_response_timeout_secs,
     )
     logger.info(f"Native gRPC server started on {get_serving().host}:{grpc_port}")
     return grpc_handle
