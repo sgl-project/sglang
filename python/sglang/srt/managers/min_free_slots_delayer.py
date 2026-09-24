@@ -34,5 +34,10 @@ class MinFreeSlotsDelayer:
     def __init__(self, min_free_slots: int):
         self._min_free_slots = min_free_slots
 
-    def should_delay(self, *, running_bs: int, num_allocatable_reqs: int) -> bool:
-        return running_bs > 0 and num_allocatable_reqs < self._min_free_slots
+    def should_delay(
+        self, *, running_bs: int, num_allocatable_reqs: int, num_waiting_reqs: int
+    ) -> bool:
+        # Once every waiting request fits, waiting longer batches nothing more.
+        return running_bs > 0 and num_allocatable_reqs < min(
+            self._min_free_slots, num_waiting_reqs
+        )
