@@ -80,6 +80,9 @@ rewritten text as `data[].revised_prompt`; video responses use `revised_prompt`.
 Video creation waits for enhancement before returning the queued job. All `n`
 outputs share one rewritten prompt.
 
+Include enhancement in client-observed end-to-end latency. The response's
+`inference_time_s` measures diffusion execution, not the preceding SRT call.
+
 ## Configure the enhancer
 
 The configuration file is read at server startup. Its supported fields are:
