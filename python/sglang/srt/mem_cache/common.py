@@ -123,28 +123,34 @@ def free_kv_row_segments(
     segments: list[tuple[torch.Tensor, int]],
     *,
     swa_evicted_seqlen: int,
+    swa_dead_lo: int = 0,
 ) -> None:
     """Free ascending disjoint ``(kv_indices, start_pos)`` segments of one
-    request's kv row, split at the SWA eviction floor."""
+    request's kv row; ``[swa_dead_lo, swa_evicted_seqlen)`` goes back full-side only."""
+    dead_lo, dead_hi = swa_dead_lo, max(swa_evicted_seqlen, swa_dead_lo)
     swa_dead: list[tuple[torch.Tensor, int]] = []
     swa_alive: list[tuple[torch.Tensor, int]] = []
     for kv_indices, start_pos in segments:
-        num_indices = kv_indices.numel()
-        if num_indices == 0:
+        end_pos = start_pos + kv_indices.numel()
+        lo = min(max(dead_lo, start_pos), end_pos)
+        hi = min(max(dead_hi, start_pos), end_pos)
+        # start_pos <= lo <= hi <= end_pos
+        # inside [lo, hi) is the swa dead segment
+        if hi <= lo:
+            swa_alive.append((kv_indices, start_pos))
             continue
-        # Below the floor the SWA peers are already gone -- window eviction, or
-        # the deliberately unmapped prefix of a PD decode SWA-tail prealloc.
-        num_dead = min(max(swa_evicted_seqlen - start_pos, 0), num_indices)
-        if num_dead > 0:
-            swa_dead.append((kv_indices[:num_dead], start_pos))
-        if num_dead < num_indices:
-            swa_alive.append((kv_indices[num_dead:], start_pos + num_dead))
+        swa_dead.append((kv_indices[lo - start_pos : hi - start_pos], lo))
+
+        if lo > start_pos:
+            swa_alive.append((kv_indices[: lo - start_pos], start_pos))
+        if end_pos > hi:
+            swa_alive.append((kv_indices[hi - start_pos :], hi))
 
     if swa_dead and swa_alive:
         # The two sides are separate calls, so neither one's page-disjointness
-        # check sees a floor that splits a page between them.
+        # check sees a boundary that splits a page between them.
         assert swa_evicted_seqlen % allocator.page_size == 0, (
-            f"SWA eviction floor {swa_evicted_seqlen} splits a page "
+            f"SWA eviction cursor {swa_evicted_seqlen} splits a page "
             f"(page_size {allocator.page_size})"
         )
     if swa_dead:
