@@ -1,12 +1,14 @@
 from __future__ import annotations
 
-import dataclasses
 import logging
 import os
 from typing import TYPE_CHECKING, Any
 
+from sglang.srt.arg_groups.arg_utils import record_fields
 from sglang.srt.arg_groups.overrides import (
     declare_resolution,
+    model_config_of,
+    resolved_view,
     resolving_view,
 )
 from sglang.srt.environ import envs
@@ -20,6 +22,7 @@ logger = logging.getLogger(__name__)
 def handle_pd_disaggregation(server_args: ServerArgs) -> None:
     """Validate and normalize PD-disaggregation server args."""
     cfg = resolving_view(server_args)
+
     # "mooncake_tcp" is mooncake with the TCP transport forced: set MC_FORCE_TCP
     # so mooncake installs TcpTransport instead of RDMA, rewrite the backend to
     # mooncake, and skip RDMA HCA selection. Must run before backend-name checks.
@@ -47,6 +50,24 @@ def handle_pd_disaggregation(server_args: ServerArgs) -> None:
             "overhead without improving prefill performance."
         )
 
+    if not 0 <= cfg.disaggregation_decode_host_receive_threshold <= 1:
+        raise ValueError(
+            "--disaggregation-decode-host-receive-threshold must be between 0 and 1"
+        )
+    if cfg.disaggregation_decode_host_receive_threshold > 0:
+        if cfg.enable_hisparse or cfg.enable_pd_role_switch:
+            raise ValueError(
+                "Decode host receive does not yet support HiSparse or role switching"
+            )
+
+        if cfg.disaggregation_decode_retraction_backup == "cpu_tensor":
+            raise ValueError("Decode host KV buffering requires host_pool retraction")
+        declare_resolution(
+            server_args,
+            "handle_pd_disaggregation",
+            disaggregation_decode_retraction_backup="host_pool",
+        )
+
     if cfg.disaggregation_mode == "decode" and cfg.dcp_size > 1:
         # Fake transfer moves no KV and is only used for synthetic decode
         # benchmarks, so it does not need the DCP relayout from Mooncake/NIXL.
@@ -59,16 +80,6 @@ def handle_pd_disaggregation(server_args: ServerArgs) -> None:
                 "PD decode DCP requires --disaggregation-transfer-backend "
                 "mooncake, nixl, or fake for synthetic benchmarking, got "
                 f"{cfg.disaggregation_transfer_backend!r}."
-            )
-        if cfg.disaggregation_decode_enable_radix_cache:
-            raise ValueError(
-                "PD decode DCP currently requires chunk cache; "
-                "--disaggregation-decode-enable-radix-cache is not supported."
-            )
-        if cfg.enable_hierarchical_cache:
-            raise ValueError(
-                "PD decode DCP currently requires chunk cache; "
-                "--enable-hierarchical-cache is not supported."
             )
 
     if cfg.disaggregation_mode == "decode":
@@ -83,13 +94,12 @@ def handle_pd_disaggregation(server_args: ServerArgs) -> None:
                     "--disaggregation-decode-enable-radix-cache is incompatible "
                     "with --disaggregation-transfer-backend fake"
                 )
-            if cfg.speculative_algorithm is not None:
+            if cfg.speculative_algorithm not in (None, "DSPARK"):
                 raise ValueError(
                     "--disaggregation-decode-enable-radix-cache is incompatible "
                     "with speculative decoding "
                     f"(--speculative-algorithm {cfg.speculative_algorithm})"
                 )
-            from sglang.srt.arg_groups.overrides import resolved_view
 
             if resolved_view(server_args).enable_dp_attention:
                 logger.warning(
@@ -127,9 +137,9 @@ def handle_pd_disaggregation(server_args: ServerArgs) -> None:
             )
 
     elif cfg.disaggregation_mode == "prefill":
-        assert (
-            cfg.disaggregation_transfer_backend != "fake"
-        ), "Prefill server does not support 'fake' as the transfer backend"
+        assert cfg.disaggregation_transfer_backend != "fake", (
+            "Prefill server does not support 'fake' as the transfer backend"
+        )
 
         if envs.SGLANG_RUST_SERVER.get():
             _alias_bootstrap_port_to_api_port(server_args)
@@ -145,6 +155,39 @@ def handle_pd_disaggregation(server_args: ServerArgs) -> None:
                 f"got '{cfg.disaggregation_transfer_backend}'."
             )
 
+        # Reject features whose role-specific state is not rebuilt on a flip.
+        if cfg.enable_pd_role_switch:
+            view = resolved_view(server_args)
+            unsupported = []
+            if view.enable_dp_attention:
+                unsupported.append("DP attention (--enable-dp-attention)")
+            if view.ep_size > 1:
+                unsupported.append(f"expert parallelism (--ep-size {view.ep_size})")
+            if view.moe_a2a_backend != "none":
+                unsupported.append(
+                    f"MoE all-to-all (--moe-a2a-backend {view.moe_a2a_backend})"
+                )
+            if view.pp_size > 1:
+                unsupported.append(f"pipeline parallelism (--pp-size {view.pp_size})")
+            if view.dp_size > 1:
+                unsupported.append(f"data parallelism (--dp-size {view.dp_size})")
+            if view.dcp_size > 1:
+                unsupported.append(
+                    f"decode context parallelism (--dcp-size {view.dcp_size})"
+                )
+            if view.speculative_algorithm is not None:
+                unsupported.append(
+                    "speculative decoding "
+                    f"(--speculative-algorithm {view.speculative_algorithm})"
+                )
+            if unsupported:
+                raise ValueError(
+                    "--enable-pd-role-switch does not rebuild role-specific "
+                    "state for the following features: "
+                    + ", ".join(unsupported)
+                    + ". Remove these options or drop --enable-pd-role-switch."
+                )
+
 
 def _alias_bootstrap_port_to_api_port(server_args: ServerArgs) -> None:
     """Rust-server prefill serves the KV bootstrap registry on the api listener
@@ -156,7 +199,7 @@ def _alias_bootstrap_port_to_api_port(server_args: ServerArgs) -> None:
     cfg = resolving_view(server_args)
     default_port = next(
         f.default
-        for f in dataclasses.fields(server_args)
+        for f in record_fields(type(server_args))
         if f.name == "disaggregation_bootstrap_port"
     )
     if cfg.disaggregation_bootstrap_port not in (
@@ -217,13 +260,11 @@ def handle_encoder_disaggregation(server_args: Any):
         declare_resolution(
             server_args,
             "_handle_encoder_disaggregation",
-            disaggregation_ib_device=validate_ib_devices(
-                server_args, cfg.disaggregation_ib_device
-            ),
+            disaggregation_ib_device=validate_ib_devices(cfg.disaggregation_ib_device),
         )
 
     # Validate model type for encoder disaggregation
-    hf_config = server_args.get_model_config().hf_config
+    hf_config = model_config_of(server_args).hf_config
     model_arch = hf_config.architectures[0]
     if cfg.encoder_transfer_backend == "auto":
         declare_resolution(
@@ -256,9 +297,10 @@ def handle_encoder_disaggregation(server_args: Any):
         "KimiK25ForConditionalGeneration",
         "KimiK3ForConditionalGeneration",
         "MiMoV2ForCausalLM",
+        "Glm5NextForConditionalGeneration",
     ]:
         raise ValueError(
             f"Model type {model_arch} is not supported for encoder disaggregation. "
             f"Supported architectures: Qwen2VL, Qwen3VL, Qwen3.5, InternS2, "
-            f"Qwen2Audio, Qwen2.5Omni, Dots3-Note, Kimi, MiMoV2."
+            f"Qwen2Audio, Qwen2.5Omni, Dots3-Note, Kimi, MiMoV2, GLM5Next."
         )

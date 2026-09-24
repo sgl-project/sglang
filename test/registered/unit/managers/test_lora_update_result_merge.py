@@ -21,7 +21,7 @@ from sglang.srt.managers.tokenizer_control_mixin import _merge_lora_update_resul
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=2, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 def _ok(adapters=None) -> LoRAUpdateOutput:

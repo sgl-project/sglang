@@ -1,13 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
 """Numerical contract for request-static H3 denoise metadata."""
 
+from types import SimpleNamespace
 from unittest.mock import patch
 
+import pytest
 import torch
 
 from sglang.multimodal_gen.configs.models.dits.minimax_h3 import (
     MINIMAX_H3_ADALN_MODALITY_NUM,
 )
+from sglang.multimodal_gen.runtime.managers.forward_context import get_forward_context
 from sglang.multimodal_gen.runtime.models.schedulers.scheduling_minimax_h3_euler_ancestral import (
     _minimax_h3_euler_eta0_step,
     _minimax_h3_rf_v_to_x0,
@@ -16,12 +19,15 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.m
     MiniMaxH3DenoiseBranch,
     _build_local_embedding_layout,
     _minimax_h3_update_target_rows_,
+    minimax_h3_denoise_loop,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.packed_sequence import (
     minimax_h3_packed_sequence,
     minimax_h3_packed_sequence_ref2va_blocks,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.stages.denoising import (
+    MiniMaxH3DenoisingStage,
+    _build_cube_attn_metadata,
     _precompute_refined_prompt_embeds,
 )
 
@@ -196,6 +202,138 @@ def test_rank_local_token_tags_match_reference_slice():
                 torch.testing.assert_close(
                     branch.static_kwargs["block_token_tags"], expected, rtol=0, atol=0
                 )
+
+
+def test_cube_metadata_builder_uses_packed_layout_and_validates_step_count():
+    packed = minimax_h3_packed_sequence(
+        text_len=3,
+        latent_t=2,
+        latent_h=8,
+        latent_w=8,
+        audio_t=3,
+        include_keyframe_cond=False,
+    )
+    server_args = SimpleNamespace(
+        attention_backend="cube_sparse_attn",
+        component_attention_backends={},
+        attention_backend_config={
+            "local_cube_size": [4, 4, 4],
+            "topk_ratio_list": [1.0, 0.5],
+        },
+    )
+
+    metadata = _build_cube_attn_metadata(
+        server_args,
+        packed=packed,
+        num_steps=2,
+        device=torch.device("cpu"),
+    )
+    assert metadata.topk_ratio_list == [1.0, 0.5]
+    assert metadata.precomputed.layout.cube_token_size == 64
+
+    with pytest.raises(ValueError, match="denoise steps"):
+        _build_cube_attn_metadata(
+            server_args,
+            packed=packed,
+            num_steps=3,
+            device=torch.device("cpu"),
+        )
+
+
+def test_cube_metadata_follows_transformer_backend_override():
+    packed = minimax_h3_packed_sequence(
+        text_len=3,
+        latent_t=2,
+        latent_h=8,
+        latent_w=8,
+        audio_t=3,
+        include_keyframe_cond=False,
+    )
+    server_args = SimpleNamespace(
+        attention_backend="fa",
+        component_attention_backends={"transformer": "cube_sparse_attn"},
+        attention_backend_config={
+            "local_cube_size": [4, 4, 4],
+            "topk_ratio_list": [0.5],
+        },
+    )
+    assert (
+        _build_cube_attn_metadata(
+            server_args,
+            packed=packed,
+            num_steps=1,
+            device=torch.device("cpu"),
+        )
+        is not None
+    )
+
+    server_args.attention_backend = "cube_sparse_attn"
+    server_args.component_attention_backends["transformer"] = "fa"
+    assert (
+        _build_cube_attn_metadata(
+            server_args,
+            packed=packed,
+            num_steps=1,
+            device=torch.device("cpu"),
+        )
+        is None
+    )
+
+
+def test_cube_metadata_is_updated_per_step():
+    branch = _branch("t2va")
+    metadata = SimpleNamespace(current_timestep=-1, topk_ratio_list=[1.0, 0.25])
+    seen = []
+
+    def model_forward(_model, _kwargs, step):
+        seen.append((step, metadata.current_timestep))
+        return (
+            torch.zeros(int(branch.update_mask.sum()), 96),
+            torch.zeros(branch.audio_pos.numel(), 32),
+        )
+
+    minimax_h3_denoise_loop(
+        model=SimpleNamespace(prepare_adaln_plans=lambda _: None),
+        model_forward=model_forward,
+        positive=branch,
+        initial_video_rows=torch.zeros(branch.img_pos.numel(), 96),
+        initial_audio_rows=torch.zeros(branch.audio_pos.numel(), 32),
+        keyframe_cond_rows=None,
+        sigmas_video=[1.0, 0.5, 0.0],
+        sigmas_audio=[1.0, 0.5, 0.0],
+        device=torch.device("cpu"),
+        attn_metadata=metadata,
+    )
+
+    assert seen == [(0, 0), (1, 1)]
+
+
+def test_native_dit_forward_publishes_cube_metadata_in_forward_context():
+    metadata = SimpleNamespace(current_timestep=0, topk_ratio_list=[0.5])
+    batch = SimpleNamespace()
+
+    def model(**_kwargs):
+        context = get_forward_context()
+        assert context.current_timestep == 0
+        assert context.attn_metadata is metadata
+        assert context.forward_batch is batch
+        return torch.zeros(1, 96), torch.zeros(1, 32)
+
+    stage = MiniMaxH3DenoisingStage.__new__(MiniMaxH3DenoisingStage)
+    with patch.object(
+        MiniMaxH3DenoisingStage,
+        "_maybe_get_bcg_runner",
+        return_value=None,
+    ):
+        video, audio = stage._forward_dit(
+            model,
+            {},
+            0,
+            batch=batch,
+            attn_metadata=metadata,
+        )
+    assert video.shape == (1, 96)
+    assert audio.shape == (1, 32)
 
 
 def test_grouped_outputs_share_prompt_refinement():

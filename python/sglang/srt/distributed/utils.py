@@ -17,13 +17,14 @@ from typing import Any, Deque, Dict, Optional, Sequence, Tuple
 import torch
 from torch.distributed import TCPStore
 
+from sglang.srt.runtime_context import get_resources
+
 logger = logging.getLogger(__name__)
 
 
 def set_global_tcp_store(store: TCPStore) -> None:
     """Install the shared TCPStore created during distributed initialization;
     the handle lives on ``ctx.resources``."""
-    from sglang.srt.runtime_context import get_resources
 
     get_resources().tcp_store = store
     logger.info("Global TCPStore has been set")
@@ -39,7 +40,6 @@ def get_global_tcp_store() -> Optional[TCPStore]:
     Returns:
         The global TCPStore instance, or None if not initialized yet.
     """
-    from sglang.srt.runtime_context import get_resources
 
     store = get_resources().tcp_store
     if store is None:
@@ -197,13 +197,13 @@ class StatelessProcessGroup:
         """
         if self.rank == src:
             self.expire_data()
-            key = f"broadcast_from/{src}/" f"{self.broadcast_send_counter}"
+            key = f"broadcast_from/{src}/{self.broadcast_send_counter}"
             self.store.set(key, pickle.dumps(obj))
             self.broadcast_send_counter += 1
             self.entries.append((key, time.perf_counter()))
             return obj
         else:
-            key = f"broadcast_from/{src}/" f"{self.broadcast_recv_src_counter[src]}"
+            key = f"broadcast_from/{src}/{self.broadcast_recv_src_counter[src]}"
             recv_obj = pickle.loads(self.store.get(key))
             self.broadcast_recv_src_counter[src] += 1
             return recv_obj
