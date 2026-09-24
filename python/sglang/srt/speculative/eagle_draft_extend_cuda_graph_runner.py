@@ -551,7 +551,11 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             forward_batch.req_pool_indices,
         ]
         if self.model_runner.model_config.model_is_mrope:
-            buffers.mrope_positions.zero_()
+            if (
+                bs * self.captured_req_width != num_tokens
+                or forward_batch.mrope_positions is None
+            ):
+                buffers.mrope_positions.zero_()
             if forward_batch.mrope_positions is not None:
                 copy_dsts.append(buffers.mrope_positions[:, :num_tokens])
                 copy_srcs.append(forward_batch.mrope_positions)

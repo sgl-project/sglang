@@ -1131,32 +1131,48 @@ class EagleDraftWorker(EagleDraftWorkerBase):
     def _draft_extend_for_decode(
         self, batch: ScheduleBatch, batch_result: GenerationBatchResult
     ):
+        # Cast to int64 before entering plan stream to avoid cross-stream
+        # synchronization issues with .to() inside the plan stream context.
+        if batch_result.prepared_draft_extend_inputs is not None:
+            num_correct_drafts, select_index, next_token_ids = (
+                batch_result.prepared_draft_extend_inputs
+            )
+        elif batch_result.accept_lens.is_cuda:
+            from sglang.kernels.ops.speculative.eagle import prepare_draft_extend_inputs
+
+            num_correct_drafts, select_index, next_token_ids = (
+                prepare_draft_extend_inputs(
+                    batch_result.accept_lens,
+                    batch_result.next_token_ids,
+                    self.speculative_num_draft_tokens,
+                )
+            )
+        else:
+            num_correct_drafts = batch_result.accept_lens - 1
+            select_index = (
+                torch.arange(
+                    0,
+                    len(batch.seq_lens) * self.speculative_num_draft_tokens,
+                    self.speculative_num_draft_tokens,
+                    device=self.device,
+                )
+                + batch_result.accept_lens
+                - 1
+            )
+
+            next_token_ids = batch_result.next_token_ids.to(torch.int64)
+
         # Batch 2: Draft extend
         draft_extend_input = EagleDraftExtendInput(
             hidden_states=batch_result.logits_output.hidden_states,
             # accept_lens includes the bonus token; correct drafts exclude it.
-            num_correct_drafts=batch_result.accept_lens - 1,
+            num_correct_drafts=num_correct_drafts,
             num_accept_tokens=batch_result.accept_lens,
             # Draft-extend fills the whole tree width (num_draft_tokens) per req,
             # not num_steps + 1, so DP MLP-sync padding stays consistent for topk > 1.
             num_tokens_per_req=self.speculative_num_draft_tokens,
             num_tokens_for_logprob_per_req=self.speculative_num_draft_tokens,
         )
-        select_index = (
-            torch.arange(
-                0,
-                len(batch.seq_lens) * self.speculative_num_draft_tokens,
-                self.speculative_num_draft_tokens,
-                device=self.device,
-            )
-            + batch_result.accept_lens
-            - 1
-        )
-
-        # Cast to int64 before entering plan stream to avoid cross-stream
-        # synchronization issues with .to() inside the plan stream context.
-        next_token_ids = batch_result.next_token_ids.to(torch.int64)
-
         # Prepare for draft extend in a separate stream
         with self.plan_stream_ctx:
             forward_batch = prepare_for_draft_extend(
@@ -1253,10 +1269,19 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         elif self.topk == 1 and not _is_hip:
             # Gated to CUDA: see #26358 — ROCm's argmax tie-break corrupts
             # MTP draft selection on FP8 logits.
-            ret_topk_index = torch.argmax(
-                draft_logits_output.next_token_logits, dim=-1, keepdim=True
-            )
-            ret_topk_p = torch.ones_like(ret_topk_index, dtype=torch.float32)
+            logits = draft_logits_output.next_token_logits
+            if (
+                _is_cuda
+                and logits.dtype == torch.float32
+                and logits.stride(-1) == 1
+                and logits.shape[-1] >= 131072
+            ):
+                from sglang.kernels.ops.speculative.row_argmax import speculative_argmax
+
+                ret_topk_p, ret_topk_index = speculative_argmax(logits, with_probs=True)
+            else:
+                ret_topk_index = torch.argmax(logits, dim=-1, keepdim=True)
+                ret_topk_p = torch.ones_like(ret_topk_index, dtype=torch.float32)
             ret_draft_probs = None
         else:
             probs = renorm_draft_probs(

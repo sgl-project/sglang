@@ -566,14 +566,17 @@ def eagle_prepare_for_verify(
         # Uniform variant: end offsets (= start + draft_token_num) are computed
         # inside the kernel, keeping the eager `seq_lens + N` add off the host
         # critical path (bs=1 MTP inter-phase seam).
-        batch.out_cache_loc = assign_extend_cache_locs_uniform_func(
-            req_pool_indices=batch.req_pool_indices,
-            req_to_token=req_to_token_pool.req_to_token,
-            start_offset=batch.seq_lens,
-            batch_size=bs,
-            draft_token_num=verify_input.draft_token_num,
-            device=device,
-        )
+        if verify_input.prepared_out_cache_loc is not None:
+            batch.out_cache_loc = verify_input.prepared_out_cache_loc
+        else:
+            batch.out_cache_loc = assign_extend_cache_locs_uniform_func(
+                req_pool_indices=batch.req_pool_indices,
+                req_to_token=req_to_token_pool.req_to_token,
+                start_offset=batch.seq_lens,
+                batch_size=bs,
+                draft_token_num=verify_input.draft_token_num,
+                device=device,
+            )
 
         batch.out_cache_loc_dsv4 = maybe_build_dsv4_verify_bundle(
             batch, verify_input.draft_token_num
@@ -601,6 +604,7 @@ def eagle_prepare_for_verify(
         target_worker.model_runner,
         capture_hidden_mode=capture_mode,
         return_hidden_states_before_norm=False,
+        spec_mrope_positions=verify_input.prepared_mrope_positions,
     )
 
     # Run attention backend plan and cuda graph preparation
@@ -797,36 +801,66 @@ def eagle_sample(
         grammar_mask.apply(next_token_logits)
 
     candidates = verify_input.draft_token.reshape(bs, verify_input.draft_token_num)
-    predict_shape = list(next_token_logits.shape)[:-1]
-    predict = torch.zeros(predict_shape, dtype=torch.int32, device=device).flatten()
-    accept_index = torch.full(
-        (bs, verify_input.max_tree_depth), -1, dtype=torch.int32, device=device
-    )
-    num_correct_drafts = torch.empty((bs,), dtype=torch.int32, device=device)
-
-    # Sample tokens
-    target_predict = None
     use_rejection_sampling = get_spec().speculative_use_rejection_sampling
-    if _verify_uses_greedy(
+    use_greedy = _verify_uses_greedy(
         is_all_greedy=sampling_info.is_all_greedy,
         is_cpu=_is_cpu,
         is_hip=_is_hip,
         is_xpu=_is_xpu,
         use_rejection_sampling=use_rejection_sampling,
-    ):
-        target_predict = torch.argmax(next_token_logits, dim=-1)
-        target_predict = target_predict.reshape(bs, verify_input.draft_token_num)
-        predict, accept_index, num_correct_drafts = verify_tree_greedy_func(
-            predicts=predict,  # mutable
-            accept_index=accept_index,  # mutable
-            accept_token_num=num_correct_drafts,  # mutable
-            candidates=candidates,
-            retrieve_index=verify_input.retrieve_index,
-            retrieve_next_token=verify_input.retrieve_next_token,
-            retrieve_next_sibling=verify_input.retrieve_next_sibling,
-            target_predict=target_predict,
-            topk=verify_input.tree_topk,
+    )
+    fused_chain_greedy = (
+        use_greedy
+        and _is_cuda
+        and verify_input.tree_topk == 1
+        and verify_input.draft_token_num == verify_input.max_tree_depth
+        and next_token_logits.dtype == torch.float32
+        and next_token_logits.stride(-1) == 1
+        and next_token_logits.shape[-1] >= 131072
+        and candidates.stride(-1) == 1
+        and verify_input.draft_token_num <= 16
+    )
+    target_predict = None
+    if fused_chain_greedy:
+        from sglang.kernels.ops.speculative.row_argmax import greedy_verify_chain
+
+        predict, accept_index, num_correct_drafts, target_predict = greedy_verify_chain(
+            next_token_logits, candidates
         )
+    else:
+        predict_shape = list(next_token_logits.shape)[:-1]
+        predict = torch.zeros(predict_shape, dtype=torch.int32, device=device).flatten()
+        accept_index = torch.full(
+            (bs, verify_input.max_tree_depth), -1, dtype=torch.int32, device=device
+        )
+        num_correct_drafts = torch.empty((bs,), dtype=torch.int32, device=device)
+
+    # Sample tokens
+    if use_greedy:
+        if not fused_chain_greedy:
+            if (
+                _is_cuda
+                and next_token_logits.dtype == torch.float32
+                and next_token_logits.stride(-1) == 1
+                and next_token_logits.shape[-1] >= 131072
+            ):
+                from sglang.kernels.ops.speculative.row_argmax import speculative_argmax
+
+                target_predict = speculative_argmax(next_token_logits)
+            else:
+                target_predict = torch.argmax(next_token_logits, dim=-1)
+            target_predict = target_predict.reshape(bs, verify_input.draft_token_num)
+            predict, accept_index, num_correct_drafts = verify_tree_greedy_func(
+                predicts=predict,  # mutable
+                accept_index=accept_index,  # mutable
+                accept_token_num=num_correct_drafts,  # mutable
+                candidates=candidates,
+                retrieve_index=verify_input.retrieve_index,
+                retrieve_next_token=verify_input.retrieve_next_token,
+                retrieve_next_sibling=verify_input.retrieve_next_sibling,
+                target_predict=target_predict,
+                topk=verify_input.tree_topk,
+            )
 
         if _is_hip:
             # On ROCm, the per-rank draft tokens can differ, so ranks accept a
@@ -1068,22 +1102,25 @@ def eagle_prepare_for_decode(batch: ScheduleBatch):
     for r in batch.reqs:
         r.decode_batch_idx += 1
 
-    cur_kv_lens_cpu = torch.tensor(cur_kv_lens, dtype=torch.int32, device="cpu")
-    nxt_kv_lens_cpu = torch.tensor(nxt_kv_lens, dtype=torch.int32, device="cpu")
-
     # Fail fast if the page>1 + topk>1 draft over-allocation
     # (get_alloc_reserve_per_decode) outgrows the req_to_token row: the write below
     # would OOB and free would leak KV. The row is widened to hold it in _init_pools
     # (PR #26972); fail here with a clear error, not on a later cryptic CUDA assert.
 
     if page_size > 1 and (get_spec().speculative_eagle_topk or 1) > 1:
-        max_alloc_len = int(nxt_kv_lens_cpu.max())
+        max_alloc_len = max(nxt_kv_lens)
         row_width = batch.req_to_token_pool.req_to_token.shape[1]
         assert max_alloc_len <= row_width, (
             f"spec v2 page>1 topk>1 draft over-allocation ({max_alloc_len}) exceeds "
             f"req_to_token row width ({row_width}); page_size={page_size}. Widen the "
             f"row to hold committed + get_alloc_reserve_per_decode (PR #26972)."
         )
+
+    if num_needed_tokens == 0:
+        return
+
+    cur_kv_lens_cpu = torch.tensor(cur_kv_lens, dtype=torch.int32, device="cpu")
+    nxt_kv_lens_cpu = torch.tensor(nxt_kv_lens, dtype=torch.int32, device="cpu")
 
     # non_blocking H2D: a blocking .to() syncs the schedule stream, which the WAR
     # barrier has chained to the prev forward -> host stalls a full forward.

@@ -44,6 +44,11 @@ def assign_draft_cache_locs_contiguous(
     pool_len: tl.constexpr,
     topk: tl.constexpr,
     speculative_num_steps: tl.constexpr,
+    positions=None,
+    mrope=None,
+    BS: tl.constexpr = 0,
+    WRITE_POSITIONS: tl.constexpr = False,
+    WRITE_MROPE: tl.constexpr = False,
 ):
     BLOCK_SIZE: tl.constexpr = 128
     pid = tl.program_id(axis=0)
@@ -60,6 +65,17 @@ def assign_draft_cache_locs_contiguous(
         mask = copy_offset < copy_len
         data = tl.load(token_pool + kv_start + copy_offset, mask=mask)
         tl.store(out_cache_ptr + copy_offset, data, mask=mask)
+
+    if WRITE_POSITIONS:
+        topk_offset = tl.arange(0, BLOCK_SIZE)
+        tl.store(positions + pid * topk + topk_offset, kv_start, topk_offset < topk)
+        if WRITE_MROPE:
+            for axis in tl.static_range(3):
+                tl.store(
+                    mrope + axis * BS * topk + pid * topk + topk_offset,
+                    kv_start,
+                    topk_offset < topk,
+                )
 
 
 @triton.jit

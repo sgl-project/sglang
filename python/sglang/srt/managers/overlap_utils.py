@@ -6,7 +6,10 @@ from typing import TYPE_CHECKING, Any, Optional, Sequence
 import msgspec
 import torch
 
-from sglang.kernels.ops.speculative.gather_spec_extras import gather_spec_extras
+from sglang.kernels.ops.speculative.gather_spec_extras import (
+    gather_spec_extras,
+    scatter_spec_extras,
+)
 from sglang.srt.environ import envs
 from sglang.srt.runtime_context import (
     get_exec,
@@ -421,6 +424,33 @@ class FutureMap:
         indices = draft_input.future_indices
         if indices.shape[0] == 0:
             return
+        if (
+            indices.is_cuda
+            and indices.shape[0] == 1
+            and indices is batch.req_pool_indices
+            and len(batch.reqs) == 1
+            and not _DEBUG_ASSERT
+        ):
+            row = batch.reqs[0].kv.req_pool_idx
+            draft_input.bonus_tokens = self.output_tokens_buf.narrow(0, row, 1)
+            if self.need_topk:
+                draft_input.topk_p = self.topk_p_buf.narrow(0, row, 1)
+                draft_input.topk_index = self.topk_index_buf.narrow(0, row, 1)
+                if (
+                    self.draft_probs_buf is not None
+                    and draft_input.draft_probs is not None
+                ):
+                    draft_input.draft_probs = self.draft_probs_buf.narrow(0, row, 1)
+            if self.need_hidden_states:
+                draft_input.hidden_states = self.hidden_states_buf.narrow(0, row, 1)
+            if draft_input.future_dsa_topk_indices_available:
+                assert self.dsa_topk_indices_buf is not None
+                draft_input.dsa_topk_indices = self.dsa_topk_indices_buf.narrow(
+                    0, row, 1
+                )
+            else:
+                draft_input.dsa_topk_indices = None
+            return
         # FIXME: indices = batch.req_pool_indices, pinned 2 iters via
         # record_batch_in_overlap; record_stream here is redundant.
         indices.record_stream(torch.get_device_module(self.device).current_stream())
@@ -605,6 +635,26 @@ class FutureMap:
             return
         self._maybe_init_forward_bufs(payload)
         self._maybe_init_dsa_topk_indices_buf(payload)
+        if indices.is_cuda:
+            pairs = [(self.output_tokens_buf, payload.bonus_tokens)]
+            if self.need_topk:
+                pairs.extend(
+                    [
+                        (self.topk_p_buf, payload.topk_p),
+                        (self.topk_index_buf, payload.topk_index),
+                    ]
+                )
+            if self.need_hidden_states:
+                pairs.append((self.hidden_states_buf, payload.hidden_states))
+            if self.draft_probs_buf is not None and payload.draft_probs is not None:
+                pairs.append((self.draft_probs_buf, payload.draft_probs))
+            if (
+                self.dsa_topk_indices_buf is not None
+                and payload.dsa_topk_indices is not None
+            ):
+                pairs.append((self.dsa_topk_indices_buf, payload.dsa_topk_indices))
+            scatter_spec_extras(indices, pairs)
+            return
         self.output_tokens_buf[indices] = payload.bonus_tokens.to(
             self.output_tokens_buf.dtype
         )

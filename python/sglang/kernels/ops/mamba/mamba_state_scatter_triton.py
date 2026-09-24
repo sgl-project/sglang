@@ -147,6 +147,208 @@ def track_mamba_states_if_needed(
 
 
 @triton.jit
+def _fused_mamba_state_scatter_multi_kernel(
+    src_ptrs,
+    dst_ptrs,
+    dst_indices_ptr,
+    step_indices_ptr,
+    dst_indices_stride,
+    step_indices_stride,
+    LAYERS: tl.constexpr,
+    ELEMENTS: tl.constexpr,
+    BLOCKS: tl.constexpr,
+    ENTRY_LAYOUTS: tl.constexpr,
+    SRC_STRIDES: tl.constexpr,
+    DST_STRIDES: tl.constexpr,
+    SRC_SIZES: tl.constexpr,
+    DST_SIZES: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+    track_indices_ptr,
+    track_steps_ptr,
+    track_indices_stride,
+    track_steps_stride,
+    BS: tl.constexpr,
+    HAS_TRACK: tl.constexpr,
+    TRACK_BLOCK: tl.constexpr,
+):
+    req = tl.program_id(0).to(tl.int64)
+    tile = tl.program_id(1).to(tl.int64)
+    active_dst = tl.load(dst_indices_ptr + req * dst_indices_stride).to(tl.int64)
+    active_step = tl.load(step_indices_ptr + req * step_indices_stride).to(tl.int64)
+    if HAS_TRACK:
+        track_dst = tl.load(track_indices_ptr + req * track_indices_stride).to(tl.int64)
+        track_step = tl.load(track_steps_ptr + req * track_steps_stride).to(tl.int64)
+        rows = tl.arange(0, TRACK_BLOCK)
+        all_track_dst = tl.load(
+            track_indices_ptr + rows * track_indices_stride, rows < BS, other=-1
+        ).to(tl.int64)
+        all_track_step = tl.load(
+            track_steps_ptr + rows * track_steps_stride, rows < BS, other=-1
+        ).to(tl.int64)
+    first_tile = 0
+    for i in tl.static_range(len(LAYERS)):
+        if (tile >= first_tile) & (tile < first_tile + LAYERS[i] * BLOCKS[i]):
+            overwritten = False
+            if HAS_TRACK:
+                valid_track = (
+                    (rows < BS)
+                    & (rows < SRC_SIZES[i][0])
+                    & (all_track_step >= 0)
+                    & (all_track_step < SRC_SIZES[i][1])
+                )
+                overwritten = (
+                    tl.sum(
+                        (valid_track & (all_track_dst == active_dst)).to(tl.int32), 0
+                    )
+                    > 0
+                )
+            for commit in tl.static_range(2 if HAS_TRACK else 1):
+                dst_idx = active_dst
+                step = active_step
+                enabled = not overwritten
+                if commit == 1:
+                    dst_idx = track_dst
+                    step = track_step
+                    enabled = True
+                if (
+                    enabled
+                    & (dst_idx >= 0)
+                    & (dst_idx < DST_SIZES[i])
+                    & (req < SRC_SIZES[i][0])
+                    & (step >= 0)
+                    & (step < SRC_SIZES[i][1])
+                ):
+                    local_tile = tile - first_tile
+                    local_layer = local_tile // BLOCKS[i]
+                    block = local_tile % BLOCKS[i]
+                    offsets = block * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+                    if ENTRY_LAYOUTS[i][0] > 0:
+                        source_offsets = (
+                            offsets // ENTRY_LAYOUTS[i][0] * ENTRY_LAYOUTS[i][1]
+                            + offsets % ENTRY_LAYOUTS[i][0] * ENTRY_LAYOUTS[i][2]
+                        )
+                    else:
+                        source_offsets = offsets
+                    src_offset = (
+                        local_layer * SRC_STRIDES[i][0]
+                        + req * SRC_STRIDES[i][1]
+                        + step * SRC_STRIDES[i][2]
+                    )
+                    dst_offset = (
+                        local_layer * DST_STRIDES[i][0] + dst_idx * DST_STRIDES[i][1]
+                    )
+                    values = tl.load(
+                        src_ptrs[i] + src_offset + source_offsets,
+                        mask=offsets < ELEMENTS[i],
+                    )
+                    tl.store(
+                        dst_ptrs[i] + dst_offset + offsets,
+                        values,
+                        mask=offsets < ELEMENTS[i],
+                    )
+        first_tile += LAYERS[i] * BLOCKS[i]
+
+
+def prepare_mamba_state_scatter_multi(state_pairs):
+    device = state_pairs[0][0].device
+    for dst, src in state_pairs:
+        if dst.device != device or src.device != device:
+            raise ValueError("states and indices must be on the same CUDA device")
+        if dst.ndim < 2 or src.ndim < 3:
+            raise ValueError("unexpected state ranks")
+        if dst.shape[0] != src.shape[0] or dst.shape[2:] != src.shape[3:]:
+            raise ValueError("state layer and trailing dimensions must match")
+        _require_entry_contiguous_dst(dst, 2, "fused_mamba_state_scatter_multi")
+        if not src.is_contiguous() and src.ndim != 5:
+            raise ValueError("src entries must be contiguous or two-dimensional")
+    layers = tuple(dst.shape[0] for dst, _ in state_pairs)
+    elements = tuple(
+        dst.numel() // (dst.shape[0] * dst.shape[1]) for dst, _ in state_pairs
+    )
+    blocks = tuple(triton.cdiv(n, 1024) for n in elements)
+    entry_layouts = tuple(
+        (
+            (0, 0, 0)
+            if src.is_contiguous()
+            else (src.shape[-1], src.stride(-2), src.stride(-1))
+        )
+        for _, src in state_pairs
+    )
+    return (
+        device,
+        (
+            tuple(src for _, src in state_pairs),
+            tuple(dst for dst, _ in state_pairs),
+        ),
+        (
+            layers,
+            elements,
+            blocks,
+            entry_layouts,
+            tuple(src.stride()[:3] for _, src in state_pairs),
+            tuple(dst.stride()[:2] for dst, _ in state_pairs),
+            tuple(src.shape[1:3] for _, src in state_pairs),
+            tuple(dst.shape[1] for dst, _ in state_pairs),
+        ),
+        sum(n * b for n, b in zip(layers, blocks)),
+    )
+
+
+def fused_mamba_state_scatter_multi(
+    state_pairs,
+    dst_indices,
+    step_indices,
+    track_indices=None,
+    track_steps=None,
+    *,
+    _metadata=None,
+):
+    if not state_pairs or step_indices.numel() == 0:
+        return
+    if dst_indices.ndim != 1 or step_indices.ndim != 1:
+        raise ValueError("indices must be 1D")
+    if dst_indices.shape != step_indices.shape:
+        raise ValueError("indices must have matching shapes")
+    if (track_indices is None) != (track_steps is None):
+        raise ValueError("track indices and steps must be supplied together")
+    indices_to_check = (dst_indices, step_indices)
+    if track_indices is not None:
+        if (
+            track_indices.shape != step_indices.shape
+            or track_steps.shape != step_indices.shape
+        ):
+            raise ValueError("track indices must have matching shapes")
+        indices_to_check += (track_indices, track_steps)
+    for indices in indices_to_check:
+        if indices.dtype not in (torch.int32, torch.int64):
+            raise ValueError("indices must have int32 or int64 dtype")
+        if not indices.is_cuda or indices.device != step_indices.device:
+            raise ValueError("indices must be on the same CUDA device")
+    metadata = _metadata or prepare_mamba_state_scatter_multi(state_pairs)
+    device, pointers, constants, tiles = metadata
+    if device != step_indices.device:
+        raise ValueError("states and indices must be on the same CUDA device")
+    _fused_mamba_state_scatter_multi_kernel[(step_indices.numel(), tiles)](
+        *pointers,
+        dst_indices,
+        step_indices,
+        dst_indices.stride(0),
+        step_indices.stride(0),
+        *constants,
+        BLOCK_SIZE=1024,
+        track_indices_ptr=track_indices,
+        track_steps_ptr=track_steps,
+        track_indices_stride=(
+            track_indices.stride(0) if track_indices is not None else 0
+        ),
+        track_steps_stride=track_steps.stride(0) if track_steps is not None else 0,
+        BS=step_indices.numel(),
+        HAS_TRACK=track_indices is not None,
+        TRACK_BLOCK=triton.next_power_of_2(step_indices.numel()),
+    )
+
+
+@triton.jit
 def _fused_mamba_state_scatter_with_mask_kernel(
     src_ptr,
     dst_ptr,
@@ -288,9 +490,13 @@ def fused_mamba_state_scatter_with_mask(
     dst_layer_stride = dst.stride(0)
     dst_req_stride = dst.stride(1)
 
-    # Ensure indices are int32 and contiguous
-    dst_indices_raw = dst_indices_raw.to(torch.int32).contiguous()
-    step_indices_raw = step_indices_raw.to(torch.int32).contiguous()
+    # Ensure index buffers are contiguous.
+    if dst_indices_raw.dtype not in (torch.int32, torch.int64):
+        dst_indices_raw = dst_indices_raw.to(torch.int32)
+    if step_indices_raw.dtype not in (torch.int32, torch.int64):
+        step_indices_raw = step_indices_raw.to(torch.int32)
+    dst_indices_raw = dst_indices_raw.contiguous()
+    step_indices_raw = step_indices_raw.contiguous()
 
     _require_entry_contiguous_dst(dst, 2, "fused_mamba_state_scatter_with_mask")
     if not src.is_contiguous():
@@ -893,3 +1099,58 @@ def track_mamba_states_all_layers(
         BLOCK_SIZE,
         check_freed_slots,
     )
+
+
+@triton.jit
+def _gather_mamba_track_indices_kernel(
+    mapping,
+    requests,
+    positions,
+    output,
+    N: tl.constexpr,
+    ROWS: tl.constexpr,
+    ROW_STRIDE: tl.constexpr,
+    COL_STRIDE: tl.constexpr,
+    REQ_STRIDE: tl.constexpr,
+    POS_STRIDE: tl.constexpr,
+    BLOCK: tl.constexpr,
+    HAS_POSITIONS: tl.constexpr,
+    UNIFORM_POSITION,
+):
+    i = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    req = tl.load(requests + i * REQ_STRIDE, i < N, other=0).to(tl.int64)
+    req = tl.where(req < 0, req + ROWS, req)
+    if HAS_POSITIONS:
+        pos = tl.load(positions + i * POS_STRIDE, i < N, other=0).to(tl.int64)
+    else:
+        pos = tl.full((), 0, tl.int64) + UNIFORM_POSITION
+    value = tl.load(mapping + req * ROW_STRIDE + pos * COL_STRIDE, i < N, other=0)
+    tl.store(output + i, value, i < N)
+
+
+def gather_mamba_track_indices(
+    mapping, requests, positions=None, uniform_position=None
+):
+    n = requests.numel()
+    if positions is not None:
+        assert positions.numel() == n
+    else:
+        assert uniform_position is not None and 0 <= uniform_position < mapping.shape[1]
+    output = torch.empty((n,), dtype=torch.int64, device=mapping.device)
+    if n:
+        _gather_mamba_track_indices_kernel[(triton.cdiv(n, 128),)](
+            mapping,
+            requests,
+            positions,
+            output,
+            n,
+            mapping.shape[0],
+            mapping.stride(0),
+            mapping.stride(1),
+            requests.stride(0),
+            positions.stride(0) if positions is not None else 0,
+            BLOCK=128,
+            HAS_POSITIONS=positions is not None,
+            UNIFORM_POSITION=uniform_position if positions is None else 0,
+        )
+    return output
