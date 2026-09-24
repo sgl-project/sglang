@@ -276,6 +276,13 @@ class ExecKernel(msgspec.Struct):
             choices=["auto", "deepgemm", "cutedsl", "aiter"],
         ),
     ] = "auto"
+    dsa_mqa_logits_backend: A[
+        str,
+        Arg(
+            help="DSA indexer non-paged MQA logits backend on ROCm. Options: 'auto' or 'triton' (default), 'flydsl' (gfx950 only).",
+            choices=["auto", "triton", "flydsl"],
+        ),
+    ] = "auto"
     dsa_topk_backend: A[
         str,
         Arg(
