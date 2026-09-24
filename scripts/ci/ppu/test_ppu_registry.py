@@ -36,6 +36,7 @@ CI_REGISTER_PATH = REPO_ROOT / "python" / "sglang" / "test" / "ci" / "ci_registe
 RUN_SUITE_PATH = REPO_ROOT / "test" / "run_suite.py"
 COVERAGE_REPORT_PATH = REPO_ROOT / "scripts" / "ci" / "utils" / "ci_coverage_report.py"
 WORKFLOW_PATH = REPO_ROOT / ".github" / "workflows" / "pr-test-ppu.yml"
+SHARED_GATE_PATH = REPO_ROOT / ".github" / "workflows" / "pr-gate.yml"
 SLASH_HANDLER_PATH = REPO_ROOT / "scripts" / "ci" / "utils" / "slash_command_handler.py"
 PACKAGE_LINT_PATH = (
     REPO_ROOT / "scripts" / "lint" / "check_no_registered_tests_in_package.py"
@@ -248,13 +249,13 @@ class PPURunSuiteWiringTest(unittest.TestCase):
 class PPUWorkflowShapeTest(unittest.TestCase):
     """Load-bearing details of pr-test-ppu.yml that a template refactor could quietly regress."""
 
-    def _workflow(self) -> dict:
+    def _workflow(self, path=WORKFLOW_PATH) -> dict:
         try:
             import yaml
         except ImportError:
             self.skipTest("PyYAML not installed")
 
-        return yaml.safe_load(WORKFLOW_PATH.read_text())
+        return yaml.safe_load(path.read_text())
 
     def _run_label_gate(
         self,
@@ -263,16 +264,27 @@ class PPUWorkflowShapeTest(unittest.TestCase):
         event="pull_request",
         payload_labels=(),
         api_error=None,
-        attempt="1",
     ):
+        """Execute the shared metadata fetch and label checks, not a GHA runner.
+
+        Only the network response is mocked. Step conditions and shell bodies
+        come from the shared workflow; draft and cooldown checks are out of scope.
+        """
         if shutil.which("node") is None:
             self.skipTest("Node.js not installed")
-        steps = self._workflow()["jobs"]["check-changes"]["steps"]
-        gate = next((step for step in steps if step.get("id") == "ppu-labels"), None)
-        self.assertIsNotNone(gate, "PPU needs a runtime label gate before dispatch")
+        shared = self._workflow(SHARED_GATE_PATH)["jobs"]["pr-gate"]
+        gate = next(step for step in shared["steps"] if step.get("id") == "pr")
         self.assertTrue(gate["uses"].startswith("actions/github-script@"))
         self.assertNotIn("continue-on-error", gate)
-        self.assertNotIn("if", gate)
+        self.assertIn("IS_PR_EVENT", shared.get("env", {}), "Shared gate needs #40999")
+        is_pr = self._workflow_value(shared["env"]["IS_PR_EVENT"], event=event)
+        values = {
+            "event": event,
+            "env": {"IS_PR_EVENT": is_pr},
+            "workflow_inputs": self._workflow()["jobs"]["pr-gate"]["with"],
+        }
+        if self._workflow_value("${{ " + gate["if"] + " }}", **values) != "true":
+            return {"outputs": {}, "calls": [], "returncode": 0}
         driver = """
 const input = JSON.parse(require('fs').readFileSync(0, 'utf8'));
 const outputs = {};
@@ -286,7 +298,10 @@ const context = {
 const github = {rest: {pulls: {get: async (args) => {
   calls.push(args);
   if (input.api_error) throw new Error(input.api_error);
-  return {data: {labels: input.live_labels.map(name => ({name}))}};
+  return {data: {
+    labels: input.live_labels.map(name => ({name})),
+    draft: false, user: {login: 'test-author'}
+  }};
 }}}};
 const core = {
   setOutput: (name, value) => { outputs[name] = String(value); },
@@ -306,7 +321,6 @@ const AsyncFunction = Object.getPrototypeOf(async function() {}).constructor;
 """
         result = subprocess.run(
             ["node", "-e", driver],
-            env={**os.environ, "GITHUB_RUN_ATTEMPT": attempt},
             input=json.dumps(
                 {
                     "script": gate["with"]["script"],
@@ -321,7 +335,36 @@ const AsyncFunction = Object.getPrototypeOf(async function() {}).constructor;
             check=True,
             timeout=10,
         )
-        return json.loads(result.stdout)
+        result = json.loads(result.stdout)
+        result["returncode"] = 1 if "error" in result else 0
+        if result["returncode"]:
+            return result
+        values["steps"] = {"pr": {"outputs": result["outputs"]}}
+        for name in (
+            "Require run-ci label (optional)",
+            "Require additional label (optional)",
+        ):
+            step = next((s for s in shared["steps"] if s.get("name") == name), None)
+            self.assertIsNotNone(step, f"Missing shared label check: {name}")
+            self.assertNotIn("continue-on-error", step)
+            if self._workflow_value("${{ " + step["if"] + " }}", **values) != "true":
+                continue
+            shell_env = {
+                key: self._workflow_value(value, **values)
+                for key, value in step.get("env", {}).items()
+            }
+            completed = subprocess.run(
+                ["bash", "-e", "-c", self._workflow_value(step["run"], **values)],
+                env={**os.environ, **shell_env},
+                text=True,
+                capture_output=True,
+                timeout=10,
+            )
+            result["returncode"] = completed.returncode
+            result["message"] = completed.stdout + completed.stderr
+            if completed.returncode:
+                break
+        return result
 
     def _workflow_value(
         self,
@@ -334,25 +377,33 @@ const AsyncFunction = Object.getPrototypeOf(async function() {}).constructor;
         input_ref="",
         run_id="100",
         attempt="1",
-        label_attempt="1",
+        check_attempt="1",
         ppu="true",
+        steps=None,
+        env=None,
+        workflow_inputs=None,
     ):
         """Evaluate the string/boolean subset used by the current expressions.
 
         This does not simulate GHA scheduling or general expression semantics.
         Comparisons and short-circuit evaluation match JavaScript for these
-        fixed inputs. Only hyphenated job access and single-argument format
-        need adaptation; grouping and authorization logic are not duplicated.
+        fixed inputs. Hyphenated property access, single-argument format,
+        fromJson, and string-array contains are adapted for the expressions
+        under test; grouping and authorization logic are not duplicated.
         """
         if shutil.which("node") is None:
             self.skipTest("Node.js not installed")
         driver = r"""
 const input = JSON.parse(require('fs').readFileSync(0, 'utf8'));
 const format = (template, value) => template.replace('{0}', String(value));
+const contains = (items, value) => items.some(
+  item => String(item).toLowerCase() === String(value).toLowerCase());
 const rendered = input.value.replace(/\$\{\{([\s\S]*?)\}\}/g, (_, expression) => {
-  const source = expression.replaceAll('needs.check-changes', "needs['check-changes']");
-  return new Function('github', 'inputs', 'needs', 'format', `return (${source});`)(
-    input.github, input.inputs, input.needs, format);
+  const source = expression.replace(/\b(needs|steps|inputs)\.([\w-]+)/g, "$1['$2']");
+  return new Function('github', 'inputs', 'needs', 'steps', 'env',
+    'format', 'fromJson', 'contains', `return (${source});`)(
+    input.github, input.inputs, input.needs, input.steps, input.env,
+    format, JSON.parse, contains);
 });
 console.log(JSON.stringify(rendered));
 """
@@ -368,10 +419,12 @@ console.log(JSON.stringify(rendered));
                         "run_id": run_id,
                         "run_attempt": attempt,
                     },
-                    "inputs": {"ref": input_ref},
+                    "inputs": {"ref": input_ref, **(workflow_inputs or {})},
+                    "steps": steps or {},
+                    "env": env or {},
                     "needs": {
                         "check-changes": {
-                            "outputs": {"ppu": ppu, "label_attempt": label_attempt}
+                            "outputs": {"ppu": ppu, "check_attempt": check_attempt}
                         }
                     },
                 }
@@ -383,30 +436,73 @@ console.log(JSON.stringify(rendered));
         )
         return json.loads(result.stdout)
 
-    def test_label_gate_binds_authorization_to_attempt(self) -> None:
-        outputs = self._workflow()["jobs"]["check-changes"]["outputs"]
+    def test_check_changes_records_the_execution_attempt(self) -> None:
+        job = self._workflow()["jobs"]["check-changes"]
         self.assertEqual(
-            outputs.get("label_attempt"), "${{ steps.ppu-labels.outputs.attempt }}"
+            job["outputs"].get("check_attempt"), "${{ steps.run-mode.outputs.attempt }}"
         )
+        step = next(s for s in job["steps"] if s.get("id") == "run-mode")
+        self.assertNotIn("if", step)
         for attempt in ("1", "2", "10"):
-            with self.subTest(attempt=attempt):
-                result = self._run_label_gate(["run-ci", "run-ci-ppu"], attempt=attempt)
-                self.assertNotIn("error", result)
-                self.assertEqual(result["outputs"].get("attempt"), attempt)
+            for run_all in (False, True):
+                with self.subTest(attempt=attempt, run_all=run_all):
+                    script = self._workflow_value(
+                        step["run"], workflow_inputs={"run_all_tests": run_all}
+                    )
+                    with tempfile.TemporaryDirectory() as directory:
+                        output = Path(directory) / "outputs"
+                        result = subprocess.run(
+                            ["bash", "-e", "-c", script],
+                            env={
+                                **os.environ,
+                                "GITHUB_OUTPUT": str(output),
+                                "GITHUB_RUN_ATTEMPT": attempt,
+                            },
+                            text=True,
+                            capture_output=True,
+                            timeout=10,
+                        )
+                        self.assertEqual(result.returncode, 0, result.stderr)
+                        outputs = dict(
+                            line.split("=", 1)
+                            for line in output.read_text().splitlines()
+                        )
+                    self.assertEqual(outputs.get("attempt"), attempt)
+                    self.assertEqual(outputs.get("run_all_tests"), str(run_all).lower())
 
-    def test_label_gate_requires_both_labels(self) -> None:
-        for labels, enabled in (
-            ([], "false"),
-            (["run-ci"], "false"),
-            (["run-ci-ppu"], "false"),
-            (["run-ci", "run-ci-ppu"], "true"),
-            (["run-ci-ppu", "run-ci"], "true"),
-            (["run-ci", "run-ci-ppu-other"], "false"),
+    def test_shared_gate_accepts_the_ppu_inputs(self) -> None:
+        wf = self._workflow(SHARED_GATE_PATH)
+        inputs = wf.get("on", wf.get(True))["workflow_call"]["inputs"]
+        self.assertIn("require-label", inputs)
+        self.assertEqual(inputs["require-label"]["type"], "string")
+        self.assertIs(inputs["require-run-ci"]["default"], True)
+
+    def test_ppu_delegates_label_lookup_to_shared_gate(self) -> None:
+        for job in self._workflow()["jobs"].values():
+            for step in job.get("steps", []):
+                self.assertNotEqual(step.get("id"), "ppu-labels")
+                self.assertNotIn(
+                    "github.rest.pulls.get", step.get("with", {}).get("script", "")
+                )
+
+    def test_shared_gate_fails_without_both_labels(self) -> None:
+        for labels, returncode in (
+            ([], 1),
+            (["run-ci"], 1),
+            (["run-ci-ppu"], 1),
+            (["run-ci", "run-ci-ppu"], 0),
+            (["run-ci-ppu", "run-ci"], 0),
+            (["run-ci", "run-ci-ppu-other"], 1),
         ):
             with self.subTest(labels=labels):
                 result = self._run_label_gate(labels)
                 self.assertNotIn("error", result)
-                self.assertEqual(result["outputs"].get("enabled"), enabled)
+                self.assertEqual(result["returncode"], returncode)
+                if returncode:
+                    missing = "run-ci" if "run-ci" not in labels else "run-ci-ppu"
+                    self.assertIn(
+                        f"Missing required label '{missing}'", result["message"]
+                    )
                 self.assertEqual(
                     result["calls"],
                     [{"owner": "sgl-project", "repo": "sglang", "pull_number": 39788}],
@@ -414,25 +510,25 @@ console.log(JSON.stringify(rendered));
 
     def test_rerun_uses_live_labels_not_the_event_snapshot(self) -> None:
         result = self._run_label_gate(["run-ci", "run-ci-ppu"], payload_labels=[])
-        self.assertEqual(result["outputs"].get("enabled"), "true")
+        self.assertEqual(result["returncode"], 0)
         result = self._run_label_gate(
             ["run-ci"], payload_labels=["run-ci", "run-ci-ppu"]
         )
-        self.assertEqual(result["outputs"].get("enabled"), "false")
+        self.assertEqual(result["returncode"], 1)
 
     def test_label_api_failure_does_not_authorize_runner(self) -> None:
         result = self._run_label_gate(
             ["run-ci", "run-ci-ppu"], api_error="GitHub API unavailable"
         )
         self.assertEqual(result.get("error"), "GitHub API unavailable")
-        self.assertNotEqual(result["outputs"].get("enabled"), "true")
+        self.assertEqual(result["returncode"], 1)
 
     def test_non_pr_runs_keep_existing_authorization(self) -> None:
         for event in ("push", "workflow_dispatch", "schedule"):
             with self.subTest(event=event):
                 result = self._run_label_gate([], event=event)
                 self.assertNotIn("error", result)
-                self.assertEqual(result["outputs"].get("enabled"), "true")
+                self.assertEqual(result["returncode"], 0)
                 self.assertEqual(result["calls"], [])
 
     def test_pr_label_additions_are_subscribed(self) -> None:
@@ -518,26 +614,60 @@ console.log(JSON.stringify(rendered));
                     self.assertNotIn(ignored_name, normal_names)
                     self.assertEqual(ignored_name, f"ignored-label-{job_id}")
 
-    def test_run_all_tests_cannot_bypass_label_authorization(self) -> None:
+    def test_scope_depends_on_paths_or_run_all_not_labels(self) -> None:
         job = self._workflow()["jobs"]["check-changes"]
         self.assertEqual(job["runs-on"], "ubuntu-latest")
         self.assertEqual(
             " ".join(job["outputs"]["ppu"].split()),
-            "${{ steps.ppu-labels.outputs.enabled == 'true' && "
-            "(steps.filter.outputs.ppu == 'true' || "
-            "steps.run-mode.outputs.run_all_tests == 'true') }}",
+            "${{ steps.filter.outputs.ppu == 'true' || "
+            "steps.run-mode.outputs.run_all_tests == 'true' }}",
+        )
+
+        for path_match in ("false", "true"):
+            for run_all in ("false", "true"):
+                with self.subTest(path_match=path_match, run_all=run_all):
+                    scope = self._workflow_value(
+                        job["outputs"]["ppu"],
+                        steps={
+                            "filter": {"outputs": {"ppu": path_match}},
+                            "run-mode": {"outputs": {"run_all_tests": run_all}},
+                        },
+                    )
+                    self.assertEqual(
+                        scope, str(path_match == "true" or run_all == "true").lower()
+                    )
+                    for job_id in ("pr-gate", "ppu-preflight"):
+                        condition = self._workflow()["jobs"][job_id]["if"]
+                        self.assertEqual(
+                            self._workflow_value("${{ " + condition + " }}", ppu=scope),
+                            scope,
+                        )
+
+    def test_registry_checks_do_not_depend_on_labels(self) -> None:
+        steps = self._workflow()["jobs"]["check-changes"]["steps"]
+        registry = next(
+            step for step in steps if step.get("name") == "Test PPU CI registry wiring"
+        )
+        self.assertNotIn("if", registry)
+        self.assertEqual(
+            registry["run"], "python3 -m unittest scripts/ci/ppu/test_ppu_registry.py"
         )
 
     def test_preflight_and_shared_gate_require_authorized_scope(self) -> None:
         jobs = self._workflow()["jobs"]
         self.assertEqual(jobs["pr-gate"]["uses"], "./.github/workflows/pr-gate.yml")
-        self.assertEqual(jobs["pr-gate"].get("with", {}), {})
+        self.assertEqual(
+            jobs["pr-gate"].get("with", {}),
+            {"require-run-ci": True, "require-label": "run-ci-ppu"},
+        )
+        self.assertEqual(jobs["pr-gate"]["needs"], "check-changes")
+        self.assertNotIn("continue-on-error", jobs["pr-gate"])
         for name in ("pr-gate", "ppu-preflight"):
             self.assertEqual(
                 " ".join(jobs[name]["if"].split()),
                 "needs.check-changes.outputs.ppu == 'true' && "
                 "(github.event_name != 'pull_request' || "
-                "needs.check-changes.outputs.label_attempt == github.run_attempt)",
+                "needs.check-changes.outputs.check_attempt == github.run_attempt)",
             )
         self.assertEqual(
             set(jobs["ppu-preflight"]["needs"]), {"check-changes", "pr-gate"}
@@ -546,14 +676,14 @@ console.log(JSON.stringify(rendered));
     def test_pr_jobs_reject_authorization_from_a_previous_attempt(self) -> None:
         jobs = self._workflow()["jobs"]
         cases = [
-            ({"attempt": "2", "label_attempt": "1"}, "false"),
-            ({"attempt": "2", "label_attempt": ""}, "false"),
-            ({"attempt": "2", "label_attempt": "2"}, "true"),
-            ({"attempt": "10", "label_attempt": "10"}, "true"),
+            ({"attempt": "2", "check_attempt": "1"}, "false"),
+            ({"attempt": "2", "check_attempt": ""}, "false"),
+            ({"attempt": "2", "check_attempt": "2"}, "true"),
+            ({"attempt": "10", "check_attempt": "10"}, "true"),
             ({"ppu": "false"}, "false"),
-            ({"event": "push", "attempt": "2", "label_attempt": "1"}, "true"),
+            ({"event": "push", "attempt": "2", "check_attempt": "1"}, "true"),
             (
-                {"event": "workflow_dispatch", "attempt": "2", "label_attempt": "1"},
+                {"event": "workflow_dispatch", "attempt": "2", "check_attempt": "1"},
                 "true",
             ),
         ]
@@ -577,22 +707,22 @@ console.log(JSON.stringify(rendered));
             "needs.check-changes.outputs.ppu == 'true'",
         )
         self.assertEqual(
-            guard["env"]["LABEL_ATTEMPT"],
-            "${{ needs.check-changes.outputs.label_attempt }}",
+            guard["env"].get("CHECK_ATTEMPT"),
+            "${{ needs.check-changes.outputs.check_attempt }}",
         )
         self.assertNotIn("continue-on-error", guard)
-        for label_attempt, current_attempt, expected in (
+        for check_attempt, current_attempt, expected in (
             ("1", "2", 1),
             ("", "2", 1),
             ("2", "2", 0),
             ("10", "10", 0),
         ):
-            with self.subTest(label_attempt=label_attempt, attempt=current_attempt):
+            with self.subTest(check_attempt=check_attempt, attempt=current_attempt):
                 result = subprocess.run(
                     ["bash", "-e", "-c", guard["run"]],
                     env={
                         **os.environ,
-                        "LABEL_ATTEMPT": label_attempt,
+                        "CHECK_ATTEMPT": check_attempt,
                         "GITHUB_RUN_ATTEMPT": current_attempt,
                     },
                     text=True,
@@ -605,7 +735,7 @@ console.log(JSON.stringify(rendered));
                 if expected:
                     self.assertIn("Re-run all jobs", result.stdout + result.stderr)
 
-    def test_finish_distinguishes_opt_out_from_missing_preflight(self) -> None:
+    def test_finish_distinguishes_out_of_scope_from_missing_preflight(self) -> None:
         steps = self._workflow()["jobs"]["pr-test-ppu-finish"]["steps"]
         script = steps[-1]["run"]
         for enabled in ("false", "true", ""):

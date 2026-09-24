@@ -59,34 +59,10 @@ jobs:
       contents: read
       pull-requests: read
     outputs:
-      # run_all_tests bypasses path filtering, not dual-label PR authorization.
-      ppu: ${{ steps.ppu-labels.outputs.enabled == 'true' && (steps.filter.outputs.ppu == 'true' || steps.run-mode.outputs.run_all_tests == 'true') }}
-      label_attempt: ${{ steps.ppu-labels.outputs.attempt }}
+      # Scope only; the shared pr-gate checks both required labels.
+      ppu: ${{ steps.filter.outputs.ppu == 'true' || steps.run-mode.outputs.run_all_tests == 'true' }}
+      check_attempt: ${{ steps.run-mode.outputs.attempt }}
     steps:
-      - name: Check PPU PR labels
-        id: ppu-labels
-        uses: actions/github-script@v8
-        with:
-          script: |
-            // Record the attempt that checked the labels so partial reruns
-            // cannot reuse authorization from an earlier attempt.
-            core.setOutput('attempt', process.env.GITHUB_RUN_ATTEMPT);
-            if (context.eventName !== 'pull_request') {
-              core.setOutput('enabled', true);
-              return;
-            }
-            const {data: pr} = await github.rest.pulls.get({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              pull_number: context.issue.number
-            });
-            const labels = pr.labels.map(label => label.name);
-            const enabled = labels.includes('run-ci') && labels.includes('run-ci-ppu');
-            core.setOutput('enabled', enabled);
-            core.info(enabled
-              ? 'PPU CI enabled: both run-ci and run-ci-ppu are present.'
-              : 'PPU CI skipped: both run-ci and run-ci-ppu are required.');
-
       - name: Checkout code
         uses: actions/checkout@v4
         with:
@@ -97,6 +73,9 @@ jobs:
       - name: Determine run mode
         id: run-mode
         run: |
+          # Require the full PR check chain in each attempt so partial reruns
+          # cannot reuse a successful shared gate from an earlier attempt.
+          echo "attempt=$GITHUB_RUN_ATTEMPT" >> "$GITHUB_OUTPUT"
           if [[ "${{ inputs.run_all_tests }}" == "true" ]]; then
             echo "run_all_tests=true" >> "$GITHUB_OUTPUT"
             echo "Run mode: ALL TESTS"
@@ -132,8 +111,11 @@ jobs:
     if: >-
       needs.check-changes.outputs.ppu == 'true' &&
       (github.event_name != 'pull_request' ||
-       needs.check-changes.outputs.label_attempt == github.run_attempt)
+       needs.check-changes.outputs.check_attempt == github.run_attempt)
     uses: ./.github/workflows/pr-gate.yml
+    with:
+      require-run-ci: true
+      require-label: run-ci-ppu
     secrets: inherit
 
   # ==================== PPU Runner Preflight ==================== #
@@ -148,7 +130,7 @@ jobs:
     if: >-
       needs.check-changes.outputs.ppu == 'true' &&
       (github.event_name != 'pull_request' ||
-       needs.check-changes.outputs.label_attempt == github.run_attempt)
+       needs.check-changes.outputs.check_attempt == github.run_attempt)
     runs-on: 1-ppu-m890p
     timeout-minutes: 60
     env:
@@ -174,14 +156,14 @@ jobs:
     if: always() && needs.check-changes.result != 'skipped'
     runs-on: ubuntu-latest
     steps:
-      - name: Reject stale PR label authorization
+      - name: Require fresh PR checks before PPU execution
         id: check-authorization
         if: github.event_name == 'pull_request' && needs.check-changes.outputs.ppu == 'true'
         env:
-          LABEL_ATTEMPT: ${{ needs.check-changes.outputs.label_attempt }}
+          CHECK_ATTEMPT: ${{ needs.check-changes.outputs.check_attempt }}
         run: |
-          if [[ "$LABEL_ATTEMPT" != "$GITHUB_RUN_ATTEMPT" ]]; then
-            echo "::error::PR label authorization is stale. Select Re-run all jobs to refresh it before running PPU CI."
+          if [[ "$CHECK_ATTEMPT" != "$GITHUB_RUN_ATTEMPT" ]]; then
+            echo "::error::PR checks were not refreshed for this attempt. Select Re-run all jobs to recheck labels through the shared gate before running PPU CI."
             exit 1
           fi
 
@@ -198,7 +180,7 @@ jobs:
           done
           echo "All jobs completed successfully"
 
-      - name: Require the preflight when PPU is authorized and in scope
+      - name: Require the preflight when PPU is in scope
         run: |
           in_scope='${{ needs.check-changes.outputs.ppu }}'
           preflight='${{ needs.ppu-preflight.result }}'
