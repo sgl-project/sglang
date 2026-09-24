@@ -30,6 +30,7 @@ from sglang.srt.disaggregation.decode_schedule_batch_mixin import (
 from sglang.srt.disaggregation.mooncake.conn import (
     KVArgsRegisterInfo,
     MooncakeKVManager,
+    MooncakeKVSender,
     TransferInfo,
 )
 from sglang.srt.disaggregation.utils import (
@@ -68,6 +69,25 @@ register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 class TestDisaggregationWire(unittest.TestCase):
+    def test_sender_clear_keeps_abort_ack_until_writes_drain(self):
+        manager = object.__new__(MooncakeKVManager)
+        sender = object.__new__(MooncakeKVSender)
+        sender.kv_mgr, sender.bootstrap_room = manager, 42
+        for outstanding in (0, 1):
+            with self.subTest(outstanding=outstanding):
+                manager.request_status = {42: KVPoll.Failed}
+                manager._staging_outstanding = {42: outstanding}
+                manager._deferred_ack_targets = {42: ("127.0.0.1", 1234)}
+                with patch.object(manager, "_send_abort_ack") as ack:
+                    sender.clear()
+                    if outstanding:
+                        ack.assert_not_called()
+                        manager._staging_outstanding[42] = 0
+                        manager._maybe_ack_drained_abort(42)
+                    ack.assert_called_once_with("127.0.0.1", 1234, 42)
+                    manager._maybe_ack_drained_abort(42)
+                    ack.assert_called_once()
+
     def test_mooncake_registration_staging_fields(self):
         msg = [
             b"room",
@@ -96,6 +116,9 @@ class TestDisaggregationWire(unittest.TestCase):
         self.assertEqual(info.staging_total_size, 4096)
         self.assertEqual(info.dst_dcp_size, 4)
         self.assertEqual(info.dst_dcp_rank, 2)
+        self.assertEqual(info.dst_kv_item_lens, [])
+        info = KVArgsRegisterInfo.from_zmq(msg + [b"", struct.pack("Q", 128)])
+        self.assertEqual(info.dst_kv_item_lens, [128])
 
     def test_int_lists_roundtrip(self):
         cases = [
@@ -316,15 +339,8 @@ class TestCPReplicatedStateTransfer(unittest.TestCase):
 
 
 class TestQwen4StateWire(unittest.TestCase):
-    def test_qsa_pending_payload_uses_nested_request_pool_row(self):
-        req = SimpleNamespace(kv=ReqKvInfo(req_pool_idx=7))
-
-        np.testing.assert_array_equal(
-            get_qsa_pending_state_indices(req),
-            np.array([7], dtype=np.int32),
-        )
-
-    def test_qsa_registers_request_ring_and_page_state_separately(self):
+    @staticmethod
+    def _qsa_pool(layer_id: int):
         pool = object.__new__(QSATokenToKVPool)
         pool.full_kv_pool = object()
         pool.get_state_buf_infos = lambda: ([10], [100], [20])
@@ -335,12 +351,24 @@ class TestQwen4StateWire(unittest.TestCase):
         pool.page_size = 4
         pool.qsa_compress_ratio = 2
         pool.qsa_compressed_page_size = 2
-        pool.full_attention_layer_id_mapping = {24: 0}
+        pool.full_attention_layer_id_mapping = {layer_id: 0}
         pool.qsa_key_state_buffer_pool = [torch.zeros((6, 1, 8), dtype=torch.bfloat16)]
         pool.qsa_rope_position_buffer = torch.zeros((6, 3), dtype=torch.int64)
         pool.qsa_compressed_k_buffer_pool = [
             torch.zeros((6, 1, 8), dtype=torch.bfloat16)
         ]
+        return pool
+
+    def test_qsa_pending_payload_uses_nested_request_pool_row(self):
+        req = SimpleNamespace(kv=ReqKvInfo(req_pool_idx=7))
+
+        np.testing.assert_array_equal(
+            get_qsa_pending_state_indices(req),
+            np.array([7], dtype=np.int32),
+        )
+
+    def test_qsa_registers_request_ring_and_page_state_separately(self):
+        pool = self._qsa_pool(24)
 
         kv_args = SimpleNamespace()
         setup_state_kv_args(kv_args, pool)
@@ -355,6 +383,34 @@ class TestQwen4StateWire(unittest.TestCase):
         self.assertEqual(
             kv_args.state_layer_ids[1:],
             [[24, QSA_ROPE_STATE_LAYER_ID], [24]],
+        )
+
+    def test_qsa_draft_state_uses_reserved_layer_id_band(self):
+        target_pool = self._qsa_pool(24)
+        draft_pool = self._qsa_pool(0)
+
+        kv_args = SimpleNamespace()
+        setup_state_kv_args(
+            kv_args,
+            target_pool,
+            draft_token_to_kv_pool=draft_pool,
+            total_kv_layers=48,
+        )
+
+        self.assertEqual(
+            kv_args.state_types,
+            [StateType.MAMBA, StateType.QSA_PENDING, StateType.QSA_COMPRESSED],
+        )
+        self.assertEqual(
+            kv_args.state_layer_ids[1:],
+            [
+                [24, QSA_ROPE_STATE_LAYER_ID, 48, 49],
+                [24, 48],
+            ],
+        )
+        self.assertEqual(
+            [len(entries) for entries in kv_args.state_data_ptrs[1:]],
+            [4, 2],
         )
 
     def test_qsa_stage_without_qsa_layers_does_not_register_rope_ring(self):
@@ -654,7 +710,8 @@ class TestEagleDsaSeedTransfer(CustomTestCase):
         seed,
         metadata_buffer_index=0,
         sampling_mask=None,
-        sampling_logprob=None,
+        sampling_logprobs=None,
+        sampling_logprobs_mode="support",
     ):
         return SimpleNamespace(
             metadata_buffer_index=metadata_buffer_index,
@@ -666,11 +723,12 @@ class TestEagleDsaSeedTransfer(CustomTestCase):
             multimodal_inputs=None,
             return_logprob=False,
             return_sampling_mask=sampling_mask is not None,
+            sampling_logprobs_mode=sampling_logprobs_mode,
             output_token_sampling_mask=(
                 None if sampling_mask is None else [sampling_mask]
             ),
             output_token_sampling_logprobs=(
-                None if sampling_logprob is None else [sampling_logprob]
+                None if sampling_logprobs is None else [sampling_logprobs]
             ),
             hidden_states_tensor=torch.tensor([1.0, 2.0]),
             output_topk_p=torch.tensor([1.0]),
@@ -721,7 +779,7 @@ class TestEagleDsaSeedTransfer(CustomTestCase):
                     self._make_req(
                         None,
                         sampling_mask=[7, 8, 9] if enabled else None,
-                        sampling_logprob=-1.25 if enabled else None,
+                        sampling_logprobs=[-1.25, -1.5, -2.0] if enabled else None,
                     )
                 )
                 schemas.append(buffers.get_buf_infos())
@@ -729,10 +787,10 @@ class TestEagleDsaSeedTransfer(CustomTestCase):
                     self.assertEqual(
                         buffers.output_token_sampling_mask_idx.shape, (1, 3)
                     )
-                    length, mask, logprob = buffers.get_buf(0)[6:9]
+                    length, mask, logprobs = buffers.get_buf(0)[6:9]
                     self.assertEqual(length[0].item(), 3)
                     self.assertEqual(mask.tolist(), [7, 8, 9])
-                    self.assertAlmostEqual(logprob[0].item(), -1.25)
+                    self.assertEqual(logprobs.tolist(), [-1.25, -1.5, -2.0])
                 else:
                     self.assertIsNone(buffers.output_token_sampling_mask_len)
                     self.assertIsNone(buffers.output_token_sampling_mask_idx)
@@ -741,7 +799,28 @@ class TestEagleDsaSeedTransfer(CustomTestCase):
         disabled_ptrs, _, disabled_sizes = schemas[0]
         enabled_ptrs, _, enabled_sizes = schemas[1]
         self.assertEqual(len(enabled_ptrs) - len(disabled_ptrs), 3)
-        self.assertEqual(sum(enabled_sizes) - sum(disabled_sizes), 3 * 4 + 128)
+        self.assertEqual(sum(enabled_sizes) - sum(disabled_sizes), 2 * 3 * 4 + 64)
+
+    def test_sampling_mask_selected_logprob_uses_first_metadata_slot(self):
+        with envs.SGLANG_ENABLE_DISAGG_SAMPLING_MASK.override(True):
+            buffers = MetadataBuffers(
+                size=1,
+                hidden_size=2,
+                hidden_states_dtype=torch.float32,
+                max_sampling_mask_tokens=3,
+            )
+            buffers.set_buf(
+                self._make_req(
+                    None,
+                    sampling_mask=[7, 8, 9],
+                    sampling_logprobs=-0.5,
+                    sampling_logprobs_mode="selected",
+                )
+            )
+            length, mask, logprobs = buffers.get_buf(0)[6:9]
+            self.assertEqual(length[0].item(), 3)
+            self.assertEqual(mask.tolist(), [7, 8, 9])
+            self.assertEqual(logprobs[0].item(), -0.5)
 
     def test_decode_input_requires_valid_seed_for_every_request(self):
         seeds = (

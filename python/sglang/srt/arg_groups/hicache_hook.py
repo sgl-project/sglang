@@ -23,6 +23,11 @@ def handle_hicache(server_args: Any):
     2) Storage <-> layout compatibility (may rewrite layout).
     """
     cfg = resolving_view(server_args)
+    if cfg.enable_linker_mla_dedup and (
+        not cfg.enable_unified_cache_external_linker
+        or cfg.unified_cache_external_linker_backend != "mooncake"
+    ):
+        raise ValueError("--enable-linker-mla-dedup requires the Mooncake linker.")
     if cfg.enable_unified_cache_external_linker:
         if cfg.enable_hierarchical_cache:
             raise ValueError(
@@ -49,11 +54,25 @@ def handle_hicache(server_args: Any):
 
     validate_hicache_host_memory_mode(server_args)
 
+    if cfg.disaggregation_decode_host_receive_threshold > 0:
+        # The shared host pool must match KV transfer's per-layer buffers.
+        declare_resolution(
+            server_args, "handle_hicache", hicache_mem_layout="layer_first"
+        )
+
     # Step 1: Initial layout-io compatibility normalization.
     resolve_layout_io_compatibility(server_args)
 
     # Step 2: Storage-layout normalization without changing io backend.
     resolve_storage_layout_compatibility(server_args)
+    if (
+        cfg.disaggregation_decode_host_receive_threshold > 0
+        and cfg.hicache_mem_layout != "layer_first"
+    ):
+        raise ValueError(
+            f"The resolved HiCache storage layout {cfg.hicache_mem_layout!r} "
+            "cannot share the layer_first decode host pool used by KV transfer"
+        )
 
     # Step 3: DCP compatibility for the L2 (device<->host) path.
     resolve_hicache_dcp_compatibility(server_args)

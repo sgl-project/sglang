@@ -433,7 +433,12 @@ class TestMultiItemScoringParity(CustomTestCase):
         tokenizer = AutoTokenizer.from_pretrained(TEST_MODEL_NAME)
 
         def label_ids(labels):
-            return [tokenizer.encode(lb, add_special_tokens=False)[0] for lb in labels]
+            token_ids = []
+            for label in labels:
+                (token_id,) = tokenizer.encode(label, add_special_tokens=False)
+                token_ids.append(token_id)
+            assert len(set(token_ids)) == len(token_ids), token_ids
+            return token_ids
 
         return {
             "basic": dict(
@@ -460,7 +465,7 @@ class TestMultiItemScoringParity(CustomTestCase):
             "many_items": dict(
                 query="Rate this option from 1 to 5:",
                 items=[f" Option {i}" for i in range(10)],
-                label_token_ids=label_ids([" 1", " 2", " 3", " 4", " 5"]),
+                label_token_ids=label_ids(["1", "2", "3", "4", "5"]),
                 apply_softmax=True,
             ),
         }

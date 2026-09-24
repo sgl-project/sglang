@@ -11,7 +11,6 @@ from sglang.srt.disaggregation.decode import (
 )
 from sglang.srt.disaggregation.fake.conn import FakeKVManager, FakeKVReceiver
 from sglang.srt.disaggregation.utils import DisaggregationMode
-from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.managers.schedule_batch import FINISH_ABORT
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.runtime_context import get_context, publish, reset_context
@@ -423,6 +422,38 @@ class TestDecodeQueueCleanup(CustomTestCase):
             req, queue.tree_cache, is_insert=False
         )
 
+        receiver = MagicMock()
+        decode_req.kv_receiver = receiver
+        decode_req.host_staged = True
+        queue.enable_host_receive = True
+        queue.enable_deferred_kv_release = False
+        queue._defer_release = MagicMock()
+        queue.queue = [decode_req]
+        queue.req_to_metadata_buffer_idx_allocator.reset_mock()
+        mock_release_kv_cache.reset_mock()
+        self.assertEqual(queue.pop_transferred(), [])
+        receiver.abort.assert_called_once_with()
+        queue._defer_release.assert_called_once_with(decode_req)
+        receiver.clear.assert_not_called()
+        queue.req_to_metadata_buffer_idx_allocator.free.assert_not_called()
+        mock_release_kv_cache.assert_not_called()
+
+        queue.queue = [decode_req]
+        decode_req.req.finished_reason = FINISH_ABORT("cancelled")
+        with (
+            patch.object(
+                queue, "_poll_with_metadata_gate", return_value=[KVPoll.Success]
+            ),
+            patch(
+                "sglang.srt.disaggregation.decode.discard_kv_cache_backup"
+            ) as discard,
+        ):
+            self.assertEqual(queue.pop_transferred(), [])
+            discard.assert_called_once_with(req, queue.tree_cache, "host_pool")
+        receiver.clear.assert_called_once_with()
+        queue.req_to_metadata_buffer_idx_allocator.free.assert_called_once_with(3)
+        mock_release_kv_cache.assert_not_called()
+
     def test_fake_receiver_initializes_deferred_release_state(self):
         manager = MagicMock()
         receiver = FakeKVReceiver(manager, "")
@@ -440,7 +471,6 @@ class TestDecodeQueueCleanup(CustomTestCase):
         scheduler.last_batch = None
         scheduler.cur_batch_for_debug = None
         scheduler.enable_overlap = False
-        scheduler.ps = ParallelState.trivial()
         scheduler.running_mbs = []
         scheduler.waiting_queue = []
         scheduler.grammar_manager = SimpleNamespace(grammar_queue=[])

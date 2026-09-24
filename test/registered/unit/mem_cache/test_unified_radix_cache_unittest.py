@@ -471,7 +471,7 @@ def build_fixture(
         page_size=cfg.page_size,
         enable_int8_mamba_checkpoint=cfg.enable_int8_mamba_checkpoint,
     )
-    # MambaRadixCache reads mamba_cache_chunk_size, whose property otherwise
+    # The mamba component reads mamba_cache_chunk_size, whose property otherwise
     # loads the HF config for self.model_path — impossible for the dummy model.
     # Mirror the property's default for a dummy HF config: FLA_CHUNK_SIZE.
     server_args._mamba_cache_chunk_size = (
@@ -861,6 +861,9 @@ class TestUnifiedRadixCacheEagleHiCacheStorageKey(CustomTestCase):
     )
 
     def test_l3_prefetch_uses_bigram_radix_key(self):
+        from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
+            PrefetchSubmission,
+        )
         from sglang.srt.mem_cache.utils import get_hash_str
 
         cache, allocator, _ = build_fixture(self.cfg)
@@ -891,23 +894,30 @@ class TestUnifiedRadixCacheEagleHiCacheStorageKey(CustomTestCase):
             def prefetch_rate_limited(self):
                 return False
 
-            def prefetch(
+            def get_prefetch_submission(self, rid):
+                return None
+
+            def submit_prefetch(
                 self,
-                request_id,
-                new_input_tokens,
-                last_hash=None,
-                prefix_keys=None,
-                extra_pools=None,
+                handle,
+                prefetch_key,
+                last_hash,
+                prefix_keys,
+                matched_prefix_tokens,
+                pool_transfers,
                 assume_stored=False,
             ):
                 self.prefetch_args = (
-                    request_id,
-                    new_input_tokens,
+                    handle,
+                    prefetch_key,
                     last_hash,
                     prefix_keys,
-                    extra_pools,
+                    matched_prefix_tokens,
+                    pool_transfers,
                 )
-                return mock.Mock()
+                return PrefetchSubmission(
+                    operation=mock.Mock(assume_stored=assume_stored)
+                )
 
         controller = FakeCacheController()
         cache.cache_controller = controller
@@ -915,7 +925,7 @@ class TestUnifiedRadixCacheEagleHiCacheStorageKey(CustomTestCase):
             CacheRequestHandle("req", 0), cache.root_node_handle(), tokens
         )
 
-        _, storage_key, _, _, _ = controller.prefetch_args
+        _, storage_key, _, _, _, _ = controller.prefetch_args
         self.assertIsInstance(storage_key, RadixKey)
         self.assertTrue(storage_key.is_bigram)
         self.assertEqual(len(storage_key), len(tokens) - 1)
@@ -6103,6 +6113,100 @@ class UnifiedRadixCacheSuite:
                 self.assertTrue(cache.tree_core.is_node_in_host_lru(node, aux))
         cache.sanity_check()
 
+    def _build_internal_mamba_fixture(self, write_policy):
+        """HiCache fixture where seq_a's node is INTERNAL (seq_b splits a
+        suffix off it) and holds its own mamba state."""
+        cache, allocator, req_to_token_pool = build_fixture(self.cfg)
+        self._init_hicache(cache, write_policy=write_policy)
+        seq_a = self._make_seq(1, 2)
+        seq_b = seq_a + self._make_seq(1000, 1)
+        self._insert(cache, allocator, req_to_token_pool, seq_a)
+        self._insert(cache, allocator, req_to_token_pool, seq_b)
+        return cache, req_to_token_pool, seq_a
+
+    def test_hicache_write_back_internal_mamba_evict_demotes_state(self):
+        """write_back: an internal node's tombstoned mamba state is demoted
+        to host, keeping the node a valid match boundary so the KV beneath
+        it stays servable."""
+        if not self.cfg.has_mamba:
+            self.skipTest("requires Mamba component")
+        if self.cfg.has_swa:
+            self.skipTest("no hicache strategy covers FULL+SWA+MAMBA")
+        # TODO(ShangmingCai): port the internal-node demote to the Rust core;
+        # its eviction walk still tombstones the state without a host backup.
+        if _selected_tree_core_test_backend() == "rust":
+            self.skipTest("internal-node state demote is Python-core only")
+        cache, req_to_token_pool, seq_a = self._build_internal_mamba_fixture(
+            "write_back"
+        )
+
+        result = cache.evict(EvictParams(num_tokens=0, mamba_num=10))
+        self.assertGreaterEqual(result.mamba_num_evicted, 1)
+
+        m = cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", seq_a))))
+        node = m.best_match_node
+        self.assertNotEqual(
+            node,
+            cache.root_node_handle(),
+            "host-demoted mamba must keep the node a valid match boundary",
+        )
+        self.assertIsNone(
+            _device_value(cache, node, ComponentType.MAMBA),
+            "device state was tombstoned",
+        )
+        self.assertIsNotNone(
+            _host_value(cache, node, ComponentType.MAMBA),
+            "state demoted to host, not dropped",
+        )
+        self.assertEqual(
+            len(m.device_indices) + m.host_hit_length,
+            len(seq_a),
+            "the full prefix stays servable (device KV is claimed once the "
+            "state is revived)",
+        )
+        self.assertGreaterEqual(
+            m.mamba_host_hit_length, 1, "load-back armed for the host state"
+        )
+
+        # Scheduler-side serve path: init_load_back revives the state and
+        # returns the node's still-device-resident KV.
+        req = self._make_req(req_to_token_pool)
+        self._apply_match_to_req(req, m)
+        new_indices, last_node = cache.init_load_back(
+            InitLoadBackParams(
+                best_match_node=m.best_match_node,
+                host_hit_length=m.host_hit_length,
+                req=req,
+            )
+        )
+        self.assertEqual(last_node, node)
+        self.assertEqual(len(m.device_indices) + len(new_indices), len(seq_a))
+        self.assertIsNotNone(
+            _device_value(cache, node, ComponentType.MAMBA),
+            "mamba state revived on device",
+        )
+        self._finish_pending_loads(cache)
+        self._release_ongoing_load_back_locks(cache)
+        cache.sanity_check()
+
+    def test_hicache_write_through_internal_mamba_evict_keeps_drop(self):
+        """Non-write_back policies keep the legacy tombstone-and-drop."""
+        if not self.cfg.has_mamba:
+            self.skipTest("requires Mamba component")
+        if self.cfg.has_swa:
+            self.skipTest("no hicache strategy covers FULL+SWA+MAMBA")
+        cache, _, seq_a = self._build_internal_mamba_fixture("write_through")
+
+        cache.evict(EvictParams(num_tokens=0, mamba_num=10))
+
+        m = cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", seq_a))))
+        self.assertEqual(
+            len(m.device_indices),
+            0,
+            "write_through keeps the legacy drop: frontier capped at root",
+        )
+        cache.sanity_check()
+
     def _build_chain_pages(self, cache, allocator, req_to_token_pool, num_pages):
         """Insert an incremental chain of single-page extensions.
 
@@ -9664,6 +9768,7 @@ class TestPrefetchCommitOrdering(CustomTestCase):
         cache.page_size = 1
         cache.enable_storage_metrics = False
         cache.buffer_pipeline = None  # cache-mode commit path
+        cache.cache_controller.pp_prefetch_decisions = {}
         walk_action = object()
         insert_result = mock.MagicMock()
         insert_result.cache_actions = [walk_action]

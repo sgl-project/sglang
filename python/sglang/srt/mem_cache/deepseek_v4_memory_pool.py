@@ -43,10 +43,10 @@ def get_dsv4_indexer_bytes_per_token(index_head_dim: int, use_fp4_indexer: bool)
     return index_head_dim + index_head_dim // 128 * 4
 
 
-def get_compress_state_ring_size(
-    compress_ratio: int, is_speculative: bool = False, num_draft_tokens: int = 0
-) -> int:
+def get_compress_state_ring_size(compress_ratio: int, num_draft_tokens: int = 0) -> int:
+    """Rows per request ring; num_draft_tokens == 0 means no speculative decoding."""
     assert compress_ratio in [2, 4, 128], f"Unsupported {compress_ratio = }"
+    is_speculative = num_draft_tokens > 0
     if compress_ratio == 2:
         # Two positions are one pair, addressed by position % ring_size; a
         # speculative ring must be wider than the draft window: pow2 >= 2 + drafts.
@@ -76,6 +76,19 @@ def get_swa_ring_size(sliding_window: int, is_speculative: bool = False) -> int:
     # A verify batch writes its draft tokens ahead of the committed position.
     spec_extra = (get_spec().speculative_num_draft_tokens - 1) if is_speculative else 0
     return sliding_window + spec_extra
+
+
+def resolve_unified_kv_fp8(unified_fp8: Optional[bool] = None) -> bool:
+    """Per-pool fp8 layout. None follows SGLANG_DSV4_UNIFIED_KV_FP8.
+
+    A caller may pass False so this pool keeps the bf16 ring while the env
+    stays on (target fused-Q still keys off the global switch).
+    """
+    from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
+        is_unified_kv_fp8,
+    )
+
+    return is_unified_kv_fp8() if unified_fp8 is None else bool(unified_fp8)
 
 
 def _num_dsv4_physical_kv_pages(
@@ -867,6 +880,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         enable_hisparse: bool = False,
         online_mtp_max_draft_tokens: int = 0,
         num_req_slots: Optional[int] = None,
+        unified_fp8: Optional[bool] = None,
         kv_source_layers: Sequence[int] = (),
         full_size: Optional[int] = None,
         is_draft_worker: bool = False,
@@ -893,13 +907,6 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         self.compressed_kv_layout_option = compressed_kv_layout
         c4_logical_size = c128_size * 32
 
-        logger.info(
-            "Initialize DeepSeekV4TokenToKVPool with "
-            f"{max_num_reqs=} {swa_size=} {c4_size=} "
-            f"{c4_logical_size=} {c128_size=} "
-            f"{c4_state_pool_size=} {c128_state_pool_size=}"
-        )
-
         self.max_num_reqs = max_num_reqs
         # PD preallocation can exceed max_num_reqs;
         # the SWA ring must cover every addressable req_pool_idx.
@@ -915,7 +922,19 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
 
         # Resolve the unified-kv gate before any sizing so the two cannot drift.
         self._unified_kv = is_unified_kv_triton()
-        self._unified_kv_fp8 = is_unified_kv_fp8()
+        self._unified_kv_fp8 = resolve_unified_kv_fp8(unified_fp8)
+        logger.info(
+            "Initialize DeepSeekV4TokenToKVPool with "
+            f"{max_num_reqs=} {swa_size=} {c4_size=} "
+            f"{c4_logical_size=} {c128_size=} "
+            f"{c4_state_pool_size=} {c128_state_pool_size=} "
+            f"unified={self._unified_kv} unified_fp8={self._unified_kv_fp8}"
+        )
+        if is_unified_kv_fp8() and not self._unified_kv_fp8:
+            logger.info(
+                "SGLANG_DSV4_UNIFIED_KV_FP8 is on; this pool stays bf16 "
+                "(unified_fp8=False)"
+            )
         # Uniform 512-dim e4m3 layout for the trtllm attention backend
         self.uniform_fp8 = (
             not self._unified_kv
@@ -1145,11 +1164,12 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
 
     def get_ring_size(self, compress_ratio: int) -> int:
         spec = get_spec()
-        return get_compress_state_ring_size(
-            compress_ratio,
-            spec.speculative_algorithm is not None,
-            spec.speculative_num_draft_tokens or 0,
+        num_draft_tokens = (
+            0
+            if spec.speculative_algorithm is None
+            else spec.speculative_num_draft_tokens or 0
         )
+        return get_compress_state_ring_size(compress_ratio, num_draft_tokens)
 
     def translate_loc_from_full_to_swa(self, kv_indices: torch.Tensor):
         assert self.full_to_swa_index_mapping is not None
@@ -1784,14 +1804,6 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         if self.request_window is not None:
             return self.request_window.buffer(self._swa_local_layer_id(layer_id))
         return self.swa_kv_pool.kv_buffer[self._swa_local_layer_id(layer_id)]
-
-    def get_swa_key_buffer(self, layer_id: int) -> torch.Tensor:
-        self.wait_layer_transfer(layer_id)
-        if self.request_window is not None:
-            return self.get_swa_raw_buffer(layer_id).view(
-                self.request_window.state.dtype
-            )
-        return self.swa_kv_pool.get_key_buffer(self._swa_local_layer_id(layer_id))
 
     def set_swa_key_buffer(
         self,

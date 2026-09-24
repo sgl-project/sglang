@@ -252,7 +252,7 @@ def main():
         "--full-parallel",
         choices=("true", "false"),
         default="false",
-        help="Lift the max_parallel throttle (set by schedule / `high priority`)",
+        help="Lift the max_parallel throttle (set by schedule / `max-concurrency`)",
     )
     parser.add_argument(
         "--partition-model-file",
