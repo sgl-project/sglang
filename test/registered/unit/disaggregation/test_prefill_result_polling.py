@@ -362,6 +362,9 @@ class _Scheduler(SchedulerDisaggregationPrefillMixin):
         assert result.delay_sample_func is None
         self.actions.append((self.iteration, "result", batch.forward_iter))
 
+    def mark_engine_busy(self):
+        self._was_fully_idle = False
+
     def process_disagg_prefill_transfer_queue(self):
         self.actions.append((self.iteration, "inflight", None))
 
