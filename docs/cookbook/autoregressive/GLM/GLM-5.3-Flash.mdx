@@ -10,10 +10,10 @@ tag: NEW
 
 <Accordion title="Install SGLang">
 
-Use an SGLang build that includes GLM-5.3-Flash support.
+Use an SGLang build that includes GLM-5.3-Flash support (v0.5.20 or later).
 
 ```bash Command
-docker pull lmsysorg/sglang:glm-5.3-flash
+docker pull lmsysorg/sglang:latest
 ```
 
 The deployment panel can render a complete `docker run` command for the selected hardware and options. See [Install SGLang with Docker](/docs/get-started/install#method-3-using-docker) for host setup.
@@ -104,7 +104,7 @@ The **Speculative** card in the Playground changes the algorithm without leaving
 
 - **EAGLE / MTP 5-1-6** is exactly what Low Latency serves, so a Low Latency base starts on this chip. Pick it from a High Throughput base to keep that recipe's other settings and add the MTP head.
 - **Off (greedy)** strips the whole `--speculative-*` family, which is what High Throughput already starts from.
-- **DFlash2** swaps the in-checkpoint MTP head for the trained block-diffusion draft in [`incoai/GLM-5.3-Flash-DFlash2`](https://huggingface.co/incoai/GLM-5.3-Flash-DFlash2). The draft proposes a whole block per step and the target verifies it in one forward pass, so output quality stays the target's. Its block size comes from the draft checkpoint, and the draft runs on `fa4` rather than the target's DSA backends. It needs a build that carries the GLM-5.3-Flash hidden-state capture from [PR #36708](https://github.com/sgl-project/sglang/pull/36708), which is merged into the [PR #36507](https://github.com/sgl-project/sglang/pull/36507) support branch (`xinyuan/glm-5.3-flash-support`) rather than into `main`, so the image pinned above is not enough on its own — pull that branch at its current head, or add #36708's commit on top of an older checkout. The draft repository is also access-gated: request access on its model page, then download it alongside the target before serving. This combination is not yet measured on the cookbook hardware, so treat it as a starting point.
+- **DFlash2** swaps the in-checkpoint MTP head for the trained block-diffusion draft in [`incoai/GLM-5.3-Flash-DFlash2`](https://huggingface.co/incoai/GLM-5.3-Flash-DFlash2). The draft proposes a whole block per step and the target verifies it in one forward pass, so output quality stays the target's. Its block size comes from the draft checkpoint, and the draft runs on `fa4` rather than the target's DSA backends. The hidden-state capture it needs ([PR #36708](https://github.com/sgl-project/sglang/pull/36708)) shipped with the GLM-5.3-Flash support in v0.5.20, so the image pinned above is enough. The draft repository is access-gated: request access on its model page, then download it alongside the target before serving. This combination is not yet measured on the cookbook hardware, so treat it as a starting point.
 
 Neither algorithm runs with DP-Attention; the card disables the affected chips and names the reason.
 
@@ -134,13 +134,13 @@ The default multimodal feature transport is automatic, and on a single CUDA node
 
 ### 3.1 Reasoning
 
-Thinking is enabled by the checkpoint's generation configuration, and generated commands enable `--reasoning-parser glm45` by default. The OpenAI-compatible API then places thinking in `message.reasoning_content` and the final answer in `message.content`. You can disable **Reasoning Parser** in the Playground when an integration needs the raw response format.
+Thinking is enabled by the checkpoint's generation configuration, and generated commands enable `--reasoning-parser auto` (which resolves to `glm45` for GLM-5.3-Flash) by default. The OpenAI-compatible API then places thinking in `message.reasoning_content` and the final answer in `message.content`. You can disable **Reasoning Parser** in the Playground when an integration needs the raw response format.
 
 To disable thinking for a request, pass `chat_template_kwargs: {"thinking": false}` in the request body.
 
 ### 3.2 Tool calling
 
-Generated commands enable `--tool-call-parser glm47` by default, so structured calls are returned in `message.tool_calls`. You can disable **Tool Call Parser** in the Playground when tool calling is not needed. On follow-up turns, read both `reasoning_content` and `content` because a thinking model can use either field around tool execution.
+Generated commands enable `--tool-call-parser auto` (which resolves to `glm47` for GLM-5.3-Flash) by default, so structured calls are returned in `message.tool_calls`. You can disable **Tool Call Parser** in the Playground when tool calling is not needed. On follow-up turns, read both `reasoning_content` and `content` because a thinking model can use either field around tool execution.
 
 ### 3.3 Multimodal serving
 

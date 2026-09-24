@@ -21,6 +21,7 @@
 import inspect
 import logging
 import re
+from array import array
 from collections.abc import Iterable, Mapping
 from contextlib import contextmanager
 from typing import List, Literal, Optional, Tuple, Union
@@ -648,10 +649,9 @@ class TransformersBase(nn.Module):
         # Pipeline parallel
         self.pipeline_parallel()
         # Module replacement (Linear → TP, RMSNorm → fused, MoE overridden by MoEMixin)
-        tp_size = get_parallel().tp_size
         self.recursive_replace()
         # Attention instances
-        self.attention_instances = self._create_attention_instances(tp_size)
+        self.attention_instances = self._create_attention_instances()
         # Vocab embeddings
         self.replace_vocab_embed_class(self.model)
 
@@ -904,7 +904,8 @@ class TransformersBase(nn.Module):
             self._register_missing_prefix(maybe_prefix("model", name))
 
     # -- Attention instances ------------------------------------------------
-    def _create_attention_instances(self, tp_size: int) -> dict[int, RadixAttention]:
+    def _create_attention_instances(self) -> dict[int, RadixAttention]:
+        tp_size = get_parallel().tp_size
         num_heads = self.text_config.num_attention_heads
         num_kv_heads = getattr(self.text_config, "num_key_value_heads", num_heads)
         hidden_size = self.text_config.hidden_size
@@ -1371,7 +1372,7 @@ class MultiModalMixin:
         rope_type = str(getattr(self.text_config, "rope_type", "")).lower()
         return "mrope" in rope_type
 
-    def pad_input_ids(self, input_ids: list[int], mm_inputs: MultimodalInputs):
+    def pad_input_ids(self, input_ids: array, mm_inputs: MultimodalInputs) -> array:
         return input_ids
 
     def _get_modality_encoder(self, modality_name: str):

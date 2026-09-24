@@ -5,14 +5,22 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use sgl_kv_indexer::{GrpcPrefixIndex, PrefixIndex, PrefixIndexConfig};
 use sgl_router::{
-    config::{CachePrefixProvider, Cli, Config, KvIndexerEndpointConfig, LogFormat, PolicyKind},
-    discovery::spawn_discovery,
+    config::{
+        CachePrefixProvider, ChatRoutingKind, Cli, Config, KvIndexerEndpointConfig, LogFormat,
+        PolicyKind,
+    },
+    discovery::{spawn_discovery, ModelId},
     policies::{
         factory::build_registry as build_policy_registry, prefix_provider::RadixTreePrefixProvider,
         PolicyRegistry,
     },
+    policies_reorg::factory::build_resolver as build_reorg_resolver,
     proxy::Proxy,
-    server::{app::build_router, app_context::AppContext, shutdown::drain_for_termination},
+    server::{
+        app::build_router,
+        app_context::{AppContext, ChatRouting},
+        shutdown::drain_for_termination,
+    },
     state::{
         kv_events::{BlockSizeOracle, KvEventIndex},
         load_monitor::router_inflight_load::{
@@ -50,14 +58,11 @@ const DRAIN_WARN_AFTER: Duration = Duration::from_secs(30);
 async fn main() -> Result<()> {
     // Resolve CLI configuration and set up startup logging.
     let cli = Cli::parse();
-    install_bootstrap_subscriber();
+    let routing = cli.routing.chat_routing;
+    init_tracing(&cli.server.log_level, cli.server.log_format)?;
     let config = cli
         .into_config()
         .context("resolve configuration from CLI flags")?;
-    init_tracing(
-        &config.observability.log_level,
-        config.observability.log_format,
-    )?;
 
     // Buffer termination signals before tokenizer loading or discovery can block startup.
     let (sigterm, sigint) = install_signal_handlers()?;
@@ -74,14 +79,33 @@ async fn main() -> Result<()> {
     let engine_state = start_engine_state_monitor(external_kv_indexer_client.is_some());
 
     // Build the policies that choose which workers receive each request.
-    let routing_policies = Arc::new(
-        build_policy_registry(
-            &config,
-            engine_state.tree(),
-            engine_state.block_size_oracle(),
-        )
-        .context("build policy registry")?,
-    );
+    let (routing_policies, chat_routing, reorg_cleanup) = match routing {
+        ChatRoutingKind::Legacy => (
+            Arc::new(
+                build_policy_registry(
+                    &config,
+                    engine_state.tree(),
+                    engine_state.block_size_oracle(),
+                )
+                .context("build policy registry")?,
+            ),
+            ChatRouting::Legacy,
+            None,
+        ),
+        ChatRoutingKind::Reorg => {
+            let (resolver, cleanup) = build_reorg_resolver(
+                &config.model,
+                &engine_state,
+                external_kv_indexer_client.clone(),
+            )
+            .context("build reorg policies")?;
+            (
+                Arc::new(PolicyRegistry::default()),
+                ChatRouting::Reorg([(ModelId(config.model.id.clone()), resolver)].into()),
+                cleanup,
+            )
+        }
+    };
 
     // Track this router's local view of in-flight requests.
     let (local_inflight_requests, inflight_cleanup) = start_local_inflight_tracker(&config);
@@ -97,7 +121,7 @@ async fn main() -> Result<()> {
     .await?;
 
     // Share routing dependencies with HTTP handlers and mark startup complete.
-    let app_context = build_app_context(
+    let mut app_context = build_app_context(
         &config,
         tokenizers,
         worker_registry,
@@ -106,6 +130,8 @@ async fn main() -> Result<()> {
         &engine_state,
         external_kv_indexer_client,
     )?;
+    app_context.chat_routing = chat_routing;
+    let app_context = Arc::new(app_context);
     app_context.mark_ready();
 
     // Serve HTTP requests until shutdown, allowing in-flight requests to finish.
@@ -120,6 +146,9 @@ async fn main() -> Result<()> {
     discovery_handle.abort();
     worker_manager_handle.abort();
     inflight_cleanup.shutdown().await;
+    if let Some(cleanup) = reorg_cleanup {
+        cleanup.shutdown().await;
+    }
     log_shutdown(&outcome.result, outcome.inflight_drain_secs);
     outcome.result
 }
@@ -148,16 +177,6 @@ fn init_tracing(default_level: &str, format: LogFormat) -> Result<()> {
         );
     }
     Ok(())
-}
-
-// Provide startup logging before configuration resolution; later installs are no-ops.
-fn install_bootstrap_subscriber() {
-    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .with_target(true)
-        .try_init();
 }
 
 fn install_signal_handlers() -> Result<(Signal, Signal)> {
@@ -272,11 +291,12 @@ fn build_app_context(
     local_inflight_requests: Arc<RouterInflightLoadRegistry>,
     engine_state: &KvEventIndex,
     external_kv_indexer_client: Option<Arc<dyn PrefixIndex>>,
-) -> Result<Arc<AppContext>> {
+) -> Result<AppContext> {
     let block_size_oracle = engine_state.block_size_oracle();
     let proxy = Arc::new(
         Proxy::new(Duration::from_secs(config.proxy.request_timeout_secs))
-            .context("build proxy client")?,
+            .context("build proxy client")?
+            .with_stream_idle_timeout(Duration::from_secs(config.proxy.stream_idle_timeout_secs)),
     );
 
     let mut app_context = AppContext::with_router_inflight_load(
@@ -298,7 +318,7 @@ fn build_app_context(
     app_context.block_size_oracle = block_size_oracle;
     app_context.engine_reported_load = engine_state.engine_reported_load();
     app_context.kv_metrics = engine_state.metrics_source();
-    Ok(Arc::new(app_context))
+    Ok(app_context)
 }
 
 /// How serving ended; `inflight_drain_secs` is `None` when the server stopped
