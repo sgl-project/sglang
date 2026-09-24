@@ -6194,11 +6194,13 @@ class UnifiedRadixCacheSuite:
             _host_value(cache, node, ComponentType.MAMBA),
             "state demoted to host, not dropped",
         )
+        # SWA can split off device-only Full ancestors without Mamba states.
+        # They count toward the Full hit but not the host-hit budget; the
+        # scheduler collects their resident KV after reviving the state below.
         self.assertEqual(
-            len(m.device_indices) + m.host_hit_length,
+            m.full_kv_hit_length,
             len(seq_a),
-            "the full prefix stays servable (device KV is claimed once the "
-            "state is revived)",
+            "the full prefix remains cached",
         )
         self.assertGreaterEqual(
             m.mamba_host_hit_length, 1, "load-back armed for the host state"
