@@ -925,7 +925,9 @@ class DeepseekV2MoE(nn.Module):
             )
 
         num_token_non_padded = (
-            forward_batch.num_token_non_padded if forward_batch is not None else None
+            forward_batch.moe_num_token_non_padded()
+            if forward_batch is not None
+            else None
         )
         if not self._enable_a2a_moe:
             if self._can_dual_stream_graph(hidden_states):
@@ -1457,7 +1459,7 @@ class DeepseekV2MoE(nn.Module):
             topk_output = self.topk(
                 hidden_states,
                 router_logits,
-                num_token_non_padded=forward_batch.num_token_non_padded,
+                num_token_non_padded=forward_batch.moe_num_token_non_padded(),
                 expert_location_dispatch_info=(
                     ExpertLocationDispatchInfo.init_new(
                         layer_id=self.layer_id,
@@ -1851,7 +1853,7 @@ class DeepseekV2MoE(nn.Module):
                 state.topk_output = self.topk(
                     hidden_states=hidden_states,
                     router_logits=router_logits,
-                    num_token_non_padded=state.forward_batch.num_token_non_padded,
+                    num_token_non_padded=state.forward_batch.moe_num_token_non_padded(),
                     expert_location_dispatch_info=(
                         ExpertLocationDispatchInfo.init_new(
                             layer_id=self.layer_id,
@@ -2687,17 +2689,6 @@ class DeepseekV2DecoderLayer(nn.Module):
             hidden_states, residual, forward_batch
         )
 
-        fuse_mlp_allreduce = (
-            self.layer_communicator.should_fuse_mlp_allreduce_with_next_layer(
-                forward_batch
-            )
-        )
-
-        # For DP with padding, reduce scatter can be used instead of all-reduce.
-        mlp_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
-            forward_batch
-        )
-
         if isinstance(self.mlp, DeepseekV2MLP):
             gemm_output_zero_allocator = None
 
@@ -2712,24 +2703,13 @@ class DeepseekV2DecoderLayer(nn.Module):
         else:
             _mlp_ctx = nullcontext()
 
-        with get_forward().scoped(
-            fuse_mlp_allreduce=fuse_mlp_allreduce,
-            mlp_reduce_scatter=mlp_reduce_scatter,
-        ):
-            with _mlp_ctx:
-                hidden_states = self.mlp(
-                    hidden_states,
-                    forward_batch,
-                    gemm_output_zero_allocator,
-                )
-
-        if fuse_mlp_allreduce:
-            hidden_states._sglang_needs_allreduce_fusion = True
-
-        if not fuse_mlp_allreduce:
-            hidden_states, residual = self.layer_communicator.postprocess_layer(
-                hidden_states, residual, forward_batch
+        with self.layer_communicator.ffn_exit(forward_batch) as ffn_exit, _mlp_ctx:
+            hidden_states = self.mlp(
+                hidden_states,
+                forward_batch,
+                gemm_output_zero_allocator,
             )
+        hidden_states, residual = ffn_exit.finish(hidden_states, residual)
 
         return hidden_states, residual, topk_indices
 

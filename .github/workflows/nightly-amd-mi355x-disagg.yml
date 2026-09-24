@@ -67,6 +67,38 @@ jobs:
             echo "image=" >> $GITHUB_OUTPUT
           fi
 
+      - name: Record which image this run uses
+        # A dispatch `image:` input bypasses the resolver above, so a run can be
+        # on any ROCm line at all and nothing in the result table says so. Three
+        # of the four failures investigated in run 35823462425 -- two accuracy
+        # collapses to ~0.03 and one scheduler death -- were a hand-passed ROCm
+        # 10 image, and each cost a day to re-run on rocm720 before that showed
+        # up. Put the tag in the summary, and say plainly when it is off the
+        # tested line.
+        env:
+          DISPATCH_IMAGE: ${{ inputs.image }}
+          RESOLVED_IMAGE: ${{ steps.image.outputs.image }}
+        run: |
+          IMAGE="${DISPATCH_IMAGE:-$RESOLVED_IMAGE}"
+          echo "### Image" >> "$GITHUB_STEP_SUMMARY"
+          if [ -z "$IMAGE" ]; then
+            echo "Recipe default (no override)." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          echo "\`$IMAGE\`" >> "$GITHUB_STEP_SUMMARY"
+          if [ -n "$DISPATCH_IMAGE" ]; then
+            echo "Dispatch input, not the resolved nightly image." >> "$GITHUB_STEP_SUMMARY"
+          fi
+          case "$IMAGE" in
+            *-rocm720-mi35x-*) ;;
+            *)
+              echo "> **Not the tested \`rocm720-mi35x\` line.** Accuracy and" \
+                   "memory failures in this run may be the image, not the code." \
+                >> "$GITHUB_STEP_SUMMARY"
+              echo "::warning::$IMAGE is not on the tested rocm720-mi35x line"
+              ;;
+          esac
+
       - name: Generate benchmark matrix
         id: generate
         env:
@@ -133,7 +165,6 @@ jobs:
       CONFIG_FILE: ${{ matrix.config.config_file }}
       RESULT_FILENAME: mi355x-${{ matrix.config.name }}
       MATRIX_CONFIG_NAME: ${{ matrix.config.name }}
-      SLURM_EXCLUDE: mia1-p01-g20,mia1-p02-g09
       # NOTE: RUNNER_NAME is a built-in default env var on every runner, so the
       # launch + cleanup steps read it directly. Do NOT set it here from
       # ${{ runner.name }} -- the `runner` context is not available in job-level
