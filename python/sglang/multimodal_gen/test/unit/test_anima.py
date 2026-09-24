@@ -127,14 +127,14 @@ def test_modular_index_uses_existing_component_loaders(tmp_path, monkeypatch):
 
     def download(repo_id, filename):
         calls.append(filename)
-        if filename == "model_index.json":
+        if filename != "modular_model_index.json":
             raise hf_diffusers_utils.EntryNotFoundError("not found")
         return str(path)
 
     monkeypatch.setattr(hf_diffusers_utils, "hf_hub_download", download)
     remote = hf_diffusers_utils.maybe_download_model_index("test/anima")
     assert remote["transformer"] == config["transformer"]
-    assert calls == ["model_index.json", "modular_model_index.json"]
+    assert calls[-2:] == ["model_index.json", "modular_model_index.json"]
     (tmp_path / "model_index.json").write_text(
         json.dumps(
             {

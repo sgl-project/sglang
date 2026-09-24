@@ -286,6 +286,7 @@ class AnimaTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         self.__post_init__()
 
     def forward(self, hidden_states, encoder_hidden_states, timestep, **kwargs):
+        encoder_hidden_states = encoder_hidden_states.to(hidden_states.dtype)
         b, _, t, h, w = hidden_states.shape
         pt, ph, pw = self.config.patch_size
         if t % pt or h % ph or w % pw:
