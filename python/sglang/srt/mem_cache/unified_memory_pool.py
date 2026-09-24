@@ -627,6 +627,20 @@ class UnifiedMHATokenToKVPool(MHATokenToKVPool):
         raw = self._unified_buffer._raw
         return [raw.data_ptr()], [raw.numel()], [self._page_bytes]
 
+    def get_page_envelope_buffer(self) -> torch.Tensor:
+        """Return this sub-pool's page-strided view of the shared allocation."""
+        assert self._unified_buffer.anchor_bytes(self._sub_pool_name) == 0
+        raw = self._unified_buffer._raw
+        page_count = (
+            self._unified_buffer.max_slots(self._sub_pool_name) // self.page_size
+        )
+        return raw[: page_count * self._page_bytes].view(page_count, self._page_bytes)
+
+    @property
+    def grow_direction(self) -> str:
+        """Physical growth direction used by this sub-pool's L1 allocator."""
+        return self._unified_buffer.spec(self._sub_pool_name).grow_direction
+
     def _physical_to_kernel_indices(self, indices: torch.Tensor) -> torch.Tensor:
         return (indices // self.page_size) * (
             self.page_size * self.kernel_page_blocks
