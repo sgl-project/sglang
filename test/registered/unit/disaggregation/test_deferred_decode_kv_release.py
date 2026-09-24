@@ -180,7 +180,7 @@ class TestResolveDeferredReleases(CustomTestCase):
             # Both ranks acked -> released exactly once.
             mgr.note_abort_ack(room, 1)
             q.resolve_deferred_releases()
-            rel.assert_called_once_with(dreq.req, q.tree_cache, adopt=False)
+            rel.assert_called_once_with(dreq.req, q.tree_cache, is_insert=False)
 
         # Held state fully cleaned up.
         self.assertEqual(q._deferred_releases, [])
@@ -199,7 +199,7 @@ class TestResolveDeferredReleases(CustomTestCase):
 
         with patch.object(decode_mod, "release_kv_cache") as rel:
             q.resolve_deferred_releases()
-            rel.assert_called_once_with(dreq.req, q.tree_cache, adopt=False)
+            rel.assert_called_once_with(dreq.req, q.tree_cache, is_insert=False)
 
         self.assertEqual(q._deferred_releases, [])
         self.assertEqual(q.req_to_metadata_buffer_idx_allocator.freed, [idx])
@@ -218,7 +218,7 @@ class TestResolveDeferredReleases(CustomTestCase):
 
         calls = []
 
-        def fake_release(req, tree_cache, *, adopt):
+        def fake_release(req, tree_cache, is_insert):
             calls.append(req)
             if req is bad.req:
                 raise RuntimeError("boom")

@@ -316,7 +316,7 @@ class TestOptimisticPrefillCacheOwnership(unittest.TestCase):
 
         component.free_out_of_window_slots.assert_called_once()
         cache.insert.assert_not_called()
-        release_kv_cache.assert_called_once_with(req, cache, adopt=False)
+        release_kv_cache.assert_called_once_with(req, cache, is_insert=False)
         cache.finish.assert_called_once_with(
             req.cache_request_handle, CacheRequestOutcome.ABORT
         )
@@ -375,7 +375,9 @@ class TestOptimisticPrefillCacheOwnership(unittest.TestCase):
                 scheduler, req
             )
 
-        release_kv_cache.assert_called_once_with(req, scheduler.tree_cache, adopt=False)
+        release_kv_cache.assert_called_once_with(
+            req, scheduler.tree_cache, is_insert=False
+        )
         sender.abort.assert_called_once()
         self.assertFalse(req.pending_bootstrap)
 

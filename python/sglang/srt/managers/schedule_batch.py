@@ -2244,7 +2244,7 @@ def release_req(
             get_disagg().disaggregation_decode_retraction_backup,
         )
     # TODO (csy): for preempted requests, we may want to insert into the tree
-    release_kv_cache(req, tree_cache, adopt=False)
+    release_kv_cache(req, tree_cache, is_insert=False)
     # NOTE(lsyin): we should use the newly evictable memory instantly.
     num_tokens = remaing_req_count * envs.SGLANG_RETRACT_DECODE_STEPS.get()
     evict_from_tree_cache(tree_cache, num_tokens)

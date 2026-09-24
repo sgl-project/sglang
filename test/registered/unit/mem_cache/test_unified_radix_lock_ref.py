@@ -55,7 +55,7 @@ class TestUnifiedRadixLockRefScenarios(unittest.TestCase):
                 return_value=SimpleNamespace(strip_thinking_cache=False),
             ),
         ):
-            release_kv_cache(req, cache, adopt=False)
+            release_kv_cache(req, cache, is_insert=False)
 
         cache.free_kv_row.assert_called_once_with(kv, [(0, 3)])
         cache._dec_req_lock.assert_not_called()

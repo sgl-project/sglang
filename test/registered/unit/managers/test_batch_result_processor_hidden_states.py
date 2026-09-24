@@ -301,7 +301,7 @@ class TestSamplingMaskStatusErrors(CustomTestCase):
         self.assertEqual(req.to_finish.status_code, 400)
         req.update_finish_state.assert_called_once_with(0)
         processor.model_worker.prepare_for_kv_cache_release.assert_called_once_with(req)
-        release.assert_called_once_with(req, processor.tree_cache, adopt=False)
+        release.assert_called_once_with(req, processor.tree_cache, is_insert=False)
         processor.output_streamer.stream_output.assert_called_once_with([req], False)
 
     def test_overflow_and_invalid_have_distinct_http_errors(self):

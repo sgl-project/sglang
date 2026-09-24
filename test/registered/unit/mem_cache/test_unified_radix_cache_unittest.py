@@ -1858,7 +1858,7 @@ class UnifiedRadixCacheSuite:
         )
 
         avail_before = allocator.available_size()
-        release_kv_cache(req, cache, adopt=False)
+        release_kv_cache(req, cache, is_insert=False)
 
         self.assertEqual(allocator.available_size(), avail_before + kv_len)
         m = cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", tokens))))

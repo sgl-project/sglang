@@ -323,7 +323,7 @@ class TestGemma4ContextLifecycle(unittest.TestCase):
                 scheduler, _Batch([req]), _result([canvas])
             )
 
-        release.assert_called_once_with(req, scheduler.tree_cache, adopt=False)
+        release.assert_called_once_with(req, scheduler.tree_cache, is_insert=False)
 
     def test_context_boundary_stops_sync_and_fdfo(self):
         block_size = 4
@@ -346,7 +346,9 @@ class TestGemma4ContextLifecycle(unittest.TestCase):
                     )
 
                 self.assertTrue(req.finished())
-                release.assert_called_once_with(req, scheduler.tree_cache, adopt=False)
+                release.assert_called_once_with(
+                    req, scheduler.tree_cache, is_insert=False
+                )
 
 
 class TestGemma4RequestValidation(unittest.TestCase):

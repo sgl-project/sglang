@@ -400,7 +400,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
         )
         mock_prepare_abort.assert_called_once()
         mock_release_kv_cache.assert_called_once_with(
-            req, queue.tree_cache, adopt=False
+            req, queue.tree_cache, is_insert=False
         )
 
         receiver = FakeReceiver()
@@ -419,7 +419,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
         self.assertIsNone(decode_req.kv_receiver)
         queue.req_to_metadata_buffer_idx_allocator.free.assert_called_once_with(3)
         mock_release_kv_cache.assert_called_once_with(
-            req, queue.tree_cache, adopt=False
+            req, queue.tree_cache, is_insert=False
         )
 
     def test_fake_receiver_initializes_deferred_release_state(self):

@@ -376,7 +376,7 @@ class SchedulerBatchResultProcessor:
                         release_kv_cache(
                             req,
                             self.tree_cache,
-                            adopt=sampling_mask_finish_reason is None,
+                            is_insert=sampling_mask_finish_reason is None,
                         )
                         req.time_stats.set_completion_time()
                     elif not batch.decoding_reqs or req not in batch.decoding_reqs:
@@ -1251,7 +1251,7 @@ class SchedulerBatchResultProcessor:
             )
             if callable(prepare_release):
                 prepare_release(req)
-            release_kv_cache(req, self.tree_cache, adopt=False)
+            release_kv_cache(req, self.tree_cache, is_insert=False)
         req.time_stats.set_completion_time()
 
     def _handle_finish_state_updated_req(
@@ -1335,12 +1335,12 @@ class SchedulerBatchResultProcessor:
                 )
                 if callable(prepare_release):
                     prepare_release(req)
-                adopt = (
+                is_insert = (
                     req.mamba_lazy_is_insert
                     if get_exec().mamba.enable_mamba_extra_buffer_lazy
                     else True
                 )
-                release_kv_cache(req, self.tree_cache, adopt=adopt)
+                release_kv_cache(req, self.tree_cache, is_insert=is_insert)
 
             req.time_stats.set_completion_time()
 

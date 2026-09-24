@@ -275,11 +275,9 @@ def retraction_discard(req: Req, tree_cache: BasePrefixCache, backend: str) -> N
     req.kv.retraction_backup = None
 
 
-def release_kv_cache(
-    req: Req, tree_cache: BasePrefixCache, *, adopt: bool = True
-) -> None:
-    """Give the request's kv row back. With ``adopt`` the tree keeps what it
-    can key first; without it (abort, retract, KV the request cannot vouch
+def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = True):
+    """Give the request's kv row back. With ``is_insert`` the tree keeps what
+    it can key first; without it (abort, retract, KV the request cannot vouch
     for) the row is freed past the protected prefix."""
     assert (not req.kv.holds_kv) == req.kv.is_kv_released
     # A mamba-capable cache may alloc mamba state before alloc KV cache
@@ -300,8 +298,8 @@ def release_kv_cache(
         return
 
     owned_kv_len = req.owned_kv_len()
-    adopt = adopt and not getattr(req, "skip_radix_cache_insert", False)
-    if adopt:
+    is_insert = is_insert and not getattr(req, "skip_radix_cache_insert", False)
+    if is_insert:
         tree_cache.cache_finished_req(req, owned_kv_len=owned_kv_len)
     else:
         # The protected prefix is not this req's to free.
@@ -310,7 +308,7 @@ def release_kv_cache(
     _release_overallocated_kv_indices(
         req, owned_kv_len, req.kv.kv_allocated_len, tree_cache
     )
-    tree_cache.after_release(req, adopted=adopt)
+    tree_cache.after_release(req, adopted=is_insert)
 
     # If the prefix cache doesn't manage mamba states, we must free them here.
     if isinstance(tree_cache.req_to_token_pool, HybridReqToTokenPool) and (

@@ -179,7 +179,7 @@ class SchedulerDllmMixin:
             release_kv_cache(
                 req,
                 self.tree_cache,
-                adopt=not self.dllm_config.requires_separate_context_encoding,
+                is_insert=not self.dllm_config.requires_separate_context_encoding,
             )
             req.time_stats.set_completion_time()
 
