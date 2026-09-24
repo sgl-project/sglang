@@ -1339,6 +1339,7 @@ class Envs:
     # (EAGLE/MTP). Off by default; see the PP+spec RFC for constraints
     # (non-overlap schedule, no DP attention).
     SGLANG_ENABLE_PP_SPEC = EnvBool(False)
+    SGLANG_ENABLE_DP_SPEC_PREFILL_COORDINATION = EnvBool(False)
     # Capture the per-replay attention-metadata prep (init_forward_metadata_out_graph)
     # into a small CUDA graph, collapsing its host dispatch cost to one launch.
     # Experimental; auto-falls back to eager if the backend's prep is not capturable.
