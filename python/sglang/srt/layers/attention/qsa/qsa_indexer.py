@@ -315,16 +315,17 @@ class QSAIndexer(MultiPlatformOp):
         compressed_locs = metadata.write_locs
         if is_extend:
             member_rows = metadata.compress_member_rows.long()
-            prefix_members = metadata.compress_prefix_members.long()
             group_locs = member_rows[:, None] + torch.arange(
                 self.compress_ratio, device=member_rows.device, dtype=torch.long
             )
-            # A private chunk-cache tail can leave the first group crossing the
-            # extend boundary. Clamp its prefix-side rows to the first current
-            # row for this main pass; _overwrite_cross_prefix_groups replaces
-            # that group's result using the pending ring below.
-            first_current_rows = member_rows + prefix_members
-            group_locs = torch.maximum(group_locs, first_current_rows[:, None])
+            if metadata.has_cross_prefix_group:
+                # gfx95 exact-chunk-fill can leave a private chunk-cache tail
+                # mid-group. Clamp prefix-side rows for this main pass;
+                # _overwrite_cross_prefix_groups replaces that group's result
+                # from the pending ring below.
+                prefix_members = metadata.compress_prefix_members.long()
+                first_current_rows = member_rows + prefix_members
+                group_locs = torch.maximum(group_locs, first_current_rows[:, None])
             source_keys = token_k
             group_locs = group_locs.clamp_max(source_keys.shape[0] - 1)
             source_rope = metadata.extend_rope_matrix

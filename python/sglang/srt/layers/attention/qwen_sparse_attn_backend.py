@@ -37,6 +37,7 @@ from sglang.srt.layers.attention.qsa.sparse_attn import (
     sparse_gqa_fwd_interface_triton_ck,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.utils import is_gfx95_supported
 
 logger = logging.getLogger(__name__)
 
@@ -528,6 +529,13 @@ class QwenSparseAttnBackend(AttentionBackend):
             raise ValueError("QSA extend write plan requires extend_seq_lens")
         extend_lens = extend_lens.long()[: lengths.numel()]
         prefix_lens = (lengths - extend_lens).clamp_min(0)
+        if not is_gfx95_supported():
+            # Prefix sharing is page-granular and the page is a ratio
+            # multiple, so a matched prefix always covers whole groups.
+            # gfx95 exact-chunk-fill can leave a private chunk-cache tail
+            # mid-group; other platforms keep this invariant until they
+            # opt into the crossing path.
+            torch._assert_async((prefix_lens % ratio == 0).all())
         # Each row spans at most ceil(extend_len / ratio) blocks, so the
         # token count and row count bound the plan without a sync.
         capacity = int(forward_batch.input_ids.numel()) // ratio + int(lengths.numel())
@@ -642,7 +650,8 @@ class QwenSparseAttnBackend(AttentionBackend):
         extend_rope_matrix = None
         extend_prefix_lens_cpu = forward_batch.extend_prefix_lens_cpu
         has_cross_prefix_group = bool(
-            extend_prefix_lens_cpu is not None
+            is_gfx95_supported()
+            and extend_prefix_lens_cpu is not None
             and any(
                 int(length) % self.compress_ratio for length in extend_prefix_lens_cpu
             )
@@ -692,12 +701,6 @@ class QwenSparseAttnBackend(AttentionBackend):
                 is_extend=group_member_rows is not None,
             )
             if write_locs.numel():
-                compress_group_ring_locs = build_group_ring_slots(
-                    req_pool_indices=row_req_pool_indices,
-                    group_end_positions=group_positions.long(),
-                    sequence_ids=group_sequence_ids.long(),
-                    compress_ratio=self.compress_ratio,
-                )
                 if group_member_rows is not None:
                     rope_source = (
                         forward_batch.mrope_positions
@@ -706,6 +709,20 @@ class QwenSparseAttnBackend(AttentionBackend):
                     )
                     extend_rope_matrix = build_rope_position_matrix(
                         rope_source, token_to_batch_idx.numel()
+                    )
+                    if has_cross_prefix_group:
+                        compress_group_ring_locs = build_group_ring_slots(
+                            req_pool_indices=row_req_pool_indices,
+                            group_end_positions=group_positions.long(),
+                            sequence_ids=group_sequence_ids.long(),
+                            compress_ratio=self.compress_ratio,
+                        )
+                else:
+                    compress_group_ring_locs = build_group_ring_slots(
+                        req_pool_indices=row_req_pool_indices,
+                        group_end_positions=group_positions.long(),
+                        sequence_ids=group_sequence_ids.long(),
+                        compress_ratio=self.compress_ratio,
                     )
         indexer_metadata = QSAIndexerMetadata(
             sequence_lengths=sequence_lengths,

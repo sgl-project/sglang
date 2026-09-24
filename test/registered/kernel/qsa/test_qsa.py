@@ -45,6 +45,11 @@ FINAL_TOPK = TOKEN_TOPK + COMPRESS_RATIO - 1
 
 
 def test_qsa_write_plan_tracks_group_crossing_extend_prefix():
+    """Plan math for a prefix that starts mid compression group.
+
+    The overwrite path is runtime-gated on `is_gfx95_supported()`; this
+    test only checks that the write plan records `prefix_members`.
+    """
     token_slot_table = torch.arange(28, dtype=torch.int32).view(2, 14)
     prefix_lens = torch.tensor([10, 0], dtype=torch.long)
     extend_lens = torch.tensor([4, 8], dtype=torch.long)

@@ -77,6 +77,7 @@ class QSAIndexerMetadata(msgspec.Struct, frozen=True):
     compress_sequence_ids: Optional[torch.Tensor] = None
     compress_member_rows: Optional[torch.Tensor] = None
     compress_prefix_members: Optional[torch.Tensor] = None
+    # True only on gfx95 when a planned group crosses a chunk-cache tail.
     has_cross_prefix_group: bool = False
     is_cuda_graph: bool = False
     graph_write_locs: Optional[torch.Tensor] = None
