@@ -153,7 +153,7 @@ def server(monkeypatch, tmp_path):
     original_init = httpx.AsyncClient.__init__
 
     def client_init(self, *args, **kwargs):
-        kwargs["transport"] = httpx.MockTransport(respond)
+        kwargs.setdefault("transport", httpx.MockTransport(respond))
         original_init(self, *args, **kwargs)
 
     monkeypatch.setattr(httpx.AsyncClient, "__init__", client_init)
@@ -163,7 +163,7 @@ def server(monkeypatch, tmp_path):
         pipeline_config=ZImagePipelineConfig(),
         num_gpus=1,
         prompt_enhancer_config=str(config_path),
-        warmup_mode="disabled",
+        warmup_mode="off",
         output_path=str(tmp_path / "outputs"),
         input_save_path=str(tmp_path / "inputs"),
     )
@@ -308,6 +308,63 @@ def test_unconfigured_enhancer_rejects_opt_in_without_generation(server):
         assert not server.batches
     finally:
         server.app.state.prompt_enhancer = enhancer
+
+
+def test_missing_switch_preserves_original_prompt(server):
+    response = server.client.post(
+        "/v1/images/generations",
+        json={"prompt": "keep exactly this", "response_format": "b64_json"},
+    )
+    assert response.status_code == 200, response.text
+    assert not server.calls
+    assert server.batches[0].prompt == "keep exactly this"
+
+
+@pytest.mark.parametrize(
+    "source", ["https://example.com/reference.png", "data:image/png;base64,AAAA"]
+)
+@pytest.mark.parametrize("include_images", [True, False])
+def test_reference_transport_is_explicit(server, source, include_images):
+    enhancer = server.app.state.prompt_enhancer
+    enhancer.config.include_images = include_images
+
+    async def run():
+        return await enhancer.enhance(
+            "keep the subject", task="image_edit", image_paths=[source]
+        )
+
+    assert server.client.portal.call(run) == server.rewritten
+    content = server.calls[0]["messages"][1]["content"]
+    if include_images:
+        assert content[1] == {"type": "image_url", "image_url": {"url": source}}
+    else:
+        assert isinstance(content, str)
+        assert source not in content
+
+
+def test_enhancer_failure_does_not_queue_video_or_leak_uploads(
+    server, monkeypatch, tmp_path
+):
+    server.args.pipeline_config = WanT2V480PConfig()
+    server.args.input_save_path = None
+    server.args.output_path = None
+    monkeypatch.setattr(video_api.tempfile, "tempdir", str(tmp_path))
+
+    async def fail(request):
+        return httpx.Response(503, text="upstream secret")
+
+    enhancer = server.app.state.prompt_enhancer
+    server.client.portal.call(enhancer.client.aclose)
+    enhancer.client = httpx.AsyncClient(
+        base_url="http://enhancer.local/v1/", transport=httpx.MockTransport(fail)
+    )
+    response = server.client.post(
+        "/v1/videos", json={"prompt": "a teapot", "enhance_prompt": True}
+    )
+    assert response.status_code == 502
+    assert "secret" not in response.text
+    assert not server.batches
+    assert not list(tmp_path.glob("sglang_*"))
 
 
 def test_realtime_does_not_silently_accept_prompt_enhancement():
