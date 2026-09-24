@@ -99,8 +99,39 @@ class DecodeStatus:
         return self.decoded_text
 
 
+def _stock_fast_backend_decode(tokenizer):
+    """Return the Rust ``tokenizers.Tokenizer.decode`` when ``batch_decode`` on this
+    tokenizer is exactly a per-row call of it, else None.
+
+    Holds for an unpatched transformers ``TokenizersBackend`` with cleanup disabled:
+    batch_decode -> decode -> _decode -> ``_tokenizer.decode(ids, skip_special_tokens)``
+    (``spaces_between_special_tokens`` is ignored there). Skipping the Python wrappers
+    saves several us per row on every decode step.
+    """
+    try:
+        import tokenizers
+        from transformers.tokenization_utils_base import PreTrainedTokenizerBase
+        from transformers.tokenization_utils_tokenizers import TokenizersBackend
+    except ImportError:
+        return None
+    cls = type(tokenizer)
+    if (
+        getattr(cls, "batch_decode", None) is PreTrainedTokenizerBase.batch_decode
+        and getattr(cls, "decode", None) is PreTrainedTokenizerBase.decode
+        and getattr(cls, "_decode", None) is TokenizersBackend._decode
+        and not {"batch_decode", "decode", "_decode"}
+        & getattr(tokenizer, "__dict__", {}).keys()
+        and type(getattr(tokenizer, "_tokenizer", None)) is tokenizers.Tokenizer
+        and not getattr(tokenizer, "clean_up_tokenization_spaces", True)
+    ):
+        return tokenizer._tokenizer.decode
+    return None
+
+
 class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
     """DetokenizerManager is a process that detokenizes the token ids."""
+
+    _backend_decode = None
 
     def __init__(
         self,
@@ -144,6 +175,7 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
                 revision=get_model().revision,
                 tokenizer_backend=get_serving().tokenizer_backend,
             )
+            self._backend_decode = _stock_fast_backend_decode(self.tokenizer)
             try:
                 self.vocab_size = len(self.tokenizer)
             except TypeError:
@@ -260,7 +292,13 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             skip_list = [skip_list[i] for i in keep_idx]
             space_list = [space_list[i] for i in keep_idx]
 
-        if not getattr(self.tokenizer, "is_fast", False):
+        backend_decode = self._backend_decode
+        if backend_decode is not None:
+            decoded = [
+                backend_decode(ids, skip_special_tokens=skip)
+                for ids, skip in zip(ids_list, skip_list)
+            ]
+        elif not getattr(self.tokenizer, "is_fast", False):
             decoded = [
                 decode_without_hf_kwargs(self.tokenizer, ids, skip)
                 for ids, skip in zip(ids_list, skip_list)
