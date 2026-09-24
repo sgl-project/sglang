@@ -196,7 +196,10 @@ class CanonicalStrategy:
                         events.append(Event("normal", content))
                     pos += 1
 
-        return events, ""
+        # Everything up to here is complete; a trailing structural marker that is
+        # still incomplete is held back for the next chunk rather than dropped.
+        _emit, hold = prefix_hold(text, self.guard_tokens)
+        return events, hold
 
     def _parse_partial_analysis(
         self, text: str, tokens: List[Token], start_pos: int
@@ -237,11 +240,17 @@ class CanonicalStrategy:
 
         # Extract partial content after <|message|>
         content_start = tokens[message_pos].end
-        content = text[content_start:]
+        # A structural marker split across chunks is not content. iter_tokens folds
+        # the incomplete tail into a TEXT token, so emitting it verbatim would hand
+        # "<|end" to the caller as reasoning and drop it from the buffer; the
+        # channel then never closes and the rest of the stream is parsed as
+        # reasoning. Hold the tail back the way the TEXT path already does.
+        emit, hold = prefix_hold(text[content_start:], self.guard_tokens)
 
-        # Return partial reasoning content and preserve the channel structure for next parse
-        remaining_text = text[tokens[start_pos].start : content_start]
-        return Event("reasoning", content), remaining_text
+        # Return partial reasoning content and preserve the channel structure for
+        # next parse, including anything held back.
+        remaining_text = text[tokens[start_pos].start : content_start] + hold
+        return Event("reasoning", emit), remaining_text
 
     def _extract_channel_type(self, header_text: str) -> Optional[str]:
         """Extract channel type from header, ignoring other attributes like to=... or <|constrain|>..."""
@@ -327,8 +336,11 @@ class CanonicalStrategy:
         if end_pos >= len(tokens):
             # No end token found
             if channel_type == "final":
-                # Final blocks can end at end of input without requiring <|return|>
-                content = text[content_start:]
+                # Final blocks can end at end of input without requiring <|return|>.
+                # A trailing structural marker that is still incomplete is not
+                # content either; leave it out here and let parse() hand it back as
+                # the remaining buffer for the next chunk to complete.
+                content, _hold = prefix_hold(text[content_start:], self.guard_tokens)
                 return Event("normal", content), end_pos
             return None  # Analysis and commentary need proper end tokens
 
