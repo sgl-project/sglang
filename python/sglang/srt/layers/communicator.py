@@ -844,6 +844,8 @@ class LayerCommunicator:
         quant_format: str = "",
         post_residual_addition: Optional[torch.Tensor] = None,
     ):
+        if isinstance(hidden_states, UnreducedOutput) and residual is None:
+            raise RuntimeError("an UnreducedOutput requires residual input")
         if (
             isinstance(hidden_states, UnreducedOutput)
             and hidden_states.reduce_and_redistribute is not None
