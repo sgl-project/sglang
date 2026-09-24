@@ -1213,12 +1213,9 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         return ceil_align(cap + headroom, self.page_size)
 
     def _get_paged_kv_bytes_per_token(self, compress_ratio: int = 0) -> float:
-        if (
-            self._unified
-            or _is_hip
-            or _is_npu
-            or get_exec().kernel.dsv4_attn_backend == "trtllm"
-        ):
+        # Unified rings, the NPU pool and the trtllm uniform-FP8 pool do not go
+        # through DeepSeekV4SingleKVPool.create_buffer, so they carry no page pad.
+        if self._unified or _is_npu or get_exec().kernel.dsv4_attn_backend == "trtllm":
             return self.kv_bytes
         from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
             resolve_compressed_kv_layout,
