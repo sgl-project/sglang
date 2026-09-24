@@ -48,6 +48,7 @@ from sglang.srt.observability.metrics_collector import (
 from sglang.srt.runtime_context import get_device as get_device_namespace
 from sglang.srt.runtime_context import (
     get_exec,
+    get_platform,
     get_schedule,
     logs_expert_balancedness_to_server_log,
     reports_expert_balancedness,
@@ -60,7 +61,9 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+# AMD specific function
 def megamoe_prefill_only_recorder_enabled() -> bool:
+    # The prefill-only arm belongs to aiter MegaMoEv2, which only exists on ROCm.
     # Read the backend through the resolved accessor, not off a supplied
     # ServerArgs: test_supplied_instance_exposure_ratchet pins (file, field)
     # pairs where a `server_args` parameter is read for a field that resolution
@@ -68,13 +71,15 @@ def megamoe_prefill_only_recorder_enabled() -> bool:
     from sglang.srt.layers.moe import get_moe_a2a_backend
 
     return (
-        envs.SGLANG_AITER_MEGA_EPLB_PREFILL_ONLY.get()
+        get_platform().is_hip
+        and envs.SGLANG_AITER_MEGA_EPLB_PREFILL_ONLY.get()
         and envs.SGLANG_AITER_MEGA_RANK_SYNC.get()
         and get_moe_a2a_backend().is_megamoe()
     )
 
 
-def should_record_megamoe_prefill_pass(forward_batch: ForwardBatch) -> bool:
+# non-hip platform always return True
+def should_record_forward_pass(forward_batch: ForwardBatch) -> bool:
     if not megamoe_prefill_only_recorder_enabled():
         return True
     if _is_model_capture_mode():
@@ -85,6 +90,19 @@ def should_record_megamoe_prefill_pass(forward_batch: ForwardBatch) -> bool:
     ):
         return False
     return int(forward_batch.extend_num_tokens or 0) > 0
+
+
+# non-hip platform always return True
+def should_advance_eplb_counter(forward_batch: ForwardBatch) -> bool:
+    """Whether a finished pass counts towards the EPLB rebalance interval.
+
+    Unlike `should_record_forward_pass`, which is local to this rank, the
+    counter has to advance in lockstep across ranks, so it keys off the globally
+    synchronized `is_extend_in_batch` rather than this rank's forward mode.
+    """
+    if not megamoe_prefill_only_recorder_enabled():
+        return True
+    return forward_batch.is_extend_in_batch
 
 
 def _is_model_capture_mode() -> bool:
@@ -248,7 +266,7 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
         if not self._recording:
             self._record_current_pass = False
             return
-        self._record_current_pass = should_record_megamoe_prefill_pass(forward_batch)
+        self._record_current_pass = should_record_forward_pass(forward_batch)
         if not self._record_current_pass:
             return
         for gatherer_key, gatherer in self._single_pass_gatherers.items():

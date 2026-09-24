@@ -3810,6 +3810,27 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             extend_num_tokens=self.extend_num_tokens,
         )
 
+    def _swa_eviction_trigger(self, sliding_window_size: int, eviction_interval: int):
+        """Pick this forward's per-request SWA eviction trigger.
+
+        Default: evict only once >= eviction_interval tokens have slid out of
+        the window, amortizing eviction work while keeping each request's
+        overshoot within the interval the pool budget reserves. Gating on
+        accumulated tokens rather than an iteration-counter phase cannot
+        starve, because seqlen progress is monotonic per KV handle.
+
+        Aiter MegaMoE DSV4 keeps the older forward-interval cadence instead:
+        per-request token gating synchronizes SWA pressure across DP ranks and
+        triggers a retraction / re-prefill storm at high concurrency.
+        """
+        if envs.SGLANG_AMD_USE_FLYDSL_MEGA_MOE.get():
+            due_this_forward = (self.forward_iter or 0) % eviction_interval == 0
+            return lambda req: due_this_forward
+        return lambda req: (
+            req.seqlen - 1 - sliding_window_size
+            >= req.kv.swa_evicted_seqlen + eviction_interval
+        )
+
     def maybe_evict_swa(self):
         if self.tree_cache.supports_swa():
             sliding_window_size = self.tree_cache.sliding_window_size
@@ -3820,35 +3841,19 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             )
 
             eviction_interval = max(1, envs.SGLANG_SWA_EVICTION_INTERVAL.get())
-            use_forward_interval_eviction = envs.SGLANG_AMD_USE_FLYDSL_MEGA_MOE.get()
-            swa_maintenance_step = (self.forward_iter or 0) % eviction_interval == 0
+            swa_evict_due = self._swa_eviction_trigger(
+                sliding_window_size, eviction_interval
+            )
             self.token_to_kv_pool_allocator.free_group_begin()
             for idx, req in enumerate(self.reqs):
                 if self.forward_mode.is_decode():
-                    # We set evict_swa condition here with two reasons:
-                    # 1. In overlap scheduler, we cannot evict swa when req.decode_batch_idx == 0 since the prev extend batch is still running.
-                    # 2. Default path: evict only once >= eviction_interval
-                    # tokens have slid out of the window, amortizing eviction
-                    # work while keeping each request's overshoot within the
-                    # interval the pool budget reserves. Gating on accumulated
-                    # tokens (rather than an iteration-counter phase) cannot
-                    # starve because seqlen progress is monotonic per KV handle.
-                    # The Aiter MegaMoE DSV4 path instead retains the validated
-                    # forward-interval cadence: per-request token gating causes
-                    # synchronized SWA pressure and a retraction/re-prefill
-                    # storm at high DP concurrency.
-                    if req.decode_batch_idx >= 1 and (
-                        (
-                            use_forward_interval_eviction
-                            and swa_maintenance_step
-                            and req.kv.holds_kv
-                        )
-                        or (
-                            not use_forward_interval_eviction
-                            and req.kv.holds_kv
-                            and req.seqlen - 1 - sliding_window_size
-                            >= req.kv.swa_evicted_seqlen + eviction_interval
-                        )
+                    # In overlap scheduler, we cannot evict swa when
+                    # req.decode_batch_idx == 0 since the prev extend batch is
+                    # still running. `_swa_eviction_trigger` owns the rest.
+                    if (
+                        req.decode_batch_idx >= 1
+                        and req.kv.holds_kv
+                        and swa_evict_due(req)
                     ):
                         self._evict_swa(req, req.seqlen - 1)
 

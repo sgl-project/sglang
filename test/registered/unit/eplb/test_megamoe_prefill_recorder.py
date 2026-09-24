@@ -9,9 +9,11 @@ from sglang.srt.eplb.eplb_map_record_fused import eplb_map_and_record_fused
 from sglang.srt.eplb.expert_distribution import (
     _ExpertDistributionRecorderReal,
     _SelectExpertsSinglePassGatherer,
-    should_record_megamoe_prefill_pass,
+    should_advance_eplb_counter,
+    should_record_forward_pass,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.runtime_context import override_platform
 from sglang.srt.utils import Withable
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -53,6 +55,11 @@ class TestMegaMoEPrefillRecorder(unittest.TestCase):
         )
         capture_patch.start()
         self.addCleanup(capture_patch.stop)
+        # The prefill-only arm is ROCm-only, so say so rather than inheriting
+        # whichever platform the test host happens to be.
+        platform_override = override_platform(is_hip=True)
+        platform_override.install()
+        self.addCleanup(platform_override.restore)
 
     def test_pass_gate_records_only_real_prefill(self):
         cases = [
@@ -67,7 +74,7 @@ class TestMegaMoEPrefillRecorder(unittest.TestCase):
         for batch, expected in cases:
             with self.subTest(mode=batch.forward_mode, extend=batch.extend_num_tokens):
                 self.assertEqual(
-                    should_record_megamoe_prefill_pass(batch),
+                    should_record_forward_pass(batch),
                     expected,
                 )
 
@@ -77,7 +84,7 @@ class TestMegaMoEPrefillRecorder(unittest.TestCase):
             "sglang.srt.eplb.expert_distribution._is_model_capture_mode",
             return_value=True,
         ):
-            self.assertFalse(should_record_megamoe_prefill_pass(batch))
+            self.assertFalse(should_record_forward_pass(batch))
 
     def test_gate_off_preserves_legacy_decode_recording(self):
         with patch(
@@ -85,9 +92,7 @@ class TestMegaMoEPrefillRecorder(unittest.TestCase):
             "SGLANG_AITER_MEGA_EPLB_PREFILL_ONLY.get",
             return_value=False,
         ):
-            self.assertTrue(
-                should_record_megamoe_prefill_pass(_batch(ForwardMode.DECODE))
-            )
+            self.assertTrue(should_record_forward_pass(_batch(ForwardMode.DECODE)))
 
     def test_recorder_skips_decode_and_commits_prefill(self):
         recorder = self._make_recorder()
@@ -110,10 +115,21 @@ class TestMegaMoEPrefillRecorder(unittest.TestCase):
                 yield
 
         manager._main_generator = generator()
-        manager.on_forward_pass_end(_batch(ForwardMode.DECODE, any_prefill=False))
+
+        decode = _batch(ForwardMode.DECODE, any_prefill=False)
+        self.assertFalse(should_advance_eplb_counter(decode))
         self.assertEqual(advances, [])
-        manager.on_forward_pass_end(_batch(ForwardMode.IDLE, any_prefill=True))
+
+        idle_with_global_prefill = _batch(ForwardMode.IDLE, any_prefill=True)
+        self.assertTrue(should_advance_eplb_counter(idle_with_global_prefill))
+        manager.on_forward_pass_end()
         self.assertEqual(advances, [1])
+
+    def test_prefill_only_arm_is_inert_off_rocm(self):
+        decode = _batch(ForwardMode.DECODE, any_prefill=False)
+        with override_platform(is_hip=False):
+            self.assertTrue(should_advance_eplb_counter(decode))
+            self.assertTrue(should_record_forward_pass(decode))
 
     def test_select_experts_filters_all_out_of_range_ids(self):
         gatherer = _SelectExpertsSinglePassGatherer.__new__(

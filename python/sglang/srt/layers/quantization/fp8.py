@@ -1663,201 +1663,205 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         self.is_fp4_expert = False
         logger.warning_once("Dequantized FP4 MoE expert weights to FP8.")
 
-    def process_weights_after_loading_block_quant(self, layer: Module) -> None:
-        if (
-            self.is_fp4_expert
-            and get_moe_a2a_backend().is_megamoe()
+    def _megamoe_fp4_experts_enabled(self) -> bool:
+        return (
+            get_moe_a2a_backend().is_megamoe()
             and envs.SGLANG_AMD_USE_FLYDSL_MEGA_MOE.get()
-        ):
-            fp4_weight_dtype = _require_fp4_dtype()
-            layer.w13_weight.data = layer.w13_weight.data.view(fp4_weight_dtype)
-            layer.w2_weight.data = layer.w2_weight.data.view(fp4_weight_dtype)
-            from sglang.srt.layers.moe.mega_moe import (
-                build_mega_moe_experts_weights,
+        )
+
+    def _build_megamoe_fp4_experts(self, layer: Module) -> None:
+        """Hand the packed FP4 experts to MegaMoEv2's own weight builder."""
+        from sglang.srt.layers.moe.mega_moe import build_mega_moe_experts_weights
+
+        fp4_weight_dtype = _require_fp4_dtype()
+        layer.w13_weight.data = layer.w13_weight.data.view(fp4_weight_dtype)
+        layer.w2_weight.data = layer.w2_weight.data.view(fp4_weight_dtype)
+        build_mega_moe_experts_weights(layer)
+
+    def _process_aiter_native_fp4_experts(self, layer: Module) -> None:
+        """AMD FP4 experts: use aiter's native MXFP4 MoE path."""
+        gu_intv = envs.SGLANG_USE_AITER_MOE_GU_ITLV.get()
+        fp4_weight_dtype = _require_fp4_dtype()
+
+        # DeepSeek V4 MoE is implemented by the FlyDSL kernel, which supports
+        # tile_k=128, so we only need to pad dim to 128. This lets DeepSeek-V4-Pro
+        # at TP8 skip padding 384 -> 512, reducing routed-expert memory by ~25%.
+        # shuffle_scale also supports non-256 shapes since aiter PR#4130.
+        fp4_k_align = 128
+        E, w13_N, w13_K_packed = layer.w13_weight.shape
+        _, w2_N, w2_K_packed = layer.w2_weight.shape
+        inter_per_part = w13_N // 2
+        padded_inter = (inter_per_part + fp4_k_align - 1) // fp4_k_align * fp4_k_align
+        # Record the padding so fused_moe is told the real intermediate size
+        # (aiter fused_moe needs intermediate_pad = padded - real; ATOM passes
+        # 128, SGLang previously defaulted to 0 -> computed the padded region).
+        layer.intermediate_pad = padded_inter - inter_per_part
+        layer.hidden_pad = 0
+        if padded_inter != inter_per_part:
+            pad_amount = padded_inter - inter_per_part
+            fp4_block_k = 32
+
+            # Pad w13_weight: (E, 2*inter, K_packed) → (E, 2*padded, K_packed)
+            old_w13 = layer.w13_weight.data
+            new_w13 = torch.zeros(
+                E,
+                2 * padded_inter,
+                w13_K_packed,
+                dtype=old_w13.dtype,
+                device=old_w13.device,
+            )
+            new_w13[:, :inter_per_part, :] = old_w13[:, :inter_per_part, :]
+            new_w13[:, padded_inter : padded_inter + inter_per_part, :] = old_w13[
+                :, inter_per_part:, :
+            ]
+            layer.w13_weight = torch.nn.Parameter(new_w13, requires_grad=False)
+
+            # Pad w2_weight: (E, N, inter_packed) → (E, N, padded_packed)
+            old_w2 = layer.w2_weight.data
+            new_w2 = torch.zeros(
+                E,
+                w2_N,
+                padded_inter // 2,
+                dtype=old_w2.dtype,
+                device=old_w2.device,
+            )
+            new_w2[:, :, :w2_K_packed] = old_w2
+            layer.w2_weight = torch.nn.Parameter(new_w2, requires_grad=False)
+
+            # Pad w13 scale: (E, 2*inter, K/block_k) → (E, 2*padded, K/block_k)
+            old_s13 = layer.w13_weight_scale_inv.data
+            _, _, s13_K = old_s13.shape
+            new_s13 = torch.zeros(
+                E,
+                2 * padded_inter,
+                s13_K,
+                dtype=old_s13.dtype,
+                device=old_s13.device,
+            )
+            new_s13[:, :inter_per_part, :] = old_s13[:, :inter_per_part, :]
+            new_s13[:, padded_inter : padded_inter + inter_per_part, :] = old_s13[
+                :, inter_per_part:, :
+            ]
+            layer.w13_weight_scale_inv = torch.nn.Parameter(
+                new_s13, requires_grad=False
             )
 
-            build_mega_moe_experts_weights(layer)
-            return
-
-        # AMD FP4 experts: use aiter's native MXFP4 MoE path.
-        # Skipped when dequant_fp4_to_fp8 is requested: this branch returns
-        # unconditionally, so without the extra check SGLANG_DSV4_FP4_DEQUANT=1
-        # is silently a no-op for routed experts on every AITER deployment.
-        if _use_aiter and self.is_fp4_expert and not self.dequant_fp4_to_fp8:
-            gu_intv = envs.SGLANG_USE_AITER_MOE_GU_ITLV.get()
-            fp4_weight_dtype = _require_fp4_dtype()
-
-            # DeepSeek V4 MoE is implemented by the FlyDSL kernel, which supports
-            # tile_k=128, so we only need to pad dim to 128. This lets DeepSeek-V4-Pro
-            # at TP8 skip padding 384 -> 512, reducing routed-expert memory by ~25%.
-            # shuffle_scale also supports non-256 shapes since aiter PR#4130.
-            fp4_k_align = 128
-            E, w13_N, w13_K_packed = layer.w13_weight.shape
-            _, w2_N, w2_K_packed = layer.w2_weight.shape
-            inter_per_part = w13_N // 2
-            padded_inter = (
-                (inter_per_part + fp4_k_align - 1) // fp4_k_align * fp4_k_align
+            # Pad w2 scale: (E, N, inter/block_k) → (E, N, padded/block_k)
+            old_s2 = layer.w2_weight_scale_inv.data
+            new_s2 = torch.zeros(
+                E,
+                w2_N,
+                padded_inter // fp4_block_k,
+                dtype=old_s2.dtype,
+                device=old_s2.device,
             )
-            # Record the padding so fused_moe is told the real intermediate size
-            # (aiter fused_moe needs intermediate_pad = padded - real; ATOM passes
-            # 128, SGLang previously defaulted to 0 -> computed the padded region).
-            layer.intermediate_pad = padded_inter - inter_per_part
-            layer.hidden_pad = 0
-            if padded_inter != inter_per_part:
-                pad_amount = padded_inter - inter_per_part
-                fp4_block_k = 32
+            new_s2[:, :, : old_s2.shape[2]] = old_s2
+            layer.w2_weight_scale_inv = torch.nn.Parameter(new_s2, requires_grad=False)
 
-                # Pad w13_weight: (E, 2*inter, K_packed) → (E, 2*padded, K_packed)
-                old_w13 = layer.w13_weight.data
-                new_w13 = torch.zeros(
-                    E,
-                    2 * padded_inter,
-                    w13_K_packed,
-                    dtype=old_w13.dtype,
-                    device=old_w13.device,
-                )
-                new_w13[:, :inter_per_part, :] = old_w13[:, :inter_per_part, :]
-                new_w13[:, padded_inter : padded_inter + inter_per_part, :] = old_w13[
-                    :, inter_per_part:, :
-                ]
-                layer.w13_weight = torch.nn.Parameter(new_w13, requires_grad=False)
-
-                # Pad w2_weight: (E, N, inter_packed) → (E, N, padded_packed)
-                old_w2 = layer.w2_weight.data
-                new_w2 = torch.zeros(
-                    E,
-                    w2_N,
-                    padded_inter // 2,
-                    dtype=old_w2.dtype,
-                    device=old_w2.device,
-                )
-                new_w2[:, :, :w2_K_packed] = old_w2
-                layer.w2_weight = torch.nn.Parameter(new_w2, requires_grad=False)
-
-                # Pad w13 scale: (E, 2*inter, K/block_k) → (E, 2*padded, K/block_k)
-                old_s13 = layer.w13_weight_scale_inv.data
-                _, _, s13_K = old_s13.shape
-                new_s13 = torch.zeros(
-                    E,
-                    2 * padded_inter,
-                    s13_K,
-                    dtype=old_s13.dtype,
-                    device=old_s13.device,
-                )
-                new_s13[:, :inter_per_part, :] = old_s13[:, :inter_per_part, :]
-                new_s13[:, padded_inter : padded_inter + inter_per_part, :] = old_s13[
-                    :, inter_per_part:, :
-                ]
-                layer.w13_weight_scale_inv = torch.nn.Parameter(
-                    new_s13, requires_grad=False
-                )
-
-                # Pad w2 scale: (E, N, inter/block_k) → (E, N, padded/block_k)
-                old_s2 = layer.w2_weight_scale_inv.data
-                new_s2 = torch.zeros(
-                    E,
-                    w2_N,
-                    padded_inter // fp4_block_k,
-                    dtype=old_s2.dtype,
-                    device=old_s2.device,
-                )
-                new_s2[:, :, : old_s2.shape[2]] = old_s2
-                layer.w2_weight_scale_inv = torch.nn.Parameter(
-                    new_s2, requires_grad=False
-                )
-
-            for scale_name in ("w13_weight_scale_inv", "w2_weight_scale_inv"):
-                scale = getattr(layer, scale_name)
-                num_experts, num_rows, _ = scale.shape
-                is_w13_scale = scale_name == "w13_weight_scale_inv"
-                if _is_gfx1250_supported:
-                    scale.data = moe_shuffle_scale(
-                        scale.contiguous(),
-                        experts_cnt=num_experts,
-                        is_guinterleave=gu_intv,
-                        gate_up=is_w13_scale,
-                    )
-                else:
-                    scale_2d = scale.reshape(-1, scale.shape[-1])
-                    scale.data = shuffle_scale(
-                        scale_2d, num_experts, gu_intv, is_w13_scale
-                    )
-
-            layer.w13_weight.data = layer.w13_weight.data.view(fp4_weight_dtype)
-            layer.w2_weight.data = layer.w2_weight.data.view(fp4_weight_dtype)
-
+        for scale_name in ("w13_weight_scale_inv", "w2_weight_scale_inv"):
+            scale = getattr(layer, scale_name)
+            num_experts, num_rows, _ = scale.shape
+            is_w13_scale = scale_name == "w13_weight_scale_inv"
             if _is_gfx1250_supported:
-                is_shuffled = True
-                layer.w13_weight.data = moe_shuffle_weight(
-                    layer.w13_weight,
+                scale.data = moe_shuffle_scale(
+                    scale.contiguous(),
+                    experts_cnt=num_experts,
                     is_guinterleave=gu_intv,
-                    gate_up=True,
-                )
-                layer.w2_weight.data = moe_shuffle_weight(
-                    layer.w2_weight,
-                    is_guinterleave=gu_intv,
-                    gate_up=False,
+                    gate_up=is_w13_scale,
                 )
             else:
-                is_shuffled = _is_shuffle_moe_mxfp4 or _use_aiter_a8w4
-                if is_shuffled:
-                    shuffle_gu_intv = gu_intv and not _use_aiter_a8w4
-                    layer.w13_weight.data = shuffle_weight(
-                        layer.w13_weight,
-                        is_guinterleave=shuffle_gu_intv,
-                        gate_up=True,
-                    )
-                    layer.w2_weight.data = shuffle_weight(
-                        layer.w2_weight,
-                        is_guinterleave=shuffle_gu_intv,
-                        gate_up=False,
-                    )
-            layer.w13_weight.is_shuffled = is_shuffled
-            layer.w2_weight.is_shuffled = is_shuffled
-            return
+                scale_2d = scale.reshape(-1, scale.shape[-1])
+                scale.data = shuffle_scale(scale_2d, num_experts, gu_intv, is_w13_scale)
 
-        # ROCm AITER: bypass the native FP4 early return when DSV4 dequant is
-        # requested, then use the standard block-FP8 MoE path.
-        if self.is_fp4_expert and self.dequant_fp4_to_fp8 and _use_aiter:
-            self._dequantize_aiter_fp4_experts(layer)
-            self.weight_block_size = [128, 128]
+        layer.w13_weight.data = layer.w13_weight.data.view(fp4_weight_dtype)
+        layer.w2_weight.data = layer.w2_weight.data.view(fp4_weight_dtype)
 
-            # gfx942/gfx950 native FP8 is e4m3fnuz, not e4m3fn.
-            if _is_fp8_fnuz:
-                w13_weight, w13_weight_scale, _ = normalize_e4m3fn_to_e4m3fnuz(
-                    weight=layer.w13_weight,
-                    weight_scale=layer.w13_weight_scale_inv,
-                    input_scale=None,
-                )
-                w2_weight, w2_weight_scale, _ = normalize_e4m3fn_to_e4m3fnuz(
-                    weight=layer.w2_weight,
-                    weight_scale=layer.w2_weight_scale_inv,
-                    input_scale=None,
-                )
-                layer.w13_weight = Parameter(w13_weight, requires_grad=False)
-                layer.w13_weight_scale_inv = Parameter(
-                    w13_weight_scale, requires_grad=False
-                )
-                layer.w2_weight = Parameter(w2_weight, requires_grad=False)
-                layer.w2_weight_scale_inv = Parameter(
-                    w2_weight_scale, requires_grad=False
-                )
-                layer.w13_input_scale = None
-                layer.w2_input_scale = None
-
-            # Only aiter-shuffle when the MoE runner is aiter; the triton runner
-            # consumes un-shuffled weights (shuffling the wrong runner corrupts output).
-            runner_is_aiter = (
-                getattr(self, "runner", None) is not None
-                and self.runner.runner_backend.is_aiter()
+        if _is_gfx1250_supported:
+            is_shuffled = True
+            layer.w13_weight.data = moe_shuffle_weight(
+                layer.w13_weight,
+                is_guinterleave=gu_intv,
+                gate_up=True,
             )
-            if _use_aiter and runner_is_aiter:
+            layer.w2_weight.data = moe_shuffle_weight(
+                layer.w2_weight,
+                is_guinterleave=gu_intv,
+                gate_up=False,
+            )
+        else:
+            is_shuffled = _is_shuffle_moe_mxfp4 or _use_aiter_a8w4
+            if is_shuffled:
+                shuffle_gu_intv = gu_intv and not _use_aiter_a8w4
                 layer.w13_weight.data = shuffle_weight(
-                    layer.w13_weight.contiguous(), (16, 16)
+                    layer.w13_weight,
+                    is_guinterleave=shuffle_gu_intv,
+                    gate_up=True,
                 )
                 layer.w2_weight.data = shuffle_weight(
-                    layer.w2_weight.contiguous(), (16, 16)
+                    layer.w2_weight,
+                    is_guinterleave=shuffle_gu_intv,
+                    gate_up=False,
                 )
+        layer.w13_weight.is_shuffled = is_shuffled
+        layer.w2_weight.is_shuffled = is_shuffled
+
+    def _process_aiter_fp4_dequant_to_fp8(self, layer: Module) -> None:
+        """Dequantize the packed FP4 experts, then take the block-FP8 path."""
+        self._dequantize_aiter_fp4_experts(layer)
+        self.weight_block_size = [128, 128]
+
+        # gfx942/gfx950 native FP8 is e4m3fnuz, not e4m3fn.
+        if _is_fp8_fnuz:
+            w13_weight, w13_weight_scale, _ = normalize_e4m3fn_to_e4m3fnuz(
+                weight=layer.w13_weight,
+                weight_scale=layer.w13_weight_scale_inv,
+                input_scale=None,
+            )
+            w2_weight, w2_weight_scale, _ = normalize_e4m3fn_to_e4m3fnuz(
+                weight=layer.w2_weight,
+                weight_scale=layer.w2_weight_scale_inv,
+                input_scale=None,
+            )
+            layer.w13_weight = Parameter(w13_weight, requires_grad=False)
+            layer.w13_weight_scale_inv = Parameter(
+                w13_weight_scale, requires_grad=False
+            )
+            layer.w2_weight = Parameter(w2_weight, requires_grad=False)
+            layer.w2_weight_scale_inv = Parameter(w2_weight_scale, requires_grad=False)
+            layer.w13_input_scale = None
+            layer.w2_input_scale = None
+
+        # Only aiter-shuffle when the MoE runner is aiter; the triton runner
+        # consumes un-shuffled weights (shuffling the wrong runner corrupts output).
+        runner_is_aiter = (
+            getattr(self, "runner", None) is not None
+            and self.runner.runner_backend.is_aiter()
+        )
+        if _use_aiter and runner_is_aiter:
+            layer.w13_weight.data = shuffle_weight(
+                layer.w13_weight.contiguous(), (16, 16)
+            )
+            layer.w2_weight.data = shuffle_weight(
+                layer.w2_weight.contiguous(), (16, 16)
+            )
+
+    def process_weights_after_loading_block_quant(self, layer: Module) -> None:
+        if _use_aiter and self.is_fp4_expert:
+            if self._megamoe_fp4_experts_enabled():
+                if self.dequant_fp4_to_fp8:
+                    raise ValueError(
+                        "SGLANG_DSV4_FP4_DEQUANT and aiter MegaMoEv2 both claim "
+                        "the FP4 routed experts: MegaMoE builds from the packed "
+                        "FP4 layout, so dequantizing to block-FP8 first would "
+                        "leave it nothing to build from. Unset "
+                        "SGLANG_DSV4_FP4_DEQUANT, or pick another "
+                        "--moe-a2a-backend."
+                    )
+                self._build_megamoe_fp4_experts(layer)
+            elif not self.dequant_fp4_to_fp8:
+                self._process_aiter_native_fp4_experts(layer)
+            else:
+                self._process_aiter_fp4_dequant_to_fp8(layer)
             return
 
         if self.convert_mxfp8_to_block:
