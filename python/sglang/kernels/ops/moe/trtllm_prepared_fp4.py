@@ -33,31 +33,34 @@ def prepare_expert_tile_metadata(
     COUNT,
     TILE: tl.constexpr,
     ROUTES: tl.constexpr,
+    BLOCK: tl.constexpr,
     TOP_K: tl.constexpr,
     PACKED: tl.constexpr,
 ):
-    r = tl.arange(0, ROUTES)
-    raw = tl.load(IDS + r)
+    r = tl.arange(0, BLOCK)
+    valid = r < ROUTES
+    raw = tl.load(IDS + r, mask=valid, other=0)
     if PACKED:
         ids = raw >> 16
         weights = (raw & 65535).to(tl.uint16).to(tl.bfloat16, bitcast=True)
     else:
         ids = raw
-        weights = tl.load(W + r)
-    keys = tl.sort(ids * ROUTES + r, descending=False)
-    expert = keys // ROUTES
-    original = keys % ROUTES
+        weights = tl.load(W + r, mask=valid, other=0.0)
+    ids = tl.where(valid, ids, 1 << 20)
+    keys = tl.sort(ids * BLOCK + r, descending=False)
+    expert = keys // BLOCK
+    original = keys % BLOCK
     prev = tl.gather(expert, tl.maximum(r - 1, 0), 0)
-    nxt = tl.gather(expert, tl.minimum(r + 1, ROUTES - 1), 0)
-    first = (r == 0) | (expert != prev)
-    last = (r == ROUTES - 1) | (expert != nxt)
+    nxt = tl.gather(expert, tl.minimum(r + 1, BLOCK - 1), 0)
+    first = valid & ((r == 0) | (expert != prev))
+    last = valid & ((r == ROUTES - 1) | (expert != nxt))
     rank = tl.cumsum(first.to(tl.int32), 0) - 1
     start = tl.associative_scan(tl.where(first, r, 0), 0, _max_scan)
     within = r - start
     position = rank * TILE + within
-    tl.store(MAP + original, position)
-    tl.store(PERM + position, original // TOP_K)
-    tl.store(EW + r, weights)
+    tl.store(MAP + original, position, valid)
+    tl.store(PERM + position, original // TOP_K, valid)
+    tl.store(EW + r, weights, valid)
     tl.store(CTA + rank, expert, first)
     tl.store(LIMIT + rank, rank * TILE + within + 1, last)
     unique = tl.sum(first.to(tl.int32), 0)
@@ -185,6 +188,7 @@ def _run_prepared(
             *[metadata[i] for i in (0, 1, 2, 3, 6, 7, 8)],
             TILE=tile,
             ROUTES=num_tokens * top_k,
+            BLOCK=triton.next_power_of_2(num_tokens * top_k),
             TOP_K=top_k,
             PACKED=routing_input_mode == c.RoutingInputMode.PackedPrecomputed,
             num_warps=4,
@@ -201,22 +205,29 @@ def _run_prepared(
     return tuple(c._torch_view_of_ffi_tensor(tensor) for tensor in result)
 
 
-def try_prepared_k3_mxfp4(cache_owner, prepared_metadata=None, **kwargs):
-    """Return native output/deferred tensors on the covered M1/M8 MXFP4 path, or None."""
-    x = kwargs["hidden_states"]
-    if not (
+def _k3_prepared_covered(x, kwargs, width):
+    """K3 M<=8 expert shape shared by the MXFP4 and NVFP4 prepared paths."""
+    return (
         x.is_cuda
         and x.ndim == 2
-        and x.shape[0] in (1, 8)
-        and x.shape[1] == 3584
-        and x.dtype == torch.float8_e4m3fn
-        and kwargs["topk_ids"].shape == (x.shape[0], 16)
+        and 1 <= x.shape[0] <= 8
+        and x.shape[1] == width
         and kwargs["top_k"] == 16
         and kwargs["num_experts"] == kwargs["local_num_experts"] == 896
         and kwargs["local_expert_offset"] == 0
         and kwargs["intermediate_size"] == 384
-        and (not kwargs["do_finalize"] or x.shape[0] == 8)
+        and (not kwargs["do_finalize"] or x.shape[0] > 1)
         and prepared_routing_sm_supported()
+    )
+
+
+def try_prepared_k3_mxfp4(cache_owner, prepared_metadata=None, **kwargs):
+    """Return native output/deferred tensors on the covered M<=8 MXFP4 path, or None."""
+    x = kwargs["hidden_states"]
+    if not (
+        _k3_prepared_covered(x, kwargs, 3584)
+        and x.dtype == torch.float8_e4m3fn
+        and kwargs["topk_ids"].shape == (x.shape[0], 16)
     ):
         return None
     c = _flashinfer_core()
@@ -235,4 +246,44 @@ def try_prepared_k3_mxfp4(cache_owner, prepared_metadata=None, **kwargs):
         expert_weights=torch.empty(
             (x.shape[0], 16), device=x.device, dtype=torch.bfloat16
         ),
+    )
+
+
+def try_prepared_k3_nvfp4(cache_owner, prepared_metadata=None, **kwargs):
+    """Return native output/deferred tensors on the covered M<=8 NVFP4 path, or None."""
+    x = kwargs["hidden_states"]
+    routing = kwargs["topk_ids"]
+    if not isinstance(routing, tuple) or len(routing) != 2:
+        return None
+    ids, weights = routing
+    scales = kwargs["hidden_states_scale"]
+    if not (
+        _k3_prepared_covered(x, kwargs, 1792)
+        and x.dtype == torch.uint8
+        and ids.dtype == torch.int32
+        and weights.dtype == torch.float32
+        and scales.shape == (x.shape[0], 224)
+        and scales.dtype == torch.float8_e4m3fn
+        and kwargs.get("per_token_scale") is None
+    ):
+        return None
+    c = _flashinfer_core()
+    if c is None:
+        return None
+    # MoERunner validates a BF16 output; this placeholder is never consumed.
+    if kwargs.get("output") is None:
+        kwargs["output"] = torch.empty(
+            (x.shape[0], 3584), device=x.device, dtype=torch.bfloat16
+        )
+    return _run_prepared(
+        c,
+        cache_owner,
+        prepared_metadata,
+        kwargs,
+        hidden_size=3584,
+        dtype_act=c.DtypeTrtllmGen.E2m1,
+        dtype_weights=c.DtypeTrtllmGen.E2m1,
+        routing_input_mode=c.RoutingInputMode.UnpackedPrecomputed,
+        topk_ids=ids,
+        expert_weights=weights,
     )

@@ -65,8 +65,8 @@ def _gemm_ag_op(
     c: Optional[torch.Tensor],
     out: torch.Tensor,
 ) -> None:
-    # Rubin BS1: 112 producer blocks beat the GB300-tuned 448-block grid.
-    split_n = 8 if x.shape[0] == 1 and get_device_sm() == 107 else 2
+    # Rubin M<=8: 112 producer blocks beat the default 448-block grid.
+    split_n = 8 if x.shape[0] <= 8 and get_device_sm() == 107 else 2
     _jit_module(split_n).run(_COMM_MAP[world_size], x, weight, b, c, out)
 
 

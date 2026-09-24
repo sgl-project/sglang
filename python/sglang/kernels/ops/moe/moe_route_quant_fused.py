@@ -17,6 +17,8 @@ serving through sglang.srt.layers.moe.route_quant_handoff.
 
 from __future__ import annotations
 
+import logging
+import os
 from typing import TYPE_CHECKING, Tuple
 
 import torch
@@ -28,6 +30,7 @@ from sglang.kernels.jit.utils import (
     make_cpp_args,
 )
 from sglang.kernels.ops.moe import moe_route_radix
+from sglang.srt.utils.common import get_device_sm
 
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
@@ -63,15 +66,30 @@ def _jit_metadata_module() -> Module:
         "moe_route_quant_metadata",
         *args,
         cuda_files=["moe/route_quant_metadata.cuh"],
-        cuda_wrappers=[("run", f"RouteQuantMetadataKernel<{args}>::run")],
+        cuda_wrappers=[
+            ("run", f"RouteQuantMetadataKernel<{args}, Mxfp8RowQuant>::run")
+        ],
         extra_cuda_cflags=["-O3"],
     )
 
 
 @cache_once
-def metadata_available() -> bool:
-    import logging
+def _jit_nvfp4_module() -> Module:
+    args = make_cpp_args(is_arch_support_pdl())
+    return load_jit(
+        "moe_route_quant_nvfp4",
+        *args,
+        cuda_files=["moe/route_quant_metadata.cuh"],
+        cuda_wrappers=[
+            ("run", f"RouteQuantMetadataKernel<{args}, Nvfp4RowQuant>::run")
+        ],
+        extra_cuda_cflags=["-O3", "-DENABLE_BF16", "-DENABLE_FP4"],
+        extra_dependencies=["flashinfer", "flashinfer_nv_internal"],
+    )
 
+
+@cache_once
+def metadata_available() -> bool:
     try:
         _jit_metadata_module()
         return True
@@ -82,7 +100,7 @@ def metadata_available() -> bool:
         return False
 
 
-def allocate_metadata(device, num_tokens=1):
+def allocate_metadata(device, num_tokens=1, weight_dtype=torch.bfloat16):
     # The native body reads only live permuted slots, so skip the memset.
     def empty(n):
         return torch.empty(n, device=device, dtype=torch.int32)
@@ -92,7 +110,7 @@ def allocate_metadata(device, num_tokens=1):
         empty(1),
         empty(routes),
         empty(routes * 8 + 1),
-        torch.empty((num_tokens, 16), device=device, dtype=torch.bfloat16),
+        torch.empty((num_tokens, 16), device=device, dtype=weight_dtype),
         empty(1792),
         empty(896),
         empty(routes),
@@ -113,8 +131,6 @@ def _arrival_counter(device) -> torch.Tensor:
 
 @cache_once
 def available() -> bool:
-    import logging
-
     try:
         _jit_module()
         return True
@@ -173,7 +189,8 @@ def route_quant_fused(
     metadata_args = (
         []
         if metadata is None
-        else [metadata[i] for i in (0, 1, 2, 3, 6, 7, 8)] + [_arrival_counter(device)]
+        else [metadata[i] for i in (0, 1, 2, 3, 6, 7, 8)]
+        + [_arrival_counter(device), out_s]  # out_s: unused global-scale slot
     )
     module.run(
         scores,
@@ -191,3 +208,66 @@ def route_quant_fused(
         bool(apply_scale),
     )
     return out_w, out_i, out_packed, out_q, out_s
+
+
+def nvfp4_covered(scores, bias, topk, x, global_scale) -> bool:
+    """covered() plus the SM107 NVFP4 quantizer: M<=8, a one-element FP32
+    global scale, and FlashInfer's default FP4 fast math."""
+    return (
+        covered(scores, bias, topk, x)
+        and x.is_cuda
+        and get_device_sm() == 107
+        and x.shape[0] <= 8
+        and scores.device == bias.device == global_scale.device == x.device
+        and global_scale.numel() == 1
+        and global_scale.dtype == torch.float32
+        and global_scale.is_contiguous()
+        and not any(
+            os.getenv(name, "").strip().lower() not in {"", "0", "false", "off", "no"}
+            for name in (
+                "FLASHINFER_NVFP4_4OVER6",
+                "FLASHINFER_DISABLE_FP4_QUANT_FAST_MATH",
+                "TRTLLM_DISABLE_FP4_QUANT_FAST_MATH",
+            )
+        )
+    )
+
+
+def route_quant_nvfp4(
+    scores,
+    bias,
+    x,
+    global_scale,
+    topk,
+    renormalize,
+    routed_scaling_factor,
+    apply_scale,
+    metadata,
+):
+    """Returns ``(weights [M, topk] fp32, ids [M, topk] int32, x_q [M, 1792]
+    packed FP4, x_s [M, 224] linear fp8_e4m3)`` and fills ``metadata``
+    (allocate_metadata with FP32 weights). Caller must have checked
+    nvfp4_covered()."""
+    M = x.shape[0]
+    weights = torch.empty((M, topk), device=x.device, dtype=torch.float32)
+    ids = torch.empty((M, topk), device=x.device, dtype=torch.int32)
+    x_q = torch.empty((M, _HIDDEN // 2), device=x.device, dtype=torch.uint8)
+    x_s = torch.empty((M, _HIDDEN // 16), device=x.device, dtype=torch.uint8)
+    _jit_nvfp4_module().run(
+        scores,
+        bias,
+        weights,
+        ids,
+        torch.empty_like(ids),
+        x,
+        x_q,
+        x_s,
+        *[metadata[i] for i in (0, 1, 2, 3, 6, 7, 8)],
+        _arrival_counter(x.device),
+        global_scale.reshape(1),
+        topk,
+        float(routed_scaling_factor),
+        bool(renormalize),
+        bool(apply_scale),
+    )
+    return weights, ids, x_q, x_s.view(torch.float8_e4m3fn)

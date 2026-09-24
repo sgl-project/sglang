@@ -23,6 +23,7 @@ from sglang.kernels.ops.gemm.k3_shared_situ import (
     can_use_k3_shared_situ,
     k3_shared_situ,
 )
+from sglang.kernels.ops.moe import moe_route_quant_fused
 from sglang.srt.configs.kimi_k3 import KimiK3Config
 from sglang.srt.configs.kimi_linear import KimiLinearConfig
 from sglang.srt.distributed import (
@@ -1318,6 +1319,24 @@ class KimiK3MoE(nn.Module):
         if expert_output.data_ptr() != latent.data_ptr():
             latent.copy_(expert_output)
 
+    def _nvfp4_preparation_covered(self, router_logits, routed_input):
+        if not (
+            self._defer_moe_finalize
+            and self.alt_stream is not None
+            and self.fuse_ar_norm
+            and k3_ar_fusion.enabled()
+            and k3_ar_fusion.finalize_push_fits(routed_input.shape[0])
+            and self.gate.e_score_correction_bias is not None
+        ):
+            return False
+        return moe_route_quant_fused.nvfp4_covered(
+            router_logits,
+            self.gate.e_score_correction_bias,
+            self.experts.top_k,
+            routed_input,
+            self.experts.w13_input_scale_quant,
+        )
+
     def _forward_routed_deferred(self, hidden_states, router_logits, routed_input):
         """Routed experts with the in-op finalize skipped: returns the
         FlashInferTrtllmDeferredFinalizeOutput triple (permuted gemm2 output,
@@ -1325,8 +1344,15 @@ class KimiK3MoE(nn.Module):
         all-reduce."""
         if self._route_quant_fuse_eligible:
             route_quant_handoff.stage(routed_input)
+        fuse_nvfp4 = self._nvfp4_preparation_covered(router_logits, routed_input)
+        if fuse_nvfp4:
+            route_quant_handoff.stage(routed_input, self.experts.w13_input_scale_quant)
         try:
             topk_output = self.topk(hidden_states, router_logits)
+            if fuse_nvfp4 and not route_quant_handoff.ready(
+                routed_input, self.experts.w13_input_scale_quant
+            ):
+                routed_input = routed_input.to(hidden_states.dtype).contiguous()
             return self.experts.forward_deferred_finalize(routed_input, topk_output)
         finally:
             route_quant_handoff.clear()
@@ -1432,7 +1458,9 @@ class KimiK3MoE(nn.Module):
             )
         if num_tokens > 1 and _is_hip and not _aiter_k3_opt:
             router_logits = router_logits.contiguous()
-        if self._moe_front_needs_dense_bf16:
+        if self._moe_front_needs_dense_bf16 and not self._nvfp4_preparation_covered(
+            router_logits, routed_input
+        ):
             # off an fp32 front the cast allocates the dense buffer, so the
             # contiguous() behind it is free; off a bf16 front it is the copy
             routed_input = routed_input.to(hidden_states.dtype).contiguous()
@@ -1465,7 +1493,7 @@ class KimiK3MoE(nn.Module):
             # both ride one collective.
             joint_finalize = (
                 defer_finalize
-                and num_tokens == 1
+                and 0 < num_tokens <= 8
                 and hidden_size == 2 * k3_ar_fusion.NORM_DIM
                 and self.moe_hidden_size == k3_ar_fusion.NORM_DIM
                 and k3_ar_fusion.finalize_push_fits(3 * num_tokens)
