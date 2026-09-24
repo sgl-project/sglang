@@ -37,8 +37,8 @@ def _jit_hash_topk_module():
 
 
 @cache_once
-def _jit_mega_moe_pre_dispatch_module(quant_group_size: int):
-    args = make_cpp_args(quant_group_size, is_arch_support_pdl())
+def _jit_mega_moe_pre_dispatch_module(quant_group_size: int, write_shared_sf: bool):
+    args = make_cpp_args(quant_group_size, is_arch_support_pdl(), write_shared_sf)
     return load_jit(
         make_name("mega_moe_pre_dispatch"),
         *args,
@@ -160,8 +160,18 @@ def mega_moe_pre_dispatch(
     buf_topk_idx: torch.Tensor,
     buf_topk_weights: torch.Tensor,
     quant_group_size: int = 32,
+    *,
+    shared_x_sf: Optional[torch.Tensor] = None,
+    shared_block_m: int = 0,
 ) -> None:
-    module = _jit_mega_moe_pre_dispatch_module(quant_group_size)
+    """Quantize routing inputs and optionally emit DeepGEMM's shared L1 scales.
+
+    ``shared_x_sf`` is a column-major int32 buffer for group-32 scales. Its
+    paged row layout requires the same ``shared_block_m`` as the consuming MoE.
+    """
+    module = _jit_mega_moe_pre_dispatch_module(
+        quant_group_size, shared_x_sf is not None
+    )
     module.run(
         x,
         topk_idx,
@@ -170,6 +180,8 @@ def mega_moe_pre_dispatch(
         buf_x_sf,
         buf_topk_idx,
         buf_topk_weights,
+        shared_x_sf,
+        shared_block_m,
     )
 
 
