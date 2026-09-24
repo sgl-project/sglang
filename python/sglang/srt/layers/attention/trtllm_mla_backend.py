@@ -1244,8 +1244,10 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
 
         That pass discards attention/logits. Under DCP the synthetic
         full-head metadata can overflow the trtllm-gen workspace (and on
-        multi-node GB300 has also produced NVLink errors). Real requests
-        and CUDA-graph capture must not take this path.
+        multi-node GB300 has also produced NVLink errors), and running the
+        kernel starts its own FlashInfer tuning, whose synthetic inputs can
+        OOM on some ranks only and hang the cross-rank tactic reduction.
+        Real requests and CUDA-graph capture must not take this path.
         """
         output = torch.zeros(
             (q.shape[0], layer.tp_q_head_num * layer.v_head_dim),
@@ -1476,9 +1478,8 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         is_neox: Optional[bool] = False,
         llama_4_scaling: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        # Under speculative decoding the autotune dummy forward is
-        # TARGET_VERIFY-shaped; skip its DCP verify kernel for the same reason
-        # as forward_decode.
+        # A speculative runner's autotune dummy forward is TARGET_VERIFY-shaped,
+        # so it never reaches forward_decode's guard.
         if (
             forward_batch.forward_mode.is_target_verify()
             and get_parallel().dcp_enabled
