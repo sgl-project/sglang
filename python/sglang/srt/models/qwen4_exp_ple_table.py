@@ -65,6 +65,7 @@ _SHARED_TABLES: list[torch.Tensor] = []
 _CUDA_DEV_ATTR_PAGEABLE_MEMORY_ACCESS_USES_HOST_PAGE_TABLES = 100
 _MADV_RANDOM = 1
 _MADV_DONTNEED = 4
+_MADV_HUGEPAGE = 14
 _PAGE_SHIFT = 12
 # One MADV_DONTNEED call takes mmap_lock for its whole range; over the full
 # 47.7 GiB table that is ~3.5 s during which every fault in the process --
@@ -320,6 +321,8 @@ def allocate_shared_ple_host_table(
         os.close(memfd)
 
     table = torch.frombuffer(mapping, dtype=torch.uint8)
+    # Registration faults the pages in; shmem THP "advise" backs only advised mappings.
+    _madvise(addr=table.data_ptr(), length=nbytes, advice=_MADV_HUGEPAGE)
     cudart = torch.cuda.cudart()
     rc = int(cudart.cudaHostRegister(table.data_ptr(), nbytes, 0))
     if rc != 0:

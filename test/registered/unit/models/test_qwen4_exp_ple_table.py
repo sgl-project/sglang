@@ -6,7 +6,8 @@ survive a re-open, reuses the file across calls, replaces one of the wrong size,
 and the prefetcher computes the right page set and honours its size floor. The
 resident-set trimmer measures only its own mapping, drops its pages once over
 budget without losing what was written through them, and is off when the budget
-is zero or the mapping is pinned.
+is zero or the mapping is pinned. The shared table's whole mapping is advised for
+huge pages before CUDA registration faults it in.
 
 GPU part (skipped unless the device reads pageable host memory through the host
 page tables, i.e. unified-memory parts such as GB10): the production Triton
@@ -14,8 +15,10 @@ gather kernel reading from the file-backed table matches a torch gather.
 """
 
 import os
+import re
 import tempfile
 import unittest
+from types import SimpleNamespace
 from unittest import mock
 
 import torch
@@ -25,6 +28,7 @@ from sglang.srt.models.qwen4_exp_ple_table import (
     PleFileRssTrimmer,
     _mapping_rss_bytes,
     allocate_ple_host_table,
+    allocate_shared_ple_host_table,
     default_ple_table_dir,
     device_uses_host_page_tables,
     make_ple_file_prefetcher,
@@ -296,6 +300,42 @@ class TestPleFileRssTrimmer(CustomTestCase):
 
 
 @unittest.skipUnless(
+    os.path.exists("/proc/self/smaps")
+    and os.path.isdir("/sys/kernel/mm/transparent_hugepage"),
+    "needs Linux VMA flags and transparent huge page support",
+)
+class TestSharedPleTableHugePageAdvice(CustomTestCase):
+    def test_mapping_is_advised_before_cuda_registration(self):
+        """cudaHostRegister faults the table in, so its whole mapping must
+        already be advised for huge pages."""
+        at_registration = []
+
+        def register(ptr, nbytes, flags):
+            at_registration.append((ptr, nbytes, _smaps_vma(ptr)))
+            return 0
+
+        single_rank_group = SimpleNamespace(
+            rank_in_group=0,
+            broadcast_object=lambda obj, src=0: obj,
+            barrier=lambda: None,
+        )
+        with mock.patch(
+            "torch.cuda.cudart",
+            return_value=SimpleNamespace(cudaHostRegister=register),
+        ):
+            # 256 KiB spans many pages, so advising only a prefix splits the VMA.
+            allocate_shared_ple_host_table(
+                shape=(64, 2048), dtype=torch.bfloat16, group=single_rank_group
+            )
+        ((ptr, nbytes, vma),) = at_registration
+        self.assertIsNotNone(vma, "the registered address is not mapped")
+        start, end, flags = vma
+        self.assertLessEqual(start, ptr)
+        self.assertGreaterEqual(end, ptr + nbytes)
+        self.assertIn("hg", flags)
+
+
+@unittest.skipUnless(
     torch.cuda.is_available() and device_uses_host_page_tables(0) is True,
     "needs a device that reads pageable host memory through the host page tables",
 )
@@ -326,6 +366,20 @@ class TestPleFileTableGatherOnDevice(CustomTestCase):
             torch.cuda.synchronize()
             expected = table[ids.cpu()].to("cuda")
             self.assertTrue(torch.equal(out, expected))
+
+
+def _smaps_vma(addr):
+    # (start, end, VmFlags) of the /proc/self/smaps entry holding addr, or None.
+    vma = None
+    with open("/proc/self/smaps") as f:
+        for line in f:
+            header = re.match(r"^([0-9a-f]+)-([0-9a-f]+) ", line)
+            if header is not None:
+                start, end = int(header.group(1), 16), int(header.group(2), 16)
+                vma = (start, end) if start <= addr < end else None
+            elif vma is not None and line.startswith("VmFlags:"):
+                return (*vma, line.split()[1:])
+    return None
 
 
 if __name__ == "__main__":
