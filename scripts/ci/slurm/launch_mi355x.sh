@@ -1647,6 +1647,28 @@ EOF
         [[ -f "$WORKDIR/bench_exit" ]] && return 1
         ! compgen -G "$WORKDIR/raw_conc*.json" > /dev/null
     }
+    # squeue is not authoritative for "has this job left the queue". It asks the
+    # spur controller for the whole queue, and a controller hiccup -- the same
+    # Raft leader election spur_submit_leg already retries around -- answers with
+    # an empty list, the error swallowed by 2>/dev/null. A single miss is enough
+    # to end the leg.
+    #
+    # That is what happened to job 4177 on 2026-09-24. The monitor decided the
+    # job was gone 21 minutes into a healthy sweep, waited 90s for a drive_exit
+    # that could not arrive because the job was still benchmarking, reported
+    # "incomplete sweep: 3/7", and then scancelled the run it had just given up
+    # on -- the teardown below found the job in squeue, because it had never
+    # left. scontrol, which answers per job, still had it RUNNING throughout.
+    # Ask scontrol before believing the queue listing.
+    spur_job_alive() {
+        squeue -h -o "%i" 2>/dev/null | grep -qx "$1" && return 0
+        local _info
+        _info=$(scontrol show job "$1" 2>/dev/null) || return 1
+        [[ "$_info" == *"JobState=RUNNING"* \
+           || "$_info" == *"JobState=PENDING"* \
+           || "$_info" == *"JobState=CONFIGURING"* \
+           || "$_info" == *"JobState=COMPLETING"* ]]
+    }
     SPUR_RESUBMITS_LEFT=${SPUR_RESUBMITS_LEFT:-20}
 
     spur_submit_leg
@@ -1662,7 +1684,7 @@ EOF
         # ever running it (node failure, scheduler kill, time limit).
         while :; do
             [[ -f "$WORKDIR/drive_exit" ]] && break
-            if ! squeue -h -o "%i" 2>/dev/null | grep -qx "$SPUR_LEG_JOB_ID"; then
+            if ! spur_job_alive "$SPUR_LEG_JOB_ID"; then
                 # Cancelled before it ever ran: wait for the nodes and submit
                 # again rather than reporting a result we never measured.
                 if spur_never_started "$SPUR_LEG_JOB_ID" && (( SPUR_RESUBMITS_LEFT > 0 )); then
@@ -1743,7 +1765,7 @@ EOF
         # 1774/1775 held all four nodes long after their legs had been recorded
         # rc=1. Unconditional, because reaching here means this leg is done with
         # its nodes either way.
-        if squeue -h -o "%i" 2>/dev/null | grep -qx "$SPUR_LEG_JOB_ID"; then
+        if spur_job_alive "$SPUR_LEG_JOB_ID"; then
             echo "[launch] releasing spur job $SPUR_LEG_JOB_ID"
             scancel "$SPUR_LEG_JOB_ID" 2>/dev/null || true
         fi
