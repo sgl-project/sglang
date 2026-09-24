@@ -235,6 +235,15 @@ def _update_gather_batch(
         batch.global_num_tokens_for_logprob = (
             mlp_sync_info.global_num_tokens_for_logprob
         )
+    if envs.SGLANG_ENABLE_DP_SPEC_PREFILL_COORDINATION.get():
+        # Fresh counts have not yet been adjusted by the coordination plan.
+        batch.dp_spec_prefill_coordination_applied = False
+        info = mlp_sync_info.tp0_info_cpu
+        batch.dp_spec_prefill_coordination_metadata = (
+            mlp_sync_info.global_num_tokens,
+            mlp_sync_info.global_num_tokens_for_logprob,
+            info[:, 3],
+        )
     if not skip_global_metadata:
         batch.is_extend_in_batch = mlp_sync_info.is_extend_in_batch
         batch.tbo_split_seq_index = mlp_sync_info.tbo_split_seq_index
@@ -571,6 +580,9 @@ class SchedulerDPAttnAdapter:
         extend view when a peer rank runs extend this step, so the step stays
         mode-homogeneous and every rank replays the extend graphs instead of
         all falling to eager."""
+        if envs.SGLANG_ENABLE_DP_SPEC_PREFILL_COORDINATION.get():
+            # Keep verification rows in their native mode on heterogeneous steps.
+            return batch
         if batch is None or not batch.forward_mode.is_decode():
             return batch
         # Global triggers from the gather. This rank's own eligibility (spec/
