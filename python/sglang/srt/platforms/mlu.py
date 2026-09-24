@@ -6,8 +6,12 @@ from typing import Optional
 
 import torch
 
-from sglang.srt.platforms.device_mixin import DeviceCapability, DeviceMixin, PlatformEnum
-from sglang.srt.platforms.interface import SRTPlatform
+from sglang.srt.platforms.device_mixin import (
+    DeviceCapability,
+    DeviceMixin,
+    PlatformEnum,
+)
+from sglang.srt.platforms.interface import KVPoolKind, SRTPlatform
 
 
 class MluDeviceMixin(DeviceMixin):
@@ -78,3 +82,17 @@ class MluSRTPlatform(MluDeviceMixin, SRTPlatform):
 
     def get_position_dtype(self) -> torch.dtype:
         return torch.int32
+
+    def get_paged_allocator_cls(self) -> type:
+        from sglang.srt.hardware_backend.mlu.allocator_mlu import (
+            MLUPagedTokenToKVPoolAllocator,
+        )
+
+        return MLUPagedTokenToKVPoolAllocator
+
+    def get_kv_pool_cls(self, *, kind: KVPoolKind) -> Optional[type]:
+        if kind != "mha":
+            return None
+        from sglang.srt.hardware_backend.mlu.memory_pool_mlu import MLUMHATokenToKVPool
+
+        return MLUMHATokenToKVPool

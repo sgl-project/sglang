@@ -1383,6 +1383,8 @@ class KVCacheConfigurator:
             get_exec().kernel.attention_backend == "ascend" and not self.mambaish_config
         ):
             unsupported_pool_family = "NPU/Ascend KV pool"
+        elif get_exec().kernel.attention_backend == "mlu" and not self.mambaish_config:
+            unsupported_pool_family = "MLU KV pool"
         elif self.use_mla_backend and self.is_hybrid_swa:
             unsupported_pool_family = "hybrid DSA/MLA-SWA KV pool"
         elif self.use_mla_backend and is_dsa_model:
@@ -1683,6 +1685,16 @@ class KVCacheConfigurator:
                 token_to_kv_pool = self._build_ascend_mha_kv_pool(
                     max_total_num_tokens=sizes.max_total_num_tokens,
                 )
+        elif get_exec().kernel.attention_backend == "mlu" and not self.mambaish_config:
+            if self.use_mla_backend:
+                raise RuntimeError(
+                    "MLU backend currently supports MHA/GQA models only; "
+                    "MLA models are not supported."
+                )
+            token_to_kv_pool = self._build_mha_kv_pool(
+                max_total_num_tokens=sizes.max_total_num_tokens,
+                mha_pool_class=mha_pool_class,
+            )
         elif self.use_mla_backend and self.is_hybrid_swa:
             token_to_kv_pool = self._build_hybrid_mla_swa_kv_pool(
                 full_max_total_num_tokens=sizes.full_max_total_num_tokens,
