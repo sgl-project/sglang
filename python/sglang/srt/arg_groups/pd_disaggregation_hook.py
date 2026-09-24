@@ -22,6 +22,15 @@ logger = logging.getLogger(__name__)
 def handle_pd_disaggregation(server_args: ServerArgs) -> None:
     """Validate and normalize PD-disaggregation server args."""
     cfg = resolving_view(server_args)
+    if envs.SGLANG_NIXL_HOST_STAGING_MB.get() and (
+        cfg.disaggregation_transfer_backend != "nixl"
+        or cfg.disaggregation_mode not in ("prefill", "decode")
+        or cfg.enable_hisparse
+        or envs.SGLANG_DISAGG_STAGING_BUFFER.get()
+    ):
+        raise ValueError(
+            "NIXL host staging requires PD NIXL without HiSparse or GPU staging"
+        )
 
     # "mooncake_tcp" is mooncake with the TCP transport forced: set MC_FORCE_TCP
     # so mooncake installs TcpTransport instead of RDMA, rewrite the backend to
