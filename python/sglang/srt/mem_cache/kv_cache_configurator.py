@@ -66,7 +66,6 @@ from sglang.srt.mem_cache.memory_pool import (
     HybridReqToTokenPool,
     KVCache,
     MHATokenToKVPool,
-    MHATokenToKVPoolFP4,
     MHATokenToKVPoolMXFP8,
     MiniMaxSparseKVPool,
     MLATokenToKVPool,
@@ -74,6 +73,7 @@ from sglang.srt.mem_cache.memory_pool import (
     NoOpMHATokenToKVPool,
     PageMajorMHATokenToKVPool,
     ReqToTokenPool,
+    get_minimax_sparse_index_dtype,
 )
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.platforms import current_platform
@@ -1822,14 +1822,12 @@ class KVCacheConfigurator:
             size=max_total_num_tokens,
             page_size=self.pool_page_size,
             dtype=self.kv_cache_dtype,
-            # fp8 attn-GEMM mode opts the lightning-indexer cache into
-            # fp8 too (fp8 indexer GEMMs); fp8 KV without the mode
-            # (e5m2 or non-trtllm_mha backend) keeps the indexer bf16
-            # with the widening-dequant contract.
-            index_dtype=(
-                self.kv_cache_dtype
-                if m3_fp8_attn_gemm_enabled(resolving_view(self.server_args))
-                else self.model_dtype
+            index_dtype=get_minimax_sparse_index_dtype(
+                fp8_attn_gemm=m3_fp8_attn_gemm_enabled(
+                    resolving_view(self.server_args)
+                ),
+                kv_cache_dtype=self.kv_cache_dtype,
+                model_dtype=self.model_dtype,
             ),
             head_num=self.model_config.get_num_kv_heads(
                 get_parallel().attn_tp_size, get_parallel().attn_dcp_size
@@ -1946,26 +1944,6 @@ class KVCacheConfigurator:
             quant_method=quant_method,
             post_capture_active=self.post_capture_kv_active and quant_method is None,
             **extra_args,
-        )
-        return token_to_kv_pool
-
-    def _build_mha_fp4_kv_pool(self, *, max_total_num_tokens: int) -> KVCache:
-        token_to_kv_pool = MHATokenToKVPoolFP4(
-            max_total_num_tokens,
-            page_size=self.pool_page_size,
-            dtype=self.kv_cache_dtype,
-            head_num=self.model_config.get_num_kv_heads(
-                get_parallel().attn_tp_size, get_parallel().attn_dcp_size
-            ),
-            head_dim=self.model_config.head_dim,
-            v_head_dim=self.model_config.v_head_dim,
-            layer_num=self.layer_info.num_effective_layers,
-            device=self.device,
-            enable_memory_saver=get_exec().features.enable_memory_saver,
-            start_layer=self.layer_info.start_layer,
-            end_layer=self.layer_info.end_layer,
-            enable_alt_stream=not get_disagg().enable_pdmux,
-            enable_kv_cache_copy=(get_spec().speculative_algorithm is not None),
         )
         return token_to_kv_pool
 

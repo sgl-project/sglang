@@ -1698,6 +1698,9 @@ class Envs:
     # 2 is the accuracy-safe default: higher values reuse staler selections
     # in the skip layers.
     SGLANG_MINIMAX_M3_INDEX_TOPK_FREQ = EnvInt(2)
+    # gfx95: lightning-indexer K cache in fp8_e4m3fn (bf16 q x fp8 k in the scorers);
+    # main attention K/V keep kv_cache_dtype.
+    SGLANG_OPT_MINIMAX_M3_FP8_INDEX_CACHE = EnvBool(True)
     # Run the sparse prefill main attention through AITER's Gluon paged attention
     # instead of the Triton kernel. Unsupported cases fall back to Triton.
     SGLANG_OPT_USE_MINIMAX_GLUON_PREFILL = EnvBool(True)
