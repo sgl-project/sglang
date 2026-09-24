@@ -1,5 +1,6 @@
 """Native panics reach Python crash handlers without permitting poisoned reuse."""
 
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -117,3 +118,7 @@ def test_guard_does_not_match_unrelated_exception_by_name():
     with pytest.raises(unrelated_panic) as caught:
         guard.fail()
     assert caught.value is original
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))
