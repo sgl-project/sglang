@@ -175,8 +175,14 @@ def _make_model_runner(
     spec.is_none.return_value = True
     mr.spec_algorithm = spec
 
+    # Single stage: the runner's local hybrid-SWA view is the whole model's split.
     mr.layer_info = SimpleNamespace(
-        start_layer=0, end_layer=num_layers, num_effective_layers=num_layers
+        start_layer=0,
+        end_layer=num_layers,
+        num_effective_layers=num_layers,
+        swa_attention_layer_ids=list(mc.swa_attention_layer_ids),
+        full_attention_layer_ids=list(mc.full_attention_layer_ids),
+        is_hybrid_swa_mtp_draft=False,
     )
     mr.attn_dp_size = 1
     mr.pp_size = 1
