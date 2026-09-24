@@ -308,7 +308,7 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
     _release_overallocated_kv_indices(
         req, owned_kv_len, req.kv.kv_allocated_len, tree_cache
     )
-    tree_cache.after_release(req, inserted=is_insert)
+    tree_cache.on_release(req, inserted=is_insert)
 
     # If the prefix cache doesn't manage mamba states, we must free them here.
     if isinstance(tree_cache.req_to_token_pool, HybridReqToTokenPool) and (

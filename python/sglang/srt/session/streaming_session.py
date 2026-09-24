@@ -355,8 +355,8 @@ class StreamingSession(BasePrefixCache):
     def claim_kv_row(self, req: Req) -> bool:
         return self.try_cache_finished_req(req)
 
-    def after_release(self, req: Req, *, inserted: bool) -> None:
-        self.inner.after_release(req, inserted=inserted)
+    def on_release(self, req: Req, *, inserted: bool) -> None:
+        self.inner.on_release(req, inserted=inserted)
 
     def cache_finished_req(self, req: Req, **kwargs):
         self.inner.cache_finished_req(req, **kwargs)
