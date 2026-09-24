@@ -93,7 +93,7 @@ class TestNPUQwen3_6_35BA3B_1P_AIME2026(TestNpuAccuracyTestCaseBase):
     eval_batch_size = 64
     generation_config = {
         "max_tokens": 65536,
-        "temperature": 0.2,
+        "temperature": 0,
         "repetition_penalty": 1.08,
     }
 
