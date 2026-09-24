@@ -40,9 +40,14 @@ class BasicDecodeCorrectnessMixin:
         self.assertIn("paris", out.lower())
 
     def test_basic_math(self):
+        # A reasoning model (e.g. Qwen3) narrates the arithmetic and blows past
+        # a short token cap before emitting the answer. A one-shot exemplar plus
+        # stop="\n" conditions greedy to reply with the bare number immediately.
         out = self._decode_generate(
+            "Q: What is 12 multiplied by 12? Reply with just the number.\nA: 144\n"
             "Q: What is 17 multiplied by 23? Reply with just the number.\nA:",
             self.sanity_max_new_tokens_short,
+            stop=["\n"],
         )
         self.assertIn("391", out)
 
