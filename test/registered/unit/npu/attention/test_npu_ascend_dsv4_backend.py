@@ -26,6 +26,7 @@ for mod in (
     "sglang.srt.speculative.decoupled_spec_io",
     "sglang.srt.speculative.spec_info",
     "sglang.srt.speculative.eagle_info",
+    "sglang.srt.speculative.base_spec_worker",
 ):
     sys.modules.setdefault(mod, MagicMock())
 
