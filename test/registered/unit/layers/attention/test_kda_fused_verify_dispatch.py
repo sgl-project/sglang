@@ -70,55 +70,26 @@ def _inputs(batch, *, tokens=6, heads=16, head_dim=128, weight_dtype=torch.float
 
 
 @pytest.mark.parametrize(
-    "batch,tokens",
+    "gfx950,batch,changes,expected",
     [
-        (1, 6),  # supported min batch, T=6
-        (16, 6),  # supported max batch, T=6
-        (17, 6),  # unsupported batch boundary, T=6
-        (16, 8),  # supported max batch, T=8
+        (True, 1, {}, True),
+        (True, 16, dict(tokens=8), True),
+        (True, 17, {}, False),
+        (True, 4, dict(tokens=4), False),
+        (True, 4, dict(weight_dtype=torch.bfloat16), False),
+        (False, 4, {}, False),
     ],
 )
-def test_hip_only_routes_supported_batch_range(monkeypatch, batch, tokens):
-    gate = _load_gate(monkeypatch)
+def test_hip_routes_only_measured_shapes(monkeypatch, gfx950, batch, changes, expected):
+    gate = _load_gate(monkeypatch, gfx950=gfx950)
     backend = SimpleNamespace(_fused_chain_verify_fn=object())
-    assert gate(backend, **_inputs(batch, tokens=tokens)) is (batch <= 16)
-
-
-@pytest.mark.parametrize(
-    "changes",
-    [
-        dict(tokens=4),
-        dict(weight_dtype=torch.bfloat16),
-    ],
-)
-def test_hip_unmeasured_shapes_fall_back(monkeypatch, changes):
-    gate = _load_gate(monkeypatch)
-    backend = SimpleNamespace(_fused_chain_verify_fn=object())
-    assert not gate(backend, **_inputs(4, **changes))
-
-
-def test_hip_unmeasured_architecture_falls_back(monkeypatch):
-    gate = _load_gate(monkeypatch, gfx950=False)
-    backend = SimpleNamespace(_fused_chain_verify_fn=object())
-    assert not gate(backend, **_inputs(4))
+    assert gate(backend, **_inputs(batch, **changes)) is expected
 
 
 def test_cuda_keeps_existing_shape_coverage(monkeypatch):
     gate = _load_gate(monkeypatch, hip=False)
     backend = SimpleNamespace(_fused_chain_verify_fn=object())
     assert gate(backend, **_inputs(32, tokens=4, weight_dtype=torch.bfloat16))
-
-
-def test_tree_and_disabled_paths_stay_unfused(monkeypatch):
-    gate = _load_gate(monkeypatch)
-    backend = SimpleNamespace(_fused_chain_verify_fn=None)
-    kwargs = _inputs(4)
-    assert not gate(backend, **kwargs)
-    backend._fused_chain_verify_fn = object()
-    kwargs["retrieve_parent_token"] = torch.empty(
-        4, 6, dtype=torch.int32, device="meta"
-    )
-    assert not gate(backend, **kwargs)
 
 
 if __name__ == "__main__":

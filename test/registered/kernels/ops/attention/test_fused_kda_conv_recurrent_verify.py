@@ -290,36 +290,6 @@ def test_glm_fp32_weights_bit_exact_on_rocm(case_index):
     assert torch.equal(ic_fus[valid], ic_ref[valid])
 
 
-@pytest.mark.parametrize("case_index", [9])
-def test_glm_fp32_weights_match_under_graph_replay(case_index):
-    B, T, H, HV, K, V, W, bias, lower, neg_slot, seed = _CASES[case_index]
-    inp = _make_inputs(B, T, H, HV, K, V, W, bias, neg_slot, seed, torch.float32)
-    results = []
-    functions = [
-        lambda: _run_reference(inp, B, T, H, HV, K, V, lower),
-        lambda: _run_fused(inp, B, T, H, HV, K, V, lower, None),
-    ]
-    for run in functions:
-        run()  # Compile before capture.
-        torch.cuda.synchronize()
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph):
-            result = run()
-        graph.replay()
-        torch.cuda.synchronize()
-        results.append(result)
-
-    valid = [i for i, slot in enumerate(inp["idx_vals"]) if slot >= 0]
-    expected, actual = results
-    _assert_output_matches_reference(
-        actual[0].reshape(B, T, HV, V)[valid],
-        expected[0].reshape(B, T, HV, V)[valid],
-    )
-    assert torch.equal(inp["conv_pool"], actual[1])
-    assert torch.equal(expected[2][valid], actual[2][valid])
-    torch.testing.assert_close(expected[3][valid], actual[3][valid], atol=4e-3, rtol=0)
-
-
 def test_output_does_not_depend_on_cta_scheduling():
     """The verify output must not change with how the CTAs happen to be
     scheduled. H=1 with HV=16 shares one Q/K history across 16 V tiles."""

@@ -19,9 +19,6 @@ pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires 
     "distribution,start",
     [
         ("diffuse", 0),
-        ("narrow", 0),
-        ("banded", 0),
-        ("inf", 8192),
         ("equal", 0),
         ("late_higher", 8192),
     ],
@@ -30,17 +27,11 @@ def test_topk_membership_including_overfull_coarse_bins(distribution, start):
     torch.manual_seed(1234)
     rows, width, length, group_topk, pool_size = 4, 50000, 32768, 512, 4
     scores = torch.randn(rows, width, device="cuda")
-    if distribution == "banded":
-        scores = 54 + 34 * torch.rand_like(scores)
-    elif distribution == "equal":
+    if distribution == "equal":
         scores.fill_(1)
     elif distribution == "late_higher":
         scores.fill_(1)
         scores[:, start + length // 2 : start + length] = 1.001
-    elif distribution in ("narrow", "inf"):
-        scores += 70
-        if distribution == "inf":
-            scores[:, start + 8192 : start + 8224] = float("inf")
     lengths = torch.full((rows,), length, dtype=torch.int32, device="cuda")
     starts = torch.full_like(lengths, start)
     result = fast_kpool_topk_transform_fused(

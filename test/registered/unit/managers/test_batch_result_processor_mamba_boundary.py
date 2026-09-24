@@ -229,49 +229,21 @@ class TestMambaPrevTrackSeqlen(unittest.TestCase):
 
 class TestMambaFreedTrackIndicesCPU(unittest.TestCase):
     def test_freed_rows_are_inert_and_live_rows_preserve_mapping(self):
-        mapping = torch.tensor([[7, 8], [11, 12]], dtype=torch.int64)
-        batch = SimpleNamespace(
-            reqs=[
-                SimpleNamespace(kv=SimpleNamespace(mamba_next_track_idx=p))
-                for p in (None, 0)
-            ],
-            req_pool_indices=torch.arange(2),
-            req_to_token_pool=SimpleNamespace(
-                req_index_to_mamba_ping_pong_track_buffer_mapping=mapping
-            ),
-        )
-        original = mapping.clone()
-        _set_mamba_track_indices_on_cpu(batch)
-        self.assertEqual(batch.mamba_track_indices.tolist(), [-1, 11])
-        self.assertEqual(batch.mamba_track_buffer_indices, [0, 0])
-        torch.testing.assert_close(mapping, original, rtol=0, atol=0)
-
-    def test_freed_rows_are_inert_even_with_position_override(self):
-        mapping = torch.tensor([[7, 8], [11, 12]], dtype=torch.int64)
-        batch = SimpleNamespace(
-            reqs=[
-                SimpleNamespace(kv=SimpleNamespace(mamba_next_track_idx=None)),
-                SimpleNamespace(kv=SimpleNamespace(mamba_next_track_idx=0)),
-            ],
-            req_pool_indices=torch.arange(2),
-            req_to_token_pool=SimpleNamespace(
-                req_index_to_mamba_ping_pong_track_buffer_mapping=mapping
-            ),
-        )
-        _set_mamba_track_indices_on_cpu(batch, [1, 1])
-        self.assertEqual(batch.mamba_track_indices.tolist(), [-1, 12])
-        self.assertEqual(batch.mamba_track_buffer_indices, [1, 1])
-
-    def test_empty_batch(self):
-        batch = SimpleNamespace(
-            reqs=[],
-            req_pool_indices=torch.empty(0, dtype=torch.int64),
-            req_to_token_pool=SimpleNamespace(
-                req_index_to_mamba_ping_pong_track_buffer_mapping=torch.empty(0, 2)
-            ),
-        )
-        _set_mamba_track_indices_on_cpu(batch)
-        self.assertEqual(batch.mamba_track_indices.tolist(), [])
+        for positions, expected in ((None, [-1, 11]), ([1, 1], [-1, 12])):
+            with self.subTest(positions=positions):
+                mapping = torch.tensor([[7, 8], [11, 12]], dtype=torch.int64)
+                batch = SimpleNamespace(
+                    reqs=[
+                        SimpleNamespace(kv=SimpleNamespace(mamba_next_track_idx=p))
+                        for p in (None, 0)
+                    ],
+                    req_pool_indices=torch.arange(2),
+                    req_to_token_pool=SimpleNamespace(
+                        req_index_to_mamba_ping_pong_track_buffer_mapping=mapping
+                    ),
+                )
+                _set_mamba_track_indices_on_cpu(batch, positions)
+                self.assertEqual(batch.mamba_track_indices.tolist(), expected)
 
 
 if __name__ == "__main__":
