@@ -10,7 +10,9 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
     _get_rank_local_dsa_indexer_layers,
     build_anchor_sidecar_stack,
 )
+from sglang.srt.mem_cache.index_key_cache import IndexKeyCache
 from sglang.srt.mem_cache.kv_cache_configurator import (
+    _should_elide_dsa_index_k,
     get_dsa_hicache_indexer_layers,
 )
 from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
@@ -41,6 +43,102 @@ class TestDSAOffloadSignatures(unittest.TestCase):
 
 
 class TestDSAProducerHostSidecar(unittest.TestCase):
+    def test_hicache_l2_device_index_k_elides_shared_layers(self):
+        config = SimpleNamespace(
+            architectures=["GlmMoeDsaForCausalLM"],
+            index_topk=2048,
+            index_topk_freq=4,
+            index_skip_topk_offset=3,
+        )
+        num_layers = 78
+        producer_layers = get_dsa_hicache_indexer_layers(config, 0, num_layers)
+        self.assertEqual(len(producer_layers), 21)
+        memory_config = SimpleNamespace(
+            enable_hierarchical_cache=True,
+            hicache_storage_backend=None,
+            enable_unified_cache_external_linker=False,
+            enable_hisparse=False,
+        )
+        parallel_config = SimpleNamespace(attn_dcp_size=1)
+        disagg_config = SimpleNamespace(disaggregation_mode="null")
+        with (
+            mock.patch(
+                "sglang.srt.mem_cache.kv_cache_configurator.get_memory",
+                return_value=memory_config,
+            ),
+            mock.patch(
+                "sglang.srt.mem_cache.kv_cache_configurator.get_parallel",
+                return_value=parallel_config,
+            ),
+            mock.patch(
+                "sglang.srt.mem_cache.kv_cache_configurator.get_disagg",
+                return_value=disagg_config,
+            ),
+        ):
+            self.assertTrue(_should_elide_dsa_index_k(is_draft_worker=False))
+            self.assertFalse(_should_elide_dsa_index_k(is_draft_worker=True))
+            pool = SimpleNamespace(
+                page_size=64,
+                custom_mem_pool=None,
+                index_head_dim=128,
+                quant_block_size=128,
+                skip_topk_layers=[i not in producer_layers for i in range(num_layers)],
+                index_k_with_scale_buffer_dtype=torch.uint8,
+                device="cpu",
+                layer_num=num_layers,
+            )
+            cache = IndexKeyCache(pool, index_buf_size=128)
+        self.assertEqual(len(cache.buffer), num_layers)
+        self.assertTrue(all(cache.buffer[i].shape[0] > 0 for i in producer_layers))
+        self.assertTrue(
+            all(
+                cache.buffer[i].shape[0] == 0
+                for i in range(num_layers)
+                if i not in producer_layers
+            )
+        )
+        self.assertEqual(sum(buf.nbytes for buf in cache.buffer), 21 * 3 * 64 * 132)
+
+    def test_device_elision_keeps_unadapted_transports_dense(self):
+        memory_config = SimpleNamespace(
+            enable_hierarchical_cache=True,
+            hicache_storage_backend=None,
+            enable_unified_cache_external_linker=False,
+            enable_hisparse=False,
+        )
+        parallel_config = SimpleNamespace(attn_dcp_size=1)
+        disagg_config = SimpleNamespace(disaggregation_mode="null")
+        with (
+            mock.patch(
+                "sglang.srt.mem_cache.kv_cache_configurator.get_memory",
+                return_value=memory_config,
+            ),
+            mock.patch(
+                "sglang.srt.mem_cache.kv_cache_configurator.get_parallel",
+                return_value=parallel_config,
+            ),
+            mock.patch(
+                "sglang.srt.mem_cache.kv_cache_configurator.get_disagg",
+                return_value=disagg_config,
+            ),
+        ):
+            self.assertTrue(_should_elide_dsa_index_k(is_draft_worker=False))
+            for field, value in (
+                ("hicache_storage_backend", "mooncake"),
+                ("enable_unified_cache_external_linker", True),
+                ("enable_hisparse", True),
+            ):
+                with self.subTest(field=field):
+                    original = getattr(memory_config, field)
+                    setattr(memory_config, field, value)
+                    self.assertFalse(_should_elide_dsa_index_k(is_draft_worker=False))
+                    setattr(memory_config, field, original)
+            disagg_config.disaggregation_mode = "prefill"
+            self.assertFalse(_should_elide_dsa_index_k(is_draft_worker=False))
+            disagg_config.disaggregation_mode = "null"
+            parallel_config.attn_dcp_size = 2
+            self.assertFalse(_should_elide_dsa_index_k(is_draft_worker=False))
+
     def test_glm_indexer_producer_layers(self):
         config = SimpleNamespace(
             architectures=["GlmMoeDsaForCausalLM"],
@@ -275,7 +373,41 @@ class TestDSAHiCacheTransfer(unittest.TestCase):
         ]
         return torch.cat(parts, dim=0)
 
-    def _run_device_to_host_indexer_copy(self, io_backend: str):
+    def test_glm_78_layer_device_indexer_allocates_only_21_producers(self):
+        model_config = SimpleNamespace(
+            architectures=["GlmMoeDsaForCausalLM"],
+            index_topk=2048,
+            index_topk_freq=4,
+            index_skip_topk_offset=3,
+        )
+        producer_layers = set(get_dsa_hicache_indexer_layers(model_config, 0, 78))
+        pool = DSATokenToKVPool(
+            size=64 * 4,
+            page_size=64,
+            kv_lora_rank=128,
+            dtype=torch.bfloat16,
+            qk_rope_head_dim=32,
+            layer_num=78,
+            device="cuda",
+            enable_memory_saver=False,
+            kv_cache_dim=576,
+            index_head_dim=128,
+            skip_topk_layers=[i not in producer_layers for i in range(78)],
+        )
+
+        self.assertEqual(len(producer_layers), 21)
+        self.assertEqual(
+            sum(buf.nbytes for buf in pool.index_k_with_scale_buffer),
+            21 * 5 * 64 * 132,
+        )
+        for layer_id, buf in enumerate(pool.index_k_with_scale_buffer):
+            self.assertEqual(buf.shape[0], 5 if layer_id in producer_layers else 0)
+
+    def _run_device_to_host_indexer_copy(
+        self,
+        io_backend: str,
+        layout: str = "layer_first",
+    ):
         page_size = 1 if is_hip() else 64
         layer_num = 4
         producer_layers = [0, 2]
@@ -292,10 +424,13 @@ class TestDSAHiCacheTransfer(unittest.TestCase):
             enable_memory_saver=False,
             kv_cache_dim=576,
             index_head_dim=128,
+            skip_topk_layers=[
+                layer not in producer_layers for layer in range(layer_num)
+            ],
         )
-        pin_memory = io_backend == "kernel"
+        pin_memory = io_backend == "kernel" or layout == "page_first_direct"
         original_alloc = ALLOC_MEMORY_FUNCS["cuda"]
-        if pin_memory:
+        if io_backend == "kernel":
             ALLOC_MEMORY_FUNCS["cuda"] = alloc_with_pin_memory
         try:
             mla_host = MLATokenToKVPoolHost(
@@ -303,7 +438,7 @@ class TestDSAHiCacheTransfer(unittest.TestCase):
                 host_to_device_ratio=2.0,
                 host_size=0,
                 page_size=page_size,
-                layout="layer_first",
+                layout=layout,
                 pin_memory=pin_memory,
                 device="cpu",
                 allocator_type="default",
@@ -312,7 +447,7 @@ class TestDSAHiCacheTransfer(unittest.TestCase):
             indexer_host = DSAIndexerPoolHost(
                 device_pool=device_pool,
                 anchor_host=mla_host,
-                layout="layer_first",
+                layout=layout,
                 pin_memory=pin_memory,
                 device="cpu",
                 allocator_type="default",
@@ -323,10 +458,13 @@ class TestDSAHiCacheTransfer(unittest.TestCase):
 
         for layer_id in range(layer_num):
             buf = device_pool.index_k_with_scale_buffer[layer_id]
-            data = torch.arange(
-                buf.numel(), device=buf.device, dtype=torch.uint8
-            ).view_as(buf)
-            buf.copy_((data + layer_id) % 256)
+            if layer_id in producer_layers:
+                data = torch.arange(
+                    buf.numel(), device=buf.device, dtype=torch.uint8
+                ).view_as(buf)
+                buf.copy_((data + layer_id) % 256)
+            else:
+                self.assertEqual(buf.shape[0], 0)
             kv_buf = device_pool.kv_buffer[layer_id]
             kv_data = torch.arange(
                 kv_buf.numel(), device=kv_buf.device, dtype=kv_buf.dtype
@@ -334,9 +472,12 @@ class TestDSAHiCacheTransfer(unittest.TestCase):
             kv_buf.copy_(kv_data + layer_id)
 
         device_pages = torch.tensor([1, 2, 3], device="cuda", dtype=torch.int64)
+        host_index_device = (
+            "cuda" if io_backend == "kernel" and layout == "layer_first" else "cpu"
+        )
         host_pages = torch.tensor(
             [0, 1, 2],
-            device="cuda" if io_backend == "kernel" else "cpu",
+            device=host_index_device,
             dtype=torch.int64,
         )
         device_indices = self._token_indices_for_pages(
@@ -345,42 +486,85 @@ class TestDSAHiCacheTransfer(unittest.TestCase):
         host_indices = self._token_indices_for_pages(
             host_pages,
             page_size,
-            device="cuda" if io_backend == "kernel" else "cpu",
+            device=host_index_device,
         )
 
-        mla_host.backup_from_device_all_layer(
-            device_pool, host_indices, device_indices, io_backend
-        )
+        if layout == "layer_first":
+            mla_host.backup_from_device_all_layer(
+                device_pool, host_indices, device_indices, io_backend
+            )
         indexer_host.backup_from_device_all_layer(
             device_pool, host_indices, device_indices, io_backend
         )
 
-        for host_layer_id, layer_id in enumerate(producer_layers):
+        for host_layer_id, layer_id in enumerate(indexer_host.device_layer_ids):
             for host_page, device_page in zip(
                 host_pages.tolist(), device_pages.tolist()
             ):
-                got = indexer_host.index_k_with_scale_buffer[host_layer_id][
-                    host_page
-                ].cpu()
+                got = (
+                    indexer_host.index_k_with_scale_buffer[host_layer_id][host_page]
+                    if layout == "layer_first"
+                    else indexer_host.index_k_with_scale_buffer[
+                        host_page, host_layer_id
+                    ]
+                ).cpu()
                 expected = device_pool.index_k_with_scale_buffer[layer_id][
                     device_page
                 ].cpu()
+                if layout != "layer_first":
+                    got = got.reshape_as(expected)
                 self.assertTrue(torch.equal(got, expected))
 
-        # Compacting the indexer sidecar must not compact ordinary MLA KV.
+        # After eviction/reuse, the compact host mapping must restore every
+        # producer's bytes without touching shared-top-k zero-row placeholders.
+        for layer_id in producer_layers:
+            device_pool.index_k_with_scale_buffer[layer_id][device_pages] = 0
+            indexer_host.load_to_device_per_layer(
+                device_pool,
+                (
+                    host_indices.cuda()
+                    if io_backend == "kernel" and layout == "page_first"
+                    else host_indices
+                ),
+                device_indices,
+                layer_id,
+                io_backend,
+            )
         for layer_id in range(layer_num):
+            if layer_id not in producer_layers:
+                self.assertEqual(
+                    device_pool.index_k_with_scale_buffer[layer_id].shape[0], 0
+                )
+                continue
             for host_page, device_page in zip(
                 host_pages.tolist(), device_pages.tolist()
             ):
-                host_start = host_page * page_size
-                device_start = device_page * page_size
-                got_kv = mla_host.kv_buffer[layer_id][
-                    host_start : host_start + page_size
-                ].cpu()
-                expected_kv = device_pool.kv_buffer[layer_id][
-                    device_start : device_start + page_size
-                ].cpu()
-                self.assertTrue(torch.equal(got_kv, expected_kv))
+                got = device_pool.index_k_with_scale_buffer[layer_id][device_page].cpu()
+                host_layer = indexer_host.host_layer_by_device[layer_id]
+                expected = (
+                    indexer_host.index_k_with_scale_buffer[host_layer][host_page]
+                    if layout == "layer_first"
+                    else indexer_host.index_k_with_scale_buffer[host_page, host_layer]
+                ).cpu()
+                if layout != "layer_first":
+                    expected = expected.reshape_as(got)
+                self.assertTrue(torch.equal(got, expected))
+
+        # Compacting the indexer sidecar must not compact ordinary MLA KV.
+        if layout == "layer_first":
+            for layer_id in range(layer_num):
+                for host_page, device_page in zip(
+                    host_pages.tolist(), device_pages.tolist()
+                ):
+                    host_start = host_page * page_size
+                    device_start = device_page * page_size
+                    got_kv = mla_host.kv_buffer[layer_id][
+                        host_start : host_start + page_size
+                    ].cpu()
+                    expected_kv = device_pool.kv_buffer[layer_id][
+                        device_start : device_start + page_size
+                    ].cpu()
+                    self.assertTrue(torch.equal(got_kv, expected_kv))
 
     @unittest.skipIf(
         is_hip(),
@@ -399,6 +583,23 @@ class TestDSAHiCacheTransfer(unittest.TestCase):
     )
     def test_device_to_host_indexer_direct(self):
         self._run_device_to_host_indexer_copy(io_backend="direct")
+
+    @unittest.skipIf(
+        is_hip(),
+        "ROCm DSATokenToKVPool page_size=1 trips the HIP-preshuffle assertion.",
+    )
+    def test_device_to_host_indexer_page_first_kernel(self):
+        self._run_device_to_host_indexer_copy(io_backend="kernel", layout="page_first")
+
+    @unittest.skipIf(
+        is_hip() or (is_cuda() and str(torch.version.cuda).startswith("13.")),
+        "CUDA 13 sgl-kernel page-first-direct batch copy returns "
+        "cudaErrorInvalidValue even with the old dense device layout.",
+    )
+    def test_device_to_host_indexer_page_first_direct(self):
+        self._run_device_to_host_indexer_copy(
+            io_backend="direct", layout="page_first_direct"
+        )
 
 
 if __name__ == "__main__":

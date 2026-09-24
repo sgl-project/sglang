@@ -909,11 +909,11 @@ class TestDSAIndexerAllocationPolicy(CustomTestCase):
         "sglang.srt.mem_cache.kv_cache_configurator.calculate_mla_kv_cache_dim",
         return_value=576,
     )
-    def test_resolved_hicache_override_prices_every_indexer_layer(
+    def test_resolved_hicache_l2_override_prices_producer_indexer_layers(
         self,
         _mock_calculate_mla_kv_cache_dim,
     ):
-        """Post-publish HiCache overrides must keep sizing and allocation aligned."""
+        """HiCache L2 must price the same producer layers it transfers."""
         num_layers = 6
         mr = _make_model_runner(self, num_layers=num_layers, use_mla_backend=True)
         _configure_dsa_model(mr)
@@ -930,7 +930,66 @@ class TestDSAIndexerAllocationPolicy(CustomTestCase):
 
             cfg = DefaultPoolConfigurator(mr)
 
+        self.assertEqual(cfg._cell_size, 576 * num_layers + 132 * 3)
+
+    @patch(
+        "sglang.srt.mem_cache.kv_cache_configurator.calculate_mla_kv_cache_dim",
+        return_value=576,
+    )
+    def test_hicache_l3_still_prices_every_indexer_layer(
+        self,
+        _mock_calculate_mla_kv_cache_dim,
+    ):
+        """Keep the existing L3 allocation until its page layout is verified."""
+        num_layers = 6
+        mr = _make_model_runner(self, num_layers=num_layers, use_mla_backend=True)
+        _configure_dsa_model(mr)
+        mr.model_config.hf_config.index_topk_freq = 4
+        mr.model_config.hf_config.index_skip_topk_offset = 3
+
+        with (
+            get_memory().override(
+                enable_hierarchical_cache=True,
+                hicache_storage_backend="mooncake",
+            ),
+            mock_cpu_env(kv_size=1),
+        ):
+            from sglang.srt.model_executor.pool_configurator import (
+                DefaultPoolConfigurator,
+            )
+
+            cfg = DefaultPoolConfigurator(mr)
+
         self.assertEqual(cfg._cell_size, (576 + 132) * num_layers)
+
+    @patch(
+        "sglang.srt.mem_cache.kv_cache_configurator.calculate_mla_kv_cache_dim",
+        return_value=576,
+    )
+    def test_hicache_l2_eagle_prices_compact_target_and_full_draft(
+        self,
+        _mock_calculate_mla_kv_cache_dim,
+    ):
+        num_layers = 78
+        mr = _make_model_runner(self, num_layers=num_layers, use_mla_backend=True)
+        _configure_dsa_model(mr)
+        mr.model_config.hf_config.index_topk_freq = 4
+        mr.model_config.hf_config.index_skip_topk_offset = 3
+        mr.spec_algorithm.is_eagle.return_value = True
+        mr.spec_algorithm.is_none.return_value = False
+        mr.spec_aux_config.eagle_draft_num_layers = 1
+
+        with (
+            get_memory().override(enable_hierarchical_cache=True),
+            mock_cpu_env(kv_size=1),
+        ):
+            from sglang.srt.model_executor.pool_configurator import (
+                DefaultPoolConfigurator,
+            )
+
+            cfg = DefaultPoolConfigurator(mr)
+
+        self.assertEqual(cfg._cell_size, 576 * 78 + 132 * 21 + 576 + 132)
 
     @patch(
         "sglang.srt.mem_cache.kv_cache_configurator.calculate_mla_kv_cache_dim",

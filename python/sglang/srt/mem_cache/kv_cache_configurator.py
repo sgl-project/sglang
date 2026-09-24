@@ -106,13 +106,23 @@ logger = logging.getLogger(__name__)
 
 def _should_elide_dsa_index_k(*, is_draft_worker: bool) -> bool:
     memory_config = get_memory()
-    return (
-        not memory_config.enable_hisparse
-        and not is_draft_worker
-        and not memory_config.enable_hierarchical_cache
-        and not memory_config.enable_unified_cache_external_linker
-        and get_disagg().disaggregation_mode == "null"
-    )
+    if (
+        memory_config.enable_hisparse
+        or is_draft_worker
+        or memory_config.enable_unified_cache_external_linker
+        or get_disagg().disaggregation_mode != "null"
+    ):
+        return False
+    if memory_config.enable_hierarchical_cache:
+        # The HiCache INDEXER sidecar from #38426 transfers producer layers
+        # only, so its L2 path can handle zero-row device placeholders. Keep
+        # L3's cross-instance page layout and DCP's virtual index-K addressing
+        # on their existing paths until those combinations are validated.
+        return (
+            memory_config.hicache_storage_backend is None
+            and get_parallel().attn_dcp_size == 1
+        )
+    return True
 
 
 def get_dsa_hicache_indexer_layers(
