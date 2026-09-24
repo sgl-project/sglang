@@ -192,6 +192,10 @@ class BaseKVSender(ABC):
     def should_send_kv_chunk(self, num_pages: int, last_chunk: bool) -> bool:
         return num_pages > 0
 
+    def is_source_pending(self) -> bool:
+        """Whether asynchronous staging still owns this request's KV/aux storage."""
+        return False
+
     @abstractmethod
     def get_transfer_metric(self) -> KVTransferMetric:
         """Return backend-specific transfer metrics for this sender."""

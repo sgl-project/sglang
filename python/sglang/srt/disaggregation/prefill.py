@@ -149,6 +149,11 @@ def maybe_release_metadata_buffer(
         allocator: The ReqToMetadataIdxAllocator instance to free the index
     """
     if req.metadata_buffer_index >= 0:
+        if (
+            req.disagg_kv_sender is not None
+            and req.disagg_kv_sender.is_source_pending()
+        ):
+            req.disagg_kv_sender.failure_exception()
         allocator.free(req.metadata_buffer_index)
         req.metadata_buffer_index = -1
 
@@ -1502,6 +1507,15 @@ class SchedulerDisaggregationPrefillMixin:
             )
         else:
             segments = [(start_idx, end_idx)]
+
+        if envs.SGLANG_NIXL_HOST_STAGING_MB.get():
+            event = torch.cuda.Event()
+            event.record(
+                self.forward_stream
+                if self.enable_overlap
+                else torch.cuda.current_stream()
+            )
+            req.disagg_kv_sender._host_ready_event = event
 
         for seg_start, seg_end in segments:
             is_final_segment = seg_end == end_idx

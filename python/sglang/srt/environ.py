@@ -158,6 +158,15 @@ class EnvInt(EnvField):
             raise ValueError(f'"{value}" is not a valid integer value')
 
 
+class EnvNonNegativeInt(EnvInt):
+    def get(self) -> int:
+        # A malformed opt-in size must not silently select a different transport.
+        value = self.parse(os.environ.get(self.name, str(self.default)))
+        if value < 0:
+            raise ValueError(f"{self.name} must be nonnegative")
+        return value
+
+
 class _DeprecatedEnvFallback:
     """Mixin for EnvField subclasses: if the canonical env var is not set,
     check *deprecated_name* and emit DeprecationWarning before reading it.
@@ -774,6 +783,9 @@ class Envs:
     # KV-transfer staging and Mooncake transport
     # ===================================================================
     # Staging buffer for heterogeneous TP KV transfer
+    # NIXL HOST staging: pinned host MiB per worker (prefill: split into its
+    # slots; decode: its receive ring). Both roles must match; 0 disables.
+    SGLANG_NIXL_HOST_STAGING_MB = EnvNonNegativeInt(0)
     SGLANG_DISAGG_STAGING_BUFFER = EnvBool(False)
     SGLANG_DISAGG_STAGING_POOL_SIZE_MB = EnvInt(4096)
     # TODO(yangminl): remove SGLANG_STAGING_USE_TORCH and the torch fallback in

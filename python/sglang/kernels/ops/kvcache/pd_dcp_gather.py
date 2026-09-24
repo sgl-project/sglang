@@ -70,3 +70,32 @@ def copy_mla_rows_into_pack(
         n,
         BLOCK_SIZE=1024,
     )
+
+
+@triton.jit
+def _copy_byte_ranges_kernel(dst_ptrs, src_ptrs, sizes, BLOCK_SIZE: tl.constexpr):
+    row = tl.program_id(0)
+    size = tl.load(sizes + row)
+    dst = tl.load(dst_ptrs + row).to(tl.pointer_type(tl.uint8))
+    src = tl.load(src_ptrs + row).to(tl.pointer_type(tl.uint8))
+    step = tl.num_programs(1) * BLOCK_SIZE
+    for start in range(tl.program_id(1) * BLOCK_SIZE, size, step):
+        offsets = start + tl.arange(0, BLOCK_SIZE).to(tl.int64)
+        mask = offsets < size
+        tl.store(dst + offsets, tl.load(src + offsets, mask=mask), mask=mask)
+
+
+def copy_byte_ranges(table: torch.Tensor, max_size: int) -> None:
+    """Copy table[2, i] bytes from address table[1, i] to table[0, i].
+
+    table: (3, n) int64 on the device, rows [dst, src, size]; addresses are raw
+    device-visible pointers (device memory or mapped pinned host memory). Runs on
+    the current stream.
+    """
+    n = table.shape[1]
+    if not n:
+        return
+    block = 4096
+    # Grid y is capped (65535); each program strides over its row's blocks.
+    grid = (n, min(triton.cdiv(max_size, block), 1024))
+    _copy_byte_ranges_kernel[grid](table[0], table[1], table[2], BLOCK_SIZE=block)
