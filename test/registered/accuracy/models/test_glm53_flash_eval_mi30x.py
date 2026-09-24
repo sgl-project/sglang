@@ -1,37 +1,34 @@
 """MI30x GLM-5.3-Flash GSM8K Accuracy Evaluation Test (8-GPU)
 
-Tests zai-org/GLM-5.3-Flash on MI30x (gfx942) with the ROCm recipe the cookbook
-ships as `verified: true`: TP8, BF16 KV cache, TileLang DSA prefill+decode,
-Triton MoE runner, AITER on, CUDA graphs off. Same command and same threshold
-as the gfx950 gate in test_glm53_flash_eval_mi35x.py.
+Tests zai-org/GLM-5.3-Flash on MI30x (gfx942) with the AMD FP8 recipe from the
+GLM-5.3-Flash cookbook refresh (#36712): TP8 + EP8, BF16 KV cache, TileLang DSA
+prefill+decode, Triton linear attention, Triton MoE runner, SGLANG_USE_AITER=1,
+full decode graphs at batch sizes 1 and 32. Same eval and threshold as the
+gfx950 gate in test_glm53_flash_eval_mi35x.py.
 
-gfx942 is not redundant with gfx950 for this model. The AMD enablement routes
-the two arches through different kernels for the same forward pass: gfx950 gets
-the fused SGL-kernel k-pool top-k and the AITER mHC pre/post plus fused
-attention-to-FFN boundary, while gfx942 takes the portable unfused Torch DSA
-top-k and the generic mHC path. Those gfx942 paths have no other nightly
-coverage. The cookbook's MI325X entry is inferred from this arch rather than
-measured directly, so this job is the only evidence behind it too.
+gfx942 is not redundant with gfx950 for this model. It takes the Triton MoE
+runner and the generic mHC path (AITER mHC is gfx95-only), and neither has any
+other nightly coverage for this model. It also resolves `dsa_topk_backend` to
+the default fused `sgl-kernel` top-k on main, whereas the support-branch runs
+behind #36607's numbers forced the portable Torch top-k on non-gfx95 ROCm.
 
 Threshold: #36607 measured the full 1319-question GSM8K split at
-1284/1319 = 97.35% on MI300X. 0.92 follows this repo's `measured - 0.05`
-convention for sgl-eval gsm8k thresholds and matches the gfx950 gate, so the
-two arches stay directly comparable.
+1284/1319 = 97.35% on MI300X, and the cookbook's MI300X cell for this exact
+TP8 + EP8 command measured 1280/1319 = 97.04%, both on the GLM-5.3-Flash
+support branch. 0.92 follows this repo's `measured - 0.05` convention for
+sgl-eval gsm8k thresholds and matches the gfx950 gate, so the two arches stay
+directly comparable.
 
-This harness scored 0.9712 on both the rocm720 image (12259 s wall) and the
-rocm724 image (5164 s wall). The first budget of 7200 s timed out at 99.8%
-complete because gfx942 has no AITER mHC and no fused DSA top-k -- both are
-gfx95-gated -- so it evaluates roughly 3x slower than the MI35x job. The
-workflow allows 18000 s.
+Runtime: budget this job generously. gfx942 gets none of the gfx95 fast paths,
+and this runner pool's shared model cache has taken over an hour to load the
+328 GB checkpoint. The workflow allows 18000 s. If that ever proves tight,
+prefer raising it over trimming the eval: a full-split score is what makes this
+arch's number comparable to the gfx950 one.
 
 Eval harness: `api="sgl_eval"` rather than the default 5-shot completion
 scorer, because GLM-5.3-Flash thinks by default and the completion scorer reads
 the last number in the response. The parameters below are the accuracy command
 the cookbook publishes for this model. See the MI35x file for the longer note.
-
-Model support is on main via #36507. The gfx942/gfx950 kernel split that this
-job exists to gate is the AMD Day-0 stack (#36607 on the support branch;
-reopened on main as #38541-#38547).
 
 Registry: nightly-amd-accuracy-8-gpu-glm53-flash suite
 """
@@ -65,16 +62,20 @@ class TestGLM53FlashEvalMI30x(unittest.TestCase):
     def test_glm_53_flash(self):
         """Run accuracy test for GLM-5.3-Flash."""
         cookbook_args = [
+            "--ep-size=8",
+            "--attention-backend=dsa",
             "--dsa-prefill-backend=tilelang",
             "--dsa-decode-backend=tilelang",
+            "--linear-attn-backend=triton",
             "--kv-cache-dtype=bfloat16",
             "--moe-runner-backend=triton",
+            "--cuda-graph-backend-decode=full",
+            "--cuda-graph-backend-prefill=disabled",
+            "--cuda-graph-bs-decode",
+            "1",
+            "32",
             "--reasoning-parser=glm45",
             "--tool-call-parser=glm47",
-            # The cookbook cell's single `--disable-cuda-graph`; that legacy
-            # flag is no longer on the CLI, so name both phases instead.
-            "--disable-prefill-cuda-graph",
-            "--disable-decode-cuda-graph",
             "--watchdog-timeout=1200",
             # Not part of the cookbook cell; purely a load-time win on a
             # checkpoint this large, with no effect on numerics.
@@ -88,7 +89,7 @@ class TestGLM53FlashEvalMI30x(unittest.TestCase):
                 tp_size=8,
                 extra_args=cookbook_args,
                 env={"SGLANG_USE_AITER": "1"},
-                variant="TP8",
+                variant="TP8-EP8",
                 launch_timeout=SERVER_LAUNCH_TIMEOUT,
             ),
         ]

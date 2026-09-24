@@ -2107,11 +2107,10 @@ jobs:
   # ==============================================================================
   # 8-GPU GLM-5.3-Flash (MI30x + MI35x)
   #
-  # Both arches are gated because the ROCm enablement routes them through
-  # different kernels for the same forward pass: gfx950 takes the fused
-  # SGL-kernel k-pool top-k and the AITER mHC pre/post plus fused
-  # attention-to-FFN boundary, gfx942 the portable unfused Torch DSA top-k and
-  # the generic mHC path.
+  # Both arches are gated because the ROCm recipe routes them through different
+  # kernels for the same forward pass: gfx950 takes the AITER MoE runner and
+  # the AITER mHC pre/post, gfx942 the Triton MoE runner and the generic mHC
+  # path.
   # ==============================================================================
 
   nightly-8-gpu-glm53-flash:
@@ -2144,8 +2143,8 @@ jobs:
           bash scripts/ci/amd/amd_ci_install_dependency.sh --skip-test-time-deps
           bash scripts/ci/amd/amd_ci_exec.sh pip install tabulate
 
-      # Measured 12259 s on rocm720 (gfx942 has no AITER mHC and no fused DSA
-      # top-k). 18000 s is ~1.5x that wall time so a cold-cache load still fits.
+      # Measured 12259 s on rocm720, and this pool's shared model cache has taken
+      # over an hour to load the 328 GB checkpoint. 18000 s covers both.
       - name: Accuracy Test ROCm (8-GPU GLM-5.3-Flash DSA+KDA)
         timeout-minutes: 360
         run: |
