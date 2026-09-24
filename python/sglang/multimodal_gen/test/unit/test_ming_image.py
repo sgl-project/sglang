@@ -30,6 +30,9 @@ from sglang.multimodal_gen.runtime.pipelines.ming_image_pipeline import prepare_
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.ming_image import (
     ming_reference_size,
 )
+from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
+from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe import fused_experts
+from sglang.srt.layers.moe.topk import StandardTopKOutput
 
 
 @pytest.mark.parametrize("mode,multi", [("zero_masked", False), ("learned", True)])
@@ -156,6 +159,34 @@ def test_padding_replacement_keeps_valid_rows_and_registers():
     torch.testing.assert_close(output[:, :3], x[:, :3], rtol=0, atol=0)
     torch.testing.assert_close(output[:, 3:], token.expand(2, 2, 8), rtol=0, atol=0)
     assert output.data_ptr() != x.data_ptr()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_moe_preserves_bf16_activation_before_fp32_combine():
+    torch.manual_seed(7)
+    x = torch.randn(16, 128, dtype=torch.bfloat16, device="cuda")
+    w13 = torch.randn(4, 256, 128, dtype=x.dtype, device=x.device) * 0.02
+    w2 = torch.randn(4, 128, 128, dtype=x.dtype, device=x.device) * 0.02
+    weights, ids = torch.randn(16, 4, device=x.device).softmax(-1).topk(2)
+    config = MoeRunnerConfig(
+        activation="silu_rounded",
+        is_gated=True,
+        no_combine=True,
+        inplace=False,
+        top_k=2,
+    )
+    actual = fused_experts(
+        x, w13, w2, StandardTopKOutput(weights, ids.int(), None), config
+    )
+    expected = torch.empty_like(actual)
+    for expert in range(4):
+        rows, slots = torch.where(ids == expert)
+        gate, up = F.linear(x[rows], w13[expert]).chunk(2, -1)
+        expected[rows, slots] = F.linear(F.silu(gate) * up, w2[expert])
+    torch.testing.assert_close(actual, expected, rtol=0, atol=2e-4)
+    combined = (actual.float() * weights.unsqueeze(-1)).sum(1).to(x.dtype)
+    reference = (expected.float() * weights.unsqueeze(-1)).sum(1).to(x.dtype)
+    torch.testing.assert_close(combined, reference, rtol=0, atol=2e-4)
 
 
 @pytest.mark.parametrize("size,mu", [(256, 0.5), (1024, 1.35), (2048, 1.35)])

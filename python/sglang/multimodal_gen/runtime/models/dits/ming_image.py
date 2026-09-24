@@ -6,10 +6,12 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
-from sglang.multimodal_gen.runtime.distributed import (
-    get_sp_group,
-    get_sp_parallel_rank,
-    get_sp_world_size,
+from sglang.multimodal_gen.runtime.distributed import get_sp_world_size
+from sglang.multimodal_gen.runtime.distributed.sp_shard_utils import (
+    gather_seq,
+    shard_like,
+    shard_seq,
+    tail_attn_meta,
 )
 from sglang.multimodal_gen.runtime.models.dits.zimage import ZImageTransformer2DModel
 from sglang.srt.layers.layernorm import RMSNorm
@@ -67,9 +69,8 @@ class MingImageTransformer2DModel(ZImageTransformer2DModel):
         x = x.reshape(batch_size, channels, frames, height // 2, 2, width // 2, 2)
         x = x.permute(0, 2, 3, 5, 4, 6, 1).flatten(1, 3).flatten(2)
         x_length = x.shape[1]
-        sp_size, rank = get_sp_world_size(), get_sp_parallel_rank()
-        x_aligned = math.ceil(x_length / 32) * 32
-        x_target = math.ceil(x_aligned / sp_size) * sp_size
+        sp_size = get_sp_world_size()
+        x_target = math.ceil(x_length / 32) * 32
         x = F.pad(x, (0, 0, 0, x_target - x_length))
         x, _ = self.all_x_embedder["2-1"](x)
         x = self._replace_padding_with_token_mask(
@@ -95,18 +96,11 @@ class MingImageTransformer2DModel(ZImageTransformer2DModel):
             (frames, height // 2, width // 2), (cap_target + 1, 0, 0), x.device
         ).flatten(0, 2)
         x_ids = F.pad(x_ids, (0, 0, 0, x_target - x_length))
-        local_length = x_target // sp_size
-        offset = rank * local_length
-        x = x[:, offset : offset + local_length].contiguous()
-        x_ids = x_ids[offset : offset + local_length]
-        x_valid = min(
-            local_length,
-            max(0, (x_aligned if self.learned_padding else x_length) - offset),
-        )
+        x_valid = x_target if self.learned_padding else x_length
         cap_valid = cap_target if self.learned_padding else cap_length
         x_freqs, cap_freqs = self.rotary_emb(x_ids), self.rotary_emb(cap_ids)
         x_mask, x_meta = self._get_attn_mask_and_meta(
-            "_ming_x_mask", [x_valid] * batch_size, local_length, x.device
+            "_ming_x_mask", [x_valid] * batch_size, x_target, x.device
         )
         cap_mask, cap_meta = self._get_attn_mask_and_meta(
             "_ming_cap_mask", [cap_valid] * batch_size, cap_target, x.device
@@ -115,9 +109,21 @@ class MingImageTransformer2DModel(ZImageTransformer2DModel):
             x.dtype
         )
         for layer in self.noise_refiner:
-            x = layer(x, x_freqs, adaln, attn_mask=x_mask, attn_mask_meta=x_meta)
+            x = layer(
+                x,
+                x_freqs,
+                adaln,
+                attn_mask=x_mask,
+                attn_mask_meta=x_meta,
+                skip_sequence_parallel_override=True,
+            )
         for layer in self.context_refiner:
             cap = layer(cap, cap_freqs, attn_mask=cap_mask, attn_mask_meta=cap_meta)
+        if sp_size > 1:
+            # masked alignment rows never contribute; learned registers must stay
+            x, cap = x[:, :x_valid], cap[:, :cap_valid]
+            x_freqs = tuple(freq[:x_valid] for freq in x_freqs)
+            cap_freqs = tuple(freq[:cap_valid] for freq in cap_freqs)
         unified = torch.cat((x, cap), 1)
         freqs = tuple(
             torch.cat((image_freq, text_freq), -2)
@@ -125,11 +131,16 @@ class MingImageTransformer2DModel(ZImageTransformer2DModel):
         )
         mask, meta = self._get_joint_attn_mask_and_meta(
             [x_valid] * batch_size,
-            local_length,
+            x_target,
             [cap_valid] * batch_size,
             cap_target,
             x.device,
         )
+        if sp_size > 1:
+            # shard the complete joint sequence, with only global-tail padding
+            unified, shard = shard_seq(unified)
+            freqs = tuple(shard_like(freq, shard, dim=0) for freq in freqs)
+            mask, meta = None, tail_attn_meta(shard, batch_size, x.device)
         for layer in self.layers:
             unified = layer(
                 unified,
@@ -137,11 +148,12 @@ class MingImageTransformer2DModel(ZImageTransformer2DModel):
                 adaln,
                 attn_mask=mask,
                 attn_mask_meta=meta,
-                num_replicated_suffix=cap_target,
             )
-        output = self.all_final_layer["2-1"](unified[:, :local_length], adaln)
+        if sp_size == 1:
+            unified = unified[:, :x_target]
+        output = self.all_final_layer["2-1"](unified, adaln)
         if sp_size > 1:
-            output = get_sp_group().all_gather(output.contiguous(), dim=1)
+            output = gather_seq(output, shard.orig_len)
         output = output[:, :x_length].reshape(
             batch_size, frames, height // 2, width // 2, 2, 2, channels
         )

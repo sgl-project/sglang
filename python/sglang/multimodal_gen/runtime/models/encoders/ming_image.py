@@ -128,6 +128,8 @@ class MingAttention(nn.Module):
             torch.arange(0, self.rotary_dim, 2, device=x.device, dtype=torch.float32)
             / self.rotary_dim
         )
+        # the public BF16 inference path casts RoPE buffers before evaluation
+        inv = inv.to(x.dtype).float()
         with torch.autocast(x.device.type, enabled=False):
             angles = positions.float().unsqueeze(-1) * inv
             angles = torch.cat((angles, angles), -1)
@@ -192,7 +194,7 @@ class MingExperts(nn.Module):
             hidden_size=config.hidden_size,
             intermediate_size_per_partition=self.intermediate_size,
             top_k=config.num_experts_per_tok,
-            activation="silu",
+            activation="silu_rounded",
             is_gated=True,
             inplace=False,
             no_combine=True,
@@ -298,6 +300,10 @@ class MingImageEncoder(TextEncoder):
         self.vision = Qwen2_5VLVisionTransformer(
             SimpleNamespace(**config.vision_config)
         )
+        self.vision.merger.ln_q.cast_x_before_out_mul = False
+        for block in self.vision.blocks:
+            block.norm1.cast_x_before_out_mul = False
+            block.norm2.cast_x_before_out_mul = False
         self.linear_proj = nn.Sequential(
             nn.Linear(config.vision_config["out_hidden_size"], llm.hidden_size),
             nn.GELU(),
@@ -345,11 +351,13 @@ class MingImageEncoder(TextEncoder):
         image_mask = input_ids == self.image_token
         image_embeddings = queries
         if pixel_values is not None:
-            image_embeddings = F.normalize(
-                self.linear_proj(self.vision(pixel_values, image_grid_thw)), dim=-1
-            )
+            vision_features = self.vision(pixel_values, image_grid_thw)
+            with torch.autocast(x.device.type, enabled=False):
+                image_embeddings = F.normalize(
+                    self.linear_proj(vision_features), dim=-1
+                )
             image_embeddings = torch.cat((image_embeddings, queries), 0)
-        x = x.masked_scatter(image_mask.unsqueeze(-1), image_embeddings)
+        x = x.masked_scatter(image_mask.unsqueeze(-1), image_embeddings.to(x.dtype))
         selected = []
         for i, layer in enumerate(self.layers):
             if i in self.selected_layers:
