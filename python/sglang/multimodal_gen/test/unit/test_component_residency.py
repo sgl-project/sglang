@@ -1040,9 +1040,16 @@ def _dual_expert_pipeline():
     return manager, server_args, denoise, t_use, t2_use, vae_use
 
 
-def test_end_stage_does_not_prefetch_unused_same_stage_expert():
-    """Warmup that only runs transformer must not H2D transformer_2 at stage exit."""
-    manager, server_args, denoise, t_use, t2_use, vae_use = _dual_expert_pipeline()
+def _finish_denoise_stage(manager):
+    # DenoisingStage finishes its active DiT inside the stage, then the
+    # executor calls end_stage.
+    manager.finish_active_use()
+    manager.end_stage()
+
+
+def test_stage_finish_does_not_prefetch_unused_same_stage_expert():
+    """Warmup that only runs transformer must not H2D transformer_2."""
+    manager, server_args, denoise, t_use, _t2_use, _vae_use = _dual_expert_pipeline()
     strategy = ComponentOffloadStrategy()
     strategy.prepare_for_use = Mock()
     strategy.wait_for_use = Mock()
@@ -1052,15 +1059,16 @@ def test_end_stage_does_not_prefetch_unused_same_stage_expert():
 
     manager.before_stage(denoise, 0, SimpleNamespace(is_warmup=False), server_args)
     manager.begin_use(t_use)
-    manager.end_stage()
+    _finish_denoise_stage(manager)
 
     prefetched = [
         call.args[1].component_name for call in strategy.prefetch_for_use.call_args_list
     ]
-    assert "transformer_2" not in prefetched
     assert prefetched == ["vae"]
-    strategy.finish_use.assert_called_once()
-    assert strategy.finish_use.call_args.args[1] is t_use
+    finished = [
+        call.args[1].component_name for call in strategy.finish_use.call_args_list
+    ]
+    assert finished == ["transformer"]
 
 
 def test_end_stage_releases_prefetched_but_never_begun_same_stage_use():
@@ -1074,18 +1082,17 @@ def test_end_stage_releases_prefetched_but_never_begun_same_stage_use():
     manager.begin_use(t_use)
     assert manager._use_key(t2_use) in manager._prefetched_use_keys
 
-    manager.end_stage()
+    _finish_denoise_stage(manager)
 
     finished = [
         call.args[1].component_name for call in strategy.finish_use.call_args_list
     ]
-    assert finished.count("transformer_2") == 1
-    assert finished.count("transformer") == 1
+    assert sorted(finished) == ["transformer", "transformer_2"]
     assert manager._use_key(t2_use) not in manager._prefetched_use_keys
 
 
-def test_end_stage_keeps_dual_expert_sequence_when_both_run():
-    manager, server_args, denoise, t_use, t2_use, vae_use = _dual_expert_pipeline()
+def test_stage_finish_keeps_dual_expert_sequence_when_both_run():
+    manager, server_args, denoise, t_use, t2_use, _vae_use = _dual_expert_pipeline()
     strategy = ComponentOffloadStrategy()
     strategy.prepare_for_use = Mock()
     strategy.wait_for_use = Mock()
@@ -1096,7 +1103,7 @@ def test_end_stage_keeps_dual_expert_sequence_when_both_run():
     manager.before_stage(denoise, 0, SimpleNamespace(is_warmup=False), server_args)
     manager.begin_use(t_use)
     manager.begin_use(t2_use)
-    manager.end_stage()
+    _finish_denoise_stage(manager)
 
     prepared = [
         call.args[1].component_name for call in strategy.prepare_for_use.call_args_list
