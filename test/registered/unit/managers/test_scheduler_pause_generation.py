@@ -42,6 +42,21 @@ class _PendingCopy:
         self.done = True
 
 
+def _all_reduce_with_peer(ops, peer_queue_sizes, peer_pending):
+    # One simulated peer rank: its (write, backup) ack counts before the drain and
+    # its pending flag after it.
+    def all_reduce(tensor, op, group):
+        ops.append(op)
+        if op == torch.distributed.ReduceOp.MIN:
+            torch.minimum(
+                tensor, torch.tensor(peer_queue_sizes, dtype=tensor.dtype), out=tensor
+            )
+        else:
+            tensor.clamp_(min=peer_pending)
+
+    return all_reduce
+
+
 class TestSchedulerPauseGeneration(CustomTestCase):
     def setUp(self):
         # The scheduler runs after its process publishes; retraction reads the
@@ -141,7 +156,7 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         return requeue_log
 
     def _decode_req_with_pending_offload(
-        self, scheduler: Scheduler
+        self, scheduler: Scheduler, tp_world_size: int = 1, offload: bool = True
     ) -> Tuple[Req, List[Tuple[str, bool]]]:
         req = Req(
             rid="run",
@@ -171,14 +186,16 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         manager.page_size = 1
         manager.offload_stride = 1
         manager.request_counter = 0
-        manager.tp_world_size = 1
+        manager.tp_world_size = tp_world_size
+        manager.tp_group = None
         manager.cache_controller = controller
         manager.decode_host_mem_pool = MagicMock()
         manager.ongoing_offload = {}
         manager.ongoing_backup = {}
         manager.offloaded_state = WeakKeyDictionary()
         manager.offload_inflight = WeakKeyDictionary()
-        self.assertTrue(manager.offload_kv_cache(req))
+        if offload:
+            self.assertTrue(manager.offload_kv_cache(req))
         scheduler.decode_offload_manager = manager
 
         frees: List[Tuple[str, bool]] = []
@@ -190,6 +207,27 @@ class TestSchedulerPauseGeneration(CustomTestCase):
 
         scheduler.tree_cache.cache_finished_req.side_effect = free_kv_row
         return req, frees
+
+    def _retract_by_pause(self, scheduler: Scheduler, req: Req):
+        scheduler.disaggregation_mode = DisaggregationMode.DECODE
+        scheduler.disagg_decode_prealloc_queue = MagicMock()
+        scheduler.running_batch = self._make_batch(
+            scheduler, reqs=[req], with_tensors=True
+        )
+        scheduler.pause_generation(PauseGenerationReqInput(mode="retract"))
+
+    def _retract_by_kv_full(self, scheduler: Scheduler, req: Req):
+        batch = self._make_batch(
+            scheduler, reqs=[req], forward_mode=ForwardMode.DECODE, with_tensors=True
+        )
+        batch.spec_algorithm = SpeculativeAlgorithm.NONE
+        scheduler.token_to_kv_pool_allocator.page_size = 1
+        scheduler.token_to_kv_pool_allocator.check_decode_capacity.return_value = False
+        scheduler.tree_cache.req_to_token_pool.mamba_allocator = None
+        scheduler.new_token_ratio_tracker = SimpleNamespace(current=1.0)
+        scheduler.ipc_channels = MagicMock()
+        scheduler.beam_coordinator = MagicMock()
+        scheduler.update_running_batch(batch)
 
     def test_inplace_only_sets_flag(self):
         """in_place pause should only set _engine_paused and return."""
@@ -563,14 +601,9 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         """PD decode retract must not free KV an offload copy is still reading, and
         must not leave offload acks that keep the paused engine from going idle."""
         scheduler = self._new_scheduler()
-        scheduler.disaggregation_mode = DisaggregationMode.DECODE
-        scheduler.disagg_decode_prealloc_queue = MagicMock()
         req, frees = self._decode_req_with_pending_offload(scheduler)
-        scheduler.running_batch = self._make_batch(
-            scheduler, reqs=[req], with_tensors=True
-        )
 
-        scheduler.pause_generation(PauseGenerationReqInput(mode="retract"))
+        self._retract_by_pause(scheduler, req)
 
         self.assertEqual(frees, [("run", True)])
         self.assertEqual(scheduler.decode_offload_manager.ongoing_offload, {})
@@ -580,20 +613,97 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         offload copy is still reading."""
         scheduler = self._new_scheduler()
         req, frees = self._decode_req_with_pending_offload(scheduler)
-        batch = self._make_batch(
-            scheduler, reqs=[req], forward_mode=ForwardMode.DECODE, with_tensors=True
-        )
-        batch.spec_algorithm = SpeculativeAlgorithm.NONE
-        scheduler.token_to_kv_pool_allocator.page_size = 1
-        scheduler.token_to_kv_pool_allocator.check_decode_capacity.return_value = False
-        scheduler.tree_cache.req_to_token_pool.mamba_allocator = None
-        scheduler.new_token_ratio_tracker = SimpleNamespace(current=1.0)
-        scheduler.ipc_channels = MagicMock()
-        scheduler.beam_coordinator = MagicMock()
 
-        scheduler.update_running_batch(batch)
+        self._retract_by_kv_full(scheduler, req)
 
         self.assertEqual(frees, [("run", True)])
+
+    def test_retraction_refused_while_any_rank_tracks_an_offload_copy(self):
+        """Retraction must be refused on every rank, before any KV is freed, while any
+        rank still tracks a device-to-host offload copy after the drain."""
+        for entrypoint in (self._retract_by_pause, self._retract_by_kv_full):
+            for case, tp_world_size, peer_queue_sizes, peer_pending in (
+                # Only the peer still has a copy; this rank has nothing to drain.
+                ("peer_only", 2, [0, 0], 1),
+                # This rank has an ack the peer lacks, so the MIN drain skips it.
+                ("asymmetric_acks", 2, [0, 0], 0),
+                # A tracked copy whose ack is missing; checked locally at TP1.
+                ("tracked_without_ack", 1, None, None),
+            ):
+                with self.subTest(entrypoint=entrypoint.__name__, case=case):
+                    scheduler = self._new_scheduler()
+                    req, frees = self._decode_req_with_pending_offload(
+                        scheduler,
+                        tp_world_size=tp_world_size,
+                        offload=case != "peer_only",
+                    )
+                    manager = scheduler.decode_offload_manager
+                    if case == "tracked_without_ack":
+                        manager.cache_controller.ack_write_queue.clear()
+                        manager.ongoing_offload.clear()
+                    all_reduce = _all_reduce_with_peer(
+                        [], peer_queue_sizes, peer_pending
+                    )
+                    with patch.object(
+                        torch.distributed, "all_reduce", side_effect=all_reduce
+                    ):
+                        try:
+                            entrypoint(scheduler, req)
+                            refused = False
+                        except RuntimeError as exc:
+                            refused = "refusing to retract" in str(exc)
+
+                    self.assertEqual((refused, frees), (True, []))
+
+    def test_retraction_proceeds_when_no_rank_tracks_an_offload_copy(self):
+        """Symmetric drains, requests with no offload, and pending storage backups
+        must not block retraction."""
+        for entrypoint in (self._retract_by_pause, self._retract_by_kv_full):
+            for case, offload, local_backups, expected_frees in (
+                ("drained", True, 0, [("run", True)]),
+                # No copy was issued, so none completed.
+                ("no_offload", False, 0, [("run", False)]),
+                # Backup acks differ across ranks; backups only read host memory.
+                ("backup_only", True, 1, [("run", True)]),
+            ):
+                with self.subTest(entrypoint=entrypoint.__name__, case=case):
+                    scheduler = self._new_scheduler()
+                    req, frees = self._decode_req_with_pending_offload(
+                        scheduler, tp_world_size=2, offload=offload
+                    )
+                    controller = scheduler.decode_offload_manager.cache_controller
+                    controller.ack_backup_queue.qsize.return_value = local_backups
+                    peer_queue_sizes = [int(offload), 0]
+                    all_reduce = _all_reduce_with_peer([], peer_queue_sizes, 0)
+                    with patch.object(
+                        torch.distributed, "all_reduce", side_effect=all_reduce
+                    ):
+                        entrypoint(scheduler, req)
+
+                    self.assertEqual(frees, expected_frees)
+
+    def test_retraction_adds_one_collective_outside_the_decode_drain(self):
+        """All ranks must issue identical collectives: the per-iteration decode drain
+        stays a single MIN, and each retraction adds exactly one MAX after its MIN."""
+        min_op, max_op = torch.distributed.ReduceOp.MIN, torch.distributed.ReduceOp.MAX
+        for entrypoint in (self._retract_by_pause, self._retract_by_kv_full):
+            with self.subTest(entrypoint=entrypoint.__name__):
+                scheduler = self._new_scheduler()
+                req, _ = self._decode_req_with_pending_offload(
+                    scheduler, tp_world_size=2
+                )
+                ops = []
+                all_reduce = _all_reduce_with_peer(ops, [1, 0], 0)
+                with patch.object(
+                    torch.distributed, "all_reduce", side_effect=all_reduce
+                ):
+                    scheduler.decode_offload_manager.check_offload_progress()
+                    decode_drain_ops = list(ops)
+                    ops.clear()
+                    entrypoint(scheduler, req)
+
+                self.assertEqual(decode_drain_ops, [min_op])
+                self.assertEqual(ops, [min_op, max_op])
 
     def test_pd_decode_continue_releases_held_rebootstrap(self):
         """continue_generation must enqueue staged rebootstrap reqs on resume."""
