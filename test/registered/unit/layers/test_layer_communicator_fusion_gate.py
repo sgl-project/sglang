@@ -103,6 +103,58 @@ class TestPostExpertsAllReduceMerge(CustomTestCase):
         self.assertEqual(self._calls(moe_ep_size=2, moe_tp_size=2, skip=True), [])
 
 
+class TestFp4AllgatherAbsorbsPostExpertsReductions(CustomTestCase):
+    """The flashinfer cutlass FP4 path reduce-scatters expert outputs over _TP.
+
+    Its standard dispatcher all-gathers tokens and reduce-scatters the expert
+    outputs over _TP, which spans the whole EP group, so neither the EP nor the
+    TP post-experts all-reduce may follow: each rank then holds its own
+    DP-local tokens, whose counts differ across ranks.
+    """
+
+    def _calls(self, *, fp4_allgather, moe_ep_size, moe_tp_size):
+        called = []
+        # Pin the gate's other skip reasons off so only the FP4 path decides.
+        no_a2a = MagicMock()
+        no_a2a.is_flashinfer.return_value = False
+        no_a2a.is_pplx.return_value = False
+        no_a2a.is_flashinfer_megamoe.return_value = False
+        with (
+            patch.object(moe_utils, "should_skip_mlp_all_reduce", return_value=False),
+            patch.object(
+                moe_utils, "should_use_dp_reduce_scatterv", return_value=False
+            ),
+            patch.object(moe_utils, "get_moe_a2a_backend", return_value=no_a2a),
+            patch.object(
+                moe_utils,
+                "should_use_flashinfer_cutlass_moe_fp4_allgather",
+                return_value=fp4_allgather,
+            ),
+            _recorded_all_reduces(
+                called,
+                moe_ep_size=moe_ep_size,
+                moe_tp_size=moe_tp_size,
+                moe_dp_size=1,
+            ),
+            get_parallel().override(dwdp_size=1),
+        ):
+            post_experts_all_reduce(torch.zeros(2, 2))
+        return called
+
+    def test_pure_ep_issues_no_reduction(self):
+        self.assertEqual(
+            self._calls(fp4_allgather=True, moe_ep_size=4, moe_tp_size=1), []
+        )
+        self.assertEqual(
+            self._calls(fp4_allgather=False, moe_ep_size=4, moe_tp_size=1), ["ep"]
+        )
+
+    def test_pure_tp_issues_no_reduction(self):
+        self.assertEqual(
+            self._calls(fp4_allgather=True, moe_ep_size=1, moe_tp_size=4), []
+        )
+
+
 class TestDeferredPostExpertsAllReduce(CustomTestCase):
     """The inline fallback must reduce over the same peers the fused kernel would.
 
