@@ -1336,14 +1336,32 @@ class KimiK3MoE(nn.Module):
             )
 
         num_tokens, hidden_size = hidden_states.shape
-        fused = _k3_bf16_gemm(
-            hidden_states,
-            self._front_w,
-            out_dtype=torch.float32 if self._front_fp32 else None,
-        )
-        gate_up, router_logits, routed_input = torch.split(
-            fused, self._front_sizes, dim=-1
-        )
+        front_out_dtype = torch.float32 if self._front_fp32 else None
+        # Experiment (SGLANG_K3_GU_SIDE_MIN_TOKENS): leave the shared gate_up
+        # out of the front GEMM and issue it on the side stream with the rest
+        # of the shared block. The merged weight is kept; the front reads only
+        # its [gate | latent down] row slice.
+        gu_side_min = envs.SGLANG_K3_GU_SIDE_MIN_TOKENS.get()
+        if gu_side_min > 0 and num_tokens >= gu_side_min:
+            gu_rows = self._front_sizes[0]
+            fused = _k3_bf16_gemm(
+                hidden_states,
+                self._front_w[gu_rows:],
+                out_dtype=front_out_dtype,
+            )
+            router_logits, routed_input = torch.split(
+                fused, self._front_sizes[1:], dim=-1
+            )
+            gate_up = None
+        else:
+            fused = _k3_bf16_gemm(
+                hidden_states,
+                self._front_w,
+                out_dtype=front_out_dtype,
+            )
+            gate_up, router_logits, routed_input = torch.split(
+                fused, self._front_sizes, dim=-1
+            )
         if num_tokens > 1 and _is_hip and not _aiter_k3_opt:
             router_logits = router_logits.contiguous()
         if self._moe_front_needs_dense_bf16:
@@ -1384,6 +1402,12 @@ class KimiK3MoE(nn.Module):
             else:
                 self._forward_routed(hidden_states, router_logits, routed_input, latent)
             with torch.cuda.stream(self.alt_stream):
+                if gate_up is None:
+                    gate_up = _k3_bf16_gemm(
+                        hidden_states,
+                        self._front_w[: self._front_sizes[0]],
+                        out_dtype=front_out_dtype,
+                    )
                 self._forward_shared(gate_up, shared_output)
                 # low-SM pull so the side-stream AR leaves the SMs to the
                 # routed GEMMs it overlaps (K3 dims are fixed; tuned here)
@@ -1425,6 +1449,12 @@ class KimiK3MoE(nn.Module):
                     prefix_sum,
                 )
         else:  # single collective over the flat [latent | shared] pair
+            if gate_up is None:
+                gate_up = _k3_bf16_gemm(
+                    hidden_states,
+                    self._front_w[: self._front_sizes[0]],
+                    out_dtype=front_out_dtype,
+                )
             self._forward_shared(gate_up, shared_output)
             self._forward_routed(hidden_states, router_logits, routed_input, latent)
             if self.fuse_ar_norm and k3_ar_fusion.enabled():
