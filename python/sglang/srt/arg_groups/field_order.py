@@ -340,8 +340,6 @@ POSITIONAL_FIELD_ORDER = (
     "enable_mamba_cache_stochastic_rounding",
     "mamba_cache_philox_rounds",
     "mamba_full_memory_ratio",
-    "mamba_replay_tail_max",
-    "mamba_replay_tail_watermark",
     "mamba_radix_cache_strategy",
     "uses_mamba_radix_cache",
     "mamba_track_interval",

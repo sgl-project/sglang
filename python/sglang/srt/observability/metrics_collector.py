@@ -499,9 +499,10 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
         # latest reusable Mamba checkpoint whenever that state is missing or
         # evicted, re-prefilling the gap through ALL layers. These counters
         # quantify that retreat at first admission (once per request; later
-        # chunk/retract re-matches are ignored). The replay budget counters
-        # preview the acceptance rate of the tail-replay budget policy; the
-        # replay execution path itself is a follow-up.
+        # chunk/retract re-matches are ignored). They are the input for
+        # checkpoint placement/retention policy — how often matches collapse
+        # to aged checkpoints, and how far behind the full-KV hit the
+        # surviving checkpoint sits.
         self.mamba_retreat_requests_total = Counter(
             name="sglang:mamba_retreat_requests_total",
             documentation="Requests whose full-KV prefix hit extended beyond the accepted Mamba checkpoint boundary.",
@@ -520,11 +521,6 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
         self.mamba_retreat_collapse_requests_total = Counter(
             name="sglang:mamba_retreat_collapse_requests_total",
             documentation="Requests whose match collapsed to zero cached prefix while a full-KV hit existed.",
-            labelnames=labels.keys(),
-        )
-        self.mamba_replay_would_admit_total = Counter(
-            name="sglang:mamba_replay_would_admit_total",
-            documentation="Retreated requests that satisfy the tail-replay budget (--mamba-replay-tail-max / watermark). Policy preview; replay path lands in a follow-up.",
             labelnames=labels.keys(),
         )
         self.mamba_retreat_gap_histogram = Histogram(
@@ -1320,7 +1316,6 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
         gap_tokens: int,
         reprefill_tokens: int,
         collapsed: bool,
-        replay_admitted: bool,
     ) -> None:
         """Account one first-admission Mamba/GDN retreat event (RFC #40865)."""
         self.mamba_retreat_requests_total.labels(**self.labels).inc()
@@ -1331,8 +1326,6 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
         self.mamba_retreat_gap_histogram.labels(**self.labels).observe(gap_tokens)
         if collapsed:
             self.mamba_retreat_collapse_requests_total.labels(**self.labels).inc()
-        if replay_admitted:
-            self.mamba_replay_would_admit_total.labels(**self.labels).inc()
 
     def increment_decode_cuda_graph_pass(self, value: bool) -> None:
         mode = "decode_cuda_graph" if value else "decode_none"
