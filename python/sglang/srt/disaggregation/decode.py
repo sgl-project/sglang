@@ -2738,6 +2738,10 @@ class SchedulerDisaggregationDecodeMixin:
             self.process_batch_result(tmp_batch, tmp_result)
 
         while True:
+            # Restore a Decode batch before request intake so an abort that
+            # arrives immediately after replay can still find that request in
+            # running_batch.
+            self._finish_dsv41_overlap_replay()
             # Pending rooms from the prior cycle can overlap request intake and
             # the tail of the in-flight decode graph.
             if not self._engine_paused:
@@ -2789,6 +2793,38 @@ class SchedulerDisaggregationDecodeMixin:
 
             # Update last_batch
             self.last_batch = batch
+
+    def _finish_dsv41_overlap_replay(self: Scheduler) -> None:
+        """Commit an isolated replay before restoring its paused Decode batch.
+
+        Cache-only replay is an EXTEND forward and cannot share one model
+        forward with existing Decode requests.  The overlap loop can still
+        pipeline that replay behind the preceding Decode forward, but the next
+        scheduling decision must first commit the replay result and merge the
+        suspended requests back.  Otherwise the replay batch becomes the sole
+        running batch and the suspended Decode requests are lost indefinitely.
+        """
+        if getattr(self, "dsv41_suspended_decode_batch", None) is None:
+            return
+
+        if (
+            self.last_batch is None
+            or not self.last_batch.dsv41_cache_only_replay
+            or len(self.result_queue) != 1
+        ):
+            raise RuntimeError(
+                "cache-only overlap replay lost its single pending result"
+            )
+
+        replay_batch, replay_result = self.result_queue.popleft()
+        if not replay_batch.dsv41_cache_only_replay:
+            raise RuntimeError("cache-only overlap replay result lost its marker")
+        self.process_batch_result(replay_batch, replay_result)
+        self.running_batch = self._restore_dsv41_suspended_decode_batch(
+            self.running_batch
+        )
+        # The pending result was consumed before the next schedule decision.
+        self.last_batch = None
 
     def _run_batch_prebuilt(
         self: Scheduler, batch: ScheduleBatch

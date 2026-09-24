@@ -2,6 +2,7 @@ import json
 import sys
 import threading
 import unittest
+from collections import deque
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -977,6 +978,126 @@ class TestDecodePrebuilt(unittest.TestCase):
         scheduler.update_running_batch.assert_called_once_with(replay)
         self.assertIs(second.batch_to_run, updated)
         self.assertIs(second.running_batch, updated)
+        self.assertIsNone(scheduler.dsv41_suspended_decode_batch)
+
+    def test_overlap_commits_replay_before_restoring_running_decode(self):
+        scheduler = self._new_scheduler(enable_overlap=True)
+        suspended = MagicMock(name="suspended")
+        suspended.is_empty.return_value = False
+        replay = MagicMock(name="replay")
+        replay.is_empty.return_value = False
+        replay.dsv41_cache_only_replay = True
+        replay_result = MagicMock(name="replay_result")
+        scheduler.running_batch = replay
+        scheduler.last_batch = replay
+        scheduler.dsv41_suspended_decode_batch = suspended
+        scheduler.result_queue = deque([(replay.copy(), replay_result)])
+        copied_replay = scheduler.result_queue[0][0]
+        copied_replay.dsv41_cache_only_replay = True
+        call_order = []
+        scheduler.process_batch_result = MagicMock(
+            side_effect=lambda *_: call_order.append("process")
+        )
+        replay.merge_batch.side_effect = lambda *_: call_order.append("restore")
+
+        SchedulerDisaggregationDecodeMixin._finish_dsv41_overlap_replay(scheduler)
+
+        scheduler.process_batch_result.assert_called_once_with(
+            copied_replay, replay_result
+        )
+        replay.merge_batch.assert_called_once_with(suspended)
+        self.assertEqual(call_order, ["process", "restore"])
+        self.assertIs(scheduler.running_batch, replay)
+        self.assertIsNone(scheduler.last_batch)
+        self.assertEqual(list(scheduler.result_queue), [])
+        self.assertIsNone(scheduler.dsv41_suspended_decode_batch)
+
+    def test_overlap_replay_requires_exactly_one_pending_result(self):
+        scheduler = self._new_scheduler(enable_overlap=True)
+        replay = MagicMock(name="replay")
+        replay.dsv41_cache_only_replay = True
+        scheduler.running_batch = replay
+        scheduler.last_batch = replay
+        scheduler.dsv41_suspended_decode_batch = MagicMock(name="suspended")
+        scheduler.result_queue = deque()
+
+        with self.assertRaisesRegex(
+            RuntimeError, "cache-only overlap replay lost its single pending result"
+        ):
+            SchedulerDisaggregationDecodeMixin._finish_dsv41_overlap_replay(scheduler)
+
+    def test_overlap_loop_restores_replay_before_next_queue_pass(self):
+        scheduler = self._new_scheduler(enable_overlap=True)
+        suspended = MagicMock(name="suspended")
+        suspended.is_empty.return_value = False
+        replay = MagicMock(name="replay")
+        replay.is_empty.return_value = False
+        replay.dsv41_cache_only_replay = True
+        replay_copy = MagicMock(name="replay_copy")
+        replay_copy.dsv41_cache_only_replay = True
+        replay.copy.return_value = replay_copy
+        replay_result = MagicMock(name="replay_result")
+
+        scheduler._engine_paused = False
+        scheduler._sched_idled = False
+        scheduler.running_batch = suspended
+        scheduler.last_batch = None
+        scheduler.dsv41_suspended_decode_batch = None
+        scheduler.disagg_decode_prealloc_queue = SimpleNamespace(
+            prefetch_prefill_dp_rank_queries=MagicMock()
+        )
+
+        def ingest():
+            call_order.append("ingest")
+            if call_order.count("ingest") == 3:
+                raise StopIteration
+
+        scheduler.ingest_requests = MagicMock(side_effect=ingest)
+        call_order = []
+        scheduler.process_decode_queue = MagicMock(
+            side_effect=lambda: call_order.append("queue")
+        )
+        scheduler.ngram_embedding_manager = SimpleNamespace(
+            prepare_for_forward=lambda batch, chunked_req: batch
+        )
+        scheduler.chunked_req = None
+
+        plan_count = 0
+
+        def get_next(*, running_batch):
+            nonlocal plan_count
+            plan_count += 1
+            if plan_count == 1:
+                self.assertIs(running_batch, suspended)
+                scheduler.dsv41_suspended_decode_batch = suspended
+                return SimpleNamespace(batch_to_run=replay, running_batch=replay)
+            self.assertIs(running_batch, replay)
+            return SimpleNamespace(batch_to_run=None, running_batch=replay)
+
+        scheduler.get_next_disagg_decode_batch_to_run = get_next
+        scheduler.is_disable_overlap_for_batch = MagicMock(return_value=False)
+        scheduler.run_batch = MagicMock(return_value=replay_result)
+        scheduler._apply_war_barrier = MagicMock()
+        scheduler.process_batch_result = MagicMock(
+            side_effect=lambda *_: call_order.append("process")
+        )
+        replay.merge_batch.side_effect = lambda *_: call_order.append("restore")
+        scheduler.launch_batch_sample_if_needed = MagicMock()
+        scheduler.on_idle = MagicMock()
+
+        with self.assertRaises(StopIteration):
+            SchedulerDisaggregationDecodeMixin.event_loop_overlap_disagg_decode(
+                scheduler
+            )
+
+        self.assertEqual(
+            call_order,
+            ["ingest", "queue", "process", "restore", "ingest", "queue", "ingest"],
+        )
+        scheduler.process_batch_result.assert_called_once_with(
+            replay_copy, replay_result
+        )
+        replay.merge_batch.assert_called_once_with(suspended)
         self.assertIsNone(scheduler.dsv41_suspended_decode_batch)
 
     def test_finished_cache_only_replay_does_not_block_next_admission(self):
