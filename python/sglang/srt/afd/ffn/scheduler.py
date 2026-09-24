@@ -25,6 +25,7 @@ from sglang.srt.afd.ffn.compute import AFDFFNCompute
 from sglang.srt.afd.ffn.executor import AFDFFNExecutor
 from sglang.srt.afd.scheduler_common import (
     build_local_handshake_info,
+    gather_nvshmem_topology,
     init_afd_comm_backend,
     should_log_step,
 )
@@ -185,7 +186,7 @@ def _log_ffn_step(session: _AFDFFNSession, compute, msg: AFDSyncMsg, rank: int) 
         and msg.wire_capacity > 0
         and not msg.child_wire_capacities
     ):
-        if msg.communication_graph:
+        if backend.decode_transport is not None or msg.communication_graph:
             graph_capacity = session.ffn_graph_variants.get(msg.wire_capacity)
         elif not session.plan.enabled:
             graph_capacity = compute.graph_capacity_for(msg.wire_capacity)
@@ -249,11 +250,15 @@ def event_loop_afd_ffn(scheduler: Scheduler) -> None:
     num_sessions = get_disagg().afd_attn_instances
     compute = scheduler.afd_ffn_compute
 
+    rank_node_ids, fabric_keys = gather_nvshmem_topology(scheduler)
+
     # Negotiate shared capacity before any session captures graphs.
     if is_rank0:
         local_info = build_local_handshake_info(
             scheduler,
             AFDRole.FFN,
+            rank_node_ids,
+            fabric_keys,
         )
         handshake_server = AFDHandshakeServer(afd_handshake_port(get_serving().port))
         try:

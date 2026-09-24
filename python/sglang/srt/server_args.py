@@ -3309,7 +3309,7 @@ class ServerArgs:
         NS("disagg"),
     ] = None
     afd_backend: A[
-        Literal["nccl"],
+        Literal["nccl", "nvshmem"],
         "The AFD data-plane backend for transferring routed expert tensors.",
         NS("disagg"),
     ] = "nccl"
@@ -3329,8 +3329,8 @@ class ServerArgs:
     afd_comm_sm_budget: A[
         Optional[int],
         Arg(
-            help="F-side SM budget reserved for NCCL communication during AFD "
-            "decode microbatch overlap. Defaults to 8.",
+            help="F-side SM budget reserved for communication during AFD "
+            "decode microbatch overlap. Defaults to 8 for NCCL and 2 for NVSHMEM.",
             resolvable=True,
         ),
         NS("disagg"),

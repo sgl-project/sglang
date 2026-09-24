@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Iterable, NamedTuple
 
@@ -73,6 +74,7 @@ class AFDFFNExecutor:
         handshake: AFDHandshakeResult,
     ):
         self._comm = comm
+        self._decode_transport = comm.decode_transport
         self._session_id = handshake.session_id
         self._compute = compute
         self._device = torch.device(self._comm.config.device)
@@ -93,7 +95,12 @@ class AFDFFNExecutor:
         self._communication_stream = (
             torch.cuda.Stream(device=self._device) if staged_overlap else None
         )
-        self._response_stream = self._communication_stream
+        # NVSHMEM request and response signals can progress independently.
+        self._response_stream = (
+            torch.cuda.Stream(device=self._device)
+            if staged_overlap and self._decode_transport is not None
+            else self._communication_stream
+        )
         self._request_ready = [
             torch.cuda.Event()
             for _ in range(self._decode_num_microbatches if staged_overlap else 0)
@@ -133,7 +140,8 @@ class AFDFFNExecutor:
                 total_num_sms=total_num_sms,
                 overlap_sm_budget=overlap_sm_budget,
             )
-            self._compute._graph_compute_num_sms = self._compute_num_sms
+            if self._decode_transport is None:
+                self._compute._graph_compute_num_sms = self._compute_num_sms
             if self._rank == 0:
                 logger.info(
                     "AFD ffn overlap SM partition: backend=%s compute=%d "
@@ -150,9 +158,15 @@ class AFDFFNExecutor:
             decode_token_buckets = [
                 capacity * source_count for capacity in decode_token_buckets
             ]
-        decode_pool_token_buckets = sorted(
-            set(decode_token_buckets) | set(handshake.local.decode_graph_token_buckets)
-        )
+        decode_pool_token_buckets = decode_token_buckets
+        if self._decode_transport is None:
+            decode_pool_token_buckets = sorted(
+                set(decode_token_buckets)
+                | set(handshake.local.decode_graph_token_buckets)
+            )
+        decode_pool_transport = self._decode_transport
+        if self._scattered and len(self._attn_ranks) > 1:
+            decode_pool_transport = None
         self._decode_pool = AFDFixedBufferPool(
             layers=self._layers,
             token_buckets=decode_pool_token_buckets,
@@ -161,6 +175,7 @@ class AFDFFNExecutor:
             role="ffn",
             with_router_logits=True,
             num_slots=self._decode_num_microbatches,
+            decode_transport=decode_pool_transport,
         )
 
         logger.info(
@@ -176,42 +191,99 @@ class AFDFFNExecutor:
             self._dtype,
         )
 
-    def capture_communication_graphs(self, plan: AFDGraphCapturePlan) -> None:
+    def capture_communication_graphs(
+        self,
+        plan: AFDGraphCapturePlan,
+    ) -> None:
         if not plan.enabled:
             return
-        attn_phase = [
-            (
-                tuple(variant.child_wire_capacities),
-                tuple(
+
+        ffn_variants = dict(plan.ffn_graph_variants)
+        attn_phase: list[tuple[tuple[int, ...], tuple[int, ...] | None]] = []
+        for variant in plan.attn_graph_variants:
+            compute_capacities = (
+                None
+                if None in variant.child_compute_capacities
+                else tuple(
                     capacity
                     for capacity in variant.child_compute_capacities
                     if capacity is not None
-                ),
+                )
             )
-            for variant in plan.attn_graph_variants
-        ]
+            attn_phase.append(
+                (
+                    tuple(variant.child_wire_capacities),
+                    compute_capacities,
+                )
+            )
+
         graph_compute_capacities = [
             capacity
             for _, compute_capacities in attn_phase
+            if compute_capacities is not None
             for capacity in compute_capacities
         ]
+        graph_compute_capacities.extend(ffn_variants.values())
         if self._rank == 0:
             logger.info(
-                "Capture AFD ffn communication graphs begin: wire_to_compute=%s",
+                "Capture AFD ffn communication graphs begin: "
+                "attn_variants=%s wire_to_compute=%s",
+                [
+                    (
+                        variant.attn_batch_size,
+                        variant.child_wire_capacities,
+                        variant.child_compute_capacities,
+                    )
+                    for variant in plan.attn_graph_variants
+                ],
                 list(plan.ffn_graph_variants),
             )
-        self._compute._prepare_graph_capture(max(graph_compute_capacities))
-        self._decode_step_graph = _AFDFFNDecodeStepGraph(
-            self._compute,
-            self._run_integrated_graph_step,
-        )
-        self._comm.startup_barrier()
-        self._capture_variants(attn_phase)
-        self._comm.startup_barrier()
-        if self._rank == 0:
-            logger.info(
-                "AFD ffn communication graphs ready: full_steps=%d", len(attn_phase)
+        if graph_compute_capacities:
+            self._compute._prepare_graph_capture(max(graph_compute_capacities))
+            self._decode_step_graph = _AFDFFNDecodeStepGraph(
+                self._compute,
+                self._run_integrated_graph_step,
             )
+
+        temporary_graphs: list[torch.cuda.CUDAGraph] = []
+        self._comm.startup_barrier()
+        temporary_graphs.extend(self._capture_variants(attn_phase))
+        self._comm.startup_barrier()
+
+        full_steps = sum(
+            compute_capacities is not None for _, compute_capacities in attn_phase
+        )
+
+        if self._decode_transport is None:
+            logger.info(
+                "AFD ffn communication graphs ready: full_steps=%d attn_participants=0",
+                full_steps,
+            )
+            return
+
+        attn_capacities = {
+            wire_capacities[0]
+            for wire_capacities, _ in attn_phase
+            if len(wire_capacities) == 1
+        }
+        ffn_only_phase = [
+            ((wire_capacity,), (compute_capacity,))
+            for wire_capacity, compute_capacity in plan.ffn_graph_variants
+            if wire_capacity not in attn_capacities
+        ]
+        temporary_graphs.extend(self._capture_variants(ffn_only_phase))
+        full_steps += len(ffn_only_phase)
+        self._comm.startup_barrier()
+
+        helper = self._capture_wait_helper()
+        self._decode_transport.install_wait_helper(helper)
+        self._comm.startup_barrier()
+
+        logger.info(
+            "AFD ffn communication graphs ready: full_steps=%d attn_participants=%d",
+            full_steps,
+            len(temporary_graphs),
+        )
 
     def _decode_source_segments(
         self, edge_wire_capacity: int
@@ -238,6 +310,27 @@ class AFDFFNExecutor:
                     peer_global_rank,
                 )
 
+    def _copy_decode_inputs(
+        self,
+        layer_id: int,
+        source_segments: tuple[_SourceSegment, ...],
+        hidden_states: torch.Tensor,
+        topk_ids: torch.Tensor,
+        topk_weights: torch.Tensor,
+        *,
+        slot_id: int = 0,
+    ) -> None:
+        for peer_global_rank, capacity, rows in source_segments:
+            views = self._decode_transport.decode_views(
+                layer_id,
+                capacity,
+                slot_id=slot_id,
+                peer_global_rank=peer_global_rank,
+            )
+            hidden_states[rows].copy_(views.hidden_states)
+            topk_ids[rows].copy_(views.topk_ids)
+            topk_weights[rows].copy_(views.topk_weights)
+
     def _run_integrated_graph_step(
         self,
         wire_capacities: tuple[int, ...],
@@ -245,15 +338,24 @@ class AFDFFNExecutor:
     ) -> None:
         if len(wire_capacities) > 1:
             children = self._prepare_decode_children_for_capacities(wire_capacities)
-            self._run_overlap_step(0, children, compute_capacities)
+            self._run_overlap_step(
+                step_id=0,
+                children=children,
+                child_compute_capacities=compute_capacities,
+            )
             return
+
         edge_wire_capacity = wire_capacities[0]
         compute_capacity = compute_capacities[0]
         source_segments = self._decode_source_segments(edge_wire_capacity)
         source_count = len(source_segments)
         wire_capacity = source_count * edge_wire_capacity
         staging_capacity = max(source_count, 1) * edge_wire_capacity
-        direct_nccl_io = source_count == 1 and wire_capacity <= compute_capacity
+        direct_nccl_io = (
+            self._decode_transport is None
+            and source_count == 1
+            and wire_capacity <= compute_capacity
+        )
         work_capacity = compute_capacity if direct_nccl_io else staging_capacity
         for layer_index, layer in enumerate(self._layers):
             work = self._decode_pool.acquire(
@@ -263,12 +365,24 @@ class AFDFFNExecutor:
                 capacity=work_capacity,
                 input_tokens=wire_capacity,
             )
-            self._recv_source_inputs(
-                source_segments,
-                work.hidden_states,
-                work.topk_ids,
-                work.topk_weights,
-            )
+            if self._decode_transport is not None:
+                self._decode_transport.launch_wait_request()
+                if source_count > 1:
+                    self._copy_decode_inputs(
+                        layer.layer_id,
+                        source_segments,
+                        work.hidden_states,
+                        work.topk_ids,
+                        work.topk_weights,
+                        slot_id=0,
+                    )
+            else:
+                self._recv_source_inputs(
+                    source_segments,
+                    work.hidden_states,
+                    work.topk_ids,
+                    work.topk_weights,
+                )
             input_capacity = compute_capacity if direct_nccl_io else wire_capacity
             output = self._compute.run_integrated_layer(
                 layer_index,
@@ -279,41 +393,116 @@ class AFDFFNExecutor:
                 compute_capacity,
                 stage_inputs=not direct_nccl_io,
             )
-            if direct_nccl_io and output.is_contiguous():
-                peer_global_rank, capacity, _ = source_segments[0]
-                self._comm.send_to(
-                    [output[:capacity]],
-                    peer_global_rank,
-                )
-                self._decode_pool.release(work)
-                continue
-            work.output[:wire_capacity].copy_(output[:wire_capacity])
-            for peer_global_rank, capacity, rows in source_segments:
-                self._comm.send_to(
-                    [work.output[rows]],
-                    peer_global_rank,
-                )
+            if self._decode_transport is not None:
+                if source_count == 1:
+                    peer_global_rank, capacity, _ = source_segments[0]
+                    work.output.copy_(output[:capacity])
+                    self._decode_transport.put_response(
+                        layer.layer_id,
+                        capacity,
+                        peer_global_rank=peer_global_rank,
+                    )
+                elif source_segments:
+                    for peer_global_rank, capacity, rows in source_segments:
+                        views = self._decode_transport.decode_views(
+                            layer.layer_id,
+                            capacity,
+                            peer_global_rank=peer_global_rank,
+                        )
+                        views.output.copy_(output[rows])
+                        self._decode_transport.put_response(
+                            layer.layer_id,
+                            capacity,
+                            peer_global_rank=peer_global_rank,
+                        )
+            else:
+                if direct_nccl_io and output.is_contiguous():
+                    peer_global_rank, capacity, _ = source_segments[0]
+                    self._comm.send_to(
+                        [output[:capacity]],
+                        peer_global_rank,
+                    )
+                    self._decode_pool.release(work)
+                    continue
+                work.output[:wire_capacity].copy_(output[:wire_capacity])
+                for peer_global_rank, capacity, rows in source_segments:
+                    self._comm.send_to(
+                        [work.output[rows]],
+                        peer_global_rank,
+                    )
             self._decode_pool.release(work)
 
     def _capture_variants(
         self,
-        variants: list[tuple[tuple[int, ...], tuple[int, ...]]],
-    ) -> None:
-        assert self._decode_step_graph is not None
+        variants: list[tuple[tuple[int, ...], tuple[int, ...] | None]],
+    ) -> list[torch.cuda.CUDAGraph]:
+        if not variants:
+            return []
+
+        temporary_graphs: list[torch.cuda.CUDAGraph] = []
+        graph_session = (
+            self._decode_step_graph.capture_session
+            if self._decode_step_graph is not None
+            else None
+        )
         with (
             torch.inference_mode(),
             model_capture_mode(),
             freeze_gc(self._compute.enable_cudagraph_gc),
             graph_capture() as ctx,
         ):
-            with self._decode_step_graph.capture_session(ctx.stream):
+            session = (
+                graph_session(ctx.stream)
+                if graph_session is not None
+                else nullcontext()
+            )
+            with session:
                 for wire_capacities, compute_capacities in variants:
-                    self._decode_step_graph.capture_variant(
-                        wire_capacities,
-                        compute_capacities,
-                    )
+                    if compute_capacities is None:
+                        (wire_capacity,) = wire_capacities
+                        temporary_graphs.append(
+                            self._capture_wait_participant(
+                                wire_capacity,
+                                ctx.stream,
+                            )
+                        )
+                    else:
+                        assert self._decode_step_graph is not None
+                        self._decode_step_graph.capture_variant(
+                            wire_capacities,
+                            compute_capacities,
+                        )
+
         self._device_module.synchronize()
         self._tp_group.barrier()
+        return temporary_graphs
+
+    def _capture_wait_participant(
+        self,
+        wire_capacity: int,
+        stream: torch.cuda.Stream,
+    ) -> torch.cuda.CUDAGraph:
+        set_is_extend_in_batch(False)
+        for _ in range(2):
+            self._device_module.synchronize()
+            self._tp_group.barrier()
+            self._run_nvshmem_eager_step(
+                step_id=0,
+                source_segments=self._decode_source_segments(wire_capacity),
+            )
+        assert self._decode_transport is not None
+        return self._decode_transport.capture_wait_graph(
+            len(self._layers),
+            stream,
+        )
+
+    def _capture_wait_helper(self) -> torch.cuda.CUDAGraph:
+        assert self._decode_transport is not None
+        with graph_capture() as ctx:
+            helper = self._decode_transport.capture_wait_graph(1, ctx.stream)
+        self._device_module.synchronize()
+        self._tp_group.barrier()
+        return helper
 
     def run_step(self, msg: AFDSyncMsg) -> None:
         dp_capacity = self._dp_capacity(msg)
@@ -388,17 +577,28 @@ class AFDFFNExecutor:
                 self._run_overlap_step(msg.step_id, decode_children)
             return
 
-        if fixed_shape and msg.communication_graph:
+        if fixed_shape and (
+            msg.communication_graph or self._decode_transport is not None
+        ):
             with torch.inference_mode():
                 if (
                     self._decode_step_graph is not None
                     and self._decode_step_graph.replay((msg.wire_capacity,))
                 ):
                     return
-                raise RuntimeError(
-                    "AFD ffn has no communication graph for wire capacity "
-                    f"{msg.wire_capacity}"
+                if self._decode_transport is None:
+                    raise RuntimeError(
+                        "AFD ffn has no communication graph for wire capacity "
+                        f"{msg.wire_capacity}"
+                    )
+
+        if fixed_shape and self._decode_transport is not None:
+            with torch.inference_mode():
+                self._run_nvshmem_eager_step(
+                    step_id=msg.step_id,
+                    source_segments=source_segments,
                 )
+            return
 
         with torch.inference_mode():
             self._run_eager_step(
@@ -548,12 +748,24 @@ class AFDFFNExecutor:
         request_stream: torch.cuda.Stream,
     ) -> None:
         with torch.cuda.stream(request_stream):
-            self._recv_source_inputs(
-                child.source_segments,
-                work.hidden_states,
-                work.topk_ids,
-                work.topk_weights,
-            )
+            if self._decode_transport is not None:
+                self._decode_transport.launch_wait_request(slot_id=child.slot_id)
+                if len(child.source_segments) > 1:
+                    self._copy_decode_inputs(
+                        layer_id,
+                        child.source_segments,
+                        work.hidden_states,
+                        work.topk_ids,
+                        work.topk_weights,
+                        slot_id=child.slot_id,
+                    )
+            else:
+                self._recv_source_inputs(
+                    child.source_segments,
+                    work.hidden_states,
+                    work.topk_ids,
+                    work.topk_weights,
+                )
             self._request_ready[child.slot_id].record(request_stream)
 
     def _run_overlap_step(
@@ -581,6 +793,8 @@ class AFDFFNExecutor:
         request_stream = self._communication_stream
         response_stream = self._response_stream
         request_stream.wait_stream(compute_stream)
+        if response_stream is not request_stream:
+            response_stream.wait_stream(compute_stream)
         num_children = len(children)
         if num_children <= 1 or num_children != self._decode_num_microbatches:
             raise RuntimeError(
@@ -589,7 +803,8 @@ class AFDFFNExecutor:
                 f"configured={self._decode_num_microbatches}"
             )
         direct_integrated_inputs = tuple(
-            len(child.source_segments) == 1
+            self._decode_transport is None
+            and len(child.source_segments) == 1
             and child_compute_capacities is not None
             and child.local_wire_capacity <= child_compute_capacities[child_index]
             for child_index, child in enumerate(children)
@@ -658,34 +873,54 @@ class AFDFFNExecutor:
                 output.record_stream(response_stream)
                 with torch.cuda.stream(response_stream):
                     response_stream.wait_event(self._response_ready[child.slot_id])
-                    direct_output = (
-                        len(child.source_segments) == 1 and output.is_contiguous()
-                    )
-                    if direct_output:
-                        peer_global_rank, capacity, _ = child.source_segments[0]
-                        response_output = output[:capacity]
-                        self._compute.finalize_deferred_output_in_place(
-                            layer_index, response_output
-                        )
-                        self._comm.send_to(
-                            [response_output],
-                            peer_global_rank,
-                        )
+                    if self._decode_transport is not None:
+                        for peer_global_rank, capacity, rows in child.source_segments:
+                            views = self._decode_transport.decode_views(
+                                layer.layer_id,
+                                capacity,
+                                slot_id=child.slot_id,
+                                peer_global_rank=peer_global_rank,
+                            )
+                            self._compute.stage_deferred_output(
+                                layer_index,
+                                views.output,
+                                output[rows],
+                            )
+                            self._decode_transport.put_response(
+                                layer.layer_id,
+                                capacity,
+                                slot_id=child.slot_id,
+                                peer_global_rank=peer_global_rank,
+                            )
                     else:
-                        self._compute.stage_deferred_output(
-                            layer_index,
-                            work.output[: child.local_wire_capacity],
-                            output[: child.local_wire_capacity],
+                        direct_output = (
+                            len(child.source_segments) == 1 and output.is_contiguous()
                         )
-                        for (
-                            peer_global_rank,
-                            capacity,
-                            rows,
-                        ) in child.source_segments:
+                        if direct_output:
+                            peer_global_rank, capacity, _ = child.source_segments[0]
+                            response_output = output[:capacity]
+                            self._compute.finalize_deferred_output_in_place(
+                                layer_index, response_output
+                            )
                             self._comm.send_to(
-                                [work.output[rows]],
+                                [response_output],
                                 peer_global_rank,
                             )
+                        else:
+                            self._compute.stage_deferred_output(
+                                layer_index,
+                                work.output[: child.local_wire_capacity],
+                                output[: child.local_wire_capacity],
+                            )
+                            for (
+                                peer_global_rank,
+                                capacity,
+                                rows,
+                            ) in child.source_segments:
+                                self._comm.send_to(
+                                    [work.output[rows]],
+                                    peer_global_rank,
+                                )
                 self._decode_pool.release(work)
 
                 next_layer_index = layer_index + 1
@@ -714,6 +949,87 @@ class AFDFFNExecutor:
                 slot_work[child_index] = next_work
 
         compute_stream.wait_stream(request_stream)
+        if response_stream is not request_stream:
+            compute_stream.wait_stream(response_stream)
+
+    def _run_nvshmem_eager_step(
+        self,
+        step_id: int,
+        source_segments: tuple[_SourceSegment, ...],
+    ) -> None:
+        assert self._decode_transport is not None
+        wire_capacity = sum(segment.capacity for segment in source_segments)
+        for layer_index, layer in enumerate(self._layers):
+            work = None
+            if wire_capacity > 0:
+                work = self._decode_pool.acquire(
+                    slot_id=0,
+                    layer_id=layer.layer_id,
+                    generation=afd_work_generation(step_id, layer_index),
+                    capacity=wire_capacity,
+                    input_tokens=wire_capacity,
+                )
+                hidden_states = work.hidden_states
+                topk_ids = work.topk_ids
+                topk_weights = work.topk_weights
+                if work.router_logits is None:
+                    raise RuntimeError("AFD ffn slot has no router logits buffer")
+                router_logits = work.router_logits
+            else:
+                hidden_states, topk_ids, topk_weights = self._make_request_buffers(
+                    layer, 0
+                )
+                router_logits = torch.empty(
+                    (0, layer.num_experts),
+                    dtype=torch.float32,
+                    device=self._device,
+                )
+
+            self._decode_transport.wait_request()
+            if len(source_segments) > 1:
+                self._copy_decode_inputs(
+                    layer.layer_id,
+                    source_segments,
+                    hidden_states,
+                    topk_ids,
+                    topk_weights,
+                    slot_id=0,
+                )
+
+            output = self._compute.run(
+                layer_index,
+                hidden_states,
+                topk_ids,
+                topk_weights,
+                router_logits,
+                allow_graph=self._decode_step_graph is None,
+            )
+
+            if len(source_segments) == 1:
+                peer_global_rank, capacity, _ = source_segments[0]
+                assert work is not None
+                work.output.copy_(output)
+                self._decode_transport.put_response(
+                    layer.layer_id,
+                    capacity,
+                    peer_global_rank=peer_global_rank,
+                )
+            elif source_segments:
+                for peer_global_rank, capacity, rows in source_segments:
+                    views = self._decode_transport.decode_views(
+                        layer.layer_id,
+                        capacity,
+                        peer_global_rank=peer_global_rank,
+                    )
+                    views.output.copy_(output[rows])
+                    self._decode_transport.put_response(
+                        layer.layer_id,
+                        capacity,
+                        peer_global_rank=peer_global_rank,
+                    )
+
+            if work is not None:
+                self._decode_pool.release(work)
 
     def _dp_capacity(self, msg: AFDSyncMsg) -> int:
         num_attn_ranks = self._comm.config.num_attn_ranks

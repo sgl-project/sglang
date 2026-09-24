@@ -333,7 +333,7 @@ def _check_comm_sm_budget_args(
         declare_resolution(
             server_args,
             "_check_comm_sm_budget_args",
-            afd_comm_sm_budget=8,
+            afd_comm_sm_budget={"nccl": 8, "nvshmem": 2}[cfg.afd_backend],
         )
     elif budget <= 0:
         raise ValueError("--afd-comm-sm-budget must be positive")

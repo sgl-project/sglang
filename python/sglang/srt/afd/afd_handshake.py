@@ -27,6 +27,7 @@ AFD_HANDSHAKE_PORT_DELTA = 300
 SYNC_PORT_OFFSET = 1
 DIST_PORT_OFFSET = 2
 SESSION_PORT_STRIDE = 2
+_NVSHMEM_REMOTE_TRANSPORTS = frozenset({"none", "ibgda"})
 
 
 @dataclass
@@ -34,6 +35,7 @@ class AFDHandshakeInfo:
     role: str
     model_identity: str
     num_ranks: int
+    rank_node_ids: list[str] = field(repr=False)
     afd_backend: str
     afd_ffn_moe_backend: str
     wire_dtype: str
@@ -45,6 +47,10 @@ class AFDHandshakeInfo:
     disable_cuda_graph_padding: bool = False
     decode_num_microbatches: int = 1
     afd_comm_sm_budget: int | None = None
+    rank_nvshmem_fabric_keys: list[tuple[bytes, int] | None] = field(
+        default_factory=list, repr=False
+    )
+    nvshmem_remote_transport: str | None = field(default=None, repr=False)
 
 
 class _HandshakeRequest(msgspec.Struct, tag="request", forbid_unknown_fields=True):
@@ -57,7 +63,9 @@ class _HandshakeReply(msgspec.Struct, tag="reply", forbid_unknown_fields=True):
     dist_host: str
     sync_port: int
     dist_port: int
+    nvshmem_uid: bytes | None = None
     session_id: int = 0
+    attn_members: tuple[AFDHandshakeInfo, ...] | None = None
 
 
 class _HandshakeError(msgspec.Struct, tag="error", forbid_unknown_fields=True):
@@ -75,7 +83,35 @@ class AFDHandshakeResult:
     dist_host: str
     sync_port: int
     dist_port: int
+    nvshmem_uid: bytes | None = None
     session_id: int = 0
+    attn_members: tuple[AFDHandshakeInfo, ...] | None = None
+
+
+def select_nvshmem_remote_transport(
+    ffn: AFDHandshakeInfo,
+    attn_members: tuple[AFDHandshakeInfo, ...],
+) -> str:
+    members = (ffn, *attn_members)
+    node_ids = {node_id for info in members for node_id in info.rank_node_ids}
+    if len(node_ids) <= 1:
+        return "none"
+
+    fabric_keys = [
+        fabric_key for info in members for fabric_key in info.rank_nvshmem_fabric_keys
+    ]
+    has_complete_fabric_topology = all(
+        len(info.rank_nvshmem_fabric_keys) == info.num_ranks for info in members
+    )
+    common_fabric_key = fabric_keys[0] if fabric_keys else None
+    if (
+        has_complete_fabric_topology
+        and common_fabric_key is not None
+        and any(common_fabric_key[0])
+        and all(fabric_key == common_fabric_key for fabric_key in fabric_keys)
+    ):
+        return "none"
+    return "ibgda"
 
 
 @dataclass(frozen=True)
@@ -268,7 +304,11 @@ def build_afd_graph_capture_plan(
             if capacity // wire_token_multiplier < attn.decode_num_microbatches
         )
     else:
-        candidate_capacities = attn_graph_capacities
+        candidate_capacities = (
+            tuple(sorted(set(attn.decode_token_buckets), reverse=True))
+            if attn.afd_backend == "nvshmem"
+            else attn_graph_capacities
+        )
     missing_capacities: list[tuple[int, int]] = []
     ffn_capacity_by_wire: dict[int, int] = {}
     for wire_capacity in candidate_capacities:
@@ -422,6 +462,33 @@ def _check_compatible(local: AFDHandshakeInfo, peer: AFDHandshakeInfo) -> None:
     _check_moe_layers_compatible(attn.moe_layers, ffn.moe_layers)
 
 
+def _get_nvshmem_unique_id(remote_transport: str) -> bytes:
+    from afd_nvshmem import get_unique_id
+
+    unique_id = get_unique_id(remote_transport=remote_transport)
+    if not isinstance(unique_id, bytes) or not unique_id:
+        raise RuntimeError("afd-nvshmem returned an invalid unique ID")
+    return unique_id
+
+
+def _check_nvshmem_config(
+    backend: str,
+    unique_id: bytes | None,
+    remote_transport: str | None,
+) -> None:
+    if backend == "nvshmem":
+        if not isinstance(unique_id, bytes) or not unique_id:
+            raise RuntimeError("AFD handshake: nvshmem backend requires a unique ID")
+        if remote_transport not in _NVSHMEM_REMOTE_TRANSPORTS:
+            raise RuntimeError(
+                "AFD handshake: nvshmem backend requires a valid remote transport"
+            )
+    elif unique_id is not None or remote_transport is not None:
+        raise RuntimeError(
+            f"AFD handshake: backend {backend!r} returned unexpected NVSHMEM state"
+        )
+
+
 def _check_moe_layers_compatible(attn: list[dict], ffn: list[dict]) -> None:
     if len(attn) != len(ffn):
         raise RuntimeError(
@@ -478,13 +545,21 @@ def run_handshake_attn(ffn_addr: str, local: AFDHandshakeInfo) -> AFDHandshakeRe
             raise RuntimeError(f"AFD handshake rejected by ffn peer: {reply.error}")
         peer = reply.info
         _check_compatible(local, peer)
+        nvshmem_uid = reply.nvshmem_uid
+        _check_nvshmem_config(
+            local.afd_backend,
+            nvshmem_uid,
+            peer.nvshmem_remote_transport,
+        )
         result = AFDHandshakeResult(
             local=local,
             peer=peer,
             dist_host=reply.dist_host,
             sync_port=reply.sync_port,
             dist_port=reply.dist_port,
+            nvshmem_uid=nvshmem_uid,
             session_id=reply.session_id,
+            attn_members=reply.attn_members,
         )
         logger.info(
             "AFD handshake done: peer_role=%s peer_ranks=%d model=%s session=%d",
@@ -547,10 +622,23 @@ class AFDHandshakeServer:
                 use_deepep_low_latency,
             )
             local.decode_graph_token_buckets = list(capacity_plan.graph_token_buckets)
-        except (RuntimeError, TypeError, ValueError) as e:
+            if local.afd_backend == "nvshmem":
+                nvshmem_remote_transport = select_nvshmem_remote_transport(
+                    local, attn_infos
+                )
+                local.nvshmem_remote_transport = nvshmem_remote_transport
+                nvshmem_uid = _get_nvshmem_unique_id(nvshmem_remote_transport)
+                logger.info(
+                    "AFD NVSHMEM remote transport selected: %s",
+                    nvshmem_remote_transport,
+                )
+            else:
+                nvshmem_uid = None
+        except (ImportError, OSError, RuntimeError, TypeError, ValueError) as e:
             self._reply_error_all([entry[0] for entry in pending], str(e))
             raise
 
+        attn_members = attn_infos if local.afd_backend == "nvshmem" else None
         results: list[AFDHandshakeResult] = []
         for session_id, (identity, peer, dist_host) in enumerate(pending):
             sync_port = self._port + SYNC_PORT_OFFSET + SESSION_PORT_STRIDE * session_id
@@ -566,7 +654,9 @@ class AFDHandshakeServer:
                             dist_host=dist_host,
                             sync_port=sync_port,
                             dist_port=dist_port,
+                            nvshmem_uid=nvshmem_uid,
                             session_id=session_id,
+                            attn_members=attn_members,
                         )
                     ),
                 ]
@@ -585,7 +675,9 @@ class AFDHandshakeServer:
                     dist_host=dist_host,
                     sync_port=sync_port,
                     dist_port=dist_port,
+                    nvshmem_uid=nvshmem_uid,
                     session_id=session_id,
+                    attn_members=attn_members,
                 )
             )
         return results

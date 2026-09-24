@@ -5,6 +5,8 @@ import unittest
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
 from dataclasses import asdict
+from itertools import product
+from unittest.mock import patch
 from uuid import uuid4
 
 import msgspec
@@ -36,6 +38,7 @@ def _handshake_info(role):
         role=role,
         model_identity="test-model:123",
         num_ranks=1,
+        rank_node_ids=["node-0"],
         afd_backend="nccl",
         afd_ffn_moe_backend="none",
         wire_dtype="bfloat16",
@@ -205,15 +208,19 @@ class TestAFDHandshakeWireProtocol(unittest.TestCase):
                     build_afd_graph_capture_plan(handshake)
 
     def test_handshake_roundtrip_agrees_on_endpoints_and_model(self):
-        for num_attn, num_ffn, backend, num_sessions in (
-            (1, 1, "none", 1),
-            (3, 2, "none", 1),
-            (2, 3, "deepep", 1),
-            (1, 1, "none", 2),
-            (3, 2, "none", 2),
-            (2, 3, "deepep", 2),
+        for transport, (num_attn, num_ffn, backend, num_sessions) in product(
+            ("nccl", "nvshmem"),
+            (
+                (1, 1, "none", 1),
+                (3, 2, "none", 1),
+                (2, 3, "deepep", 1),
+                (1, 1, "none", 2),
+                (3, 2, "none", 2),
+                (2, 3, "deepep", 2),
+            ),
         ):
             with self.subTest(
+                transport=transport,
                 num_attn=num_attn,
                 num_ffn=num_ffn,
                 backend=backend,
@@ -222,6 +229,10 @@ class TestAFDHandshakeWireProtocol(unittest.TestCase):
                 port = _free_port()
                 ffn_info = _handshake_info("ffn")
                 attn_info = _handshake_info("attn")
+                ffn_info.afd_backend = attn_info.afd_backend = transport
+                ffn_info.rank_node_ids = ["node-0"] * num_ffn
+                attn_info.rank_node_ids = ["node-0"] * num_attn
+                uid = b"\x00\xffnvshmem-uid"
                 ffn_info.num_ranks = num_ffn
                 attn_info.num_ranks = num_attn
                 ffn_info.afd_ffn_moe_backend = backend
@@ -232,6 +243,10 @@ class TestAFDHandshakeWireProtocol(unittest.TestCase):
                 ffn_info.decode_graph_token_buckets = [1]
                 with (
                     envs.SGLANG_AFD_HANDSHAKE_TIMEOUT_S.override(5),
+                    patch(
+                        "sglang.srt.afd.afd_handshake._get_nvshmem_unique_id",
+                        return_value=uid,
+                    ),
                     ThreadPoolExecutor(max_workers=num_sessions + 1) as pool,
                 ):
                     server = pool.submit(
@@ -256,6 +271,15 @@ class TestAFDHandshakeWireProtocol(unittest.TestCase):
                 ):
                     self.assertEqual(result.session_id, session_id)
                     self.assertEqual(peer_result.session_id, session_id)
+                    self.assertEqual(
+                        result.nvshmem_uid, uid if transport == "nvshmem" else None
+                    )
+                    self.assertEqual(
+                        result.attn_members,
+                        tuple(peer.peer for peer in peer_results)
+                        if transport == "nvshmem"
+                        else None,
+                    )
                     self.assertEqual(result.local, attn_info)
                     self.assertEqual(result.peer, ffn_info)
                     self.assertEqual(peer_result.local, ffn_info)

@@ -16,6 +16,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardMode
 
 if TYPE_CHECKING:
     from sglang.srt.afd.afd_handshake import AFDGraphCaptureVariant
+    from sglang.srt.afd.comm.nvshmem import NVSHMEMRuntimeOwner
     from sglang.srt.afd.layers import AFDMoELayer
 
 logger = logging.getLogger(__name__)
@@ -141,6 +142,7 @@ class AFDFixedBufferPool:
         role: str,
         with_router_logits: bool,
         num_slots: int,
+        decode_transport: Optional[NVSHMEMRuntimeOwner] = None,
         with_response_scratch: bool = False,
     ):
         if num_slots <= 0:
@@ -159,43 +161,55 @@ class AFDFixedBufferPool:
             raise RuntimeError("AFD found duplicate MoE layer ids")
 
         max_tokens = self._buckets[-1]
+        self._decode_transport = decode_transport
         self._buffers: dict[tuple[int, int, int, int], _SlotBuffers] = {}
+        self._router_logits: dict[tuple[int, int, int, int], torch.Tensor] = {}
         schemas = sorted(set(self._layer_keys.values()))
-        for slot_id in range(num_slots):
-            for hidden_size, top_k, num_experts in schemas:
-                key = (slot_id, hidden_size, top_k, num_experts)
-                self._buffers[key] = _SlotBuffers(
-                    hidden_states=torch.empty(
-                        (max_tokens, hidden_size), dtype=dtype, device=device
-                    ),
-                    topk_ids=torch.empty(
-                        (max_tokens, top_k), dtype=torch.int32, device=device
-                    ),
-                    topk_weights=torch.empty(
-                        (max_tokens, top_k), dtype=torch.float32, device=device
-                    ),
-                    output=torch.empty(
-                        (max_tokens, hidden_size), dtype=dtype, device=device
-                    ),
-                    router_logits=(
-                        torch.empty(
-                            (max_tokens, num_experts),
-                            dtype=torch.float32,
-                            device=device,
-                        )
-                        if with_router_logits
-                        else None
-                    ),
-                    response_scratch=(
-                        torch.empty(
-                            (max_tokens, hidden_size),
-                            dtype=dtype,
-                            device=device,
-                        )
-                        if with_response_scratch
-                        else None
-                    ),
-                )
+        if decode_transport is None:
+            for slot_id in range(num_slots):
+                for hidden_size, top_k, num_experts in schemas:
+                    key = (slot_id, hidden_size, top_k, num_experts)
+                    self._buffers[key] = _SlotBuffers(
+                        hidden_states=torch.empty(
+                            (max_tokens, hidden_size), dtype=dtype, device=device
+                        ),
+                        topk_ids=torch.empty(
+                            (max_tokens, top_k), dtype=torch.int32, device=device
+                        ),
+                        topk_weights=torch.empty(
+                            (max_tokens, top_k), dtype=torch.float32, device=device
+                        ),
+                        output=torch.empty(
+                            (max_tokens, hidden_size), dtype=dtype, device=device
+                        ),
+                        router_logits=(
+                            torch.empty(
+                                (max_tokens, num_experts),
+                                dtype=torch.float32,
+                                device=device,
+                            )
+                            if with_router_logits
+                            else None
+                        ),
+                        response_scratch=(
+                            torch.empty(
+                                (max_tokens, hidden_size),
+                                dtype=dtype,
+                                device=device,
+                            )
+                            if with_response_scratch
+                            else None
+                        ),
+                    )
+        elif with_router_logits:
+            for slot_id in range(num_slots):
+                for hidden_size, top_k, num_experts in schemas:
+                    key = (slot_id, hidden_size, top_k, num_experts)
+                    self._router_logits[key] = torch.empty(
+                        (max_tokens, num_experts),
+                        dtype=torch.float32,
+                        device=device,
+                    )
 
         self._active_generations: list[Optional[int]] = [None] * num_slots
         allocated_bytes = sum(
@@ -210,6 +224,9 @@ class AFDFixedBufferPool:
                 buffers.response_scratch,
             )
             if tensor is not None
+        ) + sum(
+            tensor.numel() * tensor.element_size()
+            for tensor in self._router_logits.values()
         )
         logger.info(
             "AFD fixed buffer pool ready: role=%s slots=%d schemas=%d buckets=%d "
@@ -250,21 +267,39 @@ class AFDFixedBufferPool:
             )
         layer_key = self._layer_keys[layer_id]
         buffer_key = (slot_id, *layer_key)
-        buffers = self._buffers[buffer_key]
-        hidden_states = buffers.hidden_states[:capacity]
-        topk_ids = buffers.topk_ids[:capacity]
-        topk_weights = buffers.topk_weights[:capacity]
-        output = buffers.output[:capacity]
-        router_logits = (
-            buffers.router_logits[:capacity]
-            if buffers.router_logits is not None
-            else None
-        )
-        response_scratch = (
-            buffers.response_scratch[:capacity]
-            if buffers.response_scratch is not None
-            else None
-        )
+        if self._decode_transport is None:
+            buffers = self._buffers[buffer_key]
+            hidden_states = buffers.hidden_states[:capacity]
+            topk_ids = buffers.topk_ids[:capacity]
+            topk_weights = buffers.topk_weights[:capacity]
+            output = buffers.output[:capacity]
+            router_logits = (
+                buffers.router_logits[:capacity]
+                if buffers.router_logits is not None
+                else None
+            )
+            response_scratch = (
+                buffers.response_scratch[:capacity]
+                if buffers.response_scratch is not None
+                else None
+            )
+        else:
+            views = self._decode_transport.decode_views(
+                layer_id,
+                capacity,
+                slot_id=slot_id,
+            )
+            hidden_states = views.hidden_states
+            topk_ids = views.topk_ids
+            topk_weights = views.topk_weights
+            output = views.output
+            router_logits_buffer = self._router_logits.get(buffer_key)
+            router_logits = (
+                router_logits_buffer[:capacity]
+                if router_logits_buffer is not None
+                else None
+            )
+            response_scratch = None
         self._active_generations[slot_id] = generation
         return AFDWorkHandle(
             slot_id=slot_id,
@@ -308,6 +343,7 @@ class AFDDispatcher:
         compute_num_sms: int | None = None,
     ):
         self._comm = comm
+        self._decode_transport = comm.decode_transport
         self._layers = list(layers)
         self._dtype = dtype
         self._device = device
@@ -329,6 +365,7 @@ class AFDDispatcher:
             role="attn",
             with_router_logits=False,
             num_slots=num_slots,
+            decode_transport=self._decode_transport,
             with_response_scratch=len(self._ffn_global_ranks) > 1,
         )
         self._next_step_id = 0
@@ -464,7 +501,8 @@ class AFDDispatcher:
         capacity: int,
     ) -> bool:
         return (
-            len(self._ffn_global_ranks) == 1
+            self._decode_transport is None
+            and len(self._ffn_global_ranks) == 1
             and hidden_states.shape[0] == capacity
             and hidden_states.is_contiguous()
             and topk_ids.is_contiguous()
@@ -502,7 +540,14 @@ class AFDDispatcher:
             work.hidden_states.copy_(hidden_states)
             work.topk_ids.copy_(topk_ids)
             work.topk_weights.copy_(topk_weights)
-        if peers:
+        if self._decode_transport is not None:
+            for peer_global_rank in peers:
+                self._decode_transport.put_request(
+                    layer_id,
+                    capacity,
+                    peer_global_rank=peer_global_rank,
+                )
+        elif peers:
             request = (
                 [hidden_states, topk_ids, topk_weights]
                 if direct_nccl_request
@@ -513,20 +558,45 @@ class AFDDispatcher:
         return work
 
     def combine_decode_graph_wave(
-        self, layer_id: int, work: AFDWorkHandle
+        self,
+        layer_id: int,
+        work: AFDWorkHandle,
     ) -> torch.Tensor:
+
+        capacity = work.capacity
         peers = self._ffn_global_ranks
-        if peers:
+        if self._decode_transport is not None:
+            self._decode_transport.launch_wait_response()
+            if not peers:
+                work.output.zero_()
+            else:
+                for peer_global_rank in peers[1:]:
+                    views = self._decode_transport.decode_views(
+                        layer_id,
+                        capacity,
+                        peer_global_rank=peer_global_rank,
+                    )
+                    work.output.add_(views.output)
+        elif peers:
             self._comm.recv_from([work.output], peers[0])
             if len(peers) > 1:
                 assert work.response_scratch is not None
                 for peer_global_rank in peers[1:]:
-                    self._comm.recv_from([work.response_scratch], peer_global_rank)
+                    self._comm.recv_from(
+                        [work.response_scratch],
+                        peer_global_rank,
+                    )
                     work.output.add_(work.response_scratch)
         else:
             work.output.zero_()
+        if self._decode_transport is not None:
+            # NVSHMEM arena views are externally allocated. Keep them out of
+            # downstream graph-captured collectives that register PyTorch storage.
+            output = work.output.clone()
+        else:
+            output = work.output
         self._pool.release(work)
-        return work.output
+        return output
 
     def decode_graph_wave(
         self,
@@ -542,6 +612,22 @@ class AFDDispatcher:
             topk_weights,
         )
         return self.combine_decode_graph_wave(layer_id, work)
+
+    def warmup_decode_transport(self, capacity: int) -> None:
+        if self._decode_transport is None:
+            raise RuntimeError("AFD decode transport is not initialized")
+        for layer in self._layers:
+            views = self._decode_transport.decode_views(layer.layer_id, capacity)
+            views.hidden_states.zero_()
+            views.topk_ids.zero_()
+            views.topk_weights.fill_(1.0 / layer.top_k)
+            for peer_global_rank in self._ffn_global_ranks:
+                self._decode_transport.put_request(
+                    layer.layer_id,
+                    capacity,
+                    peer_global_rank=peer_global_rank,
+                )
+            self._decode_transport.launch_wait_response()
 
     def dispatch(
         self,
@@ -642,7 +728,18 @@ class AFDDispatcher:
         if not has_peer:
             handle.output.zero_()
 
-        if has_peer:
+        if (
+            is_afd_fixed_shape_mode(self._forward_mode)
+            and self._decode_transport is not None
+        ):
+            for peer_global_rank in self._ffn_global_ranks:
+                self._decode_transport.put_request(
+                    layer_id,
+                    handle.capacity,
+                    slot_id=handle.slot_id,
+                    peer_global_rank=peer_global_rank,
+                )
+        elif has_peer:
             request = (
                 handle.request_tensors
                 if direct_nccl_request
@@ -678,7 +775,26 @@ class AFDDispatcher:
                 f"required={required_dispatches}"
             )
 
-        if self._ffn_global_ranks:
+        if (
+            is_afd_fixed_shape_mode(self._forward_mode)
+            and self._decode_transport is not None
+        ):
+            if len(self._child_wire_capacities) == 1:
+                self._decode_transport.wait_response()
+            else:
+                self._decode_transport.launch_wait_response(slot_id=handle.slot_id)
+            if len(self._ffn_global_ranks) > 1:
+                layer_index = self._next_combine_index // num_children
+                layer_id = self._layers[layer_index].layer_id
+                for peer_global_rank in self._ffn_global_ranks[1:]:
+                    views = self._decode_transport.decode_views(
+                        layer_id,
+                        handle.capacity,
+                        slot_id=handle.slot_id,
+                        peer_global_rank=peer_global_rank,
+                    )
+                    handle.output.add_(views.output)
+        elif self._ffn_global_ranks:
             self._comm.recv_from(
                 [handle.output],
                 self._ffn_global_ranks[0],
@@ -695,6 +811,10 @@ class AFDDispatcher:
                     handle.output.add_(scratch)
         if handle.slot_id is not None:
             output = handle.output[: handle.input_tokens]
+            if self._capturing_parent_graph and self._decode_transport is not None:
+                # Parent-graph replay must expose PyTorch-owned storage to the
+                # model, not the externally allocated NVSHMEM arena view.
+                output = output.clone()
             self._pool.release(handle)
         else:
             output = handle.output

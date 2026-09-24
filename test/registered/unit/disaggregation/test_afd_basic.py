@@ -161,6 +161,8 @@ class _CPUExperts(torch.nn.Module):
 
 
 class _CPUComm:
+    decode_transport = None
+
     def __init__(self, config, channels):
         self.config = config
         self.channels = channels
@@ -211,6 +213,7 @@ class TestAFDEagerRoundtrip(unittest.TestCase):
             "attn",
             "model",
             comm.config.num_attn_ranks,
+            [],
             "nccl",
             backend,
             "float32",
@@ -218,7 +221,14 @@ class TestAFDEagerRoundtrip(unittest.TestCase):
             list(range(1, 17)),
         )
         ffn = AFDHandshakeInfo(
-            "ffn", "model", comm.config.num_ffn_ranks, "nccl", backend, "float32", []
+            "ffn",
+            "model",
+            comm.config.num_ffn_ranks,
+            [],
+            "nccl",
+            backend,
+            "float32",
+            [],
         )
         handshake = AFDHandshakeResult(ffn, attn, "localhost", 30002, 30003)
         disagg = SimpleNamespace(afd_ffn_moe_backend="deepep" if scattered else "none")
@@ -471,9 +481,9 @@ class TestAFDEagerRoundtrip(unittest.TestCase):
 
     def test_low_latency_fanin_capacity_updates_every_native_dispatcher(self):
         attn = AFDHandshakeInfo(
-            "attn", "model", 3, "nccl", "deepep", "float32", [], [32, 64, 96]
+            "attn", "model", 3, [], "nccl", "deepep", "float32", [], [32, 64, 96]
         )
-        ffn = AFDHandshakeInfo("ffn", "model", 2, "nccl", "deepep", "float32", [])
+        ffn = AFDHandshakeInfo("ffn", "model", 2, [], "nccl", "deepep", "float32", [])
         attn.decode_graph_token_buckets = [32, 64]
         ffn.decode_graph_token_buckets = [1]
         plan = build_afd_ffn_capacity_plan(

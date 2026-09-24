@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import ctypes
+import logging
 from typing import TYPE_CHECKING
 
 from sglang.srt.afd.afd_config import AFDRole
@@ -22,11 +24,15 @@ from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.model_executor.runner.base_cuda_graph_runner import (
     get_batch_sizes_to_capture,
 )
-from sglang.srt.runtime_context import get_disagg, get_exec, get_model
+from sglang.srt.runtime_context import get_disagg, get_exec, get_model, get_parallel
+from sglang.srt.utils.network import get_local_ip_auto
+from sglang.srt.utils.numa_utils import _get_nvml_device_index
 
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import Scheduler
 
+
+logger = logging.getLogger(__name__)
 
 _VERBOSE_FIRST_STEPS = 5
 _LOG_INTERVAL = envs.SGLANG_AFD_LOG_INTERVAL.get()
@@ -34,7 +40,62 @@ if _LOG_INTERVAL < 0:
     raise ValueError("SGLANG_AFD_LOG_INTERVAL must be non-negative")
 
 
-def build_local_handshake_info(scheduler: Scheduler, role: AFDRole) -> AFDHandshakeInfo:
+def _query_nvshmem_fabric_key(device_id: int) -> tuple[bytes, int] | None:
+    try:
+        import pynvml
+    except ModuleNotFoundError:
+        logger.debug("AFD NVSHMEM fabric query skipped: pynvml is unavailable")
+        return None
+
+    initialized = False
+    try:
+        pynvml.nvmlInit()
+        initialized = True
+        nvml_device_id = _get_nvml_device_index(device_id)
+        handle = pynvml.nvmlDeviceGetHandleByIndex(nvml_device_id)
+        fabric_info = pynvml.c_nvmlGpuFabricInfoV_t()
+        pynvml.nvmlDeviceGetGpuFabricInfoV(handle, ctypes.byref(fabric_info))
+        if (
+            fabric_info.state != pynvml.NVML_GPU_FABRIC_STATE_COMPLETED
+            or fabric_info.status != pynvml.NVML_SUCCESS
+        ):
+            return None
+        # Some bindings expose this binary UUID as c_char[], which truncates
+        # at embedded NUL bytes when read as a Python value.
+        cluster_uuid = ctypes.string_at(
+            ctypes.addressof(fabric_info) + type(fabric_info).clusterUuid.offset,
+            pynvml.NVML_GPU_FABRIC_UUID_LEN,
+        )
+        if not any(cluster_uuid):
+            return None
+        return cluster_uuid, int(fabric_info.cliqueId)
+    except (AttributeError, pynvml.NVMLError) as exc:
+        logger.debug("AFD NVSHMEM fabric query unavailable: %s", exc)
+        return None
+    finally:
+        if initialized:
+            try:
+                pynvml.nvmlShutdown()
+            except pynvml.NVMLError as exc:
+                logger.debug("AFD NVML shutdown failed: %s", exc)
+
+
+def gather_nvshmem_topology(
+    scheduler: Scheduler,
+) -> tuple[list[str], list[tuple[bytes, int] | None]]:
+    if get_disagg().afd_backend != "nvshmem":
+        return [], []
+    local = (get_local_ip_auto(), _query_nvshmem_fabric_key(scheduler.ps.gpu_id))
+    members = get_parallel().tp_group.all_gather_object(local)
+    return [node_id for node_id, _ in members], [key for _, key in members]
+
+
+def build_local_handshake_info(
+    scheduler: Scheduler,
+    role: AFDRole,
+    rank_node_ids: list[str],
+    rank_nvshmem_fabric_keys: list[tuple[bytes, int] | None],
+) -> AFDHandshakeInfo:
     model_runner = scheduler.tp_worker.model_runner
     moe_layers = collect_afd_moe_layers(model_runner.model, role)
     scattered = get_disagg().afd_ffn_moe_backend == "deepep"
@@ -63,6 +124,8 @@ def build_local_handshake_info(scheduler: Scheduler, role: AFDRole) -> AFDHandsh
         role=role.value,
         model_identity=compute_model_identity(get_model().model_path),
         num_ranks=scheduler.ps.tp_size,
+        rank_node_ids=rank_node_ids,
+        rank_nvshmem_fabric_keys=rank_nvshmem_fabric_keys,
         afd_backend=get_disagg().afd_backend,
         afd_ffn_moe_backend=get_disagg().afd_ffn_moe_backend,
         wire_dtype=str(model_runner.dtype).removeprefix("torch."),
@@ -118,4 +181,6 @@ def init_afd_comm_backend(
         store_port=handshake.dist_port,
         device=_afd_device(scheduler),
     )
-    return create_afd_comm_backend(get_disagg().afd_backend, config)
+    return create_afd_comm_backend(
+        get_disagg().afd_backend, config, handshake=handshake
+    )

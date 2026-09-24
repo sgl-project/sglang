@@ -11,6 +11,9 @@ from sglang.srt.afd.afd_config import AFDRole
 if TYPE_CHECKING:
     import torch
 
+    from sglang.srt.afd.afd_handshake import AFDHandshakeResult
+    from sglang.srt.afd.comm.nvshmem import NVSHMEMRuntimeOwner
+
 
 @dataclass(frozen=True)
 class AFDCommConfig:
@@ -75,6 +78,10 @@ class AFDCommBackend(ABC):
     def __init__(self, config: AFDCommConfig):
         self.config = config
 
+    @property
+    def decode_transport(self) -> NVSHMEMRuntimeOwner | None:
+        return None
+
     @abstractmethod
     def send_to(
         self,
@@ -99,9 +106,22 @@ class AFDCommBackend(ABC):
     def close(self) -> None: ...
 
 
-def create_afd_comm_backend(backend: str, config: AFDCommConfig) -> AFDCommBackend:
+def create_afd_comm_backend(
+    backend: str,
+    config: AFDCommConfig,
+    *,
+    handshake: AFDHandshakeResult | None = None,
+) -> AFDCommBackend:
     if backend == "nccl":
         from sglang.srt.afd.comm.nccl import NCCLCommBackend
 
         return NCCLCommBackend(config)
+    if backend == "nvshmem":
+        if handshake is None or handshake.nvshmem_uid is None:
+            raise ValueError(
+                "AFD NVSHMEM backend requires a completed handshake with a unique ID"
+            )
+        from sglang.srt.afd.comm.nvshmem import NVSHMEMCommBackend
+
+        return NVSHMEMCommBackend(config=config, handshake=handshake)
     raise ValueError(f"Unknown AFD comm backend {backend!r}")

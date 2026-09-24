@@ -28,9 +28,11 @@ from sglang.srt.afd.dispatcher import (
 from sglang.srt.afd.layers import collect_afd_moe_layers
 from sglang.srt.afd.scheduler_common import (
     build_local_handshake_info,
+    gather_nvshmem_topology,
     init_afd_comm_backend,
     should_log_step,
 )
+from sglang.srt.distributed.parallel_state import graph_capture
 from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.runtime_context import get_disagg, get_exec, get_parallel
@@ -53,6 +55,7 @@ def _capture_afd_attn_communication_graphs(
     if not plan.enabled:
         model_runner.init_cuda_graphs()
         return
+    transport = backend.decode_transport
 
     if plan.attn_graph_variants:
         dispatcher.enable_communication_graph_variants(plan.attn_graph_variants)
@@ -60,9 +63,51 @@ def _capture_afd_attn_communication_graphs(
     backend.startup_barrier()
     model_runner.init_cuda_graphs()
     backend.startup_barrier()
+
+    if transport is None:
+        logger.info(
+            "AFD attn communication graphs ready: full_steps=%d ffn_participants=0",
+            len(plan.attn_graph_variants),
+        )
+        return
+
+    attn_capacities = {
+        variant.attn_wire_capacity for variant in plan.attn_graph_variants
+    }
+    ffn_only_capacities = [
+        wire_capacity
+        for wire_capacity, _ in plan.ffn_graph_variants
+        if wire_capacity not in attn_capacities
+    ]
+    temporary_graphs = []
+    if ffn_only_capacities:
+        with torch.inference_mode(), graph_capture() as ctx:
+            for wire_capacity in ffn_only_capacities:
+                for _ in range(2):
+                    scheduler.device_module.synchronize()
+                    get_parallel().tp_group.barrier()
+                    dispatcher.warmup_decode_transport(wire_capacity)
+                temporary_graphs.append(
+                    transport.capture_wait_graph(
+                        dispatcher.num_layers,
+                        ctx.stream,
+                    )
+                )
+        scheduler.device_module.synchronize()
+        get_parallel().tp_group.barrier()
+    backend.startup_barrier()
+
+    with graph_capture() as ctx:
+        helper = transport.capture_wait_graph(1, ctx.stream)
+    scheduler.device_module.synchronize()
+    get_parallel().tp_group.barrier()
+    transport.install_wait_helper(helper)
+    backend.startup_barrier()
+
     logger.info(
-        "AFD attn communication graphs ready: full_steps=%d",
+        "AFD attn communication graphs ready: full_steps=%d ffn_participants=%d",
         len(plan.attn_graph_variants),
+        len(temporary_graphs),
     )
 
 
@@ -309,10 +354,13 @@ def init_afd_attn(
     scheduler: Scheduler,
 ) -> tuple[AFDHandshakeResult, Optional[AFDSyncSender]]:
     rank = scheduler.ps.tp_rank
+    rank_node_ids, fabric_keys = gather_nvshmem_topology(scheduler)
     if rank == 0:
         handshake = run_handshake_attn(
             get_disagg().afd_ffn_addr,
-            build_local_handshake_info(scheduler, AFDRole.ATTN),
+            build_local_handshake_info(
+                scheduler, AFDRole.ATTN, rank_node_ids, fabric_keys
+            ),
         )
         if scheduler.ps.tp_size > 1:
             broadcast_pyobj([handshake], rank, get_parallel().tp_group.cpu_group, src=0)
