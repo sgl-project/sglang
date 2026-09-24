@@ -1,0 +1,26 @@
+{
+  "time_utc": "2026-09-24T22:35:46.763650+00:00",
+  "commit": "9f6fc553322e897a22f30320dae750f4a40a0b84",
+  "python": "3.12.3",
+  "torch": "2.13.0+cu130",
+  "startup_guard": "--hicache-storage-backend (L3) with --dcp-size > 1 is not supported yet: under DCP each rank holds a distinct interleaved MLA KV shard, so the rank-0-only replicated-MLA backup and the storage keys must become dcp_rank-aware first. Run HiCache+DCP with L1/L2 only.",
+  "host_pool": {
+    "dcp_size": 2,
+    "logical_page_tokens": 128,
+    "local_page_rows": 64,
+    "layers": 2,
+    "kv_width": 12,
+    "local_page_elements": 1536,
+    "local_page_bytes": 3072
+  },
+  "page_accessor_guard": "HiCache L3 storage paths are not yet DCP-aware (per-rank shards need dcp_rank-scoped keys); --hicache-storage-backend with --dcp-size > 1 should have been rejected at server start.",
+  "existing_host_pool_tests": {
+    "command": [
+      "/opt/sglang/bin/python",
+      "test/registered/unit/mem_cache/test_hicache_dcp_host_pool.py",
+      "-v"
+    ],
+    "exit_code": 0,
+    "output": "[CI Test Method] TestDcpKernelIndices.test_aligned_page_translates_to_full_physical_page\n[CI Test Method] TestDcpKernelIndices.test_identity_without_dcp\n[CI Test Method] TestDcpKernelIndices.test_matches_owner_rule_on_merged_unordered_pages\n[CI Test Method] TestDcpKernelIndices.test_positional_residue_pairing_survives_host_sort\n[CI Test Method] TestHostPoolSizingUnderDcp.test_alloc_is_widened_page_granular\n[CI Test Method] TestHostPoolSizingUnderDcp.test_logical_and_physical_sizing\n[CI Test Method] TestHostPoolSizingUnderDcp.test_non_dcp_pool_unchanged\n[CI Test Method] TestTransferEntryPointsTranslate.test_backup_receives_physical_rows\n[CI Test Method] TestTransferEntryPointsTranslate.test_l3_data_page_is_guarded\ntest_aligned_page_translates_to_full_physical_page (__main__.TestDcpKernelIndices.test_aligned_page_translates_to_full_physical_page) ... ok\ntest_identity_without_dcp (__main__.TestDcpKernelIndices.test_identity_without_dcp) ... ok\ntest_matches_owner_rule_on_merged_unordered_pages (__main__.TestDcpKernelIndices.test_matches_owner_rule_on_merged_unordered_pages) ... ok\ntest_positional_residue_pairing_survives_host_sort (__main__.TestDcpKernelIndices.test_positional_residue_pairing_survives_host_sort) ... ok\ntest_alloc_is_widened_page_granular (__main__.TestHostPoolSizingUnderDcp.test_alloc_is_widened_page_granular) ... Unsupported element_size = 24 for JIT HiCache kernel\nok\ntest_logical_and_physical_sizing (__main__.TestHostPoolSizingUnderDcp.test_logical_and_physical_sizing) ... Unsupported element_size = 24 for JIT HiCache kernel\nok\ntest_non_dcp_pool_unchanged (__main__.TestHostPoolSizingUnderDcp.test_non_dcp_pool_unchanged) ... Unsupported element_size = 24 for JIT HiCache kernel\nok\ntest_backup_receives_physical_rows (__main__.TestTransferEntryPointsTranslate.test_backup_receives_physical_rows) ... Unsupported element_size = 24 for JIT HiCache kernel\nok\ntest_l3_data_page_is_guarded (__main__.TestTransferEntryPointsTranslate.test_l3_data_page_is_guarded) ... Unsupported element_size = 24 for JIT HiCache kernel\nok\n\n----------------------------------------------------------------------\nRan 9 tests in 0.009s\n\nOK\n"
+  }
+}
