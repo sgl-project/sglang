@@ -807,5 +807,62 @@ class TestParsedResponseFieldsProtocol(unittest.TestCase):
     """Test ParsedResponseFields protocol."""
 
 
+class TestThinkingParam(unittest.TestCase):
+    """`thinking` is the Moonshot spelling of the reasoning controls."""
+
+    MESSAGES = [{"role": "user", "content": "hi"}]
+
+    def _request(self, **kwargs):
+        return ChatCompletionRequest(model="m", messages=self.MESSAGES, **kwargs)
+
+    def test_disabled_turns_reasoning_off(self):
+        request = self._request(thinking={"type": "disabled"})
+        self.assertIs(request.chat_template_kwargs["thinking"], False)
+        self.assertIs(request.chat_template_kwargs["enable_thinking"], False)
+
+    def test_enabled_is_the_default_type(self):
+        request = self._request(thinking={"keep": "all"})
+        self.assertIs(request.chat_template_kwargs["thinking"], True)
+
+    def test_effort_outranks_reasoning_effort(self):
+        request = self._request(
+            reasoning_effort="max", thinking={"type": "enabled", "effort": "low"}
+        )
+        self.assertEqual(request.reasoning_effort, "low")
+
+    def test_effort_outranks_reasoning_object(self):
+        request = self._request(reasoning={"effort": "max"}, thinking={"effort": "low"})
+        self.assertEqual(request.reasoning_effort, "low")
+
+    def test_reasoning_effort_survives_without_thinking_effort(self):
+        request = self._request(reasoning_effort="low", thinking={"type": "enabled"})
+        self.assertEqual(request.reasoning_effort, "low")
+
+    def test_disabled_wins_over_an_effort_derived_toggle(self):
+        request = self._request(reasoning_effort="high", thinking={"type": "disabled"})
+        self.assertIs(request.chat_template_kwargs["thinking"], False)
+
+    def test_adaptive_is_treated_as_enabled(self):
+        request = self._request(thinking={"type": "adaptive"})
+        self.assertIs(request.chat_template_kwargs["thinking"], True)
+
+    def test_explicit_none_effort_survives_a_thinking_object(self):
+        # A thinking object with no explicit type must not turn reasoning back on.
+        request = self._request(reasoning_effort="none", thinking={"keep": "all"})
+        self.assertIs(request.chat_template_kwargs["thinking"], False)
+
+    def test_effort_none_inside_thinking_disables_reasoning(self):
+        request = self._request(thinking={"effort": "none"})
+        self.assertIs(request.chat_template_kwargs["thinking"], False)
+
+    def test_null_type_is_treated_as_absent(self):
+        request = self._request(thinking={"type": None, "keep": "all"})
+        self.assertIs(request.chat_template_kwargs["thinking"], True)
+
+    def test_unknown_type_rejected(self):
+        with self.assertRaises(ValidationError):
+            self._request(thinking={"type": "sometimes"})
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
