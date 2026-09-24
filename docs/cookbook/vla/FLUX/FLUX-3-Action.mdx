@@ -25,16 +25,16 @@ SGLang runs it in the native `multimodal_gen` runtime. Work that does not depend
 
 Supported checkpoints (`black-forest-labs/flux-3-action-droid`; three 360x640 cameras `wrist`, `left`, `right`; state and action dim 8; 32-action chunks):
 
-| `--model-variant` | Recipe | Weights | Latency on 1x RTX 5090 |
-| --- | --- | --- | ---: |
-| (default) / `base` | 4 steps, guidance 4.0 (video) / 1.0 (action) | BF16 | 1.13 s |
-| `fp8r` | same | FP8 rowwise | 0.93 s |
-| `gd` | guidance-distilled: 4 steps, no CFG | BF16 | 0.62 s |
-| `gd-fp8r` | same | FP8 rowwise | 0.52 s |
-| `sd` | step-distilled: 1 step | BF16 | 0.18 s |
-| `sd-fp8r` | same | FP8 rowwise | 0.16 s |
+| `--model-variant` | Recipe | Weights | Latency on 1x RTX 5090 | Latency on 1x H200 |
+| --- | --- | --- | ---: | ---: |
+| (default) / `base` | 4 steps, guidance 4.0 (video) / 1.0 (action) | BF16 | 1.14 s | 0.41 s |
+| `fp8r` | same | FP8 rowwise | 0.93 s | 0.47 s |
+| `gd` | guidance-distilled: 4 steps, no CFG | BF16 | 0.63 s | 0.24 s |
+| `gd-fp8r` | same | FP8 rowwise | 0.52 s | 0.27 s |
+| `sd` | step-distilled: 1 step | BF16 | 0.18 s | 0.09 s |
+| `sd-fp8r` | same | FP8 rowwise | 0.16 s | 0.11 s |
 
-Latency is per request with the caption already cached, eager mode (no `torch.compile`). LayerNorm + modulation, SwiGLU and the gated residual run on bit-exact fused kernels; QK RMSNorm + RoPE runs on a fused kernel at bf16 rounding level (set `SGLANG_ENABLE_FUSED_QKNORM_ROPE=0` to use the eager path). FP8r packages load their native E4M3 weights (one scale per output row) and run `torch._scaled_mm` with per-token activation scales. This needs an SM89+ GPU.
+Latency is the median server-side time per request (`server_timing.infer_ms`) over 50 sequential requests after 10 warmup requests, on one GPU with the default serve command, eager mode (no `torch.compile`). Requests go through the OpenPI WebSocket with msgpack numpy images, and the caption is cached. Measure it with `python -m sglang.multimodal_gen.benchmarks.bench_flux3_action --url ws://127.0.0.1:30000` against a running server. On H200 the FP8r packages are slower than BF16; they save memory. LayerNorm + modulation, SwiGLU and the gated residual run on bit-exact fused kernels; QK RMSNorm + RoPE runs on a fused kernel at bf16 rounding level (set `SGLANG_ENABLE_FUSED_QKNORM_ROPE=0` to use the eager path). FP8r packages load their native E4M3 weights (one scale per output row) and run `torch._scaled_mm` with per-token activation scales. This needs an SM89+ GPU.
 
 The frozen text encoder and video VAE are downloaded from the pinned revision of [`black-forest-labs/flux-3-action-base`](https://huggingface.co/black-forest-labs/flux-3-action-base) that the policy config references.
 
@@ -51,7 +51,7 @@ cd sglang
 pip install -e "python[diffusion]"
 ```
 
-The video VAE runs its neighborhood attention on [NATTEN](https://natten.org) when it is installed. NATTEN is not a dependency of `sglang[diffusion]`; without it the VAE uses a compiled FlexAttention fallback with the same windows (actions stay at the bf16 rounding level), and the first request pays a one-time compile of about 15 s. To use NATTEN, pick the wheel that matches your torch and CUDA versions from [whl.natten.org](https://whl.natten.org/).
+The video VAE runs its neighborhood attention on [NATTEN](https://natten.org) when it is installed. NATTEN is not a dependency of `sglang[diffusion]`; without it the VAE uses a compiled FlexAttention fallback with the same windows (actions stay at the bf16 rounding level). The fallback compiles on the first request (about 3 s on H200) and is then no slower than NATTEN for this single-frame encode (24 ms vs. 36 ms per request on H200). To use NATTEN, pick the wheel that matches your torch and CUDA versions from [whl.natten.org](https://whl.natten.org/).
 
 ## 3. Model Deployment
 
@@ -75,14 +75,14 @@ sglang serve black-forest-labs/flux-3-action-droid \
 
 A local policy export (a directory containing `manifest.json`, `config.native.json` and `model.safetensors`) is detected automatically when passed as the model path. Pass `--revision` to pin a Hub revision. At startup the policy config and weights are checked against the SHA-256 hashes in `manifest.json`.
 
-Peak GPU memory and per-request latency on one RTX 5090 (BF16 base package, cached caption):
+Peak GPU memory and per-request latency on one RTX 5090. The resident rows use the same median protocol as the table above. The layerwise-offload rows are from the earlier single-run measurement.
 
 | Flags | Peak memory | Latency |
 | --- | ---: | ---: |
-| (none) | 24.1 GB | 1.13 s |
+| (none) | 23.3 GiB | 1.14 s |
 | `--dit-layerwise-offload` | 14.5 GB | 2.51 s |
 | `--layerwise-offload-components all` | 9.8 GB | 2.56 s |
-| `--model-variant fp8r` | 18.6 GB | 0.93 s |
+| `--model-variant fp8r` | 17.9 GiB | 0.93 s |
 | `--model-variant fp8r --dit-layerwise-offload` | 13.2 GB | 1.29 s |
 
 Layerwise offload streams the DiT blocks (and, with `all`, the text encoder and VAE blocks) from host memory, so use it only when the resident configuration does not fit.
