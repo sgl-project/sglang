@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import math
+import os
 from contextlib import contextmanager
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Optional
