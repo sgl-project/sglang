@@ -2045,17 +2045,28 @@ class DeepseekV4AscendAttnBackend(
                 buf = pool.swa_kv_pool.kv_buffer[pool._swa_local_layer_id(layer)]
                 tbl = getattr(fm, "swa_page_table", None)
                 if tbl is not None and tbl.numel():
-                    # fp8 has no NPU index_select (161002); gather raw bytes.
-                    src = buf.view(torch.uint8)
+                    # Slice, never gather: fp8 has no NPU index_select (161002),
+                    # and hashing the whole sequence would cost tens of MB per
+                    # step and distort the run it measures.
                     pages = torch.unique(tbl[0].reshape(-1)[-3:].to(torch.int64))
-                    pages = pages[(pages >= 0) & (pages < src.shape[0])]
-                    rows = src.index_select(0, pages).detach().reshape(-1).contiguous()
-                    raw = rows.numpy().tobytes()
-                    print(
-                        f"[SWAKV] start_pos={_l(getattr(fm, 'start_pos', None))} layer={layer} "
-                        f"pages={pages.numel()} md5={hashlib.md5(raw).hexdigest()[:16]}",
-                        flush=True,
-                    )
+                    pages = pages[(pages >= 0) & (pages < buf.shape[0])]
+                    if pages.numel():
+                        lo = int(pages.min())
+                        span = int(pages.max()) - lo + 1
+                        raw = (
+                            buf.narrow(0, lo, span)
+                            .view(torch.uint8)
+                            .detach()
+                            .cpu()
+                            .numpy()
+                            .tobytes()
+                        )
+                        print(
+                            f"[SWAKV] start_pos={_l(getattr(fm, 'start_pos', None))} layer={layer} "
+                            f"pages={pages.numel()} span={span} "
+                            f"md5={hashlib.md5(raw).hexdigest()[:16]}",
+                            flush=True,
+                        )
             except Exception as exc:
                 print(f"[SWAKV] skipped: {exc}", flush=True)
 
