@@ -1633,10 +1633,19 @@ EOF
     # incomplete sweep. That is a red result for a test that never ran. Observed
     # 2026-09-23 on jobs 4124 and 4125, both cancelled inside 40s while the four
     # amd-sglang nodes were held by another run.
+    #
+    # A job can also be cancelled just after it is placed: job 4147 on 2026-09-24
+    # had StartTime set and RunTime=00:00:05, long enough to start the containers
+    # and nothing else. Keying on StartTime=N/A alone misses that, so also accept
+    # a cancelled job that produced no bench results -- a real sweep writes
+    # raw_conc*.json and bench_exit, and neither can appear in five seconds.
     spur_never_started() {
         local _info
         _info=$(scontrol show job "$1" 2>/dev/null) || return 1
-        [[ "$_info" == *"JobState=CANCELLED"* && "$_info" == *"StartTime=N/A"* ]]
+        [[ "$_info" == *"JobState=CANCELLED"* ]] || return 1
+        [[ "$_info" == *"StartTime=N/A"* ]] && return 0
+        [[ -f "$WORKDIR/bench_exit" ]] && return 1
+        ! compgen -G "$WORKDIR/raw_conc*.json" > /dev/null
     }
     SPUR_RESUBMITS_LEFT=${SPUR_RESUBMITS_LEFT:-20}
 
