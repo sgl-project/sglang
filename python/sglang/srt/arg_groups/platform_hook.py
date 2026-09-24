@@ -63,6 +63,14 @@ def handle_mps_backends(server_args: Any):
             )
 
 
+def handle_mlu_backends(server_args: Any):
+    cfg = resolving_view(server_args)
+    if cfg.device == "mlu":
+        from sglang.srt.hardware_backend.mlu.utils import set_default_server_args
+
+        set_default_server_args(server_args)
+
+
 def handle_amd_specifics(server_args: Any):
     if get_platform().is_hip:
         declare_resolution(

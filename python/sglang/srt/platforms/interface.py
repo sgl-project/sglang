@@ -14,6 +14,8 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any, Callable, Optional, Type
 
+import torch
+
 from sglang.srt.platforms.device_mixin import DeviceMixin, PlatformEnum
 
 if TYPE_CHECKING:
@@ -85,6 +87,10 @@ class SRTPlatform(DeviceMixin):
     def get_paged_allocator_cls(self) -> type:
         """Return the paged allocator class for this platform."""
         raise NotImplementedError
+
+    def get_position_dtype(self) -> torch.dtype:
+        """Return the dtype used for token position tensors."""
+        return torch.int64
 
     def get_compile_backend(self, mode: str | None = None) -> str:
         """Return the compilation backend identifier.
