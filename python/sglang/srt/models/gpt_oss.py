@@ -731,6 +731,7 @@ class GptOssModel(nn.Module):
                     positions, hidden_states, forward_batch, residual
                 )
                 if i + 1 in self.layers_to_capture:
+                    hidden_states = complete_deferred_allreduce(hidden_states)
                     aux_hidden_states.append(
                         hidden_states + residual
                         if residual is not None

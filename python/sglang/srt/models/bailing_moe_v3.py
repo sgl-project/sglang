@@ -1387,6 +1387,7 @@ class BailingMoELinearModel(nn.Module):
                     and i in self.layers_to_capture
                     and hidden_states.shape[0] != 0
                 ):
+                    hidden_states = complete_deferred_allreduce(hidden_states)
                     if residual is None:
                         dspark_aux_hidden_states.append(hidden_states)
                     else:

@@ -833,6 +833,7 @@ class BailingMoEModel(nn.Module):
         for i in range(self.start_layer, self.end_layer):
             with get_global_expert_distribution_recorder().with_current_layer(i):
                 if i in self.layers_to_capture:
+                    hidden_states = complete_deferred_allreduce(hidden_states)
                     aux_hidden_states.append(
                         hidden_states if residual is None else hidden_states + residual
                     )
