@@ -16,7 +16,15 @@ For all methods and hardware platforms, see the [official SGLang installation gu
 
 <Tab title="Python (pip / uv)">
 
-Qwen3.8-Flash-Next support is not in a tagged release yet, so build the model-support PR rather than installing from PyPI:
+For **B200 + NVFP4 (NVDA)**, use SGLang v0.5.20, which includes the NVIDIA ModelOpt MIXED_PRECISION loader:
+
+```bash Command
+pip install -U uv
+uv venv --python 3.12 && source .venv/bin/activate
+uv pip install 'sglang==0.5.20'
+```
+
+The other recipes below retain their original model-support build:
 
 ```bash Command
 pip install -U uv
@@ -31,7 +39,7 @@ uv pip install -e python
 ```
 
 <Note>
-Model support lands in [#36497](https://github.com/sgl-project/sglang/pull/36497). Once it is in a release, `uv pip install sglang` is enough and this whole step goes away.
+The original source recipes use [#36497](https://github.com/sgl-project/sglang/pull/36497). Use the release above for the B200 NVIDIA NVFP4 recipe.
 </Note>
 
 Then run the **Python** output of the command panel below in that environment.
@@ -40,7 +48,13 @@ Then run the **Python** output of the command panel below in that environment.
 
 <Tab title="Docker">
 
-**NVIDIA datacenter GPUs** (H200 / B200 / B300 / GB300): the launch image, since this is a day-0 model with no release cut yet:
+**B200 + NVFP4 (NVDA)**: verified with the released CUDA 13.0 image on four B200 GPUs, using the checkpoint's own MTP head:
+
+```bash Command
+docker pull lmsysorg/sglang:v0.5.20-cu130
+```
+
+**Other NVIDIA datacenter recipes** (H200 / B200 / B300 / GB300): the original launch image:
 
 ```bash Command
 docker pull lmsysorg/sglang:qwen38flashnext

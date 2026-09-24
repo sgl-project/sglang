@@ -9,7 +9,7 @@
 //
 // Every datacenter recipe on this page is single-node: BF16 and FP8 run TP4 (so
 // four GPUs of an 8-GPU H200/B200/B300 host, or a whole 4-GPU GB300 node), NVFP4
-// runs on a single GPU, and the AMD cells run TP8. That fits because 6B active
+// uses TP1 for RadixArk and TP4 for NVIDIA on B200; the AMD cells run TP8. That fits because 6B active
 // params keeps compute small and the N-gram table is the only large weight block.
 // The one multi-node shape is NVFP4 on a pair of DGX Sparks (GB10): the 126 GiB
 // checkpoint does not fit one 128 GB unified-memory box with the N-gram table
@@ -44,7 +44,7 @@ export const config = {
   // Two NVFP4 exports exist: RadixArk's (routed experts NVFP4, everything else
   // BF16 with an FP8 N-gram table) and NVIDIA's ModelOpt MIXED_PRECISION export
   // (NVFP4 experts, FP8 N-gram table, FP8 block-scaled MTP experts). The NVIDIA
-  // one has recipes for the DGX Spark pair and the single RTX PRO 6000.
+  // one has recipes for B200, DGX Spark and the single RTX PRO 6000.
   quantizations: [
     { id: "bf16",       label: "BF16"         },
     { id: "fp8",        label: "FP8"          },
@@ -200,6 +200,7 @@ export const config = {
     "dgx-spark": "lmsysorg/sglang:dev-qwen38-next-local",
     rtx6000: "lmsysorg/sglang:dev-qwen38-next-local",
     b200:   "lmsysorg/sglang:qwen38flashnext",
+    "b200|nvfp4-nvda": "lmsysorg/sglang:v0.5.20-cu130",
     b300:   "lmsysorg/sglang:qwen38flashnext",
     gb300:  "lmsysorg/sglang:qwen38flashnext",
     mi350x: "lmsysorg/sglang-rocm:qwen38flashnext",
@@ -719,6 +720,26 @@ export const config = {
         "--linear-attn-decode-backend flashinfer",
         "--mamba-ssm-dtype bfloat16",
         "--reasoning-parser auto",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+
+    {
+      match: { hw: "b200", variant: "default", quant: "nvfp4-nvda", strategy: "low-latency", nodes: "single" },
+      verified: true,
+      warn: "Verified on 4x B200 with lmsysorg/sglang:v0.5.20-cu130. This NVIDIA ModelOpt MIXED_PRECISION export needs a newer loader than the qwen38flashnext image provides. Quantization and MoE backends are selected automatically from the checkpoint.",
+      env: [],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--tp 4",
+        "--linear-attn-prefill-backend flashinfer",
+        "--linear-attn-decode-backend flashinfer",
+        "--mamba-ssm-dtype bfloat16",
+        "--speculative-algorithm NEXTN",
+        "--speculative-num-steps 3",
+        "--speculative-eagle-topk 1",
+        "--speculative-num-draft-tokens 4",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
