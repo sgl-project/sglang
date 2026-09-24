@@ -159,7 +159,11 @@ def smallm_moe_enabled() -> bool:
     """True unless SGLANG_ROCM_SMALLM_MOE=0, when the device is exactly gfx950 on ROCm >= 7.2 (the kernel uses
     v_cvt_scalef32_pk_bf16_fp4 / v_dot2_f32_bf16 and needs that toolchain), hipcc is present, and no build/load
     failure has disabled the kernel in this process. Numerics differ slightly from the aiter path (bf16 activations
-    instead of MXFP4 a4w4); GSM8K matches within run-to-run noise."""
+    instead of MXFP4 a4w4); GSM8K matches within run-to-run noise.
+
+    Model coverage: the kernel is compiled for one shape only, Qwen3.5-397B-A17B MXFP4 at TP4 (hidden 4096,
+    per-rank intermediate 256, top-10 plus the optional fused shared expert). There is no model-name check;
+    smallm_moe_supported() enforces the shape, and every other model or parallel layout keeps aiter fused_moe."""
     global _available
     if os.environ.get(_ENV, "1") == "0":
         return False
@@ -294,7 +298,9 @@ def smallm_moe_supported(
         return False
     if tok > min(MAX_TOK, MAX_TOK_DISPATCH[inter]):
         return False
-    if topk_ids.shape[1] not in (10, 11) or tok * topk_ids.shape[1] > 704:
+    # 704 = MAX_TOK (64) * 11 slots: the kernels stage the whole topk_ids table in a
+    # fixed-size LDS array (MAX_NSLOT in smallm_moe.hip); larger tables would overrun it.
+    if topk_ids.shape[1] not in (10, 11) or tok * topk_ids.shape[1] > MAX_TOK * 11:
         return False
     if (
         expert_mask is not None
