@@ -1,6 +1,6 @@
 ---
 title: Install SGLang Diffusion
-description: Install SGLang Diffusion on NVIDIA, AMD, MUSA, and Ascend platforms.
+description: Install SGLang Diffusion on NVIDIA, AMD, MUSA, Ascend, and Apple Silicon platforms.
 ---
 You can install SGLang-Diffusion using one of the methods below. The standard installation already includes SGLang's optimized kernel stack, including both `sgl-kernel` and JIT kernels used by diffusion workloads.
 
@@ -127,5 +127,35 @@ cp python/pyproject_other.toml python/pyproject.toml
 uv pip install -e "python[all_mps]"
 ```
 
-SGLang Diffusion uses PyTorch MPS. The `all_mps` extra also installs the SRT
-MLX backend dependencies; `SGLANG_USE_MLX` applies only to SRT serving.
+These instructions install the PyTorch MPS runtime. The `all_mps` extra also
+installs the SRT MLX backend dependencies; `SGLANG_USE_MLX` applies only to SRT
+serving.
+
+### Native MLX for Qwen-Image 2.1
+
+The experimental native MLX pipeline runs Qwen-Image 2.1 on Apple Silicon macOS.
+Use the source checkout, virtual environment, and alternate `pyproject.toml`
+steps above, then replace the final package installation with:
+
+```bash Command
+SGLANG_BUILD_RUST_EXTS=none uv pip install -e "python[diffusion_mlx]"
+mv python/pyproject.toml.bak python/pyproject.toml
+```
+
+The optional Rust extensions are not required for this pipeline. This extra
+installs MLX and the standard Diffusion CLI/API dependencies without
+the SRT MLX language-model runtime. The second command restores the source
+checkout's default package metadata after installation.
+
+Keep a conservative allocation limit for the shared PyTorch MPS runtime on a
+48 GB Mac; the model computation uses MLX:
+
+```bash Command
+export PYTORCH_MPS_HIGH_WATERMARK_RATIO=0.15
+export PYTORCH_MPS_LOW_WATERMARK_RATIO=0.12
+```
+
+The model path selects the native pipeline;
+you do not need `SGLANG_USE_MLX`. See the
+[Qwen-Image 2.1 MLX recipe](/cookbook/diffusion/Qwen-Image/Qwen-Image-2.1#apple-silicon-mlx)
+for the supported weight format, commands, and limitations.

@@ -32,6 +32,8 @@ SGLang Diffusion supports Moore Threads GPUs (MTGPU) through the MUSA software s
 
 SGLang Diffusion supports Apple Silicon (M-series) via the MPS backend. Since Triton is Linux-only, Triton kernels are replaced with PyTorch-native fallbacks on MPS. See the [installation guide](https://docs.sglang.io/docs/sglang-diffusion/installation) for setup instructions.
 
+Qwen-Image 2.1 also has an experimental native MLX pipeline for the community Q4 weight pack, with RGBA generation and image editing. See the [MLX recipe](https://docs.sglang.io/cookbook/diffusion/Qwen-Image/Qwen-Image-2.1#apple-silicon-mlx) for installation, commands, and supported features.
+
 ## Getting Started
 
 ```bash

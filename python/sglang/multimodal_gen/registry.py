@@ -367,6 +367,7 @@ KNOWN_NON_DIFFUSERS_DIFFUSION_MODEL_PATTERNS: Dict[str, str] = {
     "fal/ideogram-v4-fast": "Ideogram4FastPipeline",
     "fal/ideogram-v4-instant": "Ideogram4InstantPipeline",
     "comfy-org/ideogram-4": "Ideogram4Nvfp4Pipeline",
+    "toxicdog/qwen-image-2.1-mlx": "QwenImage21MLXPipeline",
 }
 
 
@@ -1138,7 +1139,7 @@ def _register_configs():
     register_configs(
         sampling_param_cls=QwenImage21SamplingParams,
         pipeline_config_cls=QwenImage21PipelineConfig,
-        hf_model_paths=["Qwen/Qwen-Image-2.1"],
+        hf_model_paths=["Qwen/Qwen-Image-2.1", "toxicdog/Qwen-Image-2.1-MLX"],
         model_detectors=[lambda hf_id: "qwen-image-2.1" in hf_id.lower()],
     )
     register_configs(
