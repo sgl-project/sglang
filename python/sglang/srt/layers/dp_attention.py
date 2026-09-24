@@ -3,7 +3,7 @@ from __future__ import annotations
 import functools
 import logging
 from enum import IntEnum, auto
-from typing import TYPE_CHECKING, List, Optional, Tuple
+from typing import TYPE_CHECKING, List, Optional, Sequence, Tuple
 
 import torch
 import triton
@@ -510,11 +510,22 @@ def memcpy(dst, src, dim, offset, sz, offset_src):
     memcpy_func(dst, src, dim, offset, sz, offset_src)
 
 
+def _cp_shard_rows(
+    forward_batch: ForwardBatch, cp_shard_counts: Sequence[int]
+) -> Tuple[int, int]:
+    """(start, length) of this rank's CP shard in the gathered buffer: the CP ranks'
+    shards lie back to back, in CP rank order, at the start of their DP slot."""
+    cp_rank = get_parallel().attn_cp_rank
+    dp_start = sum(forward_batch.global_num_tokens_cpu[: dp_gather_slot()])
+    return dp_start + sum(cp_shard_counts[:cp_rank]), cp_shard_counts[cp_rank]
+
+
 def _dp_gather_via_all_reduce(
     global_tokens: torch.Tensor,
     local_tokens: torch.Tensor,
     forward_batch: ForwardBatch,
     is_partial: bool,
+    cp_shard_counts: Optional[Sequence[int]] = None,
 ):
     local_start_pos, local_num_tokens = get_dp_local_info(forward_batch)
 
@@ -522,12 +533,23 @@ def _dp_gather_via_all_reduce(
     assert local_tokens.is_contiguous()
     assert global_tokens.is_contiguous()
 
-    if local_tokens.shape[0] > 0 and (is_partial or get_parallel().attn_tp_rank == 0):
+    # CP ranks holding the same rows of their DP group leave them to CP rank 0.
+    writes = is_partial or get_parallel().attn_tp_rank == 0
+    if cp_shard_counts is None:
+        writes = writes and get_parallel().attn_cp_rank == 0
+
+    if local_tokens.shape[0] > 0 and writes:
         assert local_tokens.untyped_storage() is not global_tokens.untyped_storage(), (
             "aliasing between global_tokens and local_tokens not allowed"
         )
 
-        memcpy(global_tokens, local_tokens, 0, local_start_pos, local_num_tokens, False)
+        if cp_shard_counts is None:
+            memcpy(
+                global_tokens, local_tokens, 0, local_start_pos, local_num_tokens, False
+            )
+        else:
+            start, length = _cp_shard_rows(forward_batch, cp_shard_counts)
+            global_tokens[start : start + length].copy_(local_tokens[:length])
 
     # Input IDs are in int 32. We should use inplace_all_reduce for local case because of custom all reduce.
     if world_dp_gather_enabled():
@@ -822,8 +844,17 @@ def _dp_gather(
     local_tokens: torch.Tensor,
     forward_batch: ForwardBatch,
     is_partial: bool,
+    cp_shard_counts: Optional[Sequence[int]] = None,
 ):
     _note_dp_gather_in_prefill_graph()
+    if get_parallel().attn_cp_size > 1:
+        # The all-gathers take one block from every rank of the TP group, which
+        # spans the CP ranks as well; only placement before a sum can drop the
+        # copies CP ranks share or put their shards side by side.
+        _dp_gather_via_all_reduce(
+            global_tokens, local_tokens, forward_batch, is_partial, cp_shard_counts
+        )
+        return
     if (
         is_dp_gatherv_active()
         and forward_batch.dp_padding_mode is not None
@@ -864,22 +895,41 @@ def dp_gather_partial(
     global_tokens: torch.Tensor,
     local_tokens: torch.Tensor,
     forward_batch: ForwardBatch,
+    cp_shard_counts: Optional[Sequence[int]] = None,
 ):
-    _dp_gather(global_tokens, local_tokens, forward_batch, is_partial=True)
+    """``cp_shard_counts``: when the CP ranks of a DP group hold different shards
+    of its tokens, the rows of each shard that hold tokens; None when every CP
+    rank holds all of them. A shard padded past its tokens has the padding
+    skipped here and zeroed by ``dp_scatter``."""
+    _dp_gather(
+        global_tokens,
+        local_tokens,
+        forward_batch,
+        is_partial=True,
+        cp_shard_counts=cp_shard_counts,
+    )
 
 
 def dp_gather_replicate(
     global_tokens: torch.Tensor,
     local_tokens: torch.Tensor,
     forward_batch: ForwardBatch,
+    cp_shard_counts: Optional[Sequence[int]] = None,
 ):
-    _dp_gather(global_tokens, local_tokens, forward_batch, is_partial=False)
+    _dp_gather(
+        global_tokens,
+        local_tokens,
+        forward_batch,
+        is_partial=False,
+        cp_shard_counts=cp_shard_counts,
+    )
 
 
 def dp_scatter(
     local_tokens: torch.Tensor,  # output
     global_tokens: torch.Tensor,  # input
     forward_batch: ForwardBatch,
+    cp_shard_counts: Optional[Sequence[int]] = None,
 ):
     _note_dp_gather_in_prefill_graph()
     # local_num_tokens is not necessarily the same as local_tokens.shape[0],
@@ -894,7 +944,13 @@ def dp_scatter(
             "aliasing between local_tokens and global_tokens not allowed"
         )
 
-        memcpy(local_tokens, global_tokens, 0, local_start_pos, local_num_tokens, True)
+        if cp_shard_counts is None:
+            memcpy(
+                local_tokens, global_tokens, 0, local_start_pos, local_num_tokens, True
+            )
+        else:
+            start, length = _cp_shard_rows(forward_batch, cp_shard_counts)
+            local_tokens[:length].copy_(global_tokens[start : start + length])
 
 
 def can_use_dp_reduce_scatter() -> bool:

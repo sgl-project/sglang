@@ -16,7 +16,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import Enum, auto
 from functools import cached_property, partial
-from typing import Callable, Dict, Optional, Tuple, Union
+from typing import Callable, Dict, List, Optional, Sequence, Tuple, Union
 
 import torch
 
@@ -521,6 +521,13 @@ def moe_cp_gathered_rows(forward_batch: ForwardBatch) -> Optional[GatheredRows]:
     ):
         return None
     return GatheredRows.of(forward_batch.attn_cp_metadata.per_rank_actual_token)
+
+
+def _cp_shard_token_rows(forward_batch: ForwardBatch) -> List[int]:
+    """Rows of each CP rank's shard that hold tokens; the shards are padded to one
+    length after them."""
+    metadata = forward_batch.attn_cp_metadata
+    return metadata.per_rank_logical_token or metadata.per_rank_actual_token
 
 
 def enable_dwdp():
@@ -1338,6 +1345,7 @@ class CommunicateWithAllReduceAndLayerNormFn:
         context: CommunicateContext,
         *,
         residual_input_mode,
+        cp_shard_counts: Optional[Sequence[int]] = None,
     ):
         if get_attn_tp_context().input_scattered:
             return CommunicateWithAllReduceAndLayerNormFn._tp_all_reduce_with_scattered_residual(
@@ -1375,12 +1383,16 @@ class CommunicateWithAllReduceAndLayerNormFn:
                 hidden_states,
             )
             if use_layer_norm_before_gather:
-                dp_gather_replicate(hidden_states, local_hidden_states, forward_batch)
+                dp_gather_replicate(
+                    hidden_states, local_hidden_states, forward_batch, cp_shard_counts
+                )
             else:
-                dp_gather_partial(hidden_states, local_hidden_states, forward_batch)
+                dp_gather_partial(
+                    hidden_states, local_hidden_states, forward_batch, cp_shard_counts
+                )
 
             if not use_layer_norm_before_gather:
-                dp_scatter(residual, hidden_states, forward_batch)
+                dp_scatter(residual, hidden_states, forward_batch, cp_shard_counts)
                 if hidden_states.shape[0] != 0:
                     hidden_states = layernorm(hidden_states)
         else:
@@ -1461,15 +1473,29 @@ class CommunicateWithAllReduceAndLayerNormFn:
     ):
         """Allgather tokens for MoE when moe_dp_size < attn_cp_size.
 
-        Steps:
-          1. Standard attn-TP all-reduce + optional DP allgather + layernorm (same as
-             _gather_hidden_states_and_residual for the dp>1 case, or simple all-reduce
-             + layernorm for dp==1).
+        Under attention DP, the DP gather places each CP rank's shard in its DP
+        group's slot and so gathers across CP as well. Otherwise:
+          1. attn-TP all-reduce + layernorm.
           2. moe_cp allgather: gather tokens from cp_per_moe CP ranks so each rank holds
              all tokens for its MoE group.
 
         Residual is left at TP_ATTN_FULL throughout.
         """
+        rows = moe_cp_gathered_rows(forward_batch)
+        if context.attn_dp_size != 1:
+            # An idle DP group holds no rows but still joins the DP gather.
+            return CommunicateWithAllReduceAndLayerNormFn._gather_hidden_states_and_residual(
+                hidden_states=hidden_states,
+                residual=residual,
+                forward_batch=forward_batch,
+                layernorm=layernorm,
+                context=context,
+                residual_input_mode=residual_input_mode,
+                cp_shard_counts=(
+                    None if rows is None else _cp_shard_token_rows(forward_batch)
+                ),
+            )
+
         # Early return on empty tensor is safe for MOE_CP because:
         # - During CP extend: zigzag split guarantees all CP ranks have non-zero tokens,
         #   so no rank hits this path while others proceed to the allgather.
@@ -1478,7 +1504,7 @@ class CommunicateWithAllReduceAndLayerNormFn:
         if hidden_states.shape[0] == 0:
             return hidden_states, residual
 
-        # Step 1: Standard all-reduce/DP-allgather + layernorm (reuse existing logic).
+        # Step 1: attn-TP all-reduce + layernorm (reuse existing logic).
         hidden_states, residual = (
             CommunicateWithAllReduceAndLayerNormFn._gather_hidden_states_and_residual(
                 hidden_states=hidden_states,
@@ -1491,7 +1517,6 @@ class CommunicateWithAllReduceAndLayerNormFn:
         )
 
         # Step 2: moe_cp allgather — gather across cp_per_moe CP ranks.
-        rows = moe_cp_gathered_rows(forward_batch)
         if rows is not None and hidden_states.shape[0] > 0:
             # CP ranks can hold unequal token counts (e.g. zigzag when
             # seq_len % (cp_size * 2) != 0). NCCL allgather requires equal
@@ -1662,18 +1687,10 @@ class CommunicateSummableTensorPairFn:
         full MoE result for all cp_per_moe token chunks. We simply slice out this rank's
         CP-local portion.
 
-        If DP>1, further scatter back to the local DP slice.
+        Under attention DP, take back this rank's rows from where the DP gather put
+        them: its DP slot, or its CP shard within the slot.
         """
-        # Only scatter back during prefill; decode was never allgathered so no-op.
-        # Safe w.r.t. empty tensors: same reasoning as _gather_hidden_states_and_residual_moe
-        # — CP extend always has non-zero tokens per rank, and decode skips this path.
         rows = moe_cp_gathered_rows(forward_batch)
-        if rows is not None:
-            # Extract this rank's actual (non-padded) tokens from its chunk.
-            start, length = rows.rank_rows(get_moe_cp_rank())
-            hidden_states = hidden_states.narrow(0, start, length).contiguous()
-
-        # DP scatter (if DP attention is enabled)
         if context.attn_dp_size > 1:
             if get_parallel().tp_size == get_parallel().attn_dp_size:
                 group = get_parallel().tp_group
@@ -1683,7 +1700,27 @@ class CommunicateSummableTensorPairFn:
                 get_local_dp_buffer(group),
                 hidden_states,
             )
-            dp_scatter(hidden_states_output, global_hidden_states, forward_batch)
-            hidden_states = hidden_states_output
+            cp_shard_counts = None
+            if rows is not None:
+                # This rank's shard, at its padded length.
+                hidden_states_output = hidden_states_output[
+                    : rows.counts[get_parallel().attn_cp_rank]
+                ]
+                cp_shard_counts = _cp_shard_token_rows(forward_batch)
+            dp_scatter(
+                hidden_states_output,
+                global_hidden_states,
+                forward_batch,
+                cp_shard_counts,
+            )
+            return hidden_states_output, residual
+
+        # Only scatter back during prefill; decode was never allgathered so no-op.
+        # Safe w.r.t. empty tensors: same reasoning as _gather_hidden_states_and_residual_moe
+        # — CP extend always has non-zero tokens per rank, and decode skips this path.
+        if rows is not None:
+            # Extract this rank's actual (non-padded) tokens from its chunk.
+            start, length = rows.rank_rows(get_moe_cp_rank())
+            hidden_states = hidden_states.narrow(0, start, length).contiguous()
 
         return hidden_states, residual
