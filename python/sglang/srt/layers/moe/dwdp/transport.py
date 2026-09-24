@@ -77,6 +77,7 @@ def _copy_local_weights_to_handles(
 
         param.untyped_storage().resize_(0)
 
+        # Release freed memory per shard to avoid doubling peak memory.
         torch.cuda.empty_cache()
 
         handles[(layer_idx, name)] = handle
