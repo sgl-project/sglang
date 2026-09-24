@@ -51,7 +51,7 @@ class SchedulerLogprobResultProcessor:
 
         # Clip padded hash values from image tokens to prevent detokenization errors
         req.logprob.input_token_logprobs_idx = [
-            x if x < self.model_config.vocab_size - 1 else 0
+            x if 0 <= x < self.model_config.vocab_size else 0
             for x in input_token_logprobs_idx
         ]
 

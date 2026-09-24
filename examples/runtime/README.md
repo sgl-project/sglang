@@ -12,8 +12,23 @@ The below examples will mostly need you to start a server in a separate terminal
   An example that demonstrates how to [prefill a response](https://eugeneyan.com/writing/prompting/#prefill-claudes-responses) using the OpenAI API by enabling the `continue_final_message` parameter.
   When enabled, the final (partial) assistant message is removed and its content is used as a prefill so that the model continues that message rather  than starting a new turn. See [Anthropic's prefill example](https://docs.anthropic.com/en/docs/build-with-claude/prompt-engineering/prefill-claudes-response#example-structured-data-extraction-with-prefilling) for more context.
 * `reward_model.py`: An example how to extract scores from a reward model.
+* [`rawsystemone.py`](rawsystemone.py): Score complete prefix-suffix candidates with the native API. The standalone [OpenAPI 3.1 schema](rawsystemone.openapi.json) describes requests, responses, errors, and bearer authentication for client generation.
 * `vertex_predict.py`: An example how to deploy a model to [Vertex AI](https://cloud.google.com/vertex-ai?hl=en).
 * `chain_of_verification.py`: An example of [Chain-of-Verification (CoVe)](https://arxiv.org/abs/2309.11495) to reduce hallucinations. The model drafts an answer, then verifies it in a **fresh, isolated session** (no shared KV-cache) to avoid self-confirmation bias, and refines if needed.
+
+Regenerate the rawsystemone schema from the repository root with Python 3.10+ and
+Pydantic 2; no running server or GPU dependencies are needed:
+
+```bash
+python scripts/export_rawsystemone_openapi.py
+python scripts/export_rawsystemone_openapi.py --check
+```
+
+The schema follows the [v1.2 specification](../../sglang_rawsystemone_spec_v1_2.md).
+Its field types come from the implementation's Pydantic models; the exporter adds
+HTTP errors and wire-format semantics. `--check` detects drift from the exporter
+and models. Review these annotations when changing the handler's behavior.
+
 ## Engine
 
 The `engine` folder contains that examples that show how to use [Offline Engine API](https://docs.sglang.io/basic_usage/offline_engine_api.html#Offline-Engine-API) for common workflows.

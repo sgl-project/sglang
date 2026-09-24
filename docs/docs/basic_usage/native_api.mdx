@@ -15,6 +15,7 @@ Apart from the OpenAI compatible APIs, the SGLang Runtime also provides its nati
 - `/encode`(embedding model)
 - `/v1/rerank`(cross encoder rerank model)
 - `/v1/score`(decoder-only scoring)
+- `/v1/rawsystemone` (full-sequence completion likelihood)
 - `/classify`(reward model)
 - `/start_expert_distribution_record`
 - `/stop_expert_distribution_record`
@@ -50,6 +51,126 @@ data = {"text": "What is the capital of France?"}
 response = requests.post(url, json=data)
 print_highlight(response.json())
 ```
+
+## Rawsystemone: full-sequence completion likelihood
+
+`POST /v1/rawsystemone` scores each exact `prefix + suffix` concatenation using
+the model already loaded in this server. It returns the mean token
+log-probability of the **entire sequence**, including all scoreable prefix tokens.
+It does not generate an answer or apply a chat template. `/v1/score` retains its
+existing behavior.
+
+```bash
+curl http://127.0.0.1:30000/v1/rawsystemone \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "prefix": "Customer: Please cancel my appointment.\n\nThe requested operation is",
+    "suffixes": [" booking.", " cancellation.", " rescheduling."],
+    "return_token_logprobs": true
+  }'
+```
+
+Use your normal bearer authorization header when the server requires an API key.
+The only request fields are `prefix` (string), `suffixes` (nonempty list of
+strings), and optional `return_token_logprobs` (boolean, default `false`). Types
+are strict and unknown fields are rejected. Whitespace and Unicode are preserved
+before native tokenization. Empty strings are accepted when every resulting
+candidate has at least two native tokens. Duplicate suffixes retain separate
+result indices.
+
+For native token IDs `x[0], ..., x[n-1]`, the score is:
+
+```text
+logprob_sum = sum(log P(x[t] | x[:t]) for t in 1..n-1)
+scored_token_count = n - 1
+score = logprob_sum / scored_token_count
+```
+
+The first native token has no predictor and is excluded. A native leading BOS
+occupies that position when the tokenizer adds one; later special tokens are
+scored normally. The handler uses the configured raw-text tokenizer policy and
+never adds its own BOS, EOS, whitespace, or separators. Zero log-probabilities
+count toward the denominator. Scores use vocabulary-wide log-softmax at
+temperature 1 and are not calibrated interpretation probabilities.
+
+The response has `object: "rawsystemone"`, `model`,
+`scoring: "mean_logprob_full_sequence"`, `tokenization: "native_text_v1"`, an
+ordered `data` list, and `best_index`. Each result includes `index`, `score`,
+`logprob_sum`, and `scored_token_count`. The complete native token count is
+`scored_token_count + 1`. Higher scores win;
+exact ties select the first original index. Requested `token_logprobs` contain
+every absolute `position`, `token_id`, and `logprob`, including an initial `null`.
+Without the option, token arrays are omitted. Prompts are never echoed.
+
+`usage.input_tokens` and `usage.scored_tokens` are logical totals across all
+original candidates, including duplicates and repeated prefixes.
+`usage.generated_tokens` is zero. These are not physical GPU-work counters.
+
+### Batching and limits
+
+The handler tokenizes complete concatenations, deduplicates token sequences,
+and plans their common token prefix before dividing work into batches. With a
+useful common span and radix caching enabled, it scores the common prefix once,
+then submits independent tails through the existing native batch API. Batches
+start as admission slots become available; a slow batch does not impose a wave
+barrier. Cache-disabled requests use bounded full-sequence batches.
+
+All limits are server settings; callers still send one request. Values must be
+positive. Native context, KV-pool, scheduler, authentication, and HTTP limits
+continue to apply. Oversized candidates are rejected before prefix inference,
+even if the server otherwise permits automatic truncation.
+
+| CLI flag | Default | Meaning |
+| --- | ---: | --- |
+| `--rawsystemone-max-options` | 128 | Original suffix count |
+| `--rawsystemone-max-request-tokens` | 1048576 | Logical candidate tokens, including duplicates |
+| `--rawsystemone-max-candidates-per-batch` | 32 | Distinct candidates per native batch |
+| `--rawsystemone-max-tokens-per-batch` | 65536 | Full-input token target per batch |
+| `--rawsystemone-max-inflight-batches-per-request` | 2 | Concurrent batches per parent |
+| `--rawsystemone-max-inflight-batches` | 8 | Concurrent batches across parents |
+| `--rawsystemone-max-inflight-candidates` | 256 | Admitted candidates across parents |
+| `--rawsystemone-max-inflight-tokens` | 1048576 | Admitted full-input tokens across parents |
+| `--rawsystemone-max-pending-requests` | 64 | Active plus queued parents; overflow returns 429 |
+| `--rawsystemone-timeout-seconds` | 300 | Deadline including admission and inference |
+
+A candidate larger than the preferred batch token target runs alone if it fits
+the hard request, context, and admission limits. Admission is FIFO and counts
+full inputs, even on expected cache hits. The native scheduler still decides
+device execution; simultaneous submissions do not imply simultaneous GPU kernels.
+
+### Modes, errors, and diagnostics
+
+The initial implementation admits text-only `LlamaForCausalLM`,
+`Qwen2ForCausalLM`, `Qwen3ForCausalLM`, and `MistralForCausalLM` configurations.
+It rejects embedding/classification, multimodal, encoder-decoder, diffusion,
+speculative, MIS, data/pipeline parallel, disaggregated, and multiple-tokenizer
+worker configurations. Tensor parallelism and chunked prefill use the native
+path but require deployment-specific parity validation. No GPU configuration
+has been benchmarked as part of this patch; see the validation report below.
+
+Errors use the existing flat error envelope: `object`, `message`, `type`, `param`,
+and numeric HTTP `code`. Stable types include `invalid_request`,
+`no_scoreable_tokens`, `too_many_options`, `token_budget_exceeded`,
+`context_length_exceeded`, `unsupported_mode`, `tokenizer_unavailable`,
+`incomplete_scores`, `non_finite_scores`, `inference_error`, `overloaded`,
+`timeout`, and `model_changed`. Weight-update activity invalidates the whole
+composite result with HTTP 409, even if the model path is unchanged. Failed or
+partially applied updates conservatively invalidate results too. Disconnects,
+timeouts, and branch failures abort children and release admission slots.
+
+Children disable request-content logging. A private cache salt is shared within
+each parent request; middleware-provided `request.state.cache_salt` is preserved
+if present. Default requests therefore do not reuse KV entries across parents.
+INFO diagnostics record request ID, counts, common span, scoring/fallback mode,
+per-batch queue/elapsed times, observed concurrent submissions, and native cache
+hit counters when available. They exclude text, token IDs, salts, and token
+scores. Native uncached-input counters are not measurements of attention FLOPs.
+
+Run the client in `examples/runtime/rawsystemone.py`. Reproducible validation
+commands, benchmark methodology, and the implementation report are in
+`benchmark/rawsystemone/README.md` and `benchmark/rawsystemone/IMPLEMENTATION.md`
+in the source checkout. An optional LLM-to-completion compiler belongs in client
+code; this endpoint never calls it.
 
 ## Get Model Info
 

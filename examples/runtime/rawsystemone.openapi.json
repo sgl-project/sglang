@@ -1,0 +1,455 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "SGLang rawsystemone API",
+    "version": "1.2",
+    "description": "Standalone contract for the native scoring endpoint from sglang_rawsystemone_spec_v1_2.md. Generated from the implemented Pydantic models with wire-format and semantic annotations. Regenerate with python scripts/export_rawsystemone_openapi.py."
+  },
+  "servers": [
+    {
+      "url": "http://localhost:30000",
+      "description": "Example local SGLang server; replace with your deployment URL."
+    }
+  ],
+  "paths": {
+    "/v1/rawsystemone": {
+      "post": {
+        "operationId": "scoreRawSystemOne",
+        "summary": "Score complete prefix-suffix candidates",
+        "description": "Concatenate prefix + suffix independently for each candidate, tokenize the complete text with the native tokenizer, and score every token except the first. Prefix tokens contribute to both the sum and denominator. Uses the already-loaded default model; no generation, streaming, model selection, or sampling parameters. Server limits apply to the number of options, each candidate's native context length, and total logical candidate tokens (default 1,048,576, including duplicates). Internal batching and concurrency are configured by the server.",
+        "security": [
+          {},
+          {
+            "BearerAuth": []
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RawSystemOneRequest"
+              },
+              "example": {
+                "prefix": "Customer: Please move my appointment to Friday.\n\nThe requested operation is",
+                "suffixes": [
+                  " booking.",
+                  " cancellation.",
+                  " rescheduling."
+                ],
+                "return_token_logprobs": false
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Complete scores for every candidate. All scores are finite; failures return an error instead of a partial result. Example values are illustrative, not measured model outputs.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RawSystemOneResponse"
+                },
+                "example": {
+                  "id": "rawsystemone-example",
+                  "object": "rawsystemone",
+                  "model": "served-model-name",
+                  "scoring": "mean_logprob_full_sequence",
+                  "tokenization": "native_text_v1",
+                  "data": [
+                    {
+                      "index": 0,
+                      "score": -1.8,
+                      "logprob_sum": -36.0,
+                      "scored_token_count": 20
+                    },
+                    {
+                      "index": 1,
+                      "score": -1.7,
+                      "logprob_sum": -34.0,
+                      "scored_token_count": 20
+                    },
+                    {
+                      "index": 2,
+                      "score": -1.5,
+                      "logprob_sum": -30.0,
+                      "scored_token_count": 20
+                    }
+                  ],
+                  "best_index": 2,
+                  "usage": {
+                    "input_tokens": 63,
+                    "scored_tokens": 60,
+                    "generated_tokens": 0
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid bearer API key when server authentication is enabled.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AuthenticationError"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid fields, types, JSON, or Content-Type (invalid_request); unsupported serving configuration (unsupported_mode); or candidate limits (too_many_options, no_scoreable_tokens, context_length_exceeded, token_budget_exceeded). No candidate is silently truncated. Validation uses HTTP 400, not 422.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RawSystemOneError"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Model weights changed during scoring (model_changed). Retry the whole request.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RawSystemOneError"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "The admission queue or native scheduler is overloaded (overloaded).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RawSystemOneError"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Incomplete native score coverage (incomplete_scores), non-finite scores (non_finite_scores), or native inference failure (inference_error).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RawSystemOneError"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "The native tokenizer is unavailable (tokenizer_unavailable), or native inference is overloaded (overloaded).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RawSystemOneError"
+                }
+              }
+            }
+          },
+          "504": {
+            "description": "The server-configured scoring deadline expired (timeout); default 300 seconds.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RawSystemOneError"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Other HTTP failure propagated from native inference (inference_error).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RawSystemOneError"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "RawSystemOneRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "prefix": {
+            "title": "Prefix",
+            "type": "string",
+            "description": "Text prepended exactly to every suffix, without inserted whitespace, separators, or chat templates. Empty strings are allowed."
+          },
+          "suffixes": {
+            "items": {
+              "type": "string"
+            },
+            "minItems": 1,
+            "title": "Suffixes",
+            "type": "array",
+            "description": "Ordered candidate suffixes. Duplicates and empty strings are allowed. Each complete prefix + suffix must have at least two native tokens. The server-configured option limit defaults to 128; it is not a fixed schema limit."
+          },
+          "return_token_logprobs": {
+            "default": false,
+            "title": "Return Token Logprobs",
+            "type": "boolean",
+            "description": "Include complete native token records for every candidate. When false, token_logprobs is omitted from every result."
+          }
+        },
+        "required": [
+          "prefix",
+          "suffixes"
+        ],
+        "title": "RawSystemOneRequest",
+        "type": "object"
+      },
+      "CandidateScore": {
+        "properties": {
+          "index": {
+            "title": "Index",
+            "type": "integer",
+            "description": "Zero-based index in the request's suffixes array.",
+            "minimum": 0
+          },
+          "score": {
+            "title": "Score",
+            "type": "number",
+            "description": "logprob_sum / scored_token_count. Higher is better. This is not a calibrated probability that a candidate is correct.",
+            "format": "double"
+          },
+          "logprob_sum": {
+            "title": "Logprob Sum",
+            "type": "number",
+            "description": "Sum of all scoreable token log-probabilities in the complete candidate, including prefix tokens. Uses natural logarithms.",
+            "format": "double"
+          },
+          "scored_token_count": {
+            "title": "Scored Token Count",
+            "type": "integer",
+            "description": "Number of native tokens in the complete prefix + suffix minus one; only the first native token is excluded. This is the score denominator.",
+            "minimum": 1
+          },
+          "token_logprobs": {
+            "title": "Token Logprobs",
+            "description": "Present only when return_token_logprobs is true. Contains scored_token_count + 1 records in absolute position order, including position zero.",
+            "items": {
+              "$ref": "#/components/schemas/TokenLogprob"
+            },
+            "type": "array",
+            "minItems": 2
+          }
+        },
+        "required": [
+          "index",
+          "score",
+          "logprob_sum",
+          "scored_token_count"
+        ],
+        "title": "CandidateScore",
+        "type": "object"
+      },
+      "TokenLogprob": {
+        "properties": {
+          "position": {
+            "title": "Position",
+            "type": "integer",
+            "description": "Zero-based absolute position in the complete native token sequence.",
+            "minimum": 0
+          },
+          "token_id": {
+            "title": "Token Id",
+            "type": "integer",
+            "description": "Native tokenizer token ID at this position.",
+            "minimum": 0
+          },
+          "logprob": {
+            "anyOf": [
+              {
+                "type": "number",
+                "format": "double"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Logprob",
+            "description": "Natural log-probability after full-vocabulary log-softmax. Null only at position zero; every later position has a finite value, including a possible 0.0. This is not a raw logit."
+          }
+        },
+        "required": [
+          "position",
+          "token_id",
+          "logprob"
+        ],
+        "title": "TokenLogprob",
+        "type": "object",
+        "examples": [
+          {
+            "position": 0,
+            "token_id": 1,
+            "logprob": null
+          },
+          {
+            "position": 1,
+            "token_id": 42,
+            "logprob": -1.5
+          }
+        ]
+      },
+      "Usage": {
+        "properties": {
+          "input_tokens": {
+            "title": "Input Tokens",
+            "type": "integer",
+            "description": "Sum of (scored_token_count + 1) across all returned candidates.",
+            "minimum": 2
+          },
+          "scored_tokens": {
+            "title": "Scored Tokens",
+            "type": "integer",
+            "description": "Sum of scored_token_count across all returned candidates.",
+            "minimum": 1
+          },
+          "generated_tokens": {
+            "const": 0,
+            "default": 0,
+            "title": "Generated Tokens",
+            "type": "integer",
+            "description": "Always zero; the endpoint does not generate tokens."
+          }
+        },
+        "required": [
+          "input_tokens",
+          "scored_tokens",
+          "generated_tokens"
+        ],
+        "title": "Usage",
+        "type": "object"
+      },
+      "RawSystemOneResponse": {
+        "properties": {
+          "id": {
+            "title": "Id",
+            "type": "string",
+            "description": "Server-generated request identifier."
+          },
+          "object": {
+            "const": "rawsystemone",
+            "default": "rawsystemone",
+            "title": "Object",
+            "type": "string"
+          },
+          "model": {
+            "title": "Model",
+            "type": "string",
+            "description": "The already-loaded default model's served name."
+          },
+          "scoring": {
+            "const": "mean_logprob_full_sequence",
+            "default": "mean_logprob_full_sequence",
+            "title": "Scoring",
+            "type": "string",
+            "description": "Mean log-probability of the entire concatenated sequence, including prefix tokens and excluding only the first native token."
+          },
+          "tokenization": {
+            "const": "native_text_v1",
+            "default": "native_text_v1",
+            "title": "Tokenization",
+            "type": "string",
+            "description": "Native text tokenization of each complete prefix + suffix, including the native tokenizer's special-token behavior. Prefix and suffix are not tokenized separately."
+          },
+          "data": {
+            "items": {
+              "$ref": "#/components/schemas/CandidateScore"
+            },
+            "title": "Data",
+            "type": "array",
+            "description": "One result per original suffix, in input order, including duplicates.",
+            "minItems": 1
+          },
+          "best_index": {
+            "title": "Best Index",
+            "type": "integer",
+            "description": "Zero-based original index with the highest score. Exact ties select the first index; scores are not rounded before selection.",
+            "minimum": 0
+          },
+          "usage": {
+            "$ref": "#/components/schemas/Usage",
+            "description": "Logical candidate totals, including repeated prefixes and duplicate candidates. These do not measure physical GPU work or cache savings."
+          }
+        },
+        "required": [
+          "id",
+          "object",
+          "model",
+          "scoring",
+          "tokenization",
+          "data",
+          "best_index",
+          "usage"
+        ],
+        "title": "RawSystemOneResponse",
+        "type": "object"
+      },
+      "RawSystemOneError": {
+        "type": "object",
+        "required": [
+          "object",
+          "message",
+          "type",
+          "param",
+          "code"
+        ],
+        "properties": {
+          "object": {
+            "type": "string",
+            "const": "error"
+          },
+          "message": {
+            "type": "string",
+            "description": "Human-readable error explanation."
+          },
+          "type": {
+            "type": "string",
+            "description": "Machine-readable error type; see response descriptions."
+          },
+          "param": {
+            "type": "null"
+          },
+          "code": {
+            "type": "integer",
+            "description": "HTTP status code."
+          }
+        },
+        "example": {
+          "object": "error",
+          "message": "Invalid rawsystemone fields or field types.",
+          "type": "invalid_request",
+          "param": null,
+          "code": 400
+        }
+      },
+      "AuthenticationError": {
+        "type": "object",
+        "required": [
+          "error"
+        ],
+        "properties": {
+          "error": {
+            "type": "string"
+          }
+        },
+        "example": {
+          "error": "Unauthorized"
+        }
+      }
+    },
+    "securitySchemes": {
+      "BearerAuth": {
+        "type": "http",
+        "scheme": "bearer",
+        "description": "Use Authorization: Bearer <api-key>. Required when the server is configured with --api-key; otherwise anonymous requests are accepted. This is an API key, not necessarily a JWT."
+      }
+    }
+  }
+}

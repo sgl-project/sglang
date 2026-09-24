@@ -110,6 +110,12 @@ from sglang.srt.entrypoints.openai.serving_tokenize import (
 from sglang.srt.entrypoints.openai.serving_transcription import (
     OpenAIServingTranscription,
 )
+from sglang.srt.entrypoints.rawsystemone.protocol import (
+    RawSystemOneError,
+    RawSystemOneRequest,
+    RawSystemOneResponse,
+)
+from sglang.srt.entrypoints.rawsystemone.service import RawSystemOneService
 from sglang.srt.entrypoints.request_headers import apply_header_overrides
 from sglang.srt.entrypoints.warmup import execute_warmups
 from sglang.srt.environ import envs
@@ -321,6 +327,9 @@ async def lifespan(fast_api_app: FastAPI):
         _global_state.tokenizer_manager, _global_state.template_manager
     )
     fast_api_app.state.openai_serving_score = OpenAIServingScore(
+        _global_state.tokenizer_manager
+    )
+    fast_api_app.state.rawsystemone = RawSystemOneService.from_runtime(
         _global_state.tokenizer_manager
     )
     fast_api_app.state.openai_serving_rerank = OpenAIServingRerank(
@@ -606,6 +615,11 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
     never reach the client. For /v1/responses, keep OpenAI-style. Otherwise
     use the legacy ErrorResponse shape.
     """
+    if request.url.path == "/v1/rawsystemone":
+        return RawSystemOneError(
+            "invalid_request", "Invalid rawsystemone fields or field types."
+        ).response()
+
     if request.url.path.startswith("/v1/messages"):
         return _anthropic_error_response(
             status_code=HTTPStatus.BAD_REQUEST.value,
@@ -1923,6 +1937,24 @@ async def retrieve_model(model: str):
         root=model,
         max_model_len=_global_state.tokenizer_manager.model_config.context_len,
     )
+
+
+@app.post(
+    "/v1/rawsystemone",
+    dependencies=[Depends(validate_json_request)],
+    response_model=RawSystemOneResponse,
+)
+async def rawsystemone_request(request: RawSystemOneRequest, raw_request: Request):
+    try:
+        result = await raw_request.app.state.rawsystemone.score(request, raw_request)
+        # Keep the initial null token logprob, but omit unrequested token arrays.
+        content = result.model_dump()
+        if not request.return_token_logprobs:
+            for candidate in content["data"]:
+                candidate.pop("token_logprobs")
+        return ORJSONResponse(content=content)
+    except RawSystemOneError as exc:
+        return exc.response()
 
 
 @app.post("/v1/score", dependencies=[Depends(validate_json_request)])

@@ -91,7 +91,7 @@ class RequestLogger:
         tokenizer: Any = None,
         request: Optional[fastapi.Request] = None,
     ) -> None:
-        if not self.log_requests:
+        if not self.log_requests or getattr(obj, "no_logs", False):
             return
 
         max_length, skip_names, _ = self.metadata
@@ -162,7 +162,7 @@ class RequestLogger:
         out: Any,
         request: Optional[fastapi.Request] = None,
     ) -> None:
-        if not self.log_requests:
+        if not self.log_requests or getattr(obj, "no_logs", False):
             return
 
         e2e_latency_ms = out["meta_info"].get("e2e_latency", 0) * 1000
