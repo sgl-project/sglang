@@ -3,7 +3,7 @@
 The reduce-scatter folds the pending attention residual into its reduction
 epilogue.  The matching all-gather reassembles the token shards after MoE.
 Both reuse CustomAllReduceV2's push workspace and fall back as a pair outside
-the checked-in GB300 tuning envelope.
+the checked-in GB200/GB300 tuning envelope.
 """
 
 from __future__ import annotations
@@ -28,7 +28,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 _HIDDEN_SIZE = 7168
-_SUPPORTED_WORLD_SIZES = (4, 8)
+_SUPPORTED_WORLD_SIZES = (4, 8, 16)
 
 # Named persistent symmetric buffers, one per NVLS-aliased tensor. Every rank
 # must resolve the same (buffer, offset) for these, which a per-forward
@@ -70,17 +70,35 @@ def _init_state() -> Optional[_State]:
     a2a = get_exec().moe.moe_a2a_backend
     group = get_parallel().attn_tp_group
     comm = group.ca_comm
+    device_sm = get_device_sm()
+    is_custom_allreduce = isinstance(comm, CustomAllReduceV2)
+    if is_custom_allreduce:
+        comm_disabled = comm.disabled
+        has_multicast = comm.has_multicast
+    else:
+        comm_disabled = None
+        has_multicast = None
     if (
-        get_device_sm() != 103
+        device_sm not in (100, 103)
         or group.world_size not in _SUPPORTED_WORLD_SIZES
         or a2a not in ("megamoe", "deepep")
-        or not isinstance(comm, CustomAllReduceV2)
-        or comm.disabled
-        or not comm.has_multicast
+        or not is_custom_allreduce
+        or comm_disabled
+        or not has_multicast
     ):
         message = (
-            "K3 SP collective requires SM103, TP4/TP8, MegaMoE/DeepEP, and "
-            "CustomAllReduceV2 with multicast; using NCCL."
+            "K3 SP collective requires SM100/SM103, TP4/TP8/TP16, "
+            "MegaMoE/DeepEP, and CustomAllReduceV2 with multicast; using NCCL "
+            "(sm=%s, world_size=%s, a2a=%s, comm=%s, disabled=%s, "
+            "has_multicast=%s)."
+            % (
+                device_sm,
+                group.world_size,
+                a2a,
+                type(comm).__name__ if comm is not None else None,
+                comm_disabled,
+                has_multicast,
+            )
         )
         (logger.warning if explicit else logger.info)(message)
         return None
@@ -132,7 +150,9 @@ def _symm_buffer(
     )
 
 
-def requires_symmetric_rs(num_tokens: int, device: torch.device) -> bool:
+def requires_symmetric_rs(
+    num_tokens: int, device: torch.device, element_size: int
+) -> bool:
     """Whether standalone or fused RS reads o_proj through its NVLS alias."""
     state = _init_state()
     if state is None:
@@ -145,6 +165,8 @@ def requires_symmetric_rs(num_tokens: int, device: torch.device) -> bool:
         _HIDDEN_SIZE,
         num_tokens,
         device,
+        element_size=element_size,
+        max_push_size=state.comm.max_push_size,
     )
     if dispatch is not None and dispatch.strategy == "pull":
         return True
@@ -246,8 +268,9 @@ def _eligible(
             or not residual.is_contiguous()
         ):
             return False
-    local_bytes = tensor.numel() * tensor.element_size() // state.group.world_size
-    return local_bytes <= state.comm.max_push_size
+    # Note(ajit283): Push capacity participates in dispatch selection so an
+    # oversized push can advance to a tuned pull/direct configuration.
+    return True
 
 
 def reduce_scatter_res(
@@ -265,6 +288,8 @@ def reduce_scatter_res(
         tensor.shape[1],
         tensor.shape[0],
         tensor.device,
+        element_size=tensor.element_size(),
+        max_push_size=state.comm.max_push_size,
     )
     if dispatch is None:
         return None
@@ -372,7 +397,6 @@ def all_gather(tensor: torch.Tensor) -> Optional[torch.Tensor]:
         or tensor.ndim != 2
         or tensor.shape[1] != _HIDDEN_SIZE
         or tensor.shape[0] <= 0
-        or tensor.numel() * tensor.element_size() > state.comm.max_push_size
     ):
         return None
     from sglang.kernels.ops.kimi_k3 import sp_collective
@@ -383,6 +407,8 @@ def all_gather(tensor: torch.Tensor) -> Optional[torch.Tensor]:
         tensor.shape[1],
         global_tokens,
         tensor.device,
+        element_size=tensor.element_size(),
+        max_push_size=state.comm.max_push_size,
     )
     if dispatch is None:
         return None
