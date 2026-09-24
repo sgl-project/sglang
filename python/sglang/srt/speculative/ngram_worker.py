@@ -31,12 +31,16 @@ from sglang.srt.speculative.spec_utils import (
     prepare_mamba_track_for_verify,
     record_stream_for_v2_verify,
 )
-from sglang.srt.utils import is_cpu, is_cuda
+from sglang.srt.utils import is_cpu, is_cuda, is_xpu
 from sglang.srt.utils.async_probe import maybe_detect_inf, maybe_detect_nan
 
 _is_cpu = is_cpu()
 
-if is_cuda():
+if is_xpu():
+    from sglang.kernels.ops.speculative.reconstruct_tree import (
+        reconstruct_indices_from_tree_mask_triton as reconstruct_indices_from_tree_mask,
+    )
+elif is_cuda():
     from sglang.kernels.ops.speculative.tree import reconstruct_indices_from_tree_mask
 else:
     from sgl_kernel.speculative import reconstruct_indices_from_tree_mask
