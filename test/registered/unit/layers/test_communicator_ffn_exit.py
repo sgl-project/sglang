@@ -20,9 +20,7 @@ def make_communicator(*, fuse, reduce_scatter, cls=LayerCommunicator):
     without the process-wide parallel state."""
     communicator = cls.__new__(cls)
     if cls is LayerCommunicator:
-        communicator.should_fuse_mlp_allreduce_with_next_layer = MagicMock(
-            return_value=fuse
-        )
+        communicator.should_defer_ffn_reduction = MagicMock(return_value=fuse)
     communicator.should_use_reduce_scatter = MagicMock(return_value=reduce_scatter)
     communicator.postprocess_layer = MagicMock(
         side_effect=lambda hidden_states, residual, forward_batch: (
@@ -79,7 +77,7 @@ class TestFfnExit(CustomTestCase):
                 communicator = make_communicator(fuse=fuse, reduce_scatter=False)
                 with communicator.ffn_exit(self.forward_batch) as ffn_exit:
                     seen = published_flags()
-                    decide = communicator.should_fuse_mlp_allreduce_with_next_layer
+                    decide = communicator.should_defer_ffn_reduction
                     decide.return_value = not fuse
                     hidden_states = self.hidden_states * 2
                 hidden_states, _ = ffn_exit.finish(hidden_states, self.residual)
@@ -93,12 +91,12 @@ class TestFfnExit(CustomTestCase):
         self.assertEqual(published_flags(), before)
 
     def test_subclass_decisions_are_used(self):
-        class NeverFuses(LayerCommunicator):
-            def should_fuse_mlp_allreduce_with_next_layer(self, forward_batch):
+        class NeverDefers(LayerCommunicator):
+            def should_defer_ffn_reduction(self, forward_batch):
                 return False
 
         communicator = make_communicator(
-            fuse=True, reduce_scatter=False, cls=NeverFuses
+            fuse=True, reduce_scatter=False, cls=NeverDefers
         )
         seen, _ = self.run_exit(communicator)
         self.assertEqual(seen, (False, False))
