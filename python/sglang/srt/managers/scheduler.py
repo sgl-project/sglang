@@ -1866,6 +1866,9 @@ class Scheduler(
             "startup_time": self.startup_time,
         }
 
+        if self.enable_hierarchical_cache:
+            result_dict["hicache_object_layout"] = self._hicache_l3_layout()
+
         return result_dict
 
     def release_host_resources(self) -> None:
@@ -5292,7 +5295,7 @@ class Scheduler(
 
         return GetInternalStateReqOutput(internal_state=msgspec_to_builtins(ret))
 
-    def get_hicache_l3_cache_layout(self, recv_req: GetHiCacheL3LayoutReq):
+    def _hicache_l3_layout(self) -> dict:
         from sglang.srt.mem_cache.unified_cache.components import ComponentType
 
         layout = {
@@ -5325,7 +5328,12 @@ class Scheduler(
                 get_memory().hicache_storage_backend,
                 type(storage_backend).__name__ if storage_backend else None,
             )
-        return GetHiCacheL3LayoutReqOutput(layout=msgspec_to_builtins(layout))
+        return layout
+
+    def get_hicache_l3_cache_layout(self, recv_req: GetHiCacheL3LayoutReq):
+        return GetHiCacheL3LayoutReqOutput(
+            layout=msgspec_to_builtins(self._hicache_l3_layout())
+        )
 
     def set_internal_state(self, recv_req: SetInternalStateReq):
         server_args_dict = recv_req.server_args
