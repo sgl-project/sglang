@@ -22,7 +22,6 @@ class CandidateScore(BaseModel):
     score: float
     logprob_sum: float
     scored_token_count: int
-    input_token_count: int
     token_logprobs: list[TokenLogprob] | None = None
 
 

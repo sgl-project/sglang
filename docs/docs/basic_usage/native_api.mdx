@@ -96,7 +96,8 @@ temperature 1 and are not calibrated interpretation probabilities.
 The response has `object: "rawsystemone"`, `model`,
 `scoring: "mean_logprob_full_sequence"`, `tokenization: "native_text_v1"`, an
 ordered `data` list, and `best_index`. Each result includes `index`, `score`,
-`logprob_sum`, `scored_token_count`, and `input_token_count`. Higher scores win;
+`logprob_sum`, and `scored_token_count`. The complete native token count is
+`scored_token_count + 1`. Higher scores win;
 exact ties select the first original index. Requested `token_logprobs` contain
 every absolute `position`, `token_id`, and `logprob`, including an initial `null`.
 Without the option, token arrays are omitted. Prompts are never echoed.

@@ -48,10 +48,10 @@ FIELD_DESCRIPTIONS = {
         "calibrated probability that a candidate is correct.",
         "logprob_sum": "Sum of all scoreable token log-probabilities in the complete "
         "candidate, including prefix tokens. Uses natural logarithms.",
-        "scored_token_count": "input_token_count - 1; only the first native token is excluded.",
-        "input_token_count": "Number of native tokens in the complete prefix + suffix.",
+        "scored_token_count": "Number of native tokens in the complete prefix + suffix "
+        "minus one; only the first native token is excluded. This is the score denominator.",
         "token_logprobs": "Present only when return_token_logprobs is true. Contains "
-        "input_token_count records in absolute position order, including position zero.",
+        "scored_token_count + 1 records in absolute position order, including position zero.",
     },
     "TokenLogprob": {
         "position": "Zero-based absolute position in the complete native token sequence.",
@@ -61,7 +61,7 @@ FIELD_DESCRIPTIONS = {
         "a possible 0.0. This is not a raw logit.",
     },
     "Usage": {
-        "input_tokens": "Sum of input_token_count across all returned candidates.",
+        "input_tokens": "Sum of (scored_token_count + 1) across all returned candidates.",
         "scored_tokens": "Sum of scored_token_count across all returned candidates.",
         "generated_tokens": "Always zero; the endpoint does not generate tokens.",
     },
@@ -117,7 +117,7 @@ def build_schema():
     schemas["RawSystemOneResponse"]["properties"]["data"]["minItems"] = 1
     for name, fields in {
         "RawSystemOneResponse": {"best_index": 0},
-        "CandidateScore": {"index": 0, "scored_token_count": 1, "input_token_count": 2},
+        "CandidateScore": {"index": 0, "scored_token_count": 1},
         "TokenLogprob": {"position": 0, "token_id": 0},
         "Usage": {"input_tokens": 2, "scored_tokens": 1},
     }.items():
@@ -173,7 +173,6 @@ def build_schema():
                 "score": total / 20,
                 "logprob_sum": total,
                 "scored_token_count": 20,
-                "input_token_count": 21,
             }
             for index, total in enumerate((-36.0, -34.0, -30.0))
         ],

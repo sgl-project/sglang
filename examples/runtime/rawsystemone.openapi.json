@@ -61,22 +61,19 @@
                       "index": 0,
                       "score": -1.8,
                       "logprob_sum": -36.0,
-                      "scored_token_count": 20,
-                      "input_token_count": 21
+                      "scored_token_count": 20
                     },
                     {
                       "index": 1,
                       "score": -1.7,
                       "logprob_sum": -34.0,
-                      "scored_token_count": 20,
-                      "input_token_count": 21
+                      "scored_token_count": 20
                     },
                     {
                       "index": 2,
                       "score": -1.5,
                       "logprob_sum": -30.0,
-                      "scored_token_count": 20,
-                      "input_token_count": 21
+                      "scored_token_count": 20
                     }
                   ],
                   "best_index": 2,
@@ -229,18 +226,12 @@
           "scored_token_count": {
             "title": "Scored Token Count",
             "type": "integer",
-            "description": "input_token_count - 1; only the first native token is excluded.",
+            "description": "Number of native tokens in the complete prefix + suffix minus one; only the first native token is excluded. This is the score denominator.",
             "minimum": 1
-          },
-          "input_token_count": {
-            "title": "Input Token Count",
-            "type": "integer",
-            "description": "Number of native tokens in the complete prefix + suffix.",
-            "minimum": 2
           },
           "token_logprobs": {
             "title": "Token Logprobs",
-            "description": "Present only when return_token_logprobs is true. Contains input_token_count records in absolute position order, including position zero.",
+            "description": "Present only when return_token_logprobs is true. Contains scored_token_count + 1 records in absolute position order, including position zero.",
             "items": {
               "$ref": "#/components/schemas/TokenLogprob"
             },
@@ -252,8 +243,7 @@
           "index",
           "score",
           "logprob_sum",
-          "scored_token_count",
-          "input_token_count"
+          "scored_token_count"
         ],
         "title": "CandidateScore",
         "type": "object"
@@ -311,7 +301,7 @@
           "input_tokens": {
             "title": "Input Tokens",
             "type": "integer",
-            "description": "Sum of input_token_count across all returned candidates.",
+            "description": "Sum of (scored_token_count + 1) across all returned candidates.",
             "minimum": 2
           },
           "scored_tokens": {

@@ -394,7 +394,6 @@ class RawSystemOneService:
                     score=total / count,
                     logprob_sum=total,
                     scored_token_count=count,
-                    input_token_count=count + 1,
                     token_logprobs=list(records)
                     if request.return_token_logprobs
                     else None,

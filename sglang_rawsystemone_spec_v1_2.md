@@ -108,9 +108,9 @@ The following values are **illustrative schema examples, not measured model outp
   "scoring": "mean_logprob_full_sequence",
   "tokenization": "native_text_v1",
   "data": [
-    {"index": 0, "score": -1.8, "logprob_sum": -36.0, "scored_token_count": 20, "input_token_count": 21},
-    {"index": 1, "score": -1.7, "logprob_sum": -34.0, "scored_token_count": 20, "input_token_count": 21},
-    {"index": 2, "score": -1.5, "logprob_sum": -30.0, "scored_token_count": 20, "input_token_count": 21}
+    {"index": 0, "score": -1.8, "logprob_sum": -36.0, "scored_token_count": 20},
+    {"index": 1, "score": -1.7, "logprob_sum": -34.0, "scored_token_count": 20},
+    {"index": 2, "score": -1.5, "logprob_sum": -30.0, "scored_token_count": 20}
   ],
   "best_index": 2,
   "usage": {
@@ -122,6 +122,8 @@ The following values are **illustrative schema examples, not measured model outp
 ```
 
 `data` retains input order. Higher `score` is better. `best_index` is the first original index attaining the maximum returned score; exact ties are not resolved through another model call. Do not round scores before ranking.
+
+`scored_token_count` is the sole per-candidate token count and the denominator of `score`. The complete native token count is always `scored_token_count + 1`, so it is not returned separately.
 
 Usage fields are **logical candidate totals**, including duplicate candidates and repeated prefixes. They do not claim to measure actual GPU computation. Report physical cache/compute statistics separately through diagnostics or metrics.
 

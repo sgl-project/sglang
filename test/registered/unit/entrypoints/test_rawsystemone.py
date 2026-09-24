@@ -623,11 +623,18 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
             )
             self.assertEqual(result.status_code, 200, result.text)
             self.assertNotIn("token_logprobs", result.json()["data"][0])
+            self.assertNotIn("input_token_count", result.json()["data"][0])
+            self.assertEqual(result.json()["data"][0]["scored_token_count"], 2)
             result = await client.post(
                 "/v1/rawsystemone",
                 json=dict(prefix="ab", suffixes=["c"], return_token_logprobs=True),
             )
             self.assertIsNone(result.json()["data"][0]["token_logprobs"][0]["logprob"])
+            candidate = result.json()["data"][0]
+            self.assertNotIn("input_token_count", candidate)
+            self.assertEqual(
+                len(candidate["token_logprobs"]), candidate["scored_token_count"] + 1
+            )
             for bad in [
                 dict(prefix=1, suffixes=["x"]),
                 dict(prefix="secret", suffixes=["x"], context="secret"),
@@ -644,7 +651,7 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
         scorer = service(manager)
         out = await scorer.score(request("a", ["b", " b", "\nλ", "  "]))
         self.assertEqual(manager.texts, ["ab", "a b", "a\nλ", "a  "])
-        self.assertEqual(out.data[0].input_token_count, 2)
+        self.assertEqual(out.data[0].scored_token_count, 1)
 
     async def test_reference_parity_duplicates_prefix_candidate_and_order(self):
         scorer = service(max_candidates_per_batch=1)
