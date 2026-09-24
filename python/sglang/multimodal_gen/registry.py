@@ -819,9 +819,9 @@ def get_model_info(
     return model_info
 
 
+# Policy exports (manifest.json + config.native.json) this pipeline serves.
 FLUX3_ACTION_HF_PATHS = [
     "black-forest-labs/flux-3-action-droid",
-    "black-forest-labs/flux-3-action-so101",
 ]
 
 
