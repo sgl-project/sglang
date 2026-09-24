@@ -1862,15 +1862,6 @@ class Qwen3_5ForCausalLM(nn.Module):
             logger.info(
                 "Packed BF16/FP8 GDN input projection enabled for %d layers", packed
             )
-        if self.flashinfer_mnnvl_cutedsl_fusion is None:
-            return
-        from sglang.srt.layers.moe.cutedsl_ar_fusion import prepare_cutedsl_fusion
-
-        prepare_cutedsl_fusion(
-            self.flashinfer_mnnvl_cutedsl_fusion,
-            max_running_requests=model_runner.max_running_requests,
-            label="Qwen3.5",
-        )
 
     def set_dflash_layers_to_capture(self, layers_to_capture: list[int]):
         self.layers_to_capture = layers_to_capture
@@ -1967,7 +1958,7 @@ class Qwen3_5ForCausalLM(nn.Module):
             if residual is None:
                 raise RuntimeError("invalid final deferred MoE handoff")
             hidden_states, _ = self.flashinfer_mnnvl_cutedsl_fusion.finalize(
-                hidden_states, residual, self.norm.gemma_weight
+                handoff=hidden_states, residual=residual, gamma=self.norm.gemma_weight
             )
         elif hidden_states.shape[0] != 0:
             if residual is None:

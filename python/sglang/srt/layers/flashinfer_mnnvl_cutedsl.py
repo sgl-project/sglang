@@ -41,7 +41,7 @@ _CUDA_BLOCK_THREADS = 1024
 _HT_NON_REDUCTION_WARPS = 2
 _HT_REDUCTION_WARP_CHOICES = (1, 2, 4, 8)
 
-SUPPORTED_TP_SIZES = (2, 4, 8, 16)
+_SUPPORTED_TP_SIZES = (2, 4, 8, 16)
 
 
 def _ht_shard_split(
@@ -133,18 +133,8 @@ def _routes(bounds, ll_target, bt_targets, ht_target):
     )
 
 
-def _retargeted_config(tp_size: int, hidden_size: int, top_k: int):
-    """A single-profile routing config for a shape FlashInfer does not ship.
-
-    Reuses the shipped GB300 crossovers, which were measured at tp=8/16
-    hidden=8192 top_k=10 and are unmeasured elsewhere.
-    """
-    from flashinfer.comm.mnnvl_cutedsl import (
-        KernelTarget,
-        MNNVLCuteDSLConfig,
-        ProtocolKind,
-        StaticProfile,
-    )
+def _gb300_presets(*, wide_tp: bool):
+    """The shipped GB300 (bounds, LL, BT pair, HT) per operation, TP16 or TP8."""
     from flashinfer.comm.mnnvl_cutedsl.kernel_bt import (
         BT_ALL_REDUCE_GB300_TP8_H8192_PRESET_0,
         BT_ALL_REDUCE_GB300_TP8_H8192_PRESET_1,
@@ -168,48 +158,71 @@ def _retargeted_config(tp_size: int, hidden_size: int, top_k: int):
         LL_FINALIZE_GB300_TP16_H8192_K10,
     )
 
-    wide_tp = tp_size >= 16
     # FlashInfer's measured GB300 crossovers.
     if wide_tp:
-        finalize_bounds = (7, 52, 703, None)
-        all_reduce_bounds = (5, 512, 959, None)
-        ll_finalize = LL_FINALIZE_GB300_TP16_H8192_K10
-        ll_all_reduce = LL_ALL_REDUCE_GB300_TP16_H8192
-        bt_finalize = (
-            BT_FINALIZE_GB300_TP16_H8192_K10_PRESET_0,
-            BT_FINALIZE_GB300_TP16_H8192_K10_PRESET_1,
-        )
-        bt_all_reduce = (
-            BT_ALL_REDUCE_GB300_TP16_H8192_PRESET_0,
-            BT_ALL_REDUCE_GB300_TP16_H8192_PRESET_1,
-        )
-        ht_finalize_preset = HT_FINALIZE_GB300_TP16_H8192_K10
-        ht_all_reduce_preset = HT_ALL_REDUCE_GB300_TP16_H8192
-    else:
-        finalize_bounds = (23, 48, 703, None)
-        all_reduce_bounds = (15, 256, 1024, None)
-        ll_finalize = LL_FINALIZE_GB300_TP8_H8192_K10
-        ll_all_reduce = LL_ALL_REDUCE_GB300_TP8_H8192
-        bt_finalize = (
-            BT_FINALIZE_GB300_TP8_H8192_K10_PRESET_0,
-            BT_FINALIZE_GB300_TP8_H8192_K10_PRESET_1,
-        )
-        bt_all_reduce = (
-            BT_ALL_REDUCE_GB300_TP8_H8192_PRESET_0,
-            BT_ALL_REDUCE_GB300_TP8_H8192_PRESET_1,
-        )
-        ht_finalize_preset = HT_FINALIZE_GB300_TP8_H8192_K10
-        ht_all_reduce_preset = HT_ALL_REDUCE_GB300_TP8_H8192
+        return {
+            "finalize": (
+                (7, 52, 703, None),
+                LL_FINALIZE_GB300_TP16_H8192_K10,
+                (
+                    BT_FINALIZE_GB300_TP16_H8192_K10_PRESET_0,
+                    BT_FINALIZE_GB300_TP16_H8192_K10_PRESET_1,
+                ),
+                HT_FINALIZE_GB300_TP16_H8192_K10,
+            ),
+            "all_reduce": (
+                (5, 512, 959, None),
+                LL_ALL_REDUCE_GB300_TP16_H8192,
+                (
+                    BT_ALL_REDUCE_GB300_TP16_H8192_PRESET_0,
+                    BT_ALL_REDUCE_GB300_TP16_H8192_PRESET_1,
+                ),
+                HT_ALL_REDUCE_GB300_TP16_H8192,
+            ),
+        }
+    return {
+        "finalize": (
+            (23, 48, 703, None),
+            LL_FINALIZE_GB300_TP8_H8192_K10,
+            (
+                BT_FINALIZE_GB300_TP8_H8192_K10_PRESET_0,
+                BT_FINALIZE_GB300_TP8_H8192_K10_PRESET_1,
+            ),
+            HT_FINALIZE_GB300_TP8_H8192_K10,
+        ),
+        "all_reduce": (
+            (15, 256, 1024, None),
+            LL_ALL_REDUCE_GB300_TP8_H8192,
+            (
+                BT_ALL_REDUCE_GB300_TP8_H8192_PRESET_0,
+                BT_ALL_REDUCE_GB300_TP8_H8192_PRESET_1,
+            ),
+            HT_ALL_REDUCE_GB300_TP8_H8192,
+        ),
+    }
 
-    ht_finalize = _ht_retarget(
-        ht_finalize_preset, hidden_size=hidden_size, tp_size=tp_size
+
+def _retargeted_config(tp_size: int, hidden_size: int, top_k: int):
+    """A single-profile routing config for a shape FlashInfer does not ship.
+
+    Reuses the shipped GB300 crossovers, which were measured at tp=8/16
+    hidden=8192 top_k=10 and are unmeasured elsewhere.
+    """
+    from flashinfer.comm.mnnvl_cutedsl import (
+        KernelTarget,
+        MNNVLCuteDSLConfig,
+        ProtocolKind,
+        StaticProfile,
     )
-    ht_all_reduce = _ht_retarget(
-        ht_all_reduce_preset, hidden_size=hidden_size, tp_size=tp_size
-    )
-    if ht_finalize is None or ht_all_reduce is None:
+
+    shipped = _gb300_presets(wide_tp=tp_size >= 16)
+    ht = {
+        op: _ht_retarget(presets[3], hidden_size=hidden_size, tp_size=tp_size)
+        for op, presets in shipped.items()
+    }
+    if any(preset is None for preset in ht.values()):
         # Both operations share the HT protocol state, so HT goes for both.
-        ht_finalize = ht_all_reduce = None
+        ht = dict.fromkeys(ht)
         logger.warning(
             "MNNVL CuTe DSL: hidden_size=%d admits no HT shard split at "
             "tp_size=%d; serving this shape with the LL and BT routes only, "
@@ -218,26 +231,24 @@ def _retargeted_config(tp_size: int, hidden_size: int, top_k: int):
             tp_size,
         )
 
-    def target(protocol, preset):
-        return KernelTarget(protocol=protocol, preset=preset)
+    def routes(op):
+        bounds, ll, bt, _ = shipped[op]
+        return _routes(
+            bounds,
+            KernelTarget(protocol=ProtocolKind.LL, preset=ll),
+            tuple(KernelTarget(protocol=ProtocolKind.BT, preset=p) for p in bt),
+            None
+            if ht[op] is None
+            else KernelTarget(protocol=ProtocolKind.HT, preset=ht[op]),
+        )
 
     profile = StaticProfile(
         tp_size=tp_size,
         hidden_size=hidden_size,
         top_k=top_k,
         dtype=torch.bfloat16,
-        finalize_routes=_routes(
-            finalize_bounds,
-            target(ProtocolKind.LL, ll_finalize),
-            tuple(target(ProtocolKind.BT, preset) for preset in bt_finalize),
-            None if ht_finalize is None else target(ProtocolKind.HT, ht_finalize),
-        ),
-        all_reduce_routes=_routes(
-            all_reduce_bounds,
-            target(ProtocolKind.LL, ll_all_reduce),
-            tuple(target(ProtocolKind.BT, preset) for preset in bt_all_reduce),
-            None if ht_all_reduce is None else target(ProtocolKind.HT, ht_all_reduce),
-        ),
+        finalize_routes=routes("finalize"),
+        all_reduce_routes=routes("all_reduce"),
     )
     return MNNVLCuteDSLConfig(profiles=(profile,))
 
@@ -323,9 +334,9 @@ class FlashInferMNNVLCuteDSLARFusion:
         self.process_group = process_group
         # Cached: supports() runs per layer and must not re-enter c10d.
         self.tp_size = dist.get_world_size(process_group)
-        if self.tp_size not in SUPPORTED_TP_SIZES:
+        if self.tp_size not in _SUPPORTED_TP_SIZES:
             raise ValueError(
-                f"MNNVL CuTe DSL fusion supports tp_size in {SUPPORTED_TP_SIZES}, "
+                f"MNNVL CuTe DSL fusion supports tp_size in {_SUPPORTED_TP_SIZES}, "
                 f"got {self.tp_size}"
             )
         self.device = torch.device(device)

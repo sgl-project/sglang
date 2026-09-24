@@ -299,32 +299,23 @@ class BaseRunner(ABC):
             return
 
         if uses_cutedsl_ar_fusion():
-            # The workspace is built by the model's pre-capture hook; only the
-            # platform check runs here.
+            # Nothing else resolves the configured backend, so check the platform.
             resolve_flashinfer_allreduce_fusion_backend()
             if not mr.is_draft_worker:
                 # A draft installs no fusion communicator.
-                self._assert_model_installs_cutedsl_fusion()
+                from sglang.srt.layers.moe.cutedsl_ar_fusion import (
+                    prepare_cutedsl_fusion,
+                )
+
+                prepare_cutedsl_fusion(
+                    mr.model, max_running_requests=mr.max_running_requests
+                )
             return
 
         pre_initialize_workspaces(
             max_token_num=FUSE_ALLREDUCE_MAX_BATCH_SIZE,
             hidden_dim=mr.model_config.hidden_size,
             dtype=mr.dtype,
-        )
-
-    def _assert_model_installs_cutedsl_fusion(self):
-        from sglang.srt.layers.moe.cutedsl_ar_fusion import (
-            model_installs_cutedsl_fusion,
-        )
-
-        if model_installs_cutedsl_fusion(self.model_runner.model):
-            return
-        raise ValueError(
-            "--flashinfer-allreduce-fusion-backend cutedsl is set, but "
-            f"{type(self.model_runner.model).__name__} installed no CuTe DSL "
-            "fusion communicator, so no allreduce fusion would run at all. "
-            "Drop the flag, or choose 'auto', 'trtllm' or 'mnnvl'."
         )
 
     def _pre_initialize_fi_a2a_workspace(self):

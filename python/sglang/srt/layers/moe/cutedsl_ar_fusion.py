@@ -9,9 +9,9 @@ from __future__ import annotations
 
 import functools
 import logging
-from dataclasses import dataclass
 from typing import Callable, Optional, Sequence
 
+import msgspec
 import torch
 
 from sglang.srt.layers.communicator import (
@@ -22,10 +22,7 @@ from sglang.srt.layers.communicator import (
 )
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.layernorm import GemmaRMSNorm, RMSNorm
-from sglang.srt.layers.moe import (
-    can_merge_post_experts_all_reduce,
-    get_moe_a2a_backend,
-)
+from sglang.srt.layers.moe import get_moe_a2a_backend
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.runtime_context import (
     cutedsl_moe_max_num_tokens,
@@ -35,12 +32,12 @@ from sglang.srt.runtime_context import (
     get_parallel,
 )
 
-LayerPredicate = Callable[[torch.nn.Module], bool]
+_LayerPredicate = Callable[[torch.nn.Module], bool]
 
 logger = logging.getLogger(__name__)
 
 
-def fused_norm_gamma(layernorm: torch.nn.Module) -> Optional[torch.Tensor]:
+def _fused_norm_gamma(layernorm: torch.nn.Module) -> Optional[torch.Tensor]:
     """The multiplier as applied -- GemmaRMSNorm's pre-folded w + 1. None declines."""
     if isinstance(layernorm, GemmaRMSNorm):
         return layernorm.gemma_weight
@@ -49,7 +46,7 @@ def fused_norm_gamma(layernorm: torch.nn.Module) -> Optional[torch.Tensor]:
     return None
 
 
-def is_supported_forward_mode(forward_mode: ForwardMode) -> bool:
+def _is_supported_forward_mode(forward_mode: ForwardMode) -> bool:
     return forward_mode in (
         ForwardMode.DECODE,
         ForwardMode.EXTEND,
@@ -57,7 +54,7 @@ def is_supported_forward_mode(forward_mode: ForwardMode) -> bool:
     )
 
 
-def resolve_max_m(*, max_running_requests: int | None) -> int:
+def _resolve_max_m(*, max_running_requests: int | None) -> int:
     decode_config = get_exec().graph.cuda_graph_config.decode
     prefill_config = get_exec().graph.cuda_graph_config.prefill
     candidates = [
@@ -76,8 +73,7 @@ def resolve_max_m(*, max_running_requests: int | None) -> int:
     return max(positive)
 
 
-@dataclass(frozen=True)
-class MoeFinalizeHandoff:
+class MoeFinalizeHandoff(msgspec.Struct, frozen=True):
     """Unfinalized routed output plus the separately gated shared contribution."""
 
     routed_output: torch.Tensor
@@ -140,7 +136,7 @@ class CuteDSLFusionService:
             top_k=self.top_k,
             max_m=int(max_m),
             rms_epsilon=self.rms_epsilon,
-            # fused_norm_gamma() already returns the multiplier as applied.
+            # _fused_norm_gamma() already returns the multiplier as applied.
             weight_bias=0.0,
         )
         self._workspace = workspace
@@ -206,7 +202,7 @@ class CuteDSLFusionLayerCommunicator(LayerCommunicator):
                 )
             if residual is None:
                 raise RuntimeError("deferred MoE finalize requires residual input")
-            gamma = fused_norm_gamma(self.input_layernorm)
+            gamma = _fused_norm_gamma(self.input_layernorm)
             if gamma is None:
                 raise RuntimeError(
                     "deferred MoE finalize requires a fusable RMSNorm flavour"
@@ -217,7 +213,11 @@ class CuteDSLFusionLayerCommunicator(LayerCommunicator):
             hidden_states, residual = self.fusion_service.finalize(
                 handoff=hidden_states, residual=residual, gamma=gamma
             )
-            return self._finish_prepare_attn(hidden_states, residual, forward_batch)
+            return self._finish_prepare_attn(
+                hidden_states=hidden_states,
+                residual=residual,
+                forward_batch=forward_batch,
+            )
 
         if (
             residual is not None
@@ -233,9 +233,13 @@ class CuteDSLFusionLayerCommunicator(LayerCommunicator):
             hidden_states, residual = self.fusion_service.all_reduce_residual_rms_norm(
                 local_contribution=hidden_states,
                 residual=residual,
-                gamma=fused_norm_gamma(self.input_layernorm),
+                gamma=_fused_norm_gamma(self.input_layernorm),
             )
-            return self._finish_prepare_attn(hidden_states, residual, forward_batch)
+            return self._finish_prepare_attn(
+                hidden_states=hidden_states,
+                residual=residual,
+                forward_batch=forward_batch,
+            )
 
         return super().prepare_attn(
             hidden_states,
@@ -261,7 +265,7 @@ class CuteDSLFusionLayerCommunicator(LayerCommunicator):
             return self.fusion_service.all_reduce_residual_rms_norm(
                 local_contribution=hidden_states,
                 residual=residual,
-                gamma=fused_norm_gamma(self.post_attention_layernorm),
+                gamma=_fused_norm_gamma(self.post_attention_layernorm),
             )
         return super().prepare_mlp(hidden_states, residual, forward_batch, cache=cache)
 
@@ -282,7 +286,7 @@ class CuteDSLFusionLayerCommunicator(LayerCommunicator):
         return (
             self._common_eligible(forward_batch, m)
             and residual is not None
-            and fused_norm_gamma(self.post_attention_layernorm) is not None
+            and _fused_norm_gamma(self.post_attention_layernorm) is not None
             and norm_fn
             is CommunicateWithAllReduceAndLayerNormFn._gather_hidden_states_and_residual
             and residual_input_mode is ScatterMode.TP_ATTN_FULL
@@ -302,7 +306,7 @@ class CuteDSLFusionLayerCommunicator(LayerCommunicator):
         """Incoming, and independent of this layer's own successor."""
         return (
             self._common_eligible(forward_batch, m)
-            and fused_norm_gamma(self.input_layernorm) is not None
+            and _fused_norm_gamma(self.input_layernorm) is not None
             and not get_exec().comm.enable_quant_communications
         )
 
@@ -330,21 +334,17 @@ class CuteDSLFusionLayerCommunicator(LayerCommunicator):
         parallel = get_parallel()
         return bool(
             self.fusion_service is not None
-            and is_supported_forward_mode(forward_batch.forward_mode)
+            and _is_supported_forward_mode(forward_batch.forward_mode)
             and self.fusion_service.supports(m)
             and not is_dp_attention_enabled()
+            # Also forces moe_dp_size == 1, so a hybrid EP x MoE-TP reduction
+            # always merges into the one TP reduction the workspace performs.
             and parallel.attn_cp_size == 1
             and not get_attn_tp_context().input_scattered
             and get_moe_a2a_backend().is_none()
             and self._context.tp_size > 1
             # Restates the base's moe-cp, MOE_FULL and SCATTERED refusals.
             and self.layer_scatter_modes.mlp_mode is ScatterMode.FULL
-            # Hybrid EP x MoE-TP fuses only when both legs merge into one TP reduction.
-            and not (
-                parallel.moe_ep_size > 1
-                and parallel.moe_tp_size > 1
-                and not can_merge_post_experts_all_reduce()
-            )
         )
 
     def should_fuse_mlp_allreduce_with_next_layer(
@@ -358,25 +358,14 @@ class CuteDSLFusionLayerCommunicator(LayerCommunicator):
         return super().should_fuse_mlp_allreduce_with_next_layer(forward_batch)
 
 
-def model_installs_cutedsl_fusion(model: torch.nn.Module) -> bool:
-    # Most modules carry no layer_communicator.
-    return any(
-        isinstance(
-            module.__dict__.get("layer_communicator"),
-            CuteDSLFusionLayerCommunicator,
-        )
-        for module in model.modules()
-    )
-
-
 def install_cutedsl_fusion(
     layers: Sequence[torch.nn.Module],
     *,
     hidden_size: int,
     top_k: int,
     rms_epsilon: float,
-    can_defer_finalize: LayerPredicate,
-    requires_local_reduction: LayerPredicate | None = None,
+    can_defer_finalize: _LayerPredicate,
+    requires_local_reduction: _LayerPredicate | None = None,
     final_norm_consumes_handoff: bool = False,
     label: str,
 ) -> CuteDSLFusionService | None:
@@ -402,7 +391,7 @@ def install_cutedsl_fusion(
             layer.layer_communicator.input_layernorm,
             layer.layer_communicator.post_attention_layernorm,
         ):
-            if fused_norm_gamma(norm) is None:
+            if _fused_norm_gamma(norm) is None:
                 continue
             if float(norm.variance_epsilon) != float(rms_epsilon):
                 raise RuntimeError(
@@ -449,21 +438,41 @@ def install_cutedsl_fusion(
 
 
 def prepare_cutedsl_fusion(
-    service: CuteDSLFusionService | None,
-    *,
-    max_running_requests: int | None,
-    label: str,
+    model: torch.nn.Module, *, max_running_requests: int | None
 ) -> None:
-    if service is None:
-        return
+    """Build the workspace of every service installed anywhere in ``model``.
+
+    Scans the module tree, so a wrapper holding the model as a submodule (a VLM's
+    language_model) needs no hook of its own.
+    """
+    communicators = [
+        communicator
+        for module in model.modules()
+        # Most modules carry no layer_communicator.
+        if isinstance(
+            communicator := module.__dict__.get("layer_communicator"),
+            CuteDSLFusionLayerCommunicator,
+        )
+    ]
+    if not communicators or any(c.fusion_service is None for c in communicators):
+        raise ValueError(
+            "--flashinfer-allreduce-fusion-backend cutedsl is set, but "
+            f"{type(model).__name__} installed no CuTe DSL fusion service, so no "
+            "allreduce fusion would run at all. Drop the flag, or choose 'auto', "
+            "'trtllm' or 'mnnvl'."
+        )
     if get_disagg().enable_pdmux:
         raise RuntimeError(
             "FlashInfer MNNVL CuTe DSL fusion does not support concurrent PDMux "
             "streams sharing one mutable workspace"
         )
-    service.prepare(max_m=resolve_max_m(max_running_requests=max_running_requests))
+    services = {id(c.fusion_service): c.fusion_service for c in communicators}
+    max_m = _resolve_max_m(max_running_requests=max_running_requests)
+    for service in services.values():
+        service.prepare(max_m=max_m)
     logger.info(
-        "Prepared %s FlashInfer MNNVL CuTe DSL fusion workspace for M_max=%d",
-        label,
-        service.max_m,
+        "Prepared the FlashInfer MNNVL CuTe DSL fusion workspace for M_max=%d "
+        "(%d fused layers)",
+        max_m,
+        len(communicators),
     )

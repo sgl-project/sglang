@@ -864,7 +864,11 @@ class LayerCommunicator:
                             post_residual_addition,
                         )
 
-        return self._finish_prepare_attn(hidden_states, residual, forward_batch)
+        return self._finish_prepare_attn(
+            hidden_states=hidden_states,
+            residual=residual,
+            forward_batch=forward_batch,
+        )
 
     def _finish_prepare_attn(self, hidden_states, residual, forward_batch):
         """Tail every prepare_attn path must run, or ``attn_inputs`` is unset."""

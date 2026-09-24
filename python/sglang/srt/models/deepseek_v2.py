@@ -93,7 +93,6 @@ from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe import (
     get_moe_a2a_backend,
     get_moe_runner_backend,
-    moe_deferred_finalize_serves,
     post_experts_all_reduce,
     should_skip_post_experts_all_reduce,
     should_use_flashinfer_cutlass_moe_fp4_allgather,
@@ -577,6 +576,9 @@ class DeepseekV2MoE(nn.Module):
         self.moe_ep_size = get_parallel().moe_ep_size
         self.routed_scaling_factor = config.routed_scaling_factor
         self.n_shared_experts = config.n_shared_experts
+        self._deferred_finalize_max_tokens = (
+            envs.SGLANG_MOE_DEFERRED_FINALIZE_MAX_TOKENS.get()
+        )
 
         n_shared_experts = (
             0 if config.n_shared_experts is None else int(config.n_shared_experts)
@@ -1063,7 +1065,10 @@ class DeepseekV2MoE(nn.Module):
             and not self._shared_expert_tp1
             and topk_output.format == TopKOutputFormat.BYPASSED
             and self.experts.supports_deferred_finalize
-            and moe_deferred_finalize_serves(hidden_states.shape[0])
+            and (
+                self._deferred_finalize_max_tokens <= 0
+                or hidden_states.shape[0] <= self._deferred_finalize_max_tokens
+            )
         )
         if deferred_finalize:
             final_hidden_states = self.experts.forward_deferred_finalize(
@@ -2606,11 +2611,8 @@ class DeepseekV2DecoderLayer(nn.Module):
 
         if get_parallel().enable_prefill_cp:
             communicator_cls = DSACPLayerCommunicator
-        elif (
-            isinstance(self.mlp, DeepseekV2MoE)
-            and not is_nextn
-            and _use_mnnvl_cutedsl_fusion()
-        ):
+        elif not is_nextn and _use_mnnvl_cutedsl_fusion():
+            # Dense layers too: selecting cutedsl turns the legacy fusion off.
             from sglang.srt.layers.moe.cutedsl_ar_fusion import (
                 CuteDSLFusionLayerCommunicator,
             )
@@ -2723,6 +2725,8 @@ class DeepseekV2DecoderLayer(nn.Module):
             isinstance(self.mlp, DeepseekV2MoE)
             and not self.mlp.experts.moe_runner_config.inplace
             and not torch.compiler.is_compiling()
+            # A deferred MoE finalize handoff from the previous layer is no buffer.
+            and isinstance(hidden_states_orig, torch.Tensor)
         ):
             from sglang.srt.layers.moe.moe_runner.base import moe_output_buffer_ctx
 
@@ -2946,27 +2950,27 @@ class DeepseekV2Model(nn.Module):
 
         from sglang.srt.layers.moe.cutedsl_ar_fusion import install_cutedsl_fusion
 
-        if _use_mnnvl_cutedsl_fusion() and self.pp_group.world_size != 1:
-            raise RuntimeError(
-                "FlashInfer MNNVL CuTe DSL fusion currently requires PP=1: the "
-                "last layer of a non-final stage would hand its deferred MoE "
-                "output into PPProxyTensors, and only the last rank has the "
-                "final norm that consumes it"
-            )
-        self.flashinfer_mnnvl_cutedsl_fusion = install_cutedsl_fusion(
+        install_cutedsl_fusion(
             # PP pads self.layers with PPMissingLayer, which has no communicator.
+            # A stage's last layer has no successor, so it keeps its reduction.
             self.layers[self.start_layer : self.end_layer],
             hidden_size=config.hidden_size,
             top_k=config.num_experts_per_tok,
             rms_epsilon=config.rms_norm_eps,
+            # Only the dual-stream path hands off, which needs an unfused shared
+            # expert; with V3/R1's default shared-experts fusion only AR + norm fuse.
             # A TP1 shared expert is added after the all-reduce and cannot move it.
             can_defer_finalize=lambda layer: (
                 isinstance(layer.mlp, DeepseekV2MoE)
                 and layer.mlp.experts.supports_deferred_finalize
+                and layer.mlp.num_fused_shared_experts == 0
                 and not layer.mlp._shared_expert_tp1
             ),
+            # A TP1-replicated output must not ride into the next layer's reduction.
             requires_local_reduction=lambda layer: (
-                isinstance(layer.mlp, DeepseekV2MoE) and layer.mlp._shared_expert_tp1
+                layer.mlp._shared_expert_tp1
+                if isinstance(layer.mlp, DeepseekV2MoE)
+                else layer.mlp.tp_size == 1
             ),
             final_norm_consumes_handoff=False,
             label="DeepSeek-V3/GLM",
@@ -3290,16 +3294,6 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
         if is_wint4afp8_or_wint4a16_config(quant_config):
             return "Deepseek V3/R1 W4AFP8/W4A16 model uses different quant method for routed experts and shared experts."
         return None
-
-    def prepare_before_cuda_graph_capture(self, model_runner) -> None:
-        # BaseRunner looks the hook up here; the handle lives on the inner model.
-        from sglang.srt.layers.moe.cutedsl_ar_fusion import prepare_cutedsl_fusion
-
-        prepare_cutedsl_fusion(
-            self.model.flashinfer_mnnvl_cutedsl_fusion,
-            max_running_requests=model_runner.max_running_requests,
-            label="DeepSeek-V3/GLM",
-        )
 
     def determine_num_fused_shared_experts(self):
         # The decision was installed by the loader; this only reads it.

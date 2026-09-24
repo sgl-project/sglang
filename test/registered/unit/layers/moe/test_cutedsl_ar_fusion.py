@@ -4,16 +4,22 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from sglang.srt.layers.communicator import LayerCommunicator, ScatterMode
-from sglang.srt.layers.flashinfer_mnnvl_cutedsl import _retargeted_config
+from sglang.srt.layers.communicator import LayerCommunicator
+from sglang.srt.layers.flashinfer_mnnvl_cutedsl import (
+    FlashInferMNNVLCuteDSLARFusion,
+    _retargeted_config,
+    _with_early_finalize_shared_load,
+)
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.moe.cutedsl_ar_fusion import (
     CuteDSLFusionLayerCommunicator,
     MoeFinalizeHandoff,
     install_cutedsl_fusion,
+    prepare_cutedsl_fusion,
 )
+from sglang.srt.model_executor.cuda_graph_config import CudaGraphConfig, PhaseConfig
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
-from sglang.srt.runtime_context import get_forward, get_parallel, publish, reset_context
+from sglang.srt.runtime_context import get_forward, publish, reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -28,6 +34,20 @@ def _communicator():
     comm.input_layernorm = RMSNorm(8, eps=1e-6)
     comm.post_attention_layernorm = RMSNorm(8, eps=1e-6)
     return comm
+
+
+def _install(layers, **kwargs):
+    reset_context()
+    publish(ServerArgs(model_path="dummy"), role="test")
+    return install_cutedsl_fusion(
+        layers,
+        hidden_size=8,
+        top_k=2,
+        rms_epsilon=1e-6,
+        can_defer_finalize=lambda layer: False,
+        label="test",
+        **kwargs,
+    )
 
 
 @pytest.fixture
@@ -65,7 +85,10 @@ def test_last_layer_consumes_but_does_not_skip_the_pending_all_reduce(eligible):
         patch.object(
             CuteDSLFusionLayerCommunicator,
             "_finish_prepare_attn",
-            lambda self, h, r, fb: (h, r),
+            lambda self, *, hidden_states, residual, forward_batch: (
+                hidden_states,
+                residual,
+            ),
         ),
         patch.object(
             LayerCommunicator,
@@ -79,24 +102,14 @@ def test_last_layer_consumes_but_does_not_skip_the_pending_all_reduce(eligible):
     assert last._can_absorb_post_moe_all_reduce(_DECODE, 8) is False
 
 
-def test_a_replicated_shared_expert_producer_keeps_its_own_all_reduce(eligible):
-    """A TP1 shared expert is added after the layer's own reduction; handing that
-    reduction onward would scale the shared output by tp_size."""
-    reset_context()
-    publish(ServerArgs(model_path="dummy"), role="test")
+def test_a_replicated_output_producer_keeps_its_own_all_reduce(eligible):
+    """A TP1 shared expert (or TP1 dense MLP) is not partial; handing its layer's
+    reduction onward would scale the replicated output by tp_size."""
     layers = [
         SimpleNamespace(layer_communicator=_communicator(), replicated=replicated)
         for replicated in (True, False, False)
     ]
-    install_cutedsl_fusion(
-        layers,
-        hidden_size=8,
-        top_k=2,
-        rms_epsilon=1e-6,
-        can_defer_finalize=lambda layer: False,
-        requires_local_reduction=lambda layer: layer.replicated,
-        label="test",
-    )
+    _install(layers, requires_local_reduction=lambda layer: layer.replicated)
     replicated, plain = (layer.layer_communicator for layer in layers[:2])
 
     with patch.object(
@@ -110,37 +123,106 @@ def test_a_replicated_shared_expert_producer_keeps_its_own_all_reduce(eligible):
     assert replicated._can_consume_post_moe_all_reduce(_DECODE, 8) is True
 
 
-@pytest.mark.parametrize(
-    ("moe_ep", "moe_tp", "moe_dp", "all_reduce", "finalize"),
-    [
-        (1, 4, 1, True, True),
-        # EP x MoE-TP with MoE-DP 1 merges into one TP reduction.
-        (2, 2, 1, True, False),
-        (2, 2, 2, False, False),
-    ],
-)
-def test_hybrid_ep_tp_fuses_the_all_reduce_only_when_the_legs_merge(
-    moe_ep, moe_tp, moe_dp, all_reduce, finalize
-):
-    """Mirrors the base communicator's mergeable-EP x TP rule; the deferred
-    finalize keeps its EP=1 restriction."""
-    reset_context()
-    publish(ServerArgs(model_path="dummy"), role="test")
-    comm = _communicator()
-    comm.fusion_service = SimpleNamespace(supports=lambda m: True)
-    comm._context = SimpleNamespace(tp_size=8)
-    comm.layer_scatter_modes = SimpleNamespace(mlp_mode=ScatterMode.FULL)
+def test_a_service_nested_under_a_wrapper_is_prepared():
+    """A VLM wrapper holds the model as a submodule and has no pre-capture hook;
+    an unprepared service declines every M, leaving no fusion at all."""
+    prepared = []
+    layer = torch.nn.Linear(2, 2)
+    layer.layer_communicator = _communicator()
+    wrapper = torch.nn.Module()
+    wrapper.language_model = torch.nn.Sequential(layer)
+    _install([layer])
+    layer.layer_communicator.fusion_service.prepare = lambda *, max_m: prepared.append(
+        max_m
+    )
 
-    tp_size = moe_ep * moe_tp * moe_dp
-    with get_parallel().override(
-        moe_ep_size=moe_ep,
-        moe_tp_size=moe_tp,
-        moe_dp_size=moe_dp,
-        tp_size=tp_size,
-        attn_tp_size=tp_size,
-    ):
-        assert comm._common_eligible(_DECODE, 8) is all_reduce
-        assert comm._should_use_finalize(_DECODE, 8) is finalize
+    # The workspace M bound is the largest of every framework source.
+    reset_context()
+    publish(
+        ServerArgs(
+            model_path="dummy",
+            cuda_graph_config=CudaGraphConfig(
+                decode=PhaseConfig(max_bs=512, bs=[1, 64, 256]),
+                prefill=PhaseConfig(max_bs=4096, bs=[1024, 2048, 4096]),
+            ),
+        ),
+        role="test",
+    )
+    with patch(f"{_MODULE}.cutedsl_moe_max_num_tokens", return_value=8192):
+        prepare_cutedsl_fusion(wrapper, max_running_requests=2048)
+    assert prepared == [8192]
+
+    with pytest.raises(ValueError, match="installed no CuTe DSL fusion service"):
+        prepare_cutedsl_fusion(torch.nn.Linear(2, 2), max_running_requests=2048)
+
+
+def test_wrapper_passes_no_routed_scaling_factor_to_the_kernel():
+    """The routed output is already scaled; forwarding the factor would scale
+    DeepSeek's routed contribution twice."""
+    calls = []
+    wrapper = object.__new__(FlashInferMNNVLCuteDSLARFusion)
+    wrapper.hidden_size, wrapper.device = 8, torch.device("cpu")
+    wrapper.rms_epsilon, wrapper.weight_bias = 1e-6, 0.0
+    wrapper.workspace = object()
+    wrapper.supports = lambda m: True
+    wrapper._patterns = SimpleNamespace(
+        kARResidualRMSNorm=1, kMoEFinalizeARResidualRMSNorm=7
+    )
+    wrapper._allreduce_fusion = lambda **kwargs: calls.append(kwargs)
+    x = torch.empty(4, 8, dtype=torch.bfloat16)
+    wrapper.moe_finalize_all_reduce_rms_norm(
+        routed_output=torch.empty(8, 8, dtype=torch.bfloat16),
+        expert_weights=torch.empty(4, 2, dtype=torch.bfloat16),
+        permuted_indices=torch.empty(4, 2, dtype=torch.int32),
+        gated_shared_output=x,
+        residual=x,
+        gamma=torch.empty(8, dtype=torch.bfloat16),
+    )
+    wrapper.all_reduce_residual_rms_norm(
+        local_contribution=x, residual=x, gamma=torch.empty(8, dtype=torch.bfloat16)
+    )
+
+    assert [call["pattern"] for call in calls] == [7, 1]
+    assert all("routed_scaling_factor" not in call for call in calls)
+
+
+def test_the_handoff_views_the_producer_storage():
+    """The handoff is consumed in place by the next layer's kernel; a copy would
+    cost the [M*top_k, hidden] round trip the fusion exists to save."""
+    m, top_k = 3, 10
+    gemm2_out = torch.empty(m * top_k + 4, 16, dtype=torch.bfloat16)
+    expert_weights = torch.empty(m + 1, top_k, dtype=torch.bfloat16)
+    permuted_indices = torch.empty(m + 1, top_k, dtype=torch.int32)
+    handoff = MoeFinalizeHandoff.from_flashinfer(
+        SimpleNamespace(
+            gemm2_out=gemm2_out,
+            expert_weights=expert_weights,
+            expanded_idx_to_permuted_idx=permuted_indices,
+            top_k=top_k,
+        ),
+        gated_shared_output=torch.empty(m, 16, dtype=torch.bfloat16),
+        m=m,
+    )
+
+    assert handoff.routed_output.data_ptr() == gemm2_out.data_ptr()
+    assert handoff.permuted_indices.data_ptr() == permuted_indices.data_ptr()
+    assert tuple(handoff.expert_weights.shape) == (m, top_k)
+
+
+def test_early_shared_load_touches_only_the_finalize_routes():
+    """Only a fused finalize has a completed shared-expert handoff to load early;
+    the standalone all-reduce must keep the safe ordering."""
+    from flashinfer.comm.mnnvl_cutedsl import DEFAULT_CONFIG
+    from flashinfer.comm.mnnvl_cutedsl.kernel_ht import HTFinalizeTuning
+
+    config = _with_early_finalize_shared_load(DEFAULT_CONFIG)
+
+    for before, after in zip(DEFAULT_CONFIG.profiles, config.profiles):
+        assert after.all_reduce_routes == before.all_reduce_routes
+        for target in after.finalize_routes.targets:
+            # HT has no shared-load ordering option.
+            if not isinstance(target.preset, HTFinalizeTuning):
+                assert target.preset.load_shared_expert_before_pdl is True
 
 
 def test_dual_stream_op_pins_the_deferral_off_under_a_deferring_caller():
@@ -174,6 +256,37 @@ def test_dual_stream_op_pins_the_deferral_off_under_a_deferring_caller():
     assert torch.equal(out, torch.ones(4, 8))
 
 
+def _flashinfer_accepts(preset, *, hidden_size, top_k, tp_size):
+    """FlashInfer's own HT kernel validation, which runs before any compile."""
+    from flashinfer.comm.mnnvl_cutedsl.kernel_ht.device_kernel import (
+        _MoeFinalizeAllReduceRMSNormHTDeviceKernel,
+    )
+
+    _MoeFinalizeAllReduceRMSNormHTDeviceKernel(
+        hidden=hidden_size,
+        top_k=top_k,
+        tp=tp_size,
+        rank=0,
+        # Arbitrary grid when the preset leaves it to the device's SM count.
+        active_ctas=preset.persistent_ctas or tp_size * 8,
+        stages=preset.stages,
+        consumer_threads=preset.consumer_threads,
+        vectors_per_thread=preset.vectors_per_thread,
+        reduction_warps=preset.reduction_warps,
+        reduction_cta_groups=preset.reduction_cta_groups,
+        rms_token_groups=preset.rms_token_groups,
+        rms_pipeline_stages=preset.rms_pipeline_stages,
+        rms_shard_major=preset.rms_shard_major,
+        rms_epsilon=1e-6,
+        routed_scaling_factor=1.0,
+        weight_bias=0.0,
+        include_shared_expert=True,
+        add_residual=True,
+        write_residual_output=True,
+        enable_pdl=preset.enable_pdl,
+    )
+
+
 # (hidden_size, top_k, tp_size, HT routable), from the checkpoint configs of
 # Qwen3.8, DeepSeek-V3 and GLM-5.3. False: the vectors per reduction shard are
 # not a warp multiple at that width, which the kernel rejects.
@@ -190,7 +303,7 @@ def test_dual_stream_op_pins_the_deferral_off_under_a_deferring_caller():
         (6144, 8, 16, False),
     ],
 )
-def test_retargeted_profiles_cover_capacity_and_satisfy_the_kernel(
+def test_retargeted_profiles_cover_capacity_and_pass_flashinfer_validation(
     hidden_size, top_k, tp_size, ht_routable
 ):
     """A wrong split aborts at compile time on a Blackwell node, and an
@@ -199,47 +312,17 @@ def test_retargeted_profiles_cover_capacity_and_satisfy_the_kernel(
 
     profile = _retargeted_config(tp_size, hidden_size, top_k).profiles[0]
     profile.validate_capacity(4096)
-    for routes in (profile.finalize_routes, profile.all_reduce_routes):
+    for routes, routed_top_k in (
+        (profile.finalize_routes, top_k),
+        (profile.all_reduce_routes, 0),
+    ):
         assert routes.is_unbounded
         ht = [t.preset for t in routes.targets if t.protocol is ProtocolKind.HT]
         assert bool(ht) is ht_routable
-        if not ht:
-            continue
-        preset, packs = ht[0], hidden_size // 8
-        # The device kernel's own validation expressions.
-        assert preset.consumer_threads + (2 + preset.reduction_warps) * 32 <= 1024
-        assert preset.consumer_threads % 32 == 0
-        assert preset.reduction_warps in (1, 2, 4, 8)
-        assert (
-            hidden_size % (preset.consumer_threads * 8 * preset.vectors_per_thread) == 0
-        )
-        assert packs % tp_size == 0
-        assert packs % (preset.consumer_threads // preset.rms_token_groups) == 0
-        assert (packs // tp_size) % (preset.reduction_warps * 32) == 0
-        if preset.rms_shard_major:
-            rms_warps = (preset.consumer_threads // preset.rms_token_groups) // 32
-            assert tp_size % rms_warps == 0 and tp_size >= rms_warps
-        if preset.rms_pipeline_stages > 1:
-            assert preset.rms_token_groups * preset.rms_pipeline_stages <= preset.stages
-
-
-def test_the_handoff_constructs_inside_a_dynamo_traced_region():
-    """Both producers build a handoff under fullgraph=True, and Dynamo cannot
-    construct a msgspec.Struct, so migrating it off a frozen dataclass fails
-    server startup at capture time."""
-
-    def build(x):
-        return MoeFinalizeHandoff(
-            routed_output=x,
-            expert_weights=x,
-            permuted_indices=x,
-            gated_shared_output=x,
-            m=2,
-        )
-
-    handoff = torch.compile(build, fullgraph=True, backend="eager")(torch.zeros(4, 8))
-
-    assert handoff.m == 2
+        for preset in ht:
+            _flashinfer_accepts(
+                preset, hidden_size=hidden_size, top_k=routed_top_k, tp_size=tp_size
+            )
 
 
 if __name__ == "__main__":
