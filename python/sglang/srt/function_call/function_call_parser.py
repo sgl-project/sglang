@@ -210,7 +210,9 @@ class FunctionCallParser:
         return sp_result.normal_text, sp_result.calls
 
     def get_legacy_structural_tag(
-        self, at_least_one: bool = False
+        self,
+        at_least_one: bool = False,
+        named_function_name: Optional[str] = None,
     ) -> StructuralTagResponseFormat:
         """
         Generate a structural tag response format for all available tools.
@@ -220,6 +222,8 @@ class FunctionCallParser:
         Args:
             at_least_one: If True, the grammar forces at least one tool call
                 (no free text allowed). Used for required/named tool_choice.
+            named_function_name: Restrict the grammar to this one function and
+                always enforce its parameters schema (named tool_choice).
 
         Raises:
             ValueError: If tools have conflicting $defs schemas.
@@ -235,13 +239,20 @@ class FunctionCallParser:
             function = tool.function
             name = function.name
             assert name is not None
+            if named_function_name is not None and name != named_function_name:
+                continue
             info = get_structure_info(name)
 
             # accept all if not strict, otherwise only accept the schema
             is_strict = (
                 function.strict or self.tool_strict_level >= ToolStrictLevel.PARAMETER
             )
-            schema = function.parameters if is_strict else {}
+            if named_function_name is not None:
+                # An empty schema would let greedy decoding emit `{}` with all
+                # required arguments missing.
+                schema = function.parameters or {}
+            else:
+                schema = function.parameters if is_strict else {}
 
             tool_structures.append(
                 StructuresResponseFormat(
@@ -348,9 +359,17 @@ class FunctionCallParser:
                 if self.detector.supports_structural_tag():
                     # For "required"/named: always use structural_tag to preserve the
                     # model's native tool call format. Schema is only included when
-                    # strict=True, per OpenAI protocol semantics.
+                    # strict=True, per OpenAI protocol semantics — a named
+                    # tool_choice is the exception and always enforces its schema.
                     # For "auto": only constrain when strict is enabled.
-                    tag = self.get_legacy_structural_tag(at_least_one=is_required)
+                    tag = self.get_legacy_structural_tag(
+                        at_least_one=is_required,
+                        named_function_name=(
+                            tool_choice.function.name
+                            if isinstance(tool_choice, ToolChoice)
+                            else None
+                        ),
+                    )
                     return ("structural_tag", tag)
 
             if (

@@ -1,7 +1,9 @@
 """
-Tests for JSON schema constraint functionality used by JsonArrayParser
+Tests for tool_choice constraint generation: the json_schema path and the
+legacy structural tag path must agree on named tool_choice semantics.
 """
 
+import json
 import unittest
 
 import jsonschema
@@ -12,6 +14,7 @@ from sglang.srt.entrypoints.openai.protocol import (
     ToolChoice,
     ToolChoiceFuncName,
 )
+from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.function_call.utils import (
     _get_tool_schema_defs,
     get_json_schema_constraint,
@@ -621,6 +624,86 @@ class TestJsonSchemaConstraint(unittest.TestCase):
         # Should still include $defs even if not referenced
         self.assertIn("$defs", schema)
         self.assertIn("UnusedType", schema["$defs"])
+
+
+class TestNamedToolChoiceStructuralTag(unittest.TestCase):
+    """Named tool_choice on the legacy structural tag path: the grammar must be
+    restricted to the named function and enforce its real parameters schema even
+    when strict is not set. Regression tests for the divergence from the
+    json_schema path above, where a non-strict tool got an empty schema and
+    greedy decoding could emit minimal arguments like ``{}``."""
+
+    ADD_PARAMS = {
+        "type": "object",
+        "properties": {"a": {"type": "number"}, "b": {"type": "number"}},
+        "required": ["a", "b"],
+    }
+    WEATHER_PARAMS = {
+        "type": "object",
+        "properties": {"city": {"type": "string"}},
+        "required": ["city"],
+    }
+
+    @staticmethod
+    def _tool(name, params, strict=False):
+        return Tool(
+            type="function",
+            function=Function(
+                name=name,
+                description=f"{name} tool",
+                parameters=params,
+                strict=strict,
+            ),
+        )
+
+    def _named_constraint(self, tools, name):
+        parser = FunctionCallParser(tools, "llama3")
+        tool_choice = ToolChoice(
+            type="function", function=ToolChoiceFuncName(name=name)
+        )
+        constraint = parser.get_structure_constraint(tool_choice)
+        self.assertIsNotNone(constraint)
+        self.assertEqual(constraint[0], "structural_tag")
+        return json.loads(constraint[1].model_dump_json(by_alias=True))
+
+    def test_named_non_strict_enforces_real_schema(self):
+        tools = [self._tool("add", self.ADD_PARAMS)]
+        tag = self._named_constraint(tools, "add")
+
+        self.assertEqual(len(tag["structures"]), 1)
+        schema = tag["structures"][0]["schema"]
+        self.assertIn("a", schema.get("properties", {}))
+        self.assertIn("b", schema.get("properties", {}))
+        self.assertEqual(set(schema.get("required", [])), {"a", "b"})
+
+    def test_named_restricts_to_named_function(self):
+        tools = [
+            self._tool("add", self.ADD_PARAMS, strict=True),
+            self._tool("get_weather", self.WEATHER_PARAMS, strict=True),
+        ]
+        tag = self._named_constraint(tools, "get_weather")
+
+        self.assertEqual(len(tag["structures"]), 1)
+        properties = tag["structures"][0]["schema"].get("properties", {})
+        self.assertIn("city", properties)
+        self.assertNotIn("a", properties)
+
+    def test_required_non_strict_keeps_legacy_behavior(self):
+        tools = [self._tool("add", self.ADD_PARAMS)]
+        parser = FunctionCallParser(tools, "llama3")
+        constraint = parser.get_structure_constraint("required")
+
+        self.assertIsNotNone(constraint)
+        self.assertEqual(constraint[0], "structural_tag")
+        tag = json.loads(constraint[1].model_dump_json(by_alias=True))
+        self.assertEqual(tag["at_least_one"], True)
+        for structure in tag["structures"]:
+            self.assertEqual(structure["schema"], {})
+
+    def test_auto_non_strict_unconstrained(self):
+        tools = [self._tool("add", self.ADD_PARAMS)]
+        parser = FunctionCallParser(tools, "llama3")
+        self.assertIsNone(parser.get_structure_constraint("auto"))
 
 
 if __name__ == "__main__":
