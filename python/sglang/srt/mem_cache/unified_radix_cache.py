@@ -310,15 +310,6 @@ class UnifiedRadixCache(BasePrefixCache):
         if not reduced and self.tp_world_size > 1:
             torch.distributed.all_reduce(tensor, op=op, group=self.tp_group)
 
-    def _barrier_attn_groups(self):
-        waited = False
-        for group in (self.attn_cp_group, self.attn_tp_group):
-            if group is not None and torch.distributed.get_world_size(group=group) > 1:
-                torch.distributed.barrier(group=group)
-                waited = True
-        if not waited and self.tp_world_size > 1:
-            torch.distributed.barrier(group=self.tp_group)
-
     def _drain_async_work(self):
         """
         Block until all outstanding async sends are consumed, then clear.
@@ -355,7 +346,7 @@ class UnifiedRadixCache(BasePrefixCache):
                 data,
                 group_src=self.pp_rank - 1,
                 group=self.pp_group,
-                tag=P2PTag.HIRADIX_PP_SYNC,
+                tag=P2PTag.HICACHE_PP_SYNC,
             )
         if self.pp_rank + 1 < self.pp_size:
             copy_of_data = data.clone()
@@ -363,7 +354,7 @@ class UnifiedRadixCache(BasePrefixCache):
                 copy_of_data,
                 group_dst=self.pp_rank + 1,
                 group=self.pp_group,
-                tag=P2PTag.HIRADIX_PP_SYNC,
+                tag=P2PTag.HICACHE_PP_SYNC,
             )
             self.work_list.append(send_work)
 
@@ -1112,6 +1103,46 @@ class UnifiedRadixCache(BasePrefixCache):
                 self.session_refs.register_session_ref(req)
 
     @rank_consensus(same_params=["req.rid", "chunked"])
+    def advance_unpublished_req(self, req: Req, chunked: bool = False) -> None:
+        assert not self.supports_mamba()
+        token_ids = req.get_fill_ids()
+        kv_indices = self.req_to_token_pool.req_to_token[
+            req.kv.req_pool_idx, : len(token_ids)
+        ]
+        insert_params = InsertParams(
+            prev_prefix_len=req.kv.cache_protected_len,
+            chunked=chunked,
+            priority=getattr(req, "priority", 0) or 0,
+            rotation_base=req.kv_rotation_base,
+        )
+        effective_cache_len = len(token_ids)
+        for comp in self._components_tuple:
+            cache_len = comp.prepare_for_caching_req(
+                req=req,
+                insert_params=insert_params,
+                token_ids_len=len(token_ids),
+                is_finished=False,
+            )
+            if cache_len is not None:
+                effective_cache_len = min(effective_cache_len, cache_len)
+
+        radix_key = RadixKey(
+            token_ids[:effective_cache_len],
+            req.extra_key,
+            is_bigram=self.tree_core.is_eagle,
+            cache_salt=req.cache_salt,
+        )
+        if envs.SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS.get():
+            for comp in self._components_tuple:
+                comp.free_out_of_window_slots(req, len(radix_key) - 1, insert_params)
+
+        req.prefix_indices = kv_indices.to(dtype=torch.int64, copy=True)
+        for comp in self._components_tuple:
+            comp.cleanup_after_caching_req(
+                req, is_finished=False, insert_params=insert_params
+            )
+
+    @rank_consensus(same_params=["req.rid", "chunked"])
     def cache_unfinished_req(self, req: Req, chunked: bool = False, **kwargs) -> None:
         if self.session.try_cache_unfinished_req(req, chunked=chunked, **kwargs):
             return
@@ -1438,26 +1469,19 @@ class UnifiedRadixCache(BasePrefixCache):
             return 0
         return self.evict_host(num_tokens)
 
-    def retraction_backup(self, req: Req) -> Optional[RetractionBackup]:
+    def backup_kv_cache(self, req: Req) -> Optional[RetractionBackup]:
         """Back up device KV to the host pool; None when it cannot fit after reclaim."""
         assert req.seqlen > 1
 
         device_indices, extra_transfers = self._retraction_device_transfers(req)
-        host_indices = self.host_pool_group.alloc(len(device_indices))
-        if host_indices is None:
-            self._reclaim_retraction_host(len(device_indices))
-            host_indices = self.host_pool_group.alloc(len(device_indices))
-        if host_indices is None:
-            return None
-
-        resolved = self.host_pool_group.resolve_host_transfers(
+        allocation = self.cache_controller.allocate_host_transfers(
+            device_indices,
             extra_transfers or None,
-            primary_device_indices=device_indices,
-            primary_host_indices=host_indices,
+            reclaim=self._reclaim_retraction_host,
         )
-        if resolved is None and extra_transfers:
-            self.host_pool_group.free(host_indices)
+        if allocation is None:
             return None
+        host_indices, resolved = allocation
 
         backup = RetractionBackup(
             host_indices=host_indices,
@@ -1481,11 +1505,11 @@ class UnifiedRadixCache(BasePrefixCache):
             )
             completion.finish_event.synchronize()
         except Exception:
-            self.retraction_discard(backup)
+            self.discard_kv_cache_backup(backup)
             raise
         return backup
 
-    def retraction_restore(self, req: Req, backup: RetractionBackup) -> None:
+    def restore_kv_cache(self, req: Req, backup: RetractionBackup) -> None:
         device_indices, current_transfers = self._retraction_device_transfers(req)
         assert len(backup.host_indices) == len(device_indices), (
             f"Host backup has {len(backup.host_indices)} slots, but restore has "
@@ -1530,13 +1554,27 @@ class UnifiedRadixCache(BasePrefixCache):
             transfer_layer_id_max=self.cache_controller.transfer_layer_id_max,
         )
         completion.finish_event.synchronize()
-        self.retraction_discard(backup)
+        self.discard_kv_cache_backup(backup)
 
-    def retraction_discard(self, backup: RetractionBackup) -> None:
+    def discard_kv_cache_backup(self, backup: RetractionBackup) -> None:
         self.host_pool_group.free(backup.host_indices)
         self.host_pool_group.release_transfers(backup.pool_transfers)
 
     # ---- HiCache: Backup / LoadBack ----
+
+    def backup_node_for_write_back(self, node_id: NodeId) -> bool:
+        """Synchronously back up one node (Full KV plus any unbacked component
+        state) and drain the ack -- the deferred-demote shape the eviction
+        loop runs for leaves, reusable by component evictors ahead of an
+        internal-state tombstone. Returns True once the backup is committed.
+        """
+        written = self._execute_and_commit_kv_backup(
+            BackupKV(node_ids=[node_id]), write_back=True
+        )
+        if written == 0:
+            return False
+        self.writing_check(write_back=True)
+        return True
 
     def _execute_and_commit_kv_backup(
         self, action: BackupKV, write_back: bool = False
@@ -1597,11 +1635,16 @@ class UnifiedRadixCache(BasePrefixCache):
     def _execute_kv_backup(self, node_id, device_value, comp_xfers, sidecar_xfers):
         """Execute Backup action."""
         kv_tokens = len(device_value)
-        host_avail = self.cache_controller.mem_pool_host.available_size()
-        if host_avail < kv_tokens:
-            needed = kv_tokens - host_avail
-            if self.evict_host(needed) < needed:
-                return None
+        anchor_entry = self.cache_controller.mem_pool_host.anchor_entry
+        if (
+            anchor_entry.host_pool.shared_allocation_domain is None
+            or anchor_entry.host_evict_fn is None
+        ):
+            host_avail = self.cache_controller.mem_pool_host.available_size()
+            if host_avail < kv_tokens:
+                needed = kv_tokens - host_avail
+                if self.evict_host(needed) < needed:
+                    return None
         aux_xfers = [x for xfers in comp_xfers.values() for x in xfers]
         aux_xfers.extend(sidecar_xfers)
         # Defer submission so the next flush can merge pending node backups.
@@ -3463,8 +3506,8 @@ class UnifiedRadixCache(BasePrefixCache):
     def is_load_back_event_done(self, consumer_index: int) -> bool:
         """Return True after the local load-back event is complete.
 
-        Mirrors ``HiRadixCache`` so the disagg decode restore state machine
-        (``DecodeHiCacheTransferMixin``) can gate on load-back completion; the
+        Lets the disagg decode restore state machine
+        (``DecodeHiCacheTransferMixin``) gate on load-back completion; the
         controller-level ``layer_done_counter`` event is shared across cache
         implementations, while the tree-side bookkeeping runs in
         ``loading_check``.

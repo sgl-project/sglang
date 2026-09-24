@@ -1700,6 +1700,7 @@ class DeepseekV4HipRadixBackend(
                     kv_indptr=kv_indptr,
                     attn_sink=attn_sink,
                     v_head_dim=layer.v_head_dim,
+                    compress_ratio=compress_ratio,
                 )
             from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.paged_decode import (
                 _kv_splits_for_stream,
