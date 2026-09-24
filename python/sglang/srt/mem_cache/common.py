@@ -292,7 +292,7 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
             )
             req.kv.mamba_pool_idx = None
         return
-    if tree_cache.on_release(req):
+    if tree_cache.claim_kv_row(req):
         # A streaming session detached the kv record to keep the row.
         assert not req.kv.holds_kv
         return

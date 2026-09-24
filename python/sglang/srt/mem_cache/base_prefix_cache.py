@@ -487,10 +487,9 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         if req.last_node is not None:
             self.dec_lock_ref(req.last_node)
 
-    def on_release(self, req: Req) -> bool:
-        """Offer a request that is about to release its kv row. Return True
-        to take the row over instead (a streaming session keeping it for
-        the next turn); the caller then releases nothing."""
+    def claim_kv_row(self, req: Req) -> bool:
+        """A streaming session keeps the request's kv row for the next turn.
+        Return True after taking the row; the caller then releases nothing."""
         return False
 
     def after_release(self, req: Req, *, adopted: bool) -> None:

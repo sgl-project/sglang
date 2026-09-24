@@ -352,7 +352,7 @@ class StreamingSession(BasePrefixCache):
             return result
         return self.inner.match_prefix(params)
 
-    def on_release(self, req: Req) -> bool:
+    def claim_kv_row(self, req: Req) -> bool:
         return self.try_cache_finished_req(req)
 
     def after_release(self, req: Req, *, adopted: bool) -> None:
