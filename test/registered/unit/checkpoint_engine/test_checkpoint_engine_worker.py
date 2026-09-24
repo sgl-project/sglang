@@ -17,7 +17,9 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 import importlib.util
+import sys
 import unittest
+from types import ModuleType
 from unittest.mock import MagicMock, patch
 
 import torch
@@ -137,41 +139,76 @@ class TestWorkerDeviceUuidOnXpu(CustomTestCase):
         self.assertEqual(key, _get_physical_gpu_id(dm, torch.xpu.current_device()))
 
 
-if __name__ == "__main__":
-    unittest.main(verbosity=3)
+def _checkpoint_engine_stub():
+    """get_model_loader never calls into checkpoint-engine, so the worker can be
+    imported against a stand-in where the extra is not installed (as on CPU CI)."""
+    worker = ModuleType("checkpoint_engine.worker")
+    worker.update_weights_from_ipc = MagicMock()
+    package = ModuleType("checkpoint_engine")
+    package.worker = worker
+    return {"checkpoint_engine": package, "checkpoint_engine.worker": worker}
 
 
-@unittest.skipUnless(_HAS_CHECKPOINT_ENGINE, _NO_CKPT_ENGINE)
+class _DoubledAtRuntime:
+    """The runtime form is 2x the checkpoint value, as with FNUZ block weights or
+    doubled KV scales; writing a checkpoint tensor onto it corrupts the layer."""
+
+    def process_weights_after_loading(self, layer):
+        layer.weight.data.mul_(2)
+        layer.runtime_form = True
+
+    def restore_weights_before_loading(self, layer):
+        if layer.runtime_form:
+            layer.weight.data.div_(2)
+            layer.runtime_form = False
+
+
+class _ConvertedModel(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.layer = torch.nn.Module()
+        self.layer.weight = torch.nn.Parameter(torch.ones(2), requires_grad=False)
+        self.layer.quant_method = _DoubledAtRuntime()
+        self.layer.quant_method.process_weights_after_loading(self.layer)
+        self.written_onto = []
+
+    def load_weights(self, weights):
+        self.written_onto.append(self.layer.weight.tolist())
+        for _, value in weights:
+            self.layer.weight.data.copy_(value)
+
+
 class TestWorkerModelLoaderRestores(CustomTestCase):
     """An IPC reload opens no weight-update session, so the loader itself must put the
     converted layers back in checkpoint form before the first write."""
 
-    def test_restore_runs_before_every_load(self):
-        calls = []
-        model_runner = MagicMock()
-        model_runner.model.load_weights.side_effect = lambda weights: calls.append(
-            ("load", list(weights))
+    def setUp(self):
+        stubs = {} if _HAS_CHECKPOINT_ENGINE else _checkpoint_engine_stub()
+        with patch.dict(sys.modules, stubs):
+            self.worker = importlib.import_module(_WORKER_MOD)
+
+    def test_every_update_writes_onto_checkpoint_form(self):
+        model = _ConvertedModel()
+        worker = self.worker.SGLangCheckpointEngineWorkerExtensionImpl(
+            model_runner=MagicMock(model=model)
         )
-        worker = SGLangCheckpointEngineWorkerExtensionImpl(model_runner=model_runner)
         with (
-            patch(
-                "sglang.srt.model_loader.loader.restore_weight",
-                side_effect=lambda model, device: calls.append(("restore", model)),
-            ),
-            patch(f"{_WORKER_MOD}.get_device", return_value="cpu"),
-            patch(f"{_WORKER_MOD}.get_device_module") as device_module,
+            patch.object(self.worker, "get_device", return_value="cpu"),
+            patch.object(self.worker, "get_device_module") as device_module,
         ):
             device_module.return_value.current_device.return_value = 0
-            loader = worker.get_model_loader()
-            loader(iter([("a", 1)]))
-            loader(iter([]))
+            load, post_hook = worker.get_model_loader(), worker.get_post_hook()
+            for value in (3.0, 5.0):
+                load(iter([("layer.weight", torch.full((2,), value))]))
+                load(iter([]))  # a later bucket of the same update
+                post_hook()
 
+        # Without the restore, the second update would land on 6.0 (3.0 converted).
         self.assertEqual(
-            calls,
-            [
-                ("restore", model_runner.model),
-                ("load", [("a", 1)]),
-                ("restore", model_runner.model),
-                ("load", []),
-            ],
+            model.written_onto, [[1.0, 1.0], [3.0, 3.0], [3.0, 3.0], [5.0, 5.0]]
         )
+        self.assertEqual(model.layer.weight.tolist(), [10.0, 10.0])
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=3)
