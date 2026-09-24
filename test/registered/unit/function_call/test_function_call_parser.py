@@ -936,6 +936,105 @@ class TestMistralDetector(unittest.TestCase):
         self.assertEqual(params["decision"], "TOOL")
         self.assertEqual(params["content"], "Use weather API")
 
+    def _mistral_tools(self):
+        """self.tools plus a second tool, for parallel-call cases."""
+        return self.tools + [
+            Tool(
+                type="function",
+                function=Function(
+                    name="get_weather",
+                    description="Get weather",
+                    parameters={
+                        "type": "object",
+                        "properties": {"city": {"type": "string"}},
+                        "required": ["city"],
+                    },
+                ),
+            )
+        ]
+
+    @staticmethod
+    def _collect_mistral(chunks, tools):
+        """Feed deltas and merge streamed calls the way a client would."""
+        store: dict = {}
+        order = []
+        text = ""
+        detector = MistralDetector()
+        for chunk in chunks:
+            result = detector.parse_streaming_increment(chunk, tools)
+            text += result.normal_text or ""
+            for call in result.calls:
+                if call.tool_index not in store:
+                    store[call.tool_index] = [call.name, ""]
+                    order.append(call.tool_index)
+                if call.name:
+                    store[call.tool_index][0] = call.name
+                store[call.tool_index][1] += call.parameters or ""
+        end = detector.finish(tools)
+        text += end.normal_text or ""
+        for call in end.calls:
+            if call.tool_index not in store:
+                store[call.tool_index] = [call.name, ""]
+                order.append(call.tool_index)
+            if call.name:
+                store[call.tool_index][0] = call.name
+            store[call.tool_index][1] += call.parameters or ""
+        return text, [(i, store[i][0], store[i][1]) for i in order]
+
+    def test_streaming_two_calls_does_not_leak_arguments_as_text(self):
+        """The tail of a JSON array is framing, not assistant text.
+
+        After the first call is emitted the buffer holds ", {next call}...]",
+        which has no [TOOL_CALLS marker. Treating it as normal text printed the
+        remaining arguments to the user and dropped the following calls.
+        """
+        text = (
+            '[TOOL_CALLS] [{"name": "make_next_step_decision", '
+            '"arguments": {"decision": "ANSWER", "content": "42"}}, '
+            '{"name": "get_weather", "arguments": {"city": "Beijing"}}]'
+        )
+        tools = self._mistral_tools()
+        for chunk_size in (1, 5, 40, len(text)):
+            chunks = [text[i : i + chunk_size] for i in range(0, len(text), chunk_size)]
+            streamed_text, streamed = self._collect_mistral(chunks, tools)
+            non_stream = MistralDetector().detect_and_parse(text, tools)
+            expected = [(c.tool_index, c.name, c.parameters) for c in non_stream.calls]
+            self.assertEqual(streamed, expected, f"chunk_size={chunk_size}")
+            self.assertEqual(len(streamed), 2, f"chunk_size={chunk_size}")
+            self.assertEqual(
+                streamed_text, non_stream.normal_text, f"chunk_size={chunk_size}"
+            )
+            self.assertNotIn('"name"', streamed_text, f"chunk_size={chunk_size}")
+
+    def test_finish_releases_arguments_of_a_call_completed_in_one_delta(self):
+        """A call completing inside one delta must not arrive with empty args."""
+        text = (
+            '[TOOL_CALLS] [{"name": "make_next_step_decision", '
+            '"arguments": {"decision": "ANSWER", "content": "42"}}]'
+        )
+        tools = self._mistral_tools()
+        streamed_text, streamed = self._collect_mistral([text], tools)
+        non_stream = MistralDetector().detect_and_parse(text, tools)
+
+        self.assertEqual(
+            streamed, [(c.tool_index, c.name, c.parameters) for c in non_stream.calls]
+        )
+        self.assertEqual(streamed_text, non_stream.normal_text)
+
+    def test_finish_is_a_noop_when_nothing_is_pending(self):
+        text = (
+            '[TOOL_CALLS] [{"name": "make_next_step_decision", '
+            '"arguments": {"decision": "ANSWER", "content": "42"}}]'
+        )
+        tools = self._mistral_tools()
+        detector = MistralDetector()
+        detector.parse_streaming_increment(text, tools)
+        detector.parse_streaming_increment("", tools)
+
+        end = detector.finish(tools)
+        self.assertEqual(end.calls, [])
+        self.assertEqual(end.normal_text, "")
+
 
 class TestBaseFormatDetector(unittest.TestCase):
     """Test buffer management and sequential tool index assignment in BaseFormatDetector."""

@@ -14,6 +14,10 @@ from sglang.srt.function_call.utils import _is_complete_json
 
 logger = logging.getLogger(__name__)
 
+# Upper bound for the end-of-stream drain: each round releases at most one
+# pending unit (a tool name or one argument diff).
+_MAX_FINISH_DRAIN_ROUNDS = 1024
+
 
 class MistralDetector(BaseFormatDetector):
     """
@@ -127,6 +131,20 @@ class MistralDetector(BaseFormatDetector):
 
         # No marker: either flush as normal text or keep buffering a partial marker.
         if self._tool_calls_marker not in current_text:
+            # A JSON array can continue past its first element: once a call has
+            # been emitted, the buffer holds ", {next call}...]" and carries no
+            # marker of its own. Flushing it would print the remaining arguments
+            # as visible text and drop every following call, so hand it to the
+            # base implementation, which handles the separator case.
+            if self.current_tool_id > 0:
+                separator = self.tool_call_separator
+                head = current_text.lstrip()
+                if head.startswith(separator):
+                    return super().parse_streaming_increment(new_text="", tools=tools)
+                if not head or separator.startswith(head):
+                    # The separator is still arriving one character at a time;
+                    # hold it rather than printing a lone comma to the user.
+                    return StreamingParseResult()
             if not self._ends_with_partial_token(self._buffer, self._tool_calls_marker):
                 normal_text = self._buffer
                 self._buffer = ""
@@ -194,6 +212,34 @@ class MistralDetector(BaseFormatDetector):
 
         # Otherwise, keep buffering.
         return StreamingParseResult()
+
+    def finish(self, tools: List[Tool]) -> StreamingParseResult:
+        """Release tool-call state the last delta left pending.
+
+        parse_streaming_increment emits at most one unit per call: a tool name
+        with empty parameters, then that call's argument diff, then the next
+        call. A delta carrying a complete call therefore leaves work pending for
+        the following delta, and when that delta was the last one (multi-token
+        deltas from speculative decoding / MTP, ``stream_interval > 1``, or a
+        call short enough to be generated in a single step) nothing picked it up:
+        the call reached the client with empty arguments while detect_and_parse
+        returned them.
+
+        Re-running the parser with an empty delta drains that queue. The loop
+        stops as soon as a round yields neither calls nor text, so a stream that
+        was already flushed returns nothing.
+        """
+        normal_parts: List[str] = []
+        calls: List[ToolCallItem] = []
+        for _ in range(_MAX_FINISH_DRAIN_ROUNDS):
+            result = self.parse_streaming_increment("", tools)
+            if not result.calls and not result.normal_text:
+                break
+            if result.calls:
+                calls.extend(result.calls)
+            if result.normal_text:
+                normal_parts.append(result.normal_text)
+        return StreamingParseResult(normal_text="".join(normal_parts), calls=calls)
 
     def _try_parse_compact_args_format(
         self, text: str
