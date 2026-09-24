@@ -7,9 +7,18 @@ from sglang.srt.utils import is_gfx95_supported
 
 __all__ = [
     "fused_fp8_bmm_rope_cat_and_cache_mla",
+    "fused_qk_cat_and_cache_mla",
     "fused_qk_rope_cat",
     "fused_qk_rope_cat_and_cache_mla",
 ]
+
+# The NoPE MLA cat+cache op is newer than the rope one. Bind None on an aiter
+# without it, so NoPE layers fall back to the unfused path instead of every
+# DeepSeek import failing.
+try:
+    from aiter.ops.triton.fused_kv_cache import fused_qk_cat_and_cache_mla
+except ImportError:
+    fused_qk_cat_and_cache_mla = None
 
 # This module is imported wherever AITER is on, gfx942 included, but the fused
 # bmm+rope+cache op is gfx95-only. Import it behind the same predicate its one
