@@ -17,7 +17,6 @@ import importlib
 import sys
 import threading
 import types
-import unittest
 from unittest import mock
 
 import torch
@@ -28,8 +27,9 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchResult,
 )
 from sglang.srt.mem_cache.common import abort_prefix_cache_request, release_kv_cache
-from sglang.srt.mem_cache.radix_cache import RadixKey
+from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -54,7 +54,8 @@ def _install_lmcache_stubs():
     adapter = mods["lmcache.integration.sglang.sglang_adapter"]
     adapter.LMCacheLayerwiseConnector = object
     adapter.LoadMetadata = object
-    adapter.StoreMetadata = object
+    # Must accept kwargs like the real StoreMetadata dataclass.
+    adapter.StoreMetadata = lambda **kwargs: types.SimpleNamespace(**kwargs)
     mods["lmcache.integration.sglang.utils"].lmcache_get_config = lambda _: None
     return mock.patch.dict(sys.modules, mods)
 
@@ -71,6 +72,11 @@ def _import_under_stubs(module_name, stub_cm):
 
 LMCacheMode, LMCRadixCache = (lambda m: (m.LMCacheMode, m.LMCRadixCache))(
     _import_under_stubs(_LMC_MODULE, _install_lmcache_stubs)
+)
+
+# Keep StoreMetadata callable for production cache_finished_req under stubs.
+LMCRadixCache.cache_finished_req.__globals__["StoreMetadata"] = lambda **kwargs: (
+    types.SimpleNamespace(**kwargs)
 )
 
 
@@ -121,6 +127,7 @@ def _make_lmcache(lookup_result: int, mode=None):
     cache = object.__new__(LMCRadixCache)
     cache._mode = mode
     cache._mp_load_back_markers = {}
+    cache._mp_open_sessions = set()
     cache.lmcache_connector = FakeMPConnector(lookup_result)
     return cache
 
@@ -142,7 +149,7 @@ def _match(cache, req, token_ids, radix_hit: int):
     return cache._mp_match_prefix(key, base_res, value, None, req)
 
 
-class TestLMCacheTwoPhaseAbort(unittest.TestCase):
+class TestLMCacheTwoPhaseAbort(CustomTestCase):
     def test_abort_after_match_prefix_without_store(self):
         cache = _make_lmcache(lookup_result=16)
         req = _make_req("rid-abort")
@@ -154,6 +161,7 @@ class TestLMCacheTwoPhaseAbort(unittest.TestCase):
         self.assertIn(req.rid, cache._mp_load_back_markers)
         self.assertIn(req.rid, cache.lmcache_connector.pending_lookups)
         self.assertTrue(cache.lmcache_connector.locks_held[req.rid])
+        self.assertIn(req.rid, cache._mp_open_sessions)
 
         cache.cancel_aborted_request_work(handle)
         self.assertNotIn(req.rid, cache._mp_load_back_markers)
@@ -163,6 +171,7 @@ class TestLMCacheTwoPhaseAbort(unittest.TestCase):
         cache.finish_request_session(handle)
         self.assertEqual(cache.lmcache_connector.pending_lookups, {})
         self.assertEqual(cache.lmcache_connector.end_session_calls, [req.rid])
+        self.assertNotIn(req.rid, cache._mp_open_sessions)
 
     def test_cancel_does_not_end_session(self):
         cache = _make_lmcache(lookup_result=16)
@@ -175,22 +184,83 @@ class TestLMCacheTwoPhaseAbort(unittest.TestCase):
         self.assertEqual(cache.lmcache_connector.end_session_calls, [])
         self.assertNotIn("end_session", [op[0] for op in cache.lmcache_connector.ops])
 
-    def test_abort_then_store_ends_session_after_store(self):
+    def test_finish_request_session_is_idempotent(self):
+        """Bootstrap abort can finalize twice; END_SESSION must fire once."""
         cache = _make_lmcache(lookup_result=16)
-        req = _make_req("rid-store")
+        req = _make_req("rid-idem")
         handle = CacheRequestHandle(rid=req.rid, attempt_id=0)
         _match(cache, req, list(range(16)), radix_hit=4)
 
         cache.cancel_aborted_request_work(handle)
-        self.assertEqual(cache.lmcache_connector.end_session_calls, [])
-
-        cache.lmcache_connector.store_kv(types.SimpleNamespace(request_id=req.rid))
+        cache.finish_request_session(handle)
         cache.finish_request_session(handle)
 
+        self.assertEqual(cache.lmcache_connector.end_session_calls, [req.rid])
         self.assertEqual(
-            [op[0] for op in cache.lmcache_connector.ops],
-            ["lookup", "release_pending", "store", "end_session"],
+            [op[0] for op in cache.lmcache_connector.ops].count("end_session"), 1
         )
+
+    def test_production_cache_finished_req_stores_before_end_session(self):
+        """Drive real LMCRadixCache.cache_finished_req (CPU stubs, no GPU)."""
+        cache = _make_lmcache(lookup_result=16)
+        rid = "rid-prod-store"
+        handle = CacheRequestHandle(rid=rid, attempt_id=0)
+        last_node = object()
+        token_ids = list(range(4))
+        kv_indices = torch.arange(4, dtype=torch.int64)
+
+        _match(cache, _make_req(rid), list(range(16)), radix_hit=4)
+        cache.cancel_aborted_request_work(handle)
+        self.assertEqual(cache.lmcache_connector.end_session_calls, [])
+
+        req = types.SimpleNamespace(
+            rid=rid,
+            origin_input_ids=token_ids,
+            output_ids=[],
+            extra_key=None,
+            cache_salt=None,
+            kv=types.SimpleNamespace(
+                req_pool_idx=0,
+                kv_committed_len=len(token_ids),
+            ),
+        )
+        cache.req_to_token_pool = types.SimpleNamespace(
+            req_to_token=kv_indices.unsqueeze(0)
+        )
+        cache.inc_lock_ref = mock.Mock()
+        cache.dec_lock_ref = mock.Mock()
+
+        g = LMCRadixCache.cache_finished_req.__globals__
+        prev_get_spec = g.get("get_spec")
+        g["get_spec"] = lambda: types.SimpleNamespace(speculative_eagle_topk=None)
+        try:
+            with (
+                mock.patch.object(RadixCache, "cache_finished_req", return_value=None),
+                mock.patch.object(
+                    RadixCache,
+                    "match_prefix",
+                    return_value=MatchResult(
+                        device_indices=kv_indices,
+                        last_device_node=last_node,
+                        last_host_node=last_node,
+                        best_match_node=last_node,
+                    ),
+                ),
+            ):
+                cache.cache_finished_req(
+                    req, is_insert=True, owned_kv_len=len(token_ids)
+                )
+        finally:
+            if prev_get_spec is not None:
+                g["get_spec"] = prev_get_spec
+
+        self.assertIn("store", [op[0] for op in cache.lmcache_connector.ops])
+        self.assertNotIn("end_session", [op[0] for op in cache.lmcache_connector.ops])
+
+        cache.finish_request_session(handle)
+        op_names = [op[0] for op in cache.lmcache_connector.ops]
+        self.assertLess(op_names.index("store"), op_names.index("end_session"))
+        self.assertEqual(cache.lmcache_connector.end_session_calls, [rid])
 
     def test_abort_before_match_prefix_is_a_noop(self):
         cache = _make_lmcache(lookup_result=0)
@@ -203,10 +273,8 @@ class TestLMCacheTwoPhaseAbort(unittest.TestCase):
 
         self.assertEqual(cache._mp_load_back_markers, {})
         self.assertEqual(cache.lmcache_connector.pending_lookups, {})
-        self.assertEqual(
-            cache.lmcache_connector.end_session_calls,
-            ["rid-never-matched", "rid-never-matched"],
-        )
+        # No LOOKUP → no open session → END_SESSION must not fire.
+        self.assertEqual(cache.lmcache_connector.end_session_calls, [])
 
     def test_abort_after_lookup_miss_still_ends_session(self):
         cache = _make_lmcache(lookup_result=4)
@@ -246,6 +314,7 @@ class TestLMCacheTwoPhaseAbort(unittest.TestCase):
 
         self.assertNotIn(req.rid, cache._mp_load_back_markers)
         self.assertEqual(cache.lmcache_connector.end_session_calls, [])
+        self.assertIn(req.rid, cache._mp_open_sessions)
 
 
 class _FakeKv:
@@ -287,7 +356,7 @@ def _req_for_helper(rid="rid-helper", holds_kv=False, holds_mamba=False):
     )
 
 
-class TestAbortPrefixCacheRequest(unittest.TestCase):
+class TestAbortPrefixCacheRequest(CustomTestCase):
     def test_waiting_queue_abort_closes_session_without_store(self):
         cache = _RecordingCache()
         abort_prefix_cache_request(_req_for_helper(), cache)
@@ -360,7 +429,7 @@ class FakeFlexKVConnector:
         self.cancelled_prefetch.append(handle)
 
 
-class TestFlexKVCancelBeforeStore(unittest.TestCase):
+class TestFlexKVCancelBeforeStore(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         module = _import_under_stubs(_FKV_MODULE, _install_flexkv_stubs)
@@ -412,4 +481,6 @@ class TestFlexKVCancelBeforeStore(unittest.TestCase):
 
 
 if __name__ == "__main__":
+    import unittest
+
     unittest.main()

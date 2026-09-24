@@ -170,6 +170,12 @@ class LMCRadixCache(RadixCache):
         self._in_flight_nodes: list[TreeNode] = []
         self._node_lock = threading.Lock()
         self._mp_load_back_markers: dict[str, _LMCacheLoadBackMarker] = {}
+        # Tracks rids with an open LMCache MP session so END_SESSION is
+        # once-per-session. Prefill bootstrap abort can call
+        # finish_request_session twice (abort_request leaves the req in
+        # PrefillBootstrapQueue; sender.abort then makes pop_bootstrapped
+        # hit handle_bootstrap_failure).
+        self._mp_open_sessions: set[str] = set()
 
     def reset(self):
         super().reset()
@@ -178,6 +184,8 @@ class LMCRadixCache(RadixCache):
                 self._in_flight_nodes.clear()
         if hasattr(self, "_mp_load_back_markers"):
             self._mp_load_back_markers.clear()
+        if hasattr(self, "_mp_open_sessions"):
+            self._mp_open_sessions.clear()
 
     def match_prefix(self, params: MatchPrefixParams) -> MatchResult:
         """Dispatch to the mode-specific match_prefix.
@@ -222,6 +230,8 @@ class LMCRadixCache(RadixCache):
         """
         token_ids = key.raw_token_ids()
         matched = self.lmcache_connector.lookup_kv(token_ids, req.rid)
+        # lookup_kv opens the MP session; finish_request_session closes it.
+        self._mp_open_sessions.add(req.rid)
         if matched <= value.numel():
             # Release the read locks; keep the pending session for end_session.
             self.lmcache_connector.release_pending(req.rid)
@@ -517,10 +527,18 @@ class LMCRadixCache(RadixCache):
         self.lmcache_connector.release_pending(request_id)
 
     def finish_request_session(self, handle: CacheRequestHandle) -> None:
-        """Send END_SESSION after optional STORE, or immediately if none ran."""
+        """Send END_SESSION after optional STORE, or immediately if none ran.
+
+        Idempotent: duplicate abort paths (e.g. bootstrap queue abort then
+        ``handle_bootstrap_failure``) must not emit a second END_SESSION.
+        """
         if self._mode is not LMCacheMode.MP:
             return
-        self.lmcache_connector.end_session(handle.rid)
+        request_id = handle.rid
+        if request_id not in self._mp_open_sessions:
+            return
+        self._mp_open_sessions.discard(request_id)
+        self.lmcache_connector.end_session(request_id)
 
     def evict(self, params: EvictParams) -> EvictResult:
         """Before base eviction, wait for any outstanding stores and release locks."""
