@@ -1,5 +1,6 @@
 """Host-side transport of output-token sampling masks."""
 
+import pickle
 import sys
 from array import array
 from typing import List, Optional, Tuple, Union
@@ -8,7 +9,9 @@ import msgspec
 import numpy as np
 
 
-class SamplingMaskChunk(msgspec.Struct, frozen=True, kw_only=True, array_like=True):
+class SamplingMaskChunk(
+    msgspec.Struct, frozen=True, kw_only=True, array_like=True, gc=False
+):
     """One request's sampling masks in one output batch, one row per output token."""
 
     # int32 [num_rows]
@@ -17,6 +20,20 @@ class SamplingMaskChunk(msgspec.Struct, frozen=True, kw_only=True, array_like=Tr
     token_ids: np.ndarray
     # float32 [sum(lengths)] in support mode, [num_rows] in selected mode
     logprobs: np.ndarray
+
+    def __reduce_ex__(self, protocol: int):
+        # Unpickling with numpy's reducer leaves GC-tracked objects per array; with a
+        # chunk per request per message they trigger full collections downstream.
+        if protocol < 5:
+            return super().__reduce_ex__(protocol)
+        return (
+            _chunk_from_buffers,
+            (
+                pickle.PickleBuffer(self.lengths),
+                pickle.PickleBuffer(self.token_ids),
+                pickle.PickleBuffer(self.logprobs),
+            ),
+        )
 
     def to_lists(
         self, support_logprobs: bool
@@ -33,6 +50,14 @@ class SamplingMaskChunk(msgspec.Struct, frozen=True, kw_only=True, array_like=Tr
                 values.append(self.logprobs[start:end].tolist())
             start = end
         return masks, values
+
+
+def _chunk_from_buffers(lengths, token_ids, logprobs) -> SamplingMaskChunk:
+    return SamplingMaskChunk(
+        lengths=np.frombuffer(lengths, dtype=np.int32),
+        token_ids=np.frombuffer(token_ids, dtype=np.int32),
+        logprobs=np.frombuffer(logprobs, dtype=np.float32),
+    )
 
 
 class _GrowableArray(msgspec.Struct):
