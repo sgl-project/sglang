@@ -107,6 +107,8 @@ class TestModelOverridableWhitelist(CustomTestCase):
                     "fp4_gemm_runner_backend",
                     "disable_custom_all_reduce",
                     "enable_aiter_allreduce_fusion",
+                    "disable_aiter_allreduce_fusion_in_prefill",
+                    "disable_aiter_allreduce_fusion_in_decode",
                     "enable_symm_mem",
                     "speculative_attention_mode",
                     "speculative_draft_attention_backend",

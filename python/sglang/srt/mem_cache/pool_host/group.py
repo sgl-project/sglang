@@ -7,6 +7,7 @@ from typing import Any
 import torch
 
 from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
+from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
 
 
 @dataclass
@@ -74,6 +75,63 @@ class HostPoolGroup:
 
     def get_pool(self, name: PoolName):
         return self.get_entry(name).host_pool
+
+    def get_contiguous_buf_infos(self):
+        """Return (device_buffers, host_buffers), each (ptrs, sizes, item_sizes)."""
+        host_by_device_ptr = {}
+        device_infos = ([], [], [])
+        for entry in self.entries:
+            host = entry.host_pool
+            pools = (entry.device_pool, *entry.packed_draft_device_pools)
+            for pool in pools:
+                dense_mha = (
+                    type(pool) is MHATokenToKVPool
+                    and pool.kv_cache_layout == "nhd"
+                    and pool.v_head_dim == pool.head_dim
+                )
+                if (
+                    not dense_mha
+                    or pool.layer_shard_enabled
+                    or pool.page_size != self.page_size
+                ):
+                    raise ValueError(
+                        "Host receive requires dense NHD MHA target and "
+                        "draft KV with matching page sizes"
+                    )
+                for combined, values in zip(
+                    device_infos, pool.get_contiguous_buf_infos(), strict=True
+                ):
+                    combined.extend(values)
+
+            # Packed MHA stores target/draft K followed by target/draft V,
+            # while the wire lists target K/V followed by draft K/V. Associate
+            # each host view with its device buffer before applying wire order.
+            device_buffers = [b for p in pools for b in p.k_buffer] + [
+                b for p in pools for b in p.v_buffer
+            ]
+            for device_buffer, host_buffer in zip(
+                device_buffers, host.host_kv_data_refs, strict=True
+            ):
+                if (
+                    not host_buffer.is_contiguous()
+                    or host_buffer.shape[1:] != device_buffer.shape[1:]
+                ):
+                    raise ValueError(
+                        "KV transfer requires matching contiguous per-layer "
+                        "device and host buffers"
+                    )
+                host_by_device_ptr[device_buffer.data_ptr()] = (
+                    host_buffer.data_ptr(),
+                    host_buffer.nbytes,
+                    host.token_stride_size * self.page_size,
+                )
+        infos = [host_by_device_ptr[ptr] for ptr in device_infos[0]]
+        host_infos = (
+            [info[0] for info in infos],
+            [info[1] for info in infos],
+            [info[2] for info in infos],
+        )
+        return device_infos, host_infos
 
     def alloc(
         self,

@@ -97,7 +97,9 @@ class SamplingBatchInfo:
     # CPU request flags and their derived device indices. The flags make batch
     # filtering cheap; the indices keep sampler work limited to opted-in rows.
     return_sampling_masks: Optional[List[bool]] = None
+    return_sampling_support_logprobs: Optional[List[bool]] = None
     sampling_mask_batch_indices: Optional[torch.Tensor] = None
+    sampling_support_logprobs_capture_indices: Optional[torch.Tensor] = None
 
     watermark_keys: Optional[torch.Tensor] = None
     watermark_context_windows: Optional[torch.Tensor] = None
@@ -193,6 +195,10 @@ class SamplingBatchInfo:
             and any(r.custom_logit_processor for r in reqs)  # check the flag first.
         )  # then check the requests.
         return_sampling_masks = [r.return_sampling_mask for r in reqs]
+        return_sampling_support_logprobs = [
+            r.return_sampling_mask and r.sampling_logprobs_mode == "support"
+            for r in reqs
+        ]
         sampling_mask_batch_indices = cls._make_sampling_mask_batch_indices(
             return_sampling_masks, device
         )
@@ -217,6 +223,13 @@ class SamplingBatchInfo:
             watermark_enabled = None
             watermark_candidates_host = None
             has_watermark_candidates = False
+        sampling_support_logprobs_capture_indices = (
+            cls._make_sampling_support_logprobs_capture_indices(
+                return_sampling_masks,
+                return_sampling_support_logprobs,
+                device,
+            )
+        )
 
         if has_custom_logit_processor:
             # Merge the same type of custom logit processors together
@@ -283,12 +296,16 @@ class SamplingBatchInfo:
             device=device,
             logit_bias=logit_bias,
             return_sampling_masks=return_sampling_masks,
+            return_sampling_support_logprobs=return_sampling_support_logprobs,
             sampling_mask_batch_indices=sampling_mask_batch_indices,
             watermark_keys=watermark_keys,
             watermark_context_windows=watermark_context_windows,
             watermark_enabled=watermark_enabled,
             watermark_candidates_host=watermark_candidates_host,
             has_watermark_candidates=has_watermark_candidates,
+            sampling_support_logprobs_capture_indices=(
+                sampling_support_logprobs_capture_indices
+            ),
         )
         ret.adjusted_from_schedule_batch(batch, vocab_size)
         return ret
@@ -315,6 +332,30 @@ class SamplingBatchInfo:
         indices = [
             i for i, should_return in enumerate(return_sampling_masks) if should_return
         ]
+        if not indices:
+            return None
+        return _rows_to_device_indices(indices, device)
+
+    @staticmethod
+    def _make_sampling_support_logprobs_capture_indices(
+        return_sampling_masks: List[bool],
+        return_sampling_support_logprobs: Optional[List[bool]],
+        device: str,
+    ) -> Optional[torch.Tensor]:
+        """Map support-mode requests to rows in the compact mask capture."""
+        if return_sampling_support_logprobs is None:
+            return None
+        capture_index = -1
+        indices = []
+        for return_mask, return_support in zip(
+            return_sampling_masks,
+            return_sampling_support_logprobs,
+            strict=True,
+        ):
+            if return_mask:
+                capture_index += 1
+            if return_support:
+                indices.append(capture_index)
         if not indices:
             return None
         return _rows_to_device_indices(indices, device)
@@ -444,10 +485,21 @@ class SamplingBatchInfo:
             self.return_sampling_masks = [
                 self.return_sampling_masks[i] for i in keep_indices
             ]
+            if self.return_sampling_support_logprobs is not None:
+                self.return_sampling_support_logprobs = [
+                    self.return_sampling_support_logprobs[i] for i in keep_indices
+                ]
             if self.sampling_mask_batch_indices is not None:
                 self.sampling_mask_batch_indices = (
                     self._make_sampling_mask_batch_indices(
                         self.return_sampling_masks, self.device
+                    )
+                )
+                self.sampling_support_logprobs_capture_indices = (
+                    self._make_sampling_support_logprobs_capture_indices(
+                        self.return_sampling_masks,
+                        self.return_sampling_support_logprobs,
+                        self.device,
                     )
                 )
 
@@ -525,6 +577,16 @@ class SamplingBatchInfo:
             self.return_sampling_masks = (
                 self.return_sampling_masks or [False] * self_len
             ) + (other.return_sampling_masks or [False] * other_len)
+            self.return_sampling_support_logprobs = (
+                self.return_sampling_support_logprobs or [False] * self_len
+            ) + (other.return_sampling_support_logprobs or [False] * other_len)
+            self.sampling_support_logprobs_capture_indices = (
+                self._make_sampling_support_logprobs_capture_indices(
+                    self.return_sampling_masks,
+                    self.return_sampling_support_logprobs,
+                    self.device,
+                )
+            )
 
         # Note: because the __len()__ operator is defined on the temperatures tensor,
         # please make sure any merge operation with len(self) or len(other) is done before
