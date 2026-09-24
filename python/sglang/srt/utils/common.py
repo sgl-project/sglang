@@ -221,12 +221,17 @@ def is_cpu() -> bool:
 
 
 @lru_cache(maxsize=1)
-def is_musa() -> bool:
+def _is_musa_cached() -> bool:
     try:
         import torchada  # noqa: F401
     except ImportError:
         return False
     return hasattr(torch.version, "musa") and torch.version.musa is not None
+
+
+@torch.compiler.assume_constant_result
+def is_musa() -> bool:
+    return _is_musa_cached()
 
 
 @lru_cache(maxsize=1)
