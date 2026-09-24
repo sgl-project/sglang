@@ -1,15 +1,17 @@
 [build-system]
 requires = [
-  "setuptools>=75.0",
   "scikit-build-core>=0.10",
-  "torch>=2.8.0",
+  "torch==2.13.0",
   "wheel",
 ]
-build-backend = "setuptools.build_meta"
+build-backend = "scikit_build_core.build"
 
 [project]
 name = "sglang-kernel"
 version = "0.4.7"
+authors = [
+  { name="SGLang Kernel Team", email="sglang@lmsys.org" },
+]
 description = "Kernel Library for SGLang"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -19,7 +21,7 @@ classifiers = [
   "License :: OSI Approved :: Apache Software License",
   "Environment :: GPU :: NVIDIA CUDA"
 ]
-dependencies = []
+dependencies = ["torch==2.13.0"]
 
 [project.urls]
 "Homepage" = "https://github.com/sgl-project/sglang/tree/main/python/sglang/kernels/aot"
@@ -30,3 +32,11 @@ exclude = [
   "dist*",
   "tests*",
 ]
+
+[tool.scikit-build]
+cmake.build-type = "Release"
+minimum-version = "build-system.requires"
+
+wheel.py-api = "cp310"
+wheel.license-files = []
+wheel.packages = ["python/sgl_kernel"]
