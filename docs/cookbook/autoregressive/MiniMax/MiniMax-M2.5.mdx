@@ -565,7 +565,7 @@ Check that the final answer identifies Paris. Repeat requests and check the serv
 
 For **Ascend A3**, use [the A3 throughput and accuracy benchmarks](#5-3-ascend-a3-benchmarks) with the command generated in section 3.
 
-For **Ascend A2**, [section 5.4](#5-4-ascend-a2-smoke-validation) records simple chat checks and serial synthetic generation probes. [Section 5.5](#5-5-ascend-a2-performance-benchmark) reports the official benchmark tool's results on a separate configuration with concurrency up to 8 and a synthetic workload. No GPQA accuracy result is reported here.
+For **Ascend A2**, [section 5.4](#5-4-ascend-a2-smoke-validation) records simple chat checks and serial synthetic generation probes. [Section 5.5](#5-5-ascend-a2-performance-benchmark) reports the official benchmark tool's results on a separate configuration with concurrency up to 8 and a synthetic workload. [Section 5.6](#5-6-ascend-a2-reference-length-performance) measures 3500-input/1500-output requests, and [section 5.7](#5-7-ascend-a2-fixed-50-question-gsm8k-regression) records a fixed 50-question GSM8K deployment regression. No GPQA accuracy result is reported here.
 
 The benchmark sections below use **industry-standard configurations** for comparable benchmark results; the A2 smoke record has a separate, limited scope.
 
@@ -1427,3 +1427,82 @@ for length, concurrency, count, seed in cases:
 ```
 
 Retain failed runs and missing-run records when reporting a reproduction; do not summarize only successful seeds. Keep each run's mean and percentile metrics separate. The synthetic data and performance measurements provide no GPQA or other model-quality score.
+
+### 5.6 Ascend A2 reference-length performance
+
+On September 24, 2026, the same A2 hardware and runtime completed three official `sglang.bench_serving` runs with **3500 input tokens and 1500 output tokens**, using seeds **1, 17, and 29**. Each run measured two requests at client concurrency 2. All **6/6 measured requests** completed with the exact planned token lengths and no request errors: 21000 input tokens and 9000 output tokens in total. Each run's one-request, 32-output-token warm-up is excluded from these counts.
+
+The server used the section 5.5 launch command with `--context-length 9216` instead of 8192. Its other settings remained TP8, ModelSlim, BF16, memory fraction 0.97, KV limit 16384, maximum running requests 8, prefill chunk 128, maximum prefill tokens 4096, and graph capture and radix cache disabled. **Client concurrency 2 did not change the server's maximum of 8.** No draft model was used; the interactive selector's conservative default is unchanged.
+
+The workload reused the 16 synthetic prompts from section 5.5. It matches only the A3 reference's token lengths, not its ShareGPT workload, concurrency 320, hardware, or EAGLE3 configuration. It does not validate A3 throughput or the reference's 50 ms TPOT target.
+
+| Metric | Mean | Min–max |
+| --- | --- | --- |
+| Output throughput (tok/s) | 8.004 | 7.896–8.065 |
+| Total throughput (tok/s) | 26.680 | 26.319–26.882 |
+| Mean TTFT (ms) | 10317.118 | 10267.749–10365.114 |
+| Mean TPOT (ms) | 243.163 | 241.222–246.570 |
+| Mean E2E (s) | 374.818 | 371.957–379.927 |
+
+These are arithmetic means and minimum–maximum values across the three run-level means or rates, not request extrema. Per-run percentiles are retained separately and are not averaged. Six measured requests provide a bounded performance observation, not a sustained-load or stability result.
+
+To reproduce, generate `minimax-a2-perf/synthetic-prompts.json` using the data-creation portion of section 5.5.2, launch the server with context 9216, and run the following from that working directory. Use the same model/tokenizer paths as the server, and retain each JSONL and log, including failures:
+
+```bash Command
+set -euo pipefail
+mkdir -p minimax-a2-reference-perf
+for SEED in 1 17 29; do
+  RESULT="minimax-a2-reference-perf/in3500-out1500-c2-n2-seed${SEED}.jsonl"
+  test ! -e "$RESULT"
+  python -m sglang.bench_serving \
+    --backend sglang --base-url http://127.0.0.1:31216 \
+    --model /workspace/issue1215/model \
+    --tokenizer /workspace/issue1215/metadata \
+    --dataset-name random --dataset-path minimax-a2-perf/synthetic-prompts.json \
+    --random-input-len 3500 --random-output-len 1500 --random-range-ratio 1 \
+    --tokenize-prompt --num-prompts 2 --max-concurrency 2 \
+    --request-rate inf --temperature 0 --seed "$SEED" \
+    --warmup-requests 1 --flush-cache --output-details --disable-tqdm \
+    --output-file "$RESULT" 2>&1 | tee "${RESULT%.jsonl}.log"
+done
+```
+
+Check every result for `completed=2`, input lengths `[3500,3500]`, output lengths `[1500,1500]`, and two empty error entries before aggregating it. Verify server health after each run. A successful process exit alone is insufficient to establish those conditions.
+
+### 5.7 Ascend A2 fixed 50-question GSM8K regression
+
+On September 24, 2026, a **preselected 50-question deployment regression completed with 49/50 correct (98%)**, zero capped outputs, zero transport/protocol errors, and no missing or duplicate questions. This is a bounded GSM8K test subset, not full GSM8K accuracy, an EvalScope result, GPQA accuracy, or evidence of A3 parity.
+
+The run used the same A2 hardware, W8A8 weights, and runtime as above. The server used context 9216, maximum running requests **2**, memory fraction 0.97, and KV limit 16384; all other launch settings matched section 5.6. The client submitted **one request at a time** to `/v1/chat/completions`, with `temperature=1.0`, `max_tokens=6144`, and generation seed `42 + original test row index`. The reasoning parser remained `minimax`; scoring used only final answer content.
+
+The protocol was frozen before an independent three-question pilot:
+
+1. Use the MIT-licensed [official GSM8K data at revision 3101c7d5072418e28b9008a6636bde82a006892c](https://github.com/openai/grade-school-math/tree/3101c7d5072418e28b9008a6636bde82a006892c/grade_school_math/data). Take training rows 0–4 as five worked demonstrations.
+2. Shuffle all 1319 test-row indices with Python `random.Random(20260924).shuffle`. Reserve the first three indices for the independent pilot and use the next 50, in order, for this regression. Do not include pilot answers in the result or select, replace, reorder, or drop questions based on observed answers.
+3. Build a single user message by joining the five `Question: ...\nAnswer: ...` demonstrations with two newlines, then append the test question as `Question: ...\nAnswer:`. Preserve the training answers, including their worked solutions. Apply the deployed MiniMax chat template through the chat endpoint.
+4. Before any generation, tokenize all 50 messages with the server and verify that each prompt plus the 6144-token output allowance fits context 9216. Submit each frozen question exactly once, with a per-request wall limit of 1800 seconds. Stop new submissions on a transport/protocol error; do not retry or resume a failed run.
+5. Parse only final content using the pinned runtime's last-number rule: remove commas, find matches of `-?\d+\.?\d*`, and parse the last match numerically. Compare it with the gold answer parsed the same way. A missing number, wrong answer, length cap, or transport/protocol error scores zero. Keep the denominator fixed at 50; report an incomplete run as incomplete rather than a full score.
+
+The selection can be reconstructed without model access:
+
+```python Example
+import random
+
+indices = list(range(1319))
+random.Random(20260924).shuffle(indices)
+pilot_ids = indices[:3]       # Excluded from regression scoring.
+regression_ids = indices[3:53]
+assert len(set(regression_ids)) == 50
+assert not set(pilot_ids).intersection(regression_ids)
+```
+
+| Check | Observed result |
+| --- | --- |
+| Unique completed questions | 50/50 |
+| Correct final answers | 49/50 (98%) |
+| Wrong final answers | 1 |
+| Length-capped responses | 0 |
+| Transport/protocol errors | 0 |
+| Completion-token range | 292–2507 |
+
+All 50 prompts passed preflight. The client elapsed time, including preflight, was 9444.598 seconds; it is not a per-request latency benchmark. The downloaded run's 172 manifest entries passed hash verification, and rescoring the preserved final answers with the declared parser reproduced 49/50. Preserve the frozen IDs, prompt hashes, parameters, every response, and raw SSE when reproducing the regression. This result tests the declared subset and parsing protocol; it does not establish full-dataset accuracy, long-context quality, sustained stability, or the unvalidated A3 recipe's acceptance criteria.
