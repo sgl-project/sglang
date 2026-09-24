@@ -310,10 +310,10 @@ RUN mkdir -p /etc/sglang/constraints && : > /etc/sglang/constraints/torch-rocm.t
 # flavor name, so they apply here unchanged.
 FROM $BASE_IMAGE_1250_ROCM1000 AS gfx1250-rocm1000
 ENV BUILD_VLLM="0"
-# Unlike the gfx942/gfx950 images, this one replaces the SDK's Triton: the
-# revision below is what the MI45x bring-up ran on, and it carries a fix the
-# SDK build does not have yet.
-ENV BUILD_TRITON="1"
+# Test branch: keep the Triton the ROCm 10 SDK ships, the same way the
+# gfx942/gfx950 images do, instead of the MI45x bring-up revision in
+# TRITON_COMMIT_DEFAULT below. Set back to 1 to restore the bring-up Triton.
+ENV BUILD_TRITON="0"
 ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
 ENV BUILD_MOONCAKE="1"
@@ -322,7 +322,8 @@ ENV BUILD_MOONCAKE="1"
 # brought up against.
 ENV AITER_COMMIT_DEFAULT="a6d2b564fd671724a3720b8edf70e8d674e4d694"
 # The upstream Triton the gfx1250 bring-up was validated against, carried over
-# from the ROCm 7.14 flavor this image replaced. Built from source below.
+# from the ROCm 7.14 flavor this image replaced. Kept here for the BUILD_TRITON=1
+# path; unused while BUILD_TRITON=0 leaves the SDK's Triton in place.
 ENV TRITON_COMMIT_DEFAULT="76940ad348795521b3dc9f6c79acd7309ff924e3"
 ENV PIP_CONSTRAINT="/etc/sglang/constraints/torch-rocm.txt"
 RUN mkdir -p /etc/sglang/constraints && : > /etc/sglang/constraints/torch-rocm.txt
