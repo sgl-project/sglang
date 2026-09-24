@@ -1004,6 +1004,25 @@ class MiniMaxM3Attention(nn.Module):
         sparse_backend = getattr(attn_backend, "sparse", None)
         return getattr(sparse_backend, "kv_pool", None)
 
+    @staticmethod
+    def _get_msa_decode_idx_q_fp8_out(
+        forward_batch: ForwardBatch, num_tokens: int
+    ) -> Optional[torch.Tensor]:
+        if (
+            not _is_cuda
+            or not forward_batch.forward_mode.is_decode()
+            or not has_forward_context()
+        ):
+            return None
+        sparse_backend = getattr(get_forward_context().attn_backend, "sparse", None)
+        if not getattr(sparse_backend, "use_msa_ppu", False):
+            return None
+        state = getattr(sparse_backend, "_ppu_msa_dec", None)
+        fp8_q_out = getattr(state, "idx_q_fp8", None)
+        if fp8_q_out is None or num_tokens > fp8_q_out.shape[0]:
+            return None
+        return fp8_q_out[:num_tokens]
+
     def _sparse_qk_index_norm_rope_cache(
         self,
         positions: torch.Tensor,
@@ -1019,8 +1038,18 @@ class MiniMaxM3Attention(nn.Module):
         # The fused kernel writes normed bf16 K/V straight into the paged cache, so an
         # fp8 main K/V cache (--kv-cache-dtype fp8_*) can't use it; fall back to norm+rope.
         main_kv_is_fp8 = kv_pool is not None and kv_pool.dtype in _FP8_KV_DTYPES
+        # Same for the index-K cache: an fp8 index pool (MSA fp8 indexer) is
+        # written via the quantizing set_index_k_buffer, not by this bf16 kernel.
+        index_kv_is_fp8 = kv_pool is not None and any(
+            pool is not None and pool.dtype in _FP8_KV_DTYPES
+            for pool in (
+                getattr(kv_pool, "index_k_pool", None),
+                getattr(kv_pool, "index_kv_pool", None),
+            )
+        )
         can_use_cache_fusion = (
             not main_kv_is_fp8
+            and not index_kv_is_fp8
             and idx_v is None
             and self._can_use_rocm_sparse_qk_index_norm_rope(
                 positions, q, k, idx_q, idx_k
@@ -1113,16 +1142,25 @@ class MiniMaxM3Attention(nn.Module):
                     minimax_qknorm_rope_grouped,
                 )
 
+                fp8_idx_q_out = self._get_msa_decode_idx_q_fp8_out(
+                    forward_batch, fused_out.shape[0]
+                )
                 minimax_qknorm_rope_grouped(
                     fused_out,
                     self._qknorm_groups(),
                     self.rotary_emb.cos_sin_cache,
                     positions,
                     self.q_norm.variance_epsilon,
+                    fp8_q_out=fp8_idx_q_out,
+                    # Group 2 corresponds to index_q_norm; write its RoPE output
+                    # directly into the fp8 idx_q buffer for SAIL MSA decode.
+                    fp8_q_group_idx=2,
                 )
                 q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
                 idx_qkv = fused_out[:, self._fused_main_size :]
                 idx_q, idx_k, idx_v = self._split_index_qkv(idx_qkv)
+                if fp8_idx_q_out is not None:
+                    idx_q = fp8_idx_q_out.flatten(1)
                 inner_state = (q, k, v, idx_q, idx_k, idx_v, forward_batch)
                 return None, forward_batch, inner_state
         else:
@@ -1167,6 +1205,9 @@ class MiniMaxM3Attention(nn.Module):
                         minimax_qknorm_rope,
                     )
 
+                    fp8_idx_q_out = self._get_msa_decode_idx_q_fp8_out(
+                        forward_batch, idx_qkv.shape[0]
+                    )
                     minimax_qknorm_rope(
                         idx_qkv,
                         self.index_q_norm.weight,
@@ -1177,8 +1218,11 @@ class MiniMaxM3Attention(nn.Module):
                         1,
                         0 if self.disable_index_value else 1,
                         self.index_q_norm.variance_epsilon,
+                        fp8_q_out=fp8_idx_q_out,
                     )
                     idx_q, idx_k, idx_v = self._split_index_qkv(idx_qkv)
+                    if fp8_idx_q_out is not None:
+                        idx_q = fp8_idx_q_out.flatten(1)
                 else:
                     idx_q, idx_k, idx_v = self._split_index_qkv(idx_qkv)
                     idx_q, idx_k = self._index_qk_norm_rope(positions, idx_q, idx_k)

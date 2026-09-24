@@ -26,15 +26,18 @@ constexpr int kMaxGroups = 4;
 
 struct FusedGemmaQKNormParams {
   bf16_t* __restrict__ qkv;
+  fp8_e4m3_t* __restrict__ fp8_q_out;
   const bf16_t* __restrict__ weight[kMaxGroups];  // per-group norm weight [head_dim]
   uint32_t group_offset[kMaxGroups];              // head offset of the group in the row
   uint32_t group_count[kMaxGroups];               // number of heads in the group
   uint32_t num_groups;
   uint32_t total_heads;  // sum of group_count[0..num_groups)
+  uint32_t fp8_q_group_idx;
   const float* __restrict__ cos_sin_cache;
   const void* __restrict__ positions;  // dtype depends on PosT template
   uint32_t num_tokens;
   int64_t token_stride;
+  int64_t fp8_q_out_token_stride;
   float eps;
 };
 
@@ -113,6 +116,14 @@ struct FusedTrait {
     input[idx_1] = o1_bf16;
     input[idx_2] = o2_bf16;
     input[idx_3] = o3_bf16;
+
+    if (params.fp8_q_out != nullptr && g == params.fp8_q_group_idx) {
+      auto output = params.fp8_q_out + token_id * params.fp8_q_out_token_stride + local_head * kHeadDim;
+      output[idx_0] = static_cast<fp8_e4m3_t>(static_cast<float>(o0_bf16));
+      output[idx_1] = static_cast<fp8_e4m3_t>(static_cast<float>(o1_bf16));
+      output[idx_2] = static_cast<fp8_e4m3_t>(static_cast<float>(o2_bf16));
+      output[idx_3] = static_cast<fp8_e4m3_t>(static_cast<float>(o3_bf16));
+    }
   }
 };
 
@@ -133,7 +144,7 @@ __global__ void fused_gemma_qknorm_rope_kernel(const __grid_constant__ FusedGemm
 // index-Q/index-K heads are all normed and rotated in one launch; the V /
 // index-V heads, lying outside every group, are left untouched.
 template <typename PosT, int64_t HEAD_DIM, int64_t ROTARY_DIM, bool kUsePDL>
-void fused_gemma_qknorm_rope(
+void launch_fused_gemma_qknorm_rope(
     tvm::ffi::TensorView qkv,
     tvm::ffi::TensorView w0,
     tvm::ffi::TensorView w1,
@@ -150,7 +161,10 @@ void fused_gemma_qknorm_rope(
     int64_t off3,
     int64_t cnt3,
     int64_t num_groups,
-    double eps) {
+    double eps,
+    fp8_e4m3_t* fp8_q_out,
+    int64_t fp8_q_out_token_stride,
+    uint32_t fp8_q_group_idx) {
   using namespace host;
   auto N = SymbolicSize{"num_tokens"};
   auto device = SymbolicDevice{};
@@ -170,11 +184,14 @@ void fused_gemma_qknorm_rope(
 
   auto params = FusedGemmaQKNormParams{};
   params.qkv = static_cast<bf16_t*>(qkv.data_ptr());
+  params.fp8_q_out = fp8_q_out;
   params.cos_sin_cache = static_cast<const float*>(cos_sin_cache.data_ptr());
   params.positions = positions.data_ptr();
   params.num_tokens = static_cast<uint32_t>(N.unwrap());
   params.num_groups = static_cast<uint32_t>(num_groups);
   params.token_stride = static_cast<int64_t>(qkv.stride(0));
+  params.fp8_q_out_token_stride = fp8_q_out_token_stride;
+  params.fp8_q_group_idx = fp8_q_group_idx;
   params.eps = static_cast<float>(eps);
 
   uint32_t total_heads = 0;
@@ -195,6 +212,97 @@ void fused_gemma_qknorm_rope(
   const uint32_t num_blocks = div_ceil(static_cast<uint32_t>(needed_threads), block_size);
   LaunchKernel(num_blocks, block_size, device.unwrap())  //
       .enable_pdl(kUsePDL)(fused_gemma_qknorm_rope_kernel<Trait>, params);
+}
+
+template <typename PosT, int64_t HEAD_DIM, int64_t ROTARY_DIM, bool kUsePDL>
+void fused_gemma_qknorm_rope(
+    tvm::ffi::TensorView qkv,
+    tvm::ffi::TensorView w0,
+    tvm::ffi::TensorView w1,
+    tvm::ffi::TensorView w2,
+    tvm::ffi::TensorView w3,
+    tvm::ffi::TensorView cos_sin_cache,
+    tvm::ffi::TensorView positions,
+    int64_t off0,
+    int64_t cnt0,
+    int64_t off1,
+    int64_t cnt1,
+    int64_t off2,
+    int64_t cnt2,
+    int64_t off3,
+    int64_t cnt3,
+    int64_t num_groups,
+    double eps) {
+  launch_fused_gemma_qknorm_rope<PosT, HEAD_DIM, ROTARY_DIM, kUsePDL>(
+      qkv,
+      w0,
+      w1,
+      w2,
+      w3,
+      cos_sin_cache,
+      positions,
+      off0,
+      cnt0,
+      off1,
+      cnt1,
+      off2,
+      cnt2,
+      off3,
+      cnt3,
+      num_groups,
+      eps,
+      nullptr,
+      0,
+      0);
+}
+
+template <typename PosT, int64_t HEAD_DIM, int64_t ROTARY_DIM, bool kUsePDL>
+void fused_gemma_qknorm_rope_fp8_qout(
+    tvm::ffi::TensorView qkv,
+    tvm::ffi::TensorView fp8_q_out,
+    tvm::ffi::TensorView w0,
+    tvm::ffi::TensorView w1,
+    tvm::ffi::TensorView w2,
+    tvm::ffi::TensorView w3,
+    tvm::ffi::TensorView cos_sin_cache,
+    tvm::ffi::TensorView positions,
+    int64_t off0,
+    int64_t cnt0,
+    int64_t off1,
+    int64_t cnt1,
+    int64_t off2,
+    int64_t cnt2,
+    int64_t off3,
+    int64_t cnt3,
+    int64_t num_groups,
+    int64_t fp8_q_group_idx,
+    double eps) {
+  using namespace host;
+  auto device = SymbolicDevice{};
+  device.set_options<kDLCUDA>();
+  TensorMatcher({-1, -1, HEAD_DIM}).with_dtype<fp8_e4m3_t>().with_device(device).verify(fp8_q_out);
+  RuntimeCheck(fp8_q_group_idx >= 0 && fp8_q_group_idx < num_groups);
+  launch_fused_gemma_qknorm_rope<PosT, HEAD_DIM, ROTARY_DIM, kUsePDL>(
+      qkv,
+      w0,
+      w1,
+      w2,
+      w3,
+      cos_sin_cache,
+      positions,
+      off0,
+      cnt0,
+      off1,
+      cnt1,
+      off2,
+      cnt2,
+      off3,
+      cnt3,
+      num_groups,
+      eps,
+      static_cast<fp8_e4m3_t*>(fp8_q_out.data_ptr()),
+      static_cast<int64_t>(fp8_q_out.stride(0)),
+      static_cast<uint32_t>(fp8_q_group_idx));
 }
 
 }  // namespace sglang

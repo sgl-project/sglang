@@ -26,6 +26,9 @@ from sglang.srt.configs.model_config import (
 from sglang.srt.distributed.parallel_state import get_world_group
 from sglang.srt.distributed.utils import get_pp_indices
 from sglang.srt.environ import envs
+from sglang.srt.layers.attention.minimax_sparse_ops.msa_ppu import (
+    ppu_msa_indexer_fp8_available,
+)
 from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
     get_kv_cache_quant_method,
     resolve_kv_cache_quant,
@@ -1492,14 +1495,18 @@ class KVCacheConfigurator:
             size=max_total_num_tokens,
             page_size=self.pool_page_size,
             dtype=self.kv_cache_dtype,
-            # fp8 attn-GEMM mode opts the lightning-indexer cache into
-            # fp8 too (fp8 indexer GEMMs); fp8 KV without the mode
-            # (e5m2 or non-trtllm_mha backend) keeps the indexer bf16
-            # with the widening-dequant contract.
+            # fp8 attn-GEMM mode opts the lightning-indexer cache into fp8 too
+            # (fp8 indexer GEMMs); on PPU the SAIL MSA fp8 OnlyScore indexer
+            # also uses fp8 e4m3 for the index-K cache. Otherwise keep the
+            # indexer in the model dtype (bf16 widening-dequant contract).
             index_dtype=(
                 self.kv_cache_dtype
                 if m3_fp8_attn_gemm_enabled(self.server_args)
-                else self.model_dtype
+                else (
+                    torch.float8_e4m3fn
+                    if (current_platform.is_ppu() and ppu_msa_indexer_fp8_available())
+                    else self.model_dtype
+                )
             ),
             head_num=self.model_config.get_num_kv_heads(
                 get_parallel().attn_tp_size, get_parallel().attn_dcp_size
