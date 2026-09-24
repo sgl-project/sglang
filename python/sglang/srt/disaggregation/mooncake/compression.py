@@ -44,13 +44,9 @@ class CompressionRuntime:
         self.bytes_per_token = self.layout.page_bytes
         self.max_raw_bytes = self.chunk_tokens * self.bytes_per_token
         shared = getattr(manager, "shared_compression_runtime", None)
-        if (
-            self.force
-            and shared is not None
-            and (shared.mode != "lz4" or not shared.force)
-        ):
-            raise ValueError("Forced P/D and L2 must share a forced LZ4 runtime")
-        if shared is None or shared.mode != self.mode:
+        if shared is not None and shared.mode != self.mode:
+            raise ValueError("P/D and L2 must share the same compression algorithm")
+        if shared is None:
             self.shared = KVCompressionRuntime(
                 self.layout,
                 self.mode,
@@ -276,8 +272,12 @@ class CompressedDecodeStagingHandler(DecodeStagingHandler):
                 )
                 if self.runtime.verify and not desc.sha256:
                     raise ValueError("Verified transfer requires a source KV digest")
-                if self.runtime.force and any(e != "lz4" for _, _, e in desc.pages):
-                    raise ValueError("Forced LZ4 transfer cannot contain raw pages")
+                if self.runtime.force and any(
+                    e != self.runtime.mode for _, _, e in desc.pages
+                ):
+                    raise ValueError(
+                        "Forced transfer requires the negotiated compressed encoding"
+                    )
                 if (
                     req._staging_failed
                     or self.kv_manager.check_status(room) == KVPoll.Failed
@@ -375,6 +375,7 @@ class CompressedDecodeStagingHandler(DecodeStagingHandler):
                         "scatter_gpu_ms": decoded.elapsed_time(scattered_event),
                         "verified": bool(desc.sha256),
                         "lz4_objects": sum(e == "lz4" for _, _, e in desc.pages),
+                        "ans_objects": sum(e == "ans" for _, _, e in desc.pages),
                         "restore_wait_ms": restore_wait_ms,
                         "layout_host_ms": layout_host_ms,
                         "layout_gpu_ms": layout_begin.elapsed_time(decoded),

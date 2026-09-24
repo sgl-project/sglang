@@ -499,6 +499,10 @@ class HiCacheLifecycleMixin:
             lz4 = sum(
                 ticket.leases[i].future.result().encoding == "lz4" for i in selected
             )
+            ans = sum(
+                ticket.leases[i].future.result().encoding == "ans" for i in selected
+            )
+            state.stats["restored_ans_pages"] += ans
             verified = len(selected) if state.runtime.verify else 0
             state.stats["restored_lz4_pages"] += lz4
             state.stats["verified_restored_pages"] += verified
@@ -513,6 +517,7 @@ class HiCacheLifecycleMixin:
                         "native_missing_pages": len(ticket.host_indices),
                         "adopted_pages": len(selected),
                         "lz4_pages": lz4,
+                        "ans_pages": ans,
                         "verified_pages": verified,
                         "seconds": time.perf_counter() - ticket.completion.started,
                     }

@@ -10,6 +10,8 @@ from typing import Any
 NVCOMP_VERSION = "5.3.0.16"
 FORMAT_VERSION = 2
 ALIGNMENT = 256
+ENCODING_IDS = {"raw": 0, "lz4": 1, "ans": 2}
+ENCODING_NAMES = {value: key for key, value in ENCODING_IDS.items()}
 _ids = itertools.count(1)
 _id_lock = threading.Lock()
 

@@ -16,8 +16,27 @@ import urllib.request
 from pathlib import Path
 
 LENGTHS = [1, 32, 1023, 1024, 1025, 4097, 8192]
-CACHE_PHASES = {"native", "passthrough", "lz4", "force-l2"}
-PHASES = ["off", "native", "passthrough", "lz4", "force", "force-l2"]
+CACHE_PHASES = {"native", "passthrough", "lz4", "force-l2", "ans-l2", "force-ans-l2"}
+PHASES = [
+    "off",
+    "native",
+    "passthrough",
+    "lz4",
+    "force",
+    "force-l2",
+    "ans-transfer",
+    "force-ans",
+    "ans-l2",
+    "force-ans-l2",
+]
+
+
+def phase_mode(phase):
+    if "ans" in phase:
+        return "ans"
+    return "passthrough" if phase == "passthrough" else "lz4"
+
+
 BASE = (
     "A field research team records the temperature, rainfall, and river level each morning. "
     "They compare observations across seasons and explain which measurements support their conclusions. "
@@ -65,8 +84,10 @@ def validate_restore_event(row, event, phase):
         ),
         "Frozen L2 restore requires 8191 evicted, adopted and verified pages",
     )
-    if phase == "force-l2":
-        require(event.get("lz4_pages") == 8191, "L2 restored raw objects")
+    if phase in ("force-l2", "force-ans-l2"):
+        require(
+            event.get(f"{phase_mode(phase)}_pages") == 8191, "L2 restored raw objects"
+        )
 
 
 def completed_drains(observations):
@@ -495,6 +516,7 @@ def audit(directory):
     config = json.loads((directory / "config.json").read_text())
     rows = complete_rows(directory, config)
     phase = config["phase"]
+    require(phase in PHASES, "Unknown validation phase")
     pre = (directory / "prefill.log").read_text()
     dec = (directory / "decode.log").read_text()
     if phase not in ("off", "native"):
@@ -503,7 +525,7 @@ def audit(directory):
             require(settings, f"Missing effective compression config: {role}")
             cfg = settings[-1][1]
             require(
-                cfg["mode"] == ("passthrough" if phase == "passthrough" else "lz4")
+                cfg["mode"] == phase_mode(phase)
                 and cfg["force"] == phase.startswith("force")
                 and cfg["verify"]
                 and cfg["chunk_tokens"] == 1024
@@ -578,11 +600,12 @@ def audit(directory):
             )
             if phase.startswith("force"):
                 require(
-                    s["lz4_objects"] == s["objects"] and s["raw_objects"] == 0,
+                    s[f"{phase_mode(phase)}_objects"] == s["objects"]
+                    and s["raw_objects"] == 0,
                     "Forced path fell back",
                 )
                 require(
-                    r["lz4_objects"] == s["objects"],
+                    r[f"{phase_mode(phase)}_objects"] == s["objects"],
                     "Decode did not decompress every object",
                 )
 
@@ -653,16 +676,24 @@ def audit(directory):
                 == 0,
                 "Background failure occurred",
             )
-            if phase == "force-l2":
+            if phase in ("force-l2", "force-ans-l2"):
                 require(
-                    state["operations"]["published_lz4_pages"] > 0,
-                    "No LZ4 L2 publication",
+                    state["operations"][f"published_{phase_mode(phase)}_pages"] > 0,
+                    "No selected algorithm L2 publication",
                 )
     summary = {
         "phase": phase,
         "requests": len(rows),
         "handoff_verified": True,
         "verified_pd_chunks": len(receives),
+        "pd_logical_bytes": sum(s["raw_bytes"] for s in sends),
+        "pd_wire_payload_bytes": sum(s["wire_bytes"] for s in sends),
+        "pd_descriptor_bytes": (
+            sum(s["descriptor_bytes"] for s in sends)
+            if all("descriptor_bytes" in s for s in sends)
+            else None
+        ),
+        "byte_accounting_boundary": "Payload and JSON descriptor only; transport headers excluded",
         "l2_restores": sum(r["case"] == "restore" for r in l2_rows),
         "same_path_output_comparison": "pending: run compare",
         "performance_claim": False,
@@ -679,6 +710,10 @@ def compare(baseline, tested):
         ("native", "lz4"),
         ("native", "force-l2"),
         ("off", "force"),
+        ("off", "ans-transfer"),
+        ("off", "force-ans"),
+        ("native", "ans-l2"),
+        ("native", "force-ans-l2"),
     }
     require(
         (configs[0]["phase"], configs[1]["phase"]) in allowed,

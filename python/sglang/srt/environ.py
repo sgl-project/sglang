@@ -783,7 +783,7 @@ class Envs:
     SGLANG_HICACHE_KV_COMPRESSION = EnvStr("off")
     SGLANG_KV_COMPRESSION_WORKSPACE_MB = EnvInt(512)
     SGLANG_PD_KV_COMPRESSION = EnvStr("off")
-    # Diagnostic only: requires LZ4 + VERIFY; Prefill LZ4 L2 is optional.
+    # Diagnostic only: requires LZ4/ANS + VERIFY; matching Prefill L2 is optional.
     SGLANG_PD_KV_COMPRESSION_FORCE = EnvBool(False)
     SGLANG_KV_COMPRESSION_TRACE_LENGTHS = EnvBool(False)
     SGLANG_PD_KV_COMPRESSION_VERIFY = EnvBool(False)

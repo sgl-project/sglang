@@ -21,6 +21,8 @@ import numpy as np
 import torch
 
 from sglang.srt.kv_compression.types import (
+    ENCODING_IDS,
+    ENCODING_NAMES,
     BufferDrainError,
     EncodedPage,
     Lease,
@@ -438,7 +440,7 @@ class CompressedHostKVCache:
         _, r = self._record(handle)
         if (
             r["state"] != _WRITING
-            or encoding not in ("raw", "lz4")
+            or encoding not in ENCODING_IDS
             or int(ref) <= 0
             or int(ref) > np.iinfo(np.int64).max
         ):
@@ -458,7 +460,7 @@ class CompressedHostKVCache:
         self.reserved_bytes -= int(r["capacity"])
         self.live_payload_bytes += int(r["capacity"])
         self.encoded_bytes += length
-        r["ref"], r["encoding"], r["state"] = ref, encoding == "lz4", _READY
+        r["ref"], r["encoding"], r["state"] = ref, ENCODING_IDS[encoding], _READY
         if self.verify:
             self.checksums[slot] = np.frombuffer(checksum, dtype=np.uint8)
         self.keys[bucket], self.slots[bucket] = ref, slot
@@ -472,11 +474,13 @@ class CompressedHostKVCache:
                 raise ValueError(
                     "Compressed handle belongs to another KV materialization"
                 )
+            if int(r["encoding"]) not in ENCODING_NAMES:
+                raise ValueError("Invalid stored encoding")
             page = HostEncodedPage(
                 self,
                 int(handle),
                 int(r["length"]),
-                "lz4" if r["encoding"] else "raw",
+                ENCODING_NAMES[int(r["encoding"])],
                 self.size_per_token,
                 self.checksums[slot].tobytes() if self.verify else None,
             )
@@ -494,7 +498,11 @@ class CompressedHostKVCache:
                 return None
             slot = int(self.slots[bucket])
             r = self.records[slot]
-            if mode == "passthrough" and r["encoding"]:
+            if mode not in ("passthrough", "lz4", "ans"):
+                raise ValueError("Unknown representation mode")
+            if int(r["encoding"]) not in ENCODING_NAMES:
+                raise ValueError("Invalid stored encoding")
+            if ENCODING_NAMES[int(r["encoding"])] not in ("raw", mode):
                 return None
             return self.acquire((int(r["generation"]) << 32) | slot, ref)
 

@@ -14,7 +14,7 @@ PROTOCOL_VERSION = 2
 # The chunk payload remains v2; registration now follows upstream's
 # per-entry KV lengths field. Reject the older r4 envelope at bootstrap.
 REGISTRATION_VERSION = 2
-MODES = ("off", "passthrough", "lz4")
+MODES = ("off", "passthrough", "lz4", "ans")
 
 
 CHUNK_READY = b"COMPRESSED_CHUNK_READY_V2"
@@ -47,9 +47,10 @@ def capability(mode: str, force=None, verify=None) -> str:
             "y",
         )
     suffix = "/forced-test" if force else ""
+    representation = "native-ans-65536-u1" if mode == "ans" else "native-lz4-65536"
     return (
         f"pd-kv-v{PROTOCOL_VERSION}/{mode}/nvcomp-{NVCOMP_VERSION}"
-        f"/native-lz4-65536/registration-v{REGISTRATION_VERSION}/verify-{int(verify)}{suffix}"
+        f"/{representation}/registration-v{REGISTRATION_VERSION}/verify-{int(verify)}{suffix}"
     )
 
 
@@ -96,7 +97,7 @@ class ChunkDescriptor:
         result = cls(**value)
         if type(result.version) is not int or result.version != PROTOCOL_VERSION:
             raise ValueError("Unsupported compression protocol version")
-        if result.encoding not in ("raw", "lz4", "pages"):
+        if result.encoding not in ("raw", "lz4", "ans", "pages"):
             raise ValueError("Unknown KV representation")
         if not isinstance(result.nonce, str) or not 1 <= len(result.nonce) <= 64:
             raise ValueError("Invalid request nonce")
@@ -127,7 +128,7 @@ class ChunkDescriptor:
                     or type(size) is not int
                     or size <= 0
                     or offset != (end + 255) // 256 * 256
-                    or encoding not in ("raw", "lz4")
+                    or encoding not in ("raw", "lz4", "ans")
                 ):
                     raise ValueError("Invalid page range/encoding")
                 end = offset + size
@@ -140,6 +141,13 @@ class ChunkDescriptor:
     def validate(
         self, *, nonce: str, raw_bytes: int, capacity: int, mode: str, page_bytes=None
     ) -> None:
+        validate_mode(mode)
+        allowed = ("raw",) if mode == "passthrough" else ("raw", mode)
+        encodings = (
+            [p[2] for p in self.pages] if self.encoding == "pages" else [self.encoding]
+        )
+        if mode == "off" or any(e not in allowed for e in encodings):
+            raise ValueError("KV encoding does not match negotiated mode")
         if self.nonce != nonce:
             raise ValueError("Stale compression descriptor")
         if self.raw_bytes != raw_bytes or self.wire_bytes > capacity:

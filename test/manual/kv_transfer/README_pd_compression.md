@@ -1,4 +1,4 @@
-# Experimental LZ4 KV transfer and compressed HiCache L2
+# Experimental LZ4/ANS KV transfer and compressed HiCache L2
 
 This opt-in prototype shares KV encoding between Mooncake P/D transfer and a
 compressed Prefill HiCache Host pool. Attention continues to use its existing
@@ -6,7 +6,7 @@ KV tensors. HiCache owns prefix matching, backup, restoration, eviction and ACKs
 P/D owns transfer ranges and remote completion. The shared compression executor
 owns representation conversion and bounded execution resources.
 
-The LZ4 payload and chunk descriptor use v2, with nvCOMP `5.3.0.16`.
+The LZ4/ANS payload and chunk descriptor use v2, with nvCOMP `5.3.0.16`.
 The capability includes the registration layout and VERIFY policy; incompatible
 experimental peers are rejected during bootstrap. Update both workers together.
 With compression disabled, the original transfer path is used.
@@ -24,7 +24,7 @@ not supported with the required staging buffers.
 A compression object contains one token's K/V across all layers. The 4 KiB
 Host storage block size does not change KV pages or the attention layout.
 Ordinary mode retains raw fallback; FORCE is a verification mode that permits
-LZ4 expansion and requires VERIFY=1. This is not a reproduction of KVServe's
+LZ4/ANS expansion and requires VERIFY=1. This is not a reproduction of KVServe's
 algorithms or controller.
 
 ## Data flow and ownership
@@ -114,10 +114,14 @@ DRY_RUN=1 bash test/manual/kv_transfer/launch_pd_compression.sh
 | off | off | 0 | off | 0 |
 | force | lz4 | 0 | off | 1 |
 | lz4 | lz4 | 1 | lz4 | 0 |
+| ans-transfer | ans | 0 | off | 0 |
+| force-ans | ans | 0 | off | 1 |
+| ans-l2 | ans | 1 | ans | 0 |
+| force-ans-l2 | ans | 1 | ans | 1 |
 
 Decode uses ENABLE_HICACHE=0 and HICACHE_COMPRESSION=off. Its P/D mode, FORCE
 and VERIFY must match Prefill. Re-establish native/off baselines with the new
-image. Run `native -> passthrough -> force-l2 -> off -> force -> lz4`, then fault
+image. Run `native -> passthrough -> force-l2 -> off -> force -> lz4`, then `ans-transfer -> force-ans -> ans-l2 -> force-ans-l2`, then fault
 validation. Use fresh workers for each group, with no resets within a group.
 
 ```bash
@@ -137,7 +141,7 @@ cycle must drain naturally within 180 seconds with three consecutive fresh
 zero-work snapshots, without request-time health failures or Router 503s.
 Missing/null cache-source details fail the Host-hit requirement.
 
-Forced LZ4 must have per-object evidence of encoding, transfer, L2 publication,
+Forced LZ4/ANS must have per-object evidence of encoding, transfer, L2 publication,
 old-object reuse and restore after GPU eviction. Save image/source hashes,
 configuration, workload fingerprints, raw responses, diagnostics and metrics.
 Stop on a failed gate. Old-image results cannot substitute for this run.
@@ -205,3 +209,53 @@ The GPU test inventory includes decoded-owner lifetime at 1/64/65/1024 full
 Qwen3-8B-shaped pages, too-small budgets, and actual payload/target corruption.
 Use the manifest's collected node IDs, never an old hard-coded case count.
 Local CPU success and GPU collection/skips are not GPU or RDMA acceptance.
+
+
+## ANS backend and algorithm probe
+
+ANS uses nvCOMP 5.3.0.16, NVCOMP_NATIVE, 65536-byte internal chunks and
+`data_type="|u1"`. BF16 values are treated as opaque bytes, never converted to
+FP16. Each logical token page includes all K/V layers; the Host pool's 4 KiB
+blocks do not change algorithm input granularity. No byte shuffle is enabled.
+Existing LZ4 capabilities are unchanged. ANS peers negotiate a distinct format
+and reject LZ4, force or VERIFY mismatches before accepting data. This is the
+nvCOMP ANS format, not an SSD-LLaMA rANS implementation.
+
+For a bounded, model-derived KV probe on an isolated GPU (not a serving Pod):
+
+```bash
+CUDA_VISIBLE_DEVICES="$GPU" python test/manual/kv_transfer/probe_ans_kv.py \
+  --model "$MODEL_PATH" --prompt-file "$PROMPT_FILE" --tokens 1024 \
+  --output results/ans-probe.json
+```
+
+The local prompt must contain at least the requested number of tokens. This
+loads Qwen3-8B using Transformers SDPA, measures the same captured BF16 KV with
+LZ4 and ANS, verifies every decoded byte, warms each batch, and saves three
+repetitions of sizes and timings. It does not save KV or prompt text. It is not
+SGLang attention or end-to-end performance evidence. Do not install new model
+or nvCOMP versions to make the probe pass silently.
+
+For the full path, set `COMPRESSION_MODE=ans`, and on Prefill set
+`ENABLE_HICACHE=1 HICACHE_COMPRESSION=ans`. Use
+`SGLANG_PD_KV_COMPRESSION_FORCE=1 SGLANG_PD_KV_COMPRESSION_VERIFY=1` for the
+forced diagnostic group; Decode keeps L2 off. Both workers use the same mode.
+The launcher preserves the fixed budgets; unsupported upper bounds fail
+admission rather than growing memory automatically.
+
+Run the existing validator with the four new phase names. Compare
+`ans-transfer` and `force-ans` against `off`; compare `ans-l2` and
+`force-ans-l2` against `native`. Original six groups remain required regressions.
+The two non-cache groups have 14 requests each, and the two cache groups have
+38 each (284 requests including the original 180). Stronger compression must
+not weaken 8191-page restore, identity, digest, drain or output assertions.
+Normal ANS may legitimately fall back to raw; forced groups must prove ANS at
+send, receive, publication and restore. Zero raw fallback is not a speed claim.
+
+Measure serving performance separately with evalscope after real Router smoke
+and warmup, with fixed sampling, cache state and three repeated runs. Record
+actual network bytes including descriptors, encoding/decoding, copies, queue
+waits, workspace and L2 occupancy. Cold encoding and cached-object reuse are
+separate experiments. Keep VERIFY settings matched. Show finalized commands
+and monitoring queries before a measured run; no performance result is implied
+by the algorithm probe or correctness validator.

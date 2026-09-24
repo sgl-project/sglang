@@ -7,13 +7,14 @@ pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA requ
 
 
 @pytest.mark.parametrize("tokens", [1, 31, 1023, 1024])
-def test_fragmented_bf16_kv_roundtrip(tokens):
+@pytest.mark.parametrize("mode", ["lz4", "ans"])
+def test_fragmented_bf16_kv_roundtrip(tokens, mode):
     from sglang.srt.disaggregation.common.staging_buffer import (
         StagingBuffer,
         gather_all_layers_to_staging,
         scatter_staging_to_kv,
     )
-    from sglang.srt.kv_compression.backend import NvcompLZ4Backend
+    from sglang.srt.kv_compression.backend import BACKENDS
 
     torch.manual_seed(42)
     device = torch.device("cuda", 0)
@@ -32,7 +33,7 @@ def test_fragmented_bf16_kv_roundtrip(tokens):
     gather_all_layers_to_staging(k, v, source.cpu().numpy(), packed, 0, heads, 1, 0)
     stream = torch.cuda.Stream(device=device)
     stream.wait_stream(torch.cuda.current_stream(device))
-    backend = NvcompLZ4Backend(device, stream)
+    backend = BACKENDS[mode](device, stream)
     raw = packed.buffer[:nbytes]
     with torch.cuda.stream(stream):
         encoded = torch.empty(
@@ -50,12 +51,13 @@ def test_fragmented_bf16_kv_roundtrip(tokens):
         )
 
 
-def test_uncompressed_size_mismatch_is_rejected():
-    from sglang.srt.kv_compression.backend import NvcompLZ4Backend
+@pytest.mark.parametrize("mode", ["lz4", "ans"])
+def test_uncompressed_size_mismatch_is_rejected(mode):
+    from sglang.srt.kv_compression.backend import BACKENDS
 
     device = torch.device("cuda", 0)
     stream = torch.cuda.Stream(device=device)
-    backend = NvcompLZ4Backend(device, stream)
+    backend = BACKENDS[mode](device, stream)
     with torch.cuda.stream(stream):
         source = torch.zeros(4096, dtype=torch.uint8, device=device)
         encoded = torch.empty(
@@ -70,7 +72,8 @@ def test_uncompressed_size_mismatch_is_rejected():
 
 
 @pytest.mark.parametrize("tokens", [1, 31, 65, 1024])
-def test_shared_page_runtime_l2_only_restore_and_reuse(tokens):
+@pytest.mark.parametrize("mode", ["lz4", "ans"])
+def test_shared_page_runtime_l2_only_restore_and_reuse(tokens, mode):
     from sglang.srt.kv_compression.layout import KVLayoutAdapter
     from sglang.srt.kv_compression.runtime import KVCompressionRuntime
     from sglang.srt.kv_compression.store import CompressedHostKVCache
@@ -82,14 +85,14 @@ def test_shared_page_runtime_l2_only_restore_and_reuse(tokens):
         torch.randn(2 * tokens + 3, 8, 128, device=device, dtype=torch.bfloat16)
         for _ in range(4)
     ]
-    # Deliberately exercise lz4 and raw fallback. This is NOT a ratio benchmark.
+    # Deliberately exercise compression and raw fallback. This is NOT a ratio benchmark.
     for tensor in buffers:
         tensor[::4].zero_()
     layout = KVLayoutAdapter(buffers[:2], buffers[2:])
     source = list(range(0, 2 * tokens, 2))
     target = list(range(1, 2 * tokens + 1, 2))
     expected = layout.pack_pages(source).cpu()
-    runtime = KVCompressionRuntime(layout, "lz4", 128 * 1024**2)
+    runtime = KVCompressionRuntime(layout, mode, 128 * 1024**2)
     pool = CompressedHostKVCache(layout.page_bytes, 64 * 1024**2)
     from sglang.srt.kv_compression.provider import (
         HostEncodedKVProvider,
@@ -115,7 +118,7 @@ def test_shared_page_runtime_l2_only_restore_and_reuse(tokens):
         CompressedHostIO(runtime, pool)._write(handles.tolist(), refs, source, ready)
         for lease in leases:
             lease.close()
-        assert "lz4" in encodings, "GPU decompression must actually be exercised"
+        assert mode in encodings, "GPU decompression must actually be exercised"
         for tensor in buffers:
             tensor.zero_()
         ready = torch.cuda.Event()
@@ -144,7 +147,8 @@ def test_shared_page_runtime_l2_only_restore_and_reuse(tokens):
 
 
 @pytest.mark.parametrize("tokens", [1, 65, 1025])
-def test_forced_lz4_bit_exact_and_bounded(tokens):
+@pytest.mark.parametrize("mode", ["lz4", "ans"])
+def test_forced_compression_bit_exact_and_bounded(tokens, mode):
     from sglang.srt.kv_compression.layout import KVLayoutAdapter
     from sglang.srt.kv_compression.runtime import KVCompressionRuntime
     from sglang.srt.kv_compression.types import new_page_refs
@@ -163,11 +167,11 @@ def test_forced_lz4_bit_exact_and_bounded(tokens):
     expected = layout.pack_pages(list(range(tokens))).cpu()
     ready = torch.cuda.Event()
     ready.record()
-    runtime = KVCompressionRuntime(layout, "lz4", 256 * 1024**2, force=True)
+    runtime = KVCompressionRuntime(layout, mode, 256 * 1024**2, force=True)
     leases = runtime.acquire_pages(new_page_refs(tokens), list(range(tokens)), ready)
     try:
         pages = [lease.future.result(timeout=120) for lease in leases]
-        assert all(page.encoding == "lz4" for page in pages)
+        assert all(page.encoding == mode for page in pages)
         assert runtime.stats["attempted_encoded_bytes"] == sum(p.nbytes for p in pages)
         runtime.submit(
             lambda: runtime.restore(leases, list(range(tokens, tokens * 2))), 0
@@ -183,7 +187,8 @@ def test_forced_lz4_bit_exact_and_bounded(tokens):
 
 
 @pytest.mark.parametrize("tokens", [1, 65, 1025])
-def test_forced_lz4_verified_l2_eviction_restore(tokens):
+@pytest.mark.parametrize("mode", ["lz4", "ans"])
+def test_forced_compression_verified_l2_eviction_restore(tokens, mode):
     from sglang.srt.kv_compression.host_io import CompressedHostIO
     from sglang.srt.kv_compression.layout import KVLayoutAdapter
     from sglang.srt.kv_compression.provider import (
@@ -207,13 +212,11 @@ def test_forced_lz4_verified_l2_eviction_restore(tokens):
     source = list(range(0, tokens * 2, 2))
     target = list(range(1, tokens * 2, 2))[::-1]
     expected = layout.pack_pages(source).cpu()
-    runtime = KVCompressionRuntime(
-        layout, "lz4", 512 * 1024**2, force=True, verify=True
-    )
+    runtime = KVCompressionRuntime(layout, mode, 512 * 1024**2, force=True, verify=True)
     pool = CompressedHostKVCache(
         layout.page_bytes,
         64 * 1024**2,
-        reservation_bytes=runtime.output_bound,
+        reservation_bytes=max(layout.page_bytes, runtime.output_bound),
         verify=True,
     )
     adapter = CompressedHostIO(runtime, pool)
@@ -236,7 +239,7 @@ def test_forced_lz4_verified_l2_eviction_restore(tokens):
         )
         completion.future.result(timeout=120)
         assert completion.query() and completion.actual_bytes > 0
-        assert adapter.stats["published_lz4_pages"] == tokens
+        assert adapter.stats[f"published_{mode}_pages"] == tokens
         assert adapter.stats["verified_backup_pages"] == tokens
         for tensor in buffers:
             tensor.zero_()
@@ -262,7 +265,7 @@ def test_forced_lz4_verified_l2_eviction_restore(tokens):
             lease.close()
         # Acquiring for another send uses the same L2 objects, without encoding.
         leases = runtime.acquire_pages(refs, target)
-        assert all(l.future.result().encoding == "lz4" for l in leases)
+        assert all(l.future.result().encoding == mode for l in leases)
         assert runtime.stats["encoded_pages"] == tokens
         for lease in leases:
             lease.close()
@@ -281,7 +284,8 @@ def test_forced_lz4_verified_l2_eviction_restore(tokens):
 
 
 @pytest.mark.parametrize("tokens", [1, 65])
-def test_force_lz4_fixed_blocks_verified_restore(tokens):
+@pytest.mark.parametrize("mode", ["lz4", "ans"])
+def test_force_compression_fixed_blocks_verified_restore(tokens, mode):
     """Real nvCOMP, pinned D2H/scatter/gather/H2D and target byte validation."""
     from sglang.srt.kv_compression.host_io import CompressedHostIO
     from sglang.srt.kv_compression.layout import KVLayoutAdapter
@@ -295,13 +299,11 @@ def test_force_lz4_fixed_blocks_verified_restore(tokens):
         for _ in range(4)
     ]
     layout = KVLayoutAdapter(buffers[:2], buffers[2:])
-    runtime = KVCompressionRuntime(
-        layout, "lz4", 128 * 1024**2, force=True, verify=True
-    )
+    runtime = KVCompressionRuntime(layout, mode, 128 * 1024**2, force=True, verify=True)
     pool = CompressedHostKVCache(
         layout.page_bytes,
         64 * 1024**2,
-        reservation_bytes=runtime.output_bound,
+        reservation_bytes=max(layout.page_bytes, runtime.output_bound),
         verify=True,
     )
     fragmented = pool.alloc(2 * tokens)
@@ -316,7 +318,7 @@ def test_force_lz4_fixed_blocks_verified_restore(tokens):
     try:
         io = CompressedHostIO(runtime, pool)
         io._write(handles.tolist(), refs, source, ready)
-        assert io.stats["published_lz4_pages"] == tokens
+        assert io.stats[f"published_{mode}_pages"] == tokens
         assert io.stats["verified_backup_pages"] == tokens
         for tensor in buffers:
             tensor.zero_()
@@ -351,7 +353,8 @@ def test_force_lz4_fixed_blocks_verified_restore(tokens):
         runtime.close()
 
 
-def test_gpu_block_write_failure_drains_before_reclaim():
+@pytest.mark.parametrize("mode", ["lz4", "ans"])
+def test_gpu_block_write_failure_drains_before_reclaim(mode):
     from unittest.mock import patch
 
     from sglang.srt.kv_compression.host_io import CompressedHostIO
@@ -364,11 +367,11 @@ def test_gpu_block_write_failure_drains_before_reclaim():
         torch.randn(4, 8, 128, device="cuda", dtype=torch.bfloat16) for _ in range(4)
     ]
     layout = KVLayoutAdapter(buffers[:2], buffers[2:])
-    runtime = KVCompressionRuntime(layout, "lz4", 64 * 1024**2, force=True, verify=True)
+    runtime = KVCompressionRuntime(layout, mode, 64 * 1024**2, force=True, verify=True)
     pool = CompressedHostKVCache(
         layout.page_bytes,
         64 * 1024**2,
-        reservation_bytes=runtime.output_bound,
+        reservation_bytes=max(layout.page_bytes, runtime.output_bound),
         verify=True,
     )
     ready = torch.cuda.Event()
@@ -434,7 +437,7 @@ def review_encoded(runtime, indices):
             lease.close()
 
 
-@pytest.mark.parametrize("mode", ["passthrough", "lz4"])
+@pytest.mark.parametrize("mode", ["passthrough", "lz4", "ans"])
 @pytest.mark.parametrize("count", [1, 64, 65, 1024])
 def test_decode_output_stays_budgeted_until_delayed_scatter(mode, count):
     import concurrent.futures
@@ -445,7 +448,7 @@ def test_decode_output_stays_budgeted_until_delayed_scatter(mode, count):
 
     model = review_layout(count)
     runtime = KVCompressionRuntime(
-        model, mode, 512 * 1024**2, force=mode == "lz4", verify=True
+        model, mode, 512 * 1024**2, force=mode != "passthrough", verify=True
     )
     pages = review_encoded(runtime, list(range(0, 2 * count, 2)))
     release, reached = threading.Event(), threading.Event()
@@ -489,7 +492,8 @@ def test_decode_output_stays_budgeted_until_delayed_scatter(mode, count):
                 pytorch_allocated_delta=after - before,
                 runtime=snapshot,
                 encoding={
-                    e: sum(p.encoding == e for p in pages) for e in ("raw", "lz4")
+                    e: sum(p.encoding == e for p in pages)
+                    for e in ("raw", "lz4", "ans")
                 },
                 budget_covers_live_output=snapshot["resident_bytes"]
                 >= live_result_bytes,
@@ -551,7 +555,7 @@ def test_decode_rejects_task_larger_than_workspace():
         runtime.close()
 
 
-@pytest.mark.parametrize("mode", ["passthrough", "lz4"])
+@pytest.mark.parametrize("mode", ["passthrough", "lz4", "ans"])
 @pytest.mark.parametrize("where", ["payload", "target"])
 def test_actual_byte_corruption_detected_and_next_restore_succeeds(mode, where):
     import concurrent.futures
@@ -563,7 +567,7 @@ def test_actual_byte_corruption_detected_and_next_restore_succeeds(mode, where):
 
     model = review_layout(1)
     runtime = KVCompressionRuntime(
-        model, mode, 512 * 1024**2, force=mode == "lz4", verify=True
+        model, mode, 512 * 1024**2, force=mode != "passthrough", verify=True
     )
     pages = review_encoded(runtime, [0])
     future = concurrent.futures.Future()
@@ -633,3 +637,29 @@ def test_actual_byte_corruption_detected_and_next_restore_succeeds(mode, where):
         for lease in leases:
             lease.close()
         runtime.close()
+
+
+@pytest.mark.parametrize("mode", ["lz4", "ans"])
+@pytest.mark.parametrize("count", [1, 64, 65])
+def test_nvcomp_preallocated_batches_and_capacity(mode, count):
+    from sglang.srt.kv_compression.backend import BACKENDS
+
+    device = torch.device("cuda", 0)
+    stream = torch.cuda.Stream(device=device)
+    backend = BACKENDS[mode](device, stream)
+    with torch.cuda.stream(stream):
+        # Uniform bytes test bounds, not model compressibility.
+        raw = torch.randint(256, (count, 147456), dtype=torch.uint8, device=device)
+        for start in range(0, count, 64):
+            sources = list(raw[start : start + 64].unbind())
+            bounds = [backend.max_output_bytes(src) for src in sources]
+            outputs = [torch.empty(n, dtype=torch.uint8, device=device) for n in bounds]
+            with pytest.raises(ValueError, match="capacity"):
+                backend.compress_batch(sources, [outputs[0][:-1], *outputs[1:]])
+            lengths = backend.compress_batch(sources, outputs)
+            restored = [torch.empty_like(src) for src in sources]
+            backend.decompress_batch(
+                [out[:n] for out, n in zip(outputs, lengths)], restored
+            )
+            assert all(torch.equal(src, dst) for src, dst in zip(sources, restored))
+            assert all(0 < n <= bound for n, bound in zip(lengths, bounds))

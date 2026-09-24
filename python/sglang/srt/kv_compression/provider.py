@@ -24,15 +24,19 @@ class HostEncodedKVProvider:
         self._pool, self.spec = pool, spec
 
     def acquire(self, page_ref: int, spec: RepresentationSpec) -> Lease | None:
-        if (spec.layout, spec.version) != (self.spec.layout, self.spec.version):
+        if (spec.layout, spec.version, spec.mode) != (
+            self.spec.layout,
+            self.spec.version,
+            self.spec.mode,
+        ):
             return None
         lease = self._pool.acquire_ref(page_ref, spec.mode)
         if lease is None:
             return None
         page = lease.future.result()  # Host acquire returns an already-ready value.
-        if (spec.force and page.encoding != "lz4") or (
-            spec.verify and page.raw_sha256 is None
-        ):
+        if (
+            page.encoding not in ((spec.mode,) if spec.force else ("raw", spec.mode))
+        ) or (spec.verify and page.raw_sha256 is None):
             lease.close()
             return None
         return lease

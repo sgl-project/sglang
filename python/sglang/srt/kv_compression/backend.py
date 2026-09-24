@@ -16,7 +16,9 @@ from sglang.srt.kv_compression.types import (
 )
 
 
-class NvcompLZ4Backend:
+class NvcompBackend:
+    algorithm = None
+
     def __init__(self, device, stream):
         import torch
         from nvidia import nvcomp
@@ -30,8 +32,10 @@ class NvcompLZ4Backend:
         self.nvcomp = nvcomp
         self.stream = stream
         self.thread_id = threading.get_ident()
+        self._bounds = {}
         self.impl = nvcomp.Codec(
-            algorithm="LZ4",
+            algorithm=self.algorithm,
+            **({"data_type": "|u1"} if self.algorithm == "ANS" else {}),
             device_id=device.index,
             cuda_stream=stream.cuda_stream,
             uncomp_chunk_size=65536,
@@ -52,11 +56,18 @@ class NvcompLZ4Backend:
         return self.nvcomp.as_array(tensor, cuda_stream=self.stream.cuda_stream)
 
     def max_output_bytes(self, src) -> int:
+        source = self._array(src)
+        if src.numel() in self._bounds:
+            return self._bounds[src.numel()]
         # The 5.3 release note and Python reference use different spellings.
         bound = getattr(self.impl, "get_max_comp_buffer_size", None)
         if bound is None:
             bound = getattr(self.impl, "get_max_compressed_buffer_size")
-        return int(bound(self._array(src)))
+        size = int(bound(source))
+        if size <= 0:
+            raise ValueError("nvCOMP returned an invalid output bound")
+        self._bounds[src.numel()] = size
+        return size
 
     def drain(self):
         try:
@@ -91,6 +102,11 @@ class NvcompLZ4Backend:
     def compress_batch(self, sources, outputs):
         if len(sources) != len(outputs) or not sources:
             raise ValueError("Invalid compression batch")
+        if any(
+            dst.numel() < self.max_output_bytes(src)
+            for src, dst in zip(sources, outputs)
+        ):
+            raise ValueError("Compression output capacity is too small")
         try:
             result = self.impl.encode(
                 [self._array(t) for t in sources],
@@ -119,3 +135,14 @@ class NvcompLZ4Backend:
             self.impl.decode(arrays, out=[self._array(t) for t in outputs])
         finally:
             self.drain()
+
+
+class NvcompLZ4Backend(NvcompBackend):
+    algorithm = "LZ4"
+
+
+class NvcompANSBackend(NvcompBackend):
+    algorithm = "ANS"
+
+
+BACKENDS = {"lz4": NvcompLZ4Backend, "ans": NvcompANSBackend}

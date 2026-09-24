@@ -122,10 +122,10 @@ class KVCompressionRuntime:
         force=False,
         verify=False,
     ):
-        if mode not in ("passthrough", "lz4"):
+        if mode not in ("passthrough", "lz4", "ans"):
             raise ValueError("Unsupported compression execution mode")
-        if force and mode != "lz4":
-            raise ValueError("Forced compression requires LZ4")
+        if force and mode not in ("lz4", "ans"):
+            raise ValueError("Forced compression requires LZ4 or ANS")
         self.force = force
         self.verify = verify
         self.trace_reuse = os.environ.get(
@@ -151,6 +151,11 @@ class KVCompressionRuntime:
             "encoded_pages": 0,
             "reused_inflight_pages": 0,
             "reused_host_pages": 0,
+            **{
+                f"{action}_{encoding}_pages": 0
+                for action in ("encoded", "reused_host")
+                for encoding in ("raw", "lz4", "ans")
+            },
             "raw_fallback_pages": 0,
             "encode_seconds": 0.0,
             "peak_bytes": 0,
@@ -193,11 +198,11 @@ class KVCompressionRuntime:
                 if self.device.type == "cuda"
                 else None
             )
-            if self.mode == "lz4":
+            if self.mode in ("lz4", "ans"):
                 if self._factory is None:
-                    from sglang.srt.kv_compression.backend import NvcompLZ4Backend
+                    from sglang.srt.kv_compression.backend import BACKENDS
 
-                    self._factory = NvcompLZ4Backend
+                    self._factory = BACKENDS[self.mode]
                 self.backend = self._factory(self.device, self.stream)
                 sample = torch.empty(
                     self.layout.page_bytes, dtype=torch.uint8, device=self.device
@@ -402,12 +407,17 @@ class KVCompressionRuntime:
                             ),
                         )
                         if lease is not None:
-                            if self.force and lease.future.result().encoding != "lz4":
+                            if lease.future.result().encoding not in (
+                                (self.mode,) if self.force else ("raw", self.mode)
+                            ):
                                 lease.close()
                                 raise ValueError(
-                                    "Forced LZ4 cannot reuse a raw L2 object"
+                                    "Incompatible L2 encoding for this runtime"
                                 )
                             self.stats["reused_host_pages"] += 1
+                            self.stats[
+                                f"reused_host_{lease.future.result().encoding}_pages"
+                            ] += 1
                             if self.trace_reuse:
                                 sources.append([int(ref), "host"])
                             leases.append(lease)
@@ -559,19 +569,22 @@ class KVCompressionRuntime:
                                 "capacity_per_page": self.output_bound,
                                 "actual_lengths": lengths,
                                 "force": self.force,
+                                "mode": self.mode,
                             }
                         ),
                     )
             pages = []
             for i, length in enumerate(lengths):
                 # Include an allowance for the per-page descriptor/alignment.
-                use_lz4 = self.backend is not None and (
+                use_compressed = self.backend is not None and (
                     self.force or length + 256 < self.layout.page_bytes
                 )
-                data = outputs[i][:length] if use_lz4 else raw[i].clone()
+                data = outputs[i][:length] if use_compressed else raw[i].clone()
                 pages.append(
                     EncodedPage(
-                        data, "lz4" if use_lz4 else "raw", self.layout.page_bytes
+                        data,
+                        self.mode if use_compressed else "raw",
+                        self.layout.page_bytes,
                     )
                 )
             self.drain()
@@ -582,6 +595,7 @@ class KVCompressionRuntime:
                     entry.resident_bytes = page.data.untyped_storage().nbytes()
                     self._live_bytes += entry.resident_bytes
                     self.stats["encoded_pages"] += 1
+                    self.stats[f"encoded_{page.encoding}_pages"] += 1
                     self.stats["raw_fallback_pages"] += int(
                         self.backend is not None and page.encoding == "raw"
                     )
@@ -654,7 +668,7 @@ class KVCompressionRuntime:
                 keepalive.append(src)
                 if page.encoding == "raw":
                     raw[i].copy_(src, non_blocking=True)
-                elif page.encoding == "lz4" and self.backend is not None:
+                elif page.encoding == self.mode and self.backend is not None:
                     sources.append(src)
                     outputs.append(raw[i])
                 else:

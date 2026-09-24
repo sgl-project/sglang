@@ -74,6 +74,11 @@ class CompressionMetrics:
             "reused_inflight_pages",
             "reused_host_pages",
             "raw_fallback_pages",
+            *(
+                f"{action}_{encoding}_pages"
+                for action in ("encoded", "reused_host")
+                for encoding in ("raw", "lz4", "ans")
+            ),
         ):
             self._increment(self.pages, key, runtime[key])
         for key in (
@@ -81,9 +86,11 @@ class CompressionMetrics:
             "restored_pages",
             "completed_restore_pages",
             "published_lz4_pages",
+            "published_ans_pages",
             "published_raw_pages",
             "verified_backup_pages",
             "restored_lz4_pages",
+            "restored_ans_pages",
             "verified_restored_pages",
         ):
             self._increment(self.pages, key, adapter[key])

@@ -12,28 +12,32 @@ case "$ROLE" in
 esac
 export SGLANG_PD_KV_COMPRESSION="${COMPRESSION_MODE:-off}"
 case "$SGLANG_PD_KV_COMPRESSION" in
-  off|passthrough|lz4) ;;
-  *) echo "COMPRESSION_MODE must be off, passthrough or lz4" >&2; exit 2 ;;
+  off|passthrough|lz4|ans) ;;
+  *) echo "COMPRESSION_MODE must be off, passthrough, lz4 or ans" >&2; exit 2 ;;
 esac
 export SGLANG_HICACHE_KV_COMPRESSION="${HICACHE_COMPRESSION:-off}"
 case "$SGLANG_HICACHE_KV_COMPRESSION" in
-  off|passthrough|lz4) ;;
-  *) echo "HICACHE_COMPRESSION must be off, passthrough or lz4" >&2; exit 2 ;;
+  off|passthrough|lz4|ans) ;;
+  *) echo "HICACHE_COMPRESSION must be off, passthrough, lz4 or ans" >&2; exit 2 ;;
 esac
 export SGLANG_PD_KV_COMPRESSION_FORCE="${SGLANG_PD_KV_COMPRESSION_FORCE:-0}"
 export SGLANG_PD_KV_COMPRESSION_VERIFY="${SGLANG_PD_KV_COMPRESSION_VERIFY:-1}"
 if [[ "$SGLANG_PD_KV_COMPRESSION_FORCE" != 0 ]]; then
-  if [[ "$SGLANG_PD_KV_COMPRESSION_FORCE" != 1 || "$SGLANG_PD_KV_COMPRESSION" != lz4 ||
+  if [[ "$SGLANG_PD_KV_COMPRESSION_FORCE" != 1 || ( "$SGLANG_PD_KV_COMPRESSION" != lz4 && "$SGLANG_PD_KV_COMPRESSION" != ans ) ||
         "$SGLANG_PD_KV_COMPRESSION_VERIFY" != 1 ]]; then
-    echo "FORCE=1 is diagnostic only: lz4 and VERIFY=1 on both workers required" >&2; exit 2
+    echo "FORCE=1 is diagnostic only: lz4/ans and VERIFY=1 on both workers required" >&2; exit 2
   fi
   if [[ "${ENABLE_HICACHE:-0}" == 1 ]]; then
-    if [[ "$ROLE" != prefill || "$SGLANG_HICACHE_KV_COMPRESSION" != lz4 ]]; then
-      echo "FORCE allows only Prefill LZ4 L2" >&2; exit 2
+    if [[ "$ROLE" != prefill || "$SGLANG_HICACHE_KV_COMPRESSION" != "$SGLANG_PD_KV_COMPRESSION" ]]; then
+      echo "FORCE allows only matching Prefill compressed L2" >&2; exit 2
     fi
   elif [[ "$SGLANG_HICACHE_KV_COMPRESSION" != off ]]; then
     echo "L2 compression requires HiCache" >&2; exit 2
   fi
+fi
+if [[ "$SGLANG_HICACHE_KV_COMPRESSION" != off &&
+      "$SGLANG_HICACHE_KV_COMPRESSION" != "$SGLANG_PD_KV_COMPRESSION" ]]; then
+  echo "P/D and L2 compression algorithms must match" >&2; exit 2
 fi
 # Privileged Kubernetes containers can enumerate every GPU despite a 1-GPU
 # resource request. Bind to the plugin allocation; never assume physical 0.

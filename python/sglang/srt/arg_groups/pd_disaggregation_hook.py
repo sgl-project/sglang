@@ -328,6 +328,9 @@ def _validate_pd_compression(server_args: ServerArgs) -> None:
     if cfg.page_size != 1 or cfg.attention_backend != "flashinfer":
         errors.append("--page-size 1 --attention-backend flashinfer are required")
     host_compression = envs.SGLANG_HICACHE_KV_COMPRESSION.get()
+    pd_compression = envs.SGLANG_PD_KV_COMPRESSION.get()
+    if host_compression != "off" and host_compression != pd_compression:
+        errors.append("P/D and compressed L2 must use the same algorithm")
     prefill_cache = (
         cfg.disaggregation_mode == "prefill" and cfg.enable_hierarchical_cache
     )
@@ -381,15 +384,15 @@ def _validate_pd_compression(server_args: ServerArgs) -> None:
         )
     if envs.SGLANG_PD_KV_COMPRESSION_FORCE.get():
         if (
-            envs.SGLANG_PD_KV_COMPRESSION.get() != "lz4"
+            pd_compression not in ("lz4", "ans")
             or (
                 cfg.enable_hierarchical_cache
-                and (not prefill_cache or host_compression != "lz4")
+                and (not prefill_cache or host_compression != pd_compression)
             )
             or (not cfg.enable_hierarchical_cache and host_compression != "off")
         ):
             errors.append(
-                "FORCE is test-only: LZ4 P/D; optional Prefill LZ4 L2; Decode L2 off"
+                "FORCE is test-only: LZ4/ANS P/D; optional matching Prefill L2; Decode L2 off"
             )
         if not envs.SGLANG_PD_KV_COMPRESSION_VERIFY.get():
             errors.append("FORCE requires VERIFY=1")
