@@ -83,6 +83,9 @@ class MluSRTPlatform(MluDeviceMixin, SRTPlatform):
     def get_position_dtype(self) -> torch.dtype:
         return torch.int32
 
+    def get_default_attention_backend(self) -> str:
+        return "mlu"
+
     def get_paged_allocator_cls(self) -> type:
         from sglang.srt.hardware_backend.mlu.allocator_mlu import (
             MLUPagedTokenToKVPoolAllocator,
