@@ -965,6 +965,34 @@ class TestCPInterleaveStrategy(CustomTestCase):
             self.assertTrue(torch.equal(helper_x, expected_x))
             self.assertTrue(torch.equal(helper_positions, expected_positions))
 
+    def test_interleave_shards_python_sequences(self):
+        for sequence_type in (list, tuple):
+            for num_tokens in (0, 2, 7, 8):
+                tokens = sequence_type(range(num_tokens))
+                for cp_size in (1, 2, 4):
+                    strategy = InterleaveCPStrategy(cp_size=cp_size)
+                    for rank in range(cp_size):
+                        with (
+                            self.subTest(
+                                sequence_type=sequence_type,
+                                num_tokens=num_tokens,
+                                cp_size=cp_size,
+                                rank=rank,
+                            ),
+                            get_parallel().override(
+                                attn_cp_rank=rank, attn_cp_size=cp_size
+                            ),
+                        ):
+                            local_tokens = strategy.shard_local_tokens(tokens)
+                            expected = sequence_type(
+                                token
+                                for index, token in enumerate(tokens)
+                                if index % cp_size == rank
+                            )
+                            self.assertIs(type(local_tokens), sequence_type)
+                            self.assertEqual(local_tokens, expected)
+                            self.assertEqual(tokens, sequence_type(range(num_tokens)))
+
     def test_interleave_padding_preserves_shard_and_gather(self):
         cp_size = 4
         total_tokens = 10
