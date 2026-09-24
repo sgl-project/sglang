@@ -9,7 +9,7 @@ This module defines the base class for pipelines that are composed of multiple s
 
 import os
 from abc import ABC, abstractmethod
-from typing import Any, Callable, Iterator, Literal, cast
+from typing import Any, Callable, ClassVar, Iterator, Literal, cast
 
 import torch
 from tqdm import tqdm
@@ -23,6 +23,7 @@ from sglang.multimodal_gen.runtime.loader.comfyui_checkpoints import (
     load_comfyui_transformer,
 )
 from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader import (
+    ComponentLoader,
     PipelineComponentLoader,
 )
 from sglang.multimodal_gen.runtime.loader.utils import _normalize_component_type
@@ -86,6 +87,8 @@ class ComposedPipelineBase(ABC):
     _required_config_modules: list[str] = []
     _unfiltered_required_config_modules: tuple[str, ...] = ()
     _extra_config_module_map: dict[str, str] = {}
+    # Exact module keys; unspecified components retain the default loader dispatch.
+    component_loaders: ClassVar[dict[str, type[ComponentLoader]]] = {}
     server_args: ServerArgs | None = None
     modules: dict[str, Any] = {}
     executor: PipelineExecutor | None = None
@@ -279,6 +282,7 @@ class ComposedPipelineBase(ABC):
                 "Flux2KleinPipeline": {"vae"},
                 "QwenImageEditPipeline": {"vae"},
                 "QwenImageEditPlusPipeline": {"vae"},
+                "QwenImage21Pipeline": {"vae"},
                 "QwenImageLayeredPipeline": {"vae", "transformer"},
                 "LongCatImageEditPipeline": {"vae"},
                 "GlmImagePipeline": {"vae", "transformer"},
@@ -501,9 +505,9 @@ class ComposedPipelineBase(ABC):
         self._validate_direct_gpu_component_selection(model_index, server_args)
 
         # some sanity checks
-        assert (
-            len(model_index) > 1
-        ), "model_index.json must contain at least one pipeline module"
+        assert len(model_index) > 1, (
+            "model_index.json must contain at least one pipeline module"
+        )
 
         # In disagg mode, read HF config for skipped components (e.g., VAE)
         # so that update_model_arch + post_init can derive pipeline_config.
@@ -637,6 +641,7 @@ class ComposedPipelineBase(ABC):
             module, memory_usage = PipelineComponentLoader.load_component(
                 component_name=module_name,
                 component_type=load_module_name,
+                loader_cls=self.component_loaders.get(module_name),
                 component_model_path=component_model_path,
                 transformers_or_diffusers=transformers_or_diffusers,
                 server_args=server_args,

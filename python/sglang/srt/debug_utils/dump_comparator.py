@@ -152,7 +152,7 @@ def check_tensor_pair(
         value_baseline = fn(x_baseline).item()
         value_target = fn(x_target).item()
         print(
-            f"[{name}] {value_baseline :.4f} vs {value_target:.4f} (diff: {value_target - value_baseline:.4f})"
+            f"[{name}] {value_baseline:.4f} vs {value_target:.4f} (diff: {value_target - value_baseline:.4f})"
         )
 
     if x_baseline.shape != x_target.shape:

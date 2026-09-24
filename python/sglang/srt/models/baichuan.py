@@ -80,7 +80,6 @@ def _get_alibi_slopes(total_num_heads: int) -> torch.Tensor:
 
 
 class BaiChuanMLP(nn.Module):
-
     def __init__(
         self,
         hidden_size: int,
@@ -106,8 +105,7 @@ class BaiChuanMLP(nn.Module):
         )
         if hidden_act != "silu":
             raise ValueError(
-                f"Unsupported activation: {hidden_act}. "
-                "Only silu is supported for now."
+                f"Unsupported activation: {hidden_act}. Only silu is supported for now."
             )
         self.act_fn = SiluAndMul()
 
@@ -223,7 +221,6 @@ class BaiChuanAttention(nn.Module):
 
 
 class BaiChuanDecoderLayer(nn.Module):
-
     def __init__(
         self,
         config: PretrainedConfig,
@@ -284,7 +281,6 @@ class BaiChuanDecoderLayer(nn.Module):
 
 
 class BaiChuanModel(nn.Module):
-
     def __init__(
         self,
         config: PretrainedConfig,

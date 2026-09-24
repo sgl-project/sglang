@@ -6,7 +6,7 @@ from unittest.mock import patch
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=1, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 class _FakeModelRunner:
@@ -35,14 +35,18 @@ class TestModelRunnerDecodeRows(unittest.TestCase):
             spec = SimpleNamespace(
                 speculative_adaptive=True, speculative_adaptive_config=f.name
             )
-            with patch(
-                "sglang.srt.model_executor.model_runner.get_spec", return_value=spec
-            ), patch(
-                "sglang.srt.model_executor.model_runner.max_speculative_num_draft_tokens",
-                return_value=6,
-            ), patch(
-                "sglang.srt.model_executor.model_runner.get_batch_sizes_to_capture",
-                side_effect=_alignment_8_capture_bs,
+            with (
+                patch(
+                    "sglang.srt.model_executor.model_runner.get_spec", return_value=spec
+                ),
+                patch(
+                    "sglang.srt.model_executor.model_runner.max_speculative_num_draft_tokens",
+                    return_value=6,
+                ),
+                patch(
+                    "sglang.srt.model_executor.model_runner.get_batch_sizes_to_capture",
+                    side_effect=_alignment_8_capture_bs,
+                ),
             ):
                 self.assertEqual(runner.max_decode_logits_rows(), 72)
 
