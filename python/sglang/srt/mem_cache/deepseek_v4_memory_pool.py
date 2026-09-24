@@ -1145,7 +1145,11 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         )
         self.full_size = full_size
         self.kv_source_layers = list(kv_source_layers)
-        self.sources_by_ratio = self._collect_sources_by_ratio()
+        self.sources_by_ratio = collect_sources_by_ratio(
+            self.compression_ratios,
+            self.kv_source_layers,
+            range(self._stage_start, self._stage_end),
+        )
         self._init_compressed_pools(
             stage_ratios=stage_ratios,
             page_size=page_size,
@@ -1623,13 +1627,6 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
                     head_dim=self.indexer_head_dim,
                     enable_memory_saver=enable_memory_saver,
                 )
-
-    def _collect_sources_by_ratio(self) -> dict[int, List[int]]:
-        return collect_sources_by_ratio(
-            self.compression_ratios,
-            self.kv_source_layers,
-            range(self._stage_start, self._stage_end),
-        )
 
     def source_layer_of(self, layer_id: int) -> int:
         """The layer owning this layer's compressed storage: itself for ratios 4/128,
