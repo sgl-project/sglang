@@ -20,6 +20,9 @@ from sglang.srt.distributed.parallel_state import (
     get_world_group,
 )
 from sglang.srt.environ import envs
+from sglang.srt.layers.attention.minimax_sparse_ops.msa_ppu import (
+    ppu_msa_indexer_fp8_available,
+)
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.mem_cache.allocation_sizing import get_req_to_token_extra_context_len
 from sglang.srt.mem_cache.allocator import (
@@ -951,7 +954,17 @@ class ModelRunnerKVCacheMixin:
                     size=self.max_total_num_tokens,
                     page_size=self.page_size,
                     dtype=self.kv_cache_dtype,
-                    index_dtype=self.dtype,
+                    # SGLANG_SAIL_MINIMAX_M3_MSA_INDEXER_FP8=1 (PPU only)
+                    # quantizes the index-K cache to fp8 e4m3 for the SAIL MSA
+                    # fp8 OnlyScore indexer.
+                    index_dtype=(
+                        torch.float8_e4m3fn
+                        if (
+                            current_platform.is_ppu()
+                            and ppu_msa_indexer_fp8_available()
+                        )
+                        else self.dtype
+                    ),
                     head_num=self.model_config.get_num_kv_heads(
                         get_attention_tp_size()
                     ),

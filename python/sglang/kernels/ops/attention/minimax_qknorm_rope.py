@@ -18,7 +18,7 @@ Two entry points:
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, List, Sequence, Tuple
+from typing import TYPE_CHECKING, List, Optional, Sequence, Tuple
 
 import torch
 
@@ -43,7 +43,13 @@ def _jit_module(pos_dtype, head_dim, rope_dim) -> Module:
         "fused_gemma_qknorm_rope",
         *args,
         cuda_files=["minimax/fused_gemma_qknorm_rope.cuh"],
-        cuda_wrappers=[("fused_gemma_qknorm_rope", f"fused_gemma_qknorm_rope<{args}>")],
+        cuda_wrappers=[
+            ("fused_gemma_qknorm_rope", f"fused_gemma_qknorm_rope<{args}>"),
+            (
+                "fused_gemma_qknorm_rope_fp8_qout",
+                f"fused_gemma_qknorm_rope_fp8_qout<{args}>",
+            ),
+        ],
     )
 
 
@@ -93,12 +99,60 @@ def _fused_gemma_qknorm_rope(
     )
 
 
+@register_custom_op(mutates_args=["qkv", "fp8_q_out"])
+def _fused_gemma_qknorm_rope_fp8_qout(
+    qkv: torch.Tensor,
+    fp8_q_out: torch.Tensor,
+    w0: torch.Tensor,
+    w1: torch.Tensor,
+    w2: torch.Tensor,
+    w3: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    positions: torch.Tensor,
+    off0: int,
+    cnt0: int,
+    off1: int,
+    cnt1: int,
+    off2: int,
+    cnt2: int,
+    off3: int,
+    cnt3: int,
+    num_groups: int,
+    fp8_q_group_idx: int,
+    eps: float,
+) -> None:
+    module = _jit_module(positions.dtype, 128, 64)
+    module.fused_gemma_qknorm_rope_fp8_qout(
+        qkv,
+        fp8_q_out,
+        w0,
+        w1,
+        w2,
+        w3,
+        cos_sin_cache,
+        positions,
+        off0,
+        cnt0,
+        off1,
+        cnt1,
+        off2,
+        cnt2,
+        off3,
+        cnt3,
+        num_groups,
+        fp8_q_group_idx,
+        eps,
+    )
+
+
 def minimax_qknorm_rope_grouped(
     qkv: torch.Tensor,
     groups: Sequence[Tuple[torch.Tensor, int, int]],
     cos_sin_cache: torch.Tensor,
     positions: torch.Tensor,
     eps: float,
+    fp8_q_out: Optional[torch.Tensor] = None,
+    fp8_q_group_idx: int = 0,
 ) -> torch.Tensor:
     """Fused GemmaRMSNorm + partial NeoX RoPE over ``groups``, in place on ``qkv``.
 
@@ -127,25 +181,56 @@ def minimax_qknorm_rope_grouped(
         offsets.append(0)
         counts.append(0)
 
-    _fused_gemma_qknorm_rope(
-        qkv,
-        weights[0],
-        weights[1],
-        weights[2],
-        weights[3],
-        cos_sin_cache,
-        positions,
-        offsets[0],
-        counts[0],
-        offsets[1],
-        counts[1],
-        offsets[2],
-        counts[2],
-        offsets[3],
-        counts[3],
-        num_groups,
-        eps,
-    )
+    if fp8_q_out is None:
+        _fused_gemma_qknorm_rope(
+            qkv,
+            weights[0],
+            weights[1],
+            weights[2],
+            weights[3],
+            cos_sin_cache,
+            positions,
+            offsets[0],
+            counts[0],
+            offsets[1],
+            counts[1],
+            offsets[2],
+            counts[2],
+            offsets[3],
+            counts[3],
+            num_groups,
+            eps,
+        )
+    else:
+        assert 0 <= fp8_q_group_idx < num_groups
+        assert fp8_q_out.shape == (
+            qkv.shape[0],
+            counts[fp8_q_group_idx],
+            128,
+        )
+        assert fp8_q_out.dtype == torch.float8_e4m3fn
+        assert fp8_q_out.is_contiguous()
+        _fused_gemma_qknorm_rope_fp8_qout(
+            qkv,
+            fp8_q_out,
+            weights[0],
+            weights[1],
+            weights[2],
+            weights[3],
+            cos_sin_cache,
+            positions,
+            offsets[0],
+            counts[0],
+            offsets[1],
+            counts[1],
+            offsets[2],
+            counts[2],
+            offsets[3],
+            counts[3],
+            num_groups,
+            fp8_q_group_idx,
+            eps,
+        )
     return qkv
 
 
@@ -159,6 +244,7 @@ def minimax_qknorm_rope(
     nk: int,
     nv: int,  # deprecated / ignored: V heads are simply left untouched
     eps: float,
+    fp8_q_out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Main-attention layout ``[q (nq) | k (nk) | v ...]``: norm + rope Q then K."""
     return minimax_qknorm_rope_grouped(
@@ -167,4 +253,5 @@ def minimax_qknorm_rope(
         cos_sin_cache,
         positions,
         eps,
+        fp8_q_out=fp8_q_out,
     )

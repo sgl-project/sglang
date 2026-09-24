@@ -5474,6 +5474,19 @@ def get_minimax_sparse_index_dtype(
         return kv_cache_dtype
     if _is_gfx95_supported and envs.SGLANG_OPT_MINIMAX_M3_FP8_INDEX_CACHE.get():
         return torch.float8_e4m3fn
+    # On PPU the SAIL MSA fp8 OnlyScore indexer stores the index-K cache in fp8
+    # e4m3 too. Folded here (not inline at the pool-construction site) so this
+    # helper stays the single source of truth shared with the cell-size estimate
+    # caller in pool_configurator.py; the two must agree or the index-K pool is
+    # sized for the wrong element width. Local import: memory_pool is foundational
+    # and a module-level import of the attention-layer msa_ppu would be circular.
+    if current_platform.is_ppu():
+        from sglang.srt.layers.attention.minimax_sparse_ops.msa_ppu import (
+            ppu_msa_indexer_fp8_available,
+        )
+
+        if ppu_msa_indexer_fp8_available():
+            return torch.float8_e4m3fn
     return model_dtype
 
 
