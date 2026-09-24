@@ -385,7 +385,7 @@ class SWAComponent(TreeComponent):
             swa_branching_seqlen=branching_seqlen,
         )
 
-    def resync_window_full_to_swa_mapping(self, node: UnifiedTreeNode) -> None:
+    def resync_window_full_to_swa_mapping(self, node_id: int) -> None:
         """Re-point the allocator's global full -> swa table for the reused window.
 
         A prefix-cache hit restores only the Full req_to_token rows, while
@@ -396,15 +396,18 @@ class SWAComponent(TreeComponent):
         action path so the mutation stays on the audited call, not on every
         (possibly discarded) match.
         """
+        if node_id is None:
+            return
         alloc = self.cache.token_to_kv_pool_allocator
         if is_swa_req_ring(alloc):
             return
         ct = self.component_type
         root = self.tree_core.root_node
+        node = self.tree_core.node_by_id(node_id)
         full_chunks: list[torch.Tensor] = []
         swa_chunks: list[torch.Tensor] = []
         n_swa = 0
-        while node is not root and n_swa < self.sliding_window_size:
+        while node.id != root.id and n_swa < self.sliding_window_size:
             cd = node.component_data[ct]
             if cd.value is None:
                 break
