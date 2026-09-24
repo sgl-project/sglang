@@ -13,6 +13,15 @@ from sglang.srt.environ import (
 
 _redirect_third_party_caches()
 
+# torchada registers the MUSA torch operators/device integration. Load it at
+# the package boundary so users do not need to add ``import torchada`` to every
+# test or entrypoint. Keep this conditional: torchada is vendor-specific and
+# must not be required on CUDA/CPU/NPU installations.
+import torch as _torch
+
+if getattr(_torch.version, "musa", None) is not None:
+    import torchada as _torchada  # noqa: F401
+
 if _sys.platform == "darwin" and _platform.machine() == "arm64":
     from sglang._platform_stubs import install_platform_stubs as _install_platform_stubs
 

@@ -131,11 +131,17 @@ if torch.musa.is_available():
 else:
     print(f"Warning: torch.musa not available. Using default target: {mtgpu_target}")
 
-if mtgpu_target not in ["mp_22", "mp_31"]:
+if mtgpu_target not in ["mp_22", "mp_31", "mp_42"]:
     print(
         f"Warning: Unsupported GPU architecture detected '{mtgpu_target}'. Expected 'mp_22' or 'mp_31'."
     )
     sys.exit(1)
+
+# mp_42 does not currently implement __musa_barrier_slc, which is required by
+# the legacy custom allreduce kernel. Exclude that translation unit and disable
+# its registrations until the vendor toolchain provides the primitive.
+if mtgpu_target == "mp_42":
+    sources.remove("csrc/allreduce/custom_all_reduce.cu")
 
 mcc_flags = [
     "-DNDEBUG",
@@ -156,6 +162,9 @@ mcc_flags = [
     "-DFLASHINFER_ENABLE_F16",
     "-DFLASHINFER_ENABLE_BF16",
 ]
+
+if mtgpu_target == "mp_42":
+    mcc_flags.append("-DSGLANG_MUSA_DISABLE_CUSTOM_AR")
 
 if mtgpu_target == "mp_31":
     mcc_flags.extend(
@@ -188,18 +197,28 @@ class _CustomBuildExt(BuildExtension):
 
     @staticmethod
     def _clone_and_checkout(repo_path, repo_url, git_tag, git_shallow):
-        """Clone a git repository and checkout a specific tag/commit."""
+        """Clone a third-party repository only when it is not already present.
+
+        The MUSA build reuses the checked-out sources under ``build/_deps``.
+        Avoid fetching from the network on every rebuild; callers can remove the
+        repository directory or set ``SGLANG_MUSA_UPDATE_THIRD_PARTY=1`` when
+        they explicitly want to refresh it.
+        """
         repo_path.parent.mkdir(parents=True, exist_ok=True)
-        if not repo_path.exists():
-            clone_cmd = ["git", "clone"]
-            if git_shallow:
-                clone_cmd += ["--depth", "1"]
-            clone_cmd += [repo_url, str(repo_path)]
-            subprocess.check_call(clone_cmd)
-            subprocess.check_call(["git", "checkout", git_tag], cwd=repo_path)
-        else:
+        if repo_path.exists():
+            if os.environ.get("SGLANG_MUSA_UPDATE_THIRD_PARTY", "0") != "1":
+                print(f"Reusing existing third-party repository: {repo_path}")
+                return
             subprocess.check_call(["git", "fetch", "--all"], cwd=repo_path)
             subprocess.check_call(["git", "checkout", git_tag], cwd=repo_path)
+            return
+
+        clone_cmd = ["git", "clone"]
+        if git_shallow:
+            clone_cmd += ["--depth", "1"]
+        clone_cmd += [repo_url, str(repo_path)]
+        subprocess.check_call(clone_cmd)
+        subprocess.check_call(["git", "checkout", git_tag], cwd=repo_path)
 
     def run(self):
         if os.environ.get("SGLANG_MUSA_SKIP_THIRD_PARTY", "0") == "1":

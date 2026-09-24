@@ -18,9 +18,12 @@ ARG DEBIAN_FRONTEND=noninteractive
 ARG MUSA_APT_SOURCE=https://dl.mthreads.com/repo/repository/ubuntu2204/
 ARG MUSA_PIP_INDEX_URL=https://dl.mthreads.com/repo/api/pypi/pypi/simple
 ARG PYPI_INDEX_URL=https://pypi.org/simple
+ARG MTGPU_TARGET=mp_42
+ARG MATE_MUSA_ARCH=4.2
 
 ENV MUSA_HOME=/usr/local/musa \
-    MATE_MUSA_ARCH_LIST=3.1 \
+    MATE_MUSA_ARCH_LIST=${MATE_MUSA_ARCH} \
+    SGLANG_MUSA_DISABLE_CUSTOM_AR=1 \
     PATH=/usr/local/musa/bin:/usr/local/musa/mudnn/bin:${PATH} \
     LD_LIBRARY_PATH=/usr/local/musa/lib:/usr/local/musa/mudnn/lib:/usr/local/mtshmem/lib:/usr/local/lib \
     TORCH_EXTENSIONS_DIR=/root/.cache/torch_extensions \
@@ -111,7 +114,7 @@ RUN cp python/pyproject_other.toml python/pyproject.toml \
 
 RUN cd python/sglang/kernels/aot \
     && cp pyproject_musa.toml pyproject.toml \
-    && MTGPU_TARGET=mp_31 python setup_musa.py install
+    && MTGPU_TARGET=${MTGPU_TARGET} python setup_musa.py install
 
 # Keep this check in a single shell command: the legacy Docker builder does not
 # reliably preserve Dockerfile heredocs and can turn the check into a silent

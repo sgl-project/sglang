@@ -20,6 +20,7 @@ limitations under the License.
 #include "torch_musa/csrc/aten/musa/MUSAContext.h"
 
 TORCH_LIBRARY_EXPAND(sgl_kernel, m) {
+#ifndef SGLANG_MUSA_DISABLE_CUSTOM_AR
   /*
    * From csrc/allreduce
    */
@@ -38,7 +39,7 @@ TORCH_LIBRARY_EXPAND(sgl_kernel, m) {
       "all_reduce(int fa, Tensor inp, Tensor! out, int reg_buffer, "
       "int reg_buffer_sz_bytes) -> ()");
   m.impl("all_reduce", torch::kMUSA, &all_reduce);
-
+#endif
   /*
    * From csrc/attention
    */
