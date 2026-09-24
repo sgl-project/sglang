@@ -79,6 +79,17 @@ def skip_low_ratio_indexer(compress_ratio: int) -> bool:
     )
 
 
+def skip_candidate_filtering() -> bool:
+    """Whether the captured candidate variant serves only contexts inside the
+    candidate window, where every block is a candidate and the candidate layers
+    select like dense ones."""
+    return _capture_attention_variant in (
+        "candidate_all",
+        "candidate_c2_all",
+        "candidate_unfiltered",
+    )
+
+
 def _set_capture_attention_variant(variant: Optional[str]) -> None:
     global _capture_attention_variant
     _capture_attention_variant = variant
