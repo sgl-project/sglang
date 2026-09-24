@@ -9,7 +9,6 @@ from sglang.kernels.jit.utils import cache_once, load_jit
 from sglang.srt.utils import is_xpu
 from sglang.srt.utils.custom_op import register_custom_op
 
-# cuda also has same name for the symbol, but we gate on the device at runtime
 _fused_qk_norm_rope_xpu = None
 if is_xpu():
     try:
@@ -130,7 +129,6 @@ def can_use_fused_qk_norm_rope(
         logger.warning(f"Unsupported dtype={dtype} for JIT fused_qk_norm_rope kernel")
         return False
     if _fused_qk_norm_rope_xpu is not None:
-        # AOT on XPU: the kernel ships prebuilt, so there is nothing to compile.
         return True
     try:
         _jit_fused_qknorm_rope_module(head_dim, is_neox, yarn)
