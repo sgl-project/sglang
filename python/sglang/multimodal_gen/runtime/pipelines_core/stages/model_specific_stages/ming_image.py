@@ -7,7 +7,10 @@ import numpy as np
 import torch
 from PIL import Image
 from torchvision.transforms.functional import pil_to_tensor, to_tensor
-from transformers.models.qwen2_vl.image_processing_qwen2_vl import Qwen2VLImageProcessor
+from transformers.models.qwen2_vl.image_processing_pil_qwen2_vl import (
+    Qwen2VLImageProcessorPil,
+    smart_resize,
+)
 
 from sglang.multimodal_gen.configs.pipeline_configs.ming_image import (
     MingImageLayerPipelineConfig,
@@ -29,7 +32,7 @@ from sglang.multimodal_gen.runtime.utils.vision import load_image
 class MingImageEncodingStage(TextEncodingStage):
     def __init__(self, text_encoders, tokenizers):
         super().__init__(text_encoders, tokenizers)
-        self.image_processor = Qwen2VLImageProcessor.from_pretrained(
+        self.image_processor = Qwen2VLImageProcessorPil.from_pretrained(
             tokenizers[0].name_or_path
         )
 
@@ -84,20 +87,9 @@ class MingImageEncodingStage(TextEncodingStage):
                 int(image.width * ratio),
                 int(image.height * ratio),
             )
-            vh, vw = image.height, image.width
-            h0, w0 = max(28, round(vh / 28) * 28), max(28, round(vw / 28) * 28)
-            if h0 * w0 > 1024 * 28 * 28:
-                scale = math.sqrt(vh * vw / (1024 * 28 * 28))
-                h0, w0 = (
-                    math.floor(vh / scale / 28) * 28,
-                    math.floor(vw / scale / 28) * 28,
-                )
-            elif h0 * w0 < 56 * 56:
-                scale = math.sqrt(56 * 56 / (vh * vw))
-                h0, w0 = (
-                    math.ceil(vh * scale / 28) * 28,
-                    math.ceil(vw * scale / 28) * 28,
-                )
+            h0, w0 = smart_resize(
+                image.height, image.width, min_pixels=56 * 56, max_pixels=1024 * 28 * 28
+            )
             processed = self.image_processor(
                 images=image.convert("RGB").resize((w0, h0)), return_tensors="pt"
             )

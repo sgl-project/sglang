@@ -90,8 +90,9 @@ def test_repeated_generation_and_editing(diffusion_server, case):
                     assert image.mode == "RGBA"
                     assert image.size == (512, 512)
                     pixels = np.array(image)
-                    assert pixels[..., :3].std() > 5
                     images.append(pixels)
+            # a decomposed background layer can legitimately be a solid color
+            assert max(pixels[..., :3].std() for pixels in images) > 5
             if first is not None:
                 for actual, expected in zip(images, first, strict=True):
                     np.testing.assert_array_equal(actual, expected)
