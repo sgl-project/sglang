@@ -37,7 +37,6 @@ class TestCPUGraph(CustomTestCase):
             "2",
         ],
         min_throughput=7,
-        single_numa_node=True,
     )
     def test_latency_torch_compile_cpu(self):
         return DEFAULT_MLA_MODEL_NAME_FOR_TEST
