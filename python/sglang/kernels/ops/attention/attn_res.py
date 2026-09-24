@@ -103,7 +103,7 @@ _COMM_MAP: dict[int, Communicator] = {}
 
 def register_comm(comm: Communicator) -> None:
     # One communicator per world_size per process -- see the note in
-    # kimi_k3/all_reduce.py::register_comm. The ops key only on world_size, so an
+    # communication/all_reduce_residual.py::register_comm. The ops key only on world_size, so an
     # overwrite here would hand the old group's callers the new group's peer
     # pointers.
     prev = _COMM_MAP.get(comm.world_size)
