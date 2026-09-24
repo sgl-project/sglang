@@ -660,7 +660,7 @@ class BailingMoEBlock(nn.Module):
         self.attn_tp_rank = get_parallel().attn_tp_rank
 
         self.is_layer_sparse = self._is_layer_sparse(
-            config, layer_id=layer_id, is_nextn=False
+            config, layer_id=layer_id, is_nextn=is_nextn
         )
         is_previous_layer_sparse = self._is_layer_sparse(
             config, layer_id=layer_id - 1, is_nextn=False

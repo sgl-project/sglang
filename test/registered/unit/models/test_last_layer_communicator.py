@@ -227,6 +227,19 @@ class TestLastLayerCommunicator(CustomTestCase):
                 _, planned, _ = build(case, num_layers, layer_id, is_nextn=True)
                 self.assertEqual((planned["layer_id"], planned["num_layers"]), (0, 1))
 
+    def test_bailing_draft_layer_builds_an_moe(self):
+        """The Bailing V2 NextN checkpoint holds expert weights, so the NextN
+        layer builds the sparse MoE block, also when the model's first layers
+        are dense."""
+        config = bailing_moe_config(NUM_LAYERS)
+        config.first_k_dense_replace = 1
+        _, planned, built = build(
+            "bailing_moe", NUM_LAYERS, 0, config=config, is_nextn=True
+        )
+        self.assertIn("BailingMoESparseMoeBlock", built)
+        self.assertNotIn("BailingMoEMLP", built)
+        self.assertTrue(planned["is_layer_sparse"])
+
     def test_bailing_hybrid_draft_layer_is_planned_as_sparse(self):
         """The Bailing hybrid NextN layer builds an MoE, so its layout plan is
         that of a sparse layer, also when the model's first layers are dense."""
