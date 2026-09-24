@@ -3086,7 +3086,13 @@ class Scheduler(
                 self._add_request_to_queue(req)
                 return
 
-        if get_parallel().pp_rank == 0 and getattr(
+        if self.enable_unified_cache_external_linker and get_parallel().pp_size > 1:
+            req.external_cache_hit_length = recv_req.external_cache_hit_length
+            if get_parallel().pp_rank == 0:
+                # The existing PP request handoff carries this query result.
+                req.init_next_round_input(self.tree_cache, cow_mamba=False)
+                recv_req.external_cache_hit_length = req.external_cache_hit_length
+        elif get_parallel().pp_rank == 0 and getattr(
             self.tree_cache.cache_controller, "pp_prefetch_command_group", None
         ):
             recv_req.pp_prefetch_ticketed = bool(self._prefetch_kvcache(req))
