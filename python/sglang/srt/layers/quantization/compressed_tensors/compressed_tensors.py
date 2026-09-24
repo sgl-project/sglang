@@ -46,6 +46,7 @@ from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsW4A4Nvfp4MoE,
     CompressedTensorsW4A16Fp4,
     CompressedTensorsW4A16Mxfp4,
+    CompressedTensorsW4A16Mxfp4MoE,
     CompressedTensorsW4A16Nvfp4MoE,
     CompressedTensorsW4AFP8MoE,
     CompressedTensorsW8A8Fp8,
@@ -231,8 +232,14 @@ class CompressedTensorsConfig(QuantizationConfig):
             # handles all MoE backends, bypassing the scheme abstraction.
             # On NPU the dedicated Mxfp4MoEMethod does not apply, so fall
             # through to the scheme-based path and let get_moe_scheme select
-            # NPUCompressedTensorsW4A8mxfp4MoE.
-            if self._is_mxfp4_moe(layer_name=prefix) and not _is_npu:
+            # NPUCompressedTensorsW4A8mxfp4MoE. A model that keeps the
+            # `weight_packed` expert names falls through too: Mxfp4MoEMethod
+            # registers the fused `w13_weight`/`w2_weight` instead.
+            if (
+                self._is_mxfp4_moe(layer_name=prefix)
+                and layer.serves_fused_mxfp4
+                and not _is_npu
+            ):
                 from sglang.srt.layers.quantization.mxfp4 import Mxfp4MoEMethod
 
                 logger.info_once(
@@ -976,6 +983,18 @@ class CompressedTensorsConfig(QuantizationConfig):
                 ):
                     logger.info_once("Using NPUCompressedTensorsW4A16Int4DynamicMoE")
                     return NPUCompressedTensorsW4A16Int4DynamicMoE(self)
+        elif self._is_mxfp4_linear(weight_quant):
+            if input_quant is not None:
+                # MXFP4 has no FP4-activation MoE kernel in tree; the Marlin
+                # path is weight-only and the input global scales are dropped.
+                logger.warning_once(
+                    "MXFP4 w4a4 MoE is served weight-only via FP4 Marlin. "
+                    "Activation quantization is ignored."
+                )
+            logger.info_once("Using CompressedTensorsW4A16Mxfp4MoE")
+            return CompressedTensorsW4A16Mxfp4MoE(
+                has_input_global_scale=input_quant is not None
+            )
         elif self._is_fp4a16_nvfp4(weight_quant, input_quant):
             logger.info_once("Using CompressedTensorsW4A16Nvfp4MoE")
             return CompressedTensorsW4A16Nvfp4MoE()

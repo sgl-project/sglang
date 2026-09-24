@@ -25,6 +25,7 @@ from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import
 )
 from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsW4A4Nvfp4MoE,
+    CompressedTensorsW4A16Mxfp4MoE,
     CompressedTensorsW4A16Nvfp4MoE,
     CompressedTensorsW8A8Fp8MoE,
 )
@@ -39,6 +40,14 @@ NVFP4_WEIGHTS = {
     "symmetric": True,
     "strategy": "tensor_group",
     "group_size": 16,
+    "dynamic": False,
+}
+MXFP4_WEIGHTS = {
+    "num_bits": 4,
+    "type": "float",
+    "symmetric": True,
+    "strategy": "group",
+    "group_size": 32,
     "dynamic": False,
 }
 INT4_WEIGHTS = {
@@ -135,6 +144,43 @@ class TestFp4MoeSchemeSelection(CustomTestCase):
                 scheme = _get_moe_scheme(_make_config(quant_format, weights), (9, 0))
                 self.assertIsNotNone(scheme)
 
+    def test_mxfp4a16_selects_weight_only_mxfp4_scheme(self):
+        scheme = _get_moe_scheme(
+            _make_config("mxfp4-pack-quantized", MXFP4_WEIGHTS), (9, 0)
+        )
+        self.assertIsInstance(scheme, CompressedTensorsW4A16Mxfp4MoE)
+        self.assertEqual(scheme.group_size, 32)
+        self.assertFalse(scheme.has_input_global_scale)
+
+    def test_mxfp4_w4a4_is_served_weight_only(self):
+        """MXFP4 has no FP4-activation MoE kernel in tree, so w4a4 is served
+        weight-only on every capability -- unlike NVFP4, which has an SM100
+        native path."""
+        for capability in ((9, 0), (10, 0)):
+            with self.subTest(capability=capability):
+                scheme = _get_moe_scheme(
+                    _make_config(
+                        "mxfp4-pack-quantized",
+                        MXFP4_WEIGHTS,
+                        dict(MXFP4_WEIGHTS, dynamic=True),
+                    ),
+                    capability,
+                )
+                self.assertIsInstance(scheme, CompressedTensorsW4A16Mxfp4MoE)
+                self.assertTrue(scheme.has_input_global_scale)
+
+    def test_mxfp4_and_nvfp4_predicates_do_not_overlap(self):
+        """Both are fp4 group quant; only group_size and strategy separate them,
+        so a widened predicate would silently steal the other's checkpoints."""
+        mxfp4 = _get_moe_scheme(
+            _make_config("mxfp4-pack-quantized", MXFP4_WEIGHTS), (9, 0)
+        )
+        nvfp4 = _get_moe_scheme(
+            _make_config("nvfp4-pack-quantized", NVFP4_WEIGHTS), (9, 0)
+        )
+        self.assertIsInstance(mxfp4, CompressedTensorsW4A16Mxfp4MoE)
+        self.assertIsInstance(nvfp4, CompressedTensorsW4A16Nvfp4MoE)
+
     def test_fp8_w8a8_moe_still_selects_fp8(self):
         """Guards the None-guard additions to the w8a8 predicates against
         regressing the path they were written for."""
@@ -201,6 +247,62 @@ class TestWeightOnlyNvfp4MoeWeightCreation(CustomTestCase):
         layer, _ = self._create(has_input_global_scale=True)
         self.assertEqual(layer.w13_input_global_scale.shape, (8, 2))
         self.assertEqual(layer.w2_input_global_scale.shape, (8,))
+
+
+class TestWeightOnlyMxfp4MoeWeightCreation(CustomTestCase):
+    """MXFP4 differs from NVFP4 in group size, scale dtype and the absence of a
+    weight global scale; each is a contract with the checkpoint's tensors."""
+
+    def _create(self, has_input_global_scale=False):
+        layer = torch.nn.Module()
+        scheme = CompressedTensorsW4A16Mxfp4MoE(
+            has_input_global_scale=has_input_global_scale
+        )
+        scheme.create_weights(
+            layer=layer,
+            num_experts=8,
+            hidden_size=2048,
+            intermediate_size_per_partition=1536,
+            params_dtype=torch.bfloat16,
+            weight_loader=lambda *args, **kwargs: None,
+        )
+        return layer, scheme
+
+    def test_registered_parameters_match_checkpoint_layout(self):
+        layer, _ = self._create()
+        self.assertEqual(layer.w13_weight_packed.shape, (8, 3072, 1024))
+        self.assertEqual(layer.w13_weight_packed.dtype, torch.uint8)
+        self.assertEqual(layer.w2_weight_packed.shape, (8, 2048, 768))
+        # One E8M0 scale per 32 input elements, half as many as NVFP4's gs=16.
+        self.assertEqual(layer.w13_weight_scale.shape, (8, 3072, 64))
+        self.assertEqual(layer.w2_weight_scale.shape, (8, 2048, 48))
+
+    def test_scales_are_raw_uint8_exponent_bytes(self):
+        """The checkpoint stores E8M0 exponents with no float8 dtype attached;
+        converting rather than reinterpreting them reads exponents as small
+        integers and silently produces garbage."""
+        layer, _ = self._create()
+        self.assertEqual(layer.w13_weight_scale.dtype, torch.uint8)
+        self.assertEqual(layer.w2_weight_scale.dtype, torch.uint8)
+
+    def test_no_weight_global_scale_is_registered(self):
+        """MXFP4's E8M0 scales are absolute powers of two, so the checkpoint
+        ships no outer scale; registering one would claim a missing tensor."""
+        layer, _ = self._create()
+        self.assertFalse(hasattr(layer, "w13_weight_global_scale"))
+        self.assertFalse(hasattr(layer, "w2_weight_global_scale"))
+
+    def test_w4a4_checkpoint_gets_an_input_scale_destination(self):
+        """The Marlin kernel never reads it, but granitemoe_load_split_experts
+        raises KeyError on a tensor with no registered param."""
+        layer, _ = self._create(has_input_global_scale=True)
+        self.assertEqual(layer.w13_input_global_scale.shape, (8, 2))
+        self.assertEqual(layer.w2_input_global_scale.shape, (8,))
+
+    def test_a16_checkpoint_registers_no_input_scale(self):
+        layer, _ = self._create()
+        self.assertFalse(hasattr(layer, "w13_input_global_scale"))
+        self.assertFalse(hasattr(layer, "w2_input_global_scale"))
 
 
 if __name__ == "__main__":
