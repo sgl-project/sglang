@@ -409,23 +409,55 @@ class Flux3ActionPreprocessStage(PipelineStage):
         return batch
 
 
-class Flux3ActionConditioningStage(PipelineStage):
-    """Text contexts (cached per caption), VAE-encoded frame and state -> conditioning streams."""
+class Flux3ActionTextEncodingStage(PipelineStage):
+    """Prompt (and CFG negative) -> DiT-encoded text contexts, cached per caption."""
 
     def __init__(
         self,
         config: Flux3ActionPipelineConfig,
         transformer: Flux3Transformer,
-        vae: Flux3VideoVAE,
         text_encoder: Flux3TextEncoder,
     ):
         super().__init__()
         self.config = config
         self.transformer = transformer
-        self.vae = vae
         self.text_encoder = text_encoder
         self._contexts: OrderedDict[str, Flux3SegmentState] = OrderedDict()
         self._cached_tokens = 0
+
+    def component_uses(
+        self, server_args: ServerArgs, stage_name: str | None = None
+    ) -> list[ComponentUse]:
+        stage_name = self._component_stage_name(stage_name)
+        # Contexts are cached per caption: both components run only on a miss.
+        return [
+            ComponentUse(
+                stage_name=stage_name,
+                component_name=name,
+                allow_prefetch=False,
+                start_at_stage_entry=False,
+            )
+            for name in ("text_encoder", "transformer")
+        ]
+
+    def _encode(self, captions: list[str], device: torch.device) -> dict:
+        with self.use_declared_component(
+            component_name="text_encoder", module=self.text_encoder
+        ):
+            # One caption per forward: batching changes bf16 GEMM results.
+            encoded = [self.text_encoder.encode([c])[0] for c in captions]
+        contexts = {}
+        with (
+            self.use_declared_component(
+                component_name="transformer", module=self.transformer
+            ),
+            set_forward_context(current_timestep=0, attn_metadata=None),
+        ):
+            for caption, ctx in zip(captions, encoded):
+                contexts[caption] = self.transformer.encode_context(
+                    ctx=ctx.to(device), ctx_ids=text_ids(ctx.shape[1]).to(device)
+                )
+        return contexts
 
     def _contexts_for(
         self, captions: list[str], device: torch.device, *, use_cache: bool
@@ -433,19 +465,7 @@ class Flux3ActionConditioningStage(PipelineStage):
         """DiT-encoded text contexts of ``captions`` and whether all were cached."""
         cached = self._contexts if use_cache else {}
         todo = [c for c in dict.fromkeys(captions) if c not in cached]
-        fresh = {}
-        if todo:
-            # The residency manager places the encoder (e.g. --text-encoder-cpu-offload).
-            with self.use_declared_component(
-                component_name="text_encoder", module=self.text_encoder
-            ):
-                # One caption per forward: batching changes bf16 GEMM results.
-                encoded = [self.text_encoder.encode([c])[0] for c in todo]
-            for caption, ctx in zip(todo, encoded):
-                with set_forward_context(current_timestep=0, attn_metadata=None):
-                    fresh[caption] = self.transformer.encode_context(
-                        ctx.to(device), text_ids(ctx.shape[1]).to(device)
-                    )
+        fresh = self._encode(todo, device) if todo else {}
         contexts = [fresh.get(c) or cached[c] for c in captions]
         if use_cache:
             self._remember(captions, fresh)
@@ -466,49 +486,8 @@ class Flux3ActionConditioningStage(PipelineStage):
             _, evicted = self._contexts.popitem(last=False)
             self._cached_tokens -= evicted.length
 
-    def component_uses(
-        self, server_args: ServerArgs, stage_name: str | None = None
-    ) -> list[ComponentUse]:
-        return [
-            # Contexts are cached per caption: load the encoder only on a cache miss.
-            ComponentUse(
-                stage_name=self._component_stage_name(stage_name),
-                component_name="text_encoder",
-                allow_prefetch=False,
-                start_at_stage_entry=False,
-            )
-        ]
-
-    def _conditioning_streams(
-        self, observation: Flux3ActionObservation, device: torch.device
-    ) -> list[Flux3SegmentState]:
-        cfg = self.config
-        h, w = cfg.latent_hw
-        frame = observation.canvas.to(device, torch.bfloat16)[None]
-        latent = self.vae.encode_frame(frame)[..., :h, :w]
-        video, video_ids = pack_video(latent, first_frame=0, fps=cfg.fps)
-        flipped = _flip_gripper(observation.state, dims=cfg.gripper_flip_dims)
-        token = normalize(
-            flipped, stats=cfg.state_normalization, clip=cfg.normalization_clip
-        )
-        state_values = (token[None, :, None] * cfg.action_scale).to(device)
-        state, state_ids = pack_action(state_values, seconds=torch.zeros(1))
-        zero = torch.zeros(1, device=device)
-        with set_forward_context(current_timestep=0, attn_metadata=None):
-            return [
-                self.transformer.encode_stream(
-                    name="video_cond", x=video, ids=video_ids.to(device), timesteps=zero
-                ),
-                self.transformer.encode_stream(
-                    name=f"{cfg.action_modality}_cond",
-                    x=state,
-                    ids=state_ids.to(device),
-                    timesteps=zero,
-                ),
-            ]
-
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
-        device = get_local_torch_device()
+        start = time.perf_counter()
         state = vla_state(batch)
         observation: Flux3ActionObservation = state["flux3_observation"]
         options = vla_options(batch)
@@ -518,23 +497,88 @@ class Flux3ActionConditioningStage(PipelineStage):
         captions = [observation.prompt]
         if any(g != 1.0 for g in guidance.values()):
             captions.append("")
-        start = time.perf_counter()
         use_cache = bool(options.get("enable_prefix_cache", True))
         state["flux3_contexts"], hit = self._contexts_for(
-            captions, device, use_cache=use_cache
+            captions, get_local_torch_device(), use_cache=use_cache
         )
+        state["flux3_guidance"] = guidance
         state["cache"] = {
             "enabled": use_cache,
             "hit": hit,
             "scope": "caption",
             "mode": "exact",
         }
-        text_done = time.perf_counter()
-        state["flux3_conditioning"] = self._conditioning_streams(observation, device)
-        state["flux3_guidance"] = guidance
-        timings = vla_timings(batch)
-        timings["text_ms"] = (text_done - start) * 1000
-        timings["conditioning_ms"] = (time.perf_counter() - text_done) * 1000
+        vla_timings(batch)["text_ms"] = (time.perf_counter() - start) * 1000
+        return batch
+
+
+class Flux3ActionObservationEncodingStage(PipelineStage):
+    """Observed frame (VAE) and robot state -> DiT-encoded conditioning streams."""
+
+    def __init__(
+        self,
+        config: Flux3ActionPipelineConfig,
+        transformer: Flux3Transformer,
+        vae: Flux3VideoVAE,
+    ):
+        super().__init__()
+        self.config = config
+        self.transformer = transformer
+        self.vae = vae
+
+    def component_uses(
+        self, server_args: ServerArgs, stage_name: str | None = None
+    ) -> list[ComponentUse]:
+        stage_name = self._component_stage_name(stage_name)
+        return [
+            ComponentUse(stage_name=stage_name, component_name="vae"),
+            ComponentUse(
+                stage_name=stage_name,
+                component_name="transformer",
+                start_at_stage_entry=False,
+            ),
+        ]
+
+    def _state_tokens(self, state: torch.Tensor, device: torch.device):
+        cfg = self.config
+        flipped = _flip_gripper(state, dims=cfg.gripper_flip_dims)
+        token = normalize(
+            flipped, stats=cfg.state_normalization, clip=cfg.normalization_clip
+        )
+        values = (token[None, :, None] * cfg.action_scale).to(device)
+        return pack_action(values, seconds=torch.zeros(1))
+
+    def forward(self, batch: Req, server_args: ServerArgs) -> Req:
+        start = time.perf_counter()
+        cfg = self.config
+        device = get_local_torch_device()
+        state = vla_state(batch)
+        observation: Flux3ActionObservation = state["flux3_observation"]
+        h, w = cfg.latent_hw
+        with self.use_declared_component(component_name="vae", module=self.vae):
+            frame = observation.canvas.to(device, torch.bfloat16)[None]
+            latent = self.vae.encode_frame(frame)[..., :h, :w]
+        video, video_ids = pack_video(latent, first_frame=0, fps=cfg.fps)
+        action, action_ids = self._state_tokens(observation.state, device)
+        zero = torch.zeros(1, device=device)
+        with (
+            self.use_declared_component(
+                component_name="transformer", module=self.transformer
+            ),
+            set_forward_context(current_timestep=0, attn_metadata=None),
+        ):
+            state["flux3_conditioning"] = [
+                self.transformer.encode_stream(
+                    name="video_cond", x=video, ids=video_ids.to(device), timesteps=zero
+                ),
+                self.transformer.encode_stream(
+                    name=f"{cfg.action_modality}_cond",
+                    x=action,
+                    ids=action_ids.to(device),
+                    timesteps=zero,
+                ),
+            ]
+        vla_timings(batch)["observation_ms"] = (time.perf_counter() - start) * 1000
         return batch
 
 
@@ -551,6 +595,19 @@ class Flux3ActionDenoisingStage(PipelineStage):
         self.config = config
         self.transformer = transformer
         self.scheduler = scheduler
+
+    def component_uses(
+        self, server_args: ServerArgs, stage_name: str | None = None
+    ) -> list[ComponentUse]:
+        return [
+            ComponentUse(
+                stage_name=self._component_stage_name(stage_name),
+                component_name="transformer",
+                phase="denoise",
+                preferred_ready_after_request=True,
+                memory_intensive=True,
+            )
+        ]
 
     def _noised_streams(self, seed: int):
         cfg = self.config
@@ -627,13 +684,16 @@ class Flux3ActionDenoisingStage(PipelineStage):
                 for k in order
             }
 
-        result = cosmos_unipc(
-            samples,
-            predict,
-            scheduler=self.scheduler,
-            n_steps=steps,
-            shift=cfg.sampler_shift,
-        )
+        with self.use_declared_component(
+            component_name="transformer", module=self.transformer
+        ):
+            result = cosmos_unipc(
+                samples,
+                predict,
+                scheduler=self.scheduler,
+                n_steps=steps,
+                shift=cfg.sampler_shift,
+            )
         targets = result[cfg.action_modality][0].float() / cfg.action_scale
         actions = targets_to_actions(
             targets, state=observation.state.to(device), config=cfg

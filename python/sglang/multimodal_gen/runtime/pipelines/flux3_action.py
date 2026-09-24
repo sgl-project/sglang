@@ -37,9 +37,10 @@ from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import 
     ComposedPipelineBase,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.flux3_action import (
-    Flux3ActionConditioningStage,
     Flux3ActionDenoisingStage,
+    Flux3ActionObservationEncodingStage,
     Flux3ActionPreprocessStage,
+    Flux3ActionTextEncodingStage,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.vla import (
     VLAActionPostprocessStage,
@@ -172,13 +173,18 @@ class Flux3ActionPipeline(ComposedPipelineBase):
         transformer = self.get_module("transformer")
         self.add_stage(Flux3ActionPreprocessStage(config), "flux3_action_preprocess")
         self.add_stage(
-            Flux3ActionConditioningStage(
+            Flux3ActionTextEncodingStage(
                 config,
-                transformer,
-                self.get_module("vae"),
-                self.get_module("text_encoder"),
+                transformer=transformer,
+                text_encoder=self.get_module("text_encoder"),
             ),
-            "flux3_action_conditioning",
+            "flux3_action_text_encoding",
+        )
+        self.add_stage(
+            Flux3ActionObservationEncodingStage(
+                config, transformer=transformer, vae=self.get_module("vae")
+            ),
+            "flux3_action_observation_encoding",
         )
         self.add_stage(
             Flux3ActionDenoisingStage(
