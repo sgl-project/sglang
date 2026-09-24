@@ -81,6 +81,7 @@ from sglang.srt.layers.cp.cp_decode_attn_tp import get_cp_decode_attn_tp_ctx
 from sglang.srt.layers.dcp.planner import (
     prepare_decode_context_parallel_metadata,
 )
+from sglang.srt.layers.flashinfer_comm_fusion import uses_cutedsl_ar_fusion
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
@@ -575,6 +576,9 @@ class DeepseekV2MoE(nn.Module):
         self.moe_ep_size = get_parallel().moe_ep_size
         self.routed_scaling_factor = config.routed_scaling_factor
         self.n_shared_experts = config.n_shared_experts
+        self._deferred_finalize_max_tokens = (
+            envs.SGLANG_MOE_DEFERRED_FINALIZE_MAX_TOKENS.get()
+        )
 
         n_shared_experts = (
             0 if config.n_shared_experts is None else int(config.n_shared_experts)
@@ -924,14 +928,11 @@ class DeepseekV2MoE(nn.Module):
                 input_ids_global=input_ids_global,
             )
 
-        if _is_hip:
-            num_token_non_padded = None
-        else:
-            num_token_non_padded = (
-                forward_batch.moe_num_token_non_padded()
-                if forward_batch is not None
-                else None
-            )
+        num_token_non_padded = (
+            forward_batch.moe_num_token_non_padded()
+            if forward_batch is not None
+            else None
+        )
         if not self._enable_a2a_moe:
             if self._can_dual_stream_graph(hidden_states):
                 fwd = get_forward()
@@ -1064,6 +1065,10 @@ class DeepseekV2MoE(nn.Module):
             and not self._shared_expert_tp1
             and topk_output.format == TopKOutputFormat.BYPASSED
             and self.experts.supports_deferred_finalize
+            and (
+                self._deferred_finalize_max_tokens <= 0
+                or hidden_states.shape[0] <= self._deferred_finalize_max_tokens
+            )
         )
         if deferred_finalize:
             final_hidden_states = self.experts.forward_deferred_finalize(
@@ -1096,6 +1101,17 @@ class DeepseekV2MoE(nn.Module):
 
         # The routed-input pre-quant was already joined inside the routed MoE apply.
         current_stream.wait_stream(self.alt_stream)
+
+        if deferred_finalize and get_forward().defer_moe_finalize:
+            # deferred_finalize excludes _shared_expert_tp1, so the shared add folds in.
+            assert shared_output is not None
+            from sglang.srt.layers.moe.cutedsl_ar_fusion import MoeFinalizeHandoff
+
+            return MoeFinalizeHandoff.from_flashinfer(
+                final_hidden_states,
+                gated_shared_output=shared_output,
+                m=hidden_states.shape[0],
+            )
 
         all_reduce_done = False
         if deferred_finalize:
@@ -2485,6 +2501,10 @@ class DeepseekV2AttentionMLA(
             return quant_config
 
 
+def _use_mnnvl_cutedsl_fusion() -> bool:
+    return _is_cuda and uses_cutedsl_ar_fusion()
+
+
 class DeepseekV2DecoderLayer(nn.Module):
     def __init__(
         self,
@@ -2589,11 +2609,17 @@ class DeepseekV2DecoderLayer(nn.Module):
 
         self._gfx95_quant_format = self._detect_gfx95_quant_format()
 
-        communicator_cls = (
-            DSACPLayerCommunicator
-            if get_parallel().enable_prefill_cp
-            else LayerCommunicator
-        )
+        if get_parallel().enable_prefill_cp:
+            communicator_cls = DSACPLayerCommunicator
+        elif not is_nextn and _use_mnnvl_cutedsl_fusion():
+            # Dense layers too: selecting cutedsl turns the legacy fusion off.
+            from sglang.srt.layers.moe.cutedsl_ar_fusion import (
+                CuteDSLFusionLayerCommunicator,
+            )
+
+            communicator_cls = CuteDSLFusionLayerCommunicator
+        else:
+            communicator_cls = LayerCommunicator
         self.layer_communicator = communicator_cls(
             layer_scatter_modes=self.layer_scatter_modes,
             input_layernorm=self.input_layernorm,
@@ -2699,6 +2725,8 @@ class DeepseekV2DecoderLayer(nn.Module):
             isinstance(self.mlp, DeepseekV2MoE)
             and not self.mlp.experts.moe_runner_config.inplace
             and not torch.compiler.is_compiling()
+            # A deferred MoE finalize handoff from the previous layer is no buffer.
+            and isinstance(hidden_states_orig, torch.Tensor)
         ):
             from sglang.srt.layers.moe.moe_runner.base import moe_output_buffer_ctx
 
@@ -2920,6 +2948,34 @@ class DeepseekV2Model(nn.Module):
         # llama_4_scaling: for supporting Mistral-Large-3 model
         self.llama_4_scaling_config = getattr(config, "llama_4_scaling", None)
 
+        from sglang.srt.layers.moe.cutedsl_ar_fusion import install_cutedsl_fusion
+
+        install_cutedsl_fusion(
+            # PP pads self.layers with PPMissingLayer, which has no communicator.
+            # A stage's last layer has no successor, so it keeps its reduction.
+            self.layers[self.start_layer : self.end_layer],
+            hidden_size=config.hidden_size,
+            top_k=config.num_experts_per_tok,
+            rms_epsilon=config.rms_norm_eps,
+            # Only the dual-stream path hands off, which needs an unfused shared
+            # expert; with V3/R1's default shared-experts fusion only AR + norm fuse.
+            # A TP1 shared expert is added after the all-reduce and cannot move it.
+            can_defer_finalize=lambda layer: (
+                isinstance(layer.mlp, DeepseekV2MoE)
+                and layer.mlp.experts.supports_deferred_finalize
+                and layer.mlp.num_fused_shared_experts == 0
+                and not layer.mlp._shared_expert_tp1
+            ),
+            # A TP1-replicated output must not ride into the next layer's reduction.
+            requires_local_reduction=lambda layer: (
+                layer.mlp._shared_expert_tp1
+                if isinstance(layer.mlp, DeepseekV2MoE)
+                else layer.mlp.tp_size == 1
+            ),
+            final_norm_consumes_handoff=False,
+            label="DeepSeek-V3/GLM",
+        )
+
     def get_input_embeddings(self) -> torch.Tensor:
         return self.embed_tokens
 
@@ -3052,6 +3108,10 @@ class DeepseekV2Model(nn.Module):
                 zero_allocator=zero_allocator,
             )
 
+        last_layer = self.layers[self.end_layer - 1]
+        hidden_states, residual = last_layer.layer_communicator.finish_layer_stack(
+            hidden_states, residual, forward_batch
+        )
         if not self.pp_group.is_last_rank:
             proxy_tensors = {
                 "hidden_states": hidden_states,
@@ -3388,6 +3448,8 @@ def dsv2_flashinfer_moe_dual_stream_graph(
         fuse_mlp_allreduce=fuse_mlp_allreduce,
         mlp_reduce_scatter=mlp_reduce_scatter,
         flashinfer_trtllm_bypass=True,
+        # The op's Tensor schema cannot carry a MoeFinalizeHandoff.
+        defer_moe_finalize=False,
     ):
         return moe_fusion.forward_normal_dual_stream(hidden_states)
 

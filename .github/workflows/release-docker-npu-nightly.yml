@@ -1,4 +1,5 @@
 name: Release Docker Images Nightly (NPU)
+
 on:
   pull_request:
     branches:
@@ -8,25 +9,41 @@ on:
       - 'docker/npu.Dockerfile'
   workflow_dispatch:
   schedule:
-    - cron: "0 14 * * *" # Execute at 10:00 p.m. Beijing Time every day
-
+    - cron: "0 14 * * *"
 concurrency:
   group: ${{ github.workflow }}-${{ github.sha }}
   cancel-in-progress: true
 
 jobs:
   build:
-    runs-on: ubuntu-22.04-arm
+    name: build ${{ matrix.platform }}-${{ matrix.device_type }}
+    runs-on: ${{ matrix.runner }}
     strategy:
+      fail-fast: false
       matrix:
-        cann_version: ["9.0.0"]
-        device_type: ["910b", "a3"]
+        include:
+          - device_type: a3
+            cann_version: "9.1.0"
+            platform: amd64
+            runner: ubuntu-latest
+          - device_type: a3
+            cann_version: "9.1.0"
+            platform: arm64
+            runner: ubuntu-22.04-arm
+          - device_type: 950
+            cann_version: "9.1.0"
+            platform: amd64
+            runner: ubuntu-latest
+          - device_type: 950
+            cann_version: "9.1.0"
+            platform: arm64
+            runner: ubuntu-22.04-arm
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
       - name: Free up disk space
-        uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be # v1.3.1
+        uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be
         with:
           tool-cache: true
           docker-images: false
@@ -38,48 +55,64 @@ jobs:
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: |
-            lmsysorg/sglang
-          # push with schedule event
-          # push with workflow_dispatch event
+          images: lmsysorg/sglang
           tags: |
             type=ref,event=pr
             type=ref,event=branch
             type=schedule,pattern=main
           flavor: |
             latest=false
-            suffix=-cann${{ matrix.cann_version }}-${{ matrix.device_type }},onlatest=true
-      # Login against a Docker registry except on PR
-      # https://github.com/docker/login-action
-      - name: Log into docker hub
+            suffix=-cann${{ matrix.cann_version }}-${{ matrix.device_type }}-${{ matrix.platform }}
+
+      - name: Log into Docker Hub
         uses: docker/login-action@v3
         if: ${{ github.repository == 'sgl-project/sglang' && github.event_name != 'pull_request' }}
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      # Enable Docker multi-architecture build environment
-      # Emulate non-native architectures
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
-      # Required for building and pushing multi-arch Docker images
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      # Build and push Docker image with Buildx (don't push on PR)
-      # https://github.com/docker/build-push-action
       - name: Build and push Docker image
-        id: build-and-push
         uses: docker/build-push-action@v6
         with:
           context: docker
           file: docker/npu.Dockerfile
-          platforms: linux/arm64,linux/amd64
+          platforms: linux/${{ matrix.platform }}
           labels: ${{ steps.meta.outputs.labels }}
           tags: ${{ steps.meta.outputs.tags }}
-          push: ${{ github.repository == 'sgl-project/sglang' && github.event_name != 'pull_request' }}
+          outputs: ${{ github.repository == 'sgl-project/sglang' && github.event_name != 'pull_request' && 'type=registry,oci-mediatypes=false' || '' }}
           provenance: false
+          sbom: false
           build-args: |
             SGLANG_KERNEL_NPU_TAG=2026.9.0.post5
             CANN_VERSION=${{ matrix.cann_version }}
             DEVICE_TYPE=${{ matrix.device_type }}
+
+  merge:
+    name: merge multi-arch manifest
+    needs: build
+    if: ${{ github.repository == 'sgl-project/sglang' && github.event_name != 'pull_request' }}
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        cann_version: ["9.1.0"]
+        device_type: ["a3", "950"]
+    steps:
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log into Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Compute base image
+        run: |
+          echo "IMAGE=lmsysorg/sglang:${GITHUB_REF_NAME}-cann${{ matrix.cann_version }}-${{ matrix.device_type }}" >> "$GITHUB_ENV"
+
+      - name: Create multi-arch manifest
+        run: |
+          docker buildx imagetools create \
+            -t "${IMAGE}" \
+            "${IMAGE}-amd64" \
+            "${IMAGE}-arm64"
