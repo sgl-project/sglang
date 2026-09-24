@@ -423,10 +423,39 @@ class TestDeploymentConfig(unittest.TestCase):
                 _transformer_config(block)
             ).lidar_attends_captions
         )
+        self.assertFalse(
+            parse_multiview_deployment_config(
+                _transformer_config({**block, "control_attends_sensor": False})
+            ).control_attends_sensor
+        )
+        # The Sep-22 export renamed the caption-layout key; both spellings parse and
+        # a disagreement between them is an error.
+        renamed = {
+            k: v for k, v in block.items() if k != "separate_view_text_tokenization"
+        }
+        renamed["per_view_captions"] = True
+        self.assertTrue(
+            parse_multiview_deployment_config(
+                _transformer_config(renamed)
+            ).per_view_captions
+        )
+        with self.assertRaisesRegex(ValueError, "disagree"):
+            parse_multiview_deployment_config(
+                _transformer_config({**block, "per_view_captions": False})
+            )
+        with self.assertRaisesRegex(ValueError, "per_view_captions"):
+            parse_multiview_deployment_config(
+                _transformer_config(
+                    {
+                        k: v
+                        for k, v in block.items()
+                        if k != "separate_view_text_tokenization"
+                    }
+                )
+            )
         for field, value, message in (
             ("decomposed_temporal_window_seconds", 0.4, "temporal window"),
             ("attention_scope", "all_views", "all_views"),
-            ("control_attends_sensor", False, "control_attends_sensor"),
             ("lidar_attends_captions", "yes", "boolean"),
             ("schema_version", None, "schema_version=2"),
         ):
@@ -457,7 +486,7 @@ class TestDeploymentConfig(unittest.TestCase):
         )
         self.assertEqual(deployment.schema_version, 2)
         self.assertFalse(deployment.is_legacy)
-        self.assertTrue(deployment.separate_view_text_tokenization)
+        self.assertTrue(deployment.per_view_captions)
         self.assertTrue(deployment.variable_view_count)
         self.assertTrue(deployment.supports_lidar)
         self.assertIsNone(deployment.decomposed_temporal_window_seconds)
@@ -1142,7 +1171,9 @@ def _maskless_oracle(q, k, v, k_und, v_und, layout, *, count_once=False):
         starts.append(starts[-1] + length)
     for qi, (q_axis, q_view, q_control, q_instant) in enumerate(rows):
         for ki, (k_axis, k_view, k_control, k_instant) in enumerate(rows):
-            if (q_axis, q_view) == (k_axis, k_view):
+            if (q_axis, q_view) == (k_axis, k_view) and (
+                layout.control_attends_sensor or not q_control or k_control
+            ):
                 counts[qi, und + ki] += 1
             if (
                 fold_instants
@@ -1217,9 +1248,9 @@ class TestMasklessAttention(unittest.TestCase):
             "all_views",
             maskless_unavailable_reason(**{**ok, "attention_scope": "all_views"}),
         )
-        self.assertIn(
-            "control_attends_sensor",
-            maskless_unavailable_reason(**{**ok, "control_attends_sensor": False}),
+        # control_attends_sensor is expressed by the split same-view pass, not refused.
+        self.assertIsNone(
+            maskless_unavailable_reason(**{**ok, "control_attends_sensor": False})
         )
         with self.assertRaisesRegex(ValueError, "temporal window"):
             build_multiview_maskless_plan(
@@ -1274,6 +1305,38 @@ class TestMasklessAttention(unittest.TestCase):
         self.assertEqual(plan.caption_q_gather.tolist(), list(range(16)))
         self.assertIsNone(plan.caption_kv_gather)
         self.assertEqual(plan.caption_kv_offsets.tolist(), [0, 5])
+
+    def test_control_attends_sensor_false_splits_the_same_view_pass(self):
+        # Sensor queries keep the whole view group; control queries see only their
+        # view's control tokens. One varlen call, two segments per group.
+        layout = MultiviewLayout(
+            num_views=2,
+            latent_frames=2,
+            patch_height=1,
+            patch_width=1,
+            control_attends_sensor=False,
+            items=(
+                MaskItem((2, 1, 1), 2, is_control=True),
+                MaskItem((2, 1, 1), 2),
+            ),
+        )
+        plan = build_multiview_maskless_plan(
+            layout, und_tokens=3, batch_size=1, device=torch.device("cpu")
+        )
+        # Packed [C0 C1 | W0 W1]: sensor segments (W0 -> {W0, C0}), (W1 -> {W1, C1}),
+        # then control segments (C0 -> {C0}), (C1 -> {C1}).
+        self.assertEqual(plan.same_view_q_gather.tolist(), [2, 3, 0, 1])
+        self.assertEqual(plan.same_view_q_offsets.tolist(), [0, 1, 2, 3, 4])
+        self.assertEqual(plan.same_view_kv_gather.tolist(), [2, 0, 3, 1, 0, 1])
+        self.assertEqual(plan.same_view_kv_offsets.tolist(), [0, 2, 4, 5, 6])
+        # With the flag on, the pass is keyed by the plain partition.
+        on = build_multiview_maskless_plan(
+            msgspec.structs.replace(layout, control_attends_sensor=True),
+            und_tokens=3,
+            batch_size=1,
+            device=torch.device("cpu"),
+        )
+        self.assertIsNone(on.same_view_kv_gather)
 
     def test_single_camera_without_lidar_skips_the_instant_fold(self):
         layout = MultiviewLayout(
@@ -1366,6 +1429,21 @@ class TestMasklessAttention(unittest.TestCase):
         )
         self._run(
             self._joint_layout(caption_lengths=()), cpu, torch.float32, 1e-5, 1e-5
+        )
+        self._run(
+            self._joint_layout(control_attends_sensor=False),
+            cpu,
+            torch.float32,
+            1e-5,
+            1e-5,
+        )
+        self._run(
+            self._joint_layout(control_attends_sensor=False),
+            cpu,
+            torch.float32,
+            1e-5,
+            1e-5,
+            batch_size=2,
         )
         camera_only = MultiviewLayout(
             num_views=3,

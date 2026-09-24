@@ -178,7 +178,9 @@ class Cosmos3MultiviewDeploymentConfig(msgspec.Struct, frozen=True):
     share_vision_temporal_positions: bool
     backend: str
     schema_version: int | None = None
-    separate_view_text_tokenization: bool = False
+    #: One caption per camera (the export's ``per_view_captions``; older exports
+    #: spelled it ``separate_view_text_tokenization``).
+    per_view_captions: bool = False
     variable_view_count: bool = False
     inference_defaults: dict[str, Any] | None = None
     lidar: dict[str, Any] | None = None
@@ -206,6 +208,33 @@ class Cosmos3MultiviewDeploymentConfig(msgspec.Struct, frozen=True):
             return fallback
         value = self.inference_defaults.get(name)
         return fallback if value is None else value
+
+
+def _per_view_captions_flag(raw: Mapping[str, Any]) -> bool:
+    """The caption layout flag under either of its two names.
+
+    Exports from Sep 22 2026 on (HF 38f182c) write ``per_view_captions``, the key
+    imaginaire4's exporter and vLLM-Omni use; earlier schema-2 exports wrote
+    ``separate_view_text_tokenization``. Both are accepted; they must agree.
+    """
+    values = {
+        name: raw[name]
+        for name in ("per_view_captions", "separate_view_text_tokenization")
+        if name in raw
+    }
+    if not values:
+        raise ValueError(
+            "Cosmos3 multiview transformer config requires field 'per_view_captions' "
+            "(or the older 'separate_view_text_tokenization')."
+        )
+    for name, value in values.items():
+        if not isinstance(value, bool):
+            raise TypeError(f"Cosmos3 multiview {name} must be boolean.")
+    if len(set(values.values())) > 1:
+        raise ValueError(
+            f"Cosmos3 multiview per_view_captions flags disagree: {values}."
+        )
+    return next(iter(values.values()))
 
 
 def _required_field(config: Mapping[str, Any], name: str) -> Any:
@@ -447,10 +476,9 @@ def parse_multiview_deployment_config(
     variable_view_count = False
     inference_defaults: dict[str, Any] | None = None
     if schema_version == 2:
-        for field_name in ("separate_view_text_tokenization", "variable_view_count"):
-            if not isinstance(_required_field(raw, field_name), bool):
-                raise TypeError(f"Cosmos3 multiview {field_name} must be boolean.")
-        separate_captions = bool(raw["separate_view_text_tokenization"])
+        if not isinstance(_required_field(raw, "variable_view_count"), bool):
+            raise TypeError("Cosmos3 multiview variable_view_count must be boolean.")
+        separate_captions = _per_view_captions_flag(raw)
         variable_view_count = bool(raw["variable_view_count"])
         inference_defaults = _validate_inference_defaults(
             _required_field(raw, "inference_defaults")
@@ -514,7 +542,7 @@ def parse_multiview_deployment_config(
         share_vision_temporal_positions=True,
         backend=backend,
         schema_version=schema_version,
-        separate_view_text_tokenization=separate_captions,
+        per_view_captions=separate_captions,
         variable_view_count=variable_view_count,
         inference_defaults=inference_defaults,
         lidar=lidar,

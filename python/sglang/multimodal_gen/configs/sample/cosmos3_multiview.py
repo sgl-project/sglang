@@ -25,7 +25,7 @@ input JSON::
 Every view needs a pre-computed WSM ``control_path``. ``vision_path`` (an RGB
 still or clip) is optional but must be given for every camera or none; with it
 the request is image-to-video, without it text-to-video. Checkpoints that
-tokenize one caption per camera (``separate_view_text_tokenization``) take the
+tokenize one caption per camera (``per_view_captions``) take the
 caption in ``views[].prompt``; unversioned v1 exports read the top-level
 prompt. ``lidar`` selects joint camera/LiDAR generation on exports that ship
 the LiDAR encoder. As a CLI convenience, a ``control_path`` list in checkpoint

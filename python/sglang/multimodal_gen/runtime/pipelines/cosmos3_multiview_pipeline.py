@@ -148,7 +148,7 @@ class Cosmos3MultiviewPipeline(ComposedPipelineBase):
             deployment.control_attends_sensor,
             deployment.backend,
             deployment.schema_version,
-            deployment.separate_view_text_tokenization,
+            deployment.per_view_captions,
             deployment.supports_lidar,
             deployment.system_prompt_variant,
         )

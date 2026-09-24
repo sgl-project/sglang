@@ -613,7 +613,7 @@ class Cosmos3MultiviewInputStage(PipelineStage):
                 )
                 for camera, view in zip(cameras, views, strict=True)
             ]
-        if deployment.separate_view_text_tokenization and any(
+        if deployment.per_view_captions and any(
             view.prompt is None or not view.prompt.strip() for view in views
         ):
             raise ValueError(
@@ -899,7 +899,7 @@ class Cosmos3MultiviewTokenizationStage(Cosmos3TokenizationStage):
             bool(self.deployment.inference_default("emphasize_control_in_prompt", True))
         )
 
-        if self.deployment.separate_view_text_tokenization:
+        if self.deployment.per_view_captions:
             cameras = list(batch.extra[EXTRA_CAMERAS])
             captions = list(batch.extra[EXTRA_VIEW_PROMPTS])
             emphasis = None

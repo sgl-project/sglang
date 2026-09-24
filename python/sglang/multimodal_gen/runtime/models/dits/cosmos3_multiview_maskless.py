@@ -9,7 +9,9 @@ The ``decomposed`` scope is computed as unmasked varlen dense passes merged by
 log-sum-exp instead of one masked kernel over ``[UND | GEN]``:
 
 * **same view**: every ``(view axis, view)`` group over all of its frames, the
-  control item's tokens and the target's together;
+  control item's tokens and the target's together (with
+  ``control_attends_sensor`` off, a control query is keyed on its view's control
+  tokens only, as a second segment of the same call);
 * **cross instant**: every frame instant across views, sensor tokens only
   (control tokens are sliced out), with LiDAR sweeps quantized onto the camera
   frame grid by maximum overlap;
@@ -74,11 +76,10 @@ def maskless_unavailable_reason(
             "decomposed_temporal_window_seconds must be null: the maskless backend "
             "attends whole frame instants, not a temporal window."
         )
-    if not control_attends_sensor:
-        return (
-            "control_attends_sensor must be true: the same-view pass is symmetric, "
-            "so a control item always reads its target."
-        )
+    # ``control_attends_sensor`` is not a condition: with it off, the same-view
+    # pass is cut into a sensor segment (keyed on the whole group) and a control
+    # segment (keyed on the group's control tokens), one varlen call either way.
+    del control_attends_sensor
     return None
 
 
@@ -96,6 +97,16 @@ class MultiviewMasklessPlan(msgspec.Struct, frozen=True, eq=False):
     same_view_gather: torch.Tensor | None
     same_view_offsets: torch.Tensor
     same_view_max_len: int
+    #: Set only under ``control_attends_sensor=False`` with a control item: the
+    #: same-view pass then reads queries and keys through different gathers. A
+    #: sensor segment is keyed on its whole group, a control segment on the
+    #: group's control tokens alone. ``None`` keys the pass by ``same_view_*``.
+    same_view_q_gather: torch.Tensor | None
+    same_view_q_offsets: torch.Tensor | None
+    same_view_q_max_len: int
+    same_view_kv_gather: torch.Tensor | None
+    same_view_kv_offsets: torch.Tensor | None
+    same_view_kv_max_len: int
     cross_view_gather: torch.Tensor | None
     cross_view_offsets: torch.Tensor | None
     cross_view_max_len: int
@@ -154,6 +165,46 @@ def _caption_run(
     return torch.arange(starts[view], starts[view + 1], device=device)
 
 
+def _control_split(
+    sensor_runs: dict[int, list[torch.Tensor]],
+    control_runs: dict[int, list[torch.Tensor]],
+    device: torch.device,
+) -> dict[str, Any]:
+    """The same-view pass re-cut for ``control_attends_sensor=False``.
+
+    A sensor query keeps the whole group (its view's sensor and control tokens);
+    a control query reaches only its view's control tokens. One varlen call
+    expresses that as two segments per group: the query side is a permutation
+    of the stream (sensor runs in group order, then control runs), the key side
+    repeats a group's control tokens in both of its segments.
+    """
+    groups = sorted(set(sensor_runs) | set(control_runs))
+    segments = [
+        (sensor_runs[g], sensor_runs[g] + control_runs.get(g, []))
+        for g in groups
+        if g in sensor_runs
+    ]
+    segments += [
+        (control_runs[g], control_runs[g]) for g in groups if g in control_runs
+    ]
+    queries = [torch.cat(q) for q, _ in segments]
+    keys = [torch.cat(kv) for _, kv in segments]
+    return {
+        "q_gather": torch.cat(queries),
+        "q_lens": [int(run.numel()) for run in queries],
+        "kv_gather": torch.cat(keys),
+        "kv_lens": [int(run.numel()) for run in keys],
+    }
+
+
+def _tile_keys(
+    gather: torch.Tensor, tokens: int, batch_size: int, device: torch.device
+) -> torch.Tensor:
+    """Repeat a (possibly duplicating) key gather for every batch entry."""
+    shifts = torch.arange(batch_size, device=device) * tokens
+    return (gather.unsqueeze(0) + shifts.unsqueeze(1)).reshape(-1)
+
+
 def build_multiview_maskless_plan(
     layout: MultiviewLayout,
     *,
@@ -204,6 +255,8 @@ def build_multiview_maskless_plan(
     instant_ids: list[torch.Tensor] = []
     sensor_positions: list[torch.Tensor] = []
     caption_reader_positions: list[torch.Tensor] = []
+    sensor_runs: dict[int, list[torch.Tensor]] = {}
+    control_runs: dict[int, list[torch.Tensor]] = {}
     position = 0
     for item in items:
         frames = item.token_shape[0] // item.num_views
@@ -214,6 +267,11 @@ def build_multiview_maskless_plan(
             group = view_group.setdefault((axis, view), len(view_group))
             group_item.setdefault(group, (item, view))
             ids.append(group)
+            start = position + view * frames * spatial
+            run = torch.arange(start, start + frames * spatial, device=device)
+            (control_runs if item.is_control else sensor_runs).setdefault(
+                group, []
+            ).append(run)
         view_ids.append(
             torch.tensor(ids, device=device).repeat_interleave(frames * spatial)
         )
@@ -242,6 +300,11 @@ def build_multiview_maskless_plan(
         )
 
     same_view_gather, same_view_lens = _partition(torch.cat(view_ids))
+    split = (
+        _control_split(sensor_runs, control_runs, device)
+        if not layout.control_attends_sensor and control_runs
+        else None
+    )
 
     cross_view_gather = cross_view_offsets = None
     cross_view_lens: list[int] = []
@@ -296,6 +359,22 @@ def build_multiview_maskless_plan(
         same_view_gather=_tile(same_view_gather, gen_tokens),
         same_view_offsets=_cumulative_offsets(same_view_lens * batch_size, device),
         same_view_max_len=max(same_view_lens),
+        same_view_q_gather=_tile(split["q_gather"], gen_tokens) if split else None,
+        same_view_q_offsets=(
+            _cumulative_offsets(split["q_lens"] * batch_size, device) if split else None
+        ),
+        same_view_q_max_len=max(split["q_lens"]) if split else 0,
+        same_view_kv_gather=(
+            _tile_keys(split["kv_gather"], gen_tokens, batch_size, device)
+            if split
+            else None
+        ),
+        same_view_kv_offsets=(
+            _cumulative_offsets(split["kv_lens"] * batch_size, device)
+            if split
+            else None
+        ),
+        same_view_kv_max_len=max(split["kv_lens"]) if split else 0,
         cross_view_gather=(
             _tile(cross_view_gather, gen_tokens)
             if cross_view_gather is not None
@@ -607,18 +686,32 @@ def multiview_maskless_attention(
     outputs: list[torch.Tensor] = []
     lses: list[torch.Tensor] = []
 
-    gather = plan.same_view_gather
-    out, lse = _varlen_attention(
-        _select(q_flat, gather),
-        _select(k_flat, gather),
-        _select(v_flat, gather),
-        plan.same_view_offsets,
-        plan.same_view_offsets,
-        plan.same_view_max_len,
-        plan.same_view_max_len,
-        scale,
-        kernel,
-    )
+    if plan.same_view_kv_gather is None:
+        gather = plan.same_view_gather
+        out, lse = _varlen_attention(
+            _select(q_flat, gather),
+            _select(k_flat, gather),
+            _select(v_flat, gather),
+            plan.same_view_offsets,
+            plan.same_view_offsets,
+            plan.same_view_max_len,
+            plan.same_view_max_len,
+            scale,
+            kernel,
+        )
+    else:
+        gather = plan.same_view_q_gather
+        out, lse = _varlen_attention(
+            _select(q_flat, gather),
+            _select(k_flat, plan.same_view_kv_gather),
+            _select(v_flat, plan.same_view_kv_gather),
+            plan.same_view_q_offsets,
+            plan.same_view_kv_offsets,
+            plan.same_view_q_max_len,
+            plan.same_view_kv_max_len,
+            scale,
+            kernel,
+        )
     out, lse = _scatter(out, lse, gather, tokens)
     outputs.append(out)
     lses.append(lse)
