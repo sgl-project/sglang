@@ -46,7 +46,7 @@ from sglang.srt.kv_canary.req_to_expected_token_ids_manager import (
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
     dp_gather_slot,
-    set_dp_buffer_len,
+    set_dp_buffer_len_from_batch,
     set_is_extend_in_batch,
     world_dp_gather_enabled,
 )
@@ -688,6 +688,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     dp_local_start_pos: Optional[torch.Tensor] = None  # cached info at runtime
     dp_local_num_tokens: Optional[torch.Tensor] = None  # cached info at runtime
     global_dp_buffer_len: Optional[int] = None
+    # global_num_tokens_cpu as published for the DP gather: attn-TP aligned and,
+    # under MAX_LEN, padded to the max. None when the raw list already is.
+    global_num_tokens_padded_cpu: Optional[List[int]] = None
 
     # For Qwen2-VL
     mrope_positions: torch.Tensor = None
@@ -1584,13 +1587,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         )
 
         self.global_dp_buffer_len = buffer_len
-        set_dp_buffer_len(
-            buffer_len,
-            num_tokens,
-            dp_padding_mode.is_max_len(),
-            global_num_tokens,
-            self.global_num_tokens_gpu,
-        )
+        self.global_num_tokens_padded_cpu = global_num_tokens
+        set_dp_buffer_len_from_batch(self)
         set_is_extend_in_batch(self.is_extend_in_batch)
 
         bs = self.batch_size
