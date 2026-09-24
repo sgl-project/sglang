@@ -743,7 +743,13 @@ def should_skip_post_experts_all_reduce(*, is_tp_path: bool) -> bool:
         return True
     if should_use_dp_reduce_scatterv():
         return True
-    if is_tp_path and should_use_flashinfer_cutlass_moe_fp4_allgather():
+    if should_use_flashinfer_cutlass_moe_fp4_allgather():
+        # The standard dispatcher all-gathers tokens and reduce-scatters the
+        # expert outputs over _TP, which spans the whole EP group
+        # (moe_ep_size == attn_dp_size), so both post-experts reductions are
+        # already done. An extra EP all-reduce would reduce DP-local outputs of
+        # different tokens, and mismatched token counts across ranks crash or
+        # hang the collective.
         return True
     if get_moe_a2a_backend().is_flashinfer():
         return True
