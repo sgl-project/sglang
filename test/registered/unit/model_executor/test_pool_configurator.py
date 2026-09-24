@@ -1157,9 +1157,7 @@ class TestSWAPoolFloor(CustomTestCase):
         cfg = object.__new__(DSV4PoolConfigurator)
         cfg.swa_ratio = 0.1
         cfg.sliding_window_size = 128
-        cfg.swa_page_size = 128
-        # The C4 state ring is addressed per SWA page, not per window.
-        cfg.state_page_tokens = page_size
+        cfg.swa_page_size = page_size
         cfg.c4_ring_size = 8
         cfg.c4_shrink_factor = 1
         cfg._unified = unified

@@ -1031,10 +1031,8 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
                 f"layers=[{kvc.layer_info.start_layer},{kvc.layer_info.end_layer}) "
                 f"local={len(self.compression_ratios)}/{len(cfg.compress_ratios)}"
             )
-        self.swa_page_size = cfg.window_size
-        # The C4 state ring is indexed by SWA page, not by window; sizing it
-        # by the window allocates page_size/window_size x the reachable rows.
-        self.state_page_tokens = get_schedule().page_size
+        self.swa_window_size = cfg.window_size
+        self.swa_page_size = get_schedule().page_size
         self.operator_swa_ratio = _operator_swa_full_tokens_ratio()
         self.swa_ratio = (
             self.operator_swa_ratio
@@ -1086,8 +1084,9 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
             dsv4_unified_row_bytes,
         )
 
-        # swa_page_size is the model's sliding window (cfg.window_size).
-        self._swa_ring_size = get_swa_ring_size(self.swa_page_size, self.is_speculative)
+        self._swa_ring_size = get_swa_ring_size(
+            self.swa_window_size, self.is_speculative
+        )
         self._spec_infl = 1.0
 
         # The unified pool takes no dtype, so --kv-cache-dtype never reaches it.
@@ -1256,7 +1255,7 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
 
     def _get_bytes_per_swa_token(self) -> float:
         """Bytes one SWA slot costs across the stage. c4_state_pool_size = swa_tokens
-        / state_page_tokens * ring, so c4 compress state is priced per SWA slot too."""
+        / swa_page_size * ring, so c4 compress state is priced per SWA slot too."""
         if self.encoder_replay:
             # Target SWA lives in the request window; only the draft owns paged SWA
             # bytes, and its layers carry no compressed state.
@@ -1265,7 +1264,7 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         c4_state_bytes = 2 * 2 * self.attn_head_dim * c4_state_dtype_size
         c4_indexer_state_bytes = 2 * 2 * self.indexer_head_dim * c4_state_dtype_size
 
-        c4_state_ratio = self.c4_ring_size / self.state_page_tokens
+        c4_state_ratio = self.c4_ring_size / self.swa_page_size
         return (
             self.kv_bytes * self.num_layers_total
             + c4_state_ratio
@@ -1353,7 +1352,7 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
             c4_state_pool_size=(
                 0
                 if self._unified
-                else swa_tokens // self.state_page_tokens * self.c4_ring_size
+                else swa_tokens // self.swa_page_size * self.c4_ring_size
             ),
             c128_state_pool_size=0,
         )
