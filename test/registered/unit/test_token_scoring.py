@@ -4,6 +4,11 @@ import unittest
 from types import SimpleNamespace
 
 import torch
+from tokenizers import Tokenizer
+from tokenizers.models import WordLevel
+from tokenizers.pre_tokenizers import Whitespace
+from tokenizers.processors import TemplateProcessing
+from transformers import PreTrainedTokenizerFast
 
 from sglang.srt.entrypoints.engine_score_mixin import EngineScoreMixin
 from sglang.srt.entrypoints.openai.protocol import ScoringRequest
@@ -94,6 +99,33 @@ class TestTokenScoring(unittest.IsolatedAsyncioTestCase):
         for scores in result.scores:
             torch.testing.assert_close(torch.tensor(scores), expected)
         self.assertIsNone(result.token_logprobs)
+
+    async def test_mis_text_items_do_not_add_special_tokens(self):
+        vocab = {"[UNK]": 0, "[BOS]": 1, "Rate": 2, ":": 3, "Option": 4, "A": 5, "B": 6}
+        tokenizer = Tokenizer(WordLevel(vocab, unk_token="[UNK]"))
+        tokenizer.pre_tokenizer = Whitespace()
+        tokenizer.post_processor = TemplateProcessing(
+            single="[BOS] $A", special_tokens=[("[BOS]", vocab["[BOS]"])]
+        )
+        manager = ScoringManager(enable_mis=True)
+        manager.tokenizer = PreTrainedTokenizerFast(
+            tokenizer_object=tokenizer, bos_token="[BOS]", unk_token="[UNK]"
+        )
+        items = [" Option A", " Option B"]
+        for query in ("Rate:", ""):
+            with self.subTest(query=query):
+                await manager.score_request(
+                    query=query, items=items, label_token_ids=[5, 6]
+                )
+                request = manager.requests[-1]
+                packed = request.input_ids[0]
+                delimiters = request.multi_item_delimiter_indices[0]
+                prefix = packed[: delimiters[0]]
+                for item, start, end in zip(items, delimiters, delimiters[1:]):
+                    self.assertEqual(
+                        prefix + packed[start + 1 : end],
+                        manager.tokenizer.encode(query + item),
+                    )
 
     async def test_async_engine_and_full_prompts(self):
         manager = ScoringManager()

@@ -110,7 +110,8 @@ class TokenizerManagerScoreMixin:
         items_ids = []
         for item in items_list:
             if isinstance(item, str):
-                items_ids.append(self.tokenizer.encode(item))
+                # items continue the query, so only the query gets special tokens
+                items_ids.append(self.tokenizer.encode(item, add_special_tokens=False))
             else:
                 items_ids.append(list(item))
 
