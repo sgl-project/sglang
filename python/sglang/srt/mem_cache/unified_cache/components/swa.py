@@ -400,6 +400,8 @@ class SWAComponent(TreeComponent):
         """
         if node_id is None:
             return
+        if os.environ.get("DSV4_DISABLE_SWA_WINDOW_RESYNC"):
+            return
         alloc = self.cache.token_to_kv_pool_allocator
         if is_swa_req_ring(alloc):
             return
