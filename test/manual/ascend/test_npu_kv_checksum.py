@@ -13,9 +13,6 @@ from sglang.srt.disaggregation.checksum import (
     page_indices_for_request,
 )
 from sglang.srt.hardware_backend.npu.checksum import adler32_strided_checksum
-from sglang.test.ci.ci_register import register_npu_ci
-
-register_npu_ci(est_time=30, suite="full-1-npu-a3", nightly=True)
 
 
 def reference(tensors, strides, indices):

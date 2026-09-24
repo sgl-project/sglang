@@ -7,7 +7,7 @@ request with HTTP 500, so "every request returns 200" is the pass condition.
 What this does not catch: decode skips the comparison when the prefill side
 never wrote a checksum (expected == 0), so a request would pass vacuously.
 test_both_sides_report_checksum_enabled is what rules that out. The kernel's
-own arithmetic is covered by test/registered/npu/test_npu_kv_checksum.py.
+own arithmetic is covered by test/manual/ascend/test_npu_kv_checksum.py.
 """
 
 import os
