@@ -1,9 +1,13 @@
-# SPDX-License-Identifier: Apache-2.0
-
+import sys
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
+
 from sglang.srt.utils.cpp_extension_loader import load_extension_with_recovery
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
 def test_stale_torch_lock_is_removed_before_loading(tmp_path: Path):
@@ -78,3 +82,7 @@ def test_broken_extension_is_rebuilt_under_the_same_lock(tmp_path: Path):
     assert result is expected
     assert build_directory.is_dir()
     assert load.call_count == 2
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__]))

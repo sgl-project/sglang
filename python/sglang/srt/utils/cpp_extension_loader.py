@@ -1,3 +1,11 @@
+"""``torch.utils.cpp_extension.load`` behind a lock that dead processes release.
+
+torch guards a JIT build with a ``lock`` file and waits while it exists, so a
+process killed mid-build leaves every later loader spinning forever. The flock
+here is released by the kernel when its holder dies; under it, a leftover torch
+lock can only be stale and is removed before loading.
+"""
+
 from __future__ import annotations
 
 import fcntl
