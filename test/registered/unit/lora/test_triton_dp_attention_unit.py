@@ -20,7 +20,12 @@ from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.lora.mem_pool import LoRAMemoryPool
 from sglang.srt.lora.utils import LoRABatchInfo
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
-from sglang.srt.runtime_context import LoRABatchLayout, get_forward, get_parallel
+from sglang.srt.runtime_context import (
+    LoRABatchLayout,
+    get_context,
+    get_forward,
+    get_parallel,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -155,6 +160,34 @@ def test_layout_selects_routing_without_shape_inference():
     with get_forward().scoped(lora_batch_layout=LoRABatchLayout.TP_GLOBAL):
         assert _routes(backend._sgemm_info()) == [2, 1]
     assert _routes(backend._sgemm_info()) == [1, 0]
+
+
+@pytest.mark.parametrize(
+    "parallel_overrides",
+    [{"attn_tp_size": 2}, {"attn_cp_size": 2}],
+    ids=["attn-tp", "attn-cp"],
+)
+def test_manager_rejects_dp_attention_with_multi_rank_attention_groups(
+    parallel_overrides,
+):
+    with (
+        get_context().override_server_args(
+            enable_dp_attention=True, enable_lora_overlap_loading=False
+        ) as args,
+        get_parallel().override(
+            **{"attn_tp_size": 1, "attn_cp_size": 1, **parallel_overrides}
+        ),
+        pytest.raises(ValueError, match="requires --dp-size equal to --tp-size"),
+    ):
+        LoRAManager(
+            base_model=torch.nn.Linear(2, 2),
+            base_hf_config=SimpleNamespace(),
+            max_loras_per_batch=2,
+            load_config=None,
+            dtype=torch.float32,
+            server_args=args,
+            lora_backend="triton",
+        )
 
 
 @pytest.mark.parametrize("mlp_mode", [ScatterMode.FULL, ScatterMode.TP_ATTN_FULL])

@@ -431,6 +431,7 @@ python3 -m sglang.launch_server \
 
 Keep these constraints in mind:
 
+- `--dp-size` must equal `--tp-size`, so every attention DP rank owns its whole token batch. The server rejects other layouts at startup.
 - All adapters must be GPU-pinned (`pinned: true`), including dynamically loaded adapters. You can pin at most `--max-loras-per-batch - 1` adapters; the remaining slot is reserved for the base model.
 - Decode CUDA graphs are supported. LoRA prefill runs eagerly when DPA is enabled.
 - `--max-loras-per-batch` limits the union of adapters active across all DP ranks in a synchronized forward, not the adapters on one rank alone.

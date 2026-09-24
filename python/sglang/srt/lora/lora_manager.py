@@ -110,6 +110,16 @@ class LoRAManager:
                 "overlap loading; use a pool that coordinates adapter slots "
                 "across DP ranks or disable overlap loading"
             )
+        # LoRA routing knows only DP-local and TP-global token layouts. A wider
+        # attention TP/CP group can scatter one DP rank's tokens across ranks.
+        if self.enable_dp_attention and (
+            self.attn_tp_size != 1 or get_parallel().attn_cp_size != 1
+        ):
+            raise ValueError(
+                "LoRA with DP attention requires --dp-size equal to --tp-size "
+                f"(got attention TP size {self.attn_tp_size} and attention CP "
+                f"size {get_parallel().attn_cp_size})"
+            )
         self.pending_lora_load_events = {}
 
         self.eviction_policy = get_lora().lora_eviction_policy
