@@ -107,6 +107,7 @@ class Qwen3MoeLLMModel(Qwen3MoeModel):
         ):
             layer_idx += self.start_layer
             if layer_idx in self.layers_to_capture:
+                hidden_states = complete_deferred_allreduce(hidden_states)
                 aux_hidden_states.append(
                     hidden_states + residual if residual is not None else hidden_states
                 )

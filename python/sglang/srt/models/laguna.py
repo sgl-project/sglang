@@ -597,6 +597,7 @@ class LagunaModel(nn.Module):
         aux_hidden_states = []
         for i in range(self.start_layer, self.end_layer):
             if i in self.layers_to_capture:
+                hidden_states = complete_deferred_allreduce(hidden_states)
                 aux_hidden_states.append(
                     hidden_states + residual if residual is not None else hidden_states
                 )
