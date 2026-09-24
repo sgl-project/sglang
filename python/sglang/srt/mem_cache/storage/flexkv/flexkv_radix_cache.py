@@ -385,8 +385,8 @@ class FlexKVRadixCache(RadixCache):
     # cache_finished_req (STORE)
     # ------------------------------------------------------------------
 
-    def after_release(self, req: Req, *, adopted: bool) -> None:
-        if not adopted:
+    def after_release(self, req: Req, *, inserted: bool) -> None:
+        if not inserted:
             self._load_markers.pop(req.cache_request_handle, None)
 
     def cache_finished_req(  # type: ignore[override]

@@ -438,8 +438,8 @@ class LMCRadixCache(RadixCache):
                 )
             )
 
-    def after_release(self, req: Req, *, adopted: bool) -> None:
-        if not adopted and self._mode is LMCacheMode.MP:
+    def after_release(self, req: Req, *, inserted: bool) -> None:
+        if not inserted and self._mode is LMCacheMode.MP:
             self._mp_load_back_markers.pop(req.rid, None)
             self.lmcache_connector.end_session(req.rid)
 

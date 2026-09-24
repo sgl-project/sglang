@@ -492,8 +492,8 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         Return True after taking the row; the caller then releases nothing."""
         return False
 
-    def after_release(self, req: Req, *, adopted: bool) -> None:
-        """The request's kv row is freed and its lock dropped; ``adopted``
+    def after_release(self, req: Req, *, inserted: bool) -> None:
+        """The request's kv row is freed and its lock dropped; ``inserted``
         says whether its KV went into the tree first. Per-request state a
         cache keeps outside the tree is dropped here, before the row slot
         itself is returned to the pool."""

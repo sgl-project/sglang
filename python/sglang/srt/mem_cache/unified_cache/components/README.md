@@ -235,7 +235,7 @@ Cache a completed request's KV data into the tree.
 | Aspect | Detail |
 |--------|--------|
 | **Purpose** | After a request finishes, insert its token/KV data into the tree for future reuse |
-| **Inputs** | `req` — the finished request; `owned_kv_len` — end of the request-owned KV range; slots past it are freed by `release_kv_cache`. A request that leaves without inserting goes through `release_kv_cache(is_insert=False)` instead, which frees the row and calls `after_release(req, adopted=False)` for component cleanup |
+| **Inputs** | `req` — the finished request; `owned_kv_len` — end of the request-owned KV range; slots past it are freed by `release_kv_cache`. A request that leaves without inserting goes through `release_kv_cache(is_insert=False)` instead, which frees the row and calls `after_release(req, inserted=False)` for component cleanup |
 | **Output** | `None` |
 | **Mutation** | Calls component hooks → `insert` → `dec_lock_ref` → component cleanup. Frees unaligned tail KV indices. |
 | **Complexity** | **O(K + D·C)** — insert O(K + D·C) + lock release O(D). Simplifies to **O(K)**. |
