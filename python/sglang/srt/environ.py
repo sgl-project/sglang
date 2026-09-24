@@ -1648,6 +1648,10 @@ class Envs:
     SGLANG_ENABLE_PCG_DSV2_DUAL_STREAM = EnvBool(False)
     SGLANG_DSA_TOPK_BROADCAST = EnvBool(False)
     SGLANG_DISABLE_DSA_INDEXER_FUSION = EnvBool(False)
+    # HIP analog of CUDA SGLANG_DISABLE_DSA_INDEXER_FUSION (default on).
+    # Set 1 for the legacy split writer. Omits Hadamard; pre-quant logits match.
+    # Separate from the CUDA flag: that one also packs wk+weights_proj.
+    SGLANG_DISABLE_AITER_FUSED_FP8_DSA_INDEXER = EnvBool(False)
     # Opt-in perf path for --dsa-prefill-backend flashmla_sparse_q8: fuse the
     # absorbed q bmm with the nope/rope concat + fp8 cast so q is written
     # directly in fp8 ("born fp8") and the standalone concat-cast kernel

@@ -1163,7 +1163,7 @@ class TestSWAPoolFloor(CustomTestCase):
         cfg = object.__new__(DSV4PoolConfigurator)
         cfg.swa_ratio = 0.1
         cfg.sliding_window_size = 128
-        cfg.swa_page_size = 128
+        cfg.swa_page_size = page_size
         cfg.c4_ring_size = 8
         cfg.c4_shrink_factor = 1
         cfg._unified = unified
@@ -1183,8 +1183,9 @@ class TestSWAPoolFloor(CustomTestCase):
         sizes = self._dsv4_sizes(max_tokens=32768, page_size=256)
         self.assertEqual(sizes.full_max_total_num_tokens, 32768)
         self.assertEqual(sizes.swa_max_total_num_tokens, 3072)
-        # Non-unified: the c4 state pool scales with the paged SWA pool.
-        self.assertEqual(sizes.c4_state_pool_size, 3072 // 128 * 8)
+        # Non-unified: the c4 state pool scales with the paged SWA pool, and
+        # is sized by the page the ring is addressed by (not the window).
+        self.assertEqual(sizes.c4_state_pool_size, 3072 // 256 * 8)
 
     def test_dsv4_token_cap_never_grows_total_footprint(self):
         """Regression: the token-cap path subtracts no fixed-pool bias, so
