@@ -10159,6 +10159,298 @@ class TestSWAWindowUnderBigramKey(CustomTestCase):
         cache.sanity_check()
 
 
+def _alloc_paged_kv(allocator, need_size, page_size):
+    """``SWATokenToKVPoolAllocator.alloc`` asserts ``page_size == 1``; allocate a
+    page-aligned full+SWA pair the way ``alloc_extend`` does."""
+    aligned = ((need_size + page_size - 1) // page_size) * page_size
+    full_indices = allocator.full_attn_allocator.alloc(aligned)
+    swa_indices = allocator.swa_attn_allocator.alloc(aligned)
+    assert full_indices is not None and swa_indices is not None
+    allocator.full_to_swa_index_mapping[full_indices] = swa_indices
+    return full_indices[:need_size]
+
+
+class TestSWAFinishedPrefill(CustomTestCase):
+    """A request that finishes directly after prefill must not cache its whole
+    final chunk as live sliding-window KV.
+
+    ``cache_unfinished_req`` trims the slots below the window before it inserts;
+    the finished path used to skip that, so an 8192-token prompt with one output
+    token kept all 8192 SWA slots alive and the tree recorded live SWA on a node
+    whose read window had long passed. The trim is measured against the
+    page-aligned radix key -- an EAGLE bigram key is one shorter than the tokens
+    it spans -- has to leave a full window of live SWA on the leaf the insert
+    creates, and must not free below the tree-owned prefix or a retention floor.
+    """
+
+    page_size = 256
+    window = 128
+
+    def _cfg(self, **overrides):
+        values = dict(
+            page_size=self.page_size,
+            components=(ComponentType.FULL, ComponentType.SWA),
+            sliding_window_size=self.window,
+            kv_size=16384,
+            max_context_len=16384,
+            head_num=1,
+            head_dim=8,
+        )
+        values.update(overrides)
+        return CacheConfig(**values)
+
+    def _stage_prompt_row(
+        self,
+        cfg,
+        cache,
+        allocator,
+        req_to_token_pool,
+        tokens,
+        *,
+        protected_len=0,
+        pre_evicted=0,
+        borrow_prefix=False,
+    ):
+        """A fresh request whose prompt sits in its own kv row.
+
+        When borrow_prefix is set the row is staged the way the scheduler admits
+        a prefill: match the cache first, keep the matched tree-owned indices
+        borrowed in the row, allocate only the unmatched tail, and carry the
+        real lock receipt for the matched node.
+        """
+        req = Req(
+            rid=0,
+            origin_input_text="",
+            origin_input_ids=array("q"),
+            sampling_params=SamplingParams(temperature=0, max_new_tokens=1),
+        )
+        req_to_token_pool.alloc([req])
+        prompt = array("q", tokens)
+        req.origin_input_ids = prompt
+        req.output_ids = array("q")
+        req.full_untruncated_fill_ids = prompt
+        req.set_extend_range(0, len(prompt))
+        req.extra_key = None
+        if borrow_prefix:
+            match = cache.match_prefix(
+                MatchPrefixParams(key=RadixKey(array("q", prompt)), req=req)
+            )
+            hit = len(match.device_indices)
+            req.prefix_indices = match.device_indices
+            req.last_node = match.last_device_node
+            req.kv.cache_protected_len = hit
+            if req.last_node is not None:
+                req.lock_receipt = cache.inc_lock_ref(req.last_node).to_dec_params()
+            if hit:
+                req_to_token_pool.write(
+                    (req.kv.req_pool_idx, slice(0, hit)), match.device_indices
+                )
+            if hit < len(prompt):
+                loc = _alloc_paged_kv(allocator, len(prompt) - hit, cfg.page_size)
+                req_to_token_pool.write(
+                    (req.kv.req_pool_idx, slice(hit, len(prompt))), loc
+                )
+        else:
+            loc = _alloc_paged_kv(allocator, len(prompt), cfg.page_size)
+            req_to_token_pool.write((req.kv.req_pool_idx, slice(0, len(prompt))), loc)
+            req.kv.cache_protected_len = protected_len
+            req.last_node = cache.root_node_handle()
+            req.lock_receipt = DecLockRefParams()
+        req.kv.kv_committed_len = len(prompt)
+        req.kv.kv_allocated_len = len(prompt)
+        if pre_evicted:
+            # A chunked prefill already handed this range back; the finished path
+            # must not free it a second time.
+            row = req_to_token_pool.req_to_token[req.kv.req_pool_idx]
+            allocator.free_swa_segment(row[:pre_evicted], start_pos=0)
+            req.kv.swa_evicted_seqlen = pre_evicted
+        return req
+
+    def _finish_prefill(self, cfg, tokens, *, enabled, **kwargs):
+        cache, allocator, req_to_token_pool = build_fixture(cfg)
+        req = self._stage_prompt_row(
+            cfg, cache, allocator, req_to_token_pool, tokens, **kwargs
+        )
+        self._finish(cache, req, enabled=enabled)
+        return cache, allocator, req
+
+    def _finish(self, cache, req, *, enabled):
+        with envs.SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS.override(enabled):
+            cache.cache_finished_req(
+                req, is_insert=True, owned_kv_len=req.owned_kv_len()
+            )
+
+    def _retained_swa(self, cfg, allocator):
+        return cfg.kv_size - allocator.swa_available_size()
+
+    def test_finished_prefill_retains_only_window(self):
+        tokens = list(range(1, 8193))
+        for is_eagle in (False, True):
+            for enabled in (False, True):
+                with self.subTest(is_eagle=is_eagle, enabled=enabled):
+                    cfg = self._cfg(is_eagle=is_eagle)
+                    cache, allocator, req = self._finish_prefill(
+                        cfg, tokens, enabled=enabled
+                    )
+                    key = RadixKey(array("q", tokens), is_bigram=is_eagle).page_aligned(
+                        self.page_size
+                    )
+                    if enabled:
+                        # pre_len = len(key) - 1, threshold = pre_len - page_size
+                        # floored to a page: the leaf keeps two pages of live SWA.
+                        self.assertEqual(req.kv.swa_evicted_seqlen, len(key) - 512)
+                        self.assertEqual(self._retained_swa(cfg, allocator), 512)
+                    else:
+                        self.assertEqual(req.kv.swa_evicted_seqlen, 0)
+                        self.assertEqual(self._retained_swa(cfg, allocator), len(key))
+                    match = cache.match_prefix(MatchPrefixParams(key=key))
+                    self.assertEqual(len(match.device_indices), len(key))
+                    cache.sanity_check()
+
+    def test_short_and_page_boundary_prompts_keep_a_full_window(self):
+        cfg = self._cfg(page_size=64, sliding_window_size=128, kv_size=4096)
+        for length in (64, 128, 192, 193, 320, 512):
+            with self.subTest(length=length):
+                tokens = list(range(1, length + 1))
+                cache, allocator, req = self._finish_prefill(cfg, tokens, enabled=True)
+                key = RadixKey(array("q", tokens)).page_aligned(cfg.page_size)
+                # A request shorter than the window has nothing to trim, and a
+                # longer one has to keep a full window of live SWA at the leaf its
+                # insert created -- otherwise the next match refuses that leaf.
+                self.assertGreaterEqual(
+                    len(key) - req.kv.swa_evicted_seqlen,
+                    min(len(key), cfg.sliding_window_size),
+                    f"a leaf ending at {len(key)} keeps only "
+                    f"{len(key) - req.kv.swa_evicted_seqlen} live SWA tokens against "
+                    f"a {cfg.sliding_window_size} window",
+                )
+                self.assertEqual(
+                    self._retained_swa(cfg, allocator),
+                    len(key) - req.kv.swa_evicted_seqlen,
+                )
+                match = cache.match_prefix(MatchPrefixParams(key=key))
+                self.assertEqual(len(match.device_indices), len(key))
+                cache.sanity_check()
+
+    def test_protected_prefix_is_not_trimmed(self):
+        cfg = self._cfg()
+        cache, allocator, req_to_token_pool = build_fixture(cfg)
+        prefix = list(range(1, 2049))
+        tokens = prefix + list(range(9000, 9000 + 6144))
+
+        first = self._stage_prompt_row(cfg, cache, allocator, req_to_token_pool, prefix)
+        self._finish(cache, first, enabled=True)
+        prefix_live = self._retained_swa(cfg, allocator)
+
+        # Another live request holds the shared prefix with its own lock.
+        matched = cache.match_prefix(
+            MatchPrefixParams(key=RadixKey(array("q", prefix)))
+        )
+        self.assertEqual(len(matched.device_indices), len(prefix))
+        lock = cache.inc_lock_ref(matched.last_device_node)
+
+        # Scheduler shape: match first, borrow the matched tree-owned indices in
+        # the row, allocate only the unmatched tail, then finish.
+        req = self._stage_prompt_row(
+            cfg, cache, allocator, req_to_token_pool, tokens, borrow_prefix=True
+        )
+        self.assertEqual(req.kv.cache_protected_len, len(prefix))
+        self.assertEqual(
+            req_to_token_pool.req_to_token[req.kv.req_pool_idx, : len(prefix)].tolist(),
+            matched.device_indices.tolist(),
+            "the row must borrow the matched tree-owned prefix indices",
+        )
+        full_before = allocator.full_attn_allocator.available_size()
+        swa_before = allocator.swa_attn_allocator.available_size()
+
+        self._finish(cache, req, enabled=True)
+
+        # The trim may release only the request's own tail, [protected,
+        # frontier). "keep" is the two pages below the insert boundary that the
+        # new leaf's live SWA window needs.
+        keep = 2 * self.page_size
+        self.assertEqual(req.kv.swa_evicted_seqlen, len(tokens) - keep)
+        self.assertEqual(
+            allocator.swa_attn_allocator.available_size() - swa_before,
+            len(tokens) - len(prefix) - keep,
+        )
+        self.assertEqual(allocator.full_attn_allocator.available_size(), full_before)
+        self.assertEqual(self._retained_swa(cfg, allocator), prefix_live + keep)
+        self.assertEqual(
+            cfg.kv_size - allocator.full_attn_allocator.available_size(), len(tokens)
+        )
+
+        # The borrowed prefix and the whole finished span stay reusable.
+        again = cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", prefix))))
+        self.assertEqual(len(again.device_indices), len(prefix))
+        whole = cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", tokens))))
+        self.assertEqual(len(whole.device_indices), len(tokens))
+
+        # Release the independent holder: every owned slot must come back.
+        cache.dec_lock_ref(matched.last_device_node, lock.to_dec_params())
+        cache.evict(
+            EvictParams(
+                num_tokens=len(tokens),
+                swa_num_tokens=self._retained_swa(cfg, allocator),
+            )
+        )
+        self.assertEqual(allocator.full_attn_allocator.available_size(), cfg.kv_size)
+        self.assertEqual(allocator.swa_attn_allocator.available_size(), cfg.kv_size)
+        cache.sanity_check()
+
+    def test_prior_swa_eviction_is_not_refreed(self):
+        cfg = self._cfg()
+        cache, allocator, req = self._finish_prefill(
+            cfg, list(range(1, 8193)), enabled=True, pre_evicted=self.page_size
+        )
+        # Only the newly out-of-window range may be released: a second free of the
+        # already-evicted page would double-credit the SWA allocator.
+        self.assertEqual(req.kv.swa_evicted_seqlen, 8192 - 512)
+        self.assertEqual(self._retained_swa(cfg, allocator), 512)
+        key = RadixKey(array("q", range(1, 8193))).page_aligned(self.page_size)
+        match = cache.match_prefix(MatchPrefixParams(key=key))
+        self.assertEqual(len(match.device_indices), len(key))
+        cache.sanity_check()
+
+    def test_retain_floor_bounds_the_trim(self):
+        cfg = self._cfg()
+        cache, allocator, req_to_token_pool = build_fixture(cfg)
+        # A hybrid SWA+Mamba fixture is not constructible (build_fixture picks one
+        # pool layout), so exercise the mamba checkpoint floor through the same
+        # seam Mamba uses: BasePrefixCache.swa_retain_floor(req).
+        cache.swa_retain_floor = lambda req: 2048
+        req = self._stage_prompt_row(
+            cfg, cache, allocator, req_to_token_pool, list(range(1, 8193))
+        )
+        with envs.SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS.override(True):
+            cache.cache_finished_req(
+                req, is_insert=True, owned_kv_len=req.owned_kv_len()
+            )
+        self.assertEqual(req.kv.swa_evicted_seqlen, 2048)
+        self.assertEqual(self._retained_swa(cfg, allocator), 8192 - 2048)
+        key = RadixKey(array("q", range(1, 8193))).page_aligned(self.page_size)
+        match = cache.match_prefix(MatchPrefixParams(key=key))
+        self.assertEqual(len(match.device_indices), len(key))
+        cache.sanity_check()
+
+    def test_finished_prefill_without_insert_releases_everything(self):
+        cfg = self._cfg()
+        cache, allocator, req_to_token_pool = build_fixture(cfg)
+        before = allocator.swa_available_size()
+        req = self._stage_prompt_row(
+            cfg, cache, allocator, req_to_token_pool, list(range(1, 8193))
+        )
+        with envs.SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS.override(True):
+            cache.cache_finished_req(
+                req, is_insert=False, owned_kv_len=req.owned_kv_len()
+            )
+        # An aborted request owns nothing past its protected prefix: no trim, and
+        # the whole row goes back in one release.
+        self.assertEqual(req.kv.swa_evicted_seqlen, 0)
+        self.assertEqual(allocator.swa_available_size(), before)
+        cache.sanity_check()
+
+
 class TestUnifiedRadixCacheStorageAttachBackfill(CustomTestCase):
     """Enabling a storage backend must hash nodes that predate it.
 
