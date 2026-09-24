@@ -1612,8 +1612,11 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         )
 
         # Micro-benchmark only: skip the whole full-attention layer (attn + MLP)
-        # to measure the GDN-only replay cost of the tail-replay proposal
-        # (RFC sgl-project#40865). Not for production use.
+        # to measure the cost of an output-only (ReplaySSM-style) replay
+        # segment for the tail-replay proposal (RFC sgl-project#40865).
+        # Proxy measurement only: on interleaved GGGF hybrids a real replay
+        # path cannot skip FA layers (later GDN layers consume their outputs);
+        # this lower-bounds the replay-segment cost. Not for production use.
         if (
             _SKIP_FA_LAYERS
             and not forward_batch.forward_mode.is_idle()
@@ -1689,7 +1692,9 @@ ALL_DECODER_LAYER_TYPES = {
 
 # Micro-benchmark switch for the tail-replay cost model (RFC sgl-project#40865):
 # when "1", every full-attention decoder layer returns its input unchanged, so
-# measured prefill time approximates embed + GDN layers + lm_head only.
+# measured prefill time approximates embed + GDN layers + lm_head only. This
+# proxies an output-only (ReplaySSM-style) replay segment; see the RFC for why
+# a real replay path cannot skip FA layers on interleaved hybrids.
 _SKIP_FA_LAYERS = os.environ.get("SGLANG_SKIP_FA_LAYERS", "0") == "1"
 
 # ModelOpt FP4 checkpoints bake the per-layer KV-cache scales under the HF
