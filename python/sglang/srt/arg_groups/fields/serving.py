@@ -1,11 +1,4 @@
-"""Config fields of the ``serving`` namespace.
-
-One class per namespace. The class *is* the namespace: a field declared here
-lands in the ``serving`` bag, which is what ``get_serving()`` returns, so a reader
-spells it exactly as before. ``ServerArgs`` composes these classes, so the
-record stays one flat object -- the split moves where declarations live, not
-how config is shaped at runtime.
-"""
+"""Config fields of the ``serving`` namespace."""
 
 from __future__ import annotations
 
