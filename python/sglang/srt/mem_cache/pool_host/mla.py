@@ -397,6 +397,22 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         )
         return buffer
 
+    def get_hybrid_pool_buffer(self):
+        if self.layout == "page_first_kv_split":
+            # kv_buffer aliases K; zero-copy storage also accesses the other
+            # physical buffers, so all of them must be registered.
+            return [
+                buffer
+                for name in (
+                    "k_buffer",
+                    "v_buffer",
+                    "index_k_buffer",
+                    "index_k_scale_buffer",
+                )
+                if (buffer := getattr(self, name, None)) is not None
+            ]
+        return [self.kv_buffer]
+
     def _init_write_back_staging_buffers(self):
         self.staging_page_capacity = 0
         self.staging_token_capacity = 0
