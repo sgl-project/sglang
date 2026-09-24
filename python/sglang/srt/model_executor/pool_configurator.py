@@ -979,6 +979,8 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         if self._unified:
             # Unified_kv stores the whole latent: one bf16 row, or fp8 nope + bf16 rope.
             self.kv_bytes = self._unified_row_bytes
+        elif get_exec().kernel.dsv4_attn_backend == "trtllm":
+            self.kv_bytes = self.attn_head_dim
         else:
             # One FlashMLA-layout latent slot, in bytes.
             self.kv_bytes = self.qk_nope_head_dim + self.qk_rope_head_dim * 2 + 8
