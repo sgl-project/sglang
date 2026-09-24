@@ -580,10 +580,7 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
             candidate_req.prompt, str
         ):
             return "prompt_type"
-        if (
-            getattr(base_req, "image_path", None) is not None
-            or getattr(candidate_req, "image_path", None) is not None
-        ):
+        if self._has_unbatchable_image_conditioning(base_req, candidate_req):
             return "image_conditioning"
         if base_req.return_file_paths_only != candidate_req.return_file_paths_only:
             return "return_file_paths_only"
@@ -601,6 +598,15 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
     @staticmethod
     def _has_realtime_session(req: Req) -> bool:
         return bool(req.realtime_session_id) or req.session is not None
+
+    def _has_unbatchable_image_conditioning(
+        self, base_req: Req, candidate_req: Req
+    ) -> bool:
+        """True when either request carries image conditioning that this
+        pipeline cannot keep per-request inside a merged dynamic batch."""
+        if self.server_args.pipeline_config.supports_batching_image_conditioning():
+            return False
+        return base_req.image_path is not None or candidate_req.image_path is not None
 
     def _requires_sequential_multi_output(self, *reqs: Req) -> bool:
         pipeline_config = self.server_args.pipeline_config
@@ -641,10 +647,7 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
         ):
             return False
 
-        if (
-            getattr(base_req, "image_path", None) is not None
-            or getattr(candidate_req, "image_path", None) is not None
-        ):
+        if self._has_unbatchable_image_conditioning(base_req, candidate_req):
             return False
         if base_req.return_file_paths_only != candidate_req.return_file_paths_only:
             return False
