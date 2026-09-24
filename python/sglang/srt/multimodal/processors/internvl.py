@@ -466,9 +466,11 @@ class InternVLProcessor(BaseMultimodalProcessor):
                 "[internvl][qwen] image_data provided but no images parsed from prompt placeholders"
             )
 
-        image_tensor = (
-            torch.cat(pixel_values_list, dim=0) if pixel_values_list else None
-        )
+        # pixel_values_list is deliberately left unconcatenated. Its only
+        # consumer is the per-image item loop below, which used to slice the
+        # packed tensor straight back into these same tiles -- so building it
+        # cost a second request-sized allocation, live alongside the tiles it
+        # copied from, that was never read as a whole.
 
         # ----- Videos -> frame tiles (optional) -----
         video_tensor = None
@@ -575,7 +577,7 @@ class InternVLProcessor(BaseMultimodalProcessor):
 
         # Offsets
         image_offsets = []
-        if image_tensor is not None:
+        if pixel_values_list:
             image_offsets = self.get_mm_items_offset(
                 input_ids=input_ids_tensor.to(get_device()),
                 mm_token_id=self.img_context_token_id,
@@ -589,22 +591,20 @@ class InternVLProcessor(BaseMultimodalProcessor):
             )
 
         items = []
-        if image_tensor is not None:
+        if pixel_values_list:
             # Split per-image for better cache granularity
             assert len(num_patches_list) == len(image_offsets), (
                 f"InternVL: num_patches_list ({len(num_patches_list)}) != "
                 f"image_offsets ({len(image_offsets)})"
             )
-            cumulative = 0
-            for i, num_patches in enumerate(num_patches_list):
+            for i, tiles in enumerate(pixel_values_list):
                 items.append(
                     MultimodalDataItem(
-                        feature=image_tensor[cumulative : cumulative + num_patches],
+                        feature=tiles,
                         modality=Modality.IMAGE,
                         offsets=[image_offsets[i]],
                     )
                 )
-                cumulative += num_patches
         if video_tensor is not None:
             items.append(
                 MultimodalDataItem(
@@ -679,9 +679,8 @@ class InternVLProcessor(BaseMultimodalProcessor):
                 "[internvl][internlm2] image_data provided but no images parsed from prompt placeholders"
             )
 
-        pixel_values = (
-            torch.cat(pixel_values_list, dim=0) if pixel_values_list else None
-        )
+        # Left unconcatenated for the reason given on the qwen text path above:
+        # the per-image loop below consumes the tiles directly.
 
         # Expand each <IMG_CONTEXT> into <img> + <IMG_CONTEXT>*N + </img>
         ph = "<<<__IMG_CONTEXT_PLACEHOLDER__>>>"
@@ -706,29 +705,27 @@ class InternVLProcessor(BaseMultimodalProcessor):
 
         # Offsets
         image_offsets = []
-        if pixel_values is not None:
+        if pixel_values_list:
             image_offsets = self.get_mm_items_offset(
                 input_ids=input_ids_tensor.to(get_device()),
                 mm_token_id=self.img_context_token_id,
             )
 
         items = []
-        if pixel_values is not None:
+        if pixel_values_list:
             # Split per-image for better cache granularity
             assert len(num_patches_list) == len(image_offsets), (
                 f"InternVL: num_patches_list ({len(num_patches_list)}) != "
                 f"image_offsets ({len(image_offsets)})"
             )
-            cumulative = 0
-            for i, num_patches in enumerate(num_patches_list):
+            for i, tiles in enumerate(pixel_values_list):
                 items.append(
                     MultimodalDataItem(
-                        feature=pixel_values[cumulative : cumulative + num_patches],
+                        feature=tiles,
                         modality=Modality.IMAGE,
                         offsets=[image_offsets[i]],
                     )
                 )
-                cumulative += num_patches
 
         return MultimodalProcessorOutput(
             input_ids=input_ids,

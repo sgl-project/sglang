@@ -1766,7 +1766,9 @@ class MiMoV2Processor(BaseMultimodalProcessor):
             "mrope_position_delta": getattr(input_sample, "rope_deltas", None),
         }
         if getattr(input_sample, "pixel_values", None):
-            pixel_values = torch.cat(input_sample.pixel_values, dim=0)
+            # Already one tensor per image, and get_new_expanded_mm_items splits
+            # the packed tensor straight back into them; hand over the list.
+            pixel_values = list(input_sample.pixel_values)
             image_grids = torch.stack(input_sample.image_thw_grids)
             ret.update(
                 {
