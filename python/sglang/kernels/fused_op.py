@@ -16,9 +16,9 @@ a proper :class:`torch.nn.Module` and covers **two independent dimensions**:
   backend name.
 - **Platform / device** — device-specific composite paths inherited from
   ``MultiPlatformOp``: ``forward_cuda``, ``forward_hip``, ``forward_npu``,
-  ``forward_xpu``, ``forward_musa``, ``forward_cpu``, plus ``forward_<key>``
-  for out-of-tree (OOT) platform plugins. CUDA / HIP are **not** kernel
-  backends.
+  ``forward_xpu``, ``forward_musa``, ``forward_mlu``, ``forward_cpu``, plus
+  ``forward_<key>`` for out-of-tree (OOT) platform plugins. CUDA / HIP are
+  **not** kernel backends.
 
 Dispatch priority (highest first), resolved by :meth:`BaseFusedOp.forward`:
 
@@ -39,8 +39,8 @@ Dispatch priority (highest first), resolved by :meth:`BaseFusedOp.forward`:
    statically cached choice to per-call selection.
 5. **Platform-specific forward** — ``forward_cuda`` on CUDA, ``forward_hip``
    (falling back to ``forward_cuda``) on ROCm, ``forward_musa`` on MUSA,
-   ``forward_npu`` / ``forward_xpu`` on Ascend / XPU, ``forward_cpu`` on
-   AMX-capable CPUs.
+   ``forward_npu`` / ``forward_xpu`` / ``forward_mlu`` on Ascend / XPU / MLU,
+   ``forward_cpu`` on AMX-capable CPUs.
 6. **Native fallback** — ``forward_native``.
 
 Steps 3-6 are static per process, so their outcome is resolved once (lazily,
@@ -153,6 +153,7 @@ _PLATFORM_METHODS: Dict[str, Tuple[str, ...]] = {
     "musa": ("forward_musa",),
     "npu": ("forward_npu",),
     "xpu": ("forward_xpu",),
+    "mlu": ("forward_mlu",),
     "cpu": ("forward_cpu",),
 }
 
@@ -175,6 +176,7 @@ def _platform_key() -> str:
         is_cpu,
         is_cuda,
         is_hip,
+        is_mlu,
         is_musa,
         is_npu,
         is_xpu,
@@ -192,6 +194,8 @@ def _platform_key() -> str:
         return "xpu"
     if is_musa():
         return "musa"
+    if is_mlu():
+        return "mlu"
     return ""
 
 
