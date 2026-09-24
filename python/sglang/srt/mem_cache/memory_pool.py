@@ -5432,16 +5432,11 @@ class MHATokenToKOnlyPool(KVCache):
 
 
 def get_minimax_sparse_index_dtype(
-    server_args, kv_cache_dtype: torch.dtype, model_dtype: torch.dtype
+    *, fp8_attn_gemm: bool, kv_cache_dtype: torch.dtype, model_dtype: torch.dtype
 ) -> torch.dtype:
-    # pool_configurator's per-token cell size reads this; it must match the built pool
-    from sglang.srt.arg_groups.overrides import resolving_view
-    from sglang.srt.server_args import m3_fp8_attn_gemm_enabled
-
-    # fp8 attn-GEMM mode opts the indexer cache into fp8 (fp8 indexer
-    # GEMMs); fp8 KV without the mode keeps the indexer bf16 with the
-    # widening-dequant contract.
-    if m3_fp8_attn_gemm_enabled(resolving_view(server_args)):
+    """Return the index-K cache dtype; the pool's cell-size estimate must match it."""
+    # fp8 attn-GEMM mode runs the indexer GEMMs in fp8 too; plain fp8 KV keeps bf16.
+    if fp8_attn_gemm:
         return kv_cache_dtype
     if _is_gfx95_supported and envs.SGLANG_OPT_MINIMAX_M3_FP8_INDEX_CACHE.get():
         return torch.float8_e4m3fn

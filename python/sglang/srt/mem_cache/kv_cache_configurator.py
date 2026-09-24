@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, Any, Optional
 import msgspec
 import torch
 
+from sglang.srt.arg_groups.overrides import resolving_view
 from sglang.srt.configs.hybrid_arch import (
     hybrid_gdn_config,
     hybrid_kda_config,
@@ -1835,6 +1836,8 @@ class KVCacheConfigurator:
         return token_to_kv_pool
 
     def _build_minimax_sparse_kv_pool(self, *, max_total_num_tokens: int) -> KVCache:
+        from sglang.srt.server_args import m3_fp8_attn_gemm_enabled
+
         _hf_config = self.model_config.hf_config
         sparse_cfg = get_minimax_sparse_attention_config(_hf_config)
         dense_layer_ids, sparse_layer_ids = get_minimax_sparse_layer_ids(sparse_cfg)
@@ -1854,7 +1857,11 @@ class KVCacheConfigurator:
             page_size=self.pool_page_size,
             dtype=self.kv_cache_dtype,
             index_dtype=get_minimax_sparse_index_dtype(
-                self.server_args, self.kv_cache_dtype, self.model_dtype
+                fp8_attn_gemm=m3_fp8_attn_gemm_enabled(
+                    resolving_view(self.server_args)
+                ),
+                kv_cache_dtype=self.kv_cache_dtype,
+                model_dtype=self.model_dtype,
             ),
             head_num=self.model_config.get_num_kv_heads(
                 get_parallel().attn_tp_size, get_parallel().attn_dcp_size
