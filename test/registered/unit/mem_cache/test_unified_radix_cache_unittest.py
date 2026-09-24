@@ -239,7 +239,7 @@ def _drop_hicache_atexit_pin(cache):
 
 
 class TestUnifiedRadixComponentRegistryOverride(CustomTestCase):
-    def test_component_registry_override_is_instance_local(self):
+    def test_component_and_tree_core_overrides_are_instance_local(self):
         params = CacheInitParams(
             req_to_token_pool=ReqToTokenPool(
                 size=2,
@@ -254,7 +254,17 @@ class TestUnifiedRadixComponentRegistryOverride(CustomTestCase):
             component_registry_override={ComponentType.FULL: _FakeFullComponent},
         )
 
-        cache = UnifiedRadixCache(params=params)
+        with envs.SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND.override(
+            "unregistered-test-core"
+        ):
+            cache = UnifiedRadixCache(
+                params=replace(params, tree_core_backend="python")
+            )
+            with self.assertRaisesRegex(ValueError, "unregistered-test-core"):
+                UnifiedRadixCache(params=params)
+        with envs.SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND.override("python"):
+            with self.assertRaisesRegex(ValueError, "is not registered"):
+                UnifiedRadixCache(params=replace(params, tree_core_backend=""))
 
         self.assertIsInstance(cache.components[ComponentType.FULL], _FakeFullComponent)
         self.assertIsNot(COMPONENT_REGISTRY[ComponentType.FULL], _FakeFullComponent)
@@ -6772,7 +6782,7 @@ class UnifiedRadixCacheSuite:
         swa = cache.components[ComponentType.SWA]
         req = mock.Mock(
             swa_branching_seqlen=8,
-            kv=mock.Mock(cache_protected_len=4, swa_evicted_seqlen=0),
+            kv=ReqKvInfo(cache_protected_len=4),
         )
 
         for is_finished in (False, True):

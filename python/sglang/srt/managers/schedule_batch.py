@@ -981,6 +981,17 @@ class ReqKvInfo:
             max(self.component_evicted_seqlens.values(), default=0),
         )
 
+    def get_evicted_seqlen(self, component_type: ComponentType) -> int:
+        if component_type == ComponentType.SWA:
+            return self.swa_evicted_seqlen
+        return self.component_evicted_seqlens.get(component_type, 0)
+
+    def set_evicted_seqlen(self, component_type: ComponentType, length: int) -> None:
+        if component_type == ComponentType.SWA:
+            self.swa_evicted_seqlen = length
+        else:
+            self.component_evicted_seqlens[component_type] = length
+
     def clamp_evicted_seqlens(self, length: int) -> None:
         self.swa_evicted_seqlen = min(self.swa_evicted_seqlen, length)
         for component, cursor in self.component_evicted_seqlens.items():

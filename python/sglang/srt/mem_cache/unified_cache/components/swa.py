@@ -403,7 +403,7 @@ class SWAComponent(TreeComponent):
             return prefix_len
 
         full_cd = node.component_data[BASE_COMPONENT_TYPE]
-        swa_evicted_seqlen = params.swa_evicted_seqlen
+        swa_evicted_seqlen = params.get_evicted_seqlen(self.component_type)
         # A locked tombstone is legal (segment locks count every node); the
         # full-value swap below is safe because full lock_ref >= swa
         # lock_ref, so a locked-SWA node always takes the Recover branch.
@@ -480,7 +480,7 @@ class SWAComponent(TreeComponent):
         ct = self.component_type
         if node.component_data[ct].value is not None:
             return
-        swa_evicted_seqlen = params.swa_evicted_seqlen
+        swa_evicted_seqlen = params.get_evicted_seqlen(self.component_type)
         assert swa_evicted_seqlen % self.tree_core.page_size == 0, (
             f"{ct}: swa_evicted_seqlen must be page-aligned, {swa_evicted_seqlen=}"
         )
@@ -524,13 +524,13 @@ class SWAComponent(TreeComponent):
 
         node_start = result.prefix_len
         node_end = node_start + len(node.key)
-        split_pos = params.swa_evicted_seqlen - node_start
+        split_pos = params.get_evicted_seqlen(self.component_type) - node_start
         if split_pos >= len(node.key):
             # Entire leaf is outside the SWA window — left as a tombstone.
             return
         result.record_adopted_range(
             self.component_type,
-            max(node_start, params.swa_evicted_seqlen),
+            max(node_start, params.get_evicted_seqlen(self.component_type)),
             node_end,
         )
         if split_pos > 0:
@@ -823,10 +823,7 @@ class SWAComponent(TreeComponent):
                 swa_uuid = comp.metadata[uuid_key]
             cur = cur.parent
 
-        if lock_host:
-            result.swa_uuid_for_host_lock = swa_uuid
-        else:
-            result.swa_uuid_for_lock = swa_uuid
+        result.set_lock_uuid(ct, swa_uuid, lock_host=lock_host)
         return result
 
     def release_component_lock(
@@ -837,9 +834,9 @@ class SWAComponent(TreeComponent):
     ) -> None:
         ct = self.component_type
         root = self.tree_core.root_node
-        swa_uuid_for_lock = (
-            params.swa_uuid_for_host_lock if lock_host else params.swa_uuid_for_lock
-        )
+        if node is root:
+            return
+        swa_uuid_for_lock = params.get_lock_uuid(ct, lock_host=lock_host)
         dec_swa = True
         uuid_key = "host_uuid" if lock_host else "uuid"
 
@@ -931,7 +928,9 @@ class SWAComponent(TreeComponent):
     ) -> Optional[int]:
         # Unfinished requests can already have an SWA-evicted prefix; preserve
         # that boundary so insertion creates a tombstone instead of live SWA KV.
-        insert_params.swa_evicted_seqlen = req.kv.swa_evicted_seqlen
+        insert_params.set_evicted_seqlen(
+            self.component_type, req.kv.get_evicted_seqlen(self.component_type)
+        )
 
         # A recurrent checkpoint must stay attached to its exact token prefix.
         # Let MambaComponent select the insertion length for hybrid caches.
@@ -968,7 +967,9 @@ class SWAComponent(TreeComponent):
         self, req: Req, pre_len: int, insert_params: InsertParams
     ) -> None:
         self._free_out_of_window_slots(req, pre_len)
-        insert_params.swa_evicted_seqlen = req.kv.swa_evicted_seqlen
+        insert_params.set_evicted_seqlen(
+            self.component_type, req.kv.get_evicted_seqlen(self.component_type)
+        )
 
     def cleanup_after_caching_req(
         self,

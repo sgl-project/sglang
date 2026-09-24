@@ -104,6 +104,17 @@ class InsertParams:
     # off). See UnifiedTreeNode.rotation_base.
     rotation_base: Optional[int] = None
 
+    def get_evicted_seqlen(self, component_type: ComponentType) -> int:
+        if component_type == ComponentType.SWA:
+            return self.swa_evicted_seqlen
+        return self.component_evicted_seqlens.get(component_type, 0)
+
+    def set_evicted_seqlen(self, component_type: ComponentType, length: int) -> None:
+        if component_type == ComponentType.SWA:
+            self.swa_evicted_seqlen = length
+        else:
+            self.component_evicted_seqlens[component_type] = length
+
 
 @dataclasses.dataclass
 class InsertResult:
@@ -179,6 +190,21 @@ class IncLockRefResult:
         default_factory=dict
     )
 
+    def set_lock_uuid(
+        self,
+        component_type: ComponentType,
+        uuid: Optional[int],
+        *,
+        lock_host: bool = False,
+    ) -> None:
+        if component_type == ComponentType.SWA:
+            if lock_host:
+                self.swa_uuid_for_host_lock = uuid
+            else:
+                self.swa_uuid_for_lock = uuid
+        else:
+            self.component_lock_uuids[component_type] = uuid
+
     def to_dec_params(self) -> DecLockRefParams:
         """Convert to the corresponding DecLockRefParams for dec_lock_ref."""
         return DecLockRefParams(
@@ -207,6 +233,13 @@ class DecLockRefParams:
     component_lock_uuids: dict[ComponentType, Optional[int]] = dataclasses.field(
         default_factory=dict
     )
+
+    def get_lock_uuid(
+        self, component_type: ComponentType, *, lock_host: bool = False
+    ) -> Optional[int]:
+        if component_type == ComponentType.SWA:
+            return self.swa_uuid_for_host_lock if lock_host else self.swa_uuid_for_lock
+        return self.component_lock_uuids[component_type]
 
 
 @dataclasses.dataclass
