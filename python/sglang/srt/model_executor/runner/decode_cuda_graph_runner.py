@@ -61,6 +61,7 @@ from sglang.srt.layers.dp_attention import (
     set_is_extend_in_batch,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.layers.moe.aiter_moe_regime import pin_decode_moe_regime
 from sglang.srt.model_executor.cuda_graph_buffer_registry import (
     CudaGraphBufferRegistry,
     build_decode_registry,
@@ -1050,7 +1051,13 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         # Trigger CUDA graph capture for specific shapes.
         # Capture the large shapes first so that the smaller shapes
         # can reuse the memory pool allocated for the large shapes.
-        with freeze_gc(get_exec().graph.enable_cudagraph_gc):
+        #
+        # Pin aiter's decode MoE table: the kernels resolved during capture are
+        # baked into the graphs, and a replayed graph never re-enters forward().
+        with (
+            pin_decode_moe_regime(),
+            freeze_gc(get_exec().graph.enable_cudagraph_gc),
+        ):
             if not self.enable_pdmux:
                 with (
                     graph_capture(

@@ -76,6 +76,7 @@ from sglang.srt.layers.cp.utils import (
     is_mla_cp_enabled,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.layers.moe.aiter_moe_regime import set_moe_regime_for_forward_mode
 from sglang.srt.layers.sampler import create_sampler
 from sglang.srt.lora.lora_manager import LoRAManager, init_lora_cuda_graph_moe_buffers
 from sglang.srt.lora.lora_registry import LoRARef
@@ -1696,6 +1697,10 @@ class ModelRunner:
         forward_batch.apply_deprecated_skip_attn_backend_init(skip_attn_backend_init)
 
         self.forward_pass_id += 1
+
+        # Per-regime tuned MoE tables: decode and prefill want different kernels
+        # for the same shape. No-op unless aiter exposes the regime API.
+        set_moe_regime_for_forward_mode(forward_batch.forward_mode)
 
         # Try msprob debugger
         if self.msprobe_debugger is not None:
