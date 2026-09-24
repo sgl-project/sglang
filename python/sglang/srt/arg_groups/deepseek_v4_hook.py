@@ -21,16 +21,7 @@ logger = logging.getLogger(__name__)
 
 
 def apply_deepseek_v4_defaults(server_args: ServerArgs, model_arch: str) -> None:
-    """Residual imperative arm of the DeepSeek V4 defaults.
-
-    The attention/page/window/MoE-runner declarations moved to the override
-    registry (arg_groups/overrides.py: _deepseek_v4_overrides) and the
-    kv-cache dtype default to the resolution pipeline
-    (_deepseek_v4_kv_cache_dtype, invoked below at its legacy slot). This
-    keeps, at the legacy slot: the ROCm env fill (env-write policy), the
-    max_running_requests fill (the speculative hook is a later writer of
-    that field) and the validations.
-    """
+    """Apply DeepSeek V4 environment defaults, request limits, and validation."""
     cfg = resolving_view(server_args)
 
     # FlashMLA sparse prefill (SGLANG_OPT_FLASHMLA_SPARSE_PREFILL, default on)
