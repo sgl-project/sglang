@@ -1,7 +1,7 @@
 """
 Index streams for the grouped target-verify decode.
 
-The per-token HCA stream is [swa][compressed tail], one per draft, so a 
+The per-token HCA stream is [swa][compressed tail], one per draft, so a
 request's kv is read once per draft. The asm kernel can take four drafts
 in one tile, but only if the stream is laid out the way its masking
 already works:
@@ -21,7 +21,7 @@ _ALLOWED_BLOCK_Q = (1, 2, 4)
 
 @triton.jit
 def _grouped_stream_kernel(
-    out_ptr,  # [*] int32 
+    out_ptr,  # [*] int32
     indptr_ptr,  # [G+1] int32
     slot_ptr,  # [G] int32, state slot of the group's request
     pos_ptr,  # [G] int32, position of the group's LAST draft
@@ -42,11 +42,8 @@ def _grouped_stream_kernel(
         j = off + tl.arange(0, TAIL_B)
         m = j < n_tail
         jc = tl.minimum(j, TAIL_W - 1)
-        pi = tl.load(tail_page_ptr + g * TAIL_W + jc, mask=m, other=-1).to(
-            tl.int32
-        )
-        tl.store(out_ptr + base + j,
-                 tl.where(pi >= 0, pi + swa_pages, -1), mask=m)
+        pi = tl.load(tail_page_ptr + g * TAIL_W + jc, mask=m, other=-1).to(tl.int32)
+        tl.store(out_ptr + base + j, tl.where(pi >= 0, pi + swa_pages, -1), mask=m)
 
     # Then the swa from this group's first draft to its last.
     slot = tl.load(slot_ptr + g)
@@ -71,8 +68,9 @@ def _group_index(R, num_draft, block_q, device):
     n_full = num_draft // block_q
     remainder = num_draft % block_q
     n_groups = n_full + (1 if remainder else 0)
-    ends = (torch.arange(1, n_groups + 1, dtype=torch.int64,
-                         device=device) * block_q).clamp(max=num_draft)
+    ends = (
+        torch.arange(1, n_groups + 1, dtype=torch.int64, device=device) * block_q
+    ).clamp(max=num_draft)
     base = torch.arange(R, dtype=torch.int64, device=device) * num_draft
     last_token = (base[:, None] + (ends - 1)).reshape(-1)
     group_size = torch.diff(ends, prepend=ends.new_zeros(1))
@@ -118,12 +116,20 @@ def build_grouped_verify_streams(
     # Sized to the worst case rather than to kv_indptr[-1], which would need a
     # device read and so could not be captured in a graph. The streams are
     # packed by kv_indptr, so the slack past the last one is never touched.
-    indices = torch.empty((G * (Wc + win + block_q - 1),),
-                          dtype=torch.int32, device=dev)
+    indices = torch.empty(
+        (G * (Wc + win + block_q - 1),), dtype=torch.int32, device=dev
+    )
     _grouped_stream_kernel[(G,)](
-        indices, kv_indptr, slot_g, pos_g, tail_g, page_g,
-        ring_stride, swa_pages,
-        TAIL_W=max(Wc, 1), TAIL_B=min(triton.next_power_of_2(max(Wc, 1)), 1024),
+        indices,
+        kv_indptr,
+        slot_g,
+        pos_g,
+        tail_g,
+        page_g,
+        ring_stride,
+        swa_pages,
+        TAIL_W=max(Wc, 1),
+        TAIL_B=min(triton.next_power_of_2(max(Wc, 1)), 1024),
         WIN_B=triton.next_power_of_2(win + block_q - 1),
         num_warps=4,
     )

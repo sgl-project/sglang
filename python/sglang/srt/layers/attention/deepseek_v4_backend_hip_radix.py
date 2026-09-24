@@ -747,7 +747,8 @@ class DeepseekV4HipRadixBackend(
             # per-token (num_draft*bs -> bs) req-slot map produced by the prefill
             # expansion above.
             self._attach_unified_kv_decode_streams(
-                core_attn_metadata, req_pool_indices_repeated,
+                core_attn_metadata,
+                req_pool_indices_repeated,
                 num_draft=self.target_verify_num_draft_tokens,
             )
         indexer_metadata = (
@@ -957,7 +958,8 @@ class DeepseekV4HipRadixBackend(
             num_draft_tokens * bs,
         )
         self._attach_unified_kv_decode_streams(
-            core_attn_metadata, req_pool_indices_repeated,
+            core_attn_metadata,
+            req_pool_indices_repeated,
             num_draft=self.target_verify_num_draft_tokens,
         )
         indexer_metadata = (
@@ -1504,7 +1506,9 @@ class DeepseekV4HipRadixBackend(
             self.forward_metadata = current_raw
 
     def _attach_unified_kv_decode_streams(
-        self, core: DSV4AttnMetadata, state_slot: torch.Tensor,
+        self,
+        core: DSV4AttnMetadata,
+        state_slot: torch.Tensor,
         num_draft: int = 0,
     ) -> None:
         # state_slot maps each query token to its request slot;
@@ -1567,7 +1571,7 @@ class DeepseekV4HipRadixBackend(
             and N // num_draft >= _GROUPED_ASM_MIN_REQS
         ):
             from sglang.kernels.ops.attention.dsv4.unified_kv_kernels import (
-                grouped_verify_streams
+                grouped_verify_streams,
             )
 
             (
