@@ -16,7 +16,7 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload im
 
 
 class AnimaConditionerAttention(nn.Module):
-    def __init__(self, config, context_dim):
+    def __init__(self, config, context_dim, cross_attention=False):
         super().__init__()
         dim = config.model_dim
         self.heads = config.num_attention_heads
@@ -27,7 +27,9 @@ class AnimaConditionerAttention(nn.Module):
         self.o_proj = nn.Linear(dim, dim, bias=False)
         self.q_norm = nn.RMSNorm(self.head_dim, eps=1e-6)
         self.k_norm = nn.RMSNorm(self.head_dim, eps=1e-6)
-        self.attn = LocalAttention(self.heads, self.head_dim, is_cross_attention=True)
+        self.attn = LocalAttention(
+            self.heads, self.head_dim, is_cross_attention=cross_attention
+        )
 
     def forward(self, x, context, mask, rope, context_rope):
         q = self.q_norm(self.q_proj(x).unflatten(-1, (self.heads, self.head_dim)))
@@ -53,7 +55,9 @@ class AnimaConditionerBlock(nn.Module):
             self.norm_self_attn = norm(dim, eps=eps)
             self.self_attn = AnimaConditionerAttention(config, dim)
         self.norm_cross_attn = norm(dim, eps=eps)
-        self.cross_attn = AnimaConditionerAttention(config, config.source_dim)
+        self.cross_attn = AnimaConditionerAttention(
+            config, config.source_dim, cross_attention=True
+        )
         self.norm_mlp = norm(dim, eps=eps)
         self.mlp = nn.Sequential(
             nn.Linear(dim, int(dim * config.mlp_ratio)),
@@ -107,8 +111,11 @@ class AnimaTextConditioner(nn.Module, LayerwiseOffloadableModuleMixin):
         x = self.in_proj(self.embed(target_input_ids).to(source_hidden_states.dtype))
         rope = self._rope(x.shape[1], x.device, x.dtype)
         source_rope = self._rope(source_hidden_states.shape[1], x.device, x.dtype)
-        target_mask = target_attention_mask[:, None, None, :].bool()
-        source_mask = source_attention_mask[:, None, None, :].bool()
+        # additive -inf preserves SDPA's zero output for fully masked rows
+        target_mask = torch.zeros_like(target_attention_mask, dtype=x.dtype)
+        target_mask.masked_fill_(target_attention_mask == 0, float("-inf"))
+        source_mask = torch.zeros_like(source_attention_mask, dtype=x.dtype)
+        source_mask.masked_fill_(source_attention_mask == 0, float("-inf"))
         for block in self.blocks:
             x = block(
                 x, source_hidden_states, target_mask, source_mask, rope, source_rope

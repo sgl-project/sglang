@@ -51,21 +51,15 @@ class AnimaTextConditioningStage(ConditionEncodingStage):
                         max_length,
                     )
                 ]
-        # conditioner output includes learned-token padding; Cosmos attends to it
+        # Cosmos attends to conditioner padding; additional BCG padding is not valid
         batch.prompt_attention_mask = None
         batch.negative_attention_mask = None
-        batch.prompt_embeds_mask = [
-            torch.ones_like(batch.prompt_embeds[0][..., 0], dtype=torch.bool)
-        ]
+        batch.prompt_embeds_mask = None
+        batch.negative_prompt_embeds_mask = None
         batch.prompt_seq_lens = [
             [batch.prompt_embeds[0].shape[1]] * batch.prompt_embeds[0].shape[0]
         ]
         if batch.do_classifier_free_guidance:
-            batch.negative_prompt_embeds_mask = [
-                torch.ones_like(
-                    batch.negative_prompt_embeds[0][..., 0], dtype=torch.bool
-                )
-            ]
             batch.negative_prompt_seq_lens = [
                 [batch.negative_prompt_embeds[0].shape[1]]
                 * batch.negative_prompt_embeds[0].shape[0]

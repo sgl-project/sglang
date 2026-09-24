@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 import json
 import sys
+from contextlib import nullcontext
 from types import SimpleNamespace
 
 import pytest
@@ -12,10 +13,17 @@ from sglang.multimodal_gen.configs.models.dits.anima import AnimaArchConfig
 from sglang.multimodal_gen.configs.pipeline_configs.anima import AnimaPipelineConfig
 from sglang.multimodal_gen.configs.sample.anima import AnimaSamplingParams
 from sglang.multimodal_gen.registry import get_model_info
+from sglang.multimodal_gen.runtime.breakable_cuda_graph.prompt_padding import (
+    pad_masked_prompt_kwargs,
+)
 from sglang.multimodal_gen.runtime.models.dits.anima import AnimaRotaryEmbedding
 from sglang.multimodal_gen.runtime.models.encoders.qwen3 import Qwen3Attention
 from sglang.multimodal_gen.runtime.models.registry import ModelRegistry
 from sglang.multimodal_gen.runtime.pipelines.anima_pipeline import AnimaPipeline
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.anima import (
+    AnimaTextConditioningStage,
+)
+from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils import hf_diffusers_utils
 
 
@@ -53,6 +61,49 @@ def test_empty_prompt_keeps_a_masked_qwen_token():
     inputs = AnimaPipelineConfig().tokenize_prompt([""], tokenizer, {})
     assert inputs.input_ids.shape == (1, 1)
     assert not inputs.attention_mask.any()
+
+
+def test_breakable_cuda_graph_stays_enabled_for_anima():
+    args = SimpleNamespace(
+        model_id="circlestone-labs/Anima-Base-v1.0-Diffusers",
+        model_path="/models/Anima-Base-v1.0-Diffusers",
+        enable_breakable_cuda_graph=True,
+        pipeline_config=AnimaPipelineConfig(),
+        warmup_resolutions=["512x512"],
+    )
+    args._is_breakable_cuda_graph_supported_model = lambda: (
+        ServerArgs._is_breakable_cuda_graph_supported_model(args)
+    )
+    ServerArgs._adjust_breakable_cuda_graph_support(args)
+    assert args.enable_breakable_cuda_graph
+
+
+@pytest.mark.parametrize("length", [512, 600])
+def test_conditioning_does_not_allow_extra_bcg_padding(length):
+    embeds = torch.randn(1, length, 8)
+    mask = torch.ones(1, length, dtype=torch.bool)
+    batch = SimpleNamespace(
+        prompt="landscape",
+        negative_prompt="",
+        max_sequence_length=1024,
+        prompt_embeds=[embeds],
+        negative_prompt_embeds=[embeds],
+        prompt_attention_mask=[mask],
+        negative_attention_mask=[mask],
+        prompt_embeds_mask=[mask],
+        negative_prompt_embeds_mask=[mask],
+        do_classifier_free_guidance=True,
+    )
+    stage = SimpleNamespace(
+        conditioner=None,
+        use_declared_component=lambda **kwargs: nullcontext(None),
+        _condition=lambda *args: embeds,
+    )
+    AnimaTextConditioningStage.forward(stage, batch, None)
+    for masks in (batch.prompt_embeds_mask, batch.negative_prompt_embeds_mask):
+        kwargs = {"encoder_hidden_states": embeds, "encoder_hidden_states_mask": masks}
+        assert pad_masked_prompt_kwargs(kwargs, (1024,)) is kwargs
+    assert batch.prompt_seq_lens == batch.negative_prompt_seq_lens == [[length]]
 
 
 def test_qwen_all_masked_row_never_calls_attention_with_empty_kv():
@@ -150,6 +201,25 @@ def test_modular_index_uses_existing_component_loaders(tmp_path, monkeypatch):
         ]
         == "Legacy"
     )
+
+
+def test_modular_index_works_from_offline_cache(tmp_path, monkeypatch):
+    path = tmp_path / "modular_model_index.json"
+    path.write_text("{}")
+
+    def offline(**kwargs):
+        raise hf_diffusers_utils.RequestsConnectionError("offline")
+
+    monkeypatch.setattr(hf_diffusers_utils, "hf_hub_download", offline)
+    monkeypatch.setattr(
+        "huggingface_hub.try_to_load_from_cache",
+        lambda repo_id, filename: (
+            str(path) if filename == "modular_model_index.json" else None
+        ),
+    )
+    assert hf_diffusers_utils._resolve_remote_repo_model_index_path(
+        "test/anima"
+    ) == str(path)
 
 
 if __name__ == "__main__":

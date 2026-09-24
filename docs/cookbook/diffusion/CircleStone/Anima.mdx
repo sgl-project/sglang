@@ -1,0 +1,82 @@
+---
+title: Anima
+description: "Deploy Anima Base v1.0 with SGLang Diffusion for anime and illustration generation, using native components and single- or multi-GPU execution."
+---
+
+import { DiffusionModelTags } from '/src/snippets/diffusion/model-tags.jsx';
+import { Deployment } from '/src/snippets/_deployment.jsx';
+import { config } from '/src/snippets/configs/CircleStone/anima.jsx';
+
+<DiffusionModelTags tags={["image", "text-to-image", "anime + illustration", "2B transformer"]} />
+
+## 1. Quick start
+
+Install the diffusion dependencies on Linux with NVIDIA CUDA, then install this
+integration from its source checkout:
+
+```bash Installation
+uv pip install "sglang[diffusion]" --prerelease=allow
+uv pip install -e "python[diffusion]"
+```
+
+Use the official `circlestone-labs/Anima-Base-v1.0-Diffusers` checkpoint. SGLang reads
+its `modular_model_index.json` directly; no checkpoint conversion or newer Diffusers
+runtime is required.
+
+<Deployment config={config} />
+
+## 2. Model capabilities
+
+[Anima](https://huggingface.co/circlestone-labs/Anima) is CircleStone Labs and Comfy
+Org's text-to-image model for anime and illustration. It combines a Cosmos Predict2
+transformer with Qwen3 text encoding, a learned T5-token conditioner, and a Qwen-Image
+VAE. Prompts can combine tags with natural-language descriptions.
+
+This integration targets **Base v1.0 text-to-image**. It does not claim support for
+the separate Aesthetic or Turbo checkpoints, single-file ComfyUI weights, or image
+editing. The checkpoint uses the CircleStone Labs Non-Commercial License; review
+the [official license](https://huggingface.co/circlestone-labs/Anima/blob/main/LICENSE.md)
+before deployment.
+
+## 3. Sampling
+
+Defaults are 1024 x 1024, 30 steps, guidance scale 4, and an empty negative prompt.
+Width and height should be divisible by 16. `max_sequence_length` defaults to 512
+and accepts 1 through 4096. The text conditioner pads short sequences to 512 tokens;
+these padding positions remain part of the transformer's cross-attention, matching
+the official implementation.
+
+For offline generation:
+
+```bash Generate
+sglang generate \
+  --model-path circlestone-labs/Anima-Base-v1.0-Diffusers \
+  --prompt "masterpiece, best quality, safe, watercolor landscape, a quiet seaside village at sunset" \
+  --seed 42 \
+  --save-output
+```
+
+Use the same seed, generator device, dimensions, scheduler settings, and precision
+when comparing runtimes. Latents and scheduler updates remain FP32; the transformer,
+text components, and VAE default to BF16. Different attention kernels can produce
+small floating-point differences that accumulate during denoising.
+
+## 4. Runtime features
+
+The pipeline reuses SGLang's native Qwen3 encoder, Qwen-Image VAE, component loaders,
+denoising loop, and residency management. Anima's transformer and text conditioner
+are native modules, not wrappers around Diffusers models.
+
+For multi-GPU execution, choose TP to shard transformer weights or Ulysses/Ring to
+shard image tokens. The transformer has 16 heads, so `tp_size * ulysses_degree`
+must divide 16. CFG parallelism additionally splits conditional and unconditional
+denoising and requires guidance greater than 1. The total GPU count must match the
+selected parallel topology.
+
+CPU and layerwise offload trade memory for transfers. The additional
+`text_conditioner` component accepts the same residency controls as other native
+components. Cache-DiT and quantized attention are approximate optimizations; assess
+image quality for your prompts before enabling them. See
+[performance optimization](/docs/sglang-diffusion/performance-optimization) for the
+shared controls and [compatibility](/docs/sglang-diffusion/compatibility_matrix#anima)
+for the tested scope.

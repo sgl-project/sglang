@@ -785,11 +785,18 @@ def _resolve_remote_repo_model_index_path(
         if not envs.SGLANG_USE_MODELSCOPE.get():
             from huggingface_hub import try_to_load_from_cache
 
-            cached = try_to_load_from_cache(
-                repo_id=model_name_or_path, filename=filename
+            filenames = (
+                (filename, "modular_model_index.json")
+                if filename == "model_index.json"
+                else (filename,)
             )
-            if isinstance(cached, str) and os.path.exists(cached):
-                cached_path = cached
+            for candidate in filenames:
+                cached = try_to_load_from_cache(
+                    repo_id=model_name_or_path, filename=candidate
+                )
+                if isinstance(cached, str) and os.path.exists(cached):
+                    cached_path = cached
+                    break
         if cached_path is not None:
             logger.warning(
                 "Could not fetch model_index.json for '%s' from the Hugging Face "
