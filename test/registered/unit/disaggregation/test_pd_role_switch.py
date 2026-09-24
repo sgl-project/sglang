@@ -131,7 +131,6 @@ class TestHandlePdRoleSwitch(unittest.TestCase):
     def test_rejected_when_decode_graph_headroom_is_insufficient(self):
         s = self._scheduler(DisaggregationMode.PREFILL)
         s.device = "cuda"
-        s.ps = SimpleNamespace(gpu_id=0)
         s.tp_worker.get_decode_cuda_graph_bs.return_value = []
         with patch.object(role_switch, "get_available_gpu_memory", return_value=0.5):
             out = Scheduler.handle_pd_role_switch(
@@ -151,7 +150,6 @@ class TestHandlePdRoleSwitch(unittest.TestCase):
     def test_decode_graph_headroom_allows_flip(self):
         s = self._scheduler(DisaggregationMode.PREFILL)
         s.device = "cuda"
-        s.ps = SimpleNamespace(gpu_id=0)
         s.tp_worker.get_decode_cuda_graph_bs.return_value = []
         with patch.object(role_switch, "get_available_gpu_memory", return_value=1.0):
             out = Scheduler.handle_pd_role_switch(
@@ -320,6 +318,7 @@ class TestPdRoleSwitchStartupValidation(unittest.TestCase):
         base = dict(
             disaggregation_transfer_backend="mori",
             disaggregation_mode="prefill",
+            disaggregation_decode_host_receive_threshold=0.0,
             enable_pd_role_switch=True,
             enable_dp_attention=False,
             ep_size=1,

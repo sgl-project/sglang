@@ -42,6 +42,14 @@ configure_environment() {
     esac
 
     OPTIONAL_DEPS="${1:-}"
+    if [ "$OPTIONAL_DEPS" = "diffusion" ]; then
+        export SGLANG_BUILD_RUST_EXTS=none
+        export SGLANG_RUST_BUILD_MODE=never
+        if [ -n "${GITHUB_ENV:-}" ]; then
+            echo "SGLANG_BUILD_RUST_EXTS=none" >> "$GITHUB_ENV"
+            echo "SGLANG_RUST_BUILD_MODE=never" >> "$GITHUB_ENV"
+        fi
+    fi
 
     # Whether to create a uv venv (set USE_VENV=1). Default: 0.
     USE_VENV="${USE_VENV:-0}"
@@ -275,6 +283,12 @@ clean_site_packages() {
         rm -rf "$SITE_PACKAGES/sglang"
     fi
 
+    # diffusion does not use the SRT Rust extensions
+    if [ "$OPTIONAL_DEPS" = "diffusion" ]; then
+        mark_step_done "${FUNCNAME[0]}"
+        return
+    fi
+
     # Install protoc + Rust toolchain (needed by setuptools-rust, e.g. the native gRPC extension)
     bash "${SCRIPT_DIR}/../utils/install_rust_protoc.sh"
     export PATH="${CARGO_HOME:-$HOME/.cargo}/bin:${PATH}"
@@ -295,7 +309,7 @@ clean_site_packages() {
 
 setup_cargo_cache() {
     if [ "${SGLANG_BUILD_RUST_EXTS:-}" = "none" ]; then
-        echo "Using prebuilt Rust extensions; skipping Cargo target setup"
+        echo "Rust extension compilation disabled; skipping Cargo target setup"
         mark_step_done "${FUNCNAME[0]}"
         return
     fi
@@ -454,14 +468,31 @@ install_pytorch_stack() {
         fi
     done
 
+    # A cancelled install can leave dist-info without files, which uv then skips.
+    REINSTALL_ARGS=$(python3 -c '
+import importlib.metadata as md
+for name in ("torch", "torchaudio", "torchvision", "torchcodec", "triton"):
+    try:
+        dist = md.distribution(name)
+    except md.PackageNotFoundError:
+        continue
+    if not all(dist.locate_file(f).exists() for f in dist.files or []):
+        print("--reinstall-package", name)
+')
+
     $PIP_CMD install \
         "${PYTORCH_SPECS[@]}" \
+        $REINSTALL_ARGS \
         --index-url "https://download.pytorch.org/whl/${CU_VERSION}"
 
     mark_step_done "${FUNCNAME[0]}"
 }
 
 require_prebuilt_rust_exts() {
+    if [ "$OPTIONAL_DEPS" = "diffusion" ]; then
+        mark_step_done "${FUNCNAME[0]}"
+        return
+    fi
     # Stages whose download succeeded set this to none. Runs before
     # setup_pip_toolchain uninstalls sglang, so clearing it here still reaches
     # install_sglang below - setup.py reads it from the environment at build time.
@@ -787,7 +818,7 @@ verify_imports() {
 
     # One process; torch/cutlass do not import sglang, so the find_spec check
     # still runs ahead of any sglang import.
-    SGLANG_EXPECTED_INIT="${REPO_ROOT}/python/sglang/__init__.py" python3 -c '
+    SGLANG_CI_OPTIONAL_DEPS="$OPTIONAL_DEPS" SGLANG_EXPECTED_INIT="${REPO_ROOT}/python/sglang/__init__.py" python3 -c '
 import ctypes
 import importlib.metadata
 import os
@@ -830,13 +861,14 @@ print(f"sglang resolves to {spec.origin}")
 # Import, not find_spec: the finders locate an extension without dlopening it,
 # so a .so that cannot load passes find_spec and only fails inside some suite.
 import importlib
-for mod in ("server", "grpc", "multimodal"):
-    name = f"sglang.srt.rust_extensions._{mod}"
-    try:
-        importlib.import_module(name)
-    except Exception as exc:
-        raise SystemExit(f"{name} is present but does not load: {exc!r}")
-    print(f"{name} loads")
+if os.environ["SGLANG_CI_OPTIONAL_DEPS"] != "diffusion":
+    for mod in ("server", "grpc", "multimodal"):
+        name = f"sglang.srt.rust_extensions._{mod}"
+        try:
+            importlib.import_module(name)
+        except Exception as exc:
+            raise SystemExit(f"{name} is present but does not load: {exc!r}")
+        print(f"{name} loads")
 '
 
     mark_step_done "${FUNCNAME[0]}"

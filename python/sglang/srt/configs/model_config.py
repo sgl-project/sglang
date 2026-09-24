@@ -20,7 +20,7 @@ import os
 from enum import Enum, IntEnum, auto
 from functools import cached_property
 from pathlib import Path
-from typing import Any, List, Optional, Set, Union
+from typing import Any, Callable, List, Optional, Set, Union
 
 import torch
 from transformers import PretrainedConfig
@@ -45,6 +45,29 @@ from sglang.srt.utils.runai_utils import ObjectStorageModel, is_runai_obj_uri
 from sglang.utils import is_in_ci
 
 logger = logging.getLogger(__name__)
+
+_MODEL_CONFIG_FACTORIES: dict[type[ServerArgs], Callable[..., "ModelConfig"]] = {}
+
+
+def register_model_config_factory(
+    server_args_type: type[ServerArgs], factory: Callable[..., "ModelConfig"]
+) -> None:
+    """Register a factory with the same signature as ModelConfig.from_server_args.
+
+    Register before resolution or model construction in each process. The nearest
+    registered type in the argument record's MRO wins, so registrations cover
+    subclasses too. Repeating the same registration is harmless; replacing a
+    different factory for the same type is an error.
+    """
+    if not issubclass(server_args_type, ServerArgs):
+        raise TypeError("model-config factories require a ServerArgs subclass")
+    previous = _MODEL_CONFIG_FACTORIES.get(server_args_type)
+    if previous is not None and previous is not factory:
+        raise ValueError(
+            f"A model-config factory is already registered for {server_args_type.__qualname__}"
+        )
+    _MODEL_CONFIG_FACTORIES[server_args_type] = factory
+
 
 MIMO_V2_MODEL_ARCHS = (
     "MiMoV2ForCausalLM",
@@ -540,6 +563,7 @@ class ModelConfig:
             _quant_config_to_dict(getattr(self.hf_config, "quantization_config", None))
             or {}
         )
+        self.hf_quant_config: dict = quantization_config
         routed_experts_quant_method = quantization_config.get(
             "routed_experts_quant_method"
         )
@@ -692,27 +716,7 @@ class ModelConfig:
             self.hf_config.ngram_embedding_n if self.use_ngram_embedding else 0
         )
         self.use_engram = bool(getattr(self.hf_config, "engram_layer_ids", ()))
-        # A multimodal arch is piecewise-incompatible until its LM prefill is validated.
-        self.is_piecewise_cuda_graph_disabled_model = (
-            is_piecewise_cuda_graph_disabled_model(self.hf_config.architectures)
-            or (
-                self.is_multimodal
-                and not is_multimodal_piecewise_cuda_graph_supported(
-                    self.hf_config.architectures
-                )
-            )
-        )
-        # Multimodal archs whose language-model prefill is verified safe to capture
-        # under piecewise CUDA graph. ServerArgs otherwise disables prefill piecewise
-        # CG for every multimodal model; this opt-in re-enables it for listed archs
-        # (the vision encoder still runs eagerly via general_mm_embed_routine, only the
-        # LM forward is captured).
-        self.is_multimodal_piecewise_cuda_graph_supported = enable_multimodal and (
-            is_multimodal_piecewise_cuda_graph_supported(self.hf_config.architectures)
-        )
-        self.is_multimodal_breakable_cuda_graph_supported = enable_multimodal and (
-            is_multimodal_breakable_cuda_graph_supported(self.hf_config.architectures)
-        )
+        self._derive_multimodal_cuda_graph_support(enable_multimodal)
         self.dtype = _get_and_verify_dtype(self.hf_text_config, dtype)
 
         # Derive context length and model shapes
@@ -763,6 +767,18 @@ class ModelConfig:
         context_length: Optional[int] = None,
         **kwargs,
     ):
+        for record_type in type(server_args).__mro__:
+            factory = _MODEL_CONFIG_FACTORIES.get(record_type)
+            if factory is not None:
+                return factory(
+                    server_args,
+                    model_path=model_path,
+                    model_revision=model_revision,
+                    is_draft_model=is_draft_model,
+                    context_length=context_length,
+                    **kwargs,
+                )
+
         cfg = resolving_view(server_args)
         quantization = (
             cfg.speculative_draft_model_quantization
@@ -802,6 +818,31 @@ class ModelConfig:
             model_config_parser=cfg.model_config_parser,
             speculative_algorithm=cfg.speculative_algorithm,
             **kwargs,
+        )
+
+    def _derive_multimodal_cuda_graph_support(self, enable_multimodal: bool) -> None:
+        """Declare graph capabilities before deriving shapes and validating config.
+
+        External ModelConfig subclasses can extend this without modifying global
+        architecture tables or repairing the config after construction.
+        """
+        # A multimodal arch is piecewise-incompatible until its LM prefill is validated.
+        self.is_piecewise_cuda_graph_disabled_model = (
+            is_piecewise_cuda_graph_disabled_model(self.hf_config.architectures)
+            or (
+                self.is_multimodal
+                and not is_multimodal_piecewise_cuda_graph_supported(
+                    self.hf_config.architectures
+                )
+            )
+        )
+        # The vision encoder still runs eagerly; this opt-in captures only the
+        # language-model prefill of architectures validated for piecewise graphs.
+        self.is_multimodal_piecewise_cuda_graph_supported = enable_multimodal and (
+            is_multimodal_piecewise_cuda_graph_supported(self.hf_config.architectures)
+        )
+        self.is_multimodal_breakable_cuda_graph_supported = enable_multimodal and (
+            is_multimodal_breakable_cuda_graph_supported(self.hf_config.architectures)
         )
 
     def _config_draft_model(self):
@@ -886,6 +927,11 @@ class ModelConfig:
             and self.hf_config.architectures[0] == "InklingForConditionalGeneration"
         ):
             self.hf_config.architectures[0] = "InklingForConditionalGenerationMTP"
+        if (
+            is_draft_model
+            and self.hf_config.architectures[0] == "GigaChat35ForCausalLM"
+        ):
+            self.hf_config.architectures[0] = "GigaChat35ForCausalLMNextN"
         if (
             is_draft_model
             and self.hf_config.architectures[0] == "Step3p7ForConditionalGeneration"
@@ -987,6 +1033,9 @@ class ModelConfig:
             is_hybrid_swa_model(self.hf_config.architectures, self.hf_text_config)
             and not self.disable_hybrid_swa_memory
         )
+        # Whole-model split, read-only; per-runner slices live on ModelLayerInfo.
+        self.swa_attention_layer_ids: Optional[List[int]] = None
+        self.full_attention_layer_ids: Optional[List[int]] = None
 
         if self.is_hybrid_swa:
             logger.debug(f"Hybrid swa model: {self.hf_config.architectures=}")
@@ -1019,6 +1068,7 @@ class ModelConfig:
             "InklingForConditionalGeneration",
             "InklingForConditionalGenerationMTP",
             "Gemma4UnifiedForConditionalGeneration",
+            "DiffusionGemmaForBlockDiffusion",
         ]
 
     @cached_property
@@ -1150,6 +1200,8 @@ class ModelConfig:
             or "MistralLarge3ForCausalLMEagle" in self.hf_config.architectures
             or "KimiK25ForConditionalGeneration" in self.hf_config.architectures
             or "Eagle3DeepseekV2ForCausalLM" in self.hf_config.architectures
+            or "GigaChat35ForCausalLM" in self.hf_config.architectures
+            or "GigaChat35ForCausalLMNextN" in self.hf_config.architectures
         ):
             self.head_dim = 256
             self.attention_arch = AttentionArch.MLA
@@ -2150,6 +2202,7 @@ multimodal_model_archs = [
     "Gemma3nForConditionalGeneration",
     "Gemma4ForConditionalGeneration",
     "Gemma4UnifiedForConditionalGeneration",
+    "DiffusionGemmaForBlockDiffusion",
     "Glm4vForConditionalGeneration",
     "Glm4vMoeForConditionalGeneration",
     "Glm5NextForConditionalGeneration",
@@ -2397,6 +2450,7 @@ def is_hybrid_swa_model(
         "Gemma4ForCausalLM",
         "Gemma4ForConditionalGeneration",
         "Gemma4UnifiedForConditionalGeneration",
+        "DiffusionGemmaForBlockDiffusion",
         "LagunaForCausalLM",
         "MellumForCausalLM",
         "MuseGlimmerForCausalLM",
@@ -2477,6 +2531,7 @@ def get_hybrid_layer_ids(
         "Gemma4ForCausalLM" in model_architectures
         or "Gemma4ForConditionalGeneration" in model_architectures
         or "Gemma4UnifiedForConditionalGeneration" in model_architectures
+        or "DiffusionGemmaForBlockDiffusion" in model_architectures
         or "LagunaForCausalLM" in model_architectures
         or "MellumForCausalLM" in model_architectures
         or "MuseGlimmerForCausalLM" in model_architectures

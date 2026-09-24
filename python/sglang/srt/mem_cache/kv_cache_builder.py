@@ -25,7 +25,6 @@ class KVCacheBuildResult:
 
 from typing import TYPE_CHECKING
 
-from sglang.srt.arg_groups.overrides import resolving_view
 from sglang.srt.configs.hybrid_arch import (
     glm5_next_config,
     hybrid_gdn_config,
@@ -36,10 +35,14 @@ from sglang.srt.configs.hybrid_arch import (
 )
 from sglang.srt.configs.model_config import ModelImpl, is_deepseek_dsa
 from sglang.srt.environ import envs
-from sglang.srt.hardware_backend.mlx.runtime import use_mlx
 from sglang.srt.managers.mm_schedule import init_mm_embedding_cache
+from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
-from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
+from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
+from sglang.srt.mem_cache.hicache_auto_size import auto_size_hicache
+from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, MHATokenToKVPool
+from sglang.srt.mem_cache.pool_host.base import _WRITE_BACK_STAGING_PAGE_CHUNK
+from sglang.srt.mem_cache.pool_host.mha import prepare_mha_write_back_staging
 from sglang.srt.mem_cache.registry import TreeCacheBuildContext, create_tree_cache
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
@@ -51,41 +54,66 @@ from sglang.srt.runtime_context import (
     get_parallel,
     get_schedule,
 )
-from sglang.srt.utils import is_hip
+from sglang.srt.speculative.base_spec_worker import HiCacheDraftMode
+from sglang.srt.utils import ceil_align, is_hip
 
 if TYPE_CHECKING:
     from torch.distributed import ProcessGroup
 
     from sglang.srt.configs.model_config import ModelConfig
     from sglang.srt.distributed.parallel_state import GroupCoordinator
-    from sglang.srt.distributed.parallel_state_wrapper import ParallelState
     from sglang.srt.managers.tp_worker import BaseTpWorker
     from sglang.srt.server_args import ServerArgs
     from sglang.srt.speculative.base_spec_worker import HiCacheDraftPlan
     from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
 
-def get_draft_kv_pool(
-    *,
-    draft_worker: BaseTpWorker,
-    spec_algorithm: SpeculativeAlgorithm,
-    server_args: ServerArgs,
-):
-    """Return the draft token-to-KV pool for the current draft worker,
-    or None when no draft KV pool is available."""
-    if draft_worker is None or spec_algorithm.is_ngram():
-        return None
+def prepare_hicache_staging(
+    *, tp_worker: BaseTpWorker, draft_plan: Optional[HiCacheDraftPlan] = None
+) -> None:
+    """Materialize MHA transfer buffers before the final KV budget is measured."""
+    memory = get_memory()
+    page_size = get_schedule().page_size
+    if memory.hicache_mem_layout != "page_first" or not (
+        memory.enable_hierarchical_cache
+        or get_disagg().disaggregation_decode_retraction_backup == "host_pool"
+    ):
+        return
 
-    # V2 draft workers exist only on their hosting PP stage; other ranks own no
-    # nested draft worker or draft KV pool.
-    if draft_worker.draft_worker is None:
-        return None
+    def prepare(pool, packed_drafts=(), *, sidecar=False):
+        if isinstance(pool, SWAKVPool):
+            prepare(pool.full_kv_pool)
+            prepare(pool.swa_kv_pool, tuple(p.swa_kv_pool for p in packed_drafts))
+        elif isinstance(pool, HybridLinearKVPool):
+            prepare(pool.full_kv_pool, packed_drafts, sidecar=sidecar)
+        elif isinstance(pool, MHATokenToKVPool):
+            # Ratio-based host pools can only shrink with post-capture KV sizing.
+            # Sidecars instead inherit their target host pool's capacity.
+            page_capacity = _WRITE_BACK_STAGING_PAGE_CHUNK
+            if memory.hicache_size <= 0 and not sidecar:
+                page_capacity = int(pool.size * memory.hicache_ratio) // page_size + 1
+            staging = prepare_mha_write_back_staging(
+                pool,
+                layer_num=pool.layer_num + len(packed_drafts),
+                page_size=page_size,
+                page_capacity=page_capacity,
+            )
+            if staging is not None:
+                logger.info(
+                    "HiCache staging prepared before KV sizing: %.1f MiB, %d layers",
+                    sum(buffer.nbytes for buffer in staging) / (1 << 20),
+                    pool.layer_num + len(packed_drafts),
+                )
 
-    if resolving_view(server_args).enable_multi_layer_eagle:
-        draft_runner = draft_worker.draft_worker.draft_runner_list[0]
-    else:
-        draft_runner = draft_worker.draft_worker.draft_runner
-    return draft_runner.token_to_kv_pool
+    runner = tp_worker.model_runner
+    prepare(runner.token_to_kv_pool, runner.mtp_draft_device_pools)
+    if draft_plan is not None and draft_plan.mode == HiCacheDraftMode.SIDECAR:
+        for pool in draft_plan.device_pools:
+            # SWA sidecars follow only the draft's SWA component.
+            prepare(
+                pool.swa_kv_pool if isinstance(pool, BaseSWAKVPool) else pool,
+                sidecar=True,
+            )
 
 
 def maybe_register_hicache_draft(
@@ -93,8 +121,6 @@ def maybe_register_hicache_draft(
     tree_cache,
     draft_plan: HiCacheDraftPlan,
 ) -> None:
-    from sglang.srt.speculative.base_spec_worker import HiCacheDraftMode
-
     if draft_plan.mode != HiCacheDraftMode.SIDECAR:
         return
 
@@ -116,9 +142,14 @@ def maybe_register_hicache_draft(
 
 
 # Host slots a backup-only retraction pool gets, as a fraction of the device
-# pool. Sized well under 1.0 because a retraction burst touches a fraction of
-# the device tokens; overflow aborts the request rather than pre-reserving.
+# pool, with a floor large enough for one maximum-length request.
 BACKUP_ONLY_HICACHE_RATIO = 0.2
+
+
+def decode_retraction_max_tokens(req_to_token_pool, kv_cache) -> int:
+    return ceil_align(
+        min(req_to_token_pool.max_context_len - 1, kv_cache.size), kv_cache.page_size
+    )
 
 
 def uses_ssm_state(model_config) -> bool:
@@ -153,19 +184,11 @@ def resolve_decode_retraction_backup(*, tp_worker: BaseTpWorker) -> str:
             if tp_worker.is_hybrid_swa
             else None
         )
-        # Host-pool retraction transfers full and sliding-window components
-        # only, so a model with recurrent state stays on cpu_tensor.
-        #
-        # The unified pool is excluded for the same reason hierarchical cache is
-        # (see `handle_unified_memory_pool`): the host-transfer path indexes the
-        # device buffers with the ids it is handed, and under the unified pool
-        # those are VIRTUAL. It also cannot be sized from `kv_cache.size`, which
-        # is a KERNEL-FACING row count (`num_pages * 2 * layer_num * page_size`)
-        # rather than a token capacity -- gpt-oss-20b reports 85M "tokens" and
-        # asks for 418 GB of host memory per component.
+        # Host-pool retraction does not address unified page envelopes or
+        # recurrent state, so those configurations stay on cpu_tensor.
         supports_host_pool = (
-            not uses_ssm_state(tp_worker.model_runner.model_config)
-            and not memory.enable_unified_memory
+            not memory.enable_unified_memory
+            and not uses_ssm_state(tp_worker.model_runner.model_config)
             and (
                 isinstance(kv_cache, MHATokenToKVPool)
                 or (isinstance(kv_cache, SWAKVPool) and full_tokens_per_layer > 0)
@@ -194,11 +217,19 @@ def resolve_decode_retraction_backup(*, tp_worker: BaseTpWorker) -> str:
 
     if memory.hicache_ratio is None:
         # Only a decode server reaches resolution with the ratio unset. A
-        # backup-only pool can be small: retractions that overflow it abort their
-        # request instead of crashing the scheduler. Sharing the pool with
-        # HiCache keeps the standard default.
+        # backup-only pool fits at least one runnable request. Sharing the pool
+        # with prefix caching keeps the standard HiCache default.
         if backend == "host_pool" and not memory.enable_hierarchical_cache:
-            fields["hicache_ratio"] = BACKUP_ONLY_HICACHE_RATIO
+            ratio = BACKUP_ONLY_HICACHE_RATIO
+            if memory.hicache_size == 0:
+                req_pool, allocator = tp_worker.get_memory_pool()
+                kv_pool = allocator.get_kvcache()
+                min_tokens = decode_retraction_max_tokens(req_pool, kv_pool)
+                if disagg.disaggregation_decode_host_receive_threshold > 0:
+                    # One request can receive while another is retracted.
+                    min_tokens *= 2
+                ratio = max(ratio, min_tokens / kv_pool.size)
+            fields["hicache_ratio"] = ratio
         else:
             fields["hicache_ratio"] = 2.0
 
@@ -219,12 +250,12 @@ def build_kv_cache(
     attn_cp_cpu_group: ProcessGroup,
     enable_metrics: bool,
     enable_kv_cache_events: bool,
-    ps: ParallelState,
     tp_group: GroupCoordinator,
     pp_group: GroupCoordinator,
     enable_hierarchical_cache: bool,
     hicache_draft_plan: Optional[HiCacheDraftPlan] = None,
 ) -> KVCacheBuildResult:
+    parallel = get_parallel()
     sliding_window_size: Optional[int] = None
     full_tokens_per_layer: Optional[int] = None
     swa_tokens_per_layer: Optional[int] = None
@@ -233,7 +264,11 @@ def build_kv_cache(
     )
 
     # Hybrid memory pool
-    is_hybrid_swa = tp_worker.is_hybrid_swa
+    token_to_kv_pool = tp_worker.model_runner.token_to_kv_pool
+    is_hybrid_swa = tp_worker.is_hybrid_swa and (
+        not isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool)
+        or token_to_kv_pool.needs_paged_swa_allocator
+    )
     is_hybrid_ssm = uses_ssm_state(tp_worker.model_runner.model_config)
     is_dsa = is_deepseek_dsa(model_config.hf_config)
 
@@ -260,19 +295,13 @@ def build_kv_cache(
 
     # Decode-side radix cache supports SWA only through the unified tree, whose
     # component pools preserve the full-attention prefix while transferring the
-    # SWA window fresh. The legacy SWA cache and hybrid SSM pools remain
-    # incompatible with the prefix-match-and-lock allocation path.
+    # SWA window fresh. Hybrid SSM/KDA uses UnifiedRadixCache's Mamba
+    # component (match + lock + CoW), the same path as colocated serving.
     if (
         get_disagg().disaggregation_decode_enable_radix_cache
         and get_disagg().disaggregation_mode == "decode"
     ):
         if is_hybrid_swa:
-            if not (envs.SGLANG_ENABLE_UNIFIED_RADIX_TREE.get() or use_mlx()):
-                raise ValueError(
-                    "--disaggregation-decode-enable-radix-cache with sliding "
-                    "window attention (SWA) models requires the unified radix "
-                    "tree (set SGLANG_ENABLE_UNIFIED_RADIX_TREE=1)."
-                )
             if enable_hierarchical_cache:
                 raise ValueError(
                     "--disaggregation-decode-enable-radix-cache with sliding "
@@ -290,11 +319,6 @@ def build_kv_cache(
                     "--disaggregation-decode-enable-radix-cache does not support "
                     "SWA-compress models (e.g. Gemma4 / MiMo-V2) yet."
                 )
-        if is_hybrid_ssm:
-            raise ValueError(
-                "--disaggregation-decode-enable-radix-cache is incompatible "
-                "with Mamba/SSM models"
-            )
 
     effective_chunked_prefill_size = get_schedule().chunked_prefill_size
     if model_config.is_multimodal and uses_transformers_backend:
@@ -326,41 +350,45 @@ def build_kv_cache(
         enable_session_radix_cache=get_memory().enable_session_radix_cache,
         enable_mamba_extra_buffer=get_exec().mamba.enable_mamba_extra_buffer,
         enable_mamba_extra_buffer_lazy=get_exec().mamba.enable_mamba_extra_buffer_lazy,
-        pp_rank=ps.pp_rank,
-        pp_size=ps.pp_size,
-        attn_cp_rank=ps.attn_cp_rank,
-        attn_cp_size=ps.attn_cp_size,
+        pp_rank=parallel.pp_rank,
+        pp_size=parallel.pp_size,
+        attn_cp_rank=parallel.attn_cp_rank,
+        attn_cp_size=parallel.attn_cp_size,
         chunked_prefill_size=effective_chunked_prefill_size,
         sliding_window_size=sliding_window_size,
         mtp_draft_device_pools=mtp_draft_device_pools,
     )
 
-    tree_cache = create_tree_cache(
-        TreeCacheBuildContext(
-            server_args=server_args,
-            params=params,
-            is_hybrid_swa=is_hybrid_swa,
-            full_tokens_per_layer=full_tokens_per_layer,
-            is_hybrid_ssm=is_hybrid_ssm,
-            is_dsa=is_dsa,
-            enable_hierarchical_cache=enable_hierarchical_cache,
-            disable_radix_cache=disable_radix_cache,
-            effective_chunked_prefill_size=effective_chunked_prefill_size,
-            tp_worker=tp_worker,
-            model_config=model_config,
-            tp_size=ps.tp_size,
-            tp_rank=ps.tp_rank,
-            tp_group=tp_group,
-        )
+    tree_context = TreeCacheBuildContext(
+        server_args=server_args,
+        params=params,
+        is_hybrid_swa=is_hybrid_swa,
+        full_tokens_per_layer=full_tokens_per_layer,
+        is_hybrid_ssm=is_hybrid_ssm,
+        is_dsa=is_dsa,
+        enable_hierarchical_cache=enable_hierarchical_cache,
+        disable_radix_cache=disable_radix_cache,
+        effective_chunked_prefill_size=effective_chunked_prefill_size,
+        tp_worker=tp_worker,
+        model_config=model_config,
+        tp_size=parallel.tp_size,
+        tp_rank=parallel.tp_rank,
+        tp_group=tp_group,
     )
+    with auto_size_hicache(
+        params,
+        hicache_draft_plan,
+        enabled=enable_hierarchical_cache or retraction_backup == "host_pool",
+    ):
+        tree_cache = create_tree_cache(tree_context)
 
-    if (
-        enable_hierarchical_cache or retraction_backup == "host_pool"
-    ) and hicache_draft_plan is not None:
-        maybe_register_hicache_draft(
-            tree_cache=tree_cache,
-            draft_plan=hicache_draft_plan,
-        )
+        if (
+            enable_hierarchical_cache or retraction_backup == "host_pool"
+        ) and hicache_draft_plan is not None:
+            maybe_register_hicache_draft(
+                tree_cache=tree_cache,
+                draft_plan=hicache_draft_plan,
+            )
 
     if retraction_backup == "host_pool":
         if not isinstance(tree_cache, UnifiedRadixCache):
