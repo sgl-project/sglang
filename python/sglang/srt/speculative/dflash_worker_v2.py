@@ -614,6 +614,9 @@ class DFlashWorkerV2(BaseSpecWorker):
             ),
         ):
             self._draft_worker.init_attention_backends()
+        translator = self.draft_model_runner.kv_index_translator
+        if translator.is_translating:
+            translator.bind_and_verify_backends([self.draft_model_runner.attn_backend])
         self._need_mamba_verify_commit = mambaish_config(
             self.model_runner.model_config
         ) is not None and hasattr(
@@ -2504,7 +2507,6 @@ class DFlashWorkerV2(BaseSpecWorker):
 
         forward_batch = ForwardBatch(
             forward_mode=ForwardMode.TARGET_VERIFY,
-            out_cache_loc_id_space="kernel",
             batch_size=bs,
             input_ids=block_ids.flatten(),
             req_pool_indices=batch.req_pool_indices,
@@ -2524,6 +2526,10 @@ class DFlashWorkerV2(BaseSpecWorker):
             ),
             global_num_token_non_padded_cpu=bs * block_size,
         )
+        # Hand-built draft batch bypasses ForwardBatch.init_new: under the
+        # unified pool the write loc must be rebound to the draft's
+        # kernel-facing ids here (no-op on plain pools).
+        self.draft_model_runner.kv_index_translator.rebind_write_loc(forward_batch)
 
         if self.selector is not None:
             self._selector_sample = None

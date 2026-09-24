@@ -265,7 +265,10 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             )
 
             draft_num_layers = kvc.spec_aux_config.dflash_draft_num_layers
-            if (
+            fused_full_entry = kvc.fused_entry_bytes("full")
+            if fused_full_entry is not None:
+                self._cell_size = int(fused_full_entry)
+            elif (
                 draft_num_layers is not None
                 and int(draft_num_layers) > 0
                 and int(num_layers) > 0

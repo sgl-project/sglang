@@ -446,7 +446,9 @@ _SPEC_VERIFY_AUDITED_BACKENDS = frozenset(
 )
 
 
-def _assert_spec_verify_backends(server_args: Any, *, algorithm: str) -> None:
+def _assert_spec_verify_backends(
+    server_args: Any, *, algorithm: str, allowed: frozenset = None
+) -> None:
     """Refuse spec backends whose verify id rails are not translation-audited.
 
     Checks the target's prefill/decode pair AND the draft worker's own
@@ -454,7 +456,8 @@ def _assert_spec_verify_backends(server_args: Any, *, algorithm: str) -> None:
     before inheriting the target's, so it can be unaudited on its own."""
     from sglang.srt.arg_groups.overrides import attention_backends_of
 
-    allowed = _SPEC_VERIFY_AUDITED_BACKENDS
+    if allowed is None:
+        allowed = _SPEC_VERIFY_AUDITED_BACKENDS
     backends = set(attention_backends_of(resolved_view(server_args)))
     backends.discard(None)
     assert backends <= allowed, (
@@ -541,11 +544,18 @@ def handle_unified_memory_pool(server_args: Any) -> None:
                 "--enable-unified-memory host-pool decode retraction does not "
                 "support hybrid-SWA H2D/D2H transfers yet."
             )
-    assert cfg.speculative_algorithm in (None, "DSPARK", "EAGLE", "EAGLE3"), (
+    assert cfg.speculative_algorithm in (
+        None,
+        "DSPARK",
+        "EAGLE",
+        "EAGLE3",
+        "DFLASH",
+    ), (
         "--enable-unified-memory only supports --speculative-algorithm "
-        "DSPARK (chain draft) and EAGLE/EAGLE3 (fused draft KV); other "
-        "speculative algorithms are not yet audited for the unified pool's "
-        "virtual/kernel-facing loc translation. Got "
+        "DSPARK (chain draft), DFLASH (fused block draft), and "
+        "EAGLE/EAGLE3 (fused draft KV); other speculative algorithms are "
+        "not yet audited for the unified pool's virtual/kernel-facing loc "
+        "translation. Got "
         f"--speculative-algorithm={cfg.speculative_algorithm!r}."
     )
     assert cfg.speculative_eagle_topk in (None, 1), (
@@ -562,7 +572,14 @@ def handle_unified_memory_pool(server_args: Any) -> None:
         assert _mc.is_hybrid_swa or mambaish_config(_mc) is not None, (
             "--enable-unified-memory + EAGLE/EAGLE3 requires a unified "
             "target (hybrid-SWA or a mamba hybrid): the draft's KV lives "
-            "fused inside the full-attention page envelope."
+            "fused inside the full-attention page envelope (or falls back "
+            "to a private pool over the unified virtual id space)."
+        )
+        assert cfg.speculative_eagle_topk in (None, 1), (
+            "--enable-unified-memory + EAGLE/EAGLE3 supports a linear "
+            "draft chain only (--speculative-eagle-topk in {None, 1}); "
+            "tree verify is not audited for the unified pool. Got "
+            f"--speculative-eagle-topk={cfg.speculative_eagle_topk!r}."
         )
         eagle_allowed = (
             _SPEC_VERIFY_AUDITED_BACKENDS
@@ -576,9 +593,11 @@ def handle_unified_memory_pool(server_args: Any) -> None:
             and eagle_backends <= eagle_allowed
         ), (
             "--enable-unified-memory + EAGLE/EAGLE3 requires the "
-            f"spec-verify-audited attention backends {sorted(eagle_allowed)}, "
-            f"set explicitly (got {sorted(eagle_backends, key=str)}). The MLA "
-            "verify family does not apply to an MHA-shaped draft."
+            "spec-verify-audited attention backends "
+            f"{sorted(eagle_allowed)}, set explicitly (got "
+            f"{sorted(eagle_backends, key=str)}). Other backends do not "
+            "translate speculative verify indices to the unified pool's "
+            "physical id space yet."
         )
         draft_allowed = (None,) + tuple(sorted(eagle_allowed))
         assert cfg.speculative_draft_attention_backend in draft_allowed, (
@@ -589,7 +608,19 @@ def handle_unified_memory_pool(server_args: Any) -> None:
             "to inherit the target's."
         )
     if cfg.speculative_algorithm == "DSPARK":
+        assert cfg.speculative_eagle_topk in (None, 1), (
+            "--enable-unified-memory + DSPARK supports a linear draft "
+            "chain only (--speculative-eagle-topk in {None, 1}); tree "
+            "verify is not audited for the unified pool. Got "
+            f"--speculative-eagle-topk={cfg.speculative_eagle_topk!r}."
+        )
         _assert_spec_verify_backends(server_args, algorithm="DSPARK")
+    if cfg.speculative_algorithm == "DFLASH":
+        _assert_spec_verify_backends(
+            server_args,
+            algorithm="DFLASH",
+            allowed=frozenset({"triton", "fa3", "flashinfer"}),
+        )
     assert not cfg.enable_two_batch_overlap, (
         "--enable-unified-memory does not support --enable-two-batch-overlap: "
         "TBO's replay split hands each child a view without the pre-translate "
@@ -602,10 +633,10 @@ def handle_unified_memory_pool(server_args: Any) -> None:
         "is handed, and under the unified pool those are VIRTUAL."
     )
     assert not (
-        cfg.speculative_algorithm in ("EAGLE", "EAGLE3")
+        cfg.speculative_algorithm is not None
         and cfg.disaggregation_decode_retraction_backup == "host_pool"
     ), (
-        "--enable-unified-memory + EAGLE/EAGLE3 does not support "
+        "--enable-unified-memory with a draft model does not support "
         "--disaggregation-decode-retraction-backup=host_pool: the backup builds "
         "host pools off the draft's device pool, and a draft fused into the "
         "target's entries has no transfer surface of its own."

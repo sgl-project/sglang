@@ -185,12 +185,18 @@ def draft_swa_layer_ids(draft_model_config) -> Tuple[int, ...]:
 
 
 def draft_kv_profile(
-    draft_model_config, *, num_layers: int, attn_tp_size: int
+    draft_model_config,
+    *,
+    num_layers: int,
+    attn_tp_size: int,
+    num_depths: Optional[int] = None,
 ) -> DraftKVProfile:
     """The profile of a draft `ModelConfig`, heads divided by attn_tp the way
-    the target divides its own (drafts never join the DCP group)."""
+    the target divides its own (drafts never join the DCP group).
+    ``num_depths`` overrides the config's `num_nextn_predict_layers`."""
     mc = draft_model_config
-    num_depths = mc.num_nextn_predict_layers
+    if num_depths is None:
+        num_depths = mc.num_nextn_predict_layers
     return DraftKVProfile(
         num_layers=int(num_layers),
         full=DraftKVGeometry(
