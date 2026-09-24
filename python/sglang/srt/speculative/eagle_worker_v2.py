@@ -38,7 +38,6 @@ from sglang.srt.layers.moe.utils import (
     speculative_moe_a2a_backend_context,
     speculative_moe_backend_context,
 )
-from sglang.srt.managers.io_struct import UpdateWeightsFromTensorReqInput
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
@@ -117,7 +116,6 @@ from sglang.srt.utils.async_probe import (
     maybe_detect_oob,
 )
 from sglang.srt.utils.common import (
-    MultiprocessingSerializer,
     empty_context,
     fast_topk,
     get_available_gpu_memory,
@@ -129,7 +127,6 @@ from sglang.srt.utils.common import (
     is_xpu,
     log_info_on_rank0,
 )
-from sglang.srt.utils.patch_torch import monkey_patch_torch_reductions
 
 _is_cpu = is_cpu()
 _is_npu = is_npu()
@@ -1868,25 +1865,3 @@ class EAGLEWorkerV2(BaseSpecWorker):
             finalize_tree_path=True,
             grammar_barrier=grammar_barrier,
         )
-
-    def update_weights_from_tensor(self, recv_req: UpdateWeightsFromTensorReqInput):
-        monkey_patch_torch_reductions()
-        named_tensors = MultiprocessingSerializer.deserialize(
-            recv_req.serialized_named_tensors[self.model_runner.tp_rank]
-        )
-        success, message = (
-            self.draft_worker.draft_runner.weight_updater.update_weights_from_tensor(
-                named_tensors=named_tensors,
-                load_format=recv_req.load_format,
-            )
-        )
-        if not success:
-            return success, message
-
-        success, message = (
-            self.target_worker.model_runner.weight_updater.update_weights_from_tensor(
-                named_tensors=named_tensors,
-                load_format=recv_req.load_format,
-            )
-        )
-        return success, message

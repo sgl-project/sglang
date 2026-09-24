@@ -52,6 +52,58 @@ def _make_processor(case, server_mode: str = "full") -> SchedulerBatchResultProc
 
 
 class TestSamplingMaskMaterialization(CustomTestCase):
+    def test_selected_and_support_modes_share_one_batch(self):
+        output = LogitsProcessorOutput(
+            next_token_logits=None,
+            sampling_mask_output=SimpleNamespace(
+                token_ids=torch.tensor([[7, 8], [9, 10]], dtype=torch.int32),
+                lengths=torch.tensor([2, 2]),
+                selected_logprobs=torch.tensor([-0.5, -0.25]),
+                support_logprobs=torch.tensor([[-0.25, -1.5]]),
+                statuses=torch.tensor([SamplingMaskStatus.OK, SamplingMaskStatus.OK]),
+            ),
+        )
+        SchedulerBatchResultProcessor.materialize_sampling_mask_output(
+            reqs=[
+                SimpleNamespace(
+                    return_sampling_mask=True,
+                    sampling_logprobs_mode="selected",
+                ),
+                SimpleNamespace(
+                    return_sampling_mask=True,
+                    sampling_logprobs_mode="support",
+                ),
+            ],
+            output=output,
+        )
+        self.assertEqual(output.next_token_sampling_mask_idx, [[7, 8], [9, 10]])
+        self.assertEqual(
+            output.next_token_sampling_logprobs,
+            [-0.5, [-0.25, -1.5]],
+        )
+
+    def test_selected_mode_does_not_require_support_tensor(self):
+        output = LogitsProcessorOutput(
+            next_token_logits=None,
+            sampling_mask_output=SimpleNamespace(
+                token_ids=torch.tensor([[7, 8]], dtype=torch.int32),
+                lengths=torch.tensor([2]),
+                selected_logprobs=torch.tensor([-0.5]),
+                support_logprobs=None,
+                statuses=torch.tensor([SamplingMaskStatus.OK]),
+            ),
+        )
+        SchedulerBatchResultProcessor.materialize_sampling_mask_output(
+            reqs=[
+                SimpleNamespace(
+                    return_sampling_mask=True,
+                    sampling_logprobs_mode="selected",
+                )
+            ],
+            output=output,
+        )
+        self.assertEqual(output.next_token_sampling_logprobs, [-0.5])
+
     def test_packed_ids_are_copied_before_per_request_slicing(self):
         """Non-overlap capture must not perform one device copy per request."""
         packed_ids = Mock()
@@ -63,16 +115,26 @@ class TestSamplingMaskMaterialization(CustomTestCase):
                 token_ids=packed_ids,
                 lengths=torch.tensor([2, 1]),
                 selected_logprobs=torch.tensor([-0.5, -0.25]),
+                support_logprobs=torch.tensor([[-0.5, -0.75, 0.0], [-0.25, 0.0, 0.0]]),
                 statuses=torch.tensor([SamplingMaskStatus.OK, SamplingMaskStatus.OK]),
             ),
         )
         SchedulerBatchResultProcessor.materialize_sampling_mask_output(
-            reqs=[SimpleNamespace(return_sampling_mask=x) for x in (True, False, True)],
+            reqs=[
+                SimpleNamespace(
+                    return_sampling_mask=x,
+                    sampling_logprobs_mode="support",
+                )
+                for x in (True, False, True)
+            ],
             output=output,
         )
         packed_ids.cpu.assert_called_once_with()
         self.assertEqual(output.next_token_sampling_mask_idx, [[7, 8], None, [9]])
-        self.assertEqual(output.next_token_sampling_logprobs, [-0.5, None, -0.25])
+        self.assertEqual(
+            output.next_token_sampling_logprobs,
+            [[-0.5, -0.75], None, [-0.25]],
+        )
         self.assertIsNone(output.sampling_mask_output)
 
 

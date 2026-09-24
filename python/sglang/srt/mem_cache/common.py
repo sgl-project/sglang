@@ -123,28 +123,34 @@ def free_kv_row_segments(
     segments: list[tuple[torch.Tensor, int]],
     *,
     swa_evicted_seqlen: int,
+    swa_dead_lo: int = 0,
 ) -> None:
     """Free ascending disjoint ``(kv_indices, start_pos)`` segments of one
-    request's kv row, split at the SWA eviction floor."""
+    request's kv row; ``[swa_dead_lo, swa_evicted_seqlen)`` goes back full-side only."""
+    dead_lo, dead_hi = swa_dead_lo, max(swa_evicted_seqlen, swa_dead_lo)
     swa_dead: list[tuple[torch.Tensor, int]] = []
     swa_alive: list[tuple[torch.Tensor, int]] = []
     for kv_indices, start_pos in segments:
-        num_indices = kv_indices.numel()
-        if num_indices == 0:
+        end_pos = start_pos + kv_indices.numel()
+        lo = min(max(dead_lo, start_pos), end_pos)
+        hi = min(max(dead_hi, start_pos), end_pos)
+        # start_pos <= lo <= hi <= end_pos
+        # inside [lo, hi) is the swa dead segment
+        if hi <= lo:
+            swa_alive.append((kv_indices, start_pos))
             continue
-        # Below the floor the SWA peers are already gone -- window eviction, or
-        # the deliberately unmapped prefix of a PD decode SWA-tail prealloc.
-        num_dead = min(max(swa_evicted_seqlen - start_pos, 0), num_indices)
-        if num_dead > 0:
-            swa_dead.append((kv_indices[:num_dead], start_pos))
-        if num_dead < num_indices:
-            swa_alive.append((kv_indices[num_dead:], start_pos + num_dead))
+        swa_dead.append((kv_indices[lo - start_pos : hi - start_pos], lo))
+
+        if lo > start_pos:
+            swa_alive.append((kv_indices[: lo - start_pos], start_pos))
+        if end_pos > hi:
+            swa_alive.append((kv_indices[hi - start_pos :], hi))
 
     if swa_dead and swa_alive:
         # The two sides are separate calls, so neither one's page-disjointness
-        # check sees a floor that splits a page between them.
+        # check sees a boundary that splits a page between them.
         assert swa_evicted_seqlen % allocator.page_size == 0, (
-            f"SWA eviction floor {swa_evicted_seqlen} splits a page "
+            f"SWA eviction cursor {swa_evicted_seqlen} splits a page "
             f"(page_size {allocator.page_size})"
         )
     if swa_dead:
@@ -207,7 +213,7 @@ def dsv41_dspark_needs_rebootstrap(
     return isinstance(pool, DeepSeekV4TokenToKVPool) and 2 in pool.compression_ratios
 
 
-def retraction_backup(
+def backup_kv_cache(
     req: Req,
     tree_cache: BasePrefixCache,
     req_to_token_pool: ReqToTokenPool,
@@ -230,11 +236,11 @@ def retraction_backup(
         return True
 
     unified_cache = cast("UnifiedRadixCache", tree_cache)
-    req.kv.retraction_backup = unified_cache.retraction_backup(req)
+    req.kv.retraction_backup = unified_cache.backup_kv_cache(req)
     return req.kv.retraction_backup is not None
 
 
-def retraction_restore(
+def restore_kv_cache(
     req: Req,
     tree_cache: BasePrefixCache,
     req_to_token_pool: ReqToTokenPool,
@@ -251,11 +257,13 @@ def retraction_restore(
 
     unified_cache = cast("UnifiedRadixCache", tree_cache)
     assert req.kv.retraction_backup is not None
-    unified_cache.retraction_restore(req, req.kv.retraction_backup)
+    unified_cache.restore_kv_cache(req, req.kv.retraction_backup)
     req.kv.retraction_backup = None
 
 
-def retraction_discard(req: Req, tree_cache: BasePrefixCache, backend: str) -> None:
+def discard_kv_cache_backup(
+    req: Req, tree_cache: BasePrefixCache, backend: str
+) -> None:
     if backend == "cpu_tensor":
         req.kv.retraction_backup = None
         return
@@ -265,7 +273,7 @@ def retraction_discard(req: Req, tree_cache: BasePrefixCache, backend: str) -> N
         return
 
     unified_cache = cast("UnifiedRadixCache", tree_cache)
-    unified_cache.retraction_discard(req.kv.retraction_backup)
+    unified_cache.discard_kv_cache_backup(req.kv.retraction_backup)
     req.kv.retraction_backup = None
 
 

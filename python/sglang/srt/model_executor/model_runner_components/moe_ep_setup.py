@@ -13,7 +13,7 @@ from sglang.srt.eplb.lplb_solver import (
 )
 from sglang.srt.layers.moe.hash_topk import HashTopK
 from sglang.srt.layers.moe.topk import TopK
-from sglang.srt.runtime_context import get_exec
+from sglang.srt.runtime_context import get_exec, get_parallel
 from sglang.srt.utils import get_bool_env_var, is_hip, log_info_on_rank0
 
 if TYPE_CHECKING:
@@ -24,13 +24,8 @@ logger = logging.getLogger(__name__)
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
 
 
-def prepare_moe_topk(
-    *,
-    model,
-    model_config: ModelConfig,
-    moe_ep_size: int,
-    moe_ep_rank: int,
-) -> None:
+def prepare_moe_topk(*, model, model_config: ModelConfig) -> None:
+    parallel = get_parallel()
     balancer_cls = None
     num_prepared = 0
     num_routed_experts = None
@@ -61,8 +56,8 @@ def prepare_moe_topk(
             routed_scaling_factor = module.routed_scaling_factor
         module.waterfill_balancer = balancer_cls(
             num_routed_experts=num_physical_routed_experts,
-            world_size=moe_ep_size,
-            rank=moe_ep_rank,
+            world_size=parallel.moe_ep_size,
+            rank=parallel.moe_ep_rank,
             layer_id=module.layer_id,
             routed_scaling_factor=(
                 routed_scaling_factor if routed_scaling_factor is not None else 1.0

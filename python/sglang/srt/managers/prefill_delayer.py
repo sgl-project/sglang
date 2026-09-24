@@ -75,8 +75,6 @@ class _NegotiateOutput(NamedTuple):
 class PrefillDelayer:
     def __init__(
         self,
-        dp_size: int,
-        attn_tp_size: int,
         cpu_group,
         max_delay_passes: int,
         token_usage_low_watermark: Optional[float],
@@ -106,9 +104,10 @@ class PrefillDelayer:
             f"max_delay_ms={self._max_delay_ms} "
             f"queue_trigger_enabled={self._queue_trigger_enabled}"
         )
-        self.dp_size = dp_size
-        self.enable_dp_attention = get_parallel().enable_dp_attention
-        dp_size_dim = dp_size if self.enable_dp_attention else 1
+        parallel = get_parallel()
+        self.dp_size = parallel.dp_size
+        self.enable_dp_attention = parallel.enable_dp_attention
+        dp_size_dim = self.dp_size if self.enable_dp_attention else 1
 
         # Mirror scheduler_dp_attn_mixin's NCCL all-gather path: when the
         # env flag is on (or overlap scheduling is disabled), ride the NCCL
@@ -131,7 +130,7 @@ class PrefillDelayer:
         # token_watermark_force_allow, running_batch, max_prefill_bs,
         # waiting_queue_len.
         self._global_info_buffer = torch.empty(
-            (dp_size_dim, attn_tp_size, 5),
+            (dp_size_dim, parallel.attn_tp_size, 5),
             dtype=torch.int64,
             device=self._gather_device,
         )
