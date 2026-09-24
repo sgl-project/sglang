@@ -9,6 +9,7 @@ import torch
 from diffusers.models.transformers.transformer_cosmos import CosmosRotaryPosEmbed
 from transformers import BatchEncoding
 
+from sglang.cli.utils import get_is_diffusion_model
 from sglang.multimodal_gen.configs.models.dits.anima import AnimaArchConfig
 from sglang.multimodal_gen.configs.pipeline_configs.anima import AnimaPipelineConfig
 from sglang.multimodal_gen.configs.sample.anima import AnimaSamplingParams
@@ -167,6 +168,7 @@ def test_modular_index_uses_existing_component_loaders(tmp_path, monkeypatch):
     }
     path = tmp_path / "modular_model_index.json"
     path.write_text(json.dumps(index))
+    assert get_is_diffusion_model(str(tmp_path))
     (tmp_path / "transformer").mkdir()
     (tmp_path / "transformer" / "diffusion_pytorch_model.safetensors").touch()
     (tmp_path / "t5_tokenizer").mkdir()
