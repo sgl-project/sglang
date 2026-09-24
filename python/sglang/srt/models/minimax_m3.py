@@ -39,7 +39,6 @@ from sglang.srt.layers.communicator import (
     LayerCommunicator,
     LayerScatterModes,
     ScatterMode,
-    complete_deferred_allreduce,
     enable_moe_dense_fully_dp,
 )
 from sglang.srt.layers.dp_attention import (
@@ -1539,8 +1538,11 @@ class MiniMaxM3Model(nn.Module):
                         ),
                     )
 
+        last_layer = self.layers[self.end_layer - 1]
+        hidden_states, residual = last_layer.layer_communicator.finish_layer_stack(
+            hidden_states, residual, forward_batch
+        )
         if not self.pp_group.is_last_rank:
-            hidden_states = complete_deferred_allreduce(hidden_states)
             return PPProxyTensors(
                 {"hidden_states": hidden_states, "residual": residual}
             )

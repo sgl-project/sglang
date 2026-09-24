@@ -60,7 +60,6 @@ from sglang.srt.layers.attention.dsa.dsa_indexer import Indexer
 from sglang.srt.layers.communicator import (
     LayerCommunicator,
     LayerScatterModes,
-    complete_deferred_allreduce,
     enable_moe_dense_fully_dp,
 )
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
@@ -1823,8 +1822,11 @@ class Dots3Model(nn.Module):
                 zero_allocator=zero_allocator,
             )
 
+        last_layer = self.layers[self.end_layer - 1]
+        hidden_states, residual = last_layer.layer_communicator.finish_layer_stack(
+            hidden_states, residual, forward_batch
+        )
         if not self.pp_group.is_last_rank:
-            hidden_states = complete_deferred_allreduce(hidden_states)
             return PPProxyTensors(
                 {
                     "hidden_states": hidden_states,

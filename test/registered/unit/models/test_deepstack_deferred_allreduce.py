@@ -9,6 +9,7 @@ from unittest.mock import patch
 import torch
 from torch import nn
 
+from sglang.srt.layers.communicator import LayerCommunicator
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -34,6 +35,8 @@ class DeferringLayer(nn.Module):
     def __init__(self, is_last_layer):
         super().__init__()
         self.is_last_layer = is_last_layer
+        # The model ends its layers at this communicator's finish_layer_stack.
+        self.layer_communicator = LayerCommunicator.__new__(LayerCommunicator)
 
     def forward(
         self, positions=None, hidden_states=None, forward_batch=None, residual=None, **_

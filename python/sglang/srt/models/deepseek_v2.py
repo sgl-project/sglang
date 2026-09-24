@@ -70,7 +70,6 @@ from sglang.srt.layers.aux_hidden_states import (
 from sglang.srt.layers.communicator import (
     LayerCommunicator,
     LayerScatterModes,
-    complete_deferred_allreduce,
     enable_moe_dense_fully_dp,
     get_attn_tp_context,
 )
@@ -3109,8 +3108,11 @@ class DeepseekV2Model(nn.Module):
                 zero_allocator=zero_allocator,
             )
 
+        last_layer = self.layers[self.end_layer - 1]
+        hidden_states, residual = last_layer.layer_communicator.finish_layer_stack(
+            hidden_states, residual, forward_batch
+        )
         if not self.pp_group.is_last_rank:
-            hidden_states = complete_deferred_allreduce(hidden_states)
             proxy_tensors = {
                 "hidden_states": hidden_states,
                 "residual": residual,
