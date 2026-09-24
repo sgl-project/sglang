@@ -222,6 +222,9 @@ def _prune_configs(configs, named_args, **kwargs):
 
 
 _LONG_PREFILL_SEQ_THRESHOLD = 32768
+# Up to this many query rows (spec-verify batches), the 2-warp fused kernel
+# beats the autotuned split-dim kernel once the grid exceeds one wave.
+_SHORT_SEQ_FUSED_MAX = 1024
 
 
 # ---------------------------------------------------------------------------
@@ -944,6 +947,7 @@ def _sparse_mla_reduce_kernel(
     )
 
 
+@_no_async_copy()
 def _triton_sparse_mla_fwd_splitk(
     q_nope: torch.Tensor,
     q_rope: torch.Tensor,
@@ -952,6 +956,7 @@ def _triton_sparse_mla_fwd_splitk(
     sm_scale: float,
     d_v: int,
     kv_splits: int,
+    fused_num_warps: int = 4,
 ) -> torch.Tensor:
     """Split-K path for short sequences."""
     is_fp8 = _validate_input_dtypes(q_nope, q_rope, kv)
@@ -1006,7 +1011,7 @@ def _triton_sparse_mla_fwd_splitk(
             USE_FP8_DOT=use_fp8_dot,
             BLOCK_H=BLOCK_H,
             BLOCK_K=BLOCK_K,
-            num_warps=4,
+            num_warps=fused_num_warps,
             num_stages=2,
         )
         return out.unsqueeze(0)
@@ -1098,13 +1103,23 @@ def triton_sparse_mla_fwd(
     head_blocks = max(1, (H + BLOCK_H - 1) // BLOCK_H)
     base_ctas = seq * head_blocks
     if base_ctas > num_cu:
+        if seq <= _SHORT_SEQ_FUSED_MAX:
+            return _triton_sparse_mla_fwd_splitk(
+                q_nope, q_rope, kv, indices, sm_scale, d_v, 1, fused_num_warps=2
+            )
         return _triton_sparse_mla_fwd_single(q_nope, q_rope, kv, indices, sm_scale, d_v)
-    kv_splits = min(
-        _kv_splits_heuristic(
-            seq, H, BLOCK_H, target_wg_per_cu=1.0, max_kv_splits=max_kv_splits
-        ),
-        max_kv_splits,
-    )
+    if base_ctas * 4 >= num_cu * 3:
+        kv_splits = 1
+    else:
+        # Keep at least two KV tiles per split; single-tile splits lose to the
+        # extra reduce traffic.
+        max_kv_splits = max(1, max_kv_splits // 2)
+        kv_splits = min(
+            _kv_splits_heuristic(
+                seq, H, BLOCK_H, target_wg_per_cu=2.0, max_kv_splits=max_kv_splits
+            ),
+            max_kv_splits,
+        )
     return _triton_sparse_mla_fwd_splitk(
         q_nope, q_rope, kv, indices, sm_scale, d_v, kv_splits
     )
