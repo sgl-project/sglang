@@ -146,18 +146,18 @@ class _DCPMetadataTests:
 
     def test_autotune_verify_under_dcp_skips_the_kernel(self):
         """A speculative autotune dummy verify under DCP must not run the kernel;
-        doing so starts its own tuning, which can hang ranks that OOM unevenly."""
+        a FlashInfer kernel would start its own tuning, which can hang ranks."""
         out, lse = self._verify_extend(dcp_enabled=True, in_autotune=True)
         n = 3 * NUM_DRAFT_TOKENS
         self.assertEqual((out.shape, out.dtype), ((n, 4 * 512), torch.bfloat16))
         self.assertEqual((lse.shape, lse.dtype), ((n, 4), torch.float32))
         self.assertFalse(out.any() or lse.any())
 
-    def test_real_verify_under_dcp_runs_the_kernel(self):
+    def test_real_verify_under_dcp_takes_the_real_path(self):
         with self.assertRaises(_RealVerifyPath):
             self._verify_extend(dcp_enabled=True, in_autotune=False)
 
-    def test_autotune_verify_without_dcp_runs_the_kernel(self):
+    def test_autotune_verify_without_dcp_takes_the_real_path(self):
         with self.assertRaises(_RealVerifyPath):
             self._verify_extend(dcp_enabled=False, in_autotune=True)
 

@@ -1244,9 +1244,9 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
 
         That pass discards attention/logits. Under DCP the synthetic
         full-head metadata can overflow the trtllm-gen workspace (and on
-        multi-node GB300 has also produced NVLink errors), and running the
-        kernel starts its own FlashInfer tuning, whose synthetic inputs can
-        OOM on some ranks only and hang the cross-rank tactic reduction.
+        multi-node GB300 has also produced NVLink errors), and the FlashInfer
+        kernels (trtllm-gen, cute-dsl) start their own tuning, whose synthetic
+        inputs can OOM on some ranks only and hang the cross-rank reduction.
         Real requests and CUDA-graph capture must not take this path.
         """
         output = torch.zeros(
