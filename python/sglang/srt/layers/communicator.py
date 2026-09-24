@@ -1397,21 +1397,50 @@ class CommunicateSimpleFn:
                 gathered_hidden_states.append(output)
             return tuple(gathered_hidden_states)
 
-        hidden_states, local_hidden_states = (
-            get_local_dp_buffer(get_parallel().attn_tp_group),
-            hidden_states,
-        )
-        attn_tp_all_gather_into_tensor(
-            hidden_states,
-            local_hidden_states,
-        )
-        return hidden_states
+        return _redistribute_from_attn_tp_shards(hidden_states)
 
 
 def _redistribute_from_attn_tp_shards(tensor: torch.Tensor) -> torch.Tensor:
     gathered = get_local_dp_buffer(get_parallel().attn_tp_group)
     attn_tp_all_gather_into_tensor(gathered, tensor)
     return gathered
+
+
+def _redistribute_to_attn_tp_shards(
+    tensor: torch.Tensor, context: CommunicateContext
+) -> torch.Tensor:
+    return tensor.tensor_split(context.attn_tp_size)[context.attn_tp_rank]
+
+
+def _reduce_and_redistribute_output_to_attn_tp_shards(
+    hidden_states: torch.Tensor, context: CommunicateContext
+) -> torch.Tensor:
+    local_hidden_states = hidden_states.tensor_split(context.attn_tp_size)[
+        context.attn_tp_rank
+    ]
+    attn_tp_reduce_scatter_tensor(local_hidden_states, hidden_states)
+    return local_hidden_states
+
+
+def _redistribute_input_to_moe_cp(
+    hidden_states: torch.Tensor, forward_batch: ForwardBatch, moe_cp_size: int
+) -> torch.Tensor:
+    # Zigzag split can produce unequal token counts across CP ranks
+    # (when seq_len % (cp_size * 2) != 0). NCCL allgather requires
+    # equal input sizes, so pad to the max per-rank token count.
+    per_rank_tokens = forward_batch.attn_cp_metadata.per_rank_actual_token
+    max_tokens = max(per_rank_tokens)
+    pad_size = max_tokens - hidden_states.shape[0]
+    if pad_size > 0:
+        hidden_states = torch.nn.functional.pad(hidden_states, [0, 0, 0, pad_size])
+
+    output = torch.empty(
+        (max_tokens * moe_cp_size, hidden_states.shape[1]),
+        dtype=hidden_states.dtype,
+        device=hidden_states.device,
+    )
+    moe_cp_all_gather_into_tensor(output, hidden_states)
+    return output
 
 
 def _mlp_input_reduce_output(
@@ -1633,13 +1662,11 @@ class CommunicateWithAllReduceAndLayerNormFn:
         *,
         residual_input_mode,
     ):
-        input_hidden_states = hidden_states
-        hidden_states = hidden_states.tensor_split(context.attn_tp_size)[
-            context.attn_tp_rank
-        ]
-        attn_tp_reduce_scatter_tensor(hidden_states, input_hidden_states)
+        hidden_states = _reduce_and_redistribute_output_to_attn_tp_shards(
+            hidden_states, context
+        )
         if residual_input_mode == ScatterMode.TP_ATTN_FULL:
-            residual = residual.tensor_split(context.attn_tp_size)[context.attn_tp_rank]
+            residual = _redistribute_to_attn_tp_shards(residual, context)
         if hidden_states.shape[0] != 0:
             hidden_states, residual = layernorm(hidden_states, residual)
         return hidden_states, residual
@@ -1710,24 +1737,9 @@ class CommunicateWithAllReduceAndLayerNormFn:
             and forward_batch.forward_mode.is_context_parallel_extend()
             and forward_batch.attn_cp_metadata is not None
         ):
-            # Zigzag split can produce unequal token counts across CP ranks
-            # (when seq_len % (cp_size * 2) != 0). NCCL allgather requires
-            # equal input sizes, so pad to the max per-rank token count.
-            per_rank_tokens = forward_batch.attn_cp_metadata.per_rank_actual_token
-            max_tokens = max(per_rank_tokens)
-            pad_size = max_tokens - hidden_states.shape[0]
-            if pad_size > 0:
-                hidden_states = torch.nn.functional.pad(
-                    hidden_states, [0, 0, 0, pad_size]
-                )
-
-            output = torch.empty(
-                (max_tokens * moe_cp_size, hidden_states.shape[1]),
-                dtype=hidden_states.dtype,
-                device=hidden_states.device,
+            hidden_states = _redistribute_input_to_moe_cp(
+                hidden_states, forward_batch, moe_cp_size
             )
-            moe_cp_all_gather_into_tensor(output, hidden_states)
-            hidden_states = output
 
         return hidden_states, residual
 
@@ -1765,6 +1777,20 @@ def _redistribute_output(
     forward_batch: ForwardBatch,
 ) -> None:
     dp_scatter(local_hidden_states, hidden_states, forward_batch)
+
+
+def _redistribute_output_from_moe_cp(
+    hidden_states: torch.Tensor, forward_batch: ForwardBatch
+) -> torch.Tensor:
+    moe_cp_rank = get_moe_cp_rank()
+    # The allgather was padded to max_tokens_per_rank (equal chunks).
+    # Extract this rank's actual (non-padded) tokens from its chunk.
+    per_rank_tokens = forward_batch.attn_cp_metadata.per_rank_actual_token
+    max_tokens_per_rank = max(per_rank_tokens)
+    actual_local_tokens = per_rank_tokens[moe_cp_rank]
+    return hidden_states.narrow(
+        0, moe_cp_rank * max_tokens_per_rank, actual_local_tokens
+    ).contiguous()
 
 
 def _output_to_local_tokens_step(
@@ -1904,16 +1930,7 @@ class CommunicateSummableTensorPairFn:
         **kwargs,
     ):
         hidden_states += residual
-        residual = None
-        hidden_states, local_hidden_states = (
-            get_local_dp_buffer(get_parallel().attn_tp_group),
-            hidden_states,
-        )
-        attn_tp_all_gather_into_tensor(
-            hidden_states,
-            local_hidden_states,
-        )
-        return hidden_states, residual
+        return _redistribute_from_attn_tp_shards(hidden_states), None
 
     @staticmethod
     def _scatter(
@@ -1923,9 +1940,7 @@ class CommunicateSummableTensorPairFn:
         context: CommunicateContext,
     ):
         assert residual is None, "not yet handled residual!=None"
-        tensor_list = list(hidden_states.tensor_split(context.attn_tp_size))
-        hidden_states = tensor_list[context.attn_tp_rank]
-        return hidden_states, residual
+        return _redistribute_to_attn_tp_shards(hidden_states, context), None
 
     @staticmethod
     def _scatter_hidden_states_moe(
@@ -1953,27 +1968,13 @@ class CommunicateSummableTensorPairFn:
             and forward_batch.forward_mode.is_context_parallel_extend()
             and forward_batch.attn_cp_metadata is not None
         ):
-            moe_cp_rank = get_moe_cp_rank()
-            # The allgather was padded to max_tokens_per_rank (equal chunks).
-            # Extract this rank's actual (non-padded) tokens from its chunk.
-            per_rank_tokens = forward_batch.attn_cp_metadata.per_rank_actual_token
-            max_tokens_per_rank = max(per_rank_tokens)
-            actual_local_tokens = per_rank_tokens[moe_cp_rank]
-            hidden_states = hidden_states.narrow(
-                0, moe_cp_rank * max_tokens_per_rank, actual_local_tokens
-            ).contiguous()
-
-        # DP scatter (if DP attention is enabled)
-        if context.attn_dp_size > 1:
-            if get_parallel().tp_size == get_parallel().attn_dp_size:
-                group = get_parallel().tp_group
-            else:
-                group = get_parallel().attn_tp_group
-            hidden_states_output, global_hidden_states = (
-                get_local_dp_buffer(group),
-                hidden_states,
+            hidden_states = _redistribute_output_from_moe_cp(
+                hidden_states, forward_batch
             )
-            dp_scatter(hidden_states_output, global_hidden_states, forward_batch)
-            hidden_states = hidden_states_output
+
+        if context.attn_dp_size > 1:
+            hidden_states = _to_local_tokens(
+                _redistribute_output, forward_batch, hidden_states
+            )
 
         return hidden_states, residual
