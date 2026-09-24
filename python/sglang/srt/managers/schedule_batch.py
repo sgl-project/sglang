@@ -978,6 +978,9 @@ class ReqKvInfo:
 class Req(ReqDllmMixin):
     """The input and output status of a request."""
 
+    # (tokenizer, token window, text) of the last tail_str decode.
+    _tail_str_memo = None
+
     def __init__(
         self,
         rid: str,
@@ -1730,8 +1733,16 @@ class Req(ReqDllmMixin):
         ):
             return ""
 
+        # The finish check and the stream prefix check decode the same window in
+        # one step; key on the window contents so any output_ids writer is safe.
         tail_len = self._stop_match_tail_len(new_accepted_len)
-        return self.tokenizer.decode(self.output_ids[-tail_len:])
+        window = self.output_ids[-tail_len:]
+        memo = self._tail_str_memo
+        if memo is not None and memo[0] is self.tokenizer and memo[1] == window:
+            return memo[2]
+        text = self.tokenizer.decode(window)
+        self._tail_str_memo = (self.tokenizer, window, text)
+        return text
 
     def check_match_stop_str_prefix(self) -> bool:
         if not self.sampling_params.stop_strs:
