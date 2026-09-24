@@ -34,8 +34,6 @@ from sglang.kernels.ops.elementwise.elementwise import (
 from sglang.srt.batch_overlap.two_batch_overlap import model_forward_maybe_tbo
 from sglang.srt.distributed import (
     get_pp_indices,
-    moe_expert_parallel_all_reduce,
-    moe_tensor_model_parallel_all_reduce,
     tensor_model_parallel_all_reduce,
 )
 from sglang.srt.environ import envs
@@ -47,6 +45,7 @@ from sglang.srt.layers.communicator import (
     LayerCommunicator,
     LayerScatterModes,
     ScatterMode,
+    complete_deferred_allreduce,
 )
 from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
@@ -61,7 +60,6 @@ from sglang.srt.layers.linear import (
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe import (
-    can_merge_post_experts_all_reduce,
     get_moe_a2a_backend,
     should_skip_post_experts_all_reduce,
 )
@@ -1231,26 +1229,7 @@ class Qwen2MoeModel(nn.Module):
                     )
 
         if not self.pp_group.is_last_rank:
-            if (
-                hidden_states is not None
-                and hasattr(hidden_states, "_sglang_needs_allreduce_fusion")
-                and hidden_states._sglang_needs_allreduce_fusion
-            ):
-                # The deferred reduction the next layer would have fused; no
-                # layer follows on this rank, so run it here. Unconditional --
-                # the skip flags that deferred it are what got us into this
-                # branch -- so it bypasses post_experts_all_reduce()'s guards
-                # while reusing its merge rule.
-                if can_merge_post_experts_all_reduce():
-                    hidden_states = tensor_model_parallel_all_reduce(hidden_states)
-                else:
-                    if get_parallel().moe_ep_size > 1:
-                        hidden_states = moe_expert_parallel_all_reduce(hidden_states)
-                    if get_parallel().moe_tp_size > 1:
-                        hidden_states = moe_tensor_model_parallel_all_reduce(
-                            hidden_states
-                        )
-                hidden_states._sglang_needs_allreduce_fusion = False
+            hidden_states = complete_deferred_allreduce(hidden_states)
             return PPProxyTensors(
                 {
                     "hidden_states": hidden_states,
