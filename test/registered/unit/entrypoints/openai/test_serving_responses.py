@@ -1210,8 +1210,8 @@ class EnginePassthroughTestCase(CustomTestCase):
 
     def test_priority_forwarded_to_engine(self):
         captured = self._capture(
-            make_serving(),
-            ResponsesRequest(model="x", input="hi", priority=7, store=False),
+            serving=make_serving(),
+            request=ResponsesRequest(model="x", input="hi", priority=7, store=False),
         )
 
         self.assertEqual(captured["adapted_request"].priority, 7)
@@ -1220,10 +1220,40 @@ class EnginePassthroughTestCase(CustomTestCase):
         # Not 0: --default-priority-value only fills a missing priority, and
         # --abort-on-priority-when-disabled rejects any request that carries one.
         captured = self._capture(
-            make_serving(), ResponsesRequest(model="x", input="hi", store=False)
+            serving=make_serving(),
+            request=ResponsesRequest(model="x", input="hi", store=False),
         )
 
         self.assertIsNone(captured["adapted_request"].priority)
+
+    def test_tool_continuation_keeps_request_priority(self):
+        serving = make_serving()
+
+        async def one_chunk(*args, **kwargs):
+            yield engine_chunk(text="ok", finish=True)
+
+        serving.tokenizer_manager.generate_request = Mock(side_effect=one_chunk)
+        context = Mock()
+        context.need_builtin_tool_call.side_effect = [True, False]
+        context.call_tool = AsyncMock()
+        context.render_for_completion.return_value = [1, 2, 3]
+
+        async def run():
+            async for _ in serving._generate_with_builtin_tools(
+                request_id="resp_tool",
+                request_prompt="hi",
+                adapted_request=GenerateReqInput(
+                    input_ids=[1], sampling_params={}, priority=7
+                ),
+                sampling_params={},
+                context=context,
+            ):
+                pass
+
+        asyncio.run(run())
+
+        turns = serving.tokenizer_manager.generate_request.call_args_list
+        self.assertEqual([turn.args[0].priority for turn in turns], [7, 7])
 
     def test_require_reasoning_forwarded_when_reasoning_parser_configured(self):
         serving = make_serving()
@@ -1744,25 +1774,6 @@ def test_pd_tool_continuation_stops_before_side_effect(response_serving):
         asyncio.run(run())
     context.call_tool.assert_not_awaited()
     assert serving.tokenizer_manager.generate_request.call_count == 1
-
-
-def test_tool_continuation_keeps_request_priority(response_serving):
-    serving = response_serving()
-    context = Mock()
-    context.need_builtin_tool_call.side_effect = [True, False]
-    context.call_tool = AsyncMock()
-    context.render_for_completion.return_value = [1, 2, 3]
-    first_turn = GenerateReqInput(input_ids=[1], sampling_params={}, priority=7)
-
-    async def run():
-        async for _ in serving._generate_with_builtin_tools(
-            "resp_tool", "hi", first_turn, {}, context
-        ):
-            pass
-
-    asyncio.run(run())
-    turns = serving.tokenizer_manager.generate_request.call_args_list
-    assert [turn.args[0].priority for turn in turns] == [7, 7]
 
 
 if __name__ == "__main__":
