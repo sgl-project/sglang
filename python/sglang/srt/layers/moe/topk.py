@@ -2305,7 +2305,8 @@ def _post_process_topk_ids(
         if not _fold_pad_into_append:
             _mask_topk_ids_padded_region(topk_ids, num_token_non_padded, fill_value=0)
         if (
-            envs.SGLANG_AITER_MEGA_EPLB_PREFILL_ONLY.get()
+            _is_hip
+            and envs.SGLANG_AITER_MEGA_EPLB_PREFILL_ONLY.get()
             and envs.SGLANG_AITER_MEGA_EPLB_FUSED_MAP_RECORD.get()
             and envs.SGLANG_AITER_MEGA_RANK_SYNC.get()
             and layer_id is not None

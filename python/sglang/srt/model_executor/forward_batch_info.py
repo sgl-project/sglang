@@ -85,6 +85,7 @@ _skip_attn_backend_init_warned = False
 
 _is_npu = is_npu()
 _is_cpu = is_cpu()
+_is_hip = is_hip()
 
 
 def _build_forward_token_modalities(
@@ -163,7 +164,8 @@ def _mega_moe_materializes_idle_rank(batch: ForwardBatch) -> bool:
     runs a fabricated one-token extend instead of sitting the forward out.
     """
     return bool(
-        envs.SGLANG_AITER_MEGA_RANK_SYNC.get()
+        _is_hip
+        and envs.SGLANG_AITER_MEGA_RANK_SYNC.get()
         and batch.is_extend_in_batch
         and batch.forward_mode.is_idle()
     )
@@ -1480,6 +1482,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
         self._original_batch_size = self.batch_size
         global_num_tokens = list(self.global_num_tokens_cpu)
+        # MegaMoEv2 dispatch is rank-synchronous, so an idle rank still carries the
+        # one row _run_mega_routed fabricates for it. HIP-only, False elsewhere.
         mega_moe_idle_materialize = _mega_moe_materializes_idle_rank(self)
         if mega_moe_idle_materialize:
             global_num_tokens = [1] * len(global_num_tokens)

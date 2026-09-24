@@ -17,6 +17,7 @@ from sglang.srt.utils.common import (
     Range,
     ceil_align,
     flatten_arrays_to_pinned_cpu,
+    is_hip,
     is_pin_memory_available,
 )
 from sglang.srt.utils.weight_versions import (
@@ -161,6 +162,8 @@ MM_PAD_SHIFT_VALUE = 1_000_000
 _MM_HASH_MASK = (1 << 64) - 1
 
 logger = logging.getLogger(__name__)
+
+_is_hip = is_hip()
 
 
 ReturnHiddenStatesMode = Union[bool, Literal["last"]]
@@ -3823,7 +3826,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         per-request token gating synchronizes SWA pressure across DP ranks and
         triggers a retraction / re-prefill storm at high concurrency.
         """
-        if envs.SGLANG_AMD_USE_FLYDSL_MEGA_MOE.get():
+        if _is_hip and envs.SGLANG_AMD_USE_FLYDSL_MEGA_MOE.get():
             due_this_forward = (self.forward_iter or 0) % eviction_interval == 0
             return lambda req: due_this_forward
         return lambda req: (

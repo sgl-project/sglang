@@ -34,6 +34,7 @@ from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.models.deepseek_common.utils import _device_sm
 from sglang.srt.runtime_context import get_exec
+from sglang.srt.utils import is_hip
 
 if TYPE_CHECKING:
     from deep_gemm import SymmBuffer
@@ -43,10 +44,13 @@ if TYPE_CHECKING:
 
 
 _MEGA_MOE_SYMM_BUFFER: dict = {}
+_is_hip = is_hip()
 
 
 def _use_amd_flydsl_mega_moe() -> bool:
-    return envs.SGLANG_AMD_USE_FLYDSL_MEGA_MOE.get()
+    # aiter MegaMoEv2 exists only on ROCm; the platform check keeps the env from
+    # diverting a CUDA run into a path whose kernels it does not have.
+    return _is_hip and envs.SGLANG_AMD_USE_FLYDSL_MEGA_MOE.get()
 
 
 def _mega_moe_mma_type(experts=None) -> str:
