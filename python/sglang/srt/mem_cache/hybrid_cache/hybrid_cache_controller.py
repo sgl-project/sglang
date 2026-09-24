@@ -39,6 +39,7 @@ from sglang.srt.mem_cache.l2_transfer import L2Transfer
 from sglang.srt.mem_cache.pool_host import HostPoolGroup, PoolEntry
 from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
 from sglang.srt.mem_cache.radix_cache import RadixKey
+from sglang.srt.observability.trace import trace_set_thread_info
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
@@ -1053,9 +1054,13 @@ class HybridCacheController(BaseHiCacheController):
             operation.pool_storage_result.update_kv_hit_pages(kv_hit_pages)
             return hash_value, kv_hit_pages * self.page_size
 
+        # Carry caller_id/caller_role + the exported span ids (when present)
+        # plus request_id to the storage backend.
         extra_info = HiCacheStorageExtraInfo(
             prefix_keys=operation.prefix_keys.copy() if operation.prefix_keys else None,
-            extra_info={"pp_rank": pp_rank} if pp_rank is not None else None,
+            extra_info=self._storage_trace_extra(operation, include_request_id=True)
+            | ({"pp_rank": pp_rank} if pp_rank is not None else {})
+            or None,
         )
         if operation.pool_transfers:
             hit_result = self.storage_backend.batch_exists_v2(
@@ -1138,7 +1143,11 @@ class HybridCacheController(BaseHiCacheController):
             )
             self._sync_trailing_keys(transfers_nonkv, sidecar_hashes, sidecar_hit_pages)
             self._resolve_sidecar_nonkv_derived_pool_transfers(operation)
-            extra_info = HiCacheStorageExtraInfo(prefix_keys=operation.prefix_keys)
+            extra_info = HiCacheStorageExtraInfo(
+                prefix_keys=operation.prefix_keys,
+                extra_info=self._storage_trace_extra(operation, include_request_id=True)
+                or None,
+            )
             results = self.storage_backend.batch_get_v2(
                 transfers_nonkv, extra_info=extra_info
             )
@@ -1179,13 +1188,31 @@ class HybridCacheController(BaseHiCacheController):
             for transfer in operation.pool_transfers or []
             if self.should_backup(transfer)
         ]
+        # Own the Backup Req span lifecycle here so the thread span is built
+        # before any mooncake RPC (sidecar batch_set_v2, or the inherited MLA-KV
+        # write via super()) and ended after both. Init only when this rank has
+        # real backup work (sidecar RPCs OR not backup_skip, i.e. tp0): a non-tp0
+        # MLA rank with no sidecar issues zero RPCs and must not create an empty
+        # Backup span. super() runs only the KV core loop, so no double-init with
+        # base _page_backup.
+        needs_backup = bool(backup_transfers) or not self.backup_skip
+        if needs_backup:
+            self._init_op_trace(operation, rid=operation.id, role="Backup")
 
         if backup_transfers:
             self._resolve_sidecar_kv_derived_pool_transfers(operation)
             self._resolve_sidecar_nonkv_derived_pool_transfers(operation)
-            extra_info = HiCacheStorageExtraInfo(prefix_keys=operation.prefix_keys)
+            # Sidecar backup also carries caller + trace ids so its mooncake
+            # spans correlate to the backup root; no request_id (per-node).
+            sidecar_extra = HiCacheStorageExtraInfo(
+                prefix_keys=operation.prefix_keys,
+                extra_info=self._storage_trace_extra(
+                    operation, include_request_id=False
+                )
+                or None,
+            )
             results = self.storage_backend.batch_set_v2(
-                backup_transfers, extra_info=extra_info
+                backup_transfers, extra_info=sidecar_extra
             )
             pool_hits = count_pool_hits(results)
             operation.pool_storage_result.update_extra_pool_hit_pages(pool_hits)
@@ -1212,6 +1239,9 @@ class HybridCacheController(BaseHiCacheController):
             operation.completed_tokens = (
                 len(operation.hash_value) * self.page_size if sidecar_ok else 0
             )
+
+        if needs_backup:
+            self._finish_op_trace(operation)
 
     def should_backup(self, transfer: PoolTransfer) -> bool:
         if not self.backup_skip:
@@ -1242,11 +1272,19 @@ class HybridCacheController(BaseHiCacheController):
         ranks. That optimization is valid for replicated MLA KV, but not for
         hybrid rank-sharded pools such as Kimi-K3 Mamba state.
         """
+        trace_set_thread_info(
+            "Backup",
+            getattr(self, "tp_rank", None),
+            getattr(self, "dp_rank", None),
+            getattr(self, "pp_rank", None),
+        )
         while not self.storage_stop_event.is_set():
             try:
                 operation = self.backup_queue.get(block=True, timeout=1)
                 if operation is None:
                     continue
+                # Span lifecycle is owned by _page_backup (init at start / finish at
+                # end, gated by whether this rank actually has backup work).
                 self._page_backup(operation)
                 self.ack_backup_queue.put(operation)
             except Empty:
