@@ -789,14 +789,6 @@ impl<K: ChildKeyType> TreeComponent<K> for SwaComponent {
             if !tree_core.device_lru_list(SWA).in_list(Some(x)) {
                 break None;
             }
-            if tree_core.component_state(SWA).evict_device_last_backup == Some(x)
-                && !tree_core.arena.node(x).backuped()
-            {
-                cursor = tree_core
-                    .device_lru_list(SWA)
-                    .get_prev_no_lock(x, &tree_core.arena);
-                continue;
-            }
             assert!(
                 tree_core.arena.has_device_value(x, SWA),
                 "Swa eviction cursor on a valueless node {x}"
@@ -813,6 +805,7 @@ impl<K: ChildKeyType> TreeComponent<K> for SwaComponent {
             }
             if tree_core.is_write_back
                 && tree_core.swa_write_back_eviction_barrier_enabled
+                && tree_core.component_state(SWA).evict_device_last_backup != Some(x)
                 && !tree_core.arena.node(x).backuped()
             {
                 // A later Full backup cannot recover SWA data after this

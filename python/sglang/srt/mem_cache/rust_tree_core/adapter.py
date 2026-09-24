@@ -55,6 +55,7 @@ from sglang.srt.mem_cache.unified_cache.unified_tree_core_interface import (
     UnifiedTreeCoreInterface,
 )
 from sglang.srt.runtime_context import get_exec, mamba_cache_chunk_size
+from sglang.srt.utils import assert_int64_array
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -72,9 +73,7 @@ def _radix_key_buffer(key: RadixKey) -> array:
     """The key's token ids honoring `limit`; view-independent since the
     binding derives its own atoms."""
     token_ids = key.raw_token_ids()
-    assert isinstance(token_ids, array) and token_ids.typecode == "q", (
-        f"tree keys must carry array('q') token ids, got {type(token_ids).__name__}"
-    )
+    assert_int64_array(token_ids, "tree key token ids")
     return token_ids
 
 
@@ -342,9 +341,7 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
             )
 
             if isinstance(allocator.swa_attn_allocator, MultiEndedAllocator):
-                self._swa_backup_index_mapper = (
-                    allocator.translate_swa_indices_for_transfer
-                )
+                self._swa_backup_index_mapper = allocator.translate_loc_from_full_to_swa
         self.is_eagle = (
             params.is_eagle and ComponentType.MAMBA not in self.tree_components
         )
@@ -846,7 +843,26 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
         kv_xfer, comp_xfers = self._binding.build_load_back_spec(
             node_id, mamba_pool_idx
         )
-        return _transfer_from_binding(kv_xfer), _comp_xfers_from_binding(comp_xfers)
+        kv_xfer = _transfer_from_binding(kv_xfer)
+        comp_xfers = _comp_xfers_from_binding(comp_xfers)
+        # Match the Python core's load contract: each SWA segment refers either
+        # to newly loaded FULL rows or to FULL rows already resident on device.
+        full_nodes = kv_xfer.nodes_to_load or []
+        full_load_slices = {}
+        offset = 0
+        for nid, count in zip(
+            full_nodes, self._binding.get_node_key_lengths(full_nodes), strict=True
+        ):
+            full_load_slices[nid] = slice(offset, offset + count)
+            offset += count
+        for transfer in comp_xfers.get(ComponentType.SWA, ()):
+            transfer.anchor_index_parts = [
+                full_load_slices[nid]
+                if nid in full_load_slices
+                else self.get_component_device_value(nid, ComponentType.FULL)
+                for nid in transfer.nodes_to_load or ()
+            ]
+        return kv_xfer, comp_xfers
 
     def prefetch_anchor_info(
         self, node_id: NodeId

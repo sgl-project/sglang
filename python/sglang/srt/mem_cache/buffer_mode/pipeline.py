@@ -729,11 +729,6 @@ class BufferModePipeline:
         # allocate no additional staging, but must ride the same D2H operation
         # so their bytes are present when the storage write starts.
         aux_xfers.extend(cache._build_backup_sidecar(device_value, comp_xfers))
-        device_value = (
-            cache.token_to_kv_pool_allocator.translate_kv_indices_for_transfer(
-                device_value
-            )
-        )
         host_indices = cc.write(
             device_value,
             node_id=snapshot.node_id,

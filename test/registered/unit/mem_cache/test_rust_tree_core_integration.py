@@ -1865,7 +1865,7 @@ def test_unified_swa_backup_when_full_already_has_a_host_copy(backup_nodes):
         core.set_component_device_value(
             source_id,
             ComponentType.SWA,
-            allocator.translate_swa_indices_for_transfer(source_values),
+            allocator.translate_loc_from_full_to_swa(source_values),
         )
     backed_up = {}
     if backup_nodes == "parent":
@@ -1873,9 +1873,7 @@ def test_unified_swa_backup_when_full_already_has_a_host_copy(backup_nodes):
             PoolTransfer(
                 name=PoolName.SWA,
                 host_indices=torch.tensor([200, 201]),
-                device_indices=allocator.translate_swa_indices_for_transfer(
-                    node_values
-                ),
+                device_indices=allocator.translate_loc_from_full_to_swa(node_values),
                 nodes_to_load=[node],
             )
         ]
@@ -1890,7 +1888,7 @@ def test_unified_swa_backup_when_full_already_has_a_host_copy(backup_nodes):
     assert swa_transfer.nodes_to_load == [source_id for source_id, _ in sources]
     assert torch.equal(
         swa_transfer.device_indices,
-        allocator.translate_swa_indices_for_transfer(
+        allocator.translate_loc_from_full_to_swa(
             torch.cat([source_values for _, source_values in sources])
         ),
     )

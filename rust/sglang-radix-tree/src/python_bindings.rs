@@ -247,6 +247,8 @@ fn pool_name_str(name: PoolName) -> &'static str {
         PoolName::DeepseekV4C2 => "deepseek_v4_c2",
         PoolName::DeepseekV4C2Indexer => "deepseek_v4_c2_indexer",
         PoolName::DeepseekV4C2IndexerScale => "deepseek_v4_c2_indexer_scale",
+        PoolName::DeepseekV4C4Rope => "deepseek_v4_c4_rope",
+        PoolName::DeepseekV4C128Rope => "deepseek_v4_c128_rope",
         PoolName::DeepseekV4C4State => "deepseek_v4_c4_state",
         PoolName::DeepseekV4C4IndexerState => "deepseek_v4_c4_indexer_state",
         PoolName::DeepseekV4C128State => "deepseek_v4_c128_state",
@@ -273,6 +275,8 @@ fn parse_pool_name(name: &str) -> PyResult<PoolName> {
         "deepseek_v4_c2" => Ok(PoolName::DeepseekV4C2),
         "deepseek_v4_c2_indexer" => Ok(PoolName::DeepseekV4C2Indexer),
         "deepseek_v4_c2_indexer_scale" => Ok(PoolName::DeepseekV4C2IndexerScale),
+        "deepseek_v4_c4_rope" => Ok(PoolName::DeepseekV4C4Rope),
+        "deepseek_v4_c128_rope" => Ok(PoolName::DeepseekV4C128Rope),
         "deepseek_v4_c4_state" => Ok(PoolName::DeepseekV4C4State),
         "deepseek_v4_c4_indexer_state" => Ok(PoolName::DeepseekV4C4IndexerState),
         "deepseek_v4_c128_state" => Ok(PoolName::DeepseekV4C128State),
@@ -1219,6 +1223,11 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
         })
         .map_err(node_access_error)?;
         Ok(())
+    }
+
+    fn get_node_key_lengths(&self, py: Python<'_>, node_ids: Vec<NodeId>) -> PyResult<Vec<usize>> {
+        py.allow_threads(|| self.core().get_node_key_lengths(&node_ids))
+            .map_err(node_access_error)
     }
 
     /// A component's device value on a node, if set.
@@ -2575,6 +2584,11 @@ macro_rules! tree_core_binding {
             ) -> PyResult<()> {
                 self.inner
                     .set_component_device_value(py, node_id, component_type, value)
+            }
+
+            /// Key lengths for mapping newly allocated FULL load-back rows.
+            fn get_node_key_lengths(&self, py: Python<'_>, node_ids: Vec<NodeId>) -> PyResult<Vec<usize>> {
+                self.inner.get_node_key_lengths(py, node_ids)
             }
 
             /// A component's device value on a node, if set.

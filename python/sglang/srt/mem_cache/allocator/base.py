@@ -16,7 +16,7 @@ limitations under the License.
 from __future__ import annotations
 
 import abc
-from typing import TYPE_CHECKING, Hashable, Protocol
+from typing import TYPE_CHECKING, Protocol
 
 import torch
 
@@ -93,6 +93,43 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
         paged_input = -(-input_tokens // self.page_size) * self.page_size
         return max(
             0, min(max_new_tokens, token_capacity - paged_input - self.page_size - 1)
+        )
+
+    def prealloc_fits_assumes_reclaim(self) -> bool:
+        """Whether `prealloc_fits` answers about the state reachable AFTER
+        reclaiming the evictable pages, so admitting on it still owes the
+        reclaim. False when the answer describes the pool as it stands.
+        """
+        return False
+
+    def prealloc_ceiling_fits(self, full_tokens: int, swa_tokens: int) -> bool | None:
+        """Whether a demand this size could EVER be preallocated, or None when
+        this pool has no ceiling of its own and the caller's token capacity is
+        the only bound.
+        """
+        return None
+
+    def prealloc_fits(
+        self,
+        tree_cache,
+        full_tokens: int,
+        swa_tokens: int,
+        *,
+        full_budget_tokens: int,
+        swa_budget_tokens: int | None = None,
+    ) -> bool:
+        """Whether a decode-node preallocation of this size fits.
+
+        The budgets are the scheduler's policy: what each side has left once
+        decode headroom and retraction are reserved. Separate buffers make the
+        two sides independent, so each is checked against its own budget and
+        ``tree_cache`` is never read -- what it could reclaim is already
+        inside that budget. A pool that cuts both sides from one buffer
+        overrides this to price them together, since a per-side token budget
+        cannot express a shared byte envelope.
+        """
+        return full_tokens <= full_budget_tokens and (
+            swa_budget_tokens is None or swa_tokens <= swa_budget_tokens
         )
 
     def evict_to_free_tokens(self, tree_cache, num_tokens: int) -> bool | None:
@@ -178,11 +215,9 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
     def translate_kv_indices_for_transfer(
         self, kv_indices: torch.Tensor
     ) -> torch.Tensor:
-        """Token ids as device transfer engines address them.
-
-        Identity here: a static pool's token ids index its registered buffers
-        directly. Virtual-id pools must override.
-        """
+        """Token ids as the PD transfer engine addresses them. Identity here
+        because a static pool's ids index its registered buffers directly;
+        virtual-id pools must override."""
         return kv_indices
 
     def get_cpu_copy(self, indices, mamba_indices=None, req_pool_index=None):
@@ -192,10 +227,6 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
         self, kv_cache_cpu, indices, mamba_indices=None, req_pool_index=None
     ):
         raise NotImplementedError()
-
-    def set_hicache_transfer_done_event(self, transfer_key: Hashable, event) -> None:
-        """Record an asynchronous HiCache transfer completion event if needed."""
-        return
 
     def alloc_extend(self, *args, **kwargs):
         raise NotImplementedError("alloc_extend is only for paged allocator")

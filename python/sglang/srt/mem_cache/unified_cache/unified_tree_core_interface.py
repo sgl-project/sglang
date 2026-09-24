@@ -153,7 +153,6 @@ class UnifiedTreeCoreInterface(ABC):
     write_through_threshold: int
     is_write_back: bool
     has_swa_host_pool: bool
-    swa_write_back_eviction_barrier_enabled: bool
     # Whether the host tier stages one node per FIFO backup intent.
     is_host_memory_buffer_only: bool
     kv_events: KVCacheEventRecorder
@@ -475,10 +474,12 @@ class UnifiedTreeCoreInterface(ABC):
         """Mark the host tier (HiCache) as wired."""
         ...
 
-    @abstractmethod
     def enable_swa_write_back_eviction_barrier(self) -> None:
-        """Preserve dirty SWA before cache-mode write-back eviction."""
-        ...
+        """Enable a backend-managed barrier when needed.
+
+        The Python core demotes through SWAComponent directly. Native cores
+        may return a backup action to the cache executor before eviction.
+        """
 
     @abstractmethod
     def set_host_memory_buffer_only(self) -> None:
@@ -517,6 +518,9 @@ class UnifiedTreeCoreInterface(ABC):
         node_id: NodeId,
         phase: CacheTransferPhase,
         *,
+        # TODO(Jialin): Remove the legacy `host_indices` argument from the
+        # interface and bindings. Prefetch uses `staging_tokens`;
+        # `PoolTransfer.host_indices` is populated after the storage hit.
         host_indices: Optional[torch.Tensor] = None,
         token_ids: Optional[Sequence[int]] = None,
         prefetch_tokens: int = 0,

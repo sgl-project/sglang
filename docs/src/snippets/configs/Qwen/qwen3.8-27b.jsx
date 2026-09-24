@@ -360,7 +360,7 @@ export const config = {
     accuracy: {
       gsm8k_pct:
 `python3 -m sglang.test.run_eval \\
-  --host http://{{CURL_HOST}} --port {{CURL_PORT}} \\
+  --host {{CURL_HOST}} --port {{CURL_PORT}} \\
   --model {{MODEL_NAME}} \\
   --eval-name gsm8k \\
   --num-examples 1319`,

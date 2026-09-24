@@ -1460,5 +1460,64 @@ class TestFloatHoleCreditIsPerSide(unittest.TestCase):
         self.assertEqual(flt._byte_accounting_violations(), [])
 
 
+class TestPreallocIsPricedOnTheSharedGrid(unittest.TestCase):
+    """REGRESSION: PD admission compared FULL and SWA against per-side token
+    budgets, but each side's `available_size` credits the peer's drainable
+    holes, so a pair that each side can host alone can be jointly infeasible.
+    Such a pair was admitted and then refused inside `alloc_extend_swa_tail`."""
+
+    def _build(self, **kw):
+        return TestUnifiedTriPool._build(self, **kw)
+
+    def test_a_pair_each_side_can_host_alone_is_still_refused(self):
+        # page_size 1 leaves no slack between the per-side and joint views;
+        # the double-count only has room to show on a paged grid.
+        _, allocator, _, _ = self._build(page_size=4)
+        full_demand = allocator.full_available_size()
+        swa_demand = allocator.swa_available_size()
+        self.assertGreater(min(full_demand, swa_demand), 0)
+        # Each side alone reports room for its own half ...
+        self.assertLessEqual(full_demand, allocator.full_available_size())
+        self.assertLessEqual(swa_demand, allocator.swa_available_size())
+        # ... yet the two draw on the same bytes, so the grid refuses the pair.
+        self.assertFalse(
+            allocator._fits_page_demand(
+                -(-full_demand // allocator.page_size),
+                -(-swa_demand // allocator.page_size),
+            )
+        )
+        self.assertFalse(
+            allocator.prealloc_fits(
+                MagicMock(),
+                full_demand,
+                swa_demand,
+                full_budget_tokens=full_demand,
+                swa_budget_tokens=swa_demand,
+            )
+        )
+
+    def test_the_scheduler_budget_still_binds(self):
+        _, allocator, _, _ = self._build()
+        page_size = allocator.page_size
+        self.assertTrue(
+            allocator.prealloc_fits(
+                MagicMock(),
+                page_size,
+                page_size,
+                full_budget_tokens=page_size,
+                swa_budget_tokens=page_size,
+            )
+        )
+        self.assertFalse(
+            allocator.prealloc_fits(
+                MagicMock(),
+                page_size,
+                page_size,
+                full_budget_tokens=page_size - 1,
+                swa_budget_tokens=page_size,
+            )
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -56,12 +56,39 @@ class L2TransferEngine:
         self.device_to_host_stream = device_module.Stream()
         self.host_to_device_stream = device_module.Stream()
 
+    @staticmethod
+    def _resolve_device_indices(transfer: L2Transfer) -> torch.Tensor:
+        """Resolve controller IDs into this pool's device-buffer indices.
+
+        Call on the transfer stream after the producer event. The host-transfer
+        move gate prevents relocation until the transfer completes.
+        """
+        # Mamba state pools do not inherit KVCache's default attributes.
+        translate = getattr(transfer.device_pool, "host_transfer_translate", None)
+        if translate is None:
+            return transfer.device_indices
+        original_device = transfer.device_indices.device
+        # The direct backend supplies CPU indices even for a CUDA pool.
+        # Translate alongside the v2p table, then restore the backend's device.
+        indices = transfer.device_indices.to(
+            getattr(transfer.device_pool, "device", original_device)
+        ).contiguous()
+        dcp_size = getattr(transfer.host_pool, "dcp_size", 1)
+        if dcp_size > 1:
+            # The MLA host pool selects this rank and collapses logical IDs.
+            # Translate in local virtual space, then preserve that widened
+            # interface (including token order) for the host pool.
+            resolved = translate(indices // dcp_size) * dcp_size + indices % dcp_size
+        else:
+            resolved = translate(indices)
+        return resolved.to(original_device)
+
     def _prepare_transfers(self, transfers: list[L2Transfer]) -> list[L2Transfer]:
         prepared = []
         for transfer in transfers:
             host_indices, device_indices = transfer.host_pool.prepare_transfer_indices(
                 transfer.host_indices,
-                transfer.device_indices,
+                self._resolve_device_indices(transfer),
                 self.io_backend,
             )
             prepared.append(
@@ -85,12 +112,12 @@ class L2TransferEngine:
             with device_module.stream(stream):
                 # Index preparation can read producer-owned device indices.
                 start_event.wait(stream)
-                transfers = self._prepare_transfers(transfers)
+                prepared = self._prepare_transfers(transfers)
                 ack_start.record()
-                yield transfers, completion
+                yield prepared, completion
                 ack_finish.record()
                 finish_recorded = True
-                self._record_stream(transfers, stream)
+                self._record_stream(transfers + prepared, stream)
         except Exception:
             stream.synchronize()
             raise
@@ -118,7 +145,7 @@ class L2TransferEngine:
         self,
         transfers: list[L2Transfer],
         *,
-        layer_num: int,
+        transfer_layer_id_max: int,
         start_event=None,
         on_layer_done=None,
     ) -> TransferCompletion:
@@ -126,7 +153,7 @@ class L2TransferEngine:
             transfers, self.host_to_device_stream, "host_to_device", start_event
         ) as (transfers, completion):
             primary = transfers[0] if transfers else None
-            for layer_id in range(layer_num):
+            for layer_id in range(transfer_layer_id_max):
                 for transfer in transfers:
                     local_layer_id = (
                         transfer.layer_mapper(layer_id)
@@ -159,8 +186,12 @@ class L2TransferEngine:
         return start_event
 
     @staticmethod
-    def _record_stream(transfers: list[L2Transfer], stream) -> None:
+    def _record_stream(transfers: list[L2Transfer], stream, resolved=()) -> None:
+        tensors = []
         for transfer in transfers:
-            for indices in (transfer.host_indices, transfer.device_indices):
-                if indices.is_cuda:
-                    indices.record_stream(stream)
+            tensors.extend((transfer.host_indices, transfer.device_indices))
+        # Keep temporary translated indices alive until the transfer completes.
+        tensors.extend(resolved)
+        for indices in tensors:
+            if indices is not None and indices.is_cuda:
+                indices.record_stream(stream)

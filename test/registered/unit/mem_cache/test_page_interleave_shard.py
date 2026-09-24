@@ -43,6 +43,7 @@ import os
 import unittest
 import unittest.mock
 from array import array
+from contextlib import contextmanager
 from types import SimpleNamespace
 
 import torch
@@ -52,6 +53,8 @@ from sglang.srt.distributed import (
     init_distributed_environment,
     initialize_model_parallel,
 )
+from sglang.srt.managers.schedule_batch import ReqKvInfo
+from sglang.srt.mem_cache import page_interleave
 from sglang.srt.mem_cache.allocator.page_interleave import (
     PageInterleavePoolAllocator,
     page_interleave_shard_size,
@@ -69,7 +72,9 @@ from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool, ReqToTokenPool
 from sglang.srt.mem_cache.page_interleave import (
     PageInterleavePlacement,
     PageShardSpec,
+    compute_page_shard_scratch_bytes,
     get_kv_shard_group,
+    make_page_shard_spec,
 )
 from sglang.srt.mem_cache.page_interleave_pool import (
     PageInterleaveKVPoolMixin,
@@ -84,13 +89,154 @@ from sglang.srt.runtime_context import get_parallel, publish
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import ceil_div
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from sglang.test.test_utils import CustomTestCase, publish_build_topology
 
 register_cpu_ci(est_time=30, suite="base-a-test-cpu")
 
 N = 4  # shard size
 PS = 16  # physical page size
 GS = N * PS  # full-group span (N physical pages)
+
+
+class TestPageShardScratchSizing(CustomTestCase):
+    @contextmanager
+    def _fixture(
+        self,
+        *,
+        enabled=True,
+        draft=False,
+        shard_size=4,
+        use_mla=True,
+        context_len=4096,
+        chunk_tokens=256,
+        prefill_max_requests=None,
+        max_running_requests=None,
+        dp_size=1,
+        tp_size=4,
+        num_kv_heads=8,
+        head_dim=96,
+        v_head_dim=64,
+    ):
+        group = SimpleNamespace(world_size=shard_size, rank_in_group=0)
+        parallel = SimpleNamespace(
+            enable_kv_cache_sharding=enabled,
+            attn_cp_group=(SimpleNamespace(world_size=1) if use_mla else group),
+            attn_tp_group=group,
+            attn_tp_size=tp_size,
+            attn_dp_size=dp_size,
+        )
+        schedule = SimpleNamespace(
+            chunked_prefill_size=chunk_tokens,
+            prefill_max_requests=prefill_max_requests,
+            max_running_requests=max_running_requests,
+        )
+        kvc = SimpleNamespace(
+            is_draft_worker=draft,
+            use_mla_backend=use_mla,
+            page_size=16,
+            kv_cache_dtype=torch.bfloat16,
+            model_config=SimpleNamespace(
+                context_len=context_len,
+                kv_lora_rank=16,
+                qk_rope_head_dim=8,
+                head_dim=head_dim,
+                v_head_dim=v_head_dim,
+                get_num_kv_heads=lambda tp: num_kv_heads // tp,
+            ),
+        )
+        with (
+            unittest.mock.patch.object(
+                page_interleave, "get_parallel", return_value=parallel
+            ),
+            unittest.mock.patch.object(
+                page_interleave, "get_schedule", return_value=schedule
+            ),
+        ):
+            yield kvc
+
+    def test_disabled_draft_and_trivial_group_need_no_scratch(self):
+        for options in (
+            {"enabled": False},
+            {"draft": True},
+            {"shard_size": 1},
+        ):
+            with self.subTest(options=options), self._fixture(**options) as kvc:
+                self.assertIsNone(make_page_shard_spec(kvc))
+                self.assertEqual(compute_page_shard_scratch_bytes(kvc), 0)
+
+    def test_eight_contexts_are_reserved_independently_of_batch_limits(self):
+        for options in (
+            {},
+            {"prefill_max_requests": 1},
+            {"max_running_requests": 1},
+            {"max_running_requests": 4, "dp_size": 4},
+            {"chunk_tokens": 16},
+            {"chunk_tokens": 8192, "prefill_max_requests": 32},
+        ):
+            with self.subTest(options=options), self._fixture(**options) as kvc:
+                spec = make_page_shard_spec(kvc)
+                self.assertEqual(spec.max_prefix_tokens, 8 * 4096)
+                self.assertEqual(spec.chunk_tokens, options.get("chunk_tokens", 256))
+                self.assertEqual(
+                    spec.scratch_rows, spec.max_prefix_tokens + spec.chunk_tokens + 16
+                )
+
+    def test_each_context_is_aligned_before_multiplying_by_eight(self):
+        with self._fixture(context_len=4097, chunk_tokens=33) as kvc:
+            spec = make_page_shard_spec(kvc)
+        # Each request's prefix gather pads independently to 64 tokens.
+        # Aligning only 8 * context_len would reserve too few rows.
+        self.assertEqual(spec.max_prefix_tokens, 8 * 4160)
+        self.assertGreater(spec.max_prefix_tokens, 32832)
+        self.assertEqual(spec.chunk_tokens, 48)
+        self.assertEqual(spec.max_prefix_tokens % spec.logical_page_size, 0)
+
+    def test_wide_gqa_keeps_eight_contexts_without_a_byte_cap(self):
+        with self._fixture(
+            use_mla=False,
+            context_len=65536,
+            chunk_tokens=4096,
+            tp_size=1,
+            num_kv_heads=64,
+            head_dim=128,
+            v_head_dim=128,
+        ) as kvc:
+            spec = make_page_shard_spec(kvc)
+            estimated = compute_page_shard_scratch_bytes(kvc)
+        # Numerical sizing only: do not allocate this large scratch on CPU.
+        # 64 heads * (128 K + 128 V) * two-byte BF16 = 32 KiB per row.
+        self.assertEqual(spec.max_prefix_tokens, 8 * 65536)
+        self.assertEqual(spec.chunk_tokens, 4096)
+        self.assertEqual(estimated, 2 * (8 * 65536 + 4096 + 16) * 32768)
+        self.assertGreater(estimated, 64 << 20)
+
+    def test_estimate_matches_actual_mla_and_gqa_scratch_tensors(self):
+        for use_mla in (True, False):
+            with (
+                self.subTest(use_mla=use_mla),
+                self._fixture(use_mla=use_mla, context_len=128, tp_size=2) as kvc,
+            ):
+                spec = make_page_shard_spec(kvc)
+                estimated = compute_page_shard_scratch_bytes(kvc)
+                pool = SimpleNamespace(
+                    device="cpu",
+                    store_dtype=kvc.kv_cache_dtype,
+                    kv_cache_dim=24,
+                    head_num=4,
+                    head_dim=96,
+                    v_head_dim=64,
+                )
+                pool_cls = (
+                    PageInterleaveMLATokenToKVPool
+                    if use_mla
+                    else PageInterleaveMHATokenToKVPool
+                )
+                tensors = pool_cls._scratch_tensor_specs(pool, spec.scratch_rows)
+                actual = 2 * sum(
+                    tensor.numel() * tensor.element_size()
+                    for tensor in tensors.values()
+                )
+                self.assertEqual(estimated, actual)
 
 
 def _make_spec(shard_rank=0, max_prefix_groups=64, chunk_pages=32):
@@ -621,11 +767,7 @@ class _GraftReq:
         self.fill_ids = list(fill_ids)
         self.origin_input_ids = array("q", fill_ids)
         self.output_ids = array("q", [])
-        self.kv = SimpleNamespace(
-            req_pool_idx=req_pool_idx,
-            cache_protected_len=0,
-            swa_evicted_seqlen=0,
-        )
+        self.kv = ReqKvInfo(req_pool_idx=req_pool_idx)
         self.extra_key = None
         self.cache_salt = None
         self.prefix_indices = torch.empty(0, dtype=torch.int64)
@@ -768,7 +910,7 @@ class TestRotationGraftDecline(CustomTestCase):
         req = _GraftReq(list(range(8)) + [90, 91, 92, 93])
         req.kv_rotation_base = 3
         own_locs = self._own_row(tree, req, 12)
-        tree.cache_finished_req(req, kv_len_to_handle=12)
+        tree.cache_finished_req(req, owned_kv_len=12)
         released = torch.cat(freed)
         # Everything past the protected prefix is released: the duplicates of
         # the matched region AND the declined tail (nothing leaks, nothing is
@@ -784,7 +926,7 @@ class TestRotationGraftDecline(CustomTestCase):
         req = _GraftReq(list(range(8)) + [90, 91, 92, 93])
         req.kv_rotation_base = 1
         own_locs = self._own_row(tree, req, 12)
-        tree.cache_finished_req(req, kv_len_to_handle=12)
+        tree.cache_finished_req(req, owned_kv_len=12)
         self.assertEqual(_match_len(tree, req.fill_ids), 12)
         released = torch.cat(freed) if freed else torch.empty(0, dtype=torch.int64)
         # Only the 8 duplicate rows go back; the tail stays live in the tree.
@@ -1016,6 +1158,35 @@ class TestBeginShardExtendPlan(CustomTestCase):
         self.assertIn("cyclic", str(ctx.exception))
 
 
+class TestLayerTransferCounterRefused(CustomTestCase):
+    """Layer-wise KV load-back must fail loud at registration.
+
+    The gather reads pool rows directly (`_gather_pairs`), so it never passes
+    through the base getters' `layer_transfer_counter.wait_until` hook, and
+    `begin_shard_extend` kicks the first gather before any getter runs.
+    """
+
+    class _Base:
+        def register_layer_transfer_counter(self, counter):
+            self.counter = counter
+
+    class _Pool(PageInterleaveKVPoolMixin, _Base):
+        def __init__(self):
+            pass
+
+    def test_a_real_counter_is_refused(self):
+        pool = self._Pool()
+        with self.assertRaises(NotImplementedError) as cm:
+            pool.register_layer_transfer_counter(object())
+        self.assertIn("logical-page KV sharding", str(cm.exception))
+
+    def test_none_stays_a_no_op(self):
+        """The SWA/hybrid wrappers disable the counter by passing None."""
+        pool = self._Pool()
+        pool.register_layer_transfer_counter(None)
+        self.assertIsNone(pool.counter)
+
+
 class TestScratchTranslation(CustomTestCase):
     def _plan(self, base=2, n_prefix=7, n_chunk=9, rank=1):
         pages = _chain_pages(base=base, n_pages=n_prefix + n_chunk)
@@ -1215,10 +1386,8 @@ def _dist_init(rank, world, port, attn_cp_size):
         ServerArgs(model_path="dummy", tp_size=world, attn_cp_size=attn_cp_size),
         role="scheduler",
     )
-    initialize_model_parallel(
-        tensor_model_parallel_size=world,
-        attention_context_model_parallel_size=attn_cp_size,
-    )
+    publish_build_topology(tp_size=world, attn_cp_size=attn_cp_size, world_rank=rank)
+    initialize_model_parallel()
 
 
 def _gather_make_spec(shard_rank, max_prefix_groups=16, chunk_groups=4):

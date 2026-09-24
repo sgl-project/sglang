@@ -173,9 +173,6 @@ class TestBufferModeSidecar(unittest.TestCase):
         cache.cache_controller = controller
         cache.page_size = page_size
         cache._build_backup_sidecar.return_value = sidecars
-        cache.token_to_kv_pool_allocator.translate_kv_indices_for_transfer.side_effect = (
-            lambda indices: indices
-        )
 
         pipeline = BufferModePipeline.__new__(BufferModePipeline)
         pipeline._cache = cache

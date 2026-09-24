@@ -92,7 +92,15 @@ class _SharedPageEnvelopeHostBacking:
             ]
         else:
             token_capacities = [
-                int(pool.size * host_to_device_ratio) for pool in device_pools
+                int(
+                    (
+                        pool.host_capacity_tokens
+                        if pool.host_capacity_tokens is not None
+                        else pool.size
+                    )
+                    * host_to_device_ratio
+                )
+                for pool in device_pools
             ]
 
         nominal_view_bytes = [
@@ -102,7 +110,9 @@ class _SharedPageEnvelopeHostBacking:
             )
         ]
 
-        if host_size > 0:
+        if host_size == 0 and host_to_device_ratio == 0:
+            total_bytes = host_memory_budget_bytes()
+        elif host_size > 0:
             total_bytes = max(nominal_view_bytes)
         else:
             device_total_bytes = next(iter(shared_regions))[1]
@@ -115,7 +125,7 @@ class _SharedPageEnvelopeHostBacking:
                 f"Unified host backing size must be positive: {total_bytes}"
             )
 
-        available_bytes = host_memory_budget_bytes()
+        available_bytes = host_memory_budget_bytes(total_bytes)
         if total_bytes > available_bytes:
             raise ValueError(
                 "Not enough host memory for unified page-envelope backing. "
@@ -719,6 +729,11 @@ class UnifiedPageEnvelopeHostPool(HostKVCache):
         self.item_bytes = page_bytes
         self.page_size = page_size
         self.page_num = _shared_backing.sides[pool_label].page_num
+        self.device_capacity_tokens = (
+            device_pool.host_capacity_tokens
+            if device_pool.host_capacity_tokens is not None
+            else device_pool.size
+        )
         self.size = self.page_num * page_size
         self.dcp_size = 1
         self.dcp_rank = 0
@@ -831,6 +846,13 @@ class UnifiedPageEnvelopeHostPool(HostKVCache):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         host_indices = self._shared_backing.translate_indices(
             self.pool_label, host_indices
+        )
+        # The L2 engine resolves device IDs using the per-layer HiCache contract.
+        # This pool copies whole envelopes, so discard the kernel-view page stride.
+        kernel_page_size = self.page_size * self.device_pool.kernel_page_blocks
+        device_indices = (
+            device_indices // kernel_page_size * self.page_size
+            + device_indices % self.page_size
         )
         if io_backend == "kernel":
             if not host_indices.is_cuda:

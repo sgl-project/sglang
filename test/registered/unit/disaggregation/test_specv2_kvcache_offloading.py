@@ -55,7 +55,7 @@ def _make_mock_req(
         kv_allocated_len=kv_allocated_len,
     )
     req.prefix_indices = list(range(prefix_indices_len))
-    req.effective_kv_committed_len = lambda: req.kv.kv_committed_len
+    req.owned_kv_len = lambda: req.kv.kv_committed_len
     return req
 
 

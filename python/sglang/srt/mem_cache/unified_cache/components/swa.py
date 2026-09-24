@@ -86,7 +86,6 @@ class SWAComponent(TreeComponent):
         ) // params.page_size
         # HiCache state: set to host SWA pool when HiCache enabled
         self._swa_kv_pool_host = None
-        self._evict_device_last_backup_id: Optional[NodeId] = None
 
     component_type = ComponentType.SWA
 
@@ -702,7 +701,6 @@ class SWAComponent(TreeComponent):
     def _evict_device_start(self, request_cnt: int) -> None:
         """Begin the device-eviction walk from this component's LRU cursor."""
         self._evict_device_request_cnt = request_cnt
-        self._evict_device_last_backup_id = None
         if self.tree_core.enable_session_radix_cache:
             lru = self.tree_core.lru_lists[self.component_type]
             lru.cursor_begin()
@@ -735,15 +733,6 @@ class SWAComponent(TreeComponent):
             self._evict_device_cursor = (
                 lru.cursor_next() if enabled else lru.get_lru_no_lock()
             )
-        x = self._evict_device_cursor
-        if (
-            x is not None
-            and x.id == self._evict_device_last_backup_id
-            and not x.backuped
-        ):
-            self._evict_device_cursor = (
-                lru.cursor_next() if enabled else lru.get_prev_no_lock(x)
-            )
         if (
             tracker[ct] >= self._evict_device_request_cnt
             or self._evict_device_cursor is None
@@ -760,17 +749,10 @@ class SWAComponent(TreeComponent):
                 lru.cursor_next() if enabled else lru.get_prev_no_lock(x)
             )
             return x.id
-        if (
-            self.tree_core.is_write_back
-            and self.tree_core.swa_write_back_eviction_barrier_enabled
-            and not x.backuped
-        ):
-            # Back up a dirty internal SWA node before its device value is lost.
-            self._evict_device_last_backup_id = x.id
-            self.request_backup_before_device_eviction(x.id)
-            return None
         if not enabled:
             x_next = lru.get_prev_no_lock(x)
+        # write_back: demote the SWA KV to host before the internal tombstone.
+        self._maybe_backup_node_before_swa_tombstone(x)
         self.tree_core._evict_component_and_detach_lru(
             x,
             self,
@@ -785,12 +767,50 @@ class SWAComponent(TreeComponent):
         self._evict_device_cursor = lru.cursor_next() if enabled else x_next
         return None
 
+    def _maybe_backup_node_before_swa_tombstone(self, node: UnifiedTreeNode) -> None:
+        """Demote an internal node's SWA KV to host before its tombstone
+        (write_back only), mirroring the leaf deferred-demote path.
+
+        The match validator treats an unbacked tombstone as a window reset,
+        so a dropped internal SWA segment caps the match frontier until a
+        full sliding window re-accumulates below it, leaving up to one
+        window of still-resident KV unservable. The leaf backup walk covers
+        ancestors only within one window of the evicted leaf, so an
+        internal node whose child spans the window arrives here unbacked.
+        Best-effort: this walk must make progress (it satisfies an imminent
+        allocation), so any failure falls back to the legacy drop.
+        """
+        cache = self.cache
+        cd = node.component_data[self.component_type]
+        if (
+            cache.cache_controller is None
+            or not cache.is_write_back
+            or not self.tree_core.has_swa_host_pool
+            or cd.host_value is not None
+            or node.backuped
+            or node.component_data[BASE_COMPONENT_TYPE].value is None
+        ):
+            return
+        # The backup executor pre-evicts only the KV host pool; make room
+        # in the SWA host pool the way the PREFETCH hook does.
+        needed = sum(
+            len(n.component_data[self.component_type].value)
+            for n in self._collect_unbacked_swa_nodes(node)
+        )
+        if needed == 0:
+            return
+        if (
+            self._swa_kv_pool_host is not None
+            and self._swa_kv_pool_host.available_size() < needed
+        ):
+            cache.evict_host(needed, self.component_type)
+        cache.backup_node_for_write_back(node.id)
+
     def _evict_device_end(self) -> None:
         """Clear the device-eviction walk cursor state."""
         if self.tree_core.enable_session_radix_cache:
             self.tree_core.lru_lists[self.component_type].cursor_end()
         self._evict_device_cursor = None
-        self._evict_device_last_backup_id = None
 
     def acquire_component_lock(
         self,
@@ -1069,27 +1089,23 @@ class SWAComponent(TreeComponent):
             if not unbacked_swa_nodes:
                 return None
             unbacked_swa_nodes.reverse()
-            allocator = self._unified_allocator()
-            if allocator is not None:
-                full_values = []
-                for unbacked_node in unbacked_swa_nodes:
-                    full_value = unbacked_node.component_data[BASE_COMPONENT_TYPE].value
-                    assert full_value is not None
-                    assert len(full_value) == len(
-                        unbacked_node.component_data[ct].value
-                    )
-                    full_values.append(full_value)
-                device_indices = allocator.translate_swa_indices_for_transfer(
-                    torch.cat(full_values)
-                )
-            else:
-                device_indices = torch.cat(
-                    [n.component_data[ct].value for n in unbacked_swa_nodes]
-                ).to(torch.int64)
             return [
                 PoolTransfer(
                     name=PoolName.SWA,
-                    device_indices=device_indices,
+                    device_indices=(
+                        self._translate_full_to_swa(
+                            torch.cat(
+                                [
+                                    n.component_data[BASE_COMPONENT_TYPE].value
+                                    for n in unbacked_swa_nodes
+                                ]
+                            )
+                        )
+                        if self._unified_allocator() is not None
+                        else torch.cat(
+                            [n.component_data[ct].value for n in unbacked_swa_nodes]
+                        )
+                    ).to(torch.int64),
                     nodes_to_load=[n.id for n in unbacked_swa_nodes],
                 )
             ]

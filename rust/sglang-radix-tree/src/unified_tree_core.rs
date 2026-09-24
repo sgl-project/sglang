@@ -348,6 +348,8 @@ pub enum PoolName {
     DeepseekV4C2,
     DeepseekV4C2Indexer,
     DeepseekV4C2IndexerScale,
+    DeepseekV4C4Rope,
+    DeepseekV4C128Rope,
     DeepseekV4C4State,
     DeepseekV4C4IndexerState,
     DeepseekV4C128State,
@@ -464,7 +466,7 @@ pub struct ComponentState {
     /// Internal node whose component value must be backed up before the walk
     /// can tombstone it. The Controller consumes this request between steps.
     pub(crate) evict_device_backup_node: Option<NodeIdx_>,
-    /// A resumed, still-unbacked victim is skipped after failed host allocation.
+    /// A resumed victim is tombstoned after its best-effort backup attempt.
     pub(crate) evict_device_last_backup: Option<NodeIdx_>,
     /// Token budget for the current eviction walk.
     pub(crate) evict_device_request_cnt: usize,
@@ -2246,7 +2248,10 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         Ok((None, result))
     }
 
-    /// Drop an unlocked subtree when its write-back cannot reserve host KV.
+    /// Write-back fallback when a D-leaf's D->H backup fails under host
+    /// memory pressure: drop the subtree rooted at the unbacked leaf so
+    /// device eviction keeps making progress instead of leaving its KV
+    /// unevictable until host space frees up.
     pub fn drop_subtree_no_host(
         &mut self,
         node_id: NodeId,
@@ -2255,37 +2260,47 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         let mut result = EvictionStepResult::default();
         {
             let node = self.arena.node(node_id);
+            assert!(
+                self.is_evictable_device_leaf_(node),
+                "node {node_id} is not a D-leaf"
+            );
             // A failed backup never issues the D->H copy, so the subtree root has
             // no host state and no in-flight DMA reading its device slots.
             assert!(!node.backuped() && node.write_through_pending_id.is_none());
-        }
-        let mut subtree: Vec<NodeIdx_> = Vec::new();
-        let mut stack = vec![node_id];
-        while let Some(cur_id) = stack.pop() {
-            let cur = self.arena.node(cur_id);
-            if cur.is_device_locked()
-                || cur.is_host_locked()
-                || cur.write_through_pending_id.is_some()
-                || cur.is_load_back_pending()
-            {
+            if node.is_host_locked() {
                 return Ok((false, result));
             }
-            subtree.push(cur_id);
+        }
+        let mut descendants: Vec<NodeIdx_> = Vec::new();
+        let mut stack: Vec<NodeIdx_> = self
+            .arena
+            .node(node_id)
+            .children
+            .values()
+            .copied()
+            .collect();
+        while let Some(cur_id) = stack.pop() {
+            let cur = self.arena.node(cur_id);
+            if cur.is_device_locked() || cur.is_host_locked() {
+                return Ok((false, result));
+            }
+            descendants.push(cur_id);
             stack.extend(cur.children.values().copied());
         }
-        for &desc_id in subtree[1..].iter().rev() {
-            let desc = self.arena.node(desc_id);
-            let medium = if desc.evicted() {
-                StorageMedium::Cpu
-            } else {
-                if desc.backuped() {
-                    self.record_remove_event_(desc_id, StorageMedium::Cpu);
-                }
-                StorageMedium::Gpu
-            };
+        for &desc_id in descendants.iter().rev() {
+            {
+                let desc = self.arena.node(desc_id);
+                // Host-only by construction: a device descendant would contradict
+                // this node being a D-leaf, and D-leaves evict before ancestors.
+                assert!(
+                    desc.evicted() && desc.backuped(),
+                    "node {desc_id} not host-only"
+                );
+                assert!(desc.write_through_pending_id.is_none());
+            }
             self.release_all_component_layers_(
                 desc_id,
-                medium,
+                StorageMedium::Cpu,
                 &mut result.tracker,
                 &mut result.device_frees,
                 &mut result.host_frees,
@@ -4021,6 +4036,17 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         }
     }
 
+    /// Key lengths used to map load-back slices to newly allocated FULL rows.
+    pub fn get_node_key_lengths(&self, node_ids: &[NodeId]) -> Result<Vec<usize>, NodeAccessError> {
+        node_ids
+            .iter()
+            .map(|&id| {
+                let idx = self.arena.resolve(id)?;
+                Ok(self.arena.node(idx).key.atom_len())
+            })
+            .collect()
+    }
+
     /// The component's device value on the node, or None if evicted.
     pub fn get_component_device_value(
         &self,
@@ -4376,6 +4402,8 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
                 // states must match the host LRU; never both at once.
                 let mut device_count = 0;
                 let mut host_only_count = 0;
+                // A host lock delists its node, so locked nodes are exempt.
+                let mut host_locked_listed = 0;
                 for &node_id in &all_nodes {
                     if self.arena.node(node_id).is_root() {
                         continue;
@@ -4389,17 +4417,20 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
                         ));
                     }
                     let host_only = !has_device && node.has_host_value(ct);
-                    if host_only != host_lru.in_list(Some(node_id)) {
+                    let host_listed = host_lru.in_list(Some(node_id));
+                    let host_locked = node.host_lock_ref(ct) > 0;
+                    if host_locked {
+                        host_locked_listed += host_listed as usize;
+                    } else if host_only != host_listed {
                         errors.push(format!(
-                            "{ct:?} host LRU mismatch at node {node_id}: host_only={host_only} in_lru={}",
-                            host_lru.in_list(Some(node_id))
+                            "{ct:?} host LRU mismatch at node {node_id}: host_only={host_only} in_lru={host_listed}"
                         ));
                     }
                     if lru.in_list(Some(node_id)) && host_lru.in_list(Some(node_id)) {
                         errors.push(format!("{ct:?} node {node_id} in both device and host LRU"));
                     }
                     device_count += has_device as usize;
-                    host_only_count += host_only as usize;
+                    host_only_count += (host_only && !host_locked) as usize;
                 }
                 if device_count != lru.len() {
                     errors.push(format!(
@@ -4407,10 +4438,10 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
                         lru.len()
                     ));
                 }
-                if host_only_count != host_lru.len() {
+                let host_listed_count = host_lru.len().saturating_sub(host_locked_listed);
+                if host_only_count != host_listed_count {
                     errors.push(format!(
-                        "{ct:?} host LRU: tree={host_only_count} != lru={}",
-                        host_lru.len()
+                        "{ct:?} host LRU: tree={host_only_count} != lru={host_listed_count}"
                     ));
                 }
                 // Linked-list integrity
