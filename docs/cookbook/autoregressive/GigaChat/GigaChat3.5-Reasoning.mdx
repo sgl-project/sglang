@@ -1,0 +1,230 @@
+---
+title: GigaChat 3.5 Reasoning
+description: "Deploy GigaChat 3.5 Reasoning with SGLang — the 432B-A28B hybrid MLA + GDN Mixture-of-Experts thinking model with reasoning parsing, MTP speculative decoding and tool calling, on H100 and H200 in FP8."
+tag: NEW
+---
+
+## Deployment
+
+<a id="install" />
+
+<Accordion title="Install SGLang">
+
+For all install methods and hardware platforms, see the [official SGLang installation guide](../../../docs/get-started/install).
+
+<Tabs>
+
+<Tab title="Python (pip / uv)">
+
+GigaChat 3.5 support is on `main` ([PR #29189](https://github.com/sgl-project/sglang/pull/29189), merged 2026-09-21) and not yet in a `pip` release — install from source:
+
+```bash Command
+pip install --upgrade pip
+pip install 'git+https://github.com/sgl-project/sglang.git#subdirectory=python'
+```
+
+Then run the **Python** output of the command panel below.
+
+</Tab>
+
+<Tab title="Docker">
+
+<Note>No released `lmsysorg/sglang` tag carries GigaChat 3.5 yet. The nightly `lmsysorg/sglang:dev` is rebuilt from `main` and carries the model in builds after 2026-09-21, but that path has not been run end-to-end, so the command panel shows only the Python run mode. Run the Python command inside the nightly image; the Docker tab returns to the panel after a verified run.</Note>
+
+```bash Command
+docker pull lmsysorg/sglang:dev
+```
+
+For how to launch the image, see [Install → Method 3: Using Docker](../../../docs/get-started/install#method-3-using-docker). Substitute the inner `sglang serve ...` with what the command generator below produces.
+
+</Tab>
+
+</Tabs>
+
+</Accordion>
+
+This page covers the **Reasoning** checkpoint (always thinks before answering). For the direct-answer checkpoint, see [GigaChat 3.5](/cookbook/autoregressive/GigaChat/GigaChat3.5).
+
+Pick your hardware and recipe to generate the launch command. Two serving strategies cover the operating points:
+
+- **Low-Latency** — MTP speculative decoding on, Mamba state pool pinned to 80 requests. Fastest reply per user: measured 2× decode speed at batch 1 and 1.5× at 16 concurrent 8k-token requests. Pick for chat and agent loops.
+- **High-Throughput** — MTP off, pools left to the default ratio, so the KV pool is ~2.7× larger. Past a few dozen concurrent long-context requests the pinned recipe starts queueing prompts on KV space, and at saturation the draft + verify overhead no longer pays; this is the recipe for batch jobs and many concurrent users.
+
+import { Deployment } from "/src/snippets/_deployment.jsx";
+import { config }     from "/src/snippets/configs/ai-sage/gigachat3.5-reasoning.jsx";
+import { benchmarks } from "/src/snippets/configs/ai-sage/gigachat3.5-reasoning-benchmarks.jsx";
+
+<Deployment config={config} benchmarks={benchmarks} />
+
+<Note>
+  H100 numbers were measured on 8×H100 SXM at `b63f8416b3` (the PR #29189 merge on `main`) with `bench_serving`, random
+  ISL 8192 / OSL 1024, `--random-range-ratio 1.0`, `--warmup-requests 4`, `--flush-cache`; latencies are
+  P50. GSM8K is `sglang.test.run_eval --eval-name gsm8k --api chat` (5-shot, 1314 scored questions,
+  `max_tokens` 8192), so the model thinks before every answer exactly as in production.
+</Note>
+
+## Playground
+
+The Playground is where you experiment with **SGLang features beyond the verified matrix**. The Deploy panel above only emits combinations that have been run end-to-end; the Playground lets you turn on additional knobs — the reasoning and tool-call parsers, the MTP preset, parallelism — on top of whichever cell the Deploy panel is currently showing. Any change flips the badge to **Not Verified** until the new configuration is run end-to-end.
+
+import { Playground } from "/src/snippets/_playground.jsx";
+
+<Playground config={config} />
+
+## 1. Model Introduction
+
+**GigaChat 3.5 Reasoning** is the thinking release of GigaChat's hybrid Mixture-of-Experts model — **432B** total parameters, **28B** active per token, **256K** context (YaRN, factor 8 over a 32K base), released under the **MIT** license. It shares the base architecture with [GigaChat 3.5](/cookbook/autoregressive/GigaChat/GigaChat3.5): **40** layers interleaving **10** full-attention **MLA** layers (DeepSeek-style latent attention, every 4th layer) with **30** **GDN** linear-attention layers (Qwen3-Next gated delta-net, constant-size state), and an MoE block routing to **8 of 256** experts plus **1** shared expert. Only the MLA layers hold a KV cache; the linear layers keep their state in a Mamba-style pool.
+
+What differs: the chat template opens every assistant turn with `<think>`, so the model always reasons before answering (there is no template switch to turn it off), and the checkpoint ships **3** stacked **MTP** draft heads instead of 2. Tool calls use the same **GCML** format. The model card reports the largest gains over the instant release in mathematics, code, instruction following and structured output.
+
+**Recommended generation:** the model card suggests `temperature=0.6` with a generous `max_tokens` (thinking alone can run to thousands of tokens). Informational only — the sample code below relies on the checkpoint's `generation_config.json` defaults.
+
+**Resources:** HuggingFace — [GigaChat3.5-432B-A28B-Reasoning](https://huggingface.co/ai-sage/GigaChat3.5-432B-A28B-Reasoning) (FP8, served here) · [GigaChat3.5-432B-A28B-Reasoning-bf16](https://huggingface.co/ai-sage/GigaChat3.5-432B-A28B-Reasoning-bf16) (BF16, for fine-tuning; no single-node recipe).
+
+## 2. Configuration Tips
+
+**Two pools.** GDN layers keep per-request state in a Mamba-style pool, MLA layers use a paged KV pool; `--mamba-full-memory-ratio` (default 0.9) splits the post-weight budget. On 8×H100 at `--mem-fraction-static 0.8` that is ~51 GB of weights per GPU, 348 state slots and 542k KV tokens. The resolver forces `--mamba-radix-cache-strategy no_buffer` (3 slots per request, overlap scheduler off), so the unpinned server admits 116 concurrent requests.
+
+**MTP needs a pinned pool and 0.83.** Each running request holds extra state copies under speculative decoding, and the default ratio then admits only a few dozen. The Low-Latency recipe pins `--max-mamba-cache-size 240` with `--max-running-requests 80` and runs at `--mem-fraction-static 0.83` (KV pool 199k tokens); at 0.85 the server ran out of memory in eager prefill at 16 concurrent 8k-token prompts. To size by workload instead of a pin: `r = (3 + draft_tokens) × 16 MB / (11.5 KB × L)` for an average request length `L`, and with MTP keep running 8k-token requests under ~20, since the EAGLE worker holds each prompt's hidden states outside both pools.
+
+**Capacity levers** (toggles in the [Playground](#playground)). `--mamba-ssm-dtype bfloat16` halves every state slot at no cost in accuracy or accept length — on the Low-Latency recipe the KV pool grows from 199k to 496k tokens. `--kv-cache-dtype fp8_e4m3` doubles the KV pool but decodes ~2.3× slower on H100 and cannot be combined with MTP on 80 GB.
+
+**MTP flags.** `--speculative-algorithm EAGLE` uses GigaChat's own NextN heads through the multi-layer EAGLE worker, selected automatically. This checkpoint has **3** heads: `--speculative-num-steps 3`, `--speculative-num-draft-tokens 4`.
+
+**Parsers.** `--reasoning-parser gigachat35` splits thinking from the answer (§3.1), `--tool-call-parser gigachat35` gives structured tool calls (§3.2); `auto` resolves to `gigachat35` for both. Do not use the reasoning parser on the Instant checkpoint.
+
+## 3. Advanced Usage
+
+### 3.1 Reasoning
+
+The chat template opens every assistant turn with `<think>`, and there is no template switch to turn thinking off. Enable the `gigachat35` reasoning parser (toggle **Reasoning Parser** in the **Parsers** card of the [Playground above](#playground)) to split the thinking from the final answer into `reasoning_content` vs `content`. Without the parser, the raw think block is returned inline in `content`.
+
+<Accordion title="Reasoning Example (Python)">
+
+```python Example
+from openai import OpenAI
+
+client = OpenAI(base_url="http://localhost:30000/v1", api_key="EMPTY")
+
+resp = client.chat.completions.create(
+    model="ai-sage/GigaChat3.5-432B-A28B-Reasoning",
+    messages=[{"role": "user", "content": "What is 17 times 24?"}],
+    max_tokens=4096,
+)
+msg = resp.choices[0].message
+print("Reasoning:", getattr(msg, "reasoning_content", None))
+print("Answer:", msg.content)
+```
+
+</Accordion>
+
+<Accordion title="Example Output">
+
+```text Output
+Reasoning: I need to calculate 17 times 24. I can do this by breaking it down into smaller parts. First, I know that 10 times 24 is 240, and 7 times 24 is... let me figure that out. 7 times 20 is 140, and 7 times 4 is 28, so 140 plus 28 is 168. Then, I add the two results: 240 plus 168.
+
+240 plus 168: 240 plus 100 is 340, plus 60 is 400, plus 8 is 408. Wait, that doesn't seem right. Let me add them properly. 240 + 168: 0 + 8 is 8, 4 + 6 is 10, carry over the 1, so 2 + 1 is 3, plus the carried over 1 is 4, so it should be 408. But I think I remember that 17 times 24 is 408, but let me double-check.
+[... ~1,400 more thinking tokens ...]
+Answer:
+
+17 multiplied by 24 equals 408. This can be calculated in several ways:
+
+### Method 1: Breaking Down the Numbers
+- $17 \times 24 = 17 \times (20 + 4)$
+- First, $17 \times 20 = 340$
+- Then, $17 \times 4 = 68$
+- Add the results: $340 + 68 = 408$
+
+### Method 2: Using the Distributive Property
+- $17 \times 24 = (10 + 7) \times 24$
+- $10 \times 24 = 240$
+- $7 \times 24 = 168$
+- Add the results: $240 + 168 = 408$
+[...]
+```
+
+The full response was 1,641 completion tokens, 24.6 s at batch size 1 on 8×H100 without MTP.
+
+</Accordion>
+
+<Note>
+The model can spend hundreds of tokens thinking, so keep `max_tokens` generous. A response with an empty `content` and `finish_reason: "length"` means the think block was cut off before it closed — raise the limit.
+</Note>
+
+### 3.2 Tool Calling
+
+Enable the `gigachat35` tool-call parser (toggle **Tool Call Parser** in the **Parsers** card of the [Playground above](#playground)) to surface structured calls via `message.tool_calls`. GigaChat emits tool calls in its **GCML** format — a `<｜GCML｜tool_calls>` … `</｜GCML｜tool_calls>` block holding one `<｜GCML｜invoke name="…">` per call — inside the assistant turn; the parser reads them out and strips the block from `content`. `--tool-call-parser auto` also resolves to `gigachat35` for this checkpoint, since its chat template carries the GCML marker.
+
+<Accordion title="Tool Calling Example (Python)">
+
+```python Example
+from openai import OpenAI
+
+client = OpenAI(base_url="http://localhost:30000/v1", api_key="EMPTY")
+
+tools = [
+    {
+        "type": "function",
+        "function": {
+            "name": "get_weather",
+            "description": "Get the current weather for a city",
+            "parameters": {
+                "type": "object",
+                "properties": {"city": {"type": "string", "description": "The city name"}},
+                "required": ["city"],
+            },
+        },
+    }
+]
+
+resp = client.chat.completions.create(
+    model="ai-sage/GigaChat3.5-432B-A28B-Reasoning",
+    messages=[{"role": "user", "content": "What's the weather in Paris?"}],
+    tools=tools,
+)
+msg = resp.choices[0].message
+print("Reasoning:", getattr(msg, "reasoning_content", None))
+print("Content:", msg.content)
+print("Tool calls:", msg.tool_calls)
+```
+
+</Accordion>
+
+<Accordion title="Example Output">
+
+```text Output
+Reasoning: Okay, the user is asking about the weather in Paris. Let me check what tools I have available. There's the get_weather function which requires the city name. Since the user provided "Paris" directly, I can use that function. I just need to make sure to format the tool call correctly with the city parameter. No other information is needed here, so I'll call get_weather with city set to Paris.
+Content:
+Tool calls: [ChatCompletionMessageFunctionToolCall(id='call_ef4e35b959c648fbaeab9afd', function=Function(arguments='{"city": "Paris"}', name='get_weather'), type='function', index=0)]
+```
+
+Appending a `tool` message with `{"city": "Paris", "temp_c": 9, "condition": "light rain"}` and re-requesting returns the final answer with no further tool call:
+
+```text Output
+Reasoning:
+Content: The current weather in Paris is **9°C** with **light rain**.
+Tool calls: None
+```
+
+</Accordion>
+
+<Note>
+The tool-call turn carries the model's thinking in `reasoning_content`, so print it alongside `content` and `tool_calls`. GigaChat tends to call tools **sequentially** — one hop, then the next — so a multi-tool request may come back with a single call. Drive it with an agent loop that appends each `tool` result and re-requests until `finish_reason` is no longer `tool_calls`. Parallel calls (several invokes in one block) are supported by the format when the model chooses them.
+</Note>
+
+### 3.3 MTP (Speculative Decoding)
+
+GigaChat 3.5 ships its own NextN draft heads, so speculative decoding needs no separate draft model: `--speculative-algorithm EAGLE` runs the stacked heads through SGLang's multi-layer EAGLE worker, which is selected automatically for this architecture. The **Low-Latency** recipe has it on; in the [Playground](#playground) the **Speculative** card adds the same preset to any other cell.
+
+```bash Flags
+--speculative-algorithm EAGLE \
+--speculative-num-steps 3 \
+--speculative-eagle-topk 1 \
+--speculative-num-draft-tokens 4 \
+--max-running-requests 80 \
+--max-mamba-cache-size 240
+```
+
+- **Steps follow the checkpoint.** This checkpoint has 3 draft heads, so use `--speculative-num-steps 3` and `--speculative-num-draft-tokens 4` (steps + 1); the worker rejects other values at startup.
+- **Pin the state pool.** Under MTP every running request holds extra GDN state copies for verification. Without `--max-mamba-cache-size` and `--max-running-requests` the resolver clamps concurrency to a few dozen requests; §2 explains what the pin costs in context and why the recipe runs at `--mem-fraction-static 0.83`. The panel shows an amber callout whenever a speculative command lacks `--max-running-requests`.
+- **Where it pays off.** Long think blocks are long, low-entropy decode, exactly what draft heads predict well: on 8×H100 single-request decode runs about 2× faster and 16 concurrent 8k-token requests about 1.5× faster, with GSM8K unchanged. At 64 concurrent requests the verify work and the smaller KV pool make it slower than the plain recipe, which is why the High-Throughput recipe leaves MTP off. Measured numbers are in the benchmark card above.
