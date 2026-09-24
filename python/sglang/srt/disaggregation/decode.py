@@ -365,16 +365,13 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         transfer_queue: DecodeTransferQueue,
         tree_cache: BasePrefixCache,
         gloo_group: ProcessGroup,
-        tp_rank: int,
-        tp_size: int,
-        dp_size: int,
         gpu_id: int,
         bootstrap_port: int,
         max_total_num_tokens: int,
-        pp_rank: int,
         num_reserved_decode_tokens: int,
         transfer_backend: TransferBackend,
     ):
+        parallel = get_parallel()
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
         self.token_to_kv_pool = token_to_kv_pool_allocator.get_kvcache()
@@ -388,14 +385,14 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         self.gloo_group = gloo_group
         # Destinations visible to prefill but not yet on the transfer queue.
         self._num_published_destinations = 0
-        self.tp_rank = tp_rank
-        self.tp_size = tp_size
-        self.dp_size = dp_size
+        self.tp_rank = parallel.tp_rank
+        self.tp_size = parallel.tp_size
+        self.dp_size = parallel.dp_size
         self.gpu_id = gpu_id
         self.bootstrap_port = bootstrap_port
         self.max_total_num_tokens = max_total_num_tokens
-        self.pp_rank = pp_rank
-        self.pp_size = get_parallel().pp_size
+        self.pp_rank = parallel.pp_rank
+        self.pp_size = parallel.pp_size
         self.num_reserved_decode_tokens = num_reserved_decode_tokens
         self.transfer_backend = transfer_backend
         # Queue for requests pending pre-allocation
@@ -2200,7 +2197,6 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         self,
         gloo_group: ProcessGroup,
         req_to_metadata_buffer_idx_allocator: ReqToMetadataIdxAllocator,
-        tp_rank: int,
         metadata_buffers: MetadataBuffers,
         scheduler: Scheduler,
         tree_cache: BasePrefixCache,
@@ -2208,7 +2204,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         self.queue: List[DecodeRequest] = []
         self.gloo_group = gloo_group
         self.req_to_metadata_buffer_idx_allocator = req_to_metadata_buffer_idx_allocator
-        self.tp_rank = tp_rank
+        self.tp_rank = get_parallel().tp_rank
         self.metadata_buffers = metadata_buffers
         self.scheduler = scheduler
         self.tree_cache = tree_cache

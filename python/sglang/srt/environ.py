@@ -971,6 +971,10 @@ class Envs:
     SGLANG_NPU_W4A4_NEW_PACKING = EnvBool(False)
     # Use the graph-safe Triton-Ascend kernel for masked speculative KV commits.
     SGLANG_NPU_USE_TRITON_PREFIX_KV_CACHE_STORE = EnvBool(False)
+    # Write K and V into the FIA paged KV cache with a single
+    # npu_scatter_pa_kv_cache call instead of two npu_scatter_nd_update_
+    # kernels (one write kernel launch instead of two per layer).
+    SGLANG_NPU_USE_SCATTER_PA_KV_CACHE = EnvBool(False)
     # Quantize x to int8 in the dispatch operator (vendor alias consumed by the
     # Ascend DeepEP library; the MTP draft-build scopes override it to False).
     DEEP_NORMAL_MODE_USE_INT8_QUANT = EnvBool(False)
@@ -1694,6 +1698,12 @@ class Envs:
     # 2 is the accuracy-safe default: higher values reuse staler selections
     # in the skip layers.
     SGLANG_MINIMAX_M3_INDEX_TOPK_FREQ = EnvInt(2)
+    # gfx95: lightning-indexer K cache in fp8_e4m3fn (bf16 q x fp8 k in the scorers);
+    # main attention K/V keep kv_cache_dtype.
+    SGLANG_OPT_MINIMAX_M3_FP8_INDEX_CACHE = EnvBool(True)
+    # Run the sparse prefill main attention through AITER's Gluon paged attention
+    # instead of the Triton kernel. Unsupported cases fall back to Triton.
+    SGLANG_OPT_USE_MINIMAX_GLUON_PREFILL = EnvBool(True)
     # MiniMax M3 NPU prefill MAIN-attention: route the sparse main attention through
     # the native Ascend FA op `torch.ops.npu.npu_fused_infer_attention_score` (FIA)
     # with a per-query CUSTOM block_table
