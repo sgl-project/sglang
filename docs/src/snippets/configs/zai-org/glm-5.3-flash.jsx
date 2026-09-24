@@ -394,7 +394,11 @@ sgl-eval run gsm8k \\
       match: { hw: "mi355x", strategy: "low-latency", quant: "fp8" },
       nnodes: 1,
       verified: false,
-      env: ["SGLANG_USE_AITER=1", "AITER_ONLINE_TUNE=0"],
+      env: [
+        "SGLANG_USE_AITER=1", "AITER_ONLINE_TUNE=0",
+        "SGLANG_OPT_FUSED_KDA_VERIFY=1", "SGLANG_DSA_FUSE_TOPK=0",
+        "SGLANG_ENABLE_WAR_BARRIER=1", "SGLANG_FORCE_COARSE_WAR_BARRIER=1",
+      ],
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--trust-remote-code",
@@ -423,7 +427,11 @@ sgl-eval run gsm8k \\
       match: { hw: "mi355x", strategy: "low-latency", quant: "mxfp4" },
       nnodes: 1,
       verified: false,
-      env: ["SGLANG_USE_AITER=1", "AITER_ONLINE_TUNE=0"],
+      env: [
+        "SGLANG_USE_AITER=1", "AITER_ONLINE_TUNE=0",
+        "SGLANG_OPT_FUSED_KDA_VERIFY=1", "SGLANG_DSA_FUSE_TOPK=0",
+        "SGLANG_ENABLE_WAR_BARRIER=1", "SGLANG_FORCE_COARSE_WAR_BARRIER=1",
+      ],
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--trust-remote-code",
