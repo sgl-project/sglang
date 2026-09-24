@@ -194,7 +194,7 @@ The A3 preset fixes the reasoning parser to `minimax-append-think` and the tool 
 
 The A2 selector fixes TP=8, ModelSlim quantization, BF16, `--context-length 4096`, and `--max-running-requests 1`. It uses prefill chunks of 128, maximum prefill tokens of 4096, static memory fraction 0.96, and `--max-total-tokens 4096`, and disables graph capture and radix cache. No EAGLE3 draft model is required.
 
-The `minimax` reasoning parser separated reasoning from answer content in the tested runtime. The `minimax-m2` tool-call parser is configured, but tool calling was not tested. GPU count and parser toggles do not apply to this preset. The final run allocated a **4096-token KV pool on all eight ranks** and completed a synthetic 3500-input/128-output request. This validates that request size on this allocation, not every workload up to the configured limit. See section 5.4 for the earlier capacity failure and the final measurements. GPQA accuracy, standardized throughput, and sustained stability remain unmeasured.
+The `minimax` reasoning parser separated reasoning from answer content in the tested runtime. The `minimax-m2` tool-call parser is configured, but tool calling was not tested. GPU count and parser toggles do not apply to this preset. The final run allocated a **4096-token KV pool on all eight ranks** and completed a synthetic 3500-input/128-output request. This validates that request size on this allocation, not every workload up to the configured limit. See section 5.4 for the earlier capacity failure and the final measurements. GPQA accuracy, standardized throughput, and sustained stability remain unmeasured for this single-request preset; [section 5.5](#5-5-ascend-a2-performance-benchmark) reports synthetic performance measurements using a separate server configuration with concurrency up to 8.
 
 ## 4. Model Invocation
 
@@ -565,7 +565,7 @@ Check that the final answer identifies Paris. Repeat requests and check the serv
 
 For **Ascend A3**, use [the A3 throughput and accuracy benchmarks](#5-3-ascend-a3-benchmarks) with the command generated in section 3.
 
-For **Ascend A2**, [section 5.4](#5-4-ascend-a2-smoke-validation) records simple chat checks and serial synthetic generation probes. No standardized throughput or accuracy benchmark has been completed for that preset.
+For **Ascend A2**, [section 5.4](#5-4-ascend-a2-smoke-validation) records simple chat checks and serial synthetic generation probes. [Section 5.5](#5-5-ascend-a2-performance-benchmark) reports the official benchmark tool's results on a separate configuration with concurrency up to 8 and a synthetic workload. No GPQA accuracy result is reported here.
 
 The benchmark sections below use **industry-standard configurations** for comparable benchmark results; the A2 smoke record has a separate, limited scope.
 
@@ -1299,3 +1299,131 @@ Timing includes HTTP/SSE processing and ends at the stream's `DONE` event. First
 The final probe run completed and its post-run health check returned HTTP 200. Confirm startup KV allocation and actual request limits on your allocation; the successful 3500-input/128-output probe does not establish the full 4096-token boundary for every workload.
 
 These checks establish simple chat functionality and the listed synthetic request sizes. They do not establish GPQA accuracy, long-context answer quality, sustained stability, tool calling, or performance under the A3 reference workload. This observed 8×32 GiB low-concurrency run does not replace the upstream recommended hardware configuration.
+
+### 5.5 Ascend A2 performance benchmark
+
+On September 23, 2026, the official `python -m sglang.bench_serving` tool completed **10 runs and 76 measured requests** on the same 8 × 910B4 allocation and runtime recorded in section 5.4. All requests succeeded, with the planned input lengths and exactly 128 output tokens each. Warm-up requests are excluded from the 76 measured requests.
+
+This benchmark used a separate server configuration: `--mem-fraction-static 0.97`, `--max-total-tokens 16384`, `--context-length 8192`, and `--max-running-requests 8`. The interactive selector retains the single-request configuration from section 5.4. The benchmark launch command was:
+
+```bash Command
+export HCCL_BUFFSIZE=128
+export OMP_NUM_THREADS=1
+export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
+python -m sglang.launch_server \
+  --model-path /workspace/issue1215/model \
+  --tokenizer-path /workspace/issue1215/metadata \
+  --device npu --tp-size 8 --quantization modelslim --dtype bfloat16 \
+  --reasoning-parser minimax --tool-call-parser minimax-m2 \
+  --host 127.0.0.1 --port 31216 \
+  --context-length 8192 --max-running-requests 8 \
+  --chunked-prefill-size 128 --max-prefill-tokens 4096 \
+  --mem-fraction-static 0.97 --max-total-tokens 16384 \
+  --disable-cuda-graph --disable-radix-cache
+```
+
+#### 5.5.1 Workload and measured results
+
+The source data contained **16 locally authored synthetic English prompts in ShareGPT-compatible JSON format**; it was not the ShareGPT dataset. The tool used `--dataset-name random`, `--random-range-ratio 1`, and `--tokenize-prompt` to produce exact input lengths of 128 or 1024 tokens. Each run used `--request-rate inf`, temperature 0, one warm-up request, and `--flush-cache`. The serial control used seed 17; each repeated group used seeds **17, 29, and 43**, once each.
+
+The repeated groups below report the arithmetic **mean and minimum–maximum across three runs**. TTFT, TPOT, and E2E use each run's mean latency before computing this summary. The serial control has one run and therefore no repeat range. Output throughput is aggregate output tokens per second from the benchmark, not per-request decoding speed. All latency values are in milliseconds.
+
+**128 input / 128 output tokens, concurrency 1** — one run of 4 requests; 4/4 succeeded.
+
+| Metric | Value |
+| --- | --- |
+| Output throughput (tok/s) | 4.266 |
+| Mean TTFT (ms) | 486.589 |
+| Mean TPOT (ms) | 232.385 |
+| Mean E2E (ms) | 29999.459 |
+
+**128 input / 128 output tokens, concurrency 4** — three runs of 8 requests; 24/24 succeeded.
+
+| Metric | Mean | Min–max |
+| --- | --- | --- |
+| Output throughput (tok/s) | 16.731 | 16.618–16.810 |
+| Mean TTFT (ms) | 807.497 | 801.011–814.685 |
+| Mean TPOT (ms) | 234.492 | 233.452–236.043 |
+| Mean E2E (ms) | 30588.025 | 30449.379–30792.190 |
+
+**128 input / 128 output tokens, concurrency 8** — three runs of 8 requests; 24/24 succeeded.
+
+| Metric | Mean | Min–max |
+| --- | --- | --- |
+| Output throughput (tok/s) | 32.457 | 32.373–32.532 |
+| Mean TTFT (ms) | 1312.882 | 1276.591–1359.876 |
+| Mean TPOT (ms) | 237.912 | 237.480–238.622 |
+| Mean E2E (ms) | 31527.731 | 31456.127–31607.222 |
+
+**1024 input / 128 output tokens, concurrency 8** — three runs of 8 requests; 24/24 succeeded.
+
+| Metric | Mean | Min–max |
+| --- | --- | --- |
+| Output throughput (tok/s) | 13.694 | 13.291–13.942 |
+| Mean TTFT (ms) | 12582.293 | 12329.436–13062.333 |
+| Mean TPOT (ms) | 272.578 | 268.251–280.396 |
+| Mean E2E (ms) | 47199.685 | 46422.970–48672.617 |
+
+Every run had a 100% request success rate; this measures successful request completion, not answer accuracy. Per-run percentiles remain in the detailed benchmark output and are not averaged into pooled percentiles. These short tests do not establish sustained stability or long-context answer quality. Their workload, runtime, and hardware differ from the A3 reference, so the table does not provide an A2-versus-A3 comparison.
+
+#### 5.5.2 Reproduce the benchmark
+
+Start the server above and wait for `/health` to return HTTP 200. Replace the two model paths below with your container paths, using the same tokenizer revision as the weights. Save the following as `benchmark_minimax_a2.py` and run it from the tested SGLang environment. It creates the synthetic data used here and runs the fixed suite, retaining each command, log, and detailed JSONL result. It refuses to overwrite an existing result and stops if a run fails validation.
+
+```python benchmark_minimax_a2.py
+import json
+from pathlib import Path
+import subprocess
+import sys
+
+model = "/workspace/issue1215/model"
+tokenizer = "/workspace/issue1215/metadata"
+out = Path("minimax-a2-perf")
+out.mkdir(exist_ok=True)
+topics = [
+    "gardening", "astronomy", "cooking", "geometry", "music", "weather",
+    "transport", "ecology", "history", "software", "literature", "chemistry",
+    "geography", "photography", "materials", "language",
+]
+data = [{"id": f"synthetic-{i}", "conversations": [
+    {"from": "human", "value": (
+        f"Explain the basic principles of {topic}. Give a clear example and discuss its practical limitations. "
+    ) * 8},
+    {"from": "gpt", "value": "This is a synthetic performance workload, not a quality evaluation."},
+]} for i, topic in enumerate(topics)]
+dataset = out / "synthetic-prompts.json"
+dataset.write_text(json.dumps(data), encoding="utf-8")
+cases = ([(128, 1, 4, 17)]
+         + [(128, c, 8, s) for c in (4, 8) for s in (17, 29, 43)]
+         + [(1024, 8, 8, s) for s in (17, 29, 43)])
+for length, concurrency, count, seed in cases:
+    name = f"in{length}-out128-c{concurrency}-n{count}-seed{seed}"
+    result = out / f"{name}.jsonl"
+    if result.exists():
+        raise RuntimeError(f"Refusing to overwrite {result}")
+    command = [
+        sys.executable, "-m", "sglang.bench_serving", "--backend", "sglang",
+        "--base-url", "http://127.0.0.1:31216", "--model", model, "--tokenizer", tokenizer,
+        "--dataset-name", "random", "--dataset-path", str(dataset),
+        "--random-input-len", str(length), "--random-output-len", "128",
+        "--random-range-ratio", "1", "--tokenize-prompt", "--num-prompts", str(count),
+        "--max-concurrency", str(concurrency), "--request-rate", "inf",
+        "--temperature", "0", "--seed", str(seed), "--warmup-requests", "1",
+        "--flush-cache", "--output-details", "--disable-tqdm", "--output-file", str(result),
+    ]
+    (out / f"{name}.command.json").write_text(json.dumps(command, indent=2), encoding="utf-8")
+    with (out / f"{name}.log").open("w", encoding="utf-8") as log:
+        subprocess.run(command, stdout=log, stderr=subprocess.STDOUT, check=True)
+    rows = [json.loads(line) for line in result.read_text().splitlines() if line.strip()]
+    if len(rows) != 1:
+        raise RuntimeError(f"Expected exactly one result in {result}")
+    row = rows[0]
+    if not (row["completed"] == count
+            and row["input_lens"] == [length] * count
+            and row["output_lens"] == [128] * count
+            and len(row["errors"]) == count and not any(row["errors"])):
+        raise RuntimeError(f"Incomplete or mismatched run: inspect {result}")
+    print(name, row["output_throughput"], flush=True)
+```
+
+Retain failed runs and missing-run records when reporting a reproduction; do not summarize only successful seeds. Keep each run's mean and percentile metrics separate. The synthetic data and performance measurements provide no GPQA or other model-quality score.
