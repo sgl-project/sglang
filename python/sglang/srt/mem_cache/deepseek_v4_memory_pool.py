@@ -1033,47 +1033,11 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         kv_pool_cls: type = DeepSeekV4SingleKVPool
 
         self.request_window = None
-        encoder_replay = get_exec().features.enable_encoder_swa_bounded_replay
-        # DSpark's draft shares the target's full-to-SWA mapping, so the target
-        # keeps its paged SWA allocator even under encoder replay.
-        self.needs_paged_swa_allocator = (
-            not encoder_replay
-            or is_draft_worker
-            or get_spec().speculative_algorithm is not None
-        )
-        if encoder_replay and not is_draft_worker:
-            from sglang.srt.mem_cache.dsv41_request_window import RequestWindow
-
-            def make_window_pool(size, layers):
-                return self._make_kv_pool(
-                    size=size,
-                    page_size=swa_page_size,
-                    dtype=dtype,
-                    layer_num=layers,
-                    device=device,
-                    enable_memory_saver=enable_memory_saver,
-                    global_page_size=swa_page_size,
-                    kv_layout=self.kv_layout,
-                )
-
-            self.swa_kv_pool = None
-            self.unified_kv_pool = None
-            from sglang.srt.runtime_context import get_schedule
-
-            chunk = get_schedule().chunked_prefill_size or 0
-            self.request_window = RequestWindow(
-                make_window_pool,
-                num_slots=self.num_req_slots,
-                layers=stage_layer_num,
-                page_size=swa_page_size,
-                capacity=self.sliding_window + (online_mtp_max_draft_tokens or 0),
-                workspace_rows=(self.num_req_slots + 1) * self.sliding_window
-                + max(
-                    chunk,
-                    (self.num_req_slots + 1) * (1 + (online_mtp_max_draft_tokens or 0)),
-                ),
-            )
-        elif self._unified_kv:
+        # Encoder-only PD reconstructs the SWA tail into the existing paged
+        # allocator. This keeps ordinary decode on its standard zero-copy
+        # full->SWA mapping instead of copying a request window per layer/token.
+        self.needs_paged_swa_allocator = True
+        if self._unified_kv:
             assert self.kv_layout is KVLayout.V4, (
                 "unified_kv keeps bf16 rows, not a paged FlashMLA layout"
             )
@@ -1175,10 +1139,14 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         assert self.full_to_swa_index_mapping is not None
         return self.full_to_swa_index_mapping[kv_indices]
 
-    def get_contiguous_buf_infos(self) -> Tuple[List[int], List[int], List[int]]:
+    def _get_transfer_buf_infos(
+        self, ratios: Optional[Sequence[int]] = None
+    ) -> Tuple[List[int], List[int], List[int]]:
         data_ptrs: List[int] = []
         data_lens: List[int] = []
         item_lens: List[int] = []
+
+        selected_ratios = None if ratios is None else set(ratios)
 
         if self._unified_kv_fp8:
             # The page-block transfer below prices one row as buf[0].nbytes and
@@ -1202,6 +1170,8 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         # Registration order defines the PD wire layout: C4 KV, C4 indexer, C128 KV.
         # Keep each indexer immediately after the KV buffers of the same ratio.
         for ratio, kv_pool in self.kv_pools.items():
+            if selected_ratios is not None and ratio not in selected_ratios:
+                continue
             if self._unified_kv:
                 # Unified buffers store token rows after the SWA ring. Transfer
                 # compressed pages from the offset; SWA ships as StateType.SWA_RING.
@@ -1244,6 +1214,84 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
                 item_lens.append(buf[0].nbytes * index_pages_per_full_page)
 
         return data_ptrs, data_lens, item_lens
+
+    def get_contiguous_buf_infos(self) -> Tuple[List[int], List[int], List[int]]:
+        return self._get_transfer_buf_infos()
+
+    def _validate_encoder_only_transfer_profile(self) -> None:
+        """Fail before registering a partial or ambiguously paired wire layout."""
+        expected_sources = sorted(self.kv_source_layers)
+        actual_sources = sorted(
+            source
+            for ratio in (1, 2)
+            for source in self.sources_by_ratio.get(ratio, ())
+        )
+        if actual_sources != expected_sources:
+            raise RuntimeError(
+                "encoder-only transfer requires every configured Main-KV source "
+                f"to use ratio 1/2: expected={expected_sources}, actual={actual_sources}"
+            )
+        for ratio in (1, 2):
+            sources = self.sources_by_ratio.get(ratio, ())
+            if not sources:
+                continue
+            kv_pool = self.kv_pools.get(ratio)
+            index_pool = self.index_pools.get(ratio)
+            index_buffers = (
+                index_pool.contiguous_page_row_buffers()
+                if index_pool is not None
+                else ()
+            )
+            if (
+                kv_pool is None
+                or len(kv_pool.kv_buffer) != len(sources)
+                or not index_buffers
+                or len(index_buffers) % len(sources) != 0
+            ):
+                raise RuntimeError(
+                    "encoder-only transfer requires matching Main-KV and "
+                    f"Indexer-K owner groups for ratio {ratio}"
+                )
+
+    def get_encoder_only_transfer_buf_infos(
+        self,
+    ) -> Tuple[List[int], List[int], List[int]]:
+        """Return only global Main-KV and owner Indexer-K wire regions."""
+        self._validate_encoder_only_transfer_profile()
+        infos = self._get_transfer_buf_infos((1, 2))
+        layer_ids = self.get_encoder_only_transfer_layer_ids()
+        if any(len(items) != len(layer_ids) for items in infos):
+            raise RuntimeError(
+                "encoder-only transfer buffer entries and layer IDs are misaligned"
+            )
+        return infos
+
+    def get_encoder_only_transfer_layer_ids(self) -> List[int]:
+        """Layer ids aligned with :meth:`get_encoder_only_transfer_buf_infos`."""
+        self._validate_encoder_only_transfer_profile()
+        layer_ids: List[int] = []
+        for ratio in self.kv_pools:
+            if ratio not in (1, 2):
+                continue
+            sources = list(self.sources_by_ratio.get(ratio, ()))
+            if not sources:
+                continue
+            kv_pool = self.kv_pools.get(ratio)
+            if kv_pool is not None:
+                if len(kv_pool.kv_buffer) != len(sources):
+                    raise RuntimeError(
+                        f"ratio-{ratio} Main-KV entries do not match source layers"
+                    )
+                layer_ids.extend(sources)
+            index_pool = self.index_pools.get(ratio)
+            if index_pool is not None:
+                count = len(index_pool.contiguous_page_row_buffers())
+                if count % len(sources) != 0:
+                    raise RuntimeError(
+                        f"ratio-{ratio} Indexer-K entries do not match source layers"
+                    )
+                layer_ids.extend(sources * (count // len(sources)))
+        return layer_ids
 
     def get_unified_swa_ring_buf_infos(self) -> Tuple[List[int], List[int], List[int]]:
         # StateType.SWA_RING transfers [0, swa_pages) of each unified_kv layer;
@@ -1847,6 +1895,12 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
     def get_swa_key_layout(self) -> KVLayout:
         # swa_kv_pool is None under the request window and unified_kv.
         return self.kv_layout
+
+    def get_swa_key_page_size(self) -> int:
+        """Return the physical page size for the active SWA storage."""
+        if self.request_window is not None:
+            return self.request_window.page_size
+        return self.swa_kv_pool.page_size
 
     def get_swa_key_bytes_per_token(self) -> int:
         """Last dim of the ``(pages, page_size, 1, bytes)`` view the attention

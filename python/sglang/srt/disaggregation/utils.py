@@ -261,6 +261,9 @@ def poll_and_all_reduce_with_staging(
 # Metadata Buffers
 #########################
 
+CACHE_ONLY_METADATA_SLOT = 7
+CACHE_ONLY_COVERAGE_SLOT = 8
+
 
 class ReqToMetadataIdxAllocator:
     """A memory pool that maps a request to its first output token location."""
@@ -458,12 +461,13 @@ class MetadataBuffers:
         )
 
     def set_buf(self, req: Req):
-
-        self.output_ids[req.metadata_buffer_index][0] = req.output_ids[0]
+        cache_only = getattr(req, "dsv41_cache_only_replay", False)
+        if not cache_only:
+            self.output_ids[req.metadata_buffer_index][0] = req.output_ids[0]
         # The cached_tokens buffer is (size, 16); slots 0-3 hold cached token
-        # counts and slots 4-6 are reused for multimodal prompt token counts
-        # (slots 7-15 remain spare). This avoids adding new RDMA buffers.
-        # Slot map: 0=cached 1=device 2=host 3=storage 4=image 5=audio 6=video.
+        # counts, slots 4-6 hold multimodal prompt counts, and cache-only
+        # handoffs use slot 7 as the profile marker plus slot 8 as explicit
+        # global-cache coverage H. Slots 9-15 remain spare.
         self.cached_tokens[req.metadata_buffer_index][0] = req.cached_tokens
         self.cached_tokens[req.metadata_buffer_index][1] = req.cached_tokens_device
         self.cached_tokens[req.metadata_buffer_index][2] = req.cached_tokens_host
@@ -478,6 +482,21 @@ class MetadataBuffers:
         self.cached_tokens[req.metadata_buffer_index][4] = image_t
         self.cached_tokens[req.metadata_buffer_index][5] = audio_t
         self.cached_tokens[req.metadata_buffer_index][6] = video_t
+        self.cached_tokens[req.metadata_buffer_index][CACHE_ONLY_METADATA_SLOT] = int(
+            cache_only
+        )
+        self.cached_tokens[req.metadata_buffer_index][CACHE_ONLY_COVERAGE_SLOT] = (
+            int(getattr(req, "dsv41_cache_only_coverage", 0)) if cache_only else 0
+        )
+        # Store the readiness/corruption guard for every profile, including a
+        # cache-only handoff which returns before token metadata below.
+        self.bootstrap_room[req.metadata_buffer_index, 0] = (
+            req.bootstrap_room if req.bootstrap_room is not None else 0
+        )
+        if cache_only:
+            # No handoff token, logprob, sampling or draft metadata exists in this
+            # profile.  Keep the reusable metadata row deterministic.
+            return
         if req.return_logprob:
             if req.logprob.output_token_logprobs_val:  # not none or empty list
                 self.output_token_logprobs_val[req.metadata_buffer_index][0] = (
@@ -580,10 +599,6 @@ class MetadataBuffers:
                     )
                 else:
                     self.output_dsa_topk_indices[req.metadata_buffer_index].fill_(-1)
-        # Store bootstrap_room for validation on decode side
-        self.bootstrap_room[req.metadata_buffer_index, 0] = (
-            req.bootstrap_room if req.bootstrap_room is not None else 0
-        )
 
 
 #########################
@@ -994,6 +1009,7 @@ def build_kv_layer_ids(
     draft_token_to_kv_pool,
     num_draft_entries: int,
     num_hidden_layers: int,
+    main_kv_only: bool = False,
 ) -> List[int]:
     """Global layer id for every entry in ``kv_args.kv_data_ptrs``.
 
@@ -1007,7 +1023,17 @@ def build_kv_layer_ids(
     Returns [] for pools that cannot report ids, leaving the peers on positional
     pairing.
     """
+    from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
     from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
+
+    if main_kv_only:
+        if draft_token_to_kv_pool is not None or num_draft_entries:
+            raise RuntimeError("encoder-only transfer cannot include draft KV")
+        if not isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool):
+            raise RuntimeError(
+                "encoder-only transfer requires a DeepSeek-V4 token-to-KV pool"
+            )
+        return token_to_kv_pool.get_encoder_only_transfer_layer_ids()
 
     if not isinstance(token_to_kv_pool, HybridLinearKVPool):
         return []
@@ -1327,9 +1353,16 @@ def build_dsa_tail_transfer_blocks(
     return transfer_blocks
 
 
-def get_kv_transfer_buf_infos(pool):
+def get_kv_transfer_buf_infos(pool, *, main_kv_only: bool = False):
+    from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
     from sglang.srt.mem_cache.memory_pool import MiniMaxSparseKVPool
 
+    if main_kv_only:
+        if not isinstance(pool, DeepSeekV4TokenToKVPool):
+            raise RuntimeError(
+                "encoder-only prefill requires a DeepSeek-V4 token-to-KV pool"
+            )
+        return pool.get_encoder_only_transfer_buf_infos()
     if isinstance(pool, MiniMaxSparseKVPool):
         return pool.get_sparse_kv_buf_infos()
     return pool.get_contiguous_buf_infos()
@@ -1341,6 +1374,7 @@ def setup_state_kv_args(
     draft_token_to_kv_pool=None,
     total_kv_layers: int = None,
     req_to_token_pool=None,
+    main_kv_only: bool = False,
 ) -> None:
     from sglang.srt.disaggregation.base.conn import StateType
     from sglang.srt.hardware_backend.npu.memory_pool_npu import NPUMLATokenToKVPool
@@ -1370,6 +1404,8 @@ def setup_state_kv_args(
         if isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool)
         else None
     )
+    if main_kv_only:
+        return
 
     def append_dsa_tail(pool) -> None:
         if not pool.kpool_use_compress:
@@ -1745,24 +1781,36 @@ def setup_state_kv_args(
 def get_dsv41_spec_layout(kv_args: KVArgs) -> Optional[dict]:
     """Describe the positional transfer layout without pool capacities or pointers."""
     ratios = getattr(kv_args, "mla_compression_ratios", None) or []
-    if 2 not in ratios or str(get_spec().speculative_algorithm).upper() != "DSPARK":
+    encoder_only = get_disagg().dsv41_encoder_only_prefill
+    uses_dspark = str(get_spec().speculative_algorithm).upper() == "DSPARK"
+    if 2 not in ratios or not (encoder_only or uses_dspark):
         return None
 
     from sglang.srt.disaggregation.base.conn import StateType
 
-    if kv_args.state_types.count(StateType.SWA) != 2:
+    expected_swa_components = 0 if encoder_only else 2
+    if kv_args.state_types.count(StateType.SWA) != expected_swa_components:
         raise RuntimeError(
-            "DeepSeek-V4.1 DSpark PD requires target and draft SWA state"
+            "DeepSeek-V4.1 DSpark PD state layout mismatch: "
+            f"encoder_only={encoder_only} expected_swa_components="
+            f"{expected_swa_components} actual_state_types="
+            f"{[state_type.value for state_type in kv_args.state_types]}"
         )
 
-    return {
-        "num_draft_tokens": get_spec().speculative_num_draft_tokens,
+    layout = {
+        "encoder_only": encoder_only,
         "compression_ratios": list(ratios),
         "kv_layer_ids": list(kv_args.kv_layer_ids),
         "kv_item_lens": list(kv_args.kv_item_lens),
         "state_types": [state_type.value for state_type in kv_args.state_types],
         "state_item_lens": [list(items) for items in kv_args.state_item_lens],
     }
+    if not encoder_only:
+        # Ordinary DSpark PD transfers draft state, so its block width is part
+        # of the wire contract. Encoder-only PD reconstructs draft state on D
+        # and deliberately allows P to run without any speculative worker.
+        layout["num_draft_tokens"] = get_spec().speculative_num_draft_tokens
+    return layout
 
 
 def prepare_abort(req: Req, error_message: str, status_code=None):

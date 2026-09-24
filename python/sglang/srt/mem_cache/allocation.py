@@ -351,6 +351,35 @@ def alloc_for_extend(
     (the last is the host/CPU mirror). ``alloc_req_slots`` raises ``RuntimeError``
     if the pool can't satisfy the batch (fail-loud — see its docstring).
     """
+    if batch.dsv41_cache_only_replay:
+        # Decode preallocation already owns every prompt slot.  Replay the tail
+        # in place so SWA/request-local state is rebuilt without allocating or
+        # rewriting the req-to-token row.
+        if not all(r.kv.req_pool_idx is not None for r in batch.reqs):
+            raise RuntimeError("cache-only replay requires preallocated request slots")
+        pin_memory = is_pin_memory_available(batch.device)
+        req_pool_indices_cpu = torch.tensor(
+            [r.kv.req_pool_idx for r in batch.reqs],
+            dtype=torch.int64,
+            pin_memory=pin_memory,
+        )
+        req_pool_indices_device = req_pool_indices_cpu.to(
+            batch.device, non_blocking=True
+        )
+        out_cache_loc = torch.cat(
+            [
+                batch.req_to_token_pool.req_to_token[
+                    r.kv.req_pool_idx, r.extend_range.start : r.extend_range.end
+                ]
+                for r in batch.reqs
+            ]
+        ).long()
+        for req in batch.reqs:
+            if req.kv.kv_allocated_len < req.extend_range.end:
+                raise RuntimeError("cache-only replay is missing preallocated KV slots")
+            req.kv.kv_committed_len = req.extend_range.end
+        return out_cache_loc, req_pool_indices_device, req_pool_indices_cpu
+
     # free out-of-window swa tokens
     batch.maybe_evict_swa()
 

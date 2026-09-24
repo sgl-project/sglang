@@ -651,6 +651,12 @@ class TpModelWorker(BaseTpWorker):
                 indexer_topk_output=out.indexer_topk_output,
             )
 
+            if logits_output is None:
+                # DeepSeek-V4.1 asymmetric prefill intentionally terminates at
+                # the layer-20 global-cache producer.
+                batch_result.cache_only = True
+                return batch_result
+
             capture_pre_sample_logits(batch, forward_batch, logits_output)
 
             if is_verify:

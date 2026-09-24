@@ -245,6 +245,16 @@ class TestAdmissionAbortNotEnqueued(CustomTestCase):
                     q._create_receiver_and_enqueue.assert_called_once()
                 sched.retire_unadmitted_request.assert_not_called()
 
+    def test_retract_clears_cache_only_handoff_state(self):
+        req = _make_req(prompt_len=16)
+        req.dsv41_cache_only_replay = True
+        req.dsv41_cache_only_coverage = 16
+
+        req.reset_for_retract()
+
+        self.assertFalse(req.dsv41_cache_only_replay)
+        self.assertEqual(req.dsv41_cache_only_coverage, 0)
+
     def test_valid_request_still_admitted(self):
         for door in ("prefill", "decode"):
             with self.subTest(door=door):

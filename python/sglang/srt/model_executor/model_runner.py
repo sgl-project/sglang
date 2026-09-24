@@ -276,7 +276,7 @@ def _prefill_cuda_graph_allows_context_parallel(
 
 @dataclass
 class ModelRunnerOutput:
-    logits_output: Union[LogitsProcessorOutput, PPProxyTensors]
+    logits_output: Optional[Union[LogitsProcessorOutput, PPProxyTensors]]
     can_run_graph: bool
     expert_distribution_metrics: Optional[ExpertDistributionMetrics] = None
     routed_experts_output: Optional[TopkCaptureOutput] = None
@@ -1928,6 +1928,7 @@ class ModelRunner:
             if (
                 forward_batch.global_num_tokens_cpu is not None
                 and self.pp_group.is_last_rank
+                and ret is not None
             ):
                 forward_batch.post_forward_mlp_sync_batch(ret)
 

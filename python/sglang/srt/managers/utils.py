@@ -61,6 +61,9 @@ class GenerationBatchResult:
     accept_length_per_req_cpu: Optional[List[int]] = None
     dllm_algo_state: Optional[List[Any]] = None
     can_run_cuda_graph: bool = False
+    # The forward produced cache state only and intentionally has no logits or
+    # sampled token (DeepSeek-V4.1 asymmetric prefill).
+    cache_only: bool = False
 
     # PP skip output comm: True when output send/recv was skipped and
     # next_token_ids are placeholder zeros. Used by process_batch_result_prefill
@@ -156,6 +159,10 @@ class GenerationBatchResult:
         Only the tensors which are needed for processing results are copied,
         e.g., next_token_ids, logits outputs
         """
+        if self.cache_only:
+            if self.copy_done is not None:
+                self.copy_done.record()
+            return
         if return_logprob:
             if self.logits_output.next_token_logprobs is not None:
                 self.logits_output.next_token_logprobs = _async_d2h(
