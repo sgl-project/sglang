@@ -67,7 +67,6 @@ _GEMMA4_MODEL_TYPES = (
 )
 
 
-# The per-layer attributes SGLang folds into its own global / `swa_*` pair.
 _GEMMA4_FLATTENED_PER_LAYER_ATTRS = frozenset({"head_dim", "num_key_value_heads"})
 
 
@@ -113,7 +112,7 @@ def _apply_gemma4_attention_overrides(config):
     text_config = config.text_config
 
     if text_config.is_heterogeneous:
-        # transformers >= 5.16 states that split as a `per_layer_config`, and
+        # transformers states that split as a `per_layer_config`, and
         # consumes `global_head_dim` / `num_global_key_value_heads` building it.
         shapes = _gemma4_attention_shapes(text_config)
         full_head_dim, full_kv_heads = shapes["full_attention"]

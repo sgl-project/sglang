@@ -217,7 +217,7 @@ def _patch_layer_types_validation():
                 return _orig(self)
             except ValueError as e:
                 # Step-3.5-Flash lists a `layer_types` entry per main *and*
-                # next-n-predict layer, which transformers >= 5.17 rejects.
+                # next-n-predict layer, which `validate_layer_type` rejects.
                 if "must be equal to the number of" not in str(e):
                     raise
                 num_mtp_layers = getattr(self, "num_nextn_predict_layers", 0) or 0

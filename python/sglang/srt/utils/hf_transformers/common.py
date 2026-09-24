@@ -266,8 +266,8 @@ try:
 except ImportError:
     pass
 
-# Bare register: `get_config` re-parses every registry entry through the class
-# below, so AutoConfig need not resolve to it.
+# Bare register: `get_config` re-parses every registry entry through its own
+# class, so AutoConfig need not resolve to it.
 #
 # `_LazyAutoMapping` keys on the config class `__name__`, so a differently-named
 # shadow drops out of PROCESSOR/TOKENIZER/MODEL_MAPPING.

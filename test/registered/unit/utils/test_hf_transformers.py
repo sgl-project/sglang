@@ -680,9 +680,6 @@ class TestPatchRemovedSymbols(CustomTestCase):
 
 
 class TestRopeParametersValidationPatch(CustomTestCase):
-    """A config without `max_position_embeddings` must still get its
-    `default_rope_type` resolved, and must still not raise."""
-
     def test_default_rope_type_survives_a_missing_max_position_embeddings(self):
         class _AxialConfig(PretrainedConfig):
             default_rope_type = "axial"
@@ -701,7 +698,7 @@ class TestRopeParametersValidationPatch(CustomTestCase):
             rope_parameters={"rope_type": "yarn", "rope_theta": 10000.0}
         )
         self.assertFalse(hasattr(config, "max_position_embeddings"))
-        config.standardize_rope_params()  # must not raise
+        config.standardize_rope_params()
 
 
 # ---------------------------------------------------------------------------
@@ -715,11 +712,6 @@ class TestIsTorchFxAvailableCompat(CustomTestCase):
 
         self.assertTrue(hasattr(_iu, "is_torch_fx_available"))
         self.assertTrue(_iu.is_torch_fx_available())
-
-
-# ---------------------------------------------------------------------------
-# AutoConfig registration
-# ---------------------------------------------------------------------------
 
 
 # `inkling_mm_model` predates the invariant: `sglang.srt.configs.inkling` writes
@@ -767,11 +759,6 @@ class TestAutoConfigRegistration(CustomTestCase):
         ):
             with self.subTest(model_type=model_type):
                 self.assertIs(CONFIG_MAPPING[model_type], expected)
-
-
-# ---------------------------------------------------------------------------
-# Pixtral vision rope
-# ---------------------------------------------------------------------------
 
 
 class TestPixtralVisionRope(CustomTestCase):
@@ -822,11 +809,6 @@ class TestPixtralVisionRope(CustomTestCase):
         torch.testing.assert_close(sin, expected.sin(), rtol=0, atol=1e-6)
 
 
-# ---------------------------------------------------------------------------
-# Gemma4 attention overrides
-# ---------------------------------------------------------------------------
-
-
 class TestGemma4AttentionOverrides(CustomTestCase):
     """A parsed Gemma4 config carries the full-attention shape on its base
     attributes, the sliding-window one on `swa_*`, and no per-layer spec."""
@@ -866,7 +848,6 @@ class TestGemma4AttentionOverrides(CustomTestCase):
         _apply_gemma4_attention_overrides(config)
 
         self.assertFalse(config.text_config.is_heterogeneous)
-        # The reads every downstream consumer (ModelConfig, the model itself) makes.
         self.assertEqual(config.text_config.head_dim, 256)
 
     def test_config_without_a_per_layer_spec_states_one_shape(self):
@@ -906,11 +887,6 @@ class TestGemma4AttentionOverrides(CustomTestCase):
             _apply_gemma4_attention_overrides(config)
 
 
-# ---------------------------------------------------------------------------
-# Transformers-backend TP styles
-# ---------------------------------------------------------------------------
-
-
 class TestNormalizeTpStyle(CustomTestCase):
     """Every style a shipped TP plan can name must normalize; a tied-embedding
     plan naming an unknown one stops the model loading at all."""
@@ -933,11 +909,6 @@ class TestNormalizeTpStyle(CustomTestCase):
 
         with self.assertRaises(ValueError):
             _normalize_tp_style("mla_kv_a_proj")
-
-
-# ---------------------------------------------------------------------------
-# compat: _patch_layer_types_validation
-# ---------------------------------------------------------------------------
 
 
 class TestLayerTypesValidationPatch(CustomTestCase):

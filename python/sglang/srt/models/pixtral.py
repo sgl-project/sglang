@@ -951,7 +951,6 @@ class PixtralHFVisionModel(nn.Module):
         # per-patch pairs rather than the flattened `h * max_width + w` offsets.
         position_ids = position_meshgrid(embeds_2d).to(self.device)
 
-        # A (cos, sin) pair, applied to q/k inside the transformer blocks.
         position_embedding = self.patch_positional_embedding(
             embeds_featurized, position_ids
         )
