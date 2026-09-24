@@ -760,6 +760,17 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
         ):
             layer.dispatcher.set_quant_config({"dispatcher_output_dtype": "bf16"})
 
+        if self.use_flashinfer_cutlass:
+            from sglang.srt.layers.moe.moe_runner.flashinfer_cutlass import (
+                materialize_swiglu_params_for_cutlass,
+            )
+
+            layer._cutlass_swiglu_params = materialize_swiglu_params_for_cutlass(
+                layer.moe_runner_config,
+                int(layer.num_local_experts),
+                layer.w13_weight.device,
+            )
+
         # Reorder rows of W1 for fused gated activation
         if self.use_flashinfer_trtllm_moe:
             # The cached indices are GPU tensors. Colocated weight offloading
@@ -1063,11 +1074,15 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
                 FlashInferCutlassMoeQuantInfo,
             )
 
+            swiglu_alpha, swiglu_beta, swiglu_limit = layer._cutlass_swiglu_params
             quant_info = FlashInferCutlassMoeQuantInfo(
                 quant_type="bf16",
                 w13_weight=layer.w13_weight,
                 w2_weight=layer.w2_weight,
                 output_dtype=x.dtype,
+                swiglu_alpha=swiglu_alpha,
+                swiglu_beta=swiglu_beta,
+                swiglu_limit=swiglu_limit,
                 moe_ep_size=layer.moe_ep_size,
                 moe_ep_rank=layer.moe_ep_rank,
                 moe_tp_size=layer.moe_tp_size,
