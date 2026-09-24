@@ -2345,6 +2345,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             customized_info = None
         pending_notify: dict[str, ReqState] = {}
         batch_notify_size = get_serving().batch_notify_size
+        # One scheduler step produced every row; label them with one version.
+        weight_version = self.config_value("weight_version")
         for i, rid in enumerate(recv_obj.rids):
             state = self.rid_to_state.get(rid, None)
             if state is None:
@@ -2361,7 +2363,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 "id": rid,
                 "finish_reason": recv_obj.finished_reasons[i],
                 "prompt_tokens": recv_obj.prompt_tokens[i],
-                "weight_version": self.config_value("weight_version"),
+                "weight_version": weight_version,
                 "num_retractions": recv_obj.retraction_counts[i],
             }
 
