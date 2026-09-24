@@ -2072,7 +2072,7 @@ class UnifiedRadixCache(BasePrefixCache):
                 ct,
                 last_host_node_id,
                 CacheTransferPhase.PREFETCH,
-                token_ids=prefetch_key.token_ids,
+                token_ids=prefetch_key,
                 prefetch_tokens=len(prefetch_key),
                 staging_tokens=prep.staging_tokens,
                 last_hash=last_hash,

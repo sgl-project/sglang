@@ -877,6 +877,39 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         for transfer in pool_transfers or []:
             if not restorable:
                 break
+            if transfer.name == PoolName.DEEPSEEK_V4_C128:
+                # A C128 object is stored only at a complete compression-group
+                # endpoint.  Query those sparse endpoint hashes directly and
+                # expose only the consecutive endpoints as legal restore stops;
+                # the partial group after an endpoint is intentionally absent.
+                key_to_page = {key: i + 1 for i, key in enumerate(keys[:kv_pages])}
+                endpoint_keys = [
+                    key for key in transfer.keys or () if key in key_to_page
+                ]
+                component_keys, key_multiplier = self._get_hybrid_page_component_keys(
+                    endpoint_keys, transfer
+                )
+                ex = self._batch_exist(self._tag_keys(component_keys))
+                endpoint_exists = [
+                    all(
+                        r == 1
+                        for r in ex[i * key_multiplier : (i + 1) * key_multiplier]
+                    )
+                    for i in range(len(endpoint_keys))
+                ]
+                consecutive = 0
+                for exists in endpoint_exists:
+                    if not exists:
+                        break
+                    consecutive += 1
+                pool_restorable = [
+                    key_to_page[key] for key in endpoint_keys[:consecutive]
+                ]
+                if consecutive:
+                    hit_count[transfer.name] = consecutive
+                pool_restorable_set = set(pool_restorable)
+                restorable = [p for p in restorable if p in pool_restorable_set]
+                continue
             component_keys, key_multiplier = self._get_hybrid_page_component_keys(
                 keys, transfer
             )
