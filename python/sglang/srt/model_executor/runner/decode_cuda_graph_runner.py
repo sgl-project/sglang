@@ -108,6 +108,7 @@ from sglang.srt.model_executor.runner_utils.pool import (
 )
 from sglang.srt.model_executor.runner_utils.shared_read_event import make_external_event
 from sglang.srt.multiplex.pdmux_context import get_current_stream_idx, get_stream_groups
+from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import (
     get_exec,
     get_flags,
@@ -415,6 +416,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             encoder_len_fill_value=self.encoder_len_fill_value,
             num_tokens_per_req=self.captured_req_width,
             cache_loc_dtype=self._cache_loc_dtype(),
+            position_dtype=current_platform.get_position_dtype(),
             enable_mamba_track=enable_mamba_track,
             ne_token_table=(
                 model_runner.ngram_embedding_manager.table
@@ -442,6 +444,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             max_num_token=self.max_num_token,
             seq_len_fill_value=self.seq_len_fill_value,
             cache_loc_dtype=self._cache_loc_dtype(),
+            position_dtype=current_platform.get_position_dtype(),
             enable_mamba_track=enable_mamba_track,
             is_encoder_decoder=self.is_encoder_decoder,
             encoder_len_fill_value=self.encoder_len_fill_value,

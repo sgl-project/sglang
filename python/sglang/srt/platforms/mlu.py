@@ -87,3 +87,6 @@ class MluSRTPlatform(MluDeviceMixin, SRTPlatform):
 
     def get_default_attention_backend(self) -> str:
         return "mlu"
+
+    def support_cuda_graph(self) -> bool:
+        return True
