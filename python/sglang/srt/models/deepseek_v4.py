@@ -2149,6 +2149,7 @@ class MQALayer(MqaAttentionBase):
         from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
             is_unified_kv_fp8,
             is_unified_kv_triton,
+            unified_decode_fuses_inv_rope,
         )
 
         unified = is_unified_kv_triton()
@@ -2318,6 +2319,23 @@ class MQALayer(MqaAttentionBase):
         # its normal causally-indexed store from attn_k = kv.
         attn_k = kv if kv is not None else q
 
+        # The opt-in aiter wo_a front end (SGLANG_OPT_FP8_WO_A_FUSED_INVROPE)
+        # rotates inside its quant kernel, so the standalone inverse RoPE is
+        # already gone there; like vLLM #57451 (`_wo_a_fp8_weight is None`), the
+        # attention epilogue is only used when that path is not active.
+        wo_a_rotates = (
+            self.wo_a_fp8
+            and _wo_a_fp8_mxscale_fused_invrope is not None
+            and not _is_npu
+        )
+        # True when the attention kernel already applied the output inverse RoPE.
+        # Decided here from static config + forward_mode only, never inside the
+        # breakable-cuda-graph custom op below, so it is fixed per captured graph.
+        attn_rotated = (
+            unified
+            and not wo_a_rotates
+            and unified_decode_fuses_inv_rope(forward_batch.forward_mode)
+        )
         if unified:
             # only the HIP radix backend takes these two; passing them always would
             # leave non-ROCm depending on the **_ in its forward() to drop them, and
@@ -2327,6 +2345,11 @@ class MQALayer(MqaAttentionBase):
                 rope_kwargs["q_rope"] = q_rope
             if k_rope is not None:
                 rope_kwargs["k_rope"] = k_rope
+            if attn_rotated:
+                rope_kwargs["inv_rope_positions"] = positions
+                rope_kwargs["inv_rope_freqs"] = torch.view_as_real(
+                    self.freqs_cis
+                ).flatten(-2)
             o = attn_backend.forward(
                 q=q_out if q_out is not None else q,
                 k=attn_k,
@@ -2366,11 +2389,7 @@ class MQALayer(MqaAttentionBase):
                     save_kv_cache=save_kv_cache,
                 )
             o = o[:, tp_slice, :]
-        if (
-            self.wo_a_fp8
-            and _wo_a_fp8_mxscale_fused_invrope is not None
-            and not _is_npu
-        ):
+        if wo_a_rotates:
             # ROCm gfx950 fused path: inverse-RoPE + per-token-group mxfp8 quant
             # in one aiter kernel on the pre-view [T,H,Dh] output, then the a8w8
             # mxscale absorb GEMM. Replaces the standalone inverse RoPE, the
@@ -2391,7 +2410,9 @@ class MQALayer(MqaAttentionBase):
                 self.use_flashinfer_mxfp8_wo_b and not get_forward().sp_active
             )
             fuse_rope_wo_a = (
-                self.use_fused_wo_a and 0 < o.shape[0] <= _FUSED_WO_A_MAX_TOKENS
+                self.use_fused_wo_a
+                and 0 < o.shape[0] <= _FUSED_WO_A_MAX_TOKENS
+                and not attn_rotated
             )
 
             if _is_npu:
@@ -2405,8 +2426,8 @@ class MQALayer(MqaAttentionBase):
                     sin4,
                     qk_nope_dim=self.qk_nope_head_dim,
                 )
-            elif not fuse_rope_wo_a:
-                # The fused path folds this in; it must not run twice.
+            elif not fuse_rope_wo_a and not attn_rotated:
+                # The fused paths fold this in; it must not run twice.
                 fused_rope_inplace(
                     o[..., -self.qk_rope_head_dim :],
                     None,
