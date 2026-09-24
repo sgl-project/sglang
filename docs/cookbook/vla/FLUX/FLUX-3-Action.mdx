@@ -27,9 +27,9 @@ Supported checkpoints (`black-forest-labs/flux-3-action-droid`; three 360x640 ca
 
 | `--model-variant` | Recipe | Weights | Latency on 1x RTX 5090 |
 | --- | --- | --- | ---: |
-| (default) / `base` | 4 steps, guidance 4.0 (video) / 1.0 (action) | BF16 | 1.29 s |
+| (default) / `base` | 4 steps, guidance 4.0 (video) / 1.0 (action) | BF16 | 1.30 s |
 | `fp8r` | same | FP8 rowwise | 1.09 s |
-| `gd` | guidance-distilled: 4 steps, no CFG | BF16 | 0.73 s |
+| `gd` | guidance-distilled: 4 steps, no CFG | BF16 | 0.71 s |
 | `gd-fp8r` | same | FP8 rowwise | 0.61 s |
 | `sd` | step-distilled: 1 step | BF16 | 0.21 s |
 | `sd-fp8r` | same | FP8 rowwise | 0.18 s |
@@ -73,7 +73,7 @@ sglang serve black-forest-labs/flux-3-action-droid \
   --port 30000
 ```
 
-A local policy export (a directory containing `manifest.json`, `config.native.json` and `model.safetensors`) is detected automatically when passed as the model path.
+A local policy export (a directory containing `manifest.json`, `config.native.json` and `model.safetensors`) is detected automatically when passed as the model path. Pass `--revision` to pin a Hub revision. At startup the policy config and weights are checked against the SHA-256 hashes in `manifest.json`.
 
 Peak GPU memory and per-request latency on one RTX 5090 (BF16 base package, cached caption):
 
@@ -92,11 +92,12 @@ Layerwise offload streams the DiT blocks (and, with `all`, the text encoder and 
 | Field | Type | Description |
 | --- | --- | --- |
 | `input.task` | string | Language instruction. |
-| `input.observation.images` | object | Camera name -> HWC uint8 RGB image. DROID: `wrist`, `left`, `right`. Alternatively send `composite`: the 540x640 image with the wrist camera on top and the two exterior cameras at half resolution below. |
+| `input.observation.images` | object | Camera name -> HWC RGB image, uint8 or float in `[0, 1]`. DROID: `wrist`, `left`, `right` (or the LeRobot names `wrist_image_left`, `exterior_image_1_left`, `exterior_image_2_left`). Alternatively send `composite`: the 540x640 image with the wrist camera on top and the two exterior cameras at half resolution below. |
 | `input.observation.state` | array | Robot state in dataset units. DROID: 7 joint positions (rad) followed by the gripper position. |
 | `parameters.num_inference_steps` | integer, optional | Defaults to the checkpoint recipe. |
 | `parameters.guidance_scale` / `guidance_scale_action` | number, optional | Guidance scale on the video / action stream. Defaults to the checkpoint recipe. |
-| `parameters.seed` | integer, optional | Noise seed. Defaults to `0`. |
+| `parameters.seed` | integer, optional | Noise seed. Defaults to the package's `inference_seed` (`0` for DROID), so a repeated observation returns the same actions. |
+| `runtime.prefix_cache` | boolean, optional | `false` bypasses the per-caption text context cache for this request. Defaults to `true`. |
 | `runtime.output_format` | `"list"` or `"numpy"`, optional | Use `"numpy"` with msgpack clients. |
 
 The response returns absolute commands of shape `[32, 8]` in the dataset's conventions.
@@ -141,5 +142,5 @@ With the same observation and seed, SGLang matches the FLUX Action reference imp
 
 - The DiT agrees to 1e-6 (relative) in fp32.
 - The VAE latents and text contexts are bit-identical.
-- Across the full 4-step, CFG 4.0 sampling loop, actions differ by at most 0.015 rad. This is the same spread the reference shows between its own eager and prepared paths.
+- Across the full 4-step, CFG 4.0 sampling loop, actions differ by at most 0.017 rad (mean 0.003 rad). The reference's own eager and prepared paths differ from each other by 0.015 rad.
 - FP8r packages differ from the reference FP8r path by at most 0.04 rad. The reference FP8r path itself differs from BF16 by 0.055 rad.
