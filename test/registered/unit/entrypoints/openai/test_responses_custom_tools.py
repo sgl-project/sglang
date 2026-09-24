@@ -71,7 +71,7 @@ class CustomToolAdapterTestCase(CustomTestCase):
 class CustomToolShimTestCase(CustomTestCase):
     def test_custom_tool_becomes_a_single_string_function_tool(self):
         request = _custom_request()
-        (tool,) = OpenAIServingResponses._response_tools_to_chat_tools(request)
+        (tool,) = OpenAIServingResponses._response_tools_to_chat_tools(request.tools)
         self.assertEqual(tool.function.name, "emit_command")
         self.assertEqual(list(tool.function.parameters["properties"]), ["input"])
         self.assertEqual(tool.function.parameters["required"], ["input"])
@@ -80,7 +80,7 @@ class CustomToolShimTestCase(CustomTestCase):
             model="x", input="hi", tools=[{"type": "custom"}], store=False
         )
         self.assertEqual(
-            OpenAIServingResponses._response_tools_to_chat_tools(nameless), []
+            OpenAIServingResponses._response_tools_to_chat_tools(nameless.tools), []
         )
 
     def test_grammar_format_is_described_to_the_model(self):
@@ -96,7 +96,7 @@ class CustomToolShimTestCase(CustomTestCase):
                 }
             ]
         )
-        (tool,) = OpenAIServingResponses._response_tools_to_chat_tools(request)
+        (tool,) = OpenAIServingResponses._response_tools_to_chat_tools(request.tools)
         self.assertIn("lark", tool.function.description)
         self.assertIn('start: "pwd"', tool.function.description)
 

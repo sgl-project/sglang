@@ -36,6 +36,7 @@ from openai.types.responses.response_reasoning_summary_part_added_event import (
 from openai.types.responses.response_reasoning_summary_part_done_event import (
     Part as ResponseReasoningSummaryDonePart,
 )
+from openai_harmony import DeveloperContent
 from openai_harmony import Message as OpenAIMessage
 
 from sglang.srt.entrypoints.context import (
@@ -61,9 +62,11 @@ from sglang.srt.entrypoints.openai.protocol import (
     MessageProcessingResult,
     PromptTokenUsageInfo,
     RequestResponseMetadata,
+    ResponseAdditionalTools,
     ResponseOutputMessage,
     ResponsesRequest,
     ResponsesResponse,
+    ResponseTool,
     Tool,
     UsageInfo,
 )
@@ -304,12 +307,36 @@ class OpenAIServingResponses(OpenAIServingChat):
         if model_error is not None:
             return model_error
 
+        prev_response_id = request.previous_response_id
+        if prev_response_id is not None:
+            if not prev_response_id.startswith("resp_"):
+                return self._make_invalid_id_error(prev_response_id)
+            async with self.response_store_lock:
+                prev_response = self.response_store.get(prev_response_id)
+            if prev_response is None:
+                return self._make_not_found_error(prev_response_id)
+        else:
+            prev_response = None
+
+        response_tools = self._effective_response_tools(request)
+        if len(response_tools) > len(request.tools):
+            names = [
+                tool.name
+                for tool in response_tools
+                if tool.type in ("function", "custom")
+            ]
+            if len(names) != len(set(names)):
+                return self.create_error_response(
+                    "Tool names must be unique across tools and additional_tools.",
+                    param="tools",
+                )
+
         # FIXME: If the engine is dead, raise an error
         # This is required for the streaming case
 
         # ``tool_choice="required"`` needs a tool the parser can actually force.
         if request.tool_choice == "required" and not any(
-            tool.type in ("function", "custom") for tool in (request.tools or [])
+            tool.type in ("function", "custom") for tool in response_tools
         ):
             return self.create_error_response(
                 'tool_choice="required" requires at least one tool with '
@@ -320,7 +347,7 @@ class OpenAIServingResponses(OpenAIServingChat):
         tool_choice = request.effective_tool_choice()
         if isinstance(tool_choice, dict) and not any(
             tool.type in ("function", "custom") and tool.name == tool_choice["name"]
-            for tool in request.tools or []
+            for tool in response_tools
         ):
             return self.create_error_response(
                 f"Tool {tool_choice['name']!r} is not declared in tools",
@@ -369,18 +396,6 @@ class OpenAIServingResponses(OpenAIServingChat):
                 "with prefill-decode disaggregation",
                 param="tools",
             )
-
-        # Handle the previous response ID
-        prev_response_id = request.previous_response_id
-        if prev_response_id is not None:
-            if not prev_response_id.startswith("resp_"):
-                return self._make_invalid_id_error(prev_response_id)
-            async with self.response_store_lock:
-                prev_response = self.response_store.get(prev_response_id)
-            if prev_response is None:
-                return self._make_not_found_error(prev_response_id)
-        else:
-            prev_response = None
 
         try:
             model_name = request.model
@@ -672,7 +687,7 @@ class OpenAIServingResponses(OpenAIServingChat):
     ):
         messages = self._construct_input_messages(request, prev_response)
 
-        chat_tools = self._response_tools_to_chat_tools(request)
+        chat_tools = self._response_tools_to_chat_tools(request.tools)
         chat_request = ChatCompletionRequest(
             model=request.model,
             messages=messages,
@@ -680,7 +695,7 @@ class OpenAIServingResponses(OpenAIServingChat):
             tools=chat_tools or None,
             tool_choice=(
                 self._chat_tool_choice(request.effective_tool_choice())
-                if chat_tools
+                if chat_tools or any(message.get("tools") for message in messages)
                 else "none"
             ),
             parallel_tool_calls=(
@@ -1029,7 +1044,8 @@ class OpenAIServingResponses(OpenAIServingChat):
         *,
         require_reasoning: bool,
     ):
-        chat_tools = self._response_tools_to_chat_tools(request)
+        response_tools = self._effective_response_tools(request)
+        chat_tools = self._response_tools_to_chat_tools(response_tools)
         if self.reasoning_parser:
             reasoning_parser = ReasoningParser(
                 model_type=self.reasoning_parser,
@@ -1065,7 +1081,7 @@ class OpenAIServingResponses(OpenAIServingChat):
 
         tool_choice = request.effective_tool_choice()
         is_required = tool_choice == "required" or isinstance(tool_choice, dict)
-        custom_names = custom_tool_names(request.tools)
+        custom_names = custom_tool_names(response_tools)
         tool_call_items: list[
             Union[ResponseFunctionToolCall, ResponseCustomToolCall]
         ] = []
@@ -1180,11 +1196,11 @@ class OpenAIServingResponses(OpenAIServingChat):
         return {"type": "function", "function": {"name": tool_choice["name"]}}
 
     @staticmethod
-    def _response_tools_to_chat_tools(request: ResponsesRequest) -> list[Tool]:
+    def _response_tools_to_chat_tools(tools: list[ResponseTool]) -> list[Tool]:
         # ``function`` and ``custom`` tools flow to chat; built-ins go through
         # harmony. A custom tool is shimmed into a single-string function tool.
         chat_tools = []
-        for tool in request.tools:
+        for tool in tools:
             if tool.type == "function":
                 description, parameters = tool.description, tool.parameters
             elif tool.type == "custom" and tool.name:
@@ -1204,6 +1220,24 @@ class OpenAIServingResponses(OpenAIServingChat):
                 )
             )
         return chat_tools
+
+    def _effective_response_tools(
+        self, request: ResponsesRequest
+    ) -> list[ResponseTool]:
+        tools = list(request.tools)
+        for item in self._response_input_history(request):
+            if isinstance(item, dict) and item.get("type") == "additional_tools":
+                tools.extend(ResponseAdditionalTools.model_validate(item).tools)
+            elif isinstance(item, OpenAIMessage):
+                for content in item.content:
+                    if isinstance(content, DeveloperContent):
+                        functions = (content.tools or {}).get("functions")
+                        if functions is not None:
+                            tools.extend(
+                                ResponseTool(type="function", **tool.model_dump())
+                                for tool in functions.tools
+                            )
+        return tools
 
     @staticmethod
     def _normalize_response_content_part_for_chat(content_part: Any) -> Any:
@@ -1277,6 +1311,17 @@ class OpenAIServingResponses(OpenAIServingChat):
             message = message.model_dump(exclude_none=True)
         if not isinstance(message, dict):
             return message
+
+        if message.get("type") == "additional_tools":
+            item = ResponseAdditionalTools.model_validate(message)
+            return {
+                "role": "system",
+                "content": "",
+                "tools": [
+                    tool.model_dump(exclude_none=True)
+                    for tool in cls._response_tools_to_chat_tools(item.tools)
+                ],
+            }
 
         # Most chat templates only recognize system/user/assistant/tool; collapse
         # ``developer`` to ``system`` at the boundary, labelled so the instruction
@@ -1455,12 +1500,26 @@ class OpenAIServingResponses(OpenAIServingChat):
         for input_item in self._response_input_history(request):
             normalized = self._normalize_response_message_for_chat(input_item)
             if normalized is not None:
+                if (
+                    isinstance(input_item, dict)
+                    and input_item.get("type") == "additional_tools"
+                    and self.chat_encoding_spec
+                    not in ("kimi_k3", "dsv41", "dsv4", "dsv32")
+                ):
+                    normalized["content"] = label_developer_content(
+                        "Additional tools:\n" + json.dumps(normalized["tools"])
+                    )
                 messages.append(normalized)
 
         # One Responses-API assistant turn maps to multiple input items
         # (message + function_call(s)); collapse them into one chat message
         # so chat templates render a single assistant block per turn.
         messages = self._merge_consecutive_assistant_messages(messages)
+
+        if any("tools" in message for message in messages):
+            if request.tools and "tools" in messages[0]:
+                messages.insert(0, {"role": "system", "content": ""})
+            return messages
 
         # Most chat templates expect a single leading ``system`` message;
         # coalesce any ``instructions`` + interleaved ``developer`` entries.
@@ -1893,7 +1952,11 @@ class OpenAIServingResponses(OpenAIServingChat):
     ) -> AsyncGenerator[str, None]:
         pending: list[dict] = []
         can_call_tools = (
-            bool(self._response_tools_to_chat_tools(request))
+            bool(
+                self._response_tools_to_chat_tools(
+                    self._effective_response_tools(request)
+                )
+            )
             and request.effective_tool_choice() != "none"
         )
         async for event in self._responses_stream_generator_non_harmony(
@@ -1999,8 +2062,9 @@ class OpenAIServingResponses(OpenAIServingChat):
             )
         )
 
-        chat_tools = self._response_tools_to_chat_tools(request)
-        custom_names = custom_tool_names(request.tools)
+        response_tools = self._effective_response_tools(request)
+        chat_tools = self._response_tools_to_chat_tools(response_tools)
+        custom_names = custom_tool_names(response_tools)
         tool_choice = request.effective_tool_choice()
         is_required = tool_choice == "required" or isinstance(tool_choice, dict)
         tool_parser: Optional[Union[FunctionCallParser, JsonArrayParser]] = None

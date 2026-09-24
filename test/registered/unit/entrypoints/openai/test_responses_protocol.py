@@ -28,6 +28,29 @@ def _in_progress_response(request: ResponsesRequest) -> ResponsesResponse:
 
 
 class ResponsesRequestTestCase(CustomTestCase):
+    def test_additional_tools_validates_inventory_before_input_union(self):
+        inventory = {
+            "type": "additional_tools",
+            "role": "developer",
+            "tools": [{"type": "function", "name": "lookup"}],
+        }
+        request = ResponsesRequest(model="x", input=[inventory])
+        self.assertEqual(request.input[0]["type"], "additional_tools")
+        self.assertEqual(request.input[0]["tools"][0]["name"], "lookup")
+        for update in (
+            {"role": "user"},
+            {"role": None},
+            {"tools": None},
+            {"tools": {}},
+            {"tools": [{"type": "function"}]},
+            {"tools": [{"type": "custom"}]},
+            {"tools": [{"type": "function", "name": "lookup", "parameters": []}]},
+            {"tools": [{"type": "web_search"}]},
+            {"tools": [{"type": "namespace", "name": "functions", "tools": []}]},
+        ):
+            with self.subTest(update=update), self.assertRaises(ValueError):
+                ResponsesRequest(model="x", input=[{**inventory, **update}])
+
     def test_pd_routing_fields(self):
         with self.assertWarns(DeprecationWarning):
             request = ResponsesRequest(

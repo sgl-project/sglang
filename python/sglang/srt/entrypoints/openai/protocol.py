@@ -1606,6 +1606,24 @@ class ResponseTool(BaseModel):
         return self
 
 
+class ResponseAdditionalTools(BaseModel):
+    type: Literal["additional_tools"]
+    role: Literal["developer"]
+    tools: List[ResponseTool]
+
+    @model_validator(mode="after")
+    def validate_tools(self) -> ResponseAdditionalTools:
+        for tool in self.tools:
+            if tool.type not in ("function", "custom"):
+                raise ValueError(
+                    "additional_tools supports function and custom tools, "
+                    f"got {tool.type!r}"
+                )
+            if not tool.name:
+                raise ValueError("additional_tools entries must include a name")
+        return self
+
+
 class ResponseInputMessageParam(EasyInputMessageParam, total=False):
     phase: Optional[Literal["commentary", "final_answer"]]
 
@@ -1761,6 +1779,11 @@ class ResponsesRequest(BaseModel):
     def _normalize_input_item_for_validation(item):
         if not isinstance(item, dict):
             return item
+
+        if item.get("type") == "additional_tools":
+            return ResponseAdditionalTools.model_validate(item).model_dump(
+                exclude_none=True
+            )
 
         # an output item replayed into input carries a string id; without this it'd
         # be read as an item-reference, drop its content, and fail as an empty {}.
