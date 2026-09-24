@@ -25,6 +25,7 @@ class MingImagePipelineConfig(ImagePipelineConfig):
     text_encoder_precisions: tuple[str, ...] = ("bf16",)
     native_only_components: tuple[str, ...] = ("text_encoder", "transformer", "vae")
     vae_precision: str = "bf16"
+    vae_tiling: bool = False
     enable_autocast: bool = False
     generator_device: str = "cpu"
 

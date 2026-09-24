@@ -28,14 +28,21 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-@pytest.fixture(params=["Design", "Design-Layer"])
+@pytest.fixture(
+    params=[("Design", False), ("Design-Layer", False), ("Design-Layer", True)]
+)
 def case(request):
+    checkpoint, tiled = request.param
     return DiffusionTestCase(
-        f"ming_image_{request.param.lower()}",
+        f"ming_image_{checkpoint.lower()}_{'tiled' if tiled else 'full'}",
         DiffusionServerArgs(
-            model_path=f"inclusionAI/Ming-Image-0.1-{request.param}",
+            model_path=f"inclusionAI/Ming-Image-0.1-{checkpoint}",
             modality="image",
-            extras=["--performance-mode speed", "--warmup-mode off"],
+            extras=[
+                "--performance-mode speed",
+                "--warmup-mode off",
+                f"--vae-tiling {str(tiled).lower()}",
+            ],
         ),
         DiffusionSamplingParams(output_size="512x512"),
     )

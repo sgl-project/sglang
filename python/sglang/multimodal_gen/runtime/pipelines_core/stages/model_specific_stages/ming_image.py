@@ -169,6 +169,8 @@ class MingImageReferenceStage(PipelineStage):
         )
         pixels = ((pixels - 0.5) * 2).unsqueeze(0).unsqueeze(2)
         with self.use_declared_component(component_name="vae", module=self.vae) as vae:
+            if server_args.pipeline_config.vae_tiling:
+                vae.enable_tiling()
             pixels = pixels.to(
                 device=get_local_torch_device(), dtype=next(vae.parameters()).dtype
             )
