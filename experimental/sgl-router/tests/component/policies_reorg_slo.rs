@@ -4,14 +4,14 @@
 use std::sync::Arc;
 
 use sgl_router::buckets_reorg::{Bucket, BucketGroups, BucketResolver, EngineGroup, SloPreference};
-use sgl_router::policies_reorg::power_of_n::PowerOfNPolicy;
+use sgl_router::policies_reorg::power_of_two::PowerOfTwoPolicy;
 use sgl_router::policies_reorg::PickError;
 use sgl_router::state::load_monitor::engine_reported_load::EngineReportedLoadTable;
 
 fn bucket(id: &str, max: u64, rank: u32, ttft: Option<u64>, tps: Option<f64>) -> Bucket {
     let mut bucket = Bucket::new(
         id,
-        BucketGroups::Plain(EngineGroup::new(Arc::new(PowerOfNPolicy::new(
+        BucketGroups::Plain(EngineGroup::new(Arc::new(PowerOfTwoPolicy::new(
             EngineReportedLoadTable::new(),
         )))),
     );

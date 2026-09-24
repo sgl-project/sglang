@@ -168,12 +168,12 @@ pub struct RoutingArgs {
     #[arg(long, value_enum, default_value = "legacy")]
     pub chat_routing: ChatRoutingKind,
 
-    /// Routing policy (defaults to power_of_n with reorg routing).
+    /// Routing policy (defaults to power_of_two with reorg routing).
     #[arg(
         long,
         value_enum,
         default_value = "round_robin",
-        default_value_if("chat_routing", "reorg", "power_of_n")
+        default_value_if("chat_routing", "reorg", "power_of_two")
     )]
     pub policy: PolicyKind,
 
@@ -181,7 +181,8 @@ pub struct RoutingArgs {
     #[arg(long, value_enum, default_value = "power_of_two")]
     pub decode_policy: DecodePolicyKind,
 
-    /// Reorg power-of-N sample size, including decode and fallbacks (default: 2).
+    /// Sample size for reorg --policy power_of_n, including decode (default: 2).
+    /// Values above the pool size sample every engine.
     #[arg(long)]
     pub power_of_n_choices: Option<std::num::NonZeroUsize>,
 
@@ -347,14 +348,14 @@ impl Cli {
     /// Resolve CLI options and validate the resulting configuration.
     pub fn into_config(self) -> Result<Config> {
         ensure!(
-            self.routing.power_of_n_choices.is_none()
-                || self.routing.chat_routing == ChatRoutingKind::Reorg,
-            "--power-of-n-choices requires --chat-routing reorg"
-        );
-        ensure!(
             self.routing.policy != PolicyKind::PowerOfN
                 || self.routing.chat_routing == ChatRoutingKind::Reorg,
             "--policy power_of_n requires --chat-routing reorg"
+        );
+        ensure!(
+            self.routing.power_of_n_choices.is_none()
+                || self.routing.policy == PolicyKind::PowerOfN,
+            "--power-of-n-choices requires --policy power_of_n"
         );
         if self.routing.chat_routing == ChatRoutingKind::Reorg {
             ensure!(
@@ -418,10 +419,6 @@ impl Cli {
                 disable_input_ids_forwarding: self.model.disable_input_ids_forwarding,
                 policy: self.routing.policy,
                 decode_policy: self.routing.decode_policy,
-                power_of_n_choices: self
-                    .routing
-                    .power_of_n_choices
-                    .map_or(2, std::num::NonZeroUsize::get),
                 bucket_config,
                 circuit_breaker,
                 cache_aware,
@@ -888,29 +885,29 @@ mod tests {
                 .unwrap()
                 .into_config()
         };
-        assert_eq!(parse(&[]).unwrap().model.policy, PolicyKind::PowerOfN);
-        assert_eq!(parse(&[]).unwrap().model.power_of_n_choices, 2);
+        assert_eq!(parse(&[]).unwrap().model.policy, PolicyKind::PowerOfTwo);
         assert_eq!(
             parse(&["--policy", "power_of_n", "--power-of-n-choices", "4"])
                 .unwrap()
                 .model
-                .power_of_n_choices,
-            4
+                .policy,
+            PolicyKind::PowerOfN
         );
+        assert!(parse(&["--power-of-n-choices", "4"]).is_err());
         for args in [
-            "--chat-routing reorg --power-of-n-choices 0",
-            "--chat-routing reorg --policy power_of_two",
-            "--power-of-n-choices 4",
-            "--policy power_of_n",
+            &["--policy", "power_of_n"][..],
+            &["--policy", "power_of_two", "--power-of-n-choices", "4"],
         ] {
-            assert!(cfg_of(args).is_err());
+            let legacy = Cli::try_parse_from(base.iter().chain(args)).unwrap();
+            assert!(legacy.into_config().is_err(), "{args:?}");
         }
-        for args in [
-            "--policy power_of_two --decode-policy power_of_two",
-            "--policy sticky --sticky-fallback-policy power_of_two",
-        ] {
-            assert!(cfg_of(args).is_ok());
-        }
+        assert!(Cli::try_parse_from(base.iter().chain(reorg.iter()).chain(&[
+            "--policy",
+            "power_of_n",
+            "--power-of-n-choices",
+            "0"
+        ]))
+        .is_err());
         let cache = parse(&[
             "--policy",
             "cache_aware",

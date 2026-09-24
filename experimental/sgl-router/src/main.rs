@@ -59,6 +59,10 @@ async fn main() -> Result<()> {
     // Resolve CLI configuration and set up startup logging.
     let cli = Cli::parse();
     let routing = cli.routing.chat_routing;
+    let power_of_n_choices = cli
+        .routing
+        .power_of_n_choices
+        .map_or(2, std::num::NonZeroUsize::get);
     init_tracing(&cli.server.log_level, cli.server.log_format)?;
     let config = cli
         .into_config()
@@ -97,6 +101,7 @@ async fn main() -> Result<()> {
                 &config.model,
                 &engine_state,
                 external_kv_indexer_client.clone(),
+                power_of_n_choices,
             )
             .context("build reorg policies")?;
             (

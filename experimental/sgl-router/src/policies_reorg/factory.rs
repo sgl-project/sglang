@@ -16,6 +16,7 @@ use super::{
     admission::AdmissionLimits,
     cache_aware::{CacheAwarePolicy, CacheSource},
     power_of_n::PowerOfNPolicy,
+    power_of_two::PowerOfTwoPolicy,
     session_aware::SessionAwarePolicy,
     Policy,
 };
@@ -24,9 +25,12 @@ pub fn validate(model: &ModelConfig) -> Result<()> {
     ensure!(
         matches!(
             model.policy,
-            PolicyKind::PowerOfN | PolicyKind::CacheAware | PolicyKind::SessionAware
+            PolicyKind::PowerOfTwo
+                | PolicyKind::PowerOfN
+                | PolicyKind::CacheAware
+                | PolicyKind::SessionAware
         ),
-        "reorg routing supports power_of_n, cache_aware, and session_aware"
+        "reorg routing supports power_of_two, power_of_n, cache_aware, and session_aware"
     );
     ensure!(
         model.bucket_config.is_none(),
@@ -34,7 +38,7 @@ pub fn validate(model: &ModelConfig) -> Result<()> {
     );
     ensure!(
         model.decode_policy == DecodePolicyKind::PowerOfTwo,
-        "reorg routing does not support --decode-policy legacy_host_affinity"
+        "reorg routing requires --decode-policy power_of_two"
     );
     if let Some(filters) = &model.eligibility {
         ensure!(
@@ -60,10 +64,13 @@ pub fn validate(model: &ModelConfig) -> Result<()> {
 
 /// Build the default plain and PD buckets. Callers run [`validate`] first;
 /// `Cli::into_config` does so before startup reaches this point.
+/// `power_of_n_choices` is the sample size for `--policy power_of_n`, which
+/// also selects decode engines.
 pub fn build_resolver(
     model: &ModelConfig,
     state: &KvEventIndex,
     external_index: Option<Arc<dyn sgl_kv_indexer::PrefixIndex>>,
+    power_of_n_choices: usize,
 ) -> Result<(BucketResolver, Option<JanitorHandle>)> {
     let admission = Arc::new(AdmissionLimits {
         max_inflight_requests: model
@@ -73,20 +80,25 @@ pub fn build_resolver(
             .map(|n| n as u64),
         ..Default::default()
     });
-    let mut decode =
-        PowerOfNPolicy::new(state.engine_reported_load()).with_choices(model.power_of_n_choices)?;
-    decode.admission = admission.clone();
-    let decode: Arc<dyn Policy> = Arc::new(decode);
+    let decode: Arc<dyn Policy> = if model.policy == PolicyKind::PowerOfN {
+        let mut decode =
+            PowerOfNPolicy::new(state.engine_reported_load()).with_choices(power_of_n_choices)?;
+        decode.admission = admission.clone();
+        Arc::new(decode)
+    } else {
+        let mut decode = PowerOfTwoPolicy::new(state.engine_reported_load());
+        decode.admission = admission.clone();
+        Arc::new(decode)
+    };
     let affinity = model.affinity.clone().unwrap_or_default();
     let mut cleanup = None;
     let policy: Arc<dyn Policy> = match model.policy {
-        PolicyKind::PowerOfN => decode.clone(),
+        PolicyKind::PowerOfTwo | PolicyKind::PowerOfN => decode.clone(),
         PolicyKind::SessionAware => {
             let store = AffinityStore::new(Duration::from_secs(affinity.session_idle_secs));
             cleanup =
                 store.spawn_sweeper(Duration::from_secs(affinity.session_eviction_interval_secs));
-            let mut policy = SessionAwarePolicy::new(store, state.engine_reported_load())
-                .with_choices(model.power_of_n_choices)?;
+            let mut policy = SessionAwarePolicy::new(store, state.engine_reported_load());
             policy.admission = admission;
             Arc::new(policy)
         }
@@ -103,10 +115,6 @@ pub fn build_resolver(
             };
             let mut policy =
                 CacheAwarePolicy::new(Arc::new(source), state.engine_reported_load(), affinity)?;
-            policy.fallback = Arc::new(
-                PowerOfNPolicy::new(state.engine_reported_load())
-                    .with_choices(model.power_of_n_choices)?,
-            );
             policy.admission = admission;
             Arc::new(policy)
         }

@@ -85,7 +85,7 @@ async fn new_sessions_choose_lower_pressure_then_reuse_binding() {
 }
 
 #[tokio::test]
-async fn missing_and_empty_keys_use_admitted_power_of_n_without_binding() {
+async fn missing_and_empty_keys_use_admitted_power_of_two_without_binding() {
     let (mut policy, store) = policy();
     let admission = Arc::new(Admission::default());
     policy.admission = admission.clone();

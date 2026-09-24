@@ -188,7 +188,6 @@ impl AppContext {
                     disable_input_ids_forwarding: false,
                     policy: crate::config::PolicyKind::RoundRobin,
                     decode_policy: Default::default(),
-                    power_of_n_choices: 2,
                     bucket_config: None,
                     circuit_breaker: None,
                     cache_aware: None,

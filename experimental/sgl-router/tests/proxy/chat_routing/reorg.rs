@@ -148,14 +148,14 @@ fn body(content: &str) -> serde_json::Value {
 
 #[tokio::test]
 async fn configured_limits_reject_before_dispatch_and_admit_after_load_drops() {
-    use sgl_router::policies_reorg::power_of_n::PowerOfNPolicy;
+    use sgl_router::policies_reorg::power_of_two::PowerOfTwoPolicy;
     use sgl_router::state::load_monitor::engine_reported_load::{LoadStat, NativeCacheRankLoad};
     use std::time::Instant;
 
     let worker = MockWorker::start(vec![]).await;
     let mut ctx = Arc::try_unwrap(context(&[("w", Stage::Plain, &worker)], vec![]))
         .unwrap_or_else(|_| panic!("context is not shared yet"));
-    let mut policy = PowerOfNPolicy::new(ctx.engine_reported_load.clone());
+    let mut policy = PowerOfTwoPolicy::new(ctx.engine_reported_load.clone());
     policy.admission = Arc::new(AdmissionLimits {
         max_running_requests: Some(1),
         max_kv_tokens: Some(100),
@@ -694,7 +694,7 @@ async fn default_pd_groups_apply_configured_inflight_admission() {
         vec![],
     );
     let mutable = Arc::get_mut(&mut ctx).unwrap();
-    mutable.config.model.policy = PolicyKind::PowerOfN;
+    mutable.config.model.policy = PolicyKind::PowerOfTwo;
     mutable.config.model.eligibility = Some(EligibilityConfig {
         filters: vec![FilterKind::Overloaded],
         max_in_flight: Some(1),
@@ -702,7 +702,7 @@ async fn default_pd_groups_apply_configured_inflight_admission() {
     });
     let state = sgl_router::state::kv_events::KvEventIndex::new();
     let (resolver, _) =
-        sgl_router::policies_reorg::factory::build_resolver(&mutable.config.model, &state, None)
+        sgl_router::policies_reorg::factory::build_resolver(&mutable.config.model, &state, None, 2)
             .unwrap();
     mutable.chat_routing = ChatRouting::Reorg([(ModelId("tiny".into()), resolver)].into());
     let worker = ctx.registry.get(&WorkerId("d".into())).unwrap();

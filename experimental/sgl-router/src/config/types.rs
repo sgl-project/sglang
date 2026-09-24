@@ -72,7 +72,7 @@ pub enum PolicyKind {
     Random,
     #[value(name = "power_of_two")]
     PowerOfTwo,
-    /// Power-of-N selection for reorg routing.
+    /// Power-of-N selection; reorg routing only.
     #[value(name = "power_of_n")]
     PowerOfN,
     /// Selects the currently least-loaded worker.
@@ -318,8 +318,6 @@ pub struct ModelConfig {
     pub policy: PolicyKind,
     /// Selection policy for the decode pool.
     pub decode_policy: DecodePolicyKind,
-    /// Sample size for reorg power-of-N selection and fallbacks.
-    pub power_of_n_choices: usize,
     /// Optional static bucket configuration. `None` uses the global domain.
     pub bucket_config: Option<BucketConfig>,
     pub circuit_breaker: Option<CircuitBreakerConfig>,

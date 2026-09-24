@@ -56,7 +56,8 @@ src/
     session_aware.rs             Session selection and fallback
     sticky.rs                   Routing-key selection and fallback
     least_load.rs               Least-load selection
-    power_of_n.rs                N-candidate sampling and stage-aware comparison
+    power_of_two.rs              Pair sampling and stage-aware comparison
+    power_of_n.rs                N-candidate sampling with set-wide pressure comparison
     random.rs                   Random selection
     round_robin.rs              Rotation
   state/
@@ -316,17 +317,18 @@ separate mechanism.
 | --- | --- |
 | `RoundRobinPolicy` | Rotate over candidates using a cursor owned by this policy instance |
 | `RandomPolicy` | Choose uniformly from candidates |
-| `PowerOfNPolicy` | Sample up to N distinct candidates (default 2) and choose the lower-pressure engine using the stage's load comparison |
+| `PowerOfTwoPolicy` | Sample two distinct candidates when possible and choose the lower-pressure engine using the stage's load comparison |
+| `PowerOfNPolicy` | Sample up to N distinct candidates (default 2, capped at the pool size) and choose the lowest-pressure engine; each load signal is chosen once for the whole sample |
 | `LeastLoadPolicy` (`load_based`) | Choose the least loaded engine; preserve tie-breaking, telemetry fallback, and recent-dispatch correction |
-| `SessionAwarePolicy` | Reuse an admitted session binding; use power-of-N for new or keyless sessions |
+| `SessionAwarePolicy` | Reuse an admitted session binding; use power-of-two for new or keyless sessions |
 | `StickyPolicy` | Reuse an admitted routing-key binding; use the configured fallback for new or missing keys |
 | `CacheAwarePolicy` | Prefer a usable prefix under cache and pressure rules; use a load-based fallback on a miss |
 
 Session assignments are scoped by model, bucket ID, stage, and session key.
 `SessionAwarePolicy::new(store, engine_load)` receives shared state; the caller
 owns the store's idle timeout and eviction task. Missing or empty session keys
-use power-of-N without creating assignments. A new or out-of-group binding
-uses power-of-N with `AdmissionLimits::default()`, then the session policy
+use power-of-two without creating assignments. A new or out-of-group binding
+uses power-of-two with `AdmissionLimits::default()`, then the session policy
 checks its selected engine before binding. A concurrent live assignment wins,
 but is checked before returning it; rejection ends that attempt without
 rewriting the binding or retrying another engine. Existing bindings are reused
@@ -379,8 +381,8 @@ applies to the current group.
 
 Application wiring starts shared services once. Policy construction validates
 configuration and passes the required handles to each policy and admission
-implementation. For example, `PowerOfNPolicy::new(Arc<EngineReportedLoadTable>)`
-retains the application's shared load table; `.with_choices(4)?` sets N to 4. KV-aware and affinity-aware policies
+implementation. For example, `PowerOfTwoPolicy::new(Arc<EngineReportedLoadTable>)`
+retains the application's shared load table. KV-aware and affinity-aware policies
 receive their corresponding shared handles when implemented. Policies with no
 state dependency require none. Policy instances do not create duplicate
 subscriptions, polling loops, indexes, or remote-client concurrency limits.
@@ -466,7 +468,7 @@ buckets:
         decode:
           worker_ids: [D1, D2]
           policy:
-            type: power_of_n
+            type: power_of_two
             admission: {max_running_requests: 64, max_kv_tokens: 1048576}
 
   - id: long-context
@@ -483,7 +485,7 @@ buckets:
         decode:
           worker_ids: [D3, D4]
           policy:
-            type: power_of_n
+            type: power_of_two
             admission: {max_running_requests: 64, max_kv_tokens: 1048576}
 ```
 
@@ -611,10 +613,10 @@ Implemented here:
   reruns its own candidate filtering and admission after obtaining a fresh snapshot.
 - Cache selection checks bounded candidates explicitly; hard rejection cannot
   become a cold fallback or bypass admission through saturation pinning. A miss
-  defaults to power-of-N within the group's soft queue tier, then the cache
+  defaults to power-of-two within the group's soft queue tier, then the cache
   policy checks its fallback winner. Cache policies require plain/prefill groups.
 - `SessionAwarePolicy` reuses admitted model/bucket/role-scoped bindings from a
-  shared `AffinityStore`, falling back to power-of-N for new or keyless sessions.
+  shared `AffinityStore`, falling back to power-of-two for new or keyless sessions.
   Assignments follow admission; concurrent binding winners are rechecked.
   Rejection preserves existing bindings and advances to the next bucket.
   The caller owns expiry and sweeper lifecycle. A binding may remain after a

@@ -27,7 +27,7 @@ use crate::state::load_monitor::engine_reported_load::{
 use crate::workers::Worker;
 
 use super::admission::{AdmissionLimits, Decision, EngineAdmission, EngineMetrics};
-use super::power_of_n::PowerOfNPolicy;
+use super::power_of_two::PowerOfTwoPolicy;
 use super::{Pick, PickError, PickRequest, Policy, Rejection, Stage};
 
 type Signal = Option<Arc<ExternalPrefixSignal>>;
@@ -170,7 +170,7 @@ impl CacheAwarePolicy {
         }
         Ok(Self {
             source,
-            fallback: Arc::new(PowerOfNPolicy::new(Arc::clone(&engine_load))),
+            fallback: Arc::new(PowerOfTwoPolicy::new(Arc::clone(&engine_load))),
             engine_load,
             config,
             admission: Arc::new(AdmissionLimits::default()),

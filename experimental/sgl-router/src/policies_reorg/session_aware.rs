@@ -16,14 +16,14 @@ use crate::state::AffinityStore;
 use crate::workers::Worker;
 
 use super::admission::{AdmissionLimits, Decision, EngineAdmission, EngineMetrics};
-use super::power_of_n::PowerOfNPolicy;
+use super::power_of_two::PowerOfTwoPolicy;
 use super::{Pick, PickError, PickRequest, Policy, Rejection};
 
 #[derive(Debug)]
 pub struct SessionAwarePolicy {
     store: Arc<AffinityStore>,
     engine_load: Arc<EngineReportedLoadTable>,
-    fallback: PowerOfNPolicy,
+    fallback: PowerOfTwoPolicy,
     pub admission: Arc<dyn EngineAdmission>,
 }
 
@@ -34,15 +34,10 @@ impl SessionAwarePolicy {
     pub fn new(store: Arc<AffinityStore>, engine_load: Arc<EngineReportedLoadTable>) -> Self {
         Self {
             store,
-            fallback: PowerOfNPolicy::new(Arc::clone(&engine_load)),
+            fallback: PowerOfTwoPolicy::new(Arc::clone(&engine_load)),
             engine_load,
             admission: Arc::new(AdmissionLimits::default()),
         }
-    }
-
-    pub fn with_choices(mut self, choices: usize) -> Result<Self, PickError> {
-        self.fallback = self.fallback.with_choices(choices)?;
-        Ok(self)
     }
 
     fn assignment_key(request: &PickRequest<'_>) -> Option<String> {
@@ -92,7 +87,7 @@ impl Policy for SessionAwarePolicy {
                 });
             }
 
-            // The nested power-of-N policy uses AdmissionLimits::default().
+            // The nested power-of-two policy uses AdmissionLimits::default().
             // The session owner checks its chosen engine before creating or
             // replacing a binding.
             let mut pick = self.pick_fallback(engines, request).await?;

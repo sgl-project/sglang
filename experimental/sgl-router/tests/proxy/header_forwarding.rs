@@ -34,7 +34,6 @@ async fn forwards_whitelisted_headers_strips_others() {
             disable_input_ids_forwarding: false,
             policy: PolicyKind::RoundRobin,
             decode_policy: Default::default(),
-            power_of_n_choices: 2,
             bucket_config: None,
             circuit_breaker: None,
             cache_aware: None,

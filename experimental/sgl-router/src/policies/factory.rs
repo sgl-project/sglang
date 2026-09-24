@@ -96,7 +96,7 @@ fn build_kind(
         PolicyKind::RoundRobin => Arc::new(RoundRobinPolicy::new()),
         PolicyKind::Random => Arc::new(RandomPolicy::new()),
         PolicyKind::PowerOfTwo => Arc::new(PowerOfTwoChoicesPolicy::new()),
-        PolicyKind::PowerOfN => return Err(anyhow!("power_of_n requires reorg routing")),
+        PolicyKind::PowerOfN => return Err(anyhow!("power_of_n requires --chat-routing reorg")),
         PolicyKind::LoadBased => Arc::new(LoadBasedPolicy::new()),
         PolicyKind::SessionAware => Arc::new(SessionAwarePolicy::new(
             model.affinity.clone().unwrap_or_default(),
@@ -194,7 +194,7 @@ pub fn build_policy_kind_only(kind: PolicyKind) -> Result<Arc<dyn Policy>> {
         PolicyKind::RoundRobin => Arc::new(RoundRobinPolicy::new()),
         PolicyKind::Random => Arc::new(RandomPolicy::new()),
         PolicyKind::PowerOfTwo => Arc::new(PowerOfTwoChoicesPolicy::new()),
-        PolicyKind::PowerOfN => return Err(anyhow!("power_of_n requires reorg routing")),
+        PolicyKind::PowerOfN => return Err(anyhow!("power_of_n requires --chat-routing reorg")),
         PolicyKind::LoadBased => Arc::new(LoadBasedPolicy::new()),
         PolicyKind::SessionAware => Arc::new(SessionAwarePolicy::new(
             crate::config::AffinityConfig::default(),
@@ -342,7 +342,6 @@ mod tests {
                 disable_input_ids_forwarding: false,
                 policy,
                 decode_policy: Default::default(),
-                power_of_n_choices: 2,
                 bucket_config: None,
                 circuit_breaker: None,
                 cache_aware: None,

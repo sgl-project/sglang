@@ -64,7 +64,6 @@ fn build_app_context(
             disable_input_ids_forwarding: false,
             policy,
             decode_policy: Default::default(),
-            power_of_n_choices: 2,
             bucket_config: Some(bucket_config),
             circuit_breaker: None,
             cache_aware: None,
