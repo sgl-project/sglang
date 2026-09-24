@@ -53,6 +53,7 @@ from sglang.srt.distributed import (
     init_distributed_environment,
     initialize_model_parallel,
 )
+from sglang.srt.managers.schedule_batch import ReqKvInfo
 from sglang.srt.mem_cache import page_interleave
 from sglang.srt.mem_cache.allocator.page_interleave import (
     PageInterleavePoolAllocator,
@@ -766,11 +767,7 @@ class _GraftReq:
         self.fill_ids = list(fill_ids)
         self.origin_input_ids = array("q", fill_ids)
         self.output_ids = array("q", [])
-        self.kv = SimpleNamespace(
-            req_pool_idx=req_pool_idx,
-            cache_protected_len=0,
-            swa_evicted_seqlen=0,
-        )
+        self.kv = ReqKvInfo(req_pool_idx=req_pool_idx)
         self.extra_key = None
         self.cache_salt = None
         self.prefix_indices = torch.empty(0, dtype=torch.int64)

@@ -6,6 +6,7 @@ from unittest.mock import patch
 import torch
 
 from sglang.srt.environ import InvariantCheckLevel, envs
+from sglang.srt.managers.schedule_batch import ReqKvInfo
 from sglang.srt.mem_cache.allocator.base import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.allocator.swa import (
     PureSWATokenToKVPoolAllocator,
@@ -483,7 +484,7 @@ class TestFreeKvRow(CustomTestCase):
     def test_free_kv_row_reads_the_record_row_and_its_floor(self):
         indices = _swa_alloc(self.allocator, 8)
         cache = _RowCache(self.allocator, indices)
-        kv = SimpleNamespace(req_pool_idx=0, swa_evicted_seqlen=3)
+        kv = ReqKvInfo(req_pool_idx=0, swa_evicted_seqlen=3)
         self.allocator.free_swa(indices[:3])
 
         cache.free_kv_row(kv, [(1, 5)])
@@ -495,7 +496,7 @@ class TestFreeKvRow(CustomTestCase):
     def test_single_pool_free_kv_row_still_frees_the_whole_range(self):
         allocator = _SinglePoolAllocator()
         cache = _RowCache(allocator, torch.arange(16, dtype=torch.int64))
-        kv = SimpleNamespace(req_pool_idx=0, swa_evicted_seqlen=4)
+        kv = ReqKvInfo(req_pool_idx=0, swa_evicted_seqlen=4)
 
         cache.free_kv_row(kv, [(2, 6)])
 
@@ -505,6 +506,20 @@ class TestFreeKvRow(CustomTestCase):
         # guards, so an empty range has to stay a no-op here.
         cache.free_kv_row(kv, [(6, 6)])
         self.assertEqual(len(allocator.freed), 2)
+
+    def test_rows_below_the_dead_floor_are_still_alive(self):
+        # all-SWA: only [swa_dead_lo, cursor) is dead; [start, swa_dead_lo) is alive
+        allocator = _build_pure_swa_allocator(size_swa=16)
+        baseline = allocator.swa_available_size()
+        indices = _swa_alloc(allocator, 8)
+        allocator.free_swa(indices[4:6])
+        self.assertEqual(allocator.swa_available_size(), baseline - 6)
+
+        cache = _RowCache(allocator, indices)
+        kv = ReqKvInfo(req_pool_idx=0, swa_evicted_seqlen=6, swa_evict_floor=4)
+        cache.free_kv_row(kv, [(2, 8)])
+
+        self.assertEqual(allocator.swa_available_size(), baseline - 2)
 
 
 class TestSWAPeerMappedContract(CustomTestCase):

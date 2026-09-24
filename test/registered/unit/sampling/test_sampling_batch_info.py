@@ -103,6 +103,32 @@ class TestSamplingBatchInfoLen(CustomTestCase):
 
 
 class TestSamplingMaskBatchIndices(CustomTestCase):
+    def test_filter_and_merge_preserve_support_logprob_modes(self):
+        info = _make_info(
+            batch_size=3,
+            return_sampling_masks=[True, True, False],
+            return_sampling_support_logprobs=[False, True, False],
+            sampling_mask_batch_indices=torch.tensor([0, 1]),
+        )
+        info.filter_batch([1, 2], torch.tensor([1, 2]))
+        self.assertEqual(info.return_sampling_support_logprobs, [True, False])
+        self.assertEqual(info.sampling_support_logprobs_capture_indices.tolist(), [0])
+
+        other = _make_info(
+            batch_size=2,
+            return_sampling_masks=[True, True],
+            return_sampling_support_logprobs=[False, True],
+            sampling_mask_batch_indices=torch.tensor([0, 1]),
+        )
+        info.merge_batch(other)
+        self.assertEqual(
+            info.return_sampling_support_logprobs,
+            [True, False, False, True],
+        )
+        self.assertEqual(
+            info.sampling_support_logprobs_capture_indices.tolist(), [0, 2]
+        )
+
     def test_filter_removes_last_opted_in_row_then_merge_restores_capture(self):
         info = _make_info(
             batch_size=2,

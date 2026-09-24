@@ -13,6 +13,7 @@ from types import SimpleNamespace
 
 import torch
 
+from sglang.srt.managers.schedule_batch import ReqKvInfo
 from sglang.srt.mem_cache.allocator.paged import PagedTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -66,7 +67,7 @@ def _make_cache_with_row(num_tokens):
     row = alloc.alloc(num_tokens)
     req_to_token = torch.zeros((1, num_tokens), dtype=row.dtype)
     req_to_token[0] = row
-    kv = SimpleNamespace(req_pool_idx=0, swa_evicted_seqlen=0)
+    kv = ReqKvInfo(req_pool_idx=0)
     return _RowCache(alloc, req_to_token), alloc, row, kv
 
 

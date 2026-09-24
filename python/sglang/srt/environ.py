@@ -1339,6 +1339,7 @@ class Envs:
     # (EAGLE/MTP). Off by default; see the PP+spec RFC for constraints
     # (non-overlap schedule, no DP attention).
     SGLANG_ENABLE_PP_SPEC = EnvBool(False)
+    SGLANG_ENABLE_DP_SPEC_PREFILL_COORDINATION = EnvBool(False)
     # Capture the per-replay attention-metadata prep (init_forward_metadata_out_graph)
     # into a small CUDA graph, collapsing its host dispatch cost to one launch.
     # Experimental; auto-falls back to eager if the backend's prep is not capturable.
@@ -1641,6 +1642,10 @@ class Envs:
     SGLANG_ENABLE_PCG_DSV2_DUAL_STREAM = EnvBool(False)
     SGLANG_DSA_TOPK_BROADCAST = EnvBool(False)
     SGLANG_DISABLE_DSA_INDEXER_FUSION = EnvBool(False)
+    # HIP analog of CUDA SGLANG_DISABLE_DSA_INDEXER_FUSION (default on).
+    # Set 1 for the legacy split writer. Omits Hadamard; pre-quant logits match.
+    # Separate from the CUDA flag: that one also packs wk+weights_proj.
+    SGLANG_DISABLE_AITER_FUSED_FP8_DSA_INDEXER = EnvBool(False)
     # Opt-in perf path for --dsa-prefill-backend flashmla_sparse_q8: fuse the
     # absorbed q bmm with the nope/rope concat + fp8 cast so q is written
     # directly in fp8 ("born fp8") and the standalone concat-cast kernel
@@ -1698,6 +1703,12 @@ class Envs:
     # 2 is the accuracy-safe default: higher values reuse staler selections
     # in the skip layers.
     SGLANG_MINIMAX_M3_INDEX_TOPK_FREQ = EnvInt(2)
+    # gfx95: lightning-indexer K cache in fp8_e4m3fn (bf16 q x fp8 k in the scorers);
+    # main attention K/V keep kv_cache_dtype.
+    SGLANG_OPT_MINIMAX_M3_FP8_INDEX_CACHE = EnvBool(True)
+    # Run the sparse prefill main attention through AITER's Gluon paged attention
+    # instead of the Triton kernel. Unsupported cases fall back to Triton.
+    SGLANG_OPT_USE_MINIMAX_GLUON_PREFILL = EnvBool(True)
     # MiniMax M3 NPU prefill MAIN-attention: route the sparse main attention through
     # the native Ascend FA op `torch.ops.npu.npu_fused_infer_attention_score` (FIA)
     # with a per-query CUSTOM block_table

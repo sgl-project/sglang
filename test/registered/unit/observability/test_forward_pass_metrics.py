@@ -6,7 +6,10 @@ register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 import math
 import types
 import unittest
+from functools import partial
 from unittest.mock import patch
+
+import prometheus_client
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.managers.scheduler_components.metrics_reporter import (
@@ -14,6 +17,7 @@ from sglang.srt.managers.scheduler_components.metrics_reporter import (
     SchedulerMetricsReporter,
     _CacheHitRateWindow,
 )
+from sglang.srt.observability.metrics_collector import SchedulerMetricsCollector
 from sglang.test.test_utils import CustomTestCase, enter_scope
 
 
@@ -117,9 +121,6 @@ def _make_reporter(test, scheduler) -> SchedulerMetricsReporter:
     )
     return SchedulerMetricsReporter(
         scheduler=scheduler,
-        tp_rank=0,
-        pp_rank=0,
-        dp_rank=0,
         metrics_collector_context=context,
         metrics_collector=None,
     )
@@ -341,7 +342,7 @@ class TestForwardPassMetrics(unittest.TestCase):
         self.assertFalse(scheduler.enable_fpm)
 
 
-class TestIdleMetrics(unittest.TestCase):
+class TestIdleMetrics(CustomTestCase):
     def setUp(self):
         self.scheduler = types.SimpleNamespace(
             running_batch=types.SimpleNamespace(reqs=[]),
@@ -365,6 +366,61 @@ class TestIdleMetrics(unittest.TestCase):
                 stats.fwd_occupancy
             ),
         )
+
+    def test_host_receive_metrics_survive_queue_drain(self):
+        registry = prometheus_client.CollectorRegistry()
+        labels = {"model_name": "test", "priority": "", "moe_ep_rank": 0}
+        sample_labels = {key: str(value) for key, value in labels.items()}
+        with patch.multiple(
+            prometheus_client,
+            **{
+                kind: partial(getattr(prometheus_client, kind), registry=registry)
+                for kind in ("Counter", "Gauge", "Histogram", "Summary")
+            },
+        ):
+            collector = SchedulerMetricsCollector(
+                labels=labels, server_args=self.scheduler.server_args
+            )
+        self.reporter.metrics_collector = collector
+        self.reporter.current_scheduler_metrics_enabled = True
+        self.scheduler.disaggregation_mode = DisaggregationMode.DECODE
+        self.scheduler.enable_priority_scheduling = True
+        self.scheduler.disagg_decode_prealloc_queue = types.SimpleNamespace(queue=[])
+        host_reqs = [
+            types.SimpleNamespace(host_staged=True, priority=priority)
+            for priority in (1, 2)
+        ]
+        self.scheduler.disagg_decode_transfer_queue = types.SimpleNamespace(
+            queue=[*host_reqs, types.SimpleNamespace(host_staged=False, priority=1)]
+        )
+        for _ in host_reqs:
+            collector.increment_decode_host_receive_reqs()
+
+        with get_context().override_server_args(
+            disaggregation_decode_host_receive_threshold=0.8
+        ):
+            for waiting in (True, False):
+                for req in host_reqs:
+                    req.host_staged = waiting
+                with patch(
+                    "sglang.srt.managers.scheduler_components.metrics_reporter.time.perf_counter",
+                    return_value=collector.last_log_time + 31,
+                ):
+                    self.reporter._maybe_log_idle_metrics()
+                for priority, expected in (("", 2), ("1", 1), ("2", 1)):
+                    self.assertEqual(
+                        registry.get_sample_value(
+                            "sglang:num_decode_host_receive_queue_reqs",
+                            {**sample_labels, "priority": priority},
+                        ),
+                        expected if waiting else 0,
+                    )
+                self.assertEqual(
+                    registry.get_sample_value(
+                        "sglang:num_decode_host_receive_reqs_total", sample_labels
+                    ),
+                    2,
+                )
 
     def test_idle_clears_cached_forward_occupancy_immediately(self):
         self.reporter.current_scheduler_metrics_enabled = True

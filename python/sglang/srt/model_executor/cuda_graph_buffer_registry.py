@@ -35,6 +35,7 @@ from sglang.srt.model_executor.input_buffers import (
     INDEX_SEMANTIC_BUFFERS,
     share_input_buffer,
 )
+from sglang.srt.runtime_context import get_parallel
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -1011,7 +1012,6 @@ def build_eager_registry(
     is_encoder_decoder: bool = False,
     encoder_len_fill_value: int = 0,
     encoder_lens_dtype: torch.dtype = torch.int32,
-    dp_size: int = 1,
 ) -> CudaGraphBufferRegistry:
     """One fixed-max input registry for the ``EagerRunner``, serving BOTH eager
     decode and eager prefill.
@@ -1042,7 +1042,7 @@ def build_eager_registry(
         register_global_num_tokens=False,
         require_gathered_buffer=False,
         require_mlp_tp_gather=False,
-        dp_size=dp_size,
+        dp_size=get_parallel().dp_size,
         share_pool=True,
         source=None,
     )

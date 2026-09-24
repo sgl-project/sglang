@@ -112,10 +112,10 @@ from sglang.srt.mem_cache.base_prefix_cache import (
 )
 from sglang.srt.mem_cache.common import (
     RetractionBackup,
+    backup_kv_cache,
     evict_from_tree_cache,
     free_swa_out_of_window_slots,
     release_kv_cache,
-    retraction_backup,
 )
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
@@ -165,6 +165,7 @@ logger = logging.getLogger(__name__)
 
 
 ReturnHiddenStatesMode = Union[bool, Literal["last"]]
+SamplingLogprobsMode = Literal["selected", "support"]
 
 
 def get_return_hidden_states_mode(
@@ -989,6 +990,7 @@ class Req(ReqDllmMixin):
         dllm_config: Optional[DllmConfig] = None,
         token_ids_logprob: List[int] = None,
         return_sampling_mask: bool = False,
+        sampling_logprobs_mode: SamplingLogprobsMode = "selected",
         return_flat_raw_top_logprobs: bool = False,
         stream: bool = False,
         origin_input_ids_unpadded: Optional[array[int]] = None,
@@ -1226,6 +1228,7 @@ class Req(ReqDllmMixin):
         self.temp_scaled_logprobs = False
         self.top_p_normalized_logprobs = False
         self.return_sampling_mask = return_sampling_mask
+        self.sampling_logprobs_mode = sampling_logprobs_mode
         self.return_flat_raw_top_logprobs = return_flat_raw_top_logprobs
 
         # Logprobs (return values)
@@ -2236,7 +2239,7 @@ def release_req(
     backup_saved = True
     # The config bag reflects role flips; server_args keeps the launch role.
     if get_disagg().disaggregation_mode == "decode" and offload_kv:
-        backup_saved = retraction_backup(
+        backup_saved = backup_kv_cache(
             req,
             tree_cache,
             req_to_token_pool,
@@ -2442,6 +2445,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # === Config / flags crossing to ForwardBatch (by-value) ===
     forward_mode: ForwardMode = None
     global_forward_mode: Optional[ForwardMode] = None
+
+    # Full-DP metadata from the existing scheduler gather.
+    dp_spec_prefill_coordination_metadata: Optional[tuple] = None
+    dp_spec_prefill_coordination_applied: bool = False
 
     # For DP attention
     is_extend_in_batch: bool = False
@@ -3788,6 +3795,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             decoding_reqs=self.decoding_reqs,
             spec_algorithm=self.spec_algorithm,
             spec_info=self.spec_info,
+            dp_spec_prefill_coordination_metadata=self.dp_spec_prefill_coordination_metadata,
+            dp_spec_prefill_coordination_applied=self.dp_spec_prefill_coordination_applied,
             global_num_tokens=self.global_num_tokens,
             global_num_tokens_for_logprob=self.global_num_tokens_for_logprob,
             can_run_decode_cuda_graph=self.can_run_decode_cuda_graph,

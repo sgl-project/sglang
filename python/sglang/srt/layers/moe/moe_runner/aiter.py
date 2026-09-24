@@ -3,11 +3,14 @@ from __future__ import annotations
 import functools
 import inspect
 import logging
+import os
 from dataclasses import dataclass
 from enum import Enum
 from typing import TYPE_CHECKING, Any, Optional, Union
 
 import torch
+
+_SMALLM_MOE_ON = os.environ.get("SGLANG_ROCM_SMALLM_MOE", "1") != "0"
 
 from sglang.srt.layers.moe.moe_runner.base import (
     MoeQuantInfo,
@@ -294,6 +297,39 @@ class AiterRunnerCore(MoeRunnerCore):
         if self.config.no_combine:
             extra["no_combine"] = True
 
+        # gfx950 small-M MXFP4 kernel (on by default, SGLANG_ROCM_SMALLM_MOE=0 disables): same layouts as aiter, bf16 activations.
+        if _SMALLM_MOE_ON and quant_info.w13_weight.element_size() == 1:
+            from sglang.kernels.ops.moe import smallm_moe_gfx950 as _smallm
+
+            try:
+                if (
+                    _smallm.smallm_moe_supported(
+                        runner_input.hidden_states,
+                        quant_info.w13_weight,
+                        quant_info.w2_weight,
+                        runner_input.topk_ids,
+                        quant_info.expert_mask,
+                        quant_info.doweight_stage1,
+                        self.config.activation == "silu",
+                        quant_info.b13 is not None or quant_info.b2 is not None,
+                        a1_scale,
+                    )
+                    and not extra.get("no_combine")
+                    and runner_input.num_local_tokens is None
+                ):
+                    out = _smallm.smallm_moe_fwd(
+                        runner_input.hidden_states,
+                        quant_info.w13_weight,
+                        quant_info.w2_weight,
+                        runner_input.topk_weights,
+                        runner_input.topk_ids,
+                        quant_info.w13_scale,
+                        quant_info.w2_scale,
+                    )
+                    if out is not None:
+                        return AiterRunnerOutput(hidden_states=out)
+            except _smallm.SmallMMoeUnavailable:
+                pass
         output = fused_moe(
             hidden_states=runner_input.hidden_states,
             w1=quant_info.w13_weight,

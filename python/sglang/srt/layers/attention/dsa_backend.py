@@ -15,6 +15,7 @@ from typing import (
 import torch
 
 from sglang.srt.configs.model_config import get_dsa_index_topk, is_deepseek_dsa
+from sglang.srt.constants import GPU_MEMORY_TYPE_CUDA_GRAPH
 from sglang.srt.runtime_context import (
     get_buffer,
     get_exec,
@@ -91,6 +92,7 @@ from sglang.srt.utils import (
     is_xpu,
     print_warning_once,
 )
+from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 _IS_GFX95 = is_gfx95_supported()
 
@@ -340,6 +342,10 @@ class DeepseekSparseAttnBackend(
         self.needs_cpu_seq_lens = self.dsa_index_kpool > 1
         self._init_kpool_metadata_fusion()
         self.max_context_len = model_runner.model_config.context_len
+        self._memory_saver_adapter = TorchMemorySaverAdapter.create(
+            enable=get_exec().features.enable_memory_saver
+            and envs.SGLANG_MEMORY_SAVER_CUDA_GRAPH.get()
+        )
         self.num_q_heads = (
             model_runner.model_config.num_attention_heads // get_parallel().attn_tp_size
         )
@@ -1258,6 +1264,28 @@ class DeepseekSparseAttnBackend(
         )
 
         max_ctx_len = self.req_to_token.shape[1]
+        # rewritten in full before every replay; the init-once metadata below would resume zeroed
+        with self._memory_saver_adapter.region(tag=GPU_MEMORY_TYPE_CUDA_GRAPH):
+            page_table = (
+                None
+                if self.dsa_drop_wide_page_table
+                else torch.zeros(
+                    max_num_tokens,
+                    max_ctx_len,
+                    dtype=torch.int32,
+                    device=self.device,
+                )
+            )
+            flashmla_metadata = (
+                self._compute_flashmla_metadata(
+                    cache_seqlens=torch.ones(
+                        max_num_tokens, dtype=torch.int32, device=self.device
+                    ),
+                    seq_len_q=1,
+                )
+                if self.dsa_decode_impl == "flashmla_kv"
+                else None
+            )
         self.decode_cuda_graph_metadata: Dict = {
             "cache_seqlens": torch.ones(
                 max_num_tokens, dtype=torch.int32, device=self.device
@@ -1284,26 +1312,8 @@ class DeepseekSparseAttnBackend(
                 if self.dsa_drop_wide_page_table
                 else None
             ),
-            "page_table": (
-                None
-                if self.dsa_drop_wide_page_table
-                else torch.zeros(
-                    max_num_tokens,
-                    max_ctx_len,
-                    dtype=torch.int32,
-                    device=self.device,
-                )
-            ),
-            "flashmla_metadata": (
-                self._compute_flashmla_metadata(
-                    cache_seqlens=torch.ones(
-                        max_num_tokens, dtype=torch.int32, device=self.device
-                    ),
-                    seq_len_q=1,
-                )
-                if self.dsa_decode_impl == "flashmla_kv"
-                else None
-            ),
+            "page_table": page_table,
+            "flashmla_metadata": flashmla_metadata,
         }
 
         # Sized by query rows, not requests: target verify captures

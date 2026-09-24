@@ -4,8 +4,8 @@ When a decode request is aborted while its prefill->decode KV transfer may still
 be in flight, the decode side holds its KV pages / req-slot instead of freeing
 them immediately (which could let the still-in-flight write land on pages already
 reused by another request). The pages are released once every prefill rank acks
-that its transfer drained (CommonKVManager.is_abort_release_safe), or a timeout
-fires. See DecodeTransferQueue.resolve_deferred_releases.
+that its transfer drained (CommonKVManager.is_abort_release_safe). Device
+destinations may also release on timeout; host destinations require the ack.
 """
 
 import unittest
@@ -149,6 +149,38 @@ def _make_decode_req(room, idx, mgr, n_prefill_ranks=1):
 
 
 class TestResolveDeferredReleases(CustomTestCase):
+    def test_host_release_requires_drain_on_every_rank_even_after_timeout(self):
+        mgr = _make_manager()
+        q = _make_queue(timeout=-1)
+        q.enable_host_receive = True
+        q.gloo_group = object()
+        entries = [_make_decode_req(room, room, mgr) for room in (1, 2)]
+        for entry in entries:
+            entry.host_staged = True
+            mgr.register_deferred_abort_room(entry.req.bootstrap_room)
+            q._defer_release(entry)
+        with (
+            patch.object(decode_mod, "discard_kv_cache_backup") as discard,
+            patch.object(decode_mod, "release_kv_cache") as device_release,
+            patch("torch.distributed.get_world_size", return_value=2),
+            patch("torch.distributed.all_reduce") as reduce,
+        ):
+            q.resolve_deferred_releases()
+            discard.assert_not_called()
+            mgr.note_abort_ack(2, 0)
+            reduce.side_effect = lambda ready, **_: ready.zero_()
+            q.resolve_deferred_releases()
+            discard.assert_not_called()
+            reduce.side_effect = None
+            q.resolve_deferred_releases()
+            discard.assert_called_once_with(entries[1].req, q.tree_cache, "host_pool")
+            self.assertEqual(q.req_to_metadata_buffer_idx_allocator.freed, [2])
+            mgr.note_abort_ack(1, 0)
+            q.resolve_deferred_releases()
+            self.assertEqual(discard.call_count, 2)
+            self.assertEqual(q._deferred_releases, [])
+            device_release.assert_not_called()
+
     def test_noop_when_nothing_deferred(self):
         q = _make_queue()
         with patch.object(decode_mod, "release_kv_cache") as rel:

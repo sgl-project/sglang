@@ -713,12 +713,12 @@ def _build_inkling_shared_experts(
     intermediate_size: int,
     layer_id: int,
     prefix: str,
-    moe_tp_rank: int,
-    moe_tp_size: int,
     quant_config: QuantizationConfig | None = None,
 ) -> nn.Module | None:
     if n_shared_experts <= 0:
         return None
+    # The shared dense MLP is reconstructed by the full-TP all-reduce in forward.
+    parallel = get_parallel()
     if shared_expert_sink:
         shared_prefix = add_prefix("shared_experts", prefix)
         shared_sink_serves_fp4 = InklingBatchDenseMLP._resolve_fp4_strategy(
@@ -729,8 +729,6 @@ def _build_inkling_shared_experts(
             shared_sink_serves_fp4=shared_sink_serves_fp4,
         )
         if use_fused_shared:
-            # moe_tp_rank/moe_tp_size are derived internally; kept as args only
-            # for the legacy and non-sink InklingDenseMLP paths below.
             return InklingSharedFusedMoE(
                 n_shared_experts=n_shared_experts,
                 hidden_size=hidden_size,
@@ -748,8 +746,8 @@ def _build_inkling_shared_experts(
             prefix=shared_prefix,
             quant_config=quant_config,
             inference_moe_w13_interleaved=inference_moe_w13_interleaved,
-            tp_rank=moe_tp_rank,
-            tp_size=moe_tp_size,
+            tp_rank=parallel.tp_rank,
+            tp_size=parallel.tp_size,
             tp_group=get_parallel().tp_group,
         )
         return InklingBatchDenseMLP(
@@ -767,8 +765,8 @@ def _build_inkling_shared_experts(
         layer_id=layer_id,
         prefix=add_prefix("shared_experts", prefix),
         quant_config=quant_config,
-        tp_rank=moe_tp_rank,
-        tp_size=moe_tp_size,
+        tp_rank=parallel.tp_rank,
+        tp_size=parallel.tp_size,
         tp_group=get_parallel().tp_group,
     )
 
@@ -870,10 +868,6 @@ class InklingMoE(nn.Module):
             intermediate_size=self.intermediate_dim,
             layer_id=layer_id,
             prefix=prefix,
-            # Shared expert is a replicated dense MLP: shard over the full tp group, not
-            # moe_tp (the single full-tp all_reduce in forward() reconstructs it).
-            moe_tp_rank=get_parallel().tp_rank,
-            moe_tp_size=get_parallel().tp_size,
             quant_config=self.quant_config,
         )
         if isinstance(self.shared_experts, InklingSharedFusedMoE):

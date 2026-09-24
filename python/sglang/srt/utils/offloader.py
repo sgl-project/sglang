@@ -65,7 +65,7 @@ def set_offloader(instance: BaseOffloader):
     _instance = instance
 
 
-def create_offloader(dp_rank: int):
+def create_offloader():
     if get_exec().offload.cpu_offload_gb > 0:
         return OffloaderV1(
             cpu_offload_max_bytes=int(get_exec().offload.cpu_offload_gb * 1024**3)
@@ -79,8 +79,6 @@ def create_offloader(dp_rank: int):
             num_in_group=get_exec().offload.offload_num_in_group,
             prefetch_step=get_exec().offload.offload_prefetch_step,
             mode=get_exec().offload.offload_mode,
-            dp_rank=dp_rank,
-            dp_size=get_parallel().dp_size,
         )
     return NoopOffloader()
 
@@ -210,9 +208,9 @@ class OffloaderV2(BaseOffloader):
         num_in_group: int,
         prefetch_step: int,
         mode: str,
-        dp_rank: int,
-        dp_size: int,
     ):
+        parallel = get_parallel()
+        dp_rank, dp_size = parallel.dp_rank, parallel.dp_size
         self.group_size = group_size
         self.num_in_group = num_in_group
         self.prefetch_step = prefetch_step

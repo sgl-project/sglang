@@ -78,6 +78,8 @@ class OpenAIServingScore(OpenAIServingBase):
                 item_embed_overrides=item_embed_overrides,
                 request=raw_request,
                 return_pooled_hidden_states=request.return_pooled_hidden_states,
+                temperature=request.temperature,
+                return_token_logprobs=request.return_token_logprobs,
             )
 
             phs_as_lists = None
@@ -90,6 +92,7 @@ class OpenAIServingScore(OpenAIServingBase):
             response = ScoringResponse(
                 scores=result.scores,
                 pooled_hidden_states=phs_as_lists,
+                token_logprobs=result.token_logprobs,
                 model=request.model,
                 usage=UsageInfo(
                     prompt_tokens=result.prompt_tokens,

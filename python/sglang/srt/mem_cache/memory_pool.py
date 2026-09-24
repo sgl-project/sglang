@@ -79,6 +79,7 @@ from sglang.srt.utils import (
     is_cpu,
     is_cuda,
     is_float4_e2m1fn_x2,
+    is_gfx95_supported,
     is_hip,
     is_npu,
     is_xpu,
@@ -110,6 +111,7 @@ _is_cpu = is_cpu()
 _is_xpu = is_xpu()
 _cpu_has_amx_support = cpu_has_amx_support()
 _is_hip = is_hip()
+_is_gfx95_supported = is_gfx95_supported()
 _is_fp8_fnuz = is_fp8_fnuz()
 # `SGLANG_AITER_KV_CACHE_LAYOUT` is only meaningful on the ROCm AITER backend
 # (HIP + --enable-aiter / SGLANG_USE_AITER=1). On any other platform / backend
@@ -5427,6 +5429,18 @@ class MHATokenToKOnlyPool(KVCache):
     def get_kv_size_bytes(self):
         k_size_bytes = sum(get_tensor_size_bytes(k) for k in self.k_buffer)
         return k_size_bytes, 0
+
+
+def get_minimax_sparse_index_dtype(
+    *, fp8_attn_gemm: bool, kv_cache_dtype: torch.dtype, model_dtype: torch.dtype
+) -> torch.dtype:
+    """Return the index-K cache dtype; the pool's cell-size estimate must match it."""
+    # fp8 attn-GEMM mode runs the indexer GEMMs in fp8 too; plain fp8 KV keeps bf16.
+    if fp8_attn_gemm:
+        return kv_cache_dtype
+    if _is_gfx95_supported and envs.SGLANG_OPT_MINIMAX_M3_FP8_INDEX_CACHE.get():
+        return torch.float8_e4m3fn
+    return model_dtype
 
 
 class MiniMaxSparseKVPool(KVCache):

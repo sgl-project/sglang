@@ -540,6 +540,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
     # For DP attention
     is_extend_in_batch: bool = False
+    dp_spec_prefill_coordination_applied: bool = False
     can_run_decode_cuda_graph: bool = False
     can_run_dp_prefill_cuda_graph: bool = False
     dp_prefill_cuda_graph_max_prefix_len: int = 0
@@ -815,11 +816,17 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         self, batch: ScheduleBatch, device: Union[str, torch.device]
     ) -> None:
         """Populate per-rank token counts for DP-attention MLP synchronization."""
+        self.dp_spec_prefill_coordination_applied = (
+            batch.dp_spec_prefill_coordination_applied
+        )
         if batch.global_num_tokens is None:
             return
 
         assert batch.global_num_tokens_for_logprob is not None
-        if self.spec_info is not None:
+        if (
+            self.spec_info is not None
+            and not batch.dp_spec_prefill_coordination_applied
+        ):
             from sglang.srt.speculative.spec_info import spec_scale_global_num_tokens
 
             global_num_tokens, global_num_tokens_for_logprob = (
@@ -1551,6 +1558,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             and not prefill_graph_tolerates_sum_len()
         ):
             dp_padding_mode = DpPaddingMode.MAX_LEN
+        if self.dp_spec_prefill_coordination_applied:
+            # Preserve each rank's forward mode on coordinated steps.
+            dp_padding_mode = DpPaddingMode.SUM_LEN
         self.dp_padding_mode = dp_padding_mode
 
         if dp_padding_mode.is_max_len():
@@ -1591,9 +1601,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             or self.forward_mode.is_draft_extend_v2()
             or self.forward_mode.is_idle()
         ):
-            # Mamba-hybrid families need the fabricated-row idle conversion
-            # below; this includes their MTP draft workers, whose mamba-less
-            # "*E" pattern makes mambaish_config return None.
+            # TARGET_VERIFY counts as extend; hybrid-SSM verify batches keep their
+            # verify layout. MTP draft workers ("*E", no mamba layer) count as hybrid.
             hybrid_ssm = mambaish_config(model_runner.model_config) is not None or (
                 model_runner.is_draft_worker
                 and getattr(
@@ -1617,16 +1626,12 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 self._original_forward_mode = self.forward_mode
                 self.forward_mode = ForwardMode.EXTEND
                 # Fabricate a single dummy request covering num_tokens for an
-                # empty (idle) rank. Hybrid-SSM families always take this path;
-                # non-hybrid ranks reach it once MAX_LEN is forced for the
-                # prefill breakable CUDA graph (idle + prefill), which needs
+                # empty (idle) rank. Ranks reach this once MAX_LEN is forced for
+                # the prefill breakable CUDA graph (idle + prefill), which needs
                 # every DP rank to run the same captured shape. The `else`
                 # branch handles decode rows padded to a 1-token extend.
-                if hybrid_ssm or self.seq_lens.shape[0] == 0:
+                if self.seq_lens.shape[0] == 0:
                     dev = self.seq_lens.device
-                    assert self.seq_lens.shape[0] == 0, (
-                        "extend-idle conversion expects an empty rank"
-                    )
                     self.extend_num_tokens = num_tokens
                     self.extend_seq_lens = torch.tensor(
                         [num_tokens], dtype=torch.int32, device=dev
@@ -1655,15 +1660,11 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                     self.extend_seq_lens_cpu = [int(num_tokens)]
                     self.extend_logprob_start_lens_cpu = [0]
                     bs = self.batch_size = 1
-                    # Keep idle non-hybrid fabricated rows masked by default.
-                    # Hybrid-SSM needs the real count for its state update.
-                    mask_dummy_tokens = (
-                        not hybrid_ssm and self._original_forward_mode.is_idle()
-                    )
-                    # Bump the GLOBAL scalar; the LOCAL count is derived from it
-                    # downstream. (global_num_token_non_padded is None unless
+                    # Keep idle fabricated rows masked. Bump the GLOBAL scalar;
+                    # the LOCAL count is derived from it downstream.
+                    # (global_num_token_non_padded is None unless
                     # moe_ep_size > 1.)
-                    if mask_dummy_tokens:
+                    if self._original_forward_mode.is_idle():
                         if self.global_num_token_non_padded is not None:
                             self.global_num_token_non_padded.fill_(0)
                         self.global_num_token_non_padded_cpu = 0

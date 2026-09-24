@@ -1033,6 +1033,9 @@ class ModelConfig:
             is_hybrid_swa_model(self.hf_config.architectures, self.hf_text_config)
             and not self.disable_hybrid_swa_memory
         )
+        # Whole-model split, read-only; per-runner slices live on ModelLayerInfo.
+        self.swa_attention_layer_ids: Optional[List[int]] = None
+        self.full_attention_layer_ids: Optional[List[int]] = None
 
         if self.is_hybrid_swa:
             logger.debug(f"Hybrid swa model: {self.hf_config.architectures=}")

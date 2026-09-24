@@ -164,27 +164,24 @@ class PrefillBootstrapQueue:
         draft_token_to_kv_pool: Optional[KVCache],
         req_to_metadata_buffer_idx_allocator: ReqToMetadataIdxAllocator,
         metadata_buffers: MetadataBuffers,
-        tp_rank: int,
-        tp_size: int,
         gpu_id: int,
         bootstrap_port: int,
         gloo_group: ProcessGroup,
         max_total_num_tokens: int,
         scheduler: Scheduler,
         scheduler_stage_metrics: SchedulerStageMetricsRecorder,
-        pp_rank: int,
-        pp_size: int,
         transfer_backend: TransferBackend,
     ):
+        parallel = get_parallel()
         self.token_to_kv_pool = token_to_kv_pool
         self.draft_token_to_kv_pool = draft_token_to_kv_pool
         self.is_mla_backend = is_mla_backend(token_to_kv_pool)
         self.metadata_buffers = metadata_buffers
         self.req_to_metadata_buffer_idx_allocator = req_to_metadata_buffer_idx_allocator
-        self.tp_rank = tp_rank
-        self.tp_size = tp_size
-        self.pp_rank = pp_rank
-        self.pp_size = pp_size
+        self.tp_rank = parallel.tp_rank
+        self.tp_size = parallel.tp_size
+        self.pp_rank = parallel.pp_rank
+        self.pp_size = parallel.pp_size
         self.gpu_id = gpu_id
         self.bootstrap_port = bootstrap_port
         self.queue: List[Req] = []

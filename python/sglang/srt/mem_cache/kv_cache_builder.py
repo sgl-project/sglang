@@ -25,7 +25,6 @@ class KVCacheBuildResult:
 
 from typing import TYPE_CHECKING
 
-from sglang.srt.arg_groups.overrides import resolving_view
 from sglang.srt.configs.hybrid_arch import (
     glm5_next_config,
     hybrid_gdn_config,
@@ -56,7 +55,7 @@ from sglang.srt.runtime_context import (
     get_schedule,
 )
 from sglang.srt.speculative.base_spec_worker import HiCacheDraftMode
-from sglang.srt.utils import is_hip
+from sglang.srt.utils import ceil_align, is_hip
 
 if TYPE_CHECKING:
     from torch.distributed import ProcessGroup
@@ -117,29 +116,6 @@ def prepare_hicache_staging(
             )
 
 
-def get_draft_kv_pool(
-    *,
-    draft_worker: BaseTpWorker,
-    spec_algorithm: SpeculativeAlgorithm,
-    server_args: ServerArgs,
-):
-    """Return the draft token-to-KV pool for the current draft worker,
-    or None when no draft KV pool is available."""
-    if draft_worker is None or spec_algorithm.is_ngram():
-        return None
-
-    # V2 draft workers exist only on their hosting PP stage; other ranks own no
-    # nested draft worker or draft KV pool.
-    if draft_worker.draft_worker is None:
-        return None
-
-    if resolving_view(server_args).enable_multi_layer_eagle:
-        draft_runner = draft_worker.draft_worker.draft_runner_list[0]
-    else:
-        draft_runner = draft_worker.draft_worker.draft_runner
-    return draft_runner.token_to_kv_pool
-
-
 def maybe_register_hicache_draft(
     *,
     tree_cache,
@@ -166,9 +142,14 @@ def maybe_register_hicache_draft(
 
 
 # Host slots a backup-only retraction pool gets, as a fraction of the device
-# pool. Sized well under 1.0 because a retraction burst touches a fraction of
-# the device tokens; overflow aborts the request rather than pre-reserving.
+# pool, with a floor large enough for one maximum-length request.
 BACKUP_ONLY_HICACHE_RATIO = 0.2
+
+
+def decode_retraction_max_tokens(req_to_token_pool, kv_cache) -> int:
+    return ceil_align(
+        min(req_to_token_pool.max_context_len - 1, kv_cache.size), kv_cache.page_size
+    )
 
 
 def uses_ssm_state(model_config) -> bool:
@@ -236,11 +217,19 @@ def resolve_decode_retraction_backup(*, tp_worker: BaseTpWorker) -> str:
 
     if memory.hicache_ratio is None:
         # Only a decode server reaches resolution with the ratio unset. A
-        # backup-only pool can be small: retractions that overflow it abort their
-        # request instead of crashing the scheduler. Sharing the pool with
-        # HiCache keeps the standard default.
+        # backup-only pool fits at least one runnable request. Sharing the pool
+        # with prefix caching keeps the standard HiCache default.
         if backend == "host_pool" and not memory.enable_hierarchical_cache:
-            fields["hicache_ratio"] = BACKUP_ONLY_HICACHE_RATIO
+            ratio = BACKUP_ONLY_HICACHE_RATIO
+            if memory.hicache_size == 0:
+                req_pool, allocator = tp_worker.get_memory_pool()
+                kv_pool = allocator.get_kvcache()
+                min_tokens = decode_retraction_max_tokens(req_pool, kv_pool)
+                if disagg.disaggregation_decode_host_receive_threshold > 0:
+                    # One request can receive while another is retracted.
+                    min_tokens *= 2
+                ratio = max(ratio, min_tokens / kv_pool.size)
+            fields["hicache_ratio"] = ratio
         else:
             fields["hicache_ratio"] = 2.0
 

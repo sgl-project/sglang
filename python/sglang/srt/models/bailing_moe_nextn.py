@@ -127,6 +127,7 @@ class BailingMoEModelNextN(nn.Module):
                 0,
                 quant_config=quant_config,
                 prefix=add_prefix("decoder", prefix),
+                is_nextn=True,
             )
 
         self.shared_head = nn.Module()

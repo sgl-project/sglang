@@ -922,14 +922,7 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
                 self.physical_to_virtual,
             )
 
-    def bind_pages(
-        self, virtual_pages: torch.Tensor, physical_pages: torch.Tensor
-    ) -> None:
-        """Page-granular alias of ``bind``."""
-        with record_function("MultiEndedAlloc.bind_pages"):
-            self.bind(virtual_pages, physical_pages)
-
-    # -- fused take_physical_pages + bind_pages --
+    # -- fused take_physical_pages + bind --
 
     def _alloc_bind_fast_or_slow(
         self, v_pages: torch.Tensor, N: int
@@ -1689,16 +1682,6 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
                 self._stats_n_drained_pages_total += sum(
                     t.numel() for t in ready_tensors
                 )
-
-    def maybe_drain_pending_reuse(self) -> None:
-        """Public scheduler hook (once per step): flow fired compaction-src pages
-        back into `_free_phys_pages` for immediate reuse without waiting for `_flush`.
-        """
-        if not self.lazy_compaction:
-            return
-        if not self._pending_reuse:
-            return
-        self._drain_pending_reuse(urgent=False)
 
     def _topmost_survivor(
         self,
@@ -2571,33 +2554,6 @@ class FloatMultiEndedAllocator(MultiEndedAllocator):
             if not self._holes_dirty or self._free_phys_pages.numel() == 0:
                 return 0
             return self._flush(urgent=False)
-
-    def backup_state(self):
-        # Span-aware snapshot (the base backs up `watermark_physical`, meaningless
-        # here). Spec decode is asserted off under unified today.
-        return (
-            self.low_wm_page,
-            self.high_wm_page,
-            self._free_phys_pages.clone(),
-            (len(self.free_virtual_ids) if self.is_id_owner else None),
-            len(self._inverse_history),
-        )
-
-    def restore_state(self, state):
-        low_wm, high_wm, holes, _n_free_virtual, n_inverse = state
-        self.low_wm_page = low_wm
-        self.high_wm_page = high_wm
-        self._free_phys_pages = holes
-        new_entries = self._inverse_history[n_inverse:]
-        if new_entries:
-            logger.warning(
-                "FloatMultiEndedAllocator.restore_state: %d relocation(s) inside "
-                "a backup window (sub_pool=%s) — float moves are not reversible.",
-                len(new_entries),
-                self.sub_pool_name,
-            )
-        del self._inverse_history[n_inverse:]
-        return new_entries
 
     def compact_holes(self, *, retreat_side: str) -> int:
         """Close ALL interior holes by packing live pages toward the side

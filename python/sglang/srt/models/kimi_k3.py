@@ -3151,6 +3151,11 @@ class KimiK3LinearForCausalLM(nn.Module):
         self.capture_aux_hidden_states = True
         self.model.dspark_layers_to_capture = list(layer_ids)
 
+    def set_dflash_layers_to_capture(self, layer_ids: list[int]) -> None:
+        # DFLASH target_layer_ids name layer outputs, which is what the DSPARK
+        # taps already capture here, so reuse them without the usual +1 shift.
+        self.set_dspark_layers_to_capture(layer_ids)
+
     @torch.no_grad()
     def forward(
         self,
@@ -3606,6 +3611,13 @@ class KimiK3ForConditionalGeneration(nn.Module):
         if self.language_model is None:
             return 0
         return self.language_model.get_pp_proxy_dspark_hidden_size()
+
+    def set_dflash_layers_to_capture(self, layer_ids: list[int]) -> None:
+        if self.language_model is None:
+            raise AttributeError(
+                "DFLASH layer capture is not available in encoder-only mode"
+            )
+        self.language_model.set_dflash_layers_to_capture(layer_ids)
 
     def set_dspark_layers_to_capture(self, layer_ids: list[int]) -> None:
         if self.language_model is None:

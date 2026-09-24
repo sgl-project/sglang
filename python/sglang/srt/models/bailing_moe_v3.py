@@ -85,7 +85,6 @@ from sglang.srt.models.deepseek_common.utils import (
 from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
 from sglang.srt.models.kimi_linear import KimiDeltaAttention
 from sglang.srt.runtime_context import (
-    get_forward,
     get_parallel,
     get_platform,
     get_stream,
@@ -1211,19 +1210,7 @@ class BailingMoELinearDecoderLayer(nn.Module):
             hidden_states, residual, forward_batch
         )
 
-        fuse_mlp_allreduce = (
-            self.layer_communicator.should_fuse_mlp_allreduce_with_next_layer(
-                forward_batch
-            )
-        )
-        mlp_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
-            forward_batch
-        )
-
-        with get_forward().scoped(
-            fuse_mlp_allreduce=fuse_mlp_allreduce,
-            mlp_reduce_scatter=mlp_reduce_scatter,
-        ):
+        with self.layer_communicator.ffn_exit(forward_batch) as ffn_exit:
             if not (
                 enable_moe_dense_fully_dp()
                 and (not self.is_layer_sparse)
@@ -1233,13 +1220,7 @@ class BailingMoELinearDecoderLayer(nn.Module):
                     hidden_states,
                     forward_batch=forward_batch,
                 )
-
-        if fuse_mlp_allreduce:
-            hidden_states._sglang_needs_allreduce_fusion = True
-        else:
-            hidden_states, residual = self.layer_communicator.postprocess_layer(
-                hidden_states, residual, forward_batch
-            )
+        hidden_states, residual = ffn_exit.finish(hidden_states, residual)
 
         return hidden_states, residual
 

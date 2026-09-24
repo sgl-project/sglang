@@ -406,18 +406,6 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         implementations that shard trees per cache namespace."""
         return self.root_node
 
-    def is_root(self, node: Any) -> bool:
-        """Whether the node is a tree root."""
-        return node is self.root_node
-
-    def get_last_hash_value(self, node: Any) -> Optional[str]:
-        """The node's last page hash, or None when it was never hashed."""
-        return node.get_last_hash_value()
-
-    def get_prefix_hash_values(self, node: Any) -> list[str]:
-        """The hash chain of the node's ancestors, in root-to-parent order."""
-        return node.get_prefix_hash_values(node.parent)
-
     def rotation_base_of(self, node: Any) -> Optional[int]:
         """Logical-page KV sharding: the rotation base stamped on ``node``.
 
@@ -453,13 +441,15 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         """
         from sglang.srt.mem_cache.common import coalesce_ranges, free_kv_row_segments
 
+        allocator = self.token_to_kv_pool_allocator
         row = self.req_to_token_pool.req_to_token[kv.req_pool_idx]
         # Adjacent pieces whose seam falls inside one (DCP-widened) page would
         # free that page twice; the allocator rejects that, so merge them first.
         free_kv_row_segments(
-            self.token_to_kv_pool_allocator,
+            allocator,
             [(row[start:end], start) for start, end in coalesce_ranges(ranges)],
             swa_evicted_seqlen=kv.swa_evicted_seqlen,
+            swa_dead_lo=kv.swa_dead_lo(allocator.page_size),
         )
 
     @abstractmethod

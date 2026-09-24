@@ -16,6 +16,8 @@ from sglang.srt.managers.io_struct import (
     AddExternalCorpusReqOutput,
     AttachHiCacheStorageReqInput,
     AttachHiCacheStorageReqOutput,
+    BeginWeightUpdateReqInput,
+    BeginWeightUpdateReqOutput,
     ChecksumInfo,
     CheckWeightsReqInput,
     CheckWeightsReqOutput,
@@ -28,6 +30,8 @@ from sglang.srt.managers.io_struct import (
     DetachHiCacheStorageReqOutput,
     DumperControlReqInput,
     DumperControlReqOutput,
+    EndWeightUpdateReqInput,
+    EndWeightUpdateReqOutput,
     ExpertDistributionReq,
     ExpertDistributionReqOutput,
     ExpertDistributionReqType,
@@ -131,6 +135,8 @@ _COMMUNICATOR_SPECS = [
     ("get_internal_state", GetInternalStateReqOutput),
     ("set_internal_state", SetInternalStateReqOutput),
     ("expert_distribution", ExpertDistributionReqOutput),
+    ("begin_weight_update", BeginWeightUpdateReqOutput),
+    ("end_weight_update", EndWeightUpdateReqOutput),
     ("update_lora_adapter", LoRAUpdateOutput),
     ("dumper_control", DumperControlReqOutput),
     ("scale_elastic_ep", ScaleElasticEPReqOutput),
@@ -448,6 +454,38 @@ class TokenizerControlMixin:
 
         results = await self.destroy_weights_update_group_communicator(obj)
         return FanOutCommunicator.merge_results(results)
+
+    async def _weight_update_session_call(
+        self: TokenizerManager, communicator, obj
+    ) -> Tuple[bool, str]:
+        self.auto_create_handle_loop()
+        async with self.is_pause_cond:
+            is_paused = self.is_pause
+            # whoever paused the engine holds the writer lock; taking it again deadlocks
+            if is_paused:
+                results = await communicator(obj)
+        if not is_paused:
+            async with self.model_update_lock.writer_lock:
+                results = await communicator(obj)
+        return FanOutCommunicator.merge_results(results)
+
+    async def begin_weight_update(
+        self: TokenizerManager,
+        obj: BeginWeightUpdateReqInput,
+        request: Optional[fastapi.Request] = None,
+    ) -> Tuple[bool, str]:
+        return await self._weight_update_session_call(
+            self.begin_weight_update_communicator, obj
+        )
+
+    async def end_weight_update(
+        self: TokenizerManager,
+        obj: EndWeightUpdateReqInput,
+        request: Optional[fastapi.Request] = None,
+    ) -> Tuple[bool, str]:
+        return await self._weight_update_session_call(
+            self.end_weight_update_communicator, obj
+        )
 
     async def update_weights_from_distributed(
         self: TokenizerManager,

@@ -203,9 +203,6 @@ class _ForwardOccupancyLogWindow(msgspec.Struct):
 @dataclass(kw_only=True)
 class SchedulerMetricsReporter:
     scheduler: Scheduler
-    tp_rank: int
-    pp_rank: int
-    dp_rank: Optional[int]
     metrics_collector_context: SchedulerMetricsCollectorContext
     metrics_collector: Optional[SchedulerMetricsCollector]
     num_retracted_reqs: int = 0
@@ -222,7 +219,7 @@ class SchedulerMetricsReporter:
         self.enable_kv_cache_events = (
             self.metrics_collector_context.enable_kv_cache_events
         )
-        self._init_metrics(self.tp_rank, self.pp_rank, self.dp_rank)
+        self._init_metrics()
         self._install_device_timer_on_runners()
         # Keep log history after the existing async result copy so reporting does
         # not synchronize the model stream once per generated token.
@@ -244,12 +241,7 @@ class SchedulerMetricsReporter:
             self.last_gen_throughput = 0.0
         return self.last_gen_throughput
 
-    def _init_metrics(
-        self,
-        tp_rank: int,
-        pp_rank: int,
-        dp_rank: Optional[int],
-    ):
+    def _init_metrics(self):
         # Basic stats
         self.forward_ct_decode = 0
         self.num_generated_tokens = 0
@@ -851,12 +843,7 @@ class SchedulerMetricsReporter:
                 self.stats.kv_transfer_speed_gb_s = self.kv_transfer_speed_gb_s
                 self.stats.kv_transfer_latency_ms = self.kv_transfer_latency_ms
             elif self.scheduler.disaggregation_mode == DisaggregationMode.DECODE:
-                self.stats.num_decode_prealloc_queue_reqs = QueueCount.from_reqs(
-                    self.scheduler.disagg_decode_prealloc_queue.queue, priority_enabled
-                )
-                self.stats.num_decode_transfer_queue_reqs = QueueCount.from_reqs(
-                    self.scheduler.disagg_decode_transfer_queue.queue, priority_enabled
-                )
+                self._update_decode_queue_stats(priority_enabled)
 
             # Utilization / LoRA / HiCache
             self._calculate_utilization()
@@ -989,9 +976,12 @@ class SchedulerMetricsReporter:
                 spec_num_draft_tokens = spec_snapshot["num_draft_tokens"]
 
         if self.scheduler.disaggregation_mode == DisaggregationMode.DECODE:
+            self._update_decode_queue_stats(self.scheduler.enable_priority_scheduling)
             msg += f"pre-allocated usage: {self.scheduler.disagg_decode_prealloc_queue.num_tokens_pre_allocated / self.scheduler.max_total_num_tokens:.2f}, "
             msg += f"#prealloc-req: {len(self.scheduler.disagg_decode_prealloc_queue.queue)}, "
             msg += f"#transfer-req: {len(self.scheduler.disagg_decode_transfer_queue.queue)}, "
+            if get_disagg().disaggregation_decode_host_receive_threshold > 0:
+                msg += f"#host-receive-req: {self.stats.num_decode_host_receive_queue_reqs.total}, "
             msg += f"#retracted-req: {len(self.scheduler.disagg_decode_prealloc_queue.retracted_queue)}, "
 
         if (
@@ -1076,13 +1066,6 @@ class SchedulerMetricsReporter:
                 )
                 self.stats.num_prefill_inflight_queue_reqs = QueueCount.from_reqs(
                     self.scheduler.disagg_prefill_inflight_queue, priority_enabled
-                )
-            elif self.scheduler.disaggregation_mode == DisaggregationMode.DECODE:
-                self.stats.num_decode_prealloc_queue_reqs = QueueCount.from_reqs(
-                    self.scheduler.disagg_decode_prealloc_queue.queue, priority_enabled
-                )
-                self.stats.num_decode_transfer_queue_reqs = QueueCount.from_reqs(
-                    self.scheduler.disagg_decode_transfer_queue.queue, priority_enabled
                 )
 
             # Streaming session metrics
@@ -1385,6 +1368,23 @@ class SchedulerMetricsReporter:
             self.fwd_occupancy = float("nan")
             self.stats.fwd_occupancy = float("nan")
 
+    def _update_decode_queue_stats(self, priority_enabled: bool) -> None:
+        transfer_queue = self.scheduler.disagg_decode_transfer_queue.queue
+        self.stats.num_decode_prealloc_queue_reqs = QueueCount.from_reqs(
+            self.scheduler.disagg_decode_prealloc_queue.queue, priority_enabled
+        )
+        self.stats.num_decode_transfer_queue_reqs = QueueCount.from_reqs(
+            transfer_queue, priority_enabled
+        )
+        host_reqs = (
+            [req for req in transfer_queue if req.host_staged]
+            if get_disagg().disaggregation_decode_host_receive_threshold > 0
+            else []
+        )
+        self.stats.num_decode_host_receive_queue_reqs = QueueCount.from_reqs(
+            host_reqs, priority_enabled
+        )
+
     def _maybe_log_idle_metrics(self):
         """Reset forward timing and publish idle metrics when needed."""
         # Preserve the transition so the rate limit cannot leave a finite idle gauge.
@@ -1435,10 +1435,5 @@ class SchedulerMetricsReporter:
                 self.scheduler.disagg_prefill_inflight_queue, priority_enabled
             )
         if self.scheduler.disaggregation_mode == DisaggregationMode.DECODE:
-            self.stats.num_decode_prealloc_queue_reqs = QueueCount.from_reqs(
-                self.scheduler.disagg_decode_prealloc_queue.queue, priority_enabled
-            )
-            self.stats.num_decode_transfer_queue_reqs = QueueCount.from_reqs(
-                self.scheduler.disagg_decode_transfer_queue.queue, priority_enabled
-            )
+            self._update_decode_queue_stats(priority_enabled)
         self.metrics_collector.log_stats(self.stats)

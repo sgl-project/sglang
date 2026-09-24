@@ -43,10 +43,10 @@ def get_dsv4_indexer_bytes_per_token(index_head_dim: int, use_fp4_indexer: bool)
     return index_head_dim + index_head_dim // 128 * 4
 
 
-def get_compress_state_ring_size(
-    compress_ratio: int, is_speculative: bool = False, num_draft_tokens: int = 0
-) -> int:
+def get_compress_state_ring_size(compress_ratio: int, num_draft_tokens: int = 0) -> int:
+    """Rows per request ring; num_draft_tokens == 0 means no speculative decoding."""
     assert compress_ratio in [2, 4, 128], f"Unsupported {compress_ratio = }"
+    is_speculative = num_draft_tokens > 0
     if compress_ratio == 2:
         # Two positions are one pair, addressed by position % ring_size; a
         # speculative ring must be wider than the draft window: pow2 >= 2 + drafts.
@@ -1164,11 +1164,12 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
 
     def get_ring_size(self, compress_ratio: int) -> int:
         spec = get_spec()
-        return get_compress_state_ring_size(
-            compress_ratio,
-            spec.speculative_algorithm is not None,
-            spec.speculative_num_draft_tokens or 0,
+        num_draft_tokens = (
+            0
+            if spec.speculative_algorithm is None
+            else spec.speculative_num_draft_tokens or 0
         )
+        return get_compress_state_ring_size(compress_ratio, num_draft_tokens)
 
     def translate_loc_from_full_to_swa(self, kv_indices: torch.Tensor):
         assert self.full_to_swa_index_mapping is not None
@@ -1803,14 +1804,6 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         if self.request_window is not None:
             return self.request_window.buffer(self._swa_local_layer_id(layer_id))
         return self.swa_kv_pool.kv_buffer[self._swa_local_layer_id(layer_id)]
-
-    def get_swa_key_buffer(self, layer_id: int) -> torch.Tensor:
-        self.wait_layer_transfer(layer_id)
-        if self.request_window is not None:
-            return self.get_swa_raw_buffer(layer_id).view(
-                self.request_window.state.dtype
-            )
-        return self.swa_kv_pool.get_key_buffer(self._swa_local_layer_id(layer_id))
 
     def set_swa_key_buffer(
         self,

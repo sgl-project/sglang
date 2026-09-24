@@ -464,6 +464,7 @@ class Step3p5DecoderLayer(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
         alt_stream: Optional[torch.cuda.Stream] = None,
+        is_nextn: bool = False,
     ) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
@@ -575,7 +576,7 @@ class Step3p5DecoderLayer(nn.Module):
             input_layernorm=self.input_layernorm,
             post_attention_layernorm=self.post_attention_layernorm,
             allow_reduce_scatter=True,
-            is_last_layer=(layer_id == config.num_hidden_layers - 1),
+            is_last_layer=(is_nextn or layer_id == config.num_hidden_layers - 1),
         )
 
         self.layer_id = layer_id

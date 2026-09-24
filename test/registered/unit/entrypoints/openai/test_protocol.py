@@ -189,6 +189,7 @@ class TestChatCompletionRequest(unittest.TestCase):
         self.assertEqual(request.temperature, None)  # default
         self.assertFalse(request.stream)  # default
         self.assertFalse(request.return_sampling_mask)
+        self.assertIsNone(request.sampling_logprobs_mode)
         self.assertEqual(request.tool_choice, "none")  # default when no tools
 
     def test_image_content_hash_validation(self):

@@ -41,9 +41,6 @@ class SchedulerActor:
         port_args: PortArgs,
         gpu_id: int,
         tp_rank: int,
-        attn_cp_rank: int,
-        moe_dp_rank: int,
-        moe_ep_rank: int,
         pp_rank: int,
         dp_rank: Optional[int],
         dist_init_addr: Optional[str] = None,
@@ -98,16 +95,7 @@ class SchedulerActor:
         )
 
         # Configure worker (logging, process title, etc.)
-        configure_scheduler_process(
-            server_args,
-            actual_gpu_id,
-            tp_rank,
-            attn_cp_rank,
-            moe_dp_rank,
-            moe_ep_rank,
-            pp_rank,
-            dp_rank,
-        )
+        configure_scheduler_process(server_args, actual_gpu_id)
 
         # Ray actors can't use the numactl subprocess-wrapping approach
         # (SGLANG_NUMA_BIND_V2's normal path), so bind in-process via libnuma.
@@ -125,9 +113,6 @@ class SchedulerActor:
         self.scheduler = Scheduler(
             server_args=server_args,
             port_args=port_args,
-            tp_rank=tp_rank,
-            pp_rank=pp_rank,
-            dp_rank=dp_rank,
         )
 
         self._tp_rank = tp_rank

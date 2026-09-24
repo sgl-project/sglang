@@ -400,6 +400,13 @@ export const Playground = ({ config }) => {
     "--hicache-storage-backend-extra-config",
   ];
 
+  // `umbp.roleOverrides: [{mode, when, enable, allowTp, env?, flags?, note?}]` —
+  // first entry whose PD role and `when` match the live selection. `enable` is
+  // the default when the reader has not toggled the card; `allowTp` lifts
+  // requiresDpAttention; env / flags join the recipe while it is on.
+  const umbpRoleOverride = (fc, sel, h) => (fc.roleOverrides || []).find((r) =>
+    r && sel && r.mode === sel.pdMode && (!r.when || h.matchConstraint(sel, r.when)));
+
   // -------- Prefill-CP flag family (shared by the attention axis) --------
   // Every flag head that toggles/parameterizes prefill context parallelism:
   // the canonical pair plus all per-family legacy spellings.
@@ -983,11 +990,18 @@ export const Playground = ({ config }) => {
     pdDisagg: {
       // The transport default is the config's first entry, so a model whose
       // recipes standardize on one backend does not silently start on another.
-      initState: (fc) => ({
-        mode: "off",
-        transferBackend: (fc && (fc.transferBackends || [])[0] || {}).id || "mooncake",
-        ibDevice: "auto",
-      }),
+      // An entry with `defaultWhen` takes over as the default for the selections
+      // it matches (e.g. MORI and the rdmaN NIC list on ROCm).
+      initState: (fc, base) => {
+        const pick = (entries) => (entries || []).find((e) =>
+          e && e.defaultWhen && base && matchConstraint(base, e.defaultWhen));
+        const backends = (fc && fc.transferBackends) || [];
+        return {
+          mode: "off",
+          transferBackend: (pick(backends) || backends[0] || {}).id || "mooncake",
+          ibDevice: (pick(fc && fc.ibDevices) || {}).id || "auto",
+        };
+      },
 
       apply: ({ flags, env, value, sel, fc, h }) => {
         // The bootstrap port is the base cell's to choose — the router's
@@ -1057,6 +1071,11 @@ export const Playground = ({ config }) => {
             flags = h.stripFlagsByFirstToken(
               flags, roleSpec.flags.map((f) => f.split(/[\s=]/)[0]));
             adds.push(...roleSpec.flags);
+          }
+          // `stripFlags` drops base-cell flags the role has no use for (an
+          // aggregated-serving knob) without re-emitting a value of its own.
+          if (modeOk && roleSpec && roleSpec.stripFlags && roleSpec.stripFlags.length) {
+            flags = h.stripFlagsByFirstToken(flags, roleSpec.stripFlags);
           }
           // Single-host needs no --dist-init-addr: prefill/decode derive their
           // ZMQ/dist ports from the role-specific --port (spaced 100 apart, see
@@ -1373,24 +1392,28 @@ export const Playground = ({ config }) => {
       },
 
       apply: ({ flags, env, value, fc, sel, h, derived }) => {
+        const roleOverride = umbpRoleOverride(fc, sel, h);
         const ownedHeads = [
           "--enable-unified-cache-external-linker",
           "--unified-cache-external-linker-backend",
           ...((fc.requiredFlags || []).map((f) => f.split(/\s/)[0])),
         ];
         flags = h.stripFlagsByFirstToken(flags, ownedHeads);
-        if (fc.requiredEnv && fc.requiredEnv.length) {
-          env = h.stripEnvByPrefix(env, fc.requiredEnv.map((e) => e.split("=")[0]));
+        const ownedEnv = [...(fc.requiredEnv || []), ...((roleOverride && roleOverride.env) || [])];
+        if (ownedEnv.length) {
+          env = h.stripEnvByPrefix(env, ownedEnv.map((e) => e.split("=")[0]));
         }
         const enabled = value.enable !== null
-          ? value.enable : !!(derived && derived.enable);
+          ? value.enable
+          : (roleOverride ? !!roleOverride.enable : !!(derived && derived.enable));
         if (!enabled) return { flags, env };
         if (fc.onlyHw && sel && !fc.onlyHw.includes(sel.hw)) return { flags, env };
         // The linker keys by DP rank; under pure TP each rank opens its own
         // keyspace and the store holds TP copies of the same tokens, so the
         // recipe is only meaningful with DP attention on. Read it off the live
         // flags rather than the Deploy dims — the attention axis runs first.
-        if (fc.requiresDpAttention
+        // A role override with `allowTp` is a TP-only shape validated as-is.
+        if (fc.requiresDpAttention && !(roleOverride && roleOverride.allowTp)
           && !flags.some((f) => f.split(/[\s=]/)[0] === "--enable-dp-attention")) {
           return { flags, env };
         }
@@ -1401,17 +1424,22 @@ export const Playground = ({ config }) => {
           "--enable-unified-cache-external-linker",
           `--unified-cache-external-linker-backend ${backend}`,
           ...(fc.requiredFlags || []),
+          ...((roleOverride && roleOverride.flags) || []),
         ]);
-        env = [...env, ...(fc.requiredEnv || []).filter((e) => !env.includes(e))];
+        const extraEnv = [...(fc.requiredEnv || []), ...((roleOverride && roleOverride.env) || [])];
+        env = [...env, ...extraEnv.filter((e) => !env.includes(e))];
         return { flags, env };
       },
 
-      render: ({ axisId, value, setValue, fc, base, s, renderChip, renderSelect, derived }) => {
+      render: ({ axisId, value, setValue, fc, base, s, h, renderChip, renderSelect, derived }) => {
         if (fc.onlyHw && !fc.onlyHw.includes(base.hw)) return null;
         const setSlot = (k, v) => setValue({ ...value, [k]: v });
+        const roleOverride = umbpRoleOverride(fc, base, h);
         const enabled = value.enable !== null
-          ? value.enable : !!(derived && derived.enable);
-        const needsDp = !!fc.requiresDpAttention && !base.dpAttnOn;
+          ? value.enable
+          : (roleOverride ? !!roleOverride.enable : !!(derived && derived.enable));
+        const needsDp = !!fc.requiresDpAttention && !base.dpAttnOn
+          && !(roleOverride && roleOverride.allowTp);
         const backend = value.backend !== null
           ? value.backend : ((derived && derived.backend) || fc.defaultBackend || "mori");
         return (
@@ -1434,6 +1462,9 @@ export const Playground = ({ config }) => {
                 </span>
               )}
             </div>
+            {enabled && !needsDp && roleOverride && roleOverride.note && (
+              <div style={s.axisNote}>{roleOverride.note}</div>
+            )}
           </div>
         );
       },
