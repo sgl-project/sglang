@@ -1173,6 +1173,15 @@ def _make_dsv4_draft(*, unified, mapping=None):
 
 
 class TestDSV4DraftStateRegistration(unittest.TestCase):
+    @staticmethod
+    def _fill_transfer_layout(kv_args, target):
+        (
+            kv_args.kv_data_ptrs,
+            kv_args.kv_data_lens,
+            kv_args.kv_item_lens,
+        ) = target.get_encoder_only_transfer_buf_infos()
+        kv_args.kv_layer_ids = target.get_encoder_only_transfer_layer_ids()
+
     def test_encoder_only_layout_matches_with_dspark_only_on_decode(self):
         mapping = torch.arange(16)
         target = _make_dsv4_target(unified=False, mapping=mapping)
@@ -1184,29 +1193,38 @@ class TestDSV4DraftStateRegistration(unittest.TestCase):
             speculative_algorithm=None,
         ):
             setup_state_kv_args(prefill_args, target, main_kv_only=True)
-            (
-                prefill_args.kv_data_ptrs,
-                prefill_args.kv_data_lens,
-                prefill_args.kv_item_lens,
-            ) = target.get_encoder_only_transfer_buf_infos()
-            prefill_args.kv_layer_ids = target.get_encoder_only_transfer_layer_ids()
+            self._fill_transfer_layout(prefill_args, target)
             prefill_layout = get_dsv41_spec_layout(prefill_args)
         with get_context().override_server_args(
             dsv41_encoder_only_prefill=True,
             speculative_algorithm="DSPARK",
         ):
             setup_state_kv_args(decode_args, target, main_kv_only=True)
-            (
-                decode_args.kv_data_ptrs,
-                decode_args.kv_data_lens,
-                decode_args.kv_item_lens,
-            ) = target.get_encoder_only_transfer_buf_infos()
-            decode_args.kv_layer_ids = target.get_encoder_only_transfer_layer_ids()
+            self._fill_transfer_layout(decode_args, target)
             decode_layout = get_dsv41_spec_layout(decode_args)
 
         self.assertEqual(prefill_layout, decode_layout)
         self.assertTrue(prefill_layout["encoder_only"])
         self.assertEqual(prefill_layout["state_types"], [])
+
+    def test_ordinary_dspark_layout_still_requires_transferred_draft_state(self):
+        mapping = torch.arange(16)
+        target = _make_dsv4_target(unified=False, mapping=mapping)
+        draft = _make_dsv4_draft(unified=False, mapping=mapping)
+        kv_args = KVArgs()
+
+        with get_context().override_server_args(
+            dsv41_encoder_only_prefill=False,
+            speculative_algorithm="DSPARK",
+            speculative_num_draft_tokens=6,
+        ):
+            setup_state_kv_args(kv_args, target, draft)
+            self._fill_transfer_layout(kv_args, target)
+            layout = get_dsv41_spec_layout(kv_args)
+
+        self.assertFalse(layout["encoder_only"])
+        self.assertEqual(layout["num_draft_tokens"], 6)
+        self.assertEqual(layout["state_types"], ["swa", "swa"])
 
     def test_draft_state_is_a_separate_component(self):
         mapping = torch.arange(16)
