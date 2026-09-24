@@ -18,11 +18,13 @@ class TestNixlSenderFailureCleanup(unittest.TestCase):
         sender.conclude_state = None
         sender._send_failed = False
         sender._send_error = None
+        sender._host_sent_pages = []
         staging_ctx = SimpleNamespace(
             prefetched_rooms={room, 8},
             prefetch_requested={(room, 0, "session-a"), (8, 0, "session-b")},
         )
         sender.kv_mgr = SimpleNamespace(
+            host_staging=None,
             enable_staging=True,
             _staging_ctx=staging_ctx,
             request_status={room: object()},

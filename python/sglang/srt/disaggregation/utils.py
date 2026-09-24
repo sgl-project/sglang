@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import random
 from collections import deque
 from contextlib import nullcontext
@@ -9,6 +10,7 @@ from typing import (
     Iterable,
     List,
     Literal,
+    NoReturn,
     Optional,
     Tuple,
     Type,
@@ -84,6 +86,19 @@ def get_qsa_pending_state_indices(req: Req) -> np.ndarray:
     if req_pool_idx is None:
         raise ValueError("QSA pending-state transfer requires an allocated request row")
     return np.array([int(req_pool_idx)], dtype=np.int32)
+
+
+def fail_stop(reason: str) -> NoReturn:
+    """Exit the process when a remote RDMA write into local memory is unfenced.
+
+    Neither a CUDA drain nor a timeout fences a peer's in-flight WRITE (including
+    aux), and an exception would let the scheduler reuse that memory. Exit the
+    process, not just the calling thread, before any allocator reuse.
+    """
+    try:
+        os.write(2, f"NIXL host staging fail-stop: {reason}\n".encode())
+    finally:
+        os._exit(70)
 
 
 class DisaggregationMode(Enum):
@@ -232,6 +247,7 @@ def poll_and_all_reduce_with_staging(
     staging_handler,
     gloo_group: dist.ProcessGroup,
     metadata_buffers: Optional[MetadataBuffers] = None,
+    pollers=None,
 ):
     """Staging-aware polling: advance scatter, demote incomplete transfers, all_reduce."""
     for decode_req in decode_reqs:
@@ -241,7 +257,9 @@ def poll_and_all_reduce_with_staging(
             staging_handler.advance_scatter(decode_req)
 
     # allow test injection of failure probability at runtime
-    receivers = [dr.kv_receiver for dr in decode_reqs]
+    receivers = (
+        pollers if pollers is not None else [dr.kv_receiver for dr in decode_reqs]
+    )
     raw_polls = _poll_with_failure_injection(receivers)
     for i, decode_req in enumerate(decode_reqs):
         if decode_req.kv_receiver.require_staging and staging_handler.is_failed(

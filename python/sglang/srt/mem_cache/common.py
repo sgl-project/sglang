@@ -178,6 +178,13 @@ def checkpoint_kv_cache(req: Req, tree_cache: BasePrefixCache) -> None:
     if req.skip_radix_cache_insert:
         return
 
+    if req.disagg_kv_sender is not None and req.disagg_kv_sender.is_source_pending():
+        # Radix insertion may free duplicate physical pages. Keep the existing
+        # prefix lock and private suffix; only advance chunked-prefill's mapping.
+        req.prefix_indices = tree_cache.req_to_token_pool.req_to_token[
+            req.kv.req_pool_idx, : req.extend_range.end
+        ].to(dtype=torch.int64, copy=True)
+        return
     tree_cache.insert_req(req, up_to=req.extend_range.end)
 
 
@@ -297,6 +304,8 @@ def discard_kv_cache_backup(
 def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = True):
     """Give the request's kv row back; with ``is_insert`` the tree first keeps
     what it can key."""
+    if req.disagg_kv_sender is not None and req.disagg_kv_sender.is_source_pending():
+        req.disagg_kv_sender.failure_exception()
     assert (not req.kv.holds_kv) == req.kv.is_kv_released
     # A mamba-capable cache may alloc mamba state before alloc KV cache
     if not req.kv.holds_kv:

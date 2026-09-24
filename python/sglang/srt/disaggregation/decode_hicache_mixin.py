@@ -166,11 +166,17 @@ class DecodeHiCachePreallocMixin:
 class HiCacheRestoreGatedKVReceiver:
     """Wraps a kv_receiver so KVPoll.Success is gated on HiCache restore READY."""
 
-    def __init__(self, decode_req: DecodeRequest):
+    def __init__(self, decode_req: DecodeRequest, *, fail_on_restore_error=False):
         self.decode_req = decode_req
+        self.fail_on_restore_error = fail_on_restore_error
 
     def poll(self) -> KVPoll:
         poll = self.decode_req.kv_receiver.poll()
+        if (
+            self.fail_on_restore_error
+            and self.decode_req.hicache_restore_status == HiCacheRestoreResult.FAILED
+        ):
+            return KVPoll.Failed
         if (
             poll == KVPoll.Success
             and self.decode_req.hicache_restore_status == HiCacheRestoreResult.PENDING
