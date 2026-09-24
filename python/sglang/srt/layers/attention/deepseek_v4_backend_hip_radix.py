@@ -591,11 +591,6 @@ class DeepseekV4HipRadixBackend(
         )
         self.softmax_scale: float = head_dim**-0.5
         self.head_dim_v: int = model_runner.model_config.v_head_dim
-        self.local_q_heads: int = model_runner.model_config.num_attention_heads // (
-            1
-            if model_runner.server_args.enable_dp_attention
-            else model_runner.ps.tp_size
-        )
         self.cuda_int32_kwargs = {"device": self.device, "dtype": torch.int32}
         self.swa_page_size = 128
         assert model_runner.page_size is not None
@@ -1567,7 +1562,6 @@ class DeepseekV4HipRadixBackend(
         core.unified.gasm_qo_indptr = None
         if (
             _grouped_asm_enabled()
-            and self.local_q_heads == _GROUPED_ASM_GQA
             and num_draft > 1
             and N % num_draft == 0
             and N // num_draft >= _GROUPED_ASM_MIN_REQS
@@ -1763,12 +1757,9 @@ class DeepseekV4HipRadixBackend(
                     f"at {self.softmax_scale}"
                 )
                 gasm = (
-                    unified_metadata.gasm_indices if compress_ratio == 128
+                    unified_metadata.gasm_indices
+                    if compress_ratio == 128 and q.shape[1] == _GROUPED_ASM_GQA
                     else None
-                )
-                assert gasm is None or q.shape[1] == _GROUPED_ASM_GQA, (
-                    f"streams were grouped for {_GROUPED_ASM_GQA} heads a rank "
-                    f"but this layer has {q.shape[1]}"
                 )
                 if gasm is not None:
                     return runtime.decode_fp8_2buff(
