@@ -540,6 +540,11 @@ class HiCacheFile(HiCacheStorage):
                 self.metadata_cache.remove(suffixed)
             logger.warning(f"Failed to fetch {key} from HiCacheFile storage.")
             return None
+        except OSError:
+            # A failed page ends the usable prefix; earlier pages in the batch
+            # remain readable, including when this object is truncated.
+            logger.exception("Failed to read %s from HiCacheFile storage", key)
+            return None
 
     def batch_get(
         self,

@@ -1,0 +1,144 @@
+Unsupported element_size = 24 for JIT HiCache kernel
+Unsupported element_size = 24 for staged JIT HiCache kernel
+Unsupported element_size = 24 for JIT HiCache kernel
+Unsupported element_size = 24 for staged JIT HiCache kernel
+Unsupported element_size = 24 for JIT HiCache kernel
+Unsupported element_size = 24 for staged JIT HiCache kernel
+Unsupported element_size = 24 for JIT HiCache kernel
+Unsupported element_size = 24 for staged JIT HiCache kernel
+Unsupported element_size = 24 for JIT HiCache kernel
+Unsupported element_size = 24 for JIT HiCache kernel
+Unsupported element_size = 24 for JIT HiCache kernel
+Unsupported element_size = 24 for JIT HiCache kernel
+Unsupported element_size = 24 for staged JIT HiCache kernel
+Unsupported element_size = 24 for staged JIT HiCache kernel
+Unsupported element_size = 24 for staged JIT HiCache kernel
+Unsupported element_size = 24 for staged JIT HiCache kernel
+Unsupported element_size = 24 for JIT HiCache kernel
+Unsupported element_size = 24 for JIT HiCache kernel
+Unsupported element_size = 24 for JIT HiCache kernel
+Unsupported element_size = 24 for JIT HiCache kernel
+Unsupported element_size = 24 for staged JIT HiCache kernel
+Unsupported element_size = 24 for staged JIT HiCache kernel
+Unsupported element_size = 24 for staged JIT HiCache kernel
+Unsupported element_size = 24 for staged JIT HiCache kernel
+Failed to read 97cd8f0bf313e0055903db6b16e5d960c9d2d7026a67c364c3674ed127fd4694 from HiCacheFile storage
+Traceback (most recent call last):
+  File "/mnt/home/byron/sglang-worktree/dcp-l3-dev-3853948/python/sglang/srt/mem_cache/hicache_storage.py", line 533, in get
+    raise IOError(f"Short read for {suffixed}")
+OSError: Short read for 97cd8f0bf313e0055903db6b16e5d960c9d2d7026a67c364c3674ed127fd4694_controller-test_tp4_dcp1_2_page128_bfloat16_page_first
+Failed to read 97cd8f0bf313e0055903db6b16e5d960c9d2d7026a67c364c3674ed127fd4694 from HiCacheFile storage
+Traceback (most recent call last):
+  File "/mnt/home/byron/sglang-worktree/dcp-l3-dev-3853948/python/sglang/srt/mem_cache/hicache_storage.py", line 533, in get
+    raise IOError(f"Short read for {suffixed}")
+OSError: Short read for 97cd8f0bf313e0055903db6b16e5d960c9d2d7026a67c364c3674ed127fd4694_controller-test_tp4_dcp1_2_page128_bfloat16_page_first
+Prefetch operation truncated failed to retrieve page 97cd8f0bf313e0055903db6b16e5d960c9d2d7026a67c364c3674ed127fd4694.
+Prefetch operation truncated failed to retrieve page 97cd8f0bf313e0055903db6b16e5d960c9d2d7026a67c364c3674ed127fd4694.
+Unsupported element_size = 24 for JIT HiCache kernel
+Unsupported element_size = 24 for JIT HiCache kernel
+Unsupported element_size = 24 for JIT HiCache kernel
+Unsupported element_size = 24 for JIT HiCache kernel
+Unsupported element_size = 24 for staged JIT HiCache kernel
+Unsupported element_size = 24 for staged JIT HiCache kernel
+Unsupported element_size = 24 for staged JIT HiCache kernel
+Unsupported element_size = 24 for staged JIT HiCache kernel
+HiCache storage lookup failed
+Traceback (most recent call last):
+  File "/mnt/home/byron/sglang-worktree/dcp-l3-dev-3853948/python/sglang/srt/managers/cache_controller.py", line 1250, in prefetch_thread_func
+    hash_value, storage_hit_count = self._storage_hit_query(
+                                    ^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/mnt/home/byron/sglang-worktree/dcp-l3-dev-3853948/python/sglang/srt/mem_cache/hybrid_cache/hybrid_cache_controller.py", line 1065, in _storage_hit_query
+    kv_hit_count = self.storage_backend.batch_exists(hash_value, extra_info)
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.12/unittest/mock.py", line 1134, in __call__
+    return self._mock_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.12/unittest/mock.py", line 1138, in _mock_call
+    return self._execute_mock_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.12/unittest/mock.py", line 1193, in _execute_mock_call
+    raise effect
+OSError: lookup
+Unsupported element_size = 24 for JIT HiCache kernel
+Unsupported element_size = 24 for JIT HiCache kernel
+Unsupported element_size = 24 for JIT HiCache kernel
+Unsupported element_size = 24 for JIT HiCache kernel
+Unsupported element_size = 24 for staged JIT HiCache kernel
+Unsupported element_size = 24 for staged JIT HiCache kernel
+Unsupported element_size = 24 for staged JIT HiCache kernel
+Unsupported element_size = 24 for staged JIT HiCache kernel
+HiCache storage read failed
+Traceback (most recent call last):
+  File "/mnt/home/byron/sglang-worktree/dcp-l3-dev-3853948/python/sglang/srt/managers/cache_controller.py", line 1106, in _page_transfer
+    hit_pages = self._page_transfer_kv_batch(
+                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/mnt/home/byron/sglang-worktree/dcp-l3-dev-3853948/python/sglang/srt/managers/cache_controller.py", line 1148, in _page_transfer_kv_batch
+    kv_hits = self.page_get_func(
+              ^^^^^^^^^^^^^^^^^^^
+  File "/mnt/home/byron/sglang-worktree/dcp-l3-dev-3853948/python/sglang/srt/managers/cache_controller.py", line 1061, in _generic_page_get
+    page_data = self.storage_backend.batch_get(hash_values, dummy_page_dst)
+                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/mnt/home/byron/sglang-worktree/dcp-l3-dev-3853948/test/registered/unit/mem_cache/test_hicache_dcp_storage_failures.py", line 156, in fail_middle
+    raise OSError("read after successful lookup")
+OSError: read after successful lookup
+Unsupported element_size = 24 for JIT HiCache kernel
+Unsupported element_size = 24 for JIT HiCache kernel
+Unsupported element_size = 24 for JIT HiCache kernel
+Unsupported element_size = 24 for JIT HiCache kernel
+Unsupported element_size = 24 for staged JIT HiCache kernel
+Unsupported element_size = 24 for staged JIT HiCache kernel
+Unsupported element_size = 24 for staged JIT HiCache kernel
+Unsupported element_size = 24 for staged JIT HiCache kernel
+Failed to fetch 97cd8f0bf313e0055903db6b16e5d960c9d2d7026a67c364c3674ed127fd4694 from HiCacheFile storage.
+Failed to fetch 97cd8f0bf313e0055903db6b16e5d960c9d2d7026a67c364c3674ed127fd4694 from HiCacheFile storage.
+Prefetch operation evicted_after_lookup failed to retrieve page 97cd8f0bf313e0055903db6b16e5d960c9d2d7026a67c364c3674ed127fd4694.
+Prefetch operation evicted_after_lookup failed to retrieve page 97cd8f0bf313e0055903db6b16e5d960c9d2d7026a67c364c3674ed127fd4694.
+Unsupported element_size = 24 for JIT HiCache kernel
+Unsupported element_size = 24 for JIT HiCache kernel
+Unsupported element_size = 24 for JIT HiCache kernel
+Unsupported element_size = 24 for JIT HiCache kernel
+Unsupported element_size = 24 for staged JIT HiCache kernel
+Unsupported element_size = 24 for staged JIT HiCache kernel
+Unsupported element_size = 24 for staged JIT HiCache kernel
+Unsupported element_size = 24 for staged JIT HiCache kernel
+HiCache storage backup failed
+Traceback (most recent call last):
+  File "/mnt/home/byron/sglang-worktree/dcp-l3-dev-3853948/python/sglang/srt/mem_cache/hybrid_cache/hybrid_cache_controller.py", line 1251, in backup_thread_func
+    self._page_backup(operation)
+  File "/mnt/home/byron/sglang-worktree/dcp-l3-dev-3853948/python/sglang/srt/mem_cache/hybrid_cache/hybrid_cache_controller.py", line 1194, in _page_backup
+    super()._page_backup(operation)
+  File "/mnt/home/byron/sglang-worktree/dcp-l3-dev-3853948/python/sglang/srt/managers/cache_controller.py", line 1319, in _page_backup
+    success = self.page_set_func(batch_hashes, batch_host_indices, extra_info)
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/mnt/home/byron/sglang-worktree/dcp-l3-dev-3853948/test/registered/unit/mem_cache/test_hicache_dcp_storage_failures.py", line 212, in controlled_write
+    raise OSError("backup")
+OSError: backup
+Unsupported element_size = 24 for JIT HiCache kernel
+Unsupported element_size = 24 for JIT HiCache kernel
+Unsupported element_size = 24 for JIT HiCache kernel
+Unsupported element_size = 24 for JIT HiCache kernel
+Unsupported element_size = 24 for staged JIT HiCache kernel
+Unsupported element_size = 24 for staged JIT HiCache kernel
+Unsupported element_size = 24 for staged JIT HiCache kernel
+Unsupported element_size = 24 for staged JIT HiCache kernel
+DCP_FAILURE_REPORT=[{"case": "healthy", "rank": 0, "tokens": 384, "acknowledgments": 4, "remaining_slots": 0}, {"case": "healthy", "rank": 1, "tokens": 384, "acknowledgments": 4, "remaining_slots": 0}, {"case": "healthy", "rank": 2, "tokens": 384, "acknowledgments": 4, "remaining_slots": 0}, {"case": "healthy", "rank": 3, "tokens": 384, "acknowledgments": 4, "remaining_slots": 0}]
+DCP_FAILURE_REPORT=[{"case": "missing", "rank": 0, "tokens": 128, "acknowledgments": 2, "remaining_slots": 0}, {"case": "missing", "rank": 1, "tokens": 128, "acknowledgments": 2, "remaining_slots": 0}, {"case": "missing", "rank": 2, "tokens": 128, "acknowledgments": 2, "remaining_slots": 0}, {"case": "missing", "rank": 3, "tokens": 128, "acknowledgments": 2, "remaining_slots": 0}]
+DCP_FAILURE_REPORT=[{"case": "truncated", "rank": 0, "tokens": 128, "acknowledgments": 4, "remaining_slots": 0}, {"case": "truncated", "rank": 1, "tokens": 128, "acknowledgments": 4, "remaining_slots": 0}, {"case": "truncated", "rank": 2, "tokens": 128, "acknowledgments": 4, "remaining_slots": 0}, {"case": "truncated", "rank": 3, "tokens": 128, "acknowledgments": 4, "remaining_slots": 0}]
+DCP_FAILURE_REPORT=[{"case": "lookup_error", "rank": 0, "tokens": 0, "acknowledgments": 1, "remaining_slots": 0}, {"case": "lookup_error", "rank": 1, "tokens": 0, "acknowledgments": 1, "remaining_slots": 0}, {"case": "lookup_error", "rank": 2, "tokens": 0, "acknowledgments": 1, "remaining_slots": 0}, {"case": "lookup_error", "rank": 3, "tokens": 0, "acknowledgments": 1, "remaining_slots": 0}]
+DCP_FAILURE_REPORT=[{"case": "read_error", "rank": 0, "tokens": 128, "acknowledgments": 4, "remaining_slots": 0}, {"case": "read_error", "rank": 1, "tokens": 128, "acknowledgments": 4, "remaining_slots": 0}, {"case": "read_error", "rank": 2, "tokens": 128, "acknowledgments": 4, "remaining_slots": 0}, {"case": "read_error", "rank": 3, "tokens": 128, "acknowledgments": 4, "remaining_slots": 0}]
+DCP_FAILURE_REPORT=[{"case": "evicted_after_lookup", "rank": 0, "tokens": 128, "acknowledgments": 4, "remaining_slots": 0}, {"case": "evicted_after_lookup", "rank": 1, "tokens": 128, "acknowledgments": 4, "remaining_slots": 0}, {"case": "evicted_after_lookup", "rank": 2, "tokens": 128, "acknowledgments": 4, "remaining_slots": 0}, {"case": "evicted_after_lookup", "rank": 3, "tokens": 128, "acknowledgments": 4, "remaining_slots": 0}]
+DCP_FAILURE_REPORT=[{"case": "backup_error", "rank": 0, "tokens": 384, "acknowledgments": 4, "remaining_slots": 0}, {"case": "backup_error", "rank": 1, "tokens": 384, "acknowledgments": 4, "remaining_slots": 0}, {"case": "backup_error", "rank": 2, "tokens": 384, "acknowledgments": 4, "remaining_slots": 0}, {"case": "backup_error", "rank": 3, "tokens": 384, "acknowledgments": 4, "remaining_slots": 0}]
+DCP_FAILURE_REPORT=[{"case": "backup_delayed", "rank": 0, "tokens": 384, "acknowledgments": 4, "remaining_slots": 0}, {"case": "backup_delayed", "rank": 1, "tokens": 384, "acknowledgments": 4, "remaining_slots": 0}, {"case": "backup_delayed", "rank": 2, "tokens": 384, "acknowledgments": 4, "remaining_slots": 0}, {"case": "backup_delayed", "rank": 3, "tokens": 384, "acknowledgments": 4, "remaining_slots": 0}]
+.
+=============================== warnings summary ===============================
+../../../../../opt/sglang/lib/python3.12/site-packages/_pytest/config/__init__.py:1464
+  /opt/sglang/lib/python3.12/site-packages/_pytest/config/__init__.py:1464: PytestConfigWarning: Unknown config option: asyncio_mode
+  
+    self._warn_or_fail_if_strict(f"Unknown config option: {key}\n")
+
+../../../../../opt/sglang/lib/python3.12/site-packages/torch/jit/_script.py:365: 14 warnings
+  /opt/sglang/lib/python3.12/site-packages/torch/jit/_script.py:365: DeprecationWarning: `torch.jit.script_method` is deprecated. Please switch to `torch.compile` or `torch.export`.
+    warnings.warn(
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+1 passed, 15 warnings in 24.77s

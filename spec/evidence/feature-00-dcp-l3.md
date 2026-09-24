@@ -2,7 +2,7 @@ Status: proposed
 
 # DCP/L3 phase evidence
 
-**TL;DR:** Phases 1 and 2 are committed as `1cdb6b1` and `5ba812b`. Phase 3 is uncommitted for review: 54 tests and 44 subtests pass, plus 6 attachment/queue regression tests. At TP=4/DCP=2, writes are `[1, 1, 0, 0]`, every rank acknowledges its operation, and no test host allocations remain. Phases 4-5 have not started.
+**TL;DR:** Phases 1-4 are complete. Four real CPU ranks agree on the reusable prefix and complete after injected storage failures. Phase 5 will establish H200 cross-engine reuse.
 
 ## Phase 1 reproduction
 
@@ -109,6 +109,32 @@ Only ranks 0/1 account for stored bytes. With capacity for one object per shard,
 
 Ruff lint/format checks, import sorting, registered-test validation, and whitespace checks passed. The phase-3 index remains empty for human review.
 
+## Phase 4 reproduction and result
+
+Phase 3 is committed as `866d936`. The user authorized completing the remaining plan without review pauses.
+
+```sh
+unshare --cgroup /opt/sglang/bin/python -m pytest test/registered/unit/mem_cache/test_hicache_dcp_storage_failures.py -q -s
+unshare --cgroup /opt/sglang/bin/python -m pytest test/registered/unit/mem_cache/test_hicache_dcp_storage_controller.py test/registered/unit/mem_cache/test_hicache_dcp_storage_identity.py test/registered/unit/mem_cache/test_hicache_dcp_host_pool.py test/registered/unit/mem_cache/test_hicache_file_lru_unit.py test/registered/unit/managers/test_scheduler_hicache_attach.py test/registered/unit/mem_cache/test_hicache_pp_sync_drain.py -q
+/opt/sglang/bin/python scripts/lint/check_registered_tests.py
+```
+
+Results: distributed test **1 passed in 24.77s**; regressions **60 passed, 44 subtests in 13.11s**. Both had the same 15 existing warnings. Registered-test validation and whitespace checks passed. [Distributed output](feature-00-dcp-l3-phase-4.txt), [regression output](feature-00-dcp-l3-phase-4-regressions.txt).
+
+Four Gloo processes run the concrete unified-cache controller at TP=4/DCP=2, real storage workers, file I/O, prefix reductions, acknowledgment draining, and host allocation/free. Only GPU construction, the process-group factory wrapper, and tree insertion/unlock are replaced. Every selected group contains ranks 0/1/2/3. Each request spans three 128-token logical pages, with one page per I/O batch to exercise all acknowledgments after failure.
+
+| Case | Reused tokens on every rank | Host slots left |
+| --- | --- | --- |
+| Healthy | 384 | 0 |
+| Middle shard missing | 128 | 0 |
+| Middle shard truncated | 128 | 0 |
+| Lookup exception on rank 1 | 0 | 0 |
+| Read exception after hit | 128 | 0 |
+| Eviction after lookup | 128 | 0 |
+| Failed/delayed backup | 384 from initial read; write acknowledged after I/O ends | 0 |
+
+The test has collective and parent-process timeouts. Rank 0 reads remain in flight during injected rank 1 read failures. Backup failures acknowledge and keep the worker alive. Short-read detection uses the existing `readinto` count; no file-size check was added.
+
 ## Boundaries
 
-Writer selection is wired into controller backups and file eviction, but startup and runtime attachment still reject DCP/L3. These component tests do not prove model KV restore or cross-rank failure agreement. Distributed read-failure handling remains for phase 4, and H200 cross-engine restore remains for phase 5. Phase 3 awaits review; neither later phase has started.
+Phase 4 does not enable DCP/L3. H200 cross-engine restore and supported configuration checks remain for phase 5.

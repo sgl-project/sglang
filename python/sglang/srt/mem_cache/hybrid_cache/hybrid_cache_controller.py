@@ -1172,8 +1172,8 @@ class HybridCacheController(BaseHiCacheController):
         operation.storage_start += trim_tokens
 
     def _page_backup(self, operation):
-        # MLA KV is replicated across TP ranks and should still be written only
-        # by TP0. Rank-sharded sidecars still need every TP rank.
+        # Write primary KV only on its selected shard writer. Rank-sharded
+        # sidecars can still need every TP rank.
         backup_transfers = [
             transfer
             for transfer in operation.pool_transfers or []
@@ -1247,8 +1247,12 @@ class HybridCacheController(BaseHiCacheController):
                 operation = self.backup_queue.get(block=True, timeout=1)
                 if operation is None:
                     continue
-                self._page_backup(operation)
-                self.ack_backup_queue.put(operation)
+                try:
+                    self._page_backup(operation)
+                except Exception:
+                    logger.exception("HiCache storage backup failed")
+                finally:
+                    self.ack_backup_queue.put(operation)
             except Empty:
                 continue
 

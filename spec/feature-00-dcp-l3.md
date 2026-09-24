@@ -157,7 +157,7 @@ The baseline demonstrates the guards and existing local page geometry; it does n
 
 ## Implementation phases and review gates
 
-Work on one phase at a time: implement and verify it, stop for human review, then commit only after explicit approval. Start the next phase only when the user asks. Each review includes an uncommitted diff, exact test commands and results, and the small expected/actual example below.
+Complete and verify each phase before committing it. The user authorized completion of the remaining plan without approval pauses. Each review includes an uncommitted diff, exact test commands and results, and the small expected/actual example below.
 
 ```text
 1. keys + writer selection
@@ -171,7 +171,7 @@ Work on one phase at a time: implement and verify it, stop for human review, the
 5. enable supported configuration + fresh-engine proof
 ```
 
-Phase 1 is committed as `1cdb6b1` and phase 2 as `5ba812b`. Phase 3 is implemented and verified, with its changes uncommitted for review. Phases 4-5 have not started. The feature remains proposed until the full release gate passes. See the evidence log for phase-local results and reproduction commands.
+Phases 1-3 are committed (`1cdb6b1`, `5ba812b`, `866d936`). Phase 4 passes real four-rank CPU failure tests and is complete. Phase 5 remains. The feature remains proposed until the full release gate passes. See the evidence log for phase-local results and reproduction commands.
 
 Startup rejection stays in place through phase 4. Component tests call the relevant storage/pool/controller APIs directly; do not add a production flag to bypass the guard. Runtime attachment must not expose the unfinished path. Phase 5 changes the support checks only when the integrated tests pass.
 
@@ -236,8 +236,6 @@ writer?       yes     yes     no      no
 
 Keep phase-local test changes beside the code they verify. Unit and distributed test files introduced by a phase must have an exact runnable command in the evidence log. Keep raw logs and measurements in evidence, not in the feature contract. No passing results should be claimed for phases not run.
 
-- [ ] Review phase 3 and commit only after approval.
-- [ ] Complete phase 4, stopping for review and approval before committing.
 - [ ] Complete phase 5 with H200 cross-engine evidence and mark the spec implemented.
 
 ## Boundaries
