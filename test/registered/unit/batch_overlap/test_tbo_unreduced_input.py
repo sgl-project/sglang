@@ -9,7 +9,6 @@ from unittest.mock import patch
 import torch
 
 from sglang.srt.batch_overlap import two_batch_overlap as tbo
-from sglang.srt.layers import communicator
 from sglang.srt.layers.communicator import ScatterMode, UnreducedOutput
 from sglang.srt.utils import empty_context
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -20,8 +19,12 @@ register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 class TestTboEntryReducesItsInput(CustomTestCase):
     def test_split_and_merge_see_the_reduced_tensor(self):
+        # Under attention DP the partial sum spans every DP rank's tokens; its
+        # reduction also brings it back to this rank's three.
         reduced = torch.full((3, 4), 2.0)
-        hidden_states = UnreducedOutput(torch.ones(3, 4))
+        hidden_states = UnreducedOutput(
+            torch.ones(6, 4), reduce_and_redistribute=lambda partial: reduced
+        )
         seen = {}
 
         def split(**kwargs):
@@ -33,9 +36,6 @@ class TestTboEntryReducesItsInput(CustomTestCase):
             return None, None
 
         with (
-            patch.object(
-                communicator, "deferred_post_experts_all_reduce", lambda x: reduced
-            ),
             patch.object(tbo, "_model_forward_tbo_split_inputs", split),
             patch.object(
                 tbo, "execute_overlapped_operations", lambda **kwargs: [{}, {}]

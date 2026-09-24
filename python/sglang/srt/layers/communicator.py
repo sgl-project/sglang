@@ -22,6 +22,7 @@ import msgspec
 import torch
 
 from sglang.srt.distributed import (
+    GroupCoordinator,
     attention_tensor_model_parallel_all_reduce,
     attention_tensor_model_parallel_quant_all_reduce,
     tensor_model_parallel_all_reduce,
@@ -626,17 +627,22 @@ def _attn_input_update_and_read_residual(quant_format: str):
 
 class UnreducedOutput(msgspec.Struct, frozen=True):
     """A layer output that still owes its FFN all-reduce, left for the next
-    layer's input norm. Hand it to the next layer, or pass it through
-    reduce_output() before reading it any other way."""
+    layer's input. Hand it to the next layer, or pass it through reduce_output()
+    before reading it any other way."""
 
     partial: torch.Tensor
+    # Under attention DP: the reduce-scatter that sums ``partial`` over TP while
+    # bringing it back to this rank's tokens, in place of the all-reduce.
+    reduce_and_redistribute: Optional[Callable[[torch.Tensor], torch.Tensor]] = None
 
 
 def reduce_output(
     hidden_states: Union[torch.Tensor, UnreducedOutput, None],
 ) -> Optional[torch.Tensor]:
-    """Run the all-reduce an UnreducedOutput still owes; pass anything else through."""
+    """Run the reduction an UnreducedOutput still owes; pass anything else through."""
     if isinstance(hidden_states, UnreducedOutput):
+        if hidden_states.reduce_and_redistribute is not None:
+            return hidden_states.reduce_and_redistribute(hidden_states.partial)
         return deferred_post_experts_all_reduce(hidden_states.partial)
     return hidden_states
 
@@ -833,6 +839,13 @@ class LayerCommunicator:
         quant_format: str = "",
         post_residual_addition: Optional[torch.Tensor] = None,
     ):
+        if (
+            isinstance(hidden_states, UnreducedOutput)
+            and hidden_states.reduce_and_redistribute is not None
+        ):
+            # No fused kernel runs under attention DP: the reduce-scatter back to
+            # this rank's tokens comes first.
+            hidden_states = reduce_output(hidden_states)
         pending = isinstance(hidden_states, UnreducedOutput)
         if pending:
             hidden_states = hidden_states.partial
@@ -993,6 +1006,28 @@ class LayerCommunicator:
             allow_reduce_scatter=self.allow_reduce_scatter,
             is_layer_sparse=self.layer_scatter_modes.is_layer_sparse,
         )
+
+    def _reduce_scatter_for_next_layer(
+        self, forward_batch: ForwardBatch
+    ) -> Optional[Callable[[torch.Tensor], torch.Tensor]]:
+        """The reduce-scatter back to this rank's tokens that postprocess would
+        run on this layer's FFN output, bound for the next layer's input to run
+        instead; None when postprocess runs anything else."""
+        if (
+            self.is_last_layer
+            or (self._sp_variant is not None and get_forward().sp_active)
+            or self._communicate_summable_tensor_pair_fn
+            is not CommunicateSummableTensorPairFn._scatter_hidden_states
+        ):
+            return None
+        step = _output_to_local_tokens_step(
+            forward_batch,
+            allow_reduce_scatter=self.allow_reduce_scatter,
+            is_layer_sparse=self.layer_scatter_modes.is_layer_sparse,
+        )
+        if step is _redistribute_output:
+            return None
+        return partial(_to_local_tokens, step, forward_batch)
 
     def ffn_exit(self, forward_batch: ForwardBatch) -> "FfnExit":
         """Decide once how this layer's FFN output reduction completes. Use the
@@ -1181,13 +1216,23 @@ class FfnExit:
     def finish(
         self, hidden_states: torch.Tensor, residual: torch.Tensor
     ) -> Tuple[Union[torch.Tensor, UnreducedOutput], torch.Tensor]:
-        """Leave the reduction to the next layer's input norm, or postprocess."""
+        """Leave the reduction to the next layer's input, or postprocess."""
         if not isinstance(hidden_states, torch.Tensor):
             # A deferred MoE finalize handoff, consumed by the next prepare_attn.
             assert self.defer_moe_finalize, "unrequested deferred MoE handoff"
             return hidden_states, residual
         if self.fuse_mlp_allreduce:
             return UnreducedOutput(hidden_states), residual
+        reduce_and_redistribute = self.communicator._reduce_scatter_for_next_layer(
+            self.forward_batch
+        )
+        if reduce_and_redistribute is not None:
+            return (
+                UnreducedOutput(
+                    hidden_states, reduce_and_redistribute=reduce_and_redistribute
+                ),
+                residual,
+            )
         return self.communicator.postprocess_layer(
             hidden_states, residual, self.forward_batch
         )
@@ -1614,6 +1659,71 @@ class CommunicateWithAllReduceAndLayerNormFn:
         return hidden_states, residual
 
 
+def _dp_scatter_group() -> GroupCoordinator:
+    parallel = get_parallel()
+    if parallel.tp_size == parallel.attn_dp_size:
+        return parallel.tp_group
+    return parallel.attn_tp_group
+
+
+def _reduce_and_redistribute_output_varlen(
+    local_hidden_states: torch.Tensor,
+    hidden_states: torch.Tensor,
+    forward_batch: ForwardBatch,
+) -> None:
+    get_parallel().tp_group.reduce_scatterv(
+        hidden_states,
+        output=local_hidden_states,
+        sizes=get_dp_global_num_tokens(),
+    )
+
+
+def _reduce_and_redistribute_output_max_len(
+    local_hidden_states: torch.Tensor,
+    hidden_states: torch.Tensor,
+    forward_batch: ForwardBatch,
+) -> None:
+    dp_reduce_scatter_tensor(local_hidden_states, hidden_states)
+
+
+def _redistribute_output(
+    local_hidden_states: torch.Tensor,
+    hidden_states: torch.Tensor,
+    forward_batch: ForwardBatch,
+) -> None:
+    dp_scatter(local_hidden_states, hidden_states, forward_batch)
+
+
+def _output_to_local_tokens_step(
+    forward_batch: ForwardBatch, *, allow_reduce_scatter: bool, is_layer_sparse: bool
+) -> Callable[[torch.Tensor, torch.Tensor, ForwardBatch], None]:
+    """How a FULL-layout layer output comes back to this rank's tokens under
+    attention DP: a reduce-scatter when the FFN left its sum to it, otherwise a
+    scatter of the reduced output."""
+    # A MoE block leaves its sum to reduce_scatterv whenever it applies
+    # (should_skip_post_experts_all_reduce); a dense MLP does only under the
+    # published mlp_reduce_scatter, which needs allow_reduce_scatter.
+    if should_use_dp_reduce_scatterv() and (allow_reduce_scatter or is_layer_sparse):
+        return _reduce_and_redistribute_output_varlen
+    if (
+        allow_reduce_scatter
+        and forward_batch.dp_padding_mode.is_max_len()
+        and can_use_dp_reduce_scatter()
+    ):
+        return _reduce_and_redistribute_output_max_len
+    return _redistribute_output
+
+
+def _to_local_tokens(
+    step: Callable[[torch.Tensor, torch.Tensor, ForwardBatch], None],
+    forward_batch: ForwardBatch,
+    hidden_states: torch.Tensor,
+) -> torch.Tensor:
+    local_hidden_states = get_local_dp_buffer(_dp_scatter_group())
+    step(local_hidden_states, hidden_states, forward_batch)
+    return local_hidden_states
+
+
 class CommunicateSummableTensorPairFn:
     """It is allowed to make (hidden_states, residual) := (hidden_states + residual, None) if needed."""
 
@@ -1693,34 +1803,14 @@ class CommunicateSummableTensorPairFn:
         allow_reduce_scatter: bool = False,
         is_layer_sparse: bool = False,
     ):
-        if get_parallel().tp_size == get_parallel().attn_dp_size:
-            group = get_parallel().tp_group
-        else:
-            group = get_parallel().attn_tp_group
-        hidden_states, global_hidden_states = (
-            get_local_dp_buffer(group),
-            hidden_states,
+        local_hidden_states = get_local_dp_buffer(_dp_scatter_group())
+        step = _output_to_local_tokens_step(
+            forward_batch,
+            allow_reduce_scatter=allow_reduce_scatter,
+            is_layer_sparse=is_layer_sparse,
         )
-        # A MoE block leaves its sum to reduce_scatterv whenever it applies
-        # (should_skip_post_experts_all_reduce); a dense MLP does only under the
-        # published mlp_reduce_scatter, which needs allow_reduce_scatter.
-        if should_use_dp_reduce_scatterv() and (
-            allow_reduce_scatter or is_layer_sparse
-        ):
-            get_parallel().tp_group.reduce_scatterv(
-                global_hidden_states,
-                output=hidden_states,
-                sizes=get_dp_global_num_tokens(),
-            )
-        elif (
-            allow_reduce_scatter
-            and forward_batch.dp_padding_mode.is_max_len()
-            and can_use_dp_reduce_scatter()
-        ):
-            dp_reduce_scatter_tensor(hidden_states, global_hidden_states)
-        else:
-            dp_scatter(hidden_states, global_hidden_states, forward_batch)
-        return hidden_states, residual
+        step(local_hidden_states, hidden_states, forward_batch)
+        return local_hidden_states, residual
 
     @staticmethod
     def _gather(

@@ -151,6 +151,38 @@ class TestPostprocessReduceScatterv(CustomTestCase):
         self.assertIs(seen["is_layer_sparse"], True)
 
 
+class TestOutputToLocalTokensStep(CustomTestCase):
+    """The step that brings a FULL-layout output back to this rank's tokens."""
+
+    def step(self, *, varlen, max_len, tiles, allow, sparse):
+        forward_batch = types.SimpleNamespace(
+            dp_padding_mode=types.SimpleNamespace(is_max_len=lambda: max_len)
+        )
+        with (
+            patch.object(comm, "should_use_dp_reduce_scatterv", return_value=varlen),
+            patch.object(comm, "can_use_dp_reduce_scatter", return_value=tiles),
+        ):
+            return comm._output_to_local_tokens_step(
+                forward_batch, allow_reduce_scatter=allow, is_layer_sparse=sparse
+            )
+
+    def test_every_condition(self):
+        for varlen, max_len, tiles, allow, sparse in itertools.product(
+            (False, True), repeat=5
+        ):
+            if varlen and (allow or sparse):
+                expected = comm._reduce_and_redistribute_output_varlen
+            elif allow and max_len and tiles:
+                expected = comm._reduce_and_redistribute_output_max_len
+            else:
+                expected = comm._redistribute_output
+            case = dict(
+                varlen=varlen, max_len=max_len, tiles=tiles, allow=allow, sparse=sparse
+            )
+            with self.subTest(**case):
+                self.assertIs(self.step(**case), expected)
+
+
 class TestLongcatNextnReducesItsMlp(CustomTestCase):
     """Its dense layer allows no reduce-scatter, so postprocess never sums the
     MLP output; the MLP must all-reduce it itself."""
