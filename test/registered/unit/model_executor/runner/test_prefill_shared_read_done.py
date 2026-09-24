@@ -14,6 +14,7 @@ from sglang.srt.model_executor.runner_utils import (
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_registry import CustomSpecAlgo
+from sglang.srt.utils.cuda_event_ring import ReusableEventRing
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -37,11 +38,11 @@ def _model_runner(*, spec_algorithm=SpeculativeAlgorithm.NONE, compliant=True):
         spec_algorithm=spec_algorithm,
         attn_backend=attn_backend,
         shared_read_done_event=None,
+        # The publisher draws its event from the ring that sits next to the
+        # mailbox it writes, so the fake runner carries both.
+        shared_read_done_events=ReusableEventRing(_Event, depth=2),
         prefill_shared_read_stager=None,
     )
-
-
-_DEVICE_MODULE = SimpleNamespace(Event=_Event)
 
 
 def _batch(mode=ForwardMode.EXTEND):
@@ -51,7 +52,7 @@ def _batch(mode=ForwardMode.EXTEND):
 def test_publishes_recorded_event_when_enabled():
     runner = _model_runner()
     with envs.SGLANG_ENABLE_PREFILL_WAR_READ_DONE.override(True):
-        maybe_publish_prefill_shared_read_done(runner, _batch(), _DEVICE_MODULE)
+        maybe_publish_prefill_shared_read_done(runner, _batch())
     published = runner.shared_read_done_event
     assert isinstance(published, _Event) and published.recorded
 
@@ -59,7 +60,7 @@ def test_publishes_recorded_event_when_enabled():
 def test_disabled_when_flag_is_false():
     runner = _model_runner()
     with envs.SGLANG_ENABLE_PREFILL_WAR_READ_DONE.override(False):
-        maybe_publish_prefill_shared_read_done(runner, _batch(), _DEVICE_MODULE)
+        maybe_publish_prefill_shared_read_done(runner, _batch())
     assert runner.shared_read_done_event is None
 
 
@@ -70,7 +71,7 @@ def test_dflash_family_target_prefill_publishes(algorithm):
     runner = _model_runner(spec_algorithm=algorithm)
     runner.prefill_shared_read_stager = Mock(return_value=False)
     with envs.SGLANG_ENABLE_PREFILL_WAR_READ_DONE.override(True):
-        maybe_publish_prefill_shared_read_done(runner, _batch(), _DEVICE_MODULE)
+        maybe_publish_prefill_shared_read_done(runner, _batch())
     published = runner.shared_read_done_event
     assert isinstance(published, _Event) and published.recorded
     runner.prefill_shared_read_stager.assert_not_called()
@@ -95,10 +96,11 @@ def test_speculative_prefill_publishes_only_after_staging(algorithm, staged):
     runner.prefill_shared_read_stager = calls.stage
     calls.stage.return_value = staged
     calls.Event.side_effect = _Event
+    # The event comes from the runner's ring; point the ring at the same mock
+    # (depth 1 => one factory call) so the assertion still pins the order.
+    runner.shared_read_done_events = ReusableEventRing(calls.Event, depth=1)
     with envs.SGLANG_ENABLE_PREFILL_WAR_READ_DONE.override(True):
-        maybe_publish_prefill_shared_read_done(
-            runner, batch, SimpleNamespace(Event=calls.Event)
-        )
+        maybe_publish_prefill_shared_read_done(runner, batch)
     assert calls.mock_calls == [call.stage(batch)] + ([call.Event()] if staged else [])
     published = runner.shared_read_done_event
     if staged:
@@ -123,7 +125,7 @@ def test_prefill_gates_skip_staging(enabled, mode, compliant):
     )
     runner.prefill_shared_read_stager = Mock(return_value=True)
     with envs.SGLANG_ENABLE_PREFILL_WAR_READ_DONE.override(enabled):
-        maybe_publish_prefill_shared_read_done(runner, _batch(mode), _DEVICE_MODULE)
+        maybe_publish_prefill_shared_read_done(runner, _batch(mode))
     runner.prefill_shared_read_stager.assert_not_called()
     assert runner.shared_read_done_event is None
 
@@ -146,7 +148,7 @@ def test_gates_exclude_non_prefill_unsupported_algorithm_and_noncompliant_backen
             # Backend has not declared a pre-replay prefill read end.
             (_model_runner(compliant=False), _batch()),
         ):
-            maybe_publish_prefill_shared_read_done(runner, batch, _DEVICE_MODULE)
+            maybe_publish_prefill_shared_read_done(runner, batch)
             assert runner.shared_read_done_event is None
 
 
@@ -166,9 +168,7 @@ class TestPrefillReadDoneCapability(CustomTestCase):
             with self.subTest(algorithm=algorithm):
                 runner = _model_runner(spec_algorithm=algorithm)
                 with envs.SGLANG_ENABLE_PREFILL_WAR_READ_DONE.override(True):
-                    maybe_publish_prefill_shared_read_done(
-                        runner, _batch(), _DEVICE_MODULE
-                    )
+                    maybe_publish_prefill_shared_read_done(runner, _batch())
                 self.assertEqual(
                     runner.shared_read_done_event is not None, algorithm in allowed
                 )
@@ -185,9 +185,7 @@ class TestPrefillReadDoneCapability(CustomTestCase):
                 runner, batch = _model_runner(spec_algorithm=algorithm), _batch()
                 runner.prefill_shared_read_stager = Mock(return_value=False)
                 with envs.SGLANG_ENABLE_PREFILL_WAR_READ_DONE.override(True):
-                    maybe_publish_prefill_shared_read_done(
-                        runner, batch, _DEVICE_MODULE
-                    )
+                    maybe_publish_prefill_shared_read_done(runner, batch)
                 event = runner.shared_read_done_event
                 self.assertEqual(event is not None, expected)
                 if expected:
@@ -214,9 +212,7 @@ class TestPrefillReadDoneCapability(CustomTestCase):
                 runner = _model_runner(spec_algorithm=algorithm)
                 runner.attn_backend.shared_read_ends.return_value = declared
                 with envs.SGLANG_ENABLE_PREFILL_WAR_READ_DONE.override(enabled):
-                    maybe_publish_prefill_shared_read_done(
-                        runner, _batch(mode), _DEVICE_MODULE
-                    )
+                    maybe_publish_prefill_shared_read_done(runner, _batch(mode))
                 self.assertIsNone(runner.shared_read_done_event)
 
 
