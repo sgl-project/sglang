@@ -43,6 +43,7 @@ def _sgemm_lora_a_kernel(
     BLOCK_K: tl.constexpr,
     SPLIT_K: tl.constexpr = 1,
     ENABLE_PDL: tl.constexpr = False,
+    PADDED_RANK: tl.constexpr = False,
 ):
     """
     Computes a segmented batched matrix multiplication for the LoRA A matrix.
@@ -81,7 +82,8 @@ def _sgemm_lora_a_kernel(
         return
 
     # Adjust N (stack_num * max_rank) to this adapter's actual rank.
-    N = tl.minimum(N, rank * stack_num)
+    if not PADDED_RANK:
+        N = tl.minimum(N, rank * stack_num)
 
     # The tile in output matrix will have (pid_s, pid_n) as id
     num_pid_n = tl.cdiv(N, BLOCK_N)
@@ -212,11 +214,12 @@ def sgemm_lora_a_fwd(
 
     launch_kwargs = {}
     if split_k > 1:
-        # out_alloc_stream (SGLANG_OPT_LORA_OVERLAP_MAIN_ALLOC) is intentionally NOT honored here:
-        # torch.zeros launches its memset on the alloc stream, which would race the side-stream
-        # shrink without extra ordering. No current config exercises split-K together with the
-        # two-stream main-alloc overlap (qwen3.5 leaves split-K off; kimi is single-stream-coherent).
-        output = torch.zeros((S, R), device=x.device, dtype=torch.float32)
+        if out_alloc_stream is not None:
+            with torch.cuda.stream(out_alloc_stream):
+                output = torch.empty((S, R), device=x.device, dtype=torch.float32)
+            output.zero_()
+        else:
+            output = torch.zeros((S, R), device=x.device, dtype=torch.float32)
         launch_kwargs = {
             "num_warps": 2 if split_k <= 4 else 4,
             "num_stages": 3,
@@ -266,4 +269,68 @@ def sgemm_lora_a_fwd(
     )
     # split_k>1 returns the fp32 accumulator directly; the LoRA-B expand casts x to the weight dtype
     # on-load (fused), dropping the standalone fp32->bf16 copy kernel. split_k==1 already returns x.dtype.
+    return output
+
+
+def shared_sink_sgemm_lora_a_fwd(
+    x: torch.Tensor,
+    weights: torch.Tensor,
+    batch_info: LoRABatchInfo,
+    *,
+    stack_num: int,
+    padded_rank: bool,
+    out_alloc_stream=None,
+) -> torch.Tensor:
+    """Shared-sink shrink with the measured fixed-width schedule."""
+    assert x.is_contiguous()
+    assert weights.is_contiguous()
+    assert x.ndim == 2
+    assert weights.ndim == 3
+
+    num_tokens = x.shape[0]
+    rank_width = weights.shape[-2]
+    input_width = weights.shape[-1]
+    assert x.shape[-1] == input_width
+
+    block_s = 16
+    block_k = 256
+    block_rank = 16
+    grid = (
+        triton.cdiv(batch_info.max_len, block_s) * triton.cdiv(rank_width, block_rank),
+        batch_info.bs,
+    )
+
+    if out_alloc_stream is None:
+        output = torch.empty((num_tokens, rank_width), device=x.device, dtype=x.dtype)
+    else:
+        with torch.cuda.stream(out_alloc_stream):
+            output = torch.empty(
+                (num_tokens, rank_width), device=x.device, dtype=x.dtype
+            )
+
+    _sgemm_lora_a_kernel[grid](
+        x,
+        weights,
+        output,
+        rank_width,
+        input_width,
+        stack_num,
+        x.stride(0),
+        x.stride(1),
+        weights.stride(0),
+        weights.stride(1),
+        weights.stride(2),
+        output.stride(0),
+        output.stride(1),
+        batch_info.seg_lens,
+        batch_info.seg_indptr,
+        batch_info.weight_indices,
+        batch_info.lora_ranks,
+        batch_info.permutation,
+        batch_info.permutation is not None,
+        block_s,
+        block_rank,
+        block_k,
+        PADDED_RANK=padded_rank,
+    )
     return output

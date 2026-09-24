@@ -24,6 +24,7 @@ from sglang.srt.model_executor.forward_context import (
 from sglang.srt.model_executor.graph_shared_output import GraphSharedOutput
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.runtime_context import get_context, get_parallel
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
 _parallel_override = get_parallel().override(attn_tp_size=1)
 _parallel_override.__enter__()
@@ -175,6 +176,7 @@ class TinyMLAModelConfig:
         self.scaling = self.head_dim**-0.5
         self.is_encoder_decoder = False
         self.is_multimodal = False
+        self.model_is_mrope = False
         self.is_generation = True
         self.quantization = None
         self.is_hybrid_swa = False
@@ -191,13 +193,18 @@ class TinyMLAModelConfig:
             qk_rope_head_dim=qk_rope_head_dim,
             v_head_dim=kv_lora_rank,
         )
+        self.hf_config.get_text_config = lambda: self.hf_config
         self.hf_text_config = self.hf_config
+        self.linear_attn_registry_result = None
 
     def get_num_attention_heads(self, tp_size: int) -> int:
         assert self.num_attention_heads % tp_size == 0
         return self.num_attention_heads // tp_size
 
-    def get_num_kv_heads(self, tp_size: int) -> int:
+    def get_max_num_attention_heads(self) -> int:
+        return self.num_attention_heads
+
+    def get_num_kv_heads(self, tp_size: int, dcp_size: int = 1) -> int:
         return 1
 
 
@@ -226,6 +233,12 @@ class MockMLAModelRunner(ModelRunner):
         # while the model still projects K/V in bf16; `set_mla_kv_buffer`
         # does the BF16->FP8 cast on the way in.
         self.kv_cache_dtype = torch.float8_e4m3fn if fp8_kv_cache else dtype
+        self.kv_cache_dtype_str = "fp8_e4m3" if fp8_kv_cache else "auto"
+        # This runner's own resolved backends (production stamps these in
+        # ModelRunner.initialize); a draft runner would carry its own.
+        self.prefill_attention_backend_str = case.backend
+        self.decode_attention_backend_str = case.backend
+        self.draft_attention_backend = None
         self.gpu_id = 0
         self.canary_manager = None
         self.page_size = case.page_size
@@ -233,6 +246,7 @@ class MockMLAModelRunner(ModelRunner):
         self.tp_size = 1
         self.dp_size = 1
         self.pp_size = 1
+        self.spec_algorithm = SpeculativeAlgorithm.NONE
         speculative_num_draft_tokens = (
             max(case.input_lens)
             if case.forward_mode.is_target_verify()
@@ -278,6 +292,7 @@ class MockMLAModelRunner(ModelRunner):
             triton_attention_split_tile_size=None,
         )
         self.server_args = self._server_args_override.install()
+        self.max_running_requests = pool_batch_size
         self.req_to_token_pool = ReqToTokenPool(
             size=pool_batch_size,
             max_context_len=max_context_len,
@@ -296,6 +311,7 @@ class MockMLAModelRunner(ModelRunner):
             enable_memory_saver=False,
         )
         self.token_to_kv_pool_allocator = SimpleNamespace(page_size=case.page_size)
+        self.init_kv_index_translator()
         self.attn_cp_size = 1
         self.attention_chunk_size = None
         self.hisparse_coordinator = None

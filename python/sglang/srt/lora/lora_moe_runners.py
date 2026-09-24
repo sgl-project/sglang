@@ -37,7 +37,7 @@ _is_hip = is_hip()
 _is_xpu = is_xpu()
 
 if _is_cuda or _is_hip or _is_xpu:
-    from sglang.jit_kernel.moe_lora_align import moe_lora_align_block_size
+    from sglang.kernels.ops.moe.moe_lora_align import moe_lora_align_block_size
 
 
 def _get_moe_lora_block_config(max_lora_rank: int) -> dict:
@@ -227,7 +227,7 @@ def _compute_lora_alignment(
 
     device = topk_ids.device
 
-    use_naive = (
+    use_naive = _is_xpu or (
         cg is None
         and M * topk_ids.shape[1] * _SPARSITY_FACTOR
         <= lora_info.num_experts * max_loras

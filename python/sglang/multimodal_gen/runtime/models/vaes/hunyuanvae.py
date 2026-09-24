@@ -22,7 +22,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from sglang.jit_kernel.diffusion.group_norm_silu import apply_group_norm_silu
+from sglang.kernels.ops.diffusion import apply_group_norm_silu
 from sglang.multimodal_gen.configs.models.vaes import HunyuanVAEConfig
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_decode_parallel_rank,
@@ -100,7 +100,6 @@ def _apply_group_norm_silu(
 
 
 class HunyuanVAEAttention(nn.Module):
-
     def __init__(
         self, in_channels, heads, dim_head, eps, norm_num_groups, bias
     ) -> None:
@@ -167,7 +166,6 @@ class HunyuanVAEAttention(nn.Module):
 
 
 class HunyuanVideoCausalConv3d(nn.Module):
-
     def __init__(
         self,
         in_channels: int,
@@ -237,7 +235,6 @@ class HunyuanVideoCausalConv3d(nn.Module):
 
 
 class HunyuanVideoUpsampleCausal3D(nn.Module):
-
     def __init__(
         self,
         in_channels: int,
@@ -286,7 +283,6 @@ class HunyuanVideoUpsampleCausal3D(nn.Module):
 
 
 class HunyuanVideoDownsampleCausal3D(nn.Module):
-
     def __init__(
         self,
         channels: int,
@@ -309,7 +305,6 @@ class HunyuanVideoDownsampleCausal3D(nn.Module):
 
 
 class HunyuanVideoResnetBlockCausal3D(nn.Module):
-
     def __init__(
         self,
         in_channels: int,
@@ -361,7 +356,6 @@ class HunyuanVideoResnetBlockCausal3D(nn.Module):
 
 
 class HunyuanVideoMidBlock3D(nn.Module):
-
     def __init__(
         self,
         in_channels: int,
@@ -473,7 +467,6 @@ class HunyuanVideoMidBlock3D(nn.Module):
 
 
 class HunyuanVideoDownBlock3D(nn.Module):
-
     def __init__(
         self,
         in_channels: int,
@@ -537,7 +530,6 @@ class HunyuanVideoDownBlock3D(nn.Module):
 
 
 class HunyuanVideoUpBlock3D(nn.Module):
-
     def __init__(
         self,
         in_channels: int,

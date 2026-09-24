@@ -1,30 +1,26 @@
-# Construct a proof for a move commit
+# Construct a proof
 
-## 1. What a proof is
-
-- A runnable script that regenerates the commit from its base with the faithful relocation
-  primitives and byte-diffs the result against it.
+- Two levels, one chapter each: §1 constructs the **proof folder for a whole chain** (and
+  publishes it with the PR); §2 constructs the proof for a **single commit** (the
+  generator, the hand-written `Repro`, the hand-written transform).
 - The property and primitive contracts: `spec-reproduction-utils.md`. Splitting the change
   so the move is provable: `guide-split.md`. Consuming the proof: `guide-verify-proof.md`.
 
-## 2. Auto-generate the script (primary path)
+## 1. Construct proofs for a whole chain
 
-- `mechanical_refactor_proof_generator.py` infers the recipe from a commit's diff and
-  before-state AST.
-- It emits and runs a standalone, auditable script — no one hand-writes it.
-
-### 2.1 Commands
+### 1.1 Generate the proof folder
 
 ```bash
-# one commit: print the inferred script and run it (non-zero exit unless PASS)
-python3 .claude/skills/mechanical-refactor-verify/scripts/mechanical_refactor_proof_generator.py <commit>
-
-# a range: write a self-contained folder
+# a range: write a self-contained folder for every mechanical_provable commit
 python3 .claude/skills/mechanical-refactor-verify/scripts/mechanical_refactor_proof_generator.py \
-    <base>..<tip> --match -move: --out repro_out
+    <base>..<tip> --match '(?<!_)mechanical_provable' --out repro_out
 ```
 
-### 2.2 The range product
+- `mechanical_refactor_proof_generator.py` infers each recipe from a commit's diff and
+  before-state AST.
+- It emits and runs a standalone, auditable script per commit — no one hand-writes it.
+
+### 1.2 The folder product
 
 Self-contained, auditable without the skill installed:
 
@@ -32,7 +28,59 @@ Self-contained, auditable without the skill installed:
 - `output.log` + `output.html` — the verdicts;
 - a copy of `mechanical_refactor_reproduction_utils.py` — the scripts' only dependency.
 
-### 2.3 What the inference covers
+The folder is also the `--proof` input to the chain verifier
+(`mechanical_refactor_reproduction_cli.py`, contract in `spec-reproduction-cli.md`).
+
+### 1.3 Publish the proof with the PR
+
+#### 1.3.1 What to share
+
+- Share the scripts **plus** the copied `mechanical_refactor_reproduction_utils.py` — the
+  scripts import it, so a lone raw file is not runnable.
+- Never a `python3 <(curl ...)` one-liner: process substitution gives the script no real
+  directory, so the import breaks.
+- Flat layouts work: Python puts the script's own directory on `sys.path`, so the utils
+  module can sit either next to the script or one level up (the `--out` layout).
+
+#### 1.3.2 Author: create a gist
+
+```bash
+cd repro_out
+gh gist create --desc "mechanical-move proof for PR #NNNN" \
+    repro_scripts/*.py mechanical_refactor_reproduction_utils.py output.log
+# prints https://gist.github.com/<user>/<gist_id> -- put it in the PR description
+```
+
+- `gh gist create` flattens paths — fine per §1.3.1.
+- Alternatives: a PR attachment (zip the `--out` folder) or a branch holding it.
+- Put the reviewer's download-and-re-run commands (`guide-verify-proof.md` §2.1) in the
+  PR description under a "Mechanical move — reproducible" heading.
+
+#### 1.3.3 Keep the classification honest — in both directions
+
+- A `mechanical_provable` commit (and a PR made only of such commits) contains **only**
+  mechanical changes (moves, splits, renames, import fixes, formatting). Semantic changes
+  go in their own `non_mechanical_provable` commits — a chain, and therefore a PR, need
+  not be purely mechanical, but a single commit never mixes the two.
+- The dual holds too: a semantic (`non_mechanical_provable`) commit must not swallow a
+  provable relocation to skip the proof — split it out and prove it
+  (`guide-split.md` §2.2; property: `spec-reproduction-cli.md` §2.1).
+
+## 2. Construct the proof for a single commit
+
+### 2.1 What a proof is
+
+- A runnable script that regenerates the commit from its base with the faithful relocation
+  primitives and byte-diffs the result against it.
+
+### 2.2 Auto-generate the script (primary path)
+
+```bash
+# one commit: print the inferred script and run it (non-zero exit unless PASS)
+python3 .claude/skills/mechanical-refactor-verify/scripts/mechanical_refactor_proof_generator.py <commit>
+```
+
+#### 2.2.1 What the inference covers
 
 - **Method → existing class**: call sites lowered (`Owner.m(recv, …)` → `recv.m(…)`), the
   orphaned local import removed.
@@ -43,31 +91,46 @@ Self-contained, auditable without the skill installed:
 - **New-module extract of scattered defs**: `extract_symbols_to_new_module` under the
   audited header; a constant that relocated into the header is dropped from the source.
   A contiguous-tail source still uses `extract_to_new_module`.
+- **Inline-block extract-function** (intra-file): a new helper whose verbatim body is a
+  block cut from a sibling function, that function's block replaced by a call — inferred as
+  `extract_function`, authoring only the signature, the call, and (when the block ends in
+  `lhs = expr` returned by the helper) a `return lhs`. A body edited on the way out (a
+  de-self / restructure) does not infer — the residual surfaces it.
+- **A move landing just above an `if TYPE_CHECKING:` guard**: anchored with
+  `move_symbol(after=<preceding symbol>)` rather than a `before=` that would overshoot past
+  the guard.
 - **A source file the commit deletes** once its defs relocated: `delete_file`.
 - **The module-level import diff**, realised directly from the target: gained names added
-  (a wholly new module's statement verbatim, wrapping kept), lost names removed with
+  (a wholly new module's statement verbatim, wrapping kept, or one name folded into an
+  existing `from module import …` with `add_imported_name`), lost names removed with
   `remove_imported_name`.
 - Non-Python files in the commit do not block inference; their diff is noted and left to
   the residual.
 
-### 2.4 What it reports `UNSUPPORTED`
+#### 2.2.2 What it reports `UNSUPPORTED`
 
 - Single-commit mode prints the verdict with notes and exits non-zero; range mode
   records it in the outputs.
-- Review such a commit as prepare, or hand-write the `Repro` (§3).
+- Review such a commit as prepare, or hand-write the `Repro` (§2.3).
 - The cases:
     - **no definition relocated** — a rename (even a privacy flip `_foo` → `foo`) or a
       statement-level reorder; reshapes belong in prepare;
     - **a new-module extract whose symbols are not all top-level in the source** — a
       method still inside a class; prepare must de-self it out first;
-    - **an extract drawing from more than one source file**, and an **inline-block
-      extract-function** — compose `extract_function` by hand (the body must be unchanged;
-      a de-self / restructure is a separate semantic commit).
+    - **an extract drawing from more than one source file** — compose `extract_function` by
+      hand. An inline-block extract-function within one file is inferred (§2.2.1), but only
+      when the body is a verbatim cut; a de-self / restructure on the way out is a separate
+      semantic commit and does not infer.
 
-## 3. Hand-write the `Repro` when inference falls short
+### 2.3 Hand-write the `Repro` when inference falls short
 
 - Compose the transform from the same primitives (`spec-reproduction-utils.md` §3).
 - The same byte-diff then certifies it.
+- **`UNSUPPORTED`, or a primitive that cannot express the exact edit, is never a reason to
+  relabel a relocation as `non_mechanical_provable`.** If the change is a relocation, it
+  gets a proof: hand-write the `Repro` here, or (when a primitive genuinely lacks the needed
+  form, e.g. an insertion anchor) enhance the primitive first, then prove it. See
+  guide-split.md §2.7.6.
 
 ```python
 import sys
@@ -86,7 +149,7 @@ r.add_import("dst.py", "import gc")
 r.run()   # PASS = byte-identical; otherwise prints the residual
 ```
 
-## 4. A hand-written transform for a non-relocation mechanical change
+### 2.4 A hand-written transform for a non-relocation mechanical change
 
 - For a whole-file split or rename — no single symbol relocates — write a `transform()`
   and call `verify_mechanical_refactor`.
@@ -116,42 +179,3 @@ def transform(dir_root: Path) -> None:
 if __name__ == "__main__":
     verify_mechanical_refactor(BASE_COMMIT, TARGET_COMMIT, transform)
 ```
-
-## 5. Publish the proof with the PR
-
-### 5.1 What to share
-
-- Share the scripts **plus** the copied `mechanical_refactor_reproduction_utils.py` — the
-  scripts import it, so a lone raw file is not runnable.
-- Never a `python3 <(curl ...)` one-liner: process substitution gives the script no real
-  directory, so the import breaks.
-- Flat layouts work: Python puts the script's own directory on `sys.path`, so the utils
-  module can sit either next to the script or one level up (the `--out` layout).
-
-### 5.2 Author: create a gist
-
-```bash
-cd repro_out
-gh gist create --desc "mechanical-move proof for PR #NNNN" \
-    repro_scripts/*.py mechanical_refactor_reproduction_utils.py output.log
-# prints https://gist.github.com/<user>/<gist_id> -- put it in the PR description
-```
-
-- `gh gist create` flattens paths — fine per §5.1.
-- Alternatives: a PR attachment (zip the `--out` folder) or a branch holding it.
-
-### 5.3 Reviewer: download and re-run
-
-```bash
-gh gist clone <gist_id> /tmp/proof        # or: git clone https://gist.github.com/<gist_id>.git /tmp/proof
-cd <repo-root>                            # the run resolves the repo from the cwd
-python3 /tmp/proof/<sha>.py               # PASS = byte-identical to this commit
-```
-
-- Include exactly these commands in the PR description under a
-  "Mechanical move — reproducible" heading.
-
-### 5.4 Keep the PR mechanical
-
-- A mechanical PR contains **only** mechanical changes (moves, splits, renames, import
-  fixes, formatting). Semantic changes go in a separate PR.

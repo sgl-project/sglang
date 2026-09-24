@@ -19,6 +19,7 @@ pattern.
 """
 
 import logging
+from array import array
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
 import torch
@@ -132,7 +133,7 @@ class LocateAnythingForConditionalGeneration(nn.Module):
         assert isinstance(image_features, list)
         return self.multi_modal_projector(torch.cat(image_features))
 
-    def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
+    def pad_input_ids(self, input_ids: array, mm_inputs: MultimodalInputs) -> array:
         pattern = MultiModalityDataPaddingPatternMultimodalTokens()
         return pattern.pad_input_tokens(input_ids, mm_inputs)
 

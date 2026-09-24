@@ -10,6 +10,9 @@ from sglang.multimodal_gen.runtime.entrypoints.utils import (
 )
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import PipelineStage
+from sglang.multimodal_gen.runtime.pipelines_core.stages.input_validation import (
+    InputValidationStage,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.latent_preparation import (
     LatentPreparationStage,
 )
@@ -19,6 +22,7 @@ class CountingDedupStage(PipelineStage):
     deduplicated_output_fields = ("prompt_embeds",)
     deduplicated_tensor_tree_output_fields = ("timesteps",)
     deduplicated_deepcopy_output_fields = ("scheduler",)
+    deduplicated_extra_output_keys = ("shared",)
     deduplicated_extra_tensor_tree_output_keys = ("mu",)
 
     def __init__(self):
@@ -36,6 +40,7 @@ class CountingDedupStage(PipelineStage):
         batch.prompt_embeds = [torch.tensor([value])]
         batch.timesteps = torch.tensor([value])
         batch.scheduler = {"state": [value]}
+        batch.extra["shared"] = {"tensor": batch.prompt_embeds[0]}
         batch.extra["mu"] = torch.tensor([value])
         return batch
 
@@ -129,6 +134,55 @@ class TestMultiOutputGrouping(unittest.TestCase):
             ["rid:0", "rid:1"],
         )
 
+    def test_sequential_stage_matches_entrypoint_output_expansion(self):
+        def make_req():
+            req = Req(
+                sampling_params=SamplingParams(
+                    request_id="rid",
+                    prompt="p",
+                    output_path="/tmp",
+                    output_file_name="image.png",
+                    num_outputs_per_prompt=2,
+                    seed=[100, 101],
+                )
+            )
+            return req
+
+        entrypoint_outputs = expand_request_outputs(make_req())
+        sequential_parent = make_req()
+        sequential_outputs = list(
+            InputValidationStage().iter_sequential_requests(
+                sequential_parent,
+                SimpleNamespace(
+                    pipeline_config=SimpleNamespace(
+                        supports_sequential_multi_output_inference=lambda: True
+                    )
+                ),
+            )
+        )
+
+        def expansion_signature(req):
+            return (
+                req.request_id,
+                req.seed,
+                req.num_outputs_per_prompt,
+                req.output_file_name,
+                req.extra["parent_request_id"],
+                req.extra["output_index"],
+                req.metrics.request_id,
+            )
+
+        self.assertEqual(
+            [expansion_signature(req) for req in sequential_outputs],
+            [expansion_signature(req) for req in entrypoint_outputs],
+        )
+        self.assertTrue(
+            all(
+                req.trace_ctx is sequential_parent.trace_ctx
+                for req in sequential_outputs
+            )
+        )
+
     def test_split_batched_latents_uses_original_batched_tensor(self):
         stage = LatentPreparationStage.__new__(LatentPreparationStage)
         src = Req(sampling_params=SamplingParams(prompt="p"))
@@ -159,12 +213,20 @@ class TestMultiOutputGrouping(unittest.TestCase):
             self.assertTrue(torch.equal(req.prompt_embeds[0], torch.tensor([1.0])))
             self.assertTrue(torch.equal(req.timesteps, torch.tensor([1.0])))
             self.assertEqual(req.scheduler, {"state": [1.0]})
+            self.assertTrue(
+                torch.equal(req.extra["shared"]["tensor"], torch.tensor([1.0]))
+            )
             self.assertTrue(torch.equal(req.extra["mu"], torch.tensor([1.0])))
 
         self.assertIsNot(reqs[0].prompt_embeds, reqs[1].prompt_embeds)
         self.assertIs(reqs[0].prompt_embeds[0], reqs[1].prompt_embeds[0])
         self.assertIsNot(reqs[0].timesteps, reqs[1].timesteps)
         self.assertIsNot(reqs[0].scheduler, reqs[1].scheduler)
+        self.assertIsNot(reqs[0].extra["shared"], reqs[1].extra["shared"])
+        self.assertIs(
+            reqs[0].extra["shared"]["tensor"],
+            reqs[1].extra["shared"]["tensor"],
+        )
         self.assertIsNot(reqs[0].extra["mu"], reqs[1].extra["mu"])
 
     def test_declarative_stage_dedup_runs_distinct_fingerprints_separately(self):

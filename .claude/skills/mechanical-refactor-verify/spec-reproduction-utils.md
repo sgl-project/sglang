@@ -28,9 +28,11 @@
   verbatim, assembled under an **audited authored header**:
     - the byte diff certifies the bodies; the header is reproduced from the target;
     - the header audit accepts only: imports, a docstring, a TYPE_CHECKING import block,
-      a `logging.getLogger(__name__)` logger, or an unparse-equivalent copy of an
-      assignment actually deleted from the source (`drop_assigns`, e.g.
-      `_is_hip = is_hip()`);
+      a `logging.getLogger(__name__)` logger, an unparse-equivalent copy of an assignment
+      actually deleted from the source (`drop_assigns`), or an unparse-equivalent copy of a
+      module constant that **survives verbatim in the source** — re-derived boilerplate such
+      as `_is_hip = is_hip()`, provably not fiction because the same statement remains in the
+      source;
     - every dropped assignment must reappear in the header — anything else raises instead
       of certifying.
 - The **body of an extracted function** — an inline block relocated verbatim into a new
@@ -67,7 +69,8 @@
 - **Scaffolding or a constant authored into an existing module** — a logger, a module
   constant, a `TYPE_CHECKING` guard, a re-derived `_flag = compute_flag()`. (A *new*
   module's header is authored from the target, §2.1; an existing module's body is not a
-  place to author fresh code.)
+  place to author fresh code. A constant *relocated* from the source is not authored —
+  `move_assign` certifies it.)
 - A **changed body in an extracted function** — de-self, control-flow restructure, or a
   folded-in bookkeeping change: a semantic rewrite, not a relocation.
 
@@ -93,11 +96,15 @@
   relocation.
 
 - `move_symbol(name, *, src, dst, into_class, from_class, dedent, drop_self_annotation,
-  before, leave_delegate, delegate_name)`:
-    - cuts a `def` (functions only; a class moves via the extract primitives) with its
-      decorators; drops its own `@staticmethod`/`@classmethod`;
+  before, after, leave_delegate, delegate_name)`:
+    - cuts a `def` or a whole `class` (with its methods) with its decorators; drops its own
+      `@staticmethod`/`@classmethod`;
     - shifts indentation uniformly (negative `dedent` indents into a class);
-    - pastes at a class end, at module level, or above the named sibling `before`;
+    - pastes at a class end, at module level, above the named sibling `before`, or
+      immediately below the top-level symbol `after` (a sibling def/class or a module-level
+      assignment target — the anchor for landing a def just above a following
+      `if TYPE_CHECKING:` guard, which has no nameable anchor of its own); `before` and
+      `after` are mutually exclusive;
     - same-named defs need `from_class`; an ambiguous name or missing anchor raises;
     - `leave_delegate` **authors** a forwarding stub in the source (original header + one
       `return self.<attr>.<name>(...)`, `await`ed for async) — audit it like any header.
@@ -110,34 +117,65 @@
     - cuts the named defs/classes from **scattered** positions; assembles the new module
       under the audited `header` (§2.1);
     - `drop_assigns` deletes a relocated module-level constant from the source; a chained
-      `A = B = 1` keeps the surviving bindings.
+      `A = B = 1` keeps the surviving bindings;
+    - the header audit also accepts an unparse-equivalent copy of a module constant that
+      **survives** in the source (re-derived boilerplate, e.g. `_is_hip = is_hip()` kept in
+      both modules) — provable because the same statement remains in the source.
 - `extract_function(src, dst, *, name, signature, body, body_indent, call, return_text,
   before, into_class)`:
     - cuts an inline `body` verbatim (must match at a line boundary);
     - re-indents under the authored `signature` — multi-line string interiors keep their
       exact bytes;
     - replaces the block with the authored `call`.
+- `move_assign(name, *, src, dst, before)` — cuts the module-level assignment binding
+  `name` from `src` verbatim and pastes it at module level in `dst` (above the named
+  sibling `before`, else after the trailing import) — a module constant relocated
+  together with the code that reads it.
 - `lower_call_sites(name, owner, *, paths)` — `Owner.m(receiver, rest)` →
   `receiver.m(rest)` by splicing the original argument bytes (literal spelling, comments,
   magic trailing comma survive); nested matching calls are all rewritten.
 - `requalify_call_sites(name, owner, *, paths)` — `Owner.m(args)` → `m(args)`; only the
   qualifier span changes.
+- `route_call_sites_through_field(name, *, field, paths, owner)` — `recv.m(args)` →
+  `recv.field.m(args)` when `m` moved onto a collaborator reached via `self.field`; the
+  call-side dual of `move_symbol(leave_delegate=...)`. A call already routed through `field`
+  is skipped so the pass converges; `owner` restricts to one exact receiver.
 - `remove_import(rel, import_text, *, in_function)` — function-scoped or module-level;
   whole-statement match with token boundaries (`import os` cannot hit `import os.path`);
   removes exactly the matched import even on a semicolon-joined line.
 - `remove_imported_name(rel, *, module, name, asname)` — drops one name from a
   `from m import a, b` (or a plain `import x`), realising a lost import directly (this
-  repo's ruff has no F811); an import carrying comments loses only the dropped alias's own
-  line.
-- `add_import(rel, import_stmt)` — the import sorter places it; with no existing imports
-  it lands below the module docstring.
+  repo's ruff has no F811). A name on its own line in an exploded, parenthesized import is
+  deleted in place when **2+ names survive** (or the import carries comments): the parens,
+  the magic trailing comma, and the comments are preserved and the formatter leaves it
+  multi-line — a flat rebuild would drop the magic comma and collapse an import the target
+  left multi-line. A **lone** surviving name with no comments collapses to a single line
+  (the formatter does not keep one name exploded) **by default**; pass `keep_exploded=True`
+  when the target left the sole survivor exploded (its magic comma preserved) — the choice
+  is the commit author's and cannot be inferred from the source. A name sharing a line (a
+  flat single-line import) is always rebuilt. Dropping the sole name removes the whole
+  statement.
+- `add_imported_name(rel, *, module, name, asname)` — the dual of `remove_imported_name`:
+  adds one name to an existing `from module import a, b`. Use it (over `add_import`) when the
+  target extends an existing line rather than adding a fresh statement — the sorter will not
+  merge a new statement across an intervening non-import (e.g. a module-level assignment
+  between two import blocks). An import carrying comments is refused (a rebuild would drop
+  them); a name already present fails loudly.
+- `add_import(rel, import_stmt, *, after)` — the import sorter places it; with no existing
+  imports it lands below the module docstring. `after=<substr>` inserts it immediately below
+  the top-level import statement whose text contains the substring — needed when a statement
+  splits the imports into separate isort sections (e.g. `_is_hip = is_hip()` between two
+  blocks) and the default (after the last import) would land in the wrong block; a substring
+  matching no top-level import raises.
 - `add_typechecking_import(rel, import_stmt)` — appends inside the destination's
-  `if TYPE_CHECKING:` block; the sorter orders it.
+  `if TYPE_CHECKING:` block (creating the block after the trailing module import when
+  absent); the sorter orders it. A lone `pass` placeholder (the block's
+  only statement) is dropped, since populating an empty block makes its placeholder redundant.
 - `repath_import(rel, *, old_module, new_module, name)` — repaths a function-scoped
   `from old import … name …` (relative imports included) in place; module-level repaths
   fall out of add/remove + the sorter.
 - `delete_file(path)` — deletes a source module the relocation emptied; refuses anything
-  beyond a docstring, imports, or a `TYPE_CHECKING` block.
+  beyond a docstring, imports, a `TYPE_CHECKING` block, or a bare module `logger`.
 
 Cross-cutting guarantees:
 

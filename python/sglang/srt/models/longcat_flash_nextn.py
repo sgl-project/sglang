@@ -37,6 +37,7 @@ from typing import Iterable, Optional, Tuple
 import torch
 from torch import nn
 
+from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.configs import LongcatFlashConfig
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.layers import deep_gemm_wrapper
@@ -48,7 +49,6 @@ from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.layers.quantization.fp8_utils import (
     block_quant_dequant,
     block_quant_to_tensor_quant,
@@ -92,11 +92,11 @@ _is_cpu = is_cpu()
 _device_sm = get_device_sm()
 
 if _is_cuda:
-    from sgl_kernel import awq_dequantize
+    from sglang.kernels.ops.quantization.awq_dequantize import awq_dequantize
 elif _is_cpu and _is_cpu_amx_available:
     pass
 elif _is_hip:
-    from sglang.srt.layers.quantization.awq.awq_triton import (
+    from sglang.kernels.ops.quantization.awq_triton import (
         awq_dequantize_triton as awq_dequantize,
     )
 else:
@@ -107,7 +107,6 @@ logger = logging.getLogger(__name__)
 
 
 class LongcatFlashDenseDecoderLayer(nn.Module):
-
     def __init__(
         self,
         config: LongcatFlashConfig,
@@ -131,8 +130,12 @@ class LongcatFlashDenseDecoderLayer(nn.Module):
             v_head_dim=config.v_head_dim,
             q_lora_rank=config.q_lora_rank,
             kv_lora_rank=config.kv_lora_rank,
-            rope_theta=config.rope_parameters["rope_theta"],
-            rope_scaling=None,
+            rope_theta=(
+                config.rope_parameters["rope_theta"]
+                if "rope_theta" in getattr(config, "rope_parameters", {})
+                else config.rope_theta
+            ),
+            rope_scaling=getattr(config, "rope_scaling", None),
             max_position_embeddings=config.max_position_embeddings,
             quant_config=quant_config,
             layer_id=layer_id,
@@ -280,7 +283,6 @@ class LongcatFlashModelNextN(nn.Module):
 
 
 class LongcatFlashForCausalLMNextN(LongcatFlashForCausalLM):
-
     def __init__(
         self,
         config: LongcatFlashConfig,

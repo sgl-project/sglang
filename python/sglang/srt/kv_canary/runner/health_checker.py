@@ -6,7 +6,7 @@ from typing import Optional
 
 import torch
 
-from sglang.jit_kernel.kv_canary.verify import CanaryLaunchTag
+from sglang.kernels.ops.kv_canary.verify import CanaryLaunchTag
 from sglang.srt.kv_canary.config import CanaryConfig
 from sglang.srt.kv_canary.runner.future_tensor import DelayedDeviceHostHandler
 from sglang.srt.kv_canary.runner.kernel_launcher import passes_v_half_gate
@@ -34,7 +34,7 @@ class KernelRunCounterHealthChecker:
         device_state: CanaryDeviceState,
         active_tags: tuple[CanaryLaunchTag, ...],
         outer_step_counter_getter: Callable[[], int],
-        d2h_stream: torch.cuda.Stream,
+        d2h_stream: torch.Stream,
     ) -> None:
         self._config = config
         self._device_state = device_state

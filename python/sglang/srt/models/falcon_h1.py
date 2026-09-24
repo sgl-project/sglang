@@ -5,7 +5,6 @@ import torch
 from torch import nn
 
 from sglang.srt.configs.falcon_h1 import FalconH1Config
-from sglang.srt.distributed import get_pp_group
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
     HybridLinearAttnBackend,
@@ -33,12 +32,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.runtime_context import (
-    get_forward,
-    get_parallel,
-    get_server_args,
-    get_stream,
-)
+from sglang.srt.runtime_context import get_forward, get_parallel, get_stream
 from sglang.srt.utils import add_prefix, is_cuda, make_layers
 
 logger = logging.getLogger(__name__)
@@ -75,8 +69,7 @@ class FalconH1MLP(nn.Module):
         )
         if hidden_act != "silu":
             raise ValueError(
-                f"Unsupported activation: {hidden_act}. "
-                "Only silu is supported for now."
+                f"Unsupported activation: {hidden_act}. Only silu is supported for now."
             )
         self.act_fn = SiluAndMul()
         self.layer_id = layer_id
@@ -101,7 +94,6 @@ class FalconH1MLP(nn.Module):
 
 
 class FalconH1HybridAttentionDecoderLayer(nn.Module):
-
     def __init__(
         self,
         config: FalconH1Config,
@@ -280,16 +272,18 @@ class FalconH1HybridAttentionDecoderLayer(nn.Module):
         # B vector 2 * d_ssm -> 2 * d_ssm + (n_group * d_state)
         mup_vector[
             :,
-            (2 * self.d_ssm)
-            // self.tp_size : (2 * self.d_ssm + self.groups_time_state_size)
+            (2 * self.d_ssm) // self.tp_size : (
+                2 * self.d_ssm + self.groups_time_state_size
+            )
             // self.tp_size,
         ] *= self.zxbcdt_multipliers[2]
         # C vector 2 * d_ssm + (n_group * d_state)
         # -> 2 * d_ssm + 2 * (n_group * d_state)
         mup_vector[
             :,
-            (2 * self.d_ssm + self.groups_time_state_size)
-            // self.tp_size : (2 * self.d_ssm + 2 * self.groups_time_state_size)
+            (2 * self.d_ssm + self.groups_time_state_size) // self.tp_size : (
+                2 * self.d_ssm + 2 * self.groups_time_state_size
+            )
             // self.tp_size,
         ] *= self.zxbcdt_multipliers[3]
         # dt vector 2 * d_ssm + 2 * (n_group * d_state)
@@ -462,7 +456,7 @@ class FalconH1ForCausalLM(nn.Module):
     ) -> None:
         super().__init__()
         self.config = config
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
         assert self.pp_group.is_first_rank and self.pp_group.is_last_rank
         self.quant_config = quant_config
         self.model = FalconH1Model(
@@ -477,7 +471,7 @@ class FalconH1ForCausalLM(nn.Module):
                 quant_config=quant_config,
                 org_num_embeddings=config.vocab_size,
                 prefix=add_prefix("lm_head", prefix),
-                use_attn_tp_group=get_server_args().enable_dp_lm_head,
+                use_attn_tp_group=get_parallel().enable_dp_lm_head,
             )
         self.lm_head = self.lm_head.float()
         self.lm_head_multiplier = config.lm_head_multiplier
@@ -526,7 +520,6 @@ class FalconH1ForCausalLM(nn.Module):
         params_dict = dict(self.named_parameters())
         loaded_params: Set[str] = set()
         for name, loaded_weight in weights:
-
             if "rotary_emb.inv_freq" in name:
                 continue
 

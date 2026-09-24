@@ -13,6 +13,9 @@
 # ==============================================================================
 
 import logging
+import math
+import re
+from array import array
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
 import torch
@@ -22,13 +25,16 @@ from torch import nn
 from sglang.srt.batch_overlap.two_batch_overlap import model_forward_maybe_tbo
 from sglang.srt.configs.model_config import get_mimo_v2_fused_qkv_expected_tp_size
 from sglang.srt.distributed import (
-    get_pp_group,
     tensor_model_parallel_all_reduce,
 )
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.layers.activation import SiluAndMul
+from sglang.srt.layers.aux_hidden_states import (
+    AuxHiddenStateAccumulator,
+    AuxHiddenStatePacker,
+)
 from sglang.srt.layers.communicator import (
     LayerCommunicator,
     LayerScatterModes,
@@ -76,10 +82,11 @@ from sglang.srt.model_loader.weight_utils import (
 )
 from sglang.srt.models.mimo_audio import AudioEncoderMixin, MiMoAudioEncoderConfig
 from sglang.srt.models.mimo_vl import MiMoVisionTransformer, MiMoVLVisionConfig
-from sglang.srt.runtime_context import get_forward, get_parallel, get_server_args
+from sglang.srt.runtime_context import get_exec, get_forward, get_parallel
 from sglang.srt.utils import (
     LazyValue,
     add_prefix,
+    ceil_align,
     is_non_idle_and_non_empty,
     make_layers,
 )
@@ -90,12 +97,37 @@ logger = logging.getLogger(__name__)
 
 
 def load_mimo_v2_qkv_proj_weight(
-    name, param, loaded_weight, expected_fused_tp_size: Optional[int] = None
+    name,
+    param,
+    loaded_weight,
+    expected_fused_tp_size: Optional[int] = None,
+    deferred_scale_inv: Optional[Dict[str, torch.Tensor]] = None,
 ):
-    if loaded_weight.shape == param.shape:
-        # The checkpoint already stores this rank's qkv_proj shard.
+    tp_size = get_parallel().attn_tp_size
+    tp_rank = get_parallel().attn_tp_rank
+    ckpt_tp = expected_fused_tp_size if expected_fused_tp_size is not None else tp_size
+
+    if ckpt_tp == tp_size and loaded_weight.shape == param.shape:
         default_weight_loader(param, loaded_weight)
         return
+
+    if expected_fused_tp_size is not None and expected_fused_tp_size % tp_size != 0:
+        raise ValueError(
+            f"MiMoV2 fused qkv_proj checkpoint is TP={expected_fused_tp_size}-"
+            f"interleaved; got attention tp_size={tp_size} while loading {name}."
+        )
+
+    is_scale_inv = "weight_scale_inv" in name
+
+    if is_scale_inv and ckpt_tp != tp_size:
+        if deferred_scale_inv is not None:
+            deferred_scale_inv[name] = loaded_weight.clone()
+            return
+        raise ValueError(
+            f"qkv_proj scale_inv {name}: shape mismatch "
+            f"{tuple(loaded_weight.shape)} vs {tuple(param.shape)} "
+            f"due to block quantization ceiling; pass deferred_scale_inv dict"
+        )
 
     if loaded_weight.ndim != param.ndim or loaded_weight.shape[1:] != param.shape[1:]:
         raise ValueError(
@@ -103,22 +135,155 @@ def load_mimo_v2_qkv_proj_weight(
             f"expected sharded {tuple(param.shape)}"
         )
 
+    if tp_size == ckpt_tp:
+        fused_shape = (param.shape[0] * tp_size, *param.shape[1:])
+        if tuple(loaded_weight.shape) != fused_shape:
+            raise ValueError(
+                f"qkv_proj weight {name}: unexpected shape "
+                f"{tuple(loaded_weight.shape)}; expected fused {fused_shape} "
+                f"or sharded {tuple(param.shape)}"
+            )
+        default_weight_loader(param, loaded_weight.chunk(tp_size, dim=0)[tp_rank])
+    else:
+        shards_per_rank = ckpt_tp // tp_size
+        shards = loaded_weight.chunk(ckpt_tp, dim=0)
+        merged = torch.cat(
+            shards[tp_rank * shards_per_rank : (tp_rank + 1) * shards_per_rank],
+            dim=0,
+        )
+        default_weight_loader(param, merged)
+
+
+def _get_ckpt_qkv_shard_sizes(config, layer_name, ckpt_tp):
+    m = re.search(r"layers\.(\d+)\.", layer_name)
+    if m is None:
+        return None
+    layer_id = int(m.group(1))
+
+    pattern = getattr(config, "hybrid_layer_pattern", None)
+    is_swa = pattern is not None and pattern[layer_id] == 1
+
+    if is_swa:
+        nh = config.swa_num_attention_heads
+        nkv = config.swa_num_key_value_heads
+        hd = config.swa_head_dim
+        vhd = getattr(config, "swa_v_head_dim", hd)
+    else:
+        nh = config.num_attention_heads
+        nkv = config.num_key_value_heads
+        hd = config.head_dim
+        vhd = getattr(config, "v_head_dim", hd)
+
+    q_per_shard = (nh // ckpt_tp) * hd
+    k_per_shard = max(1, nkv // ckpt_tp) * hd
+    v_per_shard = max(1, nkv // ckpt_tp) * vhd
+    return (q_per_shard, k_per_shard, v_per_shard)
+
+
+def _deinterleave_qkv_shards(shards, q_per_shard, k_per_shard, v_per_shard):
+    all_q, all_k, all_v = [], [], []
+    for s in shards:
+        all_q.append(s[:q_per_shard])
+        all_k.append(s[q_per_shard : q_per_shard + k_per_shard])
+        all_v.append(s[q_per_shard + k_per_shard :])
+    return torch.cat(all_q + all_k + all_v, dim=0)
+
+
+def _resolve_deferred_qkv_scale_inv(
+    params_dict: Dict[str, torch.nn.Parameter],
+    deferred_scale_inv: Dict[str, torch.Tensor],
+    expected_fused_tp_size: int,
+    block_size: int = 128,
+    config=None,
+):
     tp_size = get_parallel().attn_tp_size
     tp_rank = get_parallel().attn_tp_rank
-    if expected_fused_tp_size is not None and tp_size != expected_fused_tp_size:
-        raise ValueError(
-            f"MiMoV2 fused qkv_proj checkpoint is TP={expected_fused_tp_size}-"
-            f"interleaved; got attention tp_size={tp_size} while loading {name}."
+    ckpt_tp = expected_fused_tp_size
+    shards_per_rank = ckpt_tp // tp_size
+
+    for scale_name, ckpt_scale in deferred_scale_inv.items():
+        weight_name = scale_name.replace(".weight_scale_inv", ".weight")
+        if weight_name not in params_dict:
+            raise ValueError(
+                f"Cannot resolve deferred scale_inv {scale_name}: "
+                f"weight {weight_name} not found"
+            )
+
+        weight_param = params_dict[weight_name]
+        scale_param = params_dict[scale_name]
+        weight_data = weight_param.data
+
+        ckpt_scale_shards = ckpt_scale.chunk(ckpt_tp, dim=0)
+        my_scale_shards = ckpt_scale_shards[
+            tp_rank * shards_per_rank : (tp_rank + 1) * shards_per_rank
+        ]
+
+        weight_rows = weight_data.shape[0]
+        rows_per_ckpt_shard = weight_rows // shards_per_rank
+        block_k = ckpt_scale.shape[1]
+
+        device = weight_data.device
+        dequant_shards = []
+        for i, shard_scale in enumerate(my_scale_shards):
+            shard_weight = weight_data[
+                i * rows_per_ckpt_shard : (i + 1) * rows_per_ckpt_shard
+            ]
+            shard_scale_f32 = shard_scale.to(dtype=torch.float32, device=device)
+            scale_expanded = shard_scale_f32.repeat_interleave(
+                block_size, dim=0
+            ).repeat_interleave(block_size, dim=1)
+            scale_expanded = scale_expanded[
+                : shard_weight.shape[0], : shard_weight.shape[1]
+            ]
+            dequant_shards.append(
+                (shard_weight.to(torch.float32) * scale_expanded).to(torch.bfloat16)
+            )
+
+        qkv_sizes = (
+            _get_ckpt_qkv_shard_sizes(config, scale_name, ckpt_tp)
+            if config is not None
+            else None
+        )
+        if qkv_sizes is not None and shards_per_rank > 1:
+            merged_bf16 = _deinterleave_qkv_shards(dequant_shards, *qkv_sizes)
+        else:
+            merged_bf16 = torch.cat(dequant_shards, dim=0)
+
+        n, k = merged_bf16.shape
+        n_pad = ceil_align(n, block_size)
+        k_pad = ceil_align(k, block_size)
+        padded = torch.zeros(
+            n_pad, k_pad, dtype=merged_bf16.dtype, device=merged_bf16.device
+        )
+        padded[:n, :k] = merged_bf16
+        blocks = padded.view(
+            n_pad // block_size, block_size, k_pad // block_size, block_size
+        )
+        amax = blocks.abs().float().amax(dim=(1, 3), keepdim=True).clamp(min=1e-12)
+        finfo = torch.finfo(torch.float8_e4m3fn)
+        new_scale_inv = amax / finfo.max
+        new_fp8 = (
+            (blocks.float() / new_scale_inv)
+            .clamp(min=finfo.min, max=finfo.max)
+            .to(torch.float8_e4m3fn)
         )
 
-    fused_shape = (param.shape[0] * tp_size, *param.shape[1:])
-    if tuple(loaded_weight.shape) != fused_shape:
-        raise ValueError(
-            f"qkv_proj weight {name}: unexpected shape {tuple(loaded_weight.shape)}; "
-            f"expected fused {fused_shape} or sharded {tuple(param.shape)}"
+        n_scale = math.ceil(n / block_size)
+        k_scale = math.ceil(k / block_size)
+        weight_param.data.copy_(new_fp8.view(n_pad, k_pad)[:n, :k].contiguous())
+        default_weight_loader(
+            scale_param,
+            new_scale_inv.view(n_pad // block_size, k_pad // block_size)[
+                :n_scale, :k_scale
+            ].contiguous(),
         )
 
-    default_weight_loader(param, loaded_weight.chunk(tp_size, dim=0)[tp_rank])
+        logger.info(
+            f"Resolved deferred qkv scale_inv {scale_name}: "
+            f"dequant {shards_per_rank} shards -> requant "
+            f"({n_scale}, {k_scale})"
+            + (f", de-interleaved QKV {qkv_sizes}" if qkv_sizes else "")
+        )
 
 
 class MiMoV2MLP(nn.Module):
@@ -157,8 +322,7 @@ class MiMoV2MLP(nn.Module):
         )
         if hidden_act != "silu":
             raise ValueError(
-                f"Unsupported activation: {hidden_act}. "
-                "Only silu is supported for now."
+                f"Unsupported activation: {hidden_act}. Only silu is supported for now."
             )
         self.act_fn = SiluAndMul()
 
@@ -186,7 +350,7 @@ class MoEGate(nn.Module):
     ):
         super().__init__()
         self.is_nextn = is_nextn
-        self.dtype = torch.float32
+        self.dtype = getattr(torch, getattr(config, "moe_router_dtype", "float32"))
         self.weight = nn.Parameter(
             torch.empty((config.n_routed_experts, config.hidden_size), dtype=self.dtype)
         )
@@ -196,7 +360,7 @@ class MoEGate(nn.Module):
                 if quant_config is not None
                 and quant_config.get_name() == "modelopt_fp4"
                 and get_moe_runner_backend().is_flashinfer_trtllm()
-                else self.dtype
+                else torch.float32
             )
             self.e_score_correction_bias = nn.Parameter(
                 torch.empty((config.n_routed_experts), dtype=correction_bias_dtype)
@@ -205,13 +369,18 @@ class MoEGate(nn.Module):
             self.e_score_correction_bias = None
 
     def forward(self, hidden_states):
-        logits = F.linear(hidden_states.to(self.dtype), self.weight, None)
+        if self.dtype != torch.float32 and hidden_states.is_cuda:
+            return torch.mm(
+                hidden_states.to(self.dtype),
+                self.weight.t(),
+                out_dtype=torch.float32,
+            )
 
-        return logits
+        logits = F.linear(hidden_states.to(self.dtype), self.weight, None)
+        return logits.to(torch.float32)
 
 
 class MiMoV2MoE(nn.Module):
-
     def __init__(
         self,
         config: MiMoV2Config,
@@ -248,7 +417,7 @@ class MiMoV2MoE(nn.Module):
         experts_type = get_moe_impl_class(quant_config)
         self.experts = experts_type(
             num_experts=config.n_routed_experts
-            + get_server_args().ep_num_redundant_experts,
+            + get_exec().moe.ep_num_redundant_experts,
             top_k=config.num_experts_per_tok,
             hidden_size=config.hidden_size,
             intermediate_size=config.moe_intermediate_size,
@@ -265,6 +434,7 @@ class MiMoV2MoE(nn.Module):
             num_expert_group=config.n_group,
             topk_group=config.topk_group,
             correction_bias=self.gate.e_score_correction_bias,
+            is_fp4_experts=getattr(quant_config, "is_fp4_experts", False),
             scoring_func=config.scoring_func,
             quant_config=quant_config,
             routed_scaling_factor=1.0,
@@ -283,7 +453,7 @@ class MiMoV2MoE(nn.Module):
             # TODO: we will support tp < ep in the future
             self.ep_size = get_parallel().moe_ep_size
             self.num_experts = (
-                config.n_routed_experts + get_server_args().ep_num_redundant_experts
+                config.n_routed_experts + get_exec().moe.ep_num_redundant_experts
             )
             self.renormalize = config.norm_topk_prob
             self.topk_group = config.topk_group
@@ -323,7 +493,6 @@ class MiMoV2MoE(nn.Module):
     ) -> torch.Tensor:
 
         if hidden_states.shape[0] > 0:
-            # router_logits: (num_tokens, n_experts)
             router_logits = self.gate(hidden_states)
             topk_output = self.topk(hidden_states, router_logits)
         else:
@@ -347,7 +516,7 @@ class MiMoV2MoE(nn.Module):
             topk_output = self.topk(
                 hidden_states,
                 router_logits,
-                num_token_non_padded=forward_batch.num_token_non_padded,
+                num_token_non_padded=forward_batch.moe_num_token_non_padded(),
                 expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
                     layer_id=self.layer_id,
                 ),
@@ -380,7 +549,7 @@ class MiMoV2MoE(nn.Module):
                 state.topk_output = self.topk(
                     hidden_states=hidden_states,
                     router_logits=router_logits,
-                    num_token_non_padded=state.forward_batch.num_token_non_padded,
+                    num_token_non_padded=state.forward_batch.moe_num_token_non_padded(),
                     expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
                         layer_id=self.layer_id,
                     ),
@@ -715,10 +884,16 @@ class MiMoV2DecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
         residual: Optional[torch.Tensor],
+        captured_last_layer_outputs: Optional[AuxHiddenStateAccumulator] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         # Self Attention
-        hidden_states, residual = self.layer_communicator.prepare_attn(
-            hidden_states, residual, forward_batch
+        hidden_states, residual = (
+            self.layer_communicator.prepare_attn_and_capture_last_layer_outputs(
+                hidden_states,
+                residual,
+                forward_batch,
+                captured_last_layer_outputs=captured_last_layer_outputs,
+            )
         )
 
         if hidden_states.shape[0] != 0:
@@ -835,7 +1010,8 @@ class MiMoV2Model(nn.Module):
         self.config = config
         self.padding_idx = getattr(config, "pad_token_id", None)
         self.vocab_size = config.vocab_size
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
+        self.layers_to_capture = []
 
         if self.pp_group.is_first_rank:
             self.embed_tokens = VocabParallelEmbedding(
@@ -895,7 +1071,8 @@ class MiMoV2Model(nn.Module):
             hidden_states = pp_proxy_tensors["hidden_states"]
             residual = pp_proxy_tensors["residual"]
 
-        if forward_batch.can_run_tbo:
+        aux_hidden_states = AuxHiddenStatePacker(len(self.layers_to_capture))
+        if forward_batch.can_run_tbo and not self.layers_to_capture:
             tbo_start_layer = self.start_layer
             tbo_end_layer = self.end_layer
 
@@ -930,7 +1107,21 @@ class MiMoV2Model(nn.Module):
                     hidden_states,
                     forward_batch,
                     residual,
+                    captured_last_layer_outputs=(
+                        aux_hidden_states if i in self.layers_to_capture else None
+                    ),
                 )
+
+        # A draft targeting the final layer ("after layer
+        # num_hidden_layers-1") maps to capture index num_hidden_layers,
+        # past the layer loop; capture the pre-norm output here instead.
+        if (
+            self.pp_group.is_last_rank
+            and self.config.num_hidden_layers in self.layers_to_capture
+        ):
+            aux_hidden_states.append(
+                hidden_states if residual is None else hidden_states + residual
+            )
 
         hidden_states_before_norm = None
         if not self.pp_group.is_last_rank:
@@ -951,7 +1142,9 @@ class MiMoV2Model(nn.Module):
                 else:
                     hidden_states, _ = self.norm(hidden_states, residual)
 
-        return hidden_states, hidden_states_before_norm
+        if len(aux_hidden_states) == 0:
+            return hidden_states, hidden_states_before_norm
+        return hidden_states, hidden_states_before_norm, aux_hidden_states.finalize()
 
     # If this function is called, it should always initialize KV cache scale
     # factors (or else raise an exception). Thus, handled exceptions should
@@ -973,7 +1166,7 @@ class MiMoV2Model(nn.Module):
                 layer_self_attn.attn.v_scale = scaling_factor
             else:
                 raise RuntimeError(
-                    "Self attention has no KV cache scaling " "factor attribute!"
+                    "Self attention has no KV cache scaling factor attribute!"
                 )
 
 
@@ -1011,7 +1204,7 @@ class MiMoV2ForCausalLM(nn.Module, AudioEncoderMixin):
         prefix: str = "",
     ) -> None:
         super().__init__()
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
         self.config = config
         self.quant_config = quant_config
         self._encoder_processor = None  # lazy-created in preprocess_mm_for_encoder
@@ -1027,7 +1220,7 @@ class MiMoV2ForCausalLM(nn.Module, AudioEncoderMixin):
                     config.hidden_size,
                     quant_config=quant_config,
                     prefix=add_prefix("lm_head", prefix),
-                    use_attn_tp_group=get_server_args().enable_dp_lm_head,
+                    use_attn_tp_group=get_parallel().enable_dp_lm_head,
                 )
             else:
                 self.lm_head = PPMissingLayer()
@@ -1038,6 +1231,7 @@ class MiMoV2ForCausalLM(nn.Module, AudioEncoderMixin):
         self.logits_processor = (
             LogitsProcessor(config) if not self.config.encoder_only else None
         )
+        self.capture_aux_hidden_states = False
 
         vision_config = getattr(config, "vision_config", None)
         audio_config = getattr(config, "audio_config", None)
@@ -1075,12 +1269,12 @@ class MiMoV2ForCausalLM(nn.Module, AudioEncoderMixin):
         return self._routed_experts_weights_of_layer.value
 
     def get_input_embedding(self, input_ids: torch.Tensor) -> torch.Tensor:
-        assert (
-            self.model is not None
-        ), "get_input_embedding() is not available in encoder_only mode"
+        assert self.model is not None, (
+            "get_input_embedding() is not available in encoder_only mode"
+        )
         return self.model.get_input_embedding(input_ids)
 
-    def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
+    def pad_input_ids(self, input_ids: array, mm_inputs: MultimodalInputs) -> array:
         pattern = MultiModalityDataPaddingPatternMultimodalTokens()
         return pattern.pad_input_tokens(input_ids, mm_inputs)
 
@@ -1191,11 +1385,20 @@ class MiMoV2ForCausalLM(nn.Module, AudioEncoderMixin):
         input_embeds: torch.Tensor = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> torch.Tensor:
-        assert (
-            not self.config.encoder_only
-        ), "forward() should not be called in encoder_only mode"
+        assert not self.config.encoder_only, (
+            "forward() should not be called in encoder_only mode"
+        )
 
-        if self._is_multimodal:
+        aux_hidden_states = None
+        if self.capture_aux_hidden_states:
+            hidden_states, hidden_states_before_norm, aux_hidden_states = self.model(
+                input_ids,
+                positions,
+                forward_batch,
+                input_embeds,
+                pp_proxy_tensors=pp_proxy_tensors,
+            )
+        elif self._is_multimodal:
             hidden_states, hidden_states_before_norm = general_mm_embed_routine(
                 input_ids=input_ids,
                 forward_batch=forward_batch,
@@ -1220,6 +1423,7 @@ class MiMoV2ForCausalLM(nn.Module, AudioEncoderMixin):
                 self.lm_head,
                 forward_batch,
                 hidden_states_before_norm=hidden_states_before_norm,
+                aux_hidden_states=aux_hidden_states,
             )
         else:
             return hidden_states
@@ -1231,6 +1435,20 @@ class MiMoV2ForCausalLM(nn.Module, AudioEncoderMixin):
     @property
     def end_layer(self):
         return self.model.end_layer if self.model is not None else 0
+
+    def set_dflash_layers_to_capture(self, layer_ids: List[int]):
+        if not self.pp_group.is_last_rank:
+            return
+
+        if layer_ids is None:
+            raise ValueError(
+                "DFLASH requires explicit layer_ids for aux hidden capture."
+            )
+
+        self.capture_aux_hidden_states = True
+        # target_layer_ids are "after layer X" ids; capture before layer X+1,
+        # matching the draft's extract_context_feature (offset=1).
+        self.model.layers_to_capture = [val + 1 for val in layer_ids]
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
@@ -1257,6 +1475,7 @@ class MiMoV2ForCausalLM(nn.Module, AudioEncoderMixin):
 
         params_dict = dict(self.named_parameters())
         skipped_mtp_weights = False
+        deferred_qkv_scale_inv: Dict[str, torch.Tensor] = {}
 
         for name, loaded_weight in weights:
             is_vision_weight = name.startswith(self._VISION_WEIGHT_PREFIXES)
@@ -1277,6 +1496,25 @@ class MiMoV2ForCausalLM(nn.Module, AudioEncoderMixin):
                 if name.startswith("audio_encoder."):
                     name = name[len("audio_encoder.") :]
                 name = self.remap_audio_weight_name(name)
+                if "input_local_transformer" not in name:
+                    name = name.replace("self_attn.out_proj", "self_attn.attn.proj")
+                    audio_stacked = False
+                    for param_name, weight_name, shard_id in [
+                        ("self_attn.attn.qkv_proj", "self_attn.q_proj", "q"),
+                        ("self_attn.attn.qkv_proj", "self_attn.k_proj", "k"),
+                        ("self_attn.attn.qkv_proj", "self_attn.v_proj", "v"),
+                    ]:
+                        if weight_name in name:
+                            name = name.replace(weight_name, param_name)
+                            if name not in params_dict:
+                                break
+                            param = params_dict[name]
+                            weight_loader = param.weight_loader
+                            weight_loader(param, loaded_weight, shard_id)
+                            audio_stacked = True
+                            break
+                    if audio_stacked:
+                        continue
                 if name not in params_dict:
                     logger.warning(
                         f"Audio param {name} not found in params_dict, skipping"
@@ -1361,6 +1599,13 @@ class MiMoV2ForCausalLM(nn.Module, AudioEncoderMixin):
                     skipped_mtp_weights = True
                 continue
 
+            if ".mlp.experts." in name and loaded_weight.dtype == torch.uint8:
+                if name.endswith(".weight_scale"):
+                    name = name + "_inv"
+                    loaded_weight = torch.exp2(loaded_weight.to(torch.float32) - 127.0)
+                elif name.endswith(".weight"):
+                    loaded_weight = loaded_weight.view(torch.int8)
+
             # Support fused qkv_proj checkpoint (Pro format)
             if "qkv_proj" in name:
                 if name in params_dict:
@@ -1369,7 +1614,11 @@ class MiMoV2ForCausalLM(nn.Module, AudioEncoderMixin):
                         self.config
                     )
                     load_mimo_v2_qkv_proj_weight(
-                        name, param, loaded_weight, expected_fused_tp_size
+                        name,
+                        param,
+                        loaded_weight,
+                        expected_fused_tp_size,
+                        deferred_scale_inv=deferred_qkv_scale_inv,
                     )
                 continue
 
@@ -1400,6 +1649,10 @@ class MiMoV2ForCausalLM(nn.Module, AudioEncoderMixin):
                     if weight_name not in name:
                         continue
                     name = name.replace(weight_name, param_name)
+                    # mxfp4 ckpts store expert scales without the `_inv` suffix,
+                    # while Fp8MoEMethod registers them as *_weight_scale_inv.
+                    if name.endswith("weight_scale") and (name + "_inv" in params_dict):
+                        name = name + "_inv"
                     param = params_dict[name]
                     weight_loader = param.weight_loader
                     weight_loader(
@@ -1430,16 +1683,25 @@ class MiMoV2ForCausalLM(nn.Module, AudioEncoderMixin):
                     else:
                         logger.warning(f"Parameter {name} not found in params_dict")
 
+        if deferred_qkv_scale_inv:
+            expected_fused_tp_size = get_mimo_v2_fused_qkv_expected_tp_size(self.config)
+            _resolve_deferred_qkv_scale_inv(
+                params_dict,
+                deferred_qkv_scale_inv,
+                expected_fused_tp_size,
+                config=self.config,
+            )
+
     def get_embed_and_head(self):
-        assert (
-            self.model is not None and self.lm_head is not None
-        ), "get_embed_and_head() is not available in encoder_only mode"
+        assert self.model is not None and self.lm_head is not None, (
+            "get_embed_and_head() is not available in encoder_only mode"
+        )
         return self.model.embed_tokens.weight, self.lm_head.weight
 
     def set_embed_and_head(self, embed, head):
-        assert (
-            self.model is not None and self.lm_head is not None
-        ), "set_embed_and_head() is not available in encoder_only mode"
+        assert self.model is not None and self.lm_head is not None, (
+            "set_embed_and_head() is not available in encoder_only mode"
+        )
         del self.model.embed_tokens.weight
         del self.lm_head.weight
         self.model.embed_tokens.weight = embed

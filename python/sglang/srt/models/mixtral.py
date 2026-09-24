@@ -26,7 +26,6 @@ from torch import nn
 from transformers import MixtralConfig
 
 from sglang.srt.distributed import (
-    get_pp_group,
     tensor_model_parallel_all_reduce,
 )
 from sglang.srt.layers.layernorm import RMSNorm
@@ -270,7 +269,7 @@ class MixtralModel(nn.Module):
         super().__init__()
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
 
         if self.pp_group.is_first_rank:
             self.embed_tokens = VocabParallelEmbedding(
@@ -336,7 +335,6 @@ class MixtralModel(nn.Module):
 
 
 class MixtralForCausalLM(nn.Module):
-
     def __init__(
         self,
         config: MixtralConfig,
@@ -344,7 +342,7 @@ class MixtralForCausalLM(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
         self.config = config
         self.quant_config = quant_config
         self.model = MixtralModel(

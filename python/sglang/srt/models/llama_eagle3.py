@@ -13,6 +13,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+from sglang.srt.runtime_context import get_spec
 from sglang.srt.utils import add_prefix
 
 # Adapted from
@@ -26,7 +27,6 @@ import torch
 from torch import nn
 from transformers import LlamaConfig
 
-from sglang.srt.distributed import get_pp_group
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import QKVParallelLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
@@ -38,7 +38,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.llama import LlamaDecoderLayer, LlamaForCausalLM, LlamaMLP
-from sglang.srt.runtime_context import get_server_args
+from sglang.srt.runtime_context import get_parallel
 
 
 class LlamaDecoderLayer(LlamaDecoderLayer):
@@ -158,6 +158,21 @@ class LlamaModel(nn.Module):
             bias=getattr(config, "bias", False),
         )
 
+        eagle_config = getattr(config, "eagle_config", None) or {}
+        # Normalize the concatenated target-model features once before the FC
+        # projection. This differs from fc_norm, which normalizes each feature
+        # chunk independently before concatenation.
+        self.norm_before_fc = bool(
+            eagle_config.get("norm_before_fc", getattr(config, "norm_before_fc", False))
+        )
+        if self.norm_before_fc:
+            self.input_norm = RMSNorm(
+                self.hidden_size_in * self.num_aux_hidden_states,
+                eps=config.rms_norm_eps,
+            )
+        else:
+            self.input_norm = None
+
         # Per-aux RMSNorm before fc; enabled via `fc_norm` or legacy `use_aux_norm` flag.
         use_fc_norm = getattr(config, "fc_norm", None) or getattr(
             config, "use_aux_norm", False
@@ -212,6 +227,8 @@ class LlamaModel(nn.Module):
 
         hidden_states = forward_batch.spec_info.hidden_states
         if hidden_states.shape[-1] != embeds.shape[-1]:
+            if self.input_norm is not None:
+                hidden_states = self.input_norm(hidden_states)
             if self.fc_norm is not None:
                 chunks = hidden_states.chunk(self.num_aux_hidden_states, dim=-1)
                 hidden_states = torch.cat(
@@ -253,12 +270,12 @@ class LlamaForCausalLMEagle3(LlamaForCausalLM):
         nn.Module.__init__(self)
         self.config = config
         self.quant_config = quant_config
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
 
         # Cache draft SWA size from server args once; consumed both by the post-init
         # attention patch below and by `get_attention_sliding_window_size` later.
         self._draft_window_size: Optional[int] = (
-            get_server_args().speculative_draft_window_size
+            get_spec().speculative_draft_window_size
         )
 
         self.model = LlamaModel(

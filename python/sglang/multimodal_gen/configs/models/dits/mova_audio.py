@@ -4,13 +4,10 @@
 from dataclasses import dataclass, field
 
 from sglang.multimodal_gen.configs.models.dits.base import DiTArchConfig, DiTConfig
-from sglang.multimodal_gen.configs.models.fsdp import is_block
 
 
 @dataclass
 class MOVAAudioArchConfig(DiTArchConfig):
-    _fsdp_shard_conditions: list = field(default_factory=lambda: [is_block])
-
     param_names_mapping: dict = field(
         default_factory=lambda: {
             r"^blocks\.(\d+)\.ffn\.0\.(.*)$": r"blocks.\1.ffn.fc_in.\2",
@@ -53,9 +50,9 @@ class MOVAAudioArchConfig(DiTArchConfig):
         self.hidden_size = self.dim
         self.num_attention_heads = self.num_heads
         self.num_channels_latents = self.out_dim
-        assert (
-            not self.has_image_input
-        ), "has_image_input must be False; it's a config from Diffsynth Studio, which means the model uses CLIP for image encoding (we don't)."
+        assert not self.has_image_input, (
+            "has_image_input must be False; it's a config from Diffsynth Studio, which means the model uses CLIP for image encoding (we don't)."
+        )
 
 
 @dataclass

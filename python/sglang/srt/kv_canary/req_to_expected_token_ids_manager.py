@@ -4,7 +4,7 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
-from sglang.jit_kernel.kv_canary.scatter_req_token_ids import (
+from sglang.kernels.ops.kv_canary.scatter_req_token_ids import (
     launch_scatter_req_token_ids_kernel,
 )
 from sglang.srt.utils.common import flatten_arrays_to_int64_tensor

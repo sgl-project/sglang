@@ -21,8 +21,9 @@ def select_best_resolution(image_size, candidate_resolutions):
 
     for width, height in candidate_resolutions:
         scale = min(width / original_width, height / original_height)
-        downscaled_width, downscaled_height = int(original_width * scale), int(
-            original_height * scale
+        downscaled_width, downscaled_height = (
+            int(original_width * scale),
+            int(original_height * scale),
         )
         effective_resolution = min(
             downscaled_width * downscaled_height, original_width * original_height
@@ -205,9 +206,9 @@ class DeepseekVLV2Processor(ProcessorMixin):
         images_seq_mask += seq_mask
         images_spatial_crop += spatial_crop
 
-        assert len(tokenized_data) == len(
-            images_seq_mask
-        ), f"format_messages_v2: tokenized_str's length {len(tokenized_str)} is not equal to imags_seq_mask's length {len(images_seq_mask)}"
+        assert len(tokenized_data) == len(images_seq_mask), (
+            f"format_messages_v2: tokenized_str's length {len(tokenized_str)} is not equal to imags_seq_mask's length {len(images_seq_mask)}"
+        )
 
         return (
             tokenized_data,
@@ -274,9 +275,9 @@ class DeepseekVLV2Processor(ProcessorMixin):
                 - num_image_tokens (List[int]): the number of image tokens
         """
 
-        assert (
-            prompt is None or conversations is None
-        ), "prompt and conversations cannot be used at the same time."
+        assert prompt is None or conversations is None, (
+            "prompt and conversations cannot be used at the same time."
+        )
 
         (
             tokenized_str,
@@ -458,9 +459,9 @@ class DeepseekVLV2Processor(ProcessorMixin):
             tokenized_str = tokenized_str + [self.eos_id]
             images_seq_mask = images_seq_mask + [False]
 
-        assert len(tokenized_str) == len(
-            images_seq_mask
-        ), f"tokenize_with_images func: tokenized_str's length {len(tokenized_str)} is not equal to imags_seq_mask's length {len(images_seq_mask)}"
+        assert len(tokenized_str) == len(images_seq_mask), (
+            f"tokenize_with_images func: tokenized_str's length {len(tokenized_str)} is not equal to imags_seq_mask's length {len(images_seq_mask)}"
+        )
 
         return tokenized_str, images_list, images_seq_mask, images_spatial_crop
 
@@ -547,7 +548,6 @@ class DeepseekVL2MlpProjectorConfig(PretrainedConfig):
 
 
 class DeepseekV2Config(PretrainedConfig):
-
     model_type = "deepseek_v2"
     keys_to_ignore_at_inference = ["past_key_values"]
 
