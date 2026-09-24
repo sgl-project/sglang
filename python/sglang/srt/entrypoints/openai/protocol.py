@@ -1670,7 +1670,7 @@ class ResponsesRequest(BaseModel):
         description="The request_id related to this request. If the caller does not set it, a random uuid will be generated.",
     )
     session_id: Optional[str] = None
-    priority: int = Field(default=0, description="Request priority")
+    priority: Optional[int] = Field(default=None, description="Request priority")
     extra_key: Optional[str] = Field(
         default=None,
         description="Extra key for caller-defined request classification",
