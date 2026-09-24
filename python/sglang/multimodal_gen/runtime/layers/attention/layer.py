@@ -178,6 +178,64 @@ def _prepare_sdpa_mask(
     return (mask - 1.0) * torch.finfo(dtype).max
 
 
+def _attention_with_compacted_kv_prefix(
+    attn_impl,
+    q: torch.Tensor,
+    k_prefix: torch.Tensor,
+    v_prefix: torch.Tensor,
+    k_suffix: torch.Tensor,
+    v_suffix: torch.Tensor,
+    prefix_lengths: list[int],
+    valid_suffix_len: int,
+    attn_metadata,
+) -> torch.Tensor:
+    """Remove padded KV rows before a backend without key-mask support."""
+    if len(prefix_lengths) != q.shape[0]:
+        raise ValueError("Prefix lengths must match the attention batch size")
+    if valid_suffix_len < 0 or valid_suffix_len > k_suffix.shape[1]:
+        raise ValueError("Valid suffix length exceeds the gathered KV length")
+
+    outputs = []
+    for batch_index, prefix_len in enumerate(prefix_lengths):
+        if prefix_len < 0 or prefix_len > k_prefix.shape[1]:
+            raise ValueError("Valid prefix length exceeds the cached KV length")
+        k = torch.cat(
+            [
+                k_prefix[batch_index : batch_index + 1, :prefix_len],
+                k_suffix[batch_index : batch_index + 1, :valid_suffix_len],
+            ],
+            dim=1,
+        )
+        v = torch.cat(
+            [
+                v_prefix[batch_index : batch_index + 1, :prefix_len],
+                v_suffix[batch_index : batch_index + 1, :valid_suffix_len],
+            ],
+            dim=1,
+        )
+        outputs.append(
+            attn_impl.forward(q[batch_index : batch_index + 1], k, v, attn_metadata)
+        )
+    return torch.cat(outputs, dim=0)
+
+
+def _should_compact_npu_kv_prefix(
+    *,
+    device_type: str,
+    has_key_mask: bool,
+    valid_prefix_lengths: list[int] | None,
+    valid_suffix_len: int | None,
+) -> bool:
+    # A masked NPU call always lands in SDPA (the varlen FastAttn path is
+    # CUDA-only), so the resolved backend cannot consume this key mask.
+    return (
+        device_type == "npu"
+        and has_key_mask
+        and valid_prefix_lengths is not None
+        and valid_suffix_len is not None
+    )
+
+
 def build_varlen_mask_meta(
     key_mask: torch.Tensor,
 ) -> dict:
@@ -1916,6 +1974,8 @@ class USPAttention(nn.Module):
         k_suffix: torch.Tensor,
         v_suffix: torch.Tensor,
         attn_mask: torch.Tensor | None = None,
+        valid_prefix_lengths: list[int] | None = None,
+        valid_suffix_len: int | None = None,
     ) -> torch.Tensor:
         """Attention with replicated K/V prefix supplied separately.
 
@@ -1959,6 +2019,8 @@ class USPAttention(nn.Module):
             v_suffix,
             ctx_attn_metadata,
             attn_mask=attn_mask,
+            valid_prefix_lengths=valid_prefix_lengths,
+            valid_suffix_len=valid_suffix_len,
         )
 
     def _forward_with_replicated_kv_prefix(
@@ -1998,6 +2060,8 @@ class USPAttention(nn.Module):
         v_shard: torch.Tensor,
         ctx_attn_metadata,
         attn_mask: torch.Tensor | None = None,
+        valid_prefix_lengths: list[int] | None = None,
+        valid_suffix_len: int | None = None,
     ) -> torch.Tensor:
         """split form avoids materializing full K/V before Ulysses all-to-all"""
         u_rank = get_ulysses_parallel_rank()
@@ -2024,15 +2088,33 @@ class USPAttention(nn.Module):
         k_rep = k_rep[:, :, h_start:h_end, :].contiguous()
         v_rep = v_rep[:, :, h_start:h_end, :].contiguous()
 
-        out = self._replicated_kv_attention(
-            q,
-            k_shard,
-            v_shard,
-            k_rep,
-            v_rep,
-            ctx_attn_metadata,
-            attn_mask=attn_mask,
-        )
+        if _should_compact_npu_kv_prefix(
+            device_type=q.device.type,
+            has_key_mask=attn_mask is not None,
+            valid_prefix_lengths=valid_prefix_lengths,
+            valid_suffix_len=valid_suffix_len,
+        ):
+            out = _attention_with_compacted_kv_prefix(
+                self.attn_impl,
+                q,
+                k_rep,
+                v_rep,
+                k_shard,
+                v_shard,
+                valid_prefix_lengths,
+                valid_suffix_len,
+                ctx_attn_metadata,
+            )
+        else:
+            out = self._replicated_kv_attention(
+                q,
+                k_shard,
+                v_shard,
+                k_rep,
+                v_rep,
+                ctx_attn_metadata,
+                attn_mask=attn_mask,
+            )
         return _usp_output_all_to_all(out, head_dim=2)
 
     def _forward_with_replicated_suffix(

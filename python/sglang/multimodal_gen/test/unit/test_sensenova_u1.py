@@ -348,7 +348,7 @@ def test_sensenova_u1_cache_dit_requires_an_explicit_guidance_profile():
         )
 
 
-def test_sensenova_u1_cache_dit_is_disabled_with_sequence_parallelism(
+def test_sensenova_u1_cache_dit_uses_sequence_parallel_group(
     monkeypatch,
 ):
     calls = _install_sensenova_cache_dit_stub(monkeypatch)
@@ -362,6 +362,11 @@ def test_sensenova_u1_cache_dit_is_disabled_with_sequence_parallelism(
     )
     server_args = _cache_dit_server_args()
     server_args.sp_degree = 2
+    sp_process_group = object()
+    monkeypatch.setattr(
+        "sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.sensenova_u1.stages.generation.get_sp_group",
+        lambda: SimpleNamespace(device_group=sp_process_group),
+    )
 
     stage._maybe_enable_cache_dit(
         _cache_dit_batch(),
@@ -370,7 +375,9 @@ def test_sensenova_u1_cache_dit_is_disabled_with_sequence_parallelism(
         cfg_interval=(0.0, 1.0),
     )
 
-    assert calls == {"enable": [], "disable": [], "refresh": []}
+    assert len(calls["enable"]) == 1
+    assert calls["enable"][0][2]["sp_group"] is sp_process_group
+    assert calls["enable"][0][2]["tp_group"] is None
 
 
 class _CacheDitRecordingBlock(torch.nn.Module):
@@ -3377,15 +3384,29 @@ def test_sensenova_u1_lora_target_modules(overrides, expected):
     assert server_args.lora_target_modules == expected
 
 
-def test_sensenova_pixel_head_sp_matches_unsharded_decoder(monkeypatch):
+@pytest.mark.parametrize(
+    ("token_h", "token_w", "pixel_size", "hidden_size"),
+    [(3, 3, 1, 3), (9, 13, 32, 8)],
+)
+def test_sensenova_pixel_head_sp_matches_unsharded_decoder(
+    monkeypatch, token_h, token_w, pixel_size, hidden_size
+):
     from sglang.multimodal_gen.runtime.distributed.sp_shard_utils import (
         SpShard,
         shard_like,
     )
+    from sglang.multimodal_gen.runtime.models.sensenova_u1.neo_unify.modeling_fm_modules import (
+        ConvDecoder,
+    )
 
-    head = torch.nn.Conv2d(3, 3, kernel_size=3, padding=1, bias=False)
-    with torch.no_grad():
-        head.weight.fill_(1 / 9)
+    if pixel_size == 1:
+        head = torch.nn.Conv2d(3, 3, kernel_size=3, padding=1, bias=False)
+        with torch.no_grad():
+            head.weight.fill_(1 / 9)
+    else:
+        with torch.random.fork_rng(devices=[]):
+            torch.manual_seed(7)
+            head = ConvDecoder(hidden_size, hidden_dim=8)
 
     model = SimpleNamespace(
         language_model=SimpleNamespace(
@@ -3395,14 +3416,20 @@ def test_sensenova_pixel_head_sp_matches_unsharded_decoder(monkeypatch):
         ),
         use_pixel_head=True,
         downsample_ratio=1,
-        patch_size=1,
+        patch_size=pixel_size,
         fm_modules={"fm_head": head},
         config=SimpleNamespace(t_eps=0.02),
     )
-    hidden = torch.arange(27, dtype=torch.float32).reshape(1, 9, 3)
-    z = torch.zeros(1, 9, 3)
+    image_token_num = token_h * token_w
+    hidden = (
+        torch.arange(image_token_num * hidden_size, dtype=torch.float32).reshape(
+            1, image_token_num, hidden_size
+        )
+        / 100
+    )
+    z = torch.zeros(1, image_token_num, pixel_size * pixel_size * 3)
     t = torch.tensor(0.25)
-    full_shard = SpShard(9, 9, 0, 1, 0)
+    full_shard = SpShard(image_token_num, image_token_num, 0, 1, 0)
     monkeypatch.setattr(modeling_neo_chat, "_build_image_shard", lambda _: full_shard)
 
     def predict(local_hidden, local_z):
@@ -3415,21 +3442,112 @@ def test_sensenova_pixel_head_sp_matches_unsharded_decoder(monkeypatch):
             t,
             local_z,
             image_token_num=local_hidden.shape[1],
-            image_size=(3, 3),
+            image_size=(token_w * pixel_size, token_h * pixel_size),
         )
 
     expected = predict(hidden, z)
+    local_len = (image_token_num + 1) // 2
     for rank in range(2):
-        shard = SpShard(9, 5, 1, 2, rank)
+        shard = SpShard(
+            image_token_num, local_len, 2 * local_len - image_token_num, 2, rank
+        )
         local_hidden = shard_like(hidden, shard, dim=1)
         local_z = shard_like(z, shard, dim=1)
-        monkeypatch.setattr(modeling_neo_chat, "_build_image_shard", lambda _: shard)
+        monkeypatch.setattr(
+            modeling_neo_chat, "_build_image_shard", lambda _, shard=shard: shard
+        )
 
-        def gather(local, original_length):
-            assert original_length == 9
+        def gather(local, original_length, local_hidden=local_hidden):
+            assert original_length == image_token_num
             torch.testing.assert_close(local, local_hidden)
             return hidden
 
         monkeypatch.setattr(modeling_neo_chat, "_sp_gather_tokens", gather)
         actual = predict(local_hidden, local_z)
         torch.testing.assert_close(actual, shard_like(expected, shard, dim=1))
+
+
+def test_sensenova_compacted_sp_kv_matches_key_mask_attention():
+    from sglang.multimodal_gen.runtime.layers.attention.layer import (
+        _attention_with_compacted_kv_prefix,
+    )
+
+    class AttentionImpl:
+        def forward(self, q, k, v, _metadata):
+            return F.scaled_dot_product_attention(
+                q.transpose(1, 2),
+                k.transpose(1, 2),
+                v.transpose(1, 2),
+            ).transpose(1, 2)
+
+    with torch.random.fork_rng(devices=[]):
+        torch.manual_seed(19)
+        q = torch.randn(2, 5, 2, 8)
+        k_prefix = torch.randn(2, 4, 2, 8)
+        v_prefix = torch.randn(2, 4, 2, 8)
+        k_suffix = torch.randn(2, 6, 2, 8)
+        v_suffix = torch.randn(2, 6, 2, 8)
+
+    prefix_lengths = [2, 4]
+    valid_suffix_len = 5
+    key_mask = torch.cat(
+        [
+            torch.arange(4)[None, :] < torch.tensor(prefix_lengths)[:, None],
+            (torch.arange(6) < valid_suffix_len)[None, :].expand(2, -1),
+        ],
+        dim=1,
+    )
+    expected = F.scaled_dot_product_attention(
+        q.transpose(1, 2),
+        torch.cat([k_prefix, k_suffix], dim=1).transpose(1, 2),
+        torch.cat([v_prefix, v_suffix], dim=1).transpose(1, 2),
+        attn_mask=key_mask[:, None, None, :],
+    ).transpose(1, 2)
+    actual = _attention_with_compacted_kv_prefix(
+        AttentionImpl(),
+        q,
+        k_prefix,
+        v_prefix,
+        k_suffix,
+        v_suffix,
+        prefix_lengths,
+        valid_suffix_len,
+        None,
+    )
+    torch.testing.assert_close(actual, expected)
+
+
+def test_sensenova_npu_kv_compaction_ignores_resolved_backend():
+    """A masked SP call on NPU must compact the padded KV rows whatever backend
+    resolved; NPU never resolves FA, so a backend gate leaves it unreachable."""
+    from sglang.multimodal_gen.runtime.layers.attention.layer import (
+        _should_compact_npu_kv_prefix,
+    )
+
+    assert _should_compact_npu_kv_prefix(
+        device_type="npu",
+        has_key_mask=True,
+        valid_prefix_lengths=[3, 5],
+        valid_suffix_len=5,
+    )
+    # CUDA keeps the mask path; its varlen FA consumes the mask directly.
+    assert not _should_compact_npu_kv_prefix(
+        device_type="cuda",
+        has_key_mask=True,
+        valid_prefix_lengths=[3, 5],
+        valid_suffix_len=5,
+    )
+    # No mask means no padding to drop; no lengths means the cached prefix
+    # cannot be split per batch row.
+    assert not _should_compact_npu_kv_prefix(
+        device_type="npu",
+        has_key_mask=False,
+        valid_prefix_lengths=[3, 5],
+        valid_suffix_len=5,
+    )
+    assert not _should_compact_npu_kv_prefix(
+        device_type="npu",
+        has_key_mask=True,
+        valid_prefix_lengths=None,
+        valid_suffix_len=None,
+    )

@@ -1173,6 +1173,8 @@ class Qwen3Attention(nn.Module):
                 k_suffix,
                 v_suffix,
                 attn_mask=key_mask,
+                valid_prefix_lengths=prefix_lengths_host,
+                valid_suffix_len=int(image_valid_len),
             )
             attn_output = attn_output.reshape(*input_shape, -1).contiguous()
             attn_output = _linear_output(self.o_proj_mot_gen, attn_output)

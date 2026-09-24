@@ -987,34 +987,50 @@ class NEOChatModel(PreTrainedModel):
             token_h = image_size[1] // (self.patch_size * merge_size)
             token_w = image_size[0] // (self.patch_size * merge_size)
             full_image_token_num = token_h * token_w
+            image_shard = _build_image_shard(full_image_token_num)
 
-            # The convolution mixes neighboring image tokens, including tokens
-            # on different SP ranks. Decode the complete grid on every rank,
-            # then restore the sequence shard used by the denoising loop.
+            # Measured one token row of receptive field in the ConvDecoder, so
+            # two rows of tile overlap keep each rank identical to a full-grid decode.
             image_hidden = outputs.last_hidden_state[:, -image_token_num:]
             image_hidden = _sp_gather_tokens(image_hidden, full_image_token_num)
+            if image_shard.local_real_len == 0:
+                x_pred = torch.zeros_like(z)
+            else:
+                first_token = image_shard.sp_rank * image_shard.local_len
+                last_token = first_token + image_shard.local_real_len
+                first_row = first_token // token_w
+                last_row = (last_token + token_w - 1) // token_w
+                tile_first_row = max(0, first_row - 2)
+                tile_last_row = min(token_h, last_row + 2)
+                tile_h = tile_last_row - tile_first_row
+                image_tile = image_hidden.reshape(B, token_h, token_w, -1)[
+                    :, tile_first_row:tile_last_row
+                ]
+                img_2d = image_tile.permute(0, 3, 1, 2).contiguous()
+                smoothed_img_2d = self.fm_modules["fm_head"](img_2d)
 
-            img_reshaped = image_hidden.reshape(B, token_h, token_w, -1)
-            img_2d = torch.einsum("b h w c -> b c h w", img_reshaped)
-            img_2d = img_2d.contiguous().view(B, -1, token_h, token_w)
-
-            smoothed_img_2d = self.fm_modules["fm_head"](img_2d)
-
-            smoothed_reshaped = smoothed_img_2d.view(
-                B,
-                3,
-                token_h,
-                self.patch_size * merge_size,
-                token_w,
-                self.patch_size * merge_size,
-            )
-            smoothed_reshaped = torch.einsum(
-                "b c h p w q -> b h w p q c", smoothed_reshaped
-            )
-            out_1d = smoothed_reshaped.contiguous().view(
-                B, L, self.patch_size * merge_size * self.patch_size * merge_size * 3
-            )
-            x_pred = shard_like(out_1d, _build_image_shard(full_image_token_num), dim=1)
+                pixel_size = self.patch_size * merge_size
+                tile_tokens = smoothed_img_2d.reshape(
+                    B, 3, tile_h, pixel_size, token_w, pixel_size
+                ).permute(0, 2, 4, 3, 5, 1)
+                tile_tokens = tile_tokens.reshape(
+                    B, tile_h * token_w, pixel_size * pixel_size * 3
+                )
+                x_pred = tile_tokens.narrow(
+                    1,
+                    first_token - tile_first_row * token_w,
+                    image_shard.local_real_len,
+                )
+                if image_shard.local_pad:
+                    x_pred = torch.cat(
+                        [
+                            x_pred,
+                            x_pred.new_zeros(
+                                B, image_shard.local_pad, x_pred.shape[-1]
+                            ),
+                        ],
+                        dim=1,
+                    )
         else:
             if self.use_deep_fm_head:
                 x_pred = self.fm_modules["fm_head"](

@@ -137,8 +137,10 @@ def _patch_cache_dit_similarity():
             mean_diff = (t1 - t2).abs().mean()
             mean_t1 = t1.abs().mean()
 
-        dist.all_reduce(mean_diff, op=dist.ReduceOp.AVG, group=target_group)
-        dist.all_reduce(mean_t1, op=dist.ReduceOp.AVG, group=target_group)
+        # The ratio of global sums equals the ratio of global averages. SUM
+        # is supported by HCCL as well as NCCL, while AVG is not universal.
+        dist.all_reduce(mean_diff, op=dist.ReduceOp.SUM, group=target_group)
+        dist.all_reduce(mean_t1, op=dist.ReduceOp.SUM, group=target_group)
 
         diff = (mean_diff / mean_t1).item()
         self.add_residual_diff(diff)

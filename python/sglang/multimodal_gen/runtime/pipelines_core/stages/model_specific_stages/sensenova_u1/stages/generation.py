@@ -25,6 +25,7 @@ from sglang.multimodal_gen.configs.sensenova_u1 import (
     resolve_sensenova_u1_edit_auto_size,
 )
 from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
+from sglang.multimodal_gen.runtime.distributed import get_sp_group, get_tp_group
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 from sglang.multimodal_gen.runtime.models.sensenova_u1.neo_unify.utils import (
     smart_resize,
@@ -271,8 +272,6 @@ class SenseNovaU1GenerationStage(PipelineStage):
         """Why a request that asked for Cache-DiT cannot mount it; None when it can."""
         if server_args.enable_breakable_cuda_graph:
             return "breakable CUDA graphs are enabled"
-        if int(getattr(server_args, "sp_degree", 1) or 1) > 1:
-            return "SenseNova sequence parallelism is enabled"
         if guidance_profile.branch_count > 2:
             return "three conditioning branches are not supported"
         # cache-dit's separate-CFG context expects a stable pair of forwards per
@@ -317,10 +316,16 @@ class SenseNovaU1GenerationStage(PipelineStage):
             self._unmount_cache_dit()
             return
 
-        self._mount_or_refresh_cache_dit(batch, guidance_profile=guidance_profile)
+        self._mount_or_refresh_cache_dit(
+            batch, server_args=server_args, guidance_profile=guidance_profile
+        )
 
     def _mount_or_refresh_cache_dit(
-        self, batch: Req, *, guidance_profile: SenseNovaGuidanceProfile
+        self,
+        batch: Req,
+        *,
+        server_args: ServerArgs,
+        guidance_profile: SenseNovaGuidanceProfile,
     ) -> None:
         """Reuse the mounted Cache-DiT context, or mount one for this request."""
         from sglang.multimodal_gen.runtime.cache.cache_dit_integration import (
@@ -372,6 +377,7 @@ class SenseNovaU1GenerationStage(PipelineStage):
             transformer,
             config=config,
             has_separate_cfg=has_separate_cfg,
+            server_args=server_args,
         )
         self._cache_dit_enabled = True
         self._cache_dit_active_key = desired_key
@@ -384,6 +390,7 @@ class SenseNovaU1GenerationStage(PipelineStage):
         *,
         config: CacheDitConfig,
         has_separate_cfg: bool,
+        server_args: ServerArgs,
     ) -> None:
         """Enable Cache-DiT on a transformer, rolling back a partial mount."""
         from sglang.multimodal_gen.runtime.cache.cache_dit_integration import (
@@ -402,10 +409,22 @@ class SenseNovaU1GenerationStage(PipelineStage):
         )
         transformer._sensenova_cache_dit_attention_type = attention_type
         try:
+            sp_group = (
+                get_sp_group().device_group
+                if (server_args.sp_degree or 1) > 1
+                else None
+            )
+            tp_group = (
+                get_tp_group().device_group
+                if (server_args.tp_size or 1) > 1
+                else None
+            )
             enable_cache_on_transformer(
                 transformer,
                 config,
                 model_name="sensenova-qwen3-image",
+                sp_group=sp_group,
+                tp_group=tp_group,
                 # A full-interval two-branch schedule issues a stable pair at
                 # every step; timestep-gated and three-branch schedules were
                 # rejected before mounting.
