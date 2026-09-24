@@ -4074,6 +4074,18 @@ def get_eager_max_batch_size(max_batch_size: int) -> int:
     return ceil_align(max_batch_size, get_cp_padding_align_size())
 
 
+def get_max_dummy_batch_size(max_batch_size: int) -> int:
+    """Largest batch a warmup or graph-capture forward can present.
+
+    The eager warmup and the cuda-graph capture grid round up by different
+    rules, so batch-indexed buffers must cover both ceilings.
+    """
+    return max(
+        get_cuda_graph_max_batch_size(max_batch_size),
+        get_eager_max_batch_size(max_batch_size),
+    )
+
+
 def find_local_repo_dir(repo_id: str, revision: Optional[str] = None) -> Optional[str]:
     import huggingface_hub as hf
 

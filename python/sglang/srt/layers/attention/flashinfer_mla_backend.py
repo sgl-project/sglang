@@ -46,7 +46,7 @@ from sglang.srt.speculative.spec_utils import (
     generate_draft_decode_kv_indices,
 )
 from sglang.srt.utils import (
-    get_cuda_graph_max_batch_size,
+    get_max_dummy_batch_size,
     is_flashinfer_available,
     next_power_of_2,
 )
@@ -259,7 +259,7 @@ class FlashInferMLAAttnBackend(AttentionBackend):
         # The eager / cuda-graph runners pad the request count to the
         # attn-tp (and cp) alignment under MLP sync (DP attention, DeepEP,
         # MegaMoE), so the dummy batch can exceed req_to_token_pool.size.
-        max_bs = get_cuda_graph_max_batch_size(model_runner.req_to_token_pool.size)
+        max_bs = get_max_dummy_batch_size(model_runner.req_to_token_pool.size)
         if kv_indptr_buf is None:
             self.kv_indptr = torch.zeros(
                 (max_bs + 1,), dtype=torch.int32, device=model_runner.device
@@ -1181,8 +1181,7 @@ class FlashInferMLAMultiStepDraftBackend:
         self.generate_draft_decode_kv_indices = generate_draft_decode_kv_indices
 
         max_bs = (
-            get_cuda_graph_max_batch_size(model_runner.req_to_token_pool.size)
-            * self.topk
+            get_max_dummy_batch_size(model_runner.req_to_token_pool.size) * self.topk
         )
         self.kv_indptr = torch.zeros(
             (
