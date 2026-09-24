@@ -258,6 +258,40 @@ def test_component_offload_warmup_preload_failure_leaves_component_offloaded(
     device_module.empty_cache.assert_called()
 
 
+def test_component_offload_warmup_preload_sizes_cast_to_target_dtype(monkeypatch):
+    """A wider target dtype must count toward the preload budget, not host bytes."""
+    module = torch.nn.Linear(64, 64, bias=False).to(dtype=torch.float16)
+    host_bytes = sum(tensor.nbytes for tensor in module.parameters())
+    cast_bytes = sum(
+        tensor.numel() * torch.float32.itemsize for tensor in module.parameters()
+    )
+    assert cast_bytes == 2 * host_bytes
+    # Enough free memory for the host copy + margin, but not for the cast copy.
+    free_bytes = host_bytes + (1 * 1024**3) + 1
+    device_module = SimpleNamespace(
+        is_available=lambda: True,
+        empty_cache=Mock(),
+        mem_get_info=lambda: (free_bytes, 16 * 1024**3),
+    )
+    monkeypatch.setattr(torch, "get_device_module", lambda: device_module)
+    strategy = ComponentOffloadStrategy()
+    strategy.prepare_for_use = Mock()
+    strategy.wait_for_use = Mock()
+    strategy.finish_use = Mock()
+    use = ComponentUse(
+        stage_name="DenoisingStage",
+        component_name="transformer",
+        preferred_ready_after_request=True,
+        target_dtype=torch.float32,
+    )
+    state = ResidencyState(batch_is_warmup=True)
+
+    strategy.finish_request(module, use, state, preferred=True)
+
+    strategy.prepare_for_use.assert_not_called()
+    strategy.finish_use.assert_called_once_with(module, use, state)
+
+
 def test_component_offload_warmup_preload_partial_oom_moves_module_to_cpu():
     if torch.cuda.is_available():
         device = torch.device("cuda")

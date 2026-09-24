@@ -71,12 +71,27 @@ def _module_ready_on_local_device(
     return dtype is None or tensor.dtype == dtype
 
 
-def _cpu_module_nbytes(module: nn.Module) -> int:
-    return sum(
-        tensor.nbytes
-        for tensor in (*module.parameters(), *module.buffers())
-        if tensor.device.type == "cpu"
-    )
+def _cpu_module_nbytes(
+    module: nn.Module, *, dtype: torch.dtype | None = None
+) -> int:
+    """Bytes the host tensors would occupy after an optional device cast.
+
+    ``module.to(device, dtype=...)`` only casts floating-point tensors, so
+    integer buffers keep their current nbytes.
+    """
+    total = 0
+    for tensor in (*module.parameters(), *module.buffers()):
+        if tensor.device.type != "cpu":
+            continue
+        if (
+            dtype is None
+            or not tensor.is_floating_point()
+            or dtype.itemsize == tensor.element_size()
+        ):
+            total += tensor.nbytes
+        else:
+            total += tensor.numel() * dtype.itemsize
+    return total
 
 
 def _device_free_bytes() -> int | None:
@@ -252,9 +267,9 @@ class ComponentOffloadStrategy(ComponentResidencyStrategy):
             _empty_device_cache()
             free_bytes = _device_free_bytes()
             try:
-                if free_bytes is None or _cpu_module_nbytes(module) <= (
-                    free_bytes - _WARMUP_PRELOAD_MARGIN_BYTES
-                ):
+                if free_bytes is None or _cpu_module_nbytes(
+                    module, dtype=use.target_dtype
+                ) <= (free_bytes - _WARMUP_PRELOAD_MARGIN_BYTES):
                     self.prepare_for_use(module, use, state)
                     self.wait_for_use(module, use, state)
                     return
