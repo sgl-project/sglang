@@ -14,7 +14,6 @@ from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
-    get_tp_cpu_bind,
     popen_launch_server,
 )
 
@@ -76,16 +75,11 @@ class TestAutoRoundCPU(CustomTestCase):
                     "--mem-fraction-static",
                     "0.3",
                 ]
-                env = None
-                bind = get_tp_cpu_bind(1)
-                if bind is not None:
-                    env = {"SGLANG_CPU_OMP_THREADS_BIND": bind}
                 process = popen_launch_server(
                     model,
                     self.base_url,
                     timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
                     other_args=other_args,
-                    env=env,
                     device=device,
                 )
 
