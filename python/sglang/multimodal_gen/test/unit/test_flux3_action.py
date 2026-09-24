@@ -591,3 +591,36 @@ def test_fp8r_checkpoint_loads_fused_rowwise_linears():
     torch.testing.assert_close(
         out.float(), x.float() @ expected.T, atol=5e-2, rtol=5e-2
     )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs the CUDA fused kernel")
+def test_fused_qknorm_rope_matches_the_eager_rotation():
+    """The fused kernel must use the same [cos | sin] cache layout and interleaved pairs."""
+    from sglang.kernels.ops.diffusion import fused_inplace_qknorm_rope
+    from sglang.multimodal_gen.runtime.models.dits.flux3 import (
+        Flux3QKNorm,
+        apply_rope,
+        rope_cos_sin,
+    )
+
+    torch.manual_seed(0)
+    norm = Flux3QKNorm(128).cuda().bfloat16()
+    torch.nn.init.normal_(norm.query_norm.scale, mean=1.0, std=0.1)
+    torch.nn.init.normal_(norm.key_norm.scale, mean=1.0, std=0.1)
+    ids = torch.randint(0, 50, (1, 7, 4)).cuda()
+    rope = rope_cos_sin(ids, (32, 32, 32, 32), 10000)
+    qkv = torch.randn(1, 7, 3, 2, 128, device="cuda", dtype=torch.bfloat16)
+    q, k, v = qkv.unbind(2)
+    expected_q, expected_k = apply_rope(*norm(q, k, v), rope)
+    fused_inplace_qknorm_rope(
+        q=q.view(-1, 2, 128),
+        k=k.view(-1, 2, 128),
+        q_weight=norm.query_norm.scale,
+        k_weight=norm.key_norm.scale,
+        cos_sin_cache=rope.reshape(-1, 128),
+        positions=torch.arange(7, device="cuda"),
+        is_neox=False,
+        eps=1e-6,
+    )
+    torch.testing.assert_close(q, expected_q, atol=3e-2, rtol=2e-2)
+    torch.testing.assert_close(k, expected_k, atol=3e-2, rtol=2e-2)

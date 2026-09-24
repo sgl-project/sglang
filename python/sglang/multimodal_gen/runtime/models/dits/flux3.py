@@ -36,6 +36,7 @@ request.
 from __future__ import annotations
 
 import math
+import os
 from typing import Any
 
 import msgspec
@@ -43,6 +44,16 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from sglang.kernels.ops.diffusion import (
+    BitExactFusionGate,
+    can_use_fused_inplace_qknorm_rope,
+    can_use_fused_layernorm_modulate,
+    fused_inplace_qknorm_rope,
+    fused_layernorm_modulate_raw,
+    fused_packed_silu_mul_bitexact,
+    is_plain_layer_norm,
+    residual_gate_add,
+)
 from sglang.multimodal_gen.configs.models.dits.flux3 import (
     Flux3ArchConfig,
     Flux3DiTConfig,
@@ -57,42 +68,126 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload im
 )
 from sglang.multimodal_gen.runtime.models.dits.base import BaseDiT
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+
+logger = init_logger(__name__)
 
 Modulation = tuple[torch.Tensor, torch.Tensor, torch.Tensor]
 TEXT_STREAM = "txt"
 
 
-def rope_matrices(
+def rope_cos_sin(
     ids: torch.Tensor, axes_dim: tuple[int, ...], theta: int
 ) -> torch.Tensor:
-    """Position ids ``(B, L, n_axes)`` -> rotation matrices ``(B, L, 1, head_dim // 2, 2, 2)``."""
-    blocks = []
+    """Position ids ``(B, L, n_axes)`` -> fp32 ``(B, L, head_dim)`` rows ``[cos | sin]``.
+
+    Pair ``i`` (channels ``2i, 2i + 1``) is rotated by angle ``i``; the angles of
+    the axes are concatenated in order (FLUX-style interleaved RoPE).
+    """
+    angles = []
     for axis, dim in enumerate(axes_dim):
         scale = torch.arange(0, dim, 2, dtype=torch.float64, device=ids.device) / dim
         omega = 1.0 / (theta**scale)
-        angles = torch.einsum("...n,d->...nd", ids[..., axis], omega)
-        matrix = torch.stack(
-            (
-                torch.cos(angles),
-                -torch.sin(angles),
-                torch.sin(angles),
-                torch.cos(angles),
-            ),
-            dim=-1,
-        )
-        blocks.append(matrix.reshape(*matrix.shape[:-1], 2, 2).float())
-    return torch.cat(blocks, dim=-3).unsqueeze(2)
+        angles.append(torch.einsum("...n,d->...nd", ids[..., axis], omega))
+    angles = torch.cat(angles, dim=-1)
+    return torch.cat((torch.cos(angles), torch.sin(angles)), dim=-1).float()
 
 
 def apply_rope(
-    q: torch.Tensor, k: torch.Tensor, rope: torch.Tensor
+    q: torch.Tensor, k: torch.Tensor, cos_sin: torch.Tensor
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Rotate adjacent channel pairs of ``q``/``k`` ``(B, L, H, D)`` in fp32."""
-    q_pairs = q.float().reshape(*q.shape[:-1], -1, 1, 2)
-    k_pairs = k.float().reshape(*k.shape[:-1], -1, 1, 2)
-    q_out = rope[..., 0] * q_pairs[..., 0] + rope[..., 1] * q_pairs[..., 1]
-    k_out = rope[..., 0] * k_pairs[..., 0] + rope[..., 1] * k_pairs[..., 1]
-    return q_out.reshape_as(q).to(q.dtype), k_out.reshape_as(k).to(k.dtype)
+    cos, sin = cos_sin[:, :, None].chunk(2, dim=-1)
+
+    def rotate(x: torch.Tensor) -> torch.Tensor:
+        pairs = x.float().reshape(*x.shape[:-1], -1, 2)
+        even = cos * pairs[..., 0] + (-sin) * pairs[..., 1]
+        odd = sin * pairs[..., 0] + cos * pairs[..., 1]
+        return torch.stack((even, odd), dim=-1).reshape_as(x).to(x.dtype)
+
+    return rotate(q), rotate(k)
+
+
+# Fused fast paths. The first two are bit-exact against the eager chain and
+# verified per signature; QK-norm + RoPE is fused at bf16 rounding level.
+_LN_MODULATE = BitExactFusionGate("FLUX 3 fused LN+modulate", per_signature=True)
+_SWIGLU = BitExactFusionGate("FLUX 3 fused SwiGLU", per_signature=True)
+
+
+def _eager_fast_path_allowed(x: torch.Tensor) -> bool:
+    return (
+        x.is_cuda
+        and x.dtype is torch.bfloat16
+        and not torch.compiler.is_compiling()
+        and not torch.cuda.is_current_stream_capturing()
+    )
+
+
+def _norm_modulate(
+    norm: nn.LayerNorm, x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor
+) -> torch.Tensor:
+    """``(1 + scale) * LN(x) + shift`` with ``(B, 1, D)`` modulation."""
+    scale_row, shift_row = scale[:, 0], shift[:, 0]
+    if (
+        _LN_MODULATE.disabled
+        or not _eager_fast_path_allowed(x)
+        or not is_plain_layer_norm(norm, x.shape[-1])
+        or not can_use_fused_layernorm_modulate(x, scale_row, shift_row)
+    ):
+        return (1 + scale) * norm(x) + shift
+    sig = (x.device, x.shape[0], x.shape[-1], norm.eps)
+    try:
+        out = fused_layernorm_modulate_raw(x, scale_row, shift_row, norm.eps)
+    except Exception as exc:
+        _LN_MODULATE.on_exception(exc, logger=logger)
+        return (1 + scale) * norm(x) + shift
+    if _LN_MODULATE.is_verified(sig):
+        return out
+    return _LN_MODULATE.accept_or_fallback(
+        out,
+        (1 + scale) * norm(x) + shift,
+        sig=sig,
+        logger=logger,
+        mismatch_msg="FLUX 3 fused LN+modulate is not bit-exact here; using eager",
+    )
+
+
+def _swiglu(packed: torch.Tensor) -> torch.Tensor:
+    """``silu(gate) * value`` of a packed ``[gate | value]`` projection."""
+    gate, value = packed.chunk(2, dim=-1)
+    if _SWIGLU.disabled or not _eager_fast_path_allowed(packed):
+        return F.silu(gate) * value
+    sig = (packed.device, packed.shape[-1], packed.stride(-2))
+    try:
+        out = fused_packed_silu_mul_bitexact(packed)
+    except Exception as exc:
+        _SWIGLU.on_exception(exc, logger=logger)
+        return F.silu(gate) * value
+    if _SWIGLU.is_verified(sig):
+        return out
+    return _SWIGLU.accept_or_fallback(
+        out,
+        F.silu(gate) * value,
+        sig=sig,
+        logger=logger,
+        mismatch_msg="FLUX 3 fused SwiGLU is not bit-exact here; using eager",
+    )
+
+
+def _fused_qknorm_rope_enabled(q: torch.Tensor, head_dim: int) -> bool:
+    return (
+        _eager_fast_path_allowed(q)
+        and os.getenv("SGLANG_ENABLE_FUSED_QKNORM_ROPE", "1").lower()
+        not in ("0", "false", "off", "no")
+        and can_use_fused_inplace_qknorm_rope(
+            head_dim=head_dim,
+            rope_dim=head_dim,
+            is_neox=False,
+            dtype=q.dtype,
+            cache_dtype=torch.float32,
+            round_norm_before_rope=False,
+        )
+    )
 
 
 def timestep_embedding(t: torch.Tensor, dim: int = 256) -> torch.Tensor:
@@ -303,14 +398,27 @@ class Flux3Block(nn.Module):
             ),
             dim=-1,
         )
-        q = q.reshape(batch, length, self.num_heads, self.head_dim)
-        k = k.reshape(batch, length, self.num_heads, self.head_dim)
-        v = v.reshape(batch, length, self.num_heads, self.head_dim)
-        q, k = self.norm(q, k, v)
-        q, k = apply_rope(q, k, rope)
+        q = q.view(batch, length, self.num_heads, self.head_dim)
+        k = k.view(batch, length, self.num_heads, self.head_dim)
+        v = v.view(batch, length, self.num_heads, self.head_dim)
+        if _fused_qknorm_rope_enabled(q, self.head_dim):
+            # In place on the fused projection: k follows q's heads in each row.
+            fused_inplace_qknorm_rope(
+                q=q.view(-1, self.num_heads, self.head_dim),
+                k=k.view(-1, self.num_heads, self.head_dim),
+                q_weight=self.norm.query_norm.scale,
+                k_weight=self.norm.key_norm.scale,
+                cos_sin_cache=rope.reshape(-1, self.head_dim),
+                positions=torch.arange(batch * length, device=q.device),
+                is_neox=False,
+                eps=1e-6,
+                round_norm_before_rope=False,
+            )
+        else:
+            q, k = self.norm(q, k, v)
+            q, k = apply_rope(q, k, rope)
         attended = self.attn(q, k, v).reshape(batch, length, self.hidden_size)
-        gate, value = mlp.chunk(2, dim=-1)
-        return self.attn_out(attended)[0] + self.mlp_out(F.silu(gate) * value)[0]
+        return self.attn_out(attended)[0] + self.mlp_out(_swiglu(mlp))[0]
 
     def forward(
         self,
@@ -327,14 +435,24 @@ class Flux3Block(nn.Module):
         """
         if lengths is None:
             shift, scale, gate = mods[0]
-            modulated = (1 + scale) * self.pre_norm(x) + shift
-            return x + gate * self._mix(modulated, rope)
-        normalized = torch.split(self.pre_norm(x), lengths, dim=1)
+            modulated = _norm_modulate(self.pre_norm, x, shift=shift, scale=scale)
+            return residual_gate_add(x, self._mix(modulated, rope), gate)
+        segments = torch.split(x, lengths, dim=1)
         modulated = torch.cat(
-            [(1 + m[1]) * seg + m[0] for seg, m in zip(normalized, mods)], dim=1
+            [
+                _norm_modulate(self.pre_norm, seg, shift=m[0], scale=m[1])
+                for seg, m in zip(segments, mods)
+            ],
+            dim=1,
         )
         output = torch.split(self._mix(modulated, rope), lengths, dim=1)
-        return x + torch.cat([m[2] * seg for seg, m in zip(output, mods)], dim=1)
+        return torch.cat(
+            [
+                residual_gate_add(seg, out.contiguous(), m[2])
+                for seg, out, m in zip(segments, output, mods)
+            ],
+            dim=1,
+        )
 
 
 class Flux3SegmentState(msgspec.Struct, frozen=True):
@@ -342,7 +460,7 @@ class Flux3SegmentState(msgspec.Struct, frozen=True):
 
     name: str
     hidden: torch.Tensor  # (B, L, hidden)
-    rope: torch.Tensor  # (B, L, 1, head_dim // 2, 2, 2)
+    rope: torch.Tensor  # (B, L, head_dim) fp32 [cos | sin]
     vec: torch.Tensor  # (B, 1 | L, hidden): timestep vector of the stream
     joint_mod: Modulation  # modulation of the stream in the joint blocks
 
@@ -446,7 +564,7 @@ class Flux3Transformer(BaseDiT, LayerwiseOffloadableModuleMixin):
         return _compute_dtype(self.txt_in)
 
     def rope(self, ids: torch.Tensor) -> torch.Tensor:
-        return rope_matrices(ids, self.axes_dim, self.theta)
+        return rope_cos_sin(ids, self.axes_dim, self.theta)
 
     def _timestep_vector(
         self, timesteps: torch.Tensor, vector: torch.Tensor | None = None

@@ -27,14 +27,14 @@ Supported checkpoints (`black-forest-labs/flux-3-action-droid`; three 360x640 ca
 
 | `--model-variant` | Recipe | Weights | Latency on 1x RTX 5090 |
 | --- | --- | --- | ---: |
-| (default) / `base` | 4 steps, guidance 4.0 (video) / 1.0 (action) | BF16 | 1.30 s |
-| `fp8r` | same | FP8 rowwise | 1.09 s |
-| `gd` | guidance-distilled: 4 steps, no CFG | BF16 | 0.71 s |
-| `gd-fp8r` | same | FP8 rowwise | 0.61 s |
-| `sd` | step-distilled: 1 step | BF16 | 0.21 s |
-| `sd-fp8r` | same | FP8 rowwise | 0.18 s |
+| (default) / `base` | 4 steps, guidance 4.0 (video) / 1.0 (action) | BF16 | 1.13 s |
+| `fp8r` | same | FP8 rowwise | 0.93 s |
+| `gd` | guidance-distilled: 4 steps, no CFG | BF16 | 0.62 s |
+| `gd-fp8r` | same | FP8 rowwise | 0.52 s |
+| `sd` | step-distilled: 1 step | BF16 | 0.18 s |
+| `sd-fp8r` | same | FP8 rowwise | 0.16 s |
 
-Latency is per request with the caption already cached, eager mode (no `torch.compile`). FP8r packages load their native E4M3 weights (one scale per output row) and run `torch._scaled_mm` with per-token activation scales. This needs an SM89+ GPU.
+Latency is per request with the caption already cached, eager mode (no `torch.compile`). LayerNorm + modulation, SwiGLU and the gated residual run on bit-exact fused kernels; QK RMSNorm + RoPE runs on a fused kernel at bf16 rounding level (set `SGLANG_ENABLE_FUSED_QKNORM_ROPE=0` to use the eager path). FP8r packages load their native E4M3 weights (one scale per output row) and run `torch._scaled_mm` with per-token activation scales. This needs an SM89+ GPU.
 
 The frozen text encoder and video VAE are downloaded from the pinned revision of [`black-forest-labs/flux-3-action-base`](https://huggingface.co/black-forest-labs/flux-3-action-base) that the policy config references.
 
@@ -79,11 +79,11 @@ Peak GPU memory and per-request latency on one RTX 5090 (BF16 base package, cach
 
 | Flags | Peak memory | Latency |
 | --- | ---: | ---: |
-| (none) | 24.1 GB | 1.30 s |
-| `--dit-layerwise-offload` | 14.5 GB | 2.55 s |
-| `--layerwise-offload-components all` | 9.9 GB | 2.58 s |
-| `--model-variant fp8r` | 18.6 GB | 1.10 s |
-| `--model-variant fp8r --dit-layerwise-offload` | 13.3 GB | 1.34 s |
+| (none) | 24.1 GB | 1.13 s |
+| `--dit-layerwise-offload` | 14.5 GB | 2.51 s |
+| `--layerwise-offload-components all` | 9.8 GB | 2.56 s |
+| `--model-variant fp8r` | 18.6 GB | 0.93 s |
+| `--model-variant fp8r --dit-layerwise-offload` | 13.2 GB | 1.29 s |
 
 Layerwise offload streams the DiT blocks (and, with `all`, the text encoder and VAE blocks) from host memory, so use it only when the resident configuration does not fit.
 
@@ -142,5 +142,5 @@ With the same observation and seed, SGLang matches the FLUX Action reference imp
 
 - The DiT agrees to 1e-6 (relative) in fp32.
 - The VAE latents and text contexts are bit-identical.
-- Across the full 4-step, CFG 4.0 sampling loop, actions differ by at most 0.017 rad (mean 0.003 rad). The reference's own eager and prepared paths differ from each other by 0.015 rad.
-- FP8r packages differ from the reference FP8r path by at most 0.04 rad. The reference FP8r path itself differs from BF16 by 0.055 rad.
+- Across the full 4-step, CFG 4.0 sampling loop, actions differ by at most 0.015 rad (mean 0.003 rad). The reference's own eager and prepared paths differ from each other by 0.015 rad.
+- FP8r packages differ from the reference FP8r path by at most 0.025 rad. The reference FP8r path itself differs from BF16 by 0.055 rad.
