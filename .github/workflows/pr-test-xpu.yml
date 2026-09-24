@@ -80,6 +80,7 @@ jobs:
               - "test/registered/unit/mem_cache/test_mamba_unittest.py"
               - "test/registered/unit/sampling/test_sampling_params.py"
               - "test/registered/unit/spec/test_adaptive_spec_params.py"
+              - "test/registered/unit/spec/test_ngram_corpus.py"
               - "test/run_suite.py"
               - "test/pytest.ini"
               - ".github/workflows/pr-test-xpu.yml"
