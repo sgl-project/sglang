@@ -2830,6 +2830,36 @@ class TestWhoAnswersDuringADraftScope(CustomTestCase):
                 self.assertEqual(parallel.attn_tp_size, 2)
                 self.assertEqual(parallel.dp_size, 2)
 
+    def test_a_narrowed_draft_still_indexes_the_targets_dp_sync(self):
+        # The draft forwards a batch whose global_num_tokens the target
+        # gathered, so indexing it must use the target's width and slot.
+        from sglang.srt.distributed import parallel_state
+        from sglang.srt.layers.dp_attention import dp_gather_slot, dp_gather_width
+
+        reset_context()
+        self.addCleanup(reset_context)
+        publish(
+            ServerArgs(
+                model_path="dummy", tp_size=4, dp_size=4, enable_dp_attention=True
+            ),
+            role="scheduler",
+            ranks=SpawnRanks(world_rank=0, dp_rank=0),
+        )
+        group = self._group(world_size=1, rank=0)
+        with (
+            get_flags().dp.override(enabled=True),
+            get_parallel().override(tp_rank=2, attn_tp_rank=0, attn_dp_rank=2),
+            patch.object(parallel_state, "_TP", group),
+        ):
+            with parallel_state.patch_tensor_parallel_group(group, owns_attention=True):
+                self.assertEqual(get_parallel().attn_dp_size, 1)
+                self.assertEqual(get_parallel().attn_dp_rank, 0)
+                self.assertEqual(dp_gather_width(), 4)
+                self.assertEqual(dp_gather_slot(), 2)
+            self.assertIsNone(get_flags().dp.scoped_gather_width)
+            self.assertIsNone(get_flags().dp.scoped_gather_slot)
+            self.assertEqual(dp_gather_slot(), 2)
+
     def test_a_report_built_for_a_runner_follows_that_runner(self):
         from sglang.srt.distributed import parallel_state
         from sglang.srt.utils.weight_checker import WeightChecker

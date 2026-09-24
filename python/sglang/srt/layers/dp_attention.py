@@ -64,8 +64,12 @@ def dp_gather_width() -> int:
     """Return the DP gather width.
 
     After elastic scale-up, the gather spans the expanded WORLD; otherwise
-    it spans the attention-DP replicas.
+    it spans the attention-DP replicas. Inside a draft scope that owns its
+    attention, it is still the target's gather (see patch_tensor_parallel_group).
     """
+    scoped = get_flags().dp.scoped_gather_width
+    if scoped is not None:
+        return scoped
     parallel = get_parallel()
     return parallel.dp_size if world_dp_gather_enabled() else parallel.attn_dp_size
 
@@ -76,6 +80,9 @@ def dp_gather_slot() -> int:
     After elastic scale-up, use the TP rank plus the join offset; otherwise
     use the attention-DP rank.
     """
+    scoped = get_flags().dp.scoped_gather_slot
+    if scoped is not None:
+        return scoped
     parallel = get_parallel()
     if world_dp_gather_enabled():
         return parallel.tp_rank + parallel.ep_join_rank_offset

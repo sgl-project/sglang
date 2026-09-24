@@ -1723,6 +1723,14 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         if self.input_embeds is not None:
             # Keep token-aligned inputs consistent after padding.
             self.input_embeds = self._pad_tensor_to_size(self.input_embeds, num_tokens)
+        if (
+            self.mm_input_embeds is not None
+            and self.mm_input_embeds.shape[0] < num_tokens
+        ):
+            # A draft reads the target's mm embeds in place of its input_ids.
+            self.mm_input_embeds = self._pad_tensor_to_size(
+                self.mm_input_embeds, num_tokens
+            )
         self.req_pool_indices = self._pad_tensor_to_size(self.req_pool_indices, bs)
         if self.req_pool_indices_cpu is not None:
             self.req_pool_indices_cpu = self._pad_tensor_to_size(
