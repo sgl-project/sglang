@@ -17,6 +17,8 @@ from typing import TYPE_CHECKING, Any, Callable, Literal, Optional, Type
 
 import msgspec
 
+import torch
+
 from sglang.srt.platforms.device_mixin import DeviceMixin, PlatformEnum
 
 if TYPE_CHECKING:
@@ -163,6 +165,10 @@ class SRTPlatform(DeviceMixin):
         is False, so most platforms need no override.
         """
         return None
+
+    def get_position_dtype(self) -> torch.dtype:
+        """Return the dtype used for token position tensors."""
+        return torch.int64
 
     def get_compile_backend(self, mode: str | None = None) -> str:
         """Return the compilation backend identifier.

@@ -234,6 +234,19 @@ def is_musa() -> bool:
 
 
 @lru_cache(maxsize=1)
+def is_mlu() -> bool:
+    if not hasattr(torch, "mlu"):
+        return False
+
+    if not torch.mlu.is_available():
+        raise RuntimeError(
+            "torch_mlu detected, but MLU device is not available or visible."
+        )
+
+    return True
+
+
+@lru_cache(maxsize=1)
 def is_mps() -> bool:
     return hasattr(torch, "mps") and torch.mps.is_available()
 
@@ -459,6 +472,22 @@ def get_available_gpu_memory(
             free_gpu_memory = psutil.virtual_memory().available
         else:
             free_gpu_memory, _ = torch.cuda.mem_get_info(gpu_id)
+
+    elif device == "mlu":
+        num_gpus = torch.mlu.device_count()
+        assert gpu_id < num_gpus
+
+        if torch.mlu.current_device() != gpu_id:
+            logger.warning(
+                "current device is not %s, but %s, which may cause useless "
+                "memory allocation for torch MLU context.",
+                gpu_id,
+                torch.mlu.current_device(),
+            )
+
+        if empty_cache:
+            empty_device_cache(torch.mlu)
+        free_gpu_memory, _ = torch.mlu.mem_get_info()
 
     elif device == "xpu":
         num_gpus = torch.xpu.device_count()
@@ -861,6 +890,15 @@ def get_npu_memory_capacity():
         raise ImportError("torch_npu is required when run on npu device.")
 
 
+def get_mlu_memory_capacity():
+    try:
+        if torch.mlu.is_available():
+            return torch.mlu.mem_get_info()[1] // 1024 // 1024  # unit: MB
+        raise ValueError("No GPU memory values found.")
+    except AttributeError:
+        raise RuntimeError("torch.mlu is not available.")
+
+
 def get_cpu_memory_capacity():
     # Per-rank memory capacity cannot be determined for customized core settings
     if os.environ.get("SGLANG_CPU_OMP_THREADS_BIND", ""):
@@ -975,6 +1013,8 @@ def get_device_memory_capacity(device: str = None):
         gpu_mem = get_xpu_memory_capacity()
     elif device == "musa":
         gpu_mem = get_mtgpu_memory_capacity()
+    elif device == "mlu":
+        gpu_mem = get_mlu_memory_capacity()
     else:
         # GPU memory is not known yet or no GPU is available.
         gpu_mem = None
@@ -985,6 +1025,9 @@ def get_device_memory_capacity(device: str = None):
 def get_device_name(device_id: int = 0) -> str:
     if hasattr(torch, "mps") and torch.mps.is_available():
         return torch.backends.mps.get_name()
+
+    if hasattr(torch, "mlu") and torch.mlu.is_available():
+        return torch.mlu.get_device_name(device_id)
 
     if (hasattr(torch, "cuda") and torch.cuda.is_available()) or is_musa():
         return torch.cuda.get_device_name(device_id)
@@ -1038,6 +1081,11 @@ def get_device(device_id: Optional[int] = None) -> str:
             )
         return "cpu"
 
+    if is_mlu():
+        if device_id is None:
+            return "mlu"
+        return "mlu:{}".format(device_id)
+
     if hasattr(torch, "cuda") and torch.cuda.is_available():
         if device_id is None:
             return "cuda"
@@ -1089,6 +1137,12 @@ def get_device_count() -> int:
     if hasattr(torch, "mps") and torch.mps.is_available():
         try:
             return torch.mps.device_count()
+        except RuntimeError:
+            return 0
+
+    if hasattr(torch, "mlu") and torch.mlu.is_available():
+        try:
+            return torch.mlu.device_count()
         except RuntimeError:
             return 0
 
@@ -1683,6 +1737,8 @@ def set_random_seed(seed: int) -> None:
         torch.cuda.manual_seed_all(seed)
     if torch.xpu.is_available():
         torch.xpu.manual_seed_all(seed)
+    if hasattr(torch, "mlu") and torch.mlu.is_available():
+        torch.mlu.manual_seed_all(seed)
 
 
 _mm_http_session = threading.local()
