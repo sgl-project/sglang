@@ -20,7 +20,7 @@ import inspect
 import logging
 import time
 from dataclasses import dataclass
-from typing import Optional, Union
+from typing import Callable, Optional, Union
 
 import torch
 import torch.distributed as dist
@@ -437,6 +437,8 @@ class ModelRunner:
 
         # Init forward stream for overlap schedule
         self.forward_stream = torch.get_device_module(self.device).Stream()
+        self.afd_control_callback: Optional[Callable[[bool], bool]] = None
+        self.afd_cuda_graph_batch_size: Optional[int] = None
 
         # Read-done mailbox: the scheduler's WAR barrier reads it from the runner
         # its worker names, and treats None as the coarse whole-forward fence.
@@ -1771,6 +1773,9 @@ class ModelRunner:
                 and self.decode_cuda_graph_runner
                 and self.decode_cuda_graph_runner.can_run_graph(forward_batch)
             )
+
+            if self.afd_control_callback is not None:
+                can_run_graph = self.afd_control_callback(can_run_graph)
 
             if (
                 forward_batch.forward_mode.is_decode()

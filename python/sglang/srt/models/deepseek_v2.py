@@ -930,7 +930,9 @@ class DeepseekV2MoE(nn.Module):
             )
 
         if not self._enable_a2a_moe:
-            if self._can_dual_stream_graph(hidden_states):
+            # AFD dispatch must stay on the stream capturing the segment.
+            allow_dual_stream = not get_moe_a2a_backend().is_afd_attn()
+            if allow_dual_stream and self._can_dual_stream_graph(hidden_states):
                 fwd = get_forward()
                 return dsv2_flashinfer_moe_dual_stream_graph(
                     hidden_states,
@@ -939,7 +941,8 @@ class DeepseekV2MoE(nn.Module):
                     fwd.mlp_reduce_scatter,
                 )
             elif (
-                self.alt_stream is not None
+                allow_dual_stream
+                and self.alt_stream is not None
                 and self.num_fused_shared_experts == 0
                 and hidden_states.shape[0] > 0
                 and get_is_capture_mode()

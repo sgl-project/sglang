@@ -1092,6 +1092,9 @@ class Scheduler(
     def init_all_cuda_graphs(self):
         """Capture cuda graphs for all workers."""
         self.maybe_init_afd()
+        if get_disagg().afd_role == "attn":
+            return
+
         self.tp_worker.init_cuda_graphs()
         if self.draft_worker is not None:
             self.draft_worker.init_cuda_graphs()

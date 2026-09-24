@@ -779,18 +779,33 @@ class TestStartupWeightLoadSchedulerRouting(CustomTestCase):
                     scheduler.init_model_worker()
                 self.assertEqual(trace, [("ffn_init", worker)])
 
-    def test_afd_attention_keeps_native_runner_initialization(self):
+    def test_afd_attention_initializes_native_runners_once_within_handshake(self):
+        from sglang.srt.afd.afd_scheduler import _capture_afd_attn_communication_graphs
         from sglang.srt.managers.scheduler import Scheduler
 
         trace = []
         scheduler = Scheduler.__new__(Scheduler)
-        scheduler.maybe_init_afd = lambda: trace.append("afd_handshake")
+
+        def init_afd():
+            trace.append("afd_handshake")
+            _capture_afd_attn_communication_graphs(
+                scheduler, None, None, SimpleNamespace(enabled=False)
+            )
+
+        scheduler.maybe_init_afd = init_afd
         scheduler.tp_worker = SimpleNamespace(
-            init_cuda_graphs=lambda: trace.append("native_runners")
+            init_cuda_graphs=lambda: trace.append("duplicate_worker_init"),
+            model_runner=SimpleNamespace(
+                init_cuda_graphs=lambda: trace.append("native_runners")
+            ),
         )
         scheduler.draft_worker = None
 
-        scheduler.init_all_cuda_graphs()
+        with patch(
+            "sglang.srt.managers.scheduler.get_disagg",
+            return_value=SimpleNamespace(afd_role="attn"),
+        ):
+            scheduler.init_all_cuda_graphs()
 
         self.assertEqual(trace, ["afd_handshake", "native_runners"])
 

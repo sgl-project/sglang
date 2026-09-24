@@ -1,34 +1,289 @@
-"""Ordered attention-side dispatch and combine for AFD."""
+"""AFD work lifecycle and fixed decode buffers."""
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import bisect
+import logging
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Optional, Sequence
 
 import torch
 
-from sglang.srt.afd.comm import AFDCommBackend
+from sglang.srt.afd.comm.base import AFDCommBackend
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 
 if TYPE_CHECKING:
+    from sglang.srt.afd.afd_handshake import AFDGraphCaptureVariant
     from sglang.srt.afd.layers import AFDMoELayer
 
+logger = logging.getLogger(__name__)
 
-@dataclass
+
+def is_afd_fixed_shape_mode(forward_mode: ForwardMode) -> bool:
+    return forward_mode.is_decode()
+
+
+def build_decode_token_buckets(
+    local_batch_sizes: Sequence[int],
+    max_local_requests: int,
+    wire_token_multiplier: int,
+) -> list[int]:
+    """Convert A-side per-rank decode buckets to wire capacities."""
+    if max_local_requests <= 0 or wire_token_multiplier <= 0:
+        raise ValueError(
+            "AFD decode bucket bounds must be positive: "
+            f"max_local_requests={max_local_requests}, "
+            f"wire_token_multiplier={wire_token_multiplier}"
+        )
+    if any(batch_size <= 0 for batch_size in local_batch_sizes):
+        raise ValueError("AFD decode batch sizes must be positive")
+
+    local_buckets = {
+        batch_size
+        for batch_size in local_batch_sizes
+        if batch_size <= max_local_requests
+    }
+    # max_running_requests can exceed CUDA graph max_bs. Preserve the configured
+    # graph buckets, then add progressively coarser transport buckets instead of
+    # jumping directly to the largest slot.
+    last_bucket = max(local_buckets, default=0)
+    while last_bucket < max_local_requests:
+        if last_bucket < 16:
+            step = 1
+        elif last_bucket < 256:
+            step = 8
+        elif last_bucket < 512:
+            step = 16
+        else:
+            step = 32
+        last_bucket = min(
+            ((last_bucket // step) + 1) * step,
+            max_local_requests,
+        )
+        local_buckets.add(last_bucket)
+    local_buckets.add(max_local_requests)
+    return sorted(batch_size * wire_token_multiplier for batch_size in local_buckets)
+
+
+def select_token_bucket(token_buckets: Sequence[int], num_tokens: int) -> int:
+    if num_tokens == 0:
+        return 0
+    bucket_index = bisect.bisect_left(token_buckets, num_tokens)
+    if bucket_index == len(token_buckets):
+        raise RuntimeError(
+            f"AFD decode token count {num_tokens} exceeds transport capacity "
+            f"{token_buckets[-1]}"
+        )
+    return token_buckets[bucket_index]
+
+
+def afd_work_generation(step_id: int, work_index: int) -> int:
+    # Keep parent steps disjoint when the number of children changes.
+    return (step_id << 32) | (work_index + 1)
+
+
+@dataclass(frozen=True)
 class AFDWorkHandle:
+    slot_id: Optional[int]
+    generation: int
+    capacity: int
+    input_tokens: int
     hidden_states: torch.Tensor
     topk_ids: torch.Tensor
     topk_weights: torch.Tensor
     output: torch.Tensor
+    router_logits: Optional[torch.Tensor]
+    # Shared experts may still read hidden_states on another stream while
+    # additional ffn responses arrive.
+    response_scratch: Optional[torch.Tensor] = None
+    # PyNcclCommunicator does not register external P2P buffers with the
+    # caching allocator. Retain direct request inputs until the ordered
+    # response has been enqueued.
+    request_tensors: Optional[tuple[torch.Tensor, ...]] = None
+
+
+@dataclass
+class _SlotBuffers:
+    hidden_states: torch.Tensor
+    topk_ids: torch.Tensor
+    topk_weights: torch.Tensor
+    output: torch.Tensor
+    router_logits: Optional[torch.Tensor]
+    response_scratch: Optional[torch.Tensor]
+
+
+class AFDFixedBufferPool:
+    """Fixed stream-ordered slots shared by layers with the same tensor schema."""
+
+    def __init__(
+        self,
+        layers: Sequence[AFDMoELayer],
+        token_buckets: Sequence[int],
+        dtype: torch.dtype,
+        device: torch.device,
+        role: str,
+        with_router_logits: bool,
+        num_slots: int,
+        with_response_scratch: bool = False,
+    ):
+        if num_slots <= 0:
+            raise ValueError("AFD fixed buffer pool requires at least one slot")
+        self._num_slots = num_slots
+        self._buckets = sorted(set(token_buckets))
+        if not self._buckets or self._buckets[0] <= 0:
+            raise ValueError("AFD fixed buffer pool requires positive token buckets")
+        self._bucket_set = set(self._buckets)
+
+        self._layer_keys = {
+            layer.layer_id: (layer.hidden_size, layer.top_k, layer.num_experts)
+            for layer in layers
+        }
+        if len(self._layer_keys) != len(layers):
+            raise RuntimeError("AFD found duplicate MoE layer ids")
+
+        max_tokens = self._buckets[-1]
+        self._buffers: dict[tuple[int, int, int, int], _SlotBuffers] = {}
+        schemas = sorted(set(self._layer_keys.values()))
+        for slot_id in range(num_slots):
+            for hidden_size, top_k, num_experts in schemas:
+                key = (slot_id, hidden_size, top_k, num_experts)
+                self._buffers[key] = _SlotBuffers(
+                    hidden_states=torch.empty(
+                        (max_tokens, hidden_size), dtype=dtype, device=device
+                    ),
+                    topk_ids=torch.empty(
+                        (max_tokens, top_k), dtype=torch.int32, device=device
+                    ),
+                    topk_weights=torch.empty(
+                        (max_tokens, top_k), dtype=torch.float32, device=device
+                    ),
+                    output=torch.empty(
+                        (max_tokens, hidden_size), dtype=dtype, device=device
+                    ),
+                    router_logits=(
+                        torch.empty(
+                            (max_tokens, num_experts),
+                            dtype=torch.float32,
+                            device=device,
+                        )
+                        if with_router_logits
+                        else None
+                    ),
+                    response_scratch=(
+                        torch.empty(
+                            (max_tokens, hidden_size),
+                            dtype=dtype,
+                            device=device,
+                        )
+                        if with_response_scratch
+                        else None
+                    ),
+                )
+
+        self._active_generations: list[Optional[int]] = [None] * num_slots
+        allocated_bytes = sum(
+            tensor.numel() * tensor.element_size()
+            for buffers in self._buffers.values()
+            for tensor in (
+                buffers.hidden_states,
+                buffers.topk_ids,
+                buffers.topk_weights,
+                buffers.output,
+                buffers.router_logits,
+                buffers.response_scratch,
+            )
+            if tensor is not None
+        )
+        logger.info(
+            "AFD fixed buffer pool ready: role=%s slots=%d schemas=%d buckets=%d "
+            "max_tokens=%d memory=%.2f MiB",
+            role,
+            num_slots,
+            len(schemas),
+            len(self._buckets),
+            max_tokens,
+            allocated_bytes / (1024 * 1024),
+        )
+
+    def acquire(
+        self,
+        slot_id: int,
+        layer_id: int,
+        generation: int,
+        capacity: int,
+        input_tokens: int,
+    ) -> AFDWorkHandle:
+        if not 0 <= slot_id < self._num_slots:
+            raise RuntimeError(f"AFD fixed buffer has no slot {slot_id}")
+        active_generation = self._active_generations[slot_id]
+        if active_generation is not None:
+            raise RuntimeError(
+                f"AFD fixed buffer slot {slot_id} is still active: "
+                f"generation={active_generation}"
+            )
+        if input_tokens > capacity:
+            raise ValueError(
+                f"AFD input token count {input_tokens} exceeds capacity {capacity}"
+            )
+        if layer_id not in self._layer_keys:
+            raise RuntimeError(f"AFD fixed buffer has no layer {layer_id}")
+        if capacity not in self._bucket_set:
+            raise RuntimeError(
+                f"AFD capacity {capacity} is not a configured fixed-buffer bucket"
+            )
+        layer_key = self._layer_keys[layer_id]
+        buffer_key = (slot_id, *layer_key)
+        buffers = self._buffers[buffer_key]
+        hidden_states = buffers.hidden_states[:capacity]
+        topk_ids = buffers.topk_ids[:capacity]
+        topk_weights = buffers.topk_weights[:capacity]
+        output = buffers.output[:capacity]
+        router_logits = (
+            buffers.router_logits[:capacity]
+            if buffers.router_logits is not None
+            else None
+        )
+        response_scratch = (
+            buffers.response_scratch[:capacity]
+            if buffers.response_scratch is not None
+            else None
+        )
+        self._active_generations[slot_id] = generation
+        return AFDWorkHandle(
+            slot_id=slot_id,
+            generation=generation,
+            capacity=capacity,
+            input_tokens=input_tokens,
+            hidden_states=hidden_states,
+            topk_ids=topk_ids,
+            topk_weights=topk_weights,
+            output=output,
+            router_logits=router_logits,
+            response_scratch=response_scratch,
+        )
+
+    def release(self, handle: AFDWorkHandle) -> None:
+        slot_id = handle.slot_id
+        if slot_id is None or not 0 <= slot_id < self._num_slots:
+            raise RuntimeError("AFD attempted to release an invalid slot handle")
+        active_generation = self._active_generations[slot_id]
+        if active_generation != handle.generation:
+            raise RuntimeError(
+                "AFD fixed buffer generation mismatch: "
+                f"slot={slot_id}, active={active_generation}, "
+                f"handle={handle.generation}"
+            )
+        self._active_generations[slot_id] = None
 
 
 class AFDDispatcher:
-    """Keep every rank's remote MoE calls in model-layer order."""
+    """A-side ordered dispatch/combine with fixed decode staging buffers."""
 
     def __init__(
         self,
         comm: AFDCommBackend,
         layers: Sequence[AFDMoELayer],
+        token_buckets: Sequence[int],
         dtype: torch.dtype,
         device: torch.device,
         scattered: bool,
@@ -37,17 +292,59 @@ class AFDDispatcher:
         self._layers = list(layers)
         self._dtype = dtype
         self._device = device
+        self._scattered = scattered
         self._ffn_global_ranks = tuple(
             comm.config.ffn_global_rank(rank)
             for rank in comm.config.ffn_ranks_for_attn(
                 comm.config.instance_rank, scattered=scattered
             )
         )
+        self._padding_topk_id = -1 if scattered else 0
+        self._pool = AFDFixedBufferPool(
+            layers=self._layers,
+            token_buckets=token_buckets,
+            dtype=dtype,
+            device=device,
+            role="attn",
+            with_router_logits=False,
+            num_slots=1,
+            with_response_scratch=len(self._ffn_global_ranks) > 1,
+        )
         self._next_step_id = 0
         self._step_id: Optional[int] = None
+        self._forward_mode: Optional[ForwardMode] = None
+        self._dp_capacity = 0
         self._wire_capacity = 0
         self._next_layer_index = 0
         self._active_handle: Optional[AFDWorkHandle] = None
+        self._communication_graph_capacities: frozenset[int] = frozenset()
+        self._current_batch_uses_paired_communication_graph = False
+
+    @property
+    def needs_empty_decode_dispatch(self) -> bool:
+        return (
+            self._scattered
+            and self._forward_mode is not None
+            and is_afd_fixed_shape_mode(self._forward_mode)
+            and self._wire_capacity > 0
+        )
+
+    def enable_communication_graph_variants(
+        self, variants: Sequence[AFDGraphCaptureVariant]
+    ) -> None:
+        self._communication_graph_capacities = frozenset(
+            variant.child_wire_capacities[0] for variant in variants
+        )
+
+    def can_capture_communication_graph(self, capacity: int) -> bool:
+        return capacity in self._communication_graph_capacities
+
+    def select_paired_communication_graph(self, can_run_graph: bool) -> bool:
+        self._current_batch_uses_paired_communication_graph = (
+            can_run_graph
+            and self._wire_capacity in self._communication_graph_capacities
+        )
+        return self._current_batch_uses_paired_communication_graph
 
     def begin_batch(
         self, forward_mode: ForwardMode, dp_capacity: int, wire_capacity: int
@@ -56,18 +353,23 @@ class AFDDispatcher:
             raise RuntimeError("AFD cannot start a batch with active work")
         if (
             self._step_id is not None
-            and self._wire_capacity > 0
+            and self._dp_capacity > 0
             and self._next_layer_index != len(self._layers)
+            and not self._current_batch_uses_paired_communication_graph
         ):
             raise RuntimeError(
                 "AFD previous batch did not execute every MoE layer: "
                 f"completed={self._next_layer_index}, expected={len(self._layers)}"
             )
-        if wire_capacity < 0:
-            raise ValueError("AFD token capacity cannot be negative")
-        if wire_capacity != dp_capacity:
+        if dp_capacity < 0 or wire_capacity < 0:
+            raise ValueError("AFD token capacities cannot be negative")
+        if dp_capacity > wire_capacity:
             raise ValueError(
-                "AFD eager execution requires exact-size transport: "
+                f"AFD DP capacity {dp_capacity} exceeds wire capacity {wire_capacity}"
+            )
+        if not is_afd_fixed_shape_mode(forward_mode) and dp_capacity != wire_capacity:
+            raise ValueError(
+                "AFD non-fixed-shape work requires exact-size transport: "
                 f"dp={dp_capacity}, wire={wire_capacity}"
             )
         if forward_mode.is_idle() and wire_capacity != 0:
@@ -76,9 +378,99 @@ class AFDDispatcher:
         step_id = self._next_step_id
         self._next_step_id += 1
         self._step_id = step_id
+        self._forward_mode = forward_mode
+        self._dp_capacity = dp_capacity
         self._wire_capacity = wire_capacity
         self._next_layer_index = 0
+        self._current_batch_uses_paired_communication_graph = False
         return step_id
+
+    def _can_send_nccl_request_directly(
+        self,
+        hidden_states: torch.Tensor,
+        topk_ids: torch.Tensor,
+        topk_weights: torch.Tensor,
+        capacity: int,
+    ) -> bool:
+        return (
+            len(self._ffn_global_ranks) == 1
+            and hidden_states.shape[0] == capacity
+            and hidden_states.is_contiguous()
+            and topk_ids.is_contiguous()
+            and topk_weights.is_contiguous()
+        )
+
+    def dispatch_decode_graph_wave(
+        self,
+        layer_id: int,
+        hidden_states: torch.Tensor,
+        topk_ids: torch.Tensor,
+        topk_weights: torch.Tensor,
+    ) -> AFDWorkHandle:
+        capacity = hidden_states.shape[0]
+        layer = next(
+            (layer for layer in self._layers if layer.layer_id == layer_id),
+            None,
+        )
+        if layer is None:
+            raise RuntimeError(f"AFD has no MoE layer {layer_id}")
+        self._validate_request(layer, hidden_states, topk_ids, topk_weights)
+
+        work = self._pool.acquire(
+            slot_id=0,
+            layer_id=layer_id,
+            generation=0,
+            capacity=capacity,
+            input_tokens=capacity,
+        )
+        peers = self._ffn_global_ranks
+        direct_nccl_request = self._can_send_nccl_request_directly(
+            hidden_states, topk_ids, topk_weights, capacity
+        )
+        if peers and not direct_nccl_request:
+            work.hidden_states.copy_(hidden_states)
+            work.topk_ids.copy_(topk_ids)
+            work.topk_weights.copy_(topk_weights)
+        if peers:
+            request = (
+                [hidden_states, topk_ids, topk_weights]
+                if direct_nccl_request
+                else [work.hidden_states, work.topk_ids, work.topk_weights]
+            )
+            for peer_global_rank in peers:
+                self._comm.send_to(request, peer_global_rank)
+        return work
+
+    def combine_decode_graph_wave(
+        self, layer_id: int, work: AFDWorkHandle
+    ) -> torch.Tensor:
+        peers = self._ffn_global_ranks
+        if peers:
+            self._comm.recv_from([work.output], peers[0])
+            if len(peers) > 1:
+                assert work.response_scratch is not None
+                for peer_global_rank in peers[1:]:
+                    self._comm.recv_from([work.response_scratch], peer_global_rank)
+                    work.output.add_(work.response_scratch)
+        else:
+            work.output.zero_()
+        self._pool.release(work)
+        return work.output
+
+    def decode_graph_wave(
+        self,
+        layer_id: int,
+        hidden_states: torch.Tensor,
+        topk_ids: torch.Tensor,
+        topk_weights: torch.Tensor,
+    ) -> torch.Tensor:
+        work = self.dispatch_decode_graph_wave(
+            layer_id,
+            hidden_states,
+            topk_ids,
+            topk_weights,
+        )
+        return self.combine_decode_graph_wave(layer_id, work)
 
     def dispatch(
         self,
@@ -87,7 +479,7 @@ class AFDDispatcher:
         topk_ids: torch.Tensor,
         topk_weights: torch.Tensor,
     ) -> AFDWorkHandle:
-        if self._step_id is None:
+        if self._step_id is None or self._forward_mode is None:
             raise RuntimeError("AFD dispatch called before begin_batch")
         if self._active_handle is not None:
             raise RuntimeError("AFD dispatch called before combining previous work")
@@ -100,21 +492,69 @@ class AFDDispatcher:
                 f"expected={layer.layer_id}, got={layer_id}"
             )
         self._validate_request(layer, hidden_states, topk_ids, topk_weights)
-        handle = AFDWorkHandle(
-            hidden_states=hidden_states.contiguous(),
-            topk_ids=topk_ids.contiguous(),
-            topk_weights=topk_weights.contiguous(),
-            output=torch.empty_like(
-                hidden_states, memory_format=torch.contiguous_format
-            ),
-        )
-        if not self._ffn_global_ranks:
-            handle.output.zero_()
-        for peer_global_rank in self._ffn_global_ranks:
-            self._comm.send_to(
-                [handle.hidden_states, handle.topk_ids, handle.topk_weights],
-                peer_global_rank,
+
+        generation = afd_work_generation(self._step_id, self._next_layer_index)
+        has_peer = bool(self._ffn_global_ranks)
+        input_tokens = hidden_states.shape[0]
+        if is_afd_fixed_shape_mode(self._forward_mode):
+            capacity = self._wire_capacity
+            if not self._dp_capacity <= input_tokens <= capacity:
+                raise RuntimeError(
+                    "AFD fixed-shape capacity mismatch: "
+                    f"dp={self._dp_capacity}, input={input_tokens}, wire={capacity}"
+                )
+            handle = self._pool.acquire(
+                slot_id=0,
+                layer_id=layer_id,
+                generation=generation,
+                capacity=capacity,
+                input_tokens=input_tokens,
             )
+            direct_nccl_request = self._can_send_nccl_request_directly(
+                hidden_states, topk_ids, topk_weights, capacity
+            )
+            if has_peer and not direct_nccl_request:
+                handle.hidden_states[:input_tokens].copy_(hidden_states)
+                handle.topk_ids[:input_tokens].copy_(topk_ids)
+                handle.topk_weights[:input_tokens].copy_(topk_weights)
+                if input_tokens < handle.capacity:
+                    handle.hidden_states[input_tokens:].zero_()
+                    handle.topk_ids[input_tokens:].fill_(self._padding_topk_id)
+                    handle.topk_weights[input_tokens:].zero_()
+            elif direct_nccl_request:
+                handle = replace(
+                    handle, request_tensors=(hidden_states, topk_ids, topk_weights)
+                )
+        else:
+            if input_tokens != self._dp_capacity:
+                raise RuntimeError(
+                    "AFD prefill input size does not match the DP capacity: "
+                    f"input={input_tokens}, dp={self._dp_capacity}"
+                )
+            hidden_states = hidden_states.contiguous()
+            topk_ids = topk_ids.contiguous()
+            topk_weights = topk_weights.contiguous()
+            handle = AFDWorkHandle(
+                slot_id=None,
+                generation=generation,
+                capacity=input_tokens,
+                input_tokens=input_tokens,
+                hidden_states=hidden_states,
+                topk_ids=topk_ids,
+                topk_weights=topk_weights,
+                output=torch.empty_like(hidden_states),
+                router_logits=None,
+            )
+        if not has_peer:
+            handle.output.zero_()
+        else:
+            request = handle.request_tensors or (
+                handle.hidden_states,
+                handle.topk_ids,
+                handle.topk_weights,
+            )
+            for peer_global_rank in self._ffn_global_ranks:
+                self._comm.send_to(request, peer_global_rank)
         self._active_handle = handle
         return handle
 
@@ -124,13 +564,20 @@ class AFDDispatcher:
         if self._ffn_global_ranks:
             self._comm.recv_from([handle.output], self._ffn_global_ranks[0])
             if len(self._ffn_global_ranks) > 1:
-                scratch = torch.empty_like(handle.output)
+                scratch = handle.response_scratch
+                if scratch is None:
+                    scratch = torch.empty_like(handle.output)
                 for peer_global_rank in self._ffn_global_ranks[1:]:
                     self._comm.recv_from([scratch], peer_global_rank)
                     handle.output.add_(scratch)
+        if handle.slot_id is not None:
+            output = handle.output[: handle.input_tokens]
+            self._pool.release(handle)
+        else:
+            output = handle.output
         self._active_handle = None
         self._next_layer_index += 1
-        return handle.output
+        return output
 
     def _validate_request(
         self,
@@ -139,12 +586,13 @@ class AFDDispatcher:
         topk_ids: torch.Tensor,
         topk_weights: torch.Tensor,
     ) -> None:
-        expected_hidden_shape = (self._wire_capacity, layer.hidden_size)
-        expected_topk_shape = (self._wire_capacity, layer.top_k)
-        if tuple(hidden_states.shape) != expected_hidden_shape:
+        input_tokens = hidden_states.shape[0]
+        expected_topk_shape = (input_tokens, layer.top_k)
+        if hidden_states.ndim != 2 or hidden_states.shape[1] != layer.hidden_size:
             raise RuntimeError(
                 f"AFD layer {layer.layer_id} hidden shape mismatch: "
-                f"expected={expected_hidden_shape}, got={tuple(hidden_states.shape)}"
+                f"expected=(*, {layer.hidden_size}), "
+                f"got={tuple(hidden_states.shape)}"
             )
         if (
             tuple(topk_ids.shape) != expected_topk_shape
@@ -185,6 +633,11 @@ def set_afd_dispatcher(dispatcher: AFDDispatcher) -> None:
 def get_afd_dispatcher() -> AFDDispatcher:
     if _DISPATCHER is None:
         raise RuntimeError(
-            "AFD dispatcher is not initialized; it is created after the startup handshake"
+            "AFD dispatcher is not initialized; it is created after the "
+            "startup handshake"
         )
+    return _DISPATCHER
+
+
+def get_afd_dispatcher_or_none() -> Optional[AFDDispatcher]:
     return _DISPATCHER

@@ -13,6 +13,7 @@ from sglang.srt.afd.afd_handshake import (
     AFDHandshakeServer,
     afd_handshake_port,
     build_afd_ffn_capacity_plan,
+    build_afd_graph_capture_plan,
 )
 from sglang.srt.afd.afd_sync import AFDSyncMsgReceiver
 from sglang.srt.afd.ffn.compute import AFDFFNCompute
@@ -125,7 +126,8 @@ def event_loop_afd_ffn(scheduler: Scheduler) -> None:
         handshake_server = AFDHandshakeServer(afd_handshake_port(get_serving().port))
         try:
             handshake = handshake_server.accept(
-                build_local_handshake_info(scheduler, AFDRole.FFN)
+                build_local_handshake_info(scheduler, AFDRole.FFN),
+                use_deepep_low_latency=get_exec().moe.deepep_mode != "normal",
             )
         finally:
             handshake_server.close()
@@ -139,12 +141,14 @@ def event_loop_afd_ffn(scheduler: Scheduler) -> None:
         handshake.peer,
         use_deepep_low_latency=get_exec().moe.deepep_mode != "normal",
     )
-    scheduler.afd_ffn_compute.configure_native_deepep_dispatch_limit(
-        capacity_plan.deepep_dispatch_limit
-    )
+    compute = scheduler.afd_ffn_compute
+    compute.configure_staged_capacity(capacity_plan)
+    plan = build_afd_graph_capture_plan(handshake)
     backend = init_afd_comm_backend(scheduler, AFDRole.FFN, handshake)
-    executor = AFDFFNExecutor(scheduler, backend, scheduler.afd_ffn_compute)
-    backend.startup_barrier()
+    if not plan.enabled:
+        compute.capture_compute_graphs()
+    executor = AFDFFNExecutor(scheduler, backend, compute, handshake)
+    executor.capture_communication_graphs(plan)
 
     receiver = None
     poller = None

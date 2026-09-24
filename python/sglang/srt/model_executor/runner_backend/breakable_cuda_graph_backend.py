@@ -26,6 +26,7 @@ import torch
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     set_graph_pool_id,
 )
+from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.model_executor.runner_backend.base_cuda_graph_backend import (
     BaseCudaGraphBackend,
@@ -154,11 +155,22 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
     def _output_rows(self, output: Any, cap: int) -> int:
         """Leading-dim row count actually produced by the body, clamped to ``cap``.
 
-        A body that shards or prunes its output along dim 0 returns fewer than
-        ``cap`` rows; everything else returns exactly ``cap``.
+        Tensor bodies can shard or prune below ``cap``. Full-model outputs
+        retain token rows because decode keys count requests instead.
         """
         if torch.is_tensor(output):
             return min(cap, output.shape[0])
+        if isinstance(output, LogitsProcessorOutput):
+            # Decode keys count requests; speculative outputs count token rows.
+            return max(
+                tensor.shape[0]
+                for tensor in (
+                    output.next_token_logits,
+                    output.hidden_states,
+                    output.full_logits,
+                )
+                if tensor is not None
+            )
         if isinstance(output, PPProxyTensors):
             rows = [t.shape[0] for t in output.tensors.values()]
             return min([cap, *rows])
@@ -167,11 +179,21 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
         return cap
 
     def _alloc_full_buffer(self, output: Any, size: int) -> Any:
-        """A same-structure buffer as ``output`` but with ``size`` leading rows."""
+        """Allocate output storage, preserving token rows for full-model outputs."""
         if output is None:
             return None
         if torch.is_tensor(output):
             return output.new_empty((size, *output.shape[1:]))
+        if isinstance(output, LogitsProcessorOutput):
+            num_tokens = self._output_rows(output, size)
+            return LogitsProcessorOutput(
+                next_token_logits=self._alloc_full_buffer(
+                    output.next_token_logits, num_tokens
+                ),
+                hidden_states=self._alloc_full_buffer(output.hidden_states, num_tokens),
+                full_logits=self._alloc_full_buffer(output.full_logits, num_tokens),
+                customized_info=output.customized_info,
+            )
         if isinstance(output, PPProxyTensors):
             return PPProxyTensors(
                 {
@@ -190,6 +212,15 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
             return None
         if torch.is_tensor(output):
             return output[:num_tokens]
+        if isinstance(output, LogitsProcessorOutput):
+            return LogitsProcessorOutput(
+                next_token_logits=self._slice_output(
+                    output.next_token_logits, num_tokens
+                ),
+                hidden_states=self._slice_output(output.hidden_states, num_tokens),
+                full_logits=self._slice_output(output.full_logits, num_tokens),
+                customized_info=output.customized_info,
+            )
         if isinstance(output, PPProxyTensors):
             return output[:num_tokens]
         if isinstance(output, tuple):
@@ -210,6 +241,25 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
             )
         if torch.is_tensor(output) and torch.is_tensor(output_buffer):
             output_buffer[:num_tokens].copy_(output[:num_tokens])
+            return
+        if isinstance(output, LogitsProcessorOutput) and isinstance(
+            output_buffer, LogitsProcessorOutput
+        ):
+            self._copy_output_to_buffer(
+                output.next_token_logits,
+                output_buffer.next_token_logits,
+                num_tokens,
+            )
+            self._copy_output_to_buffer(
+                output.hidden_states,
+                output_buffer.hidden_states,
+                num_tokens,
+            )
+            self._copy_output_to_buffer(
+                output.full_logits,
+                output_buffer.full_logits,
+                num_tokens,
+            )
             return
         if isinstance(output, PPProxyTensors) and isinstance(
             output_buffer, PPProxyTensors

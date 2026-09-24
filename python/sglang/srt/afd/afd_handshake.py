@@ -7,6 +7,7 @@ NCCL communicator, so incompatible peers fail before the first forward.
 
 from __future__ import annotations
 
+import bisect
 import hashlib
 import logging
 import os
@@ -16,6 +17,7 @@ from typing import Tuple
 import msgspec
 import zmq
 
+from sglang.srt.afd.dispatcher import build_decode_token_buckets
 from sglang.srt.environ import envs
 from sglang.srt.utils.network import get_zmq_socket
 
@@ -35,8 +37,11 @@ class AFDHandshakeInfo:
     afd_ffn_moe_backend: str
     wire_dtype: str
     moe_layers: list[dict] = field(repr=False)
-    # A admission bound: global tokens for FULL, per-rank tokens for SCATTERED.
+    # A wire capacities: global tokens for FULL, per-rank tokens for SCATTERED.
     decode_token_buckets: list[int] = field(default_factory=list, repr=False)
+    # Attn reports wire capacities; FFN reports expert-input capacities.
+    decode_graph_token_buckets: list[int] = field(default_factory=list, repr=False)
+    disable_cuda_graph_padding: bool = False
 
 
 class _HandshakeRequest(msgspec.Struct, tag="request", forbid_unknown_fields=True):
@@ -69,8 +74,73 @@ class AFDHandshakeResult:
 
 
 @dataclass(frozen=True)
+class AFDGraphCaptureVariant:
+    attn_batch_size: int
+    attn_wire_capacity: int
+    child_wire_capacities: tuple[int, ...]
+    child_compute_capacities: tuple[int | None, ...]
+
+
+@dataclass(frozen=True)
+class AFDGraphCapturePlan:
+    # Match the attention runner's descending capture order.
+    attn_graph_variants: tuple[AFDGraphCaptureVariant, ...]
+    ffn_graph_variants: tuple[tuple[int, int], ...]
+
+    @property
+    def enabled(self) -> bool:
+        return bool(self.attn_graph_variants or self.ffn_graph_variants)
+
+
+@dataclass(frozen=True)
 class AFDFFNCapacityPlan:
+    graph_token_buckets: tuple[int, ...]
     deepep_dispatch_limit: int | None
+
+
+def _select_ffn_graph_capacity(
+    ffn_buckets: list[int], wire_capacity: int, disable_padding: bool
+) -> int | None:
+    index = bisect.bisect_left(ffn_buckets, wire_capacity)
+    if index == len(ffn_buckets):
+        return None
+    compute_capacity = ffn_buckets[index]
+    if disable_padding and compute_capacity != wire_capacity:
+        return None
+    return compute_capacity
+
+
+def _build_attn_graph_shapes(
+    attn: AFDHandshakeInfo,
+) -> tuple[tuple[int, int, tuple[int, ...]], ...]:
+    attn_graph_capacities = tuple(
+        sorted(set(attn.decode_graph_token_buckets), reverse=True)
+    )
+    transport_capacities = tuple(sorted(set(attn.decode_token_buckets), reverse=True))
+    if not set(attn_graph_capacities).issubset(transport_capacities):
+        raise RuntimeError(
+            "AFD attn graph capacities must be transport capacities: "
+            f"graph={attn_graph_capacities}, transport={transport_capacities}"
+        )
+    wire_token_multiplier = (
+        1 if attn.afd_ffn_moe_backend == "deepep" else attn.num_ranks
+    )
+    shapes = []
+    for attn_wire_capacity in attn_graph_capacities:
+        if attn_wire_capacity % wire_token_multiplier != 0:
+            raise RuntimeError(
+                "AFD attn graph capacity is not divisible by the fixed wire "
+                "rows per request: "
+                f"capacity={attn_wire_capacity}, rows_per_request={wire_token_multiplier}"
+            )
+        shapes.append(
+            (
+                attn_wire_capacity // wire_token_multiplier,
+                attn_wire_capacity,
+                (attn_wire_capacity,),
+            )
+        )
+    return tuple(shapes)
 
 
 def build_afd_ffn_capacity_plan(
@@ -78,14 +148,15 @@ def build_afd_ffn_capacity_plan(
     attn: AFDHandshakeInfo,
     use_deepep_low_latency: bool,
 ) -> AFDFFNCapacityPlan:
-    """Derive the staged DeepEP capacity from A admission and rank fan-in."""
+    """Derive staged F graph and DeepEP capacities from A admission limits."""
+    scattered = ffn.afd_ffn_moe_backend == "deepep"
+    fan_in = (attn.num_ranks + ffn.num_ranks - 1) // ffn.num_ranks if scattered else 1
+    graph_capacities = {
+        capacity * fan_in for _, capacity, _ in _build_attn_graph_shapes(attn)
+    }
+    graph_max_capacity = max(graph_capacities, default=0)
     deepep_dispatch_limit = None
-    if (
-        ffn.afd_ffn_moe_backend == "deepep"
-        and use_deepep_low_latency
-        and attn.decode_token_buckets
-    ):
-        fan_in = (attn.num_ranks + ffn.num_ranks - 1) // ffn.num_ranks
+    if scattered and use_deepep_low_latency and attn.decode_token_buckets:
         deepep_dispatch_limit = max(attn.decode_token_buckets) * fan_in
         if deepep_dispatch_limit > 1024:
             raise RuntimeError(
@@ -93,7 +164,91 @@ def build_afd_ffn_capacity_plan(
                 "per rank for one attn session; "
                 f"required={deepep_dispatch_limit}"
             )
-    return AFDFFNCapacityPlan(deepep_dispatch_limit=deepep_dispatch_limit)
+        # Preserve native DeepEP's default capacity for small admission limits;
+        # shrinking its expert buffers can produce incorrect masked-GEMM results.
+        deepep_dispatch_limit = max(
+            deepep_dispatch_limit,
+            envs.SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK.default,
+        )
+        graph_max_capacity = min(graph_max_capacity, deepep_dispatch_limit)
+        graph_capacities = {
+            capacity
+            for capacity in graph_capacities
+            if capacity <= deepep_dispatch_limit
+        }
+    if not ffn.decode_graph_token_buckets or not graph_max_capacity:
+        graph_buckets: tuple[int, ...] = ()
+    elif ffn.disable_cuda_graph_padding:
+        graph_buckets = tuple(sorted(graph_capacities))
+    else:
+        graph_buckets = tuple(
+            build_decode_token_buckets(
+                local_batch_sizes=sorted(graph_capacities),
+                max_local_requests=graph_max_capacity,
+                wire_token_multiplier=1,
+            )
+        )
+    return AFDFFNCapacityPlan(
+        graph_token_buckets=graph_buckets,
+        deepep_dispatch_limit=deepep_dispatch_limit,
+    )
+
+
+def build_afd_graph_capture_plan(handshake: AFDHandshakeResult) -> AFDGraphCapturePlan:
+    attn = handshake.local if handshake.local.role == "attn" else handshake.peer
+    ffn = handshake.local if handshake.local.role == "ffn" else handshake.peer
+    attn_graph_shapes = _build_attn_graph_shapes(attn)
+    scattered = attn.afd_ffn_moe_backend == "deepep"
+    ffn_max_fan_in = (
+        (attn.num_ranks + ffn.num_ranks - 1) // ffn.num_ranks if scattered else 1
+    )
+    ffn_graph_compatible = not (
+        scattered
+        and ffn.disable_cuda_graph_padding
+        and attn.num_ranks % ffn.num_ranks != 0
+    )
+    ffn_buckets = sorted(set(ffn.decode_graph_token_buckets))
+    candidate_capacities = tuple(shape[1] for shape in attn_graph_shapes)
+    missing_capacities = []
+    ffn_capacity_by_wire = {}
+    for wire_capacity in candidate_capacities:
+        compute_capacity = (
+            _select_ffn_graph_capacity(
+                ffn_buckets,
+                wire_capacity * ffn_max_fan_in,
+                ffn.disable_cuda_graph_padding,
+            )
+            if ffn_graph_compatible
+            else None
+        )
+        if compute_capacity is None:
+            missing_capacities.append((wire_capacity, wire_capacity * ffn_max_fan_in))
+            continue
+        ffn_capacity_by_wire[wire_capacity] = compute_capacity
+    if candidate_capacities and not ffn_graph_compatible:
+        raise RuntimeError(
+            "AFD NCCL communication graph with non-uniform SCATTERED "
+            "fan-in requires F-side CUDA graph padding; remove "
+            "--disable-cuda-graph-padding"
+        )
+    if missing_capacities:
+        raise RuntimeError(
+            "AFD NCCL communication graph requires an ffn graph bucket for "
+            "every attn graph capacity: "
+            f"missing_edge_to_ffn={missing_capacities}, ffn_buckets={ffn_buckets}"
+        )
+    return AFDGraphCapturePlan(
+        attn_graph_variants=tuple(
+            AFDGraphCaptureVariant(
+                attn_batch_size=batch_size,
+                attn_wire_capacity=wire_capacity,
+                child_wire_capacities=child_wire_capacities,
+                child_compute_capacities=(ffn_capacity_by_wire[wire_capacity],),
+            )
+            for batch_size, wire_capacity, child_wire_capacities in attn_graph_shapes
+        ),
+        ffn_graph_variants=tuple(ffn_capacity_by_wire.items()),
+    )
 
 
 def afd_handshake_port(ffn_api_port: int) -> int:
@@ -229,14 +384,20 @@ class AFDHandshakeServer:
             zmq.Context.instance(), zmq.ROUTER, f"tcp://*:{port}", bind=True
         )
 
-    def accept(self, local: AFDHandshakeInfo) -> AFDHandshakeResult:
+    def accept(
+        self, local: AFDHandshakeInfo, *, use_deepep_low_latency: bool = False
+    ) -> AFDHandshakeResult:
         logger.info("AFD handshake: waiting for attn peer on port %d", self._port)
         identity, _, payload = self._socket.recv_multipart()
         try:
             request = _handshake_request_decoder.decode(payload)
             peer = request.info
             _check_compatible(local, peer)
-        except (msgspec.DecodeError, RuntimeError) as exc:
+            capacity_plan = build_afd_ffn_capacity_plan(
+                local, peer, use_deepep_low_latency
+            )
+            local.decode_graph_token_buckets = list(capacity_plan.graph_token_buckets)
+        except (msgspec.DecodeError, RuntimeError, ValueError) as exc:
             self._socket.send_multipart(
                 [identity, b"", msgspec.msgpack.encode(_HandshakeError(str(exc)))]
             )

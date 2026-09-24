@@ -1,4 +1,4 @@
-"""CPU contract tests for AFD configuration and eager execution."""
+"""CPU contract tests for AFD configuration, fixed buffers, and execution."""
 
 import unittest
 from concurrent.futures import ThreadPoolExecutor
@@ -11,8 +11,17 @@ from unittest.mock import Mock, patch
 import torch
 
 from sglang.srt.afd.afd_config import AFDRole, check_afd_server_args
-from sglang.srt.afd.afd_handshake import AFDHandshakeInfo, build_afd_ffn_capacity_plan
-from sglang.srt.afd.afd_scheduler import prepare_afd_attn_batch
+from sglang.srt.afd.afd_handshake import (
+    AFDGraphCaptureVariant,
+    AFDHandshakeInfo,
+    AFDHandshakeResult,
+    build_afd_ffn_capacity_plan,
+)
+from sglang.srt.afd.afd_scheduler import (
+    AFDSyncSender,
+    _decide_afd_attn_graph,
+    prepare_afd_attn_batch,
+)
 from sglang.srt.afd.afd_sync import AFDSyncMsg
 from sglang.srt.afd.comm.base import AFDCommConfig
 from sglang.srt.afd.dispatcher import AFDDispatcher
@@ -23,7 +32,6 @@ from sglang.srt.arg_groups.overrides import resolving_view
 from sglang.srt.layers.moe.utils import DeepEPMode, MoeA2ABackend
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
-    Phase,
     default_cuda_graph_config,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
@@ -47,7 +55,7 @@ def _make_args(**overrides):
 
 
 class TestAFDServerArgsCheck(unittest.TestCase):
-    def test_attention_role_resolves_eager_execution_and_routing(self):
+    def test_attention_role_preserves_decode_graph_and_resolves_routing(self):
         for disaggregation_mode, backend in product(
             ("null", "decode"), ("none", "deepep")
         ):
@@ -61,11 +69,12 @@ class TestAFDServerArgsCheck(unittest.TestCase):
                 self.assertEqual(resolved.moe_a2a_backend, "afd")
                 self.assertEqual(resolved.afd_ffn_moe_backend, backend)
                 self.assertTrue(resolved.disable_shared_experts_fusion)
-                for phase in Phase.ALL:
-                    self.assertEqual(
-                        getattr(resolved.cuda_graph_config, phase).backend,
-                        Backend.DISABLED,
-                    )
+                self.assertEqual(
+                    resolved.cuda_graph_config.decode.backend, Backend.FULL
+                )
+                self.assertEqual(
+                    resolved.cuda_graph_config.prefill.backend, Backend.DISABLED
+                )
                 self.assertEqual(args.moe_a2a_backend, backend)
                 self.assertIs(args.cuda_graph_config, original_graph_config)
 
@@ -137,13 +146,18 @@ class _CPUExperts(torch.nn.Module):
         self.post_scale = post_scale
         self.barrier = barrier
         self.inputs = []
+        self.routing_ids = []
+        self.output_ptrs = []
 
     def forward(self, hidden_states, topk):
         self.inputs.append(hidden_states.clone())
+        self.routing_ids.append(topk.topk_ids.clone())
         if self.barrier is not None:
             self.barrier.wait(timeout=5)
         weights = ((topk.topk_ids + 1) * topk.topk_weights).sum(dim=1, keepdim=True)
-        return hidden_states * weights * self.runner_scale
+        output = hidden_states * weights * self.runner_scale
+        self.output_ptrs.append(output.data_ptr())
+        return output
 
 
 class _CPUComm:
@@ -151,8 +165,10 @@ class _CPUComm:
         self.config = config
         self.channels = channels
         self.transfers = []
+        self.sent_tensor_ptrs = []
 
     def send_to(self, tensors, peer_global_rank):
+        self.sent_tensor_ptrs.append(tuple(t.data_ptr() for t in tensors))
         self.transfers.append(
             ("send", peer_global_rank, tuple(t.shape for t in tensors))
         )
@@ -179,13 +195,32 @@ class TestAFDEagerRoundtrip(unittest.TestCase):
     def _executor(self, comm, layers, *, scattered=False, deepep_mode="normal"):
         scheduler = SimpleNamespace(
             tp_worker=SimpleNamespace(
-                model_runner=SimpleNamespace(dtype=torch.float32, model=None)
+                model_runner=SimpleNamespace(
+                    dtype=torch.float32, model=None, device="cpu"
+                )
             ),
             tp_group=SimpleNamespace(
                 world_size=comm.config.num_ffn_ranks,
                 rank_in_group=comm.config.instance_rank,
             ),
+            ps=SimpleNamespace(gpu_id=0),
+            device_module=SimpleNamespace(),
         )
+        backend = "deepep" if scattered else "none"
+        attn = AFDHandshakeInfo(
+            "attn",
+            "model",
+            comm.config.num_attn_ranks,
+            "nccl",
+            backend,
+            "float32",
+            [],
+            list(range(1, 17)),
+        )
+        ffn = AFDHandshakeInfo(
+            "ffn", "model", comm.config.num_ffn_ranks, "nccl", backend, "float32", []
+        )
+        handshake = AFDHandshakeResult(ffn, attn, "localhost", 30002, 30003)
         disagg = SimpleNamespace(afd_ffn_moe_backend="deepep" if scattered else "none")
         with (
             patch("sglang.srt.afd.ffn.compute.get_disagg", return_value=disagg),
@@ -193,7 +228,11 @@ class TestAFDEagerRoundtrip(unittest.TestCase):
             patch(
                 "sglang.srt.afd.ffn.compute.get_exec",
                 return_value=SimpleNamespace(
-                    moe=SimpleNamespace(deepep_mode=deepep_mode)
+                    moe=SimpleNamespace(deepep_mode=deepep_mode),
+                    graph=SimpleNamespace(
+                        disable_cuda_graph_padding=False, enable_cudagraph_gc=False
+                    ),
+                    features=SimpleNamespace(enable_memory_saver=False),
                 ),
             ),
             patch(
@@ -207,7 +246,7 @@ class TestAFDEagerRoundtrip(unittest.TestCase):
             ),
         ):
             compute = AFDFFNCompute(scheduler)
-            return AFDFFNExecutor(scheduler, comm, compute)
+            return AFDFFNExecutor(scheduler, comm, compute, handshake)
 
     def _comm(self, role, rank, num_attn, num_ffn, channels):
         return _CPUComm(
@@ -225,7 +264,12 @@ class TestAFDEagerRoundtrip(unittest.TestCase):
         attn_comm = self._comm(AFDRole.ATTN, 0, 1, 1, channels)
         ffn_comm = self._comm(AFDRole.FFN, 0, 1, 1, channels)
         dispatcher = AFDDispatcher(
-            attn_comm, layers, torch.float32, torch.device("cpu"), scattered=scattered
+            comm=attn_comm,
+            layers=layers,
+            token_buckets=list(range(1, 17)),
+            dtype=torch.float32,
+            device=torch.device("cpu"),
+            scattered=scattered,
         )
         executor = self._executor(ffn_comm, layers, scattered=scattered)
         return dispatcher, executor, attn_comm, ffn_comm
@@ -280,7 +324,7 @@ class TestAFDEagerRoundtrip(unittest.TestCase):
         dispatcher, executor, attn_comm, ffn_comm = self._pair()
         invalid_messages = (
             AFDSyncMsg(0, [1, 1], int(ForwardMode.DECODE), 2),
-            AFDSyncMsg(0, [2], int(ForwardMode.DECODE), 3),
+            AFDSyncMsg(0, [2], int(ForwardMode.DECODE), 1),
             AFDSyncMsg(0, [1], int(ForwardMode.IDLE), 1),
         )
         for message in invalid_messages:
@@ -336,15 +380,17 @@ class TestAFDEagerRoundtrip(unittest.TestCase):
             for rank, hidden in enumerate(inputs):
                 comm = self._comm(AFDRole.ATTN, rank, num_attn, num_ffn, channels)
                 dispatcher = AFDDispatcher(
-                    comm,
-                    executors[0]._layers,
-                    torch.float32,
-                    torch.device("cpu"),
-                    scattered,
+                    comm=comm,
+                    layers=executors[0]._layers,
+                    token_buckets=list(range(1, 17)),
+                    dtype=torch.float32,
+                    device=torch.device("cpu"),
+                    scattered=scattered,
                 )
-                dispatcher.begin_batch(mode, len(hidden), len(hidden))
+                local_wire = wire_capacity if mode.is_decode() else len(hidden)
+                dispatcher.begin_batch(mode, len(hidden), local_wire)
                 handle = None
-                if len(hidden):
+                if len(hidden) or (mode.is_decode() and scattered):
                     ids = torch.tensor([[0, 1]], dtype=torch.int32).expand(
                         len(hidden), 2
                     )
@@ -405,10 +451,16 @@ class TestAFDEagerRoundtrip(unittest.TestCase):
                     for executor, comm, sources in zip(
                         executors, ffn_comms, source_ranks, strict=True
                     ):
+                        source_inputs = [inputs[rank] for rank in sources]
+                        if mode.is_decode():
+                            source_inputs = [
+                                torch.nn.functional.pad(
+                                    hidden, (0, 0, 0, max(tokens) - len(hidden))
+                                )
+                                for hidden in source_inputs
+                            ]
                         expected = (
-                            torch.cat([inputs[rank] for rank in sources])
-                            if sources
-                            else torch.empty(0, 2)
+                            torch.cat(source_inputs) if sources else torch.empty(0, 2)
                         )
                         self.assertEqual(len(executor._layers[0].experts.inputs), 1)
                         torch.testing.assert_close(
@@ -419,10 +471,13 @@ class TestAFDEagerRoundtrip(unittest.TestCase):
 
     def test_low_latency_fanin_capacity_updates_every_native_dispatcher(self):
         attn = AFDHandshakeInfo(
-            "attn", "model", 3, "nccl", "deepep", "float32", [], [96]
+            "attn", "model", 3, "nccl", "deepep", "float32", [], [32, 64, 96]
         )
         ffn = AFDHandshakeInfo("ffn", "model", 2, "nccl", "deepep", "float32", [])
+        attn.decode_graph_token_buckets = [32, 64]
+        ffn.decode_graph_token_buckets = [1]
         plan = build_afd_ffn_capacity_plan(ffn, attn, use_deepep_low_latency=True)
+        self.assertEqual(plan.graph_token_buckets, (64, 128))
         self.assertEqual(plan.deepep_dispatch_limit, 192)
         inners = [
             SimpleNamespace(
@@ -449,16 +504,108 @@ class TestAFDEagerRoundtrip(unittest.TestCase):
             self.assertEqual(
                 inner._low_latency_dispatcher.num_max_dispatch_tokens_per_rank, 192
             )
-        attn.decode_token_buckets = [512]
+        attn.decode_token_buckets = [32, 64, 512]
         self.assertEqual(
             build_afd_ffn_capacity_plan(ffn, attn, True).deepep_dispatch_limit, 1024
         )
-        attn.decode_token_buckets = [513]
+        attn.decode_token_buckets = [32, 64, 513]
         with self.assertRaisesRegex(RuntimeError, "required=1026"):
             build_afd_ffn_capacity_plan(ffn, attn, True)
         self.assertIsNone(
             build_afd_ffn_capacity_plan(ffn, attn, False).deepep_dispatch_limit
         )
+        attn.decode_graph_token_buckets = []
+        self.assertEqual(
+            build_afd_ffn_capacity_plan(ffn, attn, False).graph_token_buckets, ()
+        )
+
+    def test_staged_fixed_buffer_padding_reuse_and_prefill_exact_size(self):
+        layer = AFDMoELayer(3, torch.nn.Identity(), 2, 4, 2, 4, 0, None)
+        channels = {(0, 1): Queue(), (1, 0): Queue()}
+        comm = self._comm(AFDRole.ATTN, 0, 1, 1, channels)
+        dispatcher = AFDDispatcher(
+            comm=comm,
+            layers=[layer],
+            token_buckets=[4, 8],
+            dtype=torch.float32,
+            device=torch.device("cpu"),
+            scattered=True,
+        )
+        first_slot_ptr = None
+        for index, (mode, size, capacity) in enumerate(
+            (
+                (ForwardMode.DECODE, 3, 4),
+                (ForwardMode.DECODE, 5, 8),
+                (ForwardMode.DECODE, 0, 4),
+                (ForwardMode.EXTEND, 5, 5),
+            ),
+            start=1,
+        ):
+            with self.subTest(mode=mode, size=size):
+                hidden = torch.arange(size * 2, dtype=torch.float32).reshape(size, 2)
+                ids = torch.zeros(size, 2, dtype=torch.int32)
+                weights = torch.ones(size, 2)
+                dispatcher.begin_batch(mode, size, capacity)
+                handle = dispatcher.dispatch(3, hidden, ids, weights)
+                if mode.is_decode():
+                    self.assertTrue(dispatcher.needs_empty_decode_dispatch)
+                    if first_slot_ptr is None:
+                        first_slot_ptr = handle.hidden_states.data_ptr()
+                    self.assertEqual(handle.hidden_states.data_ptr(), first_slot_ptr)
+                    self.assertTrue(torch.all(handle.hidden_states[size:] == 0))
+                    self.assertTrue(torch.all(handle.topk_ids[size:] == -1))
+                    self.assertTrue(torch.all(handle.topk_weights[size:] == 0))
+                else:
+                    self.assertIsNone(handle.slot_id)
+                sent = channels[1, 0].get_nowait()
+                self.assertEqual(tuple(sent[0].shape), (capacity, 2))
+                channels[0, 1].put((torch.full((capacity, 2), float(index)),))
+                output = dispatcher.combine(handle)
+                self.assertEqual(tuple(output.shape), (size, 2))
+                self.assertTrue(torch.all(output == index))
+
+    def test_integrated_nccl_reuses_inputs_and_masks_compute_padding(self):
+        channels = {(0, 1): Queue(), (1, 0): Queue()}
+        attn_comm = self._comm(AFDRole.ATTN, 0, 1, 1, channels)
+        ffn_comm = self._comm(AFDRole.FFN, 0, 1, 1, channels)
+        layer = AFDMoELayer(0, _CPUExperts(), 2, 4, 2, 4, 0, 1.0)
+        executor = self._executor(ffn_comm, [layer], scattered=True)
+        executor._compute._allocate_graph_buffers(4)
+        dispatcher = AFDDispatcher(
+            comm=attn_comm,
+            layers=[layer],
+            token_buckets=[2, 4],
+            dtype=torch.float32,
+            device=torch.device("cpu"),
+            scattered=True,
+        )
+        hidden = torch.arange(4, dtype=torch.float32).reshape(2, 2) + 1
+        ids = torch.tensor([[0, 1], [1, 2]], dtype=torch.int32)
+        weights = torch.full((2, 2), 0.25)
+        with (
+            patch.object(
+                executor._compute,
+                "run_integrated_layer",
+                wraps=executor._compute.run_integrated_layer,
+            ) as run,
+            ThreadPoolExecutor(max_workers=1) as pool,
+        ):
+            result = pool.submit(executor._run_integrated_graph_step, (2,), (4,))
+            output = dispatcher.decode_graph_wave(0, hidden, ids, weights)
+            result.result(timeout=10)
+        torch.testing.assert_close(
+            output, hidden * ((ids + 1) * weights).sum(1, keepdim=True)
+        )
+        self.assertEqual(
+            attn_comm.sent_tensor_ptrs[0],
+            tuple(t.data_ptr() for t in (hidden, ids, weights)),
+        )
+        self.assertFalse(run.call_args.kwargs["stage_inputs"])
+        self.assertEqual(tuple(layer.experts.inputs[0].shape), (4, 2))
+        self.assertTrue(torch.all(layer.experts.inputs[0][2:] == 0))
+        self.assertTrue(torch.all(layer.experts.routing_ids[0][2:] == -1))
+        self.assertEqual(ffn_comm.sent_tensor_ptrs[0], (layer.experts.output_ptrs[0],))
+        self.assertTrue(all(channel.empty() for channel in channels.values()))
 
 
 class TestAFDSchedulerRouting(unittest.TestCase):
@@ -475,10 +622,13 @@ class TestAFDSchedulerRouting(unittest.TestCase):
             with self.subTest(tokens=tokens, gather=gather):
                 scheduler = SimpleNamespace(
                     afd_handshake=SimpleNamespace(
-                        local=SimpleNamespace(num_ranks=len(tokens))
+                        local=SimpleNamespace(
+                            num_ranks=len(tokens), decode_token_buckets=[4, 8]
+                        )
                     ),
                     ps=SimpleNamespace(tp_rank=0),
                     _afd_sync_sender=Mock(),
+                    tp_worker=SimpleNamespace(model_runner=SimpleNamespace()),
                 )
                 batch = SimpleNamespace(
                     forward_mode=ForwardMode.DECODE if tokens[0] else ForwardMode.IDLE,
@@ -520,11 +670,91 @@ class TestAFDSchedulerRouting(unittest.TestCase):
                 dispatcher.begin_batch.assert_called_once_with(
                     forward_mode=ForwardMode.DECODE,
                     dp_capacity=expected[0],
-                    wire_capacity=expected[0],
+                    wire_capacity=8 if max(expected) > 4 else 4,
                 )
-                scheduler._afd_sync_sender.send.assert_called_once_with(
-                    AFDSyncMsg(7, expected, int(ForwardMode.DECODE), max(expected))
+                self.assertEqual(
+                    scheduler.tp_worker.model_runner.afd_cuda_graph_batch_size,
+                    max(expected),
                 )
+                scheduler._afd_sync_sender.prepare_for_batch.assert_called_once_with(
+                    step_id=7,
+                    tokens_per_rank=expected,
+                    forward_mode=ForwardMode.DECODE,
+                    wire_capacity=8 if max(expected) > 4 else 4,
+                )
+
+    def test_control_publishes_final_graph_decision_and_eager_fallback(self):
+        layer = AFDMoELayer(0, torch.nn.Identity(), 2, 4, 2, 4, 0, None)
+        channels = {(0, 1): Queue(), (1, 0): Queue()}
+        comm = _CPUComm(
+            AFDCommConfig(AFDRole.ATTN, 1, 1, 0, "localhost", 1, "cpu"), channels
+        )
+        dispatcher = AFDDispatcher(
+            comm=comm,
+            layers=[layer],
+            token_buckets=[4, 8],
+            dtype=torch.float32,
+            device=torch.device("cpu"),
+            scattered=False,
+        )
+        dispatcher.enable_communication_graph_variants(
+            (AFDGraphCaptureVariant(4, 4, (4,), (4,)),)
+        )
+        with patch("sglang.srt.afd.afd_scheduler.AFDSyncMsgSender") as transport:
+            sender = AFDSyncSender(SimpleNamespace(dist_host="localhost", sync_port=1))
+        for capacity, can_run_graph, expected in (
+            (4, True, True),
+            (4, False, False),
+            (8, True, False),
+        ):
+            with self.subTest(capacity=capacity, can_run_graph=can_run_graph):
+                step_id = dispatcher.begin_batch(ForwardMode.DECODE, capacity, capacity)
+                sender.prepare_for_batch(
+                    step_id, [capacity], ForwardMode.DECODE, capacity
+                )
+                self.assertEqual(transport.return_value.send.call_count, step_id)
+                decision = _decide_afd_attn_graph(can_run_graph, dispatcher)
+                self.assertEqual(decision.use_local_model_graph, expected)
+                sender.send_prepared(decision.use_paired_communication_graph)
+                self.assertEqual(
+                    transport.return_value.send.call_args.args[0].communication_graph,
+                    expected,
+                )
+                with self.assertRaisesRegex(RuntimeError, "no prepared"):
+                    sender.send_prepared(expected)
+                if not expected:
+                    work = dispatcher.dispatch(
+                        0,
+                        torch.ones(capacity, 2),
+                        torch.zeros(capacity, 2, dtype=torch.int32),
+                        torch.ones(capacity, 2),
+                    )
+                    channels[1, 0].get_nowait()
+                    channels[0, 1].put((torch.ones(capacity, 2),))
+                    dispatcher.combine(work)
+
+    def test_breakable_logits_output_buffer_roundtrip(self):
+        from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+        from sglang.srt.model_executor.runner_backend.breakable_cuda_graph_backend import (
+            BreakableCudaGraphBackend,
+        )
+
+        backend = BreakableCudaGraphBackend.__new__(BreakableCudaGraphBackend)
+        output = LogitsProcessorOutput(
+            next_token_logits=torch.arange(20, dtype=torch.float32).reshape(4, 5),
+            hidden_states=torch.arange(8, dtype=torch.float32).reshape(4, 2),
+            full_logits=None,
+            customized_info={"marker": 7},
+        )
+        buffer = backend._alloc_full_buffer(output, 4)
+        backend._copy_output_to_buffer(output, buffer, backend._output_rows(output, 4))
+        sliced = backend._slice_output(buffer, 3)
+        torch.testing.assert_close(
+            sliced.next_token_logits, output.next_token_logits[:3]
+        )
+        torch.testing.assert_close(sliced.hidden_states, output.hidden_states[:3])
+        self.assertIsNone(sliced.full_logits)
+        self.assertEqual(sliced.customized_info, {"marker": 7})
 
     def test_pd_prebuilt_placeholder_does_not_send_an_ffn_step(self):
         from sglang.srt.managers.scheduler import Scheduler

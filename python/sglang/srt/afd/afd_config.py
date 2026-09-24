@@ -79,6 +79,7 @@ def check_afd_server_args(server_args: ServerArgs) -> None:
 
     prepare_afd_ffn_moe_backend(server_args)
     _check_common_args(server_args)
+    _configure_cuda_graph(server_args, role)
     if role.is_attn():
         _check_attn_args(server_args)
     else:
@@ -115,12 +116,39 @@ def _check_common_args(server_args: ServerArgs) -> None:
         declare_resolution(
             server_args, "_check_common_args", disable_shared_experts_fusion=True
         )
+
+
+def _configure_cuda_graph(server_args: ServerArgs, role: AFDRole) -> None:
+    cfg = resolving_view(server_args)
     from sglang.srt.model_executor.cuda_graph_config import Backend, Phase, with_phase
 
     config = cfg.cuda_graph_config
-    for phase in Phase.ALL:
-        config = with_phase(config, phase, backend=Backend.DISABLED)
-    declare_resolution(server_args, "_check_common_args", cuda_graph_config=config)
+    if config.prefill.backend != Backend.DISABLED:
+        logger.info("AFD: disabling prefill CUDA graph")
+        config = with_phase(config, Phase.PREFILL, backend=Backend.DISABLED)
+
+    if role.is_attn():
+        if config.decode.backend not in (
+            Backend.FULL,
+            Backend.BREAKABLE,
+            Backend.DISABLED,
+        ):
+            raise ValueError(
+                "AFD attn instance requires decode CUDA graph backend 'full', "
+                f"'breakable', or 'disabled'; got {config.decode.backend!r}"
+            )
+        if config.decode.backend != Backend.DISABLED and cfg.debug_cuda_graph:
+            raise ValueError("AFD attn instance does not support --debug-cuda-graph")
+    elif config.decode.backend not in (Backend.FULL, Backend.DISABLED):
+        raise ValueError(
+            "AFD ffn instance requires decode CUDA graph backend 'full' or "
+            f"'disabled'; got {config.decode.backend!r}"
+        )
+
+    if config is not cfg.cuda_graph_config:
+        declare_resolution(
+            server_args, "_configure_cuda_graph", cuda_graph_config=config
+        )
 
 
 _DEFAULT_NON_STANDARD_TOPK_RUNNERS = (

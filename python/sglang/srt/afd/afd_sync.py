@@ -14,12 +14,14 @@ logger = logging.getLogger(__name__)
 
 
 class AFDSyncMsg(msgspec.Struct, tag="sync", forbid_unknown_fields=True):
-    """Exact tensor sizes and forward mode sent before each attention step."""
+    """Per-step metadata and the final paired communication graph decision."""
 
     step_id: int
     tokens_per_rank: List[int]
     forward_mode: int
     wire_capacity: int
+    # NCCL peers must both replay paired graphs or both execute eagerly.
+    communication_graph: bool = False
 
 
 _sync_decoder = msgspec.msgpack.Decoder(AFDSyncMsg)

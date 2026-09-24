@@ -15,9 +15,14 @@ from sglang.srt.afd.comm import (
     AFDCommConfig,
     create_afd_comm_backend,
 )
+from sglang.srt.afd.dispatcher import build_decode_token_buckets
 from sglang.srt.afd.layers import collect_afd_moe_layers
 from sglang.srt.environ import envs
-from sglang.srt.runtime_context import get_disagg, get_model
+from sglang.srt.model_executor.cuda_graph_config import Backend
+from sglang.srt.model_executor.runner.base_cuda_graph_runner import (
+    get_batch_sizes_to_capture,
+)
+from sglang.srt.runtime_context import get_disagg, get_exec, get_model
 
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import Scheduler
@@ -34,11 +39,26 @@ def build_local_handshake_info(scheduler: Scheduler, role: AFDRole) -> AFDHandsh
     moe_layers = collect_afd_moe_layers(model_runner.model, role)
     scattered = get_disagg().afd_ffn_moe_backend == "deepep"
     decode_token_buckets = []
+    decode_graph_token_buckets = []
+    decode_config = get_exec().graph.cuda_graph_config.decode
+    wire_token_multiplier = 1 if scattered else scheduler.ps.tp_size
     if role.is_attn():
-        wire_token_multiplier = 1 if scattered else scheduler.ps.tp_size
-        decode_token_buckets = [
-            model_runner.max_running_requests * wire_token_multiplier
-        ]
+        if decode_config.backend == Backend.DISABLED:
+            local_batch_sizes = decode_config.bs
+        else:
+            local_batch_sizes, _ = get_batch_sizes_to_capture(model_runner, 1)
+            decode_graph_token_buckets = [
+                batch_size * wire_token_multiplier for batch_size in local_batch_sizes
+            ]
+        if local_batch_sizes is None:
+            raise RuntimeError("AFD requires normalized decode batch sizes")
+        decode_token_buckets = build_decode_token_buckets(
+            local_batch_sizes=local_batch_sizes,
+            max_local_requests=model_runner.max_running_requests,
+            wire_token_multiplier=wire_token_multiplier,
+        )
+    elif decode_config.backend == Backend.FULL:
+        decode_graph_token_buckets = list(decode_config.bs)
     return AFDHandshakeInfo(
         role=role.value,
         model_identity=compute_model_identity(get_model().model_path),
@@ -47,6 +67,8 @@ def build_local_handshake_info(scheduler: Scheduler, role: AFDRole) -> AFDHandsh
         afd_ffn_moe_backend=get_disagg().afd_ffn_moe_backend,
         wire_dtype=str(model_runner.dtype).removeprefix("torch."),
         decode_token_buckets=decode_token_buckets,
+        decode_graph_token_buckets=decode_graph_token_buckets,
+        disable_cuda_graph_padding=get_exec().graph.disable_cuda_graph_padding,
         moe_layers=[
             {
                 "layer_id": layer.layer_id,

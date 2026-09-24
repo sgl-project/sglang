@@ -702,7 +702,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         ):
             return False
 
-        if self.require_mlp_tp_gather:
+        if self.model_runner.afd_cuda_graph_batch_size is not None:
+            cuda_graph_bs = self.model_runner.afd_cuda_graph_batch_size
+        elif self.require_mlp_tp_gather:
             cuda_graph_bs = self._max_dp_batch_size(forward_batch)
         else:
             cuda_graph_bs = forward_batch.batch_size
@@ -1348,7 +1350,11 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             self._stage_ragged_verify_layout(ragged_layout, graph_size_key)
         else:
             raw_num_token = raw_bs * self.captured_req_width
-            if self.require_mlp_tp_gather:
+            if self.model_runner.afd_cuda_graph_batch_size is not None:
+                bs = self._pad_to_bucket(
+                    self.model_runner.afd_cuda_graph_batch_size, self.capture_bs
+                )
+            elif self.require_mlp_tp_gather:
                 max_batch_size = self._max_dp_batch_size(forward_batch)
                 bs = self._pad_to_bucket(max_batch_size, self.capture_bs)
             else:
