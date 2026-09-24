@@ -59,7 +59,6 @@ from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA, DeepseekV2MLP,
 from sglang.srt.models.utils import WeightsMapper
 from sglang.srt.runtime_context import (
     get_device,
-    get_forward,
     get_parallel,
     get_platform,
     get_stream,
@@ -835,6 +834,7 @@ class BailingMoELinearDecoderLayer(nn.Module):
             input_layernorm=self.input_layernorm,
             post_attention_layernorm=self.post_attention_layernorm,
             allow_reduce_scatter=False,
+            is_last_layer=(is_nextn or layer_id == config.num_hidden_layers - 1),
             qkv_latent_func=qkv_latent_func,
         )
 
@@ -883,25 +883,9 @@ class BailingMoELinearDecoderLayer(nn.Module):
         # logger.warning(
         #     f"===={self.layer_id=}, 3 shape= {hidden_states.shape}, {residual.shape}"
         # )
-        fuse_mlp_allreduce = (
-            self.layer_communicator.should_fuse_mlp_allreduce_with_next_layer(
-                forward_batch
-            )
-        )
-        mlp_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
-            forward_batch
-        )
-        with get_forward().scoped(
-            fuse_mlp_allreduce=fuse_mlp_allreduce,
-            mlp_reduce_scatter=mlp_reduce_scatter,
-        ):
+        with self.layer_communicator.ffn_exit(forward_batch) as ffn_exit:
             hidden_states = self.mlp(hidden_states)
-        if fuse_mlp_allreduce:
-            hidden_states._sglang_needs_allreduce_fusion = True
-        else:
-            hidden_states, residual = self.layer_communicator.postprocess_layer(
-                hidden_states, residual, forward_batch
-            )
+        hidden_states, residual = ffn_exit.finish(hidden_states, residual)
         return hidden_states, residual
 
     @staticmethod
