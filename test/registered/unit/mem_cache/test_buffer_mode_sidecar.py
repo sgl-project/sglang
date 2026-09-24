@@ -37,7 +37,11 @@ class TestBufferModeSidecar(unittest.TestCase):
     def _swa_component():
         return SimpleNamespace(
             full_window_pages=2,
-            _swa_kv_pool_host=SimpleNamespace(page_size=2, size=8),
+            _swa_kv_pool_host=SimpleNamespace(
+                page_size=2,
+                size=8,
+                shared_allocation_domain=None,
+            ),
         )
 
     @staticmethod
@@ -137,6 +141,7 @@ class TestBufferModeSidecar(unittest.TestCase):
         ]
 
         controller = MagicMock()
+        controller.mem_pool_host.anchor_entry.host_pool.shared_allocation_domain = None
         controller.mem_pool_host.entry_map = {
             PoolName.SWA: SimpleNamespace(
                 host_pool=SimpleNamespace(page_size=page_size)
@@ -233,12 +238,13 @@ class TestBufferModeSidecar(unittest.TestCase):
             )
             for spec in self._dsv4_specs()
         ]
+        host_indices = torch.arange(4, dtype=torch.int64)
         operation = SimpleNamespace(
             id=23,
             pool_transfers=sidecars,
             storage_start=0,
+            buffer_host_occupied_units=len(host_indices),
         )
-        host_indices = torch.arange(4, dtype=torch.int64)
         req_id = CacheRequestHandle("sidecar-prefetch", 0)
 
         cache = MagicMock()

@@ -49,6 +49,7 @@ class EvictDeviceNextNodeResult(BaseEvictionResult):
     """
 
     node_id: Optional[NodeId] = None
+    backup_kv: Optional[BackupKV] = None
     made_progress: bool = False
     unbacked_tokens: int = 0
 
@@ -472,6 +473,13 @@ class UnifiedTreeCoreInterface(ABC):
     def set_hicache_enabled(self) -> None:
         """Mark the host tier (HiCache) as wired."""
         ...
+
+    def enable_swa_write_back_eviction_barrier(self) -> None:
+        """Enable a backend-managed barrier when needed.
+
+        The Python core demotes through SWAComponent directly. Native cores
+        may return a backup action to the cache executor before eviction.
+        """
 
     @abstractmethod
     def set_host_memory_buffer_only(self) -> None:

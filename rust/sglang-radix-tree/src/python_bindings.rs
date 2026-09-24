@@ -770,6 +770,7 @@ fn tracker_to_py(tracker: HashMap<ComponentType, usize>) -> HashMap<u8, usize> {
 #[pyclass(get_all)]
 pub struct EvictDeviceNextNodeResultBinding {
     node_id: Option<NodeId>,
+    backup_kv: Option<Py<PyAny>>,
     made_progress: bool,
     tracker: HashMap<u8, usize>,
     new_device_frees: Py<PyDict>,
@@ -1224,6 +1225,11 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
         Ok(())
     }
 
+    fn get_node_key_lengths(&self, py: Python<'_>, node_ids: Vec<NodeId>) -> PyResult<Vec<usize>> {
+        py.allow_threads(|| self.core().get_node_key_lengths(&node_ids))
+            .map_err(node_access_error)
+    }
+
     /// A component's device value on a node, if set.
     fn get_component_device_value(
         &self,
@@ -1272,6 +1278,10 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
         let made_progress = node_id.is_some() || !result.tracker.is_empty();
         Ok(EvictDeviceNextNodeResultBinding {
             node_id,
+            backup_kv: result
+                .backup_kv
+                .map(|backup| cache_action_to_py(py, CacheAction::BackupKV(backup)))
+                .transpose()?,
             made_progress,
             tracker: tracker_to_py(result.tracker),
             new_device_frees: frees_to_py(py, result.device_frees)?,
@@ -1430,6 +1440,11 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
     /// Whether the host tier (HiCache) is wired.
     fn enable_hicache(&self, py: Python<'_>) -> bool {
         py.allow_threads(|| self.core().enable_hicache)
+    }
+
+    /// Preserve dirty SWA data before cache-mode write-back eviction.
+    fn enable_swa_write_back_eviction_barrier(&self, py: Python<'_>) {
+        py.allow_threads(|| self.core().enable_swa_write_back_eviction_barrier());
     }
 
     /// Mark the SWA host pool as wired (HiCache).
@@ -2571,6 +2586,11 @@ macro_rules! tree_core_binding {
                     .set_component_device_value(py, node_id, component_type, value)
             }
 
+            /// Key lengths for mapping newly allocated FULL load-back rows.
+            fn get_node_key_lengths(&self, py: Python<'_>, node_ids: Vec<NodeId>) -> PyResult<Vec<usize>> {
+                self.inner.get_node_key_lengths(py, node_ids)
+            }
+
             /// A component's device value on a node, if set.
             fn get_component_device_value(
                 &self,
@@ -2723,6 +2743,11 @@ macro_rules! tree_core_binding {
             /// Whether the host tier (HiCache) is wired.
             fn enable_hicache(&self, py: Python<'_>) -> bool {
                 self.inner.enable_hicache(py)
+            }
+
+            /// Preserve dirty SWA data before cache-mode write-back eviction.
+            fn enable_swa_write_back_eviction_barrier(&self, py: Python<'_>) {
+                self.inner.enable_swa_write_back_eviction_barrier(py)
             }
 
             /// Mark the SWA host pool as wired (HiCache).

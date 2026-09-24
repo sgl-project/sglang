@@ -528,9 +528,8 @@ class TestDecodeLockRefScenarios(CustomTestCase):
         scheduler.output_streamer = MagicMock()
         queue.scheduler = scheduler
 
-        # The 4-token match is locked, then capped to zero because the whole
-        # 8-token request is inside the SWA window. Admission rejection must
-        # still release the original matched-node lock.
+        # Admission rejection must release the matched-node lock, including
+        # when the SWA lock was already released for fresh tail allocation.
         queue._allocatable_token_budgets = MagicMock(return_value=3)
 
         preallocated, failed = queue.pop_preallocated()

@@ -296,7 +296,12 @@ def _uses_unified_page_envelope_host(
             for pool in (full_kv_pool, swa_kv_pool)
         )
         and {full_kv_pool.grow_direction, swa_kv_pool.grow_direction} == {"up", "down"}
-        and get_memory().hicache_host_memory_mode != "buffer_only"
+        # Mooncake's MHA storage contract needs separate K/V page buffers.
+        # Keep its existing buffer-only host pools instead of a shared envelope.
+        and not (
+            get_memory().hicache_host_memory_mode == "buffer_only"
+            and get_memory().hicache_storage_backend == "mooncake"
+        )
     )
 
 

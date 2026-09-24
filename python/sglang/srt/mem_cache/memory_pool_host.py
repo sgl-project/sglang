@@ -64,6 +64,7 @@ class LogicalHostPool:
     """
 
     shared_allocation_domain = None
+    stores_page_envelope = False
 
     def __init__(self, size: int, page_size: int, layout: str = "layer_first"):
         if size % page_size != 0:
