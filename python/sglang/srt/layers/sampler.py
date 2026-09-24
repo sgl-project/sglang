@@ -112,7 +112,9 @@ class Sampler(nn.Module):
         self.cp_sync_group = None
         if is_dp_attention_enabled():
             self.tp_sync_group = get_parallel().attn_tp_group.device_group
-            self.cp_sync_group = get_parallel().attn_cp_group.device_group
+            # Single-shard drafts may have no context-parallel group.
+            if get_parallel().attn_cp_size > 1:
+                self.cp_sync_group = get_parallel().attn_cp_group.device_group
 
         self.rl_on_policy_target = get_exec().deterministic.rl_on_policy_target
         # In RL on-policy mode, deterministic inference is automatically enabled.

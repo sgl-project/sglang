@@ -53,14 +53,14 @@ const config = {
         },
         {
           id: "offload", label: "CPU offload",
-          flags: (s) => s.hw === "rtx4090" && Number(s.gpus_per_node) === 1 && effectiveAttention(s) === "fa" && s.precision === "native" && s.execution === "eager"
+          flags: (s) => ["rtx4090", "rtx5090"].includes(s.hw) && Number(s.gpus_per_node) === 1 && effectiveAttention(s) === platformAttention(s) && s.precision === "native" && s.execution === "eager"
             && ["text", "edit"].includes(s.mode) && Number(s.outputs) === 1 && (!s.batching || s.batching === "off")
-            ? ["--performance-mode manual", "--component-residency dit=resident text_encoder=layerwise-offload vae=resident", `--warmup-resolutions ${s.resolution || "1024"}x${s.resolution || "1024"}`]
+            ? ["--performance-mode manual", "--component-residency text_encoder=layerwise-offload"]
             : ["--performance-mode manual", "--dit-layerwise-offload true", ...(s.hw === "rtx4090" ? ["--text-encoder-cpu-offload true"] : [])],
           recommendedWhen: (s) => ["rtx5090", "rtx4090"].includes(s.hw),
           soft: (s) => !["rtxpro6000", "rtx5090", "rtx4090"].includes(s.hw) || Number(s.gpus_per_node) !== 1,
           softReason: "This offload topology has not completed an HTTP verification run.",
-          description: "RTX 4090 native single-output FlashAttention keeps the DiT and VAE resident and streams encoder layers. Other offload recipes stream DiT layers; RTX 4090 also offloads the encoder. Requires sufficient host RAM.",
+          description: "RTX 4090 and RTX 5090 keep the DiT and VAE on the card, on their platform attention kernel, and stream encoder layers. That is faster than streaming the DiT: measured 1024px / 40 steps on one RTX 5090, 14.12s against 19.95s, on 17.0GB against 19.3GB steady. Other offload recipes stream DiT layers. Requires sufficient host RAM.",
         },
         {
           id: "all_offload", label: "All components layerwise",
@@ -210,8 +210,8 @@ const config = {
         { id: "eager", label: "Eager", recommended: true },
         {
           id: "bcg", label: "Breakable CUDA Graph",
-          flags: (s) => ["--enable-breakable-cuda-graph true", `--warmup-resolutions ${s.resolution || "1024"}x${s.resolution || "1024"}`, "--bcg-text-buckets 64"],
-          soft: true, softReason: "A 1024px H200 server captured its warmup graph, but tested requests fell back to eager because condition-prefix shapes differed.",
+          flags: (s) => ["--enable-breakable-cuda-graph true", `--warmup-resolutions ${s.resolution || "1024"}x${s.resolution || "1024"}`],
+          soft: true, softReason: "Unmatched condition-prefix shapes run eagerly. Keep eager execution for the recommended recipes.",
           description: "Captures the selected resolution. Condition-prefix shapes must also match warmup; text buckets alone do not ensure replay.",
         },
       ],
@@ -289,7 +289,7 @@ const config = {
         { id: "b200-2-ulysses", hw: "b200", nodes: 1, gpus_per_node: 2, placement: "resident", tp_size: 1, ulysses_degree: 2, ring_degree: 1, encoder: "auto", attentions: ["fa"], batchSizes: [1, 2] },
         { id: "rtxpro6000-1-resident", hw: "rtxpro6000", nodes: 1, gpus_per_node: 1, placement: "resident", tp_size: 1, ulysses_degree: 1, ring_degree: 1, encoder: "auto", attentions: ["sdpa"], batchSizes: [1, 2, 4], default: true },
         { id: "rtxpro6000-1-offload", hw: "rtxpro6000", nodes: 1, gpus_per_node: 1, placement: "offload", tp_size: 1, ulysses_degree: 1, ring_degree: 1, encoder: "auto", attentions: ["sdpa"] },
-        { id: "rtx5090-1-offload", hw: "rtx5090", nodes: 1, gpus_per_node: 1, placement: "offload", tp_size: 1, ulysses_degree: 1, ring_degree: 1, encoder: "auto", attentions: ["sdpa"], default: true, unverified: true },
+        { id: "rtx5090-1-offload", hw: "rtx5090", nodes: 1, gpus_per_node: 1, placement: "offload", tp_size: 1, ulysses_degree: 1, ring_degree: 1, encoder: "auto", attentions: ["sdpa"], default: true },
         { id: "rtx4090-1-offload", hw: "rtx4090", nodes: 1, gpus_per_node: 1, placement: "offload", tp_size: 1, ulysses_degree: 1, ring_degree: 1, encoder: "auto", attentions: ["fa", "sdpa"], batchSizes: [1, 2], batchAttentions: ["fa"], default: true },
         { id: "dgx-spark-1-resident", hw: "dgx-spark", nodes: 1, gpus_per_node: 1, placement: "resident", tp_size: 1, ulysses_degree: 1, ring_degree: 1, encoder: "auto", attentions: ["sdpa"], batchSizes: [1], default: true },
       ],
@@ -398,16 +398,17 @@ const config = {
         : "Combine the subjects from Picture 1 and Picture 2 into one coherent scene, preserving their appearance.",
     };
     const request = {
-      model: "{{MODEL_NAME}}", prompt: prompts[s.mode], n: Number(s.outputs),
-      size: `${s.resolution}x${s.resolution}`, num_inference_steps: Number(s.steps),
-      guidance_scale: 1, seed: 42, generator_device: "cpu",
+      prompt: prompts[s.mode], generator_device: "cpu",
       output_format: "png", response_format: "b64_json",
-      background: transparent ? "transparent" : "auto",
     };
+    if (Number(s.outputs) !== 1) request.n = Number(s.outputs);
+    if (s.resolution !== "1024") request.size = `${s.resolution}x${s.resolution}`;
+    if (Number(s.steps) !== 40) request.num_inference_steps = Number(s.steps);
+    if (transparent) request.background = "transparent";
     if (s.mode === "text") {
       return `curl -sS --fail-with-body http://{{CURL_HOST}}:{{CURL_PORT}}/v1/images/generations \\
   -H 'Content-Type: application/json' \\
-  -d '${JSON.stringify({ ...request, enable_cache_dit: false }, null, 2)}'`;
+  -d '${JSON.stringify(request, null, 2)}'`;
     }
     const fields = Object.entries(request).map(([key, value]) => `  --form-string '${key}=${value}'`);
     fields.push('  -F "image[]=@{{INPUT_IMAGE}};type=image/png"');

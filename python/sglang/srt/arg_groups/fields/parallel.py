@@ -1,11 +1,4 @@
-"""Config fields of the ``parallel`` namespace.
-
-One class per namespace. The class *is* the namespace: a field declared here
-lands in the ``parallel`` bag, which is what ``get_parallel()`` returns, so a reader
-spells it exactly as before. ``ServerArgs`` composes these classes, so the
-record stays one flat object -- the split moves where declarations live, not
-how config is shaped at runtime.
-"""
+"""Config fields of the ``parallel`` namespace."""
 
 from __future__ import annotations
 
@@ -280,18 +273,7 @@ class Parallel(msgspec.Struct):
         "Maximum EP size the server can scale to at runtime. Pre-allocates active-rank state and backend buffers to this size. Defaults to the launch-time world size.",
     ] = None
 
-    # ---- derived: the quotients of the leaves above -------------------------
-    #
-    # Declared here, beside what they are computed from, because a namespace is
-    # one file and one class. They are not annotated, so they are not dataclass
-    # fields and `collect_input_fields` does not put them on the record -- which
-    # is right: a quotient has no operator input to preserve, and the record is
-    # what crosses a process boundary, so a width put there would be a stale
-    # copy the moment an elastic scale-up restamps one. Every input is a leaf
-    # above, so all six are fixed once the configuration is: `publish` computes
-    # them through `parallel_widths_of` and stores them as ordinary bag leaves,
-    # and `ParallelContext` answers with the stamp when a scale-up has moved
-    # one.
+    # Derived fields are computed at publication and are not stored in ServerArgs.
     attn_tp_size = Derived(
         fn="sglang.srt.runtime_context.attn_tp_size_of",
         doc="Attention tensor-parallel width: `tp_size` divided by the "
@@ -320,3 +302,67 @@ class Parallel(msgspec.Struct):
         doc="Whether decode context parallelism is in play: `dcp_size` is "
         "wider than one rank, which is exactly when the group gets built.",
     )
+
+    # Runtime fields: publish sets ranks; distributed initialization sets groups.
+    tp_rank = Derived(doc="This process's place in the tensor-parallel group.")
+    pp_rank = Derived(doc="This process's place in the pipeline group.")
+    moe_ep_rank = Derived(doc="This process's place in the expert-parallel group.")
+    moe_dp_rank = Derived(doc=("This process's place in the MoE data-parallel group."))
+    moe_tp_rank = Derived(
+        doc=("This process's place in the MoE tensor-parallel group.")
+    )
+    attn_tp_rank = Derived(
+        doc=("This process's place in the attention tensor-parallel group.")
+    )
+    attn_cp_rank = Derived(
+        doc=("This process's place in the attention context-parallel group.")
+    )
+    dcp_rank = Derived(
+        doc=("This process's place in the decode context-parallel group.")
+    )
+    attn_dcp_rank = Derived(
+        doc=(
+            "Decode context-parallel rank inside the attention TP group, "
+            "zero where decode context parallelism is off."
+        )
+    )
+    attn_dp_rank = Derived(
+        doc=(
+            "This process's index in the attention-DP group, computed from "
+            "`tp_rank` when `initialize_dp_attention` runs."
+        )
+    )
+    dp_rank = Derived(
+        doc=(
+            "Which data-parallel replica this process serves, as the data "
+            "parallel controller numbered them at spawn. `None` when there "
+            "is no controller: unlike the other ranks it is a position in "
+            "no group, which is why the spawn states it."
+        )
+    )
+    launch_world_rank = Derived(
+        doc=(
+            "This process's rank in the WORLD group as built. A scale-up "
+            "does not renumber it."
+        )
+    )
+    launch_world_size = Derived(
+        fn="sglang.srt.runtime_context.launch_world_size_of",
+        doc="Width the WORLD group was built at -- what a scale-up leaves "
+        "behind rather than updates.",
+    )
+    max_world_size = Derived(
+        fn="sglang.srt.runtime_context.max_world_size_of",
+        doc="Ranks the WORLD group has room for: `--max-ep-size` when set, "
+        "otherwise the launch width.",
+    )
+    world_group = Derived(doc="The WORLD group.")
+    tp_group = Derived(doc="The tensor-parallel group.")
+    pp_group = Derived(doc="The pipeline group.")
+    moe_ep_group = Derived(doc="The expert-parallel group.")
+    moe_dp_group = Derived(doc="The MoE data-parallel group.")
+    moe_tp_group = Derived(doc="The MoE tensor-parallel group.")
+    attn_tp_group = Derived(doc="The attention tensor-parallel group.")
+    attn_cp_group = Derived(doc="The attention context-parallel group.")
+    shared_experts_tp_group = Derived(doc=("The shared-expert tensor-parallel group."))
+    dcp_group = Derived(doc="The decode context-parallel group.")

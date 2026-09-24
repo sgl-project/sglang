@@ -48,7 +48,6 @@ from sglang.srt.mem_cache.base_prefix_cache import (
 from sglang.srt.mem_cache.events import KVCacheEventRecorder
 from sglang.srt.mem_cache.utils import (
     get_eviction_strategy,
-    get_hash_str,
     split_node_hash_value,
 )
 
@@ -246,12 +245,6 @@ class RadixKey:
             return ((self.extra_key, self.cache_salt), plain)
         return plain if self.extra_key is None else (self.extra_key, plain)
 
-    def hash_page(self, start: int, end: int, prior_hash: Optional[str] = None) -> str:
-        """SHA256 for logical units [start, end); bigram mode feeds overlapping (t_i, t_{i+1}) byte pairs."""
-        hash_value = get_hash_str(self[start:end], prior_hash)
-        assert isinstance(hash_value, str)
-        return hash_value
-
 
 class TreeNode:
     counter = 0
@@ -266,12 +259,6 @@ class TreeNode:
         self.creation_time = time.monotonic()
 
         self.hit_count = 0
-        # indicating the node is locked to protect from eviction
-        # incremented when the node is referenced by a storage operation
-        self.host_ref_counter = 0
-        # store the host indices of KV cache
-        self.host_value: Optional[torch.Tensor] = None
-        self.write_through_pending_id: Optional[int] = None
         # store hash values of each pages
         self.hash_value: Optional[List[str]] = None
         # Namespace-aware hashes used only for external KV events.
@@ -285,34 +272,6 @@ class TreeNode:
     @property
     def evicted(self):
         return self.value is None
-
-    @property
-    def backuped(self):
-        return self.host_value is not None
-
-    def protect_host(self):
-        """Protect the host value from eviction."""
-        self.host_ref_counter += 1
-
-    def release_host(self):
-        """Release the host value, allowing it to be evicted."""
-        if self.host_ref_counter > 0:
-            self.host_ref_counter -= 1
-        else:
-            raise RuntimeError("Host reference counter is already zero.")
-
-    def get_last_hash_value(self) -> Optional[str]:
-        """Returns the hash value of the last page in this node."""
-        if self.hash_value is None or len(self.hash_value) == 0:
-            return None
-        return self.hash_value[-1]
-
-    def get_prefix_hash_values(self, node: TreeNode) -> List[str]:
-        chunks = []
-        while node is not None and node.hash_value is not None:
-            chunks.append(node.hash_value)
-            node = node.parent
-        return [value for chunk in reversed(chunks) for value in chunk]
 
     def __lt__(self, other: TreeNode):
         return self.last_access_time < other.last_access_time
@@ -375,7 +334,6 @@ class RadixCache(BasePrefixCache):
         self.root_node = TreeNode(priority=-sys.maxsize)
         self.root_node.key = RadixKey(token_ids=array("q"), extra_key=None)
         self.root_node.value = []
-        self.root_node.host_value = []
         self.root_node.lock_ref = 1
         self.root_node.hash_value = []
         self.evictable_size_ = 0

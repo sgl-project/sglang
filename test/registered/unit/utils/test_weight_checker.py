@@ -20,7 +20,6 @@ from unittest.mock import patch
 import torch
 from torch import nn
 
-from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.layers.quantization.fp8_utils import (
     quant_weight_ue8m0,
     transform_scale_ue8m0,
@@ -44,7 +43,7 @@ from sglang.srt.utils.weight_checker_comparator import (
     RawComparable,
 )
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
-from sglang.test.test_utils import CustomTestCase
+from sglang.test.test_utils import CustomTestCase, enter_scope, published_topology
 
 register_amd_ci(est_time=30, suite="stage-b-test-1-gpu-small-amd")
 register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-small")
@@ -181,15 +180,6 @@ class _FakeModelRunner:
         attn_dp_size: int | None = None,
     ):
         self.model = model
-        self.ps = ParallelState.trivial(
-            tp_rank=tp_rank,
-            tp_size=tp_size,
-            dp_rank=dp_rank,
-            dp_size=dp_size,
-            attn_dp_size=attn_dp_size if attn_dp_size is not None else dp_size,
-            pp_rank=pp_rank,
-            pp_size=pp_size,
-        )
 
 
 # ---------------------------------------------------------------------------
@@ -551,7 +541,8 @@ class _WeightCheckerTestBase(CustomTestCase):
         torch.manual_seed(0)
         self.model = _TinyModel().cuda()
         runner = _FakeModelRunner(self.model)
-        self.checker = WeightChecker(get_model=lambda: runner.model, ps=runner.ps)
+        enter_scope(self, published_topology())
+        self.checker = WeightChecker(get_model=lambda: runner.model)
 
 
 class TestSnapshot(_WeightCheckerTestBase):
@@ -579,6 +570,15 @@ class TestSnapshot(_WeightCheckerTestBase):
         with torch.no_grad():
             self.model.w.data.fill_(99.0)
         torch.testing.assert_close(self.checker._snapshot_tensors["w"], original_w)
+
+    def test_failed_snapshot_holds_no_arena(self):
+        """A copy that raises mid-snapshot must not leave the model-sized arena
+        reachable from the checker, or the retry allocates a second one."""
+        with patch.object(torch.Tensor, "copy_", side_effect=RuntimeError("boom")):
+            with self.assertRaises(RuntimeError):
+                self.checker._snapshot()
+        self.assertIsNone(self.checker._snapshot_arena)
+        self.assertIsNone(self.checker._snapshot_tensors)
 
 
 class TestResetTensors(_WeightCheckerTestBase):
@@ -626,6 +626,21 @@ class TestCompare(_WeightCheckerTestBase):
     def test_passes_when_unchanged(self):
         self.checker._snapshot()
         self.checker._compare()  # no exception
+
+    def test_success_releases_snapshot(self):
+        self.checker._snapshot()
+        self.checker._compare()
+        self.assertIsNone(self.checker._snapshot_tensors)
+        self.assertIsNone(self.checker._snapshot_arena)
+        with self.assertRaises(AssertionError):
+            self.checker._compare()
+
+    def test_failure_keeps_snapshot(self):
+        self.checker._snapshot()
+        self.checker._reset_tensors()
+        with self.assertRaises(Exception):
+            self.checker._compare()
+        self.assertIsNotNone(self.checker._snapshot_tensors)
 
     def test_fails_after_reset_on_normal_param(self):
         self.checker._snapshot()
@@ -760,9 +775,16 @@ class _ChecksumTestBase(CustomTestCase):
             pp_rank=0,
             pp_size=1,
         )
-        self.checker = WeightChecker(
-            get_model=lambda: self.runner.model, ps=self.runner.ps
+        enter_scope(
+            self,
+            published_topology(
+                tp_size=4,
+                dp_size=2,
+                enable_dp_attention=True,
+                ranks={"world_rank": 2, "dp_rank": 1},
+            ),
         )
+        self.checker = WeightChecker(get_model=lambda: self.runner.model)
 
 
 class TestComputeChecksum(_ChecksumTestBase):
