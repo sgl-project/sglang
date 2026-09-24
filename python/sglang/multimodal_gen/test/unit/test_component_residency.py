@@ -1000,3 +1000,113 @@ def test_component_is_not_kept_across_another_component_use():
     manager.end_use(text_use)
 
     strategy.finish_use.assert_called_once_with(module, text_use, manager.state)
+
+
+def _dual_expert_pipeline():
+    transformer = torch.nn.Linear(2, 2)
+    transformer_2 = torch.nn.Linear(2, 2)
+    vae = torch.nn.Linear(2, 2)
+    t_use = ComponentUse(
+        "denoise",
+        "transformer",
+        phase="transformer",
+        memory_intensive=True,
+        preferred_ready_after_request=True,
+    )
+    t2_use = ComponentUse(
+        "denoise",
+        "transformer_2",
+        phase="transformer_2",
+        memory_intensive=True,
+    )
+    vae_use = ComponentUse("decode", "vae", memory_intensive=True)
+    denoise = _Stage(t_use, t2_use)
+    decode = _Stage(vae_use)
+    pipeline = SimpleNamespace(
+        modules={
+            "transformer": transformer,
+            "transformer_2": transformer_2,
+            "vae": vae,
+        },
+        _stage_name_mapping={"denoise": denoise, "decode": decode},
+        component_residency_strategies={},
+    )
+    server_args = SimpleNamespace(enable_layerwise_nvtx_marker=False)
+    manager = ComponentResidencyManager(pipeline, server_args)
+    manager.refresh_pipeline(pipeline)
+    manager.begin_request(
+        [denoise, decode], SimpleNamespace(is_warmup=False), server_args
+    )
+    return manager, server_args, denoise, t_use, t2_use, vae_use
+
+
+def test_end_stage_does_not_prefetch_unused_same_stage_expert():
+    """Warmup that only runs transformer must not H2D transformer_2 at stage exit."""
+    manager, server_args, denoise, t_use, t2_use, vae_use = _dual_expert_pipeline()
+    strategy = ComponentOffloadStrategy()
+    strategy.prepare_for_use = Mock()
+    strategy.wait_for_use = Mock()
+    strategy.prefetch_for_use = Mock(return_value=True)
+    strategy.finish_use = Mock()
+    manager.strategy_for = Mock(return_value=strategy)
+
+    manager.before_stage(denoise, 0, SimpleNamespace(is_warmup=False), server_args)
+    manager.begin_use(t_use)
+    manager.end_stage()
+
+    prefetched = [
+        call.args[1].component_name for call in strategy.prefetch_for_use.call_args_list
+    ]
+    assert "transformer_2" not in prefetched
+    assert prefetched == ["vae"]
+    strategy.finish_use.assert_called_once()
+    assert strategy.finish_use.call_args.args[1] is t_use
+
+
+def test_end_stage_releases_prefetched_but_never_begun_same_stage_use():
+    """Strategies that prefetch while busy must still drop unused same-stage copies."""
+    manager, server_args, denoise, t_use, t2_use, _vae_use = _dual_expert_pipeline()
+    strategy = Mock()
+    strategy.prefetch_for_use.return_value = True
+    manager.strategy_for = Mock(return_value=strategy)
+
+    manager.before_stage(denoise, 0, SimpleNamespace(is_warmup=False), server_args)
+    manager.begin_use(t_use)
+    assert manager._use_key(t2_use) in manager._prefetched_use_keys
+
+    manager.end_stage()
+
+    finished = [
+        call.args[1].component_name for call in strategy.finish_use.call_args_list
+    ]
+    assert finished.count("transformer_2") == 1
+    assert finished.count("transformer") == 1
+    assert manager._use_key(t2_use) not in manager._prefetched_use_keys
+
+
+def test_end_stage_keeps_dual_expert_sequence_when_both_run():
+    manager, server_args, denoise, t_use, t2_use, vae_use = _dual_expert_pipeline()
+    strategy = ComponentOffloadStrategy()
+    strategy.prepare_for_use = Mock()
+    strategy.wait_for_use = Mock()
+    strategy.prefetch_for_use = Mock(return_value=True)
+    strategy.finish_use = Mock()
+    manager.strategy_for = Mock(return_value=strategy)
+
+    manager.before_stage(denoise, 0, SimpleNamespace(is_warmup=False), server_args)
+    manager.begin_use(t_use)
+    manager.begin_use(t2_use)
+    manager.end_stage()
+
+    prepared = [
+        call.args[1].component_name for call in strategy.prepare_for_use.call_args_list
+    ]
+    assert prepared == ["transformer", "transformer_2"]
+    finished = [
+        call.args[1].component_name for call in strategy.finish_use.call_args_list
+    ]
+    assert finished == ["transformer", "transformer_2"]
+    prefetched = [
+        call.args[1].component_name for call in strategy.prefetch_for_use.call_args_list
+    ]
+    assert prefetched == ["vae"]
