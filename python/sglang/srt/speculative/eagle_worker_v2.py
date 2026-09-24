@@ -808,7 +808,13 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         score_list: List[torch.Tensor] = []
         token_list: List[torch.Tensor] = []
         parents_list: List[torch.Tensor] = []
-        if get_spec().speculative_use_rejection_sampling:
+        # Verify commits argmax for an all-greedy batch and never reads the
+        # draft distribution, so skip building it.
+        use_rejection_sampling = (
+            get_spec().speculative_use_rejection_sampling
+            and not forward_batch.sampling_info.is_all_greedy
+        )
+        if use_rejection_sampling:
             draft_probs_list: List[torch.Tensor] = [spec_info.draft_probs]
 
         topk1_chain_fits = (
@@ -823,7 +829,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             topk1_chain_fits
             and _is_cuda
             and self.hot_token_id is None
-            and not get_spec().speculative_use_rejection_sampling
+            and not use_rejection_sampling
         ):
             draft_tokens_topk1 = torch.empty(
                 (topk_index.shape[0], self.speculative_num_steps),
@@ -886,7 +892,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 maybe_detect_inf(
                     logits_output.next_token_logits, f"draft_forward step {i}"
                 )
-                if get_spec().speculative_use_rejection_sampling:
+                if use_rejection_sampling:
                     probs, topk_p, topk_index = sample_draft_proposal(
                         logits_output.next_token_logits,
                         forward_batch.sampling_info.temperatures,
@@ -912,7 +918,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                     probs = renorm_draft_probs(
                         logits_output.next_token_logits,
                         forward_batch.sampling_info,
-                        get_spec().speculative_use_rejection_sampling,
+                        use_rejection_sampling,
                     )
                     topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
                     forward_batch.positions.add_(1)
@@ -929,9 +935,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 hidden_states = logits_output.hidden_states
 
         draft_probs = (
-            torch.stack(draft_probs_list, dim=1)
-            if get_spec().speculative_use_rejection_sampling
-            else None
+            torch.stack(draft_probs_list, dim=1) if use_rejection_sampling else None
         )
 
         # Organize the results

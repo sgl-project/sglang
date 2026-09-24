@@ -59,6 +59,8 @@ from sglang.srt.utils.device_timer import device_timer_ctx
 if TYPE_CHECKING:
     from sglang.srt.speculative.eagle_worker_v2 import EagleDraftWorker
 
+_GREEDY_VARIANT = "greedy"
+
 
 @dataclass
 class EagleDraftInputBuffers(ForwardInputBuffers):
@@ -308,8 +310,19 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
         return torch.int64
 
     def _make_graph_key(self, bs, stream_idx=None, variant_label=None):
-        # EAGLE doesn't use stream_idx / lora variants.
-        return ShapeKey(size=bs)
+        # EAGLE doesn't use stream_idx; variant_label is _GREEDY_VARIANT or None.
+        return ShapeKey(size=bs, variant_label=variant_label)
+
+    def _sampling_variant(self, forward_batch: ForwardBatch) -> Optional[str]:
+        # Under rejection sampling an all-greedy batch replays the graph that
+        # skips the draft proposal distribution (see draft_forward).
+        if (
+            get_spec().speculative_use_rejection_sampling
+            and forward_batch.sampling_info is not None
+            and forward_batch.sampling_info.is_all_greedy
+        ):
+            return _GREEDY_VARIANT
+        return None
 
     # -----------------------------------------------------------------
     # can_run_graph
@@ -333,7 +346,13 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
             cuda_graph_bs = forward_batch.batch_size
 
         is_bs_supported = (
-            self.backend.can_run(forward_batch, self._make_graph_key(cuda_graph_bs))
+            self.backend.can_run(
+                forward_batch,
+                self._make_graph_key(
+                    cuda_graph_bs,
+                    variant_label=self._sampling_variant(forward_batch),
+                ),
+            )
             if self.disable_padding
             else cuda_graph_bs <= self.max_bs
         )
@@ -497,7 +516,6 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
             # per-step forwards inside draft_forward must not re-plan.
             forward_batch.mark_forward_metadata_ready()
             self.deepep_adapter.capture(is_extend_in_batch=False)
-            shape_key = self._make_graph_key(num_seqs)
             post_warmup_hook = getattr(
                 self.draft_attn_backend, "on_after_cuda_graph_warmup", None
             )
@@ -507,12 +525,19 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
                 post_warmup_hook=post_warmup_hook,
                 run_lm_head=True,
             )
-            self.backend.capture_one(
-                shape_key,
-                run_once,
-                capture_inputs=None,
-                post_warmup_hook=post_warmup_hook,
+            variants = (
+                (None, _GREEDY_VARIANT)
+                if get_spec().speculative_use_rejection_sampling
+                else (None,)
             )
+            for variant in variants:
+                sampling_info.is_all_greedy = variant == _GREEDY_VARIANT
+                self.backend.capture_one(
+                    self._make_graph_key(num_seqs, variant_label=variant),
+                    run_once,
+                    capture_inputs=None,
+                    post_warmup_hook=post_warmup_hook,
+                )
 
     def _postprocess_output_to_raw_bs(self, out, raw_bs):
         parent_list, top_scores_index, draft_tokens, draft_probs = (
@@ -693,7 +718,9 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
         self.bs = bs
 
         # Replay via backend
-        shape_key = self._make_graph_key(bs)
+        shape_key = self._make_graph_key(
+            bs, variant_label=self._sampling_variant(forward_batch)
+        )
         with device_timer_ctx(self.model_runner.device_timer, "eagle_draft"):
             out = self._replay_graph(shape_key, forward_batch)
         if self.buffers.dsa_seed_topk is not None:

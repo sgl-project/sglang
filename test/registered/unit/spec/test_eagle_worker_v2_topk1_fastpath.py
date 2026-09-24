@@ -14,7 +14,7 @@ from unittest.mock import MagicMock, patch
 import torch
 
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
-from sglang.srt.runtime_context import get_context
+from sglang.srt.runtime_context import get_context, get_spec
 from sglang.srt.speculative.adaptive_runtime_state import SpecRuntimeState
 from sglang.srt.speculative.eagle_info import EagleVerifyInput
 from sglang.srt.speculative.eagle_utils import organize_draft_results
@@ -173,6 +173,78 @@ class TestEagleWorkerV2Topk1FastPath(CustomTestCase):
 
         self.assertEqual(result, (None, None, None, None))
         self.assertEqual(worker.draft_runner.forward.call_count, 2)
+
+    def test_all_greedy_batch_skips_rejection_sampling_proposal(self):
+        # Verify commits argmax for an all-greedy batch and never reads the
+        # draft distribution, so draft_forward must not build it.
+        bs, vocab = 2, 8
+        for is_all_greedy in (True, False):
+            with self.subTest(is_all_greedy=is_all_greedy):
+                worker = _make_worker(num_steps=2, num_draft_tokens=3)
+                worker._rebuild_topk1_chain_buffers()
+                worker.hot_token_id = None
+                worker.index_share_for_mtp_iteration = False
+                worker.seed_dsa_topk_from_draft_extend = False
+                worker.draft_attn_backend = SimpleNamespace(attn_backends=[object()])
+                logits = torch.randn(bs, vocab, device=DEVICE)
+                worker.draft_runner = SimpleNamespace(
+                    canary_manager=None,
+                    model_config=SimpleNamespace(
+                        hf_config=SimpleNamespace(architectures=["Draft"]),
+                        model_is_mrope=False,
+                    ),
+                    forward=MagicMock(
+                        return_value=SimpleNamespace(
+                            logits_output=SimpleNamespace(
+                                next_token_logits=logits, hidden_states=None
+                            )
+                        )
+                    ),
+                )
+                forward_batch = SimpleNamespace(
+                    forward_mode=ForwardMode.DECODE,
+                    batch_size=bs,
+                    out_cache_loc=torch.arange(bs * 2, device=DEVICE),
+                    positions=torch.zeros(bs, dtype=torch.long, device=DEVICE),
+                    sampling_info=SimpleNamespace(
+                        is_all_greedy=is_all_greedy,
+                        temperatures=torch.ones(bs, 1, device=DEVICE),
+                        top_ks=torch.ones(bs, dtype=torch.int32, device=DEVICE),
+                    ),
+                    spec_info=SimpleNamespace(
+                        topk_p=torch.ones(bs, 1, device=DEVICE),
+                        topk_index=torch.zeros(bs, 1, dtype=torch.long, device=DEVICE),
+                        hidden_states=None,
+                        draft_probs=torch.zeros(bs, vocab, device=DEVICE),
+                    ),
+                )
+
+                def fake_select(i, topk_p, topk_index, hidden_states, scores, topk):
+                    parents = torch.full((bs, 1), i, dtype=torch.long, device=DEVICE)
+                    return (
+                        topk_index.flatten(),
+                        hidden_states,
+                        topk_p,
+                        (topk_p.unsqueeze(1), topk_index, parents),
+                    )
+
+                with (
+                    get_spec().override(speculative_use_rejection_sampling=True),
+                    patch(
+                        "sglang.srt.speculative.eagle_worker_v2.forward_context",
+                        side_effect=lambda *_a, **_k: contextlib.nullcontext(),
+                    ),
+                    patch(
+                        "sglang.srt.speculative.eagle_worker_v2.select_top_k_tokens",
+                        side_effect=fake_select,
+                    ),
+                ):
+                    draft_probs = worker.draft_forward(forward_batch)[3]
+
+                if is_all_greedy:
+                    self.assertIsNone(draft_probs)
+                else:
+                    self.assertEqual(draft_probs.shape, (bs, 2, vocab))
 
 
 class TestEagleWorkerV2BackendFallback(CustomTestCase):
