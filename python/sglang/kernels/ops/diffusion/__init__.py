@@ -50,6 +50,13 @@ _HIP = frozenset({CapabilityRequirement.HIP})
 # ---------------------------------------------------------------------------
 _SPECS: tuple[tuple[str, KernelBackend, str, frozenset, str], ...] = (
     (
+        "diffusion.gelu_tanh_cat",
+        KernelBackend.JIT,
+        "activation.gelu_tanh_cat_jit:fused_gelu_tanh_cat",
+        _CUDA,
+        "BF16 tanh GELU plus channel concatenation.",
+    ),
+    (
         "diffusion.apply_group_norm_silu",
         KernelBackend.TRITON,
         "norm.group_norm_silu:apply_group_norm_silu",
@@ -527,6 +534,8 @@ for _op, _backend, _target, _caps, _description in _SPECS:
 # then symbol; a new public kernel belongs here and nowhere else.
 # ---------------------------------------------------------------------------
 _EXPORTS: dict[str, str] = {
+    "can_use_fused_gelu_tanh_cat": "activation.gelu_tanh_cat_jit",
+    "fused_gelu_tanh_cat": "activation.gelu_tanh_cat_jit",
     "load_extension_with_recovery": "sglang.srt.utils.cpp_extension_loader",
     # Normalization: RMSNorm / LayerNorm / GroupNorm and their fused epilogues
     "can_defer_flux2_gated_residual": "norm.flux2_gated_resnorm_jit",
