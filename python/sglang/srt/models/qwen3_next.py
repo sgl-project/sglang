@@ -949,6 +949,10 @@ class Qwen3NextModel(nn.Module):
                     ),
                 )
 
+        last_layer = self.layers[-1]
+        hidden_states, residual = last_layer.layer_communicator.finish_layer_stack(
+            hidden_states, residual, forward_batch
+        )
         if not forward_batch.forward_mode.is_idle():
             if residual is None:
                 hidden_states = self.norm(hidden_states)
