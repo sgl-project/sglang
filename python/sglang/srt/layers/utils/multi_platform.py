@@ -55,6 +55,9 @@ class MultiPlatformOp(BaseFusedOp):
     def forward_xpu(self, *args, **kwargs):
         return self.forward_native(*args, **kwargs)
 
+    def forward_mlu(self, *args, **kwargs):
+        return self.forward_native(*args, **kwargs)
+
     def forward_hpu(self, *args, **kwargs):
         return self.forward_native(*args, **kwargs)
 
