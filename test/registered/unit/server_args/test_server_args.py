@@ -4033,13 +4033,8 @@ class TestDcpCommBackendDefault(CustomTestCase):
         self.assertEqual(self._resolved(dcp_size=1), "ag_rs")
 
     @override_platform(is_npu=True, is_cuda=False, is_hip=False)
-    def test_a5_npu_rejects_dcp(self):
-        with patch(
-            "sglang.srt.hardware_backend.npu.utils.is_npu_arch35",
-            return_value=True,
-        ):
-            with self.assertRaisesRegex(AssertionError, "NPU A5"):
-                self._resolved(dcp_size=2)
+    def test_a5_npu_supports_dcp(self):
+        self.assertEqual(self._resolved(dcp_size=2), "ag_rs")
 
     @override_platform(is_cuda=True, is_hip=False)
     def test_fi_a2a_where_supported(self):
