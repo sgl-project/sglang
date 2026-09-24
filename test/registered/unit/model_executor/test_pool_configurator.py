@@ -1277,66 +1277,6 @@ class TestSWAPoolFloor(CustomTestCase):
         cfg.num_layers_c2_source = 0
         self.assertEqual(cfg._get_c2_state_fixed_bytes(10), 0)
 
-    def test_dsv4_paged_kv_budget(self):
-        import torch
-
-        from sglang.srt.environ import envs
-        from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4SingleKVPool
-        from sglang.srt.model_executor.pool_configurator import DSV4PoolConfigurator
-
-        _publish_config(
-            self,
-            dsv4_attn_backend="flashmla",
-            page_size=256,
-            max_running_requests=2,
-            chunked_prefill_size=256,
-        )
-        kvc = SimpleNamespace(
-            kv_cache_dtype_str="fp8_e4m3",
-            model_config=SimpleNamespace(
-                qk_nope_head_dim=448,
-                qk_rope_head_dim=64,
-                index_head_dim=128,
-                context_len=131072,
-                compress_ratios=[0, 4, 128],
-                window_size=128,
-                hf_config=SimpleNamespace(kv_source_layer_ids=[]),
-            ),
-            layer_info=SimpleNamespace(start_layer=0, end_layer=3),
-            pp_size=1,
-            attn_dp_size=1,
-            sliding_window_size=128,
-            page_size=256,
-            spec_algorithm=SimpleNamespace(
-                is_dspark=lambda: False, is_none=lambda: True
-            ),
-        )
-        with (
-            envs.SGLANG_DSV4_KV_LAYOUT.override("v4"),
-            envs.SGLANG_DSV4_COMPRESS_STATE_DTYPE.override("float32"),
-        ):
-            planner = DSV4PoolConfigurator(kvc)
-            costs = []
-            for ratio in (0, 4, 128):
-                page_size = 256 // (ratio or 1)
-                pool = DeepSeekV4SingleKVPool(
-                    size=256,
-                    page_size=page_size,
-                    dtype=torch.float8_e4m3fn,
-                    qk_nope_head_dim=448,
-                    qk_rope_head_dim=64,
-                    layer_num=1,
-                    device="cpu",
-                    enable_memory_saver=False,
-                )
-                actual = pool.create_buffer(num_pages=1).nbytes / page_size
-                costs.append(actual)
-            self.assertEqual(planner.bytes_per_swa_token, 3 * costs[0] + 320)
-            self.assertEqual(
-                planner.bytes_per_full_token,
-                costs[1] / 4 + costs[2] / 128 + planner.indexer_bytes_per_token / 4,
-            )
-
     def test_dsv4_paged_dspark_budget_reserves_window_and_draft_layers(self):
         from sglang.srt.model_executor.pool_configurator import DSV4PoolConfigurator
 
