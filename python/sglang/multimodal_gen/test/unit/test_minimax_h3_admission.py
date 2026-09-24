@@ -612,7 +612,7 @@ def test_validate_server_args_accepts_sla_attn():
         ),
     )
     with patch(
-        "sglang.multimodal_gen.configs.pipeline_configs.minimax_h3.get_attn_backend"
+        "sglang.multimodal_gen.runtime.layers.attention.selector.get_attn_backend"
     ) as get_attn_backend:
         MiniMaxH3PipelineConfig.validate_server_args(config, server_args)
     get_attn_backend.assert_called_once_with(
