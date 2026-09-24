@@ -275,8 +275,6 @@ class TestTreeNode(unittest.TestCase):
         self.assertIsNone(node.value)
         self.assertEqual(node.lock_ref, 0)
         self.assertEqual(node.hit_count, 0)
-        self.assertEqual(node.host_ref_counter, 0)
-        self.assertIsNone(node.host_value)
         self.assertIsNone(node.hash_value)
 
     def test_init_with_id(self):
@@ -286,86 +284,12 @@ class TestTreeNode(unittest.TestCase):
         node2 = TreeNode()
         self.assertEqual(node2.id, 1)  # Counter was incremented
 
-    def test_evicted_backuped_properties(self):
-        """Test evicted and backuped properties."""
-        test_cases = [
-            (False, False, True, False),
-            (True, False, False, False),
-            (True, True, False, True),
-            (False, True, True, True),
-        ]
-
-        for (
-            has_value,
-            has_host_value,
-            expected_evicted,
-            expected_backuped,
-        ) in test_cases:
-            with self.subTest(has_value=has_value, has_host_value=has_host_value):
-                node = TreeNode()
-
-                if has_value:
-                    node.value = torch.tensor([1, 2, 3])
-                if has_host_value:
-                    node.host_value = torch.tensor([4, 5, 6])
-
-                self.assertEqual(node.evicted, expected_evicted)
-                self.assertEqual(node.backuped, expected_backuped)
-
-    def test_protect_release_host(self):
-        """Test protect_host and release_host methods."""
+    def test_evicted_property(self):
+        """Test the evicted property."""
         node = TreeNode()
-        self.assertEqual(node.host_ref_counter, 0)
-
-        node.protect_host()
-        self.assertEqual(node.host_ref_counter, 1)
-
-        node.release_host()
-        self.assertEqual(node.host_ref_counter, 0)
-
-        # Test error case
-        with self.assertRaises(RuntimeError):
-            node.release_host()
-
-    def test_get_last_hash_value(self):
-        """Test get_last_hash_value method."""
-        node = TreeNode()
-        self.assertIsNone(node.get_last_hash_value())
-
-        node.hash_value = ["hash1", "hash2", "hash3"]
-        self.assertEqual(node.get_last_hash_value(), "hash3")
-
-    def test_get_prefix_hash_values_not_shared_across_calls(self):
-        """Regression guard for cached mutable prefix hash lists."""
-        for node_cls in (TreeNode,):
-            with self.subTest(node_cls=node_cls.__module__):
-                root = node_cls()
-                n1 = node_cls()
-                n1.parent = root
-                n1.hash_value = ["h1"]
-                n2 = node_cls()
-                n2.parent = n1
-                n2.hash_value = ["h2"]
-                n3 = node_cls()
-                n3.parent = n2
-                n3.hash_value = ["h3"]
-
-                first = n3.get_prefix_hash_values(n2)
-                self.assertEqual(first, ["h1", "h2"])
-
-                # Downstream storage code extends prefix_keys in place while
-                # processing pages. A cached list must not be observable by a
-                # later call.
-                first += ["h3"]
-
-                second = n3.get_prefix_hash_values(n2)
-                self.assertEqual(second, ["h1", "h2"])
-                self.assertIsNot(second, first)
-
-                n4 = node_cls()
-                n4.parent = n3
-                n4.hash_value = ["h4"]
-                self.assertEqual(n4.get_prefix_hash_values(n3), ["h1", "h2", "h3"])
+        self.assertTrue(node.evicted)
+        node.value = torch.tensor([1, 2, 3])
+        self.assertFalse(node.evicted)
 
 
 class TestRadixCache(CustomTestCase):

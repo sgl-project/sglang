@@ -214,30 +214,6 @@ class TestDefaultRadixCacheFactory(CustomTestCase):
             PureSWAChunkCache.assert_called_once_with(ctx.params)
             self.assertIs(result, PureSWAChunkCache.return_value)
 
-    def test_cpp_radix_cache_when_env_flag_set(self):
-        ctx = _make_ctx(
-            self,
-        )
-        # `radix_cache_cpp` requires ninja + C++ extension to import, so
-        # we inject a stand-in module rather than letting patch() trigger
-        # the real import.
-        fake_module = MagicMock()
-        with (
-            patch(
-                "sglang.srt.mem_cache.registry.envs.SGLANG_EXPERIMENTAL_CPP_RADIX_TREE.get",
-                return_value=True,
-            ),
-            patch.dict(
-                "sys.modules",
-                {"sglang.srt.mem_cache.radix_cache_cpp": fake_module},
-            ),
-        ):
-            result = default_radix_cache_factory(ctx)
-            fake_module.RadixCacheCpp.assert_called_once_with(
-                params=ctx.params, server_args=ctx.server_args
-            )
-            self.assertIs(result, fake_module.RadixCacheCpp.return_value)
-
     def test_unified_radix_cache_is_the_default(self):
         ctx = _make_ctx(
             self,
@@ -388,7 +364,7 @@ class TestDefaultRadixCacheFactory(CustomTestCase):
         )
         self.assertIs(result, cache)
 
-    def test_swa_radix_cache_when_hybrid_swa(self):
+    def test_unified_radix_cache_when_hybrid_swa(self):
         ctx = _make_ctx(self, is_hybrid_swa=True)
         # SWA hybrid models now default to the unified radix tree.
         fake_components = MagicMock()
@@ -414,7 +390,7 @@ class TestDefaultRadixCacheFactory(CustomTestCase):
             PureSWA.assert_called_once_with(params=ctx.params)
             self.assertIs(result, PureSWA.return_value)
 
-    def test_mamba_radix_cache_when_hybrid_ssm(self):
+    def test_unified_radix_cache_when_hybrid_ssm(self):
         ctx = _make_ctx(self, is_hybrid_ssm=True)
         # Mamba hybrid models now default to the unified radix tree.
         fake_components = MagicMock()
