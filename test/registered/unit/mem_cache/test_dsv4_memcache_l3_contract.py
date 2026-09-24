@@ -1,5 +1,5 @@
 import ctypes
-import threading
+import sys
 from queue import Queue
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -104,7 +104,6 @@ class _LifecycleObjectStore:
 def _make_memcache(existing=()):
     backend = NpuMemcacheStore.__new__(NpuMemcacheStore)
     backend.store = _FakeObjectStore(existing)
-    backend._store_initialized = True
     backend.mem_pool_host = SimpleNamespace(kv_buffer=None)
     backend.registered_pools = {}
     backend.mla_suffix = ""
@@ -115,141 +114,26 @@ def _make_memcache(existing=()):
     return backend
 
 
-def _make_lazy_memcache(protocol="device_sdma"):
-    _LifecycleObjectStore.instances.clear()
-    _LifecycleObjectStore.remove_all_result = 0
-    backend = NpuMemcacheStore.__new__(NpuMemcacheStore)
-    backend.store = None
-    backend.storage_config = SimpleNamespace(tp_rank=3)
-    backend._store_initialized = False
-    backend._store_init_lock = threading.Lock()
-    backend._pending_buffers = []
-    backend._store_factory = _LifecycleObjectStore
-    backend._local_cfg = object()
-    backend._device_id = 3
-    backend._init_bm = True
-    backend._protocol = protocol
-    backend._defer_runtime_init = True
-    return backend
+def test_eager_store_reads_existing_objects_before_first_backup(monkeypatch):
+    monkeypatch.setitem(
+        sys.modules,
+        "memcache_hybrid",
+        SimpleNamespace(
+            DistributedObjectStore=_LifecycleObjectStore,
+            LocalConfig=lambda: SimpleNamespace(protocol="device_sdma"),
+        ),
+    )
+    backend = NpuMemcacheStore(mem_pool=LogicalHostPool(4096, 128))
+    destination = torch.empty(16, dtype=torch.uint8)
+    backend.register_buffer(destination)
+    backend.store.objects["k0"] = b"0123456789abcdef"
 
-
-def test_lazy_clear_uses_metadata_only_client_without_initializing_runtime_store():
-    backend = _make_lazy_memcache()
-
-    backend.clear()
-
-    assert not backend._store_initialized
-    assert backend.store is None
-    assert len(_LifecycleObjectStore.instances) == 1
-    clear_client = _LifecycleObjectStore.instances[0]
-    assert clear_client.setup_calls == 1
-    assert clear_client.init_calls == [(3, False)]
-    assert clear_client.remove_all_calls == 1
-    assert clear_client.closed
-
-
-def test_lazy_clear_propagates_memcache_remove_all_failure():
-    backend = _make_lazy_memcache()
-    _LifecycleObjectStore.remove_all_result = -7
-
-    try:
-        backend.clear()
-    except RuntimeError as exc:
-        assert "remove_all failed with code -7" in str(exc)
-    else:
-        raise AssertionError("Memcache clear failure must not be reported as success")
-
-
-def test_device_transports_lazy_init_is_limited_to_logical_anchor():
-    dsv4_group = LogicalHostPool(4096, 128)
-    ordinary_group = SimpleNamespace(entries=[SimpleNamespace(name=PoolName.KV)])
-
-    assert NpuMemcacheStore._should_lazy_init(dsv4_group, "device_sdma", True)
-    assert NpuMemcacheStore._should_lazy_init(dsv4_group, "device_rdma", True)
-    assert not NpuMemcacheStore._should_lazy_init(ordinary_group, "device_sdma", True)
-    assert not NpuMemcacheStore._should_lazy_init(ordinary_group, "device_rdma", True)
-    assert not NpuMemcacheStore._should_lazy_init(dsv4_group, "host_shm", True)
-    assert not NpuMemcacheStore._should_lazy_init(dsv4_group, "device_rdma", False)
-
-
-def test_lazy_store_reports_miss_and_defers_host_registration():
-    backend = _make_lazy_memcache()
-    tensor = torch.empty(16, dtype=torch.uint8)
-
-    backend.register_buffer(tensor)
-
-    assert _LifecycleObjectStore.instances == []
-    assert backend._batch_exist(["k0", "k1"]) == [0, 0]
-    assert backend._get_batch_zero_copy_impl(["k0"], [123], [16]) == [-1]
-
-    backend.prepare_for_backup()
-
-    store = _LifecycleObjectStore.instances[0]
-    assert store.setup_calls == 1
-    assert store.init_calls == [(3, True)]
-    assert store.registered_buffers == [(tensor.data_ptr(), 16)]
-
-
-def test_lazy_store_first_put_initializes_only_once():
-    backend = _make_lazy_memcache()
-    source = ctypes.create_string_buffer(b"0123456789abcdef")
-
-    assert backend._put_batch_zero_copy_impl(
-        ["k0"], [ctypes.addressof(source)], [16]
-    ) == [0]
-    backend.prepare_for_backup()
-
-    assert len(_LifecycleObjectStore.instances) == 1
-    store = _LifecycleObjectStore.instances[0]
-    assert len(store.put_calls) == 1
-    assert store.put_calls[0][0] == ["k0"]
-    assert store.put_calls[0][2:] == ([16], None)
-    assert store.put_calls[0][1] == [ctypes.addressof(source)]
-    assert store.objects["k0"] == b"0123456789abcdef"
-
-
-def test_lazy_store_keeps_original_addresses_for_io():
-    backend = _make_lazy_memcache()
-    source = ctypes.create_string_buffer(b"0123456789abcdef")
-    destination = ctypes.create_string_buffer(16)
-
-    assert backend._put_batch_zero_copy_impl(
-        ["k0"], [ctypes.addressof(source)], [16]
-    ) == [0]
     assert backend._get_batch_zero_copy_impl(
-        ["k0"], [ctypes.addressof(destination)], [16]
+        ["k0"], [destination.data_ptr()], [16]
     ) == [16]
-
-    store = _LifecycleObjectStore.instances[0]
-    assert store.put_calls[0][1] == [ctypes.addressof(source)]
-    assert store.put_calls[0][2:] == ([16], None)
-    assert store.get_call[1] == [ctypes.addressof(destination)]
-    assert store.get_call[2:] == ([16], None)
-    assert destination.raw == b"0123456789abcdef"
-
-
-def test_device_rdma_lazy_init_registers_buffers_and_keeps_zero_copy_io():
-    backend = _make_lazy_memcache(protocol="device_rdma")
-    tensor = torch.empty(16, dtype=torch.uint8)
-    source = ctypes.create_string_buffer(b"0123456789abcdef")
-    destination = ctypes.create_string_buffer(16)
-
-    backend.register_buffer(tensor)
-    assert _LifecycleObjectStore.instances == []
-
-    backend.prepare_for_backup()
-
-    store = _LifecycleObjectStore.instances[0]
-    assert store.registered_buffers == [(tensor.data_ptr(), 16)]
-    assert backend._put_batch_zero_copy_impl(
-        ["k0"], [ctypes.addressof(source)], [16]
-    ) == [0]
-    assert backend._get_batch_zero_copy_impl(
-        ["k0"], [ctypes.addressof(destination)], [16]
-    ) == [16]
-    assert store.put_calls[0][1] == [ctypes.addressof(source)]
-    assert store.get_call[1] == [ctypes.addressof(destination)]
-    assert destination.raw == b"0123456789abcdef"
+    assert backend.store.registered_buffers == [(destination.data_ptr(), 16)]
+    assert bytes(destination.tolist()) == b"0123456789abcdef"
+    assert backend.store.put_calls == []
 
 
 def test_logical_anchor_is_a_successful_noop():
@@ -374,7 +258,6 @@ def test_partial_prefix_finds_available_trailing_window():
 def test_physical_pools_round_trip_independently():
     backend = _make_memcache()
     backend.store = _LifecycleObjectStore()
-    backend._store_initialized = True
     backend._batch_exist = lambda keys: [int(k in backend.store.objects) for k in keys]
     buffers = {
         PoolName.DEEPSEEK_V4_C4: ctypes.create_string_buffer(b"compressed-kv"),
@@ -688,14 +571,13 @@ def test_upstream_mla_indexer_scale_and_packed_kv_keys(fp8_packed):
 
 
 @pytest.mark.parametrize("backup_skip", [False, True])
-def test_backup_initializes_runtime_on_every_rank(backup_skip):
+def test_c128_backup_respects_rank_ownership(backup_skip):
     controller = HybridCacheController.__new__(HybridCacheController)
     controller.page_size = 128
     controller.backup_skip = backup_skip
     controller.storage_backend_type = "npu_memcache"
     controller.mem_pool_host = _make_host_group()
     backend = controller.storage_backend = _make_memcache()
-    backend.prepare_for_backup = Mock()
     backend.batch_set_v2 = Mock(return_value={PoolName.DEEPSEEK_V4_C128: [True]})
     controller.page_set_func = controller._page_set_zero_copy
     operation = PrefetchOperation(
@@ -708,7 +590,6 @@ def test_backup_initializes_runtime_on_every_rank(backup_skip):
 
     controller._page_backup(operation)
 
-    backend.prepare_for_backup.assert_called_once()
     assert backend.batch_set_v2.call_count == int(not backup_skip)
 
 

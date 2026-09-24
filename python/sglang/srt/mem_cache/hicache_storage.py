@@ -184,10 +184,6 @@ class HiCacheStorage(ABC):
             self.registered_pools = {}
         self.registered_pools[host_pool_name] = host_pool
 
-    def prepare_for_backup(self) -> None:
-        """Optional lifecycle hook run after inference, before an L3 backup."""
-        pass
-
     def batch_exists_v2(
         self,
         keys: List[str],

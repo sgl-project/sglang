@@ -555,6 +555,9 @@ class Scheduler(
         if (t := envs.SGLANG_TEST_STUCK_SCHEDULER_INIT.get()) > 0:
             time.sleep(t)
 
+        # HCCL and custom AiCPU must start before MemCache maps Host memory.
+        self.maybe_init_hccl_dp_prewarm()
+
         # Init cache and memory pool
         result = kv_cache_builder.build_kv_cache(
             server_args=self.server_args,
@@ -603,7 +606,6 @@ class Scheduler(
                         lambda c=cache_controller: not c.has_inflight_device_transfers()
                     )
         self.emit_metrics_constants()
-        self.maybe_init_hccl_dp_prewarm()
 
         if (c := self.tp_worker.model_runner.canary_manager) is not None:
             c.attach_radix_cache(self.tree_cache)
@@ -748,6 +750,14 @@ class Scheduler(
             device_module=self.tp_group.device_module,
         )
         logger.info("HCCL DP prewarm done: rank=%s", rank)
+        if self.server_args.hicache_storage_backend == "npu_memcache":
+            from sglang.srt.hardware_backend.npu.attention.ascend_dsv4_backend import (
+                prewarm_dsv4_aicpu,
+            )
+
+            prewarm_dsv4_aicpu(
+                self.tp_worker.model_runner.model_config, self.tp_group.device
+            )
 
     def init_zbal_on_npu(self):
         if _is_npu:

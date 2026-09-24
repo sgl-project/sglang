@@ -12,7 +12,6 @@ from __future__ import annotations
 
 import json
 import logging
-import threading
 import time
 import uuid
 from dataclasses import dataclass
@@ -31,7 +30,7 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolTransfer,
     PoolTransferResult,
 )
-from sglang.srt.mem_cache.memory_pool_host import HostKVCache, LogicalHostPool
+from sglang.srt.mem_cache.memory_pool_host import HostKVCache
 from sglang.srt.observability.metrics_collector import StorageMetrics
 
 SETUP_TIMEOUT = 600  # seconds
@@ -165,9 +164,6 @@ class NpuMemcacheStore(HiCacheStorage):
     ):
         self.store = None
         self.storage_config = storage_config
-        self._store_initialized = False
-        self._store_init_lock = threading.Lock()
-        self._pending_buffers: List[Tuple[int, int]] = []
 
         try:
             from memcache_hybrid import DistributedObjectStore, LocalConfig
@@ -187,18 +183,23 @@ class NpuMemcacheStore(HiCacheStorage):
                     "Ignoring unknown Memcache LocalConfig keys: %s", unknown_fields
                 )
 
+            self.store = DistributedObjectStore()
+            if self.store.setup(local_cfg) != 0:
+                raise RuntimeError(
+                    "memcache_hybrid.DistributedObjectStore.setup failed"
+                )
+
             ctrl = config.ctrl
             device_id = _resolve_memcache_device_id(ctrl, storage_config)
             init_bm = bool(ctrl.get("init_bm", True))
-            self._store_factory = DistributedObjectStore
-            self._local_cfg = local_cfg
-            self._device_id = device_id
-            self._init_bm = init_bm
-            self._protocol = str(getattr(local_cfg, "protocol", "")).lower()
-            self._defer_runtime_init = self._should_lazy_init(
-                mem_pool=mem_pool,
-                protocol=self._protocol,
-                init_bm=init_bm,
+            if self.store.init(device_id, init_bm) != 0:
+                raise RuntimeError("memcache_hybrid.DistributedObjectStore.init failed")
+            tp_rank = storage_config.tp_rank if storage_config is not None else 0
+            logger.info(
+                "Ascend MemCache store initialized (tp_rank=%s, device_id=%s, init_bm=%s)",
+                tp_rank,
+                device_id,
+                init_bm,
             )
 
             self._memcache_metrics_url = ctrl.get("metrics_url") or ctrl.get(
@@ -207,19 +208,8 @@ class NpuMemcacheStore(HiCacheStorage):
             self._check_server_enabled = bool(ctrl.get("check_server", False))
             self.extra_backend_tag = ctrl.get("extra_backend_tag")
 
-            self._init_runtime_fields(storage_config)
-
             if self._check_server_enabled:
                 self.check_server()
-
-            if self._defer_runtime_init:
-                logger.info(
-                    "Delay Ascend memcache BM/HYBM initialization until the first "
-                    "DSV4 L3 write (protocol=%s).",
-                    self._protocol,
-                )
-            else:
-                self._ensure_initialized()
 
             if not init_bm:
                 logger.info(
@@ -231,74 +221,14 @@ class NpuMemcacheStore(HiCacheStorage):
                     f"({envs.SGLANG_NPU_MEMCACHE_ENABLE_WARMUP.name}=0). "
                     "Set it to true to run the register-time warmup probe."
                 )
+            self._init_runtime_fields(storage_config)
+
         except ValueError as e:
             logger.error("Ascend MemCache configuration failed: %s", e)
             raise
         except Exception as exc:
             logger.error("Ascend MemCache store initialization failed: %s", exc)
             raise
-
-    @staticmethod
-    def _should_lazy_init(
-        mem_pool: Any,
-        protocol: Any,
-        init_bm: bool,
-    ) -> bool:
-        """Defer transport setup for DSV4 until after its first model forward."""
-        return (
-            init_bm
-            and str(protocol).lower() in {"device_sdma", "device_rdma"}
-            and isinstance(mem_pool, LogicalHostPool)
-        )
-
-    def _register_buffer_meta(self, ptr: int, size: int) -> None:
-        ret_code = self.store.register_buffer(ptr, size)
-        if ret_code != 0:
-            logger.error("Failed to register buffer, error code: %s", ret_code)
-            raise RuntimeError(
-                f"Failed to register buffer to Ascend Memcache, error code: {ret_code}"
-            )
-
-    def _ensure_initialized(self) -> None:
-        """Initialize BM/HYBM once and then register every deferred host buffer."""
-        if self._store_initialized:
-            return
-        with self._store_init_lock:
-            if self._store_initialized:
-                return
-            store = self._store_factory()
-            try:
-                if store.setup(self._local_cfg) != 0:
-                    raise RuntimeError(
-                        "memcache_hybrid.DistributedObjectStore.setup failed"
-                    )
-                if store.init(self._device_id, self._init_bm) != 0:
-                    raise RuntimeError(
-                        "memcache_hybrid.DistributedObjectStore.init failed"
-                    )
-                self.store = store
-                for ptr, size in self._pending_buffers:
-                    self._register_buffer_meta(ptr, size)
-                self._store_initialized = True
-                self._pending_buffers.clear()
-            except Exception:
-                try:
-                    store.close()
-                except Exception:
-                    pass
-                self.store = None
-                self._store_initialized = False
-                raise
-
-            tp_rank = self.storage_config.tp_rank if self.storage_config else 0
-            logger.info(
-                "Ascend memcache store initialized (tp_rank=%s, device_id=%s, "
-                "init_bm=%s, deferred=%s)",
-                tp_rank,
-                self._device_id,
-                self._init_bm,
-                getattr(self, "_defer_runtime_init", False),
-            )
 
     def _init_runtime_fields(
         self, storage_config: Optional[HiCacheStorageConfig]
@@ -352,14 +282,16 @@ class NpuMemcacheStore(HiCacheStorage):
         self.backup_bandwidth = []
 
     def register_buffer(self, tensor: torch.Tensor):
+        if self.store is None:
+            raise RuntimeError("Ascend MemCache store is not initialized.")
         ptr = tensor.data_ptr()
         size = tensor.numel() * tensor.element_size()
-        if not self._store_initialized:
-            buffer_meta = (ptr, size)
-            if buffer_meta not in self._pending_buffers:
-                self._pending_buffers.append(buffer_meta)
-            return
-        self._register_buffer_meta(ptr, size)
+        ret_code = self.store.register_buffer(ptr, size)
+        if ret_code != 0:
+            logger.error("Failed to register buffer, error code: %s", ret_code)
+            raise RuntimeError(
+                f"Failed to register buffer to Ascend MemCache, error code: {ret_code}"
+            )
 
     def check_server(self) -> None:
         url = self._memcache_metrics_url
@@ -459,12 +391,6 @@ class NpuMemcacheStore(HiCacheStorage):
         buf_list = host_pool.get_hybrid_pool_buffer()
         for buf in buf_list:
             self.register_buffer(buf)
-
-    def prepare_for_backup(self) -> None:
-        # DSV4 is TP-replicated, so non-zero TP ranks do not execute put(). They
-        # still need BM/HYBM ready for later L3 reads; the post-inference backup
-        # boundary initializes every rank without perturbing the first forward.
-        self._ensure_initialized()
 
     def _tag_keys(self, keys: List[str]) -> List[str]:
         if self.extra_backend_tag is None:
@@ -1004,32 +930,7 @@ class NpuMemcacheStore(HiCacheStorage):
         return len(query_keys) // key_multiplier
 
     def clear(self) -> None:
-        """Clear with a metadata-only client when BM/HYBM setup is deferred."""
-        if self._store_initialized:
-            result = self.store.remove_all()
-        else:
-            clear_client = self._store_factory()
-            try:
-                if clear_client.setup(self._local_cfg) != 0:
-                    raise RuntimeError(
-                        "Memcache metadata-only clear client setup failed"
-                    )
-                if clear_client.init(self._device_id, False) != 0:
-                    raise RuntimeError(
-                        "Memcache metadata-only clear client init failed"
-                    )
-                result = clear_client.remove_all()
-            finally:
-                try:
-                    clear_client.close()
-                except Exception:
-                    logger.warning(
-                        "Failed to close Memcache metadata-only clear client",
-                        exc_info=True,
-                    )
-
-        if int(result) != 0:
-            raise RuntimeError(f"Memcache remove_all failed with code {result}")
+        self.store.remove_all()
 
     def close(self) -> None:
         if self.store is None:
@@ -1043,14 +944,11 @@ class NpuMemcacheStore(HiCacheStorage):
     def _put_batch_zero_copy_impl(
         self, key_strs: List[str], buffer_ptrs: List[int], buffer_sizes: List[int]
     ) -> List[int]:
-        self._ensure_initialized()
         return self.store.batch_put_from(key_strs, buffer_ptrs, buffer_sizes)
 
     def _get_batch_zero_copy_impl(
         self, key_strs: List[str], buffer_ptrs: List[int], buffer_sizes: List[int]
     ) -> List[int]:
-        if not self._store_initialized:
-            return [-1] * len(key_strs)
         raw = self.store.batch_get_into(key_strs, buffer_ptrs, buffer_sizes)
         # memcache_hybrid reports 0 on success, but HiCache read postprocess expects
         # positive values for success and negative values for failures.
@@ -1064,8 +962,6 @@ class NpuMemcacheStore(HiCacheStorage):
         return out
 
     def _batch_exist(self, key_strs: List[str]) -> List[int]:
-        if not self._store_initialized:
-            return [0] * len(key_strs)
         return self.store.batch_is_exist(key_strs)
 
     def get_stats(self):

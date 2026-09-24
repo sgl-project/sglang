@@ -98,13 +98,24 @@ then flush L1/L2 without clearing the storage backend. Compare against a repeate
 resident-cache run at the same cached-prefix boundary, not against cold prefill.
 
 DSV4 keeps the default NPU-pinned Host pools and passes their buffers directly
-to MemCache without CPU staging. On A3, `device_rdma` requires the MemFabric
-Host/HBM classification fix: unpatched 1.1.4 and 1.2.0 misclassify pinned Host
-addresses and fail RDMA registration. Testing currently uses a locally patched
-1.1.4 build; pinned RDMA model end-to-end validation is still pending. Both device
-transports defer initialization until the first backup; metadata-only clear remains available
-before that point. The external MemCache services must have usable Holder
-capacity before starting the test; a healthy Meta endpoint alone is insufficient.
+to MemCache without CPU staging. A3 needs the MemFabric Host/HBM classification
+fix: `HybmVaManager::GetLocalMemoryType` must use `DrvMemGetAttribute` for
+`ASCEND_910C`, as it does for `ASCEND_950`. Otherwise pinned Host addresses can
+be misclassified as HBM and fail RDMA registration.
+
+On A3, startup must run the first HCCL collective, then the DSV4 custom AiCPU
+metadata operator, before MemFabric maps Host memory. Starting custom AiCPU
+after those mappings can fail in `halMemBindSibling`; starting it before the
+first HCCL collective can make subsequent metadata calls fail. MemCache
+initialization and buffer registration finish during startup, so existing L3
+objects are readable before the first backup.
+
+Validated with MemCache `04f67cedb553` and MemFabric `7a2d5a3e4b4e` (both 1.3.0),
+with the above MemFabric patch: A3, CANN 9.0.0, TP/DP=8, DeepEP normal,
+`device_sdma`, 8K and 128K L3 replay after flushing L1/L2. Pinned RDMA model
+end-to-end validation is still pending.
+The external MemCache services must have usable Holder capacity before starting
+the test; a healthy Meta endpoint alone is insufficient.
 
 Pass LocalService options via `--hicache-storage-backend-extra-config` (JSON). Keys below match `memcache_hybrid.LocalConfig` field names.
 
