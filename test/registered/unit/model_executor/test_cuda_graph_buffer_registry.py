@@ -29,7 +29,7 @@ from sglang.srt.model_executor.cuda_graph_buffer_registry import (
 from sglang.srt.model_executor.input_buffers import ForwardInputBuffers
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 @dataclasses.dataclass
@@ -674,8 +674,7 @@ class TestPoolBackedAlloc(unittest.TestCase):
 
 class TestBuildDecodeRegistry(unittest.TestCase):
     """``build_decode_registry`` registers the always-on FB-shared decode
-    slots with padding policies matching
-    ``DecodeInputBuffers.populate_from_forward_batch``."""
+    slots with their required padding policies."""
 
     def setUp(self):
         from sglang.srt.model_executor import input_buffers

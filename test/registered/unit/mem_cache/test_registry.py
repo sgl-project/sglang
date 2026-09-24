@@ -1,8 +1,9 @@
 """Unit tests for the radix-cache registry, routing, and selection chain."""
 
+from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 import unittest
 from unittest.mock import MagicMock, patch
@@ -16,7 +17,7 @@ from sglang.srt.mem_cache.registry import (
     register_radix_cache_backend,
     registered_radix_cache_backends,
 )
-from sglang.test.test_utils import CustomTestCase
+from sglang.test.test_utils import CustomTestCase, enter_override
 
 
 def _publish(testcase, **fields):
@@ -213,30 +214,6 @@ class TestDefaultRadixCacheFactory(CustomTestCase):
             PureSWAChunkCache.assert_called_once_with(ctx.params)
             self.assertIs(result, PureSWAChunkCache.return_value)
 
-    def test_cpp_radix_cache_when_env_flag_set(self):
-        ctx = _make_ctx(
-            self,
-        )
-        # `radix_cache_cpp` requires ninja + C++ extension to import, so
-        # we inject a stand-in module rather than letting patch() trigger
-        # the real import.
-        fake_module = MagicMock()
-        with (
-            patch(
-                "sglang.srt.mem_cache.registry.envs.SGLANG_EXPERIMENTAL_CPP_RADIX_TREE.get",
-                return_value=True,
-            ),
-            patch.dict(
-                "sys.modules",
-                {"sglang.srt.mem_cache.radix_cache_cpp": fake_module},
-            ),
-        ):
-            result = default_radix_cache_factory(ctx)
-            fake_module.RadixCacheCpp.assert_called_once_with(
-                params=ctx.params, server_args=ctx.server_args
-            )
-            self.assertIs(result, fake_module.RadixCacheCpp.return_value)
-
     def test_unified_radix_cache_is_the_default(self):
         ctx = _make_ctx(
             self,
@@ -340,14 +317,14 @@ class TestDefaultRadixCacheFactory(CustomTestCase):
         from sglang.srt.mem_cache.storage.umbp import umbp_direct_linker
 
         ctx = _make_ctx(self)
-        object.__setattr__(
-            ctx.server_args, "enable_unified_cache_external_linker", True
+        # The factory reads the linker settings from the bags.
+        enter_override(
+            self,
+            get_context().override_server_args(
+                enable_unified_cache_external_linker=True,
+                unified_cache_external_linker_backend="mori",
+            ),
         )
-        object.__setattr__(
-            ctx.server_args, "unified_cache_external_linker_backend", "mori"
-        )
-        self.assertTrue(ctx.server_args.enable_unified_cache_external_linker)
-        self.assertEqual(ctx.server_args.unified_cache_external_linker_backend, "mori")
         fake_components = MagicMock()
         fake_components.ComponentType.FULL = "full"
         fake_radix = MagicMock()
@@ -387,7 +364,7 @@ class TestDefaultRadixCacheFactory(CustomTestCase):
         )
         self.assertIs(result, cache)
 
-    def test_swa_radix_cache_when_hybrid_swa(self):
+    def test_unified_radix_cache_when_hybrid_swa(self):
         ctx = _make_ctx(self, is_hybrid_swa=True)
         # SWA hybrid models now default to the unified radix tree.
         fake_components = MagicMock()
@@ -413,7 +390,7 @@ class TestDefaultRadixCacheFactory(CustomTestCase):
             PureSWA.assert_called_once_with(params=ctx.params)
             self.assertIs(result, PureSWA.return_value)
 
-    def test_mamba_radix_cache_when_hybrid_ssm(self):
+    def test_unified_radix_cache_when_hybrid_ssm(self):
         ctx = _make_ctx(self, is_hybrid_ssm=True)
         # Mamba hybrid models now default to the unified radix tree.
         fake_components = MagicMock()

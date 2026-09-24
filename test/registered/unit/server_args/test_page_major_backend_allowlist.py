@@ -31,12 +31,14 @@ the unified pool today.
 import unittest
 from types import SimpleNamespace
 
+import msgspec
+
 from sglang.srt.arg_groups.kv_cache_hook import handle_page_major_kv_layout
 from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 def _accepts(
@@ -50,7 +52,7 @@ def _accepts(
 ) -> bool:
     """Run just `handle_page_major_kv_layout` against a minimal stand-in, since
     ServerArgs' real constructor pulls in a model config."""
-    sa = ServerArgs.__new__(ServerArgs)
+    sa = ServerArgs(model_path="dummy")
     for name, value in {
         "enable_unified_memory": unified,
         # The unified pool sets this itself; without it the flag must be explicit
@@ -64,8 +66,8 @@ def _accepts(
         "linear_attn_prefill_backend": linear_prefill,
         "mamba_backend": "triton",
     }.items():
-        object.__setattr__(sa, name, value)
-    object.__setattr__(
+        msgspec.Struct.__setattr__(sa, name, value)
+    setattr(
         sa,
         "_model_config",
         SimpleNamespace(
@@ -99,7 +101,7 @@ class TestPageMajorBackendAllowlist(unittest.TestCase):
     # MLA-family kernels that must never leak into the MHA arm.
     MLA_ONLY_BACKENDS = ("trtllm_mla", "cutedsl_mla", "tokenspeed_mla", "flashmla")
     # No kernel-facing-id wiring anywhere: must stay rejected until they get one.
-    UNWIRED_BACKENDS = ("cutlass_mla", "aiter")
+    UNWIRED_BACKENDS = ("aiter",)
 
     def test_triton_allowed_on_every_arm(self):
         """Triton reads both view families, so it is the one backend neither

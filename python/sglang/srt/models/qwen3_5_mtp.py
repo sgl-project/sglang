@@ -23,7 +23,6 @@ import torch
 from torch import nn
 from transformers import PretrainedConfig
 
-from sglang.srt.distributed import get_pp_group
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
@@ -58,12 +57,14 @@ def _mtp_quant_config(quant_config):
     # Serialized Qwen3.5 ModelOpt checkpoints keep embedded MTP weights in
     # BF16. Disable quantization for those checkpoints; non-serialized
     # modelopt_fp4 still converts MoE expert weights on load.
+    if quant_config and quant_config.get_name() == "modelopt_mixed":
+        # MIXED_PRECISION lists mtp.* layers only when the MTP head is quantized.
+        if any(name.startswith("mtp.") for name in quant_config.quantized_layers):
+            return quant_config
+        return None
     if quant_config and (
-        quant_config.get_name() == "modelopt_mixed"
-        or (
-            quant_config.get_name() == "modelopt_fp4"
-            and quant_config.is_checkpoint_nvfp4_serialized
-        )
+        quant_config.get_name() == "modelopt_fp4"
+        and quant_config.is_checkpoint_nvfp4_serialized
     ):
         return None
     if is_npu() and get_spec().speculative_draft_model_quantization is None:
@@ -110,7 +111,7 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
         self.config = config
         self.tp_size = get_parallel().tp_size
         self.quant_config = quant_config
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
 
         self.fc = nn.Linear(2 * config.hidden_size, config.hidden_size, bias=False)
         RMSNorm_cls = GemmaRMSNorm
@@ -128,7 +129,7 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
             is_nextn=True,
         )
 
-        if get_pp_group().is_last_rank:
+        if get_parallel().pp_group.is_last_rank:
             if config.tie_word_embeddings:
                 self.lm_head = self.model.embed_tokens
             else:
@@ -291,8 +292,9 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
             "_input_scale",
         )
 
-        # fused experts: experts.w13_weight / experts.w2_weight
-        is_fused_expert = False
+        # Fused checkpoint tensors: experts.gate_up_proj / experts.down_proj.
+        # The checkpoint interleaves these with separate shared-expert tensors,
+        # so picking one mapping must not affect the next weight.
         fused_expert_params_mapping = [
             ("experts.w13_weight", "experts.gate_up_proj", 0, "w1"),
             ("experts.w2_weight", "experts.down_proj", 0, "w2"),
@@ -368,13 +370,17 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
                     f"mlp.experts.{num_experts}.",
                 )
 
+            is_fused_expert = (
+                "experts.gate_up_proj" in name or "experts.down_proj" in name
+            )
+            current_expert_params_mapping = (
+                fused_expert_params_mapping
+                if is_fused_expert
+                else expert_params_mapping
+            )
+
             # 1) Process stacked parameters (q_proj/k_proj/v_proj & gate_proj/up_proj)
             for param_name, weight_name, shard_id in stacked_params_mapping:
-                # Check if this is a fused expert weight
-                if "experts.gate_up_proj" in name or "experts.down_proj" in name:
-                    is_fused_expert = True
-                    expert_params_mapping = fused_expert_params_mapping
-
                 # Skip non-matching weights
                 if weight_name not in name:
                     continue
@@ -404,7 +410,7 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
                 # 2) Process MoE expert weights (including fused experts)
                 is_expert_weight = False
 
-                for mapping in expert_params_mapping:
+                for mapping in current_expert_params_mapping:
                     param_name, weight_name, expert_id, shard_id = mapping
                     if weight_name not in name:
                         continue

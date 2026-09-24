@@ -1,7 +1,4 @@
-"""Config-time override declarations for deepseek_v2.
-
-Architectures: DeepseekV32ForCausalLM, DeepseekV3ForCausalLM, Dots3NoteForCausalLM, GlmMoeDsaForCausalLM, HYV4ForCausalLM, HYV4ForCausalLMNextN, KimiK25ForConditionalGeneration, LongcatFlashForCausalLM, LongcatFlashForCausalLMNextN, MistralLarge3ForCausalLM, PixtralForConditionalGeneration.
-"""
+"""Config-time override declarations for deepseek_v2."""
 
 import logging
 from typing import Any, Dict
@@ -24,6 +21,7 @@ logger = logging.getLogger(__name__)
     "MistralLarge3ForCausalLM",
     "PixtralForConditionalGeneration",
     "GlmMoeDsaForCausalLM",
+    "Glm5NextForConditionalGeneration",
     "HYV4ForCausalLM",
     "HYV4ForCausalLMNextN",
     "LongcatFlashForCausalLM",
@@ -31,11 +29,7 @@ logger = logging.getLogger(__name__)
     "Dots3NoteForCausalLM",
 )
 def _deepseek_family_overrides(server_args: Any, hf_config: Any) -> dict:
-    """Order-safe declarations of the DeepSeek/DSA branch. The CP parallel
-    writes (enable_dp_attention/ep_size/moe_a2a_backend have post-monolith
-    writers), the kv-cache/split-backend defaults, the quant/moe block (read
-    before it by _set_default_dsa_kv_cache_dtype) and the env writes stay in
-    the branch."""
+    """Declare DeepSeek/DSA defaults; ordered CP, KV-cache, and MoE passes run in model_hook."""
     cfg = resolving_view(server_args)
     from sglang.srt.configs.model_config import (
         is_deepseek_dsa,
@@ -142,6 +136,9 @@ def _deepseek_family_overrides(server_args: Any, hf_config: Any) -> dict:
             else:
                 overrides["page_size"] = 64
                 logger.warning("Setting page size to 64 for DeepSeek DSA.")
+        elif get_platform().is_xpu:
+            overrides["page_size"] = 128
+            logger.warning("Setting page size to 128 for DeepSeek DSA on XPU.")
     else:
         # DeepSeek V3/R1/V3.1
         if get_platform().is_sm100:

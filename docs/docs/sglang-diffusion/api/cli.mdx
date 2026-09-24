@@ -76,7 +76,7 @@ Use `sglang generate --help` and `sglang serve --help` for the full argument lis
 
 - `--model-path {MODEL}`: model path or Hugging Face model ID
 - `--served-model-name {NAME}`: stable model name exposed by serving APIs. Defaults to `--model-id` when set, otherwise `--model-path`.
-- `--model-variant {NAME}`: semantic checkpoint variant to load when one model repository contains multiple weight partitions. The pipeline maps this stable name to the repository layout before loading; for example, MiniMax-H3 accepts `fl2va` and `ref2va`. This is a server/load-time choice, unlike a request's `task`.
+- `--model-variant {NAME}`: semantic checkpoint variant to load when one model repository contains multiple weight partitions. The pipeline maps this stable name to the repository layout before loading; for example, MiniMax-H3 accepts `fl2va` and `ref2va`, or `hybrid` with explicit merged transformer weights to serve all three tasks (see the [H3 cookbook](/cookbook/diffusion/MiniMax/MiniMax-H3#singularity-hybrid-weights)). This is a server/load-time choice, unlike a request's `task`.
 - `--minimax-h3-adaln-cache-path {FILE}`: advanced MiniMax-H3-only inference cache. It replaces the checkpoint's AdaLN projection weights with precomputed outputs and only accepts requests whose exact FP32 timestep plan is included in the cache. It requires unquantized weights and the matching model variant.
 - `--minimax-h3-adaln-online {true,false}`: rebuild MiniMax-H3 AdaLN outputs from the checkpoint on demand instead of keeping the 24.2 GiB of `adaln_proj` weights resident. Works with any step count or schedule; requires the unquantized native-layout checkpoint. Built plans live in a GPU slab with per-plan LRU eviction and, by default, a pinned-host cache so previously seen schedules swap back in over PCIe instead of re-reading the checkpoint.
 - `--minimax-h3-adaln-plan-width {N}`: widest timestep plan the online slab is sized for (default 4 covers every task; t2va needs 2, fl2va 3).
@@ -95,7 +95,7 @@ Use `sglang generate --help` and `sglang serve --help` for the full argument lis
 - `--dp-size {N}` (alias `--data-parallel-size`): number of data-parallel replicas. Each replica is a full copy of the engine on `num_gpus / N` GPUs with its own ingress; generation requests round-robin across replicas, realtime sessions stick to the replica holding their state, and control operations (weights, LoRA, memory occupation, shutdown) apply to every replica. Combines with the other parallelism axes (`num_gpus = dp × cfg × tp × sp`); monolithic serving only.
 - `--ulysses-degree {N}` and `--ring-degree {N}`: USP parallelism controls
 - `--kv-gather-degree {N}`: sequence-parallel degree that splits rows inside attention and exchanges with one K/V all-gather (queries stay local) instead of Ulysses all-to-all. Non-causal attention only; does not compose with `--ulysses-degree`/`--ring-degree` yet. When no SP degree is set explicitly, `sp_degree=2` defaults to `kv_gather_degree=2` (its measured-win zone) and higher degrees default to Ulysses; under that auto assignment, attention calls the gather path cannot take fall back to the Ulysses exchange, while an explicit degree fails instead of degrading.
-- `--enable-cfg-parallel {true|false}`: enable or explicitly disable CFG parallelism
+- `--enable-cfg-parallel {true|false}`: enable or explicitly disable CFG parallelism. Requests that disable CFG remain valid on a CFG-parallel server, but extra CFG ranks redundantly recompute the single active branch.
 - `--encoder-parallel {auto|fold|dp|replicate}`: how native encoders use the GPUs in each DiT replica. `auto` TP-folds a native text/image encoder wide enough to benefit, selects batch DP for an explicitly supported native text encoder when it can engage, and otherwise keeps the existing encoder TP layout; `fold` shards native text/image encoders across the full replica whenever dimensions allow; `dp` splits a batched encode across supported native text encoder copies and composes with encoder TP; `replicate` disables folding and batch DP. Encoder collectives never cross `--dp-size` replicas. See [Encoder Parallelism](/docs/sglang-diffusion/encoder_parallel).
 - `--warmup-mode {off|request|server}`: control startup warmup for `sglang serve`; `off` skips warmup, `request` primes the request path, and `server` runs a full synthetic server warmup before serving traffic
 - `--enable-torch-compile {true|false}`: compile native diffusion hot paths. When no warmup mode is configured, this also enables server warmup so first real requests do not pay compile latency.
@@ -103,12 +103,17 @@ Use `sglang generate --help` and `sglang serve --help` for the full argument lis
 - `--enable-breakable-cuda-graph {true|false}`: capture supported DiT forwards as breakable CUDA graph segments to reduce launch overhead. Requires `--warmup-resolutions` for every served resolution because each resolution is captured separately. An `extra-high` or `high` request is rejected when it would mount request-scoped DiT fusions that were not present during lossless graph capture; VAE-only request-gated paths remain compatible.
 - `--bcg-text-buckets {N...}`: prompt-length padding buckets for breakable CUDA graph capture/replay reuse.
 - `--attention-backend {BACKEND}`: attention backend for native SGLang and diffusers pipelines
+- `--enable-attention-backend-autotune {true|false}`: for SGLang-native pipelines, benchmark compatible attention backends on each layer's first sufficiently large input and keep a backend only when it is both numerically compatible and measurably faster. Disabled by default and currently validated on SM90 and SM12x. Explicit `--attention-backend`, component overrides, and model-required backends are never replaced.
 - `--component-attention-backends {MAP}`: per-component attention backend overrides, for example `text_encoder=torch_sdpa,transformer=fa`
 - `--attention-backend-config {CONFIG}`: attention backend configuration
 - `--srt-encoder-url {HTTPADDRESS}`: address of SGLang srt server with AR model for GLM-Image like models. See [Models with AR Stage](/docs/sglang-diffusion/models_with_ar).
 - `--srt-encoder-timeout {SECONDS}`: Timeout in seconds for HTTP requests to the SGLang encoder server
 - `--srt-encoder-connection-timeout {SECONDS}`: TCP connection timeout in seconds for SGLang encoder server
 - `--scheduler-rpc-timeout {SECONDS}`: optional end-to-end deadline for an internal scheduler RPC, including scheduler queue time. It is unset by default so valid long-running and queued video jobs are not failed by the transport layer. Set it only when the deployment requires a bounded request deadline; caller cancellation and server shutdown remain effective without it.
+- `--enable-trace`: export OpenTelemetry traces for the diffusion scheduler and worker stages.
+- `--otlp-traces-endpoint {HOST:PORT}`: OTLP collector endpoint used with `--enable-trace` (default: `localhost:4317`).
+- `--otlp-service-name {NAME}`: `service.name` attached to exported traces. Resolution order is this flag, `OTEL_SERVICE_NAME`, then `sglang-diffusion`.
+- `--enable-metrics`: expose Prometheus metrics at `/metrics` (default: disabled). Includes request counts, queue time, host-side stage timing and LoRA state, separated by role and DP replica. See [Production metrics](/docs/sglang-diffusion/production_metrics) for metric semantics and disaggregated scraping.
 - `--pe-server-url {HTTPADDRESS}`: url of SGLang server hosting the PE model (e.g., for ERNIE-Image). See [Models with Prompt Enhancement](/docs/sglang-diffusion/models_with_pe).
 
 ### Sampling and output
@@ -313,6 +318,7 @@ The available modes are:
 
 - `resident`: keep the complete component on the accelerator.
 - `component-offload`: keep the complete component on CPU between uses, moving it to the accelerator before each declared use and back to CPU afterward.
+- `snapshot-offload`: retain CPU parameter storage while a complete component runs on GPU. At the end of a use, restore the CPU parameters instead of copying GPU weights back. Mutable buffers still move back to CPU.
 - `layerwise-offload`: keep component weights on CPU and stream its declared layers during execution.
 
 Selectors match exact loaded component keys from `model_index.json`, including names such as `transformer_2`, `audio_vae`, and `connectors`. The group selectors `dit`, `text_encoder`, `image_encoder`, and `vae` are also available, together with `all`. An exact key overrides a matching group, and a group overrides `all`. Components without a matching canonical selector retain their explicit legacy setting or automatic/model default.
@@ -320,6 +326,34 @@ Selectors match exact loaded component keys from `model_index.json`, including n
 The existing `--dit-cpu-offload`, `--text-encoder-cpu-offload`, `--image-encoder-cpu-offload`, `--vae-cpu-offload`, and `--cpu-offload-components` options remain supported. New and legacy options may be mixed: `--component-residency` wins only for components it matches, while unmatched legacy settings remain effective. Legacy layerwise selectors take precedence over legacy component-offload selectors for the same component. Explicit `--dit-layerwise-offload false` makes the DiT resident unless another explicit DiT selector, such as `--dit-cpu-offload true` or `--component-residency dit=component-offload`, selects a different mode.
 
 Layerwise selection is strict. A native weighted component selected for `layerwise-offload` must declare its layer structure; otherwise startup fails with the unsupported component name instead of silently changing modes. Explicit non-resident placement also requires a request-time component-use declaration, so it cannot silently select a module that the pipeline does not manage. FSDP applies only to resident components. The Diffusers backend supports only pipeline-wide `all=resident` and `all=component-offload`.
+
+#### Snapshot offload
+
+On NVIDIA CUDA GPUs with separate host and device memory, explicitly select
+`--component-residency vae=snapshot-offload` to avoid repeated weight D2H transfers.
+Existing defaults and `component-offload` behavior are unchanged.
+
+Snapshot offload retains a full host copy during GPU execution. With
+`--pin-cpu-memory` enabled (the default), it shares a per-worker host pin budget
+with layerwise offload. Layerwise initialization claims its allowance first;
+snapshot weights use the remainder. Shared parameter storage is pinned once and
+reused across requests; its allowance is returned when the storage is released.
+Pinning also checks current host headroom, including the cgroup limit.
+
+Weights that do not fit the budget, or have pinning disabled, retain their
+existing CPU storage. Checkpoint mmap stays file-backed unless pinning, dtype
+conversion, or weight mutation materializes a copy. Pageable H2D can be slower,
+and pinning temporarily needs space for both the original and pinned storage.
+This budget limits new pinned weight allocations, not total process RAM or the
+CUDA host allocator's cache. Benchmark repeated requests with the actual host
+storage and workload; avoiding D2H does not guarantee an end-to-end speedup.
+
+The whole component must still fit on GPU. Unlike layerwise offload with all layers
+retained across denoising steps, snapshot offload does not require a layer-structure
+declaration and also covers parameters outside transformer blocks. Weight updates,
+LoRA merge/unmerge, and sleep restore the CPU weights before mutation or release.
+FSDP-managed components, shared-memory GPUs, and snapshot-offloaded DiTs with
+breakable CUDA graphs are not supported.
 
 ### Layerwise Offload Tuning
 
@@ -335,23 +369,27 @@ sglang generate \
 
 Values passed to the compatibility option `--layerwise-offload-components` must match loaded component keys, such as `transformer`, `text_encoder`, `image_encoder`, `vae`, `condition_image_encoder`, `spatial_upsampler`, or `vocoder`. Its `default` group selects text encoders, image encoders, and VAEs. Use `all` to select every layerwise-offloadable component.
 
-Layerwise tuning options such as `--dit-offload-prefetch-size`, `--dit-layerwise-resident-layers`, and `--dit-layerwise-residency-policy` continue to control the streamed layer working set. Prefer the smallest component set that solves the memory issue because layerwise offload can increase latency. DiT layerwise offload can run with Cache-DiT: skipped blocks are not streamed, and the first layer after a skip may sync-load. Cache-DiT remains incompatible with FSDP.
+Layerwise tuning options such as `--dit-offload-prefetch-size`, `--dit-layerwise-resident-layers`, `--dit-layerwise-residency-policy`, and `--dit-layerwise-residency-lifetime` continue to control the streamed layer working set. Prefer the smallest component set that solves the memory issue because layerwise offload can increase latency. DiT layerwise offload can run with Cache-DiT: skipped blocks are not streamed, and the first layer after a skip may sync-load. Cache-DiT remains incompatible with FSDP.
 
-Those three set the default for every streamed component. To give one component its own values, use the `component=value` forms, which also accept JSON:
+Those four set the default for every streamed component. To give one component its own values, use the `component=value` forms, which also accept JSON:
 
 ```bash
 sglang serve --model-path <MODEL> \
   --layerwise-offload-components dit,text_encoder \
   --layerwise-prefetch-size text_encoder=2 \
-  --layerwise-resident-layers text_encoder=4 \
-  --layerwise-residency-policy text_encoder=strided
+  --layerwise-resident-layers transformer=4 \
+  --layerwise-residency-policy transformer=strided \
+  --layerwise-residency-lifetime transformer=permanent
 ```
 
-- `--layerwise-prefetch-size`: how many layers to fetch ahead. Fractional values are a share of the stack, `>= 1` an absolute count. Deeper prefetch overlaps more of the transfer with compute, at the cost of staging buffers.
-- `--layerwise-resident-layers`: how many layers stay on the GPU instead of being streamed. Resident layers are transferred once at startup, so they are removed from every pass. Fractional values are a share of the stack.
-- `--layerwise-residency-policy`: `leading` keeps the first layers, `strided` spreads them across the stack so the transfers do not arrive as one burst.
+The `component=value` maps take the loaded component's name — `transformer`, `text_encoder`, `video_vae` — not a group alias: `--layerwise-offload-components` understands `dit`, but `--layerwise-resident-layers dit=4` matches no component and is silently ignored.
 
-A component without an entry keeps the group default, so adding these options changes nothing until one is set. Both knobs trade VRAM for transfer, and the return differs by component: a DiT earns it back once per denoising step, a text encoder or VAE once per request. Measure before raising either.
+- `--layerwise-prefetch-size`: how many layers to fetch ahead. Fractional values are a share of the stack, `>= 1` an absolute count. Deeper prefetch overlaps more of the transfer with compute, at the cost of staging buffers.
+- `--layerwise-resident-layers`: how many layers stay on the GPU instead of being streamed. Fractional values are a share of the stack. Resident layers pay for a component that runs its layers many times per request — a DiT across the denoise steps, a video VAE across the latent chunks — and do nothing for one that runs them once per request, such as a text encoder.
+- `--layerwise-residency-policy`: `leading` keeps the first layers, `strided` spreads them across the stack so the transfers do not arrive as one burst.
+- `--layerwise-residency-lifetime`: how long the resident layers stay. `forward` (default) places them when the component starts running its layers for a request and releases them when it finishes, so they are transferred once per request and keep a copy in host memory. `permanent` places them at load time, keeps no host copy, and never releases them: one transfer for the life of the server.
+
+A component without an entry keeps the group default, so adding these options changes nothing until one is set. All of these trade VRAM for transfer. The lifetime decides *whose* VRAM: with `forward`, only the component that is running holds its resident layers, so the peak is the largest single component's set; with `permanent`, every component's resident layers are on the GPU at once, so the peak is their sum. Pick `permanent` when that sum fits alongside the activations — it also frees the pinned host memory the copies would have held — and `forward` when it does not. Measure before raising any of them.
 
 ## Serve
 

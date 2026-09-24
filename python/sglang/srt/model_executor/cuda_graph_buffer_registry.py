@@ -14,10 +14,9 @@
 """FB-shared slot registry for the CUDA graph forward paths.
 
 ``CudaGraphBufferRegistry`` is the ForwardBatch → graph-resident buffer mirror
-used by capture / replay. It replaces the per-runner ``DecodeInputBuffers`` /
-``PrefillInputBuffers`` dataclasses and their hand-written
-``populate_from_forward_batch`` methods with a single ``GraphSlot``-driven
-registry.
+used by capture / replay. It replaces the hand-written per-runner buffer
+population logic with a single ``GraphSlot``-driven registry while adopting
+the storage allocated by ``DecodeInputBuffers`` / ``PrefillInputBuffers``.
 
 Backend-private buffers (kernel workspaces, derived page tables, etc.) stay
 on ``AttentionBackend.cuda_graph_*`` — the registry only owns FB-shared
@@ -36,6 +35,7 @@ from sglang.srt.model_executor.input_buffers import (
     INDEX_SEMANTIC_BUFFERS,
     share_input_buffer,
 )
+from sglang.srt.runtime_context import get_parallel
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -656,7 +656,11 @@ def build_decode_registry(
             # init_new -- they leave the GLOBAL None and set the replicated LOCAL
             # count directly, so carry that through.
             if fb.global_num_token_non_padded is None:
-                buf.copy_(fb.num_token_non_padded)
+                # DFLASH's dense draft can omit both optional counts, even
+                # when EP on the target enables this slot. Preserve the
+                # registry's skip-missing-field behavior for that path.
+                if fb.num_token_non_padded is not None:
+                    buf.copy_(fb.num_token_non_padded)
                 return
             sharded = not enable_prefill_cp and attn_tp_sharded_fn(
                 ctx.padded_num_tokens
@@ -757,7 +761,10 @@ def build_decode_registry(
             def _pp_source(key):
                 def _fn(_fb, ctx):
                     ppx = ctx.pp_proxy_tensors
-                    return None if ppx is None else ppx.tensors[key]
+                    # .get(): a proxy entry can be absent (e.g. topk_indices
+                    # when a DSA model runs a dense attention backend);
+                    # returning None skips the copy for that slot.
+                    return None if ppx is None else ppx.tensors.get(key)
 
                 return _fn
 
@@ -1005,7 +1012,6 @@ def build_eager_registry(
     is_encoder_decoder: bool = False,
     encoder_len_fill_value: int = 0,
     encoder_lens_dtype: torch.dtype = torch.int32,
-    dp_size: int = 1,
 ) -> CudaGraphBufferRegistry:
     """One fixed-max input registry for the ``EagerRunner``, serving BOTH eager
     decode and eager prefill.
@@ -1036,7 +1042,7 @@ def build_eager_registry(
         register_global_num_tokens=False,
         require_gathered_buffer=False,
         require_mlp_tp_gather=False,
-        dp_size=dp_size,
+        dp_size=get_parallel().dp_size,
         share_pool=True,
         source=None,
     )
