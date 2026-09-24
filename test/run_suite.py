@@ -141,7 +141,8 @@ PER_COMMIT_SUITES = {
     # rejects any register_ppu_ci() outright.
     HWBackend.PPU: [],
     HWBackend.MLU: [
-        "pr-test-mlu",
+        "pr-test-1-mlu",
+        "pr-test-2-mlu",
     ],
 }
 
@@ -222,7 +223,7 @@ NIGHTLY_SUITES = {
         "nightly-xpu-8-gpu",
     ],
     HWBackend.MLU: [
-        "nightly-test-mlu",
+        "nightly-test-2-mlu",
     ],
 }
 
