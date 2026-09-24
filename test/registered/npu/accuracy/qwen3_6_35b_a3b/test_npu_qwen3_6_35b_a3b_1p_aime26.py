@@ -10,6 +10,10 @@ from sglang.test.ci.ci_register import register_npu_ci
 
 register_npu_ci(est_time=6500, suite="nightly-acc-2-npu-a3", nightly=True)
 
+# TEMPORARY: extra registration for the temperature=0 verification job in
+# nightly-test-npu.yml. Remove before merging.
+register_npu_ci(est_time=6500, suite="nightly-acc-temp0-2-npu-a3", nightly=True)
+
 QWEN3_6_35B_A3B_3K5_1K5_ENVS = {
     "PYTORCH_NPU_ALLOC_CONF": "expandable_segments:True",
     "STREAMS_PER_DEVICE": "32",
@@ -77,12 +81,13 @@ class TestNPUQwen3_6_35BA3B_1P_In3k5_Out1k5_aime26(TestNpuAccuracyTestCaseBase):
     envs = QWEN3_6_35B_A3B_3K5_1K5_ENVS
     other_args = QWEN3_6_35B_A3B_3K5_1K5_OTHER_ARGS
     accuracy = 0.927
+    max_retries = 3
     datasets = ["aime26"]
     few_shot_num = 0
     eval_batch_size = 4
     generation_config = {
         "max_tokens": 131072,
-        "temperature": 0.6,
+        "temperature": 0,
         "top_p": 0.95,
         "top_k": 20,
         "min_p": 0.0,

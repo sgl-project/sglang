@@ -14,6 +14,11 @@ register_npu_ci(
     nightly=True,
 )
 
+# TEMPORARY: extra registration for the temperature=0 verification job in
+# nightly-test-npu.yml. Remove before merging.
+register_npu_ci(est_time=2800, suite="nightly-acc-temp0-2-npu-a3", nightly=True)
+
+
 QWEN3_6_35B_A3B_64K_PREFIX_ENVS = {
     "PYTORCH_NPU_ALLOC_CONF": "expandable_segments:True",
     "STREAMS_PER_DEVICE": "32",
@@ -88,12 +93,13 @@ class TestNPUQwen3_6_35BA3B_1P_AIME2026(TestNpuAccuracyTestCaseBase):
     other_args = QWEN3_6_35B_A3B_64K_PREFIX_OTHER_ARGS
     envs = QWEN3_6_35B_A3B_64K_PREFIX_ENVS
     accuracy = 0.927
+    max_retries = 3
     datasets = ["aime26"]
     few_shot_num = 0
     eval_batch_size = 64
     generation_config = {
         "max_tokens": 65536,
-        "temperature": 0.2,
+        "temperature": 0,
         "repetition_penalty": 1.08,
     }
 

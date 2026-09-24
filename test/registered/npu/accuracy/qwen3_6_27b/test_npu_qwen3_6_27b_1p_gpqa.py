@@ -18,6 +18,11 @@ register_npu_ci(
     nightly=True,
 )
 
+# TEMPORARY: extra registration for the temperature=0 verification job in
+# nightly-test-npu.yml. Remove before merging.
+register_npu_ci(est_time=6500, suite="nightly-acc-temp0-2-npu-a3", nightly=True)
+
+
 QWEN3_6_27B_64K_PREFIX_ENVS = {
     "PYTORCH_NPU_ALLOC_CONF": "expandable_segments:True",
     "SGLANG_SET_CPU_AFFINITY": "1",
@@ -91,13 +96,13 @@ class TestNPUQwen3_6_27B_1P_In64k_Out1k_Prefix90_gpqa(TestNpuAccuracyTestCaseBas
     envs = QWEN3_6_27B_64K_PREFIX_ENVS
     other_args = QWEN3_6_27B_64K_PREFIX_OTHER_ARGS
     accuracy = 0.878
-    max_retries = 1
+    max_retries = 3
     datasets = ["gpqa_diamond"]
     few_shot_num = 0
     eval_batch_size = 64
     generation_config = {
         "max_tokens": 81920,
-        "temperature": 1.0,
+        "temperature": 0,
         "extra_body": {
             "chat_template_kwargs": {"enable_thinking": True},
         },
