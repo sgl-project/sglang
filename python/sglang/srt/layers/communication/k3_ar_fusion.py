@@ -391,6 +391,6 @@ def gemm_ag_down_proj(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
 
     state = _get_state()
     assert state is not None
-    out = torch.empty((1, NORM_DIM), dtype=torch.float32, device=x.device)
+    out = torch.empty((1, weight.shape[0]), dtype=torch.float32, device=x.device)
     mod.gemm_ag_down_proj(state.world_size, x, weight, out)
     return out
