@@ -2421,6 +2421,19 @@ class DeepseekV4AscendAttnBackend(
     def store_cache(self, *, layer_id: int, swa_k: torch.Tensor, forward_batch):
         pool = self.token_to_kv_pool
         swa_loc = self.get_swa_out_cache_loc(forward_batch)
+        if int(os.environ.get("DSV4_DUMP_SWA_KV", "0")) == layer_id:
+            try:
+                raw = swa_k.detach().view(torch.uint8).cpu().numpy().tobytes()
+                locs = swa_loc.reshape(-1)
+                print(
+                    f"[SWAW] start_pos={forward_batch.positions.reshape(-1)[-1].item()} "
+                    f"layer={layer_id} n={locs.numel()} "
+                    f"loc=[{int(locs.min().item())},{int(locs.max().item())}] "
+                    f"md5={hashlib.md5(raw).hexdigest()[:16]} bytes={len(raw)}",
+                    flush=True,
+                )
+            except Exception as exc:
+                print(f"[SWAW] skipped: {exc}", flush=True)
         pool.set_swa_buffer(
             layer_id=layer_id,
             loc=swa_loc,
