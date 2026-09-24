@@ -435,6 +435,7 @@ class TestDecodePreallocQueuePriority(unittest.TestCase):
             kv_receiver=MagicMock(),
             metadata_buffer_index=-1,
             is_rebootstrap=False,
+            host_staged=False,
         )
 
     def _new_queue(self, decode_reqs, *, low_priority_values_first: bool = False):
@@ -860,6 +861,7 @@ class TestDecodePrebuilt(unittest.TestCase):
         )
 
         new_batch = MagicMock()
+        new_batch.is_empty.return_value = False
         # get_new_prebuilt_batch reads the published disagg config
         # (disaggregation_decode_enable_radix_cache).
         with (
@@ -889,6 +891,7 @@ class TestDecodePrebuilt(unittest.TestCase):
 
         call_order = []
         new_batch = MagicMock()
+        new_batch.is_empty.return_value = False
         new_batch.prepare_for_prebuilt.side_effect = lambda: call_order.append(
             "prepare"
         )

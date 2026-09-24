@@ -290,9 +290,9 @@ from sglang.srt.managers.utils import (
 from sglang.srt.mem_cache import kv_cache_builder
 from sglang.srt.mem_cache.base_prefix_cache import CacheRequestOutcome
 from sglang.srt.mem_cache.common import (
+    discard_kv_cache_backup,
     maybe_cache_unfinished_req,
     release_kv_cache,
-    retraction_discard,
 )
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.model_executor.runner_utils.pool import prewarm_graph_pool_borrow
@@ -5434,6 +5434,8 @@ class Scheduler(
             )
             # For disaggregation decode mode, the request in the waiting queue has KV cache allocated.
             if self.disaggregation_mode == DisaggregationMode.DECODE:
+                if get_disagg().disaggregation_decode_host_receive_threshold > 0:
+                    discard_kv_cache_backup(req, self.tree_cache, "host_pool")
                 release_kv_cache(req, self.tree_cache)
             if self.disaggregation_mode == DisaggregationMode.PREFILL:
                 self.release_aborted_prefill_waiting_req(req)
@@ -5497,6 +5499,10 @@ class Scheduler(
             for decode_req in self.disagg_decode_transfer_queue.queue:
                 if recv_req.abort_all or decode_req.req.rid.startswith(recv_req.rid):
                     logger.debug(f"Abort transfer queue request. {decode_req.req.rid=}")
+                    if decode_req.host_staged:
+                        # Keep the host destination alive until prefill stops writing.
+                        prepare_abort(decode_req.req, "Aborted by AbortReq.")
+                        continue
                     receiver = decode_req.kv_receiver
                     receiver.abort()
                     # Arm drain-ack accounting once the ABORT is sent, so acks
@@ -5518,7 +5524,7 @@ class Scheduler(
                 remaining_retracted = []
                 for decode_req in self.disagg_decode_prealloc_queue.retracted_queue:
                     if recv_req.abort_all or decode_req.rid.startswith(recv_req.rid):
-                        retraction_discard(
+                        discard_kv_cache_backup(
                             decode_req,
                             self.tree_cache,
                             get_disagg().disaggregation_decode_retraction_backup,
