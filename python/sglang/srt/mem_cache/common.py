@@ -161,6 +161,14 @@ def free_kv_row_segments(
 
 def maybe_cache_unfinished_req(req: Req, tree_cache: BasePrefixCache, **kwargs):
     if getattr(req, "skip_radix_cache_insert", False):
+        # Nothing enters the tree, but a chunked request still has to continue
+        # from what it already prefilled: its next round keeps prefix_indices
+        # as-is, so leaving them empty re-extends (and leaks) the first chunk
+        # forever. Same bookkeeping as the chunk cache.
+        if req.kv.holds_kv:
+            req.prefix_indices = tree_cache.req_to_token_pool.req_to_token[
+                req.kv.req_pool_idx, : len(req.get_fill_ids())
+            ].to(dtype=torch.int64, copy=True)
         return
 
     tree_cache.cache_unfinished_req(req, **kwargs)
