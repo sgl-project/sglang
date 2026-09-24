@@ -293,6 +293,23 @@ class TokenizerManagerScoreMixin:
             )
         return embeds, positions
 
+    def _placeholder_positions(
+        self,
+        token_ids: List[int],
+        embed_override_token_id: Optional[int],
+        position_offset: int = 0,
+    ) -> List[int]:
+        """Return the positions of the placeholder token in ``token_ids``, each shifted by
+        ``position_offset``. Used by the stacked path, which only needs where the embeds go
+        (the embeds themselves are already stacked)."""
+        if embed_override_token_id is None:
+            return []
+        return [
+            idx + position_offset
+            for idx, tok in enumerate(token_ids)
+            if tok == embed_override_token_id
+        ]
+
     def _resolve_embed_overrides_for_request(
         self,
         query: List[int],
@@ -337,12 +354,31 @@ class TokenizerManagerScoreMixin:
         embed_override_token_id: Optional[int],
         query_embed_overrides: Optional[List[torch.Tensor]],
         item_embed_overrides: Optional[List[Optional[List[torch.Tensor]]]],
+        stacked_query_item_embed_overrides: Optional[
+            List[Optional[torch.Tensor]]
+        ] = None,
     ) -> Tuple[None, List[List[int]], Optional[list], Optional[List[int]]]:
         """Build input_ids and resolve embed overrides for token-ID inputs.
 
-        Multi-item-scoring and single-item modes differ only in how input_ids
-        are assembled and what position offset each item gets.
+        Works identically for multi-item-scoring and single-item modes — the only difference is
+        how input_ids are assembled and what position offset each item gets.
+
+        With ``stacked_query_item_embed_overrides``, embeds are used as-is and
+        query_/item_embed_overrides are ignored; see _build_token_id_inputs_stacked.
+
+        Returns:
+            (text_prompts, input_ids, positional_embed_overrides, delimiter_indices)
         """
+        if stacked_query_item_embed_overrides is not None:
+            return self._build_token_id_inputs_stacked(
+                query,
+                items,
+                item_first,
+                use_multi_item_scoring,
+                embed_override_token_id,
+                stacked_query_item_embed_overrides,
+            )
+
         # Both query and items are token IDs
         has_embeds = (
             query_embed_overrides is not None or item_embed_overrides is not None
@@ -437,6 +473,88 @@ class TokenizerManagerScoreMixin:
                 None,
             )
 
+    def _build_token_id_inputs_stacked(
+        self,
+        query: List[int],
+        items: List[List[int]],
+        item_first: bool,
+        use_multi_item_scoring: bool,
+        embed_override_token_id: Optional[int],
+        stacked_query_item_embed_overrides: List[Optional[torch.Tensor]],
+    ) -> Tuple[None, List[List[int]], Optional[list], Optional[List[int]]]:
+        """Stacked variant of _build_token_id_inputs.
+
+        Here each sequence's embeds arrive already stacked as an ``[N, hidden]`` tensor
+        (rows ordered as query placeholders first, then item placeholders) and are used
+        as-is -- we only compute the token positions where they attach.
+
+        ``stacked_query_item_embed_overrides`` lines up 1:1 with the produced
+        PositionalEmbeds: one tensor for multi-item scoring, or one per item otherwise
+        (``None`` if an item has no overrides). On the single-item path the query rows are
+        copied into each item's tensor.
+        """
+        if use_multi_item_scoring:
+            delimiter_token_id = MIS_DELIMITER_TOKEN_ID
+            combined_input_ids, delimiter_indices = (
+                self._build_multi_item_token_sequence(query, items, delimiter_token_id)
+            )
+            input_ids = [combined_input_ids]
+
+            embeds = (
+                stacked_query_item_embed_overrides[0]
+                if stacked_query_item_embed_overrides
+                else None
+            )
+            if embeds is None:
+                return None, input_ids, None, delimiter_indices
+
+            positions = self._placeholder_positions(query, embed_override_token_id, 0)
+            current_offset = len(query) + 1  # +1 for first delimiter
+            for item in items:
+                positions.extend(
+                    self._placeholder_positions(
+                        item, embed_override_token_id, current_offset
+                    )
+                )
+                current_offset += len(item) + 1  # +1 for delimiter
+
+            pe = [PositionalEmbeds(embeds=embeds, positions=positions)]
+            return None, input_ids, pe, delimiter_indices
+
+        # Single-item scoring: one sequence (query + item) per item.
+        input_ids = (
+            [item + query for item in items]
+            if item_first
+            else [query + item for item in items]
+        )
+        q_positions = self._placeholder_positions(query, embed_override_token_id, 0)
+
+        positional_embed_overrides: List[Optional[PositionalEmbeds]] = []
+        any_overrides = False
+        for i, item in enumerate(items):
+            embeds = (
+                stacked_query_item_embed_overrides[i]
+                if i < len(stacked_query_item_embed_overrides)
+                else None
+            )
+            if embeds is None:
+                positional_embed_overrides.append(None)
+                continue
+            i_positions = self._placeholder_positions(
+                item, embed_override_token_id, len(query)
+            )
+            positional_embed_overrides.append(
+                PositionalEmbeds(embeds=embeds, positions=q_positions + i_positions)
+            )
+            any_overrides = True
+
+        return (
+            None,
+            input_ids,
+            positional_embed_overrides if any_overrides else None,
+            None,
+        )
+
     # ------------------------------------------------------------------
     # Main entry point
     # ------------------------------------------------------------------
@@ -451,6 +569,10 @@ class TokenizerManagerScoreMixin:
         embed_override_token_id: Optional[int] = None,
         query_embed_overrides: Optional[List[torch.Tensor]] = None,
         item_embed_overrides: Optional[List[Optional[List[torch.Tensor]]]] = None,
+        stacked_query_item_embed_overrides: Optional[
+            List[Optional[torch.Tensor]]
+        ] = None,
+        stacked_query_item_embed_ipc_handle: Optional[Any] = None,
         request: Optional[Any] = None,
         return_pooled_hidden_states: bool = False,
     ) -> ScoreResult:
@@ -474,6 +596,25 @@ class TokenizerManagerScoreMixin:
 
         return_pooled_hidden_states is only supported for non-generation models
         (SequenceClassification, RewardModel); raises ValueError for CausalLM.
+
+        stacked_query_item_embed_overrides is a zero-copy alternative to
+        query_/item_embed_overrides: one already-stacked [N, hidden] tensor per
+        output sequence (one per item for single-item, one element for multi-item;
+        None if a sequence has no overrides), rows ordered query-placeholders-then-item.
+        Used as-is (no restack) and mutually exclusive with query_/item_embed_overrides.
+
+        stacked_query_item_embed_ipc_handle is the CUDA IPC handle of the buffer
+        backing stacked_query_item_embed_overrides. When set, each tensor is wrapped
+        for zero-copy IPC transport with this handle (requires
+        stacked_query_item_embed_overrides and tp_size==1; otherwise the tensors
+        transport by value). Caller contract (the pickle path transports the handle +
+        each tensor's offset/shape, not the tensor bytes): each override MUST be a view
+        into the buffer this handle exports; writes into that buffer MUST be complete
+        before this call (synchronize the producer stream after writing); and the region
+        MUST stay allocated and immutable until scoring finishes, so overlapping requests
+        must use distinct, not-yet-reclaimed regions. Passing a copied tensor, a view of
+        a different allocation, or a stale handle reads unrelated GPU memory and silently
+        corrupts scores.
         """
         is_generation = self.is_generation
 
@@ -487,20 +628,66 @@ class TokenizerManagerScoreMixin:
             return ScoreResult(scores=[], prompt_tokens=0)
 
         has_embeds = (
-            query_embed_overrides is not None or item_embed_overrides is not None
+            query_embed_overrides is not None
+            or item_embed_overrides is not None
+            or stacked_query_item_embed_overrides is not None
         )
         if has_embeds and embed_override_token_id is None:
             raise ValueError(
-                "embed_override_token_id is required when query_embed_overrides "
-                "or item_embed_overrides are supplied."
+                "embed_override_token_id is required when query_embed_overrides, "
+                "item_embed_overrides, or stacked_query_item_embed_overrides are supplied."
             )
         if item_first and has_embeds:
             raise ValueError("item_first is not supported when embeddings are supplied")
-        if item_embed_overrides is not None and len(item_embed_overrides) != len(items):
+        if stacked_query_item_embed_overrides is not None and (
+            query_embed_overrides is not None or item_embed_overrides is not None
+        ):
+            raise ValueError(
+                "stacked_query_item_embed_overrides is mutually exclusive with "
+                "query_embed_overrides / item_embed_overrides."
+            )
+        if (
+            stacked_query_item_embed_ipc_handle is not None
+            and stacked_query_item_embed_overrides is None
+        ):
+            raise ValueError(
+                "stacked_query_item_embed_ipc_handle requires stacked_query_item_embed_overrides."
+            )
+        # Zero-copy IPC transport only works with a single scheduler rank. With tp_size>1
+        # the scheduler would need to re-share the imported buffer to every rank, but
+        # imported IPC memory can't be re-exported. Callers must use the by-value embed API.
+        if (
+            stacked_query_item_embed_ipc_handle is not None
+            and self.server_args.tp_size > 1
+        ):
+            raise ValueError(
+                "stacked_query_item_embed_ipc_handle (zero-copy IPC transport) is not "
+                f"supported with tp_size>1 (got tp_size={self.server_args.tp_size}); "
+                "use query_/item_embed_overrides instead."
+            )
+        num_items = 1 if isinstance(items, str) else len(items)
+        if item_embed_overrides is not None and len(item_embed_overrides) != num_items:
             raise ValueError(
                 f"item_embed_overrides length ({len(item_embed_overrides)}) "
-                f"must match items length ({len(items)})."
+                f"must match items length ({num_items})."
             )
+        if stacked_query_item_embed_overrides is not None:
+            # Stacked overrides need token-id query/items: the placeholder token marks
+            # where each embed goes, so str inputs (no token IDs yet) aren't supported.
+            if isinstance(query, str) or isinstance(items, str):
+                raise ValueError(
+                    "stacked_query_item_embed_overrides requires token-id query/items, "
+                    "not str."
+                )
+            # Expect one stacked tensor per output sequence: with multi-item scoring the
+            # items are fused into one sequence, otherwise there's one sequence per item.
+            expected = 1 if get_exec().features.enable_mis else num_items
+            if len(stacked_query_item_embed_overrides) != expected:
+                raise ValueError(
+                    f"stacked_query_item_embed_overrides length "
+                    f"({len(stacked_query_item_embed_overrides)}) must be {expected} "
+                    f"(1 for multi-item scoring, else len(items))."
+                )
         if self.tokenizer is not None and label_token_ids is not None:
             vocab_size = self.tokenizer.vocab_size
             for token_id in label_token_ids:
@@ -511,6 +698,47 @@ class TokenizerManagerScoreMixin:
 
         # Check if multi-item scoring is enabled
         use_multi_item_scoring = get_exec().features.enable_mis
+
+        # Wrap each override tensor as a TransportProxyTensor carrying the shared buffer's
+        # IPC handle, so it pickles as (handle + offset/shape) instead of copying the data.
+        # The caller passes plain tensors plus one handle for the whole buffer.
+        if stacked_query_item_embed_ipc_handle is not None:
+            from sglang.srt.managers.mm_utils import TransportProxyTensor
+
+            # Guard against tensors not backed by the shared buffer. Because pickling keeps
+            # only the handle + offset/shape, a tensor from a different allocation would
+            # make the scheduler read the wrong GPU memory. We can't inspect the opaque
+            # handle, so we require every override to be a CUDA tensor and to share one
+            # backing storage (that they actually belong to this buffer stays the caller's
+            # responsibility).
+            base_ptrs = set()
+            for t in stacked_query_item_embed_overrides:
+                if t is None:
+                    continue
+                if not t.is_cuda:
+                    raise ValueError(
+                        "stacked_query_item_embed_overrides must be CUDA tensors when "
+                        "stacked_query_item_embed_ipc_handle is supplied."
+                    )
+                base_ptrs.add(t.untyped_storage().data_ptr())
+            if len(base_ptrs) > 1:
+                raise ValueError(
+                    "all stacked_query_item_embed_overrides must be views into a single "
+                    "buffer when stacked_query_item_embed_ipc_handle is supplied."
+                )
+
+            stacked_query_item_embed_overrides = [
+                (
+                    TransportProxyTensor(
+                        t,
+                        transport_mode="cuda_ipc",
+                        ipc_handle=stacked_query_item_embed_ipc_handle,
+                    )
+                    if t is not None
+                    else None
+                )
+                for t in stacked_query_item_embed_overrides
+            ]
 
         input_ids = None
         text_prompts = None
@@ -560,6 +788,7 @@ class TokenizerManagerScoreMixin:
                     embed_override_token_id,
                     query_embed_overrides,
                     item_embed_overrides,
+                    stacked_query_item_embed_overrides,
                 )
             )
         elif has_embeds:
@@ -574,6 +803,7 @@ class TokenizerManagerScoreMixin:
                     embed_override_token_id,
                     query_embed_overrides,
                     item_embed_overrides,
+                    stacked_query_item_embed_overrides,
                 )
             )
         else:
