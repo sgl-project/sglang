@@ -276,9 +276,8 @@ def retraction_discard(req: Req, tree_cache: BasePrefixCache, backend: str) -> N
 
 
 def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = True):
-    """Give the request's kv row back. With ``is_insert`` the tree keeps what
-    it can key first; without it (abort, retract, KV the request cannot vouch
-    for) the row is freed past the protected prefix."""
+    """Give the request's kv row back; with ``is_insert`` the tree first keeps
+    what it can key."""
     assert (not req.kv.holds_kv) == req.kv.is_kv_released
     # A mamba-capable cache may alloc mamba state before alloc KV cache
     if not req.kv.holds_kv:

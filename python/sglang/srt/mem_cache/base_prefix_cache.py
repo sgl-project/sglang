@@ -419,21 +419,11 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
 
     @abstractmethod
     def cache_finished_req(self, req: Req, *, owned_kv_len: int, **kwargs):
-        """Hand a finished request's KV to the tree.
-
-        ``[0, req.kv.cache_protected_len)`` is cache-owned and must survive.
-        Every slot in ``[req.kv.cache_protected_len, owned_kv_len)`` is this
-        call's to account for: insert what can be keyed, release the rest.
-        Slicing the kv row by the token-id count instead strands whatever
-        lies between -- no caller releases those. ``release_kv_cache`` frees
-        everything past ``owned_kv_len``.
-
-        Every implementation is the same three steps: insert what can be
-        keyed (advancing ``cache_protected_len``), ``free_kv_row`` the rest
-        of ``[cache_protected_len, owned_kv_len)``, ``unpin``. A request that
-        leaves without inserting never gets here; ``release_kv_cache`` runs
-        the last two steps itself.
-        """
+        """Hand a finished request's KV to the tree: insert what can be keyed
+        (advancing ``cache_protected_len``), ``free_kv_row`` the rest of
+        ``[cache_protected_len, owned_kv_len)``, ``unpin``. Slicing the row by
+        token count instead strands the slots up to ``owned_kv_len``; the
+        caller frees everything past it."""
 
     @abstractmethod
     def cache_unfinished_req(self, req: Req, **kwargs):
@@ -481,9 +471,8 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         pass
 
     def unpin(self, req: Req) -> None:
-        """Drop the tree lock the request holds on ``req.last_node``: the
-        request-level ``dec_lock_ref``. A cache whose acquire hands back a
-        receipt releases with that receipt here."""
+        """Drop the tree lock the request holds on ``req.last_node``; a cache
+        whose acquire returned a receipt releases with it here."""
         if req.last_node is not None:
             self.dec_lock_ref(req.last_node)
 
@@ -493,10 +482,8 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         return False
 
     def on_release(self, req: Req, *, inserted: bool) -> None:
-        """The request's kv row is freed and its lock dropped; ``inserted``
-        says whether its KV went into the tree first. Per-request state a
-        cache keeps outside the tree is dropped here, before the row slot
-        itself is returned to the pool."""
+        """The row is freed and the lock dropped; ``inserted`` says whether the
+        KV went into the tree first. Drop per-request state kept outside the tree."""
 
     def evictable_size(self):
         return 0

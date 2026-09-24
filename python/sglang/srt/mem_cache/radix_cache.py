@@ -442,16 +442,8 @@ class RadixCache(BasePrefixCache):
         key_limit: Optional[int] = None,
         split_prompt: bool = False,
     ) -> Tuple[RadixKey, torch.Tensor, int]:
-        """Hand the keyed prefix of the request's kv row to the tree.
-
-        Inserts the page-aligned key built from ``token_ids`` (cut at
-        ``key_limit`` when given), then gives back the request-owned duplicates
-        ``[req.kv.cache_protected_len, matched)`` the insert exposed. Returns
-        the key, the row slice it was built from and ``matched``, the key
-        length the tree already held. What follows is the caller's: a running
-        request re-points its row at the tree; a finished one releases the
-        rest and unpins.
-        """
+        """Insert the page-aligned key of ``token_ids`` (cut at ``key_limit``)
+        and free the duplicates it exposed; returns (key, row slice, matched)."""
         kv_indices = self.req_to_token_pool.req_to_token[
             req.kv.req_pool_idx, : len(token_ids)
         ]
@@ -474,11 +466,8 @@ class RadixCache(BasePrefixCache):
             )
         )
         if split_prompt:
-            # A request that was never cached while unfinished can add its
-            # whole prompt and generated output as one leaf. Split that leaf at
-            # the prompt boundary so LRU eviction can discard output KV without
-            # also losing the reusable prompt KV. Reinserting a prefix only
-            # changes radix topology; it reuses the indices inserted above.
+            # Split the leaf at the prompt boundary so eviction can drop the
+            # output KV without the prompt; a prefix re-insert only changes topology.
             prompt_key = RadixKey(
                 token_ids[: len(req.origin_input_ids)],
                 req.extra_key,
@@ -491,11 +480,8 @@ class RadixCache(BasePrefixCache):
                         key=prompt_key,
                         value=values[: len(prompt_key)],
                         priority=priority + 1,
-                        # Topology-only re-insert: this request created these
-                        # nodes moments ago, so counting it as a hit is the
-                        # same self-referencing inflation `chunked` exists to
-                        # suppress. hit_count drives eviction order, so an
-                        # extra bump would silently promote every prompt node.
+                        # The request created these nodes moments ago; another
+                        # hit_count bump would promote every prompt node.
                         chunked=True,
                     )
                 )

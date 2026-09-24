@@ -1036,15 +1036,10 @@ class UnifiedRadixCache(BasePrefixCache):
         insert_params.value = values
         result = self.insert(insert_params)
 
-        # Keep the prompt as an independent radix node. Finished requests
-        # append a short, request-specific output to a much longer prompt;
-        # without this split the prompt and output form one leaf and are
-        # evicted together. Re-inserting the prompt only changes topology:
-        # prev_prefix_len prevents the overlapping KV indices from being
-        # treated as duplicate allocations and freed. A declined rotation
-        # tail releases everything past the protected prefix below, so the
-        # split is skipped there rather than handing the tree rows that
-        # are about to be freed.
+        # Split the leaf at the prompt boundary so eviction can drop the output
+        # KV without the prompt. prev_prefix_len keeps the overlapping indices
+        # from being freed as duplicates; skipped after a declined rotation,
+        # whose rows are freed below.
         prompt_key = RadixKey(
             req.origin_input_ids,
             req.extra_key,
@@ -1064,19 +1059,15 @@ class UnifiedRadixCache(BasePrefixCache):
                     value=values[: len(prompt_key)],
                     prev_prefix_len=len(prompt_key),
                     priority=insert_params.priority + 1,
-                    # Topology-only re-insert: the request itself created
-                    # these nodes moments ago, so counting it as a hit is
-                    # the same self-referencing inflation `chunked` exists
-                    # to suppress. hit_count drives eviction order, so an
-                    # extra bump here would silently promote every prompt
-                    # node into the protected segment.
+                    # The request created these nodes moments ago; another
+                    # hit_count bump would promote every prompt node.
                     chunked=True,
                 )
             )
 
-        # Free unaligned tail (+ deferred truncation tail). A rotation
-        # decline inserted nothing, so the whole span past the protected
-        # prefix stayed request-owned and is released here instead.
+        # Free the unaligned tail and the deferred truncation tail; after a
+        # rotation decline nothing was inserted, so everything past the
+        # protected prefix goes.
         free_from = (
             # min(): the protected prefix can already run past a truncated
             # cache_len, and free_kv_row takes ascending ranges only.
