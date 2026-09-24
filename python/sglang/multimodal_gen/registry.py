@@ -45,6 +45,7 @@ from sglang.multimodal_gen.configs.pipeline_configs import (
     WanT2V720PConfig,
     ZImagePipelineConfig,
 )
+from sglang.multimodal_gen.configs.pipeline_configs.anima import AnimaPipelineConfig
 from sglang.multimodal_gen.configs.pipeline_configs.base import PipelineConfig
 from sglang.multimodal_gen.configs.pipeline_configs.ernie_image import (
     ErnieImagePipelineConfig,
@@ -123,6 +124,7 @@ from sglang.multimodal_gen.configs.pipeline_configs.wan import (
     Wan2_2_T2V_A14B_Config,
     Wan2_2_TI2V_5B_Config,
 )
+from sglang.multimodal_gen.configs.sample.anima import AnimaSamplingParams
 from sglang.multimodal_gen.configs.sample.cosmos3 import Cosmos3SamplingParams
 from sglang.multimodal_gen.configs.sample.ernie_image import ErnieImageSamplingParams
 from sglang.multimodal_gen.configs.sample.flux import (
@@ -1108,6 +1110,11 @@ def _register_configs():
         model_detectors=[
             lambda hf_id: "flux.2" in hf_id.lower() and "klein" not in hf_id.lower()
         ],
+    )
+    register_configs(
+        sampling_param_cls=AnimaSamplingParams,
+        pipeline_config_cls=AnimaPipelineConfig,
+        hf_model_paths=["circlestone-labs/Anima-Base-v1.0-Diffusers"],
     )
     register_configs(
         sampling_param_cls=ZImageTurboSamplingParams,
