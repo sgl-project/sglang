@@ -37,6 +37,7 @@ from sglang.srt.managers.mm_schedule import (
 from sglang.srt.managers.schedule_batch import (
     CudaIpcTensorTransportProxy,
     Modality,
+    MultimodalDataItem,
     MultimodalInputs,
     MultimodalProcessorOutput,
 )
@@ -1434,6 +1435,61 @@ def _wrap_tensor_or_list(value, precomputed_hash: Optional[int] = None):
         ]
         return type(value)(wrapped) if isinstance(value, tuple) else wrapped
     return value
+
+
+def narrow_value_to_own_storage(value):
+    """Copy a tensor that is a view of a larger buffer into its own storage.
+
+    Pickle serialises a tensor's whole underlying storage, not the view, and
+    `SGLANG_USE_PICKLE_IPC` selects pickle for tokenizer->scheduler IPC by
+    default. Per-item features are views far more often than not:
+    `get_new_expanded_mm_items` above splits one packed feature tensor into one
+    slice per placeholder, so without this every item carries every other
+    item's bytes and a request with N images costs `N * total_bytes` to send
+    instead of `total_bytes`.
+
+    One copy per oversized item, paid once at the boundary, replaces N
+    serialisations of the whole buffer. A tensor that already owns its storage
+    -- the single-image case, and every unsplit item -- is returned untouched.
+    """
+    # Exact type, not isinstance: TransportProxyTensor carries its transport
+    # metadata in an instance attribute set by __new__, which clone() does not
+    # run, so cloning one yields a subclass instance whose __getstate__ then
+    # fails on the missing _metadata. Subclasses own their own transport.
+    if type(value) is torch.Tensor:
+        if value.untyped_storage().nbytes() > value.numel() * value.element_size():
+            return value.clone()
+        return value
+    if type(value) is list:
+        return [narrow_value_to_own_storage(v) for v in value]
+    if type(value) is tuple:
+        return tuple(narrow_value_to_own_storage(v) for v in value)
+    return value
+
+
+def narrow_mm_features_to_own_storage(mm_inputs) -> None:
+    """Narrow every item's feature in place, just before the request is sent.
+
+    Placed on the tokenizer side of IPC and after every processor, including
+    the ones that build their own items and return a MultimodalProcessorOutput
+    directly rather than going through process_and_combine_mm_data.
+
+    Left alone for a feature already wrapped for a zero-copy transport: a
+    CudaIpcTensorTransportProxy or shm pointer is not a tensor, so it does not
+    match, and copying one would defeat the transport that replaced it.
+    """
+    if mm_inputs is None:
+        return
+    mm_items = getattr(mm_inputs, "mm_items", None)
+    if not mm_items:
+        return
+    for item in mm_items:
+        if not isinstance(item, MultimodalDataItem):
+            continue
+        item.feature = narrow_value_to_own_storage(item.feature)
+        item.precomputed_embeddings = narrow_value_to_own_storage(
+            item.precomputed_embeddings
+        )
 
 
 def wrap_shm_features(obj):
