@@ -1004,7 +1004,13 @@ class CommonKVManager(BaseKVManager):
             # For MLA models, we can retrieve KVCache from only one prefill rank, but we still need to maintain
             # multiple connections in the connection pool and have to send dummy requests to other prefill ranks,
             # or the KVPoll will never be set correctly
-            target_tp_rank = target_tp_ranks[0]
+            # For MLA models, each decode rank selects a different prefill rank via round-robin to distribute
+            # transfer load across prefill ranks. Use (attn_dp_rank * attn_tp_size + engine_rank) as a globally
+            # unique rank index for round-robin.
+            global_rank_index = (
+                self.attn_dp_rank * self.attn_tp_size + self.kv_args.engine_rank
+            )
+            target_tp_rank = target_tp_ranks[global_rank_index % len(target_tp_ranks)]
             required_dst_info_num = 1
             if self.is_mla_backend:
                 required_prefill_response_num = 1
