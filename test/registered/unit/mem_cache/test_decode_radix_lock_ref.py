@@ -39,6 +39,7 @@ from sglang.srt.disaggregation.decode_hicache_mixin import (
     DecodeHiCacheTransferMixin,
     DecodePrefixMatch,
 )
+from sglang.srt.managers.schedule_batch import ReqKvInfo
 from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefParams,
     InsertParams,
@@ -57,6 +58,7 @@ def _make_cache_with_pools(page_size=1):
     """Create a RadixCache with mock pools sufficient for cache_unfinished/finished_req."""
     mock_allocator = MagicMock()
     mock_allocator.device = torch.device("cpu")
+    mock_allocator.page_size = page_size
 
     # req_to_token pool: stores kv indices per request slot
     max_seq_len = 64
@@ -91,12 +93,11 @@ class MockReq:
         self.cache_salt = None
         self.prefix_indices = torch.empty(0, dtype=torch.int64)
         self.priority = 0
-        self.kv = SimpleNamespace(
+        self.kv = ReqKvInfo(
             req_pool_idx=req_pool_idx,
             kv_committed_len=len(fill_ids),
             kv_allocated_len=len(fill_ids),
             cache_protected_len=cache_protected_len,
-            swa_evicted_seqlen=0,
         )
         self.kv_rotation_base = None
 
@@ -341,11 +342,11 @@ class TestDecodeLockRefScenarios(CustomTestCase):
             req, is_insert=False, owned_kv_len=req.kv.kv_committed_len
         )
 
-        free_call = cache.token_to_kv_pool_allocator.free_segment.call_args
-        torch.testing.assert_close(
-            free_call.args[0], torch.tensor(full_vals[prefix_len:])
+        ((indices, start_pos),) = (
+            cache.token_to_kv_pool_allocator.free_segments.call_args.args[0]
         )
-        self.assertEqual(free_call.kwargs["start_pos"], prefix_len)
+        torch.testing.assert_close(indices, torch.tensor(full_vals[prefix_len:]))
+        self.assertEqual(start_pos, prefix_len)
 
         # The prefix node should be unlocked (back to evictable)
         self.assertEqual(cache.root_node.lock_ref, 1)
