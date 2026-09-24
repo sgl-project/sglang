@@ -15,6 +15,7 @@ from torch.distributed.fsdp import FSDPModule
 from sglang.multimodal_gen.runtime.distributed import get_tp_rank, get_tp_world_size
 from sglang.multimodal_gen.runtime.layers.linear import (
     ColumnParallelLinear,
+    MergedColumnParallelLinear,
     ReplicatedLinear,
     RowParallelLinear,
 )
@@ -257,6 +258,27 @@ def _resolve_tp_shard_dim(
     return False, None
 
 
+def _sources_are_tp_partitions(
+    actual_param: torch.nn.Parameter,
+    sources: list[SafetensorsSource],
+    shard_dim: int | None,
+) -> bool:
+    """Whether slicing each source per rank matches the linear's own TP sharding.
+
+    A merged column linear shards every output partition separately, so a
+    source spanning several partitions (a fused ``[gate | up]`` on disk) cannot
+    be sliced contiguously.
+    """
+    weight_loader = actual_param.__dict__.get("weight_loader")
+    if shard_dim is None or not isinstance(weight_loader, MethodType):
+        return True
+    owner = weight_loader.__self__
+    if not isinstance(owner, MergedColumnParallelLinear):
+        return True
+    ordered = sorted(sources, key=lambda source: source.merge_index or 0)
+    return [source.shape[shard_dim] for source in ordered] == list(owner.output_sizes)
+
+
 def read_fsdp_rank_local_tensor(
     sources: list[SafetensorsSource],
     handles: dict[str, Any],
@@ -398,6 +420,9 @@ def try_load_rank_local_tp_state_dict(
             supported, shard_dim = True, None
         else:
             supported, shard_dim = _resolve_tp_shard_dim(actual_param)
+            supported = supported and _sources_are_tp_partitions(
+                actual_param, sources, shard_dim
+            )
         if not supported:
             return None
         if tp_local_shape(sources, shard_dim, tp_size) != tuple(meta_param.shape):
