@@ -1190,7 +1190,18 @@ container_log() {  # <node> <name> <logfile>
   # flaky step that produced the false "missing" also truncated the 5-line
   # prefill log to 0 bytes, destroying the only evidence of what happened.
   local tmp="$3.fetch"
-  srun_local_or_step "$1" docker logs "$2" > "$tmp" 2>/dev/null || true
+  # `docker logs` writes the container's stdout and stderr to its own stdout and
+  # stderr, so merge them on the target host -- hence bash -c rather than passing
+  # `docker logs` straight through. Without it only the remote branch of
+  # srun_local_or_step kept stderr; the local branch runs docker directly and the
+  # 2>/dev/null below swallowed it. Every sglang scheduler line goes to stderr and
+  # only uvicorn's access log goes to stdout, so the engine sitting on the node
+  # that runs drive.sh -- always decode node 0 -- logged nothing but
+  # "POST /generate 200 OK" for the whole run, with no trace of the crash that
+  # ended it. Visible in 2p1d-ep16, where decode node 1 is fetched remotely and
+  # has the full log while node 0 has none of it. The outer 2>/dev/null still
+  # drops srun's own dispatch noise.
+  srun_local_or_step "$1" bash -c "docker logs $2 2>&1" > "$tmp" 2>/dev/null || true
   # Publish in place (truncate + rewrite the SAME inode), never by renaming over
   # the target. drive.sh keeps a `tail -F` on bench.log, and swapping the inode
   # every 10s made tail reopen and re-emit the whole file each poll -- the
