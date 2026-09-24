@@ -146,6 +146,7 @@ def _jit_deep_select_module(
             "--expt-extended-lambda",
             "--use_fast_math",
             "--ftz=false",
+            "-Xptxas=--register-usage-level=10",
         ],
     )
 
