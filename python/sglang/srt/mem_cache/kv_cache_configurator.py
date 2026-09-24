@@ -1195,6 +1195,12 @@ class KVCacheConfigurator:
         is_dsv4_model: bool,
         req_to_token_pool: ReqToTokenPool,
     ) -> KVCache:
+        mtp_pool = self._build_mtp_kv_shard_pool(
+            sizes=sizes, is_dsa_model=is_dsa_model, is_dsv4_model=is_dsv4_model
+        )
+        if mtp_pool is not None:
+            return mtp_pool
+
         # Page-granularity envelope layout for the MHA-shaped (full / SWA) pools,
         # selected by swapping in the PageMajorMHATokenToKVPool subclass. The
         # default keeps upstream's per-layer layout. The Mamba state pool is routed
@@ -1310,6 +1316,122 @@ class KVCacheConfigurator:
                     quant_method=quant_method,
                 )
         return token_to_kv_pool
+
+    def _build_mtp_kv_shard_pool(
+        self, *, sizes: _PoolSizes, is_dsa_model: bool, is_dsv4_model: bool
+    ) -> Optional[KVCache]:
+        """Build a draft pool in its target's logical space, with its own KV.
+
+        This is a pool-level opt-in through a shared sharded allocator. Target
+        pool creation and speculative serving remain separate integration work.
+        """
+        if not self.is_draft_worker:
+            return None
+
+        from sglang.srt.mem_cache.page_interleave import get_shared_kv_shard_pool
+
+        target_pool = get_shared_kv_shard_pool(self)
+        if target_pool is None:
+            return None
+
+        from sglang.srt.mem_cache.page_interleave_pool import (
+            PageInterleaveMHATokenToKVPool,
+            PageInterleaveMLATokenToKVPool,
+        )
+
+        if (
+            self.spec_algorithm != SpeculativeAlgorithm.EAGLE
+            or (self.model_config.num_nextn_predict_layers or 0) <= 0
+            or get_spec().enable_multi_layer_eagle
+        ):
+            raise ValueError(
+                "Shared KV sharding supports only an EAGLE MTP draft runner."
+            )
+        if get_parallel().attn_dcp_size > 1:
+            raise ValueError("MTP KV sharding is incompatible with DCP.")
+        if (
+            is_dsa_model
+            or is_dsv4_model
+            or self.is_hybrid_swa
+            or self.mambaish_config is not None
+            or self.sliding_window_size is not None
+            or is_minimax_sparse(self.model_config.hf_config)
+            or current_platform.is_out_of_tree()
+            or _is_npu
+        ):
+            raise ValueError("MTP KV sharding supports only dense MLA and MHA pools.")
+        if (
+            self.post_capture_kv_active
+            or get_memory().enable_page_major_kv_layout
+            or self.kv_cache_dtype_str == "mxfp8"
+            or is_float4_e2m1fn_x2(self.kv_cache_dtype)
+        ):
+            raise ValueError("MTP KV sharding requires the plain per-layer KV layout.")
+        if (
+            self.page_size != target_pool.page_size
+            or self.pool_page_size != target_pool.page_size
+        ):
+            raise ValueError(
+                "MTP and target KV pools must use the same physical page size."
+            )
+        if sizes.max_total_num_tokens != target_pool.size:
+            raise ValueError(
+                "MTP and target sharded KV pools must have the same per-rank capacity."
+            )
+        target_is_mla = isinstance(target_pool, PageInterleaveMLATokenToKVPool)
+        if self.use_mla_backend != target_is_mla or not isinstance(
+            target_pool,
+            (PageInterleaveMLATokenToKVPool, PageInterleaveMHATokenToKVPool),
+        ):
+            raise ValueError(
+                "MTP and target KV pools must use the same attention geometry."
+            )
+        fields = (
+            ("kv_lora_rank", "qk_rope_head_dim")
+            if self.use_mla_backend
+            else ("head_dim", "v_head_dim")
+        )
+        if (
+            self.kv_cache_dtype != target_pool.dtype
+            or any(
+                getattr(self.model_config, name) != getattr(target_pool, name)
+                for name in fields
+            )
+            or (
+                not self.use_mla_backend
+                and self.model_config.get_num_kv_heads(get_parallel().attn_tp_size)
+                != target_pool.head_num
+            )
+        ):
+            raise ValueError(
+                "MTP and target KV pools must use the same KV geometry and dtype."
+            )
+
+        kwargs = dict(
+            size=target_pool.size,
+            page_size=target_pool.page_size,
+            dtype=self.kv_cache_dtype,
+            layer_num=self.layer_info.num_effective_layers,
+            device=self.device,
+            enable_memory_saver=get_exec().features.enable_memory_saver,
+            start_layer=self.layer_info.start_layer,
+            end_layer=self.layer_info.end_layer,
+            shard_spec=target_pool.shard_spec,
+            shard_group=target_pool.shard_group,
+        )
+        if self.use_mla_backend:
+            return PageInterleaveMLATokenToKVPool(
+                **kwargs,
+                kv_lora_rank=self.model_config.kv_lora_rank,
+                qk_rope_head_dim=self.model_config.qk_rope_head_dim,
+            )
+        return PageInterleaveMHATokenToKVPool(
+            **kwargs,
+            head_num=target_pool.head_num,
+            head_dim=self.model_config.head_dim,
+            v_head_dim=self.model_config.v_head_dim,
+            enable_alt_stream=not get_disagg().enable_pdmux,
+        )
 
     def _build_dsv4_kv_pool(
         self,

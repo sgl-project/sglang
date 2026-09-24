@@ -120,6 +120,7 @@ class PageInterleaveKVPoolMixin:
         assert spec.chunk_tokens % spec.page_size == 0
 
         self.shard_spec = spec
+        self.shard_group = shard_group
         self.placement = PageInterleavePlacement(spec)
         self.shard_rank = spec.shard_rank
         self.shard_size = spec.shard_size
