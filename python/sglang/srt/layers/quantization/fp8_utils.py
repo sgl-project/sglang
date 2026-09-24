@@ -69,7 +69,8 @@ _use_aiter = (
     get_bool_env_var("SGLANG_USE_AITER") and _is_hip and not _is_gfx1250_supported
 )
 _use_aiter_gfx95 = _use_aiter and _is_gfx95_supported
-# Maximum token count for the MXFP8 dense PTPC decode fast path.
+# Conservative, not a tuned crossover: ptpc beat block-fp8 up to M=512 on
+# MiniMax-M3 TP4 gfx950 shapes, but lost past M=64 on narrow ones (K=768).
 MXFP8_DENSE_PTPC_DECODE_MAX_M = 128
 # ROCm 7.0 hipcc miscompiles gemm_a8w8_blockscale_bpreshuffle on gfx95 (#23319).
 _use_aiter_bpreshuffle_gfx95 = _use_aiter_gfx95 and get_hip_version() >= (7, 2, 0)
@@ -346,7 +347,6 @@ class Fp8GemmRunnerBackend(Enum):
     DEEP_GEMM = "deep_gemm"
     TRITON = "triton"
     AITER = "aiter"
-    BF16 = "bf16"
 
     def is_auto(self) -> bool:
         return self == Fp8GemmRunnerBackend.AUTO
@@ -374,9 +374,6 @@ class Fp8GemmRunnerBackend(Enum):
 
     def is_aiter(self) -> bool:
         return self == Fp8GemmRunnerBackend.AITER
-
-    def is_bf16(self) -> bool:
-        return self == Fp8GemmRunnerBackend.BF16
 
 
 class Mxfp8DenseGemmBackend(Enum):
@@ -669,13 +666,6 @@ def resolve_mxfp8_dense_gemm_backend() -> Mxfp8DenseGemmBackend:
     names a backend that owns an MXFP8 dense kernel."""
     backend = get_fp8_gemm_runner_backend()
 
-    if backend.is_bf16():
-        if not (_is_hip and _is_gfx95_supported):
-            raise RuntimeError(
-                "--fp8-gemm-backend bf16 is supported only for MXFP8 on AMD gfx950."
-            )
-        return Mxfp8DenseGemmBackend.GFX95_DOT_SCALED
-
     if backend.is_flashinfer_trtllm():
         if not (get_platform().is_sm100 and is_flashinfer_available()):
             raise RuntimeError(
@@ -813,13 +803,14 @@ def dispatch_w8a8_mxfp8_linear() -> Callable:
         return partial(flashinfer_mxfp8_blockscaled_linear, backend="cutlass")
     elif backend.is_flashinfer_cutedsl():
         return partial(flashinfer_mxfp8_blockscaled_linear, backend="cute-dsl")
-    elif backend.is_gfx95_dot_scaled():
-        from sglang.kernels.ops.quantization.mxfp8_amd_gfx95 import (
-            dot_scaled_mxfp8_blockscaled_linear,
-        )
+    elif backend.is_unsupported():
+        return _unsupported_mxfp8_linear
 
-        return dot_scaled_mxfp8_blockscaled_linear
-    return _unsupported_mxfp8_linear
+    from sglang.kernels.ops.quantization.mxfp8_amd_gfx95 import (
+        dot_scaled_mxfp8_blockscaled_linear,
+    )
+
+    return dot_scaled_mxfp8_blockscaled_linear
 
 
 def _deepgemm_w8a8_mxfp8_linear_with_fallback(
@@ -936,11 +927,6 @@ def _dispatch_explicit_backend(backend: Fp8GemmRunnerBackend) -> Callable:
     elif backend.is_triton():
         return triton_w8a8_block_fp8_linear
 
-    elif backend.is_bf16():
-        raise RuntimeError(
-            "--fp8-gemm-backend bf16 is supported only for MXFP8 on AMD gfx950."
-        )
-
     else:
         raise ValueError(f"Unknown FP8 GEMM backend: {backend}")
 
@@ -985,10 +971,6 @@ def initialize_fp8_gemm_config() -> None:
         backend = "cutlass"
 
     backend = Fp8GemmRunnerBackend(backend)
-    if backend.is_bf16() and not (_is_hip and _is_gfx95_supported):
-        raise ValueError(
-            "--fp8-gemm-backend bf16 is supported only for MXFP8 on AMD gfx950."
-        )
 
     FP8_GEMM_RUNNER_BACKEND = backend
 
@@ -1361,21 +1343,14 @@ def aiter_w8a8_block_fp8_linear(
     input_2d = input.view(-1, input.shape[-1])
     output_shape = [*input.shape[:-1], weight.shape[0]]
 
-    # Skinny-M fast path: dense linears converted from MXFP8 may carry a cached
-    # rowwise-fp8 copy (small M -> aiter flydsl
-    # per-token x per-channel GEMM), which beats the block-fp8 GEMMs at
-    # decode-sized M.
+    # dense linears converted from MXFP8 carry a rowwise-fp8 copy; its ptpc GEMM
+    # beats the block-fp8 GEMMs at decode-sized M
     if input_scale is None:
         ptpc_weight = getattr(weight, "_ptpc_weight", None)
         if (
             ptpc_weight is not None
             and input_2d.shape[0] <= MXFP8_DENSE_PTPC_DECODE_MAX_M
         ):
-            # (fp8, scale) pre-quantized by the producing fused-add-RMSNorm
-            # kernel; skips per_token_quant_hip.
-            pre_quant = getattr(input, "_fp8_qinput", None)
-            if pre_quant is not None and pre_quant[0].shape[0] == input_2d.shape[0]:
-                input_2d = pre_quant
             out = apply_fp8_ptpc_linear(
                 input=input_2d,
                 weight=ptpc_weight,
