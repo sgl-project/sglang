@@ -101,6 +101,7 @@ from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.hash_topk import HashTopK
 from sglang.srt.layers.moe.kt_ep_wrapper import KTEPWrapperMethod
+from sglang.srt.layers.moe.mhc_post_fusion import current_mhc_post_fusion
 from sglang.srt.layers.moe.token_dispatcher.base import (
     BaseDispatcher,
     CombineInput,
@@ -211,7 +212,11 @@ from sglang.srt.utils import (
 from sglang.srt.utils.custom_op import register_custom_op
 
 if _use_aiter:
-    from sglang.srt.layers.rocm_linear_utils import aiter_dsv3_router_gemm
+    from sglang.kernels.ops.moe.rocm_router_gate import rocm_router_max_tokens
+    from sglang.srt.layers.rocm_linear_utils import (
+        aiter_dsv3_router_gemm,
+        aiter_dsv3_router_split_k,
+    )
 
 if _use_aiter_gfx95:
     from sglang.srt.layers.rocm_linear_utils import (
@@ -220,6 +225,13 @@ if _use_aiter_gfx95:
 
 if _use_aiter:
     pass
+
+if _is_hip:
+    from sglang.srt.models.deepseek_common.amd import deepseek_v2_hip_act as _hip_act
+    from sglang.srt.models.deepseek_common.amd import deepseek_v2_hip_moe as _hip_moe
+else:
+    _hip_act = None
+    _hip_moe = None
 
 if _is_cuda:
     from sglang.kernels.ops.gemm.tiny_gemm import tiny_gemm_bf16
@@ -397,19 +409,13 @@ class DeepseekV2MLP(nn.Module):
             )
             return down_output
 
+        if self.use_fused_clamp_act_mul and not self._fused_clamp_fp8_checked:
+            _hip_act.resolve_fused_clamp_route(self, gate_up.shape[-1] // 2)
+
         if self.use_fused_clamp_act_mul and self.swiglu_limit is not None:
             from aiter.ops.triton.fusions.fused_clamp_act_mul import (
                 fused_clamp_act_mul,
             )
-
-            if not self._fused_clamp_fp8_checked:
-                from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
-
-                qm = getattr(self.down_proj, "quant_method", None)
-                self._fused_clamp_use_fp8 = (
-                    isinstance(qm, Fp8LinearMethod) and qm.block_quant
-                )
-                self._fused_clamp_fp8_checked = True
 
             if self._fused_clamp_use_fp8:
                 from aiter import dtypes
@@ -438,7 +444,9 @@ class DeepseekV2MLP(nn.Module):
 
         # Fallback: fused silu+clamp kernel (still faster than unfused)
         elif self.swiglu_limit is not None:
-            if _is_npu:
+            if _is_hip:
+                x = _hip_act.silu_and_mul_clamp(self, gate_up)
+            elif _is_npu:
                 x = torch.ops.npu.npu_clipped_swiglu(
                     gate_up,
                     alpha=1,
@@ -510,6 +518,17 @@ class MoEGate(nn.Module):
             hidden_size=config.hidden_size,
             weight_dtype=self.weight.dtype,
         )
+        # Rows up to which the ROCm split-K router serves the gate (-1: never).
+        self.rocm_router_max_tokens = (
+            rocm_router_max_tokens(
+                num_experts=config.n_routed_experts,
+                hidden_size=config.hidden_size,
+                topk=config.num_experts_per_tok,
+                weight_dtype=self.weight.dtype,
+            )
+            if _use_aiter and not is_hash_moe
+            else -1
+        )
 
     def forward(
         self,
@@ -540,6 +559,10 @@ class MoEGate(nn.Module):
                 out_dtype=torch.float32,
                 max_m=self.tiny_router_gemm_max_tokens,
             )
+        elif _is_hip and self.is_deepseek_v4 and self.weight.dtype == torch.bfloat16:
+            # Keep V4 router scores in FP32, as in the CUDA and tiny-GEMM paths.
+            # BF16 output rounding changes expert weights for identical rows.
+            logits = torch.mm(hidden_states, self.weight.t(), out_dtype=torch.float32)
         elif _use_aiter:
             logits = aiter_dsv3_router_gemm(hidden_states, self.weight)
         elif not _is_cuda:
@@ -933,6 +956,14 @@ class DeepseekV2MoE(nn.Module):
             if forward_batch is not None
             else None
         )
+        use_vision_topk = self.gate.e_score_correction_bias_vl is not None
+        # image tokens exist only in extend batches with images; other batches take
+        # the fused top-k
+        if use_vision_topk and _is_hip and forward_batch is not None:
+            use_vision_topk = (
+                forward_batch.forward_mode.is_extend()
+                and forward_batch.contains_image_inputs()
+            )
         if not self._enable_a2a_moe:
             if self._can_dual_stream_graph(hidden_states):
                 fwd = get_forward()
@@ -955,6 +986,7 @@ class DeepseekV2MoE(nn.Module):
                     input_ids,
                     input_ids_global=input_ids_global,
                     num_token_non_padded=num_token_non_padded,
+                    use_vision_topk=use_vision_topk,
                 )
             else:
                 return self.forward_normal(
@@ -964,11 +996,37 @@ class DeepseekV2MoE(nn.Module):
                     input_ids_global=input_ids_global,
                     skip_shared_experts=skip_shared_experts,
                     num_token_non_padded=num_token_non_padded,
+                    use_vision_topk=use_vision_topk,
                 )
         else:
             return self.forward_deepep(
                 hidden_states, forward_batch, input_ids_global=input_ids_global
             )
+
+    def _forward_gate(
+        self,
+        hidden_states: torch.Tensor,
+        gemm_output_zero_allocator: BumpAllocator,
+        *,
+        fused_gate: bool,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """The router logits and, on the ROCm decode router, the split-K partials
+        self.topk sums into them; fused_gate=False when anything else reads them."""
+        if fused_gate and _use_aiter and not self.is_hash:
+            logits_and_partials = aiter_dsv3_router_split_k(self.gate, hidden_states)
+            if logits_and_partials is not None:
+                return logits_and_partials
+        return self.gate(hidden_states, gemm_output_zero_allocator), None
+
+    def _all_reduce_output(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Post-experts all-reduce of a DeepSeek-V4 layer; the mHC post fusion state,
+        when one is active, learns whether the reduction ran here."""
+        if _is_hip:
+            return _hip_moe.all_reduce_output(self, hidden_states)
+        mhc = current_mhc_post_fusion()
+        if mhc is not None:
+            mhc.start_stats_before_all_reduce()
+        return post_experts_all_reduce(hidden_states)
 
     def forward_normal_dual_stream(
         self,
@@ -977,6 +1035,7 @@ class DeepseekV2MoE(nn.Module):
         input_ids: Optional[torch.Tensor] = None,
         input_ids_global: Optional[torch.Tensor] = None,
         num_token_non_padded: Optional[torch.Tensor] = None,
+        use_vision_topk: bool = False,
     ) -> torch.Tensor:
         # Note(kpham-sgl): issue order satisfies 3 constraints:
         # - no stream explosion: main (routed) issued before alt block -> capture reuses 1 alt stream;
@@ -1010,7 +1069,11 @@ class DeepseekV2MoE(nn.Module):
         )
 
         # router_logits: (num_tokens, n_experts)
-        router_logits = self.gate(hidden_states, gemm_output_zero_allocator)
+        router_logits, router_logits_partials = self._forward_gate(
+            hidden_states,
+            gemm_output_zero_allocator,
+            fused_gate=not use_flashinfer_trtllm_bypass and not use_vision_topk,
+        )
         if use_flashinfer_trtllm_bypass:
             topk_output = BypassedTopKOutput(
                 hidden_states=hidden_states,
@@ -1023,7 +1086,7 @@ class DeepseekV2MoE(nn.Module):
                 if getattr(self, "is_hash", False)
                 else {}
             )
-            if self.gate.e_score_correction_bias_vl is not None:
+            if use_vision_topk:
                 topk_output = vision_topk(
                     self,
                     router_logits,
@@ -1036,6 +1099,7 @@ class DeepseekV2MoE(nn.Module):
                     router_logits,
                     num_token_non_padded=num_token_non_padded,
                     expert_location_dispatch_info=dispatch_info,
+                    router_logits_partials=router_logits_partials,
                     **topk_kwargs,
                 )
         # Issued after the router so the main chain stays on the main stream at replay.
@@ -1212,14 +1276,9 @@ class DeepseekV2MoE(nn.Module):
                 and self.tp_size > 1
                 and not should_skip_post_experts_all_reduce(is_tp_path=True)
             ):
-                from sglang.srt.layers.moe.mhc_post_fusion import (
-                    current_mhc_post_fusion,
-                )
-
-                mhc = current_mhc_post_fusion()
-                if mhc is not None:
-                    mhc.start_stats_before_all_reduce()
-            final_hidden_states = post_experts_all_reduce(final_hidden_states)
+                final_hidden_states = self._all_reduce_output(final_hidden_states)
+            else:
+                final_hidden_states = post_experts_all_reduce(final_hidden_states)
         # TP1 shared experts are replicated, so add them after all-reduce to
         # avoid summing the same shared output once per TP rank.
         if self._shared_expert_tp1:
@@ -1234,6 +1293,7 @@ class DeepseekV2MoE(nn.Module):
         input_ids_global: Optional[torch.Tensor] = None,
         skip_shared_experts: bool = False,
         num_token_non_padded: Optional[torch.Tensor] = None,
+        use_vision_topk: bool = False,
     ) -> torch.Tensor:
         if hasattr(self, "shared_experts") and use_intel_amx_backend(
             self.shared_experts.gate_up_proj
@@ -1268,13 +1328,17 @@ class DeepseekV2MoE(nn.Module):
                     pre_quant_input=pre_quant_input,
                 )
             # router_logits: (num_tokens, n_experts)
-            router_logits = self.gate(hidden_states, gemm_output_zero_allocator)
+            router_logits, router_logits_partials = self._forward_gate(
+                hidden_states,
+                gemm_output_zero_allocator,
+                fused_gate=not use_vision_topk,
+            )
             topk_kwargs = (
                 {"input_ids": input_ids_global}
                 if getattr(self, "is_hash", False)
                 else {}
             )
-            if self.gate.e_score_correction_bias_vl is not None:
+            if use_vision_topk:
                 topk_output = vision_topk(
                     self,
                     router_logits,
@@ -1287,6 +1351,7 @@ class DeepseekV2MoE(nn.Module):
                     router_logits,
                     num_token_non_padded=num_token_non_padded,
                     expert_location_dispatch_info=dispatch_info,
+                    router_logits_partials=router_logits_partials,
                     **topk_kwargs,
                 )
         else:
@@ -1370,12 +1435,9 @@ class DeepseekV2MoE(nn.Module):
             and self.tp_size > 1
             and not should_skip_post_experts_all_reduce(is_tp_path=True)
         ):
-            from sglang.srt.layers.moe.mhc_post_fusion import current_mhc_post_fusion
-
-            mhc = current_mhc_post_fusion()
-            if mhc is not None:
-                mhc.start_stats_before_all_reduce()
-        final_hidden_states = post_experts_all_reduce(final_hidden_states)
+            final_hidden_states = self._all_reduce_output(final_hidden_states)
+        else:
+            final_hidden_states = post_experts_all_reduce(final_hidden_states)
         # TP1 shared experts are replicated, so add them after all-reduce to
         # avoid summing the same shared output once per TP rank.
         if shared_output is not None and self._shared_expert_tp1:

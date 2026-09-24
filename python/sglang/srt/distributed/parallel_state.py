@@ -1521,6 +1521,12 @@ class GroupCoordinator:
         if self.pynccl_comm is not None and not self.pynccl_comm.disabled:
             self.pynccl_comm.broadcast(input_, src=src)
         else:
+            # HIP graph capture: torch.distributed.broadcast aborts every rank (hipErrorCapturedEvent)
+            if is_hip() and torch.cuda.is_current_stream_capturing():
+                raise RuntimeError(
+                    f"{self.unique_name}: a broadcast captured into a HIP graph needs "
+                    "the group's pynccl communicator (use_pynccl=True)"
+                )
             # Broadcast.
             torch.distributed.broadcast(
                 input_, src=self.ranks[src], group=self.device_group

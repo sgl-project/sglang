@@ -376,6 +376,8 @@ class Mxfp8DenseGemmBackend(Enum):
     FLASHINFER_TRTLLM = "flashinfer_trtllm"
     DEEP_GEMM = "deep_gemm"
     GFX95_DOT_SCALED = "gfx95_dot_scaled"
+    # gfx950 native MXFP8: lane-ordered fp8 weight + ue8m0 scale bytes; untiled shapes keep bf16
+    GFX95_MXFP8_NATIVE = "gfx95_mxfp8_native"
     UNSUPPORTED = "unsupported"
 
     def is_flashinfer_cutlass(self) -> bool:
@@ -395,6 +397,15 @@ class Mxfp8DenseGemmBackend(Enum):
 
     def is_gfx95_dot_scaled(self) -> bool:
         return self == Mxfp8DenseGemmBackend.GFX95_DOT_SCALED
+
+    def is_gfx95_mxfp8_native(self) -> bool:
+        return self == Mxfp8DenseGemmBackend.GFX95_MXFP8_NATIVE
+
+    def is_gfx95(self) -> bool:
+        return self in (
+            Mxfp8DenseGemmBackend.GFX95_DOT_SCALED,
+            Mxfp8DenseGemmBackend.GFX95_MXFP8_NATIVE,
+        )
 
     def is_unsupported(self) -> bool:
         return self == Mxfp8DenseGemmBackend.UNSUPPORTED
@@ -721,6 +732,11 @@ def _unsupported_mxfp8_linear(*args, **kwargs) -> torch.Tensor:
 def resolve_block_fp8_mxfp8_backend() -> Mxfp8DenseGemmBackend:
     """The FlashInfer MXFP8 backend a 32-wide-K ue8m0 block-fp8 weight can run on."""
     backend = get_fp8_gemm_runner_backend()
+    # the Triton block kernel's ue8m0 activation quant is CUDA-only, so gfx950 takes an MXFP8 route
+    if _is_hip and _is_gfx95_supported:
+        if backend.is_triton():
+            return Mxfp8DenseGemmBackend.GFX95_DOT_SCALED
+        return Mxfp8DenseGemmBackend.GFX95_MXFP8_NATIVE
     # Explicit CUTLASS / CuTe-DSL only: they leave the weight untouched and store
     # the swizzled scale separately, so the block layout stays readable by Triton.
     if not (backend.is_flashinfer_cutedsl() or backend.is_flashinfer_cutlass()):
@@ -753,6 +769,18 @@ def dispatch_block_fp8_mxfp8_linear(backend: Mxfp8DenseGemmBackend) -> Callable:
         return partial(
             flashinfer_mxfp8_blockscaled_linear, backend="cute-dsl", pin_tactic=True
         )
+    if backend.is_gfx95_dot_scaled():
+        from sglang.kernels.ops.quantization.mxfp8_amd_gfx95 import (
+            dot_scaled_mxfp8_blockscaled_linear,
+        )
+
+        return dot_scaled_mxfp8_blockscaled_linear
+    if backend.is_gfx95_mxfp8_native():
+        from sglang.kernels.ops.quantization.mxfp8_native_amd_gfx95 import (
+            mxfp8_native_blockscaled_linear,
+        )
+
+        return mxfp8_native_blockscaled_linear
     return _unsupported_mxfp8_linear
 
 

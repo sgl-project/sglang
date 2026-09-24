@@ -19,16 +19,22 @@ from sglang.kernels.ops.attention.dsv4.torch_quant import (
 from sglang.kernels.ops.layernorm.rmsnorm_fp32 import rmsnorm_fp32
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.utils import add_prefix
+from sglang.srt.utils import add_prefix, is_gfx95_supported
 
 
-def _rope_fq4(x, freqs, rope_dim, *, compressed_kv=False):
-    if x.is_cuda and torch.version.cuda is not None and x.dtype == torch.bfloat16:
+def _rope_fq4(x, freqs, rope_dim, *, compressed_kv=False, positions=None):
+    """RoPE plus fake FP4 quantization, fused for bf16 inputs on CUDA and ROCm. With
+    positions, freqs is the whole table and the fused kernel gathers freqs[positions]."""
+    if x.is_cuda and x.dtype == torch.bfloat16:
         from sglang.kernels.ops.attention.dsv4.fp4_rope_fake_quant import (
             rope_tail_fake_quant_fp4,
         )
 
-        return rope_tail_fake_quant_fp4(x, freqs, rope_dim, compressed_kv=compressed_kv)
+        return rope_tail_fake_quant_fp4(
+            x, freqs, rope_dim, compressed_kv=compressed_kv, positions=positions
+        )
+    if positions is not None:
+        freqs = freqs[positions]
     quant = fake_quant_compressed_kv if compressed_kv else fake_quant_fp4
     return quant(rope_tail(x, freqs, rope_dim))
 
@@ -42,9 +48,9 @@ class RMSNorm(nn.Module):
         self.weight = nn.Parameter(torch.ones(dim))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # the Triton kernel is bitwise this fallback for bf16 rows on CUDA and ROCm (gfx950)
         if (
             x.is_cuda
-            and torch.version.cuda is not None
             and x.dtype in (torch.bfloat16, torch.float32)
             and self.weight.dtype in (torch.bfloat16, torch.float32)
             and x.shape[-1] in (128, 512)
@@ -90,8 +96,10 @@ def fused_low_ratio_compress_supported() -> bool:
     """The fused c1 / c2 / index-K decode kernels pack fp4 with
     `cvt.rn.satfinite.e2m1x2`, an sm100+ instruction; the answer also fixes the
     ratio-2 weight layout (`wkv_gate`, or `wkv` plus `wgate`)."""
-    if not torch.cuda.is_available() or torch.version.hip is not None:
+    if not torch.cuda.is_available():
         return False
+    if torch.version.hip is not None:
+        return is_gfx95_supported()
     return torch.cuda.get_device_capability()[0] >= 10
 
 
@@ -208,6 +216,16 @@ class DeepseekV41Indexer(nn.Module):
             quant_config=None,
             prefix=add_prefix("weights_proj", prefix),
         )
+        self.weights_proj_hip_max_tokens = -1
+        if torch.version.hip is not None:
+            # the router module is ROCm-only; -1 off gfx950 or for shapes it lacks
+            from sglang.kernels.ops.moe.rocm_router_gate import (
+                rocm_gemv_split_k_max_tokens,
+            )
+
+            self.weights_proj_hip_max_tokens = rocm_gemv_split_k_max_tokens(
+                n=self.n_heads, k=config.hidden_size, weight_dtype=torch.bfloat16
+            )
         # The decode GEMM matches tiny_gemm's reduction order, not cuBLAS's.
         self.weights_proj_small_max_m = _small_weights_proj_max_m(
             self.n_heads, config.hidden_size
@@ -236,10 +254,17 @@ class DeepseekV41Indexer(nn.Module):
         k = self.k_norm(self.forward_wk(latent))
         return _rope_fq4(k, freqs, self.rope_head_dim)
 
-    def queries(self, q_lora: torch.Tensor, freqs: torch.Tensor) -> torch.Tensor:
+    def queries(
+        self,
+        q_lora: torch.Tensor,
+        freqs: torch.Tensor,
+        positions: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """freqs per token, or the whole table with positions (gathered inside the
+        fused RoPE launch)."""
         q, _ = self.wq_b(q_lora)
         q = q.view(q.shape[0], self.n_local_heads, self.index_head_dim)
-        return _rope_fq4(q, freqs, self.rope_head_dim)
+        return _rope_fq4(q, freqs, self.rope_head_dim, positions=positions)
 
     def head_weights_raw(self, x: torch.Tensor) -> torch.Tensor:
         """`weights_proj(x)` before the scale, [tokens, n_heads] bf16."""

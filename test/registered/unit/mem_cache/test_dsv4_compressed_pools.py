@@ -16,6 +16,7 @@ from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
     _CompressedPoolConfig,
     _num_dsv4_physical_kv_pages,
 )
+from sglang.srt.model_executor.pool_configurator import DSV4PoolConfigurator
 from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -274,7 +275,11 @@ class TestV41KVPoolLayouts(CustomTestCase):
             self.assertEqual(view.stride(0), pool.bytes_per_page_padded)
 
     def test_v41_pool_buffers(self):
-        for option, expect in ((None, KVLayout.V41_FP4), ("fp8", KVLayout.V41)):
+        for option, expect in (
+            (None, KVLayout.V41_FP4),
+            ("fp8", KVLayout.V41),
+            ("fp4", KVLayout.V41_FP4),
+        ):
             with self.subTest(compressed=option):
                 pool = self.make_pool([0, 0, 2, 1, 1], [2, 3], KVLayout.V41, option)
                 self.assert_kernel_requirements(pool.swa_kv_pool, KVLayout.V41)
@@ -288,6 +293,7 @@ class TestV41KVPoolLayouts(CustomTestCase):
                     )
                     self.assertTrue(is_valid_kv_layout_pair(pool.kv_layout, expect))
                     self.assert_kernel_requirements(pool.kv_pools[ratio], expect)
+                    self.assertEqual(pool.kv_pools[ratio].page_size, PAGE_SIZE // ratio)
         # A pool of the fp4 layout cannot be the main cache.
         with self.assertRaises(AssertionError):
             self.make_pool([0], [], KVLayout.V41_FP4)
@@ -352,16 +358,64 @@ class TestPagedDSparkWithEncoderReplay(CustomTestCase):
     def test_target_window_and_draft_paged_storage_share_allocator_mapping(self):
         target = self.make_pool(draft=False)
         draft = self.make_pool(draft=True)
+        self.assertIsNotNone(target.request_window)
+        self.assertIsNone(target.swa_kv_pool)
+        self.assertIsNone(draft.request_window)
+        self.assertEqual(len(draft.swa_kv_pool.kv_buffer), 3)
+        self.assertTrue(target.needs_paged_swa_allocator)
+        self.assertTrue(draft.needs_paged_swa_allocator)
         allocator = SWATokenToKVPoolAllocator(
             2048, 1024, 256, torch.float8_e4m3fn, "cpu", target, False
         )
         draft.register_mapping(allocator.full_to_swa_index_mapping)
-        allocator.full_to_swa_index_mapping[256:512] = torch.arange(768, 1024)
+        mapping = allocator.full_to_swa_index_mapping
+        mapping[256:512] = torch.arange(768, 1024)
+        full = torch.tensor([256, 300, 511])
         self.assertEqual(
-            draft.translate_loc_from_full_to_swa(
-                torch.tensor([256, 300, 511])
-            ).tolist(),
-            [768, 812, 1023],
+            draft.translate_loc_from_full_to_swa(full).tolist(), [768, 812, 1023]
+        )
+        self.assertEqual(
+            draft.translate_loc_from_full_to_swa(torch.tensor([-1])).item(), -1
+        )
+        # Page reuse updates the single shared mapping, without rebuilding draft state.
+        mapping[256:512] = torch.arange(256, 512)
+        self.assertEqual(
+            draft.translate_loc_from_full_to_swa(full).tolist(), [256, 300, 511]
+        )
+
+    def test_budget_reserves_target_window_and_real_draft_layer_count(self):
+        cfg = SimpleNamespace(
+            qk_nope_head_dim=448,
+            qk_rope_head_dim=64,
+            index_head_dim=128,
+            context_len=131072,
+            compress_ratios=[0, 0] + [2] * 18 + [1] * 20,
+            window_size=128,
+            hf_config=SimpleNamespace(kv_source_layer_ids=[2, 8, 14, 20]),
+        )
+        spec = SimpleNamespace(is_dspark=lambda: True, is_none=lambda: False)
+        kvc = SimpleNamespace(
+            kv_cache_dtype_str="fp8_e4m3",
+            model_config=cfg,
+            layer_info=SimpleNamespace(start_layer=0, end_layer=40),
+            # main (#40707): the parallel widths live on the KV-cache config itself.
+            pp_size=1,
+            attn_dp_size=1,
+            sliding_window_size=128,
+            page_size=256,
+            spec_algorithm=spec,
+            spec_aux_config=SimpleNamespace(dflash_draft_num_layers=3),
+        )
+        planner = DSV4PoolConfigurator(kvc)
+        self.assertEqual(planner.bytes_per_swa_token, 3 * 584)
+        self.assertGreater(planner.swa_cap_tokens, 0)
+        budget = 256 * 1024 * 1024
+        sizes = planner.calculate_pool_sizes(budget, 256)
+        self.assertEqual(sizes.swa_max_total_num_tokens, planner.swa_cap_tokens)
+        self.assertLessEqual(
+            sizes.full_max_total_num_tokens * planner.bytes_per_full_token
+            + planner._get_swa_fixed_bytes(),
+            budget,
         )
 
 

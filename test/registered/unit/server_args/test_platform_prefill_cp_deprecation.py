@@ -1,6 +1,8 @@
 """Reject deprecated platform CP before model loading or topology setup."""
 
 import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
 
 from sglang.srt.arg_groups.parallel_hook import (
     handle_context_parallelism,
@@ -19,7 +21,12 @@ class TestPlatformPrefillCPDeprecation(CustomTestCase):
         for platform in ("is_hip", "is_musa"):
             facts = dict(is_hip=False, is_npu=False, is_musa=False)
             facts[platform] = True
-            for strategy in (None, "zigzag", "interleave"):
+            strategies = (
+                (None, "zigzag")
+                if platform == "is_hip"
+                else (None, "zigzag", "interleave")
+            )
+            for strategy in strategies:
                 with self.subTest(platform=platform, strategy=strategy):
                     with override_platform(**facts):
                         args = ServerArgs(
@@ -27,7 +34,12 @@ class TestPlatformPrefillCPDeprecation(CustomTestCase):
                             enable_prefill_cp=True,
                             cp_strategy=strategy,
                         )
-                        with self.assertRaisesRegex(ValueError, "deprecated.*refactor"):
+                        with self.assertRaisesRegex(
+                            ValueError,
+                            "requires.*interleave"
+                            if platform == "is_hip"
+                            else "deprecated.*refactor",
+                        ):
                             validate_prefill_cp_platform(args)
 
     def test_context_parallel_handler_rejects_before_model_lookup(self):
@@ -38,9 +50,14 @@ class TestPlatformPrefillCPDeprecation(CustomTestCase):
                 args = ServerArgs(
                     model_path="missing-model-must-not-be-loaded",
                     enable_prefill_cp=True,
-                    cp_strategy="interleave",
+                    cp_strategy="zigzag",
                 )
-                with self.assertRaisesRegex(ValueError, "deprecated.*refactor"):
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "requires.*interleave"
+                    if platform == "is_hip"
+                    else "deprecated.*refactor",
+                ):
                     handle_context_parallelism(args)
 
     def test_resolution_rejects_even_dummy_models(self):
@@ -53,9 +70,14 @@ class TestPlatformPrefillCPDeprecation(CustomTestCase):
                         args = ServerArgs(
                             model_path=model_path,
                             enable_prefill_cp=True,
-                            cp_strategy="interleave",
+                            cp_strategy="zigzag",
                         )
-                        with self.assertRaisesRegex(ValueError, "deprecated.*refactor"):
+                        with self.assertRaisesRegex(
+                            ValueError,
+                            "requires.*interleave"
+                            if platform == "is_hip"
+                            else "deprecated.*refactor",
+                        ):
                             args.resolve_once()
 
     def test_non_cp_and_decode_cp_are_not_rejected(self):
@@ -67,6 +89,36 @@ class TestPlatformPrefillCPDeprecation(CustomTestCase):
                     with override_platform(**facts):
                         args = ServerArgs(model_path="dummy", dcp_size=dcp_size)
                         validate_prefill_cp_platform(args)
+
+    @override_platform(is_hip=True, is_npu=False, is_musa=False)
+    def test_hip_interleave_is_qualified_after_model_lookup(self):
+        for model_type in ("deepseek_v41", "llama"):
+            with self.subTest(model_type=model_type):
+                args = ServerArgs(
+                    model_path="dummy", enable_prefill_cp=True, cp_strategy="interleave"
+                )
+                validate_prefill_cp_platform(args)
+                model = SimpleNamespace(
+                    hf_config=SimpleNamespace(
+                        model_type=model_type, architectures=["DeepseekV4ForCausalLM"]
+                    )
+                )
+                with (
+                    patch(
+                        "sglang.srt.arg_groups.parallel_hook.model_config_of",
+                        return_value=model,
+                    ),
+                    patch(
+                        "sglang.srt.layers.cp.base.init_cp_strategy"
+                    ) as init_strategy,
+                ):
+                    if model_type == "deepseek_v41":
+                        handle_context_parallelism(args)
+                        init_strategy.assert_called_once()
+                    else:
+                        with self.assertRaisesRegex(ValueError, "DeepSeek-V4.1 only"):
+                            handle_context_parallelism(args)
+                        init_strategy.assert_not_called()
 
     @override_platform(is_hip=False, is_npu=False, is_musa=False)
     def test_generic_cp_is_not_rejected_or_modified(self):

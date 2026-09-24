@@ -110,8 +110,7 @@ def create_dsv41_candidate_graph_variants(
     if not (
         (capture_forward_mode == ForwardMode.DECODE or dspark_target_verify)
         and model_runner.device == "cuda"
-        and not is_hip()
-        and torch.cuda.get_device_capability(model_runner.gpu_id)[0] >= 10
+        and (is_hip() or torch.cuda.get_device_capability(model_runner.gpu_id)[0] >= 10)
         and getattr(text_config, "model_type", None) == "deepseek_v41"
         and getattr(text_config, "candidate_source_layer_id", -1) >= 0
     ):
