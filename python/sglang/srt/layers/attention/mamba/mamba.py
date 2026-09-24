@@ -211,6 +211,7 @@ class MambaMixer2(torch.nn.Module):
         activation: str = "silu",
         use_rms_norm: bool = True,
         quant_config: Optional[QuantizationConfig] = None,
+        reduce_results: Optional[bool] = None,
         prefix: str = "",
     ):
         super().__init__()
@@ -421,6 +422,9 @@ class MambaMixer2(torch.nn.Module):
         set_weight_attrs(self.A, {"weight_loader": a_weight_loader})
         set_weight_attrs(self.dt_bias, {"weight_loader": sharded_weight_loader(0)})
 
+        # By default a layer communicator reduces the output under DP attention.
+        if reduce_results is None:
+            reduce_results = not is_dp_attention_enabled()
         self.out_proj = RowParallelLinear(
             intermediate_size,
             hidden_size,
@@ -429,7 +433,8 @@ class MambaMixer2(torch.nn.Module):
             quant_config=quant_config,
             tp_rank=self.tp_rank,
             tp_size=self.tp_size,
-            reduce_results=not is_dp_attention_enabled(),
+            reduce_results=reduce_results,
+            use_dp_attention_reduce=reduce_results and is_dp_attention_enabled(),
             prefix=f"{prefix}.out_proj",
         )
 
@@ -545,6 +550,9 @@ class MambaMixer2(torch.nn.Module):
             dtype=hidden_states.dtype,
             device=hidden_states.device,
         )
+        # Rows past the batch's tokens are DP padding; keep them finite.
+        if num_actual_tokens < preallocated_ssm_out.shape[0]:
+            preallocated_ssm_out[num_actual_tokens:].zero_()
         preallocated_ssm_out_active = preallocated_ssm_out[:num_actual_tokens]
         preallocated_ssm_out_p, preallocated_ssm_out_d = torch.split(
             preallocated_ssm_out_active,
