@@ -113,6 +113,11 @@ async fn decode_orders_by_waiting_running_kv_fraction_then_tokens() {
         (load(1, 1, 90, 100, 0), load(2, 1, 1, 100, 0)),
         (load(1, 1, 100, 1000, 0), load(1, 1, 20, 100, 0)),
         (load(1, 1, 10, 100, 0), load(1, 1, 100, 1000, 0)),
+        // These fractions round to the same f64; preserve exact ordering.
+        (
+            load(1, 1, u64::MAX - 1, u64::MAX, 0),
+            load(1, 1, u64::MAX - 1, u64::MAX - 1, 0),
+        ),
     ];
     for (left, right) in cases {
         let engines = [

@@ -7,12 +7,26 @@ use std::time::Instant;
 use futures::future::BoxFuture;
 use rand::Rng;
 
-use crate::policies::admission::{compare_decode_pressure, compare_prefill_pressure};
-use crate::state::load_monitor::engine_reported_load::EngineReportedLoadTable;
+use crate::state::load_monitor::engine_reported_load::{
+    EngineReportedLoadSnapshot, EngineReportedLoadTable,
+};
 use crate::workers::Worker;
 
 use super::admission::{AdmissionLimits, Decision, EngineAdmission, EngineMetrics};
+use super::scoring::{decode_score, load_source, prefill_score, EngineScore, LoadSource};
 use super::{Pick, PickError, PickRequest, Policy, Rejection, Stage};
+
+fn engine_pressure_score(
+    engine: &Worker,
+    load: &EngineReportedLoadSnapshot,
+    stage: Stage,
+    source: LoadSource,
+) -> EngineScore {
+    match stage {
+        Stage::Plain | Stage::Prefill => prefill_score(engine, load, source),
+        Stage::Decode => decode_score(engine, load, source),
+    }
+}
 
 /// Samples two distinct engines and selects the one with lower stage pressure.
 /// Checks admission only on the selected engine; rejection never resamples.
@@ -54,13 +68,14 @@ impl Policy for PowerOfTwoPolicy {
                         j += 1;
                     }
                     let (left, right) = (&engines[i], &engines[j]);
-                    let pressure = match request.stage {
-                        Stage::Plain | Stage::Prefill => {
-                            compare_prefill_pressure(left, right, Some(&load))
-                        }
-                        Stage::Decode => compare_decode_pressure(left, right, Some(&load)),
-                    };
-                    Arc::clone(if pressure.is_gt() { right } else { left })
+                    let source = load_source(&load, [left, right]);
+                    let left_score = engine_pressure_score(left, &load, request.stage, source);
+                    let right_score = engine_pressure_score(right, &load, request.stage, source);
+                    Arc::clone(if left_score > right_score {
+                        right
+                    } else {
+                        left
+                    })
                 }
             };
             let metrics = EngineMetrics::observe(&engine, &load);

@@ -57,6 +57,7 @@ src/
     sticky.rs                   Routing-key selection and fallback
     least_load.rs               Least-load selection
     power_of_two.rs              Pair sampling and stage-aware comparison
+    scoring.rs                  Ordered engine-pressure keys shared by policies
     random.rs                   Random selection
     round_robin.rs              Rotation
   state/
@@ -407,8 +408,12 @@ reports change after selection; it neither recaptures nor reserves capacity.
 Fallback policies read their own state and do not share snapshots with callers.
 
 Snapshot capture still scans the full table; an engine-scoped reader can be added
-if profiling justifies it. Power-of-two reuses the legacy prefill/decode pressure
-comparisons, including router-local fallback. Concrete load-aware admission remains
+if profiling justifies it. Power-of-two selects its stage-specific ordered key from
+`scoring.rs`; cache-aware reuses the prefill key. A comparison set uses queue time
+only when all its engines have estimates, native counters when all have complete
+reports, and router-local in-flight counts otherwise. The comparison set is the
+sampled pair for power-of-two and the candidate tier being ranked for cache-aware.
+Reorganized policies do not depend on legacy admission helpers. Concrete load-aware admission remains
 in #40271. Further shared load interpretation and correction for dispatches since
 the report remain follow-ups; these must preserve source, freshness, and available
 measurements without adding another
