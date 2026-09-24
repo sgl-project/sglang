@@ -881,11 +881,13 @@ class TestSharedMoeProductionLoad(unittest.TestCase):
                 fused.num_experts = 9
                 fused._num_global_routed = 8
                 fused.num_local_experts = 8 // ep_size + 1
+
                 def local_id(gid):
                     if gid == 8:
                         return 8 // ep_size
                     start = ep_rank * (8 // ep_size)
                     return gid - start if start <= gid < start + 8 // ep_size else -1
+
                 fused._map_global_expert_id_to_local_expert_id = local_id
                 pool.base_model = torch.nn.Sequential(fused)
                 pool.num_layer = 1
@@ -908,28 +910,63 @@ class TestSharedMoeProductionLoad(unittest.TestCase):
                 pool.new_embeddings_buffer = {}
                 for slot in range(2):
                     weights = {}
-                    for expert, value in [("experts.0", 10 + slot), ("shared_experts", 20 + slot)]:
+                    for expert, value in [
+                        ("experts.0", 10 + slot),
+                        ("shared_experts", 20 + slot),
+                    ]:
                         prefix = f"model.layers.0.mlp.{expert}.down_proj"
-                        weights[f"{prefix}.lora_A.weight"] = torch.full((2, 3), float(value))
-                        weights[f"{prefix}.lora_B.weight"] = torch.full((5, 2), float(value))
+                        weights[f"{prefix}.lora_A.weight"] = torch.full(
+                            (2, 3), float(value)
+                        )
+                        weights[f"{prefix}.lora_B.weight"] = torch.full(
+                            (5, 2), float(value)
+                        )
                     adapter = types.SimpleNamespace(
-                        config=types.SimpleNamespace(r=2), scaling=2.5,
-                        layers=[types.SimpleNamespace(weights=weights, pinned_weights={})],
-                        embedding_layers={}, added_tokens_embeddings={},
+                        config=types.SimpleNamespace(r=2),
+                        scaling=2.5,
+                        layers=[
+                            types.SimpleNamespace(weights=weights, pinned_weights={})
+                        ],
+                        embedding_layers={},
+                        added_tokens_embeddings={},
                     )
                     _load_lora_weight_to_buffer(
-                        pool, uid=f"adapter-{slot}", buffer_id=slot, lora_adapter=adapter,
-                        lora_modules=[{"model.layers.0.mlp.experts": _FakeRoutedMoeLayer()}],
-                        lora_embed_tokens_module=None, lora_lm_head_module=None,
+                        pool,
+                        uid=f"adapter-{slot}",
+                        buffer_id=slot,
+                        lora_adapter=adapter,
+                        lora_modules=[
+                            {"model.layers.0.mlp.experts": _FakeRoutedMoeLayer()}
+                        ],
+                        lora_embed_tokens_module=None,
+                        lora_lm_head_module=None,
                     )
                 for slot in range(2):
-                    self.assertTrue(torch.all(pool.A_buffer["down_proj_moe"][0][slot, -1] == 20 + slot))
-                    self.assertTrue(torch.all(pool.B_buffer["down_proj_moe"][0][slot, -1] == (20 + slot) * 2.5))
+                    self.assertTrue(
+                        torch.all(
+                            pool.A_buffer["down_proj_moe"][0][slot, -1] == 20 + slot
+                        )
+                    )
+                    self.assertTrue(
+                        torch.all(
+                            pool.B_buffer["down_proj_moe"][0][slot, -1]
+                            == (20 + slot) * 2.5
+                        )
+                    )
                     expected = 10 + slot if ep_rank == 0 else 0
-                    self.assertTrue(torch.all(pool.A_buffer["down_proj_moe"][0][slot, 0] == expected))
+                    self.assertTrue(
+                        torch.all(
+                            pool.A_buffer["down_proj_moe"][0][slot, 0] == expected
+                        )
+                    )
 
     def test_global_per_rank_shared_slots_are_rejected(self):
-        pool = _make_pool(num_experts_global=8, moe_ep_size=2, moe_ep_rank=0, moe_use_local_expert_ids=False)
+        pool = _make_pool(
+            num_experts_global=8,
+            moe_ep_size=2,
+            moe_ep_rank=0,
+            moe_use_local_expert_ids=False,
+        )
         pool.experts_shared_outer_loras = False
         fused = _FakeFusedMoE()
         fused.layer_id = 0
