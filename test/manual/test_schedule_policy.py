@@ -25,7 +25,6 @@ def _make_req(rid, origin_input_text, origin_input_ids, sampling_params=None, **
 
 
 class TestSchedulePolicy(CustomTestCase):
-
     def setUp(self):
         self.tree_cache = RadixCache.create_simulated()
 

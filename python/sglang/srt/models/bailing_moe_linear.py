@@ -13,7 +13,6 @@ from sglang.kernels.ops.attention.fla.layernorm_gated import RMSNorm as RMSNormG
 from sglang.kernels.ops.attention.fla.layernorm_gated import layernorm_fn
 from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.distributed import (
-    get_pp_group,
     tensor_model_parallel_all_reduce,
 )
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
@@ -60,7 +59,6 @@ from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA, DeepseekV2MLP,
 from sglang.srt.models.utils import WeightsMapper
 from sglang.srt.runtime_context import (
     get_device,
-    get_forward,
     get_parallel,
     get_platform,
     get_stream,
@@ -98,7 +96,7 @@ if _use_aiter_gfx95:
     pass
 
 if _is_cuda:
-    from sgl_kernel import awq_dequantize
+    from sglang.kernels.ops.quantization.awq_dequantize import awq_dequantize
 elif _is_cpu and _is_cpu_amx_available:
     pass
 elif _is_hip:
@@ -164,7 +162,6 @@ def weight_loader_with_alias(alias: str):
 
 
 class BailingMLP(nn.Module):
-
     def __init__(
         self,
         hidden_size: int,
@@ -233,7 +230,6 @@ class BailingMoEGate(nn.Module):
 
 
 class BailingMoE(nn.Module):
-
     def __init__(
         self,
         config: PretrainedConfig,
@@ -296,7 +292,9 @@ class BailingMoE(nn.Module):
                 self.score_function == "softmax" and self.correction_bias is None
             ) or (
                 self.score_function == "sigmoid" and self.correction_bias is not None
-            ), "score_function and correction_bias should be in 2 combination (softmax, None) or (sigmoid, not None)"
+            ), (
+                "score_function and correction_bias should be in 2 combination (softmax, None) or (sigmoid, not None)"
+            )
 
         self.topk = TopK(
             top_k=self.top_k,
@@ -503,12 +501,12 @@ class BailingMoELinearAttention(nn.Module):
 
         self.group_norm_size = getattr(config, "group_norm_size", 1)
         self.rms_norm_eps = float(getattr(config, "rms_norm_eps", 1e-5))
-        assert (
-            self.tp_size <= self.group_norm_size
-        ), "tp_size must be less than or equal to group_norm_size that can use local rms norm"
-        assert (
-            self.group_norm_size % self.tp_size == 0
-        ), "group_norm_size must be divisible by tp_size"
+        assert self.tp_size <= self.group_norm_size, (
+            "tp_size must be less than or equal to group_norm_size that can use local rms norm"
+        )
+        assert self.group_norm_size % self.tp_size == 0, (
+            "group_norm_size must be divisible by tp_size"
+        )
         self.g_norm = BailingGroupRMSNormGate(
             hidden_size=self.hidden_inner_size // self.tp_size,
             eps=self.rms_norm_eps,
@@ -622,7 +620,6 @@ class BailingMoELinearAttention(nn.Module):
 
 
 class BailingMoEAttention(nn.Module):
-
     def __init__(
         self,
         config: PretrainedConfig,
@@ -731,7 +728,6 @@ class BailingMoEAttention(nn.Module):
 
 
 class BailingMoELinearDecoderLayer(nn.Module):
-
     def __init__(
         self,
         config: PretrainedConfig,
@@ -838,6 +834,7 @@ class BailingMoELinearDecoderLayer(nn.Module):
             input_layernorm=self.input_layernorm,
             post_attention_layernorm=self.post_attention_layernorm,
             allow_reduce_scatter=False,
+            is_last_layer=(is_nextn or layer_id == config.num_hidden_layers - 1),
             qkv_latent_func=qkv_latent_func,
         )
 
@@ -886,25 +883,9 @@ class BailingMoELinearDecoderLayer(nn.Module):
         # logger.warning(
         #     f"===={self.layer_id=}, 3 shape= {hidden_states.shape}, {residual.shape}"
         # )
-        fuse_mlp_allreduce = (
-            self.layer_communicator.should_fuse_mlp_allreduce_with_next_layer(
-                forward_batch
-            )
-        )
-        mlp_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
-            forward_batch
-        )
-        with get_forward().scoped(
-            fuse_mlp_allreduce=fuse_mlp_allreduce,
-            mlp_reduce_scatter=mlp_reduce_scatter,
-        ):
+        with self.layer_communicator.ffn_exit(forward_batch) as ffn_exit:
             hidden_states = self.mlp(hidden_states)
-        if fuse_mlp_allreduce:
-            hidden_states._sglang_needs_allreduce_fusion = True
-        else:
-            hidden_states, residual = self.layer_communicator.postprocess_layer(
-                hidden_states, residual, forward_batch
-            )
+        hidden_states, residual = ffn_exit.finish(hidden_states, residual)
         return hidden_states, residual
 
     @staticmethod
@@ -918,7 +899,6 @@ class BailingMoELinearDecoderLayer(nn.Module):
 
 
 class BailingMoELinearModel(nn.Module):
-
     def __init__(
         self,
         config: PretrainedConfig,
@@ -926,7 +906,7 @@ class BailingMoELinearModel(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
         self.config = config
         self.vocab_size = config.vocab_size
         self.embed_dim = config.hidden_size
@@ -943,9 +923,9 @@ class BailingMoELinearModel(nn.Module):
             f"Layer config: {num_linear} linear attention layers, {num_full} full attention layers"
         )
 
-        assert (
-            self.num_layers % self.layer_group_size == 0
-        ), f"num_layers={self.num_layers} must be divided by layer_group_size={self.layer_group_size}"
+        assert self.num_layers % self.layer_group_size == 0, (
+            f"num_layers={self.num_layers} must be divided by layer_group_size={self.layer_group_size}"
+        )
 
         if self.pp_group.is_first_rank:
             self.word_embeddings = VocabParallelEmbedding(
@@ -1041,7 +1021,6 @@ class BailingMoELinearModel(nn.Module):
 
 
 class BailingMoELinearForCausalLM(nn.Module):
-
     packed_modules_mapping = {
         "fused_qkv_a_proj_with_mqa": ["q_a_proj", "kv_a_proj_with_mqa"],
         "gate_up_proj": ["gate_proj", "up_proj"],
@@ -1073,7 +1052,7 @@ class BailingMoELinearForCausalLM(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
         self.config = config
         self.quant_config = quant_config
         self.model = BailingMoELinearModel(
@@ -1492,7 +1471,6 @@ class BailingMoELinearForCausalLM(nn.Module):
                 weight_loader(param, loaded_weight, shard_id)
                 break
             else:
-
                 for mapping in expert_params_mapping:
                     param_name, weight_name, expert_id, shard_id = mapping
                     if weight_name not in name:
@@ -1514,7 +1492,6 @@ class BailingMoELinearForCausalLM(nn.Module):
                     )
                     break
                 else:
-
                     if name.endswith(".bias") and name not in params_dict:
                         continue
                     if "slope" in name:
@@ -1571,7 +1548,6 @@ class BailingMoELinearForCausalLM(nn.Module):
                             cached_a_proj.pop(q_a_proj_name)
                             cached_a_proj.pop(kv_a_proj_name)
                     else:
-
                         if name not in params_dict:
                             name = name.replace(".dense.", ".o_proj.")
                             if name not in params_dict:

@@ -27,6 +27,7 @@ from sglang.multimodal_gen.runtime.layers.linear import (
     QKVParallelLinear,
     ReplicatedLinear,
     RowParallelLinear,
+    UnquantizedLinearMethod,
 )
 from sglang.multimodal_gen.runtime.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
@@ -34,7 +35,7 @@ from sglang.multimodal_gen.runtime.layers.vocab_parallel_embedding import (
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     write_dense_weight,
 )
-from sglang.multimodal_gen.utils import get_mixed_precision_state
+from sglang.multimodal_gen.runtime.utils.precision import get_mixed_precision_state
 
 torch._dynamo.config.recompile_limit = 64
 
@@ -118,6 +119,16 @@ class BaseLayerWithLoRA(nn.Module):
     @property
     def bias(self):
         return getattr(self.base_layer, "bias", None)
+
+    @property
+    def can_merge_base_weight(self) -> bool:
+        """Whether a LoRA delta may safely replace the stored base weight."""
+        weight = self.weight
+        if not (weight.dtype.is_floating_point or weight.dtype.is_complex):
+            return False
+        if isinstance(self.base_layer, LinearBase):
+            return isinstance(self.base_layer.quant_method, UnquantizedLinearMethod)
+        return True
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # Layerwise rebinds Parameter.data; do not compile the merged path.

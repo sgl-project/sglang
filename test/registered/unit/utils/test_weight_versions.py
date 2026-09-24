@@ -15,9 +15,13 @@ from sglang.srt.utils.weight_versions import (
     truncate_weight_version_events,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from sglang.test.test_utils import (
+    CustomTestCase,
+    enter_scope,
+    published_topology,
+)
 
-register_cpu_ci(est_time=4, suite="base-a-test-cpu")
+register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
 
 class _ReqStub:
@@ -300,11 +304,9 @@ class _SchedulerStub:
         waiting,
         chunked=None,
         last_batch=None,
-        pp_size=1,
         hisparse=None,
     ):
         self.serving = _ServingStub(version)
-        self.ps = SimpleNamespace(pp_size=pp_size)
         self.running_batch = SimpleNamespace(reqs=running)
         self.last_batch = last_batch
         self.waiting_queue = waiting
@@ -313,7 +315,8 @@ class _SchedulerStub:
 
 
 class TestSchedulerRecordWeightVersionChange(CustomTestCase):
-    def _scheduler(self, *args, **kwargs):
+    def _scheduler(self, *args, pp_size=1, **kwargs):
+        enter_scope(self, published_topology(pp_size=pp_size))
         scheduler = _SchedulerStub(*args, **kwargs)
         for name, value in (
             ("get_serving", scheduler.serving),

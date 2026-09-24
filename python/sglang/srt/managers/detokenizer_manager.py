@@ -127,22 +127,22 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
         # In multi-tokenizer mode, results are pushed back to each TokenizerWorker
         # directly via SocketMapping inside multi_http_worker_event_loop, so the
         # single send_to_tokenizer socket is unused.
-        if server_args.tokenizer_worker_num == 1:
+        if get_serving().tokenizer_worker_num == 1:
             self.send_to_tokenizer = get_zmq_socket(
                 context, zmq.PUSH, port_args.tokenizer_ipc_name, False
             )
 
     def init_tokenizer(self, server_args: ServerArgs):
-        if server_args.skip_tokenizer_init:
+        if get_serving().skip_tokenizer_init:
             self.tokenizer = None
             self.vocab_size = None
         else:
             self.tokenizer = get_tokenizer(
                 get_serving().tokenizer_path,
-                tokenizer_mode=server_args.tokenizer_mode,
+                tokenizer_mode=get_serving().tokenizer_mode,
                 trust_remote_code=get_model().trust_remote_code,
-                revision=server_args.revision,
-                tokenizer_backend=server_args.tokenizer_backend,
+                revision=get_model().revision,
+                tokenizer_backend=get_serving().tokenizer_backend,
             )
             try:
                 self.vocab_size = len(self.tokenizer)
@@ -151,7 +151,9 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
 
     def init_running_status(self, server_args: ServerArgs):
         self.decode_status = LimitedCapacityDict(capacity=DETOKENIZER_MAX_STATES)
-        self.disable_tokenizer_batch_decode = server_args.disable_tokenizer_batch_decode
+        self.disable_tokenizer_batch_decode = (
+            get_serving().disable_tokenizer_batch_decode
+        )
         self.is_tool_call_parser_gpt_oss = get_serving().tool_call_parser == "gpt-oss"
 
         self.soft_watchdog = Watchdog.create(
@@ -548,7 +550,7 @@ def run_detokenizer_process(
     manager = None
     try:
         manager = detokenizer_manager_class(server_args, port_args)
-        if server_args.tokenizer_worker_num == 1:
+        if get_serving().tokenizer_worker_num == 1:
             manager.event_loop()
         else:
             manager.multi_http_worker_event_loop()

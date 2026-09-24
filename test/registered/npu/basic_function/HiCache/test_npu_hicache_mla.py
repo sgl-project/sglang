@@ -2,7 +2,6 @@ import unittest
 from types import SimpleNamespace
 from urllib.parse import urlparse
 
-from sglang.srt.utils import kill_process_tree
 from sglang.test.ascend.npu_eval_accuracy_kit import _is_pr_pipeline, run_npu_pr_smoke
 from sglang.test.ci.ci_register import register_npu_ci
 from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
@@ -11,6 +10,7 @@ from sglang.test.test_utils import (
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
     popen_launch_server,
+    terminate_and_kill_process_tree,
 )
 
 register_npu_ci(est_time=400, suite="base-b-test-4-npu-a3")
@@ -26,7 +26,6 @@ TEST_MODEL_MATRIX = {
 
 
 class TestAscendMlaHicache(CustomTestCase):
-
     @classmethod
     def setUpClass(cls):
         cls.models = TEST_MODEL_MATRIX.keys()
@@ -41,8 +40,8 @@ class TestAscendMlaHicache(CustomTestCase):
             "--tp-size",
             4,
             "--enable-hierarchical-cache",
-            "--hicache-ratio",
-            1.2,
+            "--hicache-size",
+            30,
         ]
 
     def test_a_gsm8k(self):
@@ -69,7 +68,7 @@ class TestAscendMlaHicache(CustomTestCase):
                             num_questions=1319,
                             max_new_tokens=512,
                             parallel=128,
-                            host=f"http://{self.url.hostname}",
+                            host=self.url.hostname,
                             port=int(self.url.port),
                         )
 
@@ -79,7 +78,7 @@ class TestAscendMlaHicache(CustomTestCase):
                             TEST_MODEL_MATRIX[model]["accuracy"],
                         )
                 finally:
-                    kill_process_tree(process.pid)
+                    terminate_and_kill_process_tree(process)
 
 
 if __name__ == "__main__":

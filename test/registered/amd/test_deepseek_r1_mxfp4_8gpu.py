@@ -40,10 +40,10 @@ class TestDeepseekR1MXFP4(CustomTestCase):
             "131072",
             "--model-loader-extra-config",
             '{"enable_multithread_load": true}',
-            "--enforce-piecewise-cuda-graph",
-            "--piecewise-cuda-graph-compiler",
+            "--cuda-graph-backend-prefill=tc_piecewise",
+            "--cuda-graph-tc-compiler",
             "eager",
-            "--piecewise-cuda-graph-max-tokens",
+            "--cuda-graph-max-bs-prefill",
             "8192",
         ]
         cls.process = popen_launch_server(
@@ -68,7 +68,7 @@ class TestDeepseekR1MXFP4(CustomTestCase):
             num_questions=1319,
             parallel=1319,
             max_new_tokens=512,
-            host="http://127.0.0.1",
+            host="127.0.0.1",
             port=int(self.base_url.split(":")[-1]),
         )
         metrics = run_eval_few_shot_gsm8k(args)
@@ -76,7 +76,7 @@ class TestDeepseekR1MXFP4(CustomTestCase):
 
         if is_in_ci():
             write_github_step_summary(
-                f"### test_gsm8k (deepseek-r1-mxfp4)\n" f'{metrics["accuracy"]=:.3f}\n'
+                f'### test_gsm8k (deepseek-r1-mxfp4)\n{metrics["accuracy"]=:.3f}\n'
             )
         self.assertGreater(metrics["accuracy"], 0.94)
 
@@ -88,7 +88,7 @@ class TestDeepseekR1MXFP4(CustomTestCase):
 
         if is_in_ci():
             write_github_step_summary(
-                f"### test_bs_1_speed (deepseek-r1-mxfp4)\n" f"{speed=:.2f} token/s\n"
+                f"### test_bs_1_speed (deepseek-r1-mxfp4)\n{speed=:.2f} token/s\n"
             )
         self.assertGreater(speed, 75)
 
@@ -141,7 +141,7 @@ class TestDeepseekR1MXFP4MTP(CustomTestCase):
             num_questions=200,
             max_new_tokens=512,
             parallel=128,
-            host="http://127.0.0.1",
+            host="127.0.0.1",
             port=int(self.base_url.split(":")[-1]),
         )
         metrics = run_eval_few_shot_gsm8k(args)
