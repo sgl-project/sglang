@@ -419,6 +419,13 @@
         #elif ((defined __MUSA_ARCH__) && (__MUSA_ARCH__ == 310))
             curr = SrcVec::load_byp_slc(p_src, j);
             res_vec = SrcVec::load_byp_slc(p_res, j);
+        #elif ((defined __MUSA_ARCH__) && (__MUSA_ARCH__ == 420))
+            //  TODO: use LS specific load inst
+            curr = *(SrcVec *)(p_src+j);
+            res_vec = *(SrcVec *)(p_res+j);
+        #else
+            curr = *(SrcVec *)(p_src + j);
+            res_vec = *(SrcVec *)(p_res + j);
         #endif
         #pragma unroll
         for (int k = 0; k < vlen; k++) {
@@ -446,6 +453,8 @@
             weight_val = *(SrcVec *)(weight + j);
           #elif ((defined __MUSA_ARCH__) && (__MUSA_ARCH__ == 310))
             weight_val = SrcVec::load_byp_slc(weight, j);
+          #elif ((defined __MUSA_ARCH__) && (__MUSA_ARCH__ == 420))
+            weight_val = *(SrcVec *)(weight + j);
           #endif
   #pragma unroll
           for (int k = 0; k < vlen; k++) {
