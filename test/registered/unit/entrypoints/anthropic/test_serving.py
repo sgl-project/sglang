@@ -176,6 +176,24 @@ class TestAnthropicServing(unittest.TestCase):
         data.update(overrides)
         return AnthropicMessagesRequest.model_validate(data)
 
+    def test_pd_fields_are_forwarded_to_chat_request(self):
+        request = self._anthropic_request(
+            stream=False,
+            bootstrap_host="prefill-service",
+            bootstrap_port=8998,
+            bootstrap_room=42,
+            routed_dp_rank=3,
+            disagg_prefill_dp_rank=2,
+        )
+
+        chat_request = self._serving()._convert_to_chat_completion_request(request)
+
+        self.assertEqual(chat_request.bootstrap_host, "prefill-service")
+        self.assertEqual(chat_request.bootstrap_port, 8998)
+        self.assertEqual(chat_request.bootstrap_room, 42)
+        self.assertEqual(chat_request.routed_dp_rank, 3)
+        self.assertEqual(chat_request.disagg_prefill_dp_rank, 2)
+
     def _tool_result_request(self, content, tools=None):
         overrides = {
             "stream": False,
