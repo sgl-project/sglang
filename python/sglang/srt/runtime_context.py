@@ -581,6 +581,7 @@ class DpFlags(_FlagGroupBase):
     # narrows attention-DP to one replica and the TP rank to the draft group,
     # but the batch it forwards carries the DP sync the target gathered, so
     # indexing that list needs this process's slot in the target's gather.
+    # dp_gather_width() also reads it as the marker for being in that scope.
     scoped_gather_slot: Optional[int] = None
     # DP gathered-buffer allocation metadata (model hidden size / dtype /
     # device), set by initialize_dp_attention alongside the flags above.

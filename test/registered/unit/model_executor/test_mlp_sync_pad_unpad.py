@@ -18,6 +18,7 @@ import torch
 from sglang.srt.distributed import parallel_state
 from sglang.srt.distributed.parallel_state import GroupCoordinator
 from sglang.srt.layers.logits_processor import LogitsMetadata, LogitsProcessor
+from sglang.srt.model_executor.cuda_graph_config import CudaGraphConfig, PhaseConfig
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
     DecodeCudaGraphRunner,
@@ -245,7 +246,7 @@ class TestDraftScopeMlpSync(CustomTestCase):
             tp_size=4,
             dp_size=4,
             enable_dp_attention=True,
-            cuda_graph_config=SimpleNamespace(prefill=SimpleNamespace(bs=[])),
+            cuda_graph_config=CudaGraphConfig(prefill=PhaseConfig(bs=[])),
         )
         override.install()
         self.addCleanup(override.restore)
