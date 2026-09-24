@@ -1,11 +1,4 @@
-"""Config fields of the ``exec`` namespace.
-
-One class per namespace. The class *is* the namespace: a field declared here
-lands in the ``exec`` bag, which is what ``get_exec()`` returns, so a reader
-spells it exactly as before. ``ServerArgs`` composes these classes, so the
-record stays one flat object -- the split moves where declarations live, not
-how config is shaped at runtime.
-"""
+"""Config fields of the ``exec`` namespace."""
 
 from __future__ import annotations
 
@@ -655,6 +648,28 @@ class ExecComm(msgspec.Struct):
     ] = None
     enable_aiter_allreduce_fusion: A[
         bool, Arg(help="Enable Aiter AllReduce Fusion.", resolvable=True)
+    ] = False
+    disable_aiter_allreduce_fusion_in_prefill: A[
+        bool,
+        Arg(
+            help=(
+                "Disable Aiter AllReduce Fusion for prefill batches "
+                "(EXTEND / MIXED / SPLIT_PREFILL) while keeping it for decode. "
+                "Only meaningful with --enable-aiter-allreduce-fusion."
+            ),
+            resolvable=True,
+        ),
+    ] = False
+    disable_aiter_allreduce_fusion_in_decode: A[
+        bool,
+        Arg(
+            help=(
+                "Disable Aiter AllReduce Fusion for decode batches (DECODE / "
+                "TARGET_VERIFY / draft-extend / IDLE) while keeping it for prefill. "
+                "Only meaningful with --enable-aiter-allreduce-fusion."
+            ),
+            resolvable=True,
+        ),
     ] = False
 
 

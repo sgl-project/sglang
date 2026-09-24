@@ -10,7 +10,24 @@ from sglang.kernels.ops.moe.rocm_router_gate import (
 )
 from sglang.srt.runtime_context import get_exec
 
-__all__ = ["fused_qk_rope_cat", "fused_qk_rope_cat_and_cache_mla"]
+from sglang.srt.utils import is_gfx95_supported
+
+__all__ = [
+    "fused_fp8_bmm_rope_cat_and_cache_mla",
+    "fused_qk_rope_cat",
+    "fused_qk_rope_cat_and_cache_mla",
+]
+
+# This module is imported wherever AITER is on, gfx942 included, but the fused
+# bmm+rope+cache op is gfx95-only. Import it behind the same predicate its one
+# caller gates on, so an aiter build without the op cannot take down every
+# DeepSeek import on another card. The name stays bound either way.
+if is_gfx95_supported():
+    from aiter.ops.triton.fusions.fused_bmm_rope_kv_cache import (
+        fused_fp8_bmm_rope_cat_and_cache_mla,
+    )
+else:
+    fused_fp8_bmm_rope_cat_and_cache_mla = None
 
 
 def aiter_dsv3_router_gemm(
