@@ -124,7 +124,7 @@ target checkpoint and verify prompt adherence.
 
 | Diffusion input | Enhancer requirements |
 | --- | --- |
-| Natural-language image/video prompts, such as Z-Image, FLUX, Qwen-Image, Wan or LTX | An SRT-served instruction model with chat completions; the default template is a starting point |
+| Natural-language image/video prompts, such as Z-Image, FLUX, Qwen-Image, Wan, LTX or MiniMax-H3 | An SRT-served instruction model with chat completions; the default template is a starting point |
 | Image editing or image-to-video | Text-only instruction rewriting, or an SRT VLM with `include_images=true` for image-aware rewriting |
 | Structured captions, such as Ideogram 4 or LingBot-Video-MoE | A model-specific `system_prompt` and preferably schema-constrained `response_format`; the default prose template is unsuitable |
 | ERNIE-Image or LongCat with built-in rewriting | Disable the built-in rewriter for the request when using this generic enhancer, to avoid rewriting twice |
@@ -181,5 +181,6 @@ CUDA_VISIBLE_DEVICES=1 sglang serve \
 when you need ERNIE's trained PE behavior. If you instead use
 `--prompt-enhancer-config`, send both `enhance_prompt=true` and `use_pe=false`.
 For LongCat, use `enable_prompt_rewrite=false` with the generic enhancer.
+These request flags skip native rewriting, not loading its model components.
 
 For Ascend setup, see [models with AR stages](/docs/sglang-diffusion/models_with_ar#ascend-npu-env).

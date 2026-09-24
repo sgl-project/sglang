@@ -22,6 +22,9 @@ from sglang.multimodal_gen.configs.pipeline_configs.ideogram import (
 from sglang.multimodal_gen.configs.pipeline_configs.longcat_image import (
     LongCatImagePipelineConfig,
 )
+from sglang.multimodal_gen.configs.pipeline_configs.minimax_h3 import (
+    MiniMaxH3PipelineConfig,
+)
 from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import (
     QwenImageEditPlusPipelineConfig,
     QwenImagePipelineConfig,
@@ -34,6 +37,7 @@ from sglang.multimodal_gen.configs.sample.ideogram import Ideogram4SamplingParam
 from sglang.multimodal_gen.configs.sample.longcat_image import (
     LongCatImageSamplingParams,
 )
+from sglang.multimodal_gen.configs.sample.minimax_h3 import MiniMaxH3SamplingParams
 from sglang.multimodal_gen.configs.sample.qwenimage import (
     QwenImageEditPlusSamplingParams,
     QwenImageSamplingParams,
@@ -49,6 +53,7 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.prompt_enhancement import 
 )
 from sglang.multimodal_gen.runtime.entrypoints.openai.protocol import (
     RealtimeVideoGenerationsRequest,
+    VideoGenerationsRequest,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
 from sglang.multimodal_gen.runtime.scheduler_client import async_scheduler_client
@@ -376,6 +381,29 @@ def test_model_sampling_contracts_remain_owned_by_the_model(
     assert sampling.prompt == server.rewritten
     for name, value in extras.items():
         assert vars(sampling)[name] == value
+
+
+def test_h3_native_request_contract_survives_enhancement(server):
+    server.args.pipeline_config = MiniMaxH3PipelineConfig()
+    server.model_info.sampling_param_cls = MiniMaxH3SamplingParams
+    target = {"short_edge": 768, "aspect_ratio": "16:9", "duration_seconds": 5.0}
+    request = VideoGenerationsRequest(
+        prompt="A red teapot", task="t2va", conditions=[], target=target, seed=123
+    )
+
+    async def enhance_and_lower():
+        request.prompt = await server.app.state.prompt_enhancer.enhance(
+            request.prompt, task="video", image_paths=[]
+        )
+        return video_api._build_video_sampling_params("h3-enhanced", request)
+
+    sampling = server.client.portal.call(enhance_and_lower)
+    assert type(sampling) is MiniMaxH3SamplingParams
+    assert sampling.prompt == server.rewritten
+    assert sampling.seed == 123
+    assert sampling.task == "t2va"
+    assert sampling.conditions == []
+    assert sampling.target == target
 
 
 @pytest.mark.parametrize(
