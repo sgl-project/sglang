@@ -287,8 +287,7 @@ def _resolve_deferred_qkv_scale_inv(
 
 
 def get_attention_sliding_window_size(config):
-    # RadixAttention's window excludes the query token, while config.sliding_window_size
-    # counts it (HF attends that many keys including the query).
+    # RadixAttention's window excludes the query token.
     return config.sliding_window_size - 1
 
 
