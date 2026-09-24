@@ -2045,10 +2045,12 @@ class DeepseekV4AscendAttnBackend(
                 buf = pool.swa_kv_pool.kv_buffer[pool._swa_local_layer_id(layer)]
                 tbl = getattr(fm, "swa_page_table", None)
                 if tbl is not None and tbl.numel():
+                    # fp8 has no NPU index_select (161002); gather raw bytes.
+                    src = buf.view(torch.uint8)
                     pages = torch.unique(tbl[0].reshape(-1)[-3:].to(torch.int64))
-                    pages = pages[(pages >= 0) & (pages < buf.shape[0])]
-                    rows = buf.index_select(0, pages).detach().reshape(-1).contiguous()
-                    raw = rows.view(torch.uint8).numpy().tobytes()
+                    pages = pages[(pages >= 0) & (pages < src.shape[0])]
+                    rows = src.index_select(0, pages).detach().reshape(-1).contiguous()
+                    raw = rows.numpy().tobytes()
                     print(
                         f"[SWAKV] start_pos={_l(getattr(fm, 'start_pos', None))} layer={layer} "
                         f"pages={pages.numel()} md5={hashlib.md5(raw).hexdigest()[:16]}",
