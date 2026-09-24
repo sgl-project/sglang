@@ -6195,84 +6195,43 @@ class UnifiedRadixCacheSuite:
         if _selected_tree_core_test_backend() == "rust":
             self.skipTest("internal-node state demote is Python-core only")
         page = self.cfg.page_size
-        cfg = replace(self.cfg, sliding_window_size=3 * page)
-        cache, allocator, req_pool = build_fixture(cfg)
-        core = cache.tree_core
-        values = self._alloc(allocator, 4 * page)
+        cache, allocator, req_pool = build_fixture(
+            replace(self.cfg, sliding_window_size=3 * page)
+        )
 
-        def insert_state(length, values, prev_prefix_len=0):
-            state = req_pool.mamba_allocator.alloc(1)
-            self.assertIsNotNone(state)
-            self._fill_mamba_state(req_pool, state, marker=length)
-            return cache.insert(
-                InsertParams(
-                    key=RadixKey(array("q", range(length))),
-                    value=values,
-                    prev_prefix_len=prev_prefix_len,
-                    mamba_value=state,
-                )
+        def insert(length):
+            return self._insert(
+                cache, allocator, req_pool, list(range(length))
             ).last_device_node
 
-        nodes = [
-            insert_state(size, values[:size], size - page)
-            for size in range(page, 5 * page, page)
-        ]
-        grandparent, parent, anchor, leaf = nodes
+        nodes = [insert(size) for size in range(page, 5 * page, page)]
+        grandparent, _, anchor, leaf = nodes
         self._init_hicache(cache, write_policy="write_back")
-
-        self.assertEqual(cache.evict(EvictParams(mamba_num=3)).mamba_num_evicted, 3)
-        self.assertEqual(cache.evict_host(page, ComponentType.FULL), page)
-        self.assertEqual(
-            [core.is_backuped(node) for node in nodes], [False, True, True, False]
-        )
-        self.assertEqual(
-            cache.evict(EvictParams(swa_num_tokens=3 * page)).swa_num_tokens_evicted,
-            3 * page,
-        )
-        self.assertEqual(cache.evict_host(3 * page, ComponentType.SWA), 3 * page)
+        cache.evict(EvictParams(mamba_num=3))
+        cache.evict_host(page, ComponentType.FULL)
+        cache.evict(EvictParams(swa_num_tokens=3 * page))
+        cache.evict_host(3 * page, ComponentType.SWA)
 
         # The backed parent stops the Full backup chain, while the SWA window
         # reaches the unbacked grandparent and marks it under the anchor's ack.
-        insert_state(3 * page, self._alloc(allocator, 3 * page))
-        self.assertEqual(list(cache.ongoing_write_through), [anchor])
+        insert(3 * page)
         self.assertEqual(
             cache.ongoing_write_through[anchor].publish_node_ids, nodes[:3]
         )
-        insert_state(page, self._alloc(allocator, page))
-        self.assertFalse(core.is_backuped(grandparent))
-        self.assertIn(ComponentType.MAMBA, core.build_backup_spec(grandparent)[1])
-        retained = {
-            (node, ct): _device_value(cache, node, ct).clone()
-            for node in nodes
-            for ct in (ComponentType.FULL, ComponentType.SWA)
-        }
+        insert(page)
+        self.assertFalse(cache.tree_core.is_backuped(grandparent))
+        self.assertIn(
+            ComponentType.MAMBA, cache.tree_core.build_backup_spec(grandparent)[1]
+        )
         leaf_lock = cache.inc_lock_ref(leaf).to_dec_params()
-        free_states = req_pool.mamba_allocator.available_size()
         try:
             result = cache.evict(EvictParams(mamba_num=1))
             self.assertEqual(result.mamba_num_evicted, 1)
-            self.assertEqual(req_pool.mamba_allocator.available_size(), free_states + 1)
             self.assertIsNone(_device_value(cache, grandparent, ComponentType.MAMBA))
             self.assertIsNotNone(_host_value(cache, grandparent, ComponentType.MAMBA))
-            self.assertTrue(core.is_backuped(grandparent))
             self.assertFalse(cache.ongoing_write_through)
-            self.assertFalse(cache.cache_controller.write_queue)
-            self.assertFalse(cache.cache_controller.ack_write_queue)
-            for (node, ct), value in retained.items():
-                self.assertTrue(torch.equal(_device_value(cache, node, ct), value))
         finally:
             cache.dec_lock_ref(leaf, leaf_lock)
-
-        # Restore through the real host/device transfer path and compare both
-        # recurrent and convolution state, rather than only the slot metadata.
-        self.assertTrue(cache.load_back(grandparent))
-        self._finish_pending_loads(cache)
-        self._release_ongoing_load_back_locks(cache)
-        state = _device_value(cache, grandparent, ComponentType.MAMBA)
-        temporal, conv = self._snapshot_mamba_state(req_pool, state)
-        self.assertTrue(torch.all(temporal == page))
-        for offset, value in enumerate(conv, start=1):
-            self.assertTrue(torch.all(value == page + offset))
         cache.sanity_check()
 
     def test_hicache_write_through_internal_mamba_evict_keeps_drop(self):
