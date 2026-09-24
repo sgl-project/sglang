@@ -279,5 +279,5 @@ def encode_simple_chat(
             f"cannot encode chat messages with {getattr(tokenizer, 'name_or_path', tokenizer)!r}."
         )
     return tokenizer.apply_chat_template(
-        messages, add_generation_prompt=True, tokenize=True
+        messages, add_generation_prompt=True, tokenize=True, return_dict=False
     )
