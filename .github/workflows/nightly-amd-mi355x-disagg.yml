@@ -65,7 +65,15 @@ jobs:
             echo "image=$FALLBACK_IMAGE" >> $GITHUB_OUTPUT
           fi
 
-      - name: Record which image this run uses
+      - name: Record what this run tests
+        # A run is an image plus a commit, and a dispatch can set either one
+        # independently. Recording only the image sent me after the wrong
+        # variable: run 35823462425 collapsed to GSM8K 0.03 on glm52 dp8ep8, it
+        # had been dispatched with a ROCm 10 image, and re-running on rocm720
+        # passed -- so I blamed the image. It was the commit. The branch was 92
+        # behind main and missing #40672, which fixes exactly that accuracy bug;
+        # the same case passes on ROCm 10 once the commit is current. Print both,
+        # and say how far behind main the tested commit is.
         env:
           DISPATCH_IMAGE: ${{ inputs.image }}
           RESOLVED_IMAGE: ${{ steps.image.outputs.image }}
@@ -73,6 +81,17 @@ jobs:
           IMAGE="${DISPATCH_IMAGE:-$RESOLVED_IMAGE}"
           echo "### Image" >> "$GITHUB_STEP_SUMMARY"
           echo "\`$IMAGE\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "### Commit" >> "$GITHUB_STEP_SUMMARY"
+          echo "\`$GITHUB_SHA\` on \`$GITHUB_REF_NAME\`" >> "$GITHUB_STEP_SUMMARY"
+          git fetch -q origin main --depth=200 2>/dev/null || true
+          BEHIND=$(git rev-list --count "$GITHUB_SHA"..origin/main 2>/dev/null || echo "")
+          if [ -n "$BEHIND" ] && [ "$BEHIND" -gt 0 ]; then
+            echo "$BEHIND commits behind \`main\`." >> "$GITHUB_STEP_SUMMARY"
+            if [ "$BEHIND" -gt 50 ]; then
+              echo "::warning::tested commit is $BEHIND commits behind main; a failure here may already be fixed upstream"
+            fi
+          fi
 
       - name: Generate benchmark matrix
         id: generate
