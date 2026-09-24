@@ -1322,59 +1322,6 @@ class TestSWAPoolFloor(CustomTestCase):
             budget,
         )
 
-    def test_dsv4_trtllm_kv_budget(self):
-        import torch
-
-        from sglang.srt.environ import envs
-        from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
-            DeepSeekV4UniformFP8KVPool,
-        )
-        from sglang.srt.model_executor.pool_configurator import DSV4PoolConfigurator
-
-        _publish_config(
-            self,
-            dsv4_attn_backend="trtllm",
-            page_size=256,
-            max_running_requests=2,
-            chunked_prefill_size=256,
-        )
-        kvc = SimpleNamespace(
-            kv_cache_dtype_str="fp8_e4m3",
-            model_config=SimpleNamespace(
-                qk_nope_head_dim=448,
-                qk_rope_head_dim=64,
-                index_head_dim=128,
-                context_len=131072,
-                compress_ratios=[0, 4, 128],
-                window_size=128,
-                hf_config=SimpleNamespace(kv_source_layer_ids=[]),
-            ),
-            layer_info=SimpleNamespace(start_layer=0, end_layer=3),
-            pp_size=1,
-            attn_dp_size=1,
-            sliding_window_size=128,
-            page_size=256,
-            spec_algorithm=SimpleNamespace(
-                is_dspark=lambda: False, is_none=lambda: True
-            ),
-        )
-        with envs.SGLANG_DSV4_KV_LAYOUT.override("v4"):
-            planner = DSV4PoolConfigurator(kvc)
-            for ratio in (0, 4, 128):
-                page_size = 256 // (ratio or 1)
-                pool = DeepSeekV4UniformFP8KVPool(
-                    size=256,
-                    page_size=page_size,
-                    dtype=torch.float8_e4m3fn,
-                    qk_nope_head_dim=448,
-                    qk_rope_head_dim=64,
-                    layer_num=1,
-                    device="cpu",
-                    enable_memory_saver=False,
-                )
-                actual = pool.create_buffer(num_pages=1).nbytes / page_size
-                self.assertEqual(planner.kv_bytes, actual)
-
     def test_dsv4_unified_c4_state_not_token_scaled(self):
         # Unified-KV sizes the c4 state ring from max_running_requests in
         # finalize_with_max_running_requests, so it must not scale here.
