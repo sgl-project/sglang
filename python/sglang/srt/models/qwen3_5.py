@@ -25,6 +25,7 @@ import triton
 
 # Layers - Attention
 from sglang.kernels.ops.attention.fla.layernorm_gated import RMSNorm as RMSNormGated
+from sglang.kernels.ops.attention.fla.layernorm_gated import _layer_norm_fwd
 from sglang.kernels.ops.attention.triton_gdn_fused_proj import (
     fused_qkvzba_split_reshape_cat_contiguous,
     qwen3_5_gdn_prefill_projection_views,
@@ -139,6 +140,8 @@ _is_xpu = is_xpu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 if _use_aiter:
     from aiter.tuned_gemm import tgemm
+
+    from sglang.kernels.ops.gemm.smallm_fp8_gfx950 import smallm_fp8_gemm_enabled
 _hip_use_alt_stream = get_bool_env_var("SGLANG_ALT_STREAM") and _is_hip
 _gdn_use_alt_stream = _is_cuda or (
     get_bool_env_var("SGLANG_GDN_QKVZ_BA_ALT_STREAM", "False") and _hip_use_alt_stream
@@ -286,6 +289,21 @@ def _linear_accepts_fp8_tuple(linear: nn.Module) -> bool:
     return quant_method.__class__.__name__ == "Fp8LinearMethod" and (
         getattr(quant_method, "block_quant", False)
         or getattr(quant_method, "use_mxfp8", False)
+    )
+
+
+def _fp8_tuple_input(linear: nn.Module, num_tokens: int) -> bool:
+    """Whether the producer hands ``linear`` a per-token FP8 (q, scale) pair (SGLANG_ROCM_SMALLM_FP8_PROJ)."""
+    scheme = getattr(linear, "scheme", None)
+    return (
+        _use_aiter
+        and 1 <= num_tokens <= 40
+        and type(scheme).__name__ == "QuarkW8A8Fp8"
+        and scheme.per_token
+        and scheme.weight_qscheme == "per_channel"
+        and not torch.compiler.is_compiling()
+        and not get_forward().sp_active
+        and smallm_fp8_gemm_enabled()
     )
 
 
@@ -1060,6 +1078,20 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             core_attn_out_pad[: core_attn_out.shape[0], :] = core_attn_out
             core_attn_out = core_attn_out_pad
 
+        nv = self.num_v_heads // self.attn_tp_size
+        if not use_strided_prefill_z and _fp8_tuple_input(self.out_proj, len(z) // nv):
+            fp8, _, _ = _layer_norm_fwd(
+                core_attn_out,
+                self.norm.weight,
+                None,
+                self.norm.eps,
+                z=z,
+                is_rms_norm=True,
+                activation=self.norm.activation,
+                quant_heads=nv,
+            )
+            return self.out_proj(fp8)[0]
+
         core_attn_out = self.norm(core_attn_out, z)
         core_attn_out = core_attn_out.reshape(z_shape_og)
         core_attn_out = core_attn_out.reshape(
@@ -1584,7 +1616,9 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         attn_output = self.attn(q, k, v, forward_batch)
 
         if self.attn_output_gate:
-            if not _is_npu:
+            if _fp8_tuple_input(self.o_proj, attn_output.shape[0]):
+                attn_output = fused_sigmoid_mul(attn_output, gate, quant=True)
+            elif not _is_npu:
                 attn_output = fused_sigmoid_mul(attn_output, gate, inplace=True)
             else:
                 gate_val = gate.reshape(gate.shape[0], -1) if gate.ndim == 3 else gate
