@@ -1,21 +1,26 @@
-"""FFN-side AFD lifecycle and single-session event loop."""
+"""FFN-side AFD lifecycle and shared-worker session scheduling."""
 
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Optional
 
 import torch
 import zmq
 
 from sglang.srt.afd.afd_config import AFDRole
 from sglang.srt.afd.afd_handshake import (
+    AFDGraphCapturePlan,
+    AFDHandshakeResult,
     AFDHandshakeServer,
     afd_handshake_port,
     build_afd_ffn_capacity_plan,
     build_afd_graph_capture_plan,
 )
-from sglang.srt.afd.afd_sync import AFDSyncMsgReceiver
+from sglang.srt.afd.afd_sync import AFDSyncMsg, AFDSyncMsgReceiver
+from sglang.srt.afd.comm import AFDCommBackend
+from sglang.srt.afd.dispatcher import is_afd_fixed_shape_mode
 from sglang.srt.afd.ffn.compute import AFDFFNCompute
 from sglang.srt.afd.ffn.executor import AFDFFNExecutor
 from sglang.srt.afd.scheduler_common import (
@@ -31,7 +36,7 @@ from sglang.srt.managers.io_struct import (
     sock_recv,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
-from sglang.srt.runtime_context import get_exec, get_serving
+from sglang.srt.runtime_context import get_disagg, get_exec, get_serving
 from sglang.srt.utils.common import broadcast_pyobj
 
 if TYPE_CHECKING:
@@ -119,78 +124,234 @@ def _handle_ffn_scheduler_request(
     return False
 
 
-def event_loop_afd_ffn(scheduler: Scheduler) -> None:
-    rank = scheduler.ps.tp_rank
-    is_rank0 = rank == 0
-    if is_rank0:
-        handshake_server = AFDHandshakeServer(afd_handshake_port(get_serving().port))
-        try:
-            handshake = handshake_server.accept(
-                build_local_handshake_info(scheduler, AFDRole.FFN),
-                use_deepep_low_latency=get_exec().moe.deepep_mode != "normal",
-            )
-        finally:
-            handshake_server.close()
-        if scheduler.ps.tp_size > 1:
-            broadcast_pyobj([handshake], rank, scheduler.tp_cpu_group, src=0)
-    else:
-        (handshake,) = broadcast_pyobj([], rank, scheduler.tp_cpu_group, src=0)
+@dataclass
+class _AFDFFNSession:
+    """One attn instance served by this ffn instance."""
 
-    capacity_plan = build_afd_ffn_capacity_plan(
-        handshake.local,
-        handshake.peer,
-        use_deepep_low_latency=get_exec().moe.deepep_mode != "normal",
+    session_id: int
+    handshake: AFDHandshakeResult
+    plan: AFDGraphCapturePlan
+    backend: AFDCommBackend
+    executor: AFDFFNExecutor
+    receiver: Optional[AFDSyncMsgReceiver] = None  # rank 0 only
+    ffn_graph_variants: dict[int, int] = field(default_factory=dict)
+    ffn_parent_graph_variants: dict[tuple[int, ...], tuple[int, ...]] = field(
+        default_factory=dict
     )
-    compute = scheduler.afd_ffn_compute
-    compute.configure_staged_capacity(capacity_plan)
+
+
+def _build_ffn_session(
+    scheduler: Scheduler, handshake: AFDHandshakeResult, compute
+) -> _AFDFFNSession:
     plan = build_afd_graph_capture_plan(handshake)
     backend = init_afd_comm_backend(scheduler, AFDRole.FFN, handshake)
     executor = AFDFFNExecutor(scheduler, backend, compute, handshake)
     if not plan.enabled:
         compute.capture_compute_graphs()
     executor.capture_communication_graphs(plan)
+    ffn_graph_variants = dict(plan.ffn_graph_variants)
+    ffn_graph_variants.update(
+        {
+            variant.child_wire_capacities[0]: variant.child_compute_capacities[0]
+            for variant in plan.attn_graph_variants
+            if len(variant.child_wire_capacities) == 1
+            and variant.child_compute_capacities[0] is not None
+        }
+    )
+    ffn_parent_graph_variants = {
+        variant.child_wire_capacities: variant.child_compute_capacities
+        for variant in plan.attn_graph_variants
+        if len(variant.child_wire_capacities) > 1
+        and all(capacity is not None for capacity in variant.child_compute_capacities)
+    }
+    return _AFDFFNSession(
+        session_id=handshake.session_id,
+        handshake=handshake,
+        plan=plan,
+        backend=backend,
+        executor=executor,
+        ffn_graph_variants=ffn_graph_variants,
+        ffn_parent_graph_variants=ffn_parent_graph_variants,
+    )
 
-    receiver = None
+
+def _log_ffn_step(session: _AFDFFNSession, compute, msg: AFDSyncMsg, rank: int) -> None:
+    handshake = session.handshake
+    backend = session.backend
+    forward_mode = ForwardMode(msg.forward_mode)
+    graph_capacity = None
+    if (
+        is_afd_fixed_shape_mode(forward_mode)
+        and msg.wire_capacity > 0
+        and not msg.child_wire_capacities
+    ):
+        if msg.communication_graph:
+            graph_capacity = session.ffn_graph_variants.get(msg.wire_capacity)
+        elif not session.plan.enabled:
+            graph_capacity = compute.graph_capacity_for(msg.wire_capacity)
+    if msg.child_wire_capacities:
+        child_compute_capacities = session.ffn_parent_graph_variants.get(
+            tuple(msg.child_wire_capacities)
+        )
+        if msg.communication_graph and child_compute_capacities:
+            graph_capacity = max(child_compute_capacities)
+        if graph_capacity is not None:
+            compute_capacity = graph_capacity
+        elif handshake.local.afd_ffn_moe_backend == "deepep":
+            attn_ranks = backend.config.attn_ranks_for_ffn(
+                rank,
+                scattered=True,
+            )
+            compute_capacity = len(attn_ranks) * max(msg.child_wire_capacities)
+        else:
+            compute_capacity = max(msg.child_wire_capacities)
+    elif graph_capacity is not None:
+        compute_capacity = graph_capacity
+    elif handshake.local.afd_ffn_moe_backend == "deepep":
+        attn_ranks = backend.config.attn_ranks_for_ffn(
+            rank,
+            scattered=True,
+        )
+        compute_capacity = (
+            len(attn_ranks) * msg.wire_capacity
+            if is_afd_fixed_shape_mode(forward_mode)
+            else sum(msg.tokens_per_rank[index] for index in attn_ranks)
+        )
+    else:
+        compute_capacity = msg.wire_capacity
+    compute_graph = graph_capacity is not None
+    logger.info(
+        "AFD step: side=ffn path=staged session=%d session_step=%d mode=%s "
+        "tokens_per_rank=%s total_tokens=%d wire=%d children=%s "
+        "communication_graph=%s compute_graph=%s compute_capacity=%d",
+        session.session_id,
+        msg.step_id,
+        forward_mode.name,
+        msg.tokens_per_rank,
+        sum(msg.tokens_per_rank),
+        msg.wire_capacity,
+        msg.child_wire_capacities,
+        msg.communication_graph,
+        compute_graph,
+        compute_capacity,
+    )
+
+
+def event_loop_afd_ffn(scheduler: Scheduler) -> None:
+    """Ffn-side event loop for AFD steps and scheduler management requests.
+
+    Serves ``--afd-attn-instances`` sessions: all handshakes are collected
+    before serving (static membership), then per-session control messages
+    are multiplexed over one shared ffn compute stream.
+    """
+    rank = scheduler.ps.tp_rank
+    is_rank0 = rank == 0
+    num_sessions = get_disagg().afd_attn_instances
+    compute = scheduler.afd_ffn_compute
+
+    # Negotiate shared capacity before any session captures graphs.
+    if is_rank0:
+        local_info = build_local_handshake_info(
+            scheduler,
+            AFDRole.FFN,
+        )
+        handshake_server = AFDHandshakeServer(afd_handshake_port(get_serving().port))
+        try:
+            handshakes = handshake_server.accept_all(
+                local_info,
+                num_sessions,
+                use_deepep_low_latency=(get_exec().moe.deepep_mode != "normal"),
+            )
+        finally:
+            handshake_server.close()
+        if scheduler.ps.tp_size > 1:
+            broadcast_pyobj([handshakes], rank, scheduler.tp_cpu_group, src=0)
+    else:
+        # Every ffn rank needs the handshake results (topology / negotiated
+        # ports) to build its data-plane comm backends.
+        (handshakes,) = broadcast_pyobj([], rank, scheduler.tp_cpu_group, src=0)
+
+    capacity_plan = build_afd_ffn_capacity_plan(
+        handshakes[0].local,
+        tuple(handshake.peer for handshake in handshakes),
+        use_deepep_low_latency=get_exec().moe.deepep_mode != "normal",
+    )
+    compute.configure_staged_capacity(capacity_plan)
+
+    sessions: list[_AFDFFNSession] = [
+        _build_ffn_session(scheduler, handshake, compute) for handshake in handshakes
+    ]
+
     poller = None
     scheduler_input_socket = None
     if is_rank0:
-        receiver = AFDSyncMsgReceiver(f"tcp://*:{handshake.sync_port}")
         scheduler_input_socket = scheduler.ipc_channels.recv_from_tokenizer
         poller = zmq.Poller()
         poller.register(scheduler_input_socket, zmq.POLLIN)
-        poller.register(receiver.socket, zmq.POLLIN)
-        logger.info("AFD ffn event loop started")
+        for session in sessions:
+            session.receiver = AFDSyncMsgReceiver(
+                f"tcp://*:{session.handshake.sync_port}"
+            )
+            poller.register(session.receiver.socket, zmq.POLLIN)
 
+    if is_rank0:
+        logger.info("AFD ffn event loop started: sessions=%d", num_sessions)
     try:
+        next_session_index = 0
         while True:
             if is_rank0:
                 events = dict(poller.poll())
                 if scheduler_input_socket in events:
-                    action = (False, sock_recv(scheduler_input_socket))
+                    session_id = -1
+                    msg = sock_recv(scheduler_input_socket)
                 else:
-                    action = (True, receiver.recv())
+                    # Round-robin among ready sessions so one busy attn instance
+                    # cannot starve the others.
+                    session_id = None
+                    for probe in range(num_sessions):
+                        session = sessions[(next_session_index + probe) % num_sessions]
+                        if session.receiver.socket in events:
+                            session_id = session.session_id
+                            next_session_index = (session_id + 1) % num_sessions
+                            msg = session.receiver.recv()
+                            break
+                    if session_id is None:
+                        raise RuntimeError("AFD ffn poller returned no readable socket")
                 if scheduler.ps.tp_size > 1:
-                    broadcast_pyobj([action], rank, scheduler.tp_cpu_group, src=0)
+                    broadcast_pyobj(
+                        [(session_id, msg)], rank, scheduler.tp_cpu_group, src=0
+                    )
             else:
-                (action,) = broadcast_pyobj([], rank, scheduler.tp_cpu_group, src=0)
+                ((session_id, msg),) = broadcast_pyobj(
+                    [], rank, scheduler.tp_cpu_group, src=0
+                )
 
-            is_step, msg = action
-            if not is_step:
+            if session_id == -1:
                 if _handle_ffn_scheduler_request(scheduler, msg, is_rank0):
                     break
                 continue
+
+            if not isinstance(msg, AFDSyncMsg):
+                if is_rank0:
+                    logger.warning(
+                        "AFD ffn session %d ignores unsupported control message: %s",
+                        session_id,
+                        type(msg).__name__,
+                    )
+                continue
+
+            session = sessions[session_id]
             if is_rank0 and should_log_step(msg.step_id):
-                logger.info(
-                    "AFD step: side=ffn step=%d mode=%s tokens_per_rank=%s wire=%d",
-                    msg.step_id,
-                    ForwardMode(msg.forward_mode).name,
-                    msg.tokens_per_rank,
-                    msg.wire_capacity,
-                )
-            executor.run_step(msg)
+                _log_ffn_step(session, compute, msg, rank)
+            # The executor keeps step order but skips data-plane I/O for a global
+            # 0-token batch, matching AFDAttnMoE.
+            session.executor.run_step(msg)
+
     finally:
-        if receiver is not None:
-            receiver.close()
-        backend.close()
+        for session in sessions:
+            if session.receiver is not None:
+                session.receiver.close()
+            session.backend.close()
+
     if is_rank0:
         logger.info("AFD ffn event loop exited")

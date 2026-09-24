@@ -79,6 +79,7 @@ class AFDSyncSender:
         self._msg_sender = AFDSyncMsgSender(
             f"tcp://{handshake.dist_host}:{handshake.sync_port}"
         )
+        self._session_id = handshake.session_id
         self._pending: Optional[AFDSyncMsg] = None
 
     def prepare_for_batch(
@@ -106,12 +107,16 @@ class AFDSyncSender:
         msg.communication_graph = communication_graph
         if should_log_step(msg.step_id):
             logger.info(
-                "AFD step: side=attn step=%d mode=%s tokens_per_rank=%s "
-                "wire=%d communication_graph=%s",
+                "AFD step: side=attn path=staged session=%d session_step=%d "
+                "mode=%s tokens_per_rank=%s total_tokens=%d wire=%d children=%s "
+                "communication_graph=%s",
+                self._session_id,
                 msg.step_id,
                 ForwardMode(msg.forward_mode).name,
                 msg.tokens_per_rank,
+                sum(msg.tokens_per_rank),
                 msg.wire_capacity,
+                msg.child_wire_capacities,
                 msg.communication_graph,
             )
         self._msg_sender.send(msg)

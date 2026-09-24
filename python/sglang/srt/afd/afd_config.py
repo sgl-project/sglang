@@ -76,6 +76,8 @@ def check_afd_server_args(server_args: ServerArgs) -> None:
     if role is None:
         if cfg.afd_decode_num_microbatches != 1:
             raise ValueError("--afd-decode-num-microbatches requires --afd-role attn")
+        if cfg.afd_attn_instances != 1:
+            raise ValueError("--afd-attn-instances requires --afd-role ffn")
         if cfg.moe_a2a_backend == "afd":
             raise ValueError("--moe-a2a-backend afd requires --afd-role attn")
         return
@@ -218,6 +220,11 @@ def _check_attn_args(server_args: ServerArgs) -> None:
         )
     if cfg.afd_ffn_addr is None:
         raise ValueError("--afd-ffn-addr is required for --afd-role attn")
+    if cfg.afd_attn_instances != 1:
+        raise ValueError(
+            "--afd-attn-instances is an ffn-side arg declaring how many "
+            "attn instances the ffn instance serves"
+        )
     if cfg.moe_a2a_backend != "afd":
         raise ValueError(
             "AFD attn instance requires the internal MoE backend 'afd'; "
@@ -253,6 +260,8 @@ def _check_ffn_args(server_args: ServerArgs) -> None:
             "--afd-ffn-addr is an attn-side arg pointing at the ffn "
             "instance; the ffn instance itself only needs --afd-role ffn"
         )
+    if cfg.afd_attn_instances < 1:
+        raise ValueError("--afd-attn-instances must be at least 1")
     if cfg.moe_a2a_backend not in ("none", "deepep"):
         raise ValueError(
             "AFD ffn instance supports --moe-a2a-backend none or deepep; "

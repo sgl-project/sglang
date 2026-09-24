@@ -3319,6 +3319,13 @@ class ServerArgs:
         "currently support 1, 2, or 3.",
         NS("disagg"),
     ] = 1
+    afd_attn_instances: A[
+        int,
+        NS("disagg"),
+        "Number of attention instances served by this FFN instance (FFN-side "
+        "argument). All instances must complete their startup handshakes "
+        "before the FFN instance starts serving.",
+    ] = 1
     afd_comm_sm_budget: A[
         Optional[int],
         Arg(

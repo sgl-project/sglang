@@ -48,14 +48,14 @@ def _free_port():
         with socket.socket() as sock:
             sock.bind(("127.0.0.1", 0))
             port = sock.getsockname()[1]
-        if port <= 65535 - 2:
+        if port <= 65535 - 4:
             return port
 
 
-def _accept_handshake(port, info):
+def _accept_handshake(port, info, num_sessions=1):
     with closing(AFDHandshakeServer(port)) as server:
         server._socket.setsockopt(zmq.RCVTIMEO, 5000)
-        return server.accept(info)
+        return server.accept_all(info, num_sessions)
 
 
 class TestAFDControlWireProtocol(unittest.TestCase):
@@ -109,6 +109,29 @@ class TestAFDControlWireProtocol(unittest.TestCase):
 
 
 class TestAFDHandshakeWireProtocol(unittest.TestCase):
+    def test_incompatible_session_rejects_all_collected_peers(self):
+        port = _free_port()
+        infos = [_handshake_info("attn") for _ in range(2)]
+        infos[1].num_ranks = 2
+        with (
+            envs.SGLANG_AFD_HANDSHAKE_TIMEOUT_S.override(5),
+            ThreadPoolExecutor(max_workers=3) as pool,
+        ):
+            server = pool.submit(_accept_handshake, port, _handshake_info("ffn"), 2)
+            clients = [
+                pool.submit(
+                    run_handshake_attn,
+                    f"127.0.0.1:{port - AFD_HANDSHAKE_PORT_DELTA}",
+                    info,
+                )
+                for info in infos
+            ]
+            for future in [server, *clients]:
+                with self.assertRaisesRegex(
+                    RuntimeError, "homogeneous attn instances.*num_ranks"
+                ):
+                    future.result(timeout=10)
+
     def test_microbatch_graph_plan_uses_child_fanin_and_keeps_tiny_batches_serial(self):
         for count in (2, 3):
             with self.subTest(count=count):
@@ -182,12 +205,20 @@ class TestAFDHandshakeWireProtocol(unittest.TestCase):
                     build_afd_graph_capture_plan(handshake)
 
     def test_handshake_roundtrip_agrees_on_endpoints_and_model(self):
-        for num_attn, num_ffn, backend in (
-            (1, 1, "none"),
-            (3, 2, "none"),
-            (2, 3, "deepep"),
+        for num_attn, num_ffn, backend, num_sessions in (
+            (1, 1, "none", 1),
+            (3, 2, "none", 1),
+            (2, 3, "deepep", 1),
+            (1, 1, "none", 2),
+            (3, 2, "none", 2),
+            (2, 3, "deepep", 2),
         ):
-            with self.subTest(num_attn=num_attn, num_ffn=num_ffn, backend=backend):
+            with self.subTest(
+                num_attn=num_attn,
+                num_ffn=num_ffn,
+                backend=backend,
+                num_sessions=num_sessions,
+            ):
                 port = _free_port()
                 ffn_info = _handshake_info("ffn")
                 attn_info = _handshake_info("attn")
@@ -201,28 +232,48 @@ class TestAFDHandshakeWireProtocol(unittest.TestCase):
                 ffn_info.decode_graph_token_buckets = [1]
                 with (
                     envs.SGLANG_AFD_HANDSHAKE_TIMEOUT_S.override(5),
-                    ThreadPoolExecutor(max_workers=1) as pool,
+                    ThreadPoolExecutor(max_workers=num_sessions + 1) as pool,
                 ):
-                    server = pool.submit(_accept_handshake, port, ffn_info)
-                    result = run_handshake_attn(
-                        f"127.0.0.1:{port - AFD_HANDSHAKE_PORT_DELTA}", attn_info
+                    server = pool.submit(
+                        _accept_handshake, port, ffn_info, num_sessions
                     )
-                    peer_result = server.result(timeout=10)
-                self.assertEqual(result.local, attn_info)
-                self.assertEqual(result.peer, ffn_info)
-                self.assertEqual(peer_result.local, ffn_info)
-                self.assertEqual(peer_result.peer, attn_info)
-                self.assertEqual(result.dist_host, "127.0.0.1")
-                self.assertEqual(result.sync_port, port + 1)
-                self.assertEqual(result.dist_port, port + 2)
-                self.assertEqual(result.sync_port, peer_result.sync_port)
-                self.assertEqual(result.dist_port, peer_result.dist_port)
-                fan_in = (
-                    (num_attn + num_ffn - 1) // num_ffn if backend == "deepep" else 1
-                )
-                self.assertEqual(
-                    result.peer.decode_graph_token_buckets, [graph_capacity * fan_in]
-                )
+                    clients = [
+                        pool.submit(
+                            run_handshake_attn,
+                            f"127.0.0.1:{port - AFD_HANDSHAKE_PORT_DELTA}",
+                            attn_info,
+                        )
+                        for _ in range(num_sessions)
+                    ]
+                    peer_results = server.result(timeout=10)
+                    results = sorted(
+                        (client.result(timeout=10) for client in clients),
+                        key=lambda result: result.session_id,
+                    )
+                self.assertEqual(len(peer_results), num_sessions)
+                for session_id, (result, peer_result) in enumerate(
+                    zip(results, peer_results)
+                ):
+                    self.assertEqual(result.session_id, session_id)
+                    self.assertEqual(peer_result.session_id, session_id)
+                    self.assertEqual(result.local, attn_info)
+                    self.assertEqual(result.peer, ffn_info)
+                    self.assertEqual(peer_result.local, ffn_info)
+                    self.assertEqual(peer_result.peer, attn_info)
+                    self.assertEqual(result.dist_host, "127.0.0.1")
+                    self.assertEqual(result.sync_port, port + 1 + 2 * session_id)
+                    self.assertEqual(result.dist_port, port + 2 + 2 * session_id)
+                    self.assertEqual(result.sync_port, peer_result.sync_port)
+                    self.assertEqual(result.dist_port, peer_result.dist_port)
+                    fan_in = (
+                        (num_attn + num_ffn - 1) // num_ffn
+                        if backend == "deepep"
+                        else 1
+                    )
+                    self.assertEqual(
+                        result.peer.decode_graph_token_buckets,
+                        [graph_capacity * fan_in],
+                    )
 
     def test_handshake_rejects_invalid_model_or_graph_capacity_on_both_peers(self):
         for invalid_graph in (False, True):

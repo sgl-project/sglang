@@ -73,6 +73,7 @@ class AFDFFNExecutor:
         handshake: AFDHandshakeResult,
     ):
         self._comm = comm
+        self._session_id = handshake.session_id
         self._compute = compute
         self._device = torch.device(self._comm.config.device)
         self._dtype = scheduler.tp_worker.model_runner.dtype
@@ -160,6 +161,19 @@ class AFDFFNExecutor:
             role="ffn",
             with_router_logits=True,
             num_slots=self._decode_num_microbatches,
+        )
+
+        logger.info(
+            "AFD ffn executor ready: session=%d rank=%d/%d moe_layers=%d "
+            "first_layer=%d last_layer=%d device=%s dtype=%s",
+            self._session_id,
+            self._rank,
+            self._num_ranks,
+            len(self._layers),
+            self._layers[0].layer_id,
+            self._layers[-1].layer_id,
+            self._device,
+            self._dtype,
         )
 
     def capture_communication_graphs(self, plan: AFDGraphCapturePlan) -> None:

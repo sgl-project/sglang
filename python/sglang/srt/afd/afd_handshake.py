@@ -12,7 +12,7 @@ import hashlib
 import logging
 import os
 from dataclasses import dataclass, field
-from typing import Tuple
+from typing import Sequence, Tuple
 
 import msgspec
 import zmq
@@ -26,6 +26,7 @@ logger = logging.getLogger(__name__)
 AFD_HANDSHAKE_PORT_DELTA = 300
 SYNC_PORT_OFFSET = 1
 DIST_PORT_OFFSET = 2
+SESSION_PORT_STRIDE = 2
 
 
 @dataclass
@@ -56,6 +57,7 @@ class _HandshakeReply(msgspec.Struct, tag="reply", forbid_unknown_fields=True):
     dist_host: str
     sync_port: int
     dist_port: int
+    session_id: int = 0
 
 
 class _HandshakeError(msgspec.Struct, tag="error", forbid_unknown_fields=True):
@@ -73,6 +75,7 @@ class AFDHandshakeResult:
     dist_host: str
     sync_port: int
     dist_port: int
+    session_id: int = 0
 
 
 @dataclass(frozen=True)
@@ -160,27 +163,41 @@ def _build_attn_graph_shapes(
 
 def build_afd_ffn_capacity_plan(
     ffn: AFDHandshakeInfo,
-    attn: AFDHandshakeInfo,
+    attn_members: Sequence[AFDHandshakeInfo],
     use_deepep_low_latency: bool,
 ) -> AFDFFNCapacityPlan:
     """Derive staged F graph and DeepEP capacities from A admission limits."""
+    graph_enabled = bool(ffn.decode_graph_token_buckets)
     scattered = ffn.afd_ffn_moe_backend == "deepep"
-    fan_in = (attn.num_ranks + ffn.num_ranks - 1) // ffn.num_ranks if scattered else 1
-    graph_capacities = {
-        child_capacity * fan_in
-        for _, _, child_capacities in _build_attn_graph_shapes(attn)
-        for child_capacity in child_capacities
-    }
-    graph_max_capacity = max(graph_capacities, default=0)
+    graph_capacities: set[int] = set()
+    graph_maxima: list[int] = []
+    dispatch_maxima: list[int] = []
+
+    for attn in attn_members:
+        fan_in = (
+            (attn.num_ranks + ffn.num_ranks - 1) // ffn.num_ranks if scattered else 1
+        )
+        session_graph_capacities = {
+            child_wire_capacity * fan_in
+            for _, _, child_wire_capacities in _build_attn_graph_shapes(attn)
+            for child_wire_capacity in child_wire_capacities
+        }
+        graph_capacities.update(session_graph_capacities)
+        graph_maxima.append(max(session_graph_capacities, default=0))
+        if scattered and use_deepep_low_latency and attn.decode_token_buckets:
+            dispatch_maxima.append(max(attn.decode_token_buckets) * fan_in)
+
+    graph_max_capacity = max(graph_maxima, default=0)
     deepep_dispatch_limit = None
-    if scattered and use_deepep_low_latency and attn.decode_token_buckets:
-        deepep_dispatch_limit = max(attn.decode_token_buckets) * fan_in
-        if deepep_dispatch_limit > 1024:
+    if scattered and dispatch_maxima:
+        max_single_session = max(dispatch_maxima)
+        if max_single_session > 1024:
             raise RuntimeError(
                 "AFD SCATTERED requires at most 1024 DeepEP dispatch tokens "
                 "per rank for one attn session; "
-                f"required={deepep_dispatch_limit}"
+                f"required={max_single_session}"
             )
+        deepep_dispatch_limit = max_single_session
         # Preserve native DeepEP's default capacity for small admission limits;
         # shrinking its expert buffers can produce incorrect masked-GEMM results.
         deepep_dispatch_limit = max(
@@ -193,10 +210,18 @@ def build_afd_ffn_capacity_plan(
             for capacity in graph_capacities
             if capacity <= deepep_dispatch_limit
         }
-    if not ffn.decode_graph_token_buckets or not graph_max_capacity:
+
+    if not graph_enabled or not graph_max_capacity:
         graph_buckets: tuple[int, ...] = ()
     elif ffn.disable_cuda_graph_padding:
-        graph_buckets = tuple(sorted(graph_capacities))
+        exact_capacities = set(graph_capacities)
+        graph_buckets = tuple(
+            sorted(
+                capacity
+                for capacity in exact_capacities
+                if 0 < capacity <= graph_max_capacity
+            )
+        )
     else:
         graph_buckets = tuple(
             build_decode_token_buckets(
@@ -205,6 +230,7 @@ def build_afd_ffn_capacity_plan(
                 wire_token_multiplier=1,
             )
         )
+
     return AFDFFNCapacityPlan(
         graph_token_buckets=graph_buckets,
         deepep_dispatch_limit=deepep_dispatch_limit,
@@ -410,6 +436,26 @@ def _check_moe_layers_compatible(attn: list[dict], ffn: list[dict]) -> None:
             )
 
 
+def _check_attn_members_compatible(
+    attn_members: tuple[AFDHandshakeInfo, ...],
+) -> None:
+    baseline = attn_members[0]
+    fields = (
+        "num_ranks",
+        "decode_token_buckets",
+        "decode_graph_token_buckets",
+        "disable_cuda_graph_padding",
+        "decode_num_microbatches",
+    )
+    for session_id, member in enumerate(attn_members[1:], start=1):
+        for name in fields:
+            if getattr(member, name) != getattr(baseline, name):
+                raise RuntimeError(
+                    "AFD requires homogeneous attn instances: "
+                    f"session={session_id}, field={name}"
+                )
+
+
 def run_handshake_attn(ffn_addr: str, local: AFDHandshakeInfo) -> AFDHandshakeResult:
     """Attn side (global sender rank only): connect and exchange info."""
     host, api_port = parse_ffn_addr(ffn_addr)
@@ -438,12 +484,14 @@ def run_handshake_attn(ffn_addr: str, local: AFDHandshakeInfo) -> AFDHandshakeRe
             dist_host=reply.dist_host,
             sync_port=reply.sync_port,
             dist_port=reply.dist_port,
+            session_id=reply.session_id,
         )
         logger.info(
-            "AFD handshake done: peer_role=%s peer_ranks=%d model=%s",
+            "AFD handshake done: peer_role=%s peer_ranks=%d model=%s session=%d",
             peer.role,
             peer.num_ranks,
             local.model_identity,
+            result.session_id,
         )
         return result
     finally:
@@ -451,7 +499,12 @@ def run_handshake_attn(ffn_addr: str, local: AFDHandshakeInfo) -> AFDHandshakeRe
 
 
 class AFDHandshakeServer:
-    """FFN rank zero accepts one attention instance before serving steps."""
+    """Ffn side (rank 0 only): bind once, accept all sessions in one round.
+
+    Uses a ROUTER socket so every attn peer's request can be collected before
+    any reply is sent. Sessions are numbered in handshake-arrival order.
+    Each session uses dedicated control and data-plane rendezvous ports.
+    """
 
     def __init__(self, port: int):
         self._port = port
@@ -459,53 +512,91 @@ class AFDHandshakeServer:
             zmq.Context.instance(), zmq.ROUTER, f"tcp://*:{port}", bind=True
         )
 
-    def accept(
-        self, local: AFDHandshakeInfo, *, use_deepep_low_latency: bool = False
-    ) -> AFDHandshakeResult:
-        logger.info("AFD handshake: waiting for attn peer on port %d", self._port)
-        identity, _, payload = self._socket.recv_multipart()
+    def accept_all(
+        self,
+        local: AFDHandshakeInfo,
+        num_sessions: int = 1,
+        use_deepep_low_latency: bool = False,
+    ) -> list[AFDHandshakeResult]:
+        pending: list[tuple[bytes, AFDHandshakeInfo, str]] = []
+        while len(pending) < num_sessions:
+            logger.info(
+                "AFD handshake: waiting for attn peer %d/%d on port %d ...",
+                len(pending) + 1,
+                num_sessions,
+                self._port,
+            )
+            identity, _, payload = self._socket.recv_multipart()
+            try:
+                request = _handshake_request_decoder.decode(payload)
+                peer = request.info
+                _check_compatible(local, peer)
+            except (msgspec.DecodeError, RuntimeError) as e:
+                self._reply_error_all(
+                    [identity] + [entry[0] for entry in pending], str(e)
+                )
+                raise
+            pending.append((identity, peer, request.dist_host))
+
+        attn_infos = tuple(peer for _, peer, _ in pending)
         try:
-            request = _handshake_request_decoder.decode(payload)
-            peer = request.info
-            _check_compatible(local, peer)
+            _check_attn_members_compatible(attn_infos)
             capacity_plan = build_afd_ffn_capacity_plan(
-                local, peer, use_deepep_low_latency
+                local,
+                attn_infos,
+                use_deepep_low_latency,
             )
             local.decode_graph_token_buckets = list(capacity_plan.graph_token_buckets)
-        except (msgspec.DecodeError, RuntimeError, ValueError) as exc:
-            self._socket.send_multipart(
-                [identity, b"", msgspec.msgpack.encode(_HandshakeError(str(exc)))]
-            )
+        except (RuntimeError, TypeError, ValueError) as e:
+            self._reply_error_all([entry[0] for entry in pending], str(e))
             raise
 
-        result = AFDHandshakeResult(
-            local=local,
-            peer=peer,
-            dist_host=request.dist_host,
-            sync_port=self._port + SYNC_PORT_OFFSET,
-            dist_port=self._port + DIST_PORT_OFFSET,
-        )
-        self._socket.send_multipart(
-            [
-                identity,
-                b"",
-                msgspec.msgpack.encode(
-                    _HandshakeReply(
-                        info=local,
-                        dist_host=result.dist_host,
-                        sync_port=result.sync_port,
-                        dist_port=result.dist_port,
-                    )
-                ),
-            ]
-        )
-        logger.info(
-            "AFD handshake done: peer_role=%s peer_ranks=%d model=%s",
-            peer.role,
-            peer.num_ranks,
-            local.model_identity,
-        )
-        return result
+        results: list[AFDHandshakeResult] = []
+        for session_id, (identity, peer, dist_host) in enumerate(pending):
+            sync_port = self._port + SYNC_PORT_OFFSET + SESSION_PORT_STRIDE * session_id
+            dist_port = self._port + DIST_PORT_OFFSET
+            dist_port += SESSION_PORT_STRIDE * session_id
+            self._socket.send_multipart(
+                [
+                    identity,
+                    b"",
+                    msgspec.msgpack.encode(
+                        _HandshakeReply(
+                            info=local,
+                            dist_host=dist_host,
+                            sync_port=sync_port,
+                            dist_port=dist_port,
+                            session_id=session_id,
+                        )
+                    ),
+                ]
+            )
+            logger.info(
+                "AFD handshake done: peer_role=%s peer_ranks=%d model=%s session=%d",
+                peer.role,
+                peer.num_ranks,
+                local.model_identity,
+                session_id,
+            )
+            results.append(
+                AFDHandshakeResult(
+                    local=local,
+                    peer=peer,
+                    dist_host=dist_host,
+                    sync_port=sync_port,
+                    dist_port=dist_port,
+                    session_id=session_id,
+                )
+            )
+        return results
+
+    def _reply_error_all(self, identities: list[bytes], error: str) -> None:
+        """Fail every collected attn peer fast instead of leaving it to
+        time out waiting for a reply that will never come."""
+        for identity in identities:
+            self._socket.send_multipart(
+                [identity, b"", msgspec.msgpack.encode(_HandshakeError(error))]
+            )
 
     def close(self) -> None:
         self._socket.close(linger=0)

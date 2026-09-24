@@ -476,7 +476,9 @@ class TestAFDEagerRoundtrip(unittest.TestCase):
         ffn = AFDHandshakeInfo("ffn", "model", 2, "nccl", "deepep", "float32", [])
         attn.decode_graph_token_buckets = [32, 64]
         ffn.decode_graph_token_buckets = [1]
-        plan = build_afd_ffn_capacity_plan(ffn, attn, use_deepep_low_latency=True)
+        plan = build_afd_ffn_capacity_plan(
+            ffn, (attn, attn), use_deepep_low_latency=True
+        )
         self.assertEqual(plan.graph_token_buckets, (64, 128))
         self.assertEqual(plan.deepep_dispatch_limit, 192)
         inners = [
@@ -506,17 +508,17 @@ class TestAFDEagerRoundtrip(unittest.TestCase):
             )
         attn.decode_token_buckets = [32, 64, 512]
         self.assertEqual(
-            build_afd_ffn_capacity_plan(ffn, attn, True).deepep_dispatch_limit, 1024
+            build_afd_ffn_capacity_plan(ffn, (attn,), True).deepep_dispatch_limit, 1024
         )
         attn.decode_token_buckets = [32, 64, 513]
         with self.assertRaisesRegex(RuntimeError, "required=1026"):
-            build_afd_ffn_capacity_plan(ffn, attn, True)
+            build_afd_ffn_capacity_plan(ffn, (attn,), True)
         self.assertIsNone(
-            build_afd_ffn_capacity_plan(ffn, attn, False).deepep_dispatch_limit
+            build_afd_ffn_capacity_plan(ffn, (attn,), False).deepep_dispatch_limit
         )
         attn.decode_graph_token_buckets = []
         self.assertEqual(
-            build_afd_ffn_capacity_plan(ffn, attn, False).graph_token_buckets, ()
+            build_afd_ffn_capacity_plan(ffn, (attn,), False).graph_token_buckets, ()
         )
 
     def test_staged_fixed_buffer_padding_reuse_and_prefill_exact_size(self):
@@ -708,7 +710,9 @@ class TestAFDSchedulerRouting(unittest.TestCase):
             (AFDGraphCaptureVariant(4, 4, (4,), (4,)),)
         )
         with patch("sglang.srt.afd.afd_scheduler.AFDSyncMsgSender") as transport:
-            sender = AFDSyncSender(SimpleNamespace(dist_host="localhost", sync_port=1))
+            sender = AFDSyncSender(
+                SimpleNamespace(dist_host="localhost", sync_port=1, session_id=0)
+            )
         for capacity, can_run_graph, expected in (
             (4, True, True),
             (4, False, False),
