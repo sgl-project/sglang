@@ -93,6 +93,7 @@ jobs:
         run: |
           python3 -m pytest -q tools/sglang-simulator/test/test_optional_aisimulate.py
           OMP_NUM_THREADS=2 python3 -m pytest -q tools/sglang-simulator/test/test_train_latency_model.py
+          python3 -m pytest -q test/registered/unit/simulator/test_prefetch_progress.py
           python3 -m pytest -q tools/sglang-simulator/test/test_simulation_sglang_runner.py
           python3 -m pytest -q tools/sglang-simulator/test/test_simulation_sglang_serving.py
           python3 -m pytest -q tools/sglang-simulator/test/test_simulation_cache_hit_ratio.py
