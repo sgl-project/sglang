@@ -69,9 +69,11 @@ from sglang.srt.managers.data_parallel_controller import (
 )
 from sglang.srt.managers.detokenizer_manager import run_detokenizer_process
 from sglang.srt.managers.io_struct import (
+    BeginWeightUpdateReqInput,
     CloseSessionReqInput,
     DestroyWeightsUpdateGroupReqInput,
     EmbeddingReqInput,
+    EndWeightUpdateReqInput,
     GenerateReqInput,
     GetWeightsByNameReqInput,
     InitWeightsUpdateGroupReqInput,
@@ -730,15 +732,8 @@ class Engine(EngineScoreMixin, EngineBase):
                 "--dist-init-addr so all nodes rendezvous at the same endpoint."
             )
 
-        tp_size = get_parallel().tp_size
-
         pp_rank_range, tp_rank_range, pp_size_per_node, tp_size_per_node = (
-            _calculate_rank_ranges(
-                get_parallel().nnodes,
-                get_parallel().pp_size,
-                tp_size,
-                get_parallel().node_rank,
-            )
+            _calculate_rank_ranges(get_parallel().node_rank)
         )
 
         # Build the distributed init method (multi-node uses the user-provided
@@ -902,12 +897,7 @@ class Engine(EngineScoreMixin, EngineBase):
             scheduler_pipe_readers = []
 
             pp_rank_range, tp_rank_range, pp_size_per_node, tp_size_per_node = (
-                _calculate_rank_ranges(
-                    get_parallel().nnodes,
-                    get_parallel().pp_size,
-                    get_parallel().tp_size,
-                    get_parallel().node_rank,
-                )
+                _calculate_rank_ranges(get_parallel().node_rank)
             )
 
             for pp_rank in pp_rank_range:
@@ -918,9 +908,6 @@ class Engine(EngineScoreMixin, EngineBase):
                         + ((pp_rank % pp_size_per_node) * tp_size_per_node)
                         + (tp_rank % tp_size_per_node) * get_device().gpu_id_step
                     )
-                    attn_cp_rank, moe_dp_rank, moe_ep_rank = _compute_parallelism_ranks(
-                        tp_rank
-                    )
 
                     with maybe_reindex_device_id(gpu_id) as gpu_id:
                         proc = mp.Process(
@@ -930,9 +917,6 @@ class Engine(EngineScoreMixin, EngineBase):
                                 port_args,
                                 gpu_id,
                                 tp_rank,
-                                attn_cp_rank,
-                                moe_dp_rank,
-                                moe_ep_rank,
                                 pp_rank,
                                 None,
                                 writer,
@@ -1555,6 +1539,20 @@ class Engine(EngineScoreMixin, EngineBase):
             self.tokenizer_manager.destroy_weights_update_group(obj, None)
         )
 
+    def begin_weight_update(self, selector: str = "all"):
+        """Open a weight-update session; close it with end_weight_update()."""
+        obj = BeginWeightUpdateReqInput(selector=selector)
+        return self.loop.run_until_complete(
+            self.tokenizer_manager.begin_weight_update(obj, None)
+        )
+
+    def end_weight_update(self):
+        """Close the session and finalize quantized weights into kernel layout."""
+        obj = EndWeightUpdateReqInput()
+        return self.loop.run_until_complete(
+            self.tokenizer_manager.end_weight_update(obj, None)
+        )
+
     def update_weights_from_distributed(
         self,
         names: list[str],
@@ -1925,15 +1923,13 @@ def _wait_for_scheduler_ready(
     return scheduler_infos
 
 
-def _calculate_rank_ranges(
-    nnodes: int, pp_size: int, tp_size: int, node_rank: int
-) -> Tuple[range, range, int, int]:
+def _calculate_rank_ranges(node_rank: int) -> Tuple[range, range, int, int]:
     """Calculate pp_rank_range and tp_rank_range for a given node.
 
+    `node_rank` stays an argument because the Ray launchers size every node
+    from the driver, not just their own.
+
     Args:
-        nnodes: Total number of nodes.
-        pp_size: Pipeline parallel size.
-        tp_size: Tensor parallel size.
         node_rank: The rank of the node to compute ranges for.
 
     Returns:
@@ -1943,15 +1939,17 @@ def _calculate_rank_ranges(
         - pp_size_per_node: number of PP ranks per node.
         - tp_size_per_node: number of TP ranks per node.
     """
-    pp_size_per_node = max(pp_size // nnodes, 1)
-    nnodes_per_pp_rank = max(nnodes // pp_size, 1)
+    parallel = get_parallel()
+    nnodes = parallel.nnodes
+    pp_size_per_node = max(parallel.pp_size // nnodes, 1)
+    nnodes_per_pp_rank = max(nnodes // parallel.pp_size, 1)
     pp_rank_range = range(
         pp_size_per_node * (node_rank // nnodes_per_pp_rank),
         pp_size_per_node * (node_rank // nnodes_per_pp_rank + 1),
     )
 
     nnodes_per_tp_group = nnodes_per_pp_rank
-    tp_size_per_node = tp_size // nnodes_per_tp_group
+    tp_size_per_node = parallel.tp_size // nnodes_per_tp_group
     tp_rank_range = range(
         tp_size_per_node * (node_rank % nnodes_per_tp_group),
         tp_size_per_node * (node_rank % nnodes_per_tp_group + 1),
@@ -1963,12 +1961,7 @@ def _calculate_rank_ranges(
 def node_hosts_rust_server() -> bool:
     """Whether this node contains a Rust listener rank, assuming Rust mode."""
     parallel = get_parallel()
-    pp_rank_range, tp_rank_range, _, _ = _calculate_rank_ranges(
-        parallel.nnodes,
-        parallel.pp_size,
-        parallel.tp_size,
-        parallel.node_rank,
-    )
+    pp_rank_range, tp_rank_range, _, _ = _calculate_rank_ranges(parallel.node_rank)
     if 0 not in pp_rank_range:
         return False
 
@@ -1983,28 +1976,3 @@ def node_hosts_rust_server() -> bool:
         if rank_within_dp_group == 0:
             return True
     return False
-
-
-def _compute_parallelism_ranks(tp_rank: int) -> Tuple[int, int, int]:
-    """Compute attention-CP, MoE-DP, and MoE-EP ranks for a TP rank.
-
-    Called while the launcher is deciding what to spawn, so the sizes are the
-    configured ones -- the groups this is laying out do not exist yet.
-    """
-    attn_dp_size = get_parallel().dp_size if get_parallel().enable_dp_attention else 1
-    tp_size = get_parallel().tp_size
-    attn_cp_size = get_parallel().attn_cp_size
-    moe_dp_size = get_parallel().moe_dp_size
-
-    # Parallelism hierarchy (outermost to innermost):
-    # - Attention: Global(TP) -> DP -> ATTN_CP -> ATTN_TP (innermost)
-    # - MoE: Global(TP) -> MOE_DP -> EP -> MOE_TP (innermost)
-    attn_tp_size = tp_size // attn_dp_size // attn_cp_size
-    attn_cp_rank = (tp_rank // attn_tp_size) % attn_cp_size
-    moe_dp_rank = tp_rank // (tp_size // moe_dp_size)
-    moe_ep_rank = (
-        tp_rank
-        % (tp_size // moe_dp_size)
-        // (tp_size // moe_dp_size // get_parallel().ep_size)
-    )
-    return attn_cp_rank, moe_dp_rank, moe_ep_rank

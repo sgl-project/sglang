@@ -412,6 +412,24 @@ class TestGenerateReqInputNormalization(CustomTestCase):
             rid=["id1", "id2"],
         )
 
+    def test_sampling_logprobs_mode_normalization(self):
+        default_req = copy.deepcopy(self.base_req)
+        default_req.normalize_batch_and_arguments()
+        self.assertEqual(default_req.sampling_logprobs_mode, [None, None])
+
+        req = copy.deepcopy(self.base_req)
+        req.return_sampling_mask = [True, True]
+        req.sampling_logprobs_mode = ["selected", "support"]
+
+        req.normalize_batch_and_arguments()
+
+        self.assertEqual(
+            req.sampling_logprobs_mode,
+            ["selected", "support"],
+        )
+        self.assertEqual(req[0].sampling_logprobs_mode, "selected")
+        self.assertEqual(req[1].sampling_logprobs_mode, "support")
+
     def test_single_image_to_list_of_lists(self):
         """Test that a single image is converted to a list of single-image lists."""
         req = copy.deepcopy(self.base_req)
