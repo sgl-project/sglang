@@ -86,30 +86,3 @@ def make_row_source(
             read_bytes=clipped,
         ),
     )
-
-
-def make_packed_source(
-    *,
-    page_buffer: torch.Tensor,
-    page_size: int,
-    bytes_per_token: int,
-    read_bytes: int,
-) -> Tuple[RealKvSource, ...]:
-    if read_bytes == 0 or page_buffer.numel() == 0:
-        return ()
-    flat = page_buffer.contiguous().view(torch.uint8)
-    if flat.ndim == 1:
-        flat = flat.reshape(1, -1)
-    clipped = _clip_read_bytes_aligned(
-        requested=read_bytes, num_bytes_per_token=bytes_per_token
-    )
-    if clipped == 0:
-        return ()
-    return (
-        RealKvSource(
-            tensor=flat,
-            page_size=page_size,
-            num_bytes_per_token=bytes_per_token,
-            read_bytes=clipped,
-        ),
-    )
