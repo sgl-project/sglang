@@ -1,4 +1,5 @@
 import logging
+import re
 from contextlib import nullcontext
 from functools import partial
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
@@ -1450,14 +1451,19 @@ class Glm5NextForConditionalGeneration(nn.Module):
                     "mlp.shared_experts",
                     f"mlp.experts.{self.config.n_routed_experts}",
                 )
-            if not is_nextn and hasattr(self.config, "num_nextn_predict_layers"):
-                num_nextn_layers = self.config.num_nextn_predict_layers
-                if num_nextn_layers > 0:
-                    import re
-
-                    match = re.search(r"layers\.(\d+)", name)
-                    if match and int(match.group(1)) >= self.config.num_hidden_layers:
-                        continue
+            if not is_nextn:
+                if hasattr(self.config, "num_nextn_predict_layers"):
+                    num_nextn_layers = self.config.num_nextn_predict_layers
+                    if num_nextn_layers > 0:
+                        # Checkpoints ship the MTP block under several prefixes
+                        # (model.layers.N., language_model.layers.N., layers.N.);
+                        # parse the index instead of matching a literal prefix.
+                        match = re.search(r"layers\.(\d+)", name)
+                        if (
+                            match
+                            and int(match.group(1)) >= self.config.num_hidden_layers
+                        ):
+                            continue
             else:
                 if not name.startswith(nextn_layer_prefix):
                     continue
