@@ -34,6 +34,7 @@ from sglang.srt.runtime_context import (
     get_context,
     get_disagg,
     get_observability,
+    get_parallel,
     get_schedule,
     get_serving,
 )
@@ -1102,42 +1103,42 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
         cls,
         *,
         server_args: ServerArgs,
-        ps: Any,
-        tp_rank: int,
-        pp_rank: int,
-        dp_rank: Optional[int],
         enable_priority_scheduling: bool,
         enable_lora: bool,
         enable_hierarchical_cache: bool,
     ) -> SchedulerMetricsCollectorContext:
         enable_metrics = get_observability().enable_metrics
-        is_stats_logging_rank = ps.attn_tp_rank == 0
+        parallel = get_parallel()
+        is_stats_logging_rank = parallel.attn_tp_rank == 0
         current_scheduler_metrics_enabled = enable_metrics and (
             is_stats_logging_rank
             or get_observability().enable_metrics_for_all_schedulers
         )
         enable_kv_cache_events = bool(
             get_observability().kv_events_config
-            and ps.pp_rank == 0
-            and ps.attn_tp_rank == 0
-            and ps.attn_cp_rank == 0
+            and get_parallel().pp_rank == 0
+            and parallel.attn_tp_rank == 0
+            and parallel.attn_cp_rank == 0
         )
         collector: Optional[SchedulerMetricsCollector] = None
         if enable_metrics:
-            engine_type = DisaggregationMode.to_engine_type(
-                get_disagg().disaggregation_mode
+            # Keep one metric series across role flips.
+            engine_type = (
+                "dynamic"
+                if get_disagg().enable_pd_role_switch
+                else DisaggregationMode.to_engine_type(get_disagg().disaggregation_mode)
             )
             labels = {
                 "model_name": get_serving().served_model_name,
                 "engine_type": engine_type,
-                "tp_rank": tp_rank,
-                "pp_rank": pp_rank,
-                "moe_ep_rank": ps.moe_ep_rank,
+                "tp_rank": parallel.tp_rank,
+                "pp_rank": parallel.pp_rank,
+                "moe_ep_rank": parallel.moe_ep_rank,
             }
             if enable_priority_scheduling:
                 labels["priority"] = ""
-            if dp_rank is not None:
-                labels["dp_rank"] = dp_rank
+            if parallel.dp_rank is not None:
+                labels["dp_rank"] = parallel.dp_rank
             if get_observability().extra_metric_labels:
                 labels.update(get_observability().extra_metric_labels)
             scheduler_collector_cls = resolve_collector_class(

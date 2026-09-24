@@ -95,7 +95,6 @@ from starlette.routing import Mount
 from torch import nn
 from torch.library import Library
 from torch.utils._contextlib import _DecoratorContextManager
-from torchvision.io import decode_jpeg
 from typing_extensions import Literal
 
 from sglang.srt.environ import envs
@@ -266,8 +265,10 @@ def _check_cuda_device_version(
 ):
     if not is_cuda():
         return False
+    # get_device_sm() answers from NVML while torch.cuda is uninitialized, so
+    # the platform probes evaluated at import time do not create a CUDA context.
     return (
-        torch.cuda.get_device_capability()[0] in device_capability_majors
+        get_device_sm() // 10 in device_capability_majors
         and tuple(map(int, torch.version.cuda.split(".")[:2])) >= cuda_version
     )
 
@@ -558,6 +559,16 @@ def is_pin_memory_available(device=None) -> bool:
     return current_platform.is_pin_memory_available(device)
 
 
+def async_d2h(tensor: torch.Tensor) -> torch.Tensor:
+    """Enqueue a CUDA-to-pinned-host copy on the current stream."""
+    if not tensor.is_cuda:
+        return tensor.to("cpu", non_blocking=True)
+    host = torch.empty(tensor.shape, dtype=tensor.dtype, pin_memory=True)
+    host.copy_(tensor, non_blocking=True)
+    tensor.record_stream(torch.cuda.current_stream(tensor.device))
+    return host
+
+
 def get_dispatch_device_backend():
     if is_cuda_alike():
         dispatch_key = "CUDA"
@@ -572,6 +583,16 @@ def get_dispatch_device_backend():
 
 @lru_cache(maxsize=1)
 def get_device_module():
+    # Resolve from the platform checks: torch.get_device_module() with no
+    # argument initializes the CUDA runtime, which poisons fork() startup.
+    if is_cuda() or is_hip():
+        return torch.cuda
+    if is_npu():
+        return torch.npu
+    if is_xpu():
+        return torch.xpu
+    if is_musa():
+        return torch.musa
     return torch.get_device_module()
 
 
@@ -585,6 +606,17 @@ def create_device_stream(device):
 def device_stream_context(stream):
     """Return the appropriate stream context manager for ``stream``."""
     return torch.get_device_module(stream.device).stream(stream)
+
+
+def is_device_stream_capturing(device: torch.device) -> bool:
+    """Whether ``device``'s current stream is mid graph capture (False if unsupported)."""
+    # Every platform answering support_cuda_graph() already calls
+    # device_module.is_current_stream_capturing() during capture, so it cannot be missing.
+    if device.type != current_platform.device_type:
+        return False
+    if not current_platform.support_cuda_graph():
+        return False
+    return torch.get_device_module(device).is_current_stream_capturing()
 
 
 def get_amdgpu_memory_capacity():
@@ -620,8 +652,55 @@ def get_amdgpu_memory_capacity():
         )
 
 
+def _get_device_sm_via_nvml() -> Optional[int]:
+    # Compute capability of torch device 0, read while torch.cuda stays
+    # uninitialized; None when NVML cannot answer and the caller falls back.
+    try:
+        import pynvml
+    except ImportError:
+        logger.debug("get_device_sm: pynvml is not installed, using torch.cuda")
+        return None
+    # Private torch API, read defensively: it maps the torch ordinal to the NVML
+    # index under CUDA_VISIBLE_DEVICES / MIG; absent or failing -> fall back.
+    getter = getattr(torch.cuda, "_get_nvml_device_index", None)
+    if getter is None:
+        logger.debug(
+            "get_device_sm: torch.cuda._get_nvml_device_index is missing, "
+            "using torch.cuda"
+        )
+        return None
+    try:
+        idx = getter(0)
+    except Exception:
+        logger.debug(
+            "get_device_sm: torch.cuda._get_nvml_device_index(0) failed, "
+            "using torch.cuda",
+            exc_info=True,
+        )
+        return None
+    try:
+        pynvml.nvmlInit()
+        try:
+            handle = pynvml.nvmlDeviceGetHandleByIndex(idx)
+            major, minor = pynvml.nvmlDeviceGetCudaComputeCapability(handle)
+        finally:
+            pynvml.nvmlShutdown()
+        return major * 10 + minor
+    except Exception:
+        logger.debug(
+            "get_device_sm: NVML query failed, using torch.cuda", exc_info=True
+        )
+        return None
+
+
 def get_device_sm():
     if torch.cuda.is_available() or is_musa():
+        # Called at import time (e.g. by the DeepGEMM configurer): initializing
+        # torch.cuda here would create a context and poison fork() startup.
+        if not is_musa() and not torch.cuda.is_initialized():
+            sm = _get_device_sm_via_nvml()
+            if sm is not None:
+                return sm
         major, minor = torch.cuda.get_device_capability()
         return major * 10 + minor
     return 0
@@ -1200,6 +1279,13 @@ class Range(NamedTuple):
     @property
     def length(self) -> int:
         return self.end - self.start
+
+
+def assert_int64_array(values: array, name: str) -> None:
+    """Require a signed int64 array suitable for zero-copy tensor views."""
+    assert (
+        isinstance(values, array) and values.typecode == "q" and values.itemsize == 8
+    ), f"{name} must be array('q') with 8-byte items"
 
 
 def flatten_arrays_to_pinned_cpu(parts: List[array[int]], pin: bool) -> torch.Tensor:
@@ -1849,6 +1935,8 @@ def _load_image(
                 )
 
                 return decode_jpeg_with_fancy_upsampling(image_bytes)
+            from torchvision.io import decode_jpeg  # lazy: ~1 s of torch._dynamo
+
             encoded_image = torch.frombuffer(image_bytes, dtype=torch.uint8)
             image_tensor = decode_jpeg(encoded_image, device="cuda")
             return image_tensor
@@ -2050,8 +2138,25 @@ def encode_video(video_path, frame_count_limit=None):
     return frames
 
 
+def configure_hf_hub_logger():
+    """Route Hugging Face Hub messages through the application's logger once."""
+    from huggingface_hub.utils import logging as hf_logging
+
+    # CLI model detection can contact Hub before configure_logger runs.
+    # basicConfig leaves any existing application logging setup intact.
+    logging.basicConfig(format="[%(asctime)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
+    hub_logger = hf_logging.get_logger()
+    for handler in hub_logger.handlers[:]:
+        # Hub installs a plain StreamHandler and also propagates to the root.
+        # Keep file handlers and custom handler subclasses intact.
+        if type(handler) is logging.StreamHandler:
+            hub_logger.removeHandler(handler)
+    hf_logging.enable_propagation()
+
+
 def suppress_noisy_warnings():
     """Suppress known noisy warnings from third-party libraries."""
+    configure_hf_hub_logger()
     warnings.filterwarnings(
         "ignore", category=UserWarning, message="The given NumPy array is not writable"
     )
@@ -2302,7 +2407,7 @@ def monkey_patch_p2p_access_check():
 
     setattr(tgt, "gpu_p2p_access_check", lambda *arg, **kwargs: True)
 
-    # Suppress the warnings from this delete function when using sglang.bench_one_batch
+    # Suppress the warnings from this delete function when using sglang.benchmark.one_batch
     from sglang.srt.distributed.device_communicators.custom_all_reduce import (
         CustomAllreduce,
     )
@@ -2364,6 +2469,8 @@ def configure_logger(server_args, prefix: str = ""):
         datefmt="%Y-%m-%d %H:%M:%S",
         force=True,
     )
+
+    configure_hf_hub_logger()
 
     # Suppress noisy httpx/httpcore loggers in every process that calls
     # configure_logger (main, scheduler, detokenizer). Spawned subprocesses
@@ -2855,18 +2962,14 @@ def direct_register_custom_op(
         raise error
 
 
-def set_gpu_proc_affinity(
-    pp_size: int,
-    tp_size: int,
-    nnodes: int,
-    gpu_id: int,
-):
+def set_gpu_proc_affinity(gpu_id: int):
     # current process
     pid = os.getpid()
     p = psutil.Process(pid)
 
-    nnodes_per_tp_group = max(nnodes // pp_size, 1)
-    tp_size_per_node = tp_size // nnodes_per_tp_group
+    parallel = get_parallel()
+    nnodes_per_tp_group = max(parallel.nnodes // parallel.pp_size, 1)
+    tp_size_per_node = parallel.tp_size // nnodes_per_tp_group
 
     # total physical cores
     total_pcores = psutil.cpu_count(logical=False)
@@ -2966,6 +3069,15 @@ def normalize_serialized_named_tensor_payloads(
     return [normalize_serialized_named_tensor_payload(data) for data in payloads]
 
 
+def _safe_load_torch_storage(data: bytes):
+    storage = torch.load(io.BytesIO(data), weights_only=True)
+    if not isinstance(storage, (torch.storage.TypedStorage, torch.UntypedStorage)):
+        raise pickle.UnpicklingError(
+            f"Expected a Torch storage, got {type(storage).__name__}"
+        )
+    return storage
+
+
 class SafeUnpickler(pickle.Unpickler):
     # Standard-library modules expose powerful callables alongside harmless data
     # types. Keep these globals exact so a newly added callable is denied by
@@ -2989,6 +3101,9 @@ class SafeUnpickler(pickle.Unpickler):
         ("collections", "OrderedDict"),
         ("collections", "defaultdict"),
         ("collections", "deque"),
+        ("collections", "Counter"),
+        ("copyreg", "__newobj__"),
+        ("copyreg", "__newobj_ex__"),
         ("functools", "partial"),
         ("itertools", "chain"),
         ("itertools", "repeat"),
@@ -2996,41 +3111,193 @@ class SafeUnpickler(pickle.Unpickler):
         ("multiprocessing.reduction", "_rebuild_socket"),
         ("multiprocessing.resource_sharer", "DupFd"),
         ("types", "SimpleNamespace"),
-    }
-
-    ALLOWED_MODULE_PREFIXES = {
-        # --- PyTorch types ---
-        "torch.",
-        "torch._tensor.",
-        "torch.storage.",
-        "torch.nn.parameter.",
-        "torch.autograd.function.",
-        # --- torch distributed ---
-        "torch.distributed.",
-        "torch.distributed._shard.",
-        "torch.distributed._composable.",
-        "torch._C._distributed_c10d.",
-        "torch._C._distributed_fsdp.",
-        "torch.distributed.optim.",
-        # --- PEFT / LoRA ---
-        "peft.",
-        "transformers.",
-        "huggingface_hub.",
-        # --- SGLang & Unitest ---
-        "sglang.srt.weight_sync.tensor_bucket.",
-        "sglang.srt.model_executor.model_runner.",
-        "sglang.srt.model_executor.model_runner_components.weight_updater.",
-        "sglang.srt.layers.",
-        "sglang.srt.utils.",
-        "sglang.srt.disaggregation.",
-        "sglang.srt.managers.",
-        "torch_npu.",
+        ("_codecs", "encode"),
+        # --- PyTorch data containers & rebuild functions ---
+        # Code-module prefixes (torch.*, sglang.srt.*) are NOT allowed: they
+        # contain gadgets like sglang.srt.utils.common.dynamic_import
+        ("torch", "Tensor"),
+        ("torch", "BFloat16Tensor"),
+        ("torch", "BoolTensor"),
+        ("torch", "ByteTensor"),
+        ("torch", "CharTensor"),
+        ("torch", "DoubleTensor"),
+        ("torch", "FloatTensor"),
+        ("torch", "HalfTensor"),
+        ("torch", "IntTensor"),
+        ("torch", "LongTensor"),
+        ("torch", "ShortTensor"),
+        ("torch.cuda", "BFloat16Tensor"),
+        ("torch.cuda", "BoolTensor"),
+        ("torch.cuda", "ByteTensor"),
+        ("torch.cuda", "CharTensor"),
+        ("torch.cuda", "DoubleTensor"),
+        ("torch.cuda", "FloatTensor"),
+        ("torch.cuda", "HalfTensor"),
+        ("torch.cuda", "IntTensor"),
+        ("torch.cuda", "LongTensor"),
+        ("torch.cuda", "ShortTensor"),
+        ("torch.cuda.sparse", "BFloat16Tensor"),
+        ("torch.cuda.sparse", "ByteTensor"),
+        ("torch.cuda.sparse", "CharTensor"),
+        ("torch.cuda.sparse", "DoubleTensor"),
+        ("torch.cuda.sparse", "FloatTensor"),
+        ("torch.cuda.sparse", "HalfTensor"),
+        ("torch.cuda.sparse", "IntTensor"),
+        ("torch.cuda.sparse", "LongTensor"),
+        ("torch.cuda.sparse", "ShortTensor"),
+        ("torch.sparse", "BFloat16Tensor"),
+        ("torch.sparse", "ByteTensor"),
+        ("torch.sparse", "CharTensor"),
+        ("torch.sparse", "DoubleTensor"),
+        ("torch.sparse", "FloatTensor"),
+        ("torch.sparse", "HalfTensor"),
+        ("torch.sparse", "IntTensor"),
+        ("torch.sparse", "LongTensor"),
+        ("torch.sparse", "ShortTensor"),
+        ("torch", "Size"),
+        ("torch", "device"),
+        ("torch", "dtype"),
+        ("torch", "bfloat16"),
+        ("torch", "bit"),
+        ("torch", "bits16"),
+        ("torch", "bits1x8"),
+        ("torch", "bits2x4"),
+        ("torch", "bits4x2"),
+        ("torch", "bits8"),
+        ("torch", "bool"),
+        ("torch", "cdouble"),
+        ("torch", "cfloat"),
+        ("torch", "chalf"),
+        ("torch", "complex128"),
+        ("torch", "complex32"),
+        ("torch", "complex64"),
+        ("torch", "double"),
+        ("torch", "float"),
+        ("torch", "float16"),
+        ("torch", "float32"),
+        ("torch", "float4_e2m1fn_x2"),
+        ("torch", "float64"),
+        ("torch", "float8_e4m3fn"),
+        ("torch", "float8_e4m3fnuz"),
+        ("torch", "float8_e5m2"),
+        ("torch", "float8_e5m2fnuz"),
+        ("torch", "float8_e8m0fnu"),
+        ("torch", "half"),
+        ("torch", "int"),
+        ("torch", "int1"),
+        ("torch", "int16"),
+        ("torch", "int2"),
+        ("torch", "int3"),
+        ("torch", "int32"),
+        ("torch", "int4"),
+        ("torch", "int5"),
+        ("torch", "int6"),
+        ("torch", "int64"),
+        ("torch", "int7"),
+        ("torch", "int8"),
+        ("torch", "long"),
+        ("torch", "qint32"),
+        ("torch", "qint8"),
+        ("torch", "quint2x4"),
+        ("torch", "quint4x2"),
+        ("torch", "quint8"),
+        ("torch", "short"),
+        ("torch", "uint1"),
+        ("torch", "uint16"),
+        ("torch", "uint2"),
+        ("torch", "uint3"),
+        ("torch", "uint32"),
+        ("torch", "uint4"),
+        ("torch", "uint5"),
+        ("torch", "uint6"),
+        ("torch", "uint64"),
+        ("torch", "uint7"),
+        ("torch", "uint8"),
+        ("torch.nn.parameter", "Parameter"),
+        ("torch.serialization", "_get_layout"),
+        ("torch._utils", "_rebuild_tensor"),
+        ("torch._utils", "_rebuild_tensor_v2"),
+        ("torch._utils", "_rebuild_tensor_v3"),
+        ("torch._utils", "_rebuild_parameter"),
+        ("torch._utils", "_rebuild_parameter_with_state"),
+        ("torch._utils", "_rebuild_qtensor"),
+        ("torch._utils", "_rebuild_sparse_tensor"),
+        ("torch._utils", "_rebuild_meta_tensor_no_storage"),
+        ("torch._utils", "_rebuild_wrapper_subclass"),
+        ("torch._utils", "_rebuild_device_tensor_from_numpy"),
+        ("torch._utils", "_rebuild_device_tensor_from_cpu_tensor"),
+        ("torch._tensor", "_rebuild_from_type_v2"),
+        ("torch.storage", "UntypedStorage"),
+        ("torch.storage", "_UntypedStorage"),
+        ("torch.storage", "TypedStorage"),
+        ("torch", "UntypedStorage"),
+        ("torch", "BFloat16Storage"),
+        ("torch", "BoolStorage"),
+        ("torch", "ByteStorage"),
+        ("torch", "CharStorage"),
+        ("torch", "ComplexDoubleStorage"),
+        ("torch", "ComplexFloatStorage"),
+        ("torch", "DoubleStorage"),
+        ("torch", "FloatStorage"),
+        ("torch", "HalfStorage"),
+        ("torch", "IntStorage"),
+        ("torch", "LongStorage"),
+        ("torch", "QInt32Storage"),
+        ("torch", "QInt8Storage"),
+        ("torch", "QUInt2x4Storage"),
+        ("torch", "QUInt4x2Storage"),
+        ("torch", "QUInt8Storage"),
+        ("torch", "ShortStorage"),
+        ("torch.cuda", "BFloat16Storage"),
+        ("torch.cuda", "BoolStorage"),
+        ("torch.cuda", "ByteStorage"),
+        ("torch.cuda", "CharStorage"),
+        ("torch.cuda", "ComplexDoubleStorage"),
+        ("torch.cuda", "ComplexFloatStorage"),
+        ("torch.cuda", "DoubleStorage"),
+        ("torch.cuda", "FloatStorage"),
+        ("torch.cuda", "HalfStorage"),
+        ("torch.cuda", "IntStorage"),
+        ("torch.cuda", "LongStorage"),
+        ("torch.cuda", "ShortStorage"),
+        ("torch.multiprocessing.reductions", "rebuild_tensor"),
+        ("torch.multiprocessing.reductions", "rebuild_meta_tensor"),
+        ("torch.multiprocessing.reductions", "rebuild_cuda_tensor"),
+        ("sglang.srt.utils.patch_torch", "_rebuild_cuda_tensor_modified"),
+        ("torch_npu.multiprocessing.reductions", "rebuild_npu_tensor"),
+        ("sglang.srt.utils.patch_torch", "_rebuild_npu_tensor_modified"),
+        ("torch.multiprocessing.reductions", "rebuild_nested_tensor"),
+        ("torch.multiprocessing.reductions", "rebuild_sparse_coo_tensor"),
+        ("torch.multiprocessing.reductions", "rebuild_sparse_compressed_tensor"),
+        ("torch.multiprocessing.reductions", "rebuild_storage_fd"),
+        ("torch.multiprocessing.reductions", "rebuild_storage_filename"),
+        ("torch.multiprocessing.reductions", "rebuild_storage_empty"),
+        ("torch.multiprocessing.reductions", "rebuild_typed_storage"),
+        ("torch.multiprocessing.reductions", "rebuild_typed_storage_child"),
+        ("torch", "per_tensor_affine"),
+        ("torch", "per_tensor_symmetric"),
+        ("torch", "per_channel_affine"),
+        ("torch", "per_channel_symmetric"),
+        ("torch", "per_channel_affine_float_qparams"),
+        # --- SGLang data containers only (no code modules) ---
+        ("sglang.srt.managers.io_struct", "GenerateReqInput"),
+        ("sglang.srt.managers.io_struct", "EmbeddingReqInput"),
+        ("sglang.srt.disaggregation.encoder.receiver", "EmbeddingData"),
+        ("sglang.srt.managers.schedule_batch", "Modality"),
+        ("sglang.srt.weight_sync.tensor_bucket", "FlattenedTensorMetadata"),
+        ("sglang.srt.weight_sync.tensor_bucket", "FlattenedTensorBucket"),
+        (
+            "sglang.srt.model_executor.model_runner_components.weight_updater",
+            "LocalSerializedTensor",
+        ),
+        ("sglang.srt.model_executor.model_runner", "LocalSerializedTensor"),
     }
 
     def find_class(self, module, name):
-        if (module, name) in self.ALLOWED_GLOBALS or any(
-            (module + ".").startswith(prefix) for prefix in self.ALLOWED_MODULE_PREFIXES
-        ):
+        if (module, name) == ("torch.storage", "_load_from_bytes"):
+            # Torch's helper calls an unrestricted nested torch.load.
+            return _safe_load_torch_storage
+        if (module, name) in self.ALLOWED_GLOBALS:
             return super().find_class(module, name)
 
         raise RuntimeError(
@@ -4437,7 +4704,7 @@ def get_extend_input_len_swa_limit(
     sliding_window_size: int, chunked_prefill_size: int, page_size: int
 ) -> int:
     # 1. a factor of 2x is because each prefill contains chunked_prefill_size tokens,
-    #    and between prefills, we run swa_radix_cache.cache_unfinished_req(),
+    #    and between prefills, we run the tree cache's cache_unfinished_req(),
     #    so we unlock the previously locked nodes.
     # 2. max is to handle the case that chunked_prefill_size is larger than sliding_window_size.
     #    in that case, each prefill contains chunked_prefill_size tokens,

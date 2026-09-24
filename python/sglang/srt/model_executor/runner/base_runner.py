@@ -76,8 +76,6 @@ def _allocate_decode_buffers(
     hidden_size: int,
     vocab_size: int,
     dtype: torch.dtype,
-    dp_size: int,
-    pp_size: int,
     is_encoder_decoder: bool,
     require_mlp_tp_gather: bool,
     seq_len_fill_value: int,
@@ -92,6 +90,7 @@ def _allocate_decode_buffers(
     allocate_logits_buffer: bool = True,
 ) -> SimpleNamespace:
     """Allocate the FB-shared decode buffers."""
+    parallel = get_parallel()
     with torch.device(device):
         input_ids = torch.zeros((max_num_token,), dtype=torch.int64)
         input_embeds = torch.zeros((max_num_token, hidden_size), dtype=dtype)
@@ -127,7 +126,7 @@ def _allocate_decode_buffers(
             torch.zeros((max_bs,), dtype=torch.bool) if enable_mamba_track else None
         )
 
-        if pp_size > 1:
+        if parallel.pp_size > 1:
             # mHC (e.g. DSV4) flattens residual into hidden_states (size = hc_hidden_size).
             is_mhc = hc_hidden_size is not None
             hs = hc_hidden_size if is_mhc else hidden_size
@@ -163,9 +162,9 @@ def _allocate_decode_buffers(
             encoder_lens = None
 
         if require_mlp_tp_gather:
-            global_num_tokens_gpu = torch.zeros((dp_size,), dtype=torch.int32)
+            global_num_tokens_gpu = torch.zeros((parallel.dp_size,), dtype=torch.int32)
             global_num_tokens_for_logprob_gpu = torch.zeros(
-                (dp_size,), dtype=torch.int32
+                (parallel.dp_size,), dtype=torch.int32
             )
         else:
             global_num_tokens_gpu = torch.zeros((1,), dtype=torch.int32)
@@ -274,7 +273,7 @@ class BaseRunner(ABC):
         if (
             envs.SGLANG_PP_PARALLEL_DEEPGEMM_WARMUP.get()
             and deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
-            and mr.ps.pp_size > 1
+            and get_parallel().pp_size > 1
             and not mr.spec_algorithm.is_speculative()
         ):
             from sglang.srt.layers.deep_gemm_wrapper.compile_utils import (
@@ -367,8 +366,6 @@ class BaseRunner(ABC):
             hidden_size=mr.model_config.hidden_size,
             vocab_size=mr.model_config.vocab_size,
             dtype=mr.model_config.dtype,
-            dp_size=get_parallel().dp_size,
-            pp_size=get_parallel().pp_size,
             is_encoder_decoder=mr.model_config.is_encoder_decoder,
             require_mlp_tp_gather=require_mlp_tp_gather(),
             seq_len_fill_value=mr.attn_backend.get_cuda_graph_seq_len_fill_value(),
@@ -546,10 +543,10 @@ class BaseRunner(ABC):
             pp_hidden_tokens = num_tokens
             if (
                 capture_forward_mode == ForwardMode.EXTEND
-                and mr.ps.pp_rank != 0
-                and mr.ps.attn_cp_size > 1
+                and get_parallel().pp_rank != 0
+                and mr.attn_cp_size > 1
             ):
-                pp_hidden_tokens = num_tokens // mr.ps.attn_cp_size
+                pp_hidden_tokens = num_tokens // mr.attn_cp_size
             pp_proxy_tensors = PPProxyTensors(
                 {k: v[:pp_hidden_tokens] for k, v in buffers.pp_proxy_tensors.items()}
             )
@@ -635,7 +632,11 @@ class BaseRunner(ABC):
             spec_algorithm=mr.spec_algorithm,
             spec_info=spec_info,
             capture_hidden_mode=capture_hidden_mode,
-            num_token_non_padded=buffers.num_token_non_padded,
+            # Maintained only under expert parallelism; None elsewhere so routing
+            # does not mask every row against a never-filled zero count.
+            num_token_non_padded=(
+                buffers.num_token_non_padded if enable_num_token_non_padded() else None
+            ),
             global_forward_mode=capture_forward_mode,
             lora_ids=lora_ids,
         )
@@ -649,6 +650,8 @@ class BaseRunner(ABC):
 
         forward_batch = mr.prepare_dummy_forward_batch(forward_batch)
         mr.attn_backend.init_forward_metadata(forward_batch)
+        if get_exec().features.enable_encoder_swa_bounded_replay:
+            mr.token_to_kv_pool.request_window.initialize_dummy_history()
 
         def run_once():
             # Reused dummy batches may carry DP-local lazy caches from a prior
