@@ -493,6 +493,61 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
         )
 
         # =================================================================
+        # Mamba/GDN retreat (RFC #40865)
+        # =================================================================
+        # A hybrid FULL+SWA+Mamba match retreats the whole prefix hit to the
+        # latest reusable Mamba checkpoint whenever that state is missing or
+        # evicted, re-prefilling the gap through ALL layers. These counters
+        # quantify that retreat at first admission (once per request; later
+        # chunk/retract re-matches are ignored). The replay budget counters
+        # preview the acceptance rate of the tail-replay budget policy; the
+        # replay execution path itself is a follow-up.
+        self.mamba_retreat_requests_total = Counter(
+            name="sglang:mamba_retreat_requests_total",
+            documentation="Requests whose full-KV prefix hit extended beyond the accepted Mamba checkpoint boundary.",
+            labelnames=labels.keys(),
+        )
+        self.mamba_retreat_gap_tokens_total = Counter(
+            name="sglang:mamba_retreat_gap_tokens_total",
+            documentation="Total gap tokens between the full-KV hit and the accepted Mamba checkpoint at first admission.",
+            labelnames=labels.keys(),
+        )
+        self.mamba_retreat_reprefill_tokens_total = Counter(
+            name="sglang:mamba_retreat_reprefill_tokens_total",
+            documentation="Total tokens re-prefilled from the accepted boundary (today's cost of the retreat).",
+            labelnames=labels.keys(),
+        )
+        self.mamba_retreat_collapse_requests_total = Counter(
+            name="sglang:mamba_retreat_collapse_requests_total",
+            documentation="Requests whose match collapsed to zero cached prefix while a full-KV hit existed.",
+            labelnames=labels.keys(),
+        )
+        self.mamba_replay_would_admit_total = Counter(
+            name="sglang:mamba_replay_would_admit_total",
+            documentation="Retreated requests that satisfy the tail-replay budget (--mamba-replay-tail-max / watermark). Policy preview; replay path lands in a follow-up.",
+            labelnames=labels.keys(),
+        )
+        self.mamba_retreat_gap_histogram = Histogram(
+            name="sglang:mamba_retreat_gap",
+            documentation="Distribution of the per-request gap between the full-KV hit and the accepted Mamba checkpoint (tokens).",
+            labelnames=labels.keys(),
+            buckets=(
+                64,
+                128,
+                256,
+                512,
+                1024,
+                2048,
+                4096,
+                8192,
+                16384,
+                32768,
+                65536,
+                131072,
+            ),
+        )
+
+        # =================================================================
         # PD disaggregation
         # =================================================================
         self.num_prefill_bootstrap_queue_reqs = Gauge(
@@ -1259,6 +1314,25 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
         self.num_retracted_output_tokens_total.labels(**self.labels).inc(
             num_retracted_output_tokens
         )
+
+    def increment_mamba_retreat(
+        self,
+        gap_tokens: int,
+        reprefill_tokens: int,
+        collapsed: bool,
+        replay_admitted: bool,
+    ) -> None:
+        """Account one first-admission Mamba/GDN retreat event (RFC #40865)."""
+        self.mamba_retreat_requests_total.labels(**self.labels).inc()
+        self.mamba_retreat_gap_tokens_total.labels(**self.labels).inc(gap_tokens)
+        self.mamba_retreat_reprefill_tokens_total.labels(**self.labels).inc(
+            reprefill_tokens
+        )
+        self.mamba_retreat_gap_histogram.labels(**self.labels).observe(gap_tokens)
+        if collapsed:
+            self.mamba_retreat_collapse_requests_total.labels(**self.labels).inc()
+        if replay_admitted:
+            self.mamba_replay_would_admit_total.labels(**self.labels).inc()
 
     def increment_decode_cuda_graph_pass(self, value: bool) -> None:
         mode = "decode_cuda_graph" if value else "decode_none"

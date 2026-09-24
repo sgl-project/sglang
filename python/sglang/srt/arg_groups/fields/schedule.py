@@ -211,6 +211,20 @@ class Schedule(msgspec.Struct):
         Optional[int],
         "The maximum size of the mamba cache.",
     ] = None
+    mamba_replay_tail_max: A[
+        int,
+        "Tail-replay budget (RFC #40865): admit a GDN tail replay of the gap "
+        "between the full-KV prefix hit and the latest reusable Mamba "
+        "checkpoint only when the gap is at most this many tokens. 0 disables "
+        "the policy (default). Until the replay execution path lands, this "
+        "only feeds the sglang:mamba_replay_would_admit_total metric.",
+    ] = 0
+    mamba_replay_tail_watermark: A[
+        float,
+        "Mamba state pool occupancy watermark (0.0-1.0) for the tail-replay "
+        "budget: gaps are admitted only while pool usage is below it. "
+        "Requires --mamba-replay-tail-max > 0.",
+    ] = 1.0
     mamba_full_memory_ratio: A[
         Optional[float],
         Arg(

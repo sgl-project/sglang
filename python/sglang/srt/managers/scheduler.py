@@ -3768,6 +3768,58 @@ class Scheduler(
 
         return res
 
+    def _mamba_pool_usage(self) -> Optional[float]:
+        """Live occupancy of the Mamba state pool, or None when not a hybrid."""
+        req_to_token_pool = self.req_to_token_pool
+        pool = getattr(req_to_token_pool, "mamba_pool", None)
+        alloc = getattr(req_to_token_pool, "mamba_allocator", None)
+        if pool is None or alloc is None or not pool.size:
+            return None
+        evictable = 0
+        mamba_evictable_size = getattr(self.tree_cache, "mamba_evictable_size", None)
+        if mamba_evictable_size is not None:
+            evictable = mamba_evictable_size() or 0
+        used = pool.size - (alloc.available_size() + evictable)
+        return max(0.0, used / pool.size)
+
+    def _mamba_replay_budget_allows(self, gap_tokens: int) -> bool:
+        """Tail-replay budget preview (RFC #40865 phase-1).
+
+        A gap replay would be admitted only if it fits the absolute tail
+        budget and the Mamba pool has headroom below the watermark. The
+        replay execution path lands in a follow-up; today this only feeds
+        the `sglang:mamba_replay_would_admit_total` counter so operators can
+        tune the budget from live retreat traffic before the path exists.
+        """
+        tail_max = self.server_args.mamba_replay_tail_max
+        if tail_max <= 0 or gap_tokens > tail_max:
+            return False
+        usage = self._mamba_pool_usage()
+        return usage is None or usage <= self.server_args.mamba_replay_tail_watermark
+
+    def _record_mamba_retreat_stats(self, req: Req) -> None:
+        """Account the Mamba/GDN retreat gap once per request (RFC #40865).
+
+        Chunked prefill and retraction re-run the match several times per
+        request; only the first admission reflects the scheduling decision
+        the retreat metrics are meant to observe.
+        """
+        if req.retreat_stats_recorded:
+            return
+        req.retreat_stats_recorded = True
+        if not self.metrics_reporter.enable_metrics:
+            return
+        accepted = len(req.prefix_indices) + req.host_hit_length
+        gap = req.full_kv_hit_length - accepted
+        if gap <= 0:
+            return
+        self.metrics_collector.increment_mamba_retreat(
+            gap_tokens=gap,
+            reprefill_tokens=max(0, len(req.origin_input_ids) - accepted),
+            collapsed=(accepted == 0),
+            replay_admitted=self._mamba_replay_budget_allows(gap),
+        )
+
     def get_new_batch_prefill(self, running_batch: ScheduleBatch) -> NextBatchPlan:
         prefill_delayer_single_pass = None
         if self.prefill_delayer:
@@ -3919,6 +3971,7 @@ class Scheduler(
         buffer_pipeline = self.tree_cache.buffer_pipeline
         # Get requests from the waiting queue to a new prefill batch
         for req in self.waiting_queue:
+            can_run_list_len_before = len(adder.can_run_list)
             if self.enable_lora and not self.can_schedule_lora_req(req, running_loras):
                 continue
 
@@ -3979,6 +4032,11 @@ class Scheduler(
                 has_chunked_req=(self.chunked_req is not None),
                 truncation_align_size=self.truncation_align_size,
             )
+            if len(adder.can_run_list) > can_run_list_len_before:
+                # Admitted: account the Mamba/GDN retreat gap exactly once per
+                # request (RFC #40865). accepted < full_kv_hit_length means the
+                # full-KV hit was collapsed to the latest reusable checkpoint.
+                self._record_mamba_retreat_stats(req)
 
             if self.enable_lora:
                 running_loras.add(req.lora_id)

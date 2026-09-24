@@ -1161,6 +1161,13 @@ class Req(ReqDllmMixin):
         # match, it will be the tracked seqlen in the ping pong buffer for the
         # right prefill pass.
         self.mamba_branching_seqlen: Optional[int] = None
+        # Length of the FULL-KV tree walk at the last prefix match, before any
+        # component-consensus retreat (RFC #40865). With a Mamba component,
+        # accepted < full_kv_hit_length means the hit was collapsed to the
+        # latest reusable checkpoint and the gap is re-prefilled through all
+        # layers. Instrumented for retreat metrics at first admission.
+        self.full_kv_hit_length: int = 0
+        self.retreat_stats_recorded: bool = False
         # Total cached prefix length (on-device prefix_indices + host_hit_length),
         # capped at the max allowed prefix. Set during prefix matching at schedule
         # time and used to estimate uncached tokens / sort by longest prefix for
@@ -1655,6 +1662,7 @@ class Req(ReqDllmMixin):
                 match_result.mamba_host_hit_length,
                 match_result.mamba_branching_seqlen,
             )
+            self.full_kv_hit_length = match_result.full_kv_hit_length
             if match_result.cache_protected_len is not None:
                 self.kv.cache_protected_len = match_result.cache_protected_len
             else:
@@ -1968,6 +1976,9 @@ class Req(ReqDllmMixin):
         self.kv.mamba_last_track_idx = None
         self.kv.mamba_last_track_seqlen = None
         self.mamba_branching_seqlen = None
+        # Retraction re-runs the match from scratch; the retreat metrics were
+        # already accounted at first admission.
+        self.full_kv_hit_length = 0
         self.kv.mamba_cow_src_index = None
         self.kv.mamba_needs_clear = False
         self.already_computed = 0
