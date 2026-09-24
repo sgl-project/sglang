@@ -228,12 +228,6 @@ if _use_aiter:
 
     aiter_per1x128_quant = get_hip_quant(aiter.QuantType.per_1x128)
 
-if _use_aiter_gfx95:
-    from sglang.kernels.ops.gemm.skinny_ptpc_gemv import (
-        skinny_ptpc_gemv,
-        skinny_ptpc_gemv_supported,
-    )
-
 
 if _is_cuda:
     from sglang.kernels.ops.gemm import fp8_scaled_mm
@@ -2368,13 +2362,6 @@ def apply_fp8_ptpc_linear(
         q_input, x_scale = input
         q_input = q_input.view(-1, q_input.shape[-1])
         output_shape = [*q_input.shape[:-1], weight.shape[0]]
-        if skinny_ptpc_gemv_supported(
-            q_input.shape[0], weight.shape[0], q_input.shape[1]
-        ):
-            output = skinny_ptpc_gemv(q_input, weight, x_scale, weight_scale)
-            if bias is not None:
-                output = output + bias
-            return output.view(*output_shape)
         output = aiter.gemm_a8w8_bpreshuffle(
             q_input, weight, x_scale, weight_scale, None, torch.bfloat16
         )
