@@ -54,6 +54,10 @@ from sglang.multimodal_gen.configs.pipeline_configs.flux import (
     Flux2KleinPipelineConfig,
     Flux2PipelineConfig,
 )
+from sglang.multimodal_gen.configs.pipeline_configs.flux3_action import (
+    Flux3ActionPipelineConfig,
+    is_flux3_action_package,
+)
 from sglang.multimodal_gen.configs.pipeline_configs.glm_image import (
     GlmImagePipelineConfig,
 )
@@ -131,6 +135,7 @@ from sglang.multimodal_gen.configs.sample.flux import (
     Flux2SamplingParams,
     FluxSamplingParams,
 )
+from sglang.multimodal_gen.configs.sample.flux3_action import Flux3ActionSamplingParams
 from sglang.multimodal_gen.configs.sample.glmimage import GlmImageSamplingParams
 from sglang.multimodal_gen.configs.sample.helios import (
     HeliosDistilledSamplingParams,
@@ -362,6 +367,7 @@ KNOWN_NON_DIFFUSERS_DIFFUSION_MODEL_PATTERNS: Dict[str, str] = {
     "lerobot/pi05": "Pi05Pipeline",
     "pi05": "Pi05Pipeline",
     "pi0.5": "Pi05Pipeline",
+    "flux-3-action": "Flux3ActionPipeline",
     "hunyuan3d": "Hunyuan3D2Pipeline",
     "flux.2-dev-nvfp4": "Flux2NvfpPipeline",
     "fal/ideogram-v4-fast": "Ideogram4FastPipeline",
@@ -535,6 +541,10 @@ def _get_config_info(
         for registered_hf_id in all_model_hf_paths:
             if registered_hf_id.lower() in SENSENOVA_U1_MODEL_IDS:
                 return _CONFIG_REGISTRY.get(_MODEL_HF_PATH_TO_NAME[registered_hf_id])
+
+    # Local FLUX 3 Action exports are identified by their manifest, not their name.
+    if is_flux3_action_package(model_path):
+        return _CONFIG_REGISTRY.get(_MODEL_HF_PATH_TO_NAME[FLUX3_ACTION_HF_PATHS[0]])
 
     # 1. Exact match
     if model_path in _MODEL_HF_PATH_TO_NAME:
@@ -809,8 +819,21 @@ def get_model_info(
     return model_info
 
 
+FLUX3_ACTION_HF_PATHS = [
+    "black-forest-labs/flux-3-action-droid",
+    "black-forest-labs/flux-3-action-so101",
+]
+
+
 # Registration of model configs
 def _register_configs():
+    # FLUX 3 Action robot policies (joint video + action flow matching).
+    register_configs(
+        sampling_param_cls=Flux3ActionSamplingParams,
+        pipeline_config_cls=Flux3ActionPipelineConfig,
+        hf_model_paths=FLUX3_ACTION_HF_PATHS,
+    )
+
     # Pi0.5 / OpenPI / LeRobot action policies.
     register_configs(
         sampling_param_cls=Pi05SamplingParams,
@@ -1470,6 +1493,8 @@ def get_non_diffusers_pipeline_name(model_path: str) -> Optional[str]:
     """Get the pipeline name for a known non-diffusers model."""
     if is_sensenova_u1_model(model_path):
         return "SenseNovaU1Pipeline"
+    if is_flux3_action_package(model_path):
+        return "Flux3ActionPipeline"
 
     normalized_model_path = _normalize_hf_cache_path(model_path)
     model_short_name = get_model_short_name(normalized_model_path)
