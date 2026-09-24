@@ -1766,24 +1766,36 @@ def setup_state_kv_args(
 def get_dsv41_spec_layout(kv_args: KVArgs) -> Optional[dict]:
     """Describe the positional transfer layout without pool capacities or pointers."""
     ratios = getattr(kv_args, "mla_compression_ratios", None) or []
-    if 2 not in ratios or str(get_spec().speculative_algorithm).upper() != "DSPARK":
+    encoder_only = get_disagg().dsv41_encoder_only_prefill
+    uses_dspark = str(get_spec().speculative_algorithm).upper() == "DSPARK"
+    if 2 not in ratios or not (encoder_only or uses_dspark):
         return None
 
     from sglang.srt.disaggregation.base.conn import StateType
 
-    if kv_args.state_types.count(StateType.SWA) != 2:
+    expected_swa_components = 0 if encoder_only else 2
+    if kv_args.state_types.count(StateType.SWA) != expected_swa_components:
         raise RuntimeError(
-            "DeepSeek-V4.1 DSpark PD requires target and draft SWA state"
+            "DeepSeek-V4.1 DSpark PD state layout mismatch: "
+            f"encoder_only={encoder_only} expected_swa_components="
+            f"{expected_swa_components} actual_state_types="
+            f"{[state_type.value for state_type in kv_args.state_types]}"
         )
 
-    return {
-        "num_draft_tokens": get_spec().speculative_num_draft_tokens,
+    layout = {
+        "encoder_only": encoder_only,
         "compression_ratios": list(ratios),
         "kv_layer_ids": list(kv_args.kv_layer_ids),
         "kv_item_lens": list(kv_args.kv_item_lens),
         "state_types": [state_type.value for state_type in kv_args.state_types],
         "state_item_lens": [list(items) for items in kv_args.state_item_lens],
     }
+    if not encoder_only:
+        # Ordinary DSpark PD transfers draft state, so its block width is part
+        # of the wire contract. Encoder-only PD reconstructs draft state on D
+        # and deliberately allows P to run without any speculative worker.
+        layout["num_draft_tokens"] = get_spec().speculative_num_draft_tokens
+    return layout
 
 
 def prepare_abort(req: Req, error_message: str, status_code=None):

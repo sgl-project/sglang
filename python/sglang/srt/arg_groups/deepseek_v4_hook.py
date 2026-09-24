@@ -255,7 +255,14 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
             ("external cache linker", cfg.enable_unified_cache_external_linker),
             ("unified memory", cfg.enable_unified_memory),
             ("radix sessions", cfg.enable_session_radix_cache),
-            ("speculative decoding", cfg.speculative_algorithm is not None),
+            (
+                "speculative decoding except Decode-local DSpark",
+                cfg.speculative_algorithm is not None
+                and not (
+                    cfg.disaggregation_mode == "decode"
+                    and str(cfg.speculative_algorithm).upper() == "DSPARK"
+                ),
+            ),
         )
         for feature, enabled in incompatible:
             if enabled:

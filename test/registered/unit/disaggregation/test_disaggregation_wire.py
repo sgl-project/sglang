@@ -39,6 +39,7 @@ from sglang.srt.disaggregation.utils import (
     MetadataBuffers,
     build_transfer_entry_pairs,
     compute_mamba_state_slice_byte_blocks,
+    get_dsv41_spec_layout,
     get_qsa_pending_state_indices,
     poll_and_all_reduce,
     poll_and_all_reduce_attn_cp_tp_group,
@@ -1109,6 +1110,10 @@ def _buf_infos(*ptrs):
 def _make_dsv4_target(*, unified, mapping=None):
     pool = object.__new__(DeepSeekV4TokenToKVPool)
     pool.compression_ratios = [0, 2, 1, 4, 128]
+    pool._stage_start = 0
+    pool._stage_end = len(pool.compression_ratios)
+    pool.kv_source_layers = [2, 8]
+    pool.sources_by_ratio = {1: [8], 2: [2]}
     pool._unified_kv = unified
     pool.page_size = 256
     pool.sliding_window = 128
@@ -1116,6 +1121,24 @@ def _make_dsv4_target(*, unified, mapping=None):
     pool.unified_swa_window = 128
     pool.unified_swa_ring_size = 131
     pool.unified_swa_pages = 524
+    pool.kv_pools = {
+        1: SimpleNamespace(kv_buffer=[torch.empty((2, 16), dtype=torch.uint8)]),
+        2: SimpleNamespace(kv_buffer=[torch.empty((2, 16), dtype=torch.uint8)]),
+    }
+    pool.index_pools = {
+        1: SimpleNamespace(
+            page_size=128,
+            contiguous_page_row_buffers=lambda: [
+                torch.empty((4, 16), dtype=torch.uint8)
+            ],
+        ),
+        2: SimpleNamespace(
+            page_size=64,
+            contiguous_page_row_buffers=lambda: [
+                torch.empty((4, 16), dtype=torch.uint8)
+            ],
+        ),
+    }
     pool.get_state_buf_infos = lambda: _buf_infos(11)
     pool.get_unified_swa_ring_buf_infos = lambda: (
         _buf_infos(12) if unified else ([], [], [])
@@ -1150,6 +1173,41 @@ def _make_dsv4_draft(*, unified, mapping=None):
 
 
 class TestDSV4DraftStateRegistration(unittest.TestCase):
+    def test_encoder_only_layout_matches_with_dspark_only_on_decode(self):
+        mapping = torch.arange(16)
+        target = _make_dsv4_target(unified=False, mapping=mapping)
+
+        prefill_args = KVArgs()
+        decode_args = KVArgs()
+        with get_context().override_server_args(
+            dsv41_encoder_only_prefill=True,
+            speculative_algorithm=None,
+        ):
+            setup_state_kv_args(prefill_args, target, main_kv_only=True)
+            (
+                prefill_args.kv_data_ptrs,
+                prefill_args.kv_data_lens,
+                prefill_args.kv_item_lens,
+            ) = target.get_encoder_only_transfer_buf_infos()
+            prefill_args.kv_layer_ids = target.get_encoder_only_transfer_layer_ids()
+            prefill_layout = get_dsv41_spec_layout(prefill_args)
+        with get_context().override_server_args(
+            dsv41_encoder_only_prefill=True,
+            speculative_algorithm="DSPARK",
+        ):
+            setup_state_kv_args(decode_args, target, main_kv_only=True)
+            (
+                decode_args.kv_data_ptrs,
+                decode_args.kv_data_lens,
+                decode_args.kv_item_lens,
+            ) = target.get_encoder_only_transfer_buf_infos()
+            decode_args.kv_layer_ids = target.get_encoder_only_transfer_layer_ids()
+            decode_layout = get_dsv41_spec_layout(decode_args)
+
+        self.assertEqual(prefill_layout, decode_layout)
+        self.assertTrue(prefill_layout["encoder_only"])
+        self.assertEqual(prefill_layout["state_types"], [])
+
     def test_draft_state_is_a_separate_component(self):
         mapping = torch.arange(16)
         cases = [

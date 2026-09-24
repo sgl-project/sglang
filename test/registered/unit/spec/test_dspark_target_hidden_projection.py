@@ -109,6 +109,64 @@ class DSparkTargetHiddenProjectionTest(CustomTestCase):
         draft_model.project_target_hidden.assert_not_called()
         self.assertIs(attention.input, projected_hidden)
 
+    def test_cache_only_replay_seeds_decode_local_draft_state(self) -> None:
+        hidden_states = torch.arange(12, dtype=torch.float32).reshape(4, 3)
+        logits_output = SimpleNamespace(
+            hidden_states=hidden_states,
+            hidden_states_token_indices=None,
+        )
+        batch_output = SimpleNamespace(
+            logits_output=logits_output,
+            next_token_ids=torch.tensor([42]),
+            next_draft_input=None,
+            new_seq_lens=None,
+        )
+        target_worker = SimpleNamespace(
+            model_runner=SimpleNamespace(
+                model=SimpleNamespace(),
+                prefill_attention_backend_str="dsv4",
+            ),
+            forward_batch_generation=mock.Mock(return_value=batch_output),
+        )
+        worker = object.__new__(DSparkWorkerV2)
+        worker._target_worker = target_worker
+        worker._target_hidden_projection_enabled = False
+        worker._tp_sync = SimpleNamespace(sync=mock.Mock())
+        worker._kv_injector = SimpleNamespace(inject_target_hidden=mock.Mock())
+        batch = SimpleNamespace(
+            forward_mode=SimpleNamespace(is_idle=lambda: False),
+            dsv41_cache_only_replay=True,
+            seq_lens=torch.tensor([256]),
+            extend_lens=[128],
+            prefix_lens=[128],
+            out_cache_loc=torch.arange(4),
+            req_pool_indices=torch.tensor([7]),
+        )
+
+        with (
+            mock.patch(
+                "sglang.srt.speculative.dspark_components.dspark_worker_v2.compute_position",
+                return_value=(torch.arange(4), None),
+            ),
+            mock.patch(
+                "sglang.srt.speculative.dspark_components.dspark_worker_v2.is_unified_kv_triton",
+                return_value=False,
+            ),
+        ):
+            result = DSparkWorkerV2._forward_prefill(worker, batch, on_publish=None)
+
+        worker._kv_injector.inject_target_hidden.assert_called_once()
+        call = worker._kv_injector.inject_target_hidden.call_args.kwargs
+        self.assertIs(call["target_hidden"], hidden_states)
+        self.assertIs(call["cache_loc"], batch.out_cache_loc)
+        self.assertTrue(torch.equal(call["positions"], torch.arange(4)))
+        self.assertIsNone(call["state_slot"])
+        self.assertIsNone(call["final_pos"])
+        self.assertFalse(call["target_hidden_is_projected"])
+        self.assertEqual(result.next_draft_input.bonus_tokens.tolist(), [42])
+        self.assertEqual(result.next_draft_input.new_seq_lens.tolist(), [256])
+        self.assertIsNone(logits_output.hidden_states)
+
 
 if __name__ == "__main__":
     unittest.main()
