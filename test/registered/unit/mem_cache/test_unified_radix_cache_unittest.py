@@ -42,7 +42,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     zero_match_result,
 )
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
-from sglang.srt.mem_cache.common import available_and_evictable_str, discard_kv_cache
+from sglang.srt.mem_cache.common import available_and_evictable_str, release_kv_cache
 from sglang.srt.mem_cache.hicache_storage import (
     PoolHitPolicy,
     PoolName,
@@ -1858,7 +1858,7 @@ class UnifiedRadixCacheSuite:
         )
 
         avail_before = allocator.available_size()
-        discard_kv_cache(req, cache)
+        release_kv_cache(req, cache, adopt=False)
 
         self.assertEqual(allocator.available_size(), avail_before + kv_len)
         m = cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", tokens))))

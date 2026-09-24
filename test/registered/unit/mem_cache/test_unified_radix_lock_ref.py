@@ -8,7 +8,7 @@ from unittest.mock import MagicMock, patch
 import torch
 
 from sglang.srt.managers.schedule_batch import ReqKvInfo
-from sglang.srt.mem_cache.common import discard_kv_cache
+from sglang.srt.mem_cache.common import release_kv_cache
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -55,7 +55,7 @@ class TestUnifiedRadixLockRefScenarios(unittest.TestCase):
                 return_value=SimpleNamespace(strip_thinking_cache=False),
             ),
         ):
-            discard_kv_cache(req, cache)
+            release_kv_cache(req, cache, adopt=False)
 
         cache.free_kv_row.assert_called_once_with(kv, [(0, 3)])
         cache._dec_req_lock.assert_not_called()

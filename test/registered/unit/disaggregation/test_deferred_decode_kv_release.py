@@ -151,7 +151,7 @@ def _make_decode_req(room, idx, mgr, n_prefill_ranks=1):
 class TestResolveDeferredReleases(CustomTestCase):
     def test_noop_when_nothing_deferred(self):
         q = _make_queue()
-        with patch.object(decode_mod, "discard_kv_cache") as rel:
+        with patch.object(decode_mod, "release_kv_cache") as rel:
             q.resolve_deferred_releases()
         rel.assert_not_called()
 
@@ -165,7 +165,7 @@ class TestResolveDeferredReleases(CustomTestCase):
         mgr.register_deferred_abort_room(room)
         q._defer_release(dreq)
 
-        with patch.object(decode_mod, "discard_kv_cache") as rel:
+        with patch.object(decode_mod, "release_kv_cache") as rel:
             # Not yet acked -> held, not released.
             q.resolve_deferred_releases()
             rel.assert_not_called()
@@ -180,7 +180,7 @@ class TestResolveDeferredReleases(CustomTestCase):
             # Both ranks acked -> released exactly once.
             mgr.note_abort_ack(room, 1)
             q.resolve_deferred_releases()
-            rel.assert_called_once_with(dreq.req, q.tree_cache)
+            rel.assert_called_once_with(dreq.req, q.tree_cache, adopt=False)
 
         # Held state fully cleaned up.
         self.assertEqual(q._deferred_releases, [])
@@ -197,9 +197,9 @@ class TestResolveDeferredReleases(CustomTestCase):
         # Force an already-expired deadline (no ack will ever arrive).
         q._deferred_releases.append((dreq, float("-inf"), idx, 1))
 
-        with patch.object(decode_mod, "discard_kv_cache") as rel:
+        with patch.object(decode_mod, "release_kv_cache") as rel:
             q.resolve_deferred_releases()
-            rel.assert_called_once_with(dreq.req, q.tree_cache)
+            rel.assert_called_once_with(dreq.req, q.tree_cache, adopt=False)
 
         self.assertEqual(q._deferred_releases, [])
         self.assertEqual(q.req_to_metadata_buffer_idx_allocator.freed, [idx])
@@ -218,12 +218,12 @@ class TestResolveDeferredReleases(CustomTestCase):
 
         calls = []
 
-        def fake_release(req, tree_cache):
+        def fake_release(req, tree_cache, *, adopt):
             calls.append(req)
             if req is bad.req:
                 raise RuntimeError("boom")
 
-        with patch.object(decode_mod, "discard_kv_cache", side_effect=fake_release):
+        with patch.object(decode_mod, "release_kv_cache", side_effect=fake_release):
             q.resolve_deferred_releases()  # must not raise
             # The good one still released despite the bad one throwing.
             self.assertIn(good.req, calls)

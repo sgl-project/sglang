@@ -293,7 +293,7 @@ class TestSamplingMaskStatusErrors(CustomTestCase):
             next_token_ids=torch.tensor([8]),
         )
         with patch(
-            "sglang.srt.managers.scheduler_components.batch_result_processor.discard_kv_cache"
+            "sglang.srt.managers.scheduler_components.batch_result_processor.release_kv_cache"
         ) as release:
             processor.process_batch_result_decode(batch, result)
 
@@ -301,7 +301,7 @@ class TestSamplingMaskStatusErrors(CustomTestCase):
         self.assertEqual(req.to_finish.status_code, 400)
         req.update_finish_state.assert_called_once_with(0)
         processor.model_worker.prepare_for_kv_cache_release.assert_called_once_with(req)
-        release.assert_called_once_with(req, processor.tree_cache)
+        release.assert_called_once_with(req, processor.tree_cache, adopt=False)
         processor.output_streamer.stream_output.assert_called_once_with([req], False)
 
     def test_overflow_and_invalid_have_distinct_http_errors(self):

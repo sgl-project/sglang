@@ -347,11 +347,11 @@ class TestDecodeQueueCleanup(CustomTestCase):
         tail.kv_receiver.init.assert_called_once_with(2)
         self.assertEqual(queue.pending_reqs, [])
 
-    @patch("sglang.srt.disaggregation.decode.discard_kv_cache")
+    @patch("sglang.srt.disaggregation.decode.release_kv_cache")
     @patch("sglang.srt.disaggregation.decode.prepare_abort")
     @patch("sglang.srt.disaggregation.decode.poll_and_all_reduce")
     def test_transfer_failure_cleanup_respects_deferred_release_gates(
-        self, mock_poll, mock_prepare_abort, mock_discard_kv_cache
+        self, mock_poll, mock_prepare_abort, mock_release_kv_cache
     ):
         receiver = FakeReceiver()
         req = SimpleNamespace(
@@ -399,7 +399,9 @@ class TestDecodeQueueCleanup(CustomTestCase):
             [req], req.return_logprob
         )
         mock_prepare_abort.assert_called_once()
-        mock_discard_kv_cache.assert_called_once_with(req, queue.tree_cache)
+        mock_release_kv_cache.assert_called_once_with(
+            req, queue.tree_cache, adopt=False
+        )
 
         receiver = FakeReceiver()
         receiver.kv_mgr = FakeKVManager.__new__(FakeKVManager)
@@ -407,7 +409,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
         queue.queue = [decode_req]
         queue.enable_deferred_kv_release = True
         queue.req_to_metadata_buffer_idx_allocator.reset_mock()
-        mock_discard_kv_cache.reset_mock()
+        mock_release_kv_cache.reset_mock()
 
         transferred = queue.pop_transferred()
 
@@ -416,7 +418,9 @@ class TestDecodeQueueCleanup(CustomTestCase):
         self.assertTrue(receiver.clear_called)
         self.assertIsNone(decode_req.kv_receiver)
         queue.req_to_metadata_buffer_idx_allocator.free.assert_called_once_with(3)
-        mock_discard_kv_cache.assert_called_once_with(req, queue.tree_cache)
+        mock_release_kv_cache.assert_called_once_with(
+            req, queue.tree_cache, adopt=False
+        )
 
     def test_fake_receiver_initializes_deferred_release_state(self):
         manager = MagicMock()

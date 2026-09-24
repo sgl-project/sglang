@@ -11,7 +11,7 @@ transfer scenarios identified in PR #19746:
    inc_lock_ref(get_new_prebuilt_batch) -> dec+inc(cache_unfinished_req) -> dec(cache_finished_req)
 
 3. Incremental transfer & failure (prefix match > 0, transfer fails)
-   inc_lock_ref(pop_preallocated) -> dec(unpin via discard_kv_cache)
+   inc_lock_ref(pop_preallocated) -> dec(unpin via release_kv_cache adopt=False)
 
 4. Full transfer & failure (prefix match == 0, transfer fails)
    no inc_lock_ref -> dec(root_node) is no-op since root lock_ref starts at 1
@@ -45,7 +45,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     InsertParams,
     MatchPrefixParams,
 )
-from sglang.srt.mem_cache.common import discard_kv_cache
+from sglang.srt.mem_cache.common import release_kv_cache
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.utils.common import Range
@@ -309,7 +309,7 @@ class TestDecodeLockRefScenarios(CustomTestCase):
         must preserve the matched prefix and release the full request-owned suffix.
 
         Flow: inc_lock_ref(pop_preallocated)
-              -> dec_lock_ref(unpin via discard_kv_cache)
+              -> dec_lock_ref(unpin via release_kv_cache adopt=False)
         """
         cache, req_to_token = _make_cache_with_pools()
 
@@ -342,7 +342,7 @@ class TestDecodeLockRefScenarios(CustomTestCase):
 
         # Transfer fails -> discard without inserting
         cache.token_to_kv_pool_allocator.reset_mock()
-        discard_kv_cache(req, cache)
+        release_kv_cache(req, cache, adopt=False)
 
         ((indices, start_pos),) = (
             cache.token_to_kv_pool_allocator.free_segments.call_args.args[0]
@@ -437,7 +437,7 @@ class TestDecodeLockRefScenarios(CustomTestCase):
         )
 
         # Transfer fails -> discard without inserting; dec_lock_ref(root) is a no-op
-        discard_kv_cache(req, cache)
+        release_kv_cache(req, cache, adopt=False)
 
         # Root lock unchanged, nothing protected or evictable
         self.assertEqual(cache.root_node.lock_ref, root_lock_before)

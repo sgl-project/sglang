@@ -275,19 +275,12 @@ def retraction_discard(req: Req, tree_cache: BasePrefixCache, backend: str) -> N
     req.kv.retraction_backup = None
 
 
-def release_kv_cache(req: Req, tree_cache: BasePrefixCache) -> None:
-    """The request is done and its KV is good: hand it to the tree, then
-    give back whatever the tree did not take."""
-    _release_kv(req, tree_cache, adopt=True)
-
-
-def discard_kv_cache(req: Req, tree_cache: BasePrefixCache) -> None:
-    """The request leaves without handing anything to the tree: abort,
-    retract, or KV it cannot vouch for."""
-    _release_kv(req, tree_cache, adopt=False)
-
-
-def _release_kv(req: Req, tree_cache: BasePrefixCache, *, adopt: bool) -> None:
+def release_kv_cache(
+    req: Req, tree_cache: BasePrefixCache, *, adopt: bool = True
+) -> None:
+    """Give the request's kv row back. With ``adopt`` the tree keeps what it
+    can key first; without it (abort, retract, KV the request cannot vouch
+    for) the row is freed past the protected prefix."""
     assert (not req.kv.holds_kv) == req.kv.is_kv_released
     # A mamba-capable cache may alloc mamba state before alloc KV cache
     if not req.kv.holds_kv:

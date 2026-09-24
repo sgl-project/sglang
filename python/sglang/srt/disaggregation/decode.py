@@ -88,10 +88,10 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     EvictParams,
 )
 from sglang.srt.mem_cache.common import (
-    discard_kv_cache,
     dsv41_dspark_needs_rebootstrap,
     kv_to_page_indices,
     page_align_floor,
+    release_kv_cache,
     retraction_discard,
     retraction_restore,
 )
@@ -2515,7 +2515,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                     indices_to_remove.add(i)
                 else:
                     # release pre-allocated kv cache, but don't insert into the tree since it's failed
-                    discard_kv_cache(decode_req.req, self.tree_cache)
+                    release_kv_cache(decode_req.req, self.tree_cache, adopt=False)
                     decode_req.kv_receiver.clear()
                     decode_req.kv_receiver = None
                     indices_to_remove.add(i)
@@ -2541,7 +2541,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                             decode_req.req
                         )
                     self._clean_hicache_prefetch_resources(decode_req)
-                    discard_kv_cache(decode_req.req, self.tree_cache)
+                    release_kv_cache(decode_req.req, self.tree_cache, adopt=False)
                     if self.scheduler.metrics_reporter.enable_metrics:
                         self.scheduler.metrics_collector.increment_transfer_failed_reqs()
                 else:
@@ -2592,7 +2592,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         if self.enable_staging and self.staging_handler.is_staging_room(room):
             self.staging_handler.unregister_decode_req(room)
         # release pre-allocated kv cache, but don't insert into the tree since it's failed
-        discard_kv_cache(decode_req.req, self.tree_cache)
+        release_kv_cache(decode_req.req, self.tree_cache, adopt=False)
         self.metadata_buffers.bootstrap_room[idx] = 0
         self.req_to_metadata_buffer_idx_allocator.free(idx)
         decode_req.kv_receiver.kv_mgr.clear_deferred_abort_state(room)
@@ -2838,7 +2838,7 @@ class SchedulerDisaggregationDecodeMixin:
             status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
         )
         self.output_streamer.stream_output([req], req.return_logprob)
-        discard_kv_cache(req, self.tree_cache)
+        release_kv_cache(req, self.tree_cache, adopt=False)
         if self.metrics_reporter.enable_metrics:
             self.metrics_collector.increment_transfer_failed_reqs()
 

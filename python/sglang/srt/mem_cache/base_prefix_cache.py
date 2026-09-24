@@ -431,7 +431,7 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         Every implementation is the same three steps: insert what can be
         keyed (advancing ``cache_protected_len``), ``free_kv_row`` the rest
         of ``[cache_protected_len, owned_kv_len)``, ``unpin``. A request that
-        leaves without inserting never gets here; ``discard_kv_cache`` runs
+        leaves without inserting never gets here; ``release_kv_cache`` runs
         the last two steps itself.
         """
 

@@ -16,7 +16,7 @@ from sglang.srt.layers.dp_attention import (
     set_is_extend_in_batch,
 )
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
-from sglang.srt.mem_cache.common import discard_kv_cache
+from sglang.srt.mem_cache.common import release_kv_cache
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.sampling.sampling_params import SamplingParams
@@ -264,7 +264,7 @@ class DynamicChunkSizer:
 
             # Release KV and Mamba cache
             if req.kv.holds_kv:
-                discard_kv_cache(req, self.tree_cache)
+                release_kv_cache(req, self.tree_cache, adopt=False)
 
         logger.info(
             f"[PP Dynamic Chunk] [PP0] Profiled {len(seq_lens)} samples: "

@@ -73,7 +73,6 @@ from sglang.srt.managers.schedule_batch import (
 )
 from sglang.srt.mem_cache.base_prefix_cache import CacheRequestOutcome
 from sglang.srt.mem_cache.common import (
-    discard_kv_cache,
     kv_to_page_indices,
     kv_to_page_num,
     maybe_cache_unfinished_req,
@@ -593,7 +592,7 @@ class SchedulerDisaggregationPrefillMixin:
             sender.abort()
         maybe_release_metadata_buffer(req, self.req_to_metadata_buffer_idx_allocator)
         if req.kv.holds_kv or req.kv.holds_mamba:
-            discard_kv_cache(req, self.tree_cache)
+            release_kv_cache(req, self.tree_cache, adopt=False)
         req.pending_bootstrap = False
 
     @scheduler_stage_method(SCHEDULER_STAGE_PROCESS_QUEUE)
@@ -1173,7 +1172,7 @@ class SchedulerDisaggregationPrefillMixin:
         req.pending_bootstrap = False
         self.tree_cache.finish(req.cache_request_handle, CacheRequestOutcome.ABORT)
         if req.kv.holds_kv or req.kv.holds_mamba:
-            discard_kv_cache(req, self.tree_cache)
+            release_kv_cache(req, self.tree_cache, adopt=False)
         return True
 
     def handle_bootstrap_failure(self: Scheduler, req: Req) -> None:
@@ -1195,7 +1194,7 @@ class SchedulerDisaggregationPrefillMixin:
             logger.warning(error_message)
         req.time_stats.trace_ctx.abort(abort_info={"reason": error_message})
         if req.kv.holds_kv or req.kv.holds_mamba:
-            discard_kv_cache(req, self.tree_cache)
+            release_kv_cache(req, self.tree_cache, adopt=False)
         maybe_release_metadata_buffer(req, self.req_to_metadata_buffer_idx_allocator)
         req.pending_bootstrap = False
         prepare_abort(req, error_message, status_code=HTTPStatus.INTERNAL_SERVER_ERROR)
@@ -1558,10 +1557,8 @@ class SchedulerDisaggregationPrefillMixin:
         )
         self._release_aborted_request(req)
         # Mamba insertion donates the checkpoint and clears its sequence marker.
-        if uses_write_through_cache or self.tree_cache.supports_mamba():
-            discard_kv_cache(req, self.tree_cache)
-        else:
-            release_kv_cache(req, self.tree_cache)
+        adopt = not uses_write_through_cache and not self.tree_cache.supports_mamba()
+        release_kv_cache(req, self.tree_cache, adopt=adopt)
         req.reset_for_retract()
         req.output_ids = array("q")
         req.start_send_idx = 0

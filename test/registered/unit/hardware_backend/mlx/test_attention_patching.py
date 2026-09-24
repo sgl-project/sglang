@@ -1253,7 +1253,7 @@ class TestMlxOverlapScheduler(unittest.TestCase):
         original_release = batch_result_processor_module.release_kv_cache
         original_get_indexer = batch_result_processor_module.get_global_indexer_capturer
 
-        def fake_release_kv_cache(release_req, tree_cache):
+        def fake_release_kv_cache(release_req, tree_cache, *, adopt=True):
             events.append(("release", release_req.rid))
             self.assertIs(tree_cache, processor.tree_cache)
 
