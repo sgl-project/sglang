@@ -1776,12 +1776,10 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                         f"PD Disaggregation does NOT support PD different TP sizes for non-MLA {st.upper()} hybrid models yet."
                     )
                 if is_qwen4_qsa_state and target_rank_registration_info is not None:
-                    # The destination stride is the source item length, so a
-                    # peer with another --qsa-indexer-dtype (or QSA page layout)
-                    # would be written at the wrong offsets. Reject it up front.
+                    # Reject QSA state layout mismatches up front.
                     if len(dst_item_lens) != len(dst_data_ptrs):
                         raise RuntimeError(
-                            f"{st.upper()} destination pointer/item-length "
+                            f"Replicated {st.upper()} destination pointer/item-length "
                             "metadata is inconsistent: "
                             f"dst ptrs={len(dst_data_ptrs)} lens={len(dst_item_lens)}"
                         )
@@ -1799,9 +1797,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                     ]
                     if layout_mismatches:
                         raise RuntimeError(
-                            f"{st.upper()} layout differs between mapped prefill "
-                            "and decode entries (both peers must use the same "
-                            "--qsa-indexer-dtype and QSA page layout): "
+                            f"Replicated {st.upper()} layout differs between mapped "
+                            "prefill and decode entries: "
                             f"{layout_mismatches}"
                         )
                 if has_heterogeneous_attn_tp and is_qwen4_qsa_state:
