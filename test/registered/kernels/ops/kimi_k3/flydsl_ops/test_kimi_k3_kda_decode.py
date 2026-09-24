@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import importlib.util
 from dataclasses import dataclass
 
 import pytest
@@ -12,8 +13,7 @@ import torch
 import torch.nn.functional as F
 
 pytest.importorskip("flydsl")
-from aiter.jit.utils.chip_info import get_gfx
-from aiter.ops.flydsl.utils import is_flydsl_available
+pytest.importorskip("aiter")
 
 from sglang.kernels.ops.kimi_k3.flydsl.kimi_k3_kda_decode import (
     _fb_build_options,
@@ -27,12 +27,9 @@ register_amd_ci(est_time=120, suite="stage-b-test-1-gpu-small-amd-mi35x")
 
 
 def _gfx950_flydsl_available() -> bool:
-    if not torch.cuda.is_available() or not is_flydsl_available():
+    if importlib.util.find_spec("flydsl") is None:
         return False
-    try:
-        return get_gfx() == "gfx950"
-    except (AssertionError, KeyError, RuntimeError):
-        return False
+    return is_flydsl_kimi_k3_kda_decode_supported()
 
 
 pytestmark = pytest.mark.skipif(
