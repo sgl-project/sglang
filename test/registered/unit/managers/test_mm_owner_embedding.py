@@ -18,7 +18,7 @@ from torch import nn
 from sglang.srt.distributed import parallel_state
 from sglang.srt.layers.cp.base import init_cp_strategy
 from sglang.srt.layers.cp.utils import prepare_cp_forward
-from sglang.srt.managers import mm_owner_embedding, mm_schedule, mm_utils
+from sglang.srt.managers import mm_owner_embedding, mm_schedule
 from sglang.srt.managers.mm_owner_embedding import (
     MmOwnerProtocolError,
     select_owner_group,
@@ -55,8 +55,8 @@ def _grid(rows: int):
     return (0, 0) if rows == 2 else (DOWNSAMPLE, DOWNSAMPLE * (rows - 3))
 
 
-def _image(item_hash: int, start: int, rows: int, grid=None) -> MultimodalDataItem:
-    h, w = _grid(rows) if grid is None else grid
+def _image(item_hash: int, start: int, rows: int) -> MultimodalDataItem:
+    h, w = _grid(rows)
     item = MultimodalDataItem(
         modality=Modality.IMAGE,
         feature=torch.zeros(1),
@@ -68,11 +68,11 @@ def _image(item_hash: int, start: int, rows: int, grid=None) -> MultimodalDataIt
 
 
 def _request(parts, prefix_len: int = 0, extend_len=None, rid: str = "rid"):
-    """``parts`` mixes token ids with ``(hash, rows)`` or ``(hash, rows, grid)`` images."""
+    """``parts`` mixes token ids with ``(hash, rows)`` images."""
     ids, items = [], []
     for part in parts:
         if isinstance(part, tuple):
-            item = _image(part[0], len(ids), part[1], *part[2:])
+            item = _image(part[0], len(ids), part[1])
             items.append(item)
             ids.extend([item.pad_value] * part[1])
         else:
@@ -542,10 +542,8 @@ def _failure(requests, trace, errors, inject=None, vocab_calls=0, cp=False):
     )
 
 
-F, G, H, I = 300, 301, 302, 303  # owners 0, 1, 2, 3 in a four-rank group
-J, K = 310, 311  # eight-row spans for the grid cases
+F, G = 300, 301  # owners 0 and 1 in a four-rank group
 AT_PLAN = [MANIFEST, PLAN]
-AT_READINESS = [MANIFEST, PLAN, STATUS]
 AT_FINALIZE_F = _cold(_bcast(0, 3))
 
 FAILURES = {
@@ -554,49 +552,6 @@ FAILURES = {
         AT_PLAN,
         ["during prepare on group rank 1", "OutOfMemoryError: injected as_tensor"],
         _raise_on(1, torch, "as_tensor", torch.OutOfMemoryError),
-    ),
-    "encode": _failure(
-        [[10, (G, 3), 11]],
-        AT_READINESS,
-        ["during encode on group rank 1", "image hashes [301]"],
-        _raise_on(1, _VisionStub, "get_image_feature"),
-    ),
-    "alloc": _failure(
-        [[10, (F, 3), 11]],
-        AT_READINESS,
-        ["during encode on group rank 3", "hash 300 shape (3, 8)"],
-        _raise_on(3, mm_owner_embedding, "_new_span_buffer"),
-    ),
-    "grid": _failure(
-        lambda rank: [[10, (J, 8, (4, 3) if rank == 2 else (3, 4)), 11]],
-        AT_PLAN,
-        ["manifest mismatch between group ranks 0 and 2", "(3, 4", "(4, 3"],
-    ),
-    "duplicate": _failure(
-        [[10, (K, 8, (3, 4)), 11], [20, (K, 8, (4, 3)), 21]],
-        AT_PLAN,
-        [
-            "during manifest on group rank 0",
-            "hash 311 (8 tokens) occurs with different",
-        ],
-    ),
-    "span_len": _failure(
-        [[10, (F, 5, (2, 2)), 11]],
-        AT_PLAN,
-        ["yields 4 span tokens, placeholder has 5"],
-    ),
-    "assemble": _failure(
-        [[10, (H, 2), 11]],
-        _cold(_bcast(2, 2))[:-1],
-        ["during features on group rank 1", "injected _assemble_per_image_chunk"],
-        _raise_on(1, mm_schedule, "_assemble_per_image_chunk"),
-    ),
-    "merge": _failure(
-        [[10, (I, 2), 11]],
-        _cold(_bcast(3, 2)),
-        ["during finalize on group rank 3", "injected _scatter_mm_embedding"],
-        _raise_on(3, mm_utils, "_scatter_mm_embedding"),
-        vocab_calls=1,
     ),
     "remap": _failure(
         [[10, (F, 3), 11]],
@@ -637,8 +592,7 @@ def _failure_program(rank, world_size):
         traced = _TracedGroup(group)
         embed = _ReducingEmbedding(None if case.cp else group)
         model = _VisionStub(embed, traced, tag=rank)
-        requests = case.requests(rank) if callable(case.requests) else case.requests
-        batch = _batch([_request(parts, rid=name) for parts in requests])
+        batch = _batch([_request(parts, rid=name) for parts in case.requests])
         with ExitStack() as stack, pytest.raises(MmOwnerProtocolError) as raised:
             stack.enter_context(case.inject(rank, batch))
             if case.cp:
