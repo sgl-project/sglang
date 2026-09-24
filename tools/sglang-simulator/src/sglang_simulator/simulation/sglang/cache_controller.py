@@ -6,6 +6,24 @@ from sglang_simulator.simulation.manager import ConfigManager, StateManager
 from sglang_simulator.simulation.sglang.req_stats_manager import request_stats_manager
 
 
+class C_PrefetchOperationHook(BaseHook):
+    HOOK_CLASS_NAME = "PrefetchOperation"
+    HOOK_MODULE_NAME = "sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller"
+    REQUIRED = False
+
+    @classmethod
+    def hook(cls, target):
+        original_init = target.__init__
+
+        def wrapped_init(self, *args, **kwargs):
+            # Include time spent waiting for the storage query and host allocation.
+            # Keep the native wall-clock timestamp for BLOCKING mode.
+            self.sim_start_time = StateManager.get_global_clock()
+            original_init(self, *args, **kwargs)
+
+        target.__init__ = wrapped_init
+
+
 class C_HiCacheController(BaseHook):
     HOOK_CLASS_NAME = "HiCacheController"
     HOOK_MODULE_NAME = "sglang.srt.managers.cache_controller"
