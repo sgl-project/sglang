@@ -7,6 +7,7 @@ import math
 import string
 from typing import TYPE_CHECKING, Any, Dict, Iterator, List, Optional, Tuple
 
+import msgspec
 from fastapi import Request
 from fastapi.responses import ORJSONResponse
 from transformers import PreTrainedTokenizerBase
@@ -20,6 +21,7 @@ from sglang.srt.entrypoints.openai.protocol import (
     DecisionScoreQuestion,
     DecisionText,
     UsageInfo,
+    is_blank_decision_text,
 )
 from sglang.srt.entrypoints.openai.serving_base import OpenAIServingBase
 from sglang.srt.entrypoints.openai.serving_chat import _CHAT_TEMPLATE_CLIENT_ERRORS
@@ -32,7 +34,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 # Version of the server-owned prompt wording and answer labels.
-# Any change to _render_question or _answer_labels needs a new version.
+# Any change to a rendering /v1/decisions can produce needs a new version.
 PROMPT_FORMAT_VERSION = 1
 
 # Parser defaults that name the chat template kwarg toggling reasoning.
@@ -46,8 +48,24 @@ _PARSER_TOGGLE_MODES = (
 _REPLY_SENTINEL = "DECISION_ANSWER"
 
 
+class QuestionView(msgspec.Struct, frozen=True):
+    """A question as the renderer and scorer see it, shared by the decision routes."""
+
+    # choice, score, or yes_no
+    kind: str
+    # None or blank when the question has no text of its own
+    question: Any
+    # Option names, level indices, or yes and no, in candidate order
+    names: List[str]
+    # Option descriptions, levels, or the yes and no descriptions
+    details: List[Any]
+
+
 class OpenAIServingDecisions(OpenAIServingBase):
     """Handler for /v1/decisions requests, answered by candidate scoring without generation"""
+
+    # Named in setup refusals, so each decision route reports itself.
+    route = "/v1/decisions"
 
     def __init__(self, chat_serving: OpenAIServingChat):
         super().__init__(chat_serving.tokenizer_manager)
@@ -82,7 +100,8 @@ class OpenAIServingDecisions(OpenAIServingBase):
                 ).detector
             except ValueError as e:
                 logger.warning(
-                    "No reasoning block check for /v1/decisions with parser '%s': %s",
+                    "No reasoning block check for %s with parser '%s': %s",
+                    self.route,
                     parser,
                     e,
                 )
@@ -101,69 +120,81 @@ class OpenAIServingDecisions(OpenAIServingBase):
         return "decision-"
 
     def _validate_request(self, request: DecisionRequest) -> Optional[str]:
-        if not self.tokenizer_manager.is_generation:
-            return "/v1/decisions requires a generation model"
-        if self.tokenizer_manager.tokenizer is None:
-            return "/v1/decisions requires the server tokenizer"
-        if self.chat_encoding_spec is not None:
-            return (
-                "/v1/decisions requires a chat template, but this model's chat "
-                f"route uses the {self.chat_encoding_spec!r} encoder"
-            )
-        if self.prompt_text_is_lossy:
-            return (
-                "/v1/decisions places answer labels on the rendered chat text, "
-                "which this tokenizer does not encode back to the same ids"
-            )
-        if self.template_manager.chat_template_name is not None:
-            return (
-                "/v1/decisions renders the tokenizer's Jinja chat template, but "
-                "this server uses the built-in chat template "
-                f"{self.template_manager.chat_template_name!r}"
-            )
-        if get_exec().features.enable_mis:
-            return "/v1/decisions does not support --enable-mis"
-        if get_exec().dllm.dllm_algorithm is not None:
-            return (
-                "/v1/decisions does not support diffusion language models "
-                "served with --dllm-algorithm"
-            )
-        _, adapter = self._parse_model_parameter(request.model)
-        if adapter is not None:
-            return (
-                f"model names the LoRA adapter {adapter!r}, which /v1/decisions "
-                "does not support"
-            )
+        error = self._validate_server(request.model)
+        if error is not None:
+            return error
         version = request.prompt_format_version
         if version is not None and version != PROMPT_FORMAT_VERSION:
             return (
                 f"prompt_format_version {version} is not served, this server "
                 f"uses version {PROMPT_FORMAT_VERSION}"
             )
-        # The answer position must follow the reasoning block, not sit inside it.
-        config = self.template_manager.reasoning_config
-        if config is not None and config.always_on:
+        return self._validate_reasoning(request.chat_template_kwargs)
+
+    def _validate_server(self, model: str) -> Optional[str]:
+        """Refuse servers this route cannot render faithfully."""
+        route = self.route
+        if not self.tokenizer_manager.is_generation:
+            return f"{route} requires a generation model"
+        if self.tokenizer_manager.tokenizer is None:
+            return f"{route} requires the server tokenizer"
+        if self.chat_encoding_spec is not None:
             return (
-                "/v1/decisions does not support chat templates that always "
-                "reason before answering"
+                f"{route} requires a chat template, but this model's chat "
+                f"route uses the {self.chat_encoding_spec!r} encoder"
             )
-        toggle = self.reasoning_toggle
-        kwargs = request.chat_template_kwargs
-        if toggle in kwargs and kwargs[toggle] is not False:
+        if self.prompt_text_is_lossy:
             return (
-                f"chat_template_kwargs sets {toggle!r} to {kwargs[toggle]!r}, "
-                "but decisions need it false or unset"
+                f"{route} places answer labels on the rendered chat text, "
+                "which this tokenizer does not encode back to the same ids"
+            )
+        if self.template_manager.chat_template_name is not None:
+            return (
+                f"{route} renders the tokenizer's Jinja chat template, but "
+                "this server uses the built-in chat template "
+                f"{self.template_manager.chat_template_name!r}"
+            )
+        if get_exec().features.enable_mis:
+            return f"{route} does not support --enable-mis"
+        if get_exec().dllm.dllm_algorithm is not None:
+            return (
+                f"{route} does not support diffusion language models "
+                "served with --dllm-algorithm"
+            )
+        _, adapter = self._parse_model_parameter(model)
+        if adapter is not None:
+            return (
+                f"model names the LoRA adapter {adapter!r}, which {route} "
+                "does not support"
             )
         return None
 
-    def _chat_template_kwargs(self, request: DecisionRequest) -> Dict[str, Any]:
+    def _validate_reasoning(
+        self, chat_template_kwargs: Dict[str, Any]
+    ) -> Optional[str]:
+        """The answer position must follow the reasoning block, not sit inside it."""
+        config = self.template_manager.reasoning_config
+        if config is not None and config.always_on:
+            return (
+                f"{self.route} does not support chat templates that always "
+                "reason before answering"
+            )
+        toggle = self.reasoning_toggle
+        if toggle in chat_template_kwargs and chat_template_kwargs[toggle] is not False:
+            return (
+                f"chat_template_kwargs sets {toggle!r} to "
+                f"{chat_template_kwargs[toggle]!r}, but decisions need it false or unset"
+            )
+        return None
+
+    def _chat_template_kwargs(self, request_kwargs: Dict[str, Any]) -> Dict[str, Any]:
         """Reasoning off, then the server defaults, then the request kwargs."""
         kwargs = {}
         if self.reasoning_toggle is not None:
             kwargs[self.reasoning_toggle] = False
         for key, value in self.default_chat_template_kwargs.items():
             kwargs.setdefault(key, value)
-        kwargs.update(request.chat_template_kwargs)
+        kwargs.update(request_kwargs)
         return kwargs
 
     def _convert_to_internal_request(
@@ -178,13 +209,15 @@ class OpenAIServingDecisions(OpenAIServingBase):
         self, request: DecisionRequest
     ) -> Iterator[Tuple[List[int], List[int]]]:
         """Prompt and label ids for each question, in request order."""
-        text = _render_text(request.input)
-        chat_template_kwargs = self._chat_template_kwargs(request)
+        text = render_text(request.input)
+        chat_template_kwargs = self._chat_template_kwargs(request.chat_template_kwargs)
         for question in request.questions:
+            view = _decision_view(question)
             try:
                 encoded = self._encode_question(
                     text=text,
-                    question=question,
+                    view=view,
+                    labels=default_labels(view),
                     chat_template_kwargs=chat_template_kwargs,
                 )
             except ValueError as e:
@@ -194,21 +227,13 @@ class OpenAIServingDecisions(OpenAIServingBase):
     def _encode_question(
         self,
         text: str,
-        question: DecisionQuestion,
+        view: QuestionView,
+        labels: List[str],
         chat_template_kwargs: Dict[str, Any],
     ) -> Tuple[List[int], List[int]]:
         tokenizer = self.tokenizer_manager.tokenizer
-        _, labels = _answer_labels(question)
-        content = _render_question(text=text, question=question, labels=labels)
-        try:
-            prompt = tokenizer.apply_chat_template(
-                [{"role": "user", "content": content}],
-                tokenize=False,
-                add_generation_prompt=True,
-                **chat_template_kwargs,
-            )
-        except _CHAT_TEMPLATE_CLIENT_ERRORS as e:
-            raise ValueError(f"the chat template failed: {e}") from e
+        content = _render_question(text=text, view=view, labels=labels)
+        prompt = self._apply_chat_template(content, chat_template_kwargs)
         if self.reasoning_markers is not None:
             # Look only after the message, whose last line is fixed text.
             closing = content.rsplit("\n", 1)[-1]
@@ -259,6 +284,19 @@ class OpenAIServingDecisions(OpenAIServingBase):
         )
         return prompt_ids, label_ids
 
+    def _apply_chat_template(
+        self, content: str, chat_template_kwargs: Dict[str, Any]
+    ) -> str:
+        try:
+            return self.tokenizer_manager.tokenizer.apply_chat_template(
+                [{"role": "user", "content": content}],
+                tokenize=False,
+                add_generation_prompt=True,
+                **chat_template_kwargs,
+            )
+        except _CHAT_TEMPLATE_CLIENT_ERRORS as e:
+            raise ValueError(f"the chat template failed: {e}") from e
+
     def _render_reply(
         self, message: str, chat_template_kwargs: Dict[str, Any]
     ) -> Optional[str]:
@@ -275,30 +313,40 @@ class OpenAIServingDecisions(OpenAIServingBase):
             # The generation prompt checks above still apply.
             return None
 
+    async def _score(
+        self,
+        adapted_request: Iterator[Tuple[List[int], List[int]]],
+        raw_request: Request,
+        temperature: float = 1.0,
+    ):
+        """Encode every question, then score them all in one call."""
+        prompts, label_token_ids = await _encode_all(adapted_request)
+        result = await self.tokenizer_manager.score_prompts(
+            prompts=prompts,
+            label_token_ids=label_token_ids,
+            apply_softmax=True,
+            request=raw_request,
+            temperature=temperature,
+            return_token_logprobs=True,
+        )
+        return prompts, label_token_ids, result
+
     async def _handle_non_streaming_request(
         self,
         adapted_request: Iterator[Tuple[List[int], List[int]]],
         request: DecisionRequest,
         raw_request: Request,
     ) -> ORJSONResponse:
-        prompts, label_token_ids = [], []
-        for prompt_ids, label_ids in adapted_request:
-            prompts.append(prompt_ids)
-            label_token_ids.append(label_ids)
-            # Each question renders and tokenizes the whole input on the event loop.
-            await asyncio.sleep(0)
-        result = await self.tokenizer_manager.score_prompts(
-            prompts=prompts,
-            label_token_ids=label_token_ids,
-            apply_softmax=True,
-            request=raw_request,
+        prompts, label_token_ids, result = await self._score(
+            adapted_request=adapted_request,
+            raw_request=raw_request,
             temperature=request.temperature,
-            return_token_logprobs=True,
         )
         answers = {}
         for i, question in enumerate(request.questions):
             answer = _build_answer(
                 question=question,
+                view=_decision_view(question),
                 probabilities=result.scores[i],
                 token_logprobs=result.token_logprobs[i],
             )
@@ -318,7 +366,7 @@ class OpenAIServingDecisions(OpenAIServingBase):
         return ORJSONResponse(content=response.model_dump(exclude_none=True))
 
 
-def _render_text(value: Optional[DecisionText]) -> str:
+def render_text(value: Optional[DecisionText]) -> str:
     if value is None:
         return ""
     if isinstance(value, str):
@@ -326,61 +374,97 @@ def _render_text(value: Optional[DecisionText]) -> str:
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
 
 
-def _answer_labels(question: DecisionQuestion) -> Tuple[List[str], List[str]]:
-    """Answer names in the response and their single-token labels, in candidate order."""
+async def _encode_all(
+    encoded: Iterator[Tuple[List[int], List[int]]],
+) -> Tuple[List[List[int]], List[List[int]]]:
+    """Collect prompt and label ids, letting other requests run between questions."""
+    prompts, label_token_ids = [], []
+    for prompt_ids, label_ids in encoded:
+        prompts.append(prompt_ids)
+        label_token_ids.append(label_ids)
+        # Each question renders and tokenizes the whole input on the event loop.
+        await asyncio.sleep(0)
+    return prompts, label_token_ids
+
+
+def _decision_view(question: DecisionQuestion) -> QuestionView:
     if isinstance(question, DecisionChoiceQuestion):
-        names = [option.name for option in question.options]
-        return names, list(string.ascii_uppercase[: len(names)])
+        return QuestionView(
+            kind="choice",
+            question=question.question,
+            names=[option.name for option in question.options],
+            details=[option.description for option in question.options],
+        )
     if isinstance(question, DecisionScoreQuestion):
-        levels = [str(level) for level in range(len(question.levels))]
-        return levels, levels
-    return ["yes", "no"], ["yes", "no"]
+        return QuestionView(
+            kind="score",
+            question=question.question,
+            names=[str(level) for level in range(len(question.levels))],
+            details=list(question.levels),
+        )
+    return QuestionView(
+        kind="yes_no",
+        question=question.question,
+        names=["yes", "no"],
+        details=[question.yes, question.no],
+    )
 
 
-def _render_question(text: str, question: DecisionQuestion, labels: List[str]) -> str:
+def default_labels(view: QuestionView) -> List[str]:
+    """Single-token labels in candidate order: A to Z, level indices, or yes and no."""
+    if view.kind == "choice":
+        return list(string.ascii_uppercase[: len(view.names)])
+    return list(view.names)
+
+
+def _render_question(text: str, view: QuestionView, labels: List[str]) -> str:
     """Prompt wording of PROMPT_FORMAT_VERSION."""
-    question_text = _render_text(question.question)
-    if isinstance(question, DecisionChoiceQuestion):
-        lines = [f"Question: {question_text}"]
-        for label, option in zip(labels, question.options):
-            detail = _render_text(option.description)
+    # Every /v1/decisions question has text. A question without its own text
+    # drops the question line, and a yes or no question keeps its lead in.
+    question_text = (
+        "" if is_blank_decision_text(view.question) else render_text(view.question)
+    )
+    if view.kind == "choice":
+        lines = [f"Question: {question_text}"] if question_text else []
+        for label, name, description in zip(labels, view.names, view.details):
+            detail = render_text(description)
             lines.append(
-                f"{label}: {option.name} - {detail}"
-                if detail
-                else f"{label}: {option.name}"
+                f"{label}: {name} - {detail}" if detail else f"{label}: {name}"
             )
         lines.append("Answer with the letter of one option only.")
-    elif isinstance(question, DecisionScoreQuestion):
-        lines = [f"Question: {question_text}"]
+    elif view.kind == "score":
+        lines = [f"Question: {question_text}"] if question_text else []
         lines += [
-            f"{label}: {_render_text(level)}"
-            for label, level in zip(labels, question.levels)
+            f"{label}: {render_text(level)}"
+            for label, level in zip(labels, view.details)
         ]
         lines.append("Answer with the number of one level only.")
     else:
-        lines = [f"Is the following true? {question_text}"]
-        for label, description in zip(labels, (question.yes, question.no)):
-            detail = _render_text(description)
+        lines = [
+            f"Is the following true? {question_text}"
+            if question_text
+            else "Is the following true?"
+        ]
+        for label, description in zip(labels, view.details):
+            detail = render_text(description)
             if detail:
                 lines.append(f"{label}: {detail}")
         lines.append("Answer with yes or no only.")
     return "\n".join([text, "", *lines])
 
 
-def _encode_labels(
+def label_context(
     tokenizer: Any,
     prompt: str,
     prompt_ids: List[int],
-    labels: List[str],
     added_tokens: Dict[int, str],
-) -> List[int]:
-    """Check that each label adds exactly one distinct token after the prompt."""
+) -> Tuple[str, List[int], bool]:
+    """Text and ids after which labels are checked, and whether the shortcut applies."""
     # Added tokens are split off before tokenization.
     # The text after the last one tokenizes on its own,
     # so the check does not grow with the input.
     # When the prompt ends with an added token, each label starts a new segment,
     # which is how the model continues after that token.
-    text, text_ids = prompt, prompt_ids
     last = next(
         (i for i in reversed(range(len(prompt_ids))) if prompt_ids[i] in added_tokens),
         None,
@@ -392,37 +476,60 @@ def _encode_labels(
         if start >= 0 and (
             tokenizer.encode(suffix, add_special_tokens=False) == prompt_ids[last + 1 :]
         ):
-            text, text_ids = suffix, prompt_ids[last + 1 :]
+            return suffix, prompt_ids[last + 1 :], True
+    return prompt, prompt_ids, False
+
+
+def label_token_id(
+    tokenizer: Any, text: str, text_ids: List[int], label: str
+) -> Optional[int]:
+    """The token a label adds after the text, or None when it is not exactly one."""
+    ids = tokenizer.encode(text + label, add_special_tokens=False)
+    if len(ids) != len(text_ids) + 1 or ids[:-1] != text_ids:
+        return None
+    return ids[-1]
+
+
+def _encode_labels(
+    tokenizer: Any,
+    prompt: str,
+    prompt_ids: List[int],
+    labels: List[str],
+    added_tokens: Dict[int, str],
+) -> List[int]:
+    """Check that each label adds exactly one distinct token after the prompt."""
+    text, text_ids, _ = label_context(tokenizer, prompt, prompt_ids, added_tokens)
     label_ids = []
     for label in labels:
-        ids = tokenizer.encode(text + label, add_special_tokens=False)
-        if (
-            len(ids) != len(text_ids) + 1
-            or ids[:-1] != text_ids
-            or ids[-1] in label_ids
-        ):
+        token_id = label_token_id(tokenizer, text, text_ids, label)
+        if token_id is None or token_id in label_ids:
             raise ValueError(
                 f"the answer label {label!r} is not one distinct token after the "
                 "chat prompt for this tokenizer, so this model is not supported"
             )
-        label_ids.append(ids[-1])
+        label_ids.append(token_id)
     return label_ids
+
+
+def label_mass(token_logprobs: List[float]) -> float:
+    return math.fsum(math.exp(logprob) for logprob in token_logprobs)
 
 
 def _build_answer(
     question: DecisionQuestion,
+    view: QuestionView,
     probabilities: List[float],
     token_logprobs: List[float],
 ) -> DecisionAnswer:
-    names, _ = _answer_labels(question)
+    names = view.names
     value = {}
-    if isinstance(question, DecisionChoiceQuestion):
+    if view.kind == "choice":
         value["choice"] = names[probabilities.index(max(probabilities))]
-    elif isinstance(question, DecisionScoreQuestion):
+    elif view.kind == "score":
         value["score"] = math.fsum(i * p for i, p in enumerate(probabilities))
     return DecisionAnswer(
         type=question.type,
         probabilities=dict(zip(names, probabilities)),
-        label_mass=math.fsum(math.exp(logprob) for logprob in token_logprobs),
+        label_mass=label_mass(token_logprobs),
         **value,
     )

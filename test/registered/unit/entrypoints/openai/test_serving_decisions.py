@@ -1,7 +1,8 @@
-"""Unit tests for /v1/decisions: request limits, prompt text, answer labels, and scoring."""
+"""Unit tests for /v1/decisions and /v1/systemone: request limits, prompt text, answer labels, and scoring."""
 
 import asyncio
 import json
+import math
 import string
 import unittest
 from types import SimpleNamespace
@@ -15,8 +16,17 @@ from sglang.srt.entrypoints.openai.protocol import DecisionRequest
 from sglang.srt.entrypoints.openai.serving_decisions import (
     PROMPT_FORMAT_VERSION,
     OpenAIServingDecisions,
+    _decision_view,
     _encode_labels,
     _render_question,
+)
+from sglang.srt.entrypoints.systemone.protocol import SystemOneRequest
+from sglang.srt.entrypoints.systemone.serving import (
+    SystemOneServing,
+    _answer,
+    _choice_confidence,
+    _score_confidence,
+    _view,
 )
 from sglang.srt.managers.tokenizer_manager_score_mixin import TokenizerManagerScoreMixin
 from sglang.srt.parser.template_detection import (
@@ -28,7 +38,7 @@ from sglang.srt.runtime_context import publish, restore_context, snapshot_contex
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=12, suite="base-a-test-cpu")
+register_cpu_ci(est_time=25, suite="base-a-test-cpu")
 
 # Tokenizer files only, of a chat template that thinks by default.
 TOKENIZER = "Qwen/Qwen3.5-35B-A3B"
@@ -69,7 +79,13 @@ def _encoded(handler, request):
     return list(prompts), list(label_ids)
 
 
-def _handler(manager, reasoning_config=None, reasoning_parser=None, lossy=False):
+def _handler(
+    manager,
+    reasoning_config=None,
+    reasoning_parser=None,
+    lossy=False,
+    serving_class=OpenAIServingDecisions,
+):
     """Build the handler over the chat serving state the server builds at startup."""
     template = manager.tokenizer.chat_template
     force_reasoning, detected = detect_reasoning_pattern(template)
@@ -94,7 +110,7 @@ def _handler(manager, reasoning_config=None, reasoning_parser=None, lossy=False)
         _prompt_text_round_trip_is_lossy=lossy,
         reasoning_parser=reasoning_parser,
     )
-    return OpenAIServingDecisions(chat_serving)
+    return serving_class(chat_serving)
 
 
 class UnknownTokenizer:
@@ -145,6 +161,7 @@ class ScoringManager(TokenizerManagerScoreMixin):
         logits = torch.randn(len(tokenizer), generator=generator, dtype=torch.float64)
         self.logprobs = torch.log_softmax(logits * 4, dim=0)
         self.requests = []
+        self.served_model_name = "served-model"
 
     def config_value(self, name):
         return None
@@ -262,10 +279,55 @@ class TestDecisions(unittest.IsolatedAsyncioTestCase):
         for question_id, lines in PROMPT_FIXTURES[PROMPT_FORMAT_VERSION].items():
             rendered = _render_question(
                 text=text,
-                question=_by_id(request, question_id),
+                view=_decision_view(_by_id(request, question_id)),
                 labels=labels[question_id],
             )
             self.assertEqual(rendered, "\n".join([text, "", *lines]))
+        # Renderings only /v1/systemone reaches: no question text, criteria-only
+        # yes or no questions, and two-letter labels beyond 26 options.
+        systemone = SystemOneRequest(
+            state="s",
+            model="m",
+            questions={
+                "choice": {
+                    "type": "choice",
+                    "criteria": {"billing": "Payments", "sales": None},
+                },
+                "score": {"type": "score", "criteria": ["Calm", "Angry"]},
+                "noul": {
+                    "type": "noul",
+                    "criteria": {"true": "Reply today", "false": "Can wait"},
+                },
+            },
+        )
+        cases = {
+            "choice": (
+                ["AA", "AB"],
+                [
+                    "AA: billing - Payments",
+                    "AB: sales",
+                    "Answer with the letter of one option only.",
+                ],
+            ),
+            "score": (
+                ["0", "1"],
+                ["0: Calm", "1: Angry", "Answer with the number of one level only."],
+            ),
+            "noul": (
+                ["yes", "no"],
+                [
+                    "Is the following true?",
+                    "yes: Reply today",
+                    "no: Can wait",
+                    "Answer with yes or no only.",
+                ],
+            ),
+        }
+        for question_id, (labels, lines) in cases.items():
+            rendered = _render_question(
+                text="s", view=_view(systemone.questions[question_id]), labels=labels
+            )
+            self.assertEqual(rendered, "\n".join(["s", "", *lines]))
 
     def test_labels_are_vocabulary_tokens_after_the_non_thinking_prompt(self):
         handler = _handler(ScoringManager(self.tokenizer))
@@ -380,26 +442,40 @@ class TestDecisions(unittest.IsolatedAsyncioTestCase):
             )
 
     async def test_questions_yield_to_other_requests(self):
-        handler = _handler(ScoringManager(self.tokenizer))
-        request = _request("s", {q: _question("yes_no") for q in "abc"})
-        events = []
-        encode = handler._encode_question
+        noul = {"type": "noul", "instructions": "x"}
+        for route, handler, request in (
+            (
+                "decisions",
+                _handler(ScoringManager(self.tokenizer)),
+                _request("s", {q: _question("yes_no") for q in "abc"}),
+            ),
+            (
+                "systemone",
+                _handler(
+                    ScoringManager(self.tokenizer), serving_class=SystemOneServing
+                ),
+                _systemone_request({q: noul for q in "abc"}),
+            ),
+        ):
+            with self.subTest(route):
+                events = []
+                encode = handler._encode_question
 
-        def recorded(**kwargs):
-            events.append("encode")
-            return encode(**kwargs)
+                def recorded(**kwargs):
+                    events.append("encode")
+                    return encode(**kwargs)
 
-        async def other_request():
-            for _ in range(3):
-                events.append("other")
-                await asyncio.sleep(0)
+                async def other_request():
+                    for _ in range(3):
+                        events.append("other")
+                        await asyncio.sleep(0)
 
-        handler._encode_question = recorded
-        other = asyncio.create_task(other_request())
-        response = await handler.handle_request(request, None)
-        await other
-        self.assertEqual(response.status_code, 200)
-        self.assertEqual(events, ["encode", "other"] * 3)
+                handler._encode_question = recorded
+                other = asyncio.create_task(other_request())
+                response = await handler.handle_request(request, None)
+                await other
+                self.assertEqual(response.status_code, 200)
+                self.assertEqual(events, ["encode", "other"] * 3)
 
     async def test_all_questions_are_scored_in_one_call(self):
         manager = ScoringManager(self.tokenizer)
@@ -653,9 +729,13 @@ class TestDecisions(unittest.IsolatedAsyncioTestCase):
                 lambda: _handler(ScoringManager(self.tokenizer)),
                 {"model": "base:adapter"},
             ),
+            # The version is checked before the reasoning settings.
             "uses version 1": (
                 lambda: _handler(ScoringManager(self.tokenizer)),
-                {"prompt_format_version": 2},
+                {
+                    "prompt_format_version": 2,
+                    "chat_template_kwargs": {"enable_thinking": True},
+                },
             ),
             "'dsv4' encoder": (
                 lambda: _handler(
@@ -711,6 +791,396 @@ class TestDecisions(unittest.IsolatedAsyncioTestCase):
             ),
             self.tokenizer.encode("A", add_special_tokens=False),
         )
+
+
+def _systemone_request(questions, **kwargs):
+    return SystemOneRequest(
+        state="The integration keeps failing.",
+        model="jev-latest",
+        questions=questions,
+        **kwargs,
+    )
+
+
+class TestSystemOne(unittest.IsolatedAsyncioTestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.tokenizer = AutoTokenizer.from_pretrained(TOKENIZER)
+
+    def setUp(self):
+        self.addCleanup(restore_context, snapshot_context())
+
+    def _serving(self, manager=None, **kwargs):
+        return _handler(
+            manager or ScoringManager(self.tokenizer),
+            serving_class=SystemOneServing,
+            **kwargs,
+        )
+
+    async def test_answers_follow_the_published_shapes(self):
+        manager = ScoringManager(self.tokenizer)
+        legend_level = {"label": "Angry", "examples": ["caps"]}
+        request = _systemone_request(
+            {
+                "urgent": {"type": "noul", "instructions": "Needs an answer today"},
+                "team": {
+                    "type": "choice",
+                    "criteria": {"billing": None, "technical": "Bugs", "sales": None},
+                },
+                "mood": {"type": "score", "criteria": ["Calm", "Civil", legend_level]},
+            }
+        )
+        response = await self._serving(manager).handle_request(request, None)
+        self.assertEqual(response.status_code, 200)
+        body = json.loads(response.body)
+        self.assertEqual(set(body), {"model", "answers", "usage"})
+        # The served model answers, never the requested alias.
+        self.assertEqual(body["model"], "served-model")
+        self.assertEqual(list(body["answers"]), ["urgent", "team", "mood"])
+        prompt_tokens = sum(len(ids) for ids in manager.requests[0].input_ids)
+        self.assertEqual(
+            body["usage"], {"input_tokens": prompt_tokens, "output_tokens": 0}
+        )
+
+        urgent = body["answers"]["urgent"]
+        self.assertEqual(set(urgent), {"type", "noul", "x_label_mass"})
+        yes_no = manager.logprobs[self.tokenizer.convert_tokens_to_ids(["yes", "no"])]
+        torch.testing.assert_close(
+            torch.tensor(urgent["noul"], dtype=torch.float64),
+            torch.softmax(yes_no, dim=0)[0],
+        )
+
+        team = body["answers"]["team"]
+        self.assertEqual(
+            set(team), {"type", "choice", "confidence", "probabilities", "x_label_mass"}
+        )
+        self.assertEqual(list(team["probabilities"]), ["billing", "technical", "sales"])
+        self.assertEqual(
+            team["choice"], max(team["probabilities"], key=team["probabilities"].get)
+        )
+        self.assertAlmostEqual(
+            team["confidence"], _choice_confidence(list(team["probabilities"].values()))
+        )
+
+        mood = body["answers"]["mood"]
+        self.assertEqual(
+            set(mood),
+            {"type", "score", "confidence", "legend", "probabilities", "x_label_mass"},
+        )
+        self.assertEqual(mood["legend"], {"0": "Calm", "1": "Civil", "2": legend_level})
+        self.assertEqual(list(mood["probabilities"]), ["0", "1", "2"])
+        self.assertAlmostEqual(
+            mood["score"], sum(int(k) * p for k, p in mood["probabilities"].items())
+        )
+
+    async def test_answers_equal_v1_decisions_bit_for_bit(self):
+        legend_level = {"label": "Angry"}
+        systemone = _systemone_request(
+            {
+                "urgent": {"type": "noul", "instructions": "Needs an answer today"},
+                "team": {
+                    "type": "choice",
+                    "instructions": "Which team?",
+                    "criteria": {"billing": None, "technical": "Bugs", "sales": None},
+                },
+                "mood": {
+                    "type": "score",
+                    "instructions": "Mood?",
+                    "criteria": ["Calm", "Civil", legend_level],
+                },
+            }
+        )
+        decisions = DecisionRequest(
+            input=systemone.state,
+            questions=[
+                {"id": "urgent", "type": "yes_no", "question": "Needs an answer today"},
+                _question(
+                    "choice",
+                    {"billing": None, "technical": "Bugs", "sales": None},
+                    "Which team?",
+                )
+                | {"id": "team"},
+                _question("score", ["Calm", "Civil", legend_level], "Mood?")
+                | {"id": "mood"},
+            ],
+        )
+        managers = [ScoringManager(self.tokenizer) for _ in range(2)]
+        bodies = []
+        for manager, handler, request in (
+            (managers[0], self._serving(managers[0]), systemone),
+            (managers[1], _handler(managers[1]), decisions),
+        ):
+            response = await handler.handle_request(request, None)
+            self.assertEqual(response.status_code, 200)
+            bodies.append(json.loads(response.body)["answers"])
+        self.assertEqual(
+            managers[0].requests[0].input_ids, managers[1].requests[0].input_ids
+        )
+        self.assertEqual(
+            managers[0].requests[0].token_ids_logprob,
+            managers[1].requests[0].token_ids_logprob,
+        )
+        systemone_answers, decision_answers = bodies
+        for question_id, answer in systemone_answers.items():
+            with self.subTest(question_id):
+                expected = decision_answers[question_id]
+                self.assertEqual(answer["x_label_mass"], expected["label_mass"])
+                if question_id == "urgent":
+                    self.assertEqual(answer["noul"], expected["probabilities"]["yes"])
+                    continue
+                self.assertEqual(answer["probabilities"], expected["probabilities"])
+                key = "choice" if question_id == "team" else "score"
+                self.assertEqual(answer[key], expected[key])
+
+    def test_answers_report_probabilities_as_scored(self):
+        # A softmax can miss a sum of 1 by a few ulp. Only confidence normalizes.
+        questions = _systemone_request(
+            {
+                "urgent": {"type": "noul", "instructions": "x"},
+                "team": {
+                    "type": "choice",
+                    "criteria": {"a": None, "b": None, "c": None},
+                },
+                "mood": {"type": "score", "criteria": ["low", "mid", "high"]},
+            }
+        ).questions
+        answers = {
+            question_id: _answer(
+                view=_view(question),
+                probabilities=[0.3] * (2 if question_id == "urgent" else 3),
+                mass=0.9,
+                question_id=question_id,
+            )
+            for question_id, question in questions.items()
+        }
+        self.assertEqual(answers["urgent"].noul, 0.3)
+        for question_id in ("team", "mood"):
+            self.assertEqual(
+                list(answers[question_id].probabilities.values()), [0.3] * 3
+            )
+        self.assertEqual(answers["mood"].score, math.fsum([0, 0.3, 0.6]))
+        self.assertAlmostEqual(answers["team"].confidence, 0.0)
+        self.assertAlmostEqual(
+            answers["mood"].confidence, _score_confidence([1 / 3] * 3)
+        )
+
+    def test_confidence_matches_the_published_formulas(self):
+        # Documented examples, a uniform choice, a split score, and one candidate.
+        self.assertAlmostEqual(_score_confidence([0, 0.14, 0.86, 0, 0]), 1 - 0.14 / 1.2)
+        self.assertAlmostEqual(_score_confidence([0, 0, 0.48, 0.52]), 0.52)
+        self.assertEqual(_score_confidence([0.5, 0, 0, 0, 0.5]), 0.0)
+        self.assertAlmostEqual(_choice_confidence([0.25] * 4), 0.0)
+        self.assertAlmostEqual(_choice_confidence([0.1, 0.9]), 0.8)
+        self.assertEqual(_choice_confidence([1.0]), 1.0)
+        self.assertEqual(_score_confidence([1.0]), 1.0)
+
+    async def test_options_beyond_26_get_two_letter_labels(self):
+        manager = ScoringManager(self.tokenizer)
+        criteria = {f"option {i}": None for i in range(30)}
+        request = _systemone_request(
+            {"q": {"type": "choice", "instructions": "Pick one", "criteria": criteria}}
+        )
+        encoded, _ = self._serving(manager)._convert_to_internal_request(request)
+        prompts, label_ids = zip(*encoded)
+        text = self.tokenizer.decode(prompts[0])
+        self.assertIn("AA: option 0", text)
+        self.assertNotIn("\nA: option 0", text)
+        self.assertEqual(len(set(label_ids[0])), 30)
+        # A tokenizer that reports no added tokens stays at 26 options.
+        plain = self._serving(ScoringManager(PlainTokenizer(self.tokenizer)))
+        response = await plain.handle_request(request, None)
+        self.assertEqual(response.status_code, 400)
+        self.assertIn(
+            "more than 26 options needs added tokens the server can read",
+            json.loads(response.body)["message"],
+        )
+        # So does a template whose only added token comes before the message.
+        original_template = self.tokenizer.chat_template
+        self.addCleanup(setattr, self.tokenizer, "chat_template", original_template)
+        self.tokenizer.chat_template = (
+            "<|im_start|>{{ messages[0]['content'] }}\nassistant\n\n"
+        )
+        leading = self._serving()
+        response = await leading.handle_request(request, None)
+        self.assertEqual(response.status_code, 400)
+        self.assertIn(
+            "more than 26 options needs an added token between the message",
+            json.loads(response.body)["message"],
+        )
+        self.assertEqual(leading.tokenizer_manager.requests, [])
+        few = _systemone_request(
+            {"q": {"type": "choice", "criteria": {"a": None, "b": None}}}
+        )
+        response = await leading.handle_request(few, None)
+        self.assertEqual(response.status_code, 200)
+
+    def test_request_validation(self):
+        levels = [str(i) for i in range(11)]
+        refused = {
+            "noul that asks nothing": {"q": {"type": "noul"}},
+            "noul with blank criteria": {
+                "q": {"type": "noul", "instructions": None, "criteria": {"true": " "}}
+            },
+            "unknown key in a question": {
+                "q": {"type": "choice", "instruction": "x", "criteria": {"a": None}}
+            },
+            "unknown key in noul criteria": {
+                "q": {"type": "noul", "criteria": {"yes": "x"}}
+            },
+            "no options": {"q": {"type": "choice", "criteria": {}}},
+            "256 options": {
+                "q": {"type": "choice", "criteria": {str(i): None for i in range(256)}}
+            },
+            "11 levels": {"q": {"type": "score", "criteria": levels}},
+            "null level": {"q": {"type": "score", "criteria": ["low", None]}},
+            "blank level": {"q": {"type": "score", "criteria": ["low", " "]}},
+            "repeated option name": {
+                "q": {"type": "choice", "criteria": {"a": None, "A ": None}}
+            },
+            "unknown type": {"q": {"type": "yes_no", "instructions": "x"}},
+            "no questions": {},
+        }
+        for case, questions in refused.items():
+            with self.subTest(case), self.assertRaises(ValidationError):
+                _systemone_request(questions)
+        for field, value in (
+            ("temperature", 0.5),
+            ("temperature", 1),
+            ("prompt_format_version", 1),
+            ("return_prompt_token_ids", True),
+            ("return_prompt_token_ids", False),
+        ):
+            with (
+                self.subTest(field=field, value=value),
+                self.assertRaisesRegex(ValidationError, "/v1/decisions") as caught,
+            ):
+                _systemone_request(
+                    {"q": {"type": "noul", "instructions": "x"}}, **{field: value}
+                )
+            self.assertEqual(caught.exception.errors()[0]["loc"], (field,))
+        self.assertNotIn(
+            "temperature", SystemOneRequest.model_json_schema()["properties"]
+        )
+        accepted = SystemOneRequest(
+            state="",
+            model="jev-latest",
+            questions={
+                "": {"type": "choice", "criteria": {"only": None}},
+                " ": {"type": "score", "criteria": ["one"]},
+            },
+            temperature=None,
+            future_field=True,
+        )
+        self.assertEqual(list(accepted.questions), ["", " "])
+
+    async def test_validation_errors_are_422_on_this_route_only(self):
+        from fastapi.exceptions import RequestValidationError
+
+        from sglang.srt.entrypoints.http_server import validation_exception_handler
+
+        # The input echo is left out, since JSON encoding can fail on it.
+        nested = []
+        for _ in range(300):
+            nested = [nested]
+        error = RequestValidationError(
+            errors=[
+                {
+                    "loc": ("body", "questions"),
+                    "msg": "Field required",
+                    "type": "missing",
+                    "input": {"state": nested},
+                }
+            ]
+        )
+
+        def request(root_path, path):
+            # Behind --fastapi-root-path the URL path starts with the root path.
+            return SimpleNamespace(
+                url=SimpleNamespace(path=root_path + path),
+                scope={"root_path": root_path},
+            )
+
+        for root_path in ["", "/prefix"]:
+            with self.subTest(root_path=root_path):
+                systemone = await validation_exception_handler(
+                    request(root_path, "/v1/systemone"), error
+                )
+                self.assertEqual(systemone.status_code, 422)
+                self.assertEqual(
+                    json.loads(systemone.body)["detail"],
+                    [
+                        {
+                            "loc": ["body", "questions"],
+                            "msg": "Field required",
+                            "type": "missing",
+                        }
+                    ],
+                )
+                decisions = await validation_exception_handler(
+                    request(root_path, "/v1/decisions"), error
+                )
+                self.assertEqual(decisions.status_code, 400)
+
+    async def test_levels_the_legend_cannot_return_are_refused_before_scoring(self):
+        def nested(depth):
+            level = "Calm"
+            for _ in range(depth):
+                level = [level]
+            return level
+
+        for case, level, status in (
+            ("nested 200 deep", nested(200), 200),
+            ("nested 300 deep", nested(300), 400),
+        ):
+            with self.subTest(case):
+                manager = ScoringManager(self.tokenizer)
+                request = _systemone_request(
+                    {"mood": {"type": "score", "criteria": ["Fine", level]}}
+                )
+                response = await self._serving(manager).handle_request(request, None)
+                self.assertEqual(response.status_code, status)
+                if status == 400:
+                    self.assertIn(
+                        "question 'mood': a level cannot be returned in the legend",
+                        json.loads(response.body)["message"],
+                    )
+                    self.assertEqual(manager.requests, [])
+
+    async def test_reasoning_refusals_apply(self):
+        request = _systemone_request(
+            {"q": {"type": "noul", "instructions": "x"}},
+            chat_template_kwargs={"enable_thinking": True},
+        )
+        plain = _systemone_request({"q": {"type": "noul", "instructions": "x"}})
+        always = ReasoningToggleConfig(special_case="always")
+        for message, serving, body in (
+            ("sets 'enable_thinking' to True", self._serving(), request),
+            ("always reason", self._serving(reasoning_config=always), plain),
+        ):
+            with self.subTest(message):
+                response = await serving.handle_request(body, None)
+                self.assertEqual(response.status_code, 400)
+                self.assertIn(message, json.loads(response.body)["message"])
+                self.assertEqual(serving.tokenizer_manager.requests, [])
+        # The server checks of /v1/decisions apply too.
+        serving = self._serving(
+            ScoringManager(self.tokenizer, dllm_algorithm="LowConfidence")
+        )
+        response = await serving.handle_request(plain, None)
+        self.assertEqual(response.status_code, 400)
+        self.assertIn(
+            "/v1/systemone does not support diffusion",
+            json.loads(response.body)["message"],
+        )
+
+    async def test_non_finite_scores_are_a_server_error(self):
+        manager = ScoringManager(self.tokenizer)
+        manager.logprobs[self.tokenizer.convert_tokens_to_ids(["yes", "no"])] = float(
+            "nan"
+        )
+        request = _systemone_request({"q": {"type": "noul", "instructions": "x"}})
+        response = await self._serving(manager).handle_request(request, None)
+        self.assertEqual(response.status_code, 500)
 
 
 if __name__ == "__main__":

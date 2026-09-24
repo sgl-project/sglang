@@ -1421,10 +1421,32 @@ class ScoringResponse(BaseModel):
     object: str = "scoring"
 
 
+def is_blank_decision_text(value) -> bool:
+    return not (value.strip() if isinstance(value, str) else value)
+
+
 def _nonblank_decision_text(value):
-    if not (value.strip() if isinstance(value, str) else value):
+    if is_blank_decision_text(value):
         raise ValueError("must not be blank")
     return value
+
+
+def check_option_names(names) -> None:
+    """Refuse option names that would make the rendered option lines ambiguous."""
+    seen = set()
+    for name in names:
+        key = name.strip().casefold()
+        if not key:
+            raise ValueError("option names must be nonempty")
+        # Each option is rendered as one prompt line.
+        if any(unicodedata.category(c) in ("Cc", "Zl", "Zp") for c in name):
+            raise ValueError(
+                f"option name {name!r} must not contain control or line break "
+                "characters"
+            )
+        if key in seen:
+            raise ValueError(f"option name {name!r} repeats another option")
+        seen.add(key)
 
 
 # Objects and arrays are rendered into the prompt as compact JSON.
@@ -1450,23 +1472,10 @@ class DecisionChoiceQuestion(BaseModel):
 
     @model_validator(mode="after")
     def _option_names_distinct(self):
-        seen = set()
-        for option in self.options:
-            key = option.name.strip().casefold()
-            if not key:
-                raise ValueError(f"question {self.id!r}: option names must be nonempty")
-            # Each option is rendered as one prompt line.
-            if any(unicodedata.category(c) in ("Cc", "Zl", "Zp") for c in option.name):
-                raise ValueError(
-                    f"question {self.id!r}: option name {option.name!r} must not "
-                    "contain control or line break characters"
-                )
-            if key in seen:
-                raise ValueError(
-                    f"question {self.id!r}: option name {option.name!r} repeats "
-                    "another option"
-                )
-            seen.add(key)
+        try:
+            check_option_names(option.name for option in self.options)
+        except ValueError as e:
+            raise ValueError(f"question {self.id!r}: {e}") from None
         return self
 
 
