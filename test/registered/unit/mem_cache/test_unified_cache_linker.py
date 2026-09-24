@@ -409,7 +409,7 @@ class TestUnifiedCacheLinkerPythonBackend(_TreeCoreBackendTestMixin, _InsertWalk
         self.assertTrue(torch.equal(kv_load.device_indices, loaded))
 
         self.assertGreaterEqual(consumer.ready_to_load_host_cache(), 0)
-        self.assertEqual(consumer.finish_external_linker_loads(), [])
+        self.assertEqual(consumer.finish_external_linker_loads([req]), [])
         self._bind_loaded_request(consumer, consumer_req_pool, req, tokens, loaded)
         consumer.cache_unfinished_req(req)
         consumer.dec_lock_ref(req.last_node, req.lock_receipt)
@@ -612,7 +612,7 @@ class TestUnifiedCacheLinkerPythonBackend(_TreeCoreBackendTestMixin, _InsertWalk
         self.assertGreaterEqual(consumer.ready_to_load_host_cache(), 0)
         self._bind_loaded_request(consumer, consumer_req_pool, req, tokens[:4], loaded)
         if load_landed:
-            self.assertEqual(consumer.finish_external_linker_loads(), [])
+            self.assertEqual(consumer.finish_external_linker_loads([req]), [])
             consumer.cache_unfinished_req(req)
             consumer.dec_lock_ref(req.last_node, req.lock_receipt)
             final = consumer.match_prefix(
@@ -623,7 +623,9 @@ class TestUnifiedCacheLinkerPythonBackend(_TreeCoreBackendTestMixin, _InsertWalk
             self.assertTrue(torch.equal(final.device_indices[3:], loaded[1:]))
         else:
             consumer_linker.load_landed = False
-            self.assertEqual(consumer.finish_external_linker_loads(), [req.rid])
+            self.assertEqual(consumer.finish_external_linker_loads([req]), [req])
+            self.assertEqual(req.discard_output_reason.status_code, 503)
+            self.assertTrue(req.skip_radix_cache_insert)
             consumer.cache_finished_req(req, is_insert=False, owned_kv_len=4)
             self.assertEqual((full_free(), swa_free()), (before[0] + 2, before[1] + 2))
             unpublished = consumer.match_prefix(

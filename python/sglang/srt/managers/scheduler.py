@@ -3557,10 +3557,9 @@ class Scheduler(
             self.abort_request(AbortReq(rid=req.rid))
             return
 
-        reason = req.discard_output_reason
-        message = "Aborted" if reason is None else reason.message
-        prepare_abort(req, message, None if reason is None else reason.status_code)
-        req.time_stats.trace_ctx.abort(abort_info={"reason": message})
+        reason = req.discard_output_reason or FINISH_ABORT("Aborted")
+        prepare_abort(req, reason.message, reason.status_code)
+        req.time_stats.trace_ctx.abort(abort_info={"reason": reason.message})
         req.to_finish = None
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             self.clear_pending_chunk_send(req)
@@ -3574,11 +3573,10 @@ class Scheduler(
 
         self.chunked_req = None
         self._pending_chunked_abort_req = None
+        # A client abort leaves the message to the tokenizer.
+        finished_reason = req.discard_output_reason and reason.to_json()
         self.ipc_channels.send_to_tokenizer.send_output(
-            _make_abort_req(
-                req, finished_reason=None if reason is None else reason.to_json()
-            ),
-            req,
+            _make_abort_req(req, finished_reason=finished_reason), req
         )
         logger.debug(f"Abort chunked prefill request. {req.rid=}")
 
@@ -4630,33 +4628,15 @@ class Scheduler(
                 )
 
         if self.enable_unified_cache_external_linker:
-            self._abort_failed_external_linker_loads(batch)
+            failed = self.tree_cache.finish_external_linker_loads(batch.reqs)
+            if self.chunked_req in failed:
+                # Result processing finishes the others; a chunked one is
+                # released like a client abort so its next chunk never runs.
+                self._pending_chunked_abort_req = self.chunked_req
 
         self._maybe_report_active_ranks()
 
         return ret
-
-    def _abort_failed_external_linker_loads(self, batch: ScheduleBatch) -> None:
-        """Abort the requests whose external KV load for ``batch`` failed.
-
-        Their forward already ran on slots the load never filled, so the output
-        is dropped and their KV must never reach the radix tree. The slots are
-        private to them, so no other request has read them.
-        """
-        failed_rids = set(self.tree_cache.finish_external_linker_loads())
-        if not failed_rids:
-            return
-        for req in batch.reqs:
-            if req.rid not in failed_rids:
-                continue
-            req.skip_radix_cache_insert = True
-            req.discard_output_reason = FINISH_ABORT(
-                "External KV cache load failed", HTTPStatus.SERVICE_UNAVAILABLE
-            )
-            if req is self.chunked_req:
-                # Stops the next chunk and releases the request, as for a
-                # client abort. Otherwise result processing finishes it.
-                self._pending_chunked_abort_req = req
 
     def _maybe_report_active_ranks(self) -> None:
         if not (

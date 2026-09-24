@@ -5,6 +5,7 @@ import logging
 import threading
 import time
 from dataclasses import replace
+from http import HTTPStatus
 from queue import Queue
 from typing import TYPE_CHECKING, Iterator, NamedTuple, Optional, Sequence, TypeVar
 
@@ -3401,12 +3402,25 @@ class UnifiedRadixCache(BasePrefixCache):
     def load_back_is_cache_owned(self) -> bool:
         return self.linker is None
 
-    def finish_external_linker_loads(self) -> list[str]:
-        """Return the rids whose external-linker load for the batch that just
-        ran did not land; see :meth:`UnifiedCacheLinkerWrapper.finish_loads`."""
+    def finish_external_linker_loads(self, reqs: list[Req]) -> list[Req]:
+        """Wait for the external-linker loads of the batch that just ran and
+        return the requests whose KV did not land, marked so their output is
+        dropped and their KV never reaches the tree. Their slots are private
+        (see :meth:`UnifiedCacheLinkerWrapper.load_back`), so nothing else read
+        them."""
         if self.linker is None:
             return []
-        return self.linker.finish_loads()
+        failed_rids = set(self.linker.finish_loads())
+        failed = [req for req in reqs if req.rid in failed_rids]
+        if failed:
+            from sglang.srt.managers.schedule_batch import FINISH_ABORT
+
+            for req in failed:
+                req.skip_radix_cache_insert = True
+                req.discard_output_reason = FINISH_ABORT(
+                    "External KV cache load failed", HTTPStatus.SERVICE_UNAVAILABLE
+                )
+        return failed
 
     def check_hicache_events(self) -> None:
         """Called per scheduler step to poll async HiCache events."""
