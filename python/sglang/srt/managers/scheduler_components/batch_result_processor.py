@@ -1191,8 +1191,17 @@ class SchedulerBatchResultProcessor:
         logprobs = [None] * batch_size
         status_by_batch = [None] * batch_size
         token_ids = sampling_output.token_ids.cpu()
+        support_logprobs = (
+            None
+            if sampling_output.support_logprobs is None
+            else sampling_output.support_logprobs.cpu()
+        )
         packed_width = token_ids.shape[1]
+        support_row = 0
         for row, batch_index in enumerate(batch_indices):
+            returns_support_logprobs = (
+                reqs[batch_index].sampling_logprobs_mode == "support"
+            )
             status = int(statuses[row])
             length = int(lengths[row])
             if status == SamplingMaskStatus.OK and not (0 <= length <= packed_width):
@@ -1200,7 +1209,14 @@ class SchedulerBatchResultProcessor:
             status_by_batch[batch_index] = status
             if status == SamplingMaskStatus.OK:
                 masks[batch_index] = token_ids[row, :length].tolist()
-                logprobs[batch_index] = float(selected_logprobs[row])
+                if returns_support_logprobs:
+                    logprobs[batch_index] = support_logprobs[
+                        support_row, :length
+                    ].tolist()
+                else:
+                    logprobs[batch_index] = float(selected_logprobs[row])
+            if returns_support_logprobs:
+                support_row += 1
 
         output.next_token_sampling_mask_idx = masks
         output.next_token_sampling_logprobs = logprobs
