@@ -126,7 +126,9 @@ class TestFusedVirtualTopkIdsPreservesSentinels(CustomTestCase):
 
     def test_out_of_range_expert_cannot_alias_another_adapter(self):
         slots = torch.arange(4, dtype=torch.int32, device=self.device)
-        ids = torch.tensor([[255, 256]], dtype=torch.int32, device=self.device).repeat(4, 1)
+        ids = torch.tensor([[255, 256]], dtype=torch.int32, device=self.device).repeat(
+            4, 1
+        )
         invalid, _, _ = _fused_virtual_topk_ids(ids, slots, 256, False, 4)
         self.assertTrue(torch.all(invalid[:, 1] == -1))
         valid, _, _ = _fused_virtual_topk_ids(ids, slots, 257, False, 4)
