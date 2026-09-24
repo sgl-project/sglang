@@ -2476,9 +2476,21 @@ class DeepseekV4AscendAttnBackend(
     def store_cache(self, *, layer_id: int, swa_k: torch.Tensor, forward_batch):
         pool = self.token_to_kv_pool
         swa_loc = self.get_swa_out_cache_loc(forward_batch)
+        _swaw_pos = (
+            int(forward_batch.positions.reshape(-1)[-1].item())
+            if torch.is_tensor(getattr(forward_batch, "positions", None))
+            and forward_batch.positions.numel()
+            else -1
+        )
+        _swaw_lo = int(os.environ.get("DSV4_DUMP_MIN_POS", "17523"))
+        _swaw_hi = int(os.environ.get("DSV4_DUMP_MAX_POS", "17530"))
         if (
             int(os.environ.get("DSV4_DUMP_SWA_KV", "0")) == layer_id
-            and getattr(self, "_swaw_printed", 0) < 8
+            and (
+                _swaw_pos == int(os.environ.get("DSV4_DUMP_SWA_FIXED_AT", "16384"))
+                or _swaw_lo <= _swaw_pos <= _swaw_hi
+            )
+            and getattr(self, "_swaw_printed", 0) < 64
         ):
             try:
                 raw = swa_k.detach().view(torch.uint8).cpu().numpy().tobytes()
