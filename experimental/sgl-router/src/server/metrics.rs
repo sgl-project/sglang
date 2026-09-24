@@ -42,7 +42,7 @@
 //! | `sgl_router_cache_aware_decisions_total` | Counter | `model_id`, `decision` |
 //! | `sgl_router_diverted_overlap_blocks` | Histogram | `model_id` |
 //! | `sgl_router_ingress_tokenize_errors_total` | Counter | `model_id` |
-//! | `sgl_router_input_ids_forwarding_total` | Counter | `model_id`, `outcome`, `tokenized` |
+//! | `sgl_router_input_ids_forwarding_total` | Counter | `model_id`, `outcome` |
 //! | `sgl_router_sampling_contract_rejections_total` | Counter | `param` |
 //!
 //! `sgl_router_cache_aware_decisions_total` records exactly one decision per
@@ -84,27 +84,17 @@
 //!   hit-rate query must not absorb it, or a fully saturated fleet reads as a
 //!   healthy one.
 //!
-//! `sgl_router_input_ids_forwarding_total` records exactly one outcome per
-//! dispatched `/v1/chat/completions` request, so the series sum to dispatched
-//! chat traffic and `outcome!="forwarded"` over the sum is the share of
-//! requests the engine had to tokenize itself. `outcome` names why:
+//! `sgl_router_input_ids_forwarding_total` records one outcome per dispatched
+//! `/v1/chat/completions` request, so `outcome!="forwarded"` over the sum is
+//! the share the engine tokenized itself:
 //!
 //! - `forwarded` — router-rendered `input_ids` replaced engine tokenization.
 //! - `disabled` — forwarding is off for the model (`--disable-input-ids-forwarding`,
-//!   or no chat formatter for it).
-//! - `caller_input_ids` — the caller supplied `input_ids`; passed through as-is.
-//! - `no_messages` — no `messages` array to render.
-//! - `tools`, `non_text_content`, `reasoning_content`, `role_rewrite`,
-//!   `template_controls`, `assistant_continuation` — the forwarding guard
-//!   excluded the request shape. Only the first matching reason books, in
-//!   that order.
+//!   or no chat formatter).
+//! - `ineligible` — the forwarding guard excluded the request shape (tools,
+//!   non-text content, caller `input_ids`, template controls, ...).
 //! - `tokenize_failed` — eligible, but ingress rendering failed (the same
 //!   requests `sgl_router_ingress_tokenize_errors_total` counts).
-//!
-//! `tokenized` says whether the router still produced routing tokens (for
-//! cache-aware prefix matching or bucket routing): `tokenized="true"` on a
-//! non-forwarded outcome is tokenization paid for routing only;
-//! `tokenized="false"` means the router never tokenized the request.
 //!
 //! The four `sgl_router_worker*` gauges and `sgl_router_workers` are sampled
 //! at scrape time from the live [`crate::workers::WorkerRegistry`] (passed to
@@ -400,14 +390,7 @@ impl CacheAwareDecision {
 pub enum InputIdsForwarding {
     Forwarded,
     Disabled,
-    CallerInputIds,
-    NoMessages,
-    Tools,
-    NonTextContent,
-    ReasoningContent,
-    RoleRewrite,
-    TemplateControls,
-    AssistantContinuation,
+    Ineligible,
     TokenizeFailed,
 }
 
@@ -416,14 +399,7 @@ impl InputIdsForwarding {
         match self {
             Self::Forwarded => "forwarded",
             Self::Disabled => "disabled",
-            Self::CallerInputIds => "caller_input_ids",
-            Self::NoMessages => "no_messages",
-            Self::Tools => "tools",
-            Self::NonTextContent => "non_text_content",
-            Self::ReasoningContent => "reasoning_content",
-            Self::RoleRewrite => "role_rewrite",
-            Self::TemplateControls => "template_controls",
-            Self::AssistantContinuation => "assistant_continuation",
+            Self::Ineligible => "ineligible",
             Self::TokenizeFailed => "tokenize_failed",
         }
     }
@@ -563,7 +539,6 @@ struct CacheAwareDecisionKey {
 struct InputIdsForwardingKey {
     model_id: String,
     outcome: &'static str,
-    tokenized: bool,
 }
 
 #[derive(Debug)]
@@ -895,18 +870,12 @@ impl MetricsRegistry {
         counter.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Bump `sgl_router_input_ids_forwarding_total{model_id,outcome,tokenized}`
+    /// Bump `sgl_router_input_ids_forwarding_total{model_id,outcome}`
     /// — exactly one call per dispatched chat request.
-    pub fn record_input_ids_forwarding(
-        &self,
-        model_id: &str,
-        outcome: InputIdsForwarding,
-        tokenized: bool,
-    ) {
+    pub fn record_input_ids_forwarding(&self, model_id: &str, outcome: InputIdsForwarding) {
         let key = InputIdsForwardingKey {
             model_id: model_id.to_owned(),
             outcome: outcome.as_str(),
-            tokenized,
         };
         let mut guard = self.input_ids_forwarding_total.lock();
         let counter = guard
@@ -1380,7 +1349,7 @@ impl MetricsRegistry {
 
         // input_ids_forwarding_total
         out.push_str(
-            "# HELP sgl_router_input_ids_forwarding_total Dispatched chat requests by whether router-rendered input_ids were forwarded to the engine (outcome=forwarded) or why not; tokenized says whether the router still tokenized the request for routing.\n",
+            "# HELP sgl_router_input_ids_forwarding_total Dispatched chat requests by whether router-rendered input_ids were forwarded to the engine (outcome=forwarded) or why not (disabled, ineligible, tokenize_failed).\n",
         );
         out.push_str("# TYPE sgl_router_input_ids_forwarding_total counter\n");
         let guard = self.input_ids_forwarding_total.lock();
@@ -1388,19 +1357,12 @@ impl MetricsRegistry {
             .iter()
             .map(|(k, v)| (k, v.load(Ordering::Relaxed)))
             .collect();
-        entries.sort_by(|a, b| {
-            (&a.0.model_id, a.0.outcome, a.0.tokenized).cmp(&(
-                &b.0.model_id,
-                b.0.outcome,
-                b.0.tokenized,
-            ))
-        });
+        entries.sort_by(|a, b| (&a.0.model_id, a.0.outcome).cmp(&(&b.0.model_id, b.0.outcome)));
         for (key, value) in entries {
             out.push_str(&format!(
-                "sgl_router_input_ids_forwarding_total{{model_id=\"{}\",outcome=\"{}\",tokenized=\"{}\"}} {}\n",
+                "sgl_router_input_ids_forwarding_total{{model_id=\"{}\",outcome=\"{}\"}} {}\n",
                 escape_label(&key.model_id),
                 key.outcome,
-                key.tokenized,
                 value,
             ));
         }
@@ -1952,18 +1914,16 @@ mod tests {
     }
 
     #[test]
-    fn input_ids_forwarding_counter_labels_outcome_and_tokenized() {
+    fn input_ids_forwarding_counter_labels_outcome() {
         let reg = MetricsRegistry::new();
-        reg.record_input_ids_forwarding("tiny", InputIdsForwarding::Forwarded, true);
-        reg.record_input_ids_forwarding("tiny", InputIdsForwarding::Forwarded, true);
-        reg.record_input_ids_forwarding("tiny", InputIdsForwarding::Tools, true);
-        reg.record_input_ids_forwarding("tiny", InputIdsForwarding::Disabled, false);
+        reg.record_input_ids_forwarding("tiny", InputIdsForwarding::Forwarded);
+        reg.record_input_ids_forwarding("tiny", InputIdsForwarding::Forwarded);
+        reg.record_input_ids_forwarding("tiny", InputIdsForwarding::Ineligible);
         let out = reg.render();
         assert!(out.contains("# TYPE sgl_router_input_ids_forwarding_total counter"));
         for series in [
-            r#"sgl_router_input_ids_forwarding_total{model_id="tiny",outcome="forwarded",tokenized="true"} 2"#,
-            r#"sgl_router_input_ids_forwarding_total{model_id="tiny",outcome="tools",tokenized="true"} 1"#,
-            r#"sgl_router_input_ids_forwarding_total{model_id="tiny",outcome="disabled",tokenized="false"} 1"#,
+            r#"sgl_router_input_ids_forwarding_total{model_id="tiny",outcome="forwarded"} 2"#,
+            r#"sgl_router_input_ids_forwarding_total{model_id="tiny",outcome="ineligible"} 1"#,
         ] {
             assert!(out.contains(series), "missing {series}; got:\n{out}");
         }

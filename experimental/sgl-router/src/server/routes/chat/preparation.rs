@@ -100,7 +100,7 @@ impl PreparedChatRequest {
             self.tokens.as_ref(),
         );
         ctx.metrics
-            .record_input_ids_forwarding(&self.model.0, forwarding, self.tokens.is_some());
+            .record_input_ids_forwarding(&self.model.0, forwarding);
         if forwarding == InputIdsForwarding::TokenizeFailed {
             ctx.metrics.record_ingress_tokenize_error(&self.model.0);
         }
@@ -513,30 +513,6 @@ fn build_outgoing_body(
     Ok(Bytes::from(bytes))
 }
 
-/// Decide whether router-rendered `input_ids` replace engine tokenization,
-/// and name the reason when they do not.
-fn input_ids_forwarding(
-    can_forward_input_ids: bool,
-    request_value: Option<&Value>,
-    request_tokens: Option<&RequestTokens>,
-) -> InputIdsForwarding {
-    if !can_forward_input_ids {
-        return InputIdsForwarding::Disabled;
-    }
-    let Some(value) = request_value else {
-        return InputIdsForwarding::NoMessages;
-    };
-    if let Some(exclusion) = chat_forwarding_exclusion(value) {
-        return exclusion;
-    }
-    // Eligible chats without rendered tokens defeat the offload.
-    if request_tokens.is_some_and(|t| t.rendered_from_chat) {
-        InputIdsForwarding::Forwarded
-    } else {
-        InputIdsForwarding::TokenizeFailed
-    }
-}
-
 /// Forward generated IDs only for request shapes verified against the engine.
 /// The engine uses `input_ids` verbatim, bypassing its chat-template processing.
 ///
@@ -553,26 +529,14 @@ fn input_ids_forwarding(
 /// Matching model files and engine defaults are still required. Worker template
 /// overrides and default kwargs cannot be inferred from the request.
 /// `--disable-input-ids-forwarding` gates forwarding separately for such fleets.
-///
-/// Returns the first matching exclusion, in the order checked below.
-fn chat_forwarding_exclusion(value: &Value) -> Option<InputIdsForwarding> {
-    if has_caller_input_ids(value) {
-        return Some(InputIdsForwarding::CallerInputIds);
-    }
-    if !value.get("messages").is_some_and(|m| m.is_array()) {
-        return Some(InputIdsForwarding::NoMessages);
-    }
-    if request_has_tools(value) {
-        return Some(InputIdsForwarding::Tools);
-    }
-    if request_has_non_text_content(value) {
-        return Some(InputIdsForwarding::NonTextContent);
-    }
-    if request_has_reasoning_content(value) {
-        return Some(InputIdsForwarding::ReasoningContent);
-    }
-    if request_has_role_rewrites(value) {
-        return Some(InputIdsForwarding::RoleRewrite);
+fn can_forward_chat_tokens(value: &Value) -> bool {
+    if has_caller_input_ids(value)
+        || request_has_tools(value)
+        || request_has_non_text_content(value)
+        || request_has_reasoning_content(value)
+        || request_has_role_rewrites(value)
+    {
+        return false;
     }
     // Request controls whose rendering has not been verified against the engine.
     for key in [
@@ -583,22 +547,41 @@ fn chat_forwarding_exclusion(value: &Value) -> Option<InputIdsForwarding> {
         "task",
     ] {
         if value.get(key).is_some_and(|v| !v.is_null()) {
-            return Some(InputIdsForwarding::TemplateControls);
+            return false;
         }
     }
-    let continues_final_message = value
+    if value
         .get("continue_final_message")
         .and_then(|v| v.as_bool())
-        == Some(true);
-    if continues_final_message || last_message_is_assistant(value) {
-        return Some(InputIdsForwarding::AssistantContinuation);
+        == Some(true)
+    {
+        return false;
     }
-    None
+    !last_message_is_assistant(value)
 }
 
-#[cfg(test)]
-fn can_forward_chat_tokens(value: &Value) -> bool {
-    chat_forwarding_exclusion(value).is_none()
+/// Whether router-rendered `input_ids` replace engine tokenization.
+///
+/// Only chats with forwarding enabled that pass the forwarding guard are
+/// eligible; an eligible chat without chat-rendered tokens is a failed offload.
+fn input_ids_forwarding(
+    can_forward_input_ids: bool,
+    request_value: Option<&Value>,
+    request_tokens: Option<&RequestTokens>,
+) -> InputIdsForwarding {
+    if !can_forward_input_ids {
+        return InputIdsForwarding::Disabled;
+    }
+    let eligible = request_value.is_some_and(|v| {
+        v.get("messages").is_some_and(|m| m.is_array()) && can_forward_chat_tokens(v)
+    });
+    if !eligible {
+        InputIdsForwarding::Ineligible
+    } else if request_tokens.is_some_and(|t| t.rendered_from_chat) {
+        InputIdsForwarding::Forwarded
+    } else {
+        InputIdsForwarding::TokenizeFailed
+    }
 }
 
 /// Whether the final chat message has `role: "assistant"` (a prefix /
@@ -870,9 +853,10 @@ mod tests {
             {"role":"assistant", "content":"answer", "reasoning_content":"prior reasoning"},
             {"role":"user", "content":"next"}
         ]});
+        assert!(!can_forward_chat_tokens(&value));
         assert_eq!(
-            chat_forwarding_exclusion(&value),
-            Some(InputIdsForwarding::ReasoningContent)
+            input_ids_forwarding(true, Some(&value), None),
+            InputIdsForwarding::Ineligible
         );
         value["messages"][1]["reasoning_content"] = Value::Null;
         assert!(can_forward_chat_tokens(&value));
@@ -895,10 +879,10 @@ mod tests {
                 .map(|role| json!({"role": role, "content": "text"}))
                 .collect();
             let value = json!({"messages": messages});
+            assert!(!can_forward_chat_tokens(&value), "{roles:?}");
             assert_eq!(
-                chat_forwarding_exclusion(&value),
-                Some(InputIdsForwarding::RoleRewrite),
-                "{roles:?}"
+                input_ids_forwarding(true, Some(&value), None),
+                InputIdsForwarding::Ineligible
             );
         }
         assert!(can_forward_chat_tokens(&json!({"messages": [
@@ -917,69 +901,24 @@ mod tests {
     }
 
     #[test]
-    fn chat_forwarding_exclusion_names_the_blocking_signal() {
-        use InputIdsForwarding::*;
+    fn can_forward_chat_tokens_blocks_unreplicated_signals() {
         let blockers = [
-            (
-                json!({"messages":[{"role":"user","content":"hi"}],"input_ids":[7, 8]}),
-                CallerInputIds,
-            ),
-            (
-                json!({"messages":[{"role":"user","content":"hi"}],"input_ids":"bad"}),
-                CallerInputIds,
-            ),
-            (json!({"prompt":"hi"}), NoMessages),
-            (
-                json!({"messages":{"role":"user","content":"hi"}}),
-                NoMessages,
-            ),
-            (
-                json!({"messages":[{"role":"user","content":"hi"}],"tools":[{"type":"function"}]}),
-                Tools,
-            ),
-            (
-                json!({"messages":[{"role":"user","content":[{"type":"image_url","image_url":"x"}]}]}),
-                NonTextContent,
-            ),
-            (
-                json!({"messages":[{"role":"user","content":"hi"}],"chat_template":"{{ custom }}"}),
-                TemplateControls,
-            ),
-            (
-                json!({"messages":[{"role":"user","content":"hi"}],"chat_template_kwargs":{"enable_thinking":true}}),
-                TemplateControls,
-            ),
-            (
-                json!({"messages":[{"role":"user","content":"hi"}],"reasoning_effort":"high"}),
-                TemplateControls,
-            ),
-            (
-                json!({"messages":[{"role":"user","content":"hi"}],"reasoning":{"enabled":true}}),
-                TemplateControls,
-            ),
-            (
-                json!({"messages":[{"role":"user","content":"hi"}],"task":"generate"}),
-                TemplateControls,
-            ),
-            (
-                json!({"messages":[{"role":"user","content":"hi"}],"continue_final_message":true}),
-                AssistantContinuation,
-            ),
-            (
-                json!({"messages":[{"role":"user","content":"hi"},{"role":"assistant","content":"partial"}]}),
-                AssistantContinuation,
-            ),
-            // Tools outrank the non-text content their tool-call turn carries.
-            (
-                json!({"messages":[{"role":"assistant","tool_calls":[{"id":"c"}]}]}),
-                Tools,
-            ),
+            json!({"messages":[{"role":"user","content":"hi"}],"input_ids":[7, 8]}),
+            json!({"messages":[{"role":"user","content":"hi"}],"input_ids":"bad"}),
+            json!({"messages":[{"role":"user","content":"hi"}],"tools":[{"type":"function"}]}),
+            json!({"messages":[{"role":"user","content":[{"type":"image_url","image_url":"x"}]}]}),
+            json!({"messages":[{"role":"user","content":"hi"}],"chat_template":"{{ custom }}"}),
+            json!({"messages":[{"role":"user","content":"hi"}],"chat_template_kwargs":{"enable_thinking":true}}),
+            json!({"messages":[{"role":"user","content":"hi"}],"reasoning_effort":"high"}),
+            json!({"messages":[{"role":"user","content":"hi"}],"reasoning":{"enabled":true}}),
+            json!({"messages":[{"role":"user","content":"hi"}],"task":"generate"}),
+            json!({"messages":[{"role":"user","content":"hi"}],"continue_final_message":true}),
+            json!({"messages":[{"role":"user","content":"hi"},{"role":"assistant","content":"partial"}]}),
         ];
-        for (body, expected) in blockers {
-            assert_eq!(
-                chat_forwarding_exclusion(&body),
-                Some(expected),
-                "must NOT forward input_ids for: {body}"
+        for b in blockers {
+            assert!(
+                !can_forward_chat_tokens(&b),
+                "must NOT forward input_ids for: {b}"
             );
         }
     }
@@ -1007,11 +946,9 @@ mod tests {
             (true, Some(&chat), Some(false), TokenizeFailed),
             (true, Some(&chat), None, TokenizeFailed),
             (false, Some(&chat), Some(true), Disabled),
-            (false, None, None, Disabled),
-            (true, Some(&tools), Some(true), Tools),
-            (true, Some(&tools), None, Tools),
-            (true, Some(&prompt), Some(false), NoMessages),
-            (true, None, None, NoMessages),
+            (true, Some(&tools), Some(true), Ineligible),
+            (true, Some(&prompt), None, Ineligible),
+            (true, None, None, Ineligible),
         ] {
             let tokens = rendered.map(|rendered_from_chat| RequestTokens {
                 ids: vec![1, 2, 3],

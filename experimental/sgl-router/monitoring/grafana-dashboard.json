@@ -1608,7 +1608,7 @@
     {
       "type": "timeseries",
       "title": "input_ids forwarding share by outcome",
-      "description": "Share of dispatched chat requests by input_ids forwarding outcome. Anything other than forwarded means the engine tokenized the request itself; tokenized=true on those outcomes is router tokenization spent on routing only.",
+      "description": "Share of dispatched chat requests by input_ids forwarding outcome. Anything other than forwarded means the engine tokenized the request itself.",
       "datasource": {
         "type": "prometheus",
         "uid": "${datasource}"
@@ -1691,10 +1691,10 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "sum by (outcome, tokenized) (rate(sgl_router_input_ids_forwarding_total[$__rate_interval])) / scalar(sum(rate(sgl_router_input_ids_forwarding_total[$__rate_interval])))",
+          "expr": "sum by (outcome) (rate(sgl_router_input_ids_forwarding_total[$__rate_interval])) / scalar(sum(rate(sgl_router_input_ids_forwarding_total[$__rate_interval])))",
           "range": true,
           "refId": "A",
-          "legendFormat": "{{outcome}} (tokenized={{tokenized}})",
+          "legendFormat": "{{outcome}}",
           "format": "time_series"
         }
       ]
