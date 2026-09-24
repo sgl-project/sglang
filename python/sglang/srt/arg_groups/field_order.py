@@ -1,14 +1,6 @@
-"""The order ``ServerArgs`` presents its fields in, frozen.
+"""Field order preserving the ServerArgs positional constructor signature.
 
-A dataclass turns field order into a positional constructor signature, so
-``ServerArgs(model_path, tokenizer_path)`` has to keep meaning what it means.
-Grouping the declarations by namespace would move the second argument onto
-another field, silently.
-
-A compatibility record and nothing else -- a field's namespace is the module it
-is declared in, and only ``collect_input_fields`` reads this. A name that is not
-here sorts after every name that is, which is the only backward-compatible
-position for a new field anyway.
+``collect_input_fields`` appends unlisted fields after these entries.
 """
 
 # fmt: off
