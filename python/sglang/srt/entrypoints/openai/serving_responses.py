@@ -561,6 +561,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                         # background+stream streams on this connection, so don't detach.
                         background=request.background and not request.stream,
                         require_reasoning=require_reasoning,
+                        priority=request.priority,
                     )
 
                     generator = self._generate_with_builtin_tools(
@@ -570,7 +571,6 @@ class OpenAIServingResponses(OpenAIServingChat):
                         sampling_params,
                         context,
                         raw_request=raw_request,
-                        priority=request.priority,
                     )
                     generators.append(generator)
             except ValueError as e:
@@ -2663,12 +2663,9 @@ class OpenAIServingResponses(OpenAIServingChat):
         sampling_params: Any,
         context: ConversationContext,
         raw_request: Optional[Request] = None,
-        priority: Optional[int] = None,
         **kwargs,
     ) -> AsyncGenerator[Any, None]:
         """Generate with builtin tool support for harmony-based models."""
-        orig_priority = priority or 0
-
         while True:
             # Generate using SGLang's tokenizer manager
             generator = self.tokenizer_manager.generate_request(
@@ -2714,6 +2711,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                 return_hidden_states=adapted_request.return_hidden_states,
                 background=adapted_request.background,
                 require_reasoning=adapted_request.require_reasoning,
+                priority=adapted_request.priority,
             )
 
             # Update sampling params with reduced max_tokens
@@ -2732,6 +2730,3 @@ class OpenAIServingResponses(OpenAIServingChat):
                     sampling_params["max_new_tokens"] = max(remaining_tokens, 1)
                 else:
                     sampling_params.max_new_tokens = max(remaining_tokens, 1)
-
-            # Slightly reduce priority for subsequent tool calls
-            priority = orig_priority - 1

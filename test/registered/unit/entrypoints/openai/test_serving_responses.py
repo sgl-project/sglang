@@ -33,6 +33,7 @@ from sglang.srt.entrypoints.openai.serving_responses import (
     _should_emit_normal_text_as_message,
 )
 from sglang.srt.function_call.core_types import ToolCallItem
+from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.parser.template_detection import ReasoningToggleConfig
 from sglang.srt.runtime_context import get_serving, publish, reset_context
 from sglang.srt.sampling.sampling_params import (
@@ -1207,6 +1208,23 @@ class EnginePassthroughTestCase(CustomTestCase):
         self.assertEqual(adapted_request.routed_dp_rank, 2)
         self.assertEqual(adapted_request.disagg_prefill_dp_rank, 0)
 
+    def test_priority_forwarded_to_engine(self):
+        captured = self._capture(
+            make_serving(),
+            ResponsesRequest(model="x", input="hi", priority=7, store=False),
+        )
+
+        self.assertEqual(captured["adapted_request"].priority, 7)
+
+    def test_unset_priority_stays_none(self):
+        # Not 0: --default-priority-value only fills a missing priority, and
+        # --abort-on-priority-when-disabled rejects any request that carries one.
+        captured = self._capture(
+            make_serving(), ResponsesRequest(model="x", input="hi", store=False)
+        )
+
+        self.assertIsNone(captured["adapted_request"].priority)
+
     def test_require_reasoning_forwarded_when_reasoning_parser_configured(self):
         serving = make_serving()
         serving.reasoning_parser = "deepseek-r1"
@@ -1726,6 +1744,25 @@ def test_pd_tool_continuation_stops_before_side_effect(response_serving):
         asyncio.run(run())
     context.call_tool.assert_not_awaited()
     assert serving.tokenizer_manager.generate_request.call_count == 1
+
+
+def test_tool_continuation_keeps_request_priority(response_serving):
+    serving = response_serving()
+    context = Mock()
+    context.need_builtin_tool_call.side_effect = [True, False]
+    context.call_tool = AsyncMock()
+    context.render_for_completion.return_value = [1, 2, 3]
+    first_turn = GenerateReqInput(input_ids=[1], sampling_params={}, priority=7)
+
+    async def run():
+        async for _ in serving._generate_with_builtin_tools(
+            "resp_tool", "hi", first_turn, {}, context
+        ):
+            pass
+
+    asyncio.run(run())
+    turns = serving.tokenizer_manager.generate_request.call_args_list
+    assert [turn.args[0].priority for turn in turns] == [7, 7]
 
 
 if __name__ == "__main__":
