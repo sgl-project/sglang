@@ -57,6 +57,12 @@ def _grouped_foreach_copy_(dsts: List[torch.Tensor], srcs: List[torch.Tensor]) -
             for dst, src in zip(group_dsts, group_srcs):
                 dst.copy_(src)
 
+    if dsts and dsts[0].is_cuda:
+        from sglang.kernels.ops.memory.small_copy import try_small_copy
+
+        if try_small_copy(dsts, srcs):
+            return
+
     groups: Dict[Tuple[torch.dtype, torch.dtype], Tuple[List, List]] = {}
     for dst, src in zip(dsts, srcs):
         key = (dst.dtype, src.dtype)
