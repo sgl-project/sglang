@@ -22,11 +22,13 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from sglang.kernels.ops.attention.dsv4 import linear_bf16_fp32
 from sglang.srt.batch_overlap.two_batch_overlap import model_forward_maybe_tbo
 from sglang.srt.configs.model_config import get_mimo_v2_fused_qkv_expected_tp_size
 from sglang.srt.distributed import (
     tensor_model_parallel_all_reduce,
 )
+from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
@@ -94,6 +96,18 @@ from sglang.srt.utils import (
 MiMoV2Config = None
 
 logger = logging.getLogger(__name__)
+
+# Minimum m (num_tokens) from which the HPC-Ops bf16xfp32 router GEMM is at
+# least as fast as cublas, benchmarked per router shape
+# (hidden_size, n_routed_experts) on H800; below it the dispatcher falls back.
+# Opt-in via SGLANG_OPT_BF16_FP32_GEMM_ALGO=hpc, for two reasons: the split
+# fp32 weight moves router logits by up to ~1e-4, enough to reorder near-tied
+# experts so generations are not bit-identical to the cublas path, and the
+# cached weight split rejects online weight updates.
+_MIMO_V2_ROUTER_HPC_GEMM_MIN_M = {
+    # MiMo-V2.5-Flash: 4096 hidden size, 256 routed experts.
+    (4096, 256): 8,
+}
 
 
 def load_mimo_v2_qkv_proj_weight(
@@ -367,8 +381,22 @@ class MoEGate(nn.Module):
             )
         else:
             self.e_score_correction_bias = None
+        self.hpc_kernel_min_m = (
+            _MIMO_V2_ROUTER_HPC_GEMM_MIN_M.get(
+                (config.hidden_size, config.n_routed_experts)
+            )
+            if self.dtype == torch.float32
+            and envs.SGLANG_OPT_BF16_FP32_GEMM_ALGO.get() == "hpc"
+            else None
+        )
 
     def forward(self, hidden_states):
+        if self.hpc_kernel_min_m is not None:
+            return linear_bf16_fp32(
+                hidden_states,
+                self.weight,
+                hpc_kernel_min_m=self.hpc_kernel_min_m,
+            )
         if self.dtype != torch.float32 and hidden_states.is_cuda:
             return torch.mm(
                 hidden_states.to(self.dtype),
