@@ -42,6 +42,7 @@
 //! | `sgl_router_cache_aware_decisions_total` | Counter | `model_id`, `decision` |
 //! | `sgl_router_diverted_overlap_blocks` | Histogram | `model_id` |
 //! | `sgl_router_ingress_tokenize_errors_total` | Counter | `model_id` |
+//! | `sgl_router_input_ids_forwarding_total` | Counter | `model_id`, `outcome`, `tokenized` |
 //! | `sgl_router_sampling_contract_rejections_total` | Counter | `param` |
 //!
 //! `sgl_router_cache_aware_decisions_total` records exactly one decision per
@@ -82,6 +83,28 @@
 //!   deliberately does NOT spell `cache_hit*`: a `decision=~"cache_hit.*"`
 //!   hit-rate query must not absorb it, or a fully saturated fleet reads as a
 //!   healthy one.
+//!
+//! `sgl_router_input_ids_forwarding_total` records exactly one outcome per
+//! dispatched `/v1/chat/completions` request, so the series sum to dispatched
+//! chat traffic and `outcome!="forwarded"` over the sum is the share of
+//! requests the engine had to tokenize itself. `outcome` names why:
+//!
+//! - `forwarded` — router-rendered `input_ids` replaced engine tokenization.
+//! - `disabled` — forwarding is off for the model (`--disable-input-ids-forwarding`,
+//!   or no chat formatter for it).
+//! - `caller_input_ids` — the caller supplied `input_ids`; passed through as-is.
+//! - `no_messages` — no `messages` array to render.
+//! - `tools`, `non_text_content`, `reasoning_content`, `role_rewrite`,
+//!   `template_controls`, `assistant_continuation` — the forwarding guard
+//!   excluded the request shape. Only the first matching reason books, in
+//!   that order.
+//! - `tokenize_failed` — eligible, but ingress rendering failed (the same
+//!   requests `sgl_router_ingress_tokenize_errors_total` counts).
+//!
+//! `tokenized` says whether the router still produced routing tokens (for
+//! cache-aware prefix matching or bucket routing): `tokenized="true"` on a
+//! non-forwarded outcome is tokenization paid for routing only;
+//! `tokenized="false"` means the router never tokenized the request.
 //!
 //! The four `sgl_router_worker*` gauges and `sgl_router_workers` are sampled
 //! at scrape time from the live [`crate::workers::WorkerRegistry`] (passed to
@@ -371,6 +394,41 @@ impl CacheAwareDecision {
     }
 }
 
+/// Whether a dispatched chat request carried router-rendered `input_ids` to
+/// the engine, and why not otherwise. See the module doc for each label.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InputIdsForwarding {
+    Forwarded,
+    Disabled,
+    CallerInputIds,
+    NoMessages,
+    Tools,
+    NonTextContent,
+    ReasoningContent,
+    RoleRewrite,
+    TemplateControls,
+    AssistantContinuation,
+    TokenizeFailed,
+}
+
+impl InputIdsForwarding {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Forwarded => "forwarded",
+            Self::Disabled => "disabled",
+            Self::CallerInputIds => "caller_input_ids",
+            Self::NoMessages => "no_messages",
+            Self::Tools => "tools",
+            Self::NonTextContent => "non_text_content",
+            Self::ReasoningContent => "reasoning_content",
+            Self::RoleRewrite => "role_rewrite",
+            Self::TemplateControls => "template_controls",
+            Self::AssistantContinuation => "assistant_continuation",
+            Self::TokenizeFailed => "tokenize_failed",
+        }
+    }
+}
+
 impl PolicySelectionFailureReason {
     pub(crate) fn as_str(self) -> &'static str {
         match self {
@@ -430,6 +488,7 @@ pub struct MetricsRegistry {
     cache_aware_decisions_total: Mutex<HashMap<CacheAwareDecisionKey, Arc<AtomicU64>>>,
     diverted_overlap_blocks: Mutex<HashMap<String, Histogram>>,
     ingress_tokenize_errors_total: Mutex<HashMap<String, Arc<AtomicU64>>>,
+    input_ids_forwarding_total: Mutex<HashMap<InputIdsForwardingKey, Arc<AtomicU64>>>,
     sampling_contract_rejections_total: Mutex<HashMap<&'static str, Arc<AtomicU64>>>,
 }
 
@@ -498,6 +557,13 @@ struct PolicyDecisionKey {
 struct CacheAwareDecisionKey {
     model_id: String,
     decision: &'static str,
+}
+
+#[derive(Debug, Hash, Eq, PartialEq, Clone)]
+struct InputIdsForwardingKey {
+    model_id: String,
+    outcome: &'static str,
+    tokenized: bool,
 }
 
 #[derive(Debug)]
@@ -823,6 +889,28 @@ impl MetricsRegistry {
         let mut guard = self.ingress_tokenize_errors_total.lock();
         let counter = guard
             .entry(model_id.to_owned())
+            .or_insert_with(|| Arc::new(AtomicU64::new(0)))
+            .clone();
+        drop(guard);
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Bump `sgl_router_input_ids_forwarding_total{model_id,outcome,tokenized}`
+    /// — exactly one call per dispatched chat request.
+    pub fn record_input_ids_forwarding(
+        &self,
+        model_id: &str,
+        outcome: InputIdsForwarding,
+        tokenized: bool,
+    ) {
+        let key = InputIdsForwardingKey {
+            model_id: model_id.to_owned(),
+            outcome: outcome.as_str(),
+            tokenized,
+        };
+        let mut guard = self.input_ids_forwarding_total.lock();
+        let counter = guard
+            .entry(key)
             .or_insert_with(|| Arc::new(AtomicU64::new(0)))
             .clone();
         drop(guard);
@@ -1285,6 +1373,34 @@ impl MetricsRegistry {
             out.push_str(&format!(
                 "sgl_router_ingress_tokenize_errors_total{{model_id=\"{}\"}} {}\n",
                 escape_label(model_id),
+                value,
+            ));
+        }
+        drop(guard);
+
+        // input_ids_forwarding_total
+        out.push_str(
+            "# HELP sgl_router_input_ids_forwarding_total Dispatched chat requests by whether router-rendered input_ids were forwarded to the engine (outcome=forwarded) or why not; tokenized says whether the router still tokenized the request for routing.\n",
+        );
+        out.push_str("# TYPE sgl_router_input_ids_forwarding_total counter\n");
+        let guard = self.input_ids_forwarding_total.lock();
+        let mut entries: Vec<(&InputIdsForwardingKey, u64)> = guard
+            .iter()
+            .map(|(k, v)| (k, v.load(Ordering::Relaxed)))
+            .collect();
+        entries.sort_by(|a, b| {
+            (&a.0.model_id, a.0.outcome, a.0.tokenized).cmp(&(
+                &b.0.model_id,
+                b.0.outcome,
+                b.0.tokenized,
+            ))
+        });
+        for (key, value) in entries {
+            out.push_str(&format!(
+                "sgl_router_input_ids_forwarding_total{{model_id=\"{}\",outcome=\"{}\",tokenized=\"{}\"}} {}\n",
+                escape_label(&key.model_id),
+                key.outcome,
+                key.tokenized,
                 value,
             ));
         }
@@ -1833,6 +1949,24 @@ mod tests {
             out.contains(r#"sgl_router_ingress_tokenize_errors_total{model_id="other"} 1"#),
             "expected other=1; got:\n{out}",
         );
+    }
+
+    #[test]
+    fn input_ids_forwarding_counter_labels_outcome_and_tokenized() {
+        let reg = MetricsRegistry::new();
+        reg.record_input_ids_forwarding("tiny", InputIdsForwarding::Forwarded, true);
+        reg.record_input_ids_forwarding("tiny", InputIdsForwarding::Forwarded, true);
+        reg.record_input_ids_forwarding("tiny", InputIdsForwarding::Tools, true);
+        reg.record_input_ids_forwarding("tiny", InputIdsForwarding::Disabled, false);
+        let out = reg.render();
+        assert!(out.contains("# TYPE sgl_router_input_ids_forwarding_total counter"));
+        for series in [
+            r#"sgl_router_input_ids_forwarding_total{model_id="tiny",outcome="forwarded",tokenized="true"} 2"#,
+            r#"sgl_router_input_ids_forwarding_total{model_id="tiny",outcome="tools",tokenized="true"} 1"#,
+            r#"sgl_router_input_ids_forwarding_total{model_id="tiny",outcome="disabled",tokenized="false"} 1"#,
+        ] {
+            assert!(out.contains(series), "missing {series}; got:\n{out}");
+        }
     }
 
     #[test]

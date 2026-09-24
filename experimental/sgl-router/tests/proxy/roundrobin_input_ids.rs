@@ -295,6 +295,46 @@ async fn round_robin_tool_request_omits_input_ids() {
     );
 }
 
+/// One forwarding outcome books per dispatch, with `tokenized` telling
+/// routing-only tokenization apart from requests the router never tokenized.
+#[tokio::test]
+async fn input_ids_forwarding_metric_books_outcome_per_request() {
+    let chat = json!({"model": MODEL, "messages": [{"role": "user", "content": "hello"}]});
+    let mut tools = chat.clone();
+    tools["tools"] = json!([{"type": "function", "function": {"name": "f"}}]);
+    let series = |outcome: &str, tokenized: bool| {
+        format!(
+            r#"sgl_router_input_ids_forwarding_total{{model_id="{MODEL}",outcome="{outcome}",tokenized="{tokenized}"}} 1"#
+        )
+    };
+    for (cfg, request, expected) in [
+        (config(), &chat, series("forwarded", true)),
+        (config(), &tools, series("tools", true)),
+        (
+            without_forwarding(config(), PolicyKind::RoundRobin),
+            &chat,
+            series("disabled", false),
+        ),
+        (
+            without_forwarding(config(), PolicyKind::CacheAware),
+            &chat,
+            series("disabled", true),
+        ),
+    ] {
+        let mock = MockWorker::start(vec![]).await;
+        let ctx = build_ctx_with_config(mock.url.clone(), cfg);
+        assert_eq!(
+            send(Arc::clone(&ctx), request.clone()).await,
+            StatusCode::OK
+        );
+        let rendered = ctx.metrics.render();
+        assert!(
+            rendered.contains(&expected),
+            "missing {expected}; got:\n{rendered}"
+        );
+    }
+}
+
 /// A successful plain-chat forward on a chat-formatter model must NOT emit
 /// `sgl_router_ingress_tokenize_errors_total` — that counter fires only when the
 /// offload was expected but the encoder failed. A tool request on the same model
