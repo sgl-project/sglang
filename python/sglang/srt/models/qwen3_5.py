@@ -39,7 +39,6 @@ from sglang.srt.configs.qwen3_5 import (
 )
 
 # Distributed
-from sglang.srt.distributed import get_pp_group
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
@@ -134,8 +133,12 @@ _is_cpu = is_cpu()
 _is_gfx95 = is_gfx95_supported()
 _is_hip = is_hip()
 _QWEN3_5_MOE_TEXT_MODEL_TYPES = ("qwen3_5_moe_text", "qwen4_exp_text")
+# qwen4_exp shares these classes, but the ROCm packed path is Qwen3.5-only.
+_QWEN3_5_ROCM_PACKED_MODEL_TYPES = ("qwen3_5_text", "qwen3_5_moe_text")
 _is_xpu = is_xpu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+if _use_aiter:
+    from aiter.tuned_gemm import tgemm
 _hip_use_alt_stream = get_bool_env_var("SGLANG_ALT_STREAM") and _is_hip
 _gdn_use_alt_stream = _is_cuda or (
     get_bool_env_var("SGLANG_GDN_QKVZ_BA_ALT_STREAM", "False") and _hip_use_alt_stream
@@ -241,6 +244,15 @@ if _is_cpu:
     fused_qkvzba_split_reshape_cat_contiguous = (
         torch.ops.sgl_kernel.fused_qkvzba_split_reshape_cat_contiguous_cpu
     )
+
+if _is_npu:
+    from sgl_kernel_npu.activation.fused_sigmoid_mul import (
+        fused_sigmoid_mul as npu_fused_sigmoid_mul,
+    )
+
+    # NPU uses the Ascend-tuned implementation; other backends keep the
+    # original Triton kernel.
+    from sgl_kernel_npu.fla.utils import fused_qkvzba_split_reshape_cat_contiguous
 
 
 @lru_cache(maxsize=1)
@@ -395,6 +407,10 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         self._bind_packed_weight_loaders(self.in_proj_ba)
         self._fused_in_proj_weight: Optional[torch.Tensor] = None
         self._fused_in_proj_qkvz_width = 0
+        self._fused_in_proj_ba_width = 0
+        self._fused_in_proj_scale: Optional[torch.Tensor] = None
+        self._fused_in_proj_sources = None
+        self._derived_weight_cache_error = None
         self._fused_input_proj_cpu_enabled = LazyValue(
             lambda: (
                 _is_cpu
@@ -654,16 +670,27 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         return query, key, value, z, b, a
 
     def finalize_fused_in_proj(self) -> None:
-        """Stack in_proj_qkvz + in_proj_ba into one GEMM weight;
-        the module weights become row views of it,
-        so weight reload and dtype checks still see them."""
-        if not _is_cuda or self._fused_in_proj_weight is not None:
+        """Prepare one BF16 or FP8 GEMM for both input projections.
+
+        BF16 parameters alias the packed rows. FP8 keeps the original layouts
+        for the separate path and publishes its derived-cache update constraint.
+        """
+        if not (_is_cuda or _use_aiter) or self._fused_in_proj_weight is not None:
+            return
+        if (
+            _use_aiter
+            and self.config.model_type not in _QWEN3_5_ROCM_PACKED_MODEL_TYPES
+        ):
             return
         if get_lora().enable_lora or get_lora().lora_paths:
             # LoRA wraps the individual Linear modules; the fused GEMM would
             # bypass their adapters.
             return
+        if _use_aiter and not get_bool_env_var("SGLANG_QWEN35_PACKED_IN_PROJ", "True"):
+            return
         qkvz, ba = self.in_proj_qkvz, self.in_proj_ba
+        if _use_aiter and self._finalize_fused_fp8_in_proj():
+            return
         if not (
             isinstance(qkvz.quant_method, UnquantizedLinearMethod)
             and isinstance(ba.quant_method, UnquantizedLinearMethod)
@@ -679,7 +706,124 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         ba.weight.data = fused[self._fused_in_proj_qkvz_width :]
         self._fused_in_proj_weight = fused
 
+    def _finalize_fused_fp8_in_proj(self) -> bool:
+        """Pack loaded Quark per-channel FP8 projections without requantizing."""
+        from aiter.ops.shuffle import shuffle_weight
+
+        from sglang.srt.layers.quantization.fp8_utils import use_aiter_bpreshuffle_gemm
+        from sglang.srt.layers.quantization.quark.schemes.quark_w8a8_fp8 import (
+            QuarkW8A8Fp8,
+        )
+
+        projections = (self.in_proj_qkvz, self.in_proj_ba)
+        if not all(
+            type(getattr(proj, "scheme", None)) is QuarkW8A8Fp8
+            and proj.scheme.weight_qscheme == "per_channel"
+            and proj.scheme.per_token
+            and proj.input_scale is None
+            and proj.bias is None
+            and proj.weight.dtype == torch.float8_e4m3fn
+            and proj.weight.is_cuda
+            and proj.weight.t().is_contiguous()
+            and proj.weight.shape[1] % 16 == 0
+            and proj.weight_scale.numel() == proj.weight.shape[1]
+            for proj in projections
+        ):
+            return False
+        # Keep the derived-cache update constraint uniform across ranks. With
+        # PP, an attention-only stage may have no GDN cache to publish it from.
+        if get_parallel().pp_size != 1:
+            return False
+        widths = [proj.weight.shape[1] for proj in projections]
+        if projections[0].weight.shape[0] != projections[1].weight.shape[0]:
+            return False
+        # CK's bpreshuffle GEMM requires N % 64 == 0. TP4 has BA=32,
+        # so pad only the packed result, preserving the original Linear sizes.
+        padded_width = (sum(widths) + 63) // 64 * 64
+        weight = torch.zeros(
+            (padded_width, projections[0].weight.shape[0]),
+            dtype=projections[0].weight.dtype,
+            device=projections[0].weight.device,
+        )
+        scale = torch.ones((padded_width, 1), dtype=torch.float32, device=weight.device)
+        offset = 0
+        for proj, width in zip(projections, widths):
+            source = proj.weight.t()
+            if not use_aiter_bpreshuffle_gemm(width):
+                source = shuffle_weight(source, (16, 16))
+            # AITER's shuffle is local to 16 output rows; concatenating aligned
+            # shuffled blocks is identical to shuffling their concatenation.
+            weight[offset : offset + width].copy_(source)
+            scale[offset : offset + width].copy_(proj.weight_scale.view(-1, 1))
+            offset += width
+        self._fused_in_proj_weight = weight
+        self._fused_in_proj_scale = scale
+        self._fused_in_proj_qkvz_width, self._fused_in_proj_ba_width = widths
+        self._fused_in_proj_sources = tuple(
+            (value, value.data_ptr(), None if value.is_inference() else value._version)
+            for proj in projections
+            for value in (proj.weight, proj.weight_scale)
+        )
+        self._derived_weight_cache_error = (
+            "Online weight updates are not supported with packed FP8 GDN input "
+            "projections: captured graphs retain a derived weight/scale buffer. "
+            "Restart with SGLANG_QWEN35_PACKED_IN_PROJ=0 before updating weights."
+        )
+        return True
+
+    def _fused_fp8_in_proj_sources_valid(self) -> bool:
+        current = tuple(
+            value
+            for proj in (self.in_proj_qkvz, self.in_proj_ba)
+            for value in (proj.weight, proj.weight_scale)
+        )
+        return all(
+            value is source
+            and value.data_ptr() == pointer
+            and (version is None or value._version == version)
+            for value, (source, pointer, version) in zip(
+                current, self._fused_in_proj_sources
+            )
+        )
+
     def _forward_input_proj(self, hidden_states: torch.Tensor):
+        if _use_aiter and self._fused_in_proj_weight is not None:
+            # Unquantized BF16 projections consume the bf16 side of the fused
+            # AR+RMSNorm tuple; one aiter GEMM replaces the two separate
+            # projections. Measured on MI355X the packed GEMM only pays off for
+            # decode/verify-sized batches, so larger batches keep the separate
+            # projections below.
+            x = hidden_states[0] if isinstance(hidden_states, tuple) else hidden_states
+            if (
+                x.dtype == torch.bfloat16
+                and 0 < x.shape[0] <= 64
+                and not torch.compiler.is_compiling()
+            ):
+                if self._fused_in_proj_scale is not None:
+                    if self._fused_fp8_in_proj_sources_valid():
+                        from sglang.srt.layers.quantization.fp8_utils import (
+                            apply_fp8_linear,
+                        )
+
+                        fused_out = apply_fp8_linear(
+                            x,
+                            self._fused_in_proj_weight.t(),
+                            self._fused_in_proj_scale,
+                            use_per_token_if_dynamic=True,
+                        )
+                        split = self._fused_in_proj_qkvz_width
+                        return (
+                            fused_out[:, :split],
+                            fused_out[:, split : split + self._fused_in_proj_ba_width],
+                        )
+                else:
+                    fused_out = tgemm.mm(
+                        x, self._fused_in_proj_weight, None, otype=x.dtype
+                    )
+                    return (
+                        fused_out[:, : self._fused_in_proj_qkvz_width],
+                        fused_out[:, self._fused_in_proj_qkvz_width :],
+                    )
         # AMD/aiter fused AR+RMSNorm+per-group-quant path ships a
         # ``(bf16, fp8, scale)`` 3-tuple so the FP8 ``in_proj_qkvz`` can
         # consume ``(fp8, scale)`` (skipping its internal quant) while the
@@ -689,7 +833,8 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             return self._forward_input_proj_fused_quant_amd(hidden_states)
 
         if (
-            self._fused_in_proj_weight is not None
+            not _use_aiter
+            and self._fused_in_proj_weight is not None
             and hidden_states.dtype == torch.bfloat16
             # Measured on cuBLAS above ~1k rows:
             # the merged (m, 4120) GEMM is ~10% slower than the two separate GEMMs.
@@ -848,7 +993,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             z = None
             b = projected_states_ba
             a = projected_states_ba
-        elif use_fused_contiguous_unpack and not _is_npu:
+        elif use_fused_contiguous_unpack:
             if _is_cpu:
                 num_k_heads_tp = self.num_k_heads // self.attn_tp_size
                 num_v_heads_tp = self.num_v_heads // self.attn_tp_size
@@ -1443,7 +1588,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
                 attn_output = fused_sigmoid_mul(attn_output, gate, inplace=True)
             else:
                 gate_val = gate.reshape(gate.shape[0], -1) if gate.ndim == 3 else gate
-                attn_output.mul_(torch.sigmoid(gate_val))
+                attn_output = npu_fused_sigmoid_mul(attn_output, gate_val.contiguous())
 
         output, _ = self.o_proj(attn_output)
         return output
@@ -1628,7 +1773,7 @@ class Qwen3_5ForCausalLM(nn.Module):
         super().__init__()
         self.config = config
         self.hidden_size = config.hidden_size
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
 
         alt_stream = get_stream("alt") if _is_cuda or _hip_use_alt_stream else None
 
@@ -1725,6 +1870,15 @@ class Qwen3_5ForCausalLM(nn.Module):
         return self.embed_tokens
 
     def prepare_before_cuda_graph_capture(self, model_runner) -> None:
+        if _use_aiter and self.config.model_type in _QWEN3_5_ROCM_PACKED_MODEL_TYPES:
+            packed = 0
+            for module in self.modules():
+                if isinstance(module, Qwen3_5GatedDeltaNet):
+                    module.finalize_fused_in_proj()
+                    packed += int(module._fused_in_proj_weight is not None)
+            logger.info(
+                "Packed BF16/FP8 GDN input projection enabled for %d layers", packed
+            )
         if self.flashinfer_mnnvl_cutedsl_fusion is None:
             return
         from sglang.srt.layers.moe.qwen35_flashinfer_fusion import (
@@ -1967,6 +2121,23 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
         prefix: str = "",
     ) -> None:
         super().__init__(config=config, quant_config=quant_config, prefix=prefix)
+        # When aiter shared-expert fusion is on, the shared expert is served as an
+        # extra fused MoE slot (index == num_experts). load_weights must then remap
+        # the checkpoint's mlp.shared_expert.* onto that slot; otherwise the shared
+        # expert weights are silently dropped and accuracy collapses.
+        self.num_fused_shared_experts = 0
+        if _use_aiter and not _disable_shared_experts_fusion():
+            self.num_fused_shared_experts = self._get_num_fused_shared_experts()
+        self.enable_shared_expert_fusion = self.num_fused_shared_experts > 0
+
+    def _get_num_fused_shared_experts(self) -> int:
+        # This is a backbone-style module (holds self.layers directly), and under
+        # PP the non-local slots are PPMissingLayer (no .mlp), so scan for the
+        # first real MoE layer instead of assuming layers[0].
+        for layer in self.layers:
+            if hasattr(layer, "mlp") and hasattr(layer.mlp, "num_fused_shared_experts"):
+                return layer.mlp.num_fused_shared_experts
+        return 0
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         weights = QWEN3_5_KV_SCALE_MAPPER.apply(weights)
@@ -1984,13 +2155,19 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
             ("in_proj_ba.", "in_proj_a.", 1),
         ]
 
+        num_experts = self.config.num_experts
+
         # Params for weights, fp8 weight scales, fp8 activation scales
         # (param_name, weight_name, expert_id, shard_id)
         expert_params_mapping = FusedMoE.make_expert_params_mapping(
             ckpt_gate_proj_name="gate_proj",
             ckpt_down_proj_name="down_proj",
             ckpt_up_proj_name="up_proj",
-            num_experts=self.config.num_experts,
+            num_experts=(
+                num_experts
+                if not self.enable_shared_expert_fusion
+                else num_experts + self.num_fused_shared_experts
+            ),
         )
 
         # Skip loading extra parameters for GPTQ/modelopt models.
@@ -2013,7 +2190,37 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
             ("experts.w2_weight", "experts.down_proj", 0, "w2"),
         ]
 
-        num_experts = self.config.num_experts
+        if self.enable_shared_expert_fusion:
+            # When shared experts are fused, map them to the extra routed slot:
+            #   mlp.shared_expert.gate_up_proj -> experts.{num_experts}.gate_up_proj -> w13, expert_id=num_experts
+            #   mlp.shared_expert.down_proj    -> experts.{num_experts}.down_proj    -> w2,  expert_id=num_experts
+            fused_expert_params_mapping += [
+                (
+                    "experts.w13_",
+                    f"experts.{num_experts}.gate_up_proj.",
+                    num_experts,
+                    "w1",
+                ),
+                (
+                    "experts.w2_",
+                    f"experts.{num_experts}.down_proj.",
+                    num_experts,
+                    "w2",
+                ),
+                ## shared experts may contain gate_proj and up_proj instead of gate_up_proj
+                (
+                    "experts.w13_",
+                    f"experts.{num_experts}.gate_proj.",
+                    num_experts,
+                    "w1",
+                ),
+                (
+                    "experts.w13_",
+                    f"experts.{num_experts}.up_proj.",
+                    num_experts,
+                    "w3",
+                ),
+            ]
 
         def load_fused_expert_weights(
             name: str,
@@ -2061,6 +2268,13 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
             ):
                 continue
 
+            if self.enable_shared_expert_fusion and "mlp.shared_expert." in name:
+                # Firstly map mlp.shared_expert.xx_proj to mlp.experts.{num_experts}.xx_proj
+                name = name.replace(
+                    "mlp.shared_expert.",
+                    f"mlp.experts.{num_experts}.",
+                )
+
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if "experts.gate_up_proj" in name or "experts.down_proj" in name:
                     is_fused_expert = True
@@ -2103,7 +2317,9 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
                     is_expert_weight = True
                     name_mapped = name.replace(weight_name, param_name)
                     if is_fused_expert:
+                        # is_fused_expert is True, the checkpoint contains gate_up_proj and down_proj for each expert
                         if "experts.gate_up_proj" in name:
+                            # experts.gate_up_proj contains all routed experts, excluding shared experts
                             loaded_weight = loaded_weight.chunk(2, dim=-2)
                             load_fused_expert_weights(
                                 name_mapped,
@@ -2119,7 +2335,8 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
                                 "w3",
                                 num_experts,
                             )
-                        else:
+                        elif "experts.down_proj" in name:
+                            # experts.down_proj contains all routed experts, excluding shared experts
                             load_fused_expert_weights(
                                 name_mapped,
                                 params_dict,
@@ -2127,6 +2344,41 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
                                 shard_id,
                                 num_experts,
                             )
+                        elif self.enable_shared_expert_fusion:
+                            # shared experts should be loaded to experts.w13_weight and experts.w2_weight
+                            param = params_dict[name_mapped]
+                            weight_loader = getattr(
+                                param, "weight_loader", default_weight_loader
+                            )
+                            if f"{num_experts}.gate_up_proj" in name:
+                                # split into w1 and w3
+                                loaded_weight = loaded_weight.chunk(2, dim=-2)
+                                # load to experts.w13_weight, shard_id = w1, expert_id = num_experts
+                                weight_loader(
+                                    param,
+                                    loaded_weight[0],
+                                    name_mapped,
+                                    "w1",
+                                    expert_id,
+                                )
+                                # load to experts.w13_weight, shard_id = w3, expert_id = num_experts
+                                weight_loader(
+                                    param,
+                                    loaded_weight[1],
+                                    name_mapped,
+                                    "w3",
+                                    expert_id,
+                                )
+                            else:
+                                # load down_proj to experts.w2_weight, shard_id = w2, expert_id = num_experts
+                                # Or load gate_proj and up_proj to experts.w13_weight, shard_id = w1/w3, expert_id = num_experts
+                                weight_loader(
+                                    param,
+                                    loaded_weight,
+                                    name_mapped,
+                                    shard_id,
+                                    expert_id,
+                                )
                     else:
                         # Skip loading extra parameters for GPTQ/modelopt models.
                         if (

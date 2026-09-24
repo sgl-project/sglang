@@ -25,14 +25,17 @@ from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.observability.metrics_collector import (
     STAT_LOGGER_ROLE_RADIX_CACHE,
     RadixCacheMetricsCollector,
+    radix_cache_metric_labels,
     resolve_collector_class,
 )
-from sglang.srt.runtime_context import get_observability
+from sglang.srt.runtime_context import get_observability, get_parallel
 
 if TYPE_CHECKING:
     from sglang.srt.managers.cache_controller import HiCacheController
     from sglang.srt.managers.schedule_batch import Req
+    from sglang.srt.mem_cache.buffer_mode.pipeline import BufferModePipeline
     from sglang.srt.mem_cache.radix_cache import RadixKey
+    from sglang.srt.mem_cache.storage_prefetch import StoragePrefetchRetries
     from sglang.srt.mem_cache.unified_cache.cache_action import (
         CacheAction,
         ComponentAction,
@@ -332,11 +335,17 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         None  # metrics collector for the cache
     )
     cache_controller: Optional[HiCacheController] = None
+    buffer_pipeline: Optional[BufferModePipeline] = None
+    storage_prefetch_retries: Optional[StoragePrefetchRetries] = None
     # Set by caches that publish KV placement events; None means they don't.
     kv_events: Optional[KVCacheEventRecorder] = None
 
     def init_metrics_collector(self):
-        labels = {"cache_type": self.__class__.__name__}
+        from sglang.srt.layers.dp_attention import is_dp_attention_enabled
+
+        labels = radix_cache_metric_labels(
+            self.__class__.__name__, get_parallel(), is_dp_attention_enabled()
+        )
         if get_observability().extra_metric_labels:
             labels.update(get_observability().extra_metric_labels)
         radix_cache_cls = resolve_collector_class(
@@ -397,22 +406,6 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         implementations that shard trees per cache namespace."""
         return self.root_node
 
-    def is_backuped(self, node: Any) -> bool:
-        """Whether the node's Full KV is present on host."""
-        return node.backuped
-
-    def is_root(self, node: Any) -> bool:
-        """Whether the node is a tree root."""
-        return node is self.root_node
-
-    def get_last_hash_value(self, node: Any) -> Optional[str]:
-        """The node's last page hash, or None when it was never hashed."""
-        return node.get_last_hash_value()
-
-    def get_prefix_hash_values(self, node: Any) -> list[str]:
-        """The hash chain of the node's ancestors, in root-to-parent order."""
-        return node.get_prefix_hash_values(node.parent)
-
     def rotation_base_of(self, node: Any) -> Optional[int]:
         """Logical-page KV sharding: the rotation base stamped on ``node``.
 
@@ -425,8 +418,18 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         return None
 
     @abstractmethod
-    def cache_finished_req(self, req: Req, is_insert: bool = True, **kwargs):
-        pass
+    def cache_finished_req(
+        self, req: Req, is_insert: bool = True, *, owned_kv_len: int, **kwargs
+    ):
+        """Dispose of a finished request's KV.
+
+        ``[0, req.kv.cache_protected_len)`` is cache-owned and must survive.
+        Every slot in ``[req.kv.cache_protected_len, owned_kv_len)`` is this
+        call's to account for: insert what can be keyed, release the rest.
+        Slicing the kv row by the token-id count instead strands whatever
+        lies between -- no caller releases those. ``release_kv_cache`` frees
+        everything past ``owned_kv_len``.
+        """
 
     @abstractmethod
     def cache_unfinished_req(self, req: Req, **kwargs):
@@ -438,13 +441,15 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         """
         from sglang.srt.mem_cache.common import coalesce_ranges, free_kv_row_segments
 
+        allocator = self.token_to_kv_pool_allocator
         row = self.req_to_token_pool.req_to_token[kv.req_pool_idx]
         # Adjacent pieces whose seam falls inside one (DCP-widened) page would
         # free that page twice; the allocator rejects that, so merge them first.
         free_kv_row_segments(
-            self.token_to_kv_pool_allocator,
+            allocator,
             [(row[start:end], start) for start, end in coalesce_ranges(ranges)],
             swa_evicted_seqlen=kv.swa_evicted_seqlen,
+            swa_dead_lo=kv.swa_dead_lo(allocator.page_size),
         )
 
     @abstractmethod
@@ -489,6 +494,10 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
     def swa_protected_size(self):
         return 0
 
+    def swa_transient_size(self):
+        """Allocated SWA tokens owned outside the request and tree views."""
+        return 0
+
     def total_size(self):
         raise NotImplementedError()
 
@@ -498,9 +507,10 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
     def init_load_back(
         self,
         params: InitLoadBackParams,
-    ) -> Tuple[torch.Tensor, Any]:
+    ) -> Optional[Tuple[torch.Tensor, Any]]:
         """
-        Preparing KV cache loading from host to device.
+        Prepare host-to-device loading. None means retry admission; an empty
+        tensor can be a successful auxiliary-only load or a recompute fallback.
         """
         raise NotImplementedError()
 
@@ -535,6 +545,13 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         Check HiCache related activities to update radix tree and synchronize across TP workers if needed
         """
         raise NotImplementedError()
+
+    def flush_pending_backups(self) -> None:
+        """
+        Submit queued host backups.
+        Caches without deferred backups have nothing to flush.
+        """
+        pass
 
     def take_events(self):
         return [] if self.kv_events is None else self.kv_events.take()

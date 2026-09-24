@@ -1,14 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import logging
+from array import array
 from typing import Iterable, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
 
-from sglang.srt.distributed import (
-    get_pp_group,
-)
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe.utils import (
     get_moe_a2a_backend,
@@ -47,13 +45,22 @@ from sglang.srt.models.minimax_vl_common import (
 )
 from sglang.srt.models.utils import WeightsMapper
 from sglang.srt.runtime_context import get_mm, get_parallel
-from sglang.srt.utils import add_prefix, get_device_sm, is_cuda, log_info_on_rank0
+from sglang.srt.utils import (
+    add_prefix,
+    get_device_sm,
+    is_cuda,
+    is_gfx95_supported,
+    is_hip,
+    log_info_on_rank0,
+)
 from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
 logger = logging.getLogger(__name__)
 
 
 _is_cuda = is_cuda()
+_is_hip = is_hip()
+_is_gfx95_supported = is_gfx95_supported()
 _device_sm = get_device_sm()
 
 
@@ -77,7 +84,7 @@ class MiniMaxM3SparseForConditionalGeneration(nn.Module):
         super().__init__()
         self.config = config
         self.quant_config = quant_config
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
 
         self.use_data_parallel = get_mm().mm_enable_dp_encoder
 
@@ -152,10 +159,12 @@ class MiniMaxM3SparseForConditionalGeneration(nn.Module):
                 "Shared and routed experts may use different quantization formats "
                 "in ModelOpt mixed-precision checkpoints."
             )
-        if not _is_cuda:
-            return "Shared experts fusion currently requires CUDA devices."
-        if (_device_sm is not None) and (_device_sm < 80):
+        if not (_is_cuda or _is_hip):
+            return "Shared experts fusion currently requires CUDA or ROCm devices."
+        if _is_cuda and (_device_sm is not None) and (_device_sm < 80):
             return "Shared experts fusion requires SM80 or newer GPUs."
+        if _is_hip and not _is_gfx95_supported:
+            return "Shared experts fusion on ROCm is validated on gfx950 only."
         if get_parallel().moe_ep_size > 1:
             return (
                 "Shared experts fusion is not supported together with expert "
@@ -187,7 +196,7 @@ class MiniMaxM3SparseForConditionalGeneration(nn.Module):
             text_config
         )
 
-    def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
+    def pad_input_ids(self, input_ids: array, mm_inputs: MultimodalInputs) -> array:
         return MultiModalityDataPaddingPatternMultimodalTokens().pad_input_tokens(
             input_ids, mm_inputs
         )

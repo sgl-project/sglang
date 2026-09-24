@@ -25,10 +25,18 @@ class Glm5NextForConditionalGenerationNextN(DeepseekV3ForCausalLMNextN):
     @classmethod
     def get_hf_to_sglang_mapper(cls, config) -> WeightsMapper:
         text_config = getattr(config, "text_config", config)
-        return WeightsMapper(
-            orig_to_new_substr={
-                f"model.layers.{text_config.num_hidden_layers}": "model.decoder",
-            },
+        n = text_config.num_hidden_layers
+        # lookups arrive as checkpoint and normalized names, so every rule has both forms
+        draft_rules: dict[str, str] = {}
+        for ckpt_prefix in (f"model.language_model.layers.{n}", f"model.layers.{n}"):
+            # eh_proj/enorm/hnorm sit beside the block under `model`, not in `decoder`
+            draft_rules[f"{ckpt_prefix}.eh_proj"] = "model.eh_proj"
+            draft_rules[f"{ckpt_prefix}.enorm"] = "model.enorm"
+            draft_rules[f"{ckpt_prefix}.hnorm"] = "model.hnorm"
+            draft_rules[ckpt_prefix] = "model.decoder"
+        # target rules still normalize the non-draft layers and vision tower in `exclude`
+        return Glm5NextForConditionalGeneration.hf_to_sglang_mapper | WeightsMapper(
+            orig_to_new_substr=draft_rules,
         )
 
     def _resolve_nextn_quant_config(self, config, quant_config):

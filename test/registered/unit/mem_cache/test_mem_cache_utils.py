@@ -90,9 +90,6 @@ class _HashKey:
     def raw_token_ids(self):
         return self.token_ids
 
-    def hash_page(self, start, end, prior_hash=None):
-        return _legacy_get_hash_str(self[start:end], prior_hash)
-
 
 def _single_hash_compatibility_cases():
     prior_hash = _legacy_get_hash_str([7, 8, 9])
@@ -262,15 +259,6 @@ class TestGetHashStr(unittest.TestCase):
         for tokens in [[], [1], [1, 2, 3], [(1, 2)], [1, 2, 3, 4, 5]]:
             with self.subTest(tokens=tokens):
                 self.assertRegex(get_hash_str(tokens), r"^[0-9a-f]{64}$")
-
-    def test_hash_key_hash_page_matches_get_hash_str(self):
-        key = _HashKey(array("q", [1, 2, 3, 4, 5, 6]), is_bigram=True)
-        prior_hash = get_hash_str([(9, 10)])
-
-        self.assertEqual(
-            key.hash_page(1, 4, prior_hash),
-            get_hash_str(key[1:4], prior_hash),
-        )
 
 
 class TestStorageHashNamespace(unittest.TestCase):

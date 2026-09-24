@@ -26,7 +26,6 @@ from sglang.kernels.ops.activation.softcap import (
     softcap_inplace_logits as fused_softcap,
 )
 from sglang.srt.beam_search.logits_capture import BeamLogitsCapture
-from sglang.srt.distributed import get_tp_group
 from sglang.srt.distributed.device_communicators import triton_symm_mem_ag
 from sglang.srt.environ import envs
 from sglang.srt.layers import layernorm_sp
@@ -51,13 +50,13 @@ from sglang.srt.layers.logprob_processor import (
     get_top_logprobs_raw,
 )
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
+from sglang.srt.managers.auxiliary_output import DeviceAuxiliaryOutput
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
     ForwardMode,
 )
 from sglang.srt.runtime_context import get_exec, get_parallel
-from sglang.srt.sampling.sampling_observer import DeviceAuxiliaryOutput
 from sglang.srt.utils.common import (
     is_cpu,
     is_npu,
@@ -209,6 +208,9 @@ class LogitsProcessorOutput:
     # The last hidden layers
     hidden_states: Optional[torch.Tensor] = None
 
+    # Original flattened token indices when only a subset of hidden rows is captured.
+    hidden_states_token_indices: Optional[torch.Tensor] = None
+
     ## Part 2: This part will be assigned in python/sglang/srt/layers/sampler.py::Sampler
     # he log probs of output tokens, if SGLANG_RETURN_ORIGINAL_LOGPROB = True, will get the log probs before applying temperature. If False, will get the log probs before applying temperature.
     next_token_logprobs: Optional[torch.Tensor] = None
@@ -241,6 +243,9 @@ class LogitsProcessorOutput:
     )
     input_token_ids_logprobs_idx: Optional[List] = None
 
+    # Completion of input-logprob copies from borrowed graph storage.
+    input_logprobs_copy_done: Optional[torch.cuda.Event] = None
+
     ## Part 4: Diffusion LLM only.
     full_logits: Optional[torch.Tensor] = None
 
@@ -260,6 +265,22 @@ class LogitsProcessorOutput:
     # Scheduler-local output copied alongside the ordinary generation result.
     auxiliary_device_output: Optional[DeviceAuxiliaryOutput] = None
 
+    def finalize_input_logprobs(self) -> None:
+        if self.input_logprobs_copy_done is None:
+            return
+        self.input_logprobs_copy_done.synchronize()
+        self.input_logprobs_copy_done = None
+        # Only borrowed results contain spans within each sequence. Other
+        # producers (including multi-item scoring) keep their existing layout.
+        for sequences in (
+            self.input_top_logprobs_val,
+            self.input_top_logprobs_idx,
+            self.input_token_ids_logprobs_val,
+        ):
+            if sequences is not None:
+                for i, spans in enumerate(sequences):
+                    sequences[i] = [row for span in spans for row in span.tolist()]
+
 
 @dataclasses.dataclass
 class LogitsMetadata:
@@ -276,6 +297,8 @@ class LogitsMetadata:
     extend_logprob_pruned_lens_cpu: Optional[List[int]] = None
     top_logprobs_nums: Optional[List[int]] = None
     extend_input_logprob_token_ids_gpu: Optional[torch.Tensor] = None
+    sample_indices_cpu: Optional[List[int]] = None
+    input_logprob_indices_cpu: Optional[List[int]] = None
     token_ids_logprobs: Optional[List[List[int]]] = None
 
     # logits and logprobs post processing
@@ -309,10 +332,15 @@ class LogitsMetadata:
 
     @classmethod
     def from_forward_batch(cls, forward_batch: ForwardBatch):
+        # MLP-sync may turn an idle rank into a dummy EXTEND for DP prefill
+        # graphs. It still has no real request whose last token needs logits.
+        forward_mode = forward_batch.forward_mode
+        if forward_batch._original_forward_mode == ForwardMode.IDLE:
+            forward_mode = ForwardMode.IDLE
         if (
-            forward_batch.forward_mode.is_extend()
+            forward_mode.is_extend()
             and forward_batch.return_logprob
-            and not forward_batch.forward_mode.is_target_verify()
+            and not forward_mode.is_target_verify()
         ):
             extend_return_top_logprob = any(
                 x > 0 for x in forward_batch.top_logprobs_nums
@@ -340,7 +368,7 @@ class LogitsMetadata:
             draft_extend_select_index = None
 
         return cls(
-            forward_mode=forward_batch.forward_mode,
+            forward_mode=forward_mode,
             capture_hidden_mode=forward_batch.capture_hidden_mode,
             next_token_logits_buffer=forward_batch.next_token_logits_buffer,
             extend_return_logprob=extend_return_logprob,
@@ -450,7 +478,19 @@ class LogitsProcessor(nn.Module):
             skip_entry_sync=True,
         )
 
-        self.input_logprob_processor = InputLogprobProcessor()
+        chunking_group = None
+        if (
+            self.do_tensor_parallel_all_gather
+            and not self.do_tensor_parallel_all_gather_dp_attn
+        ):
+            parallel = get_parallel()
+            group = (
+                parallel.attn_tp_group if self.use_attn_tp_group else parallel.tp_group
+            )
+            chunking_group = group.cpu_group
+        self.input_logprob_processor = InputLogprobProcessor(
+            self.vocab_size, chunking_group=chunking_group
+        )
 
     def forward(
         self,
@@ -718,6 +758,8 @@ class LogitsProcessor(nn.Module):
                     else [torch.cat(lst) for lst in aux_pruned_states_lists]
                 )
 
+            logits_metadata.sample_indices_cpu = sample_indices
+            logits_metadata.input_logprob_indices_cpu = input_logprob_indices
             # Build the index tensors via pinned host memory + non-blocking H2D
             # so the small copy doesn't drain the stream.
             sample_indices = torch.tensor(
@@ -1044,10 +1086,10 @@ class LogitsProcessor(nn.Module):
         """Exchange only the row block owned by each destination DP rank."""
         logits = logits.contiguous()
         all_to_all_output = torch.empty_like(logits)
-        get_tp_group().all_to_all_single(all_to_all_output.view(-1), logits.view(-1))
-        return _reassemble_tp_lm_head_all_to_all_output(
-            all_to_all_output, get_parallel().tp_size
+        get_parallel().tp_group.all_to_all_single(
+            all_to_all_output.view(-1), logits.view(-1)
         )
+        return _reassemble_tp_lm_head_all_to_all_output(all_to_all_output)
 
     def _scatter_dp_attn_logits(
         self,
@@ -1208,7 +1250,7 @@ class LogitsProcessor(nn.Module):
 
 
 def _reassemble_tp_lm_head_all_to_all_output(
-    all_to_all_output: torch.Tensor, tp_size: int
+    all_to_all_output: torch.Tensor,
 ) -> torch.Tensor:
     """Convert source-major all-to-all output to row-major full-vocab logits.
 
@@ -1217,6 +1259,7 @@ def _reassemble_tp_lm_head_all_to_all_output(
     along dim 0, while the sampler expects the vocab shards concatenated along
     dim 1.
     """
+    tp_size = get_parallel().tp_size
     assert all_to_all_output.shape[0] % tp_size == 0
     local_rows = all_to_all_output.shape[0] // tp_size
     vocab_shard = all_to_all_output.shape[1]
