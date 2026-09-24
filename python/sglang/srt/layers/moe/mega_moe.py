@@ -34,7 +34,6 @@ from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.models.deepseek_common.utils import _device_sm
 from sglang.srt.runtime_context import get_exec
-from sglang.srt.utils import ceil_align
 
 if TYPE_CHECKING:
     from deep_gemm import SymmBuffer
@@ -44,7 +43,6 @@ if TYPE_CHECKING:
 
 
 _MEGA_MOE_SYMM_BUFFER: dict = {}
-_MEGA_MOE_SHARED_SF_INDEX: dict = {}
 
 
 def _mega_moe_mma_type(experts=None) -> str:
@@ -147,33 +145,6 @@ def _get_mega_moe_symm_buffer(
     return buf
 
 
-def _fill_mega_moe_shared_l1_acts_sf(buf: SymmBuffer, num_tokens: int) -> None:
-    import deep_gemm
-
-    block_m = deep_gemm.get_block_m_for_mega_moe(
-        num_ranks=buf.group.size(),
-        num_experts=buf.num_experts,
-        num_max_tokens_per_rank=buf.num_max_tokens_per_rank,
-        num_tokens=num_tokens,
-        num_topk=buf.num_topk,
-        mma_type=buf.mma_type,
-    )
-    index = _MEGA_MOE_SHARED_SF_INDEX.get(block_m)
-    if index is None:
-        # The kernel reads shared L1 scales in BLOCK_M blocks padded to 128 rows,
-        # 4x32-transposed within each 128 rows (sm100_fp8_fp4_mega_moe.cuh).
-        token = torch.arange(buf.num_max_tokens_per_rank, device=buf.x_sf.device)
-        m = token % block_m
-        index = (
-            token // block_m * ceil_align(block_m, 128)
-            + m // 128 * 128
-            + m % 32 * 4
-            + m % 128 // 32
-        )
-        _MEGA_MOE_SHARED_SF_INDEX[block_m] = index
-    buf.shared_l1_acts_sf[index[:num_tokens]] = buf.x_sf[:num_tokens]
-
-
 def is_mega_moe_experts_ready(experts) -> bool:
     if not experts._mega_moe_weights_built:
         return False
@@ -221,9 +192,24 @@ def forward_mega_moe(
     num_tokens = hidden_states.shape[0]
 
     if moe.mega_shared_l1_weights is not None:
-        return _run_mega_routed(
-            moe, hidden_states, forward_batch, input_ids_global, num_tokens
+        fused_fork_flag = (
+            moe.alt_stream is not None
+            and num_tokens > 0
+            and get_is_capture_mode()
         )
+        if not fused_fork_flag:
+            return _run_mega_routed(
+                moe, hidden_states, forward_batch, input_ids_global, num_tokens
+            )
+
+        current_stream = torch.cuda.current_stream()
+        moe.alt_stream.wait_stream(current_stream)
+        with torch.cuda.stream(moe.alt_stream):
+            y = _run_mega_routed(
+                moe, hidden_states, forward_batch, input_ids_global, num_tokens
+            )
+        current_stream.wait_stream(moe.alt_stream)
+        return y
 
     sbo_overlap_flag = (
         moe.alt_stream is not None
@@ -417,6 +403,18 @@ def run_mega_routed_experts(
             mma_type=mma_type,
         )
     else:
+        shared_block_m = 0
+        if shared_l1_weights is not None:
+            shared_block_m = deep_gemm.get_block_m_for_mega_moe(
+                num_ranks=buf.group.size(),
+                num_experts=buf.num_experts,
+                # DeepGEMM rounds the requested capacity up for its buffer.
+                num_max_tokens_per_rank=buf.num_max_tokens_per_rank,
+                # Match the non-null output allocation passed to DeepGEMM.
+                num_tokens=max(num_tokens, 1),
+                num_topk=buf.num_topk,
+                mma_type=buf.mma_type,
+            )
         mega_moe_pre_dispatch(
             hidden_states,
             topk_ids_in,
@@ -426,6 +424,10 @@ def run_mega_routed_experts(
             buf.topk_idx,
             buf.topk_weights,
             quant_group_size=32,
+            shared_x_sf=(
+                buf.shared_l1_acts_sf if shared_l1_weights is not None else None
+            ),
+            shared_block_m=shared_block_m,
         )
 
     # Allocate at least one row so y has a non-null CUDA data_ptr;
@@ -435,8 +437,6 @@ def run_mega_routed_experts(
         dtype=torch.bfloat16,
         device=hidden_states.device,
     )
-    if shared_l1_weights is not None:
-        _fill_mega_moe_shared_l1_acts_sf(buf, num_tokens=y.shape[0])
     with _configure_mega_moe_deep_gemm_num_sms(deep_gemm):
         deep_gemm.fp8_fp4_mega_moe(
             y,
