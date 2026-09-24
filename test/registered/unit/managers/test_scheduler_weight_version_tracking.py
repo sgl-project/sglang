@@ -219,11 +219,15 @@ class TestRecordWeightVersionAfterUpdate(_WeightUpdaterManagerTestBase):
         self.assertFalse(output.success)
         self.assertEqual(self.recorded, [])
 
-    def test_successful_tensor_update_records_the_version(self):
-        """The tensor refit records the version once the load reports success."""
-        output = self._manager(_runner()).update_weights_from_tensor(_request())
+    def test_successful_tensor_update_records_the_version_at_commit(self):
+        """Like the distributed path: the version rides the session and lands at commit."""
+        manager = self._manager(_runner())
+        output = manager.update_weights_from_tensor(_request())
 
         self.assertTrue(output.success)
+        self.assertEqual(self.recorded, [])
+
+        self.assertTrue(manager.end_weight_update(EndWeightUpdateReqInput()).success)
         self.assertEqual(self.recorded, ["v2"])
 
     def test_successful_ipc_update_records_the_version(self):
