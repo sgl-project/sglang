@@ -64,6 +64,9 @@ def _copy_local_weights_to_handles(
 
         param.untyped_storage().resize_(0)
 
+        # Release freed memory per shard to avoid doubling peak memory.
+        backend.empty_cache()
+
         handles[(layer_idx, name)] = handle
         sizes[(layer_idx, name)] = phys_size
 
@@ -71,8 +74,6 @@ def _copy_local_weights_to_handles(
             f"Phase 1: layer={layer_idx}, name={name}, "
             f"phys_size={phys_size}, data_offset={data_offset}"
         )
-
-    backend.empty_cache()
 
     return handles, sizes
 
