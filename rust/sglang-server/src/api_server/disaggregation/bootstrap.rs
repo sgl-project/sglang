@@ -44,6 +44,7 @@ struct PrefillServerInfo {
     dsv41_spec_layout: Option<serde_json::Value>,
     follow_bootstrap_room: bool,
     enable_dsa_cache_layer_split: bool,
+    speculative_use_rejection_sampling: Option<bool>,
     prefill_http_port: Option<i64>,
 }
 
@@ -111,6 +112,7 @@ struct Topology {
     dsv41_spec_layout: Option<serde_json::Value>,
     follow_bootstrap_room: Option<bool>,
     enable_dsa_cache_layer_split: Option<bool>,
+    speculative_use_rejection_sampling: Option<bool>,
     prefill_http_port: Option<i64>,
     /// Keyed `(dp_group, attn_cp_rank, attn_tp_rank, pp_rank)` — the flat form
     /// of Python's nested `prefill_port_table` dicts.
@@ -164,6 +166,8 @@ struct Route {
     load_balance_method: Option<String>,
     #[serde(default)]
     enable_dsa_cache_layer_split: Option<bool>,
+    #[serde(default)]
+    speculative_use_rejection_sampling: Option<bool>,
 }
 
 async fn route_put(State(state): State<Arc<Registry>>, Json(body): Json<Route>) -> Response {
@@ -209,6 +213,12 @@ async fn route_put(State(state): State<Arc<Registry>>, Json(body): Json<Route>) 
         );
         topo.enable_dsa_cache_layer_split
             .get_or_insert(body.enable_dsa_cache_layer_split.unwrap_or(false));
+        if topo.registered_count == 0 {
+            topo.speculative_use_rejection_sampling = body.speculative_use_rejection_sampling;
+        } else if topo.speculative_use_rejection_sampling != body.speculative_use_rejection_sampling {
+            // Do not let a later rank overwrite an unknown or mixed wire layout.
+            topo.speculative_use_rejection_sampling = None;
+        }
         topo.prefill_ranks.insert(
             (dp_group, body.attn_cp_rank, body.attn_tp_rank, body.pp_rank),
             PrefillRankInfo {
@@ -284,6 +294,7 @@ async fn route_get(
             dsv41_spec_layout: topo.dsv41_spec_layout.clone(),
             follow_bootstrap_room: topo.follow_bootstrap_room.unwrap_or(true),
             enable_dsa_cache_layer_split: topo.enable_dsa_cache_layer_split.unwrap_or(false),
+            speculative_use_rejection_sampling: topo.speculative_use_rejection_sampling,
             prefill_http_port: topo.prefill_http_port,
         })
         .into_response();
@@ -379,6 +390,48 @@ pub(crate) fn router_and_sweeper() -> (Router, impl std::future::Future<Output =
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn mixed_rejection_sampling_flags_stay_unknown() {
+        let (_rt, addr) = start_on_free_port();
+        for flag in [false, true, true] {
+            let body = put_route(serde_json::json!({"speculative_use_rejection_sampling": flag}));
+            assert_eq!(request(addr, "PUT", "/route", Some(&body)).0, 200);
+        }
+        let (status, body) = request(addr, "GET", SENTINEL, None);
+        assert_eq!(status, 200);
+        let info: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(
+            info.get("speculative_use_rejection_sampling"),
+            Some(&serde_json::Value::Null),
+        );
+    }
+
+    #[test]
+    fn rejection_sampling_flag_round_trip() {
+        for enabled in [Some(false), Some(true), None] {
+            let (_rt, addr) = start_on_free_port();
+            let mut body = put_route(serde_json::json!({
+                "speculative_use_rejection_sampling": enabled,
+            }));
+            if enabled.is_none() {
+                // An older prefill's missing flag must remain unknown, not false.
+                body.as_object_mut()
+                    .unwrap()
+                    .remove("speculative_use_rejection_sampling");
+            }
+            assert_eq!(request(addr, "PUT", "/route", Some(&body)).0, 200);
+
+            let (status, body) = request(addr, "GET", SENTINEL, None);
+            assert_eq!(status, 200);
+            let info: serde_json::Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(
+                info.get("speculative_use_rejection_sampling"),
+                Some(&serde_json::json!(enabled)),
+            );
+        }
+    }
+
+
     use super::*;
     use crate::message::config::{
         DisaggregationMode, RuntimeConfig, RustServerServerArgs, ServerArgs,
@@ -429,6 +482,7 @@ mod tests {
             "page_size": 64, "kv_cache_dtype": "auto",
             "load_balance_method": "follow_bootstrap_room",
             "enable_dsa_cache_layer_split": false,
+            "speculative_use_rejection_sampling": false,
             "prefill_http_port": 30000,
         });
         body.as_object_mut()
@@ -518,6 +572,7 @@ mod tests {
                 "page_size": 64, "kv_cache_dtype": "auto",
                 "follow_bootstrap_room": true,
                 "enable_dsa_cache_layer_split": false,
+                "speculative_use_rejection_sampling": false,
                 "prefill_http_port": 30000,
             })
         );

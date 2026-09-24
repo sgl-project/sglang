@@ -2417,6 +2417,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             output_topk_p,
             output_topk_index,
             output_hidden_states,
+            output_draft_probs,
             output_dsa_topk_indices,
             output_bootstrap_room,
         ) = self.metadata_buffers.get_buf(idx)
@@ -2525,6 +2526,19 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             decode_req.req.output_topk_p = output_topk_p
             decode_req.req.output_topk_index = output_topk_index
             decode_req.req.hidden_states_tensor = output_hidden_states
+            if output_draft_probs is not None and _is_fake_transfer(decode_req.req):
+                # Fake-transfer requests are server warmups: no prefill worker
+                # populated metadata, but the rejection-sampling draft path still
+                # requires a valid q distribution.  Use a one-hot distribution
+                # at the synthetic proposal so warmup exercises the same tensor
+                # shapes without affecting any user-visible sampling result.
+                output_draft_probs.zero_()
+                fake_draft_token = int(output_topk_index.reshape(-1)[0].item())
+                if not 0 <= fake_draft_token < output_draft_probs.numel():
+                    fake_draft_token = 0
+                    output_topk_index[0] = fake_draft_token
+                output_draft_probs[fake_draft_token] = 1.0
+            decode_req.req.output_draft_probs = output_draft_probs
             if (
                 output_dsa_topk_indices is not None
                 and torch.all(output_dsa_topk_indices < 0).item()

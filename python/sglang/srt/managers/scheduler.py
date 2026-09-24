@@ -1496,6 +1496,18 @@ class Scheduler(
         output_dsa_topk_indices_dim = get_dsa_seed_metadata_dim(
             self.model_config.hf_config
         )
+        output_draft_probs_dim = 0
+        if (
+            self.disaggregation_mode != DisaggregationMode.NULL
+            and self.spec_algorithm.is_eagle()
+            and get_spec().speculative_use_rejection_sampling
+        ):
+            if get_spec().enable_multi_layer_eagle:
+                raise ValueError(
+                    "PD EAGLE rejection sampling currently supports only the "
+                    "single-layer draft worker."
+                )
+            output_draft_probs_dim = self.model_config.vocab_size
 
         if (
             self.disaggregation_mode == DisaggregationMode.DECODE
@@ -1514,6 +1526,7 @@ class Scheduler(
                 max_sampling_mask_tokens=self.server_args.sampling_mask_max_tokens,
                 custom_mem_pool=self.token_to_kv_pool_allocator.get_kvcache().maybe_get_custom_mem_pool(),
                 output_dsa_topk_indices_dim=output_dsa_topk_indices_dim,
+                output_draft_probs_dim=output_draft_probs_dim,
                 kv_checksum_enabled=get_disagg().disaggregation_enable_kv_checksum,
             )
 
@@ -1557,6 +1570,7 @@ class Scheduler(
                 max_sampling_mask_tokens=self.server_args.sampling_mask_max_tokens,
                 custom_mem_pool=self.token_to_kv_pool_allocator.get_kvcache().maybe_get_custom_mem_pool(),
                 output_dsa_topk_indices_dim=output_dsa_topk_indices_dim,
+                output_draft_probs_dim=output_draft_probs_dim,
                 kv_checksum_enabled=get_disagg().disaggregation_enable_kv_checksum,
             )
 

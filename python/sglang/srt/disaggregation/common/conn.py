@@ -38,6 +38,7 @@ from sglang.srt.runtime_context import (
     get_parallel,
     get_schedule,
     get_serving,
+    get_spec,
     max_prefill_buffer_tokens,
 )
 from sglang.srt.server_args import ServerArgs
@@ -102,6 +103,8 @@ class PrefillServerInfo:
     kv_cache_dtype: Optional[str]
     follow_bootstrap_room: bool
     enable_dsa_cache_layer_split: bool = False
+    # None means an older peer did not advertise its metadata layout.
+    speculative_use_rejection_sampling: Optional[bool] = None
     dsv41_spec_layout: Optional[dict] = None
 
     # PD true-retraction rebootstrap: the prefill's HTTP API port. The decode
@@ -888,8 +891,11 @@ class CommonKVManager(BaseKVManager):
             )
 
     def try_ensure_parallel_info(self, bootstrap_addr: str) -> bool:
-        """Single non-blocking attempt to fetch and cache prefill parallel info.
-        Returns True if info is available (cached or freshly fetched)."""
+        """Fetch, validate, and cache prefill topology and configuration.
+
+        Return True if cached or successfully validated, or False on fetch failure.
+        Raise RuntimeError for incompatible PD settings.
+        """
         if bootstrap_addr in self.prefill_info_table:
             return True
 
@@ -914,6 +920,20 @@ class CommonKVManager(BaseKVManager):
             return False
 
         # Sanity checks
+        if self.disaggregation_mode == DisaggregationMode.DECODE:
+            prefill_rejection_sampling = info.speculative_use_rejection_sampling
+            decode_rejection_sampling = get_spec().speculative_use_rejection_sampling
+            if (
+                type(prefill_rejection_sampling) is not bool
+                or prefill_rejection_sampling != decode_rejection_sampling
+            ):
+                raise RuntimeError(
+                    "PD --speculative-use-rejection-sampling mismatch or unknown setting: "
+                    f"prefill={prefill_rejection_sampling}, "
+                    f"decode={decode_rejection_sampling} ({bootstrap_addr}). "
+                    "Both workers must run compatible versions and use the same flag."
+                )
+
         if info.page_size is not None and info.page_size != self.kv_args.page_size:
             raise RuntimeError(
                 f"Page size mismatch: prefill server has page_size={info.page_size}, "
@@ -1116,6 +1136,7 @@ class CommonKVManager(BaseKVManager):
             "dsv41_spec_layout": self.dsv41_spec_layout,
             "load_balance_method": get_parallel().load_balance_method,
             "enable_dsa_cache_layer_split": get_parallel().enable_dsa_cache_layer_split,
+            "speculative_use_rejection_sampling": get_spec().speculative_use_rejection_sampling,
             # Self-register the HTTP API port so the decode can derive the PD
             # retract rebootstrap /generate URL from bootstrap info instead of a
             # router-injected pd_rebootstrap_prefill_url.
@@ -2030,6 +2051,7 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         self.dsv41_spec_layout: Optional[dict] = None
         self.follow_bootstrap_room: Optional[bool] = None
         self.enable_dsa_cache_layer_split: Optional[bool] = None
+        self.speculative_use_rejection_sampling: Optional[bool] = None
         self.prefill_http_port: Optional[int] = None
         self.prefill_port_table: Dict[
             int, Dict[int, Dict[int, Dict[int, PrefillRankInfo]]]
@@ -2139,6 +2161,13 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
                 data.get("enable_dsa_cache_layer_split", False)
             )
 
+        peer_rs = data.get("speculative_use_rejection_sampling")
+        if self._registered_count == 0:
+            self.speculative_use_rejection_sampling = peer_rs
+        elif self.speculative_use_rejection_sampling != peer_rs:
+            # Mixed/unknown rank layouts stay unknown until the registry restarts.
+            self.speculative_use_rejection_sampling = None
+
         if system_dp_size == 1:
             dp_group = attn_dp_rank
         else:
@@ -2204,6 +2233,7 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
                     else True
                 ),
                 enable_dsa_cache_layer_split=bool(self.enable_dsa_cache_layer_split),
+                speculative_use_rejection_sampling=self.speculative_use_rejection_sampling,
                 prefill_http_port=self.prefill_http_port,
             )
             payload = dataclasses.asdict(info)
