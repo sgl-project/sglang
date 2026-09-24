@@ -416,9 +416,9 @@ def build_hybrid_swa_group(
         ]
     )
     if mtp_swa_full_device_pools:
-        # Inkling's SWA drafts have full-token addressing and may have different
-        # head geometry from full attention. Use a separate host pool with KV
-        # indices instead of packing their bytes into either target pool.
+        # SWA drafts with full-token addressing may have different head geometry
+        # from full attention. Use a separate host pool with KV indices instead of
+        # packing their bytes into either target pool.
         first, *rest = mtp_swa_full_device_pools
         draft_host_pool = get_mha_host_pool_cls(first)(
             first,
