@@ -27,7 +27,6 @@ use crate::workers::Worker;
 
 use super::admission::{AdmissionLimits, Decision, EngineAdmission, EngineMetrics};
 use super::power_of_two::PowerOfTwoPolicy;
-use super::scoring::{load_source, prefill_score, EngineScore};
 use super::{Pick, PickError, PickRequest, Policy, Rejection, Stage};
 
 type Signal = Option<Arc<ExternalPrefixSignal>>;
@@ -122,7 +121,7 @@ impl PrefixMemo {
 struct Candidate<'a> {
     engine: &'a Arc<Worker>,
     uncached_tokens: u64,
-    score: EngineScore,
+    score: [u128; 5],
 }
 
 /// Less uncached work first, then lower prefill pressure, then worker id.
@@ -134,9 +133,38 @@ fn rank(left: &Candidate<'_>, right: &Candidate<'_>) -> Ordering {
 }
 
 fn score_candidates(candidates: &mut [Candidate<'_>], load: &EngineReportedLoadSnapshot) {
-    let source = load_source(load, candidates.iter().map(|c| c.engine));
+    let use_reported = candidates.iter().all(|c| {
+        load.fresh_native_cache_load_for_url(&c.engine.url)
+            .is_some()
+    });
+    let use_queue_time = candidates.iter().all(|c| {
+        load.fresh_native_cache_load_for_url(&c.engine.url)
+            .is_some_and(|report| report.estimated_prefill_queue_ms.is_some())
+    });
+    // Prefix work is ranked separately; this key breaks ties by prefill pressure.
+    let score = |engine: &Worker| -> [u128; 5] {
+        let inflight = engine.router_inflight_load() as u128;
+        let Some(report) = load
+            .fresh_native_cache_load_for_url(&engine.url)
+            .filter(|_| use_reported)
+        else {
+            return [0, 0, 0, 0, inflight];
+        };
+        [
+            // Nonnegative f64 bits preserve queue-time order.
+            if use_queue_time {
+                report.estimated_prefill_queue_ms.unwrap().to_bits() as u128
+            } else {
+                0
+            },
+            report.num_waiting_uncached_tokens.into(),
+            report.num_waiting_reqs.into(),
+            report.num_running_reqs.into(),
+            inflight,
+        ]
+    };
     for candidate in candidates {
-        candidate.score = prefill_score(candidate.engine, load, source);
+        candidate.score = score(candidate.engine);
     }
 }
 
@@ -251,7 +279,7 @@ impl CacheAwarePolicy {
                 hit.then_some(Candidate {
                     engine,
                     uncached_tokens,
-                    score: EngineScore::default(),
+                    score: [0; 5],
                 })
             })
             .collect();

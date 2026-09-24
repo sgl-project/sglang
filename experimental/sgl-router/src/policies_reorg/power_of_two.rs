@@ -7,26 +7,11 @@ use std::time::Instant;
 use futures::future::BoxFuture;
 use rand::Rng;
 
-use crate::state::load_monitor::engine_reported_load::{
-    EngineReportedLoadSnapshot, EngineReportedLoadTable,
-};
+use crate::state::load_monitor::engine_reported_load::EngineReportedLoadTable;
 use crate::workers::Worker;
 
 use super::admission::{AdmissionLimits, Decision, EngineAdmission, EngineMetrics};
-use super::scoring::{decode_score, load_source, prefill_score, EngineScore, LoadSource};
 use super::{Pick, PickError, PickRequest, Policy, Rejection, Stage};
-
-fn engine_pressure_score(
-    engine: &Worker,
-    load: &EngineReportedLoadSnapshot,
-    stage: Stage,
-    source: LoadSource,
-) -> EngineScore {
-    match stage {
-        Stage::Plain | Stage::Prefill => prefill_score(engine, load, source),
-        Stage::Decode => decode_score(engine, load, source),
-    }
-}
 
 /// Samples two distinct engines and selects the one with lower stage pressure.
 /// Checks admission only on the selected engine; rejection never resamples.
@@ -68,10 +53,52 @@ impl Policy for PowerOfTwoPolicy {
                         j += 1;
                     }
                     let (left, right) = (&engines[i], &engines[j]);
-                    let source = load_source(&load, [left, right]);
-                    let left_score = engine_pressure_score(left, &load, request.stage, source);
-                    let right_score = engine_pressure_score(right, &load, request.stage, source);
-                    Arc::clone(if left_score > right_score {
+                    let reports = [left, right]
+                        .map(|engine| load.fresh_native_cache_load_for_url(&engine.url));
+                    let use_reported = reports.iter().all(Option::is_some);
+                    let use_queue_time = reports.iter().all(|report| {
+                        report.is_some_and(|r| r.estimated_prefill_queue_ms.is_some())
+                    });
+                    // A common denominator keeps the two KV fractions exact.
+                    let kv_capacity: u128 = reports
+                        .iter()
+                        .flatten()
+                        .map(|report| u128::from(report.max_total_num_tokens))
+                        .product();
+                    // Lower wins; array elements are compared left to right.
+                    let score = |engine: &Worker| -> [u128; 5] {
+                        let inflight = engine.router_inflight_load() as u128;
+                        let Some(report) = load
+                            .fresh_native_cache_load_for_url(&engine.url)
+                            .filter(|_| use_reported)
+                        else {
+                            return [0, 0, 0, 0, inflight];
+                        };
+                        match request.stage {
+                            Stage::Plain | Stage::Prefill => [
+                                // Nonnegative f64 bits preserve queue-time order.
+                                if use_queue_time {
+                                    report.estimated_prefill_queue_ms.unwrap().to_bits() as u128
+                                } else {
+                                    0
+                                },
+                                report.num_waiting_uncached_tokens.into(),
+                                report.num_waiting_reqs.into(),
+                                report.num_running_reqs.into(),
+                                inflight,
+                            ],
+                            Stage::Decode => [
+                                report.num_waiting_reqs.into(),
+                                report.num_running_reqs.into(),
+                                u128::from(report.num_used_tokens)
+                                    * (kv_capacity
+                                        / u128::from(report.max_total_num_tokens.max(1))),
+                                report.num_used_tokens.into(),
+                                inflight,
+                            ],
+                        }
+                    };
+                    Arc::clone(if score(left) > score(right) {
                         right
                     } else {
                         left

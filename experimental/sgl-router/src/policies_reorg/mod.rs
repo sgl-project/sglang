@@ -8,7 +8,6 @@ pub mod admission;
 pub mod cache_aware;
 pub mod factory;
 pub mod power_of_two;
-mod scoring;
 pub mod session_aware;
 
 use std::fmt::Debug;
