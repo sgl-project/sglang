@@ -81,10 +81,10 @@ sglang generate --model-path Wan-AI/Wan2.1-T2V-1.3B-Diffusers \
 
 The native `QwenImage21Pipeline` supports text-to-image and reference-image
 conditioning with Qwen3-VL, a single-stream block-causal DiT, and the 64-channel
-VAE. Use an authorized checkpoint directory:
+VAE. Use the public checkpoint:
 
 ```bash
-sglang generate --model-path /models/qwen-image-2.1 --model-id Qwen-Image-2.1 \
+sglang generate --model-path Qwen/Qwen-Image-2.1 \
   --prompt "A capybara reading a book by candlelight" \
   --height 1024 --width 1024 --num-inference-steps 40 --guidance-scale 1 \
   --seed 0 --save-output
