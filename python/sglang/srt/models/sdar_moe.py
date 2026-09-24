@@ -16,7 +16,11 @@ from sglang.srt.distributed import (
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
-from sglang.srt.layers.communicator import LayerCommunicator, LayerScatterModes
+from sglang.srt.layers.communicator import (
+    LayerCommunicator,
+    LayerScatterModes,
+    complete_deferred_allreduce,
+)
 from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
@@ -487,6 +491,7 @@ class SDARMoeModel(nn.Module):
                 )
 
         if not self.pp_group.is_last_rank:
+            hidden_states = complete_deferred_allreduce(hidden_states)
             return PPProxyTensors(
                 {"hidden_states": hidden_states, "residual": residual}
             )

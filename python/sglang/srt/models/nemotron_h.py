@@ -34,6 +34,7 @@ from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
     Mamba2AttnBackend,
 )
 from sglang.srt.layers.attention.mamba.mamba import MambaMixer2
+from sglang.srt.layers.communicator import complete_deferred_allreduce
 from sglang.srt.layers.dp_attention import (
     attn_tp_all_reduce,
     is_dp_attention_enabled,
@@ -831,6 +832,7 @@ class NemotronHModel(nn.Module):
             )
 
         if not self.pp_group.is_last_rank:
+            hidden_states = complete_deferred_allreduce(hidden_states)
             return PPProxyTensors(
                 {"hidden_states": hidden_states, "residual": residual}
             )

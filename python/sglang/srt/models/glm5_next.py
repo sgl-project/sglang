@@ -28,6 +28,7 @@ from sglang.srt.layers.attention.vision import VisionAttention
 from sglang.srt.layers.communicator import (
     LayerCommunicator,
     LayerScatterModes,
+    complete_deferred_allreduce,
     enable_moe_dense_fully_dp,
     get_attn_tp_context,
 )
@@ -1215,6 +1216,7 @@ class Glm5NextModel(nn.Module):
             )
 
         if not self.pp_group.is_last_rank:
+            hidden_states = complete_deferred_allreduce(hidden_states)
             if self.config.mhc:
                 return PPProxyTensors({"hidden_states": hidden_states})
             return PPProxyTensors(
