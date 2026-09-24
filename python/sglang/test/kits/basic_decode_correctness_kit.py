@@ -19,6 +19,8 @@ class BasicDecodeCorrectnessMixin:
 
     sanity_max_new_tokens_short: int = 64
     sanity_max_new_tokens_long: int = 128
+    # Separate from the short budget so reasoning models can widen only this probe.
+    sanity_max_new_tokens_math: int = 64
 
     def _decode_generate(self, prompt: str, max_new_tokens: int, stop=None) -> str:
         sampling_params = {"temperature": 0.0, "max_new_tokens": max_new_tokens}
@@ -42,7 +44,7 @@ class BasicDecodeCorrectnessMixin:
     def test_basic_math(self):
         out = self._decode_generate(
             "Q: What is 17 multiplied by 23? Reply with just the number.\nA:",
-            self.sanity_max_new_tokens_short,
+            self.sanity_max_new_tokens_math,
         )
         self.assertIn("391", out)
 

@@ -44,9 +44,9 @@ class TestBasicSanityDSpark(
     served_model_name = TARGET_MODEL
     model = TARGET_MODEL
 
-    # Qwen3-14B reasons before answering; its greedy path has exact ties,
-    # and on H200 it reaches "391" only after 143-236 tokens.
-    sanity_max_new_tokens_short = 512
+    # Qwen3-14B reasons first and its greedy path has exact ties; H100 answers
+    # within 64 tokens, H200 only after 143-236.
+    sanity_max_new_tokens_math = 512
 
     fwd_occupancy_threshold = 60
     fwd_occupancy_max_new_tokens = 4096
