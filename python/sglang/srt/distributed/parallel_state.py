@@ -3060,6 +3060,17 @@ def patch_tensor_parallel_group(tp_group: GroupCoordinator, *, owns_attention: b
     global _TP_STATE_PATCHED
     assert not _TP_STATE_PATCHED, "Should not call when it's already patched"
 
+    # The batch a draft forwards still carries the DP sync the target gathered;
+    # the narrowed ranks cannot recover this process's slot in it, so take it
+    # before narrowing. Reads config and stamps only, not _TP.
+    dp_flags = get_flags().dp
+    saved_gather_slot = dp_flags.scoped_gather_slot
+    scoped_gather_slot = saved_gather_slot
+    if owns_attention and dp_flags.enabled:
+        from sglang.srt.layers.dp_attention import dp_gather_slot
+
+        scoped_gather_slot = dp_gather_slot()
+
     _TP_STATE_PATCHED = True
     global _TP
     old_tp_group = _TP
@@ -3086,20 +3097,12 @@ def patch_tensor_parallel_group(tp_group: GroupCoordinator, *, owns_attention: b
             moe_tp_size=tp_group.world_size,
             moe_tp_rank=tp_group.rank_in_group,
         )
-    # The batch a draft forwards still carries the DP sync the target gathered,
-    # so the narrowed attention-DP names must not re-index that list.
-    dp_flags = get_flags().dp
-    saved_gather = (dp_flags.scoped_gather_width, dp_flags.scoped_gather_slot)
-    if owns_attention and dp_flags.enabled:
-        from sglang.srt.layers.dp_attention import dp_gather_slot, dp_gather_width
-
-        dp_flags.scoped_gather_width = dp_gather_width()
-        dp_flags.scoped_gather_slot = dp_gather_slot()
+    dp_flags.scoped_gather_slot = scoped_gather_slot
     try:
         with get_parallel().override(**narrowed):
             yield
     finally:
-        dp_flags.scoped_gather_width, dp_flags.scoped_gather_slot = saved_gather
+        dp_flags.scoped_gather_slot = saved_gather_slot
         _TP_STATE_PATCHED = False
         _TP = old_tp_group
 

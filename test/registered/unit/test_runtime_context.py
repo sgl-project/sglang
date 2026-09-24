@@ -2856,7 +2856,6 @@ class TestWhoAnswersDuringADraftScope(CustomTestCase):
                 self.assertEqual(get_parallel().attn_dp_rank, 0)
                 self.assertEqual(dp_gather_width(), 4)
                 self.assertEqual(dp_gather_slot(), 2)
-            self.assertIsNone(get_flags().dp.scoped_gather_width)
             self.assertIsNone(get_flags().dp.scoped_gather_slot)
             self.assertEqual(dp_gather_slot(), 2)
 

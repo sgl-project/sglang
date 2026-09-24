@@ -578,10 +578,9 @@ class DpFlags(_FlagGroupBase):
     capturing_prefill_graph: bool = False
     prefill_graph_has_dp_gather: bool = False
     # Set for the duration of a draft scope that owns its attention. The scope
-    # narrows attention-DP to one replica, but the batch it forwards carries
-    # the DP sync the target gathered, so indexing that list needs the
-    # target's gather width and this process's slot in it.
-    scoped_gather_width: Optional[int] = None
+    # narrows attention-DP to one replica and the TP rank to the draft group,
+    # but the batch it forwards carries the DP sync the target gathered, so
+    # indexing that list needs this process's slot in the target's gather.
     scoped_gather_slot: Optional[int] = None
     # DP gathered-buffer allocation metadata (model hidden size / dtype /
     # device), set by initialize_dp_attention alongside the flags above.

@@ -67,11 +67,12 @@ def dp_gather_width() -> int:
     it spans the attention-DP replicas. Inside a draft scope that owns its
     attention, it is still the target's gather (see patch_tensor_parallel_group).
     """
-    scoped = get_flags().dp.scoped_gather_width
-    if scoped is not None:
-        return scoped
     parallel = get_parallel()
-    return parallel.dp_size if world_dp_gather_enabled() else parallel.attn_dp_size
+    if world_dp_gather_enabled():
+        return parallel.dp_size
+    if get_flags().dp.scoped_gather_slot is not None:
+        return deployment_attn_dp_size()
+    return parallel.attn_dp_size
 
 
 def dp_gather_slot() -> int:
@@ -789,7 +790,7 @@ def _dp_gather_via_all_gatherv(
     # each rank's local tensor up to sizes[rank] with zeros (matching the
     # buffer's reserved per-rank slot) so sum(sizes) == buffer rows and there
     # is no uninitialized tail for the MoE to read.
-    rank = get_parallel().attn_dp_rank
+    rank = dp_gather_slot()
     local_rows = sizes[rank]
     if local_tokens.shape[0] == local_rows:
         local_real = local_tokens
