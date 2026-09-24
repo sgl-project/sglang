@@ -138,6 +138,8 @@ class ForwardMetadata:
     lean_Lp: Optional[torch.Tensor] = None
     lean_Op: Optional[torch.Tensor] = None
     lean_locks: Optional[torch.Tensor] = None
+    # DCP extend: batch-wide prefix token count, identical on every DCP rank.
+    dcp_prefix_total: Optional[int] = None
 
 
 class TritonAttnBackend(AttentionBackend):
@@ -817,6 +819,7 @@ class TritonAttnBackend(AttentionBackend):
         window_num_kv_splits = None
         window_kv_offsets = None
         swa_attn_logits = None
+        dcp_prefix_total = None
         spec_info = forward_batch.spec_info
         # Lean decode buffers are only allocated on the decode path below; default
         # to None so the shared ForwardMetadata constructor works for extend/verify.
@@ -984,6 +987,12 @@ class TritonAttnBackend(AttentionBackend):
                     forward_batch.extend_prefix_lens,
                     self.kv_indptr,
                 )
+                if forward_batch.extend_prefix_lens_cpu is not None:
+                    dcp_prefix_total = sum(forward_batch.extend_prefix_lens_cpu)
+                else:
+                    dcp_prefix_total = int(
+                        forward_batch.extend_prefix_lens.sum().item()
+                    )
             else:
                 # gpu_only leaves _cpu unset; over-allocate is safe (ragged write).
                 if forward_batch.extend_prefix_lens_cpu is not None:
@@ -1063,6 +1072,7 @@ class TritonAttnBackend(AttentionBackend):
             lean_Lp=lean_Lp,
             lean_Op=lean_Op,
             lean_locks=lean_locks,
+            dcp_prefix_total=dcp_prefix_total,
         )
 
     def init_cuda_graph_state(
@@ -1976,7 +1986,12 @@ class TritonAttnBackend(AttentionBackend):
                 skip_prefix=True,
             )
 
-        if kv_indices.numel() == 0:
+        # The prefix path runs collectives, so branch on the batch-wide prefix
+        # length: this rank's shard is empty when a prefix is < dcp_size.
+        prefix_total = self.forward_metadata.dcp_prefix_total
+        if prefix_total is None:
+            prefix_total = kv_indices.numel()
+        if prefix_total == 0:
             return current_out.reshape(-1, layer.tp_q_head_num * layer.v_head_dim).to(
                 q.dtype
             )
