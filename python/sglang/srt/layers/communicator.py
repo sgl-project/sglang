@@ -66,9 +66,9 @@ from sglang.srt.layers.flashinfer_comm_fusion import (
 )
 from sglang.srt.layers.moe import (
     can_merge_post_experts_all_reduce,
-    deferred_post_experts_all_reduce,
     get_moe_a2a_backend,
     post_experts_output_is_complete,
+    post_experts_reduction_group,
     should_use_dp_reduce_scatterv,
     should_use_flashinfer_cutlass_moe_fp4_allgather,
 )
@@ -629,13 +629,15 @@ def _attn_input_update_and_read_residual(quant_format: str):
 
 
 class UnreducedOutput(msgspec.Struct, frozen=True):
-    """A layer output that still owes its FFN all-reduce, left for the next
-    layer's input. Hand it to the next layer, or pass it through reduce_output()
-    before reading it any other way."""
+    """A layer output that still owes its sum, left for the next layer's input.
+    Hand it to the next layer, or pass it through reduce_output() before reading
+    it any other way. The producer says what is owed: one all-reduce over
+    ``group`` that keeps the layout, or ``reduce_and_redistribute``."""
 
     partial: torch.Tensor
-    # Under attention DP: the reduce-scatter that sums ``partial`` over TP while
-    # bringing it back to this rank's tokens, in place of the all-reduce.
+    group: Optional[GroupCoordinator] = None
+    # Under attention DP: the reduction that also brings ``partial`` back to this
+    # rank's tokens (a reduce-scatter, or an all-reduce then a scatter).
     reduce_and_redistribute: Optional[Callable[[torch.Tensor], torch.Tensor]] = None
 
 
@@ -646,7 +648,7 @@ def reduce_output(
     if isinstance(hidden_states, UnreducedOutput):
         if hidden_states.reduce_and_redistribute is not None:
             return hidden_states.reduce_and_redistribute(hidden_states.partial)
-        return deferred_post_experts_all_reduce(hidden_states.partial)
+        return hidden_states.group.all_reduce(hidden_states.partial)
     return hidden_states
 
 
@@ -666,14 +668,13 @@ def _batch_size(forward_batch: ForwardBatch) -> int:
 
 
 def _deferred_reduction_runs_on_the_tp_group() -> bool:
-    """Whether deferred_post_experts_all_reduce reduces over the TP group object
+    """Whether an MoE output's one all-reduce runs over the TP group object
     itself, the group a dense FFN and reduce_moe_output reduce over."""
     parallel = get_parallel()
     if parallel.moe_ep_size > 1 and parallel.moe_tp_size > 1:
         # Some MoE blocks reduce EP and MoE-TP in two steps instead of merging.
         return False
-    group = parallel.moe_ep_group if parallel.moe_ep_size > 1 else parallel.moe_tp_group
-    return group is parallel.tp_group
+    return post_experts_reduction_group() is parallel.tp_group
 
 
 def _ffn_has_tokens(forward_batch: ForwardBatch) -> bool:
@@ -684,8 +685,8 @@ def _ffn_has_tokens(forward_batch: ForwardBatch) -> bool:
 
 
 def _unfused_completion_matches_the_ffn(forward_batch: ForwardBatch) -> bool:
-    """Whether deferred_post_experts_all_reduce is the all-reduce the FFN would
-    have run itself: one full-precision sum over the same TP group, on an output
+    """Whether the next layer's all-reduce is the one the FFN would have run
+    itself: one full-precision sum over the same TP group, on an output
     that is a plain partial sum. The output is not a plain partial sum when the
     MoE combine already summed it, a replicated shared expert is added after the
     reduction, or LoRA-B runs on the unreduced activations."""
@@ -729,6 +730,13 @@ class LayerCommunicator:
             force_layernorm_before_dp_gather
         )
         self._post_init_communicate()
+        # Under attention DP, the base postprocess scatters the FFN output back
+        # to this rank's tokens, which the next layer's input can run instead;
+        # the MHC and DSA-CP postprocess do more, so theirs stays here.
+        self._postprocess_scatters_to_local_tokens = (
+            self._communicate_summable_tensor_pair_fn
+            is CommunicateSummableTensorPairFn._scatter_hidden_states
+        )
         self._speculative_algo = SpeculativeAlgorithm.from_string(
             get_spec().speculative_algorithm
         )
@@ -855,9 +863,12 @@ class LayerCommunicator:
             # No fused kernel runs under attention DP: the reduce-scatter back to
             # this rank's tokens comes first.
             hidden_states = reduce_output(hidden_states)
-        pending = isinstance(hidden_states, UnreducedOutput)
+        unreduced = (
+            hidden_states if isinstance(hidden_states, UnreducedOutput) else None
+        )
+        pending = unreduced is not None
         if pending:
-            hidden_states = hidden_states.partial
+            hidden_states = unreduced.partial
         # residual is None marks the first decoder layer, where the SP region
         # opens: re-evaluated per forward so a crash mid-loop cannot leak into
         # the next one.
@@ -889,12 +900,14 @@ class LayerCommunicator:
                     hidden_states, residual, forward_batch
                 )
                 if post_residual_addition is None
+                # The fused kernel reduces over the MoE output's group.
+                and unreduced.group is post_experts_reduction_group()
                 else None
             )
             if fused is not None:
                 hidden_states, residual = fused
             else:
-                hidden_states = deferred_post_experts_all_reduce(hidden_states)
+                hidden_states = reduce_output(unreduced)
                 hidden_states, residual = _attn_input_update_and_read_residual(
                     quant_format
                 )(self.input_layernorm, hidden_states, residual, post_residual_addition)
@@ -1016,27 +1029,74 @@ class LayerCommunicator:
             is_layer_sparse=self.layer_scatter_modes.is_layer_sparse,
         )
 
-    def _reduce_scatter_for_next_layer(
+    def _local_token_move_can_go_to_next_layer(self) -> bool:
+        """Whether the next layer's input can run this layer's move of its FFN
+        output back to this rank's tokens: the base postprocess scatter, outside
+        an active LayerNorm SP region."""
+        return self._postprocess_scatters_to_local_tokens and not (
+            self._sp_variant is not None and get_forward().sp_active
+        )
+
+    def _reduce_scatter_step(
         self, forward_batch: ForwardBatch
-    ) -> Optional[Callable[[torch.Tensor], torch.Tensor]]:
-        """The reduce-scatter back to this rank's tokens that postprocess would
-        run on this layer's FFN output, bound for the next layer's input to run
-        instead; None when postprocess runs anything else."""
-        if (
-            self.is_last_layer
-            or (self._sp_variant is not None and get_forward().sp_active)
-            or self._communicate_summable_tensor_pair_fn
-            is not CommunicateSummableTensorPairFn._scatter_hidden_states
-        ):
-            return None
-        step = _output_to_local_tokens_step(
+    ) -> Optional[Callable[[torch.Tensor, torch.Tensor, ForwardBatch], None]]:
+        """The reduce-scatter postprocess would run on this layer's FFN output;
+        None when it runs only a scatter, or anything else."""
+        return _reduce_and_redistribute_output_step(
             forward_batch,
             allow_reduce_scatter=self.allow_reduce_scatter,
             is_layer_sparse=self.layer_scatter_modes.is_layer_sparse,
         )
-        if step is _redistribute_output:
-            return None
-        return partial(_to_local_tokens, step, forward_batch)
+
+    def ffn_reduction_group(self) -> GroupCoordinator:
+        """The group this layer's FFN output owes its sum over: the MoE output's
+        group on a sparse layer, the TP group a dense MLP reduces over."""
+        if self.layer_scatter_modes.is_layer_sparse:
+            return post_experts_reduction_group()
+        return get_parallel().tp_group
+
+    def _select_ffn_completion(self, forward_batch: ForwardBatch) -> "FfnCompletion":
+        """Decide once, before the FFN runs, what it skips and what completes its
+        output: the next layer's input, or this layer's postprocess."""
+        defer_moe_finalize = self.should_defer_moe_finalize(forward_batch)
+        # Deferring implies fusing: a handoff skips the post-experts all-reduce.
+        fuse_mlp_allreduce = defer_moe_finalize or self.should_defer_ffn_reduction(
+            forward_batch
+        )
+        mlp_reduce_scatter = self.should_use_reduce_scatter(forward_batch)
+        if fuse_mlp_allreduce:
+            group = self.ffn_reduction_group()
+            if self._postprocess_scatters_to_local_tokens:
+                # Under attention DP the next layer also brings the sum back to
+                # this rank's tokens.
+                leave = partial(
+                    UnreducedOutput,
+                    reduce_and_redistribute=partial(
+                        _all_reduce_then_to_local_tokens, group, forward_batch
+                    ),
+                )
+            else:
+                leave = partial(UnreducedOutput, group=group)
+        elif not self.is_last_layer and self._local_token_move_can_go_to_next_layer():
+            step = self._reduce_scatter_step(forward_batch)
+            leave = (
+                None
+                if step is None
+                else partial(
+                    UnreducedOutput,
+                    reduce_and_redistribute=partial(
+                        _to_local_tokens, step, forward_batch
+                    ),
+                )
+            )
+        else:
+            leave = None
+        return FfnCompletion(
+            defer_moe_finalize=defer_moe_finalize,
+            fuse_mlp_allreduce=fuse_mlp_allreduce,
+            mlp_reduce_scatter=mlp_reduce_scatter,
+            leave=leave,
+        )
 
     def ffn_exit(self, forward_batch: ForwardBatch) -> "FfnExit":
         """Decide once how this layer's FFN output reduction completes. Use the
@@ -1155,40 +1215,16 @@ class LayerCommunicator:
             and self._ffn_sum_can_move_to_next_layer()
             and _unfused_completion_matches_the_ffn(forward_batch)
             and not self.should_use_reduce_scatter(forward_batch)
-            and self._next_layer_input_can_restore_the_layout(forward_batch)
-        )
-
-    def _next_layer_input_can_restore_the_layout(
-        self, forward_batch: ForwardBatch
-    ) -> bool:
-        """Whether the next layer's input can also run what postprocess would
-        after the FFN's own all-reduce: under attention DP, the scatter back to
-        this rank's tokens."""
-        if not is_dp_attention_enabled():
-            return True
-        return (
-            self._communicate_summable_tensor_pair_fn
-            is CommunicateSummableTensorPairFn._scatter_hidden_states
-            and not (self._sp_variant is not None and get_forward().sp_active)
-            and _output_to_local_tokens_step(
-                forward_batch,
-                allow_reduce_scatter=self.allow_reduce_scatter,
-                is_layer_sparse=self.layer_scatter_modes.is_layer_sparse,
+            # Under attention DP the next layer must also run postprocess's
+            # scatter back to this rank's tokens, and nothing more.
+            and (
+                not is_dp_attention_enabled()
+                or (
+                    self._local_token_move_can_go_to_next_layer()
+                    and self._reduce_scatter_step(forward_batch) is None
+                )
             )
-            is _redistribute_output
         )
-
-    def _scatter_for_next_layer(
-        self, forward_batch: ForwardBatch
-    ) -> Optional[Callable[[torch.Tensor], torch.Tensor]]:
-        """Under attention DP, the all-reduce and the scatter back to this rank's
-        tokens that the next layer's input runs on a sum this layer's FFN left."""
-        if (
-            self._communicate_summable_tensor_pair_fn
-            is not CommunicateSummableTensorPairFn._scatter_hidden_states
-        ):
-            return None
-        return partial(_all_reduce_then_to_local_tokens, forward_batch)
 
 
 # MOE_FULL gathers across the MoE-CP group, which spans every CP rank when CP is on.
@@ -1218,10 +1254,21 @@ def scatter_mode_layouts(
     }
 
 
+class FfnCompletion(msgspec.Struct, frozen=True):
+    """One FFN's reduction decision. The flags are published while the FFN runs;
+    ``leave`` wraps its output for the next layer's input to complete, or is None
+    when this layer's postprocess completes it."""
+
+    defer_moe_finalize: bool
+    fuse_mlp_allreduce: bool
+    mlp_reduce_scatter: bool
+    leave: Optional[Callable[[torch.Tensor], UnreducedOutput]] = None
+
+
 class FfnExit:
-    """One FFN's reduction decision. Inside the ``with`` block it is published as
-    ``fuse_mlp_allreduce`` / ``mlp_reduce_scatter`` / ``defer_moe_finalize`` on
-    ``get_forward()``."""
+    """The scope that publishes an FfnCompletion while the FFN runs: inside the
+    ``with`` block it is ``fuse_mlp_allreduce`` / ``mlp_reduce_scatter`` /
+    ``defer_moe_finalize`` on ``get_forward()``."""
 
     __slots__ = (
         "communicator",
@@ -1229,19 +1276,18 @@ class FfnExit:
         "defer_moe_finalize",
         "fuse_mlp_allreduce",
         "mlp_reduce_scatter",
+        "_leave",
         "_scope",
     )
 
     def __init__(self, communicator: LayerCommunicator, forward_batch: ForwardBatch):
         self.communicator = communicator
         self.forward_batch = forward_batch
-        self.defer_moe_finalize = communicator.should_defer_moe_finalize(forward_batch)
-        # Deferring implies fusing: a handoff skips the post-experts all-reduce.
-        self.fuse_mlp_allreduce = (
-            self.defer_moe_finalize
-            or communicator.should_defer_ffn_reduction(forward_batch)
-        )
-        self.mlp_reduce_scatter = communicator.should_use_reduce_scatter(forward_batch)
+        completion = communicator._select_ffn_completion(forward_batch)
+        self.defer_moe_finalize = completion.defer_moe_finalize
+        self.fuse_mlp_allreduce = completion.fuse_mlp_allreduce
+        self.mlp_reduce_scatter = completion.mlp_reduce_scatter
+        self._leave = completion.leave
         self._scope = get_forward().scoped(
             fuse_mlp_allreduce=self.fuse_mlp_allreduce,
             mlp_reduce_scatter=self.mlp_reduce_scatter,
@@ -1263,26 +1309,8 @@ class FfnExit:
             # A deferred MoE finalize handoff, consumed by the next prepare_attn.
             assert self.defer_moe_finalize, "unrequested deferred MoE handoff"
             return hidden_states, residual
-        if self.fuse_mlp_allreduce:
-            return (
-                UnreducedOutput(
-                    hidden_states,
-                    reduce_and_redistribute=self.communicator._scatter_for_next_layer(
-                        self.forward_batch
-                    ),
-                ),
-                residual,
-            )
-        reduce_and_redistribute = self.communicator._reduce_scatter_for_next_layer(
-            self.forward_batch
-        )
-        if reduce_and_redistribute is not None:
-            return (
-                UnreducedOutput(
-                    hidden_states, reduce_and_redistribute=reduce_and_redistribute
-                ),
-                residual,
-            )
+        if self._leave is not None:
+            return self._leave(hidden_states), residual
         return self.communicator.postprocess_layer(
             hidden_states, residual, self.forward_batch
         )
@@ -1797,12 +1825,12 @@ def _redistribute_output_from_moe_cp(
     ).contiguous()
 
 
-def _output_to_local_tokens_step(
+def _reduce_and_redistribute_output_step(
     forward_batch: ForwardBatch, *, allow_reduce_scatter: bool, is_layer_sparse: bool
-) -> Callable[[torch.Tensor, torch.Tensor, ForwardBatch], None]:
-    """How a FULL-layout layer output comes back to this rank's tokens under
-    attention DP: a reduce-scatter when the FFN left its sum to it, otherwise a
-    scatter of the reduced output."""
+) -> Optional[Callable[[torch.Tensor, torch.Tensor, ForwardBatch], None]]:
+    """The reduce-scatter that brings a FULL-layout layer output back to this
+    rank's tokens under attention DP when the FFN left its sum to it; None when
+    the FFN reduced the output and only a scatter remains."""
     # A MoE block leaves its sum to reduce_scatterv whenever it applies
     # (should_skip_post_experts_all_reduce); a dense MLP does only under the
     # published mlp_reduce_scatter, which needs allow_reduce_scatter.
@@ -1814,7 +1842,7 @@ def _output_to_local_tokens_step(
         and can_use_dp_reduce_scatter()
     ):
         return _reduce_and_redistribute_output_max_len
-    return _redistribute_output
+    return None
 
 
 def _to_local_tokens(
@@ -1828,12 +1856,10 @@ def _to_local_tokens(
 
 
 def _all_reduce_then_to_local_tokens(
-    forward_batch: ForwardBatch, hidden_states: torch.Tensor
+    group: GroupCoordinator, forward_batch: ForwardBatch, hidden_states: torch.Tensor
 ) -> torch.Tensor:
     return _to_local_tokens(
-        _redistribute_output,
-        forward_batch,
-        deferred_post_experts_all_reduce(hidden_states),
+        _redistribute_output, forward_batch, group.all_reduce(hidden_states)
     )
 
 
@@ -1917,10 +1943,13 @@ class CommunicateSummableTensorPairFn:
         is_layer_sparse: bool = False,
     ):
         local_hidden_states = get_local_dp_buffer(_dp_scatter_group())
-        step = _output_to_local_tokens_step(
-            forward_batch,
-            allow_reduce_scatter=allow_reduce_scatter,
-            is_layer_sparse=is_layer_sparse,
+        step = (
+            _reduce_and_redistribute_output_step(
+                forward_batch,
+                allow_reduce_scatter=allow_reduce_scatter,
+                is_layer_sparse=is_layer_sparse,
+            )
+            or _redistribute_output
         )
         step(local_hidden_states, hidden_states, forward_batch)
         return local_hidden_states, residual

@@ -4,7 +4,6 @@ partial sum, and an embedding added to it is counted once per rank."""
 
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
 
 import torch
 from torch import nn
@@ -26,6 +25,10 @@ def all_reduce(hidden_states):
     return hidden_states * TP_SIZE
 
 
+# The group a deferred FFN output owes its sum over.
+GROUP = SimpleNamespace(all_reduce=all_reduce)
+
+
 class DeferringLayer(nn.Module):
     """One TP rank's view of a decoder layer whose FFN output sums to one. It
     completes a reduction left by the previous layer, and leaves its own to the
@@ -45,7 +48,10 @@ class DeferringLayer(nn.Module):
         residual = hidden_states if residual is None else hidden_states + residual
         if self.is_last_layer:
             return torch.ones_like(residual), residual
-        return UnreducedOutput(torch.full_like(residual, 1 / TP_SIZE)), residual
+        return (
+            UnreducedOutput(torch.full_like(residual, 1 / TP_SIZE), group=GROUP),
+            residual,
+        )
 
 
 class SumNorm(nn.Module):
@@ -99,12 +105,6 @@ MODELS = (qwen3_vl_moe, qwen3_5)
 
 class TestDeepstackOnDeferredReduction(CustomTestCase):
     def setUp(self):
-        patcher = patch(
-            "sglang.srt.layers.communicator.deferred_post_experts_all_reduce",
-            all_reduce,
-        )
-        patcher.start()
-        self.addCleanup(patcher.stop)
         self.embeds = torch.zeros(TOKENS, HIDDEN)
 
     def run_model(self, build, deepstack):

@@ -151,8 +151,9 @@ class TestPostprocessReduceScatterv(CustomTestCase):
         self.assertIs(seen["is_layer_sparse"], True)
 
 
-class TestOutputToLocalTokensStep(CustomTestCase):
-    """The step that brings a FULL-layout output back to this rank's tokens."""
+class TestReduceAndRedistributeOutputStep(CustomTestCase):
+    """The reduce-scatter that brings a FULL-layout output back to this rank's
+    tokens, or None when only a scatter remains."""
 
     def step(self, *, varlen, max_len, tiles, allow, sparse):
         forward_batch = types.SimpleNamespace(
@@ -162,7 +163,7 @@ class TestOutputToLocalTokensStep(CustomTestCase):
             patch.object(comm, "should_use_dp_reduce_scatterv", return_value=varlen),
             patch.object(comm, "can_use_dp_reduce_scatter", return_value=tiles),
         ):
-            return comm._output_to_local_tokens_step(
+            return comm._reduce_and_redistribute_output_step(
                 forward_batch, allow_reduce_scatter=allow, is_layer_sparse=sparse
             )
 
@@ -175,7 +176,7 @@ class TestOutputToLocalTokensStep(CustomTestCase):
             elif allow and max_len and tiles:
                 expected = comm._reduce_and_redistribute_output_max_len
             else:
-                expected = comm._redistribute_output
+                expected = None
             case = dict(
                 varlen=varlen, max_len=max_len, tiles=tiles, allow=allow, sparse=sparse
             )

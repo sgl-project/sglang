@@ -112,12 +112,19 @@ class TestDeferredPostExpertsAllReduce(CustomTestCase):
 
     def _calls(self, *, moe_ep_size, moe_tp_size, moe_dp_size=1):
         called = []
-        with _recorded_all_reduces(
-            called,
+
+        def group(name):
+            return types.SimpleNamespace(all_reduce=lambda x: called.append(name) or x)
+
+        parallel = types.SimpleNamespace(
             moe_ep_size=moe_ep_size,
             moe_tp_size=moe_tp_size,
             moe_dp_size=moe_dp_size,
-        ):
+            tp_group=group("tp"),
+            moe_ep_group=group("ep"),
+            moe_tp_group=group("moe_tp"),
+        )
+        with patch.object(moe_utils, "get_parallel", return_value=parallel):
             deferred_post_experts_all_reduce(torch.zeros(2, 2))
         return called
 
@@ -164,10 +171,20 @@ class TestResolveFusionGroup(CustomTestCase):
             resolve_fusion_world_size,
         )
 
-        fake_tp_group = MagicMock(name="tp_group")
-        fake_ep_group = MagicMock(name="ep_group")
-        fake_moe_tp_group = MagicMock(name="moe_tp_group")
         tp_size = moe_ep_size * moe_tp_size * moe_dp_size
+        fake_tp_group = MagicMock(
+            name="tp_group", world_size=tp_size, rank_in_group=tp_rank
+        )
+        fake_ep_group = MagicMock(
+            name="ep_group",
+            world_size=moe_ep_size,
+            rank_in_group=tp_rank % moe_ep_size,
+        )
+        fake_moe_tp_group = MagicMock(
+            name="moe_tp_group",
+            world_size=moe_tp_size,
+            rank_in_group=tp_rank % moe_tp_size,
+        )
 
         with get_parallel().override(
             moe_ep_size=moe_ep_size,
@@ -299,14 +316,14 @@ class TestDeferFfnReduction(CustomTestCase):
         lora=False,
         tp_group=True,
         global_tokens=8,
-        pair_fn=comm.CommunicateSummableTensorPairFn._scatter_hidden_states,
-        step=comm._redistribute_output,
+        scatters_to_local_tokens=True,
+        step=None,
         sp_active=False,
     ):
         communicator = _fake_communicator()
         communicator.is_last_layer = is_last_layer
         communicator.should_use_reduce_scatter = lambda forward_batch: reduce_scatter
-        communicator._communicate_summable_tensor_pair_fn = pair_fn
+        communicator._postprocess_scatters_to_local_tokens = scatters_to_local_tokens
         communicator._sp_variant = object() if sp_active else None
         communicator.allow_reduce_scatter = True
         communicator.layer_scatter_modes.is_layer_sparse = True
@@ -315,7 +332,9 @@ class TestDeferFfnReduction(CustomTestCase):
             global_dp_buffer_len=global_tokens,
         )
         with (
-            patch.object(comm, "_output_to_local_tokens_step", return_value=step),
+            patch.object(
+                comm, "_reduce_and_redistribute_output_step", return_value=step
+            ),
             get_forward().scoped(sp_active=sp_active),
             patch.object(comm, "is_enable_moe_cp_allgather", return_value=False),
             patch.object(comm, "apply_flashinfer_allreduce_fusion", return_value=fused),
@@ -404,12 +423,7 @@ class TestDeferFfnReductionUnderAttentionDp(CustomTestCase):
                 "MAX_LEN reduce-scatter",
                 dict(step=comm._reduce_and_redistribute_output_max_len),
             ),
-            (
-                "other layout change",
-                dict(
-                    pair_fn=comm.CommunicateSummableTensorPairFn._scatter_hidden_states_moe
-                ),
-            ),
+            ("other postprocess", dict(scatters_to_local_tokens=False)),
             ("LayerNorm SP", dict(sp_active=True)),
         ):
             with self.subTest(name):
@@ -427,11 +441,15 @@ class TestDeferredReductionGroup(CustomTestCase):
         parallel = types.SimpleNamespace(
             moe_ep_size=moe_ep_size,
             moe_tp_size=moe_tp_size,
+            moe_dp_size=1,
             tp_group=tp_group,
             moe_ep_group=tp_group if ep_is_tp else object(),
             moe_tp_group=tp_group if moe_tp_is_tp else object(),
         )
-        with patch.object(comm, "get_parallel", return_value=parallel):
+        with (
+            patch.object(comm, "get_parallel", return_value=parallel),
+            patch.object(moe_utils, "get_parallel", return_value=parallel),
+        ):
             return comm._deferred_reduction_runs_on_the_tp_group()
 
     def test_pure_tp_and_pure_ep_reduce_over_the_tp_group(self):

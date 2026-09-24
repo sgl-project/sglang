@@ -838,23 +838,24 @@ def post_experts_all_reduce(hidden_states: torch.Tensor) -> torch.Tensor:
     return hidden_states
 
 
+def post_experts_reduction_group():
+    """The group one all-reduce of an MoE output runs over: TP when the EP and
+    MoE-TP reductions merge, otherwise EP, otherwise MoE-TP. The same group
+    ``resolve_fusion_group`` builds the fused workspace on."""
+    parallel = get_parallel()
+    if can_merge_post_experts_all_reduce():
+        return parallel.tp_group
+    if parallel.moe_ep_size > 1:
+        return parallel.moe_ep_group
+    return parallel.moe_tp_group
+
+
 def deferred_post_experts_all_reduce(hidden_states: torch.Tensor) -> torch.Tensor:
     """Run the post-experts reduction that was deferred to allreduce fusion.
 
-    Called when the fused residual+LN kernel cannot service the shape. Reduces
-    over the same group ``resolve_fusion_group`` builds the workspace on.
+    Called when the fused residual+LN kernel cannot service the shape.
     """
-    from sglang.srt.distributed.communication_op import (
-        moe_expert_parallel_all_reduce,
-        moe_tensor_model_parallel_all_reduce,
-        tensor_model_parallel_all_reduce,
-    )
-
-    if can_merge_post_experts_all_reduce():
-        return tensor_model_parallel_all_reduce(hidden_states)
-    if get_parallel().moe_ep_size > 1:
-        return moe_expert_parallel_all_reduce(hidden_states)
-    return moe_tensor_model_parallel_all_reduce(hidden_states)
+    return post_experts_reduction_group().all_reduce(hidden_states)
 
 
 @contextmanager
