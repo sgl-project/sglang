@@ -599,6 +599,66 @@ class TestPythonicDetector(unittest.TestCase):
         self.assertEqual(result2.calls, [])
         self.assertEqual(self.detector._buffer, "")  # Buffer should be cleared
 
+    def test_finish_releases_text_after_tool_call(self):
+        """Text after a tool call must survive the end of the stream.
+
+        When the closing bracket and the text after it arrive in the same final
+        delta -- a multi-token delta from speculative decoding / MTP, or
+        stream_interval > 1 -- no further delta ever arrives. That trailing text
+        used to be dropped, so the streamed answer was truncated while the
+        non-streaming path returned it.
+        """
+        text = (
+            "User wants the weather in Mars. "
+            "[get_weather(location='Mars')]"
+            " In this way we get the weather."
+        )
+        detector = PythonicDetector()
+        result = detector.parse_streaming_increment(text, self.tools)
+
+        self.assertEqual(len(result.calls), 1)
+        self.assertEqual(result.calls[0].name, "get_weather")
+        # Deferred, not dropped.
+        self.assertEqual(detector._buffer, " In this way we get the weather.")
+
+        end = detector.finish(self.tools)
+        self.assertEqual(end.calls, [])
+        self.assertEqual(end.normal_text, " In this way we get the weather.")
+        self.assertEqual(detector._buffer, "")
+
+        # The streamed text must equal what the non-streaming path reports.
+        non_stream = PythonicDetector().detect_and_parse(text, self.tools)
+        streamed = (result.normal_text or "") + (end.normal_text or "")
+        self.assertEqual(streamed, non_stream.normal_text)
+
+    def test_finish_releases_incomplete_tool_call(self):
+        """An unterminated tool call must be released as text at end of stream.
+
+        The non-streaming path surfaces text it cannot frame, so the streaming
+        path must not silently swallow it.
+        """
+        text = "Let me check [get_weather(location='Mars'"
+        detector = PythonicDetector()
+        result = detector.parse_streaming_increment(text, self.tools)
+        self.assertEqual(result.calls, [])
+
+        end = detector.finish(self.tools)
+        self.assertEqual(end.calls, [])
+        streamed = (result.normal_text or "") + (end.normal_text or "")
+        non_stream = PythonicDetector().detect_and_parse(text, self.tools)
+        self.assertEqual(streamed, non_stream.normal_text)
+        self.assertIn("[get_weather(location='Mars'", streamed)
+
+    def test_finish_is_a_noop_when_nothing_is_buffered(self):
+        detector = PythonicDetector()
+        detector.parse_streaming_increment(
+            "[get_weather(location='Tokyo')]", self.tools
+        )
+        detector.parse_streaming_increment("", self.tools)
+        end = detector.finish(self.tools)
+        self.assertEqual(end.normal_text, "")
+        self.assertEqual(end.calls, [])
+
     def test_parse_streaming_multiple_tool_calls(self):
         """Test parsing multiple tool calls in sequence."""
         text = "[get_weather(location='Berlin')] and [search(query='restaurants')]"

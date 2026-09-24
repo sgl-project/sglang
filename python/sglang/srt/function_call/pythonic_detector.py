@@ -220,6 +220,24 @@ class PythonicDetector(BaseFormatDetector):
         # Otherwise, we're still accumulating a potential tool call
         return StreamingParseResult(normal_text="")
 
+    def finish(self, tools: List[Tool]) -> StreamingParseResult:
+        """Release text that is still buffered when the stream ends.
+
+        parse_streaming_increment returns as soon as a tool call closes and
+        leaves whatever followed that call in ``self._buffer`` for the next
+        call to emit. When the closing bracket and the text after it arrive in
+        the same final delta -- which is what speculative decoding, MTP, or
+        ``stream_interval > 1`` produce -- no further call ever arrives, so the
+        buffered text was dropped while the non-streaming path kept it as
+        ``normal_text``. Same for a tool call that is still incomplete when the
+        stream ends.
+        """
+        buffered = self._buffer
+        self._buffer = ""
+        if not buffered:
+            return StreamingParseResult()
+        return StreamingParseResult(normal_text=self._text_strip(buffered))
+
     def _get_parameter_value(self, val):
         if isinstance(val, ast.Constant):
             if val.value is None or isinstance(val.value, (str, int, float)):
