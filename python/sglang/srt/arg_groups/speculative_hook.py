@@ -89,9 +89,27 @@ def _resolve_speculative_algorithm_alias(
     if speculative_draft_model_path:
         from sglang.srt.utils.hf_transformers_utils import get_config
 
-        cfg = get_config(
-            speculative_draft_model_path, trust_remote_code=trust_remote_code, **kwargs
-        )
+        try:
+            cfg = get_config(
+                speculative_draft_model_path,
+                trust_remote_code=trust_remote_code,
+                **kwargs,
+            )
+        except Exception as e:
+            # The generic AutoConfig path requires a ``model_type`` key, which
+            # speculators-style draft configs (e.g. DFLASH's
+            # ``DFlashSpeculatorConfig`` with no ``model_type``) do not carry.
+            # This call exists only to detect Gemma4 assistant drafts; such a
+            # draft is never Gemma4, so a parse failure simply means "not a
+            # Gemma4 draft" and resolution proceeds.
+            logger.info(
+                "Could not parse draft config at %s for Gemma4-draft detection "
+                "(expected for speculators-style drafts without model_type); "
+                "treating as non-Gemma4. Error: %s",
+                speculative_draft_model_path,
+                e,
+            )
+            cfg = None
         draft_archs = getattr(cfg, "architectures", None) or []
         is_gemma4_draft = any(
             arch in ("Gemma4AssistantForCausalLM", "Gemma4UnifiedAssistantForCausalLM")
@@ -348,9 +366,7 @@ def _handle_dflash(server_args: ServerArgs) -> None:
         )
 
     if cfg.speculative_num_draft_tokens is None:
-        from sglang.srt.speculative.dflash_utils import (
-            parse_dflash_draft_config,
-        )
+        from sglang.srt.speculative.dflash_utils import parse_dflash_draft_config
 
         model_override_args = json.loads(cfg.json_model_override_args)
         inferred_block_size = None
@@ -1211,9 +1227,7 @@ def _handle_ngram(server_args: ServerArgs) -> None:
 
 
 def _maybe_disable_adaptive(server_args: ServerArgs) -> None:
-    from sglang.srt.speculative.adaptive_spec_params import (
-        adaptive_unsupported_reason,
-    )
+    from sglang.srt.speculative.adaptive_spec_params import adaptive_unsupported_reason
 
     reason = adaptive_unsupported_reason(server_args)
     if reason is not None:
