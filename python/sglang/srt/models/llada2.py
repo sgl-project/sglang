@@ -620,8 +620,6 @@ class LLaDA2MoeBlock(nn.Module):
             is_next_layer_sparse=is_next_layer_sparse,
         )
 
-        self.is_last_layer = self.layer_id == config.num_hidden_layers - 1
-
         if self.is_layer_sparse:
             self.mlp = LLaDA2MoeSparseMoeBlock(
                 layer_id=layer_id,

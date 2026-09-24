@@ -416,7 +416,6 @@ class MHCLayerCommunicator(LayerCommunicator):
         input_layernorm: torch.nn.Module,
         post_attention_layernorm: torch.nn.Module,
         allow_reduce_scatter: bool = False,
-        is_last_layer: bool = False,
         qkv_latent_func: Optional[Callable] = None,
         *,
         is_first_layer: bool,
@@ -440,7 +439,6 @@ class MHCLayerCommunicator(LayerCommunicator):
             input_layernorm,
             post_attention_layernorm,
             allow_reduce_scatter,
-            is_last_layer,
             qkv_latent_func,
         )
 

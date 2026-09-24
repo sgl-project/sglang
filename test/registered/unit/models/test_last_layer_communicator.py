@@ -187,8 +187,12 @@ def build(case, num_layers, layer_id, config=None, **kwargs):
     return communicator.call_args.kwargs, scatter_modes.init_new.call_args.kwargs, built
 
 
-def is_last_layer_passed(case, num_layers, layer_id, **kwargs):
-    return build(case, num_layers, layer_id, **kwargs)[0].get("is_last_layer", False)
+def planned_as_last(case, num_layers, layer_id, **kwargs):
+    """Whether the layer's layout plan makes it the model's last layer, the one
+    fact the communicator reads the last layer from."""
+    passed, planned, _ = build(case, num_layers, layer_id, **kwargs)
+    assert "is_last_layer" not in passed, "the plan is the only source"
+    return planned["layer_id"] == planned["num_layers"] - 1
 
 
 class TestLastLayerCommunicator(CustomTestCase):
@@ -199,7 +203,7 @@ class TestLastLayerCommunicator(CustomTestCase):
             for layer_id in range(NUM_LAYERS):
                 with self.subTest(case=case, layer_id=layer_id):
                     self.assertEqual(
-                        is_last_layer_passed(case, NUM_LAYERS, layer_id),
+                        planned_as_last(case, NUM_LAYERS, layer_id),
                         layer_id == NUM_LAYERS - 1,
                     )
 
@@ -212,7 +216,7 @@ class TestLastLayerCommunicator(CustomTestCase):
             num_layers, layer_id = draft
             with self.subTest(case=case):
                 self.assertTrue(
-                    is_last_layer_passed(case, num_layers, layer_id, is_nextn=True)
+                    planned_as_last(case, num_layers, layer_id, is_nextn=True)
                 )
 
     def test_draft_model_layer_is_planned_as_a_one_layer_model(self):
@@ -250,6 +254,33 @@ class TestLastLayerCommunicator(CustomTestCase):
         )
         self.assertIn("BailingMoE", built)
         self.assertTrue(planned["is_layer_sparse"])
+
+
+class TestLayerScatterModesLastLayer(CustomTestCase):
+    def test_the_plan_marks_the_last_layer(self):
+        from sglang.srt.layers import communicator as comm
+
+        with (
+            patch.object(comm, "enable_moe_dense_fully_dp", return_value=False),
+            patch.object(comm, "_generic_prefill_cp_shards_tokens", return_value=False),
+            patch.object(comm, "is_dsa_enable_prefill_cp", return_value=False),
+            patch.object(comm, "is_mla_cp_enabled", return_value=False),
+        ):
+            for num_layers, layer_id in (
+                (NUM_LAYERS, 0),
+                (NUM_LAYERS, 2),
+                (NUM_LAYERS, 3),
+                (1, 0),
+            ):
+                with self.subTest(num_layers=num_layers, layer_id=layer_id):
+                    modes = comm.LayerScatterModes.init_new(
+                        layer_id=layer_id,
+                        num_layers=num_layers,
+                        is_layer_sparse=False,
+                        is_previous_layer_sparse=False,
+                        is_next_layer_sparse=False,
+                    )
+                    self.assertEqual(modes.is_last_layer, layer_id == num_layers - 1)
 
 
 if __name__ == "__main__":

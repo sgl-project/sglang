@@ -678,8 +678,6 @@ class BailingMoEBlock(nn.Module):
             is_next_layer_sparse=is_next_layer_sparse,
         )
 
-        self.is_last_layer = is_nextn or (self.layer_id == config.num_hidden_layers - 1)
-
         if self.is_layer_sparse:
             self.mlp = BailingMoESparseMoeBlock(
                 layer_id=layer_id,
@@ -709,7 +707,6 @@ class BailingMoEBlock(nn.Module):
             input_layernorm=self.input_layernorm,
             post_attention_layernorm=self.post_attention_layernorm,
             allow_reduce_scatter=True,
-            is_last_layer=self.is_last_layer,
         )
 
     def _is_layer_sparse(
