@@ -95,7 +95,9 @@ def _gemm_ag_down_op(
     weight: torch.Tensor,
     out: torch.Tensor,
 ) -> None:
-    _jit_module(4, N, K, True).run(_COMM_MAP[world_size], x, weight, None, None, out)
+    _jit_module(4, N, weight.shape[0], True).run(
+        _COMM_MAP[world_size], x, weight, None, None, out
+    )
 
 
 def gemm_ag_down_proj(
@@ -104,7 +106,7 @@ def gemm_ag_down_proj(
     weight: torch.Tensor,
     out: torch.Tensor,
 ) -> torch.Tensor:
-    """BS1 TP8 latent down GEMV: [1, 7168] @ [3584, 7168].T.
+    """BS1 TP8 FP32-gathered GEMV: [1, 7168] @ [N, 7168].T, N = weight rows.
 
     Input and weight are contiguous BF16; output preserves FP32 accumulation.
     """
