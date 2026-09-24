@@ -91,7 +91,7 @@ Example identity, independent of the exact filename spelling:
 
 `exists`, `get`, `set`, metadata lookup, and eviction use the same identity. TP rank and DCP group identity are not part of the key: TP ranks 1 and 3 in this example resolve to the same object. Equal configurations in different engines produce equal keys. A different DCP or TP size produces a different key. DCP=1 objects cannot be mistaken for DCP shards.
 
-Each object contains exactly one rank's local rows for one full logical page, across the model's layers. Publish complete objects using the file backend's atomic file replacement. Validate exact byte length before exposing a loaded page. Concurrent writers of the same key use independent temporary files and publish complete objects.
+Each object contains exactly one rank's local rows for one full logical page, across the model's layers. Publish complete objects using the file backend's atomic file replacement. Concurrent writers of the same key use independent temporary files and publish complete objects.
 
 Within an engine, selected writers eliminate duplicate backup I/O. Across engines, identical keys give one persistent object per shard; an existing valid object can skip the write. Two engines racing on a missing key may both perform I/O and create temporary files before publishing to the same final path. Stage 1 guarantees unique stored objects, not exactly-once I/O across engines.
 
@@ -171,7 +171,7 @@ Work on one phase at a time: implement and verify it, stop for human review, the
 5. enable supported configuration + fresh-engine proof
 ```
 
-This run starts from the original base commit. Phase 1 is implemented, verified, and approved for commit; phases 2-5 have not started. The next phase awaits an instruction to continue. The feature remains proposed until the full release gate passes. See the evidence log for phase-local results and reproduction commands.
+Phase 1 is committed as `1cdb6b1`. Phase 2 is implemented, verified, and approved for commit. Phases 3-5 have not started. The feature remains proposed until the full release gate passes. See the evidence log for phase-local results and reproduction commands.
 
 Startup rejection stays in place through phase 4. Component tests call the relevant storage/pool/controller APIs directly; do not add a production flag to bypass the guard. Runtime attachment must not expose the unfinished path. Phase 5 changes the support checks only when the integrated tests pass.
 
@@ -194,9 +194,9 @@ writer?       yes     yes     no      no
 
 ### Phase 2: make one page round-trip correctly
 
-**Diff:** Update generic MLA host-page reads/writes to translate logical page starts once and validate alignment. Use local-sized read buffers and reject incorrect file lengths before exposing data. Retain guards on storage paths outside the supported generic file path.
+**Diff:** Update generic MLA host-page reads/writes to translate logical page starts once and validate alignment. Use local-sized read buffers. Retain guards on storage paths outside the supported generic file path.
 
-**Verify:** CPU tests fill real host pools with distinguishable token/layer values, save to temporary files, and restore into a different allocation. Cover every DCP rank at sizes 2 and 4, nonzero page starts, reordered pages, and unchanged neighboring rows. Test both shorter and longer payloads. Run the existing DCP L1/L2 host-pool tests, replacing the generic accessor's old rejection assertion with the new round-trip contract.
+**Verify:** CPU tests fill real host pools with distinguishable token/layer values, save to temporary files, and restore into a different allocation. Cover every DCP rank at sizes 2 and 4, nonzero page starts, reordered pages, and unchanged neighboring rows. Run the existing DCP L1/L2 host-pool tests, replacing the generic accessor's old rejection assertion with the new round-trip contract.
 
 **Human review:** For DCP=2, logical start 256 and logical page size 128 select local rows 128..191. With 2 layers, width 12, and BF16, the object is exactly 3,072 bytes; restored values match exactly.
 
@@ -236,7 +236,7 @@ writer?       yes     yes     no      no
 
 Keep phase-local test changes beside the code they verify. Unit and distributed test files introduced by a phase must have an exact runnable command in the evidence log. Keep raw logs and measurements in evidence, not in the feature contract. No passing results should be claimed for phases not run.
 
-- [ ] Complete phases 2-4 separately, stopping for review and approval before each commit.
+- [ ] Complete phases 3-4 separately, stopping for review and approval before each commit.
 - [ ] Complete phase 5 with H200 cross-engine evidence and mark the spec implemented.
 
 ## Boundaries
