@@ -385,24 +385,13 @@ impl CacheAwarePolicy {
             if let Some(tree) = tree {
                 let worker_url = workers[min_load_idx].url();
 
-                // Measure the reuse this branch is giving up, before the insert below
-                // makes the prompt match itself. Without this the match-rate metrics are
-                // conditioned on the balanced path, and a deployment tuned to trip the
-                // balance thresholds often — which is exactly what the KV-cache lab does
-                // on purpose — reports almost no samples at all. One extra traversal on
-                // the imbalanced path only; the insert that follows walks the same nodes.
-                let forgone = tree.prefix_match_with_counts(text);
-                let forgone_rate = if forgone.input_char_count == 0 {
-                    0.0
-                } else {
-                    forgone.matched_char_count as f64 / forgone.input_char_count as f64
-                };
-                Metrics::record_cache_aware_match_rate(Branch::LoadBalance.as_str(), forgone_rate);
-                Metrics::record_cache_aware_prefix_chars(
-                    Branch::LoadBalance.as_str(),
-                    forgone.matched_char_count,
-                    forgone.input_char_count,
-                );
+                // Measure the reuse this branch gives up, before the insert below makes
+                // the prompt match itself. Without this the match-rate metrics only see
+                // the balanced path, and a deployment that trips the balance thresholds
+                // often reports almost no samples. Read-only, so eviction order and later
+                // routing are unchanged.
+                let (matched, input) = tree.prefix_match_counts(text);
+                Self::record_match(Branch::LoadBalance, matched, input);
 
                 // Now we can work with the tree without holding the HashMap lock
                 tree.insert(text, worker_url);
@@ -433,6 +422,17 @@ impl CacheAwarePolicy {
         workers[min_load_idx].increment_processed();
 
         Some(min_load_idx)
+    }
+
+    /// Record the best-prefix match seen at a decision, labelled by the branch that ran.
+    fn record_match(branch: Branch, matched: usize, input: usize) {
+        let rate = if input == 0 {
+            0.0
+        } else {
+            matched as f64 / input as f64
+        };
+        Metrics::record_cache_aware_match_rate(branch.as_str(), rate);
+        Metrics::record_cache_aware_prefix_chars(branch.as_str(), matched, input);
     }
 
     /// Emit per-worker decision snapshot (DEBUG-gated).
@@ -551,13 +551,6 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
                 Branch::CacheMissMinLoad
             };
 
-            Metrics::record_cache_aware_match_rate(match_branch.as_str(), match_rate as f64);
-            Metrics::record_cache_aware_prefix_chars(
-                match_branch.as_str(),
-                result.matched_char_count,
-                result.input_char_count,
-            );
-
             // Select worker without String allocation
             let selected_idx = if is_cache_hit {
                 // Cache hit path: find worker by URL (compare &str directly, no allocation)
@@ -586,6 +579,7 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
 
             if let Some(idx) = selected_idx {
                 let branch = match_branch;
+                Self::record_match(branch, result.matched_char_count, result.input_char_count);
 
                 self.emit_decision_snapshot(
                     workers,
@@ -641,6 +635,11 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
             }
 
             // Fallback to first healthy worker
+            Self::record_match(
+                Branch::StaleTenantFallback,
+                result.matched_char_count,
+                result.input_char_count,
+            );
             Metrics::record_worker_cache_aware_policy_branch(Branch::StaleTenantFallback.as_str());
             healthy_indices.first().copied()
         } else {

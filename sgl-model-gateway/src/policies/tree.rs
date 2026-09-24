@@ -526,9 +526,18 @@ impl Tree {
             .insert(Arc::clone(&tenant_id), epoch);
     }
 
-    /// Performs prefix matching and returns detailed result with char counts.
-    /// Optimized: no string allocations, deferred char counting.
-    pub fn prefix_match_with_counts(&self, text: &str) -> PrefixMatchResult {
+    /// Read-only form of [`Self::prefix_match_with_counts`]: the same
+    /// `(matched_chars, input_chars)`, without refreshing any tenant's LRU timestamp
+    /// or the node's cached tenant. For measuring a match that routing will not act on.
+    pub fn prefix_match_counts(&self, text: &str) -> (usize, usize) {
+        let (_, matched_chars) = self.walk_prefix(text);
+        (matched_chars, text.chars().count())
+    }
+
+    /// Walk the longest prefix of `text` present in the tree. Returns the last node
+    /// reached (partially matched nodes included) and the matched char count.
+    #[inline]
+    fn walk_prefix(&self, text: &str) -> (NodeRef, usize) {
         let mut remaining = text;
         let mut matched_chars = 0;
         let mut prev = Arc::clone(&self.root);
@@ -563,7 +572,13 @@ impl Tree {
             }
         }
 
-        let curr = prev;
+        (prev, matched_chars)
+    }
+
+    /// Performs prefix matching and returns detailed result with char counts.
+    /// Optimized: no string allocations, deferred char counting.
+    pub fn prefix_match_with_counts(&self, text: &str) -> PrefixMatchResult {
+        let (curr, matched_chars) = self.walk_prefix(text);
 
         // Try cached tenant first (O(1)) before falling back to O(shards) DashMap iteration.
         // The cache is valid if the tenant still exists in tenant_last_access_time.
@@ -1135,6 +1150,46 @@ mod tests {
 
         assert_eq!(matched_text, "");
         assert_eq!(tenant, "empty");
+    }
+
+    #[test]
+    fn test_prefix_match_counts_is_read_only() {
+        let tree = Tree::new();
+        tree.insert("hello world", "tenant1");
+        tree.insert("help", "tenant2");
+
+        let snapshot = |tree: &Tree| -> Vec<(char, Vec<(String, u64)>)> {
+            let mut nodes = vec![Arc::clone(&tree.root)];
+            let mut out = Vec::new();
+            while let Some(node) = nodes.pop() {
+                for child in node.children.iter() {
+                    let mut stamps: Vec<(String, u64)> = child
+                        .value()
+                        .tenant_last_access_time
+                        .iter()
+                        .map(|kv| (kv.key().to_string(), *kv.value()))
+                        .collect();
+                    stamps.sort();
+                    out.push((*child.key(), stamps));
+                    nodes.push(Arc::clone(child.value()));
+                }
+            }
+            out.sort();
+            out
+        };
+
+        let before = snapshot(&tree);
+        for text in ["hello world", "hello there", "help me", "xyz", ""] {
+            let counted = tree.prefix_match_counts(text);
+            // More calls than the 1-in-8 timestamp refresh in prefix_match_with_counts.
+            for _ in 0..32 {
+                assert_eq!(tree.prefix_match_counts(text), counted);
+            }
+            assert_eq!(snapshot(&tree), before, "timestamps changed for {text:?}");
+
+            let full = tree.prefix_match_with_counts(text);
+            assert_eq!(counted, (full.matched_char_count, full.input_char_count));
+        }
     }
 
     #[test]
