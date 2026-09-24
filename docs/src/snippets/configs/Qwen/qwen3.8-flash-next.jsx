@@ -200,7 +200,7 @@ export const config = {
     "dgx-spark": "lmsysorg/sglang:dev-qwen38-next-local",
     rtx6000: "lmsysorg/sglang:dev-qwen38-next-local",
     b200:   "lmsysorg/sglang:qwen38flashnext",
-    "b200|nvfp4-nvda": "lmsysorg/sglang:v0.5.20-cu130",
+    "b200|nvfp4-nvda": "lmsysorg/sglang:latest",
     b300:   "lmsysorg/sglang:qwen38flashnext",
     gb300:  "lmsysorg/sglang:qwen38flashnext",
     mi350x: "lmsysorg/sglang-rocm:qwen38flashnext",
@@ -728,7 +728,7 @@ export const config = {
     {
       match: { hw: "b200", variant: "default", quant: "nvfp4-nvda", strategy: "low-latency", nodes: "single" },
       verified: true,
-      warn: "Verified on 4x B200 with lmsysorg/sglang:v0.5.20-cu130. This NVIDIA ModelOpt MIXED_PRECISION export needs a newer loader than the qwen38flashnext image provides. Quantization and MoE backends are selected automatically from the checkpoint.",
+      warn: "Requires SGLang v0.5.20 or later for this NVIDIA ModelOpt MIXED_PRECISION export. Quantization and MoE backends are selected automatically from the checkpoint.",
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",

@@ -10,73 +10,13 @@ tag: NEW
 
 <Accordion title="Install SGLang">
 
-For all methods and hardware platforms, see the [official SGLang installation guide](../../../docs/get-started/install). The two paths below match the **Python / Docker** toggle in the command panel.
-
-<Tabs>
-
-<Tab title="Python (pip / uv)">
-
-For **B200 + NVFP4 (NVDA)**, use SGLang v0.5.20, which includes the NVIDIA ModelOpt MIXED_PRECISION loader:
+Use an SGLang build that includes Qwen3.8-Flash-Next support (v0.5.20 or later).
 
 ```bash Command
-pip install -U uv
-uv venv --python 3.12 && source .venv/bin/activate
-uv pip install 'sglang==0.5.20'
+docker pull lmsysorg/sglang:latest
 ```
 
-The other recipes below retain their original model-support build:
-
-```bash Command
-pip install -U uv
-uv venv --python 3.12 && source .venv/bin/activate
-
-# Qwen3.8-Flash-Next model support:
-# https://github.com/sgl-project/sglang/pull/36497
-git clone https://github.com/sgl-project/sglang.git
-cd sglang
-git fetch origin pull/36497/head && git checkout FETCH_HEAD
-uv pip install -e python
-```
-
-<Note>
-The original source recipes use [#36497](https://github.com/sgl-project/sglang/pull/36497). Use the release above for the B200 NVIDIA NVFP4 recipe.
-</Note>
-
-Then run the **Python** output of the command panel below in that environment.
-
-</Tab>
-
-<Tab title="Docker">
-
-**B200 + NVFP4 (NVDA)**: verified with the released CUDA 13.0 image on four B200 GPUs, using the checkpoint's own MTP head:
-
-```bash Command
-docker pull lmsysorg/sglang:v0.5.20-cu130
-```
-
-**Other NVIDIA datacenter recipes** (H200 / B200 / B300 / GB300): the original launch image:
-
-```bash Command
-docker pull lmsysorg/sglang:qwen38flashnext
-```
-
-**DGX Spark and RTX PRO 6000**: the `qwen4-main-squashed` build (`4ccff141db`), which carries the ModelOpt MIXED_PRECISION loader ([#38121](https://github.com/sgl-project/sglang/pull/38121)), the file-backed PLE table backend ([#37068](https://github.com/sgl-project/sglang/pull/37068)), and the router-kernel fixes for the MTP output collapse on GB10 ([#36811](https://github.com/sgl-project/sglang/pull/36811) via [#38308](https://github.com/sgl-project/sglang/pull/38308), [#38290](https://github.com/sgl-project/sglang/pull/38290)). The `qwen38flashnext` image predates both, so the command generator uses this image for those two hardware rows:
-
-```bash Command
-docker pull lmsysorg/sglang:dev-qwen38-next-local
-```
-
-**AMD GPUs** (MI350X / MI355X): the matching ROCm build. It targets CDNA4 (gfx950) and is **not** interchangeable with the CUDA image above:
-
-```bash Command
-docker pull lmsysorg/sglang-rocm:qwen38flashnext
-```
-
-For how to launch either image, see [Install → Method 3: Using Docker](../../../docs/get-started/install#method-3-using-docker). Substitute the inner `sglang serve ...` with whatever the command generator below produces.
-
-</Tab>
-
-</Tabs>
+The deployment panel can render a complete `docker run` command for the selected hardware and options. See [Install SGLang with Docker](/docs/get-started/install#method-3-using-docker) for host setup.
 
 </Accordion>
 
