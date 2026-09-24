@@ -25,5 +25,5 @@ async def openpi_policy_ws(websocket: WebSocket):
         websocket,
         server_args,
         prepare_payload=_prefer_numpy_output,
-        build_response=lambda output: output,
+        build_response=server_args.pipeline_config.openpi_response,
     )

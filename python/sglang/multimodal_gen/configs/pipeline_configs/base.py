@@ -299,6 +299,17 @@ class PipelineConfig:
 
         return False
 
+    def action_metadata(self, server_args: Any) -> dict[str, Any] | None:
+        """Model-owned ``GET /v1/actions/metadata`` payload; None uses the generic one."""
+
+        del server_args
+        return None
+
+    def openpi_response(self, output: dict[str, Any]) -> dict[str, Any]:
+        """Shape of one OpenPI websocket response built from the policy output."""
+
+        return output
+
     # Wan2.2 TI2V parameters
     boundary_ratio: float | None = None
 
