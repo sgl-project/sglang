@@ -248,14 +248,19 @@ class TestOriginalTraceExport(CustomTestCase):
 
     def test_writes_named_trace_when_flag_set(self):
         with tempfile.TemporaryDirectory() as tmp:
-            with mock.patch.dict(
-                os.environ,
-                {"SGLANG_TORCH_PROFILER_DIR": tmp, _CAPTURE_TRACE: "1"},
-                clear=False,
+            with (
+                mock.patch.dict(
+                    os.environ,
+                    {"SGLANG_TORCH_PROFILER_DIR": tmp, _CAPTURE_TRACE: "1"},
+                    clear=False,
+                ),
+                mock.patch.object(
+                    putils, "get_parallel", return_value=SimpleNamespace(tp_rank=2)
+                ),
             ):
                 prof = mock.Mock()
                 putils.export_cuda_graph_capture_trace(
-                    prof, runner_name="DecodeCudaGraphRunner", tp_rank=2
+                    prof, runner_name="DecodeCudaGraphRunner"
                 )
                 expected = os.path.join(
                     tmp,
@@ -275,7 +280,7 @@ class TestOriginalTraceExport(CustomTestCase):
                 os.environ.pop(_CAPTURE_TRACE, None)
                 prof = mock.Mock()
                 putils.export_cuda_graph_capture_trace(
-                    prof, runner_name="DecodeCudaGraphRunner", tp_rank=0
+                    prof, runner_name="DecodeCudaGraphRunner"
                 )
                 prof.export_chrome_trace.assert_not_called()
                 self.assertFalse(
