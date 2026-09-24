@@ -530,6 +530,17 @@ impl RouterTrait for RouterManager {
         body: &ChatCompletionRequest,
         model_id: Option<&str>,
     ) -> Response {
+        self.route_chat_with_sglang_rid(headers, body, model_id, None)
+            .await
+    }
+
+    async fn route_chat_with_sglang_rid(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &ChatCompletionRequest,
+        model_id: Option<&str>,
+        sglang_rid: Option<&str>,
+    ) -> Response {
         // In IGW mode, resolve model_id and fail fast if not resolvable
         // In non-IGW mode, pass through to router (router handles validation)
         let effective_model_id = if self.enable_igw {
@@ -548,7 +559,12 @@ impl RouterTrait for RouterManager {
 
         if let Some(router) = router {
             router
-                .route_chat(headers, body, effective_model_id.as_deref().or(model_id))
+                .route_chat_with_sglang_rid(
+                    headers,
+                    body,
+                    effective_model_id.as_deref().or(model_id),
+                    sglang_rid,
+                )
                 .await
         } else {
             (
