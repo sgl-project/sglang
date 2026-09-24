@@ -3488,6 +3488,15 @@ class DeepseekV4AttnBackend(
             )
 
     def _low_ratio_index_topk_sm90_decode(self, layer, x, q_lora, req, pos) -> None:
+        from sglang.srt.model_executor.runner_utils.capture_mode import (
+            skip_low_ratio_indexer,
+        )
+
+        if skip_low_ratio_indexer(layer.compress_ratio):
+            # Metadata already filled every visible position. Keep those indices;
+            # the compressor still writes index K for subsequent decode steps.
+            return
+
         pool = self.token_to_kv_pool
         core = self.forward_metadata.core_metadata
         ratio = layer.compress_ratio
@@ -3528,11 +3537,12 @@ class DeepseekV4AttnBackend(
         inputs = TritonDecodeInputs(
             q, weights, slots, lens, table, table.shape[1] // 68, indexer.index_topk
         )
-        if indexer.is_candidate_source:
+        candidate_layer = not _every_request_fits()
+        if indexer.is_candidate_source and candidate_layer:
             self.forward_metadata.candidate_metadata = (
                 self.candidate_indexer.publish_decode(inputs, page_indices, raw_indices)
             )
-        elif indexer.uses_candidates:
+        elif indexer.uses_candidates and candidate_layer:
             self.candidate_indexer.select_decode(
                 self.forward_metadata.candidate_metadata,
                 inputs,

@@ -135,8 +135,7 @@ class CandidateIndexer(ABC):
     """The two-level low-ratio indexer. The candidate source publishes what its
     consumers need to select among its top candidate blocks, on the forward
     metadata; a consumer selects its top-k from that.
-
-    TritonCandidateIndexer uses Triton for sparse candidate scoring."""
+    """
 
     @abstractmethod
     def publish_decode(
