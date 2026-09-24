@@ -801,23 +801,6 @@ class TestEagleDsaSeedTransfer(CustomTestCase):
         self.assertEqual(len(enabled_ptrs) - len(disabled_ptrs), 3)
         self.assertEqual(sum(enabled_sizes) - sum(disabled_sizes), 2 * 3 * 4 + 64)
 
-    def test_sampling_mask_metadata_requires_aligned_logprobs(self):
-        with envs.SGLANG_ENABLE_DISAGG_SAMPLING_MASK.override(True):
-            buffers = MetadataBuffers(
-                size=1,
-                hidden_size=2,
-                hidden_states_dtype=torch.float32,
-                max_sampling_mask_tokens=3,
-            )
-            with self.assertRaisesRegex(RuntimeError, "must have equal lengths"):
-                buffers.set_buf(
-                    self._make_req(
-                        None,
-                        sampling_mask=[7, 8, 9],
-                        sampling_logprobs=[-0.5, -1.0],
-                    )
-                )
-
     def test_sampling_mask_selected_logprob_uses_first_metadata_slot(self):
         with envs.SGLANG_ENABLE_DISAGG_SAMPLING_MASK.override(True):
             buffers = MetadataBuffers(

@@ -236,10 +236,11 @@ class GenerateReqInput:
     # Whether to return each output token's sampling support and behavior logprob.
     return_sampling_mask: Optional[Union[List[bool], bool]] = None
     # Return either the selected token's behavior logprob or behavior logprobs for
-    # the full sampling support. Only used when return_sampling_mask is enabled.
-    sampling_logprobs_mode: Union[List[SamplingLogprobsMode], SamplingLogprobsMode] = (
-        "selected"
-    )
+    # the full sampling support. When omitted, selected mode is used if
+    # return_sampling_mask is enabled.
+    sampling_logprobs_mode: Optional[
+        Union[List[Optional[SamplingLogprobsMode]], SamplingLogprobsMode]
+    ] = None
     # Whether to detokenize tokens in text in the returned logprobs.
     return_text_in_logprobs: bool = False
     # Return prompt top logprobs as flat arrays plus shape metadata instead of
@@ -775,7 +776,7 @@ class GenerateReqInput:
             self.return_sampling_mask, False, "return_sampling_mask"
         )
         self.sampling_logprobs_mode = normalize_param(
-            self.sampling_logprobs_mode, "selected", "sampling_logprobs_mode"
+            self.sampling_logprobs_mode, None, "sampling_logprobs_mode"
         )
 
         # Handle token_ids_logprob specially due to its nested structure

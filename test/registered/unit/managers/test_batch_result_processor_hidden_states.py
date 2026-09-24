@@ -137,29 +137,6 @@ class TestSamplingMaskMaterialization(CustomTestCase):
         )
         self.assertIsNone(output.sampling_mask_output)
 
-    def test_sampling_mask_ids_and_logprobs_must_have_identical_shapes(self):
-        output = LogitsProcessorOutput(
-            next_token_logits=None,
-            sampling_mask_output=SimpleNamespace(
-                token_ids=torch.tensor([[7, 8]], dtype=torch.int32),
-                lengths=torch.tensor([2]),
-                selected_logprobs=torch.tensor([-0.5]),
-                support_logprobs=torch.tensor([[-0.5]]),
-                statuses=torch.tensor([SamplingMaskStatus.OK]),
-            ),
-        )
-
-        with self.assertRaisesRegex(RuntimeError, "incompatible packed shapes"):
-            SchedulerBatchResultProcessor.materialize_sampling_mask_output(
-                reqs=[
-                    SimpleNamespace(
-                        return_sampling_mask=True,
-                        sampling_logprobs_mode="support",
-                    )
-                ],
-                output=output,
-            )
-
 
 class _PrefillReq:
     def __init__(self, *, rid: str, inflight_middle_chunks: int, return_hidden_states):

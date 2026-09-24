@@ -413,6 +413,10 @@ class TestGenerateReqInputNormalization(CustomTestCase):
         )
 
     def test_sampling_logprobs_mode_normalization(self):
+        default_req = copy.deepcopy(self.base_req)
+        default_req.normalize_batch_and_arguments()
+        self.assertEqual(default_req.sampling_logprobs_mode, [None, None])
+
         req = copy.deepcopy(self.base_req)
         req.return_sampling_mask = [True, True]
         req.sampling_logprobs_mode = ["selected", "support"]

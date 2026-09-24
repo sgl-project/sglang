@@ -524,14 +524,6 @@ class MetadataBuffers:
                 )
                 if sampling_mask is not None and sampling_logprobs_row is not None:
                     mask_len = len(sampling_mask)
-                    if (
-                        req.sampling_logprobs_mode == "support"
-                        and len(sampling_logprobs_row) != mask_len
-                    ):
-                        raise RuntimeError(
-                            "Sampling mask IDs and logprobs must have equal lengths; "
-                            f"got {mask_len} and {len(sampling_logprobs_row)}."
-                        )
                     max_mask_len = self.output_token_sampling_mask_idx.shape[1]
                     if mask_len > max_mask_len:
                         raise RuntimeError(

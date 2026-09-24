@@ -1381,9 +1381,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     "return_sampling_mask only supports DisallowedTokensLogitsProcessor "
                     "among custom logit processors."
                 )
-            if obj.sampling_logprobs_mode == "support" and not obj.return_sampling_mask:
+            if obj.sampling_logprobs_mode is not None and not obj.return_sampling_mask:
                 raise ValueError(
-                    "sampling_logprobs_mode='support' requires "
+                    "sampling_logprobs_mode can only be set when "
                     "return_sampling_mask=true."
                 )
 
@@ -1503,7 +1503,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 top_logprobs_num=obj.top_logprobs_num,
                 token_ids_logprob=obj.token_ids_logprob,
                 return_sampling_mask=obj.return_sampling_mask,
-                sampling_logprobs_mode=obj.sampling_logprobs_mode,
+                sampling_logprobs_mode=obj.sampling_logprobs_mode or "selected",
                 return_flat_raw_top_logprobs=obj.return_flat_raw_top_logprobs,
                 stream=obj.stream,
                 rid=obj.rid,

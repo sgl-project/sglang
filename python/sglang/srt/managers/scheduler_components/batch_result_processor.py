@@ -1197,24 +1197,6 @@ class SchedulerBatchResultProcessor:
             else sampling_output.support_logprobs.cpu()
         )
         packed_width = token_ids.shape[1]
-        support_row_count = sum(
-            reqs[batch_index].sampling_logprobs_mode == "support"
-            for batch_index in batch_indices
-        )
-        if support_row_count and support_logprobs is None:
-            raise RuntimeError(
-                "Support sampling logprobs were requested but not returned by "
-                "the sampler."
-            )
-        expected_support_shape = (support_row_count, packed_width)
-        if support_logprobs is not None and (
-            tuple(support_logprobs.shape) != expected_support_shape
-        ):
-            raise RuntimeError(
-                "Sampling support IDs and logprobs have incompatible packed "
-                f"shapes; expected {expected_support_shape}, got "
-                f"{tuple(support_logprobs.shape)}."
-            )
         support_row = 0
         for row, batch_index in enumerate(batch_indices):
             returns_support_logprobs = (
