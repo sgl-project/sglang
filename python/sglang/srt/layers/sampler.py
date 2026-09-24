@@ -37,6 +37,7 @@ if is_cuda():
         min_p_sampling_from_probs,
         top_k_top_p_sampling_from_probs,
     )
+    from flashinfer.sampling import softmax as flashinfer_softmax
     from sgl_kernel import (
         top_k_renorm_prob,
         top_p_renorm_prob,
@@ -124,6 +125,12 @@ class Sampler(nn.Module):
         # In RL on-policy mode, we use log_softmax to compute logprobs to match the trainer.
         self.use_log_softmax_logprob = self.rl_on_policy_target is not None
         self.use_ascend_backend = get_exec().kernel.sampling_backend == "ascend"
+        # Deterministic mode may need the temperature-scaled logits for log_softmax.
+        self.use_fused_temperature_softmax = (
+            is_cuda()
+            and get_exec().kernel.sampling_backend == "flashinfer"
+            and not self.enable_deterministic
+        )
         self.sampling_mask_max_tokens = get_exec().features.sampling_mask_max_tokens
 
         self.output_logprob_processor = OutputLogprobProcessor()
@@ -239,6 +246,21 @@ class Sampler(nn.Module):
                 )
                 if return_logprob and not SGLANG_RETURN_ORIGINAL_LOGPROB:
                     logprobs = logprobs_via_logsoftmax_kernel
+            elif self.use_fused_temperature_softmax:
+                # Standard path, one fused temperature-softmax pass.
+                probs = flashinfer_softmax(
+                    logits, temperature=sampling_info.temperatures.view(-1)
+                )
+
+                batch_next_token_ids, sampling_mask_capture = self._sample_from_probs(
+                    probs,
+                    sampling_info,
+                    positions,
+                    simple_sampling_case,
+                )
+                if return_logprob and not SGLANG_RETURN_ORIGINAL_LOGPROB:
+                    logprobs = torch.log(probs)
+                del probs
             else:
                 # Standard path: do softmax and sample from probs.
                 logits.div_(sampling_info.temperatures)
