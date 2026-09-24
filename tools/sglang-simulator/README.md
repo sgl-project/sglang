@@ -21,7 +21,7 @@ checks instead of branching on version numbers.
   same monorepo checkout.
 - A local model directory containing model configuration files. Tokenizer files
   are also required unless tokenizer initialization is disabled.
-- Predictor data for AIConfigurator, ML, or replay mode.
+- Predictor data for the selected AIConfigurator, ML, replay, or InferCast mode.
 
 Use an official SGLang image matching the checkout when validating GPU and
 runtime compatibility.
@@ -103,7 +103,9 @@ python3 -m sglang_simulator.simulation.sglang.launch_server \
 ```
 
 In the benchmark terminal, export the same output directory before sending
-timestamped traffic with the simulator-aware benchmark adapter:
+timestamped traffic with the simulator-aware benchmark adapter. The adapter
+activates its CPU-only compatibility layer before importing SGLang, so it can
+run in a ROCm image without a visible GPU:
 
 ```bash
 cd /path/to/sglang
@@ -217,9 +219,88 @@ Supported predictors:
 | `aiconfigurator` | Operator and module performance-database estimation. |
 | `ml` | A trained sklearn-compatible 18-feature latency model. |
 | `replay` | Exact or nearest-neighbor batch-composition replay. |
+| `infercast` | AMD model-forward estimates from an InferCast FIDB slice. |
 
 Relative predictor paths are resolved from the simulator configuration location.
 Environment variables in paths use `${NAME}` syntax.
+
+### InferCast predictor
+
+Install the exact InferCast revision paired with the selected FIDB slice and
+configure the immutable model commit as `model_revision`, then
+start from [`examples/sim_configs/infercast_silicon.json`](examples/sim_configs/infercast_silicon.json).
+The adapter makes one UMD per-forward call for each `EXTEND`, `MIXED`, or
+`DECODE` iteration and records the verified provider revision, model revision,
+and FIDB stack digest. Production initialization fails if the installed
+InferCast package cannot prove the configured source revision.
+Model/GEMM quantization comes from the pinned `model_id`; attention and KV-cache
+dtypes remain explicit predictor inputs.
+
+Prefix-hit, later chunk, and mixed shapes retain their prepared `(E, P)` values. The provider has
+one contract: context forwards pass the ordered request vector and exact `execution_profile`;
+decode forwards pass the ordered visible-history vector and exact `decode_execution_profile`.
+There is no contract-version or reduction-policy selector.
+
+InferCast owns profile validation, exact homogeneous/ragged composition, calibration selection,
+and closed-domain checks. The simulator owns cache hits, chunking, and scheduling and makes exactly
+one provider call per prepared forward. Missing rows or anchors, uncaptured graph batches,
+out-of-domain workloads, and eager/CUDA-graph substitution fail closed. Simulated time advances
+only after a provider call succeeds.
+
+Attention execution mode is phase-specific. `attn_kernel_impl` selects context forwards;
+`decode_execution_profile` selects decode realization. If `decode_attn_kernel_impl` is supplied it
+must match the decode profile.
+
+For a CPU-only DeepSeek-R1 smoke against the MI355X TP8/EP2 silicon slice,
+replace the systems root and provider revision in
+[`examples/sim_configs/infercast_deepseek_r1_mi355x.json`](examples/sim_configs/infercast_deepseek_r1_mi355x.json),
+then run:
+
+```bash
+python3 tools/sglang-simulator/scripts/run_infercast_benchmark.py \
+  --model-path /path/to/deepseek-r1-config \
+  --sim-config tools/sglang-simulator/examples/sim_configs/infercast_deepseek_r1_mi355x.json \
+  --output-dir /tmp/deepseek-r1-simulator \
+  --output /tmp/deepseek-r1-simulator.json \
+  --input-length 1024 \
+  --output-length 4 \
+  --num-requests 4
+```
+
+The model path only needs the DeepSeek-R1 `config.json`; weights are loaded in
+dummy mode. This runner remains a no-cache smoke. Use the open-loop runner with
+radix cache enabled to exercise supported prefix-hit and chunked shapes.
+
+### AgentX open-loop diagnostic
+
+`scripts/run_infercast_open_loop.py` accepts a fully materialized timestamped
+trace with one JSON object per line:
+
+```json
+{"timestamp_ms": 2614, "input_length": 35008, "output_length": 120}
+```
+
+It preserves arrival times and variable request shapes while flattening every
+request into an independent event. This is useful for scheduler-load diagnosis,
+but it is not canonical AgentX: response-driven turns, spawn/join dependencies,
+tool delays, session affinity, and prefix reuse are not modeled.
+Optional `hash_ids` plus `block_size` fields reconstruct deterministic shared
+token blocks for Radix Cache and HiCache diagnostics. Enable those tiers with
+`--enable-radix-cache` and `--enable-hierarchical-cache --hicache-ratio N`.
+
+InferCast contract v2 accepts only the reviewed bounded request signatures.
+Uncollected cache-hit or chunk combinations remain expected failures without
+fallback latency or logical-time advancement. A replay predictor can isolate
+cache accounting, but its fallback latency is not model-performance evidence.
+
+```bash
+python3 tools/sglang-simulator/scripts/run_infercast_open_loop.py \
+  --model-path /path/to/model-config \
+  --sim-config /path/to/infercast.json \
+  --trace /path/to/open-loop.jsonl \
+  --output-dir /tmp/agentx-open-loop \
+  --output /tmp/agentx-open-loop.json
+```
 
 ## Workload formats
 

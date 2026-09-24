@@ -21,6 +21,17 @@ from dataclasses import fields
 from pathlib import Path
 from typing import AsyncGenerator, List, Optional
 
+# This adapter is a CPU-only simulator client.  Bootstrap before importing
+# SGLang's serving package because that package reaches accelerator-backed
+# quantization registries while constructing its CLI, even for ``--help``.
+os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
+os.environ.setdefault("SGLANG_USE_CPU_ENGINE", "1")
+os.environ.setdefault("SGLANG_SIMULATOR_BOOTSTRAP", "1")
+
+from usercustomize import apply_cpu_simulation_compat
+
+apply_cpu_simulation_compat()
+
 import aiohttp
 import numpy as np
 from sglang_simulator.compat import validate_benchmark_runtime

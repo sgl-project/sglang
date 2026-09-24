@@ -2,12 +2,12 @@
 
 import asyncio
 import atexit
+import dataclasses
 import json
 import os
 from typing import Iterator
 
 import numpy as np
-from msgspec.structs import asdict
 from sglang_simulator.compat import apply_simulator_server_args
 from sglang_simulator.dataset import BaseDataset, GenericRequest
 from sglang_simulator.simulation.benchmark import BaseBenchmarkRunner, BenchmarkConfig
@@ -33,12 +33,28 @@ from sglang.srt.server_args import ServerArgs  # noqa: E402
 logger = get_logger("sglang_simulator")
 
 
+def server_args_asdict(server_args) -> dict:
+    """Normalize ServerArgs across dataclass, msgspec, and legacy releases."""
+    if dataclasses.is_dataclass(server_args):
+        return dataclasses.asdict(server_args)
+    try:
+        from msgspec.structs import asdict as msgspec_asdict
+
+        return msgspec_asdict(server_args)
+    except (ImportError, TypeError):
+        if hasattr(server_args, "__dict__"):
+            return dict(vars(server_args))
+        raise TypeError(
+            f"unsupported ServerArgs representation: {type(server_args)!r}"
+        ) from None
+
+
 class SGLangBenchmarkRunner(BaseBenchmarkRunner):
     """Run a simulator workload directly through SGLang's in-process Engine."""
 
     def __init__(self, server_args: ServerArgs):
         # Disable features that are unnecessary for simulation.
-        server_args_kwargs = asdict(server_args)
+        server_args_kwargs = server_args_asdict(server_args)
         apply_simulator_server_args(server_args_kwargs)
         self.engine = SGLangSimulationEngine(**server_args_kwargs)
         self.server_args = self.engine.server_args
