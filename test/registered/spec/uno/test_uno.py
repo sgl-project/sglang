@@ -41,10 +41,12 @@ UNO_ADAPTER_FILES = (
 )
 LORA_PATH_ENV = "SGLANG_TEST_UNO_LORA_PATH"
 MAX_NEW_TOKENS = 128
+# Greedy prefix scored against AR; longer prefixes admit more bf16 near-ties.
 PARITY_TOKENS = 32
+# Arbitrary; a token outside AR's top-k fails regardless of the margin.
 PARITY_TOP_LOGPROBS_NUM = 5
-# UNO verify and AR teacher-forced scoring use different kernel shapes; measured
-# H200 gaps are 1-2 bf16 logit steps (0.125 each here), so this allows 4.
+# UNO verify and AR teacher-forced scoring use different kernel shapes;
+# measured H200 gaps are 1-2 bf16 logit steps (0.125 here), so this allows 4.
 PARITY_TIE_LOGPROB_MARGIN = 0.5
 # Per mode and prompt; measured at most 1 on H200, identical across launches.
 PARITY_MAX_NEAR_TIES_PER_OUTPUT = 1
@@ -179,7 +181,7 @@ class TestUnoCudaGraph(CustomTestCase):
             )
             return {
                 mode: [
-                    self._ar_logprob_gaps(prompt, output_ids)
+                    self._ar_logprob_gaps(prompt=prompt, output_ids=output_ids)
                     for prompt, output_ids in zip(PROMPTS, outputs)
                 ]
                 for mode, outputs in outputs_by_mode.items()
@@ -188,16 +190,17 @@ class TestUnoCudaGraph(CustomTestCase):
             if process is not None:
                 kill_process_tree(process.pid)
 
-    def _ar_logprob_gaps(self, prompt: str, output_ids: list[int]) -> list[float]:
-        """Per output position, AR's top-1 logprob minus that of UNO's token."""
-        prompt_logprobs = self._generate(text=prompt)["meta_info"][
+    def _ar_logprob_gaps(self, *, prompt: str, output_ids: list[int]) -> list[float]:
+        prompt_logprobs = self._score_prefill({"text": prompt})["meta_info"][
             "input_token_logprobs"
         ]
         prompt_ids = [token_id for _, token_id, *_ in prompt_logprobs]
         # UNO rejects returned logprobs, so AR scores UNO's tokens teacher-forced.
-        scored = self._generate(
-            input_ids=prompt_ids + output_ids,
-            top_logprobs_num=PARITY_TOP_LOGPROBS_NUM,
+        scored = self._score_prefill(
+            {
+                "input_ids": prompt_ids + output_ids,
+                "top_logprobs_num": PARITY_TOP_LOGPROBS_NUM,
+            }
         )["meta_info"]["input_top_logprobs"][len(prompt_ids) :]
         gaps = []
         for token_id, position in zip(output_ids, scored, strict=True):
@@ -205,12 +208,11 @@ class TestUnoCudaGraph(CustomTestCase):
             gaps.append(max(top.values()) - top.get(token_id, float("-inf")))
         return gaps
 
-    def _generate(self, **request) -> dict:
-        """Prefill-only AR request returning logprobs over the whole input."""
+    def _score_prefill(self, inputs: dict) -> dict:
         response = requests.post(
             self.base_url + "/generate",
             json={
-                **request,
+                **inputs,
                 "sampling_params": {"temperature": 0, "max_new_tokens": 0},
                 "return_logprob": True,
                 "logprob_start_len": 0,
