@@ -2,6 +2,8 @@
 
 # SPDX-License-Identifier: Apache-2.0
 
+from functools import lru_cache
+
 import torch
 
 from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend import (  # FlashAttentionMetadata,
@@ -14,6 +16,11 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
 flash_attn_varlen_func = torch.ops.sgl_kernel.flash_attn_varlen_func
+
+
+@lru_cache(maxsize=128)
+def _get_cu_seqlens(bsz: int, seqlen: int) -> torch.Tensor:
+    return torch.arange(0, (bsz + 1) * seqlen, step=seqlen, dtype=torch.int32)
 
 
 class AMXAttentionBackend(AttentionBackend):
@@ -53,16 +60,17 @@ class AMXATTNImpl(AttentionImpl):
         value: torch.Tensor,
         attn_metadata: AttentionMetadata,
     ) -> torch.Tensor:
-        max_seqlen_q = query.shape[1]
-        max_seqlen_k = key.shape[1]
-        return flash_attn_varlen_func(
-            query[0],
-            key[0],
-            value[0],
-            torch.tensor([0, max_seqlen_q]).to(torch.int),
-            torch.tensor([0, max_seqlen_k]).to(torch.int),
-            max_seqlen_q,
-            max_seqlen_k,
+        bsz, seqlen_q, nheads_q, head_size = query.shape
+        _, seqlen_k, nheads_k, _ = key.shape
+        out = flash_attn_varlen_func(
+            query.reshape(bsz * seqlen_q, nheads_q, head_size),
+            key.reshape(bsz * seqlen_k, nheads_k, head_size),
+            value.reshape(bsz * seqlen_k, nheads_k, value.shape[-1]),
+            _get_cu_seqlens(bsz, seqlen_q),
+            _get_cu_seqlens(bsz, seqlen_k),
+            seqlen_q,
+            seqlen_k,
             self.causal,
             self.softmax_scale,
-        ).unsqueeze(0)
+        )
+        return out.view(bsz, seqlen_q, nheads_q, -1)
