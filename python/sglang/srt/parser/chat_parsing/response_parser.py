@@ -83,12 +83,9 @@ def parse_response(
     stream = ResponseParser(response_template, prefix=prefix, tools=tools)
     events = stream.feed(text)
     message, final_events = stream.finalize()
-    malformed = next(
-        (event for event in events + final_events if event["type"] == "region_malformed"),
-        None,
-    )
-    if malformed is not None:
-        raise ValueError(malformed["error"])
+    for event in events + final_events:
+        if event["type"] == "region_malformed":
+            raise event["error"]
     return message
 
 
@@ -113,11 +110,11 @@ class ResponseParser:
     using the calling tool's JSON schema as each region closes.
 
     Events can be "region_open", "region_chunk", "region_close", or "region_malformed".
-    Every event carries its exact `start` and `end` offsets. Delimiter text is the
-    corresponding slice of `input_text`. The parser exposes the `prefix_end` boundary
-    separately. Open events include `captures`, the opener's named groups, when it
-    matched any. Malformed events include `close_start`, the boundary between the
-    region body and its closing delimiter.
+    Open, close and malformed events carry `start` and `end`, the span of `input_text` the
+    event consumed: its opening or closing delimiter, empty for implicit boundaries.
+    Explicit opens also carry the opener's named `captures`. A region whose value fails to
+    parse ends with "region_malformed" instead of "region_close", carrying the `error`, and
+    parsing continues after it.
 
     ResponseParser requires the chat `prefix` (i.e. the chat history, the prefill before the current generation).
     This is because chat templates or assistant prefills can sometimes write part of the message, and if we
@@ -162,8 +159,6 @@ class ResponseParser:
         self._body: str = ""
         self._opened: bool = False
         self._finalized: bool = False
-        self._prefix_end: int = 0
-        self._region_start: int = 0
         self._malformed_fields: set[str] = set()
         self.initial_events: list[dict] = []
         if prefix:
@@ -171,22 +166,9 @@ class ResponseParser:
 
     @property
     def input_text(self) -> str:
-        """Raw parser input after start-anchor truncation."""
+        """Raw parser input after start-anchor truncation. Before the first `feed()`, this is
+        exactly the truncated prefix, so its length marks where generated text begins."""
         return self._buffer
-
-    @property
-    def prefix_end(self) -> int:
-        """Boundary between the prompt prefix and generated text."""
-        return self._prefix_end
-
-    def _event(self, event_type: str, field: str, start: int, end: int, **kwargs) -> dict:
-        return {
-            "type": event_type,
-            "field": field,
-            "start": start,
-            "end": end,
-            **kwargs,
-        }
 
     def _consume_prefix(self, prefix: str) -> None:
         """Loads the prefix (the chat prefill sent to the model), right-truncates it to the start of the
@@ -200,7 +182,6 @@ class ResponseParser:
         if not truncated:
             return
         self._buffer = truncated
-        self._prefix_end = len(truncated)
         self._process(self.initial_events, eos=False)
 
     def feed(self, text: str) -> list[dict]:
@@ -250,16 +231,12 @@ class ResponseParser:
                     self._accumulate(events, self._buffer[self._pos : m.start()])
                 self._pos = m.end()
                 if kind == "open":
-                    self._close_current(events, end=m.start())
+                    self._close_current(events, m.start(), m.start())
                     self._open_explicit(events, field, m)
-                else:  # "close" for the current explicit or implicit region
+                else:  # "close" (always the implicit region's close here,
+                    #   since explicit regions only expose their own close)
                     had_content = self._opened
-                    self._close_current(
-                        events,
-                        raw=m.group(0),
-                        end=m.end(),
-                        closed=True,
-                    )
+                    self._close_current(events, m.start(), m.end())
                     # Zero-width close on an already-empty region would just
                     # re-fire next iteration -- bail out to make progress.
                     if not had_content and m.start() == m.end():
@@ -271,7 +248,7 @@ class ResponseParser:
                 if self._pos < len(self._buffer):
                     self._accumulate(events, self._buffer[self._pos :])
                     self._pos = len(self._buffer)
-                self._close_current(events)
+                self._close_current(events, self._pos, self._pos)
                 break
             # Stream everything up to the earliest still-pending delimiter. When
             # nothing is pending `hold_start == len(self._buffer)`, so this flushes
@@ -378,39 +355,23 @@ class ResponseParser:
         if not text or self._current is None:
             return
         field = self._spec.fields[self._current]
-        start = self._pos
-        end = start + len(text)
         if not self._opened:
-            self._region_start = start
-            events.append(self._event("region_open", self._current, start, start))
+            events.append({"type": "region_open", "field": self._current, "start": self._pos, "end": self._pos})
             self._opened = True
         self._body += text
         dirty = field.content not in STREAMABLE_PARSERS
-        events.append(self._event("region_chunk", self._current, start, end, text=text, dirty=dirty))
+        events.append({"type": "region_chunk", "field": self._current, "text": text, "dirty": dirty})
 
     def _open_explicit(self, events: list[dict], field: ResponseTemplateField, m: Any) -> None:
         self._current = field.name
         self._captures = {k: v for k, v in m.groupdict().items() if v is not None}
         self._body = ""
         self._opened = True
-        self._region_start = m.start()
-        event = self._event(
-            "region_open",
-            field.name,
-            m.start(),
-            m.end(),
+        events.append(
+            {"type": "region_open", "field": field.name, "start": m.start(), "end": m.end(), "captures": self._captures}
         )
-        if self._captures:
-            event["captures"] = dict(self._captures)
-        events.append(event)
 
-    def _close_current(
-        self,
-        events: list[dict],
-        raw: str = "",
-        end: int | None = None,
-        closed: bool = False,
-    ) -> None:
+    def _close_current(self, events: list[dict], close_start: int, close_end: int) -> None:
         """Close the current region and reset to the implicit/null region.
         Skipped (aside from the reset) when the current region never opened --
         avoids vacuous open/close pairs at every explicit boundary."""
@@ -418,40 +379,30 @@ class ResponseParser:
             self._reset_to_implicit()
             return
         field = self._spec.fields[self._current]
-        end = self._pos if end is None else end
-        close_start = end - len(raw)
         try:
             value = process_field(self._body, field, self._captures)
             if self._tool_params:
                 value = self._coerce_tool_calls(value)
-            if field.join is not None:
-                if not isinstance(value, str):
-                    raise ValueError(
-                        f"Field '{field.name}': 'join' requires each match to parse to a string, "
-                        f"got {type(value).__name__}."
-                    )
-                previous = self._output.get(self._current)
-                self._output[self._current] = value if previous is None else previous + field.join + value
-            elif field.repeats:
-                self._output.setdefault(self._current, []).append(value)
-            else:
-                self._output[self._current] = value
+            if field.join is not None and not isinstance(value, str):
+                raise ValueError(
+                    f"Field '{field.name}': 'join' requires each match to parse to a string, "
+                    f"got {type(value).__name__}."
+                )
         except (KeyError, TypeError, ValueError) as error:
             self._malformed_fields.add(self._current)
             events.append(
-                self._event(
-                    "region_malformed",
-                    self._current,
-                    self._region_start,
-                    end,
-                    close_start=close_start,
-                    closed=closed,
-                    error=str(error),
-                )
+                {"type": "region_malformed", "field": self._current, "start": close_start, "end": close_end, "error": error}
             )
             self._reset_to_implicit()
             return
-        events.append(self._event("region_close", self._current, close_start, end, value=value))
+        if field.join is not None:
+            previous = self._output.get(self._current)
+            self._output[self._current] = value if previous is None else previous + field.join + value
+        elif field.repeats:
+            self._output.setdefault(self._current, []).append(value)
+        else:
+            self._output[self._current] = value
+        events.append({"type": "region_close", "field": self._current, "start": close_start, "end": close_end, "value": value})
         self._reset_to_implicit()
 
     def _coerce_tool_calls(self, value: Any) -> Any:
@@ -479,5 +430,4 @@ class ResponseParser:
         self._captures = {}
         self._body = ""
         self._opened = False
-        self._region_start = self._pos
 # fmt: on
