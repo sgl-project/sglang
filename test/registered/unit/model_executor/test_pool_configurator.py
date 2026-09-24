@@ -1326,7 +1326,7 @@ class TestSWAPoolFloor(CustomTestCase):
         from sglang.srt.model_executor.pool_configurator import DSV4PoolConfigurator
 
         kvc = _make_model_runner(self, num_layers=1, page_size=256)
-        _publish_config(self, dsv4_attn_backend="trtllm")
+        _publish_config(self, dsv4_attn_backend="trtllm", page_size=256)
         kvc.kv_cache_dtype_str = "fp8_e4m3"
         cfg = kvc.model_config
         cfg.qk_nope_head_dim = 448
