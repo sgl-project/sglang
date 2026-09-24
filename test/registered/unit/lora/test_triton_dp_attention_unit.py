@@ -36,7 +36,7 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 def global_lm_head(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(
         "sglang.srt.lora.backend.triton_backend.get_parallel",
-        lambda: SimpleNamespace(enable_dp_lm_head=False),
+        lambda: SimpleNamespace(enable_dp_lm_head=False, attn_dp_rank=0),
     )
 
 
@@ -163,19 +163,22 @@ def test_layout_selects_routing_without_shape_inference():
 
 
 @pytest.mark.parametrize(
-    "parallel_overrides",
-    [{"attn_tp_size": 2}, {"attn_cp_size": 2}],
+    "attention_widths",
+    [
+        {"attn_tp_size": 2, "attn_cp_size": 1},
+        {"attn_tp_size": 1, "attn_cp_size": 2},
+    ],
     ids=["attn-tp", "attn-cp"],
 )
 def test_manager_rejects_dp_attention_with_multi_rank_attention_groups(
-    parallel_overrides,
+    attention_widths,
 ):
     with (
         get_context().override_server_args(
             enable_dp_attention=True, enable_lora_overlap_loading=False
         ) as args,
         get_parallel().override(
-            **{"attn_tp_size": 1, "attn_cp_size": 1, **parallel_overrides}
+            tp_size=4, attn_dp_size=2, moe_tp_size=4, **attention_widths
         ),
         pytest.raises(ValueError, match="requires --dp-size equal to --tp-size"),
     ):
@@ -264,9 +267,6 @@ def test_dp_cuda_graph_global_routing_does_not_require_logprob_metadata(
     local_batch_info.use_cuda_graph = True
     graph_batch_info = _batch_info([0, 0, 0, 0], [1, 1, 1, 1])
     graph_batch_info.use_cuda_graph = True
-    monkeypatch.setattr(
-        "sglang.srt.lora.backend.triton_backend.get_attention_dp_rank", lambda: 0
-    )
 
     def gather(output, local, forward_batch):
         assert local.tolist() == [1, 2]
@@ -298,10 +298,7 @@ def test_local_lm_head_keeps_local_pruned_routing(
     backend.has_global_active_lora = True
     monkeypatch.setattr(
         "sglang.srt.lora.backend.triton_backend.get_parallel",
-        lambda: SimpleNamespace(enable_dp_lm_head=True),
-    )
-    monkeypatch.setattr(
-        "sglang.srt.lora.backend.triton_backend.get_attention_dp_rank", lambda: 0
+        lambda: SimpleNamespace(enable_dp_lm_head=True, attn_dp_rank=0),
     )
 
     gather_count = 0
@@ -336,9 +333,6 @@ def test_prepare_global_routing_gathers_pruned_lm_head_routes(
     backend.batch_info = _batch_info([1, 2], [1, 1])
     backend.lm_head_batch_info = _batch_info([1, 2], [1, 1])
     backend.has_global_active_lora = True
-    monkeypatch.setattr(
-        "sglang.srt.lora.backend.triton_backend.get_attention_dp_rank", lambda: 0
-    )
 
     gather_count = 0
 
@@ -390,9 +384,6 @@ def test_prepare_global_routing_gathers_unpadded_decode_lm_head_routes(
     backend = TritonLoRABackend(3, torch.device("cpu"))
     backend.batch_info = _batch_info([1, 2, 0], [1, 1, 1])
     backend.has_global_active_lora = True
-    monkeypatch.setattr(
-        "sglang.srt.lora.backend.triton_backend.get_attention_dp_rank", lambda: 0
-    )
 
     gather_count = 0
 

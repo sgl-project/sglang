@@ -12,8 +12,6 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
     dp_gather_replicate,
-    get_attention_dp_rank,
-    get_attention_dp_size,
 )
 from sglang.srt.lora.backend.base_backend import BaseLoRABackend
 from sglang.srt.lora.utils import (
@@ -79,7 +77,7 @@ def _gather_dp_attention_weight_indices(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     global_num_tokens = forward_batch.global_num_tokens_cpu
     assert global_num_tokens is not None
-    local_num_tokens = global_num_tokens[get_attention_dp_rank()]
+    local_num_tokens = global_num_tokens[get_parallel().attn_dp_rank]
     local_weight_indices = torch.repeat_interleave(
         local_batch_info.weight_indices[: local_batch_info.num_segments],
         local_batch_info.seg_lens[: local_batch_info.num_segments],
@@ -131,7 +129,7 @@ def gather_dp_attention_lora_batch_info(
         no_lora_weight_index,
         None if graph_batch_info is None else graph_batch_info.weight_indices,
     )
-    local_num_tokens = global_num_tokens[get_attention_dp_rank()]
+    local_num_tokens = global_num_tokens[get_parallel().attn_dp_rank]
     if (
         not local_batch_info.use_cuda_graph
         and local_num_tokens != local_batch_info.expected_tokens
@@ -417,7 +415,7 @@ class TritonLoRABackend(BaseLoRABackend):
         assert local_batch_info is not None, (
             "init_cuda_graph_batch_info must run before DP-attention graph init"
         )
-        max_global_num_tokens = max_num_tokens * get_attention_dp_size()
+        max_global_num_tokens = max_num_tokens * get_parallel().attn_dp_size
         self.cuda_graph_global_batch_info = build_token_lora_batch_info(
             local_batch_info,
             torch.zeros(max_global_num_tokens, dtype=torch.int32, device=self.device),
