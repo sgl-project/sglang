@@ -1603,6 +1603,8 @@ class DeepseekV4HipRadixBackend(
         save_kv_cache: bool = True,
         q_rope: Optional[torch.Tensor] = None,
         k_rope: Optional[torch.Tensor] = None,
+        inv_rope_positions: Optional[torch.Tensor] = None,
+        inv_rope_freqs: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """unified_kv paged-attention path over the unified_kv pool.
 
@@ -1611,6 +1613,10 @@ class DeepseekV4HipRadixBackend(
         the asm reader; absent means both are plain bf16 and it goes to Triton.
         Prefill needs ``k_rope`` alongside it, because there the current chunk is
         a KV source of its own and not just something to store.
+
+        ``inv_rope_positions`` / ``inv_rope_freqs`` are passed only when
+        ``env_gate.unified_decode_fuses_inv_rope`` holds; the output then comes back
+        with the inverse RoPE already applied.
         """
         from sglang.kernels.ops.attention.dsv4.unified_kv_kernels import runtime
 
@@ -1635,6 +1641,13 @@ class DeepseekV4HipRadixBackend(
         # decode; its per-token decode streams were built in metadata.
         verify_as_decode = forward_batch.forward_mode.is_target_verify()
         is_decode = forward_batch.forward_mode.is_decode_or_idle() or verify_as_decode
+        # The model skips its own inverse RoPE whenever it passes these, so any
+        # reader below that cannot apply them would silently leave rows unrotated.
+        fuse_inv_rope = inv_rope_positions is not None
+        assert not fuse_inv_rope or (is_decode and q_rope is None), (
+            "inverse RoPE fusion requested outside the bf16 Triton paged decode "
+            f"({forward_batch.forward_mode=}, fp8={q_rope is not None})"
+        )
         if is_decode:
             if verify_as_decode:
                 # Per-token (num_draft*bs -> bs) req-slot map, precomputed once
@@ -1715,6 +1728,8 @@ class DeepseekV4HipRadixBackend(
                 # Only this call site knows compress_ratio, and it is the one
                 # thing that separates the ragged stream from the clamped ones.
                 kv_splits=_kv_splits_for_stream(compress_ratio),
+                inv_rope_positions=inv_rope_positions,
+                inv_rope_freqs=inv_rope_freqs,
             )
 
         # prefill / extend
@@ -1911,6 +1926,8 @@ class DeepseekV4HipRadixBackend(
         attn_sink: Optional[torch.Tensor] = None,
         q_rope: Optional[torch.Tensor] = None,
         k_rope: Optional[torch.Tensor] = None,
+        inv_rope_positions: Optional[torch.Tensor] = None,
+        inv_rope_freqs: Optional[torch.Tensor] = None,
         **_,
     ) -> torch.Tensor:
         if self.mtp_enabled and forward_batch.forward_mode.is_idle():
@@ -1941,8 +1958,13 @@ class DeepseekV4HipRadixBackend(
                 save_kv_cache=save_kv_cache,
                 q_rope=q_rope,
                 k_rope=k_rope,
+                inv_rope_positions=inv_rope_positions,
+                inv_rope_freqs=inv_rope_freqs,
             )
 
+        assert inv_rope_positions is None, (
+            "inverse RoPE fusion is only implemented on the unified_kv_triton path"
+        )
         if isinstance(core_attn_metadata, DSV4AttnMetadata):
             if save_kv_cache:
                 self.store_cache(layer_id, swa_k, forward_batch)

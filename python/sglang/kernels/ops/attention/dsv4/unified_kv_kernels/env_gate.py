@@ -33,3 +33,33 @@ def is_unified_kv_fp8() -> bool:
         )
         return False
     return True
+
+
+@functools.lru_cache(maxsize=1)
+def _decode_inv_rope_fusion_enabled() -> bool:
+    if not (
+        envs.SGLANG_OPT_DSV4_DECODE_FUSED_INVROPE.get()
+        and is_unified_kv_triton()
+        # the fp8 two-pool decode is aiter's asm reader + merge, no epilogue hook
+        and not is_unified_kv_fp8()
+    ):
+        return False
+    from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.paged_decode import (
+        decode_supports_fused_inv_rope,
+    )
+
+    return decode_supports_fused_inv_rope()
+
+
+def unified_decode_fuses_inv_rope(forward_mode) -> bool:
+    """Whether this forward's attention output comes back inverse-RoPE'd.
+
+    The single source of truth shared by the model (which then skips its own
+    inverse RoPE) and DeepseekV4HipRadixBackend (which asserts it only gets the
+    positions on the Triton paged-decode path). A pure function of static config
+    and forward_mode, so the decision is fixed per captured graph; it must never
+    depend on per-step batch contents.
+    """
+    return _decode_inv_rope_fusion_enabled() and (
+        forward_mode.is_decode_or_idle() or forward_mode.is_target_verify()
+    )
