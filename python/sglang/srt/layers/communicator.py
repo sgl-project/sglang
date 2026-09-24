@@ -1408,6 +1408,58 @@ class CommunicateSimpleFn:
         return hidden_states
 
 
+def _redistribute_from_attn_tp_shards(tensor: torch.Tensor) -> torch.Tensor:
+    gathered = get_local_dp_buffer(get_parallel().attn_tp_group)
+    attn_tp_all_gather_into_tensor(gathered, tensor)
+    return gathered
+
+
+def _mlp_input_reduce_output(
+    hidden_states: torch.Tensor, forward_batch: ForwardBatch
+) -> torch.Tensor:
+    if (
+        not forward_batch.forward_mode.is_decode_or_idle()
+        and get_exec().comm.enable_quant_communications
+    ):
+        return attention_tensor_model_parallel_quant_all_reduce(hidden_states)
+    return attention_tensor_model_parallel_all_reduce(hidden_states)
+
+
+def _mlp_input_reduce_output_and_update_and_read_residual(
+    hidden_states: torch.Tensor,
+    residual: torch.Tensor,
+    forward_batch: ForwardBatch,
+    layernorm: torch.nn.Module,
+) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+    """The attention-TP all-reduce, residual add and norm in one fused kernel;
+    None when no fused kernel takes the batch."""
+    if (
+        apply_aiter_all_reduce_fusion(hidden_states, forward_batch)
+        or apply_flashinfer_allreduce_fusion(hidden_states.shape[0])
+    ) and hasattr(layernorm, "forward_with_allreduce_fusion"):
+        hidden_states, residual = layernorm.forward_with_allreduce_fusion(
+            hidden_states, residual, use_attn_tp_group=True
+        )
+        return hidden_states, residual
+    return None
+
+
+def _redistribute_input_to_dp(
+    hidden_states: torch.Tensor, forward_batch: ForwardBatch
+) -> torch.Tensor:
+    global_hidden_states = get_global_dp_buffer(get_parallel().tp_group)
+    dp_gather_replicate(global_hidden_states, hidden_states, forward_batch)
+    return global_hidden_states
+
+
+def _reduce_and_redistribute_output_to_dp(
+    hidden_states: torch.Tensor, forward_batch: ForwardBatch
+) -> torch.Tensor:
+    global_hidden_states = get_global_dp_buffer(get_parallel().tp_group)
+    dp_gather_partial(global_hidden_states, hidden_states, forward_batch)
+    return global_hidden_states
+
+
 class CommunicateWithAllReduceAndLayerNormFn:
     """Besides communication, needs to
     1. All reduce in tp_attn_group on hidden_states
@@ -1532,68 +1584,43 @@ class CommunicateWithAllReduceAndLayerNormFn:
             )
 
         if residual_input_mode == ScatterMode.SCATTERED and context.attn_tp_size > 1:
-            residual, local_residual = (
-                get_local_dp_buffer(get_parallel().attn_tp_group),
-                residual,
+            residual = _redistribute_from_attn_tp_shards(residual)
+        if context.attn_dp_size == 1:
+            fused = _mlp_input_reduce_output_and_update_and_read_residual(
+                hidden_states, residual, forward_batch, layernorm
             )
-            attn_tp_all_gather_into_tensor(residual, local_residual)
-        if context.attn_dp_size != 1:
-            use_layer_norm_before_gather = (
-                context.force_layernorm_before_dp_gather or context.attn_tp_size == 1
-            )
-            if use_layer_norm_before_gather and hidden_states.shape[0] != 0:
-                if context.attn_tp_size > 1:
-                    hidden_states = attention_tensor_model_parallel_all_reduce(
-                        hidden_states
-                    )
-                with use_symmetric_memory(
-                    get_parallel().tp_group,
-                    disabled=not is_allocation_symmetric(),
-                ):
-                    hidden_states, residual = layernorm(hidden_states, residual)
-            elif context.attn_tp_rank == 0:
-                hidden_states += residual
+            if fused is not None:
+                return fused
+            hidden_states = _mlp_input_reduce_output(hidden_states, forward_batch)
+            if _is_npu and context.cache is not None:
+                _ = prepare_weight_cache(hidden_states, context.cache)
+            return layernorm(hidden_states, residual)
 
-            hidden_states, local_hidden_states = (
-                get_global_dp_buffer(get_parallel().tp_group),
-                hidden_states,
-            )
-            if use_layer_norm_before_gather:
-                dp_gather_replicate(hidden_states, local_hidden_states, forward_batch)
-            else:
-                dp_gather_partial(hidden_states, local_hidden_states, forward_batch)
-
-            if not use_layer_norm_before_gather:
-                dp_scatter(residual, hidden_states, forward_batch)
-                if hidden_states.shape[0] != 0:
-                    hidden_states = layernorm(hidden_states)
-        else:
-            handled = False
-            if (
-                apply_aiter_all_reduce_fusion(hidden_states, forward_batch)
-                or apply_flashinfer_allreduce_fusion(hidden_states.shape[0])
-            ) and hasattr(layernorm, "forward_with_allreduce_fusion"):
-                hidden_states, residual = layernorm.forward_with_allreduce_fusion(
-                    hidden_states, residual, use_attn_tp_group=True
+        # Attention DP. Replicate: reduce, add and normalize locally, then gather.
+        # Partial: one rank adds the residual, the gather sums it, then normalize.
+        replicate = (
+            context.force_layernorm_before_dp_gather or context.attn_tp_size == 1
+        )
+        if replicate and hidden_states.shape[0] != 0:
+            if context.attn_tp_size > 1:
+                hidden_states = attention_tensor_model_parallel_all_reduce(
+                    hidden_states
                 )
-                handled = True
-
-            if not handled:
-                quantize_communications = (
-                    not forward_batch.forward_mode.is_decode_or_idle()
-                    and get_exec().comm.enable_quant_communications
-                )
-                if quantize_communications:
-                    hidden_states = attention_tensor_model_parallel_quant_all_reduce(
-                        hidden_states
-                    )
-                else:
-                    hidden_states = attention_tensor_model_parallel_all_reduce(
-                        hidden_states
-                    )
-                if _is_npu and context.cache is not None:
-                    _ = prepare_weight_cache(hidden_states, context.cache)
+            with use_symmetric_memory(
+                get_parallel().tp_group,
+                disabled=not is_allocation_symmetric(),
+            ):
                 hidden_states, residual = layernorm(hidden_states, residual)
+        elif context.attn_tp_rank == 0:
+            hidden_states += residual
+        if replicate:
+            return _redistribute_input_to_dp(hidden_states, forward_batch), residual
+        hidden_states = _reduce_and_redistribute_output_to_dp(
+            hidden_states, forward_batch
+        )
+        dp_scatter(residual, hidden_states, forward_batch)
+        if hidden_states.shape[0] != 0:
+            hidden_states = layernorm(hidden_states)
         return hidden_states, residual
 
     @staticmethod
