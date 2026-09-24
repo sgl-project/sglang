@@ -62,15 +62,6 @@ DROID_COMPOSITE_HW = (540, 640)
 LATENT_CHANNELS = 96
 TEMPORAL_DOWNSAMPLE = 4
 GRAY_LEVEL = 128
-# OpenPI / RoboLab request keys (flux_action/serving/robolab.py).
-ROBOLAB_COMPOSITE_KEY = "observation/image"
-ROBOLAB_VIEW_KEYS = (
-    "observation/wrist_image_left",
-    "observation/exterior_image_1_left",
-    "observation/exterior_image_2_left",
-)
-ROBOLAB_JOINTS_KEY = "observation/joint_position"
-ROBOLAB_GRIPPER_KEY = "observation/gripper_position"
 
 
 class Flux3ActionObservation(msgspec.Struct, frozen=True):
@@ -147,30 +138,9 @@ def _check_unit_range(image: torch.Tensor) -> torch.Tensor:
     return image
 
 
-def _robolab_uint8(value: Any) -> torch.Tensor:
-    """RoboLab frames are pixel values of any dtype, clipped to uint8 (as the reference server)."""
-    array = np.asarray(value)
-    if array.ndim != 3 or array.shape[-1] != 3:
-        raise ValueError(f"expected an HWC RGB image, got shape {array.shape}")
-    if array.dtype != np.uint8:
-        array = np.clip(array, 0, 255).astype(np.uint8)
-    return torch.from_numpy(np.require(array, requirements=["C", "W"]))
-
-
 def _canonical_camera(name: str, aliases: dict[str, str]) -> str:
     name = name.removeprefix("observation.images.").removeprefix("images.")
     return aliases.get(name, name)
-
-
-def _resize_uint8_truncate(image: torch.Tensor, size: tuple[int, int]) -> torch.Tensor:
-    """RoboLab composition: bilinear on float, back to uint8 by truncation."""
-    resized = F.interpolate(
-        image.permute(2, 0, 1)[None].float(),
-        size=size,
-        mode="bilinear",
-        align_corners=False,
-    )
-    return resized[0].permute(1, 2, 0).to(torch.uint8)
 
 
 def _pad_composite(composite: torch.Tensor, canvas_hw: tuple[int, int]) -> torch.Tensor:
@@ -260,38 +230,24 @@ def _compose_canvas(
     return canvas.mul_(2.0).sub_(1.0)
 
 
-def _composite_from_robolab(observation: dict[str, Any]) -> torch.Tensor | None:
-    if ROBOLAB_COMPOSITE_KEY in observation:
-        return _robolab_uint8(observation[ROBOLAB_COMPOSITE_KEY])
-    if all(key in observation for key in ROBOLAB_VIEW_KEYS):
-        wrist, left, right = (
-            _robolab_uint8(observation[key]) for key in ROBOLAB_VIEW_KEYS
-        )
-        half = (wrist.shape[0] // 2, wrist.shape[1] // 2)
-        bottom = torch.cat(
-            [_resize_uint8_truncate(left, half), _resize_uint8_truncate(right, half)],
-            dim=1,
-        )
-        return torch.cat([wrist, bottom], dim=0)
-    return None
-
-
 def _observation_canvas(
     observation: dict[str, Any], config: Flux3ActionPipelineConfig
 ) -> torch.Tensor:
+    # OpenPI clients may also send cameras as top-level "observation.images.<name>".
+    named = {
+        k: v for k, v in observation.items() if k.startswith("observation.images.")
+    }
+    named.update(observation.get("images") or {})
     images = {
         _canonical_camera(name, config.camera_aliases): value
-        for name, value in (observation.get("images") or {}).items()
+        for name, value in named.items()
     }
     if "composite" in images:
-        composite = _as_image(images["composite"])
-    else:
-        robolab = _composite_from_robolab(observation)
-        composite = None if robolab is None else _as_image(robolab)
-    if composite is not None:
         if config.camera_layout != "droid":
             raise ValueError("a composite image requires the droid camera layout")
-        return _pad_composite(composite, canvas_hw=config.canvas_hw)
+        return _pad_composite(
+            _as_image(images["composite"]), canvas_hw=config.canvas_hw
+        )
     missing = [key for key in config.image_keys if key not in images]
     if missing:
         raise KeyError(
@@ -318,13 +274,6 @@ def _observation_state(observation: dict[str, Any], state_dim: int) -> torch.Ten
     state = observation.get("state")
     if state is None:
         state = observation.get("observation.state")
-    if state is None and ROBOLAB_JOINTS_KEY in observation:
-        joints = np.asarray(observation[ROBOLAB_JOINTS_KEY], dtype=np.float32)
-        joints = joints[-1] if joints.ndim == 2 else joints
-        gripper = np.asarray(
-            observation[ROBOLAB_GRIPPER_KEY], dtype=np.float32
-        ).reshape(-1)
-        state = np.concatenate([joints.reshape(-1), gripper[-1:]])
     if state is None:
         raise KeyError("observation lacks 'state'")
     state = torch.as_tensor(np.asarray(state, dtype=np.float32)).reshape(-1)

@@ -285,49 +285,16 @@ def test_droid_canvas_from_cameras():
     torch.testing.assert_close(obs.canvas[:, :, 640], obs.canvas[:, :, 638])
 
 
-def test_robolab_views_and_client_composite_agree():
-    """RoboLab clients send either the three views or the composite they build from them."""
-    import torch.nn.functional as F
-
+def test_droid_composite_matches_three_camera_canvas():
+    """A client-built 540x640 composite and the three cameras give the same canvas."""
     config = _droid_config()
     views = _views(1)
-    state = np.arange(8, dtype=np.float32)
-
-    def client_half(image):  # RoboLab/Cosmos client: float bilinear, truncate to uint8
-        x = torch.from_numpy(image).permute(2, 0, 1)[None].float()
-        x = F.interpolate(x, size=(180, 320), mode="bilinear", align_corners=False)
-        return x[0].permute(1, 2, 0).numpy().astype(np.uint8)
-
-    composite = np.concatenate(
-        [
-            views["wrist"],
-            np.concatenate(
-                [client_half(views["left"]), client_half(views["right"])], 1
-            ),
-        ],
-        0,
-    )
-    from_views = parse_observation(
-        {
-            "observation/wrist_image_left": views["wrist"],
-            "observation/exterior_image_1_left": views["left"],
-            "observation/exterior_image_2_left": views["right"],
-            "observation/joint_position": state[None, :7],
-            "observation/gripper_position": state[7:],
-        },
-        config,
-    )
+    from_cameras = parse_observation({"images": views, "state": np.zeros(8)}, config)
+    composite = (from_cameras.canvas[:, :540, :640] + 1) / 2
     from_composite = parse_observation(
-        {
-            "observation/image": composite,
-            "observation/joint_position": state[:7],
-            "observation/gripper_position": float(state[7]),
-        },
-        config,
+        {"images": {"composite": composite}, "state": np.zeros(8)}, config
     )
-    torch.testing.assert_close(from_views.state, torch.from_numpy(state))
-    torch.testing.assert_close(from_composite.state, torch.from_numpy(state))
-    assert torch.equal(from_views.canvas, from_composite.canvas)
+    torch.testing.assert_close(from_composite.canvas, from_cameras.canvas)
 
 
 def test_lerobot_camera_names_and_float_images():
@@ -338,7 +305,7 @@ def test_lerobot_camera_names_and_float_images():
         "observation.images.exterior_image_1_left": views["left"],
         "observation.images.exterior_image_2_left": views["right"],
     }
-    by_alias = parse_observation({"images": lerobot, "state": np.zeros(8)}, config)
+    by_alias = parse_observation({**lerobot, "observation.state": np.zeros(8)}, config)
     floats = {k: v.astype(np.float32) / 255 for k, v in views.items()}
     by_float = parse_observation({"images": floats, "state": np.zeros(8)}, config)
     torch.testing.assert_close(by_alias.canvas, by_float.canvas)

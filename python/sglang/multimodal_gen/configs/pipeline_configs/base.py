@@ -305,11 +305,6 @@ class PipelineConfig:
         del server_args
         return None
 
-    def openpi_response(self, output: dict[str, Any]) -> dict[str, Any]:
-        """Shape of one OpenPI websocket response built from the policy output."""
-
-        return output
-
     # Wan2.2 TI2V parameters
     boundary_ratio: float | None = None
 

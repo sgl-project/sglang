@@ -385,10 +385,6 @@ class Flux3ActionPipelineConfig(PipelineConfig):
             },
         }
 
-    def openpi_response(self, output: dict[str, Any]) -> dict[str, Any]:
-        # RoboLab clients of the reference server read "action"; OpenPI reads "actions".
-        return {**output, "action": output["actions"]}
-
     def estimate_request_cost(self, batch) -> float:
         options = batch.extra.get("vla", {}).get("options", {})
         guidance = self.resolve_guidance(

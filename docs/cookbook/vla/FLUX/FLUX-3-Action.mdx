@@ -116,15 +116,14 @@ print(action["shape"])  # [32, 8]
 
 `GET /v1/actions/metadata` reports the camera keys, action shape and sampler defaults of the served policy.
 
-### 4.2 OpenPI / RoboLab WebSocket
+### 4.2 OpenPI-Compatible WebSocket
 
-`/openpi/policy` accepts the RoboLab observation keys of the FLUX Action reference server:
-
-- `observation/image`: the 540x640 composite, or the three views `observation/wrist_image_left`, `observation/exterior_image_1_left` and `observation/exterior_image_2_left`.
-- `observation/joint_position` and `observation/gripper_position`.
-- `prompt`.
-
-Responses carry the chunk both as `actions` (OpenPI) and as `action` (RoboLab). Use the msgpack helpers from the [Pi0.5 page](/cookbook/vla/OpenPI/Pi0.5) to pack numpy arrays.
+`/openpi/policy` takes one observation per message, with camera images as
+`observation.images.<camera>` (`wrist`, `left`, `right`, or the LeRobot names
+`wrist_image_left`, `exterior_image_1_left`, `exterior_image_2_left`), the state
+as `observation.state` and the instruction as `task` or `prompt`. The response
+carries the `[32, 8]` chunk as `actions`. Use the msgpack helpers from the
+[Pi0.5 page](/cookbook/vla/OpenPI/Pi0.5) to pack numpy arrays.
 
 ## 5. Accuracy
 
