@@ -3,11 +3,11 @@
 This page covers principles and essentials: folder layout, how to run tests, registration, and suite selection. For complete references, see the skill guides:
 
 - **Writing tests** — templates, fixtures, model selection, complete suite tables, checklist: [`.claude/skills/write-sglang-test/SKILL.md`](../.claude/skills/write-sglang-test/SKILL.md)
-- **CI pipeline internals** — stage flow diagrams, fast-fail layers, gating, partitioning, execution modes, debugging failures: [`.claude/skills/ci-workflow-guide/SKILL.md`](../.claude/skills/ci-workflow-guide/SKILL.md)
+- **CI pipeline internals** — stage flow diagrams, fail-fast layers, gating, partitioning, execution modes, debugging failures: [`.claude/skills/ci-workflow-guide/SKILL.md`](../.claude/skills/ci-workflow-guide/SKILL.md)
 
 ## CI Pipeline Overview
 
-The CI pipeline runs in three sequential stages: **A** (pre-flight, ~3 min) → **B** (basic, ~30 min) → **C** (advanced, ~30 min). Kernel and multimodal-gen tests run in parallel with stage B. For details on stage gating, fast-fail mechanisms, execution modes (PR vs scheduled vs manual dispatch), and debugging CI failures, see the [CI workflow guide](../.claude/skills/ci-workflow-guide/SKILL.md).
+The CI pipeline runs in three sequential stages: **A** (pre-flight, ~3 min) → **B** (basic, ~30 min) → **C** (advanced, ~30 min). Kernel and multimodal-gen tests run in parallel with stage B. For details on stage gating, fail-fast mechanisms, execution modes (PR vs scheduled vs manual dispatch), and debugging CI failures, see the [CI workflow guide](../.claude/skills/ci-workflow-guide/SKILL.md).
 
 ## Folder Organization
 

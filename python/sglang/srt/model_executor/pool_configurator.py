@@ -20,6 +20,7 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
+from sglang.srt.arg_groups.overrides import resolving_view
 from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.configs.model_config import (
     AttentionArch,
@@ -40,7 +41,10 @@ from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
     get_dsv4_indexer_bytes_per_token,
     get_swa_ring_size,
 )
-from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
+from sglang.srt.mem_cache.memory_pool import (
+    DSATokenToKVPool,
+    get_minimax_sparse_index_dtype,
+)
 from sglang.srt.runtime_context import (
     get_disagg,
     get_exec,
@@ -220,7 +224,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             self._cell_size == 0
             and mambaish is not None
             and bool(mambaish.full_attention_layer_ids)
-            and kvc.ps.pp_size > 1
+            and kvc.pp_size > 1
         )
         self._zero_kv_max_tokens = (
             torch.iinfo(torch.int64).max
@@ -359,6 +363,8 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                     num_layers=num_layers,
                 )
         elif is_minimax_sparse(model_config.hf_config):
+            from sglang.srt.server_args import m3_fp8_attn_gemm_enabled
+
             # Mirrors MiniMaxSparseKVPool: main pool (K+V all layers) + indexer pool
             # (sparse-only, single-head; kv layers store K+V, k-only layers store K).
             sparse_cfg = get_minimax_sparse_attention_config(model_config.hf_config)
@@ -387,10 +393,28 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             kv_heads = model_config.get_num_kv_heads(get_parallel().attn_tp_size)
             head_dim = model_config.head_dim
             indexer_head_dim = sparse_cfg["sparse_index_dim"]
-            indexer_dtype_size = torch._utils._element_size(kvc.model_dtype)
+            indexer_dtype_size = torch._utils._element_size(
+                get_minimax_sparse_index_dtype(
+                    fp8_attn_gemm=m3_fp8_attn_gemm_enabled(
+                        resolving_view(kvc.server_args)
+                    ),
+                    kv_cache_dtype=kvc.kv_cache_dtype,
+                    model_dtype=kvc.model_dtype,
+                )
+            )
+
+            full_pool_ratio = 1
+            if get_memory().enable_hisparse:
+                from sglang.srt.mem_cache.sparsity import parse_hisparse_config
+
+                full_pool_ratio = parse_hisparse_config().host_to_device_ratio
 
             main_pool_bytes = (
-                (num_dense + num_sparse) * 2 * kv_heads * head_dim * kv_size
+                (num_dense * full_pool_ratio + num_sparse)
+                * 2
+                * kv_heads
+                * head_dim
+                * kv_size
             )
             indexer_bytes = (
                 (num_indexer_kv * 2 + num_indexer_k_only)
@@ -399,7 +423,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             )
             # FP4 scale buffer adjustment doesn't apply to MiniMax sparse:
             # cell_size is already a sum over heterogeneous sub-pools.
-            return main_pool_bytes + indexer_bytes
+            return main_pool_bytes + indexer_bytes * full_pool_ratio
         else:
             n = model_config.get_num_kv_heads(tp_size, dcp_size)
             cell_size = (
@@ -581,8 +605,8 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
         kv_size = torch._utils._element_size(kv_cache_dtype)
         tp_size = get_parallel().attn_tp_size
 
-        self._full_layers_num = len(model_config.full_attention_layer_ids)
-        self._swa_layers_num = len(model_config.swa_attention_layer_ids)
+        self._full_layers_num = len(kvc.layer_info.full_attention_layer_ids)
+        self._swa_layers_num = len(kvc.layer_info.swa_attention_layer_ids)
         assert self._swa_layers_num > 0, (
             "Hybrid SWA model must have at least one SWA layer"
         )
@@ -877,7 +901,7 @@ class SWAChunkCapPoolConfigurator(HybridSWAPoolConfigurator):
         self._swa_cap = compute_swa_request_cap(
             page_size=kvc.page_size,
             window=kvc.sliding_window_size,
-            attn_dp_size=kvc.ps.attn_dp_size,
+            attn_dp_size=kvc.attn_dp_size,
         )
 
     @staticmethod
@@ -891,7 +915,7 @@ class SWAChunkCapPoolConfigurator(HybridSWAPoolConfigurator):
             return False
         if kvc.sliding_window_size is None:
             return False
-        return len(kvc.model_config.full_attention_layer_ids) > 0
+        return len(kvc.layer_info.full_attention_layer_ids) > 0
 
     def calculate_pool_sizes(
         self, available_bytes: int, page_size: int
@@ -1015,7 +1039,7 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         self.compression_ratios = cfg.compress_ratios[
             kvc.layer_info.start_layer : kvc.layer_info.end_layer
         ]
-        if kvc.ps.pp_size > 1:
+        if kvc.pp_size > 1:
             logger.info(
                 f"DSV4 pool PP slice: rank={kvc.pp_group.rank_in_group} "
                 f"layers=[{kvc.layer_info.start_layer},{kvc.layer_info.end_layer}) "
@@ -1032,9 +1056,9 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         self.page_size = kvc.page_size
         self.is_speculative = get_spec().speculative_algorithm is not None
         self.online_c128_mtp_max_draft_tokens = max_speculative_num_draft_tokens() or 0
-        self.attn_dp_size = kvc.ps.attn_dp_size
+        self.attn_dp_size = kvc.attn_dp_size
         self.requested_max_running_requests_per_worker = (
-            get_schedule().max_running_requests // kvc.ps.attn_dp_size
+            get_schedule().max_running_requests // kvc.attn_dp_size
             if get_schedule().max_running_requests is not None
             else None
         )

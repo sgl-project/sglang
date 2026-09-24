@@ -14,6 +14,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from sglang.kernels.ops.activation.activation import relu2
 from sglang.kernels.ops.diffusion import (
     can_use_fused_inplace_qknorm_rope,
     fused_qknorm_rope_pack_kv,
@@ -78,20 +79,20 @@ def _can_enable_t1_fused_qk_norm_rope(
     is_blackwell: bool,
     is_hopper: bool,
     hidden_act: str,
-    hidden_size: int,
     tp_size: int,
     sp_size: int,
     is_compiled: bool,
+    hidden_size: int = 0,
 ) -> bool:
     if is_compiled:
         return False
     if is_blackwell:
         return True
-    if not is_hopper or sp_size != 1 or hidden_act == "relu2":
+    if not is_hopper or sp_size != 1:
         return False
-    return tp_size == 1 or (
-        tp_size == 2 and hidden_act == "silu" and hidden_size == 5120
-    )
+    if tp_size == 1:
+        return hidden_act != "relu2" or hidden_size == 2048
+    return tp_size == 2 and hidden_act == "silu" and hidden_size == 5120
 
 
 # -----------------------------------------------------------------------------
@@ -545,8 +546,18 @@ class Cosmos3DenseMLP(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         up, _ = self.up_proj(x)
-        up = F.relu(up)
-        out, _ = self.down_proj(up * up)
+        if (
+            up.is_cuda
+            and up.dtype == torch.bfloat16
+            and up.is_contiguous()
+            and not torch.is_grad_enabled()
+            and not torch.compiler.is_compiling()
+        ):
+            up = relu2(up, fast_math=False)
+        else:
+            up = F.relu(up)
+            up = up * up
+        out, _ = self.down_proj(up)
         return out
 
 
@@ -1715,9 +1726,9 @@ class Cosmos3OmniTransformer(CachableDiT, LayerwiseOffloadableModuleMixin):
         self._ensure_cache_dicts()
 
         # The T=1 fused path is faster on Blackwell. It also benefits the
-        # single-GPU Hopper Nano and TP2 Super-Text2Image (SwiGLU) workloads.
-        # The older dense-MLP Super workload remains on the split path because
-        # that shape regresses with the fusion.
+        # single-GPU Hopper Nano (SwiGLU) and Edge (2048-wide dense) workloads,
+        # as well as TP2 Super-Text2Image (SwiGLU). The older dense-MLP Super
+        # workload remains on the split path because that shape regresses.
         enable_t1_fused_qk_norm_rope = T == 1 and _can_enable_t1_fused_qk_norm_rope(
             is_blackwell=current_platform.is_blackwell(),
             is_hopper=current_platform.is_hopper(),
