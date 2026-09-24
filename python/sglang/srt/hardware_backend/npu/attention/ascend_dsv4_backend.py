@@ -508,7 +508,8 @@ class CompressorAscendBackendMixin:
                         _rows = _flat.index_select(0, _locs)
                         _a = _rows.detach().to(torch.float32).cpu().numpy()
                         print(
-                            f"[CIN] {_tag} state_rows n={_rows.shape[0]} "
+                            f"[CIN] pid={os.getpid()} start_pos={_l(getattr(fm, 'start_pos', None))} "
+                            f"{_tag} state_rows n={_rows.shape[0]} "
                             f"sum={_a.sum():.4f} absmax={abs(_a).max():.4f} "
                             f"md5={hashlib.md5(_a.tobytes()).hexdigest()[:16]}",
                             flush=True,
@@ -572,7 +573,8 @@ class CompressorAscendBackendMixin:
                 f"md5={hashlib.md5(_a.tobytes()).hexdigest()[:16]}"
             )
             print(
-                f"[COUT] L{compressor.layer_id} r{ratio} idx={int(compressor.is_in_indexer)} "
+                f"[COUT] pid={os.getpid()} start_pos={_l(getattr(fm, 'start_pos', None))} "
+                f"L{compressor.layer_id} r{ratio} idx={int(compressor.is_in_indexer)} "
                 f"n={cmp_kv.shape[0]} {_s}",
                 flush=True,
             )
