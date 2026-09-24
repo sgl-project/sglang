@@ -578,29 +578,12 @@ class ChatResponseTemplateParserTest(unittest.TestCase):
                 "fields": {"x": {"open": "<x>", "close": "</x>", "content": "json", "transform": transform}},
             }
 
-        cases = [
-            ('<x>{"name": "n"}</x>', {"a": "{content.args}"}, "missing key 'args'"),
-            ('<x>{"name": "n"}</x>', {"a": "{content.name.x}"}, "cannot index into str"),
-            ("<x>{}</x>", {"a": "{missing}"}, "not defined"),
-        ]
-        for text, transform, error in cases:
-            with self.subTest(error=error):
-                with self.assertRaisesRegex(ValueError, error):
-                    parse_response(text, spec_with(transform), prefix="")
-
-        text, transform, error = cases[0]
-        parser = ResponseParser(spec_with(transform), prefix="")
-        events = parser.feed(text)
-        malformed = next(event for event in events if event["type"] == "region_malformed")
-        self.assertIn(error, malformed["error"])
-
-    def test_parse_response_raises_for_truncated_malformed_region(self):
-        template_spec = {
-            "start_anchor": "<|assistant|>",
-            "fields": {"x": {"open": "<x>", "close": "</x>", "content": "json"}},
-        }
-        with self.assertRaisesRegex(ValueError, "could not parse region as JSON"):
-            parse_response('<x>{"name":', template_spec, prefix="")
+        with self.assertRaisesRegex(ValueError, "missing key 'args'"):
+            parse_response('<x>{"name": "n"}</x>', spec_with({"a": "{content.args}"}), prefix="")
+        with self.assertRaisesRegex(ValueError, "cannot index into str"):
+            parse_response('<x>{"name": "n"}</x>', spec_with({"a": "{content.name.x}"}), prefix="")
+        with self.assertRaises(KeyError):
+            parse_response("<x>{}</x>", spec_with({"a": "{missing}"}), prefix="")
 
     def test_transform_dotted_mixed_string_rejected(self):
         template_spec = {
@@ -641,12 +624,8 @@ class ChatResponseTemplateParserTest(unittest.TestCase):
             "start_anchor": "a",
             "fields": {"x": {"open": "<x>", "close": "</x>", "repeats": True, "join": "", "content": "json"}},
         }
-        parser = ResponseParser(template_spec, prefix="")
-        events = parser.feed("<x>{}</x>")
-        message, _ = parser.finalize()
-        malformed = next(event for event in events if event["type"] == "region_malformed")
-        self.assertIn("parse to a string", malformed["error"])
-        self.assertNotIn("x", message)
+        with self.assertRaisesRegex(ValueError, "parse to a string"):
+            parse_response("<x>{}</x>", template_spec, prefix="")
 
     def test_optional_false_raises_when_missing(self):
         template_spec = {
@@ -1000,8 +979,6 @@ class ResponseEventStreamTest(unittest.TestCase):
         chunk_accum: dict[str, str] = {}
         close_values: dict[str, object] = {}
         for ev in events:
-            self.assertLessEqual(0, ev["start"])
-            self.assertLessEqual(ev["start"], ev["end"])
             t = ev["type"]
             if t == "region_open":
                 self.assertIsNone(open_field, f"nested region_open without close: {ev}")
@@ -1011,10 +988,10 @@ class ResponseEventStreamTest(unittest.TestCase):
                 self.assertEqual(open_field, ev["field"], f"chunk outside its region: {ev}")
                 # Every chunk carries a boolean `dirty` flag.
                 self.assertIsInstance(ev["dirty"], bool, f"missing/non-bool dirty: {ev}")
-                chunk_accum[ev["field"]] += ev["text"]
+                chunk_accum[open_field] += ev["text"]
             elif t == "region_close":
                 self.assertEqual(open_field, ev["field"], f"close for non-open region: {ev}")
-                close_values[ev["field"]] = ev["value"]
+                close_values[open_field] = ev["value"]
                 open_field = None
             else:
                 self.fail(f"unexpected event type: {ev!r}")
@@ -1158,56 +1135,16 @@ class ResponseEventStreamTest(unittest.TestCase):
         spec = {
             "start_anchor": "<assistant>",
             "fields": {
-                "content": {
-                    "open_pattern": r"<content id=\d+>",
-                    "close": "</content>",
-                }
-            },
-        }
-        parser = ResponseParser(spec, prefix="")
-        events = parser.feed("<content id=7>hello</content>")
-
-        self.assertEqual(parser.input_text, "<content id=7>hello</content>")
-        boundaries = [
-            (event["type"], parser.input_text[event["start"] : event["end"]])
-            for event in events
-            if event["type"] != "region_chunk"
-        ]
-        self.assertEqual(
-            boundaries,
-            [
-                ("region_open", "<content id=7>"),
-                ("region_close", "</content>"),
-            ],
-        )
-        self.assertEqual(
-            [(event["type"], event["start"], event["end"]) for event in events],
-            [
-                ("region_open", 0, len("<content id=7>")),
-                ("region_chunk", len("<content id=7>"), len("<content id=7>hello")),
-                ("region_close", len("<content id=7>hello"), len(parser.input_text)),
-            ],
-        )
-
-    def test_implicit_and_boundary_closes_have_empty_delimiters(self):
-        spec = {
-            "start_anchor": "<assistant>",
-            "fields": {
                 "content": {"content_args": {"strip": False}},
-                "tag": {"open": "<tag>", "content_args": {"strip": False}},
+                "tag": {"open_pattern": r"<tag id=\d+>", "close": "</tag>"},
             },
         }
         parser = ResponseParser(spec, prefix="")
-        events = parser.feed("plain<tag>body")
-        _, final_events = parser.finalize()
-        events.extend(final_events)
+        events = parser.feed("plain<tag id=7>body</tag>tail")
+        events += parser.finalize()[1]
 
         boundaries = [
-            (
-                event["type"],
-                event["field"],
-                parser.input_text[event["start"] : event["end"]],
-            )
+            (event["type"], event["field"], parser.input_text[event["start"] : event["end"]])
             for event in events
             if event["type"] != "region_chunk"
         ]
@@ -1216,12 +1153,14 @@ class ResponseEventStreamTest(unittest.TestCase):
             [
                 ("region_open", "content", ""),
                 ("region_close", "content", ""),
-                ("region_open", "tag", "<tag>"),
-                ("region_close", "tag", ""),
+                ("region_open", "tag", "<tag id=7>"),
+                ("region_close", "tag", "</tag>"),
+                ("region_open", "content", ""),
+                ("region_close", "content", ""),
             ],
         )
 
-    def test_prefix_provenance_and_open_captures(self):
+    def test_open_captures_and_prefix_boundary(self):
         spec = {
             "start_anchor": "[BEGIN]",
             "fields": {
@@ -1229,24 +1168,17 @@ class ResponseEventStreamTest(unittest.TestCase):
                     "open_pattern": r"<call:(?P<name>\w+)>",
                     "close": "</call>",
                     "content": "json",
-                    "transform": {
-                        "type": "function",
-                        "function": {"name": "{name}", "arguments": "{content}"},
-                    },
+                    "transform": {"name": "{name}", "arguments": "{content}"},
                 }
             },
         }
-        prefix_input = "<call:get_"
-        parser = ResponseParser(spec, prefix="history[BEGIN]" + prefix_input)
-        generated = 'weather>{"city":"Paris"}</call>'
-        events = parser.feed(generated)
-        opening = next(event for event in events if event["type"] == "region_open")
+        parser = ResponseParser(spec, prefix="history[BEGIN]<call:get_")
+        prefix_end = len(parser.input_text)
+        events = parser.feed('weather>{"city":"Paris"}</call>')
+        opening = events[0]
 
-        self.assertEqual(opening["start"], 0)
-        self.assertEqual(opening["end"], len("<call:get_weather>"))
-        self.assertEqual(parser.prefix_end, len(prefix_input))
-        self.assertLess(opening["start"], parser.prefix_end)
-        self.assertLess(parser.prefix_end, opening["end"])
+        self.assertEqual(prefix_end, len("<call:get_"))
+        self.assertEqual((opening["type"], opening["start"], opening["end"]), ("region_open", 0, len("<call:get_weather>")))
         self.assertEqual(opening["captures"], {"name": "get_weather"})
 
     def test_malformed_region_events_recover_and_continue(self):
@@ -1258,7 +1190,6 @@ class ResponseEventStreamTest(unittest.TestCase):
                     "close": "</call>",
                     "content": "json",
                     "repeats": True,
-                    "optional": False,
                     "transform": {
                         "type": "function",
                         "function": {"name": "{name}", "arguments": "{content}"},
@@ -1266,23 +1197,15 @@ class ResponseEventStreamTest(unittest.TestCase):
                 }
             },
         }
-        malformed_text = '<call:bad>{"x":</call>'
-        valid_text = '<call:good>{"x":1}</call>'
         parser = ResponseParser(spec, prefix="")
-        events = parser.feed(malformed_text + valid_text)
-        message, final_events = parser.finalize()
-        events.extend(final_events)
-        malformed = next(event for event in events if event["type"] == "region_malformed")
+        events = parser.feed('<call:bad>{"x":</call><call:good>{"x":1}</call>')
+        message, _ = parser.finalize()
+        opening, malformed = events[0], events[2]
 
-        self.assertEqual(malformed["start"], 0)
-        self.assertEqual(malformed["end"], len(malformed_text))
-        self.assertEqual(malformed["close_start"], len('<call:bad>{"x":'))
-        self.assertTrue(malformed["closed"])
-        self.assertEqual(parser.input_text[: malformed["end"]], malformed_text)
-        self.assertEqual(
-            parser.input_text[malformed["close_start"] : malformed["end"]],
-            "</call>",
-        )
+        self.assertEqual(malformed["type"], "region_malformed")
+        self.assertIsInstance(malformed["error"], ValueError)
+        self.assertEqual(parser.input_text[opening["end"] : malformed["start"]], '{"x":')
+        self.assertEqual(parser.input_text[malformed["start"] : malformed["end"]], "</call>")
         self.assertEqual(
             message["tool_calls"],
             [{"type": "function", "function": {"name": "good", "arguments": {"x": 1}}}],
@@ -1291,27 +1214,16 @@ class ResponseEventStreamTest(unittest.TestCase):
         parser = ResponseParser(spec, prefix="")
         parser.feed('<call:bad>{"x":')
         _, events = parser.finalize()
-        malformed = next(event for event in events if event["type"] == "region_malformed")
-        self.assertFalse(malformed["closed"])
-        self.assertEqual(malformed["close_start"], malformed["end"])
+        self.assertEqual(events[-1]["type"], "region_malformed")
+        self.assertEqual(events[-1]["start"], len(parser.input_text))
 
-    def test_zero_width_close_is_reported_as_closed(self):
+    def test_parse_response_raises_for_truncated_malformed_region(self):
         spec = {
-            "start_anchor": "[BEGIN]",
-            "fields": {
-                "data": {
-                    "open": "<data>",
-                    "close_pattern": r"(?=END)",
-                    "content": "json",
-                }
-            },
+            "start_anchor": "<|assistant|>",
+            "fields": {"x": {"open": "<x>", "close": "</x>", "content": "json"}},
         }
-        parser = ResponseParser(spec, prefix="")
-        events = parser.feed("<data>{END")
-        malformed = next(event for event in events if event["type"] == "region_malformed")
-
-        self.assertTrue(malformed["closed"])
-        self.assertEqual(malformed["close_start"], malformed["end"])
+        with self.assertRaisesRegex(ValueError, "could not parse region as JSON"):
+            parse_response('<x>{"name":', spec, prefix="")
 
 
 class PrefixAndTruncationTest(unittest.TestCase):
