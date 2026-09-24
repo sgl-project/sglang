@@ -28,6 +28,7 @@ from sglang.multimodal_gen.runtime.models.dits.ming_image import (
 from sglang.multimodal_gen.runtime.models.encoders.ming_image import ming_position_ids
 from sglang.multimodal_gen.runtime.pipelines.ming_image_pipeline import prepare_mu
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.ming_image import (
+    MingImageReferenceStage,
     ming_reference_size,
 )
 from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
@@ -134,6 +135,18 @@ def test_centered_video_rope_with_reference_and_query_tokens():
 )
 def test_official_reference_buckets(height, width, resolution, expected):
     assert ming_reference_size(height, width, resolution) == expected
+
+
+@pytest.mark.parametrize(
+    "override,expected", [({}, torch.bfloat16), ({"vae": "fp32"}, torch.float32)]
+)
+def test_reference_vae_declares_precision_before_first_encode(override, expected):
+    args = SimpleNamespace(
+        component_precisions=override, pipeline_config=MingImagePipelineConfig()
+    )
+    (use,) = MingImageReferenceStage(torch.nn.Identity()).component_uses(args)
+    assert use.component_name == "vae"
+    assert use.target_dtype == expected
 
 
 def test_ming_norm_and_swiglu_preserve_reference_rounding():

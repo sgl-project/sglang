@@ -26,6 +26,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.decoding import Decodin
 from sglang.multimodal_gen.runtime.pipelines_core.stages.text_encoding import (
     TextEncodingStage,
 )
+from sglang.multimodal_gen.runtime.utils.precision import resolve_precision
 from sglang.multimodal_gen.runtime.utils.vision import load_image
 
 
@@ -150,7 +151,11 @@ class MingImageReferenceStage(PipelineStage):
     def component_uses(self, server_args, stage_name=None):
         return [
             ComponentUse(
-                stage_name=self._component_stage_name(stage_name), component_name="vae"
+                stage_name=self._component_stage_name(stage_name),
+                component_name="vae",
+                target_dtype=resolve_precision(
+                    server_args, "vae", precision_attr="vae_precision"
+                ),
             )
         ]
 
