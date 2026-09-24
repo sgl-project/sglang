@@ -3,6 +3,7 @@
 import math
 
 import torch
+from torch import nn
 from torch.nn import functional as F
 
 from sglang.multimodal_gen.runtime.distributed import (
@@ -20,10 +21,17 @@ class MingRMSNorm(RMSNorm):
         super().__init__(dim, eps=eps, cast_x_before_out_mul=True, force_native=True)
 
 
-class DiffusionTransformer(ZImageTransformer2DModel):
+class MingSiluAndMul(nn.Module):
+    def forward(self, x):
+        gate, up = x.chunk(2, dim=-1)
+        return F.silu(gate) * up
+
+
+class MingImageTransformer2DModel(ZImageTransformer2DModel):
     """Ming-Image's joint DiT, sharing Z-Image blocks and TP/SP attention."""
 
     norm_cls = MingRMSNorm
+    _aliases = ["DiffusionTransformer"]
 
     def __init__(self, config, hf_config, quant_config=None):
         super().__init__(config, hf_config, quant_config)
@@ -31,12 +39,16 @@ class DiffusionTransformer(ZImageTransformer2DModel):
         if not self.learned_padding:
             del self.x_pad_token, self.cap_pad_token
             self.register_buffer(
-                "x_pad_token", torch.zeros(1, self.dim), persistent=False
+                "x_pad_token", torch.zeros(1, self.dim, device="cpu"), persistent=False
             )
             self.register_buffer(
-                "cap_pad_token", torch.zeros(1, self.dim), persistent=False
+                "cap_pad_token",
+                torch.zeros(1, self.dim, device="cpu"),
+                persistent=False,
             )
         self.layer_names = ["noise_refiner", "context_refiner", "layers"]
+        for layer in (*self.noise_refiner, *self.context_refiner, *self.layers):
+            layer.feed_forward.act = MingSiluAndMul()
 
     def forward(
         self,
@@ -60,16 +72,20 @@ class DiffusionTransformer(ZImageTransformer2DModel):
         x_target = math.ceil(x_aligned / sp_size) * sp_size
         x = F.pad(x, (0, 0, 0, x_target - x_length))
         x, _ = self.all_x_embedder["2-1"](x)
-        x = self._replace_padding_with_token(
-            x, [x_length] * batch_size, self.x_pad_token
+        x = self._replace_padding_with_token_mask(
+            x,
+            (torch.arange(x_target, device=x.device) < x_length).unsqueeze(0),
+            self.x_pad_token,
         )
         cap, _ = self.cap_embedder(encoder_hidden_states)
         cap = torch.cat((cap, direct_embeddings), 1)
         cap_length = cap.shape[1]
         cap_target = math.ceil(cap_length / 32) * 32
         cap = F.pad(cap, (0, 0, 0, cap_target - cap_length))
-        cap = self._replace_padding_with_token(
-            cap, [cap_length] * batch_size, self.cap_pad_token
+        cap = self._replace_padding_with_token_mask(
+            cap,
+            (torch.arange(cap_target, device=x.device) < cap_length).unsqueeze(0),
+            self.cap_pad_token,
         )
 
         cap_ids = self.create_coordinate_grid(
@@ -95,7 +111,9 @@ class DiffusionTransformer(ZImageTransformer2DModel):
         cap_mask, cap_meta = self._get_attn_mask_and_meta(
             "_ming_cap_mask", [cap_valid] * batch_size, cap_target, x.device
         )
-        adaln = self.t_embedder(1000.0 - timestep).to(x.dtype)
+        adaln = self.t_embedder(((1000.0 - timestep) / 1000.0) * self.t_scale).to(
+            x.dtype
+        )
         for layer in self.noise_refiner:
             x = layer(x, x_freqs, adaln, attn_mask=x_mask, attn_mask_meta=x_meta)
         for layer in self.context_refiner:
@@ -133,4 +151,4 @@ class DiffusionTransformer(ZImageTransformer2DModel):
         return -output[:, :, :output_frames]
 
 
-EntryClass = DiffusionTransformer
+EntryClass = MingImageTransformer2DModel

@@ -29,7 +29,7 @@ class MingImageLayerSamplingParams(MingImageSamplingParams):
 
     def build_request_extra(self):
         extra = super().build_request_extra()
-        if isinstance(self.num_layers, bool) or self.num_layers < 1:
+        if type(self.num_layers) is not int or self.num_layers < 1:
             raise ValueError("num_layers must be a positive integer")
         match = re.search(
             r"(?:into\s+(\d+)\s+layers|number of layers:\s*(\d+))",

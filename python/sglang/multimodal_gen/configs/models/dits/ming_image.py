@@ -23,7 +23,7 @@ class MingImageDitConfig(ZImageDitConfig):
         config = dict(config)
         config["num_layers"] = config.pop("n_layers", self.num_layers)
         config["num_attention_heads"] = config.pop("n_heads", self.num_attention_heads)
-        if (
+        if type(config.get("multi_frame_output")) is not bool or (
             config.get("alignment_padding_mode"),
             config.get("multi_frame_output"),
         ) not in (

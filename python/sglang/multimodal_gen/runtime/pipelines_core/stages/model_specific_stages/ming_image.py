@@ -14,7 +14,7 @@ from sglang.multimodal_gen.configs.pipeline_configs.ming_image import (
 )
 from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
-from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency import (
+from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
     ComponentUse,
 )
 from sglang.multimodal_gen.runtime.models.encoders.ming_image import ming_position_ids
@@ -139,7 +139,9 @@ class MingImageEncodingStage(TextEncodingStage):
             position_ids=ming_position_ids(ids, grids, encoder.image_token).to(device),
         )
         self._begin_text_encoder_use(0)
-        encoded = self._forward_text_encoder(encoder, inputs)
+        # the official MoE router runs under BF16 autocast, including its logits
+        with torch.autocast(device.type, dtype=encoder.dtype):
+            encoded = self._forward_text_encoder(encoder, inputs)
         batch.prompt_embeds = [encoded.last_hidden_state]
         batch.negative_prompt_embeds = [torch.zeros_like(encoded.last_hidden_state)]
         batch.extra["ming_direct"] = encoded.hidden_states[0]
@@ -170,17 +172,20 @@ class MingImageReferenceStage(PipelineStage):
         )
         pixels = ((pixels - 0.5) * 2).unsqueeze(0).unsqueeze(2)
         with self.use_declared_component(component_name="vae", module=self.vae) as vae:
-            pixels = pixels.to(device=get_local_torch_device(), dtype=vae.dtype)
+            pixels = pixels.to(
+                device=get_local_torch_device(), dtype=next(vae.parameters()).dtype
+            )
             batch.extra["ming_reference_latents"] = vae.encode(pixels).mode() * 8.0064
         return batch
 
 
 class MingImageDecodingStage(DecodingStage):
     def scale_and_shift(self, latents, server_args):
-        # Rounding before scaling is part of the official BF16 decode contract.
-        return latents.to(self.vae.dtype) / 8.0064
+        return latents / 8.0064
 
     def decode(self, latents, server_args, *, vae_dtype):
+        # Rounding before scaling is part of the official BF16 decode contract.
+        latents = latents.to(vae_dtype)
         batch, channels, frames, height, width = latents.shape
         flat = latents.transpose(1, 2).reshape(
             batch * frames, channels, 1, height, width

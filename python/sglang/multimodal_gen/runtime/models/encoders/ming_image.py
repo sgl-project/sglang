@@ -2,6 +2,7 @@
 # Adapted from inclusionAI/Ming-Image (Apache-2.0 modeling code).
 """Ming's Bailing multimodal encoder and non-causal query connector."""
 
+from collections import defaultdict
 from types import SimpleNamespace
 
 import torch
@@ -160,8 +161,14 @@ class MingRouter(nn.Module):
         )
 
     def forward(self, x):
-        with torch.autocast(x.device.type, enabled=False):
-            return F.linear(x.float(), self.weight.float()).sigmoid()
+        return F.linear(x.float(), self.weight.float()).sigmoid()
+
+
+class MingMLP(Qwen3MLP):
+    def forward(self, x):
+        gate, up = self.gate_up_proj(x)[0].chunk(2, dim=-1)
+        # preserve the checkpoint's BF16 rounding between SiLU and multiplication
+        return self.down_proj(F.silu(gate) * up)[0]
 
 
 class MingExperts(nn.Module):
@@ -174,7 +181,7 @@ class MingExperts(nn.Module):
         self.experts = LingBotVideoGroupedExperts(
             config.num_experts, config.hidden_size, self.intermediate_size
         )
-        self.shared_experts = Qwen3MLP(
+        self.shared_experts = MingMLP(
             config.hidden_size,
             config.moe_intermediate_size * config.num_shared_experts,
             "silu",
@@ -188,6 +195,7 @@ class MingExperts(nn.Module):
             activation="silu",
             is_gated=True,
             inplace=False,
+            no_combine=True,
             apply_router_weight_on_input=False,
             routed_scaling_factor=None,
             gate_up_interleaved=False,
@@ -232,6 +240,7 @@ class MingExperts(nn.Module):
         )
         if get_tp_world_size() > 1:
             out = get_tp_group().all_reduce(out)
+        out = (out.float() * weights.unsqueeze(-1)).sum(1).to(x.dtype)
         return out.view_as(x) + self.shared_experts(x)
 
 
@@ -243,7 +252,7 @@ class MingEncoderBlock(nn.Module):
         self.mlp = (
             MingExperts(config)
             if self.is_moe
-            else Qwen3MLP(config.hidden_size, config.intermediate_size, "silu")
+            else MingMLP(config.hidden_size, config.intermediate_size, "silu")
         )
         self.input_layernorm = RMSNorm(
             config.hidden_size,
@@ -372,10 +381,12 @@ class MingImageEncoder(TextEncoder):
     def load_weights(self, weights):
         params = dict(self.named_parameters())
         loaded = set()
+        pieces = defaultdict(set)
         for name, weight in weights:
             if not self.should_materialize_checkpoint_weight(name):
                 continue
             name = name.removeprefix("model.model.")
+            name = name.replace(".attn.qkv.", ".attn.qkv_proj.")
             name = name.replace("connector.model.layers.", "connector.").replace(
                 "connector.model.norm.", "connector_norm."
             )
@@ -404,7 +415,12 @@ class MingImageEncoder(TextEncoder):
                     params[target].data[int(expert), offset : offset + width].copy_(
                         weight[rank * width : (rank + 1) * width]
                     )
-                loaded.add(target)
+                pieces[target].add((int(expert), projection))
+                expected = module.config.num_experts * (
+                    1 if projection == "down_proj" else 2
+                )
+                if len(pieces[target]) == expected:
+                    loaded.add(target)
                 continue
             for source, target, shard_id in (
                 (".gate_proj.", ".gate_up_proj.", 0),
@@ -431,7 +447,13 @@ class MingImageEncoder(TextEncoder):
                     param.weight_loader(param, weight, shard)
             else:
                 default_weight_loader(param, weight)
-            loaded.add(name)
+            if shard is None:
+                loaded.add(name)
+            else:
+                pieces[name].add(shard)
+                expected = {"q", "k", "v"} if isinstance(shard, str) else {0, 1}
+                if pieces[name] == expected:
+                    loaded.add(name)
         return loaded
 
 
