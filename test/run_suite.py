@@ -126,7 +126,8 @@ PER_COMMIT_SUITES = {
         "stage-b-e2e-mlx",
     ],
     HWBackend.MLU: [
-        "pr-test-mlu",
+        "pr-test-1-mlu",
+        "pr-test-2-mlu",
     ],
 }
 
@@ -203,7 +204,7 @@ NIGHTLY_SUITES = {
         "nightly-xpu-8-gpu",
     ],
     HWBackend.MLU: [
-        "nightly-test-mlu",
+        "nightly-test-2-mlu",
     ],
 }
 
