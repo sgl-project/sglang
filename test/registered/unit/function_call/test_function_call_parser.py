@@ -37,6 +37,7 @@ from sglang.srt.function_call.mistral_detector import MistralDetector
 from sglang.srt.function_call.parser_names import TOOL_CALL_PARSER_NAMES
 from sglang.srt.function_call.pythonic_detector import PythonicDetector
 from sglang.srt.function_call.qwen3_coder_detector import Qwen3CoderDetector
+from sglang.srt.function_call.qwen25_detector import Qwen25Detector
 from sglang.srt.function_call.utils import get_schema_properties
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -5507,6 +5508,120 @@ class TestQwen25Detector(unittest.TestCase):
         cities = [json.loads(result[i]["parameters"])["city"] for i in sorted(result)]
         self.assertEqual(cities, ["NYC", "LA"])
 
+    @staticmethod
+    def _collect_qwen25(chunks, tools):
+        """Feed deltas and merge streamed calls the way a client would."""
+        detector = Qwen25Detector()
+        calls: list = []
+        text = ""
+        for chunk in chunks:
+            result = detector.parse_streaming_increment(chunk, tools)
+            text += result.normal_text or ""
+            calls.extend(result.calls)
+        end = detector.finish(tools)
+        text += end.normal_text or ""
+        calls.extend(end.calls)
+        # merge argument deltas per tool index, then drop the index: the
+        # non-streaming path numbers every call 0, which is not the contract here
+        merged: dict = {}
+        order = []
+        for call in calls:
+            if call.tool_index not in merged:
+                merged[call.tool_index] = [call.name, ""]
+                order.append(call.tool_index)
+            if call.name:
+                merged[call.tool_index][0] = call.name
+            merged[call.tool_index][1] += call.parameters or ""
+        return text, [(merged[i][0], merged[i][1]) for i in order]
+
+    @staticmethod
+    def _non_stream_calls(text, tools):
+        result = Qwen25Detector().detect_and_parse(text, tools)
+        return [(c.name, c.parameters) for c in result.calls]
+
+    PARALLEL_OUTPUT = (
+        '<tool_call>\n{"name": "get_current_weather", "arguments": '
+        '{"city": "NYC", "state": "NY", "unit": "fahrenheit"}}\n</tool_call>\n'
+        '<tool_call>\n{"name": "get_current_weather", "arguments": '
+        '{"city": "Baltimore", "state": "MD", "unit": "fahrenheit"}}\n</tool_call>\n'
+        '<tool_call>\n{"name": "get_current_weather", "arguments": '
+        '{"city": "Minneapolis", "state": "MN", "unit": "fahrenheit"}}\n</tool_call>\n'
+        '<tool_call>\n{"name": "get_current_weather", "arguments": '
+        '{"city": "Los Angeles", "state": "CA", "unit": "fahrenheit"}}\n</tool_call>'
+    )
+
+    def test_finish_releases_all_calls_at_end_of_stream(self):
+        """Every call must survive any framing, including one delta per response.
+
+        The parser emits one unit per increment, so a delta carrying whole calls
+        leaves the rest pending; with no finish() override and a delta large
+        enough to hold several calls, later calls and their arguments were
+        dropped -- four calls became two, then one with empty arguments.
+        """
+        tools = self.tools
+        expected = self._non_stream_calls(self.PARALLEL_OUTPUT, tools)
+        self.assertEqual(len(expected), 4)
+
+        for chunk_size in (13, 87, 128, 152, 200, len(self.PARALLEL_OUTPUT)):
+            text = self.PARALLEL_OUTPUT
+            chunks = [text[i : i + chunk_size] for i in range(0, len(text), chunk_size)]
+            _, streamed = self._collect_qwen25(chunks, tools)
+            self.assertEqual(streamed, expected, f"chunk_size={chunk_size}")
+
+    def test_finish_releases_arguments_of_a_call_completed_in_one_delta(self):
+        """A call completing inside one delta must not arrive with empty args."""
+        text = (
+            "Sure, let me check the weather.\n"
+            '<tool_call>\n{"name": "get_current_weather", "arguments": '
+            '{"city": "NYC", "state": "NY", "unit": "celsius"}}\n</tool_call>'
+        )
+        tools = self.tools
+        expected = self._non_stream_calls(text, tools)
+        for chunk_size in (24, 48, 100, len(text)):
+            chunks = [text[i : i + chunk_size] for i in range(0, len(text), chunk_size)]
+            _, streamed = self._collect_qwen25(chunks, tools)
+            self.assertEqual(streamed, expected, f"chunk_size={chunk_size}")
+            for _, parameters in streamed:
+                json.loads(parameters)
+
+    def test_finish_is_a_noop_when_nothing_is_pending(self):
+        text = (
+            '<tool_call>\n{"name": "get_current_weather", "arguments": '
+            '{"city": "NYC", "state": "NY", "unit": "celsius"}}\n</tool_call>'
+        )
+        tools = self.tools
+        detector = Qwen25Detector()
+        detector.parse_streaming_increment(text, tools)
+        detector.parse_streaming_increment("", tools)
+
+        end = detector.finish(tools)
+        self.assertEqual(end.calls, [])
+        self.assertEqual(end.normal_text, "")
+
+
+
+    def test_finish_releases_text_withheld_for_a_partial_end_token(self):
+        """Text held back for a partial end token must not be dropped at stream end.
+
+        The streaming path keeps a trailing prefix of ``</tool_call>`` in
+        ``_normal_text_buffer`` in case the rest of the token arrives. When the
+        stream ends that token never will, so the text has to be released:
+        ``detect_and_parse`` returns those same bytes as normal text.
+        """
+        text = "Hello</tool"
+        detector = Qwen25Detector()
+        chunk = detector.parse_streaming_increment(text, self.tools)
+        end = detector.finish(self.tools)
+
+        # "Hello" streams, the partial token is withheld, and finish() releases it.
+        self.assertEqual(chunk.normal_text, "Hello")
+        self.assertEqual(end.normal_text, "</tool")
+
+        expected = Qwen25Detector().detect_and_parse(text, self.tools)
+        self.assertEqual(
+            (chunk.normal_text or "") + (end.normal_text or ""),
+            (expected.normal_text or "").strip(),
+        )
 
 class TestGemma4Detector(unittest.TestCase):
     def setUp(self):
