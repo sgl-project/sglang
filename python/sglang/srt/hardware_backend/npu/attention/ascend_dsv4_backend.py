@@ -2036,21 +2036,22 @@ class DeepseekV4AscendAttnBackend(
             )
         if os.environ.get("DSV4_DUMP_SWA_KV"):
             # Content behind the local window: hash the SWA pages the table maps
-            # to, so a miss/hit comparison does not have to trust page ids alone.
-            # Never break the run: a dump must not change serving behaviour.
+            # at the sequence tail, where a resume re-reads history. Tail pages
+            # only and native dtype bytes: hashing the whole sequence as float32
+            # costs tens of MB per step and would distort the run it measures.
             try:
                 layer = int(os.environ.get("DSV4_DUMP_SWA_KV", "0"))
                 pool = self.token_to_kv_pool
                 buf = pool.swa_kv_pool.kv_buffer[pool._swa_local_layer_id(layer)]
                 tbl = getattr(fm, "swa_page_table", None)
                 if tbl is not None and tbl.numel():
-                    pages = tbl[0].reshape(-1).to(torch.int64)
-                    pages = torch.unique(pages[(pages >= 0) & (pages < buf.shape[0])])
-                    rows = buf.index_select(0, pages)
-                    a = rows.detach().to(torch.float32).cpu().numpy()
+                    pages = torch.unique(tbl[0].reshape(-1)[-3:].to(torch.int64))
+                    pages = pages[(pages >= 0) & (pages < buf.shape[0])]
+                    rows = buf.index_select(0, pages).detach().reshape(-1).contiguous()
+                    raw = rows.view(torch.uint8).numpy().tobytes()
                     print(
-                        f"[SWAKV] layer={layer} pages={rows.shape[0]} "
-                        f"sum={a.sum():.4f} md5={hashlib.md5(a.tobytes()).hexdigest()[:16]}",
+                        f"[SWAKV] start_pos={_l(getattr(fm, 'start_pos', None))} layer={layer} "
+                        f"pages={pages.numel()} md5={hashlib.md5(raw).hexdigest()[:16]}",
                         flush=True,
                     )
             except Exception as exc:
