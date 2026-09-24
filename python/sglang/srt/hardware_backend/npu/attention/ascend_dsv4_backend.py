@@ -2137,23 +2137,20 @@ class DeepseekV4AscendAttnBackend(
                         )
                         if not os.environ.get("DSV4_DUMP_SWA_FIXED_ONLY"):
                             print(_swkv_line, flush=True)
-                        _swaf_pos = (
-                            int(fm.start_pos.max().item())
-                            if torch.is_tensor(getattr(fm, "start_pos", None))
-                            and fm.start_pos.numel()
-                            else -1
-                        )
+                        _sw = getattr(fm, "start_pos", None)
+                        if torch.is_tensor(_sw) and _sw.numel():
+                            _swaf_pos = int(_sw.max().item())
+                        elif isinstance(_sw, (list, tuple)) and _sw:
+                            _swaf_pos = int(max(_sw))
+                        else:
+                            _swaf_pos = -1
                         _swaf_lo = int(os.environ.get("DSV4_DUMP_MIN_POS", "17523"))
                         _swaf_hi = int(os.environ.get("DSV4_DUMP_MAX_POS", "17530"))
                         _swaf_at = int(os.environ.get("DSV4_DUMP_SWA_FIXED_AT", "16384"))
                         if (
-                            os.environ.get("DSV4_DUMP_SWA_FIXED")
-                            and (
-                                _swaf_pos == _swaf_at
-                                or _swaf_lo <= _swaf_pos <= _swaf_hi
-                            )
-                            and getattr(self, "_swaf_printed", 0) < 64
-                        ):
+                            _swaf_pos == _swaf_at
+                            or _swaf_lo <= _swaf_pos <= _swaf_hi
+                        ) and getattr(self, "_swaf_printed", 0) < 64:
                             try:
                                 f_lo = int(os.environ.get("DSV4_DUMP_SWA_FIXED_LO", "16256"))
                                 f_hi = int(os.environ.get("DSV4_DUMP_SWA_FIXED_HI", "16384"))
