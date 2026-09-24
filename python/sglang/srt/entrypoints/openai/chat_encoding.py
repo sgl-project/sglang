@@ -227,6 +227,10 @@ def spec_renders_prompt_ids(spec: Optional[str]) -> bool:
     return spec in ("inkling", "kimi_k3", "dsv41")
 
 
+def spec_renders_message_tools(spec: Optional[str]) -> bool:
+    return spec in ("kimi_k3", "dsv41", "dsv4", "dsv32")
+
+
 def encode_simple_chat(
     *,
     tokenizer: Any,
