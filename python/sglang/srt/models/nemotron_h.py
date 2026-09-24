@@ -52,7 +52,7 @@ from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.layers.moe.utils import (
     RoutingMethodType,
     get_moe_a2a_backend,
-    should_skip_post_experts_all_reduce,
+    reduce_moe_output,
 )
 from sglang.srt.layers.quantization import QuantizationConfig
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
@@ -372,10 +372,7 @@ class NemotronHMoE(nn.Module):
         elif shared_output is not None:
             final_hidden_states += shared_output
 
-        if self.tp_size > 1 and not should_skip_post_experts_all_reduce(
-            is_tp_path=True,
-        ):
-            final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
+        final_hidden_states = reduce_moe_output(final_hidden_states)
 
         return final_hidden_states.view(num_tokens, hidden_dim)
 

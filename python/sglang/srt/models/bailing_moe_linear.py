@@ -12,9 +12,6 @@ from transformers import PretrainedConfig
 from sglang.kernels.ops.attention.fla.layernorm_gated import RMSNorm as RMSNormGated
 from sglang.kernels.ops.attention.fla.layernorm_gated import layernorm_fn
 from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
-from sglang.srt.distributed import (
-    tensor_model_parallel_all_reduce,
-)
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.activation import SiluAndMul
@@ -33,7 +30,7 @@ from sglang.srt.layers.linear import (
     RowParallelLinear,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
-from sglang.srt.layers.moe import should_skip_post_experts_all_reduce
+from sglang.srt.layers.moe import reduce_moe_output
 from sglang.srt.layers.moe.ep_moe.layer import DeepEPMoE, get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.topk import TopK
@@ -366,10 +363,7 @@ class BailingMoE(nn.Module):
             if self.num_shared_experts > 0:
                 final_hidden_states = final_hidden_states + shared_output
 
-        if self.tp_size > 1 and not should_skip_post_experts_all_reduce(
-            is_tp_path=True,
-        ):
-            final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
+        final_hidden_states = reduce_moe_output(final_hidden_states)
         return final_hidden_states
 
 

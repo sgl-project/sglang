@@ -27,9 +27,6 @@ from torch import nn
 from transformers import PretrainedConfig
 
 from sglang.kernels.jit.utils import is_arch_support_pdl
-from sglang.srt.distributed import (
-    tensor_model_parallel_all_reduce,
-)
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.layers.communicator import (
@@ -49,7 +46,7 @@ from sglang.srt.layers.linear import (
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe import (
     get_moe_a2a_backend,
-    should_skip_post_experts_all_reduce,
+    reduce_moe_output,
 )
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
@@ -337,10 +334,7 @@ class GptOssSparseMoeBlock(nn.Module):
             topk_output = self.topk(router_input, router_logits)
             final_hidden_states = self.experts(hidden_states, topk_output)
 
-        if self.tp_size > 1 and not should_skip_post_experts_all_reduce(
-            is_tp_path=True,
-        ):
-            final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
+        final_hidden_states = reduce_moe_output(final_hidden_states)
 
         # When input was pre-padded, FusedMoE.forward_impl captured the
         # padded width as `origin_hidden_states_dim` and skipped its own
