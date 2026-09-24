@@ -120,7 +120,7 @@ class FunctionCallParser:
         tools: List[Tool],
         tool_call_parser: str,
         tokenizer=None,
-        prefix: str | None = None,
+        prefix: str = "",
     ):
         detector_class = self.ToolCallParserEnum.get(tool_call_parser)
         if detector_class:

@@ -70,7 +70,6 @@ def validate_response_template_for_serving(template: dict) -> ResponseTemplate:
             field.content != "text"
             or field.transform is not None
             or field.join is not None
-            or field.content_args.get("strip") is True
         ):
             raise ValueError(
                 f"response_template field {name!r} uses semantics that cannot "
@@ -81,22 +80,16 @@ def validate_response_template_for_serving(template: dict) -> ResponseTemplate:
 
 def resolve_response_template(
     tokenizer: Any | None,
-    fallback: dict | None,
+    template: dict | None = None,
 ) -> dict | None:
-    """Load `response_template` from the tokenizer, then use the fallback."""
-    if tokenizer is None:
-        return fallback
-
+    """Return `template` if given, otherwise the tokenizer's metadata."""
+    if template is not None or tokenizer is None:
+        return template
     template = getattr(tokenizer, "response_template", None)
-    if isinstance(template, dict):
-        return template
-
-    init_kwargs = getattr(tokenizer, "init_kwargs", None) or {}
-    template = init_kwargs.get("response_template")
-    if isinstance(template, dict):
-        return template
-
-    return fallback
+    if not isinstance(template, dict):
+        init_kwargs = getattr(tokenizer, "init_kwargs", None) or {}
+        template = init_kwargs.get("response_template")
+    return template if isinstance(template, dict) else None
 
 
 def configure_response_template_request(request: Any) -> None:
@@ -107,6 +100,43 @@ def configure_response_template_request(request: Any) -> None:
     request.chat_template_kwargs = template_kwargs
 
 
+def _load_serving_template(
+    tokenizer: Any | None, template: dict | None, fallback: dict | None
+) -> tuple[dict, ResponseTemplate]:
+    """Use the explicit template, then checkpoint metadata, then the detector's
+    built-in fallback."""
+    template = resolve_response_template(tokenizer, template) or fallback
+    if template is None:
+        raise ValueError("response_template is required")
+    return template, validate_response_template_for_serving(template)
+
+
+def _streaming_template(template: dict[str, Any]) -> ResponseTemplate:
+    result = copy.deepcopy(template)
+    fields = result["fields"]
+    if _CONTENT_FIELD not in fields and all(
+        "open" in field or "open_pattern" in field for field in fields.values()
+    ):
+        fields[_CONTENT_FIELD] = {}
+    for field in fields.values():
+        field["optional"] = True
+    return load_response_template(result)
+
+
+def _tool_extraction_template(template: dict[str, Any]) -> ResponseTemplate:
+    tool_field = copy.deepcopy(template["fields"][_TOOL_FIELD])
+    tool_field["optional"] = True
+    anchor_name = (
+        "start_anchor_pattern" if "start_anchor_pattern" in template else "start_anchor"
+    )
+    return load_response_template(
+        {
+            anchor_name: template[anchor_name],
+            "fields": {_PASSTHROUGH_FIELD: {}, _TOOL_FIELD: tool_field},
+        }
+    )
+
+
 class _ReasoningResult:
     """Duck-types `reasoning_parser.StreamingParseResult`."""
 
@@ -115,86 +145,63 @@ class _ReasoningResult:
         self.reasoning_text = reasoning_text
 
 
-def _streaming_template(template: dict[str, Any]) -> dict[str, Any]:
-    result = copy.deepcopy(template)
-    fields = result["fields"]
-    if "content" not in fields and all(
-        "open" in field or "open_pattern" in field for field in fields.values()
-    ):
-        fields["content"] = {
-            "content": "text",
-            "content_args": {"strip": False},
-        }
-    for field in fields.values():
-        field["optional"] = True
-    return result
-
-
-def _tool_extraction_template(template: dict[str, Any]) -> dict[str, Any]:
-    tool_field = copy.deepcopy(template["fields"][_TOOL_FIELD])
-    tool_field["optional"] = True
-    anchor_name = (
-        "start_anchor_pattern" if "start_anchor_pattern" in template else "start_anchor"
-    )
-    return {
-        anchor_name: template[anchor_name],
-        "fields": {
-            _PASSTHROUGH_FIELD: {
-                "content": "text",
-                "content_args": {"strip": False},
-            },
-            _TOOL_FIELD: tool_field,
-        },
-    }
-
-
 class ResponseTemplateStreamAdapter:
-    """Stream a response template and route its generic region events."""
+    """Parse one response with a template and route its generic region events."""
 
-    def __init__(
-        self,
-        template: dict | ResponseTemplate,
-        *,
-        prefix: str | None = None,
-    ):
-        self._parser_template = load_response_template(template)
-        self._prefix = prefix or ""
-        self._stream_parser: ResponseParser | None = None
-        self._event_parser: ResponseParser | None = None
+    def __init__(self, template: ResponseTemplate, *, prefix: str = ""):
+        self._template = template
+        self._prefix = prefix
+        self._parser: ResponseParser | None = None
         self._prefix_end = 0
-        tool_field = self._parser_template.fields.get(_TOOL_FIELD)
+        self._finalized = False
+        tool_field = template.fields.get(_TOOL_FIELD)
         self._tool_has_closer = (
             tool_field is not None and tool_field.close_re is not None
         )
         self._pending_reasoning = ""
         self._pending_tool_streamed = False
-        self._finalized = False
 
-    def _make_parser(self, tools: Sequence[Any] | None = None) -> ResponseParser:
-        parser_tools = [
-            tool if isinstance(tool, dict) else tool.model_dump()
-            for tool in tools or []
-        ]
-        parser = ResponseParser(
-            self._parser_template,
+    def _start(self, tools: Sequence[Any] | None) -> list[dict]:
+        """Create the parser and replay a tool region left open by the prefix."""
+        if self._parser is not None:
+            return []
+        self._parser = ResponseParser(
+            self._template,
             prefix=self._prefix,
-            tools=parser_tools,
+            tools=[
+                tool if isinstance(tool, dict) else tool.model_dump()
+                for tool in tools or []
+            ],
         )
-        self._prefix_end = len(parser.input_text)
-        return parser
-
-    @staticmethod
-    def _active_initial_tool_event(parser: ResponseParser) -> list[dict]:
-        for event in reversed(parser.initial_events):
-            if event.get("field") != _TOOL_FIELD:
-                continue
-            if event["type"] in {"region_open", "region_close", "region_malformed"}:
+        self._prefix_end = len(self._parser.input_text)
+        for event in reversed(self._parser.initial_events):
+            if event.get("field") == _TOOL_FIELD and event["type"] != "region_chunk":
                 return [event] if event["type"] == "region_open" else []
         return []
 
+    def feed(self, text: str, tools: Sequence[Any] | None = None) -> list[dict]:
+        if self._finalized:
+            return []
+        events = self._start(tools)
+        return events + self._parser.feed(text)
+
+    def finalize(self, tools: Sequence[Any] | None = None) -> list[dict]:
+        if self._finalized:
+            return []
+        events = self._start(tools)
+        self._finalized = True
+        return events + self._parser.finalize()[1]
+
+    def parse(self, text: str, tools: Sequence[Any] | None = None) -> list[dict]:
+        return self.feed(text, tools) + self.finalize(tools)
+
+    def _generated_text(self, event: dict) -> str:
+        start = max(event["start"], self._prefix_end)
+        return self._parser.input_text[start : event["end"]]
+
     def _open_tool_name(self, captures: dict | None) -> str | None:
         """Name already fixed by the opener, before the region body exists."""
-        field = self._parser_template.fields.get(_TOOL_FIELD)
+        field = self._template.fields.get(_TOOL_FIELD)
         transform = None if field is None or field.transform_each else field.transform
         function = transform.get("function") if isinstance(transform, dict) else None
         if not isinstance(function, dict):
@@ -205,67 +212,9 @@ class ResponseTemplateStreamAdapter:
             return None
         return name if isinstance(name, str) else None
 
-    def _generated_text(self, event: dict) -> str:
-        assert self._event_parser is not None
-        start = max(event["start"], self._prefix_end)
-        return self._event_parser.input_text[start : event["end"]]
-
-    def has_tool_region(self, text: str) -> bool:
-        try:
-            parser = self._make_parser()
-            events = self._active_initial_tool_event(parser) + parser.feed(text)
-        except (KeyError, RuntimeError, TypeError, ValueError):
-            return False
-        return any(
-            event["type"] == "region_open" and event.get("field") == _TOOL_FIELD
-            for event in events
-        )
-
-    def detect_and_parse(
-        self,
-        text: str,
-        tools: Sequence[Any] | None = None,
-    ) -> list[dict]:
-        parser = self._make_parser(tools)
-        self._event_parser = parser
-        events = self._active_initial_tool_event(parser) + parser.feed(text)
-        _, final_events = parser.finalize()
-        return events + final_events
-
-    def _bootstrap_stream_parser(
-        self, tools: Sequence[Any] | None
-    ) -> tuple[ResponseParser, list[dict]]:
-        initial_events: list[dict] = []
-        if self._stream_parser is None:
-            self._stream_parser = self._make_parser(tools)
-            initial_events = self._active_initial_tool_event(self._stream_parser)
-        self._event_parser = self._stream_parser
-        return self._stream_parser, initial_events
-
-    def feed(
-        self,
-        text: str,
-        tools: Sequence[Any] | None = None,
-    ) -> list[dict]:
-        if self._finalized:
-            return []
-        parser, initial_events = self._bootstrap_stream_parser(tools)
-        return initial_events + parser.feed(text)
-
-    def finalize(
-        self,
-        tools: Sequence[Any] | None = None,
-    ) -> list[dict]:
-        if self._finalized:
-            return []
-        parser, initial_events = self._bootstrap_stream_parser(tools)
-        _, events = parser.finalize()
-        self._finalized = True
-        return initial_events + events
-
     def route_reasoning_events(
         self, events: list[dict], *, stream_reasoning: bool
-    ) -> tuple[str, str]:
+    ) -> _ReasoningResult:
         reasoning_parts: list[str] = []
         normal_parts: list[str] = []
         for event in events:
@@ -273,23 +222,23 @@ class ResponseTemplateStreamAdapter:
             etype = event["type"]
             if field == _THINKING_FIELD:
                 if etype == "region_chunk":
-                    text = event["text"]
                     if stream_reasoning:
-                        reasoning_parts.append(text)
+                        reasoning_parts.append(event["text"])
                     else:
-                        self._pending_reasoning += text
+                        self._pending_reasoning += event["text"]
                 elif etype == "region_close" and not stream_reasoning:
                     reasoning_parts.append(self._pending_reasoning)
                     self._pending_reasoning = ""
             elif field == _CONTENT_FIELD and etype == "region_chunk":
                 normal_parts.append(event["text"])
             elif field == _TOOL_FIELD:
+                # Hand tool regions back verbatim so the tool detector can parse them.
                 normal_parts.append(
                     event["text"]
                     if etype == "region_chunk"
                     else self._generated_text(event)
                 )
-        return "".join(normal_parts), "".join(reasoning_parts)
+        return _ReasoningResult("".join(normal_parts), "".join(reasoning_parts))
 
     def route_tool_events(
         self,
@@ -344,37 +293,17 @@ class ResponseTemplateStreamAdapter:
     def _is_unusable_tool_end(self, event: dict) -> bool:
         """Whether a tool region ended malformed, or at end of stream without its
         closer because the call was cut off."""
-        assert self._event_parser is not None
         return event["type"] == "region_malformed" or (
             event["type"] == "region_close"
             and self._tool_has_closer
-            and event["start"] == len(self._event_parser.input_text)
+            and event["start"] == len(self._parser.input_text)
         )
 
 
-class _ResponseTemplateParserInputMixin:
-    """Preserve response-template delimiters until parsing."""
-
-    response_template: dict | None = None
-
-    def _load_response_template(
-        self,
-        tokenizer: Any | None,
-        response_template: dict | None,
-    ) -> tuple[dict, ResponseTemplate]:
-        fallback = (
-            self.response_template if response_template is None else response_template
-        )
-        template = resolve_response_template(tokenizer, fallback)
-        if template is None:
-            raise ValueError("response_template is required")
-        self.response_template = template
-        return template, validate_response_template_for_serving(template)
-
-
-class ResponseTemplateReasoningDetector(_ResponseTemplateParserInputMixin):
+class ResponseTemplateReasoningDetector:
     """Reasoning detector driven by a `response_template` grammar."""
 
+    response_template: dict | None = None
     _default_think_start = ""
     _default_think_end = ""
     thinks_internally = False
@@ -385,13 +314,13 @@ class ResponseTemplateReasoningDetector(_ResponseTemplateParserInputMixin):
         stream_reasoning: bool = True,
         tokenizer=None,
         response_template: dict | None = None,
-        prefix: str | None = None,
+        prefix: str = "",
         **_kwargs,
     ):
-        template, loaded = self._load_response_template(
-            tokenizer,
-            response_template,
+        template, loaded = _load_serving_template(
+            tokenizer, response_template, self.response_template
         )
+        self.response_template = template
         self.stream_reasoning = stream_reasoning
         thinking = loaded.fields.get(_THINKING_FIELD)
         self.think_start_token = (
@@ -405,67 +334,60 @@ class ResponseTemplateReasoningDetector(_ResponseTemplateParserInputMixin):
             else self._default_think_end
         )
         self.think_start_self_label = ""
-        self._adapter = ResponseTemplateStreamAdapter(
-            _streaming_template(template),
-            prefix=prefix,
-        )
+        self._template = _streaming_template(template)
+        self._prefix = prefix
+        self._adapter = ResponseTemplateStreamAdapter(self._template, prefix=prefix)
 
     def detect_and_parse(self, text: str) -> _ReasoningResult:
-        events = self._adapter.detect_and_parse(text)
-        normal_text, reasoning_text = self._adapter.route_reasoning_events(
-            events, stream_reasoning=True
+        adapter = ResponseTemplateStreamAdapter(self._template, prefix=self._prefix)
+        return adapter.route_reasoning_events(
+            adapter.parse(text), stream_reasoning=True
         )
-        return _ReasoningResult(normal_text=normal_text, reasoning_text=reasoning_text)
 
     def parse_streaming_increment(self, new_text: str) -> _ReasoningResult:
-        events = self._adapter.feed(new_text)
-        normal_text, reasoning_text = self._adapter.route_reasoning_events(
-            events, stream_reasoning=self.stream_reasoning
+        return self._adapter.route_reasoning_events(
+            self._adapter.feed(new_text), stream_reasoning=self.stream_reasoning
         )
-        return _ReasoningResult(normal_text=normal_text, reasoning_text=reasoning_text)
 
     def finish(self) -> _ReasoningResult:
-        events = self._adapter.finalize()
-        normal_text, reasoning_text = self._adapter.route_reasoning_events(
-            events, stream_reasoning=self.stream_reasoning
+        return self._adapter.route_reasoning_events(
+            self._adapter.finalize(), stream_reasoning=self.stream_reasoning
         )
-        return _ReasoningResult(normal_text=normal_text, reasoning_text=reasoning_text)
 
 
-class ResponseTemplateToolDetector(
-    _ResponseTemplateParserInputMixin,
-    BaseFormatDetector,
-):
+class ResponseTemplateToolDetector(BaseFormatDetector):
     """Tool-call detector driven by a `response_template` grammar."""
+
+    response_template: dict | None = None
 
     def __init__(
         self,
         tokenizer=None,
         response_template: dict | None = None,
-        prefix: str | None = None,
+        prefix: str = "",
     ):
         super().__init__()
-        template, loaded = self._load_response_template(
-            tokenizer,
-            response_template,
+        template, loaded = _load_serving_template(
+            tokenizer, response_template, self.response_template
         )
-        self._adapter = ResponseTemplateStreamAdapter(
-            _tool_extraction_template(template),
-            prefix=prefix,
-        )
-        tool_spec = loaded.fields[_TOOL_FIELD]
-        self.tool_close_literals = tool_spec.close_literals or []
+        self.response_template = template
+        if _TOOL_FIELD not in loaded.fields:
+            raise ValueError(f"response_template has no {_TOOL_FIELD!r} field")
+        self._template = _tool_extraction_template(template)
+        self._prefix = prefix
+        self._adapter = ResponseTemplateStreamAdapter(self._template, prefix=prefix)
+        self.tool_close_literals = loaded.fields[_TOOL_FIELD].close_literals or []
         if self.tool_close_literals:
             self.eot_token = self.tool_close_literals[0]
         self.incomplete_tool_call_indices: set[int] = set()
         self._tool_indices: dict[str, int] | None = None
 
-    @property
-    def has_incomplete_tool_call(self) -> bool:
-        return bool(self.incomplete_tool_call_indices)
-
     def has_tool_call(self, text: str) -> bool:
-        return self._adapter.has_tool_region(text)
+        adapter = ResponseTemplateStreamAdapter(self._template, prefix=self._prefix)
+        return any(
+            event["type"] == "region_open" and event.get("field") == _TOOL_FIELD
+            for event in adapter.feed(text)
+        )
 
     def _to_tool_call_item(
         self, value: Any, tool_indices: dict[str, int], tool_index: int
@@ -513,7 +435,6 @@ class ResponseTemplateToolDetector(
     ) -> None:
         name_was_streamed = self.current_tool_name_sent
         self._ensure_tool_slot()
-        assert self.current_tool_id >= 0
         try:
             parsed_args = json.loads(item.parameters)
         except json.JSONDecodeError:
@@ -542,18 +463,10 @@ class ResponseTemplateToolDetector(
 
     def _emit_tool_name(self, name: str, pending_calls: list[ToolCallItem]) -> None:
         self._ensure_tool_slot()
-        assert self.current_tool_id >= 0
         pending_calls.append(
-            ToolCallItem(
-                tool_index=self.current_tool_id,
-                name=name,
-                parameters="",
-            )
+            ToolCallItem(tool_index=self.current_tool_id, name=name, parameters="")
         )
-        self.prev_tool_call_arr[self.current_tool_id] = {
-            "name": name,
-            "arguments": "",
-        }
+        self.prev_tool_call_arr[self.current_tool_id] = {"name": name, "arguments": ""}
         self.incomplete_tool_call_indices.add(self.current_tool_id)
         self.current_tool_name_sent = True
 
@@ -562,9 +475,11 @@ class ResponseTemplateToolDetector(
         self.current_tool_id += 1
         self.current_tool_name_sent = False
 
-    def _route_tool_events(
-        self, events: list[dict], tool_indices: dict[str, int]
-    ) -> tuple[str, list[ToolCallItem]]:
+    def detect_and_parse(
+        self, text: str, tools: list[Tool]
+    ) -> ToolStreamingParseResult:
+        adapter = ResponseTemplateStreamAdapter(self._template, prefix=self._prefix)
+        tool_indices = self._get_tool_indices(tools)
         calls: list[ToolCallItem] = []
 
         def on_close(value: Any) -> bool:
@@ -574,27 +489,18 @@ class ResponseTemplateToolDetector(
             calls.extend(items)
             return True
 
-        normal_text = self._adapter.route_tool_events(events, on_tool_close=on_close)
-        return normal_text, calls
-
-    def detect_and_parse(
-        self, text: str, tools: list[Tool]
-    ) -> ToolStreamingParseResult:
-        events = self._adapter.detect_and_parse(text, tools)
-        normal_text, calls = self._route_tool_events(
-            events, self._get_tool_indices(tools)
+        normal_text = adapter.route_tool_events(
+            adapter.parse(text, tools), on_tool_close=on_close
         )
         return ToolStreamingParseResult(normal_text=normal_text, calls=calls)
 
     def parse_streaming_increment(
         self, new_text: str, tools: list[Tool]
     ) -> ToolStreamingParseResult:
-        events = self._adapter.feed(new_text, tools)
-        return self._emit_streaming_events(events, tools)
+        return self._emit_streaming_events(self._adapter.feed(new_text, tools), tools)
 
     def finish(self, tools: list[Tool]) -> ToolStreamingParseResult:
-        events = self._adapter.finalize(tools)
-        return self._emit_streaming_events(events, tools)
+        return self._emit_streaming_events(self._adapter.finalize(tools), tools)
 
     def _emit_streaming_events(
         self, events: list[dict], tools: list[Tool]
@@ -602,7 +508,6 @@ class ResponseTemplateToolDetector(
         if self._tool_indices is None:
             self._tool_indices = self._get_tool_indices(tools)
         tool_indices = self._tool_indices
-
         pending_calls: list[ToolCallItem] = []
 
         def on_open(name: str) -> bool:
@@ -612,11 +517,8 @@ class ResponseTemplateToolDetector(
             return True
 
         def on_close(value: Any) -> bool:
-            tool_index = max(self.current_tool_id, 0)
             items = self._to_tool_call_items(
-                value,
-                tool_indices,
-                tool_index,
+                value, tool_indices, max(self.current_tool_id, 0)
             )
             if items is None:
                 return False

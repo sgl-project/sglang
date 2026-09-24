@@ -817,8 +817,8 @@ def _architecture_auto_parsers(server_args, needs: Tuple[str, ...]) -> Dict[str,
 
 
 def resolve_auto_parsers(server_args) -> None:
-    """Resolve `--reasoning-parser=auto` / `--tool-call-parser=auto` from
-    checkpoint metadata or the chat template, before anything publishes
+    """Resolve `--reasoning-parser=auto` / `--tool-call-parser=auto` from the
+    chat template or checkpoint metadata, before anything publishes
     `server_args`.
 
     Performs a lightweight tokenizer load, so it runs once in engine init. The
@@ -906,7 +906,7 @@ def resolve_auto_parsers(server_args) -> None:
             validate_response_template_for_serving,
         )
 
-        response_template = resolve_response_template(tokenizer, None)
+        response_template = resolve_response_template(tokenizer)
         if response_template is not None:
             try:
                 response_template = validate_response_template_for_serving(

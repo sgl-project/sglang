@@ -80,7 +80,7 @@ from sglang.srt.entrypoints.openai.responses_adapters import (
 )
 from sglang.srt.entrypoints.openai.serving_chat import (
     OpenAIServingChat,
-    _has_incomplete_tool_call,
+    _incomplete_tool_call_indices,
 )
 from sglang.srt.entrypoints.openai.tool_server import MCPToolServer, ToolServer
 from sglang.srt.entrypoints.openai.utils import to_openai_style_logprobs
@@ -2253,8 +2253,7 @@ class OpenAIServingResponses(OpenAIServingChat):
             else:
                 item_status = (
                     "incomplete"
-                    if tool_parser is not None
-                    and _has_incomplete_tool_call(tool_parser, tool_index)
+                    if tool_index in _incomplete_tool_call_indices(tool_parser)
                     else "completed"
                 )
                 completed_item = ResponseFunctionToolCall(

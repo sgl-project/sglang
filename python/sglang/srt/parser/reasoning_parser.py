@@ -2267,8 +2267,6 @@ class ReasoningParser:
             if effort is not None:
                 kwargs["reasoning_effort"] = effort
 
-        if prefix is None:
-            prefix = getattr(request, "_response_parser_prefix", "")
         if tokenizer is not None:
             sig = inspect.signature(detector_class)
             if "tokenizer" in sig.parameters:
@@ -2279,6 +2277,8 @@ class ReasoningParser:
             if "tool_call_parser_active" in sig.parameters:
                 kwargs["tool_call_parser_active"] = True
 
+        if prefix is None:
+            prefix = getattr(request, "_response_parser_prefix", "")
         if prefix and issubclass(detector_class, ResponseTemplateReasoningDetector):
             kwargs["prefix"] = prefix
 

@@ -369,7 +369,7 @@ class ServerArgs:
             choices=["auto"] + reasoning_parser_choices,
             default=_declared_default("reasoning_parser"),
             help=f"Specify the parser for reasoning models. "
-            f"Use 'auto' to detect from checkpoint metadata or chat template. "
+            f"Use 'auto' to detect from chat template or checkpoint metadata. "
             f"Options include: {reasoning_parser_choices}.",
         )
         tool_call_parser_choices = list(FunctionCallParser.ToolCallParserEnum.keys())
@@ -379,7 +379,7 @@ class ServerArgs:
             choices=["auto"] + tool_call_parser_choices,
             default=_declared_default("tool_call_parser"),
             help=f"Specify the parser for handling tool-call interactions. "
-            f"Use 'auto' to detect from checkpoint metadata or chat template. "
+            f"Use 'auto' to detect from chat template or checkpoint metadata. "
             f"Options include: {tool_call_parser_choices}.",
         )
         parser.add_argument(

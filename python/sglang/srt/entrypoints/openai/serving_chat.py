@@ -127,12 +127,9 @@ _MEDIA_CONTENT_PART_TYPES = frozenset({"image_url", "video_url", "audio_url"})
 _CHAT_TEMPLATE_CACHE_MAX_SIZE = 128
 
 
-def _has_incomplete_tool_call(parser, tool_index: Optional[int] = None) -> bool:
+def _incomplete_tool_call_indices(parser) -> set[int]:
     detector = getattr(parser, "detector", parser)
-    indices = getattr(detector, "incomplete_tool_call_indices", None)
-    if tool_index is not None and indices is not None:
-        return tool_index in indices
-    return bool(getattr(detector, "has_incomplete_tool_call", False))
+    return getattr(detector, "incomplete_tool_call_indices", set())
 
 
 def normalize_tool_content(role: str, content):
@@ -1300,10 +1297,17 @@ class OpenAIServingChat(OpenAIServingBase):
         request,
         adapted_request: GenerateReqInput,
     ) -> None:
-        if self._requires_response_template_detokenization(request):
-            request._response_parser_prefix = self._response_parser_prefix(
-                adapted_request
+        """Give response-template parsers the rendered assistant prefill."""
+        if not self._requires_response_template_detokenization(request):
+            return
+        prefix = adapted_request.text
+        if not isinstance(prefix, str) and adapted_request.input_ids:
+            prefix = self.tokenizer_manager.tokenizer.decode(
+                adapted_request.input_ids,
+                skip_special_tokens=False,
+                spaces_between_special_tokens=False,
             )
+        request._response_parser_prefix = prefix or ""
 
     def _requires_response_template_detokenization(self, request) -> bool:
         if isinstance(self._reasoning_detector, ResponseTemplateReasoningDetector):
@@ -1316,25 +1320,6 @@ class OpenAIServingChat(OpenAIServingBase):
             and tool_detector is not None
             and issubclass(tool_detector, ResponseTemplateToolDetector)
         )
-
-    def _response_parser_prefix(self, adapted_request: GenerateReqInput) -> str:
-        prompt = getattr(adapted_request, "text", None)
-        if isinstance(prompt, str):
-            return prompt
-
-        prompt_ids = getattr(adapted_request, "input_ids", None)
-        if (
-            isinstance(prompt_ids, list)
-            and prompt_ids
-            and all(isinstance(token_id, int) for token_id in prompt_ids)
-            and self.tokenizer_manager.tokenizer is not None
-        ):
-            return self.tokenizer_manager.tokenizer.decode(
-                prompt_ids,
-                skip_special_tokens=False,
-                spaces_between_special_tokens=False,
-            )
-        return ""
 
     def _process_messages(
         self, request: ChatCompletionRequest, is_multimodal: bool
@@ -2107,11 +2092,10 @@ class OpenAIServingChat(OpenAIServingBase):
 
                 # Change finish_reason to "tool_calls" if we had tool calls and stopped naturally
                 final_finish_reason = finish_reason_type
-                parser = parser_dict.get(idx)
                 if (
                     has_tool_calls.get(idx, False)
                     and finish_reason_type == "stop"
-                    and not (parser is not None and _has_incomplete_tool_call(parser))
+                    and not _incomplete_tool_call_indices(parser_dict.get(idx))
                 ):
                     final_finish_reason = "tool_calls"
 

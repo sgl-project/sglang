@@ -163,9 +163,11 @@ class TestResponseTemplateLoading(unittest.TestCase):
         )
 
         self.assertEqual(
-            resolve_response_template(tokenizer, None),
+            resolve_response_template(tokenizer),
             GEMMA4_RESPONSE_TEMPLATE,
         )
+        explicit = copy.deepcopy(GEMMA4_RESPONSE_TEMPLATE)
+        self.assertIs(resolve_response_template(tokenizer, explicit), explicit)
 
     def test_rejects_unsupported_semantic_fields(self):
         template = {
@@ -185,7 +187,6 @@ class TestResponseTemplateLoading(unittest.TestCase):
 
         for field_name, update in (
             ("content", {"content": "json"}),
-            ("content", {"content_args": {"strip": True}}),
             ("thinking", {"transform": "{content}"}),
         ):
             with self.subTest(field=field_name, update=update):
@@ -193,6 +194,28 @@ class TestResponseTemplateLoading(unittest.TestCase):
                 template["fields"][field_name].update(update)
                 with self.assertRaisesRegex(ValueError, "cannot be streamed"):
                     validate_response_template_for_serving(template)
+
+    def test_checkpoint_metadata_takes_precedence_over_subclass_fallback(self):
+        class FallbackDetector(ResponseTemplateToolDetector):
+            response_template = XML_TOOL_TEMPLATE
+
+        tokenizer = SimpleNamespace(response_template=GEMMA4_RESPONSE_TEMPLATE)
+        self.assertIs(
+            FallbackDetector(tokenizer=tokenizer).response_template,
+            GEMMA4_RESPONSE_TEMPLATE,
+        )
+        self.assertIs(FallbackDetector().response_template, XML_TOOL_TEMPLATE)
+
+    def test_tool_detector_requires_tool_calls_field(self):
+        template = copy.deepcopy(GEMMA4_RESPONSE_TEMPLATE)
+        del template["fields"]["tool_calls"]
+        tokenizer = SimpleNamespace(response_template=template)
+
+        with self.assertRaisesRegex(ValueError, "no 'tool_calls' field"):
+            ResponseTemplateToolDetector(response_template=template)
+        self.assertEqual(
+            tool_close_token_ids("response_template", tokenizer), frozenset()
+        )
 
 
 class TestGemma4ResponseTemplateParity(unittest.TestCase):
@@ -481,6 +504,16 @@ class TestResponseTemplateAdapters(unittest.TestCase):
         self.assertEqual(content_parsed.normal_text, " continued")
         self.assertEqual(non_streaming_parsed.normal_text, " continued")
 
+    def test_held_prefix_bytes_are_not_replayed(self):
+        detector = ResponseTemplateReasoningDetector(
+            response_template=GEMMA4_RESPONSE_TEMPLATE,
+            prefix=PREFIX + "Existing answer <",
+        )
+
+        parsed = detector.parse_streaming_increment("b> tail<turn|>")
+
+        self.assertEqual(parsed.normal_text, "b> tail")
+
     def test_parser_config_disables_generated_special_token_spacing(self):
         request = ChatCompletionRequest(messages=[])
 
@@ -604,7 +637,7 @@ class TestResponseTemplateAdapters(unittest.TestCase):
         self.assertEqual(content.normal_text, "hello")
         self.assertEqual(parsed.normal_text, "")
         self.assertEqual(parsed.calls, [])
-        self.assertFalse(detector.has_incomplete_tool_call)
+        self.assertFalse(detector.incomplete_tool_call_indices)
 
     def test_streaming_malformed_call_leaves_emitted_name_incomplete(self):
         detector = ResponseTemplateToolDetector(
@@ -657,6 +690,24 @@ class TestResponseTemplateAdapters(unittest.TestCase):
         )
         self.assertEqual(closed.calls, [])
         self.assertEqual(detector.incomplete_tool_call_indices, {0})
+
+    def test_one_shot_parse_does_not_disturb_active_stream(self):
+        detector = ResponseTemplateToolDetector(
+            response_template=GEMMA4_RESPONSE_TEMPLATE,
+            prefix=PREFIX,
+        )
+        opening, body = TOOL_CALL.split("{", 1)
+
+        opened = detector.parse_streaming_increment(opening + "{", [_tool()])
+        one_shot = detector.detect_and_parse(TOOL_CALL, [_tool()])
+        closed = detector.parse_streaming_increment(body, [_tool()])
+
+        self.assertEqual([call.name for call in opened.calls], ["get_weather"])
+        self.assertEqual(len(one_shot.calls), 1)
+        self.assertEqual(
+            [(call.tool_index, call.name) for call in closed.calls], [(0, None)]
+        )
+        self.assertEqual(detector.incomplete_tool_call_indices, set())
 
     def test_streaming_waits_when_tool_name_depends_on_content(self):
         template = {
