@@ -2034,6 +2034,27 @@ class DeepseekV4AscendAttnBackend(
                 f"swa_len={len(row)} swa_row0={row}",
                 flush=True,
             )
+        if os.environ.get("DSV4_DUMP_SWA_KV"):
+            # Content behind the local window: hash the SWA pages the table maps
+            # to, so a miss/hit comparison does not have to trust page ids alone.
+            # Never break the run: a dump must not change serving behaviour.
+            try:
+                layer = int(os.environ.get("DSV4_DUMP_SWA_KV", "0"))
+                pool = self.token_to_kv_pool
+                buf = pool.swa_kv_pool.kv_buffer[pool._swa_local_layer_id(layer)]
+                tbl = getattr(fm, "swa_page_table", None)
+                if tbl is not None and tbl.numel():
+                    pages = tbl[0].reshape(-1).to(torch.int64)
+                    pages = torch.unique(pages[(pages >= 0) & (pages < buf.shape[0])])
+                    rows = buf.index_select(0, pages)
+                    a = rows.detach().to(torch.float32).cpu().numpy()
+                    print(
+                        f"[SWAKV] layer={layer} pages={rows.shape[0]} "
+                        f"sum={a.sum():.4f} md5={hashlib.md5(a.tobytes()).hexdigest()[:16]}",
+                        flush=True,
+                    )
+            except Exception as exc:
+                print(f"[SWAKV] skipped: {exc}", flush=True)
 
     def _compute_kernel_metadata(self, forward_batch: ForwardBatch) -> dict:
         fm = self.forward_metadata
