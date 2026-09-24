@@ -48,15 +48,6 @@ class HiCacheStorageExtraInfo:
     extra_info: Optional[dict] = None
 
 
-@dataclass(frozen=True)
-class PrefetchTimeoutConfig:
-    """Knobs for the linear prefetch-timeout policy used by HiCache."""
-
-    base: float = 2.0  # seconds, fixed overhead unrelated to token count
-    per_ki_token: float = 0.1  # seconds per 1024 tokens
-    max: float = 30.0  # seconds, upper bound for the linear timeout
-
-
 class PoolName(str, Enum):
     """Well-known pool names used as PoolTransfer/PoolEntry identifiers."""
 
@@ -66,12 +57,22 @@ class PoolName(str, Enum):
     INDEXER = "indexer"
     # TODO(hzh0425): Current DeepSeek V4 pool naming is verbose; will be normalized to
     # 'COMPRESSED_KV / COMPRESSED_INDEXER / COMPRESSED_STATE' in the next PR.
+    DEEPSEEK_V4_C1 = "deepseek_v4_c1"
+    DEEPSEEK_V4_C1_INDEXER = "deepseek_v4_c1_indexer"
+    DEEPSEEK_V4_C1_INDEXER_SCALE = "deepseek_v4_c1_indexer_scale"
+    DEEPSEEK_V4_C2 = "deepseek_v4_c2"
+    DEEPSEEK_V4_C2_INDEXER = "deepseek_v4_c2_indexer"
+    DEEPSEEK_V4_C2_INDEXER_SCALE = "deepseek_v4_c2_indexer_scale"
     DEEPSEEK_V4_C4 = "deepseek_v4_c4"
     DEEPSEEK_V4_C4_INDEXER = "deepseek_v4_c4_indexer"
     # FP4 indexer splits the indexer cache into separate payload/scale buffers,
     # so it needs a second pool alongside DEEPSEEK_V4_C4_INDEXER.
     DEEPSEEK_V4_C4_INDEXER_SCALE = "deepseek_v4_c4_indexer_scale"
     DEEPSEEK_V4_C128 = "deepseek_v4_c128"
+    # fp8 unified_kv splits a row across a packed fp8 nope pool and a parallel
+    # bf16 rope pool, so each compressed region mirrors to two host pools.
+    DEEPSEEK_V4_C4_ROPE = "deepseek_v4_c4_rope"
+    DEEPSEEK_V4_C128_ROPE = "deepseek_v4_c128_rope"
     DEEPSEEK_V4_C4_STATE = "deepseek_v4_c4_state"
     DEEPSEEK_V4_C4_INDEXER_STATE = "deepseek_v4_c4_indexer_state"
     DEEPSEEK_V4_C128_STATE = "deepseek_v4_c128_state"
@@ -112,6 +113,9 @@ class PoolTransfer:
     hit_policy: PoolHitPolicy = PoolHitPolicy.ALL_PAGES
     nodes_to_load: Optional[List[Any]] = None
     indices_from_pool: Optional[PoolName] = None
+    # Full IDs backing a dependent device allocation: resident tensors or
+    # slices of the full rows allocated by this load, in transfer order.
+    anchor_index_parts: Optional[List[torch.Tensor | slice]] = None
 
 
 @dataclass(frozen=True)
@@ -452,13 +456,6 @@ class HiCacheFile(HiCacheStorage):
         if component_name is None or component_name in ("__default__", PoolName.KV):
             return self._get_suffixed_key(key)
         return self._get_suffixed_key(f"{key}.{component_name}")
-
-    def _get_component_path(
-        self, key: str, component_name: Optional[str] = None
-    ) -> str:
-        return os.path.join(
-            self.file_path, f"{self._get_component_key(key, component_name)}.bin"
-        )
 
     def _scan_existing_files_to_metadata_cache(self) -> None:
         try:
