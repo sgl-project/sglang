@@ -402,7 +402,16 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
                     # commit (token offsets stay so the next iteration retries
                     # with more tokens).
                     printable = find_printable_text(new_text)
-                    s.sent_offset = s.decoded_text_len + len(printable)
+                    # find_printable_text is a stateless heuristic whose result
+                    # can be shorter than a previous step's: its CJK branch emits
+                    # through a trailing CJK char, its last-space branch retreats
+                    # to a space, and a non-CJK char with no space to fall back to
+                    # collapses it to "". sent_offset must not follow it
+                    # backwards, or the next clean step under-counts `pending`
+                    # and re-sends text the client already has.
+                    s.sent_offset = max(
+                        s.sent_offset, s.decoded_text_len + len(printable)
+                    )
                     output_strs.append(printable[pending:] if pending else printable)
                 continue
 
