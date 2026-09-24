@@ -2045,14 +2045,20 @@ class DeepseekV4AscendAttnBackend(
                 buf = pool.swa_kv_pool.kv_buffer[pool._swa_local_layer_id(layer)]
                 tbl = getattr(fm, "swa_page_table", None)
                 if tbl is not None and tbl.numel():
-                    # Slice, never gather: fp8 has no NPU index_select (161002),
-                    # and hashing the whole sequence would cost tens of MB per
-                    # step and distort the run it measures.
-                    pages = torch.unique(tbl[0].reshape(-1)[-3:].to(torch.int64))
-                    pages = pages[(pages >= 0) & (pages < buf.shape[0])]
-                    if pages.numel():
-                        lo = int(pages.min())
-                        span = int(pages.max()) - lo + 1
+                    # The local window is the trailing SWA page plus the one
+                    # before it. Address them by position and print the ids, so
+                    # both runs compare the same slot: a tail-of-row heuristic
+                    # picks padding and silently hashes a different page set.
+                    # Slice, never gather: fp8 has no NPU index_select (161002).
+                    vals = tbl[0].reshape(-1).tolist()
+                    pos = int(fm.start_pos.reshape(-1)[0].item()) if fm.start_pos.numel() else 0
+                    pg = pos // int(pool.swa_kv_pool.kernel_page_size)
+                    idx = sorted({max(0, pg - 1), min(pg, len(vals) - 1)})
+                    ids = [int(vals[i]) for i in idx]
+                    ids = [v for v in ids if 0 <= v < buf.shape[0]]
+                    if ids:
+                        lo = min(ids)
+                        span = max(ids) - lo + 1
                         raw = (
                             buf.narrow(0, lo, span)
                             .view(torch.uint8)
@@ -2063,8 +2069,7 @@ class DeepseekV4AscendAttnBackend(
                         )
                         print(
                             f"[SWAKV] start_pos={_l(getattr(fm, 'start_pos', None))} layer={layer} "
-                            f"pages={pages.numel()} span={span} "
-                            f"md5={hashlib.md5(raw).hexdigest()[:16]}",
+                            f"ids={ids} span={span} md5={hashlib.md5(raw).hexdigest()[:16]}",
                             flush=True,
                         )
             except Exception as exc:
