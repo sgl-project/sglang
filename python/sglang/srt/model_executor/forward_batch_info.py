@@ -1589,6 +1589,24 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             # there is no reduce-scatter in LM logprob, so we do not need to adjust the padded length for logprob
             global_num_tokens[i] = ceil_align(global_num_tokens[i], attn_tp_size)
 
+        # Legacy V1 prefill CP requires batch-level alignment: round-robin
+        # split asserts len(input_ids) % attn_cp_size == 0 (can_dsa_cp_split).
+        # CP-v2 pads each rank-local shard physically instead
+        # (pad_logical_token_to_physical), so only pad when no CP-v2 strategy
+        # is bound (strategy stays dormant on PPU, which runs V1).
+        # Zigzag (in-seq-split) CP pads to 2 * attn_cp_size for load balance;
+        # other CP modes pad to attn_cp_size; CP off pads nothing (align size
+        # 1) -- extra padding breaks EAGLE/MTP draft prefill with NaN draft
+        # logits, see #23269.
+        # Local imports: module-level CP helper imports here are circular (#27014).
+        from sglang.srt.layers.cp.padding import get_cp_padding_align_size
+        from sglang.srt.layers.cp.utils import is_cp_enabled
+
+        if not is_cp_enabled():
+            cp_align_size = get_cp_padding_align_size()
+            for i in range(sync_group_size):
+                global_num_tokens[i] = ceil_align(global_num_tokens[i], cp_align_size)
+
         dp_padding_mode = DpPaddingMode.get_dp_padding_mode(
             self.is_extend_in_batch, global_num_tokens
         )

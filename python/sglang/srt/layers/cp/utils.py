@@ -258,10 +258,20 @@ def cp_materialize_global_token_order(
     x: Any, forward_batch, stream: Optional[Any] = None
 ):
     """Materialize a CP tensor in the global logical token order."""
-    assert is_cp_active(forward_batch)
-    strategy = get_cp_strategy()
-    assert strategy is not None
-    return strategy.gather_kv_cache(x, forward_batch, stream)
+    if is_cp_active(forward_batch):
+        strategy = get_cp_strategy()
+        assert strategy is not None
+        return strategy.gather_kv_cache(x, forward_batch, stream)
+
+    # PPU keeps the V2 strategy dormant (init_cp_strategy) and runs prefill CP
+    # on the legacy V1 path, whose layers call this helper with the V1
+    # attn_cp_metadata marker installed by can_dsa_cp_split; route those
+    # gathers through the V1 rerange instead of asserting.
+    from sglang.srt.layers.utils.cp_utils import cp_all_gather_rerange_output
+
+    return cp_all_gather_rerange_output(
+        x, get_parallel().attn_cp_size, forward_batch, stream
+    )
 
 
 @contextmanager
