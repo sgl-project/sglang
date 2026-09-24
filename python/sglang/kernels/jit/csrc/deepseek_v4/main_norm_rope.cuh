@@ -79,7 +79,12 @@ struct FusedQNormRopeParams {
   float eps;
 };
 
-template <typename DType, int64_t kHeadDim, int64_t kRopeDim, typename PosT, bool kUsePDL>
+// kFp8Out: store the normed+roped output as plain e4m3 (per-tensor scale
+// 1.0) instead of DType, bit-identical to a DType store followed by
+// `.to(float8_e4m3fn)` -- the trtllm-gen backend consumes q as fp8, so
+// this removes its separate per-layer cast pass. The caller passes
+// q_output as a uint8 view of the e4m3 tensor.
+template <typename DType, int64_t kHeadDim, int64_t kRopeDim, typename PosT, bool kUsePDL, bool kFp8Out = false>
 Q_KERNEL void fused_q_norm_rope(const __grid_constant__ FusedQNormRopeParams params) {
   using namespace device;
 
@@ -104,10 +109,11 @@ Q_KERNEL void fused_q_norm_rope(const __grid_constant__ FusedQNormRopeParams par
 
   const uint32_t batch_id = work_id / params.num_q_heads;
   const uint32_t head_id = work_id % params.num_q_heads;
+  using OutT = std::conditional_t<kFp8Out, uint8_t, DType>;
   const auto input_ptr =
       static_cast<const DType*>(params.q_input) + batch_id * params.q_input_stride_batch + head_id * kHeadDim;
   const auto output_ptr =
-      static_cast<DType*>(params.q_output) + batch_id * params.q_output_stride_batch + head_id * kHeadDim;
+      static_cast<OutT*>(params.q_output) + batch_id * params.q_output_stride_batch + head_id * kHeadDim;
   const auto position = static_cast<int32_t>(static_cast<const PosT*>(params.positions)[batch_id]);
 
   __shared__ Storage s_rope[kFusedQNumWarps][kRopeSize];
@@ -151,12 +157,22 @@ Q_KERNEL void fused_q_norm_rope(const __grid_constant__ FusedQNormRopeParams par
 
   // Stash the rope tail (last kRopeSize lanes' last tile) into shared memory;
   // write nope tiles to gmem directly.
+  using OutStorage = AlignedVector<OutT, kVecSize>;
+  const auto gmem_out = tile::Memory<OutStorage>{lane_id, kWarpThreads};
   const bool is_rope_lane = lane_id >= kWarpThreads - kRopeSize;
 #pragma unroll
   for (int i = 0; i < kLocalSize; ++i) {
     if (i == kLocalSize - 1 && is_rope_lane) {
       const auto rope_id = lane_id - (kWarpThreads - kRopeSize);
       s_rope[warp_id][rope_id] = input_vec[i];
+    } else if constexpr (kFp8Out) {
+      OutStorage out_vec;
+#pragma unroll
+      for (int j = 0; j < kVecSize; j += 2) {
+        const auto p = pack_fp8(cast<float>(input_vec[i][j]), cast<float>(input_vec[i][j + 1]));
+        *reinterpret_cast<fp8x2_e4m3_t*>(&out_vec[j]) = p;
+      }
+      gmem_out.store(output_ptr, out_vec, i);
     } else {
       gmem.store(output_ptr, input_vec[i], i);
     }
@@ -175,13 +191,22 @@ Q_KERNEL void fused_q_norm_rope(const __grid_constant__ FusedQNormRopeParams par
       x_real * freq_real - x_imag * freq_imag,
       x_real * freq_imag + x_imag * freq_real,
   };
-  mem_elem.store(output_ptr + (kHeadDim - kRopeDim), cast<DType2>(rotated));
+  if constexpr (kFp8Out) {
+    // DType round-trip first so the stored bits match the unfused
+    // DType-store -> .to(e4m3) sequence exactly.
+    const auto [bx, by] = cast<fp32x2_t>(cast<DType2>(rotated));
+    tile::Memory<fp8x2_e4m3_t>{lane_id, kWarpThreads}.store(output_ptr + (kHeadDim - kRopeDim), pack_fp8(bx, by));
+  } else {
+    mem_elem.store(output_ptr + (kHeadDim - kRopeDim), cast<DType2>(rotated));
+  }
 }
 
-template <typename DType, int64_t kHeadDim, int64_t kRopeDim, bool kUsePDL>
+template <typename DType, int64_t kHeadDim, int64_t kRopeDim, bool kUsePDL, bool kFp8Out = false>
 struct FusedQNormRopeKernel {
   template <typename PosT>
-  static constexpr auto kernel = fused_q_norm_rope<DType, kHeadDim, kRopeDim, PosT, kUsePDL>;
+  static constexpr auto kernel = fused_q_norm_rope<DType, kHeadDim, kRopeDim, PosT, kUsePDL, kFp8Out>;
+  // e4m3 output is passed as a uint8 view (index_put/FFI have no fp8 dtype).
+  using OutT = std::conditional_t<kFp8Out, uint8_t, DType>;
 
   static void forward(
       const tvm::ffi::TensorView q_input,
@@ -203,7 +228,7 @@ struct FusedQNormRopeKernel {
         .verify(q_input);
     TensorMatcher({B, H, kHeadDim})  //
         .with_strides({-1, kHeadDim, 1})
-        .with_dtype<DType>()
+        .with_dtype<OutT>()
         .with_device(device_)
         .verify(q_output);
     TensorMatcher({-1, kRopeDim})  //
@@ -267,13 +292,19 @@ template <
     typename PosT,
     int32_t kPageBits,
     deepseek_v4::KVLayout kLayout,
-    bool kUsePDL>
+    bool kUsePDL,
+    bool kUniformStore = false>
 K_KERNEL void fused_k_norm_rope_flashmla(const __grid_constant__ FusedKNormRopeFlashMLAParams params) {
   using namespace device;
 
   constexpr int64_t kVecSize = 2;
   constexpr uint32_t kRopeWarp = kFusedKNumWarps - 1;
   using Paged = deepseek_v4::PagedKV<kLayout, kPageBits>;
+  // kUniformStore: write the whole head_dim (rope tail included) as plain
+  // e4m3 at per-tensor scale 1.0 into the uniform 512-byte-per-token pool
+  // (trtllm backend), instead of the packed 584-byte FlashMLA layout.
+  static_assert(!(kUniformStore && kLayout != deepseek_v4::KVLayout::V4), "the uniform fp8 store is a V4 cache");
+  constexpr int64_t kUniformPageBytes = kHeadDim << kPageBits;
   static_assert(kHeadDim == kFusedKBlockSize * kVecSize);
   static_assert(kRopeDim == kWarpThreads * kVecSize);
   static_assert(kHeadDim - kRopeDim == kRopeWarp * kWarpThreads * kVecSize);
@@ -354,9 +385,38 @@ K_KERNEL void fused_k_norm_rope_flashmla(const __grid_constant__ FusedKNormRopeF
     return deepseek_v4::v41::store_row<kLayout>(row.data, row.scale, tx, v);
   }
 
-  const auto value_ptr = row.data;
+  // Uniform 512 B rows are paged by kUniformPageBytes and addressed directly; the V4
+  // packed layout goes through the paged helper.
+  uint8_t* value_ptr = nullptr;
+  if constexpr (kUniformStore) {
+    const int64_t page = out_loc >> kPageBits;
+    const int64_t offset = out_loc & ((1 << kPageBits) - 1);
+    value_ptr = params.kvcache + page * kUniformPageBytes + offset * kHeadDim;
+  } else {
+    value_ptr = row.data;
+  }
 
   PDLTriggerSecondary<kUsePDL>();
+
+  if constexpr (kUniformStore) {
+    // Uniform pool: every warp stores its 2 elems as plain e4m3 (rope warp
+    // applies RoPE first). BF16 round-trip to match the unfused path
+    // (Triton norm+rope emits bf16, then the pool store casts bf16 -> e4m3
+    // at per-tensor scale 1.0).
+    Float2 d = data;
+    if (warp_id == kRopeWarp) {
+      const auto x_real = data[0];
+      const auto x_imag = data[1];
+      const auto freq_real = freq[0];
+      const auto freq_imag = freq[1];
+      d[0] = x_real * freq_real - x_imag * freq_imag;
+      d[1] = x_real * freq_imag + x_imag * freq_real;
+    }
+    const auto x = cast<float>(cast<bf16_t>(d[0]));
+    const auto y = cast<float>(cast<bf16_t>(d[1]));
+    reinterpret_cast<fp8x2_e4m3_t*>(value_ptr)[tx] = pack_fp8(x, y);
+    return;
+  }
 
   // part 2: rope on warp 7 (BF16 store), per-warp UE8M0 quant + store on warps 0..6.
   if (warp_id == kRopeWarp) {
@@ -389,18 +449,23 @@ template <
     int64_t kRopeDim,
     uint32_t kPageSize,
     deepseek_v4::KVLayout kLayout,
-    bool kUsePDL>
+    bool kUsePDL,
+    bool kUniformStore = false>
 struct FusedKNormRopeFlashMLAKernel {
   static constexpr int32_t kLogPageSize = std::countr_zero(kPageSize);
-  static constexpr int64_t kPageBytes = deepseek_v4::kv_page_bytes<kLayout>(kPageSize);
-  static_assert(kLayout != deepseek_v4::KVLayout::V4 || kPageBytes == host::div_ceil(584 * kPageSize, 576) * 576);
+  static_assert(!(kUniformStore && kLayout != deepseek_v4::KVLayout::V4), "the uniform fp8 store is a V4 cache");
+  static constexpr int64_t kPageBytes =
+      kUniformStore ? (kHeadDim * kPageSize) : deepseek_v4::kv_page_bytes<kLayout>(kPageSize);
+  static_assert(
+      kLayout != deepseek_v4::KVLayout::V4 || kUniformStore ||
+      kPageBytes == host::div_ceil(584 * kPageSize, 576) * 576);
   static_assert(std::has_single_bit(kPageSize), "kPageSize must be a power of 2");
   static_assert(1 << kLogPageSize == kPageSize);
   static_assert(kHeadDim == 512 && kRopeDim == 64, "FlashMLA layout requires (512, 64)");
 
   template <typename PosT>
   static constexpr auto kernel =
-      fused_k_norm_rope_flashmla<DType, kHeadDim, kRopeDim, PosT, kLogPageSize, kLayout, kUsePDL>;
+      fused_k_norm_rope_flashmla<DType, kHeadDim, kRopeDim, PosT, kLogPageSize, kLayout, kUsePDL, kUniformStore>;
 
   static void forward(
       const tvm::ffi::TensorView kv,
