@@ -8,10 +8,15 @@ from sglang.srt.function_call.base_format_detector import BaseFormatDetector
 from sglang.srt.function_call.core_types import (
     StreamingParseResult,
     StructureInfo,
+    ToolCallItem,
     _GetInfoFunc,
 )
 
 logger = logging.getLogger(__name__)
+
+# Upper bound for the end-of-stream drain: each round releases at most one
+# pending unit (a tool name or one argument diff).
+_MAX_FINISH_DRAIN_ROUNDS = 1024
 
 
 class Qwen25Detector(BaseFormatDetector):
@@ -111,6 +116,40 @@ class Qwen25Detector(BaseFormatDetector):
                     self._normal_text_buffer = ""
 
         return result
+
+    def finish(self, tools: List[Tool]) -> StreamingParseResult:
+        """Release state the last delta left pending.
+
+        The base implementation emits the tool name first and its arguments on a
+        later call, so a delta carrying a complete call leaves the arguments
+        pending -- and when that delta was the last one (multi-token deltas from
+        speculative decoding / MTP, ``stream_interval > 1``, or a short call
+        generated in one step) the call reached the client with empty arguments,
+        or later calls were dropped entirely, while detect_and_parse returned
+        them in full.
+
+        Re-running the parser with an empty delta drains that queue. Text the
+        detector held back because a partial end token could still arrive is
+        released too: the stream is over, so it never will.
+        """
+        normal_parts: List[str] = []
+        calls: List[ToolCallItem] = []
+        for _ in range(_MAX_FINISH_DRAIN_ROUNDS):
+            result = self.parse_streaming_increment("", tools)
+            if not result.calls and not result.normal_text:
+                break
+            if result.calls:
+                calls.extend(result.calls)
+            if result.normal_text:
+                normal_parts.append(result.normal_text)
+
+        if self._normal_text_buffer:
+            pending, self._normal_text_buffer = self._normal_text_buffer, ""
+            pending = pending.replace(self.eot_token[1:], "")
+            if pending:
+                normal_parts.append(pending)
+
+        return StreamingParseResult(normal_text="".join(normal_parts), calls=calls)
 
     def structure_info(self) -> _GetInfoFunc:
         return lambda name: StructureInfo(
