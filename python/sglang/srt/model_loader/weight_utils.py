@@ -1169,6 +1169,13 @@ def instanttensor_weights_iterator(
     extra_config: Optional[dict] = None,
 ) -> Generator[Tuple[str, torch.Tensor], None, None]:
     """Iterate over Safetensors weights with InstantTensor."""
+    unsupported_files = [f for f in hf_weights_files if not f.endswith(".safetensors")]
+    if unsupported_files:
+        raise ValueError(
+            "InstantTensor only supports .safetensors checkpoints; "
+            f"unsupported files: {unsupported_files}"
+        )
+
     try:
         import instanttensor
     except ImportError as e:

@@ -344,6 +344,8 @@ def _validate_default_loader_extra_config(
     *, extra_config: dict, load_format: LoadFormat
 ) -> None:
     if load_format == LoadFormat.INSTANTTENSOR:
+        # Pass extra config directly to InstantTensor and let it report invalid
+        # options, so newer versions can add parameters without a SGLang update.
         return
 
     allowed_keys = {"enable_multithread_load", "num_threads"}
