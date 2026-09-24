@@ -4,7 +4,10 @@ from unittest.mock import patch
 import torch
 
 from sglang.kernels.ops.attention.dsv4.fp4_indexer import quantize_fp4_indexer_tensor
-from sglang.srt.layers.attention.dsv4 import dense_prefill_indexer
+from sglang.srt.layers.attention.dsv4.low_ratio_indexer import (
+    deep_gemm_backend,
+    deep_gemm_utils,
+)
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -46,6 +49,42 @@ def make_inputs(request_lengths, ratio=1, zero_queries=False, seed=17):
         candidate_topk_blocks=2,
         candidate_block_size=8,
     )
+
+
+def run_dense(inputs, *, publish_candidates, candidates):
+    """The plain top-k, or the CP source's own top-k plus its candidate blocks
+    (`publish_candidates`), or a CP consumer's top-k among `candidates`."""
+    data = deep_gemm_utils.DeepGEMMPrefillData(
+        k_slots=torch.arange(inputs["kv"][0].shape[0], device="cuda"),
+        request_starts=inputs["starts"],
+        lens_per_request=[n for _, n in inputs["request_lengths"]],
+        rows_per_request=[q for q, _ in inputs["request_lengths"]],
+        compress_lens=inputs["lengths"],
+        q_fp4=inputs["q"][0],
+        q_sf=inputs["q"][1],
+        weights=inputs["weights"],
+    )
+    if publish_candidates:
+        selected, blocks = deep_gemm_backend._publish_prefill_blocks(
+            data=data,
+            kv=inputs["kv"],
+            topk=inputs["topk"],
+            topk_blocks=inputs["candidate_topk_blocks"],
+            block_size=inputs["candidate_block_size"],
+        )
+        return selected, deep_gemm_backend._DensePrefillBlocks(request_blocks=blocks)
+    if candidates is not None:
+        selected = deep_gemm_backend._consume_prefill_blocks(
+            data=data,
+            kv=inputs["kv"],
+            topk=inputs["topk"],
+            request_blocks=candidates.request_blocks,
+            block_size=inputs["candidate_block_size"],
+        )
+        return selected, None
+    return deep_gemm_utils.dense_prefill_topk(
+        data, inputs["kv"], topk=inputs["topk"]
+    ), None
 
 
 def dense_scores(inputs):
@@ -121,10 +160,10 @@ class TestDensePrefillIndexer(CustomTestCase):
                     consumer_inputs["candidate_topk_blocks"] = 128
                     consumer_scores = dense_scores(consumer_inputs)
                     with patch.object(
-                        dense_prefill_indexer, "_SCORE_BUDGET_BYTES", 128 << 10
+                        deep_gemm_utils, "_SCORE_BUDGET_BYTES", 128 << 10
                     ):
-                        selected, candidates = dense_prefill_indexer.dense_prefill_topk(
-                            **inputs, publish_candidates=True, candidates=None
+                        selected, candidates = run_dense(
+                            inputs, publish_candidates=True, candidates=None
                         )
                         self.assert_topk(inputs, selected, scores)
                         row = 0
@@ -173,8 +212,8 @@ class TestDensePrefillIndexer(CustomTestCase):
                             torch.isfinite(consumer_scores[-1]).sum().item(),
                             inputs["lengths"][-1].item(),
                         )
-                        selected, published = dense_prefill_indexer.dense_prefill_topk(
-                            **consumer_inputs,
+                        selected, published = run_dense(
+                            consumer_inputs,
                             publish_candidates=False,
                             candidates=candidates,
                         )
@@ -201,8 +240,8 @@ class TestDensePrefillIndexer(CustomTestCase):
                                 )
                             ),
                         )
-                        selected, _ = dense_prefill_indexer.dense_prefill_topk(
-                            **tail_inputs,
+                        selected, _ = run_dense(
+                            tail_inputs,
                             publish_candidates=False,
                             candidates=candidates.tail(tail_lengths),
                         )
@@ -213,8 +252,8 @@ class TestDensePrefillIndexer(CustomTestCase):
             for publish in (False, True):
                 with self.subTest(request_lengths=request_lengths, publish=publish):
                     inputs = make_inputs(request_lengths)
-                    selected, candidates = dense_prefill_indexer.dense_prefill_topk(
-                        **inputs, publish_candidates=publish, candidates=None
+                    selected, candidates = run_dense(
+                        inputs, publish_candidates=publish, candidates=None
                     )
                     self.assert_topk(inputs, selected, dense_scores(inputs))
                     if publish:
@@ -232,8 +271,8 @@ class TestDensePrefillIndexer(CustomTestCase):
         ):
             with self.subTest(request_lengths=request_lengths):
                 inputs = make_inputs(request_lengths)
-                selected, candidates = dense_prefill_indexer.dense_prefill_topk(
-                    **inputs, publish_candidates=True, candidates=None
+                selected, candidates = run_dense(
+                    inputs, publish_candidates=True, candidates=None
                 )
                 torch.testing.assert_close(
                     selected, torch.full(shape, -1, dtype=torch.int32, device="cuda")
@@ -258,11 +297,11 @@ class TestDensePrefillIndexer(CustomTestCase):
                     return logits
 
                 with (
-                    patch.object(dense_prefill_indexer, "_SCORE_BUDGET_BYTES", budget),
+                    patch.object(deep_gemm_utils, "_SCORE_BUDGET_BYTES", budget),
                     patch("deep_gemm.fp8_fp4_mqa_logits", new=checked_logits),
                 ):
-                    selected, _ = dense_prefill_indexer.dense_prefill_topk(
-                        **inputs, publish_candidates=True, candidates=None
+                    selected, _ = run_dense(
+                        inputs, publish_candidates=True, candidates=None
                     )
                 self.assertTrue(allocations)
                 self.assertLessEqual(max(allocations), budget)
@@ -276,8 +315,8 @@ class TestDensePrefillIndexer(CustomTestCase):
                 torch.cuda.synchronize()
                 torch.cuda.reset_peak_memory_stats()
                 baseline = torch.cuda.memory_allocated()
-                selected, candidates = dense_prefill_indexer.dense_prefill_topk(
-                    **inputs, publish_candidates=True, candidates=None
+                selected, candidates = run_dense(
+                    inputs, publish_candidates=True, candidates=None
                 )
                 torch.cuda.synchronize()
                 self.assertLess(
@@ -288,8 +327,8 @@ class TestDensePrefillIndexer(CustomTestCase):
                     tuple(candidates.request_blocks[0].shape), (16384, 2048)
                 )
                 del selected
-                selected, published = dense_prefill_indexer.dense_prefill_topk(
-                    **inputs, publish_candidates=False, candidates=candidates
+                selected, published = run_dense(
+                    inputs, publish_candidates=False, candidates=candidates
                 )
                 self.assertIsNone(published)
                 del selected
@@ -297,8 +336,8 @@ class TestDensePrefillIndexer(CustomTestCase):
                 baseline = torch.cuda.memory_allocated()
                 for _ in range(3):
                     torch.cuda.reset_peak_memory_stats()
-                    selected, published = dense_prefill_indexer.dense_prefill_topk(
-                        **inputs, publish_candidates=False, candidates=candidates
+                    selected, published = run_dense(
+                        inputs, publish_candidates=False, candidates=candidates
                     )
                     torch.cuda.synchronize()
                     self.assertIsNone(published)

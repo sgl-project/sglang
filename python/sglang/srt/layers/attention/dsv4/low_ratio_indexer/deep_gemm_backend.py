@@ -632,8 +632,8 @@ def _publish_prefill_blocks(
     topk_blocks: int,
     block_size: int,
 ) -> Tuple[torch.Tensor, List[torch.Tensor]]:
-    """The source 's own plain top-k, plus the ids of its best blocks per
-    request: ``[rows_b, layermin(topk_blocks, ceil(lc_b / block_size))]`` int32 each."""
+    """The source layer's own plain top-k, plus the ids of its best blocks per
+    request: ``[rows_b, min(topk_blocks, ceil(lc_b / block_size))]`` int32 each."""
     from sglang.kernels.ops.attention.dsv4 import topk_transform_ragged_v2
 
     selected = data.empty_selection(topk)
@@ -647,29 +647,48 @@ def _publish_prefill_blocks(
         for rows, lc in zip(data.rows_per_request, data.lens_per_request)
     ]
     for tile, logits in score_tiles(data, kv, width_align=4):
-        lens = data.compress_lens[tile]
-        for request, rows, request_rows, lc in _requests_in_tile(data, tile):
-            scores = logits[rows, :lc]
-            scores.masked_fill_(
-                torch.arange(lc, device=device)[None, :] >= lens[rows, None],
-                -torch.inf,
-            )
-            blocks = request_blocks[request][request_rows]
-            blocks.copy_(
-                select_candidate_block_ids(
-                    logits=scores,
-                    compress_lens=lens[rows, None],
-                    topk_blocks=blocks.shape[1],
-                    block_size=block_size,
-                )
-            )
+        _publish_tile_blocks(
+            data=data,
+            tile=tile,
+            logits=logits,
+            request_blocks=request_blocks,
+            block_size=block_size,
+        )
         topk_transform_ragged_v2(
             logits,
-            lens,
+            data.compress_lens[tile],
             out_offsets=data.request_starts[tile],
             out_indices=selected[tile],
         )
+        # Free this tile's logits before the generator scores the next one.
+        del logits
     return selected, request_blocks
+
+
+def _publish_tile_blocks(
+    *,
+    data: DeepGEMMPrefillData,
+    tile: slice,
+    logits: torch.Tensor,
+    request_blocks: List[torch.Tensor],
+    block_size: int,
+) -> None:
+    lens = data.compress_lens[tile]
+    for request, rows, request_rows, lc in _requests_in_tile(data, tile):
+        scores = logits[rows, :lc]
+        scores.masked_fill_(
+            torch.arange(lc, device=logits.device)[None, :] >= lens[rows, None],
+            -torch.inf,
+        )
+        blocks = request_blocks[request][request_rows]
+        blocks.copy_(
+            select_candidate_block_ids(
+                logits=scores,
+                compress_lens=lens[rows, None],
+                topk_blocks=blocks.shape[1],
+                block_size=block_size,
+            )
+        )
 
 
 def _consume_prefill_blocks(
@@ -704,6 +723,8 @@ def _consume_prefill_blocks(
         selected[tile] = mask_topk_scores(
             scores=logits, indices=selected[tile], offsets=starts
         )
+        # Free this tile's logits before the generator scores the next one.
+        del logits
     return selected
 
 

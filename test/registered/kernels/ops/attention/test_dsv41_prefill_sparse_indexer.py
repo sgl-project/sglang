@@ -8,12 +8,11 @@ import msgspec
 import torch
 
 from sglang.kernels.ops.attention.dsv4.fp4_indexer import quantize_fp4_indexer_tensor
-from sglang.srt.layers.attention.dsv4.candidate_indexer import (
-    PrefillIndexerInputs,
+from sglang.srt.layers.attention.dsv4.low_ratio_indexer.block_math import (
     select_candidate_blocks,
 )
-from sglang.srt.layers.attention.dsv4.dense_prefill_indexer import (
-    DenseCandidateIndexer,
+from sglang.srt.layers.attention.dsv4.low_ratio_indexer.deep_gemm_utils import (
+    DeepGEMMPrefillData,
 )
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
@@ -37,7 +36,10 @@ MIN_TAIL_OVERLAP = 0.98
 class Case(NamedTuple):
     dense: torch.Tensor  # fp32 [rows, width] scores of every row against its context
     lens: torch.Tensor  # [rows] int32 causal lengths
-    inputs: PrefillIndexerInputs
+    data: DeepGEMMPrefillData
+    kv: tuple  # the flattened index K (int8 [n, 64], int32 [n])
+    k_cache: torch.Tensor  # [pages, PAGE, 1, 68] uint8, the index-K pool
+    page_table: torch.Tensor  # [rows, pages] int32 at PAGE slots
 
 
 def make_case(rows, ctx, seed) -> Case:
@@ -77,38 +79,35 @@ def make_case(rows, ctx, seed) -> Case:
         False,
         width,
     )
-    inputs = PrefillIndexerInputs(
-        q_fp4=q_fp4,
-        q_sf=q_sf,
-        weights=weights,
-        compress_lens=lens,
+    data = DeepGEMMPrefillData(
+        k_slots=torch.arange(width, device=dev),
         request_starts=starts,
         lens_per_request=[ctx],
         rows_per_request=[rows],
-        kv=(k_fp4[:width], k_sf[:width]),
-        k_cache=k_cache,
-        page_size=PAGE,
-        # KV pages of PAGE tokens at ratio 1: the index page table is the KV one
-        kv_page_table=torch.arange(n_pages, device=dev, dtype=torch.int32)
-        .expand(rows, -1)
-        .contiguous(),
-        kv_page_size=PAGE,
-        compress_ratio=1,
+        compress_lens=lens,
+        q_fp4=q_fp4,
+        q_sf=q_sf,
+        weights=weights,
     )
-    return Case(dense, lens, inputs)
+    # KV pages of PAGE tokens at ratio 1: the index page table is the KV one
+    page_table = (
+        torch.arange(n_pages, device=dev, dtype=torch.int32)
+        .expand(rows, -1)
+        .contiguous()
+    )
+    return Case(dense, lens, data, (k_fp4[:width], k_sf[:width]), k_cache, page_table)
 
 
-def rows_of(inputs: PrefillIndexerInputs, idx: torch.Tensor) -> PrefillIndexerInputs:
-    """The inputs of a subset of rows (one request)."""
+def rows_of(data: DeepGEMMPrefillData, idx: torch.Tensor) -> DeepGEMMPrefillData:
+    """The operands of a subset of rows (one request)."""
     return msgspec.structs.replace(
-        inputs,
-        q_fp4=inputs.q_fp4[idx],
-        q_sf=inputs.q_sf[idx],
-        weights=inputs.weights[idx],
-        compress_lens=inputs.compress_lens[idx],
-        request_starts=inputs.request_starts[idx],
+        data,
+        q_fp4=data.q_fp4[idx],
+        q_sf=data.q_sf[idx],
+        weights=data.weights[idx],
+        compress_lens=data.compress_lens[idx],
+        request_starts=data.request_starts[idx],
         rows_per_request=[idx.numel()],
-        kv_page_table=inputs.kv_page_table[idx],
     )
 
 
@@ -122,18 +121,64 @@ def reference_blocks(case: Case) -> torch.Tensor:
     return keep.unflatten(1, (-1, BLOCK)).any(-1)
 
 
-def publish(indexer, inputs):
-    """(published metadata, the source layer's own top-k)."""
-    own = torch.full((inputs.num_rows, TOPK), -1, dtype=torch.int32, device="cuda")
-    return indexer.publish_prefill(inputs, own), own
-
-
-def select(indexer, published, inputs):
-    positions = torch.full(
-        (inputs.num_rows, TOPK), -1, dtype=torch.int32, device="cuda"
+def publish_sparse(case: Case):
+    """(the DeepGEMM sparse table, the source layer's own top-k)."""
+    from sglang.srt.layers.attention.dsv4.low_ratio_indexer.deep_gemm_backend import (
+        publish_prefill_table,
     )
-    indexer.select_prefill(published, inputs, positions)
+
+    own = case.data.empty_selection(TOPK)
+    table = publish_prefill_table(
+        data=case.data,
+        kv=case.kv,
+        index_page_table=case.page_table,
+        index_page_size=PAGE,
+        topk_blocks=TOPK_BLOCKS,
+        out_positions=own,
+    )
+    return table, own
+
+
+def select_sparse(table, data: DeepGEMMPrefillData, k_cache: torch.Tensor):
+    from sglang.srt.layers.attention.dsv4.low_ratio_indexer.deep_gemm_backend import (
+        select_prefill_table,
+    )
+
+    positions = data.empty_selection(TOPK)
+    select_prefill_table(
+        table=table, data=data, k_cache=k_cache, out_positions=positions
+    )
     return positions
+
+
+def publish_dense(case: Case):
+    """(the CP implementation's block ids, the source layer's own top-k)."""
+    from sglang.srt.layers.attention.dsv4.low_ratio_indexer.deep_gemm_backend import (
+        _publish_prefill_blocks,
+    )
+
+    own, blocks = _publish_prefill_blocks(
+        data=case.data,
+        kv=case.kv,
+        topk=TOPK,
+        topk_blocks=TOPK_BLOCKS,
+        block_size=BLOCK,
+    )
+    return blocks, own
+
+
+def select_dense(blocks, case: Case):
+    from sglang.srt.layers.attention.dsv4.low_ratio_indexer.deep_gemm_backend import (
+        _consume_prefill_blocks,
+    )
+
+    return _consume_prefill_blocks(
+        data=case.data,
+        kv=case.kv,
+        topk=TOPK,
+        request_blocks=blocks,
+        block_size=BLOCK,
+    )
 
 
 def picks(positions: torch.Tensor, row: int) -> set:
@@ -145,14 +190,6 @@ def picks(positions: torch.Tensor, row: int) -> set:
     "DeepGEMM's paged sparse MQA logits need SM100",
 )
 class TestPrefillSparseIndexer(CustomTestCase):
-    def setUp(self):
-        from sglang.srt.layers.attention.dsv4.candidate_indexer_deep_gemm import (
-            DeepGemmCandidateIndexer,
-        )
-
-        self.sparse = DeepGemmCandidateIndexer(TOPK_BLOCKS, BLOCK)
-        self.dense = DenseCandidateIndexer(TOPK_BLOCKS, BLOCK)
-
     @torch.inference_mode()
     def test_publish_prefill_is_the_torch_block_selection(self):
         """The published blocks equal `select_candidate_blocks` block for block
@@ -161,7 +198,7 @@ class TestPrefillSparseIndexer(CustomTestCase):
         for rows, ctx in CASES:
             with self.subTest(rows=rows, ctx=ctx):
                 case = make_case(rows, ctx, seed=rows + ctx)
-                table, own = publish(self.sparse, case.inputs)
+                table, own = publish_sparse(case)
                 expected = reference_blocks(case)
                 nb = expected.shape[1]
                 # INT32_MAX padding lands in a spare column instead of a block
@@ -169,7 +206,7 @@ class TestPrefillSparseIndexer(CustomTestCase):
                 got.scatter_(1, table.blocks.clamp_max(nb).long(), True)
                 self.assertTrue(torch.equal(got[:, :nb], expected))
                 self.assertFalse(got[0, :nb].any(), "an empty row keeps no block")
-                _, own_dense = publish(self.dense, case.inputs)
+                _, own_dense = publish_dense(case)
                 for r in range(rows):
                     self.assertEqual(picks(own, r), picks(own_dense, r), r)
 
@@ -181,12 +218,8 @@ class TestPrefillSparseIndexer(CustomTestCase):
         for rows, ctx in CASES:
             with self.subTest(rows=rows, ctx=ctx):
                 case = make_case(rows, ctx, seed=rows * 3 + ctx)
-                got = select(
-                    self.sparse, publish(self.sparse, case.inputs)[0], case.inputs
-                )
-                want = select(
-                    self.dense, publish(self.dense, case.inputs)[0], case.inputs
-                )
+                got = select_sparse(publish_sparse(case)[0], case.data, case.k_cache)
+                want = select_dense(publish_dense(case)[0], case)
                 keep = reference_blocks(case).repeat_interleave(BLOCK, dim=1)
                 self.assertEqual(picks(got, 0), set(), "an empty row selects nothing")
                 for r in range(1, rows):
@@ -211,15 +244,15 @@ class TestPrefillSparseIndexer(CustomTestCase):
         what the full table selects for those rows."""
         rows, tail = 128, 16
         case = make_case(rows, 20000, seed=7)
-        table, _ = publish(self.sparse, case.inputs)
+        table, _ = publish_sparse(case)
         idx = torch.arange(rows - tail, rows, device="cuda")
-        sub = self.sparse.prefill_tail(table, [tail])
+        sub = table.tail([tail])
         self.assertTrue(torch.equal(sub.blocks, table.blocks[idx]))
         self.assertTrue(torch.equal(sub.valid_lens, table.valid_lens[idx]))
         self.assertTrue(torch.equal(sub.compress_lens, table.compress_lens[idx]))
 
-        full = select(self.sparse, table, case.inputs)
-        part = select(self.sparse, sub, rows_of(case.inputs, idx))
+        full = select_sparse(table, case.data, case.k_cache)
+        part = select_sparse(sub, rows_of(case.data, idx), case.k_cache)
         for r in range(tail):
             a, b = picks(full, rows - tail + r), picks(part, r)
             self.assertGreaterEqual(len(a & b), MIN_TAIL_OVERLAP * len(a), r)

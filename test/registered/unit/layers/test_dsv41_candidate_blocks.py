@@ -2,11 +2,13 @@ import unittest
 
 import torch
 
-from sglang.srt.layers.attention.dsv4.candidate_indexer import (
-    PrefillCandidateBlocks,
+from sglang.srt.layers.attention.dsv4.low_ratio_indexer.block_math import (
     candidate_block_mask,
     select_candidate_block_ids,
     select_candidate_blocks,
+)
+from sglang.srt.layers.attention.dsv4.low_ratio_indexer.deep_gemm_backend import (
+    _DensePrefillBlocks,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -63,7 +65,7 @@ class TestPrefillCandidateBlocks(CustomTestCase):
 
     def test_replay_tail_keeps_request_boundaries_and_empty_tails(self):
         requests = [torch.arange(n * 2).reshape(n, 2) for n in (5, 0, 3)]
-        candidates = PrefillCandidateBlocks(request_blocks=requests)
+        candidates = _DensePrefillBlocks(request_blocks=requests)
         tail = candidates.tail([2, 0, 0])
         self.assertEqual(
             [tuple(b.shape) for b in tail.request_blocks], [(2, 2), (0, 2), (0, 2)]

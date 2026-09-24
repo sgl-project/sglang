@@ -266,6 +266,8 @@ def dense_prefill_topk(
             out_offsets=data.request_starts[tile],
             out_indices=selected[tile],
         )
+        # Free this tile's logits before the generator scores the next one.
+        del logits
     return selected
 
 

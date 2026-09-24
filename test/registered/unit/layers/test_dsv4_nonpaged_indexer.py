@@ -908,47 +908,93 @@ class TestChunkedTopKMatchesUnchunked(CustomTestCase):
                 self.assertTrue(torch.equal(run(rows_per_chunk), expected))
 
 
-class TestChunkedCandidatePublisher(CustomTestCase):
-    def test_each_deep_gemm_call_receives_one_tensor_schedule(self):
-        from sglang.srt.layers.attention.dsv4 import candidate_indexer_deep_gemm as mod
+class TestChunkedPagedDecode(CustomTestCase):
+    """An eager decode whose paged-MQA metadata is split into row chunks (#40637):
+    every DeepGEMM call must get its own chunk's schedule and every top-k its own
+    rows and plan, in the candidate publisher and in the dense indexer alike."""
 
-        num_rows, width = 5, 16
-        chunks = [slice(0, 2), slice(2, 4), slice(4, 5)]
-        plans = [torch.tensor([i], dtype=torch.uint8) for i in range(len(chunks))]
-        topk_plans = [torch.tensor([i], dtype=torch.int32) for i in range(len(chunks))]
+    num_rows, width = 5, 16
+    chunks = [slice(0, 2), slice(2, 4), slice(4, 5)]
+
+    def _inputs(self):
+        from sglang.srt.layers.attention.dsv4.low_ratio_indexer import DecodeInputs
+        from sglang.srt.layers.attention.dsv4.low_ratio_indexer.deep_gemm_utils import (
+            DeepGEMMDecodeData,
+        )
+
+        num_rows, width = self.num_rows, self.width
+        self.plans = [torch.tensor([i], dtype=torch.uint8) for i in range(3)]
+        self.topk_plans = [torch.tensor([i], dtype=torch.int32) for i in range(3)]
         metadata = SimpleNamespace(
             compressed_seq_lens=torch.full((num_rows, 1), width, dtype=torch.int32),
             page_table=torch.zeros((num_rows, 1), dtype=torch.int32),
-            deep_gemm_metadata=plans,
+            deep_gemm_metadata=self.plans,
             max_compressed_seq_len=width,
             compressed_page_size=64,
-            topk_metadata_chunks=topk_plans,
+            topk_metadata_chunks=self.topk_plans,
             use_topk_v2=True,
-            row_chunks=lambda: list(zip(chunks, plans)),
+            row_chunks=lambda: list(zip(self.chunks, self.plans)),
         )
-        inputs = SimpleNamespace(
+        inputs = DecodeInputs(
+            indexer=None,
+            layer_id=0,
+            compress_ratio=1,
+            freqs_cis=None,
+            x=None,
+            q_lora=None,
+            positions=None,
+            req_rows=torch.arange(num_rows),
+            paged_metadata=metadata,
+            is_verify=True,
+        )
+        data = DeepGEMMDecodeData(
             q_fp4=torch.zeros((num_rows, 1, 2, 64), dtype=torch.int8),
             q_sf=torch.zeros((num_rows, 1, 2), dtype=torch.int32),
-            k_cache=torch.zeros((1, 64, 1, 68), dtype=torch.uint8),
             weights=torch.zeros((num_rows, 2), dtype=torch.float32),
-            metadata=metadata,
-            request_ids=torch.arange(num_rows),
-            num_rows=num_rows,
+            k_cache=torch.zeros((1, 64, 1, 68), dtype=torch.uint8),
         )
-        page_indices = torch.full((num_rows, 4), -1, dtype=torch.int32)
-        raw_indices = torch.full_like(page_indices, -1)
-        indexer = object.__new__(mod.DeepGemmCandidateIndexer)
-        indexer.topk_blocks = 2
+        return inputs, data
 
+    def _selection(self):
+        from sglang.srt.layers.attention.dsv4.low_ratio_indexer import Selection
+
+        page_indices = torch.full((self.num_rows, 4), -1, dtype=torch.int32)
+        return Selection(page_indices=page_indices, raw_indices=page_indices.clone())
+
+    def _mocks(self):
+        width = self.width
         deep_gemm = MagicMock(
             side_effect=lambda q, *_args: torch.zeros(
                 (q[0].shape[0], width), dtype=torch.float32
             )
         )
-        topk = MagicMock()
+        return deep_gemm, MagicMock()
+
+    def _assert_chunked_calls(self, deep_gemm, topk):
+        self.assertEqual(deep_gemm.call_count, len(self.chunks))
+        for call, plan in zip(deep_gemm.call_args_list, self.plans):
+            self.assertIs(call.args[5], plan)
+            self.assertIsInstance(call.args[5], torch.Tensor)
+        self.assertEqual(
+            [call.kwargs["rows"] for call in topk.call_args_list], self.chunks
+        )
+        for call, plan in zip(topk.call_args_list, self.topk_plans):
+            self.assertIs(call.kwargs["topk_metadata"], plan)
+
+    def test_candidate_publisher_takes_one_schedule_per_call(self):
+        from sglang.srt.layers.attention.dsv4.low_ratio_indexer import (
+            deep_gemm_backend as mod,
+        )
+
+        inputs, data = self._inputs()
+        backend = object.__new__(mod.DeepGEMMCandidateBackend)
+        backend.token_to_kv_pool = None
+        backend.topk_blocks = 2
+        deep_gemm, topk = self._mocks()
         event = MagicMock()
         stream = MagicMock()
         with (
+            patch.object(mod, "get_deep_gemm_decode_data", return_value=data),
             patch.object(mod, "deep_gemm_fp4_paged_mqa_logits", deep_gemm),
             patch.object(mod, "topk_transform_paged_from_metadata", topk),
             patch.object(
@@ -973,46 +1019,73 @@ class TestChunkedCandidatePublisher(CustomTestCase):
             ),
             patch.object(
                 mod,
-                "build_sparse_indexer_schedule",
+                "build_sparse_schedule",
                 return_value=torch.tensor([7], dtype=torch.uint8),
             ),
             patch.object(mod.torch.cuda, "Event", return_value=event),
             patch.object(mod.torch.cuda, "current_stream", return_value=stream),
         ):
-            table = indexer.publish_decode(inputs, page_indices, raw_indices)
+            table = backend.publish_decode(inputs, self._selection())
 
-        self.assertEqual(deep_gemm.call_count, len(chunks))
-        for call, plan in zip(deep_gemm.call_args_list, plans):
-            self.assertIs(call.args[5], plan)
-            self.assertIsInstance(call.args[5], torch.Tensor)
-        self.assertEqual([call.kwargs["rows"] for call in topk.call_args_list], chunks)
-        for call, plan in zip(topk.call_args_list, topk_plans):
-            self.assertIs(call.kwargs["topk_metadata"], plan)
-        self.assertEqual(table.blocks.shape, (num_rows, indexer.topk_blocks))
+        self._assert_chunked_calls(deep_gemm, topk)
+        self.assertEqual(table.blocks.shape, (self.num_rows, backend.topk_blocks))
         self.assertEqual(table.phys_blocks.shape, table.blocks.shape)
-        self.assertEqual(table.valid_lens.shape, (num_rows,))
+        self.assertEqual(table.valid_lens.shape, (self.num_rows,))
         event.record.assert_called_once_with(stream)
+
+    def test_dense_decode_takes_one_schedule_per_call(self):
+        from sglang.srt.layers.attention.dsv4.low_ratio_indexer import (
+            dense_indexer as mod,
+        )
+
+        inputs, data = self._inputs()
+        indexer = object.__new__(mod.DenseIndexer)
+        indexer.token_to_kv_pool = None
+        indexer.use_deep_gemm_decode = True
+        deep_gemm, topk = self._mocks()
+        with (
+            patch.object(mod, "get_deep_gemm_decode_data", return_value=data),
+            patch.object(mod, "deep_gemm_fp4_paged_mqa_logits", deep_gemm),
+            patch.object(mod, "topk_transform_paged_from_metadata", topk),
+        ):
+            indexer.topk_decode(inputs, self._selection())
+
+        self._assert_chunked_calls(deep_gemm, topk)
 
 
 class TestCandidateIndexerGating(CustomTestCase):
     def test_candidate_indexer_gating(self):
-        from sglang.srt.layers.attention.dsv4 import candidate_indexer
+        from sglang.srt.layers.attention.dsv4 import low_ratio_indexer
+        from sglang.srt.layers.attention.dsv4.low_ratio_indexer.torch_backend import (
+            TorchCandidateBackend,
+        )
 
-        def platform(sm):
-            return patch.object(
-                candidate_indexer, "get_platform", lambda: SimpleNamespace(device_sm=sm)
+        def sm100(value):
+            return patch.object(low_ratio_indexer, "is_sm100_or_newer", lambda: value)
+
+        def make(topk_blocks, block_size):
+            return low_ratio_indexer.make_candidate_indexer(
+                token_to_kv_pool=None,
+                req_to_token=torch.zeros((1, 1), dtype=torch.int32),
+                page_size=256,
+                candidate_topk_blocks=topk_blocks,
+                candidate_block_size=block_size,
             )
 
         flag = "sglang.srt.layers.deep_gemm_wrapper.configurer.DEEPGEMM_PAGED_SPARSE_MQA_LOGITS"
-        # V4 models have no candidate source; Hopper selects through masks inline.
-        with platform(100), patch(flag, True):
-            self.assertIsNone(candidate_indexer.make_candidate_indexer(0, 8))
-        with platform(90), patch(flag, False):
-            self.assertIsNone(candidate_indexer.make_candidate_indexer(2048, 8))
+        # V4 configs carry no candidate fields (0 / 0): no layer is a candidate
+        # source, so Blackwell must not build the DeepGEMM backend for them.
+        # Hopper serves candidates on the portable backend.
+        for is_sm100, topk_blocks, block_size in ((True, 0, 0), (False, 2048, 8)):
+            with self.subTest(sm100=is_sm100, topk_blocks=topk_blocks):
+                with sm100(is_sm100), patch(flag, False):
+                    indexer = make(topk_blocks, block_size)
+                self.assertIsInstance(indexer.prefill, TorchCandidateBackend)
+                self.assertIsInstance(indexer.decode, TorchCandidateBackend)
         # Blackwell without DeepGEMM's sparse logits fails instead of falling back.
-        with platform(100), patch(flag, False):
+        with sm100(True), patch(flag, False):
             with self.assertRaises(RuntimeError):
-                candidate_indexer.make_candidate_indexer(2048, 8)
+                make(2048, 8)
 
 
 if __name__ == "__main__":
