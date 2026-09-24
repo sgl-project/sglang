@@ -23,7 +23,7 @@ class Device(msgspec.Struct):
     # -------------------------------------------------------------------------
     device: A[
         Optional[str],
-        "The device to use ('cuda', 'xpu', 'hpu', 'npu', 'cpu', 'musa'). Defaults to auto-detection if not specified.",
+        "The device to use ('cuda', 'xpu', 'hpu', 'npu', 'cpu', 'musa', 'mlu'). Defaults to auto-detection if not specified.",
     ] = None
     base_gpu_id: A[
         int,

@@ -190,13 +190,14 @@ def disable_tc_piecewise_cudagraph_if_incompatible(server_args: Any):
         ("full torch.compile mode", lambda: cfg.enable_torch_compile),
         ("pipeline parallelism (pp_size > 1)", lambda: cfg.pp_size > 1),
         (
-            "non-CUDA hardware (HIP/NPU/CPU/MPS/XPU)",
+            "non-CUDA hardware (HIP/NPU/CPU/MPS/XPU/MLU)",
             lambda: (
                 get_platform().is_hip
                 or get_platform().is_npu
                 or is_cpu()
                 or is_mps()
                 or get_platform().is_xpu
+                or get_platform().is_mlu
             ),
         ),
         (
