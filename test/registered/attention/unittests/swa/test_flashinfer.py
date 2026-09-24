@@ -3,11 +3,14 @@ import unittest
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.utils import is_flashinfer_available
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kits.attention_unittest.attention_methods.dense_attention import (
     DenseAttentionCase,
+    build_dense_attention_fixture,
     make_swa_no_prefix_input_config_cases,
     make_swa_prefix_input_config_cases,
     run_dense_attention_case,
@@ -175,6 +178,57 @@ class TestFlashInferSWAAttentionBackendCorrectness(CustomTestCase):
                         head_dim=self.HEAD_DIM,
                         hidden_size=self.HIDDEN_SIZE,
                     )
+
+    def test_full_layer_ragged_prefill_reads_cached_prefix_only(self):
+        """Full attention must ignore stale K/V in unwritten extend slots."""
+        case = DenseAttentionCase(
+            name="swa_full_layer_ragged_prefix_only",
+            backend="flashinfer",
+            forward_mode=ForwardMode.EXTEND,
+            num_heads=4,
+            num_kv_heads=4,
+            page_size=16,
+            prefix_lens=(7,),
+            extend_lens=(7,),
+            sliding_window_size=4,
+        )
+        with envs.SGLANG_FLASHINFER_USE_PAGED.override(False):
+            fixture = build_dense_attention_fixture(
+                self, case, head_dim=128, max_context_len=32, dtype=torch.bfloat16
+            )
+        self.addCleanup(fixture.runner._server_args_override.restore)
+        full = RadixAttention(
+            num_heads=4,
+            head_dim=128,
+            scaling=fixture.actual_module.attn.scaling,
+            num_kv_heads=4,
+            layer_id=0,
+            sliding_window_size=-1,
+        )
+        q = torch.zeros(7, 4, 128, dtype=torch.bfloat16, device="cuda")
+        k = torch.zeros(14, 4, 128, dtype=torch.bfloat16, device="cuda")
+        v = torch.zeros_like(k)
+        q[:, :, 0] = 16
+        k[0, :, 0] = 16
+        v[0] = 8
+        pool = fixture.runner.token_to_kv_pool
+        prefix_locs = fixture.runner.req_to_token_pool.req_to_token[0, :7].long()
+        pool.set_kv_buffer(full, prefix_locs, k[:7], v[:7])
+        batch = fixture.forward_batch
+        poison_k = torch.zeros_like(k[7:])
+        poison_k[:, :, 0] = 16
+        pool.set_kv_buffer(
+            full, batch.out_cache_loc, poison_k, torch.full_like(v[7:], -8)
+        )
+        with (
+            torch.no_grad(),
+            forward_context(ForwardContext(attn_backend=fixture.backend)),
+        ):
+            fixture.backend.init_forward_metadata(batch)
+            actual = full(q, k[7:], v[7:], batch, save_kv_cache=False).view(7, 4, 128)
+        torch.testing.assert_close(
+            actual, actual.new_full((7, 4, 128), 8), atol=0.04, rtol=0
+        )
 
     # Layout-robustness. See dense/test_triton.py for the full rationale.
     # The default `shuffled_pages` is already exercised by
