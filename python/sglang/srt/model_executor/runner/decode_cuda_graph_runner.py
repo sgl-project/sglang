@@ -31,7 +31,7 @@ import inspect
 import logging
 import os
 from types import SimpleNamespace
-from typing import TYPE_CHECKING, Callable, Optional, Union
+from typing import TYPE_CHECKING, Any, Callable, Optional, Union
 
 import torch
 import tqdm
@@ -484,6 +484,10 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             raise Exception(
                 f"Capture cuda graph failed: {e}\n{CUDA_GRAPH_CAPTURE_FAILED_MSG}"
             )
+
+    def cuda_graph_output_capacity_rows(self, output: Any) -> Optional[int]:
+        """Capacity required by the BCG shared output buffer across decode shapes."""
+        return self.max_bs
 
     def _next_token_logits_buffer_capacity_rows(self, max_num_tokens: int) -> int:
         """Rows reserved for the largest shared logits output."""
