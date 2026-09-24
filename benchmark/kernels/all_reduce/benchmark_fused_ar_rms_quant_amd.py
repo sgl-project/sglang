@@ -1,6 +1,6 @@
 """
-Benchmark fused AllReduce + RMSNorm + per-group FP8 quant on AMD with
-correctness checks.
+Benchmark fused AllReduce + RMSNorm + FP8 quant (per-group and per-token) on
+AMD with correctness checks.
 
 This script targets the three op paths used by SGLang on ROCm/aiter for
 Qwen3.5-FP8 style models:
@@ -12,6 +12,11 @@ Qwen3.5-FP8 style models:
     3. Fully fused AR+RMSNorm+per-group-quant (1 kernel):
          tensor_model_parallel_fused_allreduce_rmsnorm_quant_per_group.
 
+``--quant-type per_token`` benchmarks the same three paths with per-token
+(rowwise) quant instead, the last one being
+tensor_model_parallel_fused_allreduce_rmsnorm_quant_per_token (which also
+writes the bf16 normed output).
+
 Default shape sets cover the Qwen3.5-397B-A17B-FP8 layout:
   * hidden_size = 4096
   * TP = 8 (launched with torchrun --nproc_per_node=8)
@@ -22,6 +27,13 @@ Usage:
   torchrun --nproc_per_node=8 \
     benchmark/kernels/all_reduce/benchmark_fused_ar_rms_quant_amd.py \
     --dtype bf16 --group-size 128
+
+  # MiniMax-M3 (hidden_size=6144, TP=4), per-token only:
+  torchrun --nproc_per_node=4 \
+    benchmark/kernels/all_reduce/benchmark_fused_ar_rms_quant_amd.py \
+    --quant-type per_token \
+    --prefill-shapes 64x6144,256x6144,1024x6144,4096x6144 \
+    --decode-shapes 1x6144,4x6144,16x6144,64x6144,128x6144,256x6144
 """
 
 import argparse
@@ -38,6 +50,7 @@ from sglang.srt.distributed.communication_op import (
     tensor_model_parallel_all_reduce,
     tensor_model_parallel_fused_allreduce_rmsnorm,
     tensor_model_parallel_fused_allreduce_rmsnorm_quant_per_group,
+    tensor_model_parallel_fused_allreduce_rmsnorm_quant_per_token,
 )
 from sglang.srt.distributed.parallel_state import (
     destroy_distributed_environment,
@@ -221,6 +234,140 @@ def _check_quant_close(
     return ok, f"max_diff={max_diff:.4f},rel={rel_err:.4f}"
 
 
+def _split_3_reference_per_token(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Reference: plain all_reduce -> RMSNorm -> aiter per-token quant."""
+    import aiter
+
+    ar_out = tensor_model_parallel_all_reduce(x.clone())
+    residual_out = ar_out + residual
+    normed = F.rms_norm(residual_out, (residual_out.shape[-1],), weight, eps)
+    hip_quant = aiter.get_hip_quant(aiter.QuantType.per_Token)
+    fp8_out, scale_out = hip_quant(normed, quant_dtype=aiter.dtypes.fp8)
+    return fp8_out, residual_out, scale_out
+
+
+def _fused_ar_rms_then_quant_per_token(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+) -> Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+    """2-kernel: fused AR+RMSNorm (existing) + separate per-token quant."""
+    import aiter
+
+    result = tensor_model_parallel_fused_allreduce_rmsnorm(
+        x.clone(), residual.clone(), weight, eps
+    )
+    if result is None:
+        return None
+    normed, residual_out = result
+    hip_quant = aiter.get_hip_quant(aiter.QuantType.per_Token)
+    fp8_out, scale_out = hip_quant(normed, quant_dtype=aiter.dtypes.fp8)
+    return fp8_out, residual_out, scale_out
+
+
+def _fully_fused_per_token(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+) -> Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]]:
+    """1-kernel: fused AR+RMSNorm+per-token-quant, returning
+    ``(fp8, residual_out, scale, bf16)``."""
+    return tensor_model_parallel_fused_allreduce_rmsnorm_quant_per_token(
+        x.clone(), residual.clone(), weight, eps
+    )
+
+
+def bench_shape_per_token(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+    warmup: int,
+    iters: int,
+    repeats: int,
+    mode: str,
+) -> Dict[str, object]:
+    device = x.device
+
+    # --- Split 3-kernel baseline ---
+    split_fn = lambda: _split_3_reference_per_token(x, residual, weight, eps)
+    if mode == "graph":
+        with graph_capture() as gc:
+            g = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(g, stream=gc.stream):
+                _split_3_reference_per_token(x, residual, weight, eps)
+        split_fn = g.replay
+    split_us = _measure_us(split_fn, warmup, iters, repeats, device)
+
+    # --- Fused AR+RMSNorm + separate per-token quant (2 kernels) ---
+    probe2 = _fused_ar_rms_then_quant_per_token(x, residual, weight, eps)
+    fused2_available = probe2 is not None
+    fused2_us: Optional[float] = None
+    if fused2_available:
+        fused2_fn = lambda: _fused_ar_rms_then_quant_per_token(x, residual, weight, eps)
+        if mode == "graph":
+            with graph_capture() as gc:
+                g2 = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(g2, stream=gc.stream):
+                    _fused_ar_rms_then_quant_per_token(x, residual, weight, eps)
+            fused2_fn = g2.replay
+        fused2_us = _measure_us(fused2_fn, warmup, iters, repeats, device)
+
+    # --- Fully fused, fp8+bf16 (1 kernel) ---
+    probe1 = _fully_fused_per_token(x, residual, weight, eps)
+    # A 3-tuple means the aiter build predates the emit_bf16 per-token kernel.
+    fused1_available = (
+        probe1 is not None and isinstance(probe1, tuple) and len(probe1) == 4
+    )
+    fused1_us: Optional[float] = None
+    if fused1_available:
+        fused1_fn = lambda: _fully_fused_per_token(x, residual, weight, eps)
+        if mode == "graph":
+            with graph_capture() as gc:
+                g1 = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(g1, stream=gc.stream):
+                    _fully_fused_per_token(x, residual, weight, eps)
+            fused1_fn = g1.replay
+        fused1_us = _measure_us(fused1_fn, warmup, iters, repeats, device)
+
+    # --- Correctness ---
+    # fp8+scale vs the 2-kernel path (a [M, 1] scale is one group of hidden
+    # size), and the bf16 side-output vs the unquantized fused AR+RMSNorm output.
+    correctness = "N/A"
+    if fused1_available and fused2_available:
+        res1 = _fully_fused_per_token(x, residual, weight, eps)
+        res2 = _fused_ar_rms_then_quant_per_token(x, residual, weight, eps)
+        ok_fp8, detail_fp8 = _check_quant_close(
+            res2[0], res2[2], res1[0], res1[2], x.shape[-1]
+        )
+        normed, _ = tensor_model_parallel_fused_allreduce_rmsnorm(
+            x.clone(), residual.clone(), weight, eps
+        )
+        bf16_diff = (res1[3].float() - normed.float()).abs().max().item()
+        if not ok_fp8:
+            correctness = f"FAIL_fp8({detail_fp8})"
+        elif bf16_diff > 0.1:
+            correctness = f"FAIL_bf16(diff={bf16_diff:.4f})"
+        else:
+            correctness = f"PASS(bf16_diff={bf16_diff:.3f})"
+
+    return {
+        "split_us": split_us,
+        "fused2_available": fused2_available,
+        "fused2_us": fused2_us,
+        "fused1_available": fused1_available,
+        "fused1_us": fused1_us,
+        "correctness": correctness,
+    }
+
+
 def bench_shape(
     x: torch.Tensor,
     residual: torch.Tensor,
@@ -383,6 +530,12 @@ def main() -> None:
         default="both",
         choices=["eager", "graph", "both"],
     )
+    parser.add_argument(
+        "--quant-type",
+        type=str,
+        default="per_group",
+        choices=["per_group", "per_token", "both"],
+    )
     parser.add_argument("--csv-out", type=str, default=None)
     args = parser.parse_args()
 
@@ -425,7 +578,10 @@ def main() -> None:
     run_modes = ("eager", "graph") if args.mode == "both" else (args.mode,)
     csv_rows: List[Dict[str, object]] = []
 
-    for mode in run_modes:
+    per_group_modes = run_modes if args.quant_type != "per_token" else ()
+    per_token_modes = run_modes if args.quant_type != "per_group" else ()
+
+    for mode in per_group_modes:
         shapes = parse_shapes(
             args.prefill_shapes if mode == "eager" else args.decode_shapes
         )
@@ -506,6 +662,7 @@ def main() -> None:
                 )
                 csv_rows.append(
                     {
+                        "quant": "per_group",
                         "mode": mode,
                         "shape": f"{M}x{N}",
                         "m": M,
@@ -525,10 +682,85 @@ def main() -> None:
                     }
                 )
 
+    for mode in per_token_modes:
+        shapes = parse_shapes(
+            args.prefill_shapes if mode == "eager" else args.decode_shapes
+        )
+        if rank == 0:
+            phase = "prefill(eager)" if mode == "eager" else "decode(graph)"
+            print(f"\n{'=' * 145}")
+            print(f"Mode: {phase}, per-token quant")
+            print(
+                "| Shape | Bytes/rank | Split(3k) us | Fused2(2k) us | "
+                "Fused1+bf16(1k) us | Speedup(2k) | Speedup(1k) | "
+                "Speedup(1k vs 2k) | Corr |"
+            )
+            print(
+                "|:------|----------:|-----------:|------------:|-----------:|"
+                "-----------:|-----------:|-----------:|:---------|"
+            )
+
+        for shape in shapes:
+            x, residual, weight = _make_inputs(shape, dtype, args.seed, rank, device)
+            m = bench_shape_per_token(
+                x,
+                residual,
+                weight,
+                args.eps,
+                args.warmup,
+                args.iters,
+                args.repeats,
+                mode,
+            )
+
+            split_us = _mean_across_ranks(m["split_us"], device)
+            fused2_avail = _all_true_across_ranks(m["fused2_available"], device)
+            fused1_avail = _all_true_across_ranks(m["fused1_available"], device)
+            fused2_us = (
+                _mean_across_ranks(m["fused2_us"], device) if fused2_avail else None
+            )
+            fused1_us = (
+                _mean_across_ranks(m["fused1_us"], device) if fused1_avail else None
+            )
+
+            if rank == 0:
+                M, N = shape
+                nbytes = M * N * 2
+                f2_str = f"{fused2_us:.1f}" if fused2_us else "N/A"
+                f1_str = f"{fused1_us:.1f}" if fused1_us else "N/A"
+                s2 = f"{split_us / fused2_us:.2f}x" if fused2_us else "N/A"
+                s1 = f"{split_us / fused1_us:.2f}x" if fused1_us else "N/A"
+                s12 = (
+                    f"{fused2_us / fused1_us:.2f}x"
+                    if fused1_us and fused2_us
+                    else "N/A"
+                )
+                print(
+                    f"| {M}x{N} | {nbytes} | {split_us:.1f} | {f2_str} | "
+                    f"{f1_str} | {s2} | {s1} | {s12} | {m['correctness']} |"
+                )
+                csv_rows.append(
+                    {
+                        "quant": "per_token",
+                        "mode": mode,
+                        "shape": f"{M}x{N}",
+                        "m": M,
+                        "n": N,
+                        "bytes_per_rank": nbytes,
+                        "split_us": split_us,
+                        "fused2_us": fused2_us if fused2_us is not None else "",
+                        "fused1_us": fused1_us if fused1_us is not None else "",
+                        "fused1_available": fused1_avail,
+                        "fused2_available": fused2_avail,
+                        "correctness": m["correctness"],
+                    }
+                )
+
     if rank == 0 and args.csv_out and csv_rows:
         os.makedirs(os.path.dirname(args.csv_out) or ".", exist_ok=True)
+        fieldnames = list(dict.fromkeys(k for row in csv_rows for k in row))
         with open(args.csv_out, "w", newline="") as f:
-            w = csv.DictWriter(f, fieldnames=list(csv_rows[0].keys()))
+            w = csv.DictWriter(f, fieldnames=fieldnames, restval="")
             w.writeheader()
             w.writerows(csv_rows)
         print(f"\nSaved CSV: {args.csv_out}")
