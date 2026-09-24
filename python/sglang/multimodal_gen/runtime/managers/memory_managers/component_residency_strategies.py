@@ -10,10 +10,16 @@ from torch.distributed.fsdp import FSDPModule
 
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.managers.memory_managers.host_memory_budget import (
+    HostPinBudget,
     shared_pool_available_bytes,
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     LayerwiseOffloadableModuleMixin,
+)
+from sglang.multimodal_gen.runtime.managers.memory_managers.weight_snapshot import (
+    capture_weight_snapshot,
+    restore_weight_snapshot,
+    weight_snapshot,
 )
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
@@ -134,13 +140,16 @@ class ComponentOffloadStrategy(ComponentResidencyStrategy):
         self._prefetch_stream: object | None = None
         self._ready_events: dict[str, object] = {}
 
+    def _load_component(self, module: nn.Module, use: ComponentUse) -> None:
+        _module_to_local_device(module, dtype=use.target_dtype)
+
     def prepare_for_use(
         self,
         module: nn.Module,
         use: ComponentUse,
         state: ResidencyState,
     ) -> None:
-        _module_to_local_device(module, dtype=use.target_dtype)
+        self._load_component(module, use)
 
     def wait_for_use(
         self,
@@ -169,7 +178,7 @@ class ComponentOffloadStrategy(ComponentResidencyStrategy):
                 device=get_local_torch_device()
             )
         with torch.get_device_module().stream(self._prefetch_stream):
-            _module_to_local_device(module, dtype=use.target_dtype)
+            self._load_component(module, use)
             event = torch.get_device_module().Event()
             event.record(self._prefetch_stream)
         self._ready_events[use.component_name] = event
@@ -210,6 +219,36 @@ class ComponentOffloadStrategy(ComponentResidencyStrategy):
         self.finish_use(module, use, state)
 
 
+class SnapshotOffloadStrategy(ComponentOffloadStrategy):
+    """Keep CPU weights during device use; restore them without weight D2H."""
+
+    def __init__(self, *, pin_budget: HostPinBudget | None = None) -> None:
+        super().__init__()
+        self._pin_budget = pin_budget
+
+    def _load_component(self, module: nn.Module, use: ComponentUse) -> None:
+        if weight_snapshot(module) is not None and not _module_ready_on_local_device(
+            module, dtype=use.target_dtype
+        ):
+            restore_weight_snapshot(module)
+        if weight_snapshot(module) is None:
+            if use.target_dtype is not None:
+                module.to(dtype=use.target_dtype)
+            capture_weight_snapshot(
+                module, pin_budget=self._pin_budget, component_name=use.component_name
+            )
+        super()._load_component(module, use)
+
+    def finish_use(
+        self, module: nn.Module, use: ComponentUse, state: ResidencyState
+    ) -> None:
+        self.wait_for_use(module, use, state)
+        if restore_weight_snapshot(module):
+            self._ready_events.pop(use.component_name, None)
+        else:
+            super().finish_use(module, use, state)
+
+
 class LayerwiseOffloadStrategy(ComponentResidencyStrategy):
     """Run the lifecycle of an already configured layerwise component."""
 
@@ -239,12 +278,19 @@ class LayerwiseOffloadStrategy(ComponentResidencyStrategy):
     ) -> None:
         if not isinstance(module, LayerwiseOffloadableModuleMixin):
             return
+        # Not release_all: this is a use ending, not a reset. Whether the
+        # resident set outlives the use is declared on the use, by whoever has
+        # the pipeline's per-phase headroom in view; the default is off, so
+        # this stays the long-standing behaviour until something sets it.
+        keep_resident = use.retain_resident_layers
         for manager in module.layerwise_offload_managers:
-            manager.release_all()
+            manager.release_after_use(keep_resident=keep_resident)
         # The layers are gone; the rest of this component is dead weight on the
         # device until it is used again, and the stage that follows may be the
-        # one that needs the room.
-        module.park_non_layer_weights()
+        # one that needs the room. That reasoning does not hold when the room
+        # was just judged available: parking would undo the transfer we kept.
+        if not keep_resident:
+            module.park_non_layer_weights()
         if current_platform.is_mps():
             torch.mps.synchronize()
             module.restore_mps_cpu_non_layer_weights()
@@ -271,7 +317,7 @@ class LayerwiseOffloadStrategy(ComponentResidencyStrategy):
                 if advise_cold is not None:
                     paged_out += int(advise_cold(room_bytes=room_bytes) or 0)
             if paged_out:
-                logger.info(
+                logger.debug(
                     "Layerwise offload: paged out the first %.1f GiB of %s so the "
                     "next request's stream fits the %.1f GiB the cache can give it.",
                     paged_out / 1024**3,

@@ -22,14 +22,13 @@ from sglang.kernels.ops.moe.fused_moe_triton_kernels import (
     support_tensor_descriptor,
 )
 from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
-from sglang.srt.distributed import get_tp_group
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
 from sglang.srt.layers.moe.utils import get_moe_padding_size, get_moe_runner_backend
-from sglang.srt.runtime_context import get_exec
+from sglang.srt.runtime_context import get_exec, get_parallel
 from sglang.srt.utils import (
     cpu_has_amx_support,
     get_bool_env_var,
@@ -59,11 +58,15 @@ _is_musa = is_musa()
 if _is_cuda:
     from sgl_kernel import moe_sum_reduce
 
-    from sglang.kernels.ops.activation.activation import gelu_and_mul, silu_and_mul
+    from sglang.kernels.ops.activation.activation import (
+        gelu_and_mul,
+        gelu_tanh_and_mul,
+        silu_and_mul,
+    )
 elif _is_cpu and _is_cpu_amx_available:
     pass
 elif _is_hip:
-    from sgl_kernel import gelu_and_mul, silu_and_mul
+    from sgl_kernel import gelu_and_mul, gelu_tanh_and_mul, silu_and_mul
 
     if _use_aiter:
         try:
@@ -578,7 +581,7 @@ def _fused_moe_kernel_sequence(
         # symmetric path. Only this output enters the pool; the intermediate caches
         # below stay on the default allocator to bound pool occupancy.
         with use_symmetric_memory(
-            get_tp_group(), disabled=not is_allocation_symmetric()
+            get_parallel().tp_group, disabled=not is_allocation_symmetric()
         ):
             out_hidden_states = torch.empty_like(hidden_states)
 
@@ -771,29 +774,38 @@ def _fused_moe_kernel_sequence(
         if situ_linear_beta is not None:
             up = situ_linear_beta * torch.tanh(up / situ_linear_beta)
         intermediate_cache2.copy_((gate * up).to(intermediate_cache1.dtype))
-    elif activation == "gelu" and is_gated:
+    elif activation in ("gelu", "gelu_tanh") and is_gated:
         assert gemm1_alpha is None, "gemm1_alpha is not supported for gelu"
         assert gemm1_limit is None, "gemm1_limit is not supported for gelu"
         if _is_cuda or _is_hip:
+            activation_fn = (
+                gelu_tanh_and_mul if activation == "gelu_tanh" else gelu_and_mul
+            )
             if filter_expert and _is_cuda:
-                gelu_and_mul(
+                activation_fn(
                     intermediate_cache1.view(-1, N),
                     intermediate_cache2,
                     expert_ids=(expert_ids if down_moe_use_tma else topk_ids.view(-1)),
                     expert_step=(config["BLOCK_SIZE_M"] if down_moe_use_tma else 1),
                 )
             else:
-                gelu_and_mul(intermediate_cache1.view(-1, N), intermediate_cache2)
+                activation_fn(intermediate_cache1.view(-1, N), intermediate_cache2)
         else:
             if _has_vllm_ops:
-                vllm_ops.gelu_and_mul(
+                getattr(vllm_ops, f"{activation}_and_mul")(
                     intermediate_cache2, intermediate_cache1.view(-1, N)
                 )
             else:
                 # Fallback: native PyTorch gelu_and_mul
                 x = intermediate_cache1.view(-1, N)
                 d = x.shape[-1] // 2
-                intermediate_cache2.copy_(F.gelu(x[..., :d]) * x[..., d:])
+                intermediate_cache2.copy_(
+                    F.gelu(
+                        x[..., :d],
+                        approximate="tanh" if activation == "gelu_tanh" else "none",
+                    )
+                    * x[..., d:]
+                )
     # Activation function without multiplication
     elif activation == "silu" and not is_gated:
         intermediate_cache2 = F.silu(intermediate_cache1.view(-1, N))
@@ -813,8 +825,11 @@ def _fused_moe_kernel_sequence(
     )
 
     # LoRA hooks force the second kernel to write to intermediate_cache3 so
-    # hooks.after_down can inspect/modify it before reduction.
-    _use_intermediate = not no_combine and (topk != 1 or hooks)
+    # hooks.after_down can inspect/modify it before reduction. Non-unit routed
+    # scaling also needs the intermediate because the reduction applies it.
+    _use_intermediate = not no_combine and (
+        topk != 1 or hooks or routed_scaling_factor not in (None, 1.0)
+    )
 
     out_slice = None
     if use_fused_moe_sum_all_reduce:

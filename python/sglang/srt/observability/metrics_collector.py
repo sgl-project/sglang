@@ -34,6 +34,7 @@ from sglang.srt.runtime_context import (
     get_context,
     get_disagg,
     get_observability,
+    get_parallel,
     get_schedule,
     get_serving,
 )
@@ -1102,42 +1103,42 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
         cls,
         *,
         server_args: ServerArgs,
-        ps: Any,
-        tp_rank: int,
-        pp_rank: int,
-        dp_rank: Optional[int],
         enable_priority_scheduling: bool,
         enable_lora: bool,
         enable_hierarchical_cache: bool,
     ) -> SchedulerMetricsCollectorContext:
         enable_metrics = get_observability().enable_metrics
-        is_stats_logging_rank = ps.attn_tp_rank == 0
+        parallel = get_parallel()
+        is_stats_logging_rank = parallel.attn_tp_rank == 0
         current_scheduler_metrics_enabled = enable_metrics and (
             is_stats_logging_rank
             or get_observability().enable_metrics_for_all_schedulers
         )
         enable_kv_cache_events = bool(
             get_observability().kv_events_config
-            and ps.pp_rank == 0
-            and ps.attn_tp_rank == 0
-            and ps.attn_cp_rank == 0
+            and get_parallel().pp_rank == 0
+            and parallel.attn_tp_rank == 0
+            and parallel.attn_cp_rank == 0
         )
         collector: Optional[SchedulerMetricsCollector] = None
         if enable_metrics:
-            engine_type = DisaggregationMode.to_engine_type(
-                get_disagg().disaggregation_mode
+            # Keep one metric series across role flips.
+            engine_type = (
+                "dynamic"
+                if get_disagg().enable_pd_role_switch
+                else DisaggregationMode.to_engine_type(get_disagg().disaggregation_mode)
             )
             labels = {
                 "model_name": get_serving().served_model_name,
                 "engine_type": engine_type,
-                "tp_rank": tp_rank,
-                "pp_rank": pp_rank,
-                "moe_ep_rank": ps.moe_ep_rank,
+                "tp_rank": parallel.tp_rank,
+                "pp_rank": parallel.pp_rank,
+                "moe_ep_rank": parallel.moe_ep_rank,
             }
             if enable_priority_scheduling:
                 labels["priority"] = ""
-            if dp_rank is not None:
-                labels["dp_rank"] = dp_rank
+            if parallel.dp_rank is not None:
+                labels["dp_rank"] = parallel.dp_rank
             if get_observability().extra_metric_labels:
                 labels.update(get_observability().extra_metric_labels)
             scheduler_collector_cls = resolve_collector_class(
@@ -1936,19 +1937,42 @@ class StorageMetricsCollector(_StatLoggerDIMixin):
 
         self.storage_prefetch_unfulfilled_tokens_total = Counter(
             name="sglang:storage_prefetch_unfulfilled_tokens_total",
-            documentation="Storage-hit tokens that did not become a usable "
-            "prefetch result, by terminal reason.",
+            documentation="Attempt-level storage-hit tokens that did not become "
+            "a usable prefetch result, by diagnostic reason. This is not a "
+            "final prefill cache-miss counter. anchor_lost means the original "
+            "device prefix was no longer present when the prefetch needed it; "
+            "aux_window_trim means a staged aux trailing window could not be "
+            "trimmed to the shorter splice, so the loaded span was released; "
+            "device_overlap means the live device prefix diverged from the "
+            "request's view at splice time, so the span beyond it was released; "
+            "cache_admission_shortfall means an L3-loaded L2 span was no longer "
+            "reusable when cache-mode admission ran.",
             labelnames=list(labels.keys()) + ["reason"],
         )
         for reason in (
             "below_threshold",
             "host_capacity",
             "device_capacity",
+            "device_covered",
             "storage_transfer",
-            "shrunk",
+            "anchor_lost",
+            "aux_window_trim",
+            "device_overlap",
+            "cache_admission_shortfall",
             "dropped",
         ):
             self.storage_prefetch_unfulfilled_tokens_total.labels(
+                **self.labels, reason=reason
+            )
+
+        self.storage_prefetch_deferred_tokens_total = Counter(
+            name="sglang:storage_prefetch_deferred_tokens_total",
+            documentation="Storage-prefetch token-attempts deferred for later "
+            "reuse, by transient capacity reason.",
+            labelnames=list(labels.keys()) + ["reason"],
+        )
+        for reason in ("host_capacity", "device_capacity"):
+            self.storage_prefetch_deferred_tokens_total.labels(
                 **self.labels, reason=reason
             )
 
@@ -2041,6 +2065,14 @@ class StorageMetricsCollector(_StatLoggerDIMixin):
                 **self.labels, reason=reason
             ).inc(num_tokens)
 
+    def log_storage_prefetch_deferred_tokens(
+        self, num_tokens: int, reason: str
+    ) -> None:
+        if num_tokens > 0:
+            self.storage_prefetch_deferred_tokens_total.labels(
+                **self.labels, reason=reason
+            ).inc(num_tokens)
+
     def log_backup_dropped_tokens(self, dropped_tokens: int):
         if dropped_tokens > 0:
             self.backup_dropped_tokens_total.labels(**self.labels).inc(dropped_tokens)
@@ -2083,6 +2115,25 @@ class ExpertDispatchCollector(_StatLoggerDIMixin):
             labelnames={"layer"},
             buckets=ep_size_buckets,
         )
+
+
+def radix_cache_metric_labels(
+    cache_type: str, parallel: Any, dp_attention_enabled: bool
+) -> Dict[str, Any]:
+    # Every scheduler rank runs its own cache over its own KV shard; without
+    # rank labels the multiprocess registry sums ranks into TP x the count.
+    # Same rank keys as the storage collector (cache_controller's storage
+    # config), so one rank's L2 and L3 series line up.
+    if dp_attention_enabled:
+        tp_rank, dp_rank = parallel.attn_tp_rank, parallel.attn_dp_rank
+    else:
+        tp_rank, dp_rank = parallel.tp_rank, 0
+    return {
+        "cache_type": cache_type,
+        "tp_rank": tp_rank,
+        "pp_rank": parallel.pp_rank,
+        "dp_rank": dp_rank,
+    }
 
 
 class RadixCacheMetricsCollector(_StatLoggerDIMixin):
@@ -2205,7 +2256,9 @@ class RadixCacheMetricsCollector(_StatLoggerDIMixin):
         self.load_back_num_tokens = Counter(
             name="sglang:load_back_tokens_total",
             documentation="The number of tokens loaded back from local host "
-            "DRAM (L2) to GPU, by host pool (kv, swa, mamba, ...).",
+            "DRAM (L2) to GPU, by host pool (kv, swa, mamba, ...). Every TP "
+            "rank reports the same logical count under its own rank labels; "
+            "read one rank rather than summing ranks.",
             labelnames=list(labels.keys()) + ["pool"],
         )
 
@@ -2223,9 +2276,11 @@ class RadixCacheMetricsCollector(_StatLoggerDIMixin):
             name="sglang:hicache_backup_bytes_total",
             documentation="Bytes backed up from GPU to local host DRAM (L2), "
             "all pools combined, including draft/sidecar transfers that the "
-            "token counter excludes. Divided by the rate of "
-            "hicache_backup_duration_seconds_sum, gives the achieved D->H "
-            "bandwidth while transferring.",
+            "token counter excludes. Each rank reports its own KV shard; sum "
+            "ranks for the physical total. A window's byte delta divided by "
+            "the same window's hicache_backup_duration_seconds sum is the "
+            "bytes-weighted active bandwidth; the plain rate is wall-clock "
+            "payload traffic that includes idle time.",
             labelnames=labels.keys(),
         )
 
@@ -2233,9 +2288,11 @@ class RadixCacheMetricsCollector(_StatLoggerDIMixin):
             name="sglang:load_back_bytes_total",
             documentation="Bytes loaded back from local host DRAM (L2) to "
             "GPU, all pools combined, including draft/sidecar transfers that "
-            "the token counter excludes. Divided by the rate of "
-            "load_back_duration_seconds_sum, gives the achieved bandwidth "
-            "over each merged H2D load operation.",
+            "the token counter excludes. Each rank reports its own KV shard; "
+            "sum ranks for the physical total. A window's byte delta divided "
+            "by the same window's load_back_duration_seconds sum is the "
+            "bytes-weighted active bandwidth; the plain rate is wall-clock "
+            "payload traffic that includes idle time.",
             labelnames=labels.keys(),
         )
 
@@ -2244,7 +2301,9 @@ class RadixCacheMetricsCollector(_StatLoggerDIMixin):
             documentation="The number of tokens backed up from GPU to local "
             "host DRAM (L2), by host pool (kv, swa, mamba, ...). Covers all "
             "D->H backups regardless of --hicache-write-policy. Distinct from "
-            "the host-to-storage (L3) sglang:backuped_tokens_total.",
+            "the host-to-storage (L3) sglang:backuped_tokens_total. Every TP "
+            "rank reports the same logical count under its own rank labels; "
+            "read one rank rather than summing ranks.",
             labelnames=list(labels.keys()) + ["pool"],
         )
 

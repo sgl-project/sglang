@@ -9,6 +9,7 @@ from typing import Any
 
 from sglang.srt.arg_groups.overrides import (
     _data_parallelism_defaults,
+    _dcp_comm_backend_default,
     _dp_lm_head_validation,
     _tp_lm_head_all_to_all_default,
     declare_resolution,
@@ -18,6 +19,7 @@ from sglang.srt.arg_groups.overrides import (
     run_post_process_pass,
     should_report_expert_balancedness,
 )
+from sglang.srt.arg_groups.resolution_hooks import run_hook
 from sglang.srt.connector import ConnectorType
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.cuda_graph_config import Backend, Phase, with_phase
@@ -28,7 +30,12 @@ logger = logging.getLogger(__name__)
 
 
 def handle_context_parallelism(server_args: Any):
-    validate_prefill_cp_platform(server_args)
+    # Through the registry, not a bare call: an out-of-tree replacement of
+    # `validate_prefill_cp_platform` registered at its own (earlier) pipeline
+    # position must also win here, or a package permitting prefill CP on its
+    # own qualified HIP/NPU/MUSA build would still hit the original rejection
+    # at this later, nested call.
+    run_hook(validate_prefill_cp_platform, server_args)
 
     cfg = resolving_view(server_args)
     if parse_connector_type(cfg.model_path) != ConnectorType.INSTANCE:
@@ -114,7 +121,48 @@ def handle_context_parallelism(server_args: Any):
     )
 
 
-def handle_dcp_validation(server_args: Any):
+def handle_shared_experts_tp(server_args: Any):
+    cfg = resolving_view(server_args)
+    size = cfg.shared_experts_tp_size
+    if size is None:
+        return
+
+    from sglang.srt.runtime_context import derive_attention_widths
+
+    view = resolved_view(server_args)
+    _, attn_tp_size = derive_attention_widths(
+        tp_size=cfg.tp_size,
+        attn_cp_size=view.attn_cp_size,
+        dp_size=cfg.dp_size,
+        enable_dp_attention=view.enable_dp_attention,
+    )
+    if size < 1 or attn_tp_size % size != 0:
+        raise ValueError(
+            f"--shared-experts-tp-size ({size}) must be a positive divisor "
+            f"of attention TP size ({attn_tp_size})."
+        )
+    if parse_connector_type(cfg.model_path) == ConnectorType.INSTANCE:
+        raise ValueError(
+            "--shared-experts-tp-size requires a Kimi-K3 model configuration."
+        )
+    model_arch = model_config_of(server_args).hf_config.architectures[0]
+    if model_arch != "KimiK3ForConditionalGeneration":
+        raise ValueError("--shared-experts-tp-size is only supported for Kimi-K3.")
+    if cfg.moe_a2a_backend not in (
+        "deepep",
+        "megamoe",
+        "mooncake",
+        "ascend_fuseep",
+        "mori",
+    ):
+        raise ValueError(
+            "--shared-experts-tp-size requires an expert-parallel all-to-all "
+            "backend (deepep, megamoe, mooncake, ascend_fuseep or mori)."
+        )
+
+
+def handle_decode_context_parallelism(server_args: Any):
+    run_post_process_pass(server_args, _dcp_comm_backend_default)
     cfg = resolving_view(server_args)
     if cfg.dcp_size < 1:
         raise ValueError(
@@ -132,10 +180,9 @@ def handle_dcp_validation(server_args: Any):
     if cfg.dcp_comm_backend == "fi_a2a" and not get_platform().is_cuda:
         raise ValueError(
             "--dcp-comm-backend fi_a2a delegates the exchange to FlashInfer's "
-            "MNNVL All-to-All kernel, which requires an NVIDIA CUDA platform "
-            "with SM90+ and MNNVL fabric memory (e.g. GB200 NVL72). The "
-            "authoritative fabric probe runs at model-runner init; use 'a2a' "
-            "or 'ag_rs' on clusters without MNNVL."
+            "MNNVL All-to-All kernel, which requires Blackwell and a DCP group "
+            "within one MNNVL domain. Use 'a2a' or 'ag_rs' elsewhere, or leave "
+            "the flag unset to resolve it."
         )
     if cfg.dcp_replicate_q_proj:
         if cfg.dcp_size <= 1:
@@ -226,6 +273,34 @@ def handle_data_parallelism(server_args: Any):
 
     run_post_process_pass(server_args, _tp_lm_head_all_to_all_default)
     run_post_process_pass(server_args, _dp_lm_head_validation)
+    if resolving_view(server_args).enable_tp_lm_head_all_to_all:
+        _disable_nccl_graph_buffer_registration()
+
+
+def _disable_nccl_graph_buffer_registration() -> None:
+    """Keep NCCL from registering the buffers of the graph-captured PyNccl
+    all-to-all.
+
+    NCCL_GRAPH_REGISTER (default on) registers the send/recv buffers of every
+    collective captured in a CUDA graph for the lifetime of the graph, and
+    peers then move data through those registrations directly. The TP LM-head
+    all-to-all is captured in the decode graphs on graph-pool temporaries,
+    whose addresses the pool also hands to other tensors, and the registered
+    exchange does not survive that: under a burst of new requests (DP ranks
+    ramping at different rates) one rank finishes its step while the others
+    spin in ncclDevKernel_SendRecv forever, and every DP rank hangs.
+    Reproduced on tp4/dp4/ep4 and on a multi-node tp16/dp16/ep16 PD decode
+    deployment; disabling the registration removes the hang while dedicated
+    all-to-all buffers alone do not. Must run before the schedulers create
+    their NCCL communicators, which inherit this environment. An explicit
+    setting wins.
+    """
+    if os.environ.setdefault("NCCL_GRAPH_REGISTER", "0") != "0":
+        logger.warning(
+            "NCCL_GRAPH_REGISTER=%s was set explicitly; the graph-captured TP "
+            "LM-head all-to-all can deadlock with registered buffers.",
+            os.environ["NCCL_GRAPH_REGISTER"],
+        )
 
 
 def handle_dwdp(server_args: Any):
@@ -322,21 +397,6 @@ def handle_elastic_ep(server_args: Any):
     from sglang.srt.arg_groups.validation_hook import validate_ib_devices
 
     cfg = resolving_view(server_args)
-    if cfg.elastic_ep_rejoin:
-        if cfg.ep_join_mode is None:
-            logger.warning(
-                "--elastic-ep-rejoin is deprecated, use --elastic-ep-join-mode recover instead."
-            )
-            declare_resolution(
-                server_args,
-                "_handle_elastic_ep",
-                ep_join_mode="recover",
-            )
-        else:
-            assert cfg.ep_join_mode == "recover", (
-                "--elastic-ep-rejoin (deprecated) conflicts with "
-                f"--elastic-ep-join-mode {cfg.ep_join_mode}."
-            )
     if cfg.elastic_ep_backend is not None:
         if cfg.enable_eplb:
             if cfg.eplb_algorithm == "auto":
@@ -463,16 +523,37 @@ def handle_elastic_ep(server_args: Any):
             f"(got pp_size={cfg.pp_size}); WORLD must not span PP stages."
         )
 
-        decode_cuda_graph_disabled = (
-            cfg.cuda_graph_config.decode.backend == Backend.DISABLED
+        decode_backend = cfg.cuda_graph_config.decode.backend
+        assert decode_backend in (Backend.DISABLED, Backend.FULL), (
+            "Elastic EP runtime scale-up supports decode CUDA graph backend "
+            f"'full' or 'disabled' (got {decode_backend!r})."
         )
-        prefill_cuda_graph_disabled = (
-            cfg.cuda_graph_config.prefill.backend == Backend.DISABLED
+        assert cfg.cuda_graph_config.prefill.backend == Backend.DISABLED, (
+            "Elastic EP runtime scale-up requires prefill CUDA graph to be disabled."
         )
-        assert decode_cuda_graph_disabled and prefill_cuda_graph_disabled, (
-            "Elastic EP runtime scale-up requires decode and prefill CUDA "
-            "graphs to be disabled."
-        )
+        if decode_backend == Backend.FULL:
+            assert cfg.device == "cuda", (
+                "Elastic EP CUDA graph recapture requires CUDA "
+                f"(got device={cfg.device!r})."
+            )
+            assert cfg.speculative_algorithm is None, (
+                "Elastic EP CUDA graph recapture does not support speculative decoding."
+            )
+            assert not cfg.is_embedding, (
+                "Elastic EP CUDA graph recapture does not support embedding models."
+            )
+            assert cfg.dllm_algorithm is None, (
+                "Elastic EP CUDA graph recapture does not support diffusion models."
+            )
+            assert not cfg.encoder_only, (
+                "Elastic EP CUDA graph recapture does not support encoder-only models."
+            )
+            assert not cfg.forward_hooks, (
+                "Elastic EP CUDA graph recapture does not support forward hooks."
+            )
+            assert not cfg.enable_pdmux, (
+                "Elastic EP CUDA graph recapture does not support PDMux."
+            )
         assert resolved.enable_dp_attention, (
             "Elastic EP scale-up requires --enable-dp-attention; without it "
             "the TP group is not equivalent to WORLD and the post-scale "
@@ -551,13 +632,6 @@ def handle_eplb_and_dispatch(server_args: Any):
 
 def handle_expert_distribution_metrics(server_args: Any):
     cfg = resolving_view(server_args)
-    if "SGLANG_ENABLE_EPLB_BALANCEDNESS_METRIC" in os.environ:
-        raise ValueError(
-            "SGLANG_ENABLE_EPLB_BALANCEDNESS_METRIC is no longer supported. Use "
-            "--expert-balancedness-report-mode with one of: off, server_log, "
-            "prometheus, both."
-        )
-
     if should_report_expert_balancedness(server_args) and (
         cfg.expert_distribution_recorder_mode is None
     ):
@@ -586,9 +660,7 @@ def validate_prefill_cp_platform(server_args: Any):
     """Reject deprecated platform CP before resolving models or CP topology."""
     cfg = resolving_view(server_args)
     platform = get_platform()
-    if cfg.enable_prefill_cp and (
-        platform.is_hip or platform.is_npu or platform.is_musa
-    ):
+    if cfg.enable_prefill_cp and (platform.is_hip or platform.is_musa):
         raise ValueError(
-            "Prefill CP on HIP/NPU/MUSA is deprecated; CP support will be refactored soon."
+            "Prefill CP on HIP/MUSA is deprecated; CP support will be refactored soon."
         )

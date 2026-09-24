@@ -2,9 +2,17 @@
 //! registers its routes here, and [`serve`] runs the assembled app on the
 //! pre-bound listener until shutdown.
 
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 
-use axum::Router;
+use axum::{
+    Router,
+    extract::{Request, State},
+    middleware::Next,
+    response::Response,
+};
 
 use super::disaggregation::bootstrap as pd_bootstrap;
 use super::{common, log, native_api, openai};
@@ -26,6 +34,57 @@ pub(super) struct AppState {
     pub(super) chat_formatter: Option<openai::ChatFormatter>,
     /// Response heartbeat (bumped per drained ring frame).
     pub(super) response_activity: ActivityCounter,
+    /// Whether the main process's startup warmup has completed. The listener
+    /// binds before warmup so `/model_info` is available to construct that
+    /// request, but health endpoints must not advertise readiness yet.
+    pub(super) startup_readiness: StartupReadiness,
+}
+
+pub(super) struct StartupReadiness(AtomicBool);
+
+impl StartupReadiness {
+    fn new(skip_server_warmup: bool) -> Self {
+        Self(AtomicBool::new(skip_server_warmup))
+    }
+
+    pub(super) fn is_ready(&self) -> bool {
+        self.0.load(Ordering::Acquire)
+    }
+
+    fn record_warmup_status(&self, status: axum::http::StatusCode) {
+        if status.is_success() {
+            self.0.store(true, Ordering::Release);
+        }
+    }
+}
+
+impl Default for StartupReadiness {
+    fn default() -> Self {
+        Self::new(false)
+    }
+}
+
+/// Private marker attached by the main process to its startup warmup request.
+/// The middleware flips readiness only after that request returns successfully.
+const STARTUP_WARMUP_HEADER: &str = "x-sglang-startup-warmup";
+
+async fn mark_startup_ready(
+    State(state): State<Arc<AppState>>,
+    req: Request,
+    next: Next,
+) -> Response {
+    let is_startup_warmup = req.headers().contains_key(STARTUP_WARMUP_HEADER)
+        && matches!(
+            req.uri().path(),
+            "/generate" | "/encode" | "/v1/chat/completions"
+        );
+    let response = next.run(req).await;
+    if is_startup_warmup && response.status().is_success() {
+        state
+            .startup_readiness
+            .record_warmup_status(response.status());
+    }
+    response
 }
 
 pub async fn serve(
@@ -47,6 +106,7 @@ pub async fn serve(
         server_args: server_args.clone(),
         chat_formatter,
         response_activity,
+        startup_readiness: StartupReadiness::new(server_args.skip_server_warmup),
     });
     // Each endpoint module registers its own routes and merges here.
     let router = Router::new()
@@ -61,6 +121,10 @@ pub async fn serve(
     // No body limit, matching the Python server.
     let mut app = router
         .layer(axum::extract::DefaultBodyLimit::disable())
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            mark_startup_ready,
+        ))
         .with_state(state);
 
     // Prefill-only KV bootstrap registry. Merged AFTER `with_state` — its
@@ -100,5 +164,25 @@ pub async fn serve(
         _ = shutdown.recv_async() => {
             tracing::info!("shutdown: stopping accepts, aborting in-flight handlers");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::http::StatusCode;
+
+    #[test]
+    fn startup_readiness_requires_successful_warmup_unless_skipped() {
+        let readiness = StartupReadiness::new(false);
+        assert!(!readiness.is_ready());
+
+        readiness.record_warmup_status(StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(!readiness.is_ready());
+
+        readiness.record_warmup_status(StatusCode::OK);
+        assert!(readiness.is_ready());
+
+        assert!(StartupReadiness::new(true).is_ready());
     }
 }
