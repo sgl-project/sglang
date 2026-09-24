@@ -108,6 +108,34 @@ class TestDsv41EncoderOnlyRatioLayout(unittest.TestCase):
     @patch("sglang.srt.arg_groups.deepseek_v4_hook.get_platform")
     @patch("sglang.srt.arg_groups.deepseek_v4_hook.model_config_of")
     @patch("sglang.srt.arg_groups.deepseek_v4_hook.resolving_view")
+    def test_encoder_only_accepts_decode_local_dspark_only(
+        self, resolving_view, model_config_of, get_platform
+    ):
+        hf_config = _official_config(
+            model_type="deepseek_v41",
+            hc_pre_from_prev_sublayer=True,
+            kv_source_layer_ids=[2, 8, 14, 20],
+            index_source_layer_ids=[2, 8, 14, 20],
+            engram_layer_ids=[],
+        )
+        model_config_of.return_value = SimpleNamespace(hf_config=hf_config)
+        get_platform.return_value.is_cuda = True
+
+        for role, accepted in (("prefill", False), ("decode", True)):
+            with self.subTest(role=role):
+                resolving_view.return_value = _encoder_only_args(
+                    disaggregation_mode=role,
+                    speculative_algorithm="DSPARK",
+                )
+                if accepted:
+                    validate_deepseek_v41_features(SimpleNamespace())
+                else:
+                    with self.assertRaisesRegex(ValueError, "Decode-local DSpark"):
+                        validate_deepseek_v41_features(SimpleNamespace())
+
+    @patch("sglang.srt.arg_groups.deepseek_v4_hook.get_platform")
+    @patch("sglang.srt.arg_groups.deepseek_v4_hook.model_config_of")
+    @patch("sglang.srt.arg_groups.deepseek_v4_hook.resolving_view")
     def test_encoder_only_still_rejects_two_batch_overlap(
         self, resolving_view, model_config_of, get_platform
     ):
