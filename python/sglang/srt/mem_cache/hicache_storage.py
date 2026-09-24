@@ -457,13 +457,6 @@ class HiCacheFile(HiCacheStorage):
             return self._get_suffixed_key(key)
         return self._get_suffixed_key(f"{key}.{component_name}")
 
-    def _get_component_path(
-        self, key: str, component_name: Optional[str] = None
-    ) -> str:
-        return os.path.join(
-            self.file_path, f"{self._get_component_key(key, component_name)}.bin"
-        )
-
     def _scan_existing_files_to_metadata_cache(self) -> None:
         try:
             names = os.listdir(self.file_path)
