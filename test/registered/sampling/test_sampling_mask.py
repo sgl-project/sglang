@@ -796,6 +796,61 @@ class TestSamplingMaskDeterministic(SamplingMaskTestMixin, CustomTestCase):
             outputs.append((output["output_ids"], output["text"]))
         self.assertEqual(outputs[0], outputs[1])
 
+    def test_modes_and_streaming_return_identical_sampling_masks(self):
+        """For the same seeded tokens, selected and support mode report the same
+        supports, each selected logprob is the sampled token's support logprob, and a
+        stream that emits every token matches the response emitted every 50 tokens."""
+        sampling_params = {
+            "top_k": _TOP_K,
+            "top_p": 1.0,
+            "sampling_seed": _SAMPLING_SEED,
+            "max_new_tokens": 64,
+        }
+        responses = {}
+        for mode, stream in (
+            ("support", False),
+            ("selected", False),
+            ("support", True),
+        ):
+            response = self._post_generate(
+                sampling_params, sampling_logprobs_mode=mode, stream=stream
+            )
+            self.assertEqual(response.status_code, 200, response.text)
+            if stream:
+                chunks = [
+                    json.loads(line[6:])
+                    for line in response.iter_lines()
+                    if line.startswith(b"data: ") and line[6:] != b"[DONE]"
+                ]
+                responses[mode, stream] = chunks[-1]
+            else:
+                responses[mode, stream] = response.json()
+
+        support = responses["support", False]
+        output_ids = support["output_ids"]
+        masks = self._assert_sampling_masks(output_ids, support["meta_info"])
+        support_logprobs = support["meta_info"]["output_token_sampling_logprobs"]
+
+        selected = responses["selected", False]
+        self.assertEqual(selected["output_ids"], output_ids)
+        self.assertEqual(selected["meta_info"]["output_token_sampling_mask"], masks)
+        self.assertEqual(
+            selected["meta_info"]["output_token_sampling_logprobs"],
+            [
+                logprobs[mask.index(token)]
+                for token, mask, logprobs in zip(output_ids, masks, support_logprobs)
+            ],
+        )
+
+        streamed = responses["support", True]
+        self.assertEqual(streamed["output_ids"], output_ids)
+        for key in (
+            "output_token_sampling_mask",
+            "output_token_sampling_logprobs",
+            "output_token_sampling_mask_length",
+        ):
+            self.assertEqual(streamed["meta_info"][key], support["meta_info"][key])
+
 
 class TestSamplingMaskPytorch(TestSamplingMask):
     _sampling_backend = "pytorch"
