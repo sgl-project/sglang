@@ -633,10 +633,12 @@ class Step3p5DecoderLayer(nn.Module):
             if not fuse_mlp_allreduce and not mlp_reduce_scatter:
                 hidden_states = tensor_model_parallel_all_reduce(hidden_states)
         else:
-            hidden_states = self.mlp(hidden_states)
-            # Dense MLP uses reduce_results=True, so the output is already
-            # all-reduced.  Do NOT set the fusion flag — otherwise the next
-            # layer would all-reduce again, multiplying values by world_size.
+            # The dense MLP all-reduces its own output unless postprocess
+            # reduce-scatters it; it never leaves the sum to the next layer.
+            with get_forward().scoped(
+                fuse_mlp_allreduce=False, mlp_reduce_scatter=mlp_reduce_scatter
+            ):
+                hidden_states = self.mlp(hidden_states)
             fuse_mlp_allreduce = False
 
         if fuse_mlp_allreduce:
