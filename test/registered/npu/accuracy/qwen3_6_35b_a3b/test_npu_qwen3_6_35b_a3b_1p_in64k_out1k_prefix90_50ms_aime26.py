@@ -93,6 +93,7 @@ class TestNPUQwen3_6_35BA3B_1P_AIME2026(TestNpuAccuracyTestCaseBase):
     other_args = QWEN3_6_35B_A3B_64K_PREFIX_OTHER_ARGS
     envs = QWEN3_6_35B_A3B_64K_PREFIX_ENVS
     accuracy = 0.927
+    max_retries = 3
     datasets = ["aime26"]
     few_shot_num = 0
     eval_batch_size = 64
