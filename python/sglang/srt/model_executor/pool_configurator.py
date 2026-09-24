@@ -1084,6 +1084,7 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
             dsv4_unified_row_bytes,
         )
 
+        # swa_window_size is the model's sliding window (cfg.window_size).
         self._swa_ring_size = get_swa_ring_size(
             self.swa_window_size, self.is_speculative
         )
