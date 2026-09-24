@@ -349,7 +349,7 @@ def decode_fp8_2buff(
     )
 
     rows = unified_kv.shape[0]
-    out = q_rope.new_empty((T, H, v_head_dim))
+    out = q_rope.new_empty((n_seq * max_seqlen_q, H, v_head_dim))
     # Left None, the wrapper's occupancy heuristic picks it, folds the cross-split
     # merge back into `out`, and leaves the final bf16 there whether or not it
     # split. Pinning it to 1 costs 6.9x at bs=1 kv=2048.
@@ -375,7 +375,7 @@ def decode_fp8_2buff(
     # ReqToTokenPool reserves, so the builders can't emit a zero-length one, and
     # the compare + masked_fill_ was costing a launch per layer for it. One would
     # come back NaN now (all-sink denominator); the guard UT pins that.
-    return out
+    return out[:T]
 
 
 @triton.jit
