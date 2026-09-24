@@ -99,21 +99,6 @@ serving. Image edits are not merged across requests; use `n` for multiple
 outputs within an edit request. Batching can improve offload throughput, but
 changes floating-point rounding and is not always faster with resident weights.
 
-### Ming-Image
-
-Ming-Image Design supports native RGBA generation and single-image editing.
-Design-Layer returns ordered transparent layers from one reference image:
-
-```bash
-sglang generate --model-path inclusionAI/Ming-Image-0.1-Design \
-  --prompt "A minimalist exhibition poster" --height 1024 --width 1024 --save-output
-sglang generate --model-path inclusionAI/Ming-Image-0.1-Design-Layer \
-  --image-path /path/to/input.png --num-layers 4 --save-output
-```
-
-See the [Ming-Image cookbook](../../../docs/cookbook/diffusion/inclusionAI/Ming-Image.mdx)
-for checkpoint selection, image API requests, and runtime feature boundaries.
-
 ### Component residency
 
 Use `--component-residency COMPONENT=MODE` to choose one runtime mode for each
