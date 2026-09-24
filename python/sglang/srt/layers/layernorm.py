@@ -13,7 +13,6 @@
 # ==============================================================================
 """Fused operators for normalization layers."""
 
-import functools
 import logging
 from functools import lru_cache
 from typing import Optional, Tuple, Union
@@ -150,7 +149,7 @@ if _is_hip:
         _has_rocm_triton_gemma_rms_norm = False
 
 
-@functools.cache
+@lru_cache(maxsize=1)
 def _fuse_norm_fp8_max_m() -> int:
     if not is_gfx95_supported():
         return 0
@@ -403,12 +402,9 @@ def _forward_with_allreduce_fusion_quant_per_token(
     residual: Optional[torch.Tensor],
     weight: torch.Tensor,
 ):
-    """Fused AR + RMSNorm + per-token FP8 quant (ROCm/aiter, single kernel).
+    """Fused AR + RMSNorm + per-token FP8 quant; the bf16 output carries ``_fp8_qinput``.
 
-    Returns ``(normed_bf16, residual)`` where the bf16 output carries the
-    quantized pair as ``out._fp8_qinput = (fp8, scale)`` -- the same handoff
-    the Triton fused-add-RMSNorm uses --
-    or ``None`` when the fused kernel cannot service the request.
+    Returns ``None`` when the fused kernel cannot service the request.
     """
     if residual is None or not _use_aiter:
         return None

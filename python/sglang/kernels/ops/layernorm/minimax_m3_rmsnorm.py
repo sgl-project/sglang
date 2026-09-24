@@ -81,8 +81,7 @@ def _gemma_fused_add_rmsnorm_kernel(
     rstd = 1.0 / tl.sqrt(var + eps)
     w = tl.load(w_ptr + cols, mask=mask, other=0.0).to(tl.float32)
     out = s * rstd * (1.0 + w)
-    # TODO: can we avoid the fp32->bf16->fp32 round trip? The round trip is to
-    # maintain the parity with the unfused path
+    # quantize the bf16-rounded output so the fp8 matches per_token_quant on the unfused path
     out_cast = out.to(out_ptr.dtype.element_ty)
     tl.store(out_ptr + row * n_cols + cols, out_cast, mask=mask)
     if EMIT_FP8:
@@ -138,8 +137,7 @@ def gemma_fused_add_rmsnorm(
 ):
     """Fused (x + residual) then Gemma RMSNorm; returns (normed, pre-norm sum).
 
-    With ``emit_fp8``, also computes the per-token fp8 quant of the normed
-    output.
+    With ``emit_fp8``, normed also carries its per-token fp8 quant as ``_fp8_qinput``.
     """
     orig_shape = x.shape
     n = orig_shape[-1]

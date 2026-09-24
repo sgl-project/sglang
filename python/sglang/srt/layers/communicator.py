@@ -108,9 +108,7 @@ _fuse_norm_fp8_max_m = MXFP8_DENSE_PTPC_DECODE_MAX_M if _is_gfx95_supported else
 
 
 def _fuse_norm_fp8_quant(hidden_states: torch.Tensor) -> bool:
-    """Same gate as the Triton fused-add-RMSNorm fp8 emission: only up to the
-    M where the ptpc decode GEMM (the only consumer of the pre-quantized pair)
-    is selected, and only on the arch that has that GEMM."""
+    """Emit fp8 only where the ptpc decode GEMM, its sole consumer, is selected."""
     return hidden_states.numel() // hidden_states.shape[-1] <= _fuse_norm_fp8_max_m
 
 
@@ -739,9 +737,6 @@ class LayerCommunicator:
                             "forward_with_allreduce_fusion_quant_per_token",
                         )
                     ):
-                        # Fused AR+RMSNorm+per-token quant: the bf16 output
-                        # carries (fp8, scale) for ptpc consumers, matching the
-                        # Triton fused-add-RMSNorm handoff.
                         quant_result = self.input_layernorm.forward_with_allreduce_fusion_quant_per_token(
                             hidden_states, residual
                         )

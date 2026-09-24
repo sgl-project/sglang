@@ -86,8 +86,7 @@ def tensor_model_parallel_fused_allreduce_rmsnorm_quant_per_token(
     """Fused TP all-reduce + RMSNorm + per-token FP8 quant (ROCm/aiter).
 
     Returns ``(fp8_output, residual_out, per_token_scale, bf16_output)``, or
-    ``None`` when the backend cannot service the request. Callers MUST handle
-    ``None`` by falling back to the unquantized fused-AR-RMSNorm path.
+    ``None`` when the backend cannot service the request.
     """
     return get_tp_group().fused_allreduce_rmsnorm_quant_per_token(
         input_, residual_inp_, weight_, eps
