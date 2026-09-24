@@ -136,8 +136,7 @@ class TestPrepareAttnSteps(CustomTestCase):
                 platform(fusion=fusion) as (_, all_reduce),
             ):
                 norm = Norm()
-                hidden_states = torch.ones(2, 4)
-                hidden_states._sglang_needs_allreduce_fusion = True
+                hidden_states = comm.UnreducedOutput(torch.ones(2, 4))
                 communicator(norm).prepare_attn(hidden_states, torch.zeros(2, 4), None)
                 self.assertEqual(all_reduce.call_count, 0 if fusion else 1)
                 self.assertEqual(

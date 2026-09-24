@@ -28,9 +28,11 @@ from sglang.srt.layers.attention.vision import VisionAttention
 from sglang.srt.layers.communicator import (
     LayerCommunicator,
     LayerScatterModes,
-    complete_deferred_allreduce,
+    UnreducedOutput,
     enable_moe_dense_fully_dp,
     get_attn_tp_context,
+    layer_input_buffer,
+    reduce_output,
 )
 from sglang.srt.layers.communicator_mhc import MHCLayerCommunicator
 from sglang.srt.layers.layernorm import RMSNorm
@@ -923,7 +925,7 @@ class Glm5NextDecoderLayer(nn.Module):
         gemm_output_zero_allocator: BumpAllocator = None,
         prev_topk_indices: Optional[torch.Tensor] = None,
     ):
-        hidden_states_orig = hidden_states
+        hidden_states_orig = layer_input_buffer(hidden_states)
 
         hidden_states, residual = self.layer_communicator.prepare_attn(
             hidden_states,
@@ -987,7 +989,7 @@ class Glm5NextDecoderLayer(nn.Module):
                 )
 
         if should_allreduce_fusion:
-            hidden_states._sglang_needs_allreduce_fusion = True
+            hidden_states = UnreducedOutput(hidden_states)
 
         if not should_allreduce_fusion:
             hidden_states, residual = self.layer_communicator.postprocess_layer(
@@ -1182,7 +1184,7 @@ class Glm5NextModel(nn.Module):
             )
             with ctx:
                 if i in self.layers_to_capture:
-                    hidden_states = complete_deferred_allreduce(hidden_states)
+                    hidden_states = reduce_output(hidden_states)
                     aux_hidden_state = self._prepare_aux_hidden_state(
                         hidden_states, residual
                     )

@@ -46,7 +46,8 @@ from sglang.srt.layers.attention.mamba.mamba import mamba_v2_sharded_weight_load
 from sglang.srt.layers.communicator import (
     LayerCommunicator,
     LayerScatterModes,
-    complete_deferred_allreduce,
+    UnreducedOutput,
+    reduce_output,
 )
 from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
@@ -312,8 +313,7 @@ def _finish_mlp_output(hidden_states, *, expect_deferred: bool):
     if not expect_deferred:
         if isinstance(hidden_states, MoeFinalizeHandoff):
             raise RuntimeError("unexpected deferred-finalize handoff")
-        hidden_states._sglang_needs_allreduce_fusion = True
-        return hidden_states
+        return UnreducedOutput(hidden_states)
 
     if not isinstance(hidden_states, MoeFinalizeHandoff):
         raise RuntimeError("Qwen3.5 expected a FlashInfer deferred-finalize handoff")
@@ -1938,7 +1938,7 @@ class Qwen3_5ForCausalLM(nn.Module):
                 and layer_idx < 3
             ):
                 sep = self.hidden_size * layer_idx
-                hidden_states = complete_deferred_allreduce(hidden_states)
+                hidden_states = reduce_output(hidden_states)
                 hidden_states.add_(
                     input_deepstack_embeds[:, sep : sep + self.hidden_size]
                 )

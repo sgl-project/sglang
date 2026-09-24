@@ -39,6 +39,7 @@ from sglang.srt.layers.communicator import (
     LayerCommunicator,
     LayerScatterModes,
     ScatterMode,
+    UnreducedOutput,
     enable_moe_dense_fully_dp,
 )
 from sglang.srt.layers.dp_attention import (
@@ -1417,7 +1418,7 @@ class MiniMaxM3DecoderLayer(nn.Module):
             )
 
         if should_allreduce_fusion:
-            hidden_states._sglang_needs_allreduce_fusion = True
+            hidden_states = UnreducedOutput(hidden_states)
         else:
             hidden_states, residual = self.layer_communicator.postprocess_layer(
                 hidden_states, residual, forward_batch

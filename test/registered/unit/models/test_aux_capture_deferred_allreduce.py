@@ -60,7 +60,7 @@ class DeferringLayer(nn.Module):
         *args,
         **kwargs,
     ):
-        hidden_states = comm.complete_deferred_allreduce(hidden_states)
+        hidden_states = comm.reduce_output(hidden_states)
         if residual is None:
             residual = hidden_states.clone()
         else:

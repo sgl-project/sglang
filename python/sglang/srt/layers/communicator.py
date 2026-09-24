@@ -18,6 +18,7 @@ from enum import Enum, auto
 from functools import cached_property, partial
 from typing import Callable, Dict, Optional, Tuple, Union
 
+import msgspec
 import torch
 
 from sglang.srt.distributed import (
@@ -621,6 +622,32 @@ def _attn_input_update_and_read_residual(quant_format: str):
     return _update_and_read_residual_plain
 
 
+class UnreducedOutput(msgspec.Struct, frozen=True):
+    """A layer output that still owes its FFN all-reduce, left for the next
+    layer's input norm. Hand it to the next layer, or pass it through
+    reduce_output() before reading it any other way."""
+
+    partial: torch.Tensor
+
+
+def reduce_output(
+    hidden_states: Union[torch.Tensor, UnreducedOutput, None],
+) -> Optional[torch.Tensor]:
+    """Run the all-reduce an UnreducedOutput still owes; pass anything else through."""
+    if isinstance(hidden_states, UnreducedOutput):
+        return deferred_post_experts_all_reduce(hidden_states.partial)
+    return hidden_states
+
+
+def layer_input_buffer(
+    hidden_states: Union[torch.Tensor, UnreducedOutput],
+) -> torch.Tensor:
+    """The tensor holding a layer's input, for reusing its memory without reading it."""
+    if isinstance(hidden_states, UnreducedOutput):
+        return hidden_states.partial
+    return hidden_states
+
+
 class LayerCommunicator:
     def __init__(
         self,
@@ -762,12 +789,15 @@ class LayerCommunicator:
 
     def prepare_attn(
         self,
-        hidden_states: torch.Tensor,
+        hidden_states: Union[torch.Tensor, UnreducedOutput],
         residual: torch.Tensor,
         forward_batch: ForwardBatch,
         quant_format: str = "",
         post_residual_addition: Optional[torch.Tensor] = None,
     ):
+        pending = isinstance(hidden_states, UnreducedOutput)
+        if pending:
+            hidden_states = hidden_states.partial
         # residual is None marks the first decoder layer, where the SP region
         # opens: re-evaluated per forward so a crash mid-loop cannot leak into
         # the next one.
@@ -793,11 +823,7 @@ class LayerCommunicator:
             )
         if hidden_states.shape[0] == 0:
             residual = hidden_states
-        elif (
-            residual is not None
-            and hasattr(hidden_states, "_sglang_needs_allreduce_fusion")
-            and hidden_states._sglang_needs_allreduce_fusion
-        ):
+        elif residual is not None and pending:
             hidden_states, residual = self._reduce_output_and_update_and_read_residual(
                 hidden_states, residual, forward_batch
             )
@@ -929,14 +955,14 @@ class LayerCommunicator:
 
     def finish_layer_stack(
         self,
-        hidden_states: torch.Tensor,
+        hidden_states: Union[torch.Tensor, UnreducedOutput],
         residual: Optional[torch.Tensor],
         forward_batch: ForwardBatch,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """Complete what this layer left for a next layer. Call it on the last
         layer of this rank before its output reaches the final norm, the next
         pipeline rank, or any other consumer outside the layers."""
-        return complete_deferred_allreduce(hidden_states), residual
+        return reduce_output(hidden_states), residual
 
     def should_use_reduce_scatter(self, forward_batch: ForwardBatch):
         if not self.allow_reduce_scatter:
@@ -1097,29 +1123,17 @@ class FfnExit:
 
     def finish(
         self, hidden_states: torch.Tensor, residual: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> Tuple[Union[torch.Tensor, UnreducedOutput], torch.Tensor]:
         """Leave the reduction to the next layer's input norm, or postprocess."""
         if not isinstance(hidden_states, torch.Tensor):
             # A deferred MoE finalize handoff, consumed by the next prepare_attn.
             assert self.defer_moe_finalize, "unrequested deferred MoE handoff"
             return hidden_states, residual
         if self.fuse_mlp_allreduce:
-            hidden_states._sglang_needs_allreduce_fusion = True
-            return hidden_states, residual
+            return UnreducedOutput(hidden_states), residual
         return self.communicator.postprocess_layer(
             hidden_states, residual, self.forward_batch
         )
-
-
-def complete_deferred_allreduce(hidden_states: torch.Tensor) -> torch.Tensor:
-    """Run the all-reduce a layer left for the next layer's input norm."""
-    if (
-        hasattr(hidden_states, "_sglang_needs_allreduce_fusion")
-        and hidden_states._sglang_needs_allreduce_fusion
-    ):
-        hidden_states = deferred_post_experts_all_reduce(hidden_states)
-        hidden_states._sglang_needs_allreduce_fusion = False
-    return hidden_states
 
 
 @dataclass

@@ -32,7 +32,7 @@ from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.layers.communicator import (
     LayerCommunicator,
     LayerScatterModes,
-    complete_deferred_allreduce,
+    reduce_output,
 )
 from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
@@ -725,7 +725,7 @@ class GptOssModel(nn.Module):
                     positions, hidden_states, forward_batch, residual
                 )
                 if i + 1 in self.layers_to_capture:
-                    hidden_states = complete_deferred_allreduce(hidden_states)
+                    hidden_states = reduce_output(hidden_states)
                     aux_hidden_states.append(
                         hidden_states + residual
                         if residual is not None
