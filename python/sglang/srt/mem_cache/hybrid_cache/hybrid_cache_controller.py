@@ -39,6 +39,7 @@ from sglang.srt.mem_cache.l2_transfer import L2Transfer
 from sglang.srt.mem_cache.pool_host import HostPoolGroup, PoolEntry
 from sglang.srt.mem_cache.pool_host.base import uses_shared_host_layout
 from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
+from sglang.srt.mem_cache.pool_host.unified import UnifiedPageEnvelopeHostPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.runtime_context import get_memory
 
@@ -266,6 +267,18 @@ class HybridCacheController(BaseHiCacheController):
         storage_backend_extra_config: Optional[dict] = None,
         host_pools: Optional[list[PoolEntry]] = None,
     ):
+        if (
+            self.host_memory_mode == "buffer_only"
+            and storage_backend == "mooncake"
+            and isinstance(self.storage_host_pool, UnifiedPageEnvelopeHostPool)
+        ):
+            # A runtime backend switch cannot replace the existing host arena.
+            # Reject before creating storage threads or distributed groups.
+            raise ValueError(
+                "Mooncake buffer_only requires separate K/V host pools. "
+                "Restart with --hicache-storage-backend mooncake to select "
+                "compatible host pools."
+            )
         enable_pp_ticket = (
             self.host_memory_mode == "buffer_only"
             and storage_backend == "mooncake"

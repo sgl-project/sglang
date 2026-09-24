@@ -1122,6 +1122,7 @@ class TestUnifiedRadixCacheEagleHiCacheStorageKey(CustomTestCase):
                 host_indices=torch.empty(0, dtype=torch.int64),
                 aux_xfers=[],
                 lock_params=lock_params,
+                occupied_units=0,
             )
         }
         cache.buffer_pipeline = pipeline

@@ -60,12 +60,12 @@ _TABLES = {"virtual_to_physical", "physical_to_virtual"}
 # Methods that MUST tombstone through index_fill_; hand-listed because "writes
 # a tombstone" is a per-method design fact a scan cannot infer. Completeness is
 # guarded by `test_every_allocator_free_path_is_listed` below.
+# SWA releases delegate to the virtual-owner sub-pool free paths below;
+# clear_full_to_swa_mapping is a no-op and no longer owns a separate table.
 _TOMBSTONE_METHODS = [
     (mea.MultiEndedAllocator, "_free_lazy"),
     (mea.MultiEndedAllocator, "free"),
-    (mea.MultiEndedAllocator, "free_physical"),
     (mea.MultiEndedAllocator, "_commit_move_batch"),
-    (unified_hybrid_swa.UnifiedSWAAllocatorBase, "clear_full_to_swa_mapping"),
     (mea.FloatMultiEndedAllocator, "free"),
     (mea.FloatMultiEndedAllocator, "make_room"),
     (mea.FloatMultiEndedAllocator, "_relocate_to_positions"),
