@@ -17,6 +17,7 @@ import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.layers import k3_ar_fusion
+from sglang.srt.runtime_context import get_exec, get_parallel
 
 if TYPE_CHECKING:
     from sglang.srt.distributed.device_communicators.custom_all_reduce_v2 import (
@@ -64,7 +65,6 @@ def _init_state() -> Optional[_State]:
     from sglang.srt.distributed.device_communicators.custom_all_reduce_v2 import (
         CustomAllReduceV2,
     )
-    from sglang.srt.runtime_context import get_exec, get_parallel
     from sglang.srt.utils.common import get_device_sm
 
     a2a = get_exec().moe.moe_a2a_backend
@@ -85,7 +85,8 @@ def _init_state() -> Optional[_State]:
         (logger.warning if explicit else logger.info)(message)
         return None
 
-    from sglang.kernels.ops.kimi_k3 import attn_res, sp_collective
+    from sglang.kernels.ops.attention import attn_res
+    from sglang.kernels.ops.communication import sp_collective
 
     # Refuse to enable without a checked-in table for this exact device.
     if (
@@ -137,7 +138,7 @@ def requires_symmetric_rs(num_tokens: int, device: torch.device) -> bool:
     state = _init_state()
     if state is None:
         return False
-    from sglang.kernels.ops.kimi_k3 import sp_collective
+    from sglang.kernels.ops.communication import sp_collective
 
     dispatch = sp_collective.get_dispatch(
         "reduce_scatter",
@@ -257,7 +258,7 @@ def reduce_scatter_res(
     state = _init_state()
     if state is None or not _eligible(state, tensor, residual):
         return None
-    from sglang.kernels.ops.kimi_k3 import sp_collective
+    from sglang.kernels.ops.communication import sp_collective
 
     dispatch = sp_collective.get_dispatch(
         "reduce_scatter",
@@ -324,7 +325,8 @@ def reduce_scatter_attn_res(
         or ow.shape != (_HIDDEN_SIZE,)
     ):
         return None
-    from sglang.kernels.ops.kimi_k3 import attn_res, sp_collective
+    from sglang.kernels.ops.attention import attn_res
+    from sglang.kernels.ops.communication import sp_collective
 
     dispatch = sp_collective.get_fusion_dispatch(
         "reduce_scatter_attn_res",
@@ -375,7 +377,7 @@ def all_gather(tensor: torch.Tensor) -> Optional[torch.Tensor]:
         or tensor.numel() * tensor.element_size() > state.comm.max_push_size
     ):
         return None
-    from sglang.kernels.ops.kimi_k3 import sp_collective
+    from sglang.kernels.ops.communication import sp_collective
 
     dispatch = sp_collective.get_dispatch(
         "all_gather",
@@ -437,7 +439,8 @@ def attn_res_all_gather(
         or ow.shape != (_HIDDEN_SIZE,)
     ):
         return None
-    from sglang.kernels.ops.kimi_k3 import attn_res, sp_collective
+    from sglang.kernels.ops.attention import attn_res
+    from sglang.kernels.ops.communication import sp_collective
 
     global_tokens = prefix.shape[0] * state.group.world_size
     dispatch = sp_collective.get_fusion_dispatch(

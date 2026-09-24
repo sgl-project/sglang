@@ -14,7 +14,7 @@ from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=9, suite="base-a-test-cpu")
+register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
 
 class TestMmProcessConfigValidation(CustomTestCase):
@@ -75,6 +75,21 @@ class TestMmProcessConfigValidation(CustomTestCase):
 class TestBaseProcessorConfigExtraction(CustomTestCase):
     """Verify BaseMultimodalProcessor.__init__ extracts configs from server_args."""
 
+    def _patch_platform(self, cuda_alike, device_type):
+        platforms = SimpleNamespace(
+            current_platform=SimpleNamespace(
+                is_cuda_alike=lambda: cuda_alike,
+                device_type=device_type,
+            )
+        )
+        return patch.multiple(
+            "sglang.srt.multimodal.processors.base_processor",
+            _is_cpu=False,
+            _is_xpu=False,
+            _is_npu=False,
+            platforms=platforms,
+        )
+
     def _make_processor(
         self,
         mm_process_config,
@@ -100,17 +115,22 @@ class TestBaseProcessorConfigExtraction(CustomTestCase):
         override.install()
         self.addCleanup(override.restore)
 
-        server_args = MagicMock()
-        server_args.mm_processor_worker_num = mm_processor_worker_num
-        server_args.mm_io_worker_num = mm_io_worker_num
-        server_args.mm_preprocess_cache_size_mb = None
-        server_args.tokenizer_worker_num = 1
-        server_args.trust_mm_content_hashes = False
-        server_args.media_url_max_file_size_mb = 64
-        # A bare MagicMock makes every attribute truthy, which silently sends
-        # the worker-count decision down the CPU branch. Pin what it reads.
-        server_args.disable_fast_image_processor = False
-        server_args.rl_on_policy_target = None
+        # A real record: a bare MagicMock makes every attribute truthy, which
+        # sends the worker-count decision down the wrong branch.
+        from sglang.srt.server_args import ServerArgs
+
+        server_args = ServerArgs(
+            model_path="dummy",
+            mm_process_config=mm_process_config,
+            allowed_media_domains=[],
+            mm_processor_worker_num=mm_processor_worker_num,
+            mm_io_worker_num=mm_io_worker_num,
+            mm_preprocess_cache_size_mb=None,
+            tokenizer_worker_num=1,
+            trust_mm_content_hashes=False,
+            media_url_max_file_size_mb=64,
+            disable_fast_image_processor=False,
+        )
 
         hf_config = MagicMock()
         mock_hf_processor = MagicMock()
@@ -205,11 +225,22 @@ class TestBaseProcessorConfigExtraction(CustomTestCase):
         9.30 -> 4.02 req/s on GB300 for full-page images."""
         from transformers import BaseImageProcessor
 
-        proc = self._make_processor(
-            {}, image_processor=MagicMock(spec=BaseImageProcessor)
-        )
+        with self._patch_platform(cuda_alike=True, device_type="cuda"):
+            proc = self._make_processor(
+                {}, image_processor=MagicMock(spec=BaseImageProcessor)
+            )
         self.assertEqual(proc.mm_processor_worker_num, 1)
         self.assertIsNone(proc.mm_processor_executor)
+
+    def test_non_accelerator_fast_processor_gets_two_workers(self):
+        from transformers import BaseImageProcessor
+
+        with self._patch_platform(cuda_alike=False, device_type="custom"):
+            proc = self._make_processor(
+                {}, image_processor=MagicMock(spec=BaseImageProcessor)
+            )
+        self.assertEqual(proc.mm_processor_worker_num, 2)
+        self.assertIsNotNone(proc.mm_processor_executor)
 
     def test_explicit_request_overrides_the_path_decision(self):
         """The server argument wins: an operator who measured their own workload
@@ -235,7 +266,10 @@ class TestBaseProcessorConfigExtraction(CustomTestCase):
             BaseMultimodalProcessor,
         )
 
-        with patch.object(BaseMultimodalProcessor, "auto_mm_processor_worker_num", 3):
+        with (
+            patch.object(BaseMultimodalProcessor, "auto_mm_processor_worker_num", 3),
+            self._patch_platform(cuda_alike=True, device_type="cuda"),
+        ):
             proc = self._make_processor(
                 {}, image_processor=MagicMock(spec=BaseImageProcessor)
             )
@@ -403,8 +437,12 @@ class TestStreamOrderedMmFeaturePool(CustomTestCase):
     def test_consumer_slot_uses_global_tp_rank(self):
         from sglang.srt.multimodal.transport.memory_pool import resolve_consumer_rank
 
-        parallel = SimpleNamespace(tp_rank=6, attn_tp_rank=2)
-        with patch("sglang.srt.runtime_context.get_parallel", return_value=parallel):
+        # State the topology on the context, not by stubbing the accessor:
+        # `memory_pool` imports `get_parallel` at module scope, so a patch on
+        # the defining module never reaches the copy doing the reading.
+        from sglang.srt.runtime_context import get_parallel
+
+        with get_parallel().override(tp_rank=6, attn_tp_rank=2):
             self.assertEqual(resolve_consumer_rank(8), 6)
 
     def test_complete_group_acknowledges_each_consumer_slot(self):
@@ -484,6 +522,38 @@ class TestStreamOrderedMmFeaturePool(CustomTestCase):
         pool.shutdown()
 
         self.assertFalse(pool._recycle_thread.is_alive())
+
+
+class TestCudaIpcProcessorRollback(CustomTestCase):
+    def test_partial_wrap_failure_restores_items_and_cancels_proxy(self):
+        from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
+        from sglang.srt.multimodal.processors.base_processor import (
+            BaseMultimodalProcessor,
+        )
+        from sglang.srt.multimodal.transport.cuda_ipc import (
+            CudaIpcTensorTransportProxy,
+        )
+
+        with patch.object(BaseMultimodalProcessor, "__abstractmethods__", set()):
+            processor = BaseMultimodalProcessor.__new__(BaseMultimodalProcessor)
+        processor.use_cuda_ipc = True
+        processor.cudaipc_mmfeature_pool = MagicMock()
+        proxy = object.__new__(CudaIpcTensorTransportProxy)
+        processor._wrap_tensor_for_cuda_ipc = MagicMock(
+            side_effect=[proxy, RuntimeError("wrap failed")]
+        )
+        features = [torch.ones(2), torch.ones(3)]
+        items = [
+            MultimodalDataItem(modality=Modality.IMAGE, feature=feature)
+            for feature in features
+        ]
+
+        with self.assertRaisesRegex(RuntimeError, "wrap failed"):
+            processor._prepare_mm_items_for_transport(items)
+
+        processor.cudaipc_mmfeature_pool.cancel_proxy.assert_called_once_with(proxy)
+        self.assertIs(items[0].feature, features[0])
+        self.assertIs(items[1].feature, features[1])
 
 
 class TestPrecomputeHashBeforeCpuTransfer(CustomTestCase):

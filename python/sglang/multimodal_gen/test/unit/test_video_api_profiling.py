@@ -1,3 +1,4 @@
+import inspect
 from dataclasses import fields
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -16,8 +17,13 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.realtime_adapter 
 from sglang.multimodal_gen.runtime.entrypoints.openai.video_api import (
     _build_video_sampling_params,
     _video_request_model_kwargs,
+    create_video,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
+
+
+def test_multipart_video_declares_perf_dump_path_form_field():
+    assert "perf_dump_path" in inspect.signature(create_video).parameters
 
 
 def test_video_api_forwards_profiling_options():

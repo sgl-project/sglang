@@ -1666,14 +1666,14 @@ def cam_scan_bidi_chunkwise(
     q, k, v: camera-prepared ``(B, H, D, N)`` fp32; beta: ``(B, H, F, S)`` fp32;
     decay: ``(B, H, F)`` fp32. Returns ``(B, H, D, N)`` fp32.
     """
-    assert (
-        q.shape == k.shape == v.shape
-    ), f"q/k/v shape mismatch: {q.shape} {k.shape} {v.shape}"
+    assert q.shape == k.shape == v.shape, (
+        f"q/k/v shape mismatch: {q.shape} {k.shape} {v.shape}"
+    )
     assert q.is_contiguous() and k.is_contiguous() and v.is_contiguous()
     assert beta.is_contiguous() and decay.is_contiguous()
-    assert (
-        q.dtype == torch.float32
-    ), f"cam_scan_bidi_chunkwise requires fp32 q/k/v, got {q.dtype}"
+    assert q.dtype == torch.float32, (
+        f"cam_scan_bidi_chunkwise requires fp32 q/k/v, got {q.dtype}"
+    )
 
     B, H, D, N = q.shape
     F = beta.shape[2]

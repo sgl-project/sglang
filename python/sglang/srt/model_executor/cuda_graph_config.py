@@ -26,6 +26,8 @@ import json
 from dataclasses import dataclass, field, replace
 from typing import Any, Dict, List, Optional
 
+from sglang.srt.runtime_context import get_exec
+
 
 class Phase:
     """The two phases of model forward."""
@@ -70,7 +72,8 @@ ALLOWED_BACKENDS_PER_PHASE = {
 # For prefill, bs carries aggregate-token capture buckets for every backend;
 # full_prefill_max_req separately controls Full's fixed request-slot count.
 # full_prefill_max_req and full_prefill_prefix_chunk_tokens are prefill-only and
-# only meaningful when backend == full.
+# only meaningful when backend == full. max_context_size is shared by the
+# breakable and full prefill body-capture backends.
 ALLOWED_KEYS_PER_PHASE = {
     Phase.DECODE: ("backend", "max_bs", "bs", "tc_compiler"),
     Phase.PREFILL: (
@@ -78,8 +81,10 @@ ALLOWED_KEYS_PER_PHASE = {
         "max_bs",
         "bs",
         "tc_compiler",
+        "max_context_size",
         "full_prefill_max_req",
         "full_prefill_prefix_chunk_tokens",
+        "max_seq_len",
     ),
 }
 
@@ -93,6 +98,10 @@ class PhaseConfig:
     bs: Optional[List[int]] = None
     # Only meaningful when backend == tc_piecewise; ignored otherwise.
     tc_compiler: str = "eager"
+    # Effective for both full and breakable backends and currently only DSV4:
+    # fixed maximum context length used by context-shaped prefill graph metadata.
+    # Every token bucket shares this size; larger live contexts run eagerly.
+    max_context_size: Optional[int] = None
     # Only meaningful for the prefill phase with backend == full: max number of
     # request slots baked into each captured graph. Real bs <= full_prefill_max_req
     # reuses the graph (unused slots become zero-length sentinels); larger
@@ -105,6 +114,9 @@ class PhaseConfig:
     # chunk variants and chooses the smallest one covering a batch. None uses
     # the scheduler's aggregate chunked_prefill_size token budget.
     full_prefill_prefix_chunk_tokens: Optional[int] = None
+    # Prefill only: a batch whose longest sequence exceeds this replays eagerly, and
+    # backends that capture context-wide work size it. None defers to token buckets.
+    max_seq_len: Optional[int] = None
 
 
 def default_prefill_backend() -> str:
@@ -201,7 +213,6 @@ def check_cuda_graph_backend(phase: str, backend: str) -> bool:
     """True if cuda_graph_config[phase].backend == backend on the
     published config. Returns False if the config has not been published
     yet (e.g. unit tests, early startup)."""
-    from sglang.srt.runtime_context import get_exec
 
     try:
         cfg = get_exec().graph.cuda_graph_config

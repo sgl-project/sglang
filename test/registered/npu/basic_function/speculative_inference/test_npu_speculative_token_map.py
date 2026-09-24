@@ -20,8 +20,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_npu_ci(est_time=300, suite="base-b-test-4-npu-a3")
-register_npu_ci(est_time=300, suite="nightly-4-npu-a3", nightly=True)
+register_npu_ci(est_time=300, suite="full-4-npu-a3", nightly=True)
 
 
 class TestNpuSpeculativeTokenMap(CustomTestCase):
@@ -67,7 +66,6 @@ class TestNpuSpeculativeTokenMap(CustomTestCase):
         env.update(
             {
                 "SGLANG_ENABLE_OVERLAP_PLAN_STREAM": "1",
-                "SGLANG_ENABLE_SPEC_V2": "1",
             }
         )
         process = popen_launch_server(
@@ -127,7 +125,6 @@ class TestNpuSpeculativeTokenMap(CustomTestCase):
         env.update(
             {
                 "SGLANG_ENABLE_OVERLAP_PLAN_STREAM": "1",
-                "SGLANG_ENABLE_SPEC_V2": "1",
             }
         )
         process = popen_launch_server(

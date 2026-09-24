@@ -3,13 +3,19 @@ from contextlib import contextmanager, nullcontext
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import pytest
 import torch
+from prometheus_client import CollectorRegistry
 
+from sglang.multimodal_gen.runtime.layers.linear import ReplicatedLinear
 from sglang.multimodal_gen.runtime.layers.lora.linear import (
     BaseLayerWithLoRA,
     _use_owned_base_snapshot,
     wrap_with_lora_layer,
 )
+from sglang.multimodal_gen.runtime.layers.quantization.fp8 import Fp8Config
+from sglang.multimodal_gen.runtime.managers.gpu_worker import GPUWorker
+from sglang.multimodal_gen.runtime.observability.metrics import DiffusionMetrics
 from sglang.multimodal_gen.runtime.pipelines_core.lora.pipeline import LoRAPipeline
 from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import maybe_download_lora
 
@@ -49,6 +55,37 @@ def _make_pipeline(layer: BaseLayerWithLoRA) -> _TestLoRAPipeline:
     pipeline.lora_adapters["adapter"]["linear.lora_A"] = torch.ones(1, 2)
     pipeline.lora_adapters["adapter"]["linear.lora_B"] = torch.ones(2, 1)
     return pipeline
+
+
+def test_worker_metrics_count_individual_adapters_in_multi_lora():
+    pipeline = _make_pipeline(_make_layer())
+    pipeline._temporarily_disable_offload = lambda *args, **kwargs: nullcontext([])
+    pipeline.loaded_adapter_paths["second"] = "/second"
+    pipeline.loaded_adapter_alphas["second"] = None
+    pipeline.lora_adapters["second"] = pipeline.lora_adapters["adapter"]
+    registry = CollectorRegistry()
+    worker = GPUWorker.__new__(GPUWorker)
+    worker.pipeline = pipeline
+    worker.metrics = DiffusionMetrics(role="monolithic", replica="0", registry=registry)
+    with patch(_RANK_PATCH, return_value=0):
+        worker.set_lora(
+            ["adapter", "second"],
+            [None, None],
+            target="transformer",
+            strength=[0.5, 0.5],
+            merge_mode="merge",
+        )
+    assert (
+        registry.get_sample_value(
+            "sglang:diffusion_lora_active_adapters",
+            {"role": "monolithic", "replica": "0"},
+        )
+        == 2
+    )
+    assert pipeline.get_lora_status()["active"]["transformer"][0]["nicknames"] == [
+        "adapter",
+        "second",
+    ]
 
 
 def test_merge_cache_only_accepts_cpu_backed_weights():
@@ -92,6 +129,30 @@ def test_zero_copy_snapshot_is_limited_to_cpu_backed_layers():
     )
     assert meta_layer is not None
     assert meta_layer._base_is_view
+
+
+def test_quantized_base_uses_dynamic_lora_in_auto_mode():
+    with patch(
+        "sglang.multimodal_gen.runtime.layers.quantization.fp8."
+        "get_tensor_model_parallel_world_size",
+        return_value=1,
+    ):
+        base_layer = ReplicatedLinear(
+            2,
+            2,
+            bias=False,
+            quant_config=Fp8Config(is_checkpoint_fp8_serialized=True),
+        )
+    layer = BaseLayerWithLoRA(base_layer)
+    pipeline = _make_pipeline(layer)
+
+    assert not pipeline._should_merge_lora_for_layers(
+        "transformer", {"linear": layer}, "auto"
+    )
+    with pytest.raises(ValueError, match="use merge mode 'dynamic'"):
+        pipeline._should_merge_lora_for_layers(
+            "transformer", {"linear": layer}, "merge"
+        )
 
 
 def test_dynamic_lora_reactivates_cached_layers_without_weight_update_context():

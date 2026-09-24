@@ -656,15 +656,17 @@ BCG validation must prove all of the following:
 
 For a non-bit-exact optimization, integrate through the request-scoped site
 framework under `sglang.kernels.ops.diffusion.sites`. Mark sites during model
-construction and let `QualityGatedFusion` mount them only for
-`quality="high"`; `quality="lossless"` must keep the original code path.
+construction and let `QualityGatedFusion` mount them for both
+`quality="extra-high"` and `quality="high"`; `quality="lossless"` must keep
+the original code path. A high-only sparse, caching, or other approximate
+path must remain outside this fusion gate.
 Eligibility must be all-or-nothing for coupled sites and fail closed on dtype,
 shape, layout, backend, BCG, or compile incompatibility. Add clean site-level
 guard/parity tests and a model wiring test instead of embedding request-policy
 branches throughout the DiT.
 
 Finally, use the benchmark/profile skill's `--quality-bcg-matrix` to run
-same-GPU ABBA pairs for Eager/BCG at lossless/high. Report denoise and saved
+same-GPU ABBA pairs for Eager/BCG at lossless/extra-high/high. Report denoise and saved
 request e2e separately, require at least 1.5% repeated mean e2e improvement for
 an optimization PR, attach profile and generated-media A/B evidence, then
 delete the task-owned checkpoint cache and verify zero residual weight files
