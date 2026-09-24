@@ -1249,13 +1249,6 @@ class UnifiedRadixCache(BasePrefixCache):
         # The rematch acquired a new SWA prefix lock.
         req.swa_prefix_lock_released = False
 
-        # The window is locked now: re-point the allocator's full -> swa table for
-        # it. A hit restores only the Full req_to_token rows, while attention
-        # resolves the window's SWA pages from that (mutable) table.
-        swa_component = self.components.get(ComponentType.SWA)
-        if swa_component is not None:
-            swa_component.resync_window_full_to_swa_mapping(new_last_node)
-
         # cleanup
         for comp in self._components_tuple:
             comp.cleanup_after_caching_req(

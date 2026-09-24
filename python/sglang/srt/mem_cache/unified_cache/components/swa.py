@@ -391,11 +391,10 @@ class SWAComponent(TreeComponent):
 
         A prefix-cache hit restores only the Full req_to_token rows, while
         attention resolves the window's SWA pages from the allocator-global
-        table -- which is mutable and may have been cleared or rebound since the
-        node was written. Call after the window is locked (cache_unfinished_req)
-        so the entries stay valid for the request's lifetime, and go through the
-        action path so the mutation stays on the audited call, not on every
-        (possibly discarded) match.
+        table, which is mutable and may have been cleared or rebound since the
+        node was written. This must run BEFORE the request's forward pass: the
+        prefill computes its own KV from this window, so a late fix only rewrites
+        a mapping that has already produced wrong KV.
         """
         if node_id is None:
             return
@@ -427,12 +426,18 @@ class SWAComponent(TreeComponent):
             swa_chunks.append(cd.value)
             n_swa += len(cd.value)
             node = node.parent
-        if full_chunks:
-            self.apply_component_action(
-                RebuildFullToSWAMapping(
-                    full_indices=full_chunks, swa_indices=swa_chunks
-                )
+        if not full_chunks:
+            return
+        full = torch.cat(full_chunks)
+        swa = torch.cat(swa_chunks)
+        if os.environ.get("DSV4_DUMP_META"):
+            print(
+                f"[SWAGATE] resync node={node_id} W={self.sliding_window_size} "
+                f"n={full.numel()} full={full.tolist()[:2]}..{full.tolist()[-2:]} "
+                f"swa={swa.tolist()[:2]}..{swa.tolist()[-2:]}",
+                flush=True,
             )
+        alloc.set_full_to_swa_mapping(full, swa)
 
     def update_component_on_insert_overlap(
         self,
