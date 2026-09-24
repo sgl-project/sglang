@@ -4,11 +4,12 @@ from pathlib import Path
 
 import pytest
 import torch
-from torch.utils.cpp_extension import load
 from tqdm import tqdm
 
+from sglang.srt.utils.cpp_extension_loader import load_extension_with_recovery
+
 root = Path(__file__).parent.resolve()
-hf3fs_utils = load(
+hf3fs_utils = load_extension_with_recovery(
     name="hf3fs_utils", sources=[f"{root}/hf3fs_utils.cpp"], verbose=True
 )
 

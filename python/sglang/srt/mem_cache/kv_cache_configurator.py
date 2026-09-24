@@ -66,7 +66,6 @@ from sglang.srt.mem_cache.memory_pool import (
     HybridReqToTokenPool,
     KVCache,
     MHATokenToKVPool,
-    MHATokenToKVPoolFP4,
     MHATokenToKVPoolMXFP8,
     MiniMaxSparseKVPool,
     MLATokenToKVPool,
@@ -74,6 +73,7 @@ from sglang.srt.mem_cache.memory_pool import (
     NoOpMHATokenToKVPool,
     PageMajorMHATokenToKVPool,
     ReqToTokenPool,
+    get_minimax_sparse_index_dtype,
 )
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.platforms import current_platform
@@ -294,15 +294,9 @@ class KVCacheConfigurator:
         self.mambaish_config = mambaish_config(self.model_config)
         self.hybrid_gdn_config = hybrid_gdn_config(self.model_config)
         self.hybrid_kda_config = hybrid_kda_config(self.model_config)
-        self.is_hybrid_swa_mtp_draft = (
-            self.is_draft_worker
-            and self.draft_model_idx is not None
-            and self.is_hybrid_swa
-            and getattr(self.model_config.hf_text_config, "mtp_local_layer_ids", None)
-            is not None
-        )
-        self.draft_swa_full_capacity = self.is_hybrid_swa_mtp_draft and (
-            self.draft_model_idx in self.model_config.swa_attention_layer_ids
+        self.is_hybrid_swa_mtp_draft = self.layer_info.is_hybrid_swa_mtp_draft
+        self.draft_swa_full_capacity = self.is_hybrid_swa_mtp_draft and bool(
+            self.layer_info.swa_attention_layer_ids
         )
 
     def hybrid_swa_token_capacity(
@@ -784,19 +778,9 @@ class KVCacheConfigurator:
             swa_head_dim = head_dim
             swa_v_head_dim = head_dim
 
-        # From the sglang ModelConfig WRAPPER, never the HF config's
-        # full_attention_layer_ids: that property feeds the conv/attention
-        # pairing, not the KV-lifetime split, and returns ALL layers.
-        swa_attention_layer_ids = [
-            i
-            for i in self.model_config.swa_attention_layer_ids
-            if self.layer_info.start_layer <= i < self.layer_info.end_layer
-        ]
-        full_attention_layer_ids = [
-            i
-            for i in self.model_config.full_attention_layer_ids
-            if self.layer_info.start_layer <= i < self.layer_info.end_layer
-        ]
+        # Not the HF config's full_attention_layer_ids: that one returns ALL layers.
+        swa_attention_layer_ids = self.layer_info.swa_attention_layer_ids
+        full_attention_layer_ids = self.layer_info.full_attention_layer_ids
         n_local_layers = self.layer_info.end_layer - self.layer_info.start_layer
         assert (
             len(full_attention_layer_ids) + len(swa_attention_layer_ids)
@@ -903,17 +887,8 @@ class KVCacheConfigurator:
             swa_head_dim = head_dim
             swa_v_head_dim = head_dim
 
-        # Filter layer ids to this worker's [start_layer, end_layer) range.
-        swa_attention_layer_ids = [
-            i
-            for i in self.model_config.swa_attention_layer_ids
-            if self.layer_info.start_layer <= i < self.layer_info.end_layer
-        ]
-        full_attention_layer_ids = [
-            i
-            for i in self.model_config.full_attention_layer_ids
-            if self.layer_info.start_layer <= i < self.layer_info.end_layer
-        ]
+        swa_attention_layer_ids = self.layer_info.swa_attention_layer_ids
+        full_attention_layer_ids = self.layer_info.full_attention_layer_ids
 
         total_bytes = unified_memory_pool_bytes
         # An uncapped, draft-free pool owns the profiled budget, including bytes
@@ -1521,8 +1496,8 @@ class KVCacheConfigurator:
                 get_parallel().attn_tp_size, get_parallel().attn_dcp_size
             ),
             head_dim=self.model_config.head_dim,
-            swa_attention_layer_ids=self.model_config.swa_attention_layer_ids,
-            full_attention_layer_ids=self.model_config.full_attention_layer_ids,
+            swa_attention_layer_ids=self.layer_info.swa_attention_layer_ids,
+            full_attention_layer_ids=self.layer_info.full_attention_layer_ids,
             device=self.device,
             token_to_kv_pool_class=NPUMHATokenToKVPool,
             **kwargs,
@@ -1732,8 +1707,8 @@ class KVCacheConfigurator:
             dtype=self.kv_cache_dtype,
             head_num=0,
             head_dim=0,
-            swa_attention_layer_ids=self.model_config.swa_attention_layer_ids,
-            full_attention_layer_ids=self.model_config.full_attention_layer_ids,
+            swa_attention_layer_ids=self.layer_info.swa_attention_layer_ids,
+            full_attention_layer_ids=self.layer_info.full_attention_layer_ids,
             device=self.device,
             full_kv_pool_class=full_pool_class,
             swa_kv_pool_class=MLATokenToKVPool,
@@ -1799,16 +1774,8 @@ class KVCacheConfigurator:
             if self.kv_cache_dtype_str == "mxfp8"
             else mha_pool_class
         )
-        swa_attention_layer_ids = self.model_config.swa_attention_layer_ids
-        full_attention_layer_ids = self.model_config.full_attention_layer_ids
-        if self.is_hybrid_swa_mtp_draft:
-            if self.draft_swa_full_capacity:
-                # Route local MTP depths through the SWA ring pool.
-                swa_attention_layer_ids = [self.draft_model_idx]
-                full_attention_layer_ids = []
-            else:
-                swa_attention_layer_ids = []
-                full_attention_layer_ids = [self.draft_model_idx]
+        swa_attention_layer_ids = self.layer_info.swa_attention_layer_ids
+        full_attention_layer_ids = self.layer_info.full_attention_layer_ids
         # The draft SWA ring must cover the target allocator's full token capacity.
         size_swa = (
             full_max_total_num_tokens
@@ -1855,14 +1822,12 @@ class KVCacheConfigurator:
             size=max_total_num_tokens,
             page_size=self.pool_page_size,
             dtype=self.kv_cache_dtype,
-            # fp8 attn-GEMM mode opts the lightning-indexer cache into
-            # fp8 too (fp8 indexer GEMMs); fp8 KV without the mode
-            # (e5m2 or non-trtllm_mha backend) keeps the indexer bf16
-            # with the widening-dequant contract.
-            index_dtype=(
-                self.kv_cache_dtype
-                if m3_fp8_attn_gemm_enabled(resolving_view(self.server_args))
-                else self.model_dtype
+            index_dtype=get_minimax_sparse_index_dtype(
+                fp8_attn_gemm=m3_fp8_attn_gemm_enabled(
+                    resolving_view(self.server_args)
+                ),
+                kv_cache_dtype=self.kv_cache_dtype,
+                model_dtype=self.model_dtype,
             ),
             head_num=self.model_config.get_num_kv_heads(
                 get_parallel().attn_tp_size, get_parallel().attn_dcp_size
@@ -1979,26 +1944,6 @@ class KVCacheConfigurator:
             quant_method=quant_method,
             post_capture_active=self.post_capture_kv_active and quant_method is None,
             **extra_args,
-        )
-        return token_to_kv_pool
-
-    def _build_mha_fp4_kv_pool(self, *, max_total_num_tokens: int) -> KVCache:
-        token_to_kv_pool = MHATokenToKVPoolFP4(
-            max_total_num_tokens,
-            page_size=self.pool_page_size,
-            dtype=self.kv_cache_dtype,
-            head_num=self.model_config.get_num_kv_heads(
-                get_parallel().attn_tp_size, get_parallel().attn_dcp_size
-            ),
-            head_dim=self.model_config.head_dim,
-            v_head_dim=self.model_config.v_head_dim,
-            layer_num=self.layer_info.num_effective_layers,
-            device=self.device,
-            enable_memory_saver=get_exec().features.enable_memory_saver,
-            start_layer=self.layer_info.start_layer,
-            end_layer=self.layer_info.end_layer,
-            enable_alt_stream=not get_disagg().enable_pdmux,
-            enable_kv_cache_copy=(get_spec().speculative_algorithm is not None),
         )
         return token_to_kv_pool
 
