@@ -4,6 +4,14 @@
 import mlx.core as mx
 import mlx.nn as nn
 
+from sglang.multimodal_gen.runtime.loader.mlx_loader import (
+    create_model,
+    load_quantized_weights,
+)
+from sglang.multimodal_gen.runtime.models.encoders.qwen3vl_vision_mlx import (
+    Qwen3VLVisionEncoder,
+)
+
 
 def interleaved_rope(position_ids, head_dim, theta, sections, dtype):
     frequency = theta ** (-mx.arange(0, head_dim, 2, dtype=mx.float32) / head_dim)
@@ -149,3 +157,32 @@ class Qwen3VLTextEncoder(nn.Module):
                 )
                 x = flat.reshape(x.shape)
         return x
+
+
+def load_encoders(path, config, quantization, with_images):
+    weights = mx.load(path)
+    text_weights, vision_weights = {}, {}
+    for name, value in weights.items():
+        if name.startswith("model.visual."):
+            vision_weights[name.removeprefix("model.visual.")] = value
+        elif name.startswith("model.language_model."):
+            text_weights[name.removeprefix("model.language_model.")] = value
+        elif name.startswith("model."):
+            text_weights[name.removeprefix("model.")] = value
+        elif not name.startswith("lm_head."):
+            raise ValueError(f"unrecognized Qwen3-VL weight: {name}")
+    text_config = dict(config["text_config"])
+    text_config["mrope_section"] = text_config["rope_scaling"]["mrope_section"]
+    text_encoder = load_quantized_weights(
+        create_model(Qwen3VLTextEncoder, text_config), text_weights, quantization
+    )
+    vision_encoder = None
+    if with_images:
+        name = "patch_embed.proj.weight"
+        vision_weights[name] = vision_weights[name].transpose(0, 2, 3, 4, 1)
+        vision_encoder = load_quantized_weights(
+            create_model(Qwen3VLVisionEncoder, config["vision_config"]),
+            vision_weights,
+            quantization,
+        )
+    return text_encoder, vision_encoder

@@ -7,6 +7,11 @@ from dataclasses import dataclass
 import mlx.core as mx
 import mlx.nn as nn
 
+from sglang.multimodal_gen.runtime.loader.mlx_loader import (
+    create_model,
+    load_quantized_weights,
+)
+
 
 @dataclass
 class PrefixLayout:
@@ -290,3 +295,19 @@ class QwenImage21Transformer(nn.Module):
             return compiled(hidden_states, temb, target_rope, prefix_caches)
 
         return denoise
+
+
+def load_transformer(path, config, quantization):
+    if config.get("patch_size", 1) != 1 or not config.get("causal_condition", True):
+        raise ValueError("Qwen-Image 2.1 requires patch_size=1 and causal_condition")
+    weights = mx.load(path)
+    converted = {}
+    for name, value in weights.items():
+        if ".img_mlp.gate_up." in name:
+            gate, up = mx.split(value, 2, axis=0)
+            converted[name.replace(".gate_up.", ".gate_layer.")] = gate
+            converted[name.replace(".gate_up.", ".proj.")] = up
+        else:
+            converted[name] = value
+    model = create_model(QwenImage21Transformer, config)
+    return load_quantized_weights(model, converted, quantization)

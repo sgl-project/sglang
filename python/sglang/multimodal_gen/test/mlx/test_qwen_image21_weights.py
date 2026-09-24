@@ -8,19 +8,17 @@ mx = pytest.importorskip("mlx.core")
 nn = pytest.importorskip("mlx.nn")
 mlx_utils = pytest.importorskip("mlx.utils")
 
-from sglang.multimodal_gen.runtime.hardware_backend.mlx.qwen3vl_text import (
-    Qwen3VLTextEncoder,
-)
-from sglang.multimodal_gen.runtime.hardware_backend.mlx.qwen3vl_vision import (
-    Qwen3VLVisionEncoder,
-)
-from sglang.multimodal_gen.runtime.hardware_backend.mlx.qwen_image21 import (
+from sglang.multimodal_gen.runtime.models.dits.qwen_image21_mlx import (
     QwenImage21Transformer,
     build_layout,
-)
-from sglang.multimodal_gen.runtime.hardware_backend.mlx.weights import (
-    load_encoders,
     load_transformer,
+)
+from sglang.multimodal_gen.runtime.models.encoders.qwen3vl_mlx import (
+    Qwen3VLTextEncoder,
+    load_encoders,
+)
+from sglang.multimodal_gen.runtime.models.encoders.qwen3vl_vision_mlx import (
+    Qwen3VLVisionEncoder,
 )
 
 QUANTIZATION = dict(method="affine", bits=4, group_size=64)

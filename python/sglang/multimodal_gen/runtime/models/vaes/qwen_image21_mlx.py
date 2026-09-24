@@ -1,8 +1,12 @@
 # Copyright 2026 Qwen Team and The HuggingFace Team
 # SPDX-License-Identifier: Apache-2.0
 
+import re
+
 import mlx.core as mx
 import mlx.nn as nn
+
+from sglang.multimodal_gen.runtime.loader.mlx_loader import create_model
 
 
 def silu(x):
@@ -305,3 +309,59 @@ class QwenImage21VAE(nn.Module):
             return after(self.decoder.mid_block.attentions[0](before(latents)))
 
         return decode
+
+
+def convert_vae_name(name):
+    if name.startswith("conv1."):
+        return name.replace("conv1.", "quant_conv.", 1)
+    if name.startswith("conv2."):
+        return name.replace("conv2.", "post_quant_conv.", 1)
+    name = re.sub(r"^(encoder|decoder)\.conv1\.", r"\1.conv_in.", name)
+    name = name.replace(".head.0.", ".norm_out.").replace(".head.2.", ".conv_out.")
+    for index, target in [(0, "resnets.0"), (1, "attentions.0"), (2, "resnets.1")]:
+        name = name.replace(f".middle.{index}.", f".mid_block.{target}.")
+    for source, target, count, sampler in [
+        ("downsamples", "down_blocks", 2, "downsampler"),
+        ("upsamples", "up_blocks", 3, "upsampler"),
+    ]:
+
+        def block_name(match):
+            block, child = match.groups()
+            layer = f"resnets.{child}" if int(child) < count else sampler
+            return f".{target}.{block}.{layer}."
+
+        name = re.sub(rf"\.{source}\.(\d+)\.{source}\.(\d+)\.", block_name, name)
+    for source, target in [
+        ("residual.0.", "norm1."),
+        ("residual.2.", "conv1."),
+        ("residual.3.", "norm2."),
+        ("residual.6.", "conv2."),
+        (".shortcut.", ".conv_shortcut."),
+        ("resample.1.", "conv."),
+    ]:
+        name = name.replace(source, target)
+    return name
+
+
+def load_vae(path, config):
+    if not config.get("is_residual", True) or config.get("patch_size") not in (None, 1):
+        raise ValueError("unsupported Qwen-Image 2.1 VAE architecture")
+    weights = mx.load(path)
+    converted = {}
+    for name, value in weights.items():
+        # temporal convolutions are unused in the single-image checkpoint path
+        if ".time_conv." in name:
+            continue
+        name = convert_vae_name(name)
+        if name.endswith(".gamma"):
+            value = value.reshape(-1)
+        elif name.endswith(".weight"):
+            if value.ndim == 5:
+                value = mx.squeeze(value, axis=2)
+            value = value.transpose(0, 2, 3, 1)
+        converted[name] = value
+    model = create_model(QwenImage21VAE, config)
+    model.load_weights(list(converted.items()), strict=True)
+    model.eval()
+    mx.eval(model.parameters())
+    return model

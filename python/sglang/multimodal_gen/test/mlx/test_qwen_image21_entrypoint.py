@@ -5,6 +5,7 @@ import os
 import re
 import subprocess
 import sys
+import textwrap
 from pathlib import Path
 
 import numpy as np
@@ -18,6 +19,34 @@ pytest_plugins = ["sglang.multimodal_gen.test.mlx.test_qwen_image21_pipeline"]
 pytestmark = pytest.mark.skipif(
     sys.platform != "darwin", reason="requires Apple Silicon MLX"
 )
+
+
+def test_pipeline_discovery_without_mlx():
+    script = textwrap.dedent("""
+        import sys
+
+        sys.modules["mlx"] = None
+
+        from sglang.multimodal_gen.registry import get_pipeline_class
+        from sglang.multimodal_gen.runtime.models.registry import ModelRegistry
+
+        for name in ("QwenImage21Pipeline", "QwenImage21MLXPipeline"):
+            assert get_pipeline_class(name).pipeline_name == name
+        model, architecture = ModelRegistry.resolve_model_cls(
+            "QwenImage21Transformer2DModel"
+        )
+        assert model.__module__.endswith(".models.dits.qwen_image21")
+        assert architecture == "QwenImage21Transformer2DModel"
+        assert "mlx.core" not in sys.modules
+        """)
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        env=dict(os.environ, SGLANG_DIFFUSION_PLATFORM_OVERRIDE="cpu"),
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
 
 
 @pytest.mark.parametrize("image_count,from_hub_cache", [(0, True), (2, False)])

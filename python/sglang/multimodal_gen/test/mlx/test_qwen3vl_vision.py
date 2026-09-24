@@ -1,8 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
-import importlib.util
 import sys
-from pathlib import Path
 
 import numpy as np
 import pytest
@@ -12,15 +10,7 @@ torch = pytest.importorskip("torch")
 transformers = pytest.importorskip("transformers")
 hf = pytest.importorskip("transformers.models.qwen3_vl.modeling_qwen3_vl")
 
-_MODEL_PATH = (
-    Path(__file__).resolve().parents[2]
-    / "runtime/hardware_backend/mlx/qwen3vl_vision.py"
-)
-_SPEC = importlib.util.spec_from_file_location(
-    "qwen3vl_mlx_vision_test_model", _MODEL_PATH
-)
-model_module = importlib.util.module_from_spec(_SPEC)
-_SPEC.loader.exec_module(model_module)
+import sglang.multimodal_gen.runtime.models.encoders.qwen3vl_vision_mlx as model_module
 
 
 @pytest.mark.parametrize(

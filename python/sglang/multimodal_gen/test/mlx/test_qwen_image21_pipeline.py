@@ -14,25 +14,23 @@ transformers = pytest.importorskip("transformers")
 tokenizers = pytest.importorskip("tokenizers")
 torch = pytest.importorskip("torch")
 
-from sglang.multimodal_gen.runtime.hardware_backend.mlx.qwen3vl_text import (
-    Qwen3VLTextEncoder,
-)
-from sglang.multimodal_gen.runtime.hardware_backend.mlx.qwen3vl_vision import (
-    Qwen3VLVisionEncoder,
-)
-from sglang.multimodal_gen.runtime.hardware_backend.mlx.qwen_image21 import (
+from sglang.multimodal_gen.runtime.models.dits.qwen_image21_mlx import (
     QwenImage21Transformer,
 )
-from sglang.multimodal_gen.runtime.hardware_backend.mlx.qwen_image21_pipeline import (
-    QwenImage21MLXPipeline,
+from sglang.multimodal_gen.runtime.models.encoders.qwen3vl_mlx import (
+    Qwen3VLTextEncoder,
 )
-from sglang.multimodal_gen.runtime.hardware_backend.mlx.qwen_image21_processing import (
+from sglang.multimodal_gen.runtime.models.encoders.qwen3vl_vision_mlx import (
+    Qwen3VLVisionEncoder,
+)
+from sglang.multimodal_gen.runtime.models.vaes.qwen_image21_mlx import (
+    QwenImage21VAE,
+    load_vae,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.qwen_image21_mlx import (
+    QwenImage21MLXGenerator,
     decode_latents,
 )
-from sglang.multimodal_gen.runtime.hardware_backend.mlx.qwen_image21_vae import (
-    QwenImage21VAE,
-)
-from sglang.multimodal_gen.runtime.hardware_backend.mlx.weights import load_vae
 
 
 @pytest.fixture
@@ -170,7 +168,7 @@ def pipeline(tmp_path):
             )
         )
     )
-    return QwenImage21MLXPipeline(tmp_path)
+    return QwenImage21MLXGenerator(tmp_path)
 
 
 @pytest.mark.parametrize("image_count", [0, 1, 2])

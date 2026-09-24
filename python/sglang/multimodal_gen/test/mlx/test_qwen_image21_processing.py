@@ -12,10 +12,10 @@ torch = pytest.importorskip("torch")
 hf = pytest.importorskip("transformers.models.qwen3_vl.modeling_qwen3_vl")
 diffusers = pytest.importorskip("diffusers")
 
-from sglang.multimodal_gen.runtime.hardware_backend.mlx.qwen_image21 import (
+from sglang.multimodal_gen.runtime.models.dits.qwen_image21_mlx import (
     TimeEmbedding,
 )
-from sglang.multimodal_gen.runtime.hardware_backend.mlx.qwen_image21_processing import (
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.qwen_image21_mlx import (
     decode_latents,
     flow_schedule,
     flow_step,

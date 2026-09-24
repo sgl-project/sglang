@@ -1,8 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
-import importlib.util
 import sys
-from pathlib import Path
 
 import numpy as np
 import pytest
@@ -11,13 +9,7 @@ mx = pytest.importorskip("mlx.core")
 torch = pytest.importorskip("torch")
 F = torch.nn.functional
 
-_MODEL_PATH = (
-    Path(__file__).resolve().parents[2]
-    / "runtime/hardware_backend/mlx/qwen_image21_vae.py"
-)
-_SPEC = importlib.util.spec_from_file_location("qwen21_mlx_vae_test_model", _MODEL_PATH)
-model_module = importlib.util.module_from_spec(_SPEC)
-_SPEC.loader.exec_module(model_module)
+import sglang.multimodal_gen.runtime.models.vaes.qwen_image21_mlx as model_module
 
 
 def torch_tensor(value):

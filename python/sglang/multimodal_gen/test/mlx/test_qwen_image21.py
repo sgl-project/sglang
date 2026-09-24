@@ -1,22 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 
-import importlib.util
 import sys
-from pathlib import Path
 
 import pytest
 
 mx = pytest.importorskip("mlx.core")
 nn = pytest.importorskip("mlx.nn")
 
-# the native tensor core has no torch or serving dependency
-_MODEL_PATH = (
-    Path(__file__).resolve().parents[2] / "runtime/hardware_backend/mlx/qwen_image21.py"
-)
-_SPEC = importlib.util.spec_from_file_location("qwen21_mlx_test_model", _MODEL_PATH)
-model_module = importlib.util.module_from_spec(_SPEC)
-sys.modules[_SPEC.name] = model_module
-_SPEC.loader.exec_module(model_module)
+import sglang.multimodal_gen.runtime.models.dits.qwen_image21_mlx as model_module
 
 
 def joint_reference(model, latents, embeddings, timestep, layout, condition):
