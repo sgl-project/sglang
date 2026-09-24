@@ -1,22 +1,34 @@
-// M1/M8 extension: write native eight-token-tile expert metadata after radix
+// M<=8 extension: write native eight-token-tile expert metadata after radix
 // routing. At M1 the selected experts are already in ascending ID order; at M>1
 // the last routing CTA to finish lays out every token's routes.
 // K3 MoE-front prep in one launch: radix routing (+ trtllm packed ids) on the
 // first M CTAs, mxfp8 per-token-group quant of the routed activations on the
 // next M. Specialized like route_radix: 896 experts, top-16, 3584-wide bf16
 // row (112 ue8m0 groups of 32 = 224 lanes). Must build without fast-math to
-// keep routing bit-identical to route_radix.
+// keep routing bit-identical to route_radix. Built with -DENABLE_FP4 it also
+// provides Nvfp4RowQuant, the native NVFP4 quantizer of the trtllm-gen body.
 
 #include "../gemm/per_token_group_quant.cuh"
 #include "route_radix.cuh"
 
+#ifdef ENABLE_FP4
+#ifndef FLT_MAX
+#define FLT_MAX __FLT_MAX__
+#endif
+#include <tensorrt_llm/kernels/quantization_utils.cuh>
+#endif
+
 namespace sglang {
 
+// Quant is the row quantizer run by CTAs [M, 2M): its Params, the routing
+// weight dtype the expert body reads, a device run<TX>(quant, row), and a host
+// make() that checks its tensors and builds Params.
+template <typename Quant>
 struct RouteQuantMetadataParams {
   RouteRadixParams route;
-  QuantKernelParams quant;
+  typename Quant::Params quant;
   int32_t *total, *map, *perm, *cta, *limit, *count;
-  bf16_t* weights;
+  typename Quant::Weight* weights;
   // Zero between launches; the last routing CTA resets it for graph replay.
   int32_t* arrivals;
 };
@@ -28,7 +40,8 @@ inline constexpr uint32_t kMetadataMaxRoutes_ = kMetadataMaxTokens_ * 16;
 // Same layout as the Triton prepare_expert_tile_metadata: routes ordered by
 // (expert, route index), one padded tile per distinct expert. A token selects
 // each expert at most once, so per-token expert bitmaps give both orders.
-__device__ void write_multi_token_metadata(const RouteQuantMetadataParams& params, uint32_t M) {
+template <typename Quant>
+__device__ void write_multi_token_metadata(const RouteQuantMetadataParams<Quant>& params, uint32_t M) {
   constexpr uint32_t kWords = (LargeRouterRadixTrait::kNumExperts + 31) / 32;
   __shared__ uint32_t token_bits[kMetadataMaxTokens_][kWords];
   __shared__ uint32_t any_bits[kWords];
@@ -37,7 +50,8 @@ __device__ void write_multi_token_metadata(const RouteQuantMetadataParams& param
   const uint32_t tx = threadIdx.x;
   const uint32_t row = blockIdx.x;
   if (tx < 16) {
-    params.weights[row * 16 + tx] = __float2bfloat16_rn(params.route.out_w[row * params.route.out_w_stride + tx]);
+    params.weights[row * 16 + tx] =
+        device::cast<typename Quant::Weight>(params.route.out_w[row * params.route.out_w_stride + tx]);
   }
   __threadfence();
   __syncthreads();
@@ -110,9 +124,91 @@ using RouteQuantTrait = RouteQuantTraitT<bf16_t>;
 inline constexpr uint32_t kQuantGroupsPerRow_ = LargeRouterRadixTrait::kBlockSize / RouteQuantTrait::kNumLanes;
 inline constexpr uint32_t kQuantHidden_ = kQuantGroupsPerRow_ * RouteQuantTrait::kGroupSize;  // 3584
 
-template <bool kUsePDL, typename TScore, typename TX>
+struct Mxfp8RowQuant {
+  using Params = QuantKernelParams;
+  using Weight = bf16_t;
+
+  template <typename TX>
+  __device__ static void run(const Params& quant, uint32_t row) {
+    using Trait = RouteQuantTraitT<TX>;
+    Trait::run(quant, /*expert_idx=*/0, row, threadIdx.x / Trait::kNumLanes, threadIdx.x % Trait::kNumLanes);
+  }
+
+  static Params make(
+      const tvm::ffi::TensorView x,
+      const tvm::ffi::TensorView out_q,
+      const tvm::ffi::TensorView out_s,
+      const tvm::ffi::TensorView /*global_scale: unused*/,
+      host::SymbolicSize& M_,
+      host::SymbolicDevice& device,
+      host::SymbolicDType& x_dtype) {
+    using namespace host;
+    TensorMatcher({M_, -1}).with_dtype<bf16_t, fp32_t>(x_dtype).with_device(device).with_strides({-1, 1}).verify(x);
+    const auto quant_params =
+        x_dtype.is_type<fp32_t>()
+            ? build_quant_context<RouteQuantTraitT<fp32_t>, /*kMasked=*/false>(x, out_q, out_s).params
+            : build_quant_context<RouteQuantTraitT<bf16_t>, /*kMasked=*/false>(x, out_q, out_s).params;
+    RuntimeCheck(
+        quant_params.hidden_size == kQuantHidden_, "route_quant_fused is specialized for a 3584-wide activation row");
+    RuntimeCheck(
+        quant_params.num_tokens == static_cast<uint32_t>(M_.unwrap()),
+        "route_quant_fused: scores and activations must have the same token count");
+    return quant_params;
+  }
+};
+
+#ifdef ENABLE_FP4
+// FP32 activations round to BF16 before quantization, matching the separate cast.
+struct Nvfp4RowQuant {
+  struct Params {
+    const void* x;
+    int64_t x_stride;
+    const float* global_scale;
+    uint64_t* q;
+    uint8_t* scales;
+  };
+  using Weight = fp32_t;
+
+  template <typename TX>
+  __device__ static void run(const Params& p, uint32_t row) {
+    const uint32_t t = threadIdx.x;
+    tensorrt_llm::kernels::PackedVec<__nv_bfloat16, 16> v;
+    auto* values = reinterpret_cast<__nv_bfloat16*>(&v);
+#pragma unroll
+    for (int e = 0; e < 16; ++e) {
+      values[e] =
+          static_cast<__nv_bfloat16>(device::cast<bf16_t>(static_cast<const TX*>(p.x)[row * p.x_stride + t * 16 + e]));
+    }
+    p.q[row * 224 + t] = tensorrt_llm::kernels::cvt_warp_fp16_to_fp4<__nv_bfloat16, 16, 16, false>(
+        v, *p.global_scale, p.scales + row * 224 + t);
+  }
+
+  static Params make(
+      const tvm::ffi::TensorView x,
+      const tvm::ffi::TensorView q,
+      const tvm::ffi::TensorView scales,
+      const tvm::ffi::TensorView global_scale,
+      host::SymbolicSize& M_,
+      host::SymbolicDevice& device,
+      host::SymbolicDType& x_dtype) {
+    using namespace host;
+    TensorMatcher({M_, 3584}).with_dtype<bf16_t, fp32_t>(x_dtype).with_strides({-1, 1}).with_device(device).verify(x);
+    TensorMatcher({1}).with_dtype<fp32_t>().with_device(device).verify(global_scale);
+    TensorMatcher({M_, 1792}).with_dtype<uint8_t>().with_device(device).verify(q);
+    TensorMatcher({M_, 224}).with_dtype<uint8_t>().with_device(device).verify(scales);
+    return {
+        x.data_ptr(),
+        x.stride(0),
+        static_cast<const float*>(global_scale.data_ptr()),
+        static_cast<uint64_t*>(q.data_ptr()),
+        static_cast<uint8_t*>(scales.data_ptr())};
+  }
+};
+#endif
+
+template <bool kUsePDL, typename TScore, typename TX, typename Quant>
 __global__ __launch_bounds__(LargeRouterRadixTrait::kBlockSize)  //
-    void route_quant_metadata_kernel(const __grid_constant__ RouteQuantMetadataParams params) {
+    void route_quant_metadata_kernel(const __grid_constant__ RouteQuantMetadataParams<Quant> params) {
   const auto M = static_cast<uint32_t>(params.route.M);
   if (blockIdx.x < M) {
     __shared__ typename LargeRouterRadixTrait::Smem smem;
@@ -126,7 +222,7 @@ __global__ __launch_bounds__(LargeRouterRadixTrait::kBlockSize)  //
       params.perm[tx * 8] = 0;
       params.cta[tx] = smem.wid[tx];
       params.limit[tx] = tx * 8 + 1;
-      params.weights[tx] = __float2bfloat16_rn(params.route.out_w[tx]);
+      params.weights[tx] = device::cast<typename Quant::Weight>(params.route.out_w[tx]);
       if (tx == 0) {
         params.total[0] = 128;
         params.count[0] = 16;
@@ -136,15 +232,12 @@ __global__ __launch_bounds__(LargeRouterRadixTrait::kBlockSize)  //
     // Quant CTAs read the same primary-kernel output (the fused-front GEMM)
     // as the routing CTAs, so they carry their own PDL wait/trigger.
     device::PDLWaitPrimary<kUsePDL>();
-    const uint32_t token_idx = blockIdx.x - M;
-    const uint32_t group_idx = threadIdx.x / RouteQuantTraitT<TX>::kNumLanes;
-    const uint32_t lane_id = threadIdx.x % RouteQuantTraitT<TX>::kNumLanes;
-    RouteQuantTraitT<TX>::run(params.quant, /*expert_idx=*/0, token_idx, group_idx, lane_id);
+    Quant::template run<TX>(params.quant, blockIdx.x - M);
     device::PDLTriggerSecondary<kUsePDL>();
   }
 }
 
-template <bool kUsePDL>
+template <bool kUsePDL, typename Quant>
 struct RouteQuantMetadataKernel {
   static void
   run(const tvm::ffi::TensorView scores,
@@ -163,6 +256,7 @@ struct RouteQuantMetadataKernel {
       const tvm::ffi::TensorView limit,
       const tvm::ffi::TensorView count,
       const tvm::ffi::TensorView arrivals,
+      const tvm::ffi::TensorView global_scale,
       int64_t topk,
       double routed_scaling_factor,
       bool renormalize,
@@ -193,16 +287,7 @@ struct RouteQuantMetadataKernel {
     RuntimeCheck(scores.stride(0) % 4 == 0, "route_quant_fused: scores row stride must be a multiple of 4");
 
     auto x_dtype = SymbolicDType{};
-    TensorMatcher({M_, -1}).with_dtype<bf16_t, fp32_t>(x_dtype).with_device(device).with_strides({-1, 1}).verify(x);
-    const auto quant_params =
-        x_dtype.is_type<fp32_t>()
-            ? build_quant_context<RouteQuantTraitT<fp32_t>, /*kMasked=*/false>(x, out_q, out_s).params
-            : build_quant_context<RouteQuantTraitT<bf16_t>, /*kMasked=*/false>(x, out_q, out_s).params;
-    RuntimeCheck(
-        quant_params.hidden_size == kQuantHidden_, "route_quant_fused is specialized for a 3584-wide activation row");
-    RuntimeCheck(
-        quant_params.num_tokens == static_cast<uint32_t>(M_.unwrap()),
-        "route_quant_fused: scores and activations must have the same token count");
+    const auto quant_params = Quant::make(x, out_q, out_s, global_scale, M_, device, x_dtype);
 
     const auto M = static_cast<uint32_t>(M_.unwrap());
     RuntimeCheck(M >= 1 && M <= kMetadataMaxTokens_, "fused routing metadata supports M1..M8");
@@ -210,13 +295,16 @@ struct RouteQuantMetadataKernel {
     TensorMatcher({1}).with_dtype<int32_t>().with_device(device).verify(total);
     TensorMatcher({routes}).with_dtype<int32_t>().with_device(device).verify(map);
     TensorMatcher({routes * kMetadataTile_ + 1}).with_dtype<int32_t>().with_device(device).verify(perm);
-    TensorMatcher({static_cast<int64_t>(M), 16}).with_dtype<bf16_t>().with_device(device).verify(weights);
+    TensorMatcher({static_cast<int64_t>(M), 16})
+        .with_dtype<typename Quant::Weight>()
+        .with_device(device)
+        .verify(weights);
     TensorMatcher({routes}).with_dtype<int32_t>().with_device(device).verify(cta);
     TensorMatcher({routes}).with_dtype<int32_t>().with_device(device).verify(limit);
     TensorMatcher({1}).with_dtype<int32_t>().with_device(device).verify(count);
     TensorMatcher({1}).with_dtype<int32_t>().with_device(device).verify(arrivals);
 
-    const auto params = RouteQuantMetadataParams{
+    const auto params = RouteQuantMetadataParams<Quant>{
         .route =
             {scores.data_ptr(),
              static_cast<const fp32_t*>(bias.data_ptr()),
@@ -239,13 +327,13 @@ struct RouteQuantMetadataKernel {
         .cta = static_cast<int32_t*>(cta.data_ptr()),
         .limit = static_cast<int32_t*>(limit.data_ptr()),
         .count = static_cast<int32_t*>(count.data_ptr()),
-        .weights = static_cast<bf16_t*>(weights.data_ptr()),
+        .weights = static_cast<typename Quant::Weight*>(weights.data_ptr()),
         .arrivals = static_cast<int32_t*>(arrivals.data_ptr()),
     };
 
 #define SGL_ROUTE_QUANT_LAUNCH(TS, TX)                                    \
   LaunchKernel(2 * M, LargeRouterRadixTrait::kBlockSize, device.unwrap()) \
-      .enable_pdl(kUsePDL)(route_quant_metadata_kernel<kUsePDL, TS, TX>, params)
+      .enable_pdl(kUsePDL)(route_quant_metadata_kernel<kUsePDL, TS, TX, Quant>, params)
 
     if (score_dtype.is_type<fp32_t>()) {
       if (x_dtype.is_type<fp32_t>()) {
