@@ -120,7 +120,11 @@ class Flux3ActionPipeline(ComposedPipelineBase):
             # Native FP8r payloads load as they are (no requantization).
             with torch.device("meta"), set_default_torch_dtype(torch.bfloat16):
                 transformer = Flux3Transformer(config=config.dit_config, hf_config={})
-            load_fp8r_checkpoint(transformer, load_file(weights, device=str(device)))
+            # Offloaded (e.g. layerwise) components start on the host.
+            on_cpu = server_args.should_start_component_on_cpu("transformer")
+            load_fp8r_checkpoint(
+                transformer, load_file(weights, device="cpu" if on_cpu else str(device))
+            )
             return transformer
         return maybe_load_fsdp_model(
             model_cls=Flux3Transformer,

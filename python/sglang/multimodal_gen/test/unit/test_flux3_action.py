@@ -444,6 +444,18 @@ def test_dit_loads_released_checkpoint_names():
         model = Flux3Transformer(Flux3DiTConfig(arch_config=_tiny_arch()))
     params = set(model.state_dict())
     assert all("bias" not in n for n in params)
+    # Layerwise offload streams exactly these block lists; a stale name is skipped silently.
+    modules = dict(model.named_modules())
+    blocks = {name: modules.get(name) for name in model.layer_names}
+    assert all(isinstance(m, torch.nn.ModuleList) and len(m) for m in blocks.values())
+    assert set(blocks) == {
+        "txt_mode_blocks",
+        "single_blocks",
+        *(
+            f"content_mode_blocks.{m}"
+            for m in ("video", "video_cond", "act", "act_cond")
+        ),
+    }
     mapping = get_param_names_mapping(model.param_names_mapping)
     fused = {}
     for name in (

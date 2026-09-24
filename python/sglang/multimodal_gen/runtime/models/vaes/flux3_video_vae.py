@@ -38,6 +38,9 @@ from sglang.multimodal_gen.configs.models.vaes.flux3_video import (
     Flux3VideoVAEArchConfig,
     Flux3VideoVAEConfig,
 )
+from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
+    LayerwiseOffloadableModuleMixin,
+)
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
@@ -570,8 +573,11 @@ class ViTNorm(nn.Module):
         return self.decoder(self.z_normalizer.denormalize(z))
 
 
-class Flux3VideoVAE(nn.Module):
+class Flux3VideoVAE(nn.Module, LayerwiseOffloadableModuleMixin):
     """Frozen FLUX 3 video VAE: ``encode`` / ``encode_frame`` / ``decode``."""
+
+    layerwise_offload_dit_group_enabled = False
+    layer_names = ["model.encoder.features", "model.decoder.features"]
 
     def __init__(self, config: Flux3VideoVAEConfig, **kwargs):
         super().__init__()

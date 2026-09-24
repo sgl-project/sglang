@@ -52,6 +52,9 @@ from sglang.multimodal_gen.runtime.layers.linear import ReplicatedLinear
 from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config import (
     QuantizationConfig,
 )
+from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
+    LayerwiseOffloadableModuleMixin,
+)
 from sglang.multimodal_gen.runtime.models.dits.base import BaseDiT
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 
@@ -190,8 +193,11 @@ class Flux3Fp8RowwiseLinear(nn.Module):
             )
         self.out_features, self.in_features = weight.shape
         self.tuple_output = tuple_output
-        self.register_buffer("weight", weight.contiguous())
-        self.register_buffer("weight_scale", weight_scale.float().contiguous())
+        # Parameters (not buffers) so that layerwise offload streams them.
+        self.weight = nn.Parameter(weight.contiguous(), requires_grad=False)
+        self.weight_scale = nn.Parameter(
+            weight_scale.float().contiguous(), requires_grad=False
+        )
 
     def forward(self, x: torch.Tensor):
         leading = x.shape[:-1]
@@ -307,20 +313,22 @@ class Flux3Block(nn.Module):
         return self.attn_out(attended)[0] + self.mlp_out(F.silu(gate) * value)[0]
 
     def forward(
-        self, x: torch.Tensor, rope: torch.Tensor, mod: Modulation
-    ) -> torch.Tensor:
-        shift, scale, gate = mod
-        modulated = (1 + scale) * self.pre_norm(x) + shift
-        return x + gate * self._mix(modulated, rope)
-
-    def forward_segments(
         self,
         x: torch.Tensor,
         rope: torch.Tensor,
-        lengths: list[int],
         mods: list[Modulation],
+        lengths: list[int] | None = None,
     ) -> torch.Tensor:
-        """Joint-block forward: segment ``i`` of ``x`` (``lengths[i]`` tokens) uses ``mods[i]``."""
+        """Segment ``i`` of ``x`` (``lengths[i]`` tokens) is modulated by ``mods[i]``.
+
+        A mode block has a single segment (``lengths=None``); a joint block has
+        one per stream. Blocks are always entered through ``__call__`` so that
+        forward hooks (layerwise offload) see every block.
+        """
+        if lengths is None:
+            shift, scale, gate = mods[0]
+            modulated = (1 + scale) * self.pre_norm(x) + shift
+            return x + gate * self._mix(modulated, rope)
         normalized = torch.split(self.pre_norm(x), lengths, dim=1)
         modulated = torch.cat(
             [(1 + m[1]) * seg + m[0] for seg, m in zip(normalized, mods)], dim=1
@@ -343,7 +351,7 @@ class Flux3SegmentState(msgspec.Struct, frozen=True):
         return self.hidden.shape[1]
 
 
-class Flux3Transformer(BaseDiT):
+class Flux3Transformer(BaseDiT, LayerwiseOffloadableModuleMixin):
     _fsdp_shard_conditions = [
         lambda name, module: isinstance(module, Flux3Block),
     ]
@@ -425,6 +433,11 @@ class Flux3Transformer(BaseDiT):
         self.final_layer = nn.ModuleDict(
             {m: Flux3LastLayer(hidden, c) for m, c in self.in_channels.items()}
         )
+        self.layer_names = [
+            "txt_mode_blocks",
+            *(f"content_mode_blocks.{m}" for m in streams),
+            "single_blocks",
+        ]
         self.__post_init__()
 
     # ------------------------------------------------------------------ pieces
@@ -471,7 +484,7 @@ class Flux3Transformer(BaseDiT):
         early = self.early_stream_modulations[TEXT_STREAM](vec)
         hidden = self.txt_in(ctx.to(self.dtype))
         for block in self.txt_mode_blocks:
-            hidden = block(hidden, rope, early)
+            hidden = block(hidden, rope, [early])
         return Flux3SegmentState(
             name=TEXT_STREAM,
             hidden=hidden,
@@ -495,7 +508,7 @@ class Flux3Transformer(BaseDiT):
         early = self.early_stream_modulations[name](vec)
         hidden = self.emb_in[name](x.to(self.dtype))
         for block in self.content_mode_blocks[name]:
-            hidden = block(hidden, rope, early)
+            hidden = block(hidden, rope, [early])
         return Flux3SegmentState(
             name=name,
             hidden=hidden,
@@ -514,7 +527,7 @@ class Flux3Transformer(BaseDiT):
         rope = torch.cat([s.rope for s in segments], dim=1)
         x = torch.cat([s.hidden for s in segments], dim=1)
         for block in self.single_blocks:
-            x = block.forward_segments(x, rope, lengths, mods)
+            x = block(x, rope, mods, lengths)
         return list(torch.split(x, lengths, dim=1)[1:])
 
     def denoise(
@@ -635,10 +648,10 @@ def load_fp8r_checkpoint(
             ),
         )
     missing, unexpected = model.load_state_dict(weights, strict=False, assign=True)
-    fp8_buffers = {
-        n for n, _ in model.named_buffers() if n.removesuffix("_scale") in scales
+    fp8_params = {
+        n for n, _ in model.named_parameters() if n.removesuffix("_scale") in scales
     }
-    missing = [n for n in missing if n not in fp8_buffers]
+    missing = [n for n in missing if n not in fp8_params]
     if missing or unexpected:
         raise ValueError(
             f"FP8r checkpoint mismatch: missing {missing}, unexpected {unexpected}"

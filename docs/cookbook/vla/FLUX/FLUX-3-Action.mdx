@@ -75,7 +75,17 @@ sglang serve black-forest-labs/flux-3-action-droid \
 
 A local policy export (a directory containing `manifest.json`, `config.native.json` and `model.safetensors`) is detected automatically when passed as the model path.
 
-A BF16 package peaks at about 27 GB of GPU memory (DiT 13.9 GB, text encoder 8.9 GB, video VAE 2.5 GB, plus activations). With `--text-encoder-cpu-offload`, the text encoder stays on the CPU between requests and is moved to the GPU only to encode a caption that is not cached yet. This lowers steady-state memory by about 9 GB, but the peak while encoding a new caption is unchanged.
+Peak GPU memory and per-request latency on one RTX 5090 (BF16 base package, cached caption):
+
+| Flags | Peak memory | Latency |
+| --- | ---: | ---: |
+| (none) | 24.1 GB | 1.30 s |
+| `--dit-layerwise-offload` | 14.5 GB | 2.55 s |
+| `--layerwise-offload-components all` | 9.9 GB | 2.58 s |
+| `--model-variant fp8r` | 18.6 GB | 1.10 s |
+| `--model-variant fp8r --dit-layerwise-offload` | 13.3 GB | 1.34 s |
+
+Layerwise offload streams the DiT blocks (and, with `all`, the text encoder and VAE blocks) from host memory, so use it only when the resident configuration does not fit.
 
 ### 3.1 Action Request Schema
 

@@ -17,6 +17,10 @@ import os
 import torch
 import torch.nn as nn
 
+from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
+    LayerwiseOffloadableModuleMixin,
+)
+
 
 def parse_weight_spec(spec: str) -> tuple[str, str | None, str | None]:
     """``repo_id[:subfolder_or_file][@revision]`` -> ``(repo_id, subpath, revision)``."""
@@ -27,7 +31,10 @@ def parse_weight_spec(spec: str) -> tuple[str, str | None, str | None]:
     return repo_id, subpath or None, revision or None
 
 
-class Flux3TextEncoder(nn.Module):
+class Flux3TextEncoder(nn.Module, LayerwiseOffloadableModuleMixin):
+    layerwise_offload_dit_group_enabled = False
+    layer_names = ["model.language_model.layers"]
+
     def __init__(
         self,
         spec: str,
@@ -48,8 +55,9 @@ class Flux3TextEncoder(nn.Module):
             spec, torch_dtype=dtype, **hub_kwargs
         )
         # Text-only use of the multimodal backbone (keeps its M-RoPE position
-        # handling for padded prompts); the LM head is dropped.
+        # handling for padded prompts); the LM head and vision tower are dropped.
         self.model = model.model
+        del self.model.visual
         # hidden_states[k] is the input of layer k, so layers >= max(output_layers)
         # and the final norm never reach the context.
         language_model = self.model.language_model
