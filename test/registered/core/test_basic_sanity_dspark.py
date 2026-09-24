@@ -130,40 +130,20 @@ class TestBasicSanityDSpark(_DSparkSanityMixin, CustomTestCase):
 class TestBasicSanityDSparkXpuTriton(_DSparkSanityMixin, CustomTestCase):
     attention_backend = "triton"
     draft_attention_backend = "triton"
-    # The tp2 prefill allreduce aborts the XPU driver under gsm8k's 128-prompt
-    # cold-start burst at higher caps; cap=2 keeps the prefill batch small (see
-    # intel_xpu class). Backend-independent -- it is the allreduce, not attention.
     max_running_requests = "2"
-    mem_fraction_static = "0.85"
-    # test_logprob_mixed asks for input logprobs over prompts up to 2000 tokens;
-    # the LM head then materializes a [chunk_tokens, 151936] logits tensor. At the
-    # 4096 default that transient OOMs the 24GB B60; 1024 caps it (~0.6GB fp32).
+    mem_fraction_static = "0.75"
     chunked_prefill_size = "1024"
-    # Two B60 cards in bfloat16 (fp16 produces garbage on XPU).
-    #extra_launch_args = ["--tp", "2", "--dtype", "bfloat16"]
-    extra_launch_args = ["--tp", "2", "--dtype", "bfloat16", "--base-gpu-id", "1"]
+    extra_launch_args = ["--tp", "2", "--dtype", "bfloat16"]
 
 
 @unittest.skipUnless(is_xpu(), "Intel XPU required")
 class TestBasicSanityDSparkXpuIntelXpu(_DSparkSanityMixin, CustomTestCase):
     attention_backend = "intel_xpu"
     draft_attention_backend = "intel_xpu"
-    # intel_xpu forces page_size 64/128; the DSpark draft's block forward runs
-    # through its target-verify / draft-extend paths (topk <= 1). 0.85 leaves
-    # room for the draft markov head alongside the 14B target KV pool on a 24GB
-    # B60 (0.7 OOMs during draft build).
     page_size = "128"
     mem_fraction_static = "0.85"
-    # gsm8k fires 128 prompts at once; --max-running-requests also bounds the
-    # prefill batch, and a large cold-start prefill's tp2 allreduce aborts the
-    # XPU driver (NEO drm_neo.cpp:289). cap=2 survives (gsm8k 0.975); higher
-    # caps abort at the first prefill batch, before any decode batch forms.
     max_running_requests = "2"
-    # test_logprob_mixed asks for input logprobs over prompts up to 2000 tokens;
-    # the LM head then materializes a [chunk_tokens, 151936] logits tensor. At the
-    # 4096 default that transient OOMs the 24GB B60; 1024 caps it (~0.6GB fp32).
-    chunked_prefill_size = "1024"
-    # Two B60 cards in bfloat16 (fp16 produces garbage on XPU).
+    chunked_prefill_size = "512"
     extra_launch_args = ["--tp", "2", "--dtype", "bfloat16"]
 
 
