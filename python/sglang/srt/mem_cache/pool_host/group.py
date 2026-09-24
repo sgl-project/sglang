@@ -174,7 +174,9 @@ class HostPoolGroup:
                 self.free(indices, pool=transfer.name)
                 transfer.host_indices = None
 
-        for transfer in transfers:
+        # Reclaiming one pool can evict another's slots. Keep allocation order
+        # identical across TP ranks even when transfers come from a Rust HashMap.
+        for transfer in sorted(transfers, key=lambda transfer: transfer.name):
             if transfer.indices_from_pool is not None:
                 derived_transfers.append(transfer)
                 continue
