@@ -18,6 +18,7 @@ from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import MergedColumnParallelLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe.topk import TopKOutputFormat, biased_grouped_topk_impl
+from sglang.srt.layers.quantization.modelopt_quant import ModelOptFp4Config
 from sglang.srt.models.beam import (
     BeamAttention,
     BeamDecoderLayer,
@@ -81,6 +82,30 @@ class _LoadedExpert:
 
 
 class TestBeamConfig(CustomTestCase):
+    def test_serialized_nvfp4_is_passed_to_model(self):
+        quant_config = ModelOptFp4Config(
+            is_checkpoint_nvfp4_serialized=True,
+            group_size=16,
+            exclude_modules=["model.layers.0*", "lm_head"],
+        )
+        model = Mock()
+        model.start_layer = 0
+        model.end_layer = 4
+        model.pp_group.is_last_rank = False
+        with (
+            get_context().override_server_args(),
+            patch("sglang.srt.models.beam.BeamModel", return_value=model) as factory,
+        ):
+            BeamForCausalLM(tiny_config(), quant_config=quant_config)
+        self.assertIs(factory.call_args.kwargs["quant_config"], quant_config)
+
+        with (
+            patch("sglang.srt.models.beam.BeamModel") as factory,
+            self.assertRaisesRegex(NotImplementedError, "serialized ModelOpt NVFP4"),
+        ):
+            BeamForCausalLM(tiny_config(), quant_config=ModelOptFp4Config())
+        factory.assert_not_called()
+
     def test_unsupported_attention_and_head_parallelism_fail_before_allocation(self):
         for field in ("enable_dp_attention", "enable_dp_lm_head"):
             with (
@@ -417,6 +442,23 @@ class TestBeamNumerics(CustomTestCase):
                     topk.forward.assert_not_called()
                     topk.empty_topk_output.assert_called_once()
 
+    def test_serialized_nvfp4_uses_quantized_expert_method(self):
+        quant_config = ModelOptFp4Config(
+            is_checkpoint_nvfp4_serialized=True, group_size=16
+        )
+        factory = Mock(return_value=torch.nn.Identity())
+        with (
+            get_parallel().override(moe_tp_size=1, moe_ep_size=1),
+            patch("sglang.srt.models.beam.TopK", return_value=torch.nn.Identity()),
+            patch(
+                "sglang.srt.models.beam.get_moe_impl_class", return_value=factory
+            ) as impl,
+        ):
+            BeamMoE(tiny_config(), layer_id=3, quant_config=quant_config)
+        impl.assert_called_once_with(quant_config)
+        self.assertIs(factory.call_args.kwargs["quant_config"], quant_config)
+        self.assertIsNone(factory.call_args.kwargs["quant_method"])
+
     def _select_beam_experts(self, config, bias, logits):
         # Exercise the TopK constructed by Beam, replacing only the hardware
         # selector with its shared eager implementation for CPU CI.
@@ -684,6 +726,35 @@ class TestBeamLoading(CustomTestCase):
                 for (expert, shard), tensor in tensors.items():
                     actual = (w2 if shard == "w2" else w13).shards[expert, shard]
                     torch.testing.assert_close(actual, tensor.to(actual.dtype))
+
+    def test_nvfp4_expert_weights_and_scales_use_same_shard_mapping(self):
+        suffixes = ("weight", "weight_scale", "weight_scale_2", "input_scale")
+        for suffix in suffixes:
+            with self.subTest(suffix=suffix):
+                w13, w2 = _LoadedExpert(), _LoadedExpert()
+                params = {
+                    f"model.layers.3.mlp.experts.w13_{suffix}": w13,
+                    f"model.layers.3.mlp.experts.w2_{suffix}": w2,
+                }
+                weights = [
+                    (
+                        f"model.layers.3.mlp.experts.7.{projection}.{suffix}",
+                        torch.tensor([value]),
+                    )
+                    for value, projection in enumerate(
+                        ("gate_proj", "up_proj", "down_proj"), start=1
+                    )
+                ]
+                loaded = loader_model(params).load_weights(weights)
+                self.assertEqual(loaded, set(params))
+                for param, shard, expected in (
+                    (w13, "w1", 1),
+                    (w13, "w3", 2),
+                    (w2, "w2", 3),
+                ):
+                    torch.testing.assert_close(
+                        param.shards[7, shard], torch.tensor([expected])
+                    )
 
     def test_router_parameters_preserve_fp32_checkpoint_values(self):
         config = tiny_config()

@@ -42,6 +42,7 @@ from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.topk import TopK, TopKOutputFormat
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.quantization.modelopt_quant import ModelOptFp4Config
 from sglang.srt.layers.quantization.unquant import UnquantizedFusedMoEMethod
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import RotaryEmbedding
@@ -112,18 +113,25 @@ class BeamUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
 
 
 class BeamMLP(nn.Module):
-    def __init__(self, config: BeamConfig, prefix: str = ""):
+    def __init__(
+        self,
+        config: BeamConfig,
+        prefix: str = "",
+        quant_config: Optional[QuantizationConfig] = None,
+    ):
         super().__init__()
         self.gate_up_proj = MergedColumnParallelLinear(
             config.hidden_size,
             [config.intermediate_size] * 2,
             bias=False,
+            quant_config=quant_config,
             prefix=add_prefix("gate_up_proj", prefix),
         )
         self.down_proj = RowParallelLinear(
             config.intermediate_size,
             config.hidden_size,
             bias=False,
+            quant_config=quant_config,
             prefix=add_prefix("down_proj", prefix),
         )
         self.act_fn = BeamSiluAndMul()
@@ -136,20 +144,24 @@ class BeamMLP(nn.Module):
 
 
 class BeamMoE(nn.Module):
-    def __init__(self, config: BeamConfig, layer_id: int, prefix: str = ""):
+    def __init__(
+        self,
+        config: BeamConfig,
+        layer_id: int,
+        prefix: str = "",
+        quant_config: Optional[QuantizationConfig] = None,
+    ):
         super().__init__()
         self.config = config
         self.layer_id = layer_id
         self.tp_size = get_parallel().moe_tp_size
         self.ep_size = get_parallel().moe_ep_size
         backend = get_moe_runner_backend()
-        if (
-            not (backend.is_auto() or backend.is_triton())
-            or not get_moe_a2a_backend().is_none()
-        ):
+        if not get_moe_a2a_backend().is_none():
+            raise ValueError("Beam currently supports no MoE all-to-all")
+        if quant_config is None and not (backend.is_auto() or backend.is_triton()):
             raise ValueError(
-                "Beam BF16 currently supports the auto or triton MoE runner "
-                "with no MoE all-to-all"
+                "Beam BF16 currently supports the auto or triton MoE runner"
             )
         self.gate = ReplicatedLinear(
             config.hidden_size,
@@ -174,7 +186,7 @@ class BeamMoE(nn.Module):
         )
         # Keep normalized routing coefficients in FP32. The runner applies the
         # routed scale during combination, after weighting each expert output.
-        self.experts = get_moe_impl_class(None)(
+        self.experts = get_moe_impl_class(quant_config)(
             num_experts=config.num_experts,
             top_k=config.num_experts_per_tok,
             hidden_size=config.hidden_size,
@@ -182,7 +194,10 @@ class BeamMoE(nn.Module):
             layer_id=layer_id,
             inplace=False,
             routed_scaling_factor=config.routed_scaling_factor,
-            quant_method=BeamUnquantizedFusedMoEMethod(),
+            quant_config=quant_config,
+            quant_method=(
+                BeamUnquantizedFusedMoEMethod() if quant_config is None else None
+            ),
             prefix=add_prefix("experts", prefix),
         )
 
@@ -241,6 +256,7 @@ class BeamAttention(nn.Module):
             bias=False,
             tp_rank=self.tp_rank,
             tp_size=self.tp_size,
+            quant_config=quant_config,
             prefix=add_prefix("qkv_proj", prefix),
         )
         self.gate_proj = ColumnParallelLinear(
@@ -249,6 +265,7 @@ class BeamAttention(nn.Module):
             bias=False,
             tp_rank=self.tp_rank,
             tp_size=self.tp_size,
+            quant_config=quant_config,
             prefix=add_prefix("gate_proj", prefix),
         )
         self.gate_bias = nn.Parameter(torch.empty(self.num_heads), requires_grad=False)
@@ -260,6 +277,7 @@ class BeamAttention(nn.Module):
             tp_rank=self.tp_rank,
             tp_size=self.tp_size,
             use_dp_attention_reduce=True,
+            quant_config=quant_config,
             prefix=add_prefix("o_proj", prefix),
         )
         self.q_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
@@ -319,6 +337,7 @@ class BeamDecoderLayer(nn.Module):
         layer_id: int,
         prefix: str = "",
         rotary_emb: BeamRotaryEmbedding | None = None,
+        quant_config: Optional[QuantizationConfig] = None,
     ):
         super().__init__()
         self.layer_id = layer_id
@@ -337,13 +356,19 @@ class BeamDecoderLayer(nn.Module):
         self.self_attn = BeamAttention(
             config,
             layer_id,
+            quant_config=quant_config,
             prefix=add_prefix("self_attn", prefix),
             rotary_emb=rotary_emb,
         )
         self.mlp = (
-            BeamMLP(config, prefix=add_prefix("mlp", prefix))
+            BeamMLP(config, quant_config=quant_config, prefix=add_prefix("mlp", prefix))
             if config.mlp_layer_types[layer_id] == "dense"
-            else BeamMoE(config, layer_id, prefix=add_prefix("mlp", prefix))
+            else BeamMoE(
+                config,
+                layer_id,
+                quant_config=quant_config,
+                prefix=add_prefix("mlp", prefix),
+            )
         )
         # Round once, after FP32 normalization and learned-weight multiplication.
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -408,7 +433,11 @@ class BeamModel(nn.Module):
         self.layers, self.start_layer, self.end_layer = make_layers(
             config.num_hidden_layers,
             lambda idx, prefix: BeamDecoderLayer(
-                config, idx, prefix, rotary_emb=rotary_emb
+                config,
+                idx,
+                quant_config=quant_config,
+                prefix=prefix,
+                rotary_emb=rotary_emb,
             ),
             pp_rank=self.pp_group.rank_in_group,
             pp_size=self.pp_group.world_size,
@@ -451,8 +480,10 @@ class BeamForCausalLM(nn.Module):
         prefix: str = "",
     ):
         super().__init__()
-        if quant_config is not None:
-            raise NotImplementedError("Beam currently supports unquantized weights")
+        if quant_config is not None and not isinstance(quant_config, ModelOptFp4Config):
+            raise NotImplementedError("Beam supports only ModelOpt NVFP4 quantization")
+        if quant_config is not None and not quant_config.is_checkpoint_nvfp4_serialized:
+            raise NotImplementedError("Beam requires serialized ModelOpt NVFP4 weights")
         if get_parallel().enable_dp_attention or get_parallel().enable_dp_lm_head:
             raise NotImplementedError(
                 "Beam does not yet support attention data parallelism or a "
@@ -468,7 +499,9 @@ class BeamForCausalLM(nn.Module):
                 "redundant experts; use trivial expert placement"
             )
         self.config = config
-        self.model = BeamModel(config, prefix=add_prefix("model", prefix))
+        self.model = BeamModel(
+            config, quant_config=quant_config, prefix=add_prefix("model", prefix)
+        )
         self.start_layer = self.model.start_layer
         self.end_layer = self.model.end_layer
         self.lm_head = (
