@@ -1028,6 +1028,7 @@ class GenerateReqInput:
 
 
 class TokenizedGenerateReqInput(BaseReq, kw_only=True):
+    prefill_uncached_fraction: float = 1.0
     input_text: Optional[Union[str, List[Union[str, List[str]]]]]
     # The input token ids
     input_ids: Optional[array]  # Optional[array[int]]

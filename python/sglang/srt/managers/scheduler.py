@@ -2799,6 +2799,7 @@ class Scheduler(
                 time_stats=recv_req.time_stats,
                 multi_item_delimiter_indices=recv_req.multi_item_delimiter_indices,
             )
+            req.prefill_uncached_fraction = recv_req.prefill_uncached_fraction
             req.tokenizer = self.tokenizer
 
             if radix_native_session:

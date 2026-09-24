@@ -1494,6 +1494,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 self.fake_bootstrap_room_counter += 1
 
             tokenized_obj = TokenizedGenerateReqInput(
+                prefill_uncached_fraction=getattr(
+                    obj, "prefill_uncached_fraction", 1.0
+                ),
                 input_text=input_text,
                 input_ids=input_ids_arr,
                 mm_inputs=mm_inputs,
@@ -3614,6 +3617,14 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 raise ValueError(f"Duplicate request ID detected: {rid}")
             time_stats = APIServerReqTimeStats(disagg_mode=self.disaggregation_mode)
             state = ReqState([], False, asyncio.Event(), sub_obj, time_stats)
+            if envs.SGLANG_TRUST_PREFILL_COST_HEADER.get() and request:
+                from sglang.srt.disaggregation.decode_hrrn import (
+                    parse_uncached_fraction,
+                )
+
+                sub_obj.prefill_uncached_fraction = parse_uncached_fraction(
+                    request.headers.get("x-smg-prefill-uncached-fraction")
+                )
             self.rid_to_state[rid] = state
             if self.enable_trace:
                 time_stats.init_trace_ctx(rid, bootstrap_room, external_trace_header)
