@@ -983,7 +983,7 @@ class UnifiedRadixCache(BasePrefixCache):
     @rank_consensus(same_params=["req.rid", "owned_kv_len"])
     def cache_finished_req(self, req: Req, *, owned_kv_len: int, **kwargs) -> None:
         if self.disable:
-            self.free_kv_row(req.kv, [(0, owned_kv_len)])
+            self.free_kv_row(req.kv, [(req.kv.cache_protected_len, owned_kv_len)])
             for comp in self._components_tuple:
                 comp.cleanup_after_caching_req(req, is_finished=True)
             return
