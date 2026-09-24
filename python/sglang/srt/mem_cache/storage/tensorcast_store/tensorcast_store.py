@@ -460,7 +460,8 @@ def _select_pool_adapter(
             (FragmentComponent.K, FragmentComponent.V),
             (mha_pool.kv_buffer, mha_pool.kv_buffer),
         )
-    if pool_type is MLATokenToKVPoolHost:
+    # isinstance: NPU subclasses share the base host-side buffer layout.
+    if isinstance(mem_pool_host, MLATokenToKVPoolHost):
         mla_pool = mem_pool_host
         return (
             _PoolFamily.MLA,

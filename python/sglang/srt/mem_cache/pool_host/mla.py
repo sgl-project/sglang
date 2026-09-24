@@ -140,15 +140,26 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
             self.device_pool.device,
             host_memory_registered=self.pin_memory,
         )
-        if self.mtp_draft_device_pools:
-            device_pools = (self.device_pool, *self.mtp_draft_device_pools)
-            self.packed_device_data_ptrs = torch.cat(
-                [pool.data_ptrs for pool in device_pools]
-            )
-            self.packed_device_kv_buffers = [
-                buffer for pool in device_pools for buffer in pool.kv_buffer
-            ]
+        self._init_packed_device_transfer_buffers()
         self._init_write_back_staging_buffers()
+
+    def _init_packed_device_transfer_buffers(self):
+        """Build the packed target+draft device pointer tables.
+
+        Only consumed by the CUDA-style kernel/direct IO backends (see
+        ``_resolve_device_transfer_buffers``); backends whose device pools
+        expose contiguous buffers instead of per-layer data_ptrs/kv_buffer
+        tables (e.g. NPU kernel_ascend) override this to skip the build.
+        """
+        if not self.mtp_draft_device_pools:
+            return
+        device_pools = (self.device_pool, *self.mtp_draft_device_pools)
+        self.packed_device_data_ptrs = torch.cat(
+            [pool.data_ptrs for pool in device_pools]
+        )
+        self.packed_device_kv_buffers = [
+            buffer for pool in device_pools for buffer in pool.kv_buffer
+        ]
 
     def _init_dummy(
         self,
@@ -1195,3 +1206,21 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         )
         base_aligned = self.kv_buffer.data_ptr() % page_size_bytes == 0
         return base_aligned and stride % page_size_bytes == 0
+
+
+def get_mla_host_pool_cls(device_pool: MLATokenToKVPool) -> type:
+    """Pick the right MLA host-pool class based on the device pool type.
+
+    Returns ``NPUMLATokenToKVPoolHost`` for NPU device pools: they transfer
+    via the kernel_ascend IO backend with contiguous buffers and never build
+    the CUDA-style packed data_ptrs/kv_buffer tables, else the default
+    ``MLATokenToKVPoolHost``.
+    """
+    from sglang.srt.hardware_backend.npu.memory_pool_npu import (
+        NPUMLATokenToKVPool,
+        NPUMLATokenToKVPoolHost,
+    )
+
+    if isinstance(device_pool, NPUMLATokenToKVPool):
+        return NPUMLATokenToKVPoolHost
+    return MLATokenToKVPoolHost

@@ -12,6 +12,7 @@ from sglang.srt.mem_cache.memory_pool import (
     get_tensor_size_bytes,
     unwrap_write_loc,
 )
+from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
 from sglang.srt.utils import get_bool_env_var
 from sglang.srt.utils.common import is_npu
 
@@ -1061,3 +1062,21 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
                     assert cpu.shape[0] == len(chunk_indices)
                     buffer[chunk_indices] = cpu.to(buffer.device, non_blocking=True)
         torch.npu.synchronize()
+
+
+class NPUMLATokenToKVPoolHost(MLATokenToKVPoolHost):
+    """MLA host pool bound to NPU device pools.
+
+    NPU transfers use the kernel_ascend IO backend with contiguous
+    multi-layer k/v buffers; the device pools intentionally do not build
+    the CUDA-style per-layer data_ptrs/kv_buffer tables consumed by the
+    kernel/direct backends (see ``_resolve_device_transfer_buffers``, which
+    is short-circuited for kernel_ascend).
+    """
+
+    def _init_packed_device_transfer_buffers(self):
+        # The packed tables are only consumed by the kernel/direct backends;
+        # declare them so attribute access is uniform across subclasses.
+        if self.mtp_draft_device_pools:
+            self.packed_device_data_ptrs = None
+            self.packed_device_kv_buffers = None
