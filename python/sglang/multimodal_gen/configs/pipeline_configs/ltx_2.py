@@ -178,6 +178,10 @@ class LTX2PipelineConfig(PipelineConfig):
     generator_device: str = "cpu"
     dit_config: LTX2Config = field(default_factory=LTX2Config)
 
+    # Distilled checkpoints are trained against one fixed sigma schedule rather
+    # than a step count. When set, it replaces the derived schedule.
+    default_sigmas: tuple[float, ...] | None = None
+
     # Model architecture
     in_channels: int = 128
     out_channels: int = 128
@@ -309,6 +313,9 @@ class LTX2PipelineConfig(PipelineConfig):
             self.patch_size,
         )
         latents = latents.permute(0, 2, 4, 6, 1, 3, 5, 7).flatten(4, 7).flatten(1, 3)
+        # Deliberately left non-contiguous: both flattens are views, so this
+        # keeps the permuted strides. Normalising here would change which GEMM
+        # kernel runs and move bf16 output. The fp8 path makes its own copy.
         return latents
 
     def _infer_video_latent_frames_and_tokens_per_frame(
@@ -716,3 +723,40 @@ class LTX2PipelineConfig(PipelineConfig):
 @dataclasses.dataclass
 class LTX23PipelineConfig(LTX2PipelineConfig):
     """Configuration overrides for LTX-2.3."""
+
+    # original-mode lora swaps invalidate post-warmup timing calibration
+    supports_auto_residency: bool = False
+
+
+def register():
+    from sglang.multimodal_gen.configs.sample.ltx_2 import (
+        LTX2SamplingParams,
+        LTX23HQSamplingParams,
+        LTX23SamplingParams,
+    )
+    from sglang.multimodal_gen.registry import register_configs
+
+    register_configs(
+        sampling_param_cls=LTX2SamplingParams,
+        pipeline_config_cls=LTX2PipelineConfig,
+        hf_model_paths=["Lightricks/LTX-2"],
+        model_detectors=[
+            lambda path: "ltx" in path.lower() and "video" in path.lower(),
+            lambda path: (
+                "ltx-2" in path.lower()
+                and "ltx-2.3" not in path.lower()
+                and "ltx-2.5" not in path.lower()
+            ),
+        ],
+    )
+    register_configs(
+        sampling_param_cls=LTX23SamplingParams,
+        pipeline_config_cls=LTX23PipelineConfig,
+        hf_model_paths=["Lightricks/LTX-2.3"],
+        model_detectors=[
+            lambda path: "ltx-2.3" in path.lower(),
+        ],
+        pipeline_config_registry_entries={
+            "LTX2TwoStageHQPipeline": (LTX2PipelineConfig, LTX23HQSamplingParams),
+        },
+    )

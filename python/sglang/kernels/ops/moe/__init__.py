@@ -17,6 +17,7 @@ if TYPE_CHECKING:
     import torch
 
 _CUDA = frozenset({CapabilityRequirement.CUDA})
+_HIP = frozenset({CapabilityRequirement.HIP})
 
 register_kernel(
     KernelSpec(
@@ -48,11 +49,25 @@ register_kernel(
         op="moe.topk_softmax",
         backend=KernelBackend.AOT,
         target="sgl_kernel:topk_softmax",
+        capabilities=_HIP,
         format_signature=FormatSignature(
             in_place=True,
             description="top-k softmax routing weights/ids",
         ),
-        description="MoE top-k softmax (sgl_kernel wheel).",
+        description="MoE top-k softmax (sgl_kernel ROCm wheel).",
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="moe.topk_softmax",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.moe.moe_topk_softmax:topk_softmax",
+        capabilities=_CUDA,
+        format_signature=FormatSignature(
+            in_place=True,
+            description="top-k softmax routing weights/ids",
+        ),
+        description="MoE top-k softmax (sglang.kernels.jit).",
     )
 )
 
@@ -103,7 +118,7 @@ def topk_softmax(
     correction_bias: Optional[torch.Tensor] = None,
 ) -> None:
     """Compute top-k softmax routing weights/ids for MoE."""
-    return get_kernel("moe.topk_softmax", KernelBackend.AOT)(
+    return get_kernel("moe.topk_softmax")(
         topk_weights,
         topk_ids,
         gating_output,
@@ -113,7 +128,37 @@ def topk_softmax(
     )
 
 
-__all__ = ["moe_align_block_size", "topk_softmax"]
+def situ_and_mul_masked_post_quant(
+    input: torch.Tensor,
+    output: torch.Tensor,
+    output_scale: torch.Tensor,
+    quant_group_size: int,
+    masked_m: torch.Tensor,
+    beta: float,
+    linear_beta: float,
+    scale_ue8m0: bool = False,
+    topk: int = 8,
+    transposed: bool = False,
+    swizzle: bool = False,
+) -> None:
+    from ._jit_situ_and_mul_quant import situ_and_mul_masked_post_quant as impl
+
+    return impl(
+        input,
+        output,
+        output_scale,
+        quant_group_size,
+        masked_m,
+        beta,
+        linear_beta,
+        scale_ue8m0,
+        topk,
+        transposed,
+        swizzle,
+    )
+
+
+__all__ = ["situ_and_mul_masked_post_quant", "moe_align_block_size", "topk_softmax"]
 
 
 # Fused MoE-LoRA Triton kernels migrated into this group (from lora/triton_ops);
@@ -160,16 +205,6 @@ for _mod, _fn in _PHASE25_TRITON_KERNELS:
     )
 del _mod, _fn
 
-# Packed (topk_id << 16 | bf16-weight) kernel migrated from
-# srt/layers/quantization/mxfp4_flashinfer_trtllm_moe (RFC #29630, Phase 2.5).
-register_kernel(
-    KernelSpec(
-        op="moe.pack_topk_ids",
-        backend=KernelBackend.TRITON,
-        target="sglang.kernels.ops.moe.pack_topk_ids:PackTopkIds.triton",
-    )
-)
-
 # Single-CTA align for tiny batches: covers the corner the AOT/JIT
 # moe_align_block_size small-batch path leaves out (num_experts > 64), and is
 # selected by the moe_runner call site on numel <= SMALL_NUMEL_LIMIT.
@@ -184,5 +219,29 @@ register_kernel(
             description="align/sort expert token ids into block-padded buffers",
         ),
         description="MoE align-block-size, single-launch triton variant.",
+    )
+)
+
+# One gather for a quantized activation and its group scales: replaces the pair
+# of shuffle_rows launches the cutlass fp8 blockwise MoE used to walk the same
+# dst2src map with. Byte-identical to those calls.
+register_kernel(
+    KernelSpec(
+        op="moe.shuffle_rows_with_scales",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.moe.shuffle_rows_with_scales:shuffle_rows_with_scales",
+        capabilities=_CUDA,
+        description="Row gather of quantized values plus their scales, one launch.",
+    )
+)
+
+
+# Kernels introduced with Kimi-K3, inventoried by logical operator group.
+register_kernel(
+    KernelSpec(
+        op="moe.situ_and_mul_masked_post_quant",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.moe._jit_situ_and_mul_quant:situ_and_mul_masked_post_quant",
+        capabilities=frozenset({CapabilityRequirement.CUDA}),
     )
 )

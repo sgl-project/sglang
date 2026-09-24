@@ -8,7 +8,7 @@
 #   fast  — warp-specialized TMA kernel: cp.async.bulk producer +
 #           online-softmax consumers over a double-buffered chunk ring, out
 #           norm fused, per-nvb tuned launch config, one persistent CTA per
-#           SM. Taken on SM100+ with H=7168.
+#           SM. Taken on SM100+ except SM12x with H=7168.
 #   hip   — single Triton kernel, everything in one launch; taken on ROCm
 #           within its register budget.
 #   fused — Triton 2-kernel pipeline with full H-parallelism; the fallback
@@ -33,15 +33,20 @@ _FAST_SUPPORTED = None
 _HIP_SHAPE_GATE = None
 
 
+def _supports_attn_res_tma(capability: tuple[int, int]) -> bool:
+    """Return whether the device is eligible for the TMA fast path."""
+    major, _ = capability
+    return major >= 10 and major != 12
+
+
 def _use_fast(hidden_size: int) -> bool:
-    """The TMA kernel needs SM100+ (tcgen05, cp.async.bulk) and its H=7168
-    template instantiation; everything else takes the triton pipeline."""
+    """The TMA kernel needs SM100+ except SM12x (tcgen05, cp.async.bulk)
+    and its H=7168 template; everything else takes the triton pipeline."""
     global _FAST_SUPPORTED
     if is_npu():
         return False
     if _FAST_SUPPORTED is None:
-        major, _ = torch.cuda.get_device_capability()
-        _FAST_SUPPORTED = major >= 10
+        _FAST_SUPPORTED = _supports_attn_res_tma(torch.cuda.get_device_capability())
     return _FAST_SUPPORTED and hidden_size == 7168
 
 
@@ -52,7 +57,7 @@ def _use_hip_fused(hidden_size: int, nvb: int) -> bool:
         return False
     global _HIP_SHAPE_GATE
     if _HIP_SHAPE_GATE is None:
-        from sglang.kernels.ops.kimi_k3.attn_res_hip import supports_attn_res_hip
+        from sglang.kernels.ops.attention.attn_res_hip import supports_attn_res_hip
 
         _HIP_SHAPE_GATE = supports_attn_res_hip
     return _HIP_SHAPE_GATE(hidden_size, nvb)
@@ -92,7 +97,7 @@ def _aggregate_fast(
     config (GB300 benchmark winner across nvb). With write_bank_row the kernel
     also snapshots the prefix row into bank[:, nvb, :] (bit-exact, zero extra
     reads — the row streams through the score pass anyway)."""
-    from sglang.kernels.ops.kimi_k3.attn_res import attn_res_fused_tma
+    from sglang.kernels.ops.attention.attn_res import attn_res_fused_tma
 
     # The kernel applies one eps to both the score norm and the output norm.
     assert score_norm.variance_epsilon == out_norm.variance_epsilon
@@ -289,7 +294,7 @@ def _aggregate_hip(
     mixing share one read, and the pending residual add, the bank snapshot and
     the output RMSNorm all fold into the same launch. out_norm None returns the
     pre-norm mixture instead. Returns (result, prefix)."""
-    from sglang.kernels.ops.kimi_k3.attn_res_hip import attn_res_hip
+    from sglang.kernels.ops.attention.attn_res_hip import attn_res_hip
 
     cw = get_cw(score_proj, score_norm)
     prefix = prefix_sum if addend is None else torch.empty_like(prefix_sum)

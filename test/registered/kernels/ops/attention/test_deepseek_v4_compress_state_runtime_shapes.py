@@ -11,10 +11,10 @@
 #
 # Test command:
 #   python3 -m pytest -q \
-#     test/registered/jit/test_deepseek_v4_compress_state_runtime_shapes.py
+#     test/registered/kernels/ops/attention/test_deepseek_v4_compress_state_runtime_shapes.py
 #
 # Runtime-shape benchmark command:
-#   python3 test/registered/jit/test_deepseek_v4_compress_state_runtime_shapes.py \
+#   python3 test/registered/kernels/ops/attention/test_deepseek_v4_compress_state_runtime_shapes.py \
 #     --benchmark \
 #     --shape-source runtime \
 #     --warmup 20 \
@@ -22,7 +22,7 @@
 #     --csv /data00/eval_results/operator_bench/runtime_shape_bench.csv
 #
 # Synthetic Flash/Pro shape benchmark command:
-#   python3 test/registered/jit/test_deepseek_v4_compress_state_runtime_shapes.py \
+#   python3 test/registered/kernels/ops/attention/test_deepseek_v4_compress_state_runtime_shapes.py \
 #     --benchmark \
 #     --shape-source preset \
 #     --shape-presets all \
@@ -39,7 +39,7 @@
 # - Use long random prompts and short outputs to make prefill dominate:
 #   SGLANG_DSV4_COMPRESS_STATE_DTYPE=bf16 \
 #   SGLANG_SHARED_EXPERT_TP1=1 \
-#   SGLANG_ENABLE_THINKING=1 \
+#   SGLANG_DEFAULT_THINKING=1 \
 #   SGLANG_DSV4_FP4_EXPERTS=1 \
 #   SGLANG_JIT_DEEPGEMM_PRECOMPILE=1 \
 #   sglang serve \

@@ -6,7 +6,6 @@ from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.server_args import (
     ServerArgs,
-    get_global_server_args,
     set_global_server_args_for_scheduler,
 )
 from sglang.srt.utils import (
@@ -76,9 +75,9 @@ def torch_ref_rms_norm_rope(
     v_size = num_heads_v * head_dim
 
     # Verify dimensions match
-    assert (
-        hidden_size == q_size + k_size + v_size
-    ), f"Hidden size {hidden_size} doesn't match Q+K+V dimensions {q_size + k_size + v_size}"
+    assert hidden_size == q_size + k_size + v_size, (
+        f"Hidden size {hidden_size} doesn't match Q+K+V dimensions {q_size + k_size + v_size}"
+    )
 
     # Split the tensor into Q, K, V parts
     q = qkv[:, :q_size]

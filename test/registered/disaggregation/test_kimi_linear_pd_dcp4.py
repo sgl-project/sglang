@@ -58,8 +58,21 @@ class TestKimiLinearPDDCP4(GSM8KMixin, PDDisaggregationServerBase):
     @classmethod
     def setUpClass(cls):
         super().setUpClass()
+        # Mooncake >=0.3.13 (kvcache-ai/Mooncake#2974) bounds TCP admission per
+        # peer and hard-fails the overflow instead of applying backpressure.
+        # This test's TP4/EP4 -> TP4/DCP4 fan-out blows past the 1024 + 1024
+        # defaults on hosts that fall back to TCP, killing every KV transfer.
+        # Set before launch_all() so the server subprocesses inherit it.
+        os.environ["MC_TCP_MAX_QUEUED_TRANSFERS_PER_PEER"] = "65535"
+        os.environ["MC_TCP_MAX_PENDING_ADMISSIONS_PER_PEER"] = "65535"
         cls._collect_monolithic_references()
         cls.launch_all()
+
+    @classmethod
+    def tearDownClass(cls):
+        os.environ.pop("MC_TCP_MAX_QUEUED_TRANSFERS_PER_PEER")
+        os.environ.pop("MC_TCP_MAX_PENDING_ADMISSIONS_PER_PEER")
+        super().tearDownClass()
 
     @classmethod
     def _monolithic_reference_args(cls):
@@ -448,7 +461,29 @@ class TestKimiLinearPDDCP4(GSM8KMixin, PDDisaggregationServerBase):
                     reference,
                     actual,
                     label=(
-                        f"niah prompt_tokens={LONG_CONTEXT_TOKENS} "
+                        f"niah prompt_tokens={LONG_CONTEXT_TOKENS} depth={needle_depth}"
+                    ),
+                )
+                # Prefill now holds the long prefix. Decode must receive it
+                # again, even though prefill computes almost no new tokens.
+                # OSL > 1 checks that decode actually reads the transferred KV.
+                self._flush_cache(self.decode_url)
+                cached_actual = self._generate(
+                    self.base_url,
+                    prompt,
+                    max_new_tokens=16,
+                    ignore_eos=False,
+                )
+                self.assertGreater(
+                    cached_actual["meta_info"]["cached_tokens"],
+                    CHUNKED_PREFILL_SIZE,
+                )
+                self.assertIn(NIAH_KEY, cached_actual["text"])
+                self._assert_output_parity(
+                    reference,
+                    cached_actual,
+                    label=(
+                        f"cached niah prompt_tokens={LONG_CONTEXT_TOKENS} "
                         f"depth={needle_depth}"
                     ),
                 )

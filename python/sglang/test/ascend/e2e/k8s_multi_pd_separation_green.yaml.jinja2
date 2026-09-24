@@ -22,6 +22,7 @@ spec:
     metadata:
       labels:
         app: sgl-ascend
+        run-id: "{{ run_id }}"
         task: prefill
     spec:
       restartPolicy: Always
@@ -53,6 +54,8 @@ spec:
           value: "https://hf-mirror.com"
         - name: METRICS_DATA_FILE
           value: "{{ metrics_data_file }}"
+        - name: RUN_LABEL
+          value: "{{ run_label }}"
         - name: SGLANG_IS_IN_CI
           value: "{{ sglang_is_in_ci }}"
         command: ["/bin/bash", "-c"]
@@ -123,6 +126,7 @@ spec:
     metadata:
       labels:
         app: sgl-ascend
+        run-id: "{{ run_id }}"
         task: decode
     spec:
       restartPolicy: Always
@@ -154,6 +158,8 @@ spec:
           value: "https://hf-mirror.com"
         - name: METRICS_DATA_FILE
           value: "{{ metrics_data_file }}"
+        - name: RUN_LABEL
+          value: "{{ run_label }}"
         - name: SGLANG_IS_IN_CI
           value: "{{ sglang_is_in_ci }}"
         command: ["/bin/bash", "-c"]
@@ -224,6 +230,7 @@ spec:
     metadata:
       labels:
         app: sgl-ascend
+        run-id: "{{ run_id }}"
         task: router
     spec:
       hostNetwork: True
@@ -254,6 +261,8 @@ spec:
           value: "https://hf-mirror.com"
         - name: METRICS_DATA_FILE
           value: "{{ metrics_data_file }}"
+        - name: RUN_LABEL
+          value: "{{ run_label }}"
         - name: SGLANG_IS_IN_CI
           value: "{{ sglang_is_in_ci }}"
         command: ["/bin/bash", "-c"]

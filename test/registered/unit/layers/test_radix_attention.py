@@ -10,10 +10,15 @@ import torch
 import sglang.srt.layers.radix_attention as radix_attention_module
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
+from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
+    get_tc_piecewise_forward_context,
+    set_tc_piecewise_forward_context,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 class _RecordingAttentionBackend:
@@ -37,6 +42,7 @@ class _RecordingAttentionBackend:
                 key=key,
                 value=value,
                 attention_layer=attention_layer,
+                forward_batch=forward_batch,
                 output=forward_batch._attn_output,
                 out_cache_loc=forward_batch.out_cache_loc.clone(),
                 save_kv_cache=save_kv_cache,
@@ -69,10 +75,11 @@ class TestRadixAttentionGraphInterface(CustomTestCase):
         real_num_tokens=2,
     ):
         forward_batch = SimpleNamespace(
-            num_token_non_padded_cpu=real_num_tokens,
+            global_num_token_non_padded_cpu=real_num_tokens,
             out_cache_loc=torch.arange(num_tokens, dtype=torch.int64),
             positions=torch.arange(num_tokens, dtype=torch.int64),
             _attn_output=None,
+            mha_return_lse=False,
         )
         return SimpleNamespace(
             forward_batch=forward_batch,
@@ -174,6 +181,121 @@ class TestRadixAttentionGraphInterface(CustomTestCase):
                     self.assertEqual(output.shape, query.shape)
                     self.assertTrue(torch.all(output == 5))
 
+    def test_prefill_wrapper_opt_out_preserves_expanded_rows_and_batch(self):
+        """Expanded attention rows must not be sliced using the runner's token count."""
+        layer = RadixAttention(
+            num_heads=2,
+            head_dim=3,
+            scaling=1.0,
+            num_kv_heads=2,
+            layer_id=0,
+            use_prefill_attention_wrapper=False,
+        )
+        runner_batch = self._new_impl_context([layer], num_tokens=2).forward_batch
+        expanded_batch = SimpleNamespace(
+            forward_mode=ForwardMode.EXTEND,
+            out_cache_loc=runner_batch.out_cache_loc,
+            _attn_output=None,
+            mha_return_lse=False,
+        )
+        query = torch.arange(48, dtype=torch.float32).view(8, 2, 3)
+        key = query.flatten(1).clone()
+        value = -key
+        backend = _RecordingAttentionBackend(return_lse=False)
+
+        with (
+            forward_context(ForwardContext(backend)),
+            set_tc_piecewise_forward_context(
+                runner_batch, [layer], None, [], [], num_tokens=8, full_graph=True
+            ),
+        ):
+            output = layer(
+                query, key, value, expanded_batch, save_kv_cache=False, causal=False
+            )
+            self.assertIs(
+                get_tc_piecewise_forward_context().forward_batch, runner_batch
+            )
+
+        self.assertTrue(torch.equal(output, torch.full_like(query, 3)))
+        self.assertEqual(len(backend.calls), 1)
+        call = backend.calls[0]
+        self.assertIs(call.query, query)
+        for actual, original in ((call.key, key), (call.value, value)):
+            self.assertEqual(actual.shape, (8, 2, 3))
+            self.assertEqual(actual.data_ptr(), original.data_ptr())
+            self.assertTrue(torch.equal(actual.flatten(), original.flatten()))
+        self.assertIs(call.attention_layer, layer)
+        self.assertIs(call.forward_batch, expanded_batch)
+        self.assertIs(expanded_batch.out_cache_loc, runner_batch.out_cache_loc)
+        self.assertFalse(call.save_kv_cache)
+        self.assertEqual(call.kwargs, {"causal": False})
+        self.assertEqual(runner_batch.global_num_token_non_padded_cpu, 2)
+
+    def test_deferred_norm_rope_operands_follow_real_tokens_on_each_call(self):
+        layer = self._new_layer()
+        query = torch.zeros((4, 2, 3))
+        positions = torch.arange(4)
+        temp_scale = torch.arange(4, dtype=torch.float32).reshape(4, 1)
+        norm_weight = torch.ones(3)
+        operands = {
+            "mxfp8_norm_rope_positions": positions,
+            "mxfp8_norm_rope_temp_scale": temp_scale,
+            "norm_weight": norm_weight,
+        }
+        for breakable in (False, True):
+            with self.subTest(breakable=breakable):
+                context = self._new_impl_context([layer])
+                forward_batch = context.forward_batch
+                forward_batch.forward_mode = ForwardMode.EXTEND
+                original_cache_loc = forward_batch.out_cache_loc
+                backend = _RecordingAttentionBackend(return_lse=False)
+                with (
+                    patch.object(
+                        radix_attention_module,
+                        "get_tc_piecewise_forward_context",
+                        return_value=context,
+                    ),
+                    patch.object(
+                        radix_attention_module,
+                        "get_attn_backend",
+                        return_value=backend,
+                    ),
+                    patch.object(
+                        radix_attention_module,
+                        "is_in_breakable_cuda_graph",
+                        return_value=breakable,
+                    ),
+                    patch.object(
+                        radix_attention_module,
+                        "breakable_attention_with_output_extra_kwargs",
+                        side_effect=radix_attention_module.attention_with_output_extra_kwargs,
+                    ) as graph_break,
+                ):
+                    for real_tokens in (2, 4):
+                        forward_batch.global_num_token_non_padded_cpu = real_tokens
+                        positions.add_(10)
+                        result = layer(query, query, query, forward_batch, **operands)
+                        call = backend.calls[-1]
+                        self.assertEqual(call.query.shape[0], real_tokens)
+                        self.assertTrue(
+                            torch.equal(
+                                call.kwargs["mxfp8_norm_rope_positions"],
+                                positions[:real_tokens],
+                            )
+                        )
+                        self.assertTrue(
+                            torch.equal(
+                                call.kwargs["mxfp8_norm_rope_temp_scale"],
+                                temp_scale[:real_tokens],
+                            )
+                        )
+                        self.assertIs(call.kwargs["norm_weight"], norm_weight)
+                        self.assertIs(forward_batch.out_cache_loc, original_cache_loc)
+                        self.assertTrue(torch.all(result[:real_tokens] == 3))
+                        self.assertEqual(positions.shape[0], 4)
+                        self.assertEqual(temp_scale.shape[0], 4)
+                    self.assertEqual(graph_break.call_count, 2 if breakable else 0)
+
     def test_impl_preserves_attention_identity_and_lse(self):
         mqa = SimpleNamespace()
         mha = SimpleNamespace()
@@ -220,6 +342,34 @@ class TestRadixAttentionGraphInterface(CustomTestCase):
                     self.assertTrue(torch.all(lse[:2] == 7))
                     self.assertTrue(torch.all(lse[2:] == 0))
                     self.assertIs(forward_batch.out_cache_loc, original_out_cache_loc)
+
+    def test_extra_kwargs_path_returns_bucket_shaped_lse(self):
+        attention_layer = SimpleNamespace()
+        context = self._new_impl_context([attention_layer])
+        backend = _RecordingAttentionBackend()
+        query = torch.zeros((4, 2, 3))
+
+        with (
+            patch.object(
+                radix_attention_module,
+                "get_tc_piecewise_forward_context",
+                return_value=context,
+            ),
+            patch.object(
+                radix_attention_module, "get_attn_backend", return_value=backend
+            ),
+        ):
+            lse = radix_attention_module.attention_with_output_extra_kwargs(
+                query,
+                query,
+                query,
+                torch.empty_like(query),
+                False,
+                0,
+                {"return_lse": True},
+            )
+
+        self.assertEqual(lse.tolist(), [[7, 7], [7, 7], [0, 0], [0, 0]])
 
     def test_impl_uses_independent_query_and_key_value_extents(self):
         attention_layer = SimpleNamespace()
@@ -299,6 +449,117 @@ class TestRadixAttentionGraphInterface(CustomTestCase):
         self.assertIs(backend.calls[-1].attention_layer, attention_layer)
         self.assertTrue(torch.all(output[:2] == 3))
         self.assertIs(forward_batch.out_cache_loc, original_out_cache_loc)
+
+    def test_impl_zero_real_tokens_returns_zeroed_lse(self):
+        # Regression: an idle DP rank whose fabricated EXTEND batch is masked to
+        # 0 real tokens skips attention entirely. The skip must still honor the
+        # LSE return mode -- unified_attention_with_output_and_lse asserts a
+        # tensor comes back, so returning a bare None raised AssertionError as
+        # soon as any 0-real-token call needed LSE (chunked-prefix MHA merge).
+        attention_layer = SimpleNamespace()
+        context = self._new_impl_context([attention_layer], real_num_tokens=0)
+        backend = _RecordingAttentionBackend()
+        query = torch.zeros((4, 2, 3))
+        output = torch.full_like(query, float("nan"))
+
+        with (
+            patch.object(
+                radix_attention_module,
+                "get_tc_piecewise_forward_context",
+                return_value=context,
+            ),
+            patch.object(
+                radix_attention_module, "get_attn_backend", return_value=backend
+            ),
+        ):
+            lse = radix_attention_module._unified_attention_with_output_impl(
+                query,
+                query,
+                query,
+                output,
+                False,
+                0,
+                False,
+                True,
+            )
+
+        self.assertEqual(backend.calls, [])
+        self.assertTrue(torch.all(output == 0))
+        # Same shape/dtype the registered fake impl declares, so
+        # unified_attention_with_output_and_lse's `assert lse is not None` holds.
+        self.assertEqual(lse.shape, (4, 2))
+        self.assertEqual(lse.dtype, torch.float32)
+        self.assertTrue(torch.all(lse == 0))
+
+    def test_impl_zero_real_tokens_output_only_returns_none(self):
+        # The 0-token skip must not start returning a tensor on the non-LSE
+        # path: unified_attention_with_output is registered with an inplace
+        # (None-returning) schema.
+        attention_layer = SimpleNamespace()
+        context = self._new_impl_context([attention_layer], real_num_tokens=0)
+        backend = _RecordingAttentionBackend(return_lse=False)
+        query = torch.zeros((4, 2, 3))
+        output = torch.full_like(query, float("nan"))
+
+        with (
+            patch.object(
+                radix_attention_module,
+                "get_tc_piecewise_forward_context",
+                return_value=context,
+            ),
+            patch.object(
+                radix_attention_module, "get_attn_backend", return_value=backend
+            ),
+        ):
+            lse = radix_attention_module._unified_attention_with_output_impl(
+                query,
+                query,
+                query,
+                output,
+                False,
+                0,
+                False,
+                False,
+            )
+
+        self.assertIsNone(lse)
+        self.assertEqual(backend.calls, [])
+        self.assertTrue(torch.all(output == 0))
+
+    def test_extra_kwargs_zero_real_tokens_zeroes_output(self):
+        # Regression: attention_with_output_extra_kwargs (Inkling score_mod /
+        # aux_tensors) narrowed to query[:0] and copied output[:0], so with 0
+        # real tokens the preallocated torch.empty output was never written and
+        # its garbage (NaN/Inf) flowed into residuals and MoE routing. Only ROCm
+        # zeroed the padded tail, so every other platform leaked it.
+        attention_layer = SimpleNamespace()
+        context = self._new_impl_context([attention_layer], real_num_tokens=0)
+        backend = _RecordingAttentionBackend(return_lse=False)
+        query = torch.zeros((4, 2, 3))
+        output = torch.full_like(query, float("nan"))
+
+        with (
+            patch.object(
+                radix_attention_module,
+                "get_tc_piecewise_forward_context",
+                return_value=context,
+            ),
+            patch.object(
+                radix_attention_module, "get_attn_backend", return_value=backend
+            ),
+        ):
+            radix_attention_module.attention_with_output_extra_kwargs(
+                query,
+                query,
+                query,
+                output,
+                False,
+                0,
+                {},
+            )
+
+        self.assertEqual(backend.calls, [])
+        self.assertTrue(torch.all(output == 0))
 
     def test_lse_fake_impl_declares_shape_and_dtype(self):
         query = torch.empty((5, 3, 7), dtype=torch.float16)

@@ -133,7 +133,8 @@ class InklingMultimodalProcessor(SGLangBaseProcessor):
                 logger.info("Using Rust-accelerated Inkling image processor")
             except ImportError:
                 logger.warning(
-                    "SGLANG_INKLING_RS_MM_PREPROCESS=1 but sglang.srt.multimodal._core is not available; "
+                    "SGLANG_INKLING_RS_MM_PREPROCESS=1 but "
+                    "sglang.srt.rust_extensions._multimodal is not available; "
                     "falling back to the default image processor."
                 )
                 image_processor = InklingImageProcessor(patch_size=patch_size)

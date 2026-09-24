@@ -282,6 +282,7 @@ class LingBotWorldI2VConfig(Wan2_2_I2V_A14B_Config):
     dit_config: DiTConfig = field(default_factory=LingBotWorldVideoConfig)
     flow_shift: float | None = 10.0
     boundary_ratio: float | None = 0.947
+    vae_decode_precision_high: str = "bf16"
     text_encoder_precisions: tuple[str, ...] = field(default_factory=lambda: ("bf16",))
     preprocess_text_funcs: tuple[Callable[[str], str] | None, ...] = field(
         default_factory=lambda: (lingbot_prompt_clean,)
@@ -447,4 +448,27 @@ class LingBotWorldV2CausalDMDConfig(LingBotWorldCausalDMDConfig):
     flow_shift: float | None = 5.0
     dmd_denoising_steps: list[int] | None = field(
         default_factory=lambda: [1000, 750, 500, 250]
+    )
+
+
+def register():
+    from sglang.multimodal_gen.configs.sample.lingbot_world import (
+        LingBotWorldSamplingParams,
+    )
+    from sglang.multimodal_gen.registry import register_configs
+
+    register_configs(
+        sampling_param_cls=LingBotWorldSamplingParams,
+        pipeline_config_cls=LingBotWorldCausalDMDConfig,
+        hf_model_paths=[
+            "IPostYellow/lingbot-world-fast-diffusers",
+            "robbyant/lingbot-world-fast-diffusers",
+        ],
+    )
+    register_configs(
+        sampling_param_cls=LingBotWorldSamplingParams,
+        pipeline_config_cls=LingBotWorldV2CausalDMDConfig,
+        hf_model_paths=[
+            "robbyant/lingbot-world-v2-14b-causal-fast-diffusers",
+        ],
     )

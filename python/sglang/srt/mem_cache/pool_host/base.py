@@ -3,17 +3,20 @@ from __future__ import annotations
 import abc
 import logging
 import threading
+from contextlib import contextmanager
+from contextvars import ContextVar
 from functools import wraps
 from typing import Optional
 
-import psutil
 import torch
 
+from sglang.srt.mem_cache.host_memory import available_host_memory_bytes
 from sglang.srt.mem_cache.memory_pool import KVCache
 from sglang.srt.mem_cache.pool_host.common import (
     _cuda_host_unregister,
     get_allocator_from_storage,
 )
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import is_cuda, is_hip
 
 logger = logging.getLogger(__name__)
@@ -25,6 +28,57 @@ _is_hip = is_hip()
 HICACHE_HOST_MEMORY_RESERVE_BYTES: int = 10 * (1024**3)
 
 _WRITE_BACK_STAGING_PAGE_CHUNK = 64
+
+
+_host_memory_budget: ContextVar[Optional[int]] = ContextVar(
+    "hicache_host_memory_budget", default=None
+)
+
+
+@contextmanager
+def host_memory_budget_scope(budget_bytes: int):
+    """Book every pool built inside against one snapshot, not re-sampled psutil."""
+    token = _host_memory_budget.set(budget_bytes)
+    try:
+        yield
+    finally:
+        _host_memory_budget.reset(token)
+
+
+def ranks_per_host() -> int:
+    """Return the launch ranks per host, assuming uniform placement.
+
+    Avoid a collective: ranks may construct different numbers of host pools.
+    """
+    if not (torch.distributed.is_available() and torch.distributed.is_initialized()):
+        return 1
+    try:
+        launch_world_size = get_parallel().launch_world_size
+    except (RuntimeError, ValueError):
+        return 1
+    if launch_world_size == 1:
+        return 1
+    return max(launch_world_size // get_parallel().nnodes, 1)
+
+
+def host_memory_budget_bytes(requested_bytes: int = 0) -> int:
+    """Host RAM this rank may claim for a HiCache pool.
+
+    Bound machine availability by the visible cgroup limits before splitting
+    among local ranks. Independent engines with separate container budgets
+    therefore size against their own remaining allowance.
+
+    Inside host_memory_budget_scope, requested_bytes is booked against the
+    snapshot when it fits; the allowance before booking is returned.
+    """
+    available = _host_memory_budget.get()
+    if available is not None:
+        if requested_bytes <= available:
+            _host_memory_budget.set(available - requested_bytes)
+        return available
+
+    free = available_host_memory_bytes() - HICACHE_HOST_MEMORY_RESERVE_BYTES
+    return free // ranks_per_host()
 
 
 def sync_fixed_hicache_size(size: int, host_size: int) -> int:
@@ -43,10 +97,10 @@ def sync_fixed_hicache_size(size: int, host_size: int) -> int:
         return size
 
     try:
-        from sglang.srt.distributed.parallel_state import get_pp_group
+        from sglang.srt.runtime_context import get_parallel
 
-        pp_group = get_pp_group()
-    except AssertionError:
+        pp_group = get_parallel().pp_group
+    except RuntimeError:
         return size
 
     if pp_group.world_size <= 1:
@@ -116,32 +170,36 @@ class HostKVCache(abc.ABC):
 
         self.dtype = device_pool.store_dtype
         self.size_per_token = self.get_size_per_token()
+        # Unified pools report token capacity separately from their buffer-row count.
+        device_capacity = getattr(device_pool, "host_capacity_tokens", None)
+        if device_capacity is None:
+            device_capacity = device_pool.size
+        self.device_capacity_tokens = device_capacity
         if host_size > 0:
             self.size = sync_fixed_hicache_size(
                 int(host_size * 1e9 // self.size_per_token), host_size
             )
         else:
-            self.size = int(device_pool.size * host_to_device_ratio)
+            self.size = int(device_capacity * host_to_device_ratio)
         # Align up the host memory pool size to the page size
         self.page_num = self.size // self.page_size + 1
         self.size = self.page_num * self.page_size
         self.start_layer = device_pool.start_layer
         self.end_layer = device_pool.end_layer
 
-        if self.size <= device_pool.size:
+        if self.size <= device_capacity:
             logger.warning(
                 "HiCache %s host pool (%d tokens) is smaller than the device pool (%d tokens);"
                 "L2 cache effectiveness is reduced."
                 "Consider increasing --hicache-ratio (or --hicache-size) for higher L2 cache hit rate.",
                 pool_label,
                 self.size,
-                device_pool.size,
+                device_capacity,
             )
 
         # Verify there is enough available host memory.
-        host_mem = psutil.virtual_memory()
         requested_bytes = self.size * self.size_per_token
-        available_bytes = host_mem.available - HICACHE_HOST_MEMORY_RESERVE_BYTES
+        available_bytes = host_memory_budget_bytes(requested_bytes)
         if requested_bytes > available_bytes:
             raise ValueError(
                 f"Not enough host memory available. Requesting "
@@ -340,27 +398,11 @@ class HostKVCache(abc.ABC):
         """Page size in that same logical space (the widened DCP page)."""
         return self.page_size * self.dcp_size
 
-    def dcp_kernel_indices(self, indices: torch.Tensor) -> torch.Tensor:
-        """Transfer kernels index per-rank rows; callers hold widened logical slots.
-
-        Keep this rank's slots (% dcp_size == dcp_rank), then collapse (// dcp_size).
-        """
-        if self.dcp_size == 1:
-            return indices
-        owned = indices[indices % self.dcp_size == self.dcp_rank] // self.dcp_size
-        assert owned.numel() * self.dcp_size == indices.numel(), (
-            "HiCache DCP translation expects runs of whole widened pages "
-            f"(every residue class equally represented); got {indices.numel()} "
-            f"logical slots -> {owned.numel()} owned rows with dcp_size="
-            f"{self.dcp_size}."
-        )
-        return owned
-
     @synchronized
     def alloc(self, need_size: int) -> Optional[torch.Tensor]:
-        assert (
-            need_size % self.logical_page_size == 0
-        ), "The requested size should be a multiple of the page size."
+        assert need_size % self.logical_page_size == 0, (
+            "The requested size should be a multiple of the page size."
+        )
         if need_size > self.available_size():
             return None
 

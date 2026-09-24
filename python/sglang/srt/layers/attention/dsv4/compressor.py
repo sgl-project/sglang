@@ -6,7 +6,6 @@ import torch
 import torch.nn as nn
 
 from sglang.kernels.fused_op import BaseFusedOp
-from sglang.kernels.ops.attention.dsa.triton_kernel import act_quant
 from sglang.kernels.ops.attention.dsv4 import (
     linear_bf16_fp32,
     triton_create_paged_compress_data,
@@ -16,9 +15,6 @@ from sglang.kernels.ops.attention.dsv4.compress_old import (
     CompressorPrefillPlan,
     compress_forward,
     compress_fused_norm_rope_inplace,
-)
-from sglang.kernels.ops.attention.dsv4.quant_k_cache import (
-    quant_to_nope_fp8_rope_bf16_pack_triton,
 )
 from sglang.srt.configs.deepseek_v4 import DeepSeekV4Config
 from sglang.srt.environ import envs
@@ -32,6 +28,7 @@ from sglang.srt.mem_cache.deepseek_v4_compress_state import (
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.models.deepseek_v2 import _is_hip
+from sglang.srt.runtime_context import get_exec
 from sglang.srt.utils import add_prefix, is_npu, set_weight_attrs
 
 _is_npu = is_npu()
@@ -39,6 +36,7 @@ _is_npu = is_npu()
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
     from sglang.srt.layers.attention.deepseek_v4_backend import DeepseekV4AttnBackend
+    from sglang.srt.layers.quantization.base_config import QuantizationConfig
     from sglang.srt.layers.rotary_embedding import RotaryEmbedding
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
@@ -180,15 +178,12 @@ class CompressorBackendMixin:
         )
         if out_loc.shape[0] > new_compressed_kv.shape[0]:
             out_loc = out_loc[: new_compressed_kv.shape[0]]
-        if envs.SGLANG_OPT_USE_FUSED_STORE_CACHE.get():
-            token_to_kv_pool.set_extra_key_buffer_fused(
-                layer_id=layer_id,
-                loc=out_loc,
-                cache_k=new_compressed_kv,
-            )
-        else:
-            pack = quant_to_nope_fp8_rope_bf16_pack_triton(new_compressed_kv.bfloat16())
-            token_to_kv_pool.set_extra_key_buffer(layer_id, out_loc, pack)
+
+        token_to_kv_pool.set_extra_key_buffer_fused(
+            layer_id=layer_id,
+            loc=out_loc,
+            cache_k=new_compressed_kv,
+        )
 
     def forward_indexer_compressor(
         self,
@@ -212,21 +207,11 @@ class CompressorBackendMixin:
                 loc=out_loc,
                 cache_k=new_compressed_kv,
             )
-        elif envs.SGLANG_OPT_USE_FUSED_STORE_CACHE.get():
+        else:
             token_to_kv_pool.set_index_k_fused(
                 layer_id=layer_id,
                 loc=out_loc,
                 cache_k=new_compressed_kv,
-            )
-        else:
-            new_compressed_kv_fp8, new_compressed_kv_scale = act_quant(
-                new_compressed_kv
-            )
-            token_to_kv_pool.set_index_k_scale_buffer(
-                layer_id=layer_id,
-                loc=out_loc,
-                index_k=new_compressed_kv_fp8,
-                index_k_scale=new_compressed_kv_scale,
             )
 
 
@@ -275,6 +260,7 @@ def create_paged_compressor_data(
 ) -> FusedCompressMetadata:
     swa_page_size = token_to_kv_pool.swa_page_size
     ring_size = token_to_kv_pool.get_ring_size(compress_ratio=compress_ratio)
+    use_req_ring = compress_ratio == 4 and token_to_kv_pool._unified_kv
     # assert ring_size % compress_ratio == 0
 
     def clip_down(positions: torch.Tensor) -> torch.Tensor:
@@ -282,7 +268,7 @@ def create_paged_compressor_data(
 
     def get_raw_loc(positions: torch.Tensor) -> torch.Tensor:
         positions = positions.masked_fill(positions < 0, 0)
-        if compress_ratio == 128:
+        if compress_ratio == 128 or use_req_ring:
             state_loc = req_pool_indices * ring_size + positions % ring_size
         else:
             loc = req_to_token[req_pool_indices, positions]
@@ -305,6 +291,7 @@ def create_paged_compressor_data(
             extend_seq_lens=extend_lens,
             req_to_token=req_to_token,
             full_to_swa_index_mapping=token_to_kv_pool.full_to_swa_index_mapping,
+            use_req_ring=use_req_ring,
         )
 
         plan_kwargs: dict
@@ -354,6 +341,7 @@ class Compressor(BaseFusedOp):
         head_dim: int,
         rotate: bool = False,
         prefix: str = "",
+        quant_config: Optional[QuantizationConfig] = None,
         rotary_emb: Optional[RotaryEmbedding] = None,
     ) -> None:
         super().__init__()
@@ -377,17 +365,50 @@ class Compressor(BaseFusedOp):
             self.dim,
             2 * coff * self.head_dim,
             bias=False,
-            quant_config=None,
+            quant_config=quant_config,
             prefix=add_prefix("wkv_gate", prefix),
             params_dtype=wkv_gate_dtype,
         )
         self.norm = RMSNorm(
             self.head_dim, eps=config.rms_norm_eps, weight_dtype=torch.float32
         )
+        if (
+            is_in_indexer
+            and _is_hip
+            and get_exec().kernel.enable_deepseek_v4_fp4_indexer
+        ):
+            self._init_fp4_norm_weight()
         self.rotary_emb = rotary_emb
         self.freqs_cis = freqs_cis
 
         self.ape_converted = False
+
+    def _init_fp4_norm_weight(self) -> None:
+        """Mirror the FP32 norm weight in BF16 for the AITER FP4 K writer.
+
+        The FP8 path feeds the FP32 weight straight to its kernel; AITER wants
+        BF16, and converting at the call site costs one copy per C4 layer per
+        forward. A buffer keeps the conversion out of the forward and survives
+        module ``_apply``, and the loader below re-derives it so online weight
+        updates propagate -- they land as ``param.data.copy_``, which leaves the
+        parameter's identity and ``_version`` untouched and would silently
+        defeat any cache keyed on those. Same reach as ``load_ape_weight``:
+        ``update_weights_from_tensor(load_format="direct")`` calls
+        ``default_weight_loader`` itself and so skips both hooks.
+        """
+        self.norm.register_buffer(
+            "fp4_weight_bf16",
+            self.norm.weight.detach().to(torch.bfloat16).contiguous(),
+            persistent=False,
+        )
+        set_weight_attrs(self.norm.weight, {"weight_loader": self.load_norm_weight})
+
+    def load_norm_weight(
+        self, param: torch.Tensor, loaded_weight: torch.Tensor
+    ) -> None:
+        assert param is self.norm.weight
+        param.data.copy_(loaded_weight)
+        self.norm.fp4_weight_bf16.copy_(param.data)
 
     def _apply_ape_hotfix(self):
         self.ape_converted = True
@@ -421,7 +442,8 @@ class Compressor(BaseFusedOp):
         return ret
 
     def compute_kv_score(self, x: torch.Tensor, forward_batch: ForwardBatch):
-        kv_score = linear_bf16_fp32(x, self.wkv_gate.weight)
+
+        kv_score = self._compute_wkv_gate(x)
 
         # CUDA path: delegate to backend
         if dsa_use_prefill_cp(forward_batch):
@@ -431,6 +453,19 @@ class Compressor(BaseFusedOp):
                 torch.cuda.current_stream(),
             )
         return kv_score
+
+    def _compute_wkv_gate(self, x: torch.Tensor) -> torch.Tensor:
+        weight = getattr(self.wkv_gate, "weight", None)
+        if weight is not None:
+            return linear_bf16_fp32(x, weight)
+
+        from sglang.srt.layers.quantization.gguf import fused_mul_mat_gguf
+
+        return fused_mul_mat_gguf(
+            x,
+            self.wkv_gate.qweight,
+            self.wkv_gate.qweight_type.weight_type,
+        )
 
     def forward_native(
         self,
