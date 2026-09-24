@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from typing import TYPE_CHECKING, Callable, Optional, Sequence
 
 import torch
@@ -450,6 +451,14 @@ class SWAComponent(TreeComponent):
         if not is_tombstone:
             return prefix_len
 
+        if os.environ.get("DSV4_DUMP_META"):
+            print(
+                f"[SWAGATE] overlap node={node.id} prefix_len={prefix_len} "
+                f"total_prefix_len={total_prefix_len} "
+                f"prev_prefix_len={params.prev_prefix_len} "
+                f"swa_evicted_seqlen={params.swa_evicted_seqlen}",
+                flush=True,
+            )
         full_cd = node.component_data[BASE_COMPONENT_TYPE]
         swa_evicted_seqlen = params.swa_evicted_seqlen
         # A locked tombstone is legal (segment locks count every node); the
@@ -468,6 +477,14 @@ class SWAComponent(TreeComponent):
             )
             old_full = full_cd.value
             if full_cd.lock_ref > 0:
+                if os.environ.get("DSV4_DUMP_META"):
+                    print(
+                        f"[SWAGATE] branch1-recover node={node.id} "
+                        f"kept={old_full.tolist()[:2]}..{old_full.tolist()[-2:]} "
+                        f"incoming={value_slice.tolist()[:2]}.."
+                        f"{value_slice.tolist()[-2:]}",
+                        flush=True,
+                    )
                 cache_actions.append(
                     RecoverSWAWithLockedFull(node.id, old_full, value_slice)
                 )
@@ -533,6 +550,12 @@ class SWAComponent(TreeComponent):
             f"{ct}: swa_evicted_seqlen must be page-aligned, {swa_evicted_seqlen=}"
         )
 
+        if os.environ.get("DSV4_DUMP_META"):
+            print(
+                f"[SWAGATE] unevict node={node.id} total_prefix_len={total_prefix_len} "
+                f"prefix_len={prefix_len} swa_evicted_seqlen={swa_evicted_seqlen}",
+                flush=True,
+            )
         if swa_evicted_seqlen <= total_prefix_len:
             pass  # entire node is within the SWA window
         elif swa_evicted_seqlen < total_prefix_len + prefix_len:
@@ -1528,6 +1551,13 @@ class SWAComponent(TreeComponent):
         if isinstance(action, RebuildFullToSWAMapping):
             assert len(action.full_indices) == len(action.swa_indices)
             for full, swa in zip(action.full_indices, action.swa_indices):
+                if os.environ.get("DSV4_DUMP_META"):
+                    print(
+                        f"[SWAGATE] rebuild-map n={full.numel()} "
+                        f"full={full.tolist()[:2]}..{full.tolist()[-2:]} "
+                        f"swa={swa.tolist()[:2]}..{swa.tolist()[-2:]}",
+                        flush=True,
+                    )
                 alloc.set_full_to_swa_mapping(full, swa)
             return
         if isinstance(action, RecoverSWAWithLockedFull):
@@ -1550,6 +1580,15 @@ class SWAComponent(TreeComponent):
                 )
                 return
             swa_value = self._translate_full_to_swa(action.incoming_full)
+            if os.environ.get("DSV4_DUMP_META"):
+                print(
+                    f"[SWAGATE] recover-locked node={action.node_id} "
+                    f"kept={action.kept_full.tolist()[:2]}..{action.kept_full.tolist()[-2:]} "
+                    f"incoming={action.incoming_full.tolist()[:2]}.."
+                    f"{action.incoming_full.tolist()[-2:]} "
+                    f"swa={swa_value.tolist()[:2]}..{swa_value.tolist()[-2:]}",
+                    flush=True,
+                )
             alloc.set_full_to_swa_mapping(action.kept_full, swa_value)
             alloc.clear_full_to_swa_mapping(action.incoming_full)
             alloc.free_full_segment(action.incoming_full, start_pos=0)
@@ -1560,6 +1599,12 @@ class SWAComponent(TreeComponent):
         if isinstance(action, SWARebuild):
             # Translate the node's source full value to SWA and store it on the node.
             swa_value = self._translate_full_to_swa(action.source_value)
+            if os.environ.get("DSV4_DUMP_META"):
+                print(
+                    f"[SWAGATE] rebuild node={action.node_id} "
+                    f"swa={swa_value.tolist()[:2]}..{swa_value.tolist()[-2:]}",
+                    flush=True,
+                )
             self.tree_core.set_component_device_value(
                 action.node_id, self.component_type, swa_value
             )
