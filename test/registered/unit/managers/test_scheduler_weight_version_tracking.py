@@ -197,11 +197,17 @@ class TestRecordWeightVersionAfterUpdate(_WeightUpdaterManagerTestBase):
         self.assertFalse(output.success)
         self.assertEqual(self.recorded, [])
 
-    def test_successful_distributed_update_records_the_version(self):
-        """The distributed refit is the path an RL trainer actually drives, so it must record too."""
-        output = self._manager(_runner()).update_weights_from_distributed(_request())
+    def test_successful_distributed_update_records_the_version_at_commit(self):
+        """A refit spans many buckets; the version they carry must not name a
+        half-applied update, so it is held until end_weight_update commits."""
+        manager = self._manager(_runner())
+        output = manager.update_weights_from_distributed(_request())
 
         self.assertTrue(output.success)
+        self.assertEqual(self.recorded, [])
+        self.assertEqual(manager._session.pending_version, "v2")
+
+        self.assertTrue(manager.end_weight_update(EndWeightUpdateReqInput()).success)
         self.assertEqual(self.recorded, ["v2"])
 
     def test_failed_distributed_update_does_not_record_the_version(self):
