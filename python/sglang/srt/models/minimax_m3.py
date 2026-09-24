@@ -1202,14 +1202,7 @@ class MiniMaxM3Attention(nn.Module):
             else:
                 idx_q, idx_k, idx_v = self._split_index_qkv(idx_qkv)
                 q, k, idx_q, idx_k = self._sparse_qk_index_norm_rope_cache(
-                    positions,
-                    q,
-                    k,
-                    v,
-                    idx_q,
-                    idx_k,
-                    idx_v,
-                    forward_batch,
+                    positions, q, k, v, idx_q, idx_k, idx_v, forward_batch
                 )
 
             inner_state = (q, k, v, idx_q, idx_k, idx_v, forward_batch)
@@ -1408,8 +1401,7 @@ class MiniMaxM3DecoderLayer(nn.Module):
             )
         )
         if not _is_hip and self.is_layer_sparse and get_parallel().tp_size > 1:
-            # Sparse-layer all-reduce deferral is ROCm-only; force the
-            # immediate all-reduce elsewhere.
+            # sparse MoE all-reduce deferral is validated only on ROCm (M3 no-EOS runaway)
             should_allreduce_fusion = False
 
         use_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
