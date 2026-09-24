@@ -2134,6 +2134,44 @@ class DeepseekV4AscendAttnBackend(
                             f"qbad={qbad}",
                             flush=True,
                         )
+                        if (
+                            os.environ.get("DSV4_DUMP_SWA_FIXED")
+                            and getattr(self, "_swaf_printed", 0) < 8
+                        ):
+                            try:
+                                f_lo = int(os.environ.get("DSV4_DUMP_SWA_FIXED_LO", "16256"))
+                                f_hi = int(os.environ.get("DSV4_DUMP_SWA_FIXED_HI", "16384"))
+                                if 0 <= f_lo < f_hi <= full.numel():
+                                    self._swaf_printed = getattr(self, "_swaf_printed", 0) + 1
+                                    hh = hashlib.md5()
+                                    unmapped = 0
+                                    first = -1
+                                    last = -1
+                                    for p in range(f_lo, f_hi):
+                                        col = p // page_sz
+                                        pid = int(vals[col]) if col < len(vals) else -1
+                                        if pid <= 0:
+                                            unmapped += 1
+                                            continue
+                                        hh.update(
+                                            buf[pid, p % page_sz]
+                                            .detach()
+                                            .view(torch.uint8)
+                                            .cpu()
+                                            .numpy()
+                                            .tobytes()
+                                        )
+                                        if first < 0:
+                                            first = pid
+                                        last = pid
+                                    print(
+                                        f"[SWAF] start_pos={_l(getattr(fm, 'start_pos', None))} "
+                                        f"layer={layer} pos=[{f_lo},{f_hi}) unmapped={unmapped} "
+                                        f"ids=[{first},{last}] win={hh.hexdigest()[:16]}",
+                                        flush=True,
+                                    )
+                            except Exception as exc:
+                                print(f"[SWAF] skipped: {exc}", flush=True)
             except Exception as exc:
                 print(f"[SWAKV] skipped: {exc}", flush=True)
 
