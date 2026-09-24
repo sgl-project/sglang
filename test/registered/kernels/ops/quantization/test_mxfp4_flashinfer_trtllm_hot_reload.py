@@ -172,6 +172,10 @@ class TestMxfp4KernelForward(CustomTestCase):
     def test_mxfp8_forward_accepts_int8_load_parameters(self):
         """Signed checkpoint bytes must remain loadable across real MoE forwards."""
         from sglang.srt.layers.moe.token_dispatcher import StandardDispatchOutput
+        from sglang.srt.layers.moe.token_dispatcher.flashinfer import (
+            FlashinferCombineInput,
+            FlashinferDispatchOutput,
+        )
         from sglang.srt.layers.moe.topk import StandardTopKOutput
         from sglang.srt.layers.quantization import mxfp4_flashinfer_trtllm_moe
 
@@ -190,6 +194,14 @@ class TestMxfp4KernelForward(CustomTestCase):
                 topk_ids=torch.arange(6, device="cuda", dtype=torch.int32).repeat(8, 1),
                 router_logits=None,
             ),
+        )
+        # A2A reserves padding slots for unequal source token counts.
+        dispatch.topk_output.topk_ids[-1].fill_(-1)
+        dispatch.topk_output.topk_weights[-1].zero_()
+        a2a_dispatch = FlashinferDispatchOutput(
+            hidden_states=dispatch.hidden_states,
+            hidden_states_scale=None,
+            topk_output=dispatch.topk_output,
         )
         outputs = []
         # A local kernel call needs no distributed symmetric-memory allocator.
@@ -217,6 +229,12 @@ class TestMxfp4KernelForward(CustomTestCase):
                 self.assertEqual(output.dtype, torch.bfloat16)
                 self.assertTrue(torch.isfinite(output).all().item())
                 self.assertGreater(torch.count_nonzero(output).item(), 0)
+                self.assertEqual(torch.count_nonzero(output[-1]).item(), 0)
+                a2a_result = layer.quant_method.apply(layer, a2a_dispatch)
+                self.assertIsInstance(a2a_result, FlashinferCombineInput)
+                torch.testing.assert_close(
+                    a2a_result.hidden_states, output, rtol=0, atol=0
+                )
                 self.assertEqual(layer.w13_weight.dtype, torch.int8)
                 self.assertEqual(layer.w2_weight.dtype, torch.int8)
                 outputs.append(output.clone())
