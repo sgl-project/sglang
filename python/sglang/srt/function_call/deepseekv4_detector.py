@@ -3,8 +3,7 @@ import logging
 import re
 from typing import Any, Optional
 
-from sglang.srt.function_call.core_types import (StreamingParseResult,
-                                                 ToolCallItem)
+from sglang.srt.function_call.core_types import StreamingParseResult, ToolCallItem
 from sglang.srt.function_call.deepseekv32_detector import DeepSeekV32Detector
 
 logger = logging.getLogger(__name__)
@@ -96,7 +95,9 @@ class DeepSeekV4Detector(DeepSeekV32Detector):
             return None
         for t in tools or []:
             tname = (
-                t.function.name if hasattr(t, "function") else t.get("function", {}).get("name")
+                t.function.name
+                if hasattr(t, "function")
+                else t.get("function", {}).get("name")
             )
             if tname and tname.lower() == name.lower():
                 return ToolCallItem(

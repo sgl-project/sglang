@@ -463,7 +463,12 @@ def render_message(
             )
             prompt += task_sp_token
 
-    elif messages[index].get("role") in ["user", "developer", "system", "latest_reminder"]:
+    elif messages[index].get("role") in [
+        "user",
+        "developer",
+        "system",
+        "latest_reminder",
+    ]:
         # Normal generation: append Assistant + thinking token.
         # Also cover conversations terminated by a system / latest_reminder
         # message (common in agentic multi-turn flows): without the explicit
