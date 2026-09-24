@@ -235,3 +235,55 @@ for _mod, _fn in [
         )
     )
 del _mod, _fn
+
+
+# Kernels introduced with Kimi-K3, inventoried by logical operator group.
+for _mod, _fn, _backend, _device in [
+    ("attn_res", "attn_res_fused_tma", KernelBackend.JIT, CapabilityRequirement.CUDA),
+    (
+        "attn_res",
+        "attn_res_fused_pull_rs",
+        KernelBackend.JIT,
+        CapabilityRequirement.CUDA,
+    ),
+    (
+        "attn_res",
+        "attn_res_fused_direct_ag",
+        KernelBackend.JIT,
+        CapabilityRequirement.CUDA,
+    ),
+    ("attn_res_hip", "attn_res_hip", KernelBackend.TRITON, CapabilityRequirement.HIP),
+    (
+        "mla_output_gate",
+        "kimi_k3_mla_output_gate",
+        KernelBackend.JIT,
+        CapabilityRequirement.CUDA,
+    ),
+    (
+        "kda_decode_mtp",
+        "fused_kda_decode_mtp_dspark",
+        KernelBackend.CUTE_DSL,
+        CapabilityRequirement.CUDA,
+    ),
+    (
+        "kda_flydsl.kimi_k3_kda_decode",
+        "flydsl_kimi_k3_kda_decode",
+        KernelBackend.FLYDSL,
+        CapabilityRequirement.HIP,
+    ),
+    (
+        "kda_flydsl.kimi_k3_kda_decode",
+        "flydsl_kimi_k3_kda_decode_with_f_b",
+        KernelBackend.FLYDSL,
+        CapabilityRequirement.HIP,
+    ),
+]:
+    register_kernel(
+        KernelSpec(
+            op=f"attention.{_fn}",
+            backend=_backend,
+            target=f"sglang.kernels.ops.attention.{_mod}:{_fn}",
+            capabilities=frozenset({_device}),
+        )
+    )
+del _mod, _fn, _backend, _device

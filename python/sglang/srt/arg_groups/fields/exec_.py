@@ -1,11 +1,4 @@
-"""Config fields of the ``exec`` namespace.
-
-One class per namespace. The class *is* the namespace: a field declared here
-lands in the ``exec`` bag, which is what ``get_exec()`` returns, so a reader
-spells it exactly as before. ``ServerArgs`` composes these classes, so the
-record stays one flat object -- the split moves where declarations live, not
-how config is shaped at runtime.
-"""
+"""Config fields of the ``exec`` namespace."""
 
 from __future__ import annotations
 
@@ -637,7 +630,7 @@ class ExecComm(msgspec.Struct):
         "Enforce disable FlashInfer allreduce fusion.",
     ] = False
     flashinfer_allreduce_fusion_backend: A[
-        Optional[Literal["auto", "trtllm", "mnnvl"]],
+        Optional[Literal["auto", "trtllm", "mnnvl", "cutedsl"]],
         Arg(
             help=(
                 "Enable FlashInfer allreduce fusion and choose backend. "
@@ -648,6 +641,9 @@ class ExecComm(msgspec.Struct):
                 "'trtllm': available on single-node systems only. "
                 "'mnnvl': available on SM90 single-node systems and SM100/SM103 "
                 "single-node or multi-node systems via MNNVL fabric. "
+                "'cutedsl': Blackwell-only bf16 MNNVL CuTe DSL backend; also "
+                "fuses the MoE finalize and the shared-expert add into the "
+                "collective when the MoE runner can defer them. "
                 "Fuses allreduce with Residual + RMSNorm for supported MoE models."
             ),
             resolvable=True,

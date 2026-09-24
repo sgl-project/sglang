@@ -39,6 +39,7 @@ from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.layout import (
     check_two_pool_pair,
 )
 from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.paged_decode import (
+    _cu_count,
     sparse_attn_v4_paged_decode,
 )
 from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.paged_decode_indices import (
@@ -265,6 +266,22 @@ _DECODE_SPLIT_TAIL_MIN_TOKENS = 40
 _DECODE_SPLIT_TAIL_VALUE = 4
 
 
+def _decode_fp8_tail_splits(T: int, compress_ratio: Optional[int]) -> int:
+    """Split count for T > _DECODE_SPLIT_TAIL_MIN_TOKENS.
+
+    The v4 nm kernel fits one workgroup per CU and launches T x splits of them,
+    so a fixed 4 needs a second wave once T > CU / 4 and the call roughly
+    doubles (up to 2.4x at T=96..192 on MI355X). Take the largest split count
+    up to 4 that still fits one wave. The SWA stream is 128 rows: unsplit, it
+    skips the merge.
+    """
+    if compress_ratio is None:
+        return _DECODE_SPLIT_TAIL_VALUE
+    if compress_ratio == 0:
+        return 1
+    return max(1, min(_DECODE_SPLIT_TAIL_VALUE, _cu_count() // T))
+
+
 def decode_fp8_2buff(
     *,
     q: torch.Tensor,  # [T, H, nope_row_bytes] fp8 packed nope + inline e8m0 scale
@@ -277,6 +294,7 @@ def decode_fp8_2buff(
     v_head_dim: int,
     qo_indptr: Optional[torch.Tensor] = None,
     num_kv_splits: Optional[int] = None,
+    compress_ratio: Optional[int] = None,
 ) -> torch.Tensor:
     """Decode over the two-pool fp8 unified_kv, through aiter's v4 nm asm kernel.
 
@@ -289,6 +307,9 @@ def decode_fp8_2buff(
     ``v_head_dim`` is an element count (448 nope + 64 rope) that happens to equal
     the row's byte width; it comes from the caller so that nothing here reads one
     as the other.
+
+    ``compress_ratio`` names the stream (0 SWA, 4 CSA, 128 HCA) so the split
+    count past 40 tokens can fit the stream; None keeps the fixed 4.
     """
     from aiter.mla import mla_decode_fwd_v4_nm
 
@@ -335,7 +356,7 @@ def decode_fp8_2buff(
     # merge back into `out`, and leaves the final bf16 there whether or not it
     # split. Pinning it to 1 costs 6.9x at bs=1 kv=2048.
     if num_kv_splits is None and T > _DECODE_SPLIT_TAIL_MIN_TOKENS:
-        num_kv_splits = _DECODE_SPLIT_TAIL_VALUE
+        num_kv_splits = _decode_fp8_tail_splits(T, compress_ratio)
     mla_decode_fwd_v4_nm(
         q,
         q_rope,
