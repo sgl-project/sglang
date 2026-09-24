@@ -43,6 +43,7 @@ from sglang.srt.utils import (
     is_cuda,
     is_flashinfer_available,
     is_gfx95_supported,
+    is_gfx942_supported,
     is_gfx1250_supported,
     is_hip,
     is_musa,
@@ -69,6 +70,7 @@ _use_aiter = (
     get_bool_env_var("SGLANG_USE_AITER") and _is_hip and not _is_gfx1250_supported
 )
 _use_aiter_gfx95 = _use_aiter and _is_gfx95_supported
+_use_aiter_gfx942 = _use_aiter and is_gfx942_supported()
 # Conservative, not a tuned crossover: ptpc beat block-fp8 up to M=512 on
 # MiniMax-M3 TP4 gfx950 shapes, but lost past M=64 on narrow ones (K=768).
 MXFP8_DENSE_PTPC_DECODE_MAX_M = 128
@@ -1365,6 +1367,8 @@ def aiter_w8a8_block_fp8_linear(
         use_triton = use_aiter_triton_gemm_w8a8_tuned_gfx950(n, k) or (
             _ck_safe_m is not None and input_2d.shape[0] > _ck_safe_m
         )
+    elif _use_aiter_gfx942:
+        use_triton = envs.SGLANG_AITER_GFX942_BLOCKSCALE_USE_TRITON.get()
     else:
         use_triton = True
 
