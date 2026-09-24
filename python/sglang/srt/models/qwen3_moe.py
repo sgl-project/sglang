@@ -661,6 +661,7 @@ class Qwen3MoeAttention(nn.Module):
         )
         if use_fused:
             if _is_cuda or _is_xpu:
+                theta = self.rope_theta
                 positions = (
                     positions.view(-1)
                     .to(dtype=torch.int32, device=qkv.device)
@@ -678,14 +679,13 @@ class Qwen3MoeAttention(nn.Module):
                     self.q_norm.variance_epsilon,
                     self.q_norm.weight,
                     self.k_norm.weight,
-                    self.rope_theta,
+                    theta,
                     self.rotary_emb.is_neox_style,
                     positions,
                     factor,
                     low,
                     high,
                     attention_factor,
-                    self.rotary_emb.rotary_dim,
                 )
                 q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
             elif _is_cpu:
