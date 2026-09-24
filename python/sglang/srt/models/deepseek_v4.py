@@ -183,6 +183,7 @@ from sglang.srt.multimodal.deepseek_v41_image_processing import (
 )
 from sglang.srt.runtime_context import (
     get_device,
+    get_disagg,
     get_exec,
     get_forward,
     get_parallel,
@@ -1407,6 +1408,45 @@ class MQALayer(MqaAttentionBase):
         )
         return kv
 
+    def _materialize_cp_swa_k(
+        self,
+        x: torch.Tensor,
+        forward_batch: ForwardBatch,
+        qkv_a: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        if qkv_a is not None:
+            kv = qkv_a[..., self.q_lora_rank :]
+        else:
+            kv, _ = self.wkv(x)
+        return cp_materialize_global_token_order(
+            kv.contiguous(), forward_batch, torch.cuda.current_stream()
+        )
+
+    def _store_cp_swa_k(
+        self,
+        kv: torch.Tensor,
+        forward_batch: ForwardBatch,
+        attn_backend,
+    ) -> None:
+        # Eager prefill writes the live prefix. BCG captures the full bucket;
+        # replay refreshes padding locations to the dummy cache slot.
+        kv = kv[: forward_batch.attn_cp_metadata.total_seq_lens]
+        tail = attn_backend.forward_metadata.late_layer_tail
+        global_positions = (
+            tail.pos_global
+            if tail is not None
+            else forward_batch.positions[: kv.shape[0]]
+        )
+        get_token_to_kv_pool().set_swa_key_buffer_radix_fused_norm_rope(
+            layer_id=self.layer_id,
+            swa_loc=attn_backend.get_swa_out_cache_loc(forward_batch),
+            kv=kv,
+            kv_weight=self.kv_norm.weight.data,
+            eps=self.eps,
+            freqs_cis=self.freqs_cis,
+            positions=global_positions,
+        )
+
     def _forward_prepare_multi_stream(
         self,
         x: torch.Tensor,
@@ -1424,19 +1464,39 @@ class MQALayer(MqaAttentionBase):
         stream_compressor = self.alt_streams[1]
         stream_indexer = self.alt_streams[2]
 
-        stream_kv.wait_stream(current_stream)
-        stream_compressor.wait_stream(current_stream)
-        stream_indexer.wait_stream(current_stream)
+        use_cp = self.dsa_enable_prefill_cp and dsa_use_prefill_cp(forward_batch)
+        if not use_cp:
+            stream_kv.wait_stream(current_stream)
+            stream_compressor.wait_stream(current_stream)
+            stream_indexer.wait_stream(current_stream)
 
         x_linear = x_quant if x_quant is not None else x
         qkv_a: Optional[torch.Tensor] = None
         qkv_a_ready: Optional[torch.cuda.Event] = None
         if self.fuse_wqa_wkv:
             qkv_a, _ = self.wqkv_a(x_linear)
-            qkv_a_ready = current_stream.record_event()
+            if not use_cp:
+                qkv_a_ready = current_stream.record_event()
 
         q_lora, q_for_wqb = self._compute_q_a(x_linear, qkv_a=qkv_a)
         q_lora_ready = current_stream.record_event()
+
+        swa_k: Optional[torch.Tensor] = None
+        indexer_kv_score: Optional[torch.Tensor] = None
+        compressor_kv_score: Optional[torch.Tensor] = None
+        if use_cp:
+            # Keep CP collectives in parent-stream order, then release all
+            # worker streams after their gathered inputs are ready.
+            swa_k = self._materialize_cp_swa_k(x_linear, forward_batch, qkv_a=qkv_a)
+            if self.indexer is not None:
+                indexer_kv_score = self.indexer.compressor.compute_kv_score(
+                    x, forward_batch
+                )
+            if self.compressor is not None:
+                compressor_kv_score = self.compressor.compute_kv_score(x, forward_batch)
+            stream_kv.wait_stream(current_stream)
+            stream_compressor.wait_stream(current_stream)
+            stream_indexer.wait_stream(current_stream)
 
         if self.indexer is not None:
             with torch.cuda.stream(stream_indexer):
@@ -1447,20 +1507,29 @@ class MQALayer(MqaAttentionBase):
                     attn_backend=attn_backend,
                     enable_multi_stream=True,
                     q_lora_ready=q_lora_ready,
+                    precomputed_kv_score=indexer_kv_score,
                 )
 
         with torch.cuda.stream(stream_kv):
-            if qkv_a_ready is not None:
-                stream_kv.wait_event(qkv_a_ready)
-            # Fused norm + rope + cache write -- no bf16 KV intermediate.
-            self._compute_kv_to_cache(
-                x_linear, positions, forward_batch, attn_backend, qkv_a=qkv_a
-            )
+            if use_cp:
+                assert swa_k is not None
+                self._store_cp_swa_k(swa_k, forward_batch, attn_backend)
+            else:
+                if qkv_a_ready is not None:
+                    stream_kv.wait_event(qkv_a_ready)
+                # Fused norm + rope + cache write -- no bf16 KV intermediate.
+                self._compute_kv_to_cache(
+                    x_linear, positions, forward_batch, attn_backend, qkv_a=qkv_a
+                )
 
         if self.compressor is not None:
             with torch.cuda.stream(stream_compressor):
                 attn_backend.forward_core_compressor(
-                    x, forward_batch, self.layer_id, self.compressor
+                    x,
+                    forward_batch,
+                    self.layer_id,
+                    self.compressor,
+                    precomputed_kv_score=compressor_kv_score,
                 )
 
         q = self._compute_q_b(q_for_wqb, positions, q_out)
@@ -1469,6 +1538,96 @@ class MQALayer(MqaAttentionBase):
         current_stream.wait_stream(stream_indexer)
         del qkv_a
 
+        return q
+
+    def _forward_prepare_low_ratio_cp_multi_stream(
+        self,
+        x: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        attn_backend,
+        q_out: Optional[torch.Tensor] = None,
+        x_quant=None,
+    ) -> torch.Tensor:
+        """Overlap CP SWA/cache sources with the Q projection after allgather."""
+        assert self.alt_streams is not None
+        assert len(self.alt_streams) >= 3
+        current_stream = torch.cuda.current_stream()
+        stream_kv, stream_compressor, stream_indexer = self.alt_streams[:3]
+        x_linear = x_quant if x_quant is not None else x
+
+        qkv_a: Optional[torch.Tensor] = None
+        if self.fuse_wqa_wkv:
+            qkv_a, _ = self.wqkv_a(x_linear)
+        q_lora, q_for_wqb = self._compute_q_a(x_linear, qkv_a=qkv_a)
+
+        # Collectives must launch in identical parent-stream order on every CP
+        # rank. Neither worker may start consuming until both gathers finish.
+        swa_k = self._materialize_cp_swa_k(x_linear, forward_batch, qkv_a=qkv_a)
+        x_global = None
+        if self.compressor is not None and not forward_batch.encoder_swa_replay:
+            x_global = cp_materialize_global_token_order(
+                x.contiguous(), forward_batch, current_stream
+            )
+
+        captured = is_in_breakable_cuda_graph()
+        indexer_buffers = None
+        if captured and self.indexer is not None:
+            assert attn_backend.low_ratio_prefill_graph
+            indexer_buffers = attn_backend._cp_indexer_projection_buffers(
+                x.shape[0], self.compress_ratio
+            )
+
+        stream_kv.wait_stream(current_stream)
+        stream_compressor.wait_stream(current_stream)
+        stream_indexer.wait_stream(current_stream)
+        with torch.cuda.stream(stream_kv):
+            self._store_cp_swa_k(swa_k, forward_batch, attn_backend)
+        prepared_dense_k = None
+        with torch.cuda.stream(stream_compressor):
+            if self.compressor is not None or (
+                self.indexer is not None and not captured
+            ):
+                attn_backend.forward_low_ratio_sources(
+                    layer=self,
+                    x=x,
+                    q_lora=None if captured else q_lora,
+                    positions=positions,
+                    forward_batch=forward_batch,
+                    run_indexer=not captured,
+                    precomputed_x_global=x_global,
+                )
+            if indexer_buffers is not None:
+                # The compressor above writes this layer's index-K cache. Gather
+                # its live dense prefixes on the same stream after that write.
+                prepared_dense_k = attn_backend._low_ratio_gather_k_prefill_graph(self)
+        prepared_q = None
+        with torch.cuda.stream(stream_indexer):
+            if indexer_buffers is not None:
+                # Capture the full CP-local bucket; the paged metadata masks
+                # padding when the indexer runs after the worker join.
+                indexer_buffers["q"].copy_(
+                    self.indexer.queries(q_lora, self.freqs_cis[positions])
+                )
+                indexer_buffers["w"].copy_(self.indexer.head_weights(x))
+                prepared_q = attn_backend._low_ratio_quantize_q_prefill_graph(
+                    indexer_buffers["q"]
+                )
+
+        q = self._compute_q_b(q_for_wqb, positions, q_out)
+        current_stream.wait_stream(stream_kv)
+        current_stream.wait_stream(stream_compressor)
+        current_stream.wait_stream(stream_indexer)
+        if indexer_buffers is not None:
+            attn_backend._low_ratio_index_topk_prefill_graph(
+                self,
+                attn_backend.forward_metadata.low_ratio_pos_i64,
+                indexer_buffers["q"],
+                indexer_buffers["w"],
+                prepared_q=prepared_q,
+                prepared_dense_k=prepared_dense_k,
+            )
+        del qkv_a
         return q
 
     def _forward_prepare_low_ratio_multi_stream(
@@ -1480,6 +1639,16 @@ class MQALayer(MqaAttentionBase):
         q_out: Optional[torch.Tensor] = None,
         x_quant=None,
     ) -> torch.Tensor:
+        if self.dsa_enable_prefill_cp and dsa_use_prefill_cp(forward_batch):
+            return self._forward_prepare_low_ratio_cp_multi_stream(
+                x,
+                positions,
+                forward_batch,
+                attn_backend,
+                q_out,
+                x_quant=x_quant,
+            )
+
         # Both side streams are joined before returning, and nothing they read is
         # released before the join.
         assert self.alt_streams is not None
@@ -2000,31 +2169,8 @@ class MQALayer(MqaAttentionBase):
                     forward_batch=forward_batch,
                 )
             elif use_cp:
-                # every rank writes the whole chunk's window KV with the fused fp32 store
-                if qkv_a is not None:
-                    kv = qkv_a[..., self.q_lora_rank :]
-                else:
-                    kv, _ = self.wkv(x_linear)
-                kv = cp_materialize_global_token_order(
-                    kv.contiguous(),
-                    forward_batch,
-                    torch.cuda.current_stream(),
-                )
-                tail = attn_backend.forward_metadata.late_layer_tail
-                global_positions = (
-                    tail.pos_global
-                    if tail is not None
-                    else forward_batch.positions[: kv.shape[0]]
-                )
-                get_token_to_kv_pool().set_swa_key_buffer_radix_fused_norm_rope(
-                    layer_id=self.layer_id,
-                    swa_loc=attn_backend.get_swa_out_cache_loc(forward_batch),
-                    kv=kv,
-                    kv_weight=self.kv_norm.weight.data,
-                    eps=self.eps,
-                    freqs_cis=self.freqs_cis,
-                    positions=global_positions,
-                )
+                kv = self._materialize_cp_swa_k(x_linear, forward_batch, qkv_a=qkv_a)
+                self._store_cp_swa_k(kv, forward_batch, attn_backend)
                 kv = None
             else:
                 self._compute_kv_to_cache(
@@ -2112,6 +2258,15 @@ class MQALayer(MqaAttentionBase):
                 (DeepseekV4AttnBackend, DeepseekV4HipRadixBackend),
             )
 
+        from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
+            is_unified_kv_fp8,
+            is_unified_kv_triton,
+        )
+
+        unified = is_unified_kv_triton()
+        use_prefill_cp = self.dsa_enable_prefill_cp and dsa_use_prefill_cp(
+            forward_batch
+        )
         enable_multi_stream = (
             envs.SGLANG_OPT_USE_MULTI_STREAM_OVERLAP.get()
             and self.alt_streams is not None
@@ -2120,7 +2275,15 @@ class MQALayer(MqaAttentionBase):
                 is_in_breakable_cuda_graph()
                 or x.shape[0] <= self._multi_stream_bs_limit
             )
-            and not (self.dsa_enable_prefill_cp and dsa_use_prefill_cp(forward_batch))
+            and (
+                not use_prefill_cp
+                or (
+                    self.is_dsv41
+                    and _is_cuda
+                    and forward_batch.forward_mode.is_extend()
+                    and not unified
+                )
+            )
             and not (_is_hip and self.compressor is None)
             and self.compress_ratio not in (1, 2)
         ) or (
@@ -2131,6 +2294,24 @@ class MQALayer(MqaAttentionBase):
             and not forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed()
         )
 
+        low_ratio_cp_multi_stream = (
+            self.is_dsv41
+            and use_prefill_cp
+            and forward_batch.forward_mode.is_extend()
+            and envs.SGLANG_OPT_USE_MULTI_STREAM_OVERLAP.get()
+            and self.alt_streams is not None
+            and not unified
+            and (
+                not get_is_capture_mode()
+                or (
+                    (
+                        is_in_breakable_cuda_graph()
+                        or x.shape[0] <= self._multi_stream_bs_limit
+                    )
+                    and getattr(attn_backend, "low_ratio_prefill_graph", False)
+                )
+            )
+        )
         low_ratio_multi_stream = (
             _is_cuda
             and get_platform().is_blackwell
@@ -2144,14 +2325,9 @@ class MQALayer(MqaAttentionBase):
                     and getattr(self.wq_b.quant_method, "mxfp8_dense_backend", None)
                     == Mxfp8DenseGemmBackend.FLASHINFER_CUTEDSL
                 )
+                or low_ratio_cp_multi_stream
             )
         )
-        from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
-            is_unified_kv_fp8,
-            is_unified_kv_triton,
-        )
-
-        unified = is_unified_kv_triton()
         unified_fp8_verify = (
             unified
             and is_unified_kv_fp8()
@@ -2256,8 +2432,8 @@ class MQALayer(MqaAttentionBase):
         attn_sink = self._local_attn_sink(kernel_num_heads)
 
         if enable_multi_stream:
-            # Multi-stream path always fuses cache write into the K kernel,
-            # so the bf16 KV intermediate is gone.
+            # CP gathers raw KV before its side-stream store. Other paths fuse
+            # the store into the K kernel; neither returns a KV intermediate.
             if _is_hip:
                 q = self._forward_prepare_multi_stream_hip(
                     x,
@@ -2651,7 +2827,8 @@ class DeepseekV4DecoderLayer(nn.Module):
             is_nextn=is_nextn,
             is_deepseek_v4=True,
             vl_correction_bias=config.model_type == "deepseek_v41"
-            and config.vision_n_layers > 0,
+            and config.vision_n_layers > 0
+            and not getattr(config, "language_model_only", False),
         )
 
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -3865,7 +4042,15 @@ class DeepseekV4DecoderLayer(nn.Module):
                 skip_shared_experts=_do_shared_local,
             )
         if _use_cp and get_moe_a2a_backend().is_none():
-            hidden_states = dsa_cp_reduce_scatter_hidden_states(hidden_states)
+            if self.config.model_type == "deepseek_v41":
+                parallel = get_parallel()
+                hidden_states = parallel.tp_group.all_reduce(hidden_states)
+                parallel = get_parallel()
+                hidden_states = hidden_states.tensor_split(parallel.attn_cp_size)[
+                    parallel.attn_cp_rank
+                ].contiguous()
+            else:
+                hidden_states = dsa_cp_reduce_scatter_hidden_states(hidden_states)
         elif _use_tp_moe_gather:
             hidden_states, global_hidden_states = (
                 get_local_dp_buffer(get_parallel().tp_group),
@@ -4395,11 +4580,18 @@ class DeepseekV4Model(nn.Module):
         )
         if self.engram_hasher is not None:
             if cp_extend:
-                # n-gram hashing needs each token's predecessors: hash the whole prompt
+                # N-gram hashing needs each token's predecessors, so hash the
+                # whole prompt before selecting this CP rank's interleaved rows.
+                # The hasher builds request-to-token indices dynamically; keep
+                # that work at an eager break during breakable graph capture.
                 total = int(forward_batch.attn_cp_metadata.total_seq_lens)
-                hash_ids = self.engram_hasher(
-                    forward_batch.input_ids[:total], forward_batch
-                )
+                global_input_ids = forward_batch.input_ids[:total]
+                if is_in_breakable_cuda_graph():
+                    hash_ids = bcg_deepseek_v4_engram_hash_ids(
+                        self.engram_hasher, global_input_ids
+                    )
+                else:
+                    hash_ids = self.engram_hasher(global_input_ids, forward_batch)
                 parallel = get_parallel()
                 hash_ids = hash_ids[parallel.attn_cp_rank :: parallel.attn_cp_size]
                 pad_rows = hidden_states.shape[0] - hash_ids.shape[0]
@@ -4832,6 +5024,13 @@ class DeepseekV4Model(nn.Module):
         return hidden_states, pre_hc_head
 
 
+def _v41_vision_a2a_supported() -> bool:
+    backend = get_moe_a2a_backend()
+    return backend.is_none() or (
+        backend.is_megamoe() and get_disagg().disaggregation_mode == "decode"
+    )
+
+
 class DeepseekV4ForCausalLM(nn.Module):
     supports_cuda_vmm_feature_transport = True
 
@@ -4857,14 +5056,18 @@ class DeepseekV4ForCausalLM(nn.Module):
         self.wo_a_fp8 = wo_a_fp8_gemm_enabled(quant_config)
         self.determine_num_fused_shared_experts()
         self.vision = None
-        if config.model_type == "deepseek_v41" and config.vision_n_layers > 0:
+        if (
+            config.model_type == "deepseek_v41"
+            and config.vision_n_layers > 0
+            and not getattr(config, "language_model_only", False)
+        ):
             if (
-                get_parallel().attn_cp_size != 1
-                or get_parallel().pp_group.world_size != 1
-                or not get_moe_a2a_backend().is_none()
+                get_parallel().pp_group.world_size != 1
+                or not _v41_vision_a2a_supported()
             ):
                 raise ValueError(
-                    "V4.1 vision currently supports TP/EP/DP without CP, PP or MoE A2A"
+                    "V4.1 vision supports TP/EP/DP and prefill CP without PP; "
+                    "MoE A2A is supported only with MegaMoE on a PD decode node"
                 )
 
             args = SimpleNamespace(**vars(config), dim=config.hidden_size)
@@ -5071,16 +5274,19 @@ class DeepseekV4ForCausalLM(nn.Module):
             0 if is_shared_experts_fusion_disabled() else self.config.n_shared_experts
         )
 
-    def forward(
+    def prepare_language_model_inputs(
         self,
         input_ids: torch.Tensor,
-        positions: torch.Tensor,
         forward_batch: ForwardBatch,
         input_embeds: Optional[torch.Tensor] = None,
-        pp_proxy_tensors: Optional[PPProxyTensors] = None,
-    ) -> torch.Tensor:
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """Prepare full-sequence image embeddings and model IDs before CP splits.
+
+        Scheduler hash IDs stay intact for multimodal cache keys; the language
+        model uses image_token_id for Engram masking and visual MoE routing.
+        """
         if (
-            self.vision is not None
+            getattr(self, "vision", None) is not None
             and not forward_batch.forward_mode.is_decode()
             and not forward_batch.forward_mode.is_target_verify()
             and forward_batch.mm_inputs is not None
@@ -5089,7 +5295,7 @@ class DeepseekV4ForCausalLM(nn.Module):
             if input_embeds is not None:
                 raise ValueError("Cannot combine input_embeds and image inputs")
             input_embeds = self._prepare_mm_embeddings(input_ids, forward_batch)
-        if self.vision is not None and not (
+        if getattr(self, "vision", None) is not None and not (
             forward_batch.forward_mode.is_decode_or_idle()
             or forward_batch.forward_mode.is_target_verify()
         ):
@@ -5099,6 +5305,19 @@ class DeepseekV4ForCausalLM(nn.Module):
                 input_ids >= MM_PAD_SHIFT_VALUE, self.config.image_token_id
             )
 
+        return input_ids, input_embeds
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        input_embeds: Optional[torch.Tensor] = None,
+        pp_proxy_tensors: Optional[PPProxyTensors] = None,
+    ) -> torch.Tensor:
+        input_ids, input_embeds = self.prepare_language_model_inputs(
+            input_ids, forward_batch, input_embeds
+        )
         with get_attn_tp_context().maybe_input_scattered(forward_batch):
             hidden_states = self.model.forward(
                 input_ids, positions, forward_batch, input_embeds, pp_proxy_tensors

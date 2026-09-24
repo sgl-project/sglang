@@ -166,6 +166,7 @@ def make_candidate_indexer(
 class CandidateMasks(CandidateMetadata):
     mask: Optional[torch.Tensor] = None  # decode: [rows, width] bool
     request_masks: Optional[List[torch.Tensor]] = None  # prefill: [rows_b, lc_b] each
+    block_mask: Optional[torch.Tensor] = None  # captured prefill: [rows, blocks] bool
 
 
 def cut_request_masks(masks: CandidateMasks, tail_lens: List[int]) -> CandidateMasks:
@@ -246,6 +247,25 @@ def select_candidate_block_ids(
     return top.indices.to(torch.int32).masked_fill_(~(top.values > -torch.inf), -1)
 
 
+def select_candidate_block_mask(
+    logits: torch.Tensor,
+    compress_lens: Union[torch.Tensor, int],
+    topk_blocks: int,
+    block_size: int,
+) -> torch.Tensor:
+    """Level-one candidates in block units for fixed-width prefill graphs."""
+    top = _candidate_block_topk(
+        logits=logits,
+        compress_lens=compress_lens,
+        topk_blocks=topk_blocks,
+        block_size=block_size,
+    )
+    num_blocks = (logits.shape[-1] + block_size - 1) // block_size
+    return torch.zeros(
+        (*logits.shape[:-1], num_blocks), dtype=torch.bool, device=logits.device
+    ).scatter_(-1, top.indices, top.values > -torch.inf)
+
+
 def candidate_block_mask(
     blocks: torch.Tensor, width: int, block_size: int
 ) -> torch.Tensor:
@@ -263,15 +283,50 @@ def select_candidate_blocks(
     topk_blocks: int,
     block_size: int,
 ) -> torch.Tensor:
-    top = _candidate_block_topk(
-        logits=logits,
-        compress_lens=compress_lens,
-        topk_blocks=topk_blocks,
-        block_size=block_size,
+    keep = select_candidate_block_mask(
+        logits, compress_lens, topk_blocks, block_size
     )
-    width = logits.shape[-1]
-    num_blocks = (width + block_size - 1) // block_size
+    return keep.repeat_interleave(block_size, dim=-1)[..., : logits.shape[-1]]
+
+
+def select_candidate_block_mask_v2(
+    logits: torch.Tensor,
+    compress_lens: torch.Tensor,
+    topk_blocks: int,
+    block_size: int,
+) -> torch.Tensor:
+    """Graph-safe level-one candidate selection using the fused block-amax and
+    top-k-v2 kernels. The returned fixed-width mask has the same meaning as
+    :func:`select_candidate_block_mask`, while the kernels only read each row
+    through ``compress_lens`` instead of scanning padded logits columns."""
+    from sglang.srt.layers.attention.dsv4.candidate_indexer_deep_gemm import (
+        CANDIDATE_BLOCK_SIZE,
+        amax_topk_blocks,
+    )
+
+    assert block_size == CANDIDATE_BLOCK_SIZE, (
+        f"top-k-v2 candidate selection requires block_size={CANDIDATE_BLOCK_SIZE}, "
+        f"got {block_size}"
+    )
+    lens = compress_lens.reshape(-1).to(torch.int32).contiguous()
+    nblocks = (lens + block_size - 1) // block_size
+    blocks = amax_topk_blocks(
+        logits,
+        lens,
+        nblocks,
+        topk_blocks,
+        max_seq_len=logits.shape[1],
+    )
+
+    num_blocks = (logits.shape[1] + block_size - 1) // block_size
+    valid = blocks >= 0
+    # Invalid top-k slots use a dedicated sentinel column. This avoids their
+    # clamped indices racing with a valid write to block zero under scatter_.
+    scatter_indices = torch.where(valid, blocks, num_blocks).to(torch.int64)
     keep = torch.zeros(
-        (*logits.shape[:-1], num_blocks), dtype=torch.bool, device=logits.device
-    ).scatter_(-1, top.indices, top.values > -torch.inf)
-    return keep.repeat_interleave(block_size, dim=-1)[..., :width]
+        (logits.shape[0], num_blocks + 1),
+        dtype=torch.bool,
+        device=logits.device,
+    )
+    keep.scatter_(-1, scatter_indices, valid)
+    return keep[:, :num_blocks]

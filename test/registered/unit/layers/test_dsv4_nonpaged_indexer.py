@@ -43,6 +43,138 @@ _ISSUE_ALIGNED_COLS = 93184
 
 
 class TestDSV4PagedIndexerMetadata(CustomTestCase):
+    def test_dsv41_bcg_dense_indexer_keeps_paged_fallback_chunked(self):
+        from sglang.srt.layers.attention.deepseek_v4_backend import (
+            DeepseekV4AttnBackend,
+        )
+
+        backend = SimpleNamespace(
+            page_size=256,
+            token_to_kv_pool=SimpleNamespace(get_index_k_page_size=lambda ratio: 64),
+        )
+        core = SimpleNamespace(
+            page_table=torch.zeros((2049, 256), dtype=torch.int32),
+            seq_lens_casual=torch.full((2049,), 256, dtype=torch.int32),
+        )
+        module = "sglang.srt.layers.attention.deepseek_v4_backend"
+        with (
+            patch(f"{module}._prefill_graph_max_seq_len") as max_context,
+            patch(f"{module}.PagedIndexerMetadata") as metadata_ctor,
+        ):
+            with envs.SGLANG_DSV41_BCG_DENSE_INDEXER.override(False):
+                for context in (16384, 32768, 65536):
+                    max_context.return_value = context
+                    DeepseekV4AttnBackend._low_ratio_prefill_indexer_metadata(
+                        backend, core, 1
+                    )
+                    self.assertEqual(metadata_ctor.call_args.kwargs["row_chunk"], 2048)
+
+            with envs.SGLANG_DSV41_BCG_DENSE_INDEXER.override(True):
+                max_context.return_value = 32768
+                DeepseekV4AttnBackend._low_ratio_prefill_indexer_metadata(
+                    backend, core, 1
+                )
+                self.assertEqual(metadata_ctor.call_args.kwargs["row_chunk"], 2048)
+                self.assertTrue(metadata_ctor.call_args.kwargs["use_topk_v2"])
+
+    def test_dsv41_bcg_dense_k_layout_uses_live_request_order(self):
+        from sglang.srt.layers.attention.deepseek_v4_backend import (
+            _prefill_graph_dense_k_layout,
+        )
+
+        req_to_token = torch.arange(8)[:, None] * 1000 + torch.arange(10)[None, :] * 2
+        pool = SimpleNamespace(
+            get_low_ratio_index_k_fp4=lambda layer, slots: (
+                slots[:, None].expand(-1, 64).contiguous(),
+                slots.clone(),
+            )
+        )
+        ks, slots, packed = _prefill_graph_dense_k_layout(
+            req_to_token,
+            pool,
+            1,
+            2,
+            5,
+            torch.tensor([7, 3, 7, 3]),
+            torch.tensor([7, 3, 0, 0, 0, 0, 0, 0]),
+            torch.tensor([8, 6, 0, 0, 0, 0, 0, 0]),
+        )
+        torch.testing.assert_close(ks, torch.tensor([0, 5, 0, 5], dtype=torch.int32))
+        torch.testing.assert_close(
+            slots[:10],
+            torch.tensor([3500, 3502, 3504, 3506, 0, 1500, 1502, 1504, 0, 0]),
+        )
+        self.assertEqual(slots.shape, (40,))
+        torch.testing.assert_close(packed[0][:, 0], slots)
+        torch.testing.assert_close(packed[1], slots)
+
+    def test_dsv41_dense_logits_offsets_are_int32(self):
+        from sglang.srt.layers.attention.deepseek_v4_backend import (
+            _dense_fp4_mqa_logits,
+        )
+
+        gemm = MagicMock(return_value=torch.empty((2, 16)))
+        with patch.dict(
+            sys.modules,
+            {"deep_gemm": SimpleNamespace(fp8_fp4_mqa_logits=gemm)},
+        ):
+            _dense_fp4_mqa_logits(
+                (None, None),
+                (None, None),
+                torch.empty((2, 1)),
+                torch.tensor([0, 16], dtype=torch.int64),
+                torch.tensor([8, 20], dtype=torch.int64),
+                16,
+            )
+        self.assertEqual(gemm.call_args.args[3].dtype, torch.int32)
+        self.assertEqual(gemm.call_args.args[4].dtype, torch.int32)
+
+    def test_dsv41_bcg_dense_request_metadata_replays_in_place(self):
+        from sglang.srt.layers.attention.deepseek_v4_backend import DSV4Metadata
+
+        core = SimpleNamespace(
+            refresh_for_breakable_cuda_graph_replay_=lambda other: None
+        )
+        captured = DSV4Metadata(core, None)
+        captured.prefill_graph_dense_indexer = True
+        captured.low_ratio_local_req_indices = torch.zeros(4, dtype=torch.int64)
+        captured.low_ratio_dense_req_indices = torch.zeros(8, dtype=torch.int64)
+        captured.low_ratio_dense_seq_lens = torch.zeros(8, dtype=torch.int64)
+        live = DSV4Metadata(core, None)
+        live.prefill_graph_dense_indexer = True
+        live.low_ratio_local_req_indices = torch.tensor([7, 3, 7, 3])
+        live.low_ratio_dense_req_indices = torch.tensor([7, 3, 0, 0, 0, 0, 0, 0])
+        live.low_ratio_dense_seq_lens = torch.tensor([8, 6, 0, 0, 0, 0, 0, 0])
+
+        addresses = (
+            captured.low_ratio_local_req_indices.data_ptr(),
+            captured.low_ratio_dense_req_indices.data_ptr(),
+            captured.low_ratio_dense_seq_lens.data_ptr(),
+        )
+        captured.refresh_for_breakable_cuda_graph_replay_(live)
+        self.assertEqual(
+            addresses,
+            (
+                captured.low_ratio_local_req_indices.data_ptr(),
+                captured.low_ratio_dense_req_indices.data_ptr(),
+                captured.low_ratio_dense_seq_lens.data_ptr(),
+            ),
+        )
+        torch.testing.assert_close(
+            captured.low_ratio_local_req_indices, live.low_ratio_local_req_indices
+        )
+        torch.testing.assert_close(
+            captured.low_ratio_dense_req_indices, live.low_ratio_dense_req_indices
+        )
+        torch.testing.assert_close(
+            captured.low_ratio_dense_seq_lens, live.low_ratio_dense_seq_lens
+        )
+
+        # A large capture may use paged logits even if a smaller replay batch
+        # would be eligible for dense logits.
+        paged_capture = DSV4Metadata(core, None)
+        paged_capture.refresh_for_breakable_cuda_graph_replay_(live)
+
     def test_sm120_fp4_forces_deep_gemm_metadata(self):
         expected = torch.tensor([[0, 0], [1, 0]], dtype=torch.int32)
         deep_gemm = SimpleNamespace(
@@ -133,6 +265,49 @@ class TestDSV4PagedIndexerMetadata(CustomTestCase):
         torch.testing.assert_close(
             destination.compressed_seq_lens, source.compressed_seq_lens
         )
+
+    def test_chunked_topk_v2_plans_are_capture_stable_and_replayable(self):
+        def fake_plan(lengths):
+            value = int(lengths[0])
+            return torch.full((lengths.numel() + 1, 2), value, dtype=torch.int32)
+
+        def make_metadata(lengths):
+            with (
+                envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.override(True),
+                patch(
+                    "sglang.kernels.ops.attention.dsv4.plan_topk_v2",
+                    side_effect=fake_plan,
+                ),
+            ):
+                return PagedIndexerMetadata(
+                    page_size=256,
+                    compressed_page_size=64,
+                    page_table=torch.zeros((len(lengths), 2), dtype=torch.int32),
+                    compressed_seq_lens=torch.tensor(lengths, dtype=torch.int32),
+                    use_topk_v2=True,
+                    row_chunk=2,
+                )
+
+        destination = make_metadata([10, 20, 30, 40, 50])
+        self.assertEqual(destination.topk_metadata.shape, (3, 3, 2))
+        torch.testing.assert_close(
+            destination.topk_plan_for_chunk(0, slice(0, 2)),
+            torch.full((3, 2), 10, dtype=torch.int32),
+        )
+        torch.testing.assert_close(
+            destination.topk_plan_for_chunk(1, slice(2, 4)),
+            torch.full((3, 2), 30, dtype=torch.int32),
+        )
+        torch.testing.assert_close(
+            destination.topk_plan_for_chunk(2, slice(4, 5)),
+            torch.full((2, 2), 50, dtype=torch.int32),
+        )
+
+        source = make_metadata([11, 21, 31, 41, 51])
+        plan_ptr = destination.topk_metadata.data_ptr()
+        destination.copy_(source)
+        self.assertEqual(destination.topk_metadata.data_ptr(), plan_ptr)
+        torch.testing.assert_close(destination.topk_metadata, source.topk_metadata)
 
 
 class TestDSV4FlashInferTopK(CustomTestCase):
