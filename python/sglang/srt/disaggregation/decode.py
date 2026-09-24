@@ -2287,9 +2287,16 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 decode_req.req.output_token_sampling_mask.append(
                     output_token_sampling_mask_idx[:sampling_mask_len].cpu().tolist()
                 )
-                decode_req.req.output_token_sampling_logprobs.append(
-                    float(output_token_sampling_logprobs[0].item())
-                )
+                if decode_req.req.sampling_logprobs_mode == "support":
+                    decode_req.req.output_token_sampling_logprobs.append(
+                        output_token_sampling_logprobs[:sampling_mask_len]
+                        .cpu()
+                        .tolist()
+                    )
+                else:
+                    decode_req.req.output_token_sampling_logprobs.append(
+                        float(output_token_sampling_logprobs[0].item())
+                    )
 
         decode_req.kv_receiver.clear()
         decode_req.kv_receiver = None
