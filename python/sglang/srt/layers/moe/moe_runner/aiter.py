@@ -301,7 +301,10 @@ class AiterRunnerCore(MoeRunnerCore):
             topk_weight=runner_input.topk_weights,
             topk_ids=runner_input.topk_ids,
             quant_type=_aiter_quant_type(runner_input.quant_type),
-            activation=_aiter_activation(self.config.activation),
+            # quant_info.fused_moe_kwargs may override, e.g. MXFP8 swiglu-oai
+            activation=extra.pop(
+                "activation", _aiter_activation(self.config.activation)
+            ),
             w1_scale=quant_info.w13_scale,
             w2_scale=quant_info.w2_scale,
             a1_scale=a1_scale,
