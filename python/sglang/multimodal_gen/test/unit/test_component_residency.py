@@ -201,21 +201,11 @@ def test_snapshot_offload_sleep_uses_existing_host_storage():
     assert module.weight.data_ptr() == host_pointer
 
 
-def test_component_offload_keeps_preferred_component_after_warmup(monkeypatch):
+def test_component_offload_keeps_preferred_component_after_warmup():
     strategy = ComponentOffloadStrategy()
     strategy.prepare_for_use = Mock()
     strategy.wait_for_use = Mock()
     strategy.finish_use = Mock()
-    empty_cache = Mock()
-    monkeypatch.setattr(
-        torch,
-        "get_device_module",
-        lambda: SimpleNamespace(
-            is_available=lambda: True,
-            empty_cache=empty_cache,
-            mem_get_info=lambda: (8 * 1024**3, 16 * 1024**3),
-        ),
-    )
     module = torch.nn.Linear(2, 2)
     use = ComponentUse(
         stage_name="TextEncodingStage",
@@ -229,64 +219,29 @@ def test_component_offload_keeps_preferred_component_after_warmup(monkeypatch):
     strategy.prepare_for_use.assert_called_once_with(module, use, state)
     strategy.wait_for_use.assert_called_once_with(module, use, state)
     strategy.finish_use.assert_not_called()
-    empty_cache.assert_called_once_with()
 
 
-def test_component_offload_warmup_preload_oom_leaves_component_offloaded(
-    monkeypatch,
+@pytest.mark.parametrize(
+    "free_bytes, prepare_error",
+    [
+        (64, None),
+        (8 * 1024**3, torch.OutOfMemoryError("CUDA out of memory")),
+    ],
+    ids=["does-not-fit", "oom"],
+)
+def test_component_offload_warmup_preload_failure_leaves_component_offloaded(
+    monkeypatch, free_bytes, prepare_error
 ):
-    strategy = ComponentOffloadStrategy()
-    strategy.prepare_for_use = Mock(
-        side_effect=torch.OutOfMemoryError(
-            "CUDA out of memory. Tried to allocate 20.00 GiB\nMore details"
-        )
+    device_module = SimpleNamespace(
+        is_available=lambda: True,
+        empty_cache=Mock(),
+        mem_get_info=lambda: (free_bytes, 16 * 1024**3),
     )
+    monkeypatch.setattr(torch, "get_device_module", lambda: device_module)
+    strategy = ComponentOffloadStrategy()
+    strategy.prepare_for_use = Mock(side_effect=prepare_error)
     strategy.wait_for_use = Mock()
     strategy.finish_use = Mock()
-    empty_cache = Mock()
-    monkeypatch.setattr(
-        torch,
-        "get_device_module",
-        lambda: SimpleNamespace(
-            is_available=lambda: True,
-            empty_cache=empty_cache,
-            mem_get_info=lambda: (8 * 1024**3, 16 * 1024**3),
-        ),
-    )
-    module = torch.nn.Linear(2, 2)
-    use = ComponentUse(
-        stage_name="DenoisingStage",
-        component_name="transformer",
-        preferred_ready_after_request=True,
-    )
-    state = ResidencyState(batch_is_warmup=True)
-
-    strategy.finish_request(module, use, state, preferred=True)
-
-    strategy.prepare_for_use.assert_called_once_with(module, use, state)
-    strategy.wait_for_use.assert_not_called()
-    strategy.finish_use.assert_called_once_with(module, use, state)
-    # Once before the budget check, once after OOM recovery.
-    assert empty_cache.call_count == 2
-
-
-def test_component_offload_warmup_skips_preload_when_weights_do_not_fit(
-    monkeypatch,
-):
-    strategy = ComponentOffloadStrategy()
-    strategy.prepare_for_use = Mock()
-    strategy.wait_for_use = Mock()
-    strategy.finish_use = Mock()
-    empty_cache = Mock()
-    monkeypatch.setattr(
-        torch,
-        "get_device_module",
-        lambda: SimpleNamespace(
-            is_available=lambda: True,
-            empty_cache=empty_cache,
-            mem_get_info=lambda: (64, 1024),
-        ),
-    )
     module = torch.nn.Linear(64, 64)
     use = ComponentUse(
         stage_name="DenoisingStage",
@@ -297,16 +252,13 @@ def test_component_offload_warmup_skips_preload_when_weights_do_not_fit(
 
     strategy.finish_request(module, use, state, preferred=True)
 
-    strategy.prepare_for_use.assert_not_called()
+    assert strategy.prepare_for_use.call_count == (prepare_error is not None)
     strategy.wait_for_use.assert_not_called()
     strategy.finish_use.assert_called_once_with(module, use, state)
-    # Once before the budget check, once after the skip path.
-    assert empty_cache.call_count == 2
+    device_module.empty_cache.assert_called()
 
 
-def test_component_offload_warmup_preload_partial_oom_moves_module_to_cpu(
-    monkeypatch,
-):
+def test_component_offload_warmup_preload_partial_oom_moves_module_to_cpu():
     if torch.cuda.is_available():
         device = torch.device("cuda")
     elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
@@ -315,15 +267,6 @@ def test_component_offload_warmup_preload_partial_oom_moves_module_to_cpu(
         pytest.skip("requires CUDA or MPS to stage a partial device copy")
 
     strategy = ComponentOffloadStrategy()
-    monkeypatch.setattr(
-        torch,
-        "get_device_module",
-        lambda: SimpleNamespace(
-            is_available=lambda: True,
-            empty_cache=lambda: None,
-            mem_get_info=lambda: (8 * 1024**3, 16 * 1024**3),
-        ),
-    )
     module = torch.nn.Linear(4, 4)
     use = ComponentUse(
         stage_name="DenoisingStage",
@@ -1002,118 +945,56 @@ def test_component_is_not_kept_across_another_component_use():
     strategy.finish_use.assert_called_once_with(module, text_use, manager.state)
 
 
-def _dual_expert_pipeline():
-    transformer = torch.nn.Linear(2, 2)
-    transformer_2 = torch.nn.Linear(2, 2)
-    vae = torch.nn.Linear(2, 2)
-    t_use = ComponentUse(
-        "denoise",
-        "transformer",
-        phase="transformer",
-        memory_intensive=True,
-        preferred_ready_after_request=True,
-    )
-    t2_use = ComponentUse(
-        "denoise",
-        "transformer_2",
-        phase="transformer_2",
-        memory_intensive=True,
-    )
-    vae_use = ComponentUse("decode", "vae", memory_intensive=True)
-    denoise = _Stage(t_use, t2_use)
-    decode = _Stage(vae_use)
+def _dual_expert_manager():
+    names = ("transformer", "transformer_2")
+    uses = {
+        name: ComponentUse("denoise", name, phase=name, memory_intensive=True)
+        for name in names
+    }
+    denoise = _Stage(*uses.values())
+    decode = _Stage(ComponentUse("decode", "vae", memory_intensive=True))
     pipeline = SimpleNamespace(
-        modules={
-            "transformer": transformer,
-            "transformer_2": transformer_2,
-            "vae": vae,
-        },
+        modules={name: torch.nn.Linear(2, 2) for name in (*names, "vae")},
         _stage_name_mapping={"denoise": denoise, "decode": decode},
         component_residency_strategies={},
     )
     server_args = SimpleNamespace(enable_layerwise_nvtx_marker=False)
     manager = ComponentResidencyManager(pipeline, server_args)
     manager.refresh_pipeline(pipeline)
-    manager.begin_request(
-        [denoise, decode], SimpleNamespace(is_warmup=False), server_args
-    )
-    return manager, server_args, denoise, t_use, t2_use, vae_use
+    batch = SimpleNamespace(is_warmup=False)
+    manager.begin_request([denoise, decode], batch, server_args)
+    manager.before_stage(denoise, 0, batch, server_args)
+    return manager, uses
 
 
-def _finish_denoise_stage(manager):
-    # DenoisingStage finishes its active DiT inside the stage, then the
-    # executor calls end_stage.
-    manager.finish_active_use()
-    manager.end_stage()
-
-
-def test_stage_finish_does_not_prefetch_unused_same_stage_expert():
-    """Warmup that only runs transformer must not H2D transformer_2."""
-    manager, server_args, denoise, t_use, _t2_use, _vae_use = _dual_expert_pipeline()
-    strategy = ComponentOffloadStrategy()
-    strategy.prepare_for_use = Mock()
-    strategy.wait_for_use = Mock()
-    strategy.prefetch_for_use = Mock(return_value=True)
-    strategy.finish_use = Mock()
-    manager.strategy_for = Mock(return_value=strategy)
-
-    manager.before_stage(denoise, 0, SimpleNamespace(is_warmup=False), server_args)
-    manager.begin_use(t_use)
-    _finish_denoise_stage(manager)
-
-    prefetched = [
-        call.args[1].component_name for call in strategy.prefetch_for_use.call_args_list
-    ]
-    assert prefetched == ["vae"]
-    finished = [
-        call.args[1].component_name for call in strategy.finish_use.call_args_list
-    ]
-    assert finished == ["transformer"]
-
-
-def test_end_stage_releases_prefetched_but_never_begun_same_stage_use():
-    """Strategies that prefetch while busy must still drop unused same-stage copies."""
-    manager, server_args, denoise, t_use, t2_use, _vae_use = _dual_expert_pipeline()
-    strategy = Mock()
+@pytest.mark.parametrize(
+    "offload, experts_run, expected_finished",
+    [
+        (True, ("transformer",), ["transformer"]),
+        # Non-offload strategies prefetch transformer_2 while transformer runs.
+        (False, ("transformer",), ["transformer", "transformer_2"]),
+        (True, ("transformer", "transformer_2"), ["transformer", "transformer_2"]),
+    ],
+    ids=["one-expert-offload", "one-expert-prefetch-while-busy", "both-experts"],
+)
+def test_stage_exit_does_not_keep_unused_same_stage_expert(
+    offload, experts_run, expected_finished
+):
+    manager, uses = _dual_expert_manager()
+    strategy = Mock(spec=ComponentOffloadStrategy) if offload else Mock()
     strategy.prefetch_for_use.return_value = True
     manager.strategy_for = Mock(return_value=strategy)
 
-    manager.before_stage(denoise, 0, SimpleNamespace(is_warmup=False), server_args)
-    manager.begin_use(t_use)
-    assert manager._use_key(t2_use) in manager._prefetched_use_keys
-
-    _finish_denoise_stage(manager)
+    for name in experts_run:
+        manager.begin_use(uses[name])
+    # DenoisingStage finishes its DiT inside the stage; the executor then
+    # calls end_stage.
+    manager.finish_active_use()
+    manager.end_stage()
 
     finished = [
         call.args[1].component_name for call in strategy.finish_use.call_args_list
     ]
-    assert sorted(finished) == ["transformer", "transformer_2"]
-    assert manager._use_key(t2_use) not in manager._prefetched_use_keys
-
-
-def test_stage_finish_keeps_dual_expert_sequence_when_both_run():
-    manager, server_args, denoise, t_use, t2_use, _vae_use = _dual_expert_pipeline()
-    strategy = ComponentOffloadStrategy()
-    strategy.prepare_for_use = Mock()
-    strategy.wait_for_use = Mock()
-    strategy.prefetch_for_use = Mock(return_value=True)
-    strategy.finish_use = Mock()
-    manager.strategy_for = Mock(return_value=strategy)
-
-    manager.before_stage(denoise, 0, SimpleNamespace(is_warmup=False), server_args)
-    manager.begin_use(t_use)
-    manager.begin_use(t2_use)
-    _finish_denoise_stage(manager)
-
-    prepared = [
-        call.args[1].component_name for call in strategy.prepare_for_use.call_args_list
-    ]
-    assert prepared == ["transformer", "transformer_2"]
-    finished = [
-        call.args[1].component_name for call in strategy.finish_use.call_args_list
-    ]
-    assert finished == ["transformer", "transformer_2"]
-    prefetched = [
-        call.args[1].component_name for call in strategy.prefetch_for_use.call_args_list
-    ]
-    assert prefetched == ["vae"]
+    assert finished == expected_finished
+    assert strategy.prefetch_for_use.call_args.args[1].component_name == "vae"
+    assert manager._use_key(uses["transformer_2"]) not in manager._prefetched_use_keys

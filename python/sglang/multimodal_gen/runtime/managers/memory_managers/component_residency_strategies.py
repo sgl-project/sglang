@@ -81,32 +81,22 @@ def _cpu_module_nbytes(module: nn.Module) -> int:
 
 def _device_free_bytes() -> int | None:
     device_module = torch.get_device_module()
-    if not device_module.is_available():
-        return None
     mem_get_info = getattr(device_module, "mem_get_info", None)
-    if mem_get_info is None:
+    if mem_get_info is None or not device_module.is_available():
         return None
-    try:
-        free_bytes, _ = mem_get_info()
-    except RuntimeError:
-        return None
-    return int(free_bytes)
+    return int(mem_get_info()[0])
 
 
 def _is_out_of_memory_error(error: BaseException) -> bool:
-    if isinstance(error, torch.OutOfMemoryError):
-        return True
-    return "out of memory" in str(error).lower()
+    return isinstance(error, torch.OutOfMemoryError) or (
+        "out of memory" in str(error).lower()
+    )
 
 
 def _empty_device_cache() -> None:
     empty_cache = getattr(torch.get_device_module(), "empty_cache", None)
-    if empty_cache is None:
-        return
-    try:
+    if empty_cache is not None:
         empty_cache()
-    except Exception:
-        logger.warning("Failed to empty device cache after warmup preload.")
 
 
 def is_fsdp_managed_module(module: nn.Module) -> bool:
@@ -256,41 +246,25 @@ class ComponentOffloadStrategy(ComponentResidencyStrategy):
             # Return reserved blocks from earlier non-intensive releases (e.g. VAE)
             # before sizing the optional warmup preload against driver-free memory.
             _empty_device_cache()
-            # Skip a known-too-large H2D instead of paying for a failing copy.
             free_bytes = _device_free_bytes()
-            need_bytes = _cpu_module_nbytes(module)
-            if free_bytes is not None and need_bytes > max(
-                0, free_bytes - _WARMUP_PRELOAD_MARGIN_BYTES
-            ):
-                logger.warning(
-                    "Warmup skipped keeping %s resident after request finalization "
-                    "(need %.2f GiB, free %.2f GiB). Leaving it offloaded; it will "
-                    "be loaded on the next use.",
-                    use.component_name,
-                    need_bytes / (1024**3),
-                    free_bytes / (1024**3),
-                )
-                self.finish_use(module, use, state)
-                _empty_device_cache()
-                return
-
             try:
-                self.prepare_for_use(module, use, state)
-                self.wait_for_use(module, use, state)
+                if free_bytes is None or _cpu_module_nbytes(module) <= (
+                    free_bytes - _WARMUP_PRELOAD_MARGIN_BYTES
+                ):
+                    self.prepare_for_use(module, use, state)
+                    self.wait_for_use(module, use, state)
+                    return
             except RuntimeError as error:
-                # Warmup preload is optional. If the preferred set cannot fit,
-                # leave the component on CPU; the next request loads on demand.
                 if not _is_out_of_memory_error(error):
                     raise
-                detail = str(error).strip().splitlines()
-                logger.warning(
-                    "Warmup could not keep %s resident after request finalization "
-                    "(%s). Leaving it offloaded; it will be loaded on the next use.",
-                    use.component_name,
-                    detail[0] if detail else type(error).__name__,
-                )
-                self.finish_use(module, use, state)
-                _empty_device_cache()
+            # Warmup preload is optional; the next request loads it on demand.
+            logger.warning(
+                "Warmup could not keep %s resident after request finalization; "
+                "leaving it offloaded until its next use.",
+                use.component_name,
+            )
+            self.finish_use(module, use, state)
+            _empty_device_cache()
             return
         self.finish_use(module, use, state)
 

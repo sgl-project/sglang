@@ -507,14 +507,10 @@ class ComponentResidencyManager:
         self.state.current_use = None
         self._begin_warmup_between_uses()
         if prefetch_next:
-            # Stages call this when they are done with their components, so a
-            # later same-stage declaration (e.g. transformer_2 on a warmup that
+            # Stages call this when done with their components, so a later use
+            # declared by the same stage (e.g. transformer_2 on a warmup that
             # only ran the high-noise expert) will not run in this request.
-            self._prefetch_next_memory_intensive_use(
-                start_index=max(
-                    self._current_use_index + 1, self._stage_ordered_end_index()
-                )
-            )
+            self._prefetch_next_memory_intensive_use(skip_stage=self.state.stage_name)
 
     def _prepare_forward_use(
         self, use: ComponentUse, module: nn.Module | None = None
@@ -891,48 +887,29 @@ class ComponentResidencyManager:
         return None
 
     def _prefetch_next_memory_intensive_use(
-        self, *, start_index: int | None = None
+        self, *, skip_stage: str | None = None
     ) -> None:
-        if start_index is None:
-            start_index = self._current_use_index + 1
-        for use in self._ordered_uses[start_index:]:
-            if not use.memory_intensive:
+        for use in self._ordered_uses[self._current_use_index + 1 :]:
+            if not use.memory_intensive or use.stage_name == skip_stage:
                 continue
             if self._use_key(use) in self._prefetched_use_keys:
                 return
             self._prefetch_use(use)
             return
 
-    def _stage_ordered_end_index(self) -> int:
-        """Exclusive end index of the current stage in ``_ordered_uses``."""
-        stage_index = self.state.stage_index
-        if stage_index < 0 or stage_index >= len(self._stage_uses_by_index):
-            return self._current_use_index + 1
-        return sum(len(uses) for uses in self._stage_uses_by_index[: stage_index + 1])
-
     def _release_unconsumed_stage_prefetches(self) -> None:
-        """Release prefetches of this stage's uses that never began."""
-        end_index = self._stage_ordered_end_index()
-        next_stage_index = self.state.stage_index + 1
-        next_stage_components = (
-            {use.component_name for use in self._stage_uses_by_index[next_stage_index]}
-            if 0 < next_stage_index < len(self._stage_uses_by_index)
-            else set()
-        )
-        for use in self._ordered_uses[self._current_use_index + 1 : end_index]:
+        """Release prefetched uses of the ending stage that never began."""
+        for use in self.state.future_uses:
             key = self._use_key(use)
-            if key not in self._prefetched_use_keys:
-                continue
-            self._prefetched_use_keys.discard(key)
-            if use.component_name in next_stage_components:
-                continue
-            if self._active_use is not None and (
-                self._active_use.component_name == use.component_name
+            if use.stage_name != self.state.stage_name or (
+                key not in self._prefetched_use_keys
             ):
                 continue
-            self._begin_warmup_transition(use, None)
-            self._finish_use(use, keep_on_warmup=False, force=True)
-            self._begin_warmup_between_uses()
+            self._prefetched_use_keys.discard(key)
+            if self._active_use is None or (
+                self._active_use.component_name != use.component_name
+            ):
+                self._finish_use(use, keep_on_warmup=False, force=True)
 
     def _should_keep_after_use(self, use: ComponentUse) -> bool:
         if self.state.future_uses and self._same_use(use, self.state.future_uses[0]):
