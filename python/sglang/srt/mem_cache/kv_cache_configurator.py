@@ -590,9 +590,10 @@ class KVCacheConfigurator:
                         draft_state_layer_classes,
                     )
 
-                    assert req_to_token_pool is not None, (
-                        "a draft worker shares the target's req_to_token_pool"
-                    )
+                    if req_to_token_pool is None:
+                        req_to_token_pool = self._build_req_to_token_pool(
+                            max_num_reqs=sizes.max_running_requests
+                        )
                     # The target placed this draft from its config; the built
                     # model is the ground truth for whether it carries state.
                     state_layers = draft_state_layer_classes(self.model)
@@ -735,7 +736,9 @@ class KVCacheConfigurator:
         fallback (the draft then owns a raw-virtual-indexed pool of its own).
         Target boot declines a placement for legitimate geometry, so the
         private arm is the rollback lever, not a boot-order bug."""
-        if not self.spec_algorithm.is_eagle():
+        if not (
+            self.spec_algorithm.is_eagle() or self.spec_algorithm.is_dflash_family()
+        ):
             return None
         placement = alloc.unified_buffer.fused_draft
         if placement is None:
@@ -958,8 +961,9 @@ class KVCacheConfigurator:
         """Whether, and where, the EAGLE draft's layers fuse into the target's
         sub-pools. Fusion applies only for: unified memory ON, a unified target
         (hybrid-SWA or mamba hybrid, either full-pool kind), an EAGLE-family
-        algorithm whose draft config was loaded at target boot;
-        `place_fused_draft` then admits or declines the draft's layer kinds."""
+        or DFLASH/DSPARK algorithm whose draft config was loaded at target
+        boot; `place_fused_draft` then admits or declines the draft's layer
+        kinds."""
         from sglang.srt.mem_cache.layout.fused_draft import (
             FusedDraftDecision,
             draft_kv_profile,
@@ -971,12 +975,17 @@ class KVCacheConfigurator:
         host_has_fusable_full_pool = (
             self.is_hybrid_swa or self.mambaish_config is not None
         )
+        if self.spec_algorithm.is_eagle():
+            draft_num_layers = aux.draft_kv_num_layers
+        elif self.spec_algorithm.is_dflash_family():
+            draft_num_layers = aux.dflash_draft_num_layers
+        else:
+            draft_num_layers = None
         if not (
             get_memory().enable_unified_memory
             and host_has_fusable_full_pool
             and not self.is_draft_worker
-            and self.spec_algorithm.is_eagle()
-            and aux.draft_kv_num_layers
+            and draft_num_layers
             and aux.draft_model_config is not None
         ):
             return FusedDraftDecision()
@@ -989,8 +998,11 @@ class KVCacheConfigurator:
             )
         profile = draft_kv_profile(
             aux.draft_model_config,
-            num_layers=int(aux.draft_kv_num_layers),
+            num_layers=int(draft_num_layers),
             attn_tp_size=get_parallel().attn_tp_size,
+            # A DFLASH-family draft config inherits the target's NEXTN depth
+            # count; its draft is one block, replicated per runner.
+            num_depths=None if self.spec_algorithm.is_eagle() else 1,
         )
         num_runners = (
             int(get_spec().speculative_num_steps)

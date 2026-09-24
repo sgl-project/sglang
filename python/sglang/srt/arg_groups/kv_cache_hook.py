@@ -489,13 +489,16 @@ _SPEC_VERIFY_AUDITED_BACKENDS = frozenset(
 )
 
 
-def _assert_spec_verify_backends(server_args: Any, *, algorithm: str) -> None:
+def _assert_spec_verify_backends(
+    server_args: Any, *, algorithm: str, allowed: frozenset = None
+) -> None:
     """Refuse target backends whose verify id rails are not translation-audited.
 
     Only the target's prefill/decode pair is checked. A draft with a KV pool
     of its own indexes that pool directly by virtual id, so its translator is
     a passthrough and its backend has nothing to translate."""
-    allowed = _SPEC_VERIFY_AUDITED_BACKENDS
+    if allowed is None:
+        allowed = _SPEC_VERIFY_AUDITED_BACKENDS
     if resolving_view(server_args).dcp_size > 1:
         # flashinfer's spec verify gathers its CSR args with no DCP read
         # translation (`translate_dcp_read_ids`); the MLA verify family builds
@@ -572,11 +575,18 @@ def handle_unified_memory_pool(server_args: Any) -> None:
                 "--enable-unified-memory host-pool decode retraction does not "
                 "support hybrid-Mamba models."
             )
-    assert cfg.speculative_algorithm in (None, "DSPARK", "EAGLE", "EAGLE3"), (
+    assert cfg.speculative_algorithm in (
+        None,
+        "DSPARK",
+        "EAGLE",
+        "EAGLE3",
+        "DFLASH",
+    ), (
         "--enable-unified-memory only supports --speculative-algorithm "
-        "DSPARK (chain draft) and EAGLE/EAGLE3 (fused draft KV); other "
-        "speculative algorithms are not yet audited for the unified pool's "
-        "virtual-to-physical loc translation. Got "
+        "DSPARK (chain draft), DFLASH (fused block draft), and "
+        "EAGLE/EAGLE3 (fused draft KV); other speculative algorithms are "
+        "not yet audited for the unified pool's virtual-to-physical loc "
+        "translation. Got "
         f"--speculative-algorithm={cfg.speculative_algorithm!r}."
     )
     assert cfg.speculative_eagle_topk in (None, 1), (
@@ -591,7 +601,14 @@ def handle_unified_memory_pool(server_args: Any) -> None:
         assert _mc.is_hybrid_swa or mambaish_config(_mc) is not None, (
             "--enable-unified-memory + EAGLE/EAGLE3 requires a unified "
             "target (hybrid-SWA or a mamba hybrid): the draft's KV lives "
-            "fused inside the full-attention page envelope."
+            "fused inside the full-attention page envelope (or falls back "
+            "to a private pool over the unified virtual id space)."
+        )
+        assert cfg.speculative_eagle_topk in (None, 1), (
+            "--enable-unified-memory + EAGLE/EAGLE3 supports a linear "
+            "draft chain only (--speculative-eagle-topk in {None, 1}); "
+            "tree verify is not audited for the unified pool. Got "
+            f"--speculative-eagle-topk={cfg.speculative_eagle_topk!r}."
         )
         # The translated MHA rails. A fused draft is MHA-shaped on every host
         # (its region holds dense K/V rows), and these three also serve a
@@ -621,7 +638,19 @@ def handle_unified_memory_pool(server_args: Any) -> None:
             "Set --speculative-draft-attention-backend to one of them."
         )
     if cfg.speculative_algorithm == "DSPARK":
+        assert cfg.speculative_eagle_topk in (None, 1), (
+            "--enable-unified-memory + DSPARK supports a linear draft "
+            "chain only (--speculative-eagle-topk in {None, 1}); tree "
+            "verify is not audited for the unified pool. Got "
+            f"--speculative-eagle-topk={cfg.speculative_eagle_topk!r}."
+        )
         _assert_spec_verify_backends(server_args, algorithm="DSPARK")
+    if cfg.speculative_algorithm == "DFLASH":
+        _assert_spec_verify_backends(
+            server_args,
+            algorithm="DFLASH",
+            allowed=frozenset({"triton", "fa3", "flashinfer"}),
+        )
     assert not cfg.enable_two_batch_overlap, (
         "--enable-unified-memory does not support --enable-two-batch-overlap: "
         "TBO's replay split hands each child a view without the pre-translate "
@@ -649,15 +678,18 @@ def handle_unified_memory_pool(server_args: Any) -> None:
             "compaction so pending H2D physical reservations remain stable."
         )
     assert not (
-        cfg.speculative_algorithm in ("EAGLE", "EAGLE3")
+        cfg.speculative_algorithm is not None
         and (
-            cfg.enable_hierarchical_cache
+            (
+                cfg.speculative_algorithm in ("EAGLE", "EAGLE3")
+                and cfg.enable_hierarchical_cache
+            )
             or cfg.disaggregation_decode_retraction_backup == "host_pool"
         )
     ), (
-        "--enable-unified-memory + EAGLE/EAGLE3 does not support "
-        "--enable-hierarchical-cache or "
-        "--disaggregation-decode-retraction-backup=host_pool: both build host "
+        "--enable-unified-memory with a draft model does not support "
+        "--disaggregation-decode-retraction-backup=host_pool, nor an "
+        "EAGLE/EAGLE3 draft with --enable-hierarchical-cache: both build host "
         "pools off the draft's device pool, and a draft fused into the "
         "target's entries has no transfer surface of its own (the page "
         "envelope host pool refuses per-layer draft loads)."
