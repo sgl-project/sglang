@@ -29,13 +29,13 @@ This section provides deployment configurations optimized for different hardware
 
 Z-Image-Turbo is optimized for high-quality image generation with only 8 inference steps. The recommended launch configurations vary by hardware.
 
-**Interactive Command Generator**: Use the configuration selector below to automatically generate the appropriate deployment command for your hardware platform.
+**Interactive Command Generator**: Use the configuration selector below to automatically generate the appropriate deployment command for your hardware platform and model version. SGLang supports serving Z-Image-Turbo on NVIDIA B200, H200, H100, and AMD MI355X, MI325X, MI300X GPUs, Ascend A2, A3 NPUs and Intel Arc Pro B-Series GPUs(codename: BMG (Battlemage)).
 
 <ZImageTurboDeployment />
 
 ### 3.2 Configuration Tips
 
-Currently supported optimizations are listed [here](/docs/sglang-diffusion/compatibility_matrix).
+See [Performance Optimization](/docs/sglang-diffusion/performance-optimization) for acceleration features and their runtime requirements.
 
 - `--vae-path`: Path to a custom VAE model or HuggingFace model ID (e.g., fal/FLUX.2-Tiny-AutoEncoder). If not specified, the VAE will be loaded from the main model path.
 - `--num-gpus`: Number of GPUs to use
@@ -189,6 +189,13 @@ sglang serve --model-path Tongyi-MAI/Z-Image-Turbo
 - `--vae-cpu-offload`: Use CPU offload for VAE.
 - `--pin-cpu-memory`: Pin memory for CPU offload. Only added as a temp workaround if it throws "CUDA error: invalid argument".
 
+#### 4.2.3 Known LoRA examples
+
+Use `--lora-path` at startup or the [LoRA management API](/docs/sglang-diffusion/api/openai_api#lora-management) to load an adapter. Known Z-Image-Turbo examples include:
+
+- [`tarn59/pixel_art_style_lora_z_image_turbo`](https://huggingface.co/tarn59/pixel_art_style_lora_z_image_turbo)
+- [`wcde/Z-Image-Turbo-DeJPEG-Lora`](https://huggingface.co/wcde/Z-Image-Turbo-DeJPEG-Lora)
+
 ## 5. Benchmark
 
 Test Environment:
@@ -242,11 +249,11 @@ Test Environment:
     ============================================================
     ```
   </Tab>
-  <Tab title="Ascend A3">
+  <Tab title="Ascend A3 Series">
     **Server Command**:
 
     ```shell Command
-    #One A3 card has 2 npu chips
+    #One A3 Series card has 2 npu chips
     sglang serve --model-path Tongyi-MAI/Z-Image-Turbo --tp-size 2 --sp-degree 1 --num-gpus 2
     ```
 
@@ -322,7 +329,7 @@ Test Environment:
     ============================================================
     ```
   </Tab>
-  <Tab title="Ascend A3">
+  <Tab title="Ascend A3 Series">
     **Benchmark Command**:
 
     ```shell Command
@@ -359,3 +366,9 @@ Test Environment:
     ```
   </Tab>
 </Tabs>
+
+## 6. Run in ComfyUI
+
+import { ComfyUISupport } from '/src/snippets/diffusion/comfyui-support.jsx';
+
+<ComfyUISupport model="z-image" />

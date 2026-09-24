@@ -23,13 +23,54 @@ from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.test.ci.ci_register import register_cuda_ci
 
 # trtllm_mha kernels are sm100-only; run this kernel-unit test on Blackwell.
-register_cuda_ci(est_time=30, stage="base-b", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=16, stage="base-b", runner_config="4-gpu-b200")
 
 DEVICE = "cuda"
 PAGE_SIZE = 128
 
 
+@pytest.mark.parametrize(
+    "max_running_requests,max_draft_tokens,max_cuda_graph_bs,expected",
+    [
+        (32, None, None, 32),
+        (32, 0, 16, 32),
+        (32, 4, 64, 256),
+        (7, 16, 4, 112),
+    ],
+)
+def test_native_nvfp4_output_capacity_includes_verify_width(
+    max_running_requests, max_draft_tokens, max_cuda_graph_bs, expected
+):
+    assert (
+        trtllm_mha_backend._native_fp4_decode_output_capacity(
+            max_running_requests, max_draft_tokens, max_cuda_graph_bs
+        )
+        == expected
+    )
+
+
+@pytest.mark.parametrize(
+    "max_context_len,max_prefill_tokens,chunked_prefill_limit,expected",
+    [
+        (4096, 8192, 0, 8192),
+        (8192, 4096, 0, 8192),
+        (8192, 16384, 2048, 2048),
+    ],
+)
+def test_native_nvfp4_output_capacity_includes_unchunked_batch(
+    max_context_len, max_prefill_tokens, chunked_prefill_limit, expected
+):
+    assert (
+        trtllm_mha_backend._native_fp4_prefill_output_capacity(
+            max_context_len, max_prefill_tokens, chunked_prefill_limit
+        )
+        == expected
+    )
+
+
 def _make_backend_for_hook_test(speculative_num_draft_tokens=None):
+    from sglang.srt.mem_cache.kv_index_translator import KVIndexTranslator
+
     backend = TRTLLMHAAttnBackend.__new__(TRTLLMHAAttnBackend)
     backend.device = torch.device("cpu")
     backend.max_context_len = 1024
@@ -45,8 +86,41 @@ def _make_backend_for_hook_test(speculative_num_draft_tokens=None):
     backend.decode_cuda_graph_metadata = {}
     backend.target_verify_metadata = {}
     backend.draft_extend_metadata = {}
+    # Passthrough source (static pool): every unified-arm branch stays off,
+    # matching the real __init__'s parent binding.
+    backend.kv_index_translator = KVIndexTranslator(
+        req_to_token=backend.req_to_token,
+        token_to_kv_pool_allocator=SimpleNamespace(),
+        token_to_kv_pool=SimpleNamespace(),
+        page_size=PAGE_SIZE,
+        device="cpu",
+    )
     backend.init_cuda_graph_state(max_bs=4, max_num_tokens=16)
     return backend
+
+
+@pytest.mark.parametrize(
+    "uses_genmha,prefill_native,decode_native,forward_mode,expected",
+    [
+        (True, True, True, ForwardMode.EXTEND, True),
+        (True, True, True, ForwardMode.TARGET_VERIFY, True),
+        # Hybrid mode=decode routes target verification into the decode child.
+        (True, False, True, ForwardMode.TARGET_VERIFY, True),
+        (True, False, True, ForwardMode.EXTEND, False),
+        # SM120 XQA has native access metadata but not the physical GenMHA layout.
+        (False, False, True, ForwardMode.TARGET_VERIFY, False),
+    ],
+)
+def test_extend_selects_native_nvfp4_layout_per_call(
+    uses_genmha, prefill_native, decode_native, forward_mode, expected
+):
+    backend = TRTLLMHAAttnBackend.__new__(TRTLLMHAAttnBackend)
+    backend.uses_trtllm_gen_native_fp4 = uses_genmha
+    backend.prefill_uses_native_fp4 = prefill_native
+    backend.decode_uses_native_fp4 = decode_native
+
+    forward_batch = SimpleNamespace(forward_mode=forward_mode)
+    assert backend._forward_extend_uses_native_fp4(forward_batch) is expected
 
 
 def test_cuda_graph_metadata_launch_runs_in_graph_hook(monkeypatch):
@@ -140,6 +214,7 @@ def test_hybrid_wrappers_forward_in_graph_hook():
                 token_to_kv_pool=None,
                 req_to_token_pool=None,
                 needs_cpu_seq_lens=False,
+                kv_index_translator=None,
                 init_forward_metadata_in_graph=lambda fb: calls.append(name),
             )
 
@@ -151,6 +226,7 @@ def test_hybrid_wrappers_forward_in_graph_hook():
                 kv_cache_dtype=torch.bfloat16,
                 token_to_kv_pool=None,
                 req_to_token_pool=None,
+                kv_index_translator=None,
                 server_args=SimpleNamespace(speculative_attention_mode="decode"),
                 model_config=SimpleNamespace(context_len=2048),
             ),
@@ -541,6 +617,67 @@ def test_metadata_correctness(bs, seqlen_offset, q_mode, with_swa, static_width)
         translated = torch.where(loc >= 0, translated, torch.full_like(translated, -1))
         out_ref[:num_real] = translated
         torch.testing.assert_close(swa_out_cache_loc, out_ref, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("pass_tables", [False, True])
+def test_skip_page_table_updates_seqlens_only(pass_tables):
+    """The unified-memory arm: skip_page_table=True must still rebuild the
+    seqlen metadata in-graph but leave every page-table byte alone -- the bound
+    tables are capture-stable read tables the translator refreshes
+    out-of-graph, and an in-graph write would clobber them with virtual-derived
+    pages. Covers both call shapes: page_table=None (what the backend passes)
+    and a real sentinel-filled table (pins that the writes are compiled out,
+    not just unpassed)."""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+
+    bs, seqlen_offset, seed = 5, 1, 4242
+    pool_size, max_num_pages = 64, 16
+    seq_max = (max_num_pages - 2) * PAGE_SIZE
+    (
+        req_to_token,
+        req_pool_indices,
+        seq_lens,
+        _stride,
+        _cap,
+    ) = _build_inputs(bs, pool_size, max_num_pages, None, seq_max, seed)
+
+    cache_seqlens = torch.zeros(bs, dtype=torch.int32, device=DEVICE)
+    cu_seqlens_k = torch.zeros(bs + 1, dtype=torch.int32, device=DEVICE)
+    sentinel_pt = None
+    sentinel_swa = None
+    if pass_tables:
+        sentinel_pt = torch.full(
+            (bs, max_num_pages), 777, dtype=torch.int32, device=DEVICE
+        )
+        sentinel_swa = torch.full(
+            (bs, max_num_pages), 888, dtype=torch.int32, device=DEVICE
+        )
+
+    update_trtllm_mha_graph_metadata(
+        req_pool_indices=req_pool_indices,
+        seq_lens=seq_lens,
+        req_to_token=req_to_token,
+        cache_seqlens=cache_seqlens,
+        cu_seqlens_k=cu_seqlens_k,
+        page_table=sentinel_pt,
+        bs=bs,
+        seqlen_offset=seqlen_offset,
+        max_seq_pages=max_num_pages,
+        page_size=PAGE_SIZE,
+        swa_page_table=sentinel_swa,
+        skip_page_table=True,
+    )
+    torch.cuda.synchronize()
+
+    cache_seqlens_ref = _ref_cache_seqlens(seq_lens, seqlen_offset)
+    torch.testing.assert_close(cache_seqlens, cache_seqlens_ref, rtol=0, atol=0)
+    cu_k_ref = torch.zeros(bs + 1, dtype=torch.int32, device=DEVICE)
+    cu_k_ref[1:] = torch.cumsum(cache_seqlens_ref, dim=0, dtype=torch.int32)
+    torch.testing.assert_close(cu_seqlens_k, cu_k_ref, rtol=0, atol=0)
+    if pass_tables:
+        assert bool((sentinel_pt == 777).all()), "page_table written despite skip"
+        assert bool((sentinel_swa == 888).all()), "swa_page_table written despite skip"
 
 
 def test_bs_zero_noop():

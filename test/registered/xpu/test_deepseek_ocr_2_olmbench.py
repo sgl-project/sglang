@@ -27,6 +27,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
     write_github_step_summary,
 )
+from sglang.test.xpu.test_xpu_utils import write_results_to_github_step_summary
 
 register_xpu_ci(est_time=7200, suite="nightly-xpu-1-gpu", nightly=True)
 
@@ -93,78 +94,94 @@ class TestDeepSeekOCR2OlmBenchXPU(CustomTestCase):
             kill_process_tree(cls.process.pid)
 
     def test_olmocr_bench(self):
-        if not self.bench_dir.exists():
-            self.fail(
-                f"olmOCR-bench data not found at {self.bench_dir}. Download it first:\n"
-                "  hf download --repo-type dataset allenai/olmOCR-bench "
-                "--local-dir ./olmOCR-bench"
-            )
-
-        port = urlparse(self.base_url).port
-        cmd = [
-            sys.executable,
-            str(_REPO_ROOT / "benchmark" / "ocr" / "bench_sglang.py"),
-            "--port",
-            str(port),
-            "--split",
-            self.split,
-            "--concurrency",
-            str(self.concurrency),
-            "--model",
-            self.model,
-            *(["--max-samples", str(self.max_samples)] if self.max_samples > 0 else []),
-            "--bench-dir",
-            str(self.bench_dir),
-            "--output-dir",
-            str(self.output_dir),
-        ]
-
+        model_metrics = {
+            "client": "olmOCR-bench",
+            "accuracy_threshold": self.accuracy,
+        }
         try:
-            subprocess.run(cmd, check=True, cwd=str(_REPO_ROOT))
-        except subprocess.CalledProcessError as e:
-            self.fail(f"olmOCR-bench run failed for {self.model}: {e}")
+            if not self.bench_dir.exists():
+                self.fail(
+                    f"olmOCR-bench data not found at {self.bench_dir}. Download it first:\n"
+                    "  hf download --repo-type dataset allenai/olmOCR-bench "
+                    "--local-dir ./olmOCR-bench"
+                )
 
-        summary_path = self.output_dir / "summary.json"
-        if not summary_path.exists():
-            self.fail(f"Benchmark produced no summary at {summary_path}")
+            port = urlparse(self.base_url).port
+            cmd = [
+                sys.executable,
+                str(_REPO_ROOT / "benchmark" / "ocr" / "bench_sglang.py"),
+                "--port",
+                str(port),
+                "--split",
+                self.split,
+                "--concurrency",
+                str(self.concurrency),
+                "--model",
+                self.model,
+                *(
+                    ["--max-samples", str(self.max_samples)]
+                    if self.max_samples > 0
+                    else []
+                ),
+                "--bench-dir",
+                str(self.bench_dir),
+                "--output-dir",
+                str(self.output_dir),
+            ]
 
-        with open(summary_path, encoding="utf-8") as f:
-            results = json.load(f)
+            try:
+                subprocess.run(cmd, check=True, cwd=str(_REPO_ROOT))
+            except subprocess.CalledProcessError as e:
+                self.fail(f"olmOCR-bench run failed for {self.model}: {e}")
 
-        total_tests = sum(r.get("total_tests", 0) for r in results.values())
-        total_passed = sum(r.get("total_passed", 0) for r in results.values())
-        total_errored = sum(r.get("error_samples", 0) for r in results.values())
-        score = total_passed / total_tests if total_tests else 0.0
+            summary_path = self.output_dir / "summary.json"
+            if not summary_path.exists():
+                self.fail(f"Benchmark produced no summary at {summary_path}")
 
-        lines = [
-            f"## DeepSeek-OCR-2 olmOCR-bench (XPU, concurrency {self.concurrency})",
-            "",
-            "| Split | Tests | Passed | Score | Errored |",
-            "| --- | ---: | ---: | ---: | ---: |",
-        ]
-        for split, r in results.items():
+            with open(summary_path, encoding="utf-8") as f:
+                results = json.load(f)
+
+            total_tests = sum(r.get("total_tests", 0) for r in results.values())
+            total_passed = sum(r.get("total_passed", 0) for r in results.values())
+            total_errored = sum(r.get("error_samples", 0) for r in results.values())
+            score = total_passed / total_tests if total_tests else 0.0
+            model_metrics["accuracy"] = score
+            model_metrics["num_prompts"] = total_tests
+
+            lines = [
+                f"## DeepSeek-OCR-2 olmOCR-bench (XPU, concurrency {self.concurrency})",
+                "",
+                "| Split | Tests | Passed | Score | Errored |",
+                "| --- | ---: | ---: | ---: | ---: |",
+            ]
+            for split, r in results.items():
+                lines.append(
+                    f"| {split} | {r.get('total_tests', 0)} | "
+                    f"{r.get('total_passed', 0)} | {r.get('overall_score', 0.0):.1f}% | "
+                    f"{r.get('error_samples', 0)} |"
+                )
             lines.append(
-                f"| {split} | {r.get('total_tests', 0)} | "
-                f"{r.get('total_passed', 0)} | {r.get('overall_score', 0.0):.1f}% | "
-                f"{r.get('error_samples', 0)} |"
+                f"| **TOTAL** | {total_tests} | {total_passed} | "
+                f"**{100.0 * score:.1f}%** | {total_errored} |"
             )
-        lines.append(
-            f"| **TOTAL** | {total_tests} | {total_passed} | "
-            f"**{100.0 * score:.1f}%** | {total_errored} |"
-        )
-        write_github_step_summary("\n".join(lines) + "\n")
+            write_github_step_summary("\n".join(lines) + "\n")
 
-        # Guard against a silent empty run before comparing the score.
-        self.assertGreater(
-            total_tests, 0, f"olmOCR-bench scored 0 tests for {self.model}"
-        )
-        self.assertGreaterEqual(
-            score,
-            self.accuracy,
-            f"olmOCR-bench aggregate for {self.model} is {100.0 * score:.1f}%, "
-            f"below the {100.0 * self.accuracy:.0f}% threshold "
-            f"({total_errored} samples errored)",
-        )
+            # Guard against a silent empty run before comparing the score.
+            self.assertGreater(
+                total_tests, 0, f"olmOCR-bench scored 0 tests for {self.model}"
+            )
+            self.assertGreaterEqual(
+                score,
+                self.accuracy,
+                f"olmOCR-bench aggregate for {self.model} is {100.0 * score:.1f}%, "
+                f"below the {100.0 * self.accuracy:.0f}% threshold "
+                f"({total_errored} samples errored)",
+            )
+        except Exception as e:
+            model_metrics["error"] = str(e)
+            raise
+        finally:
+            write_results_to_github_step_summary({self.model: model_metrics})
 
 
 if __name__ == "__main__":

@@ -67,9 +67,9 @@ def test_set(eic_client):
     set_opt = eic.SetOption()
     set_opt.ttl_second = 3
     status_code, set_outcome = eic_client.mset(data_keys, data_vals, set_opt)
-    assert (
-        status_code == eic.StatusCode.SUCCESS
-    ), f"Set failed with status code: {status_code}"
+    assert status_code == eic.StatusCode.SUCCESS, (
+        f"Set failed with status code: {status_code}"
+    )
 
 
 def test_get(eic_client):
@@ -87,9 +87,9 @@ def test_get(eic_client):
         )
     get_opt = eic.GetOption()
     status_code, data_vals, get_outcome = eic_client.mget(data_keys, get_opt, data_vals)
-    assert (
-        status_code == eic.StatusCode.SUCCESS
-    ), f"Get failed with status code: {status_code}"
+    assert status_code == eic.StatusCode.SUCCESS, (
+        f"Get failed with status code: {status_code}"
+    )
 
 
 def test_exists(eic_client):
@@ -99,9 +99,9 @@ def test_exists(eic_client):
         data_keys.append(key)
     exists_opt = eic.ExistOption()
     status_code, exists_outcome = eic_client.mexist(data_keys, exists_opt)
-    assert (
-        status_code == eic.StatusCode.SUCCESS
-    ), f"Exists failed with status code: {status_code}"
+    assert status_code == eic.StatusCode.SUCCESS, (
+        f"Exists failed with status code: {status_code}"
+    )
 
 
 def main():

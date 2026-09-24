@@ -20,7 +20,6 @@ from sglang.srt.models.inkling_common.kernels.sconv import (
 from sglang.srt.runtime_context import (
     get_exec,
     get_parallel,
-    mamba_extra_buffer_enabled,
 )
 from sglang.srt.utils import is_cuda, set_weight_attrs
 
@@ -271,7 +270,10 @@ class ShortConvolution(nn.Module):
             draft_token_num = hidden_states.shape[1]
 
         mamba_track_indices = getattr(forward_batch, "mamba_track_indices", None)
-        do_tracking = mamba_track_indices is not None and mamba_extra_buffer_enabled()
+        do_tracking = (
+            mamba_track_indices is not None
+            and get_exec().mamba.enable_mamba_extra_buffer
+        )
 
         crossed = track_step = None
         if do_tracking:

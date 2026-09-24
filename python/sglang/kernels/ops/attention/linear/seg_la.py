@@ -158,7 +158,6 @@ def seg_la_kernel(
 
                 state = state * block_decay + tl.dot(k, v)
             else:
-
                 qk = tl.dot(q, k) * softmax_scale
                 decays = tl.exp(decay_scale * (offs_b[:, None] - offs_b[None, :]))
                 decays = tl.where(offs_b[None, :] <= offs_b[:, None], decays, 0.0)

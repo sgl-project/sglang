@@ -1,5 +1,5 @@
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import List, Optional
 
 import torch
@@ -15,7 +15,9 @@ logger = logging.getLogger(__name__)
 @dataclass
 class EagleVerifyInput(SpecInput):
     draft_token: torch.Tensor
-    custom_mask: torch.Tensor
+    # Keep this dataclass argument required despite SpecInput's None default;
+    # otherwise the required positions field would follow a defaulted field.
+    custom_mask: torch.Tensor = field()
     positions: torch.Tensor
     retrieve_index: torch.Tensor
     retrieve_next_token: torch.Tensor
@@ -315,8 +317,8 @@ class EagleDraftExtendInput(SpecInput):
 
     # Flat per-req index of each request's last accepted window row
     # (i * window + front + num_correct_drafts[i]). When set, the logits
-    # processor runs lm_head only on these rows. None under gathered-buffer
-    # (DP) modes, whose logprob buffer sizing assumes all-row logits.
+    # processor runs lm_head and LAST hidden capture only on these rows; FULL
+    # hidden capture remains unpruned.
     select_index: Optional[torch.Tensor] = None
 
     # None for draft-extend's idle batch; attention backends fall back to

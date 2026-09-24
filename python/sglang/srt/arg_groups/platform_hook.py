@@ -4,17 +4,30 @@
 from __future__ import annotations
 
 import logging
+import os
 from typing import Any
 
 from sglang.srt.arg_groups.overrides import (
     declare_resolution,
+    record_foreign_defaults,
     resolving_view,
 )
 from sglang.srt.hardware_backend.mlx.runtime import use_mlx
 from sglang.srt.model_executor.cuda_graph_config import Backend, Phase, with_phase
-from sglang.srt.utils.common import is_cuda, is_hip, is_host_cpu_arm64, is_npu
+from sglang.srt.runtime_context import get_platform
+from sglang.srt.utils.common import is_host_cpu_arm64
 
 logger = logging.getLogger(__name__)
+
+
+def handle_hardware_runtime_validation(server_args: Any):
+    # `server_args` is accepted, not read: every resolution-hook step takes
+    # it, uniformly, so `run_hook` never has to special-case an arity. The
+    # check below is intentionally independent of `server_args.device`:
+    # setting SGLANG_USE_MLX opts into the MLX backend and must fail
+    # immediately if the environment cannot honor that request. With the
+    # flag unset, use_mlx() remains lazy and does not import MLX.
+    use_mlx()
 
 
 def handle_npu_backends(server_args: Any):
@@ -51,21 +64,64 @@ def handle_mps_backends(server_args: Any):
 
 
 def handle_amd_specifics(server_args: Any):
-    if is_hip():
+    if get_platform().is_hip:
         declare_resolution(
             server_args, "_handle_amd_specifics", triton_attention_num_kv_splits=16
         )
+        # Above this the HIP runtime registers a pageable H2D source with the
+        # GPU rather than staging it, and the MMU notifier on that registration
+        # evicts our KFD queues once per tensor while weights load. In KB.
+        os.environ.setdefault("GPU_PINNED_MIN_XFER_SIZE", str(4 * 1024 * 1024))
 
 
 def handle_nccl_pre_warm(server_args: Any):
     # pre_warm_nccl is only used with CUDA or HIP hardware or NPU hardware
     cfg = resolving_view(server_args)
-    if cfg.pre_warm_nccl and not (is_cuda() or is_hip() or is_npu()):
+    if cfg.pre_warm_nccl and not (
+        get_platform().is_cuda or get_platform().is_hip or get_platform().is_npu
+    ):
         logger.warning(
             "pre_warm_nccl is only applicable for CUDA or HIP hardware or NPU hardware. "
             "Ignoring pre_warm_nccl setting on current hardware."
         )
         declare_resolution(server_args, "_handle_nccl_pre_warm", pre_warm_nccl=False)
+
+
+def handle_platform_defaults(server_args: Any):
+    """An out-of-tree platform's defaults, declared like every rule beside it.
+
+    `Platform.apply_server_args_defaults` is a plugin interface: the platform is
+    handed a configuration and assigns the fields it wants defaulted. In-tree
+    platforms do not implement it -- the base is a no-op and nothing overrides
+    it -- so this captures nothing here and exists for the platforms that live
+    outside this tree.
+
+    Ordering: it must precede `handle_gpu_memory_settings`, whose symm-mem
+    prealloc default keys off `enable_symm_mem`.
+    """
+    # `current_platform` is the plugin object; `get_platform()` is the facts
+    # view over it and carries neither the name nor the hook.
+    from sglang.srt.platforms import current_platform
+
+    record_foreign_defaults(
+        server_args,
+        f"platform:{current_platform.device_name}",
+        current_platform.apply_server_args_defaults,
+    )
+
+
+def handle_symm_mem_device_support(server_args: Any):
+    cfg = resolving_view(server_args)
+    # The symm-mem allocator compiles a CUDA plugin and links -lnccl, so off
+    # CUDA/HIP (e.g. Ascend NPU) it fails deep in a build step rather than here.
+    if cfg.enable_symm_mem and not (get_platform().is_cuda or get_platform().is_hip):
+        logger.warning(
+            "--enable-symm-mem is not supported on non CUDA/HIP devices "
+            "(NCCL symmetric memory is unavailable). Disabling symmetric memory."
+        )
+        declare_resolution(
+            server_args, "_handle_symm_mem_device_support", enable_symm_mem=False
+        )
 
 
 def handle_xpu_backends(server_args: Any):

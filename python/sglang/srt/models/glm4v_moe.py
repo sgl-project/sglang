@@ -6,7 +6,6 @@ import torch
 import torch.nn as nn
 from transformers.models.glm4v_moe.configuration_glm4v_moe import Glm4vMoeConfig
 
-from sglang.srt.distributed.parallel_state import get_pp_group
 from sglang.srt.layers.attention import vision_utils
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe import get_moe_a2a_backend
@@ -40,7 +39,7 @@ class Glm4vMoeForConditionalGeneration(Glm4vForConditionalGeneration):
     ) -> None:
         nn.Module.__init__(self)
 
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
         self.config = config
         self.use_data_parallel = get_mm().mm_enable_dp_encoder
         vision_utils.update_vit_attn_dummy_heads_config(self.config)
@@ -104,9 +103,9 @@ class Glm4vMoeForConditionalGeneration(Glm4vForConditionalGeneration):
         if is_shared_experts_fusion_disabled():
             return
         self.num_fused_shared_experts = self.config.n_shared_experts
-        assert (
-            self.num_fused_shared_experts == 1
-        ), "Only 1 fused shared expert is supported for Glm4vMoeForConditionalGeneration"
+        assert self.num_fused_shared_experts == 1, (
+            "Only 1 fused shared expert is supported for Glm4vMoeForConditionalGeneration"
+        )
         log_info_on_rank0(logger, "Shared experts fusion optimization enabled.")
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]], is_nextn=False):

@@ -1,11 +1,11 @@
 ---
 name: ci-workflow-guide
-description: Guide to SGLang CI workflow orchestration — stage ordering, fast-fail, gating, partitioning, execution modes, and debugging CI failures. Use when modifying CI workflows, adding stages, debugging CI pipeline issues, or understanding how tests are dispatched and gated across stages.
+description: Guide to SGLang CI workflow orchestration — stage ordering, fail-fast, gating, partitioning, execution modes, and debugging CI failures. Use when modifying CI workflows, adding stages, debugging CI pipeline issues, or understanding how tests are dispatched and gated across stages.
 ---
 
 # SGLang CI Workflow Orchestration Guide
 
-This skill covers the CI **infrastructure** layer — how tests are dispatched, gated, and fast-failed across stages. For test authoring (templates, fixtures, registration, model selection), see the [write-sglang-test skill](../write-sglang-test/SKILL.md).
+This skill covers the CI **infrastructure** layer — how tests are dispatched, gated, and aborted on failure across stages. For test authoring (templates, fixtures, registration, model selection), see the [write-sglang-test skill](../write-sglang-test/SKILL.md).
 
 ---
 
@@ -24,9 +24,10 @@ This skill covers the CI **infrastructure** layer — how tests are dispatched, 
 | `.github/workflows/pr-test.yml` | Main workflow — all stages, jobs, conditions, matrix definitions |
 | `.github/workflows/pr-test-extra.yml` | Extra workflow — gated by BOTH `run-ci` and `run-ci-extra` labels |
 | `.github/workflows/pr-gate.yml` | PR gating: draft check, `run-ci` label, per-user rate limiting |
-| `.github/actions/check-pr-test-health/action.yml` | Cross-job fast-fail: queries API for any failed job |
+| `.github/actions/check-pr-test-health/action.yml` | Cross-job fail-fast: queries API for any failed job |
 | `.github/actions/wait-for-jobs/action.yml` | Stage gating: polls API until stage jobs complete |
 | `.github/actions/check-maintenance/action.yml` | Maintenance mode check |
+| `.github/scripts/ci-labels.cjs` | Resolves the four CI control labels into dispatch axes |
 | `test/run_suite.py` | Suite runner: collects, filters, partitions, executes tests |
 | `python/sglang/test/ci/ci_register.py` | Test registration (AST-parsed markers), LPT auto-partition |
 | `python/sglang/test/ci/ci_utils.py` | `run_unittest_files()`: execution, retry, continue-on-error |
@@ -113,21 +114,21 @@ This skill covers the CI **infrastructure** layer — how tests are dispatched, 
  └─────────────────────────────────────┘
 ```
 
-**Every stage test job** includes a `check-pr-test-health` step after checkout — if any job in the run has already failed, the job fast-fails (red X) with a root cause annotation.
+**Every stage test job** includes a `check-pr-test-health` step after checkout — if any job in the run has already failed, the job fails fast (red X) with a root cause annotation.
 
-**Scheduled runs** skip `wait-for-base-*` jobs, running all stages in parallel. Fast-fail is also disabled.
+**Scheduled runs** skip `wait-for-base-*` jobs, running all stages in parallel. Fail-fast is also disabled.
 
 ---
 
-## Fast-Fail Layers
+## Fail-Fast Layers
 
-4 layers of fast-fail, from fine to coarse:
+4 layers of fail-fast, from fine to coarse:
 
 | Layer | Mechanism | Granularity | Disabled on schedule? |
 |-------|-----------|-------------|----------------------|
 | **1. Test method → file** | `unittest -f` (failfast) | One test method fails → entire test file stops immediately | Yes |
 | **2. File → suite** | `run_unittest_files()` default | One test file fails → entire suite stops (`--continue-on-error` off) | Yes |
-| **3. Job → job (same stage)** | `check-pr-test-health` action | One job fails → other waiting jobs in same stage fast-fail (red X) | Yes |
+| **3. Job → job (same stage)** | `check-pr-test-health` action | One job fails → other waiting jobs in same stage fail-fast (red X) | Yes |
 | **4. Stage → stage (cross-stage)** | `wait-for-base-*` + `needs` | Base A fails → base B/C jobs skip entirely (never get a runner) | Yes (wait jobs skipped) |
 
 - **Layer 1**: `-f` flag appended to all `python3 -m pytest` / `unittest` invocations in `ci_utils.py`
@@ -142,12 +143,17 @@ This skill covers the CI **infrastructure** layer — how tests are dispatched, 
 | Aspect | PR (`pull_request`) | Scheduled (`cron`, every 6h) | Manual dispatch (`workflow_dispatch`) |
 |--------|---------------------|------------------------------|--------------------------------------|
 | **Stage ordering** | Sequential: A → B → C via `wait-for-base-*` | Parallel (all at once) | Single target stage only |
-| **Cross-job fast-fail** | Yes (`check-pr-test-health`) | Yes | Yes |
+| **Cross-job fail-fast** | Yes (`check-pr-test-health`) | Yes | Yes |
 | **continue-on-error** | No (stop at first failure within suite) | Yes (run all tests) | No |
 | **Retry** | Enabled | Enabled | Enabled |
-| **max_parallel** | 3 (default), 14 if `high priority` label | 14 | 3 (default), 14 if `high priority` |
+| **max_parallel** | 3 (default), 14 if `max-concurrency` label | 14 | 3 (default), 14 if `max-concurrency` |
 | **PR gate** | Yes (draft, label, rate limit) | Skipped | Skipped |
-| **Concurrency** | `cancel-in-progress: true` per branch | Queue (no cancel) | Isolated per stage+SHA |
+| **Concurrency** | `cancel-in-progress: true` per PR | Queue (no cancel) | Isolated per stage+SHA |
+
+Four labels relax these limits for one PR: `bypass-fail-fast`, `parallel-stages`,
+`max-concurrency`, and `highest-priority` (all three). `.github/scripts/ci-labels.cjs`
+resolves them; the [contribution guide](https://docs.sglang.io/developer_guide/contribution_guide.html#ci-control-labels)
+describes what each one does.
 
 ---
 
@@ -158,7 +164,7 @@ This skill covers the CI **infrastructure** layer — how tests are dispatched, 
 **How it works:**
 1. Calls `listJobsForWorkflowRun` to list all jobs in the current run
 2. Matches jobs by exact name or prefix (for matrix jobs, e.g., `base-b-test-1-gpu-small (3)`)
-3. If any matched job has `conclusion === 'failure'` → fail immediately (fast-fail)
+3. If any matched job has `conclusion === 'failure'` → fail immediately (fail-fast)
 4. If all matched jobs are completed and count matches `expected_count` → success
 5. Otherwise → sleep `poll-interval-seconds` (default: 60s) and retry
 6. Timeout after `max-wait-minutes` (240 min for base-a, 480 min for base-b)
@@ -179,7 +185,7 @@ This skill covers the CI **infrastructure** layer — how tests are dispatched, 
 
 ---
 
-## Cross-Job Fast-Fail (`check-pr-test-health` action)
+## Cross-Job Fail-Fast (`check-pr-test-health` action)
 
 Composite action called after checkout in every stage test job (21 jobs total across `pr-test.yml`, `pr-test-multimodal-gen.yml`, `pr-test-sgl-kernel.yml`, `pr-test-jit-kernel.yml`).
 
@@ -189,7 +195,7 @@ Composite action called after checkout in every stage test job (21 jobs total ac
 3. If root cause failures found → calls `core.setFailed()` with the list of root cause job names
 4. If none → does nothing (step succeeds)
 
-**Cascade filtering**: When job A fast-fails due to health check, it also has `conclusion: failure`. Without filtering, job B would list both the original failure AND job A's fast-fail. The filter checks each failed job's `steps` array — if the failing step name contains `check-pr-test-health` or `Check PR test health`, it's excluded from the root cause list.
+**Cascade filtering**: When job A fails fast due to the health check, it also has `conclusion: failure`. Without filtering, job B would list both the original failure AND job A's fail-fast. The filter checks each failed job's `steps` array — if the failing step name contains `check-pr-test-health` or `Check PR test health`, it's excluded from the root cause list.
 
 **Usage pattern:**
 ```yaml
@@ -210,11 +216,11 @@ steps:
 
 **Visual effect**: Job shows **red X** (failure) with error annotation showing root cause job names. Subsequent steps are naturally skipped (default `if: success()` is false after a failed step). No per-step `if` guards needed.
 
-**No stage filtering**: Checks ALL jobs in the run, not just the current stage. Any failure anywhere triggers fast-fail.
+**No stage filtering**: Checks ALL jobs in the run, not just the current stage. Any failure anywhere triggers fail-fast.
 
 **Error message example:**
 ```
-Fast-fail: skipping — root cause job(s): base-b-test-1-gpu-small (0), base-b-test-1-gpu-small (1)
+Fail-fast: skipping — root cause job(s): base-b-test-1-gpu-small (0), base-b-test-1-gpu-small (1)
 ```
 
 ---
@@ -388,6 +394,8 @@ group: pr-test-{event_name}-{branch}-{pr_sha}-{stage}
 | `/rerun-failed-ci` | Reruns failed jobs in the latest workflow run |
 | `/tag-and-rerun-ci` | Adds `run-ci` label + reruns failed |
 | `/tag-and-rerun-ci extra` | Adds both `run-ci` and `run-ci-extra` labels + reruns failed |
+| `/run-full-ci` | Short form of `/tag-and-rerun-ci extra` (baseline + extra). Alias: `/rerun-full-ci` |
+| `/run-extra-ci` | Adds both labels + reruns **only** `PR Test Extra`, leaving baseline runs alone. Alias: `/rerun-extra-ci` |
 | `/rerun-test <test-file> [<test-file> ...]` | Reruns specific test file(s) via `rerun-test.yml`. A file arg containing a glob metacharacter (`*`, `?`, `[...]`) expands against `test/registered/` and the multimodal test dir to every matching `test_*.py` (e.g. `/rerun-test test_*backend*.py` — wrap in backticks so GitHub doesn't italicize the `*`); matches are deduped, grouped by dispatch shape, and can't carry a `::test` selector. No match → single ⛔ reply, nothing dispatched. Each reply echoes its originating command (`Results for …`) so concurrent commands stay distinguishable |
 | `/rerun-group <group> [<group> ...]` | Expands registered test groups, then reuses `/rerun-test` |
 
