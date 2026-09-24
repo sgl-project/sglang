@@ -29,8 +29,8 @@ from sglang.multimodal_gen.runtime.utils.vision import load_image
 class MingImageEncodingStage(TextEncodingStage):
     def __init__(self, text_encoders, tokenizers):
         super().__init__(text_encoders, tokenizers)
-        self.image_processor = Qwen2VLImageProcessor(
-            min_pixels=56 * 56, max_pixels=1024 * 28 * 28
+        self.image_processor = Qwen2VLImageProcessor.from_pretrained(
+            tokenizers[0].name_or_path
         )
 
     @torch.no_grad()
