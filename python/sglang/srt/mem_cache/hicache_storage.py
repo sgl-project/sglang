@@ -48,15 +48,6 @@ class HiCacheStorageExtraInfo:
     extra_info: Optional[dict] = None
 
 
-@dataclass(frozen=True)
-class PrefetchTimeoutConfig:
-    """Knobs for the linear prefetch-timeout policy used by HiCache."""
-
-    base: float = 2.0  # seconds, fixed overhead unrelated to token count
-    per_ki_token: float = 0.1  # seconds per 1024 tokens
-    max: float = 30.0  # seconds, upper bound for the linear timeout
-
-
 class PoolName(str, Enum):
     """Well-known pool names used as PoolTransfer/PoolEntry identifiers."""
 
@@ -465,13 +456,6 @@ class HiCacheFile(HiCacheStorage):
         if component_name is None or component_name in ("__default__", PoolName.KV):
             return self._get_suffixed_key(key)
         return self._get_suffixed_key(f"{key}.{component_name}")
-
-    def _get_component_path(
-        self, key: str, component_name: Optional[str] = None
-    ) -> str:
-        return os.path.join(
-            self.file_path, f"{self._get_component_key(key, component_name)}.bin"
-        )
 
     def _scan_existing_files_to_metadata_cache(self) -> None:
         try:

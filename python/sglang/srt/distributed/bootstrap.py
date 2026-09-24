@@ -24,7 +24,10 @@ from sglang.srt.distributed.parallel_state import (
     set_torch_symm_mem_all_reduce,
 )
 from sglang.srt.environ import envs
-from sglang.srt.layers.dp_attention import initialize_dp_attention
+from sglang.srt.layers.dp_attention import (
+    init_dp_gathered_buffer,
+    initialize_dp_attention,
+)
 from sglang.srt.layers.layernorm_sp import initialize_layernorm_sp
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import (
@@ -90,7 +93,6 @@ def _bind_threads_if_cpu(*, device: str) -> "Optional[List[int]]":
 def init_parallel_runtime(
     *,
     server_args: ServerArgs,
-    model_config: ModelConfig,
     device: str,
     dist_port: int,
 ) -> None:
@@ -140,8 +142,6 @@ def init_parallel_runtime(
     parallel = get_parallel()
     if device == "cpu":
         _init_cpu_threads_env(
-            tp_size=parallel.tp_size,
-            tp_rank=parallel.tp_rank,
             local_omp_cpuid=local_omp_cpuid,
             dist_init_method=dist_init_method,
         )
@@ -150,7 +150,6 @@ def init_parallel_runtime(
         backend=backend,
         dist_init_method=dist_init_method,
         server_args=server_args,
-        model_config=model_config,
         gpu_id=get_device().gpu_id,
     )
 
@@ -159,11 +158,7 @@ def init_parallel_runtime(
     if get_exec().comm.pre_warm_nccl and (
         parallel.tp_size > 1 or parallel.pp_size > 1 or parallel.moe_ep_size > 1
     ):
-        _prewarm_nccl(
-            tp_size=parallel.tp_size,
-            pp_size=parallel.pp_size,
-            moe_ep_size=parallel.moe_ep_size,
-        )
+        _prewarm_nccl()
 
     # CUDA graph capture enables the PyNCCL communicator for TP LM-head
     # all-to-all. Exercise that exact send/recv path before measuring
@@ -241,8 +236,12 @@ def _set_all_reduce_flags() -> None:
     set_custom_all_reduce(not get_exec().comm.disable_custom_all_reduce)
     set_mscclpp_all_reduce(get_exec().comm.enable_mscclpp)
     set_torch_symm_mem_all_reduce(get_exec().comm.enable_torch_symm_mem)
+    from sglang.srt.layers.flashinfer_comm_fusion import uses_cutedsl_ar_fusion
+
     set_flashinfer_allreduce_only(
         get_exec().comm.flashinfer_allreduce_fusion_backend is not None
+        # cutedsl has no legacy workspace for tagged groups to reduce over.
+        and not uses_cutedsl_ar_fusion()
     )
 
 
@@ -261,17 +260,16 @@ def _set_shm_master_env(dist_init_method: Optional[str]) -> None:
 
 def _init_cpu_threads_env(
     *,
-    tp_size: int,
-    tp_rank: int,
     local_omp_cpuid: Optional[List[int]],
     dist_init_method: Optional[str] = None,
 ) -> None:
     if _is_cpu_amx_available or _is_cpu_arm64:
+        parallel = get_parallel()
         # Bind OpenMP threads to CPU cores
         torch.ops.sgl_kernel.init_cpu_threads_env(local_omp_cpuid)
 
         # Set local size to hint SGLang to use shared memory based AllReduce
-        os.environ["LOCAL_SIZE"] = str(tp_size)
+        os.environ["LOCAL_SIZE"] = str(parallel.tp_size)
 
         # shm.cpp names its /dev/shm segments from MASTER_ADDR/MASTER_PORT.
         # Feed each engine's unique dist_init_method (tcp://host:port) into
@@ -279,7 +277,7 @@ def _init_cpu_threads_env(
         # don't collide.
         _set_shm_master_env(dist_init_method)
 
-        torch.ops.sgl_kernel.initialize(tp_size, tp_rank)
+        torch.ops.sgl_kernel.initialize(parallel.tp_size, parallel.tp_rank)
 
     else:
         logger.warning(
@@ -292,7 +290,6 @@ def _init_parallel_groups(
     backend: str,
     dist_init_method: str,
     server_args: ServerArgs,
-    model_config: ModelConfig,
     gpu_id: int,
 ) -> None:
     parallel = get_parallel()
@@ -327,16 +324,19 @@ def _init_parallel_groups(
         max_world_size=None if is_scale_joiner else get_parallel().max_ep_size,
     )
     _tag_groups_for_flashinfer_allreduce_only()
-    initialize_dp_attention(
-        server_args=server_args,
-        model_config=model_config,
-    )
-    initialize_layernorm_sp(model_config=model_config)
+    initialize_dp_attention(server_args=server_args)
     if is_npu():
         register_sgl_tp_rank(gpu_id)
 
 
-def _prewarm_nccl(*, tp_size: int, pp_size: int, moe_ep_size: int) -> None:
+def init_layer_runtime(*, model_config: ModelConfig) -> None:
+    """Size the DP gathered buffer and resolve layernorm SP from the model."""
+    init_dp_gathered_buffer(model_config)
+    initialize_layernorm_sp(model_config=model_config)
+
+
+def _prewarm_nccl() -> None:
+    parallel = get_parallel()
     warmup_start = time.perf_counter()
     tp_group_handle = get_tp_group().device_group
 
@@ -348,7 +348,8 @@ def _prewarm_nccl(*, tp_size: int, pp_size: int, moe_ep_size: int) -> None:
     warmup_elapsed = time.perf_counter() - warmup_start
     logger.info(
         f"NCCL/RCCL/HCCL warmup completed in {warmup_elapsed:.3f}s "
-        f"(tp_size={tp_size}, pp_size={pp_size}, ep_size={moe_ep_size})"
+        f"(tp_size={parallel.tp_size}, pp_size={parallel.pp_size}, "
+        f"ep_size={parallel.moe_ep_size})"
     )
 
 

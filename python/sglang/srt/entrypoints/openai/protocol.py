@@ -908,6 +908,7 @@ class ChatCompletionRequest(OpenAISglangRoutingFields):
     return_input_ids_in_sglext: bool = False
     return_output_ids_in_sglext: bool = False
     return_sampling_mask: bool = False
+    sampling_logprobs_mode: Optional[Literal["selected", "support"]] = None
     reasoning_effort: ReasoningEffortType = Field(
         default=None,
         description="Constrains effort on reasoning for reasoning models. "
@@ -1399,10 +1400,12 @@ class ScoringRequest(BaseModel):
     item_embed_overrides: Optional[List[Optional[List[List[float]]]]] = (
         None  # [num_items][num_item_embed_overrides][hidden_size]
     )
-    label_token_ids: Optional[List[int]] = (
-        None  # Token IDs to compute probabilities for
+    label_token_ids: Optional[Union[List[int], List[List[int]]]] = (
+        None  # shared candidates or one candidate list per item
     )
     apply_softmax: bool = False
+    temperature: float = Field(default=1.0, gt=0, allow_inf_nan=False)
+    return_token_logprobs: bool = False
     item_first: bool = False
     return_pooled_hidden_states: bool = False
     model: str = DEFAULT_MODEL_NAME
@@ -1413,6 +1416,7 @@ class ScoringResponse(BaseModel):
         List[float]
     ]  # List of lists of probabilities, each in the order of label_token_ids
     pooled_hidden_states: Optional[List[Optional[List[float]]]] = None
+    token_logprobs: Optional[List[List[float]]] = None
     model: str
     usage: Optional[UsageInfo] = None
     object: str = "scoring"

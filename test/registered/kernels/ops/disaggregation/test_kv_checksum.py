@@ -198,6 +198,9 @@ class _FakeScheduler(SchedulerDisaggregationDecodeMixin):
         self.metrics_reporter = SimpleNamespace(enable_metrics=True)
         self.metrics_collector = Mock()
         self.streamed_aborts = []
+        self.ngram_embedding_manager = Mock()
+        self.chunked_req = None
+        self.future_map = None
 
     def stream_output(self, reqs, return_logprob):
         self.streamed_aborts.extend(reqs)
@@ -258,32 +261,43 @@ class TestGetNewPrebuiltBatchChecksum(unittest.TestCase):
         return _FakeScheduler(computer, self.req_to_token)
 
     def _run_once(self, sched, batch_ret=None):
+        batch = Mock(reqs=sched.waiting_queue) if batch_ret is None else batch_ret
+        batch.is_empty.side_effect = lambda: not batch.reqs
+
+        def filter_batch(*, keep_indices):
+            batch.reqs = [batch.reqs[i] for i in keep_indices]
+
+        batch.filter_batch.side_effect = filter_batch
+        sched.waiting_queue = []
         running_batch = SimpleNamespace()
         with patch.object(
             SchedulerDisaggregationDecodeMixin,
             "_get_new_prebuilt_batch",
-            lambda s, rb: batch_ret,
+            lambda s, rb: batch,
         ):
             return sched.get_new_prebuilt_batch(running_batch)
 
     def test_match_keeps_req(self):
         sched = self._make_sched(_SENTINEL)
         sched.waiting_queue = [_make_req(self.true_chksum, self.num_pages)]
-        self._run_once(sched)
-        self.assertEqual(len(sched.waiting_queue), 1)
+        batch = self._run_once(sched)
+        self.assertEqual(len(batch.reqs), 1)
         self.assertEqual(sched.streamed_aborts, [])
 
     def test_mismatch_aborts(self):
         sched = self._make_sched(_SENTINEL)
         req = _make_req(0xDEADBEEF, self.num_pages)
-        sched.waiting_queue = [req]
+        valid = _make_req(self.true_chksum, self.num_pages, rid="valid")
+        sched.waiting_queue = [req, valid]
         with (
             envs.SGLANG_IS_IN_CI.override(False),
             patch("sglang.srt.disaggregation.decode.prepare_abort") as mock_abort,
             patch("sglang.srt.disaggregation.decode.release_kv_cache") as mock_release,
         ):
-            self._run_once(sched)
-            self._run_once(sched)
+            batch = self._run_once(sched)
+            self.assertIsNone(self._run_once(sched))
+        self.assertEqual(batch.reqs, [valid])
+        batch.process_prebuilt.assert_called_once_with(sched.future_map)
         self.assertEqual(sched.waiting_queue, [])
         self.assertEqual(sched.streamed_aborts, [req])
         mock_abort.assert_called_once()
@@ -310,8 +324,8 @@ class TestGetNewPrebuiltBatchChecksum(unittest.TestCase):
             patch("sglang.srt.disaggregation.decode.prepare_abort") as mock_abort,
             patch("sglang.srt.disaggregation.decode.release_kv_cache") as mock_release,
         ):
-            self._run_once(sched)
-        self.assertEqual(sched.waiting_queue, [req])
+            batch = self._run_once(sched)
+        self.assertEqual(batch.reqs, [req])
         self.assertEqual(sched.streamed_aborts, [])
         mock_abort.assert_not_called()
         mock_release.assert_not_called()
@@ -320,22 +334,21 @@ class TestGetNewPrebuiltBatchChecksum(unittest.TestCase):
         sched = self._make_sched(_SENTINEL)
         req = _make_req(self.true_chksum, self.num_pages)
         sched.waiting_queue = [req]
-        self._run_once(sched)
-        self._run_once(sched)
-        self.assertEqual(sched.waiting_queue, [req])
+        batch = self._run_once(sched)
+        sched.waiting_queue = batch.reqs
+        self.assertEqual(self._run_once(sched).reqs, [req])
         self.assertEqual(sched.streamed_aborts, [])
 
     def test_disabled_delegates_to_batch_builder(self):
         sched = self._make_sched(computer=None)
         sched.waiting_queue = [_make_req(0xABCD, 4)]
-        sentinel = object()
+        sentinel = Mock(reqs=sched.waiting_queue)
         self.assertIs(self._run_once(sched, batch_ret=sentinel), sentinel)
 
     def test_zero_expected_skips_checksum(self):
         sched = self._make_sched(_SENTINEL)
         sched.waiting_queue = [_make_req(0, self.num_pages)]
-        self._run_once(sched)
-        self.assertEqual(len(sched.waiting_queue), 1)
+        self.assertEqual(len(self._run_once(sched).reqs), 1)
 
 
 _SENTINEL = object()
