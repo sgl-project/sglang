@@ -762,6 +762,14 @@ class Envs:
     # to consumption so eviction cannot waste the fetch. Cap = fraction of
     # the pool the pins may hold; 0 disables pinning.
     SGLANG_HICACHE_BUFFER_ANCHOR_LOCK_CAP = EnvFloat(0.5)
+    # L3 storage fault isolation (per direction: reads vs writes). After this
+    # many consecutive failed storage operations, stop issuing new L3 I/O in
+    # that direction for the cool-down; 0 disables the breaker.
+    SGLANG_HICACHE_STORAGE_BREAKER_FAILURES = EnvInt(5)
+    SGLANG_HICACHE_STORAGE_BREAKER_COOLDOWN_S = EnvFloat(300.0)
+    # Skip (but still ack) L3 backups while this many are already queued, so
+    # a slow store cannot pin host pages without bound; 0 means unbounded.
+    SGLANG_HICACHE_STORAGE_BACKUP_BACKLOG_LIMIT = EnvInt(0)
     SGLANG_HICACHE_NIXL_BACKEND_STORAGE_DIR = EnvStr(None)
     # Enable O_DIRECT when opening NIXL POSIX backend files (bypasses OS page cache).
     # Disable with SGLANG_HICACHE_NIXL_USE_DIRECT_IO=0 or via the

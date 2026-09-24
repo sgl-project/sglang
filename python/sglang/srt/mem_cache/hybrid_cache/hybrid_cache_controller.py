@@ -1120,8 +1120,10 @@ class HybridCacheController(BaseHiCacheController):
         # (IO failure, timeout, TP mismatch), skip extra IO entirely to avoid
         # data misalignment.
         pool_hits: dict[str, int] = {}
-        if not operation.is_terminated() and kv_completed_pages == len(
-            operation.hash_value
+        if (
+            not operation.is_terminated()
+            and kv_completed_pages == len(operation.hash_value)
+            and self._storage_breaker("read").allow()
         ):
             # KV-derived sidecar pools are handled in CacheController._page_transfer_kv_batch.
             # Only handle non-KV-derived sidecar pools here.
@@ -1139,10 +1141,16 @@ class HybridCacheController(BaseHiCacheController):
             self._sync_trailing_keys(transfers_nonkv, sidecar_hashes, sidecar_hit_pages)
             self._resolve_sidecar_nonkv_derived_pool_transfers(operation)
             extra_info = HiCacheStorageExtraInfo(prefix_keys=operation.prefix_keys)
-            results = self.storage_backend.batch_get_v2(
-                transfers_nonkv, extra_info=extra_info
-            )
-            pool_hits = count_pool_hits(results)
+            try:
+                results = self.storage_backend.batch_get_v2(
+                    transfers_nonkv, extra_info=extra_info
+                )
+                pool_hits = count_pool_hits(results)
+                self._storage_breaker("read").record_success()
+            except Exception as e:
+                # Zero sidecar hits; the ack below is still emitted.
+                self._storage_breaker("read").record_failure("sidecar read", e)
+                pool_hits = {}
         # Emit PrefetchAck to prefetch_sync_queue, even the operation has been canceled by the
         # scheduler thread.  The prefetch sync thread expects the same number of PrefetchAck objects
         # to perform all_reduce.
@@ -1247,7 +1255,17 @@ class HybridCacheController(BaseHiCacheController):
                 operation = self.backup_queue.get(block=True, timeout=1)
                 if operation is None:
                     continue
-                self._page_backup(operation)
+                # With backup_skip, only rank-sharded sidecars are written; an
+                # operation without any has nothing to write, so a zero
+                # completed_tokens is not a failed write.
+                self._guarded_page_backup(
+                    operation,
+                    count_short_write=not self.backup_skip
+                    or any(
+                        self.should_backup(t) for t in operation.pool_transfers or []
+                    ),
+                )
+                # Always ack: the ack is what unpins the host pages.
                 self.ack_backup_queue.put(operation)
             except Empty:
                 continue
