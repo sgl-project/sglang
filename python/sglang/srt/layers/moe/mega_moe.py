@@ -432,7 +432,7 @@ def _transpose_mega_moe_sf_for_utccp(sf: torch.Tensor) -> torch.Tensor:
 
 
 def build_mega_moe_experts_weights(experts) -> None:
-    from deep_gemm import (
+    from sglang.srt.layers.deep_gemm_wrapper import (
         transform_sf_into_required_layout,
     )
 

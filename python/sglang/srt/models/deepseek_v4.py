@@ -5141,7 +5141,9 @@ class DeepseekV4ForCausalLM(nn.Module):
 
     def _setup_fp8_wo_a_scales(self, is_nextn: bool) -> None:
         if _FP8_WO_A_UE8M0:
-            from deep_gemm import transform_sf_into_required_layout
+            from sglang.srt.layers.deep_gemm_wrapper import (
+                transform_sf_into_required_layout,
+            )
 
         if is_nextn:
             layers = [self.model.decoder]

@@ -2034,7 +2034,9 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                     return
 
                 if deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0 and will_use_deepgemm:
-                    from deep_gemm import transform_sf_into_required_layout
+                    from sglang.srt.layers.deep_gemm_wrapper import (
+                        transform_sf_into_required_layout,
+                    )
 
                     for scale_param, weight_param in [
                         (layer.w13_weight_scale_inv, layer.w13_weight),

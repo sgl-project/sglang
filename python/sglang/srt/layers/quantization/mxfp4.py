@@ -644,7 +644,9 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             return
 
         if self.use_deep_gemm or self.use_mega_moe:
-            from deep_gemm import transform_sf_into_required_layout
+            from sglang.srt.layers.deep_gemm_wrapper import (
+                transform_sf_into_required_layout,
+            )
 
             # Packed fp4 (e2m1 x2 per byte) weights: DeepGEMM expects int8.
             layer.w13_weight.data = layer.w13_weight.data.view(torch.int8)
