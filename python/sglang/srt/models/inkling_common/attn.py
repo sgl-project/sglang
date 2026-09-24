@@ -6,6 +6,9 @@ from functools import cache
 import torch
 from torch import nn
 
+from sglang.kernels.ops.attention.flash_attn.cute.batch_invariance import (
+    is_batch_invariant,
+)
 from sglang.kernels.ops.attention.inkling_rel_proj import rel_proj_small_t
 from sglang.kernels.ops.attention.inkling_row_scale import row_compact_bf16
 from sglang.kernels.ops.attention.log_scaling_tau import (
@@ -30,9 +33,11 @@ from sglang.srt.models.inkling_common.norm import RMSNorm
 from sglang.srt.models.inkling_common.sconv import SconvType, ShortConvolution
 from sglang.srt.models.utils import apply_qk_norm
 from sglang.srt.runtime_context import (
+    attention_backends,
     get_exec,
     get_model,
     get_parallel,
+    get_spec,
 )
 from sglang.srt.utils import add_prefix, get_current_device_stream_fast
 
@@ -103,6 +108,30 @@ _REL_PROJ_MATMUL_MAX_T = 48
 # the kernel's launch floor loses -- there is no hidden copy to remove at
 # t=1 (r is contiguous).
 _REL_PROJ_TAU_KERNEL_MAX_T = 32
+
+
+def serving_attention_backend(forward_batch: ForwardBatch) -> str:
+    """The pair member serving this forward.
+
+    Mirrors ``HybridAttnBackend._select_backend`` exactly: decode for
+    decode/idle, the ``speculative_attention_mode`` half for target-verify,
+    prefill otherwise -- including draft-extend, which the hybrid dispatcher
+    routes through its prefill branch. The pair the runner stamped on its
+    backend wins over the configured one, so a draft runner answers with its
+    own backend.
+    """
+    from sglang.srt.model_executor.forward_context import get_attn_backend
+
+    backend = get_attn_backend()
+    configured_prefill, configured_decode = attention_backends()
+    prefill = backend.prefill_attention_backend_str or configured_prefill
+    decode = backend.decode_attention_backend_str or configured_decode
+    mode = forward_batch.forward_mode
+    if mode.is_decode_or_idle():
+        return decode
+    if mode.is_target_verify():
+        return decode if get_spec().speculative_attention_mode == "decode" else prefill
+    return prefill
 
 
 def _rel_proj_kernel_eligible(r: torch.Tensor) -> bool:
@@ -735,7 +764,9 @@ class InklingAttention(nn.Module):
 
         apply_log_scaling = log_scaling_tau is not None and not self.is_local
 
-        attention_backend = get_exec().kernel.attention_backend
+        # The kwargs below must describe the backend `self.attn` dispatches
+        # this forward to.
+        attention_backend = serving_attention_backend(forward_batch)
         assert attention_backend in ("fa4", "triton")
         # The overlap threads a CUDA event into the FA4 sheared-bias kernel, so it
         # is FA4-only for now.
@@ -915,7 +946,15 @@ class InklingAttention(nn.Module):
             # stay bf16 here and the MXFP8 pool's set_kv_buffer quantizes and
             # stores them in one fused kernel (absent descales signal it).
 
-        if envs.SGLANG_OPT_USE_INKLING_SHEARED_BIAS.get() and fa4:
+        # The sheared-bias kernel is not batch invariant: its bias tile geometry
+        # follows the query count, so the same absolute (q, k) pair accumulates in
+        # a different order for a few-query decode step than for a many-query
+        # prefill. Deterministic mode takes the score_mod path instead.
+        if (
+            envs.SGLANG_OPT_USE_INKLING_SHEARED_BIAS.get()
+            and fa4
+            and not is_batch_invariant()
+        ):
             # FA4 sheared-bias kernel: pass rel_logits directly; the kernel shears
             # it into a column-aligned pre-softmax bias.
             attn_output = self.attn(

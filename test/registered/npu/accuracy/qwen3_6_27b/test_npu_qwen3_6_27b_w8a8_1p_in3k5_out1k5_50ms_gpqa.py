@@ -9,10 +9,9 @@ from sglang.test.ascend.e2e.test_npu_performance_utils import (
 from sglang.test.ci.ci_register import register_npu_ci
 
 register_npu_ci(
-    est_time=3600,
-    suite="full-2-npu-a3",
+    est_time=8400,
+    suite="nightly-acc-2-npu-a3",
     nightly=True,
-    disabled="accuracy testcase",
 )
 
 QWEN3_6_27B_3K5_1K5_ENVS = {
@@ -49,7 +48,7 @@ QWEN3_6_27B_3K5_1K5_OTHER_ARGS = [
     74,
     "--mem-fraction-static",
     0.7,
-    "--cuda-graph-bs",
+    "--cuda-graph-bs-decode",
     2,
     8,
     16,
@@ -87,9 +86,10 @@ class TestNPUQwen3_6_27B_1P_In3k5_Out1k5_gpqa(TestNpuAccuracyTestCaseBase):
     envs = QWEN3_6_27B_3K5_1K5_ENVS
     other_args = QWEN3_6_27B_3K5_1K5_OTHER_ARGS
     accuracy = 0.878
+    max_retries = 1
     datasets = ["gpqa_diamond"]
     few_shot_num = 0
-    eval_batch_size = 8
+    eval_batch_size = 16
     generation_config = {
         "max_tokens": 81920,
         "temperature": 1.0,

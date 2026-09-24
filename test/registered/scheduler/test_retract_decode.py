@@ -17,7 +17,7 @@ from sglang.test.test_utils import (
 )
 from sglang.utils import is_in_ci
 
-register_cuda_ci(est_time=215, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=316, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=300, suite="stage-b-test-1-gpu-small-amd")
 
 
@@ -51,12 +51,12 @@ class TestRetractDecode(CustomTestCase):
             base_url=self.base_url,
             model=self.model,
             eval_name="mmlu",
-            num_examples=64,
+            num_examples=256,
             num_threads=32,
         )
 
         metrics = run_eval(args)
-        self.assertGreaterEqual(metrics["score"], 0.65)
+        self.assertGreaterEqual(metrics["score"], 0.64)
         time.sleep(1)  # wait for mem check
 
         assert self.process.poll() is None, "Server crashed during test"

@@ -4,15 +4,12 @@
 # Adapted from vllm: https://github.com/vllm-project/vllm/blob/v0.7.3/vllm/attention/backends/abstract.py
 
 from abc import ABC, abstractmethod
-from dataclasses import dataclass, fields
-from typing import TYPE_CHECKING, Any, Generic, Protocol, TypeVar
-
-if TYPE_CHECKING:
-    pass
+from dataclasses import dataclass
+from typing import Any, Generic, TypeVar
 
 import torch
 
-from sglang.kernel_api_logging import wrap_method_with_debug_kernel_once
+from sglang.kernels.kernel_api_logging import wrap_method_with_debug_kernel_once
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 
 
@@ -21,6 +18,20 @@ class AttentionRequirements:
     """Semantic attention operations required by a caller."""
 
     packed_varlen: bool = False
+
+
+def trailing_padding_used_len(
+    total_tokens: int,
+    max_seqlen: int,
+    bounds: tuple[int, ...],
+) -> int | None:
+    """Return the live prefix length for a packed, padded single sequence."""
+    if len(bounds) != 3:
+        return None
+    start, used, total = bounds
+    if start != 0 or used >= total or total != total_tokens or used != max_seqlen:
+        return None
+    return used
 
 
 class AttentionBackend(ABC):
@@ -64,15 +75,6 @@ class AttentionBackend(ABC):
     def get_metadata_cls() -> type["AttentionMetadata"]:
         raise NotImplementedError
 
-    # @staticmethod
-    # @abstractmethod
-    # def get_state_cls() -> Type["AttentionState"]:
-    #     raise NotImplementedError
-
-    # @classmethod
-    # def make_metadata(cls, *args, **kwargs) -> "AttentionMetadata":
-    #     return cls.get_metadata_cls()(*args, **kwargs)
-
     @staticmethod
     @abstractmethod
     def get_builder_cls() -> type["AttentionMetadataBuilder"]:
@@ -85,18 +87,6 @@ class AttentionMetadata:
 
     # Current step of diffusion process
     current_timestep: int
-
-    def asdict_zerocopy(self, skip_fields: set[str] | None = None) -> dict[str, Any]:
-        """Similar to dataclasses.asdict, but avoids deepcopying."""
-        if skip_fields is None:
-            skip_fields = set()
-        # Note that if we add dataclasses as fields, they will need
-        # similar handling.
-        return {
-            field.name: getattr(self, field.name)
-            for field in fields(self)
-            if field.name not in skip_fields
-        }
 
 
 T = TypeVar("T", bound=AttentionMetadata)
@@ -124,25 +114,7 @@ class AttentionMetadataBuilder(ABC, Generic[T]):
         raise NotImplementedError
 
 
-class AttentionLayer(Protocol):
-
-    _k_scale: torch.Tensor
-    _v_scale: torch.Tensor
-    _k_scale_float: float
-    _v_scale_float: float
-
-    def forward(
-        self,
-        query: torch.Tensor,
-        key: torch.Tensor,
-        value: torch.Tensor,
-        kv_cache: torch.Tensor,
-        attn_metadata: AttentionMetadata,
-    ) -> torch.Tensor: ...
-
-
 class AttentionImpl(ABC, Generic[T]):
-
     @abstractmethod
     def __init__(
         self,
@@ -207,6 +179,21 @@ class AttentionImpl(ABC, Generic[T]):
     ) -> torch.Tensor:
         raise NotImplementedError(
             f"{type(self).__name__} does not implement packed varlen attention"
+        )
+
+    def forward_ring_kv_chunk(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Attend local queries to one rotated KV chunk for ring merging.
+
+        Inputs use packed ``[T, H, D]`` layout. The returned attention output
+        has the query shape and softmax LSE uses ``[H, Tq]`` layout.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} does not implement ring KV-chunk attention"
         )
 
 

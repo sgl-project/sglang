@@ -37,6 +37,8 @@ class HiCacheStorageConfig:
     model_name: Optional[str]
     tp_lcm_size: Optional[int] = None
     should_split_heads: bool = False
+    # with dp-attention, tp_rank is attention-group-local; dp_rank disambiguates
+    dp_rank: int = 0
     extra_config: Optional[dict] = None
 
 
@@ -44,15 +46,6 @@ class HiCacheStorageConfig:
 class HiCacheStorageExtraInfo:
     prefix_keys: Optional[List[str]] = None
     extra_info: Optional[dict] = None
-
-
-@dataclass(frozen=True)
-class PrefetchTimeoutConfig:
-    """Knobs for the linear prefetch-timeout policy used by HiCache."""
-
-    base: float = 2.0  # seconds, fixed overhead unrelated to token count
-    per_ki_token: float = 0.1  # seconds per 1024 tokens
-    max: float = 30.0  # seconds, upper bound for the linear timeout
 
 
 class PoolName(str, Enum):
@@ -64,9 +57,22 @@ class PoolName(str, Enum):
     INDEXER = "indexer"
     # TODO(hzh0425): Current DeepSeek V4 pool naming is verbose; will be normalized to
     # 'COMPRESSED_KV / COMPRESSED_INDEXER / COMPRESSED_STATE' in the next PR.
+    DEEPSEEK_V4_C1 = "deepseek_v4_c1"
+    DEEPSEEK_V4_C1_INDEXER = "deepseek_v4_c1_indexer"
+    DEEPSEEK_V4_C1_INDEXER_SCALE = "deepseek_v4_c1_indexer_scale"
+    DEEPSEEK_V4_C2 = "deepseek_v4_c2"
+    DEEPSEEK_V4_C2_INDEXER = "deepseek_v4_c2_indexer"
+    DEEPSEEK_V4_C2_INDEXER_SCALE = "deepseek_v4_c2_indexer_scale"
     DEEPSEEK_V4_C4 = "deepseek_v4_c4"
     DEEPSEEK_V4_C4_INDEXER = "deepseek_v4_c4_indexer"
+    # FP4 indexer splits the indexer cache into separate payload/scale buffers,
+    # so it needs a second pool alongside DEEPSEEK_V4_C4_INDEXER.
+    DEEPSEEK_V4_C4_INDEXER_SCALE = "deepseek_v4_c4_indexer_scale"
     DEEPSEEK_V4_C128 = "deepseek_v4_c128"
+    # fp8 unified_kv splits a row across a packed fp8 nope pool and a parallel
+    # bf16 rope pool, so each compressed region mirrors to two host pools.
+    DEEPSEEK_V4_C4_ROPE = "deepseek_v4_c4_rope"
+    DEEPSEEK_V4_C128_ROPE = "deepseek_v4_c128_rope"
     DEEPSEEK_V4_C4_STATE = "deepseek_v4_c4_state"
     DEEPSEEK_V4_C4_INDEXER_STATE = "deepseek_v4_c4_indexer_state"
     DEEPSEEK_V4_C128_STATE = "deepseek_v4_c128_state"
@@ -107,6 +113,9 @@ class PoolTransfer:
     hit_policy: PoolHitPolicy = PoolHitPolicy.ALL_PAGES
     nodes_to_load: Optional[List[Any]] = None
     indices_from_pool: Optional[PoolName] = None
+    # Full IDs backing a dependent device allocation: resident tensors or
+    # slices of the full rows allocated by this load, in transfer order.
+    anchor_index_parts: Optional[List[torch.Tensor | slice]] = None
 
 
 @dataclass(frozen=True)
@@ -125,6 +134,13 @@ class PoolTransferResult:
     kv_hit_pages: int
     extra_pool_hit_pages: dict[str, int]
 
+    # Pools with TRAILING_PAGES (SWA, Mamba state) only hold a window that ends on an
+    # offloaded node boundary, so 5 can be restorable while 4 and 3 are not.
+    # Each rank owns its own shard and may hold a different set, so reducing a
+    # per-rank maximum would pick a length that is illegal on another rank; the
+    # caller intersects these sets instead.
+    restorable_prefix_pages: Optional[List[int]] = None
+
     @classmethod
     def empty(cls) -> PoolTransferResult:
         return cls(0, {})
@@ -133,18 +149,20 @@ class PoolTransferResult:
         """Accumulate kv_hit_pages across batches (max = last successful batch)."""
         self.kv_hit_pages = max(self.kv_hit_pages, kv_hit_pages)
 
-    def update_extra_pool_hit_pages(self, results: dict[str, List[bool]]) -> None:
+    def update_extra_pool_hit_pages(self, results: dict[str, int]) -> None:
         """Record actual load/write success counts per extra pool.
 
         Every extra pool contributes a prefix that must be contiguous from the
         start, so count the leading run of successes
         """
-        self.extra_pool_hit_pages.update(
-            {
-                name: (rs.index(False) if False in rs else len(rs))
-                for name, rs in results.items()
-            }
-        )
+        self.extra_pool_hit_pages.update(results)
+
+
+def count_pool_hits(results: dict[str, List[bool]]) -> dict[str, int]:
+    return {
+        name: (rs.index(False) if False in rs else len(rs))
+        for name, rs in results.items()
+    }
 
 
 class HiCacheStorage(ABC):
@@ -359,7 +377,6 @@ class MetadataCache:
 
 
 class HiCacheFile(HiCacheStorage):
-
     def __init__(
         self, storage_config: HiCacheStorageConfig, file_path: str = "/tmp/hicache"
     ):
@@ -440,13 +457,6 @@ class HiCacheFile(HiCacheStorage):
             return self._get_suffixed_key(key)
         return self._get_suffixed_key(f"{key}.{component_name}")
 
-    def _get_component_path(
-        self, key: str, component_name: Optional[str] = None
-    ) -> str:
-        return os.path.join(
-            self.file_path, f"{self._get_component_key(key, component_name)}.bin"
-        )
-
     def _scan_existing_files_to_metadata_cache(self) -> None:
         try:
             names = os.listdir(self.file_path)
@@ -522,10 +532,7 @@ class HiCacheFile(HiCacheStorage):
                 return False
             reserved = True
 
-            tmp_path = (
-                f"{tensor_path}.tmp."
-                f"{os.getpid()}.{threading.get_ident()}.{uuid.uuid4().hex}"
-            )
+            tmp_path = os.path.join(self.file_path, f".{uuid.uuid4().hex}.tmp")
             value.contiguous().view(dtype=torch.uint8).numpy().tofile(tmp_path)
             os.replace(tmp_path, tensor_path)
             self._evictor.commit(suffixed)

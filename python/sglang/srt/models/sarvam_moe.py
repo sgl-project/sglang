@@ -14,7 +14,6 @@ from transformers import PretrainedConfig
 
 from sglang.kernels.ops.attention.utils import concat_and_cast_mha_k_triton
 from sglang.srt.distributed import (
-    get_pp_group,
     tensor_model_parallel_all_reduce,
 )
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
@@ -63,11 +62,9 @@ from sglang.srt.models.deepseek_common.attention_forward_methods.forward_mha imp
 from sglang.srt.runtime_context import (
     attention_backends,
     get_exec,
-    get_forward,
     get_memory,
     get_model,
     get_parallel,
-    get_server_args,
     get_stream,
 )
 from sglang.srt.utils import (
@@ -116,7 +113,7 @@ class AttnForwardMethod(IntEnum):
 
 
 SEPARATE_ROPE_BACKENDS = frozenset(
-    ["fa3", "flashinfer", "dsa", "nsa", "cutlass_mla", "trtllm_mla"]
+    ["fa3", "flashinfer", "dsa", "nsa", "trtllm_mla"]
     # "nsa" is a deprecated alias for "dsa"
 )
 CONCAT_ROPE_BACKENDS = frozenset(["flashmla", "triton"])
@@ -159,12 +156,13 @@ for backend in CONCAT_ROPE_BACKENDS:
     AttentionBackendRegistry.register(backend, _handle_concat_rope_backend)
 
 
-def get_attn_forward_method(server_args, forward_batch) -> AttnForwardMethod:
+def get_attn_forward_method(forward_batch) -> AttnForwardMethod:
+    prefill_backend, decode_backend = attention_backends()
     is_decode = forward_batch.forward_mode.is_decode_or_idle()
     if is_decode:
-        backend = server_args.decode_attention_backend or server_args.attention_backend
+        backend = decode_backend
     else:
-        backend = server_args.prefill_attention_backend or server_args.attention_backend
+        backend = prefill_backend
         if (
             forward_batch.forward_mode.is_extend_without_speculative()
             and backend == "fa3"
@@ -456,7 +454,6 @@ class SarvamMoEMLAAttention(nn.Module):
         self.max_position_embeddings = max_position_embeddings
         self.kv_cache_dtype = get_model().kv_cache_dtype
 
-        self._server_args = None
         self.current_attention_backend = None
 
         if self.q_lora_rank is None:
@@ -761,11 +758,9 @@ class SarvamMoEMLAAttention(nn.Module):
         q_nope, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
         k_pe = latent_cache[..., self.kv_lora_rank :].unsqueeze(1)
 
-        if self._server_args is None:
-            self._server_args = get_server_args()
         self._set_current_attention_backend(forward_batch)
 
-        forward_method = get_attn_forward_method(self._server_args, forward_batch)
+        forward_method = get_attn_forward_method(forward_batch)
 
         if forward_method == AttnForwardMethod.MHA_PREFILL:
             return self._run_mha_prefill(
@@ -875,10 +870,8 @@ class SarvamMoEMLAAttention(nn.Module):
         q_nope, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
         k_pe = latent_cache[..., self.kv_lora_rank :].unsqueeze(1)
 
-        if self._server_args is None:
-            self._server_args = get_server_args()
         self._set_current_attention_backend(forward_batch)
-        forward_method = get_attn_forward_method(self._server_args, forward_batch)
+        forward_method = get_attn_forward_method(forward_batch)
 
         if forward_method == AttnForwardMethod.MHA_PREFILL:
             output = self._run_mha_prefill(
@@ -933,11 +926,9 @@ class SarvamMoEMLAAttention(nn.Module):
 
         q_nope_out, k_nope, q_pe, k_pe, forward_batch, zero_allocator = inner_state
 
-        if self._server_args is None:
-            self._server_args = get_server_args()
         self._set_current_attention_backend(forward_batch)
 
-        forward_method = get_attn_forward_method(self._server_args, forward_batch)
+        forward_method = get_attn_forward_method(forward_batch)
 
         if forward_method == AttnForwardMethod.MLA_SEPARATE_ROPE:
             attn_output = self.attn_mqa(
@@ -1097,32 +1088,16 @@ class SarvamMoEMLADecoderLayer(nn.Module):
         hidden_states, residual = self.layer_communicator.prepare_mlp(
             hidden_states, residual, forward_batch
         )
-        fuse_mlp_allreduce = (
-            self.layer_communicator.should_fuse_mlp_allreduce_with_next_layer(
-                forward_batch
-            )
-        )
-        mlp_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
-            forward_batch
-        )
-        with get_forward().scoped(
-            fuse_mlp_allreduce=fuse_mlp_allreduce,
-            mlp_reduce_scatter=mlp_reduce_scatter,
-        ):
+        with self.layer_communicator.ffn_exit(forward_batch) as ffn_exit:
             hidden_states = self.mlp(hidden_states, forward_batch)
         if (
             not self.is_layer_sparse
             and self.attn_tp_size > 1
-            and not mlp_reduce_scatter
-            and not fuse_mlp_allreduce
+            and not ffn_exit.mlp_reduce_scatter
+            and not ffn_exit.fuse_mlp_allreduce
         ):
             hidden_states = tensor_model_parallel_all_reduce(hidden_states)
-        if fuse_mlp_allreduce:
-            hidden_states._sglang_needs_allreduce_fusion = True
-        else:
-            hidden_states, residual = self.layer_communicator.postprocess_layer(
-                hidden_states, residual, forward_batch
-            )
+        hidden_states, residual = ffn_exit.finish(hidden_states, residual)
         return hidden_states, residual
 
 
@@ -1137,7 +1112,7 @@ class SarvamMLAModel(nn.Module):
         self.config = config
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
         self.alt_stream = get_stream("alt") if _is_cuda else None
 
         if self.pp_group.is_first_rank:
@@ -1218,7 +1193,7 @@ class SarvamMLAForCausalLM(nn.Module):
     ) -> None:
         super().__init__()
         self._remap_config(config)
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
         self.config = config
         self.quant_config = quant_config
         self.model = SarvamMLAModel(config, quant_config, add_prefix("model", prefix))

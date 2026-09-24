@@ -238,7 +238,6 @@ class MiMoV2ModelNextN(nn.Module):
 
 
 class MiMoV2MTP(MiMoV2ForCausalLM):
-
     def __init__(
         self,
         config: PretrainedConfig,
@@ -320,7 +319,6 @@ class MiMoV2MTP(MiMoV2ForCausalLM):
                 continue
 
             for param_name, weight_name, shard_id in stacked_params_mapping:
-
                 if f".{weight_name}." not in name:
                     continue
                 if "mtp_block" not in name:

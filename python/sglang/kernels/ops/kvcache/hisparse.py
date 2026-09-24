@@ -1,14 +1,169 @@
 from __future__ import annotations
 
 import functools
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, NamedTuple
 
 import torch
 
-from sglang.kernels.jit.utils import load_jit, make_cpp_args
+from sglang.kernels.jit.utils import (
+    cache_once,
+    is_arch_support_pdl,
+    load_jit,
+    make_cpp_args,
+)
 
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
+
+
+_GATHER_BLOCK_SIZE = 64
+
+
+class HiSparseSpecState(NamedTuple):
+    """Persistent cache state and reusable miss workspace for speculative swap.
+
+    ``cache_index`` stores the two int64 hash banks as
+    ``[num_requests, 2, hash_size]``. ``cache_policy`` uses a control-plane row
+    for the packed CLOCK states followed by one reference-epoch row per
+    request: ``[1 + num_requests, hot_buffer_size]``.
+
+    ``scratch_locs`` and ``scratch_state`` hold reusable miss locations,
+    counters, and metadata shared by all layers.
+    """
+
+    cache_index: torch.Tensor
+    cache_policy: torch.Tensor
+    scratch_locs: torch.Tensor
+    scratch_state: torch.Tensor
+
+
+@cache_once
+def _jit_spec_module(
+    item_size_bytes: int,
+    block_size: int,
+    num_top_k: int,
+    hot_buffer_size: int,
+    num_steps: int,
+    record_miss_plan: bool,
+) -> Module:
+    template_args = make_cpp_args(
+        block_size,
+        num_top_k,
+        hot_buffer_size,
+        item_size_bytes,
+        num_steps,
+        record_miss_plan,
+        is_arch_support_pdl(),
+    )
+    return load_jit(
+        "hisparse_spec",
+        *template_args,
+        cuda_files=["kvcacheio/hisparse_spec.cuh"],
+        cuda_wrappers=[
+            (
+                "load_cache_to_device_buffer_spec",
+                f"load_cache_to_device_buffer_spec<{template_args}>",
+            )
+        ],
+    )
+
+
+def load_cache_to_device_buffer_spec_mla(
+    *,
+    top_k_tokens: torch.Tensor,
+    device_buffer_tokens: torch.Tensor,
+    host_cache_locs: torch.Tensor,
+    device_buffer_locs: torch.Tensor,
+    host_cache: torch.Tensor,
+    device_buffer: torch.Tensor,
+    top_k_device_locs: torch.Tensor,
+    req_pool_indices: torch.Tensor,
+    seq_lens: torch.Tensor,
+    state: HiSparseSpecState,
+    num_real_reqs: torch.Tensor,
+    miss_src: torch.Tensor | None = None,
+    miss_dst: torch.Tensor | None = None,
+    miss_count: torch.Tensor | None = None,
+) -> None:
+    """Resolve all speculative steps and swap unique misses in one launch pair.
+
+    Optional miss-plan outputs use the same protocol as the single-step HiSparse
+    kernel, so shared-index layers can replay only the Host-to-GPU copies with
+    ``copy_cache_planned_mla``.
+    """
+    _, num_steps, num_top_k = top_k_tokens.shape
+    if not 2 <= num_steps <= 4:
+        raise ValueError(
+            f"HiSparse speculative swap requires 2-4 steps, got {num_steps}."
+        )
+    hot_buffer_size = state.cache_policy.size(1)
+    page_size = device_buffer_tokens.size(1) - hot_buffer_size
+    item_size_bytes = host_cache.stride(0) * host_cache.element_size()
+    record_miss_plan = miss_src is not None
+    if record_miss_plan:
+        if miss_dst is None or miss_count is None:
+            raise ValueError(
+                "miss_src, miss_dst, and miss_count must be provided together."
+            )
+        if miss_src.dtype != torch.int64 or miss_dst.dtype != torch.int32:
+            raise ValueError("miss_src must be int64 and miss_dst must be int32.")
+        if miss_count.dtype != torch.int32:
+            raise ValueError("miss_count must be int32.")
+        plan_capacity = num_steps * num_top_k
+        batch_size = top_k_tokens.size(0)
+        if (
+            miss_src.ndim != 2
+            or miss_dst.ndim != 2
+            or miss_src.size(0) < batch_size
+            or miss_dst.size(0) < batch_size
+            or miss_src.size(1) < plan_capacity
+            or miss_dst.size(1) < plan_capacity
+        ):
+            raise ValueError(
+                "speculative miss_src/miss_dst must have shape "
+                f"[batch, >= steps * top_k] (capacity {plan_capacity})."
+            )
+        if miss_count.ndim != 1 or miss_count.numel() < batch_size:
+            raise ValueError("speculative miss_count must have shape [batch].")
+        if miss_src.stride(0) != miss_dst.stride(0):
+            raise ValueError("miss_src/miss_dst row strides must match.")
+    else:
+        if miss_dst is not None or miss_count is not None:
+            raise ValueError(
+                "miss_src, miss_dst, and miss_count must be provided together."
+            )
+        empty = torch.empty(0)
+        miss_src = miss_dst = miss_count = empty
+
+    module = _jit_spec_module(
+        item_size_bytes,
+        _GATHER_BLOCK_SIZE,
+        num_top_k,
+        hot_buffer_size,
+        num_steps,
+        record_miss_plan,
+    )
+
+    module.load_cache_to_device_buffer_spec(
+        top_k_tokens,
+        device_buffer_tokens,
+        host_cache_locs,
+        device_buffer_locs,
+        host_cache,
+        device_buffer,
+        top_k_device_locs,
+        req_pool_indices,
+        seq_lens,
+        state.cache_index,
+        state.cache_policy,
+        state.scratch_locs,
+        state.scratch_state,
+        num_real_reqs,
+        page_size,
+        miss_src,
+        miss_dst,
+        miss_count,
+    )
 
 
 @functools.cache
@@ -19,6 +174,8 @@ def _jit_sparse_module(
     hot_buffer_size: int,
     is_mla: bool = False,
     is_dsv4_layout: bool = False,
+    top_k_block_size: int = 1,
+    top_k_is_blocks: bool = False,
     record_miss_plan: bool = False,
     skip_io: bool = False,
 ) -> Module:
@@ -30,6 +187,8 @@ def _jit_sparse_module(
         hot_buffer_size,
         is_mla,
         is_dsv4_layout,
+        top_k_block_size,
+        top_k_is_blocks,
         record_miss_plan,
         skip_io,
     )
@@ -40,13 +199,15 @@ def _jit_sparse_module(
         hot_buffer_size,
         is_mla,
         is_dsv4_layout,
+        top_k_block_size,
+        top_k_is_blocks,
         record_miss_plan,
         skip_io,
     )
     return load_jit(
         "sparse_cache",
         *cache_args,
-        cuda_files=["hisparse.cuh"],
+        cuda_files=["kvcacheio/hisparse.cuh"],
         cuda_wrappers=[
             (
                 "load_cache_to_device_buffer",
@@ -70,7 +231,7 @@ def _jit_copy_planned_module(
         is_mla,
         is_dsv4_layout,
         skip_io,
-        cuda_files=["hisparse.cuh"],
+        cuda_files=["kvcacheio/hisparse.cuh"],
         cuda_wrappers=[
             (
                 "copy_cache_planned",
@@ -86,7 +247,7 @@ def _jit_dsv4_transfer_module(block_size: int) -> Module:
     return load_jit(
         "sparse_cache_dsv4_transfer",
         block_size,
-        cuda_files=["hisparse.cuh"],
+        cuda_files=["kvcacheio/hisparse.cuh"],
         cuda_wrappers=[
             (
                 "transfer_cache_dsv4_mla",
@@ -137,9 +298,9 @@ def _load_cache_to_device_buffer_mla(
     miss_count: torch.Tensor | None,
     skip_io: bool,
 ) -> None:
-    assert (
-        hot_buffer_size >= num_top_k
-    ), f"hot_buffer_size ({hot_buffer_size}) must be >= num_top_k ({num_top_k})"
+    assert hot_buffer_size >= num_top_k, (
+        f"hot_buffer_size ({hot_buffer_size}) must be >= num_top_k ({num_top_k})"
+    )
 
     record_miss_plan = miss_src is not None
     module = _jit_sparse_module(
@@ -153,7 +314,7 @@ def _load_cache_to_device_buffer_mla(
         skip_io=skip_io,
     )
 
-    empty = torch.empty(0)
+    empty = torch.empty(0, device=top_k_tokens.device)
 
     if num_real_reqs is None:
         num_real_reqs = torch.tensor(
@@ -241,6 +402,83 @@ def load_cache_to_device_buffer_mla(
         miss_dst=miss_dst,
         miss_count=miss_count,
         skip_io=skip_io,
+    )
+
+
+def load_blocks_to_device_buffer_mha(
+    top_k_blocks: torch.Tensor,
+    device_buffer_tokens: torch.Tensor,
+    host_cache_locs: torch.Tensor,
+    device_buffer_locs: torch.Tensor,
+    host_cache_k: torch.Tensor,
+    host_cache_v: torch.Tensor,
+    device_buffer_k: torch.Tensor,
+    device_buffer_v: torch.Tensor,
+    top_k_device_locs: torch.Tensor,
+    req_pool_indices: torch.Tensor,
+    seq_lens: torch.Tensor,
+    lru_slots: torch.Tensor,
+    item_size_bytes: int,
+    hot_buffer_size: int,
+    sparse_block_size: int,
+    page_size: int = 1,
+    block_size: int = 256,
+    num_real_reqs: torch.Tensor | None = None,
+    skip_io: bool = False,
+) -> None:
+    """Swap block-selected MHA K/V into the HiSparse device pool."""
+    num_top_k_blocks = top_k_blocks.size(1)
+    num_top_k_tokens = num_top_k_blocks * sparse_block_size
+    assert hot_buffer_size >= num_top_k_tokens, (
+        f"hot_buffer_size ({hot_buffer_size}) must be >= selected tokens "
+        f"({num_top_k_tokens})"
+    )
+    assert top_k_device_locs.size(1) >= num_top_k_tokens
+    k_stride = host_cache_k.stride(0) * host_cache_k.element_size()
+    v_stride = host_cache_v.stride(0) * host_cache_v.element_size()
+    assert k_stride == v_stride == item_size_bytes, (
+        "K/V token strides must equal item_size_bytes: "
+        f"k_stride={k_stride}, v_stride={v_stride}, "
+        f"item_size_bytes={item_size_bytes}"
+    )
+
+    module = _jit_sparse_module(
+        item_size_bytes,
+        block_size,
+        num_top_k_blocks,
+        hot_buffer_size,
+        is_mla=False,
+        is_dsv4_layout=False,
+        top_k_block_size=sparse_block_size,
+        top_k_is_blocks=True,
+        record_miss_plan=False,
+        skip_io=skip_io,
+    )
+    empty = torch.empty(0, device=top_k_blocks.device)
+    if num_real_reqs is None:
+        num_real_reqs = torch.tensor(
+            [top_k_blocks.size(0)], dtype=torch.int32, device=top_k_blocks.device
+        )
+
+    module.load_cache_to_device_buffer(
+        top_k_blocks,
+        device_buffer_tokens,
+        host_cache_locs,
+        device_buffer_locs,
+        host_cache_k,
+        host_cache_v,
+        device_buffer_k,
+        device_buffer_v,
+        top_k_device_locs,
+        req_pool_indices,
+        seq_lens,
+        lru_slots,
+        num_real_reqs,
+        page_size,
+        item_size_bytes,
+        empty,
+        empty,
+        empty,
     )
 
 

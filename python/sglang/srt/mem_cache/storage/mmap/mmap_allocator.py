@@ -1,5 +1,6 @@
 import ctypes
 import ctypes.util
+import functools
 import logging
 import math
 import mmap
@@ -41,6 +42,49 @@ _MAP_HUGE_2MB = 21 << 26  # 0x1400000
 _MAP_HUGE_1GB = 30 << 26  # 0x78000000
 _MAP_FAILED = ctypes.c_void_p(-1).value
 _MADV_POPULATE_WRITE = getattr(mmap, "MADV_POPULATE_WRITE", 23)
+_PROT_RW = mmap.PROT_READ | mmap.PROT_WRITE
+
+
+@functools.cache
+def _has_madv_populate_write() -> bool:
+    """Whether this kernel implements MADV_POPULATE_WRITE (Linux 5.14+).
+
+    Probed once on a single page. Probing on the real allocation is not an
+    option: the answer decides how that allocation gets pre-faulted.
+    """
+    try:
+        probe = mmap.mmap(
+            -1,
+            mmap.PAGESIZE,
+            flags=mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS,
+            prot=_PROT_RW,
+        )
+    except OSError:
+        return False
+    try:
+        probe.madvise(_MADV_POPULATE_WRITE)
+        return True
+    except (OSError, ValueError):
+        return False
+    finally:
+        probe.close()
+
+
+def _mmap_prefaulted(fileno: int, alloc_bytes: int, flags: int) -> mmap.mmap:
+    """mmap `alloc_bytes` with every page already faulted in and writable.
+
+    cudaHostRegister has to pin real, pre-faulted pages, so these mappings can
+    never be handed back lazily. MAP_POPULATE and MADV_POPULATE_WRITE each give
+    that guarantee on their own, but asking for both makes the kernel walk the
+    whole mapping twice. Prefer the madvise, which additionally reports a
+    failure (e.g. ENOMEM) instead of leaving pages quietly unpopulated, and fall
+    back to MAP_POPULATE only where the kernel lacks it.
+    """
+    if _has_madv_populate_write():
+        mm = mmap.mmap(fileno, alloc_bytes, flags=flags, prot=_PROT_RW)
+        mm.madvise(_MADV_POPULATE_WRITE)
+        return mm
+    return mmap.mmap(fileno, alloc_bytes, flags=flags | _MAP_POPULATE, prot=_PROT_RW)
 
 
 def _alloc_hugepage(n_bytes: int, alloc_bytes: int, extra_flags: int) -> ctypes.Array:
@@ -120,19 +164,7 @@ def alloc_mmap(dims: tuple, dtype: torch.dtype) -> torch.Tensor:
     # Plain mmap path -- used directly when no hugepages requested, or as fallback.
     # torch.frombuffer keeps a reference to mm inside the tensor storage, so mm
     # stays alive until the tensor is freed and mmap.mmap.__del__ calls munmap.
-    mm = mmap.mmap(
-        -1,
-        alloc_bytes,
-        flags=mmap.MAP_SHARED | mmap.MAP_ANONYMOUS | _MAP_POPULATE,
-        prot=mmap.PROT_READ | mmap.PROT_WRITE,
-    )
-    try:
-        # MADV_POPULATE_WRITE guarantees pages are populated and writable,
-        # throwing an error on failure (e.g. out of memory).
-        mm.madvise(_MADV_POPULATE_WRITE)
-    except OSError:
-        # Fall back to MAP_POPULATE if MADV_POPULATE_WRITE is not supported (<5.14 kernel).
-        pass
+    mm = _mmap_prefaulted(-1, alloc_bytes, mmap.MAP_SHARED | mmap.MAP_ANONYMOUS)
     return torch.frombuffer(mm, dtype=dtype, count=math.prod(dims)).reshape(dims)
 
 
@@ -179,19 +211,7 @@ def alloc_shm(dims: tuple, dtype: torch.dtype) -> tuple[torch.Tensor, int, mmap.
 
     try:
         os.ftruncate(fd, alloc_bytes)
-        mm = mmap.mmap(
-            fd,
-            alloc_bytes,
-            flags=mmap.MAP_SHARED | _MAP_POPULATE,
-            prot=mmap.PROT_READ | mmap.PROT_WRITE,
-        )
-        try:
-            # MADV_POPULATE_WRITE guarantees pages are populated and writable,
-            # throwing an error on failure (e.g. out of memory).
-            mm.madvise(_MADV_POPULATE_WRITE)
-        except OSError:
-            # Fall back to MAP_POPULATE if MADV_POPULATE_WRITE is not supported (<5.14 kernel).
-            pass
+        mm = _mmap_prefaulted(fd, alloc_bytes, mmap.MAP_SHARED)
     except Exception as e:
         if fd is not None:
             os.close(fd)

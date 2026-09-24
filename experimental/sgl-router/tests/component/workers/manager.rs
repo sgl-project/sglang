@@ -4,26 +4,43 @@
 use axum::{routing::get, Json, Router};
 use serde_json::{json, Value};
 use sgl_router::discovery::{DiscoveryEvent, ModelId, WorkerId, WorkerMode, WorkerSpec};
-use sgl_router::workers::{manager, WorkerRegistry};
+use sgl_router::workers::{manager, WireProtocol, WorkerRegistry};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::net::TcpListener;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, Barrier};
 
-/// Spin up a tiny fake worker that returns `body` on `GET /server_info`.
-/// Returns the worker base URL and a shutdown channel.
+/// Spin up a tiny fake worker that returns `body` on both introspection
+/// endpoints. Returns the worker base URL and a shutdown channel.
+///
+/// One body for both because a real engine reports `served_model_name` on
+/// each.
 async fn spawn_fake_worker(body: Value) -> (String, oneshot::Sender<()>) {
+    spawn_worker_serving(body, true).await
+}
+
+/// A worker that answers `/server_info` only — an SGLang predating
+/// `served_model_name` on `/model_info`, and the shape the kind e2e fleet
+/// still has (`tests/e2e/k8s_integration/fake_worker.py` defines no
+/// `/model_info`). Registration must resolve the model name from the
+/// `/server_info` fallback for this worker.
+async fn spawn_server_info_only_worker(body: Value) -> (String, oneshot::Sender<()>) {
+    spawn_worker_serving(body, false).await
+}
+
+async fn spawn_worker_serving(body: Value, with_model_info: bool) -> (String, oneshot::Sender<()>) {
     let body = Arc::new(body);
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
-    let app = Router::new().route(
-        "/server_info",
-        get(move || {
-            let body = body.clone();
-            async move { Json((*body).clone()) }
-        }),
-    );
+    let serve_body = move || {
+        let body = body.clone();
+        async move { Json((*body).clone()) }
+    };
+    let mut app = Router::new().route("/server_info", get(serve_body.clone()));
+    if with_model_info {
+        app = app.route("/model_info", get(serve_body));
+    }
     let (tx, rx) = oneshot::channel::<()>();
     tokio::spawn(async move {
         let _ = axum::serve(listener, app)
@@ -46,6 +63,19 @@ fn spec_for(id: &str, url: &str, mode: WorkerMode) -> WorkerSpec {
         model_ids: Vec::new(),
         bootstrap_port: None,
     }
+}
+
+async fn wait_until(condition: impl Fn() -> bool, description: &str) {
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if condition() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("timed out waiting for {description}"));
 }
 
 #[tokio::test]
@@ -72,8 +102,11 @@ async fn manager_processes_added_then_removed() {
     .await
     .unwrap();
 
-    // Give the manager time to drain.
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    wait_until(
+        || registry.workers_for(&ModelId("m".into())).len() == 2,
+        "both workers to register",
+    )
+    .await;
     assert_eq!(registry.workers_for(&ModelId("m".into())).len(), 2);
 
     tx.send(DiscoveryEvent::Removed {
@@ -81,7 +114,11 @@ async fn manager_processes_added_then_removed() {
     })
     .await
     .unwrap();
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    wait_until(
+        || registry.workers_for(&ModelId("m".into())).len() == 1,
+        "removed worker to leave the registry",
+    )
+    .await;
     assert_eq!(registry.workers_for(&ModelId("m".into())).len(), 1);
 
     drop(tx);
@@ -103,7 +140,16 @@ async fn manager_handles_mode_changed() {
     )))
     .await
     .unwrap();
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    wait_until(
+        || {
+            registry
+                .workers_for_mode(&ModelId("m".into()), WorkerMode::Prefill)
+                .len()
+                == 1
+        },
+        "prefill worker to register",
+    )
+    .await;
     assert_eq!(
         registry
             .workers_for_mode(&ModelId("m".into()), WorkerMode::Prefill)
@@ -117,7 +163,19 @@ async fn manager_handles_mode_changed() {
     })
     .await
     .unwrap();
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    wait_until(
+        || {
+            registry
+                .workers_for_mode(&ModelId("m".into()), WorkerMode::Prefill)
+                .is_empty()
+                && registry
+                    .workers_for_mode(&ModelId("m".into()), WorkerMode::Decode)
+                    .len()
+                    == 1
+        },
+        "worker mode to change to decode",
+    )
+    .await;
     assert_eq!(
         registry
             .workers_for_mode(&ModelId("m".into()), WorkerMode::Prefill)
@@ -133,6 +191,208 @@ async fn manager_handles_mode_changed() {
 
     drop(tx);
     h.await.unwrap();
+}
+
+/// A worker that reports `enable_http2: true` is registered with
+/// [`WireProtocol::H2c`], so the proxy forwards to it over cleartext h2c.
+#[tokio::test]
+async fn manager_resolves_h2c_protocol_from_introspection() {
+    let (url, _s) =
+        spawn_fake_worker(json!({"served_model_name": "m", "enable_http2": true})).await;
+
+    let (tx, rx) = mpsc::channel(16);
+    let registry = Arc::new(WorkerRegistry::default());
+    let h = tokio::spawn(manager::run(rx, registry.clone()));
+
+    tx.send(DiscoveryEvent::Added(spec_for(
+        "w1",
+        &url,
+        WorkerMode::Plain,
+    )))
+    .await
+    .unwrap();
+
+    let resolved = wait_for_protocol(&registry, "w1", WireProtocol::H2c).await;
+    assert!(
+        resolved,
+        "worker reporting enable_http2 must resolve to h2c, got {:?}",
+        registry.get(&WorkerId("w1".into())).map(|w| w.protocol()),
+    );
+
+    drop(tx);
+    h.await.unwrap();
+}
+
+/// A worker that omits `enable_http2` (older SGLang) keeps the safe HTTP/1.1
+/// default on its registry entry.
+#[tokio::test]
+async fn manager_defaults_http1_when_enable_http2_absent() {
+    let (url, _s) = spawn_fake_worker(json!({"served_model_name": "m"})).await;
+
+    let (tx, rx) = mpsc::channel(16);
+    let registry = Arc::new(WorkerRegistry::default());
+    let h = tokio::spawn(manager::run(rx, registry.clone()));
+
+    tx.send(DiscoveryEvent::Added(spec_for(
+        "w1",
+        &url,
+        WorkerMode::Plain,
+    )))
+    .await
+    .unwrap();
+
+    // Non-empty `model_ids` is what proves introspection ran: `spawn_fake_worker`
+    // answers from one body, so a resolved model id means `/server_info`
+    // answered too and its silence on `enable_http2` is the engine's, not the
+    // fixture's. The positive direction — that `enable_http2` is actually read
+    // — is pinned by `manager_resolves_protocol_per_worker_no_fleet_lock`
+    // below.
+    let registered = wait_for(Duration::from_secs(2), || {
+        registry
+            .get(&WorkerId("w1".into()))
+            .is_some_and(|w| !w.model_ids.is_empty())
+    })
+    .await;
+    assert!(registered, "worker registered");
+    let w = registry.get(&WorkerId("w1".into())).unwrap();
+    assert_eq!(w.protocol(), WireProtocol::Http1);
+
+    drop(tx);
+    h.await.unwrap();
+}
+
+/// A worker with no `/model_info` at all still registers, resolving its model
+/// name from the `/server_info` fallback and its protocol from the same
+/// response.
+///
+/// Every other test here uses a fixture that answers both endpoints, so without
+/// this one the fallback chain in `introspect::fetch` has no component-level
+/// coverage — while the kind e2e fleet runs exactly this shape.
+#[tokio::test]
+async fn manager_registers_worker_that_serves_server_info_only() {
+    let (url, _s) =
+        spawn_server_info_only_worker(json!({"served_model_name": "m", "enable_http2": true}))
+            .await;
+
+    let (tx, rx) = mpsc::channel(16);
+    let registry = Arc::new(WorkerRegistry::default());
+    let h = tokio::spawn(manager::run(rx, registry.clone()));
+
+    tx.send(DiscoveryEvent::Added(spec_for(
+        "w-no-model-info",
+        &url,
+        WorkerMode::Plain,
+    )))
+    .await
+    .unwrap();
+
+    assert!(
+        wait_for_protocol(&registry, "w-no-model-info", WireProtocol::H2c).await,
+        "a worker without /model_info must still resolve its model name and \
+         protocol from /server_info; got {:?}",
+        registry
+            .get(&WorkerId("w-no-model-info".into()))
+            .map(|w| (w.model_ids.clone(), w.protocol())),
+    );
+
+    drop(tx);
+    h.await.unwrap();
+}
+
+/// The load-bearing regression for the production h2c bug: per-worker protocol
+/// means one worker that resolved HTTP/1.1 first does NOT lock the rest of the
+/// fleet off h2c. A mixed fleet (one h2c-capable worker registered AFTER a
+/// plain HTTP/1.1 worker) ends with each worker on its own protocol — the old
+/// single-client first-write-wins design forced both to HTTP/1.1.
+#[tokio::test]
+async fn manager_resolves_protocol_per_worker_no_fleet_lock() {
+    // w-http1 registers first and reports no enable_http2 (resolves Http1);
+    // w-h2c registers second and reports enable_http2: true (must still get
+    // h2c — it is not dragged down by w-http1's earlier Http1 resolution).
+    let (url_http1, _s1) = spawn_fake_worker(json!({"served_model_name": "m"})).await;
+    let (url_h2c, _s2) =
+        spawn_fake_worker(json!({"served_model_name": "m", "enable_http2": true})).await;
+
+    let (tx, rx) = mpsc::channel(16);
+    let registry = Arc::new(WorkerRegistry::default());
+    let h = tokio::spawn(manager::run(rx, registry.clone()));
+
+    tx.send(DiscoveryEvent::Added(spec_for(
+        "w-http1",
+        &url_http1,
+        WorkerMode::Plain,
+    )))
+    .await
+    .unwrap();
+    // Let the HTTP/1.1 worker resolve first so it is the one that would have
+    // "won" the old fleet-wide client.
+    assert!(
+        wait_for_protocol(&registry, "w-http1", WireProtocol::Http1).await,
+        "first worker should resolve Http1",
+    );
+
+    tx.send(DiscoveryEvent::Added(spec_for(
+        "w-h2c",
+        &url_h2c,
+        WorkerMode::Plain,
+    )))
+    .await
+    .unwrap();
+
+    assert!(
+        wait_for_protocol(&registry, "w-h2c", WireProtocol::H2c).await,
+        "an h2c-capable worker registered after an Http1 worker must still resolve h2c \
+         (per-worker protocol, no fleet-wide lock); got {:?}",
+        registry
+            .get(&WorkerId("w-h2c".into()))
+            .map(|w| w.protocol()),
+    );
+    // The earlier worker is untouched.
+    let first = registry.get(&WorkerId("w-http1".into())).unwrap();
+    assert_eq!(
+        first.protocol(),
+        WireProtocol::Http1,
+        "the Http1 worker must stay Http1",
+    );
+
+    drop(tx);
+    h.await.unwrap();
+}
+
+/// Block until `worker_id`'s registry entry reports `expected`, or 2 s elapse.
+/// Returns whether it converged.
+///
+/// The `model_ids` check is half the predicate on purpose. `H2c` proves itself
+/// — it is reachable only through a successful `/server_info` read — but
+/// `Http1` is also the default for a worker built without a resolved protocol,
+/// so waiting on that value alone would be satisfied by an implementation that
+/// never reads one. Requiring a resolved model id as well means the worker at
+/// least completed introspection against a fixture that answers both
+/// endpoints.
+async fn wait_for_protocol(
+    registry: &Arc<WorkerRegistry>,
+    worker_id: &str,
+    expected: WireProtocol,
+) -> bool {
+    let id = WorkerId(worker_id.into());
+    wait_for(Duration::from_secs(2), || {
+        registry
+            .get(&id)
+            .is_some_and(|w| !w.model_ids.is_empty() && w.protocol() == expected)
+    })
+    .await
+}
+
+/// Poll `cond` every 20 ms until it returns true or `budget` elapses.
+async fn wait_for(budget: Duration, mut cond: impl FnMut() -> bool) -> bool {
+    let deadline = Instant::now() + budget;
+    while Instant::now() < deadline {
+        if cond() {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    cond()
 }
 
 #[tokio::test]
@@ -280,7 +540,15 @@ async fn manager_handles_duplicate_added_as_upsert() {
     )))
     .await
     .unwrap();
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    wait_until(
+        || {
+            registry
+                .get(&WorkerId("w1".into()))
+                .is_some_and(|worker| worker.url == url_second)
+        },
+        "replacement Added event to update the worker",
+    )
+    .await;
 
     assert_eq!(
         registry.workers_for(&ModelId("m1".into())).len(),
@@ -304,6 +572,32 @@ async fn spawn_slow_worker(body: Value, delay: Duration) -> (String, oneshot::Se
             let body = body.clone();
             async move {
                 tokio::time::sleep(delay).await;
+                Json((*body).clone())
+            }
+        }),
+    );
+    let (tx, rx) = oneshot::channel::<()>();
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app)
+            .with_graceful_shutdown(async move {
+                let _ = rx.await;
+            })
+            .await;
+    });
+    (format!("http://127.0.0.1:{port}"), tx)
+}
+
+async fn spawn_gated_worker(body: Value, gate: Arc<Barrier>) -> (String, oneshot::Sender<()>) {
+    let body = Arc::new(body);
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let app = Router::new().route(
+        "/server_info",
+        get(move || {
+            let body = body.clone();
+            let gate = Arc::clone(&gate);
+            async move {
+                gate.wait().await;
                 Json((*body).clone())
             }
         }),
@@ -350,25 +644,22 @@ async fn spawn_counting_worker(body: Value) -> (String, Arc<AtomicUsize>, onesho
     (format!("http://127.0.0.1:{port}"), counter, tx)
 }
 
-/// Registration must run in parallel across multiple `Added` events.
-/// Each fake worker delays its `/server_info` by 200ms; with sequential
-/// processing the manager would take ≥1000ms for 5 workers. We allow
-/// up to 600ms (3x the per-fetch delay) as a generous bound that still
-/// rejects the sequential implementation.
+/// Registration must start every `/server_info` fetch before any response is
+/// released. A sequential manager stalls at the first worker's barrier.
 #[tokio::test]
 async fn added_events_run_in_parallel() {
-    let delay = Duration::from_millis(200);
     let n = 5;
+    let gate = Arc::new(Barrier::new(n + 1));
     let mut workers = Vec::new();
     for _ in 0..n {
-        workers.push(spawn_slow_worker(json!({"served_model_name": "m"}), delay).await);
+        workers
+            .push(spawn_gated_worker(json!({"served_model_name": "m"}), Arc::clone(&gate)).await);
     }
 
     let (tx, rx) = mpsc::channel(16);
     let registry = Arc::new(WorkerRegistry::default());
     let h = tokio::spawn(manager::run(rx, registry.clone()));
 
-    let start = Instant::now();
     for (i, (url, _s)) in workers.iter().enumerate() {
         tx.send(DiscoveryEvent::Added(spec_for(
             &format!("w{i}"),
@@ -378,22 +669,22 @@ async fn added_events_run_in_parallel() {
         .await
         .unwrap();
     }
-    let registered = tokio::time::timeout(Duration::from_secs(5), async {
+    assert!(
+        tokio::time::timeout(Duration::from_secs(2), gate.wait())
+            .await
+            .is_ok(),
+        "manager did not start all {n} /server_info requests concurrently"
+    );
+    let registered = tokio::time::timeout(Duration::from_secs(2), async {
         loop {
             if registry.workers_for(&ModelId("m".into())).len() == n {
-                return true;
+                return;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
     .await;
-    let elapsed = start.elapsed();
     assert!(registered.is_ok(), "manager failed to register {n} workers");
-    assert!(
-        elapsed < Duration::from_millis(600),
-        "registration of {n} workers took {elapsed:?}; sequential per-worker /server_info \
-         fetches would take ≥1000ms — parallel spawn is required"
-    );
 
     drop(tx);
     h.await.unwrap();
@@ -449,7 +740,7 @@ async fn removed_awaits_pending_added() {
 /// independently — 2N round-trips for N workers.
 #[tokio::test]
 async fn manager_emits_single_server_info_fetch_per_worker() {
-    use sgl_router::policies::kv_events::KvEventIndex;
+    use sgl_router::state::kv_events::KvEventIndex;
 
     let body = json!({
         "served_model_name": "m",
