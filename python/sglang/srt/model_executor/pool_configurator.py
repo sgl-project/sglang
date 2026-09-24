@@ -1045,7 +1045,8 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
                 f"layers=[{kvc.layer_info.start_layer},{kvc.layer_info.end_layer}) "
                 f"local={len(self.compression_ratios)}/{len(cfg.compress_ratios)}"
             )
-        self.swa_page_size = cfg.window_size
+        self.swa_window_size = cfg.window_size
+        self.swa_page_size = get_schedule().page_size
         self.operator_swa_ratio = _operator_swa_full_tokens_ratio()
         self.swa_ratio = (
             self.operator_swa_ratio
@@ -1097,8 +1098,10 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
             dsv4_unified_row_bytes,
         )
 
-        # swa_page_size is the model's sliding window (cfg.window_size).
-        self._swa_ring_size = get_swa_ring_size(self.swa_page_size, self.is_speculative)
+        # swa_window_size is the model's sliding window (cfg.window_size).
+        self._swa_ring_size = get_swa_ring_size(
+            self.swa_window_size, self.is_speculative
+        )
         self._spec_infl = 1.0
 
         # The unified pool takes no dtype, so --kv-cache-dtype never reaches it.
