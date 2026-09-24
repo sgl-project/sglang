@@ -851,22 +851,22 @@ class TestDistributedSamplingMask(CustomTestCase):
                 process.wait(timeout=30)
 
     def _generate(self, *, return_sampling_mask, return_logprob):
-        response = requests.post(
-            DEFAULT_URL_FOR_TEST + "/generate",
-            json={
-                "text": "The capital of France is",
-                "sampling_params": {
-                    "temperature": 0.8,
-                    "top_k": 8,
-                    "top_p": 0.9,
-                    "max_new_tokens": 4,
-                    "ignore_eos": True,
-                },
-                "return_sampling_mask": return_sampling_mask,
-                "sampling_logprobs_mode": "support",
-                "return_logprob": return_logprob,
+        payload = {
+            "text": "The capital of France is",
+            "sampling_params": {
+                "temperature": 0.8,
+                "top_k": 8,
+                "top_p": 0.9,
+                "max_new_tokens": 4,
+                "ignore_eos": True,
             },
-            timeout=120,
+            "return_sampling_mask": return_sampling_mask,
+            "return_logprob": return_logprob,
+        }
+        if return_sampling_mask:
+            payload["sampling_logprobs_mode"] = "support"
+        response = requests.post(
+            DEFAULT_URL_FOR_TEST + "/generate", json=payload, timeout=120
         )
         self.assertEqual(response.status_code, 200, response.text)
         return response.json()
