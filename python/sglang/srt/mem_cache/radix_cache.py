@@ -459,7 +459,7 @@ class RadixCache(BasePrefixCache):
         values = kv_indices[:key_len].to(dtype=torch.int64, copy=True)
 
         # Radix Cache takes one ref in memory pool
-        priority = getattr(req, "priority", 0) or 0
+        priority = req.priority or 0
         result = self.insert(
             InsertParams(
                 key=radix_key, value=values, chunked=chunked, priority=priority

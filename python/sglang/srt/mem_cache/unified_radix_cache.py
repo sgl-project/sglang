@@ -986,7 +986,7 @@ class UnifiedRadixCache(BasePrefixCache):
 
         insert_params = InsertParams(
             prev_prefix_len=req.kv.cache_protected_len,
-            priority=getattr(req, "priority", 0) or 0,
+            priority=req.priority or 0,
             session_id=req.session_id,
             rotation_base=req.kv_rotation_base,
         )
@@ -1105,7 +1105,7 @@ class UnifiedRadixCache(BasePrefixCache):
         insert_params = InsertParams(
             prev_prefix_len=req.kv.cache_protected_len,
             chunked=chunked,
-            priority=getattr(req, "priority", 0) or 0,
+            priority=req.priority or 0,
             rotation_base=req.kv_rotation_base,
         )
         effective_cache_len = len(token_ids)
@@ -1157,7 +1157,7 @@ class UnifiedRadixCache(BasePrefixCache):
         insert_params = InsertParams(
             prev_prefix_len=req.kv.cache_protected_len,
             chunked=chunked,
-            priority=getattr(req, "priority", 0) or 0,
+            priority=req.priority or 0,
             session_id=req.session_id,
             rotation_base=req.kv_rotation_base,
         )
