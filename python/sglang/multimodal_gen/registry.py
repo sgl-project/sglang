@@ -84,6 +84,10 @@ from sglang.multimodal_gen.configs.pipeline_configs.ltx_2 import (
     LTX23PipelineConfig,
 )
 from sglang.multimodal_gen.configs.pipeline_configs.ltx_2_5 import LTX25PipelineConfig
+from sglang.multimodal_gen.configs.pipeline_configs.ming_image import (
+    MingImageLayerPipelineConfig,
+    MingImagePipelineConfig,
+)
 from sglang.multimodal_gen.configs.pipeline_configs.minimax_h3_vdn import (
     VDNH3PipelineConfig,
 )
@@ -172,6 +176,10 @@ from sglang.multimodal_gen.configs.sample.ltx_2 import (
     LTX23SamplingParams,
 )
 from sglang.multimodal_gen.configs.sample.ltx_2_5 import LTX25SamplingParams
+from sglang.multimodal_gen.configs.sample.ming_image import (
+    MingImageLayerSamplingParams,
+    MingImageSamplingParams,
+)
 from sglang.multimodal_gen.configs.sample.minimax_h3 import (
     FastH3SamplingParams,
     MiniMaxH3SamplingParams,
@@ -355,6 +363,7 @@ _MODEL_NAME_DETECTORS: List[Tuple[str, Callable[[str], bool]]] = []
 # aliases next to the resolver that consumes them so CLI detection and
 # pipeline selection cannot drift apart
 KNOWN_NON_DIFFUSERS_DIFFUSION_MODEL_PATTERNS: Dict[str, str] = {
+    "ming-image-0.1-design": "MingImagePipeline",
     "minimaxai/minimax-h3": "MiniMaxH3Pipeline",
     "minimax/minimax-h3": "MiniMaxH3Pipeline",
     "fastvideo/fastvideo-fasth3-4-step-preview-v1-vsa-datafree": "FastH3Pipeline",
@@ -811,6 +820,23 @@ def get_model_info(
 
 # Registration of model configs
 def _register_configs():
+    register_configs(
+        sampling_param_cls=MingImageLayerSamplingParams,
+        pipeline_config_cls=MingImageLayerPipelineConfig,
+        hf_model_paths=["inclusionAI/Ming-Image-0.1-Design-Layer"],
+        model_detectors=[lambda model: "ming-image-0.1-design-layer" in model.lower()],
+    )
+    register_configs(
+        sampling_param_cls=MingImageSamplingParams,
+        pipeline_config_cls=MingImagePipelineConfig,
+        hf_model_paths=["inclusionAI/Ming-Image-0.1-Design"],
+        model_detectors=[
+            lambda model: (
+                "ming-image-0.1-design" in model.lower()
+                and "design-layer" not in model.lower()
+            )
+        ],
+    )
     # Pi0.5 / OpenPI / LeRobot action policies.
     register_configs(
         sampling_param_cls=Pi05SamplingParams,
