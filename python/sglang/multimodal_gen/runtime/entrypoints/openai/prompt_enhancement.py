@@ -20,6 +20,7 @@ class PromptEnhancerConfig(BaseModel):
         default=(
             "Rewrite the user's prompt for image or video generation. Preserve "
             "the requested subjects, count, quoted text, actions, style and language. "
+            "Preserve special tokens and reference labels exactly. "
             "Clarify visual details without inventing new subjects or changing intent. "
             "For image editing, describe only the requested edits and preserve "
             "everything else. For video, preserve the requested motion and timing. "

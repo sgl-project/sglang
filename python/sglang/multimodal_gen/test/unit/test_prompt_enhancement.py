@@ -12,8 +12,28 @@ from PIL import Image
 from pydantic import ValidationError
 
 from sglang.multimodal_gen import registry
+from sglang.multimodal_gen.configs.pipeline_configs.ernie_image import (
+    ErnieImagePipelineConfig,
+)
+from sglang.multimodal_gen.configs.pipeline_configs.flux import FluxPipelineConfig
+from sglang.multimodal_gen.configs.pipeline_configs.ideogram import (
+    Ideogram4PipelineConfig,
+)
+from sglang.multimodal_gen.configs.pipeline_configs.longcat_image import (
+    LongCatImagePipelineConfig,
+)
+from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import (
+    QwenImagePipelineConfig,
+)
 from sglang.multimodal_gen.configs.pipeline_configs.wan import WanT2V480PConfig
 from sglang.multimodal_gen.configs.pipeline_configs.zimage import ZImagePipelineConfig
+from sglang.multimodal_gen.configs.sample.ernie_image import ErnieImageSamplingParams
+from sglang.multimodal_gen.configs.sample.flux import FluxSamplingParams
+from sglang.multimodal_gen.configs.sample.ideogram import Ideogram4SamplingParams
+from sglang.multimodal_gen.configs.sample.longcat_image import (
+    LongCatImageSamplingParams,
+)
+from sglang.multimodal_gen.configs.sample.qwenimage import QwenImageSamplingParams
 from sglang.multimodal_gen.configs.sample.wan import WanT2V_1_3B_SamplingParams
 from sglang.multimodal_gen.configs.sample.zimage import ZImageTurboSamplingParams
 from sglang.multimodal_gen.runtime.entrypoints import http_server
@@ -169,15 +189,8 @@ def server(monkeypatch, tmp_path):
     )
     monkeypatch.setattr(server_args_module, "_global_server_args", args)
 
-    def model_info(*args_, **kwargs):
-        cls = (
-            ZImageTurboSamplingParams
-            if args.pipeline_config.task_type.is_image_gen()
-            else WanT2V_1_3B_SamplingParams
-        )
-        return SimpleNamespace(sampling_param_cls=cls)
-
-    monkeypatch.setattr(registry, "get_model_info", model_info)
+    model_info = SimpleNamespace(sampling_param_cls=ZImageTurboSamplingParams)
+    monkeypatch.setattr(registry, "get_model_info", lambda *args, **kwargs: model_info)
     monkeypatch.setattr(async_scheduler_client, "initialize", lambda args: None)
     monkeypatch.setattr(async_scheduler_client, "close", lambda: None)
     monkeypatch.setattr(http_server, "_wait_until_http_live", AsyncMock())
@@ -202,6 +215,7 @@ def server(monkeypatch, tmp_path):
             client=client,
             app=app,
             args=args,
+            model_info=model_info,
             calls=calls,
             batches=batches,
             rewritten=rewritten,
@@ -243,6 +257,7 @@ def test_http_routes_enhance_once_before_sampling_and_preserve_options(
         )
     else:
         server.args.pipeline_config = WanT2V480PConfig()
+        server.model_info.sampling_param_cls = WanT2V_1_3B_SamplingParams
         payload = {
             "prompt": original,
             "seed": 123,
@@ -318,6 +333,42 @@ def test_missing_switch_preserves_original_prompt(server):
     assert response.status_code == 200, response.text
     assert not server.calls
     assert server.batches[0].prompt == "keep exactly this"
+
+
+@pytest.mark.parametrize(
+    "pipeline_cls, sampling_cls, extras",
+    [
+        (FluxPipelineConfig, FluxSamplingParams, {}),
+        (QwenImagePipelineConfig, QwenImageSamplingParams, {}),
+        (Ideogram4PipelineConfig, Ideogram4SamplingParams, {}),
+        (ErnieImagePipelineConfig, ErnieImageSamplingParams, {"use_pe": False}),
+        (
+            LongCatImagePipelineConfig,
+            LongCatImageSamplingParams,
+            {"enable_prompt_rewrite": False},
+        ),
+    ],
+)
+def test_model_sampling_contracts_remain_owned_by_the_model(
+    server, pipeline_cls, sampling_cls, extras
+):
+    server.args.pipeline_config = pipeline_cls()
+    server.model_info.sampling_param_cls = sampling_cls
+    response = server.client.post(
+        "/v1/images/generations",
+        json={
+            "prompt": "a teapot",
+            "enhance_prompt": True,
+            "response_format": "b64_json",
+            **extras,
+        },
+    )
+    assert response.status_code == 200, response.text
+    sampling = server.batches[0].sampling_params
+    assert type(sampling) is sampling_cls
+    assert sampling.prompt == server.rewritten
+    for name, value in extras.items():
+        assert vars(sampling)[name] == value
 
 
 @pytest.mark.parametrize(
