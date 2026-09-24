@@ -234,6 +234,148 @@ class TestHermesDetector(CustomTestCase):
         self.assertEqual(final.normal_text, "")
         self.assertEqual(len(final.calls), 0)
 
+    def test_finish_drains_complete_calls_from_one_delta(self):
+        first = '<tool_call>{"name": "get_weather", "arguments": {"city": "Beijing"}}</tool_call>'
+        second = '<tool_call>{"name": "search", "arguments": {"query": "restaurants"}}</tool_call>'
+        for text, expected_text, expected_calls in [
+            (first, "", [("get_weather", {"city": "Beijing"})]),
+            (
+                first + second,
+                "",
+                [
+                    ("get_weather", {"city": "Beijing"}),
+                    ("search", {"query": "restaurants"}),
+                ],
+            ),
+            (
+                "Before " + first + " between " + second + " after",
+                "Before  between  after",
+                [
+                    ("get_weather", {"city": "Beijing"}),
+                    ("search", {"query": "restaurants"}),
+                ],
+            ),
+        ]:
+            with self.subTest(text=text):
+                self._assert_finished_stream([text], expected_text, expected_calls)
+
+    def test_finish_drains_calls_across_chunk_boundaries(self):
+        text = (
+            '<tool_call>{"name": "get_weather", "arguments": {"city": "Beijing"}}</tool_call>'
+            '<tool_call>{"name": "search", "arguments": {"query": "restaurants"}}</tool_call>'
+        )
+        for boundary in range(1, len(text)):
+            with self.subTest(boundary=boundary):
+                self._assert_finished_stream(
+                    [text[:boundary], text[boundary:]],
+                    "",
+                    [
+                        ("get_weather", {"city": "Beijing"}),
+                        ("search", {"query": "restaurants"}),
+                    ],
+                )
+
+    def test_finish_preserves_complete_call_before_incomplete_tail(self):
+        first = '<tool_call>{"name": "get_weather", "arguments": {"city": "Beijing"}}</tool_call>'
+        for tail in [
+            '<tool_call>{"name": "search", "arguments": {"query": "rest',
+            "<tool_call>not valid json</tool_call>",
+        ]:
+            with self.subTest(tail=tail):
+                self._assert_finished_stream(
+                    [first + " between " + tail],
+                    " between ",
+                    [("get_weather", {"city": "Beijing"})],
+                )
+
+    def test_finish_preserves_partial_marker_after_complete_call(self):
+        text = '<tool_call>{"name": "get_weather", "arguments": {"city": "Beijing"}}</tool_call>after <tool_'
+        self._assert_finished_stream(
+            [text], "after <tool_", [("get_weather", {"city": "Beijing"})]
+        )
+
+    def test_finish_drains_split_closing_marker_before_next_call(self):
+        self._assert_finished_stream(
+            [
+                '<tool_call>{"name": "get_weather",',
+                '"arguments": {"city": "Beijing"}}',
+                "</tool_",
+                'call><tool_call>{"name": "search", "arguments": {"query": "restaurants"}}</tool_call>',
+            ],
+            "",
+            [
+                ("get_weather", {"city": "Beijing"}),
+                ("search", {"query": "restaurants"}),
+            ],
+        )
+
+    def test_finish_keeps_delimiters_inside_arguments(self):
+        arguments = {"query": "literal </tool_call> and <tool_call>"}
+        text = (
+            "<tool_call>"
+            + json.dumps({"name": "search", "arguments": arguments})
+            + "</tool_call>"
+        )
+        self._assert_finished_stream([text], "", [("search", arguments)])
+
+    def test_finish_drops_missing_closing_tag_with_delimiter_in_arguments(self):
+        detector = HermesDetector()
+        text = '<tool_call>{"name": "search", "arguments": {"query": "literal </tool_call>"}}'
+        detector.parse_streaming_increment(text, self.tools)
+        final = detector.finish(self.tools)
+        self.assertEqual(final.normal_text, "")
+        self.assertEqual(final.calls, [])
+        self.assertEqual(detector._buffer, "")
+
+    def test_finish_stops_when_arguments_cannot_advance(self):
+        for arguments in [{}, {"arguments": None}]:
+            with self.subTest(arguments=arguments):
+                detector = HermesDetector()
+                text = (
+                    "<tool_call>"
+                    + json.dumps({"name": "search", **arguments})
+                    + "</tool_call>"
+                )
+                detector.parse_streaming_increment(text, self.tools)
+                final = detector.finish(self.tools)
+                self.assertEqual(final.normal_text, "")
+                self.assertEqual(final.calls, [])
+                self.assertEqual(detector._buffer, "")
+
+    def _assert_finished_stream(self, chunks, expected_text, expected_calls):
+        detector = HermesDetector()
+        results = [
+            detector.parse_streaming_increment(chunk, self.tools) for chunk in chunks
+        ]
+        results.append(detector.finish(self.tools))
+        self.assertEqual(
+            "".join(result.normal_text for result in results), expected_text
+        )
+        names = {}
+        arguments = {}
+        for result in results:
+            for call in result.calls:
+                if call.name:
+                    self.assertNotIn(call.tool_index, names)
+                    names[call.tool_index] = call.name
+                arguments[call.tool_index] = (
+                    arguments.get(call.tool_index, "") + call.parameters
+                )
+        self.assertEqual(sorted(names), list(range(len(expected_calls))))
+        self.assertEqual(
+            [(names[index], json.loads(arguments[index])) for index in sorted(names)],
+            expected_calls,
+        )
+        self.assertEqual(
+            detector.streamed_args_for_tool,
+            [arguments[index] for index in sorted(names)],
+        )
+        self.assertEqual(detector._buffer, "")
+        self.assertEqual(detector._normal_text_buffer, "")
+        final = detector.finish(self.tools)
+        self.assertEqual(final.normal_text, "")
+        self.assertEqual(final.calls, [])
+
     def test_finish_drops_unterminated_tool_call_without_raising(self):
         """If generation stops mid-argument (bot_token seen, no eot_token),
         the buffered content is neither valid normal text nor a parseable
