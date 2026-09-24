@@ -26,6 +26,7 @@ from sglang.srt.mem_cache.unified_cache.cache_action import (
     MambaEvictExcessPathStates,
 )
 from sglang.srt.mem_cache.unified_cache.components.base import (
+    BASE_COMPONENT_TYPE,
     CacheTransferPhase,
     ComponentType,
     EvictLayer,
@@ -404,6 +405,8 @@ class MambaComponent(TreeComponent):
             return x.id
         if not enabled:
             x_next = lru.get_prev_no_lock(x)
+        # write_back: demote the state to host before the internal tombstone.
+        self._maybe_backup_node_before_state_tombstone(x)
         self.tree_core._evict_component_and_detach_lru(
             x,
             self,
@@ -417,6 +420,35 @@ class MambaComponent(TreeComponent):
         )
         self._evict_device_cursor = lru.cursor_next() if enabled else x_next
         return None
+
+    def _maybe_backup_node_before_state_tombstone(self, node: UnifiedTreeNode) -> None:
+        """Demote an internal node's mamba state to host before its tombstone
+        (write_back only), mirroring the leaf deferred-demote path.
+
+        The match validator passes only nodes holding the state on some
+        layer, so a dropped internal state caps the match frontier at this
+        node forever, leaving the subtree's still-resident KV unservable.
+        Best-effort: this walk must make progress (it satisfies an imminent
+        slot allocation), so any failure falls back to the legacy drop.
+        """
+        cache = self.cache
+        cd = node.component_data[self.component_type]
+        if (
+            cache.cache_controller is None
+            or not cache.is_write_back
+            or cd.host_value is not None
+            or node.backuped
+            or node.component_data[BASE_COMPONENT_TYPE].value is None
+        ):
+            return
+        # The backup executor pre-evicts only the KV host pool; make room
+        # for the state slot the way the PREFETCH hook does.
+        if (
+            self._mamba_pool_host is not None
+            and self._mamba_pool_host.available_size() < 1
+        ):
+            cache.evict_host(1, self.component_type)
+        cache.backup_node_for_write_back(node.id)
 
     def _evict_device_end(self) -> None:
         """Clear the device-eviction walk cursor state."""
