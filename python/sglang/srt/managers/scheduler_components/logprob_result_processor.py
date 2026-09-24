@@ -43,8 +43,8 @@ class SchedulerLogprobResultProcessor:
             # But the shared pipeline requires input_token_logprobs_idx to be the same
             # length as input_token_logprobs_val (validated at line 816). We fill with
             # MIS_DELIMITER_TOKEN_ID as a dummy — score_request() ignores this field.
-            delimiter_count = len(req.multi_item_delimiter_indices)
-            input_token_logprobs_idx = [MIS_DELIMITER_TOKEN_ID] * delimiter_count
+            position_count = len(self._scoring_positions(req))
+            input_token_logprobs_idx = [MIS_DELIMITER_TOKEN_ID] * position_count
         else:
             # Regular request: include all tokens from logprob_start_len onwards
             input_token_logprobs_idx = req.origin_input_ids[req.logprob_start_len :]
@@ -150,15 +150,16 @@ class SchedulerLogprobResultProcessor:
         req.temp_input_token_ids_logprobs_val = None
 
     def _calculate_relevant_tokens_len(self, req: Req) -> int:
-        """Calculate the expected length of logprob arrays based on whether multi-item scoring is enabled.
+        """Calculate the expected length of logprob arrays based on whether position-based scoring is used.
 
-        For multi-item scoring, only delimiter positions have logprobs.
-        For regular requests, all positions from logprob_start_len onwards have logprobs.
+        For position-based scoring (MIS delimiters or setwise anchors), only those
+        positions have logprobs. For regular requests, all positions from
+        logprob_start_len onwards have logprobs.
         """
-        is_multi_item_scoring = self._is_multi_item_scoring(req)
+        positions = self._scoring_positions(req)
 
-        if is_multi_item_scoring:
-            return len(req.multi_item_delimiter_indices)
+        if positions is not None:
+            return len(positions)
         else:
             return len(req.origin_input_ids[req.logprob_start_len :])
 
@@ -168,36 +169,53 @@ class SchedulerLogprobResultProcessor:
         extend_input_len: int,
         extend_logprob_start_len: int,
     ) -> int:
-        """Calculate the number of input logprobs based on whether multi-item scoring is enabled.
+        """Calculate the number of input logprobs based on whether position-based scoring is used.
 
-        For multi-item scoring, only delimiter positions have logprobs.
-        For regular requests, all positions in the range have logprobs.
+        For position-based scoring (MIS delimiters or setwise anchors), only those
+        positions have logprobs. For regular requests, all positions in the range
+        have logprobs.
         """
-        is_multi_item_scoring = self._is_multi_item_scoring(req)
+        positions = self._scoring_positions(req)
 
-        if is_multi_item_scoring:
-            # Count pre-computed delimiter indices within the extend range
+        if positions is not None:
+            # Count pre-computed scoring positions within the extend range
             return sum(
                 1
-                for idx in req.multi_item_delimiter_indices
+                for idx in positions
                 if extend_logprob_start_len <= idx < extend_input_len
             )
         else:
             # Regular request: all tokens in the range
             return extend_input_len - extend_logprob_start_len
 
-    def _is_multi_item_scoring(self, req: Req) -> bool:
-        """Check if request uses multi-item scoring.
+    def _scoring_positions(self, req: Req):
+        """Position-based scoring readout indices for a prefill-only request, else None.
 
-        Multi-item scoring applies to prefill-only requests when a delimiter
-        token is configured. In this mode, only positions containing the
-        delimiter token receive logprobs.
+        Both MIS (delimiter positions, --enable-mis) and setwise scoring
+        (token_indices_to_pool, per-anchor readout) compute label-token logprobs
+        at a fixed set of positions instead of at every input token; the logprob
+        bookkeeping below is identical for the two.
         """
-        return (
+        if not req.is_prefill_only:
+            return None
+        # Setwise anchors take precedence over MIS delimiters: a fused setwise
+        # request carries both, and its logprobs are read at the anchors.
+        if req.token_indices_to_pool is not None:
+            return req.token_indices_to_pool
+        if (
             get_exec().features.enable_mis
-            and req.is_prefill_only
             and req.multi_item_delimiter_indices is not None
-        )
+        ):
+            return req.multi_item_delimiter_indices
+        return None
+
+    def _is_multi_item_scoring(self, req: Req) -> bool:
+        """Whether the request uses position-based scoring (MIS or setwise).
+
+        In this mode only the scoring positions receive logprobs, so the shared
+        logprob pipeline skips the None prefix and last-token pop.
+        """
+        return self._scoring_positions(req) is not None
 
     def add_input_logprob_return_values(
         self,

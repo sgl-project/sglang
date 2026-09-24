@@ -1407,10 +1407,11 @@ class ScoringRequest(BaseModel):
     item_first: bool = False
     return_pooled_hidden_states: bool = False
 
-    # Setwise readout (SequenceClassification-only): when set, the head is pooled
-    # AT every occurrence of this token in each `query + item` sequence instead of
-    # the last token, and `scores` is returned nested (one `[Nᵢ x num_labels]`
-    # matrix per item). --enable-mis fuses items; otherwise each is scored alone.
+    # Setwise readout: when set, the readout is taken AT every occurrence of this
+    # token in each `query + item` sequence instead of the last token, and `scores`
+    # is returned nested (one `[Nᵢ x num_labels]` matrix per item). SeqCls pools the
+    # head there; CausalLM reads label-token logprobs there. Both support batched
+    # and --enable-mis.
     score_extraction_token: Optional[str] = None
 
     model: str = DEFAULT_MODEL_NAME

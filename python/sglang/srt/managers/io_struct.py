@@ -356,6 +356,11 @@ class GenerateReqInput:
     # Batch-level: List[List[int]] (one per request). After __getitem__: List[int].
     multi_item_delimiter_indices: Optional[Union[List[List[int]], List[int]]] = None
 
+    # Token positions for setwise pooling readout (CausalLM: label-token logprobs
+    # are read AT these positions instead of the last token).
+    # Batch-level: List[List[int]] (one per request). After __getitem__: List[int].
+    token_indices_to_pool: Optional[Union[List[List[int]], List[int]]] = None
+
     # Cache namespace used to isolate otherwise-identical prefixes.
     cache_salt: Optional[Union[List[str], str]] = None
 
@@ -1022,6 +1027,11 @@ class GenerateReqInput:
                 if self.multi_item_delimiter_indices is not None
                 else None
             ),
+            token_indices_to_pool=(
+                self.token_indices_to_pool[i]
+                if self.token_indices_to_pool is not None
+                else None
+            ),
         )
         cache[i] = sub
         return sub
@@ -1118,6 +1128,9 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
 
     # Pre-computed delimiter indices for multi-item scoring
     multi_item_delimiter_indices: Optional[List[int]] = None
+
+    # Token positions for setwise pooling readout (CausalLM)
+    token_indices_to_pool: Optional[List[int]] = None
 
     # For observability
     # Pickled Optional[Union[APIServerReqTimeStats, DPControllerReqTimeStats]]
