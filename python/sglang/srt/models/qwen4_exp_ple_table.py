@@ -2,7 +2,7 @@
 
 ``--ple-offload-embedding`` keeps the PLE table (47.7 GiB in fp8 for
 Qwen3.8-Flash-Next) out of device memory and lets the Triton gather kernel read
-rows straight from a host pointer. Two backends provide that pointer:
+rows straight from a host pointer. Three backends provide that pointer:
 
 ``pinned`` (default)
     ``torch.empty(..., pin_memory=True)``. On a discrete GPU this frees VRAM.
@@ -23,6 +23,13 @@ rows straight from a host pointer. Two backends provide that pointer:
     page-cache folios and the table would otherwise creep towards full
     residency (see ``PleFileRssTrimmer``).
 
+``shared``
+    One complete table per tensor-parallel group in an anonymous shared
+    ``memfd`` mapping, registered with CUDA on every rank. Each rank loads only
+    its own vocabulary partition, then gathers any row itself, so the lookup
+    needs no all-reduce. Single host only: the peers open rank 0's descriptor
+    through ``/proc/<pid>/fd``.
+
 This module has no Triton or CUDA-kernel imports so that its allocator and
 prefetcher can be unit-tested on CPU.
 """
@@ -32,6 +39,7 @@ from __future__ import annotations
 import ctypes
 import ctypes.util
 import logging
+import mmap
 import os
 import re
 import threading
@@ -49,11 +57,15 @@ _SMAPS_HEADER = re.compile(r"^([0-9a-f]+)-([0-9a-f]+) ")
 _SMAPS_RSS = re.compile(r"^Rss:\s+(\d+) kB")
 
 PLE_OFFLOAD_BACKENDS = ("pinned", "file")
+# Shared tables stay mapped and registered until the process exits: captured
+# CUDA graphs hold their raw address, not a reference to the tensor.
+_SHARED_TABLES: list[torch.Tensor] = []
 
 # cudaDeviceAttr enum values (cuda_runtime_api.h).
 _CUDA_DEV_ATTR_PAGEABLE_MEMORY_ACCESS_USES_HOST_PAGE_TABLES = 100
 _MADV_RANDOM = 1
 _MADV_DONTNEED = 4
+_MADV_HUGEPAGE = 14
 _PAGE_SHIFT = 12
 # One MADV_DONTNEED call takes mmap_lock for its whole range; over the full
 # 47.7 GiB table that is ~3.5 s during which every fault in the process --
@@ -262,6 +274,68 @@ def allocate_ple_host_table(
     table = storage.view(dtype).view(*[int(d) for d in shape])
     table._sglang_ple_file_path = path  # consumed by PleFilePrefetcher
     return table
+
+
+def allocate_shared_ple_host_table(
+    shape: Sequence[int], dtype: torch.dtype, group
+) -> torch.Tensor:
+    """Map one host table of ``shape``/``dtype`` on every rank of ``group``.
+
+    Collective: every rank of ``group`` calls it in the same order. The table is
+    an anonymous ``memfd``, so there is no name to leak and it is freed when the
+    last rank exits.
+    """
+    nbytes = torch.Size(shape).numel() * torch.empty(0, dtype=dtype).element_size()
+    owner = None
+    if group.rank_in_group == 0:
+        memfd = os.memfd_create("sglang_ple_table")
+        os.ftruncate(memfd, nbytes)
+        stat = os.fstat(memfd)
+        owner = (os.getpid(), memfd, stat.st_dev, stat.st_ino)
+    pid, memfd, dev, ino = group.broadcast_object(owner, src=0)
+    path = f"/proc/{pid}/fd/{memfd}"
+    try:
+        fd = os.open(path, os.O_RDWR)
+    except OSError as exc:
+        raise RuntimeError(
+            f"--ple-offload-backend shared: cannot open rank 0's PLE table at "
+            f"{path} ({exc}); all tensor-parallel ranks must run on one host in "
+            "one PID namespace"
+        ) from exc
+    try:
+        stat = os.fstat(fd)
+        # A PID from another namespace can name an unrelated descriptor.
+        if (stat.st_dev, stat.st_ino) != (dev, ino):
+            raise RuntimeError(
+                f"--ple-offload-backend shared: {path} is not rank 0's PLE table; "
+                "all tensor-parallel ranks must run in one PID namespace"
+            )
+        mapping = mmap.mmap(
+            fd, nbytes, flags=mmap.MAP_SHARED, prot=mmap.PROT_READ | mmap.PROT_WRITE
+        )
+    finally:
+        os.close(fd)
+    # Rank 0's descriptor keeps the /proc path valid until every rank mapped it.
+    group.barrier()
+    if group.rank_in_group == 0:
+        os.close(memfd)
+
+    table = torch.frombuffer(mapping, dtype=torch.uint8)
+    # Registration faults the pages in; shmem THP "advise" backs only advised mappings.
+    _madvise(addr=table.data_ptr(), length=nbytes, advice=_MADV_HUGEPAGE)
+    cudart = torch.cuda.cudart()
+    rc = int(cudart.cudaHostRegister(table.data_ptr(), nbytes, 0))
+    if rc != 0:
+        raise RuntimeError(
+            f"--ple-offload-backend shared: cudaHostRegister of a "
+            f"{nbytes / 2**30:.2f} GiB PLE table failed (rc={rc}, "
+            f"{cudart.cudaGetErrorString(cudart.cudaError(rc))})"
+        )
+    _SHARED_TABLES.append(table)
+    logger.info(
+        "PLE table: shared memfd inode %d (%.2f GiB, %s)", ino, nbytes / 2**30, dtype
+    )
+    return table.view(dtype).view(*[int(d) for d in shape])
 
 
 def make_ple_file_prefetcher(table: torch.Tensor) -> Optional[PleFilePrefetcher]:

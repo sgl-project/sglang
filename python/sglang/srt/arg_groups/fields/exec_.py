@@ -888,8 +888,13 @@ class ExecOffload(msgspec.Struct):
             "directly; use it on unified-memory devices (e.g. GB10 / DGX Spark) "
             "where pinned host memory comes out of the same pool as the model "
             "weights. Requires a device that reports "
-            "cudaDevAttrPageableMemoryAccessUsesHostPageTables.",
-            choices=["pinned", "file"],
+            "cudaDevAttrPageableMemoryAccessUsesHostPageTables. 'shared' keeps "
+            "one complete pinned table per tensor-parallel group in anonymous "
+            "shared host memory; every rank gathers its rows directly, so the "
+            "lookup needs no all-reduce. Single node only; not supported with "
+            "--enable-dp-attention, --load-format presharded, "
+            "--weight-cache-mode or --elastic-ep-backend.",
+            choices=["pinned", "file", "shared"],
         ),
     ] = "pinned"
     ple_offload_dir: A[

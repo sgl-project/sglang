@@ -37,10 +37,24 @@ def handle_offload_compatibility(server_args: Any) -> None:
             "would stage the pinned PLE embedding back to the device."
         )
 
-    if cfg.ple_offload_backend == "file" and cfg.ple_offload_embedding is False:
+    if cfg.ple_offload_backend != "pinned" and cfg.ple_offload_embedding is False:
         raise ValueError(
-            "--ple-offload-backend file requires --ple-offload-embedding: "
-            "the file-backed table is the offloaded table."
+            f"--ple-offload-backend {cfg.ple_offload_backend} requires "
+            "--ple-offload-embedding: that backend holds the offloaded table."
+        )
+
+    if cfg.ple_offload_backend == "shared" and (
+        cfg.nnodes > 1
+        or cfg.enable_dp_attention
+        or cfg.load_format == "presharded"
+        or cfg.weight_cache_mode != "off"
+        or cfg.elastic_ep_backend is not None
+    ):
+        raise ValueError(
+            "--ple-offload-backend shared supports a single node only, without "
+            "--enable-dp-attention, --load-format presharded, --weight-cache-mode "
+            "or --elastic-ep-backend: its tensor-parallel ranks share one host "
+            "table through /proc and all build and synchronize it together."
         )
 
 
