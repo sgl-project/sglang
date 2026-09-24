@@ -54,6 +54,35 @@ def run_until_all_finished(handles: List[Any], *, max_steps: int = DEFAULT_MAX_S
     )
 
 
+DEFAULT_DRAIN_STEPS: int = 16
+
+
+def drain_until_kv_released(*reqs, max_steps: int = DEFAULT_DRAIN_STEPS):
+    # Takes Reqs, not handles: a handle's req goes None once an aborted req leaves
+    # the live queues, so the check would pass vacuously without ever seeing KV.
+    def released(r):
+        return r.kv.req_pool_idx is None and r.kv.is_kv_released
+
+    for _ in range(max_steps):
+        if all(released(r) for r in reqs):
+            return
+        yield
+    # The loop tests before each yield, so the last yield's state is still unseen.
+    pending = [r for r in reqs if not released(r)]
+    if not pending:
+        return
+    raise AssertionError(
+        f"drain_until_kv_released: reqs still holding KV after {max_steps} steps ("
+        + "; ".join(
+            f"rid={r.rid} row_idx={r.kv.req_pool_idx!r} "
+            f"kv_allocated_len={r.kv.kv_allocated_len} "
+            f"swa_evicted_seqlen={r.kv.swa_evicted_seqlen}"
+            for r in pending
+        )
+        + ")"
+    )
+
+
 def warmup_radix(t, prompt_tokens: List[int], *, max_steps: int = DEFAULT_MAX_STEPS):
     assert prompt_tokens, "warmup_radix needs a non-empty prompt"
     token = prompt_tokens[0]

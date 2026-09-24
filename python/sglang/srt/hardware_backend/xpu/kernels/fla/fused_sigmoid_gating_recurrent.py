@@ -50,7 +50,9 @@ def fused_sigmoid_gating_delta_rule_update(
     # Both paths (KDA/GDN) advance p_a once per token, so use the token-axis stride.
     # For 2D a ([T, ...]) this is stride(0); for 3D a ([B, T, ...]) this is stride(1).
     # Using stride()[-2] covers GDN [T, HV] and KDA layouts ([T, HV*K] / [B, T, HV*K]).
-    stride_a = a.stride()[-2]
+    # KDA decode also passes 4-D [B, T, H, K], where [-2] is the head stride, not the
+    # token stride; take dim 1 explicitly for that layout.
+    stride_a = a.stride()[1] if a.ndim == 4 else a.stride()[-2]
     HV = v.shape[2]
     N = B if cu_seqlens is None else len(cu_seqlens) - 1
     BK, BV = (
@@ -81,6 +83,15 @@ def fused_sigmoid_gating_delta_rule_update(
 
     grid = (NK, NV, N * HV)
 
+    # Adaptive spec changes the runtime draft count without changing the
+    # allocated per-request pitch, which is preserved in stride(0).
+    if intermediate_states_buffer is not None:
+        cache_stride_steps = intermediate_states_buffer.stride(0) // (HV * K * V)
+    elif cache_steps is not None and cache_steps > 0:
+        cache_stride_steps = cache_steps
+    else:
+        cache_stride_steps = 0
+
     fused_sigmoid_gating_delta_rule_update_kernel[grid](
         A_log=A_log,
         a=a,
@@ -95,10 +106,13 @@ def fused_sigmoid_gating_delta_rule_update(
         o=o,
         h0_source=initial_state_source,
         h0_indices=initial_state_indices,
+        stride_h0_source=(
+            initial_state_source.stride(0) if initial_state_source is not None else 0
+        ),
         cu_seqlens=cu_seqlens,
         intermediate_states_buffer=intermediate_states_buffer,
         intermediate_state_indices=intermediate_state_indices,
-        cache_steps=0 if cache_steps is None else cache_steps,
+        cache_steps=cache_stride_steps,
         retrieve_parent_token_ptr=retrieve_parent_token,
         stride_retrieve_parent_token_seq=stride_retrieve_parent_token_seq,
         stride_retrieve_parent_token_token=stride_retrieve_parent_token_token,

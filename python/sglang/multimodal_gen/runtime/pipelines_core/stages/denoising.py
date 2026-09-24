@@ -1243,7 +1243,11 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         assert self.transformer is not None
         pipeline = self.pipeline() if self.pipeline else None
         scheduler = batch.scheduler
-        assert scheduler is not None
+        # Repairing it here would reach step() with unset sigmas; pipelines without
+        # TimestepPreparationStage seed batch.scheduler in their latent-prep stage.
+        assert scheduler is not None, (
+            "batch.scheduler must be prepared before DenoisingStage"
+        )
 
         dual_transformer_mode = self._dual_transformer_execution_mode()
         uses_boundary_transformer_2 = (

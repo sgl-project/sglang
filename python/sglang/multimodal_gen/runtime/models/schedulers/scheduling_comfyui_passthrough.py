@@ -57,7 +57,8 @@ class ComfyUIPassThroughScheduler(BaseScheduler, ConfigMixin, SchedulerMixin):
         # Initialize timesteps as empty - will be set externally
         self.timesteps = torch.tensor([], dtype=torch.long)
         self.shift = 0.0
-        self._step_index = 0  # Track current step index
+        # DenoisingStage resets this to None between loops.
+        self._step_index: int | None = 0
         self._begin_index: int | None = None  # For compatibility with DenoisingStage
 
     def set_timesteps(
@@ -89,6 +90,9 @@ class ComfyUIPassThroughScheduler(BaseScheduler, ConfigMixin, SchedulerMixin):
                 device = torch.device("cpu")
             self.timesteps = torch.tensor([0], dtype=torch.long, device=device)
 
+    def _init_step_index(self, timestep: torch.FloatTensor | int) -> None:
+        self._step_index = self._begin_index if self._begin_index is not None else 0
+
     def step(
         self,
         model_output: torch.FloatTensor,
@@ -112,7 +116,10 @@ class ComfyUIPassThroughScheduler(BaseScheduler, ConfigMixin, SchedulerMixin):
         Returns:
             The input sample unchanged (prev_sample = sample)
         """
-        # Increment step index for tracking
+        # DenoisingStage clears _step_index before the loop; re-seed it.
+        if self.step_index is None:
+            self._init_step_index(timestep)
+        # Incremented before returning, unlike diffusers; nothing below reads it.
         self._step_index += 1
 
         # Simply return the input sample unchanged
@@ -164,9 +171,9 @@ class ComfyUIPassThroughScheduler(BaseScheduler, ConfigMixin, SchedulerMixin):
         return self._begin_index
 
     @property
-    def step_index(self) -> int:
+    def step_index(self) -> int | None:
         """
-        The index counter for current timestep.
+        The index counter for current timestep; None between denoising loops.
         """
         return self._step_index
 
