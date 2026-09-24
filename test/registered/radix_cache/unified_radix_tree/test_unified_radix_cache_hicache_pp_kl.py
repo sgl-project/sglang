@@ -54,7 +54,7 @@ class TestUnifiedQwen3HiCachePP(UnifiedRadixTreeTestMixin, CustomTestCase):
             num_questions=self.num_gsm8k_questions,
             max_new_tokens=2048,
             parallel=self.max_running_requests,
-            host=f"http://{url.hostname}",
+            host=url.hostname,
             port=int(url.port),
         )
         metrics = run_few_shot_gsm8k(args)

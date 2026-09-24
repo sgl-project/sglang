@@ -369,23 +369,27 @@ sglang generate \
 
 Values passed to the compatibility option `--layerwise-offload-components` must match loaded component keys, such as `transformer`, `text_encoder`, `image_encoder`, `vae`, `condition_image_encoder`, `spatial_upsampler`, or `vocoder`. Its `default` group selects text encoders, image encoders, and VAEs. Use `all` to select every layerwise-offloadable component.
 
-Layerwise tuning options such as `--dit-offload-prefetch-size`, `--dit-layerwise-resident-layers`, and `--dit-layerwise-residency-policy` continue to control the streamed layer working set. Prefer the smallest component set that solves the memory issue because layerwise offload can increase latency. DiT layerwise offload can run with Cache-DiT: skipped blocks are not streamed, and the first layer after a skip may sync-load. Cache-DiT remains incompatible with FSDP.
+Layerwise tuning options such as `--dit-offload-prefetch-size`, `--dit-layerwise-resident-layers`, `--dit-layerwise-residency-policy`, and `--dit-layerwise-residency-lifetime` continue to control the streamed layer working set. Prefer the smallest component set that solves the memory issue because layerwise offload can increase latency. DiT layerwise offload can run with Cache-DiT: skipped blocks are not streamed, and the first layer after a skip may sync-load. Cache-DiT remains incompatible with FSDP.
 
-Those three set the default for every streamed component. To give one component its own values, use the `component=value` forms, which also accept JSON:
+Those four set the default for every streamed component. To give one component its own values, use the `component=value` forms, which also accept JSON:
 
 ```bash
 sglang serve --model-path <MODEL> \
   --layerwise-offload-components dit,text_encoder \
   --layerwise-prefetch-size text_encoder=2 \
   --layerwise-resident-layers transformer=4 \
-  --layerwise-residency-policy text_encoder=strided
+  --layerwise-residency-policy transformer=strided \
+  --layerwise-residency-lifetime transformer=permanent
 ```
 
-- `--layerwise-prefetch-size`: how many layers to fetch ahead. Fractional values are a share of the stack, `>= 1` an absolute count. Deeper prefetch overlaps more of the transfer with compute, at the cost of staging buffers.
-- `--layerwise-resident-layers`: how many layers stay on the GPU instead of being streamed. They are held while the component does its work for a request and released when it finishes, so they are transferred once per request rather than once per pass — not kept for the life of the server. Fractional values are a share of the stack.
-- `--layerwise-residency-policy`: `leading` keeps the first layers, `strided` spreads them across the stack so the transfers do not arrive as one burst.
+The `component=value` maps take the loaded component's name — `transformer`, `text_encoder`, `video_vae` — not a group alias: `--layerwise-offload-components` understands `dit`, but `--layerwise-resident-layers dit=4` matches no component and is silently ignored.
 
-A component without an entry keeps the group default, so adding these options changes nothing until one is set. Both knobs trade VRAM for transfer, and the return differs by component. Resident layers pay for a component that runs its layers many times per request — a DiT across the denoise steps, a video VAE across the latent chunks — and do nothing for one that runs them once per request, such as a text encoder, which transfers the whole set again every request. Measure before raising either.
+- `--layerwise-prefetch-size`: how many layers to fetch ahead. Fractional values are a share of the stack, `>= 1` an absolute count. Deeper prefetch overlaps more of the transfer with compute, at the cost of staging buffers.
+- `--layerwise-resident-layers`: how many layers stay on the GPU instead of being streamed. Fractional values are a share of the stack. Resident layers pay for a component that runs its layers many times per request — a DiT across the denoise steps, a video VAE across the latent chunks — and do nothing for one that runs them once per request, such as a text encoder.
+- `--layerwise-residency-policy`: `leading` keeps the first layers, `strided` spreads them across the stack so the transfers do not arrive as one burst.
+- `--layerwise-residency-lifetime`: how long the resident layers stay. `forward` (default) places them when the component starts running its layers for a request and releases them when it finishes, so they are transferred once per request and keep a copy in host memory. `permanent` places them at load time, keeps no host copy, and never releases them: one transfer for the life of the server.
+
+A component without an entry keeps the group default, so adding these options changes nothing until one is set. All of these trade VRAM for transfer. The lifetime decides *whose* VRAM: with `forward`, only the component that is running holds its resident layers, so the peak is the largest single component's set; with `permanent`, every component's resident layers are on the GPU at once, so the peak is their sum. Pick `permanent` when that sum fits alongside the activations — it also frees the pinned host memory the copies would have held — and `forward` when it does not. Measure before raising any of them.
 
 ## Serve
 
