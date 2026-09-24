@@ -670,7 +670,7 @@ class TestInklingCheckpointIndices(CustomTestCase):
 
         model_runner = SimpleNamespace(
             device="cuda",
-            ps=SimpleNamespace(tp_size=1, attn_dp_size=1),
+            tp_size=1,
             model_config=SimpleNamespace(
                 dtype=torch.bfloat16, vocab_size=8, hf_config=SimpleNamespace()
             ),
@@ -725,6 +725,7 @@ class TestInklingCheckpointIndices(CustomTestCase):
             replacements = {
                 "get_exec": runtime,
                 "get_parallel": SimpleNamespace(pp_size=1),
+                "deployment_attn_dp_size": 1,
                 "get_flags": SimpleNamespace(
                     capture=SimpleNamespace(enable_torch_compile=False)
                 ),
