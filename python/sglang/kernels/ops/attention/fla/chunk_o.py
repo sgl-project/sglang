@@ -146,9 +146,9 @@ def chunk_fwd_o(
     if scale is None:
         scale = k.shape[-1] ** -0.5
 
-    use_amd_gdn_tuning = is_hip() and g is not None and K == V == 128
-    o = torch.empty_like(v) if use_amd_gdn_tuning else torch.zeros_like(v)
-    config = (64, 128, 2, 3) if use_amd_gdn_tuning else (128, 64, 4, 2)
+    use_hip_gdn_tuning = is_hip() and g is not None and K == V == 128
+    o = torch.empty_like(v) if use_hip_gdn_tuning else torch.zeros_like(v)
+    config = (64, 128, 2, 3) if use_hip_gdn_tuning else (128, 64, 4, 2)
     BK, BV, num_warps, num_stages = config
 
     def grid(meta):
