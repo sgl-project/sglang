@@ -2,15 +2,14 @@
 
 import unittest
 
+import aiter
 import torch
 import torch.nn.functional as F
-from einops import rearrange
-
-import aiter
 from aiter import dtypes, pertoken_quant
 from aiter.fused_moe import fused_topk, moe_sorting
 from aiter.ops.shuffle import shuffle_weight
 from aiter.ops.triton.fusions.fused_clamp_act_mul import fused_clamp_act_mul
+from einops import rearrange
 
 from sglang.srt.utils import is_gfx95_supported, is_hip
 from sglang.test.ci.ci_register import register_amd_ci
@@ -137,9 +136,7 @@ class TestGlm53SharedExpertFusion(CustomTestCase):
             device="cuda",
             dtype=torch.bfloat16,
         )
-        routed_weights, routed_ids = fused_topk(
-            hidden, scores, self.ROUTED_TOPK, True
-        )
+        routed_weights, routed_ids = fused_topk(hidden, scores, self.ROUTED_TOPK, True)
         hidden_q, hidden_scale = pertoken_quant(
             hidden.view(tokens, self.HIDDEN_SIZE // self.BLOCK_SIZE, self.BLOCK_SIZE),
             quant_dtype=dtypes.fp8,

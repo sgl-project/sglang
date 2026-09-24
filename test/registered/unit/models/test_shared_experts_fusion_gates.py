@@ -360,9 +360,7 @@ class TestGlm5NextGate(_FusionGateCase):
     def test_mixed_routed_or_shared_expert_precision_is_rejected(self):
         for suffix in ("experts", "shared_experts"):
             with self.subTest(suffix=suffix):
-                quant = self._fp8(
-                    ignored_layers=[f"model.layers.3.mlp.{suffix}"]
-                )
+                quant = self._fp8(ignored_layers=[f"model.layers.3.mlp.{suffix}"])
                 self.assertIn(
                     "same block-FP8 layout",
                     self._reason_on_gfx950(quant=quant),
