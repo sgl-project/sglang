@@ -6,7 +6,11 @@ from typing import Optional
 
 import torch
 
-from sglang.srt.platforms.device_mixin import DeviceCapability, DeviceMixin, PlatformEnum
+from sglang.srt.platforms.device_mixin import (
+    DeviceCapability,
+    DeviceMixin,
+    PlatformEnum,
+)
 from sglang.srt.platforms.interface import SRTPlatform
 
 
