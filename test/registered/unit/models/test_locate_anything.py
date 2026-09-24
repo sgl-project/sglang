@@ -1,25 +1,29 @@
 """Unit tests for srt/models/locate_anything.py — no server, no weight loading.
 
-Covers the InternVL-style ``mlp1`` projector shape and the optional box-grammar
-logit processor's constrained-decoding state machine.
+Covers the InternVL-style ``mlp1`` projector shape, the optional box-grammar
+logit processor's constrained-decoding state machine, and the HF -> SGLang
+weight-name remapping in ``load_weights``.
 """
 
 import unittest
+from unittest.mock import patch
 
 import numpy as np
 import torch
 
-from sglang.srt.configs import LocateAnythingConfig
+from sglang.srt.configs import LocateAnythingConfig, MoonViTConfig
 from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
+from sglang.srt.models.kimi_vl_moonvit import MoonVitPretrainedModel
 from sglang.srt.models.locate_anything import (
     LocateAnythingBoxGrammarLogitProcessor,
     LocateAnythingForConditionalGeneration,
     LocateAnythingMultiModalProjector,
 )
+from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=11, suite="base-a-test-cpu")
+register_cpu_ci(est_time=16, suite="base-a-test-cpu")
 
 
 def _small_config():
@@ -334,6 +338,158 @@ class TestGetImageFeatureWiring(CustomTestCase):
         embeds = torch.randn(5, self.TEXT_HIDDEN)
         out = model.get_image_feature([_image_item(embeds, [[2, 2]])])
         self.assertTrue(torch.equal(out, embeds))
+
+
+# ---------------------------------------------------------------------------
+# Vision checkpoint-name remapping in load_weights
+# ---------------------------------------------------------------------------
+
+# The HF LocateAnything/MoonViT checkpoint stores each block's attention as
+# ``wqkv`` / ``wo`` projections, while SGLang wraps it in a VisionAttention whose
+# submodules are ``attn.qkv_proj`` / ``attn.proj``. load_weights must rewrite the
+# former onto the latter or the vision attention weights are dropped.
+_HF_ATTENTION_MAP = (
+    ("attn.qkv_proj.", "wqkv."),
+    ("attn.proj.", "wo."),
+)
+# The checkpoint's mlp1 Sequential maps onto the named projector submodules.
+_HF_PROJECTOR_MAP = (
+    ("multi_modal_projector.pre_norm.", "mlp1.0."),
+    ("multi_modal_projector.linear_1.", "mlp1.1."),
+    ("multi_modal_projector.linear_2.", "mlp1.3."),
+)
+
+
+def _tiny_vision_param_names():
+    """Destination parameter names of a real (tiny) MoonViT tower.
+
+    Building the actual module makes the module layout the source of truth for
+    the ``attn.qkv_proj`` / ``attn.proj`` spelling instead of hard-coding names
+    that could silently drift from the implementation.
+    """
+    vision_config = MoonViTConfig(
+        hidden_size=8,
+        num_attention_heads=2,
+        num_hidden_layers=1,
+        intermediate_size=16,
+        init_pos_emb_height=4,
+        init_pos_emb_width=4,
+        merge_kernel_size=(2, 2),
+    )
+    with (
+        get_parallel().override(tp_size=1, tp_rank=0, attn_tp_size=1, attn_tp_rank=0),
+        get_context().override_server_args(),
+    ):
+        tower = MoonVitPretrainedModel(vision_config)
+    return {f"vision_tower.{name}" for name, _ in tower.named_parameters()}
+
+
+def _projector_param_names():
+    """Destination parameter names of the real (tiny) mlp1 projector."""
+    projector = LocateAnythingMultiModalProjector(_small_config())
+    return {f"multi_modal_projector.{name}" for name, _ in projector.named_parameters()}
+
+
+def _hf_checkpoint_name(dest_name):
+    """HF checkpoint spelling for a SGLang vision/projector parameter name."""
+    if dest_name.startswith("vision_tower."):
+        name = "vision_model." + dest_name[len("vision_tower.") :]
+        for dst, src in _HF_ATTENTION_MAP:
+            name = name.replace(dst, src)
+        return name
+    for dst, src in _HF_PROJECTOR_MAP:
+        if dest_name.startswith(dst):
+            return src + dest_name[len(dst) :]
+    raise AssertionError(f"unmapped parameter name: {dest_name}")
+
+
+class _RecordingParam:
+    """Stand-in parameter that records weight_loader calls.
+
+    load_weights resolves ``param.weight_loader`` and calls it as
+    ``param.weight_loader(param, weight)``; exposing a real bound method lets the
+    test assert *where* each checkpoint tensor landed without loading real
+    weights into a model.
+    """
+
+    def __init__(self, name):
+        self.name = name
+        self.loads = []
+
+    def weight_loader(self, param, loaded_weight, shard_id=None):
+        self.loads.append((loaded_weight, shard_id))
+
+
+class _WeightLoadingSink:
+    """Minimal ``self`` for load_weights: only needs config + named_parameters."""
+
+    def __init__(self, config, params):
+        self.config = config
+        self._params = params
+
+    def named_parameters(self):
+        return iter(self._params.items())
+
+
+def _fake_params(names):
+    return {name: _RecordingParam(name) for name in names}
+
+
+class TestVisionWeightNameRemap(CustomTestCase):
+    """Regression coverage for the HF ``wqkv`` / ``wo`` -> wrapped VisionAttention
+    (``attn.qkv_proj`` / ``attn.proj``) rename in load_weights."""
+
+    HF_BLOCK = "vision_model.encoder.blocks.0"
+    SGLANG_BLOCK = "vision_tower.encoder.blocks.0"
+
+    def test_wqkv_and_wo_load_onto_wrapped_attention(self):
+        dest = {
+            f"{self.SGLANG_BLOCK}.attn.qkv_proj.weight",
+            f"{self.SGLANG_BLOCK}.attn.qkv_proj.bias",
+            f"{self.SGLANG_BLOCK}.attn.proj.weight",
+            f"{self.SGLANG_BLOCK}.attn.proj.bias",
+        }
+        params = _fake_params(dest)
+        model = _WeightLoadingSink(_small_config(), params)
+        weights = [
+            (f"{self.HF_BLOCK}.wqkv.weight", torch.zeros(1)),
+            (f"{self.HF_BLOCK}.wqkv.bias", torch.zeros(1)),
+            (f"{self.HF_BLOCK}.wo.weight", torch.zeros(1)),
+            (f"{self.HF_BLOCK}.wo.bias", torch.zeros(1)),
+        ]
+
+        with patch("sglang.srt.models.locate_anything.logger") as mock_logger:
+            loaded = LocateAnythingForConditionalGeneration.load_weights(
+                model, iter(weights)
+            )
+
+        # The HF spellings are not model parameters: without the rename they are
+        # skipped with a "not found" warning and dropped.
+        self.assertEqual(loaded, dest)
+        self.assertNotIn(f"{self.SGLANG_BLOCK}.wqkv.weight", loaded)
+        self.assertNotIn(f"{self.SGLANG_BLOCK}.wo.weight", loaded)
+        mock_logger.warning.assert_not_called()
+        for name, param in params.items():
+            self.assertEqual(len(param.loads), 1, name)
+
+    def test_every_vision_and_projector_param_loads_from_hf_names(self):
+        config = _small_config()
+        dest = _tiny_vision_param_names() | _projector_param_names()
+        params = _fake_params(dest)
+        model = _WeightLoadingSink(config, params)
+        weights = [(_hf_checkpoint_name(name), torch.zeros(1)) for name in sorted(dest)]
+
+        with patch("sglang.srt.models.locate_anything.logger") as mock_logger:
+            loaded = LocateAnythingForConditionalGeneration.load_weights(
+                model, iter(weights)
+            )
+
+        # Full, exact coverage: every vision/projector parameter is fed and the
+        # "parameters did not receive weights" warning must stay silent.
+        self.assertEqual(loaded, dest)
+        mock_logger.warning.assert_not_called()
+        for name, param in params.items():
+            self.assertEqual(len(param.loads), 1, name)
 
 
 if __name__ == "__main__":
