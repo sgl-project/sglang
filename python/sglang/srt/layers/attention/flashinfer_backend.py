@@ -50,6 +50,7 @@ from sglang.srt.speculative.spec_utils import (
     draft_kv_indices_buffer_width,
     draft_kv_indices_used_len,
     generate_draft_decode_kv_indices,
+    resolve_draft_decode_window,
 )
 from sglang.srt.utils import (
     get_cuda_graph_max_batch_size,
@@ -472,9 +473,25 @@ class FlashInferAttnBackend(AttentionBackend):
 
         fmha_backend = "auto"
         if get_platform().is_sm100:
+            fmha_backend = "fa2"
             # Disable CUTLASS backend when piecewise cuda graph is enabled
-            # due to TMA descriptor initialization issues on SM100 GPUs.
-            if not check_cuda_graph_backend(Phase.PREFILL, Backend.TC_PIECEWISE):
+            # due to TMA descriptor initialization issues on SM100 GPUs. The
+            # current FlashInfer SM100 CUTLASS FMHA dispatch only instantiates
+            # 64x64, 128x128, and 192x128 head dimensions. Keep unsupported
+            # shapes (for example Qwen3.5's 256x256) on the FA2 fallback.
+            cutlass_supported_head_dims = {
+                (64, 64),
+                (128, 128),
+                (192, 128),
+            }
+            head_dims = (
+                model_runner.model_config.head_dim,
+                model_runner.model_config.v_head_dim,
+            )
+            if (
+                head_dims in cutlass_supported_head_dims
+                and not check_cuda_graph_backend(Phase.PREFILL, Backend.TC_PIECEWISE)
+            ):
                 fmha_backend = "cutlass"
         self.prefill_wrapper_ragged = BatchPrefillWithRaggedKVCacheWrapper(
             self.workspace_buffer, "NHD", backend=fmha_backend
@@ -2341,6 +2358,9 @@ class FlashInferMultiStepDraftBackend:
         # Cached variables for generate_draft_decode_kv_indices
         self.pool_len = model_runner.req_to_token_pool.req_to_token.shape[1]
         self.req_to_token_pool = model_runner.req_to_token_pool
+        self.draft_window_size, self.draft_sink_size = resolve_draft_decode_window(
+            model_runner
+        )
 
     def common_template(
         self,
@@ -2379,6 +2399,8 @@ class FlashInferMultiStepDraftBackend:
             next_power_of_2(self.speculative_num_steps),
             next_power_of_2(bs),
             self.page_size,
+            self.draft_window_size,
+            self.draft_sink_size,
         )
 
         assert forward_batch.spec_info is not None

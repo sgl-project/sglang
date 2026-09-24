@@ -29,7 +29,6 @@ from sglang.srt.configs.model_config import (
     get_minimax_sparse_layer_ids,
 )
 from sglang.srt.distributed import (
-    get_pp_group,
     tensor_model_parallel_all_reduce,
 )
 from sglang.srt.environ import envs
@@ -500,7 +499,7 @@ class MiniMaxM3MoE(nn.Module):
             topk_output = self.topk(
                 hidden_states,
                 router_logits,
-                num_token_non_padded=forward_batch.num_token_non_padded,
+                num_token_non_padded=forward_batch.moe_num_token_non_padded(),
                 expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
                     layer_id=self.layer_id,
                 ),
@@ -1362,6 +1361,7 @@ class MiniMaxM3DecoderLayer(nn.Module):
             input_layernorm=self.input_layernorm,
             post_attention_layernorm=self.post_attention_layernorm,
             allow_reduce_scatter=True,
+            is_last_layer=(layer_id == config.num_hidden_layers - 1),
         )
 
     def forward(
@@ -1441,7 +1441,7 @@ class MiniMaxM3Model(nn.Module):
 
         self.padding_idx = getattr(config, "pad_token_id", 0)
         self.vocab_size = config.vocab_size
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
         self.use_gemma_norm = getattr(config, "use_gemma_norm", False)
 
         if self.pp_group.is_first_rank:
@@ -1574,7 +1574,7 @@ class MiniMaxM3SparseForCausalLM(nn.Module):
 
         self.config = config
         self.quant_config = quant_config
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
 
         self.num_fused_shared_experts = 0
         self.determine_num_fused_shared_experts()
@@ -1612,10 +1612,12 @@ class MiniMaxM3SparseForCausalLM(nn.Module):
                 "Shared and routed experts may use different quantization formats "
                 "in ModelOpt mixed-precision checkpoints."
             )
-        if not _is_cuda:
-            return "Shared experts fusion currently requires CUDA devices."
+        if not (_is_cuda or _is_hip):
+            return "Shared experts fusion currently requires CUDA or ROCm devices."
         if _is_cuda and (_device_sm is not None) and (_device_sm < 80):
             return "Shared experts fusion requires SM80 or newer GPUs."
+        if _is_hip and not _is_gfx95_supported:
+            return "Shared experts fusion on ROCm is validated on gfx950 only."
         if get_parallel().moe_ep_size > 1:
             return "Shared experts fusion is not supported together with expert parallelism yet."
         if get_moe_a2a_backend().is_deepep():

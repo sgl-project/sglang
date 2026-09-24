@@ -1,10 +1,8 @@
 import logging
-from dataclasses import replace
 from typing import Optional
 
 import torch
 
-from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.layers.moe.utils import (
     draft_model_build_scope,
     speculative_moe_backend_context,
@@ -27,11 +25,12 @@ from sglang.srt.speculative.base_spec_worker import (
 from sglang.srt.speculative.eagle_utils import default_tree_mask_mode
 from sglang.srt.speculative.eagle_worker_v2 import EagleDraftWorker, EAGLEWorkerV2
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-from sglang.srt.speculative.spec_utils import draft_tp_context, get_plan_stream
-from sglang.srt.utils import empty_context, get_bool_env_var, is_cuda
-
-if is_cuda():
-    from sgl_kernel import segment_packbits  # noqa: F401
+from sglang.srt.speculative.spec_utils import (
+    draft_pp_context,
+    draft_tp_context,
+    get_plan_stream,
+)
+from sglang.srt.utils import empty_context, get_bool_env_var
 
 logger = logging.getLogger(__name__)
 SGLANG_RETURN_ORIGINAL_LOGPROB = get_bool_env_var("SGLANG_RETURN_ORIGINAL_LOGPROB")
@@ -44,7 +43,6 @@ class StandaloneDraftWorker(EagleDraftWorker):
         self,
         server_args: ServerArgs,
         gpu_id: int,
-        ps: ParallelState,
         nccl_port: int,
         target_worker: TpModelWorker,
     ):
@@ -53,7 +51,6 @@ class StandaloneDraftWorker(EagleDraftWorker):
         # copy args
         self.server_args = server_args
         self.gpu_id = gpu_id
-        self.ps = ps
         self.nccl_port = nccl_port
         self.target_worker = target_worker
 
@@ -79,12 +76,10 @@ class StandaloneDraftWorker(EagleDraftWorker):
         # whose MoE gates run during construction; the scope routes their
         # fusion decision to the speculative leaf (it does not swap
         # runner_backend — the draft's forwards run outside that context).
-        with empty_context(), draft_model_build_scope():
+        with draft_pp_context(), draft_model_build_scope():
             self.draft_worker = TpModelWorker(
                 server_args=server_args,
                 gpu_id=gpu_id,
-                # spec workers don't support pipeline parallelism
-                ps=replace(ps, pp_rank=0, pp_size=1),
                 nccl_port=nccl_port,
                 is_draft_worker=True,
                 # The draft runs at absolute target positions.
@@ -93,6 +88,8 @@ class StandaloneDraftWorker(EagleDraftWorker):
 
         # Alias for better readability
         self.draft_runner = self.draft_worker.model_runner
+        # Retain the target's attention topology when swapping TP groups.
+        self.draft_owns_attention = False
         self.draft_tp_context = (
             draft_tp_context if get_parallel().enable_dp_attention else empty_context
         )
@@ -131,14 +128,20 @@ class StandaloneDraftWorker(EagleDraftWorker):
 
     def init_attention_backends(self):
         with (
-            self.draft_tp_context(self.draft_runner.tp_group),
+            self.draft_tp_context(
+                self.draft_runner.tp_group,
+                owns_attention=self.draft_owns_attention,
+            ),
             speculative_moe_backend_context(),
         ):
             super().init_attention_backends()
 
     def init_cuda_graphs(self):
         with (
-            self.draft_tp_context(self.draft_runner.tp_group),
+            self.draft_tp_context(
+                self.draft_runner.tp_group,
+                owns_attention=self.draft_owns_attention,
+            ),
             speculative_moe_backend_context(),
         ):
             super().init_cuda_graphs()
@@ -155,7 +158,6 @@ class StandaloneWorkerV2(EAGLEWorkerV2):
         self,
         server_args: ServerArgs,
         gpu_id: int,
-        ps: ParallelState,
         nccl_port: int,
         target_worker: TpModelWorker,
     ):
@@ -178,7 +180,6 @@ class StandaloneWorkerV2(EAGLEWorkerV2):
         self._draft_worker = StandaloneDraftWorker(
             server_args,
             gpu_id,
-            ps,
             nccl_port,
             target_worker,
         )
