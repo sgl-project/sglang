@@ -7799,8 +7799,8 @@ class UnifiedRadixCacheSuite:
         return cache, allocator, req_to_token_pool, chain, window_pages
 
     def test_hicache_swa_finalize_match_result(self):
-        """finalize_match_result accumulates host_value lengths of SWA tombstones
-        within the trailing sliding window into ``swa_host_hit_length``. Out-of-window
+        """finalize_match_result charges the SWA tombstone tokens a load-back restores
+        (one page-aligned window) into ``swa_host_hit_length``. Out-of-window
         tombstones and chains fully on device must leave ``swa_host_hit_length`` at 0.
         ``host_hit_length`` is Full-KV only and is never written by SWA.
         """

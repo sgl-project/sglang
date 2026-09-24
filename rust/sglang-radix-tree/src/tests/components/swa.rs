@@ -502,8 +502,10 @@ fn load_back_splits_only_the_oldest_host_node_past_device_and_whole_host_nodes()
     let a = alloc_run(&mut tc, root, 1..=4);
     let b = alloc_run(&mut tc, a, 5..=6);
     let c = alloc_run(&mut tc, b, 7..=8);
-    set_swa_host(&mut tc, a);
-    set_swa_host(&mut tc, b);
+    tc.arena
+        .set_host_value(a, SWA, Tensor::from_slice(&[10i64, 11, 12, 13]));
+    tc.arena
+        .set_host_value(b, SWA, Tensor::from_slice(&[20i64, 21]));
     set_swa_device(&mut tc, c);
     let swa = swa_component(5);
     // Device c covers 2 and host b loads whole; a supplies only the last 1.
@@ -518,6 +520,32 @@ fn load_back_splits_only_the_oldest_host_node_past_device_and_whole_host_nodes()
     assert_eq!(tc.arena.node(a).key.atom_len(), 1);
     assert_eq!(tc.arena.node(b).key.atom_len(), 2);
     assert_eq!(tc.arena.node(b).parent(), a);
+    // The load moves exactly the charged 3 tokens: a's tail, then all of b.
+    let transfers = swa
+        .build_hicache_transfers(
+            &tc,
+            c,
+            CacheTransferPhase::LoadBack,
+            /* mamba_pool_idx = */ None,
+            /* host_indices = */ None,
+            /* token_ids = */ None,
+            /* prefetch_tokens = */ 0,
+            /* staging_tokens = */ 0,
+            /* last_hash = */ None,
+        )
+        .unwrap()
+        .unwrap();
+    assert!(
+        transfers[0]
+            .host_indices
+            .as_ref()
+            .unwrap()
+            .equal(&Tensor::from_slice(&[13i64, 20, 21]))
+    );
+    assert_eq!(
+        transfers[0].nodes_to_load,
+        Some(vec![tc.arena.node(a).id, tc.arena.node(b).id])
+    );
     // Re-running on the reshaped path is a no-op.
     swa.prepare_load_back_in_tree_core(&mut tc, c);
     assert_eq!(tc.arena.node(a).parent(), head);
