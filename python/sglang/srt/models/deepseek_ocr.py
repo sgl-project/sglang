@@ -22,6 +22,7 @@
 import copy
 import logging
 import math
+from array import array
 from functools import partial
 from typing import Iterable, List, Optional, Set, Tuple, Type, TypeAlias, Union
 
@@ -31,7 +32,7 @@ import transformers
 from torch import Tensor, nn
 from transformers.models.vitdet.modeling_vitdet import get_rel_pos
 
-from sglang.srt.configs.deepseek_ocr import DeepseekVLV2Config
+from sglang.srt.configs.deepseek_ocr import DeepseekVLV2Config, is_ocr2_config
 from sglang.srt.layers.quantization import QuantizationConfig
 from sglang.srt.managers.mm_utils import (
     MultiModalityDataPaddingPatternMultimodalTokens,
@@ -1420,18 +1421,12 @@ def build_qwen2_decoder_as_encoder(
     return decoder_as_encoder
 
 
-def _is_ocr2(config: DeepseekVLV2Config) -> bool:
-    return (
-        str(getattr(config.vision_config, "model_name", "")).lower() == "deepencoderv2"
-        or getattr(config.projector_config, "input_dim", None) == 896
-    )
-
-
 class DeepseekOCRForCausalLM(nn.Module):
     @staticmethod
     def shared_experts_fusion_disable_reason(hf_config, quant_config):
         text_config = hf_config.text_config
-        if _is_ocr2(hf_config) or not (
+        # Class-level hook: called before the model is built, so no `self.is_ocr2` yet.
+        if is_ocr2_config(hf_config) or not (
             text_config.topk_method == "noaux_tc" or text_config.use_mla
         ):
             # Those branches build the dense DeepseekForCausalLM, which has no
@@ -1455,7 +1450,7 @@ class DeepseekOCRForCausalLM(nn.Module):
         self.vision_config = config.vision_config
         self.projector_config = config.projector_config
         self.text_config = config.text_config
-        self.is_ocr2 = _is_ocr2(config)
+        self.is_ocr2 = is_ocr2_config(config)
         n_embed = getattr(self.projector_config, "n_embed", 1280)
 
         self.tile_tag = config.tile_tag
@@ -1769,7 +1764,7 @@ class DeepseekOCRForCausalLM(nn.Module):
 
         return inputs_embeds
 
-    def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
+    def pad_input_ids(self, input_ids: array, mm_inputs: MultimodalInputs) -> array:
         pattern = MultiModalityDataPaddingPatternMultimodalTokens()
         return pattern.pad_input_tokens(input_ids, mm_inputs)
 

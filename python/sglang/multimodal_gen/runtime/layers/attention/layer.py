@@ -18,6 +18,7 @@ from sglang.kernels.ops.diffusion import (
     fused_pack_segmented_qkv,
     fused_scatter_to_padded,
 )
+from sglang.multimodal_gen.runtime import server_args as server_args_module
 from sglang.multimodal_gen.runtime.breakable_cuda_graph.replay_token import (
     get_current_replay_token,
 )
@@ -35,6 +36,9 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_ulysses_parallel_rank,
     get_ulysses_parallel_world_size,
 )
+from sglang.multimodal_gen.runtime.layers.attention.autotune import (
+    install as install_attention_backend_autotune,
+)
 from sglang.multimodal_gen.runtime.layers.attention.backends import (
     flash_attn as _fa_backend,
 )
@@ -45,7 +49,11 @@ from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend i
 from sglang.multimodal_gen.runtime.layers.attention.backends.skip_softmax import (
     get_request_skip_softmax_params,
 )
-from sglang.multimodal_gen.runtime.layers.attention.selector import get_attn_backend
+from sglang.multimodal_gen.runtime.layers.attention.selector import (
+    get_attn_backend,
+    get_component_attn_backend_context,
+    get_global_forced_attn_backend,
+)
 from sglang.multimodal_gen.runtime.layers.attention.turbo_layer import (
     async_a2a_communicate,
 )
@@ -65,7 +73,7 @@ from sglang.multimodal_gen.runtime.managers.forward_context import (
     get_forward_context,
 )
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
-from sglang.multimodal_gen.utils import get_compute_dtype
+from sglang.multimodal_gen.runtime.utils.precision import get_compute_dtype
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
     eager_on_graph,
     is_in_breakable_cuda_graph,
@@ -413,6 +421,9 @@ class UlyssesAttention(nn.Module):
         )
         self.attn_impl = impl_cls(**self._attn_impl_ctor_kwargs)
         wrap_attention_impl_forward(self.attn_impl)
+        _maybe_install_backend_autotune(
+            self, attn_backend.get_enum(), required_attention_backend
+        )
         self.num_heads = num_heads
         self.head_size = head_size
         self.num_kv_heads = num_kv_heads
@@ -681,6 +692,9 @@ class LocalAttention(nn.Module):
         )
         self.attn_impl = impl_cls(**self._attn_impl_ctor_kwargs)
         wrap_attention_impl_forward(self.attn_impl)
+        _maybe_install_backend_autotune(
+            self, attn_backend.get_enum(), required_attention_backend
+        )
         self.num_heads = num_heads
         self.head_size = head_size
         self.num_kv_heads = num_kv_heads
@@ -748,7 +762,7 @@ class LocalAttention(nn.Module):
                 v_ = v_.repeat_interleave(repeat_factor, dim=1)
 
             sdpa_context = (
-                sdpa_kernel(_PYTORCH_DEFAULT_CUDA_SDP_BACKENDS)
+                sdpa_kernel(_PYTORCH_DEFAULT_CUDA_SDP_BACKENDS, set_priority=True)
                 if self.allow_cudnn_sdp and q_.device.type == "cuda"
                 else nullcontext()
             )
@@ -853,6 +867,9 @@ class USPAttention(nn.Module):
         )
         self.attn_impl = impl_cls(**self._attn_impl_ctor_kwargs)
         wrap_attention_impl_forward(self.attn_impl)
+        _maybe_install_backend_autotune(
+            self, attn_backend.get_enum(), required_attention_backend
+        )
         self.num_heads = num_heads
         self.head_size = head_size
         self.num_kv_heads = num_kv_heads
@@ -1185,7 +1202,7 @@ class USPAttention(nn.Module):
                 v_ = v.transpose(1, 2)
                 mask = _prepare_sdpa_mask(attn_mask, dtype=q_.dtype, device=q_.device)
                 sdpa_context = (
-                    sdpa_kernel(_PYTORCH_DEFAULT_CUDA_SDP_BACKENDS)
+                    sdpa_kernel(_PYTORCH_DEFAULT_CUDA_SDP_BACKENDS, set_priority=True)
                     if self.allow_cudnn_sdp and q_.device.type == "cuda"
                     else nullcontext()
                 )
@@ -1357,7 +1374,7 @@ class USPAttention(nn.Module):
             v_ = v.transpose(1, 2)
             mask = _prepare_sdpa_mask(gathered_mask, dtype=q_.dtype, device=q_.device)
             sdpa_context = (
-                sdpa_kernel(_PYTORCH_DEFAULT_CUDA_SDP_BACKENDS)
+                sdpa_kernel(_PYTORCH_DEFAULT_CUDA_SDP_BACKENDS, set_priority=True)
                 if self.allow_cudnn_sdp and q_.device.type == "cuda"
                 else nullcontext()
             )
@@ -1484,15 +1501,19 @@ class USPAttention(nn.Module):
                 "Replicated prefix and suffix cannot be used at the same time."
             )
 
+        # slicing along dim 1 keeps the original row stride, so the shard is
+        # contiguous only while the batch dim is 1; all_gather_into_tensor
+        # requires a contiguous input, so materialize the shard before the
+        # collective
         if num_replicated_prefix:
             replicated = tensor[:, :num_replicated_prefix]
-            sharded = tensor[:, num_replicated_prefix:]
+            sharded = tensor[:, num_replicated_prefix:].contiguous()
             gathered = sequence_model_parallel_all_gather(sharded, dim=1)
             return torch.cat([replicated, gathered], dim=1)
 
         if num_replicated_suffix:
             replicated = tensor[:, -num_replicated_suffix:]
-            sharded = tensor[:, :-num_replicated_suffix]
+            sharded = tensor[:, :-num_replicated_suffix].contiguous()
             gathered = sequence_model_parallel_all_gather(sharded, dim=1)
             return torch.cat([gathered, replicated], dim=1)
 
@@ -1644,7 +1665,7 @@ class USPAttention(nn.Module):
             v_ = v_.repeat_interleave(repeat_factor, dim=1)
 
         sdpa_context = (
-            sdpa_kernel(_PYTORCH_DEFAULT_CUDA_SDP_BACKENDS)
+            sdpa_kernel(_PYTORCH_DEFAULT_CUDA_SDP_BACKENDS, set_priority=True)
             if self.allow_cudnn_sdp and q_.device.type == "cuda"
             else nullcontext()
         )
@@ -1863,7 +1884,7 @@ class USPAttention(nn.Module):
         v_ = v.transpose(1, 2)
         mask = _prepare_sdpa_mask(attn_mask, dtype=q_.dtype, device=q_.device)
         sdpa_context = (
-            sdpa_kernel(_PYTORCH_DEFAULT_CUDA_SDP_BACKENDS)
+            sdpa_kernel(_PYTORCH_DEFAULT_CUDA_SDP_BACKENDS, set_priority=True)
             if self.allow_cudnn_sdp and q_.device.type == "cuda"
             else nullcontext()
         )
@@ -2097,3 +2118,29 @@ for _attn_cls in (
 ):
     _attn_cls.forward = _make_breakable_attention_forward(_attn_cls.forward)
 del _attn_cls
+
+
+def _maybe_install_backend_autotune(
+    layer, backend, required_attention_backend: AttentionBackendEnum | None
+) -> None:
+    """Opt-in: let the layer pick its backend by measurement on its first big call."""
+    try:
+        server_args = server_args_module.get_global_server_args()
+        if not server_args.enable_attention_backend_autotune:
+            return
+    except Exception:  # no ServerArgs yet (unit tests, tooling)
+        return
+    component_context = get_component_attn_backend_context()
+    if (
+        required_attention_backend is not None
+        or get_global_forced_attn_backend() is not None
+        or (
+            component_context is not None
+            and component_context.require_backend_selection
+        )
+        or server_args.is_arg_explicitly_set("attention_backend")
+    ):
+        return
+    layer.backend = backend
+    layer._default_attn_backend = backend
+    install_attention_backend_autotune(layer)

@@ -1,13 +1,15 @@
 import hashlib
 import logging
 import time
-from typing import Any, Callable, Dict, Iterable, NamedTuple, Optional, Set
+from typing import Any, Callable, Dict, Iterable, List, NamedTuple, Optional, Set
 
 import torch
 import torch.distributed as dist
 from pydantic import BaseModel, ConfigDict
 
 from sglang.srt.managers.mm_utils import tensor_hash
+from sglang.srt.mem_cache.storage.mmap.mmap_allocator import alloc_mmap
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils.weight_checker_comparator import (
     CHUNK_NUMEL,
     ComparableWeight,
@@ -24,6 +26,8 @@ class _StrictBaseModel(BaseModel):
 
 
 class ParallelismInfo(_StrictBaseModel):
+    # "target", or a draft role such as "draft" / "draft_step_0"
+    role: str
     tp_rank: int
     tp_size: int
     dp_rank: int
@@ -49,10 +53,13 @@ class CheckEntry(NamedTuple):
 class QuantizedWeight(NamedTuple):
     comparable_cls: type[ComparableWeight]
     scale_name: str
+    is_shuffled: bool = False
 
 
 _NON_PERSISTENT_BUFFER_PATTERNS = (
     "cos_sin_cache",
+    "cos_cache",
+    "sin_cache",
     "inv_freq",
     "freqs_cis",
     "expert_mask_gpu",
@@ -63,51 +70,126 @@ def _is_non_persistent_buffer_name(name: str) -> bool:
     return any(pat in name for pat in _NON_PERSISTENT_BUFFER_PATTERNS)
 
 
-class WeightChecker:
-    def __init__(self, *, get_model: Callable[[], Any], ps: Any):
-        self._get_model = get_model
-        self._ps = ps
-        self._snapshot_tensors = None
+def _is_skip_weight_check(name, param, skip_tensor_list=None) -> bool:
+    # one skip set shared by reset / compare / checksum
+    return (
+        _is_non_persistent_buffer_name(name)
+        or getattr(param, "_skip_weight_check", False)
+        or any(pat in name for pat in (skip_tensor_list or ()))
+    )
 
-    def handle(self, action: str, allow_quant_error: bool = False) -> Optional[Dict]:
+
+def overall_checksum(checksums: Dict[str, str]) -> str:
+    h = hashlib.sha256()
+    for name in sorted(checksums):
+        h.update(name.encode())
+        h.update(checksums[name].encode())
+    return h.hexdigest()
+
+
+def _padded(nbytes: int, align: int) -> int:
+    return (nbytes + align - 1) // align * align
+
+
+class _ArenaAllocator:
+    """Bump-allocates aligned views out of one mmap arena, so the whole snapshot is one munmap."""
+
+    def __init__(self, total_bytes: int, align: int):
+        self.arena = alloc_mmap((max(total_bytes, align),), torch.uint8)
+        self._align = align
+        self._pointer = 0
+
+    def allocate(self, like: torch.Tensor) -> torch.Tensor:
+        start = self._pointer
+        self._pointer += _padded(like.nbytes, self._align)
+        assert self._pointer <= len(self.arena)
+        return self.arena[start : start + like.nbytes].view(like.dtype).view(like.shape)
+
+
+class WeightChecker:
+    def __init__(self, *, get_model: Callable[[], Any]):
+        self._get_model = get_model
+        # Capture the runner placement before its draft scope exits.
+        parallel = get_parallel()
+        self._placement = dict(
+            tp_rank=parallel.tp_rank,
+            tp_size=parallel.tp_size,
+            dp_rank=parallel.dp_rank if parallel.dp_rank is not None else 0,
+            dp_size=parallel.attn_dp_size,
+            pp_rank=parallel.pp_rank,
+            pp_size=parallel.pp_size,
+        )
+        self._snapshot_tensors = None
+        self._snapshot_arena = None
+
+    def handle(
+        self,
+        action: str,
+        allow_quant_error: bool = False,
+        skip_tensor_list: Optional[List[str]] = None,
+        *,
+        role: str,
+    ) -> Optional[Dict]:
         logger.info(
-            f"[WeightChecker] handle action={action} allow_quant_error={allow_quant_error}"
+            f"[WeightChecker] handle action={action} "
+            f"allow_quant_error={allow_quant_error} skip_tensor_list={skip_tensor_list}"
         )
         if action == "snapshot":
             return self._snapshot()
         elif action == "reset_tensors":
-            return self._reset_tensors()
+            return self._reset_tensors(skip_tensor_list)
         elif action == "compare":
-            return self._compare(allow_quant_error=allow_quant_error)
+            return self._compare(
+                allow_quant_error=allow_quant_error, skip_tensor_list=skip_tensor_list
+            )
         elif action == "checksum":
-            return self._compute_checksum()
+            return self._compute_checksum(skip_tensor_list, role=role)
         else:
             raise Exception(f"Unsupported {action=}")
 
     def _snapshot(self):
-        named_tensors = [
-            (name, param.data.detach().cpu()) for name, param in self._model_state()
-        ]
-        self._snapshot_tensors = dict(named_tensors)
-        assert len(self._snapshot_tensors) == len(named_tensors), (
+        named_params = [(name, param.data) for name, param in self._model_state()]
+        align = 64  # torch CPU-allocator alignment
+        allocator = _ArenaAllocator(
+            sum(_padded(p.nbytes, align) for _, p in named_params), align
+        )
+        snapshot_tensors = {}
+        for name, param in named_params:
+            view = allocator.allocate(param)
+            view.copy_(param.detach())
+            snapshot_tensors[name] = view
+        assert len(snapshot_tensors) == len(named_params), (
             f"should not have duplicated tensor name"
         )
+        # publish only after every copy succeeded, so a failed snapshot holds no arena
+        self._snapshot_arena = allocator.arena
+        self._snapshot_tensors = snapshot_tensors
 
-    def _reset_tensors(self):
+    def _skip_compare_names(
+        self, skip_tensor_list: Optional[List[str]] = None
+    ) -> Set[str]:
+        return {
+            name
+            for name, param in self._model_state()
+            if _is_skip_weight_check(name, param, skip_tensor_list)
+        }
+
+    def _reset_tensors(self, skip_tensor_list: Optional[List[str]] = None):
         for name, param in self._model_state():
-            if _is_non_persistent_buffer_name(name):
+            # reset must skip exactly what compare skips
+            if _is_skip_weight_check(name, param, skip_tensor_list):
                 continue
             param.copy_(_random_like(param))
 
-    def _compare(self, allow_quant_error: bool = False):
+    def _compare(
+        self,
+        allow_quant_error: bool = False,
+        skip_tensor_list: Optional[List[str]] = None,
+    ):
         assert self._snapshot_tensors is not None
 
         quantized_set = _build_quantized_set(self._get_model())
-        skip_compare_names = {
-            name
-            for name, param in self._model_state()
-            if getattr(param, "_skip_weight_check", False)
-        }
+        skip_compare_names = self._skip_compare_names(skip_tensor_list)
         _check_tensors(
             expect_tensors=_build_check_entries(
                 self._snapshot_tensors, skip_compare_names, quantized_set
@@ -117,17 +199,17 @@ class WeightChecker:
             ),
             allow_quant_error=allow_quant_error,
         )
+        self._snapshot_tensors = None
+        self._snapshot_arena = None
 
-    def _compute_checksum(self) -> Dict:
+    def _compute_checksum(
+        self, skip_tensor_list: Optional[List[str]] = None, *, role: str
+    ) -> Dict:
         torch.cuda.synchronize()
         start = time.perf_counter()
 
         quantized_set = _build_quantized_set(self._get_model())
-        skip_compare_names = {
-            name
-            for name, param in self._model_state()
-            if getattr(param, "_skip_weight_check", False)
-        }
+        skip_compare_names = self._skip_compare_names(skip_tensor_list)
 
         # Hash the dequantized weight so two (qweight, scale) pairs with the same
         # bf16 hash equal.
@@ -138,11 +220,7 @@ class WeightChecker:
             if should_compare:
                 checksums[name] = _hash_tensor(comparable.dequantize().data)
 
-        h = hashlib.sha256()
-        for name in sorted(checksums):
-            h.update(name.encode())
-            h.update(checksums[name].encode())
-        overall = h.hexdigest()
+        overall = overall_checksum(checksums)
 
         torch.cuda.synchronize()
         elapsed = time.perf_counter() - start
@@ -153,21 +231,17 @@ class WeightChecker:
         info = ChecksumInfo(
             checksums=checksums,
             per_gpu_checksum=overall,
-            parallelism_info=self._parallelism_info(),
+            parallelism_info=self._parallelism_info(role=role),
         )
         return info.model_dump()
 
-    def _parallelism_info(self) -> ParallelismInfo:
-        ps = self._ps
+    def _parallelism_info(self, *, role: str) -> ParallelismInfo:
+        # Read the current WORLD rank because elastic scale-up can change it.
         return ParallelismInfo(
-            tp_rank=ps.tp_rank,
-            tp_size=ps.tp_size,
-            dp_rank=ps.dp_rank if ps.dp_rank is not None else 0,
-            dp_size=ps.attn_dp_size,
-            pp_rank=ps.pp_rank,
-            pp_size=ps.pp_size,
+            role=role,
             rank=dist.get_rank() if dist.is_initialized() else 0,
             size=dist.get_world_size() if dist.is_initialized() else 1,
+            **self._placement,
         )
 
     def _model_state(self):
@@ -267,12 +341,14 @@ def _build_quantized_set(model) -> Dict[str, QuantizedWeight]:
         if comparable_cls is None:
             continue
         prefix = f"{module_name}." if module_name else ""
-        own = {name for name, _ in module.named_parameters(recurse=False)}
-        for name in own:
+        own = dict(module.named_parameters(recurse=False))
+        for name, parameter in own.items():
             scale = name.replace("weight", "weight_scale_inv")
             if name.endswith("weight") and scale in own:
                 quantized_set[prefix + name] = QuantizedWeight(
-                    comparable_cls, prefix + scale
+                    comparable_cls,
+                    prefix + scale,
+                    getattr(parameter, "is_shuffled", False),
                 )
     return quantized_set
 
@@ -293,7 +369,13 @@ def _build_check_entries(
             continue  # compared via its weight's comparable
         if name in quantized_set:
             qw = quantized_set[name]
-            yield CheckEntry(name, True, qw.comparable_cls(tensor, raw[qw.scale_name]))
+            yield CheckEntry(
+                name,
+                True,
+                qw.comparable_cls(
+                    tensor, raw[qw.scale_name], is_shuffled=qw.is_shuffled
+                ),
+            )
         else:
             should_compare = name not in skip_compare_names and (
                 not _is_non_persistent_buffer_name(name)

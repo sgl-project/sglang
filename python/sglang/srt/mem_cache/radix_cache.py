@@ -48,7 +48,6 @@ from sglang.srt.mem_cache.base_prefix_cache import (
 from sglang.srt.mem_cache.events import KVCacheEventRecorder
 from sglang.srt.mem_cache.utils import (
     get_eviction_strategy,
-    get_hash_str,
     split_node_hash_value,
 )
 
@@ -71,12 +70,9 @@ class RadixKey:
     ):
         # token ids sequence (raw ints in both modes)
         self.token_ids = token_ids
-        # Extra key for caller-defined cache classification.
+        # Namespaces the tree and storage; omitted from KV events.
         self.extra_key = extra_key
-        # Cache salt is kept distinct so it cannot collide with extra_key.
-        # It namespaces the in-process radix tree and external KV events;
-        # external L3/remote storage keys remain token-only and are outside
-        # this contract.
+        # Namespaces the tree, storage and KV events.
         self.cache_salt = cache_salt or None
         # bigram view over token_ids: length = max(0, len(token_ids) - 1)
         self.is_bigram = is_bigram
@@ -249,12 +245,6 @@ class RadixKey:
             return ((self.extra_key, self.cache_salt), plain)
         return plain if self.extra_key is None else (self.extra_key, plain)
 
-    def hash_page(self, start: int, end: int, prior_hash: Optional[str] = None) -> str:
-        """SHA256 for logical units [start, end); bigram mode feeds overlapping (t_i, t_{i+1}) byte pairs."""
-        hash_value = get_hash_str(self[start:end], prior_hash)
-        assert isinstance(hash_value, str)
-        return hash_value
-
 
 class TreeNode:
     counter = 0
@@ -269,12 +259,6 @@ class TreeNode:
         self.creation_time = time.monotonic()
 
         self.hit_count = 0
-        # indicating the node is locked to protect from eviction
-        # incremented when the node is referenced by a storage operation
-        self.host_ref_counter = 0
-        # store the host indices of KV cache
-        self.host_value: Optional[torch.Tensor] = None
-        self.write_through_pending_id: Optional[int] = None
         # store hash values of each pages
         self.hash_value: Optional[List[str]] = None
         # Namespace-aware hashes used only for external KV events.
@@ -289,34 +273,6 @@ class TreeNode:
     def evicted(self):
         return self.value is None
 
-    @property
-    def backuped(self):
-        return self.host_value is not None
-
-    def protect_host(self):
-        """Protect the host value from eviction."""
-        self.host_ref_counter += 1
-
-    def release_host(self):
-        """Release the host value, allowing it to be evicted."""
-        if self.host_ref_counter > 0:
-            self.host_ref_counter -= 1
-        else:
-            raise RuntimeError("Host reference counter is already zero.")
-
-    def get_last_hash_value(self) -> Optional[str]:
-        """Returns the hash value of the last page in this node."""
-        if self.hash_value is None or len(self.hash_value) == 0:
-            return None
-        return self.hash_value[-1]
-
-    def get_prefix_hash_values(self, node: TreeNode) -> List[str]:
-        chunks = []
-        while node is not None and node.hash_value is not None:
-            chunks.append(node.hash_value)
-            node = node.parent
-        return [value for chunk in reversed(chunks) for value in chunk]
-
     def __lt__(self, other: TreeNode):
         return self.last_access_time < other.last_access_time
 
@@ -328,7 +284,6 @@ class RadixCache(BasePrefixCache):
         self.token_to_kv_pool_allocator = params.token_to_kv_pool_allocator
         self.page_size = params.page_size
         self.is_eagle = params.is_eagle
-        self.disable_finished_insert = params.disable_finished_insert
         self.eviction_policy = params.eviction_policy.lower()
 
         self.kv_events = KVCacheEventRecorder(
@@ -379,7 +334,6 @@ class RadixCache(BasePrefixCache):
         self.root_node = TreeNode(priority=-sys.maxsize)
         self.root_node.key = RadixKey(token_ids=array("q"), extra_key=None)
         self.root_node.value = []
-        self.root_node.host_value = []
         self.root_node.lock_ref = 1
         self.root_node.hash_value = []
         self.evictable_size_ = 0
@@ -480,26 +434,35 @@ class RadixCache(BasePrefixCache):
         return InsertResult(prefix_len=prefix_len, last_device_node=last_node)
 
     def cache_finished_req(
-        self, req: Req, is_insert: bool = True, *, kv_len_to_handle: int
+        self, req: Req, is_insert: bool = True, *, owned_kv_len: int
     ):
         """Cache request when it finishes."""
-        # In deterministic mode, disable finished request insertion to radix cache
-        if self.disable_finished_insert:
-            is_insert = False
-
         if self.disable:
             # The protected prefix is not this req's to free.
             kv_indices = self.req_to_token_pool.req_to_token[
-                req.kv.req_pool_idx, req.kv.cache_protected_len : kv_len_to_handle
+                req.kv.req_pool_idx, req.kv.cache_protected_len : owned_kv_len
             ]
             self.token_to_kv_pool_allocator.free_segment(
                 kv_indices, start_pos=req.kv.cache_protected_len
             )
             return
 
-        token_ids = (req.origin_input_ids + req.output_ids)[:kv_len_to_handle]
+        if not is_insert:
+            # Frees committed slots that no token id names, which the insert
+            # path below cannot reach; the protected prefix stays with the cache.
+            kv_indices = self.req_to_token_pool.req_to_token[
+                req.kv.req_pool_idx, req.kv.cache_protected_len : owned_kv_len
+            ]
+            self.token_to_kv_pool_allocator.free_segment(
+                kv_indices, start_pos=req.kv.cache_protected_len
+            )
+            if req.last_node is not None:
+                self.dec_lock_ref(req.last_node)
+            return
+
+        token_ids = (req.origin_input_ids + req.output_ids)[:owned_kv_len]
         kv_indices = self.req_to_token_pool.req_to_token[
-            req.kv.req_pool_idx, : len(token_ids)
+            req.kv.req_pool_idx, :owned_kv_len
         ]
 
         radix_key = RadixKey(
@@ -512,14 +475,36 @@ class RadixCache(BasePrefixCache):
         values = kv_indices[:key_len].to(dtype=torch.int64, copy=True)
 
         # Radix Cache takes one ref in memory pool
-        if is_insert:
-            priority = getattr(req, "priority", 0) or 0
-            result = self.insert(
-                InsertParams(key=radix_key, value=values, priority=priority)
+        priority = getattr(req, "priority", 0) or 0
+        result = self.insert(
+            InsertParams(key=radix_key, value=values, priority=priority)
+        )
+        # A request that was never cached while unfinished can add its
+        # whole prompt and generated output as one leaf. Split that leaf at
+        # the prompt boundary so LRU eviction can discard output KV without
+        # also losing the reusable prompt KV. Reinserting a prefix only
+        # changes radix topology; it reuses the indices inserted above.
+        prompt_key = RadixKey(
+            token_ids[: len(req.origin_input_ids)],
+            req.extra_key,
+            is_bigram=self.is_eagle,
+            cache_salt=req.cache_salt,
+        ).page_aligned(self.page_size)
+        if 0 < len(prompt_key) < key_len:
+            self.insert(
+                InsertParams(
+                    key=prompt_key,
+                    value=values[: len(prompt_key)],
+                    priority=priority + 1,
+                    # Topology-only re-insert: this request created these
+                    # nodes moments ago, so counting it as a hit is the
+                    # same self-referencing inflation `chunked` exists to
+                    # suppress. hit_count drives eviction order, so an
+                    # extra bump would silently promote every prompt node.
+                    chunked=True,
+                )
             )
-            freed_end = result.prefix_len
-        else:
-            freed_end = key_len
+        freed_end = result.prefix_len
 
         # duplicates / uninserted range, then the unaligned tail
         self.token_to_kv_pool_allocator.free_segments(
