@@ -1406,14 +1406,32 @@ class ScoringRequest(BaseModel):
     return_token_logprobs: bool = False
     item_first: bool = False
     return_pooled_hidden_states: bool = False
+
+    # Setwise readout (SequenceClassification-only): when set, the head is pooled
+    # AT every occurrence of this token in each `query + item` sequence instead of
+    # the last token, and `scores` is returned nested (one `[Nᵢ x num_labels]`
+    # matrix per item). --enable-mis fuses items; otherwise each is scored alone.
+    score_extraction_token: Optional[str] = None
+
     model: str = DEFAULT_MODEL_NAME
 
 
 class ScoringResponse(BaseModel):
-    scores: List[
-        List[float]
-    ]  # List of lists of probabilities, each in the order of label_token_ids
-    pooled_hidden_states: Optional[List[Optional[List[float]]]] = None
+    # Pointwise (no `score_extraction_token`): a single [num_rows x num_labels]
+    # matrix. Setwise: nested [num_items][Nᵢ x num_labels]. The nesting depth
+    # disambiguates the two shapes.
+    scores: Union[
+        List[List[float]],  # pointwise: [num_rows x num_labels]
+        List[List[List[float]]],  # setwise: [num_items][Nᵢ x num_labels]
+    ]
+    # Parallel to `scores`: flat [num_rows x hidden] (pointwise) or one such
+    # matrix per item (setwise).
+    pooled_hidden_states: Optional[
+        Union[
+            List[Optional[List[float]]],  # pointwise: [num_rows x hidden]
+            List[List[Optional[List[float]]]],  # setwise: [num_items][Nᵢ x hidden]
+        ]
+    ] = None
     token_logprobs: Optional[List[List[float]]] = None
     model: str
     usage: Optional[UsageInfo] = None
