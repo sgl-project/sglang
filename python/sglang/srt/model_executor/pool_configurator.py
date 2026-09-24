@@ -20,6 +20,7 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
+from sglang.srt.arg_groups.overrides import resolving_view
 from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.configs.model_config import (
     AttentionArch,
@@ -40,7 +41,10 @@ from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
     get_dsv4_indexer_bytes_per_token,
     get_swa_ring_size,
 )
-from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
+from sglang.srt.mem_cache.memory_pool import (
+    DSATokenToKVPool,
+    get_minimax_sparse_index_dtype,
+)
 from sglang.srt.runtime_context import (
     get_disagg,
     get_exec,
@@ -359,6 +363,8 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                     num_layers=num_layers,
                 )
         elif is_minimax_sparse(model_config.hf_config):
+            from sglang.srt.server_args import m3_fp8_attn_gemm_enabled
+
             # Mirrors MiniMaxSparseKVPool: main pool (K+V all layers) + indexer pool
             # (sparse-only, single-head; kv layers store K+V, k-only layers store K).
             sparse_cfg = get_minimax_sparse_attention_config(model_config.hf_config)
@@ -387,7 +393,15 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             kv_heads = model_config.get_num_kv_heads(get_parallel().attn_tp_size)
             head_dim = model_config.head_dim
             indexer_head_dim = sparse_cfg["sparse_index_dim"]
-            indexer_dtype_size = torch._utils._element_size(kvc.model_dtype)
+            indexer_dtype_size = torch._utils._element_size(
+                get_minimax_sparse_index_dtype(
+                    fp8_attn_gemm=m3_fp8_attn_gemm_enabled(
+                        resolving_view(kvc.server_args)
+                    ),
+                    kv_cache_dtype=kvc.kv_cache_dtype,
+                    model_dtype=kvc.model_dtype,
+                )
+            )
 
             full_pool_ratio = 1
             if get_memory().enable_hisparse:
@@ -591,8 +605,8 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
         kv_size = torch._utils._element_size(kv_cache_dtype)
         tp_size = get_parallel().attn_tp_size
 
-        self._full_layers_num = len(model_config.full_attention_layer_ids)
-        self._swa_layers_num = len(model_config.swa_attention_layer_ids)
+        self._full_layers_num = len(kvc.layer_info.full_attention_layer_ids)
+        self._swa_layers_num = len(kvc.layer_info.swa_attention_layer_ids)
         assert self._swa_layers_num > 0, (
             "Hybrid SWA model must have at least one SWA layer"
         )
@@ -901,7 +915,7 @@ class SWAChunkCapPoolConfigurator(HybridSWAPoolConfigurator):
             return False
         if kvc.sliding_window_size is None:
             return False
-        return len(kvc.model_config.full_attention_layer_ids) > 0
+        return len(kvc.layer_info.full_attention_layer_ids) > 0
 
     def calculate_pool_sizes(
         self, available_bytes: int, page_size: int
@@ -1011,6 +1025,8 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         if self._unified:
             # Unified_kv stores the whole latent: one bf16 row, or fp8 nope + bf16 rope.
             self.kv_bytes = self._unified_row_bytes
+        elif get_exec().kernel.dsv4_attn_backend == "trtllm":
+            self.kv_bytes = self.attn_head_dim
         else:
             # One FlashMLA-layout latent slot, in bytes.
             self.kv_bytes = self.qk_nope_head_dim + self.qk_rope_head_dim * 2 + 8
@@ -1031,7 +1047,8 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
                 f"layers=[{kvc.layer_info.start_layer},{kvc.layer_info.end_layer}) "
                 f"local={len(self.compression_ratios)}/{len(cfg.compress_ratios)}"
             )
-        self.swa_page_size = cfg.window_size
+        self.swa_window_size = cfg.window_size
+        self.swa_page_size = get_schedule().page_size
         self.operator_swa_ratio = _operator_swa_full_tokens_ratio()
         self.swa_ratio = (
             self.operator_swa_ratio
@@ -1062,12 +1079,24 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         if self.c4_shrink_factor > 1:
             logger.info(f"HiSparse c4 host-to-device ratio = {self.c4_shrink_factor}")
 
-        self.c4_ring_size = get_compress_state_ring_size(4, self.is_speculative)
-        self.c128_ring_size = get_compress_state_ring_size(128, self.is_speculative)
+        # Same argument as the pool's get_ring_size, so both sides agree.
+        num_draft_tokens = (
+            (get_spec().speculative_num_draft_tokens or 0) if self.is_speculative else 0
+        )
+        self.c4_ring_size = get_compress_state_ring_size(4, num_draft_tokens)
+        self.c128_ring_size = get_compress_state_ring_size(128, num_draft_tokens)
+        self.c2_ring_size = get_compress_state_ring_size(2, num_draft_tokens)
 
         self.num_layers_total = len(self.compression_ratios)
         self.num_layers_ca4 = sum(1 for r in self.compression_ratios if r == 4)
         self.num_layers_ca128 = sum(1 for r in self.compression_ratios if r == 128)
+        # Only a ratio-2 kv_source layer compresses, so only it keeps pair state.
+        self.num_layers_c2_source = sum(
+            1
+            for l in cfg.hf_config.kv_source_layer_ids
+            if kvc.layer_info.start_layer <= l < kvc.layer_info.end_layer
+            and cfg.compress_ratios[l] == 2
+        )
         # The low-ratio indexer pools are built with force_fp4=True
         # (deepseek_v4_memory_pool), so they are fp4 whatever dtype c4 uses.
         low_ratio_index_bytes = get_dsv4_indexer_bytes_per_token(
@@ -1083,8 +1112,10 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
             dsv4_unified_row_bytes,
         )
 
-        # swa_page_size is the model's sliding window (cfg.window_size).
-        self._swa_ring_size = get_swa_ring_size(self.swa_page_size, self.is_speculative)
+        # swa_window_size is the model's sliding window (cfg.window_size).
+        self._swa_ring_size = get_swa_ring_size(
+            self.swa_window_size, self.is_speculative
+        )
         self._spec_infl = 1.0
 
         # The unified pool takes no dtype, so --kv-cache-dtype never reaches it.
@@ -1381,6 +1412,25 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
             state_rows * state_last_dim * c128_state_dtype_size * self.num_layers_ca128
         )
 
+    def _get_c2_state_fixed_bytes(self, max_running_requests: int) -> int:
+        """Ratio-2 pending-pair state, one fp32 (kv, score) ring per request slot
+        on each ratio-2 kv_source layer; mirrors _make_pair_state_pool."""
+        if self.num_layers_c2_source == 0:
+            return 0
+
+        num_req_slots = self._get_num_req_slots(max_running_requests)
+        ring_size = self.c2_ring_size
+        # CompressStatePool allocates `size + ring_size + 1` rows, padded to the ratio.
+        state_rows = num_req_slots * ring_size + ring_size + 1
+        state_rows = ceil_div(state_rows, 2) * 2
+        state_last_dim = 2 * self.attn_head_dim
+        return (
+            state_rows
+            * state_last_dim
+            * torch.float32.itemsize
+            * self.num_layers_c2_source
+        )
+
     def _unified_c4_state_pool_size(self, max_running_requests: int) -> int:
         # Unified C4 state loc is req_pool_idx * c4_ring_size + pos % c4_ring_size.
         num_req_slots = self._get_num_req_slots(max_running_requests)
@@ -1489,6 +1539,9 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         c128_state_fixed_bytes = self._get_c128_state_fixed_bytes(
             max_running_requests_per_worker
         )
+        c2_state_fixed_bytes = self._get_c2_state_fixed_bytes(
+            max_running_requests_per_worker
+        )
         swa_ring_fixed_bytes = self._fixed_swa_bytes(max_running_requests_per_worker)
         c4_state_fixed_bytes = self._fixed_c4_state_bytes(
             max_running_requests_per_worker
@@ -1497,6 +1550,7 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         swa_fixed_bytes = self._get_swa_fixed_bytes()
         fixed_bytes = (
             c128_state_fixed_bytes
+            + c2_state_fixed_bytes
             + swa_fixed_bytes
             + swa_ring_fixed_bytes
             + c4_state_fixed_bytes
@@ -1520,6 +1574,7 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
             f"bytes_per_full_token={self.bytes_per_full_token:.2f}, "
             f"available_bytes={available_bytes / (1 << 30):.2f} GB, "
             f"c128_state_fixed={c128_state_fixed_bytes / (1 << 30):.2f} GB, "
+            f"c2_state_fixed={c2_state_fixed_bytes / (1 << 30):.2f} GB, "
             f"swa_fixed={swa_fixed_bytes / (1 << 30):.2f} GB, "
             f"swa_ring_fixed={swa_ring_fixed_bytes / (1 << 30):.2f} GB, "
             f"c4_state_fixed={c4_state_fixed_bytes / (1 << 30):.2f} GB, "

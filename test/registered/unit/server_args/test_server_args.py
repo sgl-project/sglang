@@ -1986,7 +1986,34 @@ class TestSSLArgs(unittest.TestCase):
         self.assertTrue(resolution_result(server_args, "enable_ssl_refresh"))
 
 
-class TestHiCacheArgs(unittest.TestCase):
+class TestHiCacheArgs(CustomTestCase):
+    def test_host_receive_speculative_uses_shared_retraction_pool(self):
+        """Speculation must still resolve host receive to the shared host pool."""
+        for algorithm in ("EAGLE", "EAGLE3", "NGRAM"):
+            with self.subTest(algorithm=algorithm):
+                args = self._make_args(
+                    disaggregation_mode="decode",
+                    disaggregation_decode_host_receive_threshold=0.8,
+                    speculative_algorithm=algorithm,
+                )
+                handle_pd_disaggregation(args)
+                self.assertEqual(
+                    resolution_result(args, "disaggregation_decode_retraction_backup"),
+                    "host_pool",
+                )
+                handle_hicache(args)
+                self.assertEqual(
+                    resolution_result(args, "hicache_mem_layout"), "layer_first"
+                )
+
+        for threshold in (-0.1, 1.1, float("nan")):
+            with self.subTest(threshold=threshold):
+                args = self._make_args(
+                    disaggregation_decode_host_receive_threshold=threshold
+                )
+                with self.assertRaisesRegex(ValueError, "must be between 0 and 1"):
+                    handle_pd_disaggregation(args)
+
     def test_linker_mla_dedup_requires_mooncake_linker(self):
         for enabled, linker, backend in (
             (False, False, "mooncake"),
