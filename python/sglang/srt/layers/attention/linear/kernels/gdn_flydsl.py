@@ -5,6 +5,7 @@ from collections.abc import Sequence
 import torch
 
 from sglang.srt.layers.attention.linear.kernels.gdn_triton import TritonGDNKernel
+from sglang.srt.utils.common import rank0_log
 
 
 def _load_aiter_flydsl_gdn():
@@ -140,6 +141,15 @@ class FlyDSLGDNKernel(TritonGDNKernel):
             or not inplace_update
             or not self._supports_inputs(q, k, v, ssm_states)
         ):
+            if not getattr(self, "_logged_triton_fallback", False):
+                self._logged_triton_fallback = True
+                if prefill_metadata is None:
+                    reason = "no prefill schedule"
+                elif not inplace_update:
+                    reason = "inplace_update is false"
+                else:
+                    reason = "unsupported input or state shape"
+                rank0_log(f"FlyDSL GDN prefill fell back to Triton ({reason}).")
             return super().extend(
                 q,
                 k,
