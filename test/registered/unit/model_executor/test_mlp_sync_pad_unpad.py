@@ -269,6 +269,7 @@ class TestDraftScopeMlpSync(CustomTestCase):
             ),
         )
         runner = _mock_model_runner()
+        runner.attn_backend.get_cpu_graph_seq_len_fill_value.return_value = 1
         runner.is_draft_worker = True
         runner.attn_tp_sequence_sharded.return_value = False
         draft_group = GroupCoordinator.__new__(GroupCoordinator)
@@ -280,6 +281,8 @@ class TestDraftScopeMlpSync(CustomTestCase):
                 tp_rank=self.SLOT, attn_tp_rank=0, attn_dp_rank=self.SLOT
             ),
             patch.object(parallel_state, "_TP", draft_group),
+            # CPU runners have no driver to pin the synced token counts with.
+            patch("sglang.srt.model_executor.forward_batch_info._is_cpu", True),
             parallel_state.patch_tensor_parallel_group(
                 draft_group, owns_attention=True
             ),
