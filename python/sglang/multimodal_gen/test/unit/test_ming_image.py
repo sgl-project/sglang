@@ -98,6 +98,7 @@ def test_cpu_noise_draw_preserves_official_frame_order():
     config.check_pipeline_config()
     assert not config.vae_tiling
     assert not config.vae_sp
+    assert config.supports_sequential_multi_output_inference()
     batch = SimpleNamespace(extra={"ming_frames": 3}, height=32, width=48)
     shape = config.prepare_latent_shape(batch, 1, 1)
     actual = torch.randn(shape, generator=torch.Generator().manual_seed(42))

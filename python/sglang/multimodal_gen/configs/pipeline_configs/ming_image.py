@@ -34,6 +34,9 @@ class MingImagePipelineConfig(ImagePipelineConfig):
         # Reference/query sequences have different lengths across requests.
         return False
 
+    def supports_sequential_multi_output_inference(self):
+        return True
+
     def get_latent_dtype(self, prompt_dtype):
         return torch.float32
 

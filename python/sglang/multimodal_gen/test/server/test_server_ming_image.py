@@ -80,8 +80,9 @@ def test_repeated_generation_and_editing(diffusion_server, case):
         }
         if layered:
             payload["num_layers"] = 2
-        first = None
-        for _ in range(2):
+        previous = {}
+        for count in (1, 1, 2, 2):
+            payload["n"] = count
             if mode == "edit":
                 response = requests.post(
                     f"{url}/edits",
@@ -95,7 +96,7 @@ def test_repeated_generation_and_editing(diffusion_server, case):
                 )
             assert response.ok, response.text
             data = response.json()["data"]
-            assert len(data) == (2 if layered else 1)
+            assert len(data) == count * (2 if layered else 1)
             images = []
             for item in data:
                 with Image.open(
@@ -107,7 +108,10 @@ def test_repeated_generation_and_editing(diffusion_server, case):
                     images.append(pixels)
             # a decomposed background layer can legitimately be a solid color
             assert max(pixels[..., :3].std() for pixels in images) > 5
-            if first is not None:
-                for actual, expected in zip(images, first, strict=True):
+            if count in previous:
+                for actual, expected in zip(images, previous[count], strict=True):
                     np.testing.assert_array_equal(actual, expected)
-            first = images
+            if count == 2:
+                for actual, expected in zip(images, previous[1]):
+                    np.testing.assert_array_equal(actual, expected)
+            previous[count] = images
