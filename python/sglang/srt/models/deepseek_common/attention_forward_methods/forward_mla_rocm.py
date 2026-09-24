@@ -343,7 +343,13 @@ def _fused_rope_cat_and_cache(
     positions: torch.Tensor,
     out_cache_loc: torch.Tensor,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """RoPE + concat + KV-cache write via the AITER fused kernel on gfx95."""
+    """RoPE + concat + KV-cache write via the AITER fused kernel on gfx95.
+
+    NoPE layers (``rotary_emb is None``, e.g. Kimi-K3) still take this path:
+    the kernel's NoPE variant copies the PE halves through and keeps the
+    concat and the cache write fused.
+    """
+    apply_rope = attn.rotary_emb is not None
     kv_cache_dtype = (
         fp8_dtype if attn.kv_cache_dtype == "fp8_e4m3" else q_nope_out.dtype
     )
@@ -368,11 +374,11 @@ def _fused_rope_cat_and_cache(
         k_pe,
         kv_pool.get_key_buffer(attn.attn_mqa.layer_id),
         out_cache_loc,
-        positions,
-        attn.rotary_emb.cos_cache,
-        attn.rotary_emb.sin_cache,
+        positions if apply_rope else None,
+        attn.rotary_emb.cos_cache if apply_rope else None,
+        attn.rotary_emb.sin_cache if apply_rope else None,
         attn.attn_mqa.k_scale,
-        attn.rotary_emb.is_neox_style,
+        attn.rotary_emb.is_neox_style if apply_rope else False,
         q_out_dtype=q_out_dtype,
     )
 
@@ -1058,14 +1064,8 @@ class DeepseekMLARocmForwardMixin:
         when running aiter-backend MLA on gfx95 (i.e., the `else` branch in
         forward_absorb_rocm_core that calls fused_qk_rope_cat_and_cache_mla).
 
-        A layer without a rotary_emb has nothing to fuse: that branch reads
-        rotary_emb.cos_cache, so skipping the standalone rope there ends in
-        AttributeError on None. Kimi-K3 has such layers.
+        NoPE layers (rotary_emb=None, e.g. Kimi-K3) take the same branch: there
+        is no rope for prepare to skip, and the kernel's NoPE variant still
+        fuses the two concats, the FP8 cast and the paged write into one launch.
         """
-        # NoPE models (rotary_emb=None, e.g. Kimi-K3) have no rope for the
-        # fused kernel to apply; keep both prepare and core on the plain path.
-        return (
-            _use_aiter_gfx95
-            and self.current_attention_backend == "aiter"
-            and self.rotary_emb is not None
-        )
+        return _use_aiter_gfx95 and self.current_attention_backend == "aiter"
