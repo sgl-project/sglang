@@ -15,6 +15,46 @@ def _unescape_mount_path(value: str) -> str:
     return re.sub(r"\\([0-7]{3})", lambda m: chr(int(m[1], 8)), value)
 
 
+# memory.stat keys for charged page cache, and for the subset the kernel
+# must write out before it can drop, per cgroup version.
+_PAGE_CACHE_STAT_KEYS = {
+    "cgroup2": (("inactive_file", "active_file"), ("file_dirty", "file_writeback")),
+    "cgroup": (
+        ("total_inactive_file", "total_active_file"),
+        ("total_dirty", "total_writeback"),
+    ),
+}
+
+
+def _unreclaimable_usage_bytes(
+    directory: Path, filesystem: str, usage_name: str
+) -> int:
+    """Charged bytes the kernel cannot free under pressure.
+
+    Usage counts clean page cache, which stays charged after the processes that
+    read the files exit and is reparented when their cgroup is removed. On a
+    shared node that leaves hundreds of GiB of a finished job's cache charged
+    against the ancestor limits a new job runs under. Under pressure the kernel
+    drops it, so it must not count against a new allocation. Dirty and
+    writeback pages are kept; shmem is on the anon LRU and stays charged.
+    """
+    usage = int((directory / usage_name).read_text())
+    try:
+        stat_text = (directory / "memory.stat").read_text()
+    except FileNotFoundError:
+        return usage
+    stats = {}
+    for line in stat_text.splitlines():
+        key, _, value = line.partition(" ")
+        if value.isdigit():
+            stats[key] = int(value)
+    cached_keys, dirty_keys = _PAGE_CACHE_STAT_KEYS[filesystem]
+    reclaimable = sum(stats.get(key, 0) for key in cached_keys) - sum(
+        stats.get(key, 0) for key in dirty_keys
+    )
+    return max(0, usage - max(0, reclaimable))
+
+
 def _cgroup_memory_headroom(proc_root: Path = Path("/proc")) -> int | None:
     memberships = {}
     try:
@@ -66,6 +106,7 @@ def _cgroup_memory_headroom(proc_root: Path = Path("/proc")) -> int | None:
             "memory.current" if filesystem == "cgroup2" else "memory.usage_in_bytes"
         )
         while True:
+            usage = None
             for name in limits:
                 try:
                     value = (directory / name).read_text().strip()
@@ -77,7 +118,10 @@ def _cgroup_memory_headroom(proc_root: Path = Path("/proc")) -> int | None:
                 limit = int(value)
                 # Do not silently ignore an unreadable usage file for a known
                 # limit: falling back to host RAM could overrun the container.
-                usage = int((directory / usage_name).read_text())
+                if usage is None:
+                    usage = _unreclaimable_usage_bytes(
+                        directory, filesystem, usage_name
+                    )
                 remaining = max(0, limit - usage)
                 headroom = remaining if headroom is None else min(headroom, remaining)
             if directory == mount:
@@ -91,7 +135,7 @@ def _cgroup_memory_headroom(proc_root: Path = Path("/proc")) -> int | None:
 
 
 def available_host_memory_bytes() -> int:
-    """Conservative allocatable RAM; charged file cache is not assumed reclaimable."""
+    """Allocatable RAM, bounded by the cgroup limits net of reclaimable page cache."""
     available = psutil.virtual_memory().available
     cgroup_headroom = _cgroup_memory_headroom()
     if cgroup_headroom is not None:

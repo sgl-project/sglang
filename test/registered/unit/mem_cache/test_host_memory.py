@@ -7,11 +7,12 @@ from unittest.mock import Mock, patch
 
 from sglang.srt.mem_cache import host_memory
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
 
-class TestHostMemory(unittest.TestCase):
+class TestHostMemory(CustomTestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
@@ -31,7 +32,7 @@ class TestHostMemory(unittest.TestCase):
             f"1 0 0:1 {mount_root} {escaped} rw - {filesystem} cgroup {options}\n"
         )
 
-    def memory(self, path, usage, maximum="max", high="max", v1=False):
+    def memory(self, path, usage, maximum="max", high="max", v1=False, stat=None):
         directory = self.mount / path
         directory.mkdir(parents=True, exist_ok=True)
         files = (
@@ -41,6 +42,94 @@ class TestHostMemory(unittest.TestCase):
         )
         for name, value in files.items():
             (directory / name).write_text(str(value))
+        if stat is not None:
+            (directory / "memory.stat").write_text(
+                "".join(f"{key} {value}\n" for key, value in stat.items())
+            )
+
+    def test_clean_file_cache_is_reclaimable(self):
+        self.configure()
+        self.memory(
+            "task/engine",
+            90,
+            100,
+            stat={"anon": 10, "inactive_file": 78, "active_file": 2},
+        )
+        self.assertEqual(host_memory._cgroup_memory_headroom(self.proc), 90)
+
+    def test_dirty_and_writeback_pages_stay_charged(self):
+        self.configure()
+        self.memory(
+            "task/engine",
+            90,
+            100,
+            stat={"inactive_file": 80, "file_dirty": 20, "file_writeback": 10},
+        )
+        self.assertEqual(host_memory._cgroup_memory_headroom(self.proc), 60)
+
+    def test_shmem_stays_charged(self):
+        self.configure()
+        # Shared anonymous mappings are counted as file memory, but live on
+        # the anon LRU. Crediting the file counter would treat live buffers as free.
+        self.memory(
+            "task/engine",
+            90,
+            100,
+            stat={"file": 85, "shmem": 80, "inactive_file": 5},
+        )
+        self.assertEqual(host_memory._cgroup_memory_headroom(self.proc), 15)
+
+    def test_ancestor_cache_from_finished_jobs_is_reclaimable(self):
+        self.configure()
+        self.memory(
+            "task",
+            720,
+            900,
+            stat={"anon": 20, "inactive_file": 690, "active_file": 10},
+        )
+        self.memory("task/engine", 5, 880, stat={"anon": 5})
+        self.assertEqual(host_memory._cgroup_memory_headroom(self.proc), 875)
+
+    def test_v1_uses_hierarchical_file_counters(self):
+        self.configure(v1=True)
+        self.memory(
+            "task",
+            720,
+            900,
+            v1=True,
+            stat={
+                "inactive_file": 10,
+                "active_file": 0,
+                "dirty": 1,
+                "writeback": 1,
+                "total_inactive_file": 690,
+                "total_active_file": 10,
+                "total_dirty": 30,
+                "total_writeback": 20,
+            },
+        )
+        self.memory("task/engine", 5, 880, v1=True)
+        self.assertEqual(host_memory._cgroup_memory_headroom(self.proc), 830)
+
+    def test_reclaimable_cache_respects_high_limit(self):
+        self.configure()
+        self.memory("task/engine", 90, 100, high=80, stat={"inactive_file": 80})
+        self.assertEqual(host_memory._cgroup_memory_headroom(self.proc), 70)
+
+    def test_inconsistent_file_counters_are_clamped(self):
+        self.configure()
+        # Usage and memory.stat are separate snapshots. Neither negative
+        # reclaimable cache nor negative charged usage should inflate a budget.
+        for stat, expected in [
+            ({"inactive_file": 5, "file_dirty": 10, "file_writeback": 10}, 10),
+            ({"inactive_file": 120}, 100),
+            ({}, 10),
+        ]:
+            with self.subTest(stat=stat):
+                self.memory("task/engine", 90, 100, stat=stat)
+                self.assertEqual(
+                    host_memory._cgroup_memory_headroom(self.proc), expected
+                )
 
     def test_v2_parent_and_high_limits(self):
         self.configure()
