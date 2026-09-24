@@ -461,5 +461,111 @@ class TestFusedConvWindowScatterMulti(CustomTestCase):
         self._run(num_types=2, n2=4)
 
 
+class TestMambaStateScatterMulti(unittest.TestCase):
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
+    def test_mixed_states_and_graph_replay(self):
+        from sglang.kernels.ops.mamba.mamba_state_scatter_triton import (
+            fused_mamba_state_scatter_multi,
+        )
+
+        for requests in (1, 3, 128):
+            for index_dtype in (torch.int32, torch.int64):
+                with self.subTest(requests=requests, index_dtype=index_dtype):
+                    slots, steps = requests + 4, 4
+                    conv_storage = torch.full(
+                        (3, slots, 2056), -7, dtype=torch.bfloat16, device="cuda"
+                    )
+                    conv = conv_storage[:, :, :2049]
+                    conv_src = torch.randn(
+                        (3, requests, steps, 2049), dtype=torch.bfloat16, device="cuda"
+                    )
+                    ngram = torch.full(
+                        (1, slots, 3), -7, dtype=torch.int64, device="cuda"
+                    )
+                    ngram_src = (
+                        torch.arange(
+                            requests * steps * 3, dtype=torch.int64, device="cuda"
+                        ).view(1, requests, steps, 3)
+                        + 2**40
+                    )
+                    window_storage = torch.randn(
+                        (2, requests, 17, steps + 2),
+                        dtype=torch.bfloat16,
+                        device="cuda",
+                    )
+                    window_src = window_storage.unfold(-1, 3, 1).permute(0, 1, 3, 2, 4)
+                    window_dst = torch.full(
+                        (2, slots, 17, 3), -7, dtype=torch.bfloat16, device="cuda"
+                    )
+                    ssm_src = torch.randn(
+                        (2, requests, steps, 3, 4, 5),
+                        dtype=torch.bfloat16,
+                        device="cuda",
+                    )
+                    ssm_dst = torch.full(
+                        (2, slots, 3, 4, 5), -7, dtype=torch.bfloat16, device="cuda"
+                    )
+                    pairs = [
+                        (conv, conv_src),
+                        (ngram, ngram_src),
+                        (window_dst, window_src),
+                        (ssm_dst, ssm_src),
+                    ]
+                    indices = torch.arange(
+                        requests, device="cuda", dtype=index_dtype
+                    ).repeat_interleave(2)[::2]
+                    step_storage = torch.zeros(
+                        requests * 2, device="cuda", dtype=index_dtype
+                    )
+                    accepted = step_storage[::2]
+                    tracked = torch.full_like(accepted, 2)
+                    track_indices = indices.roll(1)
+
+                    def run():
+                        fused_mamba_state_scatter_multi(pairs, indices, accepted)
+                        fused_mamba_state_scatter_multi(pairs, track_indices, tracked)
+
+                    run()
+                    graph = torch.cuda.CUDAGraph()
+                    with torch.cuda.graph(graph):
+                        run()
+                    for replay in range(3):
+                        accepted.fill_(replay)
+                        tracked.fill_(3 - replay)
+                        if requests > 1:
+                            accepted[0] = -1
+                            tracked[-1] = steps
+                            indices[-1] = slots
+                        if replay == 2 and index_dtype == torch.int64:
+                            indices[0] = 2**32
+                        for dst, _ in pairs:
+                            dst.fill_(-7)
+                        expected = [dst.clone() for dst, _ in pairs]
+                        for dst_idx, step_idx in (
+                            (indices, accepted),
+                            (track_indices, tracked),
+                        ):
+                            valid = (
+                                (dst_idx >= 0)
+                                & (dst_idx < slots)
+                                & (step_idx >= 0)
+                                & (step_idx < steps)
+                            )
+                            req = torch.arange(requests, device="cuda")[valid]
+                            for out, (_, src) in zip(expected, pairs):
+                                out[:, dst_idx[valid].long()] = src[
+                                    :, req, step_idx[valid].long()
+                                ]
+                        graph.replay()
+                        for (dst, _), out in zip(pairs, expected):
+                            torch.testing.assert_close(dst, out, rtol=0, atol=0)
+                        torch.testing.assert_close(
+                            conv_storage[:, :, 2049:],
+                            torch.full_like(conv_storage[:, :, 2049:], -7),
+                            rtol=0,
+                            atol=0,
+                        )
+
+
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()
