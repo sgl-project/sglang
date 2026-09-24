@@ -9,7 +9,10 @@ kernel = torch.ops.sgl_kernel
 
 from sglang.srt.utils.numa_utils import init_threads_binding
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase, get_available_cpu_ids
+from sglang.test.test_utils import (
+    CustomTestCase,
+    get_available_cpu_ids,
+)
 
 register_cpu_ci(est_time=6, suite="stage-a-tp-test-cpu-intel")
 
