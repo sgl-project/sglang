@@ -1,8 +1,4 @@
-use std::{
-    path::{Component as PathComponent, Path},
-    sync::Arc,
-    time::Duration,
-};
+use std::{sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use sha2::{Digest, Sha256};
@@ -27,41 +23,12 @@ pub struct WasmModuleConfigRequest {
     pub descriptor: WasmModuleDescriptor,
 }
 
-/// Sensitive system directories that WASM modules cannot be loaded from.
-/// These are blocked to prevent information disclosure attacks.
-const BLOCKED_PATH_PREFIXES: &[&str] = &[
-    "/etc/",
-    "/proc/",
-    "/sys/",
-    "/dev/",
-    "/boot/",
-    "/root/",
-    "/var/log/",
-    "/var/run/",
-];
-
-/// Check if a path starts with any blocked prefix.
-/// Returns the matched prefix if found, None otherwise.
-fn find_blocked_prefix(path: &str) -> Option<&'static str> {
-    BLOCKED_PATH_PREFIXES
-        .iter()
-        .find(|&&prefix| path.starts_with(prefix))
-        .copied()
-}
-
-/// Check if a path has a .wasm extension (case-insensitive).
-fn has_wasm_extension(path: &Path) -> bool {
-    path.extension()
-        .is_some_and(|ext| ext.eq_ignore_ascii_case("wasm"))
-}
-
 /// Step 1: Validate module descriptor
 ///
-/// Validates that the module descriptor has all required fields:
-/// - Module name is not empty
-/// - File path is not empty
-/// - File exists and is readable
-/// - File size is not zero
+/// Checks the descriptor's own fields, then resolves the requested file path
+/// against the configured module roots. Confinement to those roots is the
+/// security boundary; see [`crate::wasm::module_roots`] for why an allow-list
+/// replaced the deny-list of sensitive directories that used to live here.
 pub struct ValidateDescriptorStep;
 
 #[async_trait]
@@ -70,143 +37,62 @@ impl StepExecutor<WasmRegistrationWorkflowData> for ValidateDescriptorStep {
         &self,
         context: &mut WorkflowContext<WasmRegistrationWorkflowData>,
     ) -> WorkflowResult<StepResult> {
-        let descriptor = &context.data.config.descriptor;
+        let step_id = || StepId::new("validate_descriptor");
 
-        debug!("Validating WASM module descriptor: {}", descriptor.name);
+        // Take owned copies so the shared borrow of `context.data` ends before
+        // the resolved path is written back to it.
+        let (module_name, requested_path) = {
+            let descriptor = &context.data.config.descriptor;
+            (descriptor.name.clone(), descriptor.file_path.clone())
+        };
 
-        // Validate name
-        if descriptor.name.is_empty() {
+        debug!("Validating WASM module descriptor: {}", module_name);
+
+        if module_name.is_empty() {
             return Err(WorkflowError::StepFailed {
-                step_id: StepId::new("validate_descriptor"),
+                step_id: step_id(),
                 message: "Module name cannot be empty".to_string(),
             });
         }
 
-        // Validate file path
-        if descriptor.file_path.is_empty() {
+        if requested_path.is_empty() {
             return Err(WorkflowError::StepFailed {
-                step_id: StepId::new("validate_descriptor"),
+                step_id: step_id(),
                 message: "Module file path cannot be empty".to_string(),
             });
         }
 
-        // Security: Validate path to prevent path traversal attacks
-        let path = Path::new(&descriptor.file_path);
+        let roots = context
+            .data
+            .app_context
+            .as_ref()
+            .ok_or_else(|| WorkflowError::ContextValueNotFound("app_context".to_string()))?
+            .wasm_module_roots
+            .clone()
+            .ok_or_else(|| WorkflowError::StepFailed {
+                step_id: step_id(),
+                message: "WASM module roots are not configured".to_string(),
+            })?;
 
-        // Must be an absolute path
-        if !path.is_absolute() {
-            return Err(WorkflowError::StepFailed {
-                step_id: StepId::new("validate_descriptor"),
-                message: format!(
-                    "Module file path must be absolute, got: {}",
-                    descriptor.file_path
-                ),
-            });
-        }
-
-        // Check for path traversal components (.. or symbolic links that could escape)
-        for component in path.components() {
-            match component {
-                PathComponent::ParentDir => {
-                    warn!(
-                        "Path traversal attempt detected in WASM module path: {}",
-                        descriptor.file_path
-                    );
-                    return Err(WorkflowError::StepFailed {
-                        step_id: StepId::new("validate_descriptor"),
-                        message: "Path traversal (..) not allowed in module file path".to_string(),
-                    });
-                }
-                PathComponent::CurDir => {
-                    return Err(WorkflowError::StepFailed {
-                        step_id: StepId::new("validate_descriptor"),
-                        message: "Current directory (.) not allowed in module file path"
-                            .to_string(),
-                    });
-                }
-                _ => {}
+        // One call replaces the former absolute-path check, `..`/`.` scan,
+        // deny-list, symlink re-check and existence probe. The error deliberately
+        // says nothing about where the path led; that detail is logged instead.
+        let canonical_path = roots.resolve(&requested_path).await.map_err(|error| {
+            // `?error` (Debug) so the log keeps the precise cause; the message
+            // handed back to the caller uses Display, which by construction
+            // cannot say whether the path existed. See `ModulePathError`.
+            warn!(
+                requested = %requested_path,
+                ?error,
+                "Rejected WASM module path"
+            );
+            WorkflowError::StepFailed {
+                step_id: step_id(),
+                message: error.to_string(),
             }
-        }
+        })?;
 
-        // Require .wasm extension to prevent loading arbitrary files
-        if !has_wasm_extension(path) {
-            return Err(WorkflowError::StepFailed {
-                step_id: StepId::new("validate_descriptor"),
-                message: "Module file must have .wasm extension".to_string(),
-            });
-        }
-
-        // Block access to sensitive system directories
-        if let Some(prefix) = find_blocked_prefix(&descriptor.file_path) {
-            warn!(
-                "Attempt to access blocked directory in WASM module path: {}",
-                descriptor.file_path
-            );
-            return Err(WorkflowError::StepFailed {
-                step_id: StepId::new("validate_descriptor"),
-                message: format!("Access to {} directory is not allowed", prefix),
-            });
-        }
-
-        // Check if file exists and get size
-        let metadata = tokio::fs::metadata(&descriptor.file_path)
-            .await
-            .map_err(|e| WorkflowError::StepFailed {
-                step_id: StepId::new("validate_descriptor"),
-                message: format!("Failed to access file {}: {}", descriptor.file_path, e),
-            })?;
-
-        if metadata.len() == 0 {
-            return Err(WorkflowError::StepFailed {
-                step_id: StepId::new("validate_descriptor"),
-                message: "Module file size cannot be 0".to_string(),
-            });
-        }
-
-        // Canonicalize the path to resolve symlinks and verify final location is safe
-        let canonical_path = tokio::fs::canonicalize(&descriptor.file_path)
-            .await
-            .map_err(|e| WorkflowError::StepFailed {
-                step_id: StepId::new("validate_descriptor"),
-                message: format!(
-                    "Failed to canonicalize path {}: {}",
-                    descriptor.file_path, e
-                ),
-            })?;
-
-        // Re-check blocked directories after symlink resolution
-        let canonical_str = canonical_path.to_string_lossy();
-        if let Some(prefix) = find_blocked_prefix(&canonical_str) {
-            warn!(
-                "Symlink resolved to blocked directory: {} -> {}",
-                descriptor.file_path, canonical_str
-            );
-            return Err(WorkflowError::StepFailed {
-                step_id: StepId::new("validate_descriptor"),
-                message: format!(
-                    "Path resolves to blocked directory {} (via symlink)",
-                    prefix
-                ),
-            });
-        }
-
-        // Ensure canonicalized path still has .wasm extension (symlink target check)
-        if !has_wasm_extension(&canonical_path) {
-            warn!(
-                "Symlink target is not a .wasm file: {} -> {}",
-                descriptor.file_path, canonical_str
-            );
-            return Err(WorkflowError::StepFailed {
-                step_id: StepId::new("validate_descriptor"),
-                message: "Symlink target must be a .wasm file".to_string(),
-            });
-        }
-
-        // Clone name for logging before mutable borrow
-        let module_name = descriptor.name.clone();
-
-        // Store file size in typed data
-        context.data.file_size_bytes = Some(metadata.len());
+        context.data.canonical_path = Some(canonical_path.to_string_lossy().into_owned());
 
         info!(
             "Descriptor validated successfully for module: {}",
@@ -220,60 +106,55 @@ impl StepExecutor<WasmRegistrationWorkflowData> for ValidateDescriptorStep {
     }
 }
 
-/// Step 2: Calculate SHA256 hash of the module file
+/// Step 2: Read the module and derive its size and hash
 ///
-/// Reads the file and calculates its SHA256 hash for deduplication.
-/// This step is I/O intensive and may take time for large files.
-pub struct CalculateHashStep;
+/// Hashing and loading were once separate steps, which meant the file was read
+/// twice — and the hash could, in principle, describe a different revision of
+/// the file than the bytes that were ultimately registered. Reading once and
+/// deriving both from the same buffer removes the redundant I/O and makes that
+/// disagreement impossible.
+///
+/// Streaming the hash in chunks bought nothing either: the whole file is held
+/// in memory afterwards regardless, since the bytes are what get registered.
+pub struct AcquireModuleStep;
 
 #[async_trait]
-impl StepExecutor<WasmRegistrationWorkflowData> for CalculateHashStep {
+impl StepExecutor<WasmRegistrationWorkflowData> for AcquireModuleStep {
     async fn execute(
         &self,
         context: &mut WorkflowContext<WasmRegistrationWorkflowData>,
     ) -> WorkflowResult<StepResult> {
-        let file_path = &context.data.config.descriptor.file_path;
+        let step_id = || StepId::new("acquire_module");
 
-        debug!("Calculating SHA256 hash for: {}", file_path);
+        let path = context
+            .data
+            .canonical_path
+            .clone()
+            .ok_or_else(|| WorkflowError::ContextValueNotFound("canonical_path".to_string()))?;
 
-        // Read file in chunks to handle large files efficiently
-        let mut file =
-            tokio::fs::File::open(file_path)
-                .await
-                .map_err(|e| WorkflowError::StepFailed {
-                    step_id: StepId::new("calculate_hash"),
-                    message: format!("Failed to open file {}: {}", file_path, e),
-                })?;
+        debug!("Reading WASM module from: {}", path);
 
-        let mut hasher = Sha256::new();
-        let mut buffer = vec![0u8; 1024 * 1024]; // 1MB buffer
+        let wasm_bytes = tokio::fs::read(&path)
+            .await
+            .map_err(|e| WorkflowError::StepFailed {
+                step_id: step_id(),
+                message: format!("Failed to read WASM module: {}", e),
+            })?;
 
-        loop {
-            use tokio::io::AsyncReadExt;
-            let bytes_read =
-                file.read(&mut buffer)
-                    .await
-                    .map_err(|e| WorkflowError::StepFailed {
-                        step_id: StepId::new("calculate_hash"),
-                        message: format!("Failed to read file {}: {}", file_path, e),
-                    })?;
-
-            if bytes_read == 0 {
-                break;
-            }
-
-            hasher.update(&buffer[..bytes_read]);
+        if wasm_bytes.is_empty() {
+            return Err(WorkflowError::StepFailed {
+                step_id: step_id(),
+                message: "Module file size cannot be 0".to_string(),
+            });
         }
 
-        let hash: [u8; 32] = hasher.finalize().into();
+        let hash: [u8; 32] = Sha256::digest(&wasm_bytes).into();
 
-        // Clone path for logging before mutable borrow
-        let path_for_log = file_path.clone();
-
-        // Store hash in typed data
+        context.data.file_size_bytes = Some(wasm_bytes.len() as u64);
         context.data.sha256_hash = Some(hash);
+        context.data.wasm_bytes = Some(wasm_bytes);
 
-        info!("SHA256 hash calculated for: {}", path_for_log);
+        info!("WASM module read and hashed: {}", path);
         Ok(StepResult::Success)
     }
 
@@ -340,46 +221,7 @@ impl StepExecutor<WasmRegistrationWorkflowData> for CheckDuplicateStep {
     }
 }
 
-/// Step 4: Load WASM bytes into memory
-///
-/// Reads the entire WASM file into memory for faster execution.
-/// This is an I/O operation that may take time for large files.
-pub struct LoadWasmBytesStep;
-
-#[async_trait]
-impl StepExecutor<WasmRegistrationWorkflowData> for LoadWasmBytesStep {
-    async fn execute(
-        &self,
-        context: &mut WorkflowContext<WasmRegistrationWorkflowData>,
-    ) -> WorkflowResult<StepResult> {
-        let file_path = &context.data.config.descriptor.file_path;
-
-        debug!("Loading WASM bytes from: {}", file_path);
-
-        // Clone path for logging before mutable borrow
-        let path_for_log = file_path.clone();
-
-        let wasm_bytes =
-            tokio::fs::read(file_path)
-                .await
-                .map_err(|e| WorkflowError::StepFailed {
-                    step_id: StepId::new("load_wasm_bytes"),
-                    message: format!("Failed to read WASM file {}: {}", file_path, e),
-                })?;
-
-        // Store WASM bytes in typed data
-        context.data.wasm_bytes = Some(wasm_bytes);
-
-        info!("WASM bytes loaded from: {}", path_for_log);
-        Ok(StepResult::Success)
-    }
-
-    fn is_retryable(&self, _error: &WorkflowError) -> bool {
-        true // File read errors are retryable
-    }
-}
-
-/// Step 5: Validate WASM component format
+/// Step 4: Validate WASM component format
 ///
 /// Validates that the loaded WASM bytes represent a valid component.
 /// This catches format errors early during registration rather than during execution.
@@ -436,7 +278,7 @@ impl StepExecutor<WasmRegistrationWorkflowData> for ValidateWasmComponentStep {
     }
 }
 
-/// Step 6: Register module in WasmModuleManager
+/// Step 5: Register module in WasmModuleManager
 ///
 /// Creates the WasmModule object and registers it in the manager's module map.
 /// This is the final step that makes the module available for execution.
@@ -468,6 +310,14 @@ impl StepExecutor<WasmRegistrationWorkflowData> for RegisterModuleStep {
             .ok_or_else(|| WorkflowError::ContextValueNotFound("wasm_bytes".to_string()))?
             .clone();
 
+        // Record the path the bytes actually came from, not the caller's spelling
+        // of it, so the module listing reflects what was loaded.
+        let canonical_path = context
+            .data
+            .canonical_path
+            .clone()
+            .ok_or_else(|| WorkflowError::ContextValueNotFound("canonical_path".to_string()))?;
+
         let descriptor = &context.data.config.descriptor;
 
         debug!("Registering WASM module in manager: {}", descriptor.name);
@@ -494,7 +344,7 @@ impl StepExecutor<WasmRegistrationWorkflowData> for RegisterModuleStep {
             module_uuid,
             module_meta: WasmModuleMeta {
                 name: descriptor.name.clone(),
-                file_path: descriptor.file_path.clone(),
+                file_path: canonical_path,
                 sha256_hash,
                 size_bytes: file_size_bytes,
                 created_at: now,
@@ -535,18 +385,16 @@ impl StepExecutor<WasmRegistrationWorkflowData> for RegisterModuleStep {
 /// Create WASM module registration workflow
 ///
 /// This workflow handles the complete process of registering a WASM module:
-/// - Validates the module descriptor
-/// - Calculates SHA256 hash for deduplication
+/// - Validates the descriptor and confines the path to a configured module root
+/// - Reads the module once, deriving its size and SHA256 hash from that read
 /// - Checks for duplicates
-/// - Loads WASM bytes into memory
 /// - Validates WASM component format
 /// - Registers the module in the manager
 ///
 /// Workflow configuration:
-/// - ValidateDescriptor: No retry, 5s timeout (fast validation)
-/// - CalculateHash: 3 retries, 60s timeout (I/O intensive, may need retry)
+/// - ValidateDescriptor: No retry, 5s timeout (rejects bad input; retrying cannot help)
+/// - AcquireModule: 3 retries, 60s timeout (I/O intensive, may need retry)
 /// - CheckDuplicate: No retry, 5s timeout (fast check)
-/// - LoadWasmBytes: 3 retries, 60s timeout (I/O intensive)
 /// - ValidateWasmComponent: No retry, 30s timeout (CPU intensive validation)
 /// - RegisterModule: No retry, 5s timeout (fast registration)
 pub fn create_wasm_module_registration_workflow() -> WorkflowDefinition<WasmRegistrationWorkflowData>
@@ -563,9 +411,9 @@ pub fn create_wasm_module_registration_workflow() -> WorkflowDefinition<WasmRegi
         )
         .add_step(
             StepDefinition::new(
-                "calculate_hash",
-                "Calculate SHA256 Hash",
-                Arc::new(CalculateHashStep),
+                "acquire_module",
+                "Read Module and Compute Hash",
+                Arc::new(AcquireModuleStep),
             )
             .with_retry(RetryPolicy {
                 max_attempts: 3,
@@ -583,21 +431,7 @@ pub fn create_wasm_module_registration_workflow() -> WorkflowDefinition<WasmRegi
             )
             .with_timeout(Duration::from_secs(5))
             .with_failure_action(FailureAction::FailWorkflow)
-            .depends_on(&["calculate_hash"]),
-        )
-        .add_step(
-            StepDefinition::new(
-                "load_wasm_bytes",
-                "Load WASM Bytes",
-                Arc::new(LoadWasmBytesStep),
-            )
-            .with_retry(RetryPolicy {
-                max_attempts: 3,
-                backoff: BackoffStrategy::Fixed(Duration::from_secs(1)),
-            })
-            .with_timeout(Duration::from_secs(60))
-            .with_failure_action(FailureAction::FailWorkflow)
-            .depends_on(&["check_duplicate"]),
+            .depends_on(&["acquire_module"]),
         )
         .add_step(
             StepDefinition::new(
@@ -607,7 +441,7 @@ pub fn create_wasm_module_registration_workflow() -> WorkflowDefinition<WasmRegi
             )
             .with_timeout(Duration::from_secs(30))
             .with_failure_action(FailureAction::FailWorkflow)
-            .depends_on(&["load_wasm_bytes"]),
+            .depends_on(&["check_duplicate"]),
         )
         .add_step(
             StepDefinition::new(
@@ -628,6 +462,7 @@ pub fn create_wasm_registration_workflow_data(
 ) -> WasmRegistrationWorkflowData {
     WasmRegistrationWorkflowData {
         config,
+        canonical_path: None,
         wasm_bytes: None,
         sha256_hash: None,
         file_size_bytes: None,
