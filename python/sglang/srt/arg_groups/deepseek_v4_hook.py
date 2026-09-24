@@ -245,7 +245,6 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
             )
         _validate_dsv41_encoder_only_ratio_layout(hf_config)
         incompatible = (
-            ("overlap scheduler", not cfg.disable_overlap_schedule),
             ("pipeline parallelism", cfg.pp_size != 1),
             ("data parallelism", cfg.dp_size != 1),
             ("context parallelism", cfg.attn_cp_size != 1 or cfg.dcp_size != 1),
