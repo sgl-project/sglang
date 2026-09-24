@@ -1115,6 +1115,7 @@ def _register_configs():
         sampling_param_cls=AnimaSamplingParams,
         pipeline_config_cls=AnimaPipelineConfig,
         hf_model_paths=["circlestone-labs/Anima-Base-v1.0-Diffusers"],
+        model_detectors=[lambda name: name.lower() == "animamodularpipeline"],
     )
     register_configs(
         sampling_param_cls=ZImageTurboSamplingParams,

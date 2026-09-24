@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 import torch
 
+from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
     ComponentUse,
 )
@@ -53,6 +54,22 @@ class AnimaTextConditioningStage(ConditionEncodingStage):
         # conditioner output includes learned-token padding; Cosmos attends to it
         batch.prompt_attention_mask = None
         batch.negative_attention_mask = None
+        batch.prompt_embeds_mask = [
+            torch.ones_like(batch.prompt_embeds[0][..., 0], dtype=torch.bool)
+        ]
+        batch.prompt_seq_lens = [
+            [batch.prompt_embeds[0].shape[1]] * batch.prompt_embeds[0].shape[0]
+        ]
+        if batch.do_classifier_free_guidance:
+            batch.negative_prompt_embeds_mask = [
+                torch.ones_like(
+                    batch.negative_prompt_embeds[0][..., 0], dtype=torch.bool
+                )
+            ]
+            batch.negative_prompt_seq_lens = [
+                [batch.negative_prompt_embeds[0].shape[1]]
+                * batch.negative_prompt_embeds[0].shape[0]
+            ]
         return batch
 
     def _condition(self, conditioner, prompts, embeds, source_mask, max_length):
@@ -63,4 +80,8 @@ class AnimaTextConditioningStage(ConditionEncodingStage):
             max_length=max_length,
             return_tensors="pt",
         ).to(embeds.device)
-        return conditioner(embeds, tokens.input_ids, tokens.attention_mask, source_mask)
+        embeds = embeds.to(dtype=next(conditioner.parameters()).dtype)
+        with set_forward_context(current_timestep=0, attn_metadata=None):
+            return conditioner(
+                embeds, tokens.input_ids, tokens.attention_mask, source_mask
+            )

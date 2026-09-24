@@ -32,6 +32,8 @@ class AnimaPipelineConfig(ImagePipelineConfig):
     vae_precision: str = "bf16"
 
     def tokenize_prompt(self, prompt, tokenizer, tok_kwargs):
+        if not 1 <= tok_kwargs.get("max_length", 512) <= 4096:
+            raise ValueError("Anima max_sequence_length must be between 1 and 4096")
         inputs = tokenizer(prompt, **{**tok_kwargs, "padding": "longest"})
         if inputs.input_ids.shape[1] == 0:
             inputs["input_ids"] = inputs.input_ids.new_zeros((len(prompt), 1))
