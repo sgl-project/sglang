@@ -44,7 +44,6 @@ from sglang.srt.utils import cpu_has_amx_support, use_intel_amx_backend
 logger = init_logger(__name__)
 
 IS_AMP_SUPPORTED = current_platform.is_amp_supported()
-# srt's is_cpu() also requires SGLANG_USE_CPU_ENGINE, which diffusion never sets.
 USE_CPU_AMX = current_platform.is_cpu() and cpu_has_amx_support()
 WEIGHT_LOADER_V2_SUPPORTED = [
     "CompressedTensorsLinearMethod",
