@@ -1277,6 +1277,31 @@ class TestSWAPoolFloor(CustomTestCase):
         cfg.num_layers_c2_source = 0
         self.assertEqual(cfg._get_c2_state_fixed_bytes(10), 0)
 
+    def test_dsv4_paged_kv_budget(self):
+        from sglang.srt.environ import envs
+
+        cfg = self._dsv4_configurator_for_budget()
+        cfg._unified = False
+        cfg.encoder_replay = False
+        cfg.page_size = cfg.swa_page_size = 256
+        cfg.kv_bytes = 584
+        cfg.attn_head_dim = 512
+        cfg.num_layers_total = 3
+        cfg.num_layers_ca4 = cfg.num_layers_ca128 = 1
+        cfg.low_ratio_bytes_per_full_token = 0
+        cfg.indexer_bytes_per_token = 132
+        _publish_config(self, dsv4_attn_backend="flashmla")
+        with (
+            envs.SGLANG_DSV4_KV_LAYOUT.override("v4"),
+            envs.SGLANG_DSV4_COMPRESS_STATE_DTYPE.override("float32"),
+        ):
+            cfg.bytes_per_swa_token = cfg._get_bytes_per_swa_token()
+            self.assertEqual(cfg.bytes_per_swa_token, 3 * 585 + 320)
+            self.assertEqual(
+                cfg._get_bytes_per_full_token(),
+                0.1 * cfg.bytes_per_swa_token + 585 / 4 + 864 / 128 + 132 / 4,
+            )
+
     def test_dsv4_paged_dspark_budget_reserves_window_and_draft_layers(self):
         from sglang.srt.model_executor.pool_configurator import DSV4PoolConfigurator
 
