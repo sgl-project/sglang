@@ -9,6 +9,7 @@
 """Inference-only Voxtral (speech-to-text) model."""
 
 import math
+from array import array
 from typing import Any, Iterable, List, Optional, Tuple
 
 import torch
@@ -337,7 +338,7 @@ class VoxtralForConditionalGeneration(nn.Module):
 
         return results
 
-    def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
+    def pad_input_ids(self, input_ids: array, mm_inputs: MultimodalInputs) -> array:
         return self.pattern.pad_input_tokens(input_ids, mm_inputs)
 
     def get_audio_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:

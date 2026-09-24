@@ -62,6 +62,7 @@ from sglang.srt.disaggregation.utils import (
     build_staging_slot_metadata,
     get_dsa_tail_state_indices,
     get_kv_class,
+    get_kv_transfer_buf_infos,
     get_qsa_pending_state_indices,
     is_mla_backend,
     is_unadmitted_reject,
@@ -364,16 +365,13 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         transfer_queue: DecodeTransferQueue,
         tree_cache: BasePrefixCache,
         gloo_group: ProcessGroup,
-        tp_rank: int,
-        tp_size: int,
-        dp_size: int,
         gpu_id: int,
         bootstrap_port: int,
         max_total_num_tokens: int,
-        pp_rank: int,
         num_reserved_decode_tokens: int,
         transfer_backend: TransferBackend,
     ):
+        parallel = get_parallel()
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
         self.token_to_kv_pool = token_to_kv_pool_allocator.get_kvcache()
@@ -387,14 +385,14 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         self.gloo_group = gloo_group
         # Destinations visible to prefill but not yet on the transfer queue.
         self._num_published_destinations = 0
-        self.tp_rank = tp_rank
-        self.tp_size = tp_size
-        self.dp_size = dp_size
+        self.tp_rank = parallel.tp_rank
+        self.tp_size = parallel.tp_size
+        self.dp_size = parallel.dp_size
         self.gpu_id = gpu_id
         self.bootstrap_port = bootstrap_port
         self.max_total_num_tokens = max_total_num_tokens
-        self.pp_rank = pp_rank
-        self.pp_size = get_parallel().pp_size
+        self.pp_rank = parallel.pp_rank
+        self.pp_size = parallel.pp_size
         self.num_reserved_decode_tokens = num_reserved_decode_tokens
         self.transfer_backend = transfer_backend
         # Queue for requests pending pre-allocation
@@ -575,8 +573,8 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             if self.scheduler.enable_hisparse
             else self.token_to_kv_pool
         )
-        kv_data_ptrs, kv_data_lens, kv_item_lens = (
-            transfer_kv_pool.get_contiguous_buf_infos()
+        kv_data_ptrs, kv_data_lens, kv_item_lens = get_kv_transfer_buf_infos(
+            transfer_kv_pool
         )
         kv_data_mem_kinds = (
             ["DRAM"] * len(kv_data_ptrs)
@@ -1579,6 +1577,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 StateType.DSA: _full_kv_pages_payload,
                 StateType.DSA_TAIL: _dsa_tail_payload,
                 StateType.MINIMAX_INDEX_K: _full_kv_pages_payload,
+                StateType.MINIMAX_DENSE_KV: _full_kv_pages_payload,
                 StateType.SWA_RING: _swa_ring_payload,
                 StateType.DSV4_REQUEST_STATE: _request_state_payload,
                 StateType.BLOCK_SCALE: _full_kv_pages_payload,
@@ -1960,6 +1959,23 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         allocator = self.token_to_kv_pool_allocator
         uses_swa_tail = self._uses_swa_tail_prealloc()
         swa_tail_len = self._swa_tail_len(fill_len)
+        swa_pages_charged = (
+            uses_swa_tail
+            and not is_swa_req_ring(allocator)
+            and not self.scheduler.enable_hisparse
+        )
+        required_swa_tokens = (
+            ceil_align(swa_tail_len, allocator.page_size) if swa_pages_charged else 0
+        )
+        if get_disagg().disaggregation_decode_enable_radix_cache and swa_pages_charged:
+            # Admission includes evictable pages; allocation needs free pages.
+            # Separate-pool resumes skip the caller's unified-only reclaim.
+            reclaim_error = self._reclaim_swa_tail_capacity(
+                swa_tail_len, req.rid, full_len=required_alloc_tokens
+            )
+            if reclaim_error is not None:
+                logger.warning("%s", reclaim_error)
+
         if self.scheduler.enable_hisparse:
             # HiSparse is incompatible with decode-side L1 radix cache. Keep
             # this path on the upstream full-allocation semantics.
@@ -2003,7 +2019,10 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             f"protected={self._radix_full_protected()}, "
             f"required_alloc={required_alloc_tokens}, delta={delta_len}, "
             f"fill={fill_len}, prefix={prefix_len}, total_prefix={total_prefix_len}, "
-            f"page_size={self.token_to_kv_pool_allocator.page_size}, "
+            f"swa_available={allocator.swa_available_size() if swa_pages_charged else -1}, "
+            f"swa_evictable={self.tree_cache.swa_evictable_size() if swa_pages_charged else -1}, "
+            f"required_swa={required_swa_tokens}, swa_tail_len={swa_tail_len}, "
+            f"page_size={allocator.page_size}, "
             f"req={req.rid}"
         )
 
@@ -2178,7 +2197,6 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         self,
         gloo_group: ProcessGroup,
         req_to_metadata_buffer_idx_allocator: ReqToMetadataIdxAllocator,
-        tp_rank: int,
         metadata_buffers: MetadataBuffers,
         scheduler: Scheduler,
         tree_cache: BasePrefixCache,
@@ -2186,7 +2204,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         self.queue: List[DecodeRequest] = []
         self.gloo_group = gloo_group
         self.req_to_metadata_buffer_idx_allocator = req_to_metadata_buffer_idx_allocator
-        self.tp_rank = tp_rank
+        self.tp_rank = get_parallel().tp_rank
         self.metadata_buffers = metadata_buffers
         self.scheduler = scheduler
         self.tree_cache = tree_cache

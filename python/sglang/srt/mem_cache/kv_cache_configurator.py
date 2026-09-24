@@ -74,6 +74,7 @@ from sglang.srt.mem_cache.memory_pool import (
     NoOpMHATokenToKVPool,
     PageMajorMHATokenToKVPool,
     ReqToTokenPool,
+    get_minimax_sparse_index_dtype,
 )
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.platforms import current_platform
@@ -1047,14 +1048,21 @@ class KVCacheConfigurator:
 
         if not isinstance(self.mambaish_config, Qwen4ExpTextConfig):
             return {}
+        short_conv_layer_ids = [
+            i
+            for i in self.mambaish_config.short_conv_layer_ids
+            if self.layer_info.start_layer <= i < self.layer_info.end_layer
+        ]
         return {
-            "short_conv_layer_ids": [
-                i
-                for i in self.mambaish_config.short_conv_layer_ids
-                if self.layer_info.start_layer <= i < self.layer_info.end_layer
-            ],
-            "short_conv_state_shape": self.mambaish_config.short_conv_state_shape,
-            "ngram_context_len": self.mambaish_config.ngram_context_len,
+            "short_conv_layer_ids": short_conv_layer_ids,
+            "short_conv_state_shape": (
+                self.mambaish_config.short_conv_state_shape
+                if short_conv_layer_ids
+                else None
+            ),
+            "ngram_context_len": (
+                self.mambaish_config.ngram_context_len if short_conv_layer_ids else 0
+            ),
             "ngram_eos_token_id": int(self.mambaish_config.eos_token_id),
         }
 
@@ -1836,18 +1844,24 @@ class KVCacheConfigurator:
         disable_value_sparse_layer_ids = get_minimax_sparse_disable_value_layer_ids(
             sparse_cfg
         )
+        enable_hisparse = get_memory().enable_hisparse
+        hisparse_kwargs = {}
+        if enable_hisparse:
+            from sglang.srt.mem_cache.sparsity import parse_hisparse_config
+
+            hisparse_kwargs["host_to_device_ratio"] = (
+                parse_hisparse_config().host_to_device_ratio
+            )
         token_to_kv_pool = MiniMaxSparseKVPool(
             size=max_total_num_tokens,
             page_size=self.pool_page_size,
             dtype=self.kv_cache_dtype,
-            # fp8 attn-GEMM mode opts the lightning-indexer cache into
-            # fp8 too (fp8 indexer GEMMs); fp8 KV without the mode
-            # (e5m2 or non-trtllm_mha backend) keeps the indexer bf16
-            # with the widening-dequant contract.
-            index_dtype=(
-                self.kv_cache_dtype
-                if m3_fp8_attn_gemm_enabled(resolving_view(self.server_args))
-                else self.model_dtype
+            index_dtype=get_minimax_sparse_index_dtype(
+                fp8_attn_gemm=m3_fp8_attn_gemm_enabled(
+                    resolving_view(self.server_args)
+                ),
+                kv_cache_dtype=self.kv_cache_dtype,
+                model_dtype=self.model_dtype,
             ),
             head_num=self.model_config.get_num_kv_heads(
                 get_parallel().attn_tp_size, get_parallel().attn_dcp_size
@@ -1861,6 +1875,8 @@ class KVCacheConfigurator:
             enable_memory_saver=get_exec().features.enable_memory_saver,
             start_layer=self.layer_info.start_layer,
             end_layer=self.layer_info.end_layer,
+            enable_hisparse=enable_hisparse,
+            **hisparse_kwargs,
         )
         return token_to_kv_pool
 
