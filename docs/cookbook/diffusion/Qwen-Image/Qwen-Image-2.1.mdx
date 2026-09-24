@@ -135,7 +135,7 @@ runtime-wide downgrade.
 The experimental native MLX pipeline uses the community
 [`toxicdog/Qwen-Image-2.1-MLX`](https://huggingface.co/toxicdog/Qwen-Image-2.1-MLX)
 weight pack on Apple Silicon macOS. Install the
-[`diffusion_mlx` source extra](/docs/sglang-diffusion/installation#native-mlx-for-qwen-image-21)
+[`diffusion_mlx` source extra](/docs/sglang-diffusion/installation#native-mlx)
 first. The pack stores the DiT and text encoder in affine Q4 and the RGBA VAE
 in BF16. Quantization changes the model's outputs; this recipe is not numerically
 equivalent to the full BF16 checkpoint used by the NVIDIA recipes above.
