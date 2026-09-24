@@ -147,6 +147,30 @@ class TestTokenScoring(unittest.IsolatedAsyncioTestCase):
             )
         self.assertEqual(manager.requests, [])
 
+    async def test_http_out_of_vocabulary_error(self):
+        for enable_mis in (False, True):
+            for token_id in (8, 999999):
+                for labels in ([7, token_id], [[7], [1, token_id]]):
+                    with self.subTest(enable_mis=enable_mis, labels=labels):
+                        manager = ScoringManager(enable_mis=enable_mis)
+                        request = ScoringRequest(
+                            query=[],
+                            items=[[4], [5]],
+                            label_token_ids=labels,
+                            apply_softmax=True,
+                        )
+                        response = await OpenAIServingScore(
+                            manager
+                        )._handle_non_streaming_request(request, request, None)
+                        self.assertEqual(response.status_code, 400)
+                        body = json.loads(response.body)
+                        self.assertEqual(body["type"], "BadRequestError")
+                        self.assertEqual(
+                            body["message"],
+                            f"Token ID {token_id} is out of vocabulary (vocab size: 8)",
+                        )
+                        self.assertEqual(manager.requests, [])
+
     async def test_small_temperature_is_finite(self):
         for enable_mis in (False, True):
             for generation in (False, True):

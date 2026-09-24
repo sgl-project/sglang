@@ -539,12 +539,13 @@ class TokenizerManagerScoreMixin:
                     raise ValueError(
                         "label_token_ids must not contain duplicate tokens"
                     )
-                if self.tokenizer is not None and any(
-                    token >= self.tokenizer.vocab_size for token in labels
-                ):
-                    raise ValueError(
-                        "label_token_ids contains an out-of-vocabulary token"
-                    )
+                if self.tokenizer is not None:
+                    vocab_size = self.tokenizer.vocab_size
+                    for token_id in labels:
+                        if token_id >= vocab_size:
+                            raise ValueError(
+                                f"Token ID {token_id} is out of vocabulary (vocab size: {vocab_size})"
+                            )
 
         has_embeds = (
             query_embed_overrides is not None or item_embed_overrides is not None
