@@ -1611,17 +1611,14 @@ class Glm5NextForConditionalGeneration(nn.Module):
                     "mlp.shared_experts",
                     f"mlp.experts.{self.config.n_routed_experts}",
                 )
+            if not is_nextn and hasattr(self.config, "num_nextn_predict_layers"):
+                num_nextn_layers = self.config.num_nextn_predict_layers
+                if num_nextn_layers > 0:
+                    import re
 
-            if not is_nextn:
-                if hasattr(self.config, "num_nextn_predict_layers"):
-                    num_nextn_layers = self.config.num_nextn_predict_layers
-                    if num_nextn_layers > 0 and name.startswith("model.layers"):
-                        name_list = name.split(".")
-                        if (
-                            len(name_list) >= 3
-                            and int(name_list[2]) >= self.config.num_hidden_layers
-                        ):
-                            continue
+                    match = re.search(r"layers\.(\d+)", name)
+                    if match and int(match.group(1)) >= self.config.num_hidden_layers:
+                        continue
             else:
                 if not name.startswith(nextn_layer_prefix):
                     continue
