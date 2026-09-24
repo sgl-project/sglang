@@ -25,7 +25,6 @@ class KVCacheBuildResult:
 
 from typing import TYPE_CHECKING
 
-from sglang.srt.arg_groups.overrides import resolving_view
 from sglang.srt.configs.hybrid_arch import (
     glm5_next_config,
     hybrid_gdn_config,
@@ -36,7 +35,6 @@ from sglang.srt.configs.hybrid_arch import (
 )
 from sglang.srt.configs.model_config import ModelImpl, is_deepseek_dsa
 from sglang.srt.environ import envs
-from sglang.srt.hardware_backend.mlx.runtime import use_mlx
 from sglang.srt.managers.mm_schedule import init_mm_embedding_cache
 from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
@@ -64,7 +62,6 @@ if TYPE_CHECKING:
 
     from sglang.srt.configs.model_config import ModelConfig
     from sglang.srt.distributed.parallel_state import GroupCoordinator
-    from sglang.srt.distributed.parallel_state_wrapper import ParallelState
     from sglang.srt.managers.tp_worker import BaseTpWorker
     from sglang.srt.server_args import ServerArgs
     from sglang.srt.speculative.base_spec_worker import HiCacheDraftPlan
@@ -117,29 +114,6 @@ def prepare_hicache_staging(
                 pool.swa_kv_pool if isinstance(pool, BaseSWAKVPool) else pool,
                 sidecar=True,
             )
-
-
-def get_draft_kv_pool(
-    *,
-    draft_worker: BaseTpWorker,
-    spec_algorithm: SpeculativeAlgorithm,
-    server_args: ServerArgs,
-):
-    """Return the draft token-to-KV pool for the current draft worker,
-    or None when no draft KV pool is available."""
-    if draft_worker is None or spec_algorithm.is_ngram():
-        return None
-
-    # V2 draft workers exist only on their hosting PP stage; other ranks own no
-    # nested draft worker or draft KV pool.
-    if draft_worker.draft_worker is None:
-        return None
-
-    if resolving_view(server_args).enable_multi_layer_eagle:
-        draft_runner = draft_worker.draft_worker.draft_runner_list[0]
-    else:
-        draft_runner = draft_worker.draft_worker.draft_runner
-    return draft_runner.token_to_kv_pool
 
 
 def maybe_register_hicache_draft(
@@ -276,12 +250,12 @@ def build_kv_cache(
     attn_cp_cpu_group: ProcessGroup,
     enable_metrics: bool,
     enable_kv_cache_events: bool,
-    ps: ParallelState,
     tp_group: GroupCoordinator,
     pp_group: GroupCoordinator,
     enable_hierarchical_cache: bool,
     hicache_draft_plan: Optional[HiCacheDraftPlan] = None,
 ) -> KVCacheBuildResult:
+    parallel = get_parallel()
     sliding_window_size: Optional[int] = None
     full_tokens_per_layer: Optional[int] = None
     swa_tokens_per_layer: Optional[int] = None
@@ -328,12 +302,6 @@ def build_kv_cache(
         and get_disagg().disaggregation_mode == "decode"
     ):
         if is_hybrid_swa:
-            if not (envs.SGLANG_ENABLE_UNIFIED_RADIX_TREE.get() or use_mlx()):
-                raise ValueError(
-                    "--disaggregation-decode-enable-radix-cache with sliding "
-                    "window attention (SWA) models requires the unified radix "
-                    "tree (set SGLANG_ENABLE_UNIFIED_RADIX_TREE=1)."
-                )
             if enable_hierarchical_cache:
                 raise ValueError(
                     "--disaggregation-decode-enable-radix-cache with sliding "
@@ -382,10 +350,10 @@ def build_kv_cache(
         enable_session_radix_cache=get_memory().enable_session_radix_cache,
         enable_mamba_extra_buffer=get_exec().mamba.enable_mamba_extra_buffer,
         enable_mamba_extra_buffer_lazy=get_exec().mamba.enable_mamba_extra_buffer_lazy,
-        pp_rank=ps.pp_rank,
-        pp_size=ps.pp_size,
-        attn_cp_rank=ps.attn_cp_rank,
-        attn_cp_size=ps.attn_cp_size,
+        pp_rank=parallel.pp_rank,
+        pp_size=parallel.pp_size,
+        attn_cp_rank=parallel.attn_cp_rank,
+        attn_cp_size=parallel.attn_cp_size,
         chunked_prefill_size=effective_chunked_prefill_size,
         sliding_window_size=sliding_window_size,
         mtp_draft_device_pools=mtp_draft_device_pools,
@@ -403,8 +371,8 @@ def build_kv_cache(
         effective_chunked_prefill_size=effective_chunked_prefill_size,
         tp_worker=tp_worker,
         model_config=model_config,
-        tp_size=ps.tp_size,
-        tp_rank=ps.tp_rank,
+        tp_size=parallel.tp_size,
+        tp_rank=parallel.tp_rank,
         tp_group=tp_group,
     )
     with auto_size_hicache(

@@ -1308,6 +1308,17 @@ class ModelOptFp8MoEMethod(FusedMoEMethodBase):
                     requires_grad=False,
                 )
 
+            # All-None unless the runner config carries a clamp limit.
+            from sglang.srt.layers.moe.moe_runner.flashinfer_cutlass import (
+                materialize_swiglu_params_for_cutlass,
+            )
+
+            layer._cutlass_swiglu_params = materialize_swiglu_params_for_cutlass(
+                layer.moe_runner_config,
+                int(layer.num_local_experts),
+                layer.w13_weight.device,
+            )
+
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):
@@ -1388,6 +1399,7 @@ class ModelOptFp8MoEMethod(FusedMoEMethodBase):
                 FlashInferCutlassMoeQuantInfo,
             )
 
+            swiglu_alpha, swiglu_beta, swiglu_limit = layer._cutlass_swiglu_params
             quant_info = FlashInferCutlassMoeQuantInfo(
                 quant_type="fp8",
                 w13_weight=layer.w13_weight,
@@ -1399,6 +1411,9 @@ class ModelOptFp8MoEMethod(FusedMoEMethodBase):
                     layer.fc1_input_dequant,
                 ],
                 output_dtype=x.dtype,
+                swiglu_alpha=swiglu_alpha,
+                swiglu_beta=swiglu_beta,
+                swiglu_limit=swiglu_limit,
                 moe_ep_size=layer.moe_ep_size,
                 moe_ep_rank=layer.moe_ep_rank,
                 moe_tp_size=layer.moe_tp_size,
@@ -1496,6 +1511,15 @@ class ModelOptFp4Config(ModelOptQuantConfig):
     @classmethod
     def get_min_capability(cls) -> int:
         return 80
+
+    def can_fuse_shared_expert(self) -> bool:
+        # A shared-expert body kept BF16 via exclude_modules cannot share the packed
+        # FP4 FusedMoE buffers. The shared_expert_gate is a separate linear (kept
+        # BF16 by e.g. Qwen3-Next NVFP4 checkpoints) and must not veto fusion.
+        return not any(
+            "shared_expert" in name and "shared_expert_gate" not in name
+            for name in self.exclude_modules
+        )
 
     @staticmethod
     def common_group_size(cfg: dict) -> int:
@@ -2763,6 +2787,17 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 )
                 copy_or_rebind_param(layer, "gemm1_beta", gemm1_beta)
 
+        if self.enable_flashinfer_cutlass_moe:
+            from sglang.srt.layers.moe.moe_runner.flashinfer_cutlass import (
+                materialize_swiglu_params_for_cutlass,
+            )
+
+            layer._cutlass_swiglu_params = materialize_swiglu_params_for_cutlass(
+                layer.moe_runner_config,
+                int(layer.num_local_experts),
+                layer.w13_weight.device,
+            )
+
         # TODO: for flashinfer always do MOE_NVFP4_DISPATCH
         use_dispatch_fp4 = (
             not self.quant_config.use_per_token_activation
@@ -3053,7 +3088,6 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         assert activation in _SUPPORTED_ACT_STRS or (
             activation == "situ" and moe_runner_backend.is_flashinfer_trtllm()
         ), f"{activation=} is unsupported by {moe_runner_backend}"
-        moe_runner_config = self.moe_runner_config
 
         if moe_runner_backend.is_flashinfer_megamoe():
             from sglang.srt.layers.moe.flashinfer_megamoe import (
@@ -3179,9 +3213,10 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 FlashInferCutlassMoeQuantInfo,
             )
 
-            assert not moe_runner_config.apply_router_weight_on_input, (
+            assert not self.moe_runner_config.apply_router_weight_on_input, (
                 "apply_router_weight_on_input is not supported for Flashinfer"
             )
+            swiglu_alpha, swiglu_beta, swiglu_limit = layer._cutlass_swiglu_params
             quant_info = FlashInferCutlassMoeQuantInfo(
                 quant_type="fp4",
                 w13_weight=layer.w13_weight,
@@ -3195,6 +3230,9 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                     layer.w2_blockscale_swizzled,
                     layer.g2_alphas,
                 ],
+                swiglu_alpha=swiglu_alpha,
+                swiglu_beta=swiglu_beta,
+                swiglu_limit=swiglu_limit,
                 moe_ep_size=layer.moe_ep_size,
                 moe_ep_rank=layer.moe_ep_rank,
                 moe_tp_size=layer.moe_tp_size,

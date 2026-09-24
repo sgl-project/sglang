@@ -1,4 +1,5 @@
 import logging
+from array import array
 from contextlib import nullcontext
 from functools import partial
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
@@ -1093,7 +1094,11 @@ class Glm5NextModel(nn.Module):
             )
         self.layers_to_capture = []
         self.dflash_capture = False
-        if get_moe_a2a_backend().is_deepep() or get_moe_a2a_backend().is_mooncake():
+        if (
+            get_moe_a2a_backend().is_deepep()
+            or get_moe_a2a_backend().is_mooncake()
+            or get_moe_a2a_backend().is_deepep_v2()
+        ):
             self.enable_a2a_moe = True
         else:
             self.enable_a2a_moe = False
@@ -1233,11 +1238,13 @@ class Glm5NextModel(nn.Module):
 class Glm5NextForConditionalGeneration(nn.Module):
     hf_to_sglang_mapper = WeightsMapper(
         orig_to_new_substr={
-            "model.language_model.": "model.",
             "model.visual": "visual",
-        }
+        },
+        orig_to_new_prefix={
+            "model.language_model.": "model.",
+        },
+        orig_to_new_suffix={".attn.qkv": ".attn.qkv_proj"},
     )
-
     packed_modules_mapping = {
         "fused_qkv_a_proj_with_mqa": ["q_a_proj", "kv_a_proj_with_mqa"],
         **Glm5NextLinearAttention._PACKED_MODULES_MAPPING,
@@ -1417,7 +1424,7 @@ class Glm5NextForConditionalGeneration(nn.Module):
         # Capturing before layer k + 1 gives the completed output of layer k.
         self.model.layers_to_capture = [val + 1 for val in layer_ids]
 
-    def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
+    def pad_input_ids(self, input_ids: array, mm_inputs: MultimodalInputs) -> array:
         pattern = MultiModalityDataPaddingPatternMultimodalTokens()
         return pattern.pad_input_tokens(input_ids, mm_inputs)
 
@@ -1570,6 +1577,14 @@ class Glm5NextForConditionalGeneration(nn.Module):
             fused_cat_dim = 0
 
         params_dict = dict(self.named_parameters())
+
+        def maybe_map_fp8_block_scale_name(name: str) -> str:
+            if name.endswith("weight_scale"):
+                candidate = name.removesuffix("weight_scale") + "weight_scale_inv"
+                if candidate in params_dict:
+                    return candidate
+            return name
+
         weight_names = []
         for name, loaded_weight in weights:
             is_visual_weight = "visual" in name
@@ -1633,6 +1648,7 @@ class Glm5NextForConditionalGeneration(nn.Module):
                 if "mlp.experts" in name:
                     continue
                 candidate = name.replace(weight_name, param_name)
+                candidate = maybe_map_fp8_block_scale_name(candidate)
                 if (
                     param_name
                     in {
@@ -1662,6 +1678,7 @@ class Glm5NextForConditionalGeneration(nn.Module):
                         continue
                     is_expert_weight = True
                     name = name.replace(weight_name, param_name)
+                    name = maybe_map_fp8_block_scale_name(name)
                     if name not in params_dict:
                         continue
                     param = params_dict[name]
@@ -1713,6 +1730,7 @@ class Glm5NextForConditionalGeneration(nn.Module):
                                     "fused_qkv_a_proj_with_mqa",
                                 )
                             )
+                            target = maybe_map_fp8_block_scale_name(target)
                             if target in params_dict:
                                 param = params_dict[target]
                                 weight_loader = getattr(
@@ -1723,6 +1741,7 @@ class Glm5NextForConditionalGeneration(nn.Module):
                             cached_a_proj.pop(kv_a_proj_name, None)
                         continue
 
+                    name = maybe_map_fp8_block_scale_name(name)
                     if name not in params_dict:
                         continue
 
