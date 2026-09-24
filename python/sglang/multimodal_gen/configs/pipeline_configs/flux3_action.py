@@ -422,3 +422,25 @@ class Flux3ActionPipelineConfig(PipelineConfig):
         passes = 1 if all(g == 1.0 for g in guidance.values()) else 2
         steps = batch.num_inference_steps or self.default_num_inference_steps
         return float(steps * passes)
+
+
+# Policy exports (manifest.json + config.native.json) this pipeline serves.
+FLUX3_ACTION_HF_PATHS = [
+    "black-forest-labs/flux-3-action-droid",
+]
+
+
+def register():
+    from sglang.multimodal_gen.configs.sample.flux3_action import (
+        Flux3ActionSamplingParams,
+    )
+    from sglang.multimodal_gen.registry import register_configs
+
+    register_configs(
+        sampling_param_cls=Flux3ActionSamplingParams,
+        pipeline_config_cls=Flux3ActionPipelineConfig,
+        hf_model_paths=FLUX3_ACTION_HF_PATHS,
+        model_detectors=[
+            lambda hf_id: "flux-3-action" in hf_id.lower(),
+        ],
+    )
