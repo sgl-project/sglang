@@ -1474,21 +1474,14 @@ class UnifiedRadixCache(BasePrefixCache):
         assert req.seqlen > 1
 
         device_indices, extra_transfers = self._retraction_device_transfers(req)
-        host_indices = self.host_pool_group.alloc(len(device_indices))
-        if host_indices is None:
-            self._reclaim_retraction_host(len(device_indices))
-            host_indices = self.host_pool_group.alloc(len(device_indices))
-        if host_indices is None:
-            return None
-
-        resolved = self.host_pool_group.resolve_host_transfers(
+        allocation = self.cache_controller.allocate_host_transfers(
+            device_indices,
             extra_transfers or None,
-            primary_device_indices=device_indices,
-            primary_host_indices=host_indices,
+            reclaim=self._reclaim_retraction_host,
         )
-        if resolved is None and extra_transfers:
-            self.host_pool_group.free(host_indices)
+        if allocation is None:
             return None
+        host_indices, resolved = allocation
 
         backup = RetractionBackup(
             host_indices=host_indices,
@@ -1642,11 +1635,16 @@ class UnifiedRadixCache(BasePrefixCache):
     def _execute_kv_backup(self, node_id, device_value, comp_xfers, sidecar_xfers):
         """Execute Backup action."""
         kv_tokens = len(device_value)
-        host_avail = self.cache_controller.mem_pool_host.available_size()
-        if host_avail < kv_tokens:
-            needed = kv_tokens - host_avail
-            if self.evict_host(needed) < needed:
-                return None
+        anchor_entry = self.cache_controller.mem_pool_host.anchor_entry
+        if (
+            anchor_entry.host_pool.shared_allocation_domain is None
+            or anchor_entry.host_evict_fn is None
+        ):
+            host_avail = self.cache_controller.mem_pool_host.available_size()
+            if host_avail < kv_tokens:
+                needed = kv_tokens - host_avail
+                if self.evict_host(needed) < needed:
+                    return None
         aux_xfers = [x for xfers in comp_xfers.values() for x in xfers]
         aux_xfers.extend(sidecar_xfers)
         # Defer submission so the next flush can merge pending node backups.
