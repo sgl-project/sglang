@@ -2050,9 +2050,11 @@ def biased_grouped_topk_gpu(
             and experts_per_group <= 32
             and is_power_of_two(num_experts)
         ):
-            from sgl_kernel import moe_fused_gate
+            # Aliased: binding `moe_fused_gate` anywhere in this function would make it
+            # local and hide mate's module-level kernel from the MUSA branch above.
+            from sgl_kernel import moe_fused_gate as xpu_moe_fused_gate
 
-            return moe_fused_gate(
+            return xpu_moe_fused_gate(
                 gating_output.to(torch.float32),
                 correction_bias.to(torch.float32),
                 num_expert_group,
