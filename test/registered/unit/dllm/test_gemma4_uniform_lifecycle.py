@@ -318,12 +318,12 @@ class TestGemma4ContextLifecycle(unittest.TestCase):
         req.finish_on_update = True
         canvas = torch.tensor([3, 2, 1, 0])
 
-        with patch("sglang.srt.dllm.mixin.scheduler.release_kv_cache") as release:
+        with patch("sglang.srt.dllm.mixin.scheduler.discard_kv_cache") as discard:
             SchedulerDllmMixin.process_batch_result_dllm(
                 scheduler, _Batch([req]), _result([canvas])
             )
 
-        release.assert_called_once_with(req, scheduler.tree_cache, is_insert=False)
+        discard.assert_called_once_with(req, scheduler.tree_cache)
 
     def test_context_boundary_stops_sync_and_fdfo(self):
         block_size = 4
@@ -339,16 +339,14 @@ class TestGemma4ContextLifecycle(unittest.TestCase):
                 )
 
                 with patch(
-                    "sglang.srt.dllm.mixin.scheduler.release_kv_cache"
-                ) as release:
+                    "sglang.srt.dllm.mixin.scheduler.discard_kv_cache"
+                ) as discard:
                     SchedulerDllmMixin.process_batch_result_dllm(
                         scheduler, _Batch([req]), result
                     )
 
                 self.assertTrue(req.finished())
-                release.assert_called_once_with(
-                    req, scheduler.tree_cache, is_insert=False
-                )
+                discard.assert_called_once_with(req, scheduler.tree_cache)
 
 
 class TestGemma4RequestValidation(unittest.TestCase):

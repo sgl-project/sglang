@@ -280,7 +280,7 @@ class TestGetNewPrebuiltBatchChecksum(unittest.TestCase):
         with (
             envs.SGLANG_IS_IN_CI.override(False),
             patch("sglang.srt.disaggregation.decode.prepare_abort") as mock_abort,
-            patch("sglang.srt.disaggregation.decode.release_kv_cache") as mock_release,
+            patch("sglang.srt.disaggregation.decode.discard_kv_cache") as mock_release,
         ):
             self._run_once(sched)
             self._run_once(sched)
@@ -308,7 +308,7 @@ class TestGetNewPrebuiltBatchChecksum(unittest.TestCase):
         sched.waiting_queue = [req]
         with (
             patch("sglang.srt.disaggregation.decode.prepare_abort") as mock_abort,
-            patch("sglang.srt.disaggregation.decode.release_kv_cache") as mock_release,
+            patch("sglang.srt.disaggregation.decode.discard_kv_cache") as mock_release,
         ):
             self._run_once(sched)
         self.assertEqual(sched.waiting_queue, [req])

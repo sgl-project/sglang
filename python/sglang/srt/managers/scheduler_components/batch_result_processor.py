@@ -29,6 +29,7 @@ from sglang.srt.managers.schedule_batch import (
     mamba_lazy_spec_in_window,
 )
 from sglang.srt.mem_cache.common import (
+    discard_kv_cache,
     maybe_cache_unfinished_req,
     release_kv_cache,
 )
@@ -373,11 +374,9 @@ class SchedulerBatchResultProcessor:
                         if sampling_mask_finish_reason is None:
                             self._maybe_collect_routed_experts(req)
                             self._maybe_collect_indexer_topk(req)
-                        release_kv_cache(
-                            req,
-                            self.tree_cache,
-                            is_insert=sampling_mask_finish_reason is None,
-                        )
+                            release_kv_cache(req, self.tree_cache)
+                        else:
+                            discard_kv_cache(req, self.tree_cache)
                         req.time_stats.set_completion_time()
                     elif not batch.decoding_reqs or req not in batch.decoding_reqs:
                         maybe_cache_unfinished_req(req, self.tree_cache)
@@ -1251,7 +1250,7 @@ class SchedulerBatchResultProcessor:
             )
             if callable(prepare_release):
                 prepare_release(req)
-            release_kv_cache(req, self.tree_cache, is_insert=False)
+            discard_kv_cache(req, self.tree_cache)
         req.time_stats.set_completion_time()
 
     def _handle_finish_state_updated_req(
@@ -1335,12 +1334,13 @@ class SchedulerBatchResultProcessor:
                 )
                 if callable(prepare_release):
                     prepare_release(req)
-                is_insert = (
-                    req.mamba_lazy_is_insert
-                    if get_exec().mamba.enable_mamba_extra_buffer_lazy
-                    else True
-                )
-                release_kv_cache(req, self.tree_cache, is_insert=is_insert)
+                if (
+                    get_exec().mamba.enable_mamba_extra_buffer_lazy
+                    and not req.mamba_lazy_is_insert
+                ):
+                    discard_kv_cache(req, self.tree_cache)
+                else:
+                    release_kv_cache(req, self.tree_cache)
 
             req.time_stats.set_completion_time()
 

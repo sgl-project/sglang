@@ -8,7 +8,7 @@ from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.dllm.mixin.req import DllmReqPhase
 from sglang.srt.managers.schedule_batch import FINISH_LENGTH, Req, ScheduleBatch
 from sglang.srt.managers.schedule_policy import AddReqResult, PrefillAdder
-from sglang.srt.mem_cache.common import release_kv_cache
+from sglang.srt.mem_cache.common import discard_kv_cache, release_kv_cache
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.observability.req_time_stats import set_time_batch
 from sglang.srt.runtime_context import get_exec, get_schedule
@@ -176,11 +176,10 @@ class SchedulerDllmMixin:
             req.finished_reason = FINISH_LENGTH(length=len(req.output_ids))
 
         if req.finished():
-            release_kv_cache(
-                req,
-                self.tree_cache,
-                is_insert=not self.dllm_config.requires_separate_context_encoding,
-            )
+            if self.dllm_config.requires_separate_context_encoding:
+                discard_kv_cache(req, self.tree_cache)
+            else:
+                release_kv_cache(req, self.tree_cache)
             req.time_stats.set_completion_time()
 
     def _stash_dllm_context(self: Scheduler, req: Req) -> None:

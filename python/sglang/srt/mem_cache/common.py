@@ -275,7 +275,33 @@ def retraction_discard(req: Req, tree_cache: BasePrefixCache, backend: str) -> N
     req.kv.retraction_backup = None
 
 
-def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = True):
+def release_kv_cache(req: Req, tree_cache: BasePrefixCache) -> None:
+    """The request is done and its KV is good: hand it to the tree, then
+    give back whatever the tree did not take."""
+    if _taken_over(req, tree_cache):
+        return
+    if getattr(req, "skip_radix_cache_insert", False):
+        _discard_rest(req, tree_cache)
+        return
+
+    owned_kv_len = req.owned_kv_len()
+    tree_cache.cache_finished_req(req, owned_kv_len=owned_kv_len)
+    _release_overallocated_kv_indices(
+        req, owned_kv_len, req.kv.kv_allocated_len, tree_cache
+    )
+    _drop_row(req, tree_cache, adopted=True)
+
+
+def discard_kv_cache(req: Req, tree_cache: BasePrefixCache) -> None:
+    """The request leaves without handing anything to the tree: abort,
+    retract, or KV it cannot vouch for."""
+    if _taken_over(req, tree_cache):
+        return
+    _discard_rest(req, tree_cache)
+
+
+def _taken_over(req: Req, tree_cache: BasePrefixCache) -> bool:
+    """True when nothing on the row is the caller's to release."""
     assert (not req.kv.holds_kv) == req.kv.is_kv_released
     # A mamba-capable cache may alloc mamba state before alloc KV cache
     if not req.kv.holds_kv:
@@ -288,24 +314,27 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
                 req.kv.mamba_pool_idx.unsqueeze(-1)
             )
             req.kv.mamba_pool_idx = None
-        return
+        return True
+    if tree_cache.on_release(req):
+        # A streaming session detached the kv record to keep the row.
+        assert not req.kv.holds_kv
+        return True
+    return False
 
+
+def _discard_rest(req: Req, tree_cache: BasePrefixCache) -> None:
     owned_kv_len = req.owned_kv_len()
-    tree_cache.cache_finished_req(
-        req,
-        is_insert=is_insert and not getattr(req, "skip_radix_cache_insert", False),
-        owned_kv_len=owned_kv_len,
+    _assert_no_overallocation(req, owned_kv_len, req.kv.kv_allocated_len)
+    # The protected prefix is not this req's to free.
+    tree_cache.free_kv_row(
+        req.kv, [(req.kv.cache_protected_len, req.kv.kv_allocated_len)]
     )
+    tree_cache.unpin(req)
+    _drop_row(req, tree_cache, adopted=False)
 
-    # StreamingSession.cache_finished_req handles speculative tail trim
-    # internally, then sets req_pool_idx = None.
-    assert (not req.kv.holds_kv) == req.kv.is_kv_released
-    if not req.kv.holds_kv:
-        return
 
-    start_p, end_p = owned_kv_len, req.kv.kv_allocated_len
-    _release_overallocated_kv_indices(req, start_p, end_p, tree_cache)
-
+def _drop_row(req: Req, tree_cache: BasePrefixCache, *, adopted: bool) -> None:
+    tree_cache.after_release(req, adopted=adopted)
     # If the prefix cache doesn't manage mamba states, we must free them here.
     if isinstance(tree_cache.req_to_token_pool, HybridReqToTokenPool) and (
         not tree_cache.supports_mamba()
@@ -320,19 +349,24 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
     req.kv.mark_kv_released()
 
 
+def _assert_no_overallocation(req: Req, start_p: int, end_p: int) -> None:
+    # strip_thinking_cache intentionally reports output tokens as overallocated
+    # so they fall into the free path (#22373).
+    if (
+        get_spec().speculative_algorithm is None
+        and not get_serving().strip_thinking_cache
+    ):
+        assert start_p == end_p, (
+            f"Unexpected overallocated KV cache, {req.kv.kv_committed_len=}, {req.kv.kv_allocated_len=}"
+        )
+
+
 def _release_overallocated_kv_indices(
     req: Req, start_p: int, end_p: int, tree_cache: BasePrefixCache
 ) -> None:
     allocator = tree_cache.token_to_kv_pool_allocator
     page_size = allocator.page_size
-    spec_algo = get_spec().speculative_algorithm
-
-    # strip_thinking_cache intentionally reports output tokens as overallocated
-    # so they fall into the free path below (#22373).
-    if spec_algo is None and not get_serving().strip_thinking_cache:
-        assert start_p == end_p, (
-            f"Unexpected overallocated KV cache, {req.kv.kv_committed_len=}, {req.kv.kv_allocated_len=}"
-        )
+    _assert_no_overallocation(req, start_p, end_p)
 
     # Align to the ALLOCATOR's page, which under DCP is wider than the kernel
     # page: paged free() releases the whole page containing any freed index, so

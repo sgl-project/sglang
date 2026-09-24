@@ -303,7 +303,7 @@ class TestOptimisticPrefillCacheOwnership(unittest.TestCase):
         with (
             envs.SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS.override(True),
             patch(
-                "sglang.srt.disaggregation.prefill.release_kv_cache"
+                "sglang.srt.disaggregation.prefill.discard_kv_cache"
             ) as release_kv_cache,
             patch("sglang.srt.disaggregation.prefill.prepare_abort"),
             patch(
@@ -316,7 +316,7 @@ class TestOptimisticPrefillCacheOwnership(unittest.TestCase):
 
         component.free_out_of_window_slots.assert_called_once()
         cache.insert.assert_not_called()
-        release_kv_cache.assert_called_once_with(req, cache, is_insert=False)
+        release_kv_cache.assert_called_once_with(req, cache)
         cache.finish.assert_called_once_with(
             req.cache_request_handle, CacheRequestOutcome.ABORT
         )
@@ -369,15 +369,13 @@ class TestOptimisticPrefillCacheOwnership(unittest.TestCase):
         )
 
         with patch(
-            "sglang.srt.disaggregation.prefill.release_kv_cache"
+            "sglang.srt.disaggregation.prefill.discard_kv_cache"
         ) as release_kv_cache:
             SchedulerDisaggregationPrefillMixin.release_aborted_prefill_waiting_req(
                 scheduler, req
             )
 
-        release_kv_cache.assert_called_once_with(
-            req, scheduler.tree_cache, is_insert=False
-        )
+        release_kv_cache.assert_called_once_with(req, scheduler.tree_cache)
         sender.abort.assert_called_once()
         self.assertFalse(req.pending_bootstrap)
 
@@ -400,7 +398,7 @@ class TestOptimisticPrefillCacheOwnership(unittest.TestCase):
 
         with (
             patch("sglang.srt.managers.scheduler.get_serving") as get_serving,
-            patch("sglang.srt.managers.scheduler.release_kv_cache") as release,
+            patch("sglang.srt.managers.scheduler.discard_kv_cache") as release,
         ):
             get_serving.return_value.weight_version = None
             scheduler.abort_request(AbortReq(rid="req"))

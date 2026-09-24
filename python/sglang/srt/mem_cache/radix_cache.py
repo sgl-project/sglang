@@ -506,11 +506,9 @@ class RadixCache(BasePrefixCache):
         )
         return radix_key, kv_indices, result.prefix_len
 
-    def cache_finished_req(
-        self, req: Req, is_insert: bool = True, *, owned_kv_len: int
-    ):
+    def cache_finished_req(self, req: Req, *, owned_kv_len: int):
         """Cache request when it finishes."""
-        if is_insert and not self.disable:
+        if not self.disable:
             token_ids = (req.origin_input_ids + req.output_ids)[:owned_kv_len]
             radix_key, _, _ = self._adopt(req, token_ids, split_prompt=True)
             req.kv.cache_protected_len = len(radix_key)
