@@ -596,21 +596,24 @@ class ModelRunner:
             device=self.device,
         )
 
-    def init_watermark_state(self):
+    def maybe_init_watermark_state(self):
         features = get_exec().features
-        self.watermark_state = WatermarkState.create(
-            enabled=features.enable_watermark and not self.is_draft_worker,
-            max_num_reqs=self.req_to_token_pool.req_to_token.shape[0],
-            context_window=features.watermark_context_window,
-            max_contexts_per_req=self.req_to_token_pool.req_to_token.shape[1],
-            vocab_size=self.model_config.vocab_size,
-            key=features.watermark_key,
-            key_b=features.watermark_key_b,
-            mixing_probability=features.watermark_mixing_probability,
-            max_probability=features.watermark_max_probability,
-            device=self.device,
-            default_enabled=features.watermark_default_enabled,
-            enforce_all=features.watermark_enforce_all,
+        self.watermark_state = (
+            WatermarkState(
+                max_num_reqs=self.req_to_token_pool.req_to_token.shape[0],
+                context_window=features.watermark_context_window,
+                max_contexts_per_req=self.req_to_token_pool.req_to_token.shape[1],
+                vocab_size=self.model_config.vocab_size,
+                key=features.watermark_key,
+                key_b=features.watermark_key_b,
+                mixing_probability=features.watermark_mixing_probability,
+                max_probability=features.watermark_max_probability,
+                device=self.device,
+                default_enabled=features.watermark_default_enabled,
+                enforce_all=features.watermark_enforce_all,
+            )
+            if features.enable_watermark and not self.is_draft_worker
+            else None
         )
 
     def init_kv_cache_configurator(self):
@@ -935,7 +938,7 @@ class ModelRunner:
 
         # Init ngram embedding token table
         self.init_ngram_embedding_manager()
-        self.init_watermark_state()
+        self.maybe_init_watermark_state()
 
         self.maybe_init_hisparse_coordinator()
 

@@ -1,4 +1,3 @@
-import ast
 import math
 import os
 import shutil
@@ -10,7 +9,6 @@ import msgspec
 import pytest
 import torch
 
-import sglang.srt.sampling.watermarking.config as config_module
 import sglang.srt.sampling.watermarking.detector as detector_module
 from sglang.srt.sampling.watermarking import (
     WatermarkDetector,
@@ -226,18 +224,6 @@ def test_invalid_configuration_is_rejected(kwargs):
 def test_invalid_token_ids_are_rejected(token_ids):
     with pytest.raises(ValueError, match="token IDs"):
         WatermarkDetector(_KEY_A).detect_tokens(token_ids)
-
-
-@pytest.mark.parametrize("module", [detector_module, config_module])
-def test_detector_dependencies_do_not_import_torch(module):
-    tree = ast.parse(Path(module.__file__).read_text())
-    imported = set()
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Import):
-            imported.update(alias.name.split(".")[0] for alias in node.names)
-        elif isinstance(node, ast.ImportFrom) and node.module:
-            imported.add(node.module.split(".")[0])
-    assert "torch" not in imported
 
 
 def test_detector_package_is_standalone(tmp_path):

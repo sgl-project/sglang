@@ -71,23 +71,19 @@ def load_watermark_config(path: str) -> WatermarkServerConfig:
         raise WatermarkConfigError("failed to read watermark config JSON") from error
     if not isinstance(raw, dict):
         raise WatermarkConfigError("watermark config must be a JSON object")
-    unknown = sorted(set(raw) - {"key", "key_b", "context_window"})
-    if unknown:
+    if set(raw) - {"key", "key_b", "context_window"}:
         raise WatermarkConfigError("watermark config contains unknown fields")
     if not {"key", "context_window"}.issubset(raw):
         raise WatermarkConfigError("watermark config requires key and context_window")
 
     key = raw["key"]
+    key_b = raw.get("key_b")
     try:
         parse_watermark_key(key)
+        if key_b is not None:
+            parse_watermark_key(key_b)
     except ValueError as error:
         raise WatermarkConfigError(str(error)) from error
-    key_b = raw.get("key_b")
-    if key_b is not None:
-        try:
-            parse_watermark_key(key_b)
-        except ValueError as error:
-            raise WatermarkConfigError(str(error)) from error
     context_window = raw["context_window"]
     if (
         isinstance(context_window, bool)

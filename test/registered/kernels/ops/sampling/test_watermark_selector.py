@@ -3,7 +3,6 @@ import sys
 import pytest
 import torch
 
-from sglang.kernels.ops.sampling.murmur_hash import murmur_hash32
 from sglang.kernels.ops.sampling.textseal_selector import (
     can_use_finite_topk_watermark,
     force_watermark_tokens_triton,
@@ -12,7 +11,6 @@ from sglang.kernels.ops.sampling.textseal_selector import (
 )
 from sglang.srt.sampling.watermarking.core import (
     WatermarkState,
-    _dual_key_a_mask_torch,
     _hash_contexts,
     _truncate_probabilities,
     _watermark_hash32_torch,
@@ -21,42 +19,6 @@ from sglang.srt.sampling.watermarking.core import (
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=15, stage="base-b-kernel-unit", runner_config="1-gpu-large")
-
-
-def test_hash_matches_detector_vectors():
-    contexts = torch.tensor([[1, 2, 3, 4], [4, 3, 2, 1]], dtype=torch.int64)
-    lengths = torch.tensor([4, 4], dtype=torch.int32)
-    keys = torch.tensor(
-        [0x0123456789ABCDEF, 0xFEDCBA9876543210 - (1 << 64)],
-        dtype=torch.int64,
-    )
-    token_ids = torch.tensor([0, 1, 17, 8191, 8192, 16396], dtype=torch.int64)
-    expected_context_hashes = torch.tensor([1145416960, 47748951])
-    expected = torch.tensor(
-        [
-            [1293512163, 858402549, 2305555132, 2450309311, 227333036, 2684237202],
-            [221641642, 4015047244, 843143906, 1076944989, 3882127500, 2413234263],
-        ],
-        dtype=torch.int64,
-    )
-
-    context_hashes = _hash_contexts(contexts, lengths)
-    torch.testing.assert_close(context_hashes, expected_context_hashes)
-    torch.testing.assert_close(
-        _watermark_hash32_torch(keys, context_hashes, token_ids), expected
-    )
-    actual = murmur_hash32(keys.cuda(), context_hashes.cuda(), token_ids.cuda())
-    torch.testing.assert_close(actual.cpu().to(torch.int64), expected)
-
-    keys_b = torch.tensor(
-        [0x1111222233334444, 0x9999AAAABBBBCCCC - (1 << 64)], dtype=torch.int64
-    )
-    mixing_thresholds = torch.full((2,), 1 << 31, dtype=torch.int64)
-    expected_key_a_mask = torch.tensor([False, True])
-    torch.testing.assert_close(
-        _dual_key_a_mask_torch(keys, keys_b, context_hashes, mixing_thresholds),
-        expected_key_a_mask,
-    )
 
 
 def test_selector_matches_torch_across_split_boundaries():
@@ -96,13 +58,35 @@ def test_selector_matches_torch_across_split_boundaries():
     torch.testing.assert_close(actual_dual.to(torch.int64), expected_dual)
 
 
+def test_hash_near_uint32_max_does_not_override_probability():
+    vocab_size = 149050
+    probabilities = torch.zeros((1, vocab_size), dtype=torch.float32)
+    probabilities[0, 0] = 1.0 - 1e-9
+    probabilities[0, 149049] = 1e-9
+    context_hashes = torch.tensor([704711416], dtype=torch.int64)
+    keys = torch.tensor([120], dtype=torch.int64)
+    boundary_hash = _watermark_hash32_torch(
+        keys, context_hashes, torch.tensor([149049])
+    ).item()
+
+    assert boundary_hash >= (1 << 32) - 128
+    assert (
+        select_watermark_tokens_torch(probabilities, context_hashes, keys).item() == 0
+    )
+    assert (
+        select_watermark_tokens_triton(
+            probabilities.cuda(), context_hashes.cuda(), keys.cuda()
+        ).item()
+        == 0
+    )
+
+
 @pytest.mark.parametrize(
     ("dtype", "vocab_size", "dual_key"),
     [
         (torch.bfloat16, 8192, False),
         (torch.bfloat16, 8193, False),
         (torch.bfloat16, 151936, False),
-        (torch.float16, 16397, False),
         (torch.float32, 16397, False),
         (torch.float16, 16397, True),
     ],

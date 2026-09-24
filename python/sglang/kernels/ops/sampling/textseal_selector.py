@@ -6,6 +6,7 @@ from __future__ import annotations
 import torch
 import triton
 import triton.language as tl
+from triton.language.extra import libdevice
 
 from sglang.kernels.ops.sampling.murmur_hash import fmix32, murmur3_mix
 
@@ -30,12 +31,20 @@ def can_use_finite_topk_watermark(max_top_k: int | None, vocab_size: int) -> boo
 
 
 @triton.jit
+def _log_uniform_from_hash(hashed):
+    lower = tl.log((hashed.to(tl.float32) + 0.5) / _UINT32_SCALE)
+    complement = (0xFFFFFFFF - hashed).to(tl.float32) + 0.5
+    upper = libdevice.log1p(-complement / _UINT32_SCALE)
+    return tl.where(hashed < 0x80000000, lower, upper)
+
+
+@triton.jit
 def _canonicalize_topk_kernel(
     probabilities,
     topk_probabilities,
     topk_token_ids,
     vocab_size: tl.constexpr,
-    top_k: tl.constexpr,
+    top_k,
     BLOCK_K: tl.constexpr,
     SCAN_BLOCK_SIZE: tl.constexpr,
 ):
@@ -138,7 +147,7 @@ def _select_topk_watermark_token(
     mixing_threshold,
     max_probability_threshold,
     row,
-    candidate_count: tl.constexpr,
+    candidate_count,
     BLOCK_K: tl.constexpr,
     DUAL_KEY: tl.constexpr,
     APPLY_ENTROPY_GATE: tl.constexpr,
@@ -188,11 +197,10 @@ def _select_topk_watermark_token(
         state_b = murmur3_mix(state_b, context_hash.to(tl.uint32))
         state_b = murmur3_mix(state_b, token_ids)
         hashed = tl.where(use_key_a, hashed, fmix32(state_b ^ 16))
-    uniform = (hashed.to(tl.float32) + 0.5) / _UINT32_SCALE
     safe_probabilities = tl.where(is_candidate, probabilities, 1.0)
     scores = tl.where(
         is_candidate,
-        tl.log(uniform) / safe_probabilities,
+        _log_uniform_from_hash(hashed) / safe_probabilities,
         -float("inf"),
     )
     max_score = tl.max(scores, axis=0)
@@ -240,7 +248,7 @@ def _watermark_force_topk_kernel(
     max_probability_threshold,
     output_token_ids,
     vocab_size: tl.constexpr,
-    candidate_count: tl.constexpr,
+    candidate_count,
     BLOCK_K: tl.constexpr,
     CLEAR_BLOCK_SIZE: tl.constexpr,
     DUAL_KEY: tl.constexpr,
@@ -330,13 +338,11 @@ def _watermark_partial_argmax_kernel(
         state_b = murmur3_mix(state_b, context_hash)
         state_b = murmur3_mix(state_b, token_ids.to(tl.uint32))
         hashed = tl.where(use_key_a, hashed, fmix32(state_b ^ 16))
-    uniform = (hashed.to(tl.float32) + 0.5) / _UINT32_SCALE
-
     is_candidate = in_bounds & (candidate_probabilities > 0.0)
     safe_probabilities = tl.where(is_candidate, candidate_probabilities, 1.0)
     scores = tl.where(
         is_candidate,
-        tl.log(uniform) / safe_probabilities,
+        _log_uniform_from_hash(hashed) / safe_probabilities,
         -float("inf"),
     )
     local_index = tl.argmax(scores, axis=0, tie_break_left=True)
@@ -463,7 +469,7 @@ def _watermark_force_topk_with_state_kernel(
     context_window: tl.constexpr,
     max_contexts_per_req: tl.constexpr,
     vocab_size: tl.constexpr,
-    candidate_count: tl.constexpr,
+    candidate_count,
     BLOCK_K: tl.constexpr,
     HISTORY_BLOCK_SIZE: tl.constexpr,
     CLEAR_BLOCK_SIZE: tl.constexpr,
@@ -651,11 +657,10 @@ def _watermark_force_partial_argmax_kernel(
         state_b = murmur3_mix(state_b, context_hash)
         state_b = murmur3_mix(state_b, token_ids)
         hashed = tl.where(use_key_a, hashed, fmix32(state_b ^ 16))
-    uniform = (hashed.to(tl.float32) + 0.5) / _UINT32_SCALE
     safe_probabilities = tl.where(is_candidate, probabilities, 1.0)
     scores = tl.where(
         is_candidate,
-        tl.log(uniform) / safe_probabilities,
+        _log_uniform_from_hash(hashed) / safe_probabilities,
         -float("inf"),
     )
     local_score = tl.max(scores, axis=0)

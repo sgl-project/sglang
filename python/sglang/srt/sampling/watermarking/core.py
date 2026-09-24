@@ -345,6 +345,13 @@ def _dual_key_a_mask_torch(
     return hashed < mixing_thresholds
 
 
+def _log_uniform_from_hash_torch(hashed: torch.Tensor) -> torch.Tensor:
+    lower = torch.log((hashed.to(torch.float32) + 0.5) / _UINT32_SCALE)
+    complement = (_MASK32 - hashed).to(torch.float32) + 0.5
+    upper = torch.log1p(-complement / _UINT32_SCALE)
+    return torch.where(hashed < (1 << 31), lower, upper)
+
+
 def select_watermark_tokens_torch(
     probabilities: torch.Tensor,
     context_hashes: torch.Tensor,
@@ -364,10 +371,9 @@ def select_watermark_tokens_torch(
             keys, keys_b, context_hashes, mixing_thresholds
         )
         hashed = torch.where(use_key_a.view(-1, 1), hashed, hashed_b)
-    uniform = (hashed.to(torch.float32) + 0.5) / _UINT32_SCALE
     scores = torch.where(
         probabilities > 0,
-        uniform.log() / probabilities.to(torch.float32),
+        _log_uniform_from_hash_torch(hashed) / probabilities.to(torch.float32),
         -torch.inf,
     )
     return scores.argmax(dim=-1)
@@ -412,31 +418,28 @@ def force_watermark_tokens(
     max_probability: float = 1.0,
 ) -> torch.Tensor:
     if logits.is_cuda:
-        try:
-            from sglang.kernels.ops.sampling.textseal_selector import (
-                force_watermark_tokens_triton,
-            )
-        except ImportError:
-            pass
-        else:
-            selected = force_watermark_tokens_triton(
-                logits,
-                context_hashes,
-                eligible,
-                temperatures,
-                top_ks,
-                top_ps,
-                min_ps,
-                keys,
-                keys_b,
-                mixing_thresholds,
-                max_top_k=max_top_k,
-                partial_scores=partial_scores,
-                partial_token_ids=partial_token_ids,
-                output_token_ids=output_token_ids,
-                max_probability=max_probability,
-            )
-            return eligible & (selected >= 0)
+        from sglang.kernels.ops.sampling.textseal_selector import (
+            force_watermark_tokens_triton,
+        )
+
+        selected = force_watermark_tokens_triton(
+            logits,
+            context_hashes,
+            eligible,
+            temperatures,
+            top_ks,
+            top_ps,
+            min_ps,
+            keys,
+            keys_b,
+            mixing_thresholds,
+            max_top_k=max_top_k,
+            partial_scores=partial_scores,
+            partial_token_ids=partial_token_ids,
+            output_token_ids=output_token_ids,
+            max_probability=max_probability,
+        )
+        return eligible & (selected >= 0)
 
     probabilities = _truncate_probabilities(
         logits, temperatures, top_ks, top_ps, min_ps
@@ -445,42 +448,13 @@ def force_watermark_tokens(
     rows = eligible.nonzero(as_tuple=True)[0]
     if rows.numel() == 0:
         return eligible
-    candidate_probabilities = probabilities[rows].to(torch.float32).contiguous()
-    candidate_context_hashes = context_hashes[rows].contiguous()
-    candidate_keys = keys[rows].contiguous()
-    candidate_keys_b = keys_b[rows].contiguous() if keys_b is not None else None
-    candidate_mixing_thresholds = (
-        mixing_thresholds[rows].contiguous() if mixing_thresholds is not None else None
+    selected = select_watermark_tokens_torch(
+        probabilities[rows].to(torch.float32),
+        context_hashes[rows],
+        keys[rows],
+        keys_b[rows] if keys_b is not None else None,
+        mixing_thresholds[rows] if mixing_thresholds is not None else None,
     )
-    if candidate_probabilities.is_cuda:
-        try:
-            from sglang.kernels.ops.sampling.textseal_selector import (
-                select_watermark_tokens_triton,
-            )
-        except ImportError:
-            selected = select_watermark_tokens_torch(
-                candidate_probabilities,
-                candidate_context_hashes,
-                candidate_keys,
-                candidate_keys_b,
-                candidate_mixing_thresholds,
-            )
-        else:
-            selected = select_watermark_tokens_triton(
-                candidate_probabilities,
-                candidate_context_hashes,
-                candidate_keys,
-                candidate_keys_b,
-                candidate_mixing_thresholds,
-            )
-    else:
-        selected = select_watermark_tokens_torch(
-            candidate_probabilities,
-            candidate_context_hashes,
-            candidate_keys,
-            candidate_keys_b,
-            candidate_mixing_thresholds,
-        )
     logits[rows] = -torch.inf
     logits[rows, selected] = 0.0
     return eligible
@@ -575,39 +549,6 @@ class WatermarkState:
         self.output_token_ids_buffer = torch.empty(0, dtype=torch.int32, device=device)
         if vocab_size > 0 and self.token_ids.is_cuda:
             self._ensure_selection_buffers(max_num_reqs, vocab_size)
-
-    @classmethod
-    def create(
-        cls,
-        *,
-        enabled: bool,
-        max_num_reqs: int,
-        context_window: int,
-        max_contexts_per_req: int,
-        key: Optional[str],
-        device: str,
-        vocab_size: int = 0,
-        key_b: Optional[str] = None,
-        mixing_probability: float = 0.5,
-        max_probability: float = 1.0,
-        default_enabled: bool = False,
-        enforce_all: bool = False,
-    ) -> Optional[WatermarkState]:
-        if not enabled:
-            return None
-        return cls(
-            max_num_reqs=max_num_reqs,
-            context_window=context_window,
-            max_contexts_per_req=max_contexts_per_req,
-            vocab_size=vocab_size,
-            key=key,
-            key_b=key_b,
-            mixing_probability=mixing_probability,
-            max_probability=max_probability,
-            device=device,
-            default_enabled=default_enabled,
-            enforce_all=enforce_all,
-        )
 
     def prompt_tails(self, batch: ScheduleBatch) -> Optional[list[Optional[list[int]]]]:
         if not batch.forward_mode.is_extend_without_speculative():
@@ -805,6 +746,17 @@ class WatermarkState:
             self.output_token_ids_buffer[:batch_size],
         )
 
+    def _dual_key_rows(
+        self, req_pool_indices: torch.Tensor
+    ) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+        if self.default_key_b is None:
+            return None, None
+        pool_indices = req_pool_indices.to(torch.int64)
+        return (
+            self.key_b_buffer[pool_indices],
+            self.mixing_threshold_buffer[pool_indices],
+        )
+
     def context_windows(self, sampling_info: SamplingBatchInfo) -> torch.Tensor:
         return self._watermark_batch_config(sampling_info)[1]
 
@@ -943,19 +895,7 @@ class WatermarkState:
         expanded_req_pool_indices = req_pool_indices.repeat_interleave(draft_token_num)
         keys, _, watermark_enabled = self._watermark_batch_config(sampling_info)
         keys = keys.repeat_interleave(draft_token_num)
-        pool_indices = req_pool_indices.to(torch.int64)
-        keys_b = (
-            self.key_b_buffer[pool_indices].repeat_interleave(draft_token_num)
-            if self.default_key_b is not None
-            else None
-        )
-        mixing_thresholds = (
-            self.mixing_threshold_buffer[pool_indices].repeat_interleave(
-                draft_token_num
-            )
-            if self.default_key_b is not None
-            else None
-        )
+        keys_b, mixing_thresholds = self._dual_key_rows(expanded_req_pool_indices)
         watermark_enabled = watermark_enabled.repeat_interleave(draft_token_num)
         top_ks = sampling_info.top_ks.repeat_interleave(draft_token_num, dim=0)
         eligible = (
@@ -1046,56 +986,20 @@ class WatermarkState:
         partial_scores, partial_token_ids, output_token_ids = (
             self._ensure_selection_buffers(logits.shape[0], logits.shape[1])
         )
+        keys_b, mixing_thresholds = self._dual_key_rows(req_pool_indices)
         if logits.is_cuda:
-            try:
-                from sglang.kernels.ops.sampling.textseal_selector import (
-                    can_use_finite_topk_watermark,
-                    force_watermark_tokens_with_state_triton,
-                    prepare_watermark_contexts_triton,
-                )
-            except ImportError:
-                pass
-            else:
-                batch_size = req_pool_indices.shape[0]
-                context_hashes = self.context_hash_buffer[:batch_size]
-                eligible = self.eligible_buffer[:batch_size]
-                pool_indices = req_pool_indices.to(torch.int64)
-                keys_b = (
-                    self.key_b_buffer[pool_indices]
-                    if self.default_key_b is not None
-                    else None
-                )
-                mixing_thresholds = (
-                    self.mixing_threshold_buffer[pool_indices]
-                    if self.default_key_b is not None
-                    else None
-                )
-                if can_use_finite_topk_watermark(max_top_k, logits.shape[1]):
-                    force_watermark_tokens_with_state_triton(
-                        logits,
-                        self.token_ids,
-                        self.lengths,
-                        self.write_positions,
-                        self.watermarked_context_hashes,
-                        self.num_watermarked_contexts,
-                        req_pool_indices,
-                        context_windows,
-                        watermark_enabled,
-                        sampling_info.temperatures,
-                        sampling_info.top_ks,
-                        sampling_info.top_ps,
-                        sampling_info.min_ps,
-                        keys,
-                        keys_b,
-                        mixing_thresholds,
-                        context_hashes,
-                        eligible,
-                        output_token_ids,
-                        max_top_k,
-                        self.max_probability,
-                    )
-                    return
-                prepare_watermark_contexts_triton(
+            from sglang.kernels.ops.sampling.textseal_selector import (
+                can_use_finite_topk_watermark,
+                force_watermark_tokens_with_state_triton,
+                prepare_watermark_contexts_triton,
+            )
+
+            batch_size = req_pool_indices.shape[0]
+            context_hashes = self.context_hash_buffer[:batch_size]
+            eligible = self.eligible_buffer[:batch_size]
+            if can_use_finite_topk_watermark(max_top_k, logits.shape[1]):
+                force_watermark_tokens_with_state_triton(
+                    logits,
                     self.token_ids,
                     self.lengths,
                     self.write_positions,
@@ -1104,60 +1008,57 @@ class WatermarkState:
                     req_pool_indices,
                     context_windows,
                     watermark_enabled,
+                    sampling_info.temperatures,
                     sampling_info.top_ks,
+                    sampling_info.top_ps,
+                    sampling_info.min_ps,
+                    keys,
+                    keys_b,
+                    mixing_thresholds,
                     context_hashes,
                     eligible,
-                    record_context=False,
+                    output_token_ids,
+                    max_top_k,
+                    self.max_probability,
                 )
-                selected = force_watermark_tokens(
-                    logits=logits,
-                    context_hashes=context_hashes,
-                    eligible=eligible,
-                    temperatures=sampling_info.temperatures,
-                    top_ks=sampling_info.top_ks,
-                    top_ps=sampling_info.top_ps,
-                    min_ps=sampling_info.min_ps,
-                    keys=keys,
-                    keys_b=keys_b,
-                    mixing_thresholds=mixing_thresholds,
-                    max_top_k=max_top_k,
-                    partial_scores=partial_scores,
-                    partial_token_ids=partial_token_ids,
-                    output_token_ids=output_token_ids,
-                    max_probability=self.max_probability,
-                )
-                self._record_contexts(req_pool_indices, context_hashes, selected)
                 return
-
-        contexts, context_lengths = self.contexts_tail(
-            req_pool_indices, context_windows
-        )
-        context_hashes = _hash_contexts(contexts, context_lengths)
-        eligible = (
-            watermark_enabled
-            & (sampling_info.top_ks <= 1).logical_not()
-            & (context_lengths > 0)
-        )
-        selected = self._new_context_mask(req_pool_indices, context_hashes, eligible)
+            prepare_watermark_contexts_triton(
+                self.token_ids,
+                self.lengths,
+                self.write_positions,
+                self.watermarked_context_hashes,
+                self.num_watermarked_contexts,
+                req_pool_indices,
+                context_windows,
+                watermark_enabled,
+                sampling_info.top_ks,
+                context_hashes,
+                eligible,
+                record_context=False,
+            )
+        else:
+            contexts, context_lengths = self.contexts_tail(
+                req_pool_indices, context_windows
+            )
+            context_hashes = _hash_contexts(contexts, context_lengths)
+            eligible = self._new_context_mask(
+                req_pool_indices,
+                context_hashes,
+                watermark_enabled
+                & (sampling_info.top_ks <= 1).logical_not()
+                & (context_lengths > 0),
+            )
         selected = force_watermark_tokens(
             logits=logits,
             context_hashes=context_hashes,
-            eligible=selected,
+            eligible=eligible,
             temperatures=sampling_info.temperatures,
             top_ks=sampling_info.top_ks,
             top_ps=sampling_info.top_ps,
             min_ps=sampling_info.min_ps,
             keys=keys,
-            keys_b=(
-                self.key_b_buffer[req_pool_indices.to(torch.int64)]
-                if self.default_key_b is not None
-                else None
-            ),
-            mixing_thresholds=(
-                self.mixing_threshold_buffer[req_pool_indices.to(torch.int64)]
-                if self.default_key_b is not None
-                else None
-            ),
+            keys_b=keys_b,
+            mixing_thresholds=mixing_thresholds,
             max_top_k=max_top_k,
             partial_scores=partial_scores,
             partial_token_ids=partial_token_ids,
@@ -1172,21 +1073,18 @@ class WatermarkState:
         token_ids: torch.Tensor,
     ) -> None:
         if self.token_ids.is_cuda:
-            try:
-                from sglang.kernels.ops.sampling.textseal_selector import (
-                    append_watermark_tokens_triton,
-                )
-            except ImportError:
-                pass
-            else:
-                append_watermark_tokens_triton(
-                    self.token_ids,
-                    self.lengths,
-                    self.write_positions,
-                    req_pool_indices,
-                    token_ids,
-                )
-                return
+            from sglang.kernels.ops.sampling.textseal_selector import (
+                append_watermark_tokens_triton,
+            )
+
+            append_watermark_tokens_triton(
+                self.token_ids,
+                self.lengths,
+                self.write_positions,
+                req_pool_indices,
+                token_ids,
+            )
+            return
 
         pool_indices = req_pool_indices.to(torch.int64)
         write_positions = self.write_positions[pool_indices]

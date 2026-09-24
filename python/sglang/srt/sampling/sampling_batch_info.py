@@ -459,19 +459,13 @@ class SamplingBatchInfo:
             "top_ks",
             "min_ps",
             "sampling_seed",
+            "watermark_keys",
+            "watermark_context_windows",
+            "watermark_enabled",
         ]:
             value = getattr(self, item, None)
             if value is not None:
                 setattr(self, item, value[keep_indices_device])
-
-        if self.watermark_keys is not None:
-            self.watermark_keys = self.watermark_keys[keep_indices_device]
-        if self.watermark_context_windows is not None:
-            self.watermark_context_windows = self.watermark_context_windows[
-                keep_indices_device
-            ]
-        if self.watermark_enabled is not None:
-            self.watermark_enabled = self.watermark_enabled[keep_indices_device]
 
         if self.watermark_candidates_host is not None:
             self.watermark_candidates_host = [
@@ -597,25 +591,14 @@ class SamplingBatchInfo:
             "top_ks",
             "min_ps",
             "sampling_seed",
+            "watermark_keys",
+            "watermark_context_windows",
+            "watermark_enabled",
         ]:
             self_val = getattr(self, item, None)
             other_val = getattr(other, item, None)
             if self_val is not None and other_val is not None:
                 setattr(self, item, torch.cat([self_val, other_val]))
-
-        if self.watermark_keys is not None and other.watermark_keys is not None:
-            self.watermark_keys = torch.cat([self.watermark_keys, other.watermark_keys])
-        if (
-            self.watermark_context_windows is not None
-            and other.watermark_context_windows is not None
-        ):
-            self.watermark_context_windows = torch.cat(
-                [self.watermark_context_windows, other.watermark_context_windows]
-            )
-        if self.watermark_enabled is not None and other.watermark_enabled is not None:
-            self.watermark_enabled = torch.cat(
-                [self.watermark_enabled, other.watermark_enabled]
-            )
 
         if (
             self.watermark_candidates_host is not None

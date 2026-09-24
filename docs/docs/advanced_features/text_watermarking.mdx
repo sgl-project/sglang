@@ -4,243 +4,38 @@ metatags:
     description: "Configure Aaronson-Gumbel text watermarking and detect watermarked text."
 ---
 
-SGLang provides opt-in Aaronson-Gumbel watermarking for sampled text. The
-watermark changes token selection so that someone with the secret key can test
-whether a completion was produced by the configured generator.
+SGLang provides opt-in Aaronson-Gumbel watermarking for sampled text. The watermark replaces random token selection with a keyed, deterministic choice that follows the same output distribution, so anyone holding the secret key can later test whether a token sequence carries the watermark. Detection needs only the key and the token IDs; it does not need the model or a GPU.
 
-This feature can support transparency controls such as the machine-readable
-marking and detectability described in
-[Article 50 of the EU AI Act](https://eur-lex.europa.eu/eli/reg/2024/1689/oj).
-It is one technical signal, not a complete compliance program or proof of
-authorship.
+This feature can support transparency controls such as the machine-readable marking and detectability described in [Article 50 of the EU AI Act](https://eur-lex.europa.eu/eli/reg/2024/1689/oj). It is one technical signal, not a complete compliance program or proof of authorship.
 
-## Configure the server
+## How it works
 
-Store the server keys and context window in a JSON file:
+### Generation
 
-```json
-{
-  "key": "0123456789abcdef",
-  "key_b": "fedcba9876543210",
-  "context_window": 4
-}
-```
-
-Restrict the file to the server account, then launch a CUDA server:
-
-```bash
-chmod 600 /run/secrets/sglang-watermark.json
-python -m sglang.launch_server \
-  --model-path Qwen/Qwen3-8B \
-  --enable-watermark \
-  --watermark-config /run/secrets/sglang-watermark.json \
-  --watermark-default-enabled
-```
-
-<Warning>
-  Values passed with `--watermark-key` or `--watermark-key-b` are visible in the
-  process command line, including `/proc/*/cmdline` on Linux. Use
-  `--watermark-config` for server-owned production keys. SGLang redacts the key
-  arguments and config path from startup logs, request logs, server information
-  responses, and request crash-dump payloads. Process and GPU core dumps may
-  contain in-memory keys. Protect those artifacts, the configuration file, and
-  the transport used by clients that send per-request keys.
-</Warning>
-
-The server arguments are:
-
-| Argument | Default | Behavior |
-| --- | --- | --- |
-| `--enable-watermark` | disabled | Enables watermark state and accepts per-request watermark configuration. |
-| `--watermark-config PATH` | unset | Loads a JSON object containing `key`, optional `key_b`, and `context_window`. |
-| `--watermark-key HEX` | unset | Makes a server-owned 64-bit key available to opted-in or default-enabled requests. Prefer the file option. |
-| `--watermark-key-b HEX` | unset | Opts into dual-key mode with a second server-owned 64-bit key. Requires a primary server key. |
-| `--watermark-mixing-probability P` | `0.5` | In dual-key mode, sets the probability of selecting key A at each eligible position. Must be strictly between 0 and 1. |
-| `--watermark-max-probability P` | `1.0` | Skips forcing when the maximum probability after truncation and renormalization exceeds `P`. Must be greater than 0 and at most 1. |
-| `--watermark-context-window N` | `4` | Sets the default and the maximum window that a request may select, from 1 to 64 tokens. |
-| `--watermark-default-enabled` | disabled | Uses the server key when a request omits the `watermark` field. Requests may still opt out. |
-| `--watermark-enforce-all` | disabled | Uses the server key by default and rejects `{"enabled": false}`. |
-
-`--watermark-config` and `--watermark-key` are mutually exclusive. A file may
-also contain `key_b`; when it does, `--watermark-key-b` is mutually exclusive
-with that field. A CLI key B remains valid when the file omits `key_b`. The
-file's `context_window` takes precedence over `--watermark-context-window`. A
-server key does not by itself watermark every request. Add
-`--watermark-default-enabled` for a default-on service or
-`--watermark-enforce-all` for a service that also forbids opt-out. Both modes
-require a server key from `--watermark-key` or `--watermark-config`.
-
-`--watermark-key-b` enables dual-key mode for every watermarked request. The
-resolved server or request key is key A, and the server-owned second key is key
-B. Therefore, an explicit request key replaces key A while key B remains active.
-Omitting key B preserves the single-key selection path. Setting
-`--watermark-mixing-probability` without key B is an error.
-
-The server modes resolve requests as follows:
-
-| Server mode | No `watermark` field | `{"enabled": false}` | `{"enabled": true}` | `{"key": "HEX"}` |
-| --- | --- | --- | --- | --- |
-| Watermarking disabled | Off | Off | HTTP 400 | HTTP 400 |
-| `--enable-watermark` with a server key | Off | Off | Server key | Request key |
-| Add `--watermark-default-enabled` | Server key | Off | Server key | Request key |
-| Add `--watermark-enforce-all` | Server key | HTTP 400 | Server key | Request key |
-
-With `--enable-watermark` and no server key, only a request that supplies its
-own key can enable watermarking. `{"enabled": true}` then returns HTTP 400
-instead of silently producing unwatermarked text.
-
-## Configure a request
-
-The native generation API and the OpenAI-compatible completions and chat
-completions APIs accept a `watermark` object with optional `enabled`, `key`, and
-`context_window` fields. A request key implicitly enables watermarking and
-overrides the server key for that request. A request context window cannot
-exceed the server maximum.
-
-```bash
-curl http://127.0.0.1:30000/v1/chat/completions \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "model": "Qwen/Qwen3-8B",
-    "messages": [{"role": "user", "content": "Explain photosynthesis."}],
-    "temperature": 1.0,
-    "top_p": 0.95,
-    "watermark": {
-      "enabled": true,
-      "context_window": 4
-    }
-  }'
-```
-
-Use `{"enabled": false}` to opt out when the server allows it. An object that
-sets neither `enabled` nor `key`, a contradictory object that combines a key
-with `enabled: false`, invalid keys, enabled requests sent to a server without
-`--enable-watermark`, missing server keys for `enabled: true`, and windows above
-the server maximum return HTTP 400. Keys contain 1 to 16 hexadecimal digits,
-with an optional `0x` prefix.
-
-Request-level keys are credentials carried in the request body. Use an
-authenticated TLS endpoint whenever they cross a host boundary, and avoid
-recording request bodies in proxies or application logs.
-
-## How generation works
-
-At each non-greedy sampling step, SGLang first applies frequency, presence, and
-repetition penalties, logit bias, any structured-output grammar mask, and the
-ordinary temperature, top-k, top-p, and min-p truncation rules. Grammar-masked
-tokens have zero probability and cannot be selected by the watermark. Let `p_i`
-be the resulting probability of candidate token `i`. SGLang hashes the secret
-key, the preceding token context, and `i` to obtain a deterministic uniform
-value `u_i`, then selects:
+At each sampling step, SGLang first applies frequency, presence, and repetition penalties, logit bias, and any structured-output grammar mask, followed by the request's temperature and its top-k, top-p, and min-p truncation, then renormalizes. Let `p_i` be the resulting probability of candidate token `i`; grammar-masked and truncated tokens have `p_i = 0` and can never be selected. For each candidate, SGLang hashes the key, the preceding token context, and the token ID into a uniform value `u_i` in `(0, 1)` and selects
 
 ```text
-argmax_i log(u_i) / p_i
+argmax over i with p_i > 0 of  log(u_i) / p_i
 ```
 
-This is the Aaronson-Gumbel sampling rule. SGLang stores recent tokens in a ring
-buffer. If the same context hash has already been watermarked in the request,
-the repeated position uses ordinary sampling. This prevents a repeated context
-from forcing the same token indefinitely and matches the detector's one-score-
-per-context rule. Greedy requests (`temperature=0`, normalized internally to
-`top_k=1`) also use ordinary token selection and carry no watermark signal.
+When the `u_i` are independent uniforms, this rule selects token `i` with probability exactly `p_i`, so a single step is distributed like ordinary sampling. Ties go to the lowest token ID.
 
-Set `--watermark-max-probability` below 1 to leave low-entropy positions
-unchanged. Skipped positions are not added to repeated-context history, so the
-same context remains eligible at a later higher-entropy position. This option
-can improve speculative draft acceptance, but its ordinary-sampling positions
-dilute the detector statistic.
+A position is watermarked only when all of the following hold; otherwise the request samples that position normally:
 
-In dual-key mode, each eligible context deterministically selects key A with
-probability `P` and key B otherwise. Both token hashes are evaluated in the same
-selector pass; the ordinary truncation, repeated-context, and greedy rules do
-not change.
+- The request has watermarking enabled (see [Per-request control](#per-request-control)).
+- The request is not greedy. `temperature=0` is normalized to `top_k=1`, and `top_k=1` positions are never watermarked.
+- The context is not empty.
+- The context has not already been watermarked earlier in the same request. Runtime identifies a context by its 32-bit context hash.
+- The request has watermarked fewer than 4,096 contexts, or fewer than the server's maximum context length if that is smaller.
+- The largest truncated probability is at most `--watermark-max-probability`. The default `1.0` disables this gate.
 
-## Detection library
+Only a watermarked position enters the request's context history. A position skipped by the probability gate therefore leaves its context eligible for a later, higher-entropy occurrence, and once a request has watermarked 4,096 contexts the remaining tokens use ordinary sampling. The repeated-context rule keeps a repeated context from forcing the same token indefinitely.
 
-`sglang.srt.sampling.watermarking.WatermarkDetector` implements the detector
-specification below. It needs only the key and token IDs, not the model or a
-GPU. Construct it with the server's key, optional key B, mixing probability,
-and context window:
+The context for a position is the last `h` tokens before it, where `h` is the request's context window, taken from the prompt followed by the tokens generated so far. The first generated token therefore uses the last `h` prompt tokens. A context is shorter than `h` only when fewer than `h` tokens precede the position.
 
-```python
-from sglang.srt.sampling.watermarking import WatermarkDetector
+### Hash contract
 
-detector = WatermarkDetector("0123456789abcdef", key_b="fedcba9876543210")
-result = detector.detect_tokens(
-    completion_token_ids,
-    prompt_token_ids=prompt_token_ids,
-)
-print(result.combined.p_value, result.combined.z_score)
-```
-
-OpenAI-compatible responses include both token ID arrays when the request sets
-`"return_token_ids": true`. `detect_text` encodes a completion with a Hugging
-Face-compatible tokenizer and no special tokens; prefer the returned token IDs
-when available. In dual-key mode, the result also reports each key's partition.
-`log_p_value` stays finite when the p-value underflows to zero on long texts.
-
-### Standalone detector usage
-
-The import above is intended for an SGLang environment. To run detection
-without installing SGLang or Torch, copy the package directory into a separate
-application:
-
-```bash
-cp -R python/sglang/srt/sampling/watermarking detector_app/watermarking
-python -m pip install msgspec
-```
-
-Then import the copied package directly:
-
-```python
-from watermarking.detector import WatermarkDetector
-
-detector = WatermarkDetector("0123456789abcdef")
-result = detector.detect_tokens(
-    completion_token_ids,
-    prompt_token_ids=prompt_token_ids,
-)
-```
-
-The copied detector uses the Python standard library and `msgspec`. NumPy is
-optional for applications that store token arrays in NumPy formats; the
-detector itself does not import it.
-
-## Detector specification
-
-A compatible detector must use the same tokenizer and the exact prompt token
-IDs that preceded the completion. All integer arithmetic below wraps to
-unsigned 32 bits.
-
-1. For each generated token at position `t`, take up to `h=context_window`
-   preceding token IDs from the concatenated prompt and completion. With an
-   empty prompt, begin at completion position `h`. Otherwise, skip an empty
-   context and skip any exact context tuple already scored in this completion.
-2. Compute the context hash by starting with `state=0` and applying the
-   MurmurHash3 x86 32-bit body mix to each token ID. Finalize
-   `state XOR (4 * context_length)` with `fmix32`.
-3. Interpret the hexadecimal key as an unsigned 64-bit integer. Starting again
-   from `state=0`, apply the same body mix to the key's low 32 bits, its high 32
-   bits, the context hash, and the candidate token ID, in that order. Finalize
-   `state XOR 16` with `fmix32` to obtain `H_t`.
-4. Set `u_t = (H_t + 0.5) / 2^32` and accumulate
-   `S = -sum(log(1 - u_t))` over the `n` unique contexts.
-5. Under the null hypothesis, `S` follows `Gamma(shape=n, scale=1)`. Report the
-   upper-tail probability `P[Gamma(n, 1) >= S]` as the p-value. The optional
-   normal approximation is `z = (S - n) / sqrt(n)`.
-
-Generation watermarks at most the first 4,096 eligible unique contexts. For a
-matched statistic, score only that prefix; for longer completions, report a
-prefix test rather than adding the ordinary-sampling tail. Tail scores still
-follow the null distribution, but they dilute the standardized signal.
-
-Runtime repetition tracking stores the 32-bit context hash, while the detector
-deduplicates exact token tuples. A hash collision therefore makes generation
-skip a later distinct context that the detector may score. The extra detector
-score is an ordinary null sample, so this approximation can conservatively
-weaken detection rather than create watermark evidence.
-
-The MurmurHash3 primitives are:
+All arithmetic wraps to unsigned 32 bits. The primitives are the MurmurHash3 x86 32-bit body mix and finalizer:
 
 ```text
 mix(state, value):
@@ -258,28 +53,274 @@ fmix32(value):
   return value XOR (value >> 16)
 ```
 
-### Dual-key detection
-
-Given both keys, partition the unique contexts before accumulating detector
-scores. For each context hash, start with `state=0` and apply `mix` to key A's
-low and high 32-bit words, key B's low and high words, and the context hash, in
-that order. Let:
+A key is 1 to 16 hexadecimal digits with an optional `0x` prefix, interpreted as an unsigned 64-bit integer; `key_lo` and `key_hi` are its low and high 32-bit words. For a context of `L` token IDs `c_1 ... c_L` and a candidate token `t`:
 
 ```text
-coin = fmix32(state XOR 20)
-threshold = floor(P * 2^32)
+context_hash = fmix32(mix(...mix(mix(0, c_1), c_2)..., c_L) XOR (4 * L))
+token_hash   = fmix32(mix(mix(mix(mix(0, key_lo), key_hi), context_hash), t) XOR 16)
+u            = (token_hash + 0.5) / 2^32
 ```
 
-Use key A when `coin < threshold` and key B otherwise, then apply the single-key
-token hash and Gamma test independently to each partition. Repeated contexts
-must still be removed before partitioning. A detector holding only one key may
-score all unique contexts with that key; the unmatched partition dilutes the
-signal, so the two-key partitioned detector is stronger.
+The context hash covers only the context tokens; keys enter only through the token hash and, in dual-key mode, through a per-context coin that chooses which key produces the token hash:
 
-Low p-values are evidence for the keyed watermark, not a calibrated probability
-that a particular author or model produced the text. Applications must choose a
-decision threshold and evaluate false-positive and false-negative rates on
-their own traffic.
+```text
+coin      = fmix32(mix(mix(mix(mix(mix(0, a_lo), a_hi), b_lo), b_hi), context_hash) XOR 20)
+threshold = floor(P * 2^32)
+key       = key A if coin < threshold else key B
+```
+
+`a_lo`/`a_hi` and `b_lo`/`b_hi` are the words of key A and key B, and `P` is `--watermark-mixing-probability`.
+
+### Detection
+
+A detector holding the key scores each generated token `t` with `s = -log(1 - u)`, where `u` comes from the hash contract above using that token's context. Without the watermark, each `s` is an independent `Exponential(1)` sample. With the watermark, the generator preferred tokens with large `u`, so the scores are inflated.
+
+Over `n` scored contexts, the score `S = sum(s)` follows `Gamma(shape=n, scale=1)` under the null hypothesis that the text is not watermarked with this key. The detector reports the upper-tail probability `P[Gamma(n, 1) >= S]` as the p-value, its natural logarithm (finite even when the p-value underflows to `0.0`), and the normal approximation `z = (S - n) / sqrt(n)`.
+
+To match generation, a detector must follow these rules:
+
+1. Use the exact prompt token IDs that preceded the completion and the request's context window `h`. With prompt IDs, the first completion token's context is the last `h` prompt tokens. Without prompt IDs, the first `h` completion tokens have unknown contexts and are skipped.
+2. Score each distinct context once. The detector compares exact context token tuples, whereas generation compares 32-bit context hashes. After a hash collision, generation skips a later distinct context that the detector still scores. That extra score is an ordinary null sample, so the mismatch can only weaken detection, never create evidence.
+3. Stop after the first 4,096 distinct contexts and report a prefix test. Generation forces at most 4,096 contexts per request, so scoring the unforced tail adds null samples that dilute the statistic without adding evidence.
+
+Positions that generation left unforced (greedy positions, and positions skipped by `--watermark-max-probability`) are indistinguishable from ordinary text to the detector, which scores them as null samples; they dilute the statistic but cannot produce false evidence.
+
+A low p-value is evidence that the text carries the keyed watermark. It is not a calibrated probability that a particular author or model produced the text. Applications must choose a decision threshold and measure false-positive and false-negative rates on their own traffic.
+
+## Server configuration
+
+Store the server keys and context window in a JSON file, restrict it to the server account, and launch a CUDA server:
+
+```json
+{
+  "key": "0123456789abcdef",
+  "key_b": "fedcba9876543210",
+  "context_window": 4
+}
+```
+
+```bash
+chmod 600 /run/secrets/sglang-watermark.json
+python -m sglang.launch_server \
+  --model-path Qwen/Qwen3-8B \
+  --enable-watermark \
+  --watermark-config /run/secrets/sglang-watermark.json \
+  --watermark-default-enabled
+```
+
+The file must be a regular JSON object of at most 4,096 bytes. `key` and `context_window` are required, `key_b` is optional, and any other field is rejected. SGLang logs a warning when the file is readable by group or other users.
+
+<Warning>
+  Values passed with `--watermark-key` or `--watermark-key-b` are visible in the process command line, including `/proc/*/cmdline` on Linux. Use `--watermark-config` for server-owned production keys. SGLang redacts both key arguments and the config path from the recorded launch command, startup logs, request logs, server information responses, and request crash-dump payloads. Process and GPU core dumps may contain in-memory keys. Protect those artifacts, the configuration file, and the transport used by clients that send per-request keys.
+</Warning>
+
+| Argument | Default | Behavior |
+| --- | --- | --- |
+| `--enable-watermark` | disabled | Allocates watermark state and accepts per-request watermark configuration. Requires `--device cuda`. |
+| `--watermark-config PATH` | unset | Loads `key`, optional `key_b`, and `context_window` from a JSON file. |
+| `--watermark-key HEX` | unset | Server key (key A) for requests that enable watermarking without their own key. Prefer `--watermark-config`. |
+| `--watermark-key-b HEX` | unset | Enables dual-key mode with a second server key. Requires a server key A. |
+| `--watermark-mixing-probability P` | `0.5` | In dual-key mode, the probability of selecting key A for each context. Must be strictly between 0 and 1. |
+| `--watermark-max-probability P` | `1.0` | Skips watermarking when the largest truncated probability exceeds `P`. Must be greater than 0 and at most 1; `1.0` disables the gate. |
+| `--watermark-context-window N` | `4` | Default context window and the maximum that a request may select, from 1 to 64 tokens. |
+| `--watermark-default-enabled` | disabled | Watermarks requests that omit the `watermark` field with the server key. Requests may opt out. |
+| `--watermark-enforce-all` | disabled | Watermarks requests that omit the `watermark` field and rejects `{"enabled": false}`. |
+
+Startup validation enforces these rules:
+
+- All watermark arguments except `--watermark-context-window` require `--enable-watermark`; for the mixing and maximum probabilities, this applies to non-default values.
+- `--watermark-config` and `--watermark-key` are mutually exclusive. When the file contains `key_b`, `--watermark-key-b` is also rejected; a CLI key B is accepted when the file omits `key_b`.
+- The file's `context_window` replaces `--watermark-context-window`.
+- `--watermark-default-enabled` and `--watermark-enforce-all` require a server key from `--watermark-key` or `--watermark-config`.
+- A non-default `--watermark-mixing-probability` requires key B.
+
+A server key alone does not watermark every request; without `--watermark-default-enabled` or `--watermark-enforce-all`, requests must opt in.
+
+## Per-request control
+
+The native `/generate` API and the OpenAI-compatible `/v1/completions` and `/v1/chat/completions` APIs accept a `watermark` object with three optional fields:
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `enabled` | boolean | `true` enables watermarking with the server key; `false` opts out. |
+| `key` | hex string | Watermarks with this key instead of the server key. A key implicitly enables watermarking. |
+| `context_window` | integer | Context window for this request, from 1 to the server's `--watermark-context-window`. |
+
+On `/generate`, pass `watermark` either at the top level of the request or inside `sampling_params`, but not both; a batched request may pass one object per prompt as a list. On the OpenAI-compatible APIs, pass it as a top-level request field:
+
+```bash
+curl http://127.0.0.1:30000/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "Qwen/Qwen3-8B",
+    "messages": [{"role": "user", "content": "Explain photosynthesis."}],
+    "temperature": 1.0,
+    "top_p": 0.95,
+    "return_token_ids": true,
+    "watermark": {"enabled": true, "context_window": 4}
+  }'
+```
+
+The server resolves each request as follows:
+
+| Server mode | No `watermark` field | `{"enabled": false}` | `{"enabled": true}` | `{"key": "HEX"}` |
+| --- | --- | --- | --- | --- |
+| Watermarking disabled | Off | Off | HTTP 400 | HTTP 400 |
+| `--enable-watermark`, no server key | Off | Off | HTTP 400 | Request key |
+| `--enable-watermark` with a server key | Off | Off | Server key | Request key |
+| Add `--watermark-default-enabled` | Server key | Off | Server key | Request key |
+| Add `--watermark-enforce-all` | Server key | HTTP 400 | Server key | Request key |
+
+The request also returns HTTP 400 when:
+
+- the `watermark` object sets neither `enabled` nor `key`, or contains an unknown field;
+- `key` is combined with `"enabled": false`;
+- a key is not 1 to 16 hexadecimal digits;
+- `context_window` is not a positive integer or exceeds the server maximum;
+- a watermarked request uses beam search.
+
+Request-level keys are credentials carried in the request body. Use an authenticated TLS endpoint whenever they cross a host boundary, and avoid recording request bodies in proxies or application logs.
+
+## Dual-key mode
+
+`--watermark-key-b`, or `key_b` in the config file, applies dual-key selection to every watermarked request. The request's resolved key, whether the server key or a request key, is key A, and the server's second key is key B. A request key therefore replaces key A while key B stays active. Each eligible context uses key A with probability `--watermark-mixing-probability` and key B otherwise, according to the coin in the [hash contract](#hash-contract); truncation, repeated-context, and greedy rules are unchanged. Without key B, selection uses the single-key path.
+
+A detector holding both keys splits the distinct contexts by the coin, scores each context with its selected key, and tests the union, which is the strongest statistic; it can also test each partition separately. A detector holding only one key can score every distinct context with that key, but the contexts selected for the other key contribute only null samples and dilute the signal.
+
+## Using the detector
+
+`WatermarkDetector` implements the [detection rules](#detection) above. Construct it with the same key, key B, mixing probability, and context window that generation used:
+
+```python
+WatermarkDetector(
+    key,                      # hex key A
+    *,
+    key_b=None,               # hex key B for dual-key mode
+    mixing_probability=0.5,   # must match --watermark-mixing-probability
+    context_window=4,         # the request's effective window, 1 to 64
+    max_contexts=4096,        # prefix-test length, 1 to 4096
+)
+```
+
+- `detect_tokens(token_ids, *, prompt_token_ids=())` scores completion token IDs.
+- `detect_text(text, tokenizer, *, prompt_token_ids=())` first encodes the text with `tokenizer.encode(text, add_special_tokens=False)`. Any object with that method works, including Hugging Face tokenizers.
+- `detect(token_ids, *, key, key_b=None, prompt_token_ids=(), mixing_probability=0.5, context_window=4)` is a one-call shortcut.
+
+Token IDs must be unsigned 32-bit integers; any iterable of Python or NumPy integers is accepted.
+
+Every call returns a `WatermarkDetection`:
+
+| Field | Meaning |
+| --- | --- |
+| `combined` | The test to report. Single-key: every distinct context scored with key A. Dual-key: each context scored with its coin-selected key. |
+| `key_a_all_positions` | Every distinct context scored with key A. |
+| `key_b_all_positions`, `key_a_partition`, `key_b_partition` | Dual-key only (`None` otherwise): every context scored with key B, and each coin partition scored with its own key. |
+| `prefix_limit_reached` | `True` when scoring stopped at `max_contexts` distinct contexts. |
+| `tokens_examined` | Completion tokens covered by the test, including repeated and skipped ones. |
+| `repeated_contexts` | Positions skipped because their exact context was already scored. |
+| `skipped_initial_tokens` | Leading completion tokens skipped because no prompt IDs were given. |
+
+Each statistic is a `WatermarkStatistics` with `num_contexts`, `score`, `z_score`, `p_value`, and `log_p_value`.
+
+Prefer the server's token IDs to re-tokenized text, because re-encoding decoded text does not always reproduce the generated IDs. With `"return_token_ids": true`, non-streaming chat completions return `prompt_token_ids` and `response_token_ids` on each choice, and completions return `prompt_token_ids` and `token_ids`.
+
+### In an SGLang environment
+
+```python
+import requests
+
+from sglang.srt.sampling.watermarking import WatermarkDetector
+
+response = requests.post(
+    "http://127.0.0.1:30000/v1/chat/completions",
+    json={
+        "model": "Qwen/Qwen3-8B",
+        "messages": [{"role": "user", "content": "Explain photosynthesis."}],
+        "temperature": 1.0,
+        "top_p": 0.95,
+        "return_token_ids": True,
+        "watermark": {"enabled": True},
+    },
+).json()
+choice = response["choices"][0]
+
+detector = WatermarkDetector("0123456789abcdef", context_window=4)
+result = detector.detect_tokens(
+    choice["response_token_ids"],
+    prompt_token_ids=choice["prompt_token_ids"],
+)
+print(result.combined.num_contexts, result.combined.z_score, result.combined.log_p_value)
+```
+
+To score text, pass the model's tokenizer and, when available, the prompt IDs:
+
+```python
+from transformers import AutoTokenizer
+
+tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen3-8B")
+result = detector.detect_text(
+    choice["message"]["content"],
+    tokenizer,
+    prompt_token_ids=choice["prompt_token_ids"],
+)
+```
+
+For a dual-key server, pass both keys and the server's mixing probability:
+
+```python
+detector = WatermarkDetector(
+    "0123456789abcdef",
+    key_b="fedcba9876543210",
+    mixing_probability=0.5,
+    context_window=4,
+)
+result = detector.detect_tokens(completion_ids, prompt_token_ids=prompt_ids)
+print(result.combined.p_value, result.key_a_partition.p_value, result.key_b_partition.p_value)
+```
+
+### Standalone, without SGLang or PyTorch
+
+`detector.py` and `config.py` import only the Python standard library and `msgspec`, and the package's `__init__.py` imports only the detector. To run detection in a separate application, copy the package directory and install `msgspec`:
+
+```bash
+mkdir -p detector_app
+cp -R python/sglang/srt/sampling/watermarking detector_app/watermarking
+python -m pip install msgspec
+```
+
+The copy also contains `core.py`, the server runtime, which imports PyTorch; nothing on the detector import path loads it. Run the application with `detector_app` on the import path and import the detector from the copied package:
+
+```python
+from watermarking.detector import WatermarkDetector
+
+single = WatermarkDetector("0123456789abcdef", context_window=4)
+result = single.detect_tokens(completion_ids, prompt_token_ids=prompt_ids)
+
+dual = WatermarkDetector("0123456789abcdef", key_b="fedcba9876543210")
+result = dual.detect_tokens(completion_ids, prompt_token_ids=prompt_ids)
+```
+
+Text detection needs only an object with `encode(text, *, add_special_tokens)` that returns a list of IDs. For example, with the lightweight `tokenizers` package:
+
+```python
+from tokenizers import Tokenizer
+
+from watermarking.detector import WatermarkDetector
+
+
+class TokenizerAdapter:
+    def __init__(self, name):
+        self._tokenizer = Tokenizer.from_pretrained(name)
+
+    def encode(self, text, *, add_special_tokens):
+        return self._tokenizer.encode(text, add_special_tokens=add_special_tokens).ids
+
+
+detector = WatermarkDetector("0123456789abcdef", context_window=4)
+result = detector.detect_text(text, TokenizerAdapter("Qwen/Qwen3-8B"), prompt_token_ids=prompt_ids)
+```
+
+A detector written from scratch instead of reusing this package must implement the [hash contract](#hash-contract) and all three [detection rules](#detection): prompt alignment, exact-tuple deduplication, and the 4,096-context prefix.
 
 ## Compatibility
 
@@ -292,19 +333,19 @@ their own traffic.
 | JSON schema and regex grammars | Verified | Grammar masking runs before watermark selection; strict outputs remain valid and detectable. |
 | Streaming chat completions | Verified | Streaming and non-streaming requests use the same watermark state and token selection. |
 | Parallel sampling (`n > 1`) | Verified | Each generated choice owns independent request state and history. |
-| Output log probabilities | Verified | Ordinary decode reports the effective distribution after forcing at eligible positions; repeated-context and greedy bypass positions retain ordinary log probabilities. Speculative decode reports the pre-watermark target distribution. |
+| Output log probabilities | Verified | Ordinary decode reports the effective distribution after forcing at watermarked positions; unforced positions retain ordinary log probabilities. Speculative decode reports the pre-watermark target distribution. |
 | Top-k, top-p, and min-p | Verified | The selector reproduces SGLang's combined truncation support before keyed selection. |
 | Logit bias and frequency, presence, and repetition penalties | Verified | These transforms run before watermark selection. |
 | Chunked prefill | Verified | Each prefill chunk rebuilds the prompt tail from the request's complete logical fill IDs. |
 | Radix-cache prompt reuse | Verified | Prompt-tail initialization uses logical request IDs rather than only newly computed tokens. |
-| Decode retraction | Verified | Re-prefill restores the unique-context history before generation resumes. |
+| Decode retraction | Verified | Re-prefill restores the distinct-context history before generation resumes. |
 | Request abort and request-slot reuse | Verified | A later prefill resets ring-buffer and context-history state for the reused slot. |
 | Multimodal text generation | Verified | Qwen3-VL text tokens use the same watermark path after multimodal prefill. |
 | DP attention | Untested | The per-rank state path has not received a service-level DP-attention gate. |
 | NGRAM speculative decoding | Verified | Draft-node contexts are reconstructed before verification sampling. |
 | EAGLE and EAGLE3 speculative decoding | Verified | Tree nodes use their own ancestor-derived contexts. |
-| NEXTN speculative decoding | Verified | NEXTN uses the EAGLE verification path. |
-| Pipeline-parallel speculative decoding | Rejected | Startup validation fails closed until the PP relay and per-stage watermark state receive a service-level gate. |
+| NEXTN speculative decoding | Verified | NEXTN resolves to the EAGLE verification path. |
+| Pipeline-parallel speculative decoding | Rejected | Startup validation fails closed. |
 | Other speculative algorithms | Rejected | Startup validation fails closed. |
 | Speculative rejection sampling | Rejected | Startup validation fails closed. |
 | Custom logit processors | Rejected | Startup validation fails closed because processor ordering is not defined. |
@@ -314,36 +355,20 @@ their own traffic.
 | Embedded Rust API server | Rejected | Startup validation fails closed. |
 | Non-CUDA devices | Rejected | Startup validation fails closed. |
 
-Speculative verification forces a clone of the target logits so downstream
-target-model log-probability computation continues to observe the pre-watermark
-tensor. Tree-based EAGLE modes reconstruct a separate context for each draft
-node before selection. Repeated-context admission is conservative across the
-whole verify tree: after a context hash appears in an earlier row, later rows
-with the same hash bypass forcing even on sibling branches. This prevents
-duplicate history entries safely, but reconvergent wide trees may carry less
-signal.
+In speculative decoding, verification clones the target logits before forcing, so target-model log-probability computation still sees the pre-watermark distribution. Each draft node gets its own context, rebuilt from its ancestors in the verify tree. Repeated-context admission is conservative across the whole tree: once a context hash appears in an earlier row, later rows with the same hash are not forced, even on sibling branches. This keeps duplicate entries out of the history, but reconvergent wide trees may carry less signal.
 
 ## Limitations and performance
 
-- `temperature=0` produces no signal. Very low-entropy distributions also leave
-  few meaningful alternatives for the selector.
-- A `--watermark-max-probability` value below 1 weakens detection in exchange
-  for preserving ordinary selection at low-entropy positions.
-- Short completions provide few independent contexts and therefore weak
-  statistical power.
-- Paraphrasing, rewriting, translation, and retokenization can weaken or remove
-  the signal.
-- The detector needs the matching key, tokenizer, context window, and prompt
-  token IDs for the strongest result.
-- Each request tracks at most 4,096 unique watermarked contexts. After that
-  bound, generation continues with ordinary sampling for the remaining tokens.
-- Speculative decoding can lose accepted draft tokens when a draft proposal does
-  not match the watermarked target token. The impact depends on tree width and
-  workload.
+- Greedy requests carry no signal, and very low-entropy distributions leave few meaningful alternatives for the selector.
+- A `--watermark-max-probability` value below 1 keeps ordinary selection at low-entropy positions and can improve speculative draft acceptance, but the unforced positions dilute the detector statistic.
+- Short completions provide few distinct contexts and therefore weak statistical power.
+- Paraphrasing, rewriting, translation, and re-tokenization can weaken or remove the signal.
+- Detection needs the matching key or keys, mixing probability, context window, and tokenizer, and is strongest with the exact prompt token IDs.
+- A request watermarks at most 4,096 distinct contexts; later tokens use ordinary sampling.
+- The hashes are MurmurHash3, a keyed but non-cryptographic mix. There is no indistinguishability or unforgeability guarantee, and anyone holding the key can both detect and forge the watermark.
+- Speculative decoding can accept fewer draft tokens when a draft proposal does not match the watermarked target token. The impact depends on tree width and workload.
 
-On one single-GPU node of each type with public `Qwen/Qwen3-8B`, TP1, TRT-LLM
-MHA, ordinary decoding, and 800-token sampled outputs, the fused selector
-measured the following mean output throughput over three repetitions per cell:
+On one single-GPU node of each type with public `Qwen/Qwen3-8B`, TP1, TRT-LLM MHA, ordinary decoding, and 800-token sampled outputs, the fused selector measured the following mean output throughput over three repetitions per cell:
 
 | Node | Concurrency | Watermark off | Watermark on | Change |
 | --- | ---: | ---: | ---: | ---: |
@@ -352,11 +377,8 @@ measured the following mean output throughput over three repetitions per cell:
 | B300 | 1 | 258.84 token/s | 247.69 token/s | -4.31% |
 | B300 | 8, per stream | 196.26 token/s | 182.04 token/s | -7.24% |
 
-These measurements describe one model, GPU, sampling configuration, and output
-length. Benchmark your deployment before setting capacity targets.
+These measurements describe one model, GPU, sampling configuration, and output length. Benchmark your deployment before setting capacity targets. Finite-top-k selector latency at batch size one is also hardware-dependent: in one microbenchmark shape (`top_k=20`), the fast path was 58.8% slower than a full sort on H200 with bfloat16 logits and 6.4% faster on GB300 with float32 logits, and at batch size eight it was faster on both.
 
-Finite-top-k selector latency at batch size one is hardware-dependent. In the
-same microbenchmark shape (`top_k=20`), the fast path was 58.8% slower than full
-sort on H200 with bfloat16 logits and 6.4% faster on GB300 with float32 logits;
-at batch size eight it was faster on both. Deployments sensitive to single-
-request latency should benchmark their GPU and logit dtype.
+## See also
+
+The fused Triton selector is adapted from Meta's Apache-2.0 [TextSeal](https://github.com/facebookresearch/textseal) implementation and re-implemented on the hash contract above, so detection follows this page rather than TextSeal's own tooling.
