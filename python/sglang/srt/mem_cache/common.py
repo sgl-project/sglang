@@ -154,7 +154,8 @@ def free_kv_row_segments(
 
 
 def maybe_cache_unfinished_req(req: Req, tree_cache: BasePrefixCache, **kwargs):
-    if getattr(req, "skip_radix_cache_insert", False):
+    # `skip_radix_cache_insert` keeps synthetic (fake-prefill / warmup) traffic
+    if not kwargs.get("chunked") and getattr(req, "skip_radix_cache_insert", False):
         return
 
     tree_cache.cache_unfinished_req(req, **kwargs)
