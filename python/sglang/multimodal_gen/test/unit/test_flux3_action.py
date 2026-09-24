@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
+import functools
 import json
 from types import SimpleNamespace
 
@@ -26,6 +27,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.f
     cosmos_unipc,
     denormalize,
     euler,
+    make_cosmos_unipc_scheduler,
     normalize,
     pack_action,
     pack_video,
@@ -349,24 +351,35 @@ def test_position_ids_follow_the_10ms_clock():
 
 
 # ---------------------------------------------------------------- samplers
-def test_cosmos_unipc_feeds_reference_ticks():
-    """DROID recipe (4 steps, shift 5): the reference model sees ticks 999, 937, 833, 624."""
-    seen = []
-    cosmos_unipc(
-        {"a": torch.zeros(1, 3, 2)},
-        lambda samples, t: (seen.append(round(t * 1000)), {"a": torch.zeros(1, 3, 2)})[
-            1
-        ],
-        n_steps=4,
-        shift=5.0,
-    )
-    assert seen == [999, 937, 833, 624]
+def test_cosmos_unipc_feeds_reference_ticks_and_reuses_the_scheduler():
+    """DROID recipe (4 steps, shift 5): the model sees ticks 999, 937, 833, 624,
+    and the pipeline's scheduler module is not consumed by a request."""
+    scheduler = make_cosmos_unipc_scheduler()
+    for _ in range(2):
+        seen = []
+        cosmos_unipc(
+            {"a": torch.zeros(1, 3, 2)},
+            lambda samples, t: (
+                seen.append(round(t * 1000)),
+                {"a": torch.zeros(1, 3, 2)},
+            )[1],
+            scheduler=scheduler,
+            n_steps=4,
+            shift=5.0,
+        )
+        assert seen == [999, 937, 833, 624]
 
 
 @pytest.mark.parametrize(
     "sampler, sigma_max",
     # UniPC starts at the shifted 0.999: 5 * 0.999 / (1 + 4 * 0.999)
-    [(cosmos_unipc, 5 * 0.999 / (1 + 4 * 0.999)), (euler, 1.0)],
+    [
+        (
+            functools.partial(cosmos_unipc, scheduler=make_cosmos_unipc_scheduler()),
+            5 * 0.999 / (1 + 4 * 0.999),
+        ),
+        (euler, 1.0),
+    ],
 )
 def test_samplers_recover_x0_on_a_straight_flow(sampler, sigma_max):
     """Exact velocities on a straight flow must land on x0 (solver bookkeeping is consistent)."""

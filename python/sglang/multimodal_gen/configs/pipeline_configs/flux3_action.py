@@ -300,6 +300,8 @@ class Flux3ActionPipelineConfig(PipelineConfig):
         self.normalization_clip = float(config.get("normalization_clip", 6.0))
         self.inference_profile = profile
         self.sampler = config.get("sampler") or "cosmos_unipc"
+        if self.sampler not in ("cosmos_unipc", "euler"):
+            raise ValueError(f"unknown sampler {self.sampler!r}")
         self.default_num_inference_steps = int(config.get("num_inference_steps") or 4)
         self.guidance_scale = float(
             1.0 if config.get("guidance_scale") is None else config["guidance_scale"]

@@ -37,6 +37,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.f
     Flux3ActionConditioningStage,
     Flux3ActionDenoisingStage,
     Flux3ActionPreprocessStage,
+    make_cosmos_unipc_scheduler,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.vla import (
     VLAActionPostprocessStage,
@@ -93,6 +94,7 @@ class Flux3ActionPipeline(ComposedPipelineBase):
         for name, module in modules.items():
             module.requires_grad_(False).eval()
             self.memory_usages[name] = get_memory_usage_of_component(module)
+        modules["scheduler"] = make_cosmos_unipc_scheduler()
         return modules
 
     @staticmethod
@@ -168,7 +170,10 @@ class Flux3ActionPipeline(ComposedPipelineBase):
             "flux3_action_conditioning",
         )
         self.add_stage(
-            Flux3ActionDenoisingStage(config, transformer), "flux3_action_denoise"
+            Flux3ActionDenoisingStage(
+                config, transformer, scheduler=self.get_module("scheduler")
+            ),
+            "flux3_action_denoise",
         )
         self.add_stage(VLAActionPostprocessStage(), "flux3_action_postprocess")
 

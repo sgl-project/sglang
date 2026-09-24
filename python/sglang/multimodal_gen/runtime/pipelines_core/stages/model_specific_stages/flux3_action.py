@@ -381,17 +381,14 @@ def euler(
     return samples
 
 
-def cosmos_unipc(
-    samples: Samples, predict: Predictor, *, n_steps: int, shift: float
-) -> Samples:
-    """Cosmos UniPC: order 2, bh2, predict-x0, one scheduler state per stream.
+def make_cosmos_unipc_scheduler() -> FlowUniPCMultistepScheduler:
+    """The Cosmos UniPC solver of the reference: order 2, bh2, predict-x0.
 
-    The schedule shift is applied in ``set_timesteps`` only (``shift=1.0`` at
-    construction), giving the reference grid ``linspace(0.999, 0, N + 1)``
-    shifted and truncated to integer ticks.
+    The schedule shift is applied in ``set_timesteps`` only (``shift=1.0``
+    here), giving the reference grid ``linspace(0.999, 0, N + 1)`` shifted and
+    truncated to integer ticks.
     """
-    device = next(iter(samples.values())).device
-    template = FlowUniPCMultistepScheduler(
+    return FlowUniPCMultistepScheduler(
         solver_order=2,
         solver_type="bh2",
         predict_x0=True,
@@ -399,12 +396,24 @@ def cosmos_unipc(
         final_sigmas_type="zero",
         shift=1.0,
     )
-    template.set_timesteps(n_steps, device=device, shift=shift)
-    schedulers = {k: copy.deepcopy(template) for k in samples}
-    for scheduler in schedulers.values():
+
+
+def cosmos_unipc(
+    samples: Samples,
+    predict: Predictor,
+    *,
+    scheduler: FlowUniPCMultistepScheduler,
+    n_steps: int,
+    shift: float,
+) -> Samples:
+    """Solve with a private copy of ``scheduler`` per stream (UniPC keeps per-stream history)."""
+    device = next(iter(samples.values())).device
+    schedulers = {k: copy.deepcopy(scheduler) for k in samples}
+    for stream_scheduler in schedulers.values():
+        stream_scheduler.set_timesteps(n_steps, device=device, shift=shift)
         # Ticks can repeat at high step counts; index by step, not by tick.
-        scheduler.set_begin_index(0)
-    for tick in template.timesteps:
+        stream_scheduler.set_begin_index(0)
+    for tick in next(iter(schedulers.values())).timesteps:
         # The reference feeds float32(tick) / 1000 to the model.
         t = torch.tensor(float(tick), dtype=torch.float32) / NUM_TRAIN_TIMESTEPS
         velocity = predict(samples, t.item())
@@ -413,9 +422,6 @@ def cosmos_unipc(
             for k in samples
         }
     return samples
-
-
-_SAMPLERS = {"cosmos_unipc": cosmos_unipc, "euler": euler}
 
 
 # ---------------------------------------------------------------- stages
@@ -572,11 +578,15 @@ class Flux3ActionDenoisingStage(PipelineStage):
     """Joint video + action flow matching from noise; stores the action chunk."""
 
     def __init__(
-        self, config: Flux3ActionPipelineConfig, transformer: Flux3Transformer
+        self,
+        config: Flux3ActionPipelineConfig,
+        transformer: Flux3Transformer,
+        scheduler: FlowUniPCMultistepScheduler,
     ):
         super().__init__()
         self.config = config
         self.transformer = transformer
+        self.scheduler = scheduler
 
     def _noised_streams(self, seed: int):
         cfg = self.config
@@ -653,8 +663,16 @@ class Flux3ActionDenoisingStage(PipelineStage):
                 for k in order
             }
 
-        sampler = _SAMPLERS[cfg.sampler]
-        result = sampler(samples, predict, n_steps=steps, shift=cfg.sampler_shift)
+        if cfg.sampler == "cosmos_unipc":
+            result = cosmos_unipc(
+                samples,
+                predict,
+                scheduler=self.scheduler,
+                n_steps=steps,
+                shift=cfg.sampler_shift,
+            )
+        else:
+            result = euler(samples, predict, n_steps=steps, shift=cfg.sampler_shift)
         targets = result[cfg.action_modality][0].float() / cfg.action_scale
         actions = targets_to_actions(
             targets, state=observation.state.to(device), config=cfg
