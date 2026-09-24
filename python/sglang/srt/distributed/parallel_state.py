@@ -3060,9 +3060,8 @@ def patch_tensor_parallel_group(tp_group: GroupCoordinator, *, owns_attention: b
     global _TP_STATE_PATCHED
     assert not _TP_STATE_PATCHED, "Should not call when it's already patched"
 
-    # The batch a draft forwards still carries the DP sync the target gathered;
-    # the narrowed ranks cannot recover this process's slot in it, so take it
-    # before narrowing. Reads config and stamps only, not _TP.
+    # A draft forwards the target's DP sync, and the narrowed ranks cannot recover
+    # this process's slot in it; read it before narrowing (config only, not _TP).
     dp_flags = get_flags().dp
     saved_gather_slot = dp_flags.scoped_gather_slot
     scoped_gather_slot = saved_gather_slot

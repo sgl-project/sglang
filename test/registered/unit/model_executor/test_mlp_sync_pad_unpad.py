@@ -235,9 +235,6 @@ class TestMlpSyncPadUnpad(CustomTestCase):
 
 
 class TestDraftScopeMlpSync(CustomTestCase):
-    """A draft that owns its attention pads its extend to its own DP rank's
-    token count, with mm_input_embeds padded alongside input_ids."""
-
     SLOT = 2
     HIDDEN = 8
 
@@ -296,15 +293,17 @@ class TestDraftScopeMlpSync(CustomTestCase):
         self.assertEqual(tuple(fb.mm_input_embeds.shape), (rows, self.HIDDEN))
 
     def test_extend_keeps_its_own_rank_count(self):
+        """A draft extend pads to its own DP rank's token count, not rank 0's."""
         fb = self._sync_in_draft_scope([9, 5, 6, 4])
         self.assertEqual(fb.global_num_tokens_cpu, [9, 5, 6, 4])
-        self._assert_token_rows(fb, 6)
+        self._assert_token_rows(fb, rows=6)
 
     def test_max_len_extend_pads_mm_input_embeds(self):
+        """A MAX_LEN-padded extend pads mm_input_embeds along with input_ids."""
         with get_flags().dp.override(max_len_with_idle=True):
             fb = self._sync_in_draft_scope([9, 0, 6, 4])
         self.assertEqual(fb.global_num_tokens_cpu, [9, 9, 9, 9])
-        self._assert_token_rows(fb, 9)
+        self._assert_token_rows(fb, rows=9)
         torch.testing.assert_close(fb.mm_input_embeds[6:], torch.zeros(3, self.HIDDEN))
 
 

@@ -79,7 +79,8 @@ def dp_gather_slot() -> int:
     """Return this process's index in the DP gather.
 
     After elastic scale-up, use the TP rank plus the join offset; otherwise
-    use the attention-DP rank.
+    use the attention-DP rank. Inside a draft scope that owns its attention,
+    it is still the slot in the target's gather (see patch_tensor_parallel_group).
     """
     scoped = get_flags().dp.scoped_gather_slot
     if scoped is not None:

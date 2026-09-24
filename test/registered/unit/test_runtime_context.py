@@ -2831,8 +2831,8 @@ class TestWhoAnswersDuringADraftScope(CustomTestCase):
                 self.assertEqual(parallel.dp_size, 2)
 
     def test_a_narrowed_draft_still_indexes_the_targets_dp_sync(self):
-        # The draft forwards a batch whose global_num_tokens the target
-        # gathered, so indexing it must use the target's width and slot.
+        """A draft scope that owns its attention answers the DP gather width and
+        slot of the target's sync, and stops answering once the scope exits."""
         from sglang.srt.distributed import parallel_state
         from sglang.srt.layers.dp_attention import dp_gather_slot, dp_gather_width
 
