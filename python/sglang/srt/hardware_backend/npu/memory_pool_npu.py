@@ -904,6 +904,21 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             [buffer[0].nbytes for buffer in transfer_views],
         )
 
+    def get_dcp_remote_decode_layout(self) -> list[bool]:
+        """Whether each PD entry uses allocator-global slots on decode."""
+        target_global = self.is_draft_worker
+        layout = [target_global] * self.layer_num
+        if not getattr(self, "dsa_kv_cache_store_fp8", False):
+            layout.extend([target_global] * self.layer_num)
+        if self.index_head_dim is not None:
+            layout.extend([True] * self.num_indexer_layers)
+            if self.index_k_scale_buffer is not None:
+                layout.extend([True] * self.num_indexer_layers)
+
+        if len(layout) != len(self.get_contiguous_buf_infos()[0]):
+            raise RuntimeError("NPU MLA DCP layout does not match its transfer buffers")
+        return layout
+
     def get_kv_layer_ids(self):
         return (
             list(range(self.start_layer, self.start_layer + self.layer_num)) * 2
