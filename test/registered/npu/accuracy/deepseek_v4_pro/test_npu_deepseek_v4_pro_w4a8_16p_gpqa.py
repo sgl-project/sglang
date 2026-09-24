@@ -91,7 +91,6 @@ DEEPSEEK_V4_PRO_W4A8_8P_OTHER_ARGS = [
     "--deepep-mode",
     "auto",
     "--enable-metrics",
-    # "--disable-radix-cache",
     # DSPARK speculative decoding with the bundled draft weights.
     "--speculative-algorithm",
     "DSPARK",
@@ -118,11 +117,7 @@ DEEPSEEK_V4_PRO_W4A8_GENERATION_CONFIG_HIGH = {
 
 
 class TestNPUDeepSeekV4ProW4A88PGPQAHigh(TestNpuAccuracyTestCaseBase):
-    """Test NPU accuracy for DeepSeek-V4-Pro-0813 W4A8 16p GPQA High mode.
-
-    Requirement: aligned with dsv4_pro_2mix-without-dspark.sh
-    (single-node, radix cache off).
-    """
+    """Test NPU accuracy for DeepSeek-V4-Pro-0813 W4A8 16p GPQA High mode."""
 
     benchmark_tool = BENCHMARK_TOOL_DEFAULT
     model = DEEPSEEK_V4_PRO_0813_W4A8_MODEL_PATH
