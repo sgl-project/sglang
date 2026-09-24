@@ -226,11 +226,11 @@ class SWAComponent(TreeComponent):
     def _unified_allocator(self):
         """The unified SWA composite, or None when running on the static pool."""
         from sglang.srt.mem_cache.allocator.unified_hybrid_swa import (
-            UnifiedSWATokenToKVPoolAllocator,
+            UnifiedSWAAllocatorBase,
         )
 
         allocator = self.cache.token_to_kv_pool_allocator
-        if isinstance(allocator, UnifiedSWATokenToKVPoolAllocator):
+        if isinstance(allocator, UnifiedSWAAllocatorBase):
             return allocator
         return None
 
@@ -751,6 +751,8 @@ class SWAComponent(TreeComponent):
             return x.id
         if not enabled:
             x_next = lru.get_prev_no_lock(x)
+        # write_back: demote the SWA KV to host before the internal tombstone.
+        self._maybe_backup_node_before_swa_tombstone(x)
         self.tree_core._evict_component_and_detach_lru(
             x,
             self,
@@ -764,6 +766,45 @@ class SWAComponent(TreeComponent):
         )
         self._evict_device_cursor = lru.cursor_next() if enabled else x_next
         return None
+
+    def _maybe_backup_node_before_swa_tombstone(self, node: UnifiedTreeNode) -> None:
+        """Demote an internal node's SWA KV to host before its tombstone
+        (write_back only), mirroring the leaf deferred-demote path.
+
+        The match validator treats an unbacked tombstone as a window reset,
+        so a dropped internal SWA segment caps the match frontier until a
+        full sliding window re-accumulates below it, leaving up to one
+        window of still-resident KV unservable. The leaf backup walk covers
+        ancestors only within one window of the evicted leaf, so an
+        internal node whose child spans the window arrives here unbacked.
+        Best-effort: this walk must make progress (it satisfies an imminent
+        allocation), so any failure falls back to the legacy drop.
+        """
+        cache = self.cache
+        cd = node.component_data[self.component_type]
+        if (
+            cache.cache_controller is None
+            or not cache.is_write_back
+            or not self.tree_core.has_swa_host_pool
+            or cd.host_value is not None
+            or node.backuped
+            or node.component_data[BASE_COMPONENT_TYPE].value is None
+        ):
+            return
+        # The backup executor pre-evicts only the KV host pool; make room
+        # in the SWA host pool the way the PREFETCH hook does.
+        needed = sum(
+            len(n.component_data[self.component_type].value)
+            for n in self._collect_unbacked_swa_nodes(node)
+        )
+        if needed == 0:
+            return
+        if (
+            self._swa_kv_pool_host is not None
+            and self._swa_kv_pool_host.available_size() < needed
+        ):
+            cache.evict_host(needed, self.component_type)
+        cache.backup_node_for_write_back(node.id)
 
     def _evict_device_end(self) -> None:
         """Clear the device-eviction walk cursor state."""
@@ -1007,28 +1048,23 @@ class SWAComponent(TreeComponent):
         prefetch_pages = prefetch_tokens // self.cache.page_size
         if prefetch_pages >= sw_pages:
             num_pages = sw_pages
-        elif prefetch_pages <= 0:
-            return PreparePrefetchResult()
-        elif (
-            self.tree_core.is_root(node_id) or self.tree_core.is_host_memory_buffer_only
-        ):
-            # Sub-window fetch: at root the sequence IS its window; mid-tree
-            # (buffer mode) the window head is the device prefix's own ring
-            # state, so only the suffix needs fetching.
+        elif prefetch_pages > 0 and self.tree_core.is_root(node_id):
+            # At root the sequence is shorter than the window, so its whole
+            # SWA is the window -- complete, not a partial fetch.
             num_pages = prefetch_pages
         else:
-            # Cache-mode graft: a mid-tree window head is not
-            # device-guaranteed, require a full window.
+            # Mid-tree short span: the window head would have to come from the
+            # device prefix, which the match validator does not promise.
             return PreparePrefetchResult()
-        num_tokens = num_pages * self.cache.page_size
-        host_indices = self.cache.host_pool_group.alloc(
-            num_tokens,
-            pool=PoolName.SWA,
-            reclaim=lambda size: self.cache.evict_host(size, ComponentType.SWA),
-        )
+        return PreparePrefetchResult(staging_tokens=num_pages * self.cache.page_size)
+
+    def alloc_prefetch_staging(self, num_tokens: int) -> Optional[torch.Tensor]:
+        assert self._swa_kv_pool_host is not None
+        host_indices = self._swa_kv_pool_host.alloc(num_tokens)
         if host_indices is None:
-            return PreparePrefetchResult(alloc_failed=True)
-        return PreparePrefetchResult(host_indices=host_indices)
+            self.cache.evict_host(num_tokens, ComponentType.SWA)
+            host_indices = self._swa_kv_pool_host.alloc(num_tokens)
+        return host_indices
 
     def build_hicache_transfers(
         self,
@@ -1039,6 +1075,7 @@ class SWAComponent(TreeComponent):
         host_indices: Optional[torch.Tensor] = None,
         token_ids: Optional[Sequence[int]] = None,
         prefetch_tokens: int = 0,
+        staging_tokens: int = 0,
         last_hash: Optional[str] = None,
     ) -> Optional[list[PoolTransfer]]:
         ct = self.component_type
@@ -1055,8 +1092,19 @@ class SWAComponent(TreeComponent):
             return [
                 PoolTransfer(
                     name=PoolName.SWA,
-                    device_indices=torch.cat(
-                        [n.component_data[ct].value for n in unbacked_swa_nodes]
+                    device_indices=(
+                        self._translate_full_to_swa(
+                            torch.cat(
+                                [
+                                    n.component_data[BASE_COMPONENT_TYPE].value
+                                    for n in unbacked_swa_nodes
+                                ]
+                            )
+                        )
+                        if self._unified_allocator() is not None
+                        else torch.cat(
+                            [n.component_data[ct].value for n in unbacked_swa_nodes]
+                        )
                     ).to(torch.int64),
                     nodes_to_load=[n.id for n in unbacked_swa_nodes],
                 )
@@ -1116,14 +1164,14 @@ class SWAComponent(TreeComponent):
             ]
 
         if phase == CacheTransferPhase.PREFETCH:
-            assert host_indices is not None
-            # Keys are unknowable at build time; placeholders carry the
-            # count, _sync_trailing_keys fills the real trailing hashes.
-            num_pages = host_indices.numel() // self.tree_core.page_size
+            # Staging is allocated once the hit is known; the placeholders carry
+            # the planned page count and _sync_trailing_keys fills the real hashes.
+            num_pages = staging_tokens // self.tree_core.page_size
+            if num_pages == 0:
+                return None
             return [
                 PoolTransfer(
                     name=PoolName.SWA,
-                    host_indices=host_indices,
                     keys=["__placeholder__"] * num_pages,
                     hit_policy=PoolHitPolicy.TRAILING_PAGES,
                 )

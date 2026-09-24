@@ -14,7 +14,6 @@ from transformers import PretrainedConfig
 
 from sglang.kernels.ops.attention.utils import concat_and_cast_mha_k_triton
 from sglang.srt.distributed import (
-    get_pp_group,
     tensor_model_parallel_all_reduce,
 )
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
@@ -36,7 +35,7 @@ from sglang.srt.layers.linear import (
     RowParallelLinear,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor, LogitsProcessorOutput
-from sglang.srt.layers.moe import should_skip_post_experts_all_reduce
+from sglang.srt.layers.moe import reduce_moe_output
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.topk import TopK
@@ -63,7 +62,6 @@ from sglang.srt.models.deepseek_common.attention_forward_methods.forward_mha imp
 from sglang.srt.runtime_context import (
     attention_backends,
     get_exec,
-    get_forward,
     get_memory,
     get_model,
     get_parallel,
@@ -370,10 +368,7 @@ class SarvamMoESparseMoeBlock(nn.Module):
                 final_hidden_states = final_hidden_states * self.routed_scaling_factor
         current_stream.wait_stream(self.alt_stream)
         final_hidden_states = final_hidden_states + shared_out
-        if self.tp_size > 1 and not should_skip_post_experts_all_reduce(
-            is_tp_path=True,
-        ):
-            final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
+        final_hidden_states = reduce_moe_output(final_hidden_states)
         return final_hidden_states.view(num_tokens, hidden_dim)
 
     def forward_normal(
@@ -408,10 +403,7 @@ class SarvamMoESparseMoeBlock(nn.Module):
         elif self.routed_scaling_factor != 1.0:
             final_hidden_states = final_hidden_states * self.routed_scaling_factor
 
-        if self.tp_size > 1 and not should_skip_post_experts_all_reduce(
-            is_tp_path=True,
-        ):
-            final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
+        final_hidden_states = reduce_moe_output(final_hidden_states)
 
         return final_hidden_states.view(num_tokens, hidden_dim)
 
@@ -1090,32 +1082,16 @@ class SarvamMoEMLADecoderLayer(nn.Module):
         hidden_states, residual = self.layer_communicator.prepare_mlp(
             hidden_states, residual, forward_batch
         )
-        fuse_mlp_allreduce = (
-            self.layer_communicator.should_fuse_mlp_allreduce_with_next_layer(
-                forward_batch
-            )
-        )
-        mlp_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
-            forward_batch
-        )
-        with get_forward().scoped(
-            fuse_mlp_allreduce=fuse_mlp_allreduce,
-            mlp_reduce_scatter=mlp_reduce_scatter,
-        ):
+        with self.layer_communicator.ffn_exit(forward_batch) as ffn_exit:
             hidden_states = self.mlp(hidden_states, forward_batch)
         if (
             not self.is_layer_sparse
             and self.attn_tp_size > 1
-            and not mlp_reduce_scatter
-            and not fuse_mlp_allreduce
+            and not ffn_exit.mlp_reduce_scatter
+            and not ffn_exit.fuse_mlp_allreduce
         ):
             hidden_states = tensor_model_parallel_all_reduce(hidden_states)
-        if fuse_mlp_allreduce:
-            hidden_states._sglang_needs_allreduce_fusion = True
-        else:
-            hidden_states, residual = self.layer_communicator.postprocess_layer(
-                hidden_states, residual, forward_batch
-            )
+        hidden_states, residual = ffn_exit.finish(hidden_states, residual)
         return hidden_states, residual
 
 
@@ -1130,7 +1106,7 @@ class SarvamMLAModel(nn.Module):
         self.config = config
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
         self.alt_stream = get_stream("alt") if _is_cuda else None
 
         if self.pp_group.is_first_rank:
@@ -1188,6 +1164,10 @@ class SarvamMLAModel(nn.Module):
                 positions, hidden_states, forward_batch, residual
             )
 
+        last_layer = self.layers[self.end_layer - 1]
+        hidden_states, residual = last_layer.layer_communicator.finish_layer_stack(
+            hidden_states, residual, forward_batch
+        )
         if not self.pp_group.is_last_rank:
             return PPProxyTensors(
                 {"hidden_states": hidden_states, "residual": residual}
@@ -1211,7 +1191,7 @@ class SarvamMLAForCausalLM(nn.Module):
     ) -> None:
         super().__init__()
         self._remap_config(config)
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
         self.config = config
         self.quant_config = quant_config
         self.model = SarvamMLAModel(config, quant_config, add_prefix("model", prefix))

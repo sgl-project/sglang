@@ -5,14 +5,16 @@ import torch.nn.functional as F
 from torch import nn
 
 from sglang.srt.distributed import (
-    get_pp_group,
     tensor_model_parallel_all_reduce,
 )
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.layers.activation import SiluAndMul
-from sglang.srt.layers.communicator import LayerCommunicator, LayerScatterModes
+from sglang.srt.layers.communicator import (
+    LayerCommunicator,
+    LayerScatterModes,
+)
 from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
@@ -27,7 +29,7 @@ from sglang.srt.layers.linear import (
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe import (
     get_moe_a2a_backend,
-    should_skip_post_experts_all_reduce,
+    reduce_moe_output,
 )
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
@@ -223,10 +225,7 @@ class Step3p5MoEMLP(nn.Module):
                 router_logits=topk_output.router_logits,
             )
         final_hidden_states = self.experts(hidden_states, topk_output)
-        if self.tp_size > 1 and not should_skip_post_experts_all_reduce(
-            is_tp_path=True,
-        ):
-            final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
+        final_hidden_states = reduce_moe_output(final_hidden_states)
 
         return final_hidden_states.view(num_tokens, hidden_dim)
 
@@ -239,7 +238,7 @@ class Step3p5MoEMLP(nn.Module):
             topk_output = self.topk(
                 hidden_states,
                 router_logits,
-                num_token_non_padded=forward_batch.num_token_non_padded,
+                num_token_non_padded=forward_batch.moe_num_token_non_padded(),
                 expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
                     layer_id=self.layer_id,
                 ),
@@ -271,7 +270,7 @@ class Step3p5MoEMLP(nn.Module):
                 state.topk_output = self.topk(
                     hidden_states=hidden_states,
                     router_logits=router_logits,
-                    num_token_non_padded=state.forward_batch.num_token_non_padded,
+                    num_token_non_padded=state.forward_batch.moe_num_token_non_padded(),
                     expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
                         layer_id=self.layer_id,
                     ),
@@ -465,6 +464,7 @@ class Step3p5DecoderLayer(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
         alt_stream: Optional[torch.cuda.Stream] = None,
+        is_nextn: bool = False,
     ) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
@@ -576,7 +576,7 @@ class Step3p5DecoderLayer(nn.Module):
             input_layernorm=self.input_layernorm,
             post_attention_layernorm=self.post_attention_layernorm,
             allow_reduce_scatter=True,
-            is_last_layer=(layer_id == config.num_hidden_layers - 1),
+            is_last_layer=(is_nextn or layer_id == config.num_hidden_layers - 1),
         )
 
         self.layer_id = layer_id
@@ -633,10 +633,12 @@ class Step3p5DecoderLayer(nn.Module):
             if not fuse_mlp_allreduce and not mlp_reduce_scatter:
                 hidden_states = tensor_model_parallel_all_reduce(hidden_states)
         else:
-            hidden_states = self.mlp(hidden_states)
-            # Dense MLP uses reduce_results=True, so the output is already
-            # all-reduced.  Do NOT set the fusion flag — otherwise the next
-            # layer would all-reduce again, multiplying values by world_size.
+            # The dense MLP all-reduces its own output unless postprocess
+            # reduce-scatters it; it never leaves the sum to the next layer.
+            with get_forward().scoped(
+                fuse_mlp_allreduce=False, mlp_reduce_scatter=mlp_reduce_scatter
+            ):
+                hidden_states = self.mlp(hidden_states)
             fuse_mlp_allreduce = False
 
         if fuse_mlp_allreduce:
@@ -658,7 +660,7 @@ class Step3p5Model(nn.Module):
         super().__init__()
         self.config = config
         self.vocab_size = config.vocab_size
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
 
         alt_stream = get_stream("alt") if _is_cuda else None
 
@@ -734,6 +736,10 @@ class Step3p5Model(nn.Module):
                 residual,
             )
             # break
+        last_layer = self.layers[self.end_layer - 1]
+        hidden_states, residual = last_layer.layer_communicator.finish_layer_stack(
+            hidden_states, residual, forward_batch
+        )
         if not self.pp_group.is_last_rank:
             return PPProxyTensors(
                 {
@@ -797,7 +803,7 @@ class Step3p5ForCausalLM(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
         self.config = config
         self.quant_config = quant_config
         self.model = Step3p5Model(
