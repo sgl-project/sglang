@@ -2143,11 +2143,16 @@ class DeepseekV4AscendAttnBackend(
                             and fm.start_pos.numel()
                             else -1
                         )
+                        _swaf_lo = int(os.environ.get("DSV4_DUMP_MIN_POS", "17523"))
+                        _swaf_hi = int(os.environ.get("DSV4_DUMP_MAX_POS", "17530"))
+                        _swaf_at = int(os.environ.get("DSV4_DUMP_SWA_FIXED_AT", "16384"))
                         if (
                             os.environ.get("DSV4_DUMP_SWA_FIXED")
-                            and _swaf_pos
-                            >= int(os.environ.get("DSV4_DUMP_SWA_FIXED_MIN_POS", "16384"))
-                            and getattr(self, "_swaf_printed", 0) < 8
+                            and (
+                                _swaf_pos == _swaf_at
+                                or _swaf_lo <= _swaf_pos <= _swaf_hi
+                            )
+                            and getattr(self, "_swaf_printed", 0) < 64
                         ):
                             try:
                                 f_lo = int(os.environ.get("DSV4_DUMP_SWA_FIXED_LO", "16256"))
