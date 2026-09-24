@@ -139,9 +139,6 @@ _MHC_POST_MULT_VALUE = 2.0
 _MHC_FUSED_BOUNDARY_MAX_TOKENS = 16
 
 
-#: How many missing names to name in the log line before summarising the rest.
-#: Enough to identify which modules were skipped without printing hundreds of
-#: lines when a whole tower is missing.
 _UNLOADED_REPORT_LIMIT = 12
 
 
@@ -151,33 +148,7 @@ def report_unloaded_params(
     *,
     model_label: str = "Glm5Next",
 ) -> List[str]:
-    """Warn about parameters ``load_weights`` never populated.
-
-    ``load_weights`` skips any checkpoint tensor whose rewritten name misses
-    ``params_dict``, which is the right behaviour for a tensor this model does
-    not own but indistinguishable from a checkpoint whose names this loader was
-    not written against. In the latter case the module keeps its initialised
-    values and the server starts on a partly-random model: it logs that it is
-    ready, answers ``/health`` with 200, and generates noise.
-
-    That happened on GLM-5.3-Flash checkpoints written by ``save_pretrained``
-    (sgl-project/sglang#38618): 524 of 1609 tensors -- 304.4B parameters, 97% of
-    a 628 GB file -- were dropped with no warning, no traceback and no non-zero
-    exit. The only tell was a load time of 3.85 s where a complete load takes
-    139.84 s, which nobody is watching.
-
-    Returned as well as logged so a caller or a test can assert on it.
-
-    Args:
-        param_names: Every parameter the model declares, i.e.
-            ``params_dict.keys()`` as captured before the load.
-        loaded_params: The names ``load_weights`` actually wrote.
-        model_label: Name to print, so a nextn or encoder-only pass is
-            distinguishable in a log.
-
-    Returns:
-        The sorted missing names, empty when the load was complete.
-    """
+    """Warn about parameters ``load_weights`` never populated and return them."""
     missing = sorted(set(param_names) - set(loaded_params))
     if not missing:
         return []
@@ -197,14 +168,8 @@ def report_unloaded_params(
     return missing
 
 
-# transformers renames GLM-5.3-Flash tensors while loading the released
-# checkpoint (`conversion_mapping.py`, entry "glm5_next") and never reverses
-# that on save, so anything written by `save_pretrained` -- a fine-tune, a
-# merged adapter, a bf16 re-export -- carries transformers module names rather
-# than the released ones the loader below is written against. Those names miss
-# `params_dict` and the tensors are dropped without an error, which starts the
-# server on a partly-initialised model. Mapping them back here keeps one
-# loading path for both layouts.
+# transformers renames these on load (conversion_mapping.py, "glm5_next") and
+# saves under the new names, so save_pretrained output needs them mapped back.
 _HF_NATIVE_RENAMES = (
     (".self_attn.forget_gate.", ".self_attn."),
     (".attn_hc.fn", ".hc_attn_fn"),
@@ -223,11 +188,7 @@ _HF_PACKED_CONV1D = ".self_attn.conv1d.weight"
 def _split_hf_packed_gate_up(
     name: str, weight: torch.Tensor
 ) -> Iterable[Tuple[str, torch.Tensor]]:
-    """`experts.gate_up_proj` [E, 2I, H] -> per-expert `gate_proj` / `up_proj`.
-
-    transformers stacks the experts on dim 0 and concatenates gate and up on
-    dim 1, in that order, so the halves come back apart the same way.
-    """
+    """`experts.gate_up_proj` [E, 2I, H] -> per-expert `gate_proj` / `up_proj`."""
     if weight.dim() != 3:
         raise ValueError(f"{name}: expected a 3-D packed tensor, got {weight.shape}")
     n_experts, gate_and_up, _ = weight.shape
@@ -254,11 +215,7 @@ def _split_hf_packed_down(
 def _split_hf_packed_conv1d(
     name: str, weight: torch.Tensor
 ) -> Iterable[Tuple[str, torch.Tensor]]:
-    """`self_attn.conv1d.weight` [3P, 1, K] -> `q_conv1d` / `k_conv1d` / `v_conv1d`.
-
-    The singleton dimension is kept: `qkv_conv1d.weight` is unsqueezed after
-    construction, so its shards are [P, 1, K] too.
-    """
+    """`self_attn.conv1d.weight` [3P, 1, K] -> `q/k/v_conv1d` [P, 1, K]."""
     if weight.shape[0] % 3:
         raise ValueError(
             f"{name}: dim 0 is {weight.shape[0]}, which is not three parts"
@@ -271,12 +228,7 @@ def _split_hf_packed_conv1d(
 def convert_hf_native_weights(
     weights: Iterable[Tuple[str, torch.Tensor]],
 ) -> Iterable[Tuple[str, torch.Tensor]]:
-    """Yield weights under released names, whichever layout they arrived in.
-
-    A released checkpoint passes through untouched: every rule keys off a name
-    only transformers produces, and the packed tensors it unpacks do not exist
-    there under any name.
-    """
+    """Yield weights under the released names; released checkpoints pass unchanged."""
     announced = False
     for name, loaded_weight in weights:
         for source, target in _HF_NATIVE_RENAMES:
@@ -1753,9 +1705,6 @@ class Glm5NextForConditionalGeneration(nn.Module):
             return name
 
         weight_names = []
-        # Names actually written below, to be diffed against params_dict once
-        # the load finishes. weight_names above records the CHECKPOINT side and
-        # so cannot answer "did every parameter get a value".
         loaded_params: set[str] = set()
         for name, loaded_weight in convert_hf_native_weights(weights):
             is_visual_weight = "visual" in name
@@ -1910,9 +1859,6 @@ class Glm5NextForConditionalGeneration(nn.Module):
                                     param, "weight_loader", default_weight_loader
                                 )
                                 weight_loader(param, fused_weight)
-                                # The fused parameter is what params_dict
-                                # holds; q_a_proj / kv_a_proj_with_mqa are
-                                # only the checkpoint's halves of it.
                                 loaded_params.add(target)
                             cached_a_proj.pop(q_a_proj_name, None)
                             cached_a_proj.pop(kv_a_proj_name, None)
@@ -1932,10 +1878,6 @@ class Glm5NextForConditionalGeneration(nn.Module):
                     weight_loader(param, loaded_weight)
                     loaded_params.add(name)
 
-        # Only a full load can be checked for completeness. A nextn pass reads
-        # the speculative layers alone, and encoder_only / language_only skip a
-        # whole tower on purpose, so in those modes most of params_dict is
-        # legitimately untouched.
         is_partial_load = (
             is_nextn
             or getattr(self, "encoder_only", False)

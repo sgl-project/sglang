@@ -1,17 +1,4 @@
-"""`load_weights` must say so when it did not fill every parameter.
-
-Skipping a checkpoint tensor whose rewritten name misses `params_dict` is right
-for a tensor this model does not own, and indistinguishable from a checkpoint
-whose names this loader was not written against. In the second case the module
-keeps its initialised values and the server starts on a partly-random model --
-it logs that it is ready, answers /health with 200, and generates noise.
-
-That is sgl-project/sglang#38618: 524 of 1609 tensors, 304.4B parameters, 97% of
-a 628 GB file, dropped with no warning, no traceback and no non-zero exit.
-
-These tests pin `report_unloaded_params`, the part that decides whether anything
-is said at all.
-"""
+"""`load_weights` warns when it did not fill every parameter."""
 
 import logging
 import unittest
@@ -42,7 +29,6 @@ class TestReportUnloadedParams(unittest.TestCase):
             report_unloaded_params(declared, set())
         message = "\n".join(cm.output)
         self.assertIn("5 of 5 parameters were not initialized", message)
-        # The operator has to be able to tell this is not a slow load.
         self.assertIn("not meaningful", message)
 
     def test_a_long_list_is_truncated_but_counted(self):
@@ -54,12 +40,6 @@ class TestReportUnloadedParams(unittest.TestCase):
         self.assertIn(f"+{20} more", message)
 
     def test_extra_loaded_names_are_not_reported(self):
-        """A fused parameter is recorded under the name params_dict holds.
-
-        `q_a_proj` / `kv_a_proj_with_mqa` are the checkpoint's halves of
-        `fused_qkv_a_proj_with_mqa`; recording the fused name must not make the
-        halves look like a surplus or a gap.
-        """
         declared = {"attn.fused_qkv_a_proj_with_mqa.weight"}
         loaded = {
             "attn.fused_qkv_a_proj_with_mqa.weight",
@@ -78,7 +58,6 @@ class TestReportUnloadedParams(unittest.TestCase):
         self.assertEqual(report_unloaded_params(declared, set()), ["a", "b", "c"])
 
     def test_iterables_are_accepted_not_only_sets(self):
-        """params_dict.keys() is a view, and loaded_params is a set."""
         self.assertEqual(report_unloaded_params(["a", "b"], iter(["a"])), ["b"])
 
 

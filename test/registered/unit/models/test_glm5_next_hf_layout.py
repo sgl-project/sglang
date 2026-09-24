@@ -1,14 +1,4 @@
-"""GLM-5.3-Flash checkpoints written by transformers load under released names.
-
-transformers renames GLM-5.3-Flash tensors while reading the released
-checkpoint and does not reverse that on save, so `save_pretrained` output --
-a fine-tune, a merged adapter, a bf16 re-export -- reaches the loader under
-transformers module names. Those names miss `params_dict`, so the MoE, mHC and
-KDA tensors used to be dropped with no error and the server came up on a
-partly-initialised model. These tests pin the mapping in both directions: the
-transformers layout has to arrive as the released one, and the released layout
-has to pass through untouched.
-"""
+"""GLM-5.3-Flash checkpoints written by transformers load under the released names."""
 
 import unittest
 
