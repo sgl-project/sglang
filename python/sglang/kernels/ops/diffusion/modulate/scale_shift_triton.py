@@ -10,6 +10,14 @@ from sglang.kernels.ops.diffusion.common.platform import (
     lazy_fallback,
     select_impl,
 )
+from sglang.srt.utils import is_gfx1250_supported
+
+# gfx1250 only: the ROCm SDK's Triton emits packed v_pk_*_bf16 for
+# bf16 elementwise math, and that op reads an inline float immediate
+# (+-0.5/1/2/4) from the wrong half of the 32-bit word -- as zero -- silently
+# dropping the identity term in ``scale_constant + scale``. tl.full does not
+# help; the splat folds back into the immediate.
+_FP32_MODULATE = is_gfx1250_supported()
 
 
 @triton.jit
@@ -284,6 +292,7 @@ def _fused_scale_shift_4d_kernel(
     seq_len,
     num_frames,
     frame_seqlen,
+    FP32_MODULATE: tl.constexpr,
     BLOCK_N: tl.constexpr,
 ):
     pid_row = tl.program_id(0)
@@ -311,8 +320,14 @@ def _fused_scale_shift_4d_kernel(
     scale = tl.load(scale_ptrs, mask=mask, other=0.0)
     shift = tl.load(shift_ptrs, mask=mask, other=0.0)
 
-    scale_const_tensor = tl.full([BLOCK_N], scale_constant, dtype=scale.dtype)
-    output = normalized * (scale_const_tensor + scale) + shift
+    if FP32_MODULATE:
+        output = normalized.to(tl.float32) * (
+            scale_constant + scale.to(tl.float32)
+        ) + shift.to(tl.float32)
+        output = output.to(out_ptrs.dtype.element_ty)
+    else:
+        scale_const_tensor = tl.full([BLOCK_N], scale_constant, dtype=scale.dtype)
+        output = normalized * (scale_const_tensor + scale) + shift
 
     tl.store(out_ptrs, output, mask=mask)
 
@@ -338,6 +353,7 @@ def fuse_scale_shift_kernel_blc_opt(
     stride_sc_c,
     SCALE_IS_SCALAR: tl.constexpr,
     SHIFT_IS_SCALAR: tl.constexpr,
+    FP32_MODULATE: tl.constexpr,
     BLOCK_L: tl.constexpr,
     BLOCK_C: tl.constexpr,
 ):
@@ -381,7 +397,14 @@ def fuse_scale_shift_kernel_blc_opt(
         )
         scale = tl.load(scale_ptr + sc_off, mask=mask, other=0)
 
-    y = x * (scale_constant + scale) + shift
+    if FP32_MODULATE:
+        y = x.to(tl.float32) * (scale_constant + scale.to(tl.float32)) + shift.to(
+            tl.float32
+        )
+        y = y.to(y_ptr.dtype.element_ty)
+    else:
+        y = x * (scale_constant + scale) + shift
+
     tl.store(y_ptr + x_off, y, mask=mask)
 
 
@@ -448,6 +471,7 @@ def fuse_scale_shift_kernel(
             L,
             num_frames,
             frame_seqlen,
+            FP32_MODULATE=_FP32_MODULATE,
             BLOCK_N=block_n,
             num_warps=num_warps,
         )
@@ -519,6 +543,7 @@ def fuse_scale_shift_kernel(
             s_sc,
             SCALE_IS_SCALAR=need_scale_scalar,
             SHIFT_IS_SCALAR=need_shift_scalar,
+            FP32_MODULATE=_FP32_MODULATE,
             BLOCK_L=block_l,
             BLOCK_C=block_c,
             num_warps=4,
