@@ -84,9 +84,27 @@ def select_kernel(op: str, backend: Optional[KernelBackend] = None) -> KernelSpe
     )
 
 
-@lru_cache(maxsize=None)
-def _resolve(op: str, backend: Optional[KernelBackend]) -> Callable:
-    return select_kernel(op, backend=backend).load()
+class _KernelCache:
+    def __init__(self) -> None:
+        self.kernels: dict[tuple[str, Optional[KernelBackend]], Callable] = {}
+
+
+_kernel_cache = _KernelCache()
+
+
+def _resolve(cache: _KernelCache, op: str, backend: Optional[KernelBackend]) -> None:
+    key = (op, backend)
+    if key not in cache.kernels:
+        cache.kernels[key] = select_kernel(op, backend=backend).load()
+
+
+# Equivalent to torch.compiler.assume_constant_result(_resolve), without
+# importing torch into this metadata-only namespace. Populate the cache at
+# compile time: op/backend and the registry/platform are fixed for a graph.
+# Return None here, then read the callable from the captured cache in get_kernel
+# so Dynamo can guard and trace it normally (a constant-result callable has no
+# guardable source). Tensor operations are never part of this resolver.
+_resolve._dynamo_marked_constant = True
 
 
 def get_kernel(op: str, backend: Optional[KernelBackend] = None) -> Callable:
@@ -95,9 +113,19 @@ def get_kernel(op: str, backend: Optional[KernelBackend] = None) -> Callable:
     This is what the public ``sglang.kernels.ops.*`` wrappers call. The first
     call resolves and imports the backend; later calls hit the cache.
     """
-    return _resolve(op, backend)
+    # Keep one cache generation alive through resolution and lookup, even if
+    # another thread clears the process-wide cache in between.
+    cache = _kernel_cache
+    _resolve(cache, op, backend)
+    return cache.kernels[(op, backend)]
 
 
 def clear_cache() -> None:
-    """Drop the resolved-callable cache (used by tests)."""
-    _resolve.cache_clear()
+    """Drop the resolved-callable cache (used by tests).
+
+    In-flight lookups finish against their captured cache generation. Calls
+    starting after this reset resolve against a fresh cache. Tests changing
+    the registry should also reset Dynamo before recompiling.
+    """
+    global _kernel_cache
+    _kernel_cache = _KernelCache()
