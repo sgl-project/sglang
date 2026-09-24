@@ -1615,7 +1615,8 @@ class KimiK3DeltaAttention(nn.Module):
                 # ROCm only: _merge_kda_inproj_weights_hip() may merge the
                 # whole [q,k,v,g | f_a | b] in-proj instead, making _bfa_w a
                 # tail view of that buffer. _qkvgbfa_sizes is the split of the
-                # buffer, and stays None when the fusion does not apply. These
+                # buffer, and stays None when the fusion does not apply. Quark
+                # FP8 merges into a separate copy and leaves _bfa_w None. These
                 # attributes exist on ROCm only; every reader is _is_hip-gated.
                 self._qkvgbfa_layer: Optional[SimpleNamespace] = None
                 self._qkvgbfa_sizes: Optional[list[int]] = None
@@ -1837,6 +1838,11 @@ class KimiK3DeltaAttention(nn.Module):
             return
         if _is_npu:
             return
+        if _is_hip:
+            from sglang.srt.models.kimi_k3_rocm_quant import _k3_merge_kda_inproj_fp8
+
+            if _k3_merge_kda_inproj_fp8(self):
+                return
         if _is_hip and self._merge_kda_inproj_weights_hip():
             # Split-path f_b GEMM still uses this when the fused in-proj
             # is above the token threshold.
@@ -1934,7 +1940,10 @@ class KimiK3DeltaAttention(nn.Module):
 
             layer = self.attn
             w = layer.conv_weights
-            f_b_weight = self.f_b_proj.weight
+            # Quark FP8 f_b is served from its BF16 copy.
+            f_b_weight = getattr(self, "_bfa_f_b_w", None)
+            if f_b_weight is None:
+                f_b_weight = self.f_b_proj.weight
             backend = os.environ.get("SGLANG_ROCM_K3_KDA_FUSED_BACKEND", "").lower()
             backend_available = (
                 backend == "aiter"
@@ -2024,28 +2033,30 @@ class KimiK3DeltaAttention(nn.Module):
         self, hidden_states: torch.Tensor, defer_f_b: bool = False
     ):
         if self.use_full_rank_gate:
+            if (
+                _is_hip
+                and self._qkvgbfa_sizes is not None
+                and 0 < hidden_states.shape[0] <= self._qkvgbfa_bs_limit
+            ):
+                # ROCm only. One GEMM for the whole in-proj: the [f_a|b]
+                # tail rides the wide projection's bandwidth (~30% of the
+                # in-proj at decode on gfx950, SGLANG_ROCM_K3_FUSE_KDA_INPROJ).
+                fused_states = self.fused_qkvg_proj.quant_method.apply(
+                    self._qkvgbfa_layer, hidden_states, None
+                )
+                qkv, g_proj_states, f_a, beta, _pad = torch.split(
+                    fused_states, self._qkvgbfa_sizes, dim=-1
+                )
+                from sglang.kernels.ops.gemm import kimi_k3_tiny_gemm as gemm
+
+                # Fused KDA decode consumes f_a and applies f_b itself.
+                forget_gate = f_a if defer_f_b else gemm(f_a, self._bfa_f_b_w)
+                return qkv, beta, forget_gate, g_proj_states
+
             if self._bfa_w is not None:
                 w = self._bfa_w
                 n_fa, n_b = self._bfa_fa_size, self._bfa_b_size
                 from sglang.kernels.ops.gemm import kimi_k3_tiny_gemm as gemm
-
-                if (
-                    _is_hip
-                    and self._qkvgbfa_sizes is not None
-                    and 0 < hidden_states.shape[0] <= self._qkvgbfa_bs_limit
-                ):
-                    # ROCm only. One GEMM for the whole in-proj: the [f_a|b]
-                    # tail rides the wide projection's bandwidth (~30% of the
-                    # in-proj at decode on gfx950, SGLANG_ROCM_K3_FUSE_KDA_INPROJ).
-                    fused_states = self.fused_qkvg_proj.quant_method.apply(
-                        self._qkvgbfa_layer, hidden_states, None
-                    )
-                    qkv, g_proj_states, f_a, beta, _pad = torch.split(
-                        fused_states, self._qkvgbfa_sizes, dim=-1
-                    )
-                    # Fused KDA decode consumes f_a and applies f_b itself.
-                    forget_gate = f_a if defer_f_b else gemm(f_a, self._bfa_f_b_w)
-                    return qkv, beta, forget_gate, g_proj_states
 
                 if (
                     self._bfa_alt_stream is not None
