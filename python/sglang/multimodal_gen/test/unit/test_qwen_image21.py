@@ -279,6 +279,10 @@ def test_latent_pack_decode_contract():
     )
 
 
+def test_default_image_output_format_preserves_rgba():
+    assert QwenImage21SamplingParams.default_image_output_format() == "png"
+
+
 @pytest.mark.parametrize("outputs", [1, 2])
 def test_dynamic_batching_preserves_output_order_and_seeds(outputs):
     scheduler = object.__new__(Scheduler)
