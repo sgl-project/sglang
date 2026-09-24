@@ -173,8 +173,10 @@ class _WeightUpdaterManagerTestBase(CustomTestCase):
 
 class TestRecordWeightVersionAfterUpdate(_WeightUpdaterManagerTestBase):
     def test_successful_update_records_the_version(self):
-        """A refit that reports success advances the scheduler-side version."""
-        output = self._manager(_runner()).update_weights_from_disk(_request())
+        """A disk refit runs outside a session and advances the scheduler-side version at once."""
+        output = self._manager(_runner(), session=False).update_weights_from_disk(
+            _request()
+        )
 
         self.assertTrue(output.success)
         self.assertEqual(self.recorded, ["v2"])
