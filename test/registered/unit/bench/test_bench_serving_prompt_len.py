@@ -49,18 +49,25 @@ def _free_port() -> int:
 
 
 class _SSEHandler(BaseHTTPRequestHandler):
-    """Streams one round's chunks, then advances to the next round's script."""
+    """Streams one round's chunks, then advances to the next round's script.
+
+    Like an SGLang server with the default ``stream_response_default_include_usage
+    = False``, it sends the usage-only trailer only when the request sets
+    ``stream_options.include_usage``.
+    """
 
     rounds: list = []
     call_count: int = 0
 
     def do_POST(self):  # noqa: N802 (BaseHTTPRequestHandler interface)
         length = int(self.headers.get("Content-Length", "0"))
-        if length:
-            self.rfile.read(length)
+        body = json.loads(self.rfile.read(length)) if length else {}
+        include_usage = (body.get("stream_options") or {}).get("include_usage")
         chunks = type(self).rounds[
             min(type(self).call_count, len(type(self).rounds) - 1)
         ]
+        if not include_usage:
+            chunks = [c for c in chunks if c.get("choices")]
         type(self).call_count += 1
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
@@ -126,7 +133,7 @@ class TestBenchServingPromptLen(CustomTestCase):
         thread.start()
         return port, server
 
-    def _request(self, port, prompt="hello"):
+    def _request(self, port, prompt="hello", extra_request_body=None):
         return RequestFuncInput(
             prompt=prompt,
             api_url=f"http://127.0.0.1:{port}/v1/chat/completions",
@@ -135,7 +142,7 @@ class TestBenchServingPromptLen(CustomTestCase):
             model="dummy-model",
             lora_name="",
             image_data=None,
-            extra_request_body={},
+            extra_request_body=extra_request_body or {},
         )
 
     def test_streaming_prefers_server_prompt_tokens(self):
@@ -145,9 +152,10 @@ class TestBenchServingPromptLen(CustomTestCase):
 
         port, server = self._serve(Handler)
         try:
-            out = asyncio.run(
-                async_request_openai_chat_completions(self._request(port))
+            req = self._request(
+                port, extra_request_body={"stream_options": {"include_usage": True}}
             )
+            out = asyncio.run(async_request_openai_chat_completions(req))
         finally:
             server.shutdown()
         self.assertTrue(out.success, out.error)
@@ -210,7 +218,8 @@ class TestBenchServingPromptLen(CustomTestCase):
         """The bug itself: three rounds of a growing conversation.
 
         Before the fix every round reported ROW_PROMPT_LEN, so the sum was
-        3 x 9999. It must instead be the three lengths the server reported.
+        3 x 9999. It must instead be the three lengths the server reported --
+        which the stub only sends because the multi-turn wrapper asks for usage.
         """
         per_round = [100, 250, 400]
 

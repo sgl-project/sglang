@@ -1351,6 +1351,12 @@ def wrap_multi_turn_request_func(request_func: Callable, backend: str) -> Callab
             inner_input = replace(
                 copy.deepcopy(request_func_input), prompt=copy.deepcopy(prev_messages)
             )
+            # Each round's prompt length comes from the server's usage block,
+            # which a streamed response only carries when asked for.
+            if not args.disable_stream:
+                inner_input.extra_request_body.setdefault(
+                    "stream_options", {"include_usage": True}
+                )
             output = await request_func(
                 inner_input, pbar=pbar if round_index == len(prompts) - 1 else None
             )
