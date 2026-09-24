@@ -2137,8 +2137,16 @@ class DeepseekV4AscendAttnBackend(
                         )
                         if not os.environ.get("DSV4_DUMP_SWA_FIXED_ONLY"):
                             print(_swkv_line, flush=True)
+                        _swaf_pos = (
+                            int(fm.start_pos.max().item())
+                            if torch.is_tensor(getattr(fm, "start_pos", None))
+                            and fm.start_pos.numel()
+                            else -1
+                        )
                         if (
                             os.environ.get("DSV4_DUMP_SWA_FIXED")
+                            and _swaf_pos
+                            >= int(os.environ.get("DSV4_DUMP_SWA_FIXED_MIN_POS", "16384"))
                             and getattr(self, "_swaf_printed", 0) < 8
                         ):
                             try:
