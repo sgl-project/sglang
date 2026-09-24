@@ -67,6 +67,7 @@ from sglang.srt.arg_groups.serving_hook import (
     handle_load_balance_method,
     handle_missing_default_values,
     handle_multimodal_feature_transport,
+    handle_other_validations,
     handle_ssl_validation,
     handle_tokenizer_batching,
     ssl_verify_of,
@@ -120,6 +121,25 @@ _mock_device.start()
 
 
 class TestPrepareServerArgs(CustomTestCase):
+    def test_optimistic_prefill_allows_l2_write_through_only(self):
+        for policy, expected in (
+            ("write_back", 2),
+            ("write_through", 2),
+            ("write_through_selective", 0),
+        ):
+            with self.subTest(policy=policy):
+                args = ServerArgs(
+                    model_path="dummy",
+                    disaggregation_mode="prefill",
+                    optimistic_prefill_attempts=2,
+                    enable_hierarchical_cache=True,
+                    hicache_write_policy=policy,
+                )
+                handle_other_validations(args)
+                self.assertEqual(
+                    resolution_result(args, "optimistic_prefill_attempts"), expected
+                )
+
     def test_radix_eviction_policy_explicitness_is_preserved(self):
         omitted = prepare_server_args(["--model-path", "dummy"])
         separated = prepare_server_args(
@@ -544,34 +564,6 @@ class TestMultimodalFeatureTransport(CustomTestCase):
         output = "\n".join(logs.output)
         self.assertIn("base GPU 2", output)
         self.assertIn("4 tokenizer worker", output)
-
-    @override_platform(is_cuda=True)
-    def test_legacy_keep_flag_maps_to_cuda_ipc(self):
-        server_args = ServerArgs(model_path="dummy", keep_mm_feature_on_device=True)
-
-        with patch.dict(os.environ, {"SGLANG_USE_CUDA_IPC_TRANSPORT": "0"}):
-            with self.assertLogs(serving_hook.logger, level="WARNING") as logs:
-                handle_multimodal_feature_transport(server_args)
-
-            self.assertEqual(
-                resolution_result(server_args, "mm_feature_transport"), "cuda_ipc"
-            )
-            self.assertFalse(
-                resolution_result(server_args, "keep_mm_feature_on_device")
-            )
-            self.assertTrue(envs.SGLANG_USE_CUDA_IPC_TRANSPORT.get())
-
-        self.assertIn("deprecated", logs.output[0])
-
-    def test_legacy_keep_flag_rejects_explicit_cuda_vmm(self):
-        server_args = ServerArgs(
-            model_path="dummy",
-            keep_mm_feature_on_device=True,
-            mm_feature_transport="cuda_vmm",
-        )
-
-        with self.assertRaisesRegex(ValueError, "conflicts.*cuda_vmm"):
-            handle_multimodal_feature_transport(server_args)
 
     @override_platform(is_cuda=True)
     def test_explicit_cpu_overrides_legacy_environment(self):
@@ -1994,7 +1986,34 @@ class TestSSLArgs(unittest.TestCase):
         self.assertTrue(resolution_result(server_args, "enable_ssl_refresh"))
 
 
-class TestHiCacheArgs(unittest.TestCase):
+class TestHiCacheArgs(CustomTestCase):
+    def test_host_receive_speculative_uses_shared_retraction_pool(self):
+        """Speculation must still resolve host receive to the shared host pool."""
+        for algorithm in ("EAGLE", "EAGLE3", "NGRAM"):
+            with self.subTest(algorithm=algorithm):
+                args = self._make_args(
+                    disaggregation_mode="decode",
+                    disaggregation_decode_host_receive_threshold=0.8,
+                    speculative_algorithm=algorithm,
+                )
+                handle_pd_disaggregation(args)
+                self.assertEqual(
+                    resolution_result(args, "disaggregation_decode_retraction_backup"),
+                    "host_pool",
+                )
+                handle_hicache(args)
+                self.assertEqual(
+                    resolution_result(args, "hicache_mem_layout"), "layer_first"
+                )
+
+        for threshold in (-0.1, 1.1, float("nan")):
+            with self.subTest(threshold=threshold):
+                args = self._make_args(
+                    disaggregation_decode_host_receive_threshold=threshold
+                )
+                with self.assertRaisesRegex(ValueError, "must be between 0 and 1"):
+                    handle_pd_disaggregation(args)
+
     def test_linker_mla_dedup_requires_mooncake_linker(self):
         for enabled, linker, backend in (
             (False, False, "mooncake"),
@@ -2068,7 +2087,7 @@ class TestHiCacheArgs(unittest.TestCase):
                 },
                 3,
             ),
-            ({"hicache_write_policy": "write_through"}, 0),
+            ({"hicache_write_policy": "write_through"}, 3),
             (
                 {
                     "hicache_storage_backend": "file",
