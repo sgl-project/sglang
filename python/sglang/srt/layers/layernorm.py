@@ -1113,10 +1113,13 @@ class GemmaRMSNorm(BaseFusedOp):
         self,
         hidden_size: int,
         eps: float = 1e-6,
+        emit_fp8_qinput: bool = False,
     ) -> None:
         super().__init__()
         self.weight = nn.Parameter(torch.zeros(hidden_size))
         self.variance_epsilon = eps
+        # opt-in: only models whose next linear reads _fp8_qinput should pay the fp8 write
+        self.emit_fp8_qinput = emit_fp8_qinput
         self.register_buffer(
             "gemma_weight", torch.ones_like(self.weight), persistent=False
         )
@@ -1196,7 +1199,8 @@ class GemmaRMSNorm(BaseFusedOp):
                     residual,
                     self.weight.data,
                     self.variance_epsilon,
-                    emit_fp8=x.numel() // x.shape[-1] <= _fuse_norm_fp8_max_m(),
+                    emit_fp8=self.emit_fp8_qinput
+                    and x.numel() // x.shape[-1] <= _fuse_norm_fp8_max_m(),
                 )
             return rocm_triton_gemma_rmsnorm(x, self.weight.data, self.variance_epsilon)
 

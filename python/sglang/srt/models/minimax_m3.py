@@ -1328,10 +1328,10 @@ class MiniMaxM3DecoderLayer(nn.Module):
         self.use_gemma_norm = getattr(config, "use_gemma_norm", False)
         if self.use_gemma_norm:
             self.input_layernorm = GemmaRMSNorm(
-                config.hidden_size, eps=config.rms_norm_eps
+                config.hidden_size, eps=config.rms_norm_eps, emit_fp8_qinput=_is_hip
             )
             self.post_attention_layernorm = GemmaRMSNorm(
-                config.hidden_size, eps=config.rms_norm_eps
+                config.hidden_size, eps=config.rms_norm_eps, emit_fp8_qinput=_is_hip
             )
         else:
             self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
