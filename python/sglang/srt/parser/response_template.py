@@ -161,9 +161,12 @@ class ResponseTemplateStreamAdapter:
         self._prefix = prefix or ""
         self._stream_parser: ResponseParser | None = None
         self._event_parser: ResponseParser | None = None
+        self._prefix_end = 0
+        tool_field = self._parser_template.fields.get(_TOOL_FIELD)
+        self._tool_has_closer = (
+            tool_field is not None and tool_field.close_re is not None
+        )
         self._pending_reasoning = ""
-        self._pending_tool_start: int | None = None
-        self._pending_tool_body_start: int | None = None
         self._pending_tool_streamed = False
         self._finalized = False
 
@@ -172,11 +175,13 @@ class ResponseTemplateStreamAdapter:
             tool if isinstance(tool, dict) else tool.model_dump()
             for tool in tools or []
         ]
-        return ResponseParser(
+        parser = ResponseParser(
             self._parser_template,
             prefix=self._prefix,
             tools=parser_tools,
         )
+        self._prefix_end = len(parser.input_text)
+        return parser
 
     @staticmethod
     def _active_initial_tool_event(parser: ResponseParser) -> list[dict]:
@@ -200,18 +205,10 @@ class ResponseTemplateStreamAdapter:
             return None
         return name if isinstance(name, str) else None
 
-    def _generated_text(
-        self,
-        event: dict,
-        *,
-        start: int | None = None,
-        end: int | None = None,
-    ) -> str:
+    def _generated_text(self, event: dict) -> str:
         assert self._event_parser is not None
-        start = event["start"] if start is None else start
-        end = event["end"] if end is None else end
-        start = max(start, self._event_parser.prefix_end)
-        return self._event_parser.input_text[start:end] if start < end else ""
+        start = max(event["start"], self._prefix_end)
+        return self._event_parser.input_text[start : event["end"]]
 
     def has_tool_region(self, text: str) -> bool:
         try:
@@ -287,16 +284,11 @@ class ResponseTemplateStreamAdapter:
             elif field == _CONTENT_FIELD and etype == "region_chunk":
                 normal_parts.append(event["text"])
             elif field == _TOOL_FIELD:
-                if etype == "region_malformed":
-                    normal_parts.append(
-                        self._generated_text(event, start=event["close_start"])
-                    )
-                elif etype in {"region_open", "region_chunk", "region_close"}:
-                    normal_parts.append(
-                        event["text"]
-                        if etype == "region_chunk"
-                        else self._generated_text(event)
-                    )
+                normal_parts.append(
+                    event["text"]
+                    if etype == "region_chunk"
+                    else self._generated_text(event)
+                )
         return "".join(normal_parts), "".join(reasoning_parts)
 
     def route_tool_events(
@@ -305,76 +297,59 @@ class ResponseTemplateStreamAdapter:
         *,
         on_tool_open: Callable[[str], bool] | None = None,
         on_tool_close: Callable[[Any], bool],
-        on_tool_malformed: Callable[[str, bool], None] | None = None,
+        on_tool_dropped: Callable[[], None] | None = None,
     ) -> str:
+        """Route tool regions to the callbacks and return the passthrough text.
+
+        A tool call is emitted only when it ends with its closer, parses, and is
+        accepted by `on_tool_close`. Otherwise it is dropped, and a name that was
+        already streamed stays an incomplete call."""
         normal_parts: list[str] = []
-        malformed_starts = {
-            event["start"]
-            for event in events
-            if event.get("field") == _TOOL_FIELD and event["type"] == "region_malformed"
-        }
-        for event in events:
+        unusable_opens: set[int] = set()
+        open_index = None
+        for index, event in enumerate(events):
+            if event.get("field") == _TOOL_FIELD:
+                if event["type"] == "region_open":
+                    open_index = index
+                elif self._is_unusable_tool_end(event):
+                    unusable_opens.add(open_index)
+        for index, event in enumerate(events):
             field = event.get("field")
             etype = event["type"]
             if field == _PASSTHROUGH_FIELD and etype == "region_chunk":
                 normal_parts.append(event["text"])
-            elif field == _TOOL_FIELD:
-                if etype == "region_open":
-                    self._pending_tool_start = event["start"]
-                    self._pending_tool_body_start = event["end"]
-                    name = self._open_tool_name(event.get("captures"))
-                    self._pending_tool_streamed = bool(
-                        event["start"] not in malformed_starts
-                        and name is not None
-                        and on_tool_open is not None
-                        and on_tool_open(name)
+            elif field != _TOOL_FIELD or etype == "region_chunk":
+                continue
+            elif etype == "region_open":
+                name = self._open_tool_name(event.get("captures"))
+                self._pending_tool_streamed = bool(
+                    index not in unusable_opens
+                    and name is not None
+                    and on_tool_open is not None
+                    and on_tool_open(name)
+                )
+            else:
+                if self._is_unusable_tool_end(event):
+                    logger.warning(
+                        "response_template: dropping malformed or cut-off tool call"
                     )
-                elif etype == "region_malformed":
-                    if on_tool_malformed is not None:
-                        body_start = (
-                            self._pending_tool_body_start
-                            if self._pending_tool_body_start is not None
-                            else event["start"]
-                        )
-                        on_tool_malformed(
-                            self._generated_text(
-                                event,
-                                start=body_start,
-                                end=event["close_start"],
-                            ),
-                            event["closed"],
-                        )
-                    if not self._pending_tool_streamed:
-                        normal_parts.append(self._generated_text(event))
-                    self._clear_pending_tool()
-                elif etype == "region_close":
-                    if not on_tool_close(event["value"]):
-                        if (
-                            self._pending_tool_streamed
-                            and on_tool_malformed is not None
-                        ):
-                            on_tool_malformed(
-                                self._generated_text(
-                                    event,
-                                    start=self._pending_tool_body_start,
-                                    end=event["start"],
-                                ),
-                                True,
-                            )
-                        elif self._pending_tool_start is not None:
-                            normal_parts.append(
-                                self._generated_text(
-                                    event,
-                                    start=self._pending_tool_start,
-                                )
-                            )
-                    self._clear_pending_tool()
+                    accepted = False
+                else:
+                    accepted = on_tool_close(event["value"])
+                if not accepted and self._pending_tool_streamed and on_tool_dropped:
+                    on_tool_dropped()
+                self._pending_tool_streamed = False
         return "".join(normal_parts)
 
-    def _clear_pending_tool(self) -> None:
-        self._pending_tool_start = None
-        self._pending_tool_body_start = None
-        self._pending_tool_streamed = False
+    def _is_unusable_tool_end(self, event: dict) -> bool:
+        """Whether a tool region ended malformed, or at end of stream without its
+        closer because the call was cut off."""
+        assert self._event_parser is not None
+        return event["type"] == "region_malformed" or (
+            event["type"] == "region_close"
+            and self._tool_has_closer
+            and event["start"] == len(self._event_parser.input_text)
+        )
 
 
 class _ResponseTemplateParserInputMixin:
@@ -479,8 +454,9 @@ class ResponseTemplateToolDetector(
             prefix=prefix,
         )
         tool_spec = loaded.fields[_TOOL_FIELD]
-        if tool_spec.close_literals:
-            self.eot_token = tool_spec.close_literals[0]
+        self.tool_close_literals = tool_spec.close_literals or []
+        if self.tool_close_literals:
+            self.eot_token = self.tool_close_literals[0]
         self.incomplete_tool_call_indices: set[int] = set()
         self._tool_indices: dict[str, int] | None = None
 
@@ -581,30 +557,10 @@ class ResponseTemplateToolDetector(
         self.incomplete_tool_call_indices.add(self.current_tool_id)
         self.current_tool_name_sent = True
 
-    def _emit_malformed_tool_arguments(
-        self,
-        text: str,
-        pending_calls: list[ToolCallItem],
-        closed: bool,
-    ) -> None:
-        if self.current_tool_id < 0 or not self.current_tool_name_sent:
-            return
-        previous = self.streamed_args_for_tool[self.current_tool_id]
-        arguments = previous + text
-        self.streamed_args_for_tool[self.current_tool_id] = arguments
-        self.prev_tool_call_arr[self.current_tool_id]["arguments"] = arguments
-        if text:
-            pending_calls.append(
-                ToolCallItem(
-                    tool_index=self.current_tool_id,
-                    name=None,
-                    parameters=text,
-                )
-            )
-        self.incomplete_tool_call_indices.add(self.current_tool_id)
-        if closed:
-            self.current_tool_id += 1
-            self.current_tool_name_sent = False
+    def _drop_streamed_tool_call(self) -> None:
+        """Leave the streamed name as an incomplete call and move to the next."""
+        self.current_tool_id += 1
+        self.current_tool_name_sent = False
 
     def _route_tool_events(
         self, events: list[dict], tool_indices: dict[str, int]
@@ -672,11 +628,7 @@ class ResponseTemplateToolDetector(
             events,
             on_tool_open=on_open,
             on_tool_close=on_close,
-            on_tool_malformed=lambda text, closed: self._emit_malformed_tool_arguments(
-                text,
-                pending_calls,
-                closed,
-            ),
+            on_tool_dropped=self._drop_streamed_tool_call,
         )
         return ToolStreamingParseResult(normal_text=normal_text, calls=pending_calls)
 
@@ -703,3 +655,30 @@ class ResponseTemplateToolDetector(
         raise NotImplementedError(
             "structure_info not used with the response_template tool parser"
         )
+
+
+def tool_close_token_ids(
+    tool_call_parser: str | None, tokenizer: Any | None
+) -> frozenset[int]:
+    """Token ids of the tool-call closers of a response-template tool parser.
+
+    Detokenization keeps these when they stop generation, so a tool call that
+    reaches end of stream without its closer was cut off."""
+    from sglang.srt.function_call.function_call_parser import FunctionCallParser
+
+    detector_class = FunctionCallParser.ToolCallParserEnum.get(tool_call_parser)
+    if (
+        tokenizer is None
+        or detector_class is None
+        or not issubclass(detector_class, ResponseTemplateToolDetector)
+    ):
+        return frozenset()
+    try:
+        detector = detector_class(tokenizer=tokenizer)
+    except ValueError:
+        return frozenset()
+    token_ids = (
+        tokenizer.encode(literal, add_special_tokens=False)
+        for literal in detector.tool_close_literals
+    )
+    return frozenset(ids[0] for ids in token_ids if len(ids) == 1)

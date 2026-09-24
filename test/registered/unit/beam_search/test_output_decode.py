@@ -25,7 +25,9 @@ STOP_ID = 99
 
 
 def _trim(output, finished_reason, no_stop_trim):
-    stub = SimpleNamespace(is_tool_call_parser_gpt_oss=False)
+    stub = SimpleNamespace(
+        is_tool_call_parser_gpt_oss=False, tool_close_token_ids=frozenset()
+    )
     return DetokenizerManager.trim_matched_stop(
         stub, output, finished_reason, no_stop_trim
     )

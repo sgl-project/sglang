@@ -3017,7 +3017,7 @@ class ServingChatTestCase(unittest.TestCase):
             "usage chunk dropped after error abort",
         )
 
-    def test_truncated_response_template_call_keeps_stop_and_raw_arguments(self):
+    def test_truncated_response_template_call_keeps_stop_without_arguments(self):
         self.chat.tool_call_parser = "response_template"
         self.tm.tokenizer.response_template = _RESPONSE_TEMPLATE
         request = ChatCompletionRequest(
@@ -3072,7 +3072,7 @@ class ServingChatTestCase(unittest.TestCase):
             if choice.get("finish_reason") is not None
         )
 
-        self.assertEqual(arguments, '{"city":')
+        self.assertEqual(arguments, "")
         self.assertEqual(finish["finish_reason"], "stop")
         self.assertEqual(finish["matched_stop"], "CUSTOM_STOP")
 

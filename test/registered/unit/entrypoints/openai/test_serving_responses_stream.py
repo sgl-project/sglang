@@ -222,7 +222,7 @@ class NonHarmonyStreamTestCase(CustomTestCase):
         ]
         self.assertIn("function_call", added_kinds)
 
-    def test_truncated_response_template_call_keeps_raw_arguments_and_status(self):
+    def test_truncated_response_template_call_is_incomplete_without_arguments(self):
         serving = make_serving()
         serving.reasoning_parser = None
         serving.tool_call_parser = "response_template"
@@ -253,10 +253,11 @@ class NonHarmonyStreamTestCase(CustomTestCase):
         )
         terminal = payloads[-1]
 
-        self.assertEqual(deltas, '{"city":')
+        self.assertEqual(deltas, "")
         self.assertEqual(terminal["type"], "response.incomplete")
         self.assertEqual(terminal["response"]["status"], "incomplete")
-        self.assertEqual(terminal["response"]["output"][0]["arguments"], '{"city":')
+        self.assertEqual(terminal["response"]["output"][0]["name"], "get_weather")
+        self.assertEqual(terminal["response"]["output"][0]["arguments"], "")
         self.assertEqual(terminal["response"]["output"][0]["status"], "incomplete")
 
     def test_required_native_parser_matches_full_response(self):
