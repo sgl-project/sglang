@@ -247,7 +247,7 @@ class PoolsideV1Detector(BaseFormatDetector):
 
             calls.append(
                 ToolCallItem(
-                    tool_index=tool_indices[name],
+                    tool_index=len(calls),
                     name=name,
                     parameters=json.dumps(args, ensure_ascii=False),
                 )
