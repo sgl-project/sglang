@@ -55,10 +55,10 @@ from sglang.srt.entrypoints.harmony_utils import (
     parse_response_input,
     render_for_completion,
 )
-from sglang.srt.entrypoints.openai.chat_encoding import spec_renders_message_tools
 from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionMessageParam,
     ChatCompletionRequest,
+    Function,
     MessageProcessingResult,
     PromptTokenUsageInfo,
     RequestResponseMetadata,
@@ -67,17 +67,19 @@ from sglang.srt.entrypoints.openai.protocol import (
     ResponsesRequest,
     ResponsesResponse,
     ResponseTool,
+    Tool,
     UsageInfo,
 )
 from sglang.srt.entrypoints.openai.responses_adapters import (
+    custom_tool_description,
     custom_tool_names,
+    custom_tool_parameters,
     decode_custom_tool_input,
     decode_custom_tool_input_prefix,
     decode_reasoning_state,
     encode_custom_tool_input,
     encode_reasoning_state,
     label_developer_content,
-    response_tools_to_chat_tools,
 )
 from sglang.srt.entrypoints.openai.serving_chat import OpenAIServingChat
 from sglang.srt.entrypoints.openai.tool_server import MCPToolServer, ToolServer
@@ -682,7 +684,7 @@ class OpenAIServingResponses(OpenAIServingChat):
     ):
         messages = self._construct_input_messages(request, prev_response)
 
-        chat_tools = response_tools_to_chat_tools(request.tools)
+        chat_tools = self._response_tools_to_chat_tools(request.tools)
         chat_request = ChatCompletionRequest(
             model=request.model,
             messages=messages,
@@ -1040,7 +1042,7 @@ class OpenAIServingResponses(OpenAIServingChat):
         require_reasoning: bool,
     ):
         response_tools = self._effective_response_tools(request)
-        chat_tools = response_tools_to_chat_tools(response_tools)
+        chat_tools = self._response_tools_to_chat_tools(response_tools)
         if self.reasoning_parser:
             reasoning_parser = ReasoningParser(
                 model_type=self.reasoning_parser,
@@ -1190,6 +1192,32 @@ class OpenAIServingResponses(OpenAIServingChat):
             return tool_choice
         return {"type": "function", "function": {"name": tool_choice["name"]}}
 
+    @staticmethod
+    def _response_tools_to_chat_tools(tools: list[ResponseTool]) -> list[Tool]:
+        # ``function`` and ``custom`` tools flow to chat; built-ins go through
+        # harmony. A custom tool is shimmed into a single-string function tool.
+        chat_tools = []
+        for tool in tools:
+            if tool.type == "function":
+                description, parameters = tool.description, tool.parameters
+            elif tool.type == "custom" and tool.name:
+                description = custom_tool_description(tool.description, tool.format)
+                parameters = custom_tool_parameters()
+            else:
+                continue
+            chat_tools.append(
+                Tool(
+                    type="function",
+                    function=Function(
+                        name=tool.name,
+                        description=description,
+                        parameters=parameters,
+                        strict=tool.strict,
+                    ),
+                )
+            )
+        return chat_tools
+
     def _effective_response_tools(
         self, request: ResponsesRequest
     ) -> list[ResponseTool]:
@@ -1287,13 +1315,13 @@ class OpenAIServingResponses(OpenAIServingChat):
             item = ResponseAdditionalTools.model_validate(message)
             tools = [
                 tool.model_dump(exclude_none=True)
-                for tool in response_tools_to_chat_tools(item.tools)
+                for tool in cls._response_tools_to_chat_tools(item.tools)
             ]
             return {
                 "role": "system",
                 "content": (
                     ""
-                    if spec_renders_message_tools(chat_encoding_spec)
+                    if chat_encoding_spec in ("kimi_k3", "dsv41", "dsv4", "dsv32")
                     else label_developer_content(
                         "Additional tools:\n" + json.dumps(tools)
                     )
@@ -2033,7 +2061,7 @@ class OpenAIServingResponses(OpenAIServingChat):
         )
 
         response_tools = self._effective_response_tools(request)
-        chat_tools = response_tools_to_chat_tools(response_tools)
+        chat_tools = self._response_tools_to_chat_tools(response_tools)
         custom_names = custom_tool_names(response_tools)
         tool_choice = request.effective_tool_choice()
         is_required = tool_choice == "required" or isinstance(tool_choice, dict)

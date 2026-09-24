@@ -19,8 +19,6 @@ import json
 import zlib
 from typing import Any, Dict, Optional, Set, Tuple
 
-from sglang.srt.entrypoints.openai.protocol import Function, ResponseTool, Tool
-
 CUSTOM_TOOL_INPUT_KEY = "input"
 
 _SIMPLE_ESCAPES = {
@@ -72,30 +70,6 @@ def custom_tool_description(
 
 def custom_tool_names(tools: Any) -> Set[str]:
     return {tool.name for tool in tools or [] if tool.type == "custom" and tool.name}
-
-
-def response_tools_to_chat_tools(tools: list[ResponseTool]) -> list[Tool]:
-    chat_tools = []
-    for tool in tools:
-        if tool.type == "function":
-            description, parameters = tool.description, tool.parameters
-        elif tool.type == "custom" and tool.name:
-            description = custom_tool_description(tool.description, tool.format)
-            parameters = custom_tool_parameters()
-        else:
-            continue
-        chat_tools.append(
-            Tool(
-                type="function",
-                function=Function(
-                    name=tool.name,
-                    description=description,
-                    parameters=parameters,
-                    strict=tool.strict,
-                ),
-            )
-        )
-    return chat_tools
 
 
 def encode_custom_tool_input(payload: str) -> str:

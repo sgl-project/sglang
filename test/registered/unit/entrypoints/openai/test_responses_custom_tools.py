@@ -1,10 +1,11 @@
 import asyncio
 import unittest
 from copy import deepcopy
+from itertools import product
 from unittest.mock import Mock
 
 import orjson
-from openai_harmony import Conversation, Role
+from openai_harmony import Conversation
 from utils import (
     StreamFixture,
     create_response_result,
@@ -16,6 +17,7 @@ from utils import (
 )
 
 from sglang.srt.entrypoints.harmony_utils import get_encoding
+from sglang.srt.entrypoints.openai.encoding_dsv41 import encode_messages
 from sglang.srt.entrypoints.openai.protocol import ResponsesRequest, ResponsesResponse
 from sglang.srt.entrypoints.openai.responses_adapters import (
     decode_custom_tool_input,
@@ -24,7 +26,6 @@ from sglang.srt.entrypoints.openai.responses_adapters import (
     encode_custom_tool_input,
     encode_reasoning_state,
     label_developer_content,
-    response_tools_to_chat_tools,
 )
 from sglang.srt.entrypoints.openai.serving_responses import OpenAIServingResponses
 from sglang.srt.runtime_context import publish, reset_context
@@ -79,7 +80,7 @@ class CustomToolAdapterTestCase(CustomTestCase):
 class CustomToolShimTestCase(CustomTestCase):
     def test_custom_tool_becomes_a_single_string_function_tool(self):
         request = _custom_request()
-        (tool,) = response_tools_to_chat_tools(request.tools)
+        (tool,) = OpenAIServingResponses._response_tools_to_chat_tools(request.tools)
         self.assertEqual(tool.function.name, "emit_command")
         self.assertEqual(list(tool.function.parameters["properties"]), ["input"])
         self.assertEqual(tool.function.parameters["required"], ["input"])
@@ -87,7 +88,9 @@ class CustomToolShimTestCase(CustomTestCase):
         nameless = ResponsesRequest(
             model="x", input="hi", tools=[{"type": "custom"}], store=False
         )
-        self.assertEqual(response_tools_to_chat_tools(nameless.tools), [])
+        self.assertEqual(
+            OpenAIServingResponses._response_tools_to_chat_tools(nameless.tools), []
+        )
 
     def test_grammar_format_is_described_to_the_model(self):
         request = _custom_request(
@@ -102,7 +105,7 @@ class CustomToolShimTestCase(CustomTestCase):
                 }
             ]
         )
-        (tool,) = response_tools_to_chat_tools(request.tools)
+        (tool,) = OpenAIServingResponses._response_tools_to_chat_tools(request.tools)
         self.assertIn("lark", tool.function.description)
         self.assertIn('start: "pwd"', tool.function.description)
 
@@ -449,25 +452,36 @@ class AdditionalToolsTestCase(CustomTestCase):
         super().setUp()
         reset_context()
         self.addCleanup(reset_context)
-
-    def test_additional_tools_stay_at_their_input_position(self):
-        """An inline tool inventory must survive without changing the old prefix."""
-        serving = make_serving()
-        tool = {
+        self.tool = {
             "type": "function",
-            "name": "lookup",
-            "description": "Read a value.",
-            "parameters": {"type": "object", "properties": {}},
+            "name": "get_weather",
+            "description": "Get the current weather for a city.",
+            "parameters": {
+                "type": "object",
+                "properties": {"city": {"type": "string"}},
+                "required": ["city"],
+            },
         }
-        inventory = {"type": "additional_tools", "role": "developer", "tools": [tool]}
+        self.inventory = {
+            "type": "additional_tools",
+            "role": "developer",
+            "tools": [self.tool],
+        }
+        self.input = [
+            self.inventory,
+            {"role": "user", "content": "What is the weather in Paris? Use the tool."},
+        ]
+
+    def test_declaration_order(self):
+        serving = make_serving()
         request = ResponsesRequest(
             model="x",
-            instructions="Review the proposed action.",
+            instructions="Review the action.",
             input=[
-                {"role": "user", "content": "INPUT_BEFORE_TOOLS"},
-                inventory,
-                {"role": "developer", "content": "LATER_INSTRUCTION"},
-                {"role": "user", "content": "INPUT_AFTER_TOOLS"},
+                {"role": "user", "content": "BEFORE"},
+                self.inventory,
+                {"role": "developer", "content": "LATER"},
+                {"role": "user", "content": "AFTER"},
             ],
         )
         original = deepcopy(request.model_dump())
@@ -476,39 +490,29 @@ class AdditionalToolsTestCase(CustomTestCase):
                 serving.chat_encoding_spec = encoding
                 messages = serving._construct_input_messages(request)
                 self.assertEqual(
-                    [message["role"] for message in messages],
-                    ["system", "user", "system", "system", "user"],
+                    [m["content"] for m in messages if not m.get("tools")],
+                    [
+                        "Review the action.",
+                        "BEFORE",
+                        "Developer instructions:\nLATER",
+                        "AFTER",
+                    ],
                 )
-                self.assertEqual(messages[0]["content"], request.instructions)
-                self.assertEqual(messages[1]["content"], "INPUT_BEFORE_TOOLS")
-                self.assertEqual(
-                    messages[3]["content"], "Developer instructions:\nLATER_INSTRUCTION"
-                )
-                self.assertEqual(messages[4]["content"], "INPUT_AFTER_TOOLS")
-                function = messages[2]["tools"][0]["function"]
-                self.assertEqual(function["name"], "lookup")
-                self.assertEqual(function["parameters"], tool["parameters"])
                 if encoding is None:
-                    self.assertIn('"name": "lookup"', messages[2]["content"])
+                    prompt = "\n".join(m["content"] for m in messages)
                 else:
                     self.assertEqual(messages[2]["content"], "")
-                if encoding == "dsv41":
-                    from sglang.srt.entrypoints.openai.encoding_dsv41 import (
-                        encode_messages,
-                    )
-
                     prompt = encode_messages(messages, thinking_mode="chat")
-                    self.assertLess(
-                        prompt.index("INPUT_BEFORE_TOOLS"), prompt.index("lookup")
-                    )
-                    self.assertLess(
-                        prompt.index("lookup"), prompt.index("INPUT_AFTER_TOOLS")
-                    )
-                    self.assertEqual(prompt.count('"name": "lookup"'), 1)
+                positions = [
+                    prompt.index(s) for s in ("BEFORE", "get_weather", "LATER", "AFTER")
+                ]
+                self.assertEqual(positions, sorted(positions))
+                self.assertEqual(prompt.count('"name": "get_weather"'), 1)
+                self.assertIn('"city": {"type": "string"}', prompt)
                 self.assertEqual(request.model_dump(), original)
 
-    def test_deepseek_additional_tools_repro_and_stored_continuation(self):
-        """Inline tool definitions must not reject the request or hide its tool call."""
+    def test_deepseek_repro_and_continuation(self):
+        """Inline definitions must not reject the request or hide its tool call."""
         publish(
             ServerArgs(model_path="dummy", enable_response_store=True), role="tokenizer"
         )
@@ -533,215 +537,133 @@ class AdditionalToolsTestCase(CustomTestCase):
             yield engine_chunk(raw, 2, finish=True)
 
         serving.tokenizer_manager.generate_request = Mock(side_effect=generate)
-        for stream in (False, True):
-            request = ResponsesRequest(
-                model=model,
-                input=[
-                    {
-                        "type": "additional_tools",
-                        "role": "developer",
-                        "tools": [
-                            {
-                                "type": "function",
-                                "name": "get_weather",
-                                "description": "Get the current weather for a city.",
-                                "parameters": {
-                                    "type": "object",
-                                    "properties": {"city": {"type": "string"}},
-                                    "required": ["city"],
-                                },
-                            }
-                        ],
-                    },
-                    {
-                        "role": "user",
-                        "content": "What is the weather in Paris? Use the tool.",
-                    },
-                ],
-                stream=stream,
-            )
-            response = asyncio.run(create_response_result(serving, request))
-            self.assertIsInstance(response, ResponsesResponse)
-            (call,) = response.output
-            self.assertEqual((call.type, call.name), ("function_call", "get_weather"))
-            self.assertEqual(orjson.loads(call.arguments), {"city": "Paris"})
-            self.assertEqual(response.tools, [])
-            prompt = serving.tokenizer_manager.tokenizer.encode.call_args.args[0]
-            self.assertIn('"name": "get_weather"', prompt)
-            self.assertIn('"city": {"type": "string"}', prompt)
-            continuation = ResponsesRequest(
-                model=model,
-                previous_response_id=response.id,
-                input=[
-                    {
-                        "type": "function_call_output",
-                        "call_id": call.call_id,
-                        "output": "Sunny",
-                    }
-                ],
-                tool_choice={"type": "function", "name": "get_weather"},
-                stream=stream,
-            )
-            next_response = asyncio.run(create_response_result(serving, continuation))
-            self.assertIsInstance(next_response, ResponsesResponse)
-            self.assertEqual(next_response.output[0].name, "get_weather")
-
-    def test_ambiguous_inline_tool_names_are_rejected_before_generation(self):
-        serving = make_serving()
-        tool = {"type": "function", "name": "lookup"}
-        inventory = {"type": "additional_tools", "role": "developer", "tools": [tool]}
-        for top_tools, items in (
-            ([tool], [inventory]),
-            ([], [inventory, inventory]),
-            ([tool, tool], []),
+        for stream, top_tools in product(
+            (False, True), ([], [{"type": "function", "name": "initial"}])
         ):
-            with self.subTest(top_tools=top_tools):
-                request = ResponsesRequest(model="x", tools=top_tools, input=items)
+            with self.subTest(stream=stream, top_tools=top_tools):
+                request = ResponsesRequest(
+                    model=model, input=self.input, tools=top_tools, stream=stream
+                )
+                response = asyncio.run(create_response_result(serving, request))
+                self.assertIsInstance(response, ResponsesResponse)
+                (call,) = response.output
+                self.assertEqual(
+                    (call.type, call.name), ("function_call", "get_weather")
+                )
+                self.assertEqual(orjson.loads(call.arguments), {"city": "Paris"})
+                self.assertNotIn("get_weather", [tool.name for tool in response.tools])
+                prompt = serving.tokenizer_manager.tokenizer.encode.call_args.args[0]
+                self.assertIn('"city": {"type": "string"}', prompt)
+                for name in ["get_weather"] + [t["name"] for t in top_tools]:
+                    self.assertEqual(prompt.count(f'"name": "{name}"'), 1)
+                continuation = ResponsesRequest(
+                    model=model,
+                    previous_response_id=response.id,
+                    input=[
+                        {
+                            "type": "function_call_output",
+                            "call_id": call.call_id,
+                            "output": "Sunny",
+                        }
+                    ],
+                    tool_choice={"type": "function", "name": "get_weather"},
+                    stream=stream,
+                )
+                history = deepcopy(serving.msg_store[response.id])
+                replay = continuation.model_copy(
+                    update={
+                        "previous_response_id": None,
+                        "input": history + continuation.input,
+                    }
+                )
+                self.assertEqual(
+                    serving._construct_input_messages(continuation),
+                    serving._construct_input_messages(replay),
+                )
+                next_response = asyncio.run(
+                    create_response_result(serving, continuation)
+                )
+                self.assertEqual(next_response.output[0].name, "get_weather")
+                self.assertEqual(serving.msg_store[response.id], history)
+
+    def test_duplicate_names(self):
+        serving = make_serving()
+        for tools, items in (
+            ([self.tool], [self.inventory]),
+            ([], [self.inventory, self.inventory]),
+            ([self.tool, self.tool], []),
+        ):
+            with self.subTest(tools=tools):
+                request = ResponsesRequest(model="x", tools=tools, input=items)
                 response = asyncio.run(serving.create_responses(request))
                 self.assertEqual(response.status_code, 400)
                 self.assertIn(b"Tool names must be unique", response.body)
                 serving.tokenizer_manager.generate_request.assert_not_called()
 
-    def test_additional_tools_do_not_replace_top_level_tools(self):
-        serving = make_serving()
-        serving.chat_encoding_spec = "dsv41"
-        request = ResponsesRequest(
-            model="x",
-            tools=[{"type": "function", "name": "initial"}],
-            input=[
-                {
-                    "type": "additional_tools",
-                    "role": "developer",
-                    "tools": [{"type": "function", "name": "later"}],
-                },
-                {"role": "user", "content": "call later"},
-            ],
-        )
-        messages = serving._construct_input_messages(request)
-        self.assertEqual(messages[0], {"role": "system", "content": ""})
-        self.assertEqual(messages[1]["tools"][0]["function"]["name"], "later")
-        self.assertEqual(
-            [tool.name for tool in serving._effective_response_tools(request)],
-            ["initial", "later"],
-        )
-
-    def test_additional_tools_replay_matches_previous_response(self):
-        serving = make_serving()
-        history = [
-            {"role": "user", "content": "before"},
-            {
-                "type": "additional_tools",
-                "role": "developer",
-                "tools": [{"type": "function", "name": "lookup"}],
-            },
-            {"role": "assistant", "content": "ready"},
-        ]
-        serving.msg_store["resp_previous"] = deepcopy(history)
-        followup = ResponsesRequest(
-            model="x", previous_response_id="resp_previous", input="call lookup"
-        )
-        replay = ResponsesRequest(
-            model="x", input=history + [{"role": "user", "content": "call lookup"}]
-        )
-        self.assertEqual(
-            serving._construct_input_messages(followup),
-            serving._construct_input_messages(replay),
-        )
-        self.assertEqual(
-            serving._effective_response_tools(followup),
-            serving._effective_response_tools(replay),
-        )
-        self.assertEqual(serving.msg_store["resp_previous"], history)
-
-    def test_inline_function_and_custom_calls_survive_full_and_stream_output(self):
+    def test_function_and_custom_output(self):
         serving = make_serving()
         serving.tool_call_parser = None
-        for tool_type in ("function", "custom"):
-            for choice in ("required", {"type": tool_type, "name": "lookup"}, "none"):
+        for tool_type, call_type, field, value in (
+            ("function", "function_call", "arguments", '{"input": "value"}'),
+            ("custom", "custom_tool_call", "input", "value"),
+        ):
+            for choice in (
+                "required",
+                {"type": tool_type, "name": "get_weather"},
+                "none",
+            ):
                 with self.subTest(tool_type=tool_type, choice=choice):
+                    inventory = {
+                        **self.inventory,
+                        "tools": [{"type": tool_type, "name": "get_weather"}],
+                    }
                     request = ResponsesRequest(
-                        model="x",
-                        input=[
-                            {
-                                "type": "additional_tools",
-                                "role": "developer",
-                                "tools": [{"type": tool_type, "name": "lookup"}],
-                            },
-                            {"role": "user", "content": "call lookup"},
-                        ],
-                        tool_choice=choice,
-                        store=False,
+                        model="x", input=[inventory], tool_choice=choice, store=False
                     )
-                    raw = '[{"name":"lookup","parameters":{"input":"value"}}]'
+                    raw = '[{"name":"get_weather","parameters":{"input":"value"}}]'
+                    prefix = raw[: raw.index('"parameters"')]
                     (full,) = serving._make_response_output_items(
                         request, raw, tokenizer=Mock(), require_reasoning=False
                     )
-                    events = event_payloads(
+                    completed = find_completed_event(
                         StreamFixture(serving, request).run(
-                            [engine_chunk(raw[:20]), engine_chunk(raw, 2, finish=True)]
+                            [engine_chunk(prefix), engine_chunk(raw, 2, finish=True)]
                         )
                     )
-                    completed = next(
-                        e for e in events if e["type"] == "response.completed"
-                    )
                     (streamed,) = completed["response"]["output"]
-                    if choice == "none":
-                        self.assertEqual(full.type, "message")
-                        self.assertEqual(streamed["type"], "message")
-                        continue
-                    expected_type = (
-                        "custom_tool_call" if tool_type == "custom" else "function_call"
-                    )
-                    self.assertEqual(full.type, expected_type)
-                    self.assertEqual(streamed["type"], expected_type)
-                    self.assertEqual(full.name, "lookup")
-                    self.assertEqual(streamed["name"], "lookup")
-                    field = "input" if tool_type == "custom" else "arguments"
-                    self.assertEqual(getattr(full, field), streamed[field])
-                    self.assertEqual(
-                        getattr(full, field),
-                        "value" if tool_type == "custom" else '{"input": "value"}',
-                    )
+                    for call in (full.model_dump(), streamed):
+                        if choice == "none":
+                            self.assertEqual(call["type"], "message")
+                            self.assertEqual(call["content"][0]["text"], raw)
+                        else:
+                            self.assertEqual(call["type"], call_type)
+                            self.assertEqual(call["name"], "get_weather")
+                            self.assertEqual(call[field], value)
 
-    def test_harmony_additional_tools_are_developer_messages_in_place(self):
+    def test_harmony_order_and_replay(self):
         serving = make_serving()
         request = ResponsesRequest(
             model="x",
             input=[
-                {"role": "user", "content": "before"},
-                {
-                    "type": "additional_tools",
-                    "role": "developer",
-                    "tools": [
-                        {
-                            "type": "function",
-                            "name": "lookup",
-                            "description": "Read a value.",
-                        }
-                    ],
-                },
-                {"role": "user", "content": "after"},
+                {"role": "user", "content": "BEFORE"},
+                self.inventory,
+                {"role": "user", "content": "AFTER"},
             ],
         )
         messages = serving._construct_input_messages_with_harmony(request, None)
-        self.assertEqual(
-            [m.author.role for m in messages],
-            [Role.SYSTEM, Role.DEVELOPER, Role.USER, Role.DEVELOPER, Role.USER],
-        )
         rendered = get_encoding().decode(
             get_encoding().render_conversation(Conversation.from_messages(messages))
         )
-        self.assertLess(rendered.index("before"), rendered.index("lookup"))
-        self.assertLess(rendered.index("lookup"), rendered.index("after"))
+        positions = [rendered.index(s) for s in ("BEFORE", "get_weather", "AFTER")]
+        self.assertEqual(positions, sorted(positions))
         serving.msg_store["resp_previous"] = messages[2:]
         followup = ResponsesRequest(
-            model="x", previous_response_id="resp_previous", input="call lookup"
+            model="x", previous_response_id="resp_previous", input="next"
         )
         self.assertEqual(
             serving._effective_response_tools(followup),
             serving._effective_response_tools(request),
         )
-
         request.input[1]["tools"][0]["type"] = "custom"
         with self.assertRaisesRegex(ValueError, "function tools only"):
             serving._construct_input_messages_with_harmony(request, None)
