@@ -25,8 +25,9 @@ Measured avg_kl_div:
   memory   test_prefill_cache_hit                  n/a    1.73e-03        0.0
   track    test_decode_cache_hit                   n/a    2.44e-03        0.0
 
-The unified-memory rows (untranslated conv-checkpoint track ids) were measured
-on SM90 only. The lazy row was measured in the same session as the 1.18e-05 the non-lazy
+The unified-memory rows were measured on SM90 only.
+
+The lazy row was measured in the same session as the 1.18e-05 the non-lazy
 `test_prefill_cache_hit` read on that GPU, so read the pair as "both fire",
 not as one being weaker.
 
@@ -238,14 +239,7 @@ class TestUnifiedHybridLazyBitExact(TestUnifiedHybridBitExact):
 
 
 class TestUnifiedMemoryHybridBitExact(TestUnifiedHybridBitExact):
-    """Same exactness bar on the unified memory pool, whose mamba slot ids are
-    virtual.
-
-    Guards the conv-checkpoint track destinations reaching the kernels as
-    physical slots. Left virtual, every prefix-cache checkpoint is written to the
-    physical slot that shares its number, so a later hit restores another slot's
-    conv window.
-    """
+    """Same exactness bar on the unified memory pool (virtual mamba slot ids)."""
 
     @classmethod
     def setUpClass(cls):

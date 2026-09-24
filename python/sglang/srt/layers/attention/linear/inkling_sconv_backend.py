@@ -155,8 +155,7 @@ class InklingShortConvAttnBackend(ShortConvAttnBackend):
         self._graph_track_inert_seqlens = torch.zeros(
             max_bs, dtype=torch.int64, device=dev
         )
-        # Physical track destinations for a pool with virtual slot ids; refilled
-        # in place per step so a captured track scatter reads a stable address.
+        # Graph-static: captured track scatters read this address.
         self._track_indices_buf = torch.zeros(max_bs, dtype=torch.int64, device=dev)
         # Same address-stability requirement; the base only sizes this from
         # init_cuda_graph_state, which the prefill graph never calls.
@@ -276,13 +275,10 @@ class InklingShortConvAttnBackend(ShortConvAttnBackend):
             self._translate_track_indices(forward_batch)
 
     def _translate_track_indices(self, forward_batch: ForwardBatch):
-        """Point ``mamba_track_indices`` at physical slots. The conv kernels scatter
-        prefix-cache checkpoints straight into the pool, but the unified pool
-        hands out virtual ids, so an untranslated id writes the checkpoint over
-        whatever physical slot shares its number."""
+        """Translate virtual track ids to the physical slots the conv kernels write."""
         track_indices = forward_batch.mamba_track_indices
         buf = self._track_indices_buf
-        # A re-run of metadata prep on the same batch must not translate twice.
+        # Prep may re-run on the same batch; never translate twice.
         if track_indices is None or track_indices.data_ptr() == buf.data_ptr():
             return
         n = track_indices.shape[0]
