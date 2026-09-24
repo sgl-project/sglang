@@ -657,6 +657,11 @@ class TreeComponent(ABC):
         """Cache-level pre-allocation before a load-back builds its transfers."""
         return PrepareLoadBackResult()
 
+    def prepare_load_back_in_tree_core(self, node: UnifiedTreeNode) -> None:
+        """Reshape the load path (e.g. split a node) before load-back transfers are
+        built; runs inside the tree core, with no cache access."""
+        pass
+
     def finalize_load_back(
         self, req: Optional[Req], prep: PrepareLoadBackResult, success: bool
     ) -> None:

@@ -2280,6 +2280,9 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         # Component hooks take primitives, not Req: extract its fields here.
         mamba_pool_idx = req.kv.mamba_pool_idx if req is not None else None
         node = self.node_by_id(node_id)
+        # Splits must land before any transfer records node ids and lengths.
+        for comp in self.components:
+            comp.prepare_load_back_in_tree_core(node)
         kv_xfer = self.components_by_type[BASE_COMPONENT_TYPE].build_hicache_transfers(
             node, CacheTransferPhase.LOAD_BACK
         )[0]

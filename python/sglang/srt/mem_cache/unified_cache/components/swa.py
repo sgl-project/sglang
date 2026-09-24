@@ -348,7 +348,6 @@ class SWAComponent(TreeComponent):
         value_chunks: list[torch.Tensor],
         best_value_len: int,
     ) -> MatchResult:
-        ct = self.component_type
         swa_boundary_len = len(result.device_indices) + result.host_hit_length
 
         # Full KV may extend beyond the latest reusable SWA window. The branching
@@ -359,31 +358,63 @@ class SWAComponent(TreeComponent):
         ) * self.tree_core.page_size
         branching_seqlen = aligned_seqlen if aligned_seqlen > swa_boundary_len else None
 
-        n_swa = 0
-        swa_host_hit = 0
-        node = result.best_match_node
-        root = self.tree_core.root_node
-        while node is not root and n_swa < self.sliding_window_size:
-            cd = node.component_data[ct]
-            if cd.value is not None:
-                n_swa += len(cd.value)
-            elif cd.host_value is not None:
-                # TODO(hzh): load_back may currently restore a full host-tombstone
-                # segment whose length exceeds sliding_window_size. Once
-                # load_back is constrained to fetch only one sliding window
-                # worth of pages, cap swa_host_hit at sliding_window_size
-                # here so the scheduler budget matches the actual device-pool
-                # consumption.
-                swa_host_hit += len(cd.host_value)
-                n_swa += len(cd.host_value)
-            else:
-                break
-            node = node.parent
+        swa_host_hit = sum(
+            num_tokens
+            for _, num_tokens in self._window_host_loads(result.best_match_node)
+        )
 
         return result._replace(
             swa_host_hit_length=max(result.swa_host_hit_length, swa_host_hit),
             swa_branching_seqlen=branching_seqlen,
         )
+
+    def _window_host_loads(
+        self, node: UnifiedTreeNode
+    ) -> list[tuple[UnifiedTreeNode, int]]:
+        """Host-only SWA nodes a load-back from ``node`` restores, newest first, with
+        the tokens each contributes; only the oldest may contribute a page-aligned
+        tail, which prepare_load_back_in_tree_core splits off before the load.
+        """
+        ct = self.component_type
+        page_size = self.tree_core.page_size
+        loads: list[tuple[UnifiedTreeNode, int]] = []
+        n_swa = 0
+        cur = node
+        while cur is not self.tree_core.root_node and n_swa < self.sliding_window_size:
+            cd = cur.component_data[ct]
+            if cd.value is not None:
+                n_swa += len(cd.value)
+            elif cd.host_value is not None:
+                host_len = len(cd.host_value)
+                tail_len = (
+                    (self.sliding_window_size - n_swa + page_size - 1)
+                    // page_size
+                    * page_size
+                )
+                # A write-through-pending split emits an action the tree core
+                # cannot apply, so such a node loads whole.
+                if (
+                    tail_len >= host_len
+                    or (host_len - tail_len) % page_size != 0
+                    or cur.write_through_pending_id is not None
+                ):
+                    tail_len = host_len
+                loads.append((cur, tail_len))
+                n_swa += tail_len
+            else:
+                break
+            cur = cur.parent
+        return loads
+
+    def prepare_load_back_in_tree_core(self, node: UnifiedTreeNode) -> None:
+        loads = self._window_host_loads(node)
+        if not loads:
+            return
+        oldest, tail_len = loads[-1]
+        split_len = len(oldest.key) - tail_len
+        if split_len > 0:
+            _, action = self.tree_core._split_node(oldest.key, oldest, split_len)
+            assert action is None, "write-through-pending nodes load whole"
 
     def update_component_on_insert_overlap(
         self,

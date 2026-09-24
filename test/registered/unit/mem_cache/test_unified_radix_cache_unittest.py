@@ -8193,6 +8193,56 @@ class UnifiedRadixCacheSuite:
         self._release_ongoing_load_back_locks(cache)
         cache.sanity_check()
 
+    def test_hicache_swa_load_back_fetches_one_window_of_a_long_host_node(self):
+        """A host-only SWA node longer than the window reloads only its page-aligned
+        in-window tail, and the match charges exactly that SWA pool consumption."""
+        if not self.cfg.has_swa:
+            self.skipTest("requires SWA")
+        if self.cfg.has_mamba:
+            self.skipTest("SWA-only path")
+        ps = self.cfg.page_size
+        window_pages = (self.cfg.sliding_window_size + ps - 1) // ps
+        window_tokens = window_pages * ps
+        match_pages = window_pages + 2
+        seq_pages = match_pages + window_pages
+        if seq_pages * ps > self.cfg.kv_size // 2:
+            self.skipTest("kv_size too small for the long node")
+
+        cache, allocator, req_to_token_pool = self._build_hicache_fixture()
+        seq = self._make_seq(1, seq_pages)
+        self._insert(cache, allocator, req_to_token_pool, seq)
+        self._backup_tree(cache)
+        cache.evict(EvictParams(num_tokens=len(seq)))
+
+        # Matching mid-node yields one host-only node spanning the whole match.
+        prefix = seq[: match_pages * ps]
+        m = cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", prefix))))
+        node = m.best_match_node
+        self.assertEqual(_node_key_length(cache, node), len(prefix))
+        self.assertIsNone(_device_value(cache, node, ComponentType.SWA))
+        self.assertEqual(m.swa_host_hit_length, window_tokens)
+
+        swa_avail = allocator.swa_attn_allocator.available_size()
+        self.assertTrue(cache.load_back(node))
+        self.assertEqual(
+            swa_avail - allocator.swa_attn_allocator.available_size(), window_tokens
+        )
+        self._finish_pending_loads(cache)
+
+        # The out-of-window head stays an SWA host tombstone under a Full-KV load.
+        head = _node_parent(cache, node)
+        self.assertEqual(_node_key_length(cache, node), window_tokens)
+        self.assertEqual(
+            len(_device_value(cache, node, ComponentType.SWA)), window_tokens
+        )
+        self.assertIsNone(_device_value(cache, head, ComponentType.SWA))
+        self.assertIsNotNone(_host_value(cache, head, ComponentType.SWA))
+        self.assertIsNotNone(_device_value(cache, head, ComponentType.FULL))
+        self._release_ongoing_load_back_locks(cache)
+        m = cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", prefix))))
+        self.assertEqual(len(m.device_indices), len(prefix))
+        cache.sanity_check()
+
     def test_hicache_full_temp_lock_covers_evicted_anchor_and_mirrors_on_release(
         self,
     ):
