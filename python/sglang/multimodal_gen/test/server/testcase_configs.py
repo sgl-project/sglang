@@ -465,10 +465,10 @@ FLUX3_ACTION_CI_sampling_params = DiffusionSamplingParams(
         "num_inference_steps": 4,
         "seed": 0,
         "enable_prefix_cache": False,
-        # Same path is bit-exact across runs and GPUs; NATTEN vs the
-        # FlexAttention fallback moves actions by max 0.046 / mean 0.012.
-        "action_max_abs_diff_threshold": 0.15,
-        "action_mean_abs_diff_threshold": 0.03,
+        # Same path is bit-exact across runs and GPUs. Kernel swaps move actions
+        # by up to max 0.064 / mean 0.020 (eager QK-norm+RoPE in every block).
+        "action_max_abs_diff_threshold": 0.2,
+        "action_mean_abs_diff_threshold": 0.05,
     },
 )
 
