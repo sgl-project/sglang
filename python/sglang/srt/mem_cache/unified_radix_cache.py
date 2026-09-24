@@ -912,7 +912,7 @@ class UnifiedRadixCache(BasePrefixCache):
     def dec_lock_ref(
         self,
         node_id: NodeId,
-        params: DecLockRefParams,
+        params: Optional[DecLockRefParams] = None,
         skip_swa: bool = False,
     ) -> DecLockRefResult:
         result = self.session.try_dec_lock_ref(node_id, params)
