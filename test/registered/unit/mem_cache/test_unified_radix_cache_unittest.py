@@ -767,10 +767,14 @@ class TestUnifiedRadixAllocationEvictionRealComponents(CustomTestCase):
                         receipt = cache.inc_host_lock_ref(first).to_dec_params()
                     tracker = {ComponentType.FULL: 0, ct: 0}
                     # Only host allocation fails; tree walking and freeing are real.
-                    with mock.patch.object(
-                        cache, "_execute_and_commit_kv_backup", return_value=0
+                    with (
+                        mock.patch.object(cache, "cache_controller", mock.Mock()),
+                        mock.patch.object(
+                            cache, "_execute_and_commit_kv_backup", return_value=0
+                        ) as backup,
                     ):
                         cache._evict_components({ComponentType.FULL: 0, ct: 2}, tracker)
+                    backup.assert_called_once()
                     self.assertEqual(tracker[ct], 2)
                     self.assertEqual(tracker[ComponentType.FULL], 0)
                     for node_id in (first, second, leaf):
