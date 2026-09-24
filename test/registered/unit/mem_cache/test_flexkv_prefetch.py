@@ -16,6 +16,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     CacheRequestHandle,
     CacheRequestOutcome,
 )
+from sglang.srt.mem_cache.storage.flexkv.flexkv_cache_lifecycle import _namespace_kwargs
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
@@ -65,6 +66,7 @@ def method(path, cls, name):
         "torch": torch,
         "InitLoadBackParams": object,
         "_RestoreLease": NS,
+        "_namespace_kwargs": _namespace_kwargs,
         "logger": logging.getLogger(__name__),
     }
     exec(
@@ -383,3 +385,49 @@ def test_stale_abort_does_not_cancel_retried_prefetch(path, cls):
     assert new_key in cache._load_markers
     method(path, cls, "check_prefetch_progress")(cache, current)
     connector.check_prefetch_progress.assert_called_once_with(new_key)
+
+
+@pytest.mark.parametrize("chunked", [False, True])
+@pytest.mark.parametrize(
+    "extra_key,cache_salt",
+    [("adapter", None), (None, "tenant"), ("", ""), ("a\x00b", "c")],
+)
+def test_supported_namespace_prefetch_keeps_full_chain(chunked, extra_key, cache_salt):
+    connector = Mock(_chunked_prefetch=chunked, supports_cache_namespace=True)
+    cache = NS(flexkv_connector=connector, page_size=2)
+    method(SOURCE, "FlexKVRadixCache", "prefetch_from_storage")(
+        cache,
+        CacheRequestHandle("r", 1),
+        token_ids=[3, 4],
+        matched_prefix_tokens=[1, 2],
+        extra_key=extra_key,
+        cache_salt=cache_salt,
+    )
+    call = connector.prefetch_async.call_args
+    assert call.args == (_tracking_key("r", 1), [1, 2, 3, 4])
+    assert call.kwargs["namespace"] == [
+        json.dumps(["sglang-cache-v1", extra_key, cache_salt], separators=(",", ":"))
+    ]
+    assert ("candidate_start_token" in call.kwargs) is chunked
+    if chunked:
+        assert call.kwargs["candidate_start_token"] == 2
+
+
+def test_namespace_encoding_is_unambiguous_and_default_is_unchanged():
+    connector = NS(supports_cache_namespace=True)
+    identities = [
+        (None, ""),
+        ("", None),
+        ("a\x00b", "c"),
+        ("a", "b\x00c"),
+        ("a", "c"),
+        ("a", "d"),
+    ]
+    encoded = [
+        _namespace_kwargs(connector, *identity)["namespace"][0]
+        for identity in identities
+    ]
+    assert len(set(encoded)) == len(identities)
+    assert _namespace_kwargs(connector, None, None) == {}
+    assert _namespace_kwargs(NS(), "a", "b") is None
+    assert _namespace_kwargs(Mock(), "a", "b") is None

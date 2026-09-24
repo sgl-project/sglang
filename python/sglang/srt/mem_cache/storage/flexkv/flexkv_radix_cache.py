@@ -54,6 +54,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey, TreeNode
 from sglang.srt.mem_cache.storage.flexkv.flexkv_cache_lifecycle import (
     FlexKVCacheLifecycleMixin,
+    _namespace_kwargs,
     _request_key,
 )
 
@@ -89,6 +90,7 @@ class _PendingStoreLaunch:
     node: TreeNode
     token_ids: list[int]
     kv_indices: torch.Tensor
+    namespace: Optional[list[str]] = None
 
 
 @dataclass
@@ -100,6 +102,7 @@ class _PendingStoreCopy:
     kv_indices: torch.Tensor
     cpu_indices: Optional[torch.Tensor]
     ready_event: Optional[torch.cuda.Event]
+    namespace: Optional[list[str]] = None
 
 
 class FlexKVRadixCache(FlexKVCacheLifecycleMixin, RadixCache):
@@ -254,9 +257,11 @@ class FlexKVRadixCache(FlexKVCacheLifecycleMixin, RadixCache):
             key = key[:aligned_len]
 
         base_res = super().match_prefix(params)
-        # FlexKV's connector hashes tokens only. Namespaced GPU entries must
-        # never read KV produced for another LoRA adapter or cache salt.
-        if len(key) == 0 or key.extra_key is not None or key.cache_salt is not None:
+        if (
+            len(key) == 0
+            or _namespace_kwargs(self.flexkv_connector, key.extra_key, key.cache_salt)
+            is None
+        ):
             return base_res
 
         device_value: torch.Tensor = base_res.device_indices
@@ -278,6 +283,11 @@ class FlexKVRadixCache(FlexKVCacheLifecycleMixin, RadixCache):
     ) -> MatchResult:
         """LOOKUP-only path. Sets ``host_hit_length`` on the result so
         the scheduler later invokes :meth:`init_load_back`."""
+        namespace_kwargs = _namespace_kwargs(
+            self.flexkv_connector, key.extra_key, key.cache_salt
+        )
+        if namespace_kwargs is None:
+            return base_res
         token_ids = key.raw_token_ids()
         device_len = int(device_value.numel())
         if device_len >= len(token_ids):
@@ -293,6 +303,7 @@ class FlexKVRadixCache(FlexKVCacheLifecycleMixin, RadixCache):
             token_mask=token_mask,
             rid=_request_key(req.cache_request_handle),
             sglang_req_id=req.rid,
+            **namespace_kwargs,
         )
         if hit <= 0:
             return base_res
@@ -490,6 +501,9 @@ class FlexKVRadixCache(FlexKVCacheLifecycleMixin, RadixCache):
                 token_mask=token_mask,
                 rid=tracking_rid,
                 sglang_req_id=sglang_req_id,
+                **_namespace_kwargs(
+                    self.flexkv_connector, key.extra_key, key.cache_salt
+                ),
             )
             uncached_len = min(uncached_len, target_end - refreshed_len)
             value_numel = refreshed_len
@@ -616,7 +630,12 @@ class FlexKVRadixCache(FlexKVCacheLifecycleMixin, RadixCache):
             self._release_restore_prefix(_request_key(req.cache_request_handle))
         if hasattr(req, "_flexkv_restore_tree_owned_len"):
             del req._flexkv_restore_tree_owned_len
-        if not is_insert or req.extra_key is not None or req.cache_salt is not None:
+        namespace_kwargs = (
+            _namespace_kwargs(self.flexkv_connector, req.extra_key, req.cache_salt)
+            if is_insert
+            else None
+        )
+        if namespace_kwargs is None:
             self._load_markers.pop(_request_key(req.cache_request_handle), None)
             return
 
@@ -671,13 +690,17 @@ class FlexKVRadixCache(FlexKVCacheLifecycleMixin, RadixCache):
                         node=new_last_node,
                         token_ids=list(token_ids),
                         kv_indices=kv_indices,
+                        namespace=namespace_kwargs.get("namespace"),
                     )
                 )
             return
 
         try:
             fkv_task_id = self._launch_store(
-                _request_key(req.cache_request_handle), list(token_ids), kv_indices
+                _request_key(req.cache_request_handle),
+                list(token_ids),
+                kv_indices,
+                **namespace_kwargs,
             )
         except Exception:  # noqa: BLE001
             self.dec_lock_ref(new_last_node)
@@ -700,6 +723,7 @@ class FlexKVRadixCache(FlexKVCacheLifecycleMixin, RadixCache):
         token_ids: list[int],
         kv_indices: torch.Tensor,
         *,
+        namespace: Optional[list[str]] = None,
         mapping_already_on_cpu: bool = False,
         skip_mapping_validation: bool = False,
     ) -> int:
@@ -733,6 +757,7 @@ class FlexKVRadixCache(FlexKVCacheLifecycleMixin, RadixCache):
                     token_ids=token_ids,
                     kv_indices=kv_indices,
                     sglang_req_id=json.loads(rid)[0],
+                    **({"namespace": namespace} if namespace is not None else {}),
                 )
 
     def _store_profile_scope(self, name: str):
@@ -763,6 +788,7 @@ class FlexKVRadixCache(FlexKVCacheLifecycleMixin, RadixCache):
             kv_indices=pending.kv_indices,
             cpu_indices=cpu_indices,
             ready_event=ready_event,
+            namespace=pending.namespace,
         )
 
     def _launch_ready_store_copies(self) -> None:
@@ -793,6 +819,11 @@ class FlexKVRadixCache(FlexKVCacheLifecycleMixin, RadixCache):
                         store_indices,
                         mapping_already_on_cpu=pending.cpu_indices is not None,
                         skip_mapping_validation=pending.cpu_indices is None,
+                        **(
+                            {"namespace": pending.namespace}
+                            if pending.namespace is not None
+                            else {}
+                        ),
                     )
             except Exception:  # noqa: BLE001
                 self.dec_lock_ref(pending.node)

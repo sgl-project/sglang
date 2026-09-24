@@ -26,6 +26,26 @@ def _request_key(handle: CacheRequestHandle) -> str:
     return json.dumps([handle.rid, handle.attempt_id], separators=(",", ":"))
 
 
+def _namespace_kwargs(connector, extra_key, cache_salt) -> Optional[dict]:
+    """Return scoped connector arguments, or None when reuse is unsupported.
+
+    A single JSON component distinguishes null, empty strings and embedded
+    separators without depending on FlexKV's namespace component delimiter.
+    Unscoped requests keep their historical hash and connector call signature.
+    """
+    if extra_key is None and cache_salt is None:
+        return {}
+    if getattr(connector, "supports_cache_namespace", False) is not True:
+        return None
+    return {
+        "namespace": [
+            json.dumps(
+                ["sglang-cache-v1", extra_key, cache_salt], separators=(",", ":")
+            )
+        ]
+    }
+
+
 @dataclass
 class _RestoreLease:
     """Fresh destination slots retained until cache commit or a fenced reset."""
@@ -160,9 +180,10 @@ class FlexKVCacheLifecycleMixin:
         """Pass the complete token hash chain and the candidate's absolute offset."""
         rid = _request_key(handle)
         del last_host_node, last_hash, prefix_keys
-        # Match the foreground lookup/store isolation boundary: FlexKV's
-        # connector currently hashes tokens without a namespace or cache salt.
-        if extra_key is not None or cache_salt is not None or not token_ids:
+        namespace_kwargs = _namespace_kwargs(
+            self.flexkv_connector, extra_key, cache_salt
+        )
+        if namespace_kwargs is None or not token_ids:
             return
         prefix = [] if matched_prefix_tokens is None else list(matched_prefix_tokens)
         ids = prefix + list(token_ids)
@@ -171,10 +192,16 @@ class FlexKVCacheLifecycleMixin:
             return
         if getattr(self.flexkv_connector, "_chunked_prefetch", False):
             self.flexkv_connector.prefetch_async(
-                rid, ids, sglang_req_id=handle.rid, candidate_start_token=len(prefix)
+                rid,
+                ids,
+                sglang_req_id=handle.rid,
+                candidate_start_token=len(prefix),
+                **namespace_kwargs,
             )
         else:
-            self.flexkv_connector.prefetch_async(rid, ids, sglang_req_id=handle.rid)
+            self.flexkv_connector.prefetch_async(
+                rid, ids, sglang_req_id=handle.rid, **namespace_kwargs
+            )
 
     def check_prefetch_progress(self, handle: CacheRequestHandle) -> bool:
         rid = _request_key(handle)

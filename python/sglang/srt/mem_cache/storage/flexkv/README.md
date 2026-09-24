@@ -100,12 +100,15 @@ option; when changing layouts, use an empty or separately namespaced cache pool.
   Their N KV slots depend on N+1 raw tokens; the connector's token-only key
   cannot preserve the extra boundary token. This applies to both ordinary
   and hybrid adapters and both backend-selection flags.
-- The connector currently hashes token IDs without `extra_key` or `cache_salt`.
-  Such requests use their correctly namespaced GPU cache and recompute misses;
-  they skip **all** FlexKV lookup, store, and prefetch paths. This includes LoRA
-  namespaces. Supporting host reuse requires a shared connector key contract.
-  Deployments that previously stored namespaced requests through this adapter
-  should use a fresh host/remote cache pool to discard old unscoped entries.
+- Host/L3 reuse for `extra_key` (including LoRA) and `cache_salt` requires a
+  connector advertising `supports_cache_namespace=True`. Lookup, Store and
+  both prefetch modes pass the same single namespace component: compact JSON
+  `["sglang-cache-v1", extra_key, cache_salt]`. Deferred Store copies retain it.
+  Null and empty strings remain distinct; unscoped requests keep their existing
+  keys. Older connectors safely skip all FlexKV I/O for scoped requests.
+  Chunked prefetch also requires the namespace-aware #291 connector update.
+  Deployments that previously published unscoped KV for namespaced requests
+  must use a fresh host/remote cache pool to discard those old entries.
 - DeepSeek V4 unified-KV, independent `--enable-hisparse` device-page mapping,
   and Mamba/SSM pools are unsupported.
 - `--enable-streaming-session` is rejected: its wrapper can retain KV without

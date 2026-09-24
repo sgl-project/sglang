@@ -34,6 +34,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.storage.flexkv.flexkv_cache_lifecycle import (
     FlexKVCacheLifecycleMixin,
+    _namespace_kwargs,
     _request_key,
 )
 
@@ -57,6 +58,7 @@ class _StoreRequest:
     sglang_req_id: str
     token_ids: list[int]
     kv_indices: torch.Tensor
+    namespace: Optional[list[str]] = None
 
 
 class FlexKVHybridRadixCache(FlexKVCacheLifecycleMixin, BasePrefixCache):
@@ -167,7 +169,10 @@ class FlexKVHybridRadixCache(FlexKVCacheLifecycleMixin, BasePrefixCache):
             return result
 
         key = params.key.page_aligned(self.page_size)
-        if key.extra_key is not None or key.cache_salt is not None:
+        namespace_kwargs = _namespace_kwargs(
+            self.flexkv_connector, key.extra_key, key.cache_salt
+        )
+        if namespace_kwargs is None:
             return result
         token_ids = key.raw_token_ids()
         device_length = int(result.device_indices.numel())
@@ -181,6 +186,7 @@ class FlexKVHybridRadixCache(FlexKVCacheLifecycleMixin, BasePrefixCache):
             token_mask,
             rid=_request_key(params.req.cache_request_handle),
             sglang_req_id=params.req.rid,
+            **namespace_kwargs,
         )
         if hit_length <= 0:
             return result
@@ -415,9 +421,10 @@ class FlexKVHybridRadixCache(FlexKVCacheLifecycleMixin, BasePrefixCache):
 
     def _store_prefix(self, req: Req, token_ids: Sequence[int]) -> None:
         """Store a page-aligned prefix and its exact SWA/state snapshot."""
-        # The connector has no namespace/salt parameter. Keep these requests
-        # in the inner GPU cache rather than publishing unscoped host entries.
-        if req.extra_key is not None or req.cache_salt is not None:
+        namespace_kwargs = _namespace_kwargs(
+            self.flexkv_connector, req.extra_key, req.cache_salt
+        )
+        if namespace_kwargs is None:
             return
         aligned_length = len(token_ids) // self.page_size * self.page_size
         if aligned_length <= 0:
@@ -427,6 +434,7 @@ class FlexKVHybridRadixCache(FlexKVCacheLifecycleMixin, BasePrefixCache):
             array("q", token_ids),
             req.extra_key,
             is_bigram=bool(getattr(self._inner_cache, "is_eagle", False)),
+            cache_salt=req.cache_salt,
         )
         match = self._inner_cache.match_prefix(MatchPrefixParams(key=key))
         node = match.last_device_node
@@ -447,6 +455,7 @@ class FlexKVHybridRadixCache(FlexKVCacheLifecycleMixin, BasePrefixCache):
             sglang_req_id=req.rid,
             token_ids=token_ids,
             kv_indices=indices,
+            namespace=namespace_kwargs.get("namespace"),
         )
         try:
             task_id = self._launch_store(pending)
@@ -490,6 +499,11 @@ class FlexKVHybridRadixCache(FlexKVCacheLifecycleMixin, BasePrefixCache):
                     pending.token_ids,
                     indices,
                     sglang_req_id=pending.sglang_req_id,
+                    **(
+                        {"namespace": pending.namespace}
+                        if pending.namespace is not None
+                        else {}
+                    ),
                 )
 
     def _store_profile_scope(self, name: str):

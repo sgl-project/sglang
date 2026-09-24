@@ -18,6 +18,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchResult,
 )
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey
+from sglang.srt.mem_cache.storage.flexkv.flexkv_cache_lifecycle import _namespace_kwargs
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
@@ -54,8 +55,9 @@ def _load_hybrid_cache_class():
 FlexKVHybridRadixCache = _load_hybrid_cache_class()
 
 
+@pytest.mark.parametrize("supported", [False, True])
 @pytest.mark.parametrize("extra_key,cache_salt", [("lora-a", None), (None, "tenant-a")])
-def test_namespaced_lookup_does_not_read_unscoped_host_kv(extra_key, cache_salt):
+def test_namespaced_lookup_requires_connector_support(extra_key, cache_salt, supported):
     cache, req, _, _ = _make_layerwise_restore()
     result = MatchResult(
         device_indices=torch.empty(0, dtype=torch.int64),
@@ -65,10 +67,21 @@ def test_namespaced_lookup_does_not_read_unscoped_host_kv(extra_key, cache_salt)
     )
     cache._inner_cache.match_prefix.return_value = result
     cache.flexkv_connector.lookup_kv.return_value = (7, 4)
+    cache.flexkv_connector.supports_cache_namespace = supported
     key = RadixKey(array("q", range(4)), extra_key=extra_key, cache_salt=cache_salt)
 
-    assert cache.match_prefix(MatchPrefixParams(key=key, req=req)).host_hit_length == 0
-    cache.flexkv_connector.lookup_kv.assert_not_called()
+    assert cache.match_prefix(MatchPrefixParams(key=key, req=req)).host_hit_length == (
+        4 if supported else 0
+    )
+    if supported:
+        assert (
+            cache.flexkv_connector.lookup_kv.call_args.kwargs["namespace"]
+            == _namespace_kwargs(cache.flexkv_connector, extra_key, cache_salt)[
+                "namespace"
+            ]
+        )
+    else:
+        cache.flexkv_connector.lookup_kv.assert_not_called()
 
 
 @pytest.mark.parametrize("extra_key,cache_salt", [("lora-a", None), (None, "tenant-a")])
@@ -358,7 +371,8 @@ def test_finished_release_commits_restore_lease_after_inner_cache():
     assert req._flexkv_uncached_restore is False
 
 
-def test_prefill_boundary_is_stored_with_an_independent_tracking_key():
+@pytest.mark.parametrize("salt", [None, "tenant-a"])
+def test_prefill_boundary_is_stored_with_an_independent_tracking_key(salt):
     inner = MagicMock()
     inner.is_root.return_value = False
     inner.is_eagle = False
@@ -372,7 +386,7 @@ def test_prefill_boundary_is_stored_with_an_independent_tracking_key():
     dec_params = object()
     inner.inc_lock_ref.return_value = SimpleNamespace(to_dec_params=lambda: dec_params)
 
-    connector = MagicMock()
+    connector = MagicMock(supports_cache_namespace=True)
     connector.store_kv.side_effect = [17, 18]
     cache = FlexKVHybridRadixCache.__new__(FlexKVHybridRadixCache)
     cache._inner_cache = inner
@@ -388,7 +402,7 @@ def test_prefill_boundary_is_stored_with_an_independent_tracking_key():
         rid="request",
         cache_request_handle=CacheRequestHandle("request", 0),
         extra_key=None,
-        cache_salt=None,
+        cache_salt=salt,
         kv=SimpleNamespace(swa_evicted_seqlen=0),
         get_fill_ids=lambda: array("q", [1, 2, 3, 4]),
     )
@@ -416,6 +430,12 @@ def test_prefill_boundary_is_stored_with_an_independent_tracking_key():
         _tracking_key("request") + ":flexkv-store:0": (node, dec_params),
         _tracking_key("request") + ":flexkv-store:1": (node, dec_params),
     }
+
+    assert inner.match_prefix.call_args.args[0].key.cache_salt == salt
+    for store in (first_store, second_store):
+        assert store.kwargs.get("namespace") == _namespace_kwargs(
+            connector, None, salt
+        ).get("namespace")
 
 
 def test_reset_drains_flexkv_before_releasing_inner_slots():
