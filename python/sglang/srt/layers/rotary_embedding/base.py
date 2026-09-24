@@ -489,6 +489,8 @@ class RotaryEmbedding(BaseFusedOp):
                 self.is_neox_style,
             )
             return query, key
+        elif self.head_size != self.rotary_dim:
+            return self.forward_native(positions, query, key)
         else:
             self._match_cos_sin_cache_dtype(query)
             # Use fallback kernel of 'rotary_embedding'.
