@@ -1049,9 +1049,8 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
             self.indexer_head_dim, use_fp4_indexer=True
         )
 
-        self._swa_ring_size = get_swa_ring_size(
-            self.sliding_window_size, self.is_speculative
-        )
+        # kvc.sliding_window_size is None on a runner without SWA layers.
+        self._swa_ring_size = get_swa_ring_size(cfg.window_size, self.is_speculative)
         self._spec_infl = 1.0
 
         # The unified pool ignores --kv-cache-dtype; V4 resolves "auto" to fp8_e4m3
