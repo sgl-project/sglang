@@ -73,6 +73,22 @@ class StorageAttachment:
                 "launch with --enable-hierarchical-cache to attach a backend.",
             )
 
+        from sglang.srt.runtime_context import get_parallel, get_server_args
+
+        if get_parallel().attn_dcp_size > 1:
+            from sglang.srt.arg_groups.hicache_hook import validate_hicache_dcp_storage
+
+            try:
+                validate_hicache_dcp_storage(
+                    get_server_args(),
+                    storage_backend=storage_backend,
+                    prefetch_policy=hicache_storage_prefetch_policy
+                    or cache.prefetch_stop_policy,
+                    write_policy=hicache_write_policy or controller.write_policy,
+                )
+            except NotImplementedError as e:
+                return False, str(e)
+
         if cache.enable_storage:
             current_backend = controller.storage_backend_type
             if current_backend != storage_backend:

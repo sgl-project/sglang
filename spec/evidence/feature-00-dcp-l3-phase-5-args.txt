@@ -1,5 +1,4 @@
-............................ [ 46%]
-................................                                         [100%]
+.........                                            [100%]
 =============================== warnings summary ===============================
 ../../../../../opt/sglang/lib/python3.12/site-packages/_pytest/config/__init__.py:1464
   /opt/sglang/lib/python3.12/site-packages/_pytest/config/__init__.py:1464: PytestConfigWarning: Unknown config option: asyncio_mode
@@ -11,4 +10,4 @@
     warnings.warn(
 
 -- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
-60 passed, 15 warnings, 44 subtests passed in 13.11s
+9 passed, 271 deselected, 15 warnings, 20 subtests passed in 10.34s

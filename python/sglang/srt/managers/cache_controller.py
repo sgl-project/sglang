@@ -532,9 +532,26 @@ class HiCacheController:
         if self.enable_storage:
             raise RuntimeError("Storage backend already attached.")
         if get_parallel().attn_dcp_size > 1:
-            raise NotImplementedError(
-                "HiCache L3 with DCP is not supported yet, including runtime attachment."
+            from sglang.srt.arg_groups.hicache_hook import validate_hicache_dcp_storage
+            from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
+            from sglang.srt.runtime_context import get_server_args
+
+            validate_hicache_dcp_storage(
+                get_server_args(),
+                storage_backend=storage_backend,
+                write_policy=self.write_policy,
+                # Startup and StorageAttachment validate the effective policy;
+                # runtime attachment can override the original server args.
+                prefetch_policy="wait_complete",
             )
+            if (
+                type(self.storage_host_pool) is not MLATokenToKVPoolHost
+                or self.storage_host_pool.dtype != torch.bfloat16
+                or len(getattr(self.mem_pool_host, "entries", [None])) != 1
+            ):
+                raise NotImplementedError(
+                    "HiCache L3 with DCP requires a single dense BF16 MLA pool."
+                )
 
         # Defensive: a previous partial detach may have flipped `enable_storage` but
         # left background threads alive. Attaching on top of them is unsafe.
@@ -1375,3 +1392,9 @@ class HiCacheController:
                 self.prefetch_completion_sync_groups,
             )
             ack.completed_tokens = completed_tokens_tensor.item()
+            if self.storage_config.dcp_size > 1:
+                logger.debug(
+                    "DCP L3 prefetch: tp_rank=%d tokens=%d",
+                    self.storage_config.tp_rank,
+                    ack.completed_tokens,
+                )

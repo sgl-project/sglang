@@ -280,9 +280,11 @@ class TestDcpStorageController(CustomTestCase):
                         cc.storage_backend._evictor.is_storage_owner, not cc.backup_skip
                     )
 
-    def test_runtime_attach_rejects_dcp_before_side_effects(self):
+    def test_runtime_attach_rejects_unsupported_pool_before_side_effects(self):
         cc = HiCacheController.__new__(HiCacheController)
         cc.enable_storage = False
+        cc.write_policy = "write_through"
+        cc.storage_host_pool = object()
         cc._stop_storage_threads = mock.Mock()
         cc._start_storage_threads = mock.Mock()
         cc._generate_storage_config = mock.Mock()
@@ -293,7 +295,13 @@ class TestDcpStorageController(CustomTestCase):
                     "sglang.srt.managers.cache_controller.get_parallel",
                     return_value=_parallel(0, dcp_size),
                 ),
-                self.assertRaisesRegex(NotImplementedError, "runtime attachment"),
+                mock.patch("sglang.srt.runtime_context.get_server_args"),
+                mock.patch(
+                    "sglang.srt.arg_groups.hicache_hook.validate_hicache_dcp_storage"
+                ),
+                self.assertRaisesRegex(
+                    NotImplementedError, "single dense BF16 MLA pool"
+                ),
             ):
                 cc.attach_storage_backend("file")
         cc._stop_storage_threads.assert_not_called()
