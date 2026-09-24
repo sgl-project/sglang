@@ -843,6 +843,8 @@ class Envs:
     # and relies on the RDMA retry-exceeded timeout only.
     SGLANG_MORI_TRANSFER_TIMEOUT_MS = EnvInt(0)
     SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(4096)
+    SGLANG_MORI_EP_VERSION = EnvStr("epv1")
+    SGLANG_MORI_RECV_BOUND = EnvBool(False)
 
     # ===================================================================
     # AMD, ROCm, and AITER
