@@ -3375,3 +3375,61 @@ def _validate_server_args(**overrides):
 def test_sensenova_u1_lora_target_modules(overrides, expected):
     server_args = _validate_server_args(**overrides)
     assert server_args.lora_target_modules == expected
+
+
+def test_sensenova_pixel_head_sp_matches_unsharded_decoder(monkeypatch):
+    from sglang.multimodal_gen.runtime.distributed.sp_shard_utils import (
+        SpShard,
+        shard_like,
+    )
+
+    head = torch.nn.Conv2d(3, 3, kernel_size=3, padding=1, bias=False)
+    with torch.no_grad():
+        head.weight.fill_(1 / 9)
+
+    model = SimpleNamespace(
+        language_model=SimpleNamespace(
+            model=lambda **kwargs: SimpleNamespace(
+                last_hidden_state=kwargs["inputs_embeds"]
+            )
+        ),
+        use_pixel_head=True,
+        downsample_ratio=1,
+        patch_size=1,
+        fm_modules={"fm_head": head},
+        config=SimpleNamespace(t_eps=0.02),
+    )
+    hidden = torch.arange(27, dtype=torch.float32).reshape(1, 9, 3)
+    z = torch.zeros(1, 9, 3)
+    t = torch.tensor(0.25)
+    full_shard = SpShard(9, 9, 0, 1, 0)
+    monkeypatch.setattr(modeling_neo_chat, "_build_image_shard", lambda _: full_shard)
+
+    def predict(local_hidden, local_z):
+        return NEOChatModel._t2i_predict_v(
+            model,
+            local_hidden,
+            None,
+            None,
+            None,
+            t,
+            local_z,
+            image_token_num=local_hidden.shape[1],
+            image_size=(3, 3),
+        )
+
+    expected = predict(hidden, z)
+    for rank in range(2):
+        shard = SpShard(9, 5, 1, 2, rank)
+        local_hidden = shard_like(hidden, shard, dim=1)
+        local_z = shard_like(z, shard, dim=1)
+        monkeypatch.setattr(modeling_neo_chat, "_build_image_shard", lambda _: shard)
+
+        def gather(local, original_length):
+            assert original_length == 9
+            torch.testing.assert_close(local, local_hidden)
+            return hidden
+
+        monkeypatch.setattr(modeling_neo_chat, "_sp_gather_tokens", gather)
+        actual = predict(local_hidden, local_z)
+        torch.testing.assert_close(actual, shard_like(expected, shard, dim=1))

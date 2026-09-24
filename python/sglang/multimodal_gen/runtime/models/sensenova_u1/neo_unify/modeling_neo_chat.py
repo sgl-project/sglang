@@ -983,18 +983,18 @@ class NEOChatModel(PreTrainedModel):
         )
 
         if self.use_pixel_head:
-            if _sp_world_size() > 1:
-                raise NotImplementedError(
-                    "SenseNova sequence parallelism does not support the legacy "
-                    "pixel-head checkpoint layout."
-                )
             merge_size = int(1 / self.downsample_ratio)
             token_h = image_size[1] // (self.patch_size * merge_size)
             token_w = image_size[0] // (self.patch_size * merge_size)
+            full_image_token_num = token_h * token_w
 
-            img_reshaped = outputs.last_hidden_state[:, -image_token_num:].view(
-                B, token_h, token_w, -1
-            )
+            # The convolution mixes neighboring image tokens, including tokens
+            # on different SP ranks. Decode the complete grid on every rank,
+            # then restore the sequence shard used by the denoising loop.
+            image_hidden = outputs.last_hidden_state[:, -image_token_num:]
+            image_hidden = _sp_gather_tokens(image_hidden, full_image_token_num)
+
+            img_reshaped = image_hidden.reshape(B, token_h, token_w, -1)
             img_2d = torch.einsum("b h w c -> b c h w", img_reshaped)
             img_2d = img_2d.contiguous().view(B, -1, token_h, token_w)
 
@@ -1014,7 +1014,7 @@ class NEOChatModel(PreTrainedModel):
             out_1d = smoothed_reshaped.contiguous().view(
                 B, L, self.patch_size * merge_size * self.patch_size * merge_size * 3
             )
-            x_pred = out_1d
+            x_pred = shard_like(out_1d, _build_image_shard(full_image_token_num), dim=1)
         else:
             if self.use_deep_fm_head:
                 x_pred = self.fm_modules["fm_head"](
