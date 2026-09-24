@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
+import inspect
 import math
 import sys
 
@@ -150,9 +151,14 @@ def test_image_positions_match_transformers(grids):
     for _, height, width in grids:
         ids += [101] + [100] * (height * width // 4) + [102, 6, 7]
     ids += [8, 9]
+    input_ids = torch.tensor([ids])
+    rope_kwargs = {}
+    if "mm_token_type_ids" in inspect.signature(reference.get_rope_index).parameters:
+        rope_kwargs["mm_token_type_ids"] = (input_ids == config.image_token_id).int()
     expected, _ = reference.get_rope_index(
-        torch.tensor([ids]),
+        input_ids,
         image_grid_thw=torch.tensor(grids) if grids else None,
+        **rope_kwargs,
     )
     actual = image_position_ids(np.array(ids), grids, 100, 2)
     np.testing.assert_array_equal(np.array(actual), expected.numpy())

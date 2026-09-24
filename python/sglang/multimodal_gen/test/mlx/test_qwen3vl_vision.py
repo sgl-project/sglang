@@ -9,6 +9,7 @@ import pytest
 
 mx = pytest.importorskip("mlx.core")
 torch = pytest.importorskip("torch")
+transformers = pytest.importorskip("transformers")
 hf = pytest.importorskip("transformers.models.qwen3_vl.modeling_qwen3_vl")
 
 _MODEL_PATH = (
@@ -22,7 +23,19 @@ model_module = importlib.util.module_from_spec(_SPEC)
 _SPEC.loader.exec_module(model_module)
 
 
-@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize(
+    "dtype",
+    [
+        torch.float32,
+        pytest.param(
+            torch.bfloat16,
+            marks=pytest.mark.skipif(
+                transformers.__version__ != "4.57.3",
+                reason="BF16 oracle requires 4.57.3; v5 changes position interpolation",
+            ),
+        ),
+    ],
+)
 def test_vision_matches_transformers_and_isolates_reference_images(dtype):
     torch.manual_seed(31)
     settings = dict(
@@ -60,7 +73,12 @@ def test_vision_matches_transformers_and_isolates_reference_images(dtype):
         torch.no_grad(),
         torch.nn.attention.sdpa_kernel(torch.nn.attention.SDPBackend.MATH),
     ):
-        expected, deepstack = reference(pixels, torch.tensor(grid))
+        reference_output = reference(pixels, torch.tensor(grid))
+    if isinstance(reference_output, tuple):
+        expected, deepstack = reference_output
+    else:
+        expected = reference_output.pooler_output
+        deepstack = reference_output.deepstack_features
     x = mx.array(pixels.float().numpy()).astype(mlx_dtype)
     actual, actual_deepstack = model(x, grid)
     assert len(actual_deepstack) == len(deepstack) == 2
