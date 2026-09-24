@@ -20,8 +20,9 @@ Adapted from the FLUX Action reference implementation
 ``video_vae.safetensors`` so the checkpoint loads without renaming.
 
 Latents are ``(B, 96, 1 + (T - 1) // 4, H // 32, W // 32)`` and normalized by
-the running statistics stored in the checkpoint. Requires the ``natten``
-package (https://natten.org).
+the running statistics stored in the checkpoint. Neighborhood attention runs
+on NATTEN (https://natten.org) when installed, else on a FlexAttention fallback
+(``flux3_neighborhood_attention``).
 """
 
 from __future__ import annotations
@@ -40,6 +41,10 @@ from sglang.multimodal_gen.configs.models.vaes.flux3_video import (
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     LayerwiseOffloadableModuleMixin,
+)
+from sglang.multimodal_gen.runtime.models.vaes.flux3_neighborhood_attention import (
+    natten_available,
+    neighborhood_attention,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
@@ -305,16 +310,25 @@ class Natten3D(nn.Module):
     def _attend(
         self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor
     ) -> torch.Tensor:
-        from natten.functional import na2d, na3d
-
         if q.shape[1] == 1:  # a single frame uses the 2-D kernel
             q2, k2, v2 = q.squeeze(1), k.squeeze(1), v.squeeze(1)
             kernel = self.window_size[1:]
+            if not natten_available():
+                out = neighborhood_attention(q2, k2, v2, kernel_size=kernel)
+                return out.unsqueeze(1)
+            from natten.functional import na2d
+
             kwargs = _natten_attention_kwargs(q2, k2, v2, kernel_size=kernel)
             return na2d(
                 q2, k2, v2, kernel_size=kernel, attention_kwargs=kwargs
             ).unsqueeze(1)
         causal = [self.causal, False, False]
+        if not natten_available():
+            return neighborhood_attention(
+                q, k, v, kernel_size=self.window_size, is_causal=causal
+            )
+        from natten.functional import na3d
+
         kwargs = _natten_attention_kwargs(
             q, k, v, kernel_size=self.window_size, is_causal=causal
         )

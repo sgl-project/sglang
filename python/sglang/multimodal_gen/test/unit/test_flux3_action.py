@@ -730,6 +730,72 @@ def test_sp_joint_segments_follow_the_rank_shard():
     assert all(not m.any() for m in last[1][2])
 
 
+def _dense_neighborhood(q, k, v, kernel, causal):
+    """NATTEN windows spelled out as a dense mask over ``(B, *grid, heads, D)``."""
+    grid = q.shape[1:-2]
+    coords = torch.cartesian_prod(*[torch.arange(n) for n in grid]).reshape(
+        -1, len(grid)
+    )
+    allowed = torch.ones(coords.shape[0], coords.shape[0], dtype=torch.bool)
+    for axis, (n, size, is_causal) in enumerate(zip(grid, kernel, causal)):
+        qi, ki = coords[:, axis, None], coords[None, :, axis]
+        if is_causal:
+            allowed &= (ki <= qi) & (ki > qi - size)
+        else:
+            start = (qi - size // 2).clamp(0, n - size)
+            allowed &= (ki >= start) & (ki < start + size)
+
+    def flat(x):
+        return x.reshape(x.shape[0], -1, *x.shape[-2:]).transpose(1, 2)
+
+    out = torch.nn.functional.scaled_dot_product_attention(
+        flat(q).float(),
+        flat(k).float(),
+        flat(v).float(),
+        attn_mask=allowed.to(q.device),
+    )
+    return out.transpose(1, 2).reshape(q.shape)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+@pytest.mark.parametrize(
+    "grid, kernel, causal",
+    [
+        ((9, 11), (5, 5), (False, False)),
+        ((6, 7, 9), (5, 5, 5), (True, False, False)),
+        ((5, 6, 7), (5, 5, 5), (False, False, False)),
+    ],
+)
+def test_vae_attention_fallback_uses_natten_windows(grid, kernel, causal):
+    """Without NATTEN the VAE must attend over NATTEN's windows.
+
+    Non-causal windows shift inward at the borders instead of shrinking; a
+    causal axis takes the ``k`` latest positions.
+    """
+    from sglang.multimodal_gen.runtime.models.vaes.flux3_neighborhood_attention import (
+        natten_available,
+        neighborhood_attention,
+    )
+
+    torch.manual_seed(0)
+    q, k, v = (
+        torch.randn(1, *grid, 2, 64, device="cuda", dtype=torch.bfloat16)
+        for _ in range(3)
+    )
+    is_causal = list(causal) if any(causal) else None
+    out = neighborhood_attention(q, k, v, kernel_size=list(kernel), is_causal=is_causal)
+    reference = _dense_neighborhood(q, k, v, kernel, causal)
+    torch.testing.assert_close(out.float(), reference, atol=2e-2, rtol=2e-2)
+    if natten_available():
+        from natten.functional import na2d, na3d
+
+        kwargs = {} if is_causal is None else {"is_causal": is_causal}
+        natten_out = (na2d if len(grid) == 2 else na3d)(
+            q, k, v, kernel_size=list(kernel), **kwargs
+        )
+        torch.testing.assert_close(out, natten_out, atol=2e-2, rtol=2e-2)
+
+
 def test_fused_qknorm_rope_matches_the_eager_rotation():
     """The fused kernel must use the same [cos | sin] cache layout and interleaved pairs."""
     from sglang.kernels.ops.diffusion import fused_inplace_qknorm_rope

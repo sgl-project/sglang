@@ -51,7 +51,7 @@ cd sglang
 pip install -e "python[diffusion]"
 ```
 
-The video VAE needs [NATTEN](https://natten.org). Pick the wheel that matches your torch and CUDA versions from [whl.natten.org](https://whl.natten.org/).
+The video VAE runs its neighborhood attention on [NATTEN](https://natten.org) when it is installed. NATTEN is not a dependency of `sglang[diffusion]`; without it the VAE uses a compiled FlexAttention fallback with the same windows (actions stay at the bf16 rounding level), and the first request pays a one-time compile of about 15 s. To use NATTEN, pick the wheel that matches your torch and CUDA versions from [whl.natten.org](https://whl.natten.org/).
 
 ## 3. Model Deployment
 
