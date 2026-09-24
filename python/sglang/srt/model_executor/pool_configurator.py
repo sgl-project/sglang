@@ -1077,17 +1077,13 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         if self.c4_shrink_factor > 1:
             logger.info(f"HiSparse c4 host-to-device ratio = {self.c4_shrink_factor}")
 
-        # Same arguments as the pool's get_ring_size, so both sides agree.
-        num_draft_tokens = get_spec().speculative_num_draft_tokens or 0
-        self.c4_ring_size = get_compress_state_ring_size(
-            4, self.is_speculative, num_draft_tokens
+        # Same argument as the pool's get_ring_size, so both sides agree.
+        num_draft_tokens = (
+            (get_spec().speculative_num_draft_tokens or 0) if self.is_speculative else 0
         )
-        self.c128_ring_size = get_compress_state_ring_size(
-            128, self.is_speculative, num_draft_tokens
-        )
-        self.c2_ring_size = get_compress_state_ring_size(
-            2, self.is_speculative, num_draft_tokens
-        )
+        self.c4_ring_size = get_compress_state_ring_size(4, num_draft_tokens)
+        self.c128_ring_size = get_compress_state_ring_size(128, num_draft_tokens)
+        self.c2_ring_size = get_compress_state_ring_size(2, num_draft_tokens)
 
         self.num_layers_total = len(self.compression_ratios)
         self.num_layers_ca4 = sum(1 for r in self.compression_ratios if r == 4)
