@@ -456,6 +456,31 @@ class SWAComponent(TreeComponent):
             )
         alloc.set_full_to_swa_mapping(full, swa)
 
+    def tree_owned_swa_floor(self, node_id: int, hi_pos: int) -> int | None:
+        """Earliest position on this request's path whose SWA the tree still owns."""
+        if node_id is None or hi_pos <= 0:
+            return None
+        ct = self.component_type
+        root = self.tree_core.root_node
+        node = self.tree_core.node_by_id(node_id)
+        end = hi_pos
+        floor = None
+        while node.id != root.id and end > 0:
+            base = node.component_data[BASE_COMPONENT_TYPE].value
+            cd = node.component_data[ct]
+            length = (
+                len(base)
+                if base is not None
+                else (len(cd.value) if cd.value is not None else 0)
+            )
+            if length == 0:
+                break
+            if cd.value is not None:
+                floor = end - length
+            end -= length
+            node = node.parent
+        return floor
+
     def update_component_on_insert_overlap(
         self,
         node: UnifiedTreeNode,
@@ -1055,6 +1080,11 @@ class SWAComponent(TreeComponent):
             req_to_token_pool=self.cache.req_to_token_pool,
             token_to_kv_pool_allocator=self.cache.token_to_kv_pool_allocator,
             retain_floor=self.cache.swa_retain_floor(req),
+            owned_floor=(
+                self.tree_owned_swa_floor(req.last_node, pre_len)
+                if req.last_node is not None
+                else None
+            ),
         )
 
     def free_out_of_window_slots(
