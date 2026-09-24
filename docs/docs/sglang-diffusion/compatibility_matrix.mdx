@@ -122,25 +122,6 @@ python -m pytest -q python/sglang/multimodal_gen/test/server/test_server_qwen_im
 The module skips without the model variable; only editing skips when the image
 variable is absent. Credentials stay in the runner environment.
 
-## Anima
-
-Native text-to-image support targets
-`circlestone-labs/Anima-Base-v1.0-Diffusers`. It reuses the Qwen3 encoder,
-Qwen-Image VAE, and standard SGLang denoising stages. Separate Aesthetic, Turbo,
-and single-file ComfyUI checkpoints are not covered by this integration.
-
-Full-checkpoint checks on H200 cover 1024px/30-step generation and HTTP serving,
-including repeated requests and multiple outputs. Two-GPU functional checks
-cover TP, Ulysses, Ring with FlashAttention, CFG parallelism, encoder folding,
-and parallel tiled VAE decode.
-Additional checks cover DiT and conditioner layerwise offload, FlashAttention,
-Torch SDPA, SageAttention, Cache-DiT, and breakable CUDA graphs. These are
-functional checks, not a broad quality evaluation of approximate optimizations.
-
-Combined TP and SP, multi-node execution, non-NVIDIA devices, and third-party LoRAs
-remain unverified. See the [Anima cookbook](/cookbook/diffusion/CircleStone/Anima)
-for commands, checkpoint scope, and sampling defaults.
-
 ## Supported model inventory
 
 Use a listed checkpoint as `--model-path` with `sglang generate` or

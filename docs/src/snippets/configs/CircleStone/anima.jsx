@@ -1,6 +1,10 @@
 export const config = {
   modelName: "Anima Base v1.0",
-  supportedHardware: ["h200"],
+  supportedHardware: ["rtx5090", "dgx-spark", "h200"],
+  hardware: [
+    { id: "rtx5090", label: "RTX 5090", vram: "32GB", vendor: "consumer" },
+    { id: "dgx-spark", label: "DGX Spark", vram: "128GB unified", vendor: "blackwell" },
+  ],
   groupHardware: false,
   matchDims: [],
   overlayDims: [
@@ -23,11 +27,12 @@ export const config = {
       ],
     },
     {
-      id: "attention", title: "Attention", scope: "serve", default: "fa",
+      id: "attention", title: "Attention", scope: "serve", default: "platform",
       description: "Exact attention backends can differ in floating-point reduction order.",
       options: [
-        { id: "fa", label: "FlashAttention", flags: ["--attention-backend fa"], recommended: true },
-        { id: "sdpa", label: "Torch SDPA", flags: ["--attention-backend torch_sdpa"], soft: true, softReason: "Offline generation verified; this HTTP recipe is unverified." },
+        { id: "platform", label: "Platform default", flags: (s) => [`--attention-backend ${s.hw === "h200" ? "fa" : "torch_sdpa"}`], recommended: true },
+        { id: "fa", label: "FlashAttention", flags: ["--attention-backend fa"], soft: (s) => s.hw !== "h200", softReason: "On RTX 5090 and Spark, this selector falls back to Torch SDPA. Select Torch SDPA explicitly." },
+        { id: "sdpa", label: "Torch SDPA", flags: ["--attention-backend torch_sdpa"], soft: (s) => s.hw === "h200", softReason: "Offline generation verified; this HTTP recipe is unverified." },
       ],
     },
     {
@@ -36,27 +41,33 @@ export const config = {
     },
   ],
   commandBuilder: {
-    defaultSelection: { hw: "h200", nodes: 1, gpus_per_node: 1, topology_mode: "auto", tp_size: 1, ulysses_degree: 1, ring_degree: 1 },
+    defaultSelection: { hw: "rtx5090", nodes: 1, gpus_per_node: 1, topology_mode: "auto", tp_size: 1, ulysses_degree: 1, ring_degree: 1 },
     resource: {
       limits: { nodes: { min: 1, max: 1 }, gpus_per_node: { min: 1, max: 8 } },
       verifiedRecipes: [
-        { id: "h200-1gpu-resident-fa", hw: "h200", gpus_per_node: 1, tp_size: 1, ulysses_degree: 1, ring_degree: 1, placement: "resident", attention: "fa" },
+        { id: "rtx5090-1gpu-resident-sdpa", hw: "rtx5090", nodes: 1, gpus_per_node: 1, tp_size: 1, ulysses_degree: 1, ring_degree: 1, placement: "resident", attention: "sdpa" },
+        { id: "dgx-spark-1gpu-resident-sdpa", hw: "dgx-spark", nodes: 1, gpus_per_node: 1, tp_size: 1, ulysses_degree: 1, ring_degree: 1, placement: "resident", attention: "sdpa" },
+        { id: "h200-1gpu-resident-fa", hw: "h200", nodes: 1, gpus_per_node: 1, tp_size: 1, ulysses_degree: 1, ring_degree: 1, placement: "resident", attention: "fa" },
       ],
       autoTopology: (s) => ({ tp_size: Number(s.gpus_per_node), ulysses_degree: 1, ring_degree: 1 }),
       validateTopology: (s, t) => {
         const errors = [];
+        if (Number(s.nodes) !== 1) errors.push("This picker covers single-node deployment only.");
+        if (s.hw === "dgx-spark" && Number(s.gpus_per_node) !== 1) errors.push("DGX Spark has one GPU per node.");
         if (Number(s.nodes) * Number(s.gpus_per_node) !== t.tp_size * t.ulysses_degree * t.ring_degree) errors.push("GPU count must equal TP * Ulysses * Ring.");
         if (16 % (t.tp_size * t.ulysses_degree)) errors.push("TP * Ulysses must divide Anima's 16 attention heads.");
+        if (t.ring_degree > 1 && (s.hw !== "h200" || s.attention === "sdpa")) errors.push("Ring requires FlashAttention; this hardware/backend selection uses Torch SDPA.");
         return errors;
       },
     },
     resolveDeployment: (s) => {
       const r = config.commandBuilder.resource;
+      const attention = s.attention === "platform" ? (s.hw === "h200" ? "fa" : "sdpa") : s.attention;
       const t = s.topology_mode === "manual"
         ? { tp_size: Number(s.tp_size), ulysses_degree: Number(s.ulysses_degree), ring_degree: Number(s.ring_degree) }
         : r.autoTopology(s);
       const errors = r.validateTopology(s, t);
-      const recipe = r.verifiedRecipes.find((v) => v.hw === s.hw && v.gpus_per_node === Number(s.gpus_per_node) && v.tp_size === t.tp_size && v.ulysses_degree === t.ulysses_degree && v.ring_degree === t.ring_degree && v.placement === s.placement && v.attention === s.attention);
+      const recipe = r.verifiedRecipes.find((v) => v.hw === s.hw && v.gpus_per_node === Number(s.gpus_per_node) && v.tp_size === t.tp_size && v.ulysses_degree === t.ulysses_degree && v.ring_degree === t.ring_degree && v.placement === s.placement && v.attention === attention);
       const verified = !!recipe && Number(s.outputs) === 1 && errors.length === 0;
       const flags = ["--model-path {{MODEL_NAME}}"];
       const world = Number(s.nodes) * Number(s.gpus_per_node);
@@ -68,6 +79,7 @@ export const config = {
           topology: t, topologySummary: `TP ${t.tp_size} / Ulysses ${t.ulysses_degree} / Ring ${t.ring_degree}`,
           errors, warnings: verified ? [] : ["This exact HTTP recipe has not been verified."],
           verification: { serve: verified ? "verified" : "unverified", request: verified ? "verified" : "unverified" },
+          resolvedSettings: { attention: s.attention === "platform" ? (attention === "fa" ? "FlashAttention" : "Torch SDPA") : undefined },
         },
       };
     },

@@ -23,6 +23,13 @@ Use the official `circlestone-labs/Anima-Base-v1.0-Diffusers` checkpoint. SGLang
 its `modular_model_index.json` directly; no checkpoint conversion or newer Diffusers
 runtime is required.
 
+For a personal workstation, start with the single-GPU **Resident** recipe. RTX 5090
+(32 GB VRAM) and DGX Spark (128 GB unified memory, shared with the CPU) are verified
+with Torch SDPA at 1024 x 1024, 30 steps, and one output per request. Both completed
+repeated HTTP requests without CPU offload. H200 remains available for server
+deployments. The picker selects the tested attention backend for each platform;
+larger batches and resolutions need their own memory validation.
+
 <Deployment config={config} />
 
 ## 2. Model capabilities
@@ -78,8 +85,11 @@ CPU and layerwise offload trade memory for transfers. The additional
 components. Cache-DiT and quantized attention are approximate optimizations; assess
 image quality for your prompts before enabling them. See
 [performance optimization](/docs/sglang-diffusion/performance-optimization) for the
-shared controls and [compatibility](/docs/sglang-diffusion/compatibility_matrix#anima)
-for the tested scope.
+shared controls. H200 functional checks cover TP, Ulysses, Ring, CFG parallelism,
+encoder folding, parallel tiled VAE decode, layerwise offload, FlashAttention,
+Torch SDPA, SageAttention, Cache-DiT, and breakable CUDA graphs. These checks are
+not a quality guarantee for approximate optimizations. Combined TP and SP,
+multi-node execution, non-NVIDIA devices, and third-party LoRAs remain unverified.
 
 Breakable CUDA graphs reuse the conditioner's actual sequence length, without
 additional text-bucket padding. Requests with uncaptured shapes fall back to eager
