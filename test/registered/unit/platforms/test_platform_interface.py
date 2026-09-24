@@ -5,7 +5,6 @@ Tests DeviceMixin, SRTPlatform, PlatformEnum, CpuArchEnum, DeviceCapability,
 and the platform discovery / lazy initialization mechanism.
 """
 
-from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import torch
@@ -602,8 +601,8 @@ class TestMluSRTPlatform(CustomTestCase):
         self.assertEqual(base.get_dispatch_key_name(), "mlu")
         self.assertEqual(base.get_default_attention_backend(), "mlu")
         self.assertEqual(base.get_torch_distributed_backend_str(), "cncl")
-        self.assertFalse(base.support_cuda_graph())
-        self.assertFalse(base.support_piecewise_cuda_graph())
+        self.assertTrue(base.capabilities.graph_capture)
+        self.assertFalse(base.capabilities.piecewise_graph)
         self.assertEqual(base.get_position_dtype(), torch.int32)
 
     def test_mlu_pin_memory_available_for_accelerator_targets(self):

@@ -11,7 +11,7 @@ from sglang.srt.platforms.device_mixin import (
     DeviceMixin,
     PlatformEnum,
 )
-from sglang.srt.platforms.interface import KVPoolKind, SRTPlatform
+from sglang.srt.platforms.interface import KVPoolKind, PlatformCapabilities, SRTPlatform
 
 
 class MluDeviceMixin(DeviceMixin):
@@ -77,6 +77,8 @@ class MluDeviceMixin(DeviceMixin):
 class MluSRTPlatform(MluDeviceMixin, SRTPlatform):
     """In-tree Cambricon MLU SRT platform."""
 
+    capabilities = PlatformCapabilities(graph_capture=True)
+
     def get_dispatch_key_name(self) -> str:
         return "mlu"
 
@@ -85,6 +87,13 @@ class MluSRTPlatform(MluDeviceMixin, SRTPlatform):
 
     def get_default_attention_backend(self) -> str:
         return "mlu"
+
+    def get_graph_runner_cls(self) -> type:
+        from sglang.srt.hardware_backend.mlu.graph_runner.mlu_graph_runner import (
+            MLUGraphRunner,
+        )
+
+        return MLUGraphRunner
 
     def get_paged_allocator_cls(self) -> type:
         from sglang.srt.hardware_backend.mlu.allocator_mlu import (

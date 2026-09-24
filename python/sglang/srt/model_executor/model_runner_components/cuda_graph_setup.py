@@ -702,6 +702,7 @@ def capture_decode_graph(*, model_runner: ModelRunner) -> GraphCapture:
             "cpu": "CPU graph",
             "npu": "NPU graph",
             "xpu": "XPU graph",
+            "mlu": "MLU graph",
         },
     )
     role = "draft" if model_runner.is_draft_worker else "target"
