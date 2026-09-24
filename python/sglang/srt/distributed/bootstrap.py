@@ -236,8 +236,12 @@ def _set_all_reduce_flags() -> None:
     set_custom_all_reduce(not get_exec().comm.disable_custom_all_reduce)
     set_mscclpp_all_reduce(get_exec().comm.enable_mscclpp)
     set_torch_symm_mem_all_reduce(get_exec().comm.enable_torch_symm_mem)
+    from sglang.srt.layers.flashinfer_comm_fusion import uses_cutedsl_ar_fusion
+
     set_flashinfer_allreduce_only(
         get_exec().comm.flashinfer_allreduce_fusion_backend is not None
+        # cutedsl has no legacy workspace for tagged groups to reduce over.
+        and not uses_cutedsl_ar_fusion()
     )
 
 
