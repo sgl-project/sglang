@@ -1144,16 +1144,19 @@ fn internal_mamba_resume_preserves_a_new_lock_or_inflight_transfer() {
         request_internal_mamba_backup(&mut tc, parent);
         let idx = tc.arena.resolve(parent).unwrap();
         match guard {
-            "lock" => {
+            "lock" | "backup" => {
                 mamba_component().acquire_component_lock(
                     &mut tc,
                     idx,
                     IncLockRefResult::default(),
                     false,
                 );
+                if guard == "backup" {
+                    // Actual Mamba DMA sources carry their own component lock.
+                    tc.arena.node_mut(idx).write_through_pending_id = Some(parent);
+                }
             }
             "load_back" => tc.arena.node_mut(idx).load_back_pending_id = Some(parent),
-            "backup" => tc.arena.node_mut(idx).write_through_pending_id = Some(1),
             _ => unreachable!(),
         }
         let step = tc.finish_mamba_state_eviction(parent);
@@ -1165,6 +1168,23 @@ fn internal_mamba_resume_preserves_a_new_lock_or_inflight_transfer() {
         assert_eq!(next, Some(leaf));
         tc.evict_device_end(MAMBA);
     }
+}
+
+#[test]
+fn internal_mamba_resume_ignores_an_unrelated_backup_marker() {
+    let (mut tc, parent, leaf) = internal_write_back_fixture();
+    request_internal_mamba_backup(&mut tc, parent);
+    let idx = tc.arena.resolve(parent).unwrap();
+    tc.arena.node_mut(idx).write_through_pending_id = Some(leaf);
+    let step = tc.finish_mamba_state_eviction(parent);
+    assert_eq!(step.tracker, HashMap::from([(MAMBA, 1)]));
+    assert!(step.device_frees[&MAMBA][0].equal(&Tensor::from_slice(&[7i64])));
+    assert!(!tc.arena.has_device_value(idx, MAMBA));
+    assert!(tc.arena.has_device_value(idx, FULL));
+    assert_eq!(tc.arena.node(idx).write_through_pending_id, Some(leaf));
+    tc.evict_device_end(MAMBA);
+    tc.arena.node_mut(idx).write_through_pending_id = None;
+    tc.sanity_check(&[], &[]);
 }
 
 #[test]

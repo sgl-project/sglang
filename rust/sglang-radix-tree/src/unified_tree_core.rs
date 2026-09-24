@@ -2362,10 +2362,12 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             return result;
         };
         let node = self.arena.node(node_idx);
+        // An expanded SWA backup can mark an ancestor whose independently
+        // restored Mamba state is not a DMA source. Its own Mamba lock, not
+        // that unrelated write-through marker, protects state transfers.
         if !node.has_device_value(MAMBA)
             || self.arena.device_lock_ref(node_idx, MAMBA) > 0
             || node.is_load_back_pending()
-            || node.write_through_pending_id.is_some()
             || !self.device_lru_list(MAMBA).in_list(Some(node_idx))
         {
             return result;

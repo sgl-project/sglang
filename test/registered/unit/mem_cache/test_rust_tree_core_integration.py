@@ -2471,6 +2471,36 @@ def _complete_backup(core, node, full_offset=1000, aux_offset=1000):
     return full + full_offset, aux
 
 
+def _swa_mamba_cache(backend, window):
+    from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
+    from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+
+    _, allocator = _swa_cache(window=window, backend=backend)
+    request_pool = Mock(spec=HybridReqToTokenPool)
+    request_pool.mamba_allocator = Mock()
+    with (
+        get_context().override_server_args(
+            _mamba_cache_chunk_size=256, mamba_max_states_per_path=-1
+        ),
+        envs.SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND.override(backend),
+    ):
+        cache = UnifiedRadixCache(
+            CacheInitParams(
+                disable=False,
+                req_to_token_pool=request_pool,
+                token_to_kv_pool_allocator=allocator,
+                page_size=1,
+                sliding_window_size=window,
+                tree_components=(
+                    ComponentType.FULL,
+                    ComponentType.SWA,
+                    ComponentType.MAMBA,
+                ),
+            )
+        )
+    return cache, allocator
+
+
 @pytest.mark.parametrize("backend", ["python", "rust"])
 @pytest.mark.parametrize("component", [ComponentType.MAMBA, ComponentType.SWA])
 @pytest.mark.parametrize("pin_ancestor", [False, True])
@@ -2817,32 +2847,7 @@ def test_full_host_duplicates_follow_ack_order_after_pending_swa_split(backend):
 @pytest.mark.parametrize("backend", ["python", "rust"])
 @pytest.mark.parametrize("pin_ancestor", [False, True])
 def test_pending_swa_backup_does_not_pin_restored_ancestor_mamba(backend, pin_ancestor):
-    from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
-    from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
-
-    _, allocator = _swa_cache(window=8, backend=backend)
-    request_pool = Mock(spec=HybridReqToTokenPool)
-    request_pool.mamba_allocator = Mock()
-    with (
-        get_context().override_server_args(
-            _mamba_cache_chunk_size=256, mamba_max_states_per_path=-1
-        ),
-        envs.SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND.override(backend),
-    ):
-        cache = UnifiedRadixCache(
-            CacheInitParams(
-                disable=False,
-                req_to_token_pool=request_pool,
-                token_to_kv_pool_allocator=allocator,
-                page_size=1,
-                sliding_window_size=8,
-                tree_components=(
-                    ComponentType.FULL,
-                    ComponentType.SWA,
-                    ComponentType.MAMBA,
-                ),
-            )
-        )
+    cache, allocator = _swa_mamba_cache(backend, window=8)
     core = cache.tree_core
     values = allocator.alloc(12)
     nodes = [
@@ -2954,6 +2959,120 @@ def test_pending_swa_backup_does_not_pin_restored_ancestor_mamba(backend, pin_an
     cache.dec_lock_ref(leaf, leaf_lock)
     if extra_lock is not None:
         cache.dec_lock_ref(parent, extra_lock)
+    core.sanity_check([], [])
+
+
+@pytest.mark.parametrize("backend", ["python", "rust"])
+def test_failed_mamba_backup_drops_state_under_unrelated_pending_swa(backend):
+    cache, allocator = _swa_mamba_cache(backend, window=12)
+    core = cache.tree_core
+    values = allocator.alloc(16)
+    nodes = [
+        cache.insert(
+            InsertParams(
+                key=_key(list(range(size))),
+                value=values[:size],
+                prev_prefix_len=size - 4,
+                mamba_value=torch.tensor([slot]),
+            )
+        ).last_device_node
+        for size, slot in ((4, 201), (8, 202), (12, 203), (16, 204))
+    ]
+    grandparent, parent, anchor, leaf = nodes
+    core.set_hicache_enabled()
+    core.has_swa_host_pool = True
+    core.is_write_back = True
+    cache.cache_controller = SimpleNamespace(write_policy="write_back")
+    cache._build_backup_sidecar = Mock(return_value=[])
+    host_pool = Mock()
+    host_pool.available_size.return_value = 1
+    cache.host_pool_group = Mock()
+    cache.host_pool_group.get_pool.return_value = host_pool
+    cache.components[ComponentType.MAMBA]._mamba_pool_host = host_pool
+    submissions = []
+    failed_node = None
+
+    def write(node, full, aux, sidecars):
+        submissions.append((node, full.numel(), aux))
+        if node == failed_node:
+            return None  # Full host allocation failed before submitting DMA.
+        for transfers in aux.values():
+            for transfer in transfers:
+                transfer.host_indices = transfer.device_indices + 20000
+        return full + 10000
+
+    def complete_physical_writes(write_back=False):
+        for ack_id in list(cache.ongoing_write_through):
+            cache._finish_write_through_ack(ack_id)
+
+    cache._execute_kv_backup = write
+    cache.writing_check = complete_physical_writes
+
+    def evict_component(component, count):
+        tracker = {ct: 0 for ct in cache.tree_components}
+        requested = {
+            ct: count if ct == component else 0 for ct in cache.tree_components
+        }
+        cache._evict_components(requested, tracker)
+        return tracker[component]
+
+    # Reach the host topology through actual state backups and ACKs. Full
+    # duplicate reclaim then leaves an unbacked grandparent above a backed
+    # parent; no synthetic node flags or direct backup commits are needed.
+    assert evict_component(ComponentType.MAMBA, 3) == 3
+    assert [(node, count) for node, count, _ in submissions] == [
+        (node, 4) for node in nodes[:3]
+    ]
+    assert cache.evict_host(4, ComponentType.FULL) == 4
+    assert [core.is_backuped(node) for node in nodes] == [False, True, True, False]
+    core.sanity_check([], [])
+
+    assert evict_component(ComponentType.SWA, 12) == 12
+    assert cache.evict_host(12, ComponentType.SWA) == 12
+    cache.insert(
+        InsertParams(
+            key=_key(list(range(12))),
+            value=allocator.alloc(12),
+            mamba_value=torch.tensor([203]),
+        )
+    )
+    # Backup ancestry stops at the backed parent, while the expanded SWA
+    # window reaches the unbacked grandparent. Its pending mark belongs to SWA.
+    assert list(cache.ongoing_write_through) == [anchor]
+    assert cache.ongoing_write_through[anchor].publish_node_ids == nodes[:3]
+    assert submissions[-1][2][ComponentType.SWA][0].nodes_to_load == nodes[:3]
+    cache.insert(
+        InsertParams(
+            key=_key(list(range(4))),
+            value=allocator.alloc(4),
+            mamba_value=torch.tensor([211]),
+        )
+    )
+    assert not core.is_backuped(grandparent)
+    assert ComponentType.MAMBA in core.build_backup_spec(grandparent)[1]
+    leaf_lock = cache.inc_lock_ref(leaf).to_dec_params()
+    active = [(anchor, anchor), (leaf, leaf)]
+    core.sanity_check(active, [])
+    retained = {
+        (node, ct): core.get_component_device_value(node, ct).clone()
+        for node in nodes
+        for ct in (ComponentType.FULL, ComponentType.SWA)
+    }
+
+    failed_node = grandparent
+    assert evict_component(ComponentType.MAMBA, 1) == 1
+    assert submissions[-1][:2] == (grandparent, 4)
+    assert core.get_component_device_value(grandparent, ComponentType.MAMBA) is None
+    # The real DMA source and active request checkpoint remain protected.
+    for node, slot in ((anchor, 203), (leaf, 204)):
+        assert core.get_component_device_value(node, ComponentType.MAMBA).tolist() == [
+            slot
+        ]
+    for (node, ct), value in retained.items():
+        assert torch.equal(core.get_component_device_value(node, ct), value)
+    core.sanity_check(active, [])
+    cache._finish_write_through_ack(anchor)
+    cache.dec_lock_ref(leaf, leaf_lock)
     core.sanity_check([], [])
 
 
