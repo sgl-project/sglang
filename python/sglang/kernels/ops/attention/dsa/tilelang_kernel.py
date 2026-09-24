@@ -2516,7 +2516,12 @@ def dpsk_v4_fp8_attention_fwd(
     if _is_gfx95_supported:
         block_I, threads, num_stages, block_per_cu, cu = 64, 512, 0, 2, 256
     else:
-        block_I, threads, num_stages, block_per_cu, cu = 32, 128, 1, 1, 304
+        # num_stages=1 here drives T.Pipelined through InjectSoftwarePipeline, which
+        # rejects this kernel on gfx942: the compressed-KV load and the MFMA that
+        # consumes it land in one stage and cannot be reordered. gfx950 above already
+        # runs this kernel unpipelined (num_stages=0); do the same here rather than
+        # keep a setting no gfx942 build has ever compiled.
+        block_I, threads, num_stages, block_per_cu, cu = 32, 128, 0, 1, 304
 
     batch, seq_len, num_heads, _ = q.shape
     # Partial grid is (seq_len * REPLICATE_H * n_groups, batch, kv_group); the
