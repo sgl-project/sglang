@@ -11,6 +11,7 @@ from __future__ import annotations
 import importlib.util
 import logging
 import re
+import subprocess
 import sys
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable, Optional
@@ -71,11 +72,37 @@ def _rust_fallback_reason(params: CacheInitParams) -> Optional[str]:
     )
     if device.type not in ("cpu", "cuda"):
         return f"the Rust TreeCore does not support device {device.type}"
-    if (
-        importlib.util.find_spec(_RUST_TREE_CORE_MODULE) is None
-        and not _RUST_TREE_CORE_MANIFEST.is_file()
+    mode = envs.SGLANG_RUST_BUILD_MODE.get()
+    if sys.modules.get(_RUST_TREE_CORE_MODULE) is not None or mode not in (
+        "auto",
+        "never",
+        "force",
     ):
+        # Preserve the loader's invalid-mode and force-after-import errors.
+        return None
+    workspace = _RUST_TREE_CORE_MANIFEST.parent.parent
+    bundled = importlib.util.find_spec(_RUST_TREE_CORE_MODULE) is not None
+    source_checkout = (workspace / "Cargo.toml").is_file()
+    if mode != "force" and (mode == "never" or not source_checkout) and bundled:
+        return None
+    if not _RUST_TREE_CORE_MANIFEST.is_file():
+        if bundled:
+            return "the requested Rust TreeCore source build has no sources"
         return "this installation contains neither the Rust TreeCore extension nor its sources"
+    # Even a cached source build needs these version queries for its fingerprint.
+    # Match the loader's commands and cwd so rustup workspace overrides apply.
+    for command in (("cargo", "--version", "--verbose"), ("rustc", "-vV")):
+        try:
+            subprocess.run(
+                command,
+                cwd=workspace,
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+        except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
+            return f"the Rust TreeCore toolchain is unavailable ({' '.join(command)})"
     return None
 
 
@@ -83,7 +110,7 @@ def resolve_tree_core_backend(name: str, params: CacheInitParams) -> str:
     """Resolve known Rust capability gaps before loading a backend.
 
     Explicit Rust selections use the same compatibility policy as the default.
-    Build, import, and runtime failures remain errors in supported configurations.
+    Build, import, and runtime failures remain errors when the toolchain is usable.
     """
     if name != "rust":
         return name

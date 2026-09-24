@@ -14,6 +14,7 @@ Python in these cases:
 - PyTorch versions outside 2.11 through 2.13.
 - Devices other than CPU or CUDA.
 - Installations containing neither the Rust extension nor its sources.
+- Source builds with a missing or unusable Rust toolchain.
 
 This policy also applies when Rust is explicitly selected.
 Build, import, and runtime failures in supported configurations remain errors.
@@ -43,8 +44,9 @@ the shared fingerprinted Rust-extension cache; it never writes a shared object
 into the Python package. LibTorch and the Python headers come from the running
 interpreter's PyTorch install. PyTorch 2.11 through 2.13 are accepted explicitly,
 and `torch_2_13_compat.h` covers two alignment APIs removed in PyTorch 2.13.
-Source checkouts require working `cargo` and `rustc`, including for fingerprinted
-cache lookup. Trusted bundled extensions do not require a Rust compiler.
+Source checkouts need working `cargo` and `rustc` to use Rust, including for
+fingerprinted cache lookup. If either tool is unavailable, the registry selects
+Python. Trusted bundled extensions do not require a Rust compiler.
 
 ## Development
 

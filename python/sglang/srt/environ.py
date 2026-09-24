@@ -685,6 +685,7 @@ class Envs:
     # - Unsupported PyTorch versions.
     # - Devices other than CPU or CUDA.
     # - Installs with neither the Rust extension nor its sources.
+    # - Source builds with a missing or unusable Rust toolchain.
     # This also applies when Rust is explicitly selected.
     SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND = EnvStr("rust")
     SGLANG_OPT_SWA_RELEASE_LEAF_LOCK_AFTER_WINDOW = EnvBool(False)
