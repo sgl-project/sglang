@@ -516,6 +516,98 @@ class TestIntegrationScenarios(CustomTestCase):
         self.assertEqual(reasoning_chunked, reasoning_oneshot)
         self.assertEqual(normal_chunked, normal_oneshot)
 
+    def test_streaming_property_marker_split_across_chunks(self):
+        """A structural marker split across chunks must not be emitted as content.
+
+        iter_tokens folds an incomplete trailing marker into a TEXT token. The
+        partial-analysis path took text[content_start:] verbatim, so "<|end" was
+        handed to the caller as reasoning and dropped from the buffer; the channel
+        then never closed and the rest of the stream was parsed as reasoning. The
+        final path had the same hole for a trailing "<|return".
+        """
+        full_text = (
+            "<|start|>assistant<|channel|>analysis<|message|>reasoning<|end|>"
+            "<|start|>assistant<|channel|>final<|message|>answer<|return|>"
+        )
+        # Each marker arrives in pieces, as a sub-word detokenizer would
+        # hand it over, so every chunk boundary lands inside a marker.
+        chunks = [
+            "<|start|>",
+            "assistant",
+            "<|channel|>",
+            "analysis",
+            "<|message|>",
+            "reason",
+            "ing",
+            "<|",
+            "end",
+            "|>",
+            "<|start|>",
+            "assistant",
+            "<|channel|>",
+            "final",
+            "<|message|>",
+            "answer",
+            "<|",
+            "return",
+            "|>",
+        ]
+        # The chunking has to be a genuine partition of the one-shot text, or
+        # comparing against it would be meaningless.
+        self.assertEqual("".join(chunks), full_text)
+
+        parser = HarmonyParser()
+        events = []
+        for chunk in chunks:
+            events.extend(parser.parse(chunk))
+        events.extend(parser.parse(""))
+
+        reasoning = "".join(e.content for e in events if e.event_type == "reasoning")
+        normal = "".join(e.content for e in events if e.event_type == "normal")
+        self.assertEqual(reasoning, "reasoning")
+        self.assertEqual(normal, "answer")
+
+    def test_split_call_marker_still_yields_tool_call(self):
+        """Splitting "<|call|>" must not swallow the tool call into reasoning."""
+        chunks = [
+            "<|start|>",
+            "assistant",
+            "<|channel|>",
+            "analysis",
+            "<|message|>",
+            "let me check",
+            "<|",
+            "call",
+            "|>",
+        ]
+
+        parser = HarmonyParser()
+        events = []
+        for chunk in chunks:
+            events.extend(parser.parse(chunk))
+        events.extend(parser.parse(""))
+
+        self.assertIn("tool_call", [e.event_type for e in events])
+
+    def test_final_block_holds_partial_marker(self):
+        """A final block ending mid-marker must neither emit nor drop the fragment.
+
+        Final blocks are allowed to end at end of input without a <|return|>, so
+        this is the one path that can meet an incomplete marker without going
+        through the TEXT holdback. Emitting it leaks "<|ret" into the answer;
+        dropping it from ``remaining`` loses the marker start, so the marker can
+        never be completed when the next chunk arrives.
+        """
+        head = "<|start|>assistant<|channel|>final<|message|>ans"
+        strategy = CanonicalStrategy()
+        for marker in strategy.guard_tokens:
+            for k in range(1, len(marker)):
+                frag = marker[:k]
+                events, remaining = strategy.parse(head + frag)
+                normal = "".join(e.content for e in events if e.event_type == "normal")
+                self.assertEqual(normal, "ans", f"{frag!r} leaked into the content")
+                self.assertEqual(remaining, frag, f"{frag!r} was dropped")
+
     def test_streaming_property_text(self):
         """Test streaming property for text format."""
         full_text = "analysis reasoning content assistantfinal final answer"
