@@ -2407,7 +2407,7 @@ def monkey_patch_p2p_access_check():
 
     setattr(tgt, "gpu_p2p_access_check", lambda *arg, **kwargs: True)
 
-    # Suppress the warnings from this delete function when using sglang.bench_one_batch
+    # Suppress the warnings from this delete function when using sglang.benchmark.one_batch
     from sglang.srt.distributed.device_communicators.custom_all_reduce import (
         CustomAllreduce,
     )
@@ -2962,18 +2962,14 @@ def direct_register_custom_op(
         raise error
 
 
-def set_gpu_proc_affinity(
-    pp_size: int,
-    tp_size: int,
-    nnodes: int,
-    gpu_id: int,
-):
+def set_gpu_proc_affinity(gpu_id: int):
     # current process
     pid = os.getpid()
     p = psutil.Process(pid)
 
-    nnodes_per_tp_group = max(nnodes // pp_size, 1)
-    tp_size_per_node = tp_size // nnodes_per_tp_group
+    parallel = get_parallel()
+    nnodes_per_tp_group = max(parallel.nnodes // parallel.pp_size, 1)
+    tp_size_per_node = parallel.tp_size // nnodes_per_tp_group
 
     # total physical cores
     total_pcores = psutil.cpu_count(logical=False)

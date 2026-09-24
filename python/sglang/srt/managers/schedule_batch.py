@@ -96,6 +96,7 @@ from sglang.srt.disaggregation.utils import FAKE_BOOTSTRAP_HOST, DisaggregationM
 from sglang.srt.dllm.mixin.req import ReqDllmMixin
 from sglang.srt.environ import envs
 from sglang.srt.managers.embed_types import PositionalEmbeds
+from sglang.srt.managers.kv_hints import KvHintsEnvelope
 from sglang.srt.managers.scheduler_components.new_token_ratio_tracker import (
     NewTokenRatioTracker,
 )
@@ -1009,6 +1010,7 @@ class Req(ReqDllmMixin):
         disagg_mode: Optional[DisaggregationMode] = None,
         routed_dp_rank: Optional[int] = None,
         disagg_prefill_dp_rank: Optional[int] = None,
+        kv_hints: Optional[KvHintsEnvelope] = None,
         vocab_size: Optional[int] = None,
         priority: Optional[int] = None,
         metrics_collector: Optional[SchedulerMetricsCollector] = None,
@@ -1338,6 +1340,8 @@ class Req(ReqDllmMixin):
 
         self.routed_dp_rank: Optional[int] = routed_dp_rank
         self.disagg_prefill_dp_rank: Optional[int] = disagg_prefill_dp_rank
+        # Orchestrator KV hints, forwarded to the HiCache storage backends.
+        self.kv_hints: Optional[KvHintsEnvelope] = kv_hints
 
         # the start index of the sent kv cache
         # We want to send it chunk by chunk for chunked prefill.
@@ -1677,6 +1681,11 @@ class Req(ReqDllmMixin):
     def _compute_max_prefix_len(self, input_len: int) -> int:
         # NOTE: the matched length is at most 1 less than the input length to enable logprob computation
         max_prefix_len = input_len - 1
+        if (
+            self.dllm_config is not None
+            and self.dllm_config.requires_separate_context_encoding
+        ):
+            max_prefix_len = min(max_prefix_len, self.dllm_block_offset)
         if self.return_logprob and self.logprob_start_len >= 0:
             max_prefix_len = min(max_prefix_len, self.logprob_start_len)
         return max(max_prefix_len, 0)
