@@ -291,20 +291,11 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
             if (quant_config is not None and quant_config.get_name() == "modelslim")
             else None
         )
-        # BF16 logits can turn close router scores into ties before top-k.
-        router_dtype = getattr(config, "router_dtype", None)
-        assert router_dtype in (None, "fp32"), "Qwen3 router_dtype must be null or fp32"
-        self.router_dtype = torch.float32 if router_dtype == "fp32" else None
-        if self.router_dtype is not None:
-            assert gate_quant_config is None, (
-                "router_dtype requires an unquantized gate"
-            )
         self.gate = ReplicatedLinear(
             config.hidden_size,
             config.num_experts,
             bias=False,
             quant_config=gate_quant_config,
-            params_dtype=self.router_dtype,
             prefix=add_prefix("gate", prefix),
         )
 
@@ -349,7 +340,7 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
 
         if hidden_states.shape[0] > 0:
             # router_logits: (num_tokens, n_experts)
-            router_logits, _ = self.gate(hidden_states.to(self.router_dtype))
+            router_logits, _ = self.gate(hidden_states)
             if is_true_on_policy_enabled():
                 routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float)
                 routing_weights, selected_experts = torch.topk(
@@ -387,7 +378,7 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
     ) -> torch.Tensor:
         if hidden_states.shape[0] > 0:
             # router_logits: (num_tokens, n_experts)
-            router_logits, _ = self.gate(hidden_states.to(self.router_dtype))
+            router_logits, _ = self.gate(hidden_states)
             topk_output = self.topk(
                 hidden_states,
                 router_logits,
@@ -409,9 +400,7 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
             state.forward_batch.forward_mode, state.hidden_states_mlp_input
         ):
             # router_logits: (num_tokens, n_experts)
-            state.router_logits, _ = self.gate(
-                state.hidden_states_mlp_input.to(self.router_dtype)
-            )
+            state.router_logits, _ = self.gate(state.hidden_states_mlp_input)
         else:
             state.router_logits = None
 
