@@ -480,6 +480,87 @@ fn finalize_charges_only_the_in_window_tail_of_a_straddling_host_chunk() {
     assert_eq!(out.swa_host_hit_length, 1);
 }
 
+fn alloc_run(
+    tc: &mut UnifiedTreeCore<Vec<i64>>,
+    parent: NodeIdx_,
+    key: std::ops::RangeInclusive<i64>,
+) -> NodeIdx_ {
+    tc.arena
+        .alloc_child(
+            parent,
+            key.collect(),
+            /* priority = */ 0,
+            /* extra_key = */ None,
+        )
+        .unwrap()
+}
+
+#[test]
+fn load_back_splits_only_the_oldest_host_node_past_device_and_whole_host_nodes() {
+    let mut tc = swa_core(/* window = */ 5, /* page_size = */ 1);
+    let root = tc.arena.root();
+    let a = alloc_run(&mut tc, root, 1..=4);
+    let b = alloc_run(&mut tc, a, 5..=6);
+    let c = alloc_run(&mut tc, b, 7..=8);
+    set_swa_host(&mut tc, a);
+    set_swa_host(&mut tc, b);
+    set_swa_device(&mut tc, c);
+    let swa = swa_component(5);
+    // Device c covers 2 and host b loads whole; a supplies only the last 1.
+    assert_eq!(
+        finalize(&tc, &swa, c, /* prior = */ 0).swa_host_hit_length,
+        3
+    );
+
+    swa.prepare_load_back_in_tree_core(&mut tc, c);
+    let head = tc.arena.node(a).parent();
+    assert_eq!(tc.arena.node(head).key.atom_len(), 3);
+    assert_eq!(tc.arena.node(a).key.atom_len(), 1);
+    assert_eq!(tc.arena.node(b).key.atom_len(), 2);
+    assert_eq!(tc.arena.node(b).parent(), a);
+    // Re-running on the reshaped path is a no-op.
+    swa.prepare_load_back_in_tree_core(&mut tc, c);
+    assert_eq!(tc.arena.node(a).parent(), head);
+}
+
+#[test]
+fn load_back_keeps_a_write_through_pending_host_node_whole() {
+    let mut tc = swa_core(/* window = */ 3, /* page_size = */ 1);
+    let root = tc.arena.root();
+    let h = alloc_run(&mut tc, root, 1..=4);
+    let c = alloc_run(&mut tc, h, 5..=6);
+    set_swa_host(&mut tc, h);
+    set_swa_device(&mut tc, c);
+    tc.arena.node_mut(h).write_through_pending_id = Some(7);
+    let swa = swa_component(3);
+    assert_eq!(
+        finalize(&tc, &swa, c, /* prior = */ 0).swa_host_hit_length,
+        4
+    );
+
+    swa.prepare_load_back_in_tree_core(&mut tc, c);
+    assert_eq!(tc.arena.node(h).key.atom_len(), 4);
+    assert_eq!(tc.arena.node(h).parent(), root);
+}
+
+#[test]
+fn load_back_rounds_a_sub_page_window_up_to_one_page() {
+    let mut tc = swa_core(/* window = */ 2, /* page_size = */ 4);
+    let root = tc.arena.root();
+    let n = alloc_run(&mut tc, root, 1..=8);
+    set_swa_host(&mut tc, n);
+    let swa = swa_component(2);
+    assert_eq!(
+        finalize(&tc, &swa, n, /* prior = */ 0).swa_host_hit_length,
+        4
+    );
+
+    swa.prepare_load_back_in_tree_core(&mut tc, n);
+    let head = tc.arena.node(n).parent();
+    assert_eq!(tc.arena.node(head).key.atom_len(), 4);
+    assert_eq!(tc.arena.node(n).key.atom_len(), 4);
+}
+
 #[test]
 fn finalize_breaks_at_an_swa_gap() {
     let mut tc = swa_core(/* window = */ 5, /* page_size = */ 1);
