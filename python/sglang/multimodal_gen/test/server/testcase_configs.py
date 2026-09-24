@@ -451,6 +451,28 @@ PI05_ACTION_CI_sampling_params = DiffusionSamplingParams(
 )
 
 
+# DROID policy: three fixed-name 360x640 cameras, 8-dim state and actions,
+# the package recipe (4 steps, CFG on video). Noise comes from the seed.
+FLUX3_ACTION_CI_sampling_params = DiffusionSamplingParams(
+    prompt="put the marker in the cup",
+    extras={
+        "action_horizon": 32,
+        "action_dim": 8,
+        "state_dim": 8,
+        "image_height": 360,
+        "image_width": 640,
+        "camera_order": ("wrist", "left", "right"),
+        "num_inference_steps": 4,
+        "seed": 0,
+        "enable_prefix_cache": False,
+        # Same path is bit-exact across runs and GPUs; NATTEN vs the
+        # FlexAttention fallback moves actions by max 0.046 / mean 0.012.
+        "action_max_abs_diff_threshold": 0.15,
+        "action_mean_abs_diff_threshold": 0.03,
+    },
+)
+
+
 def sample_step_indices(
     step_map: dict[int, float], fractions: Sequence[float]
 ) -> list[int]:

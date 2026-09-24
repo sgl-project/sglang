@@ -63,6 +63,14 @@
             "expected_avg_denoise_ms": 0.0,
             "expected_median_denoise_ms": 0.0
         },
+        "flux3_action_http": {
+            "expected_load_ms": 46252.88,
+            "stages_ms": {},
+            "denoise_step_ms": {},
+            "expected_e2e_ms": 442.53,
+            "expected_avg_denoise_ms": 0.0,
+            "expected_median_denoise_ms": 0.0
+        },
         "qwen_image_t2i": {
             "expected_load_ms": 40799.72,
             "stages_ms": {
