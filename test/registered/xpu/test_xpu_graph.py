@@ -38,9 +38,9 @@ _FULL_IO_ARGS = ["--input", "128", "--output", "16"]
 
 
 class TestXPUGraph(CustomTestCase):
-    """Decode full-graph + prefill tc_piecewise together."""
+    """Decode full-graph + prefill (tc_piecewise / full / breakable)."""
 
-    def test_full_graph_runs(self):
+    def test_tc_piecewise_runs(self):
         args = [
             *_COMMON_ARGS,
             "--cuda-graph-config",
@@ -61,6 +61,40 @@ class TestXPUGraph(CustomTestCase):
             prefill_latency,
             0,
             "prefill latency must be > 0 with tc_piecewise XPU graph",
+        )
+        self.assertGreater(
+            decode_throughput, 0, "decode throughput must be > 0 with full XPU graph"
+        )
+
+    def test_prefill_full_graph_runs(self):
+        args = [
+            "--device",
+            "xpu",
+            "--attention-backend",
+            "intel_xpu",
+            "--disable-radix-cache",
+            "--mem-fraction-static",
+            "0.6",
+            "--batch-size",
+            "1",
+            "--cuda-graph-config",
+            '{"decode":{"backend":"full"},"prefill":{"backend":"full"}}',
+            "--cuda-graph-bs-prefill",
+            "64",
+            "128",
+        ]
+        if is_in_ci():
+            args += _CI_IO_ARGS
+        else:
+            args += _FULL_IO_ARGS
+
+        prefill_latency, decode_throughput, _ = run_bench_one_batch(
+            DEFAULT_SMALL_MODEL_NAME_FOR_TEST_QWEN, args
+        )
+        self.assertGreater(
+            prefill_latency,
+            0,
+            "prefill latency must be > 0 with full prefill XPU graph",
         )
         self.assertGreater(
             decode_throughput, 0, "decode throughput must be > 0 with full XPU graph"
