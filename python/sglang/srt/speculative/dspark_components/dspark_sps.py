@@ -40,6 +40,11 @@ class SpsCostTable(msgspec.Struct, frozen=True):
             floor_probe_index(self.sample_batch_tokens, batch_tokens)
         ]
 
+    def interp(self, batch_tokens: float) -> float:
+        return _interp_clamped(
+            self.sample_batch_tokens, self.sample_steps_per_sec, batch_tokens
+        )
+
     def to_json(self) -> str:
         return msgspec.json.encode(self).decode("utf-8")
 
