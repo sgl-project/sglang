@@ -725,6 +725,7 @@ class PureSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         kvcache: BaseSWAKVPool,
         need_sort: bool,
     ):
+        assert page_size == 1
         assert isinstance(kvcache, BaseSWAKVPool)
 
         self.page_size = page_size
@@ -733,23 +734,13 @@ class PureSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         self.need_sort = need_sort
         self._size_full = self._size_swa = size_swa
 
-        if page_size > 1:
-            self.swa_attn_allocator = PagedTokenToKVPoolAllocator(
-                size_swa,
-                page_size,
-                dtype,
-                device,
-                kvcache.swa_kv_pool,
-                need_sort,
-            )
-        else:
-            self.swa_attn_allocator = TokenToKVPoolAllocator(
-                size_swa,
-                dtype,
-                device,
-                kvcache.swa_kv_pool,
-                need_sort,
-            )
+        self.swa_attn_allocator = TokenToKVPoolAllocator(
+            size_swa,
+            dtype,
+            device,
+            kvcache.swa_kv_pool,
+            need_sort,
+        )
         self.full_attn_allocator = self.swa_attn_allocator
 
         self.full_to_swa_index_mapping = torch.cat(
@@ -807,55 +798,22 @@ class PureSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         )
 
     def alloc(self, need_size: int):
-        # Unpaged API, as in the parent: page_size > 1 goes through alloc_extend
-        # and alloc_decode instead.
         assert self.page_size == 1
         return self.swa_attn_allocator.alloc(need_size)
 
-    # The single pool is reached through an identity full->SWA mapping, so the
-    # full-side indices already are the SWA slots: no peer to allocate, and no
-    # mapping to write (set_full_to_swa_mapping raises here).
-    def alloc_extend(
-        self,
-        prefix_lens: torch.Tensor,
-        prefix_lens_cpu: torch.Tensor,
-        seq_lens: torch.Tensor,
-        seq_lens_cpu: torch.Tensor,
-        last_loc: torch.Tensor,
-        extend_num_tokens: int,
-    ):
-        assert self.page_size > 1
-        num_new_pages = get_num_new_pages(
-            seq_lens=seq_lens_cpu,
-            page_size=self.page_size,
-            prefix_lens=prefix_lens_cpu,
-        )
-        if not self.new_pages_available(num_new_pages, num_new_pages):
-            return None
-
-        return self.swa_attn_allocator.alloc_extend(
-            prefix_lens,
-            prefix_lens_cpu,
-            seq_lens,
-            seq_lens_cpu,
-            last_loc,
-            extend_num_tokens,
-            num_new_pages=num_new_pages,
+    def alloc_extend(self, *args, **kwargs):
+        raise NotImplementedError(
+            "PureSWATokenToKVPoolAllocator does not support page_size > 1."
         )
 
-    def alloc_decode(
-        self,
-        seq_lens: torch.Tensor,
-        seq_lens_cpu: torch.Tensor,
-        last_loc: torch.Tensor,
-    ):
-        assert self.page_size > 1
-        return self.swa_attn_allocator.alloc_decode(seq_lens, seq_lens_cpu, last_loc)
+    def alloc_decode(self, *args, **kwargs):
+        raise NotImplementedError(
+            "PureSWATokenToKVPoolAllocator does not support page_size > 1."
+        )
 
     def alloc_extend_swa_tail(self, *args, **kwargs):
         raise NotImplementedError(
-            "PureSWATokenToKVPoolAllocator has one pool for both halves, so it "
-            "cannot allocate an SWA tail shorter than the full extend."
+            "PureSWATokenToKVPoolAllocator does not support page_size > 1."
         )
 
     def free(self, free_index: torch.Tensor):
