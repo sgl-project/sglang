@@ -660,6 +660,8 @@ FROM nvidia/cuda:${CUDA_VERSION}-cudnn-devel-ubuntu24.04 AS runtime
 ARG CUDA_VERSION
 ARG TARGETARCH
 ARG GDRCOPY_VERSION=2.5.1
+ARG EFA_INSTALLER_VERSION=1.50.0
+ARG EFA_INSTALLER_SHA256=fa6dff8593d866866c13cb4640d9059835cd4efa427971f100ab40c97bef2841
 
 ENV DEBIAN_FRONTEND=noninteractive \
     CUDA_HOME=/usr/local/cuda \
@@ -746,6 +748,47 @@ RUN --mount=type=cache,target=/var/cache/apt,id=runtime-apt \
     libsqlite3-0 libtasn1-6 \
     dpkg dpkg-dev libdpkg-perl \
     && rm -rf /var/lib/apt/lists/*
+
+# Install the AWS EFA userspace stack (libfabric plus its EFA provider)
+#
+# Deliberately placed after every apt layer in this stage: efa_installer.sh
+# upgrades rdma-core (libibverbs1/ibverbs-providers) to AWS's build, which the
+# bundled libfabric needs for its IBVERBS_1.18 and EFA_1.4-1.7 symbols. A later
+# apt layer could pull the Ubuntu packages back over it.
+#
+# The distro libfabric1 stays installed on purpose -- libopenmpi3t64 depends on
+# it, so removing it would break that package. Both libfabric.so.1 copies
+# coexist; the ENV below makes the AWS one win deterministically.
+RUN set -eux; \
+    EFA_INSTALLER_ARCHIVE="/tmp/aws-efa-installer-${EFA_INSTALLER_VERSION}.tar.gz"; \
+    curl -fsSL --retry 3 --retry-all-errors \
+        "https://efa-installer.amazonaws.com/aws-efa-installer-${EFA_INSTALLER_VERSION}.tar.gz" \
+        -o "${EFA_INSTALLER_ARCHIVE}"; \
+    echo "${EFA_INSTALLER_SHA256}  ${EFA_INSTALLER_ARCHIVE}" | sha256sum -c -; \
+    tar -xzf "${EFA_INSTALLER_ARCHIVE}" -C /tmp; \
+    # efa_installer.sh apt-installs pciutils/environment-modules/tcl, and the
+    # apt layers above purge /var/lib/apt/lists, so refresh the lists first.
+    apt-get update -y; \
+    # --minimal is not usable here: it installs rdma-core but skips libfabric,
+    # which is the only piece needed for the EFA data path.
+    (cd /tmp/aws-efa-installer && \
+        ./efa_installer.sh -y --skip-kmod --skip-limit-conf --no-verify); \
+    test -x /opt/amazon/efa/bin/fi_info; \
+    /opt/amazon/efa/bin/fi_info --version; \
+    # Assert the EFA provider is actually compiled into this libfabric. `-l`
+    # lists providers without needing EFA hardware, so it works during a build.
+    /opt/amazon/efa/bin/fi_info -l | grep -q '^efa:'; \
+    # Assert the AWS libfabric precedes the distro 1.17.0 in the loader cache.
+    # Match the first libfabric.so.1 entry, since `ldconfig -p` prints
+    # "libfabric.so.1 (libc6,x86-64) => /path" and order decides the first one.
+    ldconfig -p | grep -m1 'libfabric\.so\.1' | grep -q '/opt/amazon/efa/lib/'; \
+    rm -rf "${EFA_INSTALLER_ARCHIVE}" /tmp/aws-efa-installer \
+        /var/lib/apt/lists/*
+
+# Prefer the AWS libfabric over the distro libfabric1 that libopenmpi3t64 pulls
+# in, and expose fi_info/fi_pingpong for debugging EFA from inside the image.
+ENV PATH="/opt/amazon/efa/bin:${PATH}" \
+    LD_LIBRARY_PATH="/opt/amazon/efa/lib:${LD_LIBRARY_PATH}"
 
 # Copy Python site-packages from framework (already cleaned of __pycache__/tests/pyc files)
 COPY --from=framework_final /opt/sglang/lib/python3.12/site-packages /opt/sglang/lib/python3.12/site-packages
