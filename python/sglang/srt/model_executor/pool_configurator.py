@@ -1079,10 +1079,21 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
 
         self.c4_ring_size = get_compress_state_ring_size(4, self.is_speculative)
         self.c128_ring_size = get_compress_state_ring_size(128, self.is_speculative)
+        # The ratio-2 pair ring widens with the draft count (pool: get_ring_size).
+        self.pair_ring_size = get_compress_state_ring_size(
+            2, self.is_speculative, get_spec().speculative_num_draft_tokens or 0
+        )
 
         self.num_layers_total = len(self.compression_ratios)
         self.num_layers_ca4 = sum(1 for r in self.compression_ratios if r == 4)
         self.num_layers_ca128 = sum(1 for r in self.compression_ratios if r == 128)
+        # Only a ratio-2 kv_source layer compresses, so only it keeps pair state.
+        self.num_layers_pair = sum(
+            1
+            for l in cfg.hf_config.kv_source_layer_ids
+            if kvc.layer_info.start_layer <= l < kvc.layer_info.end_layer
+            and cfg.compress_ratios[l] == 2
+        )
         # The low-ratio indexer pools are built with force_fp4=True
         # (deepseek_v4_memory_pool), so they are fp4 whatever dtype c4 uses.
         low_ratio_index_bytes = get_dsv4_indexer_bytes_per_token(
@@ -1398,6 +1409,22 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
             state_rows * state_last_dim * c128_state_dtype_size * self.num_layers_ca128
         )
 
+    def _get_pair_state_fixed_bytes(self, max_running_requests: int) -> int:
+        """Ratio-2 pending-pair state, one fp32 (kv, score) ring per request slot
+        on each ratio-2 kv_source layer; mirrors _make_pair_state_pool."""
+        if self.num_layers_pair == 0:
+            return 0
+
+        num_req_slots = self._get_num_req_slots(max_running_requests)
+        ring_size = self.pair_ring_size
+        # CompressStatePool allocates `size + ring_size + 1` rows, padded to the ratio.
+        state_rows = num_req_slots * ring_size + ring_size + 1
+        state_rows = ceil_div(state_rows, 2) * 2
+        state_last_dim = 2 * self.attn_head_dim
+        return (
+            state_rows * state_last_dim * torch.float32.itemsize * self.num_layers_pair
+        )
+
     def _unified_c4_state_pool_size(self, max_running_requests: int) -> int:
         # Unified C4 state loc is req_pool_idx * c4_ring_size + pos % c4_ring_size.
         num_req_slots = self._get_num_req_slots(max_running_requests)
@@ -1506,6 +1533,9 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         c128_state_fixed_bytes = self._get_c128_state_fixed_bytes(
             max_running_requests_per_worker
         )
+        pair_state_fixed_bytes = self._get_pair_state_fixed_bytes(
+            max_running_requests_per_worker
+        )
         swa_ring_fixed_bytes = self._fixed_swa_bytes(max_running_requests_per_worker)
         c4_state_fixed_bytes = self._fixed_c4_state_bytes(
             max_running_requests_per_worker
@@ -1514,6 +1544,7 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         swa_fixed_bytes = self._get_swa_fixed_bytes()
         fixed_bytes = (
             c128_state_fixed_bytes
+            + pair_state_fixed_bytes
             + swa_fixed_bytes
             + swa_ring_fixed_bytes
             + c4_state_fixed_bytes
@@ -1537,6 +1568,7 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
             f"bytes_per_full_token={self.bytes_per_full_token:.2f}, "
             f"available_bytes={available_bytes / (1 << 30):.2f} GB, "
             f"c128_state_fixed={c128_state_fixed_bytes / (1 << 30):.2f} GB, "
+            f"pair_state_fixed={pair_state_fixed_bytes / (1 << 30):.2f} GB, "
             f"swa_fixed={swa_fixed_bytes / (1 << 30):.2f} GB, "
             f"swa_ring_fixed={swa_ring_fixed_bytes / (1 << 30):.2f} GB, "
             f"c4_state_fixed={c4_state_fixed_bytes / (1 << 30):.2f} GB, "

@@ -1220,6 +1220,8 @@ class TestSWAPoolFloor(CustomTestCase):
         cfg.num_layers_ca128 = 61
         cfg.c4_ring_size = 8
         cfg.c128_ring_size = 128
+        cfg.num_layers_pair = 0
+        cfg.pair_ring_size = 2
         cfg._swa_ring_size = 128
         cfg._spec_infl = 1.0
         cfg.context_len = 65536
@@ -1244,7 +1246,7 @@ class TestSWAPoolFloor(CustomTestCase):
         cfg._unified_row_bytes = cfg.attn_head_dim * 2
         return cfg
 
-    # Token pool plus the three request-scoped fixed pools, sized from the
+    # Token pool plus the request-scoped fixed pools, sized from the
     # concurrency resolve_max_num_reqs derives from this token count.
     def _dsv4_total_bytes(self, cfg, tokens):
         estimated = max(min(int(tokens / cfg.context_len * 512), 4096), 2048)
@@ -1254,7 +1256,26 @@ class TestSWAPoolFloor(CustomTestCase):
             + cfg._fixed_swa_bytes(max_running_requests)
             + cfg._fixed_c4_state_bytes(max_running_requests)
             + cfg._get_c128_state_fixed_bytes(max_running_requests)
+            + cfg._get_pair_state_fixed_bytes(max_running_requests)
         )
+
+    def test_dsv4_pair_state_fixed_bytes_mirror_pool(self):
+        """Ratio-2 kv_source layers keep an fp32 (kv, score) ring per request
+        slot; the budget must charge the rows CompressStatePool allocates."""
+        from sglang.srt.model_executor.pool_configurator import DSV4PoolConfigurator
+
+        cfg = object.__new__(DSV4PoolConfigurator)
+        cfg.attn_head_dim = 512
+        cfg.num_layers_pair = 2
+        cfg.pair_ring_size = 2
+        cfg.disaggregation_mode = None
+        cfg.disaggregation_decode_extra_slots = 0
+        slots = 10 + 1
+        # size + ring + 1 rows, padded to the ratio (2); 2 * head_dim fp32 per row.
+        rows = (slots * 2 + 2 + 1 + 1) // 2 * 2
+        self.assertEqual(cfg._get_pair_state_fixed_bytes(10), rows * 2 * 512 * 4 * 2)
+        cfg.num_layers_pair = 0
+        self.assertEqual(cfg._get_pair_state_fixed_bytes(10), 0)
 
     def test_dsv4_paged_dspark_budget_reserves_window_and_draft_layers(self):
         from sglang.srt.model_executor.pool_configurator import DSV4PoolConfigurator
