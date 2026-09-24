@@ -2126,14 +2126,15 @@ class DeepseekV4AscendAttnBackend(
                             ).hexdigest()[:16]
                         except Exception:
                             slot0 = "n/a"
-                        print(
+                        _swkv_line = (
                             f"[SWAKV] start_pos={_l(getattr(fm, 'start_pos', None))} layer={layer} "
                             f"ids={ids} span={span} md5={hashlib.md5(raw).hexdigest()[:16]} "
                             f"win={h.hexdigest()[:16]} rows={nrows} phase={phase} "
                             f"zero={n_zero} minl={min_l} maxl={max_l} slot0={slot0} "
-                            f"qbad={qbad}",
-                            flush=True,
+                            f"qbad={qbad}"
                         )
+                        if not os.environ.get("DSV4_DUMP_SWA_FIXED_ONLY"):
+                            print(_swkv_line, flush=True)
                         if (
                             os.environ.get("DSV4_DUMP_SWA_FIXED")
                             and getattr(self, "_swaf_printed", 0) < 8
