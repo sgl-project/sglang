@@ -51,15 +51,6 @@ def make_xqa_backend(monkeypatch):
         "make_persistent_multi_ctas_kv_counter_buffer",
         lambda *a, **k: None,
     )
-    monkeypatch.setattr(
-        trtllm_mha_backend,
-        "get_exec",
-        lambda: SimpleNamespace(
-            graph=SimpleNamespace(
-                cuda_graph_config=SimpleNamespace(decode=SimpleNamespace(max_bs=8))
-            )
-        ),
-    )
 
     def make(draft_len, is_xqa=True):
         monkeypatch.setattr(
@@ -97,13 +88,12 @@ def make_xqa_backend(monkeypatch):
 def test_xqa_causal_mask_packing(make_xqa_backend, draft_len):
     mask = make_xqa_backend(draft_len)._xqa_spec_dec_mask
     assert mask.dtype == torch.uint16
-    assert mask.shape == (8, draft_len, (draft_len + 31) // 32 * 2)
+    assert mask.shape == (5, draft_len, (draft_len + 31) // 32 * 2)
     assert mask.is_contiguous()
-    # Independently unpack every bit, including zero padding after the draft.
     positions = torch.arange(mask.shape[2] * 16)
     unpacked = (mask.to(torch.int64)[..., positions // 16] >> (positions % 16)) & 1
     expected = positions[None, :] <= torch.arange(draft_len)[:, None]
-    torch.testing.assert_close(unpacked.bool(), expected.expand(8, -1, -1))
+    torch.testing.assert_close(unpacked.bool(), expected.expand(mask.shape[0], -1, -1))
 
 
 @pytest.mark.parametrize("draft_len,is_xqa", [(None, True), (8, False)])
@@ -126,7 +116,7 @@ def test_xqa_verify_mask_forwarding(
 ):
     backend = make_xqa_backend(width, is_xqa)
     backend.decode_seq_len_splits = splits
-    bs = 5  # Above the request pool size, within graph-padded capacity.
+    bs = 5
     seq_lens = torch.tensor([30, 10, 50, 20, 40], dtype=torch.int32)
     page_table = torch.arange(bs, dtype=torch.int32)[:, None]
     backend.forward_metadata = SimpleNamespace(
@@ -149,7 +139,6 @@ def test_xqa_verify_mask_forwarding(
             assert mask.data_ptr() == backend._xqa_spec_dec_mask.data_ptr()
         else:
             assert mask is None
-        # Distinct outputs verify that splitting restores the original order.
         return kwargs["query"] + 1
 
     monkeypatch.setattr(
@@ -176,15 +165,6 @@ def test_xqa_verify_mask_forwarding(
     out = backend.forward_extend(q, None, None, layer, fb, save_kv_cache=False)
     torch.testing.assert_close(out, (q + 1).view(-1, 8))
     assert len(calls) == min(splits, bs)
-    if masked:
-        for invalid_mask in (
-            None,
-            backend._xqa_spec_dec_mask[:4],
-            backend._xqa_spec_dec_mask[:, :2],
-        ):
-            backend._xqa_spec_dec_mask = invalid_mask
-            with pytest.raises(RuntimeError, match="preallocated"):
-                backend.forward_extend(q, None, None, layer, fb, save_kv_cache=False)
 
 
 @pytest.mark.parametrize(

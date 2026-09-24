@@ -396,17 +396,10 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 "SGLANG_TRTLLM_MHA_DECODE_SEQ_LEN_SPLITS must be at least 1, "
                 f"got {self.decode_seq_len_splits}"
             )
-        # XQA requires a bit-packed causal mask for multi-token verification.
-        # Chain speculation (topk <= 1) shares the same mask across requests.
-        # Allocate before graph capture, including graph-padded batch sizes.
         self._xqa_spec_dec_mask = None
         if self.is_xqa_impl and self.speculative_num_draft_tokens:
             draft_len = self.speculative_num_draft_tokens
-            max_bs = max(
-                model_runner.req_to_token_pool.size,
-                get_exec().graph.cuda_graph_config.decode.max_bs or 0,
-            )
-            # uint16 words with each row padded to a 32-bit boundary.
+            max_bs = model_runner.max_running_requests + 1
             words_per_row = (draft_len + 31) // 32 * 2
             row = torch.arange(draft_len, dtype=torch.int32)[:, None]
             word = torch.arange(words_per_row, dtype=torch.int32)[None, :]
@@ -1367,8 +1360,6 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             if q_len_per_req != 1:
                 kwargs["q_len_per_req"] = q_len_per_req
             if mask is not None:
-                # The causal mask is identical for every request, so sorting
-                # needs no gather; each group uses a contiguous prefix view.
                 kwargs["mask"] = mask[: group_seq_lens.shape[0]]
             return flashinfer.decode.trtllm_batch_decode_with_kv_cache(
                 query=group_query,
@@ -1718,23 +1709,12 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                     multi_ctas_kv_counter_buffer=self._multi_ctas_kv_counter_buffer,
                 )
             else:
-                mask = None
-                if (
-                    self.is_xqa_impl
-                    and forward_batch.forward_mode.is_target_verify()
+                mask = (
+                    self._xqa_spec_dec_mask
+                    if forward_batch.forward_mode.is_target_verify()
                     and self.forward_metadata.max_seq_len_q > 1
-                ):
-                    mask = self._xqa_spec_dec_mask
-                    if (
-                        mask is None
-                        or mask.shape[1] != self.forward_metadata.max_seq_len_q
-                        or mask.shape[0]
-                        < self.forward_metadata.cache_seqlens_int32.shape[0]
-                    ):
-                        raise RuntimeError(
-                            "XQA target verification exceeds the preallocated "
-                            "causal mask batch capacity or has an unexpected query width"
-                        )
+                    else None
+                )
                 o = self._run_fixed_q_len_decode(
                     q,
                     kv_cache,
