@@ -66,7 +66,6 @@ from sglang.srt.mem_cache.memory_pool import (
     HybridReqToTokenPool,
     KVCache,
     MHATokenToKVPool,
-    MHATokenToKVPoolFP4,
     MHATokenToKVPoolMXFP8,
     MiniMaxSparseKVPool,
     MLATokenToKVPool,
@@ -1978,26 +1977,6 @@ class KVCacheConfigurator:
             quant_method=quant_method,
             post_capture_active=self.post_capture_kv_active and quant_method is None,
             **extra_args,
-        )
-        return token_to_kv_pool
-
-    def _build_mha_fp4_kv_pool(self, *, max_total_num_tokens: int) -> KVCache:
-        token_to_kv_pool = MHATokenToKVPoolFP4(
-            max_total_num_tokens,
-            page_size=self.pool_page_size,
-            dtype=self.kv_cache_dtype,
-            head_num=self.model_config.get_num_kv_heads(
-                get_parallel().attn_tp_size, get_parallel().attn_dcp_size
-            ),
-            head_dim=self.model_config.head_dim,
-            v_head_dim=self.model_config.v_head_dim,
-            layer_num=self.layer_info.num_effective_layers,
-            device=self.device,
-            enable_memory_saver=get_exec().features.enable_memory_saver,
-            start_layer=self.layer_info.start_layer,
-            end_layer=self.layer_info.end_layer,
-            enable_alt_stream=not get_disagg().enable_pdmux,
-            enable_kv_cache_copy=(get_spec().speculative_algorithm is not None),
         )
         return token_to_kv_pool
 

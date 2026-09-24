@@ -196,10 +196,6 @@ class TensorcastStore(HiCacheStorage):
             return 0
         return self._publish_if_available(hit_pages, fallback=0)
 
-    def _build_page_fragments(self, keys: list[str]) -> tuple[PageFragment, ...]:
-        registered = self._require_registered()
-        return _expand_page_fragments(registered, keys)
-
     def _build_artifact_specs(self, keys: list[str]) -> tuple[ByteArtifactSpec, ...]:
         registered = self._require_registered()
         return _expand_artifact_specs(registered, keys)
