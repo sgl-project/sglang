@@ -82,7 +82,9 @@ from sglang.srt.layers.moe import (
 )
 from sglang.srt.layers.quantization.fp8_utils import (
     _use_aiter_bpreshuffle_gfx95,
+    emit_transposed_bpreshuffle_scale,
     materialize_bpreshuffle_fp8_scale_tuple,
+    view_aiter_fused_rms_transposed_fp8_scale_tuple,
 )
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
@@ -595,6 +597,10 @@ def _update_and_read_residual_aiter_fp8_group(
     unquantized bf16 output rides along as a third element, so the DSA indexer
     can skip dequantizing. post_residual_addition is not applied on this path."""
     needs_bf16 = get_attn_tp_context().is_dsa
+    emit_transposed_scale = emit_transposed_bpreshuffle_scale(
+        hidden_states.shape[0],
+        on_bpreshuffle_gfx95=_use_aiter_bpreshuffle_gfx95,
+    )
     output, unquantized, _, residual_out = fused_rms_fp8_group_quant(
         hidden_states,
         norm.weight,
@@ -606,9 +612,11 @@ def _update_and_read_residual_aiter_fp8_group(
         dtype_quant=torch.float8_e4m3fn,
         res1=residual,
         output_unquantized_inp1=needs_bf16,
-        transpose_scale=False,
+        transpose_scale=emit_transposed_scale,
     )
-    if _use_aiter_bpreshuffle_gfx95:
+    if emit_transposed_scale:
+        output = view_aiter_fused_rms_transposed_fp8_scale_tuple(output)
+    elif _use_aiter_bpreshuffle_gfx95:
         output = materialize_bpreshuffle_fp8_scale_tuple(output)
     if needs_bf16:
         output = (output[0], output[1], unquantized)
