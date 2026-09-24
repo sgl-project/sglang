@@ -281,6 +281,29 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             )
             and aiter_fused_fp8_writer_available()
         )
+        self._use_rocm_full_indexer_prepare = False
+        self._rocm_full_indexer_cos_sin_cache = None
+        rocm_full_indexer_prepare_requested = (
+            envs.SGLANG_ROCM_FUSED_FULL_INDEXER_PREPARE.get()
+            and _is_hip
+            and _is_gfx95_supported
+            and _use_aiter
+            # Both paths omit Hadamard, so per-call fallback cannot mix cache
+            # representations within one request.
+            and self.use_aiter_fused_fp8_writer
+            and hidden_size == 6144
+            and index_n_heads in (16, 32)
+            and index_head_dim == 128
+            and rope_head_dim == 64
+            and q_lora_rank in (1024, 2048)
+            and not is_neox_style
+        )
+        if rocm_full_indexer_prepare_requested:
+            from sglang.kernels.ops.attention.dsa.hip_gfx950 import (
+                is_full_indexer_prepare_available,
+            )
+
+            self._use_rocm_full_indexer_prepare = is_full_indexer_prepare_available()
         self.alt_stream = alt_stream
         self.dsa_enable_prefill_cp = is_dsa_enable_prefill_cp()
         if self.dsa_enable_prefill_cp:
@@ -348,6 +371,28 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             is_neox_style=is_neox_style,
             device=get_device().device,
         )
+        if self._use_rocm_full_indexer_prepare:
+            # The rotary module keeps separate [..., 32] cosine and sine
+            # tables; the full kernel consumes one contiguous [..., 64] table.
+            table_name = "_sglang_indexer_cos_sin_cache"
+            table = getattr(self.rotary_emb, table_name, None)
+            if table is None:
+                cos = getattr(self.rotary_emb, "cos_cache", None)
+                sin = getattr(self.rotary_emb, "sin_cache", None)
+                if (
+                    isinstance(cos, torch.Tensor)
+                    and isinstance(sin, torch.Tensor)
+                    and cos.dtype == sin.dtype
+                    and cos.numel() == sin.numel()
+                    and cos.shape[-1] == sin.shape[-1] == 32
+                ):
+                    table = torch.cat((cos.reshape(-1, 32), sin.reshape(-1, 32)), -1)
+                    self.rotary_emb.register_buffer(table_name, table, persistent=False)
+            if isinstance(table, torch.Tensor):
+                self._rocm_full_indexer_cos_sin_cache = table
+            else:
+                self._use_rocm_full_indexer_prepare = False
+
         if self.use_aiter_fused_fp8_writer and not (
             hasattr(self.rotary_emb, "cos_cache")
             and hasattr(self.rotary_emb, "sin_cache")
@@ -830,6 +875,133 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
 
         current_stream.wait_stream(self.alt_stream)
         return q_fp8, weights
+
+    def _try_rocm_full_indexer_prepare(
+        self,
+        x,
+        q_lora: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        layer_id: int,
+    ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+        """Run the gfx950 full-prepare decode kernel for supported DSA shapes.
+
+        Returning ``None`` leaves the existing indexer path completely intact.
+        Decode and MTP row counts through the tuned graph limit are supported.
+        """
+        if (
+            not self._use_rocm_full_indexer_prepare
+            or not _is_hip
+            or not _is_gfx95_supported
+            or not _use_aiter
+            or not self.use_aiter_fused_fp8_writer
+            or not _use_aiter_preshuffle
+            or _is_fp8_fnuz
+            or self.use_dsa_indexer_fusion
+            or self.dsa_enable_prefill_cp
+            or forward_batch.attn_cp_metadata is not None
+            or _is_in_piecewise_or_breakable_cuda_graph()
+            or not (
+                forward_batch.forward_mode.is_decode_or_idle()
+                or forward_batch.forward_mode.is_target_verify()
+            )
+            or not 1 <= q_lora.shape[0] <= 128
+        ):
+            return None
+
+        if isinstance(x, tuple):
+            if len(x) != 3:
+                return None
+            x_bf16 = x[2]
+        else:
+            x_bf16 = x
+
+        rows = q_lora.shape[0]
+        out_cache_loc = forward_batch.out_cache_loc
+        cos_sin = self._rocm_full_indexer_cos_sin_cache
+        expected_weights = (
+            (self.wq_b.weight, (self.n_heads * self.head_dim, self.q_lora_rank)),
+            (self.wk.weight, (self.head_dim, self.hidden_size)),
+            (self.weights_proj.weight, (self.n_heads, self.hidden_size)),
+        )
+        if (
+            not isinstance(self.k_norm, LayerNorm)
+            or self.is_neox_style
+            or self.n_heads not in (16, 32)
+            or self.head_dim != 128
+            or self.rope_head_dim != 64
+            or self.q_lora_rank not in (1024, 2048)
+            or self.hidden_size != 6144
+            or self.block_size != 128
+            or self.scale_fmt != "ue8m0"
+            or getattr(self.wq_b, "set_lora", False)
+            or getattr(self.wk, "set_lora", False)
+            or getattr(self.weights_proj, "set_lora", False)
+            or not isinstance(x_bf16, torch.Tensor)
+            or x_bf16.dtype != torch.bfloat16
+            or x_bf16.shape != (rows, self.hidden_size)
+            or not x_bf16.is_contiguous()
+            or q_lora.dtype != torch.bfloat16
+            or q_lora.shape != (rows, self.q_lora_rank)
+            or not q_lora.is_contiguous()
+            or positions.dtype != torch.int64
+            or positions.shape != (rows,)
+            or not positions.is_contiguous()
+            or not isinstance(out_cache_loc, torch.Tensor)
+            or out_cache_loc.dtype != torch.int64
+            or out_cache_loc.shape != (rows,)
+            or not out_cache_loc.is_contiguous()
+            or not isinstance(cos_sin, torch.Tensor)
+            or cos_sin.dtype not in (torch.bfloat16, torch.float32)
+            or cos_sin.ndim != 2
+            or cos_sin.shape[1] != 64
+            or not cos_sin.is_contiguous()
+            or self.k_norm.weight.dtype not in (torch.bfloat16, torch.float32)
+            or self.k_norm.bias is None
+            or self.k_norm.bias.dtype != self.k_norm.weight.dtype
+            or any(
+                weight.dtype != torch.bfloat16
+                or weight.shape != shape
+                or not weight.is_contiguous()
+                for weight, shape in expected_weights
+            )
+        ):
+            return None
+
+        pool = get_token_to_kv_pool()
+        if pool.page_size != 64:
+            return None
+        if hasattr(pool, "invalidate_index_buffer_for_layer"):
+            pool.invalidate_index_buffer_for_layer(layer_id)
+        if hasattr(pool, "_is_layer_owned") and not pool._is_layer_owned(layer_id):
+            return None
+        cache = pool.get_index_k_with_scale_buffer(layer_id=layer_id)
+        if cache.numel() % (pool.page_size * 132) != 0:
+            return None
+        cache = cache.view(torch.uint8).view(-1, pool.page_size, 132)
+
+        from sglang.kernels.ops.attention.dsa.hip_gfx950 import (
+            full_indexer_prepare,
+        )
+
+        result = full_indexer_prepare(
+            x_bf16,
+            q_lora,
+            self.wq_b.weight,
+            self.wk.weight,
+            self.weights_proj.weight,
+            self.k_norm.weight,
+            self.k_norm.bias,
+            cos_sin,
+            positions,
+            out_cache_loc,
+            cache,
+            eps=self.k_norm.variance_epsilon,
+        )
+        if result is None:
+            return None
+        q_fp8, weights = result
+        return q_fp8, weights.unsqueeze(-1)
 
     @staticmethod
     def _update_rope_guarded(dst: torch.Tensor, src: torch.Tensor) -> None:
@@ -1655,7 +1827,12 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             self.weights_proj, "set_lora", False
         )
 
-        if (
+        full_prepare = self._try_rocm_full_indexer_prepare(
+            x, q_lora, positions, forward_batch, layer_id
+        )
+        if full_prepare is not None:
+            q_fp8, weights = full_prepare
+        elif (
             self._aiter_fused_fp8_active(forward_batch)
             and not in_piecewise_or_breakable_cuda_graph
             and not weights_proj_lora
