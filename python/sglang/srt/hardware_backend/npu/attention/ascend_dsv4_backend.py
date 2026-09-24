@@ -2059,17 +2059,31 @@ class DeepseekV4AscendAttnBackend(
                     if ids:
                         lo = min(ids)
                         span = max(ids) - lo + 1
-                        raw = (
-                            buf.narrow(0, lo, span)
-                            .view(torch.uint8)
-                            .detach()
-                            .cpu()
-                            .numpy()
-                            .tobytes()
+                        slab_t = (
+                            buf.narrow(0, lo, span).view(torch.uint8).detach().cpu()
                         )
+                        raw = slab_t.numpy().tobytes()
+                        # Token-resolved window hash: only the rows of the tokens
+                        # the window covers, so a relocated-but-equal page set
+                        # compares equal and a genuinely wrong window does not.
+                        page_sz = int(pool.swa_kv_pool.kernel_page_size)
+                        h = hashlib.md5()
+                        nrows = 0
+                        for p in range(max(0, pos - (page_sz - 1)), pos + 1):
+                            col = p // page_sz
+                            pid = int(vals[col]) if col < len(vals) else -1
+                            if lo <= pid < lo + span:
+                                h.update(
+                                    slab_t[pid - lo, p % page_sz]
+                                    .contiguous()
+                                    .numpy()
+                                    .tobytes()
+                                )
+                                nrows += 1
                         print(
                             f"[SWAKV] start_pos={_l(getattr(fm, 'start_pos', None))} layer={layer} "
-                            f"ids={ids} span={span} md5={hashlib.md5(raw).hexdigest()[:16]}",
+                            f"ids={ids} span={span} md5={hashlib.md5(raw).hexdigest()[:16]} "
+                            f"win={h.hexdigest()[:16]} rows={nrows}",
                             flush=True,
                         )
             except Exception as exc:
