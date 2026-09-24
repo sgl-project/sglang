@@ -268,6 +268,20 @@ class TestSamplingParamsVerify(CustomTestCase):
         """Test that a small positive repetition_penalty (e.g. 1e-3) is accepted."""
         self._make(repetition_penalty=1e-3).verify(self.VOCAB_SIZE)
 
+    def test_repetition_penalty_that_overflows_logits_raises(self):
+        """verify() rejects a repetition_penalty too small to divide logits by.
+
+        Regression: any positive penalty passed. Dividing an already generated
+        token's positive logit by 1e-45 gives inf in float32, which leaves the
+        request with NaN probabilities; sampling from those raises inside the
+        scheduler. 1e-6 is the smallest accepted value.
+        """
+        for penalty in (1e-45, 1e-30, 9.9e-7):
+            with self.subTest(penalty=penalty):
+                with self.assertRaisesRegex(ValueError, "repetition_penalty"):
+                    self._make(repetition_penalty=penalty).verify(self.VOCAB_SIZE)
+        self._make(repetition_penalty=1e-6).verify(self.VOCAB_SIZE)
+
     # --- min_new_tokens / max_new_tokens ---
     def test_negative_min_new_tokens_raises(self):
         """Test that verify() rejects negative min_new_tokens."""
@@ -339,6 +353,53 @@ class TestSamplingParamsVerify(CustomTestCase):
         """Test that verify() rejects a non-integer seed (e.g. a string)."""
         with self.assertRaises(ValueError):
             self._make(sampling_seed="100").verify(self.VOCAB_SIZE)
+
+    def test_logit_bias_value_that_overflows_the_sampler_raises(self):
+        """verify() rejects a logit_bias value the sampler cannot keep finite.
+
+        Regression: only the keys were checked. A value such as 1e39 reached the
+        scheduler, where writing it into the float32 bias tensor raised while the
+        batch was built. A value that fits in float32 but exceeds 1e30, such as
+        3.4e38 with temperature 0.5, overflowed to inf when the logits were
+        divided by the temperature; sampling from the resulting NaN
+        probabilities raised inside the scheduler. Either way the scheduler
+        stopped for every request on the server. NaN, infinities and non-numbers
+        also passed validation.
+        """
+        for bias in (
+            1e39,
+            -1e39,
+            10**400,
+            3.4028234663852886e38,
+            1.0000001e30,
+            -1e31,
+            float("inf"),
+            float("-inf"),
+            float("nan"),
+        ):
+            with self.subTest(bias=bias):
+                sp = self._make(logit_bias={"5": bias})
+                with self.assertRaisesRegex(ValueError, "logit_bias values"):
+                    sp.verify(self.VOCAB_SIZE)
+        for bias in ("1.0", None):
+            with self.subTest(bias=bias):
+                sp = self._make(logit_bias={"5": bias})
+                with self.assertRaisesRegex(ValueError, "logit_bias values"):
+                    sp.verify(self.VOCAB_SIZE)
+
+    def test_logit_bias_large_finite_values_accepted(self):
+        """Biases up to 1e30 in magnitude stay valid, including large negative
+        values that clients use to ban a token."""
+        sp = self._make(
+            logit_bias={
+                "0": -1e9,
+                "1": 100,
+                "2": 1e30,
+                "3": -1e30,
+                "4": 0.0,
+            }
+        )
+        sp.verify(self.VOCAB_SIZE)
 
     def test_multiple_grammars_raises(self):
         """Reject structural_tag combined with any other grammar constraint.

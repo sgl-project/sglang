@@ -41,6 +41,17 @@ TOP_K_ALL = 1 << 30
 MAX_STOP_COUNT = 32
 MAX_STOP_REGEX_LEN = 256
 MAX_STOP_REGEX_COUNT = 32
+# The sampler adds logit_bias to the float32 logits, then divides them by the
+# temperature, which is at least _SAMPLING_EPS for a non-greedy request.
+# |bias| <= 1e30 keeps bias / temperature (<= 1e36) inside the float32 range
+# with room for the model's logits and additive penalties. A logit that
+# overflows to inf turns the request's probabilities into NaN, and sampling
+# from them raises inside the scheduler.
+_LOGIT_BIAS_MAX_ABS = 1e30
+# Positive logits of already generated tokens are divided by the repetition
+# penalty before the temperature; below 1e-6 that division can overflow the
+# same way (1e-45 turns every positive logit into inf).
+_REPETITION_PENALTY_MIN = 1e-6
 
 logger = logging.getLogger(__name__)
 
@@ -244,10 +255,10 @@ class SamplingParams(msgspec.Struct, kw_only=True, array_like=True):
             raise ValueError(
                 f"presence_penalty must be in [-2, 2], got {self.presence_penalty}."
             )
-        if not 0.0 < self.repetition_penalty <= 2.0:
+        if not _REPETITION_PENALTY_MIN <= self.repetition_penalty <= 2.0:
             raise ValueError(
-                "repetition_penalty must be in (0, 2] (1.0 = no penalty), "
-                f"got {self.repetition_penalty}."
+                f"repetition_penalty must be in [{_REPETITION_PENALTY_MIN:g}, 2] "
+                f"(1.0 = no penalty), got {self.repetition_penalty}."
             )
         if not 0 <= self.min_new_tokens:
             raise ValueError(
@@ -265,11 +276,23 @@ class SamplingParams(msgspec.Struct, kw_only=True, array_like=True):
                     f"{self.min_new_tokens}."
                 )
         if self.logit_bias is not None:
-            for token_id in self.logit_bias:
+            for token_id, bias in self.logit_bias.items():
                 if not 0 <= int(token_id) < vocab_size:
                     raise ValueError(
                         f"logit_bias must has keys in [0, {vocab_size - 1}], got "
                         f"{token_id}."
+                    )
+                # A larger value overflows the sampler's float32 logits (see
+                # _LOGIT_BIAS_MAX_ABS), and one beyond the float32 range cannot
+                # even be stored in its bias tensor.
+                try:
+                    in_range = math.isfinite(bias) and abs(bias) <= _LOGIT_BIAS_MAX_ABS
+                except (TypeError, OverflowError):
+                    in_range = False
+                if not in_range:
+                    raise ValueError(
+                        "logit_bias values must be finite numbers with |value| <= "
+                        f"{_LOGIT_BIAS_MAX_ABS:g}, got {bias!r} for token {token_id}."
                     )
         if self.sampling_seed is not None:
             if not isinstance(self.sampling_seed, int):
