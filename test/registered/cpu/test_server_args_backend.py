@@ -47,7 +47,7 @@ class TestServerArgsCPUBackend(CustomTestCase):
         )
         self.assertEqual(resolution_result(server_args, "sampling_backend"), "pytorch")
 
-    def test_intel_amx_deterministic_mvp_disables_unsupported_features(self):
+    def test_intel_amx_deterministic_supports_radix_and_chunked_prefill(self):
         server_args = self._make_server_args("intel_amx")
         server_args.enable_deterministic_inference = True
         server_args.chunked_prefill_size = 2048
@@ -58,8 +58,8 @@ class TestServerArgsCPUBackend(CustomTestCase):
             handle_deterministic_inference(server_args)
 
         view = resolved_view(server_args)
-        self.assertEqual(view.chunked_prefill_size, -1)
-        self.assertTrue(view.disable_radix_cache)
+        self.assertEqual(view.chunked_prefill_size, 2048)
+        self.assertFalse(view.disable_radix_cache)
 
     def test_intel_amx_deterministic_mvp_rejects_tp(self):
         server_args = self._make_server_args("intel_amx")

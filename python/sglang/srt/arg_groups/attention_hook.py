@@ -567,16 +567,6 @@ def handle_deterministic_inference(server_args: Any):
                     "Deterministic inference with the intel_amx attention "
                     "backend does not support speculative decoding yet."
                 )
-            if cfg.chunked_prefill_size != -1:
-                logger.warning(
-                    "Chunked prefill is disabled for deterministic inference "
-                    "with the intel_amx attention backend."
-                )
-                declare_resolution(
-                    server_args,
-                    "_handle_deterministic_inference",
-                    chunked_prefill_size=-1,
-                )
         if is_deepseek_model:
             if attention_backend not in RADIX_SUPPORTED_DETERMINISTIC_ATTENTION_BACKEND:
                 raise ValueError(
