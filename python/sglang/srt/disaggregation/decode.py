@@ -23,6 +23,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import time
+import uuid
 from collections import deque
 from concurrent.futures import Future
 from dataclasses import dataclass
@@ -680,9 +681,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         ``is_rebootstrap`` marks a PD true-retraction request whose prefix KV
         must be recomputed by the original prefill worker under the current
         weights (rather than resumed from stale CPU KV). It otherwise follows the
-        same bootstrap-handshake path as a fresh request; the ``/generate``
-        dispatch happens later, after preallocation and ``send_metadata`` (see
-        ``pop_preallocated``).
+        same bootstrap-handshake path as a fresh request. Early allocation
+        dispatches ``/generate`` after ``send_metadata``; deferred allocation
+        dispatches once the peer is resolved, before waiting for completion.
         """
         # See `PrefillBootstrapQueue.add`. A retracted or rebootstrapping
         # request owns a host KV backup that `retracted_queue` releases, and by
@@ -708,6 +709,18 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             req.retraction_mb_id = None
             self.retracted_queue.append(req)
         else:
+            if (
+                is_rebootstrap
+                and get_disagg().disaggregation_decode_allocation_policy
+                == "prefill_complete"
+            ):
+                # Recompute is a new transfer: do not reuse readiness or an
+                # abort tombstone from the previous one. _init_receiver saved
+                # the actual prefill DP rank, so changing the room cannot
+                # reroute follow_bootstrap_room requests to another worker.
+                # This policy requires attention TP1/CP1/PP1; wider groups would
+                # need to agree on the new room before creating their receivers.
+                req.bootstrap_room = uuid.uuid4().int & ((1 << 63) - 1)
             decode_req = self._create_receiver_and_enqueue(
                 req, is_rebootstrap=is_rebootstrap
             )
@@ -964,14 +977,15 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         decode_req.kv_receiver.init(prefill_dp_rank)
         if (
             get_disagg().disaggregation_decode_allocation_policy == "prefill_complete"
-            and decode_req.is_rebootstrap
             and decode_req.kv_receiver.conclude_state != KVPoll.Failed
         ):
+            decode_req.req.disagg_prefill_dp_rank = prefill_dp_rank
             # Deferred allocation cannot precede the recompute that makes its
             # source ready. Keep the existing leader election and error path.
-            self.kv_manager.submit_prefill_recompute(
-                decode_req.kv_receiver, decode_req.req.build_rebootstrap_payload()
-            )
+            if decode_req.is_rebootstrap:
+                self.kv_manager.submit_prefill_recompute(
+                    decode_req.kv_receiver, decode_req.req.build_rebootstrap_payload()
+                )
 
     def _update_handshake_waiters(
         self,

@@ -23,6 +23,7 @@ class TestNixlSenderFailureCleanup(unittest.TestCase):
             prefetch_requested={(room, 0, "session-a"), (8, 0, "session-b")},
         )
         sender.kv_mgr = SimpleNamespace(
+            deferred_bootstrap=None,
             enable_staging=True,
             _staging_ctx=staging_ctx,
             request_status={room: object()},

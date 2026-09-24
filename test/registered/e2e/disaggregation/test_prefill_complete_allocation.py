@@ -14,7 +14,7 @@ from sglang.test.server_fixtures.disaggregation_fixture import (
     PDDisaggregationServerBase,
 )
 
-register_cuda_ci(est_time=480, stage="base-b", runner_config="2-gpu-large")
+register_cuda_ci(est_time=480, stage="extra-a", runner_config="2-gpu-large")
 
 
 class _PrefillCompleteServer(PDDisaggregationServerBase):

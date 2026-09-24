@@ -1224,7 +1224,11 @@ class SchedulerDisaggregationPrefillMixin:
                 if is_aborted(req):
                     # bootstrap failed
                     self.chunked_req = None
-                elif self.has_bootstrapped_waiting_req():
+                elif (
+                    get_disagg().disaggregation_decode_allocation_policy
+                    != "prefill_complete"
+                    and self.has_bootstrapped_waiting_req()
+                ):
                     # optimistic request yields to waiting requests
                     self.chunked_req = None
                     if not self.enable_overlap:

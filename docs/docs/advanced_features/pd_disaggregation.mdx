@@ -46,15 +46,25 @@ bootstrap registry, and attention TP/CP and pipeline sizes of one. Attention DP
 is allowed when each DP rank has attention TP size one. Prefill automatically
 resolves `--optimistic-prefill-attempts` from zero to one; configurations that
 disable optimistic prefill after model validation are rejected.
+Chunked prefill does not yield just because decode has not admitted the request.
+Completed requests retain their KV in the existing optimistic-prefill inflight
+queue until decode supplies destination indices; readiness alone never starts
+a KV write.
 Retries remain eligible for prefill after the optimistic attempt budget is
 exhausted and remain subject to the existing cancellation and timeout handling.
+
+On prefill, `SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT` starts after the final
+prefill result, giving decode admission its own budget. On decode,
+`SGLANG_DISAGGREGATION_WAITING_TIMEOUT` bounds the wait for prefill completion,
+then starts afresh for admission and again when destination indices are sent
+for transfer.
 
 The option does not support staging buffers, runtime PD role switching, PD
 multiplexing, encoder disaggregation, decoupled speculation, HiSparse, decode radix cache, decode
 HiCache, or non-DSA auxiliary state pools. Prefill HiCache is limited to L2 with
 `write_back` and no storage backend. Unsupported configurations fail validation.
 
-All communicating workers must implement and enable the same policy. This
+All communicating workers must use the same revision and enable the same policy. This
 version of the decode worker rejects policy or peer-layout mismatches before
 destination registration. Older decode workers do not enforce this check. Keep
 `early` on both sides until every worker has been upgraded, then enable the new

@@ -522,8 +522,6 @@ class TestMooncakeBootstrapThreadRobustness(unittest.TestCase):
         sock = self._FlakySocket(self._ctx, zmq.PULL)
         port = sock.bind_to_random_port("tcp://127.0.0.1")
         m = MooncakeKVManager.__new__(MooncakeKVManager)
-        # Match the constructor's default early-allocation readiness state.
-        m.prefill_complete = None
         m._stopped = False
         m._worker_threads = []
         m.server_socket = sock

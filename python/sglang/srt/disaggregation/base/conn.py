@@ -171,6 +171,7 @@ class BaseKVSender(ABC):
 
     def mark_prefill_complete(self) -> None:
         """Publish retained final-prefill KV for an enabled allocation policy."""
+        raise NotImplementedError
 
     def pop_decode_prefix_len(self) -> int:
         return 0
