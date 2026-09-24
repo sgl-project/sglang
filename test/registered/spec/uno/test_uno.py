@@ -43,8 +43,8 @@ LORA_PATH_ENV = "SGLANG_TEST_UNO_LORA_PATH"
 MAX_NEW_TOKENS = 128
 PARITY_TOKENS = 32
 PARITY_TOP_LOGPROBS_NUM = 5
-# UNO verification and AR teacher-forced scoring use different kernel shapes,
-# so a token may trail AR's argmax by this much; measured max 0.25 on H200.
+# UNO verify and AR teacher-forced scoring use different kernel shapes; measured
+# H200 gaps are 1-2 bf16 logit steps (0.125 each here), so this allows 4.
 PARITY_TIE_LOGPROB_MARGIN = 0.5
 # Per mode and prompt; measured at most 1 on H200, identical across launches.
 PARITY_MAX_NEAR_TIES_PER_OUTPUT = 1
@@ -190,14 +190,17 @@ class TestUnoCudaGraph(CustomTestCase):
 
     def _ar_logprob_gaps(self, prompt: str, output_ids: list[int]) -> list[float]:
         """Per output position, AR's top-1 logprob minus that of UNO's token."""
-        prompt_ids = self._generate(text=prompt)["meta_info"]["input_token_logprobs"]
+        prompt_logprobs = self._generate(text=prompt)["meta_info"][
+            "input_token_logprobs"
+        ]
+        prompt_ids = [token_id for _, token_id, *_ in prompt_logprobs]
         # UNO rejects returned logprobs, so AR scores UNO's tokens teacher-forced.
         scored = self._generate(
-            input_ids=[token_id for _, token_id, *_ in prompt_ids] + output_ids,
+            input_ids=prompt_ids + output_ids,
             top_logprobs_num=PARITY_TOP_LOGPROBS_NUM,
         )["meta_info"]["input_top_logprobs"][len(prompt_ids) :]
         gaps = []
-        for token_id, position in zip(output_ids, scored):
+        for token_id, position in zip(output_ids, scored, strict=True):
             top = {candidate: logprob for logprob, candidate, *_ in position}
             gaps.append(max(top.values()) - top.get(token_id, float("-inf")))
         return gaps
