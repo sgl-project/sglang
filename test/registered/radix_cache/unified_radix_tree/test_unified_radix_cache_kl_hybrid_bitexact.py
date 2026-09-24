@@ -21,8 +21,12 @@ Measured avg_kl_div:
            multiturn branching                     0.0    2.01e-07        0.0
            lazy test_prefill_cache_hit        5.56e-06         n/a        0.0
   #29792   multiturn branching       9.43e-06/1.16e-05    5.14e-04        0.0
+  unified  test_logprobs_match                     n/a    1.82e-03        0.0
+  memory   test_prefill_cache_hit                  n/a    1.73e-03        0.0
+  track    test_decode_cache_hit                   n/a    2.44e-03        0.0
 
-The lazy row was measured in the same session as the 1.18e-05 the non-lazy
+The unified-memory rows (untranslated conv-checkpoint track ids) were measured
+on SM90 only. The lazy row was measured in the same session as the 1.18e-05 the non-lazy
 `test_prefill_cache_hit` read on that GPU, so read the pair as "both fire",
 not as one being weaker.
 
@@ -73,7 +77,7 @@ from sglang.test.test_utils import (
     unified_radix_tree_server_env,
 )
 
-register_cuda_ci(est_time=2300, stage="extra-a", runner_config="1-gpu-large")
+register_cuda_ci(est_time=2640, stage="extra-a", runner_config="1-gpu-large")
 
 _MODEL_PATH = os.environ.get("INKLING_TEST_MODEL_PATH", "thinkingmachines/Inkling")
 _MODEL_REVISION = os.environ.get("INKLING_TEST_MODEL_REVISION", "test")
@@ -219,6 +223,36 @@ class TestUnifiedHybridLazyBitExact(TestUnifiedHybridBitExact):
         cls.model = _MODEL_PATH
         cls.base_url = DEFAULT_URL_FOR_TEST
         other_args = _base_args("extra_buffer_lazy") + [
+            "--chunked-prefill-size",
+            "16384",
+        ]
+        if _MODEL_REVISION:
+            other_args += ["--revision", _MODEL_REVISION]
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=other_args,
+            env=unified_radix_tree_server_env(cls.tree_core_backend),
+        )
+
+
+class TestUnifiedMemoryHybridBitExact(TestUnifiedHybridBitExact):
+    """Same exactness bar on the unified memory pool, whose mamba slot ids are
+    virtual.
+
+    Guards the conv-checkpoint track destinations reaching the kernels as
+    physical slots. Left virtual, every prefix-cache checkpoint is written to the
+    physical slot that shares its number, so a later hit restores another slot's
+    conv window.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.model = _MODEL_PATH
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        other_args = _base_args() + [
+            "--enable-unified-memory",
             "--chunked-prefill-size",
             "16384",
         ]
