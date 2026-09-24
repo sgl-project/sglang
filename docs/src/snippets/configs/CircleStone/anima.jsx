@@ -40,7 +40,7 @@ export const config = {
     resource: {
       limits: { nodes: { min: 1, max: 1 }, gpus_per_node: { min: 1, max: 8 } },
       verifiedRecipes: [
-        { hw: "h200", gpus_per_node: 1, tp_size: 1, ulysses_degree: 1, ring_degree: 1, placement: "resident", attention: "fa" },
+        { id: "h200-1gpu-resident-fa", hw: "h200", gpus_per_node: 1, tp_size: 1, ulysses_degree: 1, ring_degree: 1, placement: "resident", attention: "fa" },
       ],
       autoTopology: (s) => ({ tp_size: Number(s.gpus_per_node), ulysses_degree: 1, ring_degree: 1 }),
       validateTopology: (s, t) => {
@@ -81,6 +81,6 @@ export const config = {
   },
   curl: (s) => `curl -sS http://{{CURL_HOST}}:{{CURL_PORT}}/v1/images/generations \\
   -H 'Content-Type: application/json' \\
-  -d '${JSON.stringify({ model: "{{MODEL_NAME}}", prompt: "masterpiece, best quality, safe, watercolor landscape, a quiet seaside village at sunset", size: "1024x1024", n: Number(s.outputs), seed: 42, response_format: "b64_json" }, null, 2)}'`,
+  -d '${JSON.stringify({ model: "{{MODEL_NAME}}", prompt: "masterpiece, best quality, safe, watercolor landscape, a quiet seaside village at sunset", size: "1024x1024", n: Number(s.outputs), seed: 42, generator_device: "cpu", output_format: "png", response_format: "b64_json" }, null, 2)}'`,
   cells: [],
 };

@@ -14,6 +14,7 @@ from sglang.multimodal_gen.configs.models.adapter.anima import (
 from sglang.multimodal_gen.configs.models.dits.anima import AnimaDiTConfig
 from sglang.multimodal_gen.configs.pipeline_configs.anima import AnimaPipelineConfig
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
+    cleanup_dist_env_and_memory,
     maybe_init_distributed_environment_and_model_parallel,
 )
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
@@ -25,6 +26,14 @@ from sglang.multimodal_gen.test.single_test_file.component_accuracy.utils import
 )
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+
+
+@pytest.fixture(scope="module", autouse=True)
+def cleanup_owned_process_group():
+    initialized = torch.distributed.is_initialized()
+    yield
+    if not initialized:
+        cleanup_dist_env_and_memory()
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])

@@ -131,7 +131,8 @@ and single-file ComfyUI checkpoints are not covered by this integration.
 
 Full-checkpoint checks on H200 cover 1024px/30-step generation and HTTP serving,
 including repeated requests and multiple outputs. Two-GPU functional checks
-cover TP, Ulysses, Ring with FlashAttention, CFG parallelism, and encoder folding.
+cover TP, Ulysses, Ring with FlashAttention, CFG parallelism, encoder folding,
+and parallel tiled VAE decode.
 Additional checks cover DiT and conditioner layerwise offload, FlashAttention,
 Torch SDPA, SageAttention, Cache-DiT, and breakable CUDA graphs. These are
 functional checks, not a broad quality evaluation of approximate optimizations.

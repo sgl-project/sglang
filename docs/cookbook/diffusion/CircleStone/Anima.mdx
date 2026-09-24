@@ -80,3 +80,7 @@ image quality for your prompts before enabling them. See
 [performance optimization](/docs/sglang-diffusion/performance-optimization) for the
 shared controls and [compatibility](/docs/sglang-diffusion/compatibility_matrix#anima)
 for the tested scope.
+
+Breakable CUDA graphs reuse the conditioner's actual sequence length, without
+additional text-bucket padding. Requests with uncaptured shapes fall back to eager
+execution. Standard short prompts use the same 512-token conditioning shape.
