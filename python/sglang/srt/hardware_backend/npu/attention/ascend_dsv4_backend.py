@@ -136,6 +136,14 @@ def _build_explicit_state_block_table(
     ).contiguous()
 
 
+
+def _pos_repr(fm) -> str:
+    """start_pos may be a tensor or a plain list; render it uniformly."""
+    t = getattr(fm, "start_pos", None)
+    if torch.is_tensor(t):
+        return str(t.tolist())
+    return str(t)
+
 class CompressorAscendBackendMixin:
     @staticmethod
     def _to_cpu_int_list(values) -> Optional[list[int]]:
@@ -508,7 +516,7 @@ class CompressorAscendBackendMixin:
                         _rows = _flat.index_select(0, _locs)
                         _a = _rows.detach().to(torch.float32).cpu().numpy()
                         print(
-                            f"[CIN] pid={os.getpid()} start_pos={_l(getattr(fm, 'start_pos', None))} "
+                            f"[CIN] pid={os.getpid()} start_pos={_pos_repr(fm)} "
                             f"{_tag} state_rows n={_rows.shape[0]} "
                             f"sum={_a.sum():.4f} absmax={abs(_a).max():.4f} "
                             f"md5={hashlib.md5(_a.tobytes()).hexdigest()[:16]}",
@@ -573,7 +581,7 @@ class CompressorAscendBackendMixin:
                 f"md5={hashlib.md5(_a.tobytes()).hexdigest()[:16]}"
             )
             print(
-                f"[COUT] pid={os.getpid()} start_pos={_l(getattr(fm, 'start_pos', None))} "
+                f"[COUT] pid={os.getpid()} start_pos={_pos_repr(fm)} "
                 f"L{compressor.layer_id} r{ratio} idx={int(compressor.is_in_indexer)} "
                 f"n={cmp_kv.shape[0]} {_s}",
                 flush=True,
