@@ -26,6 +26,10 @@ for mod in (
     "sglang.srt.speculative.decoupled_spec_io",
     "sglang.srt.speculative.spec_info",
     "sglang.srt.speculative.eagle_info",
+    # Pulled in transitively via disaggregation.decode -> mem_cache.kv_cache_builder.
+    # The parent stub above is not a real package, so the submodule itself must be
+    # pre-seeded or the import fails with "'sglang.srt.speculative' is not a package".
+    "sglang.srt.speculative.base_spec_worker",
 ):
     sys.modules.setdefault(mod, MagicMock())
 
