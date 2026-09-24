@@ -25,7 +25,7 @@ from sglang.srt.mem_cache.pool_host.mha import (
     MHATokenToKOnlyPoolHost,
     get_mha_host_pool_cls,
 )
-from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
+from sglang.srt.mem_cache.pool_host.mla import get_mla_host_pool_cls
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.runtime_context import get_memory, get_parallel, get_serving
 
@@ -148,7 +148,7 @@ def build_kv_host_pool(
     pool_label: str = "kv",
 ):
     kv_host_pool_cls = (
-        MLATokenToKVPoolHost if use_mla else get_mha_host_pool_cls(kv_pool)
+        get_mla_host_pool_cls(kv_pool) if use_mla else get_mha_host_pool_cls(kv_pool)
     )
     kwargs = {}
     if override_kv_cache_dim is not None:
@@ -1404,7 +1404,7 @@ def _build_mha_mla_host_pool(
     )
     if isinstance(pool, MHATokenToKVPool):
         return get_mha_host_pool_cls(pool)(pool, **kwargs)
-    return MLATokenToKVPoolHost(
+    return get_mla_host_pool_cls(pool)(
         pool,
         override_kv_cache_dim=pool.kv_cache_dim,
         **kwargs,
