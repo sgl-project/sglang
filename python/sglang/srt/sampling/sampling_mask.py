@@ -22,16 +22,15 @@ class SamplingMaskChunk(
     logprobs: np.ndarray
 
     def __reduce_ex__(self, protocol: int):
-        # Unpickling with numpy's reducer leaves GC-tracked objects per array; with a
-        # chunk per request per message they trigger full collections downstream.
+        # Read-only buffers unpickle as bytes, which np.frombuffer wraps without the
+        # GC-tracked objects that numpy's reducer or a bytearray would leave per array.
         if protocol < 5:
             return super().__reduce_ex__(protocol)
         return (
             _chunk_from_buffers,
-            (
-                pickle.PickleBuffer(self.lengths),
-                pickle.PickleBuffer(self.token_ids),
-                pickle.PickleBuffer(self.logprobs),
+            tuple(
+                pickle.PickleBuffer(memoryview(values).toreadonly())
+                for values in (self.lengths, self.token_ids, self.logprobs)
             ),
         )
 
