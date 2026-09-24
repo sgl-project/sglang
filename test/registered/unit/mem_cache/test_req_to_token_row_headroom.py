@@ -12,8 +12,11 @@ compares the headroom against what an actual decode step asks for rather than
 against a restatement of the formula.
 """
 
+import ast
+import pathlib
 import unittest
 
+import sglang.srt.mem_cache.kv_cache_configurator as _kvcfg
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.allocation_sizing import (
     get_alloc_page_size,
@@ -160,6 +163,46 @@ class TestReqToTokenRowHeadroom(CustomTestCase):
                 # reserve. Both scale by num_reqs.
                 per_request = eviction_interval * (tokens - 1) + (reserve - 1)
                 self.assertEqual(cap_spec - cap_plain, num_reqs * per_request)
+
+
+class TestUnifiedBuildersUseTheSharedHelper(CustomTestCase):
+    """The two unified-pool builders must size from the helper, not a copy.
+
+    `_init_unified_mamba_pools` and `_init_unified_mamba_swa_pools` carried a
+    hand-rolled copy of `get_req_to_token_extra_context_len()` that had drifted
+    narrower than the decode reserve the allocator takes, so the `req_to_token`
+    row could be written past its own end. The calculation itself is asserted by
+    the tests above; what is left to pin is that these builders keep *calling*
+    the helper -- a copy is exactly how the two drifted apart in the first place.
+    """
+
+    BUILDERS = ("_init_unified_mamba_pools", "_init_unified_mamba_swa_pools")
+
+    def _builder_sources(self) -> dict[str, str]:
+        path = pathlib.Path(_kvcfg.__file__)
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        out: dict[str, str] = {}
+        for node in ast.walk(tree):
+            if isinstance(node, ast.FunctionDef) and node.name in self.BUILDERS:
+                out[node.name] = ast.unparse(node)
+        return out
+
+    def test_unified_builders_use_the_shared_helper(self):
+        sources = self._builder_sources()
+        self.assertEqual(set(sources), set(self.BUILDERS), "builders not found by name")
+        for name, src in sources.items():
+            with self.subTest(builder=name):
+                self.assertIn(
+                    "get_req_to_token_extra_context_len()",
+                    src,
+                    f"{name} no longer sizes from the shared helper",
+                )
+                # The specific drift: a literal base plus the raw option.
+                self.assertNotIn(
+                    "extra_max_context_len = 4",
+                    src,
+                    f"{name} reintroduced the hand-rolled copy",
+                )
 
 
 if __name__ == "__main__":
