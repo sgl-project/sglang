@@ -28,7 +28,6 @@ from sglang.srt.layers.attention.vision import VisionAttention
 from sglang.srt.layers.communicator import (
     LayerCommunicator,
     LayerScatterModes,
-    UnreducedOutput,
     enable_moe_dense_fully_dp,
     get_attn_tp_context,
     layer_input_buffer,
@@ -109,7 +108,6 @@ from sglang.srt.multimodal.mm_utils import (
     run_dp_sharded_mrope_vision_model,
 )
 from sglang.srt.runtime_context import (
-    get_forward,
     get_lora,
     get_mm,
     get_parallel,
@@ -953,16 +951,6 @@ class Glm5NextDecoderLayer(nn.Module):
             forward_batch,
         )
 
-        should_allreduce_fusion = (
-            self.layer_communicator.should_fuse_mlp_allreduce_with_next_layer(
-                forward_batch
-            )
-        )
-
-        use_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
-            forward_batch
-        )
-
         if isinstance(self.mlp, Glm5NextMLP):
             gemm_output_zero_allocator = None
 
@@ -977,26 +965,13 @@ class Glm5NextDecoderLayer(nn.Module):
         else:
             _mlp_ctx = nullcontext()
 
-        with get_forward().scoped(
-            fuse_mlp_allreduce=should_allreduce_fusion,
-            mlp_reduce_scatter=use_reduce_scatter,
-        ):
-            with _mlp_ctx:
-                hidden_states = self.mlp(
-                    hidden_states,
-                    forward_batch,
-                    gemm_output_zero_allocator,
-                )
-
-        if should_allreduce_fusion:
-            hidden_states = UnreducedOutput(hidden_states)
-
-        if not should_allreduce_fusion:
-            hidden_states, residual = self.layer_communicator.postprocess_layer(
+        with self.layer_communicator.ffn_exit(forward_batch) as ffn_exit, _mlp_ctx:
+            hidden_states = self.mlp(
                 hidden_states,
-                residual,
                 forward_batch,
+                gemm_output_zero_allocator,
             )
+        hidden_states, residual = ffn_exit.finish(hidden_states, residual)
 
         return hidden_states, residual, topk_indices
 
