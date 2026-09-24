@@ -1024,17 +1024,13 @@ class DeepseekV2MoE(nn.Module):
                     self,
                     router_logits,
                     input_ids_global,
-                    num_token_non_padded=self._moe_topk_num_token_non_padded(
-                        num_token_non_padded
-                    ),
+                    num_token_non_padded=num_token_non_padded,
                 )
             else:
                 topk_output = self.topk(
                     hidden_states,
                     router_logits,
-                    num_token_non_padded=self._moe_topk_num_token_non_padded(
-                        num_token_non_padded
-                    ),
+                    num_token_non_padded=num_token_non_padded,
                     expert_location_dispatch_info=dispatch_info,
                     **topk_kwargs,
                 )
@@ -1211,19 +1207,6 @@ class DeepseekV2MoE(nn.Module):
             final_hidden_states += shared_output
         return final_hidden_states
 
-    @staticmethod
-    def _moe_topk_num_token_non_padded(
-        num_token_non_padded: Optional[torch.Tensor],
-    ) -> Optional[torch.Tensor]:
-        # ROCm: the AITER fused topk kernel does not take this bound, so the
-        # padded rows it leaves behind are routed as real tokens and corrupt the
-        # MoE output (DeepSeek-V4-Pro TP8DP8 TBO GSM8K collapse). Padded rows
-        # contribute zero weight anyway, so dropping the bound is safe here.
-        # See sgl-project/sglang#39804.
-        if _is_hip:
-            return None
-        return num_token_non_padded
-
     def forward_normal(
         self,
         hidden_states: torch.Tensor,
@@ -1277,17 +1260,13 @@ class DeepseekV2MoE(nn.Module):
                     self,
                     router_logits,
                     input_ids_global,
-                    num_token_non_padded=self._moe_topk_num_token_non_padded(
-                        num_token_non_padded
-                    ),
+                    num_token_non_padded=num_token_non_padded,
                 )
             else:
                 topk_output = self.topk(
                     hidden_states,
                     router_logits,
-                    num_token_non_padded=self._moe_topk_num_token_non_padded(
-                        num_token_non_padded
-                    ),
+                    num_token_non_padded=num_token_non_padded,
                     expert_location_dispatch_info=dispatch_info,
                     **topk_kwargs,
                 )
