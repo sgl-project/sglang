@@ -139,7 +139,7 @@ DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_DECODE_ARGS = [
     "--watchdog-timeout",
     9000,
     "--mem-fraction-static",
-    0.7,
+    0.68,
     "--disaggregation-mode",
     "decode",
     "--disaggregation-transfer-backend",
