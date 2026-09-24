@@ -15,6 +15,13 @@ from sglang.kernels.ops.attention.flash_attention import (
     flash_attn_varlen_func,
     flash_attn_with_kvcache,
 )
+from sglang.kernels.ops.attention.flash_attn.cute import (
+    clear_shear_bias_workspace,
+)
+from sglang.kernels.ops.attention.flash_attn.cute.interface import (
+    _shear_bias_empty,
+    _shear_bias_workspace,
+)
 from sglang.srt.utils import is_sm100_or_sm110_supported
 from sglang.test.ci.ci_register import register_cuda_ci
 
@@ -23,6 +30,45 @@ register_cuda_ci(est_time=120, stage="base-b-kernel-unit", runner_config="4-gpu-
 
 # Skip this test on Hopper machine
 skip_condition = torch.cuda.get_device_capability() < (10, 0)
+
+
+def test_shear_bias_workspace_is_stream_local_and_clearable():
+    clear_shear_bias_workspace()
+    stream_a = torch.cuda.Stream()
+    stream_b = torch.cuda.Stream()
+    shape = (4096,)
+    device = torch.device("cuda", torch.cuda.current_device())
+
+    with torch.cuda.stream(stream_a):
+        workspace_a = _shear_bias_empty(shape, torch.uint8, device)
+        workspace_a_reused = _shear_bias_empty((shape[0] // 2,), torch.uint8, device)
+    with torch.cuda.stream(stream_b):
+        workspace_b = _shear_bias_empty(shape, torch.uint8, device)
+
+    assert workspace_a.data_ptr() == workspace_a_reused.data_ptr()
+    assert workspace_a.data_ptr() != workspace_b.data_ptr()
+    assert len(_shear_bias_workspace) == 2
+
+    # Force B's write between A's write and read. A device-only cache aliases
+    # the two workspaces and deterministically changes observed_a to all twos.
+    a_ready = torch.cuda.Event()
+    b_done = torch.cuda.Event()
+    observed_a = torch.empty_like(workspace_a)
+    with torch.cuda.stream(stream_a):
+        workspace_a.fill_(1)
+        a_ready.record()
+    with torch.cuda.stream(stream_b):
+        stream_b.wait_event(a_ready)
+        workspace_b.fill_(2)
+        b_done.record()
+    with torch.cuda.stream(stream_a):
+        stream_a.wait_event(b_done)
+        observed_a.copy_(workspace_a)
+    torch.cuda.synchronize()
+
+    assert torch.all(observed_a == 1)
+    clear_shear_bias_workspace()
+    assert not _shear_bias_workspace
 
 
 def apply_rotary_emb(
