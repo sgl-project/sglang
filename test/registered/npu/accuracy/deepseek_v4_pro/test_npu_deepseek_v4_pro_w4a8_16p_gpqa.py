@@ -5,13 +5,13 @@ from sglang.test.ascend.e2e.test_npu_accuracy_utils import (
     TestNpuAccuracyTestCaseBase,
 )
 from sglang.test.ascend.e2e.test_npu_performance_utils import (
-    DEEPSEEK_V4_PRO_0813_W4A8_MODEL_PATH, TestNpuPerformanceTestCaseBase, AISBENCHMARK_DATASET_DEFAULT,
+    DEEPSEEK_V4_PRO_0813_W4A8_MODEL_PATH,
 )
 from sglang.test.ci.ci_register import register_npu_ci
 
 register_npu_ci(
     est_time=4800,
-    suite="nightly-acc-16-npu-a3",
+    suite="",
     nightly=True,
 )
 
@@ -127,7 +127,7 @@ class TestNPUDeepSeekV4ProW4A88PGPQAHigh(TestNpuAccuracyTestCaseBase):
     datasets = ["gpqa_diamond"]
     few_shot_num = 0
     generation_config = DEEPSEEK_V4_PRO_W4A8_GENERATION_CONFIG_HIGH
-    eval_batch_size = 64
+    eval_batch_size = 32
     stream = True
     timeout = 7200
     seed = 1

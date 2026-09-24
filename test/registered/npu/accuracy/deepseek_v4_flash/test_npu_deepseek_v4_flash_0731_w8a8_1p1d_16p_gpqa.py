@@ -12,7 +12,6 @@ register_npu_ci(
     est_time=3600,
     suite="",
     nightly=True,
-    disabled="accuracy testcase",
 )
 
 DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_COMMON_ENVS = {
