@@ -1,3 +1,11 @@
+"""``torch.utils.cpp_extension.load`` behind a lock that dead processes release.
+
+torch guards a JIT build with a ``lock`` file and waits while it exists, so a
+process killed mid-build leaves every later loader spinning forever. The flock
+here is released by the kernel when its holder dies; under it, a leftover torch
+lock can only be stale and is removed before loading.
+"""
+
 from __future__ import annotations
 
 import fcntl
@@ -110,6 +118,8 @@ def load_extension_with_recovery(
     sources: Sequence[str],
     extra_cflags: Sequence[str] | None = None,
     extra_cuda_cflags: Sequence[str] | None = None,
+    extra_ldflags: Sequence[str] | None = None,
+    with_cuda: bool | None = None,
     verbose: bool = False,
 ) -> Any:
     from torch.utils.cpp_extension import load
@@ -122,7 +132,9 @@ def load_extension_with_recovery(
         "extra_cuda_cflags": (
             None if extra_cuda_cflags is None else list(extra_cuda_cflags)
         ),
+        "extra_ldflags": None if extra_ldflags is None else list(extra_ldflags),
         "build_directory": str(build_directory),
+        "with_cuda": with_cuda,
         "verbose": verbose,
     }
 

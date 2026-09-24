@@ -1,8 +1,4 @@
-from typing import List
-
 import torch
-
-from sglang.srt.utils.custom_op import register_custom_op
 
 cmo_stream = None
 share_stream = None
@@ -23,56 +19,40 @@ def set_cmo_stream(stream):
     cmo_stream = stream
 
 
-@register_custom_op()
-def _prepare_weight_cache_list(
-    handle: torch.Tensor, cache: List[torch.Tensor], max_size: int
-) -> None:
-    import torch_npu
-
-    stream = get_cmo_stream()
-    if stream is None:
-        stream = torch.npu.Stream()
-        set_cmo_stream(stream)
-    stream.wait_stream(torch.npu.current_stream())
-    with torch.npu.stream(stream):
-        for weight in cache:
-            torch_npu.npu_prefetch(weight, handle, max_size)
-
-
-@register_custom_op()
-def _prepare_weight_cache_single(
-    handle: torch.Tensor, cache: torch.Tensor, max_size: int
-) -> None:
-    import torch_npu
-
-    stream = get_cmo_stream()
-    if stream is None:
-        stream = torch.npu.Stream()
-        set_cmo_stream(stream)
-    stream.wait_stream(torch.npu.current_stream())
-    with torch.npu.stream(stream):
-        torch_npu.npu_prefetch(cache, handle, max_size)
-
-
 def prepare_weight_cache(handle, cache, PREFETCH_MAX_SIZE=1000000000):
     """
     PREFETCH_MAX_SIZE: maximum size (bytes) for each prefetch operation.
     This affects the time spent in prefetch:
         time ≈ PREFETCH_MAX_SIZE / system_bandwidth
     """
-    if isinstance(cache, list):
-        _prepare_weight_cache_list(handle, cache, PREFETCH_MAX_SIZE)
-    else:
-        _prepare_weight_cache_single(handle, cache, PREFETCH_MAX_SIZE)
+    import torch_npu
+
+    stream = get_cmo_stream()
+    if stream is None:
+        stream = torch.npu.Stream()
+        set_cmo_stream(stream)
+    stream.wait_stream(torch.npu.current_stream())
+    with torch.npu.stream(stream):
+        if isinstance(cache, list):
+            for weight in cache:
+                torch_npu.npu_prefetch(
+                    weight,
+                    handle,
+                    PREFETCH_MAX_SIZE,
+                )
+        else:
+            torch_npu.npu_prefetch(
+                cache,
+                handle,
+                PREFETCH_MAX_SIZE,
+            )
 
 
-@register_custom_op(out_shape=0)
-def wait_cmo_stream(dummy: torch.Tensor) -> torch.Tensor:
+def wait_cmo_stream():
     stream = get_cmo_stream()
     if stream is not None:
         cur_stream = torch.npu.current_stream()
         cur_stream.wait_stream(stream)
-    return dummy
 
 
 def get_share_stream():
@@ -85,21 +65,14 @@ def set_share_stream(stream):
     share_stream = stream
 
 
-@register_custom_op(out_shape=0)
-def wait_share_stream(dummy: torch.Tensor) -> torch.Tensor:
+def wait_share_stream():
     stream = get_share_stream()
     if stream is not None:
         cur_stream = torch.npu.current_stream()
         cur_stream.wait_stream(stream)
-    return dummy
 
 
 def shared_expert_on_independent_stream(hidden_states, forward_func):
-    import torch.compiler
-
-    if torch.compiler.is_compiling():
-        return forward_func(hidden_states)
-
     stream = get_share_stream()
     if stream is None:
         stream = torch.npu.Stream()
