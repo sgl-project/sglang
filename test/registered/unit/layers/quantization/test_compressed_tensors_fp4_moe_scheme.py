@@ -20,6 +20,7 @@ from unittest import mock
 
 import torch
 
+from sglang.srt.layers.moe.fused_moe_triton import FusedMoE as _FusedMoE
 from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import (
     CompressedTensorsConfig,
 )
@@ -86,6 +87,17 @@ class FusedMoE(torch.nn.Module):
     """find_matched_target matches on the module's class name, and
     _add_fused_moe_to_target_scheme_map aliases a bare `Linear` target onto
     `FusedMoE`; the name is what makes the lookup resolve."""
+
+
+class _RealFusedMoESubclass(_FusedMoE):
+    """get_quant_method branches on isinstance(layer, FusedMoE), so the gate test
+    needs a real subclass -- unlike get_moe_scheme, which takes any module.
+    FusedMoE.__init__ builds a distributed layer, so bypass it and set only the
+    field the gate reads."""
+
+    def __init__(self, serves_fused_mxfp4):
+        torch.nn.Module.__init__(self)
+        self.serves_fused_mxfp4 = serves_fused_mxfp4
 
 
 def _get_moe_scheme(config_dict, capability):
@@ -180,6 +192,41 @@ class TestFp4MoeSchemeSelection(CustomTestCase):
         )
         self.assertIsInstance(mxfp4, CompressedTensorsW4A16Mxfp4MoE)
         self.assertIsInstance(nvfp4, CompressedTensorsW4A16Nvfp4MoE)
+
+    def test_fused_layout_model_still_bypasses_to_mxfp4_moe_method(self):
+        """The split-expert scheme is reached by opting out via FusedMoE's
+        serves_fused_mxfp4 flag, not by anything in the config -- GraniteMoe and
+        Kimi-K3 ship indistinguishable mxfp4-pack-quantized configs. A model that
+        keeps the flag's default must still get Mxfp4MoEMethod, or every fused
+        mxfp4 MoE silently changes kernel.
+        """
+        for variant, input_act in (
+            ("mxfp4a16", None),
+            ("mxfp4", dict(MXFP4_WEIGHTS, dynamic=True)),
+        ):
+            for serves_fused, expected in ((True, "fused"), (False, "split")):
+                with self.subTest(variant=variant, serves_fused=serves_fused):
+                    layer = _RealFusedMoESubclass(serves_fused)
+                    quant_config = CompressedTensorsConfig.from_config(
+                        _make_config("mxfp4-pack-quantized", MXFP4_WEIGHTS, input_act)
+                    )
+                    with (
+                        mock.patch(
+                            "torch.cuda.get_device_capability", return_value=(9, 0)
+                        ),
+                        mock.patch("torch.cuda.is_available", return_value=True),
+                        mock.patch(
+                            "sglang.srt.layers.quantization.mxfp4.Mxfp4MoEMethod"
+                        ) as fused_method,
+                    ):
+                        fused_method.return_value = "fused"
+                        method = quant_config.get_quant_method(layer, prefix=MOE_LAYER)
+                    if expected == "fused":
+                        self.assertEqual(method, "fused")
+                    else:
+                        self.assertIsInstance(
+                            layer.scheme, CompressedTensorsW4A16Mxfp4MoE
+                        )
 
     def test_fp8_w8a8_moe_still_selects_fp8(self):
         """Guards the None-guard additions to the w8a8 predicates against
