@@ -59,7 +59,6 @@ from sglang.srt.model_executor.runner_utils import (
 )
 from sglang.srt.runtime_context import (
     get_exec,
-    get_parallel,
     get_spec,
     max_prefill_buffer_tokens,
     max_speculative_num_draft_tokens,
@@ -150,7 +149,6 @@ class EagerRunner(BaseRunner):
             encoder_lens_dtype=(
                 torch.int64 if torch.device(mr.device).type == "cpu" else torch.int32
             ),
-            dp_size=get_parallel().dp_size,
         )
         # Eager has no capture step, so warm up here (run-once via mr._kernel_warmed_up).
         if run_warmup:

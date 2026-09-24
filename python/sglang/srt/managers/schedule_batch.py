@@ -96,6 +96,7 @@ from sglang.srt.disaggregation.utils import FAKE_BOOTSTRAP_HOST, DisaggregationM
 from sglang.srt.dllm.mixin.req import ReqDllmMixin
 from sglang.srt.environ import envs
 from sglang.srt.managers.embed_types import PositionalEmbeds
+from sglang.srt.managers.kv_hints import KvHintsEnvelope
 from sglang.srt.managers.scheduler_components.new_token_ratio_tracker import (
     NewTokenRatioTracker,
 )
@@ -111,10 +112,10 @@ from sglang.srt.mem_cache.base_prefix_cache import (
 )
 from sglang.srt.mem_cache.common import (
     RetractionBackup,
+    backup_kv_cache,
     evict_from_tree_cache,
     free_swa_out_of_window_slots,
     release_kv_cache,
-    retraction_backup,
 )
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
@@ -164,6 +165,7 @@ logger = logging.getLogger(__name__)
 
 
 ReturnHiddenStatesMode = Union[bool, Literal["last"]]
+SamplingLogprobsMode = Literal["selected", "support"]
 
 
 def get_return_hidden_states_mode(
@@ -988,6 +990,7 @@ class Req(ReqDllmMixin):
         dllm_config: Optional[DllmConfig] = None,
         token_ids_logprob: List[int] = None,
         return_sampling_mask: bool = False,
+        sampling_logprobs_mode: SamplingLogprobsMode = "selected",
         return_flat_raw_top_logprobs: bool = False,
         stream: bool = False,
         origin_input_ids_unpadded: Optional[array[int]] = None,
@@ -1009,6 +1012,7 @@ class Req(ReqDllmMixin):
         disagg_mode: Optional[DisaggregationMode] = None,
         routed_dp_rank: Optional[int] = None,
         disagg_prefill_dp_rank: Optional[int] = None,
+        kv_hints: Optional[KvHintsEnvelope] = None,
         vocab_size: Optional[int] = None,
         priority: Optional[int] = None,
         metrics_collector: Optional[SchedulerMetricsCollector] = None,
@@ -1224,6 +1228,7 @@ class Req(ReqDllmMixin):
         self.temp_scaled_logprobs = False
         self.top_p_normalized_logprobs = False
         self.return_sampling_mask = return_sampling_mask
+        self.sampling_logprobs_mode = sampling_logprobs_mode
         self.return_flat_raw_top_logprobs = return_flat_raw_top_logprobs
 
         # Logprobs (return values)
@@ -1338,6 +1343,8 @@ class Req(ReqDllmMixin):
 
         self.routed_dp_rank: Optional[int] = routed_dp_rank
         self.disagg_prefill_dp_rank: Optional[int] = disagg_prefill_dp_rank
+        # Orchestrator KV hints, forwarded to the HiCache storage backends.
+        self.kv_hints: Optional[KvHintsEnvelope] = kv_hints
 
         # the start index of the sent kv cache
         # We want to send it chunk by chunk for chunked prefill.
@@ -2232,7 +2239,7 @@ def release_req(
     backup_saved = True
     # The config bag reflects role flips; server_args keeps the launch role.
     if get_disagg().disaggregation_mode == "decode" and offload_kv:
-        backup_saved = retraction_backup(
+        backup_saved = backup_kv_cache(
             req,
             tree_cache,
             req_to_token_pool,
@@ -2438,6 +2445,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # === Config / flags crossing to ForwardBatch (by-value) ===
     forward_mode: ForwardMode = None
     global_forward_mode: Optional[ForwardMode] = None
+
+    # Full-DP metadata from the existing scheduler gather.
+    dp_spec_prefill_coordination_metadata: Optional[tuple] = None
+    dp_spec_prefill_coordination_applied: bool = False
 
     # For DP attention
     is_extend_in_batch: bool = False
@@ -3290,17 +3301,21 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             if self.release_req(idx, len(sorted_indices)):
                 retracted_reqs.append(req)
             else:
-                # The retraction host pool could not hold the backup and the
-                # device KV is already freed, so the request cannot resume.
-                req.to_finish = FINISH_ABORT(
-                    "Retraction host KV pool exhausted. Aborting the request.",
-                    status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
-                )
+                # No backup exists and the device KV is already freed, so the
+                # request cannot resume.
+                if get_disagg().disaggregation_decode_retraction_backup == "none":
+                    message = (
+                        "Retracted under decode memory pressure without a KV "
+                        "backup. Retry later."
+                    )
+                    status_code = HTTPStatus.SERVICE_UNAVAILABLE
+                else:
+                    message = "Retraction host KV pool exhausted. Aborting the request."
+                    status_code = HTTPStatus.INTERNAL_SERVER_ERROR
+                req.to_finish = FINISH_ABORT(message, status_code=status_code)
                 reqs_to_abort.append(req)
                 logger.warning(
-                    "retract_decode: aborted request %s, retraction host pool "
-                    "exhausted",
-                    req.rid,
+                    "retract_decode: aborted request %s: %s", req.rid, message
                 )
 
         if len(sorted_indices) <= 1 and not self.check_decode_mem(
@@ -3784,6 +3799,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             decoding_reqs=self.decoding_reqs,
             spec_algorithm=self.spec_algorithm,
             spec_info=self.spec_info,
+            dp_spec_prefill_coordination_metadata=self.dp_spec_prefill_coordination_metadata,
+            dp_spec_prefill_coordination_applied=self.dp_spec_prefill_coordination_applied,
             global_num_tokens=self.global_num_tokens,
             global_num_tokens_for_logprob=self.global_num_tokens_for_logprob,
             can_run_decode_cuda_graph=self.can_run_decode_cuda_graph,
