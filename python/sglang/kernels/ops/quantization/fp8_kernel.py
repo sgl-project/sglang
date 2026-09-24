@@ -61,6 +61,10 @@ if _is_cuda:
     )
 elif _is_xpu:
     from sgl_kernel import sgl_per_tensor_quant_fp8, sgl_per_token_quant_fp8
+elif _is_cpu:
+    from sglang.kernels.ops.quantization.per_tensor_quant_fp8 import (
+        per_tensor_quant_fp8_native as sgl_per_tensor_quant_fp8,
+    )
 
 if _is_musa:
     from sgl_kernel import sgl_per_token_quant_fp8
@@ -73,30 +77,15 @@ if _is_musa:
     # per_token_group_quant is CUDA-only JIT; MUSA keeps the AOT v2 group-quant op.
     from sglang.kernels.ops.quantization import sgl_per_token_group_quant_8bit
 
-if _is_cpu:
-    from sglang.kernels.ops.quantization.per_tensor_quant_fp8 import (
-        per_tensor_quant_fp8_native as sgl_per_tensor_quant_fp8,
-    )
-
-if _is_hip:
-    _has_vllm = False
-    if _use_aiter:
-        try:
-            from aiter import (  # v0.1.3
-                dynamic_per_tensor_quant,
-                dynamic_per_token_scaled_quant,
-                static_per_tensor_quant,
-            )
-        except ImportError:
-            raise ImportError("aiter is required when SGLANG_USE_AITER is set to True")
-    else:
-        try:
-            import vllm._C  # noqa: F401
-
-            _has_vllm = True
-        except ImportError:
-            # Fallback: vllm not available, will use native PyTorch implementation
-            _has_vllm = False
+if _is_hip and _use_aiter:
+    try:
+        from aiter import (  # v0.1.3
+            dynamic_per_tensor_quant,
+            dynamic_per_token_scaled_quant,
+            static_per_tensor_quant,
+        )
+    except ImportError:
+        raise ImportError("aiter is required when SGLANG_USE_AITER is set to True")
 
 if _is_musa:
 
@@ -2019,7 +2008,7 @@ Raises:
 if _is_hip:
 
     def _native_dynamic_per_token_quant_fp8(output, input, scale):
-        """Native PyTorch fallback for dynamic per-token FP8 quantization when vLLM is unavailable."""
+        """Native PyTorch fallback for dynamic per-token FP8 quantization when AITER is disabled."""
         M, N = input.shape
         eps = 1e-12
         # Compute per-token scale
@@ -2032,7 +2021,7 @@ if _is_hip:
         output.copy_(output_data)
 
     def _native_dynamic_per_tensor_quant_fp8(output, input, scale):
-        """Native PyTorch fallback for dynamic per-tensor FP8 quantization when vLLM is unavailable."""
+        """Native PyTorch fallback for dynamic per-tensor FP8 quantization when AITER is disabled."""
         eps = 1e-12
         absmax = input.abs().max()
         absmax = torch.clamp(absmax, min=eps)
@@ -2044,7 +2033,7 @@ if _is_hip:
         output.copy_(output_data)
 
     def _native_static_quant_fp8(output, input, scale):
-        """Native PyTorch fallback for static FP8 quantization when vLLM is unavailable."""
+        """Native PyTorch fallback for static FP8 quantization when AITER is disabled."""
         # Use tensor directly instead of .item() to avoid CPU-GPU sync
         output_data = torch.clamp(input / scale, fp8_min, fp8_max).to(fp8_dtype)
         output.copy_(output_data)
@@ -2069,24 +2058,13 @@ if _is_hip:
                 )
                 if _use_aiter:
                     dynamic_per_token_scaled_quant(output, input, scale)
-                elif _has_vllm:
-                    torch.ops._C.dynamic_per_token_scaled_fp8_quant(
-                        output, input.contiguous(), scale, None
-                    )
                 else:
                     _native_dynamic_per_token_quant_fp8(output, input, scale)
             else:
-                # Only vLLM needs `scale` pre-zeroed: segmented_max_reduction
-                # accumulates into it with atomicMax. AITER zeroes it itself
-                # and the native path overwrites it.
+                scale = torch.empty(1, device=input.device, dtype=torch.float32)
                 if _use_aiter:
-                    scale = torch.empty(1, device=input.device, dtype=torch.float32)
                     dynamic_per_tensor_quant(output, input, scale)
-                elif _has_vllm:
-                    scale = torch.zeros(1, device=input.device, dtype=torch.float32)
-                    torch.ops._C.dynamic_scaled_fp8_quant(output, input, scale)
                 else:
-                    scale = torch.empty(1, device=input.device, dtype=torch.float32)
                     _native_dynamic_per_tensor_quant_fp8(output, input, scale)
         else:
             # Static scaling
@@ -2095,8 +2073,6 @@ if _is_hip:
             )
             if _use_aiter:
                 static_per_tensor_quant(output, input, scale)
-            elif _has_vllm:
-                torch.ops._C.static_scaled_fp8_quant(output, input, scale)
             else:
                 _native_static_quant_fp8(output, input, scale)
 

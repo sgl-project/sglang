@@ -67,6 +67,7 @@ from sglang.srt.arg_groups.serving_hook import (
     handle_load_balance_method,
     handle_missing_default_values,
     handle_multimodal_feature_transport,
+    handle_other_validations,
     handle_ssl_validation,
     handle_tokenizer_batching,
     ssl_verify_of,
@@ -120,6 +121,25 @@ _mock_device.start()
 
 
 class TestPrepareServerArgs(CustomTestCase):
+    def test_optimistic_prefill_allows_l2_write_through_only(self):
+        for policy, expected in (
+            ("write_back", 2),
+            ("write_through", 2),
+            ("write_through_selective", 0),
+        ):
+            with self.subTest(policy=policy):
+                args = ServerArgs(
+                    model_path="dummy",
+                    disaggregation_mode="prefill",
+                    optimistic_prefill_attempts=2,
+                    enable_hierarchical_cache=True,
+                    hicache_write_policy=policy,
+                )
+                handle_other_validations(args)
+                self.assertEqual(
+                    resolution_result(args, "optimistic_prefill_attempts"), expected
+                )
+
     def test_radix_eviction_policy_explicitness_is_preserved(self):
         omitted = prepare_server_args(["--model-path", "dummy"])
         separated = prepare_server_args(
@@ -2040,7 +2060,7 @@ class TestHiCacheArgs(unittest.TestCase):
                 },
                 3,
             ),
-            ({"hicache_write_policy": "write_through"}, 0),
+            ({"hicache_write_policy": "write_through"}, 3),
             (
                 {
                     "hicache_storage_backend": "file",
