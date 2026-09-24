@@ -543,3 +543,57 @@ def test_dit_cached_streams_match_full_forward():
     assert torch.equal(cached["video"], full["x_video"])
     assert torch.equal(cached["act"], full["x_act"])
     assert full["x_act_cond"].shape == (1, 1, 3)
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability() < (8, 9),
+    reason="needs FP8 scaled_mm",
+)
+def test_fp8r_checkpoint_loads_fused_rowwise_linears():
+    """Native FP8r payloads (E4M3 + per-row scales) must fuse and dequantize consistently."""
+    from sglang.multimodal_gen.runtime.models.dits.flux3 import (
+        Flux3Fp8RowwiseLinear,
+        Flux3Transformer,
+        load_fp8r_checkpoint,
+        quantize_fp8_rowwise,
+    )
+
+    _init_single_process_parallel()
+    with torch.device("meta"):
+        model = Flux3Transformer(Flux3DiTConfig(arch_config=_tiny_arch()))
+    reference = {}
+    state = {}
+    generator = torch.Generator().manual_seed(0)
+    for name, tensor in model.state_dict().items():
+        for part in (
+            ("q_proj", "k_proj", "v_proj", "mlp_in") if ".qkv_mlp." in name else (None,)
+        ):
+            source = name if part is None else name.replace("qkv_mlp", part)
+            rows = tensor.shape[0] if part is None else {"mlp_in": 384}.get(part, 64)
+            value = torch.randn(rows, *tensor.shape[1:], generator=generator) * 0.05
+            key = f"dit.{source}"
+            # the action boundary layers stay BF16, as in the released packages
+            if value.ndim == 2 and ".act" not in source:
+                q, scale = quantize_fp8_rowwise(value)
+                state[key], state[f"{key}_scale"] = q.cuda(), scale.cuda()
+                reference[source] = q.float() * scale[:, None]
+            else:
+                state[key] = value.to(torch.bfloat16).cuda()
+    load_fp8r_checkpoint(model, state)
+
+    block = model.single_blocks[0]
+    assert isinstance(block.qkv_mlp, Flux3Fp8RowwiseLinear)
+    assert isinstance(model.early_stream_modulations["txt"].lin, Flux3Fp8RowwiseLinear)
+    assert isinstance(model.emb_in["act"], torch.nn.Linear)
+    assert model.dtype == torch.bfloat16
+    x = torch.randn(5, 64, generator=generator).cuda().to(torch.bfloat16)
+    expected = torch.cat(
+        [
+            reference[f"single_blocks.0.{p}.weight"]
+            for p in ("q_proj", "k_proj", "v_proj", "mlp_in")
+        ]
+    ).cuda()
+    out, _ = block.qkv_mlp(x)
+    torch.testing.assert_close(
+        out.float(), x.float() @ expected.T, atol=5e-2, rtol=5e-2
+    )

@@ -19,8 +19,12 @@ from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.loader.fsdp_load import maybe_load_fsdp_model
 from sglang.multimodal_gen.runtime.loader.utils import (
     get_memory_usage_of_component,
+    set_default_torch_dtype,
 )
-from sglang.multimodal_gen.runtime.models.dits.flux3 import Flux3Transformer
+from sglang.multimodal_gen.runtime.models.dits.flux3 import (
+    Flux3Transformer,
+    load_fp8r_checkpoint,
+)
 from sglang.multimodal_gen.runtime.models.encoders.flux3_text_encoder import (
     Flux3TextEncoder,
     parse_weight_spec,
@@ -73,7 +77,7 @@ class Flux3ActionPipeline(ComposedPipelineBase):
         if loaded_modules is not None:
             return loaded_modules
         config: Flux3ActionPipelineConfig = server_args.pipeline_config
-        if config.quantization is not None:
+        if config.quantization not in (None, "fp8r"):
             raise NotImplementedError(
                 f"FLUX 3 Action {config.quantization} packages are not supported"
             )
@@ -98,6 +102,12 @@ class Flux3ActionPipeline(ComposedPipelineBase):
         logger.info("Loading FLUX 3 Action DiT from %s", package)
         weights = str(package / "model.safetensors")
         device = get_local_torch_device()
+        if config.quantization == "fp8r":
+            # Native FP8r payloads load as they are (no requantization).
+            with torch.device("meta"), set_default_torch_dtype(torch.bfloat16):
+                transformer = Flux3Transformer(config=config.dit_config, hf_config={})
+            load_fp8r_checkpoint(transformer, load_file(weights, device=str(device)))
+            return transformer
         return maybe_load_fsdp_model(
             model_cls=Flux3Transformer,
             init_params={"config": config.dit_config, "hf_config": {}},

@@ -154,6 +154,65 @@ class Flux3Modulation(nn.Module):
         return shift, scale, gate
 
 
+FP8_E4M3_MAX = 448.0
+
+
+def quantize_fp8_rowwise(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """``(M, K)`` -> E4M3 values and one fp32 scale per row (amax / 448)."""
+    rows = x.float()
+    scale = (rows.abs().amax(dim=1) / FP8_E4M3_MAX).clamp(min=1e-12)
+    quantized = (rows / scale[:, None]).clamp(-FP8_E4M3_MAX, FP8_E4M3_MAX)
+    return quantized.to(torch.float8_e4m3fn), scale
+
+
+class Flux3Fp8RowwiseLinear(nn.Module):
+    """FP8 "rowwise" linear of the FLUX 3 FP8r checkpoints.
+
+    E4M3 weights with one fp32 scale per output row; activations are quantized
+    per token on the fly and multiplied with ``torch._scaled_mm`` (fp32 fast
+    accumulation, bf16 output), as in the reference FP8r inference path.
+    ``tuple_output`` mirrors the ``(output, bias)`` convention of SGLang's
+    parallel linears so the module can replace either kind.
+    """
+
+    # _scaled_mm needs M padded to a multiple of 16.
+    ROW_ALIGNMENT = 16
+
+    def __init__(
+        self, weight: torch.Tensor, weight_scale: torch.Tensor, tuple_output: bool
+    ):
+        super().__init__()
+        if weight.dtype != torch.float8_e4m3fn or weight_scale.shape != (
+            weight.shape[0],
+        ):
+            raise ValueError(
+                "expected an E4M3 weight with one fp32 scale per output row"
+            )
+        self.out_features, self.in_features = weight.shape
+        self.tuple_output = tuple_output
+        self.register_buffer("weight", weight.contiguous())
+        self.register_buffer("weight_scale", weight_scale.float().contiguous())
+
+    def forward(self, x: torch.Tensor):
+        leading = x.shape[:-1]
+        flat = x.reshape(-1, self.in_features).contiguous()
+        rows = flat.shape[0]
+        pad = -rows % self.ROW_ALIGNMENT
+        if pad:
+            flat = F.pad(flat, (0, 0, 0, pad))
+        activation, activation_scale = quantize_fp8_rowwise(flat)
+        out = torch._scaled_mm(
+            activation,
+            self.weight.T,
+            activation_scale[:, None],
+            self.weight_scale[None, :],
+            out_dtype=torch.bfloat16,
+            use_fast_accum=True,
+        )[:rows]
+        out = out.reshape(*leading, self.out_features)
+        return (out, None) if self.tuple_output else out
+
+
 class Flux3LastLayer(nn.Module):
     def __init__(self, hidden_size: int, out_channels: int):
         super().__init__()
@@ -167,9 +226,13 @@ class Flux3LastLayer(nn.Module):
         if vec.ndim == 2:
             vec = vec[:, None, :]
         x = self.norm_final(x)
-        # Two half projections avoid materializing the (L, 2 * hidden) product.
+        projection = self.adaLN_modulation[1]
+        if isinstance(projection, Flux3Fp8RowwiseLinear):
+            shift, scale = self.adaLN_modulation(vec).chunk(2, dim=-1)
+            return self.linear(x * (scale + 1) + shift)
+        # BF16: two half projections avoid materializing the (L, 2 * hidden) product.
         activated = self.adaLN_modulation[0](vec)
-        shift_w, scale_w = self.adaLN_modulation[1].weight.chunk(2)
+        shift_w, scale_w = projection.weight.chunk(2)
         x.mul_(F.linear(activated, scale_w).add_(1))
         x.add_(F.linear(activated, shift_w))
         return self.linear(x)
@@ -367,7 +430,7 @@ class Flux3Transformer(BaseDiT):
     # ------------------------------------------------------------------ pieces
     @property
     def dtype(self) -> torch.dtype:
-        return self.txt_in.weight.dtype
+        return _compute_dtype(self.txt_in)
 
     def rope(self, ids: torch.Tensor) -> torch.Tensor:
         return rope_matrices(ids, self.axes_dim, self.theta)
@@ -378,7 +441,7 @@ class Flux3Transformer(BaseDiT):
         """``timesteps`` ``(B,)`` or ``(B, L)`` in ``[0, 1]`` -> ``(B, 1 | L, hidden)``."""
         if timesteps.ndim == 1:
             timesteps = timesteps[:, None]
-        weight_dtype = self.time_in.in_layer.weight.dtype
+        weight_dtype = _compute_dtype(self.time_in.in_layer)
         with torch.autocast(device_type=timesteps.device.type, enabled=False):
             vec = self.time_in(timestep_embedding(timesteps).to(weight_dtype))
         vec = vec.to(self.dtype)
@@ -504,6 +567,82 @@ class Flux3Transformer(BaseDiT):
             context=context, streams=streams, targets=[s.name for s in streams]
         )
         return {key: outputs[s.name] for key, s in zip(names, streams)}
+
+
+def _compute_dtype(linear: nn.Module) -> torch.dtype:
+    """Activation dtype of a linear: its weight dtype, bf16 for FP8 weights."""
+    if isinstance(linear, Flux3Fp8RowwiseLinear):
+        return torch.bfloat16
+    return linear.weight.dtype
+
+
+def load_fp8r_checkpoint(
+    model: Flux3Transformer, state_dict: dict[str, torch.Tensor]
+) -> None:
+    """Load a native FP8r checkpoint into ``model`` (built on the meta device).
+
+    Every linear whose checkpoint weight is E4M3 (with ``.weight_scale``)
+    becomes a :class:`Flux3Fp8RowwiseLinear`; BF16 tensors (the embodiment's
+    action boundary layers and all norms) load as they are.
+    """
+    from sglang.multimodal_gen.runtime.loader.utils import get_param_names_mapping
+
+    mapping = get_param_names_mapping(model.param_names_mapping)
+    weights: dict[str, torch.Tensor] = {}
+    scales: dict[str, torch.Tensor] = {}
+    fused: dict[str, dict[int, tuple[torch.Tensor, torch.Tensor | None]]] = {}
+    fused_counts: dict[str, int] = {}
+    for name, tensor in state_dict.items():
+        is_scale = name.endswith(".weight_scale")
+        weight_name = name.removesuffix("_scale") if is_scale else name
+        target, index, count = mapping(weight_name)
+        if index is None:
+            (scales if is_scale else weights)[target] = tensor
+            continue
+        weight, scale = fused.setdefault(target, {}).get(index, (None, None))
+        fused[target][index] = (weight, tensor) if is_scale else (tensor, scale)
+        fused_counts[target] = count
+    for target, parts in fused.items():
+        if sorted(parts) != list(range(fused_counts[target])) or any(
+            w is None for w, _ in parts.values()
+        ):
+            raise ValueError(f"{target}: checkpoint lacks fused parts {sorted(parts)}")
+        ordered = [parts[i] for i in sorted(parts)]
+        weights[target] = torch.cat([w for w, _ in ordered])
+        part_scales = [sc for _, sc in ordered if sc is not None]
+        if part_scales:
+            if len(part_scales) != len(ordered):
+                raise ValueError(f"{target}: mixed FP8 and BF16 parts cannot be fused")
+            scales[target] = torch.cat(part_scales)
+    for name, scale in scales.items():
+        module_path = name.removesuffix(".weight")
+        parent_path, _, child = module_path.rpartition(".")
+        parent = model.get_submodule(parent_path)
+        original = getattr(parent, child)
+        weight = weights[name]
+        if weight.shape != original.weight.shape:
+            raise ValueError(
+                f"{name}: checkpoint shape {tuple(weight.shape)} does not match "
+                f"{tuple(original.weight.shape)}"
+            )
+        setattr(
+            parent,
+            child,
+            Flux3Fp8RowwiseLinear(
+                weights.pop(name),
+                scale,
+                tuple_output=isinstance(original, ReplicatedLinear),
+            ),
+        )
+    missing, unexpected = model.load_state_dict(weights, strict=False, assign=True)
+    fp8_buffers = {
+        n for n, _ in model.named_buffers() if n.removesuffix("_scale") in scales
+    }
+    missing = [n for n in missing if n not in fp8_buffers]
+    if missing or unexpected:
+        raise ValueError(
+            f"FP8r checkpoint mismatch: missing {missing}, unexpected {unexpected}"
+        )
 
 
 def _uniform(timesteps: torch.Tensor | None) -> torch.Tensor | None:
