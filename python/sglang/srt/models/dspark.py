@@ -370,14 +370,17 @@ class RNNHead(VanillaMarkov):
         return None
 
 
-def build_markov_head(config) -> Optional[nn.Module]:
-    markov_rank = int(getattr(config, "markov_rank", 0))
+def build_markov_head(config, dspark_config=None) -> Optional[nn.Module]:
+    dspark_config = dspark_config or config
+    markov_rank = int(getattr(dspark_config, "markov_rank", 0))
     if markov_rank <= 0:
         raise ValueError(
             "DSpark requires markov_rank > 0 (the Markov head is the core of the "
             f"semi-AR draft); got markov_rank={markov_rank}."
         )
-    markov_head_type = str(getattr(config, "markov_head_type", "vanilla")).lower()
+    markov_head_type = str(
+        getattr(dspark_config, "markov_head_type", None) or "vanilla"
+    ).lower()
     vocab_size = int(config.vocab_size)
     hidden_size = int(config.hidden_size)
     if markov_head_type == "vanilla":
@@ -393,8 +396,13 @@ def build_markov_head(config) -> Optional[nn.Module]:
     raise ValueError(f"Unsupported DSpark markov_head_type={markov_head_type!r}.")
 
 
-def build_nemotron_35_markov_head(config, quant_config, prefix: str) -> nn.Module:
-    markov_head_type = str(getattr(config, "markov_head_type", "vanilla")).lower()
+def build_nemotron_35_markov_head(
+    config, quant_config, prefix: str, dspark_config=None
+) -> nn.Module:
+    dspark_config = dspark_config or config
+    markov_head_type = str(
+        getattr(dspark_config, "markov_head_type", None) or "vanilla"
+    ).lower()
     if markov_head_type != "vanilla":
         raise ValueError(
             "Nemotron 3.5 DSpark requires markov_head_type='vanilla', "
@@ -403,7 +411,7 @@ def build_nemotron_35_markov_head(config, quant_config, prefix: str) -> nn.Modul
     markov_prefix = f"{prefix}.markov_head" if prefix else "markov_head"
     return Nemotron35VanillaMarkov(
         vocab_size=int(config.vocab_size),
-        markov_rank=int(config.markov_rank),
+        markov_rank=int(dspark_config.markov_rank),
         quant_config=quant_config,
         prefix=markov_prefix,
     )
@@ -452,17 +460,22 @@ class DSparkConfidenceHead(nn.Module):
         return torch.sigmoid(confidence_raw.float() / self.sts_temperatures)
 
 
-def build_confidence_head(config) -> Optional[nn.Module]:
+def build_confidence_head(config, dspark_config=None) -> Optional[nn.Module]:
+    dspark_config = dspark_config or config
     if read_ragged_verify_mode() is RaggedVerifyMode.STATIC:
         return None
-    if not hasattr(config, "enable_confidence_head"):
+    if not hasattr(dspark_config, "enable_confidence_head"):
         logger.warning(
             "DSpark draft config has no enable_confidence_head field; treating the "
             "confidence head as enabled."
         )
+    if not getattr(dspark_config, "enable_confidence_head", True):
+        return None
     hidden_size = int(config.hidden_size)
-    markov_rank = int(getattr(config, "markov_rank", 0))
-    with_markov = bool(getattr(config, "confidence_head_with_markov", markov_rank > 0))
+    markov_rank = int(getattr(dspark_config, "markov_rank", 0))
+    with_markov = bool(
+        getattr(dspark_config, "confidence_head_with_markov", markov_rank > 0)
+    )
     if with_markov and markov_rank <= 0:
         raise ValueError(
             "DSpark confidence_head_with_markov requires markov_rank > 0, "
@@ -495,11 +508,11 @@ class DSparkDraftMixin:
         self.sample_from_anchor = get_dspark_sample_from_anchor(config)
         if self.is_nemotron_35_draft:
             self.markov_head = build_nemotron_35_markov_head(
-                config, quant_config, prefix
+                config, quant_config, prefix, dspark_config
             )
         else:
-            self.markov_head = build_markov_head(config)
-        self.confidence_head = build_confidence_head(config)
+            self.markov_head = build_markov_head(config, dspark_config)
+        self.confidence_head = build_confidence_head(config, dspark_config)
         self.lm_head: Optional[nn.Module] = None
         # Expose the draft's own layer count so the draft ModelRunner sizes the
         # draft KV pool correctly. Some DSpark draft checkpoints inherit the
