@@ -17,6 +17,7 @@ from sglang.srt.layers.logits_processor import (
     SamplingMaskStatus,
 )
 from sglang.srt.layers.logprob_processor import (
+    LogprobResult,
     OutputLogprobProcessor,
 )
 from sglang.srt.runtime_context import get_exec, get_parallel, get_server_args
@@ -177,6 +178,8 @@ class Sampler(nn.Module):
         sampling_mask_batch_indices = sampling_info.sampling_mask_batch_indices
         return_sampling_mask = sampling_mask_batch_indices is not None
         sampling_mask_capture = None
+        # Probs kept for a gather-first token logprob when nothing else is requested.
+        token_logprob_probs = None
 
         if sampling_info.is_all_greedy:
             _trace_e2e_sampler("greedy_enter")
@@ -269,22 +272,35 @@ class Sampler(nn.Module):
                     simple_sampling_case,
                 )
                 if return_logprob and not SGLANG_RETURN_ORIGINAL_LOGPROB:
-                    logprobs = (
-                        logprobs_via_logsoftmax_kernel
-                        if logprobs_via_logsoftmax_kernel is not None
-                        else torch.log(probs)
-                    )
+                    if logprobs_via_logsoftmax_kernel is not None:
+                        logprobs = logprobs_via_logsoftmax_kernel
+                    elif not any(top_logprobs_nums) and not any(
+                        x is not None for x in token_ids_logprobs
+                    ):
+                        token_logprob_probs = probs
+                    else:
+                        logprobs = torch.log(probs)
                 del probs
 
         if return_logprob:
             if SGLANG_RETURN_ORIGINAL_LOGPROB:
                 logprobs = original_logprobs
-            logprob_result = self.output_logprob_processor.compute_logprobs(
-                logprobs,
-                top_logprobs_nums,
-                token_ids_logprobs,
-                batch_next_token_ids,
-            )
+            if token_logprob_probs is not None:
+                # Same log + clamp as compute_logprobs, on the sampled entries only.
+                token_logprobs = torch.log(
+                    token_logprob_probs.gather(
+                        1, batch_next_token_ids.long().view(-1, 1)
+                    ).view(-1)
+                ).clamp_(min=torch.finfo(token_logprob_probs.dtype).min)
+                del token_logprob_probs
+                logprob_result = LogprobResult(token_logprobs=token_logprobs)
+            else:
+                logprob_result = self.output_logprob_processor.compute_logprobs(
+                    logprobs,
+                    top_logprobs_nums,
+                    token_ids_logprobs,
+                    batch_next_token_ids,
+                )
             logprob_result.write_output_to(logits_output)
 
         _trace_e2e_sampler("token_sync_enter")
