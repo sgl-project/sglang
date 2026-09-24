@@ -171,7 +171,7 @@ Work on one phase at a time: implement and verify it, stop for human review, the
 5. enable supported configuration + fresh-engine proof
 ```
 
-Phase 1 is committed as `1cdb6b1`. Phase 2 is implemented, verified, and approved for commit. Phases 3-5 have not started. The feature remains proposed until the full release gate passes. See the evidence log for phase-local results and reproduction commands.
+Phase 1 is committed as `1cdb6b1` and phase 2 as `5ba812b`. Phase 3 is implemented and verified, with its changes uncommitted for review. Phases 4-5 have not started. The feature remains proposed until the full release gate passes. See the evidence log for phase-local results and reproduction commands.
 
 Startup rejection stays in place through phase 4. Component tests call the relevant storage/pool/controller APIs directly; do not add a production flag to bypass the guard. Runtime attachment must not expose the unfinished path. Phase 5 changes the support checks only when the integrated tests pass.
 
@@ -236,7 +236,8 @@ writer?       yes     yes     no      no
 
 Keep phase-local test changes beside the code they verify. Unit and distributed test files introduced by a phase must have an exact runnable command in the evidence log. Keep raw logs and measurements in evidence, not in the feature contract. No passing results should be claimed for phases not run.
 
-- [ ] Complete phases 3-4 separately, stopping for review and approval before each commit.
+- [ ] Review phase 3 and commit only after approval.
+- [ ] Complete phase 4, stopping for review and approval before committing.
 - [ ] Complete phase 5 with H200 cross-engine evidence and mark the spec implemented.
 
 ## Boundaries

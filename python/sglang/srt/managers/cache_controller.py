@@ -531,6 +531,10 @@ class HiCacheController:
         """
         if self.enable_storage:
             raise RuntimeError("Storage backend already attached.")
+        if get_parallel().attn_dcp_size > 1:
+            raise NotImplementedError(
+                "HiCache L3 with DCP is not supported yet, including runtime attachment."
+            )
 
         # Defensive: a previous partial detach may have flipped `enable_storage` but
         # left background threads alive. Attaching on top of them is unsafe.
@@ -549,12 +553,6 @@ class HiCacheController:
         self.get_hash_str = get_hash_str
         self.storage_config = self._generate_storage_config(
             model_name, storage_backend_extra_config
-        )
-        # for MLA models, only one rank needs to backup the KV cache
-        self.backup_skip = (
-            self.storage_config.is_mla_model
-            # todo: load balancing
-            and self.storage_config.tp_rank != 0
         )
 
         # Use storage backend factory for dynamic backend creation
@@ -685,6 +683,10 @@ class HiCacheController:
         # Now it's safe to clear the stop event for future re-attach.
         self.storage_stop_event.clear()
 
+    @property
+    def backup_skip(self) -> bool:
+        return not self.storage_config.is_storage_writer
+
     def _generate_storage_config(
         self,
         model_name: Optional[str] = None,
@@ -730,6 +732,7 @@ class HiCacheController:
             )
 
         attn_cp_rank, attn_cp_size = self.get_attn_cp_rank_and_size()
+        dcp_size = get_parallel().attn_dcp_size
 
         return HiCacheStorageConfig(
             tp_rank=self.tp_rank,
@@ -747,6 +750,11 @@ class HiCacheController:
             should_split_heads=should_split_heads,
             dp_rank=self.dp_rank,
             extra_config=storage_backend_extra_config,
+            dcp_size=dcp_size,
+            dcp_rank=get_parallel().attn_dcp_rank,
+            logical_page_size=self.page_size if dcp_size > 1 else None,
+            kv_cache_dtype=self.storage_host_pool.dtype if dcp_size > 1 else None,
+            host_layout=self.storage_host_pool.layout if dcp_size > 1 else None,
         )
 
     def reset(self):

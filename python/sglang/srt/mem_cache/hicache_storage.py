@@ -489,7 +489,7 @@ class HiCacheFile(HiCacheStorage):
             self.file_path,
             self.config_suffix,
             tp_rank=tp_rank,
-            is_mla_model=is_mla_model,
+            is_storage_owner=storage_config.is_storage_writer,
             extra_config=storage_config.extra_config,
             on_evict=(
                 self.metadata_cache.remove if self.metadata_cache is not None else None
