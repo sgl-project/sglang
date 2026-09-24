@@ -42,6 +42,10 @@ MAX_NEW_TOKENS = 128
 # AR decode and UNO verification use different kernel shapes, so compare a
 # bounded greedy prefix instead of requiring full-sequence bitwise identity.
 PARITY_TOKENS = 32
+# A divergence passes only if UNO's token is within this many nats of AR's argmax;
+# measured on H200, kernel-shape drift flips a 0.5 gap on the first prompt.
+PARITY_TIE_LOGPROB_MARGIN = 1.0
+PARITY_TOP_LOGPROBS_NUM = 5
 # One LoRA draft forward plus one clean verification forward.
 FORWARDS_PER_UNO_CYCLE = 2
 PROMPTS = (
@@ -94,6 +98,12 @@ def _resolve_uno_lora_path() -> str:
         allow_patterns=list(UNO_ADAPTER_FILES),
     )
     return os.path.join(snapshot_path, "adapter")
+
+
+class _GreedyOutputs(NamedTuple):
+    output_ids: list[list[int]]
+    # Per prompt, per output position: {token_id: logprob} for AR's top tokens.
+    top_logprobs: list[list[dict[int, float]]]
 
 
 class TestUnoLoraPathResolution(unittest.TestCase):
@@ -160,7 +170,7 @@ class TestUnoCudaGraph(CustomTestCase):
             )
         return args
 
-    def _run_ar_reference(self) -> list[list[int]]:
+    def _run_ar_reference(self) -> _GreedyOutputs:
         process = None
         try:
             process = popen_launch_server(
@@ -169,7 +179,8 @@ class TestUnoCudaGraph(CustomTestCase):
                 timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
                 other_args=self._server_args(None),
             )
-            return self._run_greedy_output_ids()
+            # UNO rejects returned logprobs, so only the AR reference has them.
+            return self._run_greedy_output_ids(return_top_logprobs=True)
         finally:
             if process is not None:
                 kill_process_tree(process.pid)
@@ -183,29 +194,36 @@ class TestUnoCudaGraph(CustomTestCase):
                 timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
                 other_args=self._server_args(config),
             )
-            greedy_output_ids = self._run_greedy_output_ids()
+            greedy_output_ids = self._run_greedy_output_ids().output_ids
             tpf = self._run_generation_contract(config)
             return tpf, greedy_output_ids
         finally:
             if process is not None:
                 kill_process_tree(process.pid)
 
-    def _run_greedy_output_ids(self) -> list[list[int]]:
+    def _run_greedy_output_ids(
+        self, return_top_logprobs: bool = False
+    ) -> _GreedyOutputs:
         # A list-valued request can be admitted with different prefill batch
         # shapes across server launches. Run each parity prompt at BS1 so the
         # AR and UNO comparisons use the same execution shape.
         output_ids = []
+        top_logprobs = []
         for prompt in PROMPTS:
+            payload = {
+                "text": prompt,
+                "sampling_params": {
+                    "temperature": 0,
+                    "max_new_tokens": PARITY_TOKENS,
+                    "ignore_eos": True,
+                },
+            }
+            if return_top_logprobs:
+                payload["return_logprob"] = True
+                payload["top_logprobs_num"] = PARITY_TOP_LOGPROBS_NUM
             response = requests.post(
                 self.base_url + "/generate",
-                json={
-                    "text": prompt,
-                    "sampling_params": {
-                        "temperature": 0,
-                        "max_new_tokens": PARITY_TOKENS,
-                        "ignore_eos": True,
-                    },
-                },
+                json=payload,
                 timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             )
             self.assertEqual(response.status_code, 200, response.text)
@@ -218,20 +236,48 @@ class TestUnoCudaGraph(CustomTestCase):
                 f"Wrong greedy output length for prompt {prompt!r}",
             )
             output_ids.append(result["output_ids"])
-        return output_ids
+            if return_top_logprobs:
+                top_logprobs.append(
+                    [
+                        {token_id: logprob for logprob, token_id, *_ in position}
+                        for position in result["meta_info"]["output_top_logprobs"]
+                    ]
+                )
+        return _GreedyOutputs(output_ids, top_logprobs)
 
     def _assert_ar_parity(
         self,
         mode: str,
         actual: list[list[int]],
-        expected: list[list[int]],
+        expected: _GreedyOutputs,
     ) -> None:
-        for prompt, actual_ids, expected_ids in zip(PROMPTS, actual, expected):
-            self.assertEqual(
-                actual_ids,
-                expected_ids,
-                f"{mode} UNO diverged from AR within the first "
-                f"{PARITY_TOKENS} tokens for prompt {prompt!r}",
+        for prompt, actual_ids, expected_ids, expected_top in zip(
+            PROMPTS, actual, expected.output_ids, expected.top_logprobs
+        ):
+            diverged_at = next(
+                (i for i, (a, e) in enumerate(zip(actual_ids, expected_ids)) if a != e),
+                None,
+            )
+            if diverged_at is None:
+                continue
+            candidates = expected_top[diverged_at]
+            gap = candidates[expected_ids[diverged_at]] - candidates.get(
+                actual_ids[diverged_at], float("-inf")
+            )
+            # Past the first divergence the two continuations condition on
+            # different prefixes, so nothing later is comparable.
+            self.assertLessEqual(
+                gap,
+                PARITY_TIE_LOGPROB_MARGIN,
+                f"{mode} UNO diverged from AR at token {diverged_at} of "
+                f"{PARITY_TOKENS} for prompt {prompt!r}, and not at a near-tie "
+                f"(AR top-{PARITY_TOP_LOGPROBS_NUM} logprob gap {gap:.4f} > "
+                f"{PARITY_TIE_LOGPROB_MARGIN}): "
+                f"got {actual_ids}, expected {expected_ids}",
+            )
+            print(
+                f"{mode} UNO diverged from AR at near-tie token {diverged_at} "
+                f"(logprob gap {gap:.4f}) for prompt {prompt!r}"
             )
 
     def _run_generation_contract(self, config: _UnoConfig) -> float:
