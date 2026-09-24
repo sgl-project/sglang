@@ -20,6 +20,12 @@ For the design details, please refer to [link](https://docs.google.com/document/
 
 Currently, we support Mooncake and NIXL as the transfer engine.
 
+### Decode host receive with a custom transfer backend
+
+`--disaggregation-decode-host-receive-threshold` can direct incoming KV to the decode host pool when device memory usage crosses the configured fraction. No built-in transfer backend currently supports host destinations; this option requires a custom backend that explicitly supports them.
+
+For a backend based on `CommonKVManager` and `CommonKVReceiver`, set `SGLANG_DISAGGREGATION_DEFERRED_DECODE_KV_RELEASE=1` on **both prefill and decode servers** before enabling host receive. Decode startup checks its local setting, but cannot verify the prefill server's setting. Without drain acknowledgments from prefill, an aborted transfer's host pages remain reserved to avoid freeing memory while a remote write may still be in progress.
+
 ## Profiling in PD Disaggregation Mode
 
 When you need to profile prefill or decode workers in PD disaggregation mode, please refer to the [Profile In PD Disaggregation Mode](../developer_guide/benchmark_and_profiling#profile-in-pd-disaggregation-mode) section in the Benchmark and Profiling guide. Due to torch profiler limitations, prefill and decode workers must be profiled separately using dedicated command-line options.

@@ -689,6 +689,16 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             raise ValueError(
                 "Transfer backend does not support decode host KV destinations"
             )
+        if (
+            get_disagg().disaggregation_decode_host_receive_threshold > 0
+            and isinstance(kv_manager, CommonKVManager)
+            and not kv_manager.enable_deferred_decode_kv_release
+        ):
+            raise ValueError(
+                "Decode host KV destinations require "
+                "SGLANG_DISAGGREGATION_DEFERRED_DECODE_KV_RELEASE=1 "
+                "on both prefill and decode servers"
+            )
         # Staging buffer setup (only when heterogeneous TP staging is enabled)
         if self.enable_staging and not self.is_mla_backend:
             kv_pool_for_heads = self.token_to_kv_pool
@@ -1710,6 +1720,10 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
     def _send_kv_metadata(
         self, decode_req, kv_indices, page_size, state_indices=None, **metadata_kwargs
     ) -> None:
+        if isinstance(decode_req.kv_receiver, CommonKVReceiver):
+            decode_req.kv_receiver.requires_host_drain_ack = (
+                metadata_kwargs.get("destination") == KVTransferDestination.HOST
+            )
         decode_req.metadata_buffer_index = (
             self.req_to_metadata_buffer_idx_allocator.alloc()
         )
