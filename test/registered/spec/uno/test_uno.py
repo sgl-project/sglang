@@ -3,13 +3,15 @@
 The test runs both modes on the same prompts. Linear UNO alternates
 LoRA-draft and clean-target variants in one graph runner. Tree UNO uses a
 private LoRA-draft runner before native EAGLE tree verification. Besides the
-generation contract, short greedy comparisons guard lossless output parity
-with autoregressive decoding, and stochastic requests guard nontrivial TPF for
-both linear and tree sampling on a small, fixed GSM8K sample.
+generation contract, an AR server scores each mode's short greedy output
+teacher-forced, requiring every token to be AR's argmax on UNO's own prefix
+up to a small budget of bf16 near-ties, and stochastic requests guard
+nontrivial TPF for both linear and tree sampling on a small, fixed GSM8K sample.
 """
 
 import os
 import unittest
+from collections import Counter
 from typing import NamedTuple
 from unittest.mock import patch
 
@@ -39,9 +41,15 @@ UNO_ADAPTER_FILES = (
 )
 LORA_PATH_ENV = "SGLANG_TEST_UNO_LORA_PATH"
 MAX_NEW_TOKENS = 128
-# AR decode and UNO verification use different kernel shapes, so compare a
-# bounded greedy prefix instead of requiring full-sequence bitwise identity.
+# Greedy prefix scored against AR; longer prefixes admit more bf16 near-ties.
 PARITY_TOKENS = 32
+# Arbitrary; a token outside AR's top-k fails regardless of the margin.
+PARITY_TOP_LOGPROBS_NUM = 5
+# UNO verify and AR teacher-forced scoring use different kernel shapes;
+# measured H200 gaps are 1-2 bf16 logit steps (0.125 here), so this allows 4.
+PARITY_TIE_LOGPROB_MARGIN = 0.5
+# Per mode and prompt; measured at most 1 on H200, identical across launches.
+PARITY_MAX_NEAR_TIES_PER_OUTPUT = 1
 # One LoRA draft forward plus one clean verification forward.
 FORWARDS_PER_UNO_CYCLE = 2
 PROMPTS = (
@@ -160,7 +168,9 @@ class TestUnoCudaGraph(CustomTestCase):
             )
         return args
 
-    def _run_ar_reference(self) -> list[list[int]]:
+    def _score_with_ar(
+        self, outputs_by_mode: dict[str, list[list[int]]]
+    ) -> dict[str, list[list[float]]]:
         process = None
         try:
             process = popen_launch_server(
@@ -169,10 +179,48 @@ class TestUnoCudaGraph(CustomTestCase):
                 timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
                 other_args=self._server_args(None),
             )
-            return self._run_greedy_output_ids()
+            return {
+                mode: [
+                    self._ar_logprob_gaps(prompt=prompt, output_ids=output_ids)
+                    for prompt, output_ids in zip(PROMPTS, outputs)
+                ]
+                for mode, outputs in outputs_by_mode.items()
+            }
         finally:
             if process is not None:
                 kill_process_tree(process.pid)
+
+    def _ar_logprob_gaps(self, *, prompt: str, output_ids: list[int]) -> list[float]:
+        prompt_logprobs = self._score_prefill({"text": prompt})["meta_info"][
+            "input_token_logprobs"
+        ]
+        prompt_ids = [token_id for _, token_id, *_ in prompt_logprobs]
+        # UNO rejects returned logprobs, so AR scores UNO's tokens teacher-forced.
+        scored = self._score_prefill(
+            {
+                "input_ids": prompt_ids + output_ids,
+                "top_logprobs_num": PARITY_TOP_LOGPROBS_NUM,
+            }
+        )["meta_info"]["input_top_logprobs"][len(prompt_ids) :]
+        gaps = []
+        for token_id, position in zip(output_ids, scored, strict=True):
+            top = {candidate: logprob for logprob, candidate, *_ in position}
+            gaps.append(max(top.values()) - top.get(token_id, float("-inf")))
+        return gaps
+
+    def _score_prefill(self, inputs: dict) -> dict:
+        response = requests.post(
+            self.base_url + "/generate",
+            json={
+                **inputs,
+                "sampling_params": {"temperature": 0, "max_new_tokens": 0},
+                "return_logprob": True,
+                "logprob_start_len": 0,
+            },
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        return response.json()
 
     def _run_config(self, config: _UnoConfig) -> tuple[float, list[list[int]]]:
         process = None
@@ -192,8 +240,8 @@ class TestUnoCudaGraph(CustomTestCase):
 
     def _run_greedy_output_ids(self) -> list[list[int]]:
         # A list-valued request can be admitted with different prefill batch
-        # shapes across server launches. Run each parity prompt at BS1 so the
-        # AR and UNO comparisons use the same execution shape.
+        # shapes across server launches. Run each parity prompt at BS1 so every
+        # launch uses the same execution shape.
         output_ids = []
         for prompt in PROMPTS:
             response = requests.post(
@@ -220,18 +268,33 @@ class TestUnoCudaGraph(CustomTestCase):
             output_ids.append(result["output_ids"])
         return output_ids
 
-    def _assert_ar_parity(
-        self,
-        mode: str,
-        actual: list[list[int]],
-        expected: list[list[int]],
-    ) -> None:
-        for prompt, actual_ids, expected_ids in zip(PROMPTS, actual, expected):
-            self.assertEqual(
-                actual_ids,
-                expected_ids,
-                f"{mode} UNO diverged from AR within the first "
-                f"{PARITY_TOKENS} tokens for prompt {prompt!r}",
+    def _assert_ar_parity(self, gaps_by_mode: dict[str, list[list[float]]]) -> None:
+        near_ties = [
+            (mode, prompt_index, position, gap)
+            for mode, per_prompt in gaps_by_mode.items()
+            for prompt_index, gaps in enumerate(per_prompt)
+            for position, gap in enumerate(gaps)
+            if gap != 0
+        ]
+        print(
+            f"UNO tokens that are not AR's argmax (mode, prompt, pos, gap): {near_ties}"
+        )
+        for mode, prompt_index, position, gap in near_ties:
+            self.assertLessEqual(
+                gap,
+                PARITY_TIE_LOGPROB_MARGIN,
+                f"{mode} UNO token {position} is not AR's argmax "
+                f"(logprob gap {gap:.4f}) for prompt {PROMPTS[prompt_index]!r}",
+            )
+        per_output = Counter(
+            (mode, prompt_index) for mode, prompt_index, *_ in near_ties
+        )
+        for (mode, prompt_index), count in per_output.items():
+            self.assertLessEqual(
+                count,
+                PARITY_MAX_NEAR_TIES_PER_OUTPUT,
+                f"{mode} UNO has {count} near-tie tokens for prompt "
+                f"{PROMPTS[prompt_index]!r}: {near_ties}",
             )
 
     def _run_generation_contract(self, config: _UnoConfig) -> float:
@@ -287,13 +350,11 @@ class TestUnoCudaGraph(CustomTestCase):
         return tpf
 
     def test_ar_parity_and_nontrivial_tpf(self):
-        ar_output_ids = self._run_ar_reference()
-
         linear_tpf, linear_output_ids = self._run_config(LINEAR_CONFIG)
-        self._assert_ar_parity("Linear", linear_output_ids, ar_output_ids)
-
         tree_tpf, tree_output_ids = self._run_config(TREE_CONFIG)
-        self._assert_ar_parity("Tree", tree_output_ids, ar_output_ids)
+        self._assert_ar_parity(
+            self._score_with_ar({"Linear": linear_output_ids, "Tree": tree_output_ids})
+        )
 
         print(f"UNO GSM8K sample: {linear_tpf=:.3f}, {tree_tpf=:.3f}")
 
