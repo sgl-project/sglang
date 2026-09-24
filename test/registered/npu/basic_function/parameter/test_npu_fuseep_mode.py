@@ -1,11 +1,15 @@
 """Compare selected Ascend FuseEP modes with the unfused W8A8 MoE path.
 
-Default to mode 2 on four Ascend A3 devices. Use SGLANG_TEST_FUSEEP_MODES=1,2
+Default to mode 2 on four Ascend devices. A3 checks teacher-forced logprob
+differences. A5 checks GSM8K accuracy for both backends (200 questions,
+5-shot, >= 0.90) and records logprob differences as diagnostics.
+Use SGLANG_TEST_FUSEEP_MODES=1,2
 only with an EP size supported by mode 1's per-rank expert limit.
 Override SGLANG_TEST_MODEL_PATH to use another
 ModelSlim W8A8 MoE checkpoint (for example Qwen3.5-35B-A3B-W8A8). BF16
 Qwen3.6-35B-A3B cannot exercise the current SGLang FuseEP weight loader.
-Server logs and the numerical comparison are saved under SGLANG_TEST_LOG_DIR.
+Server logs, GSM8K reports, and comparisons are saved under SGLANG_TEST_LOG_DIR.
+Set SGLANG_TEST_GSM8K_DATA_PATH to a local GSM8K test.jsonl for offline runs.
 """
 
 import concurrent.futures
@@ -13,9 +17,11 @@ import json
 import math
 import os
 import re
+import shutil
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import requests
@@ -24,6 +30,7 @@ from sglang.srt.utils import is_npu, kill_process_tree
 from sglang.srt.utils.network import get_open_port
 from sglang.test.ascend.test_ascend_utils import QWEN3_30B_A3B_W8A8_WEIGHTS_PATH
 from sglang.test.ci.ci_register import register_npu_ci
+from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     CustomTestCase,
@@ -46,8 +53,14 @@ class TestNpuFuseepMode(CustomTestCase):
         "Python example:\ndef add(a, b):\n    return a + b\n\nadd(2, 3) returns 5.",
     ]
     ARITHMETIC = [(2, 3, 5), (7, 8, 15), (12, 5, 17), (20, 30, 50)]
+    # Match the existing Qwen3-30B-A3B W8A8 FuseEP model accuracy test.
+    GSM8K_NUM_EXAMPLES = 200
+    GSM8K_ACCURACY_THRESHOLD = 0.90
 
     def setUp(self):
+        from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
+
+        self.is_a5 = is_npu_arch35()
         self.model = os.environ.get(
             "SGLANG_TEST_MODEL_PATH", QWEN3_30B_A3B_W8A8_WEIGHTS_PATH
         )
@@ -155,6 +168,33 @@ class TestNpuFuseepMode(CustomTestCase):
         with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
             return list(executor.map(request, self.ARITHMETIC))
 
+    def _run_gsm8k(self, base_url, name):
+        print(f"[{name}] Running GSM8K: 200 questions, 5-shot", flush=True)
+        metrics = run_eval(
+            SimpleNamespace(
+                base_url=base_url,
+                model=self.model,
+                eval_name="gsm8k",
+                api="completion",
+                num_examples=self.GSM8K_NUM_EXAMPLES,
+                num_shots=5,
+                num_threads=128,
+                max_tokens=512,
+                temperature=0,
+                gsm8k_data_path=os.environ.get("SGLANG_TEST_GSM8K_DATA_PATH"),
+            )
+        )
+        # run_eval uses the model name for its report, so preserve each backend
+        # before the next evaluation overwrites it.
+        report = Path(f"/tmp/gsm8k_{self.model.replace('/', '_')}.html")
+        shutil.copyfile(report, self.log_dir / f"{name}-gsm8k.html")
+        return {
+            **{key: float(value) for key, value in metrics.items()},
+            "num_examples": self.GSM8K_NUM_EXAMPLES,
+            "num_shots": 5,
+            "accuracy_threshold": self.GSM8K_ACCURACY_THRESHOLD,
+        }
+
     def _run_backend(self, mode):
         name = "baseline" if mode is None else f"mode{mode}"
         base_url = f"http://127.0.0.1:{get_open_port()}"
@@ -176,11 +216,11 @@ class TestNpuFuseepMode(CustomTestCase):
             "--mem-fraction-static",
             "0.6",
             "--context-length",
-            "2048",
+            "4096" if self.is_a5 else "2048",
             "--max-total-tokens",
-            "4096",
+            "32768" if self.is_a5 else "4096",
             "--max-running-requests",
-            "4",
+            "32" if self.is_a5 else "4",
             "--chunked-prefill-size",
             "128",
             "--max-prefill-tokens",
@@ -237,6 +277,11 @@ class TestNpuFuseepMode(CustomTestCase):
                 result_path.write_text(json.dumps(result, indent=2, ensure_ascii=False))
                 result["arithmetic"] = self._check_arithmetic(base_url)
                 result_path.write_text(json.dumps(result, indent=2, ensure_ascii=False))
+                if self.is_a5:
+                    result["gsm8k"] = self._run_gsm8k(base_url, name)
+                    result_path.write_text(
+                        json.dumps(result, indent=2, ensure_ascii=False)
+                    )
                 return result
         except Exception:
             print(log_path.read_text(errors="replace")[-16000:])
@@ -271,12 +316,37 @@ class TestNpuFuseepMode(CustomTestCase):
                     "mean_abs_logprob_diff": float(np.mean(errors)),
                     "max_abs_logprob_diff": max(errors),
                 }
+                if self.is_a5:
+                    comparisons[f"mode{mode}"]["gsm8k"] = {
+                        "baseline_score": baseline["gsm8k"]["score"],
+                        "candidate_score": candidate["gsm8k"]["score"],
+                        "accuracy_threshold": self.GSM8K_ACCURACY_THRESHOLD,
+                    }
                 print(json.dumps(comparisons[f"mode{mode}"]))
-                # W8A8 TP and EP kernels have different reduction/rounding
-                # orders. Check both average error and individual outliers.
-                self.assertLess(float(np.mean(errors)), 0.1)
-                self.assertLess(max(errors), 0.6)
-        (self.log_dir / "comparison.json").write_text(json.dumps(comparisons, indent=2))
+                # Persist diagnostics before assertions, including failed runs.
+                (self.log_dir / "comparison.json").write_text(
+                    json.dumps(comparisons, indent=2)
+                )
+                if self.is_a5:
+                    # TP and EP quantize different intermediate partitions and
+                    # use different reduction orders. Gate A5 on model accuracy;
+                    # retain finite/aligned logprobs and the error diagnostics.
+                    for name, result in (
+                        ("baseline", baseline),
+                        (f"mode{mode}", candidate),
+                    ):
+                        score = result["gsm8k"]["score"]
+                        self.assertTrue(math.isfinite(score), f"{name}: GSM8K {score=}")
+                        self.assertGreaterEqual(
+                            score,
+                            self.GSM8K_ACCURACY_THRESHOLD,
+                            f"{name}: GSM8K accuracy {score:.3f} is below "
+                            f"{self.GSM8K_ACCURACY_THRESHOLD:.2f}",
+                        )
+                else:
+                    # Preserve A3's numerical regression thresholds.
+                    self.assertLess(float(np.mean(errors)), 0.1)
+                    self.assertLess(max(errors), 0.6)
 
 
 if __name__ == "__main__":
