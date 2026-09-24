@@ -3,6 +3,7 @@ from __future__ import annotations
 import enum
 import functools
 import logging
+import os
 from dataclasses import dataclass, field
 from typing import (
     TYPE_CHECKING,
@@ -104,6 +105,14 @@ class UnifiedKvMetadata:
     csa_indices: Optional[torch.Tensor] = None
     csa_indptr: Optional[torch.Tensor] = None
 
+    # Grouped target-verify streams for the asm decode: one per (request,
+    # draft group), laid out [compressed tail][that group's window slice] so
+    # the kernel's own causal bound and band mask land on each draft's real
+    # cutoff.
+    gasm_indices: Optional[torch.Tensor] = None
+    gasm_kv_indptr: Optional[torch.Tensor] = None
+    gasm_qo_indptr: Optional[torch.Tensor] = None
+
     # prefill/extend per-token mapping
     pf_state_slot: Optional[torch.Tensor] = None
     pf_chunk_start: Optional[torch.Tensor] = None
@@ -131,6 +140,9 @@ class UnifiedKvMetadata:
                 "swa_indptr",
                 "hca_indices",
                 "hca_indptr",
+                "gasm_indices",
+                "gasm_kv_indptr",
+                "gasm_qo_indptr",
                 "csa_indices",
                 "csa_indptr",
                 "pf_state_slot",
@@ -160,6 +172,9 @@ class UnifiedKvMetadata:
                 "swa_indptr",
                 "hca_indices",
                 "hca_indptr",
+                "gasm_indices",
+                "gasm_kv_indptr",
+                "gasm_qo_indptr",
                 "csa_indices",
                 "csa_indptr",
                 "pf_state_slot",
@@ -511,6 +526,24 @@ class DSV4RawDecodeMetadata:
         self.out_cache_loc.copy_(other.out_cache_loc)
 
 
+_GROUPED_ASM_BLOCK_Q = 4
+
+# aiter serves gqa*msq off one 64-row q tile and only whitelists msq above 1
+# at gqa=16 -- the TP-only shape. DP attention gives a rank all 128 heads, so
+# the tile is full of heads with no room to group, and none is needed either:
+# one kv read already feeds 128 heads rather than 16. An unsupported pair does
+# not downgrade, it fails aiter's kernel lookup outright.
+_GROUPED_ASM_GQA = 16
+_GROUPED_ASM_MIN_REQS = 16
+
+
+def _grouped_asm_enabled() -> bool:
+    """
+    Grouped target-verify decode through the asm kernel, off by default.
+    """
+    return os.environ.get("SGLANG_DSV4_GROUPED_ASM", "0") == "1"
+
+
 class _GraphBucket(enum.Enum):
     DECODE_OR_IDLE = "decode_or_idle"
     TARGET_VERIFY = "target_verify"
@@ -558,6 +591,11 @@ class DeepseekV4HipRadixBackend(
         )
         self.softmax_scale: float = head_dim**-0.5
         self.head_dim_v: int = model_runner.model_config.v_head_dim
+        self.local_q_heads: int = model_runner.model_config.num_attention_heads // (
+            1
+            if model_runner.server_args.enable_dp_attention
+            else model_runner.ps.tp_size
+        )
         self.cuda_int32_kwargs = {"device": self.device, "dtype": torch.int32}
         self.swa_page_size = 128
         assert model_runner.page_size is not None
@@ -714,7 +752,8 @@ class DeepseekV4HipRadixBackend(
             # per-token (num_draft*bs -> bs) req-slot map produced by the prefill
             # expansion above.
             self._attach_unified_kv_decode_streams(
-                core_attn_metadata, req_pool_indices_repeated
+                core_attn_metadata, req_pool_indices_repeated,
+                num_draft=self.target_verify_num_draft_tokens,
             )
         indexer_metadata = (
             self.init_forward_metadata_indexer(core_attn_metadata)
@@ -923,7 +962,8 @@ class DeepseekV4HipRadixBackend(
             num_draft_tokens * bs,
         )
         self._attach_unified_kv_decode_streams(
-            core_attn_metadata, req_pool_indices_repeated
+            core_attn_metadata, req_pool_indices_repeated,
+            num_draft=self.target_verify_num_draft_tokens,
         )
         indexer_metadata = (
             self.init_forward_metadata_indexer(core_attn_metadata)
@@ -1469,7 +1509,8 @@ class DeepseekV4HipRadixBackend(
             self.forward_metadata = current_raw
 
     def _attach_unified_kv_decode_streams(
-        self, core: DSV4AttnMetadata, state_slot: torch.Tensor
+        self, core: DSV4AttnMetadata, state_slot: torch.Tensor,
+        num_draft: int = 0,
     ) -> None:
         # state_slot maps each query token to its request slot;
         # target-verify repeats request slots for the draft tokens.
@@ -1521,6 +1562,36 @@ class DeepseekV4HipRadixBackend(
             ring_stride=pool.unified_swa_ring_size,
             swa_pages=pool.unified_swa_pages,
         )
+        core.unified.gasm_indices = None
+        core.unified.gasm_kv_indptr = None
+        core.unified.gasm_qo_indptr = None
+        if (
+            _grouped_asm_enabled()
+            and self.local_q_heads == _GROUPED_ASM_GQA
+            and num_draft > 1
+            and N % num_draft == 0
+            and N // num_draft >= _GROUPED_ASM_MIN_REQS
+        ):
+            from sglang.kernels.ops.attention.dsv4.unified_kv_kernels import (
+                grouped_verify_streams
+            )
+
+            (
+                core.unified.gasm_indices,
+                core.unified.gasm_kv_indptr,
+                core.unified.gasm_qo_indptr,
+            ) = grouped_verify_streams.build_grouped_verify_streams(
+                state_slot=state_slot,
+                positions=core.positions_casual,
+                hca_len=hca_len,
+                hca_page_indices=hca_page_indices,
+                win=pool.unified_swa_window,
+                ring_stride=pool.unified_swa_ring_size,
+                swa_pages=pool.unified_swa_pages,
+                num_draft=num_draft,
+                block_q=_GROUPED_ASM_BLOCK_Q,
+            )
+
         # SWA ring write target, same value for every layer this forward.
         req_slot = state_slot.to(torch.int64)
         core.unified.swa_loc = (
@@ -1691,6 +1762,28 @@ class DeepseekV4HipRadixBackend(
                     "the v4 nm asm kernel hardcodes 1/sqrt(512), this backend is "
                     f"at {self.softmax_scale}"
                 )
+                gasm = (
+                    unified_metadata.gasm_indices if compress_ratio == 128
+                    else None
+                )
+                assert gasm is None or q.shape[1] == _GROUPED_ASM_GQA, (
+                    f"streams were grouped for {_GROUPED_ASM_GQA} heads a rank "
+                    f"but this layer has {q.shape[1]}"
+                )
+                if gasm is not None:
+                    return runtime.decode_fp8_2buff(
+                        q=q,
+                        q_rope=q_rope,
+                        unified_kv=unified,
+                        unified_kv_rope=pool.get_unified_kv_rope(layer_id),
+                        kv_indices=gasm,
+                        kv_indptr=unified_metadata.gasm_kv_indptr,
+                        qo_indptr=unified_metadata.gasm_qo_indptr,
+                        attn_sink=attn_sink,
+                        v_head_dim=layer.v_head_dim,
+                        max_seqlen_q=_GROUPED_ASM_BLOCK_Q,
+                        compress_ratio=compress_ratio,
+                    )
                 return runtime.decode_fp8_2buff(
                     q=q,
                     q_rope=q_rope,
