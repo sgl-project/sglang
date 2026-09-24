@@ -189,6 +189,24 @@ class TestCompleteDeferredAllreduce(CustomTestCase):
         self.assertIsNone(complete_deferred_allreduce(None))
         self.all_reduce.assert_not_called()
 
+    def test_finish_layer_stack_completes_the_last_layer(self):
+        for fuse in (True, False):
+            with self.subTest(fuse=fuse):
+                self.all_reduce.reset_mock()
+                communicator = make_communicator(fuse=fuse, reduce_scatter=False)
+                residual = torch.zeros(3, 4)
+                with communicator.ffn_exit(object()) as ffn_exit:
+                    hidden_states = torch.ones(3, 4)
+                hidden_states, _ = ffn_exit.finish(hidden_states, residual)
+
+                hidden_states, residual_out = communicator.finish_layer_stack(
+                    hidden_states, residual, object()
+                )
+                self.assertEqual(self.all_reduce.call_count, int(fuse))
+                expected = 3.0 if fuse else 2.0  # all-reduce stub / postprocess stub
+                torch.testing.assert_close(hidden_states, torch.full((3, 4), expected))
+                self.assertIs(residual_out, residual)
+
 
 if __name__ == "__main__":
     unittest.main()

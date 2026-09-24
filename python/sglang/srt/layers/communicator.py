@@ -943,6 +943,17 @@ class LayerCommunicator:
         result as a context manager around the FFN call, then call ``finish``."""
         return FfnExit(self, forward_batch)
 
+    def finish_layer_stack(
+        self,
+        hidden_states: torch.Tensor,
+        residual: Optional[torch.Tensor],
+        forward_batch: ForwardBatch,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """Complete what this layer left for a next layer. Call it on the last
+        layer of this rank before its output reaches the final norm, the next
+        pipeline rank, or any other consumer outside the layers."""
+        return complete_deferred_allreduce(hidden_states), residual
+
     def should_use_reduce_scatter(self, forward_batch: ForwardBatch):
         if not self.allow_reduce_scatter:
             return False
