@@ -1868,7 +1868,6 @@ class Qwen3_5ForCausalLM(nn.Module):
 
         prepare_cutedsl_fusion(
             self.flashinfer_mnnvl_cutedsl_fusion,
-            server_args=model_runner.server_args,
             max_running_requests=model_runner.max_running_requests,
             label="Qwen3.5",
         )

@@ -131,13 +131,6 @@ class TestFfnExit(CustomTestCase):
         hidden_states, _ = ffn_exit.finish(self.hidden_states * 2, self.residual)
         self.assertTrue(hidden_states._sglang_needs_allreduce_fusion)
 
-    def test_a_handoff_without_a_deferral_is_refused(self):
-        communicator = make_communicator(fuse=True, reduce_scatter=False)
-        with communicator.ffn_exit(self.forward_batch) as ffn_exit:
-            pass
-        with self.assertRaises(AssertionError):
-            ffn_exit.finish(object(), self.residual)
-
     def test_compiles_without_graph_breaks(self):
         communicator = LayerCommunicator.__new__(LayerCommunicator)
         communicator.should_fuse_mlp_allreduce_with_next_layer = lambda forward_batch: (

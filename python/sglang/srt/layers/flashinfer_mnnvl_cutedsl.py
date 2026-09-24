@@ -41,7 +41,6 @@ _CUDA_BLOCK_THREADS = 1024
 _HT_NON_REDUCTION_WARPS = 2
 _HT_REDUCTION_WARP_CHOICES = (1, 2, 4, 8)
 
-# The tp widths every CuTe DSL kernel accepts.
 SUPPORTED_TP_SIZES = (2, 4, 8, 16)
 
 
@@ -51,8 +50,7 @@ def _ht_shard_split(
     # The kernel shards a token into consumer_threads * 8 * vectors_per_thread
     # elements, and consumer_threads must divide its 16-byte vector count.
     packs = hidden_size // _VEC_BF16
-    # packs // 2 forces vectors_per_thread >= 2, inherited from the shipped
-    # GB300 presets; the kernel only requires it positive, so this can relax.
+    # packs // 2 keeps vectors_per_thread >= 2, as in the GB300 presets.
     limit = min(max_consumer_threads, packs // 2)
     for consumer_threads in range(
         limit - limit % _WARP_SIZE, _WARP_SIZE - 1, -_WARP_SIZE
@@ -63,8 +61,7 @@ def _ht_shard_split(
 
 
 def _ht_reduction_warp_order(preferred: int) -> tuple[int, ...]:
-    # Preset's own value first, then nearest; steps down before up, because an
-    # extra reduction warp costs consumer block budget.
+    # Preset's value first, then nearest, fewer before more: each warp costs consumers.
     return tuple(
         sorted(
             _HT_REDUCTION_WARP_CHOICES,
@@ -172,8 +169,7 @@ def _retargeted_config(tp_size: int, hidden_size: int, top_k: int):
     )
 
     wide_tp = tp_size >= 16
-    # FlashInfer's measured GB300 crossovers; TP16 shifts LL's window down
-    # because each rank publishes a smaller slice.
+    # FlashInfer's measured GB300 crossovers.
     if wide_tp:
         finalize_bounds = (7, 52, 703, None)
         all_reduce_bounds = (5, 512, 959, None)
@@ -212,8 +208,7 @@ def _retargeted_config(tp_size: int, hidden_size: int, top_k: int):
         ht_all_reduce_preset, hidden_size=hidden_size, tp_size=tp_size
     )
     if ht_finalize is None or ht_all_reduce is None:
-        # Both operations share the HT protocol state, so one unroutable
-        # operation retires HT for the profile.
+        # Both operations share the HT protocol state, so HT goes for both.
         ht_finalize = ht_all_reduce = None
         logger.warning(
             "MNNVL CuTe DSL: hidden_size=%d admits no HT shard split at "
@@ -326,8 +321,7 @@ class FlashInferMNNVLCuteDSLARFusion:
         self.rms_epsilon = float(rms_epsilon)
         self.weight_bias = float(weight_bias)
         self.process_group = process_group
-        # Fixed for the workspace's lifetime; supports() is on the per-layer
-        # eligibility path and must not re-enter c10d to learn it.
+        # Cached: supports() runs per layer and must not re-enter c10d.
         self.tp_size = dist.get_world_size(process_group)
         if self.tp_size not in SUPPORTED_TP_SIZES:
             raise ValueError(
@@ -488,7 +482,6 @@ def get_flashinfer_mnnvl_cutedsl_ar_fusion(
     weight_bias: float,
 ) -> FlashInferMNNVLCuteDSLARFusion:
     """Build the process-local workspace. Must run before graph capture."""
-    # Before the CUDA check: "requires CUDA" would misdirect for a second one.
     global _WORKSPACE
     if _WORKSPACE is not None:
         raise RuntimeError(

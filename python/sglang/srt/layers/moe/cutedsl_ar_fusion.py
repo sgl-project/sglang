@@ -10,11 +10,10 @@ from __future__ import annotations
 import functools
 import logging
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Callable, Optional, Sequence
+from typing import Callable, Optional, Sequence
 
 import torch
 
-from sglang.srt.arg_groups.overrides import cutedsl_moe_max_num_tokens
 from sglang.srt.layers.communicator import (
     CommunicateWithAllReduceAndLayerNormFn,
     LayerCommunicator,
@@ -23,17 +22,18 @@ from sglang.srt.layers.communicator import (
 )
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.layernorm import GemmaRMSNorm, RMSNorm
-from sglang.srt.layers.moe import get_moe_a2a_backend
+from sglang.srt.layers.moe import (
+    can_merge_post_experts_all_reduce,
+    get_moe_a2a_backend,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.runtime_context import (
+    cutedsl_moe_max_num_tokens,
     get_disagg,
     get_exec,
     get_flags,
     get_parallel,
 )
-
-if TYPE_CHECKING:
-    from sglang.srt.server_args import ServerArgs
 
 LayerPredicate = Callable[[torch.nn.Module], bool]
 
@@ -57,11 +57,11 @@ def is_supported_forward_mode(forward_mode: ForwardMode) -> bool:
     )
 
 
-def resolve_max_m(*, server_args: ServerArgs, max_running_requests: int | None) -> int:
+def resolve_max_m(*, max_running_requests: int | None) -> int:
     decode_config = get_exec().graph.cuda_graph_config.decode
     prefill_config = get_exec().graph.cuda_graph_config.prefill
     candidates = [
-        cutedsl_moe_max_num_tokens(server_args),
+        cutedsl_moe_max_num_tokens(),
         max_running_requests,
         decode_config.max_bs,
         prefill_config.max_bs,
@@ -76,8 +76,6 @@ def resolve_max_m(*, server_args: ServerArgs, max_running_requests: int | None) 
     return max(positive)
 
 
-# Stays a dataclass against .claude/rules/no-dataclasses.md: both producers build
-# this under fullgraph=True, and Dynamo cannot construct a msgspec.Struct.
 @dataclass(frozen=True)
 class MoeFinalizeHandoff:
     """Unfinalized routed output plus the separately gated shared contribution."""
@@ -185,15 +183,11 @@ class CuteDSLFusionService:
 class CuteDSLFusionLayerCommunicator(LayerCommunicator):
     fusion_service: CuteDSLFusionService | None = None
 
-    # This layer's runner can defer AND something downstream consumes it.
+    # The runner can defer and a successor or the final norm consumes the handoff.
     may_defer_moe_finalize: bool = False
-
-    # Unlike the flag above, excludes the last layer: its final norm all-reduces
-    # nothing.
+    # False on the last layer: the final norm does not all-reduce.
     successor_absorbs_all_reduce: bool = False
-
-    # Its MoE adds a replicated contribution after its own reduction, which
-    # moving that reduction onward would scale by tp_size.
+    # A replicated output follows the reduction; moving it would scale that by tp.
     owes_local_reduction: bool = False
 
     def prepare_attn(
@@ -343,13 +337,14 @@ class CuteDSLFusionLayerCommunicator(LayerCommunicator):
             and not get_attn_tp_context().input_scattered
             and get_moe_a2a_backend().is_none()
             and self._context.tp_size > 1
-            # Both branches of should_fuse_mlp_allreduce_with_next_layer() answer
-            # before delegating to the base, so its guards -- moe-cp allgather,
-            # MOE_FULL and SCATTERED -- are restated by requiring FULL here.
+            # Restates the base's moe-cp, MOE_FULL and SCATTERED refusals.
             and self.layer_scatter_modes.mlp_mode is ScatterMode.FULL
-            # Skipping the post-experts reduction drops both the EP and the TP
-            # leg; one fused collective cannot restore both.
-            and not (parallel.moe_ep_size > 1 and parallel.moe_tp_size > 1)
+            # Hybrid EP x MoE-TP fuses only when both legs merge into one TP reduction.
+            and not (
+                parallel.moe_ep_size > 1
+                and parallel.moe_tp_size > 1
+                and not can_merge_post_experts_all_reduce()
+            )
         )
 
     def should_fuse_mlp_allreduce_with_next_layer(
@@ -364,8 +359,7 @@ class CuteDSLFusionLayerCommunicator(LayerCommunicator):
 
 
 def model_installs_cutedsl_fusion(model: torch.nn.Module) -> bool:
-    # Most modules carry no ``layer_communicator``, so ``__dict__.get`` stands
-    # in for a defensive ``getattr`` over a heterogeneous module tree.
+    # Most modules carry no layer_communicator.
     return any(
         isinstance(
             module.__dict__.get("layer_communicator"),
@@ -391,8 +385,7 @@ def install_cutedsl_fusion(
     Every entry of ``layers`` must carry a ``layer_communicator``.
     """
     if get_flags().moe.in_speculative_scope:
-        # A draft is built in the target's process, and each workspace
-        # rendezvouses its own NVLS region, so a second one is refused outright.
+        # A draft shares the target's process, which holds one workspace.
         return None
 
     fusion_layers = [
@@ -403,8 +396,7 @@ def install_cutedsl_fusion(
     if not fusion_layers:
         return None
 
-    # The kernel validates only the epsilon the service passes, so a family
-    # with a per-layer value would silently normalize with the wrong one.
+    # The workspace compiles one epsilon and cannot see a per-layer one.
     for layer in fusion_layers:
         for norm in (
             layer.layer_communicator.input_layernorm,
@@ -459,7 +451,6 @@ def install_cutedsl_fusion(
 def prepare_cutedsl_fusion(
     service: CuteDSLFusionService | None,
     *,
-    server_args: ServerArgs,
     max_running_requests: int | None,
     label: str,
 ) -> None:
@@ -470,11 +461,7 @@ def prepare_cutedsl_fusion(
             "FlashInfer MNNVL CuTe DSL fusion does not support concurrent PDMux "
             "streams sharing one mutable workspace"
         )
-    service.prepare(
-        max_m=resolve_max_m(
-            server_args=server_args, max_running_requests=max_running_requests
-        )
-    )
+    service.prepare(max_m=resolve_max_m(max_running_requests=max_running_requests))
     logger.info(
         "Prepared %s FlashInfer MNNVL CuTe DSL fusion workspace for M_max=%d",
         label,

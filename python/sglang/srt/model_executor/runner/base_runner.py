@@ -299,13 +299,11 @@ class BaseRunner(ABC):
             return
 
         if uses_cutedsl_ar_fusion():
-            # cutedsl builds its own workspace from the model's pre-capture
-            # hook, and nothing else resolves its configured value, so the
-            # platform check runs here or not at all.
+            # The workspace is built by the model's pre-capture hook; only the
+            # platform check runs here.
             resolve_flashinfer_allreduce_fusion_backend()
             if not mr.is_draft_worker:
-                # install_cutedsl_fusion() declines inside
-                # draft_model_build_scope(), so a draft carries no communicator.
+                # A draft installs no fusion communicator.
                 self._assert_model_installs_cutedsl_fusion()
             return
 

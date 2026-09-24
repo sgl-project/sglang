@@ -1101,8 +1101,7 @@ class FfnExit:
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Leave the reduction to the next layer's input norm, or postprocess."""
         if not isinstance(hidden_states, torch.Tensor):
-            # A deferred MoE finalize handoff; the flag only permits one, and the
-            # MoE declines it per forward, so key off what came back.
+            # A deferred MoE finalize handoff, consumed by the next prepare_attn.
             assert self.defer_moe_finalize, "unrequested deferred MoE handoff"
             return hidden_states, residual
         if self.fuse_mlp_allreduce:

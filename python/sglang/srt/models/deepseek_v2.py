@@ -1098,8 +1098,7 @@ class DeepseekV2MoE(nn.Module):
         current_stream.wait_stream(self.alt_stream)
 
         if deferred_finalize and get_forward().defer_moe_finalize:
-            # deferred_finalize excluded the replicated _shared_expert_tp1
-            # output, so the shared add folds in safely.
+            # deferred_finalize excludes _shared_expert_tp1, so the shared add folds in.
             assert shared_output is not None
             from sglang.srt.layers.moe.cutedsl_ar_fusion import MoeFinalizeHandoff
 
@@ -2960,8 +2959,7 @@ class DeepseekV2Model(nn.Module):
             hidden_size=config.hidden_size,
             top_k=config.num_experts_per_tok,
             rms_epsilon=config.rms_norm_eps,
-            # A TP1-replicated shared expert is added after the all-reduce: it
-            # cannot fold into the fused add, nor move that reduction onward.
+            # A TP1 shared expert is added after the all-reduce and cannot move it.
             can_defer_finalize=lambda layer: (
                 isinstance(layer.mlp, DeepseekV2MoE)
                 and layer.mlp.experts.supports_deferred_finalize
@@ -2970,7 +2968,6 @@ class DeepseekV2Model(nn.Module):
             requires_local_reduction=lambda layer: (
                 isinstance(layer.mlp, DeepseekV2MoE) and layer.mlp._shared_expert_tp1
             ),
-            # The final norm takes a plain tensor, not a handoff.
             final_norm_consumes_handoff=False,
             label="DeepSeek-V3/GLM",
         )
@@ -3300,7 +3297,6 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
 
         prepare_cutedsl_fusion(
             self.model.flashinfer_mnnvl_cutedsl_fusion,
-            server_args=model_runner.server_args,
             max_running_requests=model_runner.max_running_requests,
             label="DeepSeek-V3/GLM",
         )
@@ -3454,8 +3450,7 @@ def dsv2_flashinfer_moe_dual_stream_graph(
         fuse_mlp_allreduce=fuse_mlp_allreduce,
         mlp_reduce_scatter=mlp_reduce_scatter,
         flashinfer_trtllm_bypass=True,
-        # scoped() leaves unlisted flags alone, and this op's Tensor schema
-        # cannot carry a MoeFinalizeHandoff; finalize locally instead.
+        # The op's Tensor schema cannot carry a MoeFinalizeHandoff.
         defer_moe_finalize=False,
     ):
         return moe_fusion.forward_normal_dual_stream(hidden_states)
