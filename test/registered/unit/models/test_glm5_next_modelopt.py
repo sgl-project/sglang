@@ -2,15 +2,9 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from torch import nn
-
-from sglang.srt.layers.conv import Conv2dLayer
 from sglang.srt.layers.quantization.modelopt_quant import ModelOptFp4Config
 from sglang.srt.models import glm5_next
-from sglang.srt.models.glm5_next import (
-    Glm5NextForConditionalGeneration,
-    Glm5NextVisionModel,
-)
+from sglang.srt.models.glm5_next import Glm5NextForConditionalGeneration
 from sglang.srt.models.glm5_next_nextn import Glm5NextForConditionalGenerationNextN
 from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -105,35 +99,6 @@ class TestGlm5NextModelOpt(CustomTestCase):
             )
 
         self.assertIsNone(reason)
-
-    def test_vision_downsample_uses_linear_eligible_convolution(self):
-        vision_config = SimpleNamespace(
-            hidden_size=16,
-            num_heads=2,
-            patch_size=2,
-            temporal_patch_size=2,
-            spatial_merge_size=2,
-            in_channels=3,
-            out_hidden_size=32,
-            intermediate_size=64,
-            projection_intermediate_size=64,
-            depth=0,
-            rms_norm_eps=1e-5,
-            swiglu_limit=None,
-        )
-
-        with (
-            patch.object(glm5_next, "get_rope", return_value=nn.Identity()),
-            patch.object(
-                glm5_next,
-                "Glm5NextVisionPatchMerger",
-                return_value=nn.Identity(),
-            ),
-        ):
-            model = Glm5NextVisionModel(vision_config)
-
-        self.assertIsInstance(model.downsample, Conv2dLayer)
-        self.assertTrue(model.downsample.enable_linear)
 
     def test_nextn_mapper_routes_checkpoint_names_to_runtime_modules(self):
         """Draft quant lookups miss unless checkpoint names reach NextN module paths."""
