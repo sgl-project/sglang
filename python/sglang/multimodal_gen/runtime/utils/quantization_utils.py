@@ -10,10 +10,6 @@ import torch
 from safetensors import safe_open
 from torch import nn
 
-from sglang.multimodal_gen.runtime.layers.linear import (
-    LinearBase,
-    UnquantizedLinearMethod,
-)
 from sglang.multimodal_gen.runtime.layers.quantization import (
     QuantizationConfig,
     get_quantization_config,
@@ -64,6 +60,11 @@ def process_model_weights_after_loading(
     quantized_only: bool = False,
 ) -> int:
     """Process native and SRT layers once, optionally staging one layer at a time."""
+    from sglang.multimodal_gen.runtime.layers.linear import (
+        LinearBase,
+        UnquantizedLinearMethod,
+    )
+
     processed_layers = 0
     for module in model.modules():
         if not isinstance(

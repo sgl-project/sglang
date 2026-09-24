@@ -68,6 +68,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_executor.runner import get_is_capture_mode
+from sglang.srt.model_loader.llada2_weight_utils import prepare_llada2_language_weights
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.utils import (
     apply_qk_norm,
@@ -177,10 +178,7 @@ class LLaDA2MoeGate(nn.Module):
             self.expert_bias = None
 
     def forward(self, hidden_states):
-        logits = F.linear(hidden_states.to(self.weight.dtype), self.weight, None).to(
-            hidden_states.dtype
-        )
-        return logits
+        return F.linear(hidden_states.to(self.weight.dtype), self.weight, None)
 
 
 class LLaDA2MoeSparseMoeBlock(nn.Module):
@@ -835,6 +833,9 @@ class LLaDA2MoeModelLM(nn.Module):
     def end_layer(self):
         return self.model.end_layer
 
+    def get_input_embeddings(self):
+        return self.model.word_embeddings
+
     def get_embed_and_head(self):
         """Used by the eagle_worker."""
         return self.model.word_embeddings.weight, self.lm_head.weight
@@ -888,7 +889,9 @@ class LLaDA2MoeModelLM(nn.Module):
         )
 
         params_dict = dict(self.named_parameters())
-        for name, loaded_weight in weights:
+        for name, loaded_weight in prepare_llada2_language_weights(
+            weights, num_experts=self.config.num_experts
+        ):
             if (
                 ("v_head" in name)
                 or ("inv_freq" in name)

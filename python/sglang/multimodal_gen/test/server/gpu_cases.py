@@ -530,6 +530,61 @@ ONE_GPU_CASES: list[DiffusionTestCase] = [
     ),
 ]
 
+if not current_platform.is_hip() and not current_platform.is_xpu():
+    ONE_GPU_CASES += [
+        DiffusionTestCase(
+            "llada_image_bf16_t2i",
+            DiffusionServerArgs(
+                model_path="inclusionAI/LLaDA-Image",
+                modality="image",
+                num_gpus=1,
+                tp_size=1,
+                ulysses_degree=1,
+                ring_degree=1,
+                cfg_parallel=False,
+                extras=[
+                    "--trust-remote-code",
+                    "--revision",
+                    "e4e2703f410f7ddb6ee8d6b09dac6a8ec5093039",
+                ],
+            ),
+            DiffusionSamplingParams(
+                prompt="A red fox sitting on a snowy hill",
+                output_size="512x512",
+                extras={"num_inference_steps": 50, "guidance_scale": 5.0, "seed": 42},
+            ),
+            run_perf_check=False,
+            run_consistency_check=False,
+            run_component_accuracy_check=False,
+        ),
+        DiffusionTestCase(
+            "llada_image_bf16_edit",
+            DiffusionServerArgs(
+                model_path="inclusionAI/LLaDA-Image",
+                modality="image",
+                num_gpus=1,
+                tp_size=1,
+                ulysses_degree=1,
+                ring_degree=1,
+                cfg_parallel=False,
+                extras=[
+                    "--trust-remote-code",
+                    "--revision",
+                    "e4e2703f410f7ddb6ee8d6b09dac6a8ec5093039",
+                ],
+            ),
+            DiffusionSamplingParams(
+                prompt="Convert 2D style to 3D style",
+                image_path="https://github.com/lm-sys/lm-sys.github.io/releases/download/test/TI2I_Qwen_Image_Edit_Input.jpg",
+                output_size="512x512",
+                extras={"num_inference_steps": 50, "guidance_scale": 5.0, "seed": 42},
+            ),
+            run_perf_check=False,
+            run_consistency_check=False,
+            run_component_accuracy_check=False,
+        ),
+    ]
+
 # Skip hunyuan3d on AMD: marching_cubes surface extraction produces invalid SDF on ROCm.
 if not current_platform.is_hip():
     ONE_GPU_CASES.append(
