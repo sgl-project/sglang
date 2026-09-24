@@ -1428,7 +1428,12 @@ class EAGLEWorkerV2(BaseSpecWorker):
                         batch, plan, on_publish, grammar_barrier, pp_proxy_tensors
                     )
         else:
-            self.activate_step_by_batch(batch.seq_lens.shape[0])
+            if batch.reqs:
+                seqlens = sorted(req.seqlen for req in batch.reqs)
+                ctx_repr = seqlens[len(seqlens) // 2]
+            else:
+                ctx_repr = 0
+            self.activate_step_by_batch(batch.seq_lens.shape[0], ctx_repr)
 
             if batch.spec_info is None:
                 capture_mode = (
@@ -1755,16 +1760,21 @@ class EAGLEWorkerV2(BaseSpecWorker):
             )
 
     def on_verify_complete_cpu(
-        self, num_correct_drafts_per_req: list[int], batch_size: int = 0
+        self,
+        num_correct_drafts_per_req: list[int],
+        batch_size: int = 0,
+        ctx_repr: int = 0,
     ) -> None:
         if self.adaptive_controller is not None:
             self.adaptive_controller.on_verify_complete(
-                num_correct_drafts_per_req, batch_size=batch_size
+                num_correct_drafts_per_req,
+                batch_size=batch_size,
+                ctx_repr=ctx_repr,
             )
 
-    def activate_step_by_batch(self, batch_size: int) -> None:
+    def activate_step_by_batch(self, batch_size: int, ctx_repr: int = 0) -> None:
         if self.adaptive_controller is not None:
-            self.adaptive_controller.activate_step_by_batch(batch_size)
+            self.adaptive_controller.activate_step_by_batch(batch_size, ctx_repr)
 
     # -- Adaptive speculative decoding protocol --
 
