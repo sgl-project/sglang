@@ -1561,6 +1561,18 @@ def deepgemm_w8a8_block_fp8_linear_with_fallback(
             return output
         return result.view(*input.shape[:-1], weight.shape[0])
 
+    if deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0 and tuple(block_size) == (128, 128):
+        from sglang.kernels.ops.gemm.tiny_gemm_fp8_blockwise import (
+            can_use_tiny_gemm_fp8_blockwise,
+            tiny_gemm_fp8_blockwise,
+        )
+
+        if can_use_tiny_gemm_fp8_blockwise(input, weight, weight_scale):
+            result = tiny_gemm_fp8_blockwise(input, weight, weight_scale, output)
+            if bias is not None:
+                result += bias
+            return result
+
     input_2d = input.view(-1, input.shape[-1])
     output_shape = [*input.shape[:-1], weight.shape[0]]
 
