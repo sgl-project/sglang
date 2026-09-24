@@ -84,7 +84,11 @@ def _device_free_bytes() -> int | None:
     mem_get_info = getattr(device_module, "mem_get_info", None)
     if mem_get_info is None or not device_module.is_available():
         return None
-    return int(mem_get_info()[0])
+    try:
+        return int(mem_get_info()[0])
+    except RuntimeError:
+        # Some backends expose mem_get_info without implementing it.
+        return None
 
 
 def _is_out_of_memory_error(error: BaseException) -> bool:
