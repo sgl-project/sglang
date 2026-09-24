@@ -314,6 +314,25 @@ def test_lerobot_camera_names_and_float_images():
         parse_observation({"images": pixels, "state": np.zeros(8)}, config)
 
 
+def test_json_decoded_pixel_lists_are_accepted():
+    """Cookbook JSON requests send image.tolist(); the lists decode to int64 arrays."""
+    config = _droid_config()
+    views = _views(2)
+    as_json = {k: np.asarray(v.tolist()) for k, v in views.items()}
+    assert next(iter(as_json.values())).dtype == np.int64
+    from_json = parse_observation({"images": as_json, "state": [0.0] * 8}, config)
+    from_uint8 = parse_observation({"images": views, "state": np.zeros(8)}, config)
+    assert torch.equal(from_json.canvas, from_uint8.canvas)
+    with pytest.raises(ValueError, match="0, 255"):
+        parse_observation(
+            {
+                "images": {**as_json, "wrist": as_json["wrist"] + 256},
+                "state": [0.0] * 8,
+            },
+            config,
+        )
+
+
 def test_missing_camera_is_reported():
     views = _views()
     del views["left"]

@@ -126,6 +126,11 @@ def _as_image(value: Any) -> torch.Tensor:
     array = np.asarray(value)
     if array.ndim != 3 or array.shape[-1] != 3:
         raise ValueError(f"expected an HWC RGB image, got shape {array.shape}")
+    if np.issubdtype(array.dtype, np.integer) and array.dtype != np.uint8:
+        # JSON pixel lists decode to int64.
+        if array.size and (array.min() < 0 or array.max() > 255):
+            raise ValueError("integer images must hold pixel values in [0, 255]")
+        array = array.astype(np.uint8)
     tensor = torch.from_numpy(np.require(array, requirements=["C", "W"]))
     if array.dtype == np.uint8:
         return tensor.permute(2, 0, 1).float().div_(255.0)
