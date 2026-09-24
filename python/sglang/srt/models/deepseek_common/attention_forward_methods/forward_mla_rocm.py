@@ -495,6 +495,10 @@ class DeepseekMLARocmForwardMixin:
                     self.kv_a_layernorm.variance_epsilon,
                 )
             elif _use_aiter_gfx95 and _is_block_scale_fp8(self.q_b_proj):
+                emit_transposed_scale = emit_transposed_bpreshuffle_scale(
+                    q.shape[0],
+                    on_bpreshuffle_gfx95=_use_aiter_bpreshuffle_gfx95,
+                )
                 if self.use_dsa:
                     q_quanted, q_lora, k_nope, _ = fused_rms_fp8_group_quant(
                         q,
@@ -507,9 +511,13 @@ class DeepseekMLARocmForwardMixin:
                         dtype_quant=torch.float8_e4m3fn,
                         res1=None,
                         output_unquantized_inp1=True,
-                        transpose_scale=False,
+                        transpose_scale=emit_transposed_scale,
                     )
-                    if _use_aiter_bpreshuffle_gfx95:
+                    if emit_transposed_scale:
+                        q_quanted = view_aiter_fused_rms_transposed_fp8_scale_tuple(
+                            q_quanted
+                        )
+                    elif _use_aiter_bpreshuffle_gfx95:
                         q_quanted = materialize_bpreshuffle_fp8_scale_tuple(q_quanted)
                     q = q_quanted
                 else:
@@ -524,9 +532,11 @@ class DeepseekMLARocmForwardMixin:
                         dtype_quant=torch.float8_e4m3fn,
                         res1=None,
                         output_unquantized_inp1=False,
-                        transpose_scale=False,
+                        transpose_scale=emit_transposed_scale,
                     )
-                    if _use_aiter_bpreshuffle_gfx95:
+                    if emit_transposed_scale:
+                        q = view_aiter_fused_rms_transposed_fp8_scale_tuple(q)
+                    elif _use_aiter_bpreshuffle_gfx95:
                         q = materialize_bpreshuffle_fp8_scale_tuple(q)
             elif _use_aiter:
                 q, k_nope = fused_qk_rmsnorm_bf16(
