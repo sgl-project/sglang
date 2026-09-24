@@ -55,6 +55,7 @@ from sglang.srt.utils import (
     LazyValue,
     add_prefix,
     cpu_has_amx_support,
+    get_bool_env_var,
     is_cpu,
     is_cuda,
     is_hip,
@@ -67,6 +68,7 @@ logger = logging.getLogger(__name__)
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
+_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
 _is_npu = is_npu()
 _is_cpu = is_cpu()
 _is_amx_available = cpu_has_amx_support()
@@ -248,7 +250,8 @@ class Qwen3GatedDeltaNet(nn.Module):
         # shape the AITER kernel hard-codes. The per-call tensor contract is
         # checked in the backend, which falls back rather than raising.
         self._gdn_fused_decode_ready = (
-            gdn_fused_decode_aiter.available()
+            _use_aiter
+            and gdn_fused_decode_aiter.available()
             and self.num_v_heads == 2 * self.num_k_heads
             and self.head_k_dim == self.head_v_dim == 128
             and self.conv_kernel_size == 4
@@ -456,7 +459,9 @@ class Qwen3GatedDeltaNet(nn.Module):
         # covered), it returns (core_attn_out, z) and everything below runs as
         # before.
         fused_gdn = (
-            self._gdn_fused_decode_ready and forward_batch.forward_mode.is_decode()
+            _use_aiter
+            and self._gdn_fused_decode_ready
+            and forward_batch.forward_mode.is_decode()
         )
         if fused_gdn:
             self.attn._gdn_onorm_args = (
