@@ -40,7 +40,7 @@ logger = init_logger(__name__)
 # NPU/ascend) is read from sgl-project/ci-data-diffusion, where the GT-gen workflows
 # publish.
 SGL_TEST_FILES_CI_DATA_REPO = "sgl-project/ci-data-diffusion"
-SGL_TEST_FILES_CI_DATA_REVISION = "0b9d7313c6bd31795fe6531a61ac45c89d9ed78e"
+SGL_TEST_FILES_CI_DATA_REVISION = "38ba32bd812b2dfb0eccc83ef063096c089e3389"
 
 # The NPU pin is kept as a separate branch so ascend GT can be bumped independently
 # when it's regenerated on its own cadence.
@@ -171,6 +171,7 @@ DEFAULT_COSMOS3_NANO_MODEL_NAME_FOR_TEST = "nvidia/Cosmos3-Nano"
 
 # Qwen image generation models
 DEFAULT_QWEN_IMAGE_MODEL_NAME_FOR_TEST = "Qwen/Qwen-Image"
+DEFAULT_QWEN_IMAGE_21_MODEL_NAME_FOR_TEST = "Qwen/Qwen-Image-2.1"
 DEFAULT_QWEN_IMAGE_2512_MODEL_NAME_FOR_TEST = "Qwen/Qwen-Image-2512"
 DEFAULT_QWEN_IMAGE_EDIT_MODEL_NAME_FOR_TEST = "Qwen/Qwen-Image-Edit"
 DEFAULT_QWEN_IMAGE_EDIT_2509_MODEL_NAME_FOR_TEST = "Qwen/Qwen-Image-Edit-2509"

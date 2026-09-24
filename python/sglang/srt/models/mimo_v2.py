@@ -15,6 +15,7 @@
 import logging
 import math
 import re
+from array import array
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
 import torch
@@ -24,7 +25,6 @@ from torch import nn
 from sglang.srt.batch_overlap.two_batch_overlap import model_forward_maybe_tbo
 from sglang.srt.configs.model_config import get_mimo_v2_fused_qkv_expected_tp_size
 from sglang.srt.distributed import (
-    get_pp_group,
     tensor_model_parallel_all_reduce,
 )
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
@@ -82,7 +82,7 @@ from sglang.srt.model_loader.weight_utils import (
 )
 from sglang.srt.models.mimo_audio import AudioEncoderMixin, MiMoAudioEncoderConfig
 from sglang.srt.models.mimo_vl import MiMoVisionTransformer, MiMoVLVisionConfig
-from sglang.srt.runtime_context import get_exec, get_forward, get_parallel
+from sglang.srt.runtime_context import get_exec, get_parallel
 from sglang.srt.utils import (
     LazyValue,
     add_prefix,
@@ -350,7 +350,7 @@ class MoEGate(nn.Module):
     ):
         super().__init__()
         self.is_nextn = is_nextn
-        self.dtype = torch.float32
+        self.dtype = getattr(torch, getattr(config, "moe_router_dtype", "float32"))
         self.weight = nn.Parameter(
             torch.empty((config.n_routed_experts, config.hidden_size), dtype=self.dtype)
         )
@@ -360,7 +360,7 @@ class MoEGate(nn.Module):
                 if quant_config is not None
                 and quant_config.get_name() == "modelopt_fp4"
                 and get_moe_runner_backend().is_flashinfer_trtllm()
-                else self.dtype
+                else torch.float32
             )
             self.e_score_correction_bias = nn.Parameter(
                 torch.empty((config.n_routed_experts), dtype=correction_bias_dtype)
@@ -369,9 +369,15 @@ class MoEGate(nn.Module):
             self.e_score_correction_bias = None
 
     def forward(self, hidden_states):
-        logits = F.linear(hidden_states.to(self.dtype), self.weight, None)
+        if self.dtype != torch.float32 and hidden_states.is_cuda:
+            return torch.mm(
+                hidden_states.to(self.dtype),
+                self.weight.t(),
+                out_dtype=torch.float32,
+            )
 
-        return logits
+        logits = F.linear(hidden_states.to(self.dtype), self.weight, None)
+        return logits.to(torch.float32)
 
 
 class MiMoV2MoE(nn.Module):
@@ -428,6 +434,7 @@ class MiMoV2MoE(nn.Module):
             num_expert_group=config.n_group,
             topk_group=config.topk_group,
             correction_bias=self.gate.e_score_correction_bias,
+            is_fp4_experts=getattr(quant_config, "is_fp4_experts", False),
             scoring_func=config.scoring_func,
             quant_config=quant_config,
             routed_scaling_factor=1.0,
@@ -509,7 +516,7 @@ class MiMoV2MoE(nn.Module):
             topk_output = self.topk(
                 hidden_states,
                 router_logits,
-                num_token_non_padded=forward_batch.num_token_non_padded,
+                num_token_non_padded=forward_batch.moe_num_token_non_padded(),
                 expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
                     layer_id=self.layer_id,
                 ),
@@ -542,7 +549,7 @@ class MiMoV2MoE(nn.Module):
                 state.topk_output = self.topk(
                     hidden_states=hidden_states,
                     router_logits=router_logits,
-                    num_token_non_padded=state.forward_batch.num_token_non_padded,
+                    num_token_non_padded=state.forward_batch.moe_num_token_non_padded(),
                     expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
                         layer_id=self.layer_id,
                     ),
@@ -900,29 +907,9 @@ class MiMoV2DecoderLayer(nn.Module):
             hidden_states, residual, forward_batch
         )
 
-        fuse_mlp_allreduce = (
-            self.layer_communicator.should_fuse_mlp_allreduce_with_next_layer(
-                forward_batch
-            )
-        )
-
-        # For DP with padding, reduce scatter can be used instead of all-reduce.
-        mlp_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
-            forward_batch
-        )
-
-        with get_forward().scoped(
-            fuse_mlp_allreduce=fuse_mlp_allreduce,
-            mlp_reduce_scatter=mlp_reduce_scatter,
-        ):
+        with self.layer_communicator.ffn_exit(forward_batch) as ffn_exit:
             hidden_states = self.mlp(hidden_states, forward_batch)
-
-        if fuse_mlp_allreduce:
-            hidden_states._sglang_needs_allreduce_fusion = True
-        else:
-            hidden_states, residual = self.layer_communicator.postprocess_layer(
-                hidden_states, residual, forward_batch
-            )
+        hidden_states, residual = ffn_exit.finish(hidden_states, residual)
 
         return hidden_states, residual
 
@@ -1003,7 +990,7 @@ class MiMoV2Model(nn.Module):
         self.config = config
         self.padding_idx = getattr(config, "pad_token_id", None)
         self.vocab_size = config.vocab_size
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
         self.layers_to_capture = []
 
         if self.pp_group.is_first_rank:
@@ -1197,7 +1184,7 @@ class MiMoV2ForCausalLM(nn.Module, AudioEncoderMixin):
         prefix: str = "",
     ) -> None:
         super().__init__()
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
         self.config = config
         self.quant_config = quant_config
         self._encoder_processor = None  # lazy-created in preprocess_mm_for_encoder
@@ -1267,7 +1254,7 @@ class MiMoV2ForCausalLM(nn.Module, AudioEncoderMixin):
         )
         return self.model.get_input_embedding(input_ids)
 
-    def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
+    def pad_input_ids(self, input_ids: array, mm_inputs: MultimodalInputs) -> array:
         pattern = MultiModalityDataPaddingPatternMultimodalTokens()
         return pattern.pad_input_tokens(input_ids, mm_inputs)
 
@@ -1591,6 +1578,13 @@ class MiMoV2ForCausalLM(nn.Module, AudioEncoderMixin):
                     )
                     skipped_mtp_weights = True
                 continue
+
+            if ".mlp.experts." in name and loaded_weight.dtype == torch.uint8:
+                if name.endswith(".weight_scale"):
+                    name = name + "_inv"
+                    loaded_weight = torch.exp2(loaded_weight.to(torch.float32) - 127.0)
+                elif name.endswith(".weight"):
+                    loaded_weight = loaded_weight.view(torch.int8)
 
             # Support fused qkv_proj checkpoint (Pro format)
             if "qkv_proj" in name:
