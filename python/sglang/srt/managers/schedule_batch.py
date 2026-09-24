@@ -1963,24 +1963,13 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             return
 
         if self.sampling_info.penalizer_orchestrator.is_required:
-            if self.enable_overlap:
-                # TODO: this can be slow, optimize this.
-                delayed_output_ids = torch.tensor(
-                    [
-                        (
-                            req.output_ids[-1]
-                            if len(req.output_ids)
-                            else req.origin_input_ids[-1]
-                        )
-                        for req in self.reqs
-                    ],
-                    dtype=torch.int64,
-                    device=self.device,
-                )
-                self.sampling_info.penalizer_orchestrator.cumulate_output_tokens(
-                    delayed_output_ids
-                )
-            else:
+            # Under overlap the previous step's token is still in flight here,
+            # so req.output_ids lags by one step and feeding the penalizer now
+            # would penalize a one-step-stale history (and the first decode
+            # step would penalize the last prompt token). The overlap path
+            # feeds it in process_batch_result_* instead, where the resolved
+            # token has landed (#41124).
+            if not self.enable_overlap:
                 self.sampling_info.penalizer_orchestrator.cumulate_output_tokens(
                     self.output_ids.to(torch.int64)
                 )

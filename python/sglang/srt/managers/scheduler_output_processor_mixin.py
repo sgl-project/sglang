@@ -141,6 +141,19 @@ class SchedulerOutputProcessorMixin:
                 result.extend_logprob_start_len_per_req,
             )
 
+            if (
+                self.enable_overlap
+                and batch.spec_algorithm.is_none()
+                and batch.sampling_info.penalizer_orchestrator.is_required
+            ):
+                # Same contract as the decode path below: under overlap the
+                # penalizer is fed when the token lands, so the first decode
+                # step penalizes the prefill-produced token instead of the
+                # last prompt token (#41124).
+                batch.sampling_info.penalizer_orchestrator.cumulate_output_tokens(
+                    result.next_token_ids.to(torch.int64)
+                )
+
             # Move next_token_ids and logprobs to cpu
             next_token_ids = next_token_ids.tolist()
             if batch.return_logprob:
@@ -388,6 +401,18 @@ class SchedulerOutputProcessorMixin:
                         v.tolist()
                         for v in logits_output.next_token_token_ids_logprobs_val
                     ]
+
+        if (
+            self.enable_overlap
+            and batch.spec_algorithm.is_none()
+            and batch.sampling_info.penalizer_orchestrator.is_required
+        ):
+            # Overlap feeds the penalizer here, where the step's token has
+            # already resolved, instead of at the next prepare_for_decode where
+            # it is still in flight (#41124).
+            batch.sampling_info.penalizer_orchestrator.cumulate_output_tokens(
+                result.next_token_ids.to(torch.int64)
+            )
 
         self.num_generated_tokens += len(batch.reqs)
         if not batch.spec_algorithm.is_none():
