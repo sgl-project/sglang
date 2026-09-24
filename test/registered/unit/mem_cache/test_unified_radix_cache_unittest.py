@@ -8243,6 +8243,60 @@ class UnifiedRadixCacheSuite:
         self.assertEqual(len(m.device_indices), len(prefix))
         cache.sanity_check()
 
+    def test_hicache_swa_load_back_tops_up_a_device_tail_from_a_host_ancestor(self):
+        """On a device-SWA node over a host-only SWA ancestor, load-back fetches only
+        the page-aligned remainder of the window, and the match charges exactly it."""
+        if not self.cfg.has_swa:
+            self.skipTest("requires SWA")
+        if self.cfg.has_mamba:
+            self.skipTest("SWA-only path")
+        ps = self.cfg.page_size
+        window_pages = (self.cfg.sliding_window_size + ps - 1) // ps
+        if window_pages < 2:
+            self.skipTest("one device page already covers the window")
+        window_tokens = window_pages * ps
+        seq_pages = 2 * window_pages + 2
+        if seq_pages * ps > self.cfg.kv_size // 2:
+            self.skipTest("kv_size too small for the long node")
+
+        cache, allocator, req_to_token_pool = self._build_hicache_fixture()
+        seq = self._make_seq(1, seq_pages)
+        self._insert(cache, allocator, req_to_token_pool, seq)
+        self._backup_tree(cache)
+        cache.evict(EvictParams(num_tokens=len(seq)))
+        m = cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", seq))))
+        self.assertTrue(cache.load_back(m.best_match_node))
+        self._finish_pending_loads(cache)
+        self._release_ongoing_load_back_locks(cache)
+
+        # Ending one page into the reloaded window leaves a device page over the
+        # SWA host tombstone head, which must supply the rest of the window.
+        head_len = len(seq) - window_tokens
+        prefix = seq[: head_len + ps]
+        m = cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", prefix))))
+        node = m.best_match_node
+        head = _node_parent(cache, node)
+        self.assertEqual(_node_key_length(cache, node), ps)
+        self.assertIsNotNone(_device_value(cache, node, ComponentType.SWA))
+        self.assertIsNone(_device_value(cache, head, ComponentType.SWA))
+        self.assertEqual(m.swa_host_hit_length, window_tokens - ps)
+
+        swa_avail = allocator.swa_attn_allocator.available_size()
+        self.assertTrue(cache.load_back(node))
+        self.assertEqual(
+            swa_avail - allocator.swa_attn_allocator.available_size(),
+            window_tokens - ps,
+        )
+        self._finish_pending_loads(cache)
+        tail = _node_parent(cache, node)
+        self.assertEqual(_node_key_length(cache, tail), window_tokens - ps)
+        self.assertIsNotNone(_device_value(cache, tail, ComponentType.SWA))
+        self.assertIsNone(
+            _device_value(cache, _node_parent(cache, tail), ComponentType.SWA)
+        )
+        self._release_ongoing_load_back_locks(cache)
+        cache.sanity_check()
+
     def test_hicache_full_temp_lock_covers_evicted_anchor_and_mirrors_on_release(
         self,
     ):

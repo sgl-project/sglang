@@ -106,7 +106,7 @@ impl SwaComponent {
                 let mut tail_len =
                     (self.sliding_window_size - n_swa).div_ceil(page_size) * page_size;
                 // A write-through-pending split emits an action the tree core
-                // cannot apply, so such a node loads whole.
+                // cannot apply, so such a node is charged and loads whole.
                 if tail_len >= host_len
                     || !(host_len - tail_len).is_multiple_of(page_size)
                     || cur.write_through_pending_id.is_some()

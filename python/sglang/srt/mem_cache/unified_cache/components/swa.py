@@ -392,7 +392,7 @@ class SWAComponent(TreeComponent):
                     * page_size
                 )
                 # A write-through-pending split emits an action the tree core
-                # cannot apply, so such a node loads whole.
+                # cannot apply, so such a node is charged and loads whole.
                 if (
                     tail_len >= host_len
                     or (host_len - tail_len) % page_size != 0

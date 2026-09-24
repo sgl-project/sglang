@@ -3339,6 +3339,8 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
     }
 
     /// Build the H->D load-back KV transfer plus per-component aux transfers.
+    /// Components may first split nodes on the load path (SWA trims to one window),
+    /// so this reshapes the tree and is not a dry-run sizing probe.
     pub fn build_load_back_spec(
         &mut self,
         node_id: NodeId,
