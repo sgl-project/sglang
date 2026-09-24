@@ -23,6 +23,7 @@ from typing import TYPE_CHECKING, Callable, List, NamedTuple, Optional
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.mem_cache.hicache_storage import (
     STORAGE_BATCH_SIZE,
     HiCacheStorageConfig,
@@ -41,6 +42,7 @@ from sglang.srt.layers.dp_attention import (
 )
 from sglang.srt.mem_cache.l2_transfer import L2Transfer, L2TransferEngine
 from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
+from sglang.srt.mem_cache.storage_circuit_breaker import StorageCircuitBreaker
 from sglang.srt.mem_cache.utils import get_storage_hash_str
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import get_device_module
@@ -333,6 +335,7 @@ class HiCacheController:
 
         # Dedicated stop event for storage background threads (prefetch/backup).
         self.storage_stop_event = threading.Event()
+        self._init_storage_fault_isolation()
 
         # Storage control queues, (re)created whenever the storage threads start.
         self.prefetch_buffer: Optional[Queue[PrefetchOperation]] = None
@@ -610,6 +613,8 @@ class HiCacheController:
                 self.page_get_func = self._page_get_zero_copy
                 self.page_set_func = self._page_set_zero_copy
 
+            # A newly attached backend starts with closed breakers.
+            self._init_storage_fault_isolation()
             # Ensure stop_event is clear before starting threads.
             self.storage_stop_event.clear()
             self._start_storage_threads()
@@ -995,6 +1000,24 @@ class HiCacheController:
         self.mem_pool_host.free(host_indices)
         return len(host_indices)
 
+    def _init_storage_fault_isolation(self) -> None:
+        failure_threshold = envs.SGLANG_HICACHE_STORAGE_BREAKER_FAILURES.get()
+        cooldown_s = envs.SGLANG_HICACHE_STORAGE_BREAKER_COOLDOWN_S.get()
+        self.storage_breakers = {
+            direction: StorageCircuitBreaker(direction, failure_threshold, cooldown_s)
+            for direction in ("read", "write")
+        }
+        self.storage_backup_backlog_limit = (
+            envs.SGLANG_HICACHE_STORAGE_BACKUP_BACKLOG_LIMIT.get()
+        )
+        self.num_storage_backups_shed = 0
+
+    def _storage_breaker(self, direction: str) -> StorageCircuitBreaker:
+        # Controllers built without __init__ (e.g. in unit tests) lack the state.
+        if "storage_breakers" not in self.__dict__:
+            self._init_storage_fault_isolation()
+        return self.storage_breakers[direction]
+
     def prefetch(
         self,
         request_id: str,
@@ -1088,6 +1111,8 @@ class HiCacheController:
             # prefetch_sync_queue) perform reduce on the results.  This is so tricky.
             if all_success and operation.is_terminated():
                 all_success = False
+            if all_success and not self._storage_breaker("read").allow():
+                all_success = False
             if all_success:
                 batch_hashes = operation.hash_value[i : i + STORAGE_BATCH_SIZE]
                 batch_host_indices = operation.host_indices[
@@ -1097,13 +1122,20 @@ class HiCacheController:
                 # Get one batch token, and update the completed_tokens if succeed
                 extra_info = HiCacheStorageExtraInfo(prefix_keys=prefix_keys)
 
-                hit_pages = self._page_transfer_kv_batch(
-                    operation,
-                    batch_hashes,
-                    batch_host_indices,
-                    extra_info,
-                    kv_derived_transfers,
-                )
+                try:
+                    hit_pages = self._page_transfer_kv_batch(
+                        operation,
+                        batch_hashes,
+                        batch_host_indices,
+                        extra_info,
+                        kv_derived_transfers,
+                    )
+                    self._storage_breaker("read").record_success()
+                except Exception as e:
+                    # Treat the batch as a miss and keep producing one ack per
+                    # batch, so peers are not stranded in the ack all-reduce.
+                    self._storage_breaker("read").record_failure("prefetch read", e)
+                    hit_pages = 0
                 # Check termination
                 if hit_pages != len(batch_hashes):
                     all_success = False
@@ -1166,7 +1198,15 @@ class HiCacheController:
                 operation = self.prefetch_buffer.get(block=True, timeout=1)
                 if operation is None:
                     continue
-                self._page_transfer(operation)
+                try:
+                    self._page_transfer(operation)
+                except Exception:
+                    # Storage errors are handled per batch in _page_transfer;
+                    # this only keeps the thread alive and the final ack coming.
+                    logger.exception(
+                        "HiCache prefetch transfer failed for req=%s.",
+                        operation.request_id,
+                    )
 
                 self.prefetch_sync_queue.put(
                     PrefetchAck(
@@ -1232,10 +1272,20 @@ class HiCacheController:
                 operation = self.prefetch_queue.get(block=True, timeout=1)
                 if operation is None:
                     continue
-                if operation.is_terminated():
+                read_breaker = self._storage_breaker("read")
+                if operation.is_terminated() or not read_breaker.allow():
                     hash_value, storage_hit_count = [], 0
                 else:
-                    hash_value, storage_hit_count = self._storage_hit_query(operation)
+                    try:
+                        hash_value, storage_hit_count = self._storage_hit_query(
+                            operation
+                        )
+                        read_breaker.record_success()
+                    except Exception as e:
+                        # Report zero hits but still join the all-reduce below,
+                        # so no peer rank is stranded in the collective.
+                        read_breaker.record_failure("hit query", e)
+                        hash_value, storage_hit_count = [], 0
                 storage_hit_count_tensor = torch.tensor(
                     storage_hit_count, dtype=torch.int
                 )
@@ -1309,6 +1359,42 @@ class HiCacheController:
                 prefix_keys = prefix_keys + batch_hashes
             operation.completed_tokens += self.page_size * len(batch_hashes)
 
+    def _guarded_page_backup(self, operation, count_short_write: bool = True) -> None:
+        """Run ``_page_backup`` without letting storage errors escape.
+
+        The write is skipped while the write breaker is open or the backup
+        backlog is over its limit; a skipped or failed write only loses the
+        L3 copy of those pages. The caller must ack the operation regardless.
+        Exceptions and short writes (backends report many I/O errors as a
+        failed result rather than an exception) both count as failures.
+        """
+        backlog_limit = getattr(self, "storage_backup_backlog_limit", 0)
+        if backlog_limit > 0 and self.backup_queue.qsize() >= backlog_limit:
+            self.num_storage_backups_shed += 1
+            if self.num_storage_backups_shed & (self.num_storage_backups_shed - 1) == 0:
+                logger.warning(
+                    "HiCache L3 backup backlog >= %d; skipped %d backups so far.",
+                    backlog_limit,
+                    self.num_storage_backups_shed,
+                )
+            return
+        write_breaker = self._storage_breaker("write")
+        if not write_breaker.allow():
+            return
+        try:
+            self._page_backup(operation)
+        except Exception as e:
+            write_breaker.record_failure("backup", e)
+            return
+        expected_tokens = len(operation.hash_value) * self.page_size
+        if count_short_write and operation.completed_tokens < expected_tokens:
+            write_breaker.record_failure(
+                "backup",
+                f"wrote {operation.completed_tokens}/{expected_tokens} tokens",
+            )
+        else:
+            write_breaker.record_success()
+
     def backup_thread_func(self):
         """
         Manage backup operations from host memory to storage backend.
@@ -1320,7 +1406,8 @@ class HiCacheController:
                     continue
 
                 if not self.backup_skip:
-                    self._page_backup(operation)
+                    self._guarded_page_backup(operation)
+                # Always ack: the ack is what unpins the host pages.
                 self.ack_backup_queue.put(operation)
 
             except Empty:
