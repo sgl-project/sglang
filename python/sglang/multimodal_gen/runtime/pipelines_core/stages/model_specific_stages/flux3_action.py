@@ -362,42 +362,6 @@ Predictor = Callable[[Samples, float], Samples]
 NUM_TRAIN_TIMESTEPS = 1000
 
 
-def _timeshift(alpha: float, t: torch.Tensor) -> torch.Tensor:
-    return alpha * t / (1.0 + (alpha - 1.0) * t)
-
-
-def euler(
-    samples: Samples, predict: Predictor, *, n_steps: int, shift: float
-) -> Samples:
-    timesteps = _timeshift(shift, torch.linspace(1.0, 0.0, n_steps + 1)).tolist()
-    for t_curr, t_prev in zip(timesteps[:-1], timesteps[1:]):
-        velocity = predict(samples, t_curr)
-        samples = {
-            k: (samples[k].float() + (t_prev - t_curr) * velocity[k].float()).to(
-                samples[k].dtype
-            )
-            for k in samples
-        }
-    return samples
-
-
-def make_cosmos_unipc_scheduler() -> FlowUniPCMultistepScheduler:
-    """The Cosmos UniPC solver of the reference: order 2, bh2, predict-x0.
-
-    The schedule shift is applied in ``set_timesteps`` only (``shift=1.0``
-    here), giving the reference grid ``linspace(0.999, 0, N + 1)`` shifted and
-    truncated to integer ticks.
-    """
-    return FlowUniPCMultistepScheduler(
-        solver_order=2,
-        solver_type="bh2",
-        predict_x0=True,
-        lower_order_final=True,
-        final_sigmas_type="zero",
-        shift=1.0,
-    )
-
-
 def cosmos_unipc(
     samples: Samples,
     predict: Predictor,
@@ -663,16 +627,13 @@ class Flux3ActionDenoisingStage(PipelineStage):
                 for k in order
             }
 
-        if cfg.sampler == "cosmos_unipc":
-            result = cosmos_unipc(
-                samples,
-                predict,
-                scheduler=self.scheduler,
-                n_steps=steps,
-                shift=cfg.sampler_shift,
-            )
-        else:
-            result = euler(samples, predict, n_steps=steps, shift=cfg.sampler_shift)
+        result = cosmos_unipc(
+            samples,
+            predict,
+            scheduler=self.scheduler,
+            n_steps=steps,
+            shift=cfg.sampler_shift,
+        )
         targets = result[cfg.action_modality][0].float() / cfg.action_scale
         actions = targets_to_actions(
             targets, state=observation.state.to(device), config=cfg

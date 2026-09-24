@@ -1,6 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
 
-import functools
 import json
 from types import SimpleNamespace
 
@@ -23,11 +22,12 @@ from sglang.multimodal_gen.runtime.entrypoints.action.protocol import (
     action_metadata,
     build_action_sampling_params,
 )
+from sglang.multimodal_gen.runtime.models.schedulers.scheduling_flow_unipc_multistep import (
+    FlowUniPCMultistepScheduler,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.flux3_action import (
     cosmos_unipc,
     denormalize,
-    euler,
-    make_cosmos_unipc_scheduler,
     normalize,
     pack_action,
     pack_video,
@@ -351,10 +351,22 @@ def test_position_ids_follow_the_10ms_clock():
 
 
 # ---------------------------------------------------------------- samplers
+def _unipc_scheduler() -> FlowUniPCMultistepScheduler:
+    # Same configuration as Flux3ActionPipeline.load_modules.
+    return FlowUniPCMultistepScheduler(
+        solver_order=2,
+        solver_type="bh2",
+        predict_x0=True,
+        lower_order_final=True,
+        final_sigmas_type="zero",
+        shift=1.0,
+    )
+
+
 def test_cosmos_unipc_feeds_reference_ticks_and_reuses_the_scheduler():
     """DROID recipe (4 steps, shift 5): the model sees ticks 999, 937, 833, 624,
     and the pipeline's scheduler module is not consumed by a request."""
-    scheduler = make_cosmos_unipc_scheduler()
+    scheduler = _unipc_scheduler()
     for _ in range(2):
         seen = []
         cosmos_unipc(
@@ -370,18 +382,7 @@ def test_cosmos_unipc_feeds_reference_ticks_and_reuses_the_scheduler():
         assert seen == [999, 937, 833, 624]
 
 
-@pytest.mark.parametrize(
-    "sampler, sigma_max",
-    # UniPC starts at the shifted 0.999: 5 * 0.999 / (1 + 4 * 0.999)
-    [
-        (
-            functools.partial(cosmos_unipc, scheduler=make_cosmos_unipc_scheduler()),
-            5 * 0.999 / (1 + 4 * 0.999),
-        ),
-        (euler, 1.0),
-    ],
-)
-def test_samplers_recover_x0_on_a_straight_flow(sampler, sigma_max):
+def test_cosmos_unipc_recovers_x0_on_a_straight_flow():
     """Exact velocities on a straight flow must land on x0 (solver bookkeeping is consistent)."""
     generator = torch.Generator().manual_seed(0)
     x0 = {
@@ -389,10 +390,13 @@ def test_samplers_recover_x0_on_a_straight_flow(sampler, sigma_max):
         "b": torch.randn(1, 3, 8, generator=generator),
     }
     eps = {k: torch.randn(v.shape, generator=generator) for k, v in x0.items()}
+    # UniPC starts at the shifted 0.999: 5 * 0.999 / (1 + 4 * 0.999)
+    sigma_max = 5 * 0.999 / (1 + 4 * 0.999)
     start = {k: sigma_max * eps[k] + (1 - sigma_max) * x0[k] for k in x0}
-    result = sampler(
+    result = cosmos_unipc(
         start,
         lambda samples, t: {k: eps[k] - x0[k] for k in samples},
+        scheduler=_unipc_scheduler(),
         n_steps=4,
         shift=5.0,
     )

@@ -29,6 +29,9 @@ from sglang.multimodal_gen.runtime.models.encoders.flux3_text_encoder import (
     Flux3TextEncoder,
     parse_weight_spec,
 )
+from sglang.multimodal_gen.runtime.models.schedulers.scheduling_flow_unipc_multistep import (
+    FlowUniPCMultistepScheduler,
+)
 from sglang.multimodal_gen.runtime.models.vaes.flux3_video_vae import Flux3VideoVAE
 from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import (
     ComposedPipelineBase,
@@ -37,7 +40,6 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.f
     Flux3ActionConditioningStage,
     Flux3ActionDenoisingStage,
     Flux3ActionPreprocessStage,
-    make_cosmos_unipc_scheduler,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.vla import (
     VLAActionPostprocessStage,
@@ -94,7 +96,16 @@ class Flux3ActionPipeline(ComposedPipelineBase):
         for name, module in modules.items():
             module.requires_grad_(False).eval()
             self.memory_usages[name] = get_memory_usage_of_component(module)
-        modules["scheduler"] = make_cosmos_unipc_scheduler()
+        # Cosmos UniPC of the reference; the policy's shift is applied per request
+        # in set_timesteps, so the scheduler itself is unshifted.
+        modules["scheduler"] = FlowUniPCMultistepScheduler(
+            solver_order=2,
+            solver_type="bh2",
+            predict_x0=True,
+            lower_order_final=True,
+            final_sigmas_type="zero",
+            shift=1.0,
+        )
         return modules
 
     @staticmethod
