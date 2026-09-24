@@ -47,6 +47,7 @@ class DeferringLayer(nn.Module):
         )
         self.layer_communicator.should_defer_ffn_reduction = lambda batch: defer
         self.layer_communicator._reduce_scatter_for_next_layer = lambda batch: None
+        self.layer_communicator._scatter_for_next_layer = lambda batch: None
         self.layer_communicator.should_use_reduce_scatter = lambda batch: False
         self.layer_communicator.postprocess_layer = lambda hidden, residual, batch: (
             all_reduce(hidden),

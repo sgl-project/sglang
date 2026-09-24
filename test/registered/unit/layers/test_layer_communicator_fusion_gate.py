@@ -13,7 +13,7 @@ from sglang.srt.layers.moe import (
     post_experts_all_reduce,
 )
 from sglang.srt.layers.moe import utils as moe_utils
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_forward, get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -298,14 +298,25 @@ class TestDeferFfnReduction(CustomTestCase):
         shared_expert_tp1=False,
         lora=False,
         tp_group=True,
+        global_tokens=8,
+        pair_fn=comm.CommunicateSummableTensorPairFn._scatter_hidden_states,
+        step=comm._redistribute_output,
+        sp_active=False,
     ):
         communicator = _fake_communicator()
         communicator.is_last_layer = is_last_layer
         communicator.should_use_reduce_scatter = lambda forward_batch: reduce_scatter
+        communicator._communicate_summable_tensor_pair_fn = pair_fn
+        communicator._sp_variant = object() if sp_active else None
+        communicator.allow_reduce_scatter = True
+        communicator.layer_scatter_modes.is_layer_sparse = True
         forward_batch = types.SimpleNamespace(
-            input_ids=types.SimpleNamespace(shape=(batch_size,))
+            input_ids=types.SimpleNamespace(shape=(batch_size,)),
+            global_dp_buffer_len=global_tokens,
         )
         with (
+            patch.object(comm, "_output_to_local_tokens_step", return_value=step),
+            get_forward().scoped(sp_active=sp_active),
             patch.object(comm, "is_enable_moe_cp_allgather", return_value=False),
             patch.object(comm, "apply_flashinfer_allreduce_fusion", return_value=fused),
             patch.object(comm, "_use_aiter", False),
@@ -359,7 +370,6 @@ class TestDeferFfnReduction(CustomTestCase):
         self,
     ):
         for condition in (
-            dict(dp_attention=True),
             dict(a2a_none=False),
             dict(output_complete=True),
             dict(quant_communications=True),
@@ -372,6 +382,38 @@ class TestDeferFfnReduction(CustomTestCase):
         ):
             with self.subTest(**condition):
                 self.assertFalse(self._should_defer(**condition))
+
+
+class TestDeferFfnReductionUnderAttentionDp(CustomTestCase):
+    """Under attention DP the next layer's input runs the all-reduce and then the
+    scatter back to this rank's tokens that postprocess would have run."""
+
+    _should_defer = TestDeferFfnReduction._should_defer
+
+    def test_defers_when_postprocess_would_only_scatter(self):
+        self.assertTrue(self._should_defer(dp_attention=True))
+
+    def test_every_rank_decides_from_all_ranks_tokens(self):
+        self.assertTrue(self._should_defer(dp_attention=True, batch_size=0))
+        self.assertFalse(self._should_defer(dp_attention=True, global_tokens=0))
+
+    def test_keeps_what_the_next_layer_input_cannot_run(self):
+        for name, condition in (
+            ("reduce-scatter", dict(step=comm._reduce_and_redistribute_output_varlen)),
+            (
+                "MAX_LEN reduce-scatter",
+                dict(step=comm._reduce_and_redistribute_output_max_len),
+            ),
+            (
+                "other layout change",
+                dict(
+                    pair_fn=comm.CommunicateSummableTensorPairFn._scatter_hidden_states_moe
+                ),
+            ),
+            ("LayerNorm SP", dict(sp_active=True)),
+        ):
+            with self.subTest(name):
+                self.assertFalse(self._should_defer(dp_attention=True, **condition))
 
 
 class TestDeferredReductionGroup(CustomTestCase):

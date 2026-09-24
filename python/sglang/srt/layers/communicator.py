@@ -673,16 +673,21 @@ def _deferred_reduction_runs_on_the_tp_group() -> bool:
     return group is parallel.tp_group
 
 
+def _ffn_has_tokens(forward_batch: ForwardBatch) -> bool:
+    if is_dp_attention_enabled():
+        # The FFN runs on every DP rank's tokens, so every rank decides alike.
+        return (getattr(forward_batch, "global_dp_buffer_len", None) or 0) > 0
+    return _batch_size(forward_batch) > 0
+
+
 def _unfused_completion_matches_the_ffn(forward_batch: ForwardBatch) -> bool:
     """Whether deferred_post_experts_all_reduce is the all-reduce the FFN would
     have run itself: one full-precision sum over the same TP group, on an output
-    that is a plain partial sum, with no attention DP layout to restore. The
-    output is not a plain partial sum when the MoE combine already summed it, a
-    replicated shared expert is added after the reduction, or LoRA-B runs on
-    the unreduced activations."""
+    that is a plain partial sum. The output is not a plain partial sum when the
+    MoE combine already summed it, a replicated shared expert is added after the
+    reduction, or LoRA-B runs on the unreduced activations."""
     return (
-        _batch_size(forward_batch) > 0
-        and not is_dp_attention_enabled()
+        _ffn_has_tokens(forward_batch)
         and get_moe_a2a_backend().is_none()
         and not post_experts_output_is_complete(is_tp_path=True)
         and not get_exec().comm.enable_quant_communications
@@ -1146,7 +1151,40 @@ class LayerCommunicator:
             and self._ffn_sum_can_move_to_next_layer()
             and _unfused_completion_matches_the_ffn(forward_batch)
             and not self.should_use_reduce_scatter(forward_batch)
+            and self._next_layer_input_can_restore_the_layout(forward_batch)
         )
+
+    def _next_layer_input_can_restore_the_layout(
+        self, forward_batch: ForwardBatch
+    ) -> bool:
+        """Whether the next layer's input can also run what postprocess would
+        after the FFN's own all-reduce: under attention DP, the scatter back to
+        this rank's tokens."""
+        if not is_dp_attention_enabled():
+            return True
+        return (
+            self._communicate_summable_tensor_pair_fn
+            is CommunicateSummableTensorPairFn._scatter_hidden_states
+            and not (self._sp_variant is not None and get_forward().sp_active)
+            and _output_to_local_tokens_step(
+                forward_batch,
+                allow_reduce_scatter=self.allow_reduce_scatter,
+                is_layer_sparse=self.layer_scatter_modes.is_layer_sparse,
+            )
+            is _redistribute_output
+        )
+
+    def _scatter_for_next_layer(
+        self, forward_batch: ForwardBatch
+    ) -> Optional[Callable[[torch.Tensor], torch.Tensor]]:
+        """Under attention DP, the all-reduce and the scatter back to this rank's
+        tokens that the next layer's input runs on a sum this layer's FFN left."""
+        if (
+            self._communicate_summable_tensor_pair_fn
+            is not CommunicateSummableTensorPairFn._scatter_hidden_states
+        ):
+            return None
+        return partial(_all_reduce_then_to_local_tokens, forward_batch)
 
 
 # MOE_FULL gathers across the MoE-CP group, which spans every CP rank when CP is on.
@@ -1222,7 +1260,15 @@ class FfnExit:
             assert self.defer_moe_finalize, "unrequested deferred MoE handoff"
             return hidden_states, residual
         if self.fuse_mlp_allreduce:
-            return UnreducedOutput(hidden_states), residual
+            return (
+                UnreducedOutput(
+                    hidden_states,
+                    reduce_and_redistribute=self.communicator._scatter_for_next_layer(
+                        self.forward_batch
+                    ),
+                ),
+                residual,
+            )
         reduce_and_redistribute = self.communicator._reduce_scatter_for_next_layer(
             self.forward_batch
         )
@@ -1722,6 +1768,16 @@ def _to_local_tokens(
     local_hidden_states = get_local_dp_buffer(_dp_scatter_group())
     step(local_hidden_states, hidden_states, forward_batch)
     return local_hidden_states
+
+
+def _all_reduce_then_to_local_tokens(
+    forward_batch: ForwardBatch, hidden_states: torch.Tensor
+) -> torch.Tensor:
+    return _to_local_tokens(
+        _redistribute_output,
+        forward_batch,
+        deferred_post_experts_all_reduce(hidden_states),
+    )
 
 
 class CommunicateSummableTensorPairFn:
