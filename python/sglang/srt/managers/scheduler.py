@@ -498,6 +498,9 @@ class Scheduler(
         self.enable_hierarchical_cache = get_memory().enable_hierarchical_cache
         self.enable_session_radix_cache = get_memory().enable_session_radix_cache
         self.enable_hicache_storage = get_memory().hicache_storage_backend is not None
+        self.enable_flexkv = bool(
+            get_memory().enable_flexkv or get_memory().radix_cache_backend == "flexkv"
+        )
         self.enable_unified_cache_external_linker = (
             get_memory().enable_unified_cache_external_linker
         )
@@ -3157,6 +3160,10 @@ class Scheduler(
                     cache_salt=req.cache_salt,
                     storage_hit_end=storage_hit_end,
                 )
+        elif self.enable_flexkv:
+            logger.info(f"[FlexKV] sglang startprefetch: request={req.rid}")
+            # The adapter starts either legacy or chunked prefetch from its config.
+            self.tree_cache.prefetch_request(req)
 
     def _process_storage_prefetch_retries(self):
         """Issue due L3 attempts in the current waiting-queue order."""
@@ -3609,7 +3616,7 @@ class Scheduler(
         # decisions (_should_defer_prefill) or ranks enter different collectives.
         if (
             self.enable_hierarchical_cache
-            or get_memory().enable_flexkv
+            or self.enable_flexkv
             or self.enable_unified_cache_external_linker
         ):
             self.tree_cache.check_hicache_events()
@@ -3902,7 +3909,9 @@ class Scheduler(
             prefill_tile_block_m=prefill_tile_block_m,
         )
 
-        if self.chunked_req is not None:
+        if self.chunked_req is not None and not self.tree_cache.has_uncommitted_restore(
+            self.chunked_req
+        ):
             self.chunked_req.init_next_round_input()
             adder.chunked_req_limit = self.policy.shortest_prefill_chunk_limit(
                 self.chunked_req,
@@ -3931,6 +3940,13 @@ class Scheduler(
         buffer_pipeline = self.tree_cache.buffer_pipeline
         # Get requests from the waiting queue to a new prefill batch
         for req in self.waiting_queue:
+            # A FlexKV restore owns request-local GPU slots until the previous
+            # batch commits them to the radix cache. Do not rematch the request
+            # in that window: match_prefix would otherwise replace the only
+            # request-side reference before cache completion.
+            if self.tree_cache.has_uncommitted_restore(req):
+                continue
+
             if self.enable_lora and not self.can_schedule_lora_req(req, running_loras):
                 continue
 
@@ -3956,7 +3972,7 @@ class Scheduler(
                 ):
                     break
 
-            if self.enable_hicache_storage:
+            if self.enable_hicache_storage or self.enable_flexkv:
                 prefetch_done = self.tree_cache.check_prefetch_progress(
                     req.cache_request_handle
                 )
@@ -3976,6 +3992,11 @@ class Scheduler(
                     req.host_hit_is_storage = False
 
             req.init_next_round_input(self.tree_cache)
+            defer_restore = getattr(
+                self.tree_cache, "should_defer_shared_restore", None
+            )
+            if defer_restore is not None and defer_restore(req):
+                continue
             if self.enable_hicache_storage and (
                 self._prefetch_after_device_hit_loss(req)
             ):
@@ -3999,9 +4020,11 @@ class Scheduler(
                 if res == AddReqResult.NO_TOKEN:
                     if (
                         self.enable_hierarchical_cache
+                        or self.enable_flexkv
                         or self.enable_unified_cache_external_linker
                     ):
-                        # Set batch_is_full after making sure there are requests that can be served
+                        # An idle FlexKV batch must retry when host-cache pressure
+                        # clears; no running decode can reset batch_is_full for it.
                         running_batch.batch_is_full = len(adder.can_run_list) > 0 or (
                             not running_batch.is_empty()
                         )
@@ -4013,6 +4036,15 @@ class Scheduler(
                 # lifecycle and freeing them here causes double-free.
                 added = len(adder.can_run_list) > 0 and req is adder.can_run_list[-1]
                 if not added:
+                    # A successful storage restore must be followed by batch
+                    # admission in this same pass. Freeing a layerwise restore
+                    # here would race its asynchronous H2D writer, so fail loud
+                    # if a future admission check violates that ordering.
+                    if self.tree_cache.has_uncommitted_restore(req):
+                        raise RuntimeError(
+                            "Request was rejected after storage load-back: "
+                            f"rid={req.rid}"
+                        )
                     # init_next_round_input() may stage deferred Mamba COW/clear
                     # metadata before add_one_req() rejects the request.
                     req.kv.mamba_cow_src_index = None

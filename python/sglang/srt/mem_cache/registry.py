@@ -100,6 +100,14 @@ def default_radix_cache_factory(ctx: TreeCacheBuildContext) -> BasePrefixCache:
 
         return SWAChunkCache(params)
 
+    if get_memory().enable_flexkv:
+        # FlexKV supplies its own host-tier path and composes with the unified
+        # radix cache for SWA models. Select it before the built-in hybrid
+        # cache branches so --enable-flexkv works for DeepSeek V4 as well.
+        from sglang.srt.mem_cache.storage.flexkv import _flexkv_factory
+
+        return _flexkv_factory(ctx)
+
     if get_memory().enable_unified_cache_external_linker:
         return _create_unified_radix_cache(ctx, server_args, params)
 
@@ -120,20 +128,6 @@ def default_radix_cache_factory(ctx: TreeCacheBuildContext) -> BasePrefixCache:
             rank=ctx.tp_rank,
             tp_group=ctx.tp_group,
         )
-
-    if get_memory().enable_flexkv:
-        # Importing the package side-effect registers the explicit
-        # ``--radix-cache-backend=flexkv`` factory; we then call the
-        # factory directly so --enable-flexkv stands on its own.
-        import os
-
-        from sglang.srt.mem_cache.storage.flexkv import _flexkv_factory
-
-        # Honor a CLI --flexkv-config-file by forwarding it via the env
-        # var that FlexKV's config loader actually reads.
-        if get_memory().flexkv_config_file and not os.environ.get("FLEXKV_CONFIG_PATH"):
-            os.environ["FLEXKV_CONFIG_PATH"] = get_memory().flexkv_config_file
-        return _flexkv_factory(ctx)
 
     return _create_unified_radix_cache(ctx, server_args, params)
 
@@ -220,7 +214,14 @@ def _create_unified_radix_cache(
 def create_tree_cache(ctx: TreeCacheBuildContext) -> BasePrefixCache:
     """Route to the matching factory to construct Radix Cache."""
     name = get_memory().radix_cache_backend
-    if name:
+    if name == "flexkv":
+        # This built-in optional backend is imported lazily, so its explicit
+        # spelling must work without an unrelated earlier package import.
+        from sglang.srt.mem_cache.storage.flexkv import _flexkv_factory
+
+        cache = _flexkv_factory(ctx)
+        source = "registered('flexkv')"
+    elif name:
         factory = get_radix_cache_factory(name)
         if factory is None:
             raise ValueError(

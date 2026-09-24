@@ -3329,7 +3329,19 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         # Ask schedulers to release resources in userspace and exit (see
         # ShutdownReq), then wait for them before hard-killing the rest.
         self._dispatch_to_scheduler(ShutdownReq())
-        deadline = time.monotonic() + _SCHEDULER_EXIT_TIMEOUT_SECS
+        # Large FlexKV host pools need time to drain transfers and unpin memory.
+        wait_s = float(
+            os.getenv(
+                "SGLANG_SCHEDULER_SHUTDOWN_WAIT_S",
+                "1200"
+                if (
+                    self.server_args.enable_flexkv
+                    or self.server_args.radix_cache_backend == "flexkv"
+                )
+                else str(_SCHEDULER_EXIT_TIMEOUT_SECS),
+            )
+        )
+        deadline = time.monotonic() + wait_s
         while time.monotonic() < deadline and collect_scheduler_processes():
             time.sleep(0.1)
         stragglers = [proc.pid for proc in collect_scheduler_processes()]
@@ -3337,7 +3349,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             # SIGKILL here lands mid-release,
             # which is how GPU memory survives a shutdown. Name the pids.
             logger.warning(
-                f"Schedulers still alive {_SCHEDULER_EXIT_TIMEOUT_SECS}s after "
+                f"Schedulers still alive {wait_s}s after "
                 f"ShutdownReq, killing them before they released: {stragglers}"
             )
         kill_process_tree(os.getpid(), include_parent=False, wait_timeout=60)

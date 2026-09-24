@@ -36,9 +36,11 @@ def _make_ctx(
     backend=None,
     enable_streaming=False,
     enable_lmcache=False,
+    enable_flexkv=False,
     is_hybrid_swa=False,
     is_hybrid_ssm=False,
     is_dsa=False,
+    is_eagle=False,
     enable_hierarchical_cache=False,
     disable_radix_cache=False,
     effective_chunked_prefill_size=None,
@@ -52,12 +54,12 @@ def _make_ctx(
         radix_cache_backend=backend,
         enable_streaming_session=enable_streaming,
         enable_lmcache=enable_lmcache,
-        enable_flexkv=False,
+        enable_flexkv=enable_flexkv,
         enable_unified_cache_external_linker=False,
     )
     return TreeCacheBuildContext(
         server_args=server_args,
-        params=MagicMock(),
+        params=MagicMock(is_eagle=is_eagle),
         is_hybrid_swa=is_hybrid_swa,
         is_hybrid_ssm=is_hybrid_ssm,
         is_dsa=is_dsa,
@@ -113,6 +115,68 @@ class TestRegisterRadixCacheBackend(_RegistryIsolationMixin, CustomTestCase):
 
 
 class TestCreateTreeCacheRouting(_RegistryIsolationMixin, CustomTestCase):
+    def test_flexkv_rejects_eagle_before_loading_optional_connector(self):
+        for backend in (None, "flexkv"):
+            for is_hybrid_swa in (False, True):
+                with self.subTest(backend=backend, is_hybrid_swa=is_hybrid_swa):
+                    ctx = _make_ctx(
+                        self,
+                        backend=backend,
+                        enable_flexkv=backend is None,
+                        is_hybrid_swa=is_hybrid_swa,
+                        is_eagle=True,
+                    )
+                    # An unavailable optional package must not hide the key
+                    # contract error or trigger connector/GPU initialization.
+                    with patch.dict(
+                        "sys.modules", {"flexkv.integration.sglang.connector": None}
+                    ):
+                        with self.assertRaisesRegex(ValueError, "EAGLE.*bigram"):
+                            create_tree_cache(ctx)
+
+    def test_flexkv_non_eagle_still_loads_optional_connector(self):
+        for backend in (None, "flexkv"):
+            for is_hybrid_swa in (False, True):
+                with self.subTest(backend=backend, is_hybrid_swa=is_hybrid_swa):
+                    ctx = _make_ctx(
+                        self,
+                        backend=backend,
+                        enable_flexkv=backend is None,
+                        is_hybrid_swa=is_hybrid_swa,
+                    )
+                    with patch.dict(
+                        "sys.modules",
+                        {
+                            "flexkv": MagicMock(),
+                            "flexkv.integration.sglang.connector": None,
+                        },
+                    ):
+                        with self.assertRaisesRegex(RuntimeError, "incompatible"):
+                            create_tree_cache(ctx)
+
+    def test_flexkv_rejects_conflicting_cache_lifecycles_before_initialization(self):
+        from sglang.srt.mem_cache.storage.flexkv import _flexkv_factory
+
+        for options, message in (
+            ({"enable_streaming": True}, "enable-streaming-session"),
+            ({"enable_hierarchical_cache": True}, "enable-hierarchical-cache"),
+        ):
+            with self.subTest(options=options):
+                with self.assertRaisesRegex(ValueError, message):
+                    _flexkv_factory(_make_ctx(self, **options))
+
+    def test_explicit_flexkv_backend_is_loaded_without_prior_registration(self):
+        _RADIX_CACHE_REGISTRY.pop("flexkv", None)
+        ctx = _make_ctx(self, backend="flexkv")
+        cache = MagicMock()
+        with patch(
+            "sglang.srt.mem_cache.storage.flexkv._flexkv_factory", return_value=cache
+        ) as factory:
+            _RADIX_CACHE_REGISTRY.pop("flexkv", None)
+            result = create_tree_cache(ctx)
+        factory.assert_called_once_with(ctx)
+        self.assertIs(result, cache)
+
     def test_dispatches_to_registered_factory(self):
         cache = MagicMock()
         cache.supports_streaming_session.return_value = True
@@ -231,6 +295,19 @@ class TestDefaultRadixCacheFactory(CustomTestCase):
             result = default_radix_cache_factory(ctx)
             fake_radix.UnifiedRadixCache.assert_called_once_with(ctx.params)
             self.assertIs(result, fake_radix.UnifiedRadixCache.return_value)
+
+    def test_flexkv_selected_before_hybrid_swa_cache(self):
+        ctx = _make_ctx(self, enable_flexkv=True, is_hybrid_swa=True)
+        fake_flexkv = MagicMock()
+        fake_flexkv._flexkv_factory.return_value = MagicMock(name="flexkv_cache")
+        with patch.dict(
+            "sys.modules",
+            {"sglang.srt.mem_cache.storage.flexkv": fake_flexkv},
+        ):
+            result = default_radix_cache_factory(ctx)
+
+        fake_flexkv._flexkv_factory.assert_called_once_with(ctx)
+        self.assertIs(result, fake_flexkv._flexkv_factory.return_value)
 
     def test_unified_radix_cache_when_hierarchical(self):
         ctx = _make_ctx(self, enable_hierarchical_cache=True)

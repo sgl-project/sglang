@@ -274,6 +274,8 @@ class SchedulePolicy:
             and get_disagg().disaggregation_mode != "decode"
         ):
             for r in waiting_queue:
+                if self.tree_cache.has_uncommitted_restore(r):
+                    continue
                 match_prefix_for_req(self.tree_cache, r, include_req=True)
 
         if self.policy == CacheAgnosticPolicy.FCFS:
@@ -380,6 +382,10 @@ class SchedulePolicy:
         self.waiting_queue_radix_tree.reset()
 
         for r in waiting_queue:
+            # Priority matching precedes admission and also rewrites prefix_indices.
+            # Preserve request-owned restore slots until normal cache completion.
+            if self.tree_cache.has_uncommitted_restore(r):
+                continue
             prefix_ids = r.origin_input_ids + r.output_ids
             extra_key = r.extra_key
             cache_salt = r.cache_salt
@@ -1372,7 +1378,9 @@ class PrefillAdder:
                     if isinstance(admission, AddReqResult):
                         return admission
                 req.prefix_indices = torch.cat([req.prefix_indices, new_indices])
-                req.kv.cache_protected_len = len(req.prefix_indices)
+                # FlexKV hybrid/IP slots remain request-owned until cache commit.
+                if not getattr(req, "_flexkv_uncached_restore", False):
+                    req.kv.cache_protected_len = len(req.prefix_indices)
 
             # Successful materialization has no remaining admission gates.
             self._commit_prefill_admission(req, admission, mamba_gap_reserve)

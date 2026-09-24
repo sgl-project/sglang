@@ -196,13 +196,16 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             (swa_capacity, self.swa_available_size()),
         )
 
-    def evict_to_free_tokens(self, tree_cache, num_tokens: int) -> None:
+    def evict_to_free_tokens(
+        self, tree_cache, num_tokens: int, *, swa_num_tokens: int | None = None
+    ) -> None:
         from sglang.srt.mem_cache.base_prefix_cache import EvictParams
 
         if tree_cache is None or tree_cache.is_chunk_cache():
             return
         full_shortfall = max(0, num_tokens - self.full_available_size())
-        swa_shortfall = max(0, num_tokens - self.swa_available_size())
+        required_swa = num_tokens if swa_num_tokens is None else swa_num_tokens
+        swa_shortfall = max(0, required_swa - self.swa_available_size())
         if full_shortfall or swa_shortfall:
             tree_cache.evict_for_alloc(
                 EvictParams(num_tokens=full_shortfall, swa_num_tokens=swa_shortfall)
