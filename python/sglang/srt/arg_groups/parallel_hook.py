@@ -329,6 +329,36 @@ def handle_dwdp(server_args: Any):
         "DWDP's prefetch event protocol does not support two-batch overlap"
     )
 
+    if cfg.device == "npu":
+        if cfg.nnodes != 1:
+            raise ValueError("NPU DWDP requires a single host (--nnodes 1) for ACL IPC")
+        if cfg.quantization is not None:
+            raise ValueError(
+                "NPU DWDP currently supports unquantized BF16/FP16 MoE only"
+            )
+        if cfg.enable_lora or cfg.enable_memory_saver or cfg.cpu_offload_gb:
+            raise ValueError(
+                "NPU DWDP requires immutable device-resident weights; "
+                "LoRA, memory saver and CPU offload are not supported"
+            )
+        if cfg.enable_pdmux:
+            raise ValueError("NPU DWDP does not support PDMux layer-split execution")
+        graph_config = cfg.cuda_graph_config
+        if hasattr(graph_config, "to_dict"):
+            graph_config = graph_config.to_dict()
+        graph_config = graph_config or {}
+        for phase in (Phase.DECODE, Phase.PREFILL):
+            explicit_backend = getattr(cfg, f"cuda_graph_backend_{phase}")
+            configured_backend = graph_config.get(phase, {}).get("backend")
+            if any(
+                backend not in (None, Backend.DISABLED)
+                for backend in (explicit_backend, configured_backend)
+            ):
+                raise ValueError("NPU DWDP does not support explicit graph capture")
+        declare_resolution(
+            server_args, "_handle_dwdp", disable_shared_experts_fusion=True
+        )
+
     if cfg.disaggregation_mode == "null":
         logger.warning(
             "DWDP with --disaggregation-mode null: decode steps re-fetch all "

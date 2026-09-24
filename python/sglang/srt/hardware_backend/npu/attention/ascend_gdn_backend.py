@@ -314,9 +314,29 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
             ).contiguous()
             g, beta = fused_gdn_gating(layer.A_log, a, b, layer.dt_bias)
 
-            core_attn_out, last_recurrent_state, h = self.chunk_gdn(
-                query, key, value, g, beta, ssm_states[cache_indices], query_start_loc
-            )
+            if hasattr(torch.ops.npu, "chunk_gated_delta_rule"):
+                core_attn_out, last_recurrent_state, h = self.chunk_gdn(
+                    query,
+                    key,
+                    value,
+                    g,
+                    beta,
+                    ssm_states[cache_indices],
+                    query_start_loc,
+                )
+            else:
+                # Older torch-npu/CANN builds do not register the native op.
+                # Keep the existing NPU Triton dispatcher usable on those builds.
+                core_attn_out, last_recurrent_state, h = self.kernel_dispatcher.extend(
+                    q=query.unsqueeze(0),
+                    k=key.unsqueeze(0),
+                    v=value.unsqueeze(0),
+                    g=g,
+                    beta=beta,
+                    ssm_states=ssm_states,
+                    cache_indices=cache_indices,
+                    query_start_loc=query_start_loc,
+                )
 
             if last_recurrent_state is not None:
                 last_recurrent_state = last_recurrent_state.to(
