@@ -4,15 +4,64 @@
 from __future__ import annotations
 
 import logging
+import math
 from typing import Any
 
 from sglang.srt.arg_groups.overrides import (
     declare_resolution,
+    model_config_of,
     resolving_view,
     use_mla_backend,
 )
+from sglang.srt.runtime_context import get_platform
 
 logger = logging.getLogger(__name__)
+
+
+def _supports_hicache_mamba_size(server_args: Any) -> bool:
+    """Keep the initial hardware/model scope separate from pool sizing."""
+    if not get_platform().is_hip:
+        return False
+
+    import torch
+
+    from sglang.srt.configs.model_config import is_qwen3_5
+
+    # The model restriction can be relaxed after other hybrid models are tested.
+    if not is_qwen3_5(model_config_of(server_args).hf_config):
+        return False
+    arch = torch.cuda.get_device_properties(0).gcnArchName.split(":", 1)[0]
+    return arch == "gfx950"
+
+
+def _validate_hicache_mamba_size(server_args: Any) -> None:
+    cfg = resolving_view(server_args)
+    size = cfg.hicache_mamba_size
+    if not math.isfinite(size) or size < 0:
+        raise ValueError("--hicache-mamba-size must be finite and non-negative.")
+    if size == 0:
+        return
+    if not cfg.enable_hierarchical_cache:
+        raise ValueError("--hicache-mamba-size requires --enable-hierarchical-cache.")
+    if cfg.hicache_size > 0:
+        raise ValueError(
+            "--hicache-mamba-size cannot be combined with --hicache-size; "
+            "use --hicache-ratio to size the KV host pool independently."
+        )
+    if cfg.hicache_host_memory_fraction is not None:
+        raise ValueError(
+            "--hicache-mamba-size requires an explicit --hicache-ratio; "
+            "automatic host-memory sizing does not support this override."
+        )
+    if cfg.hicache_host_memory_mode != "cache":
+        raise ValueError(
+            "--hicache-mamba-size requires --hicache-host-memory-mode cache."
+        )
+    if not _supports_hicache_mamba_size(server_args):
+        raise ValueError(
+            "--hicache-mamba-size is currently supported only for Qwen3.5 "
+            "on AMD gfx950."
+        )
 
 
 def handle_hicache(server_args: Any):
@@ -23,6 +72,7 @@ def handle_hicache(server_args: Any):
     2) Storage <-> layout compatibility (may rewrite layout).
     """
     cfg = resolving_view(server_args)
+    _validate_hicache_mamba_size(server_args)
     if cfg.enable_linker_mla_dedup and (
         not cfg.enable_unified_cache_external_linker
         or cfg.unified_cache_external_linker_backend != "mooncake"

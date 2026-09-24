@@ -1,8 +1,11 @@
 """Unit tests for hybrid HiCache pool assembly."""
 
 import unittest
+from functools import partial
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
+
+import torch
 
 from sglang.srt.mem_cache.base_prefix_cache import EvictParams
 from sglang.srt.mem_cache.hybrid_cache import hybrid_pool_assembler
@@ -97,6 +100,84 @@ class TestSplitHicacheSize(CustomTestCase):
         )
         self.assertEqual(shares, (55.0, 25.0, 20.0))  # proportional to device KV bytes
         self.assertEqual(sum(shares), 100)  # total budget preserved, not doubled
+
+
+class TestHostMambaSize(CustomTestCase):
+    def test_override_changes_only_mamba_host_capacity(self):
+        from sglang.srt.mem_cache.cache_init_params import CacheInitParams
+        from sglang.srt.mem_cache.hicache_storage import PoolName
+        from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
+        from sglang.srt.mem_cache.pool_host.base import host_memory_budget_scope
+        from sglang.srt.mem_cache.pool_host.mamba import MambaPoolHost
+        from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
+        from sglang.srt.runtime_context import get_context
+
+        kv = MHATokenToKVPool(
+            size=8,
+            page_size=1,
+            dtype=torch.float32,
+            head_num=1,
+            head_dim=4,
+            layer_num=1,
+            device="cpu",
+            enable_memory_saver=False,
+        )
+        # One state is 24 bytes: four float32 recurrent values and two conv values.
+        mamba = SimpleNamespace(
+            size=4,
+            device="cpu",
+            num_mamba_layers=1,
+            mamba_cache=SimpleNamespace(
+                temporal=torch.zeros((1, 4, 2, 2)),
+                conv=[torch.zeros((1, 4, 2))],
+            ),
+        )
+        params = CacheInitParams(
+            disable=False,
+            req_to_token_pool=SimpleNamespace(mamba_allocator=MagicMock()),
+            token_to_kv_pool_allocator=MagicMock(),
+            page_size=1,
+        )
+        for size_gb, expected_states in ((0.0, 7), (0.000001, 42)):
+            with (
+                self.subTest(size_gb=size_gb),
+                get_context().override_server_args(
+                    enable_hierarchical_cache=True,
+                    hicache_ratio=1.5,
+                    hicache_mamba_size=size_gb,
+                    hicache_mem_layout="page_first",
+                ),
+                host_memory_budget_scope(4096),
+                patch.object(
+                    hybrid_pool_assembler,
+                    "get_mha_host_pool_cls",
+                    return_value=partial(MHATokenToKVPoolHost, pin_memory=False),
+                ),
+                patch.object(
+                    hybrid_pool_assembler,
+                    "MambaPoolHost",
+                    partial(MambaPoolHost, pin_memory=False),
+                ),
+                patch.object(hybrid_pool_assembler, "HybridCacheController"),
+            ):
+                group, _ = hybrid_pool_assembler.build_hybrid_mamba_stack(
+                    params=params,
+                    kv_pool=kv,
+                    mamba_pool=mamba,
+                    full_layer_mapping={0: 0},
+                    mamba_layer_mapping={1: 0},
+                    load_cache_event=None,
+                    storage_backend=None,
+                    use_mla=False,
+                )
+                host_mamba = group.get_pool(PoolName.MAMBA)
+                self.assertEqual(group.get_pool(PoolName.KV).size, 13)
+                self.assertEqual(host_mamba.size, expected_states)
+                self.assertEqual(
+                    host_mamba.alloc(expected_states).numel(), expected_states
+                )
+                self.assertIsNone(host_mamba.alloc(1))
+                self.assertEqual((kv.size, mamba.size), (8, 4))
 
 
 class TestHybridStageLayerMappings(CustomTestCase):
