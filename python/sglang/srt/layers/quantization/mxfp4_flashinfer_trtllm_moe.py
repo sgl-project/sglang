@@ -278,11 +278,25 @@ class Mxfp4FlashinferTrtllmMoEMethod:
         layer: Module,
         dispatch_output: DispatchOutput,
     ) -> CombineInput:
-        from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
+        from sglang.srt.layers.moe.token_dispatcher import (
+            DispatchOutputChecker,
+            StandardCombineInput,
+        )
         from sglang.srt.layers.moe.topk import TopKOutputChecker
 
         hidden_states = dispatch_output.hidden_states
         topk_output = dispatch_output.topk_output
+        is_flashinfer_dispatch = DispatchOutputChecker.format_is_flashinfer(
+            dispatch_output
+        )
+        if is_flashinfer_dispatch and (
+            hidden_states.dtype != torch.bfloat16
+            or dispatch_output.hidden_states_scale is not None
+        ):
+            raise ValueError(
+                "FlashInfer A2A + TRT-LLM MXFP4 MoE requires an unquantized BF16 "
+                "dispatch payload; activations are quantized locally before GEMM."
+            )
 
         # Loaders keep signed checkpoint bytes; FlashInfer identifies packed FP4
         # and its logical dimensions through unsigned, zero-copy byte views.
@@ -393,6 +407,14 @@ class Mxfp4FlashinferTrtllmMoEMethod:
             enable_pdl=trtllm_moe_enable_pdl(num_tokens),
         )[0]
 
+        if is_flashinfer_dispatch:
+            from sglang.srt.layers.moe.token_dispatcher.flashinfer import (
+                FlashinferCombineInput,
+            )
+
+            return FlashinferCombineInput(hidden_states=output)
+        # Prefill uses all-gather dispatch and reduce-scatter combine rather than
+        # the decode A2A workspace, even when FlashInfer A2A is selected globally.
         return StandardCombineInput(hidden_states=output)
 
 
