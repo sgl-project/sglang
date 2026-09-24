@@ -851,14 +851,16 @@ class LayerCommunicator:
             or apply_flashinfer_allreduce_fusion(hidden_states.shape[0])
         ) and hasattr(self.input_layernorm, "forward_with_allreduce_fusion"):
             if (
-                _use_aiter
-                and self.enable_fused_ar_quant_per_token
+                self.enable_fused_ar_quant_per_token
+                and _use_aiter
                 and _fuse_norm_fp8_quant(hidden_states)
                 and hasattr(
                     self.input_layernorm,
                     "forward_with_allreduce_fusion_quant_per_token",
                 )
             ):
+                # The bf16 output carries (fp8, scale) as _fp8_qinput for the ptpc
+                # decode GEMM; None means the fused kernel cannot service the shape.
                 quant_result = (
                     self.input_layernorm.forward_with_allreduce_fusion_quant_per_token(
                         hidden_states, residual
