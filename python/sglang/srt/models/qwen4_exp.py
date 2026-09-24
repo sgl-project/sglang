@@ -791,6 +791,10 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
     The source weight may be on the meta device; only its metadata is used.
     """
 
+    # The NPU backend keeps device graphs around the host lookup, rather than
+    # forcing the entire model to execute eagerly.
+    requires_npu_host_offload_graph = True
+
     _COPIED_ATTRIBUTES = (
         "quant_config",
         "enable_tp",
@@ -898,12 +902,6 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
         flat_ids = input_ids.reshape(-1)
         if flat_ids.numel():
             if input_ids.device.type == "npu":
-                if get_is_capture_mode():
-                    raise RuntimeError(
-                        "NPU PLE host offload requires eager execution because "
-                        "row selection reads device IDs on the CPU. "
-                        "Use --cuda-graph-backend-decode=disabled."
-                    )
                 from sglang.srt.hardware_backend.npu.ple import gather_ple_host_rows
 
                 return gather_ple_host_rows(
@@ -1181,6 +1179,16 @@ class Qwen4ExpPLELayer(nn.Module):
         """Gather host PLE rows while the preceding decoder layer runs."""
         if self._prefetch_stream is None:
             return
+        if forward_batch.input_ids.device.type == "npu":
+            from sglang.srt.hardware_backend.npu.graph_runner.host_offload_graph import (
+                get_host_offload_graph,
+            )
+
+            if get_is_capture_mode() or get_host_offload_graph() is not None:
+                # Keep the host break on the capture stream. The normal layer
+                # forward records its lookup instead; hash/history and TP
+                # reduction remain in the surrounding device graph segments.
+                return
         if self._prefetch_state is not None:
             raise RuntimeError("PLE prefetch state was not consumed before reuse")
         if batch is None:

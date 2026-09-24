@@ -12,6 +12,7 @@ non-NPU hosts.
 
 from __future__ import annotations
 
+import logging
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import AbstractContextManager, contextmanager
 from functools import partial
@@ -30,6 +31,8 @@ from sglang.srt.model_executor.runner_backend.base_cuda_graph_backend import (
 )
 from sglang.srt.utils import empty_context, get_bool_env_var
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -63,6 +66,22 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
         self._enable_torch_compile = getattr(
             cuda_graph_runner, "enable_torch_compile", False
         )
+        self._host_offload = any(
+            getattr(module, "requires_npu_host_offload_graph", False)
+            for module in cuda_graph_runner.model_runner.model.modules()
+        )
+        if self._host_offload and self._enable_torch_compile:
+            raise NotImplementedError(
+                "NPU PLE segmented graphs do not support --enable-torch-compile"
+            )
+        if (
+            self._host_offload
+            and self._memory_saver_adapter is not None
+            and self._memory_saver_adapter.enabled
+        ):
+            raise NotImplementedError(
+                "NPU PLE segmented graphs do not support graph memory saver"
+            )
         # Reuse one device-bound worker for graph input updates.
         self._update_executor = ThreadPoolExecutor(
             max_workers=1,
@@ -99,6 +118,25 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
             forward_fn()
             if post_warmup_hook is not None:
                 post_warmup_hook()
+
+        if self._host_offload:
+            from sglang.srt.hardware_backend.npu.graph_runner.host_offload_graph import (
+                NPUHostOffloadGraph,
+            )
+
+            graph = NPUHostOffloadGraph(self._device_module)
+            with graph.capture(pool=self._pool, stream=self._capture_stream):
+                out = forward_fn()
+            if not self._graphs:
+                logger.info(
+                    "NPU PLE decode graph split into %d segments around %d "
+                    "host lookups",
+                    graph.num_segments,
+                    graph.num_host_lookups,
+                )
+            self._graphs[shape_key] = graph
+            self._outputs[shape_key] = out
+            return
 
         graph = torch.npu.NPUGraph()
 

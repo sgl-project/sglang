@@ -22,6 +22,9 @@ import torch
 import torch_npu  # noqa: F401
 from torch import nn
 
+from sglang.srt.hardware_backend.npu.graph_runner.host_offload_graph import (
+    NPUHostOffloadGraph,
+)
 from sglang.srt.layers.quantization.unquant import UnquantizedEmbeddingMethod
 from sglang.srt.layers.vocab_parallel_embedding import (
     VocabParallelEmbeddingShardIndices,
@@ -343,22 +346,89 @@ class TestNpuPleOffload(unittest.TestCase):
                 actual = self.lookup(embedding, ids)
                 self.assertEqual(actual.shape, (0, 3, 7))
 
-    def test_capture_rejected_before_host_row_selection(self):
+    def test_graph_replays_host_lookup_between_segments(self):
+        for backend in ("pinned", "file"):
+            with self.subTest(backend=backend):
+                embedding, rows, _ = self.make_embedding(backend, torch.bfloat16, 7)
+                recorder = self.use_recorder(embedding)
+                # Graph inputs and outputs are prepared on the CPU, as elsewhere
+                # in this file. Inside the graph only D2D copies run: segment 0
+                # produces the IDs, segment 1 consumes the staged rows.
+                ids_in = torch.zeros((2, 2), dtype=torch.int32).to(self.device)
+                ids = torch.zeros((2, 2), dtype=torch.int32).to(self.device)
+                result = torch.full((2, 2, 7), float("nan"), dtype=torch.bfloat16)
+                result = result.to(self.device)
+
+                graph = NPUHostOffloadGraph(torch.npu)
+                log("  capturing")
+                with graph.capture(stream=torch.npu.Stream()):
+                    ids.copy_(ids_in)
+                    result.copy_(embedding.gather(ids))
+                self.assertEqual(graph.num_segments, 2)
+                self.assertEqual(graph.num_host_lookups, 1)
+                # Capture must not read IDs that no segment has produced yet.
+                self.assertEqual(recorder.calls, [])
+
+                for step, ids_cpu in enumerate(
+                    (torch.tensor([[7, 0], [5, 5]]), torch.tensor([[1, 2], [6, 3]]))
+                ):
+                    ids_in.copy_(ids_cpu.to(torch.int32))
+                    # A single update broadcasts to every segment, including
+                    # those without dispatch records, as replay_with_input_update
+                    # does for attention seq_lens.
+                    graph.update([{"actual_seq_lengths_kv": [1]}])
+                    log(f"  replay {step}")
+                    graph.replay()
+                    torch.npu.synchronize()
+                    self.check(result, self.reference(rows, ids_cpu, 0, 8))
+                    self.assertTrue(
+                        torch.equal(recorder.calls[-1][0], ids_cpu.reshape(-1))
+                    )
+                self.assertEqual(len(recorder.calls), 2)
+
+    def test_raw_graph_capture_rejected_before_host_row_selection(self):
         embedding, _, _ = self.make_embedding("file", torch.bfloat16, 7)
         recorder = self.use_recorder(embedding)
         for id_dtype in (torch.int32, torch.int64):
             with self.subTest(ids=id_dtype):
                 ids = torch.tensor([1], dtype=id_dtype, device=self.device)
-                with patch(
-                    "sglang.srt.models.qwen4_exp.get_is_capture_mode", return_value=True
-                ):
+                # A plain NPUGraph capture would freeze capture-time rows.
+                with patch("torch.npu.is_current_stream_capturing", return_value=True):
                     with self.assertRaisesRegex(
-                        RuntimeError, "requires eager execution"
+                        RuntimeError, "requires NPUHostOffloadGraph"
                     ):
                         embedding.gather(ids)
         # Rejected before any host work: nothing reached the prefetcher.
         self.assertEqual(recorder.calls, [])
-        log("  capture rejected before host row selection")
+        log("  raw capture rejected before host row selection")
+
+    def test_graph_update_follows_segment_dispatch_records(self):
+        class FakeSegment:
+            def __init__(self, records):
+                self.graph_dispatch_mode = SimpleNamespace(
+                    graph_dispatch_records=[None] * records
+                )
+                self.updates = []
+
+            def update(self, cpu_update_input):
+                self.updates.append(cpu_update_input)
+
+        segments = [FakeSegment(2), FakeSegment(0), FakeSegment(1)]
+        graph = NPUHostOffloadGraph(torch.npu)
+        graph._segments = segments
+
+        graph.update([{"seq": 0}])
+        self.assertEqual([seg.updates[-1] for seg in segments], [[{"seq": 0}]] * 3)
+
+        # Per-op lists (EAGLE draft steps) are split in capture order.
+        graph.update([{"seq": 0}, {"seq": 1}, {"seq": 2}])
+        self.assertEqual(
+            [seg.updates[-1] for seg in segments],
+            [[{"seq": 0}, {"seq": 1}], [], [{"seq": 2}]],
+        )
+
+        with self.assertRaisesRegex(ValueError, "update count"):
+            graph.update([{"seq": 0}, {"seq": 1}])
 
 
 if __name__ == "__main__":

@@ -6,8 +6,8 @@ keeps every tensor well-shaped and can still produce a plausible answer.
 
 Covers what test_npu_ple_offload.py cannot reach by constructing the embedding
 directly: the CLI -> hf_text_config -> model wiring, the real checkpoint weight
-loader, the prefetch side stream, TP sharding over HCCL, and the file backend's
-on-disk layout.
+loader, the prefill prefetch side stream, decode graphs split around the host
+lookup, TP sharding over HCCL, and the file backend's on-disk layout.
 
 Not covered here:
   - Numerical agreement with a known-good reference; that needs reference
@@ -129,10 +129,6 @@ class TestNpuPleOffloadServer(CustomTestCase):
             TP_SIZE,
             "--mem-fraction-static",
             "0.85",
-            # Row selection reads device IDs on the host, which a captured
-            # graph cannot replay; the model raises at capture otherwise.
-            "--cuda-graph-backend-decode",
-            "disabled",
             "--ple-offload-embedding",
             "--ple-offload-backend",
             backend,
@@ -230,24 +226,29 @@ class TestNpuPleOffloadServer(CustomTestCase):
         self.assertEqual(files, sorted(expected))
 
     @unittest.skipUnless(
-        os.environ.get("SGLANG_TEST_PLE_CAPTURE_REJECTION"),
-        "costs a full model load before the capture failure",
+        os.environ.get("SGLANG_TEST_PLE_GRAPH_VS_EAGER"),
+        "loads the model twice",
     )
-    def test_decode_graph_is_rejected(self):
-        stdout_path = os.path.join(self.table_dir, "server_stdout.log")
-        stderr_path = os.path.join(self.table_dir, "server_stderr.log")
-        with open(stdout_path, "w+") as stdout, open(stderr_path, "w+") as stderr:
-            with self.assertRaises(Exception):
-                self.launch(
-                    "pinned",
-                    extra_args=["--cuda-graph-backend-decode", "full"],
-                    logs=(stdout, stderr),
-                )
-            stdout.seek(0)
-            stderr.seek(0)
-            log = stdout.read() + stderr.read()
-        # Any launch failure raises; only this message ties it to the PLE gather.
-        self.assertIn("requires eager execution", log)
+    def test_decode_graph_matches_eager(self):
+        prompts = ["The capital of France is", "Count from one to twenty: " * 64]
+        paths = [
+            os.path.join(self.table_dir, f"server_{name}.log")
+            for name in ("stdout", "stderr")
+        ]
+        with open(paths[0], "w") as stdout, open(paths[1], "w") as stderr:
+            self.launch("pinned", logs=(stdout, stderr))
+            graph_texts = [self.generate(prompt) for prompt in prompts]
+            # Separate handles: the dump threads keep writing to the ones above.
+            log = "".join(open(path).read() for path in paths)
+            kill_process_tree(self.process.pid)
+            self.process = None
+        # Launching proves little on its own: decode may run eagerly.
+        self.assertIn("NPU PLE decode graph split into", log)
+
+        self.launch("pinned", extra_args=["--cuda-graph-backend-decode", "disabled"])
+        eager_texts = [self.generate(prompt) for prompt in prompts]
+        # Replaying capture-time PLE rows would diverge within a few tokens.
+        self.assertEqual(graph_texts, eager_texts)
 
 
 if __name__ == "__main__":
