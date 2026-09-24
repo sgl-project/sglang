@@ -1595,16 +1595,11 @@ def _routed_experts_capture_backend_guard(view: Any) -> dict:
         return {}
     if view.moe_runner_backend not in _TOPK_BYPASSING_MOE_RUNNER_BACKENDS:
         return {}
-    if view.quantization in (None, "fp8"):
-        logger.warning(
-            f"moe_runner_backend={view.moe_runner_backend!r} bypasses TopK, so "
-            "--enable-return-routed-experts falls back to moe_runner_backend='auto'."
-        )
-        return {"moe_runner_backend": "auto"}
     raise ValueError(
         f"--enable-return-routed-experts is incompatible with moe_runner_backend="
-        f"{view.moe_runner_backend!r} under quantization={view.quantization!r}; "
-        "pass a topk-materializing --moe-runner-backend such as triton."
+        f"{view.moe_runner_backend!r}, which bypasses TopK and never materializes "
+        "the routed expert ids; pass a topk-materializing --moe-runner-backend "
+        "such as triton."
     )
 
 
