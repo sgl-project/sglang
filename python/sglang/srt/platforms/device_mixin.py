@@ -50,6 +50,7 @@ class PlatformEnum(enum.Enum):
     XPU = enum.auto()
     MUSA = enum.auto()
     NPU = enum.auto()
+    MLU = enum.auto()
     TPU = enum.auto()
     MPS = enum.auto()
     OOT = enum.auto()  # Out-of-tree (external plugin)
@@ -127,6 +128,9 @@ class DeviceMixin:
 
     def is_npu(self) -> bool:
         return self._enum == PlatformEnum.NPU
+
+    def is_mlu(self) -> bool:
+        return self._enum == PlatformEnum.MLU
 
     def is_tpu(self) -> bool:
         return self._enum == PlatformEnum.TPU
