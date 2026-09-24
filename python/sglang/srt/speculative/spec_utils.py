@@ -474,6 +474,20 @@ def generate_simulated_accept_index(
         simulate_acc_len, simulate_acc_method, spec_steps + 1
     )
 
+    if _is_cuda and accept_index.is_cuda:
+        from sglang.kernels.ops.speculative.simulated_accept import simulated_accept
+
+        return simulated_accept(
+            accept_index,
+            predict,
+            num_correct_drafts,
+            candidates,
+            target_predict,
+            spec_steps + 1,
+            simulate_acc_len,
+            use_real_draft_tokens,
+        )
+
     accept_indx_first_col = accept_index[:, 0].view(-1, 1)
     sim_accept_index = torch.full(
         (bs, spec_steps + 1), -1, dtype=torch.int32, device=accept_index.device
