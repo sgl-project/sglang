@@ -201,10 +201,12 @@ class TestUnloadRefCacheCleanup(CustomTestCase):
         tm.lora_ref_cache = {"a": LoRARef(lora_name="a", lora_path="/x")}
         return tm
 
-    def test_explicit_unload_drops_ref_cache_entry(self):
+    def test_explicit_unload_keeps_ref_cache_entry(self):
+        # a disk-backed adapter stays in the reload catalog so a later request
+        # can implicitly reload it (test_lora_update relies on this)
         tm = self._make_unload_tm(success=True)
         asyncio.run(tm.unload_lora_adapter(UnloadLoRAAdapterReqInput(lora_name="a")))
-        self.assertNotIn("a", tm.lora_ref_cache)
+        self.assertIn("a", tm.lora_ref_cache)
 
     def test_failed_unload_keeps_ref_cache_entry(self):
         tm = self._make_unload_tm(success=False)

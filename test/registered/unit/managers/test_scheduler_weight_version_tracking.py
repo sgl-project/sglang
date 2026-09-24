@@ -110,6 +110,9 @@ def _runner(result=(True, "ok")):
         "load_weights_from_distributed",
     ):
         getattr(runner.weight_updater, method).return_value = result
+    runner.weight_updater.receive_weights_from_distributed.return_value = [
+        ("model.layers.0.weight", None)
+    ]
     return runner
 
 

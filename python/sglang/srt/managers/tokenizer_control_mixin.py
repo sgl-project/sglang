@@ -1010,14 +1010,7 @@ class TokenizerControlMixin:
                 )
 
             async with self.lora_update_lock:
-                result = await self._unload_lora_adapter_locked(obj)
-                # Explicit unload is a DELETE: drop the reload-catalog entry too.
-                # The max_loaded_loras LRU loop calls _unload_lora_adapter_locked
-                # directly — an EVICT — and must keep the entry so disk-backed
-                # adapters can be implicitly reloaded later.
-                if result.success:
-                    self.lora_ref_cache.pop(obj.lora_name, None)
-                return result
+                return await self._unload_lora_adapter_locked(obj)
         except ValueError as e:
             return UnloadLoRAAdapterReqOutput(success=False, error_message=str(e))
 
