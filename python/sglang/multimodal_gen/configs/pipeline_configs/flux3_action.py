@@ -181,19 +181,27 @@ def is_flux3_action_package(model_path: str) -> bool:
     )
 
 
-def _validate_parallelism(server_args: Any) -> None:
-    """Multi-GPU serving splits the conditional / unconditional passes (CFG parallel)."""
+def _validate_parallelism(server_args: Any, num_heads: int) -> None:
+    """Multi-GPU serving shards the DiT (TP, Ulysses SP) and/or splits the CFG passes."""
     if server_args.num_gpus == 1:
         return
-    cfg_only = (
-        server_args.enable_cfg_parallel
-        and server_args.cfg_parallel_degree == server_args.num_gpus == 2
-        and server_args.tp_size == 1
-        and server_args.sp_degree == 1
+    cfg_degree = (
+        server_args.cfg_parallel_degree if server_args.enable_cfg_parallel else 1
     )
-    if not cfg_only:
+    supported = (
+        cfg_degree in (1, 2)
+        and server_args.ring_degree == 1
+        and server_args.num_gpus
+        == server_args.tp_size * server_args.sp_degree * cfg_degree
+    )
+    if not supported:
         raise NotImplementedError(
-            "FLUX 3 Action runs on one GPU, or on two with --enable-cfg-parallel"
+            "FLUX 3 Action runs on num_gpus = tp_size x sp_degree x (2 with "
+            "--enable-cfg-parallel, else 1); ring attention is not supported"
+        )
+    if num_heads % (server_args.tp_size * server_args.ulysses_degree):
+        raise ValueError(
+            f"tp_size x ulysses_degree must divide the {num_heads} attention heads"
         )
 
 
@@ -262,7 +270,6 @@ class Flux3ActionPipelineConfig(PipelineConfig):
 
     def validate_server_args(self, server_args: Any) -> None:
         super().validate_server_args(server_args)
-        _validate_parallelism(server_args)
         variant = server_args.model_variant or "base"
         package = resolve_flux3_action_package(
             server_args.model_path,
@@ -272,6 +279,9 @@ class Flux3ActionPipelineConfig(PipelineConfig):
         )
         verify_flux3_action_manifest(package, include_weights=False)
         self.load_policy_config(read_flux3_action_config(package))
+        _validate_parallelism(
+            server_args, num_heads=self.dit_config.arch_config.num_attention_heads
+        )
         self.policy_variant = variant
         self.policy_revision = server_args.revision
 

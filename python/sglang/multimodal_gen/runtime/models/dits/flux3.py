@@ -58,8 +58,26 @@ from sglang.multimodal_gen.configs.models.dits.flux3 import (
     Flux3ArchConfig,
     Flux3DiTConfig,
 )
+from sglang.multimodal_gen.runtime.distributed import (
+    divide,
+    get_sp_world_size,
+    get_tp_rank,
+    get_tp_world_size,
+    tensor_model_parallel_all_reduce,
+)
+from sglang.multimodal_gen.runtime.distributed.sp_shard_utils import (
+    SpShard,
+    build_shard_plan,
+    gather_seq,
+    shard_like,
+    tail_attn_meta,
+)
 from sglang.multimodal_gen.runtime.layers.attention import USPAttention
-from sglang.multimodal_gen.runtime.layers.linear import ReplicatedLinear
+from sglang.multimodal_gen.runtime.layers.linear import (
+    LinearBase,
+    MergedColumnParallelLinear,
+    RowParallelLinear,
+)
 from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config import (
     QuantizationConfig,
 )
@@ -339,6 +357,64 @@ class Flux3LastLayer(nn.Module):
         return self.linear(x)
 
 
+# Streams shorter than this keep their mode blocks replicated under sequence
+# parallelism (text, action and state tokens); arbitrary, not tuned.
+SP_MIN_STREAM_TOKENS = 256
+
+
+class Flux3SequenceShard(msgspec.Struct, frozen=True):
+    """This rank's slice of a sequence-parallel sequence (Ulysses or K/V gather)."""
+
+    shard: SpShard
+    # Tail-pad varlen meta for USPAttention (None when the split is even).
+    attn_mask_meta: dict[str, Any] | None
+
+
+def _sequence_shard(
+    length: int, like: torch.Tensor, min_tokens: int = 0
+) -> Flux3SequenceShard | None:
+    """The SP split of a ``length``-token sequence, or None to keep it replicated."""
+    if get_sp_world_size() == 1 or length < max(min_tokens, get_sp_world_size()):
+        return None
+    shard = build_shard_plan(length)
+    return Flux3SequenceShard(
+        shard=shard,
+        attn_mask_meta=tail_attn_meta(shard, like.shape[0], like.device),
+    )
+
+
+def _shard_mod(mod: Modulation, shard: SpShard) -> Modulation:
+    """Per-token modulation ``(B, L, D)`` follows the tokens; ``(B, 1, D)`` broadcasts."""
+    return tuple(m if m.shape[1] == 1 else shard_like(m, shard, dim=1) for m in mod)
+
+
+def _local_segments(
+    lengths: list[int], mods: list[Modulation], shard: SpShard
+) -> tuple[list[int], list[Modulation]]:
+    """Segments of the joint sequence inside this rank's shard.
+
+    The tail pad of the last rank becomes a segment with zero modulation, so
+    its rows pass through unchanged (attention masks them out).
+    """
+    start = shard.sp_rank * shard.local_len
+    end = start + shard.local_real_len
+    local_lengths, local_mods = [], []
+    pos = 0
+    for length, mod in zip(lengths, mods):
+        lo, hi = max(pos, start), min(pos + length, end)
+        if lo < hi:
+            local_lengths.append(hi - lo)
+            local_mods.append(
+                tuple(m if m.shape[1] == 1 else m[:, lo - pos : hi - pos] for m in mod)
+            )
+        pos += length
+    if shard.local_pad:
+        zero = mods[-1][0].new_zeros(mods[-1][0].shape[0], 1, mods[-1][0].shape[-1])
+        local_lengths.append(shard.local_pad)
+        local_mods.append((zero, zero, zero))
+    return local_lengths, local_mods
+
+
 class Flux3Block(nn.Module):
     """Parallel attention + SwiGLU MLP block with QK-RMSNorm and 4-axis RoPE.
 
@@ -360,52 +436,73 @@ class Flux3Block(nn.Module):
         self.num_heads = num_heads
         self.head_dim = hidden_size // num_heads
         self.mlp_hidden_dim = int(hidden_size * mlp_ratio)
+        # Tensor parallel as in the FLUX 3 native DiT: each rank owns a slice of
+        # the heads and of the MLP channels; one all-reduce per block.
+        self.tp_size = get_tp_world_size()
+        self.local_heads = divide(num_heads, self.tp_size)
+        self.local_hidden = self.local_heads * self.head_dim
+        self.local_mlp_hidden = divide(self.mlp_hidden_dim, self.tp_size)
 
-        def linear(name: str, in_features: int, out_features: int) -> ReplicatedLinear:
-            return ReplicatedLinear(
+        # q, k, v and the MLP input share one GEMM; the checkpoint's separate
+        # tensors are concatenated at load time (see Flux3ArchConfig). Gate and
+        # value are separate partitions so each rank keeps matching halves.
+        self.qkv_mlp = MergedColumnParallelLinear(
+            hidden_size,
+            [hidden_size] * 3 + [self.mlp_hidden_dim] * 2,
+            bias=False,
+            gather_output=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.qkv_mlp",
+        )
+
+        def row_linear(name: str, in_features: int) -> RowParallelLinear:
+            return RowParallelLinear(
                 in_features,
-                out_features,
+                hidden_size,
                 bias=False,
+                input_is_parallel=True,
+                reduce_results=False,
                 quant_config=quant_config,
                 prefix=f"{prefix}.{name}",
             )
 
-        # q, k, v and the MLP input share one GEMM; the checkpoint's separate
-        # tensors are concatenated at load time (see Flux3ArchConfig).
-        self.qkv_mlp = linear(
-            "qkv_mlp", hidden_size, 3 * hidden_size + 2 * self.mlp_hidden_dim
-        )
-        self.attn_out = linear("attn_out", hidden_size, hidden_size)
-        self.mlp_out = linear("mlp_out", self.mlp_hidden_dim, hidden_size)
+        self.attn_out = row_linear("attn_out", hidden_size)
+        self.mlp_out = row_linear("mlp_out", self.mlp_hidden_dim)
         self.norm = Flux3QKNorm(self.head_dim)
         self.pre_norm = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
         self.attn = USPAttention(
-            num_heads=num_heads,
+            num_heads=self.local_heads,
             head_size=self.head_dim,
             causal=False,
             supported_attention_backends=supported_attention_backends,
             prefix=f"{prefix}.attn",
         )
 
-    def _mix(self, modulated: torch.Tensor, rope: torch.Tensor) -> torch.Tensor:
+    def _mix(
+        self,
+        modulated: torch.Tensor,
+        rope: torch.Tensor,
+        sp: Flux3SequenceShard | None,
+    ) -> torch.Tensor:
         batch, length, _ = modulated.shape
+        heads = self.local_heads
         q, k, v, mlp = self.qkv_mlp(modulated)[0].split(
             (
-                self.hidden_size,
-                self.hidden_size,
-                self.hidden_size,
-                2 * self.mlp_hidden_dim,
+                self.local_hidden,
+                self.local_hidden,
+                self.local_hidden,
+                2 * self.local_mlp_hidden,
             ),
             dim=-1,
         )
-        q = q.view(batch, length, self.num_heads, self.head_dim)
-        k = k.view(batch, length, self.num_heads, self.head_dim)
-        v = v.view(batch, length, self.num_heads, self.head_dim)
+        q = q.view(batch, length, heads, self.head_dim)
+        k = k.view(batch, length, heads, self.head_dim)
+        v = v.view(batch, length, heads, self.head_dim)
         if _fused_qknorm_rope_enabled(q, self.head_dim):
             # In place on the fused projection: k follows q's heads in each row.
             fused_inplace_qknorm_rope(
-                q=q.view(-1, self.num_heads, self.head_dim),
-                k=k.view(-1, self.num_heads, self.head_dim),
+                q=q.view(-1, heads, self.head_dim),
+                k=k.view(-1, heads, self.head_dim),
                 q_weight=self.norm.query_norm.scale,
                 k_weight=self.norm.key_norm.scale,
                 cos_sin_cache=rope.reshape(-1, self.head_dim),
@@ -417,8 +514,21 @@ class Flux3Block(nn.Module):
         else:
             q, k = self.norm(q, k, v)
             q, k = apply_rope(q, k, rope)
-        attended = self.attn(q, k, v).reshape(batch, length, self.hidden_size)
-        return self.attn_out(attended)[0] + self.mlp_out(_swiglu(mlp))[0]
+        if sp is None:
+            # Replicated input: every rank already holds the whole stream.
+            attended = self.attn(q, k, v, skip_sequence_parallel_override=True)
+        else:
+            # q/k/v are strided views of the fused projection; the SP exchanges
+            # (all-to-all, K/V all-gather) need dense tensors.
+            q, k, v = q.contiguous(), k.contiguous(), v.contiguous()
+            attended = self.attn(q, k, v, attn_mask_meta=sp.attn_mask_meta)
+        attended = attended.reshape(batch, length, self.local_hidden)
+        out = self.attn_out(attended)[0] + self.mlp_out(_swiglu(mlp))[0]
+        if self.tp_size > 1:
+            # One reduce of the summed partials, not one per branch (the order
+            # the FLUX 3 reference TP uses).
+            out = tensor_model_parallel_all_reduce(out)
+        return out
 
     def forward(
         self,
@@ -426,17 +536,19 @@ class Flux3Block(nn.Module):
         rope: torch.Tensor,
         mods: list[Modulation],
         lengths: list[int] | None = None,
+        sp: Flux3SequenceShard | None = None,
     ) -> torch.Tensor:
         """Segment ``i`` of ``x`` (``lengths[i]`` tokens) is modulated by ``mods[i]``.
 
         A mode block has a single segment (``lengths=None``); a joint block has
-        one per stream. Blocks are always entered through ``__call__`` so that
-        forward hooks (layerwise offload) see every block.
+        one per stream. With ``sp``, ``x`` is this rank's sequence shard.
+        Blocks are always entered through ``__call__`` so that forward hooks
+        (layerwise offload) see every block.
         """
         if lengths is None:
             shift, scale, gate = mods[0]
             modulated = _norm_modulate(self.pre_norm, x, shift=shift, scale=scale)
-            return residual_gate_add(x, self._mix(modulated, rope), gate)
+            return residual_gate_add(x, self._mix(modulated, rope, sp), gate)
         segments = torch.split(x, lengths, dim=1)
         modulated = torch.cat(
             [
@@ -445,7 +557,7 @@ class Flux3Block(nn.Module):
             ],
             dim=1,
         )
-        output = torch.split(self._mix(modulated, rope), lengths, dim=1)
+        output = torch.split(self._mix(modulated, rope, sp), lengths, dim=1)
         return torch.cat(
             [
                 residual_gate_add(seg, out.contiguous(), m[2])
@@ -625,8 +737,19 @@ class Flux3Transformer(BaseDiT, LayerwiseOffloadableModuleMixin):
         rope = self.rope(ids) if rope is None else rope
         early = self.early_stream_modulations[name](vec)
         hidden = self.emb_in[name](x.to(self.dtype))
-        for block in self.content_mode_blocks[name]:
-            hidden = block(hidden, rope, [early])
+        # Long streams run their mode blocks sequence-parallel; the state keeps
+        # the full stream so cached conditioning is layout independent.
+        sp = _sequence_shard(hidden.shape[1], hidden, min_tokens=SP_MIN_STREAM_TOKENS)
+        if sp is None:
+            for block in self.content_mode_blocks[name]:
+                hidden = block(hidden, rope, [early])
+        else:
+            local = shard_like(hidden, sp.shard)
+            local_rope = shard_like(rope, sp.shard)
+            local_early = _shard_mod(early, sp.shard)
+            for block in self.content_mode_blocks[name]:
+                local = block(local, local_rope, [local_early], sp=sp)
+            hidden = gather_seq(local, sp.shard.orig_len)
         return Flux3SegmentState(
             name=name,
             hidden=hidden,
@@ -644,8 +767,17 @@ class Flux3Transformer(BaseDiT, LayerwiseOffloadableModuleMixin):
         mods = [s.joint_mod for s in segments]
         rope = torch.cat([s.rope for s in segments], dim=1)
         x = torch.cat([s.hidden for s in segments], dim=1)
-        for block in self.single_blocks:
-            x = block(x, rope, mods, lengths)
+        sp = _sequence_shard(x.shape[1], x)
+        if sp is None:
+            for block in self.single_blocks:
+                x = block(x, rope, mods, lengths)
+        else:
+            local = shard_like(x, sp.shard)
+            local_rope = shard_like(rope, sp.shard)
+            local_lengths, local_mods = _local_segments(lengths, mods, sp.shard)
+            for block in self.single_blocks:
+                local = block(local, local_rope, local_mods, local_lengths, sp=sp)
+            x = gather_seq(local, sp.shard.orig_len)
         return list(torch.split(x, lengths, dim=1)[1:])
 
     def denoise(
@@ -750,7 +882,7 @@ def load_fp8r_checkpoint(
         parent_path, _, child = module_path.rpartition(".")
         parent = model.get_submodule(parent_path)
         original = getattr(parent, child)
-        weight = weights[name]
+        weight = _tp_partition(original, weights.pop(name), is_scale=False)
         if weight.shape != original.weight.shape:
             raise ValueError(
                 f"{name}: checkpoint shape {tuple(weight.shape)} does not match "
@@ -760,11 +892,14 @@ def load_fp8r_checkpoint(
             parent,
             child,
             Flux3Fp8RowwiseLinear(
-                weights.pop(name),
-                scale,
-                tuple_output=isinstance(original, ReplicatedLinear),
+                weight,
+                _tp_partition(original, scale, is_scale=True),
+                tuple_output=isinstance(original, LinearBase),
             ),
         )
+    for name, tensor in weights.items():
+        owner = model.get_submodule(name.rpartition(".")[0])
+        weights[name] = _tp_partition(owner, tensor, is_scale=False)
     missing, unexpected = model.load_state_dict(weights, strict=False, assign=True)
     fp8_params = {
         n for n, _ in model.named_parameters() if n.removesuffix("_scale") in scales
@@ -774,6 +909,23 @@ def load_fp8r_checkpoint(
         raise ValueError(
             f"FP8r checkpoint mismatch: missing {missing}, unexpected {unexpected}"
         )
+
+
+def _tp_partition(
+    module: nn.Module, tensor: torch.Tensor, *, is_scale: bool
+) -> torch.Tensor:
+    """This rank's slice of a full checkpoint weight (or per-row scale) of ``module``."""
+    tp_size = get_tp_world_size()
+    if tp_size == 1:
+        return tensor
+    rank = get_tp_rank()
+    if isinstance(module, MergedColumnParallelLinear):
+        parts = tensor.split(module.output_sizes)
+        return torch.cat([part.chunk(tp_size)[rank] for part in parts])
+    if isinstance(module, RowParallelLinear) and not is_scale:
+        # Row scales stay whole: they scale output rows, which are not split.
+        return tensor.chunk(tp_size, dim=1)[rank].contiguous()
+    return tensor
 
 
 def _uniform(timesteps: torch.Tensor | None) -> torch.Tensor | None:

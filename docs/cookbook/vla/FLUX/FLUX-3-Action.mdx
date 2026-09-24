@@ -87,7 +87,27 @@ Peak GPU memory and per-request latency on one RTX 5090 (BF16 base package, cach
 
 Layerwise offload streams the DiT blocks (and, with `all`, the text encoder and VAE blocks) from host memory, so use it only when the resident configuration does not fit.
 
-### 3.1 Action Request Schema
+### 3.1 Multi-GPU
+
+Three layouts split the DiT across GPUs. They compose as `--num-gpus` = TP size x SP degree x (2 with CFG parallel):
+
+| Flags | What is split | Actions vs 1 GPU |
+| --- | --- | --- |
+| `--num-gpus 2 --enable-cfg-parallel` | The conditional and unconditional passes | Bit-identical |
+| `--num-gpus 2 --tp-size 2` | DiT weights (heads and MLP channels), one all-reduce per block | bf16 rounding level |
+| `--num-gpus 2 --sp-degree 2` | The joint sequence and the video mode blocks (K/V gather; add `--ulysses-degree 2` for Ulysses) | bf16 rounding level |
+
+CFG parallel only helps recipes that use guidance (`base`, `fp8r`). The distilled `gd` and `sd` variants run one pass per step, so both GPUs compute the same pass. TP and SP accept the FP8r packages too. Ring attention is not supported.
+
+```bash Command
+sglang serve black-forest-labs/flux-3-action-droid \
+  --model-type diffusion \
+  --num-gpus 2 \
+  --enable-cfg-parallel \
+  --port 30000
+```
+
+### 3.2 Action Request Schema
 
 | Field | Type | Description |
 | --- | --- | --- |

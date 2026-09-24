@@ -116,22 +116,35 @@ def _parallel_args(**overrides):
         cfg_parallel_degree=2,
         tp_size=1,
         sp_degree=1,
+        ulysses_degree=1,
+        ring_degree=1,
     )
     return SimpleNamespace(**{**args, **overrides})
 
 
-def test_multi_gpu_serving_requires_two_way_cfg_parallel():
-    """Layouts the DiT does not shard (TP, SP) must be refused, not run replicated."""
-    _validate_parallelism(_parallel_args(num_gpus=1, enable_cfg_parallel=False))
-    _validate_parallelism(_parallel_args())
+def test_multi_gpu_layouts_are_tp_times_sp_times_cfg():
+    """Layouts the DiT does not shard (ring, uneven heads) must be refused, not run."""
+    no_cfg = dict(enable_cfg_parallel=False, cfg_parallel_degree=1)
     for overrides in (
-        dict(enable_cfg_parallel=False, cfg_parallel_degree=1, sp_degree=2),
-        dict(enable_cfg_parallel=False, cfg_parallel_degree=1, tp_size=2),
-        dict(num_gpus=4, sp_degree=2),
-        dict(num_gpus=4, tp_size=2),
+        dict(num_gpus=1, **no_cfg),
+        dict(),
+        dict(tp_size=2, **no_cfg),
+        dict(sp_degree=2, ulysses_degree=2, **no_cfg),
+        dict(num_gpus=8, tp_size=2, sp_degree=2, ulysses_degree=2),
+    ):
+        _validate_parallelism(_parallel_args(**overrides), num_heads=24)
+    for overrides in (
+        dict(sp_degree=2, ring_degree=2, **no_cfg),
+        dict(num_gpus=4, cfg_parallel_degree=4),
+        dict(num_gpus=4),
     ):
         with pytest.raises(NotImplementedError):
-            _validate_parallelism(_parallel_args(**overrides))
+            _validate_parallelism(_parallel_args(**overrides), num_heads=24)
+    with pytest.raises(ValueError):
+        _validate_parallelism(
+            _parallel_args(num_gpus=5, sp_degree=5, ulysses_degree=5, **no_cfg),
+            num_heads=24,
+        )
 
 
 def test_cfg_parallel_branches_are_conditional_then_unconditional():
@@ -654,6 +667,69 @@ def test_fp8r_checkpoint_loads_fused_rowwise_linears():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs the CUDA fused kernel")
+def test_fp8r_tp_partition_keeps_gate_and_value_paired(monkeypatch):
+    """Each rank's fused ``qkv_mlp`` rows must be matching q/k/v/gate/value slices.
+
+    A contiguous split of the fused weight would give one rank all gate rows and
+    the other all value rows; row-parallel scales cover whole output rows.
+    """
+    from torch import nn
+
+    from sglang.multimodal_gen.runtime.layers.linear import (
+        MergedColumnParallelLinear,
+        RowParallelLinear,
+    )
+    from sglang.multimodal_gen.runtime.models.dits import flux3
+
+    monkeypatch.setattr(flux3, "get_tp_world_size", lambda: 2)
+    monkeypatch.setattr(flux3, "get_tp_rank", lambda: 1)
+    merged = MergedColumnParallelLinear.__new__(MergedColumnParallelLinear)
+    nn.Module.__init__(merged)
+    merged.output_sizes = [2, 2, 2, 4, 4]
+    rows = torch.arange(14.0)
+    local = flux3._tp_partition(merged, rows, is_scale=False)
+    assert local.tolist() == [1, 3, 5, 8, 9, 12, 13]
+    assert flux3._tp_partition(merged, rows, is_scale=True).tolist() == local.tolist()
+
+    row = RowParallelLinear.__new__(RowParallelLinear)
+    nn.Module.__init__(row)
+    weight = torch.arange(8.0).reshape(2, 4)
+    assert flux3._tp_partition(row, weight, is_scale=False).tolist() == [
+        [2, 3],
+        [6, 7],
+    ]
+    scale = torch.tensor([1.0, 2.0])
+    assert flux3._tp_partition(row, scale, is_scale=True) is scale
+
+
+def test_sp_joint_segments_follow_the_rank_shard():
+    """Each rank modulates exactly its slice of every segment; the tail pad is inert.
+
+    Joint blocks modulate per segment, so an SP rank must split its shard where
+    the global segments end, slice per-token modulation, and give the pad
+    rows a zero gate.
+    """
+    from sglang.multimodal_gen.runtime.distributed.sp_shard_utils import SpShard
+    from sglang.multimodal_gen.runtime.models.dits.flux3 import _local_segments
+
+    def mod(tokens: int, value: float):
+        return tuple(torch.full((1, tokens, 2), value) for _ in range(3))
+
+    lengths = [3, 6, 1]  # text, a stream, a single-token stream: 10 tokens
+    mods = [mod(1, 1.0), mod(6, 2.0), mod(1, 3.0)]
+    mods[1][0][:, :, 0] = torch.arange(6.0)  # per-token shift
+    # 3 ranks of 4 tokens: [0, 4), [4, 8), [8, 10) + 2 pad rows.
+    first = _local_segments(lengths, mods, SpShard(10, 4, 2, 3, 0))
+    middle = _local_segments(lengths, mods, SpShard(10, 4, 2, 3, 1))
+    last = _local_segments(lengths, mods, SpShard(10, 4, 2, 3, 2))
+    assert first[0] == [3, 1] and middle[0] == [4] and last[0] == [1, 1, 2]
+    assert first[1][1][0][0, :, 0].tolist() == [0.0]
+    assert middle[1][0][0][0, :, 0].tolist() == [1.0, 2.0, 3.0, 4.0]
+    assert last[1][0][0][0, :, 0].tolist() == [5.0]
+    assert last[1][1][2].eq(3.0).all()
+    assert all(not m.any() for m in last[1][2])
+
+
 def test_fused_qknorm_rope_matches_the_eager_rotation():
     """The fused kernel must use the same [cos | sin] cache layout and interleaved pairs."""
     from sglang.kernels.ops.diffusion import fused_inplace_qknorm_rope
