@@ -23,6 +23,7 @@ from sglang.multimodal_gen.configs.pipeline_configs.longcat_image import (
     LongCatImagePipelineConfig,
 )
 from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import (
+    QwenImageEditPlusPipelineConfig,
     QwenImagePipelineConfig,
 )
 from sglang.multimodal_gen.configs.pipeline_configs.wan import WanT2V480PConfig
@@ -33,7 +34,10 @@ from sglang.multimodal_gen.configs.sample.ideogram import Ideogram4SamplingParam
 from sglang.multimodal_gen.configs.sample.longcat_image import (
     LongCatImageSamplingParams,
 )
-from sglang.multimodal_gen.configs.sample.qwenimage import QwenImageSamplingParams
+from sglang.multimodal_gen.configs.sample.qwenimage import (
+    QwenImageEditPlusSamplingParams,
+    QwenImageSamplingParams,
+)
 from sglang.multimodal_gen.configs.sample.wan import WanT2V_1_3B_SamplingParams
 from sglang.multimodal_gen.configs.sample.zimage import ZImageTurboSamplingParams
 from sglang.multimodal_gen.runtime.entrypoints import http_server
@@ -180,6 +184,7 @@ def server(monkeypatch, tmp_path):
     monkeypatch.setattr(ServerArgs, "__post_init__", lambda self: None)
     args = ServerArgs(
         model_path="test-model",
+        served_model_name="test-model",
         pipeline_config=ZImagePipelineConfig(),
         num_gpus=1,
         prompt_enhancer_config=str(config_path),
@@ -242,6 +247,8 @@ def test_http_routes_enhance_once_before_sampling_and_preserve_options(
             },
         )
     elif endpoint == "edit":
+        server.args.pipeline_config = QwenImageEditPlusPipelineConfig()
+        server.model_info.sampling_param_cls = QwenImageEditPlusSamplingParams
         buffer = io.BytesIO()
         Image.new("RGB", (16, 16), "blue").save(buffer, format="PNG")
         response = server.client.post(
