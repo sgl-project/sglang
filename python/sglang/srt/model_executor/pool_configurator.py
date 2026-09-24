@@ -1280,6 +1280,28 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         headroom = self.swa_prefix_tails * (self.sliding_window_size + self.page_size)
         return ceil_align(cap + headroom, self.page_size)
 
+    def _get_paged_kv_bytes_per_token(self, compress_ratio: int = 0) -> float:
+        if (
+            self._unified
+            or _is_hip
+            or _is_npu
+            or get_exec().kernel.dsv4_attn_backend == "trtllm"
+        ):
+            return self.kv_bytes
+        from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
+            resolve_compressed_kv_layout,
+            select_dsv4_kv_layout,
+        )
+
+        layout, compressed_option = select_dsv4_kv_layout()
+        page_size = self.swa_page_size
+        if compress_ratio:
+            layout = resolve_compressed_kv_layout(
+                layout, compress_ratio, compressed_option
+            )
+            page_size = self.page_size // compress_ratio
+        return layout.page_bytes(page_size) / page_size
+
     def _get_bytes_per_swa_token(self) -> float:
         """Bytes one SWA slot costs across the stage. c4_state_pool_size = swa_tokens
         / swa_page_size * ring, so c4 compress state is priced per SWA slot too."""
@@ -1293,7 +1315,7 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
 
         c4_state_ratio = self.c4_ring_size / self.swa_page_size
         return (
-            self.kv_bytes * self.num_layers_total
+            self._get_paged_kv_bytes_per_token() * self.num_layers_total
             + c4_state_ratio
             * (c4_state_bytes + c4_indexer_state_bytes)
             * self.num_layers_ca4
@@ -1323,8 +1345,8 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         return (
             swa_ratio * self.bytes_per_swa_token
             + self.low_ratio_bytes_per_full_token
-            + c4_frac * self.kv_bytes * self.num_layers_ca4
-            + 1 / 128 * self.kv_bytes * self.num_layers_ca128
+            + c4_frac * self._get_paged_kv_bytes_per_token(4) * self.num_layers_ca4
+            + 1 / 128 * self._get_paged_kv_bytes_per_token(128) * self.num_layers_ca128
             + 1 / 4 * self.indexer_bytes_per_token * self.num_layers_ca4
             + c128_state_ratio * c128_state_bytes * self.num_layers_ca128
         )
