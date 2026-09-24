@@ -429,12 +429,12 @@ Detailed example in [OpenAI API Vision](./openai_api_vision).
 
 ### Structured Outputs (JSON, Regex, EBNF)
 
-You can specify a JSON schema, regular expression or [EBNF](https://en.wikipedia.org/wiki/Extended_Backus%E2%80%93Naur_form) to constrain the model output. The model output will be guaranteed to follow the given constraints. Only one constraint parameter (`json_schema`, `regex`, or `ebnf`) can be specified for a request. With XGrammar, the existing `ebnf` parameter also accepts [Lark grammar](https://lark-parser.readthedocs.io/en/latest/grammar.html) syntax.
+You can specify a JSON schema, regular expression or [EBNF](https://en.wikipedia.org/wiki/Extended_Backus%E2%80%93Naur_form) to constrain the model output. The model output will be guaranteed to follow the given constraints. Only one constraint parameter (`json_schema`, `regex`, or `ebnf`) can be specified for a request. With XGrammar, the `ebnf` parameter also accepts grammars in [XGrammar's Lark dialect](https://github.com/mlc-ai/xgrammar/blob/v0.2.7/docs/defining_structures/lark_grammar.md), which requires a `start` rule. Intel XPU installs pin xgrammar 0.1.33, which predates Lark support, so `ebnf` accepts only EBNF there.
 
 SGLang supports two grammar backends:
 
-- [XGrammar](https://github.com/mlc-ai/xgrammar) (default): Supports JSON schema, regular expression, EBNF, and Lark grammar syntax through the `ebnf` parameter.
-  - XGrammar currently uses the [GGML BNF format](https://github.com/ggml-org/llama.cpp/blob/master/grammars/README.md).
+- [XGrammar](https://github.com/mlc-ai/xgrammar) (default): Supports JSON schema, regular expression, EBNF, and XGrammar's Lark dialect through the `ebnf` parameter.
+  - For EBNF, XGrammar uses the [GGML BNF format](https://github.com/ggml-org/llama.cpp/blob/master/grammars/README.md).
 - [Outlines](https://github.com/dottxt-ai/outlines): Supports JSON schema and regular expression constraints.
 
 If instead you want to initialize the Outlines backend, you can use `--grammar-backend outlines` flag:

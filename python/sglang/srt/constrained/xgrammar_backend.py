@@ -60,6 +60,8 @@ from sglang.srt.constrained.torch_ops.token_filter_torch_ops import (
 
 logger = logging.getLogger(__name__)
 MAX_ROLLBACK_TOKENS = 200
+# Older xgrammar releases (e.g. the 0.1.33 pinned for Intel XPU) cannot compile Lark.
+_XGRAMMAR_SUPPORTS_LARK = hasattr(GrammarCompiler, "compile_lark")
 
 
 def _allocate_token_bitmask(vocab_size: int, batch_size: int) -> torch.Tensor:
@@ -374,6 +376,9 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
             ctx = self.grammar_compiler.compile_grammar(key_string)
             dispatch_type = "ebnf"
         except RuntimeError as ebnf_error:
+            if not _XGRAMMAR_SUPPORTS_LARK:
+                logger.error(f"Hit invalid ebnf: {key_string=}, {ebnf_error=}")
+                return InvalidGrammarObject(str(ebnf_error))
             try:
                 ctx = self.grammar_compiler.compile_lark(key_string)
                 dispatch_type = "lark"
