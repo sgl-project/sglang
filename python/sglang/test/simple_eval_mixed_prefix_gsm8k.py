@@ -116,20 +116,9 @@ class GSM8KEval(Eval):
                 correct_answer=correct_answer,
                 extracted_answer=extracted_answer,
             )
-            metrics = {}
-            if self._answer_mode == "last_explicit":
-                legacy_answer = get_answer_value(response_text)
-                metrics["last_number_score"] = float(legacy_answer == correct_answer)
-                html += (
-                    "<p>Answer extraction: last_explicit (last_number fallback)</p>"
-                    f"<p>Last-number extracted answer: {legacy_answer}</p>"
-                    f"<p>Last-number score: {metrics['last_number_score']}</p>"
-                )
             convo = prompt_messages + [dict(content=response_text, role="assistant")]
 
-            return SingleEvalResult(
-                html=html, score=score, metrics=metrics, convo=convo
-            )
+            return SingleEvalResult(html=html, score=score, convo=convo)
 
         results = common.map_with_progress(
             fn, list(range(len(self._lines))), num_threads=self._num_threads

@@ -43,7 +43,7 @@ class TestGSM8KAnswerExtraction(CustomTestCase):
                     get_answer_value(response, prefer_explicit=True), explicit
                 )
 
-    def test_evaluator_preserves_both_scores_and_response(self):
+    def test_evaluator_uses_selected_answer_mode_and_preserves_response(self):
         responses = ["#### 45\nCheck: 1", "#### 12\nCorrection: 13"]
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "examples.jsonl"
@@ -69,15 +69,9 @@ class TestGSM8KAnswerExtraction(CustomTestCase):
                         [convo[-1]["content"] for convo in result.convos], responses
                     )
                     if mode == "last_explicit":
-                        self.assertEqual(result.metrics["last_number_score"], 0.5)
                         self.assertIn("Extracted Answer: 45", result.htmls[0])
-                        self.assertIn(
-                            "Last-number extracted answer: 1", result.htmls[0]
-                        )
                         self.assertIn("Extracted Answer: 12", result.htmls[1])
-                        self.assertIn("Last-number score: 1.0", result.htmls[1])
                     else:
-                        self.assertNotIn("last_number_score", result.metrics)
                         self.assertIn("Extracted Answer: 1", result.htmls[0])
 
     def test_invalid_mode_fails_before_loading_data(self):

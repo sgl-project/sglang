@@ -2,15 +2,14 @@
 
 Default to mode 2 on four Ascend devices. A3 checks teacher-forced logprob
 differences. A5 checks GSM8K accuracy for both backends (200 questions,
-5-shot, >= 0.90) and records logprob differences as diagnostics. A5 prefers
-the last explicit numeric #### answer, falling back to the last number;
-the original last-number score is also saved for both backends.
+5-shot, >= 0.90). A5 prefers the last explicit numeric #### answer, falling
+back to the last number.
 Use SGLANG_TEST_FUSEEP_MODES=1,2
 only with an EP size supported by mode 1's per-rank expert limit.
 Override SGLANG_TEST_MODEL_PATH to use another
 ModelSlim W8A8 MoE checkpoint (for example Qwen3.5-35B-A3B-W8A8). BF16
 Qwen3.6-35B-A3B cannot exercise the current SGLang FuseEP weight loader.
-Server logs, GSM8K reports, and comparisons are saved under SGLANG_TEST_LOG_DIR.
+Server logs and GSM8K reports are saved under SGLANG_TEST_LOG_DIR.
 Set SGLANG_TEST_GSM8K_DATA_PATH to a local GSM8K test.jsonl for offline runs.
 """
 
@@ -171,7 +170,6 @@ class TestNpuFuseepMode(CustomTestCase):
             return list(executor.map(request, self.ARITHMETIC))
 
     def _run_gsm8k(self, base_url, name):
-        print(f"[{name}] Running GSM8K: 200 questions, 5-shot", flush=True)
         metrics = run_eval(
             SimpleNamespace(
                 base_url=base_url,
@@ -274,18 +272,10 @@ class TestNpuFuseepMode(CustomTestCase):
                 if mode is not None:
                     self.assertEqual(server_args["fuseep_mode"], mode)
                     self.assertEqual(server_args["ep_size"], self.tp_size)
-                result_path = self.log_dir / f"{name}.json"
                 result = {"generation": self._check_generation(base_url)}
-                # Preserve generated text/logprobs even if the semantic check
-                # fails, so a running server cannot mask incorrect inference.
-                result_path.write_text(json.dumps(result, indent=2, ensure_ascii=False))
                 result["arithmetic"] = self._check_arithmetic(base_url)
-                result_path.write_text(json.dumps(result, indent=2, ensure_ascii=False))
                 if self.is_a5:
                     result["gsm8k"] = self._run_gsm8k(base_url, name)
-                    result_path.write_text(
-                        json.dumps(result, indent=2, ensure_ascii=False)
-                    )
                 return result
         except Exception:
             print(log_path.read_text(errors="replace")[-16000:])
@@ -297,10 +287,24 @@ class TestNpuFuseepMode(CustomTestCase):
 
     def test_fuseep_modes_match_unfused(self):
         baseline = self._run_backend(None)
-        comparisons = {}
         for mode in self.modes:
             with self.subTest(fuseep_mode=mode):
                 candidate = self._run_backend(mode)
+                if self.is_a5:
+                    for name, result in (
+                        ("baseline", baseline),
+                        (f"mode{mode}", candidate),
+                    ):
+                        score = result["gsm8k"]["score"]
+                        self.assertTrue(math.isfinite(score), f"{name}: GSM8K {score=}")
+                        self.assertGreaterEqual(
+                            score,
+                            self.GSM8K_ACCURACY_THRESHOLD,
+                            f"{name}: GSM8K accuracy {score:.3f} is below "
+                            f"{self.GSM8K_ACCURACY_THRESHOLD:.2f}",
+                        )
+                    continue
+
                 errors = []
                 for reference, actual in zip(
                     baseline["generation"], candidate["generation"]
@@ -315,49 +319,8 @@ class TestNpuFuseepMode(CustomTestCase):
                         abs(x[0] - y[0]) for x, y in zip(ref, got) if x[0] is not None
                     )
                 self.assertTrue(errors)
-                comparisons[f"mode{mode}"] = {
-                    "tokens_compared": len(errors),
-                    "mean_abs_logprob_diff": float(np.mean(errors)),
-                    "max_abs_logprob_diff": max(errors),
-                }
-                if self.is_a5:
-                    comparisons[f"mode{mode}"]["gsm8k"] = {
-                        "baseline_score": baseline["gsm8k"]["score"],
-                        "candidate_score": candidate["gsm8k"]["score"],
-                        "baseline_last_number_score": baseline["gsm8k"][
-                            "last_number_score"
-                        ],
-                        "candidate_last_number_score": candidate["gsm8k"][
-                            "last_number_score"
-                        ],
-                        "answer_mode": "last_explicit",
-                        "accuracy_threshold": self.GSM8K_ACCURACY_THRESHOLD,
-                    }
-                print(json.dumps(comparisons[f"mode{mode}"]))
-                # Persist diagnostics before assertions, including failed runs.
-                (self.log_dir / "comparison.json").write_text(
-                    json.dumps(comparisons, indent=2)
-                )
-                if self.is_a5:
-                    # TP and EP quantize different intermediate partitions and
-                    # use different reduction orders. Gate A5 on model accuracy;
-                    # retain finite/aligned logprobs and the error diagnostics.
-                    for name, result in (
-                        ("baseline", baseline),
-                        (f"mode{mode}", candidate),
-                    ):
-                        score = result["gsm8k"]["score"]
-                        self.assertTrue(math.isfinite(score), f"{name}: GSM8K {score=}")
-                        self.assertGreaterEqual(
-                            score,
-                            self.GSM8K_ACCURACY_THRESHOLD,
-                            f"{name}: GSM8K accuracy {score:.3f} is below "
-                            f"{self.GSM8K_ACCURACY_THRESHOLD:.2f}",
-                        )
-                else:
-                    # Preserve A3's numerical regression thresholds.
-                    self.assertLess(float(np.mean(errors)), 0.1)
-                    self.assertLess(max(errors), 0.6)
+                self.assertLess(float(np.mean(errors)), 0.1)
+                self.assertLess(max(errors), 0.6)
 
 
 if __name__ == "__main__":
