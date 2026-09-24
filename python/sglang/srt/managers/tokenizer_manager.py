@@ -105,6 +105,7 @@ from sglang.srt.managers.io_struct import (
 )
 from sglang.srt.managers.load_snapshot import create_load_snapshot_reader
 from sglang.srt.managers.mm_utils import wrap_shm_features
+from sglang.srt.managers.model_update_epoch import WEIGHT_UPDATE_MESSAGES
 from sglang.srt.managers.multimodal_processor import get_mm_processor, import_processors
 from sglang.srt.managers.schedule_batch import (
     MultimodalDataItem,
@@ -646,11 +647,15 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         )
 
     def _dispatch_to_scheduler(self, obj: Any) -> None:
+        if isinstance(obj, WEIGHT_UPDATE_MESSAGES):
+            self.model_update_epoch += 1
         if self.tokenizer_ipc_name is not None:
             stamp_http_worker_ipc(obj, self.tokenizer_ipc_name)
         sock_send(self.send_to_scheduler, obj)
 
     async def _async_dispatch_to_scheduler(self, obj: Any) -> None:
+        if isinstance(obj, WEIGHT_UPDATE_MESSAGES):
+            self.model_update_epoch += 1
         if self.tokenizer_ipc_name is not None:
             stamp_http_worker_ipc(obj, self.tokenizer_ipc_name)
         await async_sock_send(self.send_to_scheduler, obj)
@@ -715,6 +720,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             self.initial_weights_loaded = False
 
         # Weight updates
+        self.model_update_epoch = 0
         # The event to notify the weight sync is finished.
         self.model_update_lock = RWLock()
         self.model_update_result: Optional[Awaitable[UpdateWeightFromDiskReqOutput]] = (
@@ -2330,6 +2336,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         while True:
             with self.soft_watchdog.disable():
                 recv_obj = await async_sock_recv(self.recv_from_detokenizer)
+            if isinstance(recv_obj, WEIGHT_UPDATE_MESSAGES):
+                self.model_update_epoch += 1
             if isinstance(
                 recv_obj,
                 (BatchStrOutput, BatchEmbeddingOutput, BatchTokenIDOutput),

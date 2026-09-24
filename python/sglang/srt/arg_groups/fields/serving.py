@@ -62,6 +62,42 @@ class Serving(msgspec.Struct):
     # -------------------------------------------------------------------------
     # HTTP server
     # -------------------------------------------------------------------------
+    rawsystemone_max_options: A[
+        int, "Maximum suffix count per rawsystemone request."
+    ] = 128
+    rawsystemone_max_request_tokens: A[
+        int,
+        "Maximum cumulative full-candidate tokens per rawsystemone request, including duplicates.",
+    ] = 1048576
+    rawsystemone_max_candidates_per_batch: A[
+        int, "Maximum distinct candidates in a rawsystemone native submission batch."
+    ] = 32
+    rawsystemone_max_tokens_per_batch: A[
+        int,
+        "Full-input token target per rawsystemone batch; larger admissible candidates run alone.",
+    ] = 65536
+    rawsystemone_max_inflight_batches_per_request: A[
+        int, "Maximum concurrent rawsystemone batches per parent request."
+    ] = 2
+    rawsystemone_max_inflight_batches: A[
+        int,
+        "Server-wide maximum concurrent rawsystemone batches (single tokenizer worker only).",
+    ] = 8
+    rawsystemone_max_inflight_candidates: A[
+        int, "Server-wide maximum admitted rawsystemone candidate inputs."
+    ] = 256
+    rawsystemone_max_inflight_tokens: A[
+        int,
+        "Server-wide maximum admitted rawsystemone full-input tokens, including cached spans.",
+    ] = 1048576
+    rawsystemone_max_pending_requests: A[
+        int,
+        "Maximum active plus queued rawsystemone parent requests; overflow returns 429.",
+    ] = 64
+    rawsystemone_timeout_seconds: A[
+        float,
+        "Rawsystemone parent deadline including tokenization, admission, and inference.",
+    ] = 300.0
     host: A[str, "The host of the HTTP server."] = "127.0.0.1"
     port: A[int, "The port of the HTTP server."] = 30000
     fastapi_root_path: A[
