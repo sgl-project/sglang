@@ -1470,11 +1470,12 @@ class TestUnifiedRadixCacheQueuedWriteThrough(CustomTestCase):
 
     cfg = CacheConfig(page_size=2, kv_size=64, max_context_len=64)
 
-    def _build(self, nodes_per_step):
-        cache, allocator, _ = build_fixture(self.cfg)
+    def _build(self, nodes_per_step, cfg=None):
+        cfg = cfg or self.cfg
+        cache, allocator, _ = build_fixture(cfg)
         server_args = ServerArgs(
             model_path="dummy",
-            page_size=self.cfg.page_size,
+            page_size=cfg.page_size,
             hicache_io_backend="kernel",
             hicache_write_policy="write_through",
         )
@@ -1582,6 +1583,82 @@ class TestUnifiedRadixCacheQueuedWriteThrough(CustomTestCase):
         self.assertIsNone(cache.tree_core.get_write_through_pending_id(node))
         self.assertEqual(self._full_lock(cache, node), 0)
         cache.sanity_check()
+
+    def _host_alloc_calls(self, cache, failures=0):
+        """Count KV host allocations; the first `failures` calls return None."""
+        host_pool = cache.cache_controller.mem_pool_host
+        alloc = host_pool.alloc
+        calls = []
+
+        def counted(*args, **kwargs):
+            calls.append(args)
+            if len(calls) <= failures:
+                return None
+            return alloc(*args, **kwargs)
+
+        self.addCleanup(setattr, host_pool, "alloc", alloc)
+        host_pool.alloc = counted
+        return calls
+
+    def _assert_all_backed_up(self, cache, nodes):
+        cache.writing_check(write_back=True)
+        self.assertTrue(all(cache.tree_core.is_backuped(n) for n in nodes))
+        self.assertTrue(
+            all(cache.tree_core.get_write_through_pending_id(n) is None for n in nodes)
+        )
+        self.assertTrue(all(self._full_lock(cache, n) == 0 for n in nodes))
+        self.assertEqual(cache.ongoing_write_through, {})
+        cache.sanity_check()
+
+    def test_flush_backs_up_disjoint_queued_nodes_with_one_host_allocation(self):
+        cache, allocator = self._build(nodes_per_step=8)
+        seqs = ([1, 2, 3, 4], [5, 6, 7, 8], [9, 10, 11, 12])
+        for seq in seqs:
+            self._insert(cache, allocator, seq)
+        nodes = [self._leaf_for(cache, seq) for seq in seqs]
+        calls = self._host_alloc_calls(cache)
+
+        cache.flush_pending_backups()
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(cache.cache_controller.ack_write_queue[-1].node_ids, nodes)
+        self._assert_all_backed_up(cache, nodes)
+
+    def test_batch_allocation_failure_falls_back_to_node_by_node(self):
+        cache, allocator = self._build(nodes_per_step=8)
+        seqs = ([1, 2, 3, 4], [5, 6, 7, 8])
+        for seq in seqs:
+            self._insert(cache, allocator, seq)
+        nodes = [self._leaf_for(cache, seq) for seq in seqs]
+        # Only the merged allocation fails; the per-node retries succeed.
+        calls = self._host_alloc_calls(cache, failures=1)
+
+        cache.flush_pending_backups()
+        self.assertEqual(len(calls), 1 + len(nodes))
+        self._assert_all_backed_up(cache, nodes)
+
+    def test_child_in_the_swa_window_of_a_batched_parent_is_backed_up_after_it(self):
+        # The child's SWA window reaches into the parent, so batching both would
+        # back the parent's SWA slots up twice; the parent must commit first.
+        cfg = CacheConfig(
+            page_size=1,
+            components=(ComponentType.FULL, ComponentType.SWA),
+            sliding_window_size=4,
+            kv_size=64,
+            max_context_len=64,
+        )
+        cache, allocator = self._build(nodes_per_step=8, cfg=cfg)
+        self._insert(cache, allocator, [1, 2, 3, 4])
+        parent = self._leaf_for(cache, [1, 2, 3, 4])
+        self._insert(cache, allocator, [1, 2, 3, 4, 5, 6])
+        child = self._leaf_for(cache, [1, 2, 3, 4, 5, 6])
+        self.assertEqual(list(cache.queued_backups), [parent, child])
+
+        cache.flush_pending_backups()
+        self.assertEqual(
+            [ack.node_ids for ack in cache.cache_controller.ack_write_queue],
+            [[parent, child]],
+        )
+        self._assert_all_backed_up(cache, [parent, child])
 
     def test_default_cap_backs_up_at_insert_time(self):
         cache, allocator = self._build(nodes_per_step=0)

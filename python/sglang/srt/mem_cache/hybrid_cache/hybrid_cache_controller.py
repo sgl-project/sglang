@@ -328,9 +328,11 @@ class HybridCacheController(BaseHiCacheController):
         node_id: int = -1,
         extra_pools: Optional[list[PoolTransfer]] = None,
         flush: bool = True,
+        node_ids: Optional[list[int]] = None,
     ) -> Optional[torch.Tensor]:
         """Queue a D2H backup; flush=False leaves it queued so the caller can
-        merge several nodes into one start_writing() submit."""
+        merge several nodes into one start_writing() submit. node_ids, when
+        given, replaces node_id as the op's ack list for a multi-node backup."""
         host_indices = self.mem_pool_host.alloc(len(device_indices))
         if host_indices is None:
             return None
@@ -343,15 +345,16 @@ class HybridCacheController(BaseHiCacheController):
             self.mem_pool_host.free(host_indices)
             return None
 
-        self.write_queue.append(
-            CacheOperation(
-                host_indices,
-                device_indices,
-                node_id,
-                priority,
-                pool_transfers=pool_transfers or None,
-            )
+        operation = CacheOperation(
+            host_indices,
+            device_indices,
+            node_id,
+            priority,
+            pool_transfers=pool_transfers or None,
         )
+        if node_ids is not None:
+            operation.node_ids = list(node_ids)
+        self.write_queue.append(operation)
         if flush:
             self.start_writing()
         return host_indices
