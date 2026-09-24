@@ -1181,6 +1181,15 @@ class ResponseEventStreamTest(unittest.TestCase):
         self.assertEqual((opening["type"], opening["start"], opening["end"]), ("region_open", 0, len("<call:get_weather>")))
         self.assertEqual(opening["captures"], {"name": "get_weather"})
 
+    def test_held_prefix_bytes_are_not_rechunked(self):
+        spec = {"start_anchor": "[BEGIN]", "fields": {"content": {}, "tag": {"open": "<tag>", "close": "</tag>"}}}
+        parser = ResponseParser(spec, prefix="[BEGIN]Existing <")
+        chunks = [event["text"] for event in parser.feed("b> tail") if event["type"] == "region_chunk"]
+        message, _ = parser.finalize()
+
+        self.assertEqual(chunks, ["b> tail"])
+        self.assertEqual(message["content"], "Existing <b> tail")
+
     def test_malformed_region_events_recover_and_continue(self):
         spec = {
             "start_anchor": "[BEGIN]",

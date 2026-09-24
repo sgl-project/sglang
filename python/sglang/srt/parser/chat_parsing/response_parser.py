@@ -159,6 +159,7 @@ class ResponseParser:
         self._body: str = ""
         self._opened: bool = False
         self._finalized: bool = False
+        self._prefix_len: int = 0
         self._malformed_fields: set[str] = set()
         self.initial_events: list[dict] = []
         if prefix:
@@ -183,6 +184,7 @@ class ResponseParser:
             return
         self._buffer = truncated
         self._process(self.initial_events, eos=False)
+        self._prefix_len = len(truncated)
 
     def feed(self, text: str) -> list[dict]:
         """Feeds more text/tokens from the model output into the tokenizer, and returns any events that result
@@ -359,8 +361,11 @@ class ResponseParser:
             events.append({"type": "region_open", "field": self._current, "start": self._pos, "end": self._pos})
             self._opened = True
         self._body += text
-        dirty = field.content not in STREAMABLE_PARSERS
-        events.append({"type": "region_chunk", "field": self._current, "text": text, "dirty": dirty})
+        # Prefix bytes held back as a possible delimiter belong to the prompt, not the chunk.
+        text = text[max(0, self._prefix_len - self._pos) :]
+        if text:
+            dirty = field.content not in STREAMABLE_PARSERS
+            events.append({"type": "region_chunk", "field": self._current, "text": text, "dirty": dirty})
 
     def _open_explicit(self, events: list[dict], field: ResponseTemplateField, m: Any) -> None:
         self._current = field.name
