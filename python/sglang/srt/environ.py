@@ -1539,9 +1539,6 @@ class Envs:
     # Per-rank local query rows (after DP-attention sharding when enabled),
     # not request ISL.
     SGLANG_OPT_DSV4_NONPAGED_INDEXER_MIN_QUERY_TOKENS = EnvInt(8192)
-    # Re-prefill this many trailing tokens on a DSV4-on-NPU cache hit so the
-    # request rewrites its own non-content-stable c4 state / SWA window. 0 = off.
-    SGLANG_DSV4_NPU_REPREFILL_TAIL = EnvInt(0)
     SGLANG_OPT_USE_JIT_INDEXER_METADATA = EnvBool(True)
     SGLANG_OPT_USE_ONLINE_COMPRESS = EnvBool(False)
     SGLANG_EXPERIMENTAL_ONLINE_C128_MTP = EnvBool(False)

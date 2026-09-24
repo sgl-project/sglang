@@ -580,10 +580,7 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         # Only the unified_kv compress-only HiCache layout needs to hold back a
         # trailing sliding window for re-prefill; every other cache keeps SWA
         # content-stable and overrides this where relevant.
-        # SGLANG_DSV4_NPU_REPREFILL_TAIL opts in (default 0 = unchanged).
-        from sglang.srt.environ import envs
-
-        return envs.SGLANG_DSV4_NPU_REPREFILL_TAIL.get()
+        return 0
 
     def supports_mamba(self) -> bool:
         return False
