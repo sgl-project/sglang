@@ -2188,9 +2188,7 @@ def set_mamba_track_indices_from_reqs(
     spec track plan, see mamba_lazy_spec_prepare).
     """
     req_to_token_pool = batch.req_to_token_pool
-    all_buffers = req_to_token_pool.req_index_to_mamba_ping_pong_track_buffer_mapping[
-        batch.req_pool_indices
-    ]  # (bs, ping_pong_size), int64, on device
+    mapping = req_to_token_pool.req_index_to_mamba_ping_pong_track_buffer_mapping
     if track_positions is None:
         # Guard: mamba_next_track_idx may be None for requests that haven't
         # gone through _alloc_ping_pong_buffer yet (e.g., spec v2 verify path).
@@ -2204,6 +2202,20 @@ def set_mamba_track_indices_from_reqs(
             for req in batch.reqs
         ]
     batch.mamba_track_buffer_indices = list(track_positions)
+    if (
+        mapping.is_cuda
+        and track_positions
+        and all(pos == track_positions[0] for pos in track_positions)
+    ):
+        from sglang.kernels.ops.mamba.mamba_state_scatter_triton import (
+            gather_mamba_track_indices,
+        )
+
+        batch.mamba_track_indices = gather_mamba_track_indices(
+            mapping, batch.req_pool_indices, uniform_position=track_positions[0]
+        )
+        return
+
     idx = (
         torch.tensor(
             track_positions,
@@ -2211,11 +2223,21 @@ def set_mamba_track_indices_from_reqs(
             pin_memory=True,
         )
         .unsqueeze(1)
-        .to(device=all_buffers.device, non_blocking=True)
+        .to(device=mapping.device, non_blocking=True)
     )
-    batch.mamba_track_indices = (
-        torch.gather(all_buffers, 1, idx).squeeze(1).to(torch.int64)
-    )
+    if mapping.is_cuda:
+        from sglang.kernels.ops.mamba.mamba_state_scatter_triton import (
+            gather_mamba_track_indices,
+        )
+
+        batch.mamba_track_indices = gather_mamba_track_indices(
+            mapping, batch.req_pool_indices, idx.squeeze(1)
+        )
+    else:
+        all_buffers = mapping[batch.req_pool_indices]
+        batch.mamba_track_indices = (
+            torch.gather(all_buffers, 1, idx).squeeze(1).to(torch.int64)
+        )
 
 
 def release_req(

@@ -893,3 +893,58 @@ def track_mamba_states_all_layers(
         BLOCK_SIZE,
         check_freed_slots,
     )
+
+
+@triton.jit
+def _gather_mamba_track_indices_kernel(
+    mapping,
+    requests,
+    positions,
+    output,
+    N: tl.constexpr,
+    ROWS: tl.constexpr,
+    ROW_STRIDE: tl.constexpr,
+    COL_STRIDE: tl.constexpr,
+    REQ_STRIDE: tl.constexpr,
+    POS_STRIDE: tl.constexpr,
+    BLOCK: tl.constexpr,
+    HAS_POSITIONS: tl.constexpr,
+    UNIFORM_POSITION,
+):
+    i = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    req = tl.load(requests + i * REQ_STRIDE, i < N, other=0).to(tl.int64)
+    req = tl.where(req < 0, req + ROWS, req)
+    if HAS_POSITIONS:
+        pos = tl.load(positions + i * POS_STRIDE, i < N, other=0).to(tl.int64)
+    else:
+        pos = tl.full((), 0, tl.int64) + UNIFORM_POSITION
+    value = tl.load(mapping + req * ROW_STRIDE + pos * COL_STRIDE, i < N, other=0)
+    tl.store(output + i, value, i < N)
+
+
+def gather_mamba_track_indices(
+    mapping, requests, positions=None, uniform_position=None
+):
+    n = requests.numel()
+    if positions is not None:
+        assert positions.numel() == n
+    else:
+        assert uniform_position is not None and 0 <= uniform_position < mapping.shape[1]
+    output = torch.empty((n,), dtype=torch.int64, device=mapping.device)
+    if n:
+        _gather_mamba_track_indices_kernel[(triton.cdiv(n, 128),)](
+            mapping,
+            requests,
+            positions,
+            output,
+            n,
+            mapping.shape[0],
+            mapping.stride(0),
+            mapping.stride(1),
+            requests.stride(0),
+            positions.stride(0) if positions is not None else 0,
+            BLOCK=128,
+            HAS_POSITIONS=positions is not None,
+            UNIFORM_POSITION=uniform_position if positions is None else 0,
+        )
+    return output
