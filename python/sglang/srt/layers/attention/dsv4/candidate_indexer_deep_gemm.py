@@ -53,6 +53,20 @@ class SparseBlockTable(CandidateMetadata):
     ready: torch.cuda.Event
 
 
+@dataclass
+class CapturedPrefillSparseBlockTable(CandidateMetadata):
+    """Graph-local candidate blocks consumed by paged sparse DeepGEMM.
+
+    Unlike :class:`SparseBlockTable`, this table stays on the capture stream and
+    therefore needs neither a ready event nor physical blocks for its top-k.
+    The consumer maps the selected logical positions through ``req_to_token``.
+    """
+
+    blocks: torch.Tensor
+    schedule: torch.Tensor
+    valid_lens: torch.Tensor
+
+
 def amax_topk_blocks(
     logits: torch.Tensor,
     seq_lens: torch.Tensor,
@@ -110,7 +124,7 @@ def sparse_logits(
     q_sf: torch.Tensor,
     k_cache: torch.Tensor,
     weights: torch.Tensor,
-    table: SparseBlockTable,
+    table: SparseBlockTable | CapturedPrefillSparseBlockTable,
 ) -> torch.Tensor:
     """bf16 logits ``[rows, topk_blocks * 8]`` of the published blocks: ``q_fp4``
     ``[rows, 1, heads, 64]`` int8 with ``q_sf`` ``[rows, 1, heads]`` int32 (packed
@@ -125,6 +139,36 @@ def sparse_logits(
         table.schedule,
         table.blocks.shape[1],
         CANDIDATE_BLOCK_SIZE,
+    )
+
+
+def captured_prefill_sparse_table(
+    logits: torch.Tensor,
+    seq_lens: torch.Tensor,
+    page_table: torch.Tensor,
+    page_size: int,
+    request_ids: torch.Tensor,
+    topk_blocks: int,
+    q_dtype: torch.dtype,
+) -> CapturedPrefillSparseBlockTable:
+    """Publish graph-safe logical block ids for later sparse consumers."""
+    nblocks, valid_lens = candidate_row_lens(seq_lens, topk_blocks)
+    blocks = amax_topk_blocks(logits, seq_lens, nblocks, topk_blocks)
+    # DeepGEMM consumes ascending logical blocks. The returned physical block
+    # table is unnecessary because graph consumers publish logical positions.
+    sort_candidate_blocks(blocks, seq_lens, page_table, page_size)
+    schedule = build_sparse_indexer_schedule(
+        blocks,
+        seq_lens,
+        page_table,
+        page_size,
+        q_dtype,
+        request_ids,
+    )
+    return CapturedPrefillSparseBlockTable(
+        blocks=blocks,
+        schedule=schedule,
+        valid_lens=valid_lens,
     )
 
 

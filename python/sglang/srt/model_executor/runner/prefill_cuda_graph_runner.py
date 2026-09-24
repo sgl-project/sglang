@@ -542,9 +542,31 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         ) and should_enable_cp_bcg_capture(server_args)
         if self.enable_cp_bcg_capture:
             if self.max_context_size is not None:
-                # TODO(SYChen123): Preserve max_seq_len_override through CP's padded
-                # metadata preparation before enabling the fixed context limit.
-                self._ignore_max_context_size("CP breakable prefill CUDA graph")
+                is_v41 = (
+                    getattr(
+                        getattr(model_runner.model_config, "hf_config", None),
+                        "model_type",
+                        None,
+                    )
+                    == "deepseek_v41"
+                )
+                if (
+                    is_v41
+                    and prefill_config.max_seq_len is not None
+                    and prefill_config.max_seq_len <= self.max_context_size
+                ):
+                    # CP's padded metadata cannot use max_seq_len_override;
+                    # max_seq_len still bounds admission and indexer width.
+                    logger.info(
+                        "CP prefill graph uses max_seq_len=%d for admission "
+                        "and indexer width (configured max-context=%d); "
+                        "skipping fixed metadata override.",
+                        prefill_config.max_seq_len,
+                        self.max_context_size,
+                    )
+                    self.max_context_size = None
+                else:
+                    self._ignore_max_context_size("CP breakable prefill CUDA graph")
             self.capture_num_tokens = filter_prefill_cp_bcg_capture_num_tokens(
                 self.capture_num_tokens, server_args
             )
@@ -701,6 +723,9 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
 
     def _get_layer_model_positions(self, forward_batch: ForwardBatch) -> torch.Tensor:
         """Mirror outer multimodal wrappers when BCG captures layer_model directly."""
+        cp_positions = getattr(forward_batch, "_cp_positions", None)
+        if cp_positions is not None:
+            return cp_positions
         if forward_batch.mrope_positions is None:
             return forward_batch.positions
 
@@ -782,7 +807,9 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             if self._uses_eager_prefill_tail():
                 # BCG / Full: capture the transformer body only.
                 positions = self._get_layer_model_positions(forward_batch)
-                input_ids = forward_batch.input_ids
+                input_ids = getattr(
+                    forward_batch, "_cp_input_ids", forward_batch.input_ids
+                )
                 kwargs = _build_layer_model_forward_kwargs(
                     self.layer_model, forward_batch, pp_proxy_tensors
                 )
@@ -1337,9 +1364,9 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             batch_max_context_len=batch_max_context_len,
         ):
             return False
-        if getattr(self, "enable_cp_bcg_capture", False) and is_cp_active(
-            forward_batch
-        ):
+        if getattr(self, "enable_cp_bcg_capture", False):
+            if not is_cp_active(forward_batch):
+                return False
             assert self.prefill_cp_bcg_input is not None
             if (
                 self.prefill_cp_bcg_input.select_replay_bucket_for_batch(
