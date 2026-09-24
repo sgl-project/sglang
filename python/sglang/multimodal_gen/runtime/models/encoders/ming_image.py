@@ -300,6 +300,10 @@ class MingImageEncoder(TextEncoder):
         self.vision = Qwen2_5VLVisionTransformer(
             SimpleNamespace(**config.vision_config)
         )
+        # Ming casts vision RoPE buffers with the model, unlike Qwen2.5-VL
+        self.vision.rotary_pos_emb.inv_freq = self.vision.rotary_pos_emb.inv_freq.to(
+            self.vision.dtype
+        )
         self.vision.merger.ln_q.cast_x_before_out_mul = False
         for block in self.vision.blocks:
             block.norm1.cast_x_before_out_mul = False

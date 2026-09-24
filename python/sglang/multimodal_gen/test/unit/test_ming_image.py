@@ -33,6 +33,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.m
 from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
 from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe import fused_experts
 from sglang.srt.layers.moe.topk import StandardTopKOutput
+from sglang.srt.runtime_context import get_context
 
 
 @pytest.mark.parametrize("mode,multi", [("zero_masked", False), ("learned", True)])
@@ -175,9 +176,10 @@ def test_moe_preserves_bf16_activation_before_fp32_combine():
         inplace=False,
         top_k=2,
     )
-    actual = fused_experts(
-        x, w13, w2, StandardTopKOutput(weights, ids.int(), None), config
-    )
+    with get_context().override_server_args(model_path="dummy"):
+        actual = fused_experts(
+            x, w13, w2, StandardTopKOutput(weights, ids.int(), None), config
+        )
     expected = torch.empty_like(actual)
     for expert in range(4):
         rows, slots = torch.where(ids == expert)
