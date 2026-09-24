@@ -2608,10 +2608,12 @@ def msgpack_decode(data: bytes) -> Any:
 
 def sock_send(socket: zmq.Socket, obj: Any, flags: int = 0) -> None:
     if _USE_PICKLE_IPC:
-        socket.send_pyobj(obj, flags=flags, protocol=pickle.HIGHEST_PROTOCOL)
+        socket.send_pyobj(
+            obj, flags=flags, protocol=pickle.HIGHEST_PROTOCOL, copy=False
+        )
         return
 
-    socket.send(msgpack_encode(obj), flags=flags)
+    socket.send(msgpack_encode(obj), flags=flags, copy=False)
 
 
 def sock_recv(socket: zmq.Socket, flags: int = 0) -> Any:
@@ -2624,10 +2626,12 @@ def sock_recv(socket: zmq.Socket, flags: int = 0) -> Any:
 
 async def async_sock_send(socket: zmq.asyncio.Socket, obj: Any, flags: int = 0) -> None:
     if _USE_PICKLE_IPC:
-        await socket.send_pyobj(obj, flags=flags, protocol=pickle.HIGHEST_PROTOCOL)
+        await socket.send_pyobj(
+            obj, flags=flags, protocol=pickle.HIGHEST_PROTOCOL, copy=False
+        )
         return
 
-    await socket.send(msgpack_encode(obj), flags=flags)
+    await socket.send(msgpack_encode(obj), flags=flags, copy=False)
 
 
 async def async_sock_recv(socket: zmq.asyncio.Socket, flags: int = 0) -> Any:
