@@ -3,10 +3,8 @@ import logging
 import re
 from typing import Any, Optional
 
-from sglang.srt.function_call.core_types import (
-    StreamingParseResult,
-    ToolCallItem,
-)
+from sglang.srt.function_call.core_types import (StreamingParseResult,
+                                                 ToolCallItem)
 from sglang.srt.function_call.deepseekv32_detector import DeepSeekV32Detector
 
 logger = logging.getLogger(__name__)
