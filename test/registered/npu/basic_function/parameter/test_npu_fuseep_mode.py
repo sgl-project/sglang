@@ -2,7 +2,9 @@
 
 Default to mode 2 on four Ascend devices. A3 checks teacher-forced logprob
 differences. A5 checks GSM8K accuracy for both backends (200 questions,
-5-shot, >= 0.90) and records logprob differences as diagnostics.
+5-shot, >= 0.90) and records logprob differences as diagnostics. A5 prefers
+the last explicit numeric #### answer, falling back to the last number;
+the original last-number score is also saved for both backends.
 Use SGLANG_TEST_FUSEEP_MODES=1,2
 only with an EP size supported by mode 1's per-rank expert limit.
 Override SGLANG_TEST_MODEL_PATH to use another
@@ -53,7 +55,7 @@ class TestNpuFuseepMode(CustomTestCase):
         "Python example:\ndef add(a, b):\n    return a + b\n\nadd(2, 3) returns 5.",
     ]
     ARITHMETIC = [(2, 3, 5), (7, 8, 15), (12, 5, 17), (20, 30, 50)]
-    # Match the existing Qwen3-30B-A3B W8A8 FuseEP model accuracy test.
+    # Use the Qwen3-30B-A3B W8A8 FuseEP model test's sample count and threshold.
     GSM8K_NUM_EXAMPLES = 200
     GSM8K_ACCURACY_THRESHOLD = 0.90
 
@@ -182,6 +184,7 @@ class TestNpuFuseepMode(CustomTestCase):
                 max_tokens=512,
                 temperature=0,
                 gsm8k_data_path=os.environ.get("SGLANG_TEST_GSM8K_DATA_PATH"),
+                gsm8k_answer_mode="last_explicit",
             )
         )
         # run_eval uses the model name for its report, so preserve each backend
@@ -193,6 +196,7 @@ class TestNpuFuseepMode(CustomTestCase):
             "num_examples": self.GSM8K_NUM_EXAMPLES,
             "num_shots": 5,
             "accuracy_threshold": self.GSM8K_ACCURACY_THRESHOLD,
+            "answer_mode": "last_explicit",
         }
 
     def _run_backend(self, mode):
@@ -320,6 +324,13 @@ class TestNpuFuseepMode(CustomTestCase):
                     comparisons[f"mode{mode}"]["gsm8k"] = {
                         "baseline_score": baseline["gsm8k"]["score"],
                         "candidate_score": candidate["gsm8k"]["score"],
+                        "baseline_last_number_score": baseline["gsm8k"][
+                            "last_number_score"
+                        ],
+                        "candidate_last_number_score": candidate["gsm8k"][
+                            "last_number_score"
+                        ],
+                        "answer_mode": "last_explicit",
                         "accuracy_threshold": self.GSM8K_ACCURACY_THRESHOLD,
                     }
                 print(json.dumps(comparisons[f"mode{mode}"]))

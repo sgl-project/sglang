@@ -4,10 +4,15 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.run_eval import _run_sgl_eval, run_eval
+from sglang.test.simple_eval_mixed_prefix_gsm8k import (
+    INVALID,
+    GSM8KEval,
+    get_answer_value,
+)
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=6, suite="stage-a-test-cpu-intel")
@@ -17,6 +22,67 @@ def _write_fake_metrics(out_parent: Path, eval_name: str, payload: dict) -> None
     run_dir = out_parent / f"sgl_eval_{eval_name}_20260101-000000"
     run_dir.mkdir(parents=True, exist_ok=True)
     (run_dir / "metrics.json").write_text(json.dumps(payload))
+
+
+class TestGSM8KAnswerExtraction(CustomTestCase):
+    def test_explicit_answers_and_legacy_default(self):
+        examples = [
+            ("Distance: #### 45\nLet me check: 0.5 * 30 = 1", 45, 1),
+            ("#### -1,234.50\nCheck item 9", -1234.5, 9),
+            ("#### 12\nCorrection: #### 13", 13, 13),
+            # The fixed rule must not choose whichever answer matches the label.
+            ("#### 12\nCorrection: the answer is 13", 12, 13),
+            ("The answer is 42", 42, 42),
+            ("#### 1/2\nThe answer is 3", 3, 3),
+            ("No numeric answer", INVALID, INVALID),
+        ]
+        for response, explicit, legacy in examples:
+            with self.subTest(response=response):
+                self.assertEqual(get_answer_value(response), legacy)
+                self.assertEqual(
+                    get_answer_value(response, prefer_explicit=True), explicit
+                )
+
+    def test_evaluator_preserves_both_scores_and_response(self):
+        responses = ["#### 45\nCheck: 1", "#### 12\nCorrection: 13"]
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "examples.jsonl"
+            path.write_text(
+                "\n".join(
+                    json.dumps({"question": f"Question {i}", "answer": f"#### {gold}"})
+                    for i, gold in enumerate((45, 13))
+                )
+            )
+            for mode in ("last_number", "last_explicit"):
+                with self.subTest(mode=mode):
+                    sampler = Mock(side_effect=responses)
+                    sampler._pack_message.side_effect = lambda **kwargs: kwargs
+                    result = GSM8KEval(
+                        num_examples=2,
+                        num_threads=1,
+                        num_shots=0,
+                        data_path=str(path),
+                        answer_mode=mode,
+                    )(sampler)
+                    self.assertEqual(result.score, 0.5)
+                    self.assertEqual(
+                        [convo[-1]["content"] for convo in result.convos], responses
+                    )
+                    if mode == "last_explicit":
+                        self.assertEqual(result.metrics["last_number_score"], 0.5)
+                        self.assertIn("Extracted Answer: 45", result.htmls[0])
+                        self.assertIn(
+                            "Last-number extracted answer: 1", result.htmls[0]
+                        )
+                        self.assertIn("Extracted Answer: 12", result.htmls[1])
+                        self.assertIn("Last-number score: 1.0", result.htmls[1])
+                    else:
+                        self.assertNotIn("last_number_score", result.metrics)
+                        self.assertIn("Extracted Answer: 1", result.htmls[0])
+
+    def test_invalid_mode_fails_before_loading_data(self):
+        with self.assertRaisesRegex(ValueError, "Unsupported GSM8K answer mode"):
+            GSM8KEval(answer_mode="pick_correct_answer")
 
 
 class TestRunSglEval(CustomTestCase):

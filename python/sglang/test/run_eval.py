@@ -316,6 +316,7 @@ def run_eval(args):
             num_threads=args.num_threads,
             num_shots=getattr(args, "num_shots", 5),
             data_path=getattr(args, "gsm8k_data_path", None),
+            answer_mode=getattr(args, "gsm8k_answer_mode", "last_number"),
         )
     elif args.eval_name == "mixed_prefix_gsm8k":
         from sglang.test.simple_eval_mixed_prefix_gsm8k import MixedPrefixGSM8KEval
@@ -505,6 +506,13 @@ if __name__ == "__main__":
         type=str,
         default=None,
         help="Path to GSM8K data file (e.g., test.jsonl)",
+    )
+    parser.add_argument(
+        "--gsm8k-answer-mode",
+        choices=["last_number", "last_explicit"],
+        default="last_number",
+        help="Native GSM8K answer extraction; last_explicit prefers the last numeric "
+        "#### answer and falls back to the last number, retaining the original score",
     )
     parser.add_argument(
         "--mixed-prefix-gsm8k-secondary-pool-size",

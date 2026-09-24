@@ -32,7 +32,16 @@ def get_few_shot_examples(lines, k):
     return "".join(get_one_example(lines, i, True) + "\n\n" for i in range(k))
 
 
-def get_answer_value(answer_str):
+def get_answer_value(answer_str, *, prefer_explicit=False):
+    if prefer_explicit:
+        # Match the numeric #### answer format demonstrated by the few-shot
+        # examples. Subsequent unmarked reasoning may end at an unrelated number.
+        # Pick the last marked answer without consulting the reference label.
+        marked = re.findall(
+            r"####[ \t]*([-+]?\d[\d,]*(?:\.\d+)?)(?![\w,./])", answer_str
+        )
+        if marked:
+            answer_str = marked[-1]
     answer_str = answer_str.replace(",", "")
     numbers = re.findall(r"-?\d+\.?\d*", answer_str)
     if len(numbers) < 1:
@@ -50,7 +59,11 @@ class GSM8KEval(Eval):
         num_threads: int = 64,
         num_shots: int = 5,
         data_path: Optional[str] = None,
+        answer_mode: str = "last_number",
     ):
+        if answer_mode not in ("last_number", "last_explicit"):
+            raise ValueError(f"Unsupported GSM8K answer mode: {answer_mode}")
+        self._answer_mode = answer_mode
         self._num_threads = num_threads
         self._num_shots = num_shots
 
@@ -91,7 +104,9 @@ class GSM8KEval(Eval):
             except Exception:
                 response_text = ""
 
-            extracted_answer = get_answer_value(response_text)
+            extracted_answer = get_answer_value(
+                response_text, prefer_explicit=self._answer_mode == "last_explicit"
+            )
             score = float(extracted_answer == correct_answer)
 
             html = common.jinja_env.from_string(HTML_JINJA).render(
@@ -101,9 +116,20 @@ class GSM8KEval(Eval):
                 correct_answer=correct_answer,
                 extracted_answer=extracted_answer,
             )
+            metrics = {}
+            if self._answer_mode == "last_explicit":
+                legacy_answer = get_answer_value(response_text)
+                metrics["last_number_score"] = float(legacy_answer == correct_answer)
+                html += (
+                    "<p>Answer extraction: last_explicit (last_number fallback)</p>"
+                    f"<p>Last-number extracted answer: {legacy_answer}</p>"
+                    f"<p>Last-number score: {metrics['last_number_score']}</p>"
+                )
             convo = prompt_messages + [dict(content=response_text, role="assistant")]
 
-            return SingleEvalResult(html=html, score=score, convo=convo)
+            return SingleEvalResult(
+                html=html, score=score, metrics=metrics, convo=convo
+            )
 
         results = common.map_with_progress(
             fn, list(range(len(self._lines))), num_threads=self._num_threads
