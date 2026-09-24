@@ -8,8 +8,9 @@
 // multi-step-trained MTP head. Multimodal (text + image in, text out).
 //
 // Every datacenter recipe on this page is single-node: BF16 and FP8 run TP4 (so
-// four GPUs of an 8-GPU H200/B200/B300 host, or a whole 4-GPU GB300 node), NVFP4
-// uses TP1 for RadixArk and TP4 for NVIDIA on B200; the AMD cells run TP8. That fits because 6B active
+// four GPUs of an 8-GPU H200/B200/B300 host, or a whole 4-GPU GB300 node).
+// Both RadixArk and NVIDIA NVFP4 support TP1; the NVIDIA B200 recipe here was
+// verified at TP4. The AMD cells run TP8. That fits because 6B active
 // params keeps compute small and the N-gram table is the only large weight block.
 // The one multi-node shape is NVFP4 on a pair of DGX Sparks (GB10): the 126 GiB
 // checkpoint does not fit one 128 GB unified-memory box with the N-gram table
