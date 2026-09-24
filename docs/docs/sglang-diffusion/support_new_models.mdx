@@ -57,6 +57,39 @@ When moving internal helpers, update all callers, tests, and cookbook examples
 together. Preserve documented registration and serving entry points; do not
 add re-export chains just to retain obsolete internal utility paths.
 
+## Add a backend-specific implementation
+
+Keep the same ownership boundaries when a model needs another tensor framework
+or hardware backend. An MLX DiT is still a model component; its framework does
+not make it hardware infrastructure. Use a backend suffix within the existing
+domain, for example:
+
+| Responsibility | MLX example |
+| --- | --- |
+| DiT architecture and checkpoint mapping | `runtime/models/dits/qwen_image21_mlx.py` |
+| Text and vision encoders | `runtime/models/encoders/qwen3vl_mlx.py`, `qwen3vl_vision_mlx.py` |
+| VAE architecture and checkpoint mapping | `runtime/models/vaes/qwen_image21_mlx.py` |
+| Pipeline registration and stage wiring | `runtime/pipelines/qwen_image21_mlx.py` |
+| Model-specific request processing and execution | `runtime/pipelines_core/stages/model_specific_stages/qwen_image21_mlx.py` |
+| Model-independent MLX weight loading | `runtime/loader/mlx_loader.py` |
+
+Keep checkpoint key mappings, architecture checks, and tensor-layout conversions
+with the model component they describe. Shared loaders can handle framework-level
+loading and quantization without importing a particular model family. Device
+selection belongs in `runtime/platforms/`; reusable kernels and layers belong in
+their existing runtime domains. Do not create a parallel model tree under
+`hardware_backend/` to isolate optional dependencies.
+
+Keep optional framework imports behind the existing platform or backend entry
+boundary. Importing or discovering the standard pipelines must still work when
+that framework is absent. Avoid eager imports from package `__init__.py` files
+and compatibility re-exports for moved internal modules.
+
+Before submitting, verify both the backend's real entry point and discovery of
+the existing pipelines without its optional dependency. Review file ownership
+separately from numerical correctness: a working model does not validate its
+directory structure.
+
 ## Out-of-Tree Models and Pipelines
 
 An installed package can register native component models and a pipeline

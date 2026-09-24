@@ -7,6 +7,10 @@ import { DiffusionModelCatalog } from '/src/snippets/diffusion/model-catalog.jsx
 
 ## Qwen-Image 2.1 integration status
 
+Apple Silicon has a separate experimental native MLX pipeline for the community
+Q4 weight pack. Its precision and feature support differ from the CUDA pipeline
+described below; see the [MLX recipe](/cookbook/diffusion/Qwen-Image/Qwen-Image-2.1#apple-silicon-mlx).
+
 Qwen-Image 2.1 has a separate native pipeline for text-to-image and optional
 reference-image conditioning. Full-checkpoint validation on H200 includes
 1024×1024, 40-step generation and editing. Reference comparisons use

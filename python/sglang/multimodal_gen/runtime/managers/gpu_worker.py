@@ -458,7 +458,9 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         peak_reserved_bytes = final_snapshot.peak_reserved_mb * (1024**2)
         peak_allocated_bytes = final_snapshot.peak_allocated_mb * (1024**2)
 
-        output_batch.peak_memory_mb = peak_reserved_bytes / (1024**2)
+        output_batch.peak_memory_mb = max(
+            output_batch.peak_memory_mb, peak_reserved_bytes / (1024**2)
+        )
         peak_reserved_gb = peak_reserved_bytes / (1024**3)
         peak_allocated_gb = peak_allocated_bytes / (1024**3)
 
@@ -1095,7 +1097,9 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
                 self._runtime_peak_allocated_mb, snapshot.peak_allocated_mb
             )
         if self.is_output_rank:
-            output_batch.peak_memory_mb = snapshot.peak_reserved_mb
+            output_batch.peak_memory_mb = max(
+                output_batch.peak_memory_mb, snapshot.peak_reserved_mb
+            )
 
     def _record_replica_peak_memory(self, output_metrics: list[Any]) -> None:
         """Record replica-wide loading and runtime allocator peaks."""
