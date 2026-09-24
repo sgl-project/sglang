@@ -69,8 +69,8 @@ def _make_batch_str_output() -> BatchStrOutput:
         output_token_ids_logprobs_val=[[], []],
         output_token_ids_logprobs_idx=[[], []],
         output_token_entropy_val=[0.0, 0.0],
-        output_token_sampling_mask=[[], []],
-        output_token_sampling_logprobs=[[], []],
+        output_token_sampling_mask=[[[7, 8]], [[9]]],
+        output_token_sampling_logprobs=[[[-0.5, -1.0]], [[0.0]]],
         output_hidden_states=[None, None],
         routed_experts=[None, None],
         indexer_topk=[None, None],
@@ -116,6 +116,17 @@ class TestMultiTokenizerMixin(unittest.TestCase):
         self.assertEqual(
             _handle_output_by_index(output, 1).weight_versions,
             [[WeightVersionSpan(version="v2", start=0, end=2)]],
+        )
+
+    def test_batch_str_output_keeps_sampling_distribution_aligned(self):
+        output = _make_batch_str_output()
+
+        single_output = _handle_output_by_index(output, 0)
+
+        self.assertEqual(single_output.output_token_sampling_mask, [[[7, 8]]])
+        self.assertEqual(
+            single_output.output_token_sampling_logprobs,
+            [[[-0.5, -1.0]]],
         )
 
     def test_batch_str_output_without_weight_versions_stays_none(self):
