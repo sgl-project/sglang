@@ -28,6 +28,7 @@ maybe_stub_sgl_kernel()
 from sglang.srt.lora.lora_registry import LoRARef, LoRARegistry
 from sglang.srt.managers.io_struct import UnloadLoRAAdapterReqInput
 from sglang.srt.managers.tokenizer_manager import ReqState, TokenizerManager
+from sglang.srt.runtime_context import get_context
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -181,12 +182,18 @@ class TestLruSkipsNonReloadable(CustomTestCase):
 
 
 class TestUnloadRefCacheCleanup(CustomTestCase):
+    def setUp(self):
+        # unload reads --enable-lora / dp_size off the runtime context, not server_args
+        config = get_context().override_server_args(
+            enable_lora=True, dp_size=1, enable_dp_attention=False
+        )
+        config.install()
+        self.addCleanup(config.restore)
+
     def _make_unload_tm(self, success: bool) -> TokenizerManager:
         tm = TokenizerManager.__new__(TokenizerManager)
         tm.auto_create_handle_loop = Mock()
-        tm.server_args = MagicMock()
-        tm.server_args.enable_lora = True
-        tm.server_args.dp_size = 1
+        tm._pending_lora_publications = {}
         tm.lora_update_lock = asyncio.Lock()
         tm._unload_lora_adapter_locked = AsyncMock(
             return_value=SimpleNamespace(success=success)
