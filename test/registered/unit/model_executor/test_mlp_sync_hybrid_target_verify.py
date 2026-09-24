@@ -53,7 +53,7 @@ def _sync(forward_mode, num_reqs, global_num_tokens):
             get_exec=lambda: no_prefill_graph,
             _elastic_should_preserve_local_token_counts=lambda **kwargs: False,
             dp_gather_slot=lambda: 0,
-            set_dp_buffer_len=lambda *args: None,
+            set_dp_buffer_len_from_batch=lambda *args: None,
             set_is_extend_in_batch=lambda *args: None,
             _is_cpu=True,
         ),
