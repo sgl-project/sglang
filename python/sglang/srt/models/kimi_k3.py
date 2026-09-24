@@ -129,6 +129,7 @@ from sglang.srt.utils.common import (
     BumpAllocator,
     add_prefix,
     get_bool_env_var,
+    get_device_sm,
     rank0_log,
     require_mlp_sync,
     set_weight_attrs,
@@ -208,7 +209,9 @@ def _k3_bf16_gemm(
                 use_cutedsl_bf16_gemm,
             )
 
-            if use_cutedsl_bf16_gemm(x.shape[0], weight.shape[0], weight.shape[1]):
+            if use_cutedsl_bf16_gemm(x.shape[0], weight.shape[0], weight.shape[1]) or (
+                x.shape[0] in (8, 16) and weight.shape == (2432, 7168)
+            ):
                 if out is None:
                     return cutedsl_bf16_gemm(x, weight)
                 return cutedsl_bf16_gemm_out(x, weight, out)
@@ -442,6 +445,11 @@ class KimiK3MoE(nn.Module):
         # Merged front weight ([H, gate_up + E + latent]), built after weight
         # loading by _merge_front_weights().
         self._front_w: Optional[torch.Tensor] = None
+        self._gemm_ag_down_eligible = False
+        self._sharded_front_enabled = self.tp_size == 8 and get_device_sm() in (
+            103,
+            107,
+        )
         self._front_sizes: Optional[List[int]] = None
         # True when _front_w merges only [gate, routed_expert_down_proj] (the EP
         # a2a pair) rather than the three-way fused-front weight.
@@ -721,6 +729,15 @@ class KimiK3MoE(nn.Module):
             return
         self._front_w, self._front_sizes = _merge_weights_as_views(mods)
         self._front_is_ep_pair = len(mods) == 2
+        self._gemm_ag_down_eligible = (
+            self._sharded_front_enabled
+            and self.alt_stream is not None
+            and self._front_sizes == [1536, 896, 3584]
+            and self._front_w.dtype == torch.bfloat16
+            and k3_ar_fusion.gemm_ag_down_fits(16)
+        )
+        if self._gemm_ag_down_eligible and self.layer_idx == 1:
+            logger.info("K3 sharded front: existing GEMM/all-gather, 8/16 token rows")
         # Invalidate the cached properties.
         for prop in (
             "_eligible_for_fused_front",
@@ -1318,13 +1335,8 @@ class KimiK3MoE(nn.Module):
     def _forward_fused(
         self, hidden_states: torch.Tensor, *, prefix_sum: Optional[torch.Tensor]
     ) -> torch.Tensor:
-        """Fused-front pipeline: read hidden_states once through the merged
-        [H, gate_up + E + latent] weight, then land both TP-partial sums in
-        one flat symmetric [latent | shared] buffer with zero copies — the
-        shared down GEMM writes its slice via out=, the MoE runner writes
-        its top-k sum via the zero-copy context — and all-reduce the pair
-        in a single collective (the symmetric mempool keeps the one-shot
-        allreduce path; same trick as RowParallelLinear)."""
+        """Run the merged or sharded front, then reduce expert outputs through
+        the symmetric [latent | shared] buffer."""
         if TYPE_CHECKING:  # NOTE: precondition for this case
             assert (
                 self._front_w is not None
@@ -1336,14 +1348,29 @@ class KimiK3MoE(nn.Module):
             )
 
         num_tokens, hidden_size = hidden_states.shape
-        fused = _k3_bf16_gemm(
-            hidden_states,
-            self._front_w,
-            out_dtype=torch.float32 if self._front_fp32 else None,
-        )
-        gate_up, router_logits, routed_input = torch.split(
-            fused, self._front_sizes, dim=-1
-        )
+        if self._gemm_ag_down_eligible and num_tokens in (8, 16):
+            latent_start = sum(self._front_sizes[:2])
+            current_stream = torch.cuda.current_stream()
+            self.alt_stream.wait_stream(current_stream)
+            with torch.cuda.stream(self.alt_stream):
+                front = _k3_bf16_gemm(
+                    hidden_states, self._front_w[:latent_start], out_dtype=torch.float32
+                )
+            routed_input = k3_ar_fusion.gemm_ag_down_proj(
+                x=hidden_states, weight=self._front_w[latent_start:]
+            )
+            current_stream.wait_stream(self.alt_stream)
+            front.record_stream(current_stream)
+            gate_up, router_logits = front.split(self._front_sizes[:2], dim=-1)
+        else:
+            fused = _k3_bf16_gemm(
+                hidden_states,
+                self._front_w,
+                out_dtype=torch.float32 if self._front_fp32 else None,
+            )
+            gate_up, router_logits, routed_input = torch.split(
+                fused, self._front_sizes, dim=-1
+            )
         if num_tokens > 1 and _is_hip and not _aiter_k3_opt:
             router_logits = router_logits.contiguous()
         if self._moe_front_needs_dense_bf16:

@@ -1,14 +1,7 @@
-"""K3 column-parallel up_proj + multicast all-gather + add3 (bf16, TP8).
+"""K3 TP8 projections with multicast gather through the shared push workspace.
 
-One entry point over ``csrc/kimi_k3/comm/gemm_ag.cuh``: for the latent MoE
-up_proj ([M, 3584] x [3584, 7168]) at small decode M, every rank computes
-only its 896-column slice of the replicated GEMM (the C++ side slices the
-full weight itself), multicast-stores it into the CustomAllReduceV2 push
-workspace (one more user of its double-buffer phase protocol), and a
-Lamport-spin consumer assembles ``out = up_proj(x) + b (+ c)`` — reading
-1/8 of the weight bytes per rank instead of all of them. Needs
-:func:`sglang.kernels.ops.kimi_k3.all_reduce.register_comm` once beforehand
-(the same registration the push all-reduce uses).
+Call ``kimi_k3.all_reduce.register_comm`` first;
+serialize these operations with other users of the communicator's push workspace.
 """
 
 from __future__ import annotations
@@ -41,8 +34,9 @@ MAX_TOKENS = 12
 
 
 @cache_once
-def _jit_module() -> Module:
-    args = make_cpp_args(K, N, MAX_TOKENS, is_arch_support_pdl())
+def _jit_module(fp32: bool = False) -> Module:
+    k, n, max_tokens = (N, K, 16) if fp32 else (K, N, MAX_TOKENS)
+    args = make_cpp_args(k, n, max_tokens, is_arch_support_pdl(), fp32)
     cls = f"GEMMAGKernel<{args}>"
     return load_jit(
         "kimi_k3_gemm_ag",
@@ -58,11 +52,13 @@ def _gemm_ag_op(
     world_size: int,
     x: torch.Tensor,
     weight: torch.Tensor,
-    b: torch.Tensor,
+    b: Optional[torch.Tensor],
     c: Optional[torch.Tensor],
     out: torch.Tensor,
 ) -> None:
-    _jit_module().run(_COMM_MAP[world_size], x, weight, b, c, out)
+    _jit_module(out.dtype == torch.float32).run(
+        _COMM_MAP[world_size], x, weight, b, c, out
+    )
 
 
 def gemm_ag_up_proj(
@@ -80,4 +76,13 @@ def gemm_ag_up_proj(
     row block); ``b`` / ``c`` / ``out`` are [M, 7168] (``out`` is
     output-only)."""
     _gemm_ag_op(world_size, x, weight, b, c, out)
+    return out
+
+
+def gemm_ag_down_proj(
+    *, world_size: int, x: torch.Tensor, weight: torch.Tensor
+) -> torch.Tensor:
+    """Gather FP32 latent output from the full BF16 [3584, 7168] weight."""
+    out = x.new_empty((x.shape[0], K), dtype=torch.float32)
+    _gemm_ag_op(world_size=world_size, x=x, weight=weight, b=None, c=None, out=out)
     return out

@@ -114,6 +114,68 @@ def _symmetric_tensor(shape):
 
 
 @torch.inference_mode()
+def test_front_projection_push_interleaving():
+    """FP32 projection must preserve values and mailbox phases across graph replays."""
+    _require_sm100()
+    if int(os.environ["WORLD_SIZE"]) != 8:
+        pytest.skip("K3 front projection requires TP8")
+    _init_comm()
+    rank = dist.get_rank()
+    generator = torch.Generator(device=_device()).manual_seed(42)
+    values = torch.randint(
+        -2, 3, (16, 7168), generator=generator, device=_device()
+    ).bfloat16()
+    weight = torch.randint(
+        -2, 3, (3584, 7168), generator=generator, device=_device()
+    ).bfloat16()
+    # Integer inputs make the independent FP32 matmul exact.
+    expected = values.float() @ weight.float().T
+    weight[: rank * 448].zero_()
+    weight[(rank + 1) * 448 :].zero_()
+    x = torch.zeros_like(values)
+    reduced = torch.empty(7168, device=_device(), dtype=torch.bfloat16)
+    residual = torch.zeros_like(reduced)
+
+    def run():
+        outputs = tuple(
+            gemm_ag.gemm_ag_down_proj(world_size=8, x=x[:rows], weight=weight)
+            for rows in (8, 16)
+        )
+        # Three collectives alternate the starting mailbox phase on each replay.
+        reduced.fill_(rank + 1)
+        all_reduce.all_reduce_push_res(world_size=8, x=reduced, residual=residual)
+        return outputs
+
+    run()
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        outputs = run()
+    for scale in (0, 1, -1) * 2:
+        x.copy_(values * scale)
+        graph.replay()
+        for rows, out in zip((8, 16), outputs):
+            torch.testing.assert_close(out, expected[:rows] * scale, rtol=0, atol=0)
+        torch.testing.assert_close(
+            reduced, torch.full_like(reduced, 36), rtol=0, atol=0
+        )
+    del graph
+
+
+@torch.inference_mode()
+def test_front_projection_alignment():
+    _require_sm100()
+    if int(os.environ["WORLD_SIZE"]) != 8:
+        pytest.skip("K3 front projection requires TP8")
+    _init_comm()
+    x = torch.zeros(8, 7168, device=_device(), dtype=torch.bfloat16)
+    weight = torch.zeros(3584, 7168, device=_device(), dtype=torch.bfloat16)
+    out = torch.empty(8 * 3584 + 1, device=_device())[1:].view(8, 3584)
+    with pytest.raises(RuntimeError, match="not aligned"):
+        gemm_ag._gemm_ag_op(world_size=8, x=x, weight=weight, b=None, c=None, out=out)
+
+
+@torch.inference_mode()
 def test_all_reduce_push():
     _require_sm100()
     comm = _init_comm()
@@ -346,6 +408,7 @@ def _precompile(num_gpus):
         gemm_ar._jit_module(_GEMM_AR_K_TOTAL // world_size, world_size)
     if _GEMM_AG_WORLD_SIZE in num_gpus:
         gemm_ag._jit_module()
+        gemm_ag._jit_module(fp32=True)
     attn_res._jit_fused_tma_module(4, 1, 200)
 
 
