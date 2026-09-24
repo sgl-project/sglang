@@ -95,17 +95,20 @@ class SamplingMaskStatus(IntEnum):
 
 @dataclasses.dataclass
 class SamplingMaskOutput:
-    """Tensor result for opted-in rows in batch order."""
+    """Sampling-support IDs and optional full-support behavior logprobs."""
 
     token_ids: torch.Tensor
     lengths: torch.Tensor
     selected_logprobs: torch.Tensor
+    support_logprobs: Optional[torch.Tensor]
     statuses: torch.Tensor
 
     def map_device_tensors(self, fn) -> None:
         self.token_ids = fn(self.token_ids)
         self.lengths = fn(self.lengths)
         self.selected_logprobs = fn(self.selected_logprobs)
+        if self.support_logprobs is not None:
+            self.support_logprobs = fn(self.support_logprobs)
         self.statuses = fn(self.statuses)
 
 
@@ -222,11 +225,13 @@ class LogitsProcessorOutput:
         List[Union[List[float], torch.Tensor]]
     ] = None
     next_token_token_ids_logprobs_idx: Optional[List] = None
-    # Post-filter support IDs, bounded by server capacity, and selected-token
-    # logprob over the full realized support.
+    # Post-filter support IDs and requested behavior logprobs, bounded by server
+    # capacity. Logprobs are normalized over the full realized support.
     sampling_mask_output: Optional[SamplingMaskOutput] = None
     next_token_sampling_mask_idx: Optional[List[Optional[List[int]]]] = None
-    next_token_sampling_logprobs: Optional[List[Optional[float]]] = None
+    next_token_sampling_logprobs: Optional[
+        List[Optional[Union[float, List[float]]]]
+    ] = None
     next_token_sampling_mask_status: Optional[List[Optional[int]]] = None
 
     ## Part 3: Prefill-only. This part will be assigned in python/sglang/srt/layers/logits_processor.py::LogitsProcessor

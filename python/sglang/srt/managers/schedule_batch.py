@@ -164,6 +164,7 @@ logger = logging.getLogger(__name__)
 
 
 ReturnHiddenStatesMode = Union[bool, Literal["last"]]
+SamplingLogprobsMode = Literal["selected", "support"]
 
 
 def get_return_hidden_states_mode(
@@ -943,6 +944,7 @@ class Req(ReqDllmMixin):
         dllm_config: Optional[DllmConfig] = None,
         token_ids_logprob: List[int] = None,
         return_sampling_mask: bool = False,
+        sampling_logprobs_mode: SamplingLogprobsMode = "selected",
         return_flat_raw_top_logprobs: bool = False,
         stream: bool = False,
         origin_input_ids_unpadded: Optional[array[int]] = None,
@@ -1179,6 +1181,7 @@ class Req(ReqDllmMixin):
         self.temp_scaled_logprobs = False
         self.top_p_normalized_logprobs = False
         self.return_sampling_mask = return_sampling_mask
+        self.sampling_logprobs_mode = sampling_logprobs_mode
         self.return_flat_raw_top_logprobs = return_flat_raw_top_logprobs
 
         # Logprobs (return values)
