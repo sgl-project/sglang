@@ -30,26 +30,39 @@ pytestmark = pytest.mark.skipif(
 
 @pytest.fixture(
     params=[
-        ("Design", False, "off"),
-        ("Design-Layer", False, "off"),
-        ("Design-Layer", True, "off"),
-        ("Design", False, "request"),
-        ("Design-Layer", False, "request"),
+        ("Design", False, "off", False),
+        ("Design-Layer", False, "off", False),
+        ("Design-Layer", True, "off", False),
+        ("Design", False, "request", False),
+        ("Design-Layer", False, "request", False),
+        ("Design-Layer", False, "off", True),
     ],
-    ids=["design-cold", "layer-cold", "layer-tiled", "design-warm", "layer-warm"],
+    ids=[
+        "design-cold",
+        "layer-cold",
+        "layer-tiled",
+        "design-warm",
+        "layer-warm",
+        "layer-offload",
+    ],
 )
 def case(request):
-    checkpoint, tiled, warmup = request.param
+    checkpoint, tiled, warmup, offload = request.param
+    extras = [
+        "--performance-mode speed",
+        f"--warmup-mode {warmup}",
+        f"--vae-tiling {str(tiled).lower()}",
+    ]
+    if offload:
+        extras.append(
+            "--component-residency text_encoder=layerwise-offload transformer=layerwise-offload"
+        )
     return DiffusionTestCase(
-        f"ming_image_{checkpoint.lower()}_{'tiled' if tiled else 'full'}_{warmup}",
+        f"ming_image_{checkpoint.lower()}_{'offload' if offload else 'tiled' if tiled else 'full'}_{warmup}",
         DiffusionServerArgs(
             model_path=f"inclusionAI/Ming-Image-0.1-{checkpoint}",
             modality="image",
-            extras=[
-                "--performance-mode speed",
-                f"--warmup-mode {warmup}",
-                f"--vae-tiling {str(tiled).lower()}",
-            ],
+            extras=extras,
         ),
         DiffusionSamplingParams(output_size="512x512"),
     )
