@@ -144,8 +144,6 @@ class TestNPUDeepSeekV4ProW4A88PIn128kOut1kPrefix90(
     temperature = 0.6
     top_p = 0.95
     request_rate = float("inf")
-    # TODO: calibrate tpot / output_token_throughput / ttft baselines on the
-    # first successful run, then set them here to enable regression assertions.
     max_attempts = 3
     pop_sglang_is_in_ci_for_gsp = True
 
