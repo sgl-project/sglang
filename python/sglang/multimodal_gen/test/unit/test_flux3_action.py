@@ -13,6 +13,7 @@ from sglang.multimodal_gen.configs.models.dits.flux3 import (
 )
 from sglang.multimodal_gen.configs.pipeline_configs.flux3_action import (
     Flux3ActionPipelineConfig,
+    _validate_parallelism,
     flux3_action_variant_subfolder,
     is_flux3_action_package,
     read_flux3_action_config,
@@ -26,6 +27,7 @@ from sglang.multimodal_gen.runtime.models.schedulers.scheduling_flow_unipc_multi
     FlowUniPCMultistepScheduler,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.flux3_action import (
+    _cfg_parallel_policy,
     cosmos_unipc,
     denormalize,
     normalize,
@@ -105,6 +107,45 @@ def test_policy_config_rejects_unsupported_profiles():
     config = Flux3ActionPipelineConfig()
     with pytest.raises(NotImplementedError):
         config.load_policy_config({**DROID_CONFIG, "inference_profile": "history"})
+
+
+def _parallel_args(**overrides):
+    args = dict(
+        num_gpus=2,
+        enable_cfg_parallel=True,
+        cfg_parallel_degree=2,
+        tp_size=1,
+        sp_degree=1,
+    )
+    return SimpleNamespace(**{**args, **overrides})
+
+
+def test_multi_gpu_serving_requires_two_way_cfg_parallel():
+    """Layouts the DiT does not shard (TP, SP) must be refused, not run replicated."""
+    _validate_parallelism(_parallel_args(num_gpus=1, enable_cfg_parallel=False))
+    _validate_parallelism(_parallel_args())
+    for overrides in (
+        dict(enable_cfg_parallel=False, cfg_parallel_degree=1, sp_degree=2),
+        dict(enable_cfg_parallel=False, cfg_parallel_degree=1, tp_size=2),
+        dict(num_gpus=4, sp_degree=2),
+        dict(num_gpus=4, tp_size=2),
+    ):
+        with pytest.raises(NotImplementedError):
+            _validate_parallelism(_parallel_args(**overrides))
+
+
+def test_cfg_parallel_branches_are_conditional_then_unconditional():
+    """The combine reads ``cond, uncond = preds``; a swapped order inverts guidance."""
+    cond, uncond = object(), object()
+    policy = _cfg_parallel_policy([cond, uncond], _parallel_args())
+    assert [b.kwargs["context"] for b in policy.branches] == [cond, uncond]
+    assert [b.is_conditional for b in policy.branches] == [True, False]
+    assert policy.parallel_uses_serial_arithmetic
+    assert _cfg_parallel_policy([cond], _parallel_args()) is None
+    assert (
+        _cfg_parallel_policy([cond, uncond], _parallel_args(enable_cfg_parallel=False))
+        is None
+    )
 
 
 def test_variant_subfolders():

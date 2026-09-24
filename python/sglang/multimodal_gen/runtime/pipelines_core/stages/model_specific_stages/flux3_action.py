@@ -31,6 +31,10 @@ from sglang.multimodal_gen.configs.pipeline_configs.flux3_action import (
     Flux3ActionPipelineConfig,
 )
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
+from sglang.multimodal_gen.runtime.distributed.cfg_parallel_utils import (
+    run_cfg_parallel,
+)
+from sglang.multimodal_gen.runtime.distributed.cfg_policy import CFGBranch, CFGPolicy
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
     ComponentUse,
@@ -265,11 +269,17 @@ def _observation_canvas(
     if config.camera_layout == "grid":
         hw = (max(c.shape[-2] for c in cams), max(c.shape[-1] for c in cams))
         cams = [
-            F.interpolate(
-                c[None], size=hw, mode="bilinear", align_corners=False, antialias=True
-            )[0]
-            if tuple(c.shape[-2:]) != hw
-            else c
+            (
+                F.interpolate(
+                    c[None],
+                    size=hw,
+                    mode="bilinear",
+                    align_corners=False,
+                    antialias=True,
+                )[0]
+                if tuple(c.shape[-2:]) != hw
+                else c
+            )
             for c in cams
         ]
     return _compose_canvas(
@@ -391,6 +401,28 @@ def cosmos_unipc(
             for k in samples
         }
     return samples
+
+
+def _cfg_parallel_policy(
+    contexts: list[Flux3SegmentState], server_args: ServerArgs
+) -> CFGPolicy | None:
+    """CFG-parallel branches of the denoising passes; None runs every context locally."""
+    if not server_args.enable_cfg_parallel:
+        return None
+    if len(contexts) == 1:
+        logger.warning_once(
+            "CFG parallel is enabled but the request has no CFG; "
+            "every rank runs the same single pass"
+        )
+        return None
+    cond, uncond = contexts
+    return CFGPolicy(
+        branches=[
+            CFGBranch("conditional", True, {"context": cond}),
+            CFGBranch("unconditional", False, {"context": uncond}),
+        ],
+        parallel_uses_serial_arithmetic=True,
+    )
 
 
 # ---------------------------------------------------------------- stages
@@ -653,6 +685,7 @@ class Flux3ActionDenoisingStage(PipelineStage):
         ropes = {k: self.transformer.rope(v.to(device)) for k, v in ids.items()}
         video_cond, action_cond = conditioning
         order = list(samples)  # joint sequence: video, video_cond, action, action_cond
+        cfg_policy = _cfg_parallel_policy(contexts, server_args)
         step = 0
 
         def predict(
@@ -674,12 +707,21 @@ class Flux3ActionDenoisingStage(PipelineStage):
                     for name in order
                 }
                 streams = [targets["video"], video_cond, targets[order[1]], action_cond]
-                preds = [
-                    self.transformer.denoise(
+
+                def denoise(ctx: Flux3SegmentState) -> tuple[torch.Tensor, ...]:
+                    out = self.transformer.denoise(
                         context=ctx, streams=streams, targets=order
                     )
-                    for ctx in contexts
-                ]
+                    return tuple(out[k] for k in order)
+
+                if cfg_policy is not None:
+                    # Each rank runs one branch; all ranks get both predictions.
+                    raw = run_cfg_parallel(
+                        cfg_policy, lambda branch: denoise(branch.kwargs["context"])
+                    )
+                else:
+                    raw = [denoise(ctx) for ctx in contexts]
+                preds = [dict(zip(order, p)) for p in raw]
             step += 1
             if len(preds) == 1:
                 return {k: v.float() for k, v in preds[0].items()}

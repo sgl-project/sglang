@@ -181,6 +181,22 @@ def is_flux3_action_package(model_path: str) -> bool:
     )
 
 
+def _validate_parallelism(server_args: Any) -> None:
+    """Multi-GPU serving splits the conditional / unconditional passes (CFG parallel)."""
+    if server_args.num_gpus == 1:
+        return
+    cfg_only = (
+        server_args.enable_cfg_parallel
+        and server_args.cfg_parallel_degree == server_args.num_gpus == 2
+        and server_args.tp_size == 1
+        and server_args.sp_degree == 1
+    )
+    if not cfg_only:
+        raise NotImplementedError(
+            "FLUX 3 Action runs on one GPU, or on two with --enable-cfg-parallel"
+        )
+
+
 @dataclass
 class Flux3ActionPipelineConfig(PipelineConfig):
     """FLUX 3 Action: joint video + action flow matching, returns action chunks."""
@@ -246,8 +262,7 @@ class Flux3ActionPipelineConfig(PipelineConfig):
 
     def validate_server_args(self, server_args: Any) -> None:
         super().validate_server_args(server_args)
-        if server_args.num_gpus > 1:
-            raise NotImplementedError("FLUX 3 Action runs on a single GPU")
+        _validate_parallelism(server_args)
         variant = server_args.model_variant or "base"
         package = resolve_flux3_action_package(
             server_args.model_path,
