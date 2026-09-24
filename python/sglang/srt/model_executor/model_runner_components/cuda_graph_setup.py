@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING, Any, Optional
 import msgspec
 
 from sglang.srt.configs.model_config import ModelImpl
-from sglang.srt.distributed import get_world_group
+from sglang.srt.distributed.parallel_state import get_world_group
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     prealloc_symmetric_memory_pool,
 )
