@@ -186,6 +186,12 @@ class Serving(msgspec.Struct):
         bool,
         "Return number of cached tokens in usage.prompt_tokens_details for each openai request.",
     ] = False
+    enable_incremental_chat_tokenization: A[
+        bool,
+        "Reuse the token ids of a chat request's previously seen history and encode only "
+        "the new messages. Output is identical to a full encode; speeds up time to first "
+        "token on long multi-turn conversations. Fast tokenizers only.",
+    ] = False
     return_input_ids: A[
         bool,
         "Return prompt (input) token ids on the response-level sglext extension for every chat completion request, as if return_input_ids_in_sglext were set on the request.",

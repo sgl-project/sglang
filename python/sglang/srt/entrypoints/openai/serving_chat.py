@@ -46,6 +46,9 @@ from sglang.srt.entrypoints.openai import (
     encoding_dsv32,
     encoding_dsv41,
 )
+from sglang.srt.entrypoints.openai.incremental_chat_tokenizer import (
+    IncrementalChatTokenizer,
+)
 from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionMessageContentTextPart,
     ChatCompletionMessageContentVideoPart,
@@ -371,6 +374,22 @@ class OpenAIServingChat(OpenAIServingBase):
         self._chat_template_cache: OrderedDict[bytes, tuple[tuple[int, ...], str]] = (
             OrderedDict()
         )
+        self._incremental_chat_tokenizer = self._make_incremental_chat_tokenizer()
+
+    def _make_incremental_chat_tokenizer(self) -> Optional[IncrementalChatTokenizer]:
+        if not get_serving().enable_incremental_chat_tokenization:
+            return None
+        tokenizer = self.tokenizer_manager.tokenizer
+        if (
+            self._prompt_text_round_trip_is_lossy
+            or not IncrementalChatTokenizer.supports(tokenizer)
+        ):
+            logger.warning(
+                "--enable-incremental-chat-tokenization needs a fast tokenizer whose "
+                "rendered prompt round-trips through text; using full tokenization"
+            )
+            return None
+        return IncrementalChatTokenizer(tokenizer)
 
     def _probe_prompt_text_round_trip(self) -> bool:
         """Does rendering the chat template to text and re-encoding lose anything?
@@ -1781,9 +1800,24 @@ class OpenAIServingChat(OpenAIServingBase):
                 return_dict=False,
                 **template_kwargs,
             )
-            prompt_ids = self.tokenizer_manager.tokenizer.encode(
-                rendered_prompt, **encode_kwargs
-            )
+            prompt_ids = None
+            if self._incremental_chat_tokenizer is not None:
+                try:
+                    prompt_ids = self._incremental_chat_tokenizer.encode(
+                        messages,
+                        rendered_prompt,
+                        tools=tools,
+                        template_kwargs=template_kwargs,
+                        encode_kwargs=encode_kwargs,
+                    )
+                except Exception:
+                    logger.exception(
+                        "Incremental chat tokenization failed; using full tokenization"
+                    )
+            if prompt_ids is None:
+                prompt_ids = self.tokenizer_manager.tokenizer.encode(
+                    rendered_prompt, **encode_kwargs
+                )
         decoded_prompt = (
             self.tokenizer_manager.tokenizer.decode(prompt_ids)
             if cache_key is not None
