@@ -50,6 +50,13 @@ _HIP = frozenset({CapabilityRequirement.HIP})
 # ---------------------------------------------------------------------------
 _SPECS: tuple[tuple[str, KernelBackend, str, frozenset, str], ...] = (
     (
+        "diffusion.gelu_tanh_cat",
+        KernelBackend.JIT,
+        "activation.gelu_tanh_cat_jit:fused_gelu_tanh_cat",
+        _CUDA,
+        "BF16 tanh GELU plus channel concatenation.",
+    ),
+    (
         "diffusion.apply_group_norm_silu",
         KernelBackend.TRITON,
         "norm.group_norm_silu:apply_group_norm_silu",
@@ -295,6 +302,13 @@ _SPECS: tuple[tuple[str, KernelBackend, str, frozenset, str], ...] = (
         "HunyuanVideo QKV pack + RoPE.",
     ),
     (
+        "diffusion.joint_qkv_cat",
+        KernelBackend.TRITON,
+        "layout.joint_qkv_cat_triton:joint_qkv_cat",
+        _CUDA,
+        "Concatenate image/text QKV views into joint attention inputs.",
+    ),
+    (
         "diffusion.rmsnorm_preserve_reduction",
         KernelBackend.TRITON,
         "norm.rmsnorm_preserve_reduction:rmsnorm_preserve_reduction",
@@ -520,7 +534,9 @@ for _op, _backend, _target, _caps, _description in _SPECS:
 # then symbol; a new public kernel belongs here and nowhere else.
 # ---------------------------------------------------------------------------
 _EXPORTS: dict[str, str] = {
-    "load_extension_with_recovery": "ext.loader",
+    "can_use_fused_gelu_tanh_cat": "activation.gelu_tanh_cat_jit",
+    "fused_gelu_tanh_cat": "activation.gelu_tanh_cat_jit",
+    "load_extension_with_recovery": "sglang.srt.utils.cpp_extension_loader",
     # Normalization: RMSNorm / LayerNorm / GroupNorm and their fused epilogues
     "can_defer_flux2_gated_residual": "norm.flux2_gated_resnorm_jit",
     "can_use_flux2_gated_resnorm": "norm.flux2_gated_resnorm_jit",
@@ -589,6 +605,8 @@ _EXPORTS: dict[str, str] = {
     # Rotary embeddings and the QK-norm chains fused around them
     "try_fused_flux2_qkv_epilogue": "sglang.kernels.kda_kernels.flux2_qkv_epilogue_jit",
     "hunyuan_qkv_rope_pack": "rope.hunyuan_qkv_pack_triton",
+    "can_use_joint_qkv_cat": "layout.joint_qkv_cat_triton",
+    "joint_qkv_cat": "layout.joint_qkv_cat_triton",
     "can_use_ltx2_qknorm_split_rope_cuda": "sglang.kernels.kda_kernels.ltx2_qknorm_split_rope_jit",
     "ltx2_qknorm_split_rope_cuda": "sglang.kernels.kda_kernels.ltx2_qknorm_split_rope_jit",
     "apply_ltx2_split_rotary_emb": "rope.ltx2_rotary_triton",
