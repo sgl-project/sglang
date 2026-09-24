@@ -1,4 +1,5 @@
 import sys
+import threading
 import unittest
 from array import array
 from collections import defaultdict
@@ -872,6 +873,16 @@ def test_layer_counter_reports_failure_after_the_forward():
     assert counter.finish(index) is False
 
 
+def test_layer_counter_finish_waits_for_layers_still_loading():
+    counter = LayerWiseLoadCounter(1)
+    index = counter.update_producer()
+    loader = threading.Timer(0.05, counter.complete, (index, 0))
+    loader.start()
+
+    assert counter.finish(index) is True  # the forward never waited on layer 0
+    loader.join()
+
+
 def test_finish_loads_adopts_a_peer_rank_failure():
     reduce = MagicMock(side_effect=lambda value, op: value.fill_(0))
     wrapper = UnifiedCacheLinkerWrapper(
@@ -1267,6 +1278,7 @@ def test_linker_load_preserves_swa_boundaries(
         prefix_indices=torch.empty(0, dtype=torch.int64),
         last_node=0,
         priority=0,
+        swa_branching_seqlen=2,  # inside the loaded tail
     )
     restored, last_node = wrapper.load_back(req)
 
@@ -1280,6 +1292,7 @@ def test_linker_load_preserves_swa_boundaries(
         return
     assert restored.tolist() == list(range(4))
     assert wrapper.inflight_load_rids == ["rid"]
+    assert req.swa_branching_seqlen is None
     assert req.kv.swa_evicted_seqlen == expected_boundary
     assert req.kv.kv_allocated_len == (previous_boundary or 4)
     assert [c.args[0] for c in full.build_external_linker_transfer.call_args_list] == [

@@ -113,10 +113,14 @@ class LayerWiseLoadCounter:
 
     def finish(self, index: int) -> bool:
         """Wait for every layer of batch ``index``; True when all of them landed."""
-        futures = self.futures.pop(index, None)
+        futures = self.futures.get(index)
         if futures is None:
             return True
-        return all(future.exception() is None for future in futures)
+        # Wait before dropping the entry: the load thread still completes the
+        # layers the forward never waited on through it.
+        landed = all(future.exception() is None for future in futures)
+        del self.futures[index]
+        return landed
 
     def reset(self) -> None:
         self.producer_index = -1
@@ -423,6 +427,13 @@ class UnifiedCacheLinkerWrapper:
             else:
                 req.kv.swa_evicted_seqlen = max(req.kv.swa_evicted_seqlen, prefix_len)
 
+        # match placed the SWA branch point before this tail was known; a point
+        # the tail covers is gone, since the request inserts the whole tail.
+        if (
+            req.swa_branching_seqlen is not None
+            and req.swa_branching_seqlen <= prefix_len
+        ):
+            req.swa_branching_seqlen = None
         self.inflight_load_rids.append(req.rid)
         return full_transfer.device_indices, req.last_node
 
