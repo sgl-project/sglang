@@ -6,28 +6,33 @@ from unittest import mock
 
 import torch
 
+from sglang.srt.arg_groups.validation_hook import validate_mps_model_config
 from sglang.srt.hardware_backend.mps import runtime
 from sglang.srt.runtime_context import override_platform
 from sglang.test.ci.ci_register import register_mps_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_mps_ci(est_time=1, suite="stage-a-unit-test-mps")
 
 
-class TestMpsRuntime(unittest.TestCase):
-    def tearDown(self):
-        runtime.validate_mps_runtime.cache_clear()
-
-    def test_version_gate_accepts_only_stable_torch_213(self):
-        self.assertTrue(runtime._is_stable_series("2.13.7", (2, 13)))
-        self.assertFalse(runtime._is_stable_series("2.12.1", (2, 13)))
-        self.assertFalse(runtime._is_stable_series("2.14.0", (2, 13)))
-        self.assertFalse(runtime._is_stable_series("2.13.0rc1", (2, 13)))
-        self.assertFalse(runtime._is_stable_series("unknown", (2, 13)))
+class TestMpsRuntime(CustomTestCase):
+    def test_runtime_accepts_torch_213_and_newer(self):
+        for version in ("2.13.0", "2.13.7", "2.14.0", "3.0.0"):
+            with (
+                self.subTest(version=version),
+                mock.patch.object(torch, "__version__", version),
+                mock.patch.object(
+                    torch.backends.mps, "is_available", return_value=True
+                ),
+                mock.patch.object(torch.mps, "recommended_max_memory", create=True),
+                mock.patch.object(torch.mps, "driver_allocated_memory", create=True),
+            ):
+                self.assertIsNone(runtime.validate_mps_runtime())
 
     def test_runtime_does_not_require_mlx_or_metal_kernel_apis(self):
         with (
             mock.patch.object(torch, "__version__", "2.13.4"),
-            mock.patch.object(torch.mps, "is_available", return_value=True),
+            mock.patch.object(torch.backends.mps, "is_available", return_value=True),
             mock.patch.object(
                 torch.mps, "recommended_max_memory", return_value=8 << 30, create=True
             ),
@@ -41,18 +46,27 @@ class TestMpsRuntime(unittest.TestCase):
             self.assertIsNone(runtime.validate_mps_runtime())
 
     def test_runtime_rejects_unsupported_torch_and_missing_memory_apis(self):
+        for version in ("2.12.1", "2.13.0rc1"):
+            with (
+                self.subTest(version=version),
+                mock.patch.object(torch, "__version__", version),
+                self.assertRaisesRegex(RuntimeError, "Torch >= 2.13"),
+            ):
+                runtime.validate_mps_runtime()
+
         with (
-            mock.patch.object(torch, "__version__", "2.12.1"),
-            self.assertRaisesRegex(RuntimeError, "stable Torch 2.13.x"),
+            mock.patch.object(torch, "__version__", "2.13.0"),
+            mock.patch.object(torch.backends.mps, "is_available", return_value=True),
+            mock.patch.object(torch.mps, "recommended_max_memory", None, create=True),
+            self.assertRaisesRegex(RuntimeError, "recommended_max_memory"),
         ):
             runtime.validate_mps_runtime()
 
-        runtime.validate_mps_runtime.cache_clear()
+    def test_runtime_rejects_unavailable_mps(self):
         with (
             mock.patch.object(torch, "__version__", "2.13.0"),
-            mock.patch.object(torch.mps, "is_available", return_value=True),
-            mock.patch.object(torch.mps, "recommended_max_memory", None, create=True),
-            self.assertRaisesRegex(RuntimeError, "recommended_max_memory"),
+            mock.patch.object(torch.backends.mps, "is_available", return_value=False),
+            self.assertRaisesRegex(RuntimeError, "available PyTorch MPS device"),
         ):
             runtime.validate_mps_runtime()
 
@@ -83,16 +97,16 @@ class TestMpsRuntime(unittest.TestCase):
 
     def test_checkpoint_derived_execution_modes_are_rejected(self):
         self.assertIsNone(
-            runtime.validate_mps_model_config(
+            validate_mps_model_config(
                 types.SimpleNamespace(quantization=None, is_multimodal=False)
             )
         )
         with self.assertRaisesRegex(ValueError, "quantization='awq'"):
-            runtime.validate_mps_model_config(
+            validate_mps_model_config(
                 types.SimpleNamespace(quantization="awq", is_multimodal=False)
             )
         with self.assertRaisesRegex(ValueError, "multimodal serving"):
-            runtime.validate_mps_model_config(
+            validate_mps_model_config(
                 types.SimpleNamespace(quantization=None, is_multimodal=True)
             )
 

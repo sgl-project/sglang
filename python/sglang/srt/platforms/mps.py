@@ -18,7 +18,7 @@ def _recommended_working_set_size() -> int:
     if not callable(getter):
         raise RuntimeError(
             "The SGLang MPS backend requires "
-            "torch.mps.recommended_max_memory() from Torch 2.13.x"
+            "torch.mps.recommended_max_memory() from Torch >= 2.13.0"
         )
     total = int(getter())
     if total <= 0:

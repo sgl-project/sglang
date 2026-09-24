@@ -43,13 +43,13 @@ from sglang.srt.arg_groups.overrides import (
     resolution_result,
     resolving_view,
 )
-from sglang.srt.arg_groups.validation_hook import validate_standard_mps_server_args
+from sglang.srt.arg_groups.validation_hook import (
+    validate_mps_model_config,
+    validate_standard_mps_server_args,
+)
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.mlx.runtime import use_mlx
-from sglang.srt.hardware_backend.mps.runtime import (
-    validate_mps_model_config,
-    validate_mps_runtime,
-)
+from sglang.srt.hardware_backend.mps.runtime import validate_mps_runtime
 from sglang.srt.runtime_context import get_platform, publish
 from sglang.srt.speculative.decoupled_spec_io import DecoupledSpecIpcConfig
 from sglang.srt.utils.network import NetworkAddress, get_free_port, wait_port_available

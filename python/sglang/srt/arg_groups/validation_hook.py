@@ -495,6 +495,45 @@ def validate_experimental_sgl_marlin(server_args: Any):
     validate_experimental_sgl_marlin_server_args(server_args, view)
 
 
+def validate_mps_model_config(
+    model_config: Any,
+    *,
+    lora_enabled: bool = False,
+) -> None:
+    """Validate checkpoint-derived MPS constraints."""
+    quantization = getattr(model_config, "quantization", None)
+    if quantization not in (None, "unquant"):
+        raise ValueError(
+            "Torch MPS currently supports only unquantized model weights; "
+            "the resolved model configuration detected "
+            f"quantization={quantization!r}"
+        )
+    if bool(getattr(model_config, "is_multimodal", False)):
+        raise ValueError(
+            "Torch MPS multimodal serving does not yet have a model-specific "
+            "end-to-end contract; use a text-only model until its encoder, "
+            "processor, and decoder paths are validated on MPS"
+        )
+    if lora_enabled:
+        for config in (
+            getattr(model_config, "hf_text_config", None),
+            getattr(model_config, "hf_config", None),
+        ):
+            if config is None:
+                continue
+            for field_name in (
+                "num_experts",
+                "num_local_experts",
+                "n_routed_experts",
+            ):
+                value = getattr(config, field_name, None)
+                if value is not None and int(value) > 0:
+                    raise ValueError(
+                        "Torch MPS LoRA currently supports dense models only; "
+                        f"the model config declares {field_name}={value!r}"
+                    )
+
+
 def validate_standard_mps_server_args(server_args: Any):
     """Validate execution modes supported by the Torch MPS path."""
 

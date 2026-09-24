@@ -437,12 +437,7 @@ class ModelRunner:
         self.init_torch_distributed()
 
         # Init forward stream for overlap schedule
-        if is_mps_device:
-            from sglang._platform_stubs import Stream
-
-            self.forward_stream = Stream(device=torch.device("mps"))
-        else:
-            self.forward_stream = torch.get_device_module(self.device).Stream()
+        self.forward_stream = torch.get_device_module(self.device).Stream()
 
         # Read-done mailbox: the scheduler's WAR barrier reads it from the runner
         # its worker names, and treats None as the coarse whole-forward fence.

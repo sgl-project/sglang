@@ -279,7 +279,11 @@ _cached_props: _MPSDeviceProperties | None = None
 
 
 def get_device_properties(device: Any = 0) -> _MPSDeviceProperties:  # noqa: ARG001
-    """Return the properties of the MPS device. Results are cached after first call."""
+    """Implement ``torch.mps.get_device_properties``, not other device backends.
+
+    Metal's recommended working-set limit bounds usable GPU memory, even though
+    Apple Silicon shares physical RAM with the CPU.
+    """
     global _cached_props
     if _cached_props is None:
         import torch
@@ -400,7 +404,7 @@ def install_platform_stubs() -> None:
     except ImportError:
         return
 
-    if not (hasattr(torch, "mps") and torch.mps.is_available()):
+    if not torch.backends.mps.is_available():
         return
 
     if "triton" not in sys.modules and importlib.util.find_spec("triton") is None:
