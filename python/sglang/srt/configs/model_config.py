@@ -563,6 +563,7 @@ class ModelConfig:
             _quant_config_to_dict(getattr(self.hf_config, "quantization_config", None))
             or {}
         )
+        self.hf_quant_config: dict = quantization_config
         routed_experts_quant_method = quantization_config.get(
             "routed_experts_quant_method"
         )
