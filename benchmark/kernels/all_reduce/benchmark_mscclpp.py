@@ -30,7 +30,7 @@ from sglang.srt.distributed.parallel_state import (
     cleanup_dist_env_and_memory,
     graph_capture,
     initialize_model_parallel,
-    set_mscclpp_all_reduce,
+    set_mscclpp,
 )
 from sglang.srt.runtime_context import get_parallel
 from sglang.test.test_utils import publish_build_topology
@@ -190,7 +190,7 @@ if __name__ == "__main__":
         )
     world, world_size = dist.group.WORLD, dist.get_world_size()
     rank = dist.get_rank()
-    set_mscclpp_all_reduce(True)
+    set_mscclpp(True)
     init_distributed_environment(
         world_size=world_size,
         rank=rank,

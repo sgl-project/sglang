@@ -11,8 +11,9 @@ from sglang.srt.distributed.parallel_state import (
     cleanup_dist_env_and_memory,
     get_tensor_model_parallel_group,
     initialize_model_parallel,
-    set_mscclpp_all_reduce,
+    set_mscclpp,
 )
+from sglang.test.test_utils import publish_build_topology
 
 
 def _max_across_ranks(value: float, group) -> float:
@@ -164,13 +165,14 @@ def main() -> None:
     world_size = dist.get_world_size()
     rank = dist.get_rank()
     device = torch.cuda.current_device()
-    set_mscclpp_all_reduce(True)
+    set_mscclpp(True)
     init_distributed_environment(
         world_size=world_size,
         rank=rank,
         local_rank=local_rank,
     )
-    initialize_model_parallel(tensor_model_parallel_size=world_size)
+    publish_build_topology(world_rank=rank, tp_size=world_size)
+    initialize_model_parallel()
     tp_group = get_tensor_model_parallel_group()
     gpu_group = tp_group.device_group
     cpu_group = tp_group.cpu_group

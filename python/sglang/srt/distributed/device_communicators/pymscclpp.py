@@ -53,6 +53,7 @@ class _AlgorithmConfig(msgspec.Struct, frozen=True, kw_only=True):
     supported_dtypes: tuple[torch.dtype, ...] = _DEFAULT_SUPPORTED_DTYPES
     in_place: bool = True
     requires_nvls: bool = False
+    requires_symmetric_memory: bool = False
     algorithm: Any = None
 
     def __post_init__(self):
@@ -80,12 +81,17 @@ class _AlgorithmConfig(msgspec.Struct, frozen=True, kw_only=True):
         nvls_supported: bool,
         symmetric_memory: bool,
     ) -> bool:
-        return self.supports_topology(
-            world_size, ipc_domain_count
-        ) and self.support_nvls(nvls_supported, symmetric_memory)
+        return (
+            self.supports_topology(world_size, ipc_domain_count)
+            and self.support_nvls(nvls_supported)
+            and self.support_symmetric_memory(symmetric_memory)
+        )
 
-    def support_nvls(self, nvls_supported: bool, symmetric_memory: bool) -> bool:
-        return not self.requires_nvls or (nvls_supported and symmetric_memory)
+    def support_nvls(self, nvls_supported: bool) -> bool:
+        return not self.requires_nvls or nvls_supported
+
+    def support_symmetric_memory(self, symmetric_memory: bool) -> bool:
+        return not self.requires_symmetric_memory or symmetric_memory
 
     def supports_message_size(self, message_size: int) -> bool:
         return self.message_size_range.contains(message_size)
@@ -403,6 +409,7 @@ def _create_native_algorithm_configs() -> tuple[_NativeAlgorithmConfig, ...]:
             threads_per_block=_DEFAULT_THREADS_PER_BLOCK,
             reduce_op="SUM",
             requires_nvls=True,
+            requires_symmetric_memory=True,
         ),
     )
 
