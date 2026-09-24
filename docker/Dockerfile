@@ -1,4 +1,9 @@
 ARG CUDA_VERSION=13.0.3
+# Declared before the first FROM so it is a global ARG: the `runtime` stage
+# starts from a fresh FROM and therefore does not inherit ARGs from `base`,
+# but the `runtime-efa` target needs this version to pin the EFA Mooncake wheel
+# to the same release the `framework` stage installed.
+ARG MOONCAKE_VERSION=0.3.13
 FROM nvidia/cuda:${CUDA_VERSION}-cudnn-devel-ubuntu24.04 AS base
 
 ARG TARGETARCH
@@ -14,7 +19,6 @@ ARG UBUNTU_MIRROR
 ARG GITHUB_ARTIFACTORY=github.com
 ARG INSTALL_FLASHINFER_JIT_CACHE=0
 ARG FLASHINFER_VERSION=0.6.18
-ARG MOONCAKE_VERSION=0.3.13
 ARG MSCCLPP_VERSION=sglang-v0.9.1
 
 ENV DEBIAN_FRONTEND=noninteractive \
@@ -793,3 +797,115 @@ LABEL org.opencontainers.image.source="https://github.com/sgl-project/sglang" \
 
 # Default command
 CMD ["/bin/bash"]
+
+# =============================================================================
+# AWS EFA runtime (opt-in target)
+# =============================================================================
+# Extends `runtime` with the pieces needed to drive AWS EFA from inside the
+# container, so no host-side EFA installation is required:
+#
+#   1. The AWS EFA userspace stack (libfabric plus its EFA provider).
+#   2. The EFA build of the Mooncake transfer engine wheel.
+#
+#   docker build --target runtime-efa -t sglang:efa      -f docker/Dockerfile .
+#
+# NOTE: this stage is last, so it is what a bare `docker build` with no
+# --target produces. Always pass --target explicitly.
+#
+# Kernel modules and host limits remain the responsibility of the container
+# host.
+FROM runtime AS runtime-efa
+
+ARG TARGETARCH
+ARG MOONCAKE_VERSION
+ARG EFA_INSTALLER_VERSION=1.50.0
+ARG EFA_INSTALLER_SHA256=fa6dff8593d866866c13cb4640d9059835cd4efa427971f100ab40c97bef2841
+
+# Install the AWS EFA userspace stack.
+#
+# `set -eux` is required: the body is a `;`-separated sequence run by /bin/sh,
+# so without it only the last command decides the RUN exit status and a failed
+# install would silently produce an empty layer.
+#
+# The distro libfabric1 stays installed on purpose -- libopenmpi3t64 depends on
+# it, so removing it would break that package. Both libfabric.so.1 copies
+# coexist; the ENV below makes the AWS one win deterministically.
+RUN set -eux; \
+    EFA_INSTALLER_ARCHIVE="/tmp/aws-efa-installer-${EFA_INSTALLER_VERSION}.tar.gz"; \
+    curl -fsSL --retry 3 --retry-all-errors \
+        "https://efa-installer.amazonaws.com/aws-efa-installer-${EFA_INSTALLER_VERSION}.tar.gz" \
+        -o "${EFA_INSTALLER_ARCHIVE}"; \
+    echo "${EFA_INSTALLER_SHA256}  ${EFA_INSTALLER_ARCHIVE}" | sha256sum -c -; \
+    tar -xzf "${EFA_INSTALLER_ARCHIVE}" -C /tmp; \
+    # efa_installer.sh apt-installs pciutils/environment-modules/tcl, and the
+    # runtime stage purges /var/lib/apt/lists, so refresh the lists first.
+    apt-get update -y; \
+    # --minimal is not usable here: it installs rdma-core but skips libfabric,
+    # which is the only piece needed for the EFA data path.
+    (cd /tmp/aws-efa-installer && \
+        ./efa_installer.sh -y --skip-kmod --skip-limit-conf --no-verify); \
+    test -x /opt/amazon/efa/bin/fi_info; \
+    /opt/amazon/efa/bin/fi_info --version; \
+    # Assert the EFA provider is actually compiled into this libfabric. `-l`
+    # lists providers without needing EFA hardware, so it works during a build.
+    /opt/amazon/efa/bin/fi_info -l | grep -q '^efa:'; \
+    # Assert the AWS libfabric precedes the distro 1.17.0 in the loader cache.
+    # Match the first libfabric.so.1 entry, since `ldconfig -p` prints
+    # "libfabric.so.1 (libc6,x86-64) => /path" and order decides the winner.
+    ldconfig -p | grep -m1 'libfabric\.so\.1' | grep -q '/opt/amazon/efa/lib/'; \
+    rm -rf "${EFA_INSTALLER_ARCHIVE}" /tmp/aws-efa-installer \
+        /var/lib/apt/lists/*
+
+# Prefer the AWS libfabric over the distro libfabric1 that libopenmpi3t64 pulls
+# in, and expose fi_info/fi_pingpong for debugging EFA from inside the image.
+ENV PATH="/opt/amazon/efa/bin:${PATH}" \
+    LD_LIBRARY_PATH="/opt/amazon/efa/lib:${LD_LIBRARY_PATH}"
+
+# Swap the standard Mooncake wheel for the EFA build. Both wheels install the
+# same `mooncake` module, so the standard one must be removed first rather than
+# installed over. --no-deps preserves the dependency stack the image was built
+# against, matching docs/advanced_features/pd_disaggregation.mdx.
+#
+# The EFA wheel is published for x86_64 only (manylinux_2_35_x86_64), so on other
+# architectures this step is skipped and the standard wheel is kept.
+RUN --mount=type=cache,target=/root/.cache/pip \
+    set -eux; \
+    if [ "${TARGETARCH}" = "amd64" ]; then \
+        python3 -m pip uninstall -y mooncake-transfer-engine-cuda13; \
+        python3 -m pip install --no-deps \
+            "mooncake-transfer-engine-efa-cuda13==${MOONCAKE_VERSION}"; \
+        # Verify by distribution metadata rather than importing the module: the
+        # extension links libcuda.so.1, absent from a GPU-less builder.
+        python3 -c "import importlib.metadata as m; \
+m.version('mooncake-transfer-engine-efa-cuda13')"; \
+        ! python3 -c "import importlib.metadata as m; \
+m.version('mooncake-transfer-engine-cuda13')" 2>/dev/null; \
+    else \
+        echo "TARGETARCH=${TARGETARCH}: mooncake-transfer-engine-efa-cuda13 is \
+x86_64-only, keeping the standard wheel (Mooncake EFA protocol unavailable)"; \
+    fi
+
+# Mooncake protocol, derived from the architecture. amd64 carries the EFA wheel
+# so it can use the `efa` protocol; other architectures kept the standard wheel,
+# which speaks `rdma` over the AWS rdma-core installed above. Setting `efa` there
+# would name a protocol the installed wheel does not implement.
+#
+# ENV cannot be made conditional and cannot read anything a RUN produced, so the
+# value is derived with ARG substitution. `#amd64` strips that exact prefix, so
+# ARCH_IF_NOT_AMD64 is empty on amd64 and holds the architecture name everywhere
+# else; `:+` maps that to rdma, and `:-` supplies efa for the empty case. The
+# ENV line reads as: rdma if not amd64, otherwise efa.
+#
+# The test is deliberately "not amd64" rather than "is amd64" so it matches the
+# `[ "${TARGETARCH}" = "amd64" ]` test used by the Mooncake swap above, keeping a
+# third architecture on rdma alongside the standard wheel. Writing it positively
+# would require stripping `arm64`, which actually means "not arm64" and would
+# wrongly select efa on any future architecture.
+#
+# Nested expansion (${PROTO_${TARGETARCH}}) is not an option -- BuildKit rejects
+# it with "unsupported modifier ($) in substitution" -- and concatenating two
+# complementary `:+` expansions silently yields "rdmaefa" on a third
+# architecture, so keep the explicit `:+` then `:-` pair.
+ARG ARCH_IF_NOT_AMD64=${TARGETARCH#amd64}
+ARG PROTOCOL_IF_NOT_AMD64=${ARCH_IF_NOT_AMD64:+rdma}
+ENV MOONCAKE_PROTOCOL=${PROTOCOL_IF_NOT_AMD64:-efa}

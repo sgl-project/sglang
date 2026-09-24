@@ -7,7 +7,7 @@ on:
   workflow_call:
     inputs:
       docker_target:
-        description: "Dockerfile target stage (framework or runtime)"
+        description: "Dockerfile target stage (framework_final, runtime, or runtime-efa)"
         required: true
         type: string
       sgl_version:
