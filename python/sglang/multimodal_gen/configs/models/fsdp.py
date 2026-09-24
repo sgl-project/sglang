@@ -56,6 +56,11 @@ def is_zimage_layer(name: str, module: object) -> bool:
     )
 
 
+def is_boogu_image_layer(name: str, module: object) -> bool:
+    last_part = name.split(".")[-1]
+    return last_part.isdigit() and ("_layers" in name or "_refiner" in name)
+
+
 def is_embed_tokens(name: str, module: object) -> bool:
     return name.endswith("embed_tokens")
 
