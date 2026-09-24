@@ -407,7 +407,6 @@ export const config = {
       match: { hw: "gb300", variant: "default", quant: "fp8", strategy: "low-latency", nodes: "multi-4" },
       verified: true,
       env: [
-        "SGLANG_FLASHINFER_MNNVL_CUTEDSL_AR_FUSION=1",
         "NCCL_NVLS_ENABLE=1",
       ],
       flags: [
@@ -431,6 +430,7 @@ export const config = {
         "--max-prefill-tokens 8192",
         "--reasoning-parser qwen3",
         "--tool-call-parser qwen3_coder",
+        "--flashinfer-allreduce-fusion-backend cutedsl",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
@@ -485,7 +485,6 @@ export const config = {
       match: { hw: "gb300", variant: "default", quant: "nvfp4", strategy: "low-latency", nodes: "multi-2" },
       verified: true,
       env: [
-        "SGLANG_FLASHINFER_MNNVL_CUTEDSL_AR_FUSION=1",
         "NCCL_MNNVL_ENABLE=1",
         "NCCL_CUMEM_ENABLE=1",
         "NCCL_NVLS_ENABLE=1",
@@ -514,6 +513,7 @@ export const config = {
         "--cuda-graph-backend-decode full",
         "--reasoning-parser qwen3",
         "--tool-call-parser qwen3_coder",
+        "--flashinfer-allreduce-fusion-backend cutedsl",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
@@ -576,7 +576,6 @@ export const config = {
       // The sizing is derived, not measured.
       match: { hw: "gb300", variant: "default", quant: "bf16", strategy: "balanced", nodes: "multi-8" },
       env: [
-        "SGLANG_FLASHINFER_MNNVL_CUTEDSL_AR_FUSION=1",
         "NCCL_NVLS_ENABLE=1",
       ],
       flags: [
@@ -592,6 +591,7 @@ export const config = {
         "--max-prefill-tokens 8192",
         "--reasoning-parser qwen3",
         "--tool-call-parser qwen3_coder",
+        "--flashinfer-allreduce-fusion-backend cutedsl",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
@@ -669,9 +669,7 @@ export const config = {
       // back to Triton.
       match: { hw: "b300", variant: "default", quant: "nvfp4", strategy: "balanced", nodes: "single" },
       verified: true,
-      env: [
-        "SGLANG_FLASHINFER_MNNVL_CUTEDSL_AR_FUSION=1",
-      ],
+      env: [],
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
@@ -689,6 +687,7 @@ export const config = {
         "--max-prefill-tokens 8192",
         "--reasoning-parser qwen3",
         "--tool-call-parser qwen3_coder",
+        "--flashinfer-allreduce-fusion-backend cutedsl",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
@@ -815,7 +814,6 @@ export const config = {
       // DeepEP v2 a2a rules DSpark out under DP-attention.
       match: { hw: "gb300", variant: "default", quant: "fp8", strategy: "dspark", nodes: "multi-4" },
       env: [
-        "SGLANG_FLASHINFER_MNNVL_CUTEDSL_AR_FUSION=1",
         "NCCL_NVLS_ENABLE=1",
       ],
       flags: [
@@ -831,6 +829,7 @@ export const config = {
         "--max-prefill-tokens 8192",
         "--reasoning-parser qwen3",
         "--tool-call-parser qwen3_coder",
+        "--flashinfer-allreduce-fusion-backend cutedsl",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
@@ -840,7 +839,6 @@ export const config = {
       // model in place of NEXTN.
       match: { hw: "gb300", variant: "default", quant: "nvfp4", strategy: "dspark", nodes: "multi-2" },
       env: [
-        "SGLANG_FLASHINFER_MNNVL_CUTEDSL_AR_FUSION=1",
         "NCCL_MNNVL_ENABLE=1",
         "NCCL_CUMEM_ENABLE=1",
         "NCCL_NVLS_ENABLE=1",
@@ -866,6 +864,7 @@ export const config = {
         "--cuda-graph-backend-decode full",
         "--reasoning-parser qwen3",
         "--tool-call-parser qwen3_coder",
+        "--flashinfer-allreduce-fusion-backend cutedsl",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
@@ -875,7 +874,6 @@ export const config = {
       // of NEXTN.
       match: { hw: "gb300", variant: "default", quant: "bf16", strategy: "dspark", nodes: "multi-8" },
       env: [
-        "SGLANG_FLASHINFER_MNNVL_CUTEDSL_AR_FUSION=1",
         "NCCL_NVLS_ENABLE=1",
       ],
       flags: [
@@ -890,6 +888,7 @@ export const config = {
         "--max-prefill-tokens 8192",
         "--reasoning-parser qwen3",
         "--tool-call-parser qwen3_coder",
+        "--flashinfer-allreduce-fusion-backend cutedsl",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
@@ -904,7 +903,6 @@ export const config = {
       verified: true,
       env: [
         "SGLANG_ENABLE_MOE_DEFERRED_FINALIZE=1",
-        "SGLANG_FLASHINFER_MNNVL_CUTEDSL_AR_FUSION=1",
       ],
       flags: [
         "--trust-remote-code",
@@ -931,6 +929,7 @@ export const config = {
         "--cuda-graph-max-bs-decode 128",
         "--reasoning-parser qwen3",
         "--tool-call-parser qwen3_coder",
+        "--flashinfer-allreduce-fusion-backend cutedsl",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],

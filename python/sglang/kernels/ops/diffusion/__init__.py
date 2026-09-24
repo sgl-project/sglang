@@ -281,11 +281,32 @@ _SPECS: tuple[tuple[str, KernelBackend, str, frozenset, str], ...] = (
         "Paired in-place Helios transposed Q/K RoPE.",
     ),
     (
+        "diffusion.complex_rope",
+        KernelBackend.TRITON,
+        "rope.complex_rope_triton:fused_complex_rope",
+        _CUDA,
+        "Paired RoPE preserving PyTorch complex64 multiplication rounding.",
+    ),
+    (
         "diffusion.hunyuan_qkv_rope_pack",
         KernelBackend.TRITON,
         "rope.hunyuan_qkv_pack_triton:hunyuan_qkv_rope_pack",
         _CUDA,
         "HunyuanVideo QKV pack + RoPE.",
+    ),
+    (
+        "diffusion.joint_qkv_cat",
+        KernelBackend.TRITON,
+        "layout.joint_qkv_cat_triton:joint_qkv_cat",
+        _CUDA,
+        "Concatenate image/text QKV views into joint attention inputs.",
+    ),
+    (
+        "diffusion.rmsnorm_preserve_reduction",
+        KernelBackend.TRITON,
+        "norm.rmsnorm_preserve_reduction:rmsnorm_preserve_reduction",
+        _CUDA,
+        "Cast-before-weight RMSNorm preserving the native FP32 mean reduction.",
     ),
     (
         "diffusion.silu_mul",
@@ -506,7 +527,7 @@ for _op, _backend, _target, _caps, _description in _SPECS:
 # then symbol; a new public kernel belongs here and nowhere else.
 # ---------------------------------------------------------------------------
 _EXPORTS: dict[str, str] = {
-    "load_extension_with_recovery": "ext.loader",
+    "load_extension_with_recovery": "sglang.srt.utils.cpp_extension_loader",
     # Normalization: RMSNorm / LayerNorm / GroupNorm and their fused epilogues
     "can_defer_flux2_gated_residual": "norm.flux2_gated_resnorm_jit",
     "can_use_flux2_gated_resnorm": "norm.flux2_gated_resnorm_jit",
@@ -536,6 +557,8 @@ _EXPORTS: dict[str, str] = {
     "try_fused_bias_mul_add": "sglang.kernels.kda_kernels.norm_scale_shift_jit",
     "try_fused_bias_scale_residual_norm_scale_shift": "sglang.kernels.kda_kernels.norm_scale_shift_jit",
     "triton_one_pass_rms_norm": "norm.rmsnorm_onepass_triton",
+    "can_use_rmsnorm_preserve_reduction": "norm.rmsnorm_preserve_reduction",
+    "rmsnorm_preserve_reduction": "norm.rmsnorm_preserve_reduction",
     "can_use_fused_rmsnorm_scale_shift": "norm.rmsnorm_scale_shift_bitexact",
     "can_use_fused_scale_residual_rmsnorm_scale_shift": "norm.rmsnorm_scale_shift_bitexact",
     "fused_rmsnorm_scale_shift_bitexact": "norm.rmsnorm_scale_shift_bitexact",
@@ -573,6 +596,8 @@ _EXPORTS: dict[str, str] = {
     # Rotary embeddings and the QK-norm chains fused around them
     "try_fused_flux2_qkv_epilogue": "sglang.kernels.kda_kernels.flux2_qkv_epilogue_jit",
     "hunyuan_qkv_rope_pack": "rope.hunyuan_qkv_pack_triton",
+    "can_use_joint_qkv_cat": "layout.joint_qkv_cat_triton",
+    "joint_qkv_cat": "layout.joint_qkv_cat_triton",
     "can_use_ltx2_qknorm_split_rope_cuda": "sglang.kernels.kda_kernels.ltx2_qknorm_split_rope_jit",
     "ltx2_qknorm_split_rope_cuda": "sglang.kernels.kda_kernels.ltx2_qknorm_split_rope_jit",
     "apply_ltx2_split_rotary_emb": "rope.ltx2_rotary_triton",
@@ -589,6 +614,8 @@ _EXPORTS: dict[str, str] = {
     "can_use_helios_qk_rope": "rope.helios_qk_rope_jit",
     "fused_inplace_helios_qk_rope": "rope.helios_qk_rope_jit",
     "apply_rotary_embedding": "rope.rotary_triton",
+    "can_use_fused_complex_rope": "rope.complex_rope_triton",
+    "fused_complex_rope": "rope.complex_rope_triton",
     # Tensor layout transformations fused with downstream quantization
     "try_flux2_token_cat_fp8": "sglang.kernels.kda_kernels.flux2_token_cat_fp8_triton",
     # Activation-function fusions
@@ -718,6 +745,7 @@ _EXPORTS: dict[str, str] = {
     "interpolate": "ext.hunyuan3d_rasterizer",
     "rasterize": "ext.hunyuan3d_rasterizer",
     "meshVerticeInpaint": "ext.mesh_processor",
+    "load_mesh_processor": "ext.mesh_processor",
 }
 
 

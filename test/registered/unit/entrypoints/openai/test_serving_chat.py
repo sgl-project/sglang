@@ -10,6 +10,8 @@ from sglang.test.test_utils import CustomTestCase, enter_override, maybe_stub_sg
 
 maybe_stub_sgl_kernel()  # must precede any import that pulls in sgl_kernel
 
+import asyncio
+import gc
 import json
 import re
 import tempfile
@@ -277,6 +279,13 @@ class ServingChatTestCase(unittest.TestCase):
         # to publish one rather than hang the values off a mock manager.
         reset_context()
         self.addCleanup(reset_context)
+        # Tests drive coroutines through get_or_create_event_loop(), which
+        # creates a fresh loop per call and leaves the previous one unclosed.
+        # Finalize those loops here, between tests: if the cyclic GC collects
+        # one mid-import, its ResourceWarning imports tracemalloc while the
+        # outer import still holds the module-lock bookkeeping, which raises
+        # KeyError from importlib._bootstrap on Python < 3.12.
+        self.addCleanup(self._close_event_loops)
         publish(
             ServerArgs(
                 model_path="dummy",
@@ -313,6 +322,17 @@ class ServingChatTestCase(unittest.TestCase):
 
         self.fastapi_request = Mock(spec=Request)
         self.fastapi_request.headers = {}
+
+    @staticmethod
+    def _close_event_loops():
+        try:
+            loop = asyncio.get_event_loop_policy().get_event_loop()
+        except RuntimeError:
+            loop = None
+        if loop is not None and not loop.is_closed():
+            loop.close()
+        asyncio.set_event_loop(None)
+        gc.collect()
 
     @staticmethod
     def _render_tool_results_in_call_order(messages, **kwargs):
@@ -590,11 +610,13 @@ class ServingChatTestCase(unittest.TestCase):
             )
 
             self.basic_req.return_sampling_mask = True
+            self.basic_req.sampling_logprobs_mode = "support"
             self.basic_req.return_meta_info = True
             adapted, processed = self.chat._convert_to_internal_request(self.basic_req)
             self.assertIsInstance(adapted, GenerateReqInput)
             self.assertFalse(adapted.stream)
             self.assertTrue(adapted.return_sampling_mask)
+            self.assertEqual(adapted.sampling_logprobs_mode, "support")
             self.assertEqual(adapted.session_id, "session-1")
             self.assertEqual(processed, self.basic_req)
 

@@ -554,9 +554,9 @@ class MoEGate(nn.Module):
         return logits
 
 
-# 96 rows of 5120 bf16 fit the 1 MiB CustomAllReduceV2 push slot the whole
-# [T, hidden] view is staged through.
-_FUSED_FINALIZE_ALL_REDUCE_MAX_TOKENS = 96
+# The dedicated 4 MiB push slot fits 384 rows of 5120 BF16 values.
+# The dispatch gate also checks slot capacity and available counters.
+_FUSED_FINALIZE_ALL_REDUCE_MAX_TOKENS = 384
 
 
 class DeepseekV2MoE(nn.Module):
@@ -610,6 +610,7 @@ class DeepseekV2MoE(nn.Module):
         self.alt_stream = alt_stream
         self.routed_quant_stream = routed_quant_stream
         self.is_nextn = is_nextn
+        self.is_deepseek_v4 = is_deepseek_v4
         self._fuse_finalize_all_reduce = (
             is_deepseek_v4
             and getattr(config, "hc_pre_from_prev_sublayer", False)
@@ -926,7 +927,9 @@ class DeepseekV2MoE(nn.Module):
             )
 
         num_token_non_padded = (
-            forward_batch.num_token_non_padded if forward_batch is not None else None
+            forward_batch.moe_num_token_non_padded()
+            if forward_batch is not None
+            else None
         )
         if not self._enable_a2a_moe:
             if self._can_dual_stream_graph(hidden_states):
@@ -1144,7 +1147,17 @@ class DeepseekV2MoE(nn.Module):
                         mhc.post,
                         mhc.comb,
                     )
-                    if mhc.norm_weight is not None:
+                    if mhc.combine_only:
+                        from sglang.kernels.ops.communication.all_reduce_mhc_combine import (
+                            moe_finalize_all_reduce_mhc_combine,
+                        )
+
+                        final_hidden_states, mhc.output, mhc.combined = (
+                            moe_finalize_all_reduce_mhc_combine(
+                                *args, mhc.pre, world_size=self.tp_size
+                            )
+                        )
+                    elif mhc.norm_weight is not None:
                         from sglang.kernels.ops.communication.all_reduce_mhc import (
                             moe_finalize_all_reduce_mhc_quant,
                         )
@@ -1190,6 +1203,18 @@ class DeepseekV2MoE(nn.Module):
             )
 
         if not all_reduce_done:
+            if (
+                self.is_deepseek_v4
+                and self.tp_size > 1
+                and not should_skip_post_experts_all_reduce(is_tp_path=True)
+            ):
+                from sglang.srt.layers.moe.mhc_post_fusion import (
+                    current_mhc_post_fusion,
+                )
+
+                mhc = current_mhc_post_fusion()
+                if mhc is not None:
+                    mhc.start_stats_before_all_reduce()
             final_hidden_states = post_experts_all_reduce(final_hidden_states)
         # TP1 shared experts are replicated, so add them after all-reduce to
         # avoid summing the same shared output once per TP rank.
@@ -1336,6 +1361,16 @@ class DeepseekV2MoE(nn.Module):
             self.routed_scaling_factor,
         )
 
+        if (
+            self.is_deepseek_v4
+            and self.tp_size > 1
+            and not should_skip_post_experts_all_reduce(is_tp_path=True)
+        ):
+            from sglang.srt.layers.moe.mhc_post_fusion import current_mhc_post_fusion
+
+            mhc = current_mhc_post_fusion()
+            if mhc is not None:
+                mhc.start_stats_before_all_reduce()
         final_hidden_states = post_experts_all_reduce(final_hidden_states)
         # TP1 shared experts are replicated, so add them after all-reduce to
         # avoid summing the same shared output once per TP rank.
@@ -1439,7 +1474,7 @@ class DeepseekV2MoE(nn.Module):
             topk_output = self.topk(
                 hidden_states,
                 router_logits,
-                num_token_non_padded=forward_batch.num_token_non_padded,
+                num_token_non_padded=forward_batch.moe_num_token_non_padded(),
                 expert_location_dispatch_info=(
                     ExpertLocationDispatchInfo.init_new(
                         layer_id=self.layer_id,
@@ -1833,7 +1868,7 @@ class DeepseekV2MoE(nn.Module):
                 state.topk_output = self.topk(
                     hidden_states=hidden_states,
                     router_logits=router_logits,
-                    num_token_non_padded=state.forward_batch.num_token_non_padded,
+                    num_token_non_padded=state.forward_batch.moe_num_token_non_padded(),
                     expert_location_dispatch_info=(
                         ExpertLocationDispatchInfo.init_new(
                             layer_id=self.layer_id,
@@ -2682,22 +2717,6 @@ class DeepseekV2DecoderLayer(nn.Module):
             hidden_states, residual, forward_batch
         )
 
-        # Deferring implies fusing, and one scoped() block below publishes both.
-        may_defer_moe_finalize = self.layer_communicator.should_defer_moe_finalize(
-            forward_batch
-        )
-        fuse_mlp_allreduce = (
-            may_defer_moe_finalize
-            or self.layer_communicator.should_fuse_mlp_allreduce_with_next_layer(
-                forward_batch
-            )
-        )
-
-        # For DP with padding, reduce scatter can be used instead of all-reduce.
-        mlp_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
-            forward_batch
-        )
-
         if isinstance(self.mlp, DeepseekV2MLP):
             gemm_output_zero_allocator = None
 
@@ -2712,30 +2731,13 @@ class DeepseekV2DecoderLayer(nn.Module):
         else:
             _mlp_ctx = nullcontext()
 
-        with get_forward().scoped(
-            fuse_mlp_allreduce=fuse_mlp_allreduce,
-            mlp_reduce_scatter=mlp_reduce_scatter,
-            defer_moe_finalize=may_defer_moe_finalize,
-        ):
-            with _mlp_ctx:
-                hidden_states = self.mlp(
-                    hidden_states,
-                    forward_batch,
-                    gemm_output_zero_allocator,
-                )
-
-        # The flag only permits a handoff; the MoE declines it per forward, so
-        # key off what came back.
-        if not isinstance(hidden_states, torch.Tensor):
-            return hidden_states, residual, topk_indices
-
-        if fuse_mlp_allreduce:
-            hidden_states._sglang_needs_allreduce_fusion = True
-
-        if not fuse_mlp_allreduce:
-            hidden_states, residual = self.layer_communicator.postprocess_layer(
-                hidden_states, residual, forward_batch
+        with self.layer_communicator.ffn_exit(forward_batch) as ffn_exit, _mlp_ctx:
+            hidden_states = self.mlp(
+                hidden_states,
+                forward_batch,
+                gemm_output_zero_allocator,
             )
+        hidden_states, residual = ffn_exit.finish(hidden_states, residual)
 
         return hidden_states, residual, topk_indices
 
@@ -2799,6 +2801,13 @@ class DeepseekV2DecoderLayer(nn.Module):
         return output
 
 
+def pp_stage_needs_embedding(pp_group, speculative_algorithm) -> bool:
+    """The first stage embeds inputs; the last supplies the EAGLE draft embedding."""
+    return pp_group.is_first_rank or (
+        pp_group.is_last_rank and speculative_algorithm is not None
+    )
+
+
 class DeepseekV2Model(nn.Module):
     fall_back_to_pt_during_load = False
 
@@ -2816,7 +2825,7 @@ class DeepseekV2Model(nn.Module):
         self.first_k_dense_replace = config.first_k_dense_replace
         self.pp_group = get_parallel().pp_group
 
-        if self.pp_group.is_first_rank or (_is_npu and self.pp_group.is_last_rank):
+        if pp_stage_needs_embedding(self.pp_group, get_spec().speculative_algorithm):
             self.embed_tokens = VocabParallelEmbedding(
                 config.vocab_size,
                 config.hidden_size,

@@ -7,10 +7,9 @@ import torch
 
 from sglang.srt.batch_overlap.two_batch_overlap import TboDPAttentionPreparer
 from sglang.srt.configs.model_config import ModelConfig
-from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.environ import envs
 from sglang.srt.layers.cp.utils import get_cp_strategy
-from sglang.srt.layers.dp_attention import world_dp_gather_enabled
+from sglang.srt.layers.dp_attention import dp_gather_width, world_dp_gather_enabled
 from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler_components.recv_skipper import (
@@ -39,7 +38,6 @@ from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils.common import require_mlp_tp_gather
 
 if TYPE_CHECKING:
-    from sglang.srt.distributed.parallel_state import GroupCoordinator
     from sglang.srt.model_executor.model_runner import ModelRunner
 
 
@@ -58,11 +56,9 @@ def _resolve_elastic_world_dp_size(
 
     from sglang.srt.elastic_ep.elastic_ep import ElasticEPStateManager
 
-    live_dp_size = get_parallel().attn_dp_size
+    live_dp_size = dp_gather_width()
     effective_ep_size = ElasticEPStateManager.get_effective_ep_size()
-    # The group's own membership, not the width it was built at: this is the
-    # one number an out-of-process join moves, and it is the upper bound the
-    # served width has to stay under.
+    # Query live membership because elastic joins can expand WORLD.
     world_size = torch.distributed.get_world_size(group)
 
     if live_dp_size != effective_ep_size:
@@ -366,10 +362,6 @@ def _local_prefill_cuda_graph_vote(
 def prepare_mlp_sync_batch_raw(
     local_batch: ScheduleBatch,
     model_runner: ModelRunner,
-    dp_size: int,
-    attn_tp_size: int,
-    attn_cp_size: int,
-    tp_group: GroupCoordinator,
     get_idle_batch: Callable[[], ScheduleBatch],
     disable_cuda_graph: bool,
     require_mlp_tp_gather: bool,
@@ -377,6 +369,10 @@ def prepare_mlp_sync_batch_raw(
     offload_tags: set[str],
     dwdp: bool = False,
 ):
+    parallel = get_parallel()
+    dp_size = parallel.dp_size
+    attn_tp_size = parallel.attn_tp_size
+    tp_group = parallel.tp_group
     # Check if other DP workers have running batches
     if (
         local_batch is None
@@ -435,9 +431,7 @@ def prepare_mlp_sync_batch_raw(
     tbo_preparer = TboDPAttentionPreparer()
     use_world_group = world_dp_gather_enabled()
     if use_world_group:
-        from sglang.srt.runtime_context import get_parallel
-
-        world = get_parallel().world_group
+        world = parallel.world_group
         group = torch.distributed.group.WORLD
         device = world.device
     elif len(offload_tags) == 0 and (
@@ -463,7 +457,7 @@ def prepare_mlp_sync_batch_raw(
     mlp_sync_info = MLPSyncBatchInfo(
         dp_size=dp_size,
         tp_size=attn_tp_size,
-        cp_size=attn_cp_size,
+        cp_size=parallel.attn_cp_size,
         num_tokens=num_tokens,
         num_tokens_for_logprob=num_tokens_for_logprob,
         can_run_decode_cuda_graph=can_run_decode_cuda_graph,
@@ -532,12 +526,10 @@ def prepare_mlp_sync_batch_raw(
 @dataclass(kw_only=True, slots=True, frozen=True)
 class SchedulerDPAttnAdapter:
     model_runner: ModelRunner
-    tp_group: GroupCoordinator
     req_to_token_pool: ReqToTokenPool
     token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator
     tree_cache: BasePrefixCache
     offload_tags: set[str]
-    ps: ParallelState
     model_config: ModelConfig
     enable_overlap: bool
     spec_algorithm: SpeculativeAlgorithm
@@ -547,10 +539,6 @@ class SchedulerDPAttnAdapter:
         return prepare_mlp_sync_batch_raw(
             local_batch,
             model_runner=self.model_runner,
-            dp_size=get_parallel().dp_size,
-            attn_tp_size=self.ps.attn_tp_size,
-            attn_cp_size=self.ps.attn_cp_size,
-            tp_group=self.tp_group,
             get_idle_batch=self.get_idle_batch,
             disable_cuda_graph=cuda_graph_fully_disabled(),
             require_mlp_tp_gather=require_mlp_tp_gather(),
