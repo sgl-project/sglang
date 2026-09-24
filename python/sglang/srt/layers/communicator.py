@@ -58,7 +58,10 @@ from sglang.srt.layers.dp_attention import (
     is_enable_moe_cp_allgather,
     moe_cp_all_gather_into_tensor,
 )
-from sglang.srt.layers.flashinfer_comm_fusion import is_flashinfer_allreduce_unavailable
+from sglang.srt.layers.flashinfer_comm_fusion import (
+    is_flashinfer_allreduce_unavailable,
+    uses_cutedsl_ar_fusion,
+)
 from sglang.srt.layers.moe import (
     can_merge_post_experts_all_reduce,
     deferred_post_experts_all_reduce,
@@ -198,6 +201,8 @@ def apply_flashinfer_allreduce_fusion(batch_size: int):
         and _is_flashinfer_available
         and not is_dp_attention_enabled()
         and get_exec().comm.flashinfer_allreduce_fusion_backend is not None
+        # cutedsl runs its own fused path from the fusion communicator.
+        and not uses_cutedsl_ar_fusion()
         and not is_flashinfer_allreduce_unavailable()
         # Symbolic size checks stay last: under Dynamo tracing they guard on
         # the dynamic token dim, so statically-off configs must short-circuit
@@ -859,6 +864,14 @@ class LayerCommunicator:
                             post_residual_addition,
                         )
 
+        return self._finish_prepare_attn(
+            hidden_states=hidden_states,
+            residual=residual,
+            forward_batch=forward_batch,
+        )
+
+    def _finish_prepare_attn(self, hidden_states, residual, forward_batch):
+        """Tail every prepare_attn path must run, or ``attn_inputs`` is unset."""
         hidden_states = self._communicate_simple_fn(
             hidden_states=hidden_states,
             forward_batch=forward_batch,
@@ -951,6 +964,12 @@ class LayerCommunicator:
             return True
         if get_attn_tp_context().input_scattered and not self.is_last_layer:
             return True
+        return False
+
+    def should_defer_moe_finalize(
+        self, forward_batch: ForwardBatch, m: int | None = None
+    ) -> bool:
+        """Whether the MoE may hand an unfinalized output to the next layer."""
         return False
 
     # NOTE: This function will cause torch recompilation
@@ -1046,11 +1065,13 @@ def scatter_mode_layouts(
 
 class FfnExit:
     """One FFN's reduction decision. Inside the ``with`` block it is published as
-    ``fuse_mlp_allreduce`` / ``mlp_reduce_scatter`` on ``get_forward()``."""
+    ``fuse_mlp_allreduce`` / ``mlp_reduce_scatter`` / ``defer_moe_finalize`` on
+    ``get_forward()``."""
 
     __slots__ = (
         "communicator",
         "forward_batch",
+        "defer_moe_finalize",
         "fuse_mlp_allreduce",
         "mlp_reduce_scatter",
         "_scope",
@@ -1059,13 +1080,17 @@ class FfnExit:
     def __init__(self, communicator: LayerCommunicator, forward_batch: ForwardBatch):
         self.communicator = communicator
         self.forward_batch = forward_batch
+        self.defer_moe_finalize = communicator.should_defer_moe_finalize(forward_batch)
+        # Deferring implies fusing: a handoff skips the post-experts all-reduce.
         self.fuse_mlp_allreduce = (
-            communicator.should_fuse_mlp_allreduce_with_next_layer(forward_batch)
+            self.defer_moe_finalize
+            or communicator.should_fuse_mlp_allreduce_with_next_layer(forward_batch)
         )
         self.mlp_reduce_scatter = communicator.should_use_reduce_scatter(forward_batch)
         self._scope = get_forward().scoped(
             fuse_mlp_allreduce=self.fuse_mlp_allreduce,
             mlp_reduce_scatter=self.mlp_reduce_scatter,
+            defer_moe_finalize=self.defer_moe_finalize,
         )
 
     def __enter__(self) -> "FfnExit":
@@ -1079,6 +1104,10 @@ class FfnExit:
         self, hidden_states: torch.Tensor, residual: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Leave the reduction to the next layer's input norm, or postprocess."""
+        if not isinstance(hidden_states, torch.Tensor):
+            # A deferred MoE finalize handoff, consumed by the next prepare_attn.
+            assert self.defer_moe_finalize, "unrequested deferred MoE handoff"
+            return hidden_states, residual
         if self.fuse_mlp_allreduce:
             hidden_states._sglang_needs_allreduce_fusion = True
             return hidden_states, residual

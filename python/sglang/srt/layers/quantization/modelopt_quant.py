@@ -788,6 +788,12 @@ class ModelOptNvFp4EmbeddingMethod(QuantizeMethodBase):
         return out.view(*index_shape, hidden).to(self.params_dtype)
 
 
+# ``FP8_PB_WO`` is ModelOpt's canonical 2D block-FP8 name. Early composed
+# Qwen3.8-Flash-Next checkpoints label the same tensor layout (fp8 weight +
+# per-block ``weight_scale_inv``) ``FP8_BLOCK_SCALES``; keep it as an alias.
+_BLOCK_FP8_ALGOS = ("FP8_PB_WO", "FP8_BLOCK_SCALES")
+
+
 class ModelOptMixedPrecisionConfig(ModelOptQuantConfig):
     """Configuration for ModelOpt MIXED_PRECISION checkpoints."""
 
@@ -798,7 +804,6 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfig):
         packed_modules_mapping: Optional[Dict[str, List[str]]],
         quantized_layers: Dict[str, Dict[str, Any]],
         fp8_config: ModelOptFp8Config,
-        fp8_pb_wo_config: Fp8Config,
         nvfp4_config: ModelOptFp4Config,
         nvfp4a16_config: ModelOptFp4Config,
         mxfp8_config: Fp8Config,
@@ -807,7 +812,6 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfig):
         super().__init__(kv_cache_quant_algo, exclude_modules, packed_modules_mapping)
         self.quantized_layers = quantized_layers
         self.fp8_config = fp8_config
-        self.fp8_pb_wo_config = fp8_pb_wo_config
         self.mxfp8_config = mxfp8_config
         self.fp8_block_config = fp8_block_config
         self.nvfp4_config = nvfp4_config
@@ -889,17 +893,26 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfig):
         if group_size is None:
             group_size = 16
 
+        # Block-FP8 layers carry their block size as ``group_size``
+        # (default 128). One Fp8Config serves every such layer, so they must
+        # all agree.
+        block_sizes = {
+            int(layer_info.get("group_size", 128))
+            for layer_info in quantized_layers.values()
+            if layer_info.get("quant_algo", "").upper() in _BLOCK_FP8_ALGOS
+        }
+        if len(block_sizes) > 1:
+            raise ValueError(
+                "MIXED_PRECISION currently requires all block-FP8 layers to "
+                f"use one group_size, got {sorted(block_sizes)}."
+            )
+        block_size = next(iter(block_sizes), 128)
+
         packed_modules_mapping = config.get("packed_modules_mapping")
         fp8_config = ModelOptFp8Config(
             is_checkpoint_fp8_serialized=True,
             kv_cache_quant_method=kv_cache_quant_algo,
             exclude_modules=[],
-            packed_modules_mapping=packed_modules_mapping,
-        )
-        fp8_pb_wo_config = Fp8Config(
-            is_checkpoint_fp8_serialized=True,
-            activation_scheme="dynamic",
-            weight_block_size=[128, 128],
             packed_modules_mapping=packed_modules_mapping,
         )
         mxfp8_config = Fp8Config(
@@ -909,11 +922,13 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfig):
             packed_modules_mapping=packed_modules_mapping,
             use_mxfp8=True,
         )
-        # ModelOpt FP8_BLOCK_SCALES: 128x128 block fp8 with weight_scale_inv.
+        # Block-FP8 (FP8_PB_WO / FP8_BLOCK_SCALES): fp8 weight with a per-block
+        # weight_scale_inv; the block size comes from the checkpoint's
+        # group_size (128 by default). One config serves Linear and FusedMoE.
         fp8_block_config = Fp8Config(
             is_checkpoint_fp8_serialized=True,
             activation_scheme="dynamic",
-            weight_block_size=[128, 128],
+            weight_block_size=[block_size, block_size],
             packed_modules_mapping=packed_modules_mapping,
         )
         nvfp4_config = ModelOptFp4Config(
@@ -938,7 +953,6 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfig):
             packed_modules_mapping=packed_modules_mapping,
             quantized_layers=quantized_layers,
             fp8_config=fp8_config,
-            fp8_pb_wo_config=fp8_pb_wo_config,
             mxfp8_config=mxfp8_config,
             fp8_block_config=fp8_block_config,
             nvfp4_config=nvfp4_config,
@@ -1029,9 +1043,7 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfig):
                 return UnquantizedLinearMethod()
             if quant_algo == "FP8":
                 return ModelOptFp8LinearMethod(self.fp8_config)
-            if quant_algo == "FP8_PB_WO":
-                return Fp8LinearMethod(self.fp8_pb_wo_config)
-            if quant_algo == "FP8_BLOCK_SCALES":
+            if quant_algo in _BLOCK_FP8_ALGOS:
                 return Fp8LinearMethod(self.fp8_block_config)
             if quant_algo == "MXFP8":
                 return Fp8LinearMethod(self.mxfp8_config)
@@ -1062,7 +1074,7 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfig):
                 return ModelOptFp8MoEMethod(self.fp8_config)
             if quant_algo == "MXFP8":
                 return Fp8MoEMethod(self.mxfp8_config)
-            if quant_algo == "FP8_BLOCK_SCALES":
+            if quant_algo in _BLOCK_FP8_ALGOS:
                 return Fp8MoEMethod(self.fp8_block_config)
             if quant_algo == "NVFP4":
                 return ModelOptNvFp4FusedMoEMethod(self.nvfp4_config)
@@ -1308,6 +1320,17 @@ class ModelOptFp8MoEMethod(FusedMoEMethodBase):
                     requires_grad=False,
                 )
 
+            # All-None unless the runner config carries a clamp limit.
+            from sglang.srt.layers.moe.moe_runner.flashinfer_cutlass import (
+                materialize_swiglu_params_for_cutlass,
+            )
+
+            layer._cutlass_swiglu_params = materialize_swiglu_params_for_cutlass(
+                layer.moe_runner_config,
+                int(layer.num_local_experts),
+                layer.w13_weight.device,
+            )
+
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):
@@ -1388,6 +1411,7 @@ class ModelOptFp8MoEMethod(FusedMoEMethodBase):
                 FlashInferCutlassMoeQuantInfo,
             )
 
+            swiglu_alpha, swiglu_beta, swiglu_limit = layer._cutlass_swiglu_params
             quant_info = FlashInferCutlassMoeQuantInfo(
                 quant_type="fp8",
                 w13_weight=layer.w13_weight,
@@ -1399,6 +1423,9 @@ class ModelOptFp8MoEMethod(FusedMoEMethodBase):
                     layer.fc1_input_dequant,
                 ],
                 output_dtype=x.dtype,
+                swiglu_alpha=swiglu_alpha,
+                swiglu_beta=swiglu_beta,
+                swiglu_limit=swiglu_limit,
                 moe_ep_size=layer.moe_ep_size,
                 moe_ep_rank=layer.moe_ep_rank,
                 moe_tp_size=layer.moe_tp_size,
@@ -2772,6 +2799,17 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 )
                 copy_or_rebind_param(layer, "gemm1_beta", gemm1_beta)
 
+        if self.enable_flashinfer_cutlass_moe:
+            from sglang.srt.layers.moe.moe_runner.flashinfer_cutlass import (
+                materialize_swiglu_params_for_cutlass,
+            )
+
+            layer._cutlass_swiglu_params = materialize_swiglu_params_for_cutlass(
+                layer.moe_runner_config,
+                int(layer.num_local_experts),
+                layer.w13_weight.device,
+            )
+
         # TODO: for flashinfer always do MOE_NVFP4_DISPATCH
         use_dispatch_fp4 = (
             not self.quant_config.use_per_token_activation
@@ -3187,6 +3225,10 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 FlashInferCutlassMoeQuantInfo,
             )
 
+            assert not self.moe_runner_config.apply_router_weight_on_input, (
+                "apply_router_weight_on_input is not supported for Flashinfer"
+            )
+            swiglu_alpha, swiglu_beta, swiglu_limit = layer._cutlass_swiglu_params
             quant_info = FlashInferCutlassMoeQuantInfo(
                 quant_type="fp4",
                 w13_weight=layer.w13_weight,
@@ -3200,6 +3242,9 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                     layer.w2_blockscale_swizzled,
                     layer.g2_alphas,
                 ],
+                swiglu_alpha=swiglu_alpha,
+                swiglu_beta=swiglu_beta,
+                swiglu_limit=swiglu_limit,
                 moe_ep_size=layer.moe_ep_size,
                 moe_ep_rank=layer.moe_ep_rank,
                 moe_tp_size=layer.moe_tp_size,
