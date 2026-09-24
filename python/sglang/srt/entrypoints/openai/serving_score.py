@@ -89,6 +89,8 @@ class OpenAIServingScore(OpenAIServingBase):
                 score_extraction_token_id=score_extraction_token_id,
                 request=raw_request,
                 return_pooled_hidden_states=request.return_pooled_hidden_states,
+                temperature=request.temperature,
+                return_token_logprobs=request.return_token_logprobs,
             )
 
             # pooled_hidden_states is flat (pointwise / single-set setwise) or
@@ -105,6 +107,7 @@ class OpenAIServingScore(OpenAIServingBase):
             response = ScoringResponse(
                 scores=result.scores,
                 pooled_hidden_states=phs_as_lists,
+                token_logprobs=result.token_logprobs,
                 model=request.model,
                 usage=UsageInfo(
                     prompt_tokens=result.prompt_tokens,
