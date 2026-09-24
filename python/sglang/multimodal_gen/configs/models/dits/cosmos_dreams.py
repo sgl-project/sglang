@@ -25,6 +25,8 @@ ACTION_CONTRACT_SCHEMA_VERSION = 3
 HISTORY_MODE_FULL = "full"
 HISTORY_MODE_SLIDING = "sliding"
 HISTORY_MODES = (HISTORY_MODE_FULL, HISTORY_MODE_SLIDING)
+# Transfer only: slide when the export's training config recorded a KV window.
+HISTORY_MODE_AUTO = "auto"
 ACTION_CONDITIONING_MODE = "action"
 CONTROL_VIDEO_CONDITIONING_MODE = "control_video"
 TRANSFER_HINTS = ("edge", "blur", "depth", "seg")
@@ -700,4 +702,66 @@ def resolve_inference_profile(
         window_frames=window_frames,
         sink_frames=manifest.sink_frames,
         history_mode=history_mode,
+    )
+
+
+class CosmosDreamsTransferHistoryProfile(msgspec.Struct, frozen=True):
+    """Committed K/V kept by a control-video rollout, in cache entries.
+
+    A logical frame is two entries, its control latent and its clean RGB latent.
+    The reference exposes ``window_frames`` logical frames to the frame being
+    generated: ``sink_frames`` pinned pairs, the newest ``recent`` pairs, and the
+    frame's own control; ``recent = window_frames - sink_frames - 1``.
+    """
+
+    history_mode: str
+    window_frames: int | None
+    sink_frames: int
+
+    @property
+    def sink_entries(self) -> int:
+        return 0 if self.window_frames is None else 2 * self.sink_frames
+
+    @property
+    def recent_pairs(self) -> int | None:
+        if self.window_frames is None:
+            return None
+        return self.window_frames - self.sink_frames - 1
+
+    def entries_after_control_commit(self) -> int | None:
+        """History the RGB target may read: recent pairs plus its own control."""
+        return None if self.recent_pairs is None else 2 * self.recent_pairs + 1
+
+    def entries_after_rgb_commit(self) -> int | None:
+        """History the next control seed may read: whole recent pairs only."""
+        return None if self.recent_pairs is None else 2 * self.recent_pairs
+
+
+def resolve_transfer_history_profile(
+    manifest: CosmosDreamsManifest, *, history_mode: str = HISTORY_MODE_FULL
+) -> CosmosDreamsTransferHistoryProfile:
+    """``full`` keeps every committed entry; ``sliding`` applies the artifact's
+    ``window_frames``/``sink_frames`` like the reference's finite-window path."""
+    if history_mode not in HISTORY_MODES:
+        raise ValueError(
+            f"Cosmos-Dreams history_mode must be one of {HISTORY_MODES}, got {history_mode!r}."
+        )
+    if history_mode == HISTORY_MODE_FULL:
+        return CosmosDreamsTransferHistoryProfile(
+            history_mode=history_mode, window_frames=None, sink_frames=0
+        )
+    if manifest.chunk_size != 1:
+        raise ValueError(
+            "Cosmos-Dreams control_video sliding history requires chunk_size=1 "
+            f"(the reference finite-window path); the artifact has chunk_size={manifest.chunk_size}."
+        )
+    if manifest.window_frames - manifest.sink_frames < 2:
+        raise ValueError(
+            "Cosmos-Dreams control_video sliding history needs window_frames - sink_frames >= 2, "
+            f"got window_frames={manifest.window_frames}, sink_frames={manifest.sink_frames}."
+        )
+    return CosmosDreamsTransferHistoryProfile(
+        history_mode=history_mode,
+        window_frames=manifest.window_frames,
+        sink_frames=manifest.sink_frames,
     )

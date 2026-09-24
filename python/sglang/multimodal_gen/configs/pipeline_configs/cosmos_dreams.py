@@ -64,7 +64,9 @@ class CosmosDreamsConfig(Cosmos3Config):
     # with --pipeline-config-path JSON, e.g. [[1.0, 0.9375, 0.8333, 0.625]] for four steps everywhere.
     frame_sigma_schedules: list[list[float]] | None = None
     # "full" keeps the K/V of the first history_max_frames pixel frames like training over
-    # whole clips; "sliding" evicts beyond the artifact's window_frames (an exporter default).
+    # whole clips (the action exports set no training window; their window_frames is an
+    # exporter default); "sliding" evicts beyond the artifact's window_frames. The Transfer
+    # config defaults to "auto" and follows the training config instead.
     history_mode: str = HISTORY_MODE_FULL
     history_max_frames: int = COSMOS_DREAMS_HISTORY_MAX_FRAMES
 
@@ -74,8 +76,11 @@ class CosmosDreamsConfig(Cosmos3Config):
             manifest = self._validate_checkpoint(self.model_path)
             self.chunk_size = manifest.chunk_size
             self.temporal_compression_factor = manifest.temporal_compression_factor
-            # Surface bad deployment settings in the launcher, before weights load.
-            self.inference_profile(manifest)
+            self._validate_history_settings(manifest)
+
+    def _validate_history_settings(self, manifest: CosmosDreamsManifest) -> None:
+        # Surface bad deployment settings in the launcher, before weights load.
+        self.inference_profile(manifest)
 
     def inference_profile(
         self, manifest: CosmosDreamsManifest

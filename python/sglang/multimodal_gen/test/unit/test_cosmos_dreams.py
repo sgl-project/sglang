@@ -614,7 +614,10 @@ class TestCosmosDreamsSdeSeeding(unittest.TestCase):
     def test_step_seed_mixes_seed_chunk_and_step_like_the_reference(self):
         device = torch.device("cpu")
         g = sde_step_generator(seed=42, frame_start=5, step_index=2, device=device)
-        self.assertEqual(g.initial_seed(), 42 + 5 * 1_000_003 + 2 * 9_176)
+        self.assertEqual(g.initial_seed(), 42 + 5 * 1_000_003 + 3 * 9_176)
+        # Step 0 of frame 0 must not reuse the initial chunk noise seed (``seed``).
+        first = sde_step_generator(seed=42, frame_start=0, step_index=0, device=device)
+        self.assertNotEqual(first.initial_seed(), 42)
         # Distinct (chunk, step) pairs never collide for the four-step schedule.
         seeds = {
             sde_step_generator(

@@ -6,8 +6,9 @@ Mirrors imaginaire4's ``video_transfer`` autoregressive path. The control clip
 VAE-encoded, and committed chunk by chunk as clean vision K/V that shares the
 target frames' temporal positions. Each target chunk is then denoised against
 ``[text | history | current control chunk]`` and its clean frames are
-committed afterwards. Nothing is evicted; the artifact declares
-``no_eviction``.
+committed afterwards. History retention follows the resolved
+``CosmosDreamsTransferHistoryProfile``: everything by default, or the artifact's
+paired control/RGB window with pinned sink frames.
 """
 
 import json
@@ -24,6 +25,7 @@ from sglang.multimodal_gen.configs.models.dits.cosmos_dreams import (
     CONTROL_VIDEO_CONDITIONING_MODE,
     TEXT_TOKENS_TRAINING_MAX,
     CosmosDreamsManifest,
+    CosmosDreamsTransferHistoryProfile,
 )
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
@@ -468,6 +470,7 @@ class CosmosDreamsTransferRolloutStage(PipelineStage):
         transformer: CosmosDreamsTransformer,
         scheduler: FlowMatchEulerDiscreteScheduler,
         manifest: CosmosDreamsManifest,
+        history_profile: CosmosDreamsTransferHistoryProfile | None = None,
     ) -> None:
         super().__init__()
         if not isinstance(transformer, CosmosDreamsTransformer):
@@ -482,6 +485,9 @@ class CosmosDreamsTransferRolloutStage(PipelineStage):
         self.transformer = transformer
         self.scheduler = validate_fixed_step_scheduler(scheduler, manifest)
         self.manifest = manifest
+        self.history_profile = history_profile or CosmosDreamsTransferHistoryProfile(
+            history_mode="full", window_frames=None, sink_frames=0
+        )
 
     def verify_input(self, batch: Req, server_args: ServerArgs) -> VerificationResult:
         result = VerificationResult()
@@ -520,16 +526,18 @@ class CosmosDreamsTransferRolloutStage(PipelineStage):
         latent: torch.Tensor,
         *,
         frame_start: int,
+        keep_entries: int | None,
     ) -> list[KVPair]:
-        # no_eviction: every control/RGB pair stays for the whole rollout.
+        # The history helper counts frames; here one entry is one control or
+        # RGB latent, so the profile hands over entry counts.
         return commit_clean_kv(
             self.transformer,
             latent,
             history=history,
             dtype=context.dtype,
             tokens_per_frame=context.tokens_per_frame,
-            sink_frames=0,
-            window_frames=None,
+            sink_frames=self.history_profile.sink_entries,
+            window_frames=keep_entries,
             text_kv=context.text_kv,
             frame_start=frame_start,
             fps=context.fps,
@@ -561,6 +569,13 @@ class CosmosDreamsTransferRolloutStage(PipelineStage):
                 f"Cosmos-Dreams requires a single integer seed, got {seed!r}."
             )
 
+        profile = self.history_profile
+        if profile.window_frames is not None and target_frame > profile.window_frames:
+            self.log_info(
+                f"Rollout of {target_frame} latent frames exceeds the sliding history of "
+                f"{profile.window_frames} frames ({profile.sink_frames} pinned); older "
+                "control/RGB pairs are evicted once it fills."
+            )
         history: list[KVPair] | None = None
         latents: list[torch.Tensor] = []
         for chunk_start, chunk_end in iter_ar_chunk_ranges(
@@ -571,6 +586,7 @@ class CosmosDreamsTransferRolloutStage(PipelineStage):
                 history,
                 control[:, :, chunk_start:chunk_end],
                 frame_start=chunk_start,
+                keep_entries=profile.entries_after_control_commit(),
             )
             generator = torch.Generator(device=device).manual_seed(seed + chunk_start)
             # The reference draws checkpoint-dtype noise, then promotes it to fp32.
@@ -606,6 +622,7 @@ class CosmosDreamsTransferRolloutStage(PipelineStage):
                     history,
                     clean_chunk[:, :, local_idx : local_idx + 1],
                     frame_start=frame_idx,
+                    keep_entries=profile.entries_after_rgb_commit(),
                 )
             latents.append(clean_chunk)
             self.log_info(

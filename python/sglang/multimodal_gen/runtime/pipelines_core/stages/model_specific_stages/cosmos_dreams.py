@@ -866,9 +866,16 @@ SDE_STEP_SEED_STRIDE = 9_176
 def sde_step_generator(
     *, seed: int, frame_start: int, step_index: int, device: torch.device
 ) -> torch.Generator:
-    """Generator for the SDE noise injected after ``step_index`` of the chunk at ``frame_start``."""
+    """Generator for the SDE noise injected after ``step_index`` of the chunk at ``frame_start``.
+
+    Reinjection steps count from one (imaginaire4 a64c10426a2): with the initial
+    chunk noise drawn from ``seed + frame_start``, a zero-based step at frame 0
+    would reuse that noise.
+    """
     step_seed = (
-        seed + frame_start * SDE_FRAME_SEED_STRIDE + step_index * SDE_STEP_SEED_STRIDE
+        seed
+        + frame_start * SDE_FRAME_SEED_STRIDE
+        + (step_index + 1) * SDE_STEP_SEED_STRIDE
     )
     return torch.Generator(device=device).manual_seed(step_seed)
 

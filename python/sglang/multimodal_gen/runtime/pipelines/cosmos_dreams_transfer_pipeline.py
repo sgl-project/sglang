@@ -72,21 +72,31 @@ class Cosmos3NanoSimTransferPipeline(ComposedPipelineBase):
                 manifest=manifest,
             )
         )
+        history_profile = pipeline_config.transfer_history_profile(manifest)
         self.add_stage(
             CosmosDreamsTransferRolloutStage(
                 transformer=transformer,
                 scheduler=self.get_module("scheduler"),
                 manifest=manifest,
+                history_profile=history_profile,
             )
         )
         self.add_stage(
             Cosmos3DecodingStage(vae, guardrails=False, sound_tokenizer=None)
         )
         logger.info(
-            "Cosmos-Dreams-Transfer pipeline stages created (checkpoint %s, hints %s, chunk_size=%d)",
+            "Cosmos-Dreams-Transfer pipeline stages created (checkpoint %s, hints %s, "
+            "chunk_size=%d, %s history%s)",
             manifest.checkpoint_id,
             list(manifest.control_contract.hints),
             manifest.chunk_size,
+            history_profile.history_mode,
+            (
+                ""
+                if history_profile.window_frames is None
+                else f" of {history_profile.window_frames} latent frames, "
+                f"{history_profile.sink_frames} pinned"
+            ),
         )
 
 

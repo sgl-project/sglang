@@ -4,6 +4,9 @@ parsing, chunk-partition alignment, prompt formatting, vision-only position
 ids, and registry wiring."""
 
 import copy
+import json
+import os
+import tempfile
 import unittest
 from dataclasses import replace
 from types import SimpleNamespace
@@ -13,12 +16,14 @@ import torch
 
 from sglang.multimodal_gen.configs.models.dits.cosmos_dreams import (
     parse_cosmos_dreams_manifest,
+    resolve_transfer_history_profile,
 )
 from sglang.multimodal_gen.configs.pipeline_configs.cosmos_dreams import (
     CosmosDreamsConfig,
 )
 from sglang.multimodal_gen.configs.pipeline_configs.cosmos_dreams_transfer import (
     CosmosDreamsTransferConfig,
+    training_kv_window,
 )
 from sglang.multimodal_gen.configs.sample.cosmos_dreams_transfer import (
     CosmosDreamsTransferSamplingParams,
@@ -108,6 +113,142 @@ class _FakeTokenizer:
 
     def convert_tokens_to_ids(self, token: str) -> int:
         return {"<|vision_start|>": 9}[token]
+
+
+class TestCosmosDreamsTransferHistory(unittest.TestCase):
+    """Sliding history must expose exactly what the reference finite-window path
+    exposes: pinned sink pairs, the newest ``window - sink - 1`` control/RGB
+    pairs, and the current frame's own control while its RGB is denoised."""
+
+    @staticmethod
+    def _chunk1_manifest(window_frames: int = 51, sink_frames: int = 1):
+        artifact = _artifact()
+        artifact.update(
+            chunk_size=1, window_frames=window_frames, sink_frames=sink_frames
+        )
+        return parse_cosmos_dreams_manifest(artifact)
+
+    def test_full_history_keeps_everything(self):
+        profile = resolve_transfer_history_profile(MANIFEST, history_mode="full")
+        self.assertIsNone(profile.window_frames)
+        self.assertEqual(profile.sink_entries, 0)
+        self.assertIsNone(profile.entries_after_control_commit())
+        self.assertIsNone(profile.entries_after_rgb_commit())
+
+    def test_sliding_window_arithmetic_matches_the_reference(self):
+        profile = resolve_transfer_history_profile(
+            self._chunk1_manifest(), history_mode="sliding"
+        )
+        self.assertEqual(profile.recent_pairs, 49)
+        self.assertEqual(profile.sink_entries, 2)
+        self.assertEqual(profile.entries_after_control_commit(), 99)
+        self.assertEqual(profile.entries_after_rgb_commit(), 98)
+
+    def test_sliding_history_needs_framewise_chunks_and_room(self):
+        with self.assertRaisesRegex(ValueError, "chunk_size=1"):
+            resolve_transfer_history_profile(MANIFEST, history_mode="sliding")
+        with self.assertRaisesRegex(ValueError, "window_frames - sink_frames"):
+            resolve_transfer_history_profile(
+                self._chunk1_manifest(window_frames=2, sink_frames=1),
+                history_mode="sliding",
+            )
+        with self.assertRaisesRegex(ValueError, "history_mode"):
+            resolve_transfer_history_profile(MANIFEST, history_mode="ring")
+
+    def test_commit_sequence_exposes_sink_recent_pairs_and_own_control(self):
+        # window 3, sink 1 -> one recent pair; entries are 1-token K/V labelled
+        # 2t (control of frame t) and 2t+1 (RGB of frame t).
+        profile = resolve_transfer_history_profile(
+            self._chunk1_manifest(window_frames=3, sink_frames=1),
+            history_mode="sliding",
+        )
+
+        def entry(label: float):
+            value = torch.full((1, 1, 1, 1), label)
+            return [(value.clone(), value.clone())]
+
+        def labels(history):
+            return history[0][0][0, :, 0, 0].tolist()
+
+        history = None
+        seen_by_rgb_target = {}
+        seen_by_control_seed = {}
+        for frame in range(4):
+            seen_by_control_seed[frame] = labels(history) if history else []
+            history = append_kv_history(
+                history,
+                entry(2 * frame),
+                tokens_per_frame=1,
+                sink_frames=profile.sink_entries,
+                window_frames=profile.entries_after_control_commit(),
+            )
+            seen_by_rgb_target[frame] = labels(history)
+            history = append_kv_history(
+                history,
+                entry(2 * frame + 1),
+                tokens_per_frame=1,
+                sink_frames=profile.sink_entries,
+                window_frames=profile.entries_after_rgb_commit(),
+            )
+        # Frame 3: pinned pair of frame 0, the pair of frame 2, then its own control.
+        self.assertEqual(seen_by_rgb_target[3], [0.0, 1.0, 4.0, 5.0, 6.0])
+        self.assertEqual(seen_by_control_seed[3], [0.0, 1.0, 4.0, 5.0])
+        # Inside the window nothing is evicted.
+        self.assertEqual(seen_by_rgb_target[1], [0.0, 1.0, 2.0])
+        self.assertEqual(seen_by_rgb_target[2], [0.0, 1.0, 2.0, 3.0, 4.0])
+
+    def test_transfer_config_follows_the_training_window_by_default(self):
+        config = CosmosDreamsTransferConfig()
+        self.assertEqual(config.history_mode, "auto")
+        # No training window recorded (chunk-4 export; its window 96 is an exporter default).
+        profile = config.transfer_history_profile(MANIFEST, trained_window=(None, 0))
+        self.assertEqual((profile.history_mode, profile.window_frames), ("full", None))
+        # Sim-Depth: kv_cache_inference_size 51, attention_sink_size 1 -> slide like the reference.
+        manifest = self._chunk1_manifest()
+        profile = config.transfer_history_profile(manifest, trained_window=(51, 1))
+        self.assertEqual(
+            (profile.history_mode, profile.window_frames, profile.sink_frames),
+            ("sliding", 51, 1),
+        )
+        with self.assertRaisesRegex(ValueError, "disagrees"):
+            config.transfer_history_profile(manifest, trained_window=(30, 1))
+        # Explicit modes override the training config.
+        config.update_pipeline_config({"history_mode": "full"})
+        self.assertIsNone(
+            config.transfer_history_profile(
+                manifest, trained_window=(51, 1)
+            ).window_frames
+        )
+        config.update_pipeline_config({"history_mode": "sliding"})
+        self.assertEqual(
+            config.transfer_history_profile(
+                manifest, trained_window=(None, 0)
+            ).window_frames,
+            51,
+        )
+        with self.assertRaisesRegex(ValueError, "chunk_size=1"):
+            config.transfer_history_profile(MANIFEST, trained_window=(None, 0))
+
+    def test_training_kv_window_reads_the_root_config(self):
+        with tempfile.TemporaryDirectory() as root:
+            self.assertEqual(training_kv_window(root), (None, 0))
+            with open(os.path.join(root, "config.json"), "w") as f:
+                json.dump(
+                    {
+                        "model": {
+                            "config": {
+                                "kv_cache_inference_size": 51,
+                                "attention_sink_size": 1,
+                            }
+                        }
+                    },
+                    f,
+                )
+            self.assertEqual(training_kv_window(root), (51, 1))
+            with open(os.path.join(root, "config.json"), "w") as f:
+                json.dump({"model": {"config": {"kv_cache_inference_size": None}}}, f)
+            self.assertEqual(training_kv_window(root), (None, 0))
+        self.assertEqual(training_kv_window(None), (None, 0))
 
 
 class TestTransferManifest(unittest.TestCase):
