@@ -358,6 +358,11 @@ impl RouterConfigBuilder {
         self
     }
 
+    pub fn source_label_header<S: Into<String>>(mut self, header: S) -> Self {
+        self.config.source_label_header = Some(header.into());
+        self
+    }
+
     // ==================== IGW Mode ====================
 
     pub fn enable_igw(mut self) -> Self {
@@ -528,6 +533,11 @@ impl RouterConfigBuilder {
 
     pub fn maybe_request_id_headers(mut self, headers: Option<Vec<String>>) -> Self {
         self.config.request_id_headers = headers;
+        self
+    }
+
+    pub fn maybe_source_label_header(mut self, header: Option<impl Into<String>>) -> Self {
+        self.config.source_label_header = header.map(|h| h.into());
         self
     }
 
@@ -862,5 +872,25 @@ mod tests {
             }
             _ => panic!("Expected CacheAware policy"),
         }
+    }
+
+    #[test]
+    fn test_builder_source_label_header() {
+        let config = RouterConfigBuilder::new()
+            .regular_mode(vec!["http://worker1:8000".to_string()])
+            .source_label_header("x-request-source")
+            .build()
+            .unwrap();
+        assert_eq!(
+            config.source_label_header.as_deref(),
+            Some("x-request-source")
+        );
+
+        let config = RouterConfigBuilder::new()
+            .regular_mode(vec!["http://worker1:8000".to_string()])
+            .maybe_source_label_header(None::<String>)
+            .build()
+            .unwrap();
+        assert!(config.source_label_header.is_none());
     }
 }
