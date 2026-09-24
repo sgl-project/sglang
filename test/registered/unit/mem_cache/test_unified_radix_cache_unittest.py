@@ -9,6 +9,7 @@ import time
 import unittest
 from array import array
 from collections import defaultdict
+from contextlib import ExitStack
 from dataclasses import dataclass, replace
 from types import SimpleNamespace
 from typing import Optional
@@ -3980,7 +3981,66 @@ class UnifiedRadixCacheSuite:
         ).last_device_node
         chain = self._path_chain(cache, leaf)
 
-        self._buffer_backup_and_wait(cache, leaf)
+        pipeline = cache.buffer_pipeline
+        controller = cache.cache_controller
+        _write_backup(cache, leaf)
+        node_ids = [intent.snapshot.node_id for intent in pipeline.pending_write_queue]
+        self.assertGreaterEqual(len(node_ids), 2)
+
+        device_allocators = [allocator]
+        if self.cfg.has_swa:
+            device_allocators.extend(
+                [allocator.full_attn_allocator, allocator.swa_attn_allocator]
+            )
+        # A deferred D2H batch must not allocate or free L1 slots before submit.
+        with ExitStack() as guards:
+            for device_allocator in device_allocators:
+                for method in (
+                    "alloc",
+                    "alloc_extend",
+                    "alloc_decode",
+                    "free",
+                    "free_segment",
+                    "free_page_ids",
+                ):
+                    if hasattr(device_allocator, method):
+                        guards.enter_context(
+                            mock.patch.object(
+                                device_allocator,
+                                method,
+                                side_effect=AssertionError(
+                                    "L1 mutation during backup preparation"
+                                ),
+                            )
+                        )
+            pipeline.flush_pending_writes()
+        self.assertFalse(pipeline.pending_write_queue)
+        self.assertFalse(controller.write_queue)
+        self.assertEqual(len(controller.ack_write_queue), 1)
+        ack = controller.ack_write_queue[0]
+        self.assertEqual(ack.node_ids, node_ids)
+        self.assertEqual(set(pipeline.ongoing_write_through), set(node_ids))
+        staged_avail = self._host_avail_sizes(cache)
+        self.assertNotEqual(staged_avail, avail0)
+
+        # GPU completion alone must not release any entry's device lock.
+        ack.finish_event.synchronize()
+        for node_id in node_ids:
+            self.assertGreater(_device_lock_ref(cache, node_id, ComponentType.FULL), 0)
+        cache.writing_check(finish_count=1)
+        self.assertFalse(pipeline.ongoing_write_through)
+        self.assertEqual(len(pipeline.ongoing_backup), len(node_ids))
+        for node_id in node_ids:
+            self.assertEqual(_device_lock_ref(cache, node_id, ComponentType.FULL), 0)
+        # Each storage write still owns its staging until its separate ACK.
+        self.assertEqual(self._host_avail_sizes(cache), staged_avail)
+        self._pump_hicache_until(
+            cache,
+            lambda: (
+                not pipeline.inflight_backup_node_ids and not pipeline.ongoing_backup
+            ),
+            "merged buffer backup did not drain every storage write",
+        )
         self.assertFalse(cache.tree_core.is_backuped(leaf))
         self.assertEqual(_device_lock_ref(cache, leaf, ComponentType.FULL), 0)
         self.assertEqual(self._host_avail_sizes(cache), avail0)
