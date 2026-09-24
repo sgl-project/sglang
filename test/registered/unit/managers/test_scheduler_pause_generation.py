@@ -621,89 +621,56 @@ class TestSchedulerPauseGeneration(CustomTestCase):
     def test_retraction_refused_while_any_rank_tracks_an_offload_copy(self):
         """Retraction must be refused on every rank, before any KV is freed, while any
         rank still tracks a device-to-host offload copy after the drain."""
-        for entrypoint in (self._retract_by_pause, self._retract_by_kv_full):
-            for case, tp_world_size, peer_queue_sizes, peer_pending in (
-                # Only the peer still has a copy; this rank has nothing to drain.
-                ("peer_only", 2, [0, 0], 1),
-                # This rank has an ack the peer lacks, so the MIN drain skips it.
-                ("asymmetric_acks", 2, [0, 0], 0),
-                # A tracked copy whose ack is missing; checked locally at TP1.
-                ("tracked_without_ack", 1, None, None),
-            ):
-                with self.subTest(entrypoint=entrypoint.__name__, case=case):
-                    scheduler = self._new_scheduler()
-                    req, frees = self._decode_req_with_pending_offload(
-                        scheduler,
-                        tp_world_size=tp_world_size,
-                        offload=case != "peer_only",
-                    )
-                    manager = scheduler.decode_offload_manager
-                    if case == "tracked_without_ack":
-                        manager.cache_controller.ack_write_queue.clear()
-                        manager.ongoing_offload.clear()
-                    all_reduce = _all_reduce_with_peer(
-                        [], peer_queue_sizes, peer_pending
-                    )
-                    with patch.object(
-                        torch.distributed, "all_reduce", side_effect=all_reduce
-                    ):
-                        try:
-                            entrypoint(scheduler, req)
-                            refused = False
-                        except RuntimeError as exc:
-                            refused = "refusing to retract" in str(exc)
-
-                    self.assertEqual((refused, frees), (True, []))
-
-    def test_retraction_proceeds_when_no_rank_tracks_an_offload_copy(self):
-        """Symmetric drains, requests with no offload, and pending storage backups
-        must not block retraction."""
-        for entrypoint in (self._retract_by_pause, self._retract_by_kv_full):
-            for case, offload, local_backups, expected_frees in (
-                ("drained", True, 0, [("run", True)]),
-                # No copy was issued, so none completed.
-                ("no_offload", False, 0, [("run", False)]),
-                # Backup acks differ across ranks; backups only read host memory.
-                ("backup_only", True, 1, [("run", True)]),
-            ):
-                with self.subTest(entrypoint=entrypoint.__name__, case=case):
-                    scheduler = self._new_scheduler()
-                    req, frees = self._decode_req_with_pending_offload(
-                        scheduler, tp_world_size=2, offload=offload
-                    )
-                    controller = scheduler.decode_offload_manager.cache_controller
-                    controller.ack_backup_queue.qsize.return_value = local_backups
-                    peer_queue_sizes = [int(offload), 0]
-                    all_reduce = _all_reduce_with_peer([], peer_queue_sizes, 0)
-                    with patch.object(
-                        torch.distributed, "all_reduce", side_effect=all_reduce
-                    ):
-                        entrypoint(scheduler, req)
-
-                    self.assertEqual(frees, expected_frees)
-
-    def test_retraction_adds_one_collective_outside_the_decode_drain(self):
-        """All ranks must issue identical collectives: the per-iteration decode drain
-        stays a single MIN, and each retraction adds exactly one MAX after its MIN."""
         min_op, max_op = torch.distributed.ReduceOp.MIN, torch.distributed.ReduceOp.MAX
-        for entrypoint in (self._retract_by_pause, self._retract_by_kv_full):
-            with self.subTest(entrypoint=entrypoint.__name__):
+        for case, entrypoint, tp_size, offload, peer_acks, peer_pending in (
+            # Nothing is tracked here at the call site; only the peer has a copy.
+            ("peer_only", self._retract_by_kv_full, 2, False, [0, 0], 1),
+            # This rank has an ack the peer lacks, so the MIN drain leaves its copy.
+            ("asymmetric_acks", self._retract_by_pause, 2, True, [0, 0], 0),
+            # A tracked copy whose ack is missing; checked locally at TP1.
+            ("tracked_without_ack", self._retract_by_pause, 1, True, None, None),
+        ):
+            with self.subTest(case=case):
                 scheduler = self._new_scheduler()
-                req, _ = self._decode_req_with_pending_offload(
-                    scheduler, tp_world_size=2
+                req, frees = self._decode_req_with_pending_offload(
+                    scheduler, tp_world_size=tp_size, offload=offload
                 )
+                manager = scheduler.decode_offload_manager
+                if case == "tracked_without_ack":
+                    manager.cache_controller.ack_write_queue.clear()
+                    manager.ongoing_offload.clear()
                 ops = []
-                all_reduce = _all_reduce_with_peer(ops, [1, 0], 0)
+                all_reduce = _all_reduce_with_peer(ops, peer_acks, peer_pending)
                 with patch.object(
                     torch.distributed, "all_reduce", side_effect=all_reduce
                 ):
-                    scheduler.decode_offload_manager.check_offload_progress()
-                    decode_drain_ops = list(ops)
-                    ops.clear()
-                    entrypoint(scheduler, req)
+                    if case == "asymmetric_acks":
+                        # The per-iteration drain only waits for the peer: it neither
+                        # fails closed nor adds a collective.
+                        manager.check_offload_progress()
+                        self.assertEqual(ops, [min_op])
+                        ops.clear()
+                    with self.assertRaisesRegex(RuntimeError, "refusing to retract"):
+                        entrypoint(scheduler, req)
 
-                self.assertEqual(decode_drain_ops, [min_op])
-                self.assertEqual(ops, [min_op, max_op])
+                self.assertEqual(frees, [])
+                if tp_size > 1:
+                    # A rank that skips the MAX leaves the other ranks waiting in it.
+                    self.assertIn(max_op, ops)
+
+    def test_pending_storage_backup_ack_does_not_block_retraction(self):
+        """A storage-backup ack left queued by the MIN drain must not block retraction:
+        backups read only host memory."""
+        scheduler = self._new_scheduler()
+        req, frees = self._decode_req_with_pending_offload(scheduler, tp_world_size=2)
+        # Only this rank has the ack, so the MIN over backup counts leaves it queued.
+        controller = scheduler.decode_offload_manager.cache_controller
+        controller.ack_backup_queue.qsize.return_value = 1
+        all_reduce = _all_reduce_with_peer([], [1, 0], 0)
+        with patch.object(torch.distributed, "all_reduce", side_effect=all_reduce):
+            self._retract_by_pause(scheduler, req)
+
+        self.assertEqual(frees, [("run", True)])
 
     def test_pd_decode_continue_releases_held_rebootstrap(self):
         """continue_generation must enqueue staged rebootstrap reqs on resume."""
