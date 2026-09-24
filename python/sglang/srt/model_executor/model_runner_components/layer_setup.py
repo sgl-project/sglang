@@ -130,8 +130,7 @@ class ModelLayerInfo(msgspec.Struct, frozen=True, kw_only=True):
     start_layer: int
     end_layer: int
     num_effective_layers: int
-    # This runner's slice of ModelConfig's whole-model swa/full split, as global
-    # layer ids; None when the model has no split.
+    # Global ids of the layers this runner owns; None when the model has no split.
     swa_attention_layer_ids: Optional[list[int]] = None
     full_attention_layer_ids: Optional[list[int]] = None
     # Owns the single block at layer_id == draft_model_idx, not a [start, end) slice.
@@ -191,7 +190,6 @@ def _resolve_local_hybrid_swa_layer_ids(
     model_config: ModelConfig,
     owned_layers: range,
 ) -> tuple[Optional[list[int]], Optional[list[int]]]:
-    # Read-only: multi-layer MTP draft runners share one ModelConfig instance.
     if model_config.swa_attention_layer_ids is None:
         return None, None
     return (

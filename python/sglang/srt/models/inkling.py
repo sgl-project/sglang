@@ -1826,8 +1826,6 @@ class InklingForConditionalGenerationMTP(nn.Module):
     """
 
     fall_back_to_pt_during_load = False
-    # The block's layer_id is draft_model_idx, so each depth runner owns exactly
-    # that layer for KV-pool routing (see resolve_layer_indices).
     mtp_layer_id_is_depth = True
 
     def __init__(

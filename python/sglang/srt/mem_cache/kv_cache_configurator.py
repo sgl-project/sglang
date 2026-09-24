@@ -778,8 +778,7 @@ class KVCacheConfigurator:
             swa_head_dim = head_dim
             swa_v_head_dim = head_dim
 
-        # Never the HF config's full_attention_layer_ids: that property feeds the
-        # conv/attention pairing and returns ALL layers.
+        # Not the HF config's full_attention_layer_ids: that one returns ALL layers.
         swa_attention_layer_ids = self.layer_info.swa_attention_layer_ids
         full_attention_layer_ids = self.layer_info.full_attention_layer_ids
         n_local_layers = self.layer_info.end_layer - self.layer_info.start_layer
