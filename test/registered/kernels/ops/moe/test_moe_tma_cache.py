@@ -33,4 +33,5 @@ def test_descriptor_does_not_follow_a_rebound_parameter():
 
 
 if __name__ == "__main__":
-    sys.exit(pytest.main([__file__, *sys.argv[1:]]))
+    args = ["-x" if arg == "-f" else arg for arg in sys.argv[1:]]
+    sys.exit(pytest.main([__file__, *args]))
