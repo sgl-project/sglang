@@ -78,12 +78,21 @@ class TestMistralDetectorStreaming(CustomTestCase):
 
     def _chunkings(self, text):
         third = len(text) // 3
-        return {
+        chunkings = {
             "char": list(text),
             "whole": [text],
             "halves": [text[: len(text) // 2], text[len(text) // 2 :]],
             "thirds": [text[:third], text[third : 2 * third], text[2 * third :]],
         }
+        # Fixed-size sweeps keep chunk boundaries from aligning with the
+        # tool-call separator: a boundary inside ", " is exactly the lone-comma
+        # framing, and mid-marker/mid-JSON boundaries exercise the partial
+        # marker and argument buffering paths.
+        for size in (5, 13, 40, 65, 100):
+            chunkings[f"size{size}"] = [
+                text[i : i + size] for i in range(0, len(text), size)
+            ]
+        return chunkings
 
     def assert_stream_matches_final(self, text):
         reference = MistralDetector().detect_and_parse(text, self.tools)
