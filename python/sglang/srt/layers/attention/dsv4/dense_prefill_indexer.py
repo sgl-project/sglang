@@ -60,7 +60,9 @@ def dense_prefill_topk(
                 )
             )
         row += query_length
-    width = ceil_align(max((n for _, n in request_lengths), default=0), 4)
+    # The specialized block-amax and top-k kernels vectorize their score and
+    # block-key reads to 32 and 16 bytes respectively.
+    width = ceil_align(max((n for _, n in request_lengths), default=0), 32)
     if row == 0 or width == 0:
         return selected, published
     rows_per_chunk = _rows_per_chunk(row, width, heads=q[0].shape[1])
@@ -254,9 +256,9 @@ def _select_tile(
                 )
                 blocks = publish.request_blocks[request][request_rows]
                 blocks.copy_(
-                    select_candidate_block_ids(
+                    _select_candidate_block_ids(
                         logits=scores,
-                        compress_lens=lens,
+                        lengths=lengths[rows],
                         topk_blocks=blocks.shape[1],
                         block_size=block_size,
                     )
@@ -275,3 +277,31 @@ def _select_tile(
         selected.copy_(
             mask_topk_scores(scores=logits, indices=selected, offsets=starts)
         )
+
+
+def _select_candidate_block_ids(
+    *,
+    logits: torch.Tensor,
+    lengths: torch.Tensor,
+    topk_blocks: int,
+    block_size: int,
+) -> torch.Tensor:
+    if block_size != 8:
+        return select_candidate_block_ids(
+            logits=logits,
+            compress_lens=lengths[:, None],
+            topk_blocks=topk_blocks,
+            block_size=block_size,
+        )
+
+    from sglang.srt.layers.attention.dsv4.candidate_indexer_deep_gemm import (
+        amax_topk_blocks,
+    )
+
+    return amax_topk_blocks(
+        logits=logits,
+        seq_lens=lengths,
+        nblocks=(lengths + block_size - 1) // block_size,
+        topk_blocks=topk_blocks,
+        max_seq_len=logits.shape[1],
+    )
