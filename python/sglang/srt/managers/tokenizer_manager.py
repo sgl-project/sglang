@@ -289,8 +289,12 @@ class ReqState:
     input_token_ids_logprobs_idx: List = dataclasses.field(default_factory=list)
     output_token_ids_logprobs_val: List = dataclasses.field(default_factory=list)
     output_token_ids_logprobs_idx: List = dataclasses.field(default_factory=list)
-    output_token_sampling_mask: List = dataclasses.field(default_factory=list)
-    output_token_sampling_logprobs: List = dataclasses.field(default_factory=list)
+    output_token_sampling_mask: List[List[int]] = dataclasses.field(
+        default_factory=list
+    )
+    output_token_sampling_logprobs: List[Union[float, List[float]]] = dataclasses.field(
+        default_factory=list
+    )
 
     # Cached flat-format prompt top logprob fields; rebuilt only when more
     # prefill chunks arrive, so streaming decode chunks reuse the payload.
@@ -1377,6 +1381,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     "return_sampling_mask only supports DisallowedTokensLogitsProcessor "
                     "among custom logit processors."
                 )
+            if obj.sampling_logprobs_mode is not None and not obj.return_sampling_mask:
+                raise ValueError(
+                    "sampling_logprobs_mode can only be set when "
+                    "return_sampling_mask=true."
+                )
 
     def _validate_mm_limits(
         self, obj: Union[GenerateReqInput, EmbeddingReqInput]
@@ -1494,6 +1503,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 top_logprobs_num=obj.top_logprobs_num,
                 token_ids_logprob=obj.token_ids_logprob,
                 return_sampling_mask=obj.return_sampling_mask,
+                sampling_logprobs_mode=obj.sampling_logprobs_mode or "selected",
                 return_flat_raw_top_logprobs=obj.return_flat_raw_top_logprobs,
                 stream=obj.stream,
                 rid=obj.rid,
@@ -1515,6 +1525,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 routed_dp_rank=obj.routed_dp_rank,
                 disagg_prefill_dp_rank=obj.disagg_prefill_dp_rank,
                 priority=obj.priority,
+                kv_hints=obj.kv_hints,
                 extra_key=obj.extra_key,
                 cache_salt=obj.cache_salt,
                 routing_key=obj.routing_key,
@@ -1550,6 +1561,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 http_worker_ipc=obj.http_worker_ipc,
                 return_pooled_hidden_states=obj.return_pooled_hidden_states,
                 multi_item_delimiter_indices=obj.multi_item_delimiter_indices,
+                token_indices_to_pool=obj.token_indices_to_pool,
             )
 
         tokenized_obj.time_stats = self.rid_to_state[obj.rid].time_stats
@@ -2841,7 +2853,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             )
 
         if top_logprobs_num > 0:
-            if len(recv_obj.input_top_logprobs_val) > 0:
+            if (
+                recv_obj.input_top_logprobs_val is not None
+                and len(recv_obj.input_top_logprobs_val) > 0
+            ):
                 state.input_top_logprobs_val.extend(
                     recv_obj.input_top_logprobs_val[recv_obj_index]
                 )
@@ -2857,27 +2872,32 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     recv_obj.input_top_logprobs_idx_flat[recv_obj_index],
                     recv_obj.input_top_logprobs_flat_null_prefix[recv_obj_index],
                 )
-            state.output_top_logprobs_val.extend(
-                recv_obj.output_top_logprobs_val[recv_obj_index]
-            )
-            state.output_top_logprobs_idx.extend(
-                recv_obj.output_top_logprobs_idx[recv_obj_index]
-            )
+            if recv_obj.output_top_logprobs_val is not None:
+                state.output_top_logprobs_val.extend(
+                    recv_obj.output_top_logprobs_val[recv_obj_index]
+                )
+                state.output_top_logprobs_idx.extend(
+                    recv_obj.output_top_logprobs_idx[recv_obj_index]
+                )
 
         if token_ids_logprob is not None:
-            if len(recv_obj.input_token_ids_logprobs_val) > 0:
+            if (
+                recv_obj.input_token_ids_logprobs_val is not None
+                and len(recv_obj.input_token_ids_logprobs_val) > 0
+            ):
                 state.input_token_ids_logprobs_val.extend(
                     recv_obj.input_token_ids_logprobs_val[recv_obj_index]
                 )
                 state.input_token_ids_logprobs_idx.extend(
                     recv_obj.input_token_ids_logprobs_idx[recv_obj_index]
                 )
-            state.output_token_ids_logprobs_val.extend(
-                recv_obj.output_token_ids_logprobs_val[recv_obj_index]
-            )
-            state.output_token_ids_logprobs_idx.extend(
-                recv_obj.output_token_ids_logprobs_idx[recv_obj_index]
-            )
+            if recv_obj.output_token_ids_logprobs_val is not None:
+                state.output_token_ids_logprobs_val.extend(
+                    recv_obj.output_token_ids_logprobs_val[recv_obj_index]
+                )
+                state.output_token_ids_logprobs_idx.extend(
+                    recv_obj.output_token_ids_logprobs_idx[recv_obj_index]
+                )
 
         self.add_logprob_to_meta_info(
             meta_info,
@@ -2982,10 +3002,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                         / recv_obj.spec_verify_ct[i]
                     )
 
-                # FIXME: backward-compat aliases, remove in next release.
-                meta_info["spec_accepted_drafts"] = num_correct_drafts
-                meta_info["spec_proposed_drafts"] = num_proposed_drafts
-
             # Acceptance histogram: tracks how many decoding steps accepted a certain number of draft tokens.
             if (
                 recv_obj.spec_correct_drafts_histogram
@@ -2993,10 +3009,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 and recv_obj.spec_correct_drafts_histogram[i]
             ):
                 meta_info["spec_correct_drafts_histogram"] = (
-                    recv_obj.spec_correct_drafts_histogram[i]
-                )
-                # FIXME: backward-compat alias, remove in next release.
-                meta_info["spec_accept_histogram"] = (
                     recv_obj.spec_correct_drafts_histogram[i]
                 )
             if (

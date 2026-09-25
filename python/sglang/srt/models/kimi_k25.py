@@ -1,4 +1,5 @@
 import logging
+from array import array
 from copy import deepcopy
 from typing import Iterable, List, Optional, Sequence, Tuple
 
@@ -775,7 +776,7 @@ class KimiK25ForConditionalGeneration(nn.Module):
         image_embeds = self.vision_tower(pixel_values, grid_thws)
         return mm_projection_auto(self.mm_projector, image_embeds)
 
-    def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
+    def pad_input_ids(self, input_ids: array, mm_inputs: MultimodalInputs) -> array:
         pattern = MultiModalityDataPaddingPatternMultimodalTokens()
         return pattern.pad_input_tokens(input_ids, mm_inputs)
 

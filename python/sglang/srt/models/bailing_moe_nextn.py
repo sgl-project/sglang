@@ -127,6 +127,7 @@ class BailingMoEModelNextN(nn.Module):
                 0,
                 quant_config=quant_config,
                 prefix=add_prefix("decoder", prefix),
+                is_nextn=True,
             )
 
         self.shared_head = nn.Module()
@@ -182,6 +183,9 @@ class BailingMoEModelNextN(nn.Module):
                 positions, hidden_states, forward_batch, residual
             )
 
+        hidden_states, residual = self.decoder.layer_communicator.finish_layer_stack(
+            hidden_states, residual, forward_batch
+        )
         if not forward_batch.forward_mode.is_idle():
             if residual is not None:
                 hidden_states, _ = self.final_layernorm(hidden_states, residual)
