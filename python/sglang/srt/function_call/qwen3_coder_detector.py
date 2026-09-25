@@ -231,11 +231,19 @@ class Qwen3CoderDetector(BaseFormatDetector):
                     )
                     tool_idx += 1
 
-            # Determine normal text (text before the first tool call)
-            start_idx = text.find(self.tool_call_start_token)
-            if start_idx == -1:
-                start_idx = text.find(self.tool_call_prefix)
-            normal_text = text[:start_idx] if start_idx > 0 else ""
+            # Determine normal text: everything outside complete tool-call
+            # blocks. The streaming parser emits text after a call (and
+            # between calls) as visible content, so one-shot parsing must
+            # keep it too; only the tool-call markup is carved out.
+            normal_text = self.tool_call_regex.sub("", text)
+            # Anything after an unclosed block or a partial tag stays inside
+            # the call for the streaming machine; do not leak it here either.
+            cut = len(normal_text)
+            for token in (self.tool_call_start_token, self.tool_call_prefix):
+                idx = normal_text.find(token)
+                if idx != -1:
+                    cut = min(cut, idx)
+            normal_text = normal_text[:cut]
 
             return StreamingParseResult(normal_text=normal_text, calls=calls)
 

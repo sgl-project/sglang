@@ -2435,6 +2435,64 @@ class TestQwen3CoderDetector(unittest.TestCase):
         self.assertEqual(params2["query"], "SELECT * FROM users")
         self.assertEqual(params2["dry_run"], True)
 
+    def test_trailing_text_after_tool_call_preserved(self):
+        """
+        Test that visible text after a closed tool call survives one-shot parsing.
+
+        Scenario: Input has plain text, a complete tool call, then more text.
+        Purpose: Non-streaming must keep the same visible content the streaming
+        parser emits for the same output (issue #40739).
+        """
+        text = (
+            "before"
+            "<tool_call>\n<function=get_current_weather>\n"
+            "<parameter=location>Paris</parameter>\n</function>\n</tool_call>"
+            "after"
+        )
+        result = self.detector.detect_and_parse(text, self.tools)
+
+        self.assertEqual(result.normal_text, "beforeafter")
+        self.assertEqual(len(result.calls), 1)
+        self.assertEqual(result.calls[0].name, "get_current_weather")
+
+    def test_text_between_two_tool_calls_preserved(self):
+        """
+        Test that text interleaved between two tool calls is kept too.
+
+        Scenario: text before, between, and after two complete tool calls.
+        Purpose: Streaming parity for every region outside tool-call blocks.
+        """
+        text = (
+            "before"
+            "<tool_call>\n<function=get_current_weather>\n"
+            "<parameter=location>Paris</parameter>\n</function>\n</tool_call>"
+            "mid"
+            "<tool_call>\n<function=sql_interpreter>\n"
+            "<parameter=query>SELECT 1</parameter>\n</function>\n</tool_call>"
+            "after"
+        )
+        result = self.detector.detect_and_parse(text, self.tools)
+
+        self.assertEqual(result.normal_text, "beforemidafter")
+        self.assertEqual(len(result.calls), 2)
+
+    def test_unclosed_tool_call_tail_still_discarded(self):
+        """
+        Test that text after an UNCLOSED tool call stays hidden.
+
+        Scenario: plain text followed by a tool call that never closes.
+        Purpose: the streaming machine treats the remainder as inside the
+        call and emits nothing more; one-shot must not leak it either.
+        """
+        text = (
+            "before"
+            "<tool_call>\n<function=get_current_weather>\n"
+            "<parameter=location>Paris"
+        )
+        result = self.detector.detect_and_parse(text, self.tools)
+
+        self.assertEqual(result.normal_text, "before")
+
     # ==================== Streaming Tests ====================
 
     def test_streaming_single_tool_call(self):
