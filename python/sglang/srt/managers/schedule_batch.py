@@ -120,6 +120,7 @@ from sglang.srt.mem_cache.common import (
 )
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
+from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
@@ -936,9 +937,11 @@ class ReqKvInfo:
     kv_committed_len: int = 0  # KV content committed up to here, <= kv_allocated_len
     kv_allocated_len: int = 0
 
-    # SWA slots in [swa_dead_lo(page_size), swa_evicted_seqlen) are already freed.
+    # SWA slots in [swa_dead_lo(page_size), get_evicted_seqlen(SWA)) are freed.
     swa_evict_floor: int = 0  # [0, here) never window-evicted (prefill-aware SWA)
-    swa_evicted_seqlen: int = 0  # SWA eviction cursor
+    component_evicted_seqlens: dict[ComponentType, int] = dataclasses.field(
+        default_factory=dict
+    )
 
     # Host-side KV backup the request holds across a retraction (unified cache).
     retraction_backup: Optional[RetractionBackup] = None
@@ -973,11 +976,25 @@ class ReqKvInfo:
 
     @property
     def is_kv_released(self) -> bool:
-        return self.kv_allocated_len == 0 and self.swa_evicted_seqlen == 0
+        return self.kv_allocated_len == 0 and self.max_evicted_seqlen == 0
+
+    @property
+    def max_evicted_seqlen(self) -> int:
+        return max(self.component_evicted_seqlens.values(), default=0)
+
+    def get_evicted_seqlen(self, component_type: ComponentType) -> int:
+        return self.component_evicted_seqlens.get(component_type, 0)
+
+    def set_evicted_seqlen(self, component_type: ComponentType, length: int) -> None:
+        self.component_evicted_seqlens[component_type] = length
+
+    def clamp_evicted_seqlens(self, length: int) -> None:
+        for component, cursor in self.component_evicted_seqlens.items():
+            self.component_evicted_seqlens[component] = min(cursor, length)
 
     def mark_kv_released(self) -> None:
         self.kv_allocated_len = 0
-        self.swa_evicted_seqlen = 0
+        self.component_evicted_seqlens.clear()
 
 
 class Req(ReqDllmMixin):
@@ -3859,7 +3876,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             return lambda req: due_this_forward
         return lambda req: (
             req.seqlen - 1 - sliding_window_size
-            >= req.kv.swa_evicted_seqlen + eviction_interval
+            >= req.kv.get_evicted_seqlen(ComponentType.SWA) + eviction_interval
         )
 
     def maybe_evict_swa(self):
@@ -3895,7 +3912,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     if (
                         release_leaf_lock
                         and not req.swa_prefix_lock_released
-                        and req.lock_receipt.swa_uuid_for_lock is not None
+                        and req.lock_receipt.component_lock_uuids.get(ComponentType.SWA)
+                        is not None
                         and req.last_node is not None
                         and req.decode_batch_idx >= sliding_window_size
                     ):
