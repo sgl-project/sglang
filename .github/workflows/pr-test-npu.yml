@@ -106,29 +106,71 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       CANN_image_a3: ${{ steps.set-vars.outputs.CANN_image_a3 }}
-      CANN_image_910b: ${{ steps.set-vars.outputs.CANN_image_910b }}
     steps:
       # When triggered by PR, no inputs parameters are used. The latest community code is tested by default.
       - name: Set image config
         id: set-vars
         run: |
-          echo "CANN_image_a3=swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/cann:9.0.0-a3-ubuntu22.04-py3.11" >> $GITHUB_OUTPUT
-          echo "CANN_image_910b=swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/cann:9.0.0-910b-ubuntu22.04-py3.11" >> $GITHUB_OUTPUT
+          echo "CANN_image_a3=swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/cann:9.1.0-a3-ubuntu22.04-py3.12" >> $GITHUB_OUTPUT
 
-  base-a-test-1-npu-a2:
-    needs: [check-changes, pr-gate, set-image-config]
+  # Stage-A gate: CPU-only unit tests. The NPU attention-backend UTs stub out
+  # torch_npu / sgl_kernel_npu before importing, so a hosted runner suffices.
+  base-a-test-npu:
+    needs: [check-changes, pr-gate]
     if: ${{ !failure() && !cancelled() && inputs.coverage_mode != true && needs.check-changes.outputs.main_package == 'true' }}
-    uses: ./.github/workflows/_npu-pr-test-stage.yml
-    with:
-      self_name:  base-a-test-1-npu-a2
-      runner_config: linux-aarch64-a2-1
-      image: ${{ needs.set-image-config.outputs.CANN_image_910b }}
-      npu_device_type: 910b
-      run_timeout_minutes: '15'
-    secrets: inherit
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      SGLANG_IS_IN_CI: true
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          # Pin to the event SHA so this job tests the same commit as the rest of the run.
+          ref: ${{ inputs.ref || github.sha }}
+
+      # Same gate the NPU stages run first: fail before the NPU jobs are scheduled.
+      - uses: ./.github/actions/check-pr-test-health
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          cache-dependency-glob: 'python/pyproject_npu.toml'
+
+      - name: Install dependencies
+        timeout-minutes: 30
+        env:
+          # uv pip targets a venv by default; setup-python has no venv.
+          UV_SYSTEM_PYTHON: "1"
+        run: |
+          # Resolve the same dependency set as the NPU stages, minus Ascend-only wheels.
+          rm -f python/pyproject.toml
+          mv python/pyproject_npu.toml python/pyproject.toml
+          # Versions mirror npu_ci_install_dependency.sh's defaults; keep them in sync.
+          # triton: sglang.srt.utils.common imports it unconditionally and the CPU
+          # wheel does not pull it in (the NPU image uses triton-ascend instead).
+          # unsafe-best-match: --index-url is the lowest-priority index, so the
+          # default strategy would resolve PyPI's CUDA torch, not the +cpu build.
+          uv pip install torch==2.10.0 torchvision==0.25.0 torchaudio==2.10.0 triton \
+            --index-url https://download.pytorch.org/whl/cpu \
+            --extra-index-url https://pypi.org/simple/ \
+            --index-strategy unsafe-best-match
+          uv pip install -e "python[dev_npu]" --index-strategy unsafe-best-match
+
+      - name: Run NPU unit tests
+        timeout-minutes: 10
+        run: |
+          cd test
+          python3 run_suite.py --hw npu --suite base-a-test-npu
 
   base-b-test-1-npu-a3:
-    needs: [check-changes, pr-gate, set-image-config, base-a-test-1-npu-a2]
+    needs: [check-changes, pr-gate, set-image-config, base-a-test-npu]
     if: ${{ !failure() && !cancelled() && (inputs.coverage_mode == true || needs.check-changes.outputs.main_package == 'true') }}
     uses: ./.github/workflows/_npu-pr-test-stage.yml
     with:
@@ -142,7 +184,7 @@ jobs:
     secrets: inherit
 
   base-b-test-2-npu-a3:
-    needs: [check-changes, pr-gate, set-image-config, base-a-test-1-npu-a2]
+    needs: [check-changes, pr-gate, set-image-config, base-a-test-npu]
     if: ${{ !failure() && !cancelled() && (inputs.coverage_mode == true || needs.check-changes.outputs.main_package == 'true') }}
     uses: ./.github/workflows/_npu-pr-test-stage.yml
     with:
@@ -156,7 +198,7 @@ jobs:
     secrets: inherit
 
   base-b-test-4-npu-a3:
-    needs: [check-changes, pr-gate, set-image-config, base-a-test-1-npu-a2]
+    needs: [check-changes, pr-gate, set-image-config, base-a-test-npu]
     if: ${{ !failure() && !cancelled() && (inputs.coverage_mode == true || needs.check-changes.outputs.main_package == 'true') }}
     uses: ./.github/workflows/_npu-pr-test-stage.yml
     with:
@@ -171,7 +213,7 @@ jobs:
     secrets: inherit
 
   base-b-test-8-npu-a3:
-    needs: [check-changes, pr-gate, set-image-config, base-a-test-1-npu-a2]
+    needs: [check-changes, pr-gate, set-image-config, base-a-test-npu]
     if: ${{ !failure() && !cancelled() && (inputs.coverage_mode == true || needs.check-changes.outputs.main_package == 'true') }}
     uses: ./.github/workflows/_npu-pr-test-stage.yml
     with:
@@ -185,7 +227,7 @@ jobs:
     secrets: inherit
 
   base-b-test-16-npu-a3:
-    needs: [check-changes, pr-gate, set-image-config, base-a-test-1-npu-a2]
+    needs: [check-changes, pr-gate, set-image-config, base-a-test-npu]
     if: ${{ !failure() && !cancelled() && (inputs.coverage_mode == true || needs.check-changes.outputs.main_package == 'true') }}
     uses: ./.github/workflows/_npu-pr-test-stage.yml
     with:
@@ -199,7 +241,7 @@ jobs:
     secrets: inherit
 
   multimodal-gen-test-1-npu-a3:
-    needs: [check-changes, pr-gate, set-image-config, base-a-test-1-npu-a2]
+    needs: [check-changes, pr-gate, set-image-config, base-a-test-npu]
     if: ${{ !failure() && !cancelled() && inputs.coverage_mode != true && needs.check-changes.outputs.multimodal_gen == 'true' }}
     runs-on: linux-aarch64-a3-800t-2
     strategy:
@@ -263,7 +305,7 @@ jobs:
           retention-days: 7
 
   multimodal-gen-test-4-npu-a3:
-    needs: [check-changes, pr-gate, set-image-config, base-a-test-1-npu-a2]
+    needs: [check-changes, pr-gate, set-image-config, base-a-test-npu]
     if: ${{ !failure() && !cancelled() && inputs.coverage_mode != true && needs.check-changes.outputs.multimodal_gen == 'true' }}
     runs-on: linux-aarch64-a3-800t-4
     strategy:
@@ -483,7 +525,7 @@ jobs:
     name: Analyze failure report
     needs:
       [
-        base-a-test-1-npu-a2,
+        base-a-test-npu,
         base-b-test-1-npu-a3,
         base-b-test-2-npu-a3,
         base-b-test-4-npu-a3,
@@ -646,7 +688,7 @@ jobs:
       [
         check-changes,
 
-        base-a-test-1-npu-a2,
+        base-a-test-npu,
         base-b-test-1-npu-a3,
         base-b-test-2-npu-a3,
         base-b-test-4-npu-a3,
