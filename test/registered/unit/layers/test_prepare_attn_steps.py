@@ -192,6 +192,26 @@ class TestPrepareAttnSteps(CustomTestCase):
                     self.assertEqual(norm.calls, [])
                     self.assertIs(residual, local)
 
+    def test_an_unreduced_output_without_a_residual_is_rejected(self):
+        for step in (None, MagicMock()):
+            with (
+                self.subTest(redistributes=step is not None),
+                platform(fusion=True) as (_, all_reduce),
+            ):
+                norm = Norm()
+                with self.assertRaises(RuntimeError):
+                    communicator(norm).prepare_attn(
+                        comm.UnreducedOutput(
+                            torch.ones(2, 4), reduce_and_redistribute=step
+                        ),
+                        None,
+                        None,
+                    )
+                self.assertEqual(all_reduce.call_count, 0)
+                if step is not None:
+                    step.assert_not_called()
+                self.assertEqual(norm.calls, [])
+
 
 if __name__ == "__main__":
     unittest.main()
