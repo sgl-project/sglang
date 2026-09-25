@@ -19,6 +19,7 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=8, suite="base-a-test-cpu")
 
 import ast
+import itertools
 import types
 import unittest
 import unittest.mock as mock
@@ -28,6 +29,7 @@ from pathlib import Path
 import torch
 
 from sglang.srt.lora.eviction_policy import get_eviction_policy
+from sglang.test.test_utils import CustomTestCase
 
 REPO_ROOT = Path(__file__).resolve().parents[4]
 MOE_UTILS_PATH = REPO_ROOT / "python/sglang/srt/layers/moe/utils.py"
@@ -816,7 +818,7 @@ class TestStreamedInstall(unittest.TestCase):
 @mock.patch.dict(
     "sys.modules", {"sglang.srt.layers.moe.fused_moe_triton.layer": _FUSED_MOE_STUB}
 )
-class TestSharedMoeProductionLoad(unittest.TestCase):
+class TestSharedMoeProductionLoad(CustomTestCase):
     def test_unmarked_2d_shared_expert_uses_dense_buffers(self):
         pool = _make_pool(
             num_experts_global=8,
@@ -869,8 +871,12 @@ class TestSharedMoeProductionLoad(unittest.TestCase):
         self.assertTrue(torch.all(pool.B_buffer["down_proj_shared_moe"][0] == -7))
 
     def test_fused_shared_weights_use_last_expert_in_each_adapter(self):
-        for ep_size, ep_rank in [(1, 0), (2, 0), (2, 1)]:
-            with self.subTest(ep_size=ep_size, ep_rank=ep_rank):
+        """Packed routed factors must not overwrite or conflict with shared factors."""
+        for (ep_size, ep_rank), layout in itertools.product(
+            [(1, 0), (2, 0), (2, 1)],
+            ["per_expert", "packed_first", "shared_first"],
+        ):
+            with self.subTest(ep_size=ep_size, ep_rank=ep_rank, layout=layout):
                 pool = _make_pool(
                     num_experts_global=8,
                     moe_ep_size=ep_size,
@@ -909,6 +915,16 @@ class TestSharedMoeProductionLoad(unittest.TestCase):
                         weights[f"{prefix}.lora_B.weight"] = torch.full(
                             (5, 2), float(value)
                         )
+                    if layout != "per_expert":
+                        for factor in ("A", "B"):
+                            prefix = "model.layers.0.mlp.experts"
+                            key = f"down_proj.lora_{factor}.weight"
+                            weight = weights.pop(f"{prefix}.0.{key}")
+                            packed = weight.new_zeros((8, *weight.shape))
+                            packed[0] = weight
+                            weights[f"{prefix}.{key}"] = packed
+                        if layout == "packed_first":
+                            weights = dict(reversed(list(weights.items())))
                     adapter = types.SimpleNamespace(
                         config=types.SimpleNamespace(r=2),
                         scaling=2.5,
@@ -936,6 +952,9 @@ class TestSharedMoeProductionLoad(unittest.TestCase):
                     self.assertTrue(torch.all(b[-1] == (20 + slot) * 2.5))
                     expected = 10 + slot if ep_rank == 0 else 0
                     self.assertTrue(torch.all(a[0] == expected))
+                    self.assertTrue(torch.all(b[0] == expected * 2.5))
+                    self.assertTrue(torch.all(a[1:-1] == 0))
+                    self.assertTrue(torch.all(b[1:-1] == 0))
 
     def test_global_per_rank_shared_slots_are_rejected(self):
         pool = _make_pool(

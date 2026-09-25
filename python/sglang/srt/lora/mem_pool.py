@@ -1315,9 +1315,24 @@ class LoRAMemoryPool:
                         temp_B_buffer[target_module][expert_id] = weights
                         temp_B_cache_keys[target_module][expert_id] = cache_name
                 elif "experts" in name and weights.dim() == 3:
-                    # Shared outer MoE weight — 3D tensor [expert_dim, rank, hidden]
+                    # Packed routed or shared-outer MoE factors
                     target_module = target_module + "_moe"
-                    if "lora_A" in name:
+                    if fused_moe is not None:
+                        # Merge packed routed factors with separately named shared factors.
+                        buffer, cache_keys = (
+                            (temp_A_buffer, temp_A_cache_keys)
+                            if "lora_A" in name
+                            else (temp_B_buffer, temp_B_cache_keys)
+                        )
+                        if buffer[target_module] is None:
+                            buffer[target_module] = {}
+                            cache_keys[target_module] = {}
+                        for expert_id, weight in enumerate(weights):
+                            buffer[target_module][expert_id] = weight
+                            cache_keys[target_module][expert_id] = append_cache_key_suffix(
+                                cache_name, f"expert{expert_id}"
+                            )
+                    elif "lora_A" in name:
                         temp_A_buffer[target_module] = weights
                         temp_A_cache_keys[target_module] = cache_name
                     else:
