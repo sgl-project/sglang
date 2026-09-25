@@ -22,10 +22,10 @@ import torch.nn.functional as F
 from torch import nn
 from transformers import PretrainedConfig
 
-from sglang.kernels.ops.elementwise.elementwise import (
+from sglang.kernels.ops.elementwise.elementwise import gelu_and_mul_triton
+from sglang.kernels.ops.layernorm import (
     fused_dual_residual_rmsnorm,
     fused_rmsnorm,
-    gelu_and_mul_triton,
 )
 from sglang.kernels.ops.moe.router import fused_moe_router_shim
 from sglang.srt.distributed import (

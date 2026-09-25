@@ -76,6 +76,12 @@ at::Tensor fused_rmsnorm_gated_cpu(at::Tensor& input, at::Tensor& weight, at::Te
 void fused_add_rmsnorm_cpu(at::Tensor& input, at::Tensor& residual, at::Tensor& weight, double eps);
 void gemma_fused_add_rmsnorm_cpu(at::Tensor& input, at::Tensor& residual, at::Tensor& weight, double eps);
 
+// fused_rmsnorm / fused_dual_residual_rmsnorm
+at::Tensor fused_rmsnorm_cpu(at::Tensor& input, at::Tensor& weight, double eps);
+at::Tensor fused_rmsnorm_cpu_inplace(at::Tensor& input, at::Tensor& weight, double eps);
+std::tuple<at::Tensor, at::Tensor> fused_dual_residual_rmsnorm_cpu(
+    const at::Tensor& x, const at::Tensor& residual, const at::Tensor& weight1, const at::Tensor& weight2, double eps);
+
 // fused_add_layernorm
 at::Tensor fused_add_layernorm_cpu(
     const at::Tensor& input,
@@ -656,6 +662,16 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.impl("fused_add_rmsnorm_cpu", torch::kCPU, &fused_add_rmsnorm_cpu);
   m.def("gemma_fused_add_rmsnorm_cpu(Tensor(a!) input, Tensor(a!) residual, Tensor weight, float eps) -> ()");
   m.impl("gemma_fused_add_rmsnorm_cpu", torch::kCPU, &gemma_fused_add_rmsnorm_cpu);
+  m.def("fused_rmsnorm_cpu(Tensor input, Tensor weight, float eps) -> Tensor");
+  m.impl("fused_rmsnorm_cpu", torch::kCPU, &fused_rmsnorm_cpu);
+  m.def("fused_rmsnorm_cpu_inplace(Tensor(a!) input, Tensor weight, float eps) -> Tensor(a!)");
+  m.impl("fused_rmsnorm_cpu_inplace", torch::kCPU, &fused_rmsnorm_cpu_inplace);
+  // `residual` is read-only: `mid` comes back as a separate tensor and the caller
+  // rebinds, so no argument carries an alias annotation here.
+  m.def(
+      "fused_dual_residual_rmsnorm_cpu(Tensor x, Tensor residual, Tensor w1, Tensor w2, float eps) -> "
+      "(Tensor, Tensor)");
+  m.impl("fused_dual_residual_rmsnorm_cpu", torch::kCPU, &fused_dual_residual_rmsnorm_cpu);
   m.def(
       "fused_add_layernorm_cpu(Tensor input, Tensor residual, Tensor weight, Tensor? bias, float eps) -> "
       "Tensor");

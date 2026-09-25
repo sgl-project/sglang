@@ -489,6 +489,56 @@ float sum_squares(const scalar_t* __restrict__ input, int64_t size) {
 }
 
 template <typename scalar_t>
+void fused_dual_residual_stage1_kernel_impl(
+    scalar_t* __restrict__ mid,
+    const scalar_t* __restrict__ x,
+    const scalar_t* __restrict__ residual,
+    const scalar_t* __restrict__ w1,
+    const NormParams& x_params,
+    const NormParams& r_params,
+    float eps) {
+  using bVec = at::vec::Vectorized<scalar_t>;
+  using fVec = at::vec::Vectorized<float>;
+  constexpr int kVecSize = bVec::size();
+  const int64_t D = x_params.D;
+
+  at::parallel_for(0, x_params.rows(), 0, [&](int64_t begin, int64_t end) {
+    int64_t b{0}, h{0}, t{0};
+    data_index_init(begin, b, x_params.B, h, x_params.H, t, x_params.T);
+    for (int64_t i = begin; i < end; ++i) {
+      const scalar_t* __restrict__ x_row = x + x_params.input_offset(b, h, t);
+      const scalar_t* __restrict__ r_row = residual + r_params.input_offset(b, h, t);
+      scalar_t* __restrict__ mid_row = mid + x_params.output_offset(b, h, t);
+
+      const float rscale1 = 1.f / std::sqrt(sum_squares(x_row, D) / static_cast<float>(D) + eps);
+      const fVec rscale1_fvec = fVec(rscale1);
+
+      int64_t d = 0;
+#pragma GCC unroll 4
+      for (; d <= D - kVecSize; d += kVecSize) {
+        auto [x_fvec0, x_fvec1] = load_float_vec2(x_row + d);
+        auto [w_fvec0, w_fvec1] = load_float_vec2(w1 + d);
+        auto [r_fvec0, r_fvec1] = load_float_vec2(r_row + d);
+        // round t first, then add and round once on store
+        bVec t_bvec =
+            convert_from_float_ext<scalar_t>(x_fvec0 * rscale1_fvec * w_fvec0, x_fvec1 * rscale1_fvec * w_fvec1);
+        auto [t_fvec0, t_fvec1] = at::vec::convert_to_float(t_bvec);
+        convert_from_float_ext<scalar_t>(r_fvec0 + t_fvec0, r_fvec1 + t_fvec1).store(mid_row + d);
+      }
+#pragma GCC unroll 4
+      for (; d < D; ++d) {
+        // same two roundings, in the same order, as the vector path
+        const scalar_t t_val =
+            static_cast<scalar_t>(static_cast<float>(x_row[d]) * rscale1 * static_cast<float>(w1[d]));
+        mid_row[d] = static_cast<scalar_t>(static_cast<float>(r_row[d]) + static_cast<float>(t_val));
+      }
+
+      data_index_step(b, x_params.B, h, x_params.H, t, x_params.T);
+    }
+  });
+}
+
+template <typename scalar_t>
 void fused_qk_norm_sumsq_kernel_impl(
     float* __restrict__ sum_sq,
     const scalar_t* __restrict__ q,
@@ -821,6 +871,73 @@ void gemma_fused_add_rmsnorm_cpu(at::Tensor& input, at::Tensor& residual, at::Te
         p,
         /*output_uses_input_stride=*/true);
   });
+}
+
+// input : {batch_size, hidden_size}
+// weight: {hidden_size}
+at::Tensor fused_rmsnorm_cpu(at::Tensor& input, at::Tensor& weight, double eps) {
+  // Out-of-place fused RMSNorm. The numerics are exactly `rmsnorm_cpu`'s, so this
+  // delegates to it rather than duplicating the kernel; the only thing added is the
+  // 2-D guard, which mirrors the reference implementation's assertion.
+  TORCH_CHECK(input.dim() == 2, "fused_rmsnorm_cpu expects a 2D tensor, got ", input.dim(), "D.");
+  return rmsnorm_cpu(input, weight, eps);
+}
+
+// input : {batch_size, hidden_size}, written and returned in place
+// weight: {hidden_size}
+at::Tensor fused_rmsnorm_cpu_inplace(at::Tensor& input, at::Tensor& weight, double eps) {
+  const auto st = input.scalar_type();
+  // In-place requires a contiguous input: the kernel writes contiguous output offsets
+  // while reading rows at the input stride, which is only the same location when the
+  // rows are not padded. Use fused_rmsnorm_cpu for a non-contiguous input.
+  CHECK_INPUT(input);
+  CHECK_INPUT_ND<2>(input);
+  CHECK_INPUT_SHAPE_DTYPE<false>(weight, {input.size(-1)}, st);
+
+  NormParams p{input, static_cast<float>(eps)};
+  p.weight = weight.data_ptr();
+
+  AT_DISPATCH_REDUCED_FLOATING_TYPES(st, "fused_rmsnorm_inplace_kernel", [&] {
+    norm4d_kernel_impl<NormMode::RMSNorm, scalar_t>(input.data_ptr<scalar_t>(), input.data_ptr<scalar_t>(), p);
+  });
+  return input;
+}
+
+// x       : {batch_size, hidden_size}
+// residual: {batch_size, hidden_size}, read-only - `mid` is returned separately
+// weight1 : {hidden_size}
+// weight2 : {hidden_size}
+std::tuple<at::Tensor, at::Tensor> fused_dual_residual_rmsnorm_cpu(
+    const at::Tensor& x, const at::Tensor& residual, const at::Tensor& weight1, const at::Tensor& weight2, double eps) {
+  const auto st = x.scalar_type();
+  CHECK_INPUT_ND<2>(x);
+  CHECK_INPUT_ND<2>(residual);
+  CHECK_EQ(x.sizes(), residual.sizes());
+  CHECK_EQ(st, residual.scalar_type());
+  CHECK_INPUT_SHAPE_DTYPE<false>(weight1, {x.size(-1)}, st);
+  CHECK_INPUT_SHAPE_DTYPE<false>(weight2, {x.size(-1)}, st);
+
+  at::Tensor mid = at::empty_like(x);
+  at::Tensor output = at::empty_like(x);
+
+  NormParams x_params{x, static_cast<float>(eps)};
+  NormParams r_params{residual, static_cast<float>(eps)};
+  NormParams mid_params{mid, static_cast<float>(eps)};
+  mid_params.weight = weight2.data_ptr();
+
+  AT_DISPATCH_REDUCED_FLOATING_TYPES(st, "fused_dual_residual_rmsnorm_kernel", [&] {
+    fused_dual_residual_stage1_kernel_impl<scalar_t>(
+        mid.data_ptr<scalar_t>(),
+        x.data_ptr<scalar_t>(),
+        residual.data_ptr<scalar_t>(),
+        weight1.data_ptr<scalar_t>(),
+        x_params,
+        r_params,
+        static_cast<float>(eps));
+    // Stage 2 is the existing RMSNorm kernel over the stored (already rounded) `mid`.
+    norm4d_kernel_impl<NormMode::RMSNorm, scalar_t>(output.data_ptr<scalar_t>(), mid.data_ptr<scalar_t>(), mid_params);
+  });
+  return std::make_tuple(output, mid);
 }
 
 // input   : {batch_size, hidden_size} or {batch_size, seq_len, hidden_size}
