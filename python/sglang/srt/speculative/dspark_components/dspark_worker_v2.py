@@ -481,6 +481,13 @@ class DSparkWorkerV2(BaseSpecWorker):
                     "memory is available after target backend initialization.",
                     available_mem,
                 )
+        if envs.SGLANG_DSPARK_MARKOV_CANDIDATE_K.get() and (
+            not capture_decode_cuda_graph
+            or not envs.SGLANG_DSPARK_FOLDED_PROPOSAL.get()
+        ):
+            raise ValueError(
+                "DSpark candidates require draft CUDA graphs and folded proposals"
+            )
         with draft_pp_context(), self._draft_context():
             if capture_decode_cuda_graph:
                 # Keep the draft model graph enabled when folded proposal is

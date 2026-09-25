@@ -545,6 +545,9 @@ class Envs:
     SGLANG_DSPARK_OPT_MARKOV_W2_BF16 = EnvBool(True)
     SGLANG_DSPARK_OPT_MARKOV_W2_TP_SHARD = EnvBool(True)
     SGLANG_DSPARK_OPT_FUSED_GREEDY_MARKOV = EnvBool(False)
+    # Opt-in approximate greedy proposals; zero keeps the full-vocabulary path.
+    SGLANG_DSPARK_MARKOV_CANDIDATE_K = EnvInt(0)
+    SGLANG_DSPARK_MARKOV_CANDIDATE_M = EnvInt(128)
     # With the TP-sharded markov_w2, gather each step's vocab-parallel logits over
     # the NVLink push collective (CustomAllReduceV2's multicast plane) instead of
     # the NCCL ring. Only taken when the group's communicator has a multicast

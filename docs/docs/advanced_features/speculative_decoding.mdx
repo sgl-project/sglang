@@ -17,6 +17,7 @@ SGLang provides several speculative decoding options, including EAGLE-2/EAGLE-3,
 - [Multi Token Prediction](#multi-token-prediction)
 - [UNO decoding](#uno-decoding)
 - [DFlash Decoding](#dflash-decoding)
+- [DSpark Markov candidate pruning](#dspark-markov-candidate-pruning)
 - [Standalone Speculative Decoding (Small Draft Model)](#standalone-speculative-decoding-small-draft-model)
 - [Speculative Decoding V2 (Overlap Scheduler)](#speculative-decoding-v2-overlap-scheduler)
 - [Ngram Speculative Decoding](#ngram-speculative-decoding)
@@ -593,6 +594,35 @@ response = client.chat.completions.create(
 
 print(response.choices[0].message.content)
 ```
+
+---
+
+## DSpark Markov candidate pruning
+
+You can optionally restrict DSpark's greedy Markov proposal step to the union of the top `K` base-logit tokens and the top `M` Markov-bias tokens for the previous token. This approximates the full-vocabulary Markov argmax and can change draft tokens and acceptance rates. Target verification is unchanged; non-greedy requests keep the existing sampling path.
+
+Use this option on NVIDIA CUDA with an unquantized vanilla Markov draft head, BF16 weights, tensor parallel size 1, and CUDA graph folded proposals. Gated, recurrent, quantized, and vocabulary-sharded heads are outside this path. Set the following environment variables before starting your DSpark server:
+
+```bash
+SGLANG_DSPARK_MARKOV_CANDIDATE_K=128 \
+SGLANG_DSPARK_MARKOV_CANDIDATE_M=128 \
+SGLANG_DSPARK_FOLDED_PROPOSAL=true \
+SGLANG_DSPARK_FOLDED_SAMPLING=0 \
+SGLANG_DSPARK_OPT_FUSED_GREEDY_MARKOV=true \
+python -m sglang.launch_server \
+    --model-path MODEL_PATH \
+    --speculative-algorithm DSPARK \
+    --speculative-draft-model-path DRAFT_MODEL_PATH \
+    --dtype bfloat16 \
+    --tp 1 \
+    --cuda-graph-backend-decode full
+```
+
+Replace `MODEL_PATH` and `DRAFT_MODEL_PATH` with compatible target and DSpark draft checkpoint paths or Hugging Face repository IDs. `K` defaults to `0`, which disables pruning; `M` defaults to `128`. When enabled, each must be in `1..min(128, vocabulary_size)`. Restart the worker to change `K` or `M`.
+
+At sampler initialization, SGLang computes the bias candidates from the loaded Markov weights in chunks of 256 vocabulary rows, before CUDA graph capture. The table stored on the GPU contains `vocabulary_size × M` int32 token IDs: about 74 MiB for a vocabulary of 151,936 and `M=128`. Precomputation also adds startup time and temporary score storage; benchmark your workload before enabling this option.
+
+The model's normal `load_weights` path rebuilds an existing table in place. Direct tensor writes, custom loaders, and IPC weight updates do not guarantee a table refresh; restart the worker after updates that bypass this path.
 
 ---
 

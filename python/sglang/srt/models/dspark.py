@@ -10,6 +10,9 @@ from torch import nn
 from sglang.kernels.ops.speculative.dspark.dspark_draft_model import (
     MarkovGreedyStep,
 )
+from sglang.kernels.ops.speculative.dspark.markov_candidates import (
+    markov_candidate_step,
+)
 from sglang.srt.distributed.communication_op import tensor_model_parallel_all_gather
 from sglang.srt.environ import envs
 from sglang.srt.layers.linear import ReplicatedLinear
@@ -96,6 +99,52 @@ class VanillaMarkov(nn.Module):
             )
         self.markov_w1 = nn.Embedding(self.vocab_size, self.markov_rank)
         self.markov_w2 = nn.Linear(self.markov_rank, self.vocab_size, bias=False)
+        self.candidate_k = 0
+        self.register_buffer("bias_top_ids", None, persistent=False)
+
+    @torch.no_grad()
+    def prepare_candidates(self, k: int, m: int) -> None:
+        """Build bias-only candidates from loaded weights before graph capture.
+
+        Chunking bounds the temporary scores to 256 * vocab_size elements.
+        Rebuilding an existing table preserves the address used by CUDA graphs.
+        """
+        if type(self) is not VanillaMarkov:
+            raise ValueError("DSpark candidates require an unquantized vanilla head")
+        if not (1 <= k <= min(128, self.vocab_size)) or not (
+            1 <= m <= min(128, self.vocab_size)
+        ):
+            raise ValueError("DSpark candidate K/M must be in 1..min(128, vocab_size)")
+        w1, w2 = self.markov_w1.weight, self.markov_w2.weight
+        if not w1.is_cuda or w1.dtype != torch.bfloat16 or w2.dtype != w1.dtype:
+            raise ValueError("DSpark candidates require CUDA BF16 Markov weights")
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError("Prepare DSpark candidates before CUDA graph capture")
+        if self.bias_top_ids is not None and (
+            self.candidate_k != k or self.bias_top_ids.shape[1] != m
+        ):
+            raise ValueError("Restart the worker to change DSpark candidate K/M")
+        table = torch.empty((self.vocab_size, m), dtype=torch.int32, device=w1.device)
+        old_reduction = (
+            torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction
+        )
+        torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = False
+        try:
+            for start in range(0, self.vocab_size, 256):
+                scores = torch.mm(
+                    w1[start : start + 256], w2.T, out_dtype=torch.float32
+                )
+                table[start : start + 256].copy_(torch.topk(scores, m, dim=-1).indices)
+                del scores
+        finally:
+            torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = (
+                old_reduction
+            )
+        if self.bias_top_ids is None:
+            self.bias_top_ids = table
+        else:
+            self.bias_top_ids.copy_(table)
+        self.candidate_k = k
 
     def get_prev_embeddings(self, token_ids: torch.Tensor) -> torch.Tensor:
         return self.markov_w1(token_ids.long())
@@ -171,15 +220,31 @@ class VanillaMarkov(nn.Module):
             return torch.empty(
                 batch_size, 0, dtype=torch.long, device=base_logits.device
             )
+        base_ids = None
+        if getattr(self, "candidate_k", 0):
+            # Include this full-vocabulary pass in candidate-path timing.
+            base_ids = torch.topk(
+                base_logits, self.candidate_k, dim=-1, sorted=False
+            ).indices
         sampled_tokens = []
         prev_tokens = first_prev_tokens.long()
         for step_idx in range(proposal_len):
             prev_embeds = self.get_prev_embeddings(prev_tokens)
-            prev_tokens = MarkovGreedyStep.execute(
-                base_logits=base_logits[:, step_idx, :],
-                prev_embeds=prev_embeds,
-                w2_weight=self.markov_w2.weight,
-            )
+            if base_ids is None:
+                prev_tokens = MarkovGreedyStep.execute(
+                    base_logits=base_logits[:, step_idx, :],
+                    prev_embeds=prev_embeds,
+                    w2_weight=self.markov_w2.weight,
+                )
+            else:
+                prev_tokens = markov_candidate_step(
+                    base_logits=base_logits[:, step_idx, :],
+                    base_ids=base_ids[:, step_idx, :],
+                    prev_tokens=prev_tokens,
+                    prev_embeds=prev_embeds,
+                    w2_weight=self.markov_w2.weight,
+                    bias_top_ids=self.bias_top_ids,
+                )
             sampled_tokens.append(prev_tokens)
         return torch.stack(sampled_tokens, dim=1)
 
@@ -586,6 +651,10 @@ class DSparkDraftMixin:
         self._load_confidence_weights(
             confidence_weights=confidence_weights, params_dict=params_dict
         )
+        if type(self.markov_head) is VanillaMarkov and self.markov_head.candidate_k:
+            self.markov_head.prepare_candidates(
+                self.markov_head.candidate_k, self.markov_head.bias_top_ids.shape[1]
+            )
 
     def _load_confidence_weights(
         self,
