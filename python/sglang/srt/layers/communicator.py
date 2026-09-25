@@ -713,6 +713,8 @@ class LayerCommunicator:
         force_layernorm_before_dp_gather: bool = False,
         enable_fused_ar_quant: bool = False,
         fused_ar_quant_keep_bf16: bool = False,
+        # False for a layer whose FFN always completes its own reduction.
+        allow_deferred_ffn_reduction: bool = True,
         _is_sp_variant: bool = False,
     ):
         self.layer_scatter_modes = layer_scatter_modes
@@ -724,6 +726,7 @@ class LayerCommunicator:
         self.force_layernorm_before_dp_gather = force_layernorm_before_dp_gather
         self.enable_fused_ar_quant = enable_fused_ar_quant
         self.fused_ar_quant_keep_bf16 = fused_ar_quant_keep_bf16
+        self.allow_deferred_ffn_reduction = allow_deferred_ffn_reduction
 
         self._context = CommunicateContext.init_new()
         self._context.force_layernorm_before_dp_gather = (
@@ -764,6 +767,7 @@ class LayerCommunicator:
                 force_layernorm_before_dp_gather=force_layernorm_before_dp_gather,
                 enable_fused_ar_quant=enable_fused_ar_quant,
                 fused_ar_quant_keep_bf16=fused_ar_quant_keep_bf16,
+                allow_deferred_ffn_reduction=allow_deferred_ffn_reduction,
                 _is_sp_variant=True,
             )
 
@@ -1144,6 +1148,18 @@ class LayerCommunicator:
         mlp_reduce_scatter = self._ffn_leaves_sum_to_reduce_scatter(
             forward_batch, dp_step
         )
+        complete_now = partial(
+            self._complete_ffn_output_now,
+            forward_batch=forward_batch,
+            dp_step=dp_step,
+        )
+        if not self.allow_deferred_ffn_reduction:
+            return FfnCompletion(
+                defer_moe_finalize=False,
+                fuse_mlp_allreduce=False,
+                mlp_reduce_scatter=mlp_reduce_scatter,
+                complete=complete_now,
+            )
         defer_moe_finalize = self.should_defer_moe_finalize(forward_batch)
         # Deferring implies fusing: a handoff skips the post-experts all-reduce.
         fuse_mlp_allreduce = defer_moe_finalize or self._ffn_sum_moves_to_next_layer(
@@ -1178,11 +1194,7 @@ class LayerCommunicator:
                 ),
             )
         else:
-            complete = partial(
-                self._complete_ffn_output_now,
-                forward_batch=forward_batch,
-                dp_step=dp_step,
-            )
+            complete = complete_now
         return FfnCompletion(
             defer_moe_finalize=defer_moe_finalize,
             fuse_mlp_allreduce=fuse_mlp_allreduce,

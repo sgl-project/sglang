@@ -33,10 +33,12 @@ def make_communicator(
     scatters_to_local_tokens=False,
     group=None,
     cls=LayerCommunicator,
+    allow_deferred=True,
 ):
     """A communicator whose decisions and postprocess are stubbed, built
     without the process-wide parallel state."""
     communicator = cls.__new__(cls)
+    communicator.allow_deferred_ffn_reduction = allow_deferred
     if cls is LayerCommunicator:
         communicator._ffn_sum_moves_to_next_layer = MagicMock(return_value=fuse)
     else:
@@ -136,6 +138,17 @@ class TestFfnExit(CustomTestCase):
                 communicator.postprocess_layer.assert_called_once()
                 torch.testing.assert_close(hidden_states, self.hidden_states * 2 + 1)
                 self.assertIs(residual, self.residual)
+
+    def test_a_layer_that_declares_no_deferral_runs_postprocess(self):
+        communicator = make_communicator(
+            fuse=True, reduce_scatter=True, allow_deferred=False
+        )
+        seen, (hidden_states, residual) = self.run_exit(communicator)
+
+        self.assertEqual(seen, (False, True))
+        communicator._ffn_sum_moves_to_next_layer.assert_not_called()
+        communicator.postprocess_layer.assert_called_once()
+        torch.testing.assert_close(hidden_states, self.hidden_states * 2 + 1)
 
     def test_finish_applies_the_decision_the_ffn_saw(self):
         """finish() applies the decision published to the FFN, even when the
@@ -267,6 +280,7 @@ class TestSelectFfnCompletion(CustomTestCase):
         self, *, fuse=False, is_last_layer=False, scatters=True, sp_variant=None
     ):
         communicator = LayerCommunicator.__new__(LayerCommunicator)
+        communicator.allow_deferred_ffn_reduction = True
         communicator.is_last_layer = is_last_layer
         communicator._sp_variant = sp_variant
         communicator._postprocess_scatters_to_local_tokens = scatters

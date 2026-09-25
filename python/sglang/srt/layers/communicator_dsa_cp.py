@@ -14,7 +14,7 @@
 
 
 from functools import partial
-from typing import Callable, Optional
+from typing import Optional
 
 import torch
 
@@ -26,7 +26,6 @@ from sglang.srt.layers.communicator import (
     CommunicateSimpleFn,
     CommunicateSummableTensorPairFn,
     LayerCommunicator,
-    LayerScatterModes,
     ScatterMode,
     _mlp_input_norm,
 )
@@ -85,23 +84,6 @@ def dsa_cp_reduce_scatter_hidden_states(hidden_states: torch.Tensor):
 
 
 class DSACPLayerCommunicator(LayerCommunicator):
-    def __init__(
-        self,
-        layer_scatter_modes: LayerScatterModes,
-        input_layernorm: torch.nn.Module,
-        post_attention_layernorm: torch.nn.Module,
-        # Reduce scatter requires skipping all-reduce in model code after MoE/MLP, so only enable for models which have that implemented. Remove flag once done for all models that use LayerCommunicator.
-        allow_reduce_scatter: bool = False,
-        qkv_latent_func: Optional[Callable] = None,
-    ):
-        super().__init__(
-            layer_scatter_modes,
-            input_layernorm,
-            post_attention_layernorm,
-            allow_reduce_scatter,
-            qkv_latent_func,
-        )
-
     def _post_init_communicate(self):
         # SCATTERED in attn tp is different from SCATTERED in global tp when dp_size > 1
         if self.layer_scatter_modes.mlp_mode != ScatterMode.SCATTERED:
