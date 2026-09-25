@@ -18,8 +18,11 @@ from sglang.kernels.ops.attention.dsv4.candidate_blocks import (
     get_tail_row_indices,
 )
 from sglang.kernels.ops.attention.dsv4.candidate_table import (
+    CANDIDATE_BLOCK_SIZE,
     amax8_varlen,
+    build_sparse_indexer_schedule,
     sort_candidate_blocks,
+    sparse_logits,
 )
 from sglang.kernels.ops.attention.dsv4.topk import (
     topk_transform_bf16_small,
@@ -50,8 +53,6 @@ from .types import (
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
-
-CANDIDATE_BLOCK_SIZE = 8  # positions per block; DeepGEMM accepts 8 or 16
 
 
 class _SparseTable(CandidateMetadata, msgspec.Struct):
@@ -222,7 +223,7 @@ class SparseTableBackend:
                 metadata.page_table,
                 metadata.compressed_page_size,
             )
-            schedule = build_sparse_schedule(
+            schedule = build_sparse_indexer_schedule(
                 blocks,
                 seq_lens,
                 metadata.page_table,
@@ -292,7 +293,7 @@ class SparseTableBackend:
             valid_len_chunks.append(row_valid_lens)
 
         blocks = torch.cat(block_chunks)
-        schedule = build_sparse_schedule(
+        schedule = build_sparse_indexer_schedule(
             blocks,
             seq_lens,
             metadata.page_table,
@@ -319,12 +320,13 @@ class SparseTableBackend:
         assert published is not None
         data = get_deep_gemm_decode_data(inputs, self.token_to_kv_pool)
         torch.cuda.current_stream().wait_event(published.ready)
-        logits = deep_gemm_sparse_logits(
+        logits = sparse_logits(
             data.q_fp4,
             data.q_sf,
             data.k_cache,
             data.weights.to(torch.bfloat16),
-            published,
+            published.schedule,
+            published.blocks.shape[1],
         )
         assert out.raw_indices is None
         topk_transform_bf16_small(
@@ -355,55 +357,6 @@ class SparseTableBackend:
         return buf[:rows]
 
 
-def build_sparse_schedule(
-    blocks: torch.Tensor,
-    seq_lens: torch.Tensor,
-    page_table: torch.Tensor,
-    page_size: int,
-    q_dtype: torch.dtype,
-    request_ids: torch.Tensor,
-) -> torch.Tensor:
-    """DeepGEMM's schedule for the published blocks: ``seq_lens`` ``[rows]``
-    int32, ``page_table`` ``[rows, pages]`` int32 at the index pool's page size.
-    ``request_ids`` ``[rows]`` int32 groups the rows of one request onto one KV
-    pass; each row keeps its own block list and output layout, and rows grouped
-    together must share their page-table row."""
-    import deep_gemm
-
-    return deep_gemm.get_paged_sparse_mqa_logits_metadata(
-        seq_lens.contiguous(),
-        page_table,
-        request_ids,
-        page_size,
-        blocks,
-        q_dtype,
-        CANDIDATE_BLOCK_SIZE,
-    )
-
-
-def deep_gemm_sparse_logits(
-    q_fp4: torch.Tensor,
-    q_sf: torch.Tensor,
-    k_cache: torch.Tensor,
-    weights: torch.Tensor,
-    table: _SparseTable,
-) -> torch.Tensor:
-    """bf16 logits ``[rows, topk_blocks * 8]`` of the published blocks: ``q_fp4``
-    ``[rows, 1, heads, 64]`` int8 with ``q_sf`` ``[rows, 1, heads]`` int32 (packed
-    ue8m0), ``k_cache`` ``[pages, page_size, 1, 68]`` uint8 whose page stride is
-    a multiple of 512 bytes, ``weights`` ``[rows, heads]`` bf16."""
-    import deep_gemm
-
-    return deep_gemm.fp8_fp4_paged_sparse_mqa_logits(
-        (q_fp4, q_sf),
-        k_cache,
-        weights,
-        table.schedule,
-        table.blocks.shape[1],
-        CANDIDATE_BLOCK_SIZE,
-    )
-
-
 def _build_prefill_table(
     *,
     blocks: torch.Tensor,
@@ -418,7 +371,7 @@ def _build_prefill_table(
 ) -> _SparsePrefillTable:
     # in place: ascending, INT32_MAX padded, plus the blocks as pool slots / 8
     phys_blocks = sort_candidate_blocks(blocks, compress_lens, page_table, page_size)
-    schedule = build_sparse_schedule(
+    schedule = build_sparse_indexer_schedule(
         blocks, compress_lens, page_table, page_size, q_dtype, request_ids
     )
     ready = torch.cuda.Event()
@@ -508,12 +461,13 @@ def select_prefill_table(
     ``publish_prefill_table`` writes; ``k_cache`` is the layer's index-K pool,
     ``[pages, page_size, 1, 68]`` uint8."""
     rows, heads = data.q_sf.shape
-    logits = deep_gemm_sparse_logits(
+    logits = sparse_logits(
         data.q_fp4.view(rows, 1, heads, 64),
         data.q_sf.view(rows, 1, heads),
         k_cache,
         data.weights.to(torch.bfloat16),
-        table,
+        table.schedule,
+        table.blocks.shape[1],
     )
     # request-relative compressed positions, -1 padded
     topk_transform_bf16_small(

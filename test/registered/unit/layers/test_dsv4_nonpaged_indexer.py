@@ -982,9 +982,7 @@ class TestChunkedPagedDecode(CustomTestCase):
             self.assertIs(call.kwargs["topk_metadata"], plan)
 
     def test_candidate_publisher_takes_one_schedule_per_call(self):
-        from sglang.srt.layers.attention.dsv4.v41_indexer import (
-            sparse_table as mod,
-        )
+        from sglang.srt.layers.attention.dsv4.v41_indexer import sparse_table as mod
 
         inputs, data = self._inputs()
         backend = object.__new__(mod.SparseTableBackend)
@@ -1019,7 +1017,7 @@ class TestChunkedPagedDecode(CustomTestCase):
             ),
             patch.object(
                 mod,
-                "build_sparse_schedule",
+                "build_sparse_indexer_schedule",
                 return_value=torch.tensor([7], dtype=torch.uint8),
             ),
             patch.object(mod.torch.cuda, "Event", return_value=event),
@@ -1034,9 +1032,7 @@ class TestChunkedPagedDecode(CustomTestCase):
         event.record.assert_called_once_with(stream)
 
     def test_dense_decode_takes_one_schedule_per_call(self):
-        from sglang.srt.layers.attention.dsv4.v41_indexer import (
-            plain as mod,
-        )
+        from sglang.srt.layers.attention.dsv4.v41_indexer import plain as mod
 
         inputs, data = self._inputs()
         indexer = object.__new__(mod.PlainIndexer)

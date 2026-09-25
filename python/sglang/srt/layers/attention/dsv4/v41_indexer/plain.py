@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from sglang.kernels.ops.attention.dsv4.topk import topk_transform_paged_torch
 from sglang.srt.layers.attention.dsv4.indexer import (
     deep_gemm_fp4_paged_mqa_logits,
     topk_transform_paged_from_metadata,
@@ -172,7 +173,6 @@ def _deep_gemm_prefill_captured(
     lens = metadata.compressed_seq_lens
     page_table = metadata.page_table
     topk = min(indexer.index_topk, width)
-    columns = torch.arange(width, device=lens.device)
     for rows, plan in metadata.row_chunks():
         logits = deep_gemm_fp4_paged_mqa_logits(
             (q_fp4[rows], q_sf[rows]),
@@ -183,14 +183,11 @@ def _deep_gemm_prefill_captured(
             plan,
             width,
         )
-        lens_c = lens[rows].unsqueeze(-1)
-        # Columns past a row's length hold garbage.
-        s = logits.masked_fill(columns[None, :] >= lens_c, -torch.inf)
-        idx = s.topk(topk, dim=-1, sorted=False).indices.sort(dim=-1).values
-        reach = idx < lens_c
-        slots = page_table[rows].gather(-1, idx // page_size) * page_size + (
-            idx % page_size
+        topk_transform_paged_torch(
+            logits,
+            lens[rows],
+            page_table[rows],
+            out.page_indices[rows, :topk],
+            page_size,
+            out.raw_indices[rows, :topk] if out.raw_indices is not None else None,
         )
-        out.page_indices[rows, :topk] = torch.where(reach, slots, -1).to(torch.int32)
-        if out.raw_indices is not None:
-            out.raw_indices[rows, :topk] = torch.where(reach, idx, -1).to(torch.int32)

@@ -16,12 +16,10 @@ from typing import TYPE_CHECKING, Generator, Iterator, List, Optional, Tuple
 import msgspec
 import torch
 
-from sglang.kernels.ops.attention.dsv4.fp4_indexer import fp4_index_logits_decode
-from sglang.srt.layers.attention.mqa_logits_utils import (
-    mqa_logits_row_bytes,
-    mqa_logits_rows_per_chunk,
+from sglang.kernels.ops.attention.dsv4.dense_prefill import (
+    score_tiles as score_tiles_op,
 )
-from sglang.srt.utils.common import ceil_align
+from sglang.kernels.ops.attention.dsv4.fp4_indexer import fp4_index_logits_decode
 
 from .types import (
     DecodeInputs,
@@ -32,10 +30,6 @@ from .types import (
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.dsv4.dsv41_sparse import DeepseekV41Indexer
     from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
-
-# TODO: use a per-forward mqa_logits_budget_bytes() budget that also
-# leaves room for candidate block ids and block-selection scratch.
-_DEEP_GEMM_SCORE_BUDGET_BYTES = 2 << 30
 
 
 class DeepGEMMDecodeData(msgspec.Struct, frozen=True):
@@ -229,28 +223,15 @@ def score_tiles(
     ``rows.start + i`` against ``kv[request_starts + j]``, garbage past the row's
     ``compress_lens``; the width is the batch's largest context aligned to
     ``width_align`` columns."""
-    from deep_gemm import fp8_fp4_mqa_logits
-
-    rows = data.num_rows
-    width = ceil_align(max(data.lens_per_request, default=0), width_align)
-    if rows == 0 or width == 0:
-        return
-    rows_per_chunk = _rows_per_chunk(rows, width, heads=data.q_fp4.shape[1])
-    for offset in range(0, rows, rows_per_chunk):
-        tile = slice(offset, min(offset + rows_per_chunk, rows))
-        starts = data.request_starts[tile]
-        yield (
-            tile,
-            fp8_fp4_mqa_logits(
-                (data.q_fp4[tile], data.q_sf[tile]),
-                kv,
-                data.weights[tile],
-                starts,
-                starts + data.compress_lens[tile],
-                False,
-                width,
-            ),
-        )
+    yield from score_tiles_op(
+        q=(data.q_fp4, data.q_sf),
+        kv=kv,
+        weights=data.weights,
+        starts=data.request_starts,
+        lengths=data.compress_lens,
+        context_lengths=data.lens_per_request,
+        width_align=width_align,
+    )
 
 
 def dense_prefill_topk(
@@ -274,21 +255,6 @@ def dense_prefill_topk(
         # Free this tile's logits before the generator scores the next one.
         del logits
     return selected
-
-
-# TODO(dark): make it SM aware; align to SM count to avoid wave quantization.
-def _rows_per_chunk(rows: int, width: int, *, heads: int) -> int:
-    """Query rows per logits tile so one fp32 [rows, width] tile fits the
-    budget; the row count stays a multiple of the kernel's row alignment."""
-    row_alignment = 128 // heads
-    rows_per_chunk = mqa_logits_rows_per_chunk(
-        num_rows=ceil_align(rows, row_alignment),
-        row_bytes=mqa_logits_row_bytes(width),
-        budget_bytes=_DEEP_GEMM_SCORE_BUDGET_BYTES,
-    )
-    if rows_per_chunk is None:
-        return rows
-    return max(row_alignment, rows_per_chunk // row_alignment * row_alignment)
 
 
 # ---------- torch ----------
