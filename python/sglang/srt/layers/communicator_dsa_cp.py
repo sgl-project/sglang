@@ -101,6 +101,8 @@ class DSACPLayerCommunicator(LayerCommunicator):
             output_mode=ScatterMode.SCATTERED,
             context=self._context,
         )
+        # The postprocess also moves between the CP shards, so it stays here.
+        self._postprocess_scatters_to_local_tokens = False
 
     def _select_mlp_input(self):
         fn = DSACPCommunicateWithAllReduceAndLayerNormFn.get_fn(

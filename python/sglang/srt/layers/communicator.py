@@ -764,13 +764,6 @@ class LayerCommunicator:
             force_layernorm_before_dp_gather
         )
         self._post_init_communicate()
-        # Under attention DP, the base postprocess scatters the FFN output back
-        # to this rank's tokens, which the next layer's input can run instead;
-        # the MHC and DSA-CP postprocess do more, so theirs stays here.
-        self._postprocess_scatters_to_local_tokens = (
-            self._communicate_summable_tensor_pair_fn
-            is CommunicateSummableTensorPairFn._scatter_hidden_states
-        )
         self._mlp_input, self._mlp_input_may_fuse = self._select_mlp_input()
         if standalone_ffn:
             self._mlp_input = partial(_ffn_stage_input, steps=self._mlp_input)
@@ -789,13 +782,19 @@ class LayerCommunicator:
             output_mode=self.layer_scatter_modes.attn_mode,
             context=self._context,
         )
+        kind = ffn_output_kind(
+            self.layer_scatter_modes.mlp_mode,
+            self.layer_scatter_modes.middle_residual_mode,
+            self.layer_scatter_modes.layer_output_mode,
+            self._context,
+        )
         self._communicate_summable_tensor_pair_fn = (
-            CommunicateSummableTensorPairFn.get_fn(
-                hidden_states_input_mode=self.layer_scatter_modes.mlp_mode,
-                residual_input_mode=self.layer_scatter_modes.middle_residual_mode,
-                output_mode=self.layer_scatter_modes.layer_output_mode,
-                context=self._context,
-            )
+            CommunicateSummableTensorPairFn.for_kind(kind)
+        )
+        # Under attention DP, the postprocess scatters the FFN output back to
+        # this rank's tokens, which the next layer's input can run instead.
+        self._postprocess_scatters_to_local_tokens = (
+            kind is FfnOutputKind.TO_LOCAL_TOKENS
         )
 
     def prepare_attn_and_capture_last_layer_outputs(
@@ -2087,6 +2086,55 @@ def _all_reduce_then_to_local_tokens(
     )
 
 
+class FfnOutputKind(Enum):
+    """What the FFN output boundary does to reach the layer output layout."""
+
+    TRIVIAL = auto()
+    TO_LOCAL_TOKENS = auto()  # FULL -> TP_ATTN_FULL
+    FROM_ATTN_TP_SHARDS = auto()  # SCATTERED -> TP_ATTN_FULL
+    TO_ATTN_TP_SHARDS = auto()  # TP_ATTN_FULL -> SCATTERED
+    FROM_MOE_CP = auto()  # MOE_FULL -> TP_ATTN_FULL
+
+
+def ffn_output_kind(
+    hidden_states_input_mode: ScatterMode,
+    residual_input_mode: ScatterMode,
+    output_mode: ScatterMode,
+    context: CommunicateContext,
+) -> FfnOutputKind:
+    if context.is_same_layout(
+        hidden_states_input_mode, output_mode
+    ) and context.is_same_layout(residual_input_mode, output_mode):
+        return FfnOutputKind.TRIVIAL
+    kind = {
+        (
+            ScatterMode.FULL,
+            ScatterMode.TP_ATTN_FULL,
+            ScatterMode.TP_ATTN_FULL,
+        ): FfnOutputKind.TO_LOCAL_TOKENS,
+        (
+            ScatterMode.SCATTERED,
+            ScatterMode.SCATTERED,
+            ScatterMode.TP_ATTN_FULL,
+        ): FfnOutputKind.FROM_ATTN_TP_SHARDS,
+        (
+            ScatterMode.TP_ATTN_FULL,
+            ScatterMode.TP_ATTN_FULL,
+            ScatterMode.SCATTERED,
+        ): FfnOutputKind.TO_ATTN_TP_SHARDS,
+        (
+            ScatterMode.MOE_FULL,
+            ScatterMode.TP_ATTN_FULL,
+            ScatterMode.TP_ATTN_FULL,
+        ): FfnOutputKind.FROM_MOE_CP,
+    }.get((hidden_states_input_mode, residual_input_mode, output_mode))
+    if kind is not None:
+        return kind
+    raise NotImplementedError(
+        f"{hidden_states_input_mode=} {residual_input_mode=} {output_mode=}"
+    )
+
+
 class CommunicateSummableTensorPairFn:
     """It is allowed to make (hidden_states, residual) := (hidden_states + residual, None) if needed."""
 
@@ -2097,39 +2145,20 @@ class CommunicateSummableTensorPairFn:
         output_mode: ScatterMode,
         context: CommunicateContext,
     ):
-        if context.is_same_layout(
-            hidden_states_input_mode, output_mode
-        ) and context.is_same_layout(residual_input_mode, output_mode):
-            return CommunicateSummableTensorPairFn._trivial
-
-        fn = {
-            (
-                ScatterMode.FULL,
-                ScatterMode.TP_ATTN_FULL,
-                ScatterMode.TP_ATTN_FULL,
-            ): CommunicateSummableTensorPairFn._scatter_hidden_states,
-            (
-                ScatterMode.SCATTERED,
-                ScatterMode.SCATTERED,
-                ScatterMode.TP_ATTN_FULL,
-            ): CommunicateSummableTensorPairFn._gather,
-            (
-                ScatterMode.TP_ATTN_FULL,
-                ScatterMode.TP_ATTN_FULL,
-                ScatterMode.SCATTERED,
-            ): CommunicateSummableTensorPairFn._scatter,
-            (
-                ScatterMode.MOE_FULL,
-                ScatterMode.TP_ATTN_FULL,
-                ScatterMode.TP_ATTN_FULL,
-            ): CommunicateSummableTensorPairFn._scatter_hidden_states_moe,
-        }.get((hidden_states_input_mode, residual_input_mode, output_mode))
-        if fn is not None:
-            return fn
-
-        raise NotImplementedError(
-            f"{hidden_states_input_mode=} {residual_input_mode=} {output_mode=}"
+        kind = ffn_output_kind(
+            hidden_states_input_mode, residual_input_mode, output_mode, context
         )
+        return CommunicateSummableTensorPairFn.for_kind(kind)
+
+    @staticmethod
+    def for_kind(kind: FfnOutputKind):
+        return {
+            FfnOutputKind.TRIVIAL: CommunicateSummableTensorPairFn._trivial,
+            FfnOutputKind.TO_LOCAL_TOKENS: CommunicateSummableTensorPairFn._scatter_hidden_states,
+            FfnOutputKind.FROM_ATTN_TP_SHARDS: CommunicateSummableTensorPairFn._gather,
+            FfnOutputKind.TO_ATTN_TP_SHARDS: CommunicateSummableTensorPairFn._scatter,
+            FfnOutputKind.FROM_MOE_CP: CommunicateSummableTensorPairFn._scatter_hidden_states_moe,
+        }[kind]
 
     @staticmethod
     def _trivial(

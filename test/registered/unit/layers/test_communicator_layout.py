@@ -300,5 +300,43 @@ class TestMlpInputOrder(CustomTestCase):
                 self.assertFalse(may_fuse)
 
 
+class TestFfnOutputKind(CustomTestCase):
+    """The postprocess is chosen by the FFN output's kind; MHC takes its own
+    implementation of the same kind."""
+
+    def test_mhc_takes_its_own_function_for_each_kind(self):
+        from sglang.srt.layers.communicator_mhc import (
+            MHCCommunicateSummableTensorPairFn as MHC,
+        )
+
+        for kind in comm.FfnOutputKind:
+            with self.subTest(kind=kind.name):
+                if kind is comm.FfnOutputKind.FROM_MOE_CP:
+                    with self.assertRaises(NotImplementedError):
+                        MHC.for_kind(kind)
+                    continue
+                fn = MHC.for_kind(kind)
+                self.assertIs(fn, getattr(MHC, fn.__name__))
+                self.assertIsNot(
+                    fn, comm.CommunicateSummableTensorPairFn.for_kind(kind)
+                )
+
+    def test_only_the_move_back_to_local_tokens_can_go_to_the_next_layer(self):
+        for kind in comm.FfnOutputKind:
+            with self.subTest(kind=kind.name):
+                c = comm.LayerCommunicator.__new__(comm.LayerCommunicator)
+                c._context = make_context(dp=2, tp=2)
+                c.layer_scatter_modes = modes(
+                    TP_ATTN_FULL, TP_ATTN_FULL, FULL, TP_ATTN_FULL
+                )
+                c.layer_scatter_modes.layer_output_mode = TP_ATTN_FULL
+                with patch.object(comm, "ffn_output_kind", return_value=kind):
+                    c._post_init_communicate()
+                self.assertEqual(
+                    c._postprocess_scatters_to_local_tokens,
+                    kind is comm.FfnOutputKind.TO_LOCAL_TOKENS,
+                )
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -28,12 +28,13 @@ from sglang.srt.layers.communicator import (
     AttentionInputs,
     CommunicateContext,
     CommunicateSimpleFn,
-    CommunicateSummableTensorPairFn,
     FfnCompletion,
+    FfnOutputKind,
     LayerCommunicator,
     LayerScatterModes,
     MlpInputKind,
     ScatterMode,
+    ffn_output_kind,
     get_attn_tp_context,
     mlp_input_kind,
     tp_reduce_scatter,
@@ -251,27 +252,22 @@ class MHCCommunicateWithAllReduceAndLayerNormFn:
         return hidden_states, residual
 
 
-class MHCCommunicateSummableTensorPairFn(CommunicateSummableTensorPairFn):
+class MHCCommunicateSummableTensorPairFn:
+    """MHC's implementation of each FFN output kind: it also combines the
+    hyper-connection streams, and contracts them after the last layer."""
+
     @staticmethod
-    def get_fn(
-        hidden_states_input_mode: ScatterMode,
-        residual_input_mode: ScatterMode,
-        output_mode: ScatterMode,
-        context: CommunicateContext,
-    ):
-        fn = CommunicateSummableTensorPairFn.get_fn(
-            hidden_states_input_mode,
-            residual_input_mode,
-            output_mode,
-            context,
-        )
-        replacements = {
-            CommunicateSummableTensorPairFn._trivial: MHCCommunicateSummableTensorPairFn._trivial,
-            CommunicateSummableTensorPairFn._scatter_hidden_states: MHCCommunicateSummableTensorPairFn._scatter_hidden_states,
-            CommunicateSummableTensorPairFn._gather: MHCCommunicateSummableTensorPairFn._gather,
-            CommunicateSummableTensorPairFn._scatter: MHCCommunicateSummableTensorPairFn._scatter,
-        }
-        return replacements.get(fn, fn)
+    def for_kind(kind: FfnOutputKind):
+        fns = MHCCommunicateSummableTensorPairFn
+        found = {
+            FfnOutputKind.TRIVIAL: fns._trivial,
+            FfnOutputKind.TO_LOCAL_TOKENS: fns._scatter_hidden_states,
+            FfnOutputKind.FROM_ATTN_TP_SHARDS: fns._gather,
+            FfnOutputKind.TO_ATTN_TP_SHARDS: fns._scatter,
+        }.get(kind)
+        if found is None:
+            raise NotImplementedError(f"MHCLayerCommunicator does not support {kind}")
+        return found
 
     @staticmethod
     def _trivial(
@@ -430,14 +426,18 @@ class MHCLayerCommunicator(LayerCommunicator):
             output_mode=self.layer_scatter_modes.attn_mode,
             context=self._context,
         )
-        self._communicate_summable_tensor_pair_fn = (
-            MHCCommunicateSummableTensorPairFn.get_fn(
-                hidden_states_input_mode=self.layer_scatter_modes.mlp_mode,
-                residual_input_mode=self.layer_scatter_modes.middle_residual_mode,
-                output_mode=self.layer_scatter_modes.layer_output_mode,
-                context=self._context,
-            )
+        self._ffn_output_kind = ffn_output_kind(
+            self.layer_scatter_modes.mlp_mode,
+            self.layer_scatter_modes.middle_residual_mode,
+            self.layer_scatter_modes.layer_output_mode,
+            self._context,
         )
+        self._communicate_summable_tensor_pair_fn = (
+            MHCCommunicateSummableTensorPairFn.for_kind(self._ffn_output_kind)
+        )
+        # The postprocess also combines the hyper-connection streams, so it
+        # stays in this layer.
+        self._postprocess_scatters_to_local_tokens = False
 
     def prepare_attn(
         self,
@@ -530,10 +530,7 @@ class MHCLayerCommunicator(LayerCommunicator):
     def should_use_reduce_scatter(self, forward_batch: ForwardBatch):
         if not self.allow_reduce_scatter:
             return False
-        if (
-            self._communicate_summable_tensor_pair_fn
-            is MHCCommunicateSummableTensorPairFn._scatter_hidden_states
-        ):
+        if self._ffn_output_kind is FfnOutputKind.TO_LOCAL_TOKENS:
             # reduce_scatterv already combines expert outputs; returning False
             # would make RowParallelLinear perform an extra all-reduce.
             if should_use_dp_reduce_scatterv():
