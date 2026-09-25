@@ -294,29 +294,46 @@ jobs:
   # series outlives the thirty-day artifact retention above. See the note on the
   # same job in test-ppu-perf.yml for why it runs on always(), why the write is
   # confined to this one job, and what a `workflow_call` caller has to grant for it.
+
   publish-trend-rows:
-    name: file the trend rows
+    name: 归档趋势原始行（CPU）
     needs: [perf-32-k8s]
-    if: always()
+    if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     permissions:
       contents: write
       actions: read
     timeout-minutes: 15
+    env:
+      TREND_TOOL_SHA: ${{ vars.PPU_TREND_TOOL_SHA }}
     steps:
+      - name: 校验维护者配置的工具版本
+        id: tool-version
+        shell: bash
+        run: |
+          if [[ ! "$TREND_TOOL_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo '::error::必须配置PPU_TREND_TOOL_SHA为已审核工具的完整commit SHA'
+            exit 1
+          fi
+          printf 'TREND_OUTPUT_DIR=%s/trend-publication\n' "$RUNNER_TEMP" >> "$GITHUB_ENV"
       - name: Checkout the publishing script
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.sha }}
+          ref: ${{ env.TREND_TOOL_SHA }}
           fetch-depth: 1
+          persist-credentials: false
           path: source
+      - name: 核验工具checkout身份
+        id: trusted
+        shell: bash
+        run: test "$(git -C source rev-parse HEAD)" = "$TREND_TOOL_SHA"
       - name: Checkout the data branch
         uses: actions/checkout@v4
         with:
           ref: nightly-test-data
           fetch-depth: 0
           path: series
-      - name: Download this run's report
+      - name: Download this run's reports
         id: download
         continue-on-error: true
         uses: actions/download-artifact@v4
@@ -329,17 +346,22 @@ jobs:
         working-directory: series
         env:
           INCOMING_DIR: ../incoming
-          TREND_DATA_BRANCH: nightly-test-data
         run: bash ../source/scripts/ci/ppu/publish_trend_rows.sh
-      # After the filing rather than before it, so that what gets counted is what
-      # the step above actually read. Unconditional, because the download is
-      # allowed to fail outright and a run that filed nothing is the case where the
-      # count matters most. Reads from the workspace root, not from series/, which
-      # is why INCOMING_DIR differs from the one above.
       - name: Account for the reports that did not arrive
-        if: always()
+        if: ${{ !cancelled() && steps.trusted.outcome == 'success' }}
         shell: bash
         env:
           INCOMING_DIR: incoming
           NEEDS_JSON: ${{ toJSON(needs) }}
-        run: python3 source/scripts/ci/ppu/account_for_trend_reports.py
+        run: |
+          set -euo pipefail
+          mkdir -p "$TREND_OUTPUT_DIR"
+          python3 source/scripts/ci/ppu/account_for_trend_reports.py | tee "$TREND_OUTPUT_DIR/accounting.txt" >> "$GITHUB_STEP_SUMMARY"
+      - name: 保存发布状态与对账
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ppu-trend-rows-perf-32-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ env.TREND_OUTPUT_DIR }}/
+          if-no-files-found: warn
+          retention-days: 30

@@ -34,6 +34,8 @@ import os
 import sys
 from pathlib import Path
 
+from trend_io import contract, files, read_rows
+
 # A job that never started contributes no report and is no gap. Anything that
 # reached a conclusion was in a position to measure, which is what "should have
 # reported" can mean without knowing how far into the suite each one got.
@@ -44,7 +46,27 @@ def main() -> None:
     incoming = Path(os.environ.get("INCOMING_DIR", "incoming"))
     # The same thing stage_trend_rows.py reads, so that the two cannot disagree
     # about what a report is: one trend.jsonl per measuring job's artifact.
-    arrived = sorted(incoming.rglob("trend.jsonl"))
+    arrived = files(incoming, suffix="trend.jsonl")
+    errors = files(incoming, suffix="trend-error.json")
+    measured = unmeasured = 0
+    identities = set()
+    reports = set()
+    for path in arrived:
+        rows = read_rows(path)
+        report_identity = []
+        for row, _ in rows:
+            identity = (
+                *contract.series_key(row),
+                row["generated_at"],
+                row["provenance"].get("github_run_id"),
+                row["provenance"].get("github_run_attempt"),
+            )
+            report_identity.append(identity)
+            if identity not in identities:
+                measured += row["status"] == "measured"
+                unmeasured += row["status"] != "measured"
+                identities.add(identity)
+        reports.add(tuple(sorted(report_identity)))
 
     raw = os.environ.get("NEEDS_JSON", "")
     try:
@@ -59,19 +81,19 @@ def main() -> None:
         key for key, value in needs.items() if (value or {}).get("result") in CONCLUDED
     )
 
-    print(f"entries that ran ({len(concluded)}):")
-    for key in concluded:
-        print(f"  {key}")
-    print(f"reports that arrived ({len(arrived)}):")
-    for path in arrived:
-        print(f"  {path}")
+    print(
+        f"concluded_jobs={len(concluded)} reports={len(reports)} "
+        f"measured={measured} unmeasured={unmeasured} conversion_errors={len(errors)}"
+    )
+    print("观测对账，不代表调度覆盖；matrix展开数量可能多于job数量")
 
     if not needs:
         return
 
-    missing = len(concluded) - len(arrived)
+    missing = len(concluded) - len(reports)
+    print(f"report_gap={max(missing, 0)}（相对已结束job数的下界）")
     if missing == 0:
-        print("every entry that ran is accounted for in the series")
+        print("报告数与已结束job数相同，不能据此证明逐配置齐全")
         return
 
     # A warning rather than a failure, for the reason the uploads themselves are
@@ -93,4 +115,8 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        sys.exit(main())
+    except (ValueError, OSError, KeyError, TypeError):
+        print("::error::趋势对账输入无效")
+        sys.exit(1)

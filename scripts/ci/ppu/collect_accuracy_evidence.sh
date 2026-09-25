@@ -45,7 +45,7 @@ if [ -d "${ACCURACY_RESULTS_ON_RUNNER}" ]; then
   # beside them -- which is gigabytes for a full split and contains generated
   # text. The verdict, the raw report and the tool log are what a reviewer needs;
   # the predictions stay on the NAS for whoever is debugging a specific answer.
-  for name in result.json summary.md junit.xml evalscope.log; do
+  for name in result.json summary.md junit.xml evalscope.log trend.jsonl trend-error.json; do
     if [ -f "${ACCURACY_RESULTS_ON_RUNNER}/${name}" ]; then
       cp -a "${ACCURACY_RESULTS_ON_RUNNER}/${name}" "${destination}/"
     fi

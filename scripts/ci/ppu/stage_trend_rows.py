@@ -25,17 +25,11 @@ Usage: python3 scripts/ci/ppu/stage_trend_rows.py
 
 from __future__ import annotations
 
-import json
 import os
-import re
 import sys
 from pathlib import Path
 
-SCHEMA_PREFIX = "ppu-perf-trend-point/"
-# A test_id becomes a directory name, so it has to be one. Every id this line
-# produces is already of this shape; the check is here so that a row can never
-# name a path outside data/.
-SAFE_TEST_ID = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9._-]*\Z")
+from trend_io import contract, files, no_links, read_rows
 
 
 def fail(message: str) -> None:
@@ -48,55 +42,64 @@ def main() -> None:
     run_id = os.environ.get("GITHUB_RUN_ID", "unknown")
     attempt = os.environ.get("GITHUB_RUN_ATTEMPT", "1")
 
-    sources = sorted(incoming.rglob("trend.jsonl"))
+    stage(incoming, Path("data"), run_id=run_id, attempt=attempt)
+
+
+def stage(incoming, data, *, run_id, attempt):
+    contract.require(
+        contract.positive_id(run_id) and contract.positive_id(attempt), "无效发布身份"
+    )
+    contract.require(not files(incoming, suffix="trend-error.json"), "报告趋势转换失败")
+    sources = files(incoming, suffix="trend.jsonl")
     if not sources:
         print("::warning::no trend.jsonl in this run's artifacts, nothing to file")
         return
 
-    # (test_id, date) -> list of raw lines, so that a run straddling midnight UTC
-    # files each row under the day it was measured rather than the day the
-    # publishing job happened to start.
-    staged: dict[tuple[str, str], list[str]] = {}
+    staged = {}
+    identities = {}
     for source in sources:
-        for number, line in enumerate(
-            source.read_text(encoding="utf-8").splitlines(), start=1
-        ):
-            if not line.strip():
+        for row, line in read_rows(source):
+            prov = row["provenance"]
+            original_run = prov.get("github_run_id") or run_id
+            original_attempt = prov.get("github_run_attempt") or attempt
+            contract.require(original_run == run_id, "不接受其他run的报告")
+            contract.require(
+                contract.positive_id(original_attempt)
+                and int(original_attempt) <= int(attempt),
+                "无效原始attempt",
+            )
+            identity = (*contract.series_key(row), original_run, original_attempt)
+            if identity in identities:
+                contract.require(identities[identity] == line, "同身份内容冲突")
                 continue
-            try:
-                row = json.loads(line)
-            except json.JSONDecodeError as error:
-                fail(f"{source}:{number} is not JSON: {error}")
-            schema = row.get("schema_version", "")
-            if not schema.startswith(SCHEMA_PREFIX):
-                fail(f"{source}:{number} is not a trend row but {schema!r}")
-            test_id = row.get("test_id")
-            if not isinstance(test_id, str) or not SAFE_TEST_ID.match(test_id):
-                fail(f"{source}:{number} has an unusable test_id {test_id!r}")
-            generated_at = row.get("generated_at")
-            if not isinstance(generated_at, str) or len(generated_at) < 10:
-                fail(f"{source}:{number} has no usable generated_at")
-            staged.setdefault((test_id, generated_at[:10]), []).append(line)
+            identities[identity] = line
+            day = str(contract.utc(row["generated_at"]).date())
+            target = (
+                data / row["test_id"] / f"{day}-{original_run}-{original_attempt}.jsonl"
+            )
+            staged.setdefault(target, []).append((identity, line))
 
-    filed = 0
-    for (test_id, date), lines in sorted(staged.items()):
-        target = Path("data") / test_id / f"{date}-{run_id}-{attempt}.jsonl"
-        content = "".join(f"{line}\n" for line in lines)
+    # 先验证所有目标和冲突，再落盘，避免部分校验失败却留下可提交文件。
+    prepared = {}
+    for target, entries in sorted(staged.items()):
+        no_links(target)
+        content = "".join(line + "\n" for _, line in sorted(entries))
         if target.exists():
-            # Re-running the publishing job of an attempt already filed is
-            # harmless; the same attempt producing *different* rows is not, and
-            # silently overwriting would erase the earlier ones.
-            if target.read_text(encoding="utf-8") == content:
-                print(f"already filed: {target}")
-                continue
-            fail(f"{target} exists and differs from what this run measured")
+            # 历史发布器保留报告顺序；同一组原行顺序不同不应触发覆盖。
+            existing = sorted(line for _, line in read_rows(target))
+            contract.require(
+                existing == sorted(line for _, line in entries), "禁止覆盖原始行"
+            )
+        else:
+            prepared[target] = content
+    for target, content in prepared.items():
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(content, encoding="utf-8")
-        print(f"filed {len(lines)} row(s): {target}")
-        filed += len(lines)
-
-    print(f"{filed} row(s) across {len(staged)} series from {len(sources)} report(s)")
+    print(f"归档新增文件 {len(prepared)}，收到报告 {len(sources)}")
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except (ValueError, OSError, TypeError, KeyError):
+        fail("趋势输入校验或落盘失败；未发布数据")

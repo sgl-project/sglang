@@ -1294,80 +1294,74 @@ jobs:
   # its caller holds, so whoever eventually wires this workflow into a parent has to
   # grant `contents: write` and `actions: read` there as well, or this job will run
   # with the read-only default and every push will 403.
+
   publish-trend-rows:
-    name: file the trend rows
-    needs:
-      - glm52-fp8chan-4k
-      - glm52-fp8chan-64k
-      - kimi26-mxfp4
-      - kimi26-w4a8
-      - glm52-mxfp4-4k
-      - glm52-mxfp4-64k
-      - qwen35-mxfp4
-      - qwen35-fp8chan
-      - minimax27-mxfp4
-      - minimax27-fp8chan
-    if: always()
-    # Not a board runner: this job needs github.com and a Python, and holds no
-    # device. Putting it on the CPU orchestration group would queue it behind the
-    # very measurements it is waiting for.
+    name: 归档趋势原始行（CPU）
+    needs: [glm52-fp8chan-4k, glm52-fp8chan-64k, kimi26-mxfp4, kimi26-w4a8, glm52-mxfp4-4k, glm52-mxfp4-64k, qwen35-mxfp4, qwen35-fp8chan, minimax27-mxfp4, minimax27-fp8chan]
+    if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     permissions:
       contents: write
-      # download-artifact reads this run's own artifacts through the Actions API,
-      # which the repository's read-only default does not cover at all.
       actions: read
     timeout-minutes: 15
+    env:
+      TREND_TOOL_SHA: ${{ vars.PPU_TREND_TOOL_SHA }}
     steps:
-      # Two checkouts, because the two things this job needs are on different
-      # branches: the script comes from the source, and the branch it writes to
-      # carries measurements only. Giving the data branch a copy of the script
-      # would make it something that has to be kept in step with the code, which
-      # is what keeping it an orphan branch avoids.
+      - name: 校验维护者配置的工具版本
+        id: tool-version
+        shell: bash
+        run: |
+          if [[ ! "$TREND_TOOL_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo '::error::必须配置PPU_TREND_TOOL_SHA为已审核工具的完整commit SHA'
+            exit 1
+          fi
+          printf 'TREND_OUTPUT_DIR=%s/trend-publication\n' "$RUNNER_TEMP" >> "$GITHUB_ENV"
       - name: Checkout the publishing script
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.sha }}
+          ref: ${{ env.TREND_TOOL_SHA }}
           fetch-depth: 1
+          persist-credentials: false
           path: source
+      - name: 核验工具checkout身份
+        id: trusted
+        shell: bash
+        run: test "$(git -C source rev-parse HEAD)" = "$TREND_TOOL_SHA"
       - name: Checkout the data branch
         uses: actions/checkout@v4
         with:
           ref: nightly-test-data
-          # Full history, unlike every other checkout here: this is the one that
-          # gets pushed, and pushing or rebasing out of a shallow clone is a
-          # failure mode not worth inviting for a branch this small.
           fetch-depth: 0
           path: series
-      # Best effort, like the uploads that produced them: an entry can finish with
-      # no artifact at all, and that is a gap in the series rather than a reason to
-      # fail a job that measured nothing itself.
       - name: Download this run's reports
         id: download
         continue-on-error: true
         uses: actions/download-artifact@v4
         with:
-          pattern: ppu-perf-k8s-*-${{ github.run_id }}-${{ github.run_attempt }}
+          pattern: ppu-perf-k8s-[a-z]*-${{ github.run_id }}-${{ github.run_attempt }}
           path: incoming
-      # Downloaded outside the data-branch checkout on purpose, so that the only
-      # thing untracked in it is nothing at all.
       - name: File the rows on the data branch
         if: steps.download.outcome == 'success'
         shell: bash
         working-directory: series
         env:
           INCOMING_DIR: ../incoming
-          TREND_DATA_BRANCH: nightly-test-data
         run: bash ../source/scripts/ci/ppu/publish_trend_rows.sh
-      # After the filing rather than before it, so that what gets counted is what
-      # the step above actually read. Unconditional, because the download is
-      # allowed to fail outright and a run that filed nothing is the case where the
-      # count matters most. Reads from the workspace root, not from series/, which
-      # is why INCOMING_DIR differs from the one above.
       - name: Account for the reports that did not arrive
-        if: always()
+        if: ${{ !cancelled() && steps.trusted.outcome == 'success' }}
         shell: bash
         env:
           INCOMING_DIR: incoming
           NEEDS_JSON: ${{ toJSON(needs) }}
-        run: python3 source/scripts/ci/ppu/account_for_trend_reports.py
+        run: |
+          set -euo pipefail
+          mkdir -p "$TREND_OUTPUT_DIR"
+          python3 source/scripts/ci/ppu/account_for_trend_reports.py | tee "$TREND_OUTPUT_DIR/accounting.txt" >> "$GITHUB_STEP_SUMMARY"
+      - name: 保存发布状态与对账
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ppu-trend-rows-perf-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ env.TREND_OUTPUT_DIR }}/
+          if-no-files-found: warn
+          retention-days: 30

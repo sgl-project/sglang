@@ -2465,3 +2465,74 @@ jobs:
           if-no-files-found: warn
           overwrite: true
           retention-days: 30
+
+  publish-trend-rows:
+    name: 归档趋势原始行（CPU）
+    needs: [glm52-fp8chan-gsm8k-smoke, glm52-fp8chan-gsm8k, glm52-fp8chan-ceval, glm52-fp8chan-ifeval, glm52-mxfp4-gsm8k-smoke, glm52-mxfp4-gsm8k, glm52-mxfp4-ceval, glm52-mxfp4-ifeval, kimi26-mxfp4-gsm8k-smoke, kimi26-mxfp4-gsm8k, kimi26-mxfp4-ceval, kimi26-mxfp4-ifeval, minimax27-fp8chan-gsm8k-smoke, minimax27-fp8chan-gsm8k, minimax27-fp8chan-ceval, minimax27-fp8chan-ifeval, minimax27-mxfp4-gsm8k-smoke, minimax27-mxfp4-gsm8k, minimax27-mxfp4-ceval, minimax27-mxfp4-ifeval, qwen35-fp8chan-gsm8k-smoke, qwen35-fp8chan-gsm8k, qwen35-fp8chan-ceval, qwen35-fp8chan-ifeval, qwen35-mxfp4-gsm8k-smoke, qwen35-mxfp4-gsm8k, qwen35-mxfp4-ceval, qwen35-mxfp4-ifeval]
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      actions: read
+    timeout-minutes: 15
+    env:
+      TREND_TOOL_SHA: ${{ vars.PPU_TREND_TOOL_SHA }}
+    steps:
+      - name: 校验维护者配置的工具版本
+        id: tool-version
+        shell: bash
+        run: |
+          if [[ ! "$TREND_TOOL_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo '::error::必须配置PPU_TREND_TOOL_SHA为已审核工具的完整commit SHA'
+            exit 1
+          fi
+          printf 'TREND_OUTPUT_DIR=%s/trend-publication\n' "$RUNNER_TEMP" >> "$GITHUB_ENV"
+      - name: Checkout the publishing script
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TREND_TOOL_SHA }}
+          fetch-depth: 1
+          persist-credentials: false
+          path: source
+      - name: 核验工具checkout身份
+        id: trusted
+        shell: bash
+        run: test "$(git -C source rev-parse HEAD)" = "$TREND_TOOL_SHA"
+      - name: Checkout the data branch
+        uses: actions/checkout@v4
+        with:
+          ref: nightly-test-data
+          fetch-depth: 0
+          path: series
+      - name: Download this run's reports
+        id: download
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          pattern: ppu-accuracy-k8s-*-${{ github.run_id }}-${{ github.run_attempt }}
+          path: incoming
+      - name: File the rows on the data branch
+        if: steps.download.outcome == 'success'
+        shell: bash
+        working-directory: series
+        env:
+          INCOMING_DIR: ../incoming
+        run: bash ../source/scripts/ci/ppu/publish_trend_rows.sh
+      - name: Account for the reports that did not arrive
+        if: ${{ !cancelled() && steps.trusted.outcome == 'success' }}
+        shell: bash
+        env:
+          INCOMING_DIR: incoming
+          NEEDS_JSON: ${{ toJSON(needs) }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$TREND_OUTPUT_DIR"
+          python3 source/scripts/ci/ppu/account_for_trend_reports.py | tee "$TREND_OUTPUT_DIR/accounting.txt" >> "$GITHUB_STEP_SUMMARY"
+      - name: 保存发布状态与对账
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ppu-trend-rows-accuracy-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ env.TREND_OUTPUT_DIR }}/
+          if-no-files-found: warn
+          retention-days: 30

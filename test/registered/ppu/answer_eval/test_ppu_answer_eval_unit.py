@@ -1668,9 +1668,17 @@ class TestPPUAnswerEval(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             output_dir = Path(temp_dir)
             write_report_files(report, output_dir)
+            # This fixture carries no test-config identity, so the trend
+            # conversion cannot build a series key and deliberately leaves a
+            # fixed, candidate-free marker instead of a trend file.  The main
+            # report and gate are unaffected.
             self.assertEqual(
                 {path.name for path in output_dir.iterdir()},
-                {"result.json", "summary.md", "junit.xml"},
+                {"result.json", "summary.md", "junit.xml", "trend-error.json"},
+            )
+            self.assertEqual(
+                json.loads((output_dir / "trend-error.json").read_text()),
+                {"reason_code": "trend_conversion_failed"},
             )
             for path in output_dir.iterdir():
                 self.assertNotIn(b"PRIVATE-CANDIDATE", path.read_bytes())
@@ -1824,6 +1832,9 @@ class TestPPUAnswerEval(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             output_dir = Path(temp_dir)
             write_report_files(report, output_dir, include_raw_outputs=True)
+            # No test-config identity here either, so the sanitized trend marker
+            # sits alongside the raw and redacted artifacts without disturbing
+            # them.
             self.assertEqual(
                 {path.name for path in output_dir.iterdir()},
                 {
@@ -1832,7 +1843,12 @@ class TestPPUAnswerEval(unittest.TestCase):
                     "junit.xml",
                     "result.raw.json",
                     "label_candidates.jsonl",
+                    "trend-error.json",
                 },
+            )
+            self.assertEqual(
+                json.loads((output_dir / "trend-error.json").read_text()),
+                {"reason_code": "trend_conversion_failed"},
             )
             raw = json.loads((output_dir / "result.raw.json").read_text())
             public = json.loads((output_dir / "result.json").read_text())

@@ -39,6 +39,7 @@ from sglang.test.kits.answer_eval_kit import (
     default_provenance,
     load_json,
 )
+from sglang.test.kits.quality_trend import write_quality_trend
 
 __all__ = [
     "ACCURACY_REPORT_SCHEMA_VERSION",
@@ -1261,6 +1262,7 @@ def write_report_files(report: dict[str, Any], output_dir: Path) -> None:
     )
     (output_dir / "summary.md").write_text(render_summary(report), encoding="utf-8")
     (output_dir / "junit.xml").write_bytes(render_junit(report))
+    write_quality_trend(report, output_dir)
 
 
 def accuracy_provenance(config: dict[str, Any], **kwargs: Any) -> dict[str, Any]:

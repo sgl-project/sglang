@@ -52,6 +52,9 @@ jobs:
     uses: ./.github/workflows/test-ppu-answer.yml
     with:
       ref: ${{ inputs.ref || github.sha }}
+    permissions:
+      contents: write
+      actions: read
     secrets: inherit
 
   answer-two-node:
@@ -59,6 +62,9 @@ jobs:
     uses: ./.github/workflows/test-ppu-answer-16.yml
     with:
       ref: ${{ inputs.ref || github.sha }}
+    permissions:
+      contents: write
+      actions: read
     secrets: inherit
 
   answer-four-node:
@@ -66,4 +72,7 @@ jobs:
     uses: ./.github/workflows/test-ppu-answer-32.yml
     with:
       ref: ${{ inputs.ref || github.sha }}
+    permissions:
+      contents: write
+      actions: read
     secrets: inherit

@@ -36,7 +36,7 @@ set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 INCOMING_DIR="${INCOMING_DIR:-incoming}"
-TREND_DATA_BRANCH="${TREND_DATA_BRANCH:-nightly-test-data}"
+TREND_DATA_BRANCH="nightly-test-data"
 
 if [ ! -e .git ]; then
   echo "::error::run this from a checkout of ${TREND_DATA_BRANCH}, not from ${PWD}" >&2
@@ -48,36 +48,6 @@ if [ ! -d "${INCOMING_DIR}" ]; then
   exit 0
 fi
 
-# Staged by a Python pass rather than by find plus cp: the rows have to be
-# grouped by the test_id inside them, and a malformed row must stop the run
-# before it reaches the branch, because a series is only as good as the worst
-# line anyone ever appended to it.
-python3 "${HERE}/stage_trend_rows.py"
-
-if [ -z "$(git status --porcelain data 2>/dev/null)" ]; then
-  echo "nothing new to file on ${TREND_DATA_BRANCH}"
-  exit 0
-fi
-
-git config user.name "github-actions[bot]"
-git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-git add data
-git commit --quiet --message "data(perf): ${GITHUB_WORKFLOW:-perf} run ${GITHUB_RUN_ID:-?} attempt ${GITHUB_RUN_ATTEMPT:-?}"
-
-# Rebase and retry rather than force: every writer only adds paths no other
-# writer uses, so a rebase onto whoever won the race replays cleanly, and a force
-# would discard their rows. Bounded, with a jittered wait, so that a genuinely
-# broken push fails the step instead of spinning.
-for attempt in 1 2 3 4 5 6; do
-  if git push --quiet origin "HEAD:${TREND_DATA_BRANCH}"; then
-    echo "filed on ${TREND_DATA_BRANCH} at $(git rev-parse --short HEAD)"
-    exit 0
-  fi
-  echo "push ${attempt} lost the race for ${TREND_DATA_BRANCH}; rebasing"
-  sleep $(( attempt * 5 + RANDOM % 10 ))
-  git fetch --quiet origin "${TREND_DATA_BRANCH}"
-  git rebase --quiet "origin/${TREND_DATA_BRANCH}"
-done
-
-echo "::error::could not file the rows on ${TREND_DATA_BRANCH} after six attempts"
-exit 1
+# 在干净的临时checkout校验与暂存，竞争后重新读取，不覆盖原始数据。
+export INCOMING_DIR
+exec python3 "${HERE}/trend_publish.py" rows

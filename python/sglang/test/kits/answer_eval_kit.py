@@ -23,6 +23,8 @@ from importlib import metadata
 from pathlib import Path
 from typing import Any, Iterable
 
+from sglang.test.kits.quality_trend import write_quality_trend
+
 
 class AnswerEvalError(RuntimeError):
     """Base error for malformed test data or candidate API responses."""
@@ -2343,6 +2345,7 @@ def write_report_files(
             json.dumps(report, ensure_ascii=True, indent=2) + "\n",
             encoding="utf-8",
         )
+    write_quality_trend(report, output_dir)
 
 
 def checkpoint_config_digest(model_path: str) -> str | None:
