@@ -5,6 +5,7 @@ import os
 import random
 import re
 import socket
+import sys
 import threading
 import time
 import traceback
@@ -1807,12 +1808,24 @@ class _SGLangPlugin(_FrameworkPlugin):
 
 
 class _MegatronPlugin(_FrameworkPlugin):
-    _available = True
-    try:
-        from megatron.core import parallel_state as _mpu
-        from megatron.core.packed_seq_params import PackedSeqParams
-    except ImportError:
-        _available = False
+    # Don't eagerly import Megatron here; check sys.modules instead.
+    # In colocate mode, eager import here makes Megatron-FSDP switch
+    # torch_memory_saver's global hook_mode to "torch", which breaks SGLang's
+    # pauseable CUDA graph that requires hook_mode="preload".
+    @property
+    def _available(self) -> bool:
+        return (
+            "megatron.core" in sys.modules
+            and "megatron.core.packed_seq_params" in sys.modules
+        )
+
+    @property
+    def _mpu(self):
+        return sys.modules["megatron.core"].parallel_state
+
+    @property
+    def PackedSeqParams(self):
+        return sys.modules["megatron.core.packed_seq_params"].PackedSeqParams
 
     @property
     def name(self) -> str:
