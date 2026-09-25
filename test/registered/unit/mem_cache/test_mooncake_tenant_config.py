@@ -77,6 +77,7 @@ def _make_storage_config(tenant_id=DEFAULT_TENANT_ID):
     return SimpleNamespace(
         tp_rank=0,
         tp_size=1,
+        dcp_size=1,
         pp_rank=0,
         pp_size=1,
         attn_cp_rank=0,
