@@ -231,9 +231,13 @@ impl ChatFormatter {
         })
     }
 
-    /// Whether router rendering is fixture-verified against SGLang for every text chat.
-    pub fn forwarding_verified(&self) -> bool {
-        matches!(self.deepseek, Some(super::deepseek::Encoder::V4(_)))
+    /// DeepSeek-V4 is fixture-verified against SGLang for every text chat; V4.1 is stale.
+    pub fn forwarding_scope(&self) -> super::ForwardingScope {
+        match self.deepseek {
+            Some(super::deepseek::Encoder::V4(_)) => super::ForwardingScope::AllText,
+            Some(super::deepseek::Encoder::V41) => super::ForwardingScope::Never,
+            None => super::ForwardingScope::Guarded,
+        }
     }
 
     /// Apply the workers' `--default-chat-template-kwargs`; they fill keys the
