@@ -151,15 +151,10 @@ def create_branch(repo_owner, repo_name, branch, commit_sha, token):
             data={"ref": f"refs/heads/{branch}", "sha": commit_sha},
         )
     except HTTPError as e:
-        body = e.error_body
-        if e.code == 422 and "already exists" in body:
+        if e.code == 422 and "already exists" in e.error_body:
             raise BranchCreateRace(branch) from e
-        if e.code == 422:
-            # e.g. "gt/foo" while "gt/foo/bar" exists: git refs cannot nest.
-            raise RuntimeError(
-                f"cannot create {repo_owner}/{repo_name} branch {branch!r}: {body}. "
-                "Pick a ci_data_branch that is not a path prefix of an existing branch."
-            ) from e
+        # Other 422s include "Object does not exist" for a just-created commit,
+        # which the publish retry loop treats as transient.
         raise
     print(f"Created {repo_owner}/{repo_name} branch {branch}")
 
@@ -500,6 +495,7 @@ def publish(source_dir, target_dir, branch):
 
     # Commit with retry (handle concurrent pushes)
     max_retries = 5
+    creating_branch = False
     for attempt in range(max_retries):
         try:
             base_sha, branch_exists = get_base_sha(REPO_OWNER, REPO_NAME, branch, token)
@@ -547,6 +543,7 @@ def publish(source_dir, target_dir, branch):
                 update_branch_ref(REPO_OWNER, REPO_NAME, branch, commit_sha, token)
             else:
                 # Born with its first commit, so an empty run leaves no branch behind.
+                creating_branch = True
                 create_branch(REPO_OWNER, REPO_NAME, branch, commit_sha, token)
             print(
                 f"Successfully pushed {len(changed_files)} changed images (commit {commit_sha[:10]})"
@@ -586,6 +583,12 @@ def publish(source_dir, target_dir, branch):
                 time.sleep(wait)
             else:
                 print(f"Failed after {attempt + 1} attempts: {e}")
+                if creating_branch and isinstance(e, HTTPError) and e.code == 422:
+                    # e.g. "gt/foo" while "gt/foo/bar" exists: git refs cannot nest.
+                    print(
+                        f"Could not create branch {branch!r}; if it is a path prefix "
+                        "of an existing branch (or has one as a prefix), pick another."
+                    )
                 raise
 
 

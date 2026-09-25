@@ -9,7 +9,7 @@ receive GT that every later pin bump from ``main`` may pick up. A run from sglan
 - ``main``: shared, linear history; use for routine new-model GT.
 - ``isolated``: ``gt/<ref>`` forked from ``main``; use for experiments such as a
   torch upgrade, reachable only through the pin of the PR that produced it.
-- any other value: that branch name, as given.
+- ``gt/<name>``: that isolated branch, named explicitly.
 
 Kept free of third-party imports so a CPU-only job can resolve the branch before
 any GPU work starts.
@@ -50,10 +50,17 @@ def resolve_publish_branch(choice, source_ref):
                 f"got {source_ref!r}"
             )
         return _isolated_branch(source_ref)
-    if choice:
-        if choice.startswith("refs/"):
-            raise SystemExit(f"ci_data_branch must be a branch name, got {choice!r}")
+    if choice == MAIN_BRANCH or (
+        choice.startswith(ISOLATED_BRANCH_PREFIX)
+        and len(choice) > len(ISOLATED_BRANCH_PREFIX)
+    ):
         return choice
+    if choice:
+        # Rejects typos such as "isloated", which would otherwise fork a new branch.
+        raise SystemExit(
+            f"ci_data_branch must be {MAIN_BRANCH}, {ISOLATED_CHOICE}, or "
+            f"{ISOLATED_BRANCH_PREFIX}<name>; got {choice!r}"
+        )
     if source_ref == MAIN_BRANCH:
         return MAIN_BRANCH
     if not source_ref:

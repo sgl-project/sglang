@@ -24,7 +24,7 @@ on:
         default: ''
         type: string
       ci_data_branch:
-        description: "sgl-project/ci-data-diffusion branch to publish to; required when 'ref' is not main. main: shared, reaches every later pin bump from main (routine new-model GT). isolated: gt/<ref>, reachable only via this PR's pin (experiments such as a torch upgrade). Or any branch name."
+        description: "sgl-project/ci-data-diffusion branch to publish to; required when 'ref' is not main. main: shared, reaches every later pin bump from main (routine new-model GT). isolated: gt/<ref>, reachable only via this PR's pin (experiments such as a torch upgrade). Or an explicit gt/<name>."
         required: false
         default: ''
         type: string
@@ -81,9 +81,11 @@ jobs:
 
       - name: Resolve ci-data-diffusion branch
         id: ci-data-branch
+        env:
+          CI_DATA_BRANCH_CHOICE: ${{ inputs.ci_data_branch }}
         run: |
           python3 "$GT_TOOLS_DIR/scripts/ci/utils/diffusion/ci_data_branch.py" \
-            --choice "${{ inputs.ci_data_branch }}"
+            --choice "$CI_DATA_BRANCH_CHOICE"
 
       - name: Verify write access to sgl-project/ci-data-diffusion
         env:
