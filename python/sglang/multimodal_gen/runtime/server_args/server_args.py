@@ -613,6 +613,7 @@ class ServerArgs(DisaggServerArgsMixin):
 
     # SGLang server for PE model inference
     pe_server_url: str | None = None
+    prompt_enhancer_config: str | None = None
 
     @property
     def broker_port(self) -> int:
@@ -3053,6 +3054,12 @@ class ServerArgs(DisaggServerArgsMixin):
             type=str,
             default=ServerArgs.pe_server_url,
             help="URL of SGLang server for PE model",
+        )
+        parser.add_argument(
+            "--prompt-enhancer-config",
+            type=str,
+            default=ServerArgs.prompt_enhancer_config,
+            help="JSON config file for an external SRT prompt enhancer, used by HTTP requests with enhance_prompt=true.",
         )
 
         return parser
