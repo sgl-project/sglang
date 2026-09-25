@@ -6,27 +6,33 @@ import sys
 import unittest
 from dataclasses import fields, is_dataclass
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import torch
 
+from sglang.srt.utils import is_npu
 from sglang.test.ci.ci_register import register_npu_ci
 
 register_npu_ci(est_time=5, suite="base-a-test-npu")
 
-# Mock NPU-only modules before importing the source module.
-for _ in (
-    "torch_npu",
-    "torch_npu.contrib",
-    "sgl_kernel_npu",
-    "sgl_kernel_npu.attention",
-    "sgl_kernel_npu.attention.sinks_attention",
-    "sglang.srt.speculative",
-    "sglang.srt.speculative.decoupled_spec_io",
-    "sglang.srt.speculative.spec_info",
-    "sglang.srt.speculative.eagle_info",
-):
-    sys.modules.setdefault(_, MagicMock())
+# Mock NPU-only modules before importing the source module, so the file
+# imports on non-NPU machines. Skipped on real NPU hosts: a MagicMock parent
+# in sys.modules would break later imports of the real submodules (e.g.
+# sgl_kernel_npu.kvcacheio from pool_host) elsewhere in the same pytest
+# process.
+if not is_npu():
+    for _ in (
+        "torch_npu",
+        "torch_npu.contrib",
+        "sgl_kernel_npu",
+        "sgl_kernel_npu.attention",
+        "sgl_kernel_npu.attention.sinks_attention",
+        "sglang.srt.speculative",
+        "sglang.srt.speculative.decoupled_spec_io",
+        "sglang.srt.speculative.spec_info",
+        "sglang.srt.speculative.eagle_info",
+    ):
+        sys.modules.setdefault(_, MagicMock())
 
 from sglang.srt.hardware_backend.npu.attention.ascend_backend import (
     AscendAttnBackend,
@@ -155,6 +161,9 @@ class TestForwardMetadata(unittest.TestCase):
             "actual_seq_lengths_q_pa",
             "actual_seq_lengths_q_pa_cpu",
             "actual_seq_lengths_kv",
+            "quant_indexer_cu_seqlens_q",
+            "quant_indexer_seqused_k",
+            "quant_indexer_metadata",
             "swa_mask",
             "prefix_lens",
             "flatten_prefix_block_tables",
@@ -527,6 +536,127 @@ class TestGetSwaMask(unittest.TestCase):
         seq_lens = torch.tensor([5, 10])
         mask = self.builder.get_swa_mask(seq_lens, s2=15, left_context=512)
         self.assertEqual(mask.dtype, torch.bool)
+
+
+class TestQuantIndexerMetadataPlanning(unittest.TestCase):
+    """Tests for AscendAttnBackend._plan_quant_indexer_metadata: the
+    once-per-step quant_lightning_indexer (v2) task-list pre-plan shared by
+    all DSA indexer layers of a batch. The metadata op is mocked so the
+    tests run on any platform; the real op is exercised by the NPU-gated
+    test_npu_quant_lightning_indexer.py."""
+
+    @staticmethod
+    def _make_backend(seq_lens_cpu_int, actual_seq_lengths_q=None, enabled=True):
+        backend = object.__new__(AscendAttnBackend)
+        backend.device = "cpu"
+        backend.quant_indexer_enabled = enabled
+        backend.quant_indexer_n_heads = 64
+        backend.quant_indexer_topk = 2048
+        backend.quant_indexer_head_dim = 128
+        backend.forward_metadata = ForwardMetadata(
+            seq_lens_cpu_int=seq_lens_cpu_int,
+            actual_seq_lengths_q=actual_seq_lengths_q,
+        )
+        return backend
+
+    @staticmethod
+    def _make_forward_batch(is_extend, attn_cp_metadata=None, extend_seq_lens=None):
+        batch = MagicMock()
+        batch.forward_mode.is_extend.return_value = is_extend
+        batch.attn_cp_metadata = attn_cp_metadata
+        batch.extend_seq_lens = extend_seq_lens
+        return batch
+
+    @staticmethod
+    def _plan(backend, forward_batch):
+        with patch("torch.ops.cann_ops_transformer", create=True) as mock_ns:
+            mock_ns.quant_lightning_indexer_metadata.return_value = torch.zeros(
+                1, dtype=torch.uint8
+            )
+            backend._plan_quant_indexer_metadata(forward_batch)
+        return mock_ns
+
+    def test_plain_extend_plans_int32_inputs(self):
+        backend = self._make_backend(torch.tensor([10, 20]))
+        batch = self._make_forward_batch(
+            is_extend=True, extend_seq_lens=torch.tensor([3, 5])
+        )
+        mock_ns = self._plan(backend, batch)
+        fm = backend.forward_metadata
+        self.assertTrue(
+            torch.equal(fm.quant_indexer_cu_seqlens_q, torch.tensor([0, 3, 8]))
+        )
+        self.assertEqual(fm.quant_indexer_cu_seqlens_q.dtype, torch.int32)
+        self.assertTrue(torch.equal(fm.quant_indexer_seqused_k, torch.tensor([10, 20])))
+        self.assertEqual(fm.quant_indexer_seqused_k.dtype, torch.int32)
+        self.assertIsNotNone(fm.quant_indexer_metadata)
+
+        op = mock_ns.quant_lightning_indexer_metadata
+        op.assert_called_once()
+        args, kwargs = op.call_args
+        # (num_heads_q, num_heads_k, head_dim, topk, quant_mode=MXFP8)
+        self.assertEqual(args, (64, 1, 128, 2048, 3))
+        self.assertEqual(kwargs["batch_size"], 2)
+        self.assertEqual(kwargs["max_seqlen_q"], -1)
+        self.assertEqual(kwargs["max_seqlen_k"], -1)
+        self.assertEqual(kwargs["layout_q"], "TND")
+        self.assertEqual(kwargs["layout_k"], "PA_BBND")
+        self.assertEqual(kwargs["mask_mode"], 3)
+        self.assertEqual(kwargs["cmp_ratio"], 1)
+        self.assertIs(kwargs["cu_seqlens_q"], fm.quant_indexer_cu_seqlens_q)
+        self.assertIs(kwargs["seqused_k"], fm.quant_indexer_seqused_k)
+
+    def test_decode_uses_actual_seq_lengths_q(self):
+        # actual_seq_lengths_q is already the per-request cumsum, so
+        # cu_seqlens_q is just [0] + actual_seq_lengths_q.
+        backend = self._make_backend(
+            torch.tensor([7, 9]),
+            actual_seq_lengths_q=torch.tensor([1, 2], dtype=torch.int32),
+        )
+        batch = self._make_forward_batch(is_extend=False)
+        mock_ns = self._plan(backend, batch)
+        fm = backend.forward_metadata
+        self.assertTrue(
+            torch.equal(fm.quant_indexer_cu_seqlens_q, torch.tensor([0, 1, 2]))
+        )
+        mock_ns.quant_lightning_indexer_metadata.assert_called_once()
+
+    def test_int64_actual_seq_lengths_q_cast_to_int32(self):
+        # NPU cumsum of int32 upcasts to int64; the plan must hand int32
+        # cu_seqlens_q to the op (aclnn rejects int64 with EZ0020).
+        backend = self._make_backend(
+            torch.tensor([10, 20]),
+            actual_seq_lengths_q=torch.tensor([3, 8], dtype=torch.int64),
+        )
+        batch = self._make_forward_batch(is_extend=False)
+        self._plan(backend, batch)
+        fm = backend.forward_metadata
+        self.assertEqual(fm.quant_indexer_cu_seqlens_q.dtype, torch.int32)
+        self.assertTrue(
+            torch.equal(fm.quant_indexer_cu_seqlens_q, torch.tensor([0, 3, 8]))
+        )
+
+    def test_cp_extend_skips_planning(self):
+        backend = self._make_backend(torch.tensor([10]))
+        batch = self._make_forward_batch(
+            is_extend=True,
+            attn_cp_metadata=object(),
+            extend_seq_lens=torch.tensor([4]),
+        )
+        mock_ns = self._plan(backend, batch)
+        fm = backend.forward_metadata
+        mock_ns.quant_lightning_indexer_metadata.assert_not_called()
+        self.assertIsNone(fm.quant_indexer_cu_seqlens_q)
+        self.assertIsNone(fm.quant_indexer_seqused_k)
+        self.assertIsNone(fm.quant_indexer_metadata)
+
+    def test_disabled_skips_planning(self):
+        backend = self._make_backend(torch.tensor([10]), enabled=False)
+        batch = self._make_forward_batch(
+            is_extend=True, extend_seq_lens=torch.tensor([4])
+        )
+        mock_ns = self._plan(backend, batch)
+        mock_ns.quant_lightning_indexer_metadata.assert_not_called()
 
 
 class TestCanUseTnd(unittest.TestCase):

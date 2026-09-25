@@ -746,9 +746,14 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
                         create_npu_hadamard_128,
                     )
 
+                    # MXFP8 index-k scale cache for quant_lightning_indexer (v2),
+                    # quant_mode 3: one E8M0 byte per 32-element block, per-token
+                    # tail (k_n, d/64, 2) == (1, 2, 2). Stored as uint8 so the
+                    # scatter writer stays on a generic int dtype; consumers get
+                    # the E8M0 view via get_index_k_scale_buffer().
                     self.index_k_scale_buffer = torch.zeros(
-                        (*self.index_k_buffer.shape[:-2], 1),
-                        dtype=torch.float32,
+                        (*self.index_k_buffer.shape[:-1], self.index_head_dim // 64, 2),
+                        dtype=torch.uint8,
                         device=self.device,
                     )
                     self.indexer_hadamard_128 = create_npu_hadamard_128(
@@ -840,13 +845,26 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
     def get_index_k_scale_buffer(self, layer_id: int):
         if self.layer_transfer_counter is not None:
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
-        return self.index_k_scale_buffer[self._get_indexer_slot(layer_id)]
+        # E8M0 view of the raw byte storage: (block_num, block_size, k_n, d/64, 2),
+        # the k_descale layout quant_lightning_indexer (v2) expects with
+        # quant_mode 3 and layout_k PA_BBND.
+        return self.index_k_scale_buffer[self._get_indexer_slot(layer_id)].view(
+            torch.float8_e8m0fnu
+        )
 
     def set_index_k_scale_buffer(self, layer_id: int, loc, scale):
+        # Scatter whole per-token scale rows (k_n, d/64, 2) so the MX block
+        # scales keep the layout quant_lightning_indexer (v2) reads back.
+        assert scale.element_size() == 1, (
+            "index_k scale must be a 1-byte (E8M0) MX scale, "
+            f"got dtype {scale.dtype}"
+        )
+        buf = self.index_k_scale_buffer[self._get_indexer_slot(layer_id)]
+        tail = buf.shape[2:]
         torch_npu.npu_scatter_nd_update_(
-            self.index_k_scale_buffer[self._get_indexer_slot(layer_id)].view(-1, 1),
+            buf.view(-1, *tail),
             loc.view(-1, 1),
-            scale.view(-1, 1),
+            scale.reshape(-1, *tail).view(torch.uint8),
         )
 
     # for disagg
