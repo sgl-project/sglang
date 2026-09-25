@@ -16,7 +16,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import Enum, auto
 from functools import cached_property, partial
-from typing import Callable, Dict, Optional, Tuple, Union
+from typing import Callable, Dict, List, Optional, Tuple, Union
 
 import msgspec
 import torch
@@ -1689,14 +1689,28 @@ def _reduce_and_redistribute_output_to_attn_tp_shards(
     return local_hidden_states
 
 
+def moe_cp_gathered_rows(forward_batch: ForwardBatch) -> Optional[List[int]]:
+    """The real rows each MoE-CP rank contributes when this batch's FFN input is
+    gathered across the MoE-CP group, or None when it is not: only a context
+    parallel extend with CP metadata gathers, and only when the group has more
+    than one rank. The batch is read first, so a batch that is not a CP extend
+    never reads the group."""
+    if (
+        forward_batch.forward_mode.is_context_parallel_extend()
+        and forward_batch.attn_cp_metadata is not None
+        and get_moe_cp_size() > 1
+    ):
+        return forward_batch.attn_cp_metadata.per_rank_actual_token
+    return None
+
+
 def _redistribute_input_to_moe_cp(
-    hidden_states: torch.Tensor, forward_batch: ForwardBatch, moe_cp_size: int
+    hidden_states: torch.Tensor, rows: List[int], moe_cp_size: int
 ) -> torch.Tensor:
     # Zigzag split can produce unequal token counts across CP ranks
     # (when seq_len % (cp_size * 2) != 0). NCCL allgather requires
     # equal input sizes, so pad to the max per-rank token count.
-    per_rank_tokens = forward_batch.attn_cp_metadata.per_rank_actual_token
-    max_tokens = max(per_rank_tokens)
+    max_tokens = max(rows)
     pad_size = max_tokens - hidden_states.shape[0]
     if pad_size > 0:
         hidden_states = torch.nn.functional.pad(hidden_states, [0, 0, 0, pad_size])
@@ -2240,16 +2254,10 @@ def _mlp_input_gather_moe_cp(
         hidden_states, residual, forward_batch, layernorm, context
     )
 
-    # Only active during prefill (context-parallel extend); decode keeps existing path.
-    moe_cp_size = get_moe_cp_size()
-    if (
-        moe_cp_size > 1
-        and hidden_states.shape[0] > 0
-        and forward_batch.forward_mode.is_context_parallel_extend()
-        and forward_batch.attn_cp_metadata is not None
-    ):
+    rows = moe_cp_gathered_rows(forward_batch)
+    if rows is not None and hidden_states.shape[0] > 0:
         hidden_states = _redistribute_input_to_moe_cp(
-            hidden_states, forward_batch, moe_cp_size
+            hidden_states, rows, get_moe_cp_size()
         )
 
     return hidden_states, residual
@@ -2291,14 +2299,13 @@ def _redistribute_output(
 
 
 def _redistribute_output_from_moe_cp(
-    hidden_states: torch.Tensor, forward_batch: ForwardBatch
+    hidden_states: torch.Tensor, rows: List[int]
 ) -> torch.Tensor:
     moe_cp_rank = get_moe_cp_rank()
     # The allgather was padded to max_tokens_per_rank (equal chunks).
     # Extract this rank's actual (non-padded) tokens from its chunk.
-    per_rank_tokens = forward_batch.attn_cp_metadata.per_rank_actual_token
-    max_tokens_per_rank = max(per_rank_tokens)
-    actual_local_tokens = per_rank_tokens[moe_cp_rank]
+    max_tokens_per_rank = max(rows)
+    actual_local_tokens = rows[moe_cp_rank]
     return hidden_states.narrow(
         0, moe_cp_rank * max_tokens_per_rank, actual_local_tokens
     ).contiguous()
@@ -2459,15 +2466,9 @@ class CommunicateSummableTensorPairFn:
         # Only scatter back during prefill; decode was never allgathered so no-op.
         # Safe w.r.t. empty tensors: same reasoning as _mlp_input_gather_moe_cp
         # — CP extend always has non-zero tokens per rank, and decode skips this path.
-        moe_cp_size = get_moe_cp_size()
-        if (
-            moe_cp_size > 1
-            and forward_batch.forward_mode.is_context_parallel_extend()
-            and forward_batch.attn_cp_metadata is not None
-        ):
-            hidden_states = _redistribute_output_from_moe_cp(
-                hidden_states, forward_batch
-            )
+        rows = moe_cp_gathered_rows(forward_batch)
+        if rows is not None:
+            hidden_states = _redistribute_output_from_moe_cp(hidden_states, rows)
 
         if context.attn_dp_size > 1:
             hidden_states = _to_local_tokens(
