@@ -680,6 +680,9 @@ class Envs:
     SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS = EnvBool(True)
     # Decode batches between SWA out-of-window evictions.
     SGLANG_SWA_EVICTION_INTERVAL = EnvInt(128)
+    # Free a chunked prefill's out-of-window SWA slots before its next chunk is
+    # sized rather than after it (False restores the old order).
+    SGLANG_SWA_EVICT_BEFORE_CHUNK_PLAN = EnvBool(True)
     # The tree-core registry falls back to Python for:
     # - Session-aware caching.
     # - C128 or other unsupported components.
