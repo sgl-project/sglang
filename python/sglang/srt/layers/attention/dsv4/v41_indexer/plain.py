@@ -16,43 +16,42 @@ from sglang.srt.layers.attention.dsv4.indexer import (
     topk_transform_paged_from_metadata,
 )
 
-from .caps import is_sm100_or_newer, use_deep_gemm_prefill
-from .deep_gemm_utils import (
+from .scoring import (
+    decode_scores,
     dense_prefill_topk,
     get_deep_gemm_decode_data,
     get_deep_gemm_prefill_data,
     get_flat_index_k,
     get_index_k_cache,
+    prefill_requests,
     quantize_index_q,
+    write_decode,
+    write_prefill,
 )
-from .inputs import (
+from .types import (
     CapturedPrefillInputs,
     DecodeInputs,
     PrefillInputs,
     Selection,
-)
-from .torch_utils import (
-    decode_scores,
-    prefill_requests,
-    write_decode,
-    write_prefill,
 )
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 
 
-class DenseIndexer:
+class PlainIndexer:
     def __init__(
         self,
         *,
         token_to_kv_pool: DeepSeekV4TokenToKVPool,
         req_to_token: torch.Tensor,
+        use_deep_gemm_prefill: bool,
+        use_deep_gemm_decode: bool,
     ):
         self.token_to_kv_pool = token_to_kv_pool
         self.req_to_token = req_to_token
-        self.use_deep_gemm_prefill = use_deep_gemm_prefill()
-        self.use_deep_gemm_decode = is_sm100_or_newer()
+        self.use_deep_gemm_prefill = use_deep_gemm_prefill
+        self.use_deep_gemm_decode = use_deep_gemm_decode
 
     def topk_prefill(self, inputs: PrefillInputs, out: Selection) -> None:
         if self.use_deep_gemm_prefill:

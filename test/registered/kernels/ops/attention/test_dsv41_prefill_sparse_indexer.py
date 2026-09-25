@@ -7,11 +7,11 @@ from typing import NamedTuple
 import msgspec
 import torch
 
-from sglang.kernels.ops.attention.dsv4.fp4_indexer import quantize_fp4_indexer_tensor
-from sglang.srt.layers.attention.dsv4.low_ratio_indexer.block_math import (
-    select_candidate_blocks,
+from sglang.kernels.ops.attention.dsv4.candidate_blocks import (
+    select_candidate_block_ids,
 )
-from sglang.srt.layers.attention.dsv4.low_ratio_indexer.deep_gemm_utils import (
+from sglang.kernels.ops.attention.dsv4.fp4_indexer import quantize_fp4_indexer_tensor
+from sglang.srt.layers.attention.dsv4.v41_indexer.scoring import (
     DeepGEMMPrefillData,
 )
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -115,15 +115,20 @@ def reference_blocks(case: Case) -> torch.Tensor:
     """[rows, blocks] bool: the torch block selection of the dense scores."""
     j = torch.arange(case.dense.shape[1], device=case.dense.device)
     scores = case.dense.masked_fill(j[None, :] >= case.lens[:, None], -torch.inf)
-    keep = select_candidate_blocks(
+    ids = select_candidate_block_ids(
         scores, case.lens[:, None], topk_blocks=TOPK_BLOCKS, block_size=BLOCK
+    ).to(torch.int64)
+    num_blocks = -(-scores.shape[1] // BLOCK)
+    keep = torch.zeros(
+        ids.shape[0], num_blocks + 1, dtype=torch.bool, device=ids.device
     )
-    return keep.unflatten(1, (-1, BLOCK)).any(-1)
+    keep.scatter_(1, ids.masked_fill(ids < 0, num_blocks), True)
+    return keep[:, :num_blocks]
 
 
 def publish_sparse(case: Case):
     """(the DeepGEMM sparse table, the source layer's own top-k)."""
-    from sglang.srt.layers.attention.dsv4.low_ratio_indexer.deep_gemm_backend import (
+    from sglang.srt.layers.attention.dsv4.v41_indexer.sparse_table import (
         publish_prefill_table,
     )
 
@@ -140,7 +145,7 @@ def publish_sparse(case: Case):
 
 
 def select_sparse(table, data: DeepGEMMPrefillData, k_cache: torch.Tensor):
-    from sglang.srt.layers.attention.dsv4.low_ratio_indexer.deep_gemm_backend import (
+    from sglang.srt.layers.attention.dsv4.v41_indexer.sparse_table import (
         select_prefill_table,
     )
 
@@ -153,7 +158,7 @@ def select_sparse(table, data: DeepGEMMPrefillData, k_cache: torch.Tensor):
 
 def publish_dense(case: Case):
     """(the CP implementation's block ids, the source layer's own top-k)."""
-    from sglang.srt.layers.attention.dsv4.low_ratio_indexer.deep_gemm_backend import (
+    from sglang.srt.layers.attention.dsv4.v41_indexer.dense_blocks import (
         _publish_prefill_blocks,
     )
 
@@ -168,7 +173,7 @@ def publish_dense(case: Case):
 
 
 def select_dense(blocks, case: Case):
-    from sglang.srt.layers.attention.dsv4.low_ratio_indexer.deep_gemm_backend import (
+    from sglang.srt.layers.attention.dsv4.v41_indexer.dense_blocks import (
         _consume_prefill_blocks,
     )
 
@@ -176,7 +181,7 @@ def select_dense(blocks, case: Case):
         data=case.data,
         kv=case.kv,
         topk=TOPK,
-        request_blocks=blocks,
+        blocks=blocks,
         block_size=BLOCK,
     )
 
@@ -192,7 +197,7 @@ def picks(positions: torch.Tensor, row: int) -> set:
 class TestPrefillSparseIndexer(CustomTestCase):
     @torch.inference_mode()
     def test_publish_prefill_is_the_torch_block_selection(self):
-        """The published blocks equal `select_candidate_blocks` block for block
+        """The published blocks equal `select_candidate_block_ids` block for block
         (ragged lengths, an empty row, block counts above and below 2048), and the
         source's own top-k from the same tiled pass is the dense one."""
         for rows, ctx in CASES:
@@ -256,6 +261,26 @@ class TestPrefillSparseIndexer(CustomTestCase):
         for r in range(tail):
             a, b = picks(full, rows - tail + r), picks(part, r)
             self.assertGreaterEqual(len(a & b), MIN_TAIL_OVERLAP * len(a), r)
+
+    def test_block_ids_tail_does_not_sync_the_host(self):
+        """The late-layer tail of published block ids is cut on the device
+        without a host sync while earlier work is still queued."""
+        from sglang.srt.layers.attention.dsv4.v41_indexer.dense_blocks import (
+            BlockIds,
+        )
+
+        busy = torch.randn(4096, 4096, device="cuda")
+        for _ in range(8):
+            busy = busy @ busy
+        blocks = torch.arange(40, dtype=torch.int32, device="cuda").view(20, 2)
+        ids = BlockIds(blocks=blocks, rows_per_request=[5, 0, 10, 5])
+        torch.cuda.set_sync_debug_mode("error")
+        try:
+            tail = ids.tail([2, 0, 3, 5])
+        finally:
+            torch.cuda.set_sync_debug_mode("default")
+        rows = [3, 4, 12, 13, 14, 15, 16, 17, 18, 19]
+        torch.testing.assert_close(tail.blocks, blocks[rows])
 
 
 if __name__ == "__main__":

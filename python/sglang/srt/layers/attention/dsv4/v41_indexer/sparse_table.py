@@ -1,4 +1,4 @@
-"""The candidate scheme on SM100, carried by a DeepGEMM sparse table.
+"""The candidate scheme carried by a DeepGEMM sparse table (SM100).
 
 A source publishes the block ids it kept plus the pool slots and the schedule
 ``fp8_fp4_paged_sparse_mqa_logits`` needs for them, and a consumer scores only
@@ -12,13 +12,16 @@ from typing import TYPE_CHECKING, List, Optional, Tuple
 import msgspec
 import torch
 
-from sglang.kernels.ops.attention.dsv4.candidate_blocks import candidate_row_lens
+from sglang.kernels.ops.attention.dsv4.candidate_blocks import (
+    amax_topk_blocks,
+    candidate_row_lens,
+    get_tail_row_indices,
+)
 from sglang.kernels.ops.attention.dsv4.candidate_table import (
     amax8_varlen,
     sort_candidate_blocks,
 )
 from sglang.kernels.ops.attention.dsv4.topk import (
-    plan_topk_v2,
     topk_transform_bf16_small,
     topk_transform_paged_v2,
     topk_transform_ragged_v2,
@@ -29,12 +32,7 @@ from sglang.srt.layers.attention.dsv4.indexer import (
 )
 from sglang.srt.layers.attention.dsv4.metadata import expand_index_page_table
 
-from .block_math import (
-    candidate_block_mask,
-    mask_topk_scores,
-    select_candidate_block_ids,
-)
-from .deep_gemm_utils import (
+from .scoring import (
     DeepGEMMDecodeData,
     DeepGEMMPrefillData,
     get_deep_gemm_decode_data,
@@ -43,7 +41,7 @@ from .deep_gemm_utils import (
     get_index_k_cache,
     score_tiles,
 )
-from .inputs import (
+from .types import (
     CandidateMetadata,
     DecodeInputs,
     PrefillInputs,
@@ -87,11 +85,11 @@ class _SparsePrefillTable(_SparseTable):
     topk_blocks: int
 
     def tail(self, rows_per_request: List[int]) -> _SparsePrefillTable:
-        rows, start = [], 0
-        for n, t in zip(self.rows_per_request, rows_per_request):
-            rows.append(torch.arange(start + n - t, start + n))
-            start += n
-        rows = torch.cat(rows).to(self.blocks.device)
+        rows = get_tail_row_indices(
+            full_rows_per_request=self.rows_per_request,
+            tail_rows_per_request=rows_per_request,
+            device=self.blocks.device,
+        )
         compress_lens = self.compress_lens[rows].contiguous()
         _, valid_lens = candidate_row_lens(compress_lens, self.topk_blocks)
         return _build_prefill_table(
@@ -107,19 +105,7 @@ class _SparsePrefillTable(_SparseTable):
         )
 
 
-class _DensePrefillBlocks(CandidateMetadata, msgspec.Struct):
-    request_blocks: List[torch.Tensor]
-
-    def tail(self, rows_per_request: List[int]) -> _DensePrefillBlocks:
-        return _DensePrefillBlocks(
-            request_blocks=[
-                blocks[blocks.shape[0] - length :]
-                for blocks, length in zip(self.request_blocks, rows_per_request)
-            ]
-        )
-
-
-class DeepGEMMCandidateBackend:
+class SparseTableBackend:
     def __init__(
         self,
         *,
@@ -369,90 +355,6 @@ class DeepGEMMCandidateBackend:
         return buf[:rows]
 
 
-class DeepGEMMCPCandidateBackend:
-    def __init__(
-        self,
-        *,
-        token_to_kv_pool: DeepSeekV4TokenToKVPool,
-        req_to_token: torch.Tensor,
-        candidate_topk_blocks: int,
-        candidate_block_size: int,
-    ) -> None:
-        self.token_to_kv_pool = token_to_kv_pool
-        self.req_to_token = req_to_token
-        self.topk_blocks = candidate_topk_blocks
-        self.block_size = candidate_block_size
-
-    def publish_prefill(self, inputs: PrefillInputs, out: Selection):
-        out.reset()
-        data = self._get_prefill_data(inputs)
-        if data is None:
-            return None
-        selected, request_blocks = _publish_prefill_blocks(
-            data=data,
-            kv=self._get_flat_index_k(inputs, data),
-            topk=inputs.indexer.index_topk,
-            topk_blocks=self.topk_blocks,
-            block_size=self.block_size,
-        )
-        data.write_selection(selected=selected, out=out)
-        return _DensePrefillBlocks(request_blocks)
-
-    def consume_prefill(
-        self,
-        inputs: PrefillInputs,
-        published: Optional[_DensePrefillBlocks],
-        out: Selection,
-    ) -> None:
-        out.reset()
-        data = self._get_prefill_data(inputs)
-        if data is None:
-            return
-        assert isinstance(published, _DensePrefillBlocks)
-        selected = _consume_prefill_blocks(
-            data=data,
-            kv=self._get_flat_index_k(inputs, data),
-            topk=inputs.indexer.index_topk,
-            request_blocks=published.request_blocks,
-            block_size=self.block_size,
-        )
-        data.write_selection(selected=selected, out=out)
-
-    def _get_prefill_data(self, inputs: PrefillInputs) -> Optional[DeepGEMMPrefillData]:
-        return get_deep_gemm_prefill_data(inputs, self.req_to_token)
-
-    def _get_flat_index_k(self, inputs: PrefillInputs, data: DeepGEMMPrefillData):
-        return get_flat_index_k(
-            data=data, token_to_kv_pool=self.token_to_kv_pool, layer_id=inputs.layer_id
-        )
-
-
-def amax_topk_blocks(
-    logits: torch.Tensor,
-    seq_lens: torch.Tensor,
-    nblocks: torch.Tensor,
-    topk_blocks: int,
-    max_seq_len: Optional[int] = None,
-) -> torch.Tensor:
-    """Per row the ``topk_blocks`` blocks of 8 positions with the largest block
-    maximum among its first ``seq_lens[b]`` positions, the newest block always
-    included: block ids in no particular order, ``-1`` past the row's count.
-    ``nblocks`` is ``ceil(seq_lens / 8)`` as int32."""
-    rows = logits.shape[0]
-    block = CANDIDATE_BLOCK_SIZE
-    if max_seq_len is None:
-        max_seq_len = logits.shape[1]
-    # NOTE: plan cannot be the previous kernel of topk_transform_paged_v2
-    plan = plan_topk_v2(nblocks)
-    # block maxima, the newest block +inf; the top-k reads each row up to nblocks
-    # only, so nothing past a row's keys is initialised (v2 needs stride % 4 == 0)
-    keys = logits.new_empty(rows, -(-max_seq_len // (4 * block)) * 4)
-    amax8_varlen(logits, seq_lens, out=keys)
-    blocks = torch.empty(rows, topk_blocks, dtype=torch.int32, device=logits.device)
-    topk_transform_paged_v2(keys, nblocks, None, blocks, 1, plan)
-    return blocks
-
-
 def build_sparse_schedule(
     blocks: torch.Tensor,
     seq_lens: torch.Tensor,
@@ -622,126 +524,3 @@ def select_prefill_table(
         CANDIDATE_BLOCK_SIZE,
     )
     out_positions.add_(torch.where(out_positions >= 0, data.request_starts[:, None], 0))
-
-
-def _publish_prefill_blocks(
-    *,
-    data: DeepGEMMPrefillData,
-    kv: Tuple[torch.Tensor, torch.Tensor],
-    topk: int,
-    topk_blocks: int,
-    block_size: int,
-) -> Tuple[torch.Tensor, List[torch.Tensor]]:
-    """The source layer's own plain top-k, plus the ids of its best blocks per
-    request: ``[rows_b, min(topk_blocks, ceil(lc_b / block_size))]`` int32 each."""
-    from sglang.kernels.ops.attention.dsv4 import topk_transform_ragged_v2
-
-    selected = data.empty_selection(topk)
-    device = data.request_starts.device
-    request_blocks = [
-        torch.empty(
-            (rows, min(topk_blocks, -(-lc // block_size))),
-            dtype=torch.int32,
-            device=device,
-        )
-        for rows, lc in zip(data.rows_per_request, data.lens_per_request)
-    ]
-    for tile, logits in score_tiles(data, kv, width_align=4):
-        _publish_tile_blocks(
-            data=data,
-            tile=tile,
-            logits=logits,
-            request_blocks=request_blocks,
-            block_size=block_size,
-        )
-        topk_transform_ragged_v2(
-            logits,
-            data.compress_lens[tile],
-            out_offsets=data.request_starts[tile],
-            out_indices=selected[tile],
-        )
-        # Free this tile's logits before the generator scores the next one.
-        del logits
-    return selected, request_blocks
-
-
-def _publish_tile_blocks(
-    *,
-    data: DeepGEMMPrefillData,
-    tile: slice,
-    logits: torch.Tensor,
-    request_blocks: List[torch.Tensor],
-    block_size: int,
-) -> None:
-    lens = data.compress_lens[tile]
-    for request, rows, request_rows, lc in _requests_in_tile(data, tile):
-        scores = logits[rows, :lc]
-        scores.masked_fill_(
-            torch.arange(lc, device=logits.device)[None, :] >= lens[rows, None],
-            -torch.inf,
-        )
-        blocks = request_blocks[request][request_rows]
-        blocks.copy_(
-            select_candidate_block_ids(
-                logits=scores,
-                compress_lens=lens[rows, None],
-                topk_blocks=blocks.shape[1],
-                block_size=block_size,
-            )
-        )
-
-
-def _consume_prefill_blocks(
-    *,
-    data: DeepGEMMPrefillData,
-    kv: Tuple[torch.Tensor, torch.Tensor],
-    topk: int,
-    request_blocks: List[torch.Tensor],
-    block_size: int,
-) -> torch.Tensor:
-    """A consumer's top-k over its dense scores masked to the published blocks."""
-    from sglang.kernels.ops.attention.dsv4 import topk_transform_ragged_v2
-
-    selected = data.empty_selection(topk)
-    for tile, logits in score_tiles(data, kv, width_align=4):
-        starts = data.request_starts[tile]
-        for request, rows, request_rows, lc in _requests_in_tile(data, tile):
-            logits[rows, :lc].masked_fill_(
-                ~candidate_block_mask(
-                    blocks=request_blocks[request][request_rows],
-                    width=lc,
-                    block_size=block_size,
-                ),
-                -torch.inf,
-            )
-        topk_transform_ragged_v2(
-            logits,
-            data.compress_lens[tile],
-            out_offsets=starts,
-            out_indices=selected[tile],
-        )
-        selected[tile] = mask_topk_scores(
-            scores=logits, indices=selected[tile], offsets=starts
-        )
-        # Free this tile's logits before the generator scores the next one.
-        del logits
-    return selected
-
-
-def _requests_in_tile(data: DeepGEMMPrefillData, tile: slice):
-    """``(request, rows, request_rows, lc)`` of each request with a visible
-    position and rows in ``tile``: its rows within the tile and within itself."""
-    start = 0
-    for request, (num_rows, lc) in enumerate(
-        zip(data.rows_per_request, data.lens_per_request)
-    ):
-        end = start + num_rows
-        begin, stop = max(start, tile.start), min(end, tile.stop)
-        if begin < stop and lc > 0:
-            yield (
-                request,
-                slice(begin - tile.start, stop - tile.start),
-                slice(begin - start, stop - start),
-                lc,
-            )
-        start = end

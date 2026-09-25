@@ -1,9 +1,9 @@
-"""What the attention backend hands a low-ratio indexer backend, and what it gets
+"""What the attention backend hands the V4.1 indexer backends, and what it gets
 back."""
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, List, Optional
+from typing import TYPE_CHECKING, List, Optional, Protocol, TypeVar
 
 import msgspec
 import torch
@@ -78,3 +78,39 @@ class CapturedPrefillInputs(msgspec.Struct, frozen=True, kw_only=True):
     q: torch.Tensor  # [rows, heads, 128] bf16, roped
     weights: torch.Tensor  # [rows, heads] bf16 head weights
     paged_metadata: PagedIndexerMetadata
+
+
+Metadata = TypeVar("Metadata", bound=CandidateMetadata)
+
+
+class PrefillCandidates(Protocol[Metadata]):
+    """The candidate scheme on prefill: what a publish carries is the backend's
+    own; the attention backend keeps it alive and hands it back unread."""
+
+    def publish_prefill(
+        self,
+        inputs: PrefillInputs,
+        out: Selection,
+    ) -> Optional[Metadata]: ...
+
+    def consume_prefill(
+        self,
+        inputs: PrefillInputs,
+        published: Optional[Metadata],
+        out: Selection,
+    ) -> None: ...
+
+
+class DecodeCandidates(Protocol[Metadata]):
+    def publish_decode(
+        self,
+        inputs: DecodeInputs,
+        out: Selection,
+    ) -> Optional[Metadata]: ...
+
+    def consume_decode(
+        self,
+        inputs: DecodeInputs,
+        published: Optional[Metadata],
+        out: Selection,
+    ) -> None: ...

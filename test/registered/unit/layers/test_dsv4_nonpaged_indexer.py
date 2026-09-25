@@ -917,8 +917,8 @@ class TestChunkedPagedDecode(CustomTestCase):
     chunks = [slice(0, 2), slice(2, 4), slice(4, 5)]
 
     def _inputs(self):
-        from sglang.srt.layers.attention.dsv4.low_ratio_indexer import DecodeInputs
-        from sglang.srt.layers.attention.dsv4.low_ratio_indexer.deep_gemm_utils import (
+        from sglang.srt.layers.attention.dsv4.v41_indexer import DecodeInputs
+        from sglang.srt.layers.attention.dsv4.v41_indexer.scoring import (
             DeepGEMMDecodeData,
         )
 
@@ -956,7 +956,7 @@ class TestChunkedPagedDecode(CustomTestCase):
         return inputs, data
 
     def _selection(self):
-        from sglang.srt.layers.attention.dsv4.low_ratio_indexer import Selection
+        from sglang.srt.layers.attention.dsv4.v41_indexer import Selection
 
         page_indices = torch.full((self.num_rows, 4), -1, dtype=torch.int32)
         return Selection(page_indices=page_indices, raw_indices=page_indices.clone())
@@ -982,12 +982,12 @@ class TestChunkedPagedDecode(CustomTestCase):
             self.assertIs(call.kwargs["topk_metadata"], plan)
 
     def test_candidate_publisher_takes_one_schedule_per_call(self):
-        from sglang.srt.layers.attention.dsv4.low_ratio_indexer import (
-            deep_gemm_backend as mod,
+        from sglang.srt.layers.attention.dsv4.v41_indexer import (
+            sparse_table as mod,
         )
 
         inputs, data = self._inputs()
-        backend = object.__new__(mod.DeepGEMMCandidateBackend)
+        backend = object.__new__(mod.SparseTableBackend)
         backend.token_to_kv_pool = None
         backend.topk_blocks = 2
         deep_gemm, topk = self._mocks()
@@ -1034,12 +1034,12 @@ class TestChunkedPagedDecode(CustomTestCase):
         event.record.assert_called_once_with(stream)
 
     def test_dense_decode_takes_one_schedule_per_call(self):
-        from sglang.srt.layers.attention.dsv4.low_ratio_indexer import (
-            dense_indexer as mod,
+        from sglang.srt.layers.attention.dsv4.v41_indexer import (
+            plain as mod,
         )
 
         inputs, data = self._inputs()
-        indexer = object.__new__(mod.DenseIndexer)
+        indexer = object.__new__(mod.PlainIndexer)
         indexer.token_to_kv_pool = None
         indexer.use_deep_gemm_decode = True
         deep_gemm, topk = self._mocks()
@@ -1055,33 +1055,35 @@ class TestChunkedPagedDecode(CustomTestCase):
 
 class TestCandidateIndexerGating(CustomTestCase):
     def test_candidate_indexer_gating(self):
-        from sglang.srt.layers.attention.dsv4 import low_ratio_indexer
-        from sglang.srt.layers.attention.dsv4.low_ratio_indexer.torch_backend import (
-            TorchCandidateBackend,
+        from sglang.srt.layers.attention.dsv4 import v41_indexer
+        from sglang.srt.layers.attention.dsv4.v41_indexer.dense_blocks import (
+            DenseBlocksBackend,
         )
 
         def sm100(value):
-            return patch.object(low_ratio_indexer, "is_sm100_or_newer", lambda: value)
+            return patch.object(v41_indexer, "is_sm100_or_newer", lambda: value)
 
         def make(topk_blocks, block_size):
-            return low_ratio_indexer.make_candidate_indexer(
-                token_to_kv_pool=None,
-                req_to_token=torch.zeros((1, 1), dtype=torch.int32),
-                page_size=256,
-                candidate_topk_blocks=topk_blocks,
-                candidate_block_size=block_size,
-            )
+            # The prefill choice reads the real DeepGEMM build and is cached.
+            with patch.object(v41_indexer, "_use_deep_gemm_prefill", lambda: False):
+                return v41_indexer.make_candidate_indexer(
+                    token_to_kv_pool=None,
+                    req_to_token=torch.zeros((1, 1), dtype=torch.int32),
+                    page_size=256,
+                    candidate_topk_blocks=topk_blocks,
+                    candidate_block_size=block_size,
+                )
 
         flag = "sglang.srt.layers.deep_gemm_wrapper.configurer.DEEPGEMM_PAGED_SPARSE_MQA_LOGITS"
         # V4 configs carry no candidate fields (0 / 0): no layer is a candidate
         # source, so Blackwell must not build the DeepGEMM backend for them.
-        # Hopper serves candidates on the portable backend.
+        # Hopper serves candidates on dense block ids.
         for is_sm100, topk_blocks, block_size in ((True, 0, 0), (False, 2048, 8)):
             with self.subTest(sm100=is_sm100, topk_blocks=topk_blocks):
                 with sm100(is_sm100), patch(flag, False):
-                    indexer = make(topk_blocks, block_size)
-                self.assertIsInstance(indexer.prefill, TorchCandidateBackend)
-                self.assertIsInstance(indexer.decode, TorchCandidateBackend)
+                    prefill, decode = make(topk_blocks, block_size)
+                self.assertIsInstance(prefill, DenseBlocksBackend)
+                self.assertIsInstance(decode, DenseBlocksBackend)
         # Blackwell without DeepGEMM's sparse logits fails instead of falling back.
         with sm100(True), patch(flag, False):
             with self.assertRaises(RuntimeError):
