@@ -9,6 +9,7 @@ from datetime import datetime
 from logging.handlers import TimedRotatingFileHandler
 from typing import List, Optional, Union
 
+import numpy as np
 import torch.distributed as dist
 
 
@@ -65,7 +66,7 @@ def log_json(
         "event": event,
         **data,
     }
-    msg = json.dumps(log_data, ensure_ascii=False)
+    msg = json.dumps(log_data, ensure_ascii=False, default=np.ndarray.tolist)
 
     if not isinstance(loggers, list):
         loggers = [loggers]

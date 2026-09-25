@@ -17,6 +17,8 @@ import dataclasses
 import logging
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Tuple, Union
 
+import numpy as np
+
 from sglang.srt.environ import envs
 from sglang.srt.utils.log_utils import create_log_targets, log_json
 
@@ -250,6 +252,9 @@ def _dataclass_to_string_truncated(
         else:
             return f"{repr(data)}"
     elif isinstance(data, (list, tuple)):
+        if any(isinstance(v, np.ndarray) for v in data):
+            # str() would print these rows as array(...) reprs, not as lists.
+            data = [v.tolist() if isinstance(v, np.ndarray) else v for v in data]
         if len(data) > max_length:
             half_length = max_length // 2
             return str(data[:half_length]) + " ... " + str(data[-half_length:])
@@ -295,6 +300,8 @@ def _transform_data_for_logging(
             half_length = max_length // 2
             return list(data[:half_length]) + ["..."] + list(data[-half_length:])
         return [_transform_data_for_logging(v, max_length) for v in data]
+    elif isinstance(data, np.ndarray):
+        return _transform_data_for_logging(data.tolist(), max_length)
     elif isinstance(data, dict):
         return {
             k: _transform_data_for_logging(v, max_length)
