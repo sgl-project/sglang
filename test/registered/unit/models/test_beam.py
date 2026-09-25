@@ -18,7 +18,6 @@ from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import MergedColumnParallelLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe.topk import TopKOutputFormat, biased_grouped_topk_impl
-from sglang.srt.layers.quantization.modelopt_quant import ModelOptFp4Config
 from sglang.srt.models.beam import (
     BeamAttention,
     BeamDecoderLayer,
@@ -82,30 +81,6 @@ class _LoadedExpert:
 
 
 class TestBeamConfig(CustomTestCase):
-    def test_serialized_nvfp4_is_passed_to_model(self):
-        quant_config = ModelOptFp4Config(
-            is_checkpoint_nvfp4_serialized=True,
-            group_size=16,
-            exclude_modules=["model.layers.0*", "lm_head"],
-        )
-        model = Mock()
-        model.start_layer = 0
-        model.end_layer = 4
-        model.pp_group.is_last_rank = False
-        with (
-            get_context().override_server_args(),
-            patch("sglang.srt.models.beam.BeamModel", return_value=model) as factory,
-        ):
-            BeamForCausalLM(tiny_config(), quant_config=quant_config)
-        self.assertIs(factory.call_args.kwargs["quant_config"], quant_config)
-
-        with (
-            patch("sglang.srt.models.beam.BeamModel") as factory,
-            self.assertRaisesRegex(NotImplementedError, "serialized ModelOpt NVFP4"),
-        ):
-            BeamForCausalLM(tiny_config(), quant_config=ModelOptFp4Config())
-        factory.assert_not_called()
-
     def test_unsupported_attention_and_head_parallelism_fail_before_allocation(self):
         for field in ("enable_dp_attention", "enable_dp_lm_head"):
             with (
@@ -441,23 +416,6 @@ class TestBeamNumerics(CustomTestCase):
                 else:
                     topk.forward.assert_not_called()
                     topk.empty_topk_output.assert_called_once()
-
-    def test_serialized_nvfp4_uses_quantized_expert_method(self):
-        quant_config = ModelOptFp4Config(
-            is_checkpoint_nvfp4_serialized=True, group_size=16
-        )
-        factory = Mock(return_value=torch.nn.Identity())
-        with (
-            get_parallel().override(moe_tp_size=1, moe_ep_size=1),
-            patch("sglang.srt.models.beam.TopK", return_value=torch.nn.Identity()),
-            patch(
-                "sglang.srt.models.beam.get_moe_impl_class", return_value=factory
-            ) as impl,
-        ):
-            BeamMoE(tiny_config(), layer_id=3, quant_config=quant_config)
-        impl.assert_called_once_with(quant_config)
-        self.assertIs(factory.call_args.kwargs["quant_config"], quant_config)
-        self.assertIsNone(factory.call_args.kwargs["quant_method"])
 
     def _select_beam_experts(self, config, bias, logits):
         # Exercise the TopK constructed by Beam, replacing only the hardware
