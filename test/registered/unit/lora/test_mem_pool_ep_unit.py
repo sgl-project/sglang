@@ -40,18 +40,8 @@ class _FakeFusedMoE(torch.nn.Module):
     pass
 
 
-def setUpModule():
-    global _fused_moe_patch
-    stub = types.ModuleType("sglang.srt.layers.moe.fused_moe_triton.layer")
-    stub.FusedMoE = _FakeFusedMoE
-    _fused_moe_patch = mock.patch.dict(
-        "sys.modules", {"sglang.srt.layers.moe.fused_moe_triton.layer": stub}
-    )
-    _fused_moe_patch.start()
-
-
-def tearDownModule():
-    _fused_moe_patch.stop()
+_FUSED_MOE_STUB = types.ModuleType("sglang.srt.layers.moe.fused_moe_triton.layer")
+_FUSED_MOE_STUB.FusedMoE = _FakeFusedMoE
 
 
 class _FakeBaseLayerWithLoRA:
@@ -126,7 +116,13 @@ class _FakeDenseLayer:
 
 
 def _load_lora_weight_to_buffer(pool, **kwargs):
-    with mock.patch.dict("sys.modules", {"sglang.srt.lora.layers": _LORA_LAYERS_STUB}):
+    with mock.patch.dict(
+        "sys.modules",
+        {
+            "sglang.srt.lora.layers": _LORA_LAYERS_STUB,
+            "sglang.srt.layers.moe.fused_moe_triton.layer": _FUSED_MOE_STUB,
+        },
+    ):
         return pool.load_lora_weight_to_buffer(**kwargs)
 
 
@@ -223,6 +219,21 @@ def _make_pool(
         pool._num_experts_local = num_experts_global // moe_ep_size
     else:
         pool._num_experts_local = num_experts_global
+    pool.num_layer = 1
+    pool.tp_rank = 0
+    pool.max_lora_rank = 2
+    pool.target_modules = {"down_proj"}
+    pool.experts_shared_outer_loras = False
+    pool.strict_loading = True
+    pool.lora_added_tokens_size = 0
+    pool.pin_memory_available = False
+    pool.enable_lora_overlap_loading = False
+    pool.base_model = torch.nn.Identity()
+    pool.embedding_A_buffer = {}
+    pool.embedding_B_buffer = {}
+    pool.lm_head_A_buffer = {}
+    pool.lm_head_B_buffer = {}
+    pool.new_embeddings_buffer = {}
     return pool
 
 
@@ -662,6 +673,9 @@ class TestIterLocalExpertWeightsTensor(unittest.TestCase):
             list(pool._iter_local_expert_weights(weights, "weights"))
 
 
+@mock.patch.dict(
+    "sys.modules", {"sglang.srt.layers.moe.fused_moe_triton.layer": _FUSED_MOE_STUB}
+)
 class TestStreamedInstall(unittest.TestCase):
     def setUp(self):
         self.pool = pool = _make_pool(
@@ -799,6 +813,9 @@ class TestStreamedInstall(unittest.TestCase):
                 self.assertTrue(torch.all(tensor == 0))
 
 
+@mock.patch.dict(
+    "sys.modules", {"sglang.srt.layers.moe.fused_moe_triton.layer": _FUSED_MOE_STUB}
+)
 class TestSharedMoeProductionLoad(unittest.TestCase):
     def test_unmarked_2d_shared_expert_uses_dense_buffers(self):
         pool = _make_pool(
@@ -807,16 +824,6 @@ class TestSharedMoeProductionLoad(unittest.TestCase):
             moe_ep_rank=0,
             moe_use_local_expert_ids=False,
         )
-        pool.num_layer = 1
-        pool.tp_rank = 0
-        pool.max_lora_rank = 2
-        pool.target_modules = {"down_proj"}
-        pool.experts_shared_outer_loras = False
-        pool.strict_loading = True
-        pool.lora_added_tokens_size = 0
-        pool.pin_memory_available = False
-        pool.enable_lora_overlap_loading = False
-        pool.base_model = torch.nn.Identity()
         pool.A_buffer = {
             "down_proj": [torch.full((1, 2, 3), -1.0)],
             "down_proj_shared_moe": [torch.full((1, 2, 2, 3), -7.0)],
@@ -825,11 +832,6 @@ class TestSharedMoeProductionLoad(unittest.TestCase):
             "down_proj": [torch.full((1, 5, 2), -1.0)],
             "down_proj_shared_moe": [torch.full((1, 1, 5, 2), -7.0)],
         }
-        pool.embedding_A_buffer = {}
-        pool.embedding_B_buffer = {}
-        pool.lm_head_A_buffer = {}
-        pool.lm_head_B_buffer = {}
-        pool.new_embeddings_buffer = {}
 
         down_a = torch.arange(6, dtype=torch.float32).reshape(2, 3)
         down_b = torch.arange(10, dtype=torch.float32).reshape(5, 2)
@@ -890,24 +892,10 @@ class TestSharedMoeProductionLoad(unittest.TestCase):
 
                 fused._map_global_expert_id_to_local_expert_id = local_id
                 pool.base_model = torch.nn.Sequential(fused)
-                pool.num_layer = 1
-                pool.tp_rank = 0
-                pool.max_lora_rank = 2
-                pool.target_modules = {"down_proj"}
-                pool.experts_shared_outer_loras = False
-                pool.strict_loading = True
-                pool.lora_added_tokens_size = 0
-                pool.pin_memory_available = False
-                pool.enable_lora_overlap_loading = False
                 n = pool._get_moe_pool_expert_dim(pool.base_model, 0)
                 self.assertEqual(n, 8 // ep_size + 1)
                 pool.A_buffer = {"down_proj_moe": [torch.full((2, n, 2, 3), -1.0)]}
                 pool.B_buffer = {"down_proj_moe": [torch.full((2, n, 5, 2), -1.0)]}
-                pool.embedding_A_buffer = {}
-                pool.embedding_B_buffer = {}
-                pool.lm_head_A_buffer = {}
-                pool.lm_head_B_buffer = {}
-                pool.new_embeddings_buffer = {}
                 for slot in range(2):
                     weights = {}
                     for expert, value in [
@@ -942,23 +930,12 @@ class TestSharedMoeProductionLoad(unittest.TestCase):
                         lora_lm_head_module=None,
                     )
                 for slot in range(2):
-                    self.assertTrue(
-                        torch.all(
-                            pool.A_buffer["down_proj_moe"][0][slot, -1] == 20 + slot
-                        )
-                    )
-                    self.assertTrue(
-                        torch.all(
-                            pool.B_buffer["down_proj_moe"][0][slot, -1]
-                            == (20 + slot) * 2.5
-                        )
-                    )
+                    a = pool.A_buffer["down_proj_moe"][0][slot]
+                    b = pool.B_buffer["down_proj_moe"][0][slot]
+                    self.assertTrue(torch.all(a[-1] == 20 + slot))
+                    self.assertTrue(torch.all(b[-1] == (20 + slot) * 2.5))
                     expected = 10 + slot if ep_rank == 0 else 0
-                    self.assertTrue(
-                        torch.all(
-                            pool.A_buffer["down_proj_moe"][0][slot, 0] == expected
-                        )
-                    )
+                    self.assertTrue(torch.all(a[0] == expected))
 
     def test_global_per_rank_shared_slots_are_rejected(self):
         pool = _make_pool(
@@ -967,7 +944,6 @@ class TestSharedMoeProductionLoad(unittest.TestCase):
             moe_ep_rank=0,
             moe_use_local_expert_ids=False,
         )
-        pool.experts_shared_outer_loras = False
         fused = _FakeFusedMoE()
         fused.layer_id = 0
         fused.num_fused_shared_experts = 1
@@ -985,15 +961,8 @@ class TestSharedMoeProductionLoad(unittest.TestCase):
             moe_ep_rank=3,
             moe_use_local_expert_ids=True,
         )
-        pool.num_layer = 1
-        pool.max_lora_rank = 2
         pool.target_modules = {"gate_up_proj", "down_proj"}
         pool.experts_shared_outer_loras = True
-        pool.strict_loading = True
-        pool.lora_added_tokens_size = 0
-        pool.pin_memory_available = False
-        pool.enable_lora_overlap_loading = False
-        pool.base_model = torch.nn.Identity()
         pool.A_buffer = {
             "gate_up_proj": [torch.full((1, 4, 5), -7.0)],
             "down_proj": [torch.full((1, 2, 3), -7.0)],
@@ -1006,11 +975,6 @@ class TestSharedMoeProductionLoad(unittest.TestCase):
             "gate_up_proj_shared_moe": [torch.full((1, 2, 6, 2), -1.0)],
             "down_proj_shared_moe": [torch.full((1, 1, 5, 2), -1.0)],
         }
-        pool.embedding_A_buffer = {}
-        pool.embedding_B_buffer = {}
-        pool.lm_head_A_buffer = {}
-        pool.lm_head_B_buffer = {}
-        pool.new_embeddings_buffer = {}
 
         gate_b = torch.arange(2 * 6 * 2, dtype=torch.float32).reshape(2, 6, 2)
         down_a = torch.arange(2 * 2 * 3, dtype=torch.float32).reshape(2, 2, 3)
@@ -1091,15 +1055,8 @@ class TestSharedMoeProductionLoad(unittest.TestCase):
                     moe_ep_rank=0,
                     moe_use_local_expert_ids=False,
                 )
-                pool.num_layer = 1
-                pool.max_lora_rank = 2
                 pool.target_modules = {"gate_up_proj", "down_proj"}
                 pool.experts_shared_outer_loras = True
-                pool.strict_loading = True
-                pool.lora_added_tokens_size = 0
-                pool.pin_memory_available = False
-                pool.enable_lora_overlap_loading = False
-                pool.base_model = torch.nn.Identity()
                 pool.A_buffer = {
                     f"gate_up_proj{suffix}": [torch.full((1, 1, 4, 5), -1.0)],
                     f"down_proj{suffix}": [torch.full((1, 2, 2, 3), -1.0)],
@@ -1108,11 +1065,6 @@ class TestSharedMoeProductionLoad(unittest.TestCase):
                     f"gate_up_proj{suffix}": [torch.full((1, 2, 6, 2), -1.0)],
                     f"down_proj{suffix}": [torch.full((1, 1, 5, 2), -1.0)],
                 }
-                pool.embedding_A_buffer = {}
-                pool.embedding_B_buffer = {}
-                pool.lm_head_A_buffer = {}
-                pool.lm_head_B_buffer = {}
-                pool.new_embeddings_buffer = {}
 
                 adapter = types.SimpleNamespace(
                     config=types.SimpleNamespace(r=2),
@@ -1374,6 +1326,9 @@ def _fake_base_model_with_hidden_dim(num_experts: int) -> torch.nn.Module:
     return _Model()
 
 
+@mock.patch.dict(
+    "sys.modules", {"sglang.srt.layers.moe.fused_moe_triton.layer": _FUSED_MOE_STUB}
+)
 class TestMoeBufferShardsByMoeTp(unittest.TestCase):
     """Regression: per-expert MoE LoRA buffers must shard by `moe_tp_size`,
     not the outer attention `tp_size`.
