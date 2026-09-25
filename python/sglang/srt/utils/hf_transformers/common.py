@@ -14,12 +14,15 @@
 """Shared helpers used by config, tokenizer, and processor modules."""
 
 import json
+import logging
 import os
 from pathlib import Path
 from typing import Any, Dict, Optional, Type, Union
 
 import torch
 from huggingface_hub import snapshot_download
+
+logger = logging.getLogger(__name__)
 
 from sglang.srt.configs import (
     AfmoeConfig,
@@ -493,7 +496,23 @@ def get_rope_config(config):
     """
     rope_params = getattr(config, "rope_parameters", None)
     if rope_params is not None:
-        rope_theta = rope_params.get("rope_theta", getattr(config, "rope_theta", 10000))
+        if "rope_theta" in rope_params:
+            rope_theta = rope_params["rope_theta"]
+        elif hasattr(config, "rope_theta"):
+            rope_theta = config.rope_theta
+        else:
+            # A rope_parameters dict without a base usually means a partial
+            # rope_scaling override replaced it wholesale (e.g. via
+            # --json-model-override-args). The model keeps generating fluent
+            # text with the wrong base, so say so instead of failing silently.
+            rope_theta = 10000
+            logger.warning(
+                "rope_parameters has no rope_theta and the config has no "
+                "top-level rope_theta; defaulting the RoPE base to %s. If this "
+                "checkpoint was trained with a different base, pass it inside "
+                "the rope override.",
+                rope_theta,
+            )
         return rope_theta, rope_params
     return getattr(config, "rope_theta", 10000), getattr(config, "rope_scaling", None)
 

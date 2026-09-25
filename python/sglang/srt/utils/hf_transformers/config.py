@@ -332,6 +332,19 @@ def get_config(
             if isinstance(value, dict) and isinstance(current, PretrainedConfig):
                 current.update(value)
             else:
+                if (
+                    key in ("rope_scaling", "rope_parameters")
+                    and isinstance(value, dict)
+                    and isinstance(current, dict)
+                ):
+                    # transformers v5 keeps the rope base inside rope_parameters
+                    # and assigning rope_scaling replaces the dict wholesale, so
+                    # a partial override (e.g. restating the checkpoint's own
+                    # scaling) would silently drop the base and get_rope_config
+                    # would fall back to 10000. Merge instead: override keys
+                    # win, keys absent from the override survive from the
+                    # loaded config.
+                    value = {**current, **value}
                 setattr(config, key, value)
 
     if is_gguf and not gguf_has_sidecar_config:
