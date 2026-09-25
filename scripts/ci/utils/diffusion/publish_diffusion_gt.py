@@ -495,8 +495,8 @@ def publish(source_dir, target_dir, branch):
 
     # Commit with retry (handle concurrent pushes)
     max_retries = 5
-    creating_branch = False
     for attempt in range(max_retries):
+        creating_branch = False
         try:
             base_sha, branch_exists = get_base_sha(REPO_OWNER, REPO_NAME, branch, token)
             tree_sha = get_tree_sha(REPO_OWNER, REPO_NAME, base_sha, token)
