@@ -42,7 +42,8 @@ class TestCargoWorkspace(CustomTestCase):
             f"--- stdout ---\n{proc.stdout}\n--- stderr ---\n{proc.stderr}",
         )
 
-    def test_cargo_test_workspace(self):
+    def setUp(self):
+        super().setUp()
         # Not skipUnless: cargo is a hard dependency of the editable install
         # (setuptools-rust builds sglang-grpc), so a missing toolchain is a
         # broken environment, and a silently-skipped CI test is worthless.
@@ -56,6 +57,7 @@ class TestCargoWorkspace(CustomTestCase):
             f"rust workspace manifest not found at {RUST_WORKSPACE}",
         )
 
+    def test_cargo_test_workspace(self):
         self._run_cargo(["test", "--workspace"], cwd=RUST_WORKSPACE)
         # Verify that the public crate builds with only its packaged inputs.
         self._run_cargo(
@@ -67,6 +69,14 @@ class TestCargoWorkspace(CustomTestCase):
                 "--allow-dirty",
                 "--offline",
             ],
+            cwd=RUST_WORKSPACE,
+        )
+
+    def test_cargo_test_renderer_http_feature(self):
+        # `--workspace` builds sglang-renderer without its non-default `http`
+        # feature, which gates the HTTP frontend and its tests.
+        self._run_cargo(
+            ["test", "-p", "sglang-renderer", "--features", "http"],
             cwd=RUST_WORKSPACE,
         )
 
