@@ -9,7 +9,9 @@ from sglang.kernels.ops.activation.activation import (
     SUPPORTED_ACTIVATIONS,
     relu2,
     run_activation,
+    silu_and_mul_with_activation_rounding,
 )
+from sglang.srt.utils import is_sm90_supported
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=20, stage="base-b-kernel-unit", runner_config="1-gpu-large")
@@ -237,6 +239,36 @@ def test_relu2_negative_inputs_zeroed() -> None:
     x = -torch.rand((64, 512), dtype=torch.bfloat16, device="cuda") - 1e-3
     out = relu2(x)
     assert torch.count_nonzero(out) == 0
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("limit", [0.0, 6.3, 10.0])
+@pytest.mark.skipif(not is_sm90_supported(), reason="Hopper rounding contract")
+def test_rounded_silu_clamp_graph(dtype, limit):
+    # Include all input bit patterns, especially eager rounding boundaries,
+    # infinities and NaNs; the activation must round before multiplying up.
+    values = (
+        torch.arange(65536, device="cuda", dtype=torch.int32)
+        .to(torch.int16)
+        .view(dtype)
+    )
+    x = torch.cat((values.view(-1, 32), values.roll(17953).view(-1, 32)), dim=1)
+
+    def reference():
+        gate, up = x.chunk(2, dim=-1)
+        if limit > 0:
+            gate = gate.clamp(max=limit)
+            up = up.clamp(-limit, limit)
+        return F.silu(gate) * up
+
+    actual = silu_and_mul_with_activation_rounding(x, clamp_limit=limit)
+    torch.testing.assert_close(actual, reference(), rtol=0, atol=0, equal_nan=True)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        silu_and_mul_with_activation_rounding(x, actual, clamp_limit=limit)
+    x.neg_()
+    graph.replay()
+    torch.testing.assert_close(actual, reference(), rtol=0, atol=0, equal_nan=True)
 
 
 if __name__ == "__main__":
