@@ -622,6 +622,9 @@ def _attn_input_update_and_read_residual(quant_format: str):
 
 
 class LayerCommunicator:
+    # Communicators built without __init__ (e.g. test doubles) publish no LoRA layout.
+    _publish_lora_layout: bool = False
+
     def __init__(
         self,
         layer_scatter_modes: LayerScatterModes,
