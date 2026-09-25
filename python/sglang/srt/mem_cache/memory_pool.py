@@ -2691,6 +2691,9 @@ class MHATokenToKVPool(KVCache):
             self._get_key_buffer(layer_id).unsqueeze(1),
             self._get_value_buffer(layer_id).unsqueeze(1),
             loc,
+            # Padded rows target the reserved slot 0, which attention reads back;
+            # skip it as the store_cache fallback does.
+            reserved_skip_index=0,
         )
 
     def set_kv_buffer(
@@ -5515,6 +5518,9 @@ class MHATokenToKOnlyPool(KVCache):
         if self.store_dtype != self.dtype:
             cache_k = cache_k.view(self.store_dtype)
         k_buffer = self.k_buffer[layer_id]
+        maybe_detect_oob(
+            loc, 0, self.size + self.page_size, "set_k_buffer (MHA K-only)"
+        )
         if _has_dense_kv_rows(cache_k, self.head_num, self.head_dim, loc.numel()):
             store_k_slots(
                 k_buffer,

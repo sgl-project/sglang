@@ -157,7 +157,8 @@ def store_k_slots_kernel(
 def store_k_slots(k_buffer: torch.Tensor, src: torch.Tensor, loc: torch.Tensor) -> None:
     """Scatter ``src[i]`` into slot-major ``k_buffer[loc[i]]`` in place, one launch.
 
-    Negative ``loc`` entries are skipped. The trailing ``(head_num, head_dim)`` dims must
+    Negative ``loc`` entries are skipped; the caller bounds the rest, as nothing here
+    checks ``loc < k_buffer.shape[0]``. The trailing ``(head_num, head_dim)`` dims must
     be contiguous, so the kernel can treat them as one flat axis.
     """
     if loc.numel() == 0:
@@ -174,6 +175,13 @@ def store_k_slots(k_buffer: torch.Tensor, src: torch.Tensor, loc: torch.Tensor) 
     )
     assert src.shape[0] == loc.numel(), (
         f"store_k_slots: src/loc batch mismatch: {src.shape[0]} vs {loc.numel()}"
+    )
+    assert loc.ndim == 1 and loc.is_contiguous(), (
+        f"store_k_slots: loc must be 1-D contiguous, got "
+        f"shape={tuple(loc.shape)}, stride={loc.stride()}"
+    )
+    assert loc.dtype in (torch.int32, torch.int64), (
+        f"store_k_slots: loc must be int32 or int64, got {loc.dtype}"
     )
     for name, t in (("k_buffer", k_buffer), ("src", src)):
         assert t.stride(-1) == 1 and t.stride(-2) == t.shape[-1], (

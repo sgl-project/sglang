@@ -27,6 +27,7 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.moe.moe_runner.triton_utils.moe_align_block_size import (
     moe_align_block_size,
 )
+from sglang.srt.utils.async_probe import maybe_detect_oob
 
 
 @triton.jit
@@ -288,6 +289,12 @@ def fused_moe_mxfp8_native(
     else:
         # No copy: from here on topk_ids is read, never written. Skipping the clamp
         # needs every id inside [0, local_num_experts) — see _needs_expert_filter.
+        maybe_detect_oob(
+            topk_ids,
+            0,
+            local_num_experts,
+            "fused_moe_mxfp8_native unclamped topk_ids",
+        )
         topk_ids = topk_ids.to(torch.int32)
 
     # Only the branches above can drop a route to -1.
