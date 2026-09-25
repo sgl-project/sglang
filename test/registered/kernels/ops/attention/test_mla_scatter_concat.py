@@ -1,4 +1,4 @@
-"""Representative parity coverage for the lightweight Kimi-K3 prerequisites."""
+"""MLA scatter and query concatenation parity."""
 
 import unittest
 
@@ -18,9 +18,6 @@ from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=20, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 
-NUM_EXPERTS = 896
-
-TOPK = 16
 
 NOPE_DIM = 512
 
@@ -58,7 +55,7 @@ def _make_mla_inputs(batch_size, num_heads, seed):
     )
 
 
-class TestKimiK3PrerequisiteOps(CustomTestCase):
+class TestMLAScatterConcat(CustomTestCase):
     def test_mla_scatter_concat_bf16_and_fp8(self):
         batch_size, num_heads = 64, 8
         pool, loc, k_nope, k_rope, q_nope, q_rope = _make_mla_inputs(

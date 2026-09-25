@@ -1,4 +1,4 @@
-"""Representative parity coverage for the lightweight Kimi-K3 prerequisites."""
+"""Image normalization and patchification parity."""
 
 import unittest
 
@@ -13,20 +13,8 @@ from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=10, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 
-NUM_EXPERTS = 896
 
-TOPK = 16
-
-NOPE_DIM = 512
-
-ROPE_DIM = 64
-
-MLA_DIM = NOPE_DIM + ROPE_DIM
-
-MLA_PAGES = 256
-
-
-class TestKimiK3PrerequisiteOps(CustomTestCase):
+class TestImagePatchify(CustomTestCase):
     def test_normalize_and_patchify(self):
         torch.manual_seed(5)
         image = torch.randn(2, 3, 17, 19, device="cuda")

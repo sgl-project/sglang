@@ -3,19 +3,14 @@ import unittest
 import torch
 
 from sglang.kernels.ops.quantization.fp8_kernel import per_token_group_quant_fp8
+from sglang.srt.utils import is_cuda
 from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.kernels.fp8 import TestFP8Base
 
-register_cuda_ci(est_time=9, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=4, stage="base-b", runner_config="1-gpu-large")
 
-from sglang.srt.utils import get_device, is_cuda, is_xpu
 
 _is_cuda = is_cuda()
-_is_xpu = is_xpu()
-
-device = get_device()
-
-
-from sglang.test.kernels.fp8 import TestFP8Base
 
 
 class TestPerTokenGroupQuantFP8(TestFP8Base):

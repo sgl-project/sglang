@@ -429,8 +429,11 @@ register_kernel(
     KernelSpec(
         op="gemm.linear_bf16_fp32",
         backend=KernelBackend.TORCH,
-        target="sglang.kernels.ops.gemm.bf16_fp32:linear_bf16_fp32",
-        capabilities=frozenset({CapabilityRequirement.CUDA, CapabilityRequirement.HIP}),
+        target="sglang.kernels.ops.gemm.bf16_fp32:_linear_bf16_fp32_cublas",
+        description=(
+            "Torch/cuBLAS implementation. The direct linear_bf16_fp32 entry also "
+            "retains its environment-controlled HPC-Ops, AITER and DeepGEMM dispatch."
+        ),
     )
 )
 register_kernel(
@@ -473,7 +476,7 @@ register_kernel(
         backend=KernelBackend.JIT,
         target="sglang.kernels.ops.gemm.fp8_blockwise_gemm:fp8_blockwise_scaled_mm",
         capabilities=frozenset(
-            {CapabilityRequirement.cuda(min_sm=(12, 0), max_sm=(12, 0))}
+            {CapabilityRequirement.cuda(min_sm=(12, 0), max_sm=(12, 9))}
         ),
     )
 )
@@ -483,7 +486,7 @@ register_kernel(
         backend=KernelBackend.JIT,
         target="sglang.kernels.ops.gemm.sm120_fp8_gemv:sm120_fp8_gemv",
         capabilities=frozenset(
-            {CapabilityRequirement.cuda(min_sm=(12, 0), max_sm=(12, 0))}
+            {CapabilityRequirement.cuda(min_sm=(12, 0), max_sm=(12, 9))}
         ),
     )
 )
@@ -516,7 +519,6 @@ register_kernel(
         op="gemm.w8a8_block_fp8_matmul",
         backend=KernelBackend.TRITON,
         target="sglang.kernels.ops.gemm.fp8_kernel:w8a8_block_fp8_matmul",
-        capabilities=frozenset({CapabilityRequirement.CUDA, CapabilityRequirement.HIP}),
     )
 )
 register_kernel(
@@ -548,7 +550,6 @@ register_kernel(
         op="gemm.triton_scaled_mm",
         backend=KernelBackend.TRITON,
         target="sglang.kernels.ops.gemm.fp8_kernel:triton_scaled_mm",
-        capabilities=frozenset({CapabilityRequirement.CUDA, CapabilityRequirement.HIP}),
     )
 )
 register_kernel(
@@ -556,6 +557,5 @@ register_kernel(
         op="gemm.w8a8_block_int8_matmul",
         backend=KernelBackend.TRITON,
         target="sglang.kernels.ops.gemm.int8_kernel:w8a8_block_int8_matmul",
-        capabilities=frozenset({CapabilityRequirement.CUDA, CapabilityRequirement.HIP}),
     )
 )

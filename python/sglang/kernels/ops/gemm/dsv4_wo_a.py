@@ -1,15 +1,10 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
-
 import torch
 import triton
 import triton.language as tl
 
 from sglang.kernels.ops.layernorm.mxfp8_epilogue import ue8m0_scale
-
-if TYPE_CHECKING:
-    pass
 
 
 @triton.jit

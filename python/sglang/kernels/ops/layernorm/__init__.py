@@ -578,6 +578,5 @@ register_kernel(
         op="layernorm.rms_normalize_triton",
         backend=KernelBackend.TRITON,
         target="sglang.kernels.ops.layernorm.rms_normalize_hip:rms_normalize_triton",
-        capabilities=frozenset({CapabilityRequirement.HIP}),
     )
 )

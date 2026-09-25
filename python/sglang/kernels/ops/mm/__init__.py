@@ -15,3 +15,11 @@ register_kernel(
         capabilities=frozenset({CapabilityRequirement.CUDA}),
     )
 )
+
+register_kernel(
+    KernelSpec(
+        op="mm.normalize_and_patchify",
+        backend=KernelBackend.TORCH,
+        target="sglang.kernels.ops.mm.process.image:_normalize_and_patchify_torch",
+    )
+)

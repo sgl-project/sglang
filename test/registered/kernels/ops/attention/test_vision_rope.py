@@ -1,4 +1,4 @@
-"""Representative parity coverage for the lightweight Kimi-K3 prerequisites."""
+"""Vision complex RoPE parity and input constraints."""
 
 import unittest
 
@@ -14,20 +14,8 @@ from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=20, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 
-NUM_EXPERTS = 896
 
-TOPK = 16
-
-NOPE_DIM = 512
-
-ROPE_DIM = 64
-
-MLA_DIM = NOPE_DIM + ROPE_DIM
-
-MLA_PAGES = 256
-
-
-class TestKimiK3PrerequisiteOps(CustomTestCase):
+class TestVisionRoPE(CustomTestCase):
     def test_vision_rope(self):
         torch.manual_seed(4)
         qkv = torch.randn(480, 3, 12, 128, device="cuda", dtype=torch.bfloat16)

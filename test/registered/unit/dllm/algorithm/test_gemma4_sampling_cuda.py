@@ -1,4 +1,4 @@
-"""CUDA numerical checks for DiffusionGemma's inference optimizations."""
+"""DiffusionGemma denoiser statistics and sampling parity."""
 
 import unittest
 
@@ -10,12 +10,13 @@ from sglang.srt.dllm.algorithm.gemma4_renoise import (
     _sample_denoiser,
 )
 from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=10, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
-class TestGemma4SamplingCUDA(unittest.TestCase):
+class TestGemma4SamplingCUDA(CustomTestCase):
     def test_full_vocabulary_statistics_and_sampling(self):
         generator = torch.Generator(device="cuda").manual_seed(123)
         for batch_size in (1, 3):

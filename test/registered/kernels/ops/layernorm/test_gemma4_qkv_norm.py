@@ -1,4 +1,4 @@
-"""CUDA numerical checks for DiffusionGemma's inference optimizations."""
+"""Packed QKV normalization parity for DiffusionGemma."""
 
 import unittest
 
@@ -6,12 +6,13 @@ import torch
 
 from sglang.kernels.ops.layernorm.gemma4_fused_ops import gemma_qkv_rmsnorm
 from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=10, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
-class TestGemma4SamplingCUDA(unittest.TestCase):
+class TestGemma4QKVNorm(CustomTestCase):
     def test_qkv_norm_with_full_and_sliding_head_dimensions(self):
         for num_q, num_kv, head_dim in ((8, 4, 256), (8, 1, 512)):
             with self.subTest(head_dim=head_dim):

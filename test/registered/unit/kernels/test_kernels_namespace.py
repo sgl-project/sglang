@@ -278,5 +278,28 @@ def test_reclassified_public_entry_points_are_inventoried():
             assert f"sglang.kernels.ops.{module}:{node.name}" in targets
 
 
+@pytest.mark.parametrize(
+    "op, sm, expected",
+    [
+        ("gemm.hopper_bf16_gemv", (9, 0), True),
+        ("gemm.hopper_bf16_gemv", (10, 0), False),
+        ("gemm.fp8_blockwise_scaled_mm", (12, 0), True),
+        ("gemm.fp8_blockwise_scaled_mm", (12, 1), True),
+        ("gemm.fp8_blockwise_scaled_mm", (10, 0), False),
+        ("attention.fused_rope_wo_a_bf16", (9, 0), False),
+        ("attention.fused_rope_wo_a_bf16", (10, 0), True),
+        ("attention.fused_rope_wo_a_bf16", (10, 3), True),
+        ("attention.fused_rope_wo_a_bf16", (12, 0), False),
+    ],
+)
+def test_registered_architecture_boundaries(op, sm, expected):
+    spec = K.registry.get_backend(op, KernelBackend.JIT)
+    platform = PlatformInfo(
+        device_type="cuda", cuda_arch_major=sm[0], cuda_arch_minor=sm[1]
+    )
+    assert K.capabilities_satisfied(spec.capabilities, platform) is expected
+    assert not K.capabilities_satisfied(spec.capabilities, _CPU)
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__]))

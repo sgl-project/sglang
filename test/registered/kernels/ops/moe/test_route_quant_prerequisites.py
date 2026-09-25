@@ -1,4 +1,4 @@
-"""Representative parity coverage for the lightweight Kimi-K3 prerequisites."""
+"""Expert routing, packed output, and quantization parity."""
 
 import unittest
 
@@ -18,14 +18,6 @@ register_cuda_ci(est_time=25, stage="base-b-kernel-unit", runner_config="1-gpu-l
 NUM_EXPERTS = 896
 
 TOPK = 16
-
-NOPE_DIM = 512
-
-ROPE_DIM = 64
-
-MLA_DIM = NOPE_DIM + ROPE_DIM
-
-MLA_PAGES = 256
 
 
 def _pack_topk_oracle(topk_ids, topk_weights):
@@ -74,7 +66,7 @@ def _route_oracle(
     return w.gather(1, by_id), ranked.gather(1, by_id).to(torch.int32)
 
 
-class TestKimiK3PrerequisiteOps(CustomTestCase):
+class TestRouteQuant(CustomTestCase):
     def test_moe_auxiliary_kernels(self):
         x = torch.randn(2, TOPK, 7168, device="cuda", dtype=torch.bfloat16)
         out = torch.empty(2, 7168, device="cuda", dtype=torch.bfloat16)

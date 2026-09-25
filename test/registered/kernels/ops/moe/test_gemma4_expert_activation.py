@@ -1,4 +1,4 @@
-"""CUDA numerical checks for DiffusionGemma's inference optimizations."""
+"""Expert activation parity for DiffusionGemma."""
 
 import unittest
 
@@ -6,12 +6,13 @@ import torch
 
 from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=15, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
-class TestGemma4SamplingCUDA(unittest.TestCase):
+class TestGemma4ExpertActivation(CustomTestCase):
     def test_expert_activation_matches_checkpoint(self):
         from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe import (
             fused_experts_impl,

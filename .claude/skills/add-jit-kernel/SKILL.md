@@ -501,6 +501,32 @@ def scale(src: torch.Tensor, factor: float, out: torch.Tensor | None = None) -> 
 
 ---
 
+## Register the public entry point (required)
+
+Add metadata in `python/sglang/kernels/ops/elementwise/__init__.py` so the
+operator appears in the registry without importing its implementation:
+
+```python
+from sglang.kernels.registry import register_kernel
+from sglang.kernels.spec import CapabilityRequirement, KernelBackend, KernelSpec
+
+register_kernel(
+    KernelSpec(
+        op="elementwise.scale",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.elementwise.scale:scale",
+        capabilities=frozenset({CapabilityRequirement.CUDA}),
+    )
+)
+```
+
+Record the devices the implementation actually supports; the CUDA-only scale
+example above does not imply that every JIT kernel is CUDA-only. Runtime and
+correctness tests import `scale` from `sglang.kernels.ops.elementwise.scale`.
+Do not import the implementation eagerly in the group initializer. When an
+existing `BaseFusedOp` owns the operation, add the implementation there instead
+of registering a second conflicting op/backend pair.
+
 ## Step 3 (optional): Tune JIT build flags
 
 If your kernel uses some math functions like `expf` or `sinf`, consider enabling `--use_fast_math` for better performance (with a potential precision tradeoff):

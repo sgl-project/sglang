@@ -334,7 +334,9 @@ register_kernel(
         op="attention.fused_rope_wo_a_bf16",
         backend=KernelBackend.JIT,
         target="sglang.kernels.ops.attention.dsv4.wo_a:fused_rope_wo_a_bf16",
-        capabilities=frozenset({CapabilityRequirement.cuda(min_sm=(10, 0))}),
+        capabilities=frozenset(
+            {CapabilityRequirement.cuda(min_sm=(10, 0), max_sm=(10, 9))}
+        ),
     )
 )
 register_kernel(

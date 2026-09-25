@@ -261,7 +261,6 @@ register_kernel(
         op="moe.gemma4_fused_routing",
         backend=KernelBackend.TRITON,
         target="sglang.kernels.ops.moe.gemma4_routing:gemma4_fused_routing",
-        capabilities=frozenset({CapabilityRequirement.CUDA}),
     )
 )
 register_kernel(

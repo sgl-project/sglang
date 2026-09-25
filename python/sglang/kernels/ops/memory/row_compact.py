@@ -1,17 +1,10 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
-
 import torch
 
 from sglang.kernels.jit.utils import (
     is_arch_support_pdl,
 )
-
-if TYPE_CHECKING:
-    pass
-
-
 from sglang.kernels.ops.elementwise.row_scale import _jit_row_scale_module
 
 

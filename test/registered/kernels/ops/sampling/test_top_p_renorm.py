@@ -1,4 +1,4 @@
-"""Representative parity coverage for the lightweight Kimi-K3 prerequisites."""
+"""Top-p probability renormalization parity."""
 
 import unittest
 
@@ -12,20 +12,8 @@ from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=5, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 
-NUM_EXPERTS = 896
 
-TOPK = 16
-
-NOPE_DIM = 512
-
-ROPE_DIM = 64
-
-MLA_DIM = NOPE_DIM + ROPE_DIM
-
-MLA_PAGES = 256
-
-
-class TestKimiK3PrerequisiteOps(CustomTestCase):
+class TestTopPRenorm(CustomTestCase):
     def test_top_p_renorm(self):
         torch.manual_seed(3)
         probs = torch.randn(3, 1024, device="cuda").softmax(-1)

@@ -1,4 +1,4 @@
-"""Representative parity coverage for the lightweight Kimi-K3 prerequisites."""
+"""Tiny GEMM variant parity."""
 
 import unittest
 
@@ -10,20 +10,8 @@ from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=5, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 
-NUM_EXPERTS = 896
 
-TOPK = 16
-
-NOPE_DIM = 512
-
-ROPE_DIM = 64
-
-MLA_DIM = NOPE_DIM + ROPE_DIM
-
-MLA_PAGES = 256
-
-
-class TestKimiK3PrerequisiteOps(CustomTestCase):
+class TestTinyGemmVariants(CustomTestCase):
     def test_tiny_gemm_variants(self):
         """Both K3 gate-projection shapes, one per kernel variant: N=144 is the
         tiny dimension for the first, K=128 for the second."""

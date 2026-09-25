@@ -1,4 +1,4 @@
-"""Representative parity coverage for the lightweight Kimi-K3 prerequisites."""
+"""ReplaySSM ring folding parity."""
 
 import unittest
 
@@ -15,20 +15,8 @@ from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 
-NUM_EXPERTS = 896
 
-TOPK = 16
-
-NOPE_DIM = 512
-
-ROPE_DIM = 64
-
-MLA_DIM = NOPE_DIM + ROPE_DIM
-
-MLA_PAGES = 256
-
-
-class TestKimiK3PrerequisiteOps(CustomTestCase):
+class TestReplaySSMRingFold(CustomTestCase):
     def test_replayssm_ring_fold(self):
         batch_size, num_steps = 8, 4
         num_value_heads, num_key_heads = 8, 2
