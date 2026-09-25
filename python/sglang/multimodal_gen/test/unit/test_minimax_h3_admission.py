@@ -466,6 +466,7 @@ def test_extra_high_quality_does_not_enable_h3_cache_dit():
             _explicit_fields={"quality"},
             enable_cache_dit=None,
             cache_dit_params=None,
+            enable_spectrum=False,
         )
     )
 
