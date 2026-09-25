@@ -99,6 +99,7 @@ from sglang.srt.eplb.expert_location_dispatch import (
 )
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.moe import (
+    get_moe_a2a_backend,
     get_moe_runner_backend,
     is_moe_input_scattered_across_dp_ranks,
 )
@@ -110,6 +111,7 @@ from sglang.srt.utils import (
     get_compiler_backend,
     is_cpu,
     is_cuda,
+    is_gfx95_supported,
     is_hip,
     is_musa,
     is_npu,
@@ -125,6 +127,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 _is_cuda = is_cuda()
 _is_hip = is_hip()
+_is_gfx95 = is_gfx95_supported()
 _is_cpu = is_cpu()
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_xpu = is_xpu()
@@ -149,6 +152,30 @@ _RENORMALIZE_SUM_EPSILON = 1e-20
 # default because it is a numerics-affecting change that must be validated with
 # an accuracy run before becoming the default.
 _skip_hip_pad_mask = get_bool_env_var("SGLANG_MORI_NO_PAD_MASK", "False")
+
+
+def _use_rocm_triton_softmax_topk(
+    hidden_states: torch.Tensor,
+    gating_output: torch.Tensor,
+    topk: int,
+    correction_bias: Optional[torch.Tensor],
+    num_fused_shared_experts: int,
+    packed_out: Optional[torch.Tensor],
+) -> bool:
+    """Use the lower-latency Triton router for Qwen3.5 decode-sized rows."""
+    return (
+        _use_aiter
+        and _is_gfx95
+        and hidden_states.shape[1] == 4096
+        and hidden_states.dtype == torch.bfloat16
+        and gating_output.shape[0] <= 128
+        and gating_output.shape[1] == 512
+        and gating_output.dtype == torch.bfloat16
+        and topk == 10
+        and correction_bias is None
+        and num_fused_shared_experts == 0
+        and packed_out is None
+    )
 
 
 if _is_cuda:
@@ -991,7 +1018,15 @@ def fused_topk(
     topk_ids = torch.empty(M, topk, dtype=torch.int32, device=hidden_states.device)
 
     if scoring_func == "softmax":
-        if _use_aiter:
+        use_rocm_triton = _use_rocm_triton_softmax_topk(
+            hidden_states,
+            gating_output,
+            topk,
+            correction_bias,
+            num_fused_shared_experts,
+            packed_out,
+        )
+        if _use_aiter and not use_rocm_triton:
             # Use fused_topk instead of topk_softmax to auto dispatch to the correct kernel
             topk_weights, topk_ids = aiter_fused_topk(
                 hidden_states,
@@ -1018,7 +1053,7 @@ def fused_topk(
                 num_token_non_padded=num_token_non_padded,
             )
         # ===== END TO BE REFACTORED ====
-        elif _is_cuda:
+        elif _is_cuda or use_rocm_triton:
             # Unified Triton router (subsumes the AOT topk_softmax CUDA kernel).
             from sglang.kernels.ops.moe.moe_fused_gate import (
                 moe_fused_gate as _jit_moe_fused_gate,
@@ -2205,6 +2240,7 @@ def _post_process_topk_ids(
     capture_routed_experts_if_allowed(topk_config, layer_id, topk_ids)
     recorder_topk_ids = None
     _fold_pad_into_append = False
+    recorder_was_fused = False
     if _is_cuda:
         # LP path: solve LP outside torch.compile (the solver contains an
         # EP all-reduce that can't run inside compiled regions).
@@ -2268,10 +2304,34 @@ def _post_process_topk_ids(
         )
         if not _fold_pad_into_append:
             _mask_topk_ids_padded_region(topk_ids, num_token_non_padded, fill_value=0)
+        if (
+            _is_hip
+            and envs.SGLANG_AITER_MEGA_EPLB_PREFILL_ONLY.get()
+            and envs.SGLANG_AITER_MEGA_EPLB_FUSED_MAP_RECORD.get()
+            and envs.SGLANG_AITER_MEGA_RANK_SYNC.get()
+            and layer_id is not None
+        ):
+            from sglang.srt.eplb.eplb_map_record_fused import (
+                eplb_map_and_record_fused,
+            )
+
+            if get_moe_a2a_backend().is_megamoe():
+                recorder = get_global_expert_distribution_recorder()
+                load_buffer = recorder.get_current_pass_count_buffer(layer_id)
+                if load_buffer is not None:
+                    fused_topk_ids = eplb_map_and_record_fused(
+                        topk_ids,
+                        expert_location_dispatch_info,
+                        load_buffer,
+                        num_token_non_padded,
+                    )
+                    if fused_topk_ids is not None:
+                        topk_ids = fused_topk_ids
+                        recorder_was_fused = True
         # The logical->physical remap is only meaningful when a real
         # expert-location mapping exists. With a trivial placement and EPLB off
         # the map is identity so the remap can be skipped safely.
-        if _eplb_remap_enabled():
+        if not recorder_was_fused and _eplb_remap_enabled():
             topk_ids = topk_ids_logical_to_physical(
                 topk_ids, expert_location_dispatch_info
             )
@@ -2280,7 +2340,7 @@ def _post_process_topk_ids(
         # That final pass re-zeros after any shared-expert append/remap, so a
         # second zeroing here would be redundant (zeroing is idempotent).
 
-    if recorder_topk_ids is None:
+    if recorder_topk_ids is None and not recorder_was_fused:
         recorder_topk_ids = topk_ids
 
     _aiter_append = num_fused_shared_experts > 0 and _use_aiter
@@ -2437,10 +2497,14 @@ def select_experts(
         info=expert_location_dispatch_info,
     )
 
+    # Only aiter_biased_grouped_topk wants the bias in the gating dtype. The JIT
+    # router returns before it in biased_grouped_topk_gpu and upcasts the bias
+    # in-register, so downcasting here would only buy it a per-call cast back.
     if (
         _use_aiter
         and use_grouped_topk
         and correction_bias is not None
+        and not envs.SGLANG_OPT_USE_JIT_KERNEL_GROUPED_TOPK.get()
         and dynamic_expert_bias is None
     ):
         correction_bias = topk_config.correction_bias_for_dtype(router_logits.dtype)
@@ -2674,9 +2738,10 @@ def select_experts(
         padded_rows_masked=padded_rows_masked,
     )
 
-    get_global_expert_distribution_recorder().on_select_experts(
-        topk_ids=recorder_topk_ids
-    )
+    if recorder_topk_ids is not None:
+        get_global_expert_distribution_recorder().on_select_experts(
+            topk_ids=recorder_topk_ids
+        )
 
     if packed_topk is not None:
         return StandardTopKOutputPacked(

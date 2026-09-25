@@ -19,7 +19,6 @@ from sglang.srt.beam_search.output import (
     pack_beam_search_output,
 )
 from sglang.srt.disaggregation.utils import DisaggregationMode
-from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import (
     BatchEmbeddingOutput,
@@ -53,7 +52,6 @@ class SchedulerOutputStreamer:
 
     send_to_detokenizer: zmq.Socket
     tree_cache: BasePrefixCache
-    ps: ParallelState
     server_args: ServerArgs
     is_generation: bool
     spec_algorithm: SpeculativeAlgorithm
@@ -376,8 +374,8 @@ class _GenerationStreamAccumulator:
     input_token_ids_logprobs_idx: Optional[list] = None
     output_token_ids_logprobs_val: Optional[list] = None
     output_token_ids_logprobs_idx: Optional[list] = None
-    output_token_sampling_mask: Optional[list] = None
-    output_token_sampling_logprobs: Optional[list] = None
+    output_token_sampling_mask: Optional[list[list[list[int]]]] = None
+    output_token_sampling_logprobs: Optional[list[list[float | list[float]]]] = None
     # Rust server mode: the Rust detokenizer reconstructs text/ids from the raw
     # output tokens itself and never consumes the scheduler's incremental-detok
     # offsets (decode_ids / read_offset), so that per-step bookkeeping is skipped.
