@@ -16,6 +16,99 @@ INDEX_K_SLOT_BYTES = INDEX_K_PAYLOAD_BYTES.value + INDEX_K_SCALE_BYTES.value
 
 
 @triton.jit
+def _finish_paged_indexer_topk_kernel(
+    Indices,
+    Scores,
+    Lengths,
+    Requests,
+    ReqTable,
+    Pages,
+    Raw,
+    BATCH: tl.constexpr,
+    K: tl.constexpr,
+    WIDTH: tl.constexpr,
+    OUT_WIDTH: tl.constexpr,
+    IDX_STRIDE: tl.constexpr,
+    SCORE_STRIDE: tl.constexpr,
+    TABLE_STRIDE: tl.constexpr,
+    PAGE_STRIDE: tl.constexpr,
+    RAW_STRIDE: tl.constexpr,
+    RATIO: tl.constexpr,
+    MASK_SCORES: tl.constexpr,
+    WRITE_RAW: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    row = tl.program_id(0)
+    col = tl.arange(0, BLOCK)
+    idx = tl.load(Indices + row * IDX_STRIDE + col, (row < BATCH) & (col < K), WIDTH)
+    if MASK_SCORES:
+        valid = (row < BATCH) & (col < K) & (idx >= 0) & (idx < WIDTH)
+        score = tl.load(Scores + row * SCORE_STRIDE + idx, valid, -float("inf"))
+        idx = tl.where(valid & (score > -float("inf")), idx, WIDTH)
+    idx = tl.sort(tl.where(idx >= 0, idx, WIDTH), descending=False)
+    length = tl.load(Lengths + row, row < BATCH, 0)
+    req = tl.load(Requests + row, row < BATCH, 0)
+    valid = (row < BATCH) & (col < K) & (idx < length)
+    slot = tl.load(
+        ReqTable + req.to(tl.int64) * TABLE_STRIDE + idx.to(tl.int64) * RATIO,
+        valid,
+        0,
+    )
+    tl.store(
+        Pages + row * PAGE_STRIDE + col,
+        tl.where(valid, slot.to(tl.int64) // RATIO, -1),
+        col < OUT_WIDTH,
+    )
+    if WRITE_RAW:
+        tl.store(
+            Raw + row * RAW_STRIDE + col, tl.where(valid, idx, -1), col < OUT_WIDTH
+        )
+
+
+def finish_paged_indexer_topk(
+    indices: torch.Tensor,
+    scores: torch.Tensor,
+    lengths: torch.Tensor,
+    req: torch.Tensor,
+    req_table: torch.Tensor,
+    page_indices: torch.Tensor,
+    raw_indices: torch.Tensor | None,
+    ratio: int,
+    mask_scores: bool,
+) -> None:
+    """Sort selected positions and map them to compressed KV slots.
+
+    Candidate consumers discard selected masked scores, including top-k underfill.
+    The entire output (including padded rows/columns) is written, with -1 padding.
+    """
+    if not page_indices.shape[0]:
+        return
+    _finish_paged_indexer_topk_kernel[(page_indices.shape[0],)](
+        indices,
+        scores,
+        lengths,
+        req,
+        req_table,
+        page_indices,
+        raw_indices,
+        lengths.numel(),
+        indices.shape[1],
+        scores.shape[1],
+        page_indices.shape[1],
+        indices.stride(0),
+        scores.stride(0),
+        req_table.stride(0),
+        page_indices.stride(0),
+        raw_indices.stride(0) if raw_indices is not None else 0,
+        ratio,
+        mask_scores,
+        raw_indices is not None,
+        triton.next_power_of_2(max(page_indices.shape[1], indices.shape[1])),
+        num_warps=4,
+    )
+
+
+@triton.jit
 def _select_group_value(group, v0, v1, v2, v3):
     return tl.where(
         group == 0,

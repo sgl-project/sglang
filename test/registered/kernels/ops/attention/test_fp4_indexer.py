@@ -15,6 +15,7 @@ from sglang.kernels.ops.attention.dsv4 import (
     fused_q_indexer_rope_hadamard_fp4_quant,
 )
 from sglang.kernels.ops.attention.dsv4.fp4_indexer import (
+    finish_paged_indexer_topk,
     fp4_index_logits_decode,
     fp4_index_logits_paged,
     quantize_fp4_indexer_tensor,
@@ -513,13 +514,20 @@ def test_fp4_paged_logits_replay(batch, ratio, width, masked):
         )
         indices = torch.empty((batch, k), dtype=torch.int32, device=q.device)
         topk_transform_paged_v2(scores, lengths, None, indices, 1, plan)
-        return scores, indices
+        pages = torch.empty((batch + 1, 528), dtype=torch.int32, device=q.device)[
+            :, :512
+        ]
+        raw = torch.empty_like(pages) if ratio == 1 else None
+        finish_paged_indexer_topk(
+            indices, scores, lengths, req, req_table, pages, raw, ratio, masked
+        )
+        return scores, indices, pages, raw
 
     for _ in range(3):
         run()
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        scores, indices = run()
+        scores, indices, pages, raw = run()
     for step, visible in enumerate([width, 0, 1, 63, 64, 65, width]):
         lens.copy_((visible - torch.arange(batch, device=q.device)).clamp_min(0))
         lengths.copy_(lens)
@@ -538,6 +546,9 @@ def test_fp4_paged_logits_replay(batch, ratio, width, masked):
             scores[:, :width][visible_mask], expected[visible_mask], atol=0, rtol=0
         )
         blocks = amax_topk_blocks(scores, lengths, (lengths + 7) // 8, 2048)
+        assert (pages[batch] == -1).all().item()
+        if raw is not None:
+            assert (raw[batch] == -1).all().item()
         for row, length in enumerate(lens.tolist()):
             selected = indices[row][indices[row] >= 0].long()
             assert selected.numel() == selected.unique().numel() == min(k, length)
@@ -548,6 +559,17 @@ def test_fp4_paged_logits_replay(batch, ratio, width, masked):
                 atol=0,
                 rtol=0,
             )
+            kept = (
+                selected[expected[row, selected] > -torch.inf] if masked else selected
+            )
+            kept = kept.sort().values
+            expected_pages = torch.full_like(pages[row], -1)
+            expected_pages[: kept.numel()] = slots[row, kept].to(torch.int32)
+            torch.testing.assert_close(pages[row], expected_pages, rtol=0, atol=0)
+            if raw is not None:
+                expected_raw = torch.full_like(raw[row], -1)
+                expected_raw[: kept.numel()] = kept.to(torch.int32)
+                torch.testing.assert_close(raw[row], expected_raw, rtol=0, atol=0)
             nblocks = (length + 7) // 8
             chosen = blocks[row][blocks[row] >= 0].long()
             assert chosen.numel() == chosen.unique().numel() == min(2048, nblocks)
