@@ -71,21 +71,9 @@ fn with_l1(
     max_memory_bytes: usize,
     counters: &Arc<L1Counters>,
 ) -> Result<CachedTokenizer> {
-    let (hits, misses, usage) = (
-        Arc::clone(counters),
-        Arc::clone(counters),
-        Arc::clone(counters),
-    );
+    let usage = Arc::clone(counters);
     Ok(CachedTokenizer::new(inner, specials, max_memory_bytes)?
         .with_extend(true)
-        .with_observer(
-            Arc::new(move || {
-                hits.hits.fetch_add(1, Ordering::Relaxed);
-            }),
-            Arc::new(move || {
-                misses.misses.fetch_add(1, Ordering::Relaxed);
-            }),
-        )
         .with_token_observer(Arc::new(move |u: CacheTokenUsage| {
             usage
                 .cached_tokens
@@ -124,15 +112,17 @@ fn encoder(
     Ok((create_tokenizer_from_file(path)?, EncodeBackend::Hf))
 }
 
-/// Special tokens an encode can be split after: atomic in BPE (`special`, not `normalized`)
-/// and not absorbing adjacent whitespace (`lstrip`/`rstrip`), so encoding each side separately
-/// yields the ids of encoding the whole.
+/// L1 matches literal spellings, so only unconditional, non-overlapping added tokens
+/// are safe boundaries. Consider all added tokens as competitors, including ordinary
+/// tokens that can consume a candidate spelling as part of a longer match.
 fn boundary_tokens(path: &str) -> Result<Vec<String>> {
     #[derive(serde::Deserialize)]
     struct AddedToken {
         content: String,
         #[serde(default)]
         special: bool,
+        #[serde(default)]
+        single_word: bool,
         normalized: Option<bool>,
         #[serde(default)]
         lstrip: bool,
@@ -150,18 +140,52 @@ fn boundary_tokens(path: &str) -> Result<Vec<String>> {
     let text = std::fs::read_to_string(path).with_context(|| format!("read {path}"))?;
     let parsed: TokenizerJson =
         serde_json::from_str(&text).with_context(|| format!("parse added_tokens in {path}"))?;
-    Ok(parsed
-        .added_tokens
+    let safe = |t: &AddedToken| {
+        t.special
+            && t.normalized == Some(false)
+            && !t.single_word
+            && !t.lstrip
+            && !t.rstrip
+            && !t.content.is_empty()
+    };
+    // HF also merges special-token declarations from the sibling config. A declaration
+    // there can change matching flags or introduce a token overlapping a JSON boundary.
+    // Match HF's treatment of this optional file: ignore missing/invalid config entries.
+    let config_tokens: Vec<AddedToken> = Path::new(path)
+        .parent()
+        .and_then(|dir| std::fs::read_to_string(dir.join("tokenizer_config.json")).ok())
+        .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+        .and_then(|config| config.get("added_tokens_decoder")?.as_object().cloned())
         .into_iter()
+        .flat_map(|tokens| tokens.into_values())
+        .filter_map(|value| serde_json::from_value::<AddedToken>(value).ok())
+        .filter(|t| t.special)
+        .collect();
+    let tokens = &parsed.added_tokens;
+    Ok(tokens
+        .iter()
+        .filter(|t| safe(t) && !suffix_overlaps(&t.content, &t.content))
         .filter(|t| {
-            t.special
-                && t.normalized == Some(false)
-                && !t.lstrip
-                && !t.rstrip
-                && !t.content.is_empty()
+            tokens.iter().chain(&config_tokens).all(|other| {
+                if other.content == t.content {
+                    return safe(other);
+                }
+                other.content.is_empty()
+                    || !(t.content.contains(&other.content)
+                        || other.content.contains(&t.content)
+                        || suffix_overlaps(&t.content, &other.content)
+                        || suffix_overlaps(&other.content, &t.content))
+            })
         })
-        .map(|t| t.content)
+        .map(|t| t.content.clone())
         .collect())
+}
+
+/// Whether a proper suffix of `left` can start `right` (including self-overlap).
+fn suffix_overlaps(left: &str, right: &str) -> bool {
+    left.char_indices()
+        .skip(1)
+        .any(|(start, _)| right.starts_with(&left[start..]))
 }
 
 /// Treat `source` as a filesystem path (rather than a HuggingFace repo id)
@@ -367,5 +391,137 @@ mod model_files_tests {
         let files = ModelFiles::open(tokenizer.to_str().unwrap());
         let error = files.json("config.json").unwrap_err();
         assert!(error.to_string().contains("config.json"));
+    }
+}
+
+#[cfg(test)]
+mod cache_tests {
+    use super::*;
+    use serde_json::{json, Value};
+
+    fn added(content: &str) -> Value {
+        json!({"content": content, "special": true, "single_word": false,
+            "normalized": false, "lstrip": false, "rstrip": false})
+    }
+
+    /// Keep an independent safe boundary so both the cold path and an actual cache hit
+    /// exercise the unsafe spelling. Compare each backend with its own uncached encoder.
+    fn check(mut tokens: Vec<Value>, config: Option<Value>, text: &str, keep_safe: bool) {
+        if keep_safe {
+            tokens.insert(0, added("[SAFE]"));
+        }
+        for (i, token) in tokens.iter_mut().enumerate() {
+            token["id"] = json!(257 + i);
+        }
+        let mut data: Value =
+            serde_json::from_str(include_str!("../../tests/fixtures/tiny_tokenizer.json")).unwrap();
+        data["model"]["type"] = json!("BPE");
+        data["added_tokens"] = tokens.into();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tokenizer.json");
+        std::fs::write(&path, data.to_string()).unwrap();
+        if let Some(config) = config {
+            std::fs::write(dir.path().join("tokenizer_config.json"), config.to_string()).unwrap();
+        }
+        let path = path.to_str().unwrap();
+        let expected_boundaries = if keep_safe { vec!["[SAFE]"] } else { vec![] };
+        assert_eq!(boundary_tokens(path).unwrap(), expected_boundaries);
+        let text = if keep_safe {
+            format!("[SAFE]{text}")
+        } else {
+            text.to_owned()
+        };
+        for backend in [TokenizerBackend::Hf, TokenizerBackend::Fast] {
+            let (plain, _) = load_with(
+                path,
+                TokenizerConfig {
+                    backend,
+                    l1_cache_mb: 0,
+                },
+            )
+            .unwrap();
+            let expected = encode(&plain, &text).unwrap();
+            let (cached, stats) = load_with(
+                path,
+                TokenizerConfig {
+                    backend,
+                    l1_cache_mb: 1,
+                },
+            )
+            .unwrap();
+            assert_eq!(
+                stats.backend(),
+                match backend {
+                    TokenizerBackend::Hf => EncodeBackend::Hf,
+                    TokenizerBackend::Fast => EncodeBackend::Fast,
+                }
+            );
+            for pass in 0..3 {
+                assert_eq!(
+                    encode(&cached, &text).unwrap(),
+                    expected,
+                    "{backend:?}, pass {pass}: {text}"
+                );
+            }
+            if keep_safe {
+                assert!(stats.l1_tokens().0 > 0, "must exercise a cache hit");
+            } else {
+                assert_eq!(stats.l1_state(), L1State::DisabledNoSpecials);
+                assert_eq!(stats.l1_tokens(), (0, 0));
+            }
+        }
+    }
+
+    #[test]
+    fn l1_excludes_whole_word_boundaries() {
+        let mut cat = added("cat");
+        cat["single_word"] = json!(true);
+        check(vec![cat], None, "catfish", true);
+    }
+
+    #[test]
+    fn l1_excludes_overlapping_added_tokens() {
+        check(
+            vec![added("<x>"), added("<x>long")],
+            None,
+            "<x>longtail",
+            true,
+        );
+        let mut ordinary = added("<x>long");
+        ordinary["special"] = json!(false);
+        check(vec![added("<x>"), ordinary], None, "<x>longtail", true);
+        check(
+            vec![added("<x>"), added(">tail")],
+            None,
+            "<x>tailmore",
+            true,
+        );
+        check(vec![added("aba")], None, "ababa!", true);
+        check(vec![added("猫猫")], None, "猫猫猫!", true);
+    }
+
+    #[test]
+    fn l1_checks_sibling_special_token_declarations() {
+        let mut cat = added("cat");
+        cat["single_word"] = json!(true);
+        check(
+            vec![added("cat")],
+            Some(json!({"added_tokens_decoder": {"258": cat}})),
+            "catfish",
+            true,
+        );
+        check(
+            vec![added("<x>")],
+            Some(json!({"added_tokens_decoder": {"259": added("<x>long")}})),
+            "<x>longtail",
+            true,
+        );
+    }
+
+    #[test]
+    fn l1_passes_through_without_safe_boundaries() {
+        let mut cat = added("cat");
+        cat["single_word"] = json!(true);
+        check(vec![cat], None, "catfish", false);
     }
 }

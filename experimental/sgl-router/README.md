@@ -237,15 +237,16 @@ flags make it cheaper:
   needs a `tokenizer.json` and falls back to `hf` when fastokens cannot load it.
 - `--tokenizer-l1-cache-mb N` caches prefix tokenizations at special-token
   boundaries, so a multi-turn chat encodes only the turns added since the
-  previous request. Boundaries are only special, non-normalized, non-stripping
-  added tokens, where split and whole encodes agree.
+  previous request. Boundaries are unconditional, non-normalized, non-stripping
+  special tokens with no overlapping added-token spellings. Unsafe candidates
+  are excluded; if none remain, encoding proceeds without the cache.
 
 On a ~69K-token DeepSeek-V4 chat, `hf` encodes in ~40 ms, `fast` in ~4 ms, and
 a new turn on a cached history in ~0.2 ms. The DeepSeek fixtures check every
-case under `hf`, `fast`, and `fast` with L1. `/metrics` reports the resolved
-choice (`sgl_router_tokenizer_backend`, `sgl_router_tokenizer_l1_state`) and the
-cache's effect (`sgl_router_tokenizer_l1_lookups_total`,
-`sgl_router_tokenizer_l1_tokens_total`).
+case under `hf`, `fast`, and `fast` with L1. Startup logs report the resolved
+backend and cache state. `/metrics` exposes only
+`sgl_router_tokenizer_l1_tokens_total{source="cached"|"encoded"}` to measure
+how much tokenization work the cache reuses.
 
 ## DeepSeek V4
 
