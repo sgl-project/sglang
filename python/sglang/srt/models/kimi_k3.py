@@ -1307,11 +1307,26 @@ class KimiK3MoE(nn.Module):
             and self.experts.moe_runner_config.activation == "situ"
         )
 
-    def _forward_routed(self, hidden_states, router_logits, routed_input, latent):
+    def _route_staged(self, hidden_states, router_logits, routed_input):
+        """Stage the fused route preparation and route; returns the topk output
+        and the routed input to feed the experts. Caller clears the handoff."""
         if self._route_quant_fuse_eligible:
             route_quant_handoff.stage(routed_input)
+        fuse_nvfp4 = self._nvfp4_preparation_covered(router_logits, routed_input)
+        if fuse_nvfp4:
+            route_quant_handoff.stage(routed_input, self.experts.w13_input_scale_quant)
+        topk_output = self.topk(hidden_states, router_logits)
+        if fuse_nvfp4 and not route_quant_handoff.ready(
+            routed_input, self.experts.w13_input_scale_quant
+        ):
+            routed_input = routed_input.to(hidden_states.dtype).contiguous()
+        return topk_output, routed_input
+
+    def _forward_routed(self, hidden_states, router_logits, routed_input, latent):
         try:
-            topk_output = self.topk(hidden_states, router_logits)
+            topk_output, routed_input = self._route_staged(
+                hidden_states, router_logits, routed_input
+            )
             with zero_copy_context.set_moe_output(latent):
                 expert_output = self.experts(routed_input, topk_output)
         finally:
@@ -1322,10 +1337,10 @@ class KimiK3MoE(nn.Module):
     def _nvfp4_preparation_covered(self, router_logits, routed_input):
         if not (
             self._defer_moe_finalize
+            and isinstance(self.experts.quant_method, ModelOptNvFp4FusedMoEMethod)
             and self.alt_stream is not None
             and self.fuse_ar_norm
             and k3_ar_fusion.enabled()
-            and k3_ar_fusion.finalize_push_fits(routed_input.shape[0])
             and self.gate.e_score_correction_bias is not None
         ):
             return False
@@ -1342,17 +1357,10 @@ class KimiK3MoE(nn.Module):
         FlashInferTrtllmDeferredFinalizeOutput triple (permuted gemm2 output,
         expanded_idx_to_permuted_idx, expert_weights) for the finalize-fused
         all-reduce."""
-        if self._route_quant_fuse_eligible:
-            route_quant_handoff.stage(routed_input)
-        fuse_nvfp4 = self._nvfp4_preparation_covered(router_logits, routed_input)
-        if fuse_nvfp4:
-            route_quant_handoff.stage(routed_input, self.experts.w13_input_scale_quant)
         try:
-            topk_output = self.topk(hidden_states, router_logits)
-            if fuse_nvfp4 and not route_quant_handoff.ready(
-                routed_input, self.experts.w13_input_scale_quant
-            ):
-                routed_input = routed_input.to(hidden_states.dtype).contiguous()
+            topk_output, routed_input = self._route_staged(
+                hidden_states, router_logits, routed_input
+            )
             return self.experts.forward_deferred_finalize(routed_input, topk_output)
         finally:
             route_quant_handoff.clear()

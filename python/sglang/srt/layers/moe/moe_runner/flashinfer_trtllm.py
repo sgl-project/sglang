@@ -1482,8 +1482,7 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
         hidden_states = torch.nn.functional.pad(hidden_states, (0, hidden_pad))
     prepared_nvfp4 = None
     if (
-        _deferred_finalize_enabled.get()
-        and hidden_pad == 0
+        hidden_pad == 0
         and hidden_states_scale is None
         and not quant_info.use_per_token_activation
     ):

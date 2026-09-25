@@ -1,7 +1,7 @@
 """Fused K3 MoE-front prep: radix routing + trtllm id pack + mxfp8 quant.
 
 One launch replaces the three tiny kernels between the K3 fused-front GEMM and
-the trtllm-gen routed-MoE op at decode batch sizes (route_radix -> triton
+the trtllm-gen routed-MoE op (route_radix -> triton
 (id<<16|bf16(w)) pack -> per_token_group_quant, ~7.5us busy + 2 extra launches
 per MoE layer with the SMs near idle). CTAs [0, M) run the route_radix body
 with the pack folded into its epilogue; CTAs [M, 2M) run the
@@ -38,10 +38,6 @@ if TYPE_CHECKING:
 _HIDDEN = 3584
 _GROUP_SIZE = 32
 _NUM_GROUPS = _HIDDEN // _GROUP_SIZE
-# Fusion trades the flat quant grid for one 224-thread CTA per token; that (and
-# the win itself, which is launch overhead) only makes sense at small decode
-# batches. Above the cap the callers run the unfused chain.
-_MAX_TOKENS = 64
 
 
 @cache_once
@@ -211,13 +207,12 @@ def route_quant_fused(
 
 
 def nvfp4_covered(scores, bias, topk, x, global_scale) -> bool:
-    """covered() plus the SM107 NVFP4 quantizer: M<=8, a one-element FP32
-    global scale, and FlashInfer's default FP4 fast math."""
+    """covered() plus the SM107 NVFP4 quantizer: a one-element FP32 global
+    scale and FlashInfer's default FP4 fast math."""
     return (
         covered(scores, bias, topk, x)
         and x.is_cuda
         and get_device_sm() == 107
-        and x.shape[0] <= 8
         and scores.device == bias.device == global_scale.device == x.device
         and global_scale.numel() == 1
         and global_scale.dtype == torch.float32
@@ -246,8 +241,8 @@ def route_quant_nvfp4(
 ):
     """Returns ``(weights [M, topk] fp32, ids [M, topk] int32, x_q [M, 1792]
     packed FP4, x_s [M, 224] linear fp8_e4m3)`` and fills ``metadata``
-    (allocate_metadata with FP32 weights). Caller must have checked
-    nvfp4_covered()."""
+    (allocate_metadata with FP32 weights) when given. Caller must have checked
+    nvfp4_covered(); metadata is only produced for M<=8."""
     M = x.shape[0]
     weights = torch.empty((M, topk), device=x.device, dtype=torch.float32)
     ids = torch.empty((M, topk), device=x.device, dtype=torch.int32)
@@ -262,7 +257,11 @@ def route_quant_nvfp4(
         x,
         x_q,
         x_s,
-        *[metadata[i] for i in (0, 1, 2, 3, 6, 7, 8)],
+        *(
+            [metadata[i] for i in (0, 1, 2, 3, 6, 7, 8)]
+            if metadata is not None
+            else [ids] * 7
+        ),
         _arrival_counter(x.device),
         global_scale.reshape(1),
         topk,

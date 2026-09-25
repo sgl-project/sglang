@@ -103,8 +103,10 @@ def try_route_quant_fused(
             gating_output, correction_bias, topk, x, scale
         ):
             return None
-        metadata = moe_route_quant_fused.allocate_metadata(
-            x.device, x.shape[0], torch.float32
+        metadata = (
+            moe_route_quant_fused.allocate_metadata(x.device, x.shape[0], torch.float32)
+            if x.shape[0] <= 8
+            else None
         )
         weights, ids, x_q, x_s = moe_route_quant_fused.route_quant_nvfp4(
             gating_output,
