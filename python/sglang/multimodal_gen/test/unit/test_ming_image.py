@@ -6,6 +6,8 @@ import pytest
 import torch
 from torch.nn import functional as F
 
+import sglang.multimodal_gen.runtime.models.dits.ming_image as ming_dit
+from sglang.kernels.ops.diffusion import BitExactFusionGate
 from sglang.multimodal_gen.configs.models.dits.ming_image import MingImageDitConfig
 from sglang.multimodal_gen.configs.pipeline_configs.ming_image import (
     MingImageLayerPipelineConfig,
@@ -201,6 +203,37 @@ def test_ming_norm_and_swiglu_preserve_reference_rounding():
     torch.testing.assert_close(norm(x), expected, rtol=0, atol=0)
     gate, up = x.chunk(2, -1)
     torch.testing.assert_close(MingSiluAndMul()(x), F.silu(gate) * up, rtol=0, atol=0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_ming_swiglu_fused_matches_bf16_eager(monkeypatch):
+    gate = BitExactFusionGate("Ming test SiLU-mul", per_signature=True)
+    monkeypatch.setattr(ming_dit, "_MING_SWIGLU_FUSION", gate)
+    torch.manual_seed(9)
+    x = torch.randn(1, 32, 256, dtype=torch.bfloat16, device="cuda")
+    a, b = x.chunk(2, dim=-1)
+    expected = F.silu(a) * b
+    actual = MingSiluAndMul()(x)
+    assert torch.equal(actual, expected)
+    assert gate.verified or gate.disabled
+    assert torch.equal(MingSiluAndMul()(x), expected)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_ming_swiglu_disables_fusion_on_mismatch(monkeypatch):
+    gate = BitExactFusionGate("Ming test SiLU-mul", per_signature=True)
+    monkeypatch.setattr(ming_dit, "_MING_SWIGLU_FUSION", gate)
+
+    def wrong_fused(x):
+        return torch.zeros(
+            (*x.shape[:-1], x.shape[-1] // 2), device=x.device, dtype=x.dtype
+        )
+
+    monkeypatch.setattr(ming_dit, "fused_packed_silu_mul_bitexact", wrong_fused)
+    x = torch.randn(1, 4, 128, dtype=torch.bfloat16, device="cuda")
+    a, b = x.chunk(2, dim=-1)
+    assert torch.equal(MingSiluAndMul()(x), F.silu(a) * b)
+    assert gate.disabled
 
 
 def test_padding_replacement_keeps_valid_rows_and_registers():
