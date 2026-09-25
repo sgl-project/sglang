@@ -31,6 +31,22 @@ When a cache miss occurs in L1 and L2, HiCache automatically fetches the require
 
 This integration is particularly valuable for production deployments involving long-context models, multi-turn conversations, and high-throughput serving scenarios where traditional caching approaches become capacity-constrained.
 
+### Decode context parallelism (DCP)
+
+Mooncake L3 supports DCP for MLA models with one materialized host KV pool
+using `layer_first`, `page_first`, or `page_first_direct`. GQA/MHA, extra
+host pools, split KV buffers, and separate KV scale buffers are not supported
+with DCP.
+
+Engines sharing DCP cache must use matching TP/DCP/PP/CP sizes and logical
+page sizes. Each DCP shard has its own key; equivalent MLA replicas reuse
+that key. For example, TP=4/DCP=2 stores two KV objects per logical page,
+with ranks 0 and 1 writing and ranks 2 and 3 reusing those shards.
+
+As with other MLA L3 sharing, use matching model settings, KV format, and
+host layout. KV format and host layout are not yet included in the keys;
+use different `extra_backend_tag` values when these differ.
+
 ## Install Mooncake
 
 **Method 1: with pip**
