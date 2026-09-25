@@ -11,7 +11,6 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.run_eval import run_eval
 from sglang.test.sgl_eval import (
     _print_truncated_samples,
     api_base_url,
@@ -65,14 +64,6 @@ class TestSglEvalAdapter(CustomTestCase):
             self.assertEqual(preview["text_chars"], len(response))
             self.assertTrue(preview["head"].startswith("start "))
             self.assertTrue(preview["tail"].endswith("end"))
-
-    def test_gsm8k_sgl_eval_opt_in_dispatches_to_adapter(self):
-        args = SimpleNamespace(eval_name="gsm8k", api="sgl_eval")
-        with patch(
-            "sglang.test.sgl_eval.run_sgl_eval", return_value={"score": 1}
-        ) as evaluate:
-            self.assertEqual(run_eval(args), {"score": 1})
-            evaluate.assert_called_once_with(args)
 
     def test_real_sgl_eval_chat_grading_and_metrics(self):
         self._check_chat_grading()

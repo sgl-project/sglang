@@ -2,10 +2,10 @@ import unittest
 from types import SimpleNamespace
 
 from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.run_eval import run_eval
 from sglang.test.server_fixtures.disaggregation_fixture import (
     PDDisaggregationServerBase,
 )
+from sglang.test.sgl_eval import run_sgl_eval
 
 register_cuda_ci(est_time=170, stage="extra-b", runner_config="4-gpu-b200")
 
@@ -50,12 +50,11 @@ class TestDisaggregationDWDPGptOss(PDDisaggregationServerBase):
         cls.launch_all()
 
     def test_gsm8k(self):
-        metrics = run_eval(
+        metrics = run_sgl_eval(
             SimpleNamespace(
                 base_url=self.base_url,
                 model=self.model,
                 eval_name="gsm8k",
-                api="sgl_eval",
                 num_examples=100,
                 max_tokens=4096,
                 num_threads=8,
