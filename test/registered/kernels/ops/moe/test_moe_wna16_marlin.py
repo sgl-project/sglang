@@ -684,5 +684,102 @@ def test_fused_marlin_moe_nvfp4_non_gated_matches_dequant_reference():
     torch.testing.assert_close(output, output_ref, rtol=0.05, atol=0.25)
 
 
+@pytest.mark.skipif(not is_sm90_supported(), reason="Hopper MXFP4 decode tile")
+@pytest.mark.parametrize("m", [1, 4])
+def test_mxfp4_tp8_gate_decode(m):
+    from sglang.srt.layers.quantization.marlin_utils_fp4 import (
+        _permute_moe_fp4_scales_for_marlin,
+        _repack_moe_fp4_weight_for_marlin,
+        mxfp4_marlin_process_scales,
+    )
+
+    torch.manual_seed(741 + m)
+    e, n, k, topk = 8, 640, 5120, 6
+    raw = torch.randint(0, 256, (e, n, k // 2), device="cuda", dtype=torch.uint8)
+    scale = torch.randint(
+        120, 126, (e, n, k // 32), device="cuda", dtype=torch.uint8
+    ).view(torch.float8_e8m0fnu)
+    packed = _repack_moe_fp4_weight_for_marlin(
+        raw,
+        num_experts=e,
+        size_n=n,
+        size_k=k,
+        perm=torch.empty(0, device="cuda", dtype=torch.int32),
+    )
+    sf = _permute_moe_fp4_scales_for_marlin(
+        scale.bfloat16(),
+        num_experts=e,
+        size_n=n,
+        size_k=k,
+        group_size=32,
+        process_scales=lambda s: mxfp4_marlin_process_scales(
+            s, input_dtype=torch.bfloat16
+        ),
+    )
+    fp4 = torch.tensor(
+        [0, 0.5, 1, 1.5, 2, 3, 4, 6, -0.0, -0.5, -1, -1.5, -2, -3, -4, -6],
+        device="cuda",
+        dtype=torch.float64,
+    )
+    codes = torch.stack((raw & 15, raw >> 4), dim=-1).reshape(e, n, k)
+    weights = fp4[codes.long()] * scale.double().repeat_interleave(32, -1)
+    x = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
+    ids = torch.rand(m, e, device="cuda").topk(topk, dim=1).indices.int()
+    topk_weights = torch.full((m, topk), 1 / topk, device="cuda")
+    sorted_ids, expert_ids, count = moe_align_block_size(ids, 8, e)
+    workspace = torch.zeros(
+        torch.cuda.get_device_properties(0).multi_processor_count * 4,
+        device="cuda",
+        dtype=torch.int32,
+    )
+
+    def run():
+        return _run_single_gemm(
+            moe_wna16_marlin_gemm,
+            x,
+            None,
+            packed,
+            sf,
+            None,
+            None,
+            None,
+            workspace,
+            sorted_ids,
+            expert_ids,
+            count,
+            topk_weights,
+            scalar_types.float4_e2m1f,
+            8,
+            topk,
+            m,
+            n,
+            k,
+            False,
+            True,
+            False,
+        )
+
+    run()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        actual = run()
+    for _ in range(2):
+        x.neg_()
+        graph.replay()
+        expected = torch.stack(
+            [
+                x[row].double() @ weights[expert].T
+                for row in range(m)
+                for expert in ids[row].tolist()
+            ]
+        )
+        torch.testing.assert_close(
+            actual.double(),
+            expected,
+            rtol=1 / 128,
+            atol=expected.square().mean().sqrt().item() * 1e-4,
+        )
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v", "-s"]))
