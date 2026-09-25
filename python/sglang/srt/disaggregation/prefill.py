@@ -666,6 +666,9 @@ class SchedulerDisaggregationPrefillMixin:
     def event_loop_normal_disagg_prefill(self: Scheduler) -> None:
         """A normal scheduler loop for prefill worker in disaggregation mode."""
         while True:
+            if self.gracefully_exit:
+                break
+
             # Receive requests
             self.ingest_requests()
             if self._engine_paused:
@@ -706,6 +709,9 @@ class SchedulerDisaggregationPrefillMixin:
         self.result_queue = deque()
 
         while True:
+            if self.gracefully_exit:
+                break
+
             # Receive requests
             self.ingest_requests()
             if self._engine_paused:

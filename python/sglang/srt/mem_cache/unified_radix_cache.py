@@ -1561,6 +1561,10 @@ class UnifiedRadixCache(BasePrefixCache):
         loop runs for leaves, reusable by component evictors ahead of an
         internal-state tombstone. Returns True once the backup is committed.
         """
+        # An auxiliary backup may already cover this node under another ack.
+        # Finish it before building a new transfer and claiming ack ownership.
+        if self.ongoing_write_through:
+            self.writing_check(write_back=True)
         written = self._execute_and_commit_kv_backup(
             BackupKV(node_ids=[node_id]), write_back=True
         )
