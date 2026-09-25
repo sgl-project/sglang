@@ -577,6 +577,9 @@ class DpFlags(_FlagGroupBase):
     # gather/scatter helpers, whose captured geometry needs one shared bucket.
     capturing_prefill_graph: bool = False
     prefill_graph_has_dp_gather: bool = False
+    # This process's slot in the target's DP sync while a draft scope narrows
+    # attention; dp_gather_width() also reads it as the in-scope marker.
+    scoped_gather_slot: Optional[int] = None
     # DP gathered-buffer allocation metadata (model hidden size / dtype /
     # device), set by initialize_dp_attention alongside the flags above.
     buffer_hidden_size: Any = None
@@ -660,9 +663,11 @@ class ForwardFlags:
         # fuse_mlp_allreduce: next residual+LN absorbs the post-MLP all-reduce.
         # mlp_reduce_scatter: postprocess will reduce-scatter (skip MLP AR).
         # flashinfer_trtllm_bypass: deepseek dual-stream graph topk bypass.
+        # defer_moe_finalize: next layer's fused collective absorbs the finalize.
         "fuse_mlp_allreduce": False,
         "mlp_reduce_scatter": False,
         "flashinfer_trtllm_bypass": False,
+        "defer_moe_finalize": False,
         # LayerNorm sequence parallelism region; see layers/layernorm_sp.py.
         "sp_active": False,
     }
@@ -679,6 +684,7 @@ class ForwardFlags:
             "fuse_mlp_allreduce",
             "mlp_reduce_scatter",
             "flashinfer_trtllm_bypass",
+            "defer_moe_finalize",
             "sp_active",
         }
     )
