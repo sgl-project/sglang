@@ -6,7 +6,13 @@ from unittest.mock import MagicMock, patch
 import torch
 
 from sglang.srt.layers import communicator as comm
-from sglang.srt.layers.boundary_layout import Layout, StageOutput, SumGroup
+from sglang.srt.layers.boundary_layout import (
+    Layout,
+    StageOutput,
+    SumGroup,
+    TokenAxis,
+    sequence_parallel_layer_sides,
+)
 from sglang.srt.layers.communicator import LayerCommunicator, ScatterMode
 from sglang.srt.layers.moe import (
     can_merge_post_experts_all_reduce,
@@ -19,6 +25,19 @@ from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
+
+
+def sp_region_steps():
+    """The steps a layer runs while a LayerNorm SP region is active."""
+    return comm._select_boundary_steps(
+        sequence_parallel_layer_sides(
+            axis_sizes={
+                TokenAxis.ATTN_DP: 1,
+                TokenAxis.ATTN_CP: 1,
+                TokenAxis.ATTN_TP_SCATTER: 2,
+            }
+        )
+    )
 
 
 def _fake_communicator(mlp_mode=ScatterMode.TP_ATTN_FULL):
@@ -329,7 +348,7 @@ class TestDeferFfnReduction(CustomTestCase):
         communicator = _fake_communicator()
         communicator.is_last_layer = is_last_layer
         communicator._postprocess_scatters_to_local_tokens = scatters_to_local_tokens
-        communicator._sp_region = sp_active
+        communicator._sp_steps = sp_region_steps() if sp_active else None
         communicator._ffn_output = StageOutput(
             Layout(frozenset()),
             group=SumGroup.MOE_OUTPUT,

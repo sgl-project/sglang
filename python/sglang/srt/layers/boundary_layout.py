@@ -102,6 +102,37 @@ class DecoderLayerSides(msgspec.Struct, frozen=True):
     output_rows: Layout
 
 
+def sequence_parallel_layer_sides(
+    *, axis_sizes: Mapping[TokenAxis, int]
+) -> DecoderLayerSides:
+    """A decoder layer while a LayerNorm SP region is active. Its linears
+    all-gather their input and reduce-scatter their output themselves, so the
+    layer's rows, its residual and both outputs stay on each TP rank's slice."""
+    attention = Layout.sharded_over(
+        TokenAxis.ATTN_DP, TokenAxis.ATTN_CP, axis_sizes=axis_sizes
+    )
+    local = Layout.sharded_over(
+        TokenAxis.ATTN_DP,
+        TokenAxis.ATTN_CP,
+        TokenAxis.ATTN_TP_SCATTER,
+        axis_sizes=axis_sizes,
+    )
+    gathers = frozenset({TokenAxis.ATTN_TP_SCATTER})
+    return DecoderLayerSides(
+        input_rows=local,
+        # qkv and gate_up gather the slices into their GEMM.
+        attention=StageInput(attention, gathers_itself=gathers),
+        # o_proj and down reduce-scatter out of theirs, whether fused or not.
+        attention_output=StageOutput(local),
+        ffn=StageInput(
+            Layout.sharded_over(axis_sizes=axis_sizes), gathers_itself=gathers
+        ),
+        ffn_output=StageOutput(local),
+        ffn_residual_rows=local,
+        output_rows=local,
+    )
+
+
 def decoder_layer_sides(
     *,
     axis_sizes: Mapping[TokenAxis, int],

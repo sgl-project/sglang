@@ -8,7 +8,13 @@ import torch
 
 import sglang
 from sglang.srt.layers import communicator as comm
-from sglang.srt.layers.boundary_layout import Layout, StageOutput, SumGroup
+from sglang.srt.layers.boundary_layout import (
+    Layout,
+    StageOutput,
+    SumGroup,
+    TokenAxis,
+    sequence_parallel_layer_sides,
+)
 from sglang.srt.layers.communicator import (
     LayerCommunicator,
     UnreducedOutput,
@@ -19,6 +25,19 @@ from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+
+
+def sp_region_steps():
+    """The steps a layer runs while a LayerNorm SP region is active."""
+    return comm._select_boundary_steps(
+        sequence_parallel_layer_sides(
+            axis_sizes={
+                TokenAxis.ATTN_DP: 1,
+                TokenAxis.ATTN_CP: 1,
+                TokenAxis.ATTN_TP_SCATTER: 2,
+            }
+        )
+    )
 
 
 def make_group(scale=3):
@@ -51,7 +70,7 @@ def make_communicator(
         return_value=reduce_scatter
     )
     communicator.is_last_layer = False
-    communicator._sp_region = False
+    communicator._sp_steps = None
     communicator._postprocess_scatters_to_local_tokens = scatters_to_local_tokens
     communicator._postprocess_dp_step = MagicMock(return_value=reduce_scatter_step)
     communicator.ffn_reduction_group = MagicMock(return_value=group or make_group())
@@ -284,7 +303,7 @@ class TestSelectFfnCompletion(CustomTestCase):
     ):
         communicator = LayerCommunicator.__new__(LayerCommunicator)
         communicator.is_last_layer = is_last_layer
-        communicator._sp_region = sp_region
+        communicator._sp_steps = sp_region_steps() if sp_region else None
         communicator._postprocess_scatters_to_local_tokens = scatters
         communicator._ffn_output = StageOutput(
             Layout(frozenset()),

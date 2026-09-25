@@ -45,6 +45,7 @@ from sglang.srt.layers.boundary_layout import (
     SumGroup,
     TokenAxis,
     decoder_layer_sides,
+    sequence_parallel_layer_sides,
 )
 from sglang.srt.layers.cp.utils import (
     is_mla_cp_active,
@@ -768,15 +769,21 @@ class LayerCommunicator:
             get_lora().enable_lora
         )
 
-        # Under LayerNorm SP the residual and norms run on this rank's sequence
-        # shard with no collectives while the region is active.
-        self._sp_region = layernorm_sp.layernorm_sp_enabled()
+        # Under LayerNorm SP, the steps the layer runs while the region is
+        # active; None without SP.
+        self._sp_steps = (
+            _select_boundary_steps(
+                sequence_parallel_layer_sides(axis_sizes=_token_axis_sizes())
+            )
+            if layernorm_sp.layernorm_sp_enabled()
+            else None
+        )
 
     def _declared_sides(self) -> Optional[DecoderLayerSides]:
         """The declarations this layer's boundaries are chosen from: an
-        attention and an FFN, without CP, LayerNorm SP or input-scattered
-        attention, in a layer whose previous layer is known. None when the
-        steps come from the scatter modes."""
+        attention and an FFN, without CP or input-scattered attention, in a
+        layer whose previous layer is known. None when the steps come from the
+        scatter modes. An active LayerNorm SP region has its own declarations."""
         modes = self.layer_scatter_modes
         parallel = get_parallel()
         # A MoE dispatched per DP shard computes on this rank's local rows and
@@ -785,18 +792,13 @@ class LayerCommunicator:
         if not (
             self._takes_declared_boundaries
             and parallel.attn_cp_size == 1
-            and not layernorm_sp.layernorm_sp_enabled()
             and not parallel.enable_attn_tp_input_scattered
             and not enable_moe_dense_fully_dp()
             and (modes.is_first_layer or modes.is_previous_layer_sparse is not None)
         ):
             return None
         return decoder_layer_sides(
-            axis_sizes={
-                TokenAxis.ATTN_DP: parallel.attn_dp_size,
-                TokenAxis.ATTN_CP: parallel.attn_cp_size,
-                TokenAxis.ATTN_TP_SCATTER: parallel.attn_tp_size,
-            },
+            axis_sizes=_token_axis_sizes(),
             ffn_on_local_rows=modes.is_layer_sparse and moe_on_local_rows,
             previous_on_local_rows=(
                 not modes.is_first_layer
@@ -991,7 +993,7 @@ class LayerCommunicator:
             hidden_states = owed.partial
         # The SP region opens at the first layer, re-evaluated per forward so a
         # crash mid-loop cannot leak into the next one.
-        if self._sp_region and self.layer_scatter_modes.is_first_layer:
+        if self._sp_steps is not None and self.layer_scatter_modes.is_first_layer:
             get_forward().set(
                 "sp_active", layernorm_sp.runs_sp(forward_batch.forward_mode)
             )
@@ -1021,17 +1023,20 @@ class LayerCommunicator:
         )
 
     def _in_sp_region(self) -> bool:
-        return self._sp_region and get_forward().sp_active
+        return self._sp_steps is not None and get_forward().sp_active
 
     def _finish_prepare_attn(self, hidden_states, residual, forward_batch):
-        """Tail every prepare_attn path must run, or ``attn_inputs`` is unset. In
-        the SP region the attention input stays on this rank's sequence shard."""
-        if not self._in_sp_region():
-            hidden_states = self._communicate_simple_fn(
-                hidden_states=hidden_states,
-                forward_batch=forward_batch,
-                context=self._context,
-            )
+        """Tail every prepare_attn path must run, or ``attn_inputs`` is unset."""
+        move = (
+            self._sp_steps.attention_input
+            if self._in_sp_region()
+            else self._communicate_simple_fn
+        )
+        hidden_states = move(
+            hidden_states=hidden_states,
+            forward_batch=forward_batch,
+            context=self._context,
+        )
         if self.qkv_latent_func is not None:
             attn_inputs = AttentionInputs(
                 hidden_states, forward_batch, self.qkv_latent_func
@@ -1175,7 +1180,7 @@ class LayerCommunicator:
     ):
         self.publish_mlp_lora_layout()
         if self._in_sp_region():
-            return _mlp_input_norm(
+            return self._sp_steps.ffn_input(
                 hidden_states,
                 residual,
                 forward_batch,
@@ -1207,7 +1212,12 @@ class LayerCommunicator:
         forward_batch: ForwardBatch,
     ):
         if self._in_sp_region():
-            return hidden_states, residual
+            return self._sp_steps.ffn_output_move(
+                hidden_states=hidden_states,
+                residual=residual,
+                forward_batch=forward_batch,
+                context=self._context,
+            )
         if self._postprocess_scatters_to_local_tokens:
             step = self._postprocess_dp_step(forward_batch) or _redistribute_output
             return _to_local_tokens(step, forward_batch, hidden_states), residual
@@ -1843,6 +1853,52 @@ def _sum_group(group: SumGroup) -> GroupCoordinator:
     return post_experts_reduction_group()
 
 
+def _token_axis_sizes() -> Dict[TokenAxis, int]:
+    parallel = get_parallel()
+    return {
+        TokenAxis.ATTN_DP: parallel.attn_dp_size,
+        TokenAxis.ATTN_CP: parallel.attn_cp_size,
+        TokenAxis.ATTN_TP_SCATTER: parallel.attn_tp_size,
+    }
+
+
+class BoundarySteps(msgspec.Struct, frozen=True):
+    """The steps one set of declarations chooses for a layer's boundaries:
+    into the attention, from the attention output to the FFN input, and the
+    FFN output on to the rows the layer hands on."""
+
+    attention_input: Callable
+    ffn_input: Callable
+    ffn_output_move: Callable
+
+
+def _select_boundary_steps(sides: DecoderLayerSides) -> BoundarySteps:
+    """The steps for declarations whose stage outputs are complete and stay
+    on the layer's rows, so no fused kernel and no FFN-exit decision takes part."""
+    returns_over_dp, ffn_output_move = _select_ffn_output_move(
+        sides.ffn_output, residual=sides.ffn_residual_rows, to=sides.output_rows
+    )
+    if (
+        returns_over_dp
+        or sides.attention_output.group is not None
+        or sides.ffn_output.group is not None
+    ):
+        raise NotImplementedError(f"{sides=}")
+    ffn_input, _ = _select_ffn_input(
+        sides.attention_output,
+        residual=sides.input_rows,
+        residual_to=sides.ffn_residual_rows,
+        need=sides.ffn,
+        force_layernorm_before_gather=False,
+        fusions=(),
+    )
+    return BoundarySteps(
+        attention_input=_select_attention_input_move(sides.input_rows, sides.attention),
+        ffn_input=ffn_input,
+        ffn_output_move=ffn_output_move,
+    )
+
+
 def _select_attention_input_move(rows: Layout, need: StageInput) -> Callable:
     """How the rows a layer takes become its attention's input: as they are,
     or gathered over attention TP from each rank's slice, unless the attention
@@ -1881,7 +1937,7 @@ def _select_ffn_input(
         SumGroup.ATTN_TP,
     ):
         raise NotImplementedError(f"{produced=}")
-    gathered = produced.layout.sharded - need.layout.sharded
+    gathered = produced.layout.sharded - need.layout.sharded - need.gathers_itself
     sliced = need.layout.sharded - produced.layout.sharded
     if sliced:
         # Each attention-TP rank takes its own slice: the reduce-scatter
@@ -1984,21 +2040,6 @@ def mlp_input_kind(
         and context.is_same_layout(residual_in, residual_out)
         and context.attn_tp_size == 1
     ):
-        return MlpInputKind.NORM
-    if (
-        hidden_in == ScatterMode.SCATTERED
-        and residual_in == ScatterMode.SCATTERED
-        and hidden_out == ScatterMode.SCATTERED
-        and residual_out == ScatterMode.SCATTERED
-    ):
-        # Megatron LayerNorm sequence parallelism (layers/layernorm_sp.py):
-        # activations stay sequence-sharded across the attn->mlp boundary, so
-        # there is nothing to gather or scatter here -- just the residual add
-        # plus LayerNorm on the local shard. The row-parallel o_proj already
-        # issued the reduce-scatter (g-bar) that the all-reduce would have
-        # done, and the g all-gather is fused into the next column-parallel
-        # linear. Distinct from the branch above because under pure TP
-        # attn_tp_size == tp_size > 1, so that gate does not fire.
         return MlpInputKind.NORM
     if hidden_in == ScatterMode.TP_ATTN_FULL and residual_in in (
         ScatterMode.SCATTERED,
