@@ -6,14 +6,9 @@ import atexit
 import logging
 import os
 
-from comfy import model_detection, model_management
-from comfy.patcher_extension import WrappersMP
-from comfy.utils import (
-    calculate_parameters,
-    load_torch_file,
-    state_dict_prefix_replace,
-    unet_to_diffusers,
-)
+from ..executors.flux import FluxExecutor
+from ..executors.minimax_h3 import MiniMaxH3Executor
+from ..executors.zimage import ZImageExecutor
 
 logger = logging.getLogger(__name__)
 
@@ -99,6 +94,8 @@ def _load_state_dict_for_detection(model_path: str):
             for key in handle.keys():
                 sd[key] = _HeaderTensor(handle.get_slice(key).get_shape())
         return sd
+    from comfy.utils import load_torch_file
+
     return load_torch_file(model_path)
 
 
@@ -109,22 +106,23 @@ except ImportError:
         "Error: sglang.multimodal_gen is not installed. Please install it using 'pip install sglang[diffusion]'"
     )
 
-from ..executors import (
-    FluxExecutor,
-    MiniMaxH3Executor,
-    QwenImageEditExecutor,
-    QwenImageExecutor,
-    ZImageExecutor,
-)
-from .model_patcher import SGLDModelPatcher
 
-_EXECUTOR_CLASSES = (
-    FluxExecutor,
-    ZImageExecutor,
-    QwenImageExecutor,
-    QwenImageEditExecutor,
-    MiniMaxH3Executor,
-)
+def _load_executor_classes():
+    """Qwen adapters import ComfyUI. Keep them optional so CI can load the rest."""
+    classes = [FluxExecutor, ZImageExecutor, MiniMaxH3Executor]
+    try:
+        from ..executors.qwen_image import QwenImageEditExecutor, QwenImageExecutor
+    except ModuleNotFoundError as exc:
+        missing = exc.name or ""
+        if not missing.startswith("comfy"):
+            raise
+        logger.info("ComfyUI is not installed; Qwen image executors are unavailable")
+    else:
+        classes.extend([QwenImageExecutor, QwenImageEditExecutor])
+    return tuple(classes)
+
+
+_EXECUTOR_CLASSES = _load_executor_classes()
 
 
 _SHARED = None
@@ -322,6 +320,13 @@ class SGLDiffusionGenerator:
         dtype = model_options.get("dtype", None)
         # Header-only read: H3 BF16 is ~66GB and we only need keys + shapes
         # for detect_unet_config. SGLD loads the real weights later.
+        from comfy import model_detection, model_management
+        from comfy.utils import (
+            calculate_parameters,
+            state_dict_prefix_replace,
+            unet_to_diffusers,
+        )
+
         sd = _load_state_dict_for_detection(model_path)
         diffusion_model_prefix = model_detection.unet_prefix_from_state_dict(sd)
         temp_sd = state_dict_prefix_replace(
@@ -435,6 +440,11 @@ class SGLDiffusionGenerator:
         self.executor._sgld_reload = reload_kwargs
         self.executor._ensure_runtime = self.ensure_executor
         comfyui_model.diffusion_model = self.executor
+
+        from comfy import model_management
+        from comfy.patcher_extension import WrappersMP
+
+        from .model_patcher import SGLDModelPatcher
 
         load_device = model_management.get_torch_device()
         offload_device = model_management.unet_offload_device()
