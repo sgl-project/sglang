@@ -1230,7 +1230,11 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     def moe_num_token_non_padded(self) -> Optional[torch.Tensor]:
         """Bound for masking a sparse MoE's padded rows, or None when the MoE
         input is a gathered buffer whose real rows are not a prefix of it."""
-        from sglang.srt.layers.communicator import ScatterMode, sparse_mlp_scatter_mode
+        from sglang.srt.layers.communicator import (
+            ScatterMode,
+            moe_cp_gathered_rows,
+            sparse_mlp_scatter_mode,
+        )
 
         if self.num_token_non_padded is None:
             return None
@@ -1239,7 +1243,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         if mode == ScatterMode.SCATTERED:
             # a2a dispatch, FP4 all-gather and dwdp all route the local shard.
             return self.num_token_non_padded
-        if mode == ScatterMode.MOE_FULL and self._moe_input_gathered_across_moe_cp():
+        if mode == ScatterMode.MOE_FULL and moe_cp_gathered_rows(self) is not None:
             return None
         # DSA / MLA CP take the FULL mode but all-gather across CP on a prefill,
         # which leaves the real rows zigzag-permuted rather than in a prefix.
@@ -1254,16 +1258,6 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             return self.num_token_non_padded
         # None under cuda-graph replay: its static batch carries no GLOBAL count.
         return self.global_num_token_non_padded
-
-    def _moe_input_gathered_across_moe_cp(self) -> bool:
-        from sglang.srt.layers.dp_attention import get_moe_cp_size
-
-        # Mirrors the communicator's MOE_FULL gather guard: decode stays FULL.
-        return (
-            self.forward_mode.is_context_parallel_extend()
-            and self.attn_cp_metadata is not None
-            and get_moe_cp_size() > 1
-        )
 
     def _moe_input_gathered_across_cp(self) -> bool:
         from sglang.srt.layers.attention.dsa.utils import dsa_use_prefill_cp
