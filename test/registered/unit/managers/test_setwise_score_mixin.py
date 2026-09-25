@@ -409,12 +409,14 @@ class TestSingleItemScoringResults(CustomTestCase):
     def test_multi_position_score_rows_preserves_list_values_without_softmax(self):
         # No softmax returns the original list as-is (no float round-trip).
         emb = [[0.1, 0.2], [0.3, 0.4]]
-        rows = self.h._multi_position_score_rows(emb, apply_softmax=False)
+        rows = self.h._multi_position_score_rows(
+            emb, apply_softmax=False, temperature=1.0
+        )
         self.assertIs(rows, emb)
 
     def test_multi_position_score_rows_softmax_over_labels(self):
         rows = self.h._multi_position_score_rows(
-            [[0.0, 0.0], [2.0, 2.0]], apply_softmax=True
+            [[0.0, 0.0], [2.0, 2.0]], apply_softmax=True, temperature=1.0
         )
         for row in rows:
             self.assertAlmostEqual(sum(row), 1.0, places=5)
@@ -422,7 +424,9 @@ class TestSingleItemScoringResults(CustomTestCase):
 
     def test_multi_position_score_rows_rejects_non_matrix(self):
         with self.assertRaisesRegex(ValueError, "expected a 2-D"):
-            self.h._multi_position_score_rows([0.1, 0.2], apply_softmax=False)
+            self.h._multi_position_score_rows(
+                [0.1, 0.2], apply_softmax=False, temperature=1.0
+            )
 
     def test_multi_position_phs_matrix_rejects_row_count_mismatch(self):
         with self.assertRaisesRegex(ValueError, "one row per score position"):

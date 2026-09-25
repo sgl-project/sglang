@@ -24,8 +24,10 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 class ScoringManager(TokenizerManagerScoreMixin):
     """Replace only model execution; keep request construction and score extraction real."""
 
-    def __init__(self, enable_mis=False, generation=True):
-        self.server_args = ServerArgs(model_path="dummy", enable_mis=enable_mis)
+    def __init__(self, enable_mis=False, generation=True, **server_args):
+        self.server_args = ServerArgs(
+            model_path="dummy", enable_mis=enable_mis, **server_args
+        )
         publish(self.server_args, role="test")
         self.is_generation = generation
         self.tokenizer = SimpleNamespace(vocab_size=8)
@@ -51,7 +53,10 @@ class ScoringManager(TokenizerManagerScoreMixin):
                 results.append({"meta_info": meta})
             else:
                 embedding = [1.0, 3.0]
-                if self.server_args.enable_mis:
+                if request.token_indices_to_pool is not None:
+                    # setwise pools the head at every anchor: one row per position
+                    embedding = [embedding] * len(request.token_indices_to_pool[index])
+                elif self.server_args.enable_mis:
                     count = len(request.multi_item_delimiter_indices[index])
                     embedding = [embedding] * count
                 results.append({"meta_info": meta, "embedding": embedding})
@@ -156,6 +161,37 @@ class TestTokenScoring(unittest.IsolatedAsyncioTestCase):
                 await manager.score_request(
                     query=[], items=[[4]], return_token_logprobs=True
                 )
+
+    async def test_setwise_classification_temperature(self):
+        """Setwise rows honor temperature in both the batched and --enable-mis paths."""
+        cases = {2.0: torch.softmax(torch.tensor([0.5, 1.5]), 0), 1e-300: [0.0, 1.0]}
+        for enable_mis in (False, True):
+            for temperature, expected in cases.items():
+                with self.subTest(enable_mis=enable_mis, temperature=temperature):
+                    manager = ScoringManager(
+                        enable_mis=enable_mis,
+                        generation=False,
+                        disable_radix_cache=True,
+                        chunked_prefill_size=-1,
+                    )
+                    manager.model_config = SimpleNamespace(
+                        hf_config=SimpleNamespace(
+                            architectures=["Qwen3ForSequenceClassification"]
+                        )
+                    )
+                    result = await manager.score_request(
+                        query=[4],
+                        items=[[5, 7], [6, 7, 7]],
+                        apply_softmax=True,
+                        score_extraction_token_id=7,
+                        temperature=temperature,
+                    )
+                    self.assertEqual([len(rows) for rows in result.scores], [1, 2])
+                    for rows in result.scores:
+                        for row in rows:
+                            torch.testing.assert_close(
+                                torch.tensor(row), torch.as_tensor(expected)
+                            )
 
     async def test_invalid_candidates_and_temperature(self):
         manager = ScoringManager()

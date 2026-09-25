@@ -225,7 +225,7 @@ class TokenizerManagerScoreMixin:
     # ------------------------------------------------------------------
 
     def _multi_position_score_rows(
-        self, embedding: Any, apply_softmax: bool
+        self, embedding: Any, apply_softmax: bool, *, temperature: float
     ) -> List[List[float]]:
         """Validate a 2-D multi-position result embedding and return its per-token rows."""
         embedding_tensor = torch.as_tensor(embedding)
@@ -240,7 +240,10 @@ class TokenizerManagerScoreMixin:
                 "pool per position do)."
             )
         if apply_softmax:
-            return torch.softmax(embedding_tensor, dim=-1).tolist()
+            scores_tensor = embedding_tensor.to(torch.float64)
+            # center before scaling so small temperatures do not overflow
+            centered = scores_tensor - scores_tensor.amax(dim=-1, keepdim=True)
+            return torch.softmax(centered / temperature, dim=-1).tolist()
         return embedding if isinstance(embedding, list) else embedding_tensor.tolist()
 
     def _multi_position_phs_matrix(self, phs: Any, expected_rows: int) -> torch.Tensor:
@@ -259,6 +262,7 @@ class TokenizerManagerScoreMixin:
         per_item_anchor_counts: List[int],
         apply_softmax: bool,
         return_pooled_hidden_states: bool = False,
+        temperature: float = 1.0,
     ) -> ScoreResult:
         """Process a fused multi-item score-extraction request (``--enable-mis``).
 
@@ -275,7 +279,9 @@ class TokenizerManagerScoreMixin:
         if embedding is None:
             raise ValueError("Embedding not found in the result.")
 
-        rows = self._multi_position_score_rows(embedding, apply_softmax)
+        rows = self._multi_position_score_rows(
+            embedding, apply_softmax, temperature=temperature
+        )
         total_anchors = sum(per_item_anchor_counts)
         if len(rows) != total_anchors:
             raise RuntimeError(
@@ -361,7 +367,9 @@ class TokenizerManagerScoreMixin:
                 prompt_tokens += result.get("meta_info", {}).get("prompt_tokens", 0)
 
                 if per_item_matrix:
-                    rows = self._multi_position_score_rows(embedding, apply_softmax)
+                    rows = self._multi_position_score_rows(
+                        embedding, apply_softmax, temperature=temperature
+                    )
                     scores.append(rows)
                 else:
                     if apply_softmax:
@@ -1044,6 +1052,7 @@ class TokenizerManagerScoreMixin:
                 per_item_anchor_counts,
                 apply_softmax,
                 return_pooled_hidden_states,
+                temperature=temperature,
             )
         elif use_multi_item_scoring:
             # Multi-item scoring: extract scores from input_token_ids_logprobs or embedding
