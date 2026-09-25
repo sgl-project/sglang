@@ -324,8 +324,14 @@ class SWAComponent(TreeComponent):
         state = {"len": float("inf")}
 
         # A per-request SWA ring is not stored in tree nodes, so its bookkeeping
-        # must not gate prefix matching.
-        swa_req_ring = is_swa_req_ring(self.cache.token_to_kv_pool_allocator)
+        # must not gate prefix matching. The same holds for HiCache without an
+        # SWA host pool (the paged / request_window DSV4 pools on a non-unified
+        # layout): SWA never leaves the device, so a host-only Full-KV tombstone
+        # is still a valid match boundary; load_back restores the Full KV and
+        # the window is re-prefilled (or replayed) by the scheduler.
+        swa_not_in_tree = is_swa_req_ring(self.cache.token_to_kv_pool_allocator) or (
+            not self.tree_core.has_swa_host_pool and self.tree_core.enable_hicache
+        )
 
         def validator(node: UnifiedTreeNode) -> bool:
             cd = node.component_data[ct]
@@ -333,7 +339,7 @@ class SWAComponent(TreeComponent):
             # — load_back will restore SWA from host before use.
             if cd.value is None and (match_device_only or cd.host_value is None):
                 state["len"] = 0
-                if swa_req_ring and (node.backuped or not node.evicted):
+                if swa_not_in_tree and (node.backuped or not node.evicted):
                     return True
                 return False
             state["len"] += len(node.key)
