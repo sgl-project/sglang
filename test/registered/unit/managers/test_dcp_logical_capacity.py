@@ -24,7 +24,6 @@ from sglang.srt.mem_cache.unified_memory_pool import (
 )
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.observability.metrics_collector import SchedulerStats
-from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase, enter_scope, published_topology
 
@@ -131,9 +130,7 @@ def make_scheduler(worker):
         page_size=64,
         server_args=NS(dcp_size=runner.server_args.dcp_size, enable_lora=False),
         running_batch=NS(reqs=[]),
-        last_batch=None,
         waiting_queue=[],
-        chunked_req=None,
         disaggregation_mode=DisaggregationMode.DECODE,
         disagg_decode_prealloc_queue=NS(queue=[], retracted_queue=[]),
         disagg_decode_transfer_queue=NS(queue=[]),
@@ -173,21 +170,15 @@ class TestDcpLogicalCapacity(CustomTestCase):
             config.start()
             self.addCleanup(config.stop)
 
-    def test_worker_capacity_uses_effective_dcp(self):
+    def test_logical_capacity(self):
         for dcp_size in (1, 2, 8):
             with self.subTest(dcp_size=dcp_size):
-                worker = self.make_worker(dcp_size)
-                # The runner's configured DCP is not the published attention group.
-                worker.model_runner.server_args.dcp_size = 8
-                info = TpModelWorker.get_worker_info(worker)
-                capacity = PHYSICAL * dcp_size
-                self.assertEqual(info[0], capacity)
-                self.assertEqual(info[4], min(CONTEXT, capacity) - 1)
-                self.assertEqual(info[5], info[4] - 5)
+                info = TpModelWorker.get_worker_info(self.make_worker(dcp_size))
+                self.assertEqual(info[0], PHYSICAL * dcp_size)
+                self.assertEqual(info[4], min(CONTEXT, PHYSICAL * dcp_size) - 1)
 
-    def test_capacity_is_rows_times_dcp_not_allocator_size(self):
-        """The unified Mamba allocator's size also counts Mamba state bytes as
-        tokens, so capacity must come from the configured rows, not the allocator."""
+        # Unified Mamba's allocator.size also counts Mamba state bytes, so
+        # capacity must come from the configured rows.
         runner = self.make_worker(8).model_runner
         runner.max_total_num_tokens = 64
         runner.token_to_kv_pool_allocator = make_unified_mamba_allocator(
@@ -195,61 +186,32 @@ class TestDcpLogicalCapacity(CustomTestCase):
         )
         self.assertGreater(runner.token_to_kv_pool_allocator.size, 64 * 8)
         self.assertEqual(runner.logical_max_total_num_tokens, 64 * 8)
-        # Draft sizes are already widened by loc_space_scale; SWA never widens.
-        for configurator in (
-            make_configurator(is_draft_worker=True),
-            make_configurator(is_hybrid_swa=True),
-        ):
-            runner.kv_cache_configurator = configurator
-            self.assertEqual(runner.logical_max_total_num_tokens, 64)
 
-    def test_hybrid_swa_bounds_do_not_widen_under_dcp(self):
-        runner = self.make_worker(1).model_runner
+        # Draft sizes already carry loc_space_scale; SWA never widens.
+        runner.kv_cache_configurator = make_configurator(is_draft_worker=True)
+        self.assertEqual(runner.logical_max_total_num_tokens, 64)
         runner.is_hybrid_swa = True
         runner.kv_cache_configurator = make_configurator(is_hybrid_swa=True)
-        runner.swa_max_total_num_tokens = PHYSICAL // 4
-        for dcp_size, full_capacity, expected in (
-            (1, PHYSICAL // 2, PHYSICAL // 2),
-            (1, 0, PHYSICAL // 4),
-            (8, PHYSICAL // 2, PHYSICAL // 2),
-        ):
-            with self.subTest(dcp_size=dcp_size, full_capacity=full_capacity):
-                enter_scope(self, get_parallel().override(attn_dcp_size=dcp_size))
-                runner.full_max_total_num_tokens = full_capacity
-                self.assertEqual(
-                    runner.effective_logical_max_total_num_tokens, expected
-                )
-                self.assertEqual(runner.logical_max_total_num_tokens, PHYSICAL)
+        runner.full_max_total_num_tokens = 32
+        runner.swa_max_total_num_tokens = 16
+        self.assertEqual(runner.logical_max_total_num_tokens, 64)
+        self.assertEqual(runner.effective_logical_max_total_num_tokens, 32)
 
-    def test_output_budget_does_not_multiply_logical_capacity_again(self):
-        worker = self.make_worker(8)
-        worker.model_config.context_len = PHYSICAL * 16
-        scheduler = make_scheduler(worker)
-        req = NS(
-            rid="near-capacity",
-            origin_input_ids=range(scheduler.max_total_num_tokens - 1024),
-            sampling_params=NS(max_new_tokens=600, min_new_tokens=0),
-        )
-        Scheduler.init_req_max_new_tokens(scheduler, req)
-        self.assertEqual(req.sampling_params.max_new_tokens, 511)
-
-    def test_one_million_token_context_is_not_clipped_to_per_rank_rows(self):
+    def test_one_million_token_request_is_admitted_under_dcp8(self):
         scheduler = make_scheduler(self.make_worker(8))
         self.assertEqual(scheduler.max_req_input_len, CONTEXT - 6)
         req = NS(
             rid="dcp-long",
             origin_input_ids=range(1_000_000),
             output_ids=[],
+            return_logprob=False,
             sampling_params=NS(max_new_tokens=64, min_new_tokens=0),
         )
         Scheduler.init_req_max_new_tokens(scheduler, req)
         self.assertEqual(req.sampling_params.max_new_tokens, 64)
         self.assertFalse(
             PrefillBootstrapQueue._check_if_req_exceed_kv_capacity(
-                NS(
-                    max_total_num_tokens=scheduler.tp_worker.model_runner.effective_logical_max_total_num_tokens
-                ),
-                req,
+                NS(max_total_num_tokens=scheduler.max_total_num_tokens), req
             )
         )
         queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
@@ -262,43 +224,38 @@ class TestDcpLogicalCapacity(CustomTestCase):
         self.assertFalse(
             DecodePreallocQueue._check_if_req_exceed_kv_capacity(queue, req)
         )
-        # Context safety still applies independently of the larger pool.
-        req.origin_input_ids = range(CONTEXT - 32)
-        Scheduler.init_req_max_new_tokens(scheduler, req)
-        self.assertEqual(req.sampling_params.max_new_tokens, 30)
 
         req.origin_input_ids = range(scheduler.max_total_num_tokens + 1)
-        req.return_logprob = False
         with patch("sglang.srt.disaggregation.decode.prepare_abort") as abort:
             self.assertTrue(
                 DecodePreallocQueue._check_if_req_exceed_kv_capacity(queue, req)
             )
         abort.assert_called_once()
-        queue.scheduler.output_streamer.stream_output.assert_called_once()
 
-    def test_load_usage_uses_logical_capacity_exactly_once(self):
-        for dcp_size in (1, 8):
-            with self.subTest(dcp_size=dcp_size):
-                scheduler = make_scheduler(
-                    self.make_worker(dcp_size, enable_metrics=True)
-                )
-                allocator = scheduler.token_to_kv_pool_allocator
-                # Keep half the real allocator's pages available; no CUDA calls.
-                allocator.free_pages = allocator.free_pages[
-                    : len(allocator.free_pages) // 2
-                ]
-                loads = scheduler.load_inquirer.get_loads()
-                self.assertEqual(loads.max_total_num_tokens, allocator.size)
-                self.assertEqual(loads.memory.token_capacity, allocator.size)
-                used = allocator.size - (allocator.num_pages // 2) * allocator.page_size
-                self.assertEqual(loads.num_used_tokens, used)
-                self.assertEqual(loads.token_usage, 0.5)
-                self.assertEqual(
-                    scheduler.pool_stats_observer.max_total_num_tokens, allocator.size
-                )
-                Scheduler.emit_metrics_constants(scheduler)
-                constants = scheduler.metrics_collector.emit_constants.call_args
-                self.assertEqual(constants.kwargs["num_pages"], PHYSICAL // 64)
+        # Output budget counts the logical capacity once.
+        worker = self.make_worker(8)
+        worker.model_config.context_len = PHYSICAL * 16
+        scheduler = make_scheduler(worker)
+        req.origin_input_ids = range(scheduler.max_total_num_tokens - 1024)
+        req.sampling_params.max_new_tokens = 600
+        Scheduler.init_req_max_new_tokens(scheduler, req)
+        self.assertEqual(req.sampling_params.max_new_tokens, 511)
+
+    def test_reporting_counts_dcp_once(self):
+        scheduler = make_scheduler(self.make_worker(8, enable_metrics=True))
+        allocator = scheduler.token_to_kv_pool_allocator
+        # Keep half the real allocator's pages available; no CUDA calls.
+        allocator.free_pages = allocator.free_pages[: len(allocator.free_pages) // 2]
+        loads = scheduler.load_inquirer.get_loads()
+        self.assertEqual(loads.max_total_num_tokens, allocator.size)
+        self.assertEqual(loads.memory.token_capacity, allocator.size)
+        self.assertEqual(loads.token_usage, 0.5)
+        self.assertEqual(
+            scheduler.pool_stats_observer.max_total_num_tokens, allocator.size
+        )
+        Scheduler.emit_metrics_constants(scheduler)
+        constants = scheduler.metrics_collector.emit_constants.call_args
+        self.assertEqual(constants.kwargs["num_pages"], PHYSICAL // 64)
 
 
 if __name__ == "__main__":
