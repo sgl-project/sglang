@@ -116,8 +116,8 @@ struct Kernel {
         .num_vectors = num_vectors,
         .scale = static_cast<float>(scale),
     };
-    const auto blocks = static_cast<uint32_t>(
-        std::min<int64_t>(div_ceil(num_vectors, static_cast<int64_t>(kThreads)), kMaxBlocks));
+    const auto blocks =
+        static_cast<uint32_t>(std::min<int64_t>(div_ceil(num_vectors, static_cast<int64_t>(kThreads)), kMaxBlocks));
     LaunchKernel(blocks, kThreads, device.unwrap())(kernel, params);
   }
 };

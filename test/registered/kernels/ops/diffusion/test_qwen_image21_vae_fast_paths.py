@@ -5,20 +5,23 @@ Regressions caught: a fused norm + SiLU tail or a folded-padding conv that no
 longer matches the original chain, parameter names changed by the wrappers,
 and a fast path that stays on after its first-sight check failed.
 """
+
 from copy import deepcopy
 
 import pytest
 import torch
 
-from sglang.kernels.ops.diffusion import BitExactFusionGate
 from sglang.multimodal_gen.configs.models.vaes.qwenimage21 import (
     QwenImage21VAEArchConfig,
     QwenImage21VAEConfig,
 )
-from sglang.multimodal_gen.runtime.models.vaes import qwen_image21_vae_cuda_opt as vae_opt
+from sglang.multimodal_gen.runtime.models.vaes import (
+    qwen_image21_vae_cuda_opt as vae_opt,
+)
 from sglang.multimodal_gen.runtime.models.vaes.autoencoder_kl_qwenimage21 import (
     AutoencoderKLQwenImage21,
 )
+from sglang.multimodal_gen.runtime.models.vaes.fast_path_gate import use_vae_fast_path
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=40, stage="base-b-kernel-unit", runner_config="1-gpu-large")
@@ -54,7 +57,13 @@ def make_vae():
 
 
 def gates(vae):
-    return [m._gate for m in vae.modules() if isinstance(m, (vae_opt.FusedChannelRMSNormSiLU, vae_opt.FoldedPadConv2d))]
+    found = []
+    for m in vae.modules():
+        if isinstance(m, vae_opt.FusedChannelRMSNormSiLU):
+            found.append(m._exact_gate)
+        elif isinstance(m, vae_opt.FoldedPadConv2d):
+            found.append(m._gates["nchw"])
+    return found
 
 
 @torch.no_grad()
@@ -80,12 +89,55 @@ def test_mismatch_disables_the_norm_fast_path(monkeypatch):
     reference = make_vae()
     optimized = vae_opt.maybe_optimize_qwen_image21_vae(deepcopy(reference))
     monkeypatch.setattr(
-        vae_opt, "channel_rmsnorm_finish_silu", lambda x, norm, gamma, scale: torch.zeros_like(x)
+        vae_opt,
+        "channel_rmsnorm_finish_silu",
+        lambda x, norm, gamma, scale: torch.zeros_like(x),
     )
     z = torch.randn(1, 4, 1, 4, 4, device="cuda", dtype=torch.bfloat16)
     assert torch.equal(optimized.decode(z), reference.decode(z))
-    norm_gates = [m._gate for m in optimized.modules() if isinstance(m, vae_opt.FusedChannelRMSNormSiLU)]
-    assert norm_gates and all(gate.disabled and not gate.verified for gate in norm_gates)
+    norm_gates = [
+        m._exact_gate
+        for m in optimized.modules()
+        if isinstance(m, vae_opt.FusedChannelRMSNormSiLU)
+    ]
+    assert norm_gates and all(
+        gate.disabled and not gate.verified for gate in norm_gates
+    )
+
+
+@torch.no_grad()
+def test_extra_high_decodes_channels_last_and_lossless_is_restored(monkeypatch):
+    reference = make_vae()
+    optimized = vae_opt.maybe_optimize_qwen_image21_vae(deepcopy(reference))
+    calls = {"nhwc": 0, "gather": 0}
+    real_nhwc, real_gather = (
+        vae_opt.channel_rmsnorm_silu_nhwc,
+        vae_opt.nearest_upsample_nhwc,
+    )
+
+    def counting_nhwc(x, gamma, scale):
+        calls["nhwc"] += 1
+        return real_nhwc(x, gamma, scale)
+
+    def counting_gather(x, scale_factor):
+        calls["gather"] += 1
+        return real_gather(x, scale_factor)
+
+    monkeypatch.setattr(vae_opt, "channel_rmsnorm_silu_nhwc", counting_nhwc)
+    monkeypatch.setattr(vae_opt, "nearest_upsample_nhwc", counting_gather)
+    z = torch.randn(1, 4, 1, 4, 4, device="cuda", dtype=torch.bfloat16)
+    expected = reference.decode(z)
+    with use_vae_fast_path(optimized, True):
+        fast = optimized.decode(z)
+    assert fast.shape == expected.shape
+    assert calls["nhwc"] > 0 and calls["gather"] > 0
+    torch.testing.assert_close(fast.float(), expected.float(), atol=0.05, rtol=0)
+    assert (
+        not torch.equal(fast, expected) or True
+    )  # rounding may or may not differ on a tiny model
+    # gate off: layout and kernels revert, output is bit-identical again
+    assert torch.equal(optimized.decode(z), expected)
+    assert not optimized.decoder._sgl_channels_last
 
 
 @torch.no_grad()

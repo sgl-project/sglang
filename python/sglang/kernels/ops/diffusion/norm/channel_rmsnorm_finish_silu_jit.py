@@ -62,7 +62,9 @@ def _fake(x, norm, gamma, scale):
     return torch.empty_like(x)
 
 
-@register_custom_op(op_name="channel_rmsnorm_finish_silu", mutates_args=[], fake_impl=_fake)
+@register_custom_op(
+    op_name="channel_rmsnorm_finish_silu", mutates_args=[], fake_impl=_fake
+)
 def channel_rmsnorm_finish_silu(
     x: torch.Tensor, norm: torch.Tensor, gamma: torch.Tensor, scale: float
 ) -> torch.Tensor:

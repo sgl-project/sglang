@@ -379,6 +379,13 @@ _SPECS: tuple[tuple[str, KernelBackend, str, frozenset, str], ...] = (
         "Bit-exact channel-first RMSNorm finish + SiLU on aten's fp32 channel norm (Qwen-Image 2.1 VAE), CUDA.",
     ),
     (
+        "diffusion.channel_rmsnorm_silu_nhwc",
+        KernelBackend.JIT,
+        "norm.channel_rmsnorm_silu_nhwc_jit:channel_rmsnorm_silu_nhwc",
+        _CUDA,
+        "Channels-last channel RMSNorm + SiLU with an in-warp reduction (Qwen-Image 2.1 VAE, quality-gated), CUDA.",
+    ),
+    (
         "diffusion.vdn_delta_factors",
         KernelBackend.JIT,
         "attention.vdn_delta_factors_jit:vdn_delta_factors",
@@ -586,6 +593,9 @@ _EXPORTS: dict[str, str] = {
     "rmsnorm_preserve_reduction": "norm.rmsnorm_preserve_reduction",
     "can_use_channel_rmsnorm_finish_silu": "norm.channel_rmsnorm_finish_silu_jit",
     "channel_rmsnorm_finish_silu": "norm.channel_rmsnorm_finish_silu_jit",
+    "can_use_channel_rmsnorm_silu_nhwc": "norm.channel_rmsnorm_silu_nhwc_jit",
+    "channel_rmsnorm_silu_nhwc": "norm.channel_rmsnorm_silu_nhwc_jit",
+    "is_channels_last_dense": "norm.channel_rmsnorm_silu_nhwc_jit",
     "can_use_fused_rmsnorm_scale_shift": "norm.rmsnorm_scale_shift_bitexact",
     "can_use_fused_scale_residual_rmsnorm_scale_shift": "norm.rmsnorm_scale_shift_bitexact",
     "fused_rmsnorm_scale_shift_bitexact": "norm.rmsnorm_scale_shift_bitexact",

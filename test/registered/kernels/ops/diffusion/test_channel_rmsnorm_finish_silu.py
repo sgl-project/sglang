@@ -6,6 +6,7 @@ tail, a SiLU formula that differs from aten's, the sign of zero after the
 ``+ 0.0`` bias, wrong channel/norm indexing for NCHW and NCDHW inputs, and
 predicates admitting layouts the kernel cannot address.
 """
+
 import pytest
 import torch
 import torch.nn.functional as F
@@ -40,7 +41,8 @@ def assert_bits_equal(actual, expected):
 
 
 @pytest.mark.parametrize(
-    "shape", [(1, 1152, 1, 64, 64), (1, 144, 1, 256, 256), (2, 288, 32, 32), (1, 4, 1, 8, 8)]
+    "shape",
+    [(1, 1152, 1, 64, 64), (1, 144, 1, 256, 256), (2, 288, 32, 32), (1, 4, 1, 8, 8)],
 )
 @pytest.mark.parametrize("amplitude", [1e-3, 1.0, 100.0])
 @torch.no_grad()
