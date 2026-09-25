@@ -105,6 +105,7 @@ These fusion families mount under both `quality="extra-high"` and
 | `scale_residual_norm_scale_shift` | KDA / Triton / CuTe-DSL / FlyDSL | bit-exact (Triton) or backend-specific close contract | the above plus the preceding `residual + gate * update` |
 | `scale_residual_norm_scale_shift_nvfp4` | JIT CUDA | matches the selected NVFP4 producer contract | Qwen residual LayerNorm/modulation + FC1 NVFP4 quantization |
 | `layernorm_modulate` | Triton | bit-exact | affine-free LayerNorm + adaLN modulate |
+| `try_fused_fp32_layernorm_bf16` | KDA / Triton | bit-exact against the verified native dispatch | LingBot World causal FP32 LayerNorm on Hopper with FP32 affine or adaLN post-ops, including BF16 input/output conversions; other devices retain native LayerNorm |
 | `qk_head_layernorm` | Triton | bit-exact | per-head LayerNorm on q/k |
 | `qk_rmsnorm_native` | Triton | bit-exact | Z-Image per-head QK RMSNorm |
 | `norm_scale_shift` | KDA / CuTe-DSL / FlyDSL | backend-specific close contract | LN-or-RMS + scale/shift, many broadcast modes |
@@ -112,6 +113,7 @@ These fusion families mount under both `quality="extra-high"` and
 | `apply_group_norm_silu` | Triton | close | `GroupNorm + SiLU`, NCHW-contiguous |
 | `group_norm_silu_4d`, `group_norm_silu_rows` | Triton | close | channels-last GroupNorm(+SiLU); what lets a VAE decoder run channels_last end to end with no `nchwToNhwc` transposes |
 | `wan_rmsnorm_silu` | Triton | close | Wan VAE `channels_last_3d` RMSNorm + SiLU |
+| `wan_norm_silu_post` | JIT CUDA | bit-exact, first-sight verified | Wan VAE FP32 divide, scale, affine, and SiLU after the unchanged native L2 reduction; dense NCDHW and `channels_last_3d` |
 
 ### adaLN modulation and gating
 
@@ -119,9 +121,16 @@ These fusion families mount under both `quality="extra-high"` and
 | --- | --- | --- | --- |
 | `modulate_scale_shift` | JIT CUDA | bit-exact | `x * (1 + scale) + shift` |
 | `residual_gate_add` | KDA (JIT CUDA) | bit-exact | `residual + gate * update` |
+| `try_fused_scaled_residual_bf16` | Triton | bit-exact against the verified native dispatch | LingBot World causal BF16 residual with an FP32 per-frame gate; skips the unused normalized output before camera conditioning |
 | `timestep_embedding` | JIT CUDA | close | sinusoidal timestep embedding |
 | `temb_table_slices` | Triton | bit-exact | see note below |
 | `ltx2_ada_values` | Triton | bit-exact | LTX-2 nine-way adaLN value split, slices come out contiguous |
+
+LingBot World camera conditioning also uses `modulate_scale_shift` with one
+affine row per token. The causal normalization and residual paths verify each
+new signature outside CUDA graph capture and fall back to their native chains
+on mismatch or unsupported layouts. These paths preserve `lossless` arithmetic;
+kernel replay support does not enable BCG for a model configuration that disables it.
 
 <Tip>
 `temb_table_slices` is worth knowing about. The eager `(scale_shift_table + temb.float()).chunk(6, dim=2)` materializes roughly 8 GB of fp32 at 704p/121f *and* hands six **strided** slices downstream, whose `.contiguous()` calls then copy each one again. The fused kernel produces the six slices in one pass, each naturally contiguous, so the downstream copies become no-ops.
@@ -222,9 +231,9 @@ Kernels are written against a specific eager chain in a specific model, so cover
 | HunyuanVideo / Helios | QKV+RoPE pack, strided QK RMSNorm, linear+GELU; Helios also has paired in-place Q/K RoPE |
 | LingBot Video MoE | Default-on group-limited top-k expert selection; fused RMSNorm, per-token gated residual, and fused RMSNorm+modulate at `quality=extra-high` or `quality=high` |
 | Sana | LN+modulate, GLUMB bias+SiLU / bias+GLU, residual-gate add |
-| SANA-Video | Packed QKV/KV; paired fp64 interleaved RoPE; LN+modulate, GLUMB bias+SiLU / bias+GLU, and residual-gate add during BCG; BF16-input linear attention at `quality=extra-high` or `quality=high` |
+| SANA-Video | Packed QKV/KV; paired fp64 interleaved RoPE; GLUMB bias+SiLU / bias+GLU in eager and BCG; LN+modulate and residual-gate add during BCG; BF16-input linear attention at `quality=extra-high` or `quality=high` |
 | Sana-WM | bidirectional gated delta-net, fused QK inverse-RMS |
-| Wan | temb table slices; VAE cat+pad and DupUp3D add, `channels_last_3d` RMSNorm+SiLU |
+| Wan / LongLive 2 VAE | temb table slices (Wan); VAE cat+pad and DupUp3D add; lossless FP32 normalization post-ops; full `channels_last_3d` RMSNorm+SiLU at `quality=extra-high` or `quality=high` |
 | Cosmos3 / Krea2 / MiniMax-H3 | QK-norm + RoPE (Krea2 also CuTe-DSL norm+scale/shift; MiniMax-H3 also indexed modulation) |
 | FLUX.2 VAE / HunyuanVAE / latent upsampler | GroupNorm + SiLU (channels-last two-pass for FLUX.2) |
 
