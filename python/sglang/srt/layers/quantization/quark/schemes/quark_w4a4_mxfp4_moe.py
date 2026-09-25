@@ -70,7 +70,12 @@ _shuffle_moe_gfx1250 = (
 )
 
 if _is_hip:
-    from aiter.ops.triton.quant import dynamic_mxfp4_quant
+
+    def dynamic_mxfp4_quant(x):
+        from aiter.ops.triton.quant import dynamic_mxfp4_quant as quantize
+
+        return quantize(x)
+
 else:
     dynamic_mxfp4_quant = None
 

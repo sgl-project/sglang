@@ -83,14 +83,6 @@ def _dequant_mxfp4_to_bf16(
 
 
 if _is_hip:
-    from aiter.ops.triton.gemm.fused.fused_gemm_afp4wfp4_split_cat import (
-        fused_gemm_afp4wfp4_split_cat as _fused_gemm_afp4wfp4_split_cat_orig,
-    )
-    from aiter.ops.triton.gemm_afp4wfp4 import gemm_afp4wfp4 as _gemm_afp4wfp4_orig
-    from aiter.ops.triton.gemm_afp4wfp4_pre_quant_atomic import (
-        gemm_afp4wfp4_pre_quant as _gemm_afp4wfp4_pre_quant_orig,
-    )
-    from aiter.ops.triton.quant import dynamic_mxfp4_quant as _dynamic_mxfp4_quant_orig
 
     def _aiter_gemm_afp4wfp4(
         x: torch.Tensor,
@@ -99,7 +91,9 @@ if _is_hip:
         w_scales: torch.Tensor,
         y: torch.Tensor,
     ) -> None:
-        _gemm_afp4wfp4_orig(x, w, x_scales, w_scales, y.dtype, y)
+        from aiter.ops.triton.gemm_afp4wfp4 import gemm_afp4wfp4
+
+        gemm_afp4wfp4(x, w, x_scales, w_scales, y.dtype, y)
 
     def _aiter_gemm_afp4wfp4_fake(
         x: torch.Tensor,
@@ -126,7 +120,11 @@ if _is_hip:
         w_scales: torch.Tensor,
         y: torch.Tensor,
     ) -> None:
-        _gemm_afp4wfp4_pre_quant_orig(x, w, w_scales, y.dtype, y)
+        from aiter.ops.triton.gemm_afp4wfp4_pre_quant_atomic import (
+            gemm_afp4wfp4_pre_quant,
+        )
+
+        gemm_afp4wfp4_pre_quant(x, w, w_scales, y.dtype, y)
 
     def _aiter_gemm_afp4wfp4_pre_quant_fake(
         x: torch.Tensor,
@@ -149,7 +147,9 @@ if _is_hip:
     def _aiter_dynamic_mxfp4_quant(
         x: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        return _dynamic_mxfp4_quant_orig(x)
+        from aiter.ops.triton.quant import dynamic_mxfp4_quant
+
+        return dynamic_mxfp4_quant(x)
 
     def _aiter_dynamic_mxfp4_quant_fake(
         x: torch.Tensor,
@@ -180,7 +180,11 @@ if _is_hip:
         S1: int,
         S2: int,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        return _fused_gemm_afp4wfp4_split_cat_orig(
+        from aiter.ops.triton.gemm.fused.fused_gemm_afp4wfp4_split_cat import (
+            fused_gemm_afp4wfp4_split_cat,
+        )
+
+        return fused_gemm_afp4wfp4_split_cat(
             x=x,
             w=w,
             y=y,

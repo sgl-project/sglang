@@ -27,6 +27,7 @@ if TYPE_CHECKING:
 
 awq_marlin_moe_repack = None
 awq_marlin_repack = None
+awq_gemm = None
 
 
 def _unsupported_awq_dequantize(*args, **kwargs):
@@ -44,6 +45,9 @@ elif is_hip():
     try:
         from sglang.kernels.ops.quantization.awq_triton import (
             awq_dequantize_triton as awq_dequantize,
+        )
+        from sglang.kernels.ops.quantization.awq_triton import (
+            awq_gemm_triton as awq_gemm,
         )
     except ImportError:
         pass
@@ -73,6 +77,14 @@ else:
 _, scalar_types = get_scalar_types()
 
 
+def _use_awq_packed_gemm(x: torch.Tensor) -> bool:
+    return (
+        awq_gemm is not None
+        and 0 < x.shape[0] <= 16
+        and torch.cuda.get_device_properties(x.device).gcnArchName.startswith("gfx1151")
+    )
+
+
 class AWQLinearKernel:
     def __init__(self, quant_config: Optional[QuantizationConfig] = None):
         self.quant_config = quant_config
@@ -94,8 +106,20 @@ class AWQLinearKernel:
         pack_factor = self.quant_config.pack_factor
         out_shape = x.shape[:-1] + (qweight.shape[-1] * pack_factor,)
         reshaped_x = x.reshape(-1, x.shape[-1])
-        out = awq_dequantize(qweight, scales, qzeros)
-        out = torch.matmul(reshaped_x, out)
+        if _use_awq_packed_gemm(reshaped_x):
+            out = awq_gemm(
+                reshaped_x.contiguous(),
+                qweight,
+                scales,
+                qzeros,
+                split_k_iters=8,
+                block_size_m=16,
+                block_size_n=64,
+                block_size_k=32,
+            )
+        else:
+            out = awq_dequantize(qweight, scales, qzeros)
+            out = torch.matmul(reshaped_x, out)
 
         if bias is not None:
             out.add_(bias)
