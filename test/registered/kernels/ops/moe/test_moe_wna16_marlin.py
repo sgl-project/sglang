@@ -781,5 +781,119 @@ def test_mxfp4_tp8_gate_decode(m):
         )
 
 
+@pytest.mark.skipif(not is_sm90_supported(), reason="Hopper MXFP4 weight loading")
+@pytest.mark.parametrize("tp_rank", [0, 7])
+def test_mxfp4_tp8_load_before_padding(tp_rank):
+    from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+    from sglang.srt.layers.quantization.marlin_utils_fp4 import (
+        prepare_moe_mxfp4_layer_for_marlin,
+    )
+    from sglang.srt.layers.quantization.mxfp4_marlin_moe import Mxfp4MarlinMoEMethod
+
+    torch.manual_seed(325 + tp_rank)
+    e, h, intermediate, tp, m = 2, 256, 288, 8, 4
+    method = Mxfp4MarlinMoEMethod(None, "test")
+    layer = torch.nn.Module()
+    layer.hidden_size = h
+    with torch.device("cuda"):
+        method.create_weights(layer, e, h, intermediate, torch.bfloat16)
+    assert layer.w13_weight.shape == (e, 2 * intermediate, h // 2)
+    loader = SimpleNamespace(
+        moe_tp_size=tp,
+        use_padded_loading=False,
+        use_presharded_weights=False,
+        use_triton_kernels=False,
+        moe_runner_config=SimpleNamespace(is_gated=True),
+        quant_method=method,
+    )
+    fp4 = torch.tensor(
+        [0, 0.5, 1, 1.5, 2, 3, 4, 6, -0.0, -0.5, -1, -1.5, -2, -3, -4, -6],
+        device="cuda",
+        dtype=torch.float64,
+    )
+    references = {}
+    for shard in ("w1", "w3", "w2"):
+        down = shard == "w2"
+        n, k = (h, intermediate * tp) if down else (intermediate * tp, h)
+        raw = torch.randint(0, 256, (e, n, k // 2), device="cuda", dtype=torch.uint8)
+        scale = torch.randint(
+            119, 123, (e, n, k // 32), device="cuda", dtype=torch.uint8
+        ).view(torch.float8_e8m0fnu)
+        prefix = "w2" if down else "w13"
+        load = FusedMoE._load_w2 if down else FusedMoE._load_w13
+        axis = 1 if down else 0
+        expected = []
+        for data, suffix in [
+            (raw.view(torch.int8), "weight"),
+            (scale, "weight_scale_inv"),
+        ]:
+            parameter = getattr(layer, f"{prefix}_{suffix}")
+            for expert in range(e):
+                load(loader, parameter[expert], axis, shard, data[expert], tp_rank)
+            width = data.shape[axis + 1] // tp
+            selected = data.narrow(axis + 1, tp_rank * width, width)
+            actual = (
+                parameter
+                if down
+                else parameter[:, :intermediate]
+                if shard == "w1"
+                else parameter[:, intermediate:]
+            )
+            torch.testing.assert_close(actual.float(), selected.float(), rtol=0, atol=0)
+            expected.append(selected)
+        packed, sf = expected
+        packed = packed.view(torch.uint8)
+        codes = torch.stack((packed & 15, packed >> 4), dim=-1).flatten(-2)
+        references[shard] = fp4[codes.long()] * sf.double().repeat_interleave(32, -1)
+
+    prepare_moe_mxfp4_layer_for_marlin(layer)
+    assert layer.w13_weight_scale.shape[-1] == 640
+    assert layer.w2_weight_scale.shape[1] == 10
+    x = torch.randn(m, h, device="cuda", dtype=torch.bfloat16)
+    ids = (
+        torch.tensor([[0, 1]], device="cuda", dtype=torch.int32)
+        .expand(m, -1)
+        .contiguous()
+    )
+    weights = torch.tensor([[0.25, 0.75]], device="cuda").expand(m, -1).contiguous()
+
+    def run():
+        return fused_marlin_moe(
+            x,
+            layer.w13_weight,
+            layer.w2_weight,
+            layer.w13_weight_scale,
+            layer.w2_weight_scale,
+            torch.empty(m, e, device="cuda"),
+            weights,
+            ids,
+            workspace=layer.workspace,
+            num_bits=4,
+            clamp_limit=10.0,
+        )
+
+    run()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        actual = run()
+    for _ in range(2):
+        x.normal_()
+        graph.replay()
+        expected = []
+        for expert in range(e):
+            gate = (x.double() @ references["w1"][expert].T).bfloat16().clamp(max=10)
+            up = (x.double() @ references["w3"][expert].T).bfloat16().clamp(-10, 10)
+            activated = torch.nn.functional.silu(gate) * up
+            projected = activated.double() @ references["w2"][expert].T
+            expected.append((projected * weights[:, expert, None]).bfloat16())
+        reference = torch.stack(expected).float().sum(0).bfloat16()
+        torch.testing.assert_close(
+            actual,
+            reference,
+            rtol=0.03,
+            atol=reference.float().square().mean().sqrt().item() * 0.002,
+        )
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v", "-s"]))
