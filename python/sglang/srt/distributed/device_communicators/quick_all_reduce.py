@@ -4,7 +4,7 @@ import logging
 import os
 from enum import Enum
 from functools import cache
-from typing import Union
+from typing import Any, Optional, Union
 
 import torch
 import torch.distributed as dist
@@ -264,3 +264,55 @@ class QuickAllReduce:
 
     def __del__(self):
         self.close()
+
+
+def _configure_aiter_quickreduce_env() -> None:
+    """Translate legacy SGLang QuickReduce settings for AITER.
+
+    Explicit AITER settings always win. This keeps existing launch scripts
+    working while allowing users to migrate one variable at a time.
+    """
+    aliases = {
+        "ROCM_QUICK_REDUCE_QUANTIZATION": "AITER_QUICK_REDUCE_QUANTIZATION",
+        "ROCM_QUICK_REDUCE_CAST_BF16_TO_FP16": ("AITER_QUICK_REDUCE_CAST_BF16_TO_FP16"),
+        "ROCM_QUICK_REDUCE_MAX_SIZE_BYTES_MB": ("AITER_QUICK_REDUCE_MAX_SIZE_BYTES_MB"),
+    }
+    for legacy_name, aiter_name in aliases.items():
+        if aiter_name in os.environ or legacy_name not in os.environ:
+            continue
+        value = os.environ[legacy_name]
+        if legacy_name == "ROCM_QUICK_REDUCE_QUANTIZATION" and value == "INT8":
+            value = "FP8"
+        os.environ[aiter_name] = value
+
+
+def create_quick_allreduce(
+    group: ProcessGroup, device: Union[int, str, torch.device]
+) -> Optional[Any]:
+    """Create the configured QuickReduce communicator.
+
+    AITER is opt-in through ``SGLANG_USE_AITER``. If its Python implementation
+    is not installed, retain the bundled communicator as a compatibility
+    fallback. Constructor failures intentionally propagate: distributed
+    initialization may already have exchanged resources, so silently creating
+    a second communicator is unsafe.
+    """
+    if not qr_rocm_arch_available():
+        return None
+
+    if os.environ.get("SGLANG_USE_AITER", "0").lower() in ("1", "true"):
+        _configure_aiter_quickreduce_env()
+        try:
+            from aiter.dist.device_communicators.quick_all_reduce import (
+                QuickAllReduce as AiterQuickAllReduce,
+            )
+        except (ImportError, AttributeError) as exc:
+            logger.info(
+                "AITER QuickAllReduce unavailable; using bundled QuickAllReduce: %s",
+                exc,
+            )
+        else:
+            logger.info("Using AITER QuickAllReduce")
+            return AiterQuickAllReduce(group=group, device=device)
+
+    return QuickAllReduce(group=group, device=device)
