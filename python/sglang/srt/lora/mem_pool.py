@@ -1329,8 +1329,10 @@ class LoRAMemoryPool:
                             cache_keys[target_module] = {}
                         for expert_id, weight in enumerate(weights):
                             buffer[target_module][expert_id] = weight
-                            cache_keys[target_module][expert_id] = append_cache_key_suffix(
-                                cache_name, f"expert{expert_id}"
+                            cache_keys[target_module][expert_id] = (
+                                append_cache_key_suffix(
+                                    cache_name, f"expert{expert_id}"
+                                )
                             )
                     elif "lora_A" in name:
                         temp_A_buffer[target_module] = weights
