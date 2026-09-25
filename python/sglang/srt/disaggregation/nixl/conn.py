@@ -412,6 +412,8 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
     # message is tagged too. It is new to NIXL, hence free to carry the reason.
     kv_status_msg_tag = b"KV_STATUS"
     kv_status_msg_carries_reason = True
+    # ABORT handler defers the ack until the transfer worker drains.
+    supports_deferred_decode_kv_release = True
 
     def __init__(
         self,

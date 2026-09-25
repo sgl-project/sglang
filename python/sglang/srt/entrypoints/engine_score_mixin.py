@@ -37,6 +37,7 @@ class EngineScoreMixin:
         query_embed_overrides: Optional[List[torch.Tensor]] = None,
         item_embed_overrides: Optional[List[Optional[List[torch.Tensor]]]] = None,
         return_pooled_hidden_states: bool = False,
+        score_extraction_token_id: Optional[int] = None,
         temperature: float = 1.0,
         return_token_logprobs: bool = False,
     ) -> ScoreResult:
@@ -53,6 +54,11 @@ class EngineScoreMixin:
         For SequenceClassification models, returns the pooled class logits directly from
         the classification head. label_token_ids is optional and ignored.
 
+        Setwise scoring is expressed via ``score_extraction_token_id``: pass a single
+        item containing the whole candidate block with one extraction token per
+        candidate, and the head is pooled AT those positions, so ``scores`` becomes
+        the ``[N x num_labels]`` per-candidate matrix.
+
         Args:
             query: The query text or pre-tokenized token IDs.
             items: The item text(s) or pre-tokenized token IDs.
@@ -63,6 +69,11 @@ class EngineScoreMixin:
             embed_override_token_id: Placeholder token ID used to locate override positions.
             query_embed_overrides: Embedding vectors replacing placeholder tokens in query.
             item_embed_overrides: Per-item embedding vectors replacing placeholder tokens in items.
+            score_extraction_token_id: SequenceClassification-only. When set, pool the
+                head at every occurrence of this token per sequence instead of the last
+                token; ``scores`` becomes nested — one ``[Ni x num_labels]`` matrix per
+                item (``len(scores) == len(items)``), where ``Ni`` is the number of
+                extraction tokens (candidates) in item ``i``.
             return_pooled_hidden_states: Whether to include raw pooled transformer
                 hidden states (before the task head) in the result. Only supported
                 for non-generation models (SequenceClassification, RewardModel).
@@ -72,8 +83,10 @@ class EngineScoreMixin:
                 each item's candidates. Only supported for CausalLM, not raw logits.
 
         Returns:
-            ScoreResult with scores (one list per item), prompt token count, and
-            optional pooled_hidden_states tensors.
+            ScoreResult with scores (flat ``[num_items x num_labels]`` for pointwise
+            scoring, or nested ``[num_items][Ni x num_labels]`` when
+            score_extraction_token_id is set), prompt token count, and optional
+            pooled_hidden_states tensors.
         """
         return self.loop.run_until_complete(
             self.tokenizer_manager.score_request(
@@ -85,6 +98,7 @@ class EngineScoreMixin:
                 embed_override_token_id=embed_override_token_id,
                 query_embed_overrides=query_embed_overrides,
                 item_embed_overrides=item_embed_overrides,
+                score_extraction_token_id=score_extraction_token_id,
                 request=None,
                 return_pooled_hidden_states=return_pooled_hidden_states,
                 temperature=temperature,
@@ -103,6 +117,7 @@ class EngineScoreMixin:
         query_embed_overrides: Optional[List[torch.Tensor]] = None,
         item_embed_overrides: Optional[List[Optional[List[torch.Tensor]]]] = None,
         return_pooled_hidden_states: bool = False,
+        score_extraction_token_id: Optional[int] = None,
         temperature: float = 1.0,
         return_token_logprobs: bool = False,
     ) -> ScoreResult:
@@ -116,6 +131,7 @@ class EngineScoreMixin:
             embed_override_token_id=embed_override_token_id,
             query_embed_overrides=query_embed_overrides,
             item_embed_overrides=item_embed_overrides,
+            score_extraction_token_id=score_extraction_token_id,
             request=None,
             return_pooled_hidden_states=return_pooled_hidden_states,
             temperature=temperature,

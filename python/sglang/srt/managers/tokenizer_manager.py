@@ -1561,6 +1561,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 http_worker_ipc=obj.http_worker_ipc,
                 return_pooled_hidden_states=obj.return_pooled_hidden_states,
                 multi_item_delimiter_indices=obj.multi_item_delimiter_indices,
+                token_indices_to_pool=obj.token_indices_to_pool,
             )
 
         tokenized_obj.time_stats = self.rid_to_state[obj.rid].time_stats
@@ -2396,12 +2397,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             ):
                 output_sampling_mask = recv_obj.output_token_sampling_mask
                 if output_sampling_mask is not None:
-                    state.output_token_sampling_mask.extend(output_sampling_mask[i])
-                    output_sampling_logprobs = recv_obj.output_token_sampling_logprobs
-                    if output_sampling_logprobs is not None:
-                        state.output_token_sampling_logprobs.extend(
-                            output_sampling_logprobs[i]
-                        )
+                    masks, logprobs = output_sampling_mask[i].to_lists(
+                        support_logprobs=state.obj.sampling_logprobs_mode == "support"
+                    )
+                    state.output_token_sampling_mask.extend(masks)
+                    state.output_token_sampling_logprobs.extend(logprobs)
                     meta_info["output_token_sampling_mask"] = (
                         state.output_token_sampling_mask
                     )
@@ -2852,7 +2852,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             )
 
         if top_logprobs_num > 0:
-            if len(recv_obj.input_top_logprobs_val) > 0:
+            if (
+                recv_obj.input_top_logprobs_val is not None
+                and len(recv_obj.input_top_logprobs_val) > 0
+            ):
                 state.input_top_logprobs_val.extend(
                     recv_obj.input_top_logprobs_val[recv_obj_index]
                 )
@@ -2868,27 +2871,32 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     recv_obj.input_top_logprobs_idx_flat[recv_obj_index],
                     recv_obj.input_top_logprobs_flat_null_prefix[recv_obj_index],
                 )
-            state.output_top_logprobs_val.extend(
-                recv_obj.output_top_logprobs_val[recv_obj_index]
-            )
-            state.output_top_logprobs_idx.extend(
-                recv_obj.output_top_logprobs_idx[recv_obj_index]
-            )
+            if recv_obj.output_top_logprobs_val is not None:
+                state.output_top_logprobs_val.extend(
+                    recv_obj.output_top_logprobs_val[recv_obj_index]
+                )
+                state.output_top_logprobs_idx.extend(
+                    recv_obj.output_top_logprobs_idx[recv_obj_index]
+                )
 
         if token_ids_logprob is not None:
-            if len(recv_obj.input_token_ids_logprobs_val) > 0:
+            if (
+                recv_obj.input_token_ids_logprobs_val is not None
+                and len(recv_obj.input_token_ids_logprobs_val) > 0
+            ):
                 state.input_token_ids_logprobs_val.extend(
                     recv_obj.input_token_ids_logprobs_val[recv_obj_index]
                 )
                 state.input_token_ids_logprobs_idx.extend(
                     recv_obj.input_token_ids_logprobs_idx[recv_obj_index]
                 )
-            state.output_token_ids_logprobs_val.extend(
-                recv_obj.output_token_ids_logprobs_val[recv_obj_index]
-            )
-            state.output_token_ids_logprobs_idx.extend(
-                recv_obj.output_token_ids_logprobs_idx[recv_obj_index]
-            )
+            if recv_obj.output_token_ids_logprobs_val is not None:
+                state.output_token_ids_logprobs_val.extend(
+                    recv_obj.output_token_ids_logprobs_val[recv_obj_index]
+                )
+                state.output_token_ids_logprobs_idx.extend(
+                    recv_obj.output_token_ids_logprobs_idx[recv_obj_index]
+                )
 
         self.add_logprob_to_meta_info(
             meta_info,

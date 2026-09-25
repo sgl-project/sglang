@@ -267,7 +267,6 @@ def run_eval(args):
     if args.eval_name == "mmlu":
         # Scored by sgl-eval (NeMo-Skills' mcq prompt + eval_mcq grader), so a
         # caller's threshold has to be measured against it, not inherited.
-        # `simple_eval_mmlu` stays: the ascend eval imports its subject2category.
         return _run_sgl_eval("mmlu", args)
     elif args.eval_name == "mgsm_en":
         from sglang.test.simple_eval_mgsm import MGSMEval

@@ -3096,6 +3096,41 @@ class TestFloatMultiEndedAllocator(unittest.TestCase):
         self.assertGreater(moved, 0)
         self._check_float_state(fla, kv)
 
+    def test_on_demand_movers_honor_move_gate(self):
+        """`make_room` / `compact_holes` relocate live pages just as `_flush`
+        does, so a closed move gate must stop them too: the shortfall ladder
+        reaches `make_room` while a host transfer or RDMA still addresses the
+        float's physical pages, and an ungated mover copies KV out from under
+        it. A blocked ask reports what is open now and leaves state untouched.
+        """
+        _, _, fla, _, kv = self._build_tri()
+        vs = [fla.alloc(2) for _ in range(4)]
+        for v in vs:
+            self._stamp(fla, kv, v)
+        fla.free(vs[1])  # an interior hole `compact_holes` would pack
+        epp = fla.entry_bytes_per_page
+        _, gap_high = fla._gap_pages()
+        ask = (gap_high + 2) * epp
+
+        def snapshot():
+            return (
+                fla.low_wm_page,
+                fla.high_wm_page,
+                fla._hole_pages(),
+                len(fla._inverse_history),
+            )
+
+        fla.host_transfer_move_gate = lambda: False
+        before = snapshot()
+        self.assertLess(fla.make_room(side="high", min_bytes=ask), ask)
+        self.assertEqual(fla.compact_holes(retreat_side="high"), 0)
+        self.assertEqual(snapshot(), before)
+        self._check_float_state(fla, kv)
+
+        fla.host_transfer_move_gate = lambda: True
+        self.assertGreaterEqual(fla.make_room(side="high", min_bytes=ask), ask)
+        self._check_float_state(fla, kv)
+
 
 class TestDcpWidening(unittest.TestCase):
     """`dcp_size > 1`: the alloc surface speaks a widened virtual id space while

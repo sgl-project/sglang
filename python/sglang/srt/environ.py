@@ -698,8 +698,9 @@ class Envs:
     SGLANG_DISAGGREGATION_BOOTSTRAP_ENTRY_CLEANUP_INTERVAL = EnvInt(120)
     # Deferred decode-side KV release: on abort, hold an in-flight request's KV
     # pages/slot until the prefill acks the transfer drained, or the timeout
-    # below fires. Off by default (no behavior/perf impact when disabled).
-    SGLANG_DISAGGREGATION_DEFERRED_DECODE_KV_RELEASE = EnvBool(False)
+    # below fires. Only applies to backends that ack the drain
+    # (supports_deferred_decode_kv_release).
+    SGLANG_DISAGGREGATION_DEFERRED_DECODE_KV_RELEASE = EnvBool(True)
     SGLANG_DISAGGREGATION_DEFERRED_DECODE_KV_RELEASE_TIMEOUT = EnvFloat(30.0)
 
     # ===================================================================
@@ -908,6 +909,12 @@ class Envs:
     SGLANG_ROCM_K3_FUSE_KDA_INPROJ_MAX_TOKENS = EnvInt(256)
     SGLANG_HACK_FLASHMLA_BACKEND = EnvStr("tilelang")
     SGLANG_USE_AITER_FP8_PER_TOKEN = EnvBool(False)
+    SGLANG_AMD_USE_FLYDSL_MEGA_MOE = EnvBool(False)
+    SGLANG_AMD_FLYDSL_MEGA_MOE_MTPR = EnvInt(8192)
+    SGLANG_AMD_FLYDSL_MEGA_QUANT = EnvStr("")
+    SGLANG_AITER_MEGA_RANK_SYNC = EnvBool(False)
+    SGLANG_AITER_MEGA_EPLB_PREFILL_ONLY = EnvBool(False)
+    SGLANG_AITER_MEGA_EPLB_FUSED_MAP_RECORD = EnvBool(False)
     # Above 8192 tokens of context, aiter's non-static workspace is large enough
     # that mem_fraction_static is scaled by 0.85 to leave room for it. Set this to
     # honor an explicitly passed --mem-fraction-static instead. Off by default:
@@ -971,10 +978,6 @@ class Envs:
     SGLANG_NPU_W4A4_NEW_PACKING = EnvBool(False)
     # Use the graph-safe Triton-Ascend kernel for masked speculative KV commits.
     SGLANG_NPU_USE_TRITON_PREFIX_KV_CACHE_STORE = EnvBool(False)
-    # Write K and V into the FIA paged KV cache with a single
-    # npu_scatter_pa_kv_cache call instead of two npu_scatter_nd_update_
-    # kernels (one write kernel launch instead of two per layer).
-    SGLANG_NPU_USE_SCATTER_PA_KV_CACHE = EnvBool(False)
     # Quantize x to int8 in the dispatch operator (vendor alias consumed by the
     # Ascend DeepEP library; the MTP draft-build scopes override it to False).
     DEEP_NORMAL_MODE_USE_INT8_QUANT = EnvBool(False)
@@ -1000,6 +1003,9 @@ class Envs:
     # on load. Unrelated to the NVFP4 block-FP8 NextN path above.
     SGLANG_GLM_NEXTN_MOE_PTPC = EnvBool(False)
     SGLANG_QUANT_ALLOW_DOWNCASTING = EnvBool(False)
+    # HIP: convert only MXFP8 dense linears to block-fp8; fused MoE stays MX 1x32,
+    # since the block-scale MoE kernel lacks SwiGLU-OAI
+    SGLANG_FORCE_MXFP8_BLOCK_CONVERT_DENSE = EnvBool(False)
     SGLANG_FP8_IGNORED_LAYERS = EnvStr("")
     SGLANG_FP4_IGNORED_LAYERS = EnvStr("")
     # On by default; set SGLANG_ENABLE_FP8_GEMM_CONFIG_TUNE=0 as a kill switch.
