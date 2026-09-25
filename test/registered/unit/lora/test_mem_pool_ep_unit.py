@@ -47,6 +47,9 @@ class _FakeFusedMoEWithLoRA(_FakeBaseLayerWithLoRA):
 _LORA_LAYERS_STUB = types.ModuleType("sglang.srt.lora.layers")
 _LORA_LAYERS_STUB.BaseLayerWithLoRA = _FakeBaseLayerWithLoRA
 _LORA_LAYERS_STUB.FusedMoEWithLoRA = _FakeFusedMoEWithLoRA
+_LORA_LAYERS_STUB.unwrap_lora_layer = lambda module: (
+    module.base_layer if isinstance(module, _FakeBaseLayerWithLoRA) else module
+)
 _LORA_ADAPTER_STUB = types.ModuleType("sglang.srt.lora.lora")
 _LORA_ADAPTER_STUB.LoRAAdapter = object
 with mock.patch.dict(

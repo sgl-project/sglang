@@ -21,7 +21,7 @@ from sglang.srt.distributed import (
 from sglang.srt.environ import envs
 from sglang.srt.layers.utils import get_layer_id
 from sglang.srt.lora.eviction_policy import get_eviction_policy
-from sglang.srt.lora.layers import BaseLayerWithLoRA
+from sglang.srt.lora.layers import BaseLayerWithLoRA, unwrap_lora_layer
 from sglang.srt.lora.lora import LoRAAdapter
 from sglang.srt.lora.lora_config import LoRAConfig
 from sglang.srt.lora.lora_registry import LoRARef
@@ -296,11 +296,7 @@ class LoRAMemoryPool:
             linears = {}
             for name, module in base_model.named_modules():
                 layer_id = get_layer_id(name)
-                base_layer = (
-                    module.base_layer
-                    if isinstance(module, BaseLayerWithLoRA)
-                    else module
-                )
+                base_layer = unwrap_lora_layer(module)
                 if layer_id is not None and (
                     hasattr(base_layer, "input_size_per_partition")
                     or hasattr(base_layer, "output_partition_sizes")
