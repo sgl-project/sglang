@@ -139,14 +139,14 @@ class GatedResidual(HyperConnectionBase):
                 self.hidden_size * self.hc_count,
                 self.config.hc_lowrank,
                 bias=False,
-                device=torch.cuda.current_device(),
+                device=torch.get_device_module().current_device(),
                 dtype=config.params_dtype,
             )
             self.input_mix_weight_up = nn.Linear(
                 self.config.hc_lowrank,
                 self.hc_count * self.hidden_size,
                 bias=False,
-                device=torch.cuda.current_device(),
+                device=torch.get_device_module().current_device(),
                 dtype=config.params_dtype,
             )
             lowrank = self.config.hc_lowrank
@@ -166,7 +166,7 @@ class GatedResidual(HyperConnectionBase):
                 self.hidden_size * self.hc_count,
                 self.hc_count,
                 bias=False,
-                device=torch.cuda.current_device(),
+                device=torch.get_device_module().current_device(),
                 dtype=config.params_dtype,
             )
             # hc_combine rejects other shapes; device and dtype are checked per call.

@@ -416,7 +416,6 @@ class MHCLayerCommunicator(LayerCommunicator):
         input_layernorm: torch.nn.Module,
         post_attention_layernorm: torch.nn.Module,
         allow_reduce_scatter: bool = False,
-        is_last_layer: bool = False,
         qkv_latent_func: Optional[Callable] = None,
         *,
         is_first_layer: bool,
@@ -440,7 +439,6 @@ class MHCLayerCommunicator(LayerCommunicator):
             input_layernorm,
             post_attention_layernorm,
             allow_reduce_scatter,
-            is_last_layer,
             qkv_latent_func,
         )
 
@@ -482,6 +480,7 @@ class MHCLayerCommunicator(LayerCommunicator):
         residual: torch.Tensor,
         forward_batch: ForwardBatch,
     ):
+        self.publish_attn_lora_layout()
         if self.is_first_layer:
             if get_attn_tp_context().input_scattered:
                 hidden_states, _ = tp_reduce_scatter(
@@ -527,6 +526,7 @@ class MHCLayerCommunicator(LayerCommunicator):
         forward_batch: ForwardBatch,
         cache=None,
     ):
+        self.publish_mlp_lora_layout()
         if cache is not None:
             self._context.cache = cache
 
@@ -556,6 +556,9 @@ class MHCLayerCommunicator(LayerCommunicator):
         return hidden_states, residual
 
     def should_fuse_mlp_allreduce_with_next_layer(self, forward_batch):
+        return False
+
+    def should_defer_ffn_reduction(self, forward_batch):
         return False
 
     def should_use_reduce_scatter(self, forward_batch: ForwardBatch):

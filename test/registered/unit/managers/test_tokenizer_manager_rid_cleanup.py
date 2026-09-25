@@ -201,6 +201,8 @@ def _make_batch_str_output(rid: str, finished_reason=None) -> BatchStrOutput:
             kwargs[f.name] = [[]]
         elif f.name in _PER_REQUEST_OPTIONAL_FIELDS:
             kwargs[f.name] = [None]
+        elif f.name == "output_token_sampling_mask":
+            kwargs[f.name] = None
         # Fields with class defaults — skip, let the default be used
         elif (
             f.default is not msgspec.NODEFAULT

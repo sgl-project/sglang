@@ -569,6 +569,41 @@ class TestTokenizerManagerLogprobs(CustomTestCase):
         self.assertEqual(meta_info["output_token_logprobs"], [(-0.25, 42, None)])
         self.assertEqual(meta_info["output_token_logprobs_length"], 1)
 
+    def test_top_and_token_ids_logprobs_without_logprob_lists(self):
+        """An output without logprob lists, as sent for a request aborted before
+        prefill, must not crash a request that asked for top or token id logprobs."""
+        state = _make_state(
+            return_logprob=True, top_logprobs_num=2, token_ids_logprob=[42]
+        )
+        recv_obj = SimpleNamespace(
+            input_token_logprobs_val=None,
+            output_token_logprobs_val=None,
+            input_top_logprobs_val=None,
+            input_top_logprobs_val_flat=None,
+            output_top_logprobs_val=None,
+            input_token_ids_logprobs_val=None,
+            output_token_ids_logprobs_val=None,
+        )
+        meta_info = {}
+
+        _TokenizerManagerStub().convert_logprob_style(
+            meta_info,
+            state,
+            top_logprobs_num=2,
+            token_ids_logprob=[42],
+            return_text_in_logprobs=False,
+            recv_obj=recv_obj,
+            recv_obj_index=0,
+        )
+
+        for key in (
+            "input_top_logprobs",
+            "output_top_logprobs",
+            "input_token_ids_logprobs",
+            "output_token_ids_logprobs",
+        ):
+            self.assertEqual(meta_info[key], [])
+
 
 def _make_batch_token_id_output(**overrides) -> BatchTokenIDOutput:
     """A two-request BatchTokenIDOutput with the required fields stubbed."""
@@ -601,7 +636,6 @@ def _make_batch_token_id_output(**overrides) -> BatchTokenIDOutput:
         output_token_ids_logprobs_idx=[[], []],
         output_token_entropy_val=None,
         output_token_sampling_mask=None,
-        output_token_sampling_logprobs=None,
         output_hidden_states=None,
         routed_experts=None,
         indexer_topk=None,
