@@ -56,6 +56,9 @@ class StageInput(msgspec.Struct, frozen=True):
     compute group does not span."""
 
     layout: Layout
+    # Token axes the consumer gathers over itself when its input arrives
+    # sharded over them.
+    gathers_itself: FrozenSet[TokenAxis] = frozenset()
 
 
 class StageOutput(msgspec.Struct, frozen=True):
@@ -87,34 +90,58 @@ class DecoderLayerSides(msgspec.Struct, frozen=True):
     """The declarations both sides of a decoder layer's boundaries are chosen
     from."""
 
-    # The rows the layer takes and hands on; the residual stays on them.
-    layer_rows: Layout
+    # The rows the layer's input and residual arrive on.
+    input_rows: Layout
     attention: StageInput
     attention_output: StageOutput
     ffn: StageInput
     ffn_output: StageOutput
+    # The rows the residual is on while the FFN runs.
+    ffn_residual_rows: Layout
+    # The rows the layer hands on.
+    output_rows: Layout
 
 
 def decoder_layer_sides(
     *,
     axis_sizes: Mapping[TokenAxis, int],
+    ffn_on_local_rows: bool,
+    previous_on_local_rows: bool,
+    is_last_layer: bool,
+    attention_gathers_local_rows: bool,
     ffn_group: SumGroup,
     leaves_for_next_layer: bool,
     leaves_for_reduce_scatter: bool,
     leaves_for_reduce_scatterv: bool,
 ) -> DecoderLayerSides:
-    """An attention followed by an FFN on the TP group (a dense MLP, or a MoE
-    not dispatched per DP shard), derived from the groups each computes over."""
+    """An attention followed by an FFN, derived from the groups each computes
+    over. The FFN runs either on the TP group (a dense MLP, or a MoE not
+    dispatched per DP shard) or on this rank's local rows (a MoE dispatched per
+    DP shard, which completes its own combine)."""
     # Attention computes over the attention-TP ranks of one DP (and CP) shard.
     attention = Layout.sharded_over(
         TokenAxis.ATTN_DP, TokenAxis.ATTN_CP, axis_sizes=axis_sizes
     )
-    # The TP group spans every token axis, so its FFN needs every row.
-    ffn = Layout.sharded_over(axis_sizes=axis_sizes)
+    # Each attention-TP rank's own slice of those rows.
+    local = Layout.sharded_over(
+        TokenAxis.ATTN_DP,
+        TokenAxis.ATTN_CP,
+        TokenAxis.ATTN_TP_SCATTER,
+        axis_sizes=axis_sizes,
+    )
+    # The TP group spans every token axis, so an FFN on it needs every row.
+    ffn = local if ffn_on_local_rows else Layout.sharded_over(axis_sizes=axis_sizes)
     attention_tp = axis_sizes[TokenAxis.ATTN_TP_SCATTER] > 1
     return DecoderLayerSides(
-        layer_rows=attention,
-        attention=StageInput(attention),
+        input_rows=local if previous_on_local_rows else attention,
+        attention=StageInput(
+            attention,
+            gathers_itself=(
+                frozenset({TokenAxis.ATTN_TP_SCATTER})
+                if attention_gathers_local_rows
+                else frozenset()
+            ),
+        ),
         # The output projection leaves the attention-TP sum to prepare_mlp.
         attention_output=StageOutput(
             attention,
@@ -122,11 +149,17 @@ def decoder_layer_sides(
             always_leaves=attention_tp,
         ),
         ffn=StageInput(ffn),
-        ffn_output=StageOutput(
-            ffn,
-            group=ffn_group,
-            leaves_for_next_layer=leaves_for_next_layer,
-            leaves_for_reduce_scatter=leaves_for_reduce_scatter,
-            leaves_for_reduce_scatterv=leaves_for_reduce_scatterv,
+        ffn_output=(
+            StageOutput(ffn)
+            if ffn_on_local_rows
+            else StageOutput(
+                ffn,
+                group=ffn_group,
+                leaves_for_next_layer=leaves_for_next_layer,
+                leaves_for_reduce_scatter=leaves_for_reduce_scatter,
+                leaves_for_reduce_scatterv=leaves_for_reduce_scatterv,
+            )
         ),
+        ffn_residual_rows=local if ffn_on_local_rows else attention,
+        output_rows=local if ffn_on_local_rows and not is_last_layer else attention,
     )
