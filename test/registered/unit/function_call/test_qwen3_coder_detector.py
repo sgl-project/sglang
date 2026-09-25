@@ -1,6 +1,7 @@
 """Unit tests for Qwen3CoderDetector -- no server, no model loading."""
 
 import json
+import time
 
 from sglang.srt.entrypoints.openai.protocol import Function, Tool
 from sglang.srt.function_call.qwen3_coder_detector import Qwen3CoderDetector
@@ -81,6 +82,34 @@ class TestQwen3CoderDetectorMalformedParameterEnd(CustomTestCase):
         self.assertEqual(
             json.loads(result.calls[0].parameters)["city"], "a <b>tag</b> city"
         )
+
+    def test_closed_value_ending_like_a_marker_is_kept(self):
+        """A value closed by a real </parameter> may itself end in "</parameters>"
+        or "</parameter_x>" (e.g. XML a coder model writes); only an unclosed
+        value can carry a drifted marker."""
+        for value in ("<config>\n  <p>1</p>\n</parameters>", "x </parameterList>"):
+            with self.subTest(value=value):
+                text = _call(f"{value}\n</parameter>")
+                parsed = Qwen3CoderDetector().detect_and_parse(text, TOOLS)
+                self.assertEqual(json.loads(parsed.calls[0].parameters)["city"], value)
+                self.assertEqual(
+                    json.loads(_stream(Qwen3CoderDetector(), text))["city"], value
+                )
+
+    def test_long_whitespace_run_in_unclosed_value_parses_in_linear_time(self):
+        """Finding a drifted marker at the end of an unclosed value must not rescan
+        from every whitespace position (quadratic on long whitespace runs)."""
+        value = "a" + " " * 100_000 + "b"
+        text = (
+            "<tool_call>\n<function=get_weather>\n"
+            f"<parameter=city>\n{value}\n"
+            "<parameter=days>\n3\n</parameter>\n"
+            "</function>\n</tool_call>"
+        )
+        start = time.perf_counter()
+        result = Qwen3CoderDetector().detect_and_parse(text, TOOLS)
+        self.assertLess(time.perf_counter() - start, 2.0)
+        self.assertEqual(json.loads(result.calls[0].parameters)["city"], value)
 
 
 if __name__ == "__main__":
