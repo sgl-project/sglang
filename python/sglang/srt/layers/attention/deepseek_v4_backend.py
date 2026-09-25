@@ -2894,6 +2894,11 @@ class DeepseekV4AttnBackend(
         core = self.forward_metadata.core_metadata
         state = self.token_to_kv_pool.get_attention_compress_states(layer.layer_id)
         kv, score = layer.compressor.project(x)
+        fuse_pool_norm = (
+            get_platform().is_sm90
+            and 0 < x.shape[0] <= 64
+            and layer.compressor.norm.weight.shape == (512,)
+        )
         pooled, group_pos, slots = c2_decode_pool(
             kv,
             score,
@@ -2905,6 +2910,8 @@ class DeepseekV4AttnBackend(
             state.kv_score_buffer.score,
             state.kv_score_buffer.shape[0] - 1,
             ring_size=state.ring_size,
+            norm_weight=layer.compressor.norm.weight if fuse_pool_norm else None,
+            norm_eps=layer.compressor.norm.eps,
         )
         self._low_ratio_write_group(
             layer,
@@ -2912,6 +2919,7 @@ class DeepseekV4AttnBackend(
             slots,
             group_pos,
             fuse_index_store=_is_sm100_or_newer(),
+            normalized=fuse_pool_norm,
         )
 
     def _low_ratio_compress_fused(self, layer, x, req, pos, *, draft_len=1) -> None:
@@ -3066,9 +3074,10 @@ class DeepseekV4AttnBackend(
         group_pos,
         *,
         fuse_index_store=False,
+        normalized=False,
     ) -> None:
         pool = self.token_to_kv_pool
-        latent = layer.compressor.finish(pooled)
+        latent = pooled if normalized else layer.compressor.finish(pooled)
         freqs = layer.freqs_cis[group_pos]
         # Index keys come from the pre-RoPE latent, so publish them first. Stored
         # as fp4 (per-32 ue8m0, no hadamard), matching the reference indexer.
