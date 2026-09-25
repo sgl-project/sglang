@@ -152,9 +152,21 @@ def create_branch(repo_owner, repo_name, branch, commit_sha, token):
         )
     except HTTPError as e:
         if e.code == 422 and "already exists" in e.error_body:
-            raise BranchCreateRace(branch) from e
-        # Other 422s include "Object does not exist" for a just-created commit,
-        # which the publish retry loop treats as transient.
+            # Only a race if the branch now exists; otherwise the name collides
+            # with a nested ref (gt/foo vs gt/foo/bar), and retrying cannot help.
+            if get_branch_head(repo_owner, repo_name, branch, token) is not None:
+                raise BranchCreateRace(branch) from e
+            raise RuntimeError(
+                f"cannot create branch {branch!r}: {e.error_body}. It is a path "
+                "prefix of an existing branch, or has one as a prefix; pick another."
+            ) from e
+        if e.code == 422:
+            # Also returned transiently for a just-created commit, so the publish
+            # retry loop retries it.
+            print(
+                f"Creating branch {branch!r} returned 422; retrying. If this persists, "
+                "the name may collide with an existing nested branch (gt/foo vs gt/foo/bar)."
+            )
         raise
     print(f"Created {repo_owner}/{repo_name} branch {branch}")
 
@@ -496,7 +508,6 @@ def publish(source_dir, target_dir, branch):
     # Commit with retry (handle concurrent pushes)
     max_retries = 5
     for attempt in range(max_retries):
-        creating_branch = False
         try:
             base_sha, branch_exists = get_base_sha(REPO_OWNER, REPO_NAME, branch, token)
             tree_sha = get_tree_sha(REPO_OWNER, REPO_NAME, base_sha, token)
@@ -543,7 +554,6 @@ def publish(source_dir, target_dir, branch):
                 update_branch_ref(REPO_OWNER, REPO_NAME, branch, commit_sha, token)
             else:
                 # Born with its first commit, so an empty run leaves no branch behind.
-                creating_branch = True
                 create_branch(REPO_OWNER, REPO_NAME, branch, commit_sha, token)
             print(
                 f"Successfully pushed {len(changed_files)} changed images (commit {commit_sha[:10]})"
@@ -583,12 +593,6 @@ def publish(source_dir, target_dir, branch):
                 time.sleep(wait)
             else:
                 print(f"Failed after {attempt + 1} attempts: {e}")
-                if creating_branch and isinstance(e, HTTPError) and e.code == 422:
-                    # e.g. "gt/foo" while "gt/foo/bar" exists: git refs cannot nest.
-                    print(
-                        f"Could not create branch {branch!r}; if it is a path prefix "
-                        "of an existing branch (or has one as a prefix), pick another."
-                    )
                 raise
 
 

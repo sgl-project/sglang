@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       ref:
-        description: 'Git ref to checkout'
+        description: 'Git ref to checkout and generate GT from. The publish scripts under scripts/ci/utils always run from the commit this workflow is dispatched from, so to test a change to them, dispatch from that branch.'
         required: false
         default: ''
         type: string
@@ -54,7 +54,7 @@ on:
         default: true
         type: boolean
       ci_data_branch:
-        description: "sgl-project/ci-data-diffusion branch to publish to; required when 'ref' is not main. main: shared, reaches every later pin bump from main (routine new-model GT). isolated: gt/<ref>, reachable only via this PR's pin (experiments such as a torch upgrade). Or an explicit gt/<name>."
+        description: "sgl-project/ci-data-diffusion branch to publish to; required unless the source ref (ref, or the dispatching branch when ref is empty) is main. main: shared, reaches every later pin bump from main (routine new-model GT). isolated: gt/<ref>, reachable only via this PR's pin (experiments such as a torch upgrade). Or an explicit gt/<name>."
         required: false
         default: ''
         type: string
@@ -797,7 +797,7 @@ jobs:
             echo
             echo "Branch \`$CI_DATA_BRANCH\` head: \`$head\`"
             echo
-            echo "To use this GT, set \`SGL_TEST_FILES_CI_DATA_REVISION\` in \`python/sglang/multimodal_gen/test/test_utils.py\` to \`$head\`."
+            echo "To use this GT, set the CUDA pin (the first \`SGL_TEST_FILES_CI_DATA_REVISION\` assignment, not the \`is_npu()\` one) in \`python/sglang/multimodal_gen/test/test_utils.py\` to \`$head\`."
             if [ "$CI_DATA_BRANCH" != main ]; then
               echo
               echo "This is an isolated branch: it is forked from main once and not refreshed, and later pin bumps from main will not include it. Merge it into ci-data-diffusion main when the PR that pins it lands, and do not delete it while any pin points at it."

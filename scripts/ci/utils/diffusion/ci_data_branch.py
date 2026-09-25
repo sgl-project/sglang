@@ -30,13 +30,33 @@ def _strip_ref(ref):
     return ref.removeprefix("refs/heads/")
 
 
+def _sanitize_branch_name(name):
+    """Rewrite ``name`` into a legal git branch name; may return ""."""
+    name = re.sub(r"[^A-Za-z0-9._/-]+", "-", name).replace("..", ".")
+    components = []
+    for component in name.split("/"):
+        # git check-ref-format: no component starts with "." or ends with ".lock".
+        component = component.lstrip(".")
+        if component.endswith(".lock"):
+            component = component.removesuffix(".lock") + "-lock"
+        if component:
+            components.append(component)
+    return "/".join(components).strip(".-")
+
+
 def _isolated_branch(source_ref):
-    name = source_ref.removeprefix("refs/")
-    name = re.sub(r"[^A-Za-z0-9._/-]+", "-", name)
-    name = re.sub(r"/+", "/", name).replace("..", ".").strip("/.-")
+    name = _sanitize_branch_name(source_ref.removeprefix("refs/"))
     if not name:
         raise SystemExit(f"cannot derive an isolated branch name from {source_ref!r}")
     return f"{ISOLATED_BRANCH_PREFIX}{name}"
+
+
+def _is_legal_isolated_branch(choice):
+    if not choice.startswith(ISOLATED_BRANCH_PREFIX):
+        return False
+    name = choice.removeprefix(ISOLATED_BRANCH_PREFIX)
+    # One definition of a legal name: whatever the sanitizer leaves unchanged.
+    return bool(name) and _sanitize_branch_name(name) == name
 
 
 def resolve_publish_branch(choice, source_ref):
@@ -50,16 +70,14 @@ def resolve_publish_branch(choice, source_ref):
                 f"got {source_ref!r}"
             )
         return _isolated_branch(source_ref)
-    if choice == MAIN_BRANCH or (
-        choice.startswith(ISOLATED_BRANCH_PREFIX)
-        and len(choice) > len(ISOLATED_BRANCH_PREFIX)
-    ):
+    if choice == MAIN_BRANCH or _is_legal_isolated_branch(choice):
         return choice
     if choice:
-        # Rejects typos such as "isloated", which would otherwise fork a new branch.
+        # Rejects typos such as "isloated", which would otherwise fork a new branch,
+        # and illegal names, which would only fail at publish after all GPU work.
         raise SystemExit(
             f"ci_data_branch must be {MAIN_BRANCH}, {ISOLATED_CHOICE}, or "
-            f"{ISOLATED_BRANCH_PREFIX}<name>; got {choice!r}"
+            f"{ISOLATED_BRANCH_PREFIX}<name> with a legal git branch name; got {choice!r}"
         )
     if source_ref == MAIN_BRANCH:
         return MAIN_BRANCH
