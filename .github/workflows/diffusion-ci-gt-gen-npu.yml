@@ -23,6 +23,11 @@ on:
         required: false
         default: ''
         type: string
+      ci_data_branch:
+        description: "sgl-project/ci-data-diffusion branch to publish to; required when 'ref' is not main. main: shared, reaches every later pin bump from main (routine new-model GT). isolated: gt/<ref>, reachable only via this PR's pin (experiments such as a torch upgrade). Or any branch name."
+        required: false
+        default: ''
+        type: string
 
 
 concurrency:
@@ -37,6 +42,11 @@ env:
   SGLANG_IS_IN_CI: true
   OUTPUT_NAME: ${{ inputs.output_name || 'diffusion-ci-outputs' }}
   PUBLISH_TARGET_DIR: ${{ inputs.publish_target_dir || 'diffusion-ci/consistency_gt/sglang_generated/ascend' }}
+  # Recorded in ci-data commits and used to resolve the ci-data branch.
+  GT_SOURCE_REF: ${{ inputs.ref || github.ref }}
+  # Publish tooling runs from this workflow's own commit, so a ref that predates
+  # it still publishes where this workflow says.
+  GT_TOOLS_DIR: gt-publish-tools
 
 jobs:
 
@@ -50,16 +60,30 @@ jobs:
       partition-count-2npu: ${{ steps.compute.outputs['partition-count-2npu'] }}
       plan-1npu: ${{ steps.compute.outputs.plan-1npu }}
       plan-2npu: ${{ steps.compute.outputs.plan-2npu }}
+      ci-data-branch: ${{ steps.ci-data-branch.outputs.ci-data-branch }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
           ref: ${{ inputs.ref || github.ref }}
 
+      - name: Checkout GT publish tooling
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          path: ${{ env.GT_TOOLS_DIR }}
+          sparse-checkout: scripts/ci/utils
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.10'
+
+      - name: Resolve ci-data-diffusion branch
+        id: ci-data-branch
+        run: |
+          python3 "$GT_TOOLS_DIR/scripts/ci/utils/diffusion/ci_data_branch.py" \
+            --choice "${{ inputs.ci_data_branch }}"
 
       - name: Verify write access to sgl-project/ci-data-diffusion
         env:
@@ -95,11 +119,20 @@ jobs:
     timeout-minutes: 150
     container:
       image: swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/cann:9.1.0-a3-ubuntu22.04-py3.12
+    env:
+      CI_DATA_BRANCH: ${{ needs.compute-diffusion-partitions.outputs.ci-data-branch }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
           ref: ${{ inputs.ref || github.ref }}
+
+      - name: Checkout GT publish tooling
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          path: ${{ env.GT_TOOLS_DIR }}
+          sparse-checkout: scripts/ci/utils
 
       - name: Mark repository safe
         run: |
@@ -151,7 +184,7 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GH_PAT_FOR_NIGHTLY_CI_DATA }}
         run: |
-          python scripts/ci/utils/diffusion/publish_diffusion_gt.py \
+          python "$GT_TOOLS_DIR/scripts/ci/utils/diffusion/publish_diffusion_gt.py" \
             --source-dir python/${{ env.OUTPUT_NAME }} \
             --target-dir "${{ env.PUBLISH_TARGET_DIR }}"
 
@@ -167,11 +200,20 @@ jobs:
     timeout-minutes: 150
     container:
       image: swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/cann:9.1.0-a3-ubuntu22.04-py3.12
+    env:
+      CI_DATA_BRANCH: ${{ needs.compute-diffusion-partitions.outputs.ci-data-branch }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
           ref: ${{ inputs.ref || github.ref }}
+
+      - name: Checkout GT publish tooling
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          path: ${{ env.GT_TOOLS_DIR }}
+          sparse-checkout: scripts/ci/utils
 
       - name: Mark repository safe
         run: |
@@ -223,6 +265,47 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GH_PAT_FOR_NIGHTLY_CI_DATA }}
         run: |
-          python scripts/ci/utils/diffusion/publish_diffusion_gt.py \
+          python "$GT_TOOLS_DIR/scripts/ci/utils/diffusion/publish_diffusion_gt.py" \
             --source-dir python/${{ env.OUTPUT_NAME }} \
             --target-dir "${{ env.PUBLISH_TARGET_DIR }}"
+
+  report-ci-data-head:
+    # Every publishing job commits to the same branch; its head after all of them
+    # finish is the one SHA that holds this run's complete GT.
+    needs:
+      - compute-diffusion-partitions
+      - multimodal-diffusion-gen-1npu
+      - multimodal-diffusion-gen-2npu
+    if: always() && github.repository == 'sgl-project/sglang'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Report ci-data-diffusion branch head
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT_FOR_NIGHTLY_CI_DATA }}
+          CI_DATA_BRANCH: ${{ needs.compute-diffusion-partitions.outputs.ci-data-branch }}
+          ANY_JOB_FAILED: ${{ contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') }}
+        run: |
+          if [ -z "$CI_DATA_BRANCH" ]; then
+            echo "No ci-data-diffusion branch was resolved; nothing was published."
+            exit 0
+          fi
+          if ! head=$(gh api "repos/sgl-project/ci-data-diffusion/git/ref/heads/$CI_DATA_BRANCH" --jq .object.sha) || [ -z "$head" ]; then
+            echo "::warning::Could not read ci-data-diffusion branch $CI_DATA_BRANCH: either no GT changed so it was never created, or the API call above failed."
+            exit 0
+          fi
+          {
+            echo "## ci-data-diffusion GT"
+            echo
+            echo "Branch \`$CI_DATA_BRANCH\` head: \`$head\`"
+            echo
+            echo "To use this GT, set \`SGL_TEST_FILES_CI_DATA_REVISION\` in \`python/sglang/multimodal_gen/test/test_utils.py\` to \`$head\`."
+            if [ "$CI_DATA_BRANCH" != main ]; then
+              echo
+              echo "This is an isolated branch: it is forked from main once and not refreshed, and later pin bumps from main will not include it. Merge it into ci-data-diffusion main when the PR that pins it lands, and do not delete it while any pin points at it."
+            fi
+            if [ "$ANY_JOB_FAILED" = true ]; then
+              echo
+              echo "**Warning:** at least one generation job failed or was cancelled, so this head is missing some of this run's GT."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+          cat "$GITHUB_STEP_SUMMARY"

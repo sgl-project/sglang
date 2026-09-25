@@ -2,11 +2,7 @@
 Publish diffusion CI ground-truth images to sgl-project/ci-data-diffusion
 via the GitHub API (same pattern as publish_traces.py).
 
-GT from sglang ``main`` is published to ci-data-diffusion ``main``. GT from any
-other sglang ref (a torch upgrade, a new-model PR) is published to an isolated
-``gt/<ref>`` branch forked from ``main``, so it only reaches CI through the SHA
-pin in ``test_utils.py`` of the PR that produced it, and never leaks into a later
-pin bump made from ``main``. Pass ``--branch main`` to publish to ``main`` anyway.
+The target branch is chosen by ci_data_branch.py; see its docstring.
 """
 
 import argparse
@@ -15,9 +11,10 @@ import hashlib
 import io
 import json
 import os
-import re
+import subprocess
 import sys
 from dataclasses import dataclass
+from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from urllib.error import HTTPError
 from urllib.parse import quote
@@ -32,7 +29,6 @@ if __package__:
         create_blobs,
         create_commit,
         create_tree,
-        get_branch_sha,
         get_tree_sha,
         is_permission_error,
         is_rate_limit_error,
@@ -40,13 +36,14 @@ if __package__:
         update_branch_ref,
         verify_token_permissions,
     )
+    from .ci_data_branch import MAIN_BRANCH, resolve_publish_branch
 else:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    from ci_data_branch import MAIN_BRANCH, resolve_publish_branch
     from publish_traces import (
         create_blobs,
         create_commit,
         create_tree,
-        get_branch_sha,
         get_tree_sha,
         is_permission_error,
         is_rate_limit_error,
@@ -57,8 +54,6 @@ else:
 
 REPO_OWNER = "sgl-project"
 REPO_NAME = "ci-data-diffusion"
-MAIN_BRANCH = "main"
-ISOLATED_BRANCH_PREFIX = "gt/"
 DEFAULT_TARGET_DIR = "diffusion-ci/consistency_gt/sglang_generated"
 
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp"}
@@ -112,62 +107,61 @@ def git_blob_sha(content):
     return hashlib.sha1(header + content).hexdigest()
 
 
-def resolve_publish_branch(branch, source_ref):
-    """Pick the ci-data-diffusion branch a GT-gen run publishes to.
+def get_branch_head(repo_owner, repo_name, branch, token):
+    """Head SHA of ``branch``, or None if it does not exist.
 
-    An explicit ``branch`` wins. Otherwise GT built from sglang ``main`` goes to
-    ``main`` and GT built from anything else goes to ``gt/<source_ref>``.
+    Uses the singular ``git/ref`` endpoint: the plural ``git/refs/heads/<name>``
+    prefix-matches, returning a list for ``gt/foo`` when only ``gt/foo-rc1`` exists.
     """
-    if branch:
-        return branch
-    ref = (source_ref or "").strip()
-    ref = ref.removeprefix("refs/heads/").removeprefix("refs/")
-    if ref in ("", MAIN_BRANCH):
-        return MAIN_BRANCH
-    ref = re.sub(r"[^A-Za-z0-9._/-]+", "-", ref).strip("/.-")
-    ref = re.sub(r"/+", "/", ref).replace("..", ".")
-    if not ref:
-        raise ValueError(f"cannot derive a branch name from ref {source_ref!r}")
-    return f"{ISOLATED_BRANCH_PREFIX}{ref}"
-
-
-def get_branch_sha_or_none(repo_owner, repo_name, branch, token):
+    url = (
+        f"https://api.github.com/repos/{repo_owner}/{repo_name}/git/ref/heads/"
+        f"{quote(branch, safe='/')}"
+    )
     try:
-        return get_branch_sha(repo_owner, repo_name, branch, token)
+        response = make_github_request(url, token)
     except HTTPError as e:
         if e.code == 404:
             return None
         raise
+    return json.loads(response)["object"]["sha"]
 
 
-def ensure_branch(repo_owner, repo_name, branch, base_branch, token):
-    """Return the head SHA of ``branch``, forking it from ``base_branch`` if absent."""
-    sha = get_branch_sha_or_none(repo_owner, repo_name, branch, token)
-    if sha is not None:
-        return sha
-    base_sha = get_branch_sha(repo_owner, repo_name, base_branch, token)
+def get_base_sha(repo_owner, repo_name, branch, token):
+    """The commit to compare against and build on: ``branch``, else ``main`` before it exists."""
+    head = get_branch_head(repo_owner, repo_name, branch, token)
+    if head is not None:
+        return head, True
+    base = get_branch_head(repo_owner, repo_name, MAIN_BRANCH, token)
+    if base is None:
+        raise RuntimeError(f"{repo_owner}/{repo_name} has no {MAIN_BRANCH} branch")
+    return base, False
+
+
+class BranchCreateRace(Exception):
+    """A parallel job created the branch between our lookup and our create."""
+
+
+def create_branch(repo_owner, repo_name, branch, commit_sha, token):
     url = f"https://api.github.com/repos/{repo_owner}/{repo_name}/git/refs"
     try:
         make_github_request(
             url,
             token,
             method="POST",
-            data={"ref": f"refs/heads/{branch}", "sha": base_sha},
+            data={"ref": f"refs/heads/{branch}", "sha": commit_sha},
         )
-        print(f"Created {repo_owner}/{repo_name} branch {branch} at {base_sha[:10]}")
-        return base_sha
     except HTTPError as e:
-        # A parallel matrix job created it first.
-        if e.code == 422 and "already exists" in getattr(e, "error_body", ""):
-            return get_branch_sha(repo_owner, repo_name, branch, token)
+        body = e.error_body
+        if e.code == 422 and "already exists" in body:
+            raise BranchCreateRace(branch) from e
+        if e.code == 422:
+            # e.g. "gt/foo" while "gt/foo/bar" exists: git refs cannot nest.
+            raise RuntimeError(
+                f"cannot create {repo_owner}/{repo_name} branch {branch!r}: {body}. "
+                "Pick a ci_data_branch that is not a path prefix of an existing branch."
+            ) from e
         raise
-
-
-def resolve_read_ref(repo_owner, repo_name, branch, token):
-    """The ref existing GT is compared against: ``branch``, or ``main`` before it exists."""
-    if get_branch_sha_or_none(repo_owner, repo_name, branch, token) is not None:
-        return branch
-    return MAIN_BRANCH
+    print(f"Created {repo_owner}/{repo_name} branch {branch}")
 
 
 def get_remote_image_entries(repo_owner, repo_name, target_dir, token, ref):
@@ -419,10 +413,11 @@ def check_quality(source_dir, target_dir, branch):
         print(f"No image files found in {source_dir}")
         return
 
-    read_ref = resolve_read_ref(REPO_OWNER, REPO_NAME, branch, token)
+    base_sha, branch_exists = get_base_sha(REPO_OWNER, REPO_NAME, branch, token)
+    read_ref = branch if branch_exists else MAIN_BRANCH
     print(f"Comparing against existing GT on {REPO_OWNER}/{REPO_NAME}@{read_ref}")
     remote_image_entries = get_remote_image_entries(
-        REPO_OWNER, REPO_NAME, target_dir, token, read_ref
+        REPO_OWNER, REPO_NAME, target_dir, token, base_sha
     )
     remote_blob_shas = {
         path: item["sha"] for path, item in remote_image_entries.items()
@@ -450,36 +445,31 @@ def build_commit_message(target_dir, num_files):
         lines.append(f"Triggered-by: {os.environ['GITHUB_TRIGGERING_ACTOR']}")
     if os.environ.get("GT_SOURCE_REF"):
         lines.append(f"Source-ref: {os.environ['GT_SOURCE_REF']}")
-    if os.environ.get("GT_SOURCE_SHA"):
-        lines.append(f"Source-sha: {os.environ['GT_SOURCE_SHA']}")
+    # The cwd is the sglang checkout the GT was generated from.
+    rev = subprocess.run(
+        ["git", "rev-parse", "HEAD"], capture_output=True, text=True, check=False
+    )
+    if rev.returncode == 0:
+        lines.append(f"Source-sha: {rev.stdout.strip()}")
     try:
-        from importlib.metadata import version
-
         lines.append(f"Torch: {version('torch')}")
-    except Exception:
+    except PackageNotFoundError:
         pass
     return "\n".join(lines).rstrip() + "\n"
 
 
 def report_published_commit(branch, commit_sha, target_dir):
-    lines = [
-        f"Published GT to {REPO_OWNER}/{REPO_NAME}@{branch} "
-        f"({target_dir}): {commit_sha}",
-    ]
-    if branch != MAIN_BRANCH:
-        lines.append(
-            f"This GT is on the isolated branch {branch}, not main. To use it, "
-            "set SGL_TEST_FILES_CI_DATA_REVISION in "
-            f"python/sglang/multimodal_gen/test/test_utils.py to {commit_sha} "
-            f"(the head of {branch} once every job has published) in the same PR, "
-            f"and merge {branch} into {REPO_NAME} main when that PR lands."
-        )
-    for line in lines:
-        print(line)
+    # Other jobs of the run commit to the same branch; the SHA to pin is the head
+    # printed by the workflow's final report job, not this intermediate commit.
+    line = (
+        f"Published GT to {REPO_OWNER}/{REPO_NAME}@{branch} ({target_dir}) "
+        f"as {commit_sha}. Pin the branch head from the run's final report job."
+    )
+    print(line)
     summary_path = os.environ.get("GITHUB_STEP_SUMMARY")
     if summary_path:
         with open(summary_path, "a", encoding="utf-8") as f:
-            f.write("\n\n".join(lines) + "\n")
+            f.write(line + "\n")
 
 
 def publish(source_dir, target_dir, branch):
@@ -512,12 +502,10 @@ def publish(source_dir, target_dir, branch):
     max_retries = 5
     for attempt in range(max_retries):
         try:
-            branch_sha = ensure_branch(
-                REPO_OWNER, REPO_NAME, branch, MAIN_BRANCH, token
-            )
-            tree_sha = get_tree_sha(REPO_OWNER, REPO_NAME, branch_sha, token)
+            base_sha, branch_exists = get_base_sha(REPO_OWNER, REPO_NAME, branch, token)
+            tree_sha = get_tree_sha(REPO_OWNER, REPO_NAME, base_sha, token)
             remote_image_entries = get_remote_image_entries(
-                REPO_OWNER, REPO_NAME, target_dir, token, branch
+                REPO_OWNER, REPO_NAME, target_dir, token, base_sha
             )
             remote_blob_shas = {
                 path: item["sha"] for path, item in remote_image_entries.items()
@@ -553,14 +541,23 @@ def publish(source_dir, target_dir, branch):
 
             commit_msg = build_commit_message(target_dir, len(changed_files))
             commit_sha = create_commit(
-                REPO_OWNER, REPO_NAME, new_tree_sha, branch_sha, commit_msg, token
+                REPO_OWNER, REPO_NAME, new_tree_sha, base_sha, commit_msg, token
             )
-            update_branch_ref(REPO_OWNER, REPO_NAME, branch, commit_sha, token)
+            if branch_exists:
+                update_branch_ref(REPO_OWNER, REPO_NAME, branch, commit_sha, token)
+            else:
+                # Born with its first commit, so an empty run leaves no branch behind.
+                create_branch(REPO_OWNER, REPO_NAME, branch, commit_sha, token)
             print(
                 f"Successfully pushed {len(changed_files)} changed images (commit {commit_sha[:10]})"
             )
             report_published_commit(branch, commit_sha, target_dir)
             return
+        except BranchCreateRace:
+            if attempt < max_retries - 1:
+                print(f"Branch {branch} was created concurrently, retrying...")
+                continue
+            raise
         except Exception as e:
             if is_rate_limit_error(e):
                 print("Rate-limited, skipping.")
@@ -624,16 +621,15 @@ def main():
     )
     parser.add_argument(
         "--branch",
-        default=None,
+        default=os.environ.get("CI_DATA_BRANCH", ""),
         help=(
-            f"{REPO_NAME} branch to publish to. Default: {MAIN_BRANCH} when "
-            f"--source-ref is sglang {MAIN_BRANCH}, else "
-            f"{ISOLATED_BRANCH_PREFIX}<source-ref>"
+            f"{REPO_NAME} branch: {MAIN_BRANCH}, isolated, or a branch name "
+            "(default: $CI_DATA_BRANCH; see ci_data_branch.py)"
         ),
     )
     parser.add_argument(
         "--source-ref",
-        default=os.environ.get("GT_SOURCE_REF"),
+        default=os.environ.get("GT_SOURCE_REF", ""),
         help="The sglang ref the GT was generated from (default: $GT_SOURCE_REF)",
     )
     parser.add_argument(
@@ -645,10 +641,16 @@ def main():
 
     per_platform = os.environ.get("SGLANG_DIFFUSION_GT_PER_PLATFORM") == "1"
     target_dir = _resolve_target_dir(args.target_dir, per_platform)
-    branch = resolve_publish_branch(args.branch, args.source_ref)
     if args.check_only:
+        # Read-only, so an unchosen branch just compares against main.
+        branch = (
+            resolve_publish_branch(args.branch, args.source_ref)
+            if args.branch
+            else MAIN_BRANCH
+        )
         check_quality(args.source_dir, target_dir, branch)
     else:
+        branch = resolve_publish_branch(args.branch, args.source_ref)
         publish(args.source_dir, target_dir, branch)
 
 
