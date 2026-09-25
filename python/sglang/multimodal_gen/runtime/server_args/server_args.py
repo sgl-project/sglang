@@ -217,6 +217,10 @@ BREAKABLE_CUDA_GRAPH_SUPPORTED_MODEL_IDS = frozenset(
         "ltx-2.3",
         "minimax-h3",
         "minimaxai/minimax-h3",
+        "inclusionai/ming-image-0.1-design",
+        "inclusionai/ming-image-0.1-design-layer",
+        "ming-image-0.1-design",
+        "ming-image-0.1-design-layer",
         "qwen/qwen-image",
         "qwen/qwen-image-2512",
         "qwen/qwen-image-2.1",
@@ -242,6 +246,8 @@ BREAKABLE_CUDA_GRAPH_SUPPORTED_PIPELINE_CONFIGS = frozenset(
         "LongCatImagePipelineConfig",
         "LongCatImageEditPipelineConfig",
         "MiniMaxH3PipelineConfig",
+        "MingImagePipelineConfig",
+        "MingImageLayerPipelineConfig",
         "QwenImagePipelineConfig",
         "QwenImage21PipelineConfig",
         "SanaPipelineConfig",
@@ -613,6 +619,7 @@ class ServerArgs(DisaggServerArgsMixin):
 
     # SGLang server for PE model inference
     pe_server_url: str | None = None
+    prompt_enhancer_config: str | None = None
 
     @property
     def broker_port(self) -> int:
@@ -3053,6 +3060,12 @@ class ServerArgs(DisaggServerArgsMixin):
             type=str,
             default=ServerArgs.pe_server_url,
             help="URL of SGLang server for PE model",
+        )
+        parser.add_argument(
+            "--prompt-enhancer-config",
+            type=str,
+            default=ServerArgs.prompt_enhancer_config,
+            help="JSON config file for an external SRT prompt enhancer, used by HTTP requests with enhance_prompt=true.",
         )
 
         return parser

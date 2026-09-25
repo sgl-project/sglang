@@ -1714,7 +1714,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             self.req_to_metadata_buffer_idx_allocator.alloc()
         )
         assert decode_req.metadata_buffer_index is not None
-        page_indices = kv_to_page_indices(kv_indices, page_size).astype(np.int32)
+        page_indices = self._transfer_page_indices(decode_req, kv_indices, page_size)
         if (
             metadata_kwargs.get("destination") != KVTransferDestination.HOST
             and self.transfer_queue.enable_staging
@@ -2041,6 +2041,17 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         )
         return num_new_pages * page_size
 
+    def _alloc_for_decode_prealloc(
+        self, allocator: BaseTokenToKVPoolAllocator, **kwargs
+    ) -> torch.Tensor:
+        return alloc_for_decode_prealloc(allocator, **kwargs)
+
+    def _transfer_page_indices(
+        self, decode_req: DecodeRequest, kv_indices: torch.Tensor, page_size: int
+    ) -> np.ndarray:
+        # int32 for ZMQ serialization -- from_zmq reads np.int32.
+        return kv_to_page_indices(kv_indices, page_size).astype(np.int32)
+
     def _pre_alloc(
         self,
         req: Req,
@@ -2149,7 +2160,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 coordinator.host_token_len(fill_len),
             )
         else:
-            kv_loc = alloc_for_decode_prealloc(
+            kv_loc = self._alloc_for_decode_prealloc(
                 allocator,
                 req=req,
                 fill_len=fill_len,
@@ -2854,6 +2865,9 @@ class SchedulerDisaggregationDecodeMixin:
         """A normal scheduler loop for decode worker in disaggregation mode."""
 
         while True:
+            if self.gracefully_exit:
+                break
+
             # Pending rooms from the prior cycle can overlap request intake and
             # the tail of the in-flight decode graph.
             if not self._engine_paused:
@@ -2898,6 +2912,9 @@ class SchedulerDisaggregationDecodeMixin:
             self.process_batch_result(tmp_batch, tmp_result)
 
         while True:
+            if self.gracefully_exit:
+                break
+
             # Pending rooms from the prior cycle can overlap request intake and
             # the tail of the in-flight decode graph.
             if not self._engine_paused:

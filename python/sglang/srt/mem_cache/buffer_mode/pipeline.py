@@ -507,8 +507,13 @@ class BufferModePipeline:
         return states
 
     def flush_pending_writes(self) -> None:
-        """Launch D2H transfers for admitted intents, head-of-line: device
-        locks and staging slots are taken only here, when capacity allows."""
+        """Stage admitted intents, then submit their D2H as one operation.
+
+        Preparation must not allocate or free L1 KV slots: it only allocates
+        host staging, and buffer-mode evict_host is a no-op. Flush before
+        returning to scheduler admission, where L1 slots can be reused.
+        Each staged source stays locked until its D2H ack.
+        """
         if not self.pending_write_queue:
             return
         cc = self._cache.cache_controller
@@ -560,24 +565,29 @@ class BufferModePipeline:
                 # instead of failing the alloc inside cc.write; acks free
                 # aux staging, retry next round.
                 break
-            if not self._launch_backup_intent(intent, device_value, comp_xfers):
+            if not self._stage_backup_intent(intent, device_value, comp_xfers):
                 # Pool full of in-flight staging and nothing reclaimable
                 # (the tree never holds host values in buffer mode):
                 # defer, head-of-line; pending acks will free slots.
                 break
             self.pending_write_queue.popleft()
 
-    def _launch_backup_intent(
+        # Submit earlier successes even if a later intent ran out of staging.
+        # Do not leave prepared copies deferred across scheduler admission.
+        cc.start_writing()
+
+    def _stage_backup_intent(
         self,
         intent: _UnifiedBackupIntent,
         device_value: torch.Tensor,
         comp_xfers: dict[ComponentType, list[PoolTransfer]],
     ) -> bool:
-        """Launch one admitted intent's D2H (staging alloc + device lock +
-        async copy); the caller removes it from pending_write_queue. Returns
-        False when staging cannot be allocated. From a successful launch the
-        intent always reaches its storage-ack, so its content joins the
-        LAUNCHED cover consulted by admission."""
+        """Allocate host staging and pin one admitted intent's source.
+
+        The caller removes successful intents from pending_write_queue and
+        submits them together before returning. Return False when staging
+        cannot be allocated.
+        """
         cache = self._cache
         cc = cache.cache_controller
         snapshot = intent.snapshot
@@ -591,6 +601,7 @@ class BufferModePipeline:
             device_value,
             node_id=snapshot.node_id,
             extra_pools=aux_xfers or None,
+            flush=False,
         )
         if host_indices is None:
             return False
