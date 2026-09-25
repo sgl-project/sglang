@@ -3,6 +3,13 @@
 Wrong head indices do not fail loudly: the transfer delivers the wrong channels
 and the only symptom is a garbled end-to-end accuracy score.
 
+Under GQA the rank count on either side can exceed the KV head count, so ranks
+replicate a shared head and the map must divide by the replication factor
+(QKVParallelLinear: tp_rank // num_kv_head_replicas). A modulo map hands ranks
+1..r-1 of each group a head they do not own. No end-to-end test reaches that
+shape: every heterogeneous-TP suite runs with tp <= total_kv_heads on both
+sides, where the two maps agree.
+
 Expected values are derived by hand from the head-distribution rules, never by
 calling the implementation, so a bug in it cannot make both sides agree.
 """
@@ -26,12 +33,6 @@ class TestHeadSliceParamsGather(CustomTestCase):
             self.SRC_TP, self.DST_TP, src_rank, dst_rank, self.KV_HEADS
         )
 
-    def test_each_prefill_rank_sends_its_own_two_heads(self):
-        for src_rank in range(self.SRC_TP):
-            src_start, num_heads, _, _ = self._call(src_rank)
-            self.assertEqual(src_start, 0, f"rank {src_rank} sends from its own base")
-            self.assertEqual(num_heads, 2, f"rank {src_rank} owns 8//4 = 2 heads")
-
     def test_prefill_ranks_tile_the_decode_head_range(self):
         self.assertEqual([self._call(r)[2] for r in range(4)], [0, 2, 0, 2])
 
@@ -48,20 +49,12 @@ class TestHeadSliceParamsScatter(CustomTestCase):
             self.SRC_TP, self.DST_TP, src_rank, dst_rank, self.KV_HEADS
         )
 
-    def test_each_decode_rank_takes_two_heads_at_its_own_base(self):
-        for dst_rank in range(self.DST_TP):
-            _, num_heads, dst_start, _ = self._call(dst_rank)
-            self.assertEqual(num_heads, 2, "decode rank owns 8//4 = 2 heads")
-            self.assertEqual(dst_start, 0, "decode rank writes at its own base")
-
     def test_decode_ranks_walk_the_prefill_head_range(self):
         self.assertEqual([self._call(d)[0] for d in range(4)], [0, 2, 0, 2])
 
 
-class TestHeadSliceParamsGqaReplication(CustomTestCase):
-    """Fewer KV heads than decode ranks: consecutive decode ranks replicate a
-    shared head, so the map must divide by the replication factor. A modulo map
-    hands ranks 1..r-1 of each group a head they do not own."""
+class TestHeadSliceParamsScatterReplication(CustomTestCase):
+    """More decode ranks than KV heads: consecutive decode ranks share a head."""
 
     SRC_TP, DST_TP, KV_HEADS = 1, 4, 2
 
@@ -71,16 +64,41 @@ class TestHeadSliceParamsGqaReplication(CustomTestCase):
         )
 
     def test_replicating_decode_ranks_read_the_same_head(self):
-        self.assertEqual([self._call(d)[0] for d in range(4)], [0, 0, 1, 1])
-
-    def test_modulo_mapping_would_disagree(self):
-        self.assertNotEqual([self._call(d)[0] for d in range(4)], [0, 1, 0, 1])
+        starts = [self._call(d)[0] for d in range(4)]
+        self.assertEqual(starts, [0, 0, 1, 1])
+        self.assertNotEqual(starts, [0, 1, 0, 1], "a modulo map would give this")
 
     def test_each_decode_rank_takes_a_single_head(self):
         for dst_rank in range(self.DST_TP):
             _, num_heads, dst_start, _ = self._call(dst_rank)
             self.assertEqual(num_heads, 1, "max(1, 2 // 4) clamps to one head")
             self.assertEqual(dst_start, 0)
+
+
+class TestHeadSliceParamsGatherReplication(CustomTestCase):
+    """More prefill ranks than KV heads -- the gather-side mirror of
+    TestHeadSliceParamsScatterReplication, and the branch that reads
+    src_replication rather than dst_replication."""
+
+    SRC_TP, DST_TP, KV_HEADS = 8, 2, 4
+
+    def _call(self, src_rank):
+        return compute_head_slice_params(
+            self.SRC_TP, self.DST_TP, src_rank, 0, self.KV_HEADS
+        )
+
+    def test_replicating_prefill_ranks_write_the_same_head(self):
+        starts = [self._call(r)[2] for r in range(8)]
+        self.assertEqual(starts, [0, 0, 1, 1, 0, 0, 1, 1])
+        self.assertNotEqual(
+            starts, [0, 1, 0, 1, 0, 1, 0, 1], "a modulo map would give this"
+        )
+
+    def test_each_prefill_rank_sends_a_single_head(self):
+        for src_rank in range(self.SRC_TP):
+            src_start, num_heads, _, _ = self._call(src_rank)
+            self.assertEqual(num_heads, 1, "max(1, 4 // 8) clamps to one head")
+            self.assertEqual(src_start, 0, "gather always sends from the rank base")
 
 
 class TestHeadSliceParamsEqualTp(CustomTestCase):
@@ -90,13 +108,6 @@ class TestHeadSliceParamsEqualTp(CustomTestCase):
                 4, 4, rank, rank, 8
             )
             self.assertEqual((src_start, num_heads, dst_start), (0, 2, 0))
-
-
-class TestHeadSliceParamsContract(CustomTestCase):
-    def test_second_and_fourth_results_are_the_same_count(self):
-        for src_tp, dst_tp, kv_heads in ((4, 2, 8), (2, 4, 8), (1, 4, 2), (8, 8, 8)):
-            result = compute_head_slice_params(src_tp, dst_tp, 1, 1, kv_heads)
-            self.assertEqual(result[1], result[3])
 
 
 if __name__ == "__main__":
