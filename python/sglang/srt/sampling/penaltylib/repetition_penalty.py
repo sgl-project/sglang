@@ -49,11 +49,11 @@ class BatchedRepetitionPenalizer(_BatchedPenalizer):
             .unsqueeze_(1)
         )
 
-    def _cumulate_output_tokens(self, output_ids: torch.Tensor):
-        self.cumulated_repetition_penalties.scatter_(
+    def _cumulate_output_tokens(self, output_ids: torch.Tensor, rows: slice):
+        self.cumulated_repetition_penalties[rows].scatter_(
             dim=1,
             index=output_ids.unsqueeze(1),
-            src=self.repetition_penalties,
+            src=self.repetition_penalties[rows],
         )
 
     def _apply(self, logits: torch.Tensor) -> torch.Tensor:
