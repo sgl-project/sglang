@@ -1236,25 +1236,59 @@ class Qwen4ExpPLELayer(nn.Module):
         query = hidden_states.reshape(token_count, hc_count, hidden_size)
         key_normed = self._apply_ple_norm(self.norm_key, key)
         query_normed = self._apply_ple_norm(self.norm_query, query)
-        gate = (key_normed * query_normed).sum(dim=-1, keepdim=True)
-        gate = gate / math.sqrt(hidden_size)
-        fused_gate_value = False
-        if batch.use_decode_fast_path:
-            from sglang.kernels.ops.qwen4_ple import (
-                can_fuse_qwen4_gate_value,
-                fused_qwen4_gate_value,
-            )
+        from sglang.kernels.ops.qwen4_ple import (
+            can_fuse_qwen4_gate_reduce,
+            fused_qwen4_gate_reduce,
+        )
 
-            fused_gate_value = can_fuse_qwen4_gate_value(gate, value)
-        if fused_gate_value:
-            gated_value = fused_qwen4_gate_value(gate, value)
+        fused_gate_reduce = (
+            self.ple_embedding.enable_ple_fusion
+            and batch.mode.is_target_verify()
+            and can_fuse_qwen4_gate_reduce(key_normed, query_normed, value)
+        )
+        if fused_gate_reduce:
+            gated_value = fused_qwen4_gate_reduce(key_normed, query_normed, value)
         else:
-            gate = gate.abs().clamp_min(1e-6).sqrt() * gate.sign()
-            gate = torch.sigmoid(gate)
-            gated_value = gate * value.unsqueeze(-2)
+            gate = (key_normed * query_normed).sum(dim=-1, keepdim=True)
+            gate = gate / math.sqrt(hidden_size)
+            fused_gate_value = False
+            if batch.use_decode_fast_path:
+                from sglang.kernels.ops.qwen4_ple import (
+                    can_fuse_qwen4_gate_value,
+                    fused_qwen4_gate_value,
+                )
+
+                fused_gate_value = can_fuse_qwen4_gate_value(gate, value)
+            if fused_gate_value:
+                gated_value = fused_qwen4_gate_value(gate, value)
+            else:
+                gate = gate.abs().clamp_min(1e-6).sqrt() * gate.sign()
+                gate = torch.sigmoid(gate)
+                gated_value = gate * value.unsqueeze(-2)
         gated_value_normed = self._apply_ple_norm(self.norm_conv, gated_value)
         gated_value = gated_value.flatten(-2)
         gated_value_normed = gated_value_normed.flatten(-2)
+        if self.ple_embedding.enable_ple_fusion and batch.mode.is_target_verify():
+            from sglang.kernels.ops.qwen4_ple import (
+                can_fuse_qwen4_verify_conv,
+                fused_qwen4_verify_conv,
+            )
+
+            pool = get_req_to_token_pool()
+            conv_args = (
+                gated_value_normed,
+                gated_value,
+                self.conv1d.weight,
+                pool.short_conv_layer_cache(self.layer_id),
+                batch.state_indices,
+                batch.valid_tokens,
+                batch.row_width,
+                self.short_conv_dilation,
+                pool.short_conv_layer_intermediate_cache(self.layer_id),
+            )
+            if can_fuse_qwen4_verify_conv(*conv_args):
+                output = fused_qwen4_verify_conv(*conv_args)
+                return _pad_token_rows(output, batch.physical_tokens)
         conv_output = self._short_conv(
             gated_value_normed,
             forward_batch,
