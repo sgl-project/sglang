@@ -29,7 +29,7 @@ from sglang.kernels.ops.attention.dsv4.dequant_k_cache import (
     gather_dequant_requant_fp8_paged,
     q8kv8_padded_num_heads,
 )
-from sglang.kernels.ops.attention.dsv4.fp4_indexer import fp4_index_logits_decode
+from sglang.kernels.ops.attention.dsv4.fp4_indexer import fp4_index_logits_decode_paged
 from sglang.kernels.ops.attention.dsv4.kv_layout import KVLayout
 from sglang.kernels.ops.attention.dsv4.metadata_kernel import (
     fill_all_compressed_indices,
@@ -3521,16 +3521,21 @@ class DeepseekV4AttnBackend(
             return
         q = indexer.queries(q_lora, layer.freqs_cis[pos])
         weights = indexer.head_weights(x)
-        j = torch.arange(lmax, device=pos.device)
-        valid = j[None, :] < lens[:, None]
-        slots = (
-            self.req_to_token[req[:, None], (j * ratio)[None, :]].to(torch.int64)
-            // ratio
-        )
-        slots = slots.masked_fill(~valid, 0)
         table = pool.get_index_k_with_scale_buffer(layer.layer_id)
-        s = fp4_index_logits_decode(
-            q, weights, slots, lens, table, table.shape[1] // 68
+        # Resolve slots in the Triton tile instead of materializing [bs, lmax]
+        # int64 slots here. That intermediate scales with the configured context
+        # limit rather than visible lengths (e.g., 1,536 verify rows x 1M x 8 B
+        # is 12 GiB). The warmup/capture row count depends on the configuration.
+        s = fp4_index_logits_decode_paged(
+            q,
+            weights,
+            self.req_to_token,
+            req,
+            ratio,
+            lmax,
+            lens,
+            table,
+            table.shape[1] // 68,
         )
         if indexer.is_candidate_source:
             mask = select_candidate_blocks(
@@ -3554,9 +3559,14 @@ class DeepseekV4AttnBackend(
             idx = idx.masked_fill(idx < 0, lmax)
         idx = idx.sort(dim=-1).values
         reach = idx < lens[:, None]
-        page_indices[:bs, :k] = torch.where(
-            reach, slots.gather(1, idx.clamp_max(lmax - 1)), -1
-        ).to(torch.int32)
+        # Only resolve selected slots: [bs, k], instead of [bs, lmax].
+        selected_slots = (
+            self.req_to_token[req[:, None], (idx.clamp_max(lmax - 1) * ratio)].to(
+                torch.int64
+            )
+            // ratio
+        )
+        page_indices[:bs, :k] = torch.where(reach, selected_slots, -1).to(torch.int32)
         if raw_indices is not None:
             raw_indices[:bs, :k] = torch.where(reach, idx, -1).to(torch.int32)
 
