@@ -4,6 +4,7 @@ from unittest.mock import Mock, patch
 
 import torch
 
+from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.schedule_batch import ReqLogprob
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
@@ -11,6 +12,7 @@ from sglang.srt.managers.scheduler_components.batch_result_processor import (
 from sglang.srt.managers.scheduler_components.logprob_result_processor import (
     SchedulerLogprobResultProcessor,
 )
+from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
 from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -111,31 +113,15 @@ class TestPrefillLogprobOffsets(CustomTestCase):
             prefill_stats=None,
             dp_cooperation_info=None,
         )
-        result = SimpleNamespace(
-            copy_done=None,
-            auxiliary_host_output=None,
-            routed_experts_output=None,
-            indexer_topk_output=None,
-            logits_output=SimpleNamespace(
-                hidden_states=None,
-                customized_info=None,
+        result = GenerationBatchResult(
+            logits_output=LogitsProcessorOutput(
+                next_token_logits=None,
                 input_token_logprobs=input_token_logprobs,
                 next_token_logprobs=torch.tensor([-0.5, -0.6]),
-                input_top_logprobs_val=None,
-                input_top_logprobs_idx=None,
-                input_token_ids_logprobs_val=None,
-                input_token_ids_logprobs_idx=None,
-                next_token_top_logprobs_val=None,
-                next_token_top_logprobs_idx=None,
-                next_token_token_ids_logprobs_val=None,
-                next_token_token_ids_logprobs_idx=None,
             ),
             next_token_ids=torch.tensor([7, 8]),
             extend_input_len_per_req=[2, 3],
             extend_logprob_start_len_per_req=[0, 0],
-            grammar_advanced=False,
-            can_run_cuda_graph=False,
-            skipped_output_comm=False,
         )
 
         processor = _make_processor(self)
