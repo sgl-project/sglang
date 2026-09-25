@@ -4,15 +4,9 @@ import torch
 import triton
 import triton.language as tl
 
-# torch reduces each softmax row with one block, so the speculative row counts
-# -- batch_size per draft step, batch_size * num_draft_tokens at verify --
-# occupy a handful of blocks of a 256-CU GPU and the row is read three times.
-# These kernels split each row across CTAs and fold the temperature divide in,
-# which also drops the separate div pass over logits / temperatures.
+# Split low-row-count reductions across CTAs and fuse temperature scaling.
 _MIN_BLOCK = 2048
 _TARGET_CTAS = 512
-# Above this many rows one block per row already fills the GPU, and the split
-# only adds two launches plus the partial buffers.
 ROW_LIMIT = 32
 
 
@@ -27,7 +21,6 @@ def _partial_max_sumexp_kernel(
     num_splits,
     BLOCK: tl.constexpr,
 ):
-    # int64 row base: row * stride overflows int32 once rows * vocab reaches 2^31.
     row = tl.program_id(0).to(tl.int64)
     split = tl.program_id(1)
     t = tl.load(temperatures + row)
@@ -40,7 +33,9 @@ def _partial_max_sumexp_kernel(
     )
     x = x / t
     block_max = tl.max(x, axis=0)
-    block_sum = tl.sum(tl.where(mask, tl.exp(x - block_max), 0.0), axis=0)
+    # Fully masked splits contribute zero without evaluating -inf - (-inf).
+    safe_block_max = tl.where(block_max == -float("inf"), 0.0, block_max)
+    block_sum = tl.sum(tl.where(mask, tl.exp(x - safe_block_max), 0.0), axis=0)
     out_offset = row * num_splits + split
     tl.store(partial_max + out_offset, block_max)
     tl.store(partial_sum + out_offset, block_sum)
@@ -63,8 +58,6 @@ def _combine_kernel(
     )
     s = tl.load(partial_sum + row * num_splits + offsets, mask=mask, other=0.0)
     m_all = tl.max(m, axis=0)
-    # Rescale each block's sum to the row max before adding: the blocks
-    # subtracted their own max, exactly as an online softmax merge does.
     s_all = tl.sum(tl.where(mask, s * tl.exp(m - m_all), 0.0), axis=0)
     tl.store(row_max + row, m_all)
     tl.store(row_sum + row, s_all)
@@ -95,11 +88,7 @@ def _normalize_kernel(
 
 
 def _split_geometry(rows: int, vocab_size: int):
-    """Block width and split count that keep the grid near _TARGET_CTAS.
-
-    Cost is flat once the row is spread at all -- the three launches dominate --
-    so the block floor only has to keep the loads coalesced.
-    """
+    """Choose a block width and split count near the target grid size."""
     splits = min(
         triton.cdiv(_TARGET_CTAS, rows), max(1, triton.cdiv(vocab_size, _MIN_BLOCK))
     )
@@ -110,16 +99,12 @@ def _split_geometry(rows: int, vocab_size: int):
 def temperature_softmax(
     logits: torch.Tensor, temperatures: torch.Tensor
 ) -> torch.Tensor:
-    """``softmax(logits / temperatures, dim=-1)`` with the row split across CTAs.
-
-    ``temperatures`` is one value per row, in any shape that flattens to the row
-    count. Falls back to the torch pair for the shapes the split does not pay
-    for, so callers can use it unconditionally.
-    """
+    """Apply temperature softmax, splitting eligible rows across CTAs."""
     if (
         logits.ndim != 2
         or logits.dtype != torch.float32
         or logits.shape[0] == 0
+        or logits.shape[1] == 0
         or logits.shape[0] > ROW_LIMIT
         or logits.stride(1) != 1
         or not logits.is_cuda
@@ -128,10 +113,18 @@ def temperature_softmax(
 
     rows, vocab_size = logits.shape
     t = temperatures.reshape(-1)
-    if t.shape[0] != rows or t.stride(0) != 1 or t.dtype != logits.dtype:
+    if (
+        t.shape[0] != rows
+        or t.stride(0) != 1
+        or t.dtype != logits.dtype
+        or t.device != logits.device
+    ):
         return torch.softmax(logits / temperatures, dim=-1)
 
     block, num_splits = _split_geometry(rows, vocab_size)
+    if num_splits == 1:
+        return torch.softmax(logits / temperatures, dim=-1)
+
     probs = torch.empty_like(logits)
     partial_max = torch.empty(
         (rows, num_splits), dtype=torch.float32, device=logits.device

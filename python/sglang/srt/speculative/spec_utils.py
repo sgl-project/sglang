@@ -139,7 +139,6 @@ def fast_sample(probs: torch.Tensor, num_samples: int = 1):
     q.clamp_min_(torch.finfo(torch.float32).tiny)
     scores = probs.float() / q
     if num_samples == 1:
-        # row_argmax returns one index per row; gather below wants a column.
         sample_index = row_argmax(scores).unsqueeze(-1)
     else:
         sample_index = scores.topk(num_samples, dim=-1).indices
