@@ -98,6 +98,7 @@ from sglang.srt.disaggregation.utils import (
     ReqToMetadataIdxAllocator,
     TransferBackend,
     get_dsa_seed_metadata_dim,
+    is_aborted,
     prepare_abort,
     unified_memory_disagg_move_gate,
 )
@@ -2853,9 +2854,9 @@ class Scheduler(
             # TODO: set trace context
             if self.metrics_reporter.enable_metrics:
                 req.time_stats.set_metrics_collector(self.metrics_collector)
-            if isinstance(req.finished_reason, FINISH_ABORT):
-                self.init_req_max_new_tokens(req)
-                self._add_request_to_queue(req)
+            if is_aborted(req):
+                req.update_finish_state()
+                self.output_streamer.stream_output([req], req.return_logprob)
                 return
 
         else:
@@ -2876,8 +2877,9 @@ class Scheduler(
             )
             req.tokenizer = self.tokenizer
             req.set_finish_with_abort(error_msg)
-            self.init_req_max_new_tokens(req)
-            self._add_request_to_queue(req)
+            # Reject before PD admission, preserving the original session error.
+            req.update_finish_state()
+            self.output_streamer.stream_output([req], req.return_logprob)
             return
 
         if recv_req.pp_prefetch_ticketed is True:
@@ -5840,9 +5842,12 @@ class Scheduler(
         output = self.session_controller.open(recv_req)
         if output.success and self.enable_session_radix_cache:
             self.tree_cache.open_radix_session(recv_req.session_id)
+        # Each DP queue must install the session before the tokenizer can
+        # acknowledge it. TP/CP followers process this open before receiving
+        # their next work broadcast from the same leader.
         if (
             get_parallel().pp_rank == 0
-            and get_parallel().tp_rank == 0
+            and get_parallel().attn_tp_rank == 0
             and get_parallel().attn_cp_rank == 0
         ):
             return output

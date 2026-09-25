@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 import hashlib
 import logging
 import time
@@ -988,17 +987,22 @@ class TokenizerControlMixin:
 
         if obj.session_id is None:
             obj.session_id = uuid.uuid4().hex
-        elif obj.session_id in self.session_futures:
+        elif obj.session_id in self.session_open_communicators:
             return None
 
-        future = asyncio.Future()
-        self.session_futures[obj.session_id] = future
-        self._dispatch_to_scheduler(obj)
-
+        # A global TP0 response alone does not make the session available on
+        # another DP queue. Keep opens concurrent, but await every DP leader.
+        communicator = FanOutCommunicator(
+            self._dispatch_to_scheduler, self.elastic_worker_count
+        )
+        self.session_open_communicators[obj.session_id] = communicator
         try:
-            return await future
+            responses = await communicator(obj)
+            if all(response.success for response in responses):
+                return obj.session_id
+            return None
         finally:
-            self.session_futures.pop(obj.session_id, None)
+            self.session_open_communicators.pop(obj.session_id, None)
 
     async def close_session(
         self: TokenizerManager,

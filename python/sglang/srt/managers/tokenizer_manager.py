@@ -668,7 +668,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self.last_receive_tstamp = real_time()
 
         # Session
-        self.session_futures = {}  # session_id -> asyncio event
+        self.session_open_communicators = {}  # session_id -> DP acknowledgements
 
         # Subprocess liveness watchdog — set by Engine or http_server after construction
         self._subprocess_watchdog = None
@@ -3482,15 +3482,14 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         return responses[0]
 
     def _handle_open_session_req_output(self, recv_obj):
-        future = self.session_futures.get(recv_obj.session_id)
-        if future is None:
+        communicator = self.session_open_communicators.get(recv_obj.session_id)
+        if communicator is None:
             logger.warning(
                 "Open session response arrived after waiter cleanup: %s",
                 recv_obj.session_id,
             )
             return
-        if not future.done():
-            future.set_result(recv_obj.session_id if recv_obj.success else None)
+        communicator.handle_recv(recv_obj)
 
     def _handle_update_weights_from_disk_req_output(self, recv_obj):
         if self.model_update_expected_workers == 1:
