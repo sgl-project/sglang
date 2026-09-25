@@ -97,6 +97,24 @@ def test_int4_tuner_filename_uses_runtime_down_projection_dimension(monkeypatch)
     assert filename == "E=256,N=256.json"
 
 
+def test_rtx_pro_6000_server_edition_configs_resolve_for_current_triton_runtime():
+    config_root = (
+        Path(fused_moe_triton_config.__file__).parent / "configs" / "triton_3_7_1"
+    )
+    for experts in (64, 128, 256):
+        config_path = config_root / (
+            f"E={experts},N=640,"
+            "device_name=NVIDIA_RTX_PRO_6000_Blackwell_Server_Edition,"
+            "dtype=fp8_w8a8,block_shape=[128, 128].json"
+        )
+        assert config_path.is_file(), config_path.name
+        config = json.loads(config_path.read_text())
+        assert config, config_path.name
+        for tile in config.values():
+            assert tile["BLOCK_SIZE_M"] > 0
+            assert tile["BLOCK_SIZE_N"] > 0
+
+
 if __name__ == "__main__":
     import sys
 
