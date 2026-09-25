@@ -72,6 +72,7 @@ from sglang.srt.configs.model_config import (
     is_deepseek_v4,
     is_minimax_sparse,
 )
+from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.constrained.grammar_manager import GrammarManager
 from sglang.srt.debug_utils.pr_fix_toggle import maybe_revert_pr_fix
 from sglang.srt.disaggregation.decode import (
@@ -4998,6 +4999,9 @@ class Scheduler(
 
     def flush_cache(self, empty_cache: bool = True):
         """Flush memory pools (e.g., KV cache, Mamba cache) and optionally empty device allocator cache."""
+        if GPU_MEMORY_TYPE_KV_CACHE in self.weight_updater.offload_tags:
+            logger.info("Cache flush skipped: KV cache memory is released.")
+            return True
         if self.is_fully_idle(ignore_waiting=self._engine_paused):
             self.cur_batch_for_debug = None
             self.last_batch = None

@@ -516,9 +516,6 @@ class SchedulerWeightUpdaterManager:
         if tags is None or len(tags) == 0:
             tags = GPU_MEMORY_ALL_TYPES
 
-        for tag in tags:
-            self.offload_tags.add(tag)
-
         if GPU_MEMORY_TYPE_KV_CACHE in tags:
             if scheduler is not None:
                 if scheduler.disaggregation_mode == DisaggregationMode.DECODE:
@@ -533,8 +530,14 @@ class SchedulerWeightUpdaterManager:
                     queue = getattr(scheduler, "disagg_prefill_bootstrap_queue", None)
                     if queue is not None:
                         queue.release_memory_occupation()
-            self.memory_saver_adapter.pause(GPU_MEMORY_TYPE_KV_CACHE)
+            # flush_cache is a no-op once KV is tagged as offloaded, so flush before tagging
             self.flush_cache()
+
+        for tag in tags:
+            self.offload_tags.add(tag)
+
+        if GPU_MEMORY_TYPE_KV_CACHE in tags:
+            self.memory_saver_adapter.pause(GPU_MEMORY_TYPE_KV_CACHE)
 
         if GPU_MEMORY_TYPE_WEIGHTS in tags:
             self._assert_weight_cache_inactive("release_memory_occupation")

@@ -120,7 +120,6 @@ if HAS_TILELANG:
         head_dim: int,
         block_n: int = 64,
         block_q: int = 32,
-        num_stages: int = 3,
         threads: int = 512,
     ):
         rows = T.dynamic("rows")
@@ -150,9 +149,8 @@ if HAS_TILELANG:
                     end_max = T.max(end_max, T.min(Ends[row_base + qi], keys))
 
                 T.copy(Q[row_base * heads, 0], q_shared)
-                for ni in T.Pipelined(
-                    T.ceildiv(end_max - start_min, block_n), num_stages=num_stages
-                ):
+                # a serial loop: tilelang >= 0.1.14 only pipelines constant trip counts
+                for ni in T.serial(T.ceildiv(end_max - start_min, block_n)):
                     T.copy(K[start_min + ni * block_n, 0], k_shared)
                     T.gemm(
                         k_shared,
