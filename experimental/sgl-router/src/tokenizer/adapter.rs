@@ -2,25 +2,166 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use anyhow::{Context, Result};
-use dynamo_tokenizers::{traits::DecodeResult, Tokenizer};
+use dynamo_tokenizers::{
+    create_tokenizer_from_file, traits, traits::DecodeResult, CacheTokenUsage, CachedTokenizer,
+    FastTokenizer, Tokenizer,
+};
 use std::path::Path;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
-/// Load a local tokenizer file or Hugging Face repo, honoring HF cache/auth settings.
-/// Tiktoken `.model` files also require sibling config.json and tokenizer_config.json.
+use super::stats::{EncodeBackend, L1Counters, L1State, TokenizerStats};
+use crate::config::{TokenizerBackend, TokenizerConfig};
+
+/// Load a local tokenizer file or Hugging Face repo with the default HF, uncached encoder.
 pub fn load(source: &str) -> Result<Arc<Tokenizer>> {
+    load_with(source, TokenizerConfig::default()).map(|(t, _)| t)
+}
+
+/// Load a local tokenizer file or Hugging Face repo, honoring HF cache/auth settings, with the
+/// configured encode backend and L1 cache. Tiktoken `.model` files also require sibling
+/// config.json and tokenizer_config.json.
+pub fn load_with(
+    source: &str,
+    cfg: TokenizerConfig,
+) -> Result<(Arc<Tokenizer>, Arc<TokenizerStats>)> {
     if Path::new(source).is_file() || looks_like_path(source) {
-        return Tokenizer::from_file(source)
-            .map(Arc::new)
-            .with_context(|| format!("load tokenizer from {source}"));
+        return build(source, cfg).with_context(|| format!("load tokenizer from {source}"));
     }
     let downloaded = download_tokenizer(source)?;
     let path = downloaded
         .to_str()
         .context("downloaded tokenizer path is not valid UTF-8")?;
-    Tokenizer::from_file(path)
-        .map(Arc::new)
-        .with_context(|| format!("load downloaded tokenizer for {source}"))
+    build(path, cfg).with_context(|| format!("load downloaded tokenizer for {source}"))
+}
+
+fn build(path: &str, cfg: TokenizerConfig) -> Result<(Arc<Tokenizer>, Arc<TokenizerStats>)> {
+    let (inner, backend) = encoder(path, cfg.backend)?;
+    let l1 = Arc::new(L1Counters::default());
+    let (tokenizer, l1_state) = if cfg.l1_cache_mb == 0 {
+        (Tokenizer::from(inner), L1State::Off)
+    } else {
+        let specials = boundary_tokens(path)?;
+        if specials.is_empty() {
+            tracing::warn!(
+                path,
+                "--tokenizer-l1-cache-mb is set but the tokenizer declares no safely splittable \
+                 special tokens; the L1 cache is inert"
+            );
+            (Tokenizer::from(inner), L1State::DisabledNoSpecials)
+        } else {
+            let bytes = cfg.l1_cache_mb.saturating_mul(1 << 20);
+            let cached = with_l1(inner, specials, bytes, &l1)?;
+            (Tokenizer::from(Arc::new(cached)), L1State::Active)
+        }
+    };
+    let stats = TokenizerStats {
+        backend,
+        l1_state,
+        l1,
+    };
+    Ok((Arc::new(tokenizer), Arc::new(stats)))
+}
+
+/// Wrap `inner` in the L1 prefix cache, extending on partial hits so each turn of a growing
+/// conversation reuses all earlier turns, and feed `counters` from its observers.
+fn with_l1(
+    inner: Arc<dyn traits::Tokenizer>,
+    specials: Vec<String>,
+    max_memory_bytes: usize,
+    counters: &Arc<L1Counters>,
+) -> Result<CachedTokenizer> {
+    let (hits, misses, usage) = (
+        Arc::clone(counters),
+        Arc::clone(counters),
+        Arc::clone(counters),
+    );
+    Ok(CachedTokenizer::new(inner, specials, max_memory_bytes)?
+        .with_extend(true)
+        .with_observer(
+            Arc::new(move || {
+                hits.hits.fetch_add(1, Ordering::Relaxed);
+            }),
+            Arc::new(move || {
+                misses.misses.fetch_add(1, Ordering::Relaxed);
+            }),
+        )
+        .with_token_observer(Arc::new(move |u: CacheTokenUsage| {
+            usage
+                .cached_tokens
+                .fetch_add(u.cached_tokens as u64, Ordering::Relaxed);
+            usage
+                .encoded_tokens
+                .fetch_add(u.uncached_tokens as u64, Ordering::Relaxed);
+        })))
+}
+
+/// Build the encoder for `backend`; `fast` falls back to HF when fastokens cannot load the file.
+fn encoder(
+    path: &str,
+    backend: TokenizerBackend,
+) -> Result<(Arc<dyn traits::Tokenizer>, EncodeBackend)> {
+    if !path.ends_with(".json") {
+        if backend == TokenizerBackend::Fast {
+            tracing::warn!(
+                path,
+                "fastokens needs a tokenizer.json; encoding on tiktoken"
+            );
+        }
+        return Ok((create_tokenizer_from_file(path)?, EncodeBackend::Tiktoken));
+    }
+    if backend == TokenizerBackend::Fast {
+        match FastTokenizer::from_file(path) {
+            Ok(t) => return Ok((Arc::new(t), EncodeBackend::Fast)),
+            Err(e) => tracing::warn!(path, error = %format!("{e:#}"),
+                "fastokens cannot load this tokenizer; encoding on hf"),
+        }
+        return Ok((
+            create_tokenizer_from_file(path)?,
+            EncodeBackend::FastFallbackHf,
+        ));
+    }
+    Ok((create_tokenizer_from_file(path)?, EncodeBackend::Hf))
+}
+
+/// Special tokens an encode can be split after: atomic in BPE (`special`, not `normalized`)
+/// and not absorbing adjacent whitespace (`lstrip`/`rstrip`), so encoding each side separately
+/// yields the ids of encoding the whole.
+fn boundary_tokens(path: &str) -> Result<Vec<String>> {
+    #[derive(serde::Deserialize)]
+    struct AddedToken {
+        content: String,
+        #[serde(default)]
+        special: bool,
+        normalized: Option<bool>,
+        #[serde(default)]
+        lstrip: bool,
+        #[serde(default)]
+        rstrip: bool,
+    }
+    #[derive(serde::Deserialize)]
+    struct TokenizerJson {
+        #[serde(default)]
+        added_tokens: Vec<AddedToken>,
+    }
+    if !path.ends_with(".json") {
+        return Ok(Vec::new());
+    }
+    let text = std::fs::read_to_string(path).with_context(|| format!("read {path}"))?;
+    let parsed: TokenizerJson =
+        serde_json::from_str(&text).with_context(|| format!("parse added_tokens in {path}"))?;
+    Ok(parsed
+        .added_tokens
+        .into_iter()
+        .filter(|t| {
+            t.special
+                && t.normalized == Some(false)
+                && !t.lstrip
+                && !t.rstrip
+                && !t.content.is_empty()
+        })
+        .map(|t| t.content)
+        .collect())
 }
 
 /// Treat `source` as a filesystem path (rather than a HuggingFace repo id)
