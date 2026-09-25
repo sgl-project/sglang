@@ -805,6 +805,7 @@ def test_mxfp4_tp8_load_before_padding(tp_rank):
         use_triton_kernels=False,
         moe_runner_config=SimpleNamespace(is_gated=True),
         quant_method=method,
+        quant_config=None,
     )
     fp4 = torch.tensor(
         [0, 0.5, 1, 1.5, 2, 3, 4, 6, -0.0, -0.5, -1, -1.5, -2, -3, -4, -6],
