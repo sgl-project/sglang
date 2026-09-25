@@ -2,7 +2,19 @@ Status: implemented
 
 # DCP/L3 phase evidence
 
-**TL;DR:** All five phases are complete. H200 fresh readers at TP/DCP=2/2, 4/2, and 4/4 restored 1,024 tokens on every rank and produced exactly the cold-run output IDs. Missing-shard recovery, runtime attachment, concurrent writers, and CPU failure tests passed.
+**TL;DR:** Dense MLA DCP shards use shared file keys and one writer per shard. H200 fresh readers at TP/DCP=2/2, 4/2, and 4/4 restored 1,024 tokens per rank with matching output IDs. The current CPU suite verifies missing shards, eviction after lookup, and delayed writes using upstream exception behavior.
+
+The phase logs below record historical revisions. The exception-recovery cases in phase 4 and earlier aggregate test runs describe the implementation before the scope reduction recorded next.
+
+## Current scope verification
+
+Removed the general lookup/read/backup exception handlers and the file `OSError` handler. The five affected methods match upstream main at `2f2f9d12`. The DCP runtime-attachment validation handler remains.
+
+The four-process Gloo test now covers healthy reads, a missing middle shard, eviction after lookup, and delayed backup. It retains real prefix reductions, completion queues, host allocations, and bounded test cleanup. Missing/evicted shards reuse 128 tokens per rank; healthy reads reuse 384; all cases release their host slots.
+
+Re-ran the focused CPU command in the Phase 5 CPU checks section: **64 passed, 65 subtests, 26.26s**. Re-ran the unified-cache storage/prefetch command there: **89 passed, 137 skipped, 2543 deselected, 20.29s**. Both runs exited 0 with the same 15 existing warnings.
+
+Captured output: [focused CPU](feature-00-dcp-l3-scoped-cpu.txt), [storage/prefetch regressions](feature-00-dcp-l3-scoped-regressions.txt). Ruff lint/format for the adjusted test, import sorting, registered-test validation, and whitespace checks passed. The H200 results below were measured before this scope reduction; that matrix was not rerun for this removal.
 
 ## Phase 1 reproduction
 

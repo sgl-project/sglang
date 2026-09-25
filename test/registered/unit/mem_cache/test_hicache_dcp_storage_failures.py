@@ -1,4 +1,4 @@
-"""Four real Gloo ranks exercise DCP storage failures and worker completion."""
+"""Four real Gloo ranks exercise DCP missing shards and worker completion."""
 
 import json
 import tempfile
@@ -55,11 +55,7 @@ def _worker(rank, directory):
     cases = (
         "healthy",
         "missing",
-        "truncated",
-        "lookup_error",
-        "read_error",
         "evicted_after_lookup",
-        "backup_error",
         "backup_delayed",
     )
     for case in cases:
@@ -128,19 +124,11 @@ def _worker(rank, directory):
             bad_path = storage_dir / (
                 cc.storage_backend._get_suffixed_key(hashes[1]) + ".bin"
             )
-            if rank == 1:
-                if case == "missing":
-                    bad_path.unlink()
-                elif case == "truncated":
-                    with bad_path.open("r+b") as f:
-                        f.truncate(100)
+            if rank == 1 and case == "missing":
+                bad_path.unlink()
             dist.barrier()
-            if rank == 1 and case == "lookup_error":
-                cc.storage_backend.batch_exists = mock.Mock(
-                    side_effect=OSError("lookup")
-                )
-            # Use one page per batch to check repeated ACKs after failure,
-            # including the final batch after a failed middle batch.
+            # One page per batch checks every ACK when a shard disappears
+            # after lookup, including batches after the first missing page.
             with mock.patch(
                 "sglang.srt.managers.cache_controller.STORAGE_BATCH_SIZE", 1
             ):
@@ -150,34 +138,11 @@ def _worker(rank, directory):
                     cc.prefetch_queue.put(op)
                     queried = cc.prefetch_hit_queue.get(timeout=20)
                     assert queried is op
-                    expected_lookup = (
-                        0
-                        if case == "lookup_error"
-                        else 128
-                        if case == "missing"
-                        else 384
-                    )
+                    expected_lookup = 128 if case == "missing" else 384
                     assert op.storage_hit_count == expected_lookup
                     if case == "evicted_after_lookup" and rank == 1:
                         bad_path.unlink()
                     dist.barrier()
-                    if case == "read_error" and rank == 1:
-                        original = cc.storage_backend.batch_get
-
-                        def fail_middle(keys, targets):
-                            if hashes[1] in keys:
-                                raise OSError("read after successful lookup")
-                            return original(keys, targets)
-
-                        cc.storage_backend.batch_get = fail_middle
-                    if case in ("read_error", "truncated") and rank == 0:
-                        original = cc.page_get_func
-
-                        def slow_read(*args, **kwargs):
-                            time.sleep(0.1)
-                            return original(*args, **kwargs)
-
-                        cc.page_get_func = slow_read
                     op.host_indices = pool.alloc(op.storage_hit_count)
                     cache.ongoing_prefetch[op.handle] = SimpleNamespace(operation=op)
                     cc.prefetch_buffer.put(op)
@@ -191,17 +156,7 @@ def _worker(rank, directory):
                         cc.ack_prefetch_queue.put(ack)
                     _drain(cache, prefetch=len(acks))
                     expected = (
-                        0
-                        if case == "lookup_error"
-                        else 128
-                        if case
-                        in (
-                            "missing",
-                            "truncated",
-                            "read_error",
-                            "evicted_after_lookup",
-                        )
-                        else 384
+                        128 if case in ("missing", "evicted_after_lookup") else 384
                     )
                     assert op.completed_tokens == expected, (
                         case,
@@ -211,9 +166,9 @@ def _worker(rank, directory):
                     assert len(acks) == expected_lookup // 128 + 1
                     assert int(pool.slot_used.sum()) == 0
 
-                    # Verify failed and delayed writes still acknowledge, and
-                    # that the same worker can process a subsequent operation.
-                    if case in ("backup_error", "backup_delayed"):
+                    # A delayed shard writer must retain its host allocation
+                    # until its write finishes, while replicas can acknowledge.
+                    if case == "backup_delayed":
                         entered, release = threading.Event(), threading.Event()
                         original_set = cc.page_set_func
 
@@ -221,8 +176,6 @@ def _worker(rank, directory):
                             if rank == 1:
                                 entered.set()
                                 assert release.wait(10)
-                                if case == "backup_error":
-                                    raise OSError("backup")
                             return original_set(*args)
 
                         cc.page_set_func = controlled_write
@@ -235,11 +188,7 @@ def _worker(rank, directory):
                             assert pool.slot_used[slots].all()
                             release.set()
                         ack = cc.ack_backup_queue.get(timeout=20)
-                        assert ack.completed_tokens == (
-                            0
-                            if rank >= 2 or (rank == 1 and case == "backup_error")
-                            else 128
-                        )
+                        assert ack.completed_tokens == (0 if rank >= 2 else 128)
                         cc.ack_backup_queue.put(ack)
                         _drain(cache, backup=1)
                         assert int(pool.slot_used.sum()) == 0
@@ -279,7 +228,8 @@ class TestDcpStorageFailures(unittest.TestCase):
                 json.loads(Path(directory, f"rank-{rank}.json").read_text())
                 for rank in range(4)
             ]
-            for case_index in range(8):
+            self.assertTrue(all(len(rank) == 4 for rank in reports))
+            for case_index in range(4):
                 rows = [rank[case_index] for rank in reports]
                 self.assertEqual(len({row["tokens"] for row in rows}), 1)
                 self.assertTrue(all(row["remaining_slots"] == 0 for row in rows))

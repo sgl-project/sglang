@@ -1122,19 +1122,13 @@ class HiCacheController:
                 # Get one batch token, and update the completed_tokens if succeed
                 extra_info = HiCacheStorageExtraInfo(prefix_keys=prefix_keys)
 
-                try:
-                    hit_pages = self._page_transfer_kv_batch(
-                        operation,
-                        batch_hashes,
-                        batch_host_indices,
-                        extra_info,
-                        kv_derived_transfers,
-                    )
-                except Exception:
-                    # Keep emitting one acknowledgment per batch so peers can
-                    # finish their prefix reductions after a local I/O failure.
-                    logger.exception("HiCache storage read failed")
-                    hit_pages = 0
+                hit_pages = self._page_transfer_kv_batch(
+                    operation,
+                    batch_hashes,
+                    batch_host_indices,
+                    extra_info,
+                    kv_derived_transfers,
+                )
                 # Check termination
                 if hit_pages != len(batch_hashes):
                     all_success = False
@@ -1266,14 +1260,7 @@ class HiCacheController:
                 if operation.is_terminated():
                     hash_value, storage_hit_count = [], 0
                 else:
-                    try:
-                        hash_value, storage_hit_count = self._storage_hit_query(
-                            operation
-                        )
-                    except Exception:
-                        # A local lookup failure must still join the reduction.
-                        logger.exception("HiCache storage lookup failed")
-                        hash_value, storage_hit_count = [], 0
+                    hash_value, storage_hit_count = self._storage_hit_query(operation)
                 storage_hit_count_tensor = torch.tensor(
                     storage_hit_count, dtype=torch.int
                 )
@@ -1357,15 +1344,9 @@ class HiCacheController:
                 if operation is None:
                     continue
 
-                try:
-                    if not self.backup_skip:
-                        self._page_backup(operation)
-                except Exception:
-                    logger.exception("HiCache storage backup failed")
-                finally:
-                    # Completion releases the local host lock, including when
-                    # I/O failed or this rank skipped a replicated shard.
-                    self.ack_backup_queue.put(operation)
+                if not self.backup_skip:
+                    self._page_backup(operation)
+                self.ack_backup_queue.put(operation)
 
             except Empty:
                 continue

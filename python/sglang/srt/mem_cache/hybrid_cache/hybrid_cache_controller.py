@@ -1399,12 +1399,8 @@ class HybridCacheController(BaseHiCacheController):
                 operation = self.backup_queue.get(block=True, timeout=1)
                 if operation is None:
                     continue
-                try:
-                    self._page_backup(operation)
-                except Exception:
-                    logger.exception("HiCache storage backup failed")
-                finally:
-                    self.ack_backup_queue.put(operation)
+                self._page_backup(operation)
+                self.ack_backup_queue.put(operation)
             except Empty:
                 continue
 

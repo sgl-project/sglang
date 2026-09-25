@@ -49,11 +49,11 @@ logical start 256 -> local rows 128..191
 
 The controller, prefix hashes, completion counts, and host allocations use logical tokens. Generic MLA host-page access validates alignment/range and translates the page start once (`local_start = logical_start / D`). Dummy read buffers contain local bytes. Nonadjacent page operations preserve their order. Zero-copy page metadata remains guarded under DCP.
 
-## Completion and failure handling
+## Completion and shared-prefix agreement
 
-Each backup acknowledges its local work. A replica can acknowledge a skipped write before the shard writer finishes; this does not claim global persistence. A writer holds its host buffer until local I/O ends, including failed writes. Both base and unified-cache backup workers acknowledge failures so host locks can be released.
+Each backup acknowledges its local work. A replica can acknowledge a skipped write before the shard writer finishes; this does not claim global persistence. A writer holds its host buffer until its write completes.
 
-Lookup and read completion use the existing minimum-prefix reductions. In the supported layout, the attention TP group covers every DCP shard and replica. A lookup exception contributes zero hits. A read exception ends the local usable prefix while preserving one acknowledgment per remaining batch. A short file read returns a missing page using the existing `readinto` count.
+Lookup and read completion use the existing minimum-prefix reductions. In the supported layout, the attention TP group covers every DCP shard and replica. Missing shards shorten the shared usable prefix. The existing read path preserves one acknowledgment per batch when a page is absent, including eviction after lookup.
 
 ```text
 rank 0: A B C
@@ -67,7 +67,7 @@ The final acknowledgment lets the scheduler release unused host pages after I/O 
 
 The release gate uses separate writer and reader processes with initially empty GPU/host caches. It compares deterministic output token IDs against a cold run and checks per-rank L3-restored tokens, final object counts, and byte sizes. It covers TP/DCP=2/2, 4/2, 4/4, a missing middle shard, concurrent writers, and runtime attachment.
 
-CPU tests cover shared keys, every shard at DCP=2/4, reordered page round trips, writer/eviction ownership, delayed backup lifetimes, and real four-process failure reductions with bounded timeouts. See [commands and measured evidence](evidence/feature-00-dcp-l3.md).
+CPU tests cover shared keys, every shard at DCP=2/4, reordered page round trips, writer/eviction ownership, delayed backup lifetimes, and real four-process prefix agreement with bounded timeouts. See [commands and measured evidence](evidence/feature-00-dcp-l3.md).
 
 | Responsibility | Code |
 | --- | --- |
