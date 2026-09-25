@@ -59,7 +59,20 @@ _EXTERNAL_LINKER_SUPPORTED_COMPONENTS = frozenset(
 
 
 class UnifiedCacheLinker(ABC):
-    """External KV store reached directly from the device pools."""
+    """External KV store reached directly from the device pools.
+
+    Out-of-tree implementations are selected by
+    ``--unified-cache-external-linker-config`` and constructed in each worker as
+    ``Linker(server_args, params, components=..., extra_config=...)``.
+    ``params`` is a :class:`CacheInitParams`, ``components`` contains the active
+    :class:`ComponentType` values, and ``extra_config`` is a private copy of the
+    plugin's JSON options. Validate unsupported pool layouts and topologies in
+    the constructor before registering resources.
+
+    ``layer_done_counter`` must provide ``set_consumer(index)`` and
+    ``wait_until(layer)`` for the KV pool's layer wait hook. Completion means
+    device copies are safe for inference and the tree can release its locks.
+    """
 
     layer_done_counter: object
 
