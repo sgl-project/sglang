@@ -160,9 +160,7 @@ class FrozenKVMTPDraftWorker(EagleDraftWorkerBase, TpModelWorker):
 
         self.kv_context: Optional[FrozenKVMTPContext] = None
 
-        # Built above under the pipeline scope only, so this runner carries the
-        # target's attention topology: entering the tensor scope later swaps the
-        # communicator without giving the draft a replica of its own.
+        # Retain the target's attention topology when swapping TP groups.
         self.draft_owns_attention = False
         self.draft_tp_context = (
             draft_tp_context if get_parallel().enable_dp_attention else empty_context

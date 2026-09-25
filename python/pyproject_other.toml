@@ -83,6 +83,7 @@ runtime_common = [
 srt_empty = ["sglang[runtime_base]"]
 
 diffusion_common = [
+  "accelerate",
   "addict",
   "cloudpickle",
   "diffusers==0.37.0",
@@ -208,7 +209,7 @@ test = [
   "peft>=0.18.0,<0.19.0", # Pin to <0.19.0 due to torchao incompatibility
   "pytest",
   "sentence_transformers",
-  "sgl-eval==0.1.0",
+  "sgl-eval==0.1.2",
   "tabulate",
 ]
 

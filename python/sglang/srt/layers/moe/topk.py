@@ -2471,10 +2471,14 @@ def select_experts(
         info=expert_location_dispatch_info,
     )
 
+    # Only aiter_biased_grouped_topk wants the bias in the gating dtype. The JIT
+    # router returns before it in biased_grouped_topk_gpu and upcasts the bias
+    # in-register, so downcasting here would only buy it a per-call cast back.
     if (
         _use_aiter
         and use_grouped_topk
         and correction_bias is not None
+        and not envs.SGLANG_OPT_USE_JIT_KERNEL_GROUPED_TOPK.get()
         and dynamic_expert_bias is None
     ):
         correction_bias = topk_config.correction_bias_for_dtype(router_logits.dtype)

@@ -71,13 +71,13 @@ from sglang.srt.arg_groups.overrides import (
 )
 from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.configs.model_config import ModelConfig
+from sglang.srt.distributed import bootstrap
 from sglang.srt.distributed.parallel_state import (
     destroy_distributed_environment,
     destroy_model_parallel,
 )
 from sglang.srt.entrypoints.engine import _set_envs_and_config
 from sglang.srt.hardware_backend.mlx.runtime import use_mlx
-from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
 from sglang.srt.layers.moe import initialize_moe_config
 from sglang.srt.layers.quantization.fp4_utils import initialize_fp4_gemm_config
 from sglang.srt.layers.quantization.fp8_utils import initialize_fp8_gemm_config
@@ -93,8 +93,8 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.runtime_context import (
     SpawnRanks,
+    get_device,
     get_model,
-    get_parallel,
     get_schedule,
     publish,
     spawn_world_rank,
@@ -277,7 +277,6 @@ class BenchArgs:
         )
         parser.add_argument(
             "--profile-prefix",
-            "--profile-filename-prefix",  # deprecated alias, kept for back-compat
             dest="profile_prefix",
             type=str,
             default=BenchArgs.profile_prefix,
@@ -316,18 +315,8 @@ def load_model(server_args, port_args, gpu_id, tp_rank):
     cfg = resolving_view(server_args)
     suppress_other_loggers()
     rank_print = print if tp_rank == 0 else lambda *args, **kwargs: None
-    moe_ep_rank = tp_rank // (cfg.tp_size // cfg.ep_size)
 
     model_config = ModelConfig.from_server_args(server_args)
-    attn_tp_rank, attn_tp_size, attn_dp_rank, attn_dp_size = (
-        compute_dp_attention_world_info(
-            cfg.enable_dp_attention,
-            tp_rank,
-            cfg.tp_size,
-            cfg.dp_size,
-            cfg.attn_cp_size,
-        )
-    )
     runner_kwargs = dict(
         model_config=model_config,
         mem_fraction_static=cfg.mem_fraction_static,
@@ -335,6 +324,13 @@ def load_model(server_args, port_args, gpu_id, tp_rank):
         nccl_port=port_args.nccl_port,
         server_args=server_args,
     )
+
+    bootstrap.init_parallel_runtime(
+        server_args=server_args,
+        device=get_device().device,
+        dist_port=port_args.nccl_port,
+    )
+    bootstrap.init_layer_runtime(model_config=model_config)
 
     _use_mlx = use_mlx()
     if _use_mlx:
@@ -546,10 +542,6 @@ def _maybe_prepare_mlp_sync_batch(batch: ScheduleBatch, model_runner):
         prepare_mlp_sync_batch_raw(
             batch,
             model_runner=model_runner,
-            dp_size=get_parallel().dp_size,
-            attn_tp_size=get_parallel().attn_tp_size,
-            attn_cp_size=model_runner.attn_cp_size,
-            tp_group=model_runner.tp_group,
             get_idle_batch=None,
             disable_cuda_graph=cuda_graph_fully_disabled(),
             require_mlp_tp_gather=require_mlp_tp_gather(),
@@ -911,13 +903,7 @@ def latency_test(
     initialize_fp4_gemm_config()
 
     if get_bool_env_var("SGLANG_SET_CPU_AFFINITY"):
-        parallel = get_parallel()
-        set_gpu_proc_affinity(
-            parallel.pp_size,
-            parallel.tp_size,
-            parallel.nnodes,
-            tp_rank,
-        )
+        set_gpu_proc_affinity(tp_rank)
 
     # Configure the logger
     configure_logger(server_args, prefix=f" TP{tp_rank}")

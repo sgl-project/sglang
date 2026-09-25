@@ -55,8 +55,6 @@ class TestTransformersFallbackSkipSubstrs(CustomTestCase):
             pass
 
         with (
-            # `__init__` only stashes the pipeline group, so an empty
-            # stand-in carries it past the read.
             get_parallel().override(pp_group=SimpleNamespace()),
             patch(
                 "sglang.srt.models.transformers.get_hf_text_config",

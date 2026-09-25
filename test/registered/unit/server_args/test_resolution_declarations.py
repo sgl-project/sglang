@@ -95,7 +95,6 @@ _REACHED_BY_SHAPES = frozenset(
         "flashinfer_allreduce_fusion_backend",
         "grammar_backend",
         "hicache_ratio",
-        "keep_mm_feature_on_device",
         "load_balance_method",
         "max_running_requests",
         "mem_fraction_static",
@@ -132,15 +131,7 @@ def _stash_overlay(server_args):
 
 
 def _live_topology_leaves():
-    """Names `ParallelContext` answers from a runtime write, not the config.
-
-    Read off the declarations that carry no `fn`, which is what those are.
-    Inferring them from "did the read raise" is wrong -- it raises only while
-    nothing has written the name, so in a process where an earlier test stated
-    one the property answers that value and a leaf check reads it as a config
-    mismatch (`parallel.tp_size: bag=1 resolution=2`). Whether a name is
-    shadowed is a property of the declaration, not of the process.
-    """
+    """Return runtime-only parallel fields, identified by declarations without ``fn``."""
     from sglang.srt.runtime_context import _derived_widths
 
     return frozenset(n for n, d in _derived_widths().items() if not d.fn)
@@ -291,7 +282,9 @@ class TestResolutionDeclarations(CustomTestCase):
         from sglang.srt.runtime_context import publish, reset_context
 
         mapping = namespace_of(ServerArgs)
-        self.assertGreater(len(mapping), 400, "the namespace mapping collapsed")
+        self.assertEqual(
+            set(mapping), {field.name for field in msgspec.structs.fields(ServerArgs)}
+        )
 
         self.assertEqual(
             set(),
