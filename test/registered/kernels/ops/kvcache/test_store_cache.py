@@ -11,8 +11,8 @@ from sglang.kernels.ops.kvcache.cache_ops import launch_reshape_and_cache_flash
 from sglang.kernels.ops.kvcache.kvcache import can_use_store_cache, store_cache
 from sglang.srt.mem_cache.hisparse_memory_pool import HiSparseMHAMainPool
 from sglang.srt.mem_cache.memory_pool import (
-    MHATokenToKVPool,
     MHATokenToKOnlyPool,
+    MHATokenToKVPool,
     _as_token_head_dim,
     _has_dense_kv_rows,
 )
