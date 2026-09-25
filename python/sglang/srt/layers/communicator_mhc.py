@@ -29,11 +29,12 @@ from sglang.srt.layers.communicator import (
     CommunicateContext,
     CommunicateSimpleFn,
     CommunicateSummableTensorPairFn,
-    CommunicateWithAllReduceAndLayerNormFn,
     LayerCommunicator,
     LayerScatterModes,
+    MlpInputKind,
     ScatterMode,
     get_attn_tp_context,
+    mlp_input_kind,
     tp_reduce_scatter,
 )
 from sglang.srt.layers.dp_attention import (
@@ -130,35 +131,7 @@ class MHCState:
         self.h_post = None
 
 
-class MHCCommunicateWithAllReduceAndLayerNormFn(CommunicateWithAllReduceAndLayerNormFn):
-    @staticmethod
-    def get_fn(
-        hidden_states_input_mode: ScatterMode,
-        residual_input_mode: ScatterMode,
-        hidden_states_output_mode: ScatterMode,
-        residual_output_mode: ScatterMode,
-        context: CommunicateContext,
-    ):
-        fn = CommunicateWithAllReduceAndLayerNormFn.get_fn(
-            hidden_states_input_mode,
-            residual_input_mode,
-            hidden_states_output_mode,
-            residual_output_mode,
-            context,
-        )
-        replacements = {
-            CommunicateWithAllReduceAndLayerNormFn._simple: MHCCommunicateWithAllReduceAndLayerNormFn._simple,
-            CommunicateWithAllReduceAndLayerNormFn._gather_hidden_states_and_residual: MHCCommunicateWithAllReduceAndLayerNormFn._gather_hidden_states_and_residual,
-            CommunicateWithAllReduceAndLayerNormFn._scatter_hidden_states_and_residual: MHCCommunicateWithAllReduceAndLayerNormFn._scatter_hidden_states_and_residual,
-        }
-        if isinstance(fn, partial):
-            return partial(
-                replacements.get(fn.func, fn.func),
-                *fn.args,
-                **(fn.keywords or {}),
-            )
-        return replacements.get(fn, fn)
-
+class MHCCommunicateWithAllReduceAndLayerNormFn:
     @staticmethod
     def _scatter_hidden_states_and_residual(
         hidden_states: torch.Tensor,
@@ -456,15 +429,6 @@ class MHCLayerCommunicator(LayerCommunicator):
             output_mode=self.layer_scatter_modes.attn_mode,
             context=self._context,
         )
-        self._communicate_with_all_reduce_and_layer_norm_fn = (
-            MHCCommunicateWithAllReduceAndLayerNormFn.get_fn(
-                hidden_states_input_mode=self.layer_scatter_modes.attn_mode,
-                residual_input_mode=self.layer_scatter_modes.layer_input_mode,
-                hidden_states_output_mode=self.layer_scatter_modes.mlp_mode,
-                residual_output_mode=self.layer_scatter_modes.middle_residual_mode,
-                context=self._context,
-            )
-        )
         self._communicate_summable_tensor_pair_fn = (
             MHCCommunicateSummableTensorPairFn.get_fn(
                 hidden_states_input_mode=self.layer_scatter_modes.mlp_mode,
@@ -518,26 +482,21 @@ class MHCLayerCommunicator(LayerCommunicator):
 
         return hidden_states, residual
 
-    def prepare_mlp(
-        self,
-        hidden_states: torch.Tensor,
-        residual: torch.Tensor,
-        forward_batch: ForwardBatch,
-        cache=None,
-    ):
-        if cache is not None:
-            self._context.cache = cache
-
-        hidden_states, residual = self._communicate_with_all_reduce_and_layer_norm_fn(
-            hidden_states=hidden_states,
-            residual=residual,
-            forward_batch=forward_batch,
-            layernorm=self.post_attention_layernorm,
-            context=self._context,
-            mhc=self.mhc,
-        )
-
-        return hidden_states, residual
+    def _select_mlp_input(self):
+        """MHC's own implementation of each boundary kind, applied to this
+        layer's MHC state."""
+        kind = mlp_input_kind(self.layer_scatter_modes, self._context)
+        residual_input_mode = self.layer_scatter_modes.layer_input_mode
+        fns = MHCCommunicateWithAllReduceAndLayerNormFn
+        if kind is MlpInputKind.NORM:
+            return partial(fns._simple, mhc=self.mhc), False
+        if kind is MlpInputKind.GATHER:
+            fn = fns._gather_hidden_states_and_residual
+        elif kind is MlpInputKind.SCATTER:
+            fn = fns._scatter_hidden_states_and_residual
+        else:
+            raise NotImplementedError(f"MHCLayerCommunicator does not support {kind}")
+        return partial(fn, residual_input_mode=residual_input_mode, mhc=self.mhc), False
 
     def postprocess_layer(self, hidden_states, residual, forward_batch):
         hidden_states, residual = self._communicate_summable_tensor_pair_fn(

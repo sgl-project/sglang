@@ -438,8 +438,12 @@ class GigaChat35DecoderLayer(deepseek_v2.DeepseekV2DecoderLayer):
             pre_layernorm=self.post_attention_layernorm if self._use_pre else None,
             post_layernorm=self.post_self_attn_layernorm,
         )
-        self.layer_communicator.input_layernorm = attn_prepare_layernorm
-        self.layer_communicator.post_attention_layernorm = mlp_prepare_layernorm
+        # The communicator chooses its fused steps from its norms when built.
+        self.layer_communicator = self._build_layer_communicator(
+            input_layernorm=attn_prepare_layernorm,
+            post_attention_layernorm=mlp_prepare_layernorm,
+            qkv_latent_func=self.layer_communicator.qkv_latent_func,
+        )
 
     def _is_layer_sparse(self, layer_id: int, is_nextn: bool) -> bool:
         if is_nextn:

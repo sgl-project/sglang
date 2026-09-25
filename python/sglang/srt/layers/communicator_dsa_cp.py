@@ -25,10 +25,10 @@ from sglang.srt.layers.communicator import (
     CommunicateContext,
     CommunicateSimpleFn,
     CommunicateSummableTensorPairFn,
-    CommunicateWithAllReduceAndLayerNormFn,
     LayerCommunicator,
     LayerScatterModes,
     ScatterMode,
+    _mlp_input_norm,
 )
 from sglang.srt.layers.cp.utils import is_mla_cp_active
 from sglang.srt.layers.dp_attention import (
@@ -113,19 +113,22 @@ class DSACPLayerCommunicator(LayerCommunicator):
             output_mode=ScatterMode.SCATTERED,
             context=self._context,
         )
-        self._communicate_with_all_reduce_and_layer_norm_fn = DSACPCommunicateWithAllReduceAndLayerNormFn.get_fn(
-            hidden_states_input_mode=ScatterMode.SCATTERED,
-            residual_input_mode=ScatterMode.SCATTERED,
-            hidden_states_output_mode=self.layer_scatter_modes.mlp_mode,  # SCATTERED, FULL
-            residual_output_mode=ScatterMode.SCATTERED,
-            context=self._context,
-        )
         self._communicate_summable_tensor_pair_fn = DSACPCommunicateSummableTensorPairFn.get_fn(
             hidden_states_input_mode=self.layer_scatter_modes.mlp_mode,  # SCATTERED, FULL
             residual_input_mode=ScatterMode.SCATTERED,
             output_mode=ScatterMode.SCATTERED,
             context=self._context,
         )
+
+    def _select_mlp_input(self):
+        fn = DSACPCommunicateWithAllReduceAndLayerNormFn.get_fn(
+            hidden_states_input_mode=ScatterMode.SCATTERED,
+            residual_input_mode=ScatterMode.SCATTERED,
+            hidden_states_output_mode=self.layer_scatter_modes.mlp_mode,  # SCATTERED, FULL
+            residual_output_mode=ScatterMode.SCATTERED,
+            context=self._context,
+        )
+        return fn, False
 
 
 class DSACPCommunicateSimpleFn(CommunicateSimpleFn):
@@ -141,9 +144,7 @@ class DSACPCommunicateSimpleFn(CommunicateSimpleFn):
         raise NotImplementedError(f"{input_mode=} {output_mode=}")
 
 
-class DSACPCommunicateWithAllReduceAndLayerNormFn(
-    CommunicateWithAllReduceAndLayerNormFn
-):
+class DSACPCommunicateWithAllReduceAndLayerNormFn:
     """Besides communication, needs to
     1. All reduce in tp_attn_group on hidden_states
     2. Apply layer norm
@@ -161,7 +162,7 @@ class DSACPCommunicateWithAllReduceAndLayerNormFn(
         assert residual_input_mode == ScatterMode.SCATTERED
         assert residual_output_mode == ScatterMode.SCATTERED
         if hidden_states_output_mode == ScatterMode.SCATTERED:
-            return DSACPCommunicateWithAllReduceAndLayerNormFn._simple
+            return _mlp_input_norm
 
         if hidden_states_output_mode == ScatterMode.FULL:
             return partial(
