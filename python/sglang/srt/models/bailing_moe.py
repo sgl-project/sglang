@@ -660,7 +660,7 @@ class BailingMoEBlock(nn.Module):
         self.attn_tp_rank = get_parallel().attn_tp_rank
 
         self.is_layer_sparse = self._is_layer_sparse(
-            config, layer_id=layer_id, is_nextn=False
+            config, layer_id=layer_id, is_nextn=is_nextn
         )
         is_previous_layer_sparse = self._is_layer_sparse(
             config, layer_id=layer_id - 1, is_nextn=False
@@ -671,7 +671,8 @@ class BailingMoEBlock(nn.Module):
 
         self.layer_scatter_modes = LayerScatterModes.init_new(
             layer_id=layer_id,
-            num_layers=config.num_hidden_layers,
+            # A NextN draft is a one-layer model.
+            num_layers=1 if is_nextn else config.num_hidden_layers,
             is_layer_sparse=self.is_layer_sparse,
             is_previous_layer_sparse=is_previous_layer_sparse,
             is_next_layer_sparse=is_next_layer_sparse,
