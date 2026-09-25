@@ -837,7 +837,14 @@ class Fp8LinearMethod(LinearMethodBase):
             from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
             from sglang.srt.layers.quantization.fp8_utils import block_quant_dequant
 
-            if not is_batch_invariant_mode_enabled():
+            # Keep even the smallest/largest finite E4M3 value representable
+            # as normal BF16, and reject mislabeled non-power-of-two scales.
+            exact_bf16_scales = (
+                (weight_scale >= 2.0**-117)
+                & (weight_scale <= 2.0**119)
+                & (torch.frexp(weight_scale)[0] == 0.5)
+            ).all()
+            if not is_batch_invariant_mode_enabled() and exact_bf16_scales.item():
                 # Hopper group32 FP8 accumulates each 32-wide block separately.
                 # Reuse a BF16 weight expansion for larger GEMMs, keeping the
                 # original FP8 weights for decode and weight reloads.

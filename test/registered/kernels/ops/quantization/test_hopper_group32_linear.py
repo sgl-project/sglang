@@ -115,6 +115,16 @@ def test_cached_weight_refresh():
         method.process_weights_after_loading_block_quant(layer)
         assert layer._block_fp8_bf16_weight is None
         assert layer._derived_weight_cache_error is None
+    for scale in (2.0**-118, 2.0**120, 1.5, float("nan")):
+        layer.weight_scale_inv.data.fill_(scale)
+        method.process_weights_after_loading_block_quant(layer)
+        assert layer._block_fp8_bf16_weight is None
+        assert layer._derived_weight_cache_error is None
+    for scale in (2.0**-117, 2.0**119):
+        layer.weight_scale_inv.data.fill_(scale)
+        method.process_weights_after_loading_block_quant(layer)
+        assert layer._block_fp8_bf16_weight is not None
+    layer.weight_scale_inv.data.fill_(1)
     layer.keep_plain_weight_layout = True
     method.process_weights_after_loading_block_quant(layer)
     assert layer._block_fp8_bf16_weight is None
