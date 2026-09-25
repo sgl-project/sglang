@@ -1,9 +1,15 @@
+import ast
+import types
 import unittest
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import torch
 
+import sglang
+from sglang.srt.layers import communicator as comm
 from sglang.srt.layers.communicator import (
+    CommunicateSummableTensorPairFn,
     LayerCommunicator,
     UnreducedOutput,
     reduce_output,
@@ -15,13 +21,24 @@ from sglang.test.test_utils import CustomTestCase
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
-def make_communicator(*, fuse, reduce_scatter, cls=LayerCommunicator):
+def make_communicator(
+    *,
+    fuse,
+    reduce_scatter,
+    next_layer_reduce_scatter=None,
+    next_layer_scatter=None,
+    cls=LayerCommunicator,
+):
     """A communicator whose decisions and postprocess are stubbed, built
     without the process-wide parallel state."""
     communicator = cls.__new__(cls)
     if cls is LayerCommunicator:
         communicator.should_defer_ffn_reduction = MagicMock(return_value=fuse)
     communicator.should_use_reduce_scatter = MagicMock(return_value=reduce_scatter)
+    communicator._reduce_scatter_for_next_layer = MagicMock(
+        return_value=next_layer_reduce_scatter
+    )
+    communicator._scatter_for_next_layer = MagicMock(return_value=next_layer_scatter)
     communicator.postprocess_layer = MagicMock(
         side_effect=lambda hidden_states, residual, forward_batch: (
             hidden_states + 1,
@@ -54,6 +71,32 @@ class TestFfnExit(CustomTestCase):
         self.assertEqual(seen, (True, False))
         self.assertIsInstance(hidden_states, UnreducedOutput)
         self.assertIs(residual, self.residual)
+        communicator.postprocess_layer.assert_not_called()
+
+    def test_a_reduce_scatter_is_left_to_the_next_layer(self):
+        """Under attention DP the reduce-scatter postprocess would run goes to the
+        next layer with the partial sum."""
+        step = MagicMock()
+        communicator = make_communicator(
+            fuse=False, reduce_scatter=True, next_layer_reduce_scatter=step
+        )
+        seen, (hidden_states, residual) = self.run_exit(communicator)
+        self.assertEqual(seen, (False, True))
+        self.assertIsInstance(hidden_states, UnreducedOutput)
+        self.assertIs(hidden_states.reduce_and_redistribute, step)
+        self.assertIs(residual, self.residual)
+        communicator.postprocess_layer.assert_not_called()
+        step.assert_not_called()
+
+    def test_a_deferred_sum_carries_the_scatter_back_under_attention_dp(self):
+        step = MagicMock()
+        communicator = make_communicator(
+            fuse=True, reduce_scatter=False, next_layer_scatter=step
+        )
+        _, (hidden_states, _) = self.run_exit(communicator)
+        self.assertIsInstance(hidden_states, UnreducedOutput)
+        self.assertIs(hidden_states.reduce_and_redistribute, step)
+        communicator._reduce_scatter_for_next_layer.assert_not_called()
         communicator.postprocess_layer.assert_not_called()
 
     def test_postprocess_completes_other_exits(self):
@@ -153,6 +196,17 @@ class TestReduceOutput(CustomTestCase):
         reduce_output(hidden_states)
         self.all_reduce.assert_called_once()
 
+    def test_a_reduce_scatter_left_by_the_last_layer_runs_once(self):
+        local = torch.full((1, 4), 7.0)
+        step = MagicMock(return_value=local)
+        partial = torch.ones(3, 4)
+        hidden_states = reduce_output(
+            UnreducedOutput(partial, reduce_and_redistribute=step)
+        )
+        step.assert_called_once_with(partial)
+        self.assertIs(hidden_states, local)
+        self.all_reduce.assert_not_called()
+
     def test_complete_hidden_states_pass_through(self):
         communicator = make_communicator(fuse=False, reduce_scatter=False)
         with communicator.ffn_exit(object()) as ffn_exit:
@@ -180,6 +234,229 @@ class TestReduceOutput(CustomTestCase):
                 expected = 3.0 if fuse else 2.0  # all-reduce stub / postprocess stub
                 torch.testing.assert_close(hidden_states, torch.full((3, 4), expected))
                 self.assertIs(residual_out, residual)
+
+
+class TestReduceScatterForNextLayer(CustomTestCase):
+    """Which reduce-scatter the next layer runs in place of postprocess."""
+
+    def communicator(self, *, is_last_layer=False, pair_fn=None, sp_variant=None):
+        communicator = LayerCommunicator.__new__(LayerCommunicator)
+        communicator.is_last_layer = is_last_layer
+        communicator._sp_variant = sp_variant
+        communicator._communicate_summable_tensor_pair_fn = (
+            pair_fn or CommunicateSummableTensorPairFn._scatter_hidden_states
+        )
+        communicator.allow_reduce_scatter = True
+        communicator.layer_scatter_modes = types.SimpleNamespace(is_layer_sparse=True)
+        return communicator
+
+    def bound(self, communicator, step):
+        with patch.object(comm, "_output_to_local_tokens_step", return_value=step):
+            return communicator._reduce_scatter_for_next_layer(object())
+
+    def test_a_reduce_scatter_is_bound_for_the_next_layer(self):
+        for step in (
+            comm._reduce_and_redistribute_output_varlen,
+            comm._reduce_and_redistribute_output_max_len,
+        ):
+            with self.subTest(step=step.__name__):
+                bound = self.bound(self.communicator(), step)
+                self.assertIs(bound.func, comm._to_local_tokens)
+                self.assertIs(bound.args[0], step)
+
+    def test_postprocess_keeps_everything_else(self):
+        reduce_scatter = comm._reduce_and_redistribute_output_varlen
+        for name, communicator, step in (
+            ("scatter only", self.communicator(), comm._redistribute_output),
+            ("last layer", self.communicator(is_last_layer=True), reduce_scatter),
+            (
+                "other layout change",
+                self.communicator(
+                    pair_fn=CommunicateSummableTensorPairFn._scatter_hidden_states_moe
+                ),
+                reduce_scatter,
+            ),
+        ):
+            with self.subTest(name):
+                self.assertIsNone(self.bound(communicator, step))
+
+    def test_postprocess_keeps_an_active_layernorm_sp_region(self):
+        communicator = self.communicator(sp_variant=object())
+        with get_forward().scoped(sp_active=True):
+            self.assertIsNone(
+                self.bound(communicator, comm._reduce_and_redistribute_output_varlen)
+            )
+
+
+class TestScatterForNextLayer(CustomTestCase):
+    def communicator(self, pair_fn):
+        communicator = LayerCommunicator.__new__(LayerCommunicator)
+        communicator._communicate_summable_tensor_pair_fn = pair_fn
+        return communicator
+
+    def test_only_a_scatter_back_to_local_tokens_is_carried(self):
+        forward_batch = object()
+        bound = self.communicator(
+            CommunicateSummableTensorPairFn._scatter_hidden_states
+        )._scatter_for_next_layer(forward_batch)
+        self.assertIs(bound.func, comm._all_reduce_then_to_local_tokens)
+        self.assertIs(bound.args[0], forward_batch)
+        self.assertIsNone(
+            self.communicator(
+                CommunicateSummableTensorPairFn._trivial
+            )._scatter_for_next_layer(forward_batch)
+        )
+
+    def test_the_all_reduce_runs_before_the_scatter(self):
+        calls = []
+        partial = torch.ones(3, 4)
+        local = torch.empty(1, 4)
+        with (
+            patch.object(
+                comm,
+                "deferred_post_experts_all_reduce",
+                side_effect=lambda x: calls.append(("all_reduce", x)) or x * 2,
+            ),
+            patch.object(comm, "_dp_scatter_group", return_value="group"),
+            patch.object(
+                comm,
+                "get_local_dp_buffer",
+                side_effect=lambda group: calls.append(("buffer", group)) or local,
+            ),
+            patch.object(
+                comm,
+                "dp_scatter",
+                side_effect=lambda out, full, fb: calls.append(("scatter", out)),
+            ),
+        ):
+            result = comm._all_reduce_then_to_local_tokens(object(), partial)
+        self.assertEqual([c[0] for c in calls], ["all_reduce", "buffer", "scatter"])
+        self.assertIs(calls[0][1], partial)
+        self.assertIs(result, local)
+
+
+SRT_DIR = Path(sglang.__file__).resolve().parent / "srt"
+# Attributes a decoder layer holds its FFN, or parts of it, in.
+FFN_ATTRS = {"mlp", "moe", "shared_expert", "shared_experts", "share_expert"}
+
+
+def can_be_true(value, params):
+    """Whether a use_dp_attention_reduce value can turn it on: anything but
+    False or a function forwarding its own parameter of that name."""
+    if isinstance(value, ast.Constant) and value.value is False:
+        return False
+    return not (isinstance(value, ast.Name) and value.id in params)
+
+
+class SourceIndex:
+    def __init__(self):
+        self.paths = {
+            "sglang.srt." + str(p.relative_to(SRT_DIR))[:-3].replace("/", "."): p
+            for p in SRT_DIR.rglob("*.py")
+        }
+        self._trees = {}
+
+    def tree(self, module):
+        if module not in self._trees:
+            self._trees[module] = ast.parse(self.paths[module].read_text())
+        return self._trees[module]
+
+    def resolve(self, module, name):
+        """The (module, ClassDef) that `name` refers to in `module`, if any."""
+        for node in self.tree(module).body:
+            if isinstance(node, ast.ClassDef) and node.name == name:
+                return module, node
+        for node in ast.walk(self.tree(module)):
+            if isinstance(node, ast.ImportFrom) and node.module in self.paths:
+                for alias in node.names:
+                    if (alias.asname or alias.name) == name:
+                        return self.resolve(node.module, alias.name)
+        return None
+
+
+def submodule_constructions(cls):
+    """(attribute, class name, call) for each `self.attr = Name(...)`."""
+    for node in ast.walk(cls):
+        if isinstance(node, ast.Assign) and isinstance(node.value, ast.Call):
+            func = node.value.func
+            for target in node.targets:
+                if (
+                    isinstance(func, ast.Name)
+                    and isinstance(target, ast.Attribute)
+                    and getattr(target.value, "id", None) == "self"
+                ):
+                    yield target.attr, func.id, node.value
+
+
+def attention_tp_reductions(cls):
+    """Lines in a class that can turn on use_dp_attention_reduce."""
+    found = []
+    for fn in ast.walk(cls):
+        if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        params = {a.arg for a in fn.args.args + fn.args.kwonlyargs}
+        for node in ast.walk(fn):
+            if isinstance(node, ast.keyword) and node.arg == "use_dp_attention_reduce":
+                if can_be_true(node.value, params):
+                    found.append(node.value.lineno)
+            elif isinstance(node, ast.Assign) and any(
+                isinstance(t, ast.Attribute) and t.attr == "use_dp_attention_reduce"
+                for t in node.targets
+            ):
+                if can_be_true(node.value, params):
+                    found.append(node.lineno)
+    return found
+
+
+class TestFfnExitUsersOweATpSum(CustomTestCase):
+    """Under attention DP the next layer's input completes a deferred FFN sum
+    with an all-reduce over TP. An FFN whose linear layers reduce over the
+    attention-TP group only (use_dp_attention_reduce) owes a different sum, so
+    no FFN of a layer that uses ffn_exit may turn it on."""
+
+    def test_no_ffn_behind_ffn_exit_reduces_over_attention_tp(self):
+        index = SourceIndex()
+        layers, ffn_classes, offenders = [], set(), []
+        for module, path in sorted(index.paths.items()):
+            source = path.read_text()
+            if (
+                not module.startswith("sglang.srt.models.")
+                or ".ffn_exit(" not in source
+            ):
+                continue
+            for cls in index.tree(module).body:
+                if not isinstance(cls, ast.ClassDef):
+                    continue
+                if ".ffn_exit(" not in ast.get_source_segment(source, cls):
+                    continue
+                layers.append(f"{module}.{cls.name}")
+                todo = []
+                for attr, name, call in submodule_constructions(cls):
+                    if attr not in FFN_ATTRS:
+                        continue
+                    todo.append((module, name))
+                    offenders += [
+                        f"{module}.{cls.name}:{kw.value.lineno}"
+                        for kw in call.keywords
+                        if kw.arg == "use_dp_attention_reduce"
+                        and can_be_true(kw.value, set())
+                    ]
+                # Everything an FFN class builds is part of the FFN.
+                while todo:
+                    resolved = index.resolve(*todo.pop())
+                    if resolved is None:
+                        continue
+                    where, ffn = resolved
+                    if (where, ffn.name) in ffn_classes:
+                        continue
+                    ffn_classes.add((where, ffn.name))
+                    offenders += [
+                        f"{where}.{ffn.name}:{line}"
+                        for line in attention_tp_reductions(ffn)
+                    ]
+                    todo += [(where, n) for _, n, _ in submodule_constructions(ffn)]
+        self.assertTrue(layers and ffn_classes, "no FFN behind ffn_exit found")
+        self.assertEqual(sorted(set(offenders)), [])
 
 
 if __name__ == "__main__":

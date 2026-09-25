@@ -168,6 +168,30 @@ class TestPrepareAttnSteps(CustomTestCase):
             self.assertEqual(all_reduce.call_count, 1)
             self.assertEqual(norm.calls, ["norm"])
 
+    def test_an_owed_reduce_scatter_reaches_local_tokens_before_the_norm(self):
+        for local_rows in (1, 0):
+            with (
+                self.subTest(local_rows=local_rows),
+                platform(fusion=True) as (_, all_reduce),
+            ):
+                norm = Norm()
+                partial = torch.ones(3, 4)
+                local = torch.full((local_rows, 4), 7.0)
+                step = MagicMock(return_value=local)
+                hidden_states, residual = communicator(norm).prepare_attn(
+                    comm.UnreducedOutput(partial, reduce_and_redistribute=step),
+                    torch.zeros(local_rows, 4),
+                    None,
+                )
+                step.assert_called_once_with(partial)
+                self.assertEqual(all_reduce.call_count, 0)
+                if local_rows:
+                    self.assertEqual(norm.calls, ["norm"])
+                    torch.testing.assert_close(hidden_states, local * 2)
+                else:
+                    self.assertEqual(norm.calls, [])
+                    self.assertIs(residual, local)
+
 
 if __name__ == "__main__":
     unittest.main()
