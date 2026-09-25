@@ -4,8 +4,8 @@ from typing import Dict, List, TypedDict
 
 import torch
 
-from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe import get_config_dtype_str
 from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe_triton_config import (
+    get_config_dtype_str,
     get_config_file_name,
 )
 from sglang.srt.utils import is_gfx95_supported, is_hip
@@ -78,6 +78,7 @@ def get_model_config(
         topk = config.num_experts_per_tok
         intermediate_size = config.intermediate_size
     elif architecture in [
+        "BeamForCausalLM",
         "Qwen2MoeForCausalLM",
         "Qwen3MoeForCausalLM",
         "Qwen3NextForCausalLM",
@@ -216,6 +217,36 @@ def get_model_config(
         "block_shape": block_shape,
         "architecture": architecture,
     }
+
+
+def get_moe_layer_ids(model_name: str) -> List[int]:
+    """Return layer IDs in the order used by captured router dumps."""
+    config = get_config(model_name, trust_remote_code=True)
+    if config.architectures[0] == "BeamForCausalLM":
+        layer_ids = [
+            i
+            for i, layer_type in enumerate(config.mlp_layer_types)
+            if layer_type == "sparse"
+        ]
+    elif (
+        hasattr(config, "first_k_dense_replace")
+        and getattr(config, "moe_layer_freq", 1) == 1
+    ):
+        layer_ids = list(range(config.first_k_dense_replace, config.num_hidden_layers))
+    else:
+        raise ValueError(
+            f"Unsupported captured-routing layer layout: {config.architectures[0]}"
+        )
+    if not layer_ids:
+        raise ValueError("Captured-routing tuning requires at least one MoE layer")
+    return layer_ids
+
+
+def load_topk_ids(topk_ids_dir: str, i: int, moe_layer_ids: List[int]):
+    capture_idx, layer_idx = divmod(i, len(moe_layer_ids))
+    return torch.load(
+        f"{topk_ids_dir}/topk_ids_layer{moe_layer_ids[layer_idx]}_idx{capture_idx}.pt"
+    )
 
 
 def get_rocm_configs_compute_bound() -> List[Dict[str, int]]:

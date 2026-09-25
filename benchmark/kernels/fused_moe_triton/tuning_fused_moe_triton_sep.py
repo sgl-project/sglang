@@ -20,6 +20,8 @@ from common_utils import (
     get_configs_compute_bound,
     get_default_batch_sizes,
     get_model_config,
+    get_moe_layer_ids,
+    load_topk_ids,
     sort_config,
 )
 from ray.experimental.tqdm_ray import tqdm
@@ -116,15 +118,6 @@ class KernelWrapper:
             torch.cuda.synchronize()
             time_cost = min(time_cost, start_event.elapsed_time(end_event))
         return time_cost
-
-
-def load_topk_ids(topk_ids_dir, i: int):
-    num_layers = 61
-    dense_layers = 3
-    moe_layers = num_layers - dense_layers
-    return torch.load(
-        f"{topk_ids_dir}/topk_ids_layer{i % moe_layers + dense_layers}_idx{i // moe_layers}.pt"
-    )
 
 
 def benchmark_config(
@@ -536,6 +529,7 @@ class BestConfigTrace:
 
 class BenchmarkWorker:
     def __init__(self, seed: int, server_args: ServerArgs) -> None:
+        self.moe_layer_ids = get_moe_layer_ids(server_args.model_path)
         torch.set_default_device("cuda")
         torch.cuda.manual_seed_all(0)
         self.seed = seed
@@ -563,7 +557,9 @@ class BenchmarkWorker:
         enable_up_tma: bool = False,
     ) -> Tuple[Dict[str, int], float]:
         torch.cuda.manual_seed_all(0)
-        topk_ids_list = [load_topk_ids(topk_ids_dir, i) for i in range(100)]
+        topk_ids_list = [
+            load_topk_ids(topk_ids_dir, i, self.moe_layer_ids) for i in range(100)
+        ]
         with torch.cuda.device(self.device_id) if is_hip() else nullcontext():
             if enable_up_tma:
                 # Two-step: first measure down to determine c_sorted,
@@ -646,7 +642,9 @@ class BenchmarkWorker:
         ep_size: int = 1,
         enable_up_tma: bool = False,
     ) -> Dict[str, int]:
-        topk_ids_list = [load_topk_ids(topk_ids_dir, i) for i in range(100)]
+        topk_ids_list = [
+            load_topk_ids(topk_ids_dir, i, self.moe_layer_ids) for i in range(100)
+        ]
 
         if not enable_up_tma:
             # Default path: single round, up c_sorted=False, no up TMA.
@@ -803,7 +801,9 @@ class BenchmarkWorker:
         for i, file in enumerate(cmp_config_files):
             print(f"config {i}: {file}")
 
-        topk_ids_list = [load_topk_ids(topk_ids_dir, i) for i in range(100)]
+        topk_ids_list = [
+            load_topk_ids(topk_ids_dir, i, self.moe_layer_ids) for i in range(100)
+        ]
         torch.cuda.manual_seed_all(0)
         with torch.cuda.device(self.device_id) if is_hip() else nullcontext():
             for bs in num_tokens:
