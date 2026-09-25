@@ -48,6 +48,12 @@ class MulAdd(CustomOp):
     def forward_npu(
         self, a: torch.Tensor, b: torch.Tensor, c: torch.Tensor, k: int = 0
     ):
+        # The kernel flattens b to a single [inner_dim] row, so anything wider
+        # (per-frame [B, F, 1, C] with F > 1, or batch > 1) needs the eager
+        # frame-wise path instead.
+        if b.dim() == 4 and b.numel() != a.shape[-1]:
+            return self.forward_native(a, b, c, k=k)
+
         from sgl_kernel_npu.norm.scale_shift import fused_scale_shift
 
         return fused_scale_shift(a, b, c, scale_constant=k)
