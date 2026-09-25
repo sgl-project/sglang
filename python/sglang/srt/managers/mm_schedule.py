@@ -683,29 +683,21 @@ def _adjust_embedding_length(
     num_mm_tokens_in_input_ids: int,
     logger,
 ) -> torch.Tensor:
-    num_mm_tokens_in_embedding = embedding.shape[0]
+    # Chunk extraction has already selected the rows for this extend window.
+    # Cropping here would shift image rows onto different placeholder tokens.
+    num_mm_tokens_in_embedding = _embedding_token_count(embedding)
     if num_mm_tokens_in_input_ids != num_mm_tokens_in_embedding:
-        logger.warning(
-            f"Number of tokens in multimodal embedding does not match those in the input text. "
-            f"Got {num_mm_tokens_in_input_ids} tokens in the text but {num_mm_tokens_in_embedding} "
-            f"tokens from multimodal embeddings."
-        )
-        if num_mm_tokens_in_input_ids < num_mm_tokens_in_embedding:
-            chunked_prefill_size = get_schedule().chunked_prefill_size
-            if chunked_prefill_size != -1:
-                logger.warning(
-                    "You may want to avoid this issue by raising `chunked_prefill_size`, or disabling chunked prefill"
-                )
-            # extract from the end: this is a compromise
-            if embedding.dim() == 2:
-                embedding = embedding[-num_mm_tokens_in_input_ids:, :]
-            else:
-                num_multimodal = num_mm_tokens_in_input_ids // embedding.shape[0]
-                embedding = embedding[-num_multimodal:, :]
-        else:
-            raise RuntimeError(
-                f"Insufficient multimodal embedding length: {num_mm_tokens_in_input_ids=} vs {num_mm_tokens_in_embedding=}. This is an internal error"
+        hint = ""
+        if get_schedule().chunked_prefill_size != -1:
+            hint = (
+                " Chunked prefill is enabled; check that embedding chunks match "
+                "the requested token spans."
             )
+        raise RuntimeError(
+            "Multimodal embedding length does not match the placeholder tokens in "
+            f"the input text: {num_mm_tokens_in_input_ids=} vs "
+            f"{num_mm_tokens_in_embedding=}. This is an internal error.{hint}"
+        )
     return embedding
 
 

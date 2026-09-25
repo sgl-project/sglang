@@ -5,9 +5,16 @@ import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.managers import mm_schedule as mm_utils
+from sglang.srt.managers.mm_utils import embed_mm_inputs
+from sglang.srt.managers.schedule_batch import (
+    Modality,
+    MultimodalDataItem,
+    MultimodalInputs,
+)
+from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=8, suite="stage-a-test-cpu-intel")
+register_cpu_ci(est_time=8, suite="base-a-test-cpu")
 
 
 @pytest.mark.parametrize(
@@ -109,21 +116,42 @@ def test_get_embedding_and_mask_async_asserts_offset_count():
     assert "derived from offsets" in message
 
 
-def test_adjust_embedding_length_crops_overlong_embedding():
-    embedding = torch.arange(20, dtype=torch.float32).reshape(5, 4)
-    server_args = Mock(chunked_prefill_size=-1)
+@pytest.mark.parametrize("shape", [(6, 4), (2, 3, 4), (1, 2, 3, 4)])
+def test_adjust_embedding_length_preserves_exact_flattened_rows(shape):
+    """Leading encoder batch axes count as tokens, not embedding width."""
+    embedding = torch.arange(24, dtype=torch.float32).reshape(shape)
 
-    with patch.object(mm_utils, "get_schedule", return_value=server_args):
-        result = mm_utils._adjust_embedding_length(embedding, 3, Mock())
+    result = mm_utils._adjust_embedding_length(embedding, 6, Mock())
 
-    torch.testing.assert_close(result, embedding[-3:], rtol=0, atol=0)
+    assert result is embedding
 
 
-def test_adjust_embedding_length_rejects_short_embedding():
-    embedding = torch.zeros(2, 4)
+@pytest.mark.parametrize("shape", [(6, 4), (2, 3, 4), (1, 2, 3, 4)])
+@pytest.mark.parametrize("placeholder_count", [0, 5, 7])
+@pytest.mark.parametrize("chunked_prefill_size", [-1, 4])
+def test_adjust_embedding_length_rejects_mismatched_flattened_rows(
+    shape, placeholder_count, chunked_prefill_size
+):
+    """Never silently discard encoder rows or accept a shortage at placement."""
+    embedding = torch.arange(24, dtype=torch.float32).reshape(shape)
+    original = embedding.clone()
 
-    with pytest.raises(RuntimeError, match="Insufficient multimodal embedding length"):
-        mm_utils._adjust_embedding_length(embedding, 3, Mock())
+    with (
+        patch.object(
+            mm_utils,
+            "get_schedule",
+            return_value=Mock(chunked_prefill_size=chunked_prefill_size),
+        ),
+        pytest.raises(RuntimeError, match="Multimodal embedding length") as error,
+    ):
+        mm_utils._adjust_embedding_length(embedding, placeholder_count, Mock())
+
+    assert f"num_mm_tokens_in_input_ids={placeholder_count}" in str(error.value)
+    assert "num_mm_tokens_in_embedding=6" in str(error.value)
+    assert ("Chunked prefill is enabled" in str(error.value)) == (
+        chunked_prefill_size != -1
+    )
+    torch.testing.assert_close(embedding, original, rtol=0, atol=0)
 
 
 def test_get_embedding_and_mask_falls_back_after_input_ids_rewrite():
@@ -160,6 +188,133 @@ def test_get_embedding_and_mask_falls_back_after_input_ids_rewrite():
     assert result is embedding
     assert result_mask is mask
     assert result_input_ids is rewritten_input_ids
+
+
+@pytest.mark.parametrize(
+    ("route", "per_item"),
+    [
+        ("batched", False),
+        ("batched", True),
+        ("by_item", False),
+        ("by_item", True),
+        ("full", False),
+        ("full", True),
+        ("precomputed", False),
+    ],
+)
+def test_encoder_rows_keep_their_positions_across_prefill_chunks(route, per_item):
+    """Flatten batch axes before chunking; cache reuse must retain row order."""
+    rows = torch.arange(32, dtype=torch.float32).reshape(8, 4)
+    offsets = [(2, 5), (8, 11)]
+    items = [
+        MultimodalDataItem(
+            modality=Modality.IMAGE,
+            hash=100 + i,
+            pad_value=20 + i,
+            feature=rows[i * 4 : (i + 1) * 4].reshape(2, 2, 4),
+            offsets=[offset],
+        )
+        for i, offset in enumerate(offsets)
+    ]
+    if route == "full":
+        items = [
+            MultimodalDataItem(
+                modality=Modality.IMAGE,
+                hash=100,
+                pad_value=20,
+                feature=rows.reshape(2, 4, 4),
+                offsets=offsets,
+            )
+        ]
+    if route == "precomputed":
+        for item in items:
+            item.precomputed_embeddings = item.feature
+
+    def encode(encode_items):
+        if route == "precomputed":
+            raise AssertionError("Precomputed embeddings must skip encoding")
+        features = [item.feature for item in encode_items]
+        return features if per_item else torch.cat(features)
+
+    input_ids = torch.zeros(14, dtype=torch.long)
+    for item in items:
+        for start, end in item.offsets:
+            input_ids[start : end + 1] = item.pad_value
+    text_embedding = torch.nn.Embedding(2, 4)
+    expected = text_embedding(torch.zeros_like(input_ids))
+    expected[2:6] = rows[:4]
+    expected[8:12] = rows[4:]
+    override = get_context().override_server_args(tp_size=1, chunked_prefill_size=4)
+    override.install()
+    try:
+        with (
+            get_parallel().override(attn_tp_rank=0, attn_tp_size=1, tp_size=1),
+            patch.object(mm_utils, "_is_hip", route == "by_item"),
+            patch.object(
+                mm_utils, "embedding_cache", mm_utils.MultiModalStaticCache(4096)
+            ),
+        ):
+            chunks = []
+            for prefix, length in [(0, 4), (4, 4), (8, 6)]:
+                chunk, _ = embed_mm_inputs(
+                    mm_inputs_list=[MultimodalInputs(mm_items=items)],
+                    extend_prefix_lens=[prefix],
+                    extend_seq_lens=[length],
+                    input_ids=input_ids[prefix : prefix + length].clone(),
+                    input_embedding=text_embedding,
+                    data_embedding_func_mapping={Modality.IMAGE: encode},
+                )
+                chunks.append(chunk)
+    finally:
+        override.restore()
+
+    torch.testing.assert_close(torch.cat(chunks), expected, rtol=0, atol=0)
+
+
+def test_evs_rewritten_spans_determine_chunk_row_counts():
+    """Frame redistribution changes a chunk's row count without changing length."""
+    rows = torch.arange(16, dtype=torch.float32).reshape(4, 4)
+    original_ids = [0, 20, 20, 0, 20, 20, 0]
+    item = MultimodalDataItem(
+        modality=Modality.VIDEO,
+        hash=100,
+        pad_value=20,
+        feature=torch.zeros(1),
+        offsets=[(1, 2), (4, 5)],
+        model_specific_data={"pre_chunked_input_ids": original_ids},
+    )
+    encoder = Mock(
+        return_value=mm_utils.EVSEmbeddingResult(
+            embedding=rows, num_tokens_per_frame=[3, 1]
+        )
+    )
+    override = get_context().override_server_args(tp_size=1, chunked_prefill_size=4)
+    override.install()
+    try:
+        with (
+            get_parallel().override(attn_tp_rank=0, attn_tp_size=1, tp_size=1),
+            patch.object(
+                mm_utils, "embedding_cache", mm_utils.MultiModalStaticCache(4096)
+            ),
+        ):
+            for prefix, length, expected_rows, expected_mask in [
+                (0, 4, rows[:3], [False, True, True, True]),
+                (4, 3, rows[3:], [False, True, False]),
+            ]:
+                result, mask, _ = mm_utils.get_embedding_and_mask(
+                    data_embedding_func=encoder,
+                    embedding_items=[item],
+                    placeholder_tensor=torch.tensor([20]),
+                    input_ids=torch.tensor(original_ids[prefix : prefix + length]),
+                    items_size=[0, 1],
+                    prefix_length=[prefix],
+                    extend_length=[length],
+                    items_offset_list=[item.offsets],
+                )
+                torch.testing.assert_close(result, expected_rows, rtol=0, atol=0)
+                assert mask.flatten().tolist() == expected_mask
+    finally:
+        override.restore()
 
 
 if __name__ == "__main__":
