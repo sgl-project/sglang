@@ -46,17 +46,22 @@ class DeferringLayer(nn.Module):
         super().__init__()
         self.return_topk = return_topk
         self.layer_communicator = comm.LayerCommunicator.__new__(comm.LayerCommunicator)
-        self.layer_communicator._ffn_output = comm.StageOutput(
-            comm.Layout(frozenset()),
-            group=comm.SumGroup.TP,
-            leaves_for_next_layer=True,
+        self.layer_communicator._steps = comm.BoundarySteps(
+            attention_input=comm.CommunicateSimpleFn._trivial,
+            ffn_input=comm._mlp_input_norm,
+            ffn_output=comm.StageOutput(
+                comm.Layout(frozenset()),
+                group=comm.SumGroup.TP,
+                leaves_for_next_layer=True,
+            ),
+            ffn_output_move=comm.CommunicateSummableTensorPairFn._trivial,
+            ffn_sum_is_movable=True,
         )
         self.layer_communicator.should_fuse_mlp_allreduce_with_next_layer = (
             lambda batch: defer
         )
         self.layer_communicator._ffn_sum_moves_to_next_layer = lambda batch, **_: defer
         self.layer_communicator.is_last_layer = False
-        self.layer_communicator._postprocess_scatters_to_local_tokens = False
         # No batch runs its own steps: no SP region, no scattered input.
         self.layer_communicator._sp_steps = None
         self.layer_communicator._input_scattered_steps = None

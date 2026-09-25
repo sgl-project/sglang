@@ -223,7 +223,7 @@ class TestMlpInputOrder(CustomTestCase):
     def test_a_gather_runs_the_order_chosen_at_construction(self):
         for mlp_mode in (FULL, MOE_FULL):
             with self.subTest(mlp_mode=mlp_mode):
-                c, (steps, may_fuse) = communicator(
+                c, (steps, fused) = communicator(
                     (TP_ATTN_FULL, TP_ATTN_FULL, mlp_mode, TP_ATTN_FULL),
                     make_context(tp=2),
                     Fusable(),
@@ -239,7 +239,7 @@ class TestMlpInputOrder(CustomTestCase):
                     gathers_residual=False,
                     fusions=(entry,),
                 )
-                self.assertTrue(may_fuse)
+                self.assertEqual([f.run for f in fused], [entry])
 
     def test_no_fused_entry_without_a_fusable_norm_or_under_attention_dp(self):
         for context, norm in (
@@ -247,10 +247,10 @@ class TestMlpInputOrder(CustomTestCase):
             (make_context(dp=2, tp=2), Fusable()),
         ):
             with self.subTest(dp=context.attn_dp_size):
-                _, (steps, may_fuse) = communicator(GATHER_LAYOUT, context, norm)
+                _, (steps, fused) = communicator(GATHER_LAYOUT, context, norm)
                 order = steps.keywords["order"]
                 self.assertEqual(order.keywords.get("fusions", ()), ())
-                self.assertFalse(may_fuse)
+                self.assertEqual(fused, ())
 
     def test_other_kinds_take_their_steps(self):
         tp = make_context(tp=2)
@@ -267,9 +267,9 @@ class TestMlpInputOrder(CustomTestCase):
             ),
         ):
             with self.subTest(expected=expected.__name__):
-                _, (steps, may_fuse) = communicator(layout, context, Fusable())
+                _, (steps, fused) = communicator(layout, context, Fusable())
                 self.assertIs(steps, expected)
-                self.assertFalse(may_fuse)
+                self.assertEqual(fused, ())
         _, (steps, _) = communicator(
             (TP_ATTN_FULL, TP_ATTN_FULL, SCATTERED, SCATTERED), tp, Fusable()
         )
@@ -297,11 +297,11 @@ class TestMlpInputOrder(CustomTestCase):
                 c.layer_scatter_modes = modes(*layout)
                 c._context = make_context(tp=2)
                 c.post_attention_layernorm = Fusable()
-                steps, may_fuse = c._select_mlp_input()
+                steps, fused = c._select_mlp_input()
                 self.assert_order(
                     steps, func, residual_input_mode=TP_ATTN_FULL, mhc=mhc
                 )
-                self.assertFalse(may_fuse)
+                self.assertEqual(fused, ())
 
 
 if __name__ == "__main__":

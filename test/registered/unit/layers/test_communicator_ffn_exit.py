@@ -45,6 +45,20 @@ def make_group(scale=3):
     return types.SimpleNamespace(all_reduce=MagicMock(side_effect=lambda h: h * scale))
 
 
+def ordinary_steps(ffn_output, *, returns_over_dp=False):
+    """A layer's ordinary steps, carrying the FFN output declaration the exit
+    reads and whether the output goes back over attention DP."""
+    return comm.BoundarySteps(
+        attention_input=comm.CommunicateSimpleFn._trivial,
+        ffn_input=comm._mlp_input_norm,
+        ffn_output=ffn_output,
+        ffn_output_move=(
+            None if returns_over_dp else comm.CommunicateSummableTensorPairFn._trivial
+        ),
+        ffn_sum_is_movable=True,
+    )
+
+
 def make_communicator(
     *,
     fuse,
@@ -58,8 +72,13 @@ def make_communicator(
     """A communicator whose decisions and postprocess are stubbed, built
     without the process-wide parallel state."""
     communicator = cls.__new__(cls)
-    communicator._ffn_output = StageOutput(
-        Layout(frozenset()), group=SumGroup.TP, leaves_for_next_layer=allow_deferred
+    communicator._steps = ordinary_steps(
+        StageOutput(
+            Layout(frozenset()),
+            group=SumGroup.TP,
+            leaves_for_next_layer=allow_deferred,
+        ),
+        returns_over_dp=scatters_to_local_tokens,
     )
     if cls is LayerCommunicator:
         communicator._ffn_sum_moves_to_next_layer = MagicMock(return_value=fuse)
@@ -72,7 +91,6 @@ def make_communicator(
     communicator.is_last_layer = False
     communicator._sp_steps = None
     communicator._input_scattered_steps = None
-    communicator._postprocess_scatters_to_local_tokens = scatters_to_local_tokens
     communicator._postprocess_dp_step = MagicMock(return_value=reduce_scatter_step)
     communicator.ffn_reduction_group = MagicMock(return_value=group or make_group())
     communicator.postprocess_layer = MagicMock(
@@ -306,13 +324,15 @@ class TestSelectFfnCompletion(CustomTestCase):
         communicator.is_last_layer = is_last_layer
         communicator._sp_steps = sp_region_steps() if sp_region else None
         communicator._input_scattered_steps = None
-        communicator._postprocess_scatters_to_local_tokens = scatters
-        communicator._ffn_output = StageOutput(
-            Layout(frozenset()),
-            group=SumGroup.MOE_OUTPUT,
-            leaves_for_next_layer=True,
-            leaves_for_reduce_scatter=True,
-            leaves_for_reduce_scatterv=True,
+        communicator._steps = ordinary_steps(
+            StageOutput(
+                Layout(frozenset()),
+                group=SumGroup.MOE_OUTPUT,
+                leaves_for_next_layer=True,
+                leaves_for_reduce_scatter=True,
+                leaves_for_reduce_scatterv=True,
+            ),
+            returns_over_dp=scatters,
         )
         communicator._ffn_sum_moves_to_next_layer = lambda forward_batch, **_: fuse
         communicator._ffn_leaves_sum_to_reduce_scatter = lambda forward_batch, dp_step: (

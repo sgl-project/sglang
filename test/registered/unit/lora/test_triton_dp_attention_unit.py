@@ -227,10 +227,10 @@ def test_communicator_publishes_layout_at_each_transition(
     communicator.post_attention_layernorm = None
     communicator.input_layernorm = lambda x: x
     communicator.qkv_latent_func = None
-    communicator._communicate_simple_fn = lambda **kwargs: kwargs["hidden_states"]
-    communicator._mlp_input = lambda hidden_states, residual, *args: (
-        hidden_states,
-        residual,
+    communicator._steps = SimpleNamespace(
+        attention_input=lambda hidden_states, **kwargs: hidden_states,
+        layer_input=None,
+        ffn_input=lambda hidden_states, residual, *args: (hidden_states, residual),
     )
     communicator._attn_input_fusions = ()
     monkeypatch.setattr(

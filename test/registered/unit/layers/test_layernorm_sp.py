@@ -15,6 +15,9 @@ from sglang.srt.arg_groups.layernorm_sp_hook import validate_layernorm_sp
 from sglang.srt.layers import communicator as comm
 from sglang.srt.layers import layernorm_sp
 from sglang.srt.layers.boundary_layout import (
+    Layout,
+    StageOutput,
+    SumGroup,
     TokenAxis,
     sequence_parallel_layer_sides,
 )
@@ -167,17 +170,27 @@ class TestSpRegionSteps(CustomTestCase):
         c = comm.LayerCommunicator.__new__(comm.LayerCommunicator)
         c._sp_steps = sp_region_steps()
         c._input_scattered_steps = None
-        c.layer_scatter_modes = SimpleNamespace(is_first_layer=first_layer)
+        c.layer_scatter_modes = SimpleNamespace(
+            is_first_layer=first_layer, is_layer_sparse=False
+        )
+        c.allow_reduce_scatter = False
         c._attn_input_fusions = ()
         c.input_layernorm = _Norm()
         c.post_attention_layernorm = _Norm()
         c.qkv_latent_func = None
         c._context = SimpleNamespace(cache=None)
-        c._communicate_simple_fn = MagicMock(side_effect=AssertionError("moved"))
-        c._communicate_summable_tensor_pair_fn = MagicMock(
-            side_effect=AssertionError("postprocess ran")
-        )
+        c._steps = self.ordinary_steps(MagicMock(side_effect=AssertionError("moved")))
         return c
+
+    def ordinary_steps(self, attention_input):
+        """The layer's steps outside the region, which must not run inside it."""
+        return comm.BoundarySteps(
+            attention_input=attention_input,
+            ffn_input=MagicMock(side_effect=AssertionError("ordinary FFN input ran")),
+            ffn_output=StageOutput(Layout(frozenset()), group=SumGroup.TP),
+            ffn_output_move=MagicMock(side_effect=AssertionError("postprocess ran")),
+            ffn_sum_is_movable=True,
+        )
 
     def run_prepare_attn(self, communicator, mode, hidden, residual):
         batch = SimpleNamespace(forward_mode=mode)
@@ -208,20 +221,19 @@ class TestSpRegionSteps(CustomTestCase):
 
     def test_decode_leaves_the_region_closed(self):
         communicator = self.communicator(first_layer=True)
-        communicator._communicate_simple_fn = MagicMock(
-            side_effect=lambda **k: k["hidden_states"]
-        )
+        move = MagicMock(side_effect=lambda **k: k["hidden_states"])
+        communicator._steps = self.ordinary_steps(move)
         (h, _), active, scatter = self.run_prepare_attn(
             communicator, ForwardMode.DECODE, torch.ones(2, 4), None
         )
         self.assertFalse(active)
         scatter.assert_not_called()
-        communicator._communicate_simple_fn.assert_called_once()
+        move.assert_called_once()
 
     def test_a_later_layer_does_not_reopen_the_region(self):
         communicator = self.communicator(first_layer=False)
-        communicator._communicate_simple_fn = MagicMock(
-            side_effect=lambda **k: k["hidden_states"]
+        communicator._steps = self.ordinary_steps(
+            MagicMock(side_effect=lambda **k: k["hidden_states"])
         )
         _, active, scatter = self.run_prepare_attn(
             communicator, ForwardMode.EXTEND, torch.ones(2, 4), torch.ones(2, 4)
