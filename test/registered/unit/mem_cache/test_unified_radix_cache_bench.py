@@ -592,6 +592,14 @@ def bench_lock_unlock(
     )
 
 
+def _finish_req(cache, req, up_to):
+    """What release_kv_cache does after the row is known to be the request's:
+    insert, free the rest of the owned span, drop the lock."""
+    cache.insert_req(req, up_to=up_to)
+    cache.free_kv_row(req.kv, [(req.kv.cache_protected_len, up_to)])
+    cache.unpin(req)
+
+
 def bench_cache_finished(
     num_seqs=5000,
     chunk_len=256,
@@ -650,9 +658,7 @@ def bench_cache_finished(
     return bench_api(
         "cache_finished",
         lambda: req_items,
-        lambda req: env.tree.cache_finished_req(
-            req, owned_kv_len=req.kv.kv_committed_len
-        ),
+        lambda req: _finish_req(env.tree, req, req.kv.kv_committed_len),
         len(req_items) - warmup,
         env.avg_tokens,
         warmup,

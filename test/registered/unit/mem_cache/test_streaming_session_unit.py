@@ -57,7 +57,7 @@ class _FakeInnerCache:
         self.dec_lock_ref_params = []
         self.dec_lock_ref_skip_swa = []
 
-    def cache_finished_req(self, *args, **kwargs):
+    def insert_req(self, *args, **kwargs):
         raise AssertionError("Streaming requests should not delegate to inner cache")
 
     def match_prefix(self, *args, **kwargs):

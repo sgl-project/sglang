@@ -59,7 +59,10 @@ class TestPureSWAChunkCache(CustomTestCase):
         cache = self._make_cache()
 
         # protected 2, floor 3, cursor 6: [2, 3) and [6, 8) go back, [3, 6) is dead
-        cache.cache_finished_req(_make_req(), owned_kv_len=8)
+        req = _make_req()
+        cache.insert_req(req, up_to=8)
+        cache.free_kv_row(req.kv, [(req.kv.cache_protected_len, 8)])
+        cache.unpin(req)
 
         self.assertEqual(cache.token_to_kv_pool_allocator.freed, [2, 6, 7])
         self.assertEqual(cache.token_to_kv_pool_allocator.skipped, [3, 4, 5])

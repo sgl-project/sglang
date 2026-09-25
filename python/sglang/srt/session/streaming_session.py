@@ -173,7 +173,7 @@ class StreamingSession(BasePrefixCache):
         """Returns an active slot for this req, or None.
 
         Side effect: if req is pre-aborted (to_finish set, e.g. input too
-        long), detach it from the session so cache_finished_req treats it
+        long), detach it from the session so release_kv_cache treats it
         as a normal req. The slot stays intact for the next request.
         """
         if not _is_streaming(req):
@@ -358,8 +358,8 @@ class StreamingSession(BasePrefixCache):
     def on_release(self, req: Req, *, inserted: bool) -> None:
         self.inner.on_release(req, inserted=inserted)
 
-    def cache_finished_req(self, req: Req, **kwargs):
-        self.inner.cache_finished_req(req, **kwargs)
+    def insert_req(self, req: Req, **kwargs):
+        self.inner.insert_req(req, **kwargs)
 
     def cache_unfinished_req(self, req: Req, **kwargs):
         if self.try_cache_unfinished_req(req, **kwargs):

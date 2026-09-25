@@ -433,7 +433,7 @@ class RadixCache(BasePrefixCache):
         )
         return InsertResult(prefix_len=prefix_len, last_device_node=last_node)
 
-    def _adopt(
+    def _insert_cache(
         self,
         req: Req,
         token_ids,
@@ -492,22 +492,21 @@ class RadixCache(BasePrefixCache):
         )
         return radix_key, kv_indices, result.prefix_len
 
-    def cache_finished_req(self, req: Req, *, owned_kv_len: int):
-        """Cache request when it finishes."""
-        if not self.disable:
-            token_ids = (req.origin_input_ids + req.output_ids)[:owned_kv_len]
-            radix_key, _, _ = self._adopt(req, token_ids, split_prompt=True)
-            req.kv.cache_protected_len = len(radix_key)
-        # The protected prefix is not this req's to free.
-        self.free_kv_row(req.kv, [(req.kv.cache_protected_len, owned_kv_len)])
-        self.unpin(req)
+    def insert_req(self, req: Req, *, up_to: int):
+        if self.disable:
+            return
+        token_ids = (req.origin_input_ids + req.output_ids)[:up_to]
+        radix_key, _, _ = self._insert_cache(req, token_ids, split_prompt=True)
+        req.kv.cache_protected_len = len(radix_key)
 
     def cache_unfinished_req(self, req: Req, chunked=False):
         """Cache request when it is unfinished."""
         if self.disable:
             return
 
-        radix_key, kv_indices, _ = self._adopt(req, req.get_fill_ids(), chunked=chunked)
+        radix_key, kv_indices, _ = self._insert_cache(
+            req, req.get_fill_ids(), chunked=chunked
+        )
 
         # The prefix indices could be updated, reuse it
         match_result = self.match_prefix(MatchPrefixParams(key=radix_key))
@@ -526,7 +525,7 @@ class RadixCache(BasePrefixCache):
 
         # The cache_protected_len is not always equal to len(req.prefix_indices)
         # since for page_size > 1, the partial part is added to req.prefix_indices, but that part of kv indices is not added to the tree.
-        # It should be freed in the next cache_unfinished_req and final cache_finished_req to avoid memory leak.
+        # It should be freed in the next cache_unfinished_req or by release_kv_cache to avoid memory leak.
         # So we introduce this `cache_protected_len` field to make sure the partial part can be freed correctly.
         req.kv.cache_protected_len = len(new_indices)
 

@@ -452,6 +452,14 @@ def _aux_storage_key_transfers(cache, node_id):
     return transfers or None
 
 
+def _finish_req(cache, req, up_to):
+    """What release_kv_cache does after the row is known to be the request's:
+    insert, free the rest of the owned span, drop the lock."""
+    cache.insert_req(req, up_to=up_to)
+    cache.free_kv_row(req.kv, [(req.kv.cache_protected_len, up_to)])
+    cache.unpin(req)
+
+
 def build_fixture(
     cfg: CacheConfig,
     *,
@@ -1755,7 +1763,7 @@ class UnifiedRadixCacheSuite:
         if self.cfg.has_mamba:
             req.kv.mamba_last_track_seqlen = kv_len
 
-        cache.cache_finished_req(req, owned_kv_len=req.owned_kv_len())
+        _finish_req(cache, req, req.owned_kv_len())
 
         all_ids = input_ids + output_ids
         aligned_len = (len(all_ids) // ps) * ps
@@ -1813,10 +1821,10 @@ class UnifiedRadixCacheSuite:
             req.kv.mamba_last_track_seqlen = kv_len
         req.reasoning_tokens = 1
 
-        # cache_finished_req reads get_serving().strip_thinking_cache
+        # owned_kv_len reads get_serving().strip_thinking_cache
         with get_serving().override(strip_thinking_cache=True):
             avail_before = allocator.available_size()
-            cache.cache_finished_req(req, owned_kv_len=req.owned_kv_len())
+            _finish_req(cache, req, req.owned_kv_len())
             start_p, end_p = req.owned_kv_len(), req.kv.kv_allocated_len
         if ps > 1:
             start_p = ((start_p + ps - 1) // ps) * ps
@@ -2034,7 +2042,7 @@ class UnifiedRadixCacheSuite:
             req.kv.mamba_last_track_seqlen = kv_len
 
         avail_before = allocator.available_size()
-        cache.cache_finished_req(req, owned_kv_len=req.owned_kv_len())
+        _finish_req(cache, req, req.owned_kv_len())
 
         self.assertEqual(allocator.available_size(), avail_before + tail_extra)
         aligned = input_ids[: (len(input_ids) // ps) * ps]
@@ -8782,7 +8790,7 @@ class TestUnifiedRadixCacheInt8MambaCheckpoint(CustomTestCase):
         )
         req.last_node = cache.root_node_handle()
 
-        cache.cache_finished_req(req, owned_kv_len=req.owned_kv_len())
+        _finish_req(cache, req, req.owned_kv_len())
 
     def test_finished_req_stores_radix_mamba_state_in_int8_pool(self):
         cache, allocator, req_to_token_pool = build_fixture(self.cfg)

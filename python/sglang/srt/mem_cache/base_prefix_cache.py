@@ -418,12 +418,11 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         return None
 
     @abstractmethod
-    def cache_finished_req(self, req: Req, *, owned_kv_len: int, **kwargs):
-        """Hand a finished request's KV to the tree: insert what can be keyed
-        (advancing ``cache_protected_len``), ``free_kv_row`` the rest of
-        ``[cache_protected_len, owned_kv_len)``, ``unpin``. Slicing the row by
-        token count instead strands the slots up to ``owned_kv_len``; the
-        caller frees everything past it."""
+    def insert_req(self, req: Req, *, up_to: int, **kwargs):
+        """Hand a finished request's KV up to row position ``up_to`` to the
+        tree: insert what can be keyed and advance ``cache_protected_len``
+        past it. The caller then frees ``[cache_protected_len, up_to)`` and
+        everything after, and unpins; nothing here releases a slot."""
 
     @abstractmethod
     def cache_unfinished_req(self, req: Req, **kwargs):

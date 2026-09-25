@@ -760,8 +760,16 @@ class TestShardedCoreGate(CustomTestCase):
             UnifiedRadixCache(params)  # no raise: sharding is off
 
 
+def _finish_req(cache, req, up_to):
+    """What release_kv_cache does after the row is known to be the request's:
+    insert, free the rest of the owned span, drop the lock."""
+    cache.insert_req(req, up_to=up_to)
+    cache.free_kv_row(req.kv, [(req.kv.cache_protected_len, up_to)])
+    cache.unpin(req)
+
+
 class _GraftReq:
-    """Minimal Req stand-in for cache_unfinished/finished_req."""
+    """Minimal Req stand-in for cache_unfinished_req / insert_req."""
 
     def __init__(self, fill_ids, req_pool_idx=0):
         self.fill_ids = list(fill_ids)
@@ -910,7 +918,7 @@ class TestRotationGraftDecline(CustomTestCase):
         req = _GraftReq(list(range(8)) + [90, 91, 92, 93])
         req.kv_rotation_base = 3
         own_locs = self._own_row(tree, req, 12)
-        tree.cache_finished_req(req, owned_kv_len=12)
+        _finish_req(tree, req, 12)
         released = torch.cat(freed)
         # Everything past the protected prefix is released: the duplicates of
         # the matched region AND the declined tail (nothing leaks, nothing is
@@ -926,7 +934,7 @@ class TestRotationGraftDecline(CustomTestCase):
         req = _GraftReq(list(range(8)) + [90, 91, 92, 93])
         req.kv_rotation_base = 1
         own_locs = self._own_row(tree, req, 12)
-        tree.cache_finished_req(req, owned_kv_len=12)
+        _finish_req(tree, req, 12)
         self.assertEqual(_match_len(tree, req.fill_ids), 12)
         released = torch.cat(freed) if freed else torch.empty(0, dtype=torch.int64)
         # Only the 8 duplicate rows go back; the tail stays live in the tree.
