@@ -72,6 +72,7 @@ from sglang.srt.layers.communicator import (
     LayerScatterModes,
     enable_moe_dense_fully_dp,
     get_attn_tp_context,
+    layer_input_buffer,
 )
 from sglang.srt.layers.communicator_dsa_cp import (
     DSACPLayerCommunicator,
@@ -115,6 +116,7 @@ from sglang.srt.layers.moe.utils import (
     is_sbo_enabled,
     is_shared_experts_fusion_disabled,
     is_tbo_enabled,
+    should_add_replicated_moe_output,
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.fp8 import Fp8Config
@@ -1222,7 +1224,7 @@ class DeepseekV2MoE(nn.Module):
             final_hidden_states = post_experts_all_reduce(final_hidden_states)
         # TP1 shared experts are replicated, so add them after all-reduce to
         # avoid summing the same shared output once per TP rank.
-        if self._shared_expert_tp1:
+        if self._shared_expert_tp1 and should_add_replicated_moe_output():
             final_hidden_states += shared_output
         return final_hidden_states
 
@@ -1378,7 +1380,11 @@ class DeepseekV2MoE(nn.Module):
         final_hidden_states = post_experts_all_reduce(final_hidden_states)
         # TP1 shared experts are replicated, so add them after all-reduce to
         # avoid summing the same shared output once per TP rank.
-        if shared_output is not None and self._shared_expert_tp1:
+        if (
+            shared_output is not None
+            and self._shared_expert_tp1
+            and should_add_replicated_moe_output()
+        ):
             final_hidden_states += shared_output
         return final_hidden_states
 
@@ -2625,9 +2631,6 @@ class DeepseekV2DecoderLayer(nn.Module):
             input_layernorm=self.input_layernorm,
             post_attention_layernorm=self.post_attention_layernorm,
             allow_reduce_scatter=True,
-            is_last_layer=(
-                is_nextn or (self.layer_id == self.config.num_hidden_layers - 1)
-            ),
             qkv_latent_func=self.self_attn.prepare_qkv_latent,
         )
 
@@ -2683,7 +2686,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         captured_last_layer_outputs: Optional[AuxHiddenStateAccumulator] = None,
         next_full_attention_layer_id: Optional[int] = None,
     ) -> torch.Tensor:
-        hidden_states_orig = hidden_states
+        hidden_states_orig = layer_input_buffer(hidden_states)
         hidden_states, residual = (
             self.layer_communicator.prepare_attn_and_capture_last_layer_outputs(
                 hidden_states,

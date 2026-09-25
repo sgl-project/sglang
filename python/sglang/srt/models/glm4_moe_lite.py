@@ -35,9 +35,9 @@ from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.communicator import (
     LayerCommunicator,
     LayerScatterModes,
-    complete_deferred_allreduce,
     enable_moe_dense_fully_dp,
     get_attn_tp_context,
+    reduce_output,
 )
 from sglang.srt.layers.dp_attention import (
     is_allocation_symmetric,
@@ -592,9 +592,6 @@ class Glm4MoeLiteDecoderLayer(nn.Module):
             input_layernorm=self.input_layernorm,
             post_attention_layernorm=self.post_attention_layernorm,
             allow_reduce_scatter=True,
-            is_last_layer=(
-                is_nextn or (self.layer_id == self.config.num_hidden_layers - 1)
-            ),
             qkv_latent_func=self.self_attn.prepare_qkv_latent,
         )
 
@@ -804,7 +801,7 @@ class Glm4MoeLiteModel(nn.Module):
         for i in range(normal_start_layer, normal_end_layer):
             with get_global_expert_distribution_recorder().with_current_layer(i):
                 if i in self.layers_to_capture:
-                    hidden_states = complete_deferred_allreduce(hidden_states)
+                    hidden_states = reduce_output(hidden_states)
                     aux_hidden_states.append(hidden_states + residual)
                 layer = self.layers[i]
                 hidden_states, residual = layer(

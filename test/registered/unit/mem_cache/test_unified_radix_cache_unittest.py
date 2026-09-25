@@ -43,7 +43,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     zero_match_result,
 )
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
-from sglang.srt.mem_cache.common import available_and_evictable_str
+from sglang.srt.mem_cache.common import available_and_evictable_str, release_kv_cache
 from sglang.srt.mem_cache.hicache_storage import (
     PoolHitPolicy,
     PoolName,
@@ -1755,7 +1755,7 @@ class UnifiedRadixCacheSuite:
         if self.cfg.has_mamba:
             req.kv.mamba_last_track_seqlen = kv_len
 
-        cache.cache_finished_req(req, is_insert=True, owned_kv_len=req.owned_kv_len())
+        cache.cache_finished_req(req, owned_kv_len=req.owned_kv_len())
 
         all_ids = input_ids + output_ids
         aligned_len = (len(all_ids) // ps) * ps
@@ -1816,9 +1816,7 @@ class UnifiedRadixCacheSuite:
         # cache_finished_req reads get_serving().strip_thinking_cache
         with get_serving().override(strip_thinking_cache=True):
             avail_before = allocator.available_size()
-            cache.cache_finished_req(
-                req, is_insert=True, owned_kv_len=req.owned_kv_len()
-            )
+            cache.cache_finished_req(req, owned_kv_len=req.owned_kv_len())
             start_p, end_p = req.owned_kv_len(), req.kv.kv_allocated_len
         if ps > 1:
             start_p = ((start_p + ps - 1) // ps) * ps
@@ -1849,6 +1847,7 @@ class UnifiedRadixCacheSuite:
         kv_indices = self._alloc(allocator, kv_len)
         req_to_token_pool.write((req.kv.req_pool_idx, slice(0, kv_len)), kv_indices)
         req.kv.kv_committed_len = kv_len
+        req.kv.kv_allocated_len = kv_len
         req.last_node = cache.root_node_handle()
         req.kv.cache_protected_len = 0
         req.lock_receipt = DecLockRefParams()
@@ -1860,7 +1859,7 @@ class UnifiedRadixCacheSuite:
         )
 
         avail_before = allocator.available_size()
-        cache.cache_finished_req(req, is_insert=False, owned_kv_len=req.owned_kv_len())
+        release_kv_cache(req, cache, is_insert=False)
 
         self.assertEqual(allocator.available_size(), avail_before + kv_len)
         m = cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", tokens))))
@@ -2035,7 +2034,7 @@ class UnifiedRadixCacheSuite:
             req.kv.mamba_last_track_seqlen = kv_len
 
         avail_before = allocator.available_size()
-        cache.cache_finished_req(req, is_insert=True, owned_kv_len=req.owned_kv_len())
+        cache.cache_finished_req(req, owned_kv_len=req.owned_kv_len())
 
         self.assertEqual(allocator.available_size(), avail_before + tail_extra)
         aligned = input_ids[: (len(input_ids) // ps) * ps]
@@ -6249,6 +6248,51 @@ class UnifiedRadixCacheSuite:
         self._release_ongoing_load_back_locks(cache)
         cache.sanity_check()
 
+    def test_hicache_internal_mamba_backup_waits_for_pending_swa(self):
+        if not (self.cfg.has_swa and self.cfg.has_mamba):
+            self.skipTest("requires Full, SWA and Mamba components")
+        if _selected_tree_core_test_backend() == "rust":
+            self.skipTest("internal-node state demote is Python-core only")
+        page = self.cfg.page_size
+        cache, allocator, req_pool = build_fixture(
+            replace(self.cfg, sliding_window_size=3 * page)
+        )
+
+        def insert(length):
+            return self._insert(
+                cache, allocator, req_pool, list(range(length))
+            ).last_device_node
+
+        nodes = [insert(size) for size in range(page, 5 * page, page)]
+        grandparent, _, anchor, leaf = nodes
+        self._init_hicache(cache, write_policy="write_back")
+        cache.evict(EvictParams(mamba_num=3))
+        cache.evict_host(page, ComponentType.FULL)
+        cache.evict(EvictParams(swa_num_tokens=3 * page))
+        cache.evict_host(3 * page, ComponentType.SWA)
+
+        # The backed parent stops the Full backup chain, while the SWA window
+        # reaches the unbacked grandparent and marks it under the anchor's ack.
+        insert(3 * page)
+        self.assertEqual(
+            cache.ongoing_write_through[anchor].publish_node_ids, nodes[:3]
+        )
+        insert(page)
+        self.assertFalse(cache.tree_core.is_backuped(grandparent))
+        self.assertIn(
+            ComponentType.MAMBA, cache.tree_core.build_backup_spec(grandparent)[1]
+        )
+        leaf_lock = cache.inc_lock_ref(leaf).to_dec_params()
+        try:
+            result = cache.evict(EvictParams(mamba_num=1))
+            self.assertEqual(result.mamba_num_evicted, 1)
+            self.assertIsNone(_device_value(cache, grandparent, ComponentType.MAMBA))
+            self.assertIsNotNone(_host_value(cache, grandparent, ComponentType.MAMBA))
+            self.assertFalse(cache.ongoing_write_through)
+        finally:
+            cache.dec_lock_ref(leaf, leaf_lock)
+        cache.sanity_check()
+
     def test_hicache_write_through_internal_mamba_evict_keeps_drop(self):
         """Non-write_back policies keep the legacy tombstone-and-drop."""
         if not self.cfg.has_mamba:
@@ -8738,7 +8782,7 @@ class TestUnifiedRadixCacheInt8MambaCheckpoint(CustomTestCase):
         )
         req.last_node = cache.root_node_handle()
 
-        cache.cache_finished_req(req, is_insert=True, owned_kv_len=req.owned_kv_len())
+        cache.cache_finished_req(req, owned_kv_len=req.owned_kv_len())
 
     def test_finished_req_stores_radix_mamba_state_in_int8_pool(self):
         cache, allocator, req_to_token_pool = build_fixture(self.cfg)

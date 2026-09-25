@@ -505,7 +505,6 @@ class InternS2MobiusLinearDecoderLayer(_InternS2MobiusDecoderMixin, nn.Module):
             input_layernorm=self.input_layernorm,
             post_attention_layernorm=self.post_attention_layernorm,
             allow_reduce_scatter=True,
-            is_last_layer=(layer_id == config.num_hidden_layers - 1),
             enable_fused_ar_quant=enable_fused_ar_quant,
             fused_ar_quant_keep_bf16=enable_fused_ar_quant,
         )
@@ -639,7 +638,6 @@ class InternS2MobiusAttentionDecoderLayer(
             input_layernorm=self.input_layernorm,
             post_attention_layernorm=self.post_attention_layernorm,
             allow_reduce_scatter=True,
-            is_last_layer=(layer_id == config.num_hidden_layers - 1),
             enable_fused_ar_quant=enable_fused_ar_quant,
             fused_ar_quant_keep_bf16=False,
         )

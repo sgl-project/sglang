@@ -1212,6 +1212,25 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         headroom = self.swa_prefix_tails * (self.sliding_window_size + self.page_size)
         return ceil_align(cap + headroom, self.page_size)
 
+    def _get_paged_kv_bytes_per_token(self, compress_ratio: int = 0) -> float:
+        # Unified rings, the NPU pool and the trtllm uniform-FP8 pool do not go
+        # through DeepSeekV4SingleKVPool.create_buffer, so they carry no page pad.
+        if self._unified or _is_npu or get_exec().kernel.dsv4_attn_backend == "trtllm":
+            return self.kv_bytes
+        from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
+            resolve_compressed_kv_layout,
+            select_dsv4_kv_layout,
+        )
+
+        layout, compressed_option = select_dsv4_kv_layout()
+        page_size = self.page_size
+        if compress_ratio:
+            layout = resolve_compressed_kv_layout(
+                layout, compress_ratio, compressed_option
+            )
+            page_size = self.page_size // compress_ratio
+        return layout.page_bytes(page_size) / page_size
+
     def _get_bytes_per_swa_token(self) -> float:
         """Bytes one SWA slot costs across the stage. c4_state_pool_size = swa_tokens
         // page_size * ring, so c4 compress state is priced per SWA slot too."""
@@ -1224,9 +1243,11 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         c4_indexer_state_bytes = 2 * 2 * self.indexer_head_dim * c4_state_dtype_size
 
         c4_state_ratio = self.ring_sizes.get(4, 0) / self.page_size
-        return self.kv_bytes * self.num_layers_total + c4_state_ratio * (
-            c4_state_bytes + c4_indexer_state_bytes
-        ) * self.num_layers(4)
+        return self._get_paged_kv_bytes_per_token() * self.num_layers_total + (
+            c4_state_ratio
+            * (c4_state_bytes + c4_indexer_state_bytes)
+            * self.num_layers(4)
+        )
 
     def _compressed_bytes_per_full_token(self, ratio: int) -> float:
         """Compressed KV (+ indexer) bytes one full token adds per layer of `ratio`;
@@ -1235,9 +1256,12 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
             return (self.kv_bytes + self.low_ratio_index_bytes) / ratio
         if ratio == 4:
             c4_frac = 1 / (4 * self.c4_shrink_factor)
-            return c4_frac * self.kv_bytes + 1 / 4 * self.indexer_bytes_per_token
+            return (
+                c4_frac * self._get_paged_kv_bytes_per_token(4)
+                + 1 / 4 * self.indexer_bytes_per_token
+            )
         assert ratio == 128, f"unsupported compression ratio: {ratio}"
-        return 1 / 128 * self.kv_bytes
+        return 1 / 128 * self._get_paged_kv_bytes_per_token(128)
 
     def _get_bytes_per_full_token(self) -> float:
         # Cap mode and ring mode both move the SWA pool and the c4 state that

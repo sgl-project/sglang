@@ -90,13 +90,15 @@ class InputValidationStage(PipelineStage):
         if num_outputs == 1:
             return iter((batch,))
 
-        return iter(
-            expand_request_outputs(
-                batch,
-                reuse_parent_trace_ctx=True,
-                preserve_parent_metrics=True,
-            )
+        outputs = expand_request_outputs(
+            batch,
+            reuse_parent_trace_ctx=True,
+            preserve_parent_metrics=True,
         )
+        # expansion resets generators after this stage has already validated them
+        for output in outputs:
+            self._generate_seeds(output, server_args)
+        return iter(outputs)
 
     @staticmethod
     def _calculate_dimensions_from_area(
