@@ -145,8 +145,9 @@ class TestBufferModeSidecar(unittest.TestCase):
             )
         }
 
-        def _write(device_value, *, node_id, extra_pools):
+        def _write(device_value, node_id, extra_pools, flush):
             self.assertEqual(node_id, 7)
+            self.assertFalse(flush)
             self.assertEqual(
                 [transfer.name for transfer in extra_pools],
                 [PoolName.SWA, *[transfer.name for transfer in sidecars]],
@@ -192,7 +193,7 @@ class TestBufferModeSidecar(unittest.TestCase):
         intent = _UnifiedBackupIntent(snapshot=snapshot)
 
         self.assertTrue(
-            pipeline._launch_backup_intent(
+            pipeline._stage_backup_intent(
                 intent,
                 device_indices,
                 comp_xfers={ComponentType.SWA: [swa]},

@@ -7,6 +7,22 @@ description: Use when choosing the fastest SGLang Diffusion flags for a model, G
 
 Use this skill when the user wants the fastest command line, lower VRAM, or the right performance flags for a specific model and GPU setup.
 
+## Start from the model's cookbook page
+
+Tune from the deployment we already recommend, not from scratch: read
+`docs/cookbook/diffusion/<Family>/` for the model first, take its command as
+the baseline, then apply the options below. The cookbook page is what users
+follow, so a recipe that silently disagrees with it on GPU count, parallelism
+degrees, or offload flags is a recipe for a configuration nobody runs.
+
+Families with a cookbook page: Cosmos, Ernie-Image, FLUX, Ideogram, JoyEcho,
+Krea, LTX, LingBot-Video, LingBot-World, LongLive, MOVA, MiniMax, Qwen-Image,
+SANA-Video, SANA-WM, Wan, Z-Image.
+
+`test/` configs are pinned CI setups for correctness and regression checks, not
+deployment advice. Use them when you need an exactly reproducible run, and note
+which cookbook flags you diverged from.
+
 Before running any `sglang generate` command below inside the diffusion container:
 - use `python/sglang/multimodal_gen/.claude/skills/sglang-diffusion-benchmark-profile/scripts/diffusion_skill_env.py` to derive the repo root, verify write access, and choose idle GPU(s)
 - export `HF_TOKEN` first when the selected model lives in a gated Hugging Face repo such as `black-forest-labs/FLUX.*`
@@ -508,7 +524,7 @@ Use these as first commands to benchmark, not as universal winners.
 | FireRed-Image-Edit 1.0 / 1.1 | 1024x1024 image edit, 40 steps, guidance 4.0 | `--backend=sglang --num-gpus 2 --enable-cfg-parallel --ulysses-degree 1 --enable-torch-compile --warmup-mode request --dit-layerwise-offload false --dit-cpu-offload false` | Uses the native `QwenImageEditPlusPipeline` path. 2-GPU CFG parallel is the validated H100 starting point; benchmark 1.0 and 1.1 separately because checkpoint differences can change denoise latency. |
 | Hunyuan3D-2 shape | Shape generation, 50 steps, guidance 5.0 | `--backend=sglang --enable-torch-compile --warmup-mode request --dit-layerwise-offload false --dit-cpu-offload false` | Focus on `Hunyuan3DShapeDenoisingStage`; keep mesh export/paint timings separate from denoise. |
 | LingBot Video MoE 30B | 384x640, 17 frames, 12 steps for the current GPU case | `--model-path robbyant/lingbot-video-moe-30b-a3b --text-encoder-cpu-offload` | Native T2V path. Prompts are structured JSON captions, not raw free text; keep that contract when comparing latency or quality. Current main can mount the fused Triton RMSNorm path at `quality=extra-high` or `quality=high`; keep `lossless` as the reference. `--text-encoder-cpu-offload` targets memory-bound multi-GPU or small-VRAM cards; on a single large-VRAM GPU (e.g. 275 GB B300) the whole model stays resident (~73 GB peak), so dropping the flag removes H2D/D2H traffic and was 8% faster end to end (3.80s -> 3.49s, bit-identical). |
-| MOVA / Helios / LingBot World | Use the benchmark/profile presets or server test cases first | `--enable-torch-compile --warmup-mode request`; pin offload and topology flags explicitly | These video/realtime families have model-specific stages and condition handling. For LingBot World causal serving, keep `--kv-cache-quant off` as the exact cache baseline before testing INT4/INT2. |
+| MOVA / Helios / LingBot World | Start from the family's cookbook page — it pins the GPU count and parallelism these realtime paths need (e.g. LingBot World is served with `--num-gpus 4 --ulysses-degree 4`, LingBot World 2.0 with 8) | `--enable-torch-compile --warmup-mode request`; pin offload and topology flags explicitly | These video/realtime families have model-specific stages and condition handling. Realtime keeps up with playback only at the documented GPU count, so do not tune down from it by accident. For LingBot World causal serving, keep `--kv-cache-quant off` as the exact cache baseline before testing INT4/INT2. |
 
 ## Historical PR Watchlist
 

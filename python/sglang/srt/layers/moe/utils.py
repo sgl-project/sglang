@@ -284,6 +284,7 @@ class DispatcherOutputDtype(Enum):
     - FP8: dispatch hidden states in fp8
     - INT8: dispatch hidden states in int8
     - NVFP4: dispatch hidden states in nvfp4
+    - MXFP4: dispatch hidden states in mxfp4 (fp4_e2m1 + e8m0 block scale)
     - MXFP8: dispatch hidden states in mxfp8 (fp8_e4m3 + e8m0 block scale)
     """
 
@@ -291,6 +292,7 @@ class DispatcherOutputDtype(Enum):
     FP8 = "fp8"
     INT8 = "int8"
     NVFP4 = "nvfp4"
+    MXFP4 = "mxfp4"
     MXFP8 = "mxfp8"
 
 
@@ -730,52 +732,130 @@ def should_skip_mlp_all_reduce() -> bool:
     return f.fuse_mlp_allreduce or f.mlp_reduce_scatter
 
 
-def should_skip_post_experts_all_reduce(*, is_tp_path: bool) -> bool:
-    """Whether to skip the post-experts all-reduce (EP or TP) because a
-    downstream component will fuse, replace, or absorb it.
+def post_experts_output_is_complete(*, is_tp_path: bool) -> bool:
+    """Whether the experts' output owes no sum over the MoE-TP group
+    (``is_tp_path=True``) or the EP group: the combine already summed it, or each
+    rank computed its own tokens in full.
 
-    Skip reasons, in order:
-      - ``get_forward().fuse_mlp_allreduce``: LayerCommunicator will fuse the
-        all-reduce with the next layer's residual all-reduce.
-      - ``get_forward().mlp_reduce_scatter``: LayerCommunicator's post-attention
-        scatter will do reduce-scatter, which would double-reduce on top of
-        an all-reduce.
-      - ``should_use_dp_reduce_scatterv()``: the standard dispatcher's combine
-        path replaces the all-reduce with a reduce-scatterv.
-      - ``should_use_flashinfer_cutlass_moe_fp4_allgather()`` (TP path only):
-        the flashinfer cutlass FP4 kernel performs an all-gather that absorbs
-        the post-experts TP all-reduce. Not relevant to the EP all-reduce.
-      - ``get_moe_a2a_backend().is_flashinfer()``: the flashinfer A2A
-        dispatcher's ``MoeAlltoAll.combine`` already alltoall-reduces partial
-        MoE outputs back to the source rank, so any further EP/TP all-reduce
-        would double-count and overflow BF16. Mirrors TRTLLM's
-        ``not enable_alltoall`` gate
-        (``tensorrt_llm/_torch/modules/fused_moe/interface.py:879``).
-
-    The first two reasons come from per-layer ``ForwardFlags`` published by
-    the decoder via ``get_forward().scoped(...)``. Pass ``is_tp_path=True``
-    for the post-experts TP all-reduce, ``False`` for the EP all-reduce.
+    This is a property of the MoE configuration. Whether the MoE block or a later
+    step runs a sum that is still owed is decided separately.
     """
-    if should_skip_mlp_all_reduce():
-        return True
     if get_parallel().dwdp_size > 1:
         return True
-    if should_use_dp_reduce_scatterv():
-        return True
     if is_tp_path and should_use_flashinfer_cutlass_moe_fp4_allgather():
+        # The combine reduce-scatters back to the local tokens.
         return True
-    if get_moe_a2a_backend().is_flashinfer():
-        return True
-    if get_moe_a2a_backend().is_pplx():
-        # pplx's AllToAll.combine already sums each token's expert outputs back
-        # to the source rank
-        return True
-    if get_moe_a2a_backend().is_flashinfer_megamoe():
-        # The mega kernel does its EP all-to-all + combine internally and
-        # returns per-rank outputs, so any further EP/TP all-reduce would
-        # double-count. Same opt-in as the flashinfer a2a dispatcher.
-        return True
-    return False
+    a2a = get_moe_a2a_backend()
+    # The flashinfer and pplx combines, and the megamoe kernel's internal
+    # combine, sum each token's expert outputs back to its source rank.
+    return a2a.is_flashinfer() or a2a.is_pplx() or a2a.is_flashinfer_megamoe()
+
+
+def should_skip_post_experts_all_reduce(*, is_tp_path: bool) -> bool:
+    """Whether the MoE block should leave out its post-experts all-reduce: a later
+    step runs it (fused into the next norm, or as the reduce-scatter back to the
+    local tokens), or there is nothing to sum.
+
+    Pass ``is_tp_path=True`` for the TP all-reduce, ``False`` for the EP one.
+    """
+    return (
+        should_skip_mlp_all_reduce()
+        or should_use_dp_reduce_scatterv()
+        or post_experts_output_is_complete(is_tp_path=is_tp_path)
+    )
+
+
+def reduce_moe_output(hidden_states: torch.Tensor) -> torch.Tensor:
+    """All-reduce a MoE block's output (routed plus shared experts) over TP,
+    unless a later step does it or there is nothing to sum."""
+    from sglang.srt.distributed.communication_op import (
+        tensor_model_parallel_all_reduce,
+    )
+
+    if get_parallel().tp_size > 1 and not should_skip_post_experts_all_reduce(
+        is_tp_path=True
+    ):
+        return tensor_model_parallel_all_reduce(hidden_states)
+    return hidden_states
+
+
+def should_add_replicated_moe_output() -> bool:
+    """Whether this rank adds an output every TP rank holds in full, such as a
+    shared expert replicated with tp_size=1, to its MoE output.
+
+    Call it after the MoE block's own reduction. When a later step still sums
+    the output over TP, only TP rank 0 adds it, so the sum counts it once.
+    """
+    parallel = get_parallel()
+    summed_later = should_skip_post_experts_all_reduce(
+        is_tp_path=True
+    ) and not post_experts_output_is_complete(is_tp_path=True)
+    return not (parallel.tp_size > 1 and summed_later and parallel.tp_rank != 0)
+
+
+def can_merge_post_experts_all_reduce() -> bool:
+    """Whether the EP and MoE-TP reductions can collapse into one _TP all-reduce.
+
+    True when moe_dp_size == 1: the two groups are an orthogonal decomposition
+    of _TP, so reducing over each in turn equals one _TP reduction.
+    """
+    parallel = get_parallel()
+    return (
+        parallel.moe_ep_size > 1
+        and parallel.moe_tp_size > 1
+        and parallel.moe_dp_size == 1
+    )
+
+
+def post_experts_all_reduce(hidden_states: torch.Tensor) -> torch.Tensor:
+    """Reduce the post-experts MoE output across the EP and MoE-TP groups.
+
+    When both are live and mergeable, issues one _TP all-reduce instead of two
+    sequential ones, which also restores the invariant the fused residual+LN path
+    depends on.
+    """
+    from sglang.srt.distributed.communication_op import (
+        moe_expert_parallel_all_reduce,
+        moe_tensor_model_parallel_all_reduce,
+        tensor_model_parallel_all_reduce,
+    )
+
+    parallel = get_parallel()
+    reduce_ep = parallel.moe_ep_size > 1 and not should_skip_post_experts_all_reduce(
+        is_tp_path=False
+    )
+    reduce_tp = parallel.moe_tp_size > 1 and not should_skip_post_experts_all_reduce(
+        is_tp_path=True
+    )
+
+    if reduce_ep and reduce_tp and can_merge_post_experts_all_reduce():
+        return tensor_model_parallel_all_reduce(hidden_states)
+
+    if reduce_ep:
+        hidden_states = moe_expert_parallel_all_reduce(hidden_states)
+    if reduce_tp:
+        hidden_states = moe_tensor_model_parallel_all_reduce(hidden_states)
+    return hidden_states
+
+
+def post_experts_reduction_group():
+    """The group one all-reduce of an MoE output runs over: TP when the EP and
+    MoE-TP reductions merge, otherwise EP, otherwise MoE-TP. The same group
+    ``resolve_fusion_group`` builds the fused workspace on."""
+    parallel = get_parallel()
+    if can_merge_post_experts_all_reduce():
+        return parallel.tp_group
+    if parallel.moe_ep_size > 1:
+        return parallel.moe_ep_group
+    return parallel.moe_tp_group
+
+
+def deferred_post_experts_all_reduce(hidden_states: torch.Tensor) -> torch.Tensor:
+    """Run the post-experts reduction that was deferred to allreduce fusion.
+
+    Called when the fused residual+LN kernel cannot service the shape.
+    """
+    return post_experts_reduction_group().all_reduce(hidden_states)
 
 
 @contextmanager
