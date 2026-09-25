@@ -65,9 +65,6 @@ class SWAKVPool(BaseSWAKVPool):
 
         full_kv_pool_class = full_kv_pool_class or token_to_kv_pool_class
         swa_kv_pool_class = swa_kv_pool_class or token_to_kv_pool_class
-        # Both sub-pools must allocate inside the torch_memory_saver region, otherwise
-        # release_memory_occupation(kv_cache) cannot unmap the KV cache of SWA models
-        # and a colocated trainer never gets that memory back.
         common_kwargs = {
             "page_size": page_size,
             "enable_memory_saver": enable_memory_saver,
