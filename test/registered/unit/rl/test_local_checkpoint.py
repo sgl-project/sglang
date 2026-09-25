@@ -146,6 +146,54 @@ def test_quantized_delta_chain_and_repeated_pull(stream, encoding):
     _assert_checkpoint(stream, updated, 2)
 
 
+def test_noop_delta_skips_tensor_scan_and_preserves_marker_on_write_failure(
+    stream, monkeypatch
+):
+    _, source, _, initial, _ = stream
+    _pull(stream, 0)
+    _publish(source, 1, initial, initial)
+
+    def unexpected_tensor_scan(*args):
+        raise AssertionError("An unchanged version must not scan checkpoint tensors")
+
+    def failed_replace(*args):
+        raise OSError("interrupted state replacement")
+
+    monkeypatch.setattr(local_checkpoint, "_tensor_locations", unexpected_tensor_scan)
+    with monkeypatch.context() as context:
+        context.setattr(local_checkpoint.os, "replace", failed_replace)
+        with pytest.raises(OSError, match="interrupted state replacement"):
+            _pull(stream, 1)
+    _assert_checkpoint(stream, initial, 0)
+    _pull(stream, 1)
+    _assert_checkpoint(stream, initial, 1)
+
+
+@pytest.mark.parametrize(
+    "field,value,error",
+    [
+        ("base_version", "2", RuntimeError),
+        ("compression_format", "unsupported", NotImplementedError),
+        ("delta_encoding", "unsupported", NotImplementedError),
+        ("checksum_format", None, KeyError),
+    ],
+)
+def test_noop_delta_keeps_metadata_validation(stream, field, value, error):
+    _, source, _, initial, _ = stream
+    _pull(stream, 0)
+    _publish(source, 1, initial, initial)
+    index_path = source / "weight_v000001/model.safetensors.index.json"
+    index = json.loads(index_path.read_text())
+    if value is None:
+        del index["metadata"][field]
+    else:
+        index["metadata"][field] = value
+    index_path.write_text(json.dumps(index))
+    with pytest.raises(error):
+        _pull(stream, 1)
+    _assert_checkpoint(stream, initial, 0)
+
+
 def test_new_trainer_stream_reseeds_reused_local_checkpoint(stream):
     _, source, _, initial, updated = stream
     _publish(source, 1, initial, updated)
