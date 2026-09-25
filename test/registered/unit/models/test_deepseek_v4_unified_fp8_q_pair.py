@@ -116,6 +116,13 @@ class _Harness(deepseek_v4.MQALayer):
         return q_out, k_nope_out
 
 
+_NO_HIP_GLUE = SimpleNamespace(
+    skip_head_pad=lambda attn: False,
+    wo_b_takes_fp8_grid=lambda attn: False,
+    wo_a_fp8_grid_matmul=lambda o, wo_a, fp8_grid: None,
+)
+
+
 def _run(fp8, mode=ForwardMode.DECODE, cp=False, fused_verify=True):
     layer = _Harness()
     layer.dsa_enable_prefill_cp = cp
@@ -141,7 +148,10 @@ def _run(fp8, mode=ForwardMode.DECODE, cp=False, fused_verify=True):
         patch.object(deepseek_v4, "fused_rope_inplace", return_value=None),
         patch.object(deepseek_v4, "_FP8_WO_A_GEMM", False),
         patch.object(deepseek_v4, "_is_gfx942_supported", False),
+        patch.object(deepseek_v4, "_is_gfx95_supported", False),
         patch.object(deepseek_v4, "_is_hip", True),
+        # the ROCm model glue is only imported on ROCm; the unified path needs none of it
+        patch.object(deepseek_v4, "_hip", _NO_HIP_GLUE),
         patch.object(deepseek_v4, "_is_npu", False),
     ):
         layer.forward(

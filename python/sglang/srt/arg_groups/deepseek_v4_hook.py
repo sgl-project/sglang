@@ -182,7 +182,10 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
         from sglang.srt.model_executor.cuda_graph_config import Backend
 
         incompatible = (
-            ("non-CUDA hardware", not get_platform().is_cuda),
+            (
+                "non-CUDA/ROCm hardware",
+                not (get_platform().is_cuda or get_platform().is_hip),
+            ),
             (
                 "prefill CUDA graphs",
                 cfg.cuda_graph_config.prefill.backend != Backend.DISABLED,

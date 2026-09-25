@@ -44,6 +44,14 @@ def handle_context_parallelism(server_args: Any):
         model_arch = hf_config.architectures[0]
         if (
             cfg.enable_prefill_cp
+            and get_platform().is_hip
+            and hf_config.model_type != "deepseek_v41"
+        ):
+            raise ValueError(
+                "HIP interleave prefill CP currently supports DeepSeek-V4.1 only."
+            )
+        if (
+            cfg.enable_prefill_cp
             and model_arch == "DeepseekV32ForCausalLM"
             and cfg.cp_strategy == "zigzag"
         ):
@@ -660,7 +668,14 @@ def validate_prefill_cp_platform(server_args: Any):
     """Reject deprecated platform CP before resolving models or CP topology."""
     cfg = resolving_view(server_args)
     platform = get_platform()
-    if cfg.enable_prefill_cp and (platform.is_hip or platform.is_musa):
+    # HIP interleave is model-qualified by handle_context_parallelism after lookup.
+    if cfg.enable_prefill_cp and platform.is_hip:
+        if cfg.cp_strategy != "interleave":
+            raise ValueError(
+                "HIP prefill CP requires --cp-strategy interleave and a DeepSeek-V4.1 model."
+            )
+        return
+    if cfg.enable_prefill_cp and platform.is_musa:
         raise ValueError(
-            "Prefill CP on HIP/MUSA is deprecated; CP support will be refactored soon."
+            "Prefill CP on MUSA is deprecated; CP support will be refactored soon."
         )

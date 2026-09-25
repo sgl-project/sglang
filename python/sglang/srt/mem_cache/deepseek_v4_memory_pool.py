@@ -23,11 +23,12 @@ from sglang.kernels.ops.attention.dsv4.kv_layout import (
 from sglang.kernels.ops.attention.dsv4.unified_kv_kernels import layout
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.environ import envs
+from sglang.srt.layers.attention.hip_flash_mla import resolve_hip_flashmla_backend
 from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
 from sglang.srt.mem_cache.deepseek_v4_compress_state import CompressStatePool
 from sglang.srt.mem_cache.memory_pool import KVCache
 from sglang.srt.runtime_context import get_exec, get_platform, get_spec
-from sglang.srt.utils import ceil_div, is_hip
+from sglang.srt.utils import ceil_div, is_gfx95_supported, is_hip
 
 logger = logging.getLogger(__name__)
 
@@ -170,7 +171,8 @@ def flashmla_supports_v41_kv_layouts() -> bool:
 
 def select_dsv4_kv_layout() -> Tuple[KVLayout, Optional[str]]:
     """The (main-cache layout, compressed-cache option) for a new DeepSeek-V4
-    family pool; the V4.1 layouts exist only in SM100 / SM103 FlashMLA."""
+    family pool; the V4.1 layouts exist only in SM100 / SM103 FlashMLA or gfx950
+    AITER attention."""
     mode = envs.SGLANG_DSV4_KV_LAYOUT.get().lower()
     option = envs.SGLANG_DSV4_COMPRESSED_KV_LAYOUT.get().lower()
     if mode == "v4":
@@ -181,6 +183,17 @@ def select_dsv4_kv_layout() -> Tuple[KVLayout, Optional[str]]:
         and torch.version.cuda is not None
         and torch.cuda.get_device_capability()[0] == 10
     )
+    if _is_hip:
+        supported = (
+            is_gfx95_supported() and resolve_hip_flashmla_backend() == "aiter_sparse"
+        )
+        if mode == "auto" and not supported:
+            return KVLayout.V4, None
+        if not supported:
+            raise ValueError(
+                "V4.1 KV layouts on HIP require gfx950 with aiter_sparse attention"
+            )
+        return KVLayout.V41, option
     supported = flashmla_supports_v41_kv_layouts()
     if mode == "auto":
         if is_sm100 and supported:
@@ -665,6 +678,21 @@ class DeepSeekV4IndexerPool(KVCache):
         loc: torch.Tensor,
         cache_k: torch.Tensor,
     ) -> None:
+        if self.uses_aiter_fp4_layout:
+            # the FlyDSL kernels read the fp4 payload and the packed ue8m0 scales
+            # from two buffers
+            from sglang.kernels.ops.attention.dsv4.fp4_indexer_hip import (
+                store_fp4_index_k_cache_split,
+            )
+
+            return store_fp4_index_k_cache_split(
+                cache_k,
+                self.index_k_payload_buffer[layer_id - self.start_layer],
+                self.index_k_scale_buffer[layer_id - self.start_layer],
+                loc,
+                page_size=self.page_size,
+                rne=self.index_k_rne,
+            )
         from sglang.kernels.ops.attention.dsv4.fp4_indexer import (
             store_fp4_index_k_cache,
         )
@@ -683,6 +711,17 @@ class DeepSeekV4IndexerPool(KVCache):
         """Packed fp4 rows at `slots`: (payload int8 [n, 64], scales int32 [n]),
         from the page layout [page_size * 64 payload | page_size * 4 scale]."""
         assert self.use_fp4_indexer, "packed readback only applies to the fp4 layout"
+        if self.uses_aiter_fp4_layout:
+            from sglang.kernels.ops.attention.dsv4.fp4_indexer_hip import (
+                read_fp4_index_k_split,
+            )
+
+            return read_fp4_index_k_split(
+                self.index_k_payload_buffer[layer_id - self.start_layer],
+                self.index_k_scale_buffer[layer_id - self.start_layer],
+                slots,
+                page_size=self.page_size,
+            )
         buf = self.index_k_with_scale_buffer[layer_id - self.start_layer]
         slots = slots.to(torch.int64)
         p = self.page_size
@@ -702,23 +741,13 @@ class DeepSeekV4IndexerPool(KVCache):
         from sglang.srt.layers.quantization.fp8 import DSV4_DEQUANT_FP4_TABLE
 
         assert self.use_fp4_indexer, "dequant readback only applies to the fp4 layout"
-        buf = self.index_k_with_scale_buffer[layer_id - self.start_layer]
         if slots is None:
-            slots = torch.arange(self.size, device=buf.device)
-        slots = slots.to(torch.int64)
-        # Page layout: see get_index_k_fp4.
-        p = self.page_size
-        page, off = (slots // p).unsqueeze(-1), slots % p
-        payload_cols = (off * 64).unsqueeze(-1) + torch.arange(64, device=buf.device)
-        scale_cols = (p * 64 + off * 4).unsqueeze(-1) + torch.arange(
-            4, device=buf.device
-        )
-        u = buf[page, payload_cols].view(torch.uint8)  # [n, 64]
+            slots = torch.arange(self.size, device=self.device)
+        payload, packed = self.get_index_k_fp4(layer_id, slots.to(torch.int64))
+        u = payload.view(torch.uint8)  # [n, 64]
         codes = torch.stack([u & 0x0F, (u >> 4) & 0x0F], dim=-1)  # [n, 64, 2]
-        vals = DSV4_DEQUANT_FP4_TABLE.to(buf.device)[codes.long()].flatten(
-            1
-        )  # [n, 128]
-        exps = buf[page, scale_cols].to(torch.int32) & 0xFF  # [n, 4]
+        vals = DSV4_DEQUANT_FP4_TABLE.to(u.device)[codes.long()].flatten(1)  # [n, 128]
+        exps = torch.stack([(packed >> (8 * c)) & 0xFF for c in range(4)], dim=-1)
         scales = torch.exp2(exps.float() - 127).repeat_interleave(32, dim=-1)
         return (vals * scales).to(torch.bfloat16)
 
@@ -1892,6 +1921,12 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             compress_layer_id
         )
 
+    def low_ratio_index_k_is_split(self, layer_id: int) -> bool:
+        """Whether the layer's index-K pool keeps payload and scale in the split
+        FlyDSL layout (ROCm) rather than one fused [.., 68]-byte row."""
+        compress_ratio, _, _ = self.layer_mapping[layer_id]
+        return self._indexer_pool(compress_ratio).uses_aiter_fp4_layout
+
     def get_index_k_fp4_payload_buffer(self, layer_id: int) -> torch.Tensor:
         self.wait_layer_transfer(layer_id)
         compress_ratio, compress_layer_id, _ = self.layer_mapping[layer_id]
@@ -1988,8 +2023,11 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         eps: float,
         freqs_cis: torch.Tensor,
         positions: torch.Tensor,
+        q: Optional[torch.Tensor] = None,
     ) -> None:
+        """q ([B, H, head_dim]): rope its query heads in the same launch."""
         if self.uniform_fp8:
+            assert q is None, "uniform FP8 store does not fuse query RoPE"
             # Uniform-FP8 (trtllm-gen): in-place norm + RoPE (kv is not read again),
             # then an e4m3 cast + scatter with per-tensor scale 1.0.
             from sglang.kernels.ops.attention.deepseek_v4_rope import (
@@ -2017,6 +2055,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             kvcache=self.get_swa_raw_buffer(layer_id),
             page_size=self.swa_page_size,
             layout=self.kv_layout,
+            q=q,
         )
 
     def set_unified_key_buffer_radix_fused_norm_rope(
