@@ -80,7 +80,10 @@ class Step3p5AMultiTokenPredictor(nn.Module):
         self.eh_proj = nn.Linear(config.hidden_size * 2, config.hidden_size, bias=False)
         self.shared_head = SharedHead(config=config, quant_config=quant_config)
         self.mtp_block = Step3p5DecoderLayer(
-            config=config, layer_id=layer_id, prefix=f"{prefix}.mtp_block"
+            config=config,
+            layer_id=layer_id,
+            prefix=f"{prefix}.mtp_block",
+            is_nextn=True,
         )
         self.lm_head = self.shared_head.head
 
@@ -111,6 +114,9 @@ class Step3p5AMultiTokenPredictor(nn.Module):
             hidden_states=hidden_states,
             forward_batch=forward_batch,
             residual=None,
+        )
+        hidden_states, residual = self.mtp_block.layer_communicator.finish_layer_stack(
+            hidden_states, residual, forward_batch
         )
         hidden_states_before_norm = None
         if not forward_batch.forward_mode.is_idle():

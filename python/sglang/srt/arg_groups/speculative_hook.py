@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 from typing import TYPE_CHECKING, Optional
 
 from sglang.srt.arg_groups.choices import DRAFT_ATTENTION_BACKEND_CHOICES
@@ -16,6 +15,7 @@ from sglang.srt.arg_groups.overrides import (
     resolving_view,
     run_post_process_pass,
 )
+from sglang.srt.environ import envs
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_platform
 
@@ -35,6 +35,7 @@ def _should_auto_enable_hip_rejection_sampling(
     accept_threshold_single: float,
     accept_threshold_acc: float,
     enable_deterministic_inference: bool,
+    simulate_acc_len: float = -1.0,
 ) -> bool:
     """Whether HIP may default ``speculative_use_rejection_sampling`` on.
 
@@ -43,6 +44,10 @@ def _should_auto_enable_hip_rejection_sampling(
     would crash configs that previously ran greedy on HIP, including EAGLE3
     stage-a ``test_basic_sanity_eagle3`` (draft 32000 vs target 128256). Skip
     EAGLE3 and any EAGLE run that already has a token map.
+
+    Also skip when ``SGLANG_SIMULATE_ACC_LEN`` is on: AgentX throughput still
+    runs the real EAGLE verify then overwrites accept length, so the Triton
+    chain sampler is paid for and thrown away.
     """
     return (
         is_hip
@@ -53,6 +58,7 @@ def _should_auto_enable_hip_rejection_sampling(
         and accept_threshold_single == 1.0
         and accept_threshold_acc == 1.0
         and not enable_deterministic_inference
+        and simulate_acc_len <= 0
     )
 
 
@@ -135,15 +141,6 @@ def handle_speculative_decoding(server_args: ServerArgs) -> None:
             speculative_algorithm=cfg.speculative_algorithm.upper(),
         )
 
-    # Removal notice for the retired env var; raw os.getenv on purpose -- the
-    # Envs descriptor is gone. Drop this check after one release.
-    if os.getenv("SGLANG_ENABLE_SPEC_V2") is not None:
-        logger.warning(
-            "SGLANG_ENABLE_SPEC_V2 has been removed: speculative decoding "
-            "always runs the V2 worker. Use --disable-overlap-schedule to "
-            "select the non-overlap (synchronous) path."
-        )
-
     kwargs = {}
 
     override_config_file = cfg.decrypted_draft_config_file
@@ -221,6 +218,15 @@ def handle_speculative_decoding(server_args: ServerArgs) -> None:
             "--speculative-skip-dp-mlp-sync is only supported with "
             f"speculative_algorithm == EAGLE, got {cfg.speculative_algorithm}."
         )
+
+    if envs.SGLANG_ENABLE_DP_SPEC_PREFILL_COORDINATION.get():
+        if (
+            cfg.speculative_algorithm not in ("EAGLE", "EAGLE3")
+            or cfg.enable_multi_layer_eagle
+        ):
+            raise ValueError(
+                "DP spec/prefill coordination requires single-layer EAGLE or EAGLE3"
+            )
 
     if cfg.speculative_adaptive:
         _maybe_disable_adaptive(server_args)
@@ -1025,6 +1031,7 @@ def _handle_eagle_family(server_args: ServerArgs) -> None:
         accept_threshold_single=cfg.speculative_accept_threshold_single,
         accept_threshold_acc=cfg.speculative_accept_threshold_acc,
         enable_deterministic_inference=cfg.enable_deterministic_inference,
+        simulate_acc_len=float(envs.SGLANG_SIMULATE_ACC_LEN.get()),
     ):
         declare_resolution(
             server_args,
@@ -1116,9 +1123,9 @@ def _handle_eagle_family(server_args: ServerArgs) -> None:
 
 def _handle_ngram(server_args: ServerArgs) -> None:
     cfg = resolving_view(server_args)
-    if cfg.device not in ("cuda", "cpu"):
+    if cfg.device not in ("cuda", "cpu", "xpu"):
         raise ValueError(
-            "Ngram speculative decoding only supports CUDA or CPU devices."
+            "Ngram speculative decoding only supports CUDA, CPU, or XPU devices."
         )
 
     _disable_overlap_schedule_for_cpu(server_args)

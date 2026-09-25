@@ -668,7 +668,6 @@ def unified_radix_tree_server_env(
         **os.environ,
         **extra_env,
         "SGLANG_ENABLE_RANK_CONSENSUS_CHECKER": "1",
-        "SGLANG_ENABLE_UNIFIED_RADIX_TREE": "1",
         "SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND": tree_core_backend,
     }
 
@@ -2408,38 +2407,6 @@ class CustomTestCase(unittest.TestCase):
             f"[CI Test Method] {self.__class__.__name__}.{self._testMethodName}",
             flush=True,
         )
-
-
-def dump_bench_raw_result(
-    path: str,
-    states,
-    preds,
-    labels,
-):
-    if not path:
-        return
-
-    rows = []
-    for i in range(len(states)):
-        state = states[i]
-        output = state["answer"]
-        prompt = _ensure_remove_suffix(state.text(), output)
-        rows.append(
-            dict(
-                prompt_id=i,
-                prompt=prompt,
-                output=output,
-                correct=bool(preds[i] == labels[i]),
-            )
-        )
-
-    print(f"BenchRawResultDumper save results to {path}")
-    Path(path).write_text("\n".join(json.dumps(row) for row in rows))
-
-
-def _ensure_remove_suffix(text: str, suffix: str):
-    assert text.endswith(suffix)
-    return text.removesuffix(suffix)
 
 
 class ModelLaunchSettings:
