@@ -827,7 +827,9 @@ class LoRAMemoryPool:
                                 if self.moe_use_local_expert_ids
                                 else fused_moe.num_experts
                             )
-                            assert shape[1] == num_experts, "LoRA/base expert layout mismatch"
+                            assert shape[1] == num_experts, (
+                                "LoRA/base expert layout mismatch"
+                            )
                         buffer[moe_key].append(
                             torch.zeros(shape, dtype=self.dtype, device=device)
                         )
