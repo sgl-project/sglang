@@ -625,6 +625,37 @@ def concat_cast_kv_fp8_pad(
     return out
 
 
+@triton.jit
+def _gather_cast_kv_bf16_paged_vec_kernel(
+    kv_buffer_ptr,
+    out_ptr,
+    loc_ptr,
+    num_tokens,
+    total_rows,
+    buffer_stride: tl.constexpr,
+    out_stride: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    TOKENS_PER_PROG: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    rows = pid * TOKENS_PER_PROG + tl.arange(0, TOKENS_PER_PROG)
+    gathered = rows < num_tokens
+    loc = tl.load(loc_ptr + rows, mask=gathered, other=0).to(tl.int64)
+    cols = tl.arange(0, HEAD_DIM)
+    src = tl.load(
+        kv_buffer_ptr + loc[:, None] * buffer_stride + cols[None, :],
+        mask=gathered[:, None],
+        other=0.0,
+    )
+    # Rows past num_tokens load nothing and store that zero: they are the
+    # -1-sentinel landing pad, so the trailing zero_ fuses into this kernel.
+    tl.store(
+        out_ptr + rows[:, None].to(tl.int64) * out_stride + cols[None, :],
+        src,
+        mask=(rows < total_rows)[:, None],
+    )
+
+
 def gather_cast_kv_fp8_pad_paged(
     out: torch.Tensor,
     kv_cache: torch.Tensor,
@@ -639,11 +670,6 @@ def gather_cast_kv_fp8_pad_paged(
     ``kv_cache``: [slots, 1, head_dim] bf16;
     ``page_table_1_flattened``: [num_tokens] int32 slot ids.
     """
-    # Local import: mla_buffer reaches into sglang.srt.runtime_context, and this
-    # module lives under sglang.kernels; importing it at module scope would make
-    # every kernels-side consumer pull in srt at import time.
-    from sglang.kernels.ops.kvcache.mla_buffer import get_mla_kv_buffer_triton
-
     head_dim = out.shape[-1]
     num_tokens = page_table_1_flattened.shape[0]
     assert out.dtype == torch.float8_e4m3fn and out.is_contiguous()
@@ -652,6 +678,33 @@ def gather_cast_kv_fp8_pad_paged(
     # so only stride(0) is passed; a non-unit last-dim stride would silently read
     # the wrong elements. concat_cast_kv_fp8_pad asserts the same invariant.
     assert kv_cache.stride(-1) == 1
+    if head_dim == nope_dim and head_dim & (head_dim - 1) == 0:
+        # NoPE: source and destination rows are both one contiguous HEAD_DIM run,
+        # so gather, cast and pad-zeroing fit in one kernel.  The shared get
+        # kernel below runs one program per token -- 131072 CTAs at a 128k
+        # context -- and CTA count, not access width, is what binds there.
+        total_rows = out.shape[0]
+        _gather_cast_kv_bf16_paged_vec_kernel[
+            (triton.cdiv(total_rows, _GATHER_TOKENS_PER_PROG),)
+        ](
+            kv_cache,
+            out,
+            page_table_1_flattened,
+            num_tokens,
+            total_rows,
+            kv_cache.stride(0),
+            out.stride(0),
+            HEAD_DIM=head_dim,
+            TOKENS_PER_PROG=_GATHER_TOKENS_PER_PROG,
+            num_warps=4,
+        )
+        return out
+
+    # Local import: mla_buffer reaches into sglang.srt.runtime_context, and this
+    # module lives under sglang.kernels; importing it at module scope would make
+    # every kernels-side consumer pull in srt at import time.
+    from sglang.kernels.ops.kvcache.mla_buffer import get_mla_kv_buffer_triton
+
     if num_tokens > 0:
         rows = out[:num_tokens]
         get_mla_kv_buffer_triton(
