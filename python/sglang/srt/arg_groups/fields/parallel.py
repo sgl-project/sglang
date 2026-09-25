@@ -87,9 +87,56 @@ class Parallel(msgspec.Struct):
                 "follow_bootstrap_room",
                 "total_requests",
                 "total_tokens",
+                "consistent_hash",
             ],
         ),
     ] = "auto"
+    enable_dp_spill: A[
+        bool,
+        Arg(
+            help="For --load-balance-method consistent_hash: on top of the "
+            "consistent-hash session->dp_rank pin, spill a session to a less-loaded "
+            "dp_rank when its home rank's waiting-uncached-token backlog exceeds the "
+            "least-loaded rank by a relative gap + absolute floor. Uses the shm "
+            "LoadSnapshot num_waiting_uncached_tokens; no effect for other methods.",
+        ),
+    ] = False
+    enable_dp_repin: A[
+        bool,
+        Arg(
+            help="For --load-balance-method consistent_hash with --enable-dp-spill: "
+            "if true (default), a spilled session returns to its consistent-hash home "
+            "once the home rank drains -- home is recomputed every request, so the "
+            "spill is transient and no per-session migration state is kept (no "
+            "migration storm). If false, the session sticks to the spilled rank "
+            "(a bounded session->rank map is kept) until that rank also overloads.",
+        ),
+    ] = True
+    dp_spill_gap_pct: A[
+        float,
+        Arg(
+            help="Relative backlog gap that triggers a consistent_hash spill "
+            "(home > min * (1 + gap) + abs). Only used with --enable-dp-spill.",
+        ),
+    ] = 0.30
+    dp_spill_abs: A[
+        int,
+        Arg(
+            help="Absolute waiting-uncached-token floor added to the consistent_hash "
+            "spill threshold. Only used with --enable-dp-spill.",
+        ),
+    ] = 8192
+    dp_spill_group_size: A[
+        int,
+        Arg(
+            help="Number of consecutive dp_ranks that share one node-local KV store "
+            "(= cards per node; default 8, set 4 for 4-GPU nodes). dp_ranks are "
+            "grouped as [0, size), [size, 2*size), ...; a consistent_hash spill only "
+            "considers ranks in the home rank's own group, so a request never spills "
+            "across the node boundary (which would cross the shared store). No effect "
+            "when dp_size <= group_size (single group). Only used with --enable-dp-spill.",
+        ),
+    ] = 8
     attn_cp_size: A[
         int,
         Arg(
