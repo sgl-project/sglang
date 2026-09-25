@@ -207,8 +207,8 @@ def _check_glm_boundary(x, residual, post, comb, fn, scale, base, *, use_norm):
     )
 
 
-@pytest.mark.parametrize("num_tokens", [4096, 4097, 8192])
-def test_hopper_compensated_mhc_prefill(num_tokens):
+@pytest.mark.parametrize("num_tokens", [32, 33, 64, 128, 257, 4096, 4097, 8192])
+def test_hopper_compensated_mhc(num_tokens):
     from sglang.srt.environ import envs
     from sglang.srt.models.deepseek_v4 import DeepseekV4DecoderLayer
     from sglang.srt.utils import is_sm90_supported
@@ -257,6 +257,26 @@ def test_hopper_compensated_mhc_prefill(num_tokens):
             torch.testing.assert_close(result.double(), expected, rtol=1e-5, atol=2e-6)
         DeepseekV4DecoderLayer.refresh_mhc_norm_weight_cache(layer)
         assert layer._hc_attn_bf16_parts is None
+
+
+@pytest.mark.parametrize("num_tokens", [1, 4, 64, 4096])
+def test_hopper_combine_norm(num_tokens):
+    from sglang.srt.layers.layernorm import RMSNorm
+    from sglang.srt.models.deepseek_v4 import DeepseekV4DecoderLayer
+    from sglang.srt.utils import is_sm90_supported
+
+    if not is_sm90_supported():
+        pytest.skip("Hopper combine/norm dispatch")
+    torch.manual_seed(39 + num_tokens)
+    x = torch.randn(num_tokens, 4, 5120, device="cuda", dtype=torch.bfloat16)
+    pre = torch.rand(num_tokens, 4, device="cuda")
+    norm = RMSNorm(5120, eps=1e-6).cuda().bfloat16()
+    layer = SimpleNamespace(
+        hc_mult=4, config=SimpleNamespace(model_type="deepseek_v41")
+    )
+    actual = DeepseekV4DecoderLayer._hc_combine(layer, x, pre, norm)
+    expected = norm(mhc.hc_combine(x.flatten(1), pre, 4, x.dtype))
+    torch.testing.assert_close(actual, expected, rtol=1 / 128, atol=1e-5)
 
 
 if __name__ == "__main__":

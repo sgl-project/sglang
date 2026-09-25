@@ -3246,7 +3246,10 @@ class DeepseekV4DecoderLayer(nn.Module):
 
             if (
                 x.is_cuda
-                and get_platform().is_blackwell
+                and (
+                    get_platform().is_blackwell
+                    or (get_platform().is_sm90 and not quantize)
+                )
                 and (
                     0 < x.shape[0] <= 96
                     or (
@@ -3302,9 +3305,10 @@ class DeepseekV4DecoderLayer(nn.Module):
         )
 
         parts = bf16_parts = None
+        hopper_medium = get_platform().is_sm90 and 32 <= x_flat.shape[0] < 4096
         if (
             x.is_cuda
-            and x_flat.shape[0] >= 128
+            and (x_flat.shape[0] >= 128 or hopper_medium)
             and x_flat.is_contiguous()
             and (get_platform().is_sm100 or get_platform().is_sm90)
             and envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.get()
@@ -3326,7 +3330,7 @@ class DeepseekV4DecoderLayer(nn.Module):
                     get_platform().is_sm90
                     and (
                         x.shape[0] == 1
-                        or (bf16_parts is not None and 4096 <= x.shape[0] <= 65536)
+                        or (bf16_parts is not None and 32 <= x.shape[0] <= 65536)
                     )
                 )
             )
@@ -3341,7 +3345,9 @@ class DeepseekV4DecoderLayer(nn.Module):
                 if stats_stream is not None
                 else nullcontext()
             ):
-                if bf16_parts is not None and 4096 <= x_flat.shape[0] <= 65536:
+                if bf16_parts is not None and (
+                    hopper_medium or 4096 <= x_flat.shape[0] <= 65536
+                ):
                     from sglang.kernels.ops.layernorm.mhc import (
                         hc_mix_stats_sinkhorn_bf16x3,
                     )
