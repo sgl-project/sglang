@@ -5,13 +5,6 @@ from typing import Optional
 import torch
 
 from sglang.srt.environ import envs
-from sglang.srt.utils import get_bool_env_var, is_hip
-
-_is_hip = is_hip()
-_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
-
-if _use_aiter:
-    from aiter.tuned_gemm import tgemm
 
 _linear_bf16_fp32_algo = envs.SGLANG_OPT_BF16_FP32_GEMM_ALGO.get()
 _HPC_GEMM_WEIGHT_CACHE_ATTR = "_sglang_bf16xfp32_weight_cache"
@@ -147,9 +140,7 @@ def linear_bf16_fp32(
     *,
     hpc_kernel_min_m: Optional[int] = None,
 ) -> torch.Tensor:
-    if _use_aiter and y.dtype == torch.bfloat16:
-        return tgemm.mm(x, y, otype=x.dtype).float()
-    elif hpc_kernel_min_m is not None:
+    if hpc_kernel_min_m is not None:
         output = _linear_bf16_fp32_hpc(x, y, min_m=hpc_kernel_min_m)
         if output is not None:
             return output
