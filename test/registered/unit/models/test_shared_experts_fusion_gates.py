@@ -271,6 +271,28 @@ class TestGlmMoeGate(_FusionGateCase):
             "GlmMoeDsaForCausalLM",
         )
 
+    def test_the_dsa_nextn_draft_declares_its_own_architecture(self):
+        from sglang.srt.models.glm4_moe import GlmMoeDsaForCausalLMNextN
+
+        self.assertEqual(
+            GlmMoeDsaForCausalLMNextN.fused_shared_experts_architecture,
+            "GlmMoeDsaForCausalLMNextN",
+        )
+
+    def test_the_dsa_nextn_draft_can_fuse_the_target_layout(self):
+        from sglang.srt.models.glm4_moe import GlmMoeDsaForCausalLMNextN
+
+        self._seed()
+        draft_config = SimpleNamespace(
+            architectures=["GlmMoeDsaForCausalLMNextN"],
+            n_routed_experts=256,
+            n_shared_experts=1,
+        )
+        self.assertNotIn(
+            "does not support",
+            self._reason(GlmMoeDsaForCausalLMNextN, draft_config) or "",
+        )
+
 
 class TestMiniMaxGates(_FusionGateCase):
     def test_a_config_without_shared_experts_cannot_fuse(self):
