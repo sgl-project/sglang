@@ -100,6 +100,7 @@ class SamplingMaskOutput:
     selected_logprobs: torch.Tensor
     support_logprobs: Optional[torch.Tensor]
     statuses: torch.Tensor
+    output_lens: Optional[torch.Tensor] = None
 
     def map_device_tensors(self, fn) -> None:
         self.token_ids = fn(self.token_ids)
@@ -108,6 +109,8 @@ class SamplingMaskOutput:
         if self.support_logprobs is not None:
             self.support_logprobs = fn(self.support_logprobs)
         self.statuses = fn(self.statuses)
+        if self.output_lens is not None:
+            self.output_lens = fn(self.output_lens)
 
 
 def _trace_e2e_logits(stage: str, **fields) -> None:
@@ -229,9 +232,11 @@ class LogitsProcessorOutput:
     # Post-filter support IDs and requested behavior logprobs, bounded by server
     # capacity. Logprobs are normalized over the full realized support.
     sampling_mask_output: Optional[SamplingMaskOutput] = None
-    next_token_sampling_mask_idx: Optional[List[Optional[List[int]]]] = None
+    next_token_sampling_mask_idx: Optional[
+        List[Optional[Union[List[int], List[List[int]]]]]
+    ] = None
     next_token_sampling_logprobs: Optional[
-        List[Optional[Union[float, List[float]]]]
+        List[Optional[Union[float, List[float], List[List[float]]]]]
     ] = None
     next_token_sampling_mask_status: Optional[List[Optional[int]]] = None
 
