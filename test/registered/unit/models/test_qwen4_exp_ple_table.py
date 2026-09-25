@@ -29,6 +29,7 @@ from sglang.srt.models.qwen4_exp_ple_table import (
     device_uses_host_page_tables,
     make_ple_file_prefetcher,
     make_ple_file_rss_trimmer,
+    ple_pinned_mapping,
     ple_table_file_name,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -104,6 +105,13 @@ class TestPleFileTableAllocator(CustomTestCase):
         table = allocate_ple_host_table((4, 4), torch.bfloat16, "pinned", None)
         self.assertTrue(table.is_pinned())
         self.assertIsNone(make_ple_file_prefetcher(table))
+        # Without the NUMA request the table owns its own memory.
+        self.assertIsNone(ple_pinned_mapping(table))
+
+    def test_file_backed_table_has_no_pinned_mapping(self):
+        with tempfile.TemporaryDirectory() as d:
+            table = allocate_ple_host_table((4, 4), torch.bfloat16, "file", d)
+            self.assertIsNone(ple_pinned_mapping(table))
 
 
 class TestPleFilePrefetcher(CustomTestCase):

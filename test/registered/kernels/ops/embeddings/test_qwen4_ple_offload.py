@@ -15,6 +15,7 @@ from sglang.srt.models import qwen4_exp as qwen4_exp_module
 from sglang.srt.models.qwen4_exp import (
     Qwen4ExpPinnedHostEmbedding,
     Qwen4ExpPLELayer,
+    _gather_ple_embedding_from_pinned_kernel,
 )
 from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.srt.utils import set_weight_attrs
@@ -75,8 +76,9 @@ def _make_source_embedding(
         num_embeddings_padded=org_vocab_size + num_added_embeddings,
         shard_indices=shard_indices,
         embedding_dim=embedding_dim,
-        weight_scale=None,
         quant_method=UnquantizedEmbeddingMethod(),
+        # The offloaded table keeps the source's per-tensor scale (1.0 for bf16).
+        weight_scale=torch.ones(1, dtype=torch.bfloat16, device="cuda"),
         num_embeddings_per_partition=local_rows,
         num_org_embeddings_per_partition=local_rows,
         num_added_embeddings_per_partition=0,
@@ -144,6 +146,29 @@ def test_qwen4_ple_pinned_gather_shard_boundaries_and_out_buffer():
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
+def test_qwen4_ple_pinned_gather_does_not_read_a_zero_row_shard():
+    embedding_dim = 13
+    ids = torch.tensor([[-1, 0, 3], [4, 8, 100]], device="cuda")
+    output = torch.full(
+        (*ids.shape, embedding_dim),
+        torch.nan,
+        dtype=torch.bfloat16,
+        device="cuda",
+    )
+    _gather_ple_embedding_from_pinned_kernel[(ids.numel(),)](
+        0,
+        ids,
+        output,
+        embedding_dim=embedding_dim,
+        tp_vocab_start=4,
+        tp_vocab_end=4,
+        is_fp8=False,
+        BLOCK_D=16,
+    )
+
+    torch.testing.assert_close(output, torch.zeros_like(output), rtol=0, atol=0)
+
+
 def test_qwen4_ple_pinned_gather_empty_input():
     offloaded = Qwen4ExpPinnedHostEmbedding(_make_source_embedding())
     _load_rows(offloaded, torch.zeros((8, 7), dtype=torch.bfloat16, device="cuda"))
@@ -160,7 +185,7 @@ def test_qwen4_ple_pinned_embedding_rejects_unsupported_weights():
         Qwen4ExpPinnedHostEmbedding(_make_source_embedding(num_added_embeddings=1))
 
 
-def test_qwen4_ple_prefetch_buffer_lifecycle(monkeypatch):
+def _make_prefetch_layer() -> Qwen4ExpPLELayer:
     layer = Qwen4ExpPLELayer.__new__(Qwen4ExpPLELayer)
     nn.Module.__init__(layer)
     layer.ple_embed_dim = 7
@@ -169,9 +194,20 @@ def test_qwen4_ple_prefetch_buffer_lifecycle(monkeypatch):
             _make_source_embedding(embedding_dim=layer.ple_embed_dim)
         )
     )
+    layer._prefetch_stream = object()
+    layer._graph_prefetch_buffer = None
     layer._graph_prefetch_buffers = {}
     layer._eager_prefetch_buffer = None
+    return layer
+
+
+def test_qwen4_ple_prefetch_buffer_lifecycle(monkeypatch):
+    layer = _make_prefetch_layer()
     lookup_ids = torch.empty((0,), dtype=torch.int64, device="cuda")
+    # The shared graph buffer is the sm120 policy; pin the gate so the test
+    # asserts the same thing on every CI card.
+    monkeypatch.setattr(qwen4_exp_module, "is_sm120_supported", lambda: True)
+    monkeypatch.setattr(qwen4_exp_module, "is_sm121", lambda: False)
 
     monkeypatch.setattr(qwen4_exp_module, "get_is_capture_mode", lambda: False)
     eager_large = layer._get_prefetch_buffer(8, lookup_ids)
@@ -184,13 +220,34 @@ def test_qwen4_ple_prefetch_buffer_lifecycle(monkeypatch):
     assert eager_grown_small.data_ptr() == eager_grown.data_ptr()
     assert layer._eager_prefetch_buffer.shape == (12, layer.ple_embed_dim)
 
+    layer.prepare_cuda_graph_prefetch_buffer(5, lookup_ids.device)
     monkeypatch.setattr(qwen4_exp_module, "get_is_capture_mode", lambda: True)
     graph_three = layer._get_prefetch_buffer(3, lookup_ids)
     graph_five = layer._get_prefetch_buffer(5, lookup_ids)
     graph_three_reused = layer._get_prefetch_buffer(3, lookup_ids)
     assert graph_three_reused.data_ptr() == graph_three.data_ptr()
+    assert graph_five.data_ptr() == graph_three.data_ptr()
+    assert layer._graph_prefetch_buffer.shape == (5, layer.ple_embed_dim)
+
+
+def test_qwen4_ple_prefetch_buffer_is_per_size_off_sm120(monkeypatch):
+    layer = _make_prefetch_layer()
+    lookup_ids = torch.empty((0,), dtype=torch.int64, device="cuda")
+    monkeypatch.setattr(qwen4_exp_module, "is_sm120_supported", lambda: False)
+
+    # Other cards get no shared preallocation ...
+    layer.prepare_cuda_graph_prefetch_buffer(5, lookup_ids.device)
+    assert layer._graph_prefetch_buffer is None
+
+    # ... and one stable buffer per captured size instead.
+    monkeypatch.setattr(qwen4_exp_module, "get_is_capture_mode", lambda: True)
+    graph_three = layer._get_prefetch_buffer(3, lookup_ids)
+    graph_five = layer._get_prefetch_buffer(5, lookup_ids)
     assert graph_five.data_ptr() != graph_three.data_ptr()
-    assert set(layer._graph_prefetch_buffers) == {3, 5}
+    assert (
+        layer._get_prefetch_buffer(3, lookup_ids).data_ptr() == graph_three.data_ptr()
+    )
+    assert sorted(layer._graph_prefetch_buffers) == [3, 5]
 
 
 @pytest.fixture

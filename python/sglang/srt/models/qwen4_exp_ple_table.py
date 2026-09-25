@@ -41,6 +41,7 @@ from typing import Optional, Sequence
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.utils.numa_utils import allocate_interleaved_pinned_table
 
 logger = logging.getLogger(__name__)
 
@@ -228,6 +229,7 @@ def allocate_ple_host_table(
     backend: str = "pinned",
     table_dir: Optional[str] = None,
     tag: Optional[str] = None,
+    interleave: bool = False,
 ) -> torch.Tensor:
     """Return a host tensor of ``shape``/``dtype`` for the PLE table.
 
@@ -235,13 +237,22 @@ def allocate_ple_host_table(
     (the server defaults it to ``$SGLANG_CACHE_DIR/ple/<model path>``): the
     file name only encodes shape, dtype and ``tag``, and every boot rewrites
     the whole table through the weight loader.
+
+    ``interleave`` asks the pinned backend to spread the table over the host's
+    NUMA nodes; read it back with ``ple_pinned_mapping``. It does not apply to
+    the file backend, whose mapping is pageable rather than pinned.
     """
     if backend not in PLE_OFFLOAD_BACKENDS:
         raise ValueError(
             f"unknown PLE offload backend {backend!r}; choose from {PLE_OFFLOAD_BACKENDS}"
         )
     if backend == "pinned":
-        return torch.empty(tuple(shape), dtype=dtype, device="cpu", pin_memory=True)
+        table, mapping = allocate_interleaved_pinned_table(
+            tuple(shape), dtype, interleave=interleave
+        )
+        # The tensor points into the mapping, so the caller has to keep it.
+        table._sglang_ple_pinned_mapping = mapping
+        return table
 
     numel = 1
     for d in shape:
@@ -262,6 +273,15 @@ def allocate_ple_host_table(
     table = storage.view(dtype).view(*[int(d) for d in shape])
     table._sglang_ple_file_path = path  # consumed by PleFilePrefetcher
     return table
+
+
+def ple_pinned_mapping(table: torch.Tensor):
+    """The NUMA-interleaved mapping behind a pinned table, or None.
+
+    ``None`` covers every table that owns its own memory: the file backend and
+    the plain node-local ``pin_memory=True`` allocation.
+    """
+    return getattr(table, "_sglang_ple_pinned_mapping", None)
 
 
 def make_ple_file_prefetcher(table: torch.Tensor) -> Optional[PleFilePrefetcher]:

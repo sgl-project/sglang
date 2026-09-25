@@ -316,6 +316,20 @@ class Envs:
     # sizes the KV pool. Cap its resident set; 0 disables the trim.
     SGLANG_QWEN4_PLE_FILE_RSS_BUDGET_GB = EnvFloat(8.0)
     SGLANG_QWEN4_PLE_FILE_RSS_INTERVAL_S = EnvFloat(30.0)
+    # Spread the offloaded Qwen4-Exp PLE table over all NUMA nodes instead of
+    # letting it land entirely on the node local to the GPU. The GPU reads the
+    # table over PCIe, so node locality buys nothing while a node-local table
+    # can exhaust a small node. Set to 0 to keep the plain node-local pinning.
+    SGLANG_PLE_OFFLOAD_NUMA_INTERLEAVE = EnvBool(True)
+    # Select the QSA sparse decode backend. Auto uses Triton on SM120 and the
+    # flash-attention fallback on other architectures.
+    SGLANG_QSA_DECODE_BACKEND = EnvStr("auto")
+    # Select the QSA MQA scoring backend. Auto follows the architecture default;
+    # failures from the selected backend are reported to the caller.
+    SGLANG_QSA_MQA_BACKEND = EnvStr("auto")
+    # Select QSA sparse prefill launch geometry. Auto enables tuned SM120
+    # configurations for eligible shapes; table keeps device-table selection.
+    SGLANG_QSA_PREFILL_GEOMETRY = EnvStr("auto")
     SGLANG_PREFETCH_BLOCK_SIZE_MB = EnvInt(16)
     SGLANG_GEMMA_OUT_OF_PLACE_POSITION_MUTATION = EnvBool(False)
     SGLANG_ENABLE_WEIGHT_LOADER_V2 = EnvBool(False)
@@ -997,6 +1011,9 @@ class Envs:
     SGLANG_USE_DYNAMIC_MXFP4_LINEAR = EnvBool(False)
     SGLANG_FORCE_FP8_MARLIN = EnvBool(False)
     SGLANG_MOE_NVFP4_DISPATCH = EnvBool(False)
+    # Use the fused small-row NVFP4 MoE kernel on SM120 when its shape and
+    # execution constraints are satisfied.
+    SGLANG_NVFP4_MOE_SM120 = EnvBool(True)
     SGLANG_NVFP4_CKPT_FP8_GEMM_IN_ATTN = EnvBool(False)
     SGLANG_NVFP4_CKPT_FP8_NEXTN_MOE = EnvBool(False)
     # GLM NextN (MTP): cast the draft layer's bf16 fused MoE to per-channel FP8
