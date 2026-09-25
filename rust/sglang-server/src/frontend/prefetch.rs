@@ -1,4 +1,4 @@
-//! Resolve I/O-backed media sources on the API runtime, before MM dispatch.
+//! Resolve I/O-backed media sources on the async frontend runtime, before MM dispatch.
 //!
 //! The MM worker pool is fixed, core-pinned CPU capacity: a slow image host — or
 //! a file on a hanging network mount — must never occupy it, and a request's
