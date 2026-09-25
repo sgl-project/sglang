@@ -18,9 +18,9 @@ scheduler's slot bookkeeping is untouched.
 The module also exposes a lazy-eval (`*_start` / `*_finalize`) surface
 used by the MLX overlap scheduler to pipeline CPU bookkeeping with
 GPU execution.  The lazy API is a thin split of the synchronous API:
-``*_start`` builds the compute graph without materialising outputs,
-``*_finalize`` blocks on the lazy token(s) and commits per-request
-state.
+``*_start`` builds the compute graph and submits shared KV writes
+without waiting for GPU completion. ``*_finalize`` blocks on the
+lazy token(s) and commits per-request state.
 """
 
 import logging
@@ -838,6 +838,9 @@ class MlxModelRunner:
             ]
         )
         self._attention_kv_pool.set_kv_all_layers(slot_ids_mx, k_all, v_all)
+        # Pool writes are not ancestors of the token outputs;
+        # submit them to release prior chunks' source KV arrays.
+        mx.async_eval(*self._attention_kv_pool.all_buffers())
 
     def _sync_decode_kv_to_pool(self, req_id: str) -> None:
         """Sync un-flushed decode KV for *req_id* to the shared pool."""
@@ -893,12 +896,12 @@ class MlxModelRunner:
         logit_edit_row: mx.array | None = None,
         logprob_spec: MlxLogprobSpec | None = None,
     ) -> MlxPendingPrefill:
-        """Queue a prefill forward pass without evaluating.
+        """Queue a prefill forward pass without waiting for GPU completion.
 
         Returns an :class:`MlxPendingPrefill` containing the lazy
         next-token ``mx.array`` plus everything needed to commit the
-        request in :meth:`prefill_finalize`.  The caller drives the GPU
-        by handing ``lazy_token`` (and cache state) to ``mx.async_eval``.
+        request in :meth:`prefill_finalize`. The caller submits
+        ``lazy_token`` (and cache state) to ``mx.async_eval``.
 
         ``needs_logits=False`` marks the first chunk of a chunked prompt
         (its next-token output is discarded); see :meth:`extend_start`.
@@ -1075,7 +1078,7 @@ class MlxModelRunner:
         logit_edit_row: mx.array | None = None,
         logprob_spec: MlxLogprobSpec | None = None,
     ) -> MlxPendingExtend:
-        """Queue chunked-prefill continuation without evaluating.
+        """Queue chunked-prefill continuation without waiting for GPU completion.
 
         ``needs_logits=False`` marks a non-final chunk whose next-token
         output the scheduler discards; the logit head is skipped when the

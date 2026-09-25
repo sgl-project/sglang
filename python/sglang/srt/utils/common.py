@@ -860,6 +860,16 @@ def get_xpu_memory_capacity():
         raise RuntimeError("torch.xpu is not available.")
 
 
+def get_mps_memory_capacity():
+    """Metal's recommended working-set size in MiB, matching MLX KV budgeting."""
+    try:
+        if torch.backends.mps.is_available():
+            return torch.mps.recommended_max_memory() // (1 << 20)
+        return None
+    except AttributeError:
+        raise RuntimeError("torch.mps is not available.")
+
+
 def get_mtgpu_memory_capacity():
     try:
         # Run mthreads-gmi and capture the output
@@ -922,6 +932,8 @@ def get_device_memory_capacity(device: str = None):
         gpu_mem = get_xpu_memory_capacity()
     elif device == "musa":
         gpu_mem = get_mtgpu_memory_capacity()
+    elif device == "mps":
+        gpu_mem = get_mps_memory_capacity()
     else:
         # GPU memory is not known yet or no GPU is available.
         gpu_mem = None
