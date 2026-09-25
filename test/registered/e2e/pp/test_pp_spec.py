@@ -72,7 +72,6 @@ class TestPPSpecConsistency(CustomTestCase):
                     base_url=DEFAULT_URL_FOR_TEST,
                     model=DEFAULT_TARGET_MODEL_EAGLE,
                     eval_name="gsm8k",
-                    api="completion",
                     max_tokens=512,
                     num_examples=256,
                     num_threads=32,
