@@ -53,6 +53,11 @@ on:
         required: false
         default: true
         type: boolean
+      ci_data_branch:
+        description: "sgl-project/ci-data-diffusion branch to publish to. Leave empty for the safe default: main when 'ref' is sglang main, otherwise an isolated gt/<ref> branch that only the producing PR's SHA pin can see. Set to main only when this GT must reach every later pin bump from main."
+        required: false
+        default: ''
+        type: string
 
 concurrency:
   group: diffusion-ci-gt-gen-${{ github.ref }}-${{ inputs.output_name || inputs.case_ids || inputs.official_case_ids || inputs.official_source_group || inputs.run_official_cases || 'default' }}
@@ -68,6 +73,10 @@ env:
   OUTPUT_NAME: ${{ inputs.output_name || 'diffusion-ci-outputs' }}
   PUBLISH_TARGET_DIR: ${{ inputs.publish_target_dir || (inputs.run_official_cases && 'diffusion-ci/consistency_gt/official_generated' || 'diffusion-ci/consistency_gt/sglang_generated') }}
   SGLANG_DIFFUSION_GT_PER_PLATFORM: "1"
+  # Read by publish_diffusion_gt.py to pick the ci-data-diffusion branch and to
+  # record provenance in its commits.
+  GT_SOURCE_REF: ${{ inputs.ref || github.ref }}
+  CI_DATA_BRANCH: ${{ inputs.ci_data_branch }}
 
 jobs:
   compute-official-gt-matrix:
@@ -315,9 +324,11 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ inputs.publish && secrets.GH_PAT_FOR_NIGHTLY_CI_DATA || github.token }}
         run: |
+          GT_SOURCE_SHA="$(git rev-parse HEAD)" \
           python scripts/ci/utils/diffusion/publish_diffusion_gt.py \
             --source-dir python/${{ env.OUTPUT_NAME }} \
             --target-dir "${{ env.PUBLISH_TARGET_DIR }}" \
+            --branch "$CI_DATA_BRANCH" \
             --check-only
 
       - name: Publish official GT images to sgl-project/ci-data-diffusion
@@ -325,9 +336,11 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GH_PAT_FOR_NIGHTLY_CI_DATA }}
         run: |
+          GT_SOURCE_SHA="$(git rev-parse HEAD)" \
           python scripts/ci/utils/diffusion/publish_diffusion_gt.py \
             --source-dir python/${{ env.OUTPUT_NAME }} \
-            --target-dir "${{ env.PUBLISH_TARGET_DIR }}"
+            --target-dir "${{ env.PUBLISH_TARGET_DIR }}" \
+            --branch "$CI_DATA_BRANCH"
 
   compute-diffusion-partitions:
     if: github.repository == 'sgl-project/sglang' && !inputs.run_official_cases
@@ -437,9 +450,11 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ inputs.publish && secrets.GH_PAT_FOR_NIGHTLY_CI_DATA || github.token }}
         run: |
+          GT_SOURCE_SHA="$(git rev-parse HEAD)" \
           python scripts/ci/utils/diffusion/publish_diffusion_gt.py \
             --source-dir python/${{ env.OUTPUT_NAME }} \
             --target-dir "${{ env.PUBLISH_TARGET_DIR }}" \
+            --branch "$CI_DATA_BRANCH" \
             --check-only
 
       - name: Publish GT images to sgl-project/ci-data-diffusion
@@ -447,9 +462,11 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GH_PAT_FOR_NIGHTLY_CI_DATA }}
         run: |
+          GT_SOURCE_SHA="$(git rev-parse HEAD)" \
           python scripts/ci/utils/diffusion/publish_diffusion_gt.py \
             --source-dir python/${{ env.OUTPUT_NAME }} \
-            --target-dir "${{ env.PUBLISH_TARGET_DIR }}"
+            --target-dir "${{ env.PUBLISH_TARGET_DIR }}" \
+            --branch "$CI_DATA_BRANCH"
 
   multimodal-diffusion-gen-2gpu:
     needs: compute-diffusion-partitions
@@ -515,9 +532,11 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ inputs.publish && secrets.GH_PAT_FOR_NIGHTLY_CI_DATA || github.token }}
         run: |
+          GT_SOURCE_SHA="$(git rev-parse HEAD)" \
           python scripts/ci/utils/diffusion/publish_diffusion_gt.py \
             --source-dir python/${{ env.OUTPUT_NAME }} \
             --target-dir "${{ env.PUBLISH_TARGET_DIR }}" \
+            --branch "$CI_DATA_BRANCH" \
             --check-only
 
       - name: Publish GT images to sgl-project/ci-data-diffusion
@@ -525,9 +544,11 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GH_PAT_FOR_NIGHTLY_CI_DATA }}
         run: |
+          GT_SOURCE_SHA="$(git rev-parse HEAD)" \
           python scripts/ci/utils/diffusion/publish_diffusion_gt.py \
             --source-dir python/${{ env.OUTPUT_NAME }} \
-            --target-dir "${{ env.PUBLISH_TARGET_DIR }}"
+            --target-dir "${{ env.PUBLISH_TARGET_DIR }}" \
+            --branch "$CI_DATA_BRANCH"
 
   multimodal-diffusion-gen-b200:
     needs: compute-diffusion-partitions
@@ -591,9 +612,11 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ inputs.publish && secrets.GH_PAT_FOR_NIGHTLY_CI_DATA || github.token }}
         run: |
+          GT_SOURCE_SHA="$(git rev-parse HEAD)" \
           python scripts/ci/utils/diffusion/publish_diffusion_gt.py \
             --source-dir python/${{ env.OUTPUT_NAME }} \
             --target-dir "${{ env.PUBLISH_TARGET_DIR }}" \
+            --branch "$CI_DATA_BRANCH" \
             --check-only
 
       - name: Publish GT images to sgl-project/ci-data-diffusion
@@ -601,9 +624,11 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GH_PAT_FOR_NIGHTLY_CI_DATA }}
         run: |
+          GT_SOURCE_SHA="$(git rev-parse HEAD)" \
           python scripts/ci/utils/diffusion/publish_diffusion_gt.py \
             --source-dir python/${{ env.OUTPUT_NAME }} \
-            --target-dir "${{ env.PUBLISH_TARGET_DIR }}"
+            --target-dir "${{ env.PUBLISH_TARGET_DIR }}" \
+            --branch "$CI_DATA_BRANCH"
 
   multimodal-diffusion-gen-5090:
     # The 5090 canary suite is six cases; it is generated whole rather than
@@ -661,9 +686,11 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ inputs.publish && secrets.GH_PAT_FOR_NIGHTLY_CI_DATA || github.token }}
         run: |
+          GT_SOURCE_SHA="$(git rev-parse HEAD)" \
           python scripts/ci/utils/diffusion/publish_diffusion_gt.py \
             --source-dir python/${{ env.OUTPUT_NAME }} \
             --target-dir "${{ env.PUBLISH_TARGET_DIR }}" \
+            --branch "$CI_DATA_BRANCH" \
             --check-only
 
       - name: Publish GT images to sgl-project/ci-data-diffusion
@@ -671,6 +698,8 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GH_PAT_FOR_NIGHTLY_CI_DATA }}
         run: |
+          GT_SOURCE_SHA="$(git rev-parse HEAD)" \
           python scripts/ci/utils/diffusion/publish_diffusion_gt.py \
             --source-dir python/${{ env.OUTPUT_NAME }} \
-            --target-dir "${{ env.PUBLISH_TARGET_DIR }}"
+            --target-dir "${{ env.PUBLISH_TARGET_DIR }}" \
+            --branch "$CI_DATA_BRANCH"
