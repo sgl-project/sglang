@@ -20,10 +20,19 @@ logger = logging.getLogger(__name__)
 class _ModelRegistry:
     # Keyed by model_arch
     models: Dict[str, Union[Type[nn.Module], str]] = field(default_factory=dict)
+    _default_models_loaded: bool = True
+
+    def _load_default_models(self):
+        if self._default_models_loaded:
+            return
+
+        self.models = import_model_classes("sglang.srt.models") | self.models
+        self._default_models_loaded = True
 
     def register(
         self, package_name: str, overwrite: bool = False, strict: bool = False
     ):
+        self._load_default_models()
         new_models = import_model_classes(package_name, strict=strict)
         if overwrite:
             self.models.update(new_models)
@@ -36,7 +45,11 @@ class _ModelRegistry:
                 self.models[arch] = cls
 
     def get_supported_archs(self) -> AbstractSet[str]:
+        self._load_default_models()
         return self.models.keys()
+
+    def is_arch_supported(self, architecture: str) -> bool:
+        return architecture in self.models or architecture in self.get_supported_archs()
 
     def _raise_for_unsupported(self, architectures: List[str]):
         all_supported_archs = self.get_supported_archs()
@@ -81,6 +94,16 @@ class _ModelRegistry:
         self,
         architectures: Union[str, List[str]],
     ) -> Tuple[Type[nn.Module], str]:
+        # Fast startup path: resolve registered models without importing defaults.
+        if architectures:
+            first_arch = (
+                architectures if isinstance(architectures, str) else architectures[0]
+            )
+            model_cls = self.models.get(first_arch)
+            if model_cls is not None:
+                return model_cls, first_arch
+
+        self._load_default_models()
         architectures = self._normalize_archs(architectures)
 
         for arch in architectures:
@@ -128,7 +151,9 @@ def import_model_classes(package_name: str, strict: bool = False):
 
 
 ModelRegistry = _ModelRegistry()
-ModelRegistry.register("sglang.srt.models")
-
 if external_pkg := envs.SGLANG_EXTERNAL_MODEL_PACKAGE.get():
-    ModelRegistry.register(external_pkg, overwrite=True)
+    # Defer default model imports to speed up startup when using external models.
+    ModelRegistry._default_models_loaded = False
+    ModelRegistry.models.update(import_model_classes(external_pkg))
+else:
+    ModelRegistry.register("sglang.srt.models")
