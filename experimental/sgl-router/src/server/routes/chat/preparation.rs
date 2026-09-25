@@ -9,6 +9,7 @@ use crate::policies::{has_caller_input_ids, request_tokens_for, RequestTokens};
 use crate::server::app_context::AppContext;
 use crate::server::error::ApiError;
 use crate::server::metrics::{InputIdsForwarding, MetricsRegistry};
+use crate::tokenizer::ForwardingScope;
 use bytes::Bytes;
 use serde::de::IgnoredAny;
 use serde::Deserialize;
@@ -28,7 +29,7 @@ pub(super) struct PreparedChatRequest {
     pub(super) input_token_count: usize,
     caller_set_rid: bool,
     fans_out: bool,
-    can_forward_input_ids: bool,
+    forwarding_scope: ForwardingScope,
     parsed_body: Option<Value>,
     sampling_defaults: Vec<(SamplingField, Number)>,
 }
@@ -44,8 +45,12 @@ impl PreparedChatRequest {
         // Validate configured sampling rules and collect missing defaults for forwarding.
         let sampling_defaults =
             resolve_sampling_defaults(&ctx.config.model.sampling_overrides, &fields, &ctx.metrics)?;
-        let can_forward_input_ids = !ctx.config.model.disable_input_ids_forwarding
-            && ctx.tokenizers.has_chat_formatter(&model.0);
+        let forwarding_scope = if ctx.config.model.disable_input_ids_forwarding {
+            ForwardingScope::Never
+        } else {
+            ctx.tokenizers.forwarding_scope(&model.0)
+        };
+        let can_forward_input_ids = forwarding_scope != ForwardingScope::Never;
         let needs_tokens = should_tokenize_request(
             can_forward_input_ids,
             policy_needs_request_tokens,
@@ -73,7 +78,7 @@ impl PreparedChatRequest {
             input_token_count,
             caller_set_rid: fields.caller_set_rid,
             fans_out: requests_multiple_samples(&fields, &sampling_defaults),
-            can_forward_input_ids,
+            forwarding_scope,
             parsed_body,
             sampling_defaults,
         })
@@ -95,7 +100,7 @@ impl PreparedChatRequest {
     ) -> Result<Bytes, ApiError> {
         // Routing tokens can replace engine tokenization only for supported chat templates.
         let forwarding = input_ids_forwarding(
-            self.can_forward_input_ids,
+            self.forwarding_scope,
             self.parsed_body.as_ref(),
             self.tokens.as_ref(),
         );
@@ -513,23 +518,76 @@ fn build_outgoing_body(
     Ok(Bytes::from(bytes))
 }
 
+/// Forward generated IDs only for request shapes verified against the engine.
+/// The engine uses `input_ids` verbatim, bypassing its chat-template processing.
+///
+/// Preserve caller-provided IDs. Exclude requests that may render differently
+/// with dynamo-render:
+/// - Non-leading system turns or consecutive users, which strict templates rewrite.
+/// - Historical `reasoning_content`, which may be injected into message content.
+/// - Tools and tool-call history, which the engine merges and normalizes
+///   before rendering.
+/// - Non-string or missing content, which the engine flattens or blanks.
+/// - Template overrides, kwargs, reasoning controls, or task selection.
+/// - Assistant continuations, whose final turn the engine handles separately.
+///
+/// Matching model files and engine defaults are still required. Worker template
+/// overrides and default kwargs cannot be inferred from the request.
+/// `--disable-input-ids-forwarding` gates forwarding separately for such fleets.
+fn can_forward_chat_tokens(value: &Value) -> bool {
+    if has_caller_input_ids(value)
+        || request_has_tools(value)
+        || request_has_non_text_content(value)
+        || request_has_reasoning_content(value)
+        || request_has_role_rewrites(value)
+    {
+        return false;
+    }
+    // Request controls whose rendering has not been verified against the engine.
+    for key in [
+        "chat_template",
+        "chat_template_kwargs",
+        "reasoning",
+        "reasoning_effort",
+        "task",
+    ] {
+        if value.get(key).is_some_and(|v| !v.is_null()) {
+            return false;
+        }
+    }
+    if value
+        .get("continue_final_message")
+        .and_then(|v| v.as_bool())
+        == Some(true)
+    {
+        return false;
+    }
+    !last_message_is_assistant(value)
+}
+
 /// Whether router-rendered `input_ids` replace engine tokenization.
 ///
-/// Every text chat is eligible; multimodal chats and caller-provided IDs are not.
-/// An eligible chat without chat-rendered tokens is a failed offload.
+/// Only chats with forwarding enabled that pass the forwarding guard are
+/// eligible; an eligible chat without chat-rendered tokens is a failed offload.
+/// Multimodal chats are reported apart from other guard exclusions;
+/// `AllText` models skip the guard.
 fn input_ids_forwarding(
-    can_forward_input_ids: bool,
+    scope: ForwardingScope,
     request_value: Option<&Value>,
     request_tokens: Option<&RequestTokens>,
 ) -> InputIdsForwarding {
-    if !can_forward_input_ids {
+    if scope == ForwardingScope::Never {
         return InputIdsForwarding::Disabled;
     }
     if request_value.is_some_and(request_has_multimodal_content) {
         return InputIdsForwarding::IneligibleMultimodal;
     }
     let eligible = request_value.is_some_and(|v| {
-        v.get("messages").is_some_and(|m| m.is_array()) && !has_caller_input_ids(v)
+        v.get("messages").is_some_and(|m| m.is_array())
+            && match scope {
+                ForwardingScope::AllText => !has_caller_input_ids(v),
+                _ => can_forward_chat_tokens(v),
+            }
     });
     if !eligible {
         InputIdsForwarding::Ineligible
@@ -538,6 +596,83 @@ fn input_ids_forwarding(
     } else {
         InputIdsForwarding::TokenizeFailed
     }
+}
+
+/// Whether the final chat message has `role: "assistant"` (a prefix /
+/// continuation turn the engine's template path special-cases).
+fn last_message_is_assistant(value: &Value) -> bool {
+    value
+        .get("messages")
+        .and_then(|m| m.as_array())
+        .and_then(|msgs| msgs.last())
+        .and_then(|m| m.get("role"))
+        .and_then(|r| r.as_str())
+        == Some("assistant")
+}
+
+/// Tool schemas and tool-call history require engine normalization before
+/// rendering: the engine merges message-level `tools` into the template's tools
+/// and parses `tool_calls` arguments; dynamo-render does neither the same way.
+fn request_has_tools(value: &Value) -> bool {
+    let nonempty = |v: &Value| match v {
+        Value::Array(a) => !a.is_empty(),
+        Value::Null => false,
+        _ => true,
+    };
+    if ["tools", "functions"]
+        .iter()
+        .any(|key| value.get(key).is_some_and(nonempty))
+    {
+        return true;
+    }
+    value
+        .get("messages")
+        .and_then(|m| m.as_array())
+        .is_some_and(|messages| {
+            messages.iter().any(|message| {
+                message["role"] == "tool"
+                    || ["tools", "tool_calls", "function_call"]
+                        .iter()
+                        .any(|key| message.get(key).is_some_and(nonempty))
+            })
+        })
+}
+
+/// dynamo-render may inject historical reasoning into content the engine leaves unchanged.
+fn request_has_reasoning_content(value: &Value) -> bool {
+    value
+        .get("messages")
+        .and_then(|messages| messages.as_array())
+        .is_some_and(|messages| {
+            messages.iter().any(|message| {
+                message
+                    .get("reasoning_content")
+                    .is_some_and(|v| !v.is_null())
+            })
+        })
+}
+
+/// Message orders dynamo-render may rewrite for strict templates.
+fn request_has_role_rewrites(value: &Value) -> bool {
+    let Some(messages) = value.get("messages").and_then(|v| v.as_array()) else {
+        return false;
+    };
+    messages.iter().skip(1).any(|m| m["role"] == "system")
+        || messages
+            .windows(2)
+            .any(|pair| pair[0]["role"] == "user" && pair[1]["role"] == "user")
+}
+
+/// Detect non-string or missing content, which requires engine tokenization:
+/// the engine normalizes arrays and nulls differently from dynamo-render.
+fn request_has_non_text_content(value: &Value) -> bool {
+    value
+        .get("messages")
+        .and_then(|m| m.as_array())
+        .is_some_and(|msgs| {
+            msgs.iter()
+                .any(|m| !matches!(m.get("content"), Some(Value::String(_))))
+        })
 }
 
 /// Content parts other than `text` (images, video, audio, ...) need the
@@ -709,6 +844,42 @@ mod tests {
     }
 
     #[test]
+    fn request_has_tools_detects_tools_and_functions() {
+        assert!(request_has_tools(&json!({"tools":[{"type":"function"}]})));
+        assert!(request_has_tools(&json!({"functions":[{"name":"f"}]})));
+        assert!(!request_has_tools(&json!({"tools":[]})));
+        assert!(!request_has_tools(&json!({"messages":[]})));
+        for message in [
+            json!({"role":"system","content":"s","tools":[{"type":"function"}]}),
+            json!({"role":"assistant","content":"","tool_calls":[{"function":{"name":"f","arguments":"{}"}}]}),
+        ] {
+            assert!(request_has_tools(&json!({"messages":[message]})));
+        }
+    }
+
+    #[test]
+    fn request_has_non_text_content_detects_non_string_content() {
+        for content in [
+            json!([{"type":"image_url","image_url":"x"}]),
+            json!([{"type":"text","text":"a"},{"type":"text","text":"b"}]),
+            Value::Null,
+        ] {
+            assert!(
+                request_has_non_text_content(&json!({
+                    "messages":[{"role":"user","content":"hi"},{"role":"assistant","content":content}]
+                })),
+                "content {content} must block"
+            );
+        }
+        assert!(request_has_non_text_content(&json!({
+            "messages":[{"role":"assistant","tool_calls":[]}]
+        })));
+        assert!(!request_has_non_text_content(&json!({
+            "messages":[{"role":"user","content":"hello"}]
+        })));
+    }
+
+    #[test]
     fn request_has_multimodal_content_detects_non_text_parts() {
         for part in [
             json!({"type":"image_url","image_url":{"url":"x"}}),
@@ -735,6 +906,95 @@ mod tests {
     }
 
     #[test]
+    fn reasoning_history_is_an_expected_forwarding_omission() {
+        let mut value = json!({"messages": [
+            {"role":"user", "content":"hi"},
+            {"role":"assistant", "content":"answer", "reasoning_content":"prior reasoning"},
+            {"role":"user", "content":"next"}
+        ]});
+        assert!(!can_forward_chat_tokens(&value));
+        assert_eq!(
+            input_ids_forwarding(ForwardingScope::Guarded, Some(&value), None),
+            InputIdsForwarding::Ineligible
+        );
+        value["messages"][1]["reasoning_content"] = Value::Null;
+        assert!(can_forward_chat_tokens(&value));
+        value["messages"][1]
+            .as_object_mut()
+            .unwrap()
+            .remove("reasoning_content");
+        assert!(can_forward_chat_tokens(&value));
+    }
+
+    #[test]
+    fn role_rewrites_are_expected_forwarding_omissions() {
+        for roles in [
+            vec!["user", "user"],
+            vec!["system", "system", "user"],
+            vec!["user", "assistant", "system", "user"],
+        ] {
+            let messages: Vec<_> = roles
+                .iter()
+                .map(|role| json!({"role": role, "content": "text"}))
+                .collect();
+            let value = json!({"messages": messages});
+            assert!(!can_forward_chat_tokens(&value), "{roles:?}");
+            assert_eq!(
+                input_ids_forwarding(ForwardingScope::Guarded, Some(&value), None),
+                InputIdsForwarding::Ineligible
+            );
+        }
+        assert!(can_forward_chat_tokens(&json!({"messages": [
+            {"role": "system", "content": "instructions"},
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "hello"},
+            {"role": "user", "content": "next"}
+        ]})));
+    }
+
+    #[test]
+    fn can_forward_chat_tokens_allows_plain_text_chat() {
+        assert!(can_forward_chat_tokens(&json!({
+            "messages": [{"role": "user", "content": "hello"}]
+        })));
+    }
+
+    #[test]
+    fn can_forward_chat_tokens_blocks_unreplicated_signals() {
+        let blockers = [
+            json!({"messages":[{"role":"user","content":"hi"}],"input_ids":[7, 8]}),
+            json!({"messages":[{"role":"user","content":"hi"}],"input_ids":"bad"}),
+            json!({"messages":[{"role":"user","content":"hi"}],"tools":[{"type":"function"}]}),
+            json!({"messages":[{"role":"user","content":[{"type":"image_url","image_url":"x"}]}]}),
+            json!({"messages":[{"role":"user","content":"hi"}],"chat_template":"{{ custom }}"}),
+            json!({"messages":[{"role":"user","content":"hi"}],"chat_template_kwargs":{"enable_thinking":true}}),
+            json!({"messages":[{"role":"user","content":"hi"}],"reasoning_effort":"high"}),
+            json!({"messages":[{"role":"user","content":"hi"}],"reasoning":{"enabled":true}}),
+            json!({"messages":[{"role":"user","content":"hi"}],"task":"generate"}),
+            json!({"messages":[{"role":"user","content":"hi"}],"continue_final_message":true}),
+            json!({"messages":[{"role":"user","content":"hi"},{"role":"assistant","content":"partial"}]}),
+        ];
+        for b in blockers {
+            assert!(
+                !can_forward_chat_tokens(&b),
+                "must NOT forward input_ids for: {b}"
+            );
+        }
+    }
+
+    #[test]
+    fn can_forward_chat_tokens_ignores_null_and_false_fields() {
+        assert!(can_forward_chat_tokens(&json!({
+            "messages": [{"role": "user", "content": "hi"}],
+            "input_ids": null,
+            "chat_template": null,
+            "reasoning_effort": null,
+            "chat_template_kwargs": null,
+            "continue_final_message": false
+        })));
+    }
+
+    #[test]
     fn input_ids_forwarding_outcome_per_request() {
         use InputIdsForwarding::*;
         let chat = json!({"messages":[{"role":"user","content":"hi"}]});
@@ -747,27 +1007,35 @@ mod tests {
         let text_parts =
             json!({"messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}]});
         let caller_ids = json!({"messages":[{"role":"user","content":"hi"}], "input_ids":[7]});
-        for (enabled, value, rendered, expected) in [
-            (true, Some(&chat), Some(true), Forwarded),
-            (true, Some(&chat), Some(false), TokenizeFailed),
-            (true, Some(&chat), None, TokenizeFailed),
-            (false, Some(&chat), Some(true), Disabled),
-            (true, Some(&tools), Some(true), Forwarded),
-            (true, Some(&caller_ids), Some(false), Ineligible),
-            (true, Some(&prompt), None, Ineligible),
-            (true, None, None, Ineligible),
-            (true, Some(&image), None, IneligibleMultimodal),
-            (false, Some(&image), None, Disabled),
-            (true, Some(&text_parts), Some(true), Forwarded),
+        let (never, guarded, all) = (
+            ForwardingScope::Never,
+            ForwardingScope::Guarded,
+            ForwardingScope::AllText,
+        );
+        for (scope, value, rendered, expected) in [
+            (guarded, Some(&chat), Some(true), Forwarded),
+            (guarded, Some(&chat), Some(false), TokenizeFailed),
+            (guarded, Some(&chat), None, TokenizeFailed),
+            (never, Some(&chat), Some(true), Disabled),
+            (guarded, Some(&tools), Some(true), Ineligible),
+            (guarded, Some(&prompt), None, Ineligible),
+            (guarded, None, None, Ineligible),
+            (guarded, Some(&image), None, IneligibleMultimodal),
+            (never, Some(&image), None, Disabled),
+            (guarded, Some(&text_parts), None, Ineligible),
+            (all, Some(&tools), Some(true), Forwarded),
+            (all, Some(&text_parts), Some(true), Forwarded),
+            (all, Some(&image), None, IneligibleMultimodal),
+            (all, Some(&caller_ids), Some(false), Ineligible),
         ] {
             let tokens = rendered.map(|rendered_from_chat| RequestTokens {
                 ids: vec![1, 2, 3],
                 rendered_from_chat,
             });
             assert_eq!(
-                input_ids_forwarding(enabled, value, tokens.as_ref()),
+                input_ids_forwarding(scope, value, tokens.as_ref()),
                 expected,
-                "enabled={enabled}, request={value:?}, rendered={rendered:?}"
+                "scope={scope:?}, request={value:?}, rendered={rendered:?}"
             );
         }
     }

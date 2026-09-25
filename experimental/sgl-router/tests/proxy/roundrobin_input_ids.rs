@@ -351,6 +351,81 @@ async fn successful_forward_does_not_emit_ingress_tokenize_error() {
     );
 }
 
+#[tokio::test]
+async fn reasoning_history_preserves_messages_without_forwarding_ids() {
+    let (_dir, cfg) = template_config(json!({
+        "chat_template": "{% for m in messages %}{{ m.role }}:{{ m.content }};{% endfor %}"
+    }));
+    let mock = MockWorker::start(vec![]).await;
+    let ctx = build_ctx_with_config(mock.url.clone(), cfg);
+    let mut request = json!({"model": MODEL, "messages": [
+        {"role":"user", "content":"hi"},
+        {"role":"assistant", "content":"answer", "reasoning_content":"prior reasoning"},
+        {"role":"user", "content":"next"}
+    ]});
+    assert!(!ctx
+        .tokenizers
+        .encode_chat(MODEL, &request)
+        .unwrap()
+        .is_empty());
+    assert_forwarded_unchanged(&ctx, &mock, &request).await;
+
+    request["messages"][1]
+        .as_object_mut()
+        .unwrap()
+        .remove("reasoning_content");
+    assert_eq!(send(ctx, request).await, StatusCode::OK);
+    assert!(captured(&mock).get("input_ids").is_some());
+}
+
+/// Strict-template rewrites are used for routing only; the engine gets the original turns.
+#[tokio::test]
+async fn role_rewrites_preserve_messages_without_forwarding_ids() {
+    let template = concat!(
+        "{%- set ns = namespace(prev='') -%}",
+        "{%- for m in messages -%}",
+        "{%- if m.role == 'system' and not loop.first -%}",
+        "{{ raise_exception('System message must be first.') }}",
+        "{%- endif -%}",
+        "{%- if m.role == 'user' and ns.prev == 'user' -%}",
+        "{{ raise_exception('Conversation roles must alternate.') }}",
+        "{%- endif -%}",
+        "{{ m.role }}:{{ m.content }};",
+        "{%- set ns.prev = m.role -%}",
+        "{%- endfor -%}"
+    );
+    let (_dir, cfg) = template_config(json!({
+        "chat_template": template, "sp_model_kwargs": {"enable_sampling": false}
+    }));
+    let mock = MockWorker::start(vec![]).await;
+    let ctx = build_ctx_with_config(mock.url.clone(), cfg);
+    for roles in [
+        vec!["user", "user"],
+        vec!["system", "system", "user"],
+        vec!["user", "assistant", "system", "user"],
+    ] {
+        let messages: Vec<_> = roles
+            .iter()
+            .map(|role| json!({"role": role, "content": "text"}))
+            .collect();
+        let request = json!({"model": MODEL, "messages": messages});
+        assert!(!ctx
+            .tokenizers
+            .encode_chat(MODEL, &request)
+            .unwrap()
+            .is_empty());
+        assert_forwarded_unchanged(&ctx, &mock, &request).await;
+    }
+    let request = json!({"model": MODEL, "messages": [
+        {"role": "system", "content": "instructions"},
+        {"role": "user", "content": "hi"},
+        {"role": "assistant", "content": "hello"},
+        {"role": "user", "content": "next"}
+    ]});
+    assert_eq!(send(ctx, request).await, StatusCode::OK);
+    assert!(captured(&mock).get("input_ids").is_some());
+}
+
 #[path = "../fixtures/kimi_k3.rs"]
 mod kimi_fixture;
 
