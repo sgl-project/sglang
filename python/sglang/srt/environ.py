@@ -1550,6 +1550,13 @@ class Envs:
     # Run the DeepSeek-V4.1 ratio-1/2 prefill indexer on the torch path instead
     # of the DeepGEMM dense fp4 logits kernel (test oracle / fallback).
     SGLANG_DSV41_TORCH_PREFILL_INDEXER = EnvBool(False)
+    # Fused mapping for SM90 32-head, ratio-1/2 static target verification.
+    SGLANG_OPT_DSV41_SM90_GROUPED_INDEXER = EnvBool(False)
+    # Persistent prefix scoring and length-aware TopK; requires GROUPED_INDEXER.
+    # Equal-score cutoff ties can select different positions than PyTorch.
+    SGLANG_OPT_DSV41_SM90_LENGTH_AWARE_INDEXER = EnvBool(False)
+    # Compact candidate lists; requires the length-aware static-verify path.
+    SGLANG_OPT_DSV41_SM90_COMPACT_CANDIDATES = EnvBool(False)
     SGLANG_FP8_PAGED_MQA_LOGITS_TORCH = EnvBool(False)
     SGLANG_OPT_FLASHMLA_SPARSE_PREFILL = EnvBool(True)
 

@@ -190,7 +190,28 @@ class PrefillCandidateBlocks(CandidateMetadata, msgspec.Struct):
         )
 
 
+@dataclass
+class CandidateBlocks(CandidateMetadata):
+    """Sorted SM90 candidate block IDs; the device lengths refresh on replay.
+
+    Full masks are materialized only for fallback consumers. Do not cache them:
+    blocks may have been updated by graph replay since the last conversion.
+    """
+
+    blocks: torch.Tensor  # [rows, topk_blocks] int32, -1 pads invalid blocks
+    lengths: torch.Tensor  # [rows] int32, selected block capacity in positions
+    is_prefix: torch.Tensor  # [rows] int32, selected blocks are consecutive from 0
+    width: int  # original source mask width, in compressed positions
+    block_size: int
+
+
 def published_masks(candidate) -> CandidateMasks:
+    if isinstance(candidate, CandidateBlocks):
+        from sglang.kernels.ops.attention.dsv4.sm90_length_aware_indexer import (
+            materialize_candidate_mask,
+        )
+
+        return CandidateMasks(mask=materialize_candidate_mask(candidate))
     assert isinstance(candidate, CandidateMasks), "candidate masks missing"
     return candidate
 
