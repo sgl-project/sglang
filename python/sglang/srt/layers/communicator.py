@@ -2090,22 +2090,6 @@ def _all_reduce_then_to_local_tokens(
 class CommunicateSummableTensorPairFn:
     """It is allowed to make (hidden_states, residual) := (hidden_states + residual, None) if needed."""
 
-    @classmethod
-    def execute(
-        cls,
-        hidden_states_input_mode,
-        residual_input_mode,
-        output_mode,
-        context,
-        **kwargs,
-    ):
-        return cls.get_fn(
-            hidden_states_input_mode=hidden_states_input_mode,
-            residual_input_mode=residual_input_mode,
-            output_mode=output_mode,
-            context=context,
-        )(context=context, **kwargs)
-
     @staticmethod
     def get_fn(
         hidden_states_input_mode: ScatterMode,
