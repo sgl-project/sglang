@@ -22,6 +22,9 @@ from sglang.multimodal_gen.configs.pipeline_configs.qwen_image21 import (
 )
 from sglang.multimodal_gen.configs.sample.qwenimage21 import QwenImage21SamplingParams
 from sglang.multimodal_gen.registry import _get_config_info
+from sglang.multimodal_gen.runtime.entrypoints.openai.image_api import (
+    _resolve_image_output_format,
+)
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
     ResidencyState,
 )
@@ -281,6 +284,8 @@ def test_latent_pack_decode_contract():
 
 def test_default_image_output_format_preserves_rgba():
     assert QwenImage21SamplingParams.default_image_output_format() == "png"
+    assert _resolve_image_output_format(None, QwenImage21SamplingParams) == "png"
+    assert _resolve_image_output_format("webp", QwenImage21SamplingParams) == "webp"
 
 
 @pytest.mark.parametrize("outputs", [1, 2])
