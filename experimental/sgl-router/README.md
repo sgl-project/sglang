@@ -230,6 +230,24 @@ Detailed content-format parity coverage follows in #39133.
 The Dynamo crates are pinned exactly and `Cargo.lock` is committed; CI builds
 with `--locked`, so rendered bytes cannot change without a reviewed diff.
 
+Router tokenization sits on the TTFT path for every chat it renders. Two opt-in
+flags make it cheaper:
+
+- `--tokenizer-backend fast` encodes with fastokens (decoding stays on HF). It
+  needs a `tokenizer.json` and falls back to `hf` when fastokens cannot load it.
+- `--tokenizer-l1-cache-mb N` caches prefix tokenizations at special-token
+  boundaries, so a multi-turn chat encodes only the turns added since the
+  previous request. Boundaries are unconditional, non-normalized, non-stripping
+  special tokens with no overlapping added-token spellings. Unsafe candidates
+  are excluded; if none remain, encoding proceeds without the cache.
+
+On a ~69K-token DeepSeek-V4 chat, `hf` encodes in ~40 ms, `fast` in ~4 ms, and
+a new turn on a cached history in ~0.2 ms. The DeepSeek fixtures check every
+case under `hf`, `fast`, and `fast` with L1. Startup logs report the resolved
+backend and cache state. `/metrics` exposes only
+`sgl_router_tokenizer_l1_tokens_total{source="cached"|"encoded"}` to measure
+how much tokenization work the cache reuses.
+
 ## DeepSeek V4
 
 Native V4 rendering follows SGLang's serving path (`serving_chat.py`), not

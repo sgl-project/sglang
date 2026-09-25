@@ -15,7 +15,8 @@ use crate::config::{
     Config, DecodePolicyKind, DiscoveryBackend, EligibilityConfig, FilterKind, FusedTerm,
     InflightLoadConfig, K8sDiscoveryConfig, KvIndexerEndpointConfig, LogFormat, ModelConfig,
     ObservabilityConfig, PolicyKind, ProxyConfig, ServerConfig, SessionAffinityMode,
-    StaticUrlsDiscoveryConfig, StickyConfig, StickyFallbackKind, DEFAULT_FUSE,
+    StaticUrlsDiscoveryConfig, StickyConfig, StickyFallbackKind, TokenizerBackend, TokenizerConfig,
+    DEFAULT_FUSE,
 };
 
 const DEFAULT_KV_INDEXER_QUERY_TIMEOUT_MS: u64 = 100;
@@ -69,6 +70,17 @@ pub struct ModelArgs {
     /// Use for worker parser/template overrides or template stop strings.
     #[arg(long)]
     pub disable_input_ids_forwarding: bool,
+
+    /// Encode backend for router tokenization. fast uses fastokens for encoding and HF for
+    /// decoding, falling back to hf when fastokens cannot load the tokenizer.
+    #[arg(long, value_enum, default_value = "hf", value_name = "BACKEND")]
+    pub tokenizer_backend: TokenizerBackend,
+
+    /// L1 prefix-tokenization cache budget in MiB; 0 disables it. Reuses the tokens of a
+    /// previously encoded prompt up to its deepest shared special-token boundary, so a
+    /// multi-turn chat encodes only its new turns.
+    #[arg(long, default_value_t = 0, value_name = "MB")]
+    pub tokenizer_l1_cache_mb: usize,
 
     /// Same as SGLang's --default-chat-template-kwargs; must match the workers.
     #[arg(long, value_name = "JSON")]
@@ -414,6 +426,10 @@ impl Cli {
                     .unwrap_or_else(|| self.model.model_id.clone()),
                 id: self.model.model_id,
                 disable_input_ids_forwarding: self.model.disable_input_ids_forwarding,
+                tokenizer: TokenizerConfig {
+                    backend: self.model.tokenizer_backend,
+                    l1_cache_mb: self.model.tokenizer_l1_cache_mb,
+                },
                 policy: self.routing.policy,
                 decode_policy: self.routing.decode_policy,
                 bucket_config,
@@ -2420,6 +2436,29 @@ mod tests {
         ]))
         .unwrap();
         assert!(disabled.model.disable_input_ids_forwarding);
+    }
+
+    #[test]
+    fn tokenizer_backend_and_l1_cache_are_plumbed() {
+        let defaults = into_config_owned(with_model(&["--worker-urls", "http://x:30000"])).unwrap();
+        assert_eq!(defaults.model.tokenizer, TokenizerConfig::default());
+        assert_eq!(defaults.model.tokenizer.backend, TokenizerBackend::Hf);
+        let fast = into_config_owned(with_model(&[
+            "--worker-urls",
+            "http://x:30000",
+            "--tokenizer-backend",
+            "fast",
+            "--tokenizer-l1-cache-mb",
+            "4096",
+        ]))
+        .unwrap();
+        assert_eq!(
+            fast.model.tokenizer,
+            TokenizerConfig {
+                backend: TokenizerBackend::Fast,
+                l1_cache_mb: 4096,
+            }
+        );
     }
 
     #[test]

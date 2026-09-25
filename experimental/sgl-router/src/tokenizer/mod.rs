@@ -5,6 +5,7 @@ pub mod adapter;
 pub mod chat_formatter;
 mod deepseek;
 mod kimi;
+pub mod stats;
 
 use anyhow::Result;
 use chat_formatter::ChatFormatter;
@@ -61,6 +62,8 @@ pub struct TokenizerRegistry {
     /// Per-model chat formatter, present only when the model's prompt format is
     /// known; models without one fall back to raw prompt-text tokenization.
     formatters: DashMap<String, Arc<ChatFormatterEntry>>,
+    /// Resolved encode backend and L1 cache counters of the served model's tokenizer.
+    stats: Arc<stats::TokenizerStats>,
 }
 
 impl std::fmt::Debug for TokenizerRegistry {
@@ -73,10 +76,14 @@ impl std::fmt::Debug for TokenizerRegistry {
 
 impl TokenizerRegistry {
     pub fn load_from_config(cfg: &crate::config::Config) -> Result<Self> {
-        let me = TokenizerRegistry::default();
+        let mut me = TokenizerRegistry::default();
         let m = &cfg.model;
-        let t = adapter::load(&m.tokenizer_path)?;
+        let (t, stats) = adapter::load_with(&m.tokenizer_path, m.tokenizer)?;
+        tracing::info!(model = %m.id, backend = stats.backend().as_str(),
+            l1 = stats.l1_state().as_str(), l1_cache_mb = m.tokenizer.l1_cache_mb,
+            "tokenizer loaded");
         me.inner.insert(m.id.clone(), t);
+        me.stats = stats;
         match ChatFormatter::load(&m.id, &m.tokenizer_path) {
             Ok(Some(formatter)) => {
                 let formatter = formatter.with_defaults(&m.default_chat_template_kwargs);
@@ -115,6 +122,10 @@ impl TokenizerRegistry {
             }
         }
         Ok(me)
+    }
+
+    pub fn stats(&self) -> &stats::TokenizerStats {
+        &self.stats
     }
 
     pub fn get(&self, model_id: &str) -> Option<Arc<Tokenizer>> {
@@ -201,6 +212,7 @@ mod tests {
                 id: "tiny".into(),
                 tokenizer_path: "tests/fixtures/tiny_tokenizer.json".into(),
                 disable_input_ids_forwarding: false,
+                tokenizer: Default::default(),
                 policy: PolicyKind::RoundRobin,
                 decode_policy: Default::default(),
                 bucket_config: None,

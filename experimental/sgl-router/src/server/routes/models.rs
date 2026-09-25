@@ -51,6 +51,7 @@ mod tests {
             id: "qwen3".into(),
             tokenizer_path: "x".into(),
             disable_input_ids_forwarding: false,
+            tokenizer: Default::default(),
             policy: PolicyKind::RoundRobin,
             decode_policy: Default::default(),
             bucket_config: None,

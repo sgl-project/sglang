@@ -44,6 +44,9 @@
 //! | `sgl_router_ingress_tokenize_errors_total` | Counter | `model_id` |
 //! | `sgl_router_input_ids_forwarding_total` | Counter | `model_id`, `outcome` |
 //! | `sgl_router_sampling_contract_rejections_total` | Counter | `param` |
+//! | `sgl_router_tokenizer_l1_tokens_total` | Counter | `source` |
+//!
+//! The tokenizer series are rendered by [`crate::tokenizer::stats::TokenizerStats`].
 //!
 //! `sgl_router_cache_aware_decisions_total` records exactly one decision per
 //! cache-aware prefill selection that resolves a worker, so the labels sum to
