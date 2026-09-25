@@ -427,7 +427,9 @@ class NemotronHMLPLikeDecoderLayer(nn.Module):
         ):
             hidden_states = self.mixer.forward(hidden_states)
         if fuse_mlp_allreduce:
-            hidden_states = UnreducedOutput(hidden_states)
+            hidden_states = UnreducedOutput(
+                hidden_states, group=self.layer_communicator.ffn_reduction_group()
+            )
         else:
             hidden_states, residual = self.layer_communicator.postprocess_layer(
                 hidden_states, residual, forward_batch
@@ -531,7 +533,9 @@ class NemotronHAttnLikeDecoderLayer(nn.Module):
                 hidden_states, forward_batch, skip_reduce
             )
         if fuse_mlp_allreduce:
-            hidden_states = UnreducedOutput(hidden_states)
+            hidden_states = UnreducedOutput(
+                hidden_states, group=get_parallel().tp_group
+            )
         return hidden_states, residual
 
 

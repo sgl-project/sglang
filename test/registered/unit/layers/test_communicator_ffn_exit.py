@@ -9,7 +9,6 @@ import torch
 import sglang
 from sglang.srt.layers import communicator as comm
 from sglang.srt.layers.communicator import (
-    CommunicateSummableTensorPairFn,
     LayerCommunicator,
     UnreducedOutput,
     reduce_output,
@@ -21,12 +20,18 @@ from sglang.test.test_utils import CustomTestCase
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
+def make_group(scale=3):
+    """The group a deferred sum is owed over, with a stubbed all-reduce."""
+    return types.SimpleNamespace(all_reduce=MagicMock(side_effect=lambda h: h * scale))
+
+
 def make_communicator(
     *,
     fuse,
     reduce_scatter,
-    next_layer_reduce_scatter=None,
-    next_layer_scatter=None,
+    reduce_scatter_step=None,
+    scatters_to_local_tokens=False,
+    group=None,
     cls=LayerCommunicator,
 ):
     """A communicator whose decisions and postprocess are stubbed, built
@@ -35,10 +40,11 @@ def make_communicator(
     if cls is LayerCommunicator:
         communicator.should_defer_ffn_reduction = MagicMock(return_value=fuse)
     communicator.should_use_reduce_scatter = MagicMock(return_value=reduce_scatter)
-    communicator._reduce_scatter_for_next_layer = MagicMock(
-        return_value=next_layer_reduce_scatter
-    )
-    communicator._scatter_for_next_layer = MagicMock(return_value=next_layer_scatter)
+    communicator.is_last_layer = False
+    communicator._sp_variant = None
+    communicator._postprocess_scatters_to_local_tokens = scatters_to_local_tokens
+    communicator._reduce_scatter_step = MagicMock(return_value=reduce_scatter_step)
+    communicator.ffn_reduction_group = MagicMock(return_value=group or make_group())
     communicator.postprocess_layer = MagicMock(
         side_effect=lambda hidden_states, residual, forward_batch: (
             hidden_states + 1,
@@ -73,31 +79,46 @@ class TestFfnExit(CustomTestCase):
         self.assertIs(residual, self.residual)
         communicator.postprocess_layer.assert_not_called()
 
+    def test_reduction_left_to_next_layer_declares_its_group(self):
+        group = make_group()
+        communicator = make_communicator(fuse=True, reduce_scatter=False, group=group)
+        _, (hidden_states, _) = self.run_exit(communicator)
+        self.assertIs(hidden_states.group, group)
+        self.assertIsNone(hidden_states.reduce_and_redistribute)
+
     def test_a_reduce_scatter_is_left_to_the_next_layer(self):
         """Under attention DP the reduce-scatter postprocess would run goes to the
         next layer with the partial sum."""
         step = MagicMock()
         communicator = make_communicator(
-            fuse=False, reduce_scatter=True, next_layer_reduce_scatter=step
+            fuse=False,
+            reduce_scatter=True,
+            reduce_scatter_step=step,
+            scatters_to_local_tokens=True,
         )
         seen, (hidden_states, residual) = self.run_exit(communicator)
         self.assertEqual(seen, (False, True))
         self.assertIsInstance(hidden_states, UnreducedOutput)
-        self.assertIs(hidden_states.reduce_and_redistribute, step)
+        bound = hidden_states.reduce_and_redistribute
+        self.assertIs(bound.func, comm._to_local_tokens)
+        self.assertEqual(bound.args, (step, self.forward_batch))
         self.assertIs(residual, self.residual)
         communicator.postprocess_layer.assert_not_called()
         step.assert_not_called()
 
     def test_a_deferred_sum_carries_the_scatter_back_under_attention_dp(self):
-        step = MagicMock()
+        group = make_group()
         communicator = make_communicator(
-            fuse=True, reduce_scatter=False, next_layer_scatter=step
+            fuse=True, reduce_scatter=False, scatters_to_local_tokens=True, group=group
         )
         _, (hidden_states, _) = self.run_exit(communicator)
         self.assertIsInstance(hidden_states, UnreducedOutput)
-        self.assertIs(hidden_states.reduce_and_redistribute, step)
-        communicator._reduce_scatter_for_next_layer.assert_not_called()
+        bound = hidden_states.reduce_and_redistribute
+        self.assertIs(bound.func, comm._all_reduce_then_to_local_tokens)
+        self.assertEqual(bound.args, (group, self.forward_batch))
+        communicator._reduce_scatter_step.assert_not_called()
         communicator.postprocess_layer.assert_not_called()
+        group.all_reduce.assert_not_called()
 
     def test_postprocess_completes_other_exits(self):
         for reduce_scatter in (False, True):
@@ -174,16 +195,14 @@ class TestFfnExit(CustomTestCase):
 
 class TestReduceOutput(CustomTestCase):
     def setUp(self):
-        self.all_reduce = MagicMock(side_effect=lambda hidden_states: hidden_states * 3)
-        patcher = patch(
-            "sglang.srt.layers.communicator.deferred_post_experts_all_reduce",
-            self.all_reduce,
-        )
-        patcher.start()
-        self.addCleanup(patcher.stop)
+        self.group = make_group()
+        self.all_reduce = self.group.all_reduce
+
+    def communicator(self, *, fuse):
+        return make_communicator(fuse=fuse, reduce_scatter=False, group=self.group)
 
     def test_reduction_left_by_the_last_layer_runs_once(self):
-        communicator = make_communicator(fuse=True, reduce_scatter=False)
+        communicator = self.communicator(fuse=True)
         with communicator.ffn_exit(object()) as ffn_exit:
             hidden_states = torch.ones(3, 4)
         hidden_states, _ = ffn_exit.finish(hidden_states, torch.zeros(3, 4))
@@ -208,7 +227,7 @@ class TestReduceOutput(CustomTestCase):
         self.all_reduce.assert_not_called()
 
     def test_complete_hidden_states_pass_through(self):
-        communicator = make_communicator(fuse=False, reduce_scatter=False)
+        communicator = self.communicator(fuse=False)
         with communicator.ffn_exit(object()) as ffn_exit:
             hidden_states = torch.ones(3, 4)
         hidden_states, _ = ffn_exit.finish(hidden_states, torch.zeros(3, 4))
@@ -221,7 +240,7 @@ class TestReduceOutput(CustomTestCase):
         for fuse in (True, False):
             with self.subTest(fuse=fuse):
                 self.all_reduce.reset_mock()
-                communicator = make_communicator(fuse=fuse, reduce_scatter=False)
+                communicator = self.communicator(fuse=fuse)
                 residual = torch.zeros(3, 4)
                 with communicator.ffn_exit(object()) as ffn_exit:
                     hidden_states = torch.ones(3, 4)
@@ -236,87 +255,82 @@ class TestReduceOutput(CustomTestCase):
                 self.assertIs(residual_out, residual)
 
 
-class TestReduceScatterForNextLayer(CustomTestCase):
-    """Which reduce-scatter the next layer runs in place of postprocess."""
+class TestSelectFfnCompletion(CustomTestCase):
+    """What the next layer's input runs in place of postprocess, chosen before
+    the FFN runs."""
 
-    def communicator(self, *, is_last_layer=False, pair_fn=None, sp_variant=None):
+    def communicator(
+        self, *, fuse=False, is_last_layer=False, scatters=True, sp_variant=None
+    ):
         communicator = LayerCommunicator.__new__(LayerCommunicator)
         communicator.is_last_layer = is_last_layer
         communicator._sp_variant = sp_variant
-        communicator._communicate_summable_tensor_pair_fn = (
-            pair_fn or CommunicateSummableTensorPairFn._scatter_hidden_states
-        )
+        communicator._postprocess_scatters_to_local_tokens = scatters
         communicator.allow_reduce_scatter = True
         communicator.layer_scatter_modes = types.SimpleNamespace(is_layer_sparse=True)
+        communicator.should_defer_ffn_reduction = lambda forward_batch: fuse
+        communicator.should_use_reduce_scatter = lambda forward_batch: not fuse
+        self.group = make_group()
+        communicator.ffn_reduction_group = lambda: self.group
         return communicator
 
-    def bound(self, communicator, step):
-        with patch.object(comm, "_output_to_local_tokens_step", return_value=step):
-            return communicator._reduce_scatter_for_next_layer(object())
+    def left(self, communicator, step, forward_batch=None):
+        with patch.object(
+            comm, "_reduce_and_redistribute_output_step", return_value=step
+        ):
+            completion = communicator._select_ffn_completion(forward_batch)
+        if completion.leave is None:
+            return None
+        return completion.leave(torch.ones(3, 4))
 
     def test_a_reduce_scatter_is_bound_for_the_next_layer(self):
+        forward_batch = object()
         for step in (
             comm._reduce_and_redistribute_output_varlen,
             comm._reduce_and_redistribute_output_max_len,
         ):
             with self.subTest(step=step.__name__):
-                bound = self.bound(self.communicator(), step)
+                left = self.left(self.communicator(), step, forward_batch)
+                bound = left.reduce_and_redistribute
                 self.assertIs(bound.func, comm._to_local_tokens)
-                self.assertIs(bound.args[0], step)
+                self.assertEqual(bound.args, (step, forward_batch))
 
     def test_postprocess_keeps_everything_else(self):
         reduce_scatter = comm._reduce_and_redistribute_output_varlen
         for name, communicator, step in (
-            ("scatter only", self.communicator(), comm._redistribute_output),
+            ("scatter only", self.communicator(), None),
             ("last layer", self.communicator(is_last_layer=True), reduce_scatter),
-            (
-                "other layout change",
-                self.communicator(
-                    pair_fn=CommunicateSummableTensorPairFn._scatter_hidden_states_moe
-                ),
-                reduce_scatter,
-            ),
+            ("other postprocess", self.communicator(scatters=False), reduce_scatter),
         ):
             with self.subTest(name):
-                self.assertIsNone(self.bound(communicator, step))
+                self.assertIsNone(self.left(communicator, step))
 
     def test_postprocess_keeps_an_active_layernorm_sp_region(self):
         communicator = self.communicator(sp_variant=object())
         with get_forward().scoped(sp_active=True):
             self.assertIsNone(
-                self.bound(communicator, comm._reduce_and_redistribute_output_varlen)
+                self.left(communicator, comm._reduce_and_redistribute_output_varlen)
             )
 
-
-class TestScatterForNextLayer(CustomTestCase):
-    def communicator(self, pair_fn):
-        communicator = LayerCommunicator.__new__(LayerCommunicator)
-        communicator._communicate_summable_tensor_pair_fn = pair_fn
-        return communicator
-
-    def test_only_a_scatter_back_to_local_tokens_is_carried(self):
+    def test_a_deferred_sum_keeps_its_layout_or_scatters_back(self):
         forward_batch = object()
-        bound = self.communicator(
-            CommunicateSummableTensorPairFn._scatter_hidden_states
-        )._scatter_for_next_layer(forward_batch)
+        kept = self.left(self.communicator(fuse=True, scatters=False), None)
+        self.assertIs(kept.group, self.group)
+        self.assertIsNone(kept.reduce_and_redistribute)
+        moved = self.left(self.communicator(fuse=True), None, forward_batch)
+        self.assertIsNone(moved.group)
+        bound = moved.reduce_and_redistribute
         self.assertIs(bound.func, comm._all_reduce_then_to_local_tokens)
-        self.assertIs(bound.args[0], forward_batch)
-        self.assertIsNone(
-            self.communicator(
-                CommunicateSummableTensorPairFn._trivial
-            )._scatter_for_next_layer(forward_batch)
-        )
+        self.assertEqual(bound.args, (self.group, forward_batch))
 
     def test_the_all_reduce_runs_before_the_scatter(self):
         calls = []
         partial = torch.ones(3, 4)
         local = torch.empty(1, 4)
+        group = types.SimpleNamespace(
+            all_reduce=lambda x: calls.append(("all_reduce", x)) or x * 2
+        )
         with (
-            patch.object(
-                comm,
-                "deferred_post_experts_all_reduce",
-                side_effect=lambda x: calls.append(("all_reduce", x)) or x * 2,
-            ),
             patch.object(comm, "_dp_scatter_group", return_value="group"),
             patch.object(
                 comm,
@@ -329,7 +343,7 @@ class TestScatterForNextLayer(CustomTestCase):
                 side_effect=lambda out, full, fb: calls.append(("scatter", out)),
             ),
         ):
-            result = comm._all_reduce_then_to_local_tokens(object(), partial)
+            result = comm._all_reduce_then_to_local_tokens(group, object(), partial)
         self.assertEqual([c[0] for c in calls], ["all_reduce", "buffer", "scatter"])
         self.assertIs(calls[0][1], partial)
         self.assertIs(result, local)

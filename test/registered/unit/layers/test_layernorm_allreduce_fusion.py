@@ -3,6 +3,7 @@ batch, forward_with_allreduce_fusion still completes the sum, over the group the
 kernel reduces over."""
 
 import contextlib
+import types
 import unittest
 from unittest.mock import patch
 
@@ -11,6 +12,7 @@ import torch
 from sglang.srt.distributed import communication_op
 from sglang.srt.layers import flashinfer_comm_fusion, layernorm
 from sglang.srt.layers.layernorm import RMSNorm
+from sglang.srt.layers.moe import utils as moe_utils
 from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -55,6 +57,21 @@ def declined_fused_kernel(reduced, *, moe_ep_size, moe_tp_size):
                     communication_op, getter, return_value=Group(name, reduced)
                 )
             )
+        # The MoE output's group is read from the parallel state directly.
+        stack.enter_context(
+            patch.object(
+                moe_utils,
+                "get_parallel",
+                return_value=types.SimpleNamespace(
+                    moe_ep_size=moe_ep_size,
+                    moe_tp_size=moe_tp_size,
+                    moe_dp_size=1,
+                    tp_group=Group("tp", reduced),
+                    moe_ep_group=Group("moe_ep", reduced),
+                    moe_tp_group=Group("moe_tp", reduced),
+                ),
+            )
+        )
         stack.enter_context(patch.object(layernorm, "_use_aiter", False))
         stack.enter_context(
             patch.object(
