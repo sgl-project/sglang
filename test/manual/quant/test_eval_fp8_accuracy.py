@@ -86,7 +86,6 @@ class TestEvalFP8DynamicQuantAccuracy(CustomTestCase):
             model=DEFAULT_MODEL_NAME_FOR_DYNAMIC_QUANT_ACCURACY_TEST_FP8,
             other_args=["--quantization", "w8a8_fp8"],
             # inference will use sgl kernel w/ online quant override
-            # we observed that the accuracy is higher then offline only
             expected_score=0.64,
         )
 
@@ -95,7 +94,6 @@ class TestEvalFP8DynamicQuantAccuracy(CustomTestCase):
         self._run_test(
             model=DEFAULT_MODEL_NAME_FOR_TEST,
             # inference will use sgl kernel w/ online quantization only
-            # we observed that the accuracy is higher then offline only
             other_args=["--quantization", "w8a8_fp8"],
             expected_score=0.64,
         )

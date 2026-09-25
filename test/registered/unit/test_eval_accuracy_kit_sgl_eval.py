@@ -1,16 +1,7 @@
 """Unit tests for sgl-eval-backed accuracy mixin dispatch.
 
-Hermetic (no server, no real sgl-eval install). These guard the behavior that
-existing consumers rely on -- not the sgl-eval happy path, which the live
-accuracy runs already cover:
-
-  1. The default GSM8K backend stays on ``run_eval`` (OpenAI completion API);
-     the ~47 existing GSM8K consumers must never be silently rerouted.
-  2. The legacy ``gsm8k_accuracy_thres`` alias is still honored as the pass/fail
-     gate when the canonical ``gsm8k_score_threshold`` is unset.
-  3. MMMU-Pro delegates model and sampling selection to a built-in model preset.
-  4. The sgl-eval reasoning path skips (does not error) when sgl-eval is absent,
-     so CI without the optional dependency stays green.
+Hermetic (no server, no real sgl-eval install). These guard the dispatch that
+existing consumers rely on, not the sgl-eval happy path the live runs cover.
 """
 
 import sys
@@ -38,19 +29,15 @@ def _fake_get(url, *args, **kwargs):
 def _make_host(mixin, method):
     """Build a throwaway mixin host bound to ``method``.
 
-    Created dynamically (never bound at module scope) so it is collected by
-    neither runner: CI executes this file via ``python3 <file>`` ->
-    ``unittest.main()``, whose loader ignores pytest's ``__test__`` flag, and
-    pytest only collects module-level ``Test*`` classes. The host runs only when
-    a test below instantiates and drives it directly.
+    Created dynamically so neither runner collects it: ``unittest.main()`` ignores
+    pytest's ``__test__`` flag, and pytest only collects module-level ``Test*``.
     """
     return type(f"_{mixin.__name__}Host", (mixin, CustomTestCase), {})(method)
 
 
 class TestEvalKitBackendDispatch(CustomTestCase):
     def _run_gsm8k_default(self, score, **attrs):
-        """Run GSM8K on the default (run_eval) backend with run_eval faked to
-        return ``score``; returns the SimpleNamespace args run_eval received."""
+        """Run GSM8K on the default backend; returns the args run_eval received."""
         captured = {}
 
         def fake_run_eval(args):
@@ -70,22 +57,18 @@ class TestEvalKitBackendDispatch(CustomTestCase):
         return captured["args"]
 
     def test_default_backend_uses_run_eval_completion(self):
-        # The default path that all existing GSM8K consumers rely on must stay on
-        # run_eval's OpenAI completion API -- it must not touch sgl-eval.
         args = self._run_gsm8k_default(0.95, gsm8k_accuracy_thres=0.5)
         self.assertEqual(args.eval_name, "gsm8k")
         self.assertEqual(args.api, "completion")
 
     def test_legacy_accuracy_thres_alias_gates_score(self):
-        # Canonical gsm8k_score_threshold left unset (NaN) -> the legacy
-        # gsm8k_accuracy_thres must still be the pass/fail gate.
+        # Canonical gsm8k_score_threshold left unset (NaN).
         self._run_gsm8k_default(0.95, gsm8k_accuracy_thres=0.90)  # above -> passes
         with self.assertRaises(AssertionError):
             self._run_gsm8k_default(0.80, gsm8k_accuracy_thres=0.90)  # below -> fails
 
     def test_sgl_eval_path_skips_when_not_installed(self):
-        # GPQA/AIME25 and the sgl_eval backend must skip -- not error -- when
-        # sgl-eval is not installed. None in sys.modules makes the import raise.
+        # None in sys.modules makes ``import sgl_eval`` raise ImportError.
         host = _make_host(GPQAMixin, "test_gpqa")
         host.base_url = "http://127.0.0.1:0"
         host.model = "m"

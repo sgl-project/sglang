@@ -123,8 +123,6 @@ class TestStaticEPLB(CustomTestCase):
                 tp_size=2,
                 dp_size=2,
                 log_level="info",
-                # TODO pr-chain: enable later
-                # enable_expert_distribution_metrics=True,
             )
             engine_kwargs.update(get_a2a_backend_kwargs())
 

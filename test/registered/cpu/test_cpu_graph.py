@@ -1,8 +1,3 @@
-"""
-Usage:
-python3 -m unittest test_cpu_graph.TestCPUGraph.test_mmlu_torch_compile_cpu
-"""
-
 import copy
 import os
 import unittest

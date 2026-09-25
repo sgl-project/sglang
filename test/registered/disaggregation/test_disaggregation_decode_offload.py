@@ -15,8 +15,7 @@ from sglang.test.test_utils import (
     terminate_and_kill_process_tree,
 )
 
-# Registering the test for CUDA CI with appropriate parameters
-# Increasing estimated time since we run evaluation twice
+# est_time covers two eval rounds.
 register_cuda_ci(
     est_time=600,
     stage="base-b",
@@ -25,10 +24,7 @@ register_cuda_ci(
 
 
 class TestDisaggregationDecodeOffload(PDDisaggregationServerBase):
-    """
-    Test class for verifying KV cache offloading on the decode side in a
-    prefill-decode disaggregation setup.
-    """
+    """Decode-side KV cache offloading in a PD disaggregation setup."""
 
     @classmethod
     def setUpClass(cls):
@@ -128,13 +124,8 @@ class TestDisaggregationDecodeOffload(PDDisaggregationServerBase):
         )
 
     def test_mmlu_double_eval(self):
-        """
-        Run two rounds of MMLU evaluation:
-        1. First round: Decode node offloads KV cache back to disk (HiCache).
-        2. Restart All Nodes to clear memory cache.
-        3. Second round: Prefill node loads KV cache from disk (HiCache).
-        Verify that both rounds produce consistent scores.
-        """
+        """Round 1 offloads decode KV to HiCache disk; after restarting all nodes,
+        round 2 loads it on prefill. Both rounds must score consistently."""
         args = SimpleNamespace(
             base_url=f"http://{self.base_host}:{self.lb_port}",
             model=self.model,

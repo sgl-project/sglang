@@ -1,8 +1,3 @@
-"""
-Usage:
-python3 -m unittest test_autoround_quantization
-"""
-
 import os
 import shutil
 import tempfile

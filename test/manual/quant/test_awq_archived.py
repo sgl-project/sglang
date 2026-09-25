@@ -1,9 +1,4 @@
-"""Archived test classes split out of test/registered/quant/test_awq.py.
-
-Originally registered with `register_cuda_ci(...)`. Moved here as part of
-the per-commit pruning effort to keep the code reachable manually.
-Run with `python3 test/manual/quant/test_awq_archived.py`.
-"""
+"""Archived test classes split out of test/registered/quant/test_awq.py; not in CI."""
 
 import unittest
 from types import SimpleNamespace
@@ -21,10 +16,6 @@ from sglang.test.test_utils import (
 
 @unittest.skipIf(is_in_amd_ci(), "AWQ Marlin is not supported on AMD GPUs")
 class TestAWQMarlinFloat16(CustomTestCase):
-    """
-    Verify that the model can be loaded with float16 dtype and awq_marlin quantization
-    """
-
     @classmethod
     def setUpClass(cls):
         cls.model = "QuantTrio/Qwen3-VL-30B-A3B-Instruct-AWQ"

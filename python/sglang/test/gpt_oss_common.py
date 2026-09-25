@@ -66,8 +66,7 @@ class BaseTestGptOss(CustomTestCase):
         try:
             self._check_streaming_responses_api_request(model)
 
-            # run multiple tests in parallel since we are mostly bound by the longest generate sequence
-            # instead of the number of questions
+            # Parallel: bound by the longest generation, not the question count.
             with ThreadPoolExecutor(max_workers=4) as executor:
                 list(
                     executor.map(
@@ -131,8 +130,7 @@ class BaseTestGptOss(CustomTestCase):
             num_threads=198,
             # sgl-eval's gpqa defaults to n_repeats=8.
             repeat=1,
-            # TODO 4k is still not enough, we need e.g. 64k token, but that is super slow
-            # otherwise a lot of questions are not answered
+            # Too small (many answers truncate); ~64k would fit but is too slow.
             max_tokens=4096,
             # Arbitrary; non-zero so a tier is not scored on one greedy path.
             temperature=0.1,

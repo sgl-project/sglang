@@ -1,8 +1,3 @@
-"""
-Usage:
-python3 -m unittest test_torch_native_attention_backend.TestTorchNativeAttnBackend.test_mmlu
-"""
-
 import unittest
 from types import SimpleNamespace
 

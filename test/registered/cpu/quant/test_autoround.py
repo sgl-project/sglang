@@ -1,12 +1,5 @@
-"""
-Usage:
-SGLANG_USE_CPU_ENGINE=1 python3 -m unittest test_autoround
-
-CPU accuracy test for AutoRound INT4 checkpoints. Covers both AutoRound packing
-formats (auto_round:auto_gptq / auto_round:auto_awq) by launching a server and
-running an MMLU eval. AutoRound INT4 CPU inference uses the Intel AMX backend,
-so the test is skipped on AMD CPUs and other non-AMX CPU hosts.
-"""
+"""CPU accuracy test for AutoRound INT4 checkpoints in both packing formats
+(auto_round:auto_gptq / auto_round:auto_awq)."""
 
 import os
 import unittest

@@ -1,8 +1,3 @@
-"""
-Usage:
-python3 -m unittest test_intel_amx_attention_backend.TestIntelAMXAttnBackend.test_latency_default_model
-"""
-
 import unittest
 from types import SimpleNamespace
 

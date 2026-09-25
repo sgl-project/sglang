@@ -1,8 +1,3 @@
-"""
-Usage:
-python3 -m unittest test_autoround.TestAutoRound.test_mmlu
-"""
-
 import unittest
 from types import SimpleNamespace
 

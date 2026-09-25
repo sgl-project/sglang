@@ -1,8 +1,3 @@
-"""
-Usage:
-python -m unittest test_moe_deepep_eval_accuracy_large.TestMoEDeepEPEvalAccuracyLarge.test_mmlu
-"""
-
 import unittest
 from types import SimpleNamespace
 

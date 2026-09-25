@@ -48,10 +48,6 @@ class TestAWQ(CustomTestCase):
 
 @unittest.skipIf(is_in_amd_ci(), "AWQ Marlin is not supported on AMD GPUs")
 class TestAWQMarlinBfloat16(CustomTestCase):
-    """
-    Verify that the model can be loaded with bfloat16 dtype and awq_marlin quantization
-    """
-
     @classmethod
     def setUpClass(cls):
         cls.model = "QuantTrio/Qwen3-VL-30B-A3B-Instruct-AWQ"

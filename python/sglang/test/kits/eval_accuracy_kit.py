@@ -52,14 +52,8 @@ def _run_accuracy_eval(
 ):
     """Shared driver for the accuracy mixins below.
 
-    Runs ``eval_name`` against the test class's server (``base_url`` /
-    ``model``) through ``run_sgl_eval`` for sgl-eval benchmarks and ``run_eval``
-    otherwise, records a CI step summary, asserts the score meets
-    ``score_threshold``, and checks the speculative accept length.
-
-    ``eval_overrides`` (e.g. ``api``, ``max_tokens``, ``temperature``,
-    ``top_p``, ``num_shots``) are forwarded only when not ``None``, so the
-    common case keeps the evaluator's defaults. Returns the metrics dict.
+    ``eval_overrides`` are forwarded only when not ``None``, so unset knobs keep
+    the evaluator's defaults.
     """
     assert score_threshold == score_threshold, (
         f"{type(test_case).__name__} must set the {eval_name} score threshold"
@@ -109,12 +103,8 @@ def _run_sgl_eval(
 ):
     """Shared sgl-eval driver for the reasoning mixins and the ``sgl_eval`` backend.
 
-    Runs ``eval_name`` through ``run_sgl_eval`` against the test class's server,
-    records a CI step summary, asserts ``metric`` meets ``score_threshold``, and
-    checks the speculative accept length. ``thinking=True`` sends per-request
-    ``chat_template_kwargs={"thinking": True}`` so the server separates reasoning
-    from the final answer. Skips the test if sgl-eval is not installed. Returns
-    the metrics dict.
+    ``thinking=True`` sends per-request ``chat_template_kwargs={"thinking": True}``
+    so the server separates reasoning from the final answer.
     """
     assert score_threshold == score_threshold, (
         f"{type(test_case).__name__} must set the {eval_name} score threshold"
@@ -180,18 +170,9 @@ class MMLUSanityMixin:
 class GSM8KMixin:
     """Mixin for GSM8K evaluation.
 
-    Backend is selectable via ``gsm8k_backend`` (default ``"run_eval"``: OpenAI
-    completion API, 5-shot; or ``"sgl_eval"``: sgl-eval chat + boxed/sympy grader,
-    skipped if sgl-eval is not installed). The canonical threshold/count knobs are
-    ``gsm8k_score_threshold`` / ``gsm8k_num_examples``; the legacy
-    ``gsm8k_accuracy_thres`` / ``gsm8k_num_questions`` are still honored.
-
-    Required attributes on the test class:
-        base_url: str
-        gsm8k_score_threshold: float
-
-    Optional attributes:
-        model: str (if not set, auto-detected from server)
+    ``"run_eval"`` backend: OpenAI completion API, 5-shot; ``"sgl_eval"``: sgl-eval
+    chat + boxed/sympy grader. The legacy ``gsm8k_accuracy_thres`` /
+    ``gsm8k_num_questions`` are honored when the canonical knobs are unset.
     """
 
     gsm8k_score_threshold: float = _THRESHOLD_NOT_SET
@@ -254,11 +235,6 @@ class MMLUMixin:
     Both ``mmlu_backend`` values score through ``run_sgl_eval``; ``"run_eval"``
     keeps the 2048-token cap and no thinking, ``"sgl_eval"`` uses the reasoning
     driver's knobs (``mmlu_thinking``, ``mmlu_n_repeats``, uncapped tokens).
-
-    Required attributes on the test class:
-        base_url: str
-        model: str
-        mmlu_score_threshold: float
     """
 
     mmlu_score_threshold: float = _THRESHOLD_NOT_SET
@@ -295,14 +271,8 @@ class MMLUMixin:
 class MMMUProMixin:
     """Mixin for the standard 10-option MMMU-Pro evaluation via sgl-eval.
 
-    The model preset supplies the endpoint model and all generation settings.
-    Leaving those values to sgl-eval is important for reasoning models whose
-    recommended token budget and sampling settings differ from run_eval defaults.
-
-    Required attributes on the test class:
-        base_url: str
-        mmmu_pro_score_threshold: float
-        mmmu_pro_load_preset_from_model_id: str
+    The model preset supplies the endpoint model and all generation settings;
+    reasoning models' token budget and sampling differ from run_eval defaults.
     """
 
     mmmu_pro_score_threshold: float = _THRESHOLD_NOT_SET
@@ -328,23 +298,11 @@ class MMMUProMixin:
 
 
 class GPQAMixin:
-    """Mixin for GPQA-Diamond evaluation (graduate-level multiple choice).
+    """Mixin for GPQA-Diamond evaluation via sgl-eval (198 questions).
 
-    Runs via the sgl-eval Python API (the test is skipped if sgl-eval is not
-    installed). ``gpqa_thinking`` defaults to True, which
-    enables per-request thinking so the server separates reasoning from the final
-    answer.
-
-    Required attributes on the test class:
-        base_url: str
-        model: str
-        gpqa_score_threshold: float
-
-    Optional sampling knobs (default to sgl-eval's defaults when unset). Set these
-    for reasoning models -- e.g. DeepSeek-V4 Think-Max wants
-    gpqa_reasoning_effort="max", gpqa_max_tokens=200000, gpqa_temperature=1.0,
-    gpqa_top_p=1.0. GPQA-Diamond is 198 questions; raise gpqa_n_repeats (e.g. 16)
-    for a stable number.
+    Unset sampling knobs keep sgl-eval's defaults; DeepSeek-V4 Think-Max wants
+    reasoning_effort="max", max_tokens=200000, temperature=1.0, top_p=1.0.
+    Raise gpqa_n_repeats (e.g. 16) for a stable number.
     """
 
     gpqa_score_threshold: float = _THRESHOLD_NOT_SET
@@ -376,23 +334,11 @@ class GPQAMixin:
 
 
 class AIME25Mixin:
-    """Mixin for AIME 2025 evaluation (competition math, integer answers).
+    """Mixin for AIME 2025 evaluation via sgl-eval (30 problems, high variance).
 
-    Runs via the sgl-eval Python API (the test is skipped if sgl-eval is not
-    installed). ``aime25_thinking`` defaults to True, which
-    enables per-request thinking so the server separates reasoning from the final
-    answer.
-
-    Required attributes on the test class:
-        base_url: str
-        model: str
-        aime25_score_threshold: float
-
-    Optional sampling knobs (default to sgl-eval's defaults when unset). Set these
-    for reasoning models -- e.g. DeepSeek-V4 Think-Max wants
-    aime25_reasoning_effort="max", aime25_max_tokens=200000, aime25_temperature=1.0,
-    aime25_top_p=1.0. AIME25 has only 30 problems, so it is high variance; raise
-    aime25_n_repeats (e.g. 16) for a stable number.
+    Unset sampling knobs keep sgl-eval's defaults; DeepSeek-V4 Think-Max wants
+    reasoning_effort="max", max_tokens=200000, temperature=1.0, top_p=1.0.
+    Raise aime25_n_repeats (e.g. 16) for a stable number.
     """
 
     aime25_score_threshold: float = _THRESHOLD_NOT_SET
@@ -424,13 +370,7 @@ class AIME25Mixin:
 
 
 class HumanEvalMixin:
-    """Mixin for HumanEval evaluation.
-
-    Required attributes on the test class:
-        base_url: str
-        model: str
-        humaneval_score_threshold: float
-    """
+    """Mixin for HumanEval evaluation."""
 
     humaneval_score_threshold: float = _THRESHOLD_NOT_SET
     humaneval_score_threshold_amd: Optional[float] = None
@@ -452,13 +392,7 @@ class HumanEvalMixin:
 
 
 class MGSMEnMixin:
-    """Mixin for MGSM English evaluation.
-
-    Required attributes on the test class:
-        base_url: str
-        model: str
-        mgsm_en_score_threshold: float
-    """
+    """Mixin for MGSM English evaluation."""
 
     mgsm_en_score_threshold: float = _THRESHOLD_NOT_SET
     mgsm_en_num_examples: Optional[int] = None

@@ -32,8 +32,7 @@ class AccuracyTestParams:
     repeat: Optional[int] = None
     api: Optional[str] = None  # "chat" or "completion"; defaults to "chat" in run_eval
     seed: Optional[int] = None  # pin for reproducibility when temperature > 0
-    # sgl-eval-backed datasets only: force chat_template_kwargs.thinking instead
-    # of letting _run_sgl_eval infer it from the model name.
+    # sgl-eval-backed datasets only: default for chat_template_kwargs thinking.
     sgl_eval_thinking: Optional[bool] = None
     num_shots: Optional[int] = None  # few-shot count; None = run_eval's default
 
@@ -57,13 +56,7 @@ def write_accuracy_github_summary(
     dataset: str,
     results: List[AccuracyTestResult],
 ) -> None:
-    """Write accuracy test results to GitHub step summary.
-
-    Args:
-        test_name: Name of the test
-        dataset: Dataset name used for evaluation
-        results: List of AccuracyTestResult objects
-    """
+    """Write accuracy test results to GitHub step summary."""
     summary = f"#### {test_name} - Accuracy ({dataset})\n"
     summary += "| config | status | score | baseline | error |\n"
     summary += "| ------ | ------ | ----- | -------- | ----- |\n"
@@ -98,11 +91,7 @@ def _run_simple_eval(
     seed: Optional[int] = None,
     sgl_eval_thinking: Optional[bool] = None,
 ) -> Tuple[bool, Optional[str], Optional[dict]]:
-    """Run ``dataset`` through run_sgl_eval (sgl-eval benchmarks) or run_eval.
-
-    Returns:
-        Tuple of (success, error_message, metrics_dict)
-    """
+    """Run ``dataset`` through run_sgl_eval (sgl-eval benchmarks) or run_eval."""
     process = None
     try:
         process = popen_launch_server(
@@ -179,16 +168,7 @@ def run_accuracy_test(
     params: AccuracyTestParams,
     base_url: Optional[str] = None,
 ) -> AccuracyTestResult:
-    """Run accuracy test for a single model.
-
-    Args:
-        model: ModelLaunchSettings with model config
-        params: AccuracyTestParams with dataset, baseline, and optional settings
-        base_url: Server base URL (default: DEFAULT_URL_FOR_TEST)
-
-    Returns:
-        AccuracyTestResult with test outcome
-    """
+    """Run accuracy test for a single model."""
     base_url = base_url or DEFAULT_URL_FOR_TEST
 
     print(f"\n{'=' * 60}")
