@@ -45,6 +45,7 @@ from sglang.srt.layers.boundary_layout import (
     SumGroup,
     TokenAxis,
     decoder_layer_sides,
+    input_scattered_layer_sides,
     sequence_parallel_layer_sides,
 )
 from sglang.srt.layers.cp.utils import (
@@ -760,6 +761,20 @@ class LayerCommunicator:
             self._select_declared_boundaries(sides)
         else:
             self._select_boundaries_from_scatter_modes()
+        # The steps a batch with input-scattered attention runs; None where it
+        # cannot run or the steps come from the scatter modes.
+        self._input_scattered_steps = (
+            _select_boundary_steps(
+                input_scattered_layer_sides(
+                    axis_sizes=_token_axis_sizes(),
+                    ffn_group=sides.ffn_output.group,
+                    hands_on_partial=allow_reduce_scatter
+                    and not layer_scatter_modes.is_last_layer,
+                )
+            )
+            if sides is not None and self._input_can_be_scattered()
+            else None
+        )
         self._attn_input_fusions = self._select_attn_input_fusions()
         self._speculative_algo = SpeculativeAlgorithm.from_string(
             get_spec().speculative_algorithm
@@ -770,7 +785,8 @@ class LayerCommunicator:
         )
 
         # Under LayerNorm SP, the steps the layer runs while the region is
-        # active; None without SP.
+        # active; None without SP. The two are exclusive: SP runs a model without
+        # q_lora, which input-scattered attention needs.
         self._sp_steps = (
             _select_boundary_steps(
                 sequence_parallel_layer_sides(axis_sizes=_token_axis_sizes())
@@ -779,11 +795,25 @@ class LayerCommunicator:
             else None
         )
 
+    def _input_can_be_scattered(self) -> bool:
+        """Whether a batch may run this layer with input-scattered attention:
+        configured, on pure TP without an a2a backend. The rest of what
+        ``AttnTpContext.init_context`` requires is only known once the model is
+        built."""
+        parallel = get_parallel()
+        return (
+            parallel.enable_attn_tp_input_scattered
+            and parallel.tp_size > 1
+            and parallel.attn_dp_size == 1
+            and parallel.attn_cp_size == 1
+            and get_moe_a2a_backend().is_none()
+        )
+
     def _declared_sides(self) -> Optional[DecoderLayerSides]:
         """The declarations this layer's boundaries are chosen from: an
-        attention and an FFN, without CP or input-scattered attention, in a
-        layer whose previous layer is known. None when the steps come from the
-        scatter modes. An active LayerNorm SP region has its own declarations."""
+        attention and an FFN, without CP, in a layer whose previous layer is
+        known. None when the steps come from the scatter modes. An active
+        LayerNorm SP region and input-scattered attention have their own."""
         modes = self.layer_scatter_modes
         parallel = get_parallel()
         # A MoE dispatched per DP shard computes on this rank's local rows and
@@ -792,7 +822,6 @@ class LayerCommunicator:
         if not (
             self._takes_declared_boundaries
             and parallel.attn_cp_size == 1
-            and not parallel.enable_attn_tp_input_scattered
             and not enable_moe_dense_fully_dp()
             and (modes.is_first_layer or modes.is_previous_layer_sparse is not None)
         ):
@@ -999,7 +1028,13 @@ class LayerCommunicator:
             )
             if get_forward().sp_active:
                 hidden_states = layernorm_sp.sp_entry_scatter(hidden_states)
-        if get_attn_tp_context().input_scattered:
+        steps = self._batch_steps()
+        if steps is not None and steps.layer_input is not None:
+            hidden_states, residual = steps.layer_input(
+                hidden_states, residual, self._context
+            )
+        elif get_attn_tp_context().input_scattered:
+            # The scatter-mode path completes the input the same way.
             hidden_states, residual = self._tp_reduce_scatter(
                 hidden_states,
                 residual,
@@ -1025,13 +1060,22 @@ class LayerCommunicator:
     def _in_sp_region(self) -> bool:
         return self._sp_steps is not None and get_forward().sp_active
 
+    def _batch_steps(self) -> Optional["BoundarySteps"]:
+        """The steps this batch runs in place of the layer's ordinary ones: an
+        active LayerNorm SP region's, or input-scattered attention's."""
+        if self._in_sp_region():
+            return self._sp_steps
+        if (
+            self._input_scattered_steps is not None
+            and get_attn_tp_context().input_scattered
+        ):
+            return self._input_scattered_steps
+        return None
+
     def _finish_prepare_attn(self, hidden_states, residual, forward_batch):
         """Tail every prepare_attn path must run, or ``attn_inputs`` is unset."""
-        move = (
-            self._sp_steps.attention_input
-            if self._in_sp_region()
-            else self._communicate_simple_fn
-        )
+        steps = self._batch_steps()
+        move = self._communicate_simple_fn if steps is None else steps.attention_input
         hidden_states = move(
             hidden_states=hidden_states,
             forward_batch=forward_batch,
@@ -1190,7 +1234,9 @@ class LayerCommunicator:
         if cache is not None:
             self._context.cache = cache
 
-        return self._mlp_input(
+        steps = self._batch_steps()
+        mlp_input = self._mlp_input if steps is None else steps.ffn_input
+        return mlp_input(
             hidden_states,
             residual,
             forward_batch,
@@ -1211,8 +1257,9 @@ class LayerCommunicator:
         residual: torch.Tensor,
         forward_batch: ForwardBatch,
     ):
-        if self._in_sp_region():
-            return self._sp_steps.ffn_output_move(
+        steps = self._batch_steps()
+        if steps is not None:
+            return steps.ffn_output_move(
                 hidden_states=hidden_states,
                 residual=residual,
                 forward_batch=forward_batch,
@@ -1256,6 +1303,9 @@ class LayerCommunicator:
         """Whether the FFN leaves its sum out because a reduce-scatter completes
         it: the attention-DP one ``dp_step`` names, or the CP / input-scattered
         one."""
+        steps = self._batch_steps()
+        if steps is not None:
+            return steps.ffn_output.leaves_for_reduce_scatter
         if not self._ffn_output.leaves_for_reduce_scatter:
             return False
         if dp_step is not None:
@@ -1284,7 +1334,9 @@ class LayerCommunicator:
             forward_batch=forward_batch,
             dp_step=dp_step,
         )
-        if not self._ffn_output.leaves_for_next_layer:
+        steps = self._batch_steps()
+        ffn_output = self._ffn_output if steps is None else steps.ffn_output
+        if not ffn_output.leaves_for_next_layer:
             return FfnCompletion(
                 defer_moe_finalize=False,
                 fuse_mlp_allreduce=False,
@@ -1870,32 +1922,50 @@ class BoundarySteps(msgspec.Struct, frozen=True):
     attention_input: Callable
     ffn_input: Callable
     ffn_output_move: Callable
+    # What the FFN exit reads in place of the layer's own FFN output declaration.
+    ffn_output: StageOutput
+    # Completes what the layer's input owes before the input norm; None when it
+    # owes nothing.
+    layer_input: Optional[Callable] = None
 
 
 def _select_boundary_steps(sides: DecoderLayerSides) -> BoundarySteps:
-    """The steps for declarations whose stage outputs are complete and stay
-    on the layer's rows, so no fused kernel and no FFN-exit decision takes part."""
+    """The steps for a batch's own declarations: nothing moves back over
+    attention DP and no fused kernel runs, so the steps do not wait on a
+    per-batch decision."""
     returns_over_dp, ffn_output_move = _select_ffn_output_move(
         sides.ffn_output, residual=sides.ffn_residual_rows, to=sides.output_rows
     )
-    if (
-        returns_over_dp
-        or sides.attention_output.group is not None
-        or sides.ffn_output.group is not None
-    ):
+    if returns_over_dp or sides.ffn_output.leaves_for_next_layer:
         raise NotImplementedError(f"{sides=}")
+    rows = sides.input_rows
+    layer_input = None
+    if sides.input_owes is not None:
+        # A reduce-scatter completes the TP sum onto each rank's slice, which the
+        # attention takes: its group is the TP group without attention DP or CP.
+        if (
+            sides.input_owes is not SumGroup.TP
+            or rows.sharded
+            or TokenAxis.ATTN_TP_SCATTER not in sides.attention.gathers_itself
+        ):
+            raise NotImplementedError(f"{sides=}")
+        layer_input = tp_reduce_scatter
+        rows = Layout(frozenset({TokenAxis.ATTN_TP_SCATTER}))
     ffn_input, _ = _select_ffn_input(
         sides.attention_output,
-        residual=sides.input_rows,
+        residual=rows,
         residual_to=sides.ffn_residual_rows,
         need=sides.ffn,
         force_layernorm_before_gather=False,
         fusions=(),
+        residual_joins_sum=sides.residual_joins_attention_sum,
     )
     return BoundarySteps(
-        attention_input=_select_attention_input_move(sides.input_rows, sides.attention),
+        attention_input=_select_attention_input_move(rows, sides.attention),
         ffn_input=ffn_input,
         ffn_output_move=ffn_output_move,
+        ffn_output=sides.ffn_output,
+        layer_input=layer_input,
     )
 
 
@@ -1922,6 +1992,7 @@ def _select_ffn_input(
     need: StageInput,
     force_layernorm_before_gather: bool,
     fusions: Tuple[FusedMlpInput, ...],
+    residual_joins_sum: bool = False,
 ) -> Tuple[Callable, Tuple[FusedMlpInput, ...]]:
     """The steps from the attention output to the FFN input, and the fused
     kernels they try first: complete the attention-TP sum, move the residual to
@@ -1966,6 +2037,10 @@ def _select_ffn_input(
     if not gathered:
         if not owes_attention_tp:
             return _mlp_input_norm, ()
+        if gathers_residual and residual_joins_sum:
+            # Each rank adds its slice of the residual into its share of the
+            # sum, so the all-reduce also brings the residual back to every row.
+            return _mlp_input_residual_into_sum, ()
         fused = tuple(f for f in fusions if f.completes is produced.group)
         return (
             partial(
@@ -2119,6 +2194,18 @@ def _mlp_input_scatter(
     if hidden_states.shape[0] != 0:
         hidden_states, residual = layernorm(hidden_states, residual)
     return hidden_states, residual
+
+
+def _mlp_input_residual_into_sum(
+    hidden_states: torch.Tensor,
+    residual: torch.Tensor,
+    forward_batch: ForwardBatch,
+    layernorm: torch.nn.Module,
+    context: CommunicateContext,
+):
+    return _tp_all_reduce_with_scattered_residual(
+        hidden_states, residual, layernorm, context
+    )
 
 
 def _tp_all_reduce_with_scattered_residual(

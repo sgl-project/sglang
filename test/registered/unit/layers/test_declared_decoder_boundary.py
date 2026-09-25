@@ -24,6 +24,7 @@ from sglang.srt.layers.boundary_layout import (
     SumGroup,
     TokenAxis,
     decoder_layer_sides,
+    input_scattered_layer_sides,
     sequence_parallel_layer_sides,
 )
 from sglang.srt.layers.communicator import (
@@ -417,10 +418,6 @@ class TestWhichLayersUseDeclarations(CustomTestCase):
     def test_layers_that_keep_the_scatter_modes(self):
         dp = parallel_of(attn_dp=2, attn_tp=2)
         cases = {
-            "input-scattered attention": (
-                layer_facts(1, 3),
-                parallel_of(attn_dp=1, attn_tp=4, enable_attn_tp_input_scattered=True),
-            ),
             "attention CP": (
                 layer_facts(1, 3),
                 parallel_of(attn_dp=2, attn_tp=1, attn_cp=2),
@@ -631,10 +628,12 @@ class TestTheSequenceParallelRegion(CustomTestCase):
     themselves, so every boundary stays on this rank's slice. Other batches
     take the layer's ordinary declared steps."""
 
+    SIZES = {TokenAxis.ATTN_DP: 1, TokenAxis.ATTN_CP: 1, TokenAxis.ATTN_TP_SCATTER: 2}
     SP_STEPS = comm.BoundarySteps(
         attention_input=comm.CommunicateSimpleFn._trivial,
         ffn_input=comm._mlp_input_norm,
         ffn_output_move=comm.CommunicateSummableTensorPairFn._trivial,
+        ffn_output=sequence_parallel_layer_sides(axis_sizes=SIZES).ffn_output,
     )
 
     def test_the_region_declarations_choose_local_steps(self):
@@ -653,7 +652,16 @@ class TestTheSequenceParallelRegion(CustomTestCase):
                 self.assertEqual(sides.ffn.gathers_itself, local)
                 self.assertIsNone(sides.attention_output.group)
                 self.assertIsNone(sides.ffn_output.group)
-                self.assertEqual(comm._select_boundary_steps(sides), self.SP_STEPS)
+                steps = comm._select_boundary_steps(sides)
+                self.assertEqual(
+                    (steps.attention_input, steps.ffn_input, steps.ffn_output_move),
+                    (
+                        self.SP_STEPS.attention_input,
+                        self.SP_STEPS.ffn_input,
+                        self.SP_STEPS.ffn_output_move,
+                    ),
+                )
+                self.assertIsNone(steps.layer_input)
 
     def test_a_layer_under_sp_takes_both_sets_of_steps(self):
         parallel = parallel_of(attn_dp=1, attn_tp=2)
@@ -678,12 +686,127 @@ class TestTheSequenceParallelRegion(CustomTestCase):
             )
         self.assertIsNone(communicator._sp_steps)
 
-    def test_declarations_that_owe_a_sum_are_not_region_steps(self):
-        sides = sides_of(
-            {TokenAxis.ATTN_DP: 1, TokenAxis.ATTN_CP: 1, TokenAxis.ATTN_TP_SCATTER: 2}
+    def test_declarations_left_to_the_ffn_exit_are_not_batch_steps(self):
+        # A sum the FFN exit may hand to the next layer, or a move back over
+        # attention DP, waits on a per-batch decision.
+        for sizes, leaves_next in (
+            (self.SIZES, True),
+            ({**self.SIZES, TokenAxis.ATTN_DP: 2}, False),
+        ):
+            with self.subTest(sizes=sizes), self.assertRaises(NotImplementedError):
+                comm._select_boundary_steps(sides_of(sizes, leaves_next=leaves_next))
+
+
+class TestInputScatteredAttention(CustomTestCase):
+    """On a batch whose attention input is scattered over attention TP, a layer
+    runs the steps that batch's declarations choose: its input arrives as a TP
+    partial that a reduce-scatter completes onto each rank's slice, and the
+    residual comes back to every row inside the attention output's sum."""
+
+    SIZES = {TokenAxis.ATTN_DP: 1, TokenAxis.ATTN_CP: 1, TokenAxis.ATTN_TP_SCATTER: 2}
+
+    def test_the_declarations_choose_the_steps(self):
+        for hands_on in (False, True):
+            with self.subTest(hands_on_partial=hands_on):
+                sides = input_scattered_layer_sides(
+                    axis_sizes=self.SIZES,
+                    ffn_group=SumGroup.TP,
+                    hands_on_partial=hands_on,
+                )
+                steps = comm._select_boundary_steps(sides)
+                self.assertIs(steps.layer_input, comm.tp_reduce_scatter)
+                self.assertIs(steps.attention_input, comm.CommunicateSimpleFn._trivial)
+                self.assertIs(steps.ffn_input, comm._mlp_input_residual_into_sum)
+                self.assertIs(
+                    steps.ffn_output_move,
+                    comm.CommunicateSummableTensorPairFn._trivial,
+                )
+                self.assertIs(steps.ffn_output.leaves_for_reduce_scatter, hands_on)
+                self.assertFalse(steps.ffn_output.leaves_for_next_layer)
+
+    def test_the_order_of_a_residual_on_the_slice_is_declared(self):
+        # The same layouts take two orders: with a scattered input the residual
+        # joins the attention output's sum; after a MoE on local rows it is
+        # gathered first.
+        sizes = self.SIZES
+        attention = comm.Layout.sharded_over(axis_sizes=sizes)
+        local = comm.Layout(frozenset({TokenAxis.ATTN_TP_SCATTER}))
+        owed = comm.StageOutput(attention, group=SumGroup.ATTN_TP, always_leaves=True)
+        for joins, step in (
+            (True, comm._mlp_input_residual_into_sum),
+            (False, comm._mlp_input_without_dp),
+        ):
+            with self.subTest(residual_joins_sum=joins):
+                steps, _ = comm._select_ffn_input(
+                    owed,
+                    residual=local,
+                    residual_to=attention,
+                    need=comm.StageInput(attention),
+                    force_layernorm_before_gather=False,
+                    fusions=(),
+                    residual_joins_sum=joins,
+                )
+                self.assertIs(getattr(steps, "func", steps), step)
+
+    def test_which_layers_can_scatter_their_input(self):
+        configured = dict(enable_attn_tp_input_scattered=True)
+        for name, parallel, a2a, expected in (
+            ("pure TP", parallel_of(attn_dp=1, attn_tp=2, **configured), False, True),
+            ("not configured", parallel_of(attn_dp=1, attn_tp=2), False, False),
+            (
+                "attention DP",
+                parallel_of(attn_dp=2, attn_tp=2, **configured),
+                False,
+                False,
+            ),
+            ("a2a", parallel_of(attn_dp=1, attn_tp=2, **configured), True, False),
+        ):
+            with self.subTest(name):
+                communicator = build(
+                    layer_facts(1, 3, sparse=a2a, previous_sparse=a2a),
+                    parallel,
+                    a2a=a2a,
+                    allow_reduce_scatter=True,
+                )
+                self.assertIs(communicator._input_scattered_steps is not None, expected)
+
+    def test_a_batch_runs_them_only_while_its_input_is_scattered(self):
+        parallel = parallel_of(
+            attn_dp=1, attn_tp=2, enable_attn_tp_input_scattered=True
         )
-        with self.assertRaises(NotImplementedError):
-            comm._select_boundary_steps(sides)
+        communicator = build(layer_facts(1, 3), parallel, allow_reduce_scatter=True)
+        for scattered in (False, True):
+            with (
+                self.subTest(input_scattered=scattered),
+                patch.object(
+                    comm,
+                    "get_attn_tp_context",
+                    lambda: SimpleNamespace(input_scattered=scattered),
+                ),
+                patch.object(
+                    comm, "get_forward", lambda: SimpleNamespace(sp_active=False)
+                ),
+            ):
+                self.assertIs(
+                    communicator._batch_steps(),
+                    communicator._input_scattered_steps if scattered else None,
+                )
+
+    def test_the_last_layer_completes_its_own_sum(self):
+        parallel = parallel_of(
+            attn_dp=1, attn_tp=2, enable_attn_tp_input_scattered=True
+        )
+        for layer_id, allow, hands_on in (
+            (1, True, True),
+            (2, True, False),
+            (1, False, False),
+        ):
+            with self.subTest(layer_id=layer_id, allow_reduce_scatter=allow):
+                communicator = build(
+                    layer_facts(layer_id, 3), parallel, allow_reduce_scatter=allow
+                )
+                steps = communicator._input_scattered_steps
+                self.assertIs(steps.ffn_output.leaves_for_reduce_scatter, hands_on)
 
 
 # ---------------------------------------------------------------------------

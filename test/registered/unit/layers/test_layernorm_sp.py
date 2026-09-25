@@ -166,6 +166,7 @@ class TestSpRegionSteps(CustomTestCase):
     def communicator(self, *, first_layer):
         c = comm.LayerCommunicator.__new__(comm.LayerCommunicator)
         c._sp_steps = sp_region_steps()
+        c._input_scattered_steps = None
         c.layer_scatter_modes = SimpleNamespace(is_first_layer=first_layer)
         c._attn_input_fusions = ()
         c.input_layernorm = _Norm()
