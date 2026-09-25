@@ -1945,3 +1945,24 @@ fn iter_yields_all_members() {
     members.sort_unstable();
     assert_eq!(members, vec![NodeIdx_(10), NodeIdx_(30)]);
 }
+
+// Pin Python/Rust storage hashes across a parent-child boundary.
+#[test]
+fn storage_hashes_match_python() -> Result<(), TreeCoreRuntimeError> {
+    let namespace = KeyNamespaceRef::new(Some("adapter-a"), Some("tenant-a"));
+    let mut arena: NodeArena<Vec<i64>> = NodeArena::new(vec![FULL], 2);
+    let root = arena.root();
+    let parent = arena.alloc_child_in_namespace(root, vec![1, 2], 0, namespace)?;
+    let hashes = arena.compute_node_hash_values(parent, 2);
+    assert_eq!(
+        hashes,
+        vec!["91b8b854063250a84c6f75b3d294bc5d72047c3a15c52b09038a5831f69ecd1a"]
+    );
+    arena.node_mut(parent).hash_value = Some(hashes);
+    let child = arena.alloc_child_in_namespace(parent, vec![3, 4], 0, namespace)?;
+    assert_eq!(
+        arena.compute_node_hash_values(child, 2),
+        vec!["c1ab67afa32b9fdd2ac8429d44d56f207a99c03a30b7a9bb131a32db35354c90"]
+    );
+    Ok(())
+}

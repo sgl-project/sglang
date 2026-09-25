@@ -17,11 +17,11 @@ import torch
 
 from sglang.srt.distributed import (
     divide,
-    get_pp_group,
 )
 from sglang.srt.environ import envs
+from sglang.srt.layers.utils import get_layer_id
 from sglang.srt.lora.eviction_policy import get_eviction_policy
-from sglang.srt.lora.layers import BaseLayerWithLoRA
+from sglang.srt.lora.layers import BaseLayerWithLoRA, unwrap_lora_layer
 from sglang.srt.lora.lora import LoRAAdapter
 from sglang.srt.lora.lora_config import LoRAConfig
 from sglang.srt.lora.lora_registry import LoRARef
@@ -281,6 +281,38 @@ class LoRAMemoryPool:
             return self.attn_tp_size
         return self.tp_size
 
+    def _dense_local_dim(
+        self,
+        module_name: str,
+        base_model: torch.nn.Module,
+        layer_idx: int,
+        axis: str,
+    ) -> Optional[int]:
+        """Per-rank LoRA width of a dense linear along ``axis``, read from its base layer."""
+        if module_name in ATTN_TP_LORA_MODULE_NAMES or self.is_moe_module(module_name):
+            return None
+        linears = getattr(self, "_dense_linears", None)
+        if linears is None:
+            linears = {}
+            for name, module in base_model.named_modules():
+                layer_id = get_layer_id(name)
+                base_layer = unwrap_lora_layer(module)
+                if layer_id is not None and (
+                    hasattr(base_layer, "input_size_per_partition")
+                    or hasattr(base_layer, "output_partition_sizes")
+                ):
+                    linears.setdefault((name.rsplit(".", 1)[-1], layer_id), base_layer)
+            self._dense_linears = linears
+        base_layer = linears.get((module_name, layer_idx))
+        if base_layer is None:
+            return None
+        if axis == "input":
+            return getattr(base_layer, "input_size_per_partition", None)
+        partitions = getattr(base_layer, "output_partition_sizes", None)
+        if not partitions:
+            return None
+        return sum(partitions[: get_stacked_multiply(module_name, base_model)])
+
     @staticmethod
     def _get_num_experts(base_model: torch.nn.Module) -> int:
         cfg = base_model.config
@@ -411,11 +443,16 @@ class LoRAMemoryPool:
         c = get_stacked_multiply(module_name, base_model)
         effective_tp_size = self._effective_tp_size(module_name)
         if (
-            effective_tp_size > 1
-            and module_name in ROW_PARALLELISM_LINEAR_LORA_NAMES
+            module_name in ROW_PARALLELISM_LINEAR_LORA_NAMES
             and module_name not in REPLICATED_LINEAR_LORA_NAMES
         ):
-            input_dim = divide(input_dim, effective_tp_size)
+            local_dim = self._dense_local_dim(
+                module_name, base_model, layer_idx, "input"
+            )
+            if local_dim is not None:
+                input_dim = local_dim
+            elif effective_tp_size > 1:
+                input_dim = divide(input_dim, effective_tp_size)
 
         if self.is_moe_module(module_name):
             if self.is_shared_moe_module(module_name):
@@ -509,13 +546,18 @@ class LoRAMemoryPool:
         # Same sharding rule as get_lora_A_shape above.
         effective_tp_size = self._effective_tp_size(module_name)
         if (
-            effective_tp_size > 1
-            and module_name not in ROW_PARALLELISM_LINEAR_LORA_NAMES
+            module_name not in ROW_PARALLELISM_LINEAR_LORA_NAMES
             and module_name not in REPLICATED_LINEAR_LORA_NAMES
         ):
-            output_dim = self._column_parallel_lora_b_per_rank_dim(
-                module_name, output_dim, effective_tp_size
+            local_dim = self._dense_local_dim(
+                module_name, base_model, layer_idx, "output"
             )
+            if local_dim is not None:
+                output_dim = local_dim
+            elif effective_tp_size > 1:
+                output_dim = self._column_parallel_lora_b_per_rank_dim(
+                    module_name, output_dim, effective_tp_size
+                )
 
         # Check if MoE module and return appropriate shape
         if self.is_moe_module(module_name):
@@ -1457,7 +1499,7 @@ class LoRAMemoryPool:
                     # Non-last PP stages do not own lm_head, so adapters can
                     # legitimately contain lm_head LoRA weights with no local
                     # module to load them into, otherwise we should have been able to load this weight.
-                    assert not get_pp_group().is_last_rank, (
+                    assert not get_parallel().pp_group.is_last_rank, (
                         f"Failed to load lm_head LoRA weight: {name}, this is only expected to happen on non-last PP stages."
                     )
                     continue

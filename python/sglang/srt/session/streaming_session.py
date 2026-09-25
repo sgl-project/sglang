@@ -9,6 +9,8 @@ import torch
 from sglang.srt.managers.schedule_batch import ReqKvInfo
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
+    CacheRequestHandle,
+    CacheRequestOutcome,
     DecLockRefParams,
     DecLockRefResult,
     EvictParams,
@@ -22,6 +24,8 @@ from sglang.srt.utils.common import ceil_align, is_npu
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
+    from sglang.srt.mem_cache.buffer_mode.pipeline import BufferModePipeline
+    from sglang.srt.mem_cache.storage_prefetch import StoragePrefetchRetries
 
 
 logger = logging.getLogger(__name__)
@@ -260,9 +264,7 @@ class StreamingSession(BasePrefixCache):
             cache_protected_len=slot.kv.cache_protected_len,
         )
 
-    def try_cache_finished_req(
-        self, req: Req, is_insert: bool = True, **kwargs
-    ) -> bool:
+    def try_cache_finished_req(self, req: Req) -> bool:
         """Handles a streaming-session finish (save slot / mid-abort nuke).
         Returns True if handled; False means caller runs its raw path."""
         if not _is_streaming(req):
@@ -350,15 +352,28 @@ class StreamingSession(BasePrefixCache):
             return result
         return self.inner.match_prefix(params)
 
-    def cache_finished_req(self, req: Req, is_insert: bool = True, **kwargs):
-        if self.try_cache_finished_req(req, is_insert=is_insert, **kwargs):
-            return
-        self.inner.cache_finished_req(req, is_insert=is_insert, **kwargs)
+    def claim_kv_row(self, req: Req) -> bool:
+        return self.try_cache_finished_req(req)
+
+    def on_release(self, req: Req, *, inserted: bool) -> None:
+        self.inner.on_release(req, inserted=inserted)
+
+    def cache_finished_req(self, req: Req, **kwargs):
+        self.inner.cache_finished_req(req, **kwargs)
 
     def cache_unfinished_req(self, req: Req, **kwargs):
         if self.try_cache_unfinished_req(req, **kwargs):
             return
         self.inner.cache_unfinished_req(req, **kwargs)
+
+    def unpin(self, req: Req) -> None:
+        self.inner.unpin(req)
+
+    def finish(self, handle: CacheRequestHandle, outcome: CacheRequestOutcome) -> None:
+        self.inner.finish(handle, outcome)
+
+    def release_aborted_request(self, handle: CacheRequestHandle) -> None:
+        self.inner.release_aborted_request(handle)
 
     def evict(self, params: EvictParams) -> EvictResult:
         return self.inner.evict(params)
@@ -564,22 +579,35 @@ class StreamingSession(BasePrefixCache):
     def init_load_back(self, params: InitLoadBackParams):
         return self.inner.init_load_back(params)
 
-    def pop_prefetch_loaded_span(self, req_id: str) -> tuple[int, Optional[int]]:
-        return self.inner.pop_prefetch_loaded_span(req_id)
+    @property
+    def buffer_pipeline(self) -> Optional[BufferModePipeline]:
+        return self.inner.buffer_pipeline
+
+    @property
+    def storage_prefetch_retries(self) -> Optional[StoragePrefetchRetries]:
+        return self.inner.storage_prefetch_retries
+
+    def pop_prefetch_loaded_span(
+        self, handle: CacheRequestHandle
+    ) -> tuple[int, Optional[int]]:
+        return self.inner.pop_prefetch_loaded_span(handle)
 
     def finish_storage_prefetch_admission(
-        self, req_id: str, fulfilled_tokens: int, reason: Optional[str]
+        self, handle: CacheRequestHandle, fulfilled_tokens: int, reason: Optional[str]
     ) -> None:
-        self.inner.finish_storage_prefetch_admission(req_id, fulfilled_tokens, reason)
+        self.inner.finish_storage_prefetch_admission(handle, fulfilled_tokens, reason)
 
-    def discard_storage_prefetch_accounting(self, req_id: str) -> None:
-        self.inner.discard_storage_prefetch_accounting(req_id)
+    def discard_storage_prefetch_accounting(self, handle: CacheRequestHandle) -> None:
+        self.inner.discard_storage_prefetch_accounting(handle)
 
     def ready_to_load_host_cache(self):
         return self.inner.ready_to_load_host_cache()
 
     def check_hicache_events(self):
         return self.inner.check_hicache_events()
+
+    def flush_pending_backups(self) -> None:
+        self.inner.flush_pending_backups()
 
     def take_events(self):
         return self.inner.take_events()

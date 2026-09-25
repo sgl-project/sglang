@@ -128,6 +128,14 @@ an explicit task if several alternatives remain (for example `v2v` versus
 `f2v`). Pipelines with one task keep that task as their default. Sending a
 request never changes the server default or subsequent requests.
 
+### Prompt enhancement
+
+Image generation, image edits and video creation accept `enhance_prompt=true`
+when the server is configured with `--prompt-enhancer-config`. An independent
+SRT service rewrites the prompt before diffusion runs. The default is `false`;
+image responses return `data[].revised_prompt`, and video responses return
+`revised_prompt`. See [deployment and model compatibility](/docs/sglang-diffusion/models_with_pe).
+
 ### Model-specific request fields
 
 The image and video request schemas contain only OpenAI fields and stable

@@ -12,12 +12,11 @@ though the runtime is split into separate folders.
 The files are split by runtime responsibility. For a new model, read the
 request path first:
 
-1. `registry.py` chooses the model family, sampling params, and pipeline config.
-2. `configs/pipeline_configs/{model}.py` defines model-specific denoising and
+1. `configs/pipeline_configs/{model}.py` defines model-specific denoising and
    decoding behavior.
-3. `runtime/pipelines/{model}.py` wires modules into stages.
-4. `runtime/pipelines_core/stages/` runs the shared stage logic.
-5. `runtime/models/` contains native model components only when the architecture
+2. `runtime/pipelines/{model}.py` wires modules into stages.
+3. `runtime/pipelines_core/stages/` runs the shared stage logic.
+4. `runtime/models/` contains native model components only when the architecture
    cannot be reused.
 
 That is the dependency direction. Avoid making a model PR that requires readers
@@ -124,7 +123,6 @@ behavior.
 
 | Area | Add or edit when | Typical file |
 | --- | --- | --- |
-| Registry | Always, unless extending an already registered family | `python/sglang/multimodal_gen/registry.py` |
 | Runtime parameters | The request schema differs from existing models | `configs/sample/{model}.py` |
 | Pipeline config | Denoising, decoding, precision, position encoding, or CFG hooks differ | `configs/pipeline_configs/{model}.py` |
 | Pipeline wiring | The model needs a new stage layout or module list | `runtime/pipelines/{model}.py` |
@@ -137,11 +135,10 @@ behavior.
 
 For a new native architecture, the common minimum is:
 
-1. `registry.py`
-2. `configs/sample/{model}.py`
-3. `configs/pipeline_configs/{model}.py`
-4. `runtime/pipelines/{model}.py`
-5. `runtime/models/dits/{model}.py`
+1. `configs/sample/{model}.py`
+2. `configs/pipeline_configs/{model}.py`
+3. `runtime/pipelines/{model}.py`
+4. `runtime/models/dits/{model}.py`
 
 Every extra file should map to model behavior that existing code cannot express
 clearly.
@@ -499,19 +496,27 @@ native integration contract.
 
 ### 6. Registry
 
-Register the family once the sampling params and pipeline config exist.
+Define a `register()` function in `configs/pipeline_configs/{model}.py`. The
+runtime auto-discovers it on startup and calls it to register the sampling
+params and pipeline config.
 
 ```python
-register_configs(
-    model_family="my_model",
-    sampling_param_cls=MyModelSamplingParams,
-    pipeline_config_cls=MyModelPipelineConfig,
-    hf_model_paths=["org/my-model"],
-)
+# python/sglang/multimodal_gen/configs/pipeline_configs/my_model.py
+def register():
+    from sglang.multimodal_gen.registry import register_configs
+
+    register_configs(
+        sampling_param_cls=MyModelSamplingParams,
+        pipeline_config_cls=MyModelPipelineConfig,
+        hf_model_paths=["org/my-model"],
+        model_detectors=[lambda hf_id: "my-model" in hf_id.lower()],
+    )
 ```
 
-The pipeline file is discovered through its `EntryClass`; do not add a second
-pipeline registry unless the existing registry requires it.
+`model_detectors` matches a model path or `model_index.json` `_class_name` when
+the Hugging Face path varies; see `wan.py` or `qwen_image21.py` for real
+examples. The pipeline file is discovered through its `EntryClass`; do not add
+a second pipeline registry unless the existing registry requires it.
 
 ## Verify the Port
 

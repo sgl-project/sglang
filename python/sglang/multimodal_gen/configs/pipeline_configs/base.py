@@ -451,6 +451,10 @@ class PipelineConfig:
             for task in self.get_supported_task_types()
         )
 
+    def supports_dynamic_batching_for_request(self, batch) -> bool:
+        """Return whether one request may participate in dynamic batching."""
+        return True
+
     def supports_disaggregation(self) -> bool:
         """Return whether multi-service disaggregated deployment is supported."""
 

@@ -321,6 +321,7 @@ class QSAIndexer(MultiPlatformOp):
                 self.compress_ratio, device=member_rows.device, dtype=torch.long
             )
             source_keys = token_k
+            group_locs = group_locs.clamp_max(source_keys.shape[0] - 1)
             source_rope = metadata.extend_rope_matrix
             if source_rope is None:
                 source_rope = build_rope_position_matrix(
@@ -518,13 +519,16 @@ class QSAIndexer(MultiPlatformOp):
             token_topk=self.token_topk,
         )
 
-    def forward_cuda(
+    def _forward_impl(
         self,
         hidden_states: torch.Tensor,
         positions: torch.Tensor,
         forward_batch,
         indexer_metadata,
     ) -> torch.Tensor:
+        """Portable orchestration shared by different platforms.
+        Fast paths are gated per platforms inside kernel calls.
+        """
         forward_mode = forward_batch.forward_mode
         is_target_verify = getattr(forward_mode, "is_target_verify", lambda: False)()
         is_draft_extend = getattr(forward_mode, "is_draft_extend_v2", lambda: False)()
@@ -625,6 +629,28 @@ class QSAIndexer(MultiPlatformOp):
             row_ends,
             logical_positions,
             row_sequence_lengths,
+        )
+
+    def forward_cuda(
+        self,
+        hidden_states: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch,
+        indexer_metadata,
+    ) -> torch.Tensor:
+        return self._forward_impl(
+            hidden_states, positions, forward_batch, indexer_metadata
+        )
+
+    def forward_xpu(
+        self,
+        hidden_states: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch,
+        indexer_metadata,
+    ) -> torch.Tensor:
+        return self._forward_impl(
+            hidden_states, positions, forward_batch, indexer_metadata
         )
 
 

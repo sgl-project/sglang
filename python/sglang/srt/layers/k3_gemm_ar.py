@@ -1,11 +1,10 @@
 """K3 fused o_proj GEMM+AR dispatch (``SGLANG_K3_GEMM_AR``).
 
-Glue between the model and ``kernels.ops.kimi_k3.gemm_ar``: lazily allocates
+Glue between the model and ``kernels.ops.communication.gemm_ar``: lazily allocates
 the P2P comm region on the TP group and swaps the o_proj RowParallelLinear
 forward for the single fused GEMM+all-reduce kernel at decode shapes
 (falling through to the regular GEMM + AR path whenever the input doesn't
-fit — prefill, capture, non-2D input). Eager-mode only; see
-kernels/ops/kimi_k3/GEMM_AR_README.md.
+fit — prefill, capture, non-2D input). Eager-mode only.
 """
 
 from __future__ import annotations
@@ -55,8 +54,8 @@ def maybe_wrap_o_proj(o_proj: RowParallelLinear) -> None:
     ready-to-launch path."""
     if not _init():
         return
-    from sglang.kernels.ops.kimi_k3 import gemm_ar as mod
-    from sglang.srt.distributed.parallel_state import get_tp_group
+    from sglang.kernels.ops.communication import gemm_ar as mod
+    from sglang.srt.runtime_context import get_parallel
 
     parallel = get_parallel()
     world_size = parallel.tp_size
@@ -73,7 +72,7 @@ def maybe_wrap_o_proj(o_proj: RowParallelLinear) -> None:
     mod.init(
         world_size=world_size,
         rank=parallel.tp_rank,
-        group=get_tp_group().cpu_group,
+        group=get_parallel().tp_group.cpu_group,
         k=weight.shape[1],
     )
     # per-K compile + base-address stash, pre-capture
