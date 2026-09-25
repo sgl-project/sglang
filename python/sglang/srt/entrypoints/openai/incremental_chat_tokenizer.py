@@ -82,7 +82,7 @@ class IncrementalChatTokenizer:
         self.verify_every = verify_every
         self.stats = IncrementalChatTokenizerStats()
         # (context digest, message digests) -> entry, least recently used first
-        self._entries: "OrderedDict[Tuple[bytes, Tuple[bytes, ...]], _Entry]" = (
+        self._entries: OrderedDict[Tuple[bytes, Tuple[bytes, ...]], _Entry] = (
             OrderedDict()
         )
         self._bytes = 0
