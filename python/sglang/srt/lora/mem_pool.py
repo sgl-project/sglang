@@ -1233,17 +1233,19 @@ class LoRAMemoryPool:
             fused_moe = self._get_fused_shared_moe(self.base_model, layer_id)
             for name, weights in layer_weights.items():
                 cache_name = name
-                if fused_moe is not None and "shared_experts." in name:
+                if fused_moe is not None and re.search(r"\.shared_experts?\.", name):
                     assert fused_moe.num_fused_shared_experts == 1
                     assert weights.dim() == 2
-                    name = name.replace(
-                        "shared_experts.", f"experts.{fused_moe._num_global_routed}."
+                    name = re.sub(
+                        r"\.shared_experts?\.",
+                        f".experts.{fused_moe._num_global_routed}.",
+                        name,
                     )
                 target_module = get_target_module_name(name, self.target_modules)
 
                 # Check if this is an MoE weight (has expert index in name)
                 expert_match = re.search(r"experts\.(\d+)\.", name)
-                is_shared_expert = "shared_experts." in name
+                is_shared_expert = re.search(r"\.shared_experts?\.", name) is not None
                 shared_moe_target = f"{target_module}_shared_moe"
 
                 if is_shared_expert and (

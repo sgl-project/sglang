@@ -871,12 +871,15 @@ class TestSharedMoeProductionLoad(CustomTestCase):
         self.assertTrue(torch.all(pool.B_buffer["down_proj_shared_moe"][0] == -7))
 
     def test_fused_shared_weights_use_last_expert_in_each_adapter(self):
-        """Packed routed factors must not overwrite or conflict with shared factors."""
-        for (ep_size, ep_rank), layout in itertools.product(
+        """Shared factors must reach fused slots for either spelling and packed order."""
+        for (ep_size, ep_rank), layout, shared_name in itertools.product(
             [(1, 0), (2, 0), (2, 1)],
             ["per_expert", "packed_first", "shared_first"],
+            ["shared_expert", "shared_experts"],
         ):
-            with self.subTest(ep_size=ep_size, ep_rank=ep_rank, layout=layout):
+            with self.subTest(
+                ep_size=ep_size, ep_rank=ep_rank, layout=layout, shared_name=shared_name
+            ):
                 pool = _make_pool(
                     num_experts_global=8,
                     moe_ep_size=ep_size,
@@ -900,13 +903,19 @@ class TestSharedMoeProductionLoad(CustomTestCase):
                 pool.base_model = torch.nn.Sequential(fused)
                 n = pool._get_moe_pool_expert_dim(pool.base_model, 0)
                 self.assertEqual(n, 8 // ep_size + 1)
-                pool.A_buffer = {"down_proj_moe": [torch.full((2, n, 2, 3), -1.0)]}
-                pool.B_buffer = {"down_proj_moe": [torch.full((2, n, 5, 2), -1.0)]}
+                pool.A_buffer = {
+                    "down_proj": [torch.full((2, 2, 3), -1.0)],
+                    "down_proj_moe": [torch.full((2, n, 2, 3), -1.0)],
+                }
+                pool.B_buffer = {
+                    "down_proj": [torch.full((2, 5, 2), -1.0)],
+                    "down_proj_moe": [torch.full((2, n, 5, 2), -1.0)],
+                }
                 for slot in range(2):
                     weights = {}
                     for expert, value in [
                         ("experts.0", 10 + slot),
-                        ("shared_experts", 20 + slot),
+                        (shared_name, 20 + slot),
                     ]:
                         prefix = f"model.layers.0.mlp.{expert}.down_proj"
                         weights[f"{prefix}.lora_A.weight"] = torch.full(
