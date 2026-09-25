@@ -947,6 +947,17 @@ _OTHER_BACKEND_REGISTERS = {
 }
 
 
+# CPU suites whose per-commit job runs on ubuntu-latest, the only CPU pool in
+# rerun-test.yml. Other CPU suites need their own hardware and image.
+_UBUNTU_CPU_SUITES = {"base-a-test-cpu"}
+_CPU_SUITE_POOLS = {
+    "stage-a-test-cpu-intel": ("Intel Xeon", "the pr-test-xeon.yml"),
+    "stage-b-test-cpu-intel": ("Intel Xeon", "the pr-test-xeon.yml"),
+    "stage-a-tp-test-cpu-intel": ("Intel Xeon", "the pr-test-xeon.yml"),
+    "base-b-test-cpu-arm64": ("arm64", "the pr-test-arm64.yml"),
+}
+
+
 def _extract_other_backends(content):
     """Return (backend labels, suite names) for every non-CUDA/CPU registration."""
     labels, suites = [], []
@@ -1047,6 +1058,21 @@ def detect_suite(file_path_from_test):
     legacy_suites = _extract_legacy_suites(content)
 
     if re.search(r"^[^#\n]*register_cpu_ci\s*\(", content, re.MULTILINE):
+        cpu_suites = sorted(set(_extract_suites(content, "register_cpu_ci")))
+        if cpu_suites and not set(cpu_suites) & _UBUNTU_CPU_SUITES:
+            suite = cpu_suites[0]
+            pool, workflow = _CPU_SUITE_POOLS.get(
+                suite, ("a dedicated CPU runner", "its own")
+            )
+            return [
+                _dispatch_err(
+                    suite,
+                    f"`{full_path}` is registered for {pool} (suite `{suite}`), "
+                    f"not the ubuntu-latest CPU pool; rerun-test.yml has no job "
+                    f"for it. Rerun it with /rerun-failed-ci, or dispatch "
+                    f"{workflow} workflow manually.",
+                )
+            ]
         return [
             {
                 "suite": "cpu",

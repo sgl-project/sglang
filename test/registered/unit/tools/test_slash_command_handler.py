@@ -195,5 +195,38 @@ class TestChangedTestFiles(CustomTestCase):
                 os.chdir(previous_cwd)
 
 
+class TestDetectSuiteCpuPools(CustomTestCase):
+    def test_hardware_specific_cpu_suites_are_not_sent_to_ubuntu(self):
+        """/rerun-test ran Intel Xeon suites on ubuntu-latest, which lacks their
+        image, so they failed for reasons unrelated to the change."""
+        handler = _load_handler()
+        cases = {
+            "xeon_only.py": ('suite="stage-a-tp-test-cpu-intel"', True),
+            "portable.py": ('suite="base-a-test-cpu"', False),
+            "both.py": ('suite="base-a-test-cpu"', False),
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            reg = Path(tmp) / "test" / "registered"
+            reg.mkdir(parents=True)
+            for name, (suite, _) in cases.items():
+                extra = (
+                    '\nregister_cpu_ci(est_time=6, suite="stage-b-test-cpu-intel")'
+                    if name == "both.py"
+                    else ""
+                )
+                (reg / name).write_text(
+                    f"register_cpu_ci(est_time=6, {suite}){extra}\n"
+                )
+            previous_cwd = os.getcwd()
+            try:
+                os.chdir(tmp)
+                for name, (_, rejected) in cases.items():
+                    [result] = handler.detect_suite(f"registered/{name}")
+                    self.assertEqual(result["error"] is not None, rejected, name)
+                    self.assertEqual(result["is_cpu"], not rejected, name)
+            finally:
+                os.chdir(previous_cwd)
+
+
 if __name__ == "__main__":
     unittest.main()
