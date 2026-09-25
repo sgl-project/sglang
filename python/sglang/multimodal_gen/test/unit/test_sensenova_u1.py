@@ -8,6 +8,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 import torch.nn.functional as F
+from PIL import Image
 from transformers.cache_utils import DynamicCache
 
 from sglang.multimodal_gen.configs.pipeline_configs.sensenova_u1 import (
@@ -19,6 +20,8 @@ from sglang.multimodal_gen.configs.sample.sensenova_u1 import (
 )
 from sglang.multimodal_gen.configs.sensenova_u1 import (
     SENSENOVA_U1_REQUEST_EXTRA_KEY,
+    has_sensenova_u1_explicit_size,
+    resolve_sensenova_u1_edit_auto_size,
 )
 from sglang.multimodal_gen.registry import (
     _get_config_info,
@@ -69,15 +72,40 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.s
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.perf_logger import MemorySnapshot
+from sglang.multimodal_gen.runtime.warmup_request_builder import (
+    should_include_warmup_image,
+)
 from sglang.srt.layers.layernorm import RMSNorm
 
 
 class _FakeSenseNovaModel:
     def __init__(self):
         self.call_kwargs = None
+        self.t2i_calls = []
+        self.it2i_calls = []
 
     def t2i_generate(self, tokenizer, prompt, **kwargs):
         self.call_kwargs = {"tokenizer": tokenizer, "prompt": prompt, **kwargs}
+        self.t2i_calls.append(self.call_kwargs)
+        sample = torch.tensor(
+            [
+                [
+                    [[-1.0, 0.0], [0.5, 1.0]],
+                    [[-1.0, 0.0], [0.5, 1.0]],
+                    [[-1.0, 0.0], [0.5, 1.0]],
+                ]
+            ]
+        )
+        return sample.repeat(kwargs["batch_size"], 1, 1, 1)
+
+    def it2i_generate(self, tokenizer, prompt, images, **kwargs):
+        self.call_kwargs = {
+            "tokenizer": tokenizer,
+            "prompt": prompt,
+            "images": images,
+            **kwargs,
+        }
+        self.it2i_calls.append(self.call_kwargs)
         sample = torch.tensor(
             [
                 [
@@ -638,6 +666,9 @@ def test_sensenova_u1_sampling_params_keep_private_defaults_internal():
         "cfg_interval": (0.0, 1.0),
         "t_eps": 0.02,
         "think_mode": False,
+        "img_cfg_scale": 1.0,
+        "input_max_pixels": None,
+        "do_resize": True,
     }
 
 
@@ -658,11 +689,112 @@ def test_sensenova_u1_accepts_openai_image_api_num_frames():
     assert params.data_type == DataType.IMAGE
 
 
+def test_sensenova_u1_resolves_edit_auto_size_from_first_input_ratio():
+    assert resolve_sensenova_u1_edit_auto_size(416, 608) == (1408, 2048)
+    assert resolve_sensenova_u1_edit_auto_size(1600, 800) == (2048, 1024)
+    assert resolve_sensenova_u1_edit_auto_size(100, 1000) == (512, 2048)
+
+
+def test_sensenova_u1_detects_explicit_size_fields():
+    assert has_sensenova_u1_explicit_size({"size"})
+    assert has_sensenova_u1_explicit_size({"width"})
+    assert has_sensenova_u1_explicit_size({"height"})
+    assert not has_sensenova_u1_explicit_size({"prompt", "image_path"})
+
+
+def test_sensenova_u1_sampling_adjust_scales_first_input_to_2k_long_side(tmp_path):
+    image_path = tmp_path / "wide.png"
+    Image.new("RGB", (1600, 800)).save(image_path)
+    params = SenseNovaU1SamplingParams(
+        prompt="replace text",
+        image_path=str(image_path),
+    )
+    params._explicit_fields = {"prompt", "image_path"}
+
+    params._adjust(
+        SimpleNamespace(
+            pipeline_config=SenseNovaU1PipelineConfig(),
+            output_path=None,
+            comfyui_mode=False,
+            num_gpus=1,
+        )
+    )
+
+    assert (params.width, params.height) == (2048, 1024)
+
+
+def test_sensenova_u1_sampling_adjust_uses_preprocessed_image_size(
+    tmp_path, monkeypatch
+):
+    image_path = tmp_path / "wide.png"
+    Image.new("RGB", (1600, 800)).save(image_path)
+
+    def load_transposed_image(path, convert_method=None):
+        assert path == str(image_path)
+        image = Image.new("RGB", (800, 1600))
+        return convert_method(image) if convert_method is not None else image
+
+    monkeypatch.setattr(
+        "sglang.multimodal_gen.configs.sample.sensenova_u1.load_image",
+        load_transposed_image,
+    )
+    params = SenseNovaU1SamplingParams(
+        prompt="replace text",
+        image_path=str(image_path),
+    )
+    params._explicit_fields = {"prompt", "image_path"}
+
+    params._adjust(
+        SimpleNamespace(
+            pipeline_config=SenseNovaU1PipelineConfig(),
+            output_path=None,
+            comfyui_mode=False,
+            num_gpus=1,
+        )
+    )
+
+    assert (params.width, params.height) == (1024, 2048)
+
+
+def test_sensenova_u1_sampling_adjust_preserves_explicit_size(tmp_path):
+    image_path = tmp_path / "wide.png"
+    Image.new("RGB", (1600, 800)).save(image_path)
+    params = SenseNovaU1SamplingParams(
+        prompt="replace text",
+        image_path=str(image_path),
+        width=1024,
+        height=1024,
+    )
+    params._explicit_fields = {"prompt", "image_path", "size"}
+
+    params._adjust(
+        SimpleNamespace(
+            pipeline_config=SenseNovaU1PipelineConfig(),
+            output_path=None,
+            comfyui_mode=False,
+            num_gpus=1,
+        )
+    )
+
+    assert (params.width, params.height) == (1024, 1024)
+
+
 def test_sensenova_u1_scheduler_capabilities():
     config = SenseNovaU1PipelineConfig()
 
+    assert config.task_type.name == "TI2I"
     assert config.supports_dynamic_batching()
     assert config.supports_sequential_multi_output_inference()
+
+
+def test_sensenova_u1_warmup_defaults_to_text_to_image_signature():
+    server_args = SimpleNamespace(
+        pipeline_config=SenseNovaU1PipelineConfig(),
+        enable_breakable_cuda_graph=False,
+    )
+
+    assert should_include_warmup_image(server_args, server_based_warmup=True) is False
+    assert should_include_warmup_image(server_args, server_based_warmup=False) is False
 
 
 def _make_sensenova_u1_scheduler_request(
@@ -1037,6 +1169,7 @@ def test_sensenova_u1_rejects_video_frame_count():
 def test_sensenova_u1_cli_args_expose_only_sglang_compatible_fields():
     args = SimpleNamespace(
         prompt="hello",
+        image_path="image_google.png",
         width=2304,
         height=4096,
         guidance_scale=4.5,
@@ -1054,6 +1187,7 @@ def test_sensenova_u1_cli_args_expose_only_sglang_compatible_fields():
     cli_args = SenseNovaU1SamplingParams.get_cli_args(args)
 
     assert cli_args["prompt"] == "hello"
+    assert cli_args["image_path"] == "image_google.png"
     assert cli_args["width"] == 2304
     assert cli_args["height"] == 4096
     assert cli_args["guidance_scale"] == 4.5
@@ -1067,6 +1201,46 @@ def test_sensenova_u1_cli_args_expose_only_sglang_compatible_fields():
     assert request.profile_all_stages
     assert request.num_profiled_timesteps == 3
     assert request.perf_dump_path == "/tmp/sensenova-perf.json"
+
+
+def test_sensenova_u1_generation_stage_loads_image_path_rgba_with_white_background(
+    tmp_path,
+):
+    image_path = tmp_path / "transparent.png"
+    image = Image.new("RGBA", (2, 2), (0, 0, 0, 0))
+    image.putpixel((1, 0), (255, 0, 0, 255))
+    image.save(image_path)
+    sampling = SenseNovaU1SamplingParams(
+        prompt="replace text",
+        image_path=str(image_path),
+        width=2048,
+        height=2048,
+        seed=7,
+        do_resize=False,
+    )
+    batch = SimpleNamespace(
+        prompt=sampling.prompt,
+        width=sampling.width,
+        height=sampling.height,
+        guidance_scale=sampling.guidance_scale,
+        num_inference_steps=sampling.num_inference_steps,
+        seed=sampling.seed,
+        num_outputs_per_prompt=sampling.num_outputs_per_prompt,
+        condition_image=None,
+        image_path=str(image_path),
+        extra=sampling.build_request_extra(),
+        metrics=None,
+    )
+    model = _FakeSenseNovaModel()
+
+    SenseNovaU1GenerationStage(model=model, tokenizer="tok").forward(
+        batch, server_args=SimpleNamespace()
+    )
+
+    loaded = model.it2i_calls[0]["images"][0]
+    assert loaded.mode == "RGB"
+    assert loaded.getpixel((0, 0)) == (255, 255, 255)
+    assert loaded.getpixel((1, 0)) == (255, 0, 0)
 
 
 def test_sensenova_u1_generation_stage_uses_sglang_params_and_single_model_batch():
@@ -1112,6 +1286,144 @@ def test_sensenova_u1_generation_stage_uses_sglang_params_and_single_model_batch
     assert model.call_kwargs["num_steps"] == 30
     assert model.call_kwargs["batch_size"] == 1
     assert model.call_kwargs["seed"] == 123
+    assert len(model.t2i_calls) == 1
+    assert model.it2i_calls == []
+
+
+def test_sensenova_u1_generation_stage_uses_it2i_for_image_inputs():
+    sampling = SenseNovaU1SamplingParams(
+        prompt="make the sky orange",
+        width=2048,
+        height=2048,
+        guidance_scale=3.5,
+        img_cfg_scale=1.25,
+        cfg_norm="channel",
+        input_max_pixels=512 * 512,
+        seed=11,
+    )
+    batch = SimpleNamespace(
+        prompt=sampling.prompt,
+        width=sampling.width,
+        height=sampling.height,
+        guidance_scale=sampling.guidance_scale,
+        num_inference_steps=sampling.num_inference_steps,
+        seed=sampling.seed,
+        num_outputs_per_prompt=sampling.num_outputs_per_prompt,
+        condition_image=[Image.new("RGBA", (64, 32), (255, 0, 0, 128))],
+        image_path=None,
+        extra=sampling.build_request_extra(),
+        metrics=None,
+    )
+    model = _FakeSenseNovaModel()
+    stage = SenseNovaU1GenerationStage(model=model, tokenizer="tok")
+
+    output = stage.forward(batch, server_args=SimpleNamespace())
+
+    assert len(output.output) == 1
+    assert model.t2i_calls == []
+    assert len(model.it2i_calls) == 1
+    call = model.it2i_calls[0]
+    assert call["tokenizer"] == "tok"
+    assert call["prompt"] == "make the sky orange"
+    assert call["image_size"] == (2048, 1024)
+    assert call["cfg_scale"] == 3.5
+    assert call["img_cfg_scale"] == 1.25
+    assert call["cfg_norm"] == "channel"
+    assert call["num_steps"] == 50
+    assert call["seed"] == 11
+    assert len(call["images"]) == 1
+    assert call["images"][0].mode == "RGB"
+    assert call["images"][0].size != (64, 32)
+
+
+def test_sensenova_u1_it2i_preserves_input_aspect_ratio_for_output_size():
+    sampling = SenseNovaU1SamplingParams(
+        prompt="replace the text",
+        width=1024,
+        height=1024,
+    )
+    batch = SimpleNamespace(
+        prompt=sampling.prompt,
+        width=sampling.width,
+        height=sampling.height,
+        guidance_scale=sampling.guidance_scale,
+        num_inference_steps=sampling.num_inference_steps,
+        seed=sampling.seed,
+        num_outputs_per_prompt=sampling.num_outputs_per_prompt,
+        condition_image=[Image.new("RGB", (1600, 800))],
+        image_path=None,
+        extra=sampling.build_request_extra(),
+        metrics=None,
+    )
+    model = _FakeSenseNovaModel()
+
+    SenseNovaU1GenerationStage(model=model, tokenizer="tok").forward(
+        batch, server_args=SimpleNamespace()
+    )
+
+    out_width, out_height = model.it2i_calls[0]["image_size"]
+    assert (out_width, out_height) == (2048, 1024)
+    assert out_width % 32 == 0
+    assert out_height % 32 == 0
+    assert abs((out_width / out_height) - 2.0) < 0.05
+    assert (batch.width, batch.height) == (out_width, out_height)
+
+
+def test_sensenova_u1_it2i_preserves_explicit_output_size():
+    sampling = SenseNovaU1SamplingParams(
+        prompt="replace the text",
+        width=1024,
+        height=1024,
+    )
+    sampling._explicit_fields = {"width", "height"}
+    batch = SimpleNamespace(
+        prompt=sampling.prompt,
+        width=sampling.width,
+        height=sampling.height,
+        guidance_scale=sampling.guidance_scale,
+        num_inference_steps=sampling.num_inference_steps,
+        seed=sampling.seed,
+        num_outputs_per_prompt=sampling.num_outputs_per_prompt,
+        condition_image=[Image.new("RGB", (1600, 800))],
+        image_path=None,
+        extra=sampling.build_request_extra(),
+        metrics=None,
+    )
+    model = _FakeSenseNovaModel()
+
+    SenseNovaU1GenerationStage(model=model, tokenizer="tok").forward(
+        batch, server_args=SimpleNamespace()
+    )
+
+    assert model.it2i_calls[0]["image_size"] == (1024, 1024)
+    assert (batch.width, batch.height) == (1024, 1024)
+
+
+def test_sensenova_u1_generation_stage_rejects_cfg_zero_star_for_it2i():
+    sampling = SenseNovaU1SamplingParams(
+        prompt="edit",
+        width=2048,
+        height=2048,
+        cfg_norm="cfg_zero_star",
+    )
+    batch = SimpleNamespace(
+        prompt=sampling.prompt,
+        width=sampling.width,
+        height=sampling.height,
+        guidance_scale=sampling.guidance_scale,
+        num_inference_steps=sampling.num_inference_steps,
+        seed=sampling.seed,
+        num_outputs_per_prompt=sampling.num_outputs_per_prompt,
+        condition_image=[Image.new("RGB", (64, 64))],
+        image_path=None,
+        extra=sampling.build_request_extra(),
+        metrics=None,
+    )
+
+    with pytest.raises(ValueError, match="cfg_zero_star"):
+        SenseNovaU1GenerationStage(
+            model=_FakeSenseNovaModel(), tokenizer="tok"
+        ).forward(batch, server_args=SimpleNamespace())
 
 
 def test_sensenova_u1_generation_stage_passes_dynamic_batch_inputs():
