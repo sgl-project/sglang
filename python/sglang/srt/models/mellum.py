@@ -458,7 +458,6 @@ class MellumDecoderLayer(Qwen3MoeDecoderLayer):
             input_layernorm=self.input_layernorm,
             post_attention_layernorm=self.post_attention_layernorm,
             allow_reduce_scatter=True,
-            is_last_layer=(layer_id == cfg.num_hidden_layers - 1),
         )
 
 
