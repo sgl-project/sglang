@@ -44,6 +44,7 @@ def communicator(norm):
     c.input_layernorm = norm
     c._sp_steps = None
     c._input_scattered_steps = None
+    c._cp_steps = None
     c.qkv_latent_func = None
     c._context = None
     c.enable_fused_ar_quant = False
