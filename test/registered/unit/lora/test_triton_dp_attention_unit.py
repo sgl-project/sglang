@@ -222,7 +222,7 @@ def test_communicator_publishes_layout_at_each_transition(
     communicator._publish_lora_layout = publish_lora_layout
     communicator.layer_scatter_modes = SimpleNamespace(mlp_mode=mlp_mode)
     communicator._context = SimpleNamespace()
-    communicator._sp_region = False
+    communicator._sp_steps = None
     communicator.post_attention_layernorm = None
     communicator.input_layernorm = lambda x: x
     communicator.qkv_latent_func = None

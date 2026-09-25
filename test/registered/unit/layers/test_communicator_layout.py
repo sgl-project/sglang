@@ -123,14 +123,16 @@ class TestBoundarySelection(CustomTestCase):
                 make_context(),
                 Kind.NORM,
             ),
-            ((SCATTERED, SCATTERED, SCATTERED, SCATTERED), tp, Kind.NORM),
         ):
             with self.subTest(layout=layout):
                 self.assertIs(comm.mlp_input_kind(modes(*layout), context), kind)
-        with self.assertRaises(NotImplementedError):
-            comm.mlp_input_kind(
-                modes(SCATTERED, SCATTERED, TP_ATTN_FULL, TP_ATTN_FULL), tp
-            )
+        for layout in (
+            (SCATTERED, SCATTERED, TP_ATTN_FULL, TP_ATTN_FULL),
+            # The LayerNorm SP region chooses its steps from its declarations.
+            (SCATTERED, SCATTERED, SCATTERED, SCATTERED),
+        ):
+            with self.subTest(layout=layout), self.assertRaises(NotImplementedError):
+                comm.mlp_input_kind(modes(*layout), tp)
 
     def test_postprocess(self):
         self.assertIs(

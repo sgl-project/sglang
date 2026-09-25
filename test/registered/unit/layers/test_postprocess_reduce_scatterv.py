@@ -140,7 +140,7 @@ class TestPostprocessReduceScatterv(CustomTestCase):
     def test_postprocess_passes_the_layer_sparsity(self):
         seen = {}
         communicator = LayerCommunicator.__new__(LayerCommunicator)
-        communicator._sp_region = False
+        communicator._sp_steps = None
         communicator._context = None
         communicator._postprocess_scatters_to_local_tokens = False
         communicator.allow_reduce_scatter = False
@@ -157,7 +157,7 @@ class TestPostprocessReduceScatterv(CustomTestCase):
         for step in (object(), None):
             with self.subTest(reduce_scatter=step is not None):
                 communicator = LayerCommunicator.__new__(LayerCommunicator)
-                communicator._sp_region = False
+                communicator._sp_steps = None
                 communicator._postprocess_scatters_to_local_tokens = True
                 communicator._postprocess_dp_step = lambda forward_batch: step
                 with patch.object(

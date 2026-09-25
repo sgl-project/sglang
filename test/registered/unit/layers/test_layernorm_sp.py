@@ -14,6 +14,10 @@ import torch
 from sglang.srt.arg_groups.layernorm_sp_hook import validate_layernorm_sp
 from sglang.srt.layers import communicator as comm
 from sglang.srt.layers import layernorm_sp
+from sglang.srt.layers.boundary_layout import (
+    TokenAxis,
+    sequence_parallel_layer_sides,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.runtime_context import (
     get_flags,
@@ -26,6 +30,19 @@ from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=9, suite="base-a-test-cpu")
+
+
+def sp_region_steps():
+    """The steps a layer runs while a LayerNorm SP region is active."""
+    return comm._select_boundary_steps(
+        sequence_parallel_layer_sides(
+            axis_sizes={
+                TokenAxis.ATTN_DP: 1,
+                TokenAxis.ATTN_CP: 1,
+                TokenAxis.ATTN_TP_SCATTER: 2,
+            }
+        )
+    )
 
 
 def _initialize(*, enable=True, arch="Qwen3ForCausalLM"):
@@ -148,7 +165,7 @@ class TestSpRegionSteps(CustomTestCase):
 
     def communicator(self, *, first_layer):
         c = comm.LayerCommunicator.__new__(comm.LayerCommunicator)
-        c._sp_region = True
+        c._sp_steps = sp_region_steps()
         c.layer_scatter_modes = SimpleNamespace(is_first_layer=first_layer)
         c._attn_input_fusions = ()
         c.input_layernorm = _Norm()

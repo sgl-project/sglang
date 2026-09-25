@@ -24,6 +24,7 @@ from sglang.srt.layers.boundary_layout import (
     SumGroup,
     TokenAxis,
     decoder_layer_sides,
+    sequence_parallel_layer_sides,
 )
 from sglang.srt.layers.communicator import (
     LayerCommunicator,
@@ -437,8 +438,8 @@ class TestWhichLayersUseDeclarations(CustomTestCase):
                     communicator.allow_deferred_ffn_reduction = True
                     communicator.allow_reduce_scatter = False
                     self.assertIsNone(communicator._declared_sides())
-        # Modes given directly (Nemotron-H's stages, the SP sibling) do not say
-        # which rows the layer takes.
+        # Modes given directly (Nemotron-H's stages) do not say which rows the
+        # layer takes.
         direct = LayerScatterModes(
             layer_input_mode=ScatterMode.TP_ATTN_FULL,
             attn_mode=ScatterMode.TP_ATTN_FULL,
@@ -447,10 +448,6 @@ class TestWhichLayersUseDeclarations(CustomTestCase):
             layer_output_mode=ScatterMode.TP_ATTN_FULL,
         )
         self.assertFalse(self.declared(build(direct, dp)))
-        with planning(dp, sp=True):
-            communicator = LayerCommunicator.__new__(LayerCommunicator)
-            communicator.layer_scatter_modes = layer_facts(1, 3)
-            self.assertIsNone(communicator._declared_sides())
 
     def test_subclasses_that_pick_their_own_steps(self):
         for cls in (
@@ -626,6 +623,67 @@ class TestFusedKernelsTakeOnlyTheStepsTheyComplete(CustomTestCase):
                         post_attention_layernorm=Norm(),
                     )
                 self.assertIs(communicator._mlp_input_may_return_new_residual, expected)
+
+
+class TestTheSequenceParallelRegion(CustomTestCase):
+    """While a LayerNorm SP region is active, the layer runs the steps its
+    region declarations choose: the linears gather and reduce-scatter
+    themselves, so every boundary stays on this rank's slice. Other batches
+    take the layer's ordinary declared steps."""
+
+    SP_STEPS = comm.BoundarySteps(
+        attention_input=comm.CommunicateSimpleFn._trivial,
+        ffn_input=comm._mlp_input_norm,
+        ffn_output_move=comm.CommunicateSummableTensorPairFn._trivial,
+    )
+
+    def test_the_region_declarations_choose_local_steps(self):
+        for attn_tp in (2, 4):
+            with self.subTest(attn_tp=attn_tp):
+                sides = sequence_parallel_layer_sides(
+                    axis_sizes={
+                        TokenAxis.ATTN_DP: 1,
+                        TokenAxis.ATTN_CP: 1,
+                        TokenAxis.ATTN_TP_SCATTER: attn_tp,
+                    }
+                )
+                local = frozenset({TokenAxis.ATTN_TP_SCATTER})
+                self.assertEqual(sides.input_rows.sharded, local)
+                self.assertEqual(sides.attention.gathers_itself, local)
+                self.assertEqual(sides.ffn.gathers_itself, local)
+                self.assertIsNone(sides.attention_output.group)
+                self.assertIsNone(sides.ffn_output.group)
+                self.assertEqual(comm._select_boundary_steps(sides), self.SP_STEPS)
+
+    def test_a_layer_under_sp_takes_both_sets_of_steps(self):
+        parallel = parallel_of(attn_dp=1, attn_tp=2)
+        for layer_id in range(3):
+            with self.subTest(layer_id=layer_id):
+                with planning(parallel, sp=True):
+                    communicator = LayerCommunicator(
+                        layer_scatter_modes=layer_facts(layer_id, 3),
+                        input_layernorm=Norm(),
+                        post_attention_layernorm=Norm(),
+                    )
+                self.assertEqual(communicator._sp_steps, self.SP_STEPS)
+                # Outside the region: the attention-TP sum, then add + norm.
+                self.assertIs(communicator._mlp_input.func, comm._mlp_input_without_dp)
+
+    def test_without_sp_there_is_no_region(self):
+        with planning(parallel_of(attn_dp=1, attn_tp=2)):
+            communicator = LayerCommunicator(
+                layer_scatter_modes=layer_facts(1, 3),
+                input_layernorm=Norm(),
+                post_attention_layernorm=Norm(),
+            )
+        self.assertIsNone(communicator._sp_steps)
+
+    def test_declarations_that_owe_a_sum_are_not_region_steps(self):
+        sides = sides_of(
+            {TokenAxis.ATTN_DP: 1, TokenAxis.ATTN_CP: 1, TokenAxis.ATTN_TP_SCATTER: 2}
+        )
+        with self.assertRaises(NotImplementedError):
+            comm._select_boundary_steps(sides)
 
 
 # ---------------------------------------------------------------------------
