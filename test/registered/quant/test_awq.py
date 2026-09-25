@@ -3,7 +3,7 @@ from types import SimpleNamespace
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
-from sglang.test.run_eval import run_eval
+from sglang.test.sgl_eval_utils import run_sgl_eval
 from sglang.test.test_utils import (
     DEFAULT_AWQ_MOE_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -42,16 +42,12 @@ class TestAWQ(CustomTestCase):
             num_threads=32,
         )
 
-        metrics = run_eval(args)
+        metrics = run_sgl_eval(args)
         self.assertGreater(metrics["score"], 0.64)
 
 
 @unittest.skipIf(is_in_amd_ci(), "AWQ Marlin is not supported on AMD GPUs")
 class TestAWQMarlinBfloat16(CustomTestCase):
-    """
-    Verify that the model can be loaded with bfloat16 dtype and awq_marlin quantization
-    """
-
     @classmethod
     def setUpClass(cls):
         cls.model = "QuantTrio/Qwen3-VL-30B-A3B-Instruct-AWQ"
@@ -76,7 +72,7 @@ class TestAWQMarlinBfloat16(CustomTestCase):
             num_threads=32,
         )
 
-        metrics = run_eval(args)
+        metrics = run_sgl_eval(args)
         self.assertGreater(metrics["score"], 0.80)
 
 
