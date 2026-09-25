@@ -5235,6 +5235,23 @@ class Scheduler(
                 3,
             )
 
+        ret["trimtab"] = {
+            "max_running_requests": self.max_running_requests,
+            "max_queued_requests": self.max_queued_requests,
+            "chunked_prefill_size": self.chunked_prefill_size,
+            "max_prefill_tokens": self.max_prefill_tokens,
+            "schedule_policy": self.schedule_policy,
+            "schedule_conservativeness": getattr(
+                self, "_trimtab_conservativeness", None
+            ),
+            "log_level": getattr(self, "_trimtab_log_level", None),
+            "ceilings": dict(
+                getattr(self, "_trimtab_ceilings", {}),
+                max_prefill_tokens=self.max_total_num_tokens,
+            ),
+            "max_total_num_tokens": self.max_total_num_tokens,
+        }
+
         if get_exec().moe.elastic_ep_backend is not None:
             from sglang.srt.elastic_ep.elastic_ep import ElasticEPStateManager
 
@@ -5272,6 +5289,20 @@ class Scheduler(
 
     def set_internal_state(self, recv_req: SetInternalStateReq):
         server_args_dict = recv_req.server_args
+
+        # trimtab (github.com/numinous-technology/trimtab)
+        # Hot scheduler knobs applied to the live instance. The scheduler
+        # loop reads these attributes every step, so a change takes effect
+        # on the next step. Values are validated against ceilings recorded
+        # at boot. Handled keys are consumed here; any remaining keys fall
+        # through to the stock allowlist below.
+        server_args_dict = dict(server_args_dict)
+        trimtab_ok, trimtab_msgs = _trimtab_apply_hot_knobs(self, server_args_dict)
+        for _m in trimtab_msgs:
+            logger.info(_m)
+        if not server_args_dict:
+            return SetInternalStateReqOutput(updated=trimtab_ok)
+
         args_allow_update = set(
             [
                 "pp_max_micro_batch_size",
@@ -6100,3 +6131,111 @@ def _make_abort_req(
             num_output_tokens=len(req.output_ids),
         ),
     )
+
+
+def _trimtab_apply_hot_knobs(scheduler, args: dict):
+    """Apply trimtab hot knobs to a live scheduler.
+
+    Mutates ``args``, consuming the keys it handles, and returns
+    ``(ok, messages)``. Handled knobs, all read by the scheduler loop on
+    every step.
+
+    max_running_requests   logical cap on concurrent running requests,
+                           valid range 1..the value allocated at boot
+    max_queued_requests    admission cap on the waiting queue, >= 0
+    chunked_prefill_size   prefill chunk size for the next batch, > 0
+    max_prefill_tokens     prefill token budget per batch, 1..KV pool size
+    schedule_policy        fcfs, lpm, dfs-weight, lof, random, priority
+    schedule_conservativeness  > 0, rebuilds the new-token-ratio watermarks
+    log_level              DEBUG, INFO, WARNING, ERROR
+    """
+    if not hasattr(scheduler, "_trimtab_ceilings"):
+        scheduler._trimtab_ceilings = {
+            "max_running_requests": scheduler.max_running_requests,
+        }
+    ok = True
+    msgs = []
+    if "max_running_requests" in args:
+        v = args.pop("max_running_requests")
+        ceiling = scheduler._trimtab_ceilings["max_running_requests"]
+        if not isinstance(v, (int, float)) or not (1 <= int(v) <= ceiling):
+            ok = False
+            msgs.append(
+                f"trimtab rejected max_running_requests={v}, "
+                f"valid range is 1..{ceiling} (the boot allocation)"
+            )
+        else:
+            scheduler.max_running_requests = int(v)
+            msgs.append(f"trimtab applied max_running_requests={int(v)}")
+    if "max_queued_requests" in args:
+        v = args.pop("max_queued_requests")
+        if not isinstance(v, (int, float)) or int(v) < 0:
+            ok = False
+            msgs.append(f"trimtab rejected max_queued_requests={v}, must be >= 0")
+        else:
+            scheduler.max_queued_requests = int(v)
+            msgs.append(f"trimtab applied max_queued_requests={int(v)}")
+    if "chunked_prefill_size" in args:
+        v = args.pop("chunked_prefill_size")
+        if not isinstance(v, (int, float)) or int(v) <= 0:
+            ok = False
+            msgs.append(f"trimtab rejected chunked_prefill_size={v}, must be > 0")
+        else:
+            scheduler.chunked_prefill_size = int(v)
+            msgs.append(f"trimtab applied chunked_prefill_size={int(v)}")
+    if "max_prefill_tokens" in args:
+        v = args.pop("max_prefill_tokens")
+        hi = scheduler.max_total_num_tokens
+        if not isinstance(v, (int, float)) or not (1 <= int(v) <= hi):
+            ok = False
+            msgs.append(
+                f"trimtab rejected max_prefill_tokens={v}, valid range is 1..{hi} (the KV pool)"
+            )
+        else:
+            scheduler.max_prefill_tokens = int(v)
+            msgs.append(f"trimtab applied max_prefill_tokens={int(v)}")
+    if "schedule_policy" in args:
+        v = args.pop("schedule_policy")
+        try:
+            new = scheduler.policy._validate_and_adjust_policy(
+                str(v), scheduler.policy.tree_cache
+            )
+        except ValueError as e:
+            ok = False
+            msgs.append(f"trimtab rejected schedule_policy={v}, {e}")
+        else:
+            scheduler.policy.policy = new
+            scheduler.schedule_policy = str(v)
+            msgs.append(f"trimtab applied schedule_policy={v} (effective {new.value})")
+    if "schedule_conservativeness" in args:
+        v = args.pop("schedule_conservativeness")
+        if not isinstance(v, (int, float)) or v <= 0:
+            ok = False
+            msgs.append(f"trimtab rejected schedule_conservativeness={v}, must be > 0")
+        else:
+            from sglang.srt.environ import envs
+
+            t = scheduler.new_token_ratio_tracker
+            t.init = min(envs.SGLANG_INIT_NEW_TOKEN_RATIO.get() * float(v), 1.0)
+            t.min = min(t.init * envs.SGLANG_MIN_NEW_TOKEN_RATIO_FACTOR.get(), 1.0)
+            t.decay = (t.init - t.min) / envs.SGLANG_NEW_TOKEN_RATIO_DECAY_STEPS.get()
+            t.current = t.init
+            scheduler._trimtab_conservativeness = float(v)
+            msgs.append(
+                f"trimtab applied schedule_conservativeness={v} (new_token_ratio init {t.init:.3f} min {t.min:.3f})"
+            )
+    if "log_level" in args:
+        v = str(args.pop("log_level")).upper()
+        if v not in ("DEBUG", "INFO", "WARNING", "ERROR"):
+            ok = False
+            msgs.append(
+                f"trimtab rejected log_level={v}, must be DEBUG, INFO, WARNING or ERROR"
+            )
+        else:
+            import logging as _logging
+
+            _logging.getLogger("sglang").setLevel(v)
+            _logging.getLogger().setLevel(v)
+            scheduler._trimtab_log_level = v
+            msgs.append(f"trimtab applied log_level={v}")
+    return ok, msgs
