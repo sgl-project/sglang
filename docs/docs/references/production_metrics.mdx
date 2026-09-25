@@ -9,6 +9,8 @@ An example of the monitoring dashboard is available in [examples/monitoring/graf
 
 ## Language model metrics
 
+`sglang:time_to_first_token_seconds` measures the time from request creation in the API server to its first output arriving after detokenization, which may contain no printable text. For non-streaming requests the first output is flushed immediately, except that a pending stop-string prefix, a stop regex, or beam search defers it.
+
 Here is an example of the metrics:
 
 ```text Output
