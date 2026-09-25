@@ -9,6 +9,7 @@ import torch
 import sglang
 from sglang.srt.layers import communicator as comm
 from sglang.srt.layers.communicator import (
+    FfnExitFusion,
     LayerCommunicator,
     UnreducedOutput,
     reduce_output,
@@ -41,10 +42,12 @@ def make_communicator(
     communicator.allow_deferred_ffn_reduction = allow_deferred
     communicator.next_takes_attention_partial = False
     if cls is LayerCommunicator:
+        communicator._ffn_exit_fusions = ()
         communicator._ffn_sum_moves_to_next_layer = MagicMock(return_value=fuse)
     else:
-        # A subclass decides through its own hooks; no TP left to defer over.
+        # A subclass decides through its own entries; no TP left to defer over.
         communicator._context = types.SimpleNamespace(tp_size=1)
+        communicator._ffn_exit_fusions = communicator._select_ffn_exit_fusions()
     communicator._ffn_leaves_sum_to_reduce_scatter = MagicMock(
         return_value=reduce_scatter
     )
@@ -174,8 +177,8 @@ class TestFfnExit(CustomTestCase):
 
     def test_subclass_decisions_are_used(self):
         class NeverDefers(LayerCommunicator):
-            def should_fuse_mlp_allreduce_with_next_layer(self, forward_batch):
-                return False
+            def _select_ffn_exit_fusions(self):
+                return ()
 
         communicator = make_communicator(
             fuse=True, reduce_scatter=False, cls=NeverDefers
@@ -189,11 +192,8 @@ class TestFfnExit(CustomTestCase):
         handoff leaves finish() untouched for the next layer's input norm."""
 
         class Defers(LayerCommunicator):
-            def should_defer_moe_finalize(self, forward_batch, m=None):
-                return True
-
-            def should_fuse_mlp_allreduce_with_next_layer(self, forward_batch):
-                return False
+            def _select_ffn_exit_fusions(self):
+                return (lambda forward_batch: FfnExitFusion.DEFER_MOE_FINALIZE,)
 
         communicator = make_communicator(fuse=False, reduce_scatter=False, cls=Defers)
         handoff = object()
@@ -283,6 +283,7 @@ class TestSelectFfnCompletion(CustomTestCase):
         communicator = LayerCommunicator.__new__(LayerCommunicator)
         communicator.allow_deferred_ffn_reduction = True
         communicator.next_takes_attention_partial = False
+        communicator._ffn_exit_fusions = ()
         communicator.is_last_layer = is_last_layer
         communicator._sp_region = sp_region
         communicator._postprocess_scatters_to_local_tokens = scatters

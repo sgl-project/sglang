@@ -14,6 +14,7 @@ import msgspec
 import torch
 
 from sglang.srt.layers.communicator import (
+    FfnExitFusion,
     LayerCommunicator,
     ScatterMode,
     UnreducedOutput,
@@ -293,15 +294,33 @@ class CuteDSLFusionLayerCommunicator(LayerCommunicator):
             and self._can_consume_post_moe_all_reduce(forward_batch, m)
         )
 
-    def should_defer_moe_finalize(
-        self, forward_batch: ForwardBatch, m: int | None = None
-    ) -> bool:
-        """Deferring skips the post-experts all-reduce on the promise of a handoff."""
-        if not self.may_defer_moe_finalize:
-            return False
-        if m is None:
-            m = int(forward_batch.input_ids.shape[0])
-        return self._should_use_finalize(forward_batch, m)
+    def _select_ffn_exit_fusions(self):
+        return (
+            self._defer_moe_finalize_cutedsl,
+            self._absorb_all_reduce_cutedsl,
+            *super()._select_ffn_exit_fusions(),
+        )
+
+    def _defer_moe_finalize_cutedsl(
+        self, forward_batch: ForwardBatch
+    ) -> Optional[FfnExitFusion]:
+        """The MoE hands its unfinalized output to the next layer's finalize +
+        all-reduce + norm."""
+        if self.may_defer_moe_finalize and self._should_use_finalize(
+            forward_batch, int(forward_batch.input_ids.shape[0])
+        ):
+            return FfnExitFusion.DEFER_MOE_FINALIZE
+        return None
+
+    def _absorb_all_reduce_cutedsl(
+        self, forward_batch: ForwardBatch
+    ) -> Optional[FfnExitFusion]:
+        """The next layer's AR + RMSNorm takes the post-experts all-reduce."""
+        if self._can_absorb_post_moe_all_reduce(
+            forward_batch, int(forward_batch.input_ids.shape[0])
+        ):
+            return FfnExitFusion.NEXT_INPUT
+        return None
 
     def _common_eligible(self, forward_batch: ForwardBatch, m: int) -> bool:
         parallel = get_parallel()
@@ -319,16 +338,6 @@ class CuteDSLFusionLayerCommunicator(LayerCommunicator):
             # Restates the base's moe-cp, MOE_FULL and SCATTERED refusals.
             and self.layer_scatter_modes.mlp_mode is ScatterMode.FULL
         )
-
-    def should_fuse_mlp_allreduce_with_next_layer(
-        self, forward_batch: ForwardBatch
-    ) -> bool:
-        m = int(forward_batch.input_ids.shape[0])
-        if self.should_defer_moe_finalize(forward_batch, m):
-            return True
-        if self._can_absorb_post_moe_all_reduce(forward_batch, m):
-            return True
-        return super().should_fuse_mlp_allreduce_with_next_layer(forward_batch)
 
 
 def install_cutedsl_fusion(

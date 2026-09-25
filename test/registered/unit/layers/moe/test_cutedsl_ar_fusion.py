@@ -5,6 +5,7 @@ import pytest
 import torch
 
 from sglang.srt.layers.communicator import (
+    FfnExitFusion,
     LayerCommunicator,
     ScatterMode,
     UnreducedOutput,
@@ -142,8 +143,8 @@ def test_a_replicated_output_producer_keeps_its_own_all_reduce(eligible):
         "should_fuse_mlp_allreduce_with_next_layer",
         return_value=False,
     ):
-        assert replicated.should_fuse_mlp_allreduce_with_next_layer(_DECODE) is False
-        assert plain.should_fuse_mlp_allreduce_with_next_layer(_DECODE) is True
+        assert replicated._absorb_all_reduce_cutedsl(_DECODE) is None
+        assert plain._absorb_all_reduce_cutedsl(_DECODE) is FfnExitFusion.NEXT_INPUT
     # Consuming what a predecessor skipped stays independently eligible.
     assert replicated._can_consume_post_moe_all_reduce(_DECODE, 8) is True
 
