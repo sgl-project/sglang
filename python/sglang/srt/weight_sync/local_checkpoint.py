@@ -64,6 +64,10 @@ def pull(
     otherwise — then applies the remaining deltas in order. A local checkpoint
     already past the seed point just continues its delta chain. Raises on any
     per-tensor checksum mismatch (fail loud, never serve bad weights).
+
+    Version 0 explicitly resets a previous stream. Callers must finish all
+    startup resets before pulling positive versions; concurrent streams sharing
+    one local checkpoint are not supported.
     """
     # Object-store-backed shared filesystems lack cross-host read-after-write
     # consistency: the publisher's files only appear here after an explicit
@@ -73,6 +77,11 @@ def pull(
         _load_hook(pre_read_hook)(source_dir, target_version)
     with _pull_lock(local_checkpoint_dir):
         applied = _read_applied_version(local_checkpoint_dir)  # None on a fresh host
+        # Miles waits for every startup pull(0) before publishing new deltas.
+        # The host-local directory can outlive its previous trainer. Only an
+        # explicit reset may go backwards; a stale positive pull stays a no-op.
+        if target_version == 0 and applied is not None and applied > 0:
+            applied = None
         # Scan back from the target for the newest full version. Stop at the
         # local state — below it a reset can never be needed (or, on a fresh
         # host, at 0 = the engine's base).
@@ -173,6 +182,16 @@ def _write_applied_version(local_checkpoint_dir: str, version: int) -> None:
     os.replace(tmp, path)
 
 
+def _invalidate_applied_version(local_checkpoint_dir: str) -> None:
+    # In-place writes can fail after changing some tensors. Without a valid
+    # marker, the next pull reseeds from a full checkpoint before replaying;
+    # retrying an XOR delta against partially updated bytes would corrupt them.
+    try:
+        os.unlink(os.path.join(local_checkpoint_dir, SYNC_DIR, "state.json"))
+    except FileNotFoundError:
+        pass
+
+
 def _drop_page_cache(path: str) -> None:
     """Evict a file from the page cache (POSIX_FADV_DONTNEED)."""
     if not hasattr(os, "posix_fadvise"):  # POSIX-only (absent on macOS/Windows)
@@ -196,6 +215,7 @@ def _reset_checkpoint(src_dir: str, local_checkpoint_dir: str, version: int) -> 
     )
     os.makedirs(local_checkpoint_dir, exist_ok=True)
     src_files = [entry for entry in os.scandir(src_dir) if entry.is_file()]
+    _invalidate_applied_version(local_checkpoint_dir)
     for entry in src_files:
         shutil.copy2(entry.path, os.path.join(local_checkpoint_dir, entry.name))
         # don't let the source evict the local copy we keep resident
@@ -235,7 +255,8 @@ def _apply_delta(local_checkpoint_dir: str, version_dir: str) -> None:
     pool (each writes a distinct mmap region, so the writes don't conflict). Any mismatch raises.
     """
     with open(os.path.join(version_dir, "model.safetensors.index.json")) as f:
-        meta = json.load(f)["metadata"]
+        index = json.load(f)
+    meta = index["metadata"]
     applied = _read_applied_version(local_checkpoint_dir)
     if applied == int(meta["version"]):
         return
@@ -255,13 +276,27 @@ def _apply_delta(local_checkpoint_dir: str, version_dir: str) -> None:
     lock = threading.Lock()
     file_bytes = []  # keep alive: items hold zero-copy views into these
     items = []  # (name, compressed_view, path, offset, nbytes, want_checksum)
+    tensors_by_file = {}
+    for name, filename in index["weight_map"].items():
+        tensors_by_file.setdefault(filename, set()).add(name)
     try:
-        for delta_file in sorted(glob.glob(os.path.join(version_dir, "*.safetensors"))):
+        # The index is the publication boundary. Globbing can silently accept
+        # an incomplete object-store view as an empty or partial update, then
+        # advance the version without applying every published tensor.
+        for filename, expected_names in sorted(tensors_by_file.items()):
+            delta_file = os.path.join(version_dir, filename)
             with open(delta_file, "rb") as f:
                 blob = f.read()
             file_bytes.append(blob)
             (header_len,) = struct.unpack("<Q", blob[:8])
             header = json.loads(blob[8 : 8 + header_len])
+            actual_names = header.keys() - {"__metadata__"}
+            if actual_names != expected_names:
+                raise RuntimeError(
+                    f"delta tensor mapping mismatch in {delta_file}: "
+                    f"missing {sorted(expected_names - actual_names)}, "
+                    f"unexpected {sorted(actual_names - expected_names)}"
+                )
             want_checksums = header.get("__metadata__", {})
             view = memoryview(blob)
             for name, info in header.items():
@@ -334,6 +369,7 @@ def _apply_delta(local_checkpoint_dir: str, version_dir: str) -> None:
             apply_tensor = apply_overwrite
         else:
             raise NotImplementedError(f"delta encoding {encoding!r} not supported")
+        _invalidate_applied_version(local_checkpoint_dir)
         with ThreadPoolExecutor(max_workers=NUM_WORKERS) as pool:
             list(pool.map(apply_tensor, items))
         # no msync: the engine reads these pages via the shared cache; durability
