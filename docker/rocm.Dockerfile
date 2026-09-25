@@ -1004,6 +1004,11 @@ RUN /bin/bash -lc 'set -euo pipefail; \
     ldconfig; \
     echo "[MORI] rocm_sysdeps prefix: ${ROCM_SYSDEPS}"; \
   fi; \
+  # cco's SDMA copy-engine path is OFF by default in MORI's CMake, and without
+  # it every put silently does nothing: the all-reduce returns mostly the local
+  # slice, the model still answers, and a fused kernel measures faster than it
+  # is because it moves no data. SGLang's fused wo_b needs it.
+  export BUILD_CCO_SDMA=ON; \
   python3 setup.py develop; \
   python3 -c "import os, torch; print(os.path.join(os.path.dirname(torch.__file__), \"lib\"))" > /etc/ld.so.conf.d/torch.conf; \
   ldconfig; \

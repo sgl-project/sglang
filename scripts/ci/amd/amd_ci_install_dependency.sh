@@ -279,6 +279,12 @@ if docker exec ci_sglang test -d /sgl-workspace/mori; then
       echo "\${ROCM_SYSDEPS}/lib" > /etc/ld.so.conf.d/rocm-sysdeps.conf
       ldconfig
     fi
+    # Must match docker/rocm.Dockerfile: cco's SDMA path is OFF by default in
+    # MORI's CMake, and without it every put silently does nothing -- the
+    # all-reduce returns mostly the local slice and a fused kernel measures
+    # faster than it is because it moves no data. This step overwrites the
+    # image's MORI, so leaving it out here would undo the Dockerfile's setting.
+    export BUILD_CCO_SDMA=ON
     python3 setup.py develop
     python3 -c 'import os, torch; print(os.path.join(os.path.dirname(torch.__file__), \"lib\"))' > /etc/ld.so.conf.d/torch.conf
     ldconfig
