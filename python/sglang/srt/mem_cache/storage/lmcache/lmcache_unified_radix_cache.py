@@ -55,6 +55,8 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
         lmcache_config_file: Optional[str],
         forward_stream: Any,
     ) -> None:
+        # The parent constructor calls reset() before the connector exists.
+        self.lmcache_connector: Optional[UnifiedLMCacheMPConnector] = None
         super().__init__(params)
         self._mamba_component = self._find_mamba_component()
         self.lmcache_connector = UnifiedLMCacheMPConnector(
@@ -388,8 +390,7 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
         return self.lmcache_connector.clear()
 
     def reset(self) -> None:
-        # The parent constructor may call reset before the connector exists.
-        connector = getattr(self, "lmcache_connector", None)
+        connector = self.lmcache_connector
         if connector is not None:
             for flow in list(self._external_flows.values()):
                 if flow.load is not None:
