@@ -2628,6 +2628,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         input_layernorm: nn.Module,
         post_attention_layernorm: nn.Module,
         qkv_latent_func: Optional[Callable],
+        allow_deferred_ffn_reduction: bool = True,
     ):
         """The communicator for this layer's norms; it chooses its boundary
         steps from them at construction."""
@@ -2648,6 +2649,7 @@ class DeepseekV2DecoderLayer(nn.Module):
             post_attention_layernorm=post_attention_layernorm,
             allow_reduce_scatter=True,
             qkv_latent_func=qkv_latent_func,
+            allow_deferred_ffn_reduction=allow_deferred_ffn_reduction,
         )
 
     def _detect_gfx95_quant_format(self) -> str:
