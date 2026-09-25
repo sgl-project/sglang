@@ -779,6 +779,20 @@ def reduce_moe_output(hidden_states: torch.Tensor) -> torch.Tensor:
     return hidden_states
 
 
+def should_add_replicated_moe_output() -> bool:
+    """Whether this rank adds an output every TP rank holds in full, such as a
+    shared expert replicated with tp_size=1, to its MoE output.
+
+    Call it after the MoE block's own reduction. When a later step still sums
+    the output over TP, only TP rank 0 adds it, so the sum counts it once.
+    """
+    parallel = get_parallel()
+    summed_later = should_skip_post_experts_all_reduce(
+        is_tp_path=True
+    ) and not post_experts_output_is_complete(is_tp_path=True)
+    return not (parallel.tp_size > 1 and summed_later and parallel.tp_rank != 0)
+
+
 def can_merge_post_experts_all_reduce() -> bool:
     """Whether the EP and MoE-TP reductions can collapse into one _TP all-reduce.
 
@@ -824,23 +838,24 @@ def post_experts_all_reduce(hidden_states: torch.Tensor) -> torch.Tensor:
     return hidden_states
 
 
+def post_experts_reduction_group():
+    """The group one all-reduce of an MoE output runs over: TP when the EP and
+    MoE-TP reductions merge, otherwise EP, otherwise MoE-TP. The same group
+    ``resolve_fusion_group`` builds the fused workspace on."""
+    parallel = get_parallel()
+    if can_merge_post_experts_all_reduce():
+        return parallel.tp_group
+    if parallel.moe_ep_size > 1:
+        return parallel.moe_ep_group
+    return parallel.moe_tp_group
+
+
 def deferred_post_experts_all_reduce(hidden_states: torch.Tensor) -> torch.Tensor:
     """Run the post-experts reduction that was deferred to allreduce fusion.
 
-    Called when the fused residual+LN kernel cannot service the shape. Reduces
-    over the same group ``resolve_fusion_group`` builds the workspace on.
+    Called when the fused residual+LN kernel cannot service the shape.
     """
-    from sglang.srt.distributed.communication_op import (
-        moe_expert_parallel_all_reduce,
-        moe_tensor_model_parallel_all_reduce,
-        tensor_model_parallel_all_reduce,
-    )
-
-    if can_merge_post_experts_all_reduce():
-        return tensor_model_parallel_all_reduce(hidden_states)
-    if get_parallel().moe_ep_size > 1:
-        return moe_expert_parallel_all_reduce(hidden_states)
-    return moe_tensor_model_parallel_all_reduce(hidden_states)
+    return post_experts_reduction_group().all_reduce(hidden_states)
 
 
 @contextmanager

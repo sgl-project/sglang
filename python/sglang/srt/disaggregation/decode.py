@@ -2554,23 +2554,15 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 "sampling mask buffer disabled on decode side"
             )
             sampling_mask_len = int(output_token_sampling_mask_len[0].item())
-            if sampling_mask_len < 0:
-                decode_req.req.output_token_sampling_mask.append(None)
-                decode_req.req.output_token_sampling_logprobs.append(None)
-            else:
-                decode_req.req.output_token_sampling_mask.append(
-                    output_token_sampling_mask_idx[:sampling_mask_len].cpu().tolist()
-                )
-                if decode_req.req.sampling_logprobs_mode == "support":
-                    decode_req.req.output_token_sampling_logprobs.append(
-                        output_token_sampling_logprobs[:sampling_mask_len]
-                        .cpu()
-                        .tolist()
-                    )
-                else:
-                    decode_req.req.output_token_sampling_logprobs.append(
-                        float(output_token_sampling_logprobs[0].item())
-                    )
+            num_logprobs = (
+                sampling_mask_len
+                if decode_req.req.sampling_logprobs_mode == "support"
+                else 1
+            )
+            decode_req.req.sampling_mask_rows.append(
+                output_token_sampling_mask_idx[:sampling_mask_len].cpu().numpy(),
+                output_token_sampling_logprobs[:num_logprobs].cpu().numpy(),
+            )
 
         decode_req.kv_receiver.clear()
         decode_req.kv_receiver = None
