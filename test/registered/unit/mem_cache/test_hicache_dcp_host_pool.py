@@ -10,6 +10,7 @@ pool sizing, and that the transfer entry points hand *physical* rows to the
 kernels.
 """
 
+import ctypes
 import tempfile
 import unittest
 from itertools import product
@@ -302,7 +303,7 @@ class TestDcpStoragePages(CustomTestCase):
                             target.kv_buffer, expected, rtol=0, atol=0
                         )
 
-    def test_invalid_logical_starts_and_zero_copy_are_rejected(self):
+    def test_invalid_logical_starts_are_rejected(self):
         pool = _make_host_pool(1, dcp_size=2, layout="page_first")
         for index in (-128, 1, 64):
             with self.subTest(index=index), self.assertRaises(ValueError):
@@ -311,8 +312,122 @@ class TestDcpStoragePages(CustomTestCase):
                 pool.set_from_flat_data_page(index, pool.get_dummy_flat_data_page())
         with self.assertRaises(IndexError):
             pool.get_data_page(pool.logical_size)
-        with self.assertRaises(NotImplementedError):
-            pool.get_page_buffer_meta(torch.arange(128))
+
+
+class TestDcpStorageBufferMeta(CustomTestCase):
+    @staticmethod
+    def _page_fragments(buffer, layout, page):
+        start = page * PHYSICAL_PAGE
+        end = start + PHYSICAL_PAGE
+        if layout == "layer_first":
+            return [buffer[layer, start:end] for layer in range(buffer.shape[0])]
+        if layout == "page_first":
+            return [buffer[start:end]]
+        return [buffer[page]]
+
+    def test_pointer_round_trip_to_different_allocations(self):
+        source_pages, target_pages = [3, 0, 5], [1, 6, 2]
+        for dcp_size, layout, dtype in product(
+            (1, 2, 4),
+            ("layer_first", "page_first", "page_first_direct"),
+            (torch.float16, torch.bfloat16, torch.uint8),
+        ):
+            for rank in range(dcp_size):
+                with self.subTest(
+                    dcp_size=dcp_size, rank=rank, layout=layout, dtype=dtype
+                ):
+                    source = _make_host_pool(
+                        rank, dcp_size=dcp_size, layout=layout, dtype=dtype
+                    )
+                    target = _make_host_pool(
+                        rank, dcp_size=dcp_size, layout=layout, dtype=dtype
+                    )
+                    values = (
+                        torch.arange(source.kv_buffer.numel()) * 13 + rank * 17
+                    ) % 251
+                    source.kv_buffer.copy_(values.reshape(source.kv_buffer.shape))
+                    target.kv_buffer.fill_(255)
+                    expected = target.kv_buffer.clone()
+                    metadata = []
+                    for pool, pages in ((source, source_pages), (target, target_pages)):
+                        logical_indices = torch.cat(
+                            [
+                                torch.arange(
+                                    page * pool.logical_page_size,
+                                    (page + 1) * pool.logical_page_size,
+                                )
+                                for page in pages
+                            ]
+                        )
+                        ptrs, sizes = pool.get_page_buffer_meta(logical_indices)
+                        fragments = [
+                            fragment
+                            for page in pages
+                            for fragment in self._page_fragments(
+                                pool.kv_buffer, layout, page
+                            )
+                        ]
+                        self.assertTrue(
+                            all(fragment.is_contiguous() for fragment in fragments)
+                        )
+                        self.assertEqual(
+                            ptrs, [fragment.data_ptr() for fragment in fragments]
+                        )
+                        self.assertEqual(
+                            sizes,
+                            [
+                                fragment.numel() * fragment.element_size()
+                                for fragment in fragments
+                            ],
+                        )
+                        self.assertEqual(
+                            sum(sizes),
+                            len(pages)
+                            * PHYSICAL_PAGE
+                            * pool.layer_num
+                            * pool.kv_cache_dim
+                            * pool.dtype.itemsize,
+                        )
+                        metadata.append((ptrs, sizes))
+                    source_ptrs, source_sizes = metadata[0]
+                    target_ptrs, target_sizes = metadata[1]
+                    self.assertEqual(source_sizes, target_sizes)
+                    # Exercise the raw pointers as a zero-copy transport would.
+                    for src, dst, size in zip(source_ptrs, target_ptrs, source_sizes):
+                        ctypes.memmove(dst, src, size)
+                    for source_page, target_page in zip(source_pages, target_pages):
+                        for src, dst in zip(
+                            self._page_fragments(source.kv_buffer, layout, source_page),
+                            self._page_fragments(expected, layout, target_page),
+                        ):
+                            dst.copy_(src)
+                    torch.testing.assert_close(
+                        target.kv_buffer, expected, rtol=0, atol=0
+                    )
+                    self.assertEqual(
+                        pool.get_page_buffer_meta(torch.empty(0, dtype=torch.int64)),
+                        ([], []),
+                    )
+
+    def test_invalid_logical_pages_are_rejected(self):
+        for dcp_size, layout in product(
+            (2, 4), ("layer_first", "page_first", "page_first_direct")
+        ):
+            pool = _make_host_pool(0, dcp_size=dcp_size, layout=layout)
+            page = pool.logical_page_size
+            with self.subTest(dcp_size=dcp_size, layout=layout):
+                with self.assertRaises(AssertionError):
+                    pool.get_page_buffer_meta(torch.arange(page - 1))
+                for start in (-page, 1, PHYSICAL_PAGE):
+                    with self.subTest(start=start), self.assertRaises(ValueError):
+                        pool.get_page_buffer_meta(torch.arange(start, start + page))
+                with self.assertRaises(IndexError):
+                    pool.get_page_buffer_meta(
+                        torch.arange(pool.logical_size, pool.logical_size + page)
+                    )
+        pool.layout = "page_first_kv_split"
+        with self.assertRaisesRegex(NotImplementedError, "split KV buffers"):
+            pool.get_page_buffer_meta(torch.arange(page))
 
 
 if __name__ == "__main__":
