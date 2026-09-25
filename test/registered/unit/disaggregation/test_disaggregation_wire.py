@@ -24,6 +24,7 @@ from sglang.srt.disaggregation.common.utils import (
     unpack_int_lists,
     unpack_list_of_buffers,
 )
+from sglang.srt.disaggregation.decode import DecodeRequest, DecodeTransferQueue
 from sglang.srt.disaggregation.decode_schedule_batch_mixin import (
     ScheduleBatchDisaggregationDecodeMixin,
 )
@@ -824,6 +825,67 @@ class TestEagleDsaSeedTransfer(CustomTestCase):
             self.assertEqual(length[0].item(), 3)
             self.assertEqual(mask.tolist(), [7, 8, 9])
             self.assertEqual(logprobs[0].item(), -0.5)
+
+    def test_sampling_mask_row_reaches_decode_unchanged(self):
+        """The prefill worker's first-token row is the row the decode worker streams."""
+        for mode, logprobs, expected in (
+            ("support", [-1.25, -1.5, -2.0], [[-1.25, -1.5, -2.0]]),
+            ("selected", [-0.5], [-0.5]),
+        ):
+            with (
+                self.subTest(sampling_logprobs_mode=mode),
+                envs.SGLANG_ENABLE_DISAGG_SAMPLING_MASK.override(True),
+            ):
+                buffers = MetadataBuffers(
+                    size=1,
+                    hidden_size=2,
+                    hidden_states_dtype=torch.float32,
+                    max_sampling_mask_tokens=4,
+                )
+                buffers.set_buf(
+                    self._make_req(
+                        None,
+                        sampling_mask=[7, 8, 9],
+                        sampling_logprobs=logprobs,
+                        sampling_logprobs_mode=mode,
+                    )
+                )
+                queue = DecodeTransferQueue.__new__(DecodeTransferQueue)
+                queue.scheduler = SimpleNamespace(
+                    kv_checksum_computer=None,
+                    batch_result_processor=SimpleNamespace(
+                        _maybe_update_reasoning_tokens=lambda req, token_id: None
+                    ),
+                )
+                queue.spec_algorithm = SimpleNamespace(is_none=lambda: True)
+                queue.metadata_buffers = buffers
+                req = SimpleNamespace(
+                    rid="r0",
+                    bootstrap_host="127.0.0.1",
+                    bootstrap_room=9,
+                    output_ids=[],
+                    return_logprob=False,
+                    return_sampling_mask=True,
+                    sampling_logprobs_mode=mode,
+                    sampling_mask_rows=SamplingMaskRows(),
+                    time_stats=SimpleNamespace(set_wait_queue_entry_time=lambda: None),
+                )
+
+                queue._commit_transfer_to_req(
+                    DecodeRequest(
+                        req=req,
+                        kv_receiver=SimpleNamespace(clear=lambda: None),
+                        metadata_buffer_index=0,
+                    )
+                )
+
+                self.assertEqual(req.output_ids, [101])
+                self.assertEqual(
+                    req.sampling_mask_rows.take().to_lists(
+                        support_logprobs=mode == "support"
+                    ),
+                    ([[7, 8, 9]], expected),
+                )
 
     def test_decode_input_requires_valid_seed_for_every_request(self):
         seeds = (
