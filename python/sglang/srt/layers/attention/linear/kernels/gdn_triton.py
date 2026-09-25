@@ -1,9 +1,14 @@
+import logging
+
 import torch
 
 from sglang.srt.layers.attention.linear.kernels.kernel_backend import (
     LinearAttnKernelBase,
 )
 from sglang.srt.utils import is_cpu, is_npu, is_xpu
+from sglang.srt.utils.common import get_bool_env_var
+
+logger = logging.getLogger(__name__)
 
 if not is_cpu():
     from sglang.kernels.ops.attention.fla.chunk import chunk_gated_delta_rule
@@ -35,6 +40,50 @@ elif is_xpu():
     from sglang.srt.hardware_backend.xpu.kernels.fla.fused_sigmoid_gating_recurrent import (
         fused_sigmoid_gating_delta_rule_update,
     )
+
+
+_AITER_GDN_DECODE_UNAVAILABLE = False
+
+
+def _aiter_gdn_decode_varlen():
+    """AITER's FlyDSL packed-decode recurrence, or None if it cannot be used.
+
+    Opt-in: SGLANG_USE_AITER plus SGLANG_AITER_GDN_DECODE. The kernel splits the
+    K axis across lanes, which raises occupancy sharply at low batch (the decode
+    grid is otherwise a few hundred single-wave workgroups) but costs at high
+    batch, where the extra lanes stop being free. Measured on MI355X at
+    concurrency 4 it is ~1.2x the Triton kernel; by concurrency 32 it is behind.
+    Hence opt-in rather than automatic.
+    """
+    global _AITER_GDN_DECODE_UNAVAILABLE
+    if _AITER_GDN_DECODE_UNAVAILABLE:
+        return None
+    if not (get_bool_env_var("SGLANG_USE_AITER") and get_bool_env_var("SGLANG_AITER_GDN_DECODE")):
+        _AITER_GDN_DECODE_UNAVAILABLE = True
+        return None
+    try:
+        from aiter.ops.flydsl.linear_attention_kernels import flydsl_gdn_decode_varlen
+    except ImportError:
+        logger.info("aiter FlyDSL GDN decode unavailable; keeping the Triton recurrence")
+        _AITER_GDN_DECODE_UNAVAILABLE = True
+        return None
+    return flydsl_gdn_decode_varlen
+
+
+def _try_aiter_gdn_decode(**kw):
+    """Run the AITER recurrence, or return None so the caller keeps Triton.
+
+    Shape/dtype support is decided by the AITER wrapper, which raises rather
+    than degrading; an unsupported batch simply falls back here.
+    """
+    fn = _aiter_gdn_decode_varlen()
+    if fn is None:
+        return None
+    try:
+        return fn(**kw)
+    except ValueError as exc:
+        logger.debug("aiter FlyDSL GDN decode declined this batch: %s", exc)
+        return None
 
 
 class TritonGDNKernel(LinearAttnKernelBase):
@@ -150,6 +199,22 @@ class TritonGDNKernel(LinearAttnKernelBase):
         query_start_loc: torch.Tensor,
         **kwargs,
     ) -> torch.Tensor:
+        out = _try_aiter_gdn_decode(
+            q=q,
+            k=k,
+            v=v,
+            a=a,
+            b=b,
+            A_log=A_log,
+            dt_bias=dt_bias,
+            state=ssm_states,
+            state_indices=cache_indices,
+            cu_seqlens=query_start_loc,
+            softplus_beta=1.0,
+            softplus_threshold=20.0,
+        )
+        if out is not None:
+            return out
         return fused_sigmoid_gating_delta_rule_update(
             A_log=A_log,
             dt_bias=dt_bias,
@@ -233,6 +298,28 @@ class TritonGDNKernel(LinearAttnKernelBase):
         retrieve_parent_token: torch.Tensor,
         **kwargs,
     ) -> torch.Tensor:
+        # The AITER kernel handles a linear draft chain (topk <= 1). A tree
+        # verify needs the parent-state reload, which it does not implement.
+        if retrieve_parent_token is None:
+            out = _try_aiter_gdn_decode(
+                q=q,
+                k=k,
+                v=v,
+                a=a,
+                b=b,
+                A_log=A_log,
+                dt_bias=dt_bias,
+                state=ssm_states,
+                state_indices=cache_indices,
+                cu_seqlens=query_start_loc,
+                softplus_beta=1.0,
+                softplus_threshold=20.0,
+                disable_state_update=True,
+                intermediate_states=intermediate_states_buffer,
+                intermediate_state_indices=intermediate_state_indices,
+            )
+            if out is not None:
+                return out
         return fused_sigmoid_gating_delta_rule_update(
             A_log=A_log,
             dt_bias=dt_bias,
