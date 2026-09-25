@@ -97,6 +97,7 @@ def _run_sgl_eval(
     num_examples: Optional[int] = None,
     num_threads: int = 512,
     thinking: bool = True,
+    chat_template_kwargs: Optional[dict] = None,
     reasoning_effort: Optional[str] = None,
     max_tokens: Optional[int] = None,
     temperature: Optional[float] = None,
@@ -134,7 +135,11 @@ def _run_sgl_eval(
     gen_kwargs = dict(
         max_tokens=max_tokens,
         reasoning_effort=reasoning_effort,
-        chat_template_kwargs={"thinking": True} if thinking else None,
+        chat_template_kwargs=(
+            chat_template_kwargs
+            if chat_template_kwargs is not None
+            else ({"thinking": True} if thinking else None)
+        ),
     )
     if temperature is not None:
         gen_kwargs["temperature"] = temperature
@@ -161,6 +166,27 @@ def _run_sgl_eval(
         summary_label=summary_label,
     )
     return result
+
+
+class MMLUSanityMixin:
+    """Short MMLU accuracy gate shared by ordinary and speculative sanity tests."""
+
+    mmlu_score_threshold: float = 0.60
+    mmlu_accept_length_thres: Optional[float] = None
+
+    def test_accuracy_floor(self):
+        _run_sgl_eval(
+            self,
+            eval_name="mmlu",
+            score_threshold=self.mmlu_score_threshold,
+            num_examples=200,
+            num_threads=64,
+            thinking=False,
+            chat_template_kwargs={"enable_thinking": False},
+            max_tokens=1024,
+            temperature=0,
+            accept_length_thres=self.mmlu_accept_length_thres,
+        )
 
 
 class GSM8KMixin:

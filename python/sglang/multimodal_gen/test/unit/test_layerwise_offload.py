@@ -1,4 +1,5 @@
 import gc
+import os
 import pathlib
 from contextlib import nullcontext
 from types import SimpleNamespace
@@ -48,8 +49,11 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload im
     get_layerwise_offload_component_names_for_pipeline,
     is_layerwise_offloaded_module,
     is_resident_layerwise_module,
+    iter_materialized_weights,
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload_components import (
+    RESIDENCY_LIFETIME_FORWARD,
+    RESIDENCY_LIFETIME_PERMANENT,
     RESIDENCY_POLICY_LEADING,
     RESIDENCY_POLICY_STRIDED,
 )
@@ -223,9 +227,11 @@ def _server_args(**kwargs):
         dit_offload_prefetch_size=1,
         dit_layerwise_resident_layers=0.0,
         dit_layerwise_residency_policy=RESIDENCY_POLICY_LEADING,
+        dit_layerwise_residency_lifetime=RESIDENCY_LIFETIME_FORWARD,
         layerwise_prefetch_size={},
         layerwise_resident_layers={},
         layerwise_residency_policy={},
+        layerwise_residency_lifetime={},
         pin_cpu_memory=False,
         # the pin budget ranks candidates by bytes x steps, and reads the step
         # count off the pipeline's sampling defaults
@@ -985,6 +991,7 @@ def _resident_manager(
     prefetch_size=1,
     resident_layers=0,
     residency_policy=RESIDENCY_POLICY_LEADING,
+    residency_lifetime=RESIDENCY_LIFETIME_FORWARD,
 ):
     return LayerwiseOffloadManager(
         model=model,
@@ -995,6 +1002,7 @@ def _resident_manager(
         prefetch_size=prefetch_size,
         resident_layers=resident_layers,
         residency_policy=residency_policy,
+        residency_lifetime=residency_lifetime,
     )
 
 
@@ -1055,6 +1063,81 @@ def test_prepare_for_next_req_repins_residents(monkeypatch):
     # The next denoise re-pins the resident set (union of prefetch window + residents).
     manager.prepare_for_next_req(non_blocking=False)
     assert {0, 1, 2} <= manager._gpu_layers
+
+
+def test_release_after_use_defaults_to_the_old_release_all(monkeypatch):
+    """The rename must not move anything: `release_after_use()` == the previous call.
+
+    `finish_use` used to call `release_all()` unconditionally. It now says
+    `release_after_use()`, and with the default argument that has to clear exactly the
+    same layers, or this refactor is a behaviour change wearing a new name.
+    """
+    _patch_fake_device(monkeypatch)
+    manager = _resident_manager(
+        _MultiBlockModel(6), num_layers=6, prefetch_size=1, resident_layers=3
+    )
+    _arm_residency(manager)
+    manager.prepare_for_next_req(non_blocking=False)
+    assert manager._gpu_layers
+
+    manager.release_after_use()
+    assert not manager._gpu_layers
+    assert manager._first_pass is True
+
+
+def test_release_all_still_drops_everything(monkeypatch):
+    """`release_all` keeps its literal contract for the full-reset callers.
+
+    `enable_offload` syncs to CPU and expects nothing left on the device; it
+    must not inherit the resident-set exemption.
+    """
+    _patch_fake_device(monkeypatch)
+    manager = _resident_manager(
+        _MultiBlockModel(6), num_layers=6, prefetch_size=1, resident_layers=3
+    )
+    _arm_residency(manager)
+    manager.prepare_for_next_req(non_blocking=False)
+
+    manager.release_all()
+    assert not manager._gpu_layers
+    assert manager._first_pass is True
+
+
+def test_release_after_use_can_keep_the_resident_set(monkeypatch):
+    """`keep_resident` is the whole point of naming the two calls apart.
+
+    A component whose use is one forward pass has its resident set prefetched
+    at the start of the use and dropped at the end, so `resident_layers` buys
+    it nothing. Measured on Qwen-Image-2.1 / RTX 5090:
+    `--layerwise-resident-layers text_encoder=0.8` logs `resident=53/66` and
+    moves neither memory nor latency.
+    """
+    _patch_fake_device(monkeypatch)
+    manager = _resident_manager(
+        _MultiBlockModel(6), num_layers=6, prefetch_size=1, resident_layers=3
+    )
+    _arm_residency(manager)
+    manager.prepare_for_next_req(non_blocking=False)
+
+    manager.release_after_use(keep_resident=True)
+    assert set(manager._gpu_layers) == set(manager._retained_set)
+    # Those layers never left the device, so the next use must not re-do the
+    # sequential first pass that exists for evicted pages.
+    assert manager._first_pass is False
+
+
+def test_release_after_use_keeps_nothing_when_no_residents_are_configured(monkeypatch):
+    """`keep_resident` with an empty resident set is still a full release."""
+    _patch_fake_device(monkeypatch)
+    manager = _resident_manager(
+        _MultiBlockModel(6), num_layers=6, prefetch_size=1, resident_layers=0
+    )
+    manager.prefetch_layer(0, non_blocking=False)
+    manager.prefetch_layer(1, non_blocking=False)
+    assert manager._gpu_layers
+
+    manager.release_after_use(keep_resident=True)
+    assert not manager._gpu_layers
 
 
 def _record_prepare(manager, monkeypatch):
@@ -1166,9 +1249,11 @@ def test_configure_logs_component_start_and_completion(monkeypatch):
         "Configuring layerwise offload for transformer (_ResidentComponent): "
         "blocks (8 layers)"
     )
+    # The lifetime in parentheses is the point of this line: `forward` says the
+    # set is re-established every request, not pinned for the server's lifetime.
     assert logs[-1] == (
         "Layerwise offload ready for transformer (_ResidentComponent) in 2.35s: "
-        "groups=1, layers=8, prefetch/group=2, resident=3/8, policy=leading"
+        "groups=1, layers=8, prefetch/group=2, resident=3/8 (forward), policy=leading"
     )
 
 
@@ -1303,6 +1388,60 @@ def test_disable_offload_short_circuits_residency_release(monkeypatch):
     model.prepare_for_next_req()
     for name, param in model.named_parameters():
         assert tuple(param.shape) != (1,), name
+
+
+def test_finish_use_drops_residents_unless_the_use_says_otherwise(monkeypatch):
+    """`retain_resident_layers` defaults off, so finish_use behaves as before.
+
+    Every existing pipeline builds its uses without the flag, so this is the
+    path they all take and it must keep releasing the resident set.
+    """
+    model = _configure_mixin_model(monkeypatch)
+    released = []
+    parked = []
+    for manager in model.layerwise_offload_managers:
+        manager.release_after_use = lambda *, keep_resident=False: released.append(
+            keep_resident
+        )
+    model.park_non_layer_weights = lambda: parked.append(True)
+
+    LayerwiseOffloadStrategy().finish_use(
+        model,
+        ComponentUse(stage_name="test", component_name="transformer"),
+        SimpleNamespace(),
+    )
+
+    assert released and all(keep is False for keep in released)
+    assert parked == [True]
+
+
+def test_finish_use_keeps_residents_when_the_use_declares_it(monkeypatch):
+    """The declaration reaches the manager, and parking is skipped with it.
+
+    Parking pushes the component's non-layer weights to host; doing that right
+    after deciding the room is available would undo the transfer being kept.
+    """
+    model = _configure_mixin_model(monkeypatch)
+    released = []
+    parked = []
+    for manager in model.layerwise_offload_managers:
+        manager.release_after_use = lambda *, keep_resident=False: released.append(
+            keep_resident
+        )
+    model.park_non_layer_weights = lambda: parked.append(True)
+
+    LayerwiseOffloadStrategy().finish_use(
+        model,
+        ComponentUse(
+            stage_name="test",
+            component_name="transformer",
+            retain_resident_layers=True,
+        ),
+        SimpleNamespace(),
+    )
+
+    assert released and all(keep is True for keep in released)
+    assert parked == []
 
 
 def test_enable_offload_rearms_after_disable(monkeypatch):
@@ -1920,11 +2059,13 @@ def test_layerwise_tuning_defaults_match_the_group():
         3.0,
         20.0,
         RESIDENCY_POLICY_STRIDED,
+        RESIDENCY_LIFETIME_FORWARD,
     )
     assert args.layerwise_tuning_for("text_encoder", dit_group=False) == (
         0.0,
         0.0,
         RESIDENCY_POLICY_LEADING,
+        RESIDENCY_LIFETIME_FORWARD,
     )
 
 
@@ -1941,12 +2082,14 @@ def test_layerwise_tuning_per_component_entry_wins():
         2.0,
         4.0,
         RESIDENCY_POLICY_STRIDED,
+        RESIDENCY_LIFETIME_FORWARD,
     )
     # an entry for one component leaves every other component alone
     assert args.layerwise_tuning_for("vae", dit_group=False) == (
         0.0,
         0.0,
         RESIDENCY_POLICY_LEADING,
+        RESIDENCY_LIFETIME_FORWARD,
     )
     assert args.layerwise_tuning_for("transformer", dit_group=True)[:2] == (3.0, 20.0)
 
@@ -2268,6 +2411,153 @@ def test_mixed_scm_and_dbcache_step_schedule(monkeypatch, step_kinds):
         manager.prepare_for_next_req(non_blocking=False)
 
 
+@pytest.mark.skipif(not hasattr(os, "O_DIRECT"), reason="needs O_DIRECT")
+def test_mapped_layers_read_directly_when_the_host_cannot_cache_them(
+    tmp_path, monkeypatch
+):
+    if not pathlib.Path("/proc/self/maps").exists():
+        pytest.skip("needs /proc to tell a mapping from anonymous memory")
+    monkeypatch.setattr(layerwise_offload_mod, "MAPPED_DIRECT_READ_MIN_BYTES", 1)
+    monkeypatch.setattr(
+        layerwise_offload_mod, "host_copies_are_redundant", lambda: False
+    )
+
+    # the page cache cannot hold the mapping: it is re-read from the drive every pass
+    monkeypatch.setattr(
+        layerwise_offload_mod, "page_cache_cannot_hold", lambda _bytes: True
+    )
+    manager = _mapped_manager(tmp_path, monkeypatch, available_gib=0.001)
+    assert manager._mapped_cpu_weights[0], "expected the weight to stay mapped"
+    assert manager._ensure_mapped_courier().direct_read
+
+    # the same mapping on a host that can cache it keeps the page-cache path
+    monkeypatch.setattr(
+        layerwise_offload_mod, "page_cache_cannot_hold", lambda _bytes: False
+    )
+    manager._mapped_courier = None
+    assert not manager._ensure_mapped_courier().direct_read
+
+
+@pytest.mark.skipif(layerwise_offload_mod._libc is None, reason="needs libc mincore")
+def test_resident_fraction_sees_the_pages_the_cache_holds(tmp_path):
+    path = tmp_path / "cached.bin"
+    path.write_bytes(b"\x01" * (16 << 20))
+    mapped = torch.from_file(str(path), shared=True, size=16 << 20, dtype=torch.uint8)
+    mapped.sum()  # touch every page
+    fraction = layerwise_offload_mod._resident_fraction(
+        mapped.data_ptr(), mapped.numel()
+    )
+    assert fraction >= 0.9
+
+
+@pytest.mark.skipif(not hasattr(os, "O_DIRECT"), reason="needs O_DIRECT")
+def test_cached_mapped_layers_are_copied_rather_than_re_read(tmp_path, monkeypatch):
+    if not pathlib.Path("/proc/self/maps").exists():
+        pytest.skip("needs /proc to tell a mapping from anonymous memory")
+    monkeypatch.setattr(layerwise_offload_mod, "MAPPED_DIRECT_READ_MIN_BYTES", 1)
+    monkeypatch.setattr(
+        layerwise_offload_mod, "host_copies_are_redundant", lambda: False
+    )
+    monkeypatch.setattr(
+        layerwise_offload_mod, "host_copies_would_not_fit", lambda _bytes: True
+    )
+    monkeypatch.setattr(
+        layerwise_offload_mod, "page_cache_cannot_hold", lambda _bytes: True
+    )
+    # the page cache holds the layer: shipping it is a memcpy, not a drive read
+    monkeypatch.setattr(
+        layerwise_offload_mod, "_resident_fraction", lambda *_a, **_k: 1.0
+    )
+    manager = _mapped_manager(tmp_path, monkeypatch, available_gib=0.001)
+    courier = manager._ensure_mapped_courier()
+    assert courier.direct_read
+    manager.prefetch_layer(0, non_blocking=False)
+    assert 0 in manager._gpu_layers
+    assert courier.stats["cached_layers"] >= 1
+    assert courier.stats["direct_read_bytes"] == 0
+
+
+@pytest.mark.skipif(not hasattr(os, "O_DIRECT"), reason="needs O_DIRECT")
+def test_blocking_loads_of_cold_mapped_layers_go_through_the_courier(
+    tmp_path, monkeypatch
+):
+    if not pathlib.Path("/proc/self/maps").exists():
+        pytest.skip("needs /proc to tell a mapping from anonymous memory")
+    monkeypatch.setattr(layerwise_offload_mod, "MAPPED_DIRECT_READ_MIN_BYTES", 1)
+    monkeypatch.setattr(
+        layerwise_offload_mod, "host_copies_are_redundant", lambda: False
+    )
+    monkeypatch.setattr(
+        layerwise_offload_mod, "host_copies_would_not_fit", lambda _bytes: True
+    )
+    monkeypatch.setattr(
+        layerwise_offload_mod, "page_cache_cannot_hold", lambda _bytes: True
+    )
+    monkeypatch.setattr(
+        layerwise_offload_mod, "_resident_fraction", lambda *_a, **_k: 0.0
+    )
+    manager = _mapped_manager(tmp_path, monkeypatch, available_gib=0.001)
+    courier = manager._ensure_mapped_courier()
+    assert courier.direct_read
+    # a blocking load (how a resident set is armed) is shipped by the courier too
+    manager.prefetch_layer(0, non_blocking=False)
+    assert 0 in manager._gpu_layers and not manager._courier_inflight
+    assert courier.stats["layers"] == 1
+    assert torch.equal(manager.model.blocks[0].weight.detach().cpu(), torch.zeros(8, 8))
+
+
+@pytest.mark.skipif(not hasattr(os, "O_DIRECT"), reason="needs O_DIRECT")
+def test_a_fully_resident_small_component_may_still_read_directly(
+    tmp_path, monkeypatch
+):
+    if not pathlib.Path("/proc/self/maps").exists():
+        pytest.skip("needs /proc to tell a mapping from anonymous memory")
+    monkeypatch.setattr(
+        layerwise_offload_mod, "host_copies_are_redundant", lambda: False
+    )
+    monkeypatch.setattr(
+        layerwise_offload_mod, "host_copies_would_not_fit", lambda _bytes: True
+    )
+    monkeypatch.setattr(
+        layerwise_offload_mod, "page_cache_cannot_hold", lambda _bytes: True
+    )
+    # far below the size floor, but every layer is resident: it is armed once
+    # per request, so there is no re-streamed pass for the floor to protect
+    monkeypatch.setattr(
+        layerwise_offload_mod.torch, "get_device_module", lambda: _FakeDeviceModule
+    )
+    monkeypatch.setattr(layerwise_offload_mod.current_platform, "device_type", "cpu")
+    monkeypatch.setattr(
+        host_memory_budget, "host_memory_available_bytes", lambda: 1 << 20
+    )
+    model = _FileBackedModel(tmp_path / "weights.bin", num_blocks=2)
+    manager = LayerwiseOffloadManager(
+        model=model,
+        layers_attr_str="blocks",
+        num_layers=2,
+        enabled=True,
+        pin_cpu_memory=True,
+        prefetch_size=1,
+        resident_layers=2,
+    )
+    assert manager._mapped_cpu_weights[0] and not manager._streamed_order
+    assert manager._ensure_mapped_courier().direct_read
+
+
+@pytest.mark.skipif(layerwise_offload_mod._libc is None, reason="needs libc mincore")
+def test_resident_fraction_samples_a_large_mapping_at_page_aligned_offsets(tmp_path):
+    # large enough that the sampling stride exceeds one window: every window
+    # must start on a page boundary or mincore rejects it and the answer is -1
+    path = tmp_path / "large.bin"
+    path.write_bytes(b"\x01" * (96 << 20))
+    mapped = torch.from_file(str(path), shared=True, size=96 << 20, dtype=torch.uint8)
+    mapped.sum()
+    fraction = layerwise_offload_mod._resident_fraction(
+        mapped.data_ptr() + 1000, (96 << 20) - 1000
+    )
+    assert fraction >= 0.9
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_large_pinned_stores_are_registered_in_place_at_exact_size(monkeypatch):
     pooled = []
@@ -2303,3 +2593,230 @@ def test_small_pinned_stores_keep_using_the_pool(monkeypatch):
     tensor = layerwise_offload_mod._pinned_empty(1024, dtype=torch.float32)
     assert tensor.is_pinned()
     assert len(pooled) == 1
+
+
+# --- permanent residency lifetime -------------------------------------------
+
+
+def _permanent_manager(model, *, num_layers, resident_layers, prefetch_size=1):
+    return _resident_manager(
+        model,
+        num_layers=num_layers,
+        prefetch_size=prefetch_size,
+        resident_layers=resident_layers,
+        residency_lifetime=RESIDENCY_LIFETIME_PERMANENT,
+    )
+
+
+def test_permanent_residents_are_placed_at_load_without_a_host_store(monkeypatch):
+    """`permanent` puts the resident set on the device in the constructor.
+
+    Not on the first forward, not during warmup: at load. And it keeps no host
+    copy of those layers -- there is nothing to reload them from because
+    nothing ever releases them.
+    """
+    _patch_fake_device(monkeypatch)
+    model = _MultiBlockModel(6)
+    originals = [model.blocks[i].weight.detach().clone() for i in range(6)]
+    manager = _permanent_manager(model, num_layers=6, resident_layers=3)
+
+    assert manager._permanent_set == frozenset({0, 1, 2})
+    # Armed from load: the forward-lifetime set waits for the first forward.
+    assert manager._residency_active is True
+    assert manager._retained_layers == 3
+    assert {0, 1, 2} <= manager._gpu_layers
+    for i in range(3):
+        assert i not in manager._weight_metadata
+        assert not manager._consolidated_cpu_weights.get(i)
+        assert torch.equal(model.blocks[i].weight, originals[i])
+        # a strided view keeps its layout, as the strided host store would have
+        assert model.blocks[i].weight.stride() == originals[i].stride()
+    # Streamed layers take the ordinary path: a host store, and a placeholder
+    # until prefetched. The head of the stream is now layer 3, not layer 0.
+    assert 3 in manager._gpu_layers
+    for i in (4, 5):
+        assert i in manager._weight_metadata
+        assert tuple(model.blocks[i].weight.shape) == (1,)
+
+
+def test_permanent_residents_survive_every_release_path(monkeypatch):
+    _patch_fake_device(monkeypatch)
+    manager = _permanent_manager(_MultiBlockModel(6), num_layers=6, resident_layers=3)
+    manager.prefetch_layer(4, non_blocking=False)
+    assert {0, 1, 2, 3, 4} <= manager._gpu_layers
+
+    manager.release_layer(0, force=True)
+    assert 0 in manager._gpu_layers
+    manager.release_all()
+    assert manager._gpu_layers == {0, 1, 2}
+    # Nothing to write back and nothing to write it to; must be a no-op.
+    manager.sync_all_layers_to_cpu()
+    assert manager._gpu_layers == {0, 1, 2}
+
+
+def test_prepare_does_not_touch_permanent_residents(monkeypatch):
+    _patch_fake_device(monkeypatch)
+    model = _MultiBlockModel(6)
+    manager = _permanent_manager(model, num_layers=6, resident_layers=3)
+    manager.release_all()
+    before = [model.blocks[i].weight.data_ptr() for i in range(3)]
+
+    log = _record_prepare(manager, monkeypatch)
+    manager.prepare_for_next_req(non_blocking=False)
+
+    prefetched = [entry[1] for entry in log if entry[0] == "prefetch"]
+    assert not set(prefetched) & {0, 1, 2}
+    assert 3 in prefetched
+    assert [model.blocks[i].weight.data_ptr() for i in range(3)] == before
+
+
+def test_permanent_residents_survive_disable_and_enable_offload(monkeypatch):
+    """The compile-warmup and LoRA paths toggle offload off and on again.
+
+    Off loads every layer; on syncs the loaded layers back to their host
+    stores and releases them. Permanent layers have no host store and must
+    come out of that round trip untouched, with the streamed layer released
+    as before.
+    """
+    _patch_fake_device(monkeypatch)
+    model = _MixinModel()
+    model.configure_layerwise_offload(
+        _server_args(
+            dit_layerwise_offload=True,
+            dit_layerwise_resident_layers=2,
+            dit_layerwise_residency_lifetime=RESIDENCY_LIFETIME_PERMANENT,
+        )
+    )
+    (manager,) = model.layerwise_offload_managers
+    assert manager._permanent_set == frozenset({0, 1})
+    expected = torch.arange(9, dtype=torch.float32).reshape(3, 3)
+
+    model.disable_offload()
+    assert not is_layerwise_offloaded_module(model)
+    model.enable_offload()
+    assert is_layerwise_offloaded_module(model)
+
+    assert {0, 1} <= manager._gpu_layers
+    for i in (0, 1):
+        assert torch.equal(model.blocks[i].weight, expected)
+    assert tuple(model.blocks[2].weight.shape) == (1,)
+
+
+def test_iter_materialized_weights_reads_permanent_residents_from_the_module(
+    monkeypatch,
+):
+    _patch_fake_device(monkeypatch)
+    model = _MixinModel()
+    model.configure_layerwise_offload(
+        _server_args(
+            dit_layerwise_offload=True,
+            dit_layerwise_resident_layers=2,
+            dit_layerwise_residency_lifetime=RESIDENCY_LIFETIME_PERMANENT,
+        )
+    )
+    expected = torch.arange(9, dtype=torch.float32).reshape(3, 3)
+
+    materialized = dict(iter_materialized_weights(model))
+    assert sorted(materialized) == sorted(name for name, _ in model.named_parameters())
+    # permanent: the module's own tensor; streamed: rebuilt from the host store
+    assert torch.equal(materialized["blocks.0.weight"], expected)
+    assert torch.equal(materialized["blocks.2.weight"], expected)
+
+
+def test_permanent_residents_stay_out_of_the_host_pin_plan(monkeypatch):
+    _patch_fake_device(monkeypatch)
+    planned = {}
+    original = LayerwiseOffloadManager._plan_layer_hosting
+
+    def spy(self, layer_groups):
+        planned["layers"] = sorted(layer_groups)
+        return original(self, layer_groups)
+
+    monkeypatch.setattr(LayerwiseOffloadManager, "_plan_layer_hosting", spy)
+    _permanent_manager(_MultiBlockModel(6), num_layers=6, resident_layers=3)
+    assert planned["layers"] == [3, 4, 5]
+
+
+def test_permanent_lifetime_with_no_resident_layers_warns_and_streams(monkeypatch):
+    _patch_fake_device(monkeypatch)
+    warnings = []
+    monkeypatch.setattr(
+        layerwise_offload_mod.logger,
+        "warning",
+        lambda message, *args: warnings.append(message % args),
+    )
+    manager = _permanent_manager(_MultiBlockModel(4), num_layers=4, resident_layers=0)
+    assert manager._permanent_set == frozenset()
+    assert manager._residency_active is False
+    assert any("permanent residency with no resident layers" in w for w in warnings)
+
+
+def test_unknown_residency_lifetime_is_rejected(monkeypatch):
+    _patch_fake_device(monkeypatch)
+    with pytest.raises(ValueError, match="unknown residency lifetime"):
+        _resident_manager(
+            _MultiBlockModel(4),
+            num_layers=4,
+            resident_layers=2,
+            residency_lifetime="sometimes",
+        )
+
+
+def test_forward_lifetime_is_the_default_and_unchanged(monkeypatch):
+    _patch_fake_device(monkeypatch)
+    manager = _resident_manager(
+        _MultiBlockModel(4), num_layers=4, prefetch_size=1, resident_layers=2
+    )
+    assert manager.residency_lifetime == RESIDENCY_LIFETIME_FORWARD
+    assert manager._permanent_set == frozenset()
+    assert manager._residency_active is False
+    for i in range(4):
+        assert i in manager._weight_metadata
+
+
+def test_layerwise_tuning_returns_the_lifetime():
+    args = _server_args(
+        dit_layerwise_resident_layers=20,
+        dit_layerwise_residency_lifetime=RESIDENCY_LIFETIME_PERMANENT,
+        layerwise_residency_lifetime="video_vae=forward",
+    )
+    assert (
+        args.layerwise_tuning_for("transformer", dit_group=True)[3]
+        == RESIDENCY_LIFETIME_PERMANENT
+    )
+    assert (
+        args.layerwise_tuning_for("video_vae", dit_group=False)[3]
+        == RESIDENCY_LIFETIME_FORWARD
+    )
+    # the DiT-group default is not the auxiliary default
+    assert (
+        args.layerwise_tuning_for("text_encoder", dit_group=False)[3]
+        == RESIDENCY_LIFETIME_FORWARD
+    )
+
+
+def test_layerwise_tuning_rejects_unknown_lifetime():
+    args = _server_args(layerwise_residency_lifetime="vae=sometimes")
+    with pytest.raises(ValueError, match="unknown residency lifetime"):
+        args.layerwise_tuning_for("vae", dit_group=False)
+
+
+def test_configure_logs_a_permanent_lifetime(monkeypatch):
+    _patch_fake_device(monkeypatch)
+    logs = []
+    monkeypatch.setattr(
+        layerwise_offload_mod.logger,
+        "info",
+        lambda message, *args: logs.append(message % args),
+    )
+    comp = _ResidentComponent(8)
+    comp.configure_layerwise_offload(
+        _server_args(
+            dit_offload_prefetch_size=2,
+            dit_layerwise_resident_layers=3,
+            dit_layerwise_residency_lifetime=RESIDENCY_LIFETIME_PERMANENT,
+        ),
+        component_name="transformer",
+    )
+    assert any("placed 3 permanent resident layers" in line for line in logs)
+    assert logs[-1].endswith("resident=3/8 (permanent), policy=leading")

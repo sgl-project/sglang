@@ -132,7 +132,7 @@ class TestDSV4FlashMTPBasic(DSV4FlashMTPServerBase):
             num_examples=200,
             max_tokens=512,
             num_threads=128,
-            host="http://127.0.0.1",
+            host="127.0.0.1",
             port=int(self.base_url.split(":")[-1]),
         )
         metrics = run_gsm8k_eval(args)
@@ -147,7 +147,7 @@ class TestDSV4FlashMTPBasic(DSV4FlashMTPServerBase):
             num_examples=100,
             max_tokens=1,
             num_threads=128,
-            host="http://127.0.0.1",
+            host="127.0.0.1",
             port=int(self.base_url.split(":")[-1]),
         )
         metrics = run_gsm8k_eval(args)

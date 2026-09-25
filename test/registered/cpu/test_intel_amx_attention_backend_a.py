@@ -107,7 +107,7 @@ class TestDPAttention(CustomTestCase):
             num_examples=32,
             num_threads=32,
             max_tokens=2048,
-            host="http://127.0.0.1",
+            host="127.0.0.1",
             port=int(self.base_url.split(":")[-1]),
         )
         metrics = run_eval(args)

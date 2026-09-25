@@ -168,7 +168,7 @@ class TestOnlineQuantizationMemoryLoad(CustomTestCase):
             max_tokens=max_tokens,
             sgl_eval_thinking=False if self.model.startswith("Qwen/Qwen3") else None,
             num_threads=128,
-            host="http://127.0.0.1",
+            host="127.0.0.1",
             port=int(self.base_url.split(":")[-1]),
         )
         metrics = run_eval(args)

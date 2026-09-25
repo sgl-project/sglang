@@ -62,7 +62,7 @@ class TestUnifiedQwenHybridTriton(DefaultServerBase):
             presence_penalty=0.0 if greedy else 1.5,
             seed=42,
             num_threads=self.parallel,
-            host=f"http://{url.hostname}",
+            host=url.hostname,
             port=int(url.port),
         )
         metrics = run_gsm8k_eval(args)

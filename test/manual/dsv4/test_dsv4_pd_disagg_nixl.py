@@ -135,7 +135,7 @@ class TestDSV4FlashPDDisaggNIXL(PDDisaggregationServerBase):
             num_examples=200,
             max_tokens=512,
             num_threads=64,
-            host=f"http://{self.base_host}",
+            host=self.base_host,
             port=int(self.lb_port),
         )
         metrics = run_gsm8k_eval(args)

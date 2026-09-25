@@ -20,7 +20,6 @@ PR #25090 vs #14194):
   - cp_lse_ag_out_rs_mla: Triton (log2/exp2) correction / reduce-scatter
 """
 
-import warnings
 from typing import Optional
 
 import torch
@@ -36,41 +35,11 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
 from sglang.srt.distributed.parallel_state import GroupCoordinator
-from sglang.srt.runtime_context import get_parallel, get_platform
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import is_hip
-from sglang.srt.utils.common import is_mnnvl_fabric_device
+from sglang.srt.utils.common import is_fi_a2a_supported
 
 _is_hip = is_hip()
-
-
-def _warn_deprecated_dcp_accessor(name: str, replacement: str) -> None:
-    warnings.warn(
-        f"{name} is deprecated; use {replacement} instead.",
-        DeprecationWarning,
-        stacklevel=2,
-    )
-
-
-def dcp_enabled() -> bool:
-    """Deprecated: use ``get_parallel().dcp_enabled``."""
-    _warn_deprecated_dcp_accessor("dcp_enabled()", "get_parallel().dcp_enabled")
-    return get_parallel().dcp_enabled
-
-
-def get_attention_dcp_world_size() -> int:
-    """Deprecated: use ``get_parallel().attn_dcp_size``."""
-    _warn_deprecated_dcp_accessor(
-        "get_attention_dcp_world_size()", "get_parallel().attn_dcp_size"
-    )
-    return get_parallel().attn_dcp_size
-
-
-def get_attention_dcp_rank() -> int:
-    """Deprecated: use ``get_parallel().attn_dcp_rank``."""
-    _warn_deprecated_dcp_accessor(
-        "get_attention_dcp_rank()", "get_parallel().attn_dcp_rank"
-    )
-    return get_parallel().attn_dcp_rank
 
 
 def _ag_lse(cp_attn_lse: torch.Tensor, cp_group: GroupCoordinator) -> torch.Tensor:
@@ -388,17 +357,6 @@ def all_gather_kv_cache_for_dcp(
 # Per-process singleton: MNNVL workspace + this rank's cp position. Populated
 # once, pre-CUDA-graph-capture, by init_fi_a2a_workspace().
 _FI_A2A_STATE: Optional[dict] = None
-
-
-def is_fi_a2a_supported(
-    *, dcp_size: int, tp_size: int, pp_size: int, nnodes: int
-) -> bool:
-    if not get_platform().is_sm100:
-        return False
-    if is_mnnvl_fabric_device():
-        return True
-    tp_size_per_node = tp_size // max(nnodes // pp_size, 1)
-    return tp_size_per_node % dcp_size == 0
 
 
 def init_fi_a2a_workspace(cp_group: "GroupCoordinator") -> None:

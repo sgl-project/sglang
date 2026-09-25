@@ -136,7 +136,7 @@ class TestPureDP(CustomTestCase):
             num_examples=200,
             max_tokens=512,
             num_threads=128,
-            host="http://127.0.0.1",
+            host="127.0.0.1",
             port=int(self.base_url.split(":")[-1]),
         )
         metrics = run_gsm8k_eval(args)
@@ -179,7 +179,7 @@ class TestMTP(CustomTestCase):
             num_examples=200,
             max_tokens=512,
             num_threads=128,
-            host="http://127.0.0.1",
+            host="127.0.0.1",
             port=int(self.base_url.split(":")[-1]),
         )
         metrics = run_gsm8k_eval(args)
@@ -231,7 +231,7 @@ class TestNormal(CustomTestCase):
             num_examples=200,
             max_tokens=512,
             num_threads=128,
-            host="http://127.0.0.1",
+            host="127.0.0.1",
             port=int(self.base_url.split(":")[-1]),
         )
         metrics = run_gsm8k_eval(args)
@@ -279,7 +279,7 @@ class TestLowLatency(CustomTestCase):
             num_examples=200,
             max_tokens=512,
             num_threads=128,
-            host="http://127.0.0.1",
+            host="127.0.0.1",
             port=int(self.base_url.split(":")[-1]),
         )
         metrics = run_gsm8k_eval(args)
@@ -326,7 +326,7 @@ class TestTBOwithNormal(CustomTestCase):
             num_examples=200,
             max_tokens=512,
             num_threads=128,
-            host="http://127.0.0.1",
+            host="127.0.0.1",
             port=int(self.base_url.split(":")[-1]),
         )
         metrics = run_gsm8k_eval(args)
@@ -375,7 +375,7 @@ class TestTBOwithLowLatency(CustomTestCase):
             num_examples=200,
             max_tokens=512,
             num_threads=128,
-            host="http://127.0.0.1",
+            host="127.0.0.1",
             port=int(self.base_url.split(":")[-1]),
         )
         metrics = run_gsm8k_eval(args)
@@ -427,7 +427,7 @@ class TestMTPwithTBONormal(CustomTestCase):
             num_examples=200,
             max_tokens=512,
             num_threads=128,
-            host="http://127.0.0.1",
+            host="127.0.0.1",
             port=int(self.base_url.split(":")[-1]),
         )
         metrics = run_gsm8k_eval(args)
@@ -488,7 +488,7 @@ class TestMTPwithTBOLowLatency(CustomTestCase):
             num_examples=200,
             max_tokens=512,
             num_threads=128,
-            host="http://127.0.0.1",
+            host="127.0.0.1",
             port=int(self.base_url.split(":")[-1]),
         )
         metrics = run_gsm8k_eval(args)
@@ -550,7 +550,7 @@ class TestEPLBMoriStat(CustomTestCase):
             num_examples=200,
             max_tokens=512,
             num_threads=128,
-            host="http://127.0.0.1",
+            host="127.0.0.1",
             port=int(self.base_url.split(":")[-1]),
         )
         metrics = run_gsm8k_eval(args)

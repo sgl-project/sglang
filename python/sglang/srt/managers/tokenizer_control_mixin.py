@@ -9,12 +9,15 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 import fastapi
 
+from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.managers.communicator import FanOutCommunicator
 from sglang.srt.managers.io_struct import (
     AddExternalCorpusReqInput,
     AddExternalCorpusReqOutput,
     AttachHiCacheStorageReqInput,
     AttachHiCacheStorageReqOutput,
+    BeginWeightUpdateReqInput,
+    BeginWeightUpdateReqOutput,
     ChecksumInfo,
     CheckWeightsReqInput,
     CheckWeightsReqOutput,
@@ -27,6 +30,8 @@ from sglang.srt.managers.io_struct import (
     DetachHiCacheStorageReqOutput,
     DumperControlReqInput,
     DumperControlReqOutput,
+    EndWeightUpdateReqInput,
+    EndWeightUpdateReqOutput,
     ExpertDistributionReq,
     ExpertDistributionReqOutput,
     ExpertDistributionReqType,
@@ -48,6 +53,8 @@ from sglang.srt.managers.io_struct import (
     LoadLoRAAdapterReqOutput,
     LoRAUpdateOutput,
     OpenSessionReqInput,
+    PdRoleSwitchReqInput,
+    PdRoleSwitchReqOutput,
     ProfileReq,
     ProfileReqOutput,
     ProfileReqType,
@@ -77,6 +84,7 @@ from sglang.srt.managers.io_struct import (
 )
 from sglang.srt.managers.load_snapshot import LoadSnapshot
 from sglang.srt.runtime_context import (
+    get_disagg,
     get_lora,
     get_parallel,
     get_serving,
@@ -115,6 +123,7 @@ _COMMUNICATOR_SPECS = [
     ("resume_memory_occupation", ResumeMemoryOccupationReqOutput),
     ("check_weights", CheckWeightsReqOutput),
     ("slow_down", SlowDownReqOutput),
+    ("pd_role_switch", PdRoleSwitchReqOutput),
     ("flush_cache", FlushCacheReqOutput),
     ("add_external_corpus", AddExternalCorpusReqOutput),
     ("remove_external_corpus", RemoveExternalCorpusReqOutput),
@@ -126,6 +135,8 @@ _COMMUNICATOR_SPECS = [
     ("get_internal_state", GetInternalStateReqOutput),
     ("set_internal_state", SetInternalStateReqOutput),
     ("expert_distribution", ExpertDistributionReqOutput),
+    ("begin_weight_update", BeginWeightUpdateReqOutput),
+    ("end_weight_update", EndWeightUpdateReqOutput),
     ("update_lora_adapter", LoRAUpdateOutput),
     ("dumper_control", DumperControlReqOutput),
     ("scale_elastic_ep", ScaleElasticEPReqOutput),
@@ -444,6 +455,38 @@ class TokenizerControlMixin:
         results = await self.destroy_weights_update_group_communicator(obj)
         return FanOutCommunicator.merge_results(results)
 
+    async def _weight_update_session_call(
+        self: TokenizerManager, communicator, obj
+    ) -> Tuple[bool, str]:
+        self.auto_create_handle_loop()
+        async with self.is_pause_cond:
+            is_paused = self.is_pause
+            # whoever paused the engine holds the writer lock; taking it again deadlocks
+            if is_paused:
+                results = await communicator(obj)
+        if not is_paused:
+            async with self.model_update_lock.writer_lock:
+                results = await communicator(obj)
+        return FanOutCommunicator.merge_results(results)
+
+    async def begin_weight_update(
+        self: TokenizerManager,
+        obj: BeginWeightUpdateReqInput,
+        request: Optional[fastapi.Request] = None,
+    ) -> Tuple[bool, str]:
+        return await self._weight_update_session_call(
+            self.begin_weight_update_communicator, obj
+        )
+
+    async def end_weight_update(
+        self: TokenizerManager,
+        obj: EndWeightUpdateReqInput,
+        request: Optional[fastapi.Request] = None,
+    ) -> Tuple[bool, str]:
+        return await self._weight_update_session_call(
+            self.end_weight_update_communicator, obj
+        )
+
     async def update_weights_from_distributed(
         self: TokenizerManager,
         obj: UpdateWeightsFromDistributedReqInput,
@@ -556,13 +599,12 @@ class TokenizerControlMixin:
             async with self.is_pause_cond:
                 is_paused = self.is_pause
                 if is_paused:
-                    result = (await self.update_weights_from_ipc_communicator(obj))[0]
-                    success, message = result.success, result.message
+                    results = await self.update_weights_from_ipc_communicator(obj)
 
             if not is_paused:
                 async with self.model_update_lock.writer_lock:
-                    result = (await self.update_weights_from_ipc_communicator(obj))[0]
-                    success, message = result.success, result.message
+                    results = await self.update_weights_from_ipc_communicator(obj)
+            success, message = FanOutCommunicator.merge_results(results)
         except Exception as e:
             error_msg = f"IPC weight update failed: {str(e)}"
             logger.error(error_msg)
@@ -840,6 +882,42 @@ class TokenizerControlMixin:
     ):
         self.auto_create_handle_loop()
         await self.slow_down_communicator(obj)
+
+    async def pd_role_switch(
+        self: TokenizerManager,
+        obj: PdRoleSwitchReqInput,
+        request: Optional[fastapi.Request] = None,
+    ) -> PdRoleSwitchReqOutput:
+        self.auto_create_handle_loop()
+        if not self.server_args.enable_pd_role_switch:
+            return PdRoleSwitchReqOutput(
+                success=False,
+                message="--enable-pd-role-switch is not set on this server",
+                old_role=get_disagg().disaggregation_mode,
+                new_role=obj.new_role,
+                safe_to_restore=True,
+            )
+        results = await self.pd_role_switch_communicator(obj)
+        all_success = all(r.success for r in results)
+        safe_to_restore = bool(results) and all(r.safe_to_restore for r in results)
+        if all_success:
+            # Keep the tokenizer-manager's view of the role in sync so future
+            # control ops and bootstrap routing behave consistently.
+            self.record_config_updates(
+                "tokenizer.pd_role_switch", disaggregation_mode=obj.new_role
+            )
+            self.disaggregation_mode = DisaggregationMode(obj.new_role)
+            msg = "ok"
+        else:
+            # Surface only the failing workers' messages.
+            msg = "; ".join(r.message for r in results if not r.success)
+        return PdRoleSwitchReqOutput(
+            success=all_success,
+            message=msg,
+            old_role=results[0].old_role if results else "",
+            new_role=obj.new_role,
+            safe_to_restore=safe_to_restore,
+        )
 
     async def get_internal_state(self: TokenizerManager) -> List[Dict[Any, Any]]:
         self.auto_create_handle_loop()

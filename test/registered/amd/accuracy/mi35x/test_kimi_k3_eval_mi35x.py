@@ -128,7 +128,7 @@ class TestKimiK3EvalMI35x(CustomTestCase):
                 num_examples=self.num_questions,
                 num_threads=self.num_questions,
                 max_tokens=self.max_new_tokens,
-                host="http://127.0.0.1",
+                host="127.0.0.1",
                 port=int(self.base_url.split(":")[-1]),
             )
             metrics = run_gsm8k_eval(args)

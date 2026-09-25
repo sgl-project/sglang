@@ -26,6 +26,7 @@ from sglang.multimodal_gen.configs.pipeline_configs.model_deployment_config impo
 from sglang.multimodal_gen.configs.post_training.pipeline_configs import (
     QwenImageRolloutPipelineMixin,
 )
+from sglang.multimodal_gen.runtime.distributed.cfg_policy import CFGPolicy
 from sglang.multimodal_gen.runtime.utils.condition_expansion import (
     PromptToSampleBatchExpander,
 )
@@ -778,6 +779,9 @@ class QwenImageEditPlus_2511_PipelineConfig(QwenImageEditPlusPipelineConfig):
 class QwenImageLayeredPipelineConfig(QwenImageEditPipelineConfig):
     resolution: int = 640
     vae_precision: str = "bf16"
+    cfg_policy: CFGPolicy = field(
+        default_factory=lambda: CFGPolicy(parallel_uses_serial_arithmetic=True)
+    )
     # promoting the auxiliary components regresses first-request latency
     supports_auto_residency: bool = False
 
@@ -891,3 +895,72 @@ class QwenImageLayeredPipelineConfig(QwenImageEditPipelineConfig):
         latents = latents.permute(0, 2, 1, 3, 4).view(-1, c, 1, h, w)
         # latents = latents.reshape(batch_size, channels // (2 * 2), 1, height, width)
         return latents
+
+
+def register():
+    from sglang.multimodal_gen.configs.sample.qwenimage import (
+        QwenImage2512SamplingParams,
+        QwenImageEditPlusSamplingParams,
+        QwenImageLayeredSamplingParams,
+        QwenImageSamplingParams,
+    )
+    from sglang.multimodal_gen.registry import register_configs
+
+    register_configs(
+        sampling_param_cls=QwenImageSamplingParams,
+        pipeline_config_cls=QwenImagePipelineConfig,
+        hf_model_paths=["Qwen/Qwen-Image", "nvidia/Qwen-Image-NVFP4"],
+        model_detectors=[
+            lambda hf_id: (
+                "qwen-image" in hf_id.lower()
+                and "edit" not in hf_id.lower()
+                and "layered" not in hf_id.lower()
+                and "2512" not in hf_id.lower()
+                and "qwen-image-2.1" not in hf_id.lower()
+            )
+        ],
+    )
+    register_configs(
+        sampling_param_cls=QwenImage2512SamplingParams,
+        pipeline_config_cls=QwenImagePipelineConfig,
+        hf_model_paths=["Qwen/Qwen-Image-2512"],
+        model_detectors=[lambda hf_id: "qwen-image-2512" in hf_id.lower()],
+    )
+    register_configs(
+        sampling_param_cls=QwenImageSamplingParams,
+        pipeline_config_cls=QwenImageEditPipelineConfig,
+        hf_model_paths=["Qwen/Qwen-Image-Edit"],
+        model_detectors=[
+            lambda hf_id: (
+                "qwen-image-edit" in hf_id.lower()
+                and "2509" not in hf_id.lower()
+                and "2511" not in hf_id.lower()
+            )
+        ],
+    )
+    register_configs(
+        sampling_param_cls=QwenImageEditPlusSamplingParams,
+        pipeline_config_cls=QwenImageEditPlusPipelineConfig,
+        hf_model_paths=["Qwen/Qwen-Image-Edit-2509"],
+        model_detectors=[lambda hf_id: "qwen-image-edit-2509" in hf_id.lower()],
+    )
+    register_configs(
+        sampling_param_cls=QwenImageEditPlusSamplingParams,
+        pipeline_config_cls=QwenImageEditPlus_2511_PipelineConfig,
+        hf_model_paths=["Qwen/Qwen-Image-Edit-2511"],
+        model_detectors=[lambda hf_id: "qwen-image-edit-2511" in hf_id.lower()],
+    )
+    register_configs(
+        sampling_param_cls=QwenImageLayeredSamplingParams,
+        pipeline_config_cls=QwenImageLayeredPipelineConfig,
+        hf_model_paths=["Qwen/Qwen-Image-Layered"],
+        model_detectors=[lambda hf_id: "qwen-image-layered" in hf_id.lower()],
+    )
+    register_configs(
+        sampling_param_cls=QwenImageEditPlusSamplingParams,
+        pipeline_config_cls=QwenImageEditPlusPipelineConfig,
+        hf_model_paths=[
+            "FireRedTeam/FireRed-Image-Edit-1.0",
+            "FireRedTeam/FireRed-Image-Edit-1.1",
+        ],
+    )

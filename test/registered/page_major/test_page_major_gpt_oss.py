@@ -45,7 +45,7 @@ class TestUnifiedGptOssTriton(DefaultServerBase):
             num_examples=self.num_gsm8k_questions,
             max_tokens=512,
             num_threads=self.parallel,
-            host=f"http://{url.hostname}",
+            host=url.hostname,
             port=int(url.port),
         )
         metrics = run_gsm8k_eval(args)

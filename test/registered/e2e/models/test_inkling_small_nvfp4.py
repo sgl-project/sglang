@@ -112,7 +112,6 @@ class TestInklingSmallNvfp4(CustomTestCase):
                 "--mem-fraction-static",
                 "0.85",
             ],
-            env={**os.environ, "SGLANG_ENABLE_UNIFIED_RADIX_TREE": "1"},
         )
 
     @classmethod
@@ -133,7 +132,7 @@ class TestInklingSmallNvfp4(CustomTestCase):
                 num_examples=200,
                 max_tokens=512,
                 num_threads=128,
-                host=f"http://{url.hostname}",
+                host=url.hostname,
                 port=int(url.port),
             )
         )
@@ -201,7 +200,6 @@ class TestInklingSmallNvfp4DsparkDeterministic(CustomTestCase):
                 "--speculative-draft-attention-backend",
                 "fa4",
             ],
-            env={**os.environ, "SGLANG_ENABLE_UNIFIED_RADIX_TREE": "1"},
         )
 
     @classmethod
@@ -315,7 +313,6 @@ class TestInklingSmallNvfp4HiCacheDeterministic(CustomTestCase):
                 "4",
                 "--enable-deterministic-inference",
             ],
-            env={**os.environ, "SGLANG_ENABLE_UNIFIED_RADIX_TREE": "1"},
         )
         cls.input_ids = get_input_ids(cls.model, num_samples=18, trust_remote_code=True)
 

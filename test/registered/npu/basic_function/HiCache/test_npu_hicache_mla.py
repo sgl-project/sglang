@@ -40,8 +40,8 @@ class TestAscendMlaHicache(CustomTestCase):
             "--tp-size",
             4,
             "--enable-hierarchical-cache",
-            "--hicache-ratio",
-            1.2,
+            "--hicache-size",
+            30,
         ]
 
     def test_a_gsm8k(self):
@@ -67,7 +67,7 @@ class TestAscendMlaHicache(CustomTestCase):
                             num_examples=1319,
                             max_tokens=512,
                             num_threads=128,
-                            host=f"http://{self.url.hostname}",
+                            host=self.url.hostname,
                             port=int(self.url.port),
                         )
 

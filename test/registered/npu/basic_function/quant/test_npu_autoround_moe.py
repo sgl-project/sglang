@@ -67,7 +67,7 @@ class TestAscendAutoRoundMoE(CustomTestCase):
                             num_examples=1319,
                             max_tokens=512,
                             num_threads=128,
-                            host=f"http://{self.url.hostname}",
+                            host=self.url.hostname,
                             port=int(self.url.port),
                         )
 

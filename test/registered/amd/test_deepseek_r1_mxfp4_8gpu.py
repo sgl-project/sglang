@@ -67,7 +67,7 @@ class TestDeepseekR1MXFP4(CustomTestCase):
             num_examples=1319,
             num_threads=1319,
             max_tokens=16384,
-            host="http://127.0.0.1",
+            host="127.0.0.1",
             port=int(self.base_url.split(":")[-1]),
         )
         metrics = run_gsm8k_eval(args)
@@ -139,7 +139,7 @@ class TestDeepseekR1MXFP4MTP(CustomTestCase):
             num_examples=200,
             max_tokens=16384,
             num_threads=128,
-            host="http://127.0.0.1",
+            host="127.0.0.1",
             port=int(self.base_url.split(":")[-1]),
         )
         metrics = run_gsm8k_eval(args)

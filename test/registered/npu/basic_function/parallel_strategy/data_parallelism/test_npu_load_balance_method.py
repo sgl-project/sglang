@@ -80,7 +80,7 @@ class TestDPAttentionRoundBinLoadBalance(CustomTestCase):
             num_examples=200,
             max_tokens=16384,
             num_threads=128,
-            host=f"http://{self.url.hostname}",
+            host=self.url.hostname,
             port=int(self.url.port),
         )
 

@@ -60,7 +60,7 @@ class TestAscendW8A8(CustomTestCase):
             num_examples=200,
             max_tokens=512,
             num_threads=128,
-            host=f"http://{url.hostname}",
+            host=url.hostname,
             port=int(url.port),
         )
         metrics = run_eval(args)

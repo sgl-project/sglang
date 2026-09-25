@@ -69,7 +69,7 @@ class TestAscendTp1Bf16(CustomTestCase):
                             num_examples=1319,
                             max_tokens=512,
                             num_threads=32,
-                            host=f"http://{self.url.hostname}",
+                            host=self.url.hostname,
                             port=int(self.url.port),
                         )
 

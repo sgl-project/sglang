@@ -7,6 +7,7 @@ end to end attention solution with aiter kernels
 """
 
 import logging
+import os
 from dataclasses import dataclass
 from enum import Enum, auto
 from typing import TYPE_CHECKING, Optional
@@ -60,6 +61,7 @@ try:
 
     from sglang.kernels.ops.attention.unified_attention_3d_mtp import (
         asm_verify_attn_enabled,
+        reset_verify_attn_plan_cache,
         unified_attention_3d_mtp_decode_func,
         unified_attention_3d_mtp_func,
         unified_attention_3d_mtp_ragged_func,
@@ -157,6 +159,11 @@ class ForwardMetadata:
     swa_out_cache_loc: Optional[torch.Tensor] = None
     local_kv_lens: Optional[torch.Tensor] = None
     verify_token_table: Optional[torch.Tensor] = None
+    # ASM context-chunk prefill: KV slots to gather and cu_seqlens_k, computed
+    # once per batch by AiterAttnBackend._asm_context_prefill_indices.
+    asm_ctx_ready: bool = False
+    asm_ctx_tok_idx: Optional[torch.Tensor] = None
+    asm_ctx_cu_k: Optional[torch.Tensor] = None
 
 
 _AITER_PARTITION_SIZE_ROCM = 256
@@ -175,6 +182,12 @@ def _aiter_fp8_asm_supports_gqa(num_q_heads: int, num_kv_heads: int) -> bool:
     if num_kv_heads <= 0 or num_q_heads % num_kv_heads != 0:
         return False
     return (num_q_heads // num_kv_heads) in _AITER_FP8_ASM_GQA_RATIOS
+
+
+# Cross-check the per-batch fast indices against the generic gather (syncs).
+_GFX_ASM_CTX_GATHER_CHECK = (
+    os.environ.get("SGLANG_GFX_ASM_CTX_GATHER_CHECK", "0") == "1"
+)
 
 
 def _asm_context_prefill_gather_indices(
@@ -900,6 +913,116 @@ class AiterAttnBackend(AttentionBackend):
 
         return page_table, qo_indptr, draft_num, swa_page_table
 
+    def _build_extend_unified_page_table(
+        self,
+        bs: int,
+        seq_lens: torch.Tensor,
+        req_pool_indices: torch.Tensor,
+        max_kv_len: int,
+    ):
+        """Build the 2D block page_table (+ SWA translation) that
+        unified_attention needs for a plain extend/prefill batch. Mirrors the
+        target_verify builder with draft_num=0; rows are sized to the batch's own
+        longest sequence since extend is never graph-captured."""
+        device = seq_lens.device
+        page_size = self.page_size
+        max_blocks = max((max_kv_len + page_size - 1) // page_size, 1)
+
+        page_table = torch.zeros(bs, max_blocks, dtype=torch.int32, device=device)
+
+        swa_slot_mapping = None
+        swa_page_table = None
+        if self.use_sliding_window_kv_pool:
+            swa_slot_mapping = self.swa_kv_pool.full_to_swa_index_mapping.long()
+            swa_page_table = torch.zeros(
+                bs, max_blocks, dtype=torch.int32, device=device
+            )
+
+        BLOCK_SIZE = 1024
+        grid = (bs, triton.cdiv(max_blocks, BLOCK_SIZE))
+        scatter_req_to_token_to_page_table_kernel[grid](
+            self.req_to_token,
+            req_pool_indices,
+            seq_lens,
+            page_table,
+            self.req_to_token.stride(0),
+            page_table.stride(0),
+            swa_page_table,
+            swa_slot_mapping,
+            DRAFT_NUM=0,
+            PAGE_SIZE=page_size,
+            BLOCK_SIZE=BLOCK_SIZE,
+            HAS_SWA=(swa_slot_mapping is not None),
+        )
+        return page_table, swa_page_table
+
+    def _forward_extend_unified(
+        self,
+        q: torch.Tensor,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        bs0: int,
+        window_size,
+        sinks,
+        k_descale,
+        v_descale,
+    ):
+        """Prefill/extend through aiter's Triton ``unified_attention``. The CK
+        ``mha_batch_prefill_func`` hard-asserts head_dim <= 256, which rules out
+        Gemma-4's 512-wide full-attention layers. unified_attention pads the head
+        dim to the next power of two and reads the same paged KV the decode path
+        reads, so one kernel serves prefill and decode."""
+        bs = forward_batch.batch_size
+        max_kv_len = int(forward_batch.seq_lens_cpu.max().item())
+        page_table, swa_page_table = self._build_extend_unified_page_table(
+            bs, forward_batch.seq_lens, forward_batch.req_pool_indices, max_kv_len
+        )
+
+        # Build cu_seqlens_q from this batch's extend lengths. The standard
+        # prefill metadata path leaves self.qo_indptr unset (qo_indptr=None in
+        # ForwardMetadata), so relying on it corrupts multi-sequence batches
+        # (only bs=1 happens to work).
+        cu_seqlens_q = torch.zeros(bs + 1, dtype=torch.int32, device=q.device)
+        cu_seqlens_q[1:] = torch.cumsum(
+            forward_batch.extend_seq_lens.to(torch.int32), dim=0
+        )
+
+        # unified_attention uses (left, right) window = (window-1, 0), NOT the
+        # CK convention (window, -1). Match the decode path (`de_window`).
+        uni_window = (-1, -1)
+        pt = page_table
+        if layer.sliding_window_size is not None and layer.sliding_window_size > -1:
+            uni_window = (layer.sliding_window_size - 1, 0)
+            if swa_page_table is not None:
+                pt = swa_page_table
+
+        k_cache, v_cache = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
+        q_u = q.contiguous().view(-1, layer.tp_q_head_num, layer.qk_head_dim)
+        o = q_u.new_empty(
+            (q_u.shape[0], layer.tp_q_head_num, layer.v_head_dim),
+            dtype=self.input_dtype,
+        )
+        unified_attention(
+            q=q_u,
+            k=k_cache.view(-1, self.page_size, layer.tp_k_head_num, layer.qk_head_dim),
+            v=v_cache.view(-1, self.page_size, layer.tp_v_head_num, layer.v_head_dim),
+            out=o,
+            cu_seqlens_q=cu_seqlens_q,
+            seqused_k=forward_batch.seq_lens,
+            max_seqlen_q=self.forward_metadata.max_q_len,
+            max_seqlen_k=pt.shape[1] * self.page_size,
+            softmax_scale=layer.scaling,
+            causal=True,
+            window_size=uni_window,
+            block_table=pt,
+            softcap=layer.logit_cap,
+            q_descale=None,
+            k_descale=k_descale,
+            v_descale=v_descale,
+            sinks=sinks,
+        )
+        return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
+
     def _resolve_v2_num_draft_tokens(
         self,
         extend_seq_lens: Optional[torch.Tensor] = None,
@@ -947,6 +1070,70 @@ class AiterAttnBackend(AttentionBackend):
                 required_tokens, dtype=torch.int32, device=device
             )
         return self._kv_indices_scratch[:required_tokens]
+
+    def _asm_context_prefill_indices(
+        self, forward_batch: ForwardBatch, bs: int, num_kv_slots: int
+    ):
+        """KV slots and cu_seqlens_k for the ASM context-chunk prefill, computed
+        once per batch and shared by every full-attention layer.
+
+        For a plain extend batch AiterIndicesUpdaterPrefill lays kv_indices out
+        token by token with kv_indptr = cumsum(seq_lens), so the slots to gather
+        are the first sum(seq_lens) entries and cu_seqlens_k is kv_indptr itself;
+        both follow from host-side lengths without a device sync. Anything else
+        (spec batches, missing host lengths, or a short table) takes the generic
+        gather, which validates the metadata on the device.
+        """
+        fm = self.forward_metadata
+        if fm.asm_ctx_ready:
+            return fm.asm_ctx_tok_idx, fm.asm_ctx_cu_k
+        fm.asm_ctx_ready = True
+        total_k = 0
+        if (
+            forward_batch.spec_info is None
+            and forward_batch.forward_mode.is_extend()
+            and forward_batch.seq_lens_cpu is not None
+        ):
+            total_k = int(forward_batch.seq_lens_cpu[:bs].sum())
+        if 0 < total_k <= fm.kv_indices.numel():
+            tok_idx = fm.kv_indices[:total_k]
+            cu_k = fm.kv_indptr[: bs + 1]
+            if cu_k.dtype != torch.int32:
+                cu_k = cu_k.to(torch.int32)
+            if _GFX_ASM_CTX_GATHER_CHECK:
+                ref = _asm_context_prefill_gather_indices(
+                    fm.kv_indptr[: bs + 1],
+                    fm.kv_indices,
+                    forward_batch.seq_lens[:bs],
+                    num_kv_slots,
+                    forward_batch.forward_mode,
+                )
+                assert (
+                    ref is not None
+                    and torch.equal(ref[0], tok_idx.to(torch.long))
+                    and torch.equal(ref[1].to(torch.int32), cu_k)
+                ), (
+                    "asm context prefill: fast gather indices differ from the generic gather"
+                )
+                logger.info(
+                    "[asm-context-prefill] fast gather indices verified: bs=%d total_k=%d",
+                    bs,
+                    total_k,
+                )
+        else:
+            gathered = _asm_context_prefill_gather_indices(
+                fm.kv_indptr[: bs + 1],
+                fm.kv_indices,
+                forward_batch.seq_lens[:bs],
+                num_kv_slots,
+                forward_batch.forward_mode,
+            )
+            if gathered is None:
+                return None, None
+            tok_idx, cu_k = gathered
+            cu_k = cu_k.to(torch.int32)
+        fm.asm_ctx_tok_idx, fm.asm_ctx_cu_k = tok_idx, cu_k
+        return tok_idx, cu_k
 
     def _set_uniform_qo_indptr(
         self, bs: int, tokens_per_req: int, device: torch.device
@@ -1277,6 +1464,7 @@ class AiterAttnBackend(AttentionBackend):
         forward_batch: ForwardBatch,
         in_capture: bool = False,
     ):
+        reset_verify_attn_plan_cache()
         seq_lens_cpu = (
             forward_batch.seq_lens.cpu() if in_capture else forward_batch.seq_lens_cpu
         )
@@ -1315,6 +1503,7 @@ class AiterAttnBackend(AttentionBackend):
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Init auxiliary variables for aiter attention backend."""
+        reset_verify_attn_plan_cache()
 
         bs = forward_batch.batch_size
         kv_indptr = self.kv_indptr
@@ -3360,6 +3549,8 @@ class AiterAttnBackend(AttentionBackend):
             # faster; gathering the paged fp8 KV into a contiguous varlen
             # buffer costs only ~20 us per layer at 70k context. The no-prefix
             # first chunk already takes the ASM branch below.
+            # This applies to Qwen3.5 full-attention layers only currently,
+            # Other configurations fall through to the attention paths below.
             if (
                 is_gfx95_supported()
                 and forward_batch.forward_mode.is_extend()
@@ -3379,15 +3570,10 @@ class AiterAttnBackend(AttentionBackend):
             ):
                 bs = forward_batch.batch_size
                 k_cache, v_cache = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
-                gathered = _asm_context_prefill_gather_indices(
-                    self.forward_metadata.kv_indptr[: bs + 1],
-                    self.forward_metadata.kv_indices,
-                    forward_batch.seq_lens[:bs],
-                    self.token_to_kv_pool.get_key_buffer(layer.layer_id).shape[0],
-                    forward_batch.forward_mode,
+                tok_idx, cu_k = self._asm_context_prefill_indices(
+                    forward_batch, bs, k_cache.shape[0]
                 )
-                if gathered is not None:
-                    tok_idx, cu_k = gathered
+                if tok_idx is not None:
                     hk = layer.tp_k_head_num * layer.qk_head_dim
                     hv = layer.tp_v_head_num * layer.v_head_dim
                     # uint8 view: index_select is not implemented for fp8.
@@ -3418,7 +3604,7 @@ class AiterAttnBackend(AttentionBackend):
                         k_descale.reshape(1),
                         v_descale.reshape(1),
                         self.qo_indptr[:bs0],
-                        cu_k.to(torch.int32),
+                        cu_k,
                         self.forward_metadata.max_q_len,
                         int(self.forward_metadata.max_kv_len),
                         softmax_scale=layer.scaling,
@@ -3478,6 +3664,21 @@ class AiterAttnBackend(AttentionBackend):
                     bs0,
                     window_size,
                     sinks,
+                )
+
+            if self.use_triton_unified_attention:
+                # unified_attention has no head_dim cap; route extend through it
+                # so Gemma-4's 512-wide full-attention layers don't hit the CK
+                # `head dimension at most 256` assert.
+                return self._forward_extend_unified(
+                    q,
+                    layer,
+                    forward_batch,
+                    bs0,
+                    window_size,
+                    sinks,
+                    k_descale,
+                    v_descale,
                 )
 
             # NHD path — original aiter paged batch_prefill.

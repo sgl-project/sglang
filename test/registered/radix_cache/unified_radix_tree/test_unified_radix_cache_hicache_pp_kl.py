@@ -19,7 +19,7 @@ from sglang.test.test_utils import (
     terminate_and_kill_process_tree,
 )
 
-register_cuda_ci(est_time=738, stage="base-c", runner_config="4-gpu-h100")
+register_cuda_ci(est_time=738, stage="nightly", runner_config="4-gpu-h100")
 
 QWEN3_32B_MODEL = "Qwen/Qwen3-32B"
 
@@ -53,7 +53,7 @@ class TestUnifiedQwen3HiCachePP(UnifiedRadixTreeTestMixin, CustomTestCase):
             num_examples=self.num_gsm8k_questions,
             max_tokens=2048,
             num_threads=self.max_running_requests,
-            host=f"http://{url.hostname}",
+            host=url.hostname,
             port=int(url.port),
         )
         metrics = run_gsm8k_eval(args)
@@ -98,7 +98,9 @@ class TestUnifiedQwen3HiCachePP(UnifiedRadixTreeTestMixin, CustomTestCase):
                 "--hicache-mem-layout",
                 cls.hicache_mem_layout,
             ],
-            env={"SGLANG_ENABLE_UNIFIED_RADIX_TREE": "1"},
+            env={
+                "SGLANG_ENABLE_RANK_CONSENSUS_CHECKER": "1",
+            },
         )
         cls.input_ids = get_input_ids(cls.model, num_samples=18)
 
@@ -149,7 +151,7 @@ class TestUnifiedQwen3HiCachePPL3(AccuracyTwoPassMixin, CustomTestCase):
                 "file",
             ],
             env={
-                "SGLANG_ENABLE_UNIFIED_RADIX_TREE": "1",
+                "SGLANG_ENABLE_RANK_CONSENSUS_CHECKER": "1",
                 "SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR": cls.hicache_dir,
             },
         )

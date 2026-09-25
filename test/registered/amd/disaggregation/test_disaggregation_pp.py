@@ -97,7 +97,7 @@ class TestDisaggregationPrefillPPAccuracy(PDDisaggregationServerBase):
             num_examples=200,
             max_tokens=512,
             num_threads=128,
-            host=f"http://{self.base_host}",
+            host=self.base_host,
             port=int(self.lb_port),
         )
         metrics = run_eval(args)
@@ -190,7 +190,7 @@ class TestDisaggregationPrefillPPDynamicChunkAccuracy(PDDisaggregationServerBase
             num_examples=200,
             max_tokens=512,
             num_threads=128,
-            host=f"http://{self.base_host}",
+            host=self.base_host,
             port=int(self.lb_port),
         )
         metrics = run_eval(args)
@@ -284,7 +284,7 @@ class TestDisaggregationDecodePPAccuracy(PDDisaggregationServerBase):
             num_examples=200,
             max_tokens=512,
             num_threads=128,
-            host=f"http://{self.base_host}",
+            host=self.base_host,
             port=int(self.lb_port),
         )
         metrics = run_eval(args)

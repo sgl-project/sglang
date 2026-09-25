@@ -69,7 +69,7 @@ dependencies = [
   "uvicorn",
   "xxhash",
   "uvloop",
-  # "xgrammar==0.2.1", xgrammar depends on CUDA PyTorch and Triton only
+  # "xgrammar==0.2.7", xgrammar depends on CUDA PyTorch and Triton only
 ]
 
 [project.optional-dependencies]
@@ -91,6 +91,12 @@ diffusion = [
   "st_attn==0.0.7 ; platform_machine != 'aarch64' and platform_machine != 'arm64'",
   "trimesh>=4.0.0",
   "xatlas",
+]
+
+ray = [
+  "ray[default]>=2.55.1",
+  # Ray registers no GPU resource on XPU without dpctl.
+  "dpctl",
 ]
 
 tracing = [
