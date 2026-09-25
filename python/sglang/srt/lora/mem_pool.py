@@ -815,16 +815,22 @@ class LoRAMemoryPool:
 
                     # MoE expert version (4D)
                     moe_key = f"{module_name}_moe"
-                    buffer[moe_key] = [
-                        torch.zeros(
-                            get_lora_shape_fn(
-                                moe_key, base_model, self.max_lora_rank, idx
-                            ),
-                            dtype=self.dtype,
-                            device=device,
+                    buffer[moe_key] = []
+                    for idx in range(self.num_layer):
+                        shape = get_lora_shape_fn(
+                            moe_key, base_model, self.max_lora_rank, idx
                         )
-                        for idx in range(self.num_layer)
-                    ]
+                        fused_moe = self._get_fused_shared_moe(base_model, idx)
+                        if fused_moe is not None:
+                            num_experts = (
+                                fused_moe.num_local_experts
+                                if self.moe_use_local_expert_ids
+                                else fused_moe.num_experts
+                            )
+                            assert shape[1] == num_experts, "LoRA/base expert layout mismatch"
+                        buffer[moe_key].append(
+                            torch.zeros(shape, dtype=self.dtype, device=device)
+                        )
 
                     # Shared-expert MoE version (4D, separate sink namespace).
                     if self._has_shared_fused_moe(base_model):
@@ -924,24 +930,6 @@ class LoRAMemoryPool:
             self.target_modules,
             self.get_lora_B_shape,
         )
-
-        for layer_idx in range(self.num_layer):
-            fused_moe = self._get_fused_shared_moe(base_model, layer_idx)
-            if fused_moe is None:
-                continue
-            num_experts = (
-                fused_moe.num_local_experts
-                if self.moe_use_local_expert_ids
-                else fused_moe.num_experts
-            )
-            for buffers in (self.A_buffer, self.B_buffer):
-                for name, layers in buffers.items():
-                    if self.is_moe_module(name) and not self.is_shared_moe_module(name):
-                        assert layers[layer_idx].shape[1] == num_experts, (
-                            f"layer {layer_idx} {name}: LoRA pool has "
-                            f"{layers[layer_idx].shape[1]} experts, "
-                            f"but fused MoE requires {num_experts}"
-                        )
 
     def _get_maybe_cached_weight_for_transfer(
         self,
