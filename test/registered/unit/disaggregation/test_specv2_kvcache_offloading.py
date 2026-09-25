@@ -9,6 +9,7 @@ Requires: torch, sglang (run in an environment with sglang installed)
 
 import gc
 import unittest
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 from weakref import WeakKeyDictionary as WeakKeyDict
 
@@ -20,9 +21,16 @@ from sglang.srt.disaggregation.decode_kvcache_offload_manager import (
 from sglang.srt.disaggregation.kv_events import OffloadedState
 from sglang.srt.managers.cache_controller import HiCacheAck
 from sglang.srt.managers.schedule_batch import ReqKvInfo
+from sglang.srt.managers.scheduler_components.batch_result_processor import (
+    SchedulerBatchResultProcessor,
+)
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
+from sglang.srt.mem_cache.radix_cache import RadixKey
+from sglang.srt.mem_cache.utils import get_hash_str, get_storage_hash_str
+from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -38,6 +46,8 @@ def _make_mock_req(
     """Create a mock Req with the KV cache state needed for testing."""
     req = MagicMock()
     req.rid = rid
+    req.extra_key = None  # base traffic: storage hashes chain from tokens alone
+    req.cache_salt = None
     req.origin_input_ids = list(range(origin_len))
     req.kv = ReqKvInfo(
         req_pool_idx=req_pool_idx,
@@ -45,7 +55,7 @@ def _make_mock_req(
         kv_allocated_len=kv_allocated_len,
     )
     req.prefix_indices = list(range(prefix_indices_len))
-    req.effective_kv_committed_len = lambda: req.kv.kv_committed_len
+    req.owned_kv_len = lambda: req.kv.kv_committed_len
     return req
 
 
@@ -97,6 +107,7 @@ def _make_manager(pool_size: int, page_size: int = 1):
     manager = object.__new__(DecodeKVCacheOffloadManager)
     manager.req_to_token_pool = req_to_token_pool
     manager.token_to_kv_pool_allocator = allocator
+    manager.kv_cache = MagicMock()
     manager.page_size = page_size
     manager.tree_cache = tree_cache
     manager.offloaded_state = WeakKeyDict()
@@ -114,6 +125,27 @@ class _FinishedEvent:
 
 class TestReleaseFinishedReq(unittest.TestCase):
     """Tests for _release_finished_req overallocation cleanup."""
+
+    def test_decode_offload_hash_chain_matches_prefill(self):
+        """Decode pages must keep the prefill namespace across offload chunks."""
+        manager, _ = _make_manager(pool_size=8, page_size=2)
+        manager.cache_controller = MagicMock(get_hash_str=get_hash_str)
+        tokens = [1, 2, 3, 4, 5, 6]
+        for extra_key, cache_salt in [
+            (None, None),
+            ("lora-a", None),
+            (None, "tenant-a"),
+            ("lora-a", "tenant-a"),
+        ]:
+            with self.subTest(extra_key=extra_key, cache_salt=cache_salt):
+                namespace = dict(extra_key=extra_key, cache_salt=cache_salt)
+                req = SimpleNamespace(**namespace)
+                prefix = manager._compute_prefix_hash(req, tokens[:4])
+                tail = manager._compute_prefix_hash(req, tokens[4:], prefix[-1])
+                self.assertEqual(
+                    prefix + tail,
+                    get_storage_hash_str(RadixKey(tokens, **namespace), page_size=2),
+                )
 
     def test_no_overallocation(self):
         """Without spec v2, kv_committed == kv_allocated; no extra free."""
@@ -256,6 +288,7 @@ class TestReleaseFinishedReq(unittest.TestCase):
             torch.arange(4, 8, dtype=torch.int64),
             [10, 11, 12, 13],
             0.0,
+            [],
         )
         manager.cache_controller = MagicMock()
         manager.cache_controller.ack_write_queue = [
@@ -378,6 +411,7 @@ class TestReleaseFinishedReq(unittest.TestCase):
             torch.arange(4, 8, dtype=torch.int64),
             [10, 11, 12, 13],
             0.0,
+            [],
         )
         manager.cache_controller = MagicMock()
         manager.cache_controller.ack_write_queue = [
@@ -410,6 +444,7 @@ class TestReleaseFinishedReq(unittest.TestCase):
             torch.arange(8, 12, dtype=torch.int64),
             [14, 15, 16, 17],
             0.0,
+            [],
         )
         manager.cache_controller = MagicMock()
         manager.cache_controller.ack_write_queue = [
@@ -438,6 +473,47 @@ class TestReleaseFinishedReq(unittest.TestCase):
 
         self.assertEqual(len(manager.offloaded_state), 0)
         self.assertEqual(len(manager.offload_inflight), 0)
+
+
+class TestSamplingMaskAbortOffload(CustomTestCase):
+    def test_abort_waits_for_existing_offload_before_reusing_slots(self):
+        """An abort must not recycle slots while a previous D2H copy reads them."""
+        for inflight in (False, True):
+            with self.subTest(inflight=inflight):
+                manager, freed = _make_manager(pool_size=32)
+                req = _make_mock_req(0, 20, 20)
+                req.multimodal_inputs = None
+                req.finished.return_value = True
+                manager.req_to_token_pool.free.side_effect = lambda req: setattr(
+                    req.kv, "req_pool_idx", None
+                )
+                processor = SimpleNamespace(decode_offload_manager=manager)
+                if inflight:
+                    manager.offload_inflight[req] = 1
+                    manager.ongoing_offload[1] = (req, torch.arange(4), [1], 0.0, [])
+                    manager.cache_controller = MagicMock()
+                    manager.cache_controller.ack_write_queue = [
+                        HiCacheAck(None, _FinishedEvent(), [1])
+                    ]
+                    manager._trigger_backup = MagicMock(return_value="hash")
+
+                with get_context().override_server_args(
+                    disaggregation_decode_enable_offload_kvcache=True,
+                    enable_hisparse=False,
+                ):
+                    SchedulerBatchResultProcessor._handle_sampling_mask_abort(
+                        processor, req
+                    )
+
+                if inflight:
+                    self.assertEqual(freed, [])
+                    self.assertEqual(req.kv.req_pool_idx, 0)
+                    manager._check_offload_progress(1)
+                self.assertEqual(len(freed), 1)
+                self.assertTrue(torch.equal(freed[0], torch.arange(20)))
+                self.assertIsNone(req.kv.req_pool_idx)
+                manager.finalize_release_on_finish(req)
+                self.assertEqual(len(freed), 1)
 
 
 if __name__ == "__main__":

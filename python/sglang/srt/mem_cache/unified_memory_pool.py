@@ -167,15 +167,6 @@ class MHASubPoolSpec(SubPoolSpec):
     def page_bytes(self, page_size: int) -> int:
         return page_size * self.entry_bytes()
 
-    def layer_k_offset_in_page(self, layer_id: int, page_size: int) -> int:
-        return layer_id * page_size * (self.k_row_bytes() + self.v_row_bytes())
-
-    def layer_v_offset_in_page(self, layer_id: int, page_size: int) -> int:
-        return (
-            self.layer_k_offset_in_page(layer_id, page_size)
-            + page_size * self.k_row_bytes()
-        )
-
     def view_tail_pad_bytes(self, page_size: int) -> int:
         return page_size * self.entry_bytes()
 
@@ -609,6 +600,8 @@ class UnifiedMHATokenToKVPool(MHATokenToKVPool):
     def _create_buffers(self):
         self.k_buffer = self._k_views
         self.v_buffer = self._v_views
+        # This override must initialize the pointers and row strides used by HiCache.
+        self._init_data_ptrs_and_strides()
 
     def _clear_buffers(self):
         # Lifetime owned by UnifiedKVPool; do not delete the views.
@@ -637,20 +630,43 @@ class UnifiedMHATokenToKVPool(MHATokenToKVPool):
             env[tgt_pages] = env[src_pages]
 
     def get_contiguous_buf_infos(self):
-        raise NotImplementedError(
-            "unified layout has no per-layer contiguous regions; "
-            "KV transfer / disaggregation is unsupported."
-        )
+        """Register the raw buffer as physical page envelopes for PD transfer.
 
-    def get_cpu_copy(self, indices, mamba_indices=None):
-        raise NotImplementedError(
-            "CPU offloading is unsupported under the unified layout."
-        )
+        Full and SWA expose the same allocation with different envelope sizes;
+        the transfer backend preserves both logical entries while deduplicating
+        the underlying memory registration.
+        """
+        assert self._unified_buffer.anchor_bytes(self._sub_pool_name) == 0
+        raw = self._unified_buffer._raw
+        return [raw.data_ptr()], [raw.numel()], [self._page_bytes]
 
-    def load_cpu_copy(self, kv_cache_cpu, indices, mamba_indices=None):
-        raise NotImplementedError(
-            "CPU offloading is unsupported under the unified layout."
+    def get_page_envelope_buffer(self) -> torch.Tensor:
+        """Return this sub-pool's page-strided view of the shared allocation."""
+        assert self._unified_buffer.anchor_bytes(self._sub_pool_name) == 0
+        raw = self._unified_buffer._raw
+        page_count = (
+            self._unified_buffer.max_slots(self._sub_pool_name) // self.page_size
         )
+        return raw[: page_count * self._page_bytes].view(page_count, self._page_bytes)
+
+    @property
+    def grow_direction(self) -> str:
+        """Physical growth direction used by this sub-pool's L1 allocator."""
+        return self._unified_buffer.spec(self._sub_pool_name).grow_direction
+
+    def _physical_to_kernel_indices(self, indices: torch.Tensor) -> torch.Tensor:
+        return (indices // self.page_size) * (
+            self.page_size * self.kernel_page_blocks
+        ) + indices % self.page_size
+
+    def get_cpu_copy(self, indices, mamba_indices=None, req_pool_index=None):
+        """Translate physical host-pool ids for the page-major parent path."""
+        return super().get_cpu_copy(self._physical_to_kernel_indices(indices))
+
+    def load_cpu_copy(
+        self, kv_cache_cpu, indices, mamba_indices=None, req_pool_index=None
+    ):
+        super().load_cpu_copy(kv_cache_cpu, self._physical_to_kernel_indices(indices))
 
     def set_kv_buffer_prefix_valid(self, *args, **kwargs):
         raise NotImplementedError(
@@ -741,6 +757,22 @@ class UnifiedMLATokenToKVPool(MLATokenToKVPool):
         assert self._unified_buffer.anchor_bytes(self._sub_pool_name) == 0
         raw = self._unified_buffer._raw
         return [raw.data_ptr()], [raw.numel()], [self._page_bytes]
+
+    def _physical_to_kernel_indices(self, indices: torch.Tensor) -> torch.Tensor:
+        """Physical TOKEN ids -> the kernel-facing ids this class's `kv_buffer`
+        views are indexed by; the formula is the one in the class docstring."""
+        return (indices // self.page_size) * (
+            self.page_size * self.kernel_page_blocks
+        ) + indices % self.page_size
+
+    def get_cpu_copy(self, indices, mamba_indices=None, req_pool_index=None):
+        """Translate physical host-pool ids for the page-major parent path."""
+        return super().get_cpu_copy(self._physical_to_kernel_indices(indices))
+
+    def load_cpu_copy(
+        self, kv_cache_cpu, indices, mamba_indices=None, req_pool_index=None
+    ):
+        super().load_cpu_copy(kv_cache_cpu, self._physical_to_kernel_indices(indices))
 
     def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
         """Relocate whole page envelopes.
@@ -1076,11 +1108,35 @@ class UnifiedHybridReqToTokenPool(HybridReqToTokenPool):
         enable_linear_replayssm: bool = False,
         linear_replayssm_cache_len: int = 16,
         enable_linear_replayssm_spec: bool = False,
+        short_conv_layer_ids: Optional[List[int]] = None,
+        short_conv_state_shape=None,
+        ngram_context_len: int = 0,
+        ngram_eos_token_id: int = 0,
     ):
         # mamba_envelope_layout / speculative_eagle_topk / enable_linear_replayssm /
         # linear_replayssm_cache_len / enable_linear_replayssm_spec: accepted to match
         # the parent signature but NOT forwarded — the shared pool's conv/temporal
         # state are fixed-shape views (replayssm/spec are gated off under unified).
+        if short_conv_layer_ids or ngram_context_len:
+            raise ValueError(
+                "Qwen4-Exp PLE side states are not supported with "
+                "--enable-unified-memory"
+            )
+        from sglang.srt.mem_cache.ple_state_pool import NGramPool, ShortConvPool
+
+        self.short_conv_pool = ShortConvPool(
+            size=0,
+            state_shape=None,
+            layer_ids=[],
+            dtype=torch.bfloat16,
+            device=device,
+        )
+        self.ngram_pool = NGramPool(
+            size=0,
+            context_len=0,
+            eos_token_id=0,
+            device=device,
+        )
         assert mamba_size == self._shared_mamba_size, (
             f"UnifiedHybridReqToTokenPool._init_mamba_pool: mamba_size={mamba_size} "
             f"!= unified_buffer.max_slots({self._mamba_sub_pool_name!r}) - 1 "
@@ -1180,6 +1236,28 @@ def _check_bs1_feasibility_floor(
         f"size retract-livelocks at runtime. Raise --mem-fraction-static, lower "
         f"the model context length, or reduce reserved memory."
     )
+
+
+def _wire_mamba_slot_allocator(
+    *,
+    mamba_end,
+    req_to_token_pool,
+    device,
+) -> UnifiedMambaSlotAllocator:
+    """Install Mamba slot allocation, host capacities, and transfer translation."""
+    slot_allocator = UnifiedMambaSlotAllocator(
+        mamba_end,
+        max_size=req_to_token_pool._shared_mamba_size,
+        device=device,
+    )
+    req_to_token_pool.mamba_allocator = slot_allocator
+    state_pool = req_to_token_pool.mamba_pool
+    state_pool.host_transfer_translate = slot_allocator.translate
+    state_pool.host_capacity_tokens = req_to_token_pool._shared_mamba_size
+    state_pool.host_capacity_bytes = (
+        state_pool.host_capacity_tokens * mamba_end.entry_bytes
+    )
+    return slot_allocator
 
 
 def init_unified_mamba_pools(
@@ -1352,15 +1430,19 @@ def init_unified_mamba_pools(
         forward_stream=forward_stream,
         lazy_compaction=lazy_compaction,
     )
+    # Size host storage from the configured token cap, not the dynamic buffer view.
+    full_pool = token_to_kv_pool.full_kv_pool
+    full_pool.host_capacity_tokens = max_total_num_tokens
+    full_pool.host_capacity_bytes = (
+        max_total_num_tokens * allocator.full_attn_allocator.entry_bytes
+    )
 
-    # Wrap the composite's mamba MultiEndedAllocator in a slot allocator (PHYSICAL view).
-    mamba_slot_allocator = UnifiedMambaSlotAllocator(
-        allocator.mamba_allocator,
-        max_size=req_to_token_pool._shared_mamba_size,
+    mamba_slot_allocator = _wire_mamba_slot_allocator(
+        mamba_end=allocator.mamba_allocator,
+        req_to_token_pool=req_to_token_pool,
         device=device,
     )
-    # Inert: this allocator implements neither reader (see HybridLinearKVPool).
-    req_to_token_pool.mamba_allocator = mamba_slot_allocator
+    # Only HybridLinearKVPool's retraction CPU-copy path uses this hook.
     token_to_kv_pool._mamba_translate = mamba_slot_allocator.translate
     # No full-KV translate hook is wired: both MLA doors now receive
     # KERNEL-FACING ids -- writes from the ForwardBatch rebind, reads
@@ -1661,7 +1743,7 @@ class UnifiedSWAKVPool(SWAKVPool):
         swa_cpu = None
         if bool(valid.any().item()):
             swa_cpu = self.swa_kv_pool.get_cpu_copy(swa_phys[valid])
-        return {"full": full_cpu, "swa": swa_cpu}
+        return {"full": full_cpu, "swa": swa_cpu, "swa_mask": valid.cpu()}
 
     def load_cpu_copy(
         self, kv_cache_cpu, indices, mamba_indices=None, req_pool_index=None
@@ -1674,7 +1756,14 @@ class UnifiedSWAKVPool(SWAKVPool):
         if kv_cache_cpu.get("swa") is not None:
             assert self._swa_allocator is not None
             swa_phys = self._virt_tokens_to_phys_tokens(indices, self._swa_allocator)
-            self.swa_kv_pool.load_cpu_copy(kv_cache_cpu["swa"], swa_phys)
+            old_swa_mask = kv_cache_cpu["swa_mask"].to(indices.device)
+            assert old_swa_mask.shape == indices.shape
+            row_mask = (swa_phys >= 0)[old_swa_mask].cpu()
+            swa_phys = swa_phys[old_swa_mask][row_mask.to(indices.device)]
+            if swa_phys.numel() == 0:
+                return
+            swa_cpu = self._filter_swa_cpu_copy(kv_cache_cpu["swa"], row_mask)
+            self.swa_kv_pool.load_cpu_copy(swa_cpu, swa_phys)
 
 
 class UnifiedSWAPoolBundle(NamedTuple):
@@ -1698,13 +1787,13 @@ def init_unified_swa_pools(
     end_layer: int,
     swa_attention_layer_ids: List[int],
     full_attention_layer_ids: List[int],
-    full_max_total_num_tokens: int,
-    swa_max_total_num_tokens: int,
+    full_max_total_num_tokens: Optional[int] = None,
+    swa_max_total_num_tokens: Optional[int] = None,
+    total_bytes: Optional[int] = None,
     enable_memory_saver: bool,
     need_sort: bool,
     forward_stream: Optional[torch.cuda.Stream] = None,
     lazy_compaction: bool = False,
-    unified_total_bytes: Optional[int] = None,
     model_context_len: Optional[int] = None,
     sliding_window_size: Optional[int] = None,
 ) -> UnifiedSWAPoolBundle:
@@ -1745,15 +1834,20 @@ def init_unified_swa_pools(
         kv_cache_dtype=kv_cache_dtype,
         grow_direction="up",
     )
-    if unified_total_bytes is not None:
-        # PROFILED byte budget, sized from directly: the re-sum's floor losses
-        # stay out of the buffer, and the token counts remain boot labels.
-        total_bytes = unified_total_bytes
-    else:
+    legacy_allocator_capacities = {}
+    if total_bytes is None:
+        if full_max_total_num_tokens is None or swa_max_total_num_tokens is None:
+            raise ValueError(
+                "total_bytes or both legacy full/SWA capacities must be provided"
+            )
         total_bytes = (
             full_max_total_num_tokens * full_spec.entry_bytes()
             + swa_max_total_num_tokens * swa_spec.entry_bytes()
         )
+        legacy_allocator_capacities = {
+            "full_max_total_num_tokens": full_max_total_num_tokens,
+            "swa_max_total_num_tokens": swa_max_total_num_tokens,
+        }
     if model_context_len is not None:
         # bs=1 floor: ONE sliding window of swa KV (+ a page of slack for the
         # page-granular walk) + the slot-0 sink. The full side is not charged
@@ -1772,6 +1866,8 @@ def init_unified_swa_pools(
             ],
             factory="init_unified_swa_pools",
         )
+    if total_bytes <= 0:
+        raise ValueError(f"total_bytes must be positive, got {total_bytes}")
     shared_pool = UnifiedKVPool(
         total_bytes=total_bytes,
         sub_pool_specs=[full_spec, swa_spec],
@@ -1792,12 +1888,11 @@ def init_unified_swa_pools(
         unified_buffer=shared_pool,
         kvcache=token_to_kv_pool,
         device=device,
-        full_max_total_num_tokens=full_max_total_num_tokens,
-        swa_max_total_num_tokens=swa_max_total_num_tokens,
         page_size=page_size,
         need_sort=need_sort,
         forward_stream=forward_stream,
         lazy_compaction=lazy_compaction,
+        **legacy_allocator_capacities,
     )
 
     logger.info(
@@ -1828,12 +1923,12 @@ def init_unified_swa_pools(
         page_size,
     )
     logger.info(
-        "[unified-memory-pool]   total_bytes=%d (=%.2f GB), full_max_total_num_tokens=%d, "
-        "swa_max_total_num_tokens=%d, joint_available=%d slots",
+        "[unified-memory-pool]   total_bytes=%d (=%.2f GB), "
+        "full_capacity=%d, swa_capacity=%d, joint_available=%d slots",
         total_bytes,
         total_bytes / GB,
-        full_max_total_num_tokens,
-        swa_max_total_num_tokens,
+        allocator.size_full,
+        allocator.size_swa,
         allocator.available_size(),
     )
     logger.info(
@@ -1878,6 +1973,7 @@ def init_unified_mamba_swa_pools(
     lazy_compaction: bool = False,
     unified_total_bytes: Optional[int] = None,
     sliding_window_size: Optional[int] = None,
+    decode_pre_alloc_size: int = 0,
 ) -> UnifiedPoolBundle:
     """Build the TRI-pool unified-memory-pool stack for models with full KV +
     SWA KV + mamba/conv state (Inkling-class: `mambaish_config` AND
@@ -2005,6 +2101,7 @@ def init_unified_mamba_swa_pools(
         speculative_num_draft_tokens=speculative_num_draft_tokens,
         enable_overlap_schedule=not disable_overlap_schedule,
         start_layer=start_layer,
+        pre_alloc_size=decode_pre_alloc_size,
     )
     allocator = UnifiedMambaSWATokenToKVPoolAllocator(
         unified_buffer=shared_pool,
@@ -2018,14 +2115,11 @@ def init_unified_mamba_swa_pools(
         forward_stream=forward_stream,
         lazy_compaction=lazy_compaction,
     )
-    # Wrap the composite's mamba end in the slot allocator (PHYSICAL view) the
-    # radix MambaComponent / model-side sconv reads consume.
-    mamba_slot_allocator = UnifiedMambaSlotAllocator(
-        allocator.mamba_allocator,
-        max_size=req_to_token_pool._shared_mamba_size,
+    _wire_mamba_slot_allocator(
+        mamba_end=allocator.mamba_allocator,
+        req_to_token_pool=req_to_token_pool,
         device=device,
     )
-    req_to_token_pool.mamba_allocator = mamba_slot_allocator
 
     logger.info(
         "[unified-memory-pool] ============================================================"

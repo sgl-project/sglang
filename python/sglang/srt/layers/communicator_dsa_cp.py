@@ -30,7 +30,7 @@ from sglang.srt.layers.communicator import (
     LayerScatterModes,
     ScatterMode,
 )
-from sglang.srt.layers.cp.utils import mla_use_prefill_cp
+from sglang.srt.layers.cp.utils import is_mla_cp_active
 from sglang.srt.layers.dp_attention import (
     attn_cp_all_gather_into_tensor,
     attn_cp_reduce_scatter_tensor,
@@ -92,7 +92,6 @@ class DSACPLayerCommunicator(LayerCommunicator):
         post_attention_layernorm: torch.nn.Module,
         # Reduce scatter requires skipping all-reduce in model code after MoE/MLP, so only enable for models which have that implemented. Remove flag once done for all models that use LayerCommunicator.
         allow_reduce_scatter: bool = False,
-        is_last_layer: bool = False,
         qkv_latent_func: Optional[Callable] = None,
     ):
         super().__init__(
@@ -100,7 +99,6 @@ class DSACPLayerCommunicator(LayerCommunicator):
             input_layernorm,
             post_attention_layernorm,
             allow_reduce_scatter,
-            is_last_layer,
             qkv_latent_func,
         )
 
@@ -189,7 +187,7 @@ class DSACPCommunicateWithAllReduceAndLayerNormFn(
             hidden_states, residual = layernorm(hidden_states, residual)
         # for prefill: attn tp scattered -> full
         # for decode: attn tp full -> full
-        if dsa_use_prefill_cp(forward_batch) or mla_use_prefill_cp(forward_batch):
+        if dsa_use_prefill_cp(forward_batch) or is_mla_cp_active(forward_batch):
             hidden_states = dsa_cp_gather_hidden_states(hidden_states)
         return hidden_states, residual
 
@@ -231,9 +229,10 @@ class DSACPCommunicateSummableTensorPairFn(CommunicateSummableTensorPairFn):
         forward_batch: ForwardBatch,
         context: CommunicateContext,
         allow_reduce_scatter: bool = False,
+        **kwargs,
     ):
         # for prefill: full -> attn tp scattered
         # for decode: full -> attn tp full
-        if dsa_use_prefill_cp(forward_batch) or mla_use_prefill_cp(forward_batch):
+        if dsa_use_prefill_cp(forward_batch) or is_mla_cp_active(forward_batch):
             hidden_states = dsa_cp_reduce_scatter_hidden_states(hidden_states)
         return hidden_states, residual

@@ -4,6 +4,11 @@ export const DiffusionModelCatalog = ({ category }) => {
   const MODEL_CATALOG = {
   image: [
     {
+      name: "Ming-Image",
+      modelIds: ["inclusionAI/Ming-Image-0.1-Design", "inclusionAI/Ming-Image-0.1-Design-Layer"],
+      cookbook: "/cookbook/diffusion/inclusionAI/Ming-Image",
+    },
+    {
       name: "FLUX",
       modelIds: [
         "black-forest-labs/FLUX.1-dev",
@@ -24,6 +29,11 @@ export const DiffusionModelCatalog = ({ category }) => {
         "Qwen/Qwen-Image-2512",
       ],
       cookbook: "/cookbook/diffusion/Qwen-Image/Qwen-Image",
+    },
+    {
+      name: "Qwen-Image 2.1",
+      modelIds: ["Qwen/Qwen-Image-2.1"],
+      cookbook: "/cookbook/diffusion/Qwen-Image/Qwen-Image-2.1",
     },
     {
       name: "Qwen-Image Edit / Layered",
@@ -102,6 +112,11 @@ export const DiffusionModelCatalog = ({ category }) => {
     {
       name: "JoyAI-Image",
       modelIds: ["jdopensource/JoyAI-Image-Edit-Diffusers"],
+    },
+    {
+      name: "SenseNova-U1.5",
+      modelIds: ["sensenova/SenseNova-U1.5-8B-MoT"],
+      cookbook: "/cookbook/diffusion/SenseNova/SenseNova-U1.5-8B-MoT",
     },
     {
       name: "GLM-Image",
@@ -184,6 +199,11 @@ export const DiffusionModelCatalog = ({ category }) => {
         "FastVideo/FastVideo-FastH3-4-step-Preview-v1-VSA-DataFree",
       ],
       cookbook: "/cookbook/diffusion/MiniMax/MiniMax-H3#6-fasth3-4-step-distilled-preview",
+    },
+    {
+      name: "VDN-H3",
+      modelIds: ["OpenVDN/vdn-minimax-h3"],
+      cookbook: "/cookbook/diffusion/MiniMax/MiniMax-H3#7-vdn-h3-hybrid-attention-8-step-distill",
     },
     {
       name: "MOVA",

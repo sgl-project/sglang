@@ -11,13 +11,19 @@ from __future__ import annotations
 
 import sys
 import unittest
+from functools import partial
 
+from prometheus_client import CollectorRegistry, Counter, Gauge, Histogram
+
+from sglang.srt.observability.metrics_collector import TokenizerMetricsCollector
+from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.observability.fake_ray import (
     clear_fake_ray_modules,
     load_ray_wrappers_with_fake_ray,
     load_ray_wrappers_without_ray,
 )
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
@@ -275,6 +281,79 @@ class TestRayMissingImportError(unittest.TestCase):
 
     def test_get_replica_id_returns_none_without_ray(self):
         self.assertIsNone(self.rw._get_replica_id())
+
+
+class TestAsciiDocumentation(TestRayWrapperBase):
+    """Ray's metric backend rejects non-ASCII, so a wrapper whose constructor
+    skips ``_get_ascii_documentation`` would only crash at deploy time."""
+
+    def test_all_wrappers_fold_non_ascii_description(self):
+        for cls in (
+            self.rw.RayCounterWrapper,
+            self.rw.RayGaugeWrapper,
+            self.rw.RayHistogramWrapper,
+            self.rw.RaySummaryWrapper,
+        ):
+            with self.subTest(wrapper=cls.__name__):
+                metric = cls("sglang:x", documentation="load — seconds").metric
+                self.assertEqual(metric.description, "load - seconds")
+
+
+class TestInterTokenLatencyEquivalence(CustomTestCase):
+    """``observe_inter_token_latency`` writes histogram internals directly for
+    the default backend but replays ``observe()`` for an injected one; both must
+    record identical sums and bucket counts, or ITL diverges between the default
+    and Ray backends."""
+
+    _BUCKETS = [0.05, 0.1, 0.5, 1.0]
+    _LABELS = {"model_name": "m"}
+
+    def setUp(self):
+        super().setUp()
+        override = get_context().override_server_args(
+            prompt_tokens_buckets=None,
+            generation_tokens_buckets=None,
+        )
+        self.server_args = override.install()
+        self.addCleanup(override.restore)
+
+    def _build_collector(self, *, force_fallback: bool):
+        # A private registry per collector avoids duplicate ``sglang:`` names.
+        registry = CollectorRegistry()
+
+        class _Collector(TokenizerMetricsCollector):
+            _counter_cls = partial(Counter, registry=registry)
+            _gauge_cls = partial(Gauge, registry=registry)
+            _histogram_cls = partial(Histogram, registry=registry)
+
+        collector = _Collector(
+            server_args=self.server_args,
+            labels=self._LABELS,
+            bucket_time_to_first_token=[0.1, 1.0],
+            bucket_inter_token_latency=self._BUCKETS,
+            bucket_e2e_request_latency=[0.1, 1.0],
+        )
+        if not force_fallback:
+            # _histogram_cls=None routes observe to the default-backend path.
+            collector._histogram_cls = None
+        return collector
+
+    def test_fast_and_fallback_agree(self):
+        fast = self._build_collector(force_fallback=False)
+        fallback = self._build_collector(force_fallback=True)
+
+        for collector in (fast, fallback):
+            collector.observe_inter_token_latency(self._LABELS, 0.24, 4)
+            collector.observe_inter_token_latency(self._LABELS, 6.0, 3)  # +Inf bucket
+            collector.observe_inter_token_latency(self._LABELS, 0.3, 2)
+
+        fast_h = fast.histogram_inter_token_latency.labels(**self._LABELS)
+        fb_h = fallback.histogram_inter_token_latency.labels(**self._LABELS)
+        self.assertEqual(
+            [b.get() for b in fast_h._buckets],
+            [b.get() for b in fb_h._buckets],
+        )
+        self.assertAlmostEqual(fast_h._sum.get(), fb_h._sum.get())
 
 
 if __name__ == "__main__":

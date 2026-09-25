@@ -38,6 +38,7 @@ from sglang.kernels.spec import (
 )
 
 _CUDA = frozenset({CapabilityRequirement.CUDA})
+_CUDA_SM90_PLUS = frozenset({CapabilityRequirement.cuda(min_sm=(9, 0))})
 _CUDA_SM100_PLUS = frozenset({CapabilityRequirement.cuda(min_sm=(10, 0))})
 _HIP = frozenset({CapabilityRequirement.HIP})
 
@@ -48,6 +49,13 @@ _HIP = frozenset({CapabilityRequirement.HIP})
 # inventory: callers name the one they want via ``select_kernel``.
 # ---------------------------------------------------------------------------
 _SPECS: tuple[tuple[str, KernelBackend, str, frozenset, str], ...] = (
+    (
+        "diffusion.gelu_tanh_cat",
+        KernelBackend.JIT,
+        "activation.gelu_tanh_cat_jit:fused_gelu_tanh_cat",
+        _CUDA,
+        "BF16 tanh GELU plus channel concatenation.",
+    ),
     (
         "diffusion.apply_group_norm_silu",
         KernelBackend.TRITON,
@@ -75,6 +83,13 @@ _SPECS: tuple[tuple[str, KernelBackend, str, frozenset, str], ...] = (
         "norm.wan_rmsnorm_silu_triton:wan_rmsnorm_silu",
         _CUDA,
         "Wan VAE channels_last_3d RMSNorm + SiLU.",
+    ),
+    (
+        "diffusion.wan_norm_silu_post",
+        KernelBackend.JIT,
+        "norm.wan_norm_silu_post:wan_norm_silu_post",
+        _CUDA,
+        "Wan VAE FP32 normalization post-ops with the native denominator.",
     ),
     (
         "diffusion.rmsnorm_scale_shift",
@@ -241,7 +256,7 @@ _SPECS: tuple[tuple[str, KernelBackend, str, frozenset, str], ...] = (
         "diffusion.qwen_qkv_epilogue",
         KernelBackend.JIT,
         "rope.qwen_qkv_epilogue_jit:try_fused_qwen_qkv_epilogue",
-        _CUDA_SM100_PLUS,
+        _CUDA_SM90_PLUS,
         "Qwen-Image QK RMS-norm, RoPE, and joint QKV writes.",
     ),
     (
@@ -280,11 +295,32 @@ _SPECS: tuple[tuple[str, KernelBackend, str, frozenset, str], ...] = (
         "Paired in-place Helios transposed Q/K RoPE.",
     ),
     (
+        "diffusion.complex_rope",
+        KernelBackend.TRITON,
+        "rope.complex_rope_triton:fused_complex_rope",
+        _CUDA,
+        "Paired RoPE preserving PyTorch complex64 multiplication rounding.",
+    ),
+    (
         "diffusion.hunyuan_qkv_rope_pack",
         KernelBackend.TRITON,
         "rope.hunyuan_qkv_pack_triton:hunyuan_qkv_rope_pack",
         _CUDA,
         "HunyuanVideo QKV pack + RoPE.",
+    ),
+    (
+        "diffusion.joint_qkv_cat",
+        KernelBackend.TRITON,
+        "layout.joint_qkv_cat_triton:joint_qkv_cat",
+        _CUDA,
+        "Concatenate image/text QKV views into joint attention inputs.",
+    ),
+    (
+        "diffusion.rmsnorm_preserve_reduction",
+        KernelBackend.TRITON,
+        "norm.rmsnorm_preserve_reduction:rmsnorm_preserve_reduction",
+        _CUDA,
+        "Cast-before-weight RMSNorm preserving the native FP32 mean reduction.",
     ),
     (
         "diffusion.silu_mul",
@@ -327,6 +363,76 @@ _SPECS: tuple[tuple[str, KernelBackend, str, frozenset, str], ...] = (
         "attention.sana_wm_gdn_triton:fused_bigdn_func",
         _CUDA,
         "Sana-WM bidirectional gated delta-net.",
+    ),
+    (
+        "diffusion.fused_qknorm_rope_out_of_place",
+        KernelBackend.JIT,
+        "rope.qknorm_rope_jit:fused_qknorm_rope_out_of_place",
+        _CUDA,
+        "Out-of-place fused QK-norm + RoPE (raw q/k preserved).",
+    ),
+    (
+        "diffusion.vdn_delta_factors",
+        KernelBackend.JIT,
+        "attention.vdn_delta_factors_jit:vdn_delta_factors",
+        _CUDA,
+        "VDN-H3 delta rule: fused (I + A)^-1 -> transition / injection (fp32, head_dim 128).",
+    ),
+    (
+        "diffusion.vdn_temporal_conv_act",
+        KernelBackend.TRITON,
+        "attention.vdn_linear_branch_triton:vdn_temporal_conv_act",
+        _CUDA,
+        "VDN-H3 linear branch: 5-tap temporal conv + SiLU + L2 norm.",
+    ),
+    (
+        "diffusion.vdn_silu_l2norm",
+        KernelBackend.TRITON,
+        "attention.vdn_linear_branch_triton:vdn_silu_l2norm",
+        _CUDA,
+        "VDN-H3 linear branch: SiLU + L2 norm over head_dim.",
+    ),
+    (
+        "diffusion.vdn_frame_stats_prep",
+        KernelBackend.TRITON,
+        "attention.vdn_linear_branch_triton:vdn_frame_stats_prep",
+        _CUDA,
+        "VDN-H3 linear branch: frame-statistics GEMM operands in one pass.",
+    ),
+    (
+        "diffusion.vdn_gather_linear_state",
+        KernelBackend.TRITON,
+        "attention.vdn_linear_branch_triton:vdn_gather_linear_state",
+        _CUDA,
+        "VDN-H3 linear branch: alpha-bridged boundary gather in one pass.",
+    ),
+    (
+        "diffusion.vdn_linear_epilogue",
+        KernelBackend.TRITON,
+        "attention.vdn_linear_branch_triton:vdn_linear_epilogue",
+        _CUDA,
+        "VDN-H3 linear branch: RMSNorm * gate readout epilogue.",
+    ),
+    (
+        "diffusion.mxfp8_quantize_swizzled",
+        KernelBackend.TRITON,
+        "quantization.mxfp8_swizzled_triton:mxfp8_quantize_swizzled",
+        _CUDA,
+        "bf16 -> MXFP8 (e4m3, block-32 E8M0 scales in the cuBLASLt swizzled layout).",
+    ),
+    (
+        "diffusion.silu_mul_mxfp8",
+        KernelBackend.TRITON,
+        "quantization.mxfp8_swizzled_triton:silu_mul_mxfp8",
+        _CUDA,
+        "SwiGLU + MXFP8 quant for the online mxfp8 fc2 input.",
+    ),
+    (
+        "diffusion.indexed_scale_shift_mxfp8_",
+        KernelBackend.TRITON,
+        "quantization.mxfp8_swizzled_triton:indexed_scale_shift_mxfp8_",
+        _CUDA,
+        "Indexed adaLN modulation + MXFP8 quant for the online mxfp8 qkv/fc1 inputs.",
     ),
     (
         "diffusion.group_limited_topk",
@@ -399,6 +505,13 @@ _SPECS: tuple[tuple[str, KernelBackend, str, frozenset, str], ...] = (
         "Wan causal VAE main + DupUp3D(src).",
     ),
     (
+        "diffusion.nearest_upsample_nhwc",
+        KernelBackend.TRITON,
+        "layout.nearest_upsample_nhwc_triton:nearest_upsample_nhwc",
+        _CUDA,
+        "Wan-family VAE channels_last integer-factor nearest upsample.",
+    ),
+    (
         "diffusion.flux2_token_cat_nvfp4",
         KernelBackend.JIT,
         "layout.flux2_token_cat_nvfp4_jit:try_flux2_token_cat_nvfp4",
@@ -428,13 +541,17 @@ for _op, _backend, _target, _caps, _description in _SPECS:
 # then symbol; a new public kernel belongs here and nowhere else.
 # ---------------------------------------------------------------------------
 _EXPORTS: dict[str, str] = {
-    "load_extension_with_recovery": "ext.loader",
+    "can_use_fused_gelu_tanh_cat": "activation.gelu_tanh_cat_jit",
+    "fused_gelu_tanh_cat": "activation.gelu_tanh_cat_jit",
+    "load_extension_with_recovery": "sglang.srt.utils.cpp_extension_loader",
     # Normalization: RMSNorm / LayerNorm / GroupNorm and their fused epilogues
     "can_defer_flux2_gated_residual": "norm.flux2_gated_resnorm_jit",
     "can_use_flux2_gated_resnorm": "norm.flux2_gated_resnorm_jit",
     "flux2_gated_resnorm_raw": "norm.flux2_gated_resnorm_jit",
     "FLYDSL_NORM_MIN_ALIGNED_DIM": "norm.fused_residual_norm_flydsl",
+    "can_use_fused_scale_residual_norm_scale_shift_triton": "norm.scale_residual_norm_scale_shift_triton",
     "flydsl_fused_residual_norm_scale_shift": "norm.fused_residual_norm_flydsl",
+    "fused_scale_residual_norm_scale_shift_triton": "norm.scale_residual_norm_scale_shift_triton",
     "flydsl_norm_scale_shift": "norm.fused_residual_norm_flydsl",
     "apply_group_norm_silu": "norm.group_norm_silu",
     "triton_group_norm_silu": "norm.group_norm_silu_triton",
@@ -456,6 +573,8 @@ _EXPORTS: dict[str, str] = {
     "try_fused_bias_mul_add": "sglang.kernels.kda_kernels.norm_scale_shift_jit",
     "try_fused_bias_scale_residual_norm_scale_shift": "sglang.kernels.kda_kernels.norm_scale_shift_jit",
     "triton_one_pass_rms_norm": "norm.rmsnorm_onepass_triton",
+    "can_use_rmsnorm_preserve_reduction": "norm.rmsnorm_preserve_reduction",
+    "rmsnorm_preserve_reduction": "norm.rmsnorm_preserve_reduction",
     "can_use_fused_rmsnorm_scale_shift": "norm.rmsnorm_scale_shift_bitexact",
     "can_use_fused_scale_residual_rmsnorm_scale_shift": "norm.rmsnorm_scale_shift_bitexact",
     "fused_rmsnorm_scale_shift_bitexact": "norm.rmsnorm_scale_shift_bitexact",
@@ -468,6 +587,8 @@ _EXPORTS: dict[str, str] = {
     "try_fused_scale_residual_norm_scale_shift_fp8": "sglang.kernels.kda_kernels.norm_scale_shift_jit",
     "validate_scale_shift": "norm.scale_residual_norm_cutedsl",
     "try_fused_scale_residual_norm_scale_shift_nvfp4": "sglang.kernels.kda_kernels.norm_scale_shift_jit",
+    "can_use_wan_norm_silu_post": "norm.wan_norm_silu_post",
+    "wan_norm_silu_post": "norm.wan_norm_silu_post",
     "can_use_wan_rmsnorm_silu": "norm.wan_rmsnorm_silu_triton",
     "wan_rmsnorm_silu": "norm.wan_rmsnorm_silu_triton",
     "can_use_qk_rmsnorm_native": "norm.zimage_qk_rmsnorm_triton",
@@ -486,6 +607,8 @@ _EXPORTS: dict[str, str] = {
     "fuse_layernorm_scale_shift_gate_select01_kernel": "modulate.scale_shift_triton",
     "fuse_residual_layernorm_scale_shift_gate_select01_kernel": "modulate.scale_shift_triton",
     "fuse_scale_shift_kernel": "modulate.scale_shift_triton",
+    "try_fused_fp32_layernorm_bf16": "sglang.kernels.kda_kernels.layernorm_modulate_triton",
+    "try_fused_scaled_residual_bf16": "modulate.scale_shift_triton",
     "try_fused_scaled_residual_add_exact": "modulate.scale_shift_triton",
     "timestep_embedding": "modulate.timestep_embedding_jit",
     "can_use_fused_temb_table_slices": "modulate.wan_temb_table_slices_triton",
@@ -493,6 +616,8 @@ _EXPORTS: dict[str, str] = {
     # Rotary embeddings and the QK-norm chains fused around them
     "try_fused_flux2_qkv_epilogue": "sglang.kernels.kda_kernels.flux2_qkv_epilogue_jit",
     "hunyuan_qkv_rope_pack": "rope.hunyuan_qkv_pack_triton",
+    "can_use_joint_qkv_cat": "layout.joint_qkv_cat_triton",
+    "joint_qkv_cat": "layout.joint_qkv_cat_triton",
     "can_use_ltx2_qknorm_split_rope_cuda": "sglang.kernels.kda_kernels.ltx2_qknorm_split_rope_jit",
     "ltx2_qknorm_split_rope_cuda": "sglang.kernels.kda_kernels.ltx2_qknorm_split_rope_jit",
     "apply_ltx2_split_rotary_emb": "rope.ltx2_rotary_triton",
@@ -509,6 +634,8 @@ _EXPORTS: dict[str, str] = {
     "can_use_helios_qk_rope": "rope.helios_qk_rope_jit",
     "fused_inplace_helios_qk_rope": "rope.helios_qk_rope_jit",
     "apply_rotary_embedding": "rope.rotary_triton",
+    "can_use_fused_complex_rope": "rope.complex_rope_triton",
+    "fused_complex_rope": "rope.complex_rope_triton",
     # Tensor layout transformations fused with downstream quantization
     "try_flux2_token_cat_fp8": "sglang.kernels.kda_kernels.flux2_token_cat_fp8_triton",
     # Activation-function fusions
@@ -534,6 +661,24 @@ _EXPORTS: dict[str, str] = {
     "fused_causal_conv3d_cat_pad_cuda": "sglang.kernels.kda_kernels.causal_conv3d_cat_pad_jit",
     "fused_causal_conv3d_cat_pad": "layout.causal_conv3d_cat_pad_triton",
     "pack_qkv_destination_major": "layout.ulysses_qkv_triton",
+    "fused_qknorm_rope_out_of_place": "rope.qknorm_rope_jit",
+    "vdn_delta_factors": "attention.vdn_delta_factors_jit",
+    "can_use_vdn_delta_factors": "attention.vdn_delta_factors_jit",
+    "vdn_temporal_conv_act": "attention.vdn_linear_branch_triton",
+    "can_use_vdn_temporal_conv_act": "attention.vdn_linear_branch_triton",
+    "can_use_vdn_silu_l2norm": "attention.vdn_linear_branch_triton",
+    "can_use_vdn_frame_stats_prep": "attention.vdn_linear_branch_triton",
+    "can_use_vdn_gather_linear_state": "attention.vdn_linear_branch_triton",
+    "can_use_vdn_linear_epilogue": "attention.vdn_linear_branch_triton",
+    "vdn_silu_l2norm": "attention.vdn_linear_branch_triton",
+    "vdn_frame_stats_prep": "attention.vdn_linear_branch_triton",
+    "vdn_gather_linear_state": "attention.vdn_linear_branch_triton",
+    "vdn_linear_epilogue": "attention.vdn_linear_branch_triton",
+    "can_use_mxfp8_swizzled": "quantization.mxfp8_swizzled_triton",
+    "can_use_silu_mul_mxfp8": "quantization.mxfp8_swizzled_triton",
+    "indexed_scale_shift_mxfp8_": "quantization.mxfp8_swizzled_triton",
+    "mxfp8_quantize_swizzled": "quantization.mxfp8_swizzled_triton",
+    "silu_mul_mxfp8": "quantization.mxfp8_swizzled_triton",
     "can_use_usp_merge_heads": "layout.usp_relayout_jit",
     "usp_merge_heads": "layout.usp_relayout_jit",
     "build_inv_indices": "layout.varlen_pack_pad_triton",
@@ -542,6 +687,8 @@ _EXPORTS: dict[str, str] = {
     "fused_scatter_to_padded": "layout.varlen_pack_pad_triton",
     "cat_pad_channels_last_3d": "layout.wan_causal_cache_triton",
     "dup_up3d_add": "layout.wan_causal_cache_triton",
+    "nearest_upsample_nhwc": "layout.nearest_upsample_nhwc_triton",
+    "can_use_nearest_upsample_nhwc": "layout.nearest_upsample_nhwc_triton",
     "try_flux2_token_cat_nvfp4": "layout.flux2_token_cat_nvfp4_jit",
     # Fusion-site policy: quality gate, first-sight verification, mount
     "BitExactFusionGate": "sites.bitexact_gate",
@@ -587,6 +734,10 @@ _EXPORTS: dict[str, str] = {
     "mark_ltx2_rms_norm_modulate_site": "sites.ltx2_rmsnorm_modulate_site",
     "mount_ltx2_rms_norm_modulate": "sites.ltx2_rmsnorm_modulate_site",
     "unmount_ltx2_rms_norm_modulate": "sites.ltx2_rmsnorm_modulate_site",
+    "ltx2_qknorm_split_rope_active": "sites.ltx2_qknorm_split_rope_site",
+    "mark_ltx2_qknorm_split_rope_site": "sites.ltx2_qknorm_split_rope_site",
+    "mount_ltx2_qknorm_split_rope": "sites.ltx2_qknorm_split_rope_site",
+    "unmount_ltx2_qknorm_split_rope": "sites.ltx2_qknorm_split_rope_site",
     "lingbot_video_rmsnorm_active": "sites.lingbot_video_rmsnorm_site",
     "mark_lingbot_video_rmsnorm_site": "sites.lingbot_video_rmsnorm_site",
     "mount_lingbot_video_rmsnorm": "sites.lingbot_video_rmsnorm_site",
@@ -614,6 +765,7 @@ _EXPORTS: dict[str, str] = {
     "interpolate": "ext.hunyuan3d_rasterizer",
     "rasterize": "ext.hunyuan3d_rasterizer",
     "meshVerticeInpaint": "ext.mesh_processor",
+    "load_mesh_processor": "ext.mesh_processor",
 }
 
 
