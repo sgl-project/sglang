@@ -1493,7 +1493,7 @@ def _varlen_deep_gemm_situ_mul_quant(
     linear_beta: float,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Fused SiTU activation + per-group fp8 quant via CUDA JIT kernel."""
-    from sglang.kernels.ops.kimi_k3 import situ_and_mul_masked_post_quant
+    from sglang.kernels.ops.moe import situ_and_mul_masked_post_quant
 
     E, N, D_2 = gateup_output.shape
     D = D_2 // 2
