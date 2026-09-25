@@ -44,7 +44,7 @@ from sglang.srt.layers.boundary_layout import (
     StageOutput,
     SumGroup,
     TokenAxis,
-    dense_decoder_layer_sides,
+    decoder_layer_sides,
 )
 from sglang.srt.layers.cp.utils import (
     is_mla_cp_active,
@@ -75,6 +75,7 @@ from sglang.srt.layers.flashinfer_comm_fusion import (
 from sglang.srt.layers.moe import (
     can_merge_post_experts_all_reduce,
     get_moe_a2a_backend,
+    is_moe_input_scattered_across_dp_ranks,
     post_experts_output_is_complete,
     post_experts_reduction_group,
     should_use_dp_reduce_scatterv,
@@ -773,30 +774,43 @@ class LayerCommunicator:
 
     def _declared_sides(self) -> Optional[DecoderLayerSides]:
         """The declarations this layer's boundaries are chosen from: an
-        attention and a dense MLP on the TP group, without CP, LayerNorm SP or
-        input-scattered attention, in a layer that takes the rows a dense layer
-        or the embedding hands on. None when the steps come from the scatter
+        attention and an FFN on the TP group (a dense MLP, or a MoE not
+        dispatched per DP shard), without CP, LayerNorm SP or input-scattered
+        attention, in a layer that takes the attention's rows from the layer
+        before or the embedding. None when the steps come from the scatter
         modes."""
         modes = self.layer_scatter_modes
         parallel = get_parallel()
+        moe_on_local_rows = is_moe_input_scattered_across_dp_ranks()
+        # A MoE dispatched per DP shard keeps its rows, and so does its output.
+        previous_on_attention_rows = modes.is_first_layer or (
+            modes.is_previous_layer_sparse is not None
+            and not (modes.is_previous_layer_sparse and moe_on_local_rows)
+        )
         if not (
             self._takes_declared_boundaries
             and parallel.attn_cp_size == 1
             and not layernorm_sp.layernorm_sp_enabled()
             and not parallel.enable_attn_tp_input_scattered
-            and not modes.is_layer_sparse
             and not enable_moe_dense_fully_dp()
-            and (modes.is_first_layer or modes.is_previous_layer_sparse is False)
+            and not (modes.is_layer_sparse and moe_on_local_rows)
+            and previous_on_attention_rows
         ):
             return None
-        return dense_decoder_layer_sides(
+        return decoder_layer_sides(
             axis_sizes={
                 TokenAxis.ATTN_DP: parallel.attn_dp_size,
                 TokenAxis.ATTN_CP: parallel.attn_cp_size,
                 TokenAxis.ATTN_TP_SCATTER: parallel.attn_tp_size,
             },
+            ffn_group=SumGroup.MOE_OUTPUT if modes.is_layer_sparse else SumGroup.TP,
             leaves_for_next_layer=self.allow_deferred_ffn_reduction,
             leaves_for_reduce_scatter=self.allow_reduce_scatter,
+            # A MoE block leaves its sum to reduce_scatterv whenever that combine
+            # applies (should_skip_post_experts_all_reduce).
+            leaves_for_reduce_scatterv=(
+                self.allow_reduce_scatter or modes.is_layer_sparse
+            ),
         )
 
     def _select_declared_boundaries(self, sides: DecoderLayerSides) -> None:
