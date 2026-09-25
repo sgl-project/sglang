@@ -42,6 +42,8 @@ pub struct ChatFormatter {
     bos_token: Option<String>,
     deepseek: Option<super::deepseek::Encoder>,
     is_kimi_k3: bool,
+    /// `reasoning_effort` from the workers' default template kwargs.
+    default_effort: Option<JsonValue>,
 }
 
 impl ChatFormatter {
@@ -163,6 +165,7 @@ impl ChatFormatter {
             bos_token,
             deepseek: None,
             is_kimi_k3: false,
+            default_effort: None,
         }))
     }
 
@@ -178,6 +181,7 @@ impl ChatFormatter {
             bos_token: Some("[BOS]".into()),
             deepseek: None,
             is_kimi_k3: true,
+            default_effort: None,
         })
     }
 
@@ -205,10 +209,12 @@ impl ChatFormatter {
             .map_or(name.contains("v4.1") || name.contains("v41"), |t| {
                 t == "deepseek_v41"
             });
-        // Engine defaults: chat mode (`SGLANG_DEFAULT_THINKING=false`) and no
-        // reasoning-effort preamble; dynamo-render defaults to thinking at high effort.
+        // Engine defaults: `SGLANG_DEFAULT_THINKING` and no reasoning-effort
+        // preamble; dynamo-render defaults to thinking at high effort.
+        let thinking = std::env::var("SGLANG_DEFAULT_THINKING")
+            .is_ok_and(|v| ["true", "1", "yes", "y"].contains(&v.to_lowercase().as_str()));
         let defaults = HashMap::from([
-            ("thinking".into(), false.into()),
+            ("thinking".into(), thinking.into()),
             ("reasoning_effort".into(), "low".into()),
         ]);
         Some(Self {
@@ -221,7 +227,16 @@ impl ChatFormatter {
                 is_deepseek_v4.then(|| super::deepseek::Encoder::V4(Default::default()))
             },
             is_kimi_k3: false,
+            default_effort: None,
         })
+    }
+
+    /// Apply the workers' `--default-chat-template-kwargs`; they fill keys the
+    /// request leaves unset, and a default `reasoning_effort` acts as the request's.
+    pub fn with_defaults(mut self, defaults: &ChatTemplateKwargs) -> Self {
+        self.defaults.extend(defaults.clone());
+        self.default_effort = defaults.get("reasoning_effort").cloned();
+        self
     }
 
     /// Request kwargs plus the thinking/effort defaults SGLang derives from
@@ -332,8 +347,9 @@ impl ChatFormatter {
             }
         }
         if let Some(profile) = self.deepseek {
+            let effort = super::deepseek::request_effort(request).or(self.default_effort.clone());
             return Ok((
-                RenderedPrompt::text(profile.render(request, messages, &kwargs)?),
+                RenderedPrompt::text(profile.render(request, messages, &kwargs, effort)?),
                 prefix,
             ));
         }

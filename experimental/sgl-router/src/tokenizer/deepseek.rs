@@ -28,6 +28,7 @@ impl Encoder {
         request: &Value,
         mut messages: Vec<Value>,
         kwargs: &ChatTemplateKwargs,
+        effort: Option<Value>,
     ) -> Result<String> {
         // SGLang drops a later user's task when merging it into an existing
         // user/tool-result turn. Dynamo otherwise preserves that field.
@@ -39,8 +40,8 @@ impl Encoder {
             }
         }
         match self {
-            Self::V4(profile) => profile.render(request, messages, kwargs),
-            Self::V41 => render_v41(request, messages, kwargs),
+            Self::V4(profile) => profile.render(request, messages, kwargs, effort),
+            Self::V41 => render_v41(request, messages, kwargs, effort),
         }
     }
 }
@@ -100,6 +101,7 @@ impl V4Profile {
         request: &Value,
         mut messages: Vec<Value>,
         kwargs: &ChatTemplateKwargs,
+        effort: Option<Value>,
     ) -> Result<String> {
         ensure!(
             !messages.is_empty(),
@@ -113,10 +115,14 @@ impl V4Profile {
         if let Some(tools) = request["tools"].as_array().filter(|t| !t.is_empty()) {
             messages[0]["tools"] = normalize_tools(tools)?.into();
         }
-        let effort = match (
-            self,
-            request_effort(request).as_ref().and_then(Value::as_str),
-        ) {
+        // Without a request effort, SGLang uses SGLANG_DSV4_REASONING_EFFORT.
+        let effort = effort.or_else(|| {
+            std::env::var("SGLANG_DSV4_REASONING_EFFORT")
+                .ok()
+                .filter(|v| !v.is_empty())
+                .map(Value::from)
+        });
+        let effort = match (self, effort.as_ref().and_then(Value::as_str)) {
             (Self::Official, Some("high")) | (Self::Preview, Some("max")) => {
                 Some(ReasoningEffort::High)
             }
@@ -248,6 +254,7 @@ fn render_v41(
     request: &Value,
     mut messages: Vec<Value>,
     kwargs: &ChatTemplateKwargs,
+    effort: Option<Value>,
 ) -> Result<String> {
     ensure!(
         !messages.is_empty(),
@@ -294,9 +301,32 @@ fn render_v41(
             })
             .collect();
     }
-    // chat_encoding.parse_dsv41_reasoning_effort; unsupported values use the
-    // engine default (`high`), matching SGLANG_DSV41_REASONING_EFFORT unset.
-    let budget = match request_effort(request) {
+    // Unsupported values use SGLANG_DSV41_REASONING_EFFORT, else `high`.
+    let env_effort = std::env::var("SGLANG_DSV41_REASONING_EFFORT")
+        .ok()
+        .map(|v| {
+            v.trim()
+                .parse::<i64>()
+                .map_or_else(|_| Value::from(v.trim()), Value::from)
+        });
+    let budget = dsv41_budget(effort)
+        .or_else(|| dsv41_budget(env_effort))
+        .unwrap_or(50);
+    v41::encode_messages(
+        &messages,
+        if thinking {
+            ThinkingMode::Thinking
+        } else {
+            ThinkingMode::Chat
+        },
+        true,
+        budget,
+    )
+}
+
+/// `chat_encoding.parse_dsv41_reasoning_effort`, as a token budget.
+fn dsv41_budget(effort: Option<Value>) -> Option<u8> {
+    match effort {
         Some(Value::String(s)) => match s.as_str() {
             "low" => Some(25),
             "high" => Some(50),
@@ -313,17 +343,6 @@ fn render_v41(
         },
         _ => None,
     }
-    .unwrap_or(50);
-    v41::encode_messages(
-        &messages,
-        if thinking {
-            ThinkingMode::Thinking
-        } else {
-            ThinkingMode::Chat
-        },
-        true,
-        budget,
-    )
 }
 
 #[cfg(test)]

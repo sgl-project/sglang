@@ -196,6 +196,7 @@ impl AppContext {
                     fused: None,
                     eligibility: None,
                     sampling_overrides: Default::default(),
+                    default_chat_template_kwargs: Default::default(),
                 },
                 discovery: crate::config::DiscoveryBackend::StaticUrls(
                     crate::config::StaticUrlsDiscoveryConfig {
