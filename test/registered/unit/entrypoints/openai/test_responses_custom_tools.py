@@ -527,51 +527,76 @@ class AdditionalToolsTestCase(CustomTestCase):
         model = "deepseek-ai/DeepSeek-V4.1-Flash"
         serving.tokenizer_manager.served_model_name = model
 
-        async def generate(*args, **kwargs):
-            raw = (
-                '\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name="get_weather">\n'
-                '<｜DSML｜ parameter name="city" string="true">Paris</｜DSML｜ parameter>\n'
-                "</｜DSML｜ invoke>\n</｜DSML｜ calls>"
-            )
-            yield engine_chunk(raw[:80])
-            yield engine_chunk(raw, 2, finish=True)
-
-        serving.tokenizer_manager.generate_request = Mock(side_effect=generate)
-        for stream, top_tools in product(
-            (False, True), ([], [{"type": "function", "name": "initial"}])
+        for stream, top_tools, namespace, custom in product(
+            (False, True),
+            ([], [{"type": "function", "name": "initial"}]),
+            (None, "functions"),
+            (False, True),
         ):
-            with self.subTest(stream=stream, top_tools=top_tools):
+            with self.subTest(
+                stream=stream, top_tools=top_tools, namespace=namespace, custom=custom
+            ):
+                name = f"{namespace}.get_weather" if namespace else "get_weather"
+                tool = {**CUSTOM_TOOL, "name": "get_weather"} if custom else self.tool
+                inventory = {**self.inventory, "tools": [tool]}
+                if namespace:
+                    inventory["tools"] = [
+                        {"type": "namespace", "name": namespace, "tools": [tool]}
+                    ]
+                field = "input" if custom else "city"
+
+                async def generate(*args, **kwargs):
+                    raw = f'<｜DSML｜ calls><｜DSML｜ invoke name="{name}">{{"{field}":"Paris"}}</｜DSML｜ invoke></｜DSML｜ calls>'
+                    yield engine_chunk(raw[:80])
+                    yield engine_chunk(raw, 2, finish=True)
+
+                serving.tokenizer_manager.generate_request = Mock(side_effect=generate)
                 request = ResponsesRequest(
-                    model=model, input=self.input, tools=top_tools, stream=stream
+                    model=model,
+                    input=[inventory, self.input[1]],
+                    tools=top_tools,
+                    stream=stream,
                 )
                 response = asyncio.run(create_response_result(serving, request))
                 self.assertIsInstance(response, ResponsesResponse)
                 (call,) = response.output
                 self.assertEqual(
-                    (call.type, call.name), ("function_call", "get_weather")
+                    (call.type, call.name),
+                    ("custom_tool_call" if custom else "function_call", "get_weather"),
                 )
-                self.assertEqual(orjson.loads(call.arguments), {"city": "Paris"})
+                self.assertEqual(
+                    call.input if custom else orjson.loads(call.arguments)["city"],
+                    "Paris",
+                )
+                self.assertEqual(call.model_dump().get("namespace"), namespace)
                 self.assertNotIn("get_weather", [tool.name for tool in response.tools])
                 prompt = serving.tokenizer_manager.tokenizer.encode.call_args.args[0]
-                self.assertIn('"city": {"type": "string"}', prompt)
-                for name in ["get_weather"] + [t["name"] for t in top_tools]:
-                    self.assertEqual(prompt.count(f'"name": "{name}"'), 1)
+                self.assertIn(f'"{field}": {{"type": "string"', prompt)
+                for tool_name in [name] + [t["name"] for t in top_tools]:
+                    self.assertEqual(prompt.count(f'"name": "{tool_name}"'), 1)
                 continuation = ResponsesRequest(
                     model=model,
                     previous_response_id=response.id,
                     input=[
                         {
-                            "type": "function_call_output",
+                            "type": "custom_tool_call_output"
+                            if custom
+                            else "function_call_output",
                             "call_id": call.call_id,
                             "output": "Sunny",
                         }
                     ],
-                    tool_choice={"type": "function", "name": "get_weather"},
+                    tool_choice={
+                        "type": "custom" if custom else "function",
+                        "name": "get_weather",
+                        "namespace": namespace,
+                    },
                     stream=stream,
                 )
                 history = deepcopy(serving.msg_store[response.id])
-                replay = continuation.model_copy(
-                    update={
+                replay = ResponsesRequest.model_validate(
+                    {
+                        **continuation.model_dump(),
                         "previous_response_id": None,
                         "input": history + continuation.input,
                     }
@@ -584,14 +609,82 @@ class AdditionalToolsTestCase(CustomTestCase):
                     create_response_result(serving, continuation)
                 )
                 self.assertEqual(next_response.output[0].name, "get_weather")
+                self.assertEqual(
+                    next_response.output[0].model_dump().get("namespace"), namespace
+                )
                 self.assertEqual(serving.msg_store[response.id], history)
+
+    def test_namespace_inventory_during_review(self):
+        """Codex review sends custom exec and function wait inside a namespace."""
+        serving = make_serving()
+        serving.chat_encoding_spec = "dsv41"
+        inventory = {
+            **self.inventory,
+            "tools": [
+                {
+                    "type": "namespace",
+                    "name": "functions",
+                    "description": "Session tools",
+                    "tools": [
+                        {
+                            **CUSTOM_TOOL,
+                            "name": "exec",
+                            "format": {
+                                "type": "grammar",
+                                "syntax": "lark",
+                                "definition": 'start: "text(1)"',
+                            },
+                        },
+                        {
+                            "type": "function",
+                            "name": "wait",
+                            "parameters": {
+                                "type": "object",
+                                "properties": {"cell_id": {"type": "string"}},
+                            },
+                        },
+                    ],
+                }
+            ],
+        }
+        request = ResponsesRequest(model="x", input=[inventory], tool_choice="none")
+        prompt = encode_messages(
+            serving._construct_input_messages(request), thinking_mode="chat"
+        )
+        for text in (
+            "functions.exec",
+            "functions.wait",
+            "Session tools",
+            "start: ",
+            "cell_id",
+        ):
+            self.assertIn(text, prompt)
+        request.tool_choice = {
+            "type": "function",
+            "namespace": "missing",
+            "name": "wait",
+        }
+        response = asyncio.run(serving.create_responses(request))
+        self.assertEqual(response.status_code, 400)
+        self.assertIn(b"missing.wait", response.body)
+        serving.use_harmony = True
+        request.tool_choice = "none"
+        response = asyncio.run(serving.create_responses(request))
+        self.assertEqual(response.status_code, 400)
+        self.assertIn(b"Namespace tools are not supported with Harmony", response.body)
 
     def test_duplicate_names(self):
         serving = make_serving()
+        namespace = {"type": "namespace", "name": "functions", "tools": [self.tool]}
         for tools, items in (
             ([self.tool], [self.inventory]),
             ([], [self.inventory, self.inventory]),
             ([self.tool, self.tool], []),
+            ([namespace, namespace], []),
+            (
+                [{**self.tool, "name": "functions.get_weather"}],
+                [{**self.inventory, "tools": [namespace]}],
+            ),
         ):
             with self.subTest(tools=tools):
                 request = ResponsesRequest(model="x", tools=tools, input=items)
@@ -600,36 +693,62 @@ class AdditionalToolsTestCase(CustomTestCase):
                 self.assertIn(b"Tool names must be unique", response.body)
                 serving.tokenizer_manager.generate_request.assert_not_called()
 
+        request = ResponsesRequest(
+            model="x",
+            input=[],
+            tools=[namespace, {**namespace, "name": "other"}],
+            tool_choice={
+                "type": "function",
+                "namespace": "missing",
+                "name": "get_weather",
+            },
+        )
+        response = asyncio.run(serving.create_responses(request))
+        self.assertIn(b"missing.get_weather", response.body)
+
     def test_function_and_custom_output(self):
         serving = make_serving()
         serving.tool_call_parser = None
-        for tool_type, call_type, field, value in (
-            ("function", "function_call", "arguments", '{"input": "value"}'),
-            ("custom", "custom_tool_call", "input", "value"),
+        for namespace, (tool_type, call_type, field, value) in product(
+            (None, "functions"),
+            (
+                ("function", "function_call", "arguments", '{"input": "value"}'),
+                ("custom", "custom_tool_call", "input", "value"),
+            ),
         ):
             for choice in (
                 "required",
-                {"type": tool_type, "name": "get_weather"},
+                {"type": tool_type, "name": "get_weather", "namespace": namespace},
                 "none",
             ):
-                with self.subTest(tool_type=tool_type, choice=choice):
+                with self.subTest(
+                    tool_type=tool_type, choice=choice, namespace=namespace
+                ):
                     inventory = {
                         **self.inventory,
                         "tools": [{"type": tool_type, "name": "get_weather"}],
                     }
+                    if namespace:
+                        inventory["tools"] = [
+                            {
+                                "type": "namespace",
+                                "name": namespace,
+                                "tools": inventory["tools"],
+                            }
+                        ]
                     request = ResponsesRequest(
                         model="x", input=[inventory], tool_choice=choice, store=False
                     )
-                    raw = '[{"name":"get_weather","parameters":{"input":"value"}}]'
+                    name = f"{namespace}.get_weather" if namespace else "get_weather"
+                    raw = '[{"name":"' + name + '","parameters":{"input":"value"}}]'
                     prefix = raw[: raw.index('"parameters"')]
                     (full,) = serving._make_response_output_items(
                         request, raw, tokenizer=Mock(), require_reasoning=False
                     )
-                    completed = find_completed_event(
-                        StreamFixture(serving, request).run(
-                            [engine_chunk(prefix), engine_chunk(raw, 2, finish=True)]
-                        )
+                    events = StreamFixture(serving, request).run(
+                        [engine_chunk(prefix), engine_chunk(raw, 2, finish=True)]
                     )
+                    completed = find_completed_event(events)
                     (streamed,) = completed["response"]["output"]
                     for call in (full.model_dump(), streamed):
                         if choice == "none":
@@ -638,7 +757,14 @@ class AdditionalToolsTestCase(CustomTestCase):
                         else:
                             self.assertEqual(call["type"], call_type)
                             self.assertEqual(call["name"], "get_weather")
+                            self.assertEqual(call.get("namespace"), namespace)
                             self.assertEqual(call[field], value)
+                    for event in event_payloads(events):
+                        if event["type"] == "response.function_call_arguments.done":
+                            self.assertEqual(event["name"], "get_weather")
+                        if event.get("item", {}).get("type") == call_type:
+                            self.assertEqual(event["item"]["name"], "get_weather")
+                            self.assertEqual(event["item"].get("namespace"), namespace)
 
     def test_harmony_order_and_replay(self):
         serving = make_serving()

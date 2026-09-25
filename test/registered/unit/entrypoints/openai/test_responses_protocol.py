@@ -46,7 +46,20 @@ class ResponsesRequestTestCase(CustomTestCase):
             {"tools": [{"type": "custom"}]},
             {"tools": [{"type": "function", "name": "lookup", "parameters": []}]},
             {"tools": [{"type": "web_search"}]},
-            {"tools": [{"type": "namespace", "name": "functions", "tools": []}]},
+            {"tools": [{"type": "namespace", "name": "functions"}]},
+            *(
+                {
+                    "tools": [
+                        {"type": "namespace", "name": "functions", "tools": [child]}
+                    ]
+                }
+                for child in (
+                    {"type": "function"},
+                    {"type": "custom"},
+                    {"type": "namespace", "name": "nested", "tools": []},
+                    {"type": "web_search", "name": "search"},
+                )
+            ),
         ):
             with self.subTest(update=update), self.assertRaises(ValueError):
                 ResponsesRequest(model="x", input=[{**inventory, **update}])

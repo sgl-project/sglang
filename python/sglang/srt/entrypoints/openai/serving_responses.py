@@ -79,7 +79,9 @@ from sglang.srt.entrypoints.openai.responses_adapters import (
     decode_reasoning_state,
     encode_custom_tool_input,
     encode_reasoning_state,
+    expand_tool_namespaces,
     label_developer_content,
+    tool_call_identity,
 )
 from sglang.srt.entrypoints.openai.serving_chat import OpenAIServingChat
 from sglang.srt.entrypoints.openai.tool_server import MCPToolServer, ToolServer
@@ -319,6 +321,13 @@ class OpenAIServingResponses(OpenAIServingChat):
             prev_response = None
 
         response_tools = self._effective_response_tools(request)
+        if self.use_harmony and any(
+            tool.type == "namespace" for tool in response_tools
+        ):
+            return self.create_error_response(
+                "Namespace tools are not supported with Harmony", param="tools"
+            )
+        response_tools = expand_tool_namespaces(response_tools)
         names = [
             tool.name for tool in response_tools if tool.type in ("function", "custom")
         ]
@@ -936,24 +945,25 @@ class OpenAIServingResponses(OpenAIServingChat):
 
     @staticmethod
     def _make_tool_call_item(
-        name: str, arguments: str, custom_names: set[str]
+        name: str, arguments: str, custom_names: set[str], tools: list[ResponseTool]
     ) -> Union[ResponseFunctionToolCall, ResponseCustomToolCall]:
         """A call against a ``custom`` tool reports its freeform payload rather
         than the JSON arguments of the shim function tool."""
         call_id = f"call_{random_uuid()[:24]}"
+        identity = tool_call_identity(name, tools)
         if name in custom_names:
             return ResponseCustomToolCall(
                 type="custom_tool_call",
                 id=f"ctc_{random_uuid()[:8]}",
                 call_id=call_id,
-                name=name,
+                **identity,
                 input=decode_custom_tool_input(arguments),
             )
         return ResponseFunctionToolCall(
             arguments=arguments,
             call_id=call_id,
             type="function_call",
-            name=name,
+            **identity,
             id=f"fc_{random_uuid()[:8]}",
             status="completed",
         )
@@ -1106,6 +1116,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                                 call_info.name,
                                 call_info.parameters or "",
                                 custom_names,
+                                response_tools,
                             )
                         )
                     parsed_via_native = bool(call_info_list)
@@ -1132,7 +1143,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                         )
                         tool_call_items.append(
                             self._make_tool_call_item(
-                                tool["name"], arguments, custom_names
+                                tool["name"], arguments, custom_names, response_tools
                             )
                         )
                     content = ""
@@ -1197,7 +1208,7 @@ class OpenAIServingResponses(OpenAIServingChat):
         # ``function`` and ``custom`` tools flow to chat; built-ins go through
         # harmony. A custom tool is shimmed into a single-string function tool.
         chat_tools = []
-        for tool in tools:
+        for tool in expand_tool_namespaces(tools):
             if tool.type == "function":
                 description, parameters = tool.description, tool.parameters
             elif tool.type == "custom" and tool.name:
@@ -1340,6 +1351,10 @@ class OpenAIServingResponses(OpenAIServingChat):
             }
 
         msg_type = message.get("type")
+        if msg_type in ("function_call", "custom_tool_call") and message.get(
+            "namespace"
+        ):
+            message = {**message, "name": f"{message['namespace']}.{message['name']}"}
         if msg_type == "function_call":
             # Coerce ``arguments`` to a valid JSON-object string so the chat
             # template's unconditional ``orjson.loads`` survives truncated or
@@ -1953,7 +1968,9 @@ class OpenAIServingResponses(OpenAIServingChat):
         can_call_tools = (
             any(
                 tool.type in ("function", "custom") and tool.name
-                for tool in self._effective_response_tools(request)
+                for tool in expand_tool_namespaces(
+                    self._effective_response_tools(request)
+                )
             )
             and request.effective_tool_choice() != "none"
         )
@@ -2291,7 +2308,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                     type="custom_tool_call",
                     id=state["item_id"],
                     call_id=state["call_id"],
-                    name=state["name"] or "",
+                    **state["identity"],
                     input=payload,
                 )
                 events.append(
@@ -2309,7 +2326,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                 completed_item = ResponseFunctionToolCall(
                     arguments=arguments,
                     call_id=state["call_id"],
-                    name=state["name"] or "",
+                    **state["identity"],
                     type="function_call",
                     id=state["item_id"],
                     status="completed",
@@ -2322,7 +2339,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                             item_id=state["item_id"],
                             output_index=state["output_index"],
                             arguments=arguments,
-                            name=state["name"] or "",
+                            name=state["identity"]["name"],
                         )
                     )
                 )
@@ -2501,6 +2518,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                                 "call_id": f"call_{random_uuid()[:24]}",
                                 "output_index": current_output_index,
                                 "name": name,
+                                "identity": tool_call_identity(name, response_tools),
                                 "arguments": "",
                                 "custom": is_custom,
                                 "payload": "",
@@ -2515,14 +2533,14 @@ class OpenAIServingResponses(OpenAIServingChat):
                                     type="custom_tool_call",
                                     id=state["item_id"],
                                     call_id=state["call_id"],
-                                    name=state["name"],
+                                    **state["identity"],
                                     input="",
                                 )
                             else:
                                 added_item = ResponseFunctionToolCall(
                                     arguments="",
                                     call_id=state["call_id"],
-                                    name=state["name"],
+                                    **state["identity"],
                                     type="function_call",
                                     id=state["item_id"],
                                     status="in_progress",
