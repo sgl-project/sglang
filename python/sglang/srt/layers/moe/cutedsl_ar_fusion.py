@@ -18,6 +18,7 @@ from sglang.srt.layers.communicator import (
     CommunicateWithAllReduceAndLayerNormFn,
     LayerCommunicator,
     ScatterMode,
+    UnreducedOutput,
     get_attn_tp_context,
 )
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
@@ -221,17 +222,16 @@ class CuteDSLFusionLayerCommunicator(LayerCommunicator):
 
         if (
             residual is not None
-            and hasattr(hidden_states, "_sglang_needs_allreduce_fusion")
-            and hidden_states._sglang_needs_allreduce_fusion
+            and isinstance(hidden_states, UnreducedOutput)
             and self._can_consume_post_moe_all_reduce(
-                forward_batch, int(hidden_states.shape[0])
+                forward_batch, int(hidden_states.partial.shape[0])
             )
         ):
             if post_residual_addition is not None:
                 residual = residual + post_residual_addition
             assert self.fusion_service is not None
             hidden_states, residual = self.fusion_service.all_reduce_residual_rms_norm(
-                local_contribution=hidden_states,
+                local_contribution=hidden_states.partial,
                 residual=residual,
                 gamma=_fused_norm_gamma(self.input_layernorm),
             )

@@ -4,7 +4,7 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from sglang.srt.layers.communicator import LayerCommunicator
+from sglang.srt.layers.communicator import LayerCommunicator, UnreducedOutput
 from sglang.srt.layers.flashinfer_mnnvl_cutedsl import (
     FlashInferMNNVLCuteDSLARFusion,
     _retargeted_config,
@@ -69,7 +69,7 @@ def eligible():
 
 def test_last_layer_consumes_but_does_not_skip_the_pending_all_reduce(eligible):
     """The last layer must fuse the reduction its predecessor skipped, or the
-    tagged tensor reaches the final norm unreduced; it must not skip its own."""
+    unreduced output reaches the final norm; it must not skip its own."""
     last = _communicator()
     last.successor_absorbs_all_reduce = False
     last.fusion_service = SimpleNamespace(
@@ -78,8 +78,7 @@ def test_last_layer_consumes_but_does_not_skip_the_pending_all_reduce(eligible):
             residual + 1,
         )
     )
-    hidden_states = torch.zeros(8, 8)
-    hidden_states._sglang_needs_allreduce_fusion = True
+    hidden_states = UnreducedOutput(torch.zeros(8, 8))
 
     with (
         patch.object(
