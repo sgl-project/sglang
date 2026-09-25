@@ -32,7 +32,7 @@ class AccuracyTestParams:
     repeat: Optional[int] = None
     api: Optional[str] = None  # "chat" or "completion"; defaults to "chat" in run_eval
     seed: Optional[int] = None  # pin for reproducibility when temperature > 0
-    # sgl-eval-backed datasets only: default for chat_template_kwargs thinking.
+    # sgl-eval datasets only: True/False force thinking and enable_thinking; None sends neither.
     sgl_eval_thinking: Optional[bool] = None
     num_shots: Optional[int] = None  # few-shot count; None = run_eval's default
 
