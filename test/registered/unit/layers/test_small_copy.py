@@ -2,6 +2,8 @@ from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-small")
 
+import sys
+
 import pytest
 import torch
 
@@ -125,3 +127,7 @@ def test_dynamic_metadata_has_bounded_specializations():
             assert specialization_count - initial_count <= 16
         elif n > 48:
             assert len(kernel_cache) == specialization_count
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))
