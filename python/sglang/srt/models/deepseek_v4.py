@@ -71,14 +71,13 @@ from sglang.srt.layers.attention.dsv4.dsv41_sparse import (
 )
 from sglang.srt.layers.attention.dsv4.indexer import C4Indexer
 from sglang.srt.layers.communicator import get_attn_tp_context
-from sglang.srt.layers.communicator_dsa_cp import (
-    dsa_cp_gather_hidden_states,
-    dsa_cp_reduce_scatter_hidden_states,
-)
 from sglang.srt.layers.cp.cp_decode_attn_tp import get_cp_decode_attn_tp_ctx
 from sglang.srt.layers.cp.utils import (
     cp_gather_full_sequence_states,
     cp_materialize_global_token_order,
+    dsa_prefill_cp_fused_symm_mem,
+    dsa_prefill_cp_moe_gather,
+    dsa_prefill_cp_moe_reduce_scatter,
     is_cp_active,
 )
 from sglang.srt.layers.deep_gemm_wrapper.configurer import DEEPGEMM_SCALE_UE8M0
@@ -3814,7 +3813,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         if _use_cp:
             moe_a2a_backend = get_moe_a2a_backend()
             if moe_a2a_backend.is_none():
-                hidden_states = dsa_cp_gather_hidden_states(hidden_states)
+                hidden_states = dsa_prefill_cp_moe_gather(hidden_states)
             else:
                 assert (
                     moe_a2a_backend.is_deepep()
@@ -3865,7 +3864,7 @@ class DeepseekV4DecoderLayer(nn.Module):
                 skip_shared_experts=_do_shared_local,
             )
         if _use_cp and get_moe_a2a_backend().is_none():
-            hidden_states = dsa_cp_reduce_scatter_hidden_states(hidden_states)
+            hidden_states = dsa_prefill_cp_moe_reduce_scatter(hidden_states)
         elif _use_tp_moe_gather:
             hidden_states, global_hidden_states = (
                 get_local_dp_buffer(get_parallel().tp_group),
@@ -4763,40 +4762,47 @@ class DeepseekV4Model(nn.Module):
                 forward_batch=forward_batch,
             )
         else:
-            use_fused = self.use_fused_mhc_post_pre
-            prev_residual, prev_post, prev_comb = None, None, None
-            last_layer = None
-            for i in range(self.start_layer, self.end_layer):
-                layer = self.layers[i]
-                last_layer = layer
-                ctx = (
-                    nullcontext()
-                    if check_cuda_graph_backend(Phase.PREFILL, Backend.TC_PIECEWISE)
-                    else get_global_expert_distribution_recorder().with_current_layer(i)
-                )
-                with ctx:
-                    hidden_states, prev_residual, prev_post, prev_comb = layer(
-                        positions=positions,
-                        hidden_states=hidden_states,
-                        forward_batch=forward_batch,
-                        input_ids=input_ids,
-                        input_ids_global=input_ids_global,
-                        prev_residual=prev_residual,
-                        prev_post=prev_post,
-                        prev_comb=prev_comb,
-                    )
-                if capture_dspark and i in self.dspark_layers_to_capture:
-                    if use_fused:
-                        completed = layer.hc_post(
-                            hidden_states, prev_residual, prev_post, prev_comb
+            with dsa_prefill_cp_fused_symm_mem(
+                self.layers[self.start_layer].mlp,
+                forward_batch,
+                hidden_states,
+            ):
+                use_fused = self.use_fused_mhc_post_pre
+                prev_residual, prev_post, prev_comb = None, None, None
+                last_layer = None
+                for i in range(self.start_layer, self.end_layer):
+                    layer = self.layers[i]
+                    last_layer = layer
+                    ctx = (
+                        nullcontext()
+                        if check_cuda_graph_backend(Phase.PREFILL, Backend.TC_PIECEWISE)
+                        else get_global_expert_distribution_recorder().with_current_layer(
+                            i
                         )
-                    else:
-                        completed = hidden_states
-                    dspark_aux_hidden_states.append(completed.mean(dim=1))
-            if use_fused and last_layer is not None:
-                hidden_states = last_layer.hc_post(
-                    hidden_states, prev_residual, prev_post, prev_comb
-                )
+                    )
+                    with ctx:
+                        hidden_states, prev_residual, prev_post, prev_comb = layer(
+                            positions=positions,
+                            hidden_states=hidden_states,
+                            forward_batch=forward_batch,
+                            input_ids=input_ids,
+                            input_ids_global=input_ids_global,
+                            prev_residual=prev_residual,
+                            prev_post=prev_post,
+                            prev_comb=prev_comb,
+                        )
+                    if capture_dspark and i in self.dspark_layers_to_capture:
+                        if use_fused:
+                            completed = layer.hc_post(
+                                hidden_states, prev_residual, prev_post, prev_comb
+                            )
+                        else:
+                            completed = hidden_states
+                        dspark_aux_hidden_states.append(completed.mean(dim=1))
+                if use_fused and last_layer is not None:
+                    hidden_states = last_layer.hc_post(
+                        hidden_states, prev_residual, prev_post, prev_comb
+                    )
 
         if not self.pp_group.is_last_rank:
             # Flatten 3D mHC tensor for PP IPC.
