@@ -1,6 +1,7 @@
 // M<=8 extension: write native eight-token-tile expert metadata after radix
 // routing. At M1 the selected experts are already in ascending ID order; at M>1
-// the last routing CTA to finish lays out every token's routes.
+// the last routing CTA to finish lays out every token's routes. Larger M runs
+// routing and quantization only.
 // K3 MoE-front prep in one launch: radix routing (+ trtllm packed ids) on the
 // first M CTAs, mxfp8 per-token-group quant of the routed activations on the
 // next M. Specialized like route_radix: 896 experts, top-16, 3584-wide bf16
@@ -213,6 +214,7 @@ __global__ __launch_bounds__(LargeRouterRadixTrait::kBlockSize)  //
   if (blockIdx.x < M) {
     __shared__ typename LargeRouterRadixTrait::Smem smem;
     route_radix_block<kUsePDL, TScore>(params.route, smem);
+    if (M > kMetadataMaxTokens_) return;
     __syncthreads();
     const auto tx = threadIdx.x;
     if (M > 1) {
@@ -290,19 +292,21 @@ struct RouteQuantMetadataKernel {
     const auto quant_params = Quant::make(x, out_q, out_s, global_scale, M_, device, x_dtype);
 
     const auto M = static_cast<uint32_t>(M_.unwrap());
-    RuntimeCheck(M >= 1 && M <= kMetadataMaxTokens_, "fused routing metadata supports M1..M8");
-    const int64_t routes = M * 16;
-    TensorMatcher({1}).with_dtype<int32_t>().with_device(device).verify(total);
-    TensorMatcher({routes}).with_dtype<int32_t>().with_device(device).verify(map);
-    TensorMatcher({routes * kMetadataTile_ + 1}).with_dtype<int32_t>().with_device(device).verify(perm);
-    TensorMatcher({static_cast<int64_t>(M), 16})
-        .with_dtype<typename Quant::Weight>()
-        .with_device(device)
-        .verify(weights);
-    TensorMatcher({routes}).with_dtype<int32_t>().with_device(device).verify(cta);
-    TensorMatcher({routes}).with_dtype<int32_t>().with_device(device).verify(limit);
-    TensorMatcher({1}).with_dtype<int32_t>().with_device(device).verify(count);
-    TensorMatcher({1}).with_dtype<int32_t>().with_device(device).verify(arrivals);
+    RuntimeCheck(M >= 1, "fused routing preparation needs at least one token");
+    if (M <= kMetadataMaxTokens_) {
+      const int64_t routes = M * 16;
+      TensorMatcher({1}).with_dtype<int32_t>().with_device(device).verify(total);
+      TensorMatcher({routes}).with_dtype<int32_t>().with_device(device).verify(map);
+      TensorMatcher({routes * kMetadataTile_ + 1}).with_dtype<int32_t>().with_device(device).verify(perm);
+      TensorMatcher({static_cast<int64_t>(M), 16})
+          .with_dtype<typename Quant::Weight>()
+          .with_device(device)
+          .verify(weights);
+      TensorMatcher({routes}).with_dtype<int32_t>().with_device(device).verify(cta);
+      TensorMatcher({routes}).with_dtype<int32_t>().with_device(device).verify(limit);
+      TensorMatcher({1}).with_dtype<int32_t>().with_device(device).verify(count);
+      TensorMatcher({1}).with_dtype<int32_t>().with_device(device).verify(arrivals);
+    }
 
     const auto params = RouteQuantMetadataParams<Quant>{
         .route =
