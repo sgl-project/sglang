@@ -19,7 +19,8 @@ Two capture-trace modes plus their precedence:
 The profiler / CUDA-memory APIs are mocked; the directory + naming + schedule
 logic is pure-Python and runs on CPU. The method is invoked unbound against a
 lightweight stand-in (with the real precedence helper bound) so no model or
-server is constructed.
+server is constructed. The shared aux-hidden-state output uses the same
+stand-in approach.
 """
 
 import os
@@ -27,6 +28,8 @@ import tempfile
 import unittest
 from types import SimpleNamespace
 from unittest import mock
+
+import torch
 
 from sglang.srt.model_executor.runner import decode_cuda_graph_runner as mod
 from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
@@ -296,6 +299,54 @@ class TestOriginalTraceExport(CustomTestCase):
                     putils.graph_capture_profile_dir(),
                     os.path.join(tmp, "graph_capture_profile"),
                 )
+
+
+class _PackedAuxModel(torch.nn.Module):
+    def get_packed_aux_hidden_size(self) -> int:
+        return 12
+
+
+class TestSharedAuxHiddenStatesBuffer(CustomTestCase):
+    def _runner(self, *, model=None, dflash=True, draft=False, pp_size=1):
+        runner = SimpleNamespace(
+            model_runner=SimpleNamespace(
+                model=_PackedAuxModel() if model is None else model,
+                spec_algorithm=SimpleNamespace(is_dflash_family=lambda: dflash),
+                is_draft_worker=draft,
+                model_config=SimpleNamespace(dtype=torch.bfloat16),
+            ),
+            pp_size=pp_size,
+            max_num_token=64,
+            device="cpu",
+            _aux_hidden_states_buffers={},
+        )
+        runner._aux_hidden_states_width = (
+            DecodeCudaGraphRunner._resolve_aux_hidden_states_width(runner)
+        )
+        return runner
+
+    def test_graph_sizes_share_one_buffer_per_stream(self):
+        runner = self._runner()
+        get = DecodeCudaGraphRunner._aux_hidden_states_buffer
+        # Capture order is largest first; every size aliases the same rows.
+        views = [get(runner, None, rows) for rows in (64, 8, 32)]
+        self.assertEqual([v.shape for v in views], [(64, 12), (8, 12), (32, 12)])
+        self.assertEqual({v.data_ptr() for v in views}, {views[0].data_ptr()})
+        # PD-multiplexed streams run concurrently, so they must not alias.
+        self.assertNotEqual(get(runner, 1, 8).data_ptr(), views[0].data_ptr())
+
+    def test_only_dflash_target_without_pp_opts_in(self):
+        """EAGLE3, draft runners, PP stages and models without the packed
+        interface keep allocating their own aux output."""
+        for runner in (
+            self._runner(dflash=False),
+            self._runner(draft=True),
+            self._runner(pp_size=2),
+            self._runner(model=torch.nn.Module()),
+        ):
+            self.assertIsNone(
+                DecodeCudaGraphRunner._aux_hidden_states_buffer(runner, None, 8)
+            )
 
 
 if __name__ == "__main__":

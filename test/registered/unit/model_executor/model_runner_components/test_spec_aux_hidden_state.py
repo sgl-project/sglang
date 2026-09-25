@@ -2,7 +2,12 @@ import sys
 from types import SimpleNamespace
 
 import pytest
+import torch
 
+from sglang.srt.layers.aux_hidden_states import (
+    AuxHiddenStatePacker,
+    pack_aux_hidden_states,
+)
 from sglang.srt.model_executor.model_runner_components.spec_aux_hidden_state import (
     _map_muse_target_layer_ids,
 )
@@ -32,6 +37,25 @@ def test_muse_target_layer_id_mapping(target_model_type, draft_architecture, exp
         )
         == expected
     )
+
+
+def test_packer_writes_into_external_buffer_like_list_path():
+    """A graph runner hands every graph size a row slice of one buffer; the
+    packed output must equal the list path's concat and live in that storage,
+    and a buffer that does not fit the captures must be rejected."""
+    captures = [torch.randn(5, 4) for _ in range(3)]
+    shared = torch.full((8, 12), float("nan"))
+    packer = AuxHiddenStatePacker(3, out=shared[:5])
+    for hidden in captures:
+        packer.append(hidden)
+    packed = packer.finalize()
+
+    torch.testing.assert_close(packed, pack_aux_hidden_states(list(captures)))
+    assert packed.data_ptr() == shared.data_ptr()
+    assert shared[5:].isnan().all()
+
+    with pytest.raises(ValueError):
+        AuxHiddenStatePacker(3, out=shared[:4]).append(captures[0])
 
 
 if __name__ == "__main__":

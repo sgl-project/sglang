@@ -54,6 +54,7 @@ from sglang.srt.layers.attention.graph_variants import (
     create_attention_graph_variants,
     create_dsv41_candidate_graph_variants,
 )
+from sglang.srt.layers.aux_hidden_states import SupportsSharedAuxHiddenStates
 from sglang.srt.layers.cp.utils import is_mla_cp_enabled
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
@@ -394,6 +395,12 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         if self.require_gathered_buffer:
             assert self.require_mlp_tp_gather or self.require_attn_tp_gather
 
+        # One packed aux output per stream, aliased by every graph size. Safe
+        # because DFlash consumes target hidden states into draft KV before
+        # the next target forward on the same stream.
+        self._aux_hidden_states_width = self._resolve_aux_hidden_states_width()
+        self._aux_hidden_states_buffers: dict[Optional[int], torch.Tensor] = {}
+
         # --- buffers ---------------------------------------------------
         logits_buffer_rows = self._next_token_logits_buffer_capacity_rows(
             self.max_num_token
@@ -484,6 +491,33 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             raise Exception(
                 f"Capture cuda graph failed: {e}\n{CUDA_GRAPH_CAPTURE_FAILED_MSG}"
             )
+
+    def _resolve_aux_hidden_states_width(self) -> int:
+        model = self.model_runner.model
+        if (
+            not isinstance(model, SupportsSharedAuxHiddenStates)
+            or not self.model_runner.spec_algorithm.is_dflash_family()
+            or self.model_runner.is_draft_worker
+            or self.pp_size > 1
+        ):
+            return 0
+        return model.get_packed_aux_hidden_size()
+
+    def _aux_hidden_states_buffer(
+        self, stream_idx: Optional[int], num_tokens: int
+    ) -> Optional[torch.Tensor]:
+        if self._aux_hidden_states_width == 0:
+            return None
+        buffer = self._aux_hidden_states_buffers.get(stream_idx)
+        if buffer is None:
+            buffer = torch.empty(
+                (self.max_num_token, self._aux_hidden_states_width),
+                dtype=self.model_runner.model_config.dtype,
+                device=self.device,
+            )
+            self._aux_hidden_states_buffers[stream_idx] = buffer
+        assert num_tokens <= buffer.shape[0]
+        return buffer[:num_tokens]
 
     def _next_token_logits_buffer_capacity_rows(self, max_num_tokens: int) -> int:
         """Rows reserved for the largest shared logits output."""
@@ -1148,6 +1182,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
 
         forward_batch, attn_backend, pp_proxy_tensors = self.capture_prepare(
             bs, stream_idx=stream_idx, num_tokens=num_tokens
+        )
+        forward_batch.aux_hidden_states_buffer = self._aux_hidden_states_buffer(
+            stream_idx, num_tokens
         )
 
         # All setup hooks below read get_attn_backend() (TboForwardBatchPreparer,
