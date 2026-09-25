@@ -8,7 +8,7 @@ from types import SimpleNamespace
 import sglang as sgl
 from sglang.srt.environ import envs
 from sglang.srt.utils import kill_process_tree
-from sglang.test.run_eval import run_eval
+from sglang.test.sgl_eval_utils import run_sgl_eval
 from sglang.test.test_utils import (
     DEFAULT_MLA_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -96,7 +96,7 @@ class _BaseTestDynamicEPLB(CustomTestCase):
             num_threads=32,
         )
 
-        metrics = run_eval(args)
+        metrics = run_sgl_eval(args)
         self.assertGreater(metrics["score"], 0.5)
 
 

@@ -90,17 +90,14 @@ class TestEvalKitBackendDispatch(CustomTestCase):
         host.base_url = "http://127.0.0.1:0"
         host.model = "m"
         host.gpqa_score_threshold = 0.5
-        absent = {
-            k: None for k in ("sgl_eval.registry", "sgl_eval.sampler", "sgl_eval.types")
-        }
-        with patch.dict(sys.modules, absent):
+        with patch.dict(sys.modules, {"sgl_eval": None}):
             with self.assertRaises(unittest.SkipTest):
                 host.test_gpqa()
 
     def _run_mmmu_pro(self, score):
         captured = {}
 
-        def fake_run_eval(args):
+        def fake_run_sgl_eval(args):
             captured["args"] = args
             return {"score": score}
 
@@ -110,7 +107,7 @@ class TestEvalKitBackendDispatch(CustomTestCase):
         host.mmmu_pro_score_threshold = 0.75
         host.mmmu_pro_load_preset_from_model_id = "moonshotai/Kimi-K3"
         with (
-            patch.object(kit, "run_eval", side_effect=fake_run_eval),
+            patch.object(kit, "run_sgl_eval", side_effect=fake_run_sgl_eval),
             patch.object(kit.requests, "get", side_effect=_fake_get),
         ):
             host.test_mmmu_pro()

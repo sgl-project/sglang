@@ -48,7 +48,7 @@ from sglang.srt.utils import (
     retry,
 )
 from sglang.srt.utils.network import is_port_available
-from sglang.test.run_eval import run_eval
+from sglang.test.sgl_eval_utils import run_sgl_eval
 from sglang.utils import normalize_base_url
 
 # General test models
@@ -1740,7 +1740,7 @@ def run_mmlu_test(
         )
 
         try:
-            metrics = run_eval(args)
+            metrics = run_sgl_eval(args)
             assert metrics["score"] >= 0.65, f"{metrics=}"
         finally:
             pass

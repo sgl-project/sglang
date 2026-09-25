@@ -14,7 +14,7 @@ runs two sgl-eval evaluations (https://github.com/sgl-project/sgl-eval):
 Cookbook reference:
     https://docs.sglang.io/cookbook/autoregressive/DeepSeek/DeepSeek-V4
 
-These are MANUAL tests (not CI). ``sgl-eval`` must be on PATH.
+These are MANUAL tests (not CI). The ``sgl-eval`` package must be installed.
 
 Per-variant defaults (set on the Flash/Pro intermediate base classes):
     Flash recipes -> AIME25 score threshold 0.93
@@ -41,8 +41,7 @@ GSM8K sanity knobs (env vars):
     DSV4_GSM8K_SCORE_THRESHOLD    (default 0.93; set to 0 to skip the assertion)
 
 Shared knobs:
-    DSV4_SGL_EVAL_OUT_DIR         (default /tmp/sgl-eval-out -> --out-dir)
-    DSV4_SGL_EVAL_BIN             (default "sgl-eval"; override path to the CLI)
+    DSV4_SGL_EVAL_OUT_DIR         (default /tmp/sgl-eval-out)
     DSV4_SERVER_LAUNCH_TIMEOUT    (default 3600s; the sglang 600s default is
                                    too short for DSV4 model load + DeepGEMM
                                    warmup. 1800s is also tight for the heavier
@@ -60,22 +59,19 @@ wins on key conflict):
     SGLANG_JIT_DEEPGEMM_FAST_WARMUP=1   skip the slow DeepGEMM warmup grid
 """
 
-import json
 import os
-import shutil
-import subprocess
 import unittest
-from pathlib import Path
+from types import SimpleNamespace
 from typing import ClassVar, Dict, List, Optional
 
 from sglang.srt.utils import kill_process_tree
+from sglang.test.sgl_eval_utils import run_sgl_eval
 from sglang.test.test_utils import (
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
     popen_launch_server,
 )
 
-SGL_EVAL_BIN = os.environ.get("DSV4_SGL_EVAL_BIN", "sgl-eval")
 SGL_EVAL_OUT_DIR = os.environ.get("DSV4_SGL_EVAL_OUT_DIR", "/tmp/sgl-eval-out")
 
 # DSV4 server launch needs more than the 600s sglang default: model load alone
@@ -220,82 +216,24 @@ class DSV4Aime25TestBase(CustomTestCase):
         metric,
         threshold,
     ):
-        if shutil.which(SGL_EVAL_BIN) is None:
-            self.skipTest(f"{SGL_EVAL_BIN!r} not found on PATH")
-
-        out_dir = Path(SGL_EVAL_OUT_DIR)
-        out_dir.mkdir(parents=True, exist_ok=True)
-        glob_pattern = f"sgl_eval_{eval_name}_*.json"
-        before = set(out_dir.glob(glob_pattern))
-
-        cmd = [
-            SGL_EVAL_BIN,
-            "run",
-            eval_name,
-            "--base-url",
-            f"{self.base_url}/v1",
-            "--n-repeats",
-            str(n_repeats),
-            "--temperature",
-            str(temperature),
-            "--top-p",
-            str(top_p),
-            "--max-tokens",
-            str(max_tokens),
-            "--num-threads",
-            str(num_threads),
-            "--out-dir",
-            str(out_dir),
-        ]
-        if num_examples is not None:
-            cmd += ["--num-examples", str(num_examples)]
-
-        print(f"[{type(self).__name__}] + {' '.join(cmd)}", flush=True)
-        subprocess.run(cmd, check=True)
-
-        new = sorted(set(out_dir.glob(glob_pattern)) - before)
-        if not new:
-            self.fail(f"sgl-eval produced no new {eval_name} JSON in {out_dir}")
-        result_path = new[-1]
-        with open(result_path) as f:
-            result = json.load(f)
-        print(
-            f"[{type(self).__name__}] sgl-eval {eval_name} result "
-            f"({result_path.name}): {json.dumps(result, indent=2)}",
-            flush=True,
+        args = SimpleNamespace(
+            eval_name=eval_name,
+            base_url=self.base_url,
+            repeat=n_repeats,
+            temperature=temperature,
+            top_p=top_p,
+            max_tokens=max_tokens,
+            num_threads=num_threads,
+            num_examples=num_examples,
+            sgl_eval_out_dir=SGL_EVAL_OUT_DIR,
         )
-
-        score = self._extract_score(result, metric)
+        score = run_sgl_eval(args)[metric]
         if threshold > 0:
             self.assertGreaterEqual(
                 score,
                 threshold,
                 f"{eval_name} {metric}={score} below threshold {threshold}",
             )
-
-    @staticmethod
-    def _extract_score(result, metric):
-        """Find ``metric`` (e.g. "pass@1") anywhere in the sgl-eval JSON tree."""
-
-        def walk(o):
-            if isinstance(o, dict):
-                if metric in o and isinstance(o[metric], (int, float)):
-                    return float(o[metric])
-                for v in o.values():
-                    s = walk(v)
-                    if s is not None:
-                        return s
-            elif isinstance(o, list):
-                for v in o:
-                    s = walk(v)
-                    if s is not None:
-                        return s
-            return None
-
-        score = walk(result)
-        if score is None:
-            raise AssertionError(f"metric {metric!r} not found in sgl-eval result JSON")
-        return score
 
 
 class DSV4FlashAime25TestBase(DSV4Aime25TestBase):

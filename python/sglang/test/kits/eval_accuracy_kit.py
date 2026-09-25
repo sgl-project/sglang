@@ -4,6 +4,7 @@ from typing import Optional
 import requests
 
 from sglang.test.run_eval import run_eval
+from sglang.test.sgl_eval_utils import SGL_EVAL_BENCHMARKS, run_sgl_eval
 from sglang.test.test_utils import is_in_amd_ci, is_in_ci, write_github_step_summary
 
 _THRESHOLD_NOT_SET = float("nan")
@@ -51,14 +52,14 @@ def _run_accuracy_eval(
 ):
     """Shared driver for the accuracy mixins below.
 
-    Runs ``run_eval`` for ``eval_name`` against the test class's server
-    (``base_url`` / ``model``), records a CI step summary, asserts the score
-    meets ``score_threshold``, and checks the speculative accept length.
+    Runs ``eval_name`` against the test class's server (``base_url`` /
+    ``model``) through ``run_sgl_eval`` for sgl-eval benchmarks and ``run_eval``
+    otherwise, records a CI step summary, asserts the score meets
+    ``score_threshold``, and checks the speculative accept length.
 
     ``eval_overrides`` (e.g. ``api``, ``max_tokens``, ``temperature``,
-    ``top_p``, ``num_shots``) are forwarded to ``run_eval`` only when not
-    ``None``, so the common case stays identical to ``run_eval``'s defaults.
-    Returns the metrics dict.
+    ``top_p``, ``num_shots``) are forwarded only when not ``None``, so the
+    common case keeps the evaluator's defaults. Returns the metrics dict.
     """
     assert score_threshold == score_threshold, (
         f"{type(test_case).__name__} must set the {eval_name} score threshold"
@@ -74,7 +75,8 @@ def _run_accuracy_eval(
     )
     kwargs.update({k: v for k, v in eval_overrides.items() if v is not None})
 
-    metrics = run_eval(SimpleNamespace(**kwargs))
+    evaluate = run_sgl_eval if eval_name in SGL_EVAL_BENCHMARKS else run_eval
+    metrics = evaluate(SimpleNamespace(**kwargs))
     print(f"{eval_name} {metrics=}")
     _finalize_eval(
         test_case,
@@ -107,55 +109,41 @@ def _run_sgl_eval(
 ):
     """Shared sgl-eval driver for the reasoning mixins and the ``sgl_eval`` backend.
 
-    Runs ``eval_name`` via the sgl-eval Python API (``registry.get`` ->
-    ``EvalSpec.run``) against the test class's server, records a CI step summary,
-    asserts the score meets ``score_threshold``, and checks the speculative accept
-    length. ``thinking=True`` sends per-request ``chat_template_kwargs={"thinking":
-    True}`` so the server separates reasoning from the final answer. Skips the test
-    if sgl-eval is not installed. Returns the RunResult.
+    Runs ``eval_name`` through ``run_sgl_eval`` against the test class's server,
+    records a CI step summary, asserts ``metric`` meets ``score_threshold``, and
+    checks the speculative accept length. ``thinking=True`` sends per-request
+    ``chat_template_kwargs={"thinking": True}`` so the server separates reasoning
+    from the final answer. Skips the test if sgl-eval is not installed. Returns
+    the metrics dict.
     """
     assert score_threshold == score_threshold, (
         f"{type(test_case).__name__} must set the {eval_name} score threshold"
     )
 
     try:
-        from sgl_eval.registry import get as get_eval_spec
-        from sgl_eval.sampler import ChatCompletionSampler
-        from sgl_eval.types import GenConfig
+        import sgl_eval  # noqa: F401
     except ImportError:
         test_case.skipTest("sgl-eval not installed; pip install 'sglang[test]'")
 
-    base_url = test_case.base_url.rstrip("/")
-    if not base_url.endswith("/v1"):
-        base_url += "/v1"
-    sampler = ChatCompletionSampler(
-        base_url=base_url, model=getattr(test_case, "model", None), api_key="EMPTY"
-    )
-
-    gen_kwargs = dict(
+    args = SimpleNamespace(
+        eval_name=eval_name,
+        base_url=test_case.base_url,
+        model=getattr(test_case, "model", None),
+        repeat=n_repeats,
+        num_examples=num_examples,
+        num_threads=num_threads,
         max_tokens=max_tokens,
         reasoning_effort=reasoning_effort,
+        temperature=temperature,
+        top_p=top_p,
         chat_template_kwargs=(
             chat_template_kwargs
             if chat_template_kwargs is not None
             else ({"thinking": True} if thinking else None)
         ),
     )
-    if temperature is not None:
-        gen_kwargs["temperature"] = temperature
-    if top_p is not None:
-        gen_kwargs["top_p"] = top_p
-
-    result = get_eval_spec(eval_name).run(
-        sampler=sampler,
-        gen=GenConfig(**gen_kwargs),
-        n_repeats=n_repeats,
-        num_examples=num_examples,
-        num_threads=num_threads,
-        predictions_writer=None,
-        load_examples=None,
-    )
-    score = result.aggregate[metric]
+    metrics = run_sgl_eval(args)
+    score = metrics[metric]
     print(f"{eval_name} sgl-eval {metric}={score:.4f}")
     _finalize_eval(
         test_case,
@@ -165,7 +153,7 @@ def _run_sgl_eval(
         accept_length_thres=accept_length_thres,
         summary_label=summary_label,
     )
-    return result
+    return metrics
 
 
 class MMLUSanityMixin:
@@ -263,9 +251,9 @@ class GSM8KMixin:
 class MMLUMixin:
     """Mixin for MMLU evaluation.
 
-    Both ``mmlu_backend`` values score through sgl-eval -- ``"sgl_eval"`` calls it
-    in-process, ``"run_eval"`` reaches the same CLI via ``run_eval``. The switch
-    picks the call mechanism, not the grader.
+    Both ``mmlu_backend`` values score through ``run_sgl_eval``; ``"run_eval"``
+    keeps the 2048-token cap and no thinking, ``"sgl_eval"`` uses the reasoning
+    driver's knobs (``mmlu_thinking``, ``mmlu_n_repeats``, uncapped tokens).
 
     Required attributes on the test class:
         base_url: str

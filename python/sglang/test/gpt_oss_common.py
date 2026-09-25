@@ -7,7 +7,7 @@ from typing import Dict, List, Literal, Optional
 import requests
 
 from sglang.srt.utils import is_hip, kill_process_tree
-from sglang.test.run_eval import run_eval
+from sglang.test.sgl_eval_utils import run_sgl_eval
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
@@ -142,7 +142,7 @@ class BaseTestGptOss(CustomTestCase):
         setup = f"model={model} reasoning_effort={reasoning_effort} expected_score={expected_score}"
 
         print(f"Evaluation start: {setup}")
-        metrics = run_eval(args)
+        metrics = run_sgl_eval(args)
         print(f"Evaluation end: {setup} {metrics=}")
         self.assertGreaterEqual(metrics["score"], expected_score)
 

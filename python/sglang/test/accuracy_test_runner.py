@@ -4,6 +4,7 @@ from typing import List, Optional, Tuple
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.run_eval import run_eval
+from sglang.test.sgl_eval_utils import SGL_EVAL_BENCHMARKS, run_sgl_eval
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
@@ -97,7 +98,7 @@ def _run_simple_eval(
     seed: Optional[int] = None,
     sgl_eval_thinking: Optional[bool] = None,
 ) -> Tuple[bool, Optional[str], Optional[dict]]:
-    """Run evaluation using simple_eval backend (run_eval.py).
+    """Run ``dataset`` through run_sgl_eval (sgl-eval benchmarks) or run_eval.
 
     Returns:
         Tuple of (success, error_message, metrics_dict)
@@ -153,7 +154,8 @@ def _run_simple_eval(
         if sgl_eval_thinking is not None:
             args.sgl_eval_thinking = sgl_eval_thinking
 
-        result = run_eval(args)
+        evaluate = run_sgl_eval if dataset in SGL_EVAL_BENCHMARKS else run_eval
+        result = evaluate(args)
 
         # Handle result format (run_eval can return metrics or (metrics, latency))
         if return_latency and isinstance(result, tuple):

@@ -4,10 +4,10 @@ import unittest
 from types import SimpleNamespace
 
 from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.run_eval import run_eval
 from sglang.test.server_fixtures.disaggregation_fixture import (
     PDDisaggregationServerBase,
 )
+from sglang.test.sgl_eval_utils import run_sgl_eval
 from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -143,7 +143,7 @@ class TestDisaggregationDecodeOffload(PDDisaggregationServerBase):
             num_threads=32,
         )
 
-        metrics1 = run_eval(args)
+        metrics1 = run_sgl_eval(args)
 
         # Ensure all offloads are committed to disk
         import time
@@ -160,7 +160,7 @@ class TestDisaggregationDecodeOffload(PDDisaggregationServerBase):
         self.wait_server_ready(self.prefill_url + "/health")
         self.wait_server_ready(self.decode_url + "/health")
 
-        metrics2 = run_eval(args)
+        metrics2 = run_sgl_eval(args)
 
         # Assert score is above a minimum threshold for both rounds
         self.assertGreater(metrics1["score"], 0.64)

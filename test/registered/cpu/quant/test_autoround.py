@@ -15,7 +15,7 @@ from types import SimpleNamespace
 from sglang.srt.layers.quantization.auto_round import AutoRoundConfig
 from sglang.srt.utils import cpu_has_amx_support, kill_process_tree
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.run_eval import run_eval
+from sglang.test.sgl_eval_utils import run_sgl_eval
 from sglang.test.test_utils import (
     DEFAULT_AUTOROUND_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -89,7 +89,7 @@ class TestAutoRoundCPU(CustomTestCase):
                         num_threads=32,
                         device=device,
                     )
-                    metrics = run_eval(args)
+                    metrics = run_sgl_eval(args)
                     self.assertGreaterEqual(metrics["score"], 0.25)
                 finally:
                     kill_process_tree(process.pid)
