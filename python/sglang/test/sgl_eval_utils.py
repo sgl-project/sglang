@@ -91,7 +91,6 @@ def run_sgl_eval(args):
         "temperature",
         "top_p",
         "min_p",
-        "repetition_penalty",
         "seed",
         "reasoning_effort",
     ):
@@ -111,44 +110,19 @@ def run_sgl_eval(args):
             **(spec.default_gen.chat_template_kwargs or {}),
             **chat_kwargs,
         }
-    extra_body = dict(getattr(args, "extra_body", None) or {})
-    for key in ("top_k", "presence_penalty", "frequency_penalty"):
-        value = getattr(args, key, None)
-        if value is not None:
-            extra_body[key] = value
-    if extra_body:
-        overrides["extra_body"] = extra_body
+    if getattr(args, "top_k", None) is not None:
+        overrides["extra_body"] = {"top_k": args.top_k}
     gen = replace(spec.default_gen, **overrides)
     generation = {
         key: getattr(gen, key)
-        for key in (
-            "max_tokens",
-            "temperature",
-            "top_p",
-            "min_p",
-            "repetition_penalty",
-            "seed",
-            "chat_template_kwargs",
-        )
-    }
-    generation.update(
-        {
-            key: value
-            for key, value in (gen.extra_body or {}).items()
-            if key in ("top_k", "presence_penalty", "frequency_penalty")
-        }
-    )
+        for key in ("max_tokens", "temperature", "top_p", "min_p", "seed")
+    } | {"chat_template_kwargs": gen.chat_template_kwargs, **(gen.extra_body or {})}
     print(f"sgl-eval {spec.name} generation: {generation}", flush=True)
     sampler = ChatCompletionSampler(
         base_url=api_base_url(args),
         model=getattr(args, "model", None),
         api_key=os.environ.get("OPENAI_API_KEY", "EMPTY"),
     )
-    load_examples = None
-    if getattr(args, "from_dataset", None):
-        from sgl_eval.evals._loader import load_from_path
-
-        load_examples = load_from_path(args.from_dataset)
     out_parent = Path(
         getattr(args, "sgl_eval_out_dir", None)
         or Path.home() / ".sgl_eval" / "sglang_run_eval"
@@ -165,7 +139,7 @@ def run_sgl_eval(args):
             num_examples=getattr(args, "num_examples", None),
             num_threads=getattr(args, "num_threads", None) or spec.default_num_threads,
             predictions_writer=writer,
-            load_examples=load_examples,
+            load_examples=None,
         )
     finally:
         writer.close()
