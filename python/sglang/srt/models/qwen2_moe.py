@@ -34,10 +34,8 @@ from sglang.kernels.ops.elementwise.elementwise import (
 from sglang.srt.batch_overlap.two_batch_overlap import model_forward_maybe_tbo
 from sglang.srt.distributed import (
     get_pp_indices,
-    moe_expert_parallel_all_reduce,
-    moe_tensor_model_parallel_all_reduce,
-    tensor_model_parallel_all_reduce,
 )
+from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
@@ -50,6 +48,7 @@ from sglang.srt.layers.communicator import (
 from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
+from sglang.srt.layers.flashinfer_comm_fusion import uses_cutedsl_ar_fusion
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     MergedColumnParallelLinear,
@@ -59,9 +58,8 @@ from sglang.srt.layers.linear import (
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe import (
-    can_merge_post_experts_all_reduce,
     get_moe_a2a_backend,
-    should_skip_post_experts_all_reduce,
+    reduce_moe_output,
 )
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
@@ -108,14 +106,6 @@ from sglang.srt.utils import (
     make_layers,
     use_intel_amx_backend,
 )
-
-if is_npu():
-    from sglang.srt.hardware_backend.npu.cmo import (
-        shared_expert_on_independent_stream,
-        wait_share_stream,
-    )
-
-from sglang.srt.environ import envs
 from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
 _SGLANG_EXPERIMENTAL_LORA_OPTI = envs.SGLANG_EXPERIMENTAL_LORA_OPTI.get()
@@ -126,6 +116,7 @@ _is_cuda = is_cuda()
 _is_cpu = is_cpu()
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_hip = is_hip()
+_is_npu = is_npu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
 
@@ -343,8 +334,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             num_fused_shared_experts=self.num_fused_shared_experts,
             inplace=not _needs_hidden_after_experts,
             enable_qwen35_fp8_deferred_finalize=(
-                config.model_type == "qwen3_5_moe_text"
-                and envs.SGLANG_FLASHINFER_MNNVL_CUTEDSL_AR_FUSION.get()
+                config.model_type == "qwen3_5_moe_text" and uses_cutedsl_ar_fusion()
             ),
         )
 
@@ -539,6 +529,13 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
 
                     gate = self.shared_expert_gate(hidden_states)
                     shared_output = sigmoid_gate_mul_broadcast(shared_output, gate)
+                elif _is_npu:
+                    from sgl_kernel_npu.activation.fused_sigmoid_mul import (
+                        fused_sigmoid_mul_broadcast,
+                    )
+
+                    gate = self.shared_expert_gate(hidden_states)
+                    shared_output = fused_sigmoid_mul_broadcast(shared_output, gate)
                 else:
                     shared_output = (
                         F.sigmoid(self.shared_expert_gate(hidden_states))
@@ -585,6 +582,11 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             # router_logits: (num_tokens, n_experts)
             router_logits, _ = self.gate(hidden_states)
             if enable_dual_stream:
+                from sglang.srt.hardware_backend.npu.cmo import (
+                    shared_expert_on_independent_stream,
+                    wait_share_stream,
+                )
+
                 shared_output = shared_expert_on_independent_stream(
                     hidden_states.clone(), self._forward_shared_experts
                 )
@@ -601,7 +603,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             topk_output = self.topk(
                 hidden_states,
                 router_logits,
-                num_token_non_padded=forward_batch.num_token_non_padded,
+                num_token_non_padded=forward_batch.moe_num_token_non_padded(),
                 expert_location_dispatch_info=(
                     ExpertLocationDispatchInfo.init_new(
                         layer_id=self.layer_id,
@@ -658,7 +660,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                 hidden_states,
                 router_logits,
                 num_token_non_padded=(
-                    forward_batch.num_token_non_padded
+                    forward_batch.moe_num_token_non_padded()
                     if forward_batch is not None
                     else None
                 ),
@@ -859,11 +861,9 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         if defer_finalize:
             if shared_output is None:
                 raise RuntimeError("Qwen deferred finalize requires shared output")
-            from sglang.srt.layers.moe.qwen35_flashinfer_fusion import (
-                Qwen35MoeFinalizeHandoff,
-            )
+            from sglang.srt.layers.moe.cutedsl_ar_fusion import MoeFinalizeHandoff
 
-            return Qwen35MoeFinalizeHandoff.from_flashinfer(
+            return MoeFinalizeHandoff.from_flashinfer(
                 final_hidden_states,
                 gated_shared_output=shared_output,
                 m=num_tokens,
@@ -879,14 +879,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                 )
             else:
                 final_hidden_states += shared_output
-        if (
-            self.tp_size > 1
-            and not should_skip_post_experts_all_reduce(
-                is_tp_path=True,
-            )
-            and not get_moe_a2a_backend().is_flashinfer()
-        ):
-            final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
+        final_hidden_states = reduce_moe_output(final_hidden_states)
 
         # Debug removed - was causing issues during CUDA graph capture
 
@@ -1226,27 +1219,11 @@ class Qwen2MoeModel(nn.Module):
                         ),
                     )
 
+        last_layer = self.layers[self.end_layer - 1]
+        hidden_states, residual = last_layer.layer_communicator.finish_layer_stack(
+            hidden_states, residual, forward_batch
+        )
         if not self.pp_group.is_last_rank:
-            if (
-                hidden_states is not None
-                and hasattr(hidden_states, "_sglang_needs_allreduce_fusion")
-                and hidden_states._sglang_needs_allreduce_fusion
-            ):
-                # The deferred reduction the next layer would have fused; no
-                # layer follows on this rank, so run it here. Unconditional --
-                # the skip flags that deferred it are what got us into this
-                # branch -- so it bypasses post_experts_all_reduce()'s guards
-                # while reusing its merge rule.
-                if can_merge_post_experts_all_reduce():
-                    hidden_states = tensor_model_parallel_all_reduce(hidden_states)
-                else:
-                    if get_parallel().moe_ep_size > 1:
-                        hidden_states = moe_expert_parallel_all_reduce(hidden_states)
-                    if get_parallel().moe_tp_size > 1:
-                        hidden_states = moe_tensor_model_parallel_all_reduce(
-                            hidden_states
-                        )
-                hidden_states._sglang_needs_allreduce_fusion = False
             return PPProxyTensors(
                 {
                     "hidden_states": hidden_states,
