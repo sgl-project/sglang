@@ -91,6 +91,7 @@ def make_communicator(
     communicator.is_last_layer = False
     communicator._sp_steps = None
     communicator._input_scattered_steps = None
+    communicator._cp_steps = None
     communicator._postprocess_dp_step = MagicMock(return_value=reduce_scatter_step)
     communicator.ffn_reduction_group = MagicMock(return_value=group or make_group())
     communicator.postprocess_layer = MagicMock(
@@ -324,6 +325,7 @@ class TestSelectFfnCompletion(CustomTestCase):
         communicator.is_last_layer = is_last_layer
         communicator._sp_steps = sp_region_steps() if sp_region else None
         communicator._input_scattered_steps = None
+        communicator._cp_steps = None
         communicator._steps = ordinary_steps(
             StageOutput(
                 Layout(frozenset()),
@@ -340,7 +342,7 @@ class TestSelectFfnCompletion(CustomTestCase):
         )
         communicator._complete_ffn_output_now = lambda h, r, **_: ("now", r)
         self.group = make_group()
-        communicator.ffn_reduction_group = lambda: self.group
+        communicator.ffn_reduction_group = lambda forward_batch: self.group
         return communicator
 
     def left(self, communicator, step, forward_batch=None):

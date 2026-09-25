@@ -154,6 +154,7 @@ class TestPostprocessReduceScatterv(CustomTestCase):
         communicator = LayerCommunicator.__new__(LayerCommunicator)
         communicator._sp_steps = None
         communicator._input_scattered_steps = None
+        communicator._cp_steps = None
         communicator._context = None
         communicator.allow_reduce_scatter = False
         communicator.layer_scatter_modes = types.SimpleNamespace(is_layer_sparse=True)
@@ -171,6 +172,7 @@ class TestPostprocessReduceScatterv(CustomTestCase):
                 communicator = LayerCommunicator.__new__(LayerCommunicator)
                 communicator._sp_steps = None
                 communicator._input_scattered_steps = None
+                communicator._cp_steps = None
                 communicator._steps = steps(ffn_output_move=None)
                 communicator._postprocess_dp_step = lambda forward_batch: step
                 with patch.object(

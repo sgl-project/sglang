@@ -65,7 +65,8 @@ class DeferringLayer(nn.Module):
         # No batch runs its own steps: no SP region, no scattered input.
         self.layer_communicator._sp_steps = None
         self.layer_communicator._input_scattered_steps = None
-        self.layer_communicator.ffn_reduction_group = lambda: GROUP
+        self.layer_communicator._cp_steps = None
+        self.layer_communicator.ffn_reduction_group = lambda forward_batch: GROUP
         self.layer_communicator._ffn_leaves_sum_to_reduce_scatter = (
             lambda batch, dp_step: False
         )

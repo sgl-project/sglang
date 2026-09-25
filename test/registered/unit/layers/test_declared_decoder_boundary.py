@@ -75,11 +75,20 @@ def planning(parallel, *, sp=False, a2a=False):
     process-wide parallel state. ``parallel`` may be a callable, for a
     per-thread parallel state."""
     get_parallel = parallel if callable(parallel) else (lambda: parallel)
+
+    def moe_cp_gathers():
+        return get_parallel().attn_cp_size > get_parallel().moe_dp_size
+
     with (
         patch.object(comm, "get_parallel", get_parallel),
         patch.object(comm, "is_dsa_enable_prefill_cp", lambda: False),
         patch.object(comm, "is_mla_cp_enabled", lambda: False),
-        patch.object(comm, "get_moe_cp_size", lambda: 1),
+        # MoE-CP gathers over the whole CP group when the MoE's DP is narrower.
+        patch.object(
+            comm,
+            "get_moe_cp_size",
+            lambda: get_parallel().attn_cp_size if moe_cp_gathers() else 1,
+        ),
         patch.object(comm.layernorm_sp, "layernorm_sp_enabled", lambda: sp),
         patch.object(
             comm, "get_spec", lambda: SimpleNamespace(speculative_algorithm=None)
@@ -93,7 +102,7 @@ def planning(parallel, *, sp=False, a2a=False):
         patch.object(
             comm, "should_use_flashinfer_cutlass_moe_fp4_allgather", lambda: False
         ),
-        patch.object(comm, "is_enable_moe_cp_allgather", lambda: False),
+        patch.object(comm, "is_enable_moe_cp_allgather", moe_cp_gathers),
         patch.object(comm, "get_lora", lambda: SimpleNamespace(enable_lora=False)),
     ):
         yield
@@ -710,7 +719,7 @@ class TestTheSequenceParallelRegion(CustomTestCase):
                 patch.object(comm, "is_dp_attention_enabled", lambda: False),
             ):
                 self.assertIs(
-                    communicator._ffn_sum_can_move_to_next_layer(), not active
+                    communicator._ffn_sum_can_move_to_next_layer(None), not active
                 )
 
     def test_without_sp_there_is_no_region(self):
@@ -829,7 +838,7 @@ class TestInputScatteredAttention(CustomTestCase):
                 ),
             ):
                 self.assertIs(
-                    communicator._batch_steps(),
+                    communicator._batch_steps(None),
                     communicator._input_scattered_steps
                     if scattered
                     else communicator._steps,
@@ -914,7 +923,7 @@ class TestOneRepresentation(CustomTestCase):
                 self.assertIsInstance(communicator._steps, comm.BoundarySteps)
                 for attribute in self.SEPARATE:
                     self.assertFalse(hasattr(communicator, attribute), attribute)
-                self.assertIs(communicator._batch_steps(), communicator._steps)
+                self.assertIs(communicator._batch_steps(None), communicator._steps)
                 # Under attention DP both bring the FFN output back to this
                 # rank's tokens with the step the FFN exit chooses.
                 self.assertTrue(communicator._steps.returns_over_dp)
@@ -939,6 +948,104 @@ class TestOneRepresentation(CustomTestCase):
             self.assertEqual(
                 steps.layer_input(hidden, residual, None), (hidden, residual)
             )
+
+
+class TestPrefillCP(CustomTestCase):
+    """A prefill CP shards a batch's tokens over attention CP only on a CP
+    extend; the layer runs its CP steps on those batches and its ordinary ones
+    on every other."""
+
+    def cp_parallel(self, **overrides):
+        return parallel_of(
+            attn_dp=1, attn_tp=2, attn_cp=2, enable_prefill_cp=True, **overrides
+        )
+
+    def test_a_cp_extend_gathers_over_cp_and_takes_its_chunk_back(self):
+        communicator = build(layer_facts(1, 3), self.cp_parallel())
+        cp = communicator._cp_steps
+        self.assertIs(cp.ffn_input.func, comm._mlp_input_gather_moe_cp)
+        # Each rank completes its own chunk first: the attention-TP sum, then
+        # add + norm.
+        self.assertIs(cp.ffn_input.keywords["gather"].func, comm._mlp_input_without_dp)
+        self.assertIs(
+            cp.ffn_output_move,
+            comm.CommunicateSummableTensorPairFn._scatter_hidden_states_moe,
+        )
+        self.assertFalse(cp.returns_over_dp)
+        # The sum over the gathered rows stays with the layer.
+        self.assertFalse(cp.ffn_output.leaves_for_next_layer)
+        self.assertFalse(cp.ffn_output.leaves_for_reduce_scatter)
+        # Other batches hold every token on each CP rank: plain TP steps.
+        self.assertIs(communicator._steps.ffn_input.func, comm._mlp_input_without_dp)
+        self.assertIs(
+            communicator._steps.ffn_output_move,
+            comm.CommunicateSummableTensorPairFn._trivial,
+        )
+
+    def test_the_fused_kernels_run_on_each_chunk(self):
+        with planning(self.cp_parallel()):
+            communicator = LayerCommunicator(
+                layer_scatter_modes=layer_facts(1, 3),
+                input_layernorm=FusableNorm(),
+                post_attention_layernorm=FusableNorm(),
+            )
+        chunk = communicator._cp_steps.ffn_input.keywords["gather"]
+        self.assertEqual(
+            chunk.keywords["fusions"],
+            (communicator._mlp_input_reduce_output_and_update_and_read_residual,),
+        )
+
+    def test_which_cp_the_declarations_cover(self):
+        for name, parallel, declared in (
+            ("prefill CP", self.cp_parallel(), True),
+            (
+                "CP without prefill CP",
+                parallel_of(attn_dp=1, attn_tp=2, attn_cp=2),
+                False,
+            ),
+            (
+                "CP under attention DP",
+                parallel_of(attn_dp=2, attn_tp=1, attn_cp=2, enable_prefill_cp=True),
+                False,
+            ),
+            (
+                "a MoE-CP group narrower than CP",
+                parallel_of(
+                    attn_dp=1,
+                    attn_tp=1,
+                    attn_cp=4,
+                    enable_prefill_cp=True,
+                    moe_dp_size=2,
+                ),
+                False,
+            ),
+        ):
+            with self.subTest(name):
+                modes = planned_modes(
+                    1, 3, sparse=False, previous_sparse=False, parallel=parallel
+                )
+                communicator = build(modes, parallel)
+                self.assertIs(communicator._cp_steps is not None, declared)
+
+    def test_a_batch_runs_them_only_on_a_cp_extend(self):
+        communicator = build(layer_facts(1, 3), self.cp_parallel())
+        for rows, expected in (
+            (None, communicator._steps),
+            ([2, 1], communicator._cp_steps),
+        ):
+            with (
+                self.subTest(gathered_rows=rows),
+                patch.object(comm, "moe_cp_gathered_rows", lambda fb: rows),
+                patch.object(
+                    comm, "get_forward", lambda: SimpleNamespace(sp_active=False)
+                ),
+                patch.object(
+                    comm,
+                    "get_attn_tp_context",
+                    lambda: SimpleNamespace(input_scattered=False),
+                ),
+            ):
+                self.assertIs(communicator._batch_steps(None), expected)
 
 
 # ---------------------------------------------------------------------------

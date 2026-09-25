@@ -224,6 +224,7 @@ def test_communicator_publishes_layout_at_each_transition(
     communicator._context = SimpleNamespace()
     communicator._sp_steps = None
     communicator._input_scattered_steps = None
+    communicator._cp_steps = None
     communicator.post_attention_layernorm = None
     communicator.input_layernorm = lambda x: x
     communicator.qkv_latent_func = None

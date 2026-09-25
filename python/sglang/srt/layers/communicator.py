@@ -767,6 +767,17 @@ class LayerCommunicator:
             if sides is not None
             else self._select_boundaries_from_scatter_modes()
         )
+        # The steps a batch that shards its tokens over attention CP runs; None
+        # without CP or where the steps come from the scatter modes.
+        self._cp_steps = (
+            _select_boundary_steps(
+                self._declared_sides(cp_active=True),
+                fusions=self._select_mlp_input_fusions(),
+                force_layernorm_before_gather=force_layernorm_before_dp_gather,
+            )
+            if sides is not None and get_parallel().attn_cp_size > 1
+            else None
+        )
         # The steps a batch with input-scattered attention runs; None where it
         # cannot run or the steps come from the scatter modes.
         self._input_scattered_steps = (
@@ -815,11 +826,16 @@ class LayerCommunicator:
             and get_moe_a2a_backend().is_none()
         )
 
-    def _declared_sides(self) -> Optional[DecoderLayerSides]:
+    def _declared_sides(
+        self, *, cp_active: bool = False
+    ) -> Optional[DecoderLayerSides]:
         """The declarations this layer's boundaries are chosen from: an
-        attention and an FFN, without CP, in a layer whose previous layer is
-        known. None when the steps come from the scatter modes. An active
-        LayerNorm SP region and input-scattered attention have their own."""
+        attention and an FFN, in a layer whose previous layer is known, with
+        attention CP only for a prefill CP whose FFN gathers over the whole CP
+        group. None when the steps come from the scatter modes. ``cp_active``
+        gives a batch that shards its tokens over CP; the others hold every
+        token on each CP rank. An active LayerNorm SP region and input-scattered
+        attention have their own."""
         modes = self.layer_scatter_modes
         parallel = get_parallel()
         # A MoE dispatched per DP shard computes on this rank's local rows and
@@ -827,13 +843,16 @@ class LayerCommunicator:
         moe_on_local_rows = is_moe_input_scattered_across_dp_ranks()
         if not (
             self._takes_declared_boundaries
-            and parallel.attn_cp_size == 1
+            and (parallel.attn_cp_size == 1 or _cp_on_declarations())
             and not enable_moe_dense_fully_dp()
             and (modes.is_first_layer or modes.is_previous_layer_sparse is not None)
         ):
             return None
+        # A sum over rows gathered across CP stays with this layer: the next
+        # layer's input holds only this rank's chunk.
+        may_leave = not cp_active
         return decoder_layer_sides(
-            axis_sizes=_token_axis_sizes(),
+            axis_sizes=_token_axis_sizes(cp_active=cp_active),
             ffn_on_local_rows=modes.is_layer_sparse and moe_on_local_rows,
             previous_on_local_rows=(
                 not modes.is_first_layer
@@ -843,13 +862,14 @@ class LayerCommunicator:
             is_last_layer=modes.is_last_layer,
             attention_gathers_local_rows=_use_ag_after_qlora,
             ffn_group=SumGroup.MOE_OUTPUT if modes.is_layer_sparse else SumGroup.TP,
-            leaves_for_next_layer=self.allow_deferred_ffn_reduction,
-            leaves_for_reduce_scatter=self.allow_reduce_scatter,
+            leaves_for_next_layer=self.allow_deferred_ffn_reduction and may_leave,
+            leaves_for_reduce_scatter=self.allow_reduce_scatter and may_leave,
             # A MoE block leaves its sum to reduce_scatterv whenever that combine
             # applies (should_skip_post_experts_all_reduce).
             leaves_for_reduce_scatterv=(
                 self.allow_reduce_scatter or modes.is_layer_sparse
-            ),
+            )
+            and may_leave,
         )
 
     def _select_boundaries_from_scatter_modes(self) -> "BoundarySteps":
@@ -924,7 +944,9 @@ class LayerCommunicator:
             post_residual_addition=post_residual_addition,
         )
         if captured_last_layer_outputs is not None:
-            gathered_last_layer_output = self._batch_steps().attention_input(
+            gathered_last_layer_output = self._batch_steps(
+                forward_batch
+            ).attention_input(
                 hidden_states=residual,
                 forward_batch=forward_batch,
                 context=self._context,
@@ -933,13 +955,15 @@ class LayerCommunicator:
                 gathered_last_layer_output is residual
                 # An accumulator that copies on append already holds a snapshot.
                 and not getattr(captured_last_layer_outputs, "copies_on_append", False)
-                and not self._post_attn_residual_is_read_only(residual)
+                and not self._post_attn_residual_is_read_only(residual, forward_batch)
             ):
                 gathered_last_layer_output = residual.clone()
             captured_last_layer_outputs.append(gathered_last_layer_output)
         return hidden_states, residual
 
-    def _post_attn_residual_is_read_only(self, residual: torch.Tensor) -> bool:
+    def _post_attn_residual_is_read_only(
+        self, residual: torch.Tensor, forward_batch: ForwardBatch
+    ) -> bool:
         """True if ``prepare_mlp``'s post-attention RMSNorm leaves ``residual``
         untouched, so Eagle3 aux capture can keep its reference and skip the clone.
 
@@ -950,7 +974,10 @@ class LayerCommunicator:
         the batch is not input-scattered.
         """
         return (
-            any(f.may_return_new_residual for f in self._batch_steps().fused)
+            any(
+                f.may_return_new_residual
+                for f in self._batch_steps(forward_batch).fused
+            )
             and not get_attn_tp_context().input_scattered
             and apply_flashinfer_allreduce_fusion(residual.shape[0])
         )
@@ -1012,7 +1039,7 @@ class LayerCommunicator:
             )
             if get_forward().sp_active:
                 hidden_states = layernorm_sp.sp_entry_scatter(hidden_states)
-        layer_input = self._batch_steps().layer_input
+        layer_input = self._batch_steps(forward_batch).layer_input
         if layer_input is not None:
             hidden_states, residual = layer_input(
                 hidden_states, residual, self._context
@@ -1038,9 +1065,10 @@ class LayerCommunicator:
     def _in_sp_region(self) -> bool:
         return self._sp_steps is not None and get_forward().sp_active
 
-    def _batch_steps(self) -> "BoundarySteps":
+    def _batch_steps(self, forward_batch: ForwardBatch) -> "BoundarySteps":
         """The steps this batch runs: an active LayerNorm SP region's,
-        input-scattered attention's, or the layer's ordinary ones."""
+        input-scattered attention's, a CP extend's, or the layer's ordinary
+        ones."""
         if self._in_sp_region():
             return self._sp_steps
         if (
@@ -1048,11 +1076,13 @@ class LayerCommunicator:
             and get_attn_tp_context().input_scattered
         ):
             return self._input_scattered_steps
+        if self._cp_steps is not None and moe_cp_gathered_rows(forward_batch):
+            return self._cp_steps
         return self._steps
 
     def _finish_prepare_attn(self, hidden_states, residual, forward_batch):
         """Tail every prepare_attn path must run, or ``attn_inputs`` is unset."""
-        hidden_states = self._batch_steps().attention_input(
+        hidden_states = self._batch_steps(forward_batch).attention_input(
             hidden_states=hidden_states,
             forward_batch=forward_batch,
             context=self._context,
@@ -1195,7 +1225,7 @@ class LayerCommunicator:
         if cache is not None:
             self._context.cache = cache
 
-        return self._batch_steps().ffn_input(
+        return self._batch_steps(forward_batch).ffn_input(
             hidden_states,
             residual,
             forward_batch,
@@ -1216,7 +1246,7 @@ class LayerCommunicator:
         residual: torch.Tensor,
         forward_batch: ForwardBatch,
     ):
-        steps = self._batch_steps()
+        steps = self._batch_steps(forward_batch)
         if steps.returns_over_dp:
             step = self._postprocess_dp_step(forward_batch) or _redistribute_output
             return _to_local_tokens(step, forward_batch, hidden_states), residual
@@ -1229,10 +1259,12 @@ class LayerCommunicator:
             is_layer_sparse=self.layer_scatter_modes.is_layer_sparse,
         )
 
-    def _local_token_move_can_go_to_next_layer(self) -> bool:
+    def _local_token_move_can_go_to_next_layer(
+        self, forward_batch: ForwardBatch
+    ) -> bool:
         """Whether the next layer's input can run this layer's move of its FFN
         output back to this rank's tokens: the base postprocess scatter."""
-        return self._batch_steps().returns_over_dp
+        return self._batch_steps(forward_batch).returns_over_dp
 
     def _postprocess_dp_step(
         self, forward_batch: ForwardBatch
@@ -1240,7 +1272,7 @@ class LayerCommunicator:
         """The reduce-scatter that brings this layer's FFN output back to this
         rank's tokens under attention DP; None when the base postprocess would
         only scatter, or does not move tokens."""
-        steps = self._batch_steps()
+        steps = self._batch_steps(forward_batch)
         if not steps.returns_over_dp:
             return None
         return _reduce_and_redistribute_output_step(
@@ -1255,7 +1287,7 @@ class LayerCommunicator:
         """Whether the FFN leaves its sum out because a reduce-scatter completes
         it: the attention-DP one ``dp_step`` names, or the CP / input-scattered
         one."""
-        if not self._batch_steps().ffn_output.leaves_for_reduce_scatter:
+        if not self._batch_steps(forward_batch).ffn_output.leaves_for_reduce_scatter:
             return False
         if dp_step is not None:
             return True
@@ -1266,10 +1298,10 @@ class LayerCommunicator:
             return True
         return get_attn_tp_context().input_scattered and not self.is_last_layer
 
-    def ffn_reduction_group(self) -> GroupCoordinator:
+    def ffn_reduction_group(self, forward_batch: ForwardBatch) -> GroupCoordinator:
         """The group this layer's FFN output owes its sum over: the MoE output's
         group on a sparse layer, the TP group a dense MLP reduces over."""
-        return _sum_group(self._batch_steps().ffn_output.group)
+        return _sum_group(self._batch_steps(forward_batch).ffn_output.group)
 
     def _select_ffn_completion(self, forward_batch: ForwardBatch) -> "FfnCompletion":
         """Decide once, before the FFN runs, what it skips and what completes its
@@ -1283,7 +1315,7 @@ class LayerCommunicator:
             forward_batch=forward_batch,
             dp_step=dp_step,
         )
-        steps = self._batch_steps()
+        steps = self._batch_steps(forward_batch)
         if not steps.ffn_output.leaves_for_next_layer:
             return FfnCompletion(
                 defer_moe_finalize=False,
@@ -1297,7 +1329,7 @@ class LayerCommunicator:
             forward_batch, mlp_reduce_scatter=mlp_reduce_scatter, dp_step=dp_step
         )
         if fuse_mlp_allreduce:
-            group = self.ffn_reduction_group()
+            group = self.ffn_reduction_group(forward_batch)
             if steps.returns_over_dp:
                 # Under attention DP the next layer also brings the sum back to
                 # this rank's tokens.
@@ -1313,7 +1345,7 @@ class LayerCommunicator:
         elif (
             dp_step is not None
             and not self.is_last_layer
-            and self._local_token_move_can_go_to_next_layer()
+            and self._local_token_move_can_go_to_next_layer(forward_batch)
         ):
             complete = partial(
                 _leave_to_next_layer,
@@ -1343,7 +1375,7 @@ class LayerCommunicator:
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """This layer's postprocess, run with the attention-DP step the FFN exit
         chose."""
-        if self._local_token_move_can_go_to_next_layer():
+        if self._local_token_move_can_go_to_next_layer(forward_batch):
             return (
                 _to_local_tokens(
                     dp_step or _redistribute_output, forward_batch, hidden_states
@@ -1381,10 +1413,13 @@ class LayerCommunicator:
         """Whether the MoE may hand an unfinalized output to the next layer."""
         return False
 
-    def _ffn_sum_can_move_to_next_layer(self) -> bool:
+    def _ffn_sum_can_move_to_next_layer(self, forward_batch: ForwardBatch) -> bool:
         # Under the MoE-CP all-gather the fusion path would skip postprocess_layer
         # and its MoE-CP scatter, leaving hidden_states longer than the residual.
-        if is_enable_moe_cp_allgather() or not self._batch_steps().ffn_sum_is_movable:
+        if (
+            is_enable_moe_cp_allgather()
+            or not self._batch_steps(forward_batch).ffn_sum_is_movable
+        ):
             return False
 
         # The fused residual+LN reduces over a single group. Hybrid EP+TP spans
@@ -1412,7 +1447,7 @@ class LayerCommunicator:
     def should_fuse_mlp_allreduce_with_next_layer(
         self, forward_batch: ForwardBatch
     ) -> bool:
-        if not self._ffn_sum_can_move_to_next_layer():
+        if not self._ffn_sum_can_move_to_next_layer(forward_batch):
             return False
         batch_size = _batch_size(forward_batch)
         return (
@@ -1446,14 +1481,17 @@ class LayerCommunicator:
         return (
             self._context.tp_size > 1
             and not self.is_last_layer
-            and self._ffn_sum_can_move_to_next_layer()
+            and self._ffn_sum_can_move_to_next_layer(forward_batch)
             and _unfused_completion_matches_the_ffn(forward_batch)
             and not mlp_reduce_scatter
             # Under attention DP the next layer must also run postprocess's
             # scatter back to this rank's tokens, and nothing more.
             and (
                 not is_dp_attention_enabled()
-                or (self._local_token_move_can_go_to_next_layer() and dp_step is None)
+                or (
+                    self._local_token_move_can_go_to_next_layer(forward_batch)
+                    and dp_step is None
+                )
             )
         )
 
@@ -1867,13 +1905,28 @@ def _sum_group(group: SumGroup) -> GroupCoordinator:
     return post_experts_reduction_group()
 
 
-def _token_axis_sizes() -> Dict[TokenAxis, int]:
+def _token_axis_sizes(*, cp_active: bool = False) -> Dict[TokenAxis, int]:
+    """The token axes' sizes for a batch: attention CP shards tokens only on
+    a CP extend (``cp_active``); otherwise every CP rank holds them all."""
     parallel = get_parallel()
     return {
         TokenAxis.ATTN_DP: parallel.attn_dp_size,
-        TokenAxis.ATTN_CP: parallel.attn_cp_size,
+        TokenAxis.ATTN_CP: parallel.attn_cp_size if cp_active else 1,
         TokenAxis.ATTN_TP_SCATTER: parallel.attn_tp_size,
     }
+
+
+def _cp_on_declarations() -> bool:
+    """Whether attention CP is one the declarations cover: a prefill CP that
+    shards tokens, without attention DP, whose FFN input gathers over a MoE-CP
+    group that is the whole CP group. DSA and MLA CP pick their own steps."""
+    parallel = get_parallel()
+    return (
+        _generic_prefill_cp_shards_tokens()
+        and not (is_dsa_enable_prefill_cp() or is_mla_cp_enabled())
+        and parallel.attn_dp_size == 1
+        and parallel.moe_dp_size == 1
+    )
 
 
 class BoundarySteps(msgspec.Struct, frozen=True):
@@ -2013,6 +2066,19 @@ def _select_ffn_input(
             partial(_mlp_input_scatter, scatters_residual=residual != residual_to),
             (),
         )
+    if gathered == {TokenAxis.ATTN_CP}:
+        # Each CP rank completes its own chunk, then the chunks are gathered
+        # over the MoE-CP group, each padded to the longest.
+        on_chunk, fused = _select_ffn_input(
+            produced,
+            residual=residual,
+            residual_to=residual_to,
+            need=StageInput(produced.layout),
+            force_layernorm_before_gather=force_layernorm_before_gather,
+            fusions=fusions,
+            residual_joins_sum=residual_joins_sum,
+        )
+        return partial(_mlp_input_gather_moe_cp, gather=on_chunk), fused
     if (
         residual_to != produced.layout
         or gathered not in (frozenset(), {TokenAxis.ATTN_DP})
@@ -2069,11 +2135,12 @@ def _select_ffn_output_move(
             return False, CommunicateSummableTensorPairFn._gather
         raise NotImplementedError(f"{produced=} {residual=} {to=}")
     returned = residual.sharded - produced.layout.sharded
-    if (
-        to != residual
-        or not produced.layout.sharded <= residual.sharded
-        or returned != {TokenAxis.ATTN_DP}
-    ):
+    if to != residual or not produced.layout.sharded <= residual.sharded:
+        raise NotImplementedError(f"{produced=} {residual=} {to=}")
+    if returned == {TokenAxis.ATTN_CP}:
+        # This rank's chunk of the rows gathered over CP; no collective.
+        return False, CommunicateSummableTensorPairFn._scatter_hidden_states_moe
+    if returned != {TokenAxis.ATTN_DP}:
         raise NotImplementedError(f"{produced=} {residual=} {to=}")
     return True, None
 

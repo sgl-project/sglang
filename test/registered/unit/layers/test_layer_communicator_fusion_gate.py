@@ -66,6 +66,7 @@ def _fake_communicator(mlp_mode=ScatterMode.TP_ATTN_FULL):
     )
     communicator._sp_steps = None
     communicator._input_scattered_steps = None
+    communicator._cp_steps = None
     communicator.is_last_layer = False
     communicator._context = types.SimpleNamespace(tp_size=4)
     return communicator
@@ -366,6 +367,7 @@ class TestDeferFfnReduction(CustomTestCase):
         communicator.is_last_layer = is_last_layer
         communicator._sp_steps = sp_region_steps() if sp_active else None
         communicator._input_scattered_steps = None
+        communicator._cp_steps = None
         communicator._steps = _steps(
             ffn_output=StageOutput(
                 Layout(frozenset()),
