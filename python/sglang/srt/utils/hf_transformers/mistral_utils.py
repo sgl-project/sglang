@@ -497,7 +497,8 @@ def patch_mistral_common_tokenizer(tokenizer):
     if not hasattr(tokenizer, "get_added_vocab"):
         tokenizer.get_added_vocab = lambda: {}
 
-    # Keep the old no-op pad add working on transformers 5.12 MistralCommon.
+    # MistralCommonBackend.add_special_tokens raises NotImplementedError by design;
+    # a pad-token-only call sets `pad_token` directly and adds nothing.
     _orig_add_special_tokens = tokenizer.add_special_tokens
 
     def _safe_add_special_tokens(special_tokens_dict, *args, **kwargs):

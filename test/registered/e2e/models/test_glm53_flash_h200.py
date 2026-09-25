@@ -107,6 +107,7 @@ class TestGLM53FlashH200HighThroughput(
         "--enable-dp-attention",
         "--dp-size",
         "8",
+        "--mm-enable-dp-encoder",
     ]
 
 
