@@ -366,7 +366,8 @@ def _run_flashinfer_w4afp8(
         topk = topk.to_standard()
     fused_moe, _ = _flashinfer_cutlass_fused_moe()
     with use_symmetric_memory(
-        get_tp_group(), disabled=not symmetric_output or not is_allocation_symmetric()
+        get_parallel().tp_group,
+        disabled=not symmetric_output or not is_allocation_symmetric()
     ):
         output = torch.empty_like(x)
     fused_moe(
@@ -401,19 +402,16 @@ def fused_experts_none_to_flashinfer_cutlass(
 ) -> StandardCombineInput:
     from sglang.srt.layers.moe.token_dispatcher.standard import StandardCombineInput
 
-    if (
-        isinstance(quant_info, FlashInferCutlassMoeQuantInfo)
-        and quant_info.quant_type == "w4afp8"
-    ):
+    assert isinstance(quant_info, FlashInferCutlassMoeQuantInfo), (
+        f"Unexpected quant_info type for flashinfer_cutlass: {type(quant_info)}"
+    )
+
+    if quant_info.quant_type == "w4afp8":
         return StandardCombineInput(
             hidden_states=_run_flashinfer_w4afp8(
                 dispatch_output, quant_info, runner_config
             )
         )
-
-    assert isinstance(quant_info, FlashInferCutlassMoeQuantInfo), (
-        f"Unexpected quant_info type for flashinfer_cutlass: {type(quant_info)}"
-    )
 
     output = _run_flashinfer_cutlass(
         dispatch_output=dispatch_output,

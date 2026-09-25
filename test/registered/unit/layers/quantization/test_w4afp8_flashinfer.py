@@ -115,7 +115,7 @@ def make_layer(ep_size=1, ep_rank=0, hidden=6144, intermediate=None, experts=256
 
 def invoke(method, dispatch, config):
     with (
-        patch.object(runner, "get_tp_group", return_value=None),
+        patch.object(runner, "get_parallel", return_value=SimpleNamespace(tp_group=None)),
         patch.object(runner, "is_allocation_symmetric", return_value=False),
         patch.object(runner, "use_symmetric_memory", return_value=nullcontext()),
     ):
@@ -314,7 +314,7 @@ def test_deepep_normal_matches_standard_local_contribution(ep_rank, finalize):
             method, expected_dispatch, replace(config, routed_scaling_factor=None)
         )
         with (
-            patch.object(runner, "get_tp_group", return_value=None),
+            patch.object(runner, "get_parallel", return_value=SimpleNamespace(tp_group=None)),
             patch.object(runner, "is_allocation_symmetric", return_value=False),
             patch.object(runner, "use_symmetric_memory", return_value=nullcontext()),
         ):
@@ -344,7 +344,7 @@ def test_deepep_low_latency_graph_replay(ep_rank, finalize):
             "get",
             return_value=finalize,
         ),
-        patch.object(runner, "get_tp_group", return_value=None),
+        patch.object(runner, "get_parallel", return_value=SimpleNamespace(tp_group=None)),
         patch.object(runner, "is_allocation_symmetric", return_value=False),
         patch.object(runner, "use_symmetric_memory", return_value=nullcontext()),
     ):

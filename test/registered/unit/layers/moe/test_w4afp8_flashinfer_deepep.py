@@ -16,11 +16,12 @@ from sglang.srt.layers.moe.token_dispatcher.deepep import (
 from sglang.srt.layers.moe.utils import DeepEPMode, MoeA2ABackend
 from sglang.srt.layers.quantization.w4afp8 import W4AFp8MoEMethod
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
-class TestFlashInferW4AFP8DeepEPNormal(unittest.TestCase):
+class TestFlashInferW4AFP8DeepEPNormal(CustomTestCase):
     def payload(self, rank):
         return runner.FlashInferCutlassMoeQuantInfo(
             quant_type="w4afp8",
