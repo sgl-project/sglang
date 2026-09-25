@@ -1,36 +1,33 @@
-"""MI30x GLM-5.3-Flash GSM8K Accuracy Evaluation Test (8-GPU)
+"""DIAGNOSTIC ONLY -- not for merge.
 
-Tests zai-org/GLM-5.3-Flash on MI30x (gfx942) with the AMD FP8 recipe from the
-GLM-5.3-Flash cookbook refresh (#36712): TP8 + EP8, BF16 KV cache, TileLang DSA
-prefill+decode, Triton linear attention, Triton MoE runner, SGLANG_USE_AITER=1,
-full decode graphs at batch sizes 1 and 32. Same eval and threshold as the
-gfx950 gate in test_glm53_flash_eval_mi35x.py.
+Scratch variant of the MI30x GLM-5.3-Flash gate, used to localize why gfx942
+generates non-terminating output on main while gfx950 scores 0.975 on the same
+recipe. Run 36092686822 got the server up and the decode graphs captured (the
+two HIP fixes in #41136 work), then ran ~21.8k generated tokens per sequence
+without stopping and was killed by the 18000 s per-file budget after finishing
+roughly 106 of 1319 questions. gfx950 on the same eval peaked at ~398 tokens
+per sequence.
 
-gfx942 is not redundant with gfx950 for this model. It takes the Triton MoE
-runner and the generic mHC path (AITER mHC is gfx95-only), and neither has any
-other nightly coverage for this model. It also resolves `dsa_topk_backend` to
-the default fused `sgl-kernel` top-k on main, whereas the support-branch runs
-behind #36607's numbers forced the portable Torch top-k on non-gfx95 ROCm.
+Three suspects differ between the two arches; this file runs one small eval per
+suspect in a single job so the 328 GB weight load is paid once and the page
+cache carries the later launches:
 
-Threshold: #36607 measured the full 1319-question GSM8K split at
-1284/1319 = 97.35% on MI300X, and the cookbook's MI300X cell for this exact
-TP8 + EP8 command measured 1280/1319 = 97.04%, both on the GLM-5.3-Flash
-support branch. 0.92 follows this repo's `measured - 0.05` convention for
-sgl-eval gsm8k thresholds and matches the gfx950 gate, so the two arches stay
-directly comparable.
+  1. baseline      -- current recipe: fused sgl-kernel DSA top-k, Triton MoE,
+                      unfused torch mHC. Expected to reproduce the runaway.
+  2. torch-topk    -- #36607's non-gfx95 ROCm configuration: portable Torch DSA
+                      top-k with the fused top-k paths off. Isolates the fused
+                      sgl-kernel top-k, which no gfx942 run has ever validated.
+  3. aiter-moe     -- AITER MoE runner instead of Triton, matching what gfx950
+                      uses. Isolates the Triton MoE runner.
 
-Runtime: budget this job generously. gfx942 gets none of the gfx95 fast paths,
-and this runner pool's shared model cache has taken over an hour to load the
-328 GB checkpoint. The workflow allows 18000 s. If that ever proves tight,
-prefer raising it over trimming the eval: a full-split score is what makes this
-arch's number comparable to the gfx950 one.
+If 2 is healthy the #36607 top-k fallback is the fix and belongs in #41136. If 3
+is healthy the Triton MoE runner is at fault. If neither is healthy, suspicion
+falls on the unfused torch mHC path that #41136 now routes gfx942 to.
 
-Eval harness: `api="sgl_eval"` rather than the default 5-shot completion
-scorer, because GLM-5.3-Flash thinks by default and the completion scorer reads
-the last number in the response. The parameters below are the accuracy command
-the cookbook publishes for this model. See the MI35x file for the longer note.
-
-Registry: nightly-amd-accuracy-8-gpu-glm53-flash suite
+64 questions and 2048 max tokens keep each variant short: gfx950 needed under
+400 tokens per answer, and a runaway variant costs at most ~8 minutes at the
+266 token/s this arch sustains. The threshold is 0.0 so every variant runs and
+reports its score instead of the first failure ending the job.
 """
 
 import unittest
@@ -40,9 +37,6 @@ from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.run_combined_tests import run_combined_tests
 from sglang.test.test_utils import ModelLaunchSettings
 
-# Register for AMD CI - MI30x GLM-5.3-Flash accuracy test. Measured 12259 s
-# on rocm720 and 5164 s on rocm724; 13000 s covers the slower image plus
-# a cold-cache load of the 328 GB checkpoint.
 register_amd_ci(
     est_time=13000,
     suite="nightly-amd-accuracy-8-gpu-glm53-flash",
@@ -51,58 +45,74 @@ register_amd_ci(
 
 GLM_53_FLASH_MODEL_PATH = "zai-org/GLM-5.3-Flash"
 
-# Fetching and loading a 328 GB checkpoint against a cold cache is what this
-# budget has to cover; the default launch timeout is nowhere near enough.
 SERVER_LAUNCH_TIMEOUT = 5400
+
+COOKBOOK_ARGS = [
+    "--ep-size=8",
+    "--attention-backend=dsa",
+    "--dsa-prefill-backend=tilelang",
+    "--dsa-decode-backend=tilelang",
+    "--linear-attn-backend=triton",
+    "--kv-cache-dtype=bfloat16",
+    "--cuda-graph-backend-decode=full",
+    "--cuda-graph-backend-prefill=disabled",
+    "--cuda-graph-bs-decode",
+    "1",
+    "32",
+    "--reasoning-parser=glm45",
+    "--tool-call-parser=glm47",
+    "--watchdog-timeout=1200",
+    "--model-loader-extra-config",
+    '{"enable_multithread_load": true}',
+]
 
 
 class TestGLM53FlashEvalMI30x(unittest.TestCase):
-    """GLM-5.3-Flash GSM8K Accuracy Evaluation Test for MI30x."""
+    """GLM-5.3-Flash gfx942 output-quality localization."""
 
     def test_glm_53_flash(self):
-        """Run accuracy test for GLM-5.3-Flash."""
-        cookbook_args = [
-            "--ep-size=8",
-            "--attention-backend=dsa",
-            "--dsa-prefill-backend=tilelang",
-            "--dsa-decode-backend=tilelang",
-            "--linear-attn-backend=triton",
-            "--kv-cache-dtype=bfloat16",
-            "--moe-runner-backend=triton",
-            "--cuda-graph-backend-decode=full",
-            "--cuda-graph-backend-prefill=disabled",
-            "--cuda-graph-bs-decode",
-            "1",
-            "32",
-            "--reasoning-parser=glm45",
-            "--tool-call-parser=glm47",
-            "--watchdog-timeout=1200",
-            # Not part of the cookbook cell; purely a load-time win on a
-            # checkpoint this large, with no effect on numerics.
-            "--model-loader-extra-config",
-            '{"enable_multithread_load": true}',
-        ]
-
         variants = [
             ModelLaunchSettings(
                 GLM_53_FLASH_MODEL_PATH,
                 tp_size=8,
-                extra_args=cookbook_args,
+                extra_args=COOKBOOK_ARGS + ["--moe-runner-backend=triton"],
                 env={"SGLANG_USE_AITER": "1"},
-                variant="TP8-EP8",
+                variant="baseline-fused-topk-triton-moe",
+                launch_timeout=SERVER_LAUNCH_TIMEOUT,
+            ),
+            ModelLaunchSettings(
+                GLM_53_FLASH_MODEL_PATH,
+                tp_size=8,
+                extra_args=COOKBOOK_ARGS
+                + ["--moe-runner-backend=triton", "--dsa-topk-backend=torch"],
+                env={
+                    "SGLANG_USE_AITER": "1",
+                    "SGLANG_DSA_FUSE_TOPK": "0",
+                    "SGLANG_OPT_USE_TOPK_V2": "0",
+                },
+                variant="torch-topk-triton-moe",
+                launch_timeout=SERVER_LAUNCH_TIMEOUT,
+            ),
+            ModelLaunchSettings(
+                GLM_53_FLASH_MODEL_PATH,
+                tp_size=8,
+                extra_args=COOKBOOK_ARGS + ["--moe-runner-backend=aiter"],
+                env={"SGLANG_USE_AITER": "1"},
+                variant="fused-topk-aiter-moe",
                 launch_timeout=SERVER_LAUNCH_TIMEOUT,
             ),
         ]
 
         run_combined_tests(
             models=variants,
-            test_name="GLM-5.3-Flash (MI30x)",
+            test_name="GLM-5.3-Flash gfx942 localization (MI30x)",
             accuracy_params=AccuracyTestParams(
                 dataset="gsm8k",
-                baseline_accuracy=0.92,
+                baseline_accuracy=0.0,
                 api="sgl_eval",
+                num_examples=64,
                 num_threads=64,
-                max_tokens=32768,
+                max_tokens=2048,
                 temperature=1.0,
                 top_p=0.95,
                 seed=42,
