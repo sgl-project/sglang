@@ -1124,7 +1124,8 @@ class ModelRunner:
     def _prepare_replicated_q_proj(self) -> None:
         # --dcp-replicate-q-proj: gather each rank's attn_tp head-shard of
         # q_b_proj / w_kc into full-head buffers once here (pre-capture) so the
-        # MLA decode path can skip the per-layer Q all-gather. bf16/fp16 only.
+        # MLA decode path can skip the per-layer Q all-gather. w_kc must be
+        # bf16/fp16; q_b_proj may be bf16/fp16 or 128x128 block FP8.
         from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
         from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
 
@@ -1138,23 +1139,28 @@ class ModelRunner:
             if m.w_kc is None:
                 continue
             qp = m.q_b_proj if m.has_q_b_proj else m.q_proj
-            # q-replicate only supports the unquantized bf16/fp16 absorb path;
-            # quantized q-proj (packed weights) and non-16-bit w_kc keep the
+            # Other quantized q-proj formats and non-16-bit w_kc keep the
             # per-layer Q all-gather.
-            if (
-                m.w_kc.dtype not in (torch.bfloat16, torch.float16)
-                or not isinstance(qp.quant_method, UnquantizedLinearMethod)
-                or qp.weight.dtype not in (torch.bfloat16, torch.float16)
+            unquantized_q = isinstance(
+                qp.quant_method, UnquantizedLinearMethod
+            ) and qp.weight.dtype in (torch.bfloat16, torch.float16)
+            block_fp8_q = _is_replicable_block_fp8_linear(qp)
+            if m.w_kc.dtype not in (torch.bfloat16, torch.float16) or not (
+                unquantized_q or block_fp8_q
             ):
                 logger.warning(
-                    "dcp_replicate_q_proj: skipping quantized q-proj/w_kc "
-                    "(bf16/fp16 only); this layer keeps the Q all-gather."
+                    "dcp_replicate_q_proj: skipping unsupported q-proj/w_kc "
+                    "(needs bf16/fp16 w_kc and bf16/fp16 or 128x128 block-FP8 "
+                    "q-proj); this layer keeps the Q all-gather."
                 )
                 continue
             m.w_kc_qrep = dcp_group.all_gather(m.w_kc.contiguous(), dim=0)
-            m.q_b_proj_qrep_weight = dcp_group.all_gather(
-                qp.weight.data.contiguous(), dim=0
-            )
+            if block_fp8_q:
+                m.q_b_proj_qrep = _gather_block_fp8_linear(qp, dcp_group)
+            else:
+                m.q_b_proj_qrep_weight = dcp_group.all_gather(
+                    qp.weight.data.contiguous(), dim=0
+                )
             n_prepared += 1
         logger.info(
             "dcp_replicate_q_proj: prepared full-head Q weights for %d MLA layers",
@@ -2604,3 +2610,66 @@ class ModelRunner:
                 load_format=load_format,
             )
         self.load_config = load_config
+
+
+def _is_replicable_block_fp8_linear(layer: torch.nn.Module) -> bool:
+    """True for a 128x128 block-FP8 Fp8LinearMethod layer on the plain block path."""
+    from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
+
+    method = layer.quant_method
+    return (
+        isinstance(method, Fp8LinearMethod)
+        and method.block_quant
+        and not method.use_mxfp8
+        and not method.use_marlin
+        and list(method.weight_block_size or []) == [128, 128]
+        and layer.weight.dtype == torch.float8_e4m3fn
+        and layer.weight.shape[0] % 128 == 0
+        and not getattr(layer, "aiter_bpreshuffled", False)
+    )
+
+
+def _logical_block_fp8_scale(layer: torch.nn.Module) -> torch.Tensor:
+    """Undo post-load scale formatting: fp32 [N/128, K/128] block scales."""
+    from sglang.srt.layers.quantization.fp8_utils import inverse_transform_scale_ue8m0
+
+    scale = layer.weight_scale_inv
+    ue8m0 = getattr(scale, "format_ue8m0", False)
+    scale = scale.data
+    if ue8m0 and scale.dtype == torch.uint8:
+        scale = (scale.to(torch.int32) << 23).view(torch.float32)
+    elif ue8m0 and scale.dtype == torch.int32:
+        scale = inverse_transform_scale_ue8m0(scale, mn=layer.weight.shape[0])
+    n, k = layer.weight.shape
+    expected = ((n + 127) // 128, (k + 127) // 128)
+    assert scale.dtype == torch.float32 and tuple(scale.shape) == expected, (
+        scale.dtype,
+        tuple(scale.shape),
+        expected,
+    )
+    return scale
+
+
+def _gather_block_fp8_linear(layer: torch.nn.Module, group) -> torch.nn.Module:
+    """Full-output replica of a column-sharded block-FP8 linear.
+
+    Gathers the fp8 weight and logical fp32 block scales along the output dim,
+    then lets the layer's own quant method format them for its GEMM backend
+    (e.g. UE8M0 requant for DeepGEMM), so the replica runs the same kernels.
+    """
+    weight = layer.weight.data
+    replica = torch.nn.Module()
+    replica.weight = torch.nn.Parameter(
+        group.all_gather(weight.contiguous(), dim=0), requires_grad=False
+    )
+    replica.weight_scale_inv = torch.nn.Parameter(
+        group.all_gather(_logical_block_fp8_scale(layer).contiguous(), dim=0),
+        requires_grad=False,
+    )
+    replica.orig_dtype = getattr(layer, "orig_dtype", torch.bfloat16)
+    replica.input_size_per_partition = weight.shape[1]
+    replica.output_size_per_partition = replica.weight.shape[0]
+    replica.logical_widths = [replica.weight.shape[0]]
+    replica.quant_method = layer.quant_method
+    layer.quant_method.process_weights_after_loading(replica)
+    return replica

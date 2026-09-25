@@ -318,8 +318,7 @@ class DeepseekMLAForwardMixin:
         q_replicate_active = (
             self.is_dcp_q_replicate_phase(forward_batch)
             and not self.use_deep_gemm_bmm
-            and self.w_kc_qrep is not None
-            and self.q_b_proj_qrep_weight is not None
+            and self.has_replicated_q_proj()
         )
         if q_replicate_active:
             # force standard absorb so the full-head w_kc bmm runs
@@ -391,11 +390,7 @@ class DeepseekMLAForwardMixin:
                 k_nope = k_nope.unsqueeze(1)
                 if q_replicate_active:
                     # full-head Q from the gathered weight (skips Q all-gather)
-                    q = torch.nn.functional.linear(q, self.q_b_proj_qrep_weight).view(
-                        -1,
-                        self.num_local_heads * self.dcp_size,
-                        self.qk_head_dim,
-                    )
+                    q = self.q_b_proj_replicated_forward(q)
                 else:
                     q = self.q_b_proj_forward(q)
 
@@ -461,13 +456,7 @@ class DeepseekMLAForwardMixin:
                         )
         else:
             if q_replicate_active:
-                q = torch.nn.functional.linear(
-                    hidden_states, self.q_b_proj_qrep_weight
-                ).view(
-                    -1,
-                    self.num_local_heads * self.dcp_size,
-                    self.qk_head_dim,
-                )
+                q = self.q_b_proj_replicated_forward(hidden_states)
             else:
                 q = self.q_proj(hidden_states)[0].view(
                     -1, self.num_local_heads, self.qk_head_dim
