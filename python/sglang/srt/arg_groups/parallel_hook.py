@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import logging
 import os
-from typing import Any
+from typing import Any, Optional
 
 from sglang.srt.arg_groups.overrides import (
     _data_parallelism_defaults,
@@ -170,6 +170,11 @@ def handle_decode_context_parallelism(server_args: Any):
             "--decode-context-parallel-size) must be >= 1, but got "
             f"dcp_size={cfg.dcp_size}."
         )
+    if cfg.dcp_size > 1 and cfg.tp_size % cfg.dcp_size != 0:
+        raise ValueError(
+            "--dcp-size must divide --tp-size, but got "
+            f"dcp_size={cfg.dcp_size} with tp_size={cfg.tp_size}."
+        )
     if cfg.dcp_comm_backend in ("a2a", "fi_a2a") and cfg.dcp_size <= 1:
         raise ValueError(
             f"--dcp-comm-backend {cfg.dcp_comm_backend} only affects the "
@@ -193,6 +198,54 @@ def handle_decode_context_parallelism(server_args: Any):
                 "communication backend (it removes the head-dim Q all-gather); "
                 f"got --dcp-comm-backend={cfg.dcp_comm_backend}."
             )
+
+    validate_dcp_kv_head_replication(server_args)
+
+
+def dcp_kv_head_replication_error(
+    model_config: Any, *, tp_size: int, dcp_size: int, is_mla: bool
+) -> Optional[str]:
+    """Why ``dcp_size`` is unsafe for this model's qkv sharding, or None if it is."""
+    from sglang.srt.configs.model_config import is_qwen3_5
+
+    if dcp_size <= 1:
+        return None
+    if is_mla or is_qwen3_5(model_config.hf_config):
+        return None
+
+    dcp_kv_heads = model_config.get_num_kv_heads(tp_size, dcp_size)
+    plain_kv_heads = model_config.get_num_kv_heads(tp_size)
+    if dcp_kv_heads == plain_kv_heads:
+        return None
+
+    highest_safe = max(1, tp_size // model_config.get_total_num_kv_heads())
+    return (
+        f"--dcp-size {dcp_size} is not supported for "
+        f"{model_config.hf_config.architectures[0]} at --tp-size {tp_size}: DCP "
+        f"ranks must hold the same KV heads, so the pool is built for "
+        f"{dcp_kv_heads} KV heads per rank but this model produces "
+        f"{plain_kv_heads}. Use --dcp-size {highest_safe} or lower."
+    )
+
+
+def validate_dcp_kv_head_replication(server_args: Any) -> None:
+    """Refuse GQA models whose qkv projection does not replicate KV per DCP group."""
+    cfg = resolving_view(server_args)
+    if cfg.dcp_size <= 1:
+        return
+    if parse_connector_type(cfg.model_path) == ConnectorType.INSTANCE:
+        return
+
+    from sglang.srt.arg_groups.overrides import use_mla_backend
+
+    message = dcp_kv_head_replication_error(
+        model_config_of(server_args),
+        tp_size=cfg.tp_size,
+        dcp_size=cfg.dcp_size,
+        is_mla=use_mla_backend(server_args),
+    )
+    if message is not None:
+        raise ValueError(message)
 
 
 def handle_data_parallelism(server_args: Any):

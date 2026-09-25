@@ -155,6 +155,23 @@ def handle_xpu_backends(server_args: Any):
                 ),
             )
 
+        if (
+            cfg.dcp_size > 1
+            and cfg.cuda_graph_config.decode.backend != Backend.DISABLED
+        ):
+            logger.warning(
+                "Disabling XPU decode graph capture: --dcp-size %d needs "
+                "per-layer collectives.",
+                cfg.dcp_size,
+            )
+            declare_resolution(
+                server_args,
+                "_handle_xpu_backends",
+                cuda_graph_config=with_phase(
+                    cfg.cuda_graph_config, Phase.DECODE, backend=Backend.DISABLED
+                ),
+            )
+
 
 def handle_cpu_backends(server_args: Any):
     cfg = resolving_view(server_args)

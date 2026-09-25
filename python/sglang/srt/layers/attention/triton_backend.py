@@ -26,6 +26,8 @@ from sglang.srt.layers.attention.verify_mask import VerifyMask, maybe_create_ver
 from sglang.srt.layers.dcp import (
     cp_lse_ag_out_rs_mha,
     create_triton_kv_indices_for_dcp_triton,
+    dcp_gather_q_heads,
+    dcp_ungather_heads,
     get_dcp_lens,
 )
 from sglang.srt.layers.radix_attention import AttentionType
@@ -67,6 +69,7 @@ if _is_cuda:
     from sgl_kernel.utils import is_arch_support_pdl
 
 if TYPE_CHECKING:
+    from sglang.srt.distributed.parallel_state import GroupCoordinator
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.speculative.spec_info import SpecInput
@@ -257,6 +260,9 @@ class TritonAttnBackend(AttentionBackend):
         ) * self.dcp_size
         self.num_kv_head = model_runner.model_config.get_num_kv_heads(
             get_parallel().attn_tp_size, get_parallel().attn_dcp_size
+        )
+        self.dcp_q_per_kv_head = (self.num_head // self.dcp_size) // max(
+            1, self.num_kv_head
         )
         mla_config = model_runner.model_config
         self.use_dense_fp8_chunked_prefill = (
@@ -461,6 +467,14 @@ class TritonAttnBackend(AttentionBackend):
 
     def _dcp_lens(self, lens: torch.Tensor, start: Optional[torch.Tensor] = None):
         return get_dcp_lens(lens, self.dcp_size, self.dcp_rank, start)
+
+    def _dcp_gather_q(self, q: torch.Tensor, group: GroupCoordinator) -> torch.Tensor:
+        return dcp_gather_q_heads(q, group, self.num_kv_head, self.dcp_q_per_kv_head)
+
+    def _dcp_ungather_heads(self, x: torch.Tensor) -> torch.Tensor:
+        return dcp_ungather_heads(
+            x, self.dcp_size, self.num_kv_head, self.dcp_q_per_kv_head
+        )
 
     def _dcp_kv_indices(
         self,
@@ -1983,7 +1997,7 @@ class TritonAttnBackend(AttentionBackend):
 
         # Prefix KV is sharded across DCP ranks, so compute each rank's
         # partial attention with all gathered query heads and merge by LSE.
-        q_all = group.all_gather(q_local, dim=1).contiguous()
+        q_all = self._dcp_gather_q(q_local, group)
         total_heads = q_all.shape[1]
         prefix_out = torch.zeros(
             (total_tokens, total_heads, layer.v_head_dim),
@@ -2021,6 +2035,8 @@ class TritonAttnBackend(AttentionBackend):
             skip_extend=True,
         )
 
+        prefix_out = self._dcp_ungather_heads(prefix_out)
+        prefix_lse = self._dcp_ungather_heads(prefix_lse)
         prefix_out, prefix_lse = cp_lse_ag_out_rs_mha(
             prefix_out, prefix_lse, group, return_lse=True
         )
@@ -2296,11 +2312,17 @@ class TritonAttnBackend(AttentionBackend):
                     "DCP Triton decode does not support score_mod"
                 )
             group = get_parallel().dcp_group
-            with use_symmetric_memory(group):
+            if self.use_mla:
+                # The model already gathered Q and merges the partials itself.
                 q_for_decode = q.view(
                     -1, layer.tp_q_head_num, layer.qk_head_dim
                 ).contiguous()
-            q_for_decode = group.all_gather(q_for_decode, dim=1).contiguous()
+            else:
+                with use_symmetric_memory(group):
+                    q_local = q.view(
+                        -1, layer.tp_q_head_num, layer.qk_head_dim
+                    ).contiguous()
+                q_for_decode = self._dcp_gather_q(q_local, group)
             o_for_decode = torch.empty(
                 (q_for_decode.shape[0], q_for_decode.shape[1], layer.v_head_dim),
                 dtype=torch.float32,
@@ -2324,6 +2346,7 @@ class TritonAttnBackend(AttentionBackend):
                 logit_cap=logits_soft_cap,
                 sinks=sinks,
                 xai_temperature_len=layer.xai_temperature_len,
+                has_mla=self.use_mla,
                 enable_lean=enable_lean,
                 lean_Mp=self.forward_metadata.lean_Mp,
                 lean_Lp=self.forward_metadata.lean_Lp,
@@ -2336,6 +2359,15 @@ class TritonAttnBackend(AttentionBackend):
                 ],
                 dim=-1,
             )
+            if self.use_mla:
+                return (
+                    o_for_decode.reshape(-1, layer.tp_q_head_num * layer.v_head_dim).to(
+                        q.dtype
+                    ),
+                    local_lse,
+                )
+            o_for_decode = self._dcp_ungather_heads(o_for_decode)
+            local_lse = self._dcp_ungather_heads(local_lse)
             o = cp_lse_ag_out_rs_mha(o_for_decode, local_lse, group)
             return o.reshape(-1, layer.tp_q_head_num * layer.v_head_dim).to(q.dtype)
 

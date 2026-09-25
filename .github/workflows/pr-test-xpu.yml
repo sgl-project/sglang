@@ -65,6 +65,8 @@ jobs:
               - "test/registered/disaggregation/test_disaggregation_xpu.py"
               - "test/registered/attention/test_chunk_gated_delta_rule.py"
               - "test/registered/attention/test_deterministic.py"
+              - "test/registered/dcp/test_trtllm_mla_family_dcp_metadata.py"
+              - "test/registered/kernels/ops/attention/test_dcp_lse_combine.py"
               - "test/registered/lora/test_moe_lora_info.py"
               - "test/registered/lora/test_virtual_experts_kernels.py"
               - "test/registered/unit/sampling/test_sampling_params.py"
