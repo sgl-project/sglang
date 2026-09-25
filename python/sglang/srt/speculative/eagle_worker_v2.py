@@ -714,11 +714,19 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             self.topk,
             self.speculative_num_steps,
         )
+        # A batch without the draft-extend DSA seed (e.g. requests just handed
+        # off by a target-only prefill) drafts eagerly for a better first
+        # draft. Not under DP attention: the check is per rank, the draft's MoE
+        # collectives span every attention-DP rank, and one rank drafting
+        # eagerly while its peers replay the draft graph deadlocks. There every
+        # rank replays the graph and the runner zero-fills the missing seed;
+        # that round's draft is simply rejected by verify.
         if (
             can_run_decode_cuda_graph
             and not forward_batch.forward_mode.is_idle()
             and self.seed_dsa_topk_from_draft_extend
             and draft_input.dsa_topk_indices is None
+            and not get_parallel().enable_dp_attention
         ):
             can_run_decode_cuda_graph = False
 
