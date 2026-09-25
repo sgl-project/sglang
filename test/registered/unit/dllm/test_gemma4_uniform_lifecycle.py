@@ -395,6 +395,7 @@ class TestGemma4RequestValidation(unittest.TestCase):
             session_id=None,
             input_embeds=None,
             bootstrap_port=1,
+            logprob_start_len=-1,
         )
         req = Req(
             "unsupported-logprobs",
@@ -420,7 +421,7 @@ class TestGemma4RequestValidation(unittest.TestCase):
         self.assertIsInstance(abort, AbortReq)
         self.assertIs(original, req)
         self.assertEqual(abort.finished_reason["status_code"], 400)
-        self.assertIn("return_logprob", abort.finished_reason["message"])
+        self.assertIn("top_logprobs_num", abort.finished_reason["message"])
         scheduler._add_request_to_queue.assert_not_called()
         scheduler.output_streamer.stream_output.assert_not_called()
 
@@ -465,7 +466,6 @@ class TestGemma4RequestValidation(unittest.TestCase):
 
     def test_unsupported_request_flags(self):
         cases = [
-            ("return_logprob", {"return_logprob": True}),
             ("top_logprobs_num", {"top_logprobs_num": 2}),
             ("token_ids_logprob", {"token_ids_logprob": [3]}),
             ("return_sampling_mask", {"return_sampling_mask": True}),
@@ -484,9 +484,9 @@ class TestGemma4RequestValidation(unittest.TestCase):
     def test_reports_every_unsupported_field(self):
         error = self._validate(
             SamplingParams(frequency_penalty=0.1, presence_penalty=0.2),
-            return_logprob=True,
+            top_logprobs_num=1,
         )
-        for field in ("frequency_penalty", "presence_penalty", "return_logprob"):
+        for field in ("frequency_penalty", "presence_penalty", "top_logprobs_num"):
             self.assertIn(field, error)
         self.assertIn("sampling is governed by the renoise schedule", error)
 

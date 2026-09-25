@@ -2894,7 +2894,7 @@ class Scheduler(
             self._add_request_to_queue(req)
             return
 
-        if error_msg := self.validate_dllm_request(req):
+        if error_msg := self.validate_dllm_request(req, recv_req):
             abort_req = _make_abort_req(
                 req,
                 finished_reason={
