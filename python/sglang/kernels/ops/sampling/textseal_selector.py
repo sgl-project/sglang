@@ -255,20 +255,22 @@ def _watermark_force_topk_kernel(
     CLEAR_BLOCK_SIZE: tl.constexpr,
     DUAL_KEY: tl.constexpr,
     APPLY_ENTROPY_GATE: tl.constexpr,
+    ROWS_PER_CONFIG: tl.constexpr,
 ):
     row = tl.program_id(0).to(tl.int64)
+    config_row = row // ROWS_PER_CONFIG
     row_eligible = tl.load(eligible + row)
     context_hash = tl.load(context_hashes + row).to(tl.uint32)
-    key = tl.load(keys + row).to(tl.uint64)
-    key_b = tl.load(keys_b + row).to(tl.uint64)
-    mixing_threshold = tl.load(mixing_thresholds + row).to(tl.uint64)
+    key = tl.load(keys + config_row).to(tl.uint64)
+    key_b = tl.load(keys_b + config_row).to(tl.uint64)
+    mixing_threshold = tl.load(mixing_thresholds + config_row).to(tl.uint64)
     token_id, below_probability_threshold = _select_topk_watermark_token(
         topk_probabilities,
         topk_token_ids,
         context_hash,
-        tl.load(top_ks + row),
-        tl.load(top_ps + row),
-        tl.load(min_ps + row),
+        tl.load(top_ks + config_row),
+        tl.load(top_ps + config_row),
+        tl.load(min_ps + config_row),
         key,
         key_b,
         mixing_threshold,
@@ -586,6 +588,202 @@ def _append_watermark_tokens_kernel(
 
 
 @triton.jit
+def _speculative_context_hash_kernel(
+    token_history,
+    lengths,
+    write_positions,
+    req_pool_indices,
+    draft_tokens,
+    custom_mask,
+    positions,
+    context_windows,
+    output_context_hashes,
+    output_context_lengths,
+    context_window: tl.constexpr,
+    draft_token_num: tl.constexpr,
+    FULL_MASK: tl.constexpr,
+):
+    row = tl.program_id(0)
+    request_row = row // draft_token_num
+    draft_position = row % draft_token_num
+    pool_index = tl.load(req_pool_indices + request_row).to(tl.int64)
+    length = tl.load(lengths + pool_index)
+    write_position = tl.load(write_positions + pool_index)
+    requested_window = tl.load(context_windows + request_row)
+    base_length = tl.minimum(length, requested_window)
+    start = tl.where(length == context_window, write_position, 0)
+    source_start = length - base_length
+
+    if FULL_MASK:
+        prefix_length = tl.load(positions + request_row * draft_token_num).to(tl.int64)
+        request_offset = tl.full((), 0, tl.int64)
+        prior_request = 0
+        while prior_request < request_row:
+            prior_prefix_length = tl.load(
+                positions + prior_request * draft_token_num
+            ).to(tl.int64)
+            request_offset += draft_token_num * (prior_prefix_length + draft_token_num)
+            prior_request += 1
+        mask_row_offset = (
+            request_offset
+            + draft_position * (prefix_length + draft_token_num)
+            + prefix_length
+        )
+    else:
+        mask_row_offset = row * draft_token_num
+
+    ancestor_count = 0
+    for candidate in range(1, draft_token_num):
+        ancestor_count += tl.load(custom_mask + mask_row_offset + candidate).to(
+            tl.int32
+        )
+    total_length = base_length + ancestor_count
+    context_length = tl.minimum(total_length, requested_window)
+    skip = total_length - context_length
+
+    state = tl.full((), 0, tl.uint32)
+    rank = 0
+    for candidate in range(context_window):
+        valid = candidate < base_length
+        ring_index = (start + source_start + candidate) % context_window
+        token = tl.load(token_history + pool_index * context_window + ring_index).to(
+            tl.uint32
+        )
+        mixed = murmur3_mix(state, token).to(tl.uint32)
+        state = tl.where(valid & (rank >= skip), mixed, state).to(tl.uint32)
+        rank += valid
+    for candidate in range(1, draft_token_num):
+        valid = tl.load(custom_mask + mask_row_offset + candidate)
+        token = tl.load(draft_tokens + request_row * draft_token_num + candidate).to(
+            tl.uint32
+        )
+        mixed = murmur3_mix(state, token).to(tl.uint32)
+        state = tl.where(valid & (rank >= skip), mixed, state).to(tl.uint32)
+        rank += valid
+
+    context_hash = fmix32(state ^ (context_length * 4).to(tl.uint32))
+    tl.store(output_context_hashes + row, context_hash.to(tl.int64))
+    tl.store(output_context_lengths + row, context_length)
+
+
+@triton.jit
+def _speculative_context_eligible_kernel(
+    watermarked_context_hashes,
+    num_watermarked_contexts,
+    req_pool_indices,
+    context_hashes,
+    context_lengths,
+    watermark_enabled,
+    top_ks,
+    output_eligible,
+    draft_token_num: tl.constexpr,
+    max_contexts_per_req: tl.constexpr,
+    HISTORY_BLOCK_SIZE: tl.constexpr,
+):
+    row = tl.program_id(0)
+    request_row = row // draft_token_num
+    draft_position = row % draft_token_num
+    pool_index = tl.load(req_pool_indices + request_row).to(tl.int64)
+    context_hash = tl.load(context_hashes + row).to(tl.int32)
+    count = tl.load(num_watermarked_contexts + pool_index)
+    eligible = (
+        tl.load(watermark_enabled + request_row)
+        & (tl.load(top_ks + request_row) > 1)
+        & (tl.load(context_lengths + row) > 0)
+        & (count < max_contexts_per_req)
+    )
+
+    repeated = False
+    history_offset = 0
+    while (history_offset < count) & eligible:
+        history_positions = history_offset + tl.arange(0, HISTORY_BLOCK_SIZE)
+        history_mask = history_positions < count
+        previous_hashes = tl.load(
+            watermarked_context_hashes
+            + pool_index * max_contexts_per_req
+            + history_positions,
+            mask=history_mask,
+            other=0,
+        )
+        repeated |= tl.sum((previous_hashes == context_hash) & history_mask, axis=0) > 0
+        history_offset += HISTORY_BLOCK_SIZE
+    for prior_position in range(draft_token_num):
+        prior_hash = tl.load(
+            context_hashes + request_row * draft_token_num + prior_position
+        ).to(tl.int32)
+        repeated |= (prior_position < draft_position) & (prior_hash == context_hash)
+    tl.store(output_eligible + row, eligible & ~repeated)
+
+
+@triton.jit
+def _record_speculative_contexts_kernel(
+    watermarked_context_hashes,
+    num_watermarked_contexts,
+    req_pool_indices,
+    context_hashes,
+    selected,
+    accept_indices,
+    accept_lens,
+    max_contexts_per_req: tl.constexpr,
+    max_accept_tokens: tl.constexpr,
+):
+    request_row = tl.program_id(0)
+    pool_index = tl.load(req_pool_indices + request_row).to(tl.int64)
+    count = tl.load(num_watermarked_contexts + pool_index)
+    accept_length = tl.load(accept_lens + request_row)
+    for position in range(max_accept_tokens):
+        row = tl.load(accept_indices + request_row * max_accept_tokens + position).to(
+            tl.int64
+        )
+        row = tl.maximum(row, 0)
+        should_record = (
+            (position < accept_length)
+            & tl.load(selected + row)
+            & (count < max_contexts_per_req)
+        )
+        context_hash = tl.load(context_hashes + row).to(tl.int32)
+        tl.store(
+            watermarked_context_hashes + pool_index * max_contexts_per_req + count,
+            context_hash,
+            mask=should_record,
+        )
+        count += should_record
+    tl.store(num_watermarked_contexts + pool_index, count)
+
+
+@triton.jit
+def _append_speculative_watermark_tokens_kernel(
+    token_history,
+    lengths,
+    write_positions,
+    req_pool_indices,
+    accept_tokens,
+    accept_lens,
+    context_window: tl.constexpr,
+    max_accept_tokens: tl.constexpr,
+):
+    request_row = tl.program_id(0)
+    pool_index = tl.load(req_pool_indices + request_row).to(tl.int64)
+    write_position = tl.load(write_positions + pool_index)
+    length = tl.load(lengths + pool_index)
+    accept_length = tl.load(accept_lens + request_row)
+    for position in range(max_accept_tokens):
+        valid = position < accept_length
+        token = tl.load(accept_tokens + request_row * max_accept_tokens + position)
+        tl.store(
+            token_history + pool_index * context_window + write_position,
+            token.to(tl.int32),
+            mask=valid,
+        )
+        write_position = tl.where(
+            valid, (write_position + 1) % context_window, write_position
+        )
+        length = tl.where(valid, tl.minimum(length + 1, context_window), length)
+    tl.store(write_positions + pool_index, write_position)
+    tl.store(lengths + pool_index, length)
+
+
+@triton.jit
 def _watermark_force_partial_argmax_kernel(
     logits,
     sorted_probabilities,
@@ -846,6 +1044,111 @@ def append_watermark_tokens_triton(
     )
 
 
+def prepare_speculative_watermark_contexts_triton(
+    token_history: torch.Tensor,
+    lengths: torch.Tensor,
+    write_positions: torch.Tensor,
+    watermarked_context_hashes: torch.Tensor,
+    num_watermarked_contexts: torch.Tensor,
+    req_pool_indices: torch.Tensor,
+    draft_tokens: torch.Tensor,
+    custom_mask: torch.Tensor,
+    positions: torch.Tensor,
+    context_windows: torch.Tensor,
+    watermark_enabled: torch.Tensor,
+    top_ks: torch.Tensor,
+    output_context_hashes: torch.Tensor,
+    output_context_lengths: torch.Tensor,
+    output_eligible: torch.Tensor,
+    draft_token_num: int,
+    full_mask: bool,
+) -> None:
+    batch_size = req_pool_indices.shape[0]
+    num_rows = batch_size * draft_token_num
+    if num_rows == 0:
+        return
+    _speculative_context_hash_kernel[(num_rows,)](
+        token_history,
+        lengths,
+        write_positions,
+        req_pool_indices,
+        draft_tokens,
+        custom_mask,
+        positions,
+        context_windows,
+        output_context_hashes,
+        output_context_lengths,
+        context_window=token_history.shape[1],
+        draft_token_num=draft_token_num,
+        FULL_MASK=full_mask,
+        num_warps=1,
+    )
+    _speculative_context_eligible_kernel[(num_rows,)](
+        watermarked_context_hashes,
+        num_watermarked_contexts,
+        req_pool_indices,
+        output_context_hashes,
+        output_context_lengths,
+        watermark_enabled,
+        top_ks,
+        output_eligible,
+        draft_token_num=draft_token_num,
+        max_contexts_per_req=watermarked_context_hashes.shape[1],
+        HISTORY_BLOCK_SIZE=_HISTORY_BLOCK_SIZE,
+        num_warps=8,
+    )
+
+
+def record_speculative_watermark_contexts_triton(
+    watermarked_context_hashes: torch.Tensor,
+    num_watermarked_contexts: torch.Tensor,
+    req_pool_indices: torch.Tensor,
+    context_hashes: torch.Tensor,
+    selected: torch.Tensor,
+    accept_indices: torch.Tensor,
+    accept_lens: torch.Tensor,
+) -> None:
+    batch_size = req_pool_indices.shape[0]
+    if batch_size == 0:
+        return
+    _record_speculative_contexts_kernel[(batch_size,)](
+        watermarked_context_hashes,
+        num_watermarked_contexts,
+        req_pool_indices,
+        context_hashes,
+        selected,
+        accept_indices,
+        accept_lens,
+        max_contexts_per_req=watermarked_context_hashes.shape[1],
+        max_accept_tokens=accept_indices.shape[1],
+        num_warps=1,
+    )
+
+
+def append_speculative_watermark_tokens_triton(
+    token_history: torch.Tensor,
+    lengths: torch.Tensor,
+    write_positions: torch.Tensor,
+    req_pool_indices: torch.Tensor,
+    accept_tokens: torch.Tensor,
+    accept_lens: torch.Tensor,
+) -> None:
+    batch_size = req_pool_indices.shape[0]
+    if batch_size == 0:
+        return
+    _append_speculative_watermark_tokens_kernel[(batch_size,)](
+        token_history,
+        lengths,
+        write_positions,
+        req_pool_indices,
+        accept_tokens,
+        accept_lens,
+        context_window=token_history.shape[1],
+        max_accept_tokens=accept_tokens.shape[1],
+        num_warps=1,
+    )
+
+
 def _topk_probabilities(
     probabilities: torch.Tensor, top_k: int
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -863,6 +1166,72 @@ def _topk_probabilities(
         num_warps=8,
     )
     return topk_probabilities, topk_token_ids
+
+
+def force_speculative_watermark_tokens_triton(
+    logits: torch.Tensor,
+    context_hashes: torch.Tensor,
+    eligible: torch.Tensor,
+    temperatures: torch.Tensor,
+    top_ks: torch.Tensor,
+    top_ps: torch.Tensor,
+    min_ps: torch.Tensor,
+    keys: torch.Tensor,
+    keys_b: torch.Tensor | None,
+    mixing_thresholds: torch.Tensor | None,
+    draft_token_num: int,
+    max_top_k: int,
+    output_token_ids: torch.Tensor,
+    max_probability: float = 1.0,
+) -> torch.Tensor:
+    batch_size = temperatures.shape[0]
+    num_rows, vocab_size = logits.shape
+    if num_rows != batch_size * draft_token_num:
+        raise ValueError("speculative watermark rows do not match the batch layout")
+    if not can_use_finite_topk_watermark(max_top_k, vocab_size):
+        raise ValueError("speculative watermark fast path requires finite top-k")
+    if (keys_b is None) != (mixing_thresholds is None):
+        raise ValueError(
+            "dual-key watermark selection requires both key B and mixing thresholds"
+        )
+    dual_key = keys_b is not None
+    keys_b = keys if keys_b is None else keys_b
+    mixing_thresholds = (
+        context_hashes[:batch_size] if mixing_thresholds is None else mixing_thresholds
+    )
+    output_token_ids = output_token_ids[:num_rows]
+    if num_rows == 0:
+        return output_token_ids
+    probabilities = torch.softmax(
+        logits.view(batch_size, draft_token_num, vocab_size)
+        / temperatures.view(batch_size, 1, 1),
+        dim=-1,
+    ).view(num_rows, vocab_size)
+    topk_probabilities, topk_token_ids = _topk_probabilities(probabilities, max_top_k)
+    _watermark_force_topk_kernel[(num_rows,)](
+        logits,
+        topk_probabilities,
+        topk_token_ids,
+        context_hashes,
+        eligible,
+        top_ks,
+        top_ps,
+        min_ps,
+        keys,
+        keys_b,
+        mixing_thresholds,
+        max_probability,
+        output_token_ids,
+        vocab_size=vocab_size,
+        candidate_count=max_top_k,
+        BLOCK_K=triton.next_power_of_2(max_top_k),
+        CLEAR_BLOCK_SIZE=_CLEAR_BLOCK_SIZE,
+        DUAL_KEY=dual_key,
+        APPLY_ENTROPY_GATE=max_probability < 1.0,
+        ROWS_PER_CONFIG=draft_token_num,
+        num_warps=8,
+    )
+    return output_token_ids
 
 
 def force_watermark_tokens_with_state_triton(
@@ -1003,6 +1372,7 @@ def force_watermark_tokens_triton(
             CLEAR_BLOCK_SIZE=_CLEAR_BLOCK_SIZE,
             DUAL_KEY=dual_key,
             APPLY_ENTROPY_GATE=max_probability < 1.0,
+            ROWS_PER_CONFIG=1,
             num_warps=8,
         )
         return output_token_ids

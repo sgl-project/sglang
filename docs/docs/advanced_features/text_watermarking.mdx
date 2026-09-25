@@ -380,6 +380,16 @@ On one single-GPU node of each type with public `Qwen/Qwen3-8B`, TP1, TRT-LLM MH
 
 The GB300 concurrency-eight row was remeasured after the score-precision fix on a default-off server by comparing omitted requests with request-level opt-in. These measurements describe one model, GPU, sampling configuration, and output length. Benchmark your deployment before setting capacity targets. Finite-top-k selector latency at batch size one is also hardware-dependent: in one microbenchmark shape (`top_k=20`), the fast path was 58.8% slower than a full sort on H200 with bfloat16 logits and 6.4% faster on GB300 with float32 logits, and at batch size eight it was faster on both.
 
+On a 2x GB300 node with public `Qwen/Qwen3.5-9B`, TP2, NEXTN 3/1/4, concurrency 8, 1,024-token random inputs, 512-token outputs, temperature 0.8, top-p 0.95, and top-k 20, the fused speculative path measured the following means over three repetitions:
+
+| Watermark | Mean TPOT | Aggregate output throughput | Mean accept length |
+| --- | ---: | ---: | ---: |
+| Off | 2.246 ms | 3,188.9 token/s | 2.759 |
+| On | 2.451 ms | 2,922.2 token/s | 2.783 |
+| Change | +9.17% | -8.36% | +0.85% |
+
+Each speculative row still requires keyed selection, but tree-context reconstruction, repeated-context admission, accepted-context recording, and ring-buffer append run as fused GPU operations. The reported cost remains workload- and acceptance-dependent.
+
 ## See also
 
 The fused Triton selector is adapted from Meta's Apache-2.0 [TextSeal](https://github.com/facebookresearch/textseal) implementation and re-implemented on the hash contract above, so detection follows this page rather than TextSeal's own tooling.

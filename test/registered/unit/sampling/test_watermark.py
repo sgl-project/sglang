@@ -224,6 +224,7 @@ def test_disabled_speculative_batch_skips_watermark_state():
         seq_lens=torch.tensor([4], dtype=torch.int32),
         req_pool_indices=torch.tensor([0], dtype=torch.int32),
         sampling_info=sampling_info,
+        return_logprob=False,
         forward_mode=SimpleNamespace(is_idle=lambda: False),
     )
     logits_output = SimpleNamespace(next_token_logits=torch.randn((2, 8)))

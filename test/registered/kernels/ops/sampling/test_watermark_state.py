@@ -221,6 +221,105 @@ def test_speculative_record_stops_at_context_capacity():
     assert state.watermarked_context_hashes[0].tolist() == [10, 20]
 
 
+def test_speculative_tree_fast_path_matches_tensor_reference():
+    draft_token_num = 4
+    req_pool_indices = torch.tensor([1, 3], dtype=torch.int32, device="cuda")
+    prompt_tails = [[10, 11, 12, 13], [20, 21, 22, 23]]
+    states = [
+        WatermarkState(
+            max_num_reqs=4,
+            context_window=4,
+            max_contexts_per_req=16,
+            key="0123456789abcdef",
+            key_b="fedcba9876543210",
+            mixing_probability=0.5,
+            device="cuda",
+        )
+        for _ in range(2)
+    ]
+    for state in states:
+        state.init_from_prompt(req_pool_indices, prompt_tails)
+
+    draft_tokens = torch.tensor(
+        [[30, 31, 31, 33], [40, 41, 41, 43]],
+        dtype=torch.int32,
+        device="cuda",
+    ).flatten()
+    positions = torch.tensor(
+        [[6, 7, 7, 8], [4, 5, 5, 6]], dtype=torch.int64, device="cuda"
+    ).flatten()
+    tree_rows = (
+        (True, False, False, False),
+        (True, True, False, False),
+        (True, False, True, False),
+        (True, True, False, True),
+    )
+    custom_mask = torch.tensor(
+        [
+            value
+            for prefix_length in (6, 4)
+            for row in tree_rows
+            for value in (True,) * prefix_length + row
+        ],
+        dtype=torch.bool,
+        device="cuda",
+    )
+    sampling_info = SimpleNamespace(
+        temperatures=torch.tensor([[0.7], [1.3]], device="cuda"),
+        top_ks=torch.tensor([20, 31], dtype=torch.int32, device="cuda"),
+        top_ps=torch.tensor([0.95, 0.8], device="cuda"),
+        min_ps=torch.tensor([0.0, 0.05], device="cuda"),
+        max_top_k=31,
+        watermark_keys=torch.tensor(
+            [0x0123456789ABCDEF, 0x1111222233334444],
+            dtype=torch.int64,
+            device="cuda",
+        ),
+        watermark_context_windows=torch.tensor(
+            [4, 3], dtype=torch.int32, device="cuda"
+        ),
+        watermark_enabled=torch.ones(2, dtype=torch.bool, device="cuda"),
+    )
+    logits = torch.randn(
+        (8, 257), generator=torch.Generator("cuda").manual_seed(9), device="cuda"
+    )
+    reference_logits = logits.clone()
+    contexts, context_lengths = states[0].speculative_contexts(
+        req_pool_indices,
+        draft_tokens,
+        custom_mask,
+        positions,
+        draft_token_num,
+        True,
+        sampling_info.watermark_context_windows,
+    )
+    reference_hashes, reference_selected = states[0].force_speculative(
+        reference_logits,
+        req_pool_indices,
+        contexts,
+        context_lengths,
+        sampling_info,
+        draft_token_num,
+    )
+    fused_logits = logits.clone()
+    fused_hashes, fused_selected = states[1].force_speculative_from_tree(
+        fused_logits,
+        req_pool_indices,
+        draft_tokens,
+        custom_mask,
+        positions,
+        sampling_info,
+        draft_token_num,
+        True,
+    )
+
+    assert torch.equal(fused_hashes, reference_hashes)
+    assert torch.equal(fused_selected, reference_selected)
+    assert torch.equal(fused_logits, reference_logits)
+    assert fused_selected.view(2, draft_token_num)[:, 1].all()
+    assert fused_selected.view(2, draft_token_num)[:, 2].logical_not().all()
+
+
 def test_dual_key_speculative_rows_match_per_request_config():
     draft_token_num = 3
     state = WatermarkState(

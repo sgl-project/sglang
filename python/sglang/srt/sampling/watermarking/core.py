@@ -516,6 +516,9 @@ class WatermarkState:
         self.context_hash_buffer = torch.empty(
             max_num_reqs, dtype=torch.int64, device=device
         )
+        self.context_length_buffer = torch.empty(
+            max_num_reqs, dtype=torch.int32, device=device
+        )
         self.eligible_buffer = torch.empty(
             max_num_reqs, dtype=torch.bool, device=device
         )
@@ -746,6 +749,25 @@ class WatermarkState:
             self.output_token_ids_buffer[:batch_size],
         )
 
+    def _ensure_context_buffers(
+        self, num_rows: int
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if self.context_hash_buffer.numel() < num_rows:
+            self.context_hash_buffer = torch.empty(
+                num_rows, dtype=torch.int64, device=self.token_ids.device
+            )
+            self.context_length_buffer = torch.empty(
+                num_rows, dtype=torch.int32, device=self.token_ids.device
+            )
+            self.eligible_buffer = torch.empty(
+                num_rows, dtype=torch.bool, device=self.token_ids.device
+            )
+        return (
+            self.context_hash_buffer[:num_rows],
+            self.context_length_buffer[:num_rows],
+            self.eligible_buffer[:num_rows],
+        )
+
     def _dual_key_rows(
         self, req_pool_indices: torch.Tensor
     ) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
@@ -942,6 +964,90 @@ class WatermarkState:
         )
         return context_hashes, selected
 
+    def force_speculative_from_tree(
+        self,
+        logits: torch.Tensor,
+        req_pool_indices: torch.Tensor,
+        draft_tokens: torch.Tensor,
+        custom_mask: torch.Tensor,
+        positions: torch.Tensor,
+        sampling_info: SamplingBatchInfo,
+        draft_token_num: int,
+        full_mask: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        from sglang.kernels.ops.sampling.textseal_selector import (
+            can_use_finite_topk_watermark,
+            force_speculative_watermark_tokens_triton,
+            prepare_speculative_watermark_contexts_triton,
+        )
+
+        if not can_use_finite_topk_watermark(sampling_info.max_top_k, logits.shape[1]):
+            contexts, context_lengths = self.speculative_contexts(
+                req_pool_indices=req_pool_indices,
+                draft_tokens=draft_tokens,
+                custom_mask=custom_mask,
+                positions=positions,
+                draft_token_num=draft_token_num,
+                full_mask=full_mask,
+                context_windows=self.context_windows(sampling_info),
+            )
+            return self.force_speculative(
+                logits=logits,
+                req_pool_indices=req_pool_indices,
+                contexts=contexts,
+                context_lengths=context_lengths,
+                sampling_info=sampling_info,
+                draft_token_num=draft_token_num,
+            )
+
+        num_rows = req_pool_indices.shape[0] * draft_token_num
+        context_hashes, context_lengths, eligible = self._ensure_context_buffers(
+            num_rows
+        )
+        keys, context_windows, watermark_enabled = self._watermark_batch_config(
+            sampling_info
+        )
+        prepare_speculative_watermark_contexts_triton(
+            self.token_ids,
+            self.lengths,
+            self.write_positions,
+            self.watermarked_context_hashes,
+            self.num_watermarked_contexts,
+            req_pool_indices,
+            draft_tokens,
+            custom_mask,
+            positions,
+            context_windows,
+            watermark_enabled,
+            sampling_info.top_ks,
+            context_hashes,
+            context_lengths,
+            eligible,
+            draft_token_num,
+            full_mask,
+        )
+        keys_b, mixing_thresholds = self._dual_key_rows(req_pool_indices)
+        _, _, output_token_ids = self._ensure_selection_buffers(
+            num_rows, logits.shape[1]
+        )
+        selected_tokens = force_speculative_watermark_tokens_triton(
+            logits=logits,
+            context_hashes=context_hashes,
+            eligible=eligible,
+            temperatures=sampling_info.temperatures,
+            top_ks=sampling_info.top_ks,
+            top_ps=sampling_info.top_ps,
+            min_ps=sampling_info.min_ps,
+            keys=keys,
+            keys_b=keys_b,
+            mixing_thresholds=mixing_thresholds,
+            draft_token_num=draft_token_num,
+            max_top_k=sampling_info.max_top_k,
+            output_token_ids=output_token_ids,
+            max_probability=self.max_probability,
+        )
+        return context_hashes, eligible & (selected_tokens >= 0)
+
     def record_speculative(
         self,
         req_pool_indices: torch.Tensor,
@@ -950,6 +1056,21 @@ class WatermarkState:
         accept_index: torch.Tensor,
         accept_lens: torch.Tensor,
     ) -> None:
+        if self.token_ids.is_cuda:
+            from sglang.kernels.ops.sampling.textseal_selector import (
+                record_speculative_watermark_contexts_triton,
+            )
+
+            record_speculative_watermark_contexts_triton(
+                self.watermarked_context_hashes,
+                self.num_watermarked_contexts,
+                req_pool_indices,
+                context_hashes,
+                selected,
+                accept_index,
+                accept_lens,
+            )
+            return
         for position in range(accept_index.shape[1]):
             valid = position < accept_lens
             rows = accept_index[:, position].clamp(min=0).to(torch.int64)
@@ -965,6 +1086,20 @@ class WatermarkState:
         accept_tokens: torch.Tensor,
         accept_lens: torch.Tensor,
     ) -> None:
+        if self.token_ids.is_cuda:
+            from sglang.kernels.ops.sampling.textseal_selector import (
+                append_speculative_watermark_tokens_triton,
+            )
+
+            append_speculative_watermark_tokens_triton(
+                self.token_ids,
+                self.lengths,
+                self.write_positions,
+                req_pool_indices,
+                accept_tokens,
+                accept_lens,
+            )
+            return
         for position in range(accept_tokens.shape[1]):
             valid = position < accept_lens
             self.append(req_pool_indices[valid], accept_tokens[valid, position])

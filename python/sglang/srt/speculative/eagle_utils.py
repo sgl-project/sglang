@@ -803,27 +803,42 @@ def eagle_sample(
     watermark_context_hashes = None
     watermark_selected = None
     if watermark_state is not None and sampling_info.has_watermark_candidates:
-        # compute_spec_logprobs reads logits_output after verify; force a copy.
-        next_token_logits = next_token_logits.clone()
-        contexts, context_lengths = watermark_state.speculative_contexts(
-            req_pool_indices=batch.req_pool_indices,
-            draft_tokens=verify_input.draft_token,
-            custom_mask=verify_input.custom_mask,
-            positions=verify_input.positions,
-            draft_token_num=verify_input.draft_token_num,
-            full_mask=watermark_full_mask,
-            context_windows=watermark_state.context_windows(sampling_info),
-        )
-        watermark_context_hashes, watermark_selected = (
-            watermark_state.force_speculative(
-                logits=next_token_logits,
-                req_pool_indices=batch.req_pool_indices,
-                contexts=contexts,
-                context_lengths=context_lengths,
-                sampling_info=sampling_info,
-                draft_token_num=verify_input.draft_token_num,
+        if batch.return_logprob:
+            # compute_spec_logprobs reads logits_output after verify.
+            next_token_logits = next_token_logits.clone()
+        if next_token_logits.is_cuda:
+            watermark_context_hashes, watermark_selected = (
+                watermark_state.force_speculative_from_tree(
+                    logits=next_token_logits,
+                    req_pool_indices=batch.req_pool_indices,
+                    draft_tokens=verify_input.draft_token,
+                    custom_mask=verify_input.custom_mask,
+                    positions=verify_input.positions,
+                    sampling_info=sampling_info,
+                    draft_token_num=verify_input.draft_token_num,
+                    full_mask=watermark_full_mask,
+                )
             )
-        )
+        else:
+            contexts, context_lengths = watermark_state.speculative_contexts(
+                req_pool_indices=batch.req_pool_indices,
+                draft_tokens=verify_input.draft_token,
+                custom_mask=verify_input.custom_mask,
+                positions=verify_input.positions,
+                draft_token_num=verify_input.draft_token_num,
+                full_mask=watermark_full_mask,
+                context_windows=watermark_state.context_windows(sampling_info),
+            )
+            watermark_context_hashes, watermark_selected = (
+                watermark_state.force_speculative(
+                    logits=next_token_logits,
+                    req_pool_indices=batch.req_pool_indices,
+                    contexts=contexts,
+                    context_lengths=context_lengths,
+                    sampling_info=sampling_info,
+                    draft_token_num=verify_input.draft_token_num,
+                )
+            )
 
     candidates = verify_input.draft_token.reshape(bs, verify_input.draft_token_num)
     predict_shape = list(next_token_logits.shape)[:-1]
