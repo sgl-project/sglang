@@ -51,7 +51,7 @@ class TestKimiK2Thinking(CustomTestCase):
             base_url=self.base_url,
             model=self.model,
             eval_name="gsm8k",
-            api="completion",
+            api="sgl_eval",
             max_tokens=512,
             num_examples=200,
             num_threads=128,

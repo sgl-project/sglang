@@ -56,11 +56,10 @@ class TestDeepseekV32FP4DP(CustomTestCase):
             base_url=self.base_url,
             model=self.model,
             eval_name="gsm8k",
-            api="completion",
+            api="sgl_eval",
             max_tokens=512,
             num_examples=500,
             num_threads=500,
-            num_shots=20,
         )
         metrics = run_eval(args)
         print(f"{metrics=}")
@@ -124,11 +123,10 @@ class TestDeepseekV32FP4TP(CustomTestCase):
             base_url=self.base_url,
             model=self.model,
             eval_name="gsm8k",
-            api="completion",
+            api="sgl_eval",
             max_tokens=512,
             num_examples=500,
             num_threads=500,
-            num_shots=20,
         )
         metrics = run_eval(args)
         print(f"{metrics=}")

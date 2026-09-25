@@ -59,11 +59,10 @@ class TestDeepseekV3FP4(CustomTestCase):
             base_url=self.base_url,
             model=self.model,
             eval_name="gsm8k",
-            api="completion",
+            api="sgl_eval",
             max_tokens=512,
             num_examples=1319,
             num_threads=1319,
-            num_shots=8,
         )
         metrics = run_eval(args)
         print(f"{metrics=}")

@@ -97,12 +97,10 @@ class BaseFlashAttentionTest(CustomTestCase):
             base_url=self.base_url,
             model=self.model,
             eval_name="gsm8k",
-            api="completion",
+            api="sgl_eval",
             max_tokens=512,
             num_examples=100,
             num_threads=128,
-            num_shots=4,
-            gsm8k_data_path=GSM_DATASET_PATH,
         )
         metrics = run_eval(args)
         print(f"{metrics=}")

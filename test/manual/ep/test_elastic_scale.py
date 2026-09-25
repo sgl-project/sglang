@@ -394,7 +394,7 @@ class _ElasticScaleUpEndToEndBase(CustomTestCase):
                 base_url=self.base_url,
                 model=self.model,
                 eval_name="gsm8k",
-                api="completion",
+                api="sgl_eval",
                 max_tokens=512,
                 num_examples=256,
                 num_threads=50,

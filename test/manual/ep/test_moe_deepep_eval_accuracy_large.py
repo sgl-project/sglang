@@ -46,11 +46,10 @@ class TestMoEDeepEPEvalAccuracyLarge(CustomTestCase):
             base_url=self.base_url,
             model=self.model,
             eval_name="gsm8k",
-            api="completion",
+            api="sgl_eval",
             max_tokens=512,
             num_examples=200,
             num_threads=64,
-            num_shots=8,
         )
         metrics = run_eval(args)
         print(f"Eval accuracy of GSM8K: {metrics=}")

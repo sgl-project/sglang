@@ -56,6 +56,7 @@ class TestDPAttentionDP2TP4(
             base_url=self.base_url,
             model=self.model,
             eval_name="gsm8k",
+            api="sgl_eval",
             num_examples=None,
             num_threads=1024,
         )
@@ -112,7 +113,7 @@ class TestDPAttentionDP2TP2DeepseekV3MTP(
             base_url=self.base_url,
             model=self.model,
             eval_name="gsm8k",
-            api="completion",
+            api="sgl_eval",
             max_tokens=512,
             num_examples=200,
             num_threads=128,
