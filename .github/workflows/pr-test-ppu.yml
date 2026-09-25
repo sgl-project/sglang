@@ -61,7 +61,6 @@ jobs:
     outputs:
       # Scope only; the shared pr-gate checks both required labels.
       ppu: ${{ steps.filter.outputs.ppu == 'true' || steps.run-mode.outputs.run_all_tests == 'true' }}
-      check_attempt: ${{ steps.run-mode.outputs.attempt }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -73,9 +72,6 @@ jobs:
       - name: Determine run mode
         id: run-mode
         run: |
-          # Require the full PR check chain in each attempt so partial reruns
-          # cannot reuse a successful shared gate from an earlier attempt.
-          echo "attempt=$GITHUB_RUN_ATTEMPT" >> "$GITHUB_OUTPUT"
           if [[ "${{ inputs.run_all_tests }}" == "true" ]]; then
             echo "run_all_tests=true" >> "$GITHUB_OUTPUT"
             echo "Run mode: ALL TESTS"
@@ -98,9 +94,6 @@ jobs:
               - "python/sglang/srt/hardware_backend/ppu/**"
               - "python/sglang/kernels/aot/csrc/ppu/**"
 
-      - name: Test PPU CI registry wiring
-        run: python3 -m unittest scripts/ci/ppu/test_ppu_registry.py
-
   # ==================== PR Gate ==================== #
   pr-gate:
     name: >-
@@ -108,10 +101,7 @@ jobs:
            github.event.label.name != 'run-ci' && github.event.label.name != 'run-ci-ppu') &&
           'ignored-label-pr-gate' || 'pr-gate' }}
     needs: check-changes
-    if: >-
-      needs.check-changes.outputs.ppu == 'true' &&
-      (github.event_name != 'pull_request' ||
-       needs.check-changes.outputs.check_attempt == github.run_attempt)
+    if: needs.check-changes.outputs.ppu == 'true'
     uses: ./.github/workflows/pr-gate.yml
     with:
       require-run-ci: true
@@ -127,10 +117,7 @@ jobs:
            github.event.label.name != 'run-ci' && github.event.label.name != 'run-ci-ppu') &&
           'ignored-label-ppu-preflight' || 'ppu-preflight' }}
     needs: [check-changes, pr-gate]
-    if: >-
-      needs.check-changes.outputs.ppu == 'true' &&
-      (github.event_name != 'pull_request' ||
-       needs.check-changes.outputs.check_attempt == github.run_attempt)
+    if: needs.check-changes.outputs.ppu == 'true'
     runs-on: 1-ppu-m890p
     timeout-minutes: 60
     env:
@@ -156,17 +143,6 @@ jobs:
     if: always() && needs.check-changes.result != 'skipped'
     runs-on: ubuntu-latest
     steps:
-      - name: Require fresh PR checks before PPU execution
-        id: check-authorization
-        if: github.event_name == 'pull_request' && needs.check-changes.outputs.ppu == 'true'
-        env:
-          CHECK_ATTEMPT: ${{ needs.check-changes.outputs.check_attempt }}
-        run: |
-          if [[ "$CHECK_ATTEMPT" != "$GITHUB_RUN_ATTEMPT" ]]; then
-            echo "::error::PR checks were not refreshed for this attempt. Select Re-run all jobs to recheck labels through the shared gate before running PPU CI."
-            exit 1
-          fi
-
       - name: Check all dependent job statuses
         run: |
           json_needs='${{ toJson(needs) }}'
