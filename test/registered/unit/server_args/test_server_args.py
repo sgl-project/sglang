@@ -1124,7 +1124,7 @@ class TestLoadBalanceMethod(unittest.TestCase):
             dcp_size=4,
         )
         with self.assertRaisesRegex(
-            ValueError, "mooncake, nixl, or fake for synthetic benchmarking"
+            ValueError, "mooncake, nixl, ascend, or fake for synthetic benchmarking"
         ):
             handle_pd_disaggregation(server_args)
 
@@ -4031,6 +4031,15 @@ class TestDcpCommBackendDefault(CustomTestCase):
 
     def test_no_dcp_is_ag_rs(self):
         self.assertEqual(self._resolved(dcp_size=1), "ag_rs")
+
+    @override_platform(is_npu=True, is_cuda=False, is_hip=False)
+    def test_a5_npu_rejects_dcp(self):
+        with patch(
+            "sglang.srt.hardware_backend.npu.utils.is_npu_arch35",
+            return_value=True,
+        ):
+            with self.assertRaisesRegex(AssertionError, "NPU A5"):
+                self._resolved(dcp_size=2)
 
     @override_platform(is_cuda=True, is_hip=False)
     def test_fi_a2a_where_supported(self):
