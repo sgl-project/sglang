@@ -11,8 +11,8 @@ from sglang.kernels.ops.attention.log_scaling_tau import (
 from sglang.kernels.ops.elementwise.row_scale import row_scale_bf16
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-large")
-register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=20, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=20, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
 
 
 def _triton_ref(x2d, tau):

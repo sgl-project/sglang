@@ -245,3 +245,70 @@ register_kernel(
         capabilities=frozenset({CapabilityRequirement.CUDA}),
     )
 )
+
+
+# Public entry points inventoried by logical operator group (RFC #29630).
+register_kernel(
+    KernelSpec(
+        op="moe.gemma_routing_post_topk",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.moe.gemma4_routing:gemma_routing_post_topk",
+        capabilities=frozenset({CapabilityRequirement.CUDA}),
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="moe.gemma4_fused_routing",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.moe.gemma4_routing:gemma4_fused_routing",
+        capabilities=frozenset({CapabilityRequirement.CUDA}),
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="moe.mask_topk_ids",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.moe.dsv4:mask_topk_ids",
+        capabilities=frozenset({CapabilityRequirement.CUDA, CapabilityRequirement.HIP}),
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="moe.hash_topk",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.moe.dsv4:hash_topk",
+        capabilities=frozenset({CapabilityRequirement.CUDA, CapabilityRequirement.HIP}),
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="moe.mega_moe_pre_dispatch",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.moe.dsv4:mega_moe_pre_dispatch",
+        capabilities=frozenset({CapabilityRequirement.CUDA, CapabilityRequirement.HIP}),
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="moe.silu_and_mul_clamp",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.moe.dsv4:silu_and_mul_clamp",
+        capabilities=frozenset({CapabilityRequirement.CUDA, CapabilityRequirement.HIP}),
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="moe.silu_and_mul_masked_post_quant",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.moe.dsv4:silu_and_mul_masked_post_quant",
+        capabilities=frozenset({CapabilityRequirement.CUDA, CapabilityRequirement.HIP}),
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="moe.silu_and_mul_contig_post_quant",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.moe.dsv4:silu_and_mul_contig_post_quant",
+        capabilities=frozenset({CapabilityRequirement.CUDA, CapabilityRequirement.HIP}),
+    )
+)

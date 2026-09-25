@@ -7,7 +7,7 @@ import torch
 from sglang.kernels.ops.layernorm.gemma4_fused_ops import gemma_qkv_rmsnorm
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=35, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=10, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")

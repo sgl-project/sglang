@@ -184,7 +184,6 @@ for _mod, _fn in [
     ("dsa.cp_split", "dsa_cp_interleave_q_seqs_kernel"),
     ("dsv4.fp4_indexer", "quantize_fp4_indexer_tensor"),
     ("dsv4.fp4_indexer", "store_fp4_index_k_cache"),
-    ("dsv4.rms_normalize_hip", "rms_normalize_triton"),
 ]:
     register_kernel(
         KernelSpec(
@@ -287,3 +286,62 @@ for _mod, _fn, _backend, _device in [
         )
     )
 del _mod, _fn, _backend, _device
+
+
+# Public entry points inventoried by logical operator group (RFC #29630).
+register_kernel(
+    KernelSpec(
+        op="attention.get_block_table",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.attention.minicpm_sala.get_block_table:get_block_table",
+        capabilities=frozenset({CapabilityRequirement.CUDA}),
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="attention.fast_kpool_topk_transform_fused",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.attention.dsa.kpool_topk_transform:fast_kpool_topk_transform_fused",
+        capabilities=frozenset({CapabilityRequirement.CUDA}),
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="attention.fast_topk",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.attention.fast_topk:fast_topk",
+        capabilities=frozenset({CapabilityRequirement.CUDA}),
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="attention.fused_k_indexer_norm_rope",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.attention.dsa.indexer_k:fused_k_indexer_norm_rope",
+        capabilities=frozenset({CapabilityRequirement.CUDA}),
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="attention.fused_k_indexer_norm_rope_store",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.attention.dsa.indexer_k:fused_k_indexer_norm_rope_store",
+        capabilities=frozenset({CapabilityRequirement.CUDA}),
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="attention.fused_rope_wo_a_bf16",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.attention.dsv4.wo_a:fused_rope_wo_a_bf16",
+        capabilities=frozenset({CapabilityRequirement.cuda(min_sm=(10, 0))}),
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="attention.fp4_index_logits_decode",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.attention.dsv4.fp4_indexer:fp4_index_logits_decode",
+        capabilities=frozenset({CapabilityRequirement.CUDA}),
+    )
+)

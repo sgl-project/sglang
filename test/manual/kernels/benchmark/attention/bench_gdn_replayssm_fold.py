@@ -3,7 +3,7 @@ Qwen3.5-397B at TP4). The kernel is bound by the mandatory checkpoint
 read+write (``bs * layers * HV * K * V * 4 B * 2``), so the reported GB/s
 approximates achieved HBM bandwidth.
 
-Run: ``python -m sglang.kernels.ops.attention.fla.bench_gdn_replayssm_fold``
+Run: ``python test/manual/kernels/benchmark/attention/bench_gdn_replayssm_fold.py``
 """
 
 from __future__ import annotations

@@ -1,9 +1,13 @@
 ---
 name: add-jit-kernel
-description: Step-by-step tutorial for adding a new lightweight JIT CUDA kernel to sglang's jit_kernel module
+description: Step-by-step tutorial for adding a new lightweight JIT CUDA kernel to sglang.kernels JIT infrastructure and public operator groups
 ---
 
 # Tutorial: Adding a New JIT Kernel to SGLang
+
+Apply [kernel-organization](../kernel-organization/SKILL.md) for the public
+operator namespace, logical grouping, lazy registry metadata, and test placement.
+The implementation tutorial below does not replace that API contract.
 
 This tutorial walks through adding a simple element-wise scale operation as a JIT kernel. We'll implement `scale(x, factor) = x * factor` to demonstrate the complete workflow.
 
@@ -724,7 +728,7 @@ cd test && python3 run_suite.py --hw cuda --suite base-b-kernel-benchmark-test-1
 - `python/sglang/kernels/jit/include/sgl_kernel/cta.cuh` — `cta::reduce_max`
 - `python/sglang/kernels/jit/include/sgl_kernel/atomic.cuh` — `atomic::max`
 - `python/sglang/kernels/jit/include/sgl_kernel/runtime.cuh` — occupancy / SM count helpers
-- `python/sglang/kernels/jit/csrc/add_constant.cuh` — minimal runnable reference
+- `python/sglang/kernels/jit/csrc/elementwise/add_constant.cuh` — minimal runnable reference
 - `python/sglang/kernels/jit/csrc/elementwise/rmsnorm.cuh` — real example using `TensorMatcher` + `LaunchKernel` + `tile::Memory`
 - `python/sglang/kernels/jit/csrc/elementwise/qknorm.cuh` — real example using `runtime::get_blocks_per_sm` + persistent kernel pattern
 - `python/sglang/kernels/jit/benchmark/marker.py` — `benchmark`, `parametrize`, `do_bench`, `BenchResult`

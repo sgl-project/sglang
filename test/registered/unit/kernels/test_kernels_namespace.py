@@ -1,8 +1,10 @@
 """GPU-free import / registry / selector tests for ``sglang.kernels`` (RFC #29630)."""
 
+import ast
 import importlib
 import subprocess
 import sys
+from pathlib import Path
 
 import pytest
 
@@ -204,6 +206,76 @@ def test_kimi_k3_kernels_are_inventoried_by_operator(op, backend, device):
 
 def test_kimi_k3_model_namespace_is_retired():
     assert importlib.util.find_spec("sglang.kernels.ops.kimi_k3") is None
+
+
+def test_operator_and_test_groups_agree():
+    """A new root-level model bundle must not bypass logical op grouping."""
+    root = Path(K.__file__).resolve().parents[3]
+    ops = root / "python/sglang/kernels/ops"
+    groups = set(K.ops.__all__)
+    assert {p.name for p in ops.glob("*.py")} == {"__init__.py"}
+    assert {p.name for p in ops.iterdir() if (p / "__init__.py").is_file()} == groups
+    for kind in ("ops", "benchmark"):
+        tests = root / "test/registered/kernels" / kind
+        actual = {p.relative_to(tests).parts[0] for p in tests.rglob("*.py")}
+        assert actual <= groups, actual - groups
+
+
+def test_inventory_targets_survive_module_moves():
+    """Moving a module without its lazy target otherwise breaks only on first call."""
+    root = Path(K.__file__).resolve().parents[3] / "python"
+    for spec in K.registry.all_specs():
+        module, _ = spec.target.split(":", 1)
+        if not module.startswith("sglang.kernels.ops."):
+            continue
+        path = root.joinpath(*module.split("."))
+        assert path.with_suffix(".py").is_file() or (path / "__init__.py").is_file(), (
+            spec
+        )
+
+
+def test_reclassified_public_entry_points_are_inventoried():
+    """Public compute functions in these formerly unregistered modules need metadata."""
+    root = Path(K.__file__).resolve().parent / "ops"
+    targets = {spec.target for spec in K.registry.all_specs()}
+    modules = (
+        "attention.minicpm_sala.get_block_table",
+        "attention.fast_topk",
+        "attention.dsa.kpool_topk_transform",
+        "attention.dsa.indexer_k",
+        "attention.dsv4.wo_a",
+        "embeddings.qwen4_ngram",
+        "elementwise.qwen4_gate",
+        "elementwise.row_scale",
+        "mamba.qwen4_short_conv",
+        "mamba.lfm_short_conv",
+        "gemm.dsv4_wo_a",
+        "gemm.inkling_rel_proj",
+        "gemm.hopper_bf16_gemv",
+        "gemm.sm120_fp8_gemv",
+        "gemm.fp8_blockwise_gemm",
+        "gemm.gptq_marlin",
+        "layernorm.rmsnorm_hf",
+        "layernorm.grouped_gemma_rmsnorm",
+        "moe.dsv4",
+        "moe.gemma4_routing",
+        "memory.adler32",
+        "memory.row_compact",
+        "mm.process.image",
+    )
+    for module in modules:
+        tree = ast.parse(
+            root.joinpath(*module.split(".")).with_suffix(".py").read_text()
+        )
+        for node in tree.body:
+            if not isinstance(node, ast.FunctionDef):
+                continue
+            if (
+                node.name.startswith(("_", "can_", "is_", "use_"))
+                or node.name == "make_name"
+            ):
+                continue
+            assert f"sglang.kernels.ops.{module}:{node.name}" in targets
 
 
 if __name__ == "__main__":
