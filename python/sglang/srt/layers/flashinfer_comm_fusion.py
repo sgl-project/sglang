@@ -673,16 +673,13 @@ def resolve_fusion_group(*, use_attn_tp_group: bool):
     Must match the group the fused residual+LN kernel reduces over; a mismatch
     silently reduces across the wrong peers.
     """
-    from sglang.srt.layers.moe.utils import can_merge_post_experts_all_reduce
+    from sglang.srt.layers.moe.utils import post_experts_reduction_group
 
     parallel = get_parallel()
     if use_attn_tp_group:
         return parallel.attn_tp_size, parallel.attn_tp_rank, parallel.attn_tp_group
-    if can_merge_post_experts_all_reduce():
-        return parallel.tp_size, parallel.tp_rank, parallel.tp_group
-    if parallel.moe_ep_size > 1:
-        return parallel.moe_ep_size, parallel.moe_ep_rank, parallel.moe_ep_group
-    return parallel.moe_tp_size, parallel.moe_tp_rank, parallel.moe_tp_group
+    group = post_experts_reduction_group()
+    return group.world_size, group.rank_in_group, group
 
 
 def _sync_allreduce_unavailable_across_tp():

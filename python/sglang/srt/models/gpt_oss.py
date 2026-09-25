@@ -32,7 +32,7 @@ from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.layers.communicator import (
     LayerCommunicator,
     LayerScatterModes,
-    complete_deferred_allreduce,
+    reduce_output,
 )
 from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
@@ -564,9 +564,8 @@ class GptOssDecoderLayer(nn.Module):
         self.attn_tp_size = get_parallel().attn_tp_size
         self.attn_tp_rank = get_parallel().attn_tp_rank
 
-        # GptOss all layers are sparse and have no nextn now
+        # GptOss all layers are sparse
         self.is_layer_sparse = True
-        self.is_nextn = False
         is_previous_layer_sparse = True
         is_next_layer_sparse = True
 
@@ -611,9 +610,6 @@ class GptOssDecoderLayer(nn.Module):
             input_layernorm=self.input_layernorm,
             post_attention_layernorm=self.post_attention_layernorm,
             allow_reduce_scatter=True,
-            is_last_layer=(
-                self.is_nextn or (self.layer_id == self.config.num_hidden_layers - 1)
-            ),
         )
 
     def forward(
@@ -725,7 +721,7 @@ class GptOssModel(nn.Module):
                     positions, hidden_states, forward_batch, residual
                 )
                 if i + 1 in self.layers_to_capture:
-                    hidden_states = complete_deferred_allreduce(hidden_states)
+                    hidden_states = reduce_output(hidden_states)
                     aux_hidden_states.append(
                         hidden_states + residual
                         if residual is not None
