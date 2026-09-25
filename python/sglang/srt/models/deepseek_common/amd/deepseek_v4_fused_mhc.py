@@ -33,6 +33,14 @@ def _is_fused_mhc_post_pre_enabled() -> bool:
     # Gate only on SGLANG_OPT_FUSE_MHC_POST_PRE; TileLang switches don't apply.
     if _is_gfx1250_supported:
         return envs.SGLANG_OPT_FUSE_MHC_POST_PRE.get()
+    # Other HIP archs: TileLang's HIP codegen cannot lower the tl.get_lane_idx
+    # used by mhc_fused_post_pre_fma_tilelang, so the TileLang fused boundary is
+    # unavailable here the same way the standalone TileLang mHC pre/post paths
+    # are (_use_tilelang_mhc_pre / _use_tilelang_mhc_post). gfx95 keeps fusion
+    # through _is_aiter_gfx95_mhc_available; the rest fall back to the unfused
+    # hc_post + hc_pre sequence.
+    if _is_hip:
+        return False
     # SM120 disables the standalone TileLang pre path. mhc_fused_post_pre does
     # not read that flag and dispatches independently for both small and large
     # token batches, so the standalone pre flag must not veto the fused opt-in.

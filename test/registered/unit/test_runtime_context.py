@@ -2841,7 +2841,7 @@ class TestWhoAnswersDuringADraftScope(CustomTestCase):
             checker = WeightChecker(get_model=lambda: None)
 
         self.assertEqual(get_parallel().pp_size, 2)
-        info = checker._parallelism_info()
+        info = checker._parallelism_info(role="target")
         self.assertEqual((info.pp_rank, info.pp_size), (0, 1))
 
 
