@@ -1,6 +1,6 @@
 import unittest
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, call, patch
 
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.disaggregation.utils import DisaggregationMode
@@ -55,14 +55,27 @@ class TestReleaseMemoryFlushOrder(CustomTestCase):
 
     def test_release_flushes_once_before_the_pause_and_later_flushes_are_skipped(self):
         scheduler, manager = self._harness()
+        calls = Mock()
+        manager.flush_cache = Mock(wraps=manager.flush_cache)
+        calls.attach_mock(manager.flush_cache, "flush")
+        calls.attach_mock(manager.memory_saver_adapter.pause, "pause")
         with patch(
             "sglang.srt.managers.scheduler_components.weight_updater.torch.get_device_module",
-            return_value=SimpleNamespace(synchronize=lambda: None),
+            return_value=SimpleNamespace(synchronize=calls.synchronize),
         ):
             manager.release_memory_occupation(
                 ReleaseMemoryOccupationReqInput(tags=[GPU_MEMORY_TYPE_KV_CACHE])
             )
 
+        self.assertEqual(
+            calls.mock_calls,
+            [
+                call.flush(),
+                call.synchronize(),
+                call.pause(GPU_MEMORY_TYPE_KV_CACHE),
+                call.synchronize(),
+            ],
+        )
         self.assertEqual(scheduler.tree_cache.reset.call_count, 1)
         self.assertEqual(manager.memory_saver_adapter.pause.call_count, 1)
         self.assertIn(GPU_MEMORY_TYPE_KV_CACHE, manager.offload_tags)
