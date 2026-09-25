@@ -82,14 +82,20 @@ impl TokenizerRegistry {
             tracing::info!(model = %m.id,
                 "router-generated input_ids forwarding disabled; workers tokenize messages; \
                  routing tokenization remains available");
-        } else if me.has_chat_formatter(&m.id) {
-            tracing::warn!(model = %m.id,
-                "router-generated input_ids forwarding enabled: requires the workers' model files, \
-                 --default-chat-template-kwargs, SGLANG_DEFAULT_THINKING, and \
-                 SGLANG_DSV4_REASONING_EFFORT / SGLANG_DSV41_REASONING_EFFORT; worker parser overrides \
-                 (including --tool-call-parser deepseekv32), content-format detection, and \
-                 conversation-template stop strings are not replicated. Use \
-                 --disable-input-ids-forwarding for array-only templates or when these assumptions do not hold");
+        } else if let Some(entry) = me.formatters.get(&m.id) {
+            if entry.formatter.forwarding_verified() {
+                tracing::info!(model = %m.id,
+                    "router-generated input_ids forwarding enabled for all text chats; requires the \
+                     workers' model files, --default-chat-template-kwargs, SGLANG_DEFAULT_THINKING, \
+                     and SGLANG_DSV4_REASONING_EFFORT");
+            } else {
+                tracing::warn!(model = %m.id,
+                    "UNVERIFIED input_ids forwarding: router rendering is verified against SGLang \
+                     only for DeepSeek-V4; this model's chats may be forwarded with prompts that \
+                     differ from what the workers would render (tools, reasoning history, content \
+                     parts, strict templates). Pass --disable-input-ids-forwarding unless you have \
+                     verified parity for this model");
+            }
         }
         Ok(me)
     }

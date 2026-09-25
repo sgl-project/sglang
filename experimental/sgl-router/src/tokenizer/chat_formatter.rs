@@ -231,6 +231,11 @@ impl ChatFormatter {
         })
     }
 
+    /// Whether router rendering is fixture-verified against SGLang for every text chat.
+    pub fn forwarding_verified(&self) -> bool {
+        matches!(self.deepseek, Some(super::deepseek::Encoder::V4(_)))
+    }
+
     /// Apply the workers' `--default-chat-template-kwargs`; they fill keys the
     /// request leaves unset, and a default `reasoning_effort` acts as the request's.
     pub fn with_defaults(mut self, defaults: &ChatTemplateKwargs) -> Self {
