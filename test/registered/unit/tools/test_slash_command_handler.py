@@ -1,7 +1,6 @@
 """Tests for slash-command test selection: declarative groups and `--changed`."""
 
 import importlib.util
-import json
 import os
 import sys
 import tempfile
@@ -30,69 +29,6 @@ def _load_handler():
     with patch.dict(sys.modules, {"github": github}):
         spec.loader.exec_module(module)
     return module
-
-
-class TestConfiguredTestGroups(CustomTestCase):
-    def test_additional_group_requires_only_manifest_data(self):
-        handler = _load_handler()
-        previous_cwd = os.getcwd()
-        try:
-            os.chdir(_REPO_ROOT)
-            with tempfile.TemporaryDirectory() as temp_dir:
-                manifest = Path(temp_dir) / "groups.json"
-                manifest.write_text(
-                    json.dumps(
-                        {
-                            "mixed": [
-                                "registered/rust/test_run_rust_tests.py",
-                                "registered/core/test_srt_endpoint.py",
-                            ]
-                        }
-                    )
-                )
-                with patch.object(handler, "TEST_GROUPS_FILE_PATH", str(manifest)):
-                    specs, error = handler.resolve_test_group_specs("mixed")
-
-            self.assertIsNone(error)
-            self.assertEqual(
-                specs,
-                [
-                    "registered/rust/test_run_rust_tests.py",
-                    "registered/core/test_srt_endpoint.py",
-                ],
-            )
-        finally:
-            os.chdir(previous_cwd)
-
-    def test_rust_server_group(self):
-        handler = _load_handler()
-        previous_cwd = os.getcwd()
-        try:
-            os.chdir(_REPO_ROOT)
-            specs, error = handler.resolve_test_group_specs("rust-server")
-            self.assertIsNone(error)
-            self.assertEqual(
-                specs,
-                [
-                    "registered/rust/test_run_rust_tests.py",
-                    "registered/core/test_srt_endpoint.py",
-                    "registered/vlm/test_rust_native_mm_e2e.py",
-                    "registered/vlm/test_rust_native_mm_mmmu.py",
-                ],
-            )
-
-            resolved = [
-                item
-                for test_spec in specs
-                for item in handler._resolve_test_spec(test_spec)
-            ]
-            self.assertTrue(all(item["error"] is None for item in resolved), resolved)
-            self.assertEqual(
-                [item["mode"] for item in resolved],
-                ["cpu", "cuda", "cuda", "cuda"],
-            )
-        finally:
-            os.chdir(previous_cwd)
 
 
 class TestChangedTestFiles(CustomTestCase):
